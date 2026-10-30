@@ -13,6 +13,7 @@ use portable_pty::PtySize;
 use serde::Deserialize;
 
 use crate::scope_binding as session_scope;
+use crate::scope_binding::resolve_project_source_directory;
 use crate::{
     errors::ApiError,
     state::ApiState,
@@ -49,6 +50,8 @@ struct TerminalScopeQuery {
     workspace_id: Option<String>,
     #[serde(default)]
     workspace_path: Option<String>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
     #[serde(default = "default_terminal_cols")]
     cols: u16,
     #[serde(default = "default_terminal_rows")]
@@ -78,12 +81,19 @@ async fn terminal_channel(
 ) -> Result<Response, ApiError> {
     ensure_local_terminal_access(&headers)?;
     let binding = resolve_terminal_binding(&state, &terminal_tab_id, &query)?;
+    let _project_admission = binding
+        .workspace_id
+        .as_ref()
+        .map(|id| state.try_project_directory_admission(&magi_core::WorkspaceId::new(id)))
+        .transpose()?;
+    // 解析可能早于项目编辑提交；准入锁内重新核对原目录映射。
+    validate_terminal_binding(&state, &binding)?;
     let size = terminal_size(query.cols, query.rows);
     let terminal = state
         .terminal_sessions
         .open_or_create(binding, size)
         .map_err(terminal_runtime_error)?;
-    Ok(ws.on_upgrade(move |socket| run_terminal_channel(socket, terminal)))
+    Ok(ws.on_upgrade(move |socket| run_terminal_channel(socket, terminal, state)))
 }
 
 async fn close_terminal(
@@ -115,13 +125,24 @@ fn resolve_terminal_binding(
         query.workspace_id.as_deref(),
         query.workspace_path.as_deref(),
     )?;
-    let execution_root = match &request_scope.scope {
-        session_scope::SessionScope::Personal => {
-            state.personal_session_execution_root(&session_id)?
+    let (execution_root, source_folder_id) = match &request_scope.scope {
+        session_scope::SessionScope::Personal if query.source_folder_id.is_some() => {
+            return Err(ApiError::InvalidInput(
+                "个人会话不能选择项目源文件夹".into(),
+            ));
         }
-        session_scope::SessionScope::Workspace(binding) => state
-            .session_isolation_root(&session_id)
-            .unwrap_or_else(|| std::path::PathBuf::from(&binding.workspace_path)),
+        session_scope::SessionScope::Personal => {
+            (state.personal_session_execution_root(&session_id)?, None)
+        }
+        session_scope::SessionScope::Workspace(binding) => {
+            let directory = resolve_project_source_directory(
+                state,
+                &binding.workspace_id,
+                Some(&session_id),
+                query.source_folder_id.as_deref(),
+            )?;
+            (directory.execution_root, Some(directory.source_folder_id))
+        }
     };
     Ok(TerminalBinding {
         terminal_tab_id: terminal_tab_id.to_string(),
@@ -129,8 +150,38 @@ fn resolve_terminal_binding(
             .workspace_id()
             .map(|workspace_id| workspace_id.to_string()),
         execution_root,
+        source_folder_id,
         session_id: session_id.to_string(),
     })
+}
+
+fn validate_terminal_binding(state: &ApiState, binding: &TerminalBinding) -> Result<(), ApiError> {
+    let session_id = magi_core::SessionId::new(&binding.session_id);
+    let session = state
+        .session_store
+        .session(&session_id)
+        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+    let current = match binding.workspace_id.as_deref() {
+        Some(id) => {
+            let directory = resolve_project_source_directory(
+                state,
+                &magi_core::WorkspaceId::new(id),
+                Some(&session_id),
+                binding.source_folder_id.as_deref(),
+            )?;
+            directory.execution_root
+        }
+        None if state.session_workspace_id(&session).is_none() => {
+            state.personal_session_execution_root_path(&session_id)
+        }
+        None => return Err(ApiError::Conflict("终端原会话归属已变化".into())),
+    };
+    if current != binding.execution_root {
+        return Err(ApiError::Conflict(
+            "终端原执行目录已变化，请重新打开".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_terminal_tab_id(value: &str) -> Result<(), ApiError> {
@@ -172,7 +223,11 @@ fn ensure_local_terminal_access(headers: &HeaderMap) -> Result<(), ApiError> {
     Ok(())
 }
 
-async fn run_terminal_channel(socket: WebSocket, terminal: std::sync::Arc<TerminalSession>) {
+async fn run_terminal_channel(
+    socket: WebSocket,
+    terminal: std::sync::Arc<TerminalSession>,
+    state: ApiState,
+) {
     let mut events = terminal.subscribe();
     let snapshot = terminal.snapshot();
     let snapshot_sequence = snapshot.sequence;
@@ -197,11 +252,24 @@ async fn run_terminal_channel(socket: WebSocket, terminal: std::sync::Arc<Termin
     if snapshot.lifecycle.is_terminal() {
         return;
     }
+    let mut validation = tokio::time::interval(std::time::Duration::from_secs(1));
 
     loop {
         tokio::select! {
+            _ = validation.tick() => {
+                if let Err(error) = validate_terminal_binding(&state, terminal.binding()) {
+                    let _ = state.terminal_sessions.close(terminal.binding());
+                    let _ = send_error(&mut sink, "terminal_directory_invalid", error.message()).await;
+                    break;
+                }
+            }
             incoming = source.next() => {
                 let Some(Ok(message)) = incoming else { break; };
+                if let Err(error) = validate_terminal_binding(&state, terminal.binding()) {
+                    let _ = state.terminal_sessions.close(terminal.binding());
+                    let _ = send_error(&mut sink, "terminal_directory_invalid", error.message()).await;
+                    break;
+                }
                 match message {
                     Message::Binary(bytes) => {
                         if bytes.len() > TERMINAL_INPUT_MAX_BYTES {
@@ -309,6 +377,79 @@ async fn send_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_binding_keeps_source_identity_and_rejects_rebinding_and_revocation() {
+        use super::super::test_project_fixtures::{add_source, set_members};
+        use magi_core::{SessionId, WorkspaceId};
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(magi_event_bus::InMemoryEventBus::new(32)),
+            Arc::new(magi_session_store::SessionStore::default()),
+            Arc::new(magi_workspace::WorkspaceStore::new()),
+            Arc::new(magi_governance::GovernanceService::default()),
+        );
+        state
+            .workspace_registry
+            .register_native_path(WorkspaceId::new("terminal-project"), a.clone())
+            .unwrap();
+        let first = add_source(&state, "terminal-project", "second", &b).primary_source_folder_id;
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("terminal-session"),
+                "terminal",
+                Some("terminal-project".into()),
+            )
+            .unwrap();
+        let mut query: TerminalScopeQuery = serde_json::from_value(serde_json::json!({
+            "scope": "workspace", "sessionId": "terminal-session", "workspaceId": "terminal-project"
+        }))
+        .unwrap();
+        assert!(resolve_terminal_binding(&state, "tab", &query).is_err());
+        query.source_folder_id = Some(first.clone());
+        let original = resolve_terminal_binding(&state, "tab", &query).unwrap();
+        assert!(validate_terminal_binding(&state, &original).is_ok());
+        assert_eq!(
+            original.execution_root,
+            magi_core::HostPath::canonicalize(&a)
+                .unwrap()
+                .into_path_buf()
+        );
+        state
+            .terminal_sessions
+            .open_or_create(original.clone(), PtySize::default())
+            .unwrap();
+        set_members(&state, "terminal-project", &[&first, "second"], "second");
+        assert_eq!(
+            resolve_terminal_binding(&state, "tab", &query).unwrap(),
+            original
+        );
+        assert!(validate_terminal_binding(&state, &original).is_ok());
+        query.source_folder_id = Some("second".into());
+        let other = resolve_terminal_binding(&state, "tab", &query).unwrap();
+        assert!(matches!(
+            state
+                .terminal_sessions
+                .open_or_create(other, PtySize::default()),
+            Err(TerminalRuntimeError::BindingMismatch)
+        ));
+        state.terminal_sessions.close(&original).unwrap();
+        set_members(&state, "terminal-project", &["second"], "second");
+        assert!(validate_terminal_binding(&state, &original).is_err());
+        query.source_folder_id = Some(first);
+        assert!(resolve_terminal_binding(&state, "tab", &query).is_err());
+        query.source_folder_id = Some("second".into());
+        std::fs::remove_dir_all(&b).unwrap();
+        assert!(resolve_terminal_binding(&state, "tab", &query).is_err());
+        assert!(!b.exists());
+    }
 
     #[test]
     fn terminal_tab_id_rejects_path_and_query_syntax() {

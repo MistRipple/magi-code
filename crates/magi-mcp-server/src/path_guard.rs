@@ -44,18 +44,41 @@ pub enum PathViolation {
 #[derive(Clone, Debug)]
 pub struct PathGuard {
     root: PathBuf,
+    roots: Vec<PathBuf>,
 }
 
 impl PathGuard {
     /// `workspace_root` 必须是已存在的目录；内部保存其规范化后的真实路径。
     pub fn new(workspace_root: &Path) -> Result<Self, PathViolation> {
+        Self::for_roots(workspace_root, &[workspace_root.to_path_buf()])
+    }
+
+    pub fn for_roots(
+        workspace_root: &Path,
+        allowed_roots: &[PathBuf],
+    ) -> Result<Self, PathViolation> {
         let root = workspace_root
             .canonicalize()
             .map_err(|error| PathViolation::WorkspaceUnavailable(error.to_string()))?;
         if !root.is_dir() {
             return Err(PathViolation::WorkspaceUnavailable("不是目录".to_string()));
         }
-        Ok(Self { root })
+        let roots = allowed_roots
+            .iter()
+            .map(|path| {
+                let canonical = path
+                    .canonicalize()
+                    .map_err(|error| PathViolation::WorkspaceUnavailable(error.to_string()))?;
+                if !canonical.is_dir() {
+                    return Err(PathViolation::WorkspaceUnavailable("不是目录".into()));
+                }
+                Ok(canonical)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !roots.contains(&root) {
+            return Err(PathViolation::OutsideWorkspace);
+        }
+        Ok(Self { root, roots })
     }
 
     pub fn root(&self) -> &Path {
@@ -81,23 +104,29 @@ impl PathGuard {
             }
         };
         let lexical = lexically_normalize(&joined).ok_or(PathViolation::OutsideWorkspace)?;
-        if !lexical.starts_with(&self.root) {
+        if !self.roots.iter().any(|root| lexical.starts_with(root)) {
             // 绝对路径可能经由符号链接才落进工作区（如 /tmp → /private/tmp），
             // 这里只信任规范化后的真实路径，因此继续用真实路径判断。
             let resolved = resolve_existing_prefix(&lexical);
-            if !resolved.starts_with(&self.root) {
+            if !self.roots.iter().any(|root| resolved.starts_with(root)) {
                 return Err(PathViolation::OutsideWorkspace);
             }
         }
 
         // 最长的已存在前缀必须真实落在工作区内（符号链接逃逸）。
         let resolved = resolve_existing_prefix(&lexical);
-        if !resolved.starts_with(&self.root) {
+        if !self.roots.iter().any(|root| resolved.starts_with(root)) {
             return Err(PathViolation::SymlinkEscape);
         }
 
+        let containing = self
+            .roots
+            .iter()
+            .filter(|root| resolved.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .ok_or(PathViolation::OutsideWorkspace)?;
         let relative = resolved
-            .strip_prefix(&self.root)
+            .strip_prefix(containing)
             .map_err(|_| PathViolation::OutsideWorkspace)?;
         for component in relative.components() {
             let Component::Normal(name) = component else {

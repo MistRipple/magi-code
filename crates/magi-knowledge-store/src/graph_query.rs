@@ -633,6 +633,7 @@ mod tests {
                 updated_at: UtcMillis(1),
             }],
             vec![KnowledgeRelation {
+                code_scope: None,
                 relation_id: "relation-1".into(),
                 workspace_id: workspace_id.clone(),
                 source: crate::graph::GraphNodeRef::Knowledge {

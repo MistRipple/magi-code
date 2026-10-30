@@ -23,9 +23,12 @@ use magi_tool_runtime::{
 
 use crate::builtin_tool_schema::internal_builtin_tool_rejection_payload;
 use crate::tool_batch::{
-    SafetyEvaluationAuditContext, policy_tool_preflight_decision, publish_safety_evaluation_audit,
+    SafetyEvaluationAuditContext, policy_tool_preflight_decision_in_context,
+    publish_safety_evaluation_audit,
 };
-use crate::tool_declared_paths::{append_result_declared_paths, derive_declared_paths};
+use crate::tool_declared_paths::{
+    append_result_declared_paths, derive_declared_paths, snapshot_tool_context,
+};
 use crate::tool_result_utils::{approval_resume_contract_failure, approval_resume_is_safe};
 use crate::{execute_skill_custom_tool, parse_skill_custom_tool_name, tool_execution_policy_scope};
 
@@ -41,6 +44,9 @@ pub struct ExternalToolCall<'a> {
     pub session_id: &'a SessionId,
     pub workspace_id: Option<&'a WorkspaceId>,
     pub workspace_root: &'a Path,
+    /// 外部调用也必须使用可信的项目目录映射；不能从令牌参数自行创建执行根。
+    pub project_directory_map: Option<magi_core::ProjectDirectoryExecutionMap>,
+    pub snapshots: Vec<std::sync::Arc<magi_snapshot::SnapshotSession>>,
     pub access_profile: AccessProfile,
     /// 该外部会话的变更账本钩子。写入类工具执行前后由它对改写路径拍 hash，
     /// 使外部改动进入待处理变更并可批准 / 回退；只读调用传 `None` 亦可。
@@ -271,8 +277,45 @@ pub fn execute_external_tool_call(
         _ => call.tool_name.trim().to_string(),
     };
 
-    let policy = external_tool_policy(call.access_profile, call.workspace_root);
+    let mut policy = external_tool_policy(call.access_profile, call.workspace_root);
     let workspace_root = call.workspace_root.to_path_buf();
+    let context = ToolExecutionContext {
+        project_directory_map: call.project_directory_map.clone(),
+        caller_scope: magi_tool_runtime::ToolCallerScope::SessionMainline,
+        session_id: Some(call.session_id.clone()),
+        workspace_id: call.workspace_id.cloned(),
+        access_profile: call.access_profile,
+        working_directory: Some(workspace_root.clone()),
+        ..Default::default()
+    };
+    let context = match context.for_tool_arguments(call.arguments_json) {
+        Ok(context) => context,
+        Err(error) => return rejected(call.tool_name, &error.to_string()),
+    };
+    if let Some(map) = &call.project_directory_map {
+        policy.allowed_paths.clear();
+        policy.denied_paths.clear();
+        for root in &map.roots {
+            let root = match root.execution_root() {
+                Ok(root) => root,
+                Err(error) => return rejected(call.tool_name, &error.to_string()),
+            };
+            policy.allowed_paths.push(
+                magi_core::HostPath::from_path(root.clone())
+                    .to_path_ref()
+                    .as_str()
+                    .into(),
+            );
+            policy
+                .denied_paths
+                .extend(EXTERNAL_DENIED_RELATIVE_PATHS.iter().map(|relative| {
+                    magi_core::HostPath::from_path(root.join(relative))
+                        .to_path_ref()
+                        .as_str()
+                        .into()
+                }));
+        }
+    }
 
     if let Some(gate) = safety_gate {
         publish_safety_evaluation_audit(
@@ -291,12 +334,13 @@ pub fn execute_external_tool_call(
         );
     }
 
-    if let Some(decision) = policy_tool_preflight_decision(
+    if let Some(decision) = policy_tool_preflight_decision_in_context(
         Some(&policy),
         safety_gate,
         &decision_name,
         call.arguments_json,
         Some(&workspace_root),
+        Some(&context),
     ) {
         match decision.status {
             ExecutionResultStatus::NeedsApproval if approval_granted => {}
@@ -313,6 +357,7 @@ pub fn execute_external_tool_call(
         );
         tool_policy.access_profile = effective;
         let context = ToolExecutionContext {
+            project_directory_map: call.project_directory_map.clone(),
             caller_scope: magi_tool_runtime::ToolCallerScope::SessionMainline,
             worker_id: None,
             task_id: None,
@@ -323,6 +368,21 @@ pub fn execute_external_tool_call(
             browser_capability_snapshot: None,
             browser_execution_id: None,
         };
+        let context = match context.for_tool_arguments(call.arguments_json) {
+            Ok(context) => context,
+            Err(error) => return (serde_json::json!({
+                "tool": call.tool_name, "status": "rejected", "error_code": "project_directory_invalid",
+                "error": error.to_string(), "execution_started": false,
+            }).to_string(), ExecutionResultStatus::Rejected),
+        };
+        let projected_policy = match context.project_execution_policy(&tool_policy) {
+            Ok(policy) => policy,
+            Err(error) => return (serde_json::json!({
+                "tool": call.tool_name, "status": "rejected", "error_code": "project_directory_invalid",
+                "error": error.to_string(), "execution_started": false,
+            }).to_string(), ExecutionResultStatus::Rejected),
+        };
+        tool_policy = projected_policy;
         let mut hook_ctx = ToolHookCtx {
             tool_call_id: call.call_id.to_string(),
             worker_id: None,
@@ -339,6 +399,14 @@ pub fn execute_external_tool_call(
         if let Some(hook) = call.snapshot {
             hook.before_tool(&hook_ctx);
         }
+        for snapshot in &call.snapshots {
+            snapshot.before_tool(&snapshot_tool_context(
+                snapshot.workspace_root(),
+                context.working_directory.as_deref(),
+                &hook_ctx,
+            ));
+        }
+        let selected_root = context.working_directory.clone();
         let (payload, status) = match &target {
             ExternalTarget::Builtin(tool) => {
                 let input = ToolExecutionInput::for_builtin_invocation(
@@ -380,6 +448,16 @@ pub fn execute_external_tool_call(
         append_result_declared_paths(&mut hook_ctx.declared_paths, &payload);
         if let Some(hook) = call.snapshot {
             hook.after_tool(&hook_ctx);
+        }
+        for snapshot in &call.snapshots {
+            snapshot.after_tool(&snapshot_tool_context(
+                snapshot.workspace_root(),
+                selected_root.as_deref(),
+                &hook_ctx,
+            ));
+            if let Err(error) = snapshot.reconcile() {
+                tracing::warn!(%error, "external tool snapshot reconcile failed");
+            }
         }
         (payload, status)
     };
@@ -442,6 +520,8 @@ mod tests {
         session: &'a SessionId,
     ) -> ExternalToolCall<'a> {
         ExternalToolCall {
+            project_directory_map: None,
+            snapshots: Vec::new(),
             cancellation: None,
             call_id: "call-1",
             tool_name: tool,

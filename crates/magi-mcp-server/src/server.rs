@@ -44,6 +44,7 @@ pub struct ClientPrincipal {
     pub token_prefix: String,
     pub client_name: String,
     pub workspace_id: String,
+    pub project_directories: Option<magi_core::ProjectDirectoryBinding>,
     pub profile: Profile,
     pub approval_mode: ApprovalMode,
     pub attribution: AttributionMode,
@@ -56,6 +57,7 @@ impl From<&TokenRecord> for ClientPrincipal {
             token_prefix: record.prefix.clone(),
             client_name: record.client_name.clone(),
             workspace_id: record.workspace_id.clone(),
+            project_directories: record.project_directories.clone(),
             // 令牌统一开放完整工具目录；工具档只属于 GPT Web 槽位的 principal。
             profile: Profile::Exec,
             approval_mode: record.approval_mode,
@@ -70,7 +72,12 @@ pub enum AttributionTarget {
     /// 该令牌自己的外部工具会话。
     ExternalSession { token_id: String },
     /// GPT Web 槽位拥有者进行中的 turn。
-    WebSlotTurn { session_id: String, turn_id: String },
+    WebSlotTurn {
+        session_id: String,
+        /// 槽位租约代际，与 canonical Turn ID 分属不同身份。
+        turn_id: String,
+        canonical_turn_id: String,
+    },
 }
 
 /// 归属被拒绝（例如 `follow_web_slot` 时没有进行中的 turn）。
@@ -102,7 +109,7 @@ impl AttributionResolver for ExternalOnlyAttribution {
     }
 }
 
-/// 工作区根目录解析（令牌只绑定工作区 id）。
+/// 项目目录解析；宿主以签发或原 Turn 的冻结授权构造实际执行映射。
 pub trait WorkspaceResolver: Send + Sync {
     fn root_of(&self, workspace_id: &str) -> Option<PathBuf>;
 
@@ -113,6 +120,14 @@ pub trait WorkspaceResolver: Send + Sync {
         _target: &AttributionTarget,
     ) -> Option<PathBuf> {
         self.root_of(&principal.workspace_id)
+    }
+
+    fn execution_directories(
+        &self,
+        _principal: &ClientPrincipal,
+        _target: &AttributionTarget,
+    ) -> Result<Option<magi_core::ProjectDirectoryExecutionMap>, String> {
+        Ok(None)
     }
 
     fn name_of(&self, _workspace_id: &str) -> Option<String> {
@@ -128,6 +143,7 @@ pub struct ToolInvocation {
     pub internal_name: String,
     pub class: ToolClass,
     pub arguments: Value,
+    pub project_directory_map: Option<magi_core::ProjectDirectoryExecutionMap>,
     /// 该调用是否需要 Magi 界面里的人工确认（由后端负责发起与等待）。
     pub requires_approval: bool,
     pub attribution: AttributionTarget,
@@ -449,19 +465,36 @@ impl McpServer {
         match request.method.as_str() {
             "initialize" => {
                 let instructions = if principal.attribution == AttributionMode::External {
-                    let Some(root) = self.workspaces.root_of(&principal.workspace_id) else {
-                        return Some(error(id, JSONRPC_INVALID_PARAMS, "绑定的工作区不可用"));
+                    let target = AttributionTarget::ExternalSession {
+                        token_id: principal.token_id.clone(),
+                    };
+                    let directories = match self
+                        .workspaces
+                        .execution_directories(principal, &target)
+                    {
+                        Ok(directories) => directories,
+                        Err(message) => return Some(error(id, JSONRPC_INVALID_PARAMS, message)),
+                    };
+                    let root = directories
+                        .as_ref()
+                        .map(|map| map.root(None).and_then(|root| root.execution_root()).ok())
+                        .unwrap_or_else(|| self.workspaces.root_for(principal, &target));
+                    let Some(root) = root else {
+                        return Some(error(id, JSONRPC_INVALID_PARAMS, "绑定的项目目录不可用"));
                     };
                     let workspace = json!({
                         "name": self.workspaces.name_of(&principal.workspace_id)
                             .unwrap_or_else(|| principal.workspace_id.clone()),
                         "root": root,
+                        "directories": directories,
                     });
                     Some(format!(
                         "This Magi MCP connection is bound to workspace {workspace}. \
                          Paths refer to the machine running Magi, not the client machine. \
                          Resolve relative paths against this workspace root. \
                          The target does not change when the client opens another project. \
+                         source_folder_id selects a granted directory and resolves relative paths there. \
+                         Only the listed directories are granted; project changes do not expand this connection. \
                          Use a separate Magi MCP connection for another workspace."
                     ))
                 } else {
@@ -575,14 +608,59 @@ impl McpServer {
             Err(AttributionRefusal(reason)) => return Ok(deny(reason, Vec::new(), false)),
         };
 
-        let Some(root) = self.workspaces.root_for(principal, &attribution) else {
+        let directories = match self
+            .workspaces
+            .execution_directories(principal, &attribution)
+        {
+            Ok(directories) => directories,
+            Err(error) => return Ok(deny(error, Vec::new(), false)),
+        };
+        let selected_id = match arguments.get("source_folder_id") {
+            Some(Value::String(id)) if !id.trim().is_empty() => Some(id.as_str()),
+            Some(_) => {
+                return Ok(deny(
+                    "source_folder_id 必须为非空目录 ID".into(),
+                    Vec::new(),
+                    false,
+                ));
+            }
+            None => None,
+        };
+        let root = if let Some(map) = &directories {
+            match map.root(selected_id).and_then(|root| root.execution_root()) {
+                Ok(root) => Some(root),
+                Err(error) => return Ok(deny(error.to_string(), Vec::new(), false)),
+            }
+        } else if selected_id.is_some() {
+            return Ok(deny(
+                "当前调用没有可信项目目录映射".into(),
+                Vec::new(),
+                false,
+            ));
+        } else {
+            self.workspaces.root_for(principal, &attribution)
+        };
+        let Some(root) = root else {
             return Ok(deny(
                 "令牌绑定的工作区不可用".to_string(),
                 Vec::new(),
                 false,
             ));
         };
-        let guard = match PathGuard::new(&root) {
+        let allowed_roots = directories
+            .as_ref()
+            .map(|map| {
+                map.roots
+                    .iter()
+                    .map(|root| root.execution_root())
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose();
+        let allowed_roots = match allowed_roots {
+            Ok(roots) => roots.unwrap_or_else(|| vec![root.clone()]),
+            Err(error) => return Ok(deny(error.to_string(), Vec::new(), false)),
+        };
+        let guard = match PathGuard::for_roots(&root, &allowed_roots) {
             Ok(guard) => guard,
             Err(violation) => return Ok(deny(violation.to_string(), Vec::new(), false)),
         };
@@ -610,6 +688,7 @@ impl McpServer {
             internal_name: mapping.internal_name.clone(),
             class: mapping.class,
             arguments,
+            project_directory_map: directories,
             requires_approval,
             attribution,
             resolved_paths: resolved_paths.clone(),
@@ -757,6 +836,7 @@ mod tests {
 
     fn principal(profile: Profile) -> ClientPrincipal {
         ClientPrincipal {
+            project_directories: None,
             token_id: "tok-1".to_string(),
             token_prefix: "magi_mcp_abcdef".to_string(),
             client_name: "Cursor".to_string(),

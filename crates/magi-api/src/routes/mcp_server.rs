@@ -119,6 +119,8 @@ struct TokenDto {
     prefix: String,
     client_name: String,
     workspace_id: String,
+    source_folder_ids: Vec<String>,
+    default_source_folder_id: Option<String>,
     workspace_available: bool,
     approval_mode: ApprovalMode,
     attribution: AttributionMode,
@@ -136,14 +138,32 @@ struct TokenDto {
 
 impl TokenDto {
     fn from_record(state: &ApiState, record: &TokenRecord, now_ms: u64) -> Self {
-        let workspace_available = state
-            .workspace_root_path(&Some(WorkspaceId::new(&record.workspace_id)))
-            .is_some();
+        let workspace_available = record.project_directories.as_ref().is_some_and(|binding| {
+            state
+                .workspace_registry
+                .validate_directory_binding(binding)
+                .is_ok()
+        });
         Self {
             token_id: record.token_id.clone(),
             prefix: record.prefix.clone(),
             client_name: record.client_name.clone(),
             workspace_id: record.workspace_id.clone(),
+            source_folder_ids: record
+                .project_directories
+                .as_ref()
+                .map(|binding| {
+                    binding
+                        .source_folders
+                        .iter()
+                        .map(|folder| folder.source_folder_id.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            default_source_folder_id: record
+                .project_directories
+                .as_ref()
+                .map(|binding| binding.default_source_folder_id.clone()),
             workspace_available,
             approval_mode: record.approval_mode,
             attribution: record.attribution,
@@ -393,6 +413,10 @@ async fn verify_named_tunnel(
 struct CreateTokenRequest {
     client_name: String,
     workspace_id: String,
+    #[serde(default)]
+    source_folder_ids: Option<Vec<String>>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
     /// 需要人工确认的调用如何处理；默认每次询问。
     #[serde(default)]
     approval_mode: ApprovalMode,
@@ -433,9 +457,22 @@ async fn create_token(
         return Err(ApiError::InvalidInput("工作区不存在".to_string()));
     }
     let ttl_ms = ttl_days_to_ms(request.ttl_days.unwrap_or(DEFAULT_TOKEN_TTL_DAYS));
+    let project_directories = state
+        .workspace_registry
+        .capture_directory_binding(
+            &WorkspaceId::new(request.workspace_id.trim()),
+            request.source_folder_id.as_deref(),
+            request.source_folder_ids.as_deref(),
+        )
+        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+    state
+        .workspace_registry
+        .validate_directory_binding(&project_directories)
+        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
     let issued = state
         .mcp_service
         .issue_token(IssueTokenRequest {
+            project_directories: Some(project_directories),
             client_name: request.client_name,
             workspace_id: request.workspace_id,
             approval_mode: request.approval_mode,
@@ -1211,6 +1248,12 @@ mod tests {
         let issued = state
             .mcp_service
             .issue_token(IssueTokenRequest {
+                project_directories: Some(
+                    state
+                        .workspace_registry
+                        .capture_directory_binding(&WorkspaceId::new("ws-1"), None, None)
+                        .unwrap(),
+                ),
                 client_name: "status-client".into(),
                 workspace_id: "ws-1".into(),
                 approval_mode: ApprovalMode::Ask,

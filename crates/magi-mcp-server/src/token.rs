@@ -38,6 +38,9 @@ pub struct TokenRecord {
     pub hash: String,
     pub client_name: String,
     pub workspace_id: String,
+    /// 令牌签发时固定的源目录授权；旧格式为空时由宿主单向迁移原单目录。
+    #[serde(default)]
+    pub project_directories: Option<magi_core::ProjectDirectoryBinding>,
     /// 需要人工确认的调用如何处理；历史令牌没有该字段，按每次询问处理。
     #[serde(default)]
     pub approval_mode: ApprovalMode,
@@ -66,6 +69,7 @@ impl TokenRecord {
 pub struct IssueTokenRequest {
     pub client_name: String,
     pub workspace_id: String,
+    pub project_directories: Option<magi_core::ProjectDirectoryBinding>,
     /// 需要人工确认的调用如何处理。
     pub approval_mode: ApprovalMode,
     pub attribution: AttributionMode,
@@ -110,6 +114,10 @@ pub enum TokenError {
     NotFound,
     #[error("令牌已吊销，不能再修改")]
     Revoked,
+    #[error("令牌项目目录授权无效")]
+    InvalidDirectoryBinding,
+    #[error("令牌目录授权保存失败: {0}")]
+    Persist(String),
 }
 
 /// 编辑令牌的补丁。`None` 表示不改；不含原文，编辑从不更换原文。
@@ -190,6 +198,12 @@ impl TokenStore {
         if request.workspace_id.trim().is_empty() {
             return Err(TokenError::EmptyWorkspace);
         }
+        if let Some(binding) = &request.project_directories
+            && (binding.workspace_id.as_str() != request.workspace_id.trim()
+                || binding.validate().is_err())
+        {
+            return Err(TokenError::InvalidDirectoryBinding);
+        }
         let secret = format!("{TOKEN_PREFIX}{}", random_hex(32)?);
         let record = TokenRecord {
             token_id: format!("mcp-token-{}", random_hex(8)?),
@@ -197,6 +211,7 @@ impl TokenStore {
             hash: hash_secret(&secret),
             client_name: request.client_name.trim().to_string(),
             workspace_id: request.workspace_id.trim().to_string(),
+            project_directories: request.project_directories,
             approval_mode: request.approval_mode,
             attribution: request.attribution,
             created_at_ms: now_ms,
@@ -210,6 +225,34 @@ impl TokenStore {
             .expect("token store poisoned")
             .push(record.clone());
         Ok(IssuedToken { record, secret })
+    }
+
+    /// 宿主在开放管理入口前补齐旧格式；先持久提交整组，再发布内存授权。
+    pub fn freeze_legacy_directories(
+        &self,
+        bindings: &[(String, magi_core::ProjectDirectoryBinding)],
+        persist: impl FnOnce(&[TokenRecord]) -> Result<(), String>,
+    ) -> Result<(), TokenError> {
+        let mut records = self.records.lock().expect("token store poisoned");
+        let mut next = records.clone();
+        for (token_id, binding) in bindings {
+            binding
+                .validate()
+                .map_err(|_| TokenError::InvalidDirectoryBinding)?;
+            let record = next
+                .iter_mut()
+                .find(|record| &record.token_id == token_id)
+                .ok_or(TokenError::NotFound)?;
+            if record.workspace_id != binding.workspace_id.as_str()
+                || record.project_directories.is_some()
+            {
+                return Err(TokenError::InvalidDirectoryBinding);
+            }
+            record.project_directories = Some(binding.clone());
+        }
+        persist(&next).map_err(TokenError::Persist)?;
+        *records = next;
+        Ok(())
     }
 
     /// 编辑令牌。已吊销的令牌不可编辑。返回编辑前后的记录，调用方据此判断是否收紧了权限。
@@ -337,6 +380,7 @@ mod tests {
 
     fn request() -> IssueTokenRequest {
         IssueTokenRequest {
+            project_directories: None,
             client_name: "Cursor · 笔记本".to_string(),
             workspace_id: "workspace-a".to_string(),
             approval_mode: ApprovalMode::Ask,

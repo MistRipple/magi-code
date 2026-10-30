@@ -45,6 +45,7 @@ export interface BrowserOpenBinding {
 
 export interface HtmlFileBrowserTarget extends BrowserOpenBinding {
   filepath: string;
+  sourceFolderId?: string;
 }
 
 /**
@@ -292,6 +293,7 @@ export function openHtmlFileInRightPaneBrowser(
     try {
       const target = await resolveBrowserTarget({ workspaceId, workspacePath, sessionId });
       const url = agentUrl('/api/files/site-open', buildFilePreviewQuery(filepath, {
+        sourceFolderId: input.sourceFolderId,
         sessionId: target.sessionId,
         workspaceId: target.workspaceId,
         workspacePath: target.workspacePath,

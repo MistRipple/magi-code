@@ -150,29 +150,51 @@ pub struct GovernedKnowledgeQueryResult {
     pub truncated: bool,
 }
 
-/// 工作区代码检索引擎句柄：每个 workspace 一个 LocalSearchEngine。
+/// 工作区代码检索引擎句柄：项目、源目录与实际执行根共同定位一个引擎。
 ///
 /// 检索只读取不可变索引并使用内部线程安全缓存，因此同一 workspace 可并发查询；
 /// 文件监听和定期对账通过写锁独占更新索引。
-type WorkspaceSearchEngines = Arc<RwLock<HashMap<WorkspaceId, Arc<RwLock<LocalSearchEngine>>>>>;
+type WorkspaceSearchEngines = Arc<RwLock<HashMap<CodeIndexKey, Arc<RwLock<LocalSearchEngine>>>>>;
 
-/// 每个 workspace 的文件监听句柄：持有它仅为维持监听任务存活。
+/// 每个索引作用域的文件监听句柄：持有它仅为维持监听任务存活。
 /// 与索引引擎同生命周期——build_workspace_index 时一并建立，store 释放时随之 drop。
-type WorkspaceWatchers = Arc<RwLock<HashMap<WorkspaceId, Arc<magi_snapshot::watcher::FsWatcher>>>>;
+type WorkspaceWatchers = Arc<RwLock<HashMap<CodeIndexKey, Arc<magi_snapshot::watcher::FsWatcher>>>>;
 
 type IndexPersistenceCallback = Arc<dyn Fn(&KnowledgeStore) + Send + Sync>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodeIndexScope {
+    pub source_folder_id: String,
+    pub execution_root_ref: String,
+}
+
+impl CodeIndexScope {
+    fn graph_prefix(&self) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "source:{}:{}:",
+            magi_core::hex_lower(self.source_folder_id.as_bytes()),
+            magi_core::hex_lower(Sha256::digest(self.execution_root_ref.as_bytes()))
+        )
+    }
+}
+
+type CodeIndexKey = (WorkspaceId, Option<CodeIndexScope>);
 
 #[derive(Clone, Default)]
 pub struct KnowledgeStore {
     state: Arc<RwLock<KnowledgeState>>,
     search_engines: WorkspaceSearchEngines,
     watchers: WorkspaceWatchers,
-    workspace_roots: Arc<RwLock<HashMap<WorkspaceId, std::path::PathBuf>>>,
-    index_builds: Arc<Mutex<HashMap<WorkspaceId, bool>>>,
-    index_outcomes: Arc<RwLock<HashMap<WorkspaceId, code_scanner::CodeIndexScanOutcome>>>,
+    workspace_roots: Arc<RwLock<HashMap<CodeIndexKey, std::path::PathBuf>>>,
+    index_builds: Arc<Mutex<HashMap<CodeIndexKey, bool>>>,
+    index_outcomes: Arc<RwLock<HashMap<CodeIndexKey, code_scanner::CodeIndexScanOutcome>>>,
     index_persist_callback: Arc<RwLock<Option<IndexPersistenceCallback>>>,
     /// 知识、关系和代码索引投影的统一代际；上下文检索缓存必须绑定它。
     revision: Arc<AtomicU64>,
+    /// 只读调用视图；所有视图共享同一事实源、缓存、构建状态和持久化入口。
+    code_index_scope: Option<CodeIndexScope>,
 }
 
 impl std::fmt::Debug for KnowledgeStore {
@@ -203,6 +225,64 @@ pub struct GovernedKnowledgeService;
 impl KnowledgeStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 调用方先经过项目/会话授权与实际执行映射，再创建本次索引视图。
+    /// 不持有项目成员事实，也不允许切换视图改变 workspaceId。
+    pub fn for_source_folder(
+        &self,
+        source_folder_id: &str,
+        execution_root: &Path,
+    ) -> Result<Self, DomainError> {
+        if source_folder_id.trim().is_empty() {
+            return Err(DomainError::Validation {
+                message: "代码索引缺少源文件夹身份".into(),
+            });
+        }
+        if !execution_root.is_absolute() {
+            return Err(DomainError::Validation {
+                message: "代码索引执行根必须是绝对路径".into(),
+            });
+        }
+        let root = magi_core::HostPath::canonicalize(execution_root)
+            .unwrap_or_else(|_| magi_core::HostPath::from_path(execution_root.to_path_buf()));
+        let mut view = self.clone();
+        view.code_index_scope = Some(CodeIndexScope {
+            source_folder_id: source_folder_id.into(),
+            execution_root_ref: root.to_path_ref().as_str().into(),
+        });
+        Ok(view)
+    }
+
+    pub fn code_index_scope(&self) -> Option<&CodeIndexScope> {
+        self.code_index_scope.as_ref()
+    }
+
+    fn index_key(&self, workspace_id: &WorkspaceId) -> CodeIndexKey {
+        (workspace_id.clone(), self.code_index_scope.clone())
+    }
+
+    fn scope_matches_root(&self, root: &Path) -> bool {
+        self.code_index_scope.as_ref().is_none_or(|scope| {
+            magi_core::HostPath::from_path(root.to_path_buf())
+                .to_path_ref()
+                .as_str()
+                == scope.execution_root_ref
+        })
+    }
+
+    fn project_code_index_id(&self, workspace_id: &WorkspaceId) -> String {
+        match &self.code_index_scope {
+            None => workspace_project_code_index_id(workspace_id),
+            Some(scope) => format!(
+                "project-code-index-scoped:{}",
+                magi_core::hex_lower(
+                    serde_json::to_vec(&(workspace_id, scope))
+                        .expect("index identity serialization")
+                        .as_slice()
+                )
+            ),
+        }
     }
 
     /// 注册索引关系变更后的持久化回调。回调只在自动候选集合实际变化时触发，
@@ -245,6 +325,7 @@ impl KnowledgeStore {
             index_outcomes: Arc::default(),
             index_persist_callback: Arc::default(),
             revision: Arc::new(AtomicU64::new(1)),
+            code_index_scope: None,
         }
     }
 
@@ -286,15 +367,25 @@ impl KnowledgeStore {
         // 在此统一 canonicalize，引擎与 watcher 共用同一规范化 root。
         let root =
             std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+        if !self.scope_matches_root(&root) {
+            self.delete_code_index_for_workspace(workspace_id);
+            let outcome = code_scanner::CodeIndexScanOutcome {
+                status: code_scanner::CodeIndexScanStatus::Failed,
+                reason_code: None,
+                summary: None,
+            };
+            self.record_workspace_index_outcome(workspace_id, outcome.clone());
+            return outcome;
+        }
         self.workspace_roots
             .write()
             .expect("knowledge store workspace roots write lock poisoned")
-            .insert(workspace_id.clone(), root.clone());
+            .insert(self.index_key(workspace_id), root.clone());
 
         let outcome = code_scanner::scan_workspace(&root);
         let Some(summary) = outcome.summary.as_ref() else {
             let removed_code_index = self
-                .delete(&workspace_project_code_index_id(workspace_id))
+                .delete(&self.project_code_index_id(workspace_id))
                 .is_ok();
             self.clear_workspace_index_runtime(workspace_id);
             if outcome.status == code_scanner::CodeIndexScanStatus::Empty {
@@ -305,7 +396,7 @@ impl KnowledgeStore {
                 self.search_engines
                     .write()
                     .expect("knowledge store search engines write lock poisoned")
-                    .insert(workspace_id.clone(), Arc::new(RwLock::new(engine)));
+                    .insert(self.index_key(workspace_id), Arc::new(RwLock::new(engine)));
                 self.spawn_watcher(workspace_id, &root);
                 let relation_changed =
                     self.refresh_inferred_relations_for_workspace_inner(workspace_id) > 0;
@@ -332,7 +423,7 @@ impl KnowledgeStore {
         self.search_engines
             .write()
             .expect("knowledge store search engines write lock poisoned")
-            .insert(workspace_id.clone(), Arc::new(RwLock::new(engine)));
+            .insert(self.index_key(workspace_id), Arc::new(RwLock::new(engine)));
         let code_index_changed = self.replace_code_index_projection(workspace_id, &root, summary);
 
         // 与索引构建原子地起文件监听：变更去抖后转发到增量更新。
@@ -352,10 +443,10 @@ impl KnowledgeStore {
             .index_builds
             .lock()
             .expect("knowledge store index builds lock poisoned");
-        if builds.contains_key(workspace_id) {
+        if builds.contains_key(&self.index_key(workspace_id)) {
             return false;
         }
-        builds.insert(workspace_id.clone(), false);
+        builds.insert(self.index_key(workspace_id), false);
         true
     }
 
@@ -364,7 +455,7 @@ impl KnowledgeStore {
             .index_builds
             .lock()
             .expect("knowledge store index builds lock poisoned")
-            .remove(workspace_id)
+            .remove(&self.index_key(workspace_id))
             .unwrap_or(false);
         if discard_result {
             self.delete_code_index_for_workspace(workspace_id);
@@ -376,14 +467,14 @@ impl KnowledgeStore {
         self.index_builds
             .lock()
             .expect("knowledge store index builds lock poisoned")
-            .contains_key(workspace_id)
+            .contains_key(&self.index_key(workspace_id))
     }
 
     pub fn workspace_index_build_cancelled(&self, workspace_id: &WorkspaceId) -> bool {
         self.index_builds
             .lock()
             .expect("knowledge store index builds lock poisoned")
-            .get(workspace_id)
+            .get(&self.index_key(workspace_id))
             .copied()
             .unwrap_or(false)
     }
@@ -395,7 +486,7 @@ impl KnowledgeStore {
         self.index_outcomes
             .read()
             .expect("knowledge store index outcomes read lock poisoned")
-            .get(workspace_id)
+            .get(&self.index_key(workspace_id))
             .cloned()
     }
 
@@ -407,7 +498,7 @@ impl KnowledgeStore {
         self.index_outcomes
             .write()
             .expect("knowledge store index outcomes write lock poisoned")
-            .insert(workspace_id.clone(), outcome);
+            .insert(self.index_key(workspace_id), outcome);
     }
 
     /// 为指定 workspace 起文件监听，把去抖后的变更转发到代码索引增量更新。
@@ -454,7 +545,7 @@ impl KnowledgeStore {
                         let engine = engines
                             .read()
                             .ok()
-                            .and_then(|map| map.get(&workspace_id_for_task).cloned());
+                            .and_then(|map| map.get(&store.index_key(&workspace_id_for_task)).cloned());
                         if let Some(engine) = engine {
                             let mut engine = engine.write().expect("search engine write lock poisoned");
                             let events: Vec<(String, local_search_engine::FileIndexEventKind)> = events
@@ -494,7 +585,7 @@ impl KnowledgeStore {
                         let engine = engines
                             .read()
                             .ok()
-                            .and_then(|map| map.get(&workspace_id_for_task).cloned());
+                            .and_then(|map| map.get(&store.index_key(&workspace_id_for_task)).cloned());
                         if let Some(engine) = engine {
                             engine
                                 .write()
@@ -517,18 +608,18 @@ impl KnowledgeStore {
         self.watchers
             .write()
             .expect("knowledge store watchers write lock poisoned")
-            .insert(workspace_id.clone(), Arc::new(watcher));
+            .insert(self.index_key(workspace_id), Arc::new(watcher));
     }
 
     fn clear_workspace_index_runtime(&self, workspace_id: &WorkspaceId) {
         self.search_engines
             .write()
             .expect("knowledge store search engines write lock poisoned")
-            .remove(workspace_id);
+            .remove(&self.index_key(workspace_id));
         self.watchers
             .write()
             .expect("knowledge store watchers write lock poisoned")
-            .remove(workspace_id);
+            .remove(&self.index_key(workspace_id));
     }
 
     /// 在指定 workspace 的本地代码索引上检索；引擎未构建时返回 None。
@@ -542,10 +633,28 @@ impl KnowledgeStore {
             .search_engines
             .read()
             .expect("knowledge store search engines read lock poisoned")
-            .get(workspace_id)
+            .get(&self.index_key(workspace_id))
             .cloned()?;
         let engine = engine.read().expect("search engine read lock poisoned");
         Some(engine.search(query, options))
+    }
+
+    /// 按符号名查定义（goto_definition）。引擎未构建时返回 None。
+    pub fn search_workspace_code_with_path_filter(
+        &self,
+        workspace_id: &WorkspaceId,
+        query: &str,
+        options: SearchOptions,
+        allows: &dyn Fn(&str) -> bool,
+    ) -> Option<Vec<SearchResult>> {
+        let engine = self
+            .search_engines
+            .read()
+            .expect("search engine read lock poisoned")
+            .get(&self.index_key(workspace_id))
+            .cloned()?;
+        let engine = engine.read().expect("search engine read lock poisoned");
+        Some(engine.search_with_path_filter(query, options, allows))
     }
 
     /// 按符号名查定义（goto_definition）。引擎未构建时返回 None。
@@ -559,7 +668,7 @@ impl KnowledgeStore {
             .search_engines
             .read()
             .expect("knowledge store search engines read lock poisoned")
-            .get(workspace_id)
+            .get(&self.index_key(workspace_id))
             .cloned()?;
         let engine = engine.read().expect("search engine read lock poisoned");
         Some(engine.find_symbol_definitions(name, max_results))
@@ -575,7 +684,7 @@ impl KnowledgeStore {
             .search_engines
             .read()
             .expect("knowledge store search engines read lock poisoned")
-            .get(workspace_id)
+            .get(&self.index_key(workspace_id))
             .cloned()?;
         let engine = engine.read().expect("search engine read lock poisoned");
         Some(engine.list_file_symbols(file_path))
@@ -586,7 +695,7 @@ impl KnowledgeStore {
         self.search_engines
             .read()
             .expect("knowledge store search engines read lock poisoned")
-            .get(workspace_id)
+            .get(&self.index_key(workspace_id))
             .map(|engine| {
                 let engine = engine.read().expect("search engine read lock poisoned");
                 engine.is_ready() && engine.get_stats().total_documents > 0
@@ -605,6 +714,20 @@ impl KnowledgeStore {
         workspace_root: &Path,
         timeout: Duration,
     ) -> WorkspaceIndexEnsureResult {
+        let root =
+            std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+        let root_changed = self
+            .workspace_roots
+            .read()
+            .expect("code index roots lock poisoned")
+            .get(&self.index_key(workspace_id))
+            .is_some_and(|previous| previous != &root);
+        if root_changed
+            || !self.scope_matches_root(&root)
+            || code_scanner::workspace_root_scan_failure(&root).is_some()
+        {
+            self.delete_code_index_for_workspace(workspace_id);
+        }
         if self.workspace_index_available(workspace_id) {
             return WorkspaceIndexEnsureResult::Ready;
         }
@@ -646,7 +769,7 @@ impl KnowledgeStore {
         self.search_engines
             .read()
             .expect("knowledge store search engines read lock poisoned")
-            .get(workspace_id)
+            .get(&self.index_key(workspace_id))
             .map(|engine| {
                 engine
                     .read()
@@ -661,7 +784,7 @@ impl KnowledgeStore {
             .search_engines
             .read()
             .expect("knowledge store search engines read lock poisoned")
-            .get(workspace_id)
+            .get(&self.index_key(workspace_id))
             .cloned()?;
         let engine = engine.read().expect("search engine read lock poisoned");
         Some(engine.get_stats())
@@ -675,7 +798,7 @@ impl KnowledgeStore {
             .search_engines
             .read()
             .expect("knowledge store search engines read lock poisoned")
-            .get(workspace_id)
+            .get(&self.index_key(workspace_id))
             .cloned()?;
         let engine = engine.read().expect("search engine read lock poisoned");
         Some(engine.code_index_health())
@@ -690,7 +813,7 @@ impl KnowledgeStore {
             .search_engines
             .read()
             .expect("knowledge store search engines read lock poisoned")
-            .get(workspace_id)
+            .get(&self.index_key(workspace_id))
             .cloned()?;
         let code = engine
             .read()
@@ -711,15 +834,52 @@ impl KnowledgeStore {
             .expect("knowledge store read lock poisoned")
             .relations()
             .into_iter()
-            .filter(|relation| relation.workspace_id == *workspace_id)
+            .filter(|relation| {
+                relation.workspace_id == *workspace_id
+                    && relation.code_scope == self.code_index_scope
+            })
             .collect();
-        Some(graph_query::build_workspace_graph(
+        let mut scoped_query = query.clone();
+        if let Some(scope) = &self.code_index_scope {
+            let prefix = scope.graph_prefix();
+            scoped_query.focus = scoped_query
+                .focus
+                .map(|focus| focus.strip_prefix(&prefix).unwrap_or(&focus).to_string());
+        }
+        let mut graph = graph_query::build_workspace_graph(
             workspace_id,
             code,
             knowledge,
             relations,
-            query,
-        ))
+            &scoped_query,
+        );
+        if let Some(scope) = &self.code_index_scope {
+            let prefix = scope.graph_prefix();
+            let qualify = |id: &str| {
+                if id.starts_with("file:") || id.starts_with("symbol:") {
+                    format!("{prefix}{id}")
+                } else {
+                    id.to_string()
+                }
+            };
+            for node in &mut graph.nodes {
+                if matches!(node.kind, GraphNodeKind::File | GraphNodeKind::Symbol) {
+                    node.id = qualify(&node.id);
+                    node.metadata
+                        .insert("sourceFolderId".into(), scope.source_folder_id.clone());
+                    node.metadata
+                        .insert("executionRootRef".into(), scope.execution_root_ref.clone());
+                }
+            }
+            for edge in &mut graph.edges {
+                if edge.origin == GraphEdgeOrigin::DeterministicCode {
+                    edge.id = format!("{prefix}{}", edge.id);
+                }
+                edge.source = qualify(&edge.source);
+                edge.target = qualify(&edge.target);
+            }
+        }
+        Some(graph)
     }
 
     /// 基于已完成的代码索引刷新知识到代码的自动候选关系。
@@ -740,7 +900,7 @@ impl KnowledgeStore {
             .search_engines
             .read()
             .expect("knowledge store search engines read lock poisoned")
-            .get(workspace_id)
+            .get(&self.index_key(workspace_id))
             .cloned()
         else {
             return 0;
@@ -761,7 +921,22 @@ impl KnowledgeStore {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let candidates = infer_relation_candidates(workspace_id, &code, &records);
+        let candidates = infer_relation_candidates(workspace_id, &code, &records)
+            .into_iter()
+            .map(|mut candidate| {
+                candidate.code_scope = self.code_index_scope.clone();
+                if let Some(scope) = &self.code_index_scope {
+                    let key = format!(
+                        "{}|scope:{}",
+                        candidate.discovery_key.as_deref().unwrap_or_default(),
+                        serde_json::to_string(scope).expect("code scope serialization")
+                    );
+                    candidate.relation_id = format!("inferred-{:016x}", stable_relation_hash(&key));
+                    candidate.discovery_key = Some(key);
+                }
+                candidate
+            })
+            .collect::<Vec<_>>();
         let mut state = self
             .state
             .write()
@@ -778,7 +953,10 @@ impl KnowledgeStore {
         let existing_by_key = state
             .relations
             .values()
-            .filter(|relation| relation.workspace_id == *workspace_id)
+            .filter(|relation| {
+                relation.workspace_id == *workspace_id
+                    && relation.code_scope == self.code_index_scope
+            })
             .filter_map(|relation| {
                 relation_discovery_key(relation).map(|key| (key, relation.relation_id.clone()))
             })
@@ -788,6 +966,7 @@ impl KnowledgeStore {
             .values()
             .filter(|relation| {
                 relation.workspace_id == *workspace_id
+                    && relation.code_scope == self.code_index_scope
                     && relation.origin != GraphEdgeOrigin::Inferred
             })
             .map(|relation| {
@@ -803,6 +982,7 @@ impl KnowledgeStore {
             .values()
             .filter(|relation| {
                 relation.workspace_id == *workspace_id
+                    && relation.code_scope == self.code_index_scope
                     && relation.origin == GraphEdgeOrigin::Inferred
                     && relation.status == GraphEdgeStatus::Candidate
                     && relation.reviewed_at.is_none()
@@ -874,12 +1054,13 @@ impl KnowledgeStore {
         workspace_root: &Path,
         summary: &code_scanner::CodeIndexSummary,
     ) -> bool {
-        let Some(ingestion) =
+        let Some(mut ingestion) =
             code_scanner::code_index_ingestion_for_summary(workspace_root, summary)
         else {
             return false;
         };
-        let code_index_id = workspace_project_code_index_id(workspace_id);
+        ingestion.source.code_scope = self.code_index_scope.clone();
+        let code_index_id = self.project_code_index_id(workspace_id);
         let next_record = KnowledgeRecord {
             knowledge_id: code_index_id.clone(),
             kind: KnowledgeKind::CodeIndex,
@@ -914,7 +1095,7 @@ impl KnowledgeStore {
             .workspace_roots
             .read()
             .ok()
-            .and_then(|roots| roots.get(workspace_id).cloned())
+            .and_then(|roots| roots.get(&self.index_key(workspace_id)).cloned())
         else {
             return false;
         };
@@ -944,16 +1125,36 @@ impl KnowledgeStore {
             .expect("knowledge store read lock poisoned")
             .relations()
             .into_iter()
-            .filter(|relation| relation.workspace_id == *workspace_id)
+            .filter(|relation| {
+                relation.workspace_id == *workspace_id
+                    && relation.code_scope == self.code_index_scope
+            })
             .collect()
     }
 
     pub fn upsert_relation(&self, relation: KnowledgeRelation) -> Result<(), DomainError> {
+        if relation.code_scope != self.code_index_scope {
+            return Err(DomainError::Validation {
+                message: "关系与当前代码索引目录不匹配".into(),
+            });
+        }
         let relation = normalize_relation(relation)?;
         let mut state = self
             .state
             .write()
             .expect("knowledge store write lock poisoned");
+        if state
+            .relations
+            .get(&relation.relation_id)
+            .is_some_and(|existing| {
+                existing.workspace_id != relation.workspace_id
+                    || existing.code_scope != relation.code_scope
+            })
+        {
+            return Err(DomainError::InvalidState {
+                message: "关系身份已属于其它项目或源目录".into(),
+            });
+        }
         validate_relation(&state, &relation)?;
         state.upsert_relation(relation);
         drop(state);
@@ -966,7 +1167,7 @@ impl KnowledgeStore {
         relation: KnowledgeRelation,
         workspace_id: &WorkspaceId,
     ) -> Result<(), DomainError> {
-        if relation.workspace_id != *workspace_id {
+        if relation.workspace_id != *workspace_id || relation.code_scope != self.code_index_scope {
             return Err(DomainError::InvalidState {
                 message: format!(
                     "关系 {} 不属于 workspace {}",
@@ -988,7 +1189,10 @@ impl KnowledgeStore {
             .expect("knowledge store read lock poisoned")
             .relations
             .get(relation_id)
-            .filter(|relation| relation.workspace_id == *workspace_id)
+            .filter(|relation| {
+                relation.workspace_id == *workspace_id
+                    && relation.code_scope == self.code_index_scope
+            })
             .cloned()
     }
 
@@ -1004,7 +1208,7 @@ impl KnowledgeStore {
         let Some(relation) = state.relations.get(relation_id) else {
             return Err(DomainError::NotFound { entity: "relation" });
         };
-        if relation.workspace_id != *workspace_id {
+        if relation.workspace_id != *workspace_id || relation.code_scope != self.code_index_scope {
             return Err(DomainError::InvalidState {
                 message: format!(
                     "关系 {relation_id} 不属于 workspace {}",
@@ -1038,10 +1242,11 @@ impl KnowledgeStore {
         workspace_id: Option<WorkspaceId>,
     ) {
         let mut normalized = normalize_code_index_ingestion(ingestion);
+        normalized.source.code_scope = self.code_index_scope.clone();
         if let Some(workspace_id) = workspace_id.as_ref()
             && normalized.knowledge_id == PROJECT_CODE_INDEX_ID
         {
-            normalized.knowledge_id = workspace_project_code_index_id(workspace_id);
+            normalized.knowledge_id = self.project_code_index_id(workspace_id);
         }
         let record = KnowledgeRecord {
             knowledge_id: normalized.knowledge_id,
@@ -1120,15 +1325,7 @@ impl KnowledgeStore {
             .state
             .read()
             .expect("knowledge store read lock poisoned");
-        KnowledgeQueryService::execute(
-            &state.entries,
-            &state.index_terms,
-            &state.term_postings,
-            &state.code_sources,
-            &state.audit_links,
-            &state.governance_links,
-            query,
-        )
+        KnowledgeQueryService::execute(&state, query, self.code_index_scope.as_ref())
     }
 
     pub fn governed_output(&self, query: &KnowledgeQuery) -> Vec<GovernedKnowledgeOutput> {
@@ -1140,15 +1337,8 @@ impl KnowledgeStore {
             .state
             .read()
             .expect("knowledge store read lock poisoned");
-        let query_result = KnowledgeQueryService::execute(
-            &state.entries,
-            &state.index_terms,
-            &state.term_postings,
-            &state.code_sources,
-            &state.audit_links,
-            &state.governance_links,
-            query,
-        );
+        let query_result =
+            KnowledgeQueryService::execute(&state, query, self.code_index_scope.as_ref());
         let total_matches = query_result.total_matches;
         let truncated = query_result.truncated;
         let results = GovernedKnowledgeService::project(
@@ -1183,6 +1373,11 @@ impl KnowledgeStore {
             .filter(|record| {
                 record.kind == KnowledgeKind::CodeIndex
                     && record.workspace_id.as_ref() == Some(workspace_id)
+                    && state
+                        .code_sources
+                        .get(&record.knowledge_id)
+                        .and_then(|source| source.code_scope.as_ref())
+                        == self.code_index_scope.as_ref()
             })
             .filter_map(|record| {
                 serde_json::from_str::<crate::code_scanner::CodeIndexSummary>(&record.content)
@@ -1201,7 +1396,7 @@ impl KnowledgeStore {
             .search_engines
             .read()
             .expect("knowledge store search engines read lock poisoned")
-            .get(workspace_id)
+            .get(&self.index_key(workspace_id))
             .cloned()?;
         let mut engine = engine.write().expect("search engine write lock poisoned");
         engine.is_ready().then(|| engine.code_index_summary())
@@ -1243,13 +1438,13 @@ impl KnowledgeStore {
 
     pub fn delete_code_index_for_workspace(&self, workspace_id: &WorkspaceId) {
         let changed = self
-            .delete(&workspace_project_code_index_id(workspace_id))
+            .delete(&self.project_code_index_id(workspace_id))
             .is_ok();
         self.clear_workspace_index_runtime(workspace_id);
         self.index_outcomes
             .write()
             .expect("knowledge store index outcomes write lock poisoned")
-            .remove(workspace_id);
+            .remove(&self.index_key(workspace_id));
         if changed {
             self.notify_index_persistence();
         }
@@ -1306,19 +1501,32 @@ impl KnowledgeStore {
         for knowledge_id in knowledge_ids {
             let _ = self.delete(&knowledge_id);
         }
-        self.clear_workspace_index_runtime(workspace_id);
-        if let Some(cancelled) = self
+        self.search_engines
+            .write()
+            .expect("code index engines lock poisoned")
+            .retain(|(id, _), _| id != workspace_id);
+        self.watchers
+            .write()
+            .expect("code index watchers lock poisoned")
+            .retain(|(id, _), _| id != workspace_id);
+        self.workspace_roots
+            .write()
+            .expect("code index roots lock poisoned")
+            .retain(|(id, _), _| id != workspace_id);
+        for ((id, _), cancelled) in self
             .index_builds
             .lock()
-            .expect("knowledge store index builds lock poisoned")
-            .get_mut(workspace_id)
+            .expect("code index builds lock poisoned")
+            .iter_mut()
         {
-            *cancelled = true;
+            if id == workspace_id {
+                *cancelled = true;
+            }
         }
         self.index_outcomes
             .write()
             .expect("knowledge store index outcomes write lock poisoned")
-            .remove(workspace_id);
+            .retain(|(id, _), _| id != workspace_id);
     }
 }
 
@@ -1511,6 +1719,7 @@ fn code_graph_contains_target(code: &graph::CodeGraphSnapshot, target: &GraphNod
 
 fn relation_payload_equal(left: &KnowledgeRelation, right: &KnowledgeRelation) -> bool {
     left.workspace_id == right.workspace_id
+        && left.code_scope == right.code_scope
         && left.source == right.source
         && left.kind == right.kind
         && left.target == right.target
@@ -1647,6 +1856,7 @@ fn build_inferred_relation(
     let discovery_evidence = evidence.clone();
     let now = UtcMillis::now();
     KnowledgeRelation {
+        code_scope: None,
         relation_id,
         workspace_id: workspace_id.clone(),
         source: GraphNodeRef::Knowledge {

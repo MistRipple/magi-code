@@ -131,6 +131,8 @@ impl GraphNodeRef {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeRelation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_scope: Option<crate::CodeIndexScope>,
     pub relation_id: String,
     pub workspace_id: WorkspaceId,
     pub source: GraphNodeRef,

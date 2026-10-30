@@ -7,12 +7,11 @@ use axum::{
     routing::get,
 };
 use magi_browser_authority::{PREVIEW_OPEN_PATH, PREVIEW_PATH_PREFIX};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Component, Path};
 
 use super::changes_files_tunnel::resolve_file_access_scope;
 use crate::{change_projection::safe_workspace_path, errors::ApiError, state::ApiState};
-use magi_core::SessionId;
 
 const SITE_CSP: &str = "default-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self'; form-action 'self'";
 
@@ -39,6 +38,17 @@ struct SiteOpenQuery {
     workspace_id: Option<String>,
     workspace_path: Option<String>,
     file_path: Option<String>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SitePreviewScope {
+    session_id: Option<String>,
+    workspace_id: Option<String>,
+    source_folder_id: Option<String>,
+    execution_root_ref: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +75,7 @@ async fn open_site_preview(
         query.workspace_id.as_deref(),
         query.workspace_path.as_deref(),
         None,
+        query.source_folder_id.as_deref(),
     )?;
     let (absolute_path, relative_path) = safe_workspace_path(&scope.root, requested_path)?;
     if !absolute_path.is_file()
@@ -76,16 +87,21 @@ async fn open_site_preview(
     }
     ensure_public_site_asset(&relative_path, &absolute_path)?;
 
-    // token 绑定来源会话或显式项目，资源请求重新解析 daemon 事实；不保存第二份目录映射。
-    let scope_key = match scope.binding["sessionId"].as_str() {
-        Some(id) => format!("session:{id}"),
-        None => format!(
-            "workspace:{}",
-            scope.binding["workspaceId"]
+    // 凭据签名覆盖项目、源目录和实际副本，资源请求仍重新解析 daemon 成员与映射。
+    let scope_key = format!(
+        "v2:{}",
+        serde_json::to_string(&SitePreviewScope {
+            session_id: scope.binding["sessionId"].as_str().map(str::to_string),
+            workspace_id: scope.binding["workspaceId"].as_str().map(str::to_string),
+            source_folder_id: scope.binding["sourceFolderId"].as_str().map(str::to_string),
+            execution_root_ref: magi_core::HostPath::canonicalize(&scope.root)
+                .map_err(|error| ApiError::internal_assembly("规范化预览目录失败", error))?
+                .to_path_ref()
                 .as_str()
-                .expect("workspace scope")
-        ),
-    };
+                .into(),
+        })
+        .expect("preview scope serializes")
+    );
     let preview_token = state.tunnel_manager.site_preview_token(&scope_key).await;
     let path = format!(
         "/api/files/site/{}/{}/{}",
@@ -146,14 +162,26 @@ fn load_site_asset(
     scope_key: &str,
     requested_path: &str,
 ) -> Result<(&'static str, Vec<u8>), ApiError> {
-    let scope = if let Some(id) = scope_key.strip_prefix("session:") {
-        let session = state
-            .session_store
-            .session(&SessionId::new(id))
-            .ok_or_else(|| ApiError::session_not_found(id))?;
-        resolve_file_access_scope(state, Some(id), session.workspace_id.as_deref(), None, None)?
-    } else if let Some(id) = scope_key.strip_prefix("workspace:") {
-        resolve_file_access_scope(state, None, Some(id), None, None)?
+    let scope = if let Some(json) = scope_key.strip_prefix("v2:") {
+        let original: SitePreviewScope = serde_json::from_str(json)
+            .map_err(|_| ApiError::InvalidInput("网页预览作用域无效".into()))?;
+        let current = resolve_file_access_scope(
+            state,
+            original.session_id.as_deref(),
+            original.workspace_id.as_deref(),
+            None,
+            None,
+            original.source_folder_id.as_deref(),
+        )?;
+        let current_ref = magi_core::HostPath::canonicalize(&current.root)
+            .map_err(|_| ApiError::Conflict("原网页预览目录已不可用".into()))?
+            .to_path_ref();
+        if current_ref.as_str() != original.execution_root_ref {
+            return Err(ApiError::Conflict(
+                "原网页预览的执行目录已变化，请重新打开".into(),
+            ));
+        }
+        current
     } else {
         return Err(ApiError::InvalidInput("网页预览作用域无效".into()));
     };
@@ -259,7 +287,7 @@ mod tests {
         body::{Body, to_bytes},
         http::Request,
     };
-    use magi_core::{AbsolutePath, WorkspaceId};
+    use magi_core::{AbsolutePath, SessionId, WorkspaceId};
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_session_store::SessionStore;
@@ -286,6 +314,130 @@ mod tests {
         state
     }
 
+    async fn preview_location(state: &ApiState, query: &str) -> String {
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/files/site-open?{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .trim_start_matches("/api")
+            .into()
+    }
+
+    #[tokio::test]
+    async fn project_preview_binds_source_and_execution_copy_and_rechecks_revocation() {
+        use super::super::test_project_fixtures::{add_source, set_members};
+        let root = tempdir().unwrap();
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        let copy = root.path().join("copy");
+        for (path, content) in [(&a, "A"), (&b, "B"), (&copy, "copy")] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("index.html"), content).unwrap();
+            fs::write(path.join("app.js"), content).unwrap();
+        }
+        let state = test_state(&a, "site-project");
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("site-session"),
+                "site",
+                Some("site-project".into()),
+            )
+            .unwrap();
+        let first = add_source(&state, "site-project", "second", &b).primary_source_folder_id;
+        let query = format!(
+            "sessionId=site-session&workspaceId=site-project&sourceFolderId={first}&filePath=index.html"
+        );
+        let location = preview_location(&state, &query).await;
+        let app = routes().with_state(state.clone());
+        let request = |uri: String| Request::builder().uri(uri).body(Body::empty()).unwrap();
+        set_members(&state, "site-project", &[&first, "second"], "second");
+        let response = app
+            .clone()
+            .oneshot(request(location.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            "A"
+        );
+        let response = app
+            .clone()
+            .oneshot(request(location.replace(&first, "second")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(b.join("app.js"), a.join("escape.js")).unwrap();
+            let response = app
+                .clone()
+                .oneshot(request(location.replace("index.html", "escape.js")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        state
+            .session_isolations
+            .insert(magi_session_isolation::SessionIsolation {
+                session_id: "site-session".into(),
+                workspace_id: "site-project".into(),
+                source_root: magi_core::HostPath::canonicalize(&a)
+                    .unwrap()
+                    .into_path_buf(),
+                root: magi_core::HostPath::canonicalize(&copy)
+                    .unwrap()
+                    .into_path_buf(),
+                origin: magi_session_isolation::IsolationOrigin::Manual,
+                strategy: magi_session_isolation::CloneStrategy::Copy,
+                linked_dirs: Vec::new(),
+                git_available: false,
+                created_at_ms: 0,
+            });
+        let response = app
+            .clone()
+            .oneshot(request(location.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "原根凭据不能转入新副本"
+        );
+        let copy_location = preview_location(&state, &query).await;
+        let response = app
+            .clone()
+            .oneshot(request(copy_location.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            "copy"
+        );
+        state.session_isolations.remove("site-session");
+        let response = app.clone().oneshot(request(copy_location)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        set_members(&state, "site-project", &["second"], "second");
+        let response = app.oneshot(request(location)).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "撤销旧目录后不回落第二目录"
+        );
+    }
+
     #[tokio::test]
     async fn site_preview_serves_html_and_relative_assets_with_mime_headers() {
         let root = tempdir().expect("tempdir should create");
@@ -303,10 +455,11 @@ mod tests {
         )
         .expect("js should write");
         let state = test_state(root.path(), "workspace-site");
-        let token = state
-            .tunnel_manager
-            .site_preview_token("workspace:workspace-site")
-            .await;
+        let location = preview_location(
+            &state,
+            "workspaceId=workspace-site&filePath=site/index.html",
+        )
+        .await;
         let app = routes().with_state(state);
 
         for (path, expected_mime) in [
@@ -318,9 +471,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(format!(
-                            "/files/site/{token}/workspace%3Aworkspace-site/{path}"
-                        ))
+                        .uri(location.replace("site/index.html", path))
                         .body(Body::empty())
                         .expect("request should build"),
                 )
@@ -350,23 +501,17 @@ mod tests {
         fs::write(root.path().join("index.html"), "ok").expect("html should write");
         fs::write(root.path().join("secret.rs"), "secret").expect("source should write");
         let state = test_state(root.path(), "workspace-site");
-        let wrong_token = state
-            .tunnel_manager
-            .site_preview_token("workspace:workspace-other")
-            .await;
-        let valid_token = state
-            .tunnel_manager
-            .site_preview_token("workspace:workspace-site")
-            .await;
+        let location =
+            preview_location(&state, "workspaceId=workspace-site&filePath=index.html").await;
+        let mut wrong_parts = location.split('/').map(str::to_string).collect::<Vec<_>>();
+        wrong_parts[3].push_str("-invalid");
         let app = routes().with_state(state);
 
         let unauthorized = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!(
-                        "/files/site/{wrong_token}/workspace%3Aworkspace-site/index.html"
-                    ))
+                    .uri(wrong_parts.join("/"))
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -377,9 +522,7 @@ mod tests {
         let rejected = app
             .oneshot(
                 Request::builder()
-                    .uri(format!(
-                        "/files/site/{valid_token}/workspace%3Aworkspace-site/secret.rs"
-                    ))
+                    .uri(location.replace("index.html", "secret.rs"))
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -415,7 +558,8 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .expect("redirect should include location");
         assert!(location.starts_with("/api/files/site/"));
-        assert!(location.ends_with("/workspace%3Aworkspace-site/index.html"));
+        assert!(location.contains("/v2%3A"));
+        assert!(location.ends_with("/index.html"));
         assert!(!location.contains("transport-secret"));
     }
 
@@ -461,7 +605,7 @@ mod tests {
             .unwrap()
             .trim_start_matches("/api")
             .to_string();
-        assert!(location.contains("session%3Asite-a"));
+        assert!(location.contains("site-a"));
         for (uri, expected) in [
             (location.clone(), StatusCode::OK),
             (location.replace("index.html", "app.js"), StatusCode::OK),
@@ -544,6 +688,7 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .expect("redirect should include location");
         assert!(location.starts_with("http://site.localhost:38123/api/files/site/"));
-        assert!(location.ends_with("/workspace%3Aworkspace-site/index.html"));
+        assert!(location.contains("/v2%3A"));
+        assert!(location.ends_with("/index.html"));
     }
 }

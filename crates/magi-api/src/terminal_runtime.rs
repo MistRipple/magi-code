@@ -15,6 +15,7 @@ pub(crate) struct TerminalBinding {
     pub terminal_tab_id: String,
     /// 终端继承会话作用域。个人会话在 Magi 私有执行目录中启动，不伪造项目根目录。
     pub workspace_id: Option<String>,
+    pub source_folder_id: Option<String>,
     pub execution_root: PathBuf,
     pub session_id: String,
 }
@@ -365,6 +366,16 @@ impl TerminalSessionManager {
         count
     }
 
+    pub(crate) fn has_running_for_session(&self, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .expect("terminal sessions lock poisoned")
+            .values()
+            .any(|terminal| {
+                terminal.binding().session_id == session_id && terminal.shared.is_running()
+            })
+    }
+
     #[cfg(test)]
     fn active_count(&self) -> usize {
         self.sessions
@@ -382,6 +393,7 @@ mod tests {
 
     fn binding(root: &std::path::Path) -> TerminalBinding {
         TerminalBinding {
+            source_folder_id: None,
             terminal_tab_id: "terminal-test".to_string(),
             workspace_id: Some("workspace-test".to_string()),
             execution_root: root.to_path_buf(),

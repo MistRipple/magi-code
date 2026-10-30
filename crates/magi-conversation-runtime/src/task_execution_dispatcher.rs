@@ -95,7 +95,9 @@ pub type WorkspaceExecutionPreparer = dyn Fn(
         &SessionId,
         &Option<WorkspaceId>,
         &str,
-    ) -> Result<Option<Arc<magi_snapshot::SnapshotSession>>, String>
+        Option<&magi_core::ProjectDirectoryBinding>,
+        crate::workspace_execution::WorkspacePreparationMode,
+    ) -> Result<crate::workspace_execution::WorkspaceExecutionResources, String>
     + Send
     + Sync;
 
@@ -516,11 +518,14 @@ impl Drop for AgentWorktreeCleanup {
                 "代理 worktree 清理发生 panic，至少标记该执行代际为 inactive"
             );
             if let Some(registry) = self.dispatcher.session_code_contexts.as_ref() {
-                let _ = registry.release_agent_worktree_for_lease(
-                    self.session_id.as_str(),
-                    self.task.task_id.as_str(),
-                    self.lease_id.as_str(),
-                );
+                for context in registry.for_session(self.session_id.as_str()) {
+                    let _ = registry.release_agent_worktree_for_lease_for_root(
+                        self.session_id.as_str(),
+                        &context.execution_root,
+                        self.task.task_id.as_str(),
+                        self.lease_id.as_str(),
+                    );
+                }
             }
         }
     }
@@ -807,7 +812,7 @@ impl LlmTaskDispatcher {
                     ..
                 } => execution_root,
             })
-            .or_else(|| self.resolve_workspace_root_path(session_id, workspace_id));
+            .or_else(|| self.resolve_task_source_root(&task, session_id, workspace_id));
         self.prepare_task_workspace_execution(
             &task,
             &lease.lease_id,
@@ -822,16 +827,17 @@ impl LlmTaskDispatcher {
 
     fn prepare_workspace_execution(
         &self,
-        task_id: &TaskId,
+        task: &magi_core::Task,
         session_id: &SessionId,
         workspace_id: &Option<WorkspaceId>,
-    ) -> Result<Option<Arc<magi_snapshot::SnapshotSession>>, String> {
+        mode: crate::workspace_execution::WorkspacePreparationMode,
+    ) -> Result<crate::workspace_execution::WorkspaceExecutionResources, String> {
         let Some(prepare) = self.workspace_execution_preparer.as_ref() else {
-            return Ok(None);
+            return Ok(Default::default());
         };
         let turn_id = self
             .execution_registry
-            .turn_id(task_id)
+            .turn_id(&task.task_id)
             .ok_or_else(|| "准备执行资源时缺少 Turn 身份".to_string())?;
         let mut source = turn_id;
         let mut seen = std::collections::HashSet::new();
@@ -845,7 +851,15 @@ impl LlmTaskDispatcher {
             }
             source = binding.parent_turn_id;
         }
-        prepare(session_id, workspace_id, &source)
+        prepare(
+            session_id,
+            workspace_id,
+            &source,
+            task.executor_binding
+                .as_ref()
+                .and_then(|binding| binding.project_directories.as_ref()),
+            mode,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -871,15 +885,27 @@ impl LlmTaskDispatcher {
         if !execution_is_active() {
             return Err("准备执行资源前任务租约已失效".into());
         }
+        if let Some(binding) = task
+            .executor_binding
+            .as_ref()
+            .and_then(|executor| executor.project_directories.as_ref())
+        {
+            if workspace_id.as_ref() != Some(&binding.workspace_id) {
+                return Err("Task 项目目录绑定与执行归属不匹配".into());
+            }
+            if let Some(registry) = self.workspace_registry.as_ref() {
+                registry
+                    .validate_directory_binding(binding)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
         // 仓库准备可能等另一个任务释放资源，不能同时占住它继续执行所需的模型名额。
         let waiting = self
             .execution_registry
             .execution_admission()
             .suspend_while_waiting(&task.task_id);
         let prepared = (|| -> Result<conversation_loop::PreparedWorkspaceExecution, String> {
-            let identity_root = workspace_id
-                .as_ref()
-                .and_then(|_| self.resolve_workspace_root_path(session_id, workspace_id));
+            let identity_root = self.resolve_task_source_root(task, session_id, workspace_id);
             let transferred = self
                 .pipeline
                 .execution_runtime
@@ -887,36 +913,106 @@ impl LlmTaskDispatcher {
                 .agent_run_transfer_for_task(&task.task_id)
                 .map_err(|error| error.to_string())?
                 .is_some();
-            let snapshot = if transferred {
+            let mut resources = if transferred {
                 // 转交根的独立副本已在交接前准备；嵌套任务从直接父副本出发。
                 // 主线可能已结束或换到下一轮，不能再准备/改动它的工作区状态。
-                None
+                self.prepare_workspace_execution(
+                    task,
+                    session_id,
+                    workspace_id,
+                    crate::workspace_execution::WorkspacePreparationMode::Mapping,
+                )?
             } else {
-                self.prepare_workspace_execution(&task.task_id, session_id, workspace_id)?
+                self.prepare_workspace_execution(
+                    task,
+                    session_id,
+                    workspace_id,
+                    crate::workspace_execution::WorkspacePreparationMode::Execution,
+                )?
             };
-            let main_root = snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.workspace_root().to_path_buf());
+            let main_root = resources.default_root()?;
             if !execution_is_active() {
                 return Err("准备执行资源期间任务或父 Turn 已停止".into());
             }
-            let root = self.resolve_task_execution_root(
-                task,
-                lease_id,
-                session_id,
-                workspace_id,
-                main_root.as_ref().or(execution_root),
-                is_sidechain,
-                worker_id,
-            )?;
+            let root = if let Some(binding) = task
+                .executor_binding
+                .as_ref()
+                .and_then(|executor| executor.project_directories.as_ref())
+            {
+                let original = resources
+                    .directories
+                    .as_ref()
+                    .ok_or("项目资源准备缺少完整目录映射")?;
+                original
+                    .validate_for_binding(binding)
+                    .map_err(|error| error.to_string())?;
+                let projected =
+                    magi_core::ProjectDirectoryExecutionMap::from_binding(binding, |grant| {
+                        let parent_root = original
+                            .root(Some(&grant.source_folder_id))?
+                            .execution_root()?;
+                        self.resolve_task_execution_root(
+                            task,
+                            lease_id,
+                            session_id,
+                            workspace_id,
+                            Some(&parent_root),
+                            is_sidechain,
+                            worker_id,
+                        )
+                        .map_err(|message| magi_core::DomainError::Validation { message })?
+                        .ok_or_else(|| magi_core::DomainError::Validation {
+                            message: "项目目录缺少实际执行根".into(),
+                        })
+                        .and_then(|root| {
+                            std::fs::canonicalize(root).map_err(|error| {
+                                magi_core::DomainError::Validation {
+                                    message: format!("执行目录不可用: {error}"),
+                                }
+                            })
+                        })
+                    })
+                    .map_err(|error| error.to_string())?;
+                let root = projected
+                    .root(None)
+                    .and_then(|root| root.execution_root())
+                    .map_err(|error| error.to_string())?;
+                resources.snapshots.retain(|snapshot| {
+                    projected.roots.iter().any(|root| {
+                        root.execution_root().is_ok_and(|root| {
+                            std::fs::canonicalize(snapshot.workspace_root())
+                                .is_ok_and(|snapshot| root == snapshot)
+                        })
+                    })
+                });
+                resources.directories = Some(projected);
+                Some(root)
+            } else {
+                let root = self.resolve_task_execution_root(
+                    task,
+                    lease_id,
+                    session_id,
+                    workspace_id,
+                    main_root.as_ref().or(execution_root),
+                    is_sidechain,
+                    worker_id,
+                )?;
+                resources
+                    .snapshots
+                    .retain(|snapshot| root.as_deref() == Some(snapshot.workspace_root()));
+                root
+            };
             if !execution_is_active() {
                 return Err("准备执行资源期间任务租约已失效".into());
             }
             Ok(conversation_loop::PreparedWorkspaceExecution {
-                task: Self::task_for_execution_root(task, identity_root.as_ref(), root.as_ref()),
+                task: if resources.directories.is_some() {
+                    task.clone()
+                } else {
+                    Self::task_for_execution_root(task, identity_root.as_ref(), root.as_ref())
+                },
                 // Git 子代理的变更属于代理分支；不能让其相对路径写入主会话账本。
-                snapshot: snapshot
-                    .filter(|snapshot| root.as_deref() == Some(snapshot.workspace_root())),
+                resources,
                 root,
             })
         })();
@@ -1068,6 +1164,12 @@ impl LlmTaskDispatcher {
     }
 
     pub fn with_workspace_registry(mut self, registry: Arc<WorkspaceStore>) -> Self {
+        let mut runtime = self.execution_registry.agent_spawn_preflight_runtime();
+        runtime.workspace_registry = Some(registry.clone());
+        self.execution_registry = self
+            .execution_registry
+            .clone()
+            .with_agent_spawn_preflight_runtime(runtime);
         self.workspace_registry = Some(registry);
         self
     }
@@ -1884,25 +1986,54 @@ fn builtin_tool_visible_in_access_profile(
 }
 
 impl LlmTaskDispatcher {
+    fn resolve_task_source_root(
+        &self,
+        task: &magi_core::Task,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+    ) -> Option<PathBuf> {
+        if let Some(binding) = task
+            .executor_binding
+            .as_ref()
+            .and_then(|executor| executor.project_directories.as_ref())
+        {
+            return binding
+                .grant(None)
+                .ok()
+                .and_then(|grant| magi_core::HostPath::from_path_ref(&grant.source_path_ref).ok())
+                .map(magi_core::HostPath::into_path_buf);
+        }
+        workspace_id
+            .as_ref()
+            .and_then(|_| self.resolve_workspace_root_path(session_id, workspace_id))
+    }
+
     fn resolve_workspace_root_path(
         &self,
         session_id: &SessionId,
         workspace_id: &Option<WorkspaceId>,
     ) -> Option<PathBuf> {
-        if let Some(context) = self
-            .session_code_contexts
-            .as_ref()
-            .and_then(|registry| registry.get(session_id.as_str()))
+        let source_root = workspace_id.as_ref().and_then(|workspace_id| {
+            self.workspace_registry
+                .as_ref()?
+                .resolve_source_folder(workspace_id, None)
+                .ok()
+                .map(|(_, root)| root)
+        });
+        if workspace_id.is_some() && self.workspace_registry.is_some() && source_root.is_none() {
+            return None;
+        }
+        if let Some(context) =
+            self.session_code_contexts
+                .as_ref()
+                .and_then(|registry| match source_root.as_deref() {
+                    Some(root) => registry.get_for_path(session_id.as_str(), root),
+                    None => registry.get(session_id.as_str()),
+                })
         {
             return Some(context.execution_root);
         }
-        let workspace_id = workspace_id.as_ref()?;
-        self.workspace_registry
-            .as_ref()?
-            .workspaces()
-            .into_iter()
-            .find(|workspace| workspace.workspace_id == *workspace_id)
-            .map(|workspace| workspace.native_root_path())
+        source_root
     }
 
     /// 子代理永不直接复用主会话 live worktree：只读任务拿 detached worktree，
@@ -1920,7 +2051,10 @@ impl LlmTaskDispatcher {
     ) -> Result<Option<PathBuf>, String> {
         let main_root = execution_root
             .cloned()
-            .or_else(|| self.resolve_workspace_root_path(session_id, workspace_id));
+            .or_else(|| self.resolve_task_source_root(task, session_id, workspace_id));
+        if workspace_id.is_some() && main_root.is_none() {
+            return Err("项目执行缺少明确源文件夹绑定，不能选择任意仓库".into());
+        }
         if !is_sidechain {
             return Ok(main_root);
         }
@@ -1928,10 +2062,11 @@ impl LlmTaskDispatcher {
         if workspace_id.is_none() && main_root.is_some() {
             return Ok(main_root);
         }
-        let context = self
-            .session_code_contexts
-            .as_ref()
-            .and_then(|registry| registry.get(session_id.as_str()));
+        let context = self.session_code_contexts.as_ref().and_then(|registry| {
+            main_root
+                .as_deref()
+                .and_then(|root| registry.get_for_path(session_id.as_str(), root))
+        });
         if let Some(context) = context.as_ref()
             && let Some(coordinator) = self.workspace_git_coordinator.as_ref()
         {
@@ -2032,8 +2167,9 @@ impl LlmTaskDispatcher {
                 ))
                 .map_err(|error| format!("恢复代理 worktree 失败: {error}"))?;
                 registry
-                    .reattach_agent_worktree(
+                    .reattach_agent_worktree_for_root(
                         session_id.as_str(),
+                        &context.execution_root,
                         previous,
                         lease_id.as_str(),
                         worker.as_str(),
@@ -2042,8 +2178,9 @@ impl LlmTaskDispatcher {
                 if let Some(persist) = self.session_state_persist_callback.as_deref()
                     && let Err(error) = persist("agent_worktree_reattached")
                 {
-                    let _ = registry.release_agent_worktree_for_lease(
+                    let _ = registry.release_agent_worktree_for_lease_for_root(
                         session_id.as_str(),
+                        &context.execution_root,
                         task.task_id.as_str(),
                         lease_id.as_str(),
                     );
@@ -2096,10 +2233,16 @@ impl LlmTaskDispatcher {
         let session_key = sanitize_git_path_component(session_id.as_str());
         let task_key = sanitize_git_path_component(task.task_id.as_str());
         let allocation_nonce = UtcMillis::now().0;
+        use sha2::{Digest, Sha256};
+        let repository_key = magi_core::HostPath::from_path(context.execution_root.clone());
+        let repository_key = magi_core::hex_lower(Sha256::digest(
+            repository_key.to_path_ref().as_str().as_bytes(),
+        ));
         let path = self
             .agent_worktree_root
             .join(workspace_key)
             .join(session_key)
+            .join(&repository_key)
             .join(format!("{task_key}-{allocation_nonce}"));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -2115,8 +2258,12 @@ impl LlmTaskDispatcher {
         } else {
             magi_git::AgentWorktreeMode::Writable
         };
-        let branch = (mode == magi_git::AgentWorktreeMode::Writable)
-            .then(|| format!("magi/agent/{task_key}-{allocation_nonce}"));
+        let branch = (mode == magi_git::AgentWorktreeMode::Writable).then(|| {
+            format!(
+                "magi/agent/{task_key}-{}-{allocation_nonce}",
+                &repository_key[..12]
+            )
+        });
         // 首次执行时读取直接父代理当前 worktree，含其尚未提交改动；主线不共享子代理 index。
         let source = task.parent_task_id.as_ref().and_then(|id| {
             context
@@ -2169,8 +2316,9 @@ impl LlmTaskDispatcher {
         ))
         .map_err(|error| format!("创建 agent 隔离 worktree 失败: {error}"))?;
         registry
-            .register_agent_worktree(
+            .register_agent_worktree_for_root(
                 session_id.as_str(),
+                &context.execution_root,
                 magi_git::AgentWorktreeContext {
                     task_id: task.task_id.to_string(),
                     lease_id: Some(lease_id.to_string()),
@@ -2275,13 +2423,40 @@ impl LlmTaskDispatcher {
         if !is_sidechain {
             return None;
         }
-        let (Some(registry), Some(git_service)) = (
-            self.session_code_contexts.as_ref(),
-            self.git_service.as_ref(),
-        ) else {
-            return None;
-        };
-        let context = registry.get(session_id.as_str())?;
+        let registry = self.session_code_contexts.as_ref()?;
+        let contexts = registry.for_session(session_id.as_str());
+        let mut outputs = Vec::new();
+        for context in contexts {
+            if let Some(output) = self.finalize_agent_worktree_for_context(
+                task,
+                lease_id,
+                session_id,
+                workspace_id,
+                &context,
+            ) {
+                outputs.push(output);
+            }
+        }
+        match outputs.len() {
+            0 => None,
+            1 => outputs.pop(),
+            _ => Some(serde_json::json!({
+                "agent_workspaces": outputs.into_iter().map(|output| output["agent_workspace"].clone()).collect::<Vec<_>>()
+            })),
+        }
+    }
+
+    fn finalize_agent_worktree_for_context(
+        &self,
+        task: &magi_core::Task,
+        lease_id: &LeaseId,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        context: &magi_git::SessionCodeContext,
+    ) -> Option<serde_json::Value> {
+        let registry = self.session_code_contexts.as_ref()?;
+        let git_service = self.git_service.as_ref()?;
+
         let allocation = context
             .agent_worktrees
             .iter()
@@ -2295,7 +2470,13 @@ impl LlmTaskDispatcher {
         let mut workspace_output = None;
         let mut commit_error = None;
         if allocation.mode == magi_git::AgentWorktreeMode::Writable && allocation.path.exists() {
-            match self.commit_agent_worktree_output(task, lease_id, session_id, &allocation) {
+            match self.commit_agent_worktree_output(
+                task,
+                lease_id,
+                session_id,
+                &context.execution_root,
+                &allocation,
+            ) {
                 Ok(output) => workspace_output = output,
                 Err(error) => commit_error = Some(error),
             }
@@ -2320,8 +2501,9 @@ impl LlmTaskDispatcher {
                 Ok(observation) => match (|| -> Result<(), String> {
                     if allocation.mode == magi_git::AgentWorktreeMode::ReadOnly {
                         registry
-                            .record_agent_worktree_result(
+                            .record_agent_worktree_result_for_root(
                                 session_id.as_str(),
+                                &context.execution_root,
                                 task.task_id.as_str(),
                                 lease_id.as_str(),
                                 observation.head.ok_or("只读代理目录缺少 HEAD，不能清理")?,
@@ -2353,8 +2535,9 @@ impl LlmTaskDispatcher {
             }
         };
 
-        if let Err(error) = registry.release_agent_worktree_for_lease(
+        if let Err(error) = registry.release_agent_worktree_for_lease_for_root(
             session_id.as_str(),
+            &context.execution_root,
             task.task_id.as_str(),
             lease_id.as_str(),
         ) {
@@ -2422,6 +2605,7 @@ impl LlmTaskDispatcher {
         task: &magi_core::Task,
         lease_id: &LeaseId,
         session_id: &SessionId,
+        repository_root: &Path,
         allocation: &magi_git::AgentWorktreeContext,
     ) -> Result<Option<serde_json::Value>, String> {
         let (Some(registry), Some(git_service)) = (
@@ -2443,8 +2627,9 @@ impl LlmTaskDispatcher {
             block_on_git(git_service.changed_paths(&allocation.path, &allocation.base_head, &head))
                 .map_err(|error| format!("统计子代理改动失败: {error}"))?;
         registry
-            .record_agent_worktree_result(
+            .record_agent_worktree_result_for_root(
                 session_id.as_str(),
+                repository_root,
                 task.task_id.as_str(),
                 lease_id.as_str(),
                 head.clone(),
@@ -2456,6 +2641,7 @@ impl LlmTaskDispatcher {
         }
         Ok(Some(serde_json::json!({
             "agent_workspace": {
+                "repository_root": repository_root,
                 "branch": allocation.branch,
                 "base": allocation.base_head,
                 "head": head,
@@ -2596,6 +2782,28 @@ impl LlmTaskDispatcher {
         let knowledge_selection = ctx_runtime.select_knowledge_on_demand(KnowledgeContextRequest {
             consumer: KnowledgeConsumer::TaskExecution,
             workspace_id: Some(ws_id.clone()),
+            source_folder_id: task
+                .executor_binding
+                .as_ref()
+                .and_then(|binding| binding.project_directories.as_ref())
+                .map(|directories| directories.default_source_folder_id.clone()),
+            execution_root: (task.kind != TaskKind::LocalAgent)
+                .then(|| {
+                    self.prepare_workspace_execution(
+                        task,
+                        session_id,
+                        workspace_id,
+                        crate::workspace_execution::WorkspacePreparationMode::Mapping,
+                    )
+                    .ok()
+                    .and_then(|resources| resources.directories)
+                    .and_then(|map| {
+                        map.root(None)
+                            .ok()
+                            .map(|root| root.execution_root_ref.clone())
+                    })
+                })
+                .flatten(),
             query: base_prompt.clone(),
         });
         self.publish_knowledge_context_diagnostic(
@@ -2918,6 +3126,20 @@ impl LlmTaskDispatcher {
         #[cfg(test)] terminal_policy: TurnTerminalCommitPolicy,
         #[cfg(not(test))] _terminal_policy: TurnTerminalCommitPolicy,
     ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
+        if let Some(binding) = request.project_directories.as_ref()
+            && let Some(registry) = self.workspace_registry.as_ref()
+        {
+            let valid = request.workspace_id.as_ref() == Some(&binding.workspace_id);
+            if !valid || registry.validate_directory_membership(binding).is_err() {
+                return Err(SessionTurnExecutionError {
+                    reason:
+                        crate::session_turn_execution::SessionTurnFailureReason::RuntimeInvalidState,
+                    diagnostic_code: "project_directory_binding_invalid".into(),
+                    public_message: "原输入的项目源文件夹授权已失效".into(),
+                    model_failure: None,
+                });
+            }
+        }
         let plan_store =
             magi_plan::PlanStore::new(self.session_store.clone(), request.session_id.clone());
         let execution_settings_snapshot = self.execution_settings_snapshot();
@@ -3003,6 +3225,29 @@ impl LlmTaskDispatcher {
             let selection = runtime.select_knowledge_on_demand(KnowledgeContextRequest {
                 consumer: KnowledgeConsumer::Mainline,
                 workspace_id: request.workspace_id.clone(),
+                source_folder_id: request
+                    .project_directories
+                    .as_ref()
+                    .map(|binding| binding.default_source_folder_id.clone()),
+                execution_root: self
+                    .workspace_execution_preparer
+                    .as_ref()
+                    .and_then(|prepare| {
+                        prepare(
+                            &request.session_id,
+                            &request.workspace_id,
+                            &request.turn_id,
+                            request.project_directories.as_ref(),
+                            crate::workspace_execution::WorkspacePreparationMode::Mapping,
+                        )
+                        .ok()
+                    })
+                    .and_then(|resources| resources.directories)
+                    .and_then(|map| {
+                        map.root(None)
+                            .ok()
+                            .map(|root| root.execution_root_ref.clone())
+                    }),
                 query: request.prompt.clone(),
             });
             self.publish_knowledge_context_diagnostic(
@@ -3103,6 +3348,21 @@ impl LlmTaskDispatcher {
             Ok(skill_name) => skill_name,
             Err(error) => return (TaskOutcome::Failed { error }, None),
         };
+        if use_tools
+            && let Some(binding) = task
+                .executor_binding
+                .as_ref()
+                .and_then(|executor| executor.project_directories.as_ref())
+            && let Some(registry) = self.workspace_registry.as_ref()
+            && let Err(error) = registry.validate_directory_binding(binding)
+        {
+            return (
+                TaskOutcome::Failed {
+                    error: format!("项目源文件夹授权已失效，工具执行未开始：{error:?}"),
+                },
+                None,
+            );
+        }
         let (prompt, task_context_messages, context_summary) =
             self.assemble_prompt(execution_settings, task, session_id, workspace_id);
         let developer_prompt = compose_developer_instructions(
@@ -3111,9 +3371,8 @@ impl LlmTaskDispatcher {
                 .as_deref(),
             self.resolve_safeguard_prompt(execution_settings).as_deref(),
         );
-        let workspace_identity_root_path = workspace_id
-            .as_ref()
-            .and_then(|_| self.resolve_workspace_root_path(session_id, workspace_id));
+        let workspace_identity_root_path =
+            self.resolve_task_source_root(task, session_id, workspace_id);
         let prepare_workspace = || {
             self.prepare_task_workspace_execution(
                 task,
@@ -3189,22 +3448,38 @@ impl LlmTaskDispatcher {
 
         let safety_gate = self.build_safety_gate(execution_settings);
         let plan_store = magi_plan::PlanStore::new(self.session_store.clone(), session_id.clone());
-        let project_memory = workspace_identity_root_path.as_ref().and_then(|path| {
-            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-            match self.project_memory_registry.get_or_open(&workspace_root) {
+        let project_memory = workspace_id.as_ref().and_then(|workspace_id| {
+            match self.project_memory_registry.get_or_open(workspace_id) {
                 Ok(store) => Some(store),
                 Err(err) => {
-                    tracing::warn!(error = %err, workspace_root = %path.display(), "ProjectMemory: 打开失败，本次 Turn 不注入项目记忆");
+                    tracing::warn!(error = %err, %workspace_id, "ProjectMemory: 打开失败，本次 Turn 不注入项目记忆");
                     None
                 }
             }
         });
-        let snapshot_session = match prepared {
-            Some(prepared) => prepared.snapshot,
+        let workspace_resources = match prepared {
+            Some(prepared) => Some(prepared.resources),
+            None if use_tools
+                && task
+                    .executor_binding
+                    .as_ref()
+                    .is_some_and(|executor| executor.project_directories.is_some()) =>
+            {
+                match self.prepare_workspace_execution(
+                    task,
+                    session_id,
+                    workspace_id,
+                    crate::workspace_execution::WorkspacePreparationMode::Mapping,
+                ) {
+                    Ok(resources) => Some(resources),
+                    Err(error) => return (TaskOutcome::Failed { error }, None),
+                }
+            }
             None => self.snapshot_manager.as_ref().and_then(|manager| {
                 workspace_root_path
                     .as_ref()
                     .and_then(|root| manager.get_session_for_workspace(session_id.as_str(), root))
+                    .map(crate::workspace_execution::WorkspaceExecutionResources::from_snapshot)
             }),
         };
         let refresh_tools = |skill_id: Option<&str>| {
@@ -3255,7 +3530,7 @@ impl LlmTaskDispatcher {
             context_summary,
             system_prompt: developer_prompt,
             workspace_root_path,
-            snapshot_session,
+            workspace_resources,
             prepare_workspace: (use_tools && !executor_owns_tools)
                 .then_some(&prepare_workspace as &crate::conversation_loop::PrepareWorkspace),
             execution_group_id: Some(task.mission_id.to_string()),
@@ -5172,6 +5447,78 @@ mod tests {
     }
 
     #[test]
+    fn sidechain_repository_allocations_finalize_and_restore_independently() {
+        let fixture = tempfile::tempdir().unwrap();
+        let service = Arc::new(magi_git::GitService::new());
+        let contexts = magi_git::SessionCodeContextRegistry::default();
+        let session = SessionId::new("multi-repository-agent");
+        let workspace = Some(WorkspaceId::new("project"));
+        let lease = LeaseId::new("agent-lease");
+        let worker = WorkerId::new("agent-worker");
+        let task = task_with_role("executor", TaskTier::ExecutionChain);
+        let mut dispatcher = dispatcher_with_default_tool_surface()
+            .with_git_context_runtime(service.clone(), contexts.clone());
+        dispatcher.agent_worktree_root = fixture.path().join("agents");
+        let roots = ["a", "b"].map(|name| {
+            let root = fixture.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            git_fixture(&root, &["init", "-b", "main"]);
+            git_fixture(&root, &["config", "user.name", "Magi Test"]);
+            git_fixture(&root, &["config", "user.email", "magi@example.test"]);
+            std::fs::write(root.join("same.txt"), name).unwrap();
+            git_fixture(&root, &["add", "."]);
+            git_fixture(&root, &["commit", "-m", "base"]);
+            let observation = block_on_git(service.observe(&root)).unwrap();
+            contexts.accept(session.as_str(), "project", vec![], &observation);
+            observation.worktree_path
+        });
+        let copies = roots
+            .iter()
+            .map(|root| {
+                let copy = dispatcher
+                    .resolve_task_execution_root(
+                        &task,
+                        &lease,
+                        &session,
+                        &workspace,
+                        Some(root),
+                        true,
+                        Some(&worker),
+                    )
+                    .unwrap()
+                    .unwrap();
+                std::fs::write(copy.join("same.txt"), format!("agent {}", root.display())).unwrap();
+                copy
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(copies[0], copies[1]);
+        let outputs = dispatcher
+            .finalize_agent_worktree(&task, &lease, &session, &workspace, true)
+            .unwrap();
+        assert_eq!(outputs["agent_workspaces"].as_array().unwrap().len(), 2);
+        let restored = magi_git::SessionCodeContextRegistry::default();
+        restored.restore_after_restart(
+            serde_json::from_str(&serde_json::to_string(&contexts.all()).unwrap()).unwrap(),
+        );
+        for (index, root) in roots.iter().enumerate() {
+            assert!(!copies[index].exists());
+            let context = restored.get_repository(session.as_str(), root).unwrap();
+            let allocation = &context.agent_worktrees[0];
+            assert!(!allocation.active);
+            assert_eq!(allocation.changed_paths, vec!["same.txt"]);
+            let result_head = allocation.result_head.as_deref().unwrap();
+            assert_eq!(
+                git_fixture(root, &["show", &format!("{result_head}:same.txt")]),
+                format!("agent {}", root.display())
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("same.txt")).unwrap(),
+                ["a", "b"][index]
+            );
+        }
+    }
+
+    #[test]
     fn session_turn_model_configuration_failure_pauses_plan() {
         let dispatcher = dispatcher_with_default_tool_surface();
         let session_id = SessionId::new("session-model-config-failure");
@@ -5293,6 +5640,7 @@ mod tests {
             .expect("plan should persist");
 
         let result = dispatcher.execute_session_turn_for_test(SessionTurnExecutionRequest {
+            project_directories: None,
             session_id,
             turn_id: "turn-model-config-failure".to_string(),
             workspace_id: None,

@@ -133,16 +133,22 @@ try {
   await snap("after-activate");
 
   // 与真实使用一致：在工作区会话里打开 GPT Web（草稿/个人空状态下宿主没有会话上下文）。
-  const workspaceRoot = join(workRoot, "workspace");
-  await mkdir(workspaceRoot, { recursive: true });
-  const registered = await tools.post("/api/workspaces/register", { path: workspaceRoot });
-  const workspaceId = JSON.parse(registered.body).workspaceId;
+  const sourceRoots = [join(workRoot, "source-a"), join(workRoot, "source-b")];
+  await Promise.all(sourceRoots.map((root) => mkdir(root, { recursive: true })));
+  const registered = await tools.post("/api/workspaces/create", {
+    name: "GPT Web multi-root acceptance",
+    sourceFolders: sourceRoots.map((path, index) => ({ sourceFolderId: `source-${index}`, path })),
+    primarySourceFolderId: "source-1",
+  });
+  check("双目录项目创建成功", registered.status === 200, registered.body.slice(0, 200));
+  const project = JSON.parse(registered.body).workspace;
+  const workspaceId = project.workspaceId;
   await page.call("Page.reload", { ignoreCache: true });
   await waitFor(() => tools.exists(`[data-workspace-id="${workspaceId}"]`), "工作区进入侧栏", 30_000);
   await page.evaluate(`(() => {
     const row = document.querySelector('[data-workspace-id="${workspaceId}"]');
     row.click();
-    row.closest('.workspace-row')?.querySelector('button.row-action[aria-label]')?.click();
+    row.closest('.workspace-row')?.querySelector('[data-workspace-action="new"]')?.click();
   })()`);
   await waitFor(() => tools.exists('[data-testid="input-textarea"]'), "工作区会话输入区", 30_000);
 
@@ -197,13 +203,16 @@ try {
   if (fresh) break loggedInFlow; // 全新环境只验证到“需要登录”
   // 输入区模型选择器：登录探测通过后应出现固定的 GPT Web 入口
   await tools.click('.ia-model-btn');
-  await sleep(800);
-  await waitFor(() => page.evaluate(`[...document.querySelectorAll('.ia-model-wrap *')].some((el) => el.children.length === 0 && el.textContent.trim() === 'GPT Web')`), "选择器出现 GPT Web 入口", 15_000);
+  await waitFor(() => tools.exists('.ia-session-model-popover'), "模型选择弹窗出现");
+  if (await tools.exists('.ia-summary-model')) await tools.click('.ia-summary-model');
+  await waitFor(() => tools.exists('[data-magi-web-engine-row]:not([disabled])'), "选择器出现 GPT Web 入口", 15_000);
   check("探测通过后选择器出现固定的 GPT Web 入口", true);
-  await page.evaluate(`(() => { const label = [...document.querySelectorAll('.ia-model-wrap *')].find((el) => el.children.length === 0 && el.textContent.trim() === 'GPT Web'); (label.closest('button, [role=option], [role=menuitem], li') || label).click(); })()`);
+  await tools.click('[data-magi-web-engine-row]:not([disabled])');
   await sleep(1200);
   // 对话方式：临时对话（不在 ChatGPT 侧留下历史）
   await tools.click(".ia-model-btn");
+  await waitFor(() => tools.exists('.ia-session-model-popover'), "对话方式弹窗出现");
+  if (await tools.exists('.ia-summary-model')) await tools.click('.ia-summary-model');
   await waitFor(() => tools.exists(`[data-web-model-mode-option="${conversationMode}"]`), "对话方式选择出现", 10_000);
   await tools.click(`[data-web-model-mode-option="${conversationMode}"]`);
   await sleep(500);
@@ -368,6 +377,18 @@ try {
 
 
   }
+
+  const sessions = await tools.api('/api/workspaces/sessions?' + new URLSearchParams({ workspaceId }));
+  const projectSessions = sessions.status === 200 ? JSON.parse(sessions.body).sessions : [];
+  check("GPT Web 消息属于唯一的双目录项目会话", projectSessions.length === 1, JSON.stringify(projectSessions));
+  const webOwnerSessionId = projectSessions[0].sessionId;
+  const history = await tools.api('/api/messages?' + new URLSearchParams({ scope: 'workspace', sessionId: webOwnerSessionId, workspaceId }));
+  const turns = history?.status === 200 ? JSON.parse(history.body).canonicalTurns : [];
+  const bindings = turns.flatMap((turn) => (turn.items ?? []).filter((item) => item.kind === 'user_message').map((item) => item.metadata?.projectDirectories));
+  check("GPT Web 会话保留双目录授权和原主要目录绑定", turns.length > 0
+    && bindings.length > 0 && bindings.every((binding) => binding?.workspaceId === workspaceId
+      && binding.defaultSourceFolderId === project.primarySourceFolderId
+      && binding.sourceFolders?.length === 2), JSON.stringify({ sessionId: webOwnerSessionId, bindings }));
 
   if (questionFixture) {
     // 页面在等待作答时停止：覆盖项目归属、canonical 终态与 Web 槽位结算。

@@ -15,6 +15,7 @@
   interface Props {
     rootPath: string;
     workspaceId: string;
+    sourceFolderId?: string;
     sessionId?: string;
     /** 是否显示隐藏文件；由侧栏标题行的开关持有，树只负责按它加载。 */
     showHidden?: boolean;
@@ -22,7 +23,7 @@
     onFileSelect?: (selection: { pathRef: string; displayPath: string; name: string }) => void;
   }
 
-  let { rootPath, workspaceId, sessionId = '', showHidden = false, selectedFilePath = null, onFileSelect }: Props = $props();
+  let { rootPath, workspaceId, sourceFolderId = '', sessionId = '', showHidden = false, selectedFilePath = null, onFileSelect }: Props = $props();
 
   let expandedDirPaths = $state<Set<string>>(new Set());
   let dirCache = $state<Map<string, DirectoryEntry[]>>(new Map());
@@ -43,7 +44,7 @@
   $effect(() => {
     const nextRoot = rootPath?.trim() || '';
     const nextWorkspaceId = workspaceId?.trim() || '';
-    const nextTreeKey = `${nextWorkspaceId}\u0000${sessionId}\u0000${nextRoot}`;
+    const nextTreeKey = `${nextWorkspaceId}\u0000${sessionId}\u0000${sourceFolderId}\u0000${nextRoot}`;
     if (nextTreeKey === loadedTreeKey) {
       return;
     }
@@ -54,7 +55,7 @@
   });
 
   function currentTreeKey(): string {
-    return `${workspaceId?.trim() || ''}\u0000${sessionId}\u0000${rootPath?.trim() || ''}`;
+    return `${workspaceId?.trim() || ''}\u0000${sessionId}\u0000${sourceFolderId}\u0000${rootPath?.trim() || ''}`;
   }
 
   function resetTree(nextTreeKey = currentTreeKey()): void {
@@ -89,7 +90,7 @@
   ): Promise<void> {
     try {
       const response = await resolveAgentFileRevealTarget(filePath, nextWorkspaceId ? {
-        scope: 'workspace', workspaceId: nextWorkspaceId, workspacePath: nextRootPath,
+        scope: 'workspace', workspaceId: nextWorkspaceId, workspacePath: nextRootPath, sourceFolderId,
         ...(sessionId ? { sessionId } : {}),
       } : { scope: 'personal', sessionId });
       if (currentSelectionGeneration !== selectionGeneration || currentTreeKey() !== loadedTreeKey) {
@@ -138,6 +139,7 @@
     const requestTreeKey = loadedTreeKey;
     const requestWorkspaceId = workspaceId;
     const requestSessionId = sessionId;
+    const requestSourceFolderId = sourceFolderId;
     const isCurrent = () => requestGeneration === treeGeneration && requestTreeKey === loadedTreeKey;
     const entry = { promise: Promise.resolve(), refreshQueued: false };
     loadingDirPaths = new Set(loadingDirPaths).add(cacheKey);
@@ -148,7 +150,7 @@
         nextErrors.delete(cacheKey);
         dirErrors = nextErrors;
         try {
-          const result = await listAgentDirectory(pathRef || '', showHidden, requestWorkspaceId, requestSessionId);
+          const result = await listAgentDirectory(pathRef || '', showHidden, requestWorkspaceId, requestSessionId, requestSourceFolderId);
           if (!isCurrent()) return;
           // 读取期间发生刷新或切换隐藏文件条件时，先补读，不能提交已过期的结果。
           if (entry.refreshQueued) continue;
@@ -245,7 +247,7 @@
 
 </script>
 
-<div class="project-file-tree" data-workspace-id={workspaceId} bind:this={treeElement}>
+<div class="project-file-tree" data-workspace-id={workspaceId} data-source-folder-id={sourceFolderId || undefined} bind:this={treeElement}>
   {#if !rootPath && !sessionId}
     <div class="file-tree-empty">{i18n.t('web.projectFilesNoWorkspace')}</div>
   {:else if rootLoading && rootEntries.length === 0}
@@ -408,5 +410,9 @@
   .file-tree-error,
   .file-tree-status--error {
     color: var(--error);
+  }
+  .file-tree-row:active { background: var(--surface-active, var(--surface-hover)); }
+  @media (hover: none), (pointer: coarse) {
+    .file-tree-row { height: auto; min-block-size: 44px; padding-block: 8px; line-height: 1.5; }
   }
 </style>

@@ -32,7 +32,7 @@
       <div class="item" data-external-approval={approval.approvalId}>
         <div class="summary">{approval.summary}</div>
         <div class="meta">{i18n.t('mcpServer.approvals.from', { client: approval.clientName, prefix: approval.tokenPrefix })}</div>
-        <div class="meta ui-meta"><span>{i18n.t('mcpServer.token.boundWorkspace', { workspace: workspace?.name ?? approval.workspaceId })}</span>{#if workspace}<span>{workspace.rootPath}</span>{/if}</div>
+        <div class="meta ui-meta"><span>{i18n.t('mcpServer.token.boundWorkspace', { workspace: workspace?.name ?? approval.workspaceId })}</span></div>
         {#if session}
           <button type="button" class="btn btn--sm btn--secondary" data-mcp-approval-view-session={approval.approvalId} onclick={() => { closeSettings(); openExternalSession(session); }}>
             {i18n.t('mcpServer.audit.viewSession')}

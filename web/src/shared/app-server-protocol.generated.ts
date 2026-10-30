@@ -310,6 +310,7 @@ export interface SessionContextReference {
   kind: SessionContextReferenceKind;
   path: string;
   pathRef?: string | null;
+  sourceFolderId?: string | null;
   name: string;
 }
 
@@ -358,6 +359,7 @@ export interface TurnStartParams {
   scope: SessionScope;
   workspaceId?: string | null;
   workspacePath?: string | null;
+  sourceFolderId?: string | null;
   text?: string | null;
   skillName?: string | null;
   locale?: string | null;
@@ -1249,6 +1251,7 @@ export interface QueuedSessionTurn {
   sessionId: string;
   workspaceId: string | null;
   workspacePath: string | null;
+  sourceFolderId?: string | null;
   acceptedAt: number;
   content: string;
   text: string | null;

@@ -255,11 +255,15 @@ fn execute_agent_apply(
         }
         Err(error) => return git_error(tool, error),
     };
-    if let Err(error) = deps.session_code_contexts.mark_agent_worktree_applied(
-        &binding.session_id,
-        &task_id,
-        &result_head,
-    ) {
+    if let Err(error) = deps
+        .session_code_contexts
+        .mark_agent_worktree_applied_for_root(
+            &binding.session_id,
+            &binding.context.execution_root,
+            &task_id,
+            &result_head,
+        )
+    {
         return failed(tool, "agent_apply_record_failed", error.to_string());
     }
     if let Err(message) = persist_contexts(deps) {
@@ -281,7 +285,12 @@ fn execute_agent_apply(
         .is_ok()
     });
     if execution_context.caller_scope == magi_tool_runtime::ToolCallerScope::SessionMainline {
-        schedule_code_index_refresh(deps, &binding.workspace_id, &binding.path);
+        schedule_code_index_refresh(
+            deps,
+            &binding.workspace_id,
+            &binding.path,
+            execution_context,
+        );
     }
     succeeded(
         tool,
@@ -320,7 +329,10 @@ fn execute_delegated_git_query(
             "Git 查询缺少任务与执行目录归属",
         );
     };
-    let Some(session) = deps.session_code_contexts.get(session_id.as_str()) else {
+    let Some(session) = deps
+        .session_code_contexts
+        .get_for_path(session_id.as_str(), path)
+    else {
         return rejected(tool, "git_missing_context", "当前会话尚未建立 Git context");
     };
     if session.workspace_id != workspace_id.as_str() {
@@ -403,7 +415,7 @@ fn resolve_delegating_binding(
         .map_err(|_| reject())?;
     let session = deps
         .session_code_contexts
-        .get(session_id.as_str())
+        .get_for_path(session_id.as_str(), path)
         .ok_or_else(reject)?;
     let assigned = session
         .agent_worktrees
@@ -552,13 +564,46 @@ fn resolve_binding(
                 "当前 session 未绑定 workspace",
             )
         })?;
-    let existing = deps.session_code_contexts.get(&session_id).ok_or_else(|| {
-        rejected(
+    let working_directory = execution_context
+        .working_directory
+        .as_ref()
+        .ok_or_else(|| {
+            rejected(
+                "git",
+                "git_missing_working_directory",
+                "Git 工具缺少执行目录",
+            )
+        })?;
+    let target = optional_string(arguments, "repositoryPath")
+        .map(|path| {
+            magi_core::HostPath::resolve_native_input(&path, Some(working_directory), None)
+                .map(magi_core::HostPath::into_path_buf)
+                .map_err(|error| rejected("git", "git_invalid_repository_path", error.to_string()))
+        })
+        .transpose()?
+        .unwrap_or_else(|| working_directory.clone());
+    if let Some(map) = execution_context.project_directory_map.as_ref()
+        && !map.roots.iter().any(|root| {
+            root.execution_root()
+                .is_ok_and(|root| same_path(&target, &root))
+        })
+    {
+        return Err(rejected(
             "git",
-            "git_missing_context",
-            "当前 session 尚未建立 Git context",
-        )
-    })?;
+            "git_repository_mismatch",
+            "目标仓库不在本任务获授的实际目录映射中",
+        ));
+    }
+    let existing = deps
+        .session_code_contexts
+        .get_for_path(&session_id, &target)
+        .ok_or_else(|| {
+            rejected(
+                "git",
+                "git_missing_context",
+                "当前实际工作树尚未建立 Git context",
+            )
+        })?;
     if existing.workspace_id != workspace_id {
         return Err(rejected(
             "git",
@@ -582,25 +627,16 @@ fn resolve_binding(
             ));
         }
     }
-    let working_directory = execution_context
-        .working_directory
-        .as_ref()
-        .ok_or_else(|| {
-            rejected(
-                "git",
-                "git_missing_working_directory",
-                "Git 工具缺少执行目录",
-            )
-        })?;
-    if !same_path(working_directory, &existing.execution_root) {
+    if !same_path(&target, &existing.execution_root) {
         return Err(rejected(
             "git",
             "agent_git_mutation_forbidden",
             "子代理或非主 worktree 不能管理主对话 Git context",
         ));
     }
-    if let Err(error) = deps.session_code_contexts.validate_revision(
+    if let Err(error) = deps.session_code_contexts.validate_revision_for_root(
         &session_id,
+        &existing.execution_root,
         arguments
             .get("expectedContextRevision")
             .and_then(Value::as_u64),
@@ -673,7 +709,12 @@ fn resolve_binding(
             return Err(failed("git", "git_context_persist_failed", message));
         }
         publish_context_changed(deps, &session_id, &workspace_id, &context, &observation);
-        schedule_code_index_refresh(deps, &workspace_id, &observation.worktree_path);
+        schedule_code_index_refresh(
+            deps,
+            &workspace_id,
+            &observation.worktree_path,
+            execution_context,
+        );
     } else if let Err(message) = persist_contexts(deps) {
         return Err(failed("git", "git_context_persist_failed", message));
     }
@@ -947,7 +988,7 @@ fn execute_mutation(
         _ => return rejected(tool, "git_unknown_tool", "未知的 Git mutation"),
     };
 
-    finish_mutation(deps, tool, binding, operation)
+    finish_mutation(deps, tool, binding, operation, execution_context)
 }
 
 enum MutationResult {
@@ -961,6 +1002,7 @@ fn finish_mutation(
     tool: &str,
     binding: GitToolBinding,
     operation: MutationResult,
+    execution_context: &ToolExecutionContext,
 ) -> (String, ExecutionResultStatus) {
     let data = match operation {
         MutationResult::Observation(Ok(observation)) => json!({ "observation": observation }),
@@ -1030,7 +1072,12 @@ fn finish_mutation(
         &context,
         &observation,
     );
-    schedule_code_index_refresh(deps, &binding.workspace_id, &binding.path);
+    schedule_code_index_refresh(
+        deps,
+        &binding.workspace_id,
+        &binding.path,
+        execution_context,
+    );
     succeeded(
         tool,
         json!({
@@ -1056,18 +1103,33 @@ fn schedule_code_index_refresh(
     deps: &GitToolRuntimeDependencies,
     workspace_id: &str,
     workspace_root: &Path,
+    execution_context: &ToolExecutionContext,
 ) {
     if workspace_id.is_empty() {
         return;
     }
     let workspace_id = WorkspaceId::new(workspace_id.to_string());
-    if !deps
-        .knowledge_store
-        .begin_workspace_index_build(&workspace_id)
-    {
+    let knowledge_store = if let Some(map) = &execution_context.project_directory_map {
+        let Some(directory) = map.roots.iter().find(|directory| {
+            directory
+                .execution_root()
+                .is_ok_and(|root| same_path(&root, workspace_root))
+        }) else {
+            return;
+        };
+        let Ok(store) = deps
+            .knowledge_store
+            .for_source_folder(&directory.source_folder_id, workspace_root)
+        else {
+            return;
+        };
+        store
+    } else {
+        deps.knowledge_store.as_ref().clone()
+    };
+    if !knowledge_store.begin_workspace_index_build(&workspace_id) {
         return;
     }
-    let knowledge_store = deps.knowledge_store.clone();
     let workspace_root = workspace_root.to_path_buf();
     std::thread::spawn(move || {
         knowledge_store.build_workspace_index(&workspace_id, &workspace_root);

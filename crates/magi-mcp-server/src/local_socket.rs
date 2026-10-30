@@ -521,6 +521,7 @@ mod tests {
             Arc::new(Root),
         ));
         let principal = ClientPrincipal {
+            project_directories: None,
             token_id: "client".into(),
             token_prefix: "prefix".into(),
             client_name: "test".into(),
@@ -598,6 +599,7 @@ mod tests {
         let issued = tokens
             .issue(
                 IssueTokenRequest {
+                    project_directories: None,
                     client_name: "test".to_string(),
                     workspace_id: "ws".to_string(),
                     approval_mode: ApprovalMode::Ask,
@@ -769,6 +771,7 @@ mod tests {
             let available = available.clone();
             Arc::new(move || {
                 available.load(Ordering::SeqCst).then(|| ClientPrincipal {
+                    project_directories: None,
                     token_id: "web-slot".to_string(),
                     token_prefix: "web-slot".to_string(),
                     client_name: "GPT Web".to_string(),

@@ -56,7 +56,7 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 
 ## 目标与代理运行设计
 
-- [项目与多源文件夹改造任务计划](project-multi-root-task-plan.md)：独立后续任务；规划项目下统一会话、多本机目录、权限、Git/隔离、迁移与验收。当前仅完成规划，尚未实施。
+- [项目与多源文件夹改造任务计划](project-multi-root-task-plan.md)：项目下统一会话、多本机目录、权限、Git/隔离、迁移与验收范围。当前独立 worktree 已接通主要产品链路；阶段证据、未验证平台和外部服务边界见[实现记录](project-multi-root-implementation.md)，不能把本机通过视为全部退出条件已满足。
 
 - [子代理唤起设计与改造](subagent-delegation-design.md)：默认主线执行、四种委派目的、派发前决策合同、唯一预检和验收边界。
 - [运行时改造收敛审计](runtime-consolidation-audit.md)：当前变更范围、移除项、冻结项和继续修改门槛。
@@ -71,6 +71,25 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 - 已转交的独立代理从详情页显式继续；daemon 只重开原转交子树，沿原 Task/Thread 接纳新 Turn，保持原 Skill、执行目录与交互来源。主线继续不代替独立代理继续；重试读取原回执，旧终态回调不能释放新执行的资源。
 
 后续设计说明从当前代码和产品形态反向整理。
+
+## 项目与源文件夹
+
+项目由 daemon 的 `WorkspaceStore` 管理，沿用稳定 `workspaceId`。一个项目包含一个或多个具有稳定 `sourceFolderId` 的本机源文件夹，并以 `primarySourceFolderId` 指定主要目录。源文件夹可以是独立 Git 仓库、linked worktree 或普通目录；项目名称和主要目录变化不会改变会话归属。Web 和 Desktop 仅消费这份事实，目录选择只作用于新输入，不能给已有会话改绑项目。
+
+| 边界 | 当前合同 |
+| --- | --- |
+| 项目管理 | `/api/workspaces/create`、`update` 提交完整成员集合和主要目录；更新使用 `expectedRevision` CAS。规范化后拒绝目录重叠、跨项目复用同一物理目录，以及与 daemon 状态根重叠。 |
+| 目录修改 | daemon 持有项目准入、导航和会话提交守卫；存在活动任务、审批、排队输入、终端或未合入成果时拒绝成员/主要目录变更。改名和目录别名不迁移执行资源。 |
+| Turn 与 Task | 接纳时冻结 `ProjectDirectoryBinding`（项目修订、默认目录及获授目录集合），沿原 Input、canonical Turn 和 Task 检查点持久化。排队、重试、Goal、继续和子代理沿原绑定，执行时重新核对成员。新增目录不扩展旧任务或 MCP 令牌，已撤销或缺失目录明确失败。 |
+| 实际执行路径 | `ProjectDirectoryExecutionMap` 是原隔离/Git 注册表派生的投影。工具 cwd、路径权限、write claims、快照 hooks 和外部调用使用同一映射；副本缺失不能回落源目录。默认相对路径从冻结目录解析，显式 `source_folder_id` 只能选择本次获授目录。 |
+| 文件与变更 | HTTP 资源使用 `sourceFolderId`，文件引用、预览、下载、终端、变更和 Git 面板保留该身份。多目录项目的单目录资源请求省略身份时拒绝猜测；同名相对路径分别寻址。 |
+| 状态存储 | 项目历史、规则、记忆与账本按 `<state>/projects/<workspaceId 的 UTF-8 十六进制编码>` 定位，canonical 事件沿原 state 根保存。主要目录仅是新请求的默认 cwd，DTO 的 `rootPath` 仅为主要目录展示投影。 |
+| 旧数据 | 原单根记录和源目录 `.magi` 只用于单向迁移/可移植导入；清单、布局写屏障、原子写入和冲突拒绝保护原数据。固定项目根存在后不再扫描保留备份，防止会话删除后复活。移除项目保留源文件和历史。 |
+| 规则与外部调用 | 项目共享 `AGENTS.md` 位于固定项目状态根，各源目录规则从实际执行根读取。MCP 固定签发时的目录集合；GPT Web 从 owner session 与原 canonical Turn 解析目录，回复图片也保留原槽位代际和执行副本。 |
+
+会话隔离、Git 与知识图谱的具体边界分别见[隔离设计](session-isolation.md)、[Git 工作流](session-git-workflow.md)和[知识图谱](knowledge-graph-design.md)。[个人会话](personal-session-architecture.md)继续使用独立会话执行目录，不能在项目资源失效时成为回落路径。
+
+升级前应先退出 Desktop 并停止使用该状态根的 daemon，再备份完整状态根（默认 `~/.magi`，以实际 `MAGI_STATE_ROOT` 为准），以及各旧源目录中的 `.magi`；源代码和未合入副本也应按原有备份策略保留。迁移写入新布局后，不能通过修改或删除 `state-layout.json` 让旧版程序继续写入。需要回退时，先停止新版、另存升级后的完整状态与成果，再在独立位置恢复升级前的整套备份并使用旧版启动；升级后的新会话和修改不会自动合并进旧备份。迁移清单和旧源目录中保留的文件是恢复输入，不能替代完整升级前备份。
 
 ## 架构与维护文档
 

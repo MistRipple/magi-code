@@ -237,7 +237,7 @@
       {#if lanUrl}
         <div class="url-row">
           <input class="url-input" type="text" value={lanUrl} readonly />
-          <button class="copy-btn" class:copied data-copy-feedback={copied} onclick={copyUrl} title={copied ? i18n.t('lanAccess.copied') : i18n.t('lanAccess.copy')}>
+          <button class="btn-icon btn-icon--lg copy-btn" class:copied data-copy-feedback={copied} onclick={copyUrl} title={copied ? i18n.t('lanAccess.copied') : i18n.t('lanAccess.copy')}>
             {#if copied}<Icon name="check" size={14} />{:else}<Icon name="copy" size={14} />{/if}
           </button>
         </div>
@@ -259,14 +259,14 @@
       <div class="panel-body">
         <div class="url-row">
           <input class="url-input" type="text" value={tunnelAccessUrl} readonly />
-          <button class="copy-btn" class:copied data-copy-feedback={tunnelCopied} onclick={copyTunnelUrl} title={tunnelCopied ? i18n.t('lanAccess.copied') : i18n.t('lanAccess.copy')}>
+          <button class="btn-icon btn-icon--lg copy-btn" class:copied data-copy-feedback={tunnelCopied} onclick={copyTunnelUrl} title={tunnelCopied ? i18n.t('lanAccess.copied') : i18n.t('lanAccess.copy')}>
             {#if tunnelCopied}<Icon name="check" size={14} />{:else}<Icon name="copy" size={14} />{/if}
           </button>
         </div>
       </div>
     {/if}
     <div class="panel-body">
-      <button class="tunnel-toggle-btn" onclick={toggleTunnel} disabled={tunnelBusy || tunnelStatus === 'starting' || tunnelStatus === 'stopping'}>
+      <button class="btn btn--primary btn--sm tunnel-toggle-btn" onclick={toggleTunnel} disabled={tunnelBusy || tunnelStatus === 'starting' || tunnelStatus === 'stopping'}>
         {#if tunnelBusy || tunnelStatus === 'starting' || tunnelStatus === 'stopping'}
           <Icon name="loader" size={14} class="spinning" />
         {:else if tunnelStatus === 'running'}
@@ -280,7 +280,6 @@
   </div>
 </div>
 {/if}
-
 
 <style>
   .lan-access-panel { position: absolute; top: calc(100% + 8px); right: 0; width: min(clamp(280px, 28vw, 360px), var(--panel-available-width, calc(100vw - 24px))); max-height: 80vh; overflow-y: auto; background: var(--glass-bg); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-xl); box-shadow: var(--shadow-xl); z-index: var(--z-popover); animation: panelSlideIn 0.15s ease-out; }
@@ -304,15 +303,12 @@
   .url-row { display: flex; gap: 6px; }
   .url-input { flex: 1; min-width: 0; padding: 6px 8px; font-size: var(--text-xs); font-family: var(--font-mono); color: var(--foreground); background: var(--vscode-input-background, var(--surface-2)); border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-sm); outline: none; }
   .url-input:focus { border-color: var(--primary); }
-  .copy-btn { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; flex-shrink: 0; background: var(--primary); border: none; border-radius: var(--radius-md); color: var(--primary-foreground); cursor: pointer; transition: opacity 0.15s; }
-  .copy-btn:hover { opacity: 0.85; }
   .tunnel-section { border-top: var(--magi-hairline) solid var(--border); }
   .tunnel-status { font-weight: var(--font-normal); text-transform: none; letter-spacing: 0; font-size: var(--text-xs); color: var(--foreground-muted); }
   .tunnel-status.running { color: var(--success); }
   .tunnel-status.error { color: var(--error); }
   .tunnel-error { padding: 4px 14px; margin: 0; font-size: var(--text-xs); color: var(--error); line-height: 1.4; }
-  .tunnel-toggle-btn { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; padding: 6px 12px; font-size: var(--text-xs); font-weight: var(--font-medium); color: var(--primary-foreground); background: var(--primary); border: none; border-radius: var(--radius-md); cursor: pointer; transition: opacity 0.15s; }
-  .tunnel-toggle-btn:hover:not(:disabled) { opacity: 0.85; }
-  .tunnel-toggle-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
   .tunnel-hint { font-size: var(--text-xs); color: var(--foreground-muted); margin: 6px 0 0 0; text-align: center; line-height: 1.4; }
+  .tunnel-toggle-btn { inline-size: 100%; }
 </style>

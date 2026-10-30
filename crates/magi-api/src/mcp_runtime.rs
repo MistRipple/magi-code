@@ -518,6 +518,15 @@ impl McpServiceRuntime {
     }
 
     fn persist(&self, enabled: bool, port: Option<u16>) -> Result<(), McpRuntimeError> {
+        self.persist_tokens(enabled, port, self.tokens.records())
+    }
+
+    fn persist_tokens(
+        &self,
+        enabled: bool,
+        port: Option<u16>,
+        records: Vec<TokenRecord>,
+    ) -> Result<(), McpRuntimeError> {
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -525,7 +534,7 @@ impl McpServiceRuntime {
         let body = serde_json::to_vec_pretty(&PersistedMcp {
             enabled,
             port,
-            tokens: self.tokens.records(),
+            tokens: records,
             network: self.network_enabled.load(Ordering::SeqCst)
                 && self
                     .named
@@ -1228,6 +1237,50 @@ impl McpServiceRuntime {
         self.tokens.records()
     }
 
+    pub(crate) fn migrate_legacy_directory_bindings(
+        &self,
+        workspaces: &magi_workspace::WorkspaceStore,
+    ) -> Result<(), McpRuntimeError> {
+        let mut changed = Vec::new();
+        for record in self.tokens.records() {
+            if record.project_directories.is_some() {
+                continue;
+            }
+            let id = magi_core::WorkspaceId::new(&record.workspace_id);
+            let Some(project) = workspaces.project(&id) else {
+                continue;
+            };
+            let original_id = format!("{id}-source-0");
+            if project.source_folders.len() != 1
+                || project.revision != 1
+                || project.primary_source_folder_id != original_id
+            {
+                continue;
+            }
+            let binding = workspaces
+                .capture_directory_binding(
+                    &id,
+                    Some(&original_id),
+                    Some(std::slice::from_ref(&original_id)),
+                )
+                .map_err(|error| McpRuntimeError::Token(error.to_string()))?;
+            changed.push((record.token_id, binding));
+        }
+        if !changed.is_empty() {
+            let control = self
+                .control
+                .try_lock()
+                .map_err(|_| McpRuntimeError::Persist("MCP 初始化尚未取得控制锁".into()))?;
+            self.tokens
+                .freeze_legacy_directories(&changed, |records| {
+                    self.persist_tokens(control.enabled, control.port, records.to_vec())
+                        .map_err(|error| error.to_string())
+                })
+                .map_err(|error| McpRuntimeError::Token(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// 创建令牌。原文只在返回值里出现一次。
     pub(crate) async fn issue_token(
         &self,
@@ -1519,6 +1572,7 @@ mod tests {
 
     fn request() -> IssueTokenRequest {
         IssueTokenRequest {
+            project_directories: None,
             client_name: "cursor".to_string(),
             workspace_id: "ws".to_string(),
             approval_mode: ApprovalMode::Ask,
@@ -1537,6 +1591,94 @@ mod tests {
             builder = builder.bearer_auth(secret);
         }
         Ok(builder.send().await?.status().as_u16())
+    }
+
+    #[tokio::test]
+    async fn legacy_directory_migration_preserves_original_grant_across_restart_and_failure() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let folders = tempfile::tempdir().unwrap();
+        let source = folders.path().join("source");
+        let second = folders.path().join("second");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let workspaces = magi_workspace::WorkspaceStore::new();
+        let workspace = magi_core::WorkspaceId::new("ws");
+        let project = workspaces
+            .register_native_path(workspace.clone(), source.clone())
+            .unwrap();
+        let path = state_dir.path().join("mcp-server.json");
+        let runtime = McpServiceRuntime::load(path.clone());
+        let original = runtime.issue_token(request()).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            runtime
+                .migrate_legacy_directory_bindings(&workspaces)
+                .is_err()
+        );
+        assert!(runtime.list_tokens()[0].project_directories.is_none());
+        assert!(runtime.list_tokens()[0].revoked_at_ms.is_none());
+        std::fs::remove_dir(&path).unwrap();
+        runtime
+            .migrate_legacy_directory_bindings(&workspaces)
+            .unwrap();
+        let frozen = runtime.list_tokens().remove(0).project_directories.unwrap();
+        assert_eq!(frozen.source_folders.len(), 1);
+        let mut other = project.primary_source_folder().clone();
+        let host = magi_core::HostPath::canonicalize(&second).unwrap();
+        other.source_folder_id = "second".into();
+        other.path = magi_core::AbsolutePath::new(host.display_string());
+        other.path_ref = host.to_path_ref().as_str().into();
+        let mut members = project.source_folders;
+        members.push(other);
+        workspaces
+            .edit_project(
+                &workspace,
+                project.revision,
+                magi_workspace::WorkspaceProjectEdit {
+                    name: Some("renamed".into()),
+                    source_folders: members,
+                    primary_source_folder_id: "second".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let restored = McpServiceRuntime::load(path.clone());
+        restored
+            .migrate_legacy_directory_bindings(&workspaces)
+            .unwrap();
+        assert_eq!(
+            restored.list_tokens()[0].project_directories.as_ref(),
+            Some(&frozen)
+        );
+        assert_eq!(restored.list_tokens()[0].token_id, original.record.token_id);
+        assert_eq!(
+            workspaces
+                .resolve_bound_source_directory(&frozen, None)
+                .unwrap(),
+            std::fs::canonicalize(source).unwrap()
+        );
+        let unbound = restored.issue_token(request()).await.unwrap();
+        restored
+            .migrate_legacy_directory_bindings(&workspaces)
+            .unwrap();
+        let rejected = restored
+            .list_tokens()
+            .into_iter()
+            .find(|record| record.token_id == unbound.record.token_id)
+            .unwrap();
+        assert!(rejected.project_directories.is_none());
+        assert!(rejected.revoked_at_ms.is_none());
+        assert!(
+            McpServiceRuntime::load(path)
+                .list_tokens()
+                .into_iter()
+                .find(|record| record.token_id == unbound.record.token_id)
+                .unwrap()
+                .project_directories
+                .is_none(),
+            "项目编辑后不猜测旧令牌授权；必须重新签发明确绑定的令牌"
+        );
     }
 
     #[tokio::test]
@@ -1738,6 +1880,7 @@ mod tests {
 
     fn network_request() -> IssueTokenRequest {
         IssueTokenRequest {
+            project_directories: None,
             client_name: "remote".to_string(),
             workspace_id: "ws".to_string(),
             approval_mode: ApprovalMode::Ask,

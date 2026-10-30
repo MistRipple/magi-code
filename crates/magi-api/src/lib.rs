@@ -36,6 +36,7 @@ pub(crate) mod session_continue;
 pub mod session_title;
 pub mod skill_loader;
 mod snapshot_lifecycle;
+pub use snapshot_lifecycle::managed_snapshot_manager;
 mod sse;
 mod state;
 mod task_dispatch;

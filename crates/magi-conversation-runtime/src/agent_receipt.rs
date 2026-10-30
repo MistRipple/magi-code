@@ -119,11 +119,18 @@ impl AgentReceipt {
                 if !executor_receipts.is_empty() {
                     payload["executor_receipts"] = Value::Array(executor_receipts);
                 }
-                if let Some(mut workspace) = workspace {
-                    workspace["instruction"] = json!(
+                if let Some(workspace) = workspace {
+                    let instruction = json!(
                         "这些改动已提交到代理分支，尚未进入直接父任务的工作树。直接父任务需要采用时调用 agent_apply(task_id)；嵌套产出逐级合入，不采用时无需处理。"
                     );
-                    payload["workspace"] = workspace;
+                    if workspace.is_array() {
+                        payload["workspaces"] = workspace;
+                        payload["workspace_instruction"] = instruction;
+                    } else {
+                        let mut workspace = workspace;
+                        workspace["instruction"] = instruction;
+                        payload["workspace"] = workspace;
+                    }
                 }
                 Some(Self {
                     payload,
@@ -407,14 +414,22 @@ fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
 fn completed_output(output_refs: &[String]) -> (Option<String>, AgentActivity, Option<Value>) {
     let mut activity = AgentActivity::default();
     let mut final_text = None;
-    let mut workspace = None;
+    let mut workspaces = Vec::new();
     for output in output_refs {
         let parsed = serde_json::from_str::<Value>(output).ok();
         if let Some(output) = parsed
             .as_ref()
             .and_then(|parsed| parsed.get("agent_workspace"))
         {
-            workspace = Some(output.clone());
+            workspaces.push(output.clone());
+            continue;
+        }
+        if let Some(outputs) = parsed
+            .as_ref()
+            .and_then(|parsed| parsed.get("agent_workspaces"))
+            .and_then(Value::as_array)
+        {
+            workspaces.extend(outputs.iter().cloned());
             continue;
         }
         let Some(blocks) =
@@ -445,6 +460,11 @@ fn completed_output(output_refs: &[String]) -> (Option<String>, AgentActivity, O
             }
         }
     }
+    let workspace = match workspaces.len() {
+        0 => None,
+        1 => workspaces.pop(),
+        _ => Some(Value::Array(workspaces)),
+    };
     (final_text, activity, workspace)
 }
 
@@ -978,6 +998,38 @@ mod tests {
             rendered["workspace"]["instruction"]
                 .as_str()
                 .is_some_and(|text| text.contains("agent_apply"))
+        );
+    }
+
+    #[test]
+    fn completed_receipt_preserves_each_repository_without_overwriting_the_final_answer() {
+        let outputs = ["/repo-a", "/repo-b"].map(|root| {
+            json!({
+                    "repository_root": root, "branch": format!("agent{root}"),
+                    "base": "base", "head": "result", "changed_paths": ["src/index.ts"],
+            })
+        });
+        let child = task(
+            TaskStatus::Completed,
+            vec![
+                "两个仓库处理完成".into(),
+                json!({"agent_workspaces": outputs}).to_string(),
+            ],
+        );
+        let rendered = render_receipts(
+            vec![AgentReceipt::from_terminal_task(&child).unwrap()],
+            1024,
+        )
+        .remove(0);
+        assert_eq!(rendered["result"]["final_text"], "两个仓库处理完成");
+        assert_eq!(rendered["workspaces"].as_array().unwrap().len(), 2);
+        assert_eq!(rendered["workspaces"][0]["repository_root"], "/repo-a");
+        assert_eq!(rendered["workspaces"][1]["repository_root"], "/repo-b");
+        assert!(
+            rendered["workspace_instruction"]
+                .as_str()
+                .unwrap()
+                .contains("agent_apply")
         );
     }
 

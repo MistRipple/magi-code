@@ -158,6 +158,11 @@ pub(crate) async fn continue_agent_run(
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
     )?;
+    let _project_admission = scope
+        .workspace_id()
+        .as_ref()
+        .map(|id| state.try_project_directory_admission(id))
+        .transpose()?;
     let manager = state
         .runner_manager()
         .ok_or_else(|| ApiError::internal_assembly("继续代理", "runner_manager 未配置"))?;
@@ -204,6 +209,27 @@ pub(crate) async fn continue_agent_run(
     {
         return Err(ApiError::Conflict("代理结算期间恢复来源已变化".into()));
     }
+    let execution_roots = sources
+        .iter()
+        .map(|task| {
+            let workspace_id = scope.workspace_id();
+            let directories = crate::task_dispatch::validate_or_migrate_directory_binding(
+                state,
+                workspace_id.as_ref(),
+                task.executor_binding
+                    .as_ref()
+                    .and_then(|binding| binding.project_directories.clone()),
+            )?;
+            match directories {
+                Some(binding) => crate::task_dispatch::bound_project_execution_root(
+                    state,
+                    &scope.session_id,
+                    &binding,
+                ),
+                None => Ok(state.personal_session_execution_root_path(&scope.session_id)),
+            }
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
     let turns = state
         .session_store
         .prepare_transferred_agent_continuation(
@@ -216,23 +242,8 @@ pub(crate) async fn continue_agent_run(
     let accepted_turn = turns[0].turn_id.clone();
     let prepare_and_start = || -> Result<(), ApiError> {
         let workspace_id = scope.workspace_id();
-        let execution_root = workspace_id
-            .as_ref()
-            .and_then(|id| {
-                state
-                    .workspace_registry
-                    .workspaces()
-                    .into_iter()
-                    .find(|workspace| &workspace.workspace_id == id)
-            })
-            .map(|workspace| workspace.native_root_path())
-            .or_else(|| {
-                workspace_id
-                    .is_none()
-                    .then(|| state.personal_session_execution_root_path(&scope.session_id))
-            });
         let settings = std::sync::Arc::new(state.settings_store.execution_snapshot());
-        for (task, turn) in sources.iter().zip(&turns) {
+        for ((task, turn), execution_root) in sources.iter().zip(&turns).zip(&execution_roots) {
             let binding = turn
                 .agent_turn_binding()
                 .map_err(|error| ApiError::internal_assembly("恢复代理绑定", error))?
@@ -253,7 +264,7 @@ pub(crate) async fn continue_agent_run(
                 session_id: scope.session_id.clone(),
                 turn_id: turn.turn_id.clone(),
                 workspace_id: workspace_id.clone(),
-                execution_root: execution_root.clone(),
+                execution_root: Some(execution_root.clone()),
                 writebacks: Default::default(),
                 use_tools: true,
                 skill_name: turn

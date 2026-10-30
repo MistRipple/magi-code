@@ -28,7 +28,7 @@ const FILESYSTEM_SNAPSHOT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub(crate) fn capture_tool_workspace_snapshot(
     input: &ToolExecutionInput,
     context: &ToolExecutionContext,
-) -> Option<WorkspaceChangeSnapshot> {
+) -> Option<Vec<WorkspaceChangeSnapshot>> {
     if input.tool_kind != ToolKind::Builtin {
         return None;
     }
@@ -36,7 +36,12 @@ pub(crate) fn capture_tool_workspace_snapshot(
     if !tool_name.captures_workspace_changes() {
         return None;
     }
-    capture_workspace_change_snapshot(context.working_directory.as_deref()?)
+    let roots = context.project_execution_roots().ok()?;
+    let snapshots = roots
+        .iter()
+        .filter_map(|root| capture_workspace_change_snapshot(root))
+        .collect::<Vec<_>>();
+    (!snapshots.is_empty()).then_some(snapshots)
 }
 
 fn capture_workspace_change_snapshot(workdir: &Path) -> Option<WorkspaceChangeSnapshot> {
@@ -48,20 +53,23 @@ fn capture_workspace_change_snapshot(workdir: &Path) -> Option<WorkspaceChangeSn
             &repo_root,
             &["status", "--porcelain=v1", "--untracked-files=all"],
         )?;
+        let root = workdir.canonicalize().ok()?;
         let mut files = BTreeMap::new();
         for line in status.lines() {
             let Some((status_code, file_path)) = parse_git_status_path(line) else {
                 continue;
             };
+            let absolute = repo_root.join(&file_path);
+            let Ok(relative) = absolute.strip_prefix(&root) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
             files.insert(
-                file_path.clone(),
-                fingerprint_workspace_file(&repo_root, &file_path, &status_code),
+                relative.clone(),
+                fingerprint_workspace_file(&root, &relative, &status_code),
             );
         }
-        return Some(WorkspaceChangeSnapshot {
-            root: repo_root,
-            files,
-        });
+        return Some(WorkspaceChangeSnapshot { root, files });
     }
 
     capture_filesystem_change_snapshot(workdir)
@@ -79,28 +87,66 @@ fn capture_filesystem_change_snapshot(root: &Path) -> Option<WorkspaceChangeSnap
 
 pub(crate) fn append_workspace_changed_paths(
     payload: String,
-    before: Option<&WorkspaceChangeSnapshot>,
+    before: Option<&[WorkspaceChangeSnapshot]>,
     context: &ToolExecutionContext,
 ) -> String {
-    let Some(before) = before else {
-        return payload;
-    };
-    let Some(after) = capture_workspace_change_snapshot(
-        context
+    let Some(before) = before else { return payload };
+    let mut changed_paths = Vec::new();
+    let mut changed_files = Vec::new();
+    for before in before {
+        let Some(after) = capture_workspace_change_snapshot(&before.root) else {
+            continue;
+        };
+        if after.root != before.root {
+            continue;
+        }
+        let paths = workspace_changed_paths(before, &after);
+        let source_folder_id = context.project_directory_map.as_ref().and_then(|map| {
+            map.roots
+                .iter()
+                .find(|root| root.execution_root().ok().as_ref() == Some(&before.root))
+                .map(|root| root.source_folder_id.as_str())
+        });
+        let selected = context
             .working_directory
             .as_deref()
-            .unwrap_or(before.root.as_path()),
-    ) else {
-        return payload;
-    };
-    if after.root != before.root {
-        return payload;
+            .map(crate::canonicalize_tool_permission_path)
+            .as_ref()
+            == Some(&before.root);
+        for path in paths {
+            let absolute = before.root.join(&path);
+            changed_paths.push(if selected {
+                path.clone()
+            } else {
+                absolute.to_string_lossy().into_owned()
+            });
+            if let Some(id) = source_folder_id {
+                changed_files.push(serde_json::json!({
+                    "source_folder_id": id,
+                    "path": path,
+                    "absolute_path": absolute.to_string_lossy(),
+                    "absolute_path_ref": magi_core::HostPath::from_path(absolute).to_path_ref().as_str(),
+                }));
+            }
+        }
     }
-    let changed_paths = workspace_changed_paths(before, &after);
     if changed_paths.is_empty() {
         return payload;
     }
-    append_changed_paths_to_json_payload(payload, &changed_paths)
+    let payload = append_changed_paths_to_json_payload(payload, &changed_paths);
+    if changed_files.is_empty() {
+        return payload;
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+        return payload;
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "changed_files".into(),
+            serde_json::Value::Array(changed_files),
+        );
+    }
+    value.to_string()
 }
 
 fn workspace_changed_paths(
@@ -214,9 +260,12 @@ fn collect_filesystem_fingerprints(
             return;
         }
         let path = entry.path();
-        let Ok(metadata) = entry.metadata() else {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
         if metadata.is_dir() {
             if filesystem_snapshot_should_skip_dir(&path) {
                 continue;
@@ -253,7 +302,14 @@ fn filesystem_snapshot_should_skip_dir(path: &Path) -> bool {
     };
     matches!(
         name,
-        ".git" | "node_modules" | "target" | "dist" | "coverage" | ".next" | ".svelte-kit"
+        ".git"
+            | ".magi"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "coverage"
+            | ".next"
+            | ".svelte-kit"
     )
 }
 

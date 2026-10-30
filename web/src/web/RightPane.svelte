@@ -1,6 +1,7 @@
 <script lang="ts">
   import FileName from '../components/FileName.svelte';
   import FileTypeIcon from '../components/FileTypeIcon.svelte';
+  import { resolveComposerSourceFolder } from '../stores/composer-workspace.svelte';
   import { onMount, tick } from 'svelte';
   import Icon from '../components/Icon.svelte';
   import { getAgentRunColor } from '../lib/agent-colors';
@@ -323,6 +324,7 @@
     try {
       await closeTerminalSession({
         terminalTabId: payload.terminalTabId,
+        sourceFolderId: payload.sourceFolderId,
         workspaceId: payload.workspaceId,
         workspacePath: payload.workspacePath,
         sessionId: payload.sessionId,
@@ -335,6 +337,7 @@
   function createTerminalPane(): void {
     if (!canCreateTerminalPane) return;
     openTerminalTab({
+      sourceFolderId: resolveComposerSourceFolder(rightPaneState.activeWorkspaceId || '', rightPaneState.activeSessionId)?.sourceFolderId,
       workspaceId: rightPaneState.activeWorkspaceId,
       workspacePath: workspaceRoot,
       sessionId: rightPaneState.activeSessionId,
@@ -660,6 +663,7 @@
     if (!payload?.filepath) return '';
     return [
       payload.workspaceId ?? '',
+      payload.sourceFolderId ?? '',
       payload.workspacePath ?? '',
       payload.sessionId ?? '',
       payload.filepath,
@@ -696,6 +700,7 @@
       scope: 'workspace' as const,
       workspaceId,
       workspacePath,
+      sourceFolderId: activeCodePayload?.sourceFolderId,
       ...(sessionId ? { sessionId } : {}),
     };
   });
@@ -705,6 +710,7 @@
       sessionId: activeCodePayload?.sessionId,
       workspaceId: activeCodePayload?.workspaceId,
       workspacePath: activeCodePayload?.workspacePath,
+      sourceFolderId: activeCodePayload?.sourceFolderId,
     });
   });
   // 异步内容缓存跟随当前 Tab 集合裁剪，关闭预览后立即释放对应内容。
@@ -758,6 +764,7 @@
           sessionId: activeCodePayload?.sessionId,
           workspaceId: activeCodePayload?.workspaceId || '',
           workspacePath: activeCodePayload?.workspacePath || '',
+          sourceFolderId: activeCodePayload?.sourceFolderId,
         });
         if (contentRequestSeqByKey.get(cacheKey) !== requestSeq) return;
         fetchedContents = { ...fetchedContents, [cacheKey]: payload.content || '' };
@@ -1077,7 +1084,10 @@
     }
     if (tab.kind === 'code') {
       const payload = tab.payload as CodeTabPayload;
-      return payload.displayPath || payload.filepath;
+      const path = payload.displayPath || payload.filepath;
+      return payload.sourceFolderId && payload.workspacePath
+        ? `${payload.workspacePath} · ${path}`
+        : path;
     }
     if (tab.kind === 'browser') {
       const occupied = (tab.payload as BrowserTabPayload).agentOccupied;
@@ -1458,12 +1468,15 @@
       />
     {:else if activeTab.kind === 'terminal'}
       {@const terminalPayload = activeTab.payload as TerminalTabPayload}
+      {#key terminalPayload.terminalTabId}
       <TerminalTabContent
         terminalTabId={terminalPayload.terminalTabId}
+        sourceFolderId={terminalPayload.sourceFolderId}
         workspaceId={terminalPayload.workspaceId}
         workspacePath={terminalPayload.workspacePath}
         sessionId={terminalPayload.sessionId}
       />
+      {/key}
     {:else if activeTab.kind === 'browser'}
       <!-- BrowserTabContent 已在上方的内容槽中渲染；这里不能再进入文件预览分支。 -->
     {:else if activeTab.kind === 'webSession'}
@@ -1581,6 +1594,7 @@
             filePreviewScope={{
               workspaceId: activeCodePayload?.workspaceId,
               workspacePath: activeCodePayload?.workspacePath,
+              sourceFolderId: activeCodePayload?.sourceFolderId,
               sessionId: activeCodePayload?.sessionId,
             }}
           />

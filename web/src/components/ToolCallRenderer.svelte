@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ContentBlock } from '../types/message';
+  import { coerceToolArgumentsRecord } from '../lib/tool-call-display';
   import type { FilePreviewScope } from '../lib/file-reference';
   import {
     isImageGenerationTool,
@@ -63,6 +64,13 @@
     }
   }
 
+  const toolFilePreviewScope = $derived.by(() => {
+    const id = coerceToolArgumentsRecord(block.toolCall?.arguments).source_folder_id;
+    return typeof id === 'string' && id.trim()
+      ? { ...filePreviewScope, sourceFolderId: id.trim() }
+      : filePreviewScope;
+  });
+
   const toolName = $derived(block.toolCall?.name || 'Tool');
   const toolStatus = $derived(block.toolCall?.status);
   const normalizedToolName = $derived(normalizeTerminalToolName(toolName));
@@ -89,7 +97,7 @@
   {#if truncatedRef}
     <div class="tool-output-truncated" data-testid="tool-output-truncated" aria-busy={loadingFull}>
       <span>{i18n.t('toolCall.truncatedOutput', { omitted: truncatedRef.omittedChars })}</span>
-      <button type="button" class="tool-output-load" disabled={loadingFull} onclick={loadFullResult}>
+      <button type="button" class="btn btn--secondary btn--sm" disabled={loadingFull} onclick={loadFullResult}>
         {i18n.t(loadingFull ? 'common.loading' : 'toolCall.loadFullOutput')}
       </button>
       {#if loadFullFailed}
@@ -102,7 +110,7 @@
 {#if isGeneratedImageTool && (hasGeneratedImagePreview || toolStatus === 'pending' || toolStatus === 'running')}
   <GeneratedImageBlock
     {block}
-    {filePreviewScope}
+    filePreviewScope={toolFilePreviewScope}
   />
 {:else if isTerminalSessionTool}
   <TerminalSessionCard
@@ -120,7 +128,7 @@
     output={effectiveToolCall?.result}
     error={effectiveToolCall?.error}
     standardized={block.toolCall?.standardized}
-    {filePreviewScope}
+    filePreviewScope={toolFilePreviewScope}
     {presentationRole}
     {agentChildStatus} {agentChildStatusUpdatedAt}
     {compactAgent}
@@ -140,20 +148,6 @@
     padding-block: var(--space-2);
     color: var(--foreground-muted);
     font-size: var(--text-xs);
-  }
-
-  .tool-output-load {
-    color: var(--primary);
-    background: none;
-    border: 0;
-    padding: 0;
-    cursor: pointer;
-    font: inherit;
-  }
-
-  .tool-output-load:disabled {
-    opacity: 0.6;
-    cursor: default;
   }
 
   .tool-output-error {

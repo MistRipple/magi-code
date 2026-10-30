@@ -15,8 +15,15 @@ pub struct WebImage {
     pub alt: String,
 }
 
-/// 宿主提供的图片落地：保存到会话所属项目，返回 Markdown 里引用用的项目相对路径。
+/// 宿主在发送前绑定原 Turn，图片落地时再次验证该作用域，返回会话内相对路径。
 pub trait WebImageSink: Send + Sync {
+    fn for_turn(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        slot_turn_id: u64,
+    ) -> Result<std::sync::Arc<dyn WebImageSink>, String>;
+
     fn store(&self, session_id: &str, project_id: &str, image: WebImage) -> Result<String, String>;
 }
 

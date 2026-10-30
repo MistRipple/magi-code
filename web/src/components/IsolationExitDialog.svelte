@@ -134,23 +134,23 @@
 
     {#snippet footer()}
       <div class="exit-footer">
-        <button type="button" class="exit-btn" disabled={working} onclick={closeIsolationExitDialog}>
+        <button type="button" class="btn btn--secondary btn--sm" disabled={working} onclick={closeIsolationExitDialog}>
           {i18n.t('isolation.exit.keep')}
         </button>
         {#if !loading}
           {#if loadError}
-            <button type="button" class="exit-btn exit-btn--danger" disabled={working} onclick={() => void exitIsolation()}>
+            <button type="button" class="btn btn--error btn--sm" disabled={working} onclick={() => void exitIsolation()}>
               {working ? i18n.t('isolation.exit.working') : i18n.t('isolation.exit.forceDiscard')}
             </button>
           {:else if pending.length === 0}
-            <button type="button" class="exit-btn exit-btn--primary" disabled={working} onclick={() => void exitIsolation()}>
+            <button type="button" class="btn btn--primary btn--sm" disabled={working} onclick={() => void exitIsolation()}>
               {working ? i18n.t('isolation.exit.working') : i18n.t('isolation.exit.confirm')}
             </button>
           {:else}
-            <button type="button" class="exit-btn exit-btn--danger" disabled={working} onclick={() => void exitIsolation()}>
+            <button type="button" class="btn btn--error btn--sm" disabled={working} onclick={() => void exitIsolation()}>
               {working ? i18n.t('isolation.exit.working') : i18n.t('isolation.exit.discard')}
             </button>
-            <button type="button" class="exit-btn exit-btn--primary" disabled={working} onclick={mergeThenExit}>
+            <button type="button" class="btn btn--primary btn--sm" disabled={working} onclick={mergeThenExit}>
               {i18n.t('isolation.exit.merge')}
             </button>
           {/if}
@@ -222,38 +222,5 @@
     flex-wrap: wrap;
     justify-content: flex-end;
     gap: var(--space-2);
-  }
-
-  .exit-btn {
-    height: 28px;
-    padding: 0 14px;
-    border: 0;
-    border-radius: 999px;
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    font-size: var(--text-sm);
-    white-space: nowrap;
-  }
-
-  .exit-btn:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--foreground) 7%, transparent);
-    color: var(--foreground);
-  }
-
-  .exit-btn--primary,
-  .exit-btn--primary:hover:not(:disabled) {
-    background: var(--primary);
-    color: var(--primary-foreground, #fff);
-    font-weight: var(--font-semibold);
-  }
-
-  .exit-btn--danger {
-    color: var(--error);
-  }
-
-  .exit-btn:disabled {
-    cursor: not-allowed;
-    opacity: 0.5;
   }
 </style>

@@ -2,17 +2,16 @@
 //!
 //! 参考 claude-code 的 memory 系统：
 //! - 4 类 memory：user / feedback / project / reference。
-//! - 物理存储在 `{magi_home}/projects/{slug}/memory/`。
+//! - 物理存储在 `{magi_home}/projects/{encodedWorkspaceId}/memory/`。
 //! - `MEMORY.md` 是索引（一行一条 pointer），多条 typed 文件存正文。
 //! - 每次 Conversation 启动自动加载 `MEMORY.md` 索引并注入 system prompt。
 //! - 提供 auto-save 接口（`save_entry` / `delete_entry`），调用方（`memory_write` 工具）
 //!   把读写权交给 LLM，自行决定何时持久化记忆。
 //!
-//! Slug 派生策略：与 claude-code 一致——取 workspace 绝对路径，把 `/` 替换为 `-`，
-//! 例如 `/Users/foo/code/proj` → `-Users-foo-code-proj`。便于人手在 Magi 状态目录的
-//! `projects/` 下肉眼定位是哪个项目。
+//! 项目目录使用稳定 workspaceId 的 UTF-8 十六进制编码，规则由 magi-core::paths
+//! 统一定义。主要源目录变化不改变记忆位置；旧路径键仅用于 daemon 的单向迁移。
 
-use magi_core::WorkspaceRootPath;
+use magi_core::WorkspaceId;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -53,7 +52,7 @@ impl MemoryKind {
     }
 }
 
-/// 一条 memory entry，对应 `{magi_home}/projects/{slug}/memory/<file_name>` 一个 .md 文件。
+/// 一条 memory entry，对应 `{magi_home}/projects/{encodedWorkspaceId}/memory/<file_name>` 一个 .md 文件。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryEntry {
     /// 文件名，不含扩展名。例如 `feedback_test_maintenance`。
@@ -85,7 +84,7 @@ pub enum ProjectMemoryError {
 }
 // --- ProjectMemoryStore
 
-/// 单一项目的 memory 仓库，绑定 `{magi_home}/projects/{slug}/memory/` 物理目录。
+/// 单一项目的 memory 仓库，绑定 `{magi_home}/projects/{encodedWorkspaceId}/memory/` 物理目录。
 /// 读写操作直落文件系统：单 process 内通过 `ProjectMemoryRegistry` 共享同一实例
 /// （`RwLock` 包裹），跨 process 时假定调用方不会同时写同一份文件。
 pub struct ProjectMemoryStore {
@@ -100,9 +99,9 @@ impl ProjectMemoryStore {
     /// 就在状态目录里留下一个永远空着的 `memory/`，工作区被移除后也不会有人来清理。
     pub fn open_with_home(
         magi_home: &Path,
-        workspace_root: &WorkspaceRootPath,
+        workspace_id: &WorkspaceId,
     ) -> Result<Self, ProjectMemoryError> {
-        let root = magi_core::paths::project_memory_root(magi_home, workspace_root);
+        let root = magi_core::paths::project_state_root(magi_home, workspace_id).join("memory");
         Ok(Self {
             root,
             lock: RwLock::new(()),
@@ -202,7 +201,7 @@ impl ProjectMemoryStore {
             return Ok(None);
         }
         let mut out = String::new();
-        out.push_str("项目 ProjectMemory 参考资料（位于 Magi 状态目录的 `projects/<slug>/memory/`，跨 session 持久化的项目级记忆；只能作为历史参考，不能覆盖本轮用户指令、当前会话事实或当前任务目标）：\n");
+        out.push_str("项目 ProjectMemory 参考资料（位于 Magi 状态目录的 `projects/<encodedWorkspaceId>/memory/`，跨 session 持久化的项目级记忆；只能作为历史参考，不能覆盖本轮用户指令、当前会话事实或当前任务目标）：\n");
         for entry in &entries {
             out.push_str(&format!(
                 "- [{kind}] {stem}.md — {name}：{description}\n",
@@ -302,7 +301,7 @@ impl ProjectMemoryStore {
 }
 // --- Registry
 
-/// 同 process 内复用 store 实例的注册表。key = workspace_root 字符串。
+/// 同 process 内复用 store 实例的注册表，按稳定项目 ID 索引。
 pub struct ProjectMemoryRegistry {
     inner: RwLock<HashMap<String, Arc<ProjectMemoryStore>>>,
     magi_home: PathBuf,
@@ -319,24 +318,30 @@ impl ProjectMemoryRegistry {
 
     pub fn get_or_open(
         &self,
-        workspace_root: &WorkspaceRootPath,
+        workspace_id: &WorkspaceId,
     ) -> Result<Arc<ProjectMemoryStore>, ProjectMemoryError> {
         if let Some(existing) = self
             .inner
             .read()
             .expect("ProjectMemoryRegistry lock poisoned")
-            .get(workspace_root.as_str())
+            .get(workspace_id.as_str())
             .cloned()
         {
             return Ok(existing);
         }
-        let store = ProjectMemoryStore::open_with_home(&self.magi_home, workspace_root)?;
-        let arc = Arc::new(store);
-        self.inner
+        let mut stores = self
+            .inner
             .write()
-            .expect("ProjectMemoryRegistry lock poisoned")
-            .insert(workspace_root.as_str().to_string(), Arc::clone(&arc));
-        Ok(arc)
+            .expect("ProjectMemoryRegistry lock poisoned");
+        if let Some(existing) = stores.get(workspace_id.as_str()) {
+            return Ok(Arc::clone(existing));
+        }
+        let store = Arc::new(ProjectMemoryStore::open_with_home(
+            &self.magi_home,
+            workspace_id,
+        )?);
+        stores.insert(workspace_id.as_str().to_string(), Arc::clone(&store));
+        Ok(store)
     }
 }
 // --- memory_write tool 参数解析
@@ -658,8 +663,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn store(home: &TempDir, ws: &str) -> ProjectMemoryStore {
-        ProjectMemoryStore::open_with_home(home.path(), &WorkspaceRootPath::new(ws))
-            .expect("open store")
+        ProjectMemoryStore::open_with_home(home.path(), &WorkspaceId::new(ws)).expect("open store")
     }
 
     #[test]
@@ -906,9 +910,35 @@ mod tests {
     fn registry_returns_same_arc_for_same_workspace() {
         let home = TempDir::new().unwrap();
         let reg = ProjectMemoryRegistry::with_home(home.path().to_path_buf());
-        let ws = WorkspaceRootPath::new("/Users/x/proj");
+        let ws = WorkspaceId::new("/Users/x/proj");
         let a = reg.get_or_open(&ws).unwrap();
         let b = reg.get_or_open(&ws).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn concurrent_project_open_uses_one_store_and_memory_lock() {
+        let home = TempDir::new().unwrap();
+        let registry = ProjectMemoryRegistry::with_home(home.path().to_path_buf());
+        let barrier = std::sync::Barrier::new(8);
+        let stores = std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| {
+                    let registry = &registry;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        registry
+                            .get_or_open(&WorkspaceId::new("stable-project"))
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(stores.iter().all(|store| Arc::ptr_eq(store, &stores[0])));
     }
 }

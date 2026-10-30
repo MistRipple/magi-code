@@ -1,10 +1,8 @@
+import type { FilePreviewScope } from './file-reference';
+
 type ContextAction = () => void | Promise<void>;
 
-export type DesktopFileScope = {
-  workspaceId?: string;
-  workspacePath?: string;
-  sessionId?: string;
-};
+export type DesktopFileScope = FilePreviewScope;
 
 export type DesktopContextMenuDescriptor =
   | {

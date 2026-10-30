@@ -261,6 +261,9 @@
       workspaceId: item.workspaceId,
       workspacePath: item.workspacePath,
       sessionId: item.sessionId,
+      sourceFolderId: typeof item.message.metadata?.sourceFolderId === 'string'
+        ? item.message.metadata.sourceFolderId
+        : undefined,
     };
   }
 
@@ -1834,7 +1837,7 @@
         {#if canLoadOlderHistory || sessionHistory.historyLoadStatus === 'loading'}
           <button
             type="button"
-            class="empty-history-load"
+            class="btn btn--secondary empty-history-load"
             onclick={() => requestOlderHistoryLoad()}
             disabled={!canLoadOlderHistory}
           >
@@ -2214,32 +2217,10 @@
     opacity: 0.75;
   }
 
-  .empty-history-load {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: var(--space-2);
-    min-height: 32px;
-    margin-top: var(--space-4);
-    padding: 0 var(--space-3);
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-md);
-    background: var(--surface-2);
-    color: var(--foreground);
-    font-size: var(--text-sm);
-    line-height: 1;
-    cursor: pointer;
-  }
 
-  .empty-history-load:hover:not(:disabled) {
-    border-color: var(--primary);
-    color: var(--primary);
-  }
 
-  .empty-history-load:disabled {
-    cursor: default;
-    opacity: 0.65;
-  }
+
+  .empty-history-load { margin-top: var(--space-4); }
 
   /* 滚动按钮 - 绝对定位在消息列表右下角 */
   .scroll-to-bottom {

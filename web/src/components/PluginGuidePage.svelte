@@ -98,11 +98,11 @@
       <div class="guide-header">
         <h3>{i18n.t('settings.plugins.guide.toggle')}</h3>
         {#if guide !== null && !loadError}<div class="guide-actions">
-          <button class="guide-action" data-copy-feedback={guideCopied} data-testid="plugin-guide-copy" onclick={() => void copyGuide()}>
+          <button class="btn btn--secondary btn--sm" data-copy-feedback={guideCopied} data-testid="plugin-guide-copy" onclick={() => void copyGuide()}>
             <Icon name={guideCopied ? 'check' : 'copy'} size={13} />
             <span>{guideCopied ? i18n.t('settings.plugins.guide.copied') : i18n.t('settings.plugins.guide.copy')}</span>
           </button>
-          <button class="guide-action" data-testid="plugin-guide-export" onclick={exportGuide}>
+          <button class="btn btn--secondary btn--sm" data-testid="plugin-guide-export" onclick={exportGuide}>
             <Icon name="download" size={13} />
             <span>{i18n.t('settings.plugins.guide.export')}</span>
           </button>
@@ -135,13 +135,6 @@
   .guide-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; }
   .guide-header h3 { margin: 0; }
   .guide-actions { display: flex; gap: 6px; align-items: center; }
-  .guide-action {
-    display: inline-flex; align-items: center; gap: 4px; height: 28px; padding: 0 8px; background: transparent;
-    border: none; box-shadow: none; border-radius: var(--radius-sm); color: var(--foreground-muted); font-size: var(--text-xs); cursor: pointer;
-    transition: background var(--transition-fast), color var(--transition-fast);
-  }
-  .guide-action:hover { background: var(--surface-hover); color: var(--foreground); }
-  .guide-action:focus { outline: none; }
 
   /* 开发规范阅读页：左侧章节目录、右侧正文；长表格与代码块只在自身内部滚动。 */
 

@@ -103,6 +103,8 @@ pub struct SessionTurnExecutionRequest {
     pub session_id: SessionId,
     pub turn_id: String,
     pub workspace_id: Option<WorkspaceId>,
+    /// 接纳时冻结的项目目录授权；普通对话执行和恢复均沿此事实核对。
+    pub project_directories: Option<magi_core::ProjectDirectoryBinding>,
     pub prompt: String,
     pub images: Vec<SessionTurnImage>,
     pub context_references: Vec<crate::context_reference::SessionContextReference>,
@@ -3318,6 +3320,7 @@ mod tests {
             safety_gate: None,
             skill_runtime: None,
             request: SessionTurnExecutionRequest {
+                project_directories: None,
                 session_id,
                 turn_id,
                 workspace_id: None,
@@ -3447,6 +3450,7 @@ mod tests {
             requests: Mutex::new(Vec::new()),
         };
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id,
             workspace_id: None,
@@ -3537,6 +3541,7 @@ mod tests {
             .begin_session_turn_input(session_id.clone(), follow_up_turn_id.clone())
             .expect("识图后的纯文本输入边界必须可创建");
         let follow_up_request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id: follow_up_turn_id,
             workspace_id: None,
@@ -3823,6 +3828,7 @@ mod tests {
         };
         let event_bus = InMemoryEventBus::new(32);
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id,
             workspace_id: None,
@@ -3987,6 +3993,7 @@ mod tests {
             safety_gate: None,
             skill_runtime: None,
             request: SessionTurnExecutionRequest {
+                project_directories: None,
                 session_id,
                 turn_id: ordinary_turn_id,
                 workspace_id: None,
@@ -4155,6 +4162,7 @@ mod tests {
             safety_gate: None,
             skill_runtime: None,
             request: SessionTurnExecutionRequest {
+                project_directories: None,
                 session_id: session_id.clone(),
                 turn_id: "turn-runtime-invalid-state".to_string(),
                 workspace_id: None,
@@ -4241,6 +4249,7 @@ mod tests {
             })
             .expect("plan should write");
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id: "turn-empty-response-layer".to_string(),
             workspace_id: None,
@@ -4356,6 +4365,7 @@ mod tests {
         let event_bus = InMemoryEventBus::new(16);
         let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id: "turn-empty-stream-recovery".to_string(),
             workspace_id: None,
@@ -4443,6 +4453,7 @@ mod tests {
         };
         let event_bus = InMemoryEventBus::new(16);
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id: "turn-partial-stream-failure".to_string(),
             workspace_id: None,
@@ -4555,6 +4566,7 @@ mod tests {
         };
         let event_bus = InMemoryEventBus::new(32);
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id: "turn-stream-recovery".to_string(),
             workspace_id: None,
@@ -4656,6 +4668,7 @@ mod tests {
         };
         let event_bus = InMemoryEventBus::new(16);
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id: "turn-image-error-layer".to_string(),
             workspace_id: None,
@@ -4756,6 +4769,7 @@ mod tests {
             payload: serde_json::json!({ "content": "你好" }).to_string(),
         };
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id: "turn-placeholder-reuse".to_string(),
             workspace_id: None,
@@ -4876,6 +4890,7 @@ mod tests {
         );
         let event_bus = InMemoryEventBus::new(16);
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id: "turn-model-retry-runtime".to_string(),
             workspace_id: workspace_id.clone(),
@@ -5084,6 +5099,7 @@ mod tests {
         );
 
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id,
             turn_id: "turn-session-2000".to_string(),
             workspace_id: None,
@@ -5507,6 +5523,7 @@ mod tests {
             },
         );
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id,
             turn_id: "turn-current".to_string(),
             workspace_id: None,
@@ -5661,6 +5678,7 @@ mod tests {
             },
         );
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id,
             turn_id: "turn-session-2000".to_string(),
             workspace_id: None,
@@ -5695,6 +5713,7 @@ mod tests {
             .create_session(session_id.clone(), "context references")
             .expect("session should be created");
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id,
             turn_id: "turn-context-references".to_string(),
             workspace_id: Some(WorkspaceId::new("workspace-context-references")),
@@ -5703,6 +5722,7 @@ mod tests {
             context_references: vec![crate::context_reference::SessionContextReference {
                 kind: crate::context_reference::SessionContextReferenceKind::Directory,
                 path: std::path::PathBuf::from("/tmp/external-reference"),
+                source_folder_id: None,
                 name: "external-reference".to_string(),
             }],
             access_profile: AccessProfile::Restricted,
@@ -5739,6 +5759,7 @@ mod tests {
             .create_session(session_id.clone(), "knowledge context")
             .expect("session should be created");
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id,
             turn_id: "turn-knowledge-context".to_string(),
             workspace_id: Some(WorkspaceId::new("workspace-knowledge-context")),
@@ -5808,6 +5829,7 @@ mod tests {
             },
         );
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id,
             turn_id: "turn-current-image".to_string(),
             workspace_id: None,
@@ -5860,6 +5882,7 @@ mod tests {
             },
         );
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id,
             turn_id: "turn-workspace-chat".to_string(),
             workspace_id: Some(WorkspaceId::new("workspace-context")),
@@ -5923,6 +5946,7 @@ mod tests {
         );
         let event_bus = InMemoryEventBus::new(16);
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id: "turn-post-tool-final-item".to_string(),
             workspace_id: None,
@@ -6087,6 +6111,7 @@ mod tests {
         );
         let event_bus = InMemoryEventBus::new(16);
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id: "turn-context-compaction-notice".to_string(),
             workspace_id: Some(WorkspaceId::new("workspace-context-compaction-notice")),
@@ -6264,6 +6289,7 @@ mod tests {
             },
         );
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id: "turn-context-limit-after-tool".to_string(),
             workspace_id: Some(WorkspaceId::new("workspace-context-limit-after-tool")),
@@ -6365,6 +6391,7 @@ mod tests {
             },
         );
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id: "turn-context-compaction-failure".to_string(),
             workspace_id: Some(WorkspaceId::new("workspace-context-compaction-failure")),
@@ -6464,6 +6491,7 @@ mod tests {
             },
         );
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id: "turn-context-compaction-cancelled".to_string(),
             workspace_id: Some(WorkspaceId::new("workspace-context-compaction-cancelled")),
@@ -6550,6 +6578,7 @@ mod tests {
         );
         let event_bus = InMemoryEventBus::new(16);
         let request = SessionTurnExecutionRequest {
+            project_directories: None,
             session_id: session_id.clone(),
             turn_id: "turn-terminal-duration".to_string(),
             workspace_id: None,

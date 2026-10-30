@@ -1285,6 +1285,7 @@ mod tests {
             source_ref: Some("src/parser.rs".to_string()),
             updated_at: UtcMillis(55),
             source: magi_knowledge_store::CodeIndexSource {
+                code_scope: None,
                 path: "src/parser.rs".to_string(),
                 language: Some("rust".to_string()),
                 repo_ref: Some("magi-rust-rewrite".to_string()),

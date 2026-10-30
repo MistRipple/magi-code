@@ -75,6 +75,10 @@ pub enum KnowledgeContextDecision {
 pub struct KnowledgeContextRequest {
     pub consumer: KnowledgeConsumer,
     pub workspace_id: Option<WorkspaceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_folder_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_root: Option<String>,
     pub query: String,
 }
 
@@ -185,7 +189,7 @@ impl ContextRuntime {
         request: KnowledgeContextRequest,
     ) -> KnowledgeContextSelection {
         let cache_key = format!(
-            "{:?}\u{001f}{}\u{001f}{}\u{001f}{}",
+            "{:?}\u{001f}{}\u{001f}{}\u{001f}{}\u{001f}{}\u{001f}{}",
             request.consumer,
             request
                 .workspace_id
@@ -193,6 +197,8 @@ impl ContextRuntime {
                 .map(WorkspaceId::as_str)
                 .unwrap_or_default(),
             self.knowledge_store.revision(),
+            request.source_folder_id.as_deref().unwrap_or_default(),
+            request.execution_root.as_deref().unwrap_or_default(),
             normalize_knowledge_query(&request.query),
         );
         if let Some(selection) = self.knowledge_selection_cache.get(&cache_key) {
@@ -223,7 +229,18 @@ impl ContextRuntime {
             );
         };
 
-        let query_result = self.knowledge_store.governed_query(&KnowledgeQuery {
+        let scoped_store = request
+            .source_folder_id
+            .as_deref()
+            .zip(request.execution_root.as_deref())
+            .and_then(|(source_id, root)| {
+                let root = magi_core::HostPath::from_path_ref(root).ok()?;
+                self.knowledge_store
+                    .for_source_folder(source_id, root.as_path())
+                    .ok()
+            });
+        let store = scoped_store.as_ref().unwrap_or(&self.knowledge_store);
+        let query_result = store.governed_query(&KnowledgeQuery {
             kind: None,
             text: Some(request.query),
             tags: Vec::new(),
@@ -247,7 +264,7 @@ impl ContextRuntime {
             .into_iter()
             .filter(|result| intent.accepts(result.kind))
             .filter_map(|result| {
-                let record = self.knowledge_store.get(&result.knowledge_id)?;
+                let record = store.get(&result.knowledge_id)?;
                 Some((result.score + intent.boost(result.kind), result, record))
             })
             .collect::<Vec<_>>();
@@ -316,11 +333,16 @@ impl ContextRuntime {
             .collect::<Vec<_>>();
         query_terms.sort();
         query_terms.dedup();
-        let graph_context = self.expand_graph_context(
-            &workspace_id,
-            &results,
-            MAX_TOTAL_CHARS.saturating_sub(total_chars),
-        );
+        let graph_context = if request.source_folder_id.is_some() && scoped_store.is_none() {
+            Vec::new()
+        } else {
+            self.expand_graph_context(
+                store,
+                &workspace_id,
+                &results,
+                MAX_TOTAL_CHARS.saturating_sub(total_chars),
+            )
+        };
         let graph_chars = graph_context
             .iter()
             .map(|graph| graph.injected_chars)
@@ -340,6 +362,7 @@ impl ContextRuntime {
 
     fn expand_graph_context(
         &self,
+        store: &magi_knowledge_store::KnowledgeStore,
         workspace_id: &WorkspaceId,
         results: &[SelectedKnowledgeContext],
         remaining_chars: usize,
@@ -351,7 +374,7 @@ impl ContextRuntime {
                 if remaining_chars == 0 {
                     return None;
                 }
-                let graph = self.knowledge_store.query_workspace_graph(
+                let graph = store.query_workspace_graph(
                     workspace_id,
                     &GraphQuery {
                         focus: Some(format!("knowledge:{}", result.knowledge_id)),
@@ -718,6 +741,8 @@ mod tests {
             runtime_with_knowledge().select_knowledge_on_demand(KnowledgeContextRequest {
                 consumer: KnowledgeConsumer::Mainline,
                 workspace_id: Some(WorkspaceId::new("workspace-knowledge-context")),
+                source_folder_id: None,
+                execution_root: None,
                 query: "你好，继续吧".to_string(),
             });
 
@@ -732,6 +757,8 @@ mod tests {
             runtime_with_knowledge().select_knowledge_on_demand(KnowledgeContextRequest {
                 consumer: KnowledgeConsumer::Mainline,
                 workspace_id: Some(WorkspaceId::new("workspace-knowledge-context")),
+                source_folder_id: None,
+                execution_root: None,
                 query: "为什么运行时要采用单一事实源架构？".to_string(),
             });
 
@@ -754,6 +781,8 @@ mod tests {
             runtime_with_knowledge().select_knowledge_on_demand(KnowledgeContextRequest {
                 consumer: KnowledgeConsumer::TaskExecution,
                 workspace_id: None,
+                source_folder_id: None,
+                execution_root: None,
                 query: "排查登录失败后如何刷新令牌".to_string(),
             });
 
@@ -790,6 +819,7 @@ mod tests {
         store.build_workspace_index(&workspace_id, &root);
         store
             .upsert_relation(KnowledgeRelation {
+                code_scope: None,
                 relation_id: "candidate-parser-relation".to_string(),
                 workspace_id: workspace_id.clone(),
                 source: GraphNodeRef::Knowledge {
@@ -815,6 +845,8 @@ mod tests {
             KnowledgeContextRequest {
                 consumer: KnowledgeConsumer::Mainline,
                 workspace_id: Some(workspace_id),
+                source_folder_id: None,
+                execution_root: None,
                 query: "为什么 parser 架构这样设计？".to_string(),
             },
         );
@@ -864,6 +896,8 @@ mod tests {
             KnowledgeContextRequest {
                 consumer: KnowledgeConsumer::TaskExecution,
                 workspace_id: Some(workspace_id),
+                source_folder_id: None,
+                execution_root: None,
                 query: "为什么 local 架构这样设计？".to_string(),
             },
         );
@@ -911,6 +945,7 @@ mod tests {
         for index in 0..24 {
             store
                 .upsert_relation(KnowledgeRelation {
+                    code_scope: None,
                     relation_id: format!("large-relation-{index}"),
                     workspace_id: workspace_id.clone(),
                     source: GraphNodeRef::Knowledge {
@@ -937,6 +972,8 @@ mod tests {
             KnowledgeContextRequest {
                 consumer: KnowledgeConsumer::Mainline,
                 workspace_id: Some(workspace_id),
+                source_folder_id: None,
+                execution_root: None,
                 query: "为什么 large graph 架构这样设计？".to_string(),
             },
         );

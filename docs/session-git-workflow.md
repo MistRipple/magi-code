@@ -47,12 +47,16 @@
 branch 或 HEAD 后保留原期望基线，返回 drift/409，不静默接受。用户可以通过
 `/workspace/vcs/context/accept` 明确接受新基线。
 
+多源项目的注册表按会话及规范工作树路径寻址，不能用 `get(sessionId)` 任意选择一份上下文。HTTP Git 请求携带 `sourceFolderId`，工具通过冻结目录映射选择实际仓库；普通目录不获得 Git 上下文。项目身份、仓库身份和执行副本分别保留，主要目录切换不会重写已有基线或产物归属。
+
 ### 2.3 并发模型
 
 存在两层互补保护：
 
 1. `GitService` repository mutex 串行化 refs、HEAD、index 和 worktree 元数据操作；
 2. `WorkspaceGitOperationCoordinator` 在 turn/worker 与 Git mutation 之间建立 lease。
+
+跨仓库执行先按规范仓库身份稳定排序，整组获取租约；无法取得全部资源时释放已取得部分再等待，避免两个会话各占一半后死锁。取消按原会话释放整组，linked worktree 的元数据操作仍按 Git common dir 串行化。
 
 同一 repository 的两个主 session 的工作区执行由租约串行化；纯对话和文件检索不占用该租约。持有执行租约的 session 会阻止结构化
 branch/merge/delete/worktree mutation。外部终端不服从进程内 lease，因此持锁后的实时
@@ -81,10 +85,11 @@ worktree，也就不需要这把租约。机制、触发条件和合并语义见
 子代理在首次本地文件、检索、进程或 Git 工具准备时，从直接父任务当时的工作树快照创建独立 worktree（主线或父代理副本，包含未提交内容）。只使用模型、网络或会话协调能力的子代理不创建 worktree。GitService::snapshot_worktree 使用独立 index，把已跟踪和未跟踪的当前内容写成临时提交，不改变用户的 HEAD、index 或工作树。
 
 - 只读代理使用 detached worktree；可写代理从同一快照创建独立代理分支。
-- 工具 working_directory 与路径权限一起指向代理 worktree；ProjectMemory 仍以主 workspace identity root 归档。独立 worktree 的改动归代理分支，不使用主会话 snapshot hook 记录代理相对路径；普通目录和会话隔离副本里的子代理沿用该目录的变更账本。
+- 工具 working_directory 与路径权限一起指向代理 worktree；ProjectMemory 按稳定项目 ID 归档。子代理继承父任务的实际目录映射与权限子集，各仓库分别准备 worktree 并记录产物。独立 worktree 的改动归代理分支，不使用主会话 snapshot hook 记录代理相对路径；普通目录和会话隔离副本里的子代理沿用该目录的变更账本。
 - 模型已生成的工具参数仍引用旧目录时返回明确未执行回执，下一次请求使用更新后的 workspace 上下文；路径别名与 Windows JSON 路径按同一边界处理。
 - 可写代理终态时把产出提交到代理分支，回执包含分支、提交和改动路径；提交失败须保留工作目录并返回错误。
 - `agent_apply` 只采用已完成的直接子代理产出：主线合入主工作树，获授委派权的代理合入自己的活动可写副本。缺少真实任务身份、越级或父租约失效时拒绝；产出相对各自快照计算，不能用切换 HEAD 或丢弃 dirty 文件代替，冲突返回明确结果。
+- 多仓库产物分别采用并返回各自结果；前一个成功、后一个冲突时保留成功事实和剩余成果，不承诺跨仓库原子提交。
 - 主线可显式用 `allow_delegation=true` 授予直接子代理继续派发的能力，最多两层；孙代理不能再委派。嵌套快照检查父 Task 和 worktree 的租约，父目录释放后不会回落主目录。共享计划/Goal/主分支操作仍由主线持有。
 - 活动代理的占用按 TaskStore 生命周期释放，重启后核对真实任务状态；主线 Git mutation 不得与活动代理竞态。
 
@@ -115,6 +120,8 @@ Mutation 推荐始终携带：
 ```json
 {
   "sessionId": "session-...",
+  "workspaceId": "workspace-...",
+  "sourceFolderId": "source-...",
   "workspacePath": "/absolute/workspace",
   "expectedContextRevision": 3,
   "expectedBranch": "main",

@@ -143,6 +143,10 @@ async fn submit_session_turn_internal(
         )?
     };
     let workspace_id = scope.workspace_id();
+    let _project_admission = workspace_id
+        .as_ref()
+        .map(|id| state.try_project_directory_admission(id))
+        .transpose()?;
     if request.steer_current_turn && (request.goal_mode || request.resume) {
         return Err(ApiError::InvalidInput(
             "目标模式和继续执行必须作为独立执行轮次提交，不能作为当前轮引导".to_string(),
@@ -200,6 +204,69 @@ async fn submit_session_turn_internal(
     validate_workflow_selection(&state, &request)?;
     validate_plugin_command_selection(&state, &request)?;
     let decision = decide_session_turn(&state, &request)?;
+    request.source_folder_id =
+        trimmed_non_empty(request.source_folder_id.as_deref()).map(str::to_string);
+    request.project_directories = if request.resume {
+        let session_id = request
+            .requested_session_id()
+            .expect("validated resume session");
+        let source_task_id = decision
+            .recovery_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.source_task_id.clone())
+            .or_else(|| {
+                state
+                    .session_store
+                    .active_execution_chain(&session_id)
+                    .map(|chain| chain.root_task_id)
+            });
+        let source_task = source_task_id
+            .as_ref()
+            .and_then(|id| state.task_store().and_then(|store| store.get_task(id)));
+        let original = source_task
+            .and_then(|task| task.executor_binding)
+            .and_then(|binding| binding.project_directories);
+        let binding = crate::task_dispatch::validate_or_migrate_directory_binding(
+            &state,
+            workspace_id.as_ref(),
+            original,
+        )?;
+        if request.source_folder_id.as_ref().is_some_and(|id| {
+            binding
+                .as_ref()
+                .is_none_or(|binding| &binding.default_source_folder_id != id)
+        }) {
+            return Err(ApiError::Conflict(
+                "继续执行不能改变原任务的源文件夹".into(),
+            ));
+        }
+        binding
+    } else {
+        match workspace_id.as_ref() {
+            Some(workspace_id) => Some(
+                state
+                    .workspace_registry
+                    .capture_directory_binding(
+                        workspace_id,
+                        request.source_folder_id.as_deref(),
+                        None,
+                    )
+                    .map_err(|error| {
+                        ApiError::InvalidInput(format!("项目源文件夹选择无效: {error}"))
+                    })?,
+            ),
+            None if request.source_folder_id.is_some() => {
+                return Err(ApiError::InvalidInput(
+                    "个人会话不能选择项目源文件夹".into(),
+                ));
+            }
+            None => None,
+        }
+    };
+    crate::task_dispatch::validate_project_context_references(
+        request.project_directories.as_ref(),
+        &request.context_references(),
+    )?;
     let canonical_goal_mode = request.goal_mode;
     if let Some(target) = request.interrupt_turn_id.as_deref() {
         let session_id = request.requested_session_id().expect("validated session");
@@ -501,6 +568,7 @@ fn enqueue_session_turn_response(
     let queued_request_id = Some(request_id);
     let queued_user_message_id = Some(user_message_item_id.clone());
     let queue_position = state.enqueue_regular_session_turn(QueuedRegularSessionTurn {
+        project_directories: request.project_directories.clone(),
         request,
         request_fingerprint: Some(request_fingerprint),
         requested_workspace_id,
@@ -686,6 +754,7 @@ pub(crate) async fn submit_steer_current_turn_after_turn_commit(
             }
             other => ApiError::Conflict(other.to_string()),
         })?;
+    validate_steer_directory_binding(state, &session_id, &expected_turn_id, request)?;
     if !session_turn_request_is_steerable_input(request) {
         return Err(ApiError::InvalidInput(
             "引导仅支持文字与图片，不能混合命令或其他上下文选择".to_string(),
@@ -868,6 +937,58 @@ pub(crate) async fn submit_steer_current_turn_after_turn_commit(
     .with_request_identity(request_id, event_sequence))
 }
 
+/// 补充属于原 Turn；显式目录选择和排队时的默认目录都不能把原执行重定位或扩权。
+fn validate_steer_directory_binding(
+    state: &ApiState,
+    session_id: &SessionId,
+    turn_id: &str,
+    request: &SessionTurnRequestDto,
+) -> Result<(), ApiError> {
+    let Some(turn) = state
+        .session_store
+        .canonical_turn_for_session_turn_id(session_id, turn_id)
+    else {
+        return Err(ApiError::turn_conflict(
+            "no_active_turn",
+            None,
+            "当前回复已经结束",
+        ));
+    };
+    let binding = crate::task_dispatch::canonical_project_directory_binding(&turn)
+        .map_err(|error| ApiError::internal_assembly("读取原 Turn 目录绑定", error))?;
+    if let Some(binding) = binding.as_ref() {
+        state
+            .workspace_registry
+            .validate_directory_membership(binding)
+            .map_err(|error| {
+                ApiError::Conflict(format!("原 Turn 的源文件夹授权已失效: {error}"))
+            })?;
+    }
+    let selected = request
+        .project_directories
+        .as_ref()
+        .map(|binding| binding.default_source_folder_id.as_str())
+        .or_else(|| trimmed_non_empty(request.source_folder_id.as_deref()));
+    if selected.is_some_and(|id| {
+        binding
+            .as_ref()
+            .is_none_or(|binding| binding.default_source_folder_id != id)
+    }) || request.project_directories.as_ref().is_some_and(|queued| {
+        binding.as_ref().is_none_or(|original| {
+            queued.workspace_id != original.workspace_id
+                || queued
+                    .source_folders
+                    .iter()
+                    .any(|grant| !original.source_folders.contains(grant))
+        })
+    }) {
+        return Err(ApiError::InvalidInput(
+            "补充的源文件夹与当前任务不同，请保留到下一轮执行".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// 同一份输入能力用于队列展示；提交仍通过 Coordinator 在锁内校验目标和输入边界。
 pub(crate) fn session_turn_guide_capability(
     state: &ApiState,
@@ -884,6 +1005,15 @@ pub(crate) fn session_turn_guide_capability(
         SessionTurnGuideStatus::UnsupportedInput
     } else if target_turn_id.is_none() {
         SessionTurnGuideStatus::NoActiveTurn
+    } else if validate_steer_directory_binding(
+        state,
+        session_id,
+        target_turn_id.as_deref().expect("active turn"),
+        request,
+    )
+    .is_err()
+    {
+        SessionTurnGuideStatus::UnsupportedInput
     } else if !session_executor_accepts_steer(
         state,
         session_id,
@@ -1543,6 +1673,12 @@ async fn submit_conversation_session_turn(
     let message = request.timeline_content(request.trimmed_text().as_deref());
     let mut metadata =
         magi_conversation_runtime::session_images::session_turn_images_metadata(&images);
+    if let Some(binding) = request.project_directories.as_ref() {
+        metadata.insert(
+            "projectDirectories".into(),
+            serde_json::to_value(binding).expect("project binding serializes"),
+        );
+    }
     let context_references = request.context_references();
     metadata.extend(
         magi_conversation_runtime::context_reference::session_context_references_metadata(
@@ -1726,6 +1862,7 @@ async fn submit_conversation_session_turn(
         None,
     );
     let execution_request = SessionTurnExecutionRequest {
+        project_directories: request.project_directories.clone(),
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
         workspace_id: workspace_id.clone(),
@@ -3146,7 +3283,8 @@ pub(crate) async fn drain_next_queued_regular_session_turn(
     } else {
         queued.accepted_at
     };
-    let queued_request = queued.request;
+    let mut queued_request = queued.request;
+    queued_request.project_directories = queued.project_directories;
     // 出队时重新验证请求声明的 session scope。排队期间请求结构可能来自持久化
     // 恢复，不能只相信入队时解析出的 workspace_id；否则一个被篡改或失效的
     // workspace binding 会绕过同一条 Turn 提交入口的权限边界。
@@ -3157,6 +3295,19 @@ pub(crate) async fn drain_next_queued_regular_session_turn(
         queued_request.requested_workspace_id().as_deref(),
         queued_request.requested_workspace_path().as_deref(),
     );
+    let queued_scope = queued_scope.and_then(|scope| {
+        queued_request.project_directories =
+            crate::task_dispatch::validate_or_migrate_directory_binding(
+                &state,
+                scope.workspace_id().as_ref(),
+                queued_request.project_directories.take(),
+            )?;
+        crate::task_dispatch::validate_project_context_references(
+            queued_request.project_directories.as_ref(),
+            &queued_request.context_references(),
+        )?;
+        Ok(scope)
+    });
     let submit_result = match queued_scope {
         Err(error) => Err(error),
         Ok(scope) => match queued_request.parsed_images() {

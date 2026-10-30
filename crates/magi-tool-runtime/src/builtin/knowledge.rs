@@ -8,6 +8,67 @@ use super::{
 };
 use magi_core::ToolFailure;
 
+fn readable_index_path(
+    path: &str,
+    context: &ToolExecutionContext,
+    resources: &ToolRuntimeResources,
+) -> bool {
+    let Some(root) = context.working_directory.as_deref() else {
+        return false;
+    };
+    // 宿主路径可能经 /var -> /private/var 等系统别名到达同一目录。
+    // 先规范执行根，再拒绝根内文件/子目录被链接替换，避免误过滤合法索引。
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    let relative = Path::new(path);
+    if relative
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return false;
+    }
+    let expected = root.join(relative);
+    if !expected.is_file()
+        || std::fs::canonicalize(&expected).ok().as_deref() != Some(expected.as_path())
+    {
+        return false;
+    }
+    super::read_support::ReadOperation::new(
+        "code_symbols",
+        &serde_json::Map::new(),
+        context,
+        resources,
+    )
+    .is_ok_and(|operation| operation.allows(&expected))
+}
+
+fn store_for_execution(
+    store: &magi_knowledge_store::KnowledgeStore,
+    context: &ToolExecutionContext,
+    input: &str,
+    tool: &str,
+) -> Result<magi_knowledge_store::KnowledgeStore, String> {
+    let target = context
+        .for_tool_arguments(input)
+        .map_err(|error| invalid_input(tool, error.to_string()))?;
+    let Some(map) = target.project_directory_map.as_ref() else {
+        return Ok(store.clone());
+    };
+    let root = target
+        .working_directory
+        .as_deref()
+        .ok_or_else(|| workspace_required(tool))?;
+    let directory = map
+        .roots
+        .iter()
+        .find(|directory| directory.execution_root().ok().as_deref() == Some(root))
+        .ok_or_else(|| invalid_input(tool, "代码索引缺少已授权的实际目录映射"))?;
+    store
+        .for_source_folder(&directory.source_folder_id, root)
+        .map_err(|error| invalid_input(tool, error.to_string()))
+}
+
 /// 代码符号导航：按符号名查定义 / 列出文件符号。基于本地索引引擎的符号表。
 pub(super) fn execute_code_symbols(
     input: &str,
@@ -26,12 +87,23 @@ pub(super) fn execute_code_symbols(
     let Some(workspace_id) = context.workspace_id.as_ref() else {
         return workspace_required("code_symbols");
     };
+    let store = match store_for_execution(store, context, input, "code_symbols") {
+        Ok(store) => store,
+        Err(error) => return error,
+    };
+    if let Some(root) = context.working_directory.as_deref()
+        && let Err(error) = ensure_workspace_index(&store, workspace_id, root, "code_symbols")
+    {
+        return error;
+    }
 
     let symbol_to_json = |s: &magi_knowledge_store::symbol_index::SymbolEntry| {
         serde_json::json!({
             "name": s.name,
             "kind": format!("{:?}", s.kind),
             "path": s.file_path,
+            "source_folder_id": store.code_index_scope().map(|scope| scope.source_folder_id.as_str()),
+            "execution_root_ref": store.code_index_scope().map(|scope| scope.execution_root_ref.as_str()),
             "line": s.line,
             "endLine": s.end_line,
             "exported": s.is_exported,
@@ -53,7 +125,11 @@ pub(super) fn execute_code_symbols(
             let Some(symbols) = store.find_symbol_definitions(workspace_id, &name, limit) else {
                 return index_not_ready("code_symbols");
             };
-            let results: Vec<Value> = symbols.iter().map(symbol_to_json).collect();
+            let results: Vec<Value> = symbols
+                .iter()
+                .filter(|symbol| readable_index_path(&symbol.file_path, context, resources))
+                .map(symbol_to_json)
+                .collect();
             serde_json::json!({
                 "tool": "code_symbols",
                 "status": "succeeded",
@@ -74,7 +150,11 @@ pub(super) fn execute_code_symbols(
             let Some(symbols) = store.list_file_symbols(workspace_id, &path) else {
                 return index_not_ready("code_symbols");
             };
-            let results: Vec<Value> = symbols.iter().map(symbol_to_json).collect();
+            let results: Vec<Value> = symbols
+                .iter()
+                .filter(|symbol| readable_index_path(&symbol.file_path, context, resources))
+                .map(symbol_to_json)
+                .collect();
             serde_json::json!({
                 "tool": "code_symbols",
                 "status": "succeeded",
@@ -170,15 +250,19 @@ pub(super) fn execute_search_semantic(
     let Some(workspace_id) = context.workspace_id.as_ref() else {
         return workspace_required("search_semantic");
     };
+    let store = match store_for_execution(store, context, input, "search_semantic") {
+        Ok(store) => store,
+        Err(error) => return error,
+    };
     let Some(workspace_root) = context.working_directory.as_deref() else {
         return workspace_required("search_semantic");
     };
     if let Err(failure) =
-        ensure_workspace_index(store, workspace_id, workspace_root, "search_semantic")
+        ensure_workspace_index(&store, workspace_id, workspace_root, "search_semantic")
     {
         return failure;
     }
-    let Some(engine_results) = store.search_workspace_code(
+    let Some(engine_results) = store.search_workspace_code_with_path_filter(
         workspace_id,
         &query,
         magi_knowledge_store::local_search_engine::SearchOptions {
@@ -187,6 +271,7 @@ pub(super) fn execute_search_semantic(
             preferred_scopes: preferred_scopes.clone(),
             prefer_recent_edits,
         },
+        &|path| readable_index_path(path, context, resources),
     ) else {
         return ToolFailure::new("search_semantic", "index_invalid_state", "代码索引状态异常")
             .instruction("本轮改用 search_text 或 file_read 继续；不要重复调用 search_semantic。")
@@ -195,6 +280,7 @@ pub(super) fn execute_search_semantic(
 
     let results: Vec<Value> = engine_results
         .iter()
+        .filter(|result| readable_index_path(&result.file_path, context, resources))
         .map(|result| {
             let primary_snippet = result.snippets.first();
             let matched_keywords = primary_snippet
@@ -202,6 +288,8 @@ pub(super) fn execute_search_semantic(
                 .unwrap_or_default();
             serde_json::json!({
                 "path": &result.file_path,
+                "source_folder_id": store.code_index_scope().map(|scope| scope.source_folder_id.as_str()),
+                "execution_root_ref": store.code_index_scope().map(|scope| scope.execution_root_ref.as_str()),
                 "score": result.score,
                 "source": "engine",
                 "matched_keywords": matched_keywords,
@@ -264,6 +352,10 @@ pub(super) fn execute_knowledge_query(
     let Some(workspace_id) = context.workspace_id.as_ref() else {
         return workspace_required("knowledge_query");
     };
+    let store = match store_for_execution(store, context, input, "knowledge_query") {
+        Ok(store) => store,
+        Err(error) => return error,
+    };
 
     let kind = match parse_knowledge_kind(request.as_ref()) {
         Ok(kind) => kind,
@@ -287,6 +379,17 @@ pub(super) fn execute_knowledge_query(
     let results: Vec<Value> = governed_query
         .results
         .iter()
+        .filter(|item| {
+            item.kind != magi_knowledge_store::KnowledgeKind::CodeIndex
+                || store
+                    .code_index_summary_for_workspace(workspace_id)
+                    .is_some_and(|summary| {
+                        summary
+                            .files
+                            .iter()
+                            .all(|file| readable_index_path(&file.path, context, resources))
+                    })
+        })
         .map(|item| {
             serde_json::json!({
                 "knowledge_id": &item.knowledge_id,
@@ -343,13 +446,20 @@ pub(super) fn execute_knowledge_graph_query(
     let Some(workspace_id) = context.workspace_id.as_ref() else {
         return workspace_required("knowledge_graph_query");
     };
+    let store = match store_for_execution(store, context, input, "knowledge_graph_query") {
+        Ok(store) => store,
+        Err(error) => return error,
+    };
     let Some(workspace_root) = context.working_directory.as_deref() else {
         return workspace_required("knowledge_graph_query");
     };
 
-    if let Err(failure) =
-        ensure_workspace_index(store, workspace_id, workspace_root, "knowledge_graph_query")
-    {
+    if let Err(failure) = ensure_workspace_index(
+        &store,
+        workspace_id,
+        workspace_root,
+        "knowledge_graph_query",
+    ) {
         return failure;
     }
 
@@ -415,6 +525,22 @@ pub(super) fn execute_knowledge_graph_query(
         .instruction("本轮改用 search_text 或 file_read 继续；不要重复调用 knowledge_graph_query。")
         .into_payload();
     };
+    let mut graph = graph;
+    graph.nodes.retain(|node| {
+        node.path
+            .as_deref()
+            .is_none_or(|path| readable_index_path(path, context, resources))
+    });
+    let visible = graph
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    graph
+        .edges
+        .retain(|edge| visible.contains(&edge.source) && visible.contains(&edge.target));
+    graph.stats.returned_nodes = graph.nodes.len();
+    graph.stats.returned_edges = graph.edges.len();
     let graph = limit_graph_context(graph, &focus, max_context_tokens);
     let candidate_edges = graph
         .edges

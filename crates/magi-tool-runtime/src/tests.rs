@@ -1529,6 +1529,7 @@ fn shell_exec_records_non_git_filesystem_changed_paths() {
 fn shell_exec_cancel_active_session_kills_running_command() {
     let registry = make_registry();
     let context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-shell-cancel")),
@@ -1586,6 +1587,7 @@ fn shell_exec_cancel_active_session_kills_running_command() {
 fn shell_exec_cancel_active_scope_requires_matching_workspace() {
     let registry = make_registry();
     let context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-shell-cancel-workspace-scope")),
@@ -1644,6 +1646,7 @@ fn shell_exec_cancel_active_scope_requires_matching_workspace() {
 fn session_cancellation_stops_background_processes_in_the_same_scope() {
     let registry = make_registry();
     let context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: Some(WorkerId::new("worker-background-cancel")),
         task_id: Some(TaskId::new("task-background-cancel")),
@@ -1873,6 +1876,7 @@ fn shell_exec_blocks_conflicting_write_scope_until_guard_drops() {
     tool_registry.register_default_builtins();
 
     let context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("todo-write")),
@@ -1957,6 +1961,7 @@ fn write_guard_tracks_file_copy_destination_path() {
     tool_registry.register_default_builtins();
 
     let guarded_context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("copy-task")),
@@ -2035,6 +2040,7 @@ fn shell_exec_isolates_write_guards_by_workspace_and_session() {
     tool_registry.register_default_builtins();
 
     let guarded_context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("todo-a")),
@@ -2046,6 +2052,7 @@ fn shell_exec_isolates_write_guards_by_workspace_and_session() {
         browser_execution_id: None,
     };
     let other_context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("todo-b")),
@@ -2164,6 +2171,7 @@ fn process_launch_does_not_block_followup_shell_in_same_session() {
     let mut tool_registry = ToolRegistry::new(governance, event_bus);
     tool_registry.register_default_builtins();
     let context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-launch")),
@@ -2248,6 +2256,7 @@ fn blocked_process_write_does_not_hold_the_process_table() {
     let mut tool_registry = ToolRegistry::new(governance, event_bus);
     tool_registry.register_default_builtins();
     let context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-write-blocked")),
@@ -2349,6 +2358,7 @@ fn exited_background_processes_are_pruned_from_the_process_table() {
     let mut tool_registry = ToolRegistry::new(governance, event_bus);
     tool_registry.register_default_builtins();
     let context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-prune")),
@@ -2438,6 +2448,7 @@ fn process_launch_spawn_failure_uses_public_error_message() {
     let registry = make_registry();
     let missing_shell = "magi-missing-process-shell-for-public-error-test";
     let context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-spawn-error")),
@@ -2489,6 +2500,7 @@ fn process_write_failure_uses_public_error_message() {
     let root = unique_temp_dir("magi-tool-process-write-error");
     let registry = make_registry();
     let context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-write-error")),
@@ -2590,6 +2602,7 @@ fn process_tools_reject_missing_execution_directory_before_execution() {
     assert_eq!(payload["error_code"], "execution_directory_required");
 
     let context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-context")),
@@ -2749,6 +2762,7 @@ fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
     tool_registry.register_default_builtins();
 
     let owner_context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-owner")),
@@ -2760,6 +2774,7 @@ fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
         browser_execution_id: None,
     };
     let workspace_only_context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-workspace-only")),
@@ -2771,6 +2786,7 @@ fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
         browser_execution_id: None,
     };
     let other_session_context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-other")),
@@ -3134,6 +3150,7 @@ fn governance_blocked_invocations_appear_in_summary_and_events() {
     fs::write(&file_path, "content").expect("write file");
 
     let ctx = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: Some(WorkerId::new("worker-gov")),
         task_id: Some(TaskId::new("todo-gov")),
@@ -3248,6 +3265,7 @@ fn path_level_write_protection_detects_overlapping_paths() {
 
     // Context A holds a write guard on shared_file via paths
     let ctx_a = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("todo-path-a")),
@@ -3279,6 +3297,7 @@ fn path_level_write_protection_detects_overlapping_paths() {
 
     // Context B tries to write to the same path — should conflict
     let ctx_b = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("todo-path-b")),
@@ -3342,6 +3361,7 @@ fn summary_for_query_filters_by_context_fields() {
     fs::write(&file, "query").expect("write");
 
     let ctx_w1 = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: Some(WorkerId::new("w1")),
         task_id: Some(TaskId::new("t1")),
@@ -3353,6 +3373,7 @@ fn summary_for_query_filters_by_context_fields() {
         browser_execution_id: None,
     };
     let ctx_w2 = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: Some(WorkerId::new("w2")),
         task_id: Some(TaskId::new("t2")),
@@ -3568,6 +3589,7 @@ fn full_chain_invocations_events_summary_consistent() {
     fs::write(&file, "chain data").expect("write");
 
     let ctx = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: Some(WorkerId::new("wk-chain")),
         task_id: Some(TaskId::new("td-chain")),
@@ -8062,6 +8084,7 @@ fn builtin_execution_input_keeps_canonical_name_and_applies_invocation_policy() 
 fn registry_rejects_internal_process_tools_as_public_builtin_calls() {
     let registry = make_registry();
     let context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-internal-process")),
@@ -8122,6 +8145,7 @@ fn registry_rejects_internal_process_tools_as_public_builtin_calls() {
 fn shell_exec_background_keeps_shell_public_payload() {
     let registry = make_registry();
     let context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-shell-background")),
@@ -8163,6 +8187,7 @@ fn file_write_execution_respects_active_write_guard() {
     let root = unique_temp_dir("magi-tool-file-write-guard");
     let file = root.join("guarded.txt");
     let context = ToolExecutionContext {
+        project_directory_map: None,
         caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-file-write-guard")),
@@ -8345,7 +8370,11 @@ fn search_semantic_uses_workspace_local_index() {
     assert_eq!(payload["max_context_tokens"], 512);
     assert_eq!(payload["preferred_scopes"], serde_json::json!(["src"]));
     assert_eq!(payload["prefer_recent_edits"], false);
-    assert!(payload["index"]["query_count"].as_u64().is_some());
+    assert_eq!(
+        payload["index"]["query_count"].as_u64(),
+        Some(1),
+        "带权限过滤的查询也必须计入索引统计"
+    );
     let results = payload["results"].as_array().expect("results array");
     assert!(!results.is_empty(), "应有命中结果");
     assert!(results[0]["score"].is_number(), "分数应保持数值类型");
@@ -8405,6 +8434,217 @@ fn search_semantic_lazily_builds_missing_workspace_index() {
     }));
 
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn knowledge_tools_use_authorized_source_folder_execution_indexes() {
+    let root = unique_temp_dir("magi-knowledge-multi-source-tools");
+    let source = root.join("live");
+    let copy = root.join("copy");
+    let second = root.join("second");
+    for (folder, name) in [
+        (&source, "authenticateLiveOnly"),
+        (&copy, "authenticateCopyOnly"),
+        (&second, "authenticateSecondOnly"),
+    ] {
+        fs::create_dir_all(folder.join("src")).unwrap();
+        fs::write(
+            folder.join("src/index.ts"),
+            format!("export function {name}() {{ return true; }}\n"),
+        )
+        .unwrap();
+    }
+    let workspace_id = WorkspaceId::new("project-knowledge-tools");
+    let path_ref = |path: &std::path::Path| {
+        magi_core::HostPath::canonicalize(path)
+            .unwrap()
+            .to_path_ref()
+            .as_str()
+            .to_string()
+    };
+    let map = magi_core::ProjectDirectoryExecutionMap {
+        workspace_id: workspace_id.clone(),
+        default_source_folder_id: "a".into(),
+        roots: vec![
+            magi_core::ProjectDirectoryExecutionRoot {
+                source_folder_id: "a".into(),
+                source_root_ref: path_ref(&source),
+                execution_root_ref: path_ref(&copy),
+            },
+            magi_core::ProjectDirectoryExecutionRoot {
+                source_folder_id: "b".into(),
+                source_root_ref: path_ref(&second),
+                execution_root_ref: path_ref(&second),
+            },
+        ],
+    };
+    let store = Arc::new(magi_knowledge_store::KnowledgeStore::new());
+    // 即使项目旧单根索引已存在，新的授权映射也不能从源目录读取旧结果。
+    store.build_workspace_index(&workspace_id, &source);
+    let mut registry = ToolRegistry::new(
+        Arc::new(GovernanceService::default()),
+        Arc::new(magi_event_bus::InMemoryEventBus::new(64)),
+    )
+    .with_knowledge_store(store.clone());
+    registry.register_default_builtins();
+    let context = ToolExecutionContext {
+        workspace_id: Some(workspace_id.clone()),
+        working_directory: Some(copy.canonicalize().unwrap()),
+        project_directory_map: Some(map.clone()),
+        ..Default::default()
+    };
+    for (id, expected, forbidden) in [
+        ("a", "authenticateCopyOnly", "authenticateLiveOnly"),
+        ("b", "authenticateSecondOnly", "authenticateCopyOnly"),
+    ] {
+        let output = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(ToolCallId::new("multi-symbols"), "code_symbols", serde_json::json!({"source_folder_id": id, "action": "file_symbols", "path": "src/index.ts"}).to_string()),
+            context.clone(), &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(
+            output.status,
+            ExecutionResultStatus::Succeeded,
+            "{}",
+            output.payload
+        );
+        let payload: Value = serde_json::from_str(&output.payload).unwrap();
+        assert_eq!(payload["results"][0]["name"], expected);
+        assert_eq!(payload["results"][0]["source_folder_id"], id);
+        assert!(!output.payload.contains(forbidden));
+        let output = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("multi-search"),
+                "search_semantic",
+                serde_json::json!({"source_folder_id": id, "query": "authenticate"}).to_string(),
+            ),
+            context.clone(),
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(
+            output.status,
+            ExecutionResultStatus::Succeeded,
+            "{}",
+            output.payload
+        );
+        let payload: Value = serde_json::from_str(&output.payload).unwrap();
+        assert!(!payload["results"].as_array().unwrap().is_empty());
+        assert!(
+            payload["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["source_folder_id"] == id)
+        );
+        assert!(!output.payload.contains(forbidden));
+        let output = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("multi-graph"),
+                "knowledge_graph_query",
+                serde_json::json!({"source_folder_id": id, "focus": "file:src/index.ts"})
+                    .to_string(),
+            ),
+            context.clone(),
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(
+            output.status,
+            ExecutionResultStatus::Succeeded,
+            "{}",
+            output.payload
+        );
+        let payload: Value = serde_json::from_str(&output.payload).unwrap();
+        assert!(
+            payload["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["metadata"]["sourceFolderId"] == id)
+        );
+        assert!(!output.payload.contains(forbidden));
+    }
+    let mut restricted = context.clone();
+    restricted
+        .project_directory_map
+        .as_mut()
+        .unwrap()
+        .roots
+        .truncate(1);
+    let output = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("ungranted-search"),
+            "search_semantic",
+            serde_json::json!({"source_folder_id": "b", "query": "authenticate"}).to_string(),
+        ),
+        restricted,
+        &ToolExecutionPolicy::default(),
+    );
+    assert_eq!(output.status, ExecutionResultStatus::Rejected);
+    assert!(!output.payload.contains("authenticateSecondOnly"));
+    let denied = ToolExecutionPolicy {
+        denied_paths: vec![
+            second
+                .canonicalize()
+                .unwrap()
+                .join("src")
+                .to_string_lossy()
+                .into_owned(),
+        ],
+        ..Default::default()
+    };
+    let query = |tool: &str, arguments: Value, policy: &ToolExecutionPolicy| {
+        registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("scoped-index-policy"),
+                tool,
+                arguments.to_string(),
+            ),
+            context.clone(),
+            policy,
+        )
+    };
+    for (tool, arguments) in [
+        (
+            "search_semantic",
+            serde_json::json!({"source_folder_id":"b", "query":"authenticate"}),
+        ),
+        (
+            "code_symbols",
+            serde_json::json!({"source_folder_id":"b", "action":"definition", "name":"authenticateSecondOnly"}),
+        ),
+        (
+            "knowledge_graph_query",
+            serde_json::json!({"source_folder_id":"b", "focus":"file:src/index.ts"}),
+        ),
+    ] {
+        let output = query(tool, arguments, &denied);
+        let payload: Value = serde_json::from_str(&output.payload).unwrap();
+        assert!(
+            !payload["results"]
+                .to_string()
+                .contains("authenticateSecondOnly")
+        );
+        assert!(
+            !payload["nodes"]
+                .to_string()
+                .contains("authenticateSecondOnly")
+        );
+    }
+    #[cfg(unix)]
+    {
+        let outside = root.join("external.ts");
+        fs::write(&outside, "export function externalSecret() {}\n").unwrap();
+        fs::remove_file(second.join("src/index.ts")).unwrap();
+        std::os::unix::fs::symlink(&outside, second.join("src/index.ts")).unwrap();
+        let output = query(
+            "search_semantic",
+            serde_json::json!({"source_folder_id":"b", "query":"authenticate"}),
+            &ToolExecutionPolicy::default(),
+        );
+        assert!(!output.payload.contains("externalSecret"));
+        assert!(!output.payload.contains("authenticateSecondOnly"));
+    }
+    store.clear_workspace(&workspace_id);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -10728,4 +10968,309 @@ fn create_goal_requires_only_objective_and_exposes_no_task_budget() {
     let schema = BuiltinToolName::CreateGoal.parameters_schema();
     assert_eq!(schema["required"], serde_json::json!(["objective"]));
     assert_eq!(schema["properties"].as_object().unwrap().len(), 1);
+}
+
+#[test]
+fn project_directory_tools_share_selected_cwd_permissions_and_write_claims() {
+    use magi_core::{
+        HostPath, ProjectDirectoryBinding, ProjectDirectoryExecutionMap, ProjectSourceFolderGrant,
+    };
+    let base = unique_temp_dir("magi-project-tool-map")
+        .canonicalize()
+        .unwrap();
+    let sources = [base.join("source-a"), base.join("source-b")];
+    let copies = [base.join("copy-a"), base.join("copy-b")];
+    let outside = base.join("outside");
+    for path in sources.iter().chain(copies.iter()).chain([&outside]) {
+        fs::create_dir_all(path).unwrap();
+        fs::write(
+            path.join("same.txt"),
+            path.file_name().unwrap().to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+    }
+    let binding = ProjectDirectoryBinding {
+        workspace_id: WorkspaceId::new("multi-tool-project"),
+        project_revision: 1,
+        default_source_folder_id: "a".into(),
+        source_folders: ["a", "b"]
+            .into_iter()
+            .zip(&sources)
+            .map(|(id, path)| ProjectSourceFolderGrant {
+                source_folder_id: id.into(),
+                source_path_ref: HostPath::from_path(path.clone())
+                    .to_path_ref()
+                    .as_str()
+                    .into(),
+            })
+            .collect(),
+    };
+    let map = ProjectDirectoryExecutionMap::from_binding(&binding, |grant| {
+        Ok(copies[usize::from(grant.source_folder_id == "b")].clone())
+    })
+    .unwrap();
+    let context = ToolExecutionContext {
+        workspace_id: Some(binding.workspace_id.clone()),
+        session_id: Some(SessionId::new("tool-map-session")),
+        working_directory: Some(copies[0].clone()),
+        project_directory_map: Some(map.clone()),
+        ..Default::default()
+    };
+    let registry = make_registry();
+    let run = |name: &str, arguments: Value, policy: &ToolExecutionPolicy| {
+        registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("map-call"),
+                name,
+                arguments.to_string(),
+            ),
+            context.clone(),
+            policy,
+        )
+    };
+    let restricted = ToolExecutionPolicy {
+        access_profile: magi_core::AccessProfile::Restricted,
+        ..Default::default()
+    };
+    for (id, expected) in [(None, "copy-a"), (Some("b"), "copy-b")] {
+        let mut args = serde_json::json!({"path":"same.txt"});
+        if let Some(id) = id {
+            args["source_folder_id"] = id.into();
+        }
+        let read = run("file_read", args, &restricted);
+        assert_eq!(
+            read.status,
+            ExecutionResultStatus::Succeeded,
+            "{}",
+            read.payload
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&read.payload).unwrap()["content"],
+            expected
+        );
+    }
+    let write = run(
+        "file_write",
+        serde_json::json!({"source_folder_id":"b", "path":"new.txt", "content":"second"}),
+        &restricted,
+    );
+    assert_eq!(
+        write.status,
+        ExecutionResultStatus::Succeeded,
+        "{}",
+        write.payload
+    );
+    assert_eq!(
+        fs::read_to_string(copies[1].join("new.txt")).unwrap(),
+        "second"
+    );
+    assert!(!copies[0].join("new.txt").exists());
+    assert!(!sources[1].join("new.txt").exists());
+    let scope_context = context
+        .for_tool_arguments(r#"{"source_folder_id":"b"}"#)
+        .unwrap();
+    let scope = registry
+        .build_write_scope(
+            &ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("claim"),
+                "file_write",
+                r#"{"path":"new.txt","content":"x"}"#,
+            ),
+            &scope_context,
+            BuiltinToolAccessMode::ExplicitWrite,
+        )
+        .unwrap();
+    assert_eq!(scope.paths, vec![copies[1].join("new.txt")]);
+
+    // 显式授权的两个实际根都可写；共同祖先中的第三个目录仍需要审批。
+    let outside_write = run(
+        "file_write",
+        serde_json::json!({"path":outside.join("new.txt"), "content":"no"}),
+        &restricted,
+    );
+    assert_eq!(
+        outside_write.status,
+        ExecutionResultStatus::NeedsApproval,
+        "{}",
+        outside_write.payload
+    );
+    assert!(!outside.join("new.txt").exists());
+    let full = ToolExecutionPolicy {
+        access_profile: magi_core::AccessProfile::FullAccess,
+        ..Default::default()
+    };
+    #[cfg(unix)]
+    {
+        let shell = run(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf a > same.txt; printf b > '{}'", copies[1].join("same.txt").display()),
+            }),
+            &full,
+        );
+        assert_eq!(
+            shell.status,
+            ExecutionResultStatus::Succeeded,
+            "{}",
+            shell.payload
+        );
+        let result: Value = serde_json::from_str(&shell.payload).unwrap();
+        let files = result["changed_files"]
+            .as_array()
+            .expect("按源目录保留变更身份");
+        assert_eq!(files.len(), 2, "{result}");
+        for id in ["a", "b"] {
+            assert!(
+                files
+                    .iter()
+                    .any(|file| file["source_folder_id"] == id && file["path"] == "same.txt"),
+                "{result}"
+            );
+        }
+    }
+    let retired = run(
+        "file_write",
+        serde_json::json!({"path":sources[1].join("same.txt"), "content":"bad"}),
+        &full,
+    );
+    assert_eq!(
+        retired.status,
+        ExecutionResultStatus::Rejected,
+        "{}",
+        retired.payload
+    );
+    assert_eq!(
+        fs::read_to_string(sources[1].join("same.txt")).unwrap(),
+        "source-b"
+    );
+
+    // 相对 allow/deny 策略以接纳时的默认源目录解释，选择另一目录不能重解释它。
+    let policy = ToolExecutionPolicy {
+        access_profile: magi_core::AccessProfile::FullAccess,
+        allowed_paths: sources.iter().map(|p| p.display().to_string()).collect(),
+        denied_paths: vec![sources[1].join("blocked").display().to_string()],
+        read_only_paths: vec![sources[1].join("same.txt").display().to_string()],
+        ..Default::default()
+    };
+    for args in [
+        serde_json::json!({"source_folder_id":"b", "path":"same.txt", "content":"bad"}),
+        serde_json::json!({"source_folder_id":"b", "path":"blocked/new.txt", "content":"bad"}),
+        serde_json::json!({"source_folder_id":"unknown", "path":"new.txt", "content":"bad"}),
+    ] {
+        let output = run("file_write", args, &policy);
+        assert_eq!(
+            output.status,
+            ExecutionResultStatus::Rejected,
+            "{}",
+            output.payload
+        );
+    }
+    let mut invalid_map = map.clone();
+    invalid_map.roots.pop();
+    assert!(invalid_map.validate_for_binding(&binding).is_err());
+    fs::remove_dir_all(&copies[1]).unwrap();
+    let missing = run(
+        "file_write",
+        serde_json::json!({"path":"should-not-exist.txt", "content":"bad"}),
+        &full,
+    );
+    assert_eq!(
+        missing.status,
+        ExecutionResultStatus::Rejected,
+        "{}",
+        missing.payload
+    );
+    assert!(!copies[1].exists());
+    assert!(!copies[0].join("should-not-exist.txt").exists());
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn project_directory_shell_uses_selected_copy_and_rejects_source_and_external_links() {
+    use magi_core::{
+        HostPath, ProjectDirectoryBinding, ProjectDirectoryExecutionMap, ProjectSourceFolderGrant,
+    };
+    let base = unique_temp_dir("magi-project-shell-map")
+        .canonicalize()
+        .unwrap();
+    let source = base.join("source");
+    let copy = base.join("copy");
+    let outside = base.join("outside");
+    for root in [&source, &copy, &outside] {
+        fs::create_dir_all(root).unwrap();
+    }
+    std::os::unix::fs::symlink(&outside, copy.join("escape")).unwrap();
+    let binding = ProjectDirectoryBinding {
+        workspace_id: WorkspaceId::new("shell-map"),
+        project_revision: 1,
+        default_source_folder_id: "source".into(),
+        source_folders: vec![ProjectSourceFolderGrant {
+            source_folder_id: "source".into(),
+            source_path_ref: HostPath::from_path(source.clone())
+                .to_path_ref()
+                .as_str()
+                .into(),
+        }],
+    };
+    let context = ToolExecutionContext {
+        workspace_id: Some(binding.workspace_id.clone()),
+        working_directory: Some(copy.clone()),
+        project_directory_map: Some(
+            ProjectDirectoryExecutionMap::from_binding(&binding, |_| Ok(copy.clone())).unwrap(),
+        ),
+        ..Default::default()
+    };
+    let registry = make_registry();
+    let run = |arguments: Value, access_profile| {
+        registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("shell-map-call"),
+                "shell_exec",
+                arguments.to_string(),
+            ),
+            context.clone(),
+            &ToolExecutionPolicy {
+                access_profile,
+                ..Default::default()
+            },
+        )
+    };
+    let output = run(
+        serde_json::json!({"source_folder_id":"source", "command":"printf copied > created.txt"}),
+        magi_core::AccessProfile::FullAccess,
+    );
+    assert_eq!(
+        output.status,
+        ExecutionResultStatus::Succeeded,
+        "{}",
+        output.payload
+    );
+    assert_eq!(
+        fs::read_to_string(copy.join("created.txt")).unwrap(),
+        "copied"
+    );
+    assert!(!source.join("created.txt").exists());
+    let output = run(
+        serde_json::json!({"command":"printf bad > created.txt", "cwd":source}),
+        magi_core::AccessProfile::FullAccess,
+    );
+    assert_eq!(
+        output.status,
+        ExecutionResultStatus::Rejected,
+        "{}",
+        output.payload
+    );
+    let output = run(
+        serde_json::json!({"command":"printf bad > escape/new.txt"}),
+        magi_core::AccessProfile::Restricted,
+    );
+    assert_eq!(
+        output.status,
+        ExecutionResultStatus::NeedsApproval,
+        "{}",
+        output.payload
+    );
+    assert!(!outside.join("new.txt").exists());
+    fs::remove_dir_all(base).unwrap();
 }

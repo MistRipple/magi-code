@@ -78,6 +78,7 @@
     ? `${change.oldPath} → ${change.filePath}`
     : change?.filePath);
   const contextFileScope = $derived({
+    sourceFolderId: change?.sourceFolderId ?? filePreviewScope?.sourceFolderId,
     sessionId: filePreviewScope?.sessionId ?? change?.sessionId,
     workspaceId: filePreviewScope?.workspaceId ?? change?.workspaceId,
     workspacePath: filePreviewScope?.workspacePath ?? change?.workspacePath,
@@ -105,11 +106,12 @@
 
   function previewInRightPane(filepath: string) {
     if (!filepath) return;
-    if (requestOpenHtmlFileInBrowser(filepath)) return;
+    if (requestOpenHtmlFileInBrowser(filepath, contextFileScope)) return;
     const sessionId = filePreviewScope?.sessionId ?? change?.sessionId;
     const workspaceId = filePreviewScope?.workspaceId ?? change?.workspaceId;
     const workspacePath = filePreviewScope?.workspacePath ?? change?.workspacePath;
     openCodeTab(sessionId, filepath, {
+      sourceFolderId: contextFileScope.sourceFolderId,
       sessionId,
       workspaceId,
       workspacePath,

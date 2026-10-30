@@ -1368,7 +1368,6 @@ impl MagiTurnHarness {
         let git_service = Arc::new(magi_git::GitService::new());
         let session_code_contexts = magi_git::SessionCodeContextRegistry::default();
         let workspace_git_coordinator = magi_git::WorkspaceGitOperationCoordinator::default();
-        let snapshot_manager = Arc::new(magi_snapshot::SnapshotManager::new());
         let knowledge_store = Arc::new(magi_knowledge_store::KnowledgeStore::new());
         let runtime_directory = Arc::new(
             tempfile::Builder::new()
@@ -1377,6 +1376,10 @@ impl MagiTurnHarness {
                 .expect("Turn harness runtime directory should create"),
         );
         let runtime_state_root = runtime_directory.path();
+        let snapshot_manager = Arc::new(crate::managed_snapshot_manager(
+            runtime_state_root.to_path_buf(),
+            session_store.clone(),
+        ));
         let runtime_persistence = Arc::new(RuntimeStatePersistence::new(
             runtime_state_root.to_path_buf(),
             runtime_state_root.join("workspaces.json"),
@@ -1592,6 +1595,8 @@ impl MagiTurnHarness {
     ) -> Result<SessionTurnResponseDto, crate::errors::ApiError> {
         let response = TurnService::new(self.state.clone())
             .submit(SessionTurnRequestDto {
+                source_folder_id: None,
+                project_directories: None,
                 desktop_browser_tools_allowed: false,
                 session_id: session_id.map(ToString::to_string),
                 scope: SessionScopeKindDto::Personal,
@@ -1675,6 +1680,8 @@ impl MagiTurnHarness {
         self.provider.begin_timing();
         let response = TurnService::new(self.state.clone())
             .submit(SessionTurnRequestDto {
+                source_folder_id: None,
+                project_directories: None,
                 desktop_browser_tools_allowed: false,
                 session_id: Some(session_id.to_string()),
                 scope: SessionScopeKindDto::Workspace,
@@ -1724,6 +1731,8 @@ impl MagiTurnHarness {
         self.provider.begin_timing();
         let response = TurnService::new(self.state.clone())
             .submit(SessionTurnRequestDto {
+                source_folder_id: None,
+                project_directories: None,
                 desktop_browser_tools_allowed: false,
                 session_id: Some(session_id.to_string()),
                 scope: SessionScopeKindDto::Workspace,
@@ -1771,6 +1780,8 @@ impl MagiTurnHarness {
         self.provider.begin_timing();
         TurnService::new(self.state.clone())
             .submit(SessionTurnRequestDto {
+                source_folder_id: None,
+                project_directories: None,
                 desktop_browser_tools_allowed: false,
                 session_id: Some(session_id.to_string()),
                 scope: SessionScopeKindDto::Workspace,
@@ -1812,6 +1823,8 @@ impl MagiTurnHarness {
     ) -> Result<SessionTurnResponseDto, crate::errors::ApiError> {
         TurnService::new(self.state.clone())
             .submit(SessionTurnRequestDto {
+                source_folder_id: None,
+                project_directories: None,
                 desktop_browser_tools_allowed: false,
                 session_id: Some(session_id.to_string()),
                 scope: SessionScopeKindDto::Personal,
@@ -10614,13 +10627,20 @@ done
             create_workspace_session(&harness, &workspace_id, "isolated-merge-session");
         let isolation = harness
             .state
-            .enable_session_isolation(
+            .enable_session_isolation_set_at_boundary(
                 &session_id,
-                &workspace_id,
+                &harness
+                    .state
+                    .workspace_registry
+                    .capture_directory_binding(&workspace_id, None, None)
+                    .unwrap(),
                 magi_session_isolation::IsolationOrigin::Manual,
+                None,
             )
             .await
-            .expect("手动启用隔离副本");
+            .expect("手动启用隔离副本")
+            .pop()
+            .unwrap();
         assert_ne!(isolation.root, workspace_root.path());
         assert_eq!(
             fs::read_to_string(isolation.root.join("a.txt")).unwrap(),
@@ -10671,7 +10691,7 @@ done
 
         let plan = harness
             .state
-            .isolation_merge_plan(&session_id)
+            .isolation_merge_plan_for_source(&session_id, None)
             .await
             .unwrap();
         assert_eq!(plan.entries.len(), 2, "{plan:?}");
@@ -10679,8 +10699,9 @@ done
 
         let outcome = harness
             .state
-            .isolation_merge_apply(
+            .isolation_merge_apply_for_source(
                 &session_id,
+                None,
                 magi_session_isolation::MergeSelection::default(),
             )
             .await
@@ -10697,7 +10718,7 @@ done
         assert!(
             harness
                 .state
-                .isolation_merge_plan(&session_id)
+                .isolation_merge_plan_for_source(&session_id, None)
                 .await
                 .unwrap()
                 .entries
@@ -12074,6 +12095,8 @@ done
                 .get(session.as_str())
                 .is_none()
         );
+        // canonical 终态先发布，控制面仍可能在提交同一轮的收尾。
+        drop(harness.state.lock_session_turn_commit(&session).await);
         harness
             .state
             .discard_session_isolation(&session)
@@ -18885,6 +18908,287 @@ done
         );
 
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn project_task_executes_same_name_files_across_git_and_plain_roots_and_copies() {
+        for isolated in [false, true] {
+            let harness = MagiTurnHarness::new_task("跨目录任务完成");
+            let fixture = tempfile::tempdir().unwrap();
+            let parent = fixture.path().canonicalize().unwrap();
+            let sources = [
+                parent.join("repo-a"),
+                parent.join("repo-b"),
+                parent.join("plain"),
+            ];
+            let copies = [
+                parent.join("copy-a"),
+                parent.join("copy-b"),
+                parent.join("copy-plain"),
+            ];
+            for (index, source) in sources.iter().enumerate() {
+                fs::create_dir(source).unwrap();
+                fs::write(source.join("same.txt"), format!("original {index}")).unwrap();
+                if index < 2 {
+                    git_fixture_command(source, &["init", "-b", "main"]);
+                    git_fixture_command(source, &["config", "user.name", "Magi Harness"]);
+                    git_fixture_command(
+                        source,
+                        &["config", "user.email", "magi-harness@example.test"],
+                    );
+                    git_fixture_command(source, &["add", "."]);
+                    git_fixture_command(source, &["commit", "-m", "fixture baseline"]);
+                    fs::write(source.join("dirty.txt"), "user content").unwrap();
+                }
+            }
+            let workspace = magi_core::WorkspaceId::new("multi-task");
+            harness
+                .state
+                .workspace_registry
+                .register_native_path(workspace.clone(), sources[0].clone())
+                .unwrap();
+            crate::routes::test_project_fixtures::add_source(
+                &harness.state,
+                workspace.as_str(),
+                "second",
+                &sources[1],
+            );
+            let project = crate::routes::test_project_fixtures::add_source(
+                &harness.state,
+                workspace.as_str(),
+                "plain",
+                &sources[2],
+            );
+            let session = SessionId::new("multi-task-session");
+            harness
+                .state
+                .session_store
+                .create_session_for_workspace(
+                    session.clone(),
+                    "multi task",
+                    Some(workspace.to_string()),
+                )
+                .unwrap();
+            if isolated {
+                for (source, copy) in sources.iter().zip(&copies) {
+                    let outcome =
+                        magi_session_isolation::create_isolated_copy(source, copy).unwrap();
+                    harness.state.session_isolations.insert(
+                        magi_session_isolation::SessionIsolation {
+                            session_id: session.to_string(),
+                            workspace_id: workspace.to_string(),
+                            source_root: source.clone(),
+                            root: copy.clone(),
+                            origin: magi_session_isolation::IsolationOrigin::Manual,
+                            strategy: outcome.strategy,
+                            linked_dirs: outcome.linked_dirs,
+                            git_available: outcome.git_available,
+                            created_at_ms: 1,
+                        },
+                    );
+                }
+            }
+            let ids = [project.primary_source_folder_id.as_str(), "second", "plain"];
+            let mut steps = Vec::new();
+            for (index, id) in ids.iter().enumerate() {
+                steps.push((
+                    "file_read",
+                    serde_json::json!({"source_folder_id":id,"path":"same.txt"}).to_string(),
+                ));
+                steps.push(("file_write", serde_json::json!({"source_folder_id":id,"path":"same.txt","content":format!("changed {index}")}).to_string()));
+            }
+            steps.push(("shell_exec", serde_json::json!({"source_folder_id":"second","command":"printf shell > shell.txt","access_mode":"explicit_write"}).to_string()));
+            harness
+                .provider
+                .set_tool_sequence_then_completed(steps, "跨目录任务完成");
+            let accepted = harness
+                .submit_workspace_task_with_access_profile(
+                    &session,
+                    &workspace,
+                    &sources[0],
+                    "依次读取并修改三个目录的 same.txt，再在第二目录执行 shell_exec",
+                    "multi-task-request",
+                    "multi-task-user",
+                    Some(AccessProfile::FullAccess),
+                )
+                .await
+                .unwrap();
+            let turn = harness
+                .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+                .await;
+            assert_eq!(
+                turn.status,
+                CanonicalTurnStatus::Completed,
+                "isolated={isolated} {turn:#?}"
+            );
+            let tools = turn
+                .items
+                .iter()
+                .filter_map(|item| item.tool.as_ref())
+                .collect::<Vec<_>>();
+            assert_eq!(tools.len(), 7, "{turn:#?}");
+            for tool in &tools {
+                assert_eq!(
+                    tool.result.as_ref().unwrap()["status"],
+                    "succeeded",
+                    "{tool:#?}"
+                );
+            }
+            let executions = if isolated { &copies } else { &sources };
+            for (index, execution) in executions.iter().enumerate() {
+                assert_eq!(
+                    fs::read_to_string(execution.join("same.txt")).unwrap(),
+                    format!("changed {index}")
+                );
+                assert_eq!(
+                    tools[index * 2].result.as_ref().unwrap()["content"],
+                    format!("original {index}")
+                );
+                if isolated {
+                    assert_eq!(
+                        fs::read_to_string(sources[index].join("same.txt")).unwrap(),
+                        format!("original {index}")
+                    );
+                }
+                let snapshot = harness
+                    .state
+                    .snapshot_manager
+                    .get_session_for_workspace(session.as_str(), execution)
+                    .unwrap();
+                let changes = snapshot.pending_changes().unwrap();
+                let same = changes
+                    .iter()
+                    .find(|change| change.path == "same.txt")
+                    .unwrap();
+                assert_eq!(same.source, magi_snapshot::SourceKind::Tool);
+                assert!(same.tool_call_id.is_some());
+                assert_eq!(
+                    same.original_content.as_deref(),
+                    Some(format!("original {index}").as_str())
+                );
+                if index < 2 {
+                    assert_eq!(
+                        fs::read_to_string(execution.join("dirty.txt")).unwrap(),
+                        "user content"
+                    );
+                }
+            }
+            assert_eq!(
+                fs::read_to_string(executions[1].join("shell.txt")).unwrap(),
+                "shell"
+            );
+            assert!(!executions[0].join("shell.txt").exists());
+            for source in &sources[..2] {
+                let observation = harness.state.git_service.observe(source).await.unwrap();
+                assert!(
+                    !harness
+                        .state
+                        .workspace_git_coordinator
+                        .session_holds_execution(session.as_str(), &observation.git_common_dir)
+                );
+            }
+            assert!(harness.provider.requests().iter().any(|request| {
+                request.messages.as_ref().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message.content.as_deref().is_some_and(|text| {
+                            text.contains("本轮项目目录映射")
+                                && text.contains("second")
+                                && text.contains("plain")
+                        })
+                    })
+                })
+            }));
+            if !isolated {
+                harness
+                    .provider
+                    .set_agent_spawn_then_wait("跨仓库子代理完成");
+                if let Some(ProviderBehavior::AgentSpawnThenWait { child_steps, .. }) =
+                    &mut harness.provider.state.lock().unwrap().behavior
+                {
+                    *child_steps = ids[..2]
+                        .iter()
+                        .enumerate()
+                        .map(|(index, id)| {
+                            (
+                                "file_write".into(),
+                                serde_json::json!({"source_folder_id":id,
+                            "path":"agent.txt","content":format!("agent {index}")})
+                                .to_string(),
+                            )
+                        })
+                        .collect();
+                }
+                let accepted = harness
+                    .submit_workspace_task_with_access_profile(
+                        &session,
+                        &workspace,
+                        &sources[0],
+                        "派发一个子代理，分别写入两个仓库并收集结果",
+                        "multi-agent-request",
+                        "multi-agent-user",
+                        Some(AccessProfile::FullAccess),
+                    )
+                    .await
+                    .unwrap();
+                let turn = harness
+                    .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+                    .await;
+                assert_eq!(turn.status, CanonicalTurnStatus::Completed, "{turn:#?}");
+                let root_id = magi_core::TaskId::new(accepted.root_task_id.unwrap());
+                let children = harness.state.task_store().unwrap().get_children(&root_id);
+                assert_eq!(children.len(), 1);
+                assert_eq!(
+                    children[0].status,
+                    magi_core::TaskStatus::Completed,
+                    "{:?}",
+                    children[0]
+                );
+                for (index, source) in sources[..2].iter().enumerate() {
+                    assert!(
+                        !source.join("agent.txt").exists(),
+                        "代理产物应保留在自己的分支"
+                    );
+                    let context = harness
+                        .state
+                        .session_code_contexts
+                        .get_for_path(session.as_str(), source)
+                        .unwrap();
+                    let allocation = context
+                        .agent_worktrees
+                        .iter()
+                        .find(|tree| tree.task_id == children[0].task_id.as_str())
+                        .unwrap();
+                    assert!(!allocation.active);
+                    assert!(!allocation.path.exists());
+                    assert_eq!(allocation.changed_paths, vec!["agent.txt"]);
+                    let result = magi_process::std_command("git")
+                        .arg("-C")
+                        .arg(source)
+                        .args([
+                            "show",
+                            &format!("{}:agent.txt", allocation.result_head.as_ref().unwrap()),
+                        ])
+                        .output()
+                        .unwrap();
+                    assert!(result.status.success());
+                    assert_eq!(
+                        String::from_utf8_lossy(&result.stdout),
+                        format!("agent {index}")
+                    );
+                    assert_eq!(
+                        fs::read_to_string(source.join("same.txt")).unwrap(),
+                        format!("changed {index}")
+                    );
+                }
+                let output = children[0]
+                    .output_refs
+                    .iter()
+                    .filter_map(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                    .find(|value| value["agent_workspaces"].is_array())
+                    .expect("完整多仓库产出应进入原 output_refs");
+                assert_eq!(output["agent_workspaces"].as_array().unwrap().len(), 2);
+            }
+        }
     }
 
     #[tokio::test]

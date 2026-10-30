@@ -264,12 +264,16 @@ impl BrowserWebModelBridgeClient {
 
     /// 把回复里的页面图片读出来保存到项目里，并把引用改写成项目内路径。
     /// 单张失败不让整轮失败：该处换成一句说明，其余图片和正文照常交付。
-    async fn resolve_page_images(&self, text: &str) -> String {
+    async fn resolve_page_images(
+        &self,
+        text: &str,
+        sink: Option<&Result<Arc<dyn crate::images::WebImageSink>, String>>,
+    ) -> String {
         let refs = crate::images::page_image_refs(text);
         if refs.is_empty() {
             return text.to_string();
         }
-        let Some(sink) = self.image_sink.clone() else {
+        let Some(sink) = sink else {
             return crate::images::strip_page_images(text);
         };
         let mut resolved = Vec::with_capacity(refs.len());
@@ -277,8 +281,13 @@ impl BrowserWebModelBridgeClient {
             let outcome = if index >= Self::MAX_IMAGES_PER_REPLY {
                 Err("单条回复的图片太多，已跳过".to_string())
             } else {
-                self.save_page_image(sink.as_ref(), &image.src, &image.alt)
-                    .await
+                match sink {
+                    Ok(sink) => {
+                        self.save_page_image(sink.as_ref(), &image.src, &image.alt)
+                            .await
+                    }
+                    Err(error) => Err(error.clone()),
+                }
             };
             resolved.push(match outcome {
                 Ok(path) => format!("![{}]({path})", image.alt),
@@ -390,6 +399,13 @@ impl BrowserWebModelBridgeClient {
 
         let mut message_accepted = false;
         let result = async {
+            let image_sink = self.image_sink.as_ref().map(|sink| {
+                sink.for_turn(
+                    &self.identity.session_id,
+                    &self.identity.project_id,
+                    lease.turn_id(),
+                )
+            });
             // 临时对话的上下文只存在于槽位的页面里。网页里曾经有过上下文、槽位却已不在
             // （重启 / 停止 / 页面销毁）：上下文不可恢复，直接判失效，不碰页面、不新开一条冒充续接。
             if claim.newly_claimed
@@ -647,7 +663,7 @@ impl BrowserWebModelBridgeClient {
             self.report_saved_progress().await;
             // 槽位记住的是页面上的原始文本（下一轮要和页面最后一条消息比对）；交给会话的是
             // 图片已落地的版本。
-            let delivered = self.resolve_page_images(&last_assistant).await;
+            let delivered = self.resolve_page_images(&last_assistant, image_sink.as_ref()).await;
             self.slots.set_last_message(
                 &self.owner,
                 WebMessage {
@@ -1512,10 +1528,26 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingImageSink {
-        stored: Mutex<Vec<(String, String, crate::images::WebImage)>>,
+        stored: Arc<Mutex<Vec<(String, String, crate::images::WebImage)>>>,
+        binding_error: Option<&'static str>,
     }
 
     impl crate::images::WebImageSink for RecordingImageSink {
+        fn for_turn(
+            &self,
+            _session_id: &str,
+            _project_id: &str,
+            _slot_turn_id: u64,
+        ) -> Result<Arc<dyn crate::images::WebImageSink>, String> {
+            if let Some(error) = self.binding_error {
+                return Err(error.into());
+            }
+            Ok(Arc::new(Self {
+                stored: self.stored.clone(),
+                binding_error: None,
+            }))
+        }
+
         fn store(
             &self,
             session_id: &str,
@@ -1529,6 +1561,38 @@ mod tests {
     }
 
     const IMAGE_REPLY: &str = "好的\n\n![已生成图像 1](blob:https://chatgpt.com/a)\n\n![已生成图像 2](blob:https://chatgpt.com/a)";
+
+    #[tokio::test]
+    async fn unavailable_image_scope_keeps_text_delivery_without_saving_or_rebinding() {
+        for reply in ["text only", IMAGE_REPLY] {
+            let driver = FakeDriver::new(reply);
+            driver.with_image(vec![1, 2, 3]);
+            let sink = Arc::new(RecordingImageSink {
+                binding_error: Some("original source unavailable"),
+                ..Default::default()
+            });
+            let client = client_with(
+                driver,
+                Arc::new(WebSlotTable::new()),
+                "s1",
+                WebModelClientConfig::default(),
+            )
+            .with_image_sink(sink.clone());
+            let response = client
+                .execute(request("request", vec![]), &|_| {}, &|| false)
+                .await
+                .unwrap();
+            let content = response.content.unwrap();
+            if reply == "text only" {
+                assert_eq!(content, reply);
+            } else {
+                assert!(content.starts_with("好的"));
+                assert!(content.contains("图片未能保存"));
+                assert!(!content.contains("blob:"));
+            }
+            assert!(sink.stored.lock().unwrap().is_empty());
+        }
+    }
 
     #[tokio::test]
     async fn page_images_are_saved_to_the_project_and_never_streamed_as_page_urls() {

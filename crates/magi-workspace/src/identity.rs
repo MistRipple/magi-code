@@ -200,6 +200,15 @@ pub fn resolve_or_create_workspace_identity(
     Ok(identity)
 }
 
+/// 只读取首次注册所需的历史身份，不为新源文件夹建立项目 manifest。
+/// 多源项目创建入口先检查整组来源，不能将两个旧项目静默合并或重建历史身份。
+pub fn existing_workspace_identity(workspace_root: &Path) -> DomainResult<Option<WorkspaceId>> {
+    let _guard = identity_write_lock()
+        .lock()
+        .expect("workspace identity write lock poisoned");
+    infer_workspace_identity_locked(workspace_root)
+}
+
 /// 校验已注册工作区与项目本地 manifest 一致；缺少 manifest 时以注册归属初始化。
 /// session projection 与工作区归属的一致性由启动时的 projection 加载逐个强校验，这里不读取它们。
 pub fn verify_or_create_workspace_identity(

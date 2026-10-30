@@ -505,7 +505,8 @@ fn runtime_sidecar_flush_hook_only_persists_dirty_sidecars() {
         }
     );
     assert!(
-        PathBuf::from(workspace_root.as_str())
+        repository
+            .project_storage_root("workspace-flush")
             .join(".magi/session-projections")
             .exists()
     );
@@ -1822,7 +1823,8 @@ fn runtime_maintenance_tick_can_refresh_ledger_and_flush_due_sidecars() {
     assert!(ledger.last_persisted_at.is_some());
     assert!(!ledger.pending_flush);
     assert!(
-        PathBuf::from(workspace_root.as_str())
+        repository
+            .project_storage_root("workspace-maintenance")
             .join(".magi/session-projections")
             .exists()
     );

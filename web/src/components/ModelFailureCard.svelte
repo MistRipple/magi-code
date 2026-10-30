@@ -165,7 +165,7 @@
     <div class="model-failure-actions">
       <button
         type="button"
-        class="model-failure-action"
+        class="btn btn--primary btn--sm"
         data-web-model-action={webAction.kind}
         onclick={runWebAction}
       >{i18n.t(webAction.labelKey)}</button>
@@ -270,22 +270,6 @@
     flex-wrap: wrap;
     gap: var(--space-2);
     margin-top: var(--space-3);
-  }
-
-  .model-failure-action {
-    padding: 4px 12px;
-    border:0;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground);
-    font-size: var(--text-sm);
-    font-weight: var(--font-medium);
-    cursor: pointer;
-  }
-
-  .model-failure-action:hover,
-  .model-failure-action:focus-visible {
-    background: var(--background-hover);
   }
 
   .model-failure-diagnostic {

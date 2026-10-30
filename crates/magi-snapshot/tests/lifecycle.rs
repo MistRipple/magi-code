@@ -77,35 +77,123 @@ async fn start_session_is_idempotent_for_existing_session() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn start_session_rejects_same_session_id_for_different_workspace() {
-    let dir_a = tempdir().unwrap();
-    let dir_b = tempdir().unwrap();
-    let root_a = dir_a.path().to_path_buf();
-    let root_b = dir_b.path().to_path_buf();
-    fs::write(root_a.join("a.txt"), "a").unwrap();
-    fs::write(root_b.join("b.txt"), "b").unwrap();
-
-    let mgr = SnapshotManager::new();
-    let first = mgr
-        .start_session("s-workspace-bound".into(), root_a.clone())
+async fn one_session_tracks_same_relative_path_in_independent_roots_and_restarts() {
+    let a = tempdir().unwrap();
+    let b = tempdir().unwrap();
+    for (root, text) in [(a.path(), "A baseline"), (b.path(), "B baseline")] {
+        fs::write(root.join("same.txt"), text).unwrap();
+    }
+    let manager = SnapshotManager::new();
+    let first = manager
+        .start_session("multi-root".into(), a.path().into())
         .await
         .unwrap();
-    let second = mgr
-        .start_session("s-workspace-bound".into(), root_b.clone())
-        .await;
-
-    assert!(second.is_err(), "同名 session 不得复用到另一个 workspace");
+    let second = manager
+        .start_session("multi-root".into(), b.path().into())
+        .await
+        .unwrap();
+    assert_eq!(first.session_id(), second.session_id());
     assert!(
-        mgr.get_session_for_workspace("s-workspace-bound", &root_a)
-            .is_some(),
-        "原 workspace 的快照账本仍应可按 workspace 命中"
+        manager.get_session("multi-root").is_none(),
+        "旧读入口不得任意选择一份账本"
+    );
+    assert_eq!(manager.sessions_for_session("multi-root").len(), 2);
+    assert!(Arc::ptr_eq(
+        &first,
+        &manager
+            .get_session_for_workspace("multi-root", a.path())
+            .unwrap()
+    ));
+    let ctx = ToolHookCtx {
+        tool_call_id: "multi-write".into(),
+        worker_id: None,
+        execution_group_id: Some("multi-turn".into()),
+        declared_paths: vec![PathBuf::from("same.txt")],
+    };
+    for (session, text) in [(&first, "A changed"), (&second, "B changed")] {
+        session.before_tool(&ctx);
+        fs::write(session.workspace_root().join("same.txt"), text).unwrap();
+        session.after_tool(&ctx);
+    }
+    assert_eq!(
+        first.pending_changes().unwrap()[0]
+            .original_content
+            .as_deref(),
+        Some("A baseline")
+    );
+    assert_eq!(
+        second.pending_changes().unwrap()[0]
+            .original_content
+            .as_deref(),
+        Some("B baseline")
+    );
+    first.revert(&["same.txt".into()]).unwrap();
+    assert_eq!(
+        fs::read_to_string(a.path().join("same.txt")).unwrap(),
+        "A baseline"
+    );
+    assert_eq!(
+        fs::read_to_string(b.path().join("same.txt")).unwrap(),
+        "B changed"
+    );
+    manager.archive_session("multi-root").await.unwrap();
+    assert_eq!(manager.sessions_for_session("multi-root").len(), 2);
+    fs::write(a.path().join("offline.txt"), "written while archived").unwrap();
+    let resumed_a = manager
+        .start_session("multi-root".into(), a.path().into())
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&first, &resumed_a));
+    assert!(
+        resumed_a
+            .pending_changes()
+            .unwrap()
+            .iter()
+            .any(|change| change.path == "offline.txt")
+    );
+    resumed_a.approve(&["offline.txt".into()]).unwrap();
+    manager.archive_session("multi-root").await.unwrap();
+    drop(manager);
+    let restored = SnapshotManager::new();
+    let restored_a = restored
+        .start_session("multi-root".into(), a.path().into())
+        .await
+        .unwrap();
+    let restored_b = restored
+        .start_session("multi-root".into(), b.path().into())
+        .await
+        .unwrap();
+    assert!(restored_a.pending_changes().unwrap().is_empty());
+    let pending = restored_b.pending_changes().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].original_content.as_deref(), Some("B baseline"));
+    assert_eq!(pending[0].preview_content.as_deref(), Some("B changed"));
+    restored
+        .drop_session_for_workspace("multi-root", a.path())
+        .await
+        .unwrap();
+    assert!(
+        restored
+            .get_session_for_workspace("multi-root", a.path())
+            .is_none()
     );
     assert!(
-        mgr.get_session_for_workspace("s-workspace-bound", &root_b)
-            .is_none(),
-        "错误 workspace 不应命中已存在账本"
+        restored
+            .get_session_for_workspace("multi-root", b.path())
+            .is_some()
     );
-    assert_eq!(first.workspace_root(), root_a.canonicalize().unwrap());
+    assert_eq!(restored_b.pending_changes().unwrap().len(), 1);
+    restored
+        .rebase_session("multi-root".into(), a.path().into())
+        .await
+        .unwrap();
+    assert_eq!(
+        restored_b.pending_changes().unwrap().len(),
+        1,
+        "重建另一目录基线不得清除 B 的成果"
+    );
+    restored.drop_session("multi-root").await.unwrap();
+    assert!(restored.sessions_for_session("multi-root").is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -744,12 +832,13 @@ async fn restarted_shared_blob_survives_until_every_session_releases_it() {
         .start_session("s-shared-a".into(), root.clone())
         .await
         .unwrap();
+    restarted.drop_session("s-shared-a").await.unwrap();
+    // B 尚未按需加载；磁盘索引仍必须保护它的基线内容。
     let session_b = restarted
         .start_session("s-shared-b".into(), root.clone())
         .await
         .unwrap();
 
-    restarted.drop_session("s-shared-a").await.unwrap();
     let ctx = ToolHookCtx {
         tool_call_id: "call-shared-revert".into(),
         worker_id: None,

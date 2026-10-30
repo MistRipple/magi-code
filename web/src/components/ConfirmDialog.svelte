@@ -14,19 +14,19 @@
 
     {#snippet footer()}
       <div class="confirm-footer">
-        <button type="button" class="confirm-btn" onclick={() => settleConfirm('cancel')}>
+        <button type="button" class="btn btn--secondary btn--sm" onclick={() => settleConfirm('cancel')}>
           {request.cancelLabel}
         </button>
         {#if request.secondaryLabel}
-          <button type="button" class="confirm-btn confirm-btn--secondary" onclick={() => settleConfirm('secondary')}>
+          <button type="button" class="btn btn--secondary btn--sm" onclick={() => settleConfirm('secondary')}>
             {request.secondaryLabel}
           </button>
         {/if}
         <button
           type="button"
-          class="confirm-btn"
-          class:confirm-btn--primary={request.tone !== 'danger'}
-          class:confirm-btn--danger={request.tone === 'danger'}
+          class="btn btn--sm"
+          class:btn--primary={request.tone !== 'danger'}
+          class:btn--error={request.tone === 'danger'}
           onclick={() => settleConfirm('confirm')}
         >
           {request.confirmLabel}
@@ -47,43 +47,8 @@
 
   .confirm-footer {
     display: flex;
+    flex-wrap: wrap;
     justify-content: flex-end;
     gap: var(--space-2);
-  }
-
-  .confirm-btn {
-    height: 28px;
-    padding: 0 14px;
-    border: 0;
-    border-radius: 999px;
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    font-size: var(--text-sm);
-    white-space: nowrap;
-  }
-
-  .confirm-btn:hover {
-    background: color-mix(in srgb, var(--foreground) 7%, transparent);
-    color: var(--foreground);
-  }
-
-  .confirm-btn--secondary {
-    border: var(--magi-hairline) solid var(--border);
-    color: var(--foreground);
-  }
-
-  .confirm-btn--primary,
-  .confirm-btn--primary:hover {
-    background: var(--primary);
-    color: var(--primary-foreground, #fff);
-    font-weight: var(--font-semibold);
-  }
-
-  .confirm-btn--danger,
-  .confirm-btn--danger:hover {
-    background: var(--error);
-    color: var(--primary-foreground, #fff);
-    font-weight: var(--font-semibold);
   }
 </style>

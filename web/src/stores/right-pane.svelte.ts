@@ -28,6 +28,7 @@ export interface AgentTabPayload {
 /** Code tab payload —— filepath 必填；diff 存在时走 diff 视图，否则走单文件 viewer */
 export interface CodeTabPayload {
   filepath: string;
+  sourceFolderId?: string;
   displayPath?: string;
   workspaceId?: string;
   workspacePath?: string;
@@ -76,6 +77,7 @@ export interface BrowserTabPayload {
 
 /** Terminal tab payload —— 用户手动命令终端的稳定实例 ID，不持久化运行输出。 */
 export interface TerminalTabPayload {
+  sourceFolderId?: string;
   terminalTabId: string;
   workspaceId?: string;
   workspacePath?: string;
@@ -299,6 +301,7 @@ function sanitizeTabForPersist(tab: RightPaneTab): RightPaneTab {
   const payload = tab.payload as CodeTabPayload;
   const slim: CodeTabPayload = {
     filepath: payload.filepath,
+    sourceFolderId: payload.sourceFolderId,
     displayPath: payload.displayPath,
     workspaceId: payload.workspaceId,
     workspacePath: payload.workspacePath,
@@ -527,7 +530,8 @@ function tabKey(kind: RightPaneTabKind, payload: RightPaneTabPayload): string {
     return `agent:${(payload as AgentTabPayload).agentRunId}`;
   }
   if (kind === 'code') {
-    return `code:${(payload as CodeTabPayload).filepath}`;
+    const code = payload as CodeTabPayload;
+    return code.sourceFolderId ? `code:${code.sourceFolderId}:${code.filepath}` : `code:${code.filepath}`;
   }
   if (kind === 'terminal') {
     return `terminal:${(payload as TerminalTabPayload).terminalTabId}`;
@@ -787,6 +791,7 @@ export function openCodeTab(
   sessionId: string | null | undefined,
   filepath: string | null | undefined,
   options?: {
+    sourceFolderId?: string;
     label?: string;
     displayPath?: string;
     diff?: string | null;
@@ -834,6 +839,7 @@ export function openCodeTab(
     'code',
     {
       filepath: trimmedFilepath,
+      sourceFolderId: options?.sourceFolderId,
       displayPath,
       workspaceId,
       workspacePath: options?.workspacePath,
@@ -982,6 +988,7 @@ function newTerminalTabId(): string {
  * 旧进程或旧输出仍然可用；后台进程始终按 `Personal | Workspace` 会话作用域管理。
  */
 export function openTerminalTab(options: {
+  sourceFolderId?: string;
   workspaceId?: string | null;
   workspacePath?: string;
   sessionId: string;
@@ -999,6 +1006,7 @@ export function openTerminalTab(options: {
     'terminal',
     {
       terminalTabId,
+      sourceFolderId: options.sourceFolderId,
       workspaceId,
       workspacePath: options.workspacePath?.trim() || undefined,
       sessionId,
@@ -1200,6 +1208,7 @@ export function synchronizeBrowserTabs(
 }
 
 export interface PendingChangeTabProjection {
+  sourceFolderId?: string;
   filePath: string;
   snapshotId?: string;
   updatedAt?: number;
@@ -1239,8 +1248,8 @@ export function synchronizeChangeDiffTabs(
   }
   const changesByPath = new Map(
     pendingChanges
-      .map((change) => [change.filePath.trim(), change] as const)
-      .filter(([filePath]) => filePath.length > 0),
+      .map((change) => [`${change.sourceFolderId || ''}\u0000${change.filePath.trim()}`, change] as const)
+      .filter(([, change]) => change.filePath.trim().length > 0),
   );
   const staleTabIds: string[] = [];
   for (const tab of pane.openTabs) {
@@ -1251,7 +1260,7 @@ export function synchronizeChangeDiffTabs(
     if (!payload.isChangeDiff) {
       continue;
     }
-    const change = changesByPath.get(payload.filepath);
+    const change = changesByPath.get(`${payload.sourceFolderId || ''}\u0000${payload.filepath}`);
     if (!change) {
       staleTabIds.push(tab.id);
       continue;

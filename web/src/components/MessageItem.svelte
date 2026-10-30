@@ -451,7 +451,7 @@
   <div class="message-item user" class:sending={sendingAnimation} data-message-id={message.id} data-turn-id={messageTurnId || undefined} data-source="user">
     {#if messageContextReferences.length > 0}
       <div class="user-context-references">
-        {#each messageContextReferences as reference (`${message.id}-${reference.kind}-${reference.path}`)}
+        {#each messageContextReferences as reference (`${message.id}-${reference.sourceFolderId || ''}-${reference.kind}-${reference.path}`)}
           <button
             type="button"
             class="user-context-reference"
@@ -459,7 +459,7 @@
             disabled={reference.kind === 'directory'}
             onclick={() => {
               if (reference.kind === 'file') {
-                dispatchFilePreviewEvent({ filepath: reference.path, ...filePreviewScope });
+                dispatchFilePreviewEvent({ filepath: reference.path, ...filePreviewScope, sourceFolderId: reference.sourceFolderId || filePreviewScope?.sourceFolderId });
               }
             }}
           >

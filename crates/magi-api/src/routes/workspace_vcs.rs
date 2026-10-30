@@ -402,10 +402,11 @@ async fn accept_git_context(
             "当前 workspace 有运行中的 turn/worker，不能接受新的 Git 基线",
         )));
     }
-    if let Err(error) = state
-        .session_code_contexts
-        .validate_revision(session_id, request.expected_context_revision)
-    {
+    if let Err(error) = state.session_code_contexts.validate_revision_for_root(
+        session_id,
+        &scope.path,
+        request.expected_context_revision,
+    ) {
         return Ok(Json(GitOperationResponse::rejected_kind(
             "git_stale_context_revision",
             error.to_string(),
@@ -576,9 +577,10 @@ async fn merge_preview(
         Ok(preview) => Ok(Json(GitOperationResponse {
             ok: true,
             observation: Some(preview.observation.clone()),
-            session_context: state
-                .session_code_contexts
-                .get(request.context.session_id.as_deref().unwrap_or_default()),
+            session_context: state.session_code_contexts.get_for_path(
+                request.context.session_id.as_deref().unwrap_or_default(),
+                &scope.path,
+            ),
             data: Some(
                 serde_json::to_value(preview)
                     .map_err(|error| ApiError::internal_assembly("序列化 merge preview", error))?,
@@ -676,10 +678,11 @@ async fn worktree_list(
             Ok(Json(GitOperationResponse {
                 ok: true,
                 observation: None,
-                session_context: request
-                    .session_id
-                    .as_deref()
-                    .and_then(|session_id| state.session_code_contexts.get(session_id)),
+                session_context: request.session_id.as_deref().and_then(|session_id| {
+                    state
+                        .session_code_contexts
+                        .get_for_path(session_id, &scope.path)
+                }),
                 data: Some(
                     serde_json::to_value(worktrees).map_err(|error| {
                         ApiError::internal_assembly("序列化 worktree 列表", error)
@@ -757,7 +760,11 @@ async fn worktree_create(
                 .context
                 .session_id
                 .as_deref()
-                .and_then(|session_id| state.session_code_contexts.get(session_id)),
+                .and_then(|session_id| {
+                    state
+                        .session_code_contexts
+                        .get_for_path(session_id, &scope.path)
+                }),
             data: Some(
                 serde_json::to_value(worktree)
                     .map_err(|error| ApiError::internal_assembly("序列化 worktree", error))?,
@@ -800,27 +807,28 @@ async fn worktree_remove(
     {
         Ok(worktrees) => {
             let session_context = if let Some(session_id) = request.context.session_id.as_deref() {
-                if let Some(agent) =
-                    state
-                        .session_code_contexts
-                        .get(session_id)
-                        .and_then(|context| {
-                            context
-                                .agent_worktrees
-                                .into_iter()
-                                .find(|agent| agent.path == removed_path)
-                        })
+                if let Some(agent) = state
+                    .session_code_contexts
+                    .get_for_path(session_id, &scope.path)
+                    .and_then(|context| {
+                        context
+                            .agent_worktrees
+                            .into_iter()
+                            .find(|agent| agent.path == removed_path)
+                    })
                 {
                     let context = state
                         .session_code_contexts
-                        .release_agent_worktree(session_id, &agent.task_id)
+                        .release_agent_worktree_for_root(session_id, &scope.path, &agent.task_id)
                         .map_err(|error| {
                             ApiError::internal_assembly("释放 agent worktree context", error)
                         })?;
                     state.persist_session_git_contexts()?;
                     Some(context)
                 } else {
-                    state.session_code_contexts.get(session_id)
+                    state
+                        .session_code_contexts
+                        .get_for_path(session_id, &scope.path)
                 }
             } else {
                 None
@@ -864,9 +872,11 @@ async fn prepare_mutation(
         false,
     )?;
     if let Some(session_id) = request.session_id.as_deref()
-        && let Err(error) = state
-            .session_code_contexts
-            .validate_revision(session_id, request.expected_context_revision)
+        && let Err(error) = state.session_code_contexts.validate_revision_for_root(
+            session_id,
+            &scope.path,
+            request.expected_context_revision,
+        )
     {
         return Ok(Err(GitOperationResponse::rejected_kind(
             "git_stale_context_revision",
@@ -1055,7 +1065,7 @@ fn publish_git_context_changed(
 ) {
     let typed_session_id = session_id.map(|value| SessionId::new(value.to_string()));
     let context_revision = session_id
-        .and_then(|value| state.session_code_contexts.get(value))
+        .and_then(|value| state.session_code_contexts.get_for_path(value, &scope.path))
         .map(|context| context.context_revision);
     state.event_bus.publish(
         EventEnvelope::domain(
@@ -1372,6 +1382,143 @@ mod tests {
                 .expect("pending changes")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn project_git_http_mutations_keep_other_repository_baseline_and_revision() {
+        let (first, state, workspace_id, session_id) = git_api_fixture();
+        let second = tempfile::tempdir().unwrap();
+        git(second.path(), &["init", "-b", "main"]);
+        git(second.path(), &["config", "user.name", "Magi Test"]);
+        git(
+            second.path(),
+            &["config", "user.email", "magi@example.test"],
+        );
+        fs::write(second.path().join("README.md"), "second base\n").unwrap();
+        git(second.path(), &["add", "."]);
+        git(second.path(), &["commit", "-m", "base"]);
+        let project = state
+            .workspace_registry
+            .project(&WorkspaceId::new(&workspace_id))
+            .unwrap();
+        let mut folder = project.primary_source_folder().clone();
+        let native = second.path().canonicalize().unwrap();
+        let host = magi_core::HostPath::from_path(native.clone());
+        folder.source_folder_id = "second".into();
+        folder.path = magi_core::AbsolutePath::new(host.display_string());
+        folder.path_ref = host.to_path_ref().as_str().into();
+        let mut folders = project.source_folders;
+        folders.push(folder);
+        state
+            .workspace_registry
+            .edit_project(
+                &WorkspaceId::new(&workspace_id),
+                project.revision,
+                magi_workspace::WorkspaceProjectEdit {
+                    name: project.name,
+                    source_folders: folders,
+                    primary_source_folder_id: project.primary_source_folder_id,
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let first_status = post_json(
+            state.clone(),
+            "/workspace/vcs/status",
+            serde_json::json!({
+                "workspacePath": first.path(), "sessionId": session_id,
+            }),
+        )
+        .await;
+        let second_status = post_json(
+            state.clone(),
+            "/workspace/vcs/status",
+            serde_json::json!({
+                "workspacePath": second.path(), "sessionId": session_id,
+            }),
+        )
+        .await;
+        assert_eq!(first_status["isRepo"], true, "{first_status}");
+        assert_eq!(second_status["isRepo"], true, "{second_status}");
+        assert!(state.session_code_contexts.get(&session_id).is_none());
+        let second_before = state
+            .session_code_contexts
+            .get_repository(&session_id, &native)
+            .unwrap();
+        let created = post_json(state.clone(), "/workspace/vcs/branch/create", serde_json::json!({
+            "workspacePath": first.path(), "sessionId": session_id,
+            "expectedContextRevision": first_status["sessionContext"]["contextRevision"], "branch": "feature/first",
+        })).await;
+        assert_eq!(created["ok"], true, "{created}");
+        assert_eq!(
+            state
+                .session_code_contexts
+                .get_repository(&session_id, &native)
+                .unwrap(),
+            second_before
+        );
+        let preview = post_json(state.clone(), "/workspace/vcs/merge/preview", serde_json::json!({
+            "workspacePath": second.path(), "sessionId": session_id,
+            "expectedContextRevision": second_status["sessionContext"]["contextRevision"], "target": "main",
+        })).await;
+        assert_eq!(preview["ok"], true, "{preview}");
+        assert_eq!(
+            preview["sessionContext"]["executionRoot"],
+            serde_json::json!(native)
+        );
+        let persisted = state.session_code_contexts.all();
+        let restored = magi_git::SessionCodeContextRegistry::default();
+        restored.restore_after_restart(
+            serde_json::from_slice(&serde_json::to_vec(&persisted).unwrap()).unwrap(),
+        );
+        assert_eq!(restored.for_session(&session_id).len(), 2);
+        assert_eq!(
+            restored.get_repository(&session_id, &native).unwrap(),
+            second_before
+        );
+        let session = SessionId::new(&session_id);
+        let workspace = WorkspaceId::new(&workspace_id);
+        let first_context = state
+            .ensure_session_code_context_for_root(&session, &workspace, first.path())
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .ensure_session_code_context_for_root(&session, &workspace, second.path())
+            .await
+            .unwrap()
+            .unwrap();
+        let plain = tempfile::tempdir().unwrap();
+        assert!(
+            state
+                .ensure_session_code_context_for_root(&session, &workspace, plain.path())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .workspace_git_coordinator
+                .execution_roots(&session_id)
+                .len(),
+            2,
+            "普通目录不能释放其它仓库正在使用的租约"
+        );
+        state.release_session_git_execution_lease_for_repository(
+            &session,
+            &first_context.git.git_common_dir,
+        );
+        assert!(
+            !state
+                .workspace_git_coordinator
+                .session_holds_execution(&session_id, &first_context.git.git_common_dir)
+        );
+        assert!(
+            state
+                .workspace_git_coordinator
+                .session_holds_execution(&session_id, &second_before.git.git_common_dir)
+        );
+        state.release_session_git_execution_lease(&session);
     }
 
     #[tokio::test]

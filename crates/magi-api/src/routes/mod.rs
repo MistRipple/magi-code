@@ -23,6 +23,68 @@ mod workspace_vcs;
 mod workspaces;
 
 #[cfg(test)]
+pub(crate) mod test_project_fixtures {
+    use crate::state::ApiState;
+    use magi_core::{AbsolutePath, HostPath, WorkspaceId};
+    use magi_workspace::{WorkspaceProjectEdit, WorkspaceRecord};
+    use std::path::Path;
+
+    pub(crate) fn add_source(
+        state: &ApiState,
+        workspace_id: &str,
+        source_folder_id: &str,
+        path: &Path,
+    ) -> WorkspaceRecord {
+        let id = WorkspaceId::new(workspace_id);
+        let project = state.workspace_registry.project(&id).unwrap();
+        let mut folder = project.primary_source_folder().clone();
+        let host = HostPath::canonicalize(path).unwrap();
+        folder.source_folder_id = source_folder_id.into();
+        folder.path = AbsolutePath::new(host.display_string());
+        folder.path_ref = host.to_path_ref().as_str().into();
+        let primary = project.primary_source_folder_id.clone();
+        let name = project.name.clone();
+        let mut members = project.source_folders.clone();
+        members.push(folder);
+        state
+            .workspace_registry
+            .edit_project(
+                &id,
+                project.revision,
+                WorkspaceProjectEdit {
+                    name,
+                    source_folders: members,
+                    primary_source_folder_id: primary,
+                },
+                |_| Ok(()),
+            )
+            .unwrap()
+    }
+
+    pub(crate) fn set_members(state: &ApiState, workspace_id: &str, keep: &[&str], primary: &str) {
+        let id = WorkspaceId::new(workspace_id);
+        let project = state.workspace_registry.project(&id).unwrap();
+        state
+            .workspace_registry
+            .edit_project(
+                &id,
+                project.revision,
+                WorkspaceProjectEdit {
+                    name: project.name.clone(),
+                    source_folders: project
+                        .source_folders
+                        .into_iter()
+                        .filter(|folder| keep.contains(&folder.source_folder_id.as_str()))
+                        .collect(),
+                    primary_source_folder_id: primary.into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod test_turn_fixtures {
     use magi_conversation_runtime::{
         CanonicalTurnEventSink, CoordinatorAdmission, CoordinatorCommandResult,

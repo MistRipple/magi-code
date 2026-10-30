@@ -1,4 +1,5 @@
 <script lang="ts">
+  import '../styles/settings.css';
   import { themeDisplayName } from '../appearance/labels';
 
   $effect(() => { document.documentElement.lang = i18n.locale; });
@@ -25,6 +26,7 @@
   import { pluginRegistryRevision } from '../stores/plugin-registry.svelte';
   import SidebarFooter from '../components/SidebarFooter.svelte';
   import Modal from '../components/Modal.svelte';
+  import SelectField from '../components/SelectField.svelte';
   import { runActionWithFeedback } from '../lib/action-feedback';
   import {
     DESKTOP_CONTEXT_DROP_EVENT,
@@ -103,13 +105,16 @@
     listAgentWorkspaces,
     markAgentSessionViewed,
     registerAgentWorkspace,
+    createAgentProject,
     removeAgentWorkspace,
+    updateAgentProject,
     renameAgentSession,
     resolveAgentBaseUrl,
     BROWSER_AUTHORITY_CHANGED_EVENT,
     type AgentConnectionEventDetail,
     type AgentUnavailableSession,
     type AgentWorkspaceSummary,
+    type AgentWorkspaceSourceFolder,
   } from './agent-api';
   import {
     loadBrowserAuthorityTab,
@@ -205,6 +210,15 @@ import {
   let showRemoveWorkspaceDialog = $state(false);
   let pendingRemoveWorkspace = $state<AgentWorkspaceSummary | null>(null);
   let workspaceDialogError = $state('');
+  let projectEditWorkspace = $state<AgentWorkspaceSummary | null>(null);
+  let projectEditorOpen = $state(false);
+  let projectEditorTrigger: HTMLElement | null = null;
+  let projectEditorElement = $state<HTMLElement | null>(null);
+  let projectEditName = $state('');
+  let projectEditFolders = $state<Array<{ sourceFolderId: string; path: string; displayPath: string; name: string }>>([]);
+  let projectEditPrimary = $state('');
+  let projectEditError = $state('');
+  const projectEditorFormId = $props.id();
   let showDeleteSessionDialog = $state(false);
   let pendingDeleteSession = $state<{ workspace: AgentWorkspaceSummary | null; session: Session } | null>(null);
   let editingSession = $state<{ workspaceId: string | null; sessionId: string } | null>(null);
@@ -294,11 +308,13 @@ import {
   const workspaceSessionRequestSeqByWorkspace = new Map<string, number>();
   const sessionViewedRequests = new Set<string>();
 
-  type WorkspaceFileSelection = { pathRef: string; displayPath: string; name: string };
+  type WorkspaceFileSelection = { pathRef: string; displayPath: string; name: string; sourceFolderId?: string };
   type ProjectFileTreeProps = {
     sessionId?: string;
     rootPath: string;
     workspaceId: string;
+    sourceFolders?: AgentWorkspaceSourceFolder[];
+    selectedSourceFolderId?: string;
     showHidden?: boolean;
     selectedFilePath?: string | null;
     onFileSelect?: (selection: WorkspaceFileSelection) => void;
@@ -343,7 +359,7 @@ import {
 
   function loadProjectFileTree(): Promise<void> {
     if (ProjectFileTreeComponent) return Promise.resolve();
-    projectFileTreeLoad ??= import('./ProjectFileTree.svelte')
+    projectFileTreeLoad ??= import('./ProjectFileTrees.svelte')
       .then((module) => {
         ProjectFileTreeComponent = module.default;
       })
@@ -789,6 +805,11 @@ import {
     return (tab.payload as CodeTabPayload).filepath;
   });
 
+  const activeCodeSourceFolderId = $derived.by(() => {
+    const tab = activeRightPaneState.openTabs.find((tab) => tab.id === activeRightPaneState.activeTabId);
+    return tab?.kind === 'code' ? (tab.payload as CodeTabPayload).sourceFolderId || '' : '';
+  });
+
   $effect(() => {
     if (sidebarMode === 'files') {
       void loadProjectFileTree().catch((error) => {
@@ -813,6 +834,12 @@ import {
         addToast('error', i18n.t('app.featureLoadFailed'));
         closeWorkspaceFolderPicker();
       });
+    }
+    if (workspaceOnboardingState.projectCreationRequested) {
+      const trigger = workspaceOnboardingState.projectCreationTrigger;
+      workspaceOnboardingState.projectCreationRequested = false;
+      workspaceOnboardingState.projectCreationTrigger = null;
+      if (!workspaceActionPending && !loadError) openProjectEditor(null, trigger);
     }
   });
   const previewIsOverlay = $derived(inlineRightPaneVisible && panelLayout.previewOverlay);
@@ -855,7 +882,7 @@ import {
   }
 
   function workspaceNavigationPath(workspace: AgentWorkspaceSummary): string {
-    // 会话协议使用规范化后的真实工作区路径；rootPathRef 只用于文件系统引用。
+    // 路径作为主要目录展示提示，项目/会话归属由 daemon 的 workspaceId 确认。
     return workspace.rootPath.trim();
   }
 
@@ -957,7 +984,10 @@ import {
     }
     const requestedWorkspacePath = currentWorkspaceBinding().workspacePath;
     const requestedWorkspace = requestedWorkspacePath
-      ? nextWorkspaces.find((workspace) => workspace.rootPath?.trim() === requestedWorkspacePath)
+      ? nextWorkspaces.find((workspace) => workspace.rootPath?.trim() === requestedWorkspacePath
+        || workspace.rootPathRef?.trim() === requestedWorkspacePath
+        || workspace.sourceFolders?.some((folder) => folder.path?.trim() === requestedWorkspacePath
+          || folder.pathRef?.trim() === requestedWorkspacePath))
       : null;
     if (requestedWorkspace) {
       return requestedWorkspace.workspaceId;
@@ -1747,6 +1777,7 @@ import {
   function handleFileSelect(
     filePath: string,
     metadata: {
+      sourceFolderId?: string;
       workspaceId?: string;
       workspacePath?: string;
       sessionId?: string;
@@ -1793,6 +1824,7 @@ import {
       // 不经过「请求对象 → 等右栏消费」，右栏懒加载或未挂载时也不会丢事件。
       requestRightPaneVisibility(true);
       void openHtmlFileInRightPaneBrowser({
+        sourceFolderId: metadata.sourceFolderId,
         filepath: normalizedFilePath,
         workspaceId,
         workspacePath,
@@ -1800,6 +1832,7 @@ import {
       });
     } else {
       openCodeTab(sessionId, normalizedFilePath, {
+        sourceFolderId: metadata.sourceFolderId,
         displayPath: metadata.displayPath,
         label: metadata.label,
         workspaceId,
@@ -2041,6 +2074,10 @@ import {
   async function handleFolderSelected(
     selection: { pathRef: string; displayPath: string; name: string },
   ): Promise<void> {
+    if (workspaceOnboardingState.origin === 'project') {
+      handleProjectFolderSelected(selection);
+      return;
+    }
     if (workspaceActionPending) {
       return;
     }
@@ -2091,7 +2128,80 @@ import {
       return;
     }
     workspaceDialogError = '';
-    openWorkspaceFolderPicker('sidebar');
+    openProjectEditor(null, document.querySelector<HTMLElement>('[data-testid="sidebar-add-workspace"]'));
+  }
+
+  function openProjectEditor(workspace: AgentWorkspaceSummary | null, trigger: HTMLElement | null): void {
+    if (workspaceActionPending) return;
+    projectEditorTrigger = trigger;
+    projectEditorOpen = true;
+    projectEditWorkspace = workspace;
+    projectEditName = workspace?.name || '';
+    projectEditFolders = (workspace?.sourceFolders || []).map((folder) => ({
+      sourceFolderId: folder.sourceFolderId,
+      path: folder.pathRef || folder.path,
+      displayPath: folder.path,
+      name: folder.name || '',
+    }));
+    projectEditPrimary = workspace?.primarySourceFolderId || '';
+    projectEditError = '';
+  }
+
+  function closeProjectEditor(): void {
+    if (workspaceActionPending) return;
+    projectEditorOpen = false;
+    projectEditWorkspace = null;
+    projectEditError = '';
+    void tick().then(() => projectEditorTrigger?.isConnected && projectEditorTrigger.focus({ preventScroll: true }));
+  }
+
+  function removeProjectFromEditor(): void {
+    const workspace = projectEditWorkspace;
+    if (!workspace || workspaceActionPending) return;
+    openRemoveWorkspaceDialog(workspace);
+  }
+
+  function addProjectFolder(): void {
+    if (!projectEditorOpen || workspaceActionPending) return;
+    openWorkspaceFolderPicker('project');
+  }
+
+  function removeProjectFolder(sourceFolderId: string): void {
+    if (workspaceActionPending || (projectEditWorkspace && projectEditFolders.length <= 1)) return;
+    const remaining = projectEditFolders.filter((folder) => folder.sourceFolderId !== sourceFolderId);
+    projectEditFolders = remaining;
+    if (remaining.length === 1) projectEditPrimary = remaining[0].sourceFolderId;
+    else if (projectEditPrimary === sourceFolderId) projectEditPrimary = '';
+  }
+
+  async function saveProjectEditor(): Promise<void> {
+    if (!projectEditorOpen || workspaceActionPending || !projectEditFolders.length || !projectEditPrimary || !projectEditName.trim()) return;
+    workspaceActionPending = true;
+    projectEditError = '';
+    try {
+      const members = projectEditFolders.map(({ sourceFolderId, path, name }) => ({ sourceFolderId, path, name }));
+      const editing = projectEditWorkspace;
+      const updated = editing
+        ? await updateAgentProject(editing, projectEditName, members, projectEditPrimary)
+        : await createAgentProject(projectEditName.trim(), members, projectEditPrimary);
+      workspaces = editing
+        ? workspaces.map((workspace) => workspace.workspaceId === updated.workspaceId ? updated : workspace)
+        : [...workspaces.filter((workspace) => workspace.workspaceId !== updated.workspaceId), updated];
+      projectEditorOpen = false;
+      projectEditWorkspace = null;
+      if (!editing) {
+        selectedWorkspaceId = updated.workspaceId;
+        expandedWorkspaceIds = { ...expandedWorkspaceIds, [updated.workspaceId]: true };
+        const navigation = navigateSession({ kind: 'draft', scope: 'workspace', workspaceId: updated.workspaceId, workspacePath: workspaceNavigationPath(updated) });
+        if (navigation) await waitForSessionNavigation(navigation);
+        if (sidebarIsDrawer) sidebarOpen = false;
+      }
+      void tick().then(() => projectEditorTrigger?.isConnected && projectEditorTrigger.focus({ preventScroll: true }));
+    } catch (error) {
+      projectEditError = error instanceof Error ? error.message : i18n.t(projectEditWorkspace ? 'web.projectUpdateFailed' : 'web.projectCreateFailed');
+    } finally {
+      workspaceActionPending = false;
+    }
   }
 
   function closeAddWorkspaceDialog(options: { force?: boolean } = {}): void {
@@ -2099,8 +2209,25 @@ import {
       return;
     }
     workspaceDialogError = '';
-    
+    const restoreProjectFocus = workspaceOnboardingState.origin === 'project';
     closeWorkspaceFolderPicker();
+    if (restoreProjectFocus) void tick().then(() => projectEditorElement?.querySelector<HTMLButtonElement>('[data-add-source-folder]')?.focus());
+  }
+
+  function handleProjectFolderSelected(
+    selection: { pathRef: string; displayPath: string; name: string },
+  ): void {
+    if (!projectEditorOpen) return;
+    const sourceFolderId = `draft-${crypto.randomUUID()}`;
+    const firstFolder = projectEditFolders.length === 0;
+    projectEditFolders = [...projectEditFolders, {
+      sourceFolderId,
+      path: selection.pathRef.trim(),
+      displayPath: selection.displayPath,
+      name: selection.name.trim(),
+    }];
+    if (firstFolder) projectEditPrimary = sourceFolderId;
+    closeAddWorkspaceDialog();
   }
 
   function openRemoveWorkspaceDialog(workspace: AgentWorkspaceSummary): void {
@@ -2109,7 +2236,6 @@ import {
     }
     workspaceDialogError = '';
     pendingRemoveWorkspace = workspace;
-    
     showRemoveWorkspaceDialog = true;
   }
 
@@ -2119,7 +2245,6 @@ import {
     }
     workspaceDialogError = '';
     pendingRemoveWorkspace = null;
-    
     showRemoveWorkspaceDialog = false;
   }
 
@@ -2144,6 +2269,11 @@ import {
       );
       if (!next) {
         return;
+      }
+      if (projectEditWorkspace?.workspaceId === removedId) {
+        projectEditorOpen = false;
+        projectEditWorkspace = null;
+        projectEditError = '';
       }
       invalidateWorkspaceSessionRequests(removedId);
       workspaces = next;
@@ -2928,6 +3058,7 @@ import {
     const handlePreviewFile = (event: Event) => {
       const detail = (event as CustomEvent<{
         filepath?: string;
+        sourceFolderId?: string;
         workspaceId?: string;
         workspacePath?: string;
         sessionId?: string;
@@ -2942,6 +3073,7 @@ import {
       const filepath = detail?.filepath;
       if (typeof filepath === 'string') {
         const handled = handleFileSelect(filepath, {
+          sourceFolderId: detail?.sourceFolderId,
           workspaceId: detail?.workspaceId,
           workspacePath: detail?.workspacePath,
           sessionId: detail?.sessionId,
@@ -2964,13 +3096,14 @@ import {
       const filepath = detail?.filepath?.trim() || '';
       if (!filepath || !isHtmlFile(filepath)) return;
       const binding = currentWorkspaceBinding();
-      if (binding.scope !== 'workspace' || !binding.workspaceId || !binding.workspacePath || !binding.sessionId) return;
+      if (binding.scope !== 'workspace') return;
       requestRightPaneVisibility(true);
       void openHtmlFileInRightPaneBrowser({
         filepath,
-        workspaceId: binding.workspaceId,
-        workspacePath: binding.workspacePath,
-        sessionId: binding.sessionId,
+        workspaceId: detail.workspaceId ?? binding.workspaceId,
+        workspacePath: detail.workspacePath ?? binding.workspacePath,
+        sessionId: detail.sessionId ?? binding.sessionId,
+        sourceFolderId: detail.sourceFolderId,
       });
     };
     /**
@@ -3232,7 +3365,7 @@ import {
               <Icon name="chevronDown" size={11} />
             </span>
           </button>
-          <div class="section-title-tools">
+          <div class="section-title-tools section-title-tools--projects">
             <button
               type="button"
               class="btn-icon btn-icon--sm"
@@ -3248,12 +3381,13 @@ import {
             <button
               type="button"
               class="btn-icon btn-icon--sm"
-              data-tooltip={i18n.t('web.selectFolder')}
-              aria-label={i18n.t('web.selectFolder')}
+              data-tooltip={i18n.t('web.createProjectTitle')}
+              data-testid="sidebar-add-workspace"
+              aria-label={i18n.t('web.createProjectTitle')}
               disabled={workspaceActionPending || !!loadError}
               onclick={openAddWorkspaceDialog}
             >
-              <Icon name="folder" size={13} />
+              <Icon name="plus" size={16} />
             </button>
             <button
               type="button"
@@ -3310,7 +3444,7 @@ import {
                     >
                       <Icon name="chevronDown" size={10} />
                     </span>
-                    <Icon name="folder" size={12} class="workspace-folder-icon" />
+                    <Icon name="grid" size={12} class="workspace-project-icon" />
                     <span class="workspace-label">
                       <span class="workspace-name">{workspace.name}</span>
                       {#if workspaceHints[workspace.workspaceId]}<span class="workspace-path">{workspaceHints[workspace.workspaceId]}</span>{/if}
@@ -3333,6 +3467,20 @@ import {
                     }}
                   >
                     <Icon name="plus" size={12} />
+                  </button>
+                  <button
+                    type="button"
+                    class="btn-icon btn-icon--sm row-action"
+                    data-workspace-action="edit"
+                    title={i18n.t('web.editWorkspaceTitle')}
+                    aria-label={i18n.t('web.editWorkspaceAria', { name: workspace.name })}
+                    disabled={workspaceActionPending}
+                    onclick={(event) => {
+                      event.stopPropagation();
+                      openProjectEditor(workspace, event.currentTarget);
+                    }}
+                  >
+                    <Icon name="edit" size={12} />
                   </button>
                   <button
                     type="button"
@@ -3585,10 +3733,13 @@ import {
             bind:this={projectFileTreeHandle}
             rootPath={selectedWorkspace?.rootPath || ''}
             workspaceId={selectedWorkspaceId}
-            sessionId={!selectedWorkspaceId ? currentSessionId || '' : ''}
+            sourceFolders={selectedWorkspace?.sourceFolders || []}
+            sessionId={currentSessionId || ''}
             showHidden={fileTreeShowHidden}
             selectedFilePath={activeCodeTabFilePath}
+            selectedSourceFolderId={activeCodeSourceFolderId}
             onFileSelect={(selection) => handleFileSelect(selection.pathRef, {
+              sourceFolderId: selection.sourceFolderId,
               displayPath: selection.displayPath,
               label: selection.name,
             })}
@@ -3799,6 +3950,17 @@ import {
   {/if}
 </div>
 
+{#if projectEditorOpen}
+  <Modal title={i18n.t(projectEditWorkspace ? 'web.editWorkspaceTitle' : 'web.createProjectTitle')} onClose={closeProjectEditor} form={true}
+    initialFocusSelector="input"
+    closeOnBackdrop={false} closeOnEscape={!workspaceActionPending} size="md" modalClass="project-editor-modal">
+    <div class="project-editor" bind:this={projectEditorElement}>
+      {@render projectEditor()}
+    </div>
+    {#snippet footer()}{@render projectEditorActions()}{/snippet}
+  </Modal>
+{/if}
+
 {#if workspaceOnboardingState.open}
   <Modal
     onClose={closeAddWorkspaceDialog}
@@ -3839,12 +4001,75 @@ import {
 
     {#snippet footer()}
       <button class="btn btn--secondary" type="button" onclick={() => closeRemoveWorkspaceDialog()} disabled={workspaceActionPending}>{i18n.t('web.folderPickerCancel')}</button>
-      <button class="btn btn--danger" type="button" onclick={() => void removeWorkspace()} disabled={workspaceActionPending}>
+      <button class="btn btn--error" type="button" onclick={() => void removeWorkspace()} disabled={workspaceActionPending}>
         {workspaceActionPending ? i18n.t('web.removingWorkspace') : i18n.t('web.confirmRemoveWorkspace')}
       </button>
     {/snippet}
   </Modal>
 {/if}
+
+{#snippet projectEditor()}
+  <form id={projectEditorFormId} onsubmit={(event) => { event.preventDefault(); void saveProjectEditor(); }}
+    aria-busy={workspaceActionPending}>
+    <label class="workspace-dialog-field">
+      <span class="project-name-control">
+        <span class="project-name-icon"><Icon name="grid" size={18} /></span>
+        <input class="form-input" bind:value={projectEditName} aria-label={i18n.t('web.projectNameLabel')} placeholder={i18n.t('web.projectNameLabel')} required disabled={workspaceActionPending} />
+      </span>
+    </label>
+    <div class="workspace-dialog-field">
+      <div class="project-source-heading">
+        <span>{i18n.t('web.sourceFoldersLabel')}</span>
+        <span class="project-source-device"><Icon name="monitor" size={16} />{i18n.t('web.thisComputer')}</span>
+      </div>
+      <div class="workspace-source-folder-list">
+        {#each projectEditFolders as folder (folder.sourceFolderId)}
+          <div class="workspace-source-folder-item">
+            <div class="workspace-source-folder-row">
+              <span class="project-source-icon"><Icon name="folder" size={20} /></span>
+              <div class="workspace-source-folder-copy">
+                <bdi class="workspace-source-folder-name">{folder.name || folder.displayPath.split(/[\\/]/).filter(Boolean).at(-1)}</bdi>
+                <span class="workspace-source-folder-path" dir="ltr">{folder.displayPath}</span>
+              </div>
+              <button class="btn-icon btn-icon--sm btn-icon--danger" type="button"
+                aria-label={i18n.t('web.removeSourceFolderAria', { path: folder.displayPath })}
+                title={i18n.t('web.removeSourceFolder')}
+                onclick={() => removeProjectFolder(folder.sourceFolderId)} disabled={workspaceActionPending || Boolean(projectEditWorkspace && projectEditFolders.length <= 1)}>
+                <Icon name="x" size={16} />
+              </button>
+            </div>
+          </div>
+        {/each}
+        <button class="btn btn--ghost project-add-folder" type="button" data-add-source-folder onclick={addProjectFolder} disabled={workspaceActionPending}>
+          <Icon name="folder-plus" size={20} />{i18n.t('web.addSourceFolder')}
+        </button>
+      </div>
+    </div>
+    {#if projectEditFolders.length > 1}
+    <div class="workspace-dialog-field">
+      <span>{i18n.t('input.primarySourceFolder')}</span>
+      <SelectField bind:value={projectEditPrimary} label={i18n.t('input.primarySourceFolder')}
+        disabled={workspaceActionPending}
+        options={[{ value: '', label: i18n.t('web.selectPrimarySourceFolder'), disabled: true }, ...projectEditFolders.map(folder => ({
+          value: folder.sourceFolderId, label: `${folder.name || folder.displayPath.split(/[\\/]/).filter(Boolean).at(-1)} · ${folder.displayPath}`,
+        }))]} />
+    </div>
+    {#if !projectEditPrimary}<p class="settings-hint" role="status">{i18n.t('web.selectPrimarySourceFolder')}</p>{/if}
+    {/if}
+    {#if projectEditError}<div class="workspace-dialog-error" role="alert">{projectEditError}</div>{/if}
+  </form>
+{/snippet}
+
+{#snippet projectEditorActions()}
+  {#if projectEditWorkspace}
+    <button class="btn btn--error project-remove-action" type="button" onclick={removeProjectFromEditor} disabled={workspaceActionPending}>{i18n.t('web.removeProject')}</button>
+  {/if}
+  <button class="btn btn--secondary" type="button" onclick={closeProjectEditor} disabled={workspaceActionPending}>{i18n.t('web.folderPickerCancel')}</button>
+  <button class="btn btn--primary" type="submit" form={projectEditorFormId}
+    disabled={workspaceActionPending || !projectEditPrimary || !projectEditFolders.length || !projectEditName.trim()}>
+    {workspaceActionPending ? i18n.t('common.loading') : i18n.t(projectEditWorkspace ? 'web.saveWorkspaceChanges' : 'web.createProjectTitle')}
+  </button>
+{/snippet}
 
 {#if showDeleteSessionDialog && pendingDeleteSession}
   <Modal
@@ -3857,12 +4082,42 @@ import {
 
     {#snippet footer()}
       <button class="btn btn--secondary" type="button" onclick={closeDeleteSessionDialog}>{i18n.t('header.cancel')}</button>
-      <button class="btn btn--danger" type="button" onclick={confirmDeleteSession}>{i18n.t('header.confirmDelete')}</button>
+      <button class="btn btn--error" type="button" onclick={confirmDeleteSession}>{i18n.t('header.confirmDelete')}</button>
     {/snippet}
   </Modal>
 {/if}
 
 <style>
+  :global(.project-editor-modal .modal-header) { padding: var(--space-6); border-block-end: 0; }
+  :global(.project-editor-modal .modal-body) { padding: 0 var(--space-6); }
+  :global(.project-editor-modal .modal-footer) { flex-wrap: wrap; padding: var(--space-6); border-block-start: 0; gap: var(--space-3); }
+  .project-remove-action { margin-inline-end: auto; }
+  .project-editor { min-inline-size: 0; }
+  .workspace-dialog-field { display: flex; flex-direction: column; gap: var(--space-3); margin-block-end: var(--space-5); min-inline-size: 0; font-size: var(--text-sm); }
+  .workspace-dialog-field:last-child { margin-block-end: 0; }
+  .project-name-control { display: flex; align-items: center; min-inline-size: 0; min-block-size: var(--btn-height-xl); border-radius: var(--radius-sm); box-shadow: inset 0 0 0 var(--magi-hairline) var(--border); background: var(--vscode-input-background); }
+  .project-name-control:focus-within { box-shadow: var(--magi-focus-shadow); }
+  .project-name-icon { display: flex; align-items: center; justify-content: center; flex: 0 0 var(--btn-height-xl); align-self: stretch; border-inline-end: var(--magi-hairline) solid var(--border); }
+  .project-name-control .form-input { flex: 1; min-inline-size: 0; block-size: var(--btn-height-xl); background: transparent; box-shadow: none; border-radius: 0; font-size: var(--text-base); padding-inline: var(--space-4); }
+  .project-source-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--space-3); min-inline-size: 0; font-weight: var(--font-semibold); }
+  .project-source-device { display: inline-flex; align-items: center; gap: var(--space-3); color: var(--foreground-muted); font-size: var(--text-xs); font-weight: var(--font-medium); line-height: var(--leading-normal); }
+  .project-source-icon { display: flex; color: var(--foreground-muted); flex: none; }
+  .workspace-source-folder-list { display: flex; flex-direction: column; min-inline-size: 0; box-shadow: inset 0 0 0 var(--magi-hairline) var(--border); border-radius: var(--radius-lg); overflow: hidden; }
+  .workspace-source-folder-item { min-inline-size: 0; padding: var(--space-4) var(--space-5); border-block-end: var(--magi-hairline) solid var(--border); }
+  .workspace-source-folder-row { display: flex; align-items: center; gap: var(--space-3); min-inline-size: 0; min-block-size: var(--btn-height-lg); }
+  .workspace-source-folder-copy { display: flex; flex-direction: column; gap: var(--space-1); flex: 1; min-inline-size: 0; }
+  .workspace-source-folder-name, .workspace-source-folder-path { overflow-wrap: anywhere; line-height: var(--leading-normal); }
+  .workspace-source-folder-name { font-size: var(--text-base); font-weight: var(--font-medium); }
+  .workspace-source-folder-path { color: var(--foreground-muted); font-size: var(--text-xs); unicode-bidi: isolate; }
+  .workspace-source-folder-list .btn-icon { flex: none; inline-size: var(--btn-height-lg); block-size: var(--btn-height-lg); padding: var(--space-3); }
+  .project-add-folder { justify-content: flex-start; gap: var(--space-3); inline-size: 100%; block-size: auto; min-block-size: var(--btn-height-xl); padding: var(--space-4) var(--space-5); border-radius: 0; white-space: normal; line-height: var(--leading-normal); overflow-wrap: anywhere; text-align: start; }
+  .project-add-folder :global(svg) { flex: none; color: var(--foreground-muted); }
+  .project-editor :global(.form-input) { min-inline-size: 0; max-inline-size: 100%; }
+  @media (hover: none), (pointer: coarse) {
+    :global(.project-editor-modal .modal-close) { inline-size: 44px; block-size: 44px; }
+      .workspace-source-folder-list .btn-icon { inline-size: 44px; block-size: 44px; padding: 14px; }
+    .project-add-folder { min-block-size: 44px; }
+  }
   .web-workbench-shell {
     display: grid;
     grid-template-columns: var(--sidebar-width, 320px) minmax(0, 1fr);
@@ -4383,6 +4638,8 @@ import {
     transition: background var(--transition-fast);
   }
 
+  .workspace-header-btn:active:not(:disabled) { background: var(--surface-active, var(--surface-hover)); }
+
   .workspace-row:hover {
     background: color-mix(in srgb, var(--surface-hover) 60%, transparent);
   }
@@ -4395,17 +4652,18 @@ import {
      不用 focus-within：鼠标点击后行会保留焦点，操作不能因此持续显示。 */
   .row-action {
     position: absolute;
-    right: 4px;
+    inset-inline-end: 4px;
     width: 24px;
     height: 24px;
     opacity: 0;
     pointer-events: none;
   }
 
-  .row-action[data-workspace-action="new"] { right: 30px; }
+  .row-action[data-workspace-action="new"] { inset-inline-end: 56px; }
+  .row-action[data-workspace-action="edit"] { inset-inline-end: 30px; }
 
   .workspace-row:is(:hover, :has(.row-action:focus-visible)) .workspace-header-btn {
-    padding-right: 60px;
+    padding-inline-end: 86px;
   }
 
   .workspace-row:hover .row-action,
@@ -4418,7 +4676,7 @@ import {
     opacity: 0.35;
   }
 
-  /* 分区标题行右侧的工具组：平时收敛，悬停标题行或聚焦其中按钮时出现。 */
+  /* 项目入口常显；其他分区工具在悬停或键盘聚焦时出现。 */
   .section-title-tools {
     display: flex;
     align-items: center;
@@ -4428,6 +4686,7 @@ import {
     transition: opacity var(--transition-fast);
   }
 
+  .section-title-tools--projects,
   .section-title-row:hover .section-title-tools,
   .section-title-row:focus-within .section-title-tools,
   .section-title-tools:has(.btn-icon--active) {
@@ -4541,7 +4800,7 @@ import {
     transform: rotate(0deg);
   }
 
-  :global(.workspace-folder-icon) {
+  :global(.workspace-project-icon) {
     flex-shrink: 0;
     color: var(--foreground-muted);
   }
@@ -5264,9 +5523,15 @@ import {
     .row-action:disabled { opacity: 0.35; }
     .row-action,
     .section-title-tools :global(.btn-icon),
-    .sidebar-header-tools :global(.btn-icon) { width: 36px; height: 36px; }
-    .workspace-header-btn { min-height: 40px; }
-    .workspace-row:is(:hover, :has(.row-action:focus-visible)) .workspace-header-btn { padding-right: 8px; }
+    .sidebar-header-tools :global(.btn-icon),
+    .project-editor :global(.btn-icon) { width: 44px; height: 44px; flex: 0 0 44px; padding: 14px; }
+    .workspace-row { flex-wrap: wrap; gap: 8px; padding: 4px; }
+    .workspace-header-btn { min-height: 44px; flex-basis: 100%; }
+    .workspace-row .row-action { margin-inline-end: 0; }
+    .workspace-row .row-action[data-workspace-action="remove"] { margin-inline-start: auto; }
+    .workspace-row:is(:hover, :has(.row-action:focus-visible)) .workspace-header-btn { padding-inline-end: 8px; }
+    .project-editor :global(.btn) { min-block-size: 44px; }
+    .project-editor :global(.form-input) { min-block-size: 44px; }
   }
 
   :global(html.magi-web-drawer-open),

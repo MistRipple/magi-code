@@ -161,6 +161,7 @@ export const icons = {
   'loader': glyphs['loader-circle'],
   'terminal': glyphs['square-terminal'],
   'folder': glyphs['folder'],
+  'folder-plus': `${glyphs['folder']}<path d="M12 10v6m-3-3h6"/>`,
   'plug': glyphs['plug'],
   'qrcode': glyphs['qr-code'],
   'download': glyphs['download'],

@@ -5,24 +5,154 @@ use magi_core::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceSourceFolder {
+    pub source_folder_id: String,
+    pub path: AbsolutePath,
+    pub path_ref: String,
+    pub name: Option<String>,
+    pub created_at: UtcMillis,
+    pub updated_at: UtcMillis,
+}
+
+impl WorkspaceSourceFolder {
+    pub fn native_path(&self) -> PathBuf {
+        magi_core::HostPath::from_path_ref(&self.path_ref)
+            .map(magi_core::HostPath::into_path_buf)
+            .unwrap_or_else(|_| PathBuf::from(self.path.as_str()))
+    }
+}
+
+/// 项目身份不由任何一个源目录代表。旧 rootPath 仅用于单向迁移读取；新格式
+/// 只保存成员与主要目录引用，避免出现两份可写的主要目录事实。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", try_from = "WorkspaceRecordWire")]
 pub struct WorkspaceRecord {
     pub workspace_id: WorkspaceId,
     pub name: Option<String>,
-    pub root_path: AbsolutePath,
-    pub root_path_ref: String,
+    pub source_folders: Vec<WorkspaceSourceFolder>,
+    pub primary_source_folder_id: String,
+    pub revision: u64,
     pub worktree_root: Option<AbsolutePath>,
     pub status: WorkspaceLifecycleStatus,
     pub created_at: UtcMillis,
     pub updated_at: UtcMillis,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspaceRecordWire {
+    workspace_id: WorkspaceId,
+    name: Option<String>,
+    root_path: Option<AbsolutePath>,
+    root_path_ref: Option<String>,
+    source_folders: Option<Vec<WorkspaceSourceFolder>>,
+    primary_source_folder_id: Option<String>,
+    revision: Option<u64>,
+    worktree_root: Option<AbsolutePath>,
+    status: WorkspaceLifecycleStatus,
+    created_at: UtcMillis,
+    updated_at: UtcMillis,
+}
+
+impl TryFrom<WorkspaceRecordWire> for WorkspaceRecord {
+    type Error = String;
+
+    fn try_from(wire: WorkspaceRecordWire) -> Result<Self, String> {
+        let (source_folders, primary_source_folder_id, revision) = match (
+            wire.source_folders,
+            wire.primary_source_folder_id,
+            wire.revision,
+            wire.root_path,
+            wire.root_path_ref,
+        ) {
+            (Some(folders), Some(primary), Some(revision), None, None) => {
+                (folders, primary, revision)
+            }
+            (None, None, None, Some(path), Some(path_ref)) => {
+                let id = format!("{}-source-0", wire.workspace_id);
+                (
+                    vec![WorkspaceSourceFolder {
+                        source_folder_id: id.clone(),
+                        path,
+                        path_ref,
+                        name: None,
+                        created_at: wire.created_at,
+                        updated_at: wire.updated_at,
+                    }],
+                    id,
+                    1,
+                )
+            }
+            _ => return Err("项目记录必须为完整的旧单目录格式或多源目录格式，不能混用".into()),
+        };
+        let record = Self {
+            workspace_id: wire.workspace_id,
+            name: wire.name,
+            source_folders,
+            primary_source_folder_id,
+            revision,
+            worktree_root: wire.worktree_root,
+            status: wire.status,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+        };
+        record.validate().map_err(|error| error.to_string())?;
+        Ok(record)
+    }
+}
+
 impl WorkspaceRecord {
+    pub fn validate(&self) -> DomainResult<()> {
+        let mut ids = std::collections::HashSet::new();
+        let mut paths = std::collections::HashSet::new();
+        if self.workspace_id.as_str().trim().is_empty()
+            || self.revision == 0
+            || self.source_folders.is_empty()
+            || !self
+                .source_folders
+                .iter()
+                .any(|folder| folder.source_folder_id == self.primary_source_folder_id)
+        {
+            return Err(DomainError::Validation {
+                message: "项目身份、修订或主要源文件夹无效".into(),
+            });
+        }
+        for folder in &self.source_folders {
+            if folder.source_folder_id.trim().is_empty()
+                || !ids.insert(&folder.source_folder_id)
+                || !paths.insert(folder.native_path())
+            {
+                return Err(DomainError::Validation {
+                    message: "源文件夹身份和路径必须非空且唯一".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn source_folder(&self, source_folder_id: &str) -> Option<&WorkspaceSourceFolder> {
+        self.source_folders
+            .iter()
+            .find(|folder| folder.source_folder_id == source_folder_id)
+    }
+
+    pub fn primary_source_folder(&self) -> &WorkspaceSourceFolder {
+        self.source_folder(&self.primary_source_folder_id)
+            .expect("validated project must reference its primary source folder")
+    }
+
+    /// 仅表达默认 cwd；授权、持久化和完整资源范围不得通过本方法推导。
     pub fn native_root_path(&self) -> PathBuf {
-        magi_core::HostPath::from_path_ref(&self.root_path_ref)
-            .map(magi_core::HostPath::into_path_buf)
-            .unwrap_or_else(|_| PathBuf::from(self.root_path.as_str()))
+        self.primary_source_folder().native_path()
+    }
+
+    pub fn source_folder_roots(&self) -> Vec<PathBuf> {
+        self.source_folders
+            .iter()
+            .map(WorkspaceSourceFolder::native_path)
+            .collect()
     }
 }
 

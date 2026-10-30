@@ -11,6 +11,7 @@ pub use model_reasoning::{
     AgentModelSelection, ReasoningCapability, ReasoningEffort, ReasoningTransport,
 };
 pub mod paths;
+pub mod project;
 pub mod public_text;
 pub mod status;
 pub mod task;
@@ -36,6 +37,10 @@ pub use ids::{
     AssignmentId, BrowserAnnotationId, BrowserCommandId, BrowserLeaseId, BrowserProfileId,
     BrowserSessionId, BrowserTabId, EventId, GoalId, LeaseId, MissionId, PlanId, PlanItemId,
     SessionId, TaskId, ThreadId, ToolCallId, WorkerId, WorkspaceId,
+};
+pub use project::{
+    ProjectDirectoryBinding, ProjectDirectoryExecutionMap, ProjectDirectoryExecutionRoot,
+    ProjectSourceFolderGrant,
 };
 pub use public_text::{
     PUBLIC_REDACTED_PATH, PUBLIC_REDACTED_VALUE, PUBLIC_RUNTIME_SUMMARY_MAX_CHARS,

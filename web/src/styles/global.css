@@ -213,6 +213,16 @@
   --radius-2xl: 16px;
   /* 特大卡片 */
   --radius-full: 9999px;
+
+  /* 文字按钮语义令牌：颜色由当前 Magi 皮肤投影，几何保持跨页面一致。 */
+  --btn-radius: calc(var(--radius-lg) + var(--radius-xs));
+  --btn-radius-sm: var(--radius-lg);
+  --btn-radius-lg: var(--radius-xl);
+  --btn-primary-bg: var(--foreground);
+  --btn-primary-fg: var(--magi-canvas);
+  --btn-primary-hover-bg: color-mix(in srgb, var(--foreground) 86%, var(--magi-canvas));
+  --btn-danger-bg: color-mix(in srgb, var(--error) 10%, var(--magi-canvas));
+  --btn-danger-fg: color-mix(in srgb, var(--error) 75%, var(--foreground));
   /* 圆形、胶囊 */
 
   /* ==========================================
@@ -808,63 +818,82 @@ pre code {
   align-items: center;
   justify-content: center;
   gap: var(--space-2);
-  padding: 0 var(--space-4);
-  height: var(--btn-height-md);
+  padding: var(--space-2) var(--space-5);
+  min-block-size: var(--btn-height-lg);
+  min-inline-size: min(88px, 100%);
+  max-inline-size: 100%;
+  flex-shrink: 0;
   font-size: var(--text-sm);
   font-weight: var(--font-medium);
-  border-radius: var(--radius-sm);
+  line-height: var(--leading-normal);
+  border-radius: var(--btn-radius);
   border: none;
   cursor: pointer;
   transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: center;
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 
 .btn--primary {
-  background: var(--primary);
-  color: var(--primary-foreground);
+  background: var(--btn-primary-bg);
+  color: var(--btn-primary-fg);
 }
 
-.btn--primary:hover {
-  background: var(--primary-hover);
+.btn--primary:hover:not(:disabled) {
+  background: var(--btn-primary-hover-bg);
+}
+
+.btn--primary:active:not(:disabled) {
+  background: color-mix(in srgb, var(--btn-primary-bg) 76%, var(--btn-primary-fg));
 }
 
 .btn--secondary {
-  background: var(--secondary);
+  background: transparent;
+  color: var(--foreground-muted);
+}
+
+.btn--secondary:hover:not(:disabled) {
+  background: var(--surface-hover);
   color: var(--foreground);
 }
 
-.btn--secondary:hover {
-  background: var(--secondary-hover);
+.btn--secondary:active:not(:disabled) {
+  background: var(--surface-active);
+  color: var(--foreground);
 }
 
 .btn--error {
-  background: transparent;
-  color: var(--error);
+  background: var(--btn-danger-bg);
+  color: var(--btn-danger-fg);
   border: 0;
 }
 
-.btn--error:hover {
-  background: var(--error);
-  color: white;
-  border-color: var(--error);
+.btn--error:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--btn-danger-fg) 14%, var(--magi-canvas));
 }
 
-.btn--danger {
-  background: var(--error);
-  color: white;
+.btn--error:active:not(:disabled) {
+  background: color-mix(in srgb, var(--btn-danger-fg) 18%, var(--magi-canvas));
 }
 
-.btn--danger:hover {
-  background: color-mix(in srgb, var(--error) 88%, #151515);
+
+.btn--warning {
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  color: color-mix(in srgb, var(--warning) 75%, var(--foreground));
 }
 
-.btn--ghost-danger {
-  background: transparent;
-  color: var(--error);
+.btn--warning:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--warning) 20%, transparent);
 }
 
-.btn--ghost-danger:hover {
-  background: var(--error-muted);
+.btn--warning:active:not(:disabled) {
+  background: color-mix(in srgb, var(--warning) 26%, transparent);
 }
 
 .btn.is-saving,
@@ -906,21 +935,29 @@ pre code {
   color: var(--foreground-muted);
 }
 
-.btn--ghost:hover {
+.btn--ghost:hover:not(:disabled),
+.btn--ghost:active:not(:disabled) {
   background: var(--surface-hover);
   color: var(--foreground);
 }
 
 .btn--sm {
-  height: var(--btn-height-sm);
-  padding: 0 var(--space-3);
+  min-block-size: var(--btn-height-md);
+  min-inline-size: 0;
+  padding: var(--space-2) var(--space-4);
   font-size: var(--text-xs);
+  border-radius: var(--btn-radius-sm);
 }
 
 .btn--lg {
-  height: var(--btn-height-lg);
-  padding: 0 var(--space-5);
+  min-block-size: var(--btn-height-xl);
+  padding: var(--space-3) var(--space-6);
   font-size: var(--text-base);
+  border-radius: var(--btn-radius-lg);
+}
+
+@media (hover: none), (pointer: coarse) {
+  .btn { min-block-size: 44px; }
 }
 
 /* ------------------------------------------
@@ -1456,11 +1493,16 @@ input:focus-visible + .control-switch { box-shadow: var(--magi-focus-shadow); }
 .modal-footer {
   flex-shrink: 0;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: var(--space-3);
   padding: var(--space-4);
   border-top: var(--magi-hairline) solid var(--border);
+}
+
+.modal-footer .btn {
+  min-inline-size: min(88px, 100%);
 }
 
 /* 模态框关闭按钮 */
@@ -1841,57 +1883,6 @@ body.vscode-light .hljs-params {
 
 .dock-row + .dock-row {
   border-top: var(--magi-hairline) solid color-mix(in srgb, var(--border-subtle, var(--border)) 55%, transparent);
-}
-
-/* 文字操作：胶囊形幽灵按钮；主操作用 --primary，需要注意的用 --warn。 */
-.dock-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  flex: 0 0 auto;
-  min-height: 24px;
-  padding: 0 10px;
-  border: 0;
-  border-radius: 999px;
-  background: transparent;
-  color: var(--foreground-muted);
-  font: inherit;
-  font-size: var(--text-xs);
-  cursor: pointer;
-  transition: background var(--transition-fast), color var(--transition-fast);
-}
-
-.dock-btn:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--foreground) 7%, transparent);
-  color: var(--foreground);
-}
-
-.dock-btn--primary {
-  padding: 0 14px;
-  background: var(--primary);
-  color: var(--primary-foreground, #fff);
-  font-weight: var(--font-semibold);
-}
-
-.dock-btn--primary:hover:not(:disabled) {
-  background: var(--primary-hover, var(--primary));
-  color: var(--primary-foreground, #fff);
-}
-
-.dock-btn--warn {
-  background: color-mix(in srgb, var(--warning) 12%, transparent);
-  color: color-mix(in srgb, var(--warning) 84%, var(--foreground));
-}
-
-.dock-btn--warn:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--warning) 20%, transparent);
-  color: color-mix(in srgb, var(--warning) 84%, var(--foreground));
-}
-
-.dock-btn:disabled {
-  opacity: 0.45;
-  cursor: default;
 }
 
 /* 图标操作：22px 方形幽灵按钮，悬停出底色；危险操作悬停变红。 */

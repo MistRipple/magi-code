@@ -1,13 +1,11 @@
-//! workspace 级持久化共享的文件系统布局工具。
+//! 项目共享状态布局。新写入按稳定项目 ID 定位；旧路径 slug 只用于迁移读取。
 //!
-//! 按 workspace 归档的 store 共享 `<magi_home>/projects/<slug>/` 前缀，
-//! 必须使用同一个 slug 函数——否则同一 workspace 在不同 store 会落到不同目录。
-//! 本模块把规则收敛到唯一来源。
+//! 项目历史和记忆共用 project_state_root，不能按默认 cwd 或隔离副本定位。
 //!
 //! 物理布局：
-//! - project memory：`<magi_home>/projects/<slug>/memory/<entry>`
+//! - project memory：`<state>/projects/<encodedWorkspaceId>/memory/<entry>`
 
-use crate::WorkspaceRootPath;
+use crate::{WorkspaceId, WorkspaceRootPath};
 use std::path::{Path, PathBuf};
 
 /// 把 workspace 绝对路径映射为目录名安全的 slug。
@@ -45,14 +43,46 @@ pub fn project_root(magi_home: &Path, workspace_root: &WorkspaceRootPath) -> Pat
     magi_home.join("projects").join(slug)
 }
 
-/// `<magi_home>/projects/<slug>/memory` —— project memory 根目录。
+/// 旧 `<magi_home>/projects/<slug>/memory`，仅用于单向迁移读取。
 pub fn project_memory_root(magi_home: &Path, workspace_root: &WorkspaceRootPath) -> PathBuf {
     project_root(magi_home, workspace_root).join("memory")
+}
+
+/// 按稳定项目身份定位共享状态；源目录和主要目录变化不改变此位置。
+pub fn project_state_root(state_root: &Path, workspace_id: &WorkspaceId) -> PathBuf {
+    state_root
+        .join("projects")
+        .join(crate::hex_lower(workspace_id.as_str().as_bytes()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_ids_keep_separators_case_and_unicode_distinct() {
+        let root = Path::new("state");
+        let roots = [
+            "project/a",
+            "project\\a",
+            "project_a",
+            "Project/a",
+            "项目/a",
+        ]
+        .map(|id| project_state_root(root, &WorkspaceId::new(id)));
+        let unique = roots.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), roots.len());
+        for path in roots {
+            let relative = path.strip_prefix(root.join("projects")).unwrap();
+            assert_eq!(relative.components().count(), 1);
+            assert!(
+                relative
+                    .to_string_lossy()
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            );
+        }
+    }
 
     #[test]
     fn workspace_slug_typical_absolute_path() {

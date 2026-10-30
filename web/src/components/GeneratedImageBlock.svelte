@@ -32,20 +32,14 @@
   });
   const imageSrc = $derived.by(() => {
     if (!preview) return '';
-    return agentUrl('/api/files/raw', buildFilePreviewQuery(preview.path, {
-      workspaceId: filePreviewScope?.workspaceId,
-      workspacePath: filePreviewScope?.workspacePath,
-      sessionId: filePreviewScope?.sessionId,
-    }));
+    return agentUrl('/api/files/raw', buildFilePreviewQuery(preview.path, filePreviewScope));
   });
 
   function openImageFile(): void {
     if (!preview?.path) return;
     dispatchFilePreviewEvent({
+      ...filePreviewScope,
       filepath: preview.path,
-      workspaceId: filePreviewScope?.workspaceId,
-      workspacePath: filePreviewScope?.workspacePath,
-      sessionId: filePreviewScope?.sessionId,
       contentKind: 'binary',
       mime: preview.mime,
       size: preview.bytes,

@@ -532,7 +532,7 @@
               <div class="wallpaper-actions">
                 <input bind:this={wallpaperInput} class="sr-only" type="file" accept="image/png,image/jpeg,image/webp" onchange={handleWallpaperChange} />
                 <button class="btn btn--secondary btn--sm" type="button" onclick={() => wallpaperInput?.click()} disabled={Boolean(busyAction)}>{i18n.t('appearance.chooseImage')}</button>
-                {#if draft.wallpaper}<button class="btn btn--ghost-danger btn--sm" type="button" onclick={() => draft!.wallpaper = undefined}>{i18n.t('appearance.removeImage')}</button>{/if}
+                {#if draft.wallpaper}<button class="btn btn--error btn--sm" type="button" onclick={() => draft!.wallpaper = undefined}>{i18n.t('appearance.removeImage')}</button>{/if}
               </div>
             </div>
             {#if draft.wallpaper}

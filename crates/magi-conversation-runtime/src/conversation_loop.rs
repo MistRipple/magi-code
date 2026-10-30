@@ -59,8 +59,8 @@ use crate::{
     prompt_utils::{
         PromptFragmentKind, current_access_profile_prompt, current_agent_mode_prompt,
         current_turn_context_priority_prompt, dynamic_skill_prompt_message,
-        execution_context_system_prompt, normalize_model_stream_preview_content,
-        normalize_model_visible_content, runtime_context_message, skill_prompt_message,
+        normalize_model_stream_preview_content, normalize_model_visible_content,
+        project_execution_context_system_prompt, runtime_context_message, skill_prompt_message,
         system_prompt_fragment_message,
     },
     session_images::{SessionTurnImage, session_turn_image_sources},
@@ -105,7 +105,7 @@ const COMPLETION_RECOVERY_MAX_ATTEMPTS: usize = 4;
 pub struct PreparedWorkspaceExecution {
     pub task: Task,
     pub root: Option<PathBuf>,
-    pub snapshot: Option<Arc<magi_snapshot::SnapshotSession>>,
+    pub resources: crate::workspace_execution::WorkspaceExecutionResources,
 }
 
 pub type PrepareWorkspace<'a> = dyn Fn() -> Result<PreparedWorkspaceExecution, String> + Sync + 'a;
@@ -170,7 +170,7 @@ pub struct ConversationLoopRequest<'a> {
     pub workspace_root_path: Option<PathBuf>,
     /// 当前 session 的文件变更账本。任务系统 的主线/代理工具写入都必须通过
     /// 同一个 SnapshotSession 记录，才能把文件变更归因到主线或具体代理 worker。
-    pub snapshot_session: Option<Arc<magi_snapshot::SnapshotSession>>,
+    pub workspace_resources: Option<crate::workspace_execution::WorkspaceExecutionResources>,
     pub prepare_workspace: Option<&'a PrepareWorkspace<'a>>,
     pub execution_group_id: Option<String>,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
@@ -735,7 +735,7 @@ fn run_conversation_loop_inner(
         context_summary,
         system_prompt,
         mut workspace_root_path,
-        mut snapshot_session,
+        mut workspace_resources,
         prepare_workspace,
         execution_group_id,
         persist_session_state,
@@ -837,11 +837,28 @@ fn run_conversation_loop_inner(
         static_context_messages.push(skill_message);
     }
     // 执行 cwd 与项目归属分别由 daemon 提供，个人目录不能被描述成项目。
+    let project_rules_root = project_memory.and_then(|store| store.root().parent());
+    let workspace_rules = match crate::workspace_rules::render_workspace_rules(
+        project_rules_root,
+        workspace_resources
+            .as_ref()
+            .and_then(|resources| resources.directories.as_ref()),
+    ) {
+        Ok(rules) => rules,
+        Err(error) => return (TaskOutcome::Failed { error }, context_summary),
+    };
     static_context_messages.push(system_prompt_fragment_message(
         PromptFragmentKind::WorkspaceContext,
-        execution_context_system_prompt(
-            workspace_root_path.as_ref().and_then(|root| root.to_str()),
-            workspace_id.is_some(),
+        format!(
+            "{}{}",
+            project_execution_context_system_prompt(
+                workspace_root_path.as_ref().and_then(|root| root.to_str()),
+                workspace_id.is_some(),
+                workspace_resources
+                    .as_ref()
+                    .and_then(|resources| resources.directories.as_ref()),
+            ),
+            workspace_rules
         ),
     ));
     // ---- Cache breakpoint · STATIC → NON-STATIC ----
@@ -2932,33 +2949,44 @@ fn run_conversation_loop_inner(
         });
         if needs_workspace && !workspace_prepared {
             if let Some(prepare) = prepare_workspace {
-                match prepare() {
-                    Ok(prepared) => {
+                match prepare().and_then(|prepared| {
+                    crate::workspace_rules::render_workspace_rules(
+                        project_rules_root,
+                        prepared.resources.directories.as_ref(),
+                    )
+                    .map(|rules| (prepared, rules))
+                }) {
+                    Ok((prepared, rules)) => {
                         if workspace_root_path != prepared.root {
                             retired_workspace_root = workspace_root_path.clone();
                             workspace_root_path = prepared.root;
                             tool_execution_ledger
                                 .rebind_workspace_root(workspace_root_path.as_deref());
-                            let updated = system_prompt_fragment_message(
-                                PromptFragmentKind::WorkspaceContext,
-                                execution_context_system_prompt(
+                        }
+                        let updated = system_prompt_fragment_message(
+                            PromptFragmentKind::WorkspaceContext,
+                            format!(
+                                "{}{}",
+                                project_execution_context_system_prompt(
                                     workspace_root_path.as_ref().and_then(|root| root.to_str()),
                                     workspace_id.is_some(),
+                                    prepared.resources.directories.as_ref(),
                                 ),
-                            );
-                            for history in [&mut static_context_messages, &mut messages] {
-                                if let Some(message) = history.iter_mut().find(|message| {
-                                    message.content.as_deref().is_some_and(|content| {
-                                        content.starts_with(
-                                            "<magi-developer-fragment id=\"workspace_context\"",
-                                        )
-                                    })
-                                }) {
-                                    *message = updated.clone();
-                                }
+                                rules
+                            ),
+                        );
+                        for history in [&mut static_context_messages, &mut messages] {
+                            if let Some(message) = history.iter_mut().find(|message| {
+                                message.content.as_deref().is_some_and(|content| {
+                                    content.starts_with(
+                                        "<magi-developer-fragment id=\"workspace_context\"",
+                                    )
+                                })
+                            }) {
+                                *message = updated.clone();
                             }
                         }
-                        snapshot_session = prepared.snapshot;
+                        workspace_resources = Some(prepared.resources);
                         prepared_execution_task = Some(prepared.task);
                     }
                     Err(error) => {
@@ -3116,7 +3144,7 @@ fn run_conversation_loop_inner(
                 &valid_tool_calls,
                 &mut tool_execution_ledger,
                 Some(&tool_progress_callback),
-                snapshot_session.clone(),
+                workspace_resources.clone(),
                 execution_group_id.clone(),
                 &|| execution_guard.is_active(),
             )
@@ -4536,7 +4564,7 @@ mod tests {
     };
     use magi_core::{
         ApprovalRequirement, MissionId, RiskLevel, Task, TaskId, TaskKind, TaskStatus, TaskTier,
-        WorkerId, WorkspaceRootPath,
+        WorkerId,
     };
     use magi_governance::GovernanceService;
     use magi_session_store::{
@@ -7155,7 +7183,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -7337,7 +7365,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -7575,7 +7603,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -7773,7 +7801,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -8276,7 +8304,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -8354,7 +8382,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -8455,7 +8483,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -8722,7 +8750,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -8823,7 +8851,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -9051,7 +9079,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -9199,7 +9227,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -9315,7 +9343,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -9380,10 +9408,11 @@ mod tests {
         let home = tempfile::tempdir().expect("temp magi home should create");
         let workspace_dir = home.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).expect("workspace dir should create");
-        let workspace_root = WorkspaceRootPath::new(workspace_dir.to_string_lossy());
-        let project_memory =
-            magi_project_memory::ProjectMemoryStore::open_with_home(home.path(), &workspace_root)
-                .expect("project memory should open");
+        let project_memory = magi_project_memory::ProjectMemoryStore::open_with_home(
+            home.path(),
+            workspace_id.as_ref().expect("project-bound fixture"),
+        )
+        .expect("project memory should open");
         project_memory
             .save_entry(&magi_project_memory::MemoryEntry {
                 file_stem: "old_reference".to_string(),
@@ -9393,6 +9422,33 @@ mod tests {
                 body: "旧内容".to_string(),
             })
             .expect("project memory entry should save");
+        std::fs::write(
+            project_memory.root().parent().unwrap().join("AGENTS.md"),
+            "SHARED_PROJECT_RULE",
+        )
+        .unwrap();
+        std::fs::write(workspace_dir.join("AGENTS.md"), "SOURCE_A_RULE").unwrap();
+        let second_directory = home.path().join("second");
+        std::fs::create_dir_all(&second_directory).unwrap();
+        std::fs::write(second_directory.join("AGENTS.md"), "SOURCE_B_RULE").unwrap();
+        let directories = magi_core::ProjectDirectoryExecutionMap {
+            workspace_id: workspace_id.clone().unwrap(),
+            default_source_folder_id: "a".into(),
+            roots: [("a", &workspace_dir), ("b", &second_directory)]
+                .into_iter()
+                .map(|(id, root)| {
+                    let path_ref = magi_core::HostPath::from_path(root.to_path_buf())
+                        .to_path_ref()
+                        .as_str()
+                        .to_string();
+                    magi_core::ProjectDirectoryExecutionRoot {
+                        source_folder_id: id.into(),
+                        source_root_ref: path_ref.clone(),
+                        execution_root_ref: path_ref,
+                    }
+                })
+                .collect(),
+        };
         let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
         plan_store
             .update(magi_plan::UpdatePlanInput {
@@ -9454,7 +9510,10 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: Some(workspace_dir),
-            snapshot_session: None,
+            workspace_resources: Some(crate::workspace_execution::WorkspaceExecutionResources {
+                directories: Some(directories),
+                snapshots: vec![],
+            }),
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -9475,6 +9534,14 @@ mod tests {
         };
 
         let reference_index = content_at("TASK_REFERENCE_ONLY");
+        let rules_index = content_at("SHARED_PROJECT_RULE");
+        assert_eq!(messages[rules_index].role, "developer");
+        let rules = messages[rules_index].content.as_deref().unwrap();
+        assert!(rules.contains("SOURCE_A_RULE"));
+        assert!(rules.contains("SOURCE_B_RULE"));
+        assert!(rules.contains("source_folder_id=\"a\""));
+        assert!(rules.contains("source_folder_id=\"b\""));
+        assert!(rules.contains("不能覆盖本轮用户明确要求"));
         assert_eq!(
             messages[reference_index].context_origin,
             magi_bridge_client::ChatMessageOrigin::ContextReference
@@ -9862,7 +9929,7 @@ mod tests {
                 context_summary: None,
                 system_prompt: None,
                 workspace_root_path: None,
-                snapshot_session: None,
+                workspace_resources: None,
                 prepare_workspace: None,
                 execution_group_id: None,
                 persist_session_state: None,
@@ -10089,7 +10156,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -10224,7 +10291,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -10356,7 +10423,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -10504,7 +10571,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -10706,7 +10773,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
@@ -10919,7 +10986,7 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: Some(dir.path().to_path_buf()),
-            snapshot_session: None,
+            workspace_resources: None,
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,

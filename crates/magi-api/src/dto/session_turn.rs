@@ -76,6 +76,8 @@ pub struct SessionContextReferenceDto {
     pub path: String,
     #[serde(default)]
     pub path_ref: Option<String>,
+    #[serde(default)]
+    pub source_folder_id: Option<String>,
     pub name: String,
 }
 
@@ -187,6 +189,11 @@ pub struct SessionTurnRequestDto {
     pub workspace_id: Option<String>,
     #[serde(default)]
     pub workspace_path: Option<String>,
+    #[serde(default)]
+    pub source_folder_id: Option<String>,
+    /// 可信接纳入口捕获的授权，不接受客户端 JSON；队列在原 Input payload 单独保存它。
+    #[serde(skip)]
+    pub(crate) project_directories: Option<magi_core::ProjectDirectoryBinding>,
     pub text: Option<String>,
     pub skill_name: Option<String>,
     #[serde(default)]
@@ -306,6 +313,12 @@ impl SessionTurnRequestDto {
             validated.push(SessionContextReference {
                 kind,
                 path: canonical,
+                source_folder_id: reference
+                    .source_folder_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string),
                 name,
             });
         }
@@ -325,6 +338,7 @@ impl SessionTurnRequestDto {
                         .as_str()
                         .to_string(),
                 ),
+                source_folder_id: reference.source_folder_id.clone(),
                 name: reference.name.clone(),
             })
             .collect();
@@ -341,6 +355,7 @@ impl SessionTurnRequestDto {
                         SessionContextReferenceKind::Directory
                     }
                 },
+                source_folder_id: reference.source_folder_id.clone(),
                 path: reference
                     .path_ref
                     .as_deref()
@@ -550,14 +565,18 @@ impl SessionTurnRequestDto {
             .context_references()
             .into_iter()
             .map(|reference| {
-                serde_json::json!({
+                let mut value = serde_json::json!({
                     "kind": match reference.kind {
                         SessionContextReferenceKind::File => "file",
                         SessionContextReferenceKind::Directory => "directory",
                     },
                     "path": reference.path,
                     "name": reference.name,
-                })
+                });
+                if let Some(source_folder_id) = reference.source_folder_id {
+                    value["sourceFolderId"] = serde_json::json!(source_folder_id);
+                }
+                value
             })
             .collect::<Vec<_>>();
         let mut canonical_request = serde_json::json!({
@@ -590,6 +609,9 @@ impl SessionTurnRequestDto {
         // 不改变历史普通/引导请求的指纹；只有新增投递意图才带此键。
         if let Some(turn_id) = &normalized.interrupt_turn_id {
             canonical_request["interruptTurnId"] = serde_json::json!(turn_id);
+        }
+        if let Some(id) = trimmed_non_empty(normalized.source_folder_id.as_deref()) {
+            canonical_request["sourceFolderId"] = serde_json::json!(id);
         }
         let bytes = serde_json::to_vec(&canonical_request)
             .map_err(|error| format!("序列化 Turn 请求指纹失败: {error}"))?;
@@ -856,6 +878,8 @@ mod tests {
     #[test]
     fn timeline_content_uses_user_text_directly() {
         let request = SessionTurnRequestDto {
+            source_folder_id: None,
+            project_directories: None,
             desktop_browser_tools_allowed: true,
             session_id: Some("session-a".to_string()),
             scope: SessionScopeKindDto::Workspace,
@@ -1172,6 +1196,38 @@ mod tests {
         assert_ne!(request.request_fingerprint().unwrap(), without);
         request.text = None;
         assert_eq!(request.timeline_content(None), "[插件选择 1 项]");
+    }
+
+    #[test]
+    fn source_folder_selection_changes_fingerprint_but_server_binding_cannot_be_forged() {
+        let mut request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope": "workspace", "workspaceId": "project", "text": "inspect"
+        }))
+        .unwrap();
+        let legacy = request.request_fingerprint().unwrap();
+        request.source_folder_id = Some("source-a".into());
+        let selected = request.request_fingerprint().unwrap();
+        assert_ne!(selected, legacy);
+        request.source_folder_id = Some(" source-a ".into());
+        assert_eq!(request.request_fingerprint().unwrap(), selected);
+        request.source_folder_id = Some("source-b".into());
+        assert_ne!(request.request_fingerprint().unwrap(), selected);
+        request.source_folder_id = None;
+        request.project_directories = Some(magi_core::ProjectDirectoryBinding {
+            workspace_id: magi_core::WorkspaceId::new("project"),
+            project_revision: 2,
+            default_source_folder_id: "server-source".into(),
+            source_folders: vec![],
+        });
+        assert_eq!(request.request_fingerprint().unwrap(), legacy);
+        let serialized = serde_json::to_value(&request).unwrap();
+        assert!(serialized.get("projectDirectories").is_none());
+        let mut forged = serialized;
+        forged["projectDirectories"] = serde_json::json!({
+            "workspaceId": "project", "projectRevision": 2,
+            "defaultSourceFolderId": "outside", "sourceFolders": []
+        });
+        assert!(serde_json::from_value::<SessionTurnRequestDto>(forged).is_err());
     }
 
     #[test]

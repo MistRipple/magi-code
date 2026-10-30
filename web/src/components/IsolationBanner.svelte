@@ -9,11 +9,13 @@
   import { isolationOriginBlockingSession } from '../lib/isolation-merge';
   import { resolveCurrentSessionTitle } from '../lib/session-title';
   import Icon from './Icon.svelte';
+  import { selectedComposerSourceFolderId } from '../stores/composer-workspace.svelte';
 
   const sessionId = $derived(messagesState.currentSessionId?.trim() || '');
   const isolation = $derived(sessionId ? getSessionIsolation(sessionId) : null);
   const binding = $derived({
     workspaceId: messagesState.currentWorkspaceId?.trim() || '',
+    sourceFolderId: selectedComposerSourceFolderId(messagesState.currentWorkspaceId || '', sessionId),
     workspacePath: messagesState.currentWorkspacePath?.trim() || '',
   });
   const blockingSessionId = $derived(isolation ? isolationOriginBlockingSession(isolation.origin) : null);
@@ -47,13 +49,13 @@
     <div class="isolation-banner-actions">
       <button
         type="button"
-        class="isolation-banner-btn primary"
+        class="btn btn--primary btn--sm"
         onclick={() => openIsolationMergeDialog(sessionId, binding)}
       >
         <Icon name="git-merge" size={12} />
         <span>{i18n.t('isolation.banner.merge')}</span>
       </button>
-      <button type="button" class="isolation-banner-btn" onclick={() => openIsolationExitDialog(sessionId, binding)}>
+      <button type="button" class="btn btn--secondary btn--sm" onclick={() => openIsolationExitDialog(sessionId, binding)}>
         <span>{i18n.t('isolation.banner.exit')}</span>
       </button>
     </div>
@@ -110,41 +112,4 @@
     gap: 4px;
   }
 
-  .isolation-banner-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 4px;
-    height: 24px;
-    padding: 0 10px;
-    border: 0;
-    border-radius: 999px;
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    font-size: var(--text-xs);
-    white-space: nowrap;
-    transition: background var(--transition-fast), color var(--transition-fast);
-  }
-
-  .isolation-banner-btn:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--foreground) 7%, transparent);
-    color: var(--foreground);
-  }
-
-  .isolation-banner-btn.primary {
-    background: var(--primary);
-    color: var(--primary-foreground, #fff);
-    font-weight: var(--font-semibold);
-  }
-
-  .isolation-banner-btn.primary:hover:not(:disabled) {
-    background: var(--primary-hover, var(--primary));
-    color: var(--primary-foreground, #fff);
-  }
-
-  .isolation-banner-btn:disabled {
-    cursor: not-allowed;
-    opacity: 0.5;
-  }
 </style>

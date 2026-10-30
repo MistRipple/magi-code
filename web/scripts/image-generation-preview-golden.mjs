@@ -61,6 +61,21 @@ await withGoldenViteServer(async (server) => {
     '无法解析尺寸时使用稳定的正方形占位',
   );
 
+  const { render } = await server.ssrLoadModule('svelte/server');
+  const { default: GeneratedImageBlock } = await server.ssrLoadModule('/src/components/GeneratedImageBlock.svelte');
+  for (const sourceFolderId of ['source-a', 'source-b']) {
+    const html = render(GeneratedImageBlock, { props: {
+      block: { type: 'tool_call', toolCall: {
+        name: 'image_generate', status: 'success',
+        result: { status: 'succeeded', path: 'generated-images/same.png', media_type: 'image/png' },
+      } },
+      filePreviewScope: { workspaceId: 'project', workspacePath: '/current-primary', sessionId: 'original-session', sourceFolderId },
+    } }).body;
+    const url = new URL(html.match(/<img[^>]*src="([^"]+)"/u)?.[1].replaceAll('&amp;', '&'));
+    assert.equal(url.searchParams.get('sourceFolderId'), sourceFolderId, '同名生成图片必须保留各自源目录');
+    assert.equal(url.searchParams.get('sessionId'), 'original-session', '图片预览必须保留原会话副本');
+  }
+
   console.log('image generation preview golden passed');
 }, { configFile: 'vite.web.config.ts' });
 

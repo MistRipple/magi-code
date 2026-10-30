@@ -24,8 +24,29 @@ await withGoldenViteServer(async (server) => {
   assertSnapshotMergeKeepsLiveTurnIdentity(turnStore);
   assertRestartBootstrapRebasesCanonicalWatermark(dataHandlers, messagesStore, turnStore);
   assertSteeringConsumptionReceipts(reducer, projection, canonicalProtocol);
+  assertFrozenSourceFolderProjection(reducer, projection);
   console.log('canonical turn golden replay passed');
 }, { configFile: 'vite.web.config.ts' });
+
+function assertFrozenSourceFolderProjection(reducer, projection) {
+  const c = baseCase('frozen-source', 'session-source', 'turn-source', 100);
+  for (const metadata of [
+    { projectDirectories: { defaultSourceFolderId: 'source-a' } },
+    { pendingDispatch: { project_directories: { defaultSourceFolderId: 'source-a' } } },
+  ]) {
+    const input = { ...user(c, 1, '跨目录修改'), metadata };
+    const edit = (seq, sourceFolderId) => item(c, seq, `edit-${seq}`, 'tool_call', 'completed', {
+      tool: { callId: `call-${seq}`, name: 'file_write',
+        arguments: { path: 'src/index.ts', content: 'changed', ...(sourceFolderId ? { source_folder_id: sourceFolderId } : {}) },
+        result: { status: 'succeeded', path: 'src/index.ts', created: false } },
+    });
+    const state = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'completed', [input, edit(2), edit(3, 'source-b')])]);
+    const messages = projection.buildCanonicalTimelineProjection(state).artifacts.map(artifact => artifact.message);
+    assert.deepEqual(messages.map(message => message.metadata.sourceFolderId), ['source-a', 'source-a', 'source-b']);
+    assert.deepEqual(messages.slice(1).map(message => message.blocks[0].fileChange.sourceFolderId), ['source-a', 'source-b'],
+      '缺省目录来自原始接纳事实，显式跨目录工具保留自己的目录，不能读取当前侧栏选择');
+  }
+}
 
 function assertSteeringConsumptionReceipts(reducer, projection, protocol) {
   const c = baseCase('input-receipt', 'session-input-receipt', 'turn-input-receipt', 100);

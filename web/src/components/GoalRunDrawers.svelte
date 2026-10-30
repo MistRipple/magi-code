@@ -580,7 +580,7 @@
           <div class="goal-actions">
             <button
               type="button"
-              class="plan-resume-action dock-btn dock-btn--warn"
+              class="plan-resume-action btn btn--warning btn--sm"
               disabled={goalActionLoading !== null}
               onclick={resumeGoal}
               title={i18n.t('goalPanel.action.resumeBlockedPlan')}
@@ -736,7 +736,7 @@
                 <span class="goal-edit-buttons">
                   <button
                     type="button"
-                    class="goal-edit-button goal-edit-button--ghost"
+                    class="btn btn--secondary btn--sm"
                     disabled={goalActionLoading !== null}
                     onclick={cancelEditGoal}
                   >
@@ -744,7 +744,7 @@
                   </button>
                   <button
                     type="submit"
-                    class="goal-edit-button"
+                    class="btn btn--primary btn--sm"
                     disabled={goalActionLoading !== null || !goalDraftSavable}
                   >
                     {goalActionLoading === 'save' ? i18n.t('common.loading') : i18n.t('common.save')}
@@ -875,7 +875,6 @@
 
   .run-drawer-toggle:focus-visible,
   .icon-action:focus-visible,
-  .goal-edit-button:focus-visible,
   .goal-edit-input:focus-visible {
     outline: 2px solid color-mix(in srgb, var(--primary) 58%, transparent);
     outline-offset: 2px;
@@ -1145,29 +1144,6 @@
   .goal-edit-input:focus {
     border-color: color-mix(in srgb, var(--primary) 48%, var(--border));
     outline: none;
-  }
-
-  .goal-edit-button {
-    height: 26px;
-    padding: 0 var(--space-3);
-    border: var(--magi-hairline) solid color-mix(in srgb, var(--primary) 40%, var(--border));
-    border-radius: var(--radius-sm);
-    background: var(--primary);
-    color: var(--primary-foreground);
-    font-size: var(--text-xs);
-    font-weight: var(--font-semibold);
-    cursor: pointer;
-  }
-
-  .goal-edit-button--ghost {
-    border-color: var(--border);
-    background: transparent;
-    color: var(--foreground-muted);
-  }
-
-  .goal-edit-button:disabled {
-    cursor: not-allowed;
-    opacity: 0.55;
   }
 
   .run-progress-count {

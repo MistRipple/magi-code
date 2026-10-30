@@ -23,6 +23,7 @@ use magi_web_model::{WebSlotOwner, WebSlotTable};
 /// 槽位端点上固定的调用方标识（审批、审计里显示的“令牌”）。
 pub(crate) const WEB_SLOT_PRINCIPAL_ID: &str = "web-slot";
 pub(crate) const WEB_SLOT_CLIENT_NAME: &str = "GPT Web";
+pub(crate) type CanonicalTurnResolver = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// 连接器权限档的设置值。**不含 `exec`**：Web 槽位不开放命令执行。
 pub(crate) fn slot_profile_from_setting(value: Option<&str>) -> Profile {
@@ -41,6 +42,7 @@ fn active_turn(slots: &WebSlotTable) -> Option<(WebSlotOwner, u64)> {
 /// `follow_web_slot` 的归属解析：有进行中的 turn 才接受调用。
 pub(crate) struct SlotAttribution {
     pub(crate) slots: Arc<dyn Fn() -> Option<Arc<WebSlotTable>> + Send + Sync>,
+    pub(crate) canonical_turn: CanonicalTurnResolver,
 }
 
 impl AttributionResolver for SlotAttribution {
@@ -61,9 +63,15 @@ impl AttributionResolver for SlotAttribution {
                 if owner.project_id != principal.workspace_id {
                     return Err(refusal());
                 }
+                let canonical_turn_id =
+                    (self.canonical_turn)(&owner.session_id).ok_or_else(refusal)?;
+                if active_turn(&slots) != Some((owner.clone(), turn)) {
+                    return Err(refusal());
+                }
                 Ok(AttributionTarget::WebSlotTurn {
                     session_id: owner.session_id,
                     turn_id: turn.to_string(),
+                    canonical_turn_id,
                 })
             }
         }
@@ -84,6 +92,7 @@ pub(crate) fn slot_principal_provider(
             .map(|snapshot| snapshot.owner_project_id)
             .unwrap_or_default();
         Some(ClientPrincipal {
+            project_directories: None,
             token_id: WEB_SLOT_PRINCIPAL_ID.to_string(),
             token_prefix: WEB_SLOT_PRINCIPAL_ID.to_string(),
             client_name: WEB_SLOT_CLIENT_NAME.to_string(),
@@ -103,6 +112,7 @@ mod tests {
 
     fn principal(workspace: &str) -> ClientPrincipal {
         ClientPrincipal {
+            project_directories: None,
             token_id: WEB_SLOT_PRINCIPAL_ID.to_string(),
             token_prefix: WEB_SLOT_PRINCIPAL_ID.to_string(),
             client_name: WEB_SLOT_CLIENT_NAME.to_string(),
@@ -117,6 +127,7 @@ mod tests {
         let table = table.clone();
         SlotAttribution {
             slots: Arc::new(move || Some(table.clone())),
+            canonical_turn: Arc::new(|_| Some("canonical-turn".into())),
         }
     }
 
@@ -143,7 +154,9 @@ mod tests {
             AttributionTarget::WebSlotTurn {
                 session_id,
                 turn_id,
+                canonical_turn_id,
             } => {
+                assert_eq!(canonical_turn_id, "canonical-turn");
                 assert_eq!(session_id, "session-a");
                 assert_eq!(turn_id, lease.turn_id().to_string());
             }
@@ -423,6 +436,31 @@ mod tests {
             }
             self.table.begin_turn(&self.owner).unwrap()
         }
+
+        fn bind_turn_directories(&self, binding: &magi_core::ProjectDirectoryBinding) {
+            let turn = self
+                .state
+                .session_store
+                .runtime_sidecar(&self.session_id)
+                .unwrap()
+                .current_turn
+                .unwrap();
+            let mut user = turn
+                .items
+                .into_iter()
+                .find(|item| item.kind == "user_message")
+                .unwrap();
+            user.metadata.insert(
+                "projectDirectories".into(),
+                serde_json::to_value(binding).unwrap(),
+            );
+            magi_conversation_runtime::CanonicalTurnEventSink::for_store(
+                &self.state.session_store,
+                None,
+            )
+            .upsert_item_sidecar(&self.session_id, Some(&turn.turn_id), user)
+            .unwrap();
+        }
     }
 
     /// 像 `magi-mcp --stdio --slot` 一样：连接槽位端点（无握手）并发一条 JSON-RPC。
@@ -639,6 +677,90 @@ mod tests {
                 .iter()
                 .any(|(_, status)| status.as_deref() == Some("succeeded"))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slot_directories_follow_canonical_turn_grants_and_revoke_pending_writes() {
+        let f = fixture().await;
+        std::fs::write(f.root.join("a.txt"), "original root").unwrap();
+        let _lease = f.begin_web_turn();
+        let workspace = magi_core::WorkspaceId::new("ws-slot");
+        let binding = f
+            .state
+            .workspace_registry
+            .capture_directory_binding(&workspace, None, None)
+            .unwrap();
+        f.bind_turn_directories(&binding);
+        let second = tempfile::tempdir().unwrap();
+        let second_root = second.path().canonicalize().unwrap();
+        std::fs::write(second_root.join("a.txt"), "second root").unwrap();
+        let project = crate::routes::test_project_fixtures::add_source(
+            &f.state,
+            "ws-slot",
+            "second",
+            &second_root,
+        );
+        crate::routes::test_project_fixtures::set_members(
+            &f.state,
+            "ws-slot",
+            &[&project.primary_source_folder_id, "second"],
+            "second",
+        );
+
+        let read = slot_call(&f.endpoint, "tools/call", read_call()).await;
+        assert!(!is_error(&read), "{read}");
+        assert!(read.to_string().contains("original root"), "{read}");
+        let denied = slot_call(&f.endpoint, "tools/call", serde_json::json!({"name":"magi.fs.read", "arguments":{"source_folder_id":"second", "path":"a.txt"}})).await;
+        assert!(is_error(&denied), "{denied}");
+
+        let multi = f
+            .state
+            .workspace_registry
+            .capture_directory_binding(&workspace, Some(&binding.default_source_folder_id), None)
+            .unwrap();
+        f.bind_turn_directories(&multi);
+        let read = slot_call(&f.endpoint, "tools/call", serde_json::json!({"name":"magi.fs.read", "arguments":{"source_folder_id":"second", "path":"a.txt"}})).await;
+        assert!(!is_error(&read), "{read}");
+        assert!(read.to_string().contains("second root"), "{read}");
+
+        let state = f.state.clone();
+        let session = f.session_id.clone();
+        let first = binding.default_source_folder_id.clone();
+        let revoke = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(pending) = state
+                    .conversation_registry
+                    .tool_approvals()
+                    .pending_for_session(&session)
+                    .first()
+                {
+                    crate::routes::test_project_fixtures::set_members(
+                        &state,
+                        "ws-slot",
+                        &[&first],
+                        &first,
+                    );
+                    let _ = state.conversation_registry.tool_approvals().resolve(
+                        &session,
+                        &pending.approval_id,
+                        ToolApprovalDecision::AllowOnce,
+                    );
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "必须在原会话等待审批");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let write = slot_call(&f.endpoint, "tools/call", serde_json::json!({"name":"magi.fs.write", "arguments":{"source_folder_id":"second", "path":"a.txt", "content":"must reject"}})).await;
+        revoke.join().unwrap();
+        assert!(is_error(&write), "{write}");
+        assert_eq!(
+            std::fs::read_to_string(second_root.join("a.txt")).unwrap(),
+            "second root"
+        );
+        f.state.mcp_service.stop_slot_gateway().await;
     }
 
     #[cfg(unix)]

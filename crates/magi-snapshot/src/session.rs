@@ -55,7 +55,7 @@ impl SnapshotSession {
         blobs: Arc<BlobStore>,
         snapshots_root: PathBuf,
         respect_gitignore: bool,
-        mut watcher_events: broadcast::Receiver<DebouncedEvent>,
+        watcher_events: broadcast::Receiver<DebouncedEvent>,
     ) -> SnapshotResult<Arc<Self>> {
         let session = tokio::task::spawn_blocking(move || {
             tracing::info!(%session_id, stage = "initializing", "snapshot preparation");
@@ -75,8 +75,21 @@ impl SnapshotSession {
         })??;
         tracing::info!(session_id = %session.session_id, stage = "initialized", "snapshot preparation");
 
-        let weak = Arc::downgrade(&session);
-        let watcher_task = tokio::spawn(async move {
+        session.resume(watcher_events).await;
+        Ok(session)
+    }
+
+    /// 归档保留账本与 blob 所有权；重新激活使用同一个实例，避免重复 retain。
+    pub(crate) async fn resume(
+        self: &Arc<Self>,
+        mut watcher_events: broadcast::Receiver<DebouncedEvent>,
+    ) -> bool {
+        let mut task = self.watcher_task.lock().await;
+        if task.is_some() {
+            return false;
+        }
+        let weak = Arc::downgrade(self);
+        *task = Some(tokio::spawn(async move {
             loop {
                 match watcher_events.recv().await {
                     Ok(event) => {
@@ -97,10 +110,8 @@ impl SnapshotSession {
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-        });
-        *session.watcher_task.lock().await = Some(watcher_task);
-
-        Ok(session)
+        }));
+        true
     }
 
     /// 构建快照账本的同步部分。调用方必须将其放入 blocking worker。
@@ -179,11 +190,14 @@ impl SnapshotSession {
     /// 删除 session：停 watcher、清 baseline/events/refs、释放 blob 引用。
     pub async fn drop_session(&self) -> SnapshotResult<()> {
         self.archive().await;
-        self.release_runtime_blob_ownership()?;
+        // 读取本会话的持久引用后移除自己的索引，再释放 blob；其余未加载
+        // 会话的索引仍会保护它们的内容。
+        let events = self.events.read_all()?;
         if self.session_dir.exists() {
             std::fs::remove_dir_all(&self.session_dir)
                 .map_err(|e| SnapshotError::io(&self.session_dir, e))?;
         }
+        self.release_runtime_blob_ownership(&events)?;
         Ok(())
     }
 
@@ -272,7 +286,7 @@ impl SnapshotSession {
         }
     }
 
-    pub(crate) fn release_runtime_blob_ownership(&self) -> SnapshotResult<()> {
+    fn release_runtime_blob_ownership(&self, events: &[ChangeEvent]) -> SnapshotResult<()> {
         let baseline = self.baseline.read().expect("baseline poisoned");
         for meta in baseline.entries.values() {
             self.release_meta_blob(meta)?;
@@ -283,7 +297,7 @@ impl SnapshotSession {
         for meta in current.values() {
             self.release_meta_blob(meta)?;
         }
-        for event in self.events.read_all()? {
+        for event in events {
             if let Some(meta) = event.before.as_ref() {
                 self.release_meta_blob(meta)?;
             }

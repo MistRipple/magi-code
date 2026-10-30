@@ -230,7 +230,7 @@
   {#if historyWindow}
     <div class="turn-earlier-steps" data-testid="turn-earlier-steps">
       <span>{i18n.t('conversationTurn.earlierStepsHidden', { count: historyWindow.omittedItemCount })}</span>
-      <button type="button" class="turn-earlier-steps-load" disabled={loadingEarlier} onclick={loadEarlierSteps}>
+      <button type="button" class="btn btn--secondary btn--sm" disabled={loadingEarlier} onclick={loadEarlierSteps}>
         {loadingEarlier ? i18n.t('messageList.loadingOlder') : i18n.t('conversationTurn.loadEarlierSteps')}
       </button>
       {#if loadEarlierFailed}
@@ -378,20 +378,6 @@
     padding: var(--space-2) 0;
     color: var(--foreground-muted);
     font-size: var(--text-xs);
-  }
-
-  .turn-earlier-steps-load {
-    color: var(--primary);
-    background: none;
-    border: 0;
-    padding: 0;
-    cursor: pointer;
-    font: inherit;
-  }
-
-  .turn-earlier-steps-load:disabled {
-    opacity: 0.6;
-    cursor: default;
   }
 
   .turn-earlier-steps-error {

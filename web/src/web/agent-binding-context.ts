@@ -4,6 +4,7 @@ export interface PersonalAgentBindingContext {
 }
 
 export interface WorkspaceAgentBindingContext {
+  sourceFolderId?: string;
   scope: 'workspace';
   workspaceId: string;
   workspacePath: string;
@@ -19,6 +20,7 @@ export type WorkspaceAgentBindingOverride = {
   workspaceId: string;
   workspacePath: string;
   sessionId?: string;
+  sourceFolderId?: string;
 };
 
 export type AgentBindingOverride =

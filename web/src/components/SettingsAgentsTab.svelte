@@ -480,8 +480,8 @@
           <div class="toolbar-description">{i18n.t('settings.agents.toolbarDescription')}</div>
         </div>
         <div class="toolbar-actions">
-          <button type="button" class="toolbar-button" onclick={chooseImportFile}>{i18n.t('settings.agents.importRole')}</button>
-          <button type="button" class="toolbar-button primary" onclick={openCreateRole}>{i18n.t('settings.agents.createRole')}</button>
+          <button type="button" class="btn btn--secondary btn--sm" onclick={chooseImportFile}>{i18n.t('settings.agents.importRole')}</button>
+          <button type="button" class="btn btn--primary btn--sm" onclick={openCreateRole}>{i18n.t('settings.agents.createRole')}</button>
         </div>
         <input bind:this={importInput} class="visually-hidden" type="file" accept=".md,text/markdown" onchange={handleImportFile} />
       </div>
@@ -533,7 +533,7 @@
               }}
             >
               <div class="role-editor-back-row">
-                <button type="button" class="editor-back-button" onclick={closeEditor} disabled={editorBusy}>
+                <button type="button" class="btn btn--secondary btn--sm" onclick={closeEditor} disabled={editorBusy}>
                   <Icon name="chevron-left" size={14} />
                   {i18n.t('settings.agents.editor.back')}
                 </button>
@@ -575,7 +575,7 @@
               </div>
               {#if editorError}<div class="role-editor-error" role="alert">{editorError}</div>{/if}
               <footer class="role-editor-footer">
-                <button type="submit" class="toolbar-button primary" disabled={editorBusy}>{editorBusy ? i18n.t('settings.agents.editor.saving') : i18n.t('settings.agents.editor.save')}</button>
+                <button type="submit" class="btn btn--primary btn--sm" disabled={editorBusy}>{editorBusy ? i18n.t('settings.agents.editor.saving') : i18n.t('settings.agents.editor.save')}</button>
               </footer>
             </form>
           </div>
@@ -611,13 +611,13 @@
                         <p class="detail-description">{selected.description}</p>
                       {/if}
                       <div class="detail-actions">
-                        <button type="button" class="text-button" onclick={() => openCopyRole(tmpl)}>{i18n.t('settings.agents.action.copy')}</button>
-                        <button type="button" class="text-button" onclick={() => exportSelectedRole(tmpl.templateId)}>{i18n.t('settings.agents.action.export')}</button>
+                          <button type="button" class="btn btn--ghost btn--sm" onclick={() => openCopyRole(tmpl)}>{i18n.t('settings.agents.action.copy')}</button>
+                          <button type="button" class="btn btn--ghost btn--sm" onclick={() => exportSelectedRole(tmpl.templateId)}>{i18n.t('settings.agents.action.export')}</button>
                         {#if tmpl.editable}
-                          <button type="button" class="text-button" onclick={() => openEditRole(tmpl)}>{i18n.t('settings.agents.action.edit')}</button>
+                          <button type="button" class="btn btn--ghost btn--sm" onclick={() => openEditRole(tmpl)}>{i18n.t('settings.agents.action.edit')}</button>
                         {/if}
                         {#if tmpl.deletable}
-                          <button type="button" class="text-button danger" onclick={() => removeSelectedRole(tmpl)}>{i18n.t('settings.agents.action.delete')}</button>
+                          <button type="button" class="btn btn--error btn--sm" onclick={() => removeSelectedRole(tmpl)}>{i18n.t('settings.agents.action.delete')}</button>
                         {/if}
                       </div>
                     </div>
@@ -766,29 +766,6 @@
   .toolbar-title { font-size: 14px; font-weight: calc(var(--font-semibold) + 50); color: var(--ind-foreground); }
   .toolbar-description { margin-top: 4px; color: var(--ind-foreground-soft); font-size: 12px; }
   .toolbar-actions, .detail-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .toolbar-button {
-    border: var(--magi-hairline) solid var(--ind-border-separator);
-    background: var(--ind-bg-control);
-    color: var(--ind-foreground-secondary);
-    border-radius: 7px;
-    padding: 7px 12px;
-    font: inherit;
-    font-size: 12px;
-    cursor: pointer;
-  }
-  .toolbar-button:hover { background: var(--ind-bg-control-hover); color: var(--ind-foreground); }
-  .toolbar-button.primary { background: var(--ind-tab-accent); border-color: var(--ind-tab-accent); color: white; }
-  .toolbar-button:disabled { opacity: .55; cursor: default; }
-  .text-button {
-    border: 0;
-    padding: 0;
-    background: transparent;
-    color: var(--ind-tab-accent);
-    font: inherit;
-    font-size: 12px;
-    cursor: pointer;
-  }
-  .text-button.danger { color: var(--error, #ff3b30); }
   .source-badge {
     display: inline-flex;
     align-items: center;
@@ -817,25 +794,6 @@
     padding: 20px 22px 22px;
   }
   .role-editor-back-row { margin-bottom: 16px; }
-  .editor-back-button {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    border: 0;
-    padding: 4px 0;
-    background: transparent;
-    color: var(--ind-foreground-muted);
-    font: inherit;
-    font-size: 12px;
-    cursor: pointer;
-  }
-  .editor-back-button:hover { color: var(--ind-tab-accent); }
-  .editor-back-button:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--ind-tab-accent) 52%, transparent);
-    outline-offset: 3px;
-    border-radius: 4px;
-  }
-  .editor-back-button:disabled { opacity: .55; cursor: default; }
   .role-editor-header {
     display: flex;
     align-items: flex-start;
@@ -1313,7 +1271,7 @@
   @container agents-tab (max-width: 560px) {
     .agents-toolbar { align-items: flex-start; flex-direction: column; }
     .toolbar-actions { width: 100%; }
-    .toolbar-button { flex: 1; }
+    .toolbar-actions .btn { flex: 1; }
     .role-editor-grid { grid-template-columns: 1fr; }
     .role-editor-grid .wide { grid-column: auto; }
     .detail-masonry {

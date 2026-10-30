@@ -637,6 +637,30 @@ pub fn execution_context_system_prompt(root_path: Option<&str>, has_project: boo
     }
 }
 
+pub(crate) fn project_execution_context_system_prompt(
+    root_path: Option<&str>,
+    has_project: bool,
+    directories: Option<&magi_core::ProjectDirectoryExecutionMap>,
+) -> String {
+    let mut prompt = execution_context_system_prompt(root_path, has_project);
+    if let Some(directories) = directories {
+        let roots = directories.roots.iter().map(|root| serde_json::json!({
+            "source_folder_id": root.source_folder_id,
+            "execution_root": root.execution_root().ok().map(|path| magi_core::HostPath::from_path(path).display_string()),
+            "isolated": root.source_root_ref != root.execution_root_ref,
+        })).collect::<Vec<_>>();
+        prompt.push_str(&format!(
+            "\n\n本轮项目目录映射（由执行入口提供）：{}\n文件、检索、Shell 与 Git 工具可用 source_folder_id 选择其中一个目录；省略时从 default_source_folder_id 的执行根解析。跨目录绝对路径也必须使用这里的实际执行根。目录选择不改变项目归属或扩大授权；隔离时不得指回源目录。各目录内 AGENTS.md 的规则仅适用于对应目录，不能套用到其他目录。",
+            serde_json::json!({
+                "workspace_id": directories.workspace_id,
+                "default_source_folder_id": directories.default_source_folder_id,
+                "directories": roots,
+            }),
+        ));
+    }
+    prompt
+}
+
 pub fn normalize_model_visible_content(content: String) -> String {
     content
         .strip_prefix("loopback-model::")

@@ -312,6 +312,9 @@ pub struct DispatchSubmissionRequest {
     pub accepted_at: UtcMillis,
     pub session_id: SessionId,
     pub workspace_id: Option<WorkspaceId>,
+    /// 接纳时冻结的目录授权；它随 accepted input 持久化，不能由当前项目选择漂移。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_directories: Option<magi_core::ProjectDirectoryBinding>,
     /// 任务执行 cwd。项目会话使用项目根目录；个人会话使用 Magi 管理的私有目录。
     pub execution_root: Option<std::path::PathBuf>,
     /// 新会话首次执行时使用的模型配置。它是 accepted 请求事实的一部分，实际写入
@@ -846,7 +849,7 @@ fn validate_dispatch_request(
         magi_plan::PlanStore::from_store(runtime.session_store, request.session_id.clone())
             .active_item_id();
     let now = UtcMillis::now();
-    let task = make_dispatch_task(DispatchTaskInput {
+    let mut task = make_dispatch_task(DispatchTaskInput {
         task_id: action_task_id.clone(),
         mission_id: mission_id.clone(),
         title: request.task_title.clone(),
@@ -873,6 +876,9 @@ fn validate_dispatch_request(
         denied_tools: request.denied_tools.clone(),
         plan_item_id: plan_item_id.clone(),
     });
+    if let Some(binding) = task.executor_binding.as_mut() {
+        binding.project_directories = request.project_directories.clone();
+    }
     let worker_thread_id = if target_role == "coordinator" && request.recovery_checkpoint.is_none()
     {
         orchestrator_thread_id.clone()
@@ -1800,6 +1806,7 @@ mod tests {
         target_role: &str,
     ) -> DispatchSubmissionRequest {
         DispatchSubmissionRequest {
+            project_directories: None,
             accepted_at,
             session_id,
             workspace_id: Some(WorkspaceId::new("workspace-materialize-rollback")),
@@ -2007,6 +2014,7 @@ mod tests {
             .expect("旧 thread 测试数据应注册成功");
 
         let request = DispatchSubmissionRequest {
+            project_directories: None,
             accepted_at: UtcMillis(2_000),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-fresh-thread")),
@@ -2098,6 +2106,7 @@ mod tests {
             workspace_root_path: None,
         };
         let make_request = |accepted_at| DispatchSubmissionRequest {
+            project_directories: None,
             accepted_at,
             session_id: session_id.clone(),
             workspace_id: None,
@@ -2194,6 +2203,7 @@ mod tests {
             "status": "active"
         });
         let request = DispatchSubmissionRequest {
+            project_directories: None,
             accepted_at: UtcMillis(2_100),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-browser-annotation")),
@@ -2510,6 +2520,7 @@ mod tests {
             .expect("source Turn should be interrupted by user");
 
         let request = DispatchSubmissionRequest {
+            project_directories: None,
             accepted_at: UtcMillis(3_000),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-resume-checkpoint")),
@@ -2767,6 +2778,7 @@ mod tests {
         let thread_count_before = session_store.thread_registry_snapshot(&session_id).len();
         let event_count_before = event_bus.snapshot().recent_events.len();
         let request = DispatchSubmissionRequest {
+            project_directories: None,
             accepted_at: UtcMillis(4_000),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-invalid-resume-checkpoint")),
@@ -2872,6 +2884,7 @@ mod tests {
             .expect("session should be creatable");
 
         let request = DispatchSubmissionRequest {
+            project_directories: None,
             accepted_at: UtcMillis(3_000),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-exec-chain-tier")),
@@ -2984,6 +2997,7 @@ mod tests {
             })
             .expect("plan should create");
         let request = DispatchSubmissionRequest {
+            project_directories: None,
             accepted_at: UtcMillis(3_100),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-plan-root-binding")),
@@ -3057,6 +3071,7 @@ mod tests {
             .expect("session should be creatable");
 
         let request = DispatchSubmissionRequest {
+            project_directories: None,
             accepted_at: UtcMillis(3_250),
             session_id,
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-skill-mainline-role")),
@@ -3135,6 +3150,7 @@ mod tests {
             .expect("session should be creatable");
 
         let request = DispatchSubmissionRequest {
+            project_directories: None,
             accepted_at: UtcMillis(3_500),
             session_id,
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-active-skill")),
@@ -3215,6 +3231,7 @@ mod tests {
             .expect("session should be creatable");
 
         let request = DispatchSubmissionRequest {
+            project_directories: None,
             accepted_at: UtcMillis(4_000),
             session_id,
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-context-reference")),
@@ -3226,6 +3243,7 @@ mod tests {
             context_references: vec![SessionContextReference {
                 kind: crate::context_reference::SessionContextReferenceKind::File,
                 path: std::path::PathBuf::from("/tmp/external/reference.md"),
+                source_folder_id: None,
                 name: "reference.md".to_string(),
             }],
             browser_annotation_refs: Vec::new(),
@@ -3322,6 +3340,7 @@ mod tests {
             )
             .expect("goal should be creatable");
         let request = DispatchSubmissionRequest {
+            project_directories: None,
             accepted_at: UtcMillis(5_000),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-goal-continuation-dispatch")),
@@ -3449,6 +3468,7 @@ mod tests {
             )
             .expect("goal should be creatable");
         let request = DispatchSubmissionRequest {
+            project_directories: None,
             accepted_at: UtcMillis(6_000),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-goal-continuation-pause-race")),

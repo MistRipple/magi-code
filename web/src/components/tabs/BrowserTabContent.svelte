@@ -2167,8 +2167,8 @@
             maxlength="4000"
           ></textarea>
           <div class="annotation-editor-actions">
-            <button type="button" onclick={cancelAnnotationCreation}>{i18n.t('common.cancel')}</button>
-            <button type="button" class="primary" disabled={!annotationComment.trim()} onclick={submitCreatedAnnotation}>{i18n.t('common.save')}</button>
+            <button type="button" class="btn btn--secondary btn--sm" onclick={cancelAnnotationCreation}>{i18n.t('common.cancel')}</button>
+            <button type="button" class="btn btn--primary btn--sm" disabled={!annotationComment.trim()} onclick={submitCreatedAnnotation}>{i18n.t('common.save')}</button>
           </div>
         </div>
       {/if}
@@ -2306,9 +2306,6 @@
   .annotation-editor { position: fixed; top: calc(anchor(bottom) - 12px); left: anchor(left); width: min(360px, calc(anchor-size(width) - 24px)); z-index: 4; box-sizing: border-box; padding: 10px; border: var(--magi-hairline) solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); transform: translateY(-100%); }
   .annotation-editor textarea { box-sizing: border-box; width: 100%; min-height: 74px; resize: vertical; padding: 7px; border: var(--magi-hairline) solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); }
   .annotation-editor-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 8px; }
-  .annotation-editor-actions button { min-width: 58px; height: 28px; border: var(--magi-hairline) solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); cursor: pointer; }
-  .annotation-editor-actions button.primary { border-color: var(--primary); background: var(--primary); color: var(--primary-foreground); }
-  .annotation-editor-actions button:disabled { opacity: .5; cursor: default; }
   .browser-placeholder { display: grid; flex: 1; place-items: center; padding: 20px; color: var(--foreground-muted); font-size: var(--text-sm); text-align: center; }
   .browser-placeholder.error { color: var(--error); }
   .browser-record { display: flex; flex: 1; flex-direction: column; align-items: center; gap: 9px; min-width: 0; padding: 44px 24px; color: var(--foreground-muted); text-align: center; }

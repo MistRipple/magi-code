@@ -26,6 +26,8 @@ impl SessionContextReferenceKind {
 pub struct SessionContextReference {
     pub kind: SessionContextReferenceKind,
     pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_folder_id: Option<String>,
     pub name: String,
 }
 

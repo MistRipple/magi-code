@@ -47,6 +47,7 @@ import {
  * 抛出运行时硬错误，而不是静默回退。
  */
 interface TurnPresentation {
+  readonly defaultSourceFolderId?: string;
   /** 按呈现序排好的完整 item 数组——所有需要顺序遍历的下游消费者直接读这个。 */
   readonly orderedItems: readonly CanonicalTurnItem[];
   /** itemId → 1-based 呈现序号。downstream `presentationSeq * 1000` 写入 metadata.itemSeq。 */
@@ -290,6 +291,7 @@ function buildMessageBlocks(
   item: CanonicalTurnItem,
   content: string,
   artifactId: string,
+  defaultSourceFolderId?: string,
 ): ContentBlock[] | undefined {
   if (item.kind === 'assistant_thinking') {
     const blockId = `thinking:${item.itemId}`;
@@ -321,6 +323,7 @@ function buildMessageBlocks(
     const fileChangeBlocks = buildCanonicalToolFileChangeBlocks({
       blockIdBase: item.tool.callId,
       sessionId: item.sessionId,
+      defaultSourceFolderId,
       toolName: item.tool.name,
       arguments: item.tool.arguments,
       result: item.tool.result,
@@ -439,7 +442,7 @@ function normalizeMessageContextReferencesFromMetadata(
       const name = typeof reference.name === 'string' && reference.name.trim()
         ? reference.name.trim()
         : path.split(/[\\/]/u).filter(Boolean).pop() || path;
-      return { kind, path, name };
+      return { kind, path, name, ...(typeof reference.sourceFolderId === 'string' && reference.sourceFolderId.trim() ? { sourceFolderId: reference.sourceFolderId.trim() } : {}) };
     })
     .filter((reference): reference is import('../types/message').MessageContextReference => (
       reference !== null
@@ -638,7 +641,11 @@ function buildMessage(
   const workerId = isAgentTaskSidechain ? normalizeCanonicalWorkerId(item) : undefined;
   const roleId = isAgentTaskSidechain ? normalizeCanonicalRoleId(item) : undefined;
   const taskId = normalizeCanonicalTaskId(item);
-  const blocks = buildMessageBlocks(item, content, artifactId);
+  const requestedSourceFolderId = coerceToolArgumentsRecord(item.tool?.arguments).source_folder_id;
+  const sourceFolderId = typeof requestedSourceFolderId === 'string'
+    ? requestedSourceFolderId.trim()
+    : presentation.defaultSourceFolderId;
+  const blocks = buildMessageBlocks(item, content, artifactId, presentation.defaultSourceFolderId);
   const agentChildTaskId = item.kind === 'tool_call'
     && canonicalToolName(item.tool?.name || '') === 'agent_spawn'
     ? (() => {
@@ -707,6 +714,7 @@ function buildMessage(
       ...messageMetadataWithoutTransportAttachments(item.metadata),
       ...(inputDelivery ? { inputDelivery } : {}),
       sessionId: item.sessionId,
+      ...(sourceFolderId ? { sourceFolderId } : {}),
       turnId: item.turnId,
       turnSeq: item.turnSeq,
       turnStatus: turn.status,
@@ -835,6 +843,12 @@ function buildTurnPresentation(turn: CanonicalTurn, agentChildStatuses: Readonly
     .sort((left, right) =>
       left.itemSeq - right.itemSeq || left.itemId.localeCompare(right.itemId),
     );
+  const originalInput = sorted.find((item) => item.kind === 'user_message');
+  const pendingDispatch = originalInput?.metadata?.pendingDispatch as Record<string, unknown> | undefined;
+  const directoryBinding = (originalInput?.metadata?.projectDirectories ?? pendingDispatch?.project_directories) as Record<string, unknown> | undefined;
+  const defaultSourceFolderId = typeof directoryBinding?.defaultSourceFolderId === 'string'
+    ? directoryBinding.defaultSourceFolderId.trim() || undefined
+    : undefined;
 
   const ordered: CanonicalTurnItem[] = [];
   let responseGroupKey: string | null = null;
@@ -903,6 +917,7 @@ function buildTurnPresentation(turn: CanonicalTurn, agentChildStatuses: Readonly
   }
 
   return {
+    defaultSourceFolderId,
     orderedItems: ordered,
     presentationSeq,
     responseDurationAnchorItemId,

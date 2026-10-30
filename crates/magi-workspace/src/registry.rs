@@ -3,8 +3,8 @@ mod worktree;
 
 use crate::models::{
     SnapshotRecord, WorkspaceDurableState, WorkspaceProjectionInput, WorkspaceRecord,
-    WorkspaceRecoveryFlushReason, WorkspaceRecoverySidecarStoreState, WorkspaceStoreState,
-    WorktreeAllocation,
+    WorkspaceRecoveryFlushReason, WorkspaceRecoverySidecarStoreState, WorkspaceSourceFolder,
+    WorkspaceStoreState, WorktreeAllocation,
 };
 use magi_core::{
     AbsolutePath, DomainError, DomainResult, ExecutionOwnership, UtcMillis, WorkspaceId,
@@ -118,6 +118,14 @@ impl WorkspaceStore {
         self.export_state().durable_state()
     }
 
+    /// 导航等非管理入口保存注册表时也保持读锁，避免旧快照晚于项目管理事务落盘。
+    pub fn with_durable_state<R>(&self, persist: impl FnOnce(&WorkspaceDurableState) -> R) -> R {
+        let state = self.read_state();
+        let result = persist(&state.durable_state());
+        drop(state);
+        result
+    }
+
     pub fn projection_input(&self) -> WorkspaceProjectionInput {
         let mut state = self.export_state();
         state
@@ -139,7 +147,12 @@ impl WorkspaceStore {
             .read_state()
             .workspaces
             .iter()
-            .map(|workspace| workspace.root_path.clone())
+            .flat_map(|workspace| {
+                workspace
+                    .source_folders
+                    .iter()
+                    .map(|folder| folder.path.clone())
+            })
             .collect::<Vec<_>>();
         roots.sort_by(|left, right| left.0.cmp(&right.0));
         roots
@@ -158,10 +171,20 @@ impl WorkspaceStore {
         workspace_id: WorkspaceId,
         root_path: PathBuf,
     ) -> DomainResult<WorkspaceRecord> {
-        let host_path = magi_core::HostPath::from_path(root_path);
+        self.register_native_path_with_persistence(workspace_id, root_path, |_| Ok(()))
+    }
+
+    pub fn register_native_path_with_persistence(
+        &self,
+        workspace_id: WorkspaceId,
+        root_path: PathBuf,
+        persist: impl FnOnce(&WorkspaceDurableState) -> DomainResult<()>,
+    ) -> DomainResult<WorkspaceRecord> {
+        let host_path = magi_core::HostPath::canonicalize(&root_path)
+            .unwrap_or_else(|_| magi_core::HostPath::from_path(root_path));
         let display_path = AbsolutePath::new(host_path.display_string());
         let root_path_ref = host_path.to_path_ref().as_str().to_string();
-        self.register_with_path_ref(workspace_id, display_path, root_path_ref)
+        self.register_with_path_ref(workspace_id, display_path, root_path_ref, persist)
     }
 
     fn register_with_path_ref(
@@ -169,46 +192,28 @@ impl WorkspaceStore {
         workspace_id: WorkspaceId,
         root_path: AbsolutePath,
         root_path_ref: String,
+        persist: impl FnOnce(&WorkspaceDurableState) -> DomainResult<()>,
     ) -> DomainResult<WorkspaceRecord> {
-        let mut state = self.write_state();
-        if state
-            .workspaces
-            .iter()
-            .any(|workspace| workspace.workspace_id == workspace_id)
-        {
-            return Err(DomainError::AlreadyExists {
-                entity: "workspace",
-            });
-        }
-        let native_root_path = magi_core::HostPath::from_path_ref(&root_path_ref)
-            .map(magi_core::HostPath::into_path_buf)
-            .unwrap_or_else(|_| PathBuf::from(root_path.as_str()));
-        if state
-            .workspaces
-            .iter()
-            .any(|workspace| workspace.native_root_path() == native_root_path)
-        {
-            return Err(DomainError::AlreadyExists {
-                entity: "workspace_root_path",
-            });
-        }
-
         let now = UtcMillis::now();
         let workspace = WorkspaceRecord {
             workspace_id: workspace_id.clone(),
             name: None,
-            root_path,
-            root_path_ref,
             worktree_root: None,
             status: WorkspaceLifecycleStatus::Registered,
             created_at: now,
             updated_at: now,
+            source_folders: vec![WorkspaceSourceFolder {
+                source_folder_id: format!("{workspace_id}-source-0"),
+                path: root_path.clone(),
+                path_ref: root_path_ref.clone(),
+                name: None,
+                created_at: now,
+                updated_at: now,
+            }],
+            primary_source_folder_id: format!("{workspace_id}-source-0"),
+            revision: 1,
         };
-        state.workspaces.push(workspace.clone());
-        if state.active_workspace_id.is_none() {
-            state.active_workspace_id = Some(workspace_id);
-        }
-        Ok(workspace)
+        self.register_project(workspace, persist)
     }
 
     pub fn activate(&self, workspace_id: &WorkspaceId) -> DomainResult<WorkspaceRecord> {
@@ -291,18 +296,33 @@ impl WorkspaceStore {
     }
 
     pub fn deregister(&self, workspace_id: &WorkspaceId) -> DomainResult<()> {
+        self.deregister_with_persistence(workspace_id, |_| Ok(()))
+    }
+
+    pub fn deregister_with_persistence(
+        &self,
+        workspace_id: &WorkspaceId,
+        persist: impl FnOnce(&WorkspaceDurableState) -> DomainResult<()>,
+    ) -> DomainResult<()> {
         let mut state = self.write_state();
         let pos = state
             .workspaces
             .iter()
-            .position(|w| &w.workspace_id == workspace_id)
+            .position(|project| &project.workspace_id == workspace_id)
             .ok_or(DomainError::NotFound {
                 entity: "workspace",
             })?;
-        state.workspaces.remove(pos);
-        if state.active_workspace_id.as_ref() == Some(workspace_id) {
-            state.active_workspace_id = state.workspaces.first().map(|w| w.workspace_id.clone());
+        let mut next = state.durable_state();
+        next.workspaces.remove(pos);
+        if next.active_workspace_id.as_ref() == Some(workspace_id) {
+            next.active_workspace_id = next
+                .workspaces
+                .first()
+                .map(|project| project.workspace_id.clone());
         }
+        persist(&next)?;
+        state.active_workspace_id = next.active_workspace_id;
+        state.workspaces = next.workspaces;
         Ok(())
     }
 }
@@ -324,7 +344,12 @@ mod tests {
             .register_native_path(workspace_id, root.clone())
             .expect("native workspace should register");
 
-        assert!(workspace.root_path_ref.starts_with("mhp1:"));
+        assert!(
+            workspace
+                .primary_source_folder()
+                .path_ref
+                .starts_with("mhp1:")
+        );
         assert_eq!(workspace.native_root_path(), root);
     }
 

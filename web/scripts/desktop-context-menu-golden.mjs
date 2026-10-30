@@ -25,6 +25,8 @@ globalThis.Node = MockNode;
 globalThis.HTMLElement = MockHTMLElement;
 globalThis.HTMLInputElement = MockInputElement;
 globalThis.HTMLTextAreaElement = MockTextAreaElement;
+globalThis.$state = (value) => value;
+globalThis.$derived = (value) => value;
 
 let selectedTarget = null;
 globalThis.window = {
@@ -90,7 +92,7 @@ await withGoldenViteServer(async (server) => {
   assert.equal(resolve(contextEvent(link))?.kind, 'link', '网页链接必须提供打开和复制链接菜单');
 
   const file = new MockHTMLElement();
-  const fileScope = { workspaceId: 'workspace-main', workspacePath: '/workspace' };
+  const fileScope = { workspaceId: 'workspace-main', workspacePath: '/workspace', sessionId: 'session-original', sourceFolderId: 'source-b' };
   contextMenu.desktopContextMenu(file, {
     kind: 'file',
     filePath: 'src/main.rs',
@@ -146,6 +148,54 @@ await withGoldenViteServer(async (server) => {
   const previewImage = new MockHTMLElement();
   contextMenu.desktopContextMenu(previewImage, { kind: 'image', open: () => undefined });
   assert.equal(resolve(contextEvent(previewImage))?.kind, 'image-open', '内嵌图片必须至少保留打开预览操作');
+
+  // 从实际 document 事件走到 daemon 请求，再用响应调用 preload；右键定位
+  // 不能丢掉历史文件所在的源目录，或从当前输入区重新推导它。
+  const originalFetch = globalThis.fetch;
+  const originalDocument = globalThis.document;
+  let handler;
+  let removeMenu;
+  const revealed = [];
+  const requests = [];
+  try {
+    window.location = { href: 'http://127.0.0.1:38239/web.html' };
+    window.setTimeout = setTimeout;
+    window.clearTimeout = clearTimeout;
+    globalThis.localStorage = { getItem: () => null, setItem: () => undefined };
+    window.magiDesktop = {
+      showContextMenu: async ({ items }) => {
+        assert.ok(items.some((item) => item.id === 'reveal-file'));
+        return 'reveal-file';
+      },
+      revealWorkspaceFile: async (target) => revealed.push(target),
+    };
+    globalThis.document = {
+      addEventListener: (type, listener) => { if (type === 'contextmenu') handler = listener; },
+      removeEventListener: () => { handler = null; },
+    };
+    globalThis.fetch = async (url, init) => {
+      requests.push({ url: new URL(url), body: JSON.parse(init.body) });
+      return new Response(JSON.stringify({
+        targetPathRef: 'file-in-b', workspaceRootPathRef: 'execution-copy-b',
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const controller = await server.ssrLoadModule('/src/lib/desktop-context-menu.ts');
+    removeMenu = controller.installDesktopContextMenu();
+    handler({ ...contextEvent(file), preventDefault() {}, stopPropagation() {} });
+    for (let attempt = 0; revealed.length === 0 && attempt < 20; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url.origin, 'http://127.0.0.1:38239');
+    assert.equal(requests[0].body.sourceFolderId, 'source-b');
+    assert.equal(requests[0].body.sessionId, 'session-original');
+    assert.deepEqual(revealed, [{ targetPathRef: 'file-in-b', workspaceRootPathRef: 'execution-copy-b' }]);
+  } finally {
+    removeMenu?.();
+    globalThis.fetch = originalFetch;
+    if (originalDocument === undefined) delete globalThis.document;
+    else globalThis.document = originalDocument;
+  }
 });
 
 const [bootstrap, controller, workbench, codeBlock, markdownLink, markdownImage, fileReference, fileSpan, generatedImage, messageItem, toolCall, apiRoutes, desktopMain, desktopFiles, desktopPreload] = await Promise.all([

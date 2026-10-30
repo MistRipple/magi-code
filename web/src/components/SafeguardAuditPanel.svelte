@@ -113,7 +113,7 @@
         <Icon name="refresh" size={13} />
         {i18n.t('settings.safeguard.audit.refresh')}
       </button>
-      <button type="button" class="btn btn--danger btn--sm" disabled={total === 0 || loading || deleting} onclick={() => void clearAll()}>
+      <button type="button" class="btn btn--error btn--sm" disabled={total === 0 || loading || deleting} onclick={() => void clearAll()}>
         {i18n.t('settings.safeguard.audit.clearAll')}
       </button>
     </span>

@@ -520,6 +520,8 @@ async fn restart_task(
         root_task.goal.trim().to_string()
     };
     let restart_request = SessionTurnRequestDto {
+        source_folder_id: None,
+        project_directories: None,
         desktop_browser_tools_allowed,
         session_id: Some(session_id.to_string()),
         scope: request.scope,

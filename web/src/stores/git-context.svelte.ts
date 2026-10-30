@@ -24,6 +24,7 @@ export interface GitContextBinding {
   workspaceId: string;
   workspacePath: string;
   sessionId?: string;
+  sourceFolderId?: string;
 }
 
 export const gitContextState = $state({
@@ -62,8 +63,9 @@ export function gitContextBindingKey(binding: GitContextBinding): string {
   const workspaceId = normalizeBindingPart(binding.workspaceId);
   const workspacePath = normalizeBindingPart(binding.workspacePath);
   const sessionId = normalizeBindingPart(binding.sessionId);
-  if (workspaceId) return `id:${workspaceId}\u0000${sessionId}`;
-  if (workspacePath) return `path:${workspacePath}\u0000${sessionId}`;
+  const sourceFolderId = normalizeBindingPart(binding.sourceFolderId);
+  if (workspaceId) return `id:${workspaceId}\u0000${sessionId}\u0000${sourceFolderId}`;
+  if (workspacePath) return `path:${workspacePath}\u0000${sessionId}\u0000${sourceFolderId}`;
   return '';
 }
 
@@ -71,11 +73,13 @@ function normalizedBinding(binding: GitContextBinding): GitContextBinding {
   const workspaceId = normalizeBindingPart(binding.workspaceId);
   const workspacePath = normalizeBindingPart(binding.workspacePath);
   const sessionId = normalizeBindingPart(binding.sessionId);
+  const sourceFolderId = normalizeBindingPart(binding.sourceFolderId);
   return {
     scope: 'workspace',
     workspaceId,
     workspacePath,
     ...(sessionId ? { sessionId } : {}),
+    ...(sourceFolderId ? { sourceFolderId } : {}),
   };
 }
 

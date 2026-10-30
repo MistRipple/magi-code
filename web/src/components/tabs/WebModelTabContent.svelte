@@ -260,7 +260,7 @@
   class:web-model-content--offscreen={!active}
   data-web-model-session={browserSessionId}
   aria-hidden={!active}
-  style:--wm-top={notice ? '72px' : '36px'}
+  style:--wm-top={notice ? 'calc(var(--wm-bar-height) * 2)' : 'var(--wm-bar-height)'}
 >
   <!-- 应用级标题栏：只放共享事实（后台推理 / 发送条数 / 连接状态）与两个显式动作。「清除数据」是
        破坏性操作，只在设置里提供，不放在随手可点的标题栏。 -->
@@ -269,7 +269,7 @@
     <span class="bar-address" title={homeUrl}><Icon name="globe" size={12} />{homeHost}</span>
     <button
       type="button"
-      class="bar-action bar-icon"
+      class="btn-icon btn-icon--sm"
       data-web-model-reload="1"
       disabled={!desktopSurface || reloading}
       title={i18n.t('webModel.reload.title')}
@@ -279,7 +279,7 @@
     {#each quickTargets as target (target)}
       <button
         type="button"
-        class="bar-action bar-link"
+        class="btn btn--secondary btn--sm bar-link"
         data-web-model-goto={target}
         disabled={!desktopSurface || navigating || running}
         title={i18n.t(`webModel.nav.${target}.title`)}
@@ -308,7 +308,7 @@
     </span>
     <button
       type="button"
-      class="bar-action"
+      class="btn btn--secondary btn--sm"
       data-web-model-check="1"
       disabled={!desktopSurface || checking}
       title={i18n.t('webModel.check.title')}
@@ -325,7 +325,7 @@
     >
       <span class="bar-notice-text">{notice.text}</span>
       {#if notice.action}
-        <button type="button" class="bar-action" onclick={notice.action.run}>{notice.action.label}</button>
+        <button type="button" class="btn btn--secondary btn--sm" onclick={notice.action.run}>{notice.action.label}</button>
       {/if}
     </p>
   {/if}
@@ -359,6 +359,7 @@
   /* 内容槽与每个宿主都绝对定位于 RightPane 的 `.right-pane-body`。
      折叠右栏与关闭视图只改 `hidden`，不卸载组件。 */
   .web-model-content {
+    --wm-bar-height: 36px;
     position: absolute;
     inset: 0;
     display: flex;
@@ -386,7 +387,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    height: 36px;
+    height: var(--wm-bar-height);
     padding: 0 8px;
     font-size: var(--text-xs);
     background: transparent;
@@ -420,12 +421,12 @@
 
   .bar-notice {
     position: absolute;
-    top: 36px;
+    top: var(--wm-bar-height);
     left: 0;
     right: 0;
     z-index: 3;
     box-sizing: border-box;
-    height: 36px;
+    height: var(--wm-bar-height);
     margin: 0;
     padding: 4px 8px;
     overflow: hidden;
@@ -448,7 +449,7 @@
     overflow: hidden;
   }
 
-  .bar-notice .bar-action {
+  .bar-notice .btn {
     flex: none;
   }
 
@@ -487,29 +488,14 @@
     background: var(--warning, #d9962b);
   }
 
-  .bar-action {
-    padding: 1px 8px;
-    border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.24));
-    border-radius: 6px;
-    font-size: var(--text-xs);
-    background: transparent;
-    cursor: pointer;
-  }
 
   .bar-link {
     flex: none;
   }
 
-  .bar-icon {
-    flex: none;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 2px 6px;
-  }
-  .bar-action:disabled {
-    cursor: default;
-    opacity: 0.45;
+
+  @media (hover: none), (pointer: coarse) {
+    .web-model-content { --wm-bar-height: 52px; }
   }
 
 

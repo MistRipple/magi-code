@@ -142,7 +142,7 @@ impl ToolRegistry {
         let effective_access_profile = policy.effective_access_profile();
         let workspace_root_path = context.working_directory.as_deref();
         let engine = crate::builtin_permission_engine();
-        let permission_policy = execution_permission_policy(&policy, workspace_root_path);
+        let permission_policy = execution_permission_policy(&policy, context);
         let mut pending_output = None;
 
         let tool_is_writeful = crate::BuiltinToolName::from_name(input.tool_name.trim())
@@ -186,6 +186,16 @@ impl ToolRegistry {
             workspace_root_path,
             effective_access_profile,
         ) {
+            if context
+                .references_retired_project_root(&path_request.absolute_path)
+                .unwrap_or(true)
+            {
+                return Some(self.build_policy_rejection(
+                    input,
+                    "project_execution_root_retired: 路径指向原源目录，必须使用本次执行副本".into(),
+                    effective_access_profile,
+                ));
+            }
             if path_request.kind == magi_permissions::PathAccessKind::Write
                 && read_only_paths
                     .iter()
@@ -457,11 +467,26 @@ fn select_permission_axis_output(
     }
 }
 
-pub(crate) fn execution_permission_policy(
+pub fn execution_permission_policy(
     policy: &ToolExecutionPolicy,
-    workspace_root_path: Option<&Path>,
+    context: &ToolExecutionContext,
 ) -> magi_permissions::PermissionPolicy {
+    let workspace_root_path = context.working_directory.as_deref();
     let effective_access_profile = policy.effective_access_profile();
+    let mut allowed_paths = effective_tool_policy_allowed_paths(
+        effective_access_profile,
+        &policy.allowed_paths,
+        workspace_root_path,
+    );
+    if context.project_directory_map.is_some()
+        && policy
+            .allowed_paths
+            .iter()
+            .all(|path| path.trim().is_empty())
+        && effective_access_profile != AccessProfile::FullAccess
+    {
+        allowed_paths = context.project_execution_roots().unwrap_or_default();
+    }
     magi_permissions::PermissionPolicy {
         allowed_tools: policy
             .allowed_tool_names
@@ -481,11 +506,7 @@ pub(crate) fn execution_permission_policy(
                     .unwrap_or_else(|| tool_name.trim().to_string())
             })
             .collect(),
-        allowed_paths: effective_tool_policy_allowed_paths(
-            effective_access_profile,
-            &policy.allowed_paths,
-            workspace_root_path,
-        ),
+        allowed_paths,
         denied_paths: normalize_tool_policy_paths(&policy.denied_paths, workspace_root_path),
         command_mode: policy.command_mode.clone(),
     }
@@ -908,7 +929,11 @@ pub fn tool_path_access_requests(
             }
             paths.extend(shell_exec_command_path_accesses(
                 object,
-                workspace_root_path,
+                object
+                    .and_then(|object| field_string(object, "cwd"))
+                    .map(|cwd| resolve_tool_path(&cwd, workspace_root_path))
+                    .as_deref()
+                    .or(workspace_root_path),
                 shell_kind,
             ));
             if access_profile == AccessProfile::ReadOnly {

@@ -13,12 +13,22 @@ use crate::scope_binding::require_registered_workspace_binding;
 use crate::session_activity::session_running_task_count;
 use crate::{errors::ApiError, state::ApiState};
 
+mod project_management;
+
 static WORKSPACE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/workspaces", get(list_workspaces))
         .route("/workspaces/register", post(register_workspace))
+        .route(
+            "/workspaces/create",
+            post(project_management::create_project),
+        )
+        .route(
+            "/workspaces/update",
+            post(project_management::update_project),
+        )
         .route("/workspaces/remove", post(remove_workspace))
         .route("/workspaces/pick", get(pick_workspace))
         .route("/workspaces/sessions", get(workspace_sessions))
@@ -33,6 +43,43 @@ struct WorkspaceDto {
     root_path_ref: String,
     name: Option<String>,
     is_active: bool,
+    revision: u64,
+    primary_source_folder_id: String,
+    source_folders: Vec<WorkspaceSourceFolderDto>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSourceFolderDto {
+    source_folder_id: String,
+    path: String,
+    path_ref: String,
+    name: Option<String>,
+    is_primary: bool,
+}
+
+fn workspace_dto(state: &ApiState, workspace: &magi_workspace::WorkspaceRecord) -> WorkspaceDto {
+    let active_id = state.workspace_registry.active_workspace_id();
+    WorkspaceDto {
+        workspace_id: workspace.workspace_id.to_string(),
+        root_path: workspace.primary_source_folder().path.to_string(),
+        root_path_ref: workspace.primary_source_folder().path_ref.clone(),
+        name: workspace.name.clone(),
+        is_active: active_id.as_ref() == Some(&workspace.workspace_id),
+        revision: workspace.revision,
+        primary_source_folder_id: workspace.primary_source_folder_id.clone(),
+        source_folders: workspace
+            .source_folders
+            .iter()
+            .map(|folder| WorkspaceSourceFolderDto {
+                source_folder_id: folder.source_folder_id.clone(),
+                path: folder.path.to_string(),
+                path_ref: folder.path_ref.clone(),
+                name: folder.name.clone(),
+                is_primary: workspace.primary_source_folder_id == folder.source_folder_id,
+            })
+            .collect(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -143,16 +190,7 @@ async fn list_workspaces(State(state): State<ApiState>) -> Json<WorkspaceListRes
         .workspace_registry
         .workspaces()
         .into_iter()
-        .map(|w| {
-            let active_id = state.workspace_registry.active_workspace_id();
-            WorkspaceDto {
-                workspace_id: w.workspace_id.to_string(),
-                root_path: w.root_path.to_string(),
-                root_path_ref: w.root_path_ref.clone(),
-                name: w.name.clone(),
-                is_active: active_id.as_ref() == Some(&w.workspace_id),
-            }
-        })
+        .map(|w| workspace_dto(&state, &w))
         .collect();
     Json(WorkspaceListResponse { workspaces })
 }
@@ -168,6 +206,7 @@ async fn register_workspace(
     Json(request): Json<RegisterWorkspaceRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let canonical_path = canonical_workspace_path(&request.path)?;
+    let _navigation_guard = state.lock_session_navigation().await;
 
     if let Some(state_root) = state
         .runtime_persistence()
@@ -182,6 +221,12 @@ async fn register_workspace(
 
     // 已注册过的 workspace：复用已有记录，仍异步刷新索引。
     if let Some(workspace) = registered_workspace_for_path(&state, &canonical_path) {
+        if workspace.source_folders.len() != 1 {
+            return Err(ApiError::Conflict(
+                "该文件夹已属于多目录项目，请按项目身份打开".into(),
+            ));
+        }
+        state.restore_workspace_history_for_api(&workspace)?;
         let workspace_id = workspace.workspace_id.clone();
         state.schedule_workspace_code_index(workspace_id, canonical_path.clone());
         return Ok(Json(serde_json::json!({
@@ -197,9 +242,14 @@ async fn register_workspace(
             .map_err(|error| ApiError::internal_assembly("工作区身份初始化失败", error))?;
     match state
         .workspace_registry
-        .register_native_path(workspace_id.clone(), canonical_path.clone())
-    {
-        Ok(_) => {}
+        .register_native_path_with_persistence(
+            workspace_id.clone(),
+            canonical_path.clone(),
+            |snapshot| state.persist_workspace_snapshot(snapshot),
+        ) {
+        Ok(project) => {
+            state.restore_workspace_history_for_api(&project)?;
+        }
         Err(error) => {
             // 并发竞态：另一个请求先注册了同一路径。
             if let Some(workspace) = registered_workspace_for_path(&state, &canonical_path) {
@@ -215,8 +265,7 @@ async fn register_workspace(
         }
     }
 
-    // 先持久化 workspace 注册状态（快），索引放到后台不阻塞响应。
-    state.persist_workspace_durable_state_for_api()?;
+    // 注册事务已先完成持久提交；索引放到后台不阻塞响应。
     publish_workspace_registry_changed(&state);
     state.schedule_workspace_code_index(workspace_id.clone(), canonical_path.clone());
     Ok(Json(serde_json::json!({
@@ -279,11 +328,15 @@ fn workspace_root_matches(
     workspace: &magi_workspace::WorkspaceRecord,
     canonical_path: &Path,
 ) -> bool {
-    let stored_path = workspace.native_root_path();
-    magi_core::HostPath::canonicalize(&stored_path)
-        .map(magi_core::HostPath::into_path_buf)
-        .map(|path| path == canonical_path)
-        .unwrap_or_else(|_| stored_path == canonical_path)
+    workspace
+        .source_folder_roots()
+        .into_iter()
+        .any(|stored_path| {
+            magi_core::HostPath::canonicalize(&stored_path)
+                .map(magi_core::HostPath::into_path_buf)
+                .map(|path| path == canonical_path)
+                .unwrap_or_else(|_| stored_path == canonical_path)
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,8 +349,11 @@ async fn remove_workspace(
     State(state): State<ApiState>,
     Json(request): Json<RemoveWorkspaceRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let workspace_id = magi_core::WorkspaceId::new(request.workspace_id.trim());
+    let _project_edit = state.try_project_directory_edit(&workspace_id)?;
     let _navigation_guard = state.lock_session_navigation().await;
-    let workspace_id = magi_core::WorkspaceId::new(&request.workspace_id);
+    let _project_guards =
+        project_management::acquire_project_edit_guards(&state, &workspace_id, false).await?;
     if !state
         .workspace_registry
         .workspaces()
@@ -333,25 +389,19 @@ async fn remove_workspace(
     }
     state
         .workspace_registry
-        .deregister(&workspace_id)
+        .deregister_with_persistence(&workspace_id, |snapshot| {
+            state.persist_workspace_snapshot(snapshot)
+        })
         .map_err(|e| ApiError::internal_assembly("工作区移除失败", e))?;
-    state.persist_workspace_durable_state_for_api()?;
     publish_workspace_registry_changed(&state);
     Ok(Json(serde_json::json!({ "removed": true })))
 }
 
 async fn pick_workspace(State(state): State<ApiState>) -> Json<serde_json::Value> {
-    let workspaces = state.workspace_registry.workspaces();
-    let active_id = state.workspace_registry.active_workspace_id();
-    Json(serde_json::json!({
-        "workspaces": workspaces.iter().map(|w| serde_json::json!({
-            "workspaceId": w.workspace_id.to_string(),
-            "rootPath": w.root_path.to_string(),
-            "rootPathRef": w.root_path_ref.clone(),
-            "name": w.name.clone(),
-            "isActive": active_id.as_ref() == Some(&w.workspace_id),
-        })).collect::<Vec<_>>(),
-    }))
+    Json(
+        serde_json::json!({"workspaces": state.workspace_registry.workspaces()
+        .iter().map(|workspace| workspace_dto(&state, workspace)).collect::<Vec<_>>() }),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -397,14 +447,7 @@ async fn workspace_sessions(
         .ok_or_else(|| {
             ApiError::InvalidInput(format!("workspace 不存在: {requested_workspace_id}"))
         })?;
-    let active_id = state.workspace_registry.active_workspace_id();
-    let workspace_dto = WorkspaceDto {
-        workspace_id: workspace.workspace_id.to_string(),
-        root_path: workspace.root_path.to_string(),
-        root_path_ref: workspace.root_path_ref.clone(),
-        name: workspace.name.clone(),
-        is_active: active_id.as_ref() == Some(&workspace.workspace_id),
-    };
+    let workspace_dto = workspace_dto(&state, &workspace);
     let scoped_workspace_id = workspace.workspace_id.to_string();
     // 目录游标必须先于 SessionStore 快照读取。所有会话目录变更都先提交
     // SessionStore、再发布事件，因此这个顺序保证：游标一旦包含某个事件，
@@ -454,6 +497,101 @@ mod tests {
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         )
+    }
+
+    #[tokio::test]
+    async fn workspace_registration_write_failure_does_not_publish_registration() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let blocked = root.path().join("blocked");
+        fs::write(&blocked, b"file blocks registry directory").unwrap();
+        let state = test_state().with_runtime_persistence(Arc::new(
+            crate::state::RuntimeStatePersistence::new(
+                root.path().join("state"),
+                blocked.join("workspaces.json"),
+                root.path().join("knowledge.json"),
+            ),
+        ));
+        let events_before = state.event_bus.snapshot().next_sequence;
+        assert!(
+            register_workspace(
+                State(state.clone()),
+                Json(RegisterWorkspaceRequest {
+                    path: source.to_string_lossy().into(),
+                })
+            )
+            .await
+            .is_err()
+        );
+        assert!(state.workspace_registry.is_empty());
+        assert!(state.workspace_registry.active_workspace_id().is_none());
+        assert_eq!(state.event_bus.snapshot().next_sequence, events_before);
+        // 失败后的重试复用原目录稳定身份，不能分配另一个项目并遗失原历史。
+        let identity = magi_workspace::resolve_or_create_workspace_identity(
+            &source,
+            WorkspaceId::new("unused"),
+        )
+        .unwrap();
+        fs::remove_file(&blocked).unwrap();
+        let _ = register_workspace(
+            State(state.clone()),
+            Json(RegisterWorkspaceRequest {
+                path: source.to_string_lossy().into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.workspace_registry.workspaces()[0].workspace_id,
+            identity
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_registration_cannot_reinterpret_a_multi_directory_project() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let state = test_state();
+        let id = WorkspaceId::new("multi-project");
+        let project = state
+            .workspace_registry
+            .register_native_path(id.clone(), a)
+            .unwrap();
+        let mut second = project.primary_source_folder().clone();
+        let host = magi_core::HostPath::from_path(b.clone());
+        second.source_folder_id = "second".into();
+        second.path = AbsolutePath::new(host.display_string());
+        second.path_ref = host.to_path_ref().as_str().into();
+        let mut folders = project.source_folders;
+        folders.push(second);
+        state
+            .workspace_registry
+            .edit_project(
+                &id,
+                1,
+                magi_workspace::WorkspaceProjectEdit {
+                    name: None,
+                    source_folders: folders,
+                    primary_source_folder_id: project.primary_source_folder_id,
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let events_before = state.event_bus.snapshot().next_sequence;
+        let result = register_workspace(
+            State(state.clone()),
+            Json(RegisterWorkspaceRequest {
+                path: b.to_string_lossy().into(),
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(ApiError::Conflict(_))));
+        assert_eq!(state.workspace_registry.workspaces().len(), 1);
+        assert_eq!(state.event_bus.snapshot().next_sequence, events_before);
     }
 
     #[tokio::test]
@@ -1156,7 +1294,7 @@ mod tests {
         assert_eq!(payload["workspace"]["workspaceId"], workspace_id.as_str());
         assert_eq!(
             payload["workspace"]["rootPath"],
-            root.to_string_lossy().as_ref()
+            root.canonicalize().unwrap().to_string_lossy().as_ref()
         );
         assert!(payload.get("sessionId").is_none());
         let sessions = payload["sessions"]

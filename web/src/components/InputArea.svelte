@@ -57,11 +57,14 @@
   } from '../shared/access-profile';
   import {
     composerWorkspaceState,
+    selectedComposerSourceFolderId,
+    composerSourceFolderForPath,
+    selectComposerSourceFolder,
     resolveComposerWorkspace,
     setComposerHasUnsavedInput,
     type ComposerWorkspaceOption,
   } from '../stores/composer-workspace.svelte';
-  import { openWorkspaceFolderPicker } from '../stores/workspace-onboarding.svelte';
+  import { openWorkspaceFolderPicker, requestProjectCreation } from '../stores/workspace-onboarding.svelte';
   import {
     navigateSession,
     sessionNavigationState,
@@ -149,6 +152,7 @@
   }
 
   interface QueuedMessageEdit {
+    sourceFolderId?: string;
     queueId: string;
     revision: number;
     sessionId: string;
@@ -157,6 +161,7 @@
   }
 
   interface ComposerSubmissionDraft {
+    sourceFolderId?: string;
     queuedEdit?: QueuedMessageEdit | null;
     accessProfile?: AccessProfile;
     text: string;
@@ -373,6 +378,103 @@
   let settingsBootstrapRefreshKey = '';
   let settingsBootstrapRefreshSeq = 0;
   let workspacePickerOpen = $state(false);
+  let sourceFolderSearch = $state('');
+  let workspaceTrigger = $state<HTMLButtonElement | null>(null);
+  let workspacePopover = $state<HTMLDivElement | null>(null);
+  let sourceFolderPickerOpen = $state(false);
+  let sourceFolderTrigger = $state<HTMLButtonElement | null>(null);
+  let sourceFolderPopover = $state<HTMLDivElement | null>(null);
+  const workspacePopoverId = $props.id();
+  const sourceFolderPopoverId = `${workspacePopoverId}-source-folder`;
+
+  function fitContextPopover(node: HTMLElement) {
+    let frame = 0;
+    const fit = () => {
+      node.style.translate = 'none';
+      const rect = node.getBoundingClientRect();
+      const viewport = window.visualViewport;
+      const start = (viewport?.offsetLeft || 0) + 12;
+      const end = (viewport?.offsetLeft || 0) + (viewport?.width || window.innerWidth) - 12;
+      node.style.translate = `${rect.left < start ? start - rect.left : rect.right > end ? end - rect.right : 0}px 0`;
+    };
+    // 等工具栏响应式布局完成，再按最终位置约束弹层。
+    const scheduleFit = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(fit);
+    };
+    const observer = new ResizeObserver(scheduleFit);
+    observer.observe(node);
+    const toolbar = node.closest('.ia-actions');
+    if (toolbar) observer.observe(toolbar);
+    window.addEventListener('resize', scheduleFit);
+    window.visualViewport?.addEventListener('resize', scheduleFit);
+    window.visualViewport?.addEventListener('scroll', scheduleFit);
+    scheduleFit();
+    return { destroy() {
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+      window.removeEventListener('resize', scheduleFit);
+      window.visualViewport?.removeEventListener('resize', scheduleFit);
+      window.visualViewport?.removeEventListener('scroll', scheduleFit);
+    } };
+  }
+
+  function closeWorkspacePicker(restoreFocus = true): void {
+    workspacePickerOpen = false;
+    sourceFolderSearch = '';
+    if (restoreFocus) workspaceTrigger?.focus();
+  }
+
+  async function openSourceFolderPicker(last = false): Promise<void> {
+    if (!composerWorkspace || (composerWorkspace.sourceFolders?.length || 0) <= 1 || sessionInputLocked || isInteractionBlocking || editingQueuedMessage || editingTurn) return;
+    sourceFolderSearch = '';
+    sourceFolderPickerOpen = true;
+    workspacePickerOpen = false;
+    await tick();
+    if (!sourceFolderPickerOpen) return;
+    const options = sourceFolderPopover?.querySelectorAll<HTMLButtonElement>('[role="option"]:not(:disabled)');
+    const selected = sourceFolderPopover?.querySelector<HTMLButtonElement>('[aria-selected="true"]:not(:disabled)');
+    if (last) options?.[options.length - 1]?.focus();
+    else (selected || options?.[0])?.focus();
+  }
+
+  function closeSourceFolderPicker(restoreFocus = true): void {
+    sourceFolderPickerOpen = false;
+    sourceFolderSearch = '';
+    if (restoreFocus) sourceFolderTrigger?.focus();
+  }
+
+  async function openWorkspacePicker(last = false): Promise<void> {
+    if (!isDraftSession || sessionInputLocked || isInteractionBlocking) return;
+    sourceFolderPickerOpen = false;
+    workspacePickerOpen = true;
+    await tick();
+    if (!workspacePickerOpen) return;
+    const options = workspacePopover?.querySelectorAll<HTMLButtonElement>('[role="option"]:not(:disabled)');
+    const selected = workspacePopover?.querySelector<HTMLButtonElement>('[aria-selected="true"]:not(:disabled)');
+    if (last) options?.[options.length - 1]?.focus();
+    else (selected || options?.[0])?.focus();
+  }
+
+  function handleContextPickerKeys(event: KeyboardEvent, popover: HTMLDivElement | null, closePicker: () => void): void {
+    if (event.isComposing || event.keyCode === 229) return;
+    if (event.key === 'Escape') {
+      event.preventDefault(); event.stopPropagation(); closePicker(); return;
+    }
+    const fromSearch = event.target instanceof HTMLInputElement;
+    if (fromSearch && !['ArrowDown', 'ArrowUp'].includes(event.key)) return;
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+    const target = event.target as HTMLElement;
+    const list = target.closest('[role="listbox"]') || (fromSearch ? target.nextElementSibling : popover);
+    const options = Array.from(list?.querySelectorAll<HTMLButtonElement>('[role="option"]:not(:disabled)') || []);
+    if (!options.length) return;
+    event.preventDefault();
+    const index = options.indexOf(target as HTMLButtonElement);
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? options.length - 1
+      : event.key === 'ArrowDown' ? (index + 1) % options.length
+      : (index <= 0 ? options.length : index) - 1;
+    options[next].focus();
+  }
   let accessProfilePickerOpen = $state(false);
   let selectedAccessProfile = $state<AccessProfile>('restricted');
   const currentPickerModel = $derived.by(() => readOrchestratorModel());
@@ -467,6 +569,7 @@
   const stopLoading = $derived(messagesState.interruptPendingSessions.has(currentSessionId?.trim() || ''));
   const currentWorkspaceId = $derived(messagesState.currentWorkspaceId);
   const currentWorkspacePath = $derived(messagesState.currentWorkspacePath);
+  const selectedSourceFolderId = $derived(selectedComposerSourceFolderId(currentWorkspaceId || '', currentSessionId));
   const isDraftSession = $derived.by(() => !currentSessionId?.trim());
   /**
    * 会话方向边界。已有本地 canonical 历史时不提供“导入 Web”
@@ -500,10 +603,14 @@
       : resolveComposerWorkspace(currentWorkspaceId, currentWorkspacePath)
   ));
   const workspaceOptions = $derived.by(() => composerWorkspaceState.workspaces);
+  const filteredSourceFolders = $derived((composerWorkspace?.sourceFolders || []).filter(folder =>
+    `${folder.name || ''} ${folder.path}`.toLocaleLowerCase().includes(sourceFolderSearch.trim().toLocaleLowerCase())));
+  const selectedSourceFolder = $derived(composerWorkspace?.sourceFolders?.find((folder) => folder.sourceFolderId === selectedSourceFolderId));
   const filteredPickerWebEngines = $derived(pickerWebEngines.filter(engine => `${engine.displayName} ${engine.id}`.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())));
   const filteredWorkspaces = $derived(workspaceOptions.filter(workspace => `${workspace.name} ${workspace.rootPath}`.toLocaleLowerCase().includes(workspaceSearch.trim().toLocaleLowerCase())));
   $effect(() => { if (!pickerOpen || pickerModels.length + pickerWebEngines.length <= 10) modelSearch = ''; });
   $effect(() => { if (!workspacePickerOpen || workspaceOptions.length <= 10) workspaceSearch = ''; });
+  $effect(() => { if (!sourceFolderPickerOpen || (composerWorkspace?.sourceFolders?.length || 0) <= 10) sourceFolderSearch = ''; });
   const agentRunState = $derived(getAgentRunState(currentSessionId, currentWorkspaceId));
 
   function currentComposerReferenceScopeKey(): string {
@@ -519,6 +626,8 @@
   $effect(() => onDraftSessionAdopted((workspaceId, sessionId) => {
     // 首条消息的接纳是同一会话的绑定交接，期间继续输入的草稿也随之保留。
     const previousScopeKey = composerReferenceScopeKey;
+    const draftDirectory = selectedComposerSourceFolderId(workspaceId, '');
+    selectComposerSourceFolder(workspaceId, sessionId, draftDirectory);
     composerReferenceScopeKey = [workspaceId, messagesState.currentWorkspacePath?.trim() || '', sessionId].join('\u0000');
     const draft = scopedComposerDrafts.get(previousScopeKey);
     if (draft) scopedComposerDrafts.set(composerReferenceScopeKey, draft);
@@ -784,6 +893,8 @@
       scopedComposerDrafts.delete(composerReferenceScopeKey);
     }
     editingQueuedMessage = null;
+    sourceFolderPickerOpen = false;
+    sourceFolderSearch = '';
     queueEditConflict = '';
     inputValue = '';
     selectedImages = [];
@@ -952,6 +1063,7 @@
 
   function captureComposerSubmissionDraft(text: string): ComposerSubmissionDraft {
     return {
+      sourceFolderId: selectedSourceFolderId || undefined,
       queuedEdit: editingQueuedMessage ? { ...editingQueuedMessage } : null,
       accessProfile: selectedAccessProfile,
       text,
@@ -986,6 +1098,7 @@
   function restoreComposerSubmissionDraft(draft: ComposerSubmissionDraft): void {
     invalidateEnhanceState();
     editingQueuedMessage = draft.queuedEdit ? { ...draft.queuedEdit } : null;
+    selectComposerSourceFolder(currentWorkspaceId || '', currentSessionId, draft.sourceFolderId || '');
     queueEditConflict = '';
     if (draft.accessProfile) selectedAccessProfile = draft.accessProfile;
     inputValue = draft.text;
@@ -1627,6 +1740,7 @@
       kind: selection.isDirectory ? 'directory' : 'file',
       path: selection.displayPath,
       pathRef: selection.pathRef,
+      sourceFolderId: composerSourceFolderForPath(currentWorkspaceId || '', selection.displayPath),
       name: selection.name,
     });
     contextPickerOpen = false;
@@ -1637,6 +1751,7 @@
     kind: ComposerContextReferenceKind;
     path: string;
     pathRef?: string;
+    sourceFolderId?: string;
     name: string;
   }): boolean {
     const next = addComposerContextReference(selectedContextReferences, input);
@@ -1760,7 +1875,7 @@
   }
 
   function workspaceNavigationPath(workspace: ComposerWorkspaceOption): string {
-    // 会话和消息归属使用真实工作区路径，路径引用仅用于文件系统 API。
+    // 路径作为主要目录展示提示，项目/会话归属由 daemon 的 workspaceId 确认。
     return workspace.rootPath.trim();
   }
 
@@ -1771,7 +1886,7 @@
 
   function composerWorkspaceTitle(workspace: ComposerWorkspaceOption | null): string {
     if (!workspace) return i18n.t('input.workspace.personalHint');
-    return `${i18n.t('input.workspace.title')}: ${workspace.rootPath}`;
+    return `${i18n.t('input.workspace.title')}: ${composerWorkspaceLabel(workspace)}\n${workspace.rootPath}`;
   }
 
   function workspaceButtonLabel(workspace: ComposerWorkspaceOption | null): string {
@@ -1809,6 +1924,18 @@
     if (!isDraftSession || sessionInputLocked || isInteractionBlocking) return;
     workspacePickerOpen = false;
     openWorkspaceFolderPicker('composer');
+  }
+
+  function createProjectFromComposer(): void {
+    if (!isDraftSession || sessionInputLocked || isInteractionBlocking) return;
+    closeWorkspacePicker();
+    requestProjectCreation(workspaceTrigger);
+  }
+
+  function selectSourceFolder(sourceFolderId: string): void {
+    if (!composerWorkspace || sessionInputLocked || isInteractionBlocking || editingQueuedMessage || editingTurn) return;
+    selectComposerSourceFolder(composerWorkspace.workspaceId, currentSessionId, sourceFolderId);
+    closeSourceFolderPicker();
   }
 
   function resolveSubmissionWorkspace(): ComposerWorkspaceOption | null {
@@ -1959,6 +2086,7 @@
     }
     function handlePickerOutsidePointerDown(event: PointerEvent) {
       const target = event.target;
+      if (sourceFolderPickerOpen && !(target instanceof Element && target.closest('.ia-source-folder-wrap'))) closeSourceFolderPicker(false);
       if (workspacePickerOpen && !(target instanceof Element && target.closest('.ia-workspace-wrap'))) {
         workspacePickerOpen = false;
       }
@@ -2160,6 +2288,10 @@
       }
 
       const targetWorkspace = resolveSubmissionWorkspace();
+      if (targetWorkspace?.sourceFolders?.length && !selectedSourceFolder) {
+        addToast('warning', i18n.t('input.sourceFolderUnavailable'));
+        return;
+      }
 
       const orchestratorSessionConfig = resolveTurnOrchestratorSessionConfigPayload();
       if (!orchestratorSessionConfig) {
@@ -2176,6 +2308,7 @@
       }
       vscode.postMessage({
         type: 'executeTask',
+        sourceFolderId: targetWorkspace ? selectedSourceFolderId || undefined : undefined,
         text: submissionText,
         requestId,
         workspaceId: targetWorkspace?.workspaceId || '',
@@ -2335,8 +2468,10 @@
     const draft: ComposerSubmissionDraft = {
       accessProfile: isAccessProfile(target.accessProfile) ? target.accessProfile : selectedAccessProfile,
       queuedEdit: { queueId: target.id, revision: target.revision, sessionId: messagesState.currentSessionId || '',
+        sourceFolderId: target.sourceFolderId,
         workspaceId: target.workspaceId || '', workspacePath: target.workspacePath || '' },
       text: (target.text ?? target.content ?? '').toString(),
+      sourceFolderId: target.sourceFolderId,
       images: (target.images ?? []).map((image) => ({
         id: generateId(),
         dataUrl: image.dataUrl,
@@ -2391,6 +2526,7 @@
           expectedRevision: target.revision, editRequestId, request: {
             scope: target.workspaceId || target.workspacePath ? 'workspace' : 'personal',
             sessionId: target.sessionId, workspaceId: target.workspaceId || null, workspacePath: target.workspacePath || null,
+            sourceFolderId: target.sourceFolderId || null,
             text, skillName: selectedSkill?.skillId ?? null, goalMode: selectedGoalMode, command: selectedSessionCommand,
             workflowId: selectedWorkflow?.workflowId ?? null, pluginCommandId: selectedPluginCommand?.pluginCommandId ?? null,
             accessProfile: selectedAccessProfile, locale: i18n.locale,
@@ -2549,9 +2685,7 @@
     return withOrchestratorReasoningEffort(
       config,
       readOrchestratorReasoningEffort(),
-      typeof config.model === 'string' && config.model.trim()
-        ? {}
-        : { model },
+      { model },
     );
   }
 
@@ -2577,6 +2711,7 @@
     return resolveOrchestratorModel(
       getCurrentOrchestratorSessionConfigSnapshot(),
       getEffectiveOrchestratorConfigSnapshot(),
+      pickerModels,
     );
   }
 
@@ -2678,7 +2813,7 @@
     messagesState.settingsBootstrapSnapshot = {
       ...snapshot,
       orchestratorReasoningCapability: capability,
-      orchestratorSessionDefaults: { ...sessionConfig },
+      ...(!sessionConfig.engineId ? { orchestratorSessionDefaults: { ...sessionConfig } } : {}),
       orchestratorSessionConfig: { ...sessionConfig },
       effectiveOrchestratorConfig: { ...effectiveConfig },
     } as AgentSettingsBootstrapSnapshot;
@@ -2688,16 +2823,13 @@
     const snapshot = messagesState.settingsBootstrapSnapshot;
     if (snapshot && settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
       const currentSessionConfig = objectRecord(snapshot.orchestratorSessionConfig);
-      const currentModel = typeof currentSessionConfig.model === 'string'
-        ? currentSessionConfig.model.trim()
-        : '';
-      const resolvedSessionConfig = currentModel
-        ? currentSessionConfig
-        : { ...defaults, ...currentSessionConfig };
+      const currentModel = resolveOrchestratorModel(currentSessionConfig, undefined, pickerModels);
+      const shouldInitialize = !currentModel && (isDraftSession || !currentSessionConfig.model);
+      const resolvedSessionConfig = { ...currentSessionConfig, ...defaults };
       messagesState.settingsBootstrapSnapshot = {
         ...snapshot,
         orchestratorSessionDefaults: { ...defaults },
-        ...(!currentModel ? {
+        ...(shouldInitialize ? {
           orchestratorSessionConfig: { ...resolvedSessionConfig },
           effectiveOrchestratorConfig: {
             ...snapshot.orchestratorConfig,
@@ -2707,7 +2839,11 @@
       } as AgentSettingsBootstrapSnapshot;
     }
     if (isDraftSession) {
-      messagesState.draftOrchestratorSessionConfig = { ...defaults, ...messagesState.draftOrchestratorSessionConfig };
+      const draftConfig = messagesState.draftOrchestratorSessionConfig;
+      const draftModel = resolveOrchestratorModel(draftConfig, undefined, pickerModels);
+      messagesState.draftOrchestratorSessionConfig = draftModel
+        ? { ...defaults, ...draftConfig }
+        : { ...draftConfig, ...defaults };
     }
   }
 
@@ -3193,14 +3329,14 @@
             </div>
             <div class="ia-queue-actions">
               {#if queued.interruptTurnId && queued.interruptionError}
-                <button type="button" class="ia-queue-action dock-btn"
+                <button type="button" class="ia-queue-action btn btn--secondary btn--sm"
                   onclick={() => vscode.postMessage({ type: 'retryQueuedMessage', queuedMessageId: queued.id, expectedRevision: queued.revision })}
                 >{i18n.t('input.followUp.retry')}</button>
               {/if}
               {#if !queued.interruptTurnId}
               <button
                 type="button"
-                class="ia-queue-action ia-queue-guide dock-btn"
+                class="ia-queue-action ia-queue-guide btn btn--secondary btn--sm"
                 disabled={!guideAvailable}
                 onclick={() => guideQueuedMessage(queued)}
                 title={guideQueuedMessageTitle(queued)}
@@ -3603,70 +3739,133 @@
           <button
             type="button"
             class="ia-workspace-btn"
-            aria-haspopup="listbox"
+            bind:this={workspaceTrigger}
+            aria-haspopup="dialog"
             class:active={workspacePickerOpen}
             class:configured={composerWorkspace !== null}
             class:locked={!isDraftSession}
             onclick={() => {
-              if (isDraftSession) {
-                workspacePickerOpen = !workspacePickerOpen;
+              if (workspacePickerOpen) closeWorkspacePicker(false);
+              else void openWorkspacePicker();
+            }}
+            onkeydown={(event) => {
+              if (event.key === 'Escape' && workspacePickerOpen) {
+                event.preventDefault(); event.stopPropagation(); closeWorkspacePicker();
+              } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                event.preventDefault(); void openWorkspacePicker(event.key === 'ArrowUp');
               }
             }}
             disabled={sessionInputLocked || isInteractionBlocking}
             title={workspaceButtonTitle(composerWorkspace)}
+            aria-label={workspaceButtonTitle(composerWorkspace)}
             aria-expanded={workspacePickerOpen}
+            aria-controls={workspacePopoverId}
             aria-disabled={!isDraftSession || sessionInputLocked || isInteractionBlocking}
           >
-            <Icon name="folder" size={12} />
+            <Icon name="grid" size={16} />
             <span class="ia-workspace-btn-label">{workspaceButtonLabel(composerWorkspace)}</span>
           </button>
           {#if workspacePickerOpen}
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <div class="ia-popover-backdrop" onclick={() => (workspacePickerOpen = false)}></div>
-            <div class="ia-picker-popover ia-workspace-popover" data-magi-surface="popover" role="group" aria-label={i18n.t('input.workspace.title')}>
-              <div class="ia-picker-header">{i18n.t('input.workspace.title')}</div>
-              <button type="button" class="ia-picker-item" class:selected={isPersonalSession}
-                onclick={() => selectWorkspace('')}>
-                <span class="ia-picker-item-label">{i18n.t('input.workspace.unbound')}</span>
-                <span class="ia-picker-item-desc">{i18n.t('input.workspace.personalHint')}</span>
-              </button>
-              {#if workspaceOptions.length > 10}<input type="search" class="form-input" bind:value={workspaceSearch} placeholder={i18n.t('selection.search')} aria-label={i18n.t('selection.searchFor', { label: i18n.t('input.workspace.title') })} />{/if}
-              {#if workspaceOptions.length === 0}
-                <div class="ia-picker-status">{i18n.t('input.workspace.empty')}</div>
-              {:else}
-                <div class="ia-picker-list" role="listbox" aria-label={i18n.t('input.workspace.title')}>
-                  {#each filteredWorkspaces as workspace (workspace.workspaceId)}
-                    <button
-                      type="button"
-                      class="ia-picker-item"
-                      class:selected={composerWorkspace?.workspaceId === workspace.workspaceId}
-                      role="option" aria-selected={composerWorkspace?.workspaceId === workspace.workspaceId}
-                      onclick={() => selectWorkspace(workspace.workspaceId)}
-                    >
-                      <span class="ia-picker-item-label">{workspace.name}</span>
-                      <span class="ia-picker-item-desc">{workspace.rootPath}</span>
+            <div class="ia-popover-backdrop" onclick={() => closeWorkspacePicker(false)}></div>
+            <div id={workspacePopoverId} class="ia-picker-popover ia-workspace-popover" data-magi-surface="popover" role="dialog" tabindex="-1" aria-label={i18n.t('input.workspace.title')}
+              bind:this={workspacePopover} use:fitContextPopover onkeydown={(event) => handleContextPickerKeys(event, workspacePopover, closeWorkspacePicker)}>
+              {#if isDraftSession}
+                <button type="button" class="ia-picker-item" class:selected={isPersonalSession}
+                  onclick={() => selectWorkspace('')}>
+                  <span class="ia-picker-item-label">{i18n.t('input.workspace.unbound')}</span>
+                </button>
+                {#if workspaceOptions.length > 10}<input type="search" class="form-input" bind:value={workspaceSearch} placeholder={i18n.t('selection.search')} aria-label={i18n.t('selection.searchFor', { label: i18n.t('input.workspace.title') })} />{/if}
+                {#if workspaceOptions.length === 0}
+                  <div class="ia-picker-status">{i18n.t('input.workspace.empty')}</div>
+                {:else}
+                  <div class="ia-picker-list" role="listbox" aria-label={i18n.t('input.workspace.title')}>
+                    {#each filteredWorkspaces as workspace (workspace.workspaceId)}
+                      <button
+                        type="button"
+                        class="ia-picker-item"
+                        class:selected={composerWorkspace?.workspaceId === workspace.workspaceId}
+                        role="option" aria-selected={composerWorkspace?.workspaceId === workspace.workspaceId}
+                        onclick={() => selectWorkspace(workspace.workspaceId)}
+                      >
+                        <span class="ia-picker-item-label" title={workspace.name}>{workspace.name}</span>
+                        <span class="ia-picker-item-desc" dir="ltr" title={workspace.rootPath}>{workspace.rootPath}</span>
+                      </button>
+                    {:else}
+                      <div class="ia-picker-status" role="status">{i18n.t('selection.empty')}</div>
+                    {/each}
+                  </div>
+                {/if}
+              {/if}
+              {#if isDraftSession}
+                <div class="ia-picker-divider"></div>
+                <button type="button" class="ia-picker-item ia-picker-row ia-workspace-action" onclick={createProjectFromComposer}>
+                  <span class="ia-workspace-action-label"><Icon name="plus" size={16} /><span class="ia-picker-item-label">{i18n.t('web.createProjectTitle')}</span></span>
+                </button>
+                <button
+                  type="button"
+                  class="ia-picker-item ia-picker-row ia-workspace-action"
+                  onclick={useExistingWorkspaceFolder}
+                >
+                  <span class="ia-workspace-action-label">
+                    <Icon name="folder" size={13} />
+                    <span class="ia-picker-item-label">{i18n.t('input.workspace.useExistingFolder')}</span>
+                  </span>
+                  <Icon name="chevron-right" size={11} />
+                </button>
+              {/if}
+            </div>
+          {/if}
+        </div>
+        {#if composerWorkspace && (composerWorkspace.sourceFolders?.length || 0) > 1}
+          <div class="ia-picker-wrap ia-source-folder-wrap">
+            <button type="button" class="ia-workspace-btn" class:active={sourceFolderPickerOpen}
+              bind:this={sourceFolderTrigger}
+              aria-haspopup="dialog" aria-expanded={sourceFolderPickerOpen} aria-controls={sourceFolderPopoverId}
+              aria-label={`${i18n.t('input.sourceFolderTitle')}: ${selectedSourceFolder?.path || i18n.t('input.sourceFolderUnavailable')}`}
+              title={`${i18n.t('input.sourceFolderTitle')}: ${selectedSourceFolder?.path || i18n.t('input.sourceFolderUnavailable')}`}
+              disabled={sessionInputLocked || isInteractionBlocking || Boolean(editingQueuedMessage || editingTurn)}
+              onkeydown={(event) => {
+                if (event.key === 'Escape' && sourceFolderPickerOpen) {
+                  event.preventDefault(); event.stopPropagation(); closeSourceFolderPicker();
+                } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                  event.preventDefault(); void openSourceFolderPicker(event.key === 'ArrowUp');
+                }
+              }}
+              onclick={() => { if (sourceFolderPickerOpen) closeSourceFolderPicker(false); else void openSourceFolderPicker(); }}>
+              <Icon name="folder" size={16} />
+              <bdi class="ia-workspace-btn-label">{selectedSourceFolder?.name || selectedSourceFolder?.path.split(/[\\/]/).filter(Boolean).at(-1) || i18n.t('input.sourceFolderTitle')}</bdi>
+            </button>
+            {#if sourceFolderPickerOpen}
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <div class="ia-popover-backdrop" onclick={() => closeSourceFolderPicker(false)}></div>
+              <div id={sourceFolderPopoverId} class="ia-picker-popover ia-source-folder-popover" data-magi-surface="popover" role="dialog" tabindex="-1"
+                aria-label={i18n.t('input.sourceFolderTitle')} bind:this={sourceFolderPopover}
+                use:fitContextPopover onkeydown={(event) => handleContextPickerKeys(event, sourceFolderPopover, closeSourceFolderPicker)}>
+                {#if (composerWorkspace.sourceFolders?.length || 0) > 10}
+                  <input type="search" class="form-input" bind:value={sourceFolderSearch}
+                    placeholder={i18n.t('selection.search')}
+                    aria-label={i18n.t('selection.searchFor', { label: i18n.t('input.sourceFolderTitle') })} />
+                {/if}
+                <div role="listbox" aria-label={i18n.t('input.sourceFolderTitle')}>
+                  {#each filteredSourceFolders as folder (folder.sourceFolderId)}
+                    <button type="button" class="ia-picker-item" class:selected={selectedSourceFolderId === folder.sourceFolderId}
+                      role="option" aria-selected={selectedSourceFolderId === folder.sourceFolderId}
+                      disabled={sessionInputLocked || isInteractionBlocking || Boolean(editingQueuedMessage || editingTurn)}
+                      onclick={() => selectSourceFolder(folder.sourceFolderId)}>
+                      <span class="ia-picker-item-label" title={folder.name || folder.path.split(/[\\/]/).filter(Boolean).at(-1)}><bdi>{folder.name || folder.path.split(/[\\/]/).filter(Boolean).at(-1)}</bdi>{#if folder.isPrimary} · {i18n.t('input.primarySourceFolder')}{/if}</span>
+                      <span class="ia-picker-item-desc" dir="ltr" title={folder.path}>{folder.path}</span>
                     </button>
                   {:else}
                     <div class="ia-picker-status" role="status">{i18n.t('selection.empty')}</div>
                   {/each}
                 </div>
-              {/if}
-              <div class="ia-picker-divider"></div>
-              <button
-                type="button"
-                class="ia-picker-item ia-picker-row ia-workspace-action"
-                onclick={useExistingWorkspaceFolder}
-              >
-                <span class="ia-workspace-action-label">
-                  <Icon name="folder" size={13} />
-                  <span class="ia-picker-item-label">{i18n.t('input.workspace.useExistingFolder')}</span>
-                </span>
-                <Icon name="chevron-right" size={11} />
-              </button>
-            </div>
-          {/if}
-        </div>
+              </div>
+            {/if}
+          </div>
+        {/if}
         <GitContextControl
           workspace={composerWorkspace}
           sessionId={persistedSessionId}
@@ -3837,7 +4036,7 @@
                     {pickerError}
                     <button
                       type="button"
-                      class="ia-picker-retry"
+                      class="btn btn--secondary btn--sm ia-picker-retry"
                       onclick={() => { pickerError = null; loadPickerModels(); }}
                     >{i18n.t('input.mainModelPicker.retry')}</button>
                   </div>
@@ -4015,7 +4214,7 @@
           {#if hasContent}
             <button
               type="button"
-              class="ia-queue-action dock-btn"
+              class="ia-queue-action btn btn--secondary btn--sm"
               data-testid="input-replace-button"
               onclick={() => interruptTargetTurnId && sendMessage(interruptTargetTurnId)}
               disabled={sessionInputLocked || sendPreparing || pendingImageReadCount > 0 || !mainModelReady || !interruptTargetTurnId || Boolean(editingTurn || editingQueuedMessage || selectedSessionCommand || selectedPluginCommand)}
@@ -4115,12 +4314,12 @@
         }}
       ></textarea>
       <div class="browser-annotation-edit-actions">
-        <button type="button" onclick={closeBrowserAnnotationEditing} disabled={browserAnnotationSaving}>
+        <button type="button" class="btn btn--secondary btn--sm" onclick={closeBrowserAnnotationEditing} disabled={browserAnnotationSaving}>
           {i18n.t('browser.annotation.cancel')}
         </button>
         <button
           type="button"
-          class="primary"
+          class="btn btn--primary btn--sm"
           onclick={() => void saveBrowserAnnotationEditing()}
           disabled={browserAnnotationSaving || !editingBrowserAnnotationComment.trim()}
         >
@@ -4477,9 +4676,13 @@
   .ia-workspace-wrap {
     max-width: 190px;
   }
-  .ia-workspace-popover {
+  .ia-picker-popover:is(.ia-workspace-popover, .ia-source-folder-popover) {
     right: auto;
     left: 0;
+    /* 项目与源文件夹都是名称 + 单行路径，收敛宽度后以省略提示保持信息密度。 */
+    width: min(280px, calc(100vw - 24px));
+    box-sizing: border-box;
+    max-height: min(264px, 56dvh);
   }
   .ia-picker-btn {
     display: inline-flex;
@@ -5011,6 +5214,10 @@
     font-size: var(--text-xs);
     color: var(--foreground-muted);
     line-height: 1.4;
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    unicode-bidi: isolate;
   }
   .ia-picker-list {
     display: flex;
@@ -5019,6 +5226,21 @@
     padding-top: 4px;
     margin-top: 4px;
     border-top: 1px dashed var(--border-subtle);
+  }
+  :is(.ia-workspace-popover, .ia-source-folder-popover) .ia-picker-item { min-inline-size: 0; text-align: start; }
+  :is(.ia-workspace-popover, .ia-source-folder-popover) .ia-picker-item-label,
+  :is(.ia-workspace-popover, .ia-source-folder-popover) .ia-picker-item-desc { inline-size: 100%; }
+  :is(.ia-workspace-popover, .ia-source-folder-popover) .ia-picker-item-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    word-break: normal;
+  }
+  :is(.ia-workspace-popover, .ia-source-folder-popover) .ia-picker-item-desc[dir="ltr"] {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    word-break: normal;
   }
   .ia-picker-status {
     font-size: var(--text-xs);
@@ -5032,22 +5254,6 @@
     flex-direction: column;
     gap: 6px;
     align-items: center;
-  }
-  .ia-picker-retry {
-    align-self: center;
-    padding: 2px 10px;
-    font-size: var(--text-xs);
-    background: transparent;
-    border: 0;
-    border-radius: var(--radius-full);
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
-  .ia-picker-retry:hover {
-    background: color-mix(in srgb, var(--primary) 12%, transparent);
-    border-color: color-mix(in srgb, var(--primary) 38%, transparent);
-    color: var(--primary);
   }
 
   /* 斜杠快捷引用：Goal 与 Skill 共用一套稳定的结构化展示。 */
@@ -5152,25 +5358,6 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 10px;
-  }
-  .browser-annotation-edit-actions button {
-    min-height: 30px;
-    padding: 0 10px;
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--surface-1);
-    color: var(--foreground);
-    font: inherit;
-    cursor: pointer;
-  }
-  .browser-annotation-edit-actions button.primary {
-    border-color: var(--accent);
-    background: var(--accent);
-    color: var(--accent-foreground, white);
-  }
-  .browser-annotation-edit-actions button:disabled {
-    opacity: .5;
-    cursor: default;
   }
 
   .ia-slash-popover {
@@ -5487,4 +5674,20 @@
     }
   }
 
+  .ia-workspace-btn:active:not(:disabled), .ia-picker-item:active {
+    background: var(--surface-active, var(--surface-hover));
+  }
+  @media (hover: none), (pointer: coarse) {
+    .ia-actions { flex-wrap: wrap; gap: 8px; }
+    .ia-left { flex: 1 1 100%; flex-wrap: wrap; gap: 8px; max-width: 100%; }
+    .ia-right { flex: 1 1 100%; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+    .ia-runtime-controls, .ia-submit-controls { flex-wrap: wrap; gap: 8px; }
+    .ia-workspace-wrap { flex: 0 1 auto; inline-size: auto; max-inline-size: 100%; }
+    .ia-workspace-btn {
+      inline-size: auto; min-inline-size: 44px; max-inline-size: 100%;
+      block-size: auto; min-block-size: 44px; padding: 10px 12px; line-height: 1.5;
+    }
+    .ia-workspace-btn-label { display: inline; max-inline-size: 160px; }
+    :is(.ia-workspace-popover, .ia-source-folder-popover) .ia-picker-item { min-block-size: 44px; padding-block: 8px; }
+  }
 </style>

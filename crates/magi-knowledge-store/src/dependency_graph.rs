@@ -122,7 +122,9 @@ impl DependencyGraph {
             if meta.len() > 500 * 1024 {
                 continue;
             }
-            if let Ok(content) = std::fs::read_to_string(&full_path) {
+            if let Ok(content) =
+                crate::code_scanner::read_index_file(std::path::Path::new(project_root), path)
+            {
                 self.parse_imports(path, &content);
             }
         }
@@ -311,7 +313,9 @@ impl DependencyGraph {
         if meta.len() > 500 * 1024 {
             return;
         }
-        if let Ok(content) = std::fs::read_to_string(&full_path) {
+        if let Ok(content) =
+            crate::code_scanner::read_index_file(std::path::Path::new(project_root), file_path)
+        {
             self.parse_imports(file_path, &content);
         }
     }
@@ -612,8 +616,10 @@ fn resolve_python(
 impl DependencyGraph {
     fn load_tsconfig_paths(&mut self, project_root: &str) {
         self.path_aliases.clear();
-        let tsconfig_path = format!("{}/tsconfig.json", project_root);
-        let Ok(raw) = std::fs::read_to_string(&tsconfig_path) else {
+        let Ok(raw) = crate::code_scanner::read_index_file(
+            std::path::Path::new(project_root),
+            "tsconfig.json",
+        ) else {
             return;
         };
 

@@ -659,6 +659,10 @@ pub struct SessionContextReference {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "pathRef")]
     pub path_ref: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "sourceFolderId")]
+    pub source_folder_id: Option<String>,
     pub name: String,
 }
 
@@ -755,6 +759,10 @@ pub struct TurnStartParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "workspacePath")]
     pub workspace_path: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "sourceFolderId")]
+    pub source_folder_id: Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -2767,6 +2775,10 @@ pub struct QueuedSessionTurn {
     pub workspace_id: Option<String>,
     #[serde(rename = "workspacePath")]
     pub workspace_path: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "sourceFolderId")]
+    pub source_folder_id: Option<String>,
     #[serde(rename = "acceptedAt")]
     pub accepted_at: u64,
     pub content: String,

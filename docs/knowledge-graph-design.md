@@ -15,6 +15,10 @@
 
 文件和符号使用工作区相对路径，行号只作为证据，不作为身份。Project Memory、Session 和 Task 不进入主图谱。
 
+多源项目的索引键还包含 `sourceFolderId + executionRoot`，图谱文件/符号节点使用作用域前缀，因此不同源目录的同名相对路径不会合并。隔离副本与源目录共用源身份，但使用各自实际执行根的索引；知识关系 mutation 的作用域必须与原记录一致。多源项目的代码索引、图谱和关系列表请求省略目录身份时明确拒绝。项目共享 ADR、FAQ、Learning 的读取与管理仍按项目 ID 进行。
+
+后台刷新从实际执行根反查源目录，无法归属的副本不写入项目默认索引。工具查询按路径策略过滤索引结果，并在读盘时重新检查路径和符号链接。自动上下文缓存包含源身份和执行根；实际映射尚未准备时只提供共享文本知识，不借旧单根图谱推断目录事实。
+
 派生关系包括工作区包含文件、文件包含符号及文件依赖文件，不复制到 knowledge.json。持久化关系包括知识到文件/符号的 applies_to、explains、references，以及知识之间的 related_to、supersedes、contradicts。
 
 关系来源为 deterministic_code、explicit_user、explicit_agent、inferred；状态为 active、candidate、dangling、rejected。每条关系保留来源、状态、可选置信度和证据摘要。非法路径、非法置信度及跨工作区关系须拒绝。

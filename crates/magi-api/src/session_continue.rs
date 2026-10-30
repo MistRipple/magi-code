@@ -852,10 +852,20 @@ where
     let workspace_id = state
         .session_workspace_id(&session)
         .or_else(|| chain.workspace_id.clone());
-    let execution_root = if workspace_id.is_none() {
-        Some(state.personal_session_execution_root(session_id)?)
+    let binding = crate::task_dispatch::validate_or_migrate_directory_binding(
+        state,
+        workspace_id.as_ref(),
+        root_task
+            .executor_binding
+            .as_ref()
+            .and_then(|binding| binding.project_directories.clone()),
+    )?;
+    let execution_root = if let Some(binding) = binding.as_ref() {
+        Some(crate::task_dispatch::bound_project_execution_root(
+            state, session_id, binding,
+        )?)
     } else {
-        state.session_isolation_root(session_id)
+        Some(state.personal_session_execution_root(session_id)?)
     };
 
     let primary_branch = branches_to_resume

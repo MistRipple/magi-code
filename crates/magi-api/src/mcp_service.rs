@@ -65,7 +65,9 @@ impl ToolSchemaProvider for BuiltinSchemas {
                 return Some(ToolSchema {
                     description: "列出该客户端在 Magi 中产生的待处理变更（路径、变更类型、大小、是否可回退）。"
                         .to_string(),
-                    input_schema: serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+                    input_schema: serde_json::json!({ "type": "object", "properties": {
+                        "source_folder_id": {"type":"string","minLength":1,"description":"本次获授的源目录 ID；省略使用令牌或原 Turn 的默认目录"}
+                    }, "additionalProperties": false }),
                 });
             }
             CHANGES_REVERT => {
@@ -75,6 +77,7 @@ impl ToolSchemaProvider for BuiltinSchemas {
                     input_schema: serde_json::json!({
                         "type": "object",
                         "properties": {
+                            "source_folder_id": {"type":"string","minLength":1,"description":"本次获授的源目录 ID；省略使用令牌或原 Turn 的默认目录"},
                             "paths": {
                                 "type": "array",
                                 "items": { "type": "string" },
@@ -113,14 +116,38 @@ pub(crate) fn workspace_name(state: &ApiState, workspace_id: &str) -> Option<Str
         .map(|workspace| {
             workspace
                 .name
+                .clone()
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| {
-                    Path::new(workspace.root_path.as_str())
+                    Path::new(workspace.primary_source_folder().path.as_str())
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| workspace.root_path.to_string())
+                        .unwrap_or_else(|| workspace.primary_source_folder().path.to_string())
                 })
         })
+}
+
+impl RegistryWorkspaces {
+    fn web_turn(
+        &self,
+        principal: &magi_mcp_server::ClientPrincipal,
+        target: &AttributionTarget,
+    ) -> Result<magi_session_store::CanonicalTurn, String> {
+        let AttributionTarget::WebSlotTurn {
+            session_id,
+            turn_id,
+            canonical_turn_id,
+        } = target
+        else {
+            return Err("调用不是 GPT Web Turn".into());
+        };
+        self.state.web_turn_for_slot(
+            session_id,
+            &principal.workspace_id,
+            turn_id.parse().map_err(|_| "GPT Web 槽位代际无效")?,
+            canonical_turn_id,
+        )
+    }
 }
 
 impl WorkspaceResolver for RegistryWorkspaces {
@@ -134,37 +161,79 @@ impl WorkspaceResolver for RegistryWorkspaces {
         principal: &magi_mcp_server::ClientPrincipal,
         target: &AttributionTarget,
     ) -> Option<PathBuf> {
-        match target {
-            AttributionTarget::ExternalSession { .. } => self.root_of(&principal.workspace_id),
-            AttributionTarget::WebSlotTurn {
-                session_id,
-                turn_id,
-            } => {
-                let (owner, active) = self.state.web_model.bindings()?.active_context()?;
-                if owner.session_id != *session_id
-                    || active.to_string() != *turn_id
-                    || owner.project_id != principal.workspace_id
-                {
-                    return None;
-                }
-                let id = SessionId::new(session_id);
-                let session = self.state.session_store.session(&id)?;
-                if session.workspace_id.as_deref().unwrap_or("") != principal.workspace_id {
-                    return None;
-                }
-                match self.state.session_workspace_id(&session) {
-                    Some(workspace) => self
-                        .state
-                        .workspace_root_path(&Some(workspace))
-                        .map(|root| self.state.snapshot_root_for_session(&id, &root)),
-                    None => self.state.personal_session_execution_root(&id).ok(),
-                }
-            }
+        if let AttributionTarget::WebSlotTurn { session_id, .. } = target
+            && principal.workspace_id.is_empty()
+        {
+            self.web_turn(principal, target).ok()?;
+            return self
+                .state
+                .personal_session_execution_root(&SessionId::new(session_id))
+                .ok();
         }
+        self.execution_directories(principal, target)
+            .ok()
+            .flatten()
+            .and_then(|map| map.root(None).and_then(|root| root.execution_root()).ok())
     }
 
     fn name_of(&self, workspace_id: &str) -> Option<String> {
         workspace_name(&self.state, workspace_id)
+    }
+
+    fn execution_directories(
+        &self,
+        principal: &magi_mcp_server::ClientPrincipal,
+        target: &AttributionTarget,
+    ) -> Result<Option<magi_core::ProjectDirectoryExecutionMap>, String> {
+        let web_turn = match target {
+            AttributionTarget::WebSlotTurn { .. } => Some(self.web_turn(principal, target)?),
+            AttributionTarget::ExternalSession { .. } => None,
+        };
+        if principal.workspace_id.is_empty() {
+            if web_turn.is_none() {
+                return Err("外部令牌缺少项目授权".into());
+            }
+            return Ok(None);
+        }
+        let workspace = WorkspaceId::new(&principal.workspace_id);
+        let original = match web_turn {
+            None => Some(
+                principal
+                    .project_directories
+                    .clone()
+                    .ok_or("令牌缺少已持久化的目录授权")?,
+            ),
+            Some(turn) => crate::task_dispatch::canonical_project_directory_binding(&turn)
+                .map_err(|error| format!("原 Web Turn 目录绑定无效: {error}"))?,
+        };
+        let binding = crate::task_dispatch::validate_or_migrate_directory_binding(
+            &self.state,
+            Some(&workspace),
+            original,
+        )
+        .map_err(|error| error.message().to_string())?
+        .ok_or("项目缺少目录授权")?;
+        let session_id = match target {
+            AttributionTarget::ExternalSession { token_id } => external_session_id(token_id),
+            AttributionTarget::WebSlotTurn { session_id, .. } => SessionId::new(session_id),
+        };
+        self.state
+            .workspace_registry
+            .validate_directory_binding(&binding)
+            .map_err(|error| error.to_string())?;
+        let map = magi_core::ProjectDirectoryExecutionMap::from_binding(&binding, |grant| {
+            let source = self
+                .state
+                .workspace_registry
+                .resolve_bound_source_directory(&binding, Some(&grant.source_folder_id))?;
+            self.state
+                .session_execution_root_for_source(&session_id, &source)
+                .map_err(|error| magi_core::DomainError::Validation {
+                    message: error.message().to_string(),
+                })
+        })
+        .map_err(|error| error.to_string())?;
+        Ok(Some(map))
     }
 }
 
@@ -365,6 +434,10 @@ impl ApiToolBackend {
             Ok(snapshot) => snapshot,
             Err(_) => return error_outcome("变更账本不可用"),
         };
+        let is_alive = liveness(&self.state, &self.tokens, invocation);
+        if !is_alive() {
+            return cancelled_outcome();
+        }
         match invocation.internal_name.as_str() {
             CHANGES_LIST => {
                 if invocation.requires_approval
@@ -431,9 +504,8 @@ impl ApiToolBackend {
                     Ok(Some(message)) => return error_outcome(message),
                     Err(message) => return error_outcome(message),
                 }
-                let cancellation = invocation.cancellation.clone();
                 let reverted = tokio::task::spawn_blocking(move || {
-                    if cancellation.is_cancelled() {
+                    if !is_alive() {
                         return Ok(None);
                     }
                     snapshot.revert(&paths).map(Some)
@@ -511,6 +583,20 @@ impl ApiToolBackend {
         })
         .await
         .map_err(|_| "审批等待意外中断".to_string())?
+    }
+
+    fn project_execution_map(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> Result<Option<magi_core::ProjectDirectoryExecutionMap>, String> {
+        let map = RegistryWorkspaces {
+            state: self.state.clone(),
+        }
+        .execution_directories(&invocation.principal, &invocation.attribution)?;
+        if map != invocation.project_directory_map {
+            return Err("调用期间项目执行映射已变化".into());
+        }
+        Ok(map)
     }
 }
 
@@ -679,13 +765,21 @@ fn liveness(
         })
         .map(|record| record.hash.clone());
     let attribution = invocation.attribution.clone();
+    let principal = invocation.principal.clone();
+    let directories = invocation.project_directory_map.clone();
     let cancellation = invocation.cancellation.clone();
     move || {
         !cancellation.is_cancelled()
+            && (RegistryWorkspaces {
+                state: state.clone(),
+            })
+            .execution_directories(&principal, &attribution)
+            .is_ok_and(|current| current == directories)
             && match &attribution {
                 AttributionTarget::WebSlotTurn {
                     session_id,
                     turn_id,
+                    ..
                 } => state
                     .web_model
                     .bindings()
@@ -844,9 +938,13 @@ impl ToolBackend for ApiToolBackend {
             // 调用都作为普通工具项写进 canonical（§8.4）：GPT Web 槽位写进拥有者会话当前的 Turn，
             // 外部令牌写进它自己外部会话的活动段 Turn。
             let target = match &invocation.attribution {
-                AttributionTarget::WebSlotTurn { session_id, .. } => Some((
+                AttributionTarget::WebSlotTurn {
+                    session_id,
+                    canonical_turn_id,
+                    ..
+                } => Some((
                     SessionId::new(session_id.clone()),
-                    None,
+                    Some(canonical_turn_id.clone()),
                     Some(magi_conversation_runtime::session_writeback::TOOL_ORIGIN_CHATGPT_WEB),
                 )),
                 AttributionTarget::ExternalSession { .. } => {
@@ -998,11 +1096,28 @@ impl ApiToolBackend {
             };
             let workspace_id = (!invocation.principal.workspace_id.is_empty())
                 .then(|| WorkspaceId::new(invocation.principal.workspace_id.clone()));
-            let Some(root) = (RegistryWorkspaces {
-                state: self.state.clone(),
-            })
-            .root_for(&invocation.principal, &invocation.attribution) else {
-                return error_outcome("令牌绑定的工作区不可用");
+            let project_directory_map = match self.project_execution_map(&invocation) {
+                Ok(map) => map,
+                Err(error) => return error_outcome(error),
+            };
+            let root = if let Some(map) = project_directory_map.as_ref() {
+                let context = magi_tool_runtime::ToolExecutionContext {
+                    workspace_id: workspace_id.clone(),
+                    project_directory_map: Some(map.clone()),
+                    ..Default::default()
+                };
+                match context.for_tool_arguments(&invocation.arguments.to_string()) {
+                    Ok(context) => context.working_directory,
+                    Err(error) => return error_outcome(error.to_string()),
+                }
+            } else {
+                RegistryWorkspaces {
+                    state: self.state.clone(),
+                }
+                .root_for(&invocation.principal, &invocation.attribution)
+            };
+            let Some(root) = root else {
+                return error_outcome("调用目录不可用");
             };
             let class = Some(invocation.class);
             if invocation.internal_name.starts_with("changes_") {
@@ -1024,13 +1139,30 @@ impl ApiToolBackend {
                 return error_outcome(format!("无法建立 Git 上下文: {}", error.message()));
             }
             // 写入类调用才需要会话账本；只读调用不触发整树快照的懒启动。
-            let snapshot = if workspace_id.is_none() || matches!(class, Some(ToolClass::Read)) {
-                None
+            let snapshots = if workspace_id.is_none() || matches!(class, Some(ToolClass::Read)) {
+                Vec::new()
             } else {
-                match self.state.ensure_snapshot_session(&session_id, &root).await {
-                    Ok(snapshot) => Some(snapshot),
-                    Err(_) => return error_outcome("变更账本不可用，已拒绝执行写入类工具"),
+                let roots = match project_directory_map
+                    .as_ref()
+                    .map(|map| {
+                        map.roots
+                            .iter()
+                            .map(|root| root.execution_root())
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()
+                {
+                    Ok(roots) => roots.unwrap_or_else(|| vec![root.clone()]),
+                    Err(error) => return error_outcome(error.to_string()),
+                };
+                let mut snapshots = Vec::new();
+                for root in roots {
+                    match self.state.ensure_snapshot_session(&session_id, &root).await {
+                        Ok(snapshot) => snapshots.push(snapshot),
+                        Err(_) => return error_outcome("变更账本不可用，已拒绝执行写入类工具"),
+                    }
                 }
+                snapshots
             };
 
             let state = self.state.clone();
@@ -1048,9 +1180,8 @@ impl ApiToolBackend {
                     &session_id,
                     workspace_id.as_ref(),
                     &root,
-                    snapshot
-                        .as_deref()
-                        .map(|s| s as &dyn magi_snapshot::ToolHook),
+                    snapshots,
+                    project_directory_map,
                 )
             })
             .await;
@@ -1149,7 +1280,8 @@ fn run_blocking(
     session_id: &SessionId,
     workspace_id: Option<&WorkspaceId>,
     root: &Path,
-    snapshot: Option<&dyn magi_snapshot::ToolHook>,
+    snapshots: Vec<Arc<magi_snapshot::SnapshotSession>>,
+    project_directory_map: Option<magi_core::ProjectDirectoryExecutionMap>,
 ) -> InvocationOutcome {
     let arguments_json = invocation.arguments.to_string();
     let safety_gate =
@@ -1197,6 +1329,9 @@ fn run_blocking(
         }
         granted = true;
     }
+    if !is_alive() {
+        return cancelled_outcome();
+    }
     let access_profile = access_profile_for(invocation.principal.profile);
     let external_call = ExternalToolCall {
         cancellation: Some(invocation.cancellation.flag()),
@@ -1206,8 +1341,10 @@ fn run_blocking(
         session_id,
         workspace_id,
         workspace_root: root,
+        project_directory_map,
+        snapshots,
         access_profile,
-        snapshot,
+        snapshot: None,
         skill_runtime: state.skill_runtime.as_deref(),
         skill_dispatch_runtime: state.skill_dispatch_runtime.as_deref(),
     };
@@ -1226,6 +1363,9 @@ fn run_blocking(
         }
         if let Err((payload, _)) = approve(&format!("{call_id}-safety")) {
             return error_outcome(payload);
+        }
+        if !is_alive() {
+            return cancelled_outcome();
         }
         result = execute_external_tool_call(
             &state.event_bus,
@@ -1330,6 +1470,17 @@ fn assemble_server(
         )
         .with_attribution(Arc::new(crate::web_slot_mcp::SlotAttribution {
             slots: slots_provider(&state),
+            canonical_turn: {
+                let sessions = state.session_store.clone();
+                Arc::new(move |id| {
+                    let session_id = SessionId::new(id);
+                    let turn_id = sessions.runtime_sidecar(&session_id)?.current_turn?.turn_id;
+                    sessions
+                        .canonical_turn_for_session_turn_id(&session_id, &turn_id)
+                        .filter(|turn| !turn.status.is_terminal())
+                        .map(|turn| turn.turn_id)
+                })
+            },
         }))
         .with_audit(Arc::new(EventBusAudit { state })),
     )
@@ -1392,7 +1543,6 @@ mod tests {
         state: ApiState,
         router: axum::Router,
         transport_session: tokio::sync::OnceCell<String>,
-        #[cfg(unix)]
         tokens: Arc<TokenStore>,
         secret: String,
         token_id: String,
@@ -1516,6 +1666,12 @@ mod tests {
         let issued = tokens
             .issue(
                 IssueTokenRequest {
+                    project_directories: Some(
+                        state
+                            .workspace_registry
+                            .capture_directory_binding(&WorkspaceId::new("ws-mcp"), None, None)
+                            .unwrap(),
+                    ),
                     client_name: "cursor".to_string(),
                     workspace_id: "ws-mcp".to_string(),
                     approval_mode,
@@ -1549,7 +1705,6 @@ mod tests {
                 tokens.clone(),
                 HttpConfig::default(),
             )),
-            #[cfg(unix)]
             tokens,
             secret: issued.secret,
             token_id: issued.record.token_id,
@@ -1985,6 +2140,196 @@ mod tests {
             "关闭保存内容后读到的内容不落库: {items:?}"
         );
         assert!(items.iter().any(|item| item.2.contains("内容未保存")));
+    }
+
+    #[tokio::test]
+    async fn project_mcp_tokens_freeze_directory_grants_and_write_each_execution_copy() {
+        let mut f = fixture_with_approval(ApprovalMode::Always, Duration::from_secs(5));
+        let second = tempfile::tempdir().unwrap();
+        let second_root = second.path().canonicalize().unwrap();
+        let project = crate::routes::test_project_fixtures::add_source(
+            &f.state,
+            "ws-mcp",
+            "second",
+            &second_root,
+        );
+        let first_id = project.primary_source_folder_id.clone();
+        let denied = rpc(&f, "tools/call", call("magi.fs.write", serde_json::json!({"source_folder_id":"second","path":"same.txt","content":"must reject"}))).await;
+        assert!(is_error(&denied), "{denied}");
+        assert!(!second_root.join("same.txt").exists());
+        f.state
+            .workspace_registry
+            .edit_project(
+                &project.workspace_id,
+                project.revision,
+                magi_workspace::WorkspaceProjectEdit {
+                    name: Some("renamed project".into()),
+                    source_folders: project.source_folders,
+                    primary_source_folder_id: "second".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let old_default = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.fs.write",
+                serde_json::json!({"path":"same.txt","content":"old default"}),
+            ),
+        )
+        .await;
+        assert!(!is_error(&old_default), "{old_default}");
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("same.txt")).unwrap(),
+            "old default"
+        );
+        assert!(!second_root.join("same.txt").exists());
+
+        let binding = f
+            .state
+            .workspace_registry
+            .capture_directory_binding(&WorkspaceId::new("ws-mcp"), Some(&first_id), None)
+            .unwrap();
+        let issued = f
+            .tokens
+            .issue(
+                IssueTokenRequest {
+                    project_directories: Some(binding),
+                    client_name: "multi root".into(),
+                    workspace_id: "ws-mcp".into(),
+                    approval_mode: ApprovalMode::Always,
+                    attribution: AttributionMode::External,
+                    ttl_ms: None,
+                    network: false,
+                },
+                UtcMillis::now().0,
+            )
+            .unwrap();
+        f.secret = issued.secret;
+        f.token_id = issued.record.token_id;
+        f.transport_session = tokio::sync::OnceCell::new();
+        std::fs::write(second_root.join("same.txt"), "second original").unwrap();
+        let copies = tempfile::tempdir().unwrap();
+        let copy_root = copies.path().canonicalize().unwrap();
+        let execution_roots = [copy_root.join("first"), copy_root.join("second")];
+        let session =
+            ensure_external_session(&f.state, &f.token_id, "multi root", "ws-mcp").unwrap();
+        for (source, execution) in [&f.root, &second_root].into_iter().zip(&execution_roots) {
+            let outcome = magi_session_isolation::create_isolated_copy(source, execution).unwrap();
+            f.state
+                .session_isolations
+                .insert(magi_session_isolation::SessionIsolation {
+                    session_id: session.to_string(),
+                    workspace_id: "ws-mcp".into(),
+                    source_root: source.clone(),
+                    root: execution.clone(),
+                    origin: magi_session_isolation::IsolationOrigin::Manual,
+                    strategy: outcome.strategy,
+                    linked_dirs: outcome.linked_dirs,
+                    git_available: outcome.git_available,
+                    created_at_ms: 1,
+                });
+        }
+        for (index, id) in [first_id.as_str(), "second"].into_iter().enumerate() {
+            let result = rpc(&f, "tools/call", call("magi.fs.write", serde_json::json!({"source_folder_id":id,"path":"same.txt","content":format!("copy {index}")}))).await;
+            assert!(!is_error(&result), "{result}");
+            assert_eq!(
+                std::fs::read_to_string(execution_roots[index].join("same.txt")).unwrap(),
+                format!("copy {index}")
+            );
+            let snapshot = f
+                .state
+                .snapshot_manager
+                .get_session_for_workspace(session.as_str(), &execution_roots[index])
+                .unwrap();
+            let changes = snapshot.pending_changes().unwrap();
+            let same = changes
+                .iter()
+                .find(|change| change.path == "same.txt")
+                .unwrap();
+            assert_eq!(same.source, magi_snapshot::SourceKind::Tool);
+            assert!(same.tool_call_id.is_some());
+        }
+        let result = rpc(&f, "tools/call", call("magi.fs.copy", serde_json::json!({"source":execution_roots[0].join("same.txt"),"destination":execution_roots[1].join("copied.txt")}))).await;
+        assert!(!is_error(&result), "{result}");
+        assert_eq!(
+            std::fs::read_to_string(execution_roots[1].join("copied.txt")).unwrap(),
+            "copy 0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("same.txt")).unwrap(),
+            "old default"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second_root.join("same.txt")).unwrap(),
+            "second original"
+        );
+        let source_write = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.fs.write",
+                serde_json::json!({"path":second_root.join("same.txt"),"content":"must reject"}),
+            ),
+        )
+        .await;
+        assert!(is_error(&source_write), "{source_write}");
+
+        f.tokens
+            .update(
+                &f.token_id,
+                magi_mcp_server::TokenPatch {
+                    approval_mode: Some(ApprovalMode::Ask),
+                    ..Default::default()
+                },
+                UtcMillis::now().0,
+            )
+            .unwrap();
+        let state = f.state.clone();
+        let owner = session.clone();
+        let keep_id = first_id.clone();
+        let remover = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(approval) = state
+                    .conversation_registry
+                    .tool_approvals()
+                    .pending_for_session(&owner)
+                    .first()
+                {
+                    crate::routes::test_project_fixtures::set_members(
+                        &state,
+                        "ws-mcp",
+                        &[&keep_id],
+                        &keep_id,
+                    );
+                    let _ = state.conversation_registry.tool_approvals().resolve(
+                        &owner,
+                        &approval.approval_id,
+                        magi_conversation_runtime::ToolApprovalDecision::AllowOnce,
+                    );
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let result = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.fs.remove",
+                serde_json::json!({"source_folder_id":"second","path":"same.txt"}),
+            ),
+        )
+        .await;
+        remover.join().unwrap();
+        assert!(is_error(&result), "{result}");
+        assert_eq!(
+            std::fs::read_to_string(execution_roots[1].join("same.txt")).unwrap(),
+            "copy 1"
+        );
     }
 
     #[tokio::test]
@@ -2602,6 +2947,7 @@ mod tests {
         // 而不是令牌的完整目录；两者都必须与各自真实的 tools/list 一致。
         let f = fixture(Duration::from_secs(5));
         let slot_principal = magi_mcp_server::ClientPrincipal {
+            project_directories: None,
             token_id: crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID.to_string(),
             token_prefix: crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID.to_string(),
             client_name: "GPT Web".to_string(),

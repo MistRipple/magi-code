@@ -119,6 +119,41 @@ pub(crate) fn registered_workspace_path(
         .ok_or_else(|| ApiError::not_found("workspace 不存在", workspace_id.as_str()))
 }
 
+pub(crate) struct ProjectSourceDirectory {
+    pub source_folder_id: String,
+    pub execution_root: PathBuf,
+    pub display_source_path: String,
+}
+
+/// 文件、预览和终端共用当前项目成员及原会话执行映射；不改变会话所属项目。
+pub(crate) fn resolve_project_source_directory(
+    state: &ApiState,
+    workspace_id: &WorkspaceId,
+    session_id: Option<&SessionId>,
+    source_folder_id: Option<&str>,
+) -> Result<ProjectSourceDirectory, ApiError> {
+    let (folder, source_root) = state
+        .workspace_registry
+        .resolve_source_folder(workspace_id, source_folder_id)
+        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+    let mut execution_root = source_root.clone();
+    if let Some(session_id) = session_id {
+        let session = state
+            .session_store
+            .session(session_id)
+            .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+        if state.session_workspace_id(&session).as_ref() != Some(workspace_id) {
+            return Err(ApiError::Conflict("源文件夹与会话所属项目不匹配".into()));
+        }
+        execution_root = state.session_execution_root_for_source(session_id, &source_root)?;
+    }
+    Ok(ProjectSourceDirectory {
+        source_folder_id: folder.source_folder_id,
+        display_source_path: folder.path.as_str().to_string(),
+        execution_root,
+    })
+}
+
 pub(crate) fn require_registered_workspace_binding(
     state: &ApiState,
     requested_workspace_id: Option<&str>,

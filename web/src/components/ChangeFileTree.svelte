@@ -3,12 +3,14 @@
   import FileTypeIcon from './FileTypeIcon.svelte';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { composerWorkspaceState } from '../stores/composer-workspace.svelte';
   import type { Edit, EditType } from '../types/message';
 
   interface Props {
     edits: readonly Edit[];
     workspacePath?: string;
     activeFilePath?: string | null;
+    activeSourceFolderId?: string;
     changeMutationPending?: boolean;
     onOpen: (edit: Edit) => void | Promise<void>;
     onApprove: (edit: Edit) => void;
@@ -36,6 +38,7 @@
     edits,
     workspacePath = '',
     activeFilePath = null,
+    activeSourceFolderId = '',
     changeMutationPending = false,
     onOpen,
     onApprove,
@@ -48,7 +51,7 @@
 
   const tree = $derived(buildTree(edits, workspacePath));
   const treeSignature = $derived(edits.map((edit) => (
-    `${displayPathForEdit(edit, workspacePath)}::${edit.type ?? 'modify'}`
+    `${edit.sourceFolderId || ''}::${displayPathForEdit(edit, workspacePath)}::${edit.type ?? 'modify'}`
   )).join('\u0000'));
   $effect(() => {
     const signature = treeSignature;
@@ -114,16 +117,31 @@
     for (const edit of sourceEdits) {
       const relativePath = displayPathForEdit(edit, rootPath);
       if (!relativePath) continue;
-      const existing = latestEditsByPath.get(relativePath);
+      const identity = `${edit.sourceFolderId || ''}\u0000${relativePath}`;
+      const existing = latestEditsByPath.get(identity);
       if (!existing || (edit.updatedAt ?? 0) >= (existing.updatedAt ?? 0)) {
-        latestEditsByPath.set(relativePath, edit);
+        latestEditsByPath.set(identity, edit);
       }
     }
 
-    for (const [relativePath, edit] of latestEditsByPath) {
+    for (const edit of latestEditsByPath.values()) {
+      const relativePath = displayPathForEdit(edit, rootPath);
       const segments = relativePath.split('/').filter(Boolean);
       let parent = root;
       let parentKey = '';
+      if (edit.sourceFolderId) {
+        parentKey = `source:${edit.sourceFolderId}`;
+        let source = directories.get(parentKey);
+        if (!source) {
+          const project = composerWorkspaceState.workspaces.find((project) => project.workspaceId === edit.workspaceId);
+          const folder = project?.sourceFolders?.find((folder) => folder.sourceFolderId === edit.sourceFolderId);
+          const path = folder?.path || edit.workspacePath || edit.sourceFolderId;
+          source = { kind: 'directory', key: parentKey, name: folder?.name || path.split(/[\\/]/).filter(Boolean).at(-1) || path, children: [] };
+          directories.set(parentKey, source);
+          root.children.push(source);
+        }
+        parent = source;
+      }
 
       for (const segment of segments.slice(0, -1)) {
         parentKey = parentKey ? `${parentKey}/${segment}` : segment;
@@ -144,7 +162,7 @@
       const fileName = segments[segments.length - 1];
       parent.children.push({
         kind: 'file',
-        key: relativePath,
+        key: `${edit.sourceFolderId || ''}\u0000${relativePath}`,
         name: fileName,
         relativePath,
         edit,
@@ -241,7 +259,7 @@
   }
 
   function isActiveFile(edit: Edit, relativePath: string): boolean {
-    if (!activeFilePath) return false;
+    if (!activeFilePath || (edit.sourceFolderId || '') !== activeSourceFolderId) return false;
     return displayPathForPath(
       activeFilePath,
       edit.workspacePath || workspacePath,

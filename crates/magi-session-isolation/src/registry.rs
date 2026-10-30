@@ -36,23 +36,57 @@ pub struct SessionIsolation {
 
 #[derive(Clone, Debug, Default)]
 pub struct SessionIsolationRegistry {
-    inner: Arc<RwLock<HashMap<String, SessionIsolation>>>,
+    inner: Arc<RwLock<HashMap<(String, PathBuf), SessionIsolation>>>,
+}
+
+fn source_key(source: &Path) -> PathBuf {
+    std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf())
 }
 
 impl SessionIsolationRegistry {
+    /// 旧单目录消费者只允许读取唯一映射；多目录时不能选择任意首项。
     pub fn get(&self, session_id: &str) -> Option<SessionIsolation> {
+        let inner = self
+            .inner
+            .read()
+            .expect("session isolation registry read lock poisoned");
+        let mut matches = inner.values().filter(|item| item.session_id == session_id);
+        let only = matches.next()?.clone();
+        matches.next().is_none().then_some(only)
+    }
+
+    pub fn for_session(&self, session_id: &str) -> Vec<SessionIsolation> {
+        self.all()
+            .into_iter()
+            .filter(|item| item.session_id == session_id)
+            .collect()
+    }
+
+    pub fn get_for_source(&self, session_id: &str, source: &Path) -> Option<SessionIsolation> {
         self.inner
             .read()
             .expect("session isolation registry read lock poisoned")
-            .get(session_id)
+            .get(&(session_id.to_string(), source_key(source)))
             .cloned()
+    }
+
+    /// 允许调用方已经持有实际执行路径；仍按同一登记解析，不创建第二条绑定。
+    pub fn get_for_root(&self, session_id: &str, root: &Path) -> Option<SessionIsolation> {
+        let root = source_key(root);
+        let mut matches = self
+            .for_session(session_id)
+            .into_iter()
+            .filter(|item| source_key(&item.source_root) == root || source_key(&item.root) == root);
+        let only = matches.next()?;
+        matches.next().is_none().then_some(only)
     }
 
     pub fn contains(&self, session_id: &str) -> bool {
         self.inner
             .read()
             .expect("session isolation registry read lock poisoned")
-            .contains_key(session_id)
+            .values()
+            .any(|item| item.session_id == session_id)
     }
 
     pub fn all(&self) -> Vec<SessionIsolation> {
@@ -63,7 +97,11 @@ impl SessionIsolationRegistry {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        all.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        all.sort_by(|left, right| {
+            left.session_id
+                .cmp(&right.session_id)
+                .then_with(|| left.source_root.cmp(&right.source_root))
+        });
         all
     }
 
@@ -71,17 +109,96 @@ impl SessionIsolationRegistry {
         self.inner
             .write()
             .expect("session isolation registry write lock poisoned")
-            .insert(isolation.session_id.clone(), isolation);
+            .insert(
+                (
+                    isolation.session_id.clone(),
+                    source_key(&isolation.source_root),
+                ),
+                isolation,
+            );
     }
 
+    /// 整组映射先持久化，再发布。持有原注册表写锁，避免不同会话相互覆盖持久状态。
+    pub fn insert_many_with_persistence<E>(
+        &self,
+        additions: &[SessionIsolation],
+        persist: impl FnOnce(&[SessionIsolation]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut inner = self
+            .inner
+            .write()
+            .expect("session isolation registry write lock poisoned");
+        let mut next = inner.clone();
+        for isolation in additions {
+            next.insert(
+                (
+                    isolation.session_id.clone(),
+                    source_key(&isolation.source_root),
+                ),
+                isolation.clone(),
+            );
+        }
+        let mut records = next.values().cloned().collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            left.session_id
+                .cmp(&right.session_id)
+                .then_with(|| left.source_root.cmp(&right.source_root))
+        });
+        persist(&records)?;
+        *inner = next;
+        Ok(())
+    }
+
+    /// 持久化期间保持原注册表读锁，避免快照取出后被另一会话的新登记反向覆盖。
+    pub fn persist_with<E>(
+        &self,
+        persist: impl FnOnce(&[SessionIsolation]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let inner = self
+            .inner
+            .read()
+            .expect("session isolation registry read lock poisoned");
+        let records = inner.values().cloned().collect::<Vec<_>>();
+        persist(&records)
+    }
+
+    /// 旧单目录删除不能删除多根中的任意一项或整组。
     pub fn remove(&self, session_id: &str) -> Option<SessionIsolation> {
+        let mut inner = self
+            .inner
+            .write()
+            .expect("session isolation registry write lock poisoned");
+        let mut matches = inner.keys().filter(|(id, _)| id == session_id);
+        let key = matches.next()?.clone();
+        if matches.next().is_some() {
+            return None;
+        }
+        inner.remove(&key)
+    }
+
+    pub fn remove_for_source(&self, session_id: &str, source: &Path) -> Option<SessionIsolation> {
         self.inner
             .write()
             .expect("session isolation registry write lock poisoned")
-            .remove(session_id)
+            .remove(&(session_id.to_string(), source_key(source)))
     }
 
-    /// daemon 启动时载入持久化的登记；只保留副本目录仍然存在的条目。
+    pub fn remove_session(&self, session_id: &str) -> Vec<SessionIsolation> {
+        let mut inner = self
+            .inner
+            .write()
+            .expect("session isolation registry write lock poisoned");
+        let removed = inner
+            .values()
+            .filter(|item| item.session_id == session_id)
+            .cloned()
+            .collect();
+        inner.retain(|(id, _), _| id != session_id);
+        removed
+    }
+
+    /// 保留原映射，包括暂时不可用的副本。丢弃映射会使重启后的请求回落到
+    /// 原目录，既掩盖成果丢失，也可能把后续写入落到用户目录。
     pub fn restore(&self, isolations: Vec<SessionIsolation>) -> usize {
         let mut target = self
             .inner
@@ -89,18 +206,23 @@ impl SessionIsolationRegistry {
             .expect("session isolation registry write lock poisoned");
         target.clear();
         for isolation in isolations {
-            if isolation.root.is_dir() {
-                target.insert(isolation.session_id.clone(), isolation);
-            }
+            target.insert(
+                (
+                    isolation.session_id.clone(),
+                    source_key(&isolation.source_root),
+                ),
+                isolation,
+            );
         }
         target.len()
     }
 
-    /// 指定主工作区下仍在使用隔离副本的会话。
+    /// 指定源目录下仍在使用隔离副本的会话；符号链接别名不分配第二份副本。
     pub fn sessions_for_source(&self, source_root: &Path) -> Vec<SessionIsolation> {
+        let key = source_key(source_root);
         self.all()
             .into_iter()
-            .filter(|isolation| isolation.source_root == source_root)
+            .filter(|item| source_key(&item.source_root) == key)
             .collect()
     }
 }
@@ -124,16 +246,57 @@ mod tests {
     }
 
     #[test]
-    fn restore_drops_isolations_whose_copy_directory_is_gone() {
+    fn restore_keeps_missing_copy_binding_to_prevent_source_fallback() {
         let kept = tempfile::tempdir().unwrap();
         let registry = SessionIsolationRegistry::default();
         let restored = registry.restore(vec![
             sample("alive", kept.path().to_path_buf()),
             sample("gone", PathBuf::from("/definitely/not/here")),
         ]);
-        assert_eq!(restored, 1);
+        assert_eq!(restored, 2);
         assert!(registry.contains("alive"));
-        assert!(!registry.contains("gone"));
+        assert!(registry.contains("gone"));
+        assert_eq!(
+            registry.get("gone").unwrap().root,
+            PathBuf::from("/definitely/not/here")
+        );
+    }
+
+    #[test]
+    fn multiple_sources_keep_independent_mappings_after_restart_and_removal() {
+        let registry = SessionIsolationRegistry::default();
+        let a = sample("same-session", PathBuf::from("/copy-a"));
+        let b = SessionIsolation {
+            source_root: PathBuf::from("/src-b"),
+            root: PathBuf::from("/missing-copy-b"),
+            ..a.clone()
+        };
+        registry.insert(a.clone());
+        registry.insert(b.clone());
+        assert!(registry.contains("same-session"));
+        assert!(
+            registry.get("same-session").is_none(),
+            "旧入口不得选任意首项"
+        );
+        assert!(registry.remove("same-session").is_none());
+        assert_eq!(
+            registry.get_for_source("same-session", Path::new("/src")),
+            Some(a.clone())
+        );
+        assert_eq!(
+            registry.get_for_root("same-session", Path::new("/missing-copy-b")),
+            Some(b.clone())
+        );
+        let durable = serde_json::to_vec(&registry.all()).unwrap();
+        let restarted = SessionIsolationRegistry::default();
+        assert_eq!(
+            restarted.restore(serde_json::from_slice(&durable).unwrap()),
+            2
+        );
+        restarted.remove_for_source("same-session", Path::new("/src"));
+        assert_eq!(restarted.get("same-session"), Some(b));
+        assert_eq!(restarted.remove_session("same-session").len(), 1);
+        assert!(!restarted.contains("same-session"));
     }
 
     #[test]

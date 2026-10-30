@@ -20,5 +20,30 @@ await withGoldenViteServer(async server => {
   const query = new URLSearchParams(api.buildFilePreviewQuery('report.md', { workspaceId: '', workspacePath: '', sessionId: 'personal' }));
   assert.equal(query.get('sessionId'), 'personal');
   assert.equal(query.has('workspaceId'), false, '个人文件预览不能借用当前项目');
+  composer.syncComposerWorkspaces([{
+    workspaceId: 'project', rootPath: '/tmp/primary', name: 'Project', isActive: true,
+    primarySourceFolderId: 'a', sourceFolders: [
+      { sourceFolderId: 'a', path: '/tmp/primary', isPrimary: true },
+      { sourceFolderId: 'b', path: '/tmp/secondary', pathRef: 'mhp1:u:L3RtcC9zZWNvbmRhcnk', isPrimary: false },
+    ],
+  }]);
+  for (const path of ['/tmp/secondary', 'mhp1:u:L3RtcC9zZWNvbmRhcnk']) {
+    const project = composer.resolveComposerWorkspace('', path);
+    assert.equal(project?.workspaceId, 'project', '次目录路径和引用均应识别同一项目');
+    assert.equal(project.rootPath, '/tmp/primary', '导航路径不能更改主要执行目录');
+  }
+  composer.selectComposerSourceFolder('project', 'chat-a', 'b');
+  assert.equal(composer.selectedComposerSourceFolderId('project', 'chat-a'), 'b');
+  assert.equal(composer.selectedComposerSourceFolderId('project', 'chat-b'), 'a', '目录选择按会话隔离');
+  composer.syncComposerWorkspaces([{
+    workspaceId: 'project', rootPath: '/tmp/primary', name: 'Project', isActive: true,
+    primarySourceFolderId: 'a', sourceFolders: [{ sourceFolderId: 'a', path: '/tmp/primary', isPrimary: true }],
+  }]);
+  assert.equal(composer.selectedComposerSourceFolderId('project', 'chat-a'), 'a', '移除已选目录后，新输入恢复有效主要目录');
+  assert.deepEqual(composer.composerWorkspaceState.sourceFolderSelections, {}, '已撤销目录选择不滞留页面状态');
+  composer.selectComposerSourceFolder('project', 'chat-a', 'a');
+  composer.syncComposerWorkspaces([]);
+  assert.equal(composer.selectedComposerSourceFolderId('project', 'chat-a'), '');
+  assert.deepEqual(composer.composerWorkspaceState.sourceFolderSelections, {}, '移除项目同步清理其页面级目录选择');
 });
 console.log('personal session golden passed');

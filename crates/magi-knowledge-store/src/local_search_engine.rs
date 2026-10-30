@@ -214,8 +214,27 @@ impl LocalSearchEngine {
     }
 
     pub fn search(&self, query: &str, options: SearchOptions) -> Vec<SearchResult> {
+        self.measured_search(query, options, None)
+    }
+
+    /// 调用方授权逐文件检查。策略相关结果不复用或写入项目共享查询缓存。
+    pub fn search_with_path_filter(
+        &self,
+        query: &str,
+        options: SearchOptions,
+        allows: &dyn Fn(&str) -> bool,
+    ) -> Vec<SearchResult> {
+        self.measured_search(query, options, Some(allows))
+    }
+
+    fn measured_search(
+        &self,
+        query: &str,
+        options: SearchOptions,
+        allows: Option<&dyn Fn(&str) -> bool>,
+    ) -> Vec<SearchResult> {
         let started = std::time::Instant::now();
-        let results = self.search_inner(query, options);
+        let results = self.search_inner(query, options, allows);
         let elapsed = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         self.query_count.fetch_add(1, Ordering::Relaxed);
         self.total_query_micros
@@ -224,7 +243,12 @@ impl LocalSearchEngine {
         results
     }
 
-    fn search_inner(&self, query: &str, options: SearchOptions) -> Vec<SearchResult> {
+    fn search_inner(
+        &self,
+        query: &str,
+        options: SearchOptions,
+        allows: Option<&dyn Fn(&str) -> bool>,
+    ) -> Vec<SearchResult> {
         let max_results = options.max_results.unwrap_or(10);
         let max_context_tokens = options.max_context_tokens.unwrap_or(8000);
         let cache_key = search_cache_key(query, &options);
@@ -234,7 +258,9 @@ impl LocalSearchEngine {
             return Vec::new();
         }
 
-        if let Some(cached) = self.search_cache.get(&cache_key) {
+        if allows.is_none()
+            && let Some(cached) = self.search_cache.get(&cache_key)
+        {
             return cached;
         }
 
@@ -325,11 +351,14 @@ impl LocalSearchEngine {
             &symbol_hits,
             max_results,
             max_context_tokens,
+            allows,
         );
 
         let file_paths: Vec<String> = results.iter().map(|r| r.file_path.clone()).collect();
-        self.search_cache
-            .set(&cache_key, results.clone(), file_paths);
+        if allows.is_none() {
+            self.search_cache
+                .set(&cache_key, results.clone(), file_paths);
+        }
 
         results
     }
@@ -985,6 +1014,7 @@ impl LocalSearchEngine {
         symbol_hits: &[SymbolSearchHit],
         max_results: usize,
         max_context_tokens: usize,
+        allows: Option<&dyn Fn(&str) -> bool>,
     ) -> Vec<SearchResult> {
         let index_hit_map: HashMap<&str, &IndexSearchHit> = index_hits
             .iter()
@@ -1006,9 +1036,14 @@ impl LocalSearchEngine {
             if results.len() >= max_results || total_context_tokens >= max_context_tokens {
                 break;
             }
+            if allows.is_some_and(|allows| !allows(&item.file_path)) {
+                continue;
+            }
 
-            let full_path = Path::new(&self.project_root).join(&item.file_path);
-            let lines = match std::fs::read_to_string(&full_path) {
+            let lines = match crate::code_scanner::read_index_file(
+                Path::new(&self.project_root),
+                &item.file_path,
+            ) {
                 Ok(content) => content.lines().map(|l| l.to_string()).collect::<Vec<_>>(),
                 Err(_) => continue,
             };

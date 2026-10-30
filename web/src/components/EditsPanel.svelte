@@ -65,9 +65,10 @@
     currentRoundEdits.length > 0 && currentRoundEdits.every((edit) => edit.revertible === true)
   );
 
-  function editScope(edit?: Edit): { scope: 'workspace'; sessionId?: string; workspaceId: string; workspacePath: string } {
+  function editScope(edit?: Edit): { scope: 'workspace'; sessionId?: string; workspaceId: string; workspacePath: string; sourceFolderId?: string } {
     return {
       scope: 'workspace',
+      sourceFolderId: edit?.sourceFolderId,
       sessionId: edit?.sessionId?.trim() || getCurrentSessionId() || undefined,
       workspaceId: edit?.workspaceId?.trim() || messagesState.currentWorkspaceId?.trim() || '',
       workspacePath: edit?.workspacePath?.trim() || messagesState.currentWorkspacePath?.trim() || '',
@@ -89,9 +90,12 @@
     const scopeSessionId = normalizeScopePart(scope.sessionId);
     const scopeWorkspaceId = normalizeScopePart(scope.workspaceId);
     const scopeWorkspacePath = normalizeScopePart(scope.workspacePath);
+    const statusSourceFolderId = normalizeScopePart(status.sourceFolderId);
+    const scopeSourceFolderId = normalizeScopePart(scope.sourceFolderId);
     if (statusSessionId && scopeSessionId && statusSessionId !== scopeSessionId) return false;
     if (statusWorkspaceId && scopeWorkspaceId && statusWorkspaceId !== scopeWorkspaceId) return false;
     if (statusWorkspacePath && scopeWorkspacePath && statusWorkspacePath !== scopeWorkspacePath) return false;
+    if (statusSourceFolderId && scopeSourceFolderId && statusSourceFolderId !== scopeSourceFolderId) return false;
     return Boolean(statusSessionId || statusWorkspaceId || statusWorkspacePath);
   }
 
@@ -104,6 +108,12 @@
     if (!pane.activeTabId) return '';
     const tab = pane.openTabs.find((item) => item.id === pane.activeTabId);
     return tab?.kind === 'code' ? (tab.payload as CodeTabPayload).filepath : '';
+  });
+
+  const activeCodeSourceFolderId = $derived.by(() => {
+    const pane = getRightPaneState(rightPaneState.activeScopeKey);
+    const tab = pane.openTabs.find((tab) => tab.id === pane.activeTabId);
+    return tab?.kind === 'code' ? (tab.payload as CodeTabPayload).sourceFolderId || '' : '';
   });
 
   function approveChange(edit: Edit) {
@@ -119,13 +129,13 @@
 
   function approveAllChanges() {
     if (changeMutationPending || edits.length === 0) return;
-    vscode.postMessage({ type: 'approveAllChanges', ...editScope(currentRoundEdits[0] ?? earlierPendingEdits[0]) });
+    vscode.postMessage({ type: 'approveAllChanges', ...editScope() });
   }
   async function revertAllChanges() {
     if (changeMutationPending || edits.length === 0 || !allEditsRevertible) return;
     const confirmed = await confirmMessage(i18n.t('edits.confirm.revertAll', { count: edits.length }), { tone: 'danger', confirmLabel: i18n.t('edits.actions.revertAll') });
     if (!confirmed) return;
-    vscode.postMessage({ type: 'revertAllChanges', ...editScope(currentRoundEdits[0] ?? earlierPendingEdits[0]) });
+    vscode.postMessage({ type: 'revertAllChanges', ...editScope() });
   }
   async function revertCurrentRound() {
     if (changeMutationPending || !latestExecutionGroupId || !currentRoundRevertible) return;
@@ -134,7 +144,7 @@
     vscode.postMessage({
       type: 'revertExecutionGroup',
       executionGroupId: latestExecutionGroupId,
-      ...editScope(currentRoundEdits[0]),
+      ...editScope(),
     });
   }
 
@@ -234,7 +244,7 @@
     }
     const scope = editScope(edit);
     const detail = await loadChangeDetail(edit, scope);
-    if (requestOpenHtmlFileInBrowser(detail.filePath)) {
+    if (requestOpenHtmlFileInBrowser(detail.filePath, scope)) {
       return;
     }
     const diff = synthesizeDiff(detail);
@@ -276,7 +286,7 @@
         <div class="group-actions">
           <button
             type="button"
-            class="group-action approve"
+            class="btn btn--primary btn--sm"
             disabled={changeMutationPending}
             title={sessionIsolated ? i18n.t('edits.isolated.approveAllTitle') : i18n.t('edits.actions.approveAllTitle')}
             onclick={approveAllChanges}
@@ -286,7 +296,7 @@
           </button>
           <button
             type="button"
-            class="group-action revert"
+            class="btn btn--secondary btn--sm"
             disabled={changeMutationPending || !allEditsRevertible}
             title={allEditsRevertible ? i18n.t('edits.actions.revertAllTitle') : i18n.t('edits.actions.revertUnavailable')}
             onclick={revertAllChanges}
@@ -315,6 +325,7 @@
               edits={earlierPendingEdits}
               workspacePath={messagesState.currentWorkspacePath || ''}
               activeFilePath={activeCodeFilePath}
+              activeSourceFolderId={activeCodeSourceFolderId}
               changeMutationPending={changeMutationPending}
               onOpen={viewDiff}
               onApprove={approveChange}
@@ -343,7 +354,7 @@
                 <div class="group-actions">
                   <button
                     type="button"
-                    class="group-action revert"
+                    class="btn btn--secondary btn--sm"
                     disabled={changeMutationPending || !currentRoundRevertible}
                     title={currentRoundRevertible ? i18n.t('edits.group.revertRoundTitle') : i18n.t('edits.actions.revertUnavailable')}
                     onclick={revertCurrentRound}
@@ -358,6 +369,7 @@
               edits={displayedCurrentEdits}
               workspacePath={messagesState.currentWorkspacePath || ''}
               activeFilePath={activeCodeFilePath}
+              activeSourceFolderId={activeCodeSourceFolderId}
               changeMutationPending={changeMutationPending}
               onOpen={viewDiff}
               onApprove={approveChange}
@@ -474,42 +486,6 @@
     margin-left: auto;
   }
 
-  .group-action {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 4px;
-    min-height: 28px;
-    padding: 0 8px;
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    font-size: var(--text-xs);
-    font-weight: var(--font-medium);
-    transition: background var(--transition-fast), color var(--transition-fast);
-  }
-
-  .group-action.approve {
-    background: var(--primary-muted);
-    color: var(--primary);
-  }
-
-  .group-action.approve:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--primary) 22%, transparent);
-  }
-
-  .group-action.revert:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--error) 10%, transparent);
-    color: var(--error);
-  }
-
-  .group-action:disabled {
-    cursor: not-allowed;
-    opacity: 0.5;
-  }
-
   .group-section {
     margin: 0 0 var(--space-2);
   }
@@ -553,8 +529,5 @@
   @container edits-panel (max-width: 640px) {
     .changes-toolbar { gap: 8px; }
     .changes-toolbar > .group-actions { flex-basis: 100%; margin-left: 0; }
-    .group-action {
-      padding-inline: 6px;
-    }
   }
 </style>

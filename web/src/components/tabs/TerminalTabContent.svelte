@@ -8,12 +8,13 @@
 
   interface Props {
     terminalTabId: string;
+    sourceFolderId?: string;
     workspaceId?: string;
     workspacePath?: string;
     sessionId: string;
   }
 
-  let { terminalTabId, workspaceId, workspacePath = '', sessionId }: Props = $props();
+  let { terminalTabId, sourceFolderId, workspaceId, workspacePath = '', sessionId }: Props = $props();
   let terminalHost: HTMLDivElement;
   let accessibleStatus = $state(i18n.t('terminalPanel.status.connecting'));
 
@@ -147,6 +148,7 @@
       const generation = ++connectionGeneration;
       accessibleStatus = i18n.t('terminalPanel.status.connecting');
       const next = new WebSocket(terminalChannelUrl({
+        sourceFolderId,
         terminalTabId,
         workspaceId,
         workspacePath,

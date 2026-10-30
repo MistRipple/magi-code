@@ -53,7 +53,6 @@ use magi_process::ManagedProcessGroup;
 use magi_session_store::{SessionExecutionSidecarStatus, SessionStore};
 use magi_settings_store::SettingsStore;
 use magi_skill_runtime::SkillDispatchRuntime;
-use magi_snapshot::SnapshotManager;
 use magi_tool_runtime::{
     AgentRoleCatalogEntry, AgentRoleCatalogProvider, ExternalMcpServerCatalogEntry,
     ExternalMcpToolCatalogEntry, ExternalMcpToolExecutor, ExternalToolCatalogEntry,
@@ -964,25 +963,26 @@ impl DaemonRuntime {
                 )
             })
             .collect();
-        Self::validate_workspace_state_separation(&config.state_root, &workspace_roots)?;
-        for workspace in &workspace_durable_state.workspaces {
-            magi_workspace::verify_or_create_workspace_identity(
-                &workspace.native_root_path(),
-                &workspace.workspace_id,
-            )
-            .map_err(|error| {
-                DaemonError::internal(format!(
-                    "校验工作区稳定身份失败 {}: {error}",
-                    workspace.native_root_path().display()
-                ))
-            })?;
-        }
+        let source_roots = workspace_durable_state
+            .workspaces
+            .iter()
+            .flat_map(|workspace| {
+                workspace
+                    .source_folder_roots()
+                    .into_iter()
+                    .map(|root| (workspace.workspace_id.to_string(), root))
+            })
+            .collect::<Vec<_>>();
+        Self::validate_workspace_state_separation(&config.state_root, &source_roots)?;
+        // 先恢复旧事务并建立旧 daemon 的写屏障，再单向迁移项目历史。
+        state_repository.verify_state_layout(&workspace_roots)?;
+        state_repository.migrate_project_storage()?;
+        let workspace_durable_state = state_repository.load_workspace_durable_state()?;
         let workspace_store = Arc::new(WorkspaceStore::from_persisted_parts(
             workspace_durable_state,
             state_repository.load_workspace_recovery_sidecars()?,
         ));
 
-        state_repository.verify_state_layout(&workspace_roots)?;
         let (session_durable, session_sidecars) =
             state_repository.load_session_projections(&workspace_roots)?;
         let session_store = Arc::new(
@@ -1172,33 +1172,44 @@ impl DaemonRuntime {
         else {
             return;
         };
-        if !self
-            .knowledge_store
-            .begin_workspace_index_build(&active_workspace_id)
-        {
-            return;
-        }
-        let knowledge_store = self.knowledge_store.clone();
-        let scan_root = active_workspace.native_root_path();
-        tokio::spawn(async move {
-            let build_store = knowledge_store.clone();
-            let build_workspace_id = active_workspace_id.clone();
-            let build_result = tokio::task::spawn_blocking(move || {
-                build_store.build_workspace_index(&build_workspace_id, &scan_root)
-            })
-            .await;
-            match build_result {
-                Ok(_) => {}
-                Err(error) => {
-                    warn!(
-                        workspace_id = %active_workspace_id,
-                        error = %error,
-                        "活动工作区代码索引后台构建任务失败"
-                    );
-                }
+        let multi_source = active_workspace.source_folders.len() > 1;
+        for folder in active_workspace.source_folders {
+            let scan_root = folder.native_path();
+            if std::fs::canonicalize(&scan_root).is_ok_and(|canonical| canonical != scan_root) {
+                warn!(workspace_id = %active_workspace_id, source_folder_id = %folder.source_folder_id, "源文件夹原登记路径已变化，跳过代码索引预热");
+                continue;
             }
-            knowledge_store.finish_workspace_index_build(&active_workspace_id);
-        });
+            let knowledge_store = if multi_source {
+                match self
+                    .knowledge_store
+                    .for_source_folder(&folder.source_folder_id, &scan_root)
+                {
+                    Ok(store) => store,
+                    Err(error) => {
+                        warn!(workspace_id = %active_workspace_id, source_folder_id = %folder.source_folder_id, %error, "活动项目代码索引作用域无效");
+                        continue;
+                    }
+                }
+            } else {
+                self.knowledge_store.as_ref().clone()
+            };
+            if !knowledge_store.begin_workspace_index_build(&active_workspace_id) {
+                continue;
+            }
+            let workspace_id = active_workspace_id.clone();
+            tokio::spawn(async move {
+                let build_store = knowledge_store.clone();
+                let build_workspace_id = workspace_id.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    build_store.build_workspace_index(&build_workspace_id, &scan_root)
+                })
+                .await;
+                if let Err(error) = result {
+                    warn!(workspace_id = %workspace_id, scope = ?knowledge_store.code_index_scope(), %error, "活动项目代码索引后台构建失败");
+                }
+                knowledge_store.finish_workspace_index_build(&workspace_id);
+            });
+        }
     }
 
     pub(crate) fn prepare_graceful_shutdown(
@@ -1350,7 +1361,10 @@ impl DaemonRuntime {
             settings_store.clone(),
             default_model_available,
         );
-        let snapshot_manager = Arc::new(SnapshotManager::new());
+        let snapshot_manager = Arc::new(magi_api::managed_snapshot_manager(
+            self.state_root.clone(),
+            self.session_store.clone(),
+        ));
         let memory_store = MemoryStore::new();
         let context_runtime = ContextRuntime::with_runtime_sources(
             (*self.knowledge_store).clone(),
@@ -1439,11 +1453,14 @@ impl DaemonRuntime {
                     .is_ok()
             })
         };
-        let runtime_persistence = Arc::new(RuntimeStatePersistence::new(
-            self.state_root.clone(),
-            self.state_root.join("workspaces.json"),
-            self.state_root.join("knowledge.json"),
-        ));
+        let runtime_persistence = Arc::new(
+            RuntimeStatePersistence::new(
+                self.state_root.clone(),
+                self.state_root.join("workspaces.json"),
+                self.state_root.join("knowledge.json"),
+            )
+            .with_shared_write_lock(self.state_repository.shared_write_lock()),
+        );
         let git_service = Arc::new(magi_git::GitService::new());
         let session_code_contexts = magi_git::SessionCodeContextRegistry::default();
         let workspace_git_coordinator = magi_git::WorkspaceGitOperationCoordinator::default();
@@ -1757,6 +1774,28 @@ impl DaemonRuntime {
         .with_plugin_manager(self.plugins.manager())
         .with_plugin_data_migrator(self.plugins.data_migrator())
         .with_runtime_persistence(runtime_persistence)
+        .with_workspace_history_restore({
+            let repository = self.state_repository.clone();
+            let sessions = self.session_store.clone();
+            Arc::new(move |project| {
+                sessions
+                    .restore_workspace_history(project.workspace_id.as_str(), || {
+                        let load = || -> Result<_, DaemonError> {
+                            repository.migrate_project_storage()?;
+                            repository.load_project_session_projections(project)
+                        };
+                        load().map_err(|error| DomainError::Persistence {
+                            message: error.to_string(),
+                        })
+                    })
+                    .map_err(|error| {
+                        ApiError::internal_assembly(
+                            "恢复项目历史失败，原文件保留；请修复后重试注册",
+                            error,
+                        )
+                    })
+            })
+        })
         .with_canonical_event_next_sequence_provider({
             let repository = self.state_repository.clone();
             Arc::new(move |session_id| {
@@ -3894,6 +3933,129 @@ done
         assert!(ledger.usage_entries.is_empty());
     }
 
+    #[tokio::test]
+    async fn portable_project_registration_restores_history_without_daemon_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let source_config = DaemonConfig::new(
+            "127.0.0.1",
+            0,
+            "daemon-test",
+            root.path().join("source-state"),
+        );
+        seed_registered_test_workspace(&source_config, Some("portable-hot-session"));
+        let source = test_workspace_root(&source_config);
+        let repository = StateRepository::new(source_config.state_root.clone());
+        let projection_dir = source.join(".magi/session-projections");
+        fs::create_dir_all(&projection_dir).unwrap();
+        let name = "portable-hot-session.json";
+        fs::copy(
+            repository
+                .project_storage_root("test-workspace-001")
+                .join(".magi/session-projections")
+                .join(name),
+            projection_dir.join(name),
+        )
+        .unwrap();
+        let projection_path = projection_dir.join(name);
+        let mut projection: serde_json::Value =
+            serde_json::from_slice(&fs::read(&projection_path).unwrap()).unwrap();
+        projection["durable"]["timeline"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "entryId":"portable-user-message", "sessionId":"portable-hot-session",
+                "kind":"UserMessage", "message":"retained portable history", "occurredAt":1
+            }));
+        fs::write(
+            &projection_path,
+            serde_json::to_vec_pretty(&projection).unwrap(),
+        )
+        .unwrap();
+        let other = root.path().join("other-source");
+        fs::create_dir_all(&other).unwrap();
+        for use_project_create in [false, true] {
+            let target = DaemonConfig::new(
+                "127.0.0.1",
+                0,
+                "daemon-test",
+                root.path().join(if use_project_create {
+                    "target-project-state"
+                } else {
+                    "target-register-state"
+                }),
+            );
+            let runtime = DaemonRuntime::restore(&target).unwrap();
+            let app = runtime.router("daemon-test".into()).unwrap();
+            let (status, registered) = post_json(
+                app.clone(),
+                if use_project_create {
+                    "/api/workspaces/create"
+                } else {
+                    "/api/workspaces/register"
+                },
+                if use_project_create {
+                    json!({"name":"portable multi-source", "sourceFolders":[
+                {"sourceFolderId":"old", "path":source}, {"sourceFolderId":"new", "path":other}
+            ], "primarySourceFolderId":"new"})
+                } else {
+                    json!({"path":source})
+                },
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{registered}");
+            assert_eq!(registered["workspaceId"], "test-workspace-001");
+            if use_project_create {
+                let project = runtime
+                    .workspace_store
+                    .project(&WorkspaceId::new("test-workspace-001"))
+                    .unwrap();
+                assert_eq!(
+                    project.primary_source_folder().native_path(),
+                    other.canonicalize().unwrap()
+                );
+                assert_eq!(project.source_folders.len(), 2);
+            }
+            let history = get_json(
+                app.clone(),
+                "/api/workspaces/sessions?workspaceId=test-workspace-001",
+            )
+            .await;
+            assert_eq!(
+                history["sessions"][0]["sessionId"],
+                "portable-hot-session",
+                "{history}; {:?}",
+                runtime
+                    .session_store
+                    .unavailable_sessions(Some("test-workspace-001"))
+            );
+            assert_eq!(history["sessions"].as_array().unwrap().len(), 1);
+            let (status, _) = post_json(
+                app,
+                "/api/session/materialize",
+                json!({"scope":"workspace","workspaceId":"test-workspace-001"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                runtime
+                    .session_store
+                    .sessions_for_workspace("test-workspace-001")
+                    .len(),
+                2
+            );
+            drop(runtime);
+            let restarted = DaemonRuntime::restore(&target).unwrap();
+            assert_eq!(
+                restarted
+                    .session_store
+                    .sessions_for_workspace("test-workspace-001")
+                    .len(),
+                2
+            );
+            assert!(projection_dir.is_dir());
+        }
+    }
+
     #[test]
     fn restore_does_not_rewrite_existing_session_projection_or_ledger() {
         let state_root = temp_state_root("restore-without-rewrite");
@@ -3904,7 +4066,8 @@ done
         drop(fixture);
 
         let projection_path = fs::read_dir(
-            test_workspace_root(&config)
+            StateRepository::new(state_root.clone())
+                .project_storage_root("test-workspace-001")
                 .join(".magi")
                 .join("session-projections"),
         )

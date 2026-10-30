@@ -131,6 +131,8 @@ pub type CanonicalEventNextSequenceProvider =
     Arc<dyn Fn(&SessionId) -> Result<u64, String> + Send + Sync>;
 /// 返回值表示回调是否已经把 durable session projection 一并写入。
 pub type SessionStateCheckpointPersist = Arc<dyn Fn(&str) -> Result<bool, ApiError> + Send + Sync>;
+pub type WorkspaceHistoryRestore =
+    Arc<dyn Fn(&magi_workspace::WorkspaceRecord) -> Result<(), ApiError> + Send + Sync>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionProjectionPersistMode {
     Full,
@@ -179,6 +181,8 @@ fn snapshot_baseline_patch(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct QueuedRegularSessionTurn {
     pub request: SessionTurnRequestDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_directories: Option<magi_core::ProjectDirectoryBinding>,
     /// 用户提交请求的完整幂等指纹。服务端补齐 requestId/userMessageId 前计算，
     /// 重启恢复后只允许同一份原始请求重放，不再依赖被 normalize 的 request 做猜测。
     #[serde(default)]
@@ -1444,6 +1448,7 @@ pub struct ApiState {
     canonical_event_next_sequence_provider: Option<CanonicalEventNextSequenceProvider>,
     session_state_checkpoint_persist: Option<SessionStateCheckpointPersist>,
     session_projection_persist: Option<SessionProjectionPersist>,
+    workspace_history_restore: Option<WorkspaceHistoryRestore>,
     bridge_probe_snapshot_provider: BridgeProbeSnapshotProvider,
     bridge_preflight_snapshot_provider: BridgePreflightSnapshotProvider,
     bridge_cutover_smoke_provider: BridgeCutoverSmokeSnapshotProvider,
@@ -1505,6 +1510,8 @@ pub struct ApiState {
     session_turn_locks: Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>,
     session_change_sync_locks: Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>,
     session_navigation_lock: Arc<tokio::sync::Mutex<()>>,
+    /// 项目管理与工具/终端准入的短事务锁；不持有成员或授权事实。
+    project_directory_locks: Arc<Mutex<HashMap<WorkspaceId, Arc<tokio::sync::RwLock<()>>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1664,6 +1671,12 @@ impl RuntimeStatePersistence {
         Some(self.root_path.as_path())
     }
 
+    /// daemon 的恢复/迁移与运行中持久化必须串行写入同一状态根。
+    pub fn with_shared_write_lock(mut self, write_lock: Arc<Mutex<()>>) -> Self {
+        self.write_lock = write_lock;
+        self
+    }
+
     pub(crate) fn save_json<T>(&self, path: &Path, value: &T) -> Result<(), ApiError>
     where
         T: serde::Serialize,
@@ -1691,7 +1704,7 @@ impl RuntimeStatePersistence {
     }
 
     fn save_workspace_store(&self, store: &WorkspaceStore) -> Result<(), ApiError> {
-        self.save_json(&self.workspace_path, &store.durable_state())
+        store.with_durable_state(|snapshot| self.save_json(&self.workspace_path, snapshot))
     }
 
     pub(crate) fn save_knowledge_store(&self, store: &KnowledgeStore) -> Result<(), ApiError> {
@@ -2327,6 +2340,7 @@ impl ApiState {
             canonical_event_next_sequence_provider: None,
             session_state_checkpoint_persist: None,
             session_projection_persist: None,
+            workspace_history_restore: None,
             bridge_probe_snapshot_provider: BridgeProbeSnapshotProvider::default(),
             bridge_preflight_snapshot_provider: BridgePreflightSnapshotProvider::default(),
             bridge_cutover_smoke_provider: BridgeCutoverSmokeSnapshotProvider::default(),
@@ -2379,6 +2393,7 @@ impl ApiState {
             session_turn_locks: Arc::new(Mutex::new(HashMap::new())),
             session_change_sync_locks: Arc::new(Mutex::new(HashMap::new())),
             session_navigation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            project_directory_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -2414,7 +2429,10 @@ impl ApiState {
         session_id: &SessionId,
         workspace_root: &Path,
     ) -> PathBuf {
-        let Some(isolation) = self.session_isolations.get(session_id.as_str()) else {
+        let Some(isolation) = self
+            .session_isolations
+            .get_for_source(session_id.as_str(), workspace_root)
+        else {
             return workspace_root.to_path_buf();
         };
         let canonical = std::fs::canonicalize(workspace_root).ok();
@@ -2432,6 +2450,7 @@ impl ApiState {
         session_id: &SessionId,
         workspace_root: &Path,
     ) -> Result<Arc<SnapshotSession>, ApiError> {
+        let _ = self.session_execution_root_for_source(session_id, workspace_root)?;
         if let Some(session) = self.snapshot_session(session_id, workspace_root) {
             return Ok(session);
         }
@@ -2467,11 +2486,18 @@ impl ApiState {
         }
         tracing::info!(%session_id, stage = "changes_reconciled", "workspace execution preparation");
         // 隔离副本有自己独立的 Git 状态，不与主工作区的 branch/HEAD 对齐。
-        if self.session_isolations.contains(session_id.as_str()) {
+        if self
+            .session_isolations
+            .get_for_root(session_id.as_str(), workspace_root)
+            .is_some()
+        {
             return Ok(snapshot);
         }
 
-        let Some(existing_context) = self.session_code_contexts.get(session_id.as_str()) else {
+        let Some(existing_context) = self
+            .session_code_contexts
+            .get_for_path(session_id.as_str(), workspace_root)
+        else {
             match self.git_service.observe(workspace_root).await {
                 Ok(observation) => {
                     tracing::info!(%session_id, stage = "changes_git_observed", "workspace execution preparation");
@@ -2665,22 +2691,6 @@ impl ApiState {
         Ok(())
     }
 
-    pub(crate) async fn ensure_snapshot_session_for_workspace_id(
-        &self,
-        session_id: &SessionId,
-        workspace_id: &Option<WorkspaceId>,
-    ) -> Result<Option<Arc<SnapshotSession>>, ApiError> {
-        let Some(workspace_id) = workspace_id else {
-            return Ok(None);
-        };
-        let workspace_root = self
-            .workspace_root_path(&Some(workspace_id.clone()))
-            .ok_or_else(|| ApiError::not_found("workspace 不存在", workspace_id.as_str()))?;
-        self.ensure_snapshot_session(session_id, &workspace_root)
-            .await
-            .map(Some)
-    }
-
     pub fn with_tunnel_port(mut self, port: u16) -> Self {
         self.tunnel_manager = crate::tunnel::TunnelManager::new(port);
         self
@@ -2792,7 +2802,6 @@ impl ApiState {
         self.conversation_registry
             .human_wait()
             .set_hook(Arc::new(HumanWaitGitLeaseHook {
-                session_code_contexts,
                 coordinator: workspace_git_coordinator,
             }));
         self
@@ -3487,8 +3496,14 @@ impl ApiState {
             .workspaces()
             .into_iter()
             .find(|workspace| {
-                let stored_path = workspace.native_root_path();
-                canonicalize_path_for_workspace_match(&stored_path) == requested_path
+                // 旧 workspacePath 在导航和事件订阅中只标识项目，必须识别所有
+                // 当前源目录；执行目录仍由 sourceFolderId 和冻结绑定分别校验。
+                workspace
+                    .source_folder_roots()
+                    .into_iter()
+                    .any(|stored_path| {
+                        canonicalize_path_for_workspace_match(&stored_path) == requested_path
+                    })
             })
             .map(|workspace| workspace.workspace_id)
     }
@@ -3794,7 +3809,7 @@ impl ApiState {
 
     pub fn with_runtime_persistence(mut self, persistence: Arc<RuntimeStatePersistence>) -> Self {
         if let Some(state_root) = persistence.state_root() {
-            self.restore_session_isolations_from(state_root);
+            self.restore_session_isolations_from(&persistence);
             let path = state_root.join("session-git-contexts.json");
             match fs::read(&path) {
                 Ok(bytes) => {
@@ -3832,6 +3847,12 @@ impl ApiState {
             self.mcp_service = Arc::new(crate::mcp_runtime::McpServiceRuntime::load(
                 state_root.join("mcp-server.json"),
             ));
+            if let Err(error) = self
+                .mcp_service
+                .migrate_legacy_directory_bindings(&self.workspace_registry)
+            {
+                tracing::error!(%error, "MCP 旧令牌目录授权迁移失败，保留原令牌与文件；缺少持久目录授权的调用拒绝执行");
+            }
         }
         self.runtime_persistence = Some(persistence);
         if let Some(persistence) = self.runtime_persistence.clone() {
@@ -4119,6 +4140,21 @@ impl ApiState {
         self
     }
 
+    pub fn with_workspace_history_restore(mut self, restore: WorkspaceHistoryRestore) -> Self {
+        self.workspace_history_restore = Some(restore);
+        self
+    }
+
+    pub(crate) fn restore_workspace_history_for_api(
+        &self,
+        project: &magi_workspace::WorkspaceRecord,
+    ) -> Result<(), ApiError> {
+        if let Some(restore) = &self.workspace_history_restore {
+            restore(project)?;
+        }
+        Ok(())
+    }
+
     pub fn persist_session_state_checkpoint(&self, checkpoint: &str) -> Result<(), ApiError> {
         let durable_persisted = if let Some(persist) = &self.session_state_checkpoint_persist {
             persist(checkpoint)?
@@ -4143,17 +4179,56 @@ impl ApiState {
         let Some(workspace_id) = workspace_id else {
             return Ok(None);
         };
-        // 隔离会话在自己的副本里运行：没有主工作区的 Git 上下文，也不需要执行租约。
-        if self.session_isolations.contains(session_id.as_str()) {
+        // 旧入口无法表达目录身份，多根时必须由调用方指定源目录再执行。
+        let (_, workspace_root) = self
+            .workspace_registry
+            .resolve_source_folder(workspace_id, None)
+            .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+        self.ensure_session_code_context_for_root(session_id, workspace_id, &workspace_root)
+            .await
+    }
+
+    pub(crate) async fn ensure_session_code_context_for_root(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &WorkspaceId,
+        workspace_root: &Path,
+    ) -> Result<Option<magi_git::SessionCodeContext>, ApiError> {
+        let workspace_root =
+            std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+        if let Some(isolation) = self
+            .session_isolations
+            .get_for_source(session_id.as_str(), &workspace_root)
+        {
+            if isolation.source_root != workspace_root || !isolation.root.is_dir() {
+                return Err(ApiError::Conflict(
+                    "隔离副本与原目录绑定不匹配或已丢失".into(),
+                ));
+            }
             return Ok(None);
+        } else if self.session_isolations.contains(session_id.as_str()) {
+            return Err(ApiError::Conflict(
+                "源文件夹缺少会话隔离映射，不能回落原目录".into(),
+            ));
         }
-        let workspace_root = self
-            .workspace_root_path(&Some(workspace_id.clone()))
-            .ok_or_else(|| ApiError::not_found("workspace 不存在", workspace_id.as_str()))?;
         let _change_sync_guard = self.lock_session_change_sync(session_id).await;
         tracing::info!(%session_id, stage = "change_sync_acquired", "workspace execution preparation");
         let session_key = session_id.as_str();
-        let existing_context = self.session_code_contexts.get(session_key);
+        let existing_context = self
+            .session_code_contexts
+            .get_for_path(session_key, &workspace_root);
+        if existing_context.as_ref().is_some_and(|context| {
+            std::fs::canonicalize(&context.execution_root)
+                .unwrap_or_else(|_| context.execution_root.clone())
+                != workspace_root
+                && !context.runtime_workspace_roots.iter().any(|path| {
+                    std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()) == workspace_root
+                })
+        }) {
+            return Err(ApiError::Conflict(
+                "会话 Git 上下文属于另一个源文件夹，不能重用目录绑定".into(),
+            ));
+        }
         if let Some(existing_context) = existing_context.as_ref() {
             self.begin_session_git_execution(session_id, &existing_context.git.git_common_dir)
                 .await?;
@@ -4161,7 +4236,7 @@ impl ApiState {
         let mut observation = match self.git_service.observe(&workspace_root).await {
             Ok(observation) => observation,
             Err(magi_git::GitError::NotRepository { .. }) => {
-                self.release_session_git_execution_lease(session_id);
+                // 普通源目录没有 Git 资源；同会话其它获授仓库的租约仍在使用。
                 return Ok(None);
             }
             Err(error) => {
@@ -4335,11 +4410,40 @@ impl ApiState {
         session_id: &SessionId,
         git_common_dir: &std::path::Path,
     ) -> Result<(), ApiError> {
+        self.begin_session_git_execution_set(session_id, &[git_common_dir.to_path_buf()], None)
+            .await
+    }
+
+    pub(crate) async fn begin_session_git_execution_set(
+        &self,
+        session_id: &SessionId,
+        git_common_dirs: &[PathBuf],
+        expected_turn_id: Option<&str>,
+    ) -> Result<(), ApiError> {
         let mut announced = false;
         let result = loop {
+            if let Some(turn_id) = expected_turn_id
+                && !self
+                    .session_store
+                    .runtime_sidecar(session_id)
+                    .and_then(|sidecar| sidecar.current_turn)
+                    .is_some_and(|turn| {
+                        turn.turn_id == turn_id
+                            && self
+                                .session_store
+                                .canonical_turn_for_session_turn_id(session_id, turn_id)
+                                .is_some_and(|turn| !turn.status.is_terminal())
+                    })
+            {
+                self.workspace_git_coordinator
+                    .cancel_waiter(session_id.as_str());
+                break Err(ApiError::Conflict(
+                    "工作区准备目标 Turn 已关闭或变化".into(),
+                ));
+            }
             match self
                 .workspace_git_coordinator
-                .begin_execution(session_id.as_str(), git_common_dir)
+                .begin_execution_set(session_id.as_str(), git_common_dirs)
             {
                 Ok(()) => break Ok(()),
                 Err(
@@ -4356,8 +4460,10 @@ impl ApiState {
                             .cancel_waiter(session_id.as_str());
                         break Err(ApiError::Conflict(error.to_string()));
                     }
-                    self.workspace_git_coordinator
-                        .register_waiter(session_id.as_str(), git_common_dir);
+                    for root in git_common_dirs {
+                        self.workspace_git_coordinator
+                            .register_waiter(session_id.as_str(), root);
+                    }
                     if !announced {
                         announced = true;
                         let blocking: Vec<String> = match &error {
@@ -4509,6 +4615,15 @@ impl ApiState {
             .end_execution(session_id.as_str());
     }
 
+    pub fn release_session_git_execution_lease_for_repository(
+        &self,
+        session_id: &SessionId,
+        git_common_dir: &std::path::Path,
+    ) {
+        self.workspace_git_coordinator
+            .end_execution_for_repository(session_id.as_str(), git_common_dir);
+    }
+
     /// 删除 session 时只回收干净的 agent worktree；任何未提交改动都保留目录与 context，
     /// 禁止用 `--force` 静默丢失代理产物。
     async fn cleanup_session_git_resources(&self, session_id: &SessionId) -> bool {
@@ -4579,37 +4694,34 @@ impl ApiState {
             }
             return true;
         }
-        let Some(context) = self.session_code_contexts.get(session_id.as_str()) else {
-            self.session_code_contexts.remove(session_id.as_str());
-            let _ = self.persist_session_git_contexts();
-            return true;
-        };
         let mut cleanup_failed = false;
-        for agent in &context.agent_worktrees {
-            if !agent.path.exists() {
-                continue;
-            }
-            if let Err(error) = self
-                .git_service
-                .worktree_remove(
-                    &context.git.worktree_path,
-                    magi_git::WorktreeRemoveOptions {
-                        path: agent.path.clone(),
-                        force: false,
-                        confirm_force: false,
-                        precondition: context.precondition(),
-                    },
-                )
-                .await
-            {
-                cleanup_failed = true;
-                tracing::warn!(
-                    session_id = %session_id,
-                    task_id = %agent.task_id,
-                    worktree_path = %agent.path.display(),
-                    %error,
-                    "session 删除时保留无法安全回收的 agent worktree"
-                );
+        for context in self.session_code_contexts.for_session(session_id.as_str()) {
+            for agent in &context.agent_worktrees {
+                if !agent.path.exists() {
+                    continue;
+                }
+                if let Err(error) = self
+                    .git_service
+                    .worktree_remove(
+                        &context.git.worktree_path,
+                        magi_git::WorktreeRemoveOptions {
+                            path: agent.path.clone(),
+                            force: false,
+                            confirm_force: false,
+                            precondition: context.precondition(),
+                        },
+                    )
+                    .await
+                {
+                    cleanup_failed = true;
+                    tracing::warn!(
+                        session_id = %session_id,
+                        task_id = %agent.task_id,
+                        worktree_path = %agent.path.display(),
+                        %error,
+                        "session 删除时保留无法安全回收的 agent worktree"
+                    );
+                }
             }
         }
         if !cleanup_failed {
@@ -4716,6 +4828,22 @@ impl ApiState {
             })
     }
 
+    /// 在 WorkspaceStore 的管理事务中调用，快照由持有写锁的原拥有方提供，
+    /// 不重新读取 registry，也不先发布尚未落盘的内存事实。
+    pub(crate) fn persist_workspace_snapshot(
+        &self,
+        snapshot: &magi_workspace::WorkspaceDurableState,
+    ) -> magi_core::DomainResult<()> {
+        let Some(persistence) = &self.runtime_persistence else {
+            return Ok(());
+        };
+        persistence
+            .save_json(&persistence.workspace_path, snapshot)
+            .map_err(|error| magi_core::DomainError::Persistence {
+                message: format!("{error:?}"),
+            })
+    }
+
     pub fn persist_workspace_durable_state(&self) -> Result<(), ApiError> {
         let Some(persistence) = &self.runtime_persistence else {
             return Ok(());
@@ -4741,43 +4869,67 @@ impl ApiState {
         workspace_id: WorkspaceId,
         workspace_root: PathBuf,
     ) -> bool {
-        if !self
-            .knowledge_store
-            .begin_workspace_index_build(&workspace_id)
-        {
+        let Some(project) = self.workspace_registry.project(&workspace_id) else {
+            return false;
+        };
+        let root = canonicalize_path_for_workspace_match(&workspace_root);
+        let source = self
+            .session_isolations
+            .all()
+            .into_iter()
+            .find(|isolation| {
+                isolation.workspace_id == workspace_id.as_str()
+                    && canonicalize_path_for_workspace_match(&isolation.root) == root
+            })
+            .map(|isolation| isolation.source_root)
+            .unwrap_or_else(|| root.clone());
+        let Some(folder) = project
+            .source_folders
+            .iter()
+            .find(|folder| canonicalize_path_for_workspace_match(&folder.native_path()) == source)
+        else {
+            // 不能将无法归属的副本索引写入项目的旧单根槽位。
+            return false;
+        };
+        let isolated = source != root;
+        let index_store = if project.source_folders.len() == 1 && !isolated {
+            self.knowledge_store.as_ref().clone()
+        } else {
+            let Ok(index_store) = self
+                .knowledge_store
+                .for_source_folder(&folder.source_folder_id, &root)
+            else {
+                return false;
+            };
+            index_store
+        };
+        self.schedule_code_index(workspace_id, root, index_store)
+    }
+
+    pub(crate) fn schedule_code_index(
+        &self,
+        workspace_id: WorkspaceId,
+        workspace_root: PathBuf,
+        index_store: KnowledgeStore,
+    ) -> bool {
+        if !index_store.begin_workspace_index_build(&workspace_id) {
             return false;
         }
-
         let state = self.clone();
         tokio::spawn(async move {
-            let build_state = state.clone();
+            let build_store = index_store.clone();
             let build_workspace_id = workspace_id.clone();
-            let build_result = tokio::task::spawn_blocking(move || {
-                build_state
-                    .knowledge_store
-                    .build_workspace_index(&build_workspace_id, &workspace_root)
+            let result = tokio::task::spawn_blocking(move || {
+                build_store.build_workspace_index(&build_workspace_id, &workspace_root)
             })
             .await;
-            match build_result {
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        workspace_id = %workspace_id,
-                        error = %error,
-                        "后台代码索引构建任务失败"
-                    );
-                }
+            if let Err(error) = result {
+                tracing::warn!(workspace_id = %workspace_id, scope = ?index_store.code_index_scope(), error = %error, "后台代码索引构建失败");
             }
-            if state
-                .knowledge_store
-                .finish_workspace_index_build(&workspace_id)
+            if index_store.finish_workspace_index_build(&workspace_id)
                 && let Err(error) = state.persist_knowledge_state()
             {
-                tracing::warn!(
-                    workspace_id = %workspace_id,
-                    error = ?error,
-                    "已取消的后台代码索引清理结果持久化失败"
-                );
+                tracing::warn!(workspace_id = %workspace_id, error = ?error, "已取消的代码索引清理结果持久化失败");
             }
         });
         true
@@ -4863,6 +5015,15 @@ impl ApiState {
 
     pub fn task_store(&self) -> Option<&TaskStore> {
         self.task_store.as_deref()
+    }
+
+    pub(crate) fn has_active_session_tool_execution(&self, session_id: &SessionId) -> bool {
+        self.tool_registry.as_ref().is_some_and(|registry| {
+            registry.has_active_executions(&ToolExecutionContextQuery {
+                session_id: Some(session_id.clone()),
+                ..Default::default()
+            })
+        })
     }
 
     /// 构造一次性 Turn 事实写回边界。SessionStore 的 canonical mutation 必须
@@ -4991,8 +5152,56 @@ impl ApiState {
         lock.lock_owned().await
     }
 
+    /// 项目管理同时冻结已有会话的接纳边界。只尝试取得锁，不能在持有导航锁时
+    /// 等待执行结算（执行结算可能需要导航），也不能阻塞其它项目的控制面。
+    pub(crate) fn try_lock_session_turn_commit(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionTurnCommitGuard, ApiError> {
+        let lock = self
+            .session_turn_locks
+            .lock()
+            .expect("session turn locks should hold")
+            .entry(session_id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let guard = lock.try_lock_owned().map_err(|_| {
+            ApiError::Conflict("项目会话正在提交控制状态，请稍后重试项目修改".into())
+        })?;
+        Ok(SessionTurnCommitGuard {
+            _session_turn_guard: guard,
+        })
+    }
+
     pub(crate) async fn lock_session_navigation(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.session_navigation_lock.lock().await
+    }
+
+    fn project_directory_lock(&self, id: &WorkspaceId) -> Arc<tokio::sync::RwLock<()>> {
+        self.project_directory_locks
+            .lock()
+            .expect("project directory locks")
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone()
+    }
+
+    pub(crate) fn try_project_directory_admission(
+        &self,
+        id: &WorkspaceId,
+    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, ApiError> {
+        self.project_directory_lock(id)
+            .try_read_owned()
+            .map_err(|_| ApiError::Conflict("项目源文件夹正在修改，请稍后重试".into()))
+    }
+
+    pub(crate) fn try_project_directory_edit(
+        &self,
+        id: &WorkspaceId,
+    ) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, ApiError> {
+        self.project_directory_lock(id)
+            .try_write_owned()
+            .map_err(|_| ApiError::Conflict("项目请求正在接纳或目录正在修改，请稍后重试".into()))
     }
 
     /// 取得指定 session 的 Turn 提交锁。
@@ -5954,32 +6163,18 @@ fn normalize_mcp_servers_section(snapshot: &mut HashMap<String, serde_json::Valu
 /// 租约只用来保证同一 repository 同时只有一个主 session 在执行；等人不是执行，
 /// 不让出的话，用户思考期间同一仓库的其它会话都发不出消息。
 struct HumanWaitGitLeaseHook {
-    session_code_contexts: magi_git::SessionCodeContextRegistry,
     coordinator: magi_git::WorkspaceGitOperationCoordinator,
 }
 
 impl magi_conversation_runtime::HumanWaitHook for HumanWaitGitLeaseHook {
     fn suspend(&self, session_id: &SessionId) {
-        self.coordinator.end_execution(session_id.as_str());
+        self.coordinator.suspend_execution(session_id.as_str());
     }
 
     fn try_resume(&self, session_id: &SessionId) -> bool {
-        // 没有 Git context（非 Git 工作区）的会话从未占用过租约，也就无需抢回。
-        let Some(context) = self.session_code_contexts.get(session_id.as_str()) else {
-            return true;
-        };
-        match self
-            .coordinator
-            .begin_execution(session_id.as_str(), &context.git.git_common_dir)
-        {
-            Ok(()) => true,
-            Err(_) => {
-                // 排进等待队列，保证按先后顺序交接，而不是被后来者一直抢先。
-                self.coordinator
-                    .register_waiter(session_id.as_str(), &context.git.git_common_dir);
-                false
-            }
-        }
+        self.coordinator
+            .try_resume_execution(session_id.as_str())
+            .is_ok()
     }
 }
 
@@ -6168,7 +6363,10 @@ mod tests {
         accepted_at: u64,
     ) -> QueuedRegularSessionTurn {
         QueuedRegularSessionTurn {
+            project_directories: None,
             request: SessionTurnRequestDto {
+                source_folder_id: None,
+                project_directories: None,
                 desktop_browser_tools_allowed: false,
                 session_id: Some(session_id.to_string()),
                 scope: crate::dto::SessionScopeKindDto::Workspace,
@@ -8151,8 +8349,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn session_isolation_round_trips_through_runtime_persistence_and_drops_missing_copies() {
+    #[tokio::test]
+    async fn session_isolation_round_trips_and_preserves_missing_copy_binding() {
         let root = tempfile::tempdir().expect("state root");
         let alive_copy = tempfile::tempdir().expect("isolated copy");
         let persistence = || {
@@ -8187,9 +8385,10 @@ mod tests {
         state
             .session_isolations
             .insert(isolation("alive-session", alive_copy.path()));
+        let gone_copy = root.path().join("gone-copy");
         state
             .session_isolations
-            .insert(isolation("gone-session", Path::new("/definitely/not/here")));
+            .insert(isolation("gone-session", &gone_copy));
         state
             .persist_session_isolations()
             .expect("persist session isolations");
@@ -8197,9 +8396,21 @@ mod tests {
         let reloaded = new_state();
         assert!(reloaded.session_isolations.contains("alive-session"));
         assert!(
-            !reloaded.session_isolations.contains("gone-session"),
-            "副本目录已经不存在的会话回到主工作区运行"
+            reloaded.session_isolations.contains("gone-session"),
+            "副本目录已经不存在时必须保留绑定，阻止请求回落原目录"
         );
+        assert_eq!(
+            reloaded.snapshot_root_for_session(&SessionId::new("gone-session"), Path::new("/repo")),
+            gone_copy
+        );
+        assert!(
+            reloaded
+                .ensure_snapshot_session(&SessionId::new("gone-session"), Path::new("/repo"))
+                .await
+                .is_err(),
+            "快照准备不能为丢失副本新建空目录"
+        );
+        assert!(!gone_copy.exists());
         assert_eq!(
             reloaded
                 .snapshot_root_for_session(&SessionId::new("alive-session"), Path::new("/repo")),
@@ -8360,13 +8571,21 @@ mod tests {
             Arc::new(GovernanceService::default()),
         )
         .with_runtime_persistence(persistence());
+        let source_root = root.path().join("source");
+        fs::create_dir_all(&source_root).unwrap();
         state
-            .enqueue_regular_session_turn(queued_turn_fixture(
-                &session_id,
-                &workspace_id,
-                "queue-first",
-                11,
-            ))
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), source_root)
+            .unwrap();
+        let binding = state
+            .workspace_registry
+            .capture_directory_binding(&workspace_id, None, None)
+            .unwrap();
+        let mut first = queued_turn_fixture(&session_id, &workspace_id, "queue-first", 11);
+        first.project_directories = Some(binding.clone());
+        first.request.project_directories = Some(binding.clone());
+        state
+            .enqueue_regular_session_turn(first)
             .expect("first turn should persist");
         state
             .enqueue_regular_session_turn(queued_turn_fixture(
@@ -8387,6 +8606,14 @@ mod tests {
         .with_runtime_persistence(persistence());
         assert_eq!(restored.restore_regular_session_turn_queues().unwrap(), 2);
         assert_eq!(restored.queued_regular_session_turns(&session_id).len(), 2);
+        let restored_first = restored
+            .peek_next_regular_session_turn(&session_id)
+            .unwrap();
+        assert_eq!(restored_first.project_directories, Some(binding));
+        assert!(
+            restored_first.request.project_directories.is_none(),
+            "请求 JSON 不接受服务端授权；授权只在原 Input payload 保存"
+        );
         assert!(
             restored
                 .remove_regular_session_turn(&session_id, "queue-second")
@@ -9122,6 +9349,80 @@ mod tests {
                 Some("/tmp/magi-known-from-path"),
             ),
             Some(workspace_id)
+        );
+    }
+
+    #[test]
+    fn workspace_navigation_path_tracks_all_current_sources_after_primary_change() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let id = WorkspaceId::new("navigation-multi-source");
+        let project = state
+            .workspace_registry
+            .register_native_path(id.clone(), a.clone())
+            .unwrap();
+        let mut second = project.primary_source_folder().clone();
+        let host = magi_core::HostPath::canonicalize(&b).unwrap();
+        second.source_folder_id = "secondary".into();
+        second.path = AbsolutePath::new(host.display_string());
+        second.path_ref = host.to_path_ref().as_str().into();
+        let project = state
+            .workspace_registry
+            .edit_project(
+                &id,
+                project.revision,
+                magi_workspace::WorkspaceProjectEdit {
+                    name: Some("renamed".into()),
+                    source_folders: vec![project.primary_source_folder().clone(), second.clone()],
+                    primary_source_folder_id: second.source_folder_id.clone(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        for path in [&a, &b] {
+            assert_eq!(
+                state.resolve_workspace_id_from_request(None, path.to_str()),
+                Some(id.clone())
+            );
+            let binding = crate::scope_binding::require_registered_workspace_binding(
+                &state,
+                None,
+                path.to_str(),
+            )
+            .unwrap();
+            assert_eq!(binding.workspace_id, id);
+            assert_eq!(binding.workspace_path, host.display_string());
+        }
+        state
+            .workspace_registry
+            .edit_project(
+                &id,
+                project.revision,
+                magi_workspace::WorkspaceProjectEdit {
+                    name: project.name,
+                    source_folders: vec![second],
+                    primary_source_folder_id: "secondary".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            state.resolve_workspace_id_from_request(None, a.to_str()),
+            None
+        );
+        assert_eq!(
+            state.resolve_workspace_id_from_request(None, b.to_str()),
+            Some(id)
         );
     }
 

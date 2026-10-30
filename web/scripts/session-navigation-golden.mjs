@@ -82,16 +82,27 @@ await withGoldenViteServer(async (server) => {
     sessionId: 'session-navigation-golden',
   });
   assert.ok(workspaceSession, 'workspace session navigation should create a transaction');
+  assert.equal(navigation.matchesSessionNavigationTarget(workspaceSession.requestId, {
+    kind: 'session', scope: 'workspace', workspaceId: 'workspace-other',
+    workspacePath: '/tmp/workspace-navigation-golden', sessionId: 'session-navigation-golden',
+  }), false, '相同目录提示不能让其它项目提交导航');
+  assert.equal(navigation.matchesSessionNavigationTarget(workspaceSession.requestId, {
+    kind: 'session', scope: 'workspace', workspaceId: 'workspace-navigation-golden',
+    workspacePath: '/tmp/new-primary', sessionId: 'session-other',
+  }), false, '同项目不同会话必须继续拒绝');
+  assert.equal(navigation.navigateSession({
+    ...workspaceSession.target, workspacePath: '/tmp/new-primary',
+  }), workspaceSession, '切换主要目录不能重新创建同项目同会话的在途导航');
   assert.equal(
     navigation.settleSessionNavigation(workspaceSession.requestId, {
       kind: 'session',
       scope: 'workspace',
       workspaceId: 'workspace-navigation-golden',
-      workspacePath: '/tmp/workspace-navigation-golden',
+      workspacePath: '/tmp/new-primary',
       sessionId: 'session-navigation-golden',
     }),
     true,
-    'workspace navigation must validate both workspace id and path',
+    '同项目同会话的响应在主要目录变化后仍可确认导航',
   );
   await workspaceSession.completion;
   assert.equal(navigation.sessionNavigationState.pending, null);

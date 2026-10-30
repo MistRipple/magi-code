@@ -494,6 +494,7 @@ mod tests {
         let issued = tokens
             .issue(
                 IssueTokenRequest {
+                    project_directories: None,
                     client_name: "test".to_string(),
                     workspace_id: "ws".to_string(),
                     approval_mode: ApprovalMode::Ask,
@@ -686,6 +687,7 @@ mod tests {
             .tokens
             .issue(
                 IssueTokenRequest {
+                    project_directories: None,
                     client_name: "other".into(),
                     workspace_id: "ws".into(),
                     approval_mode: ApprovalMode::Ask,
@@ -918,6 +920,7 @@ mod tests {
             tokens
                 .issue(
                     IssueTokenRequest {
+                        project_directories: None,
                         client_name: "test".to_string(),
                         workspace_id: "ws".to_string(),
                         approval_mode: ApprovalMode::Ask,
@@ -1152,6 +1155,7 @@ mod tests {
             .tokens
             .issue(
                 IssueTokenRequest {
+                    project_directories: None,
                     client_name: "remote".to_string(),
                     workspace_id: "ws".to_string(),
                     approval_mode: ApprovalMode::Ask,

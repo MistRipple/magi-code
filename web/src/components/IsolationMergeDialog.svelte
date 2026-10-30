@@ -232,12 +232,12 @@
 
     {#snippet footer()}
       <div class="merge-footer">
-        <button type="button" class="merge-btn" disabled={applying} onclick={closeIsolationMergeDialog}>
+        <button type="button" class="btn btn--secondary btn--sm" disabled={applying} onclick={closeIsolationMergeDialog}>
           {i18n.t('isolation.merge.cancel')}
         </button>
         <button
           type="button"
-          class="merge-btn merge-btn--primary"
+          class="btn btn--primary btn--sm"
           disabled={applying || loading || mergeableCount === 0}
           onclick={() => void apply()}
         >
@@ -411,39 +411,8 @@
 
   .merge-footer {
     display: flex;
+    flex-wrap: wrap;
     justify-content: flex-end;
     gap: var(--space-2);
-  }
-
-  .merge-btn {
-    height: 28px;
-    padding: 0 14px;
-    border: 0;
-    border-radius: 999px;
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    font-size: var(--text-sm);
-  }
-
-  .merge-btn:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--foreground) 7%, transparent);
-    color: var(--foreground);
-  }
-
-  .merge-btn--primary {
-    background: var(--primary);
-    color: var(--primary-foreground, #fff);
-    font-weight: var(--font-semibold);
-  }
-
-  .merge-btn--primary:hover:not(:disabled) {
-    background: var(--primary-hover, var(--primary));
-    color: var(--primary-foreground, #fff);
-  }
-
-  .merge-btn:disabled {
-    cursor: not-allowed;
-    opacity: 0.5;
   }
 </style>

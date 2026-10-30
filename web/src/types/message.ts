@@ -293,6 +293,7 @@ export interface MessageImage {
 }
 
 export interface MessageContextReference {
+  sourceFolderId?: string;
   kind: 'file' | 'directory';
   path: string;
   pathRef?: string;
@@ -391,6 +392,7 @@ export interface ContentBlock {
   toolCall?: ToolCall;      // 工具调用信息
   thinking?: ThinkingBlock; // 思考块信息
   fileChange?: {
+    sourceFolderId?: string;
     sessionId?: string;
     workspaceId?: string;
     workspacePath?: string;
@@ -745,6 +747,7 @@ export interface QueuedMessageImage {
 }
 
 export interface QueuedMessageContextReference {
+  sourceFolderId?: string;
   kind: 'file' | 'directory';
   path: string;
   pathRef?: string;
@@ -764,6 +767,7 @@ export interface QueuedMessageBrowserAnnotationReference {
 export type QueuedMessageBrowserNodeSelection = MessageBrowserNodeSelection;
 
 export interface QueuedMessage {
+  sourceFolderId?: string;
   interruptTurnId?: string | null;
   interruptionError?: string | null;
   revision?: number;
@@ -888,6 +892,7 @@ export type EditContentKind = 'text' | 'large_text' | 'binary' | 'symlink' | 'sp
 export type EditSourceKind = 'tool' | 'watcher' | 'external' | 'baseline';
 
 export interface Edit {
+  sourceFolderId?: string;
   sessionId?: string;
   workspaceId?: string;
   workspacePath?: string;
@@ -923,6 +928,7 @@ export interface ChangeMutationStatus {
   sessionId?: string | null;
   workspaceId?: string | null;
   workspacePath?: string | null;
+  sourceFolderId?: string | null;
   updatedAt?: number;
 }
 

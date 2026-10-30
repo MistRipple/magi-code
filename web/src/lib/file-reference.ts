@@ -1,4 +1,5 @@
 export interface FilePreviewEventDetail {
+  sourceFolderId?: string;
   filepath: string;
   workspaceId?: string;
   workspacePath?: string;
@@ -13,7 +14,7 @@ export interface FilePreviewEventDetail {
   imageDataUrl?: string;
 }
 
-export type FilePreviewScope = Pick<FilePreviewEventDetail, 'workspaceId' | 'workspacePath' | 'sessionId'>;
+export type FilePreviewScope = Pick<FilePreviewEventDetail, 'workspaceId' | 'workspacePath' | 'sessionId' | 'sourceFolderId'>;
 export type FilePreviewScopeReader = () => FilePreviewScope | undefined;
 export const FILE_PREVIEW_SCOPE_CONTEXT = Symbol('magi-file-preview-scope');
 

@@ -611,6 +611,9 @@ impl BuiltinToolName {
                     | Self::ProcessInspect
                     | Self::DiffPreview
                     | Self::ImageGenerate
+                    | Self::SearchSemantic
+                    | Self::KnowledgeGraphQuery
+                    | Self::CodeSymbols
             )
     }
 
@@ -2168,6 +2171,32 @@ impl BuiltinToolName {
             schema["properties"]["repositoryPath"] = serde_json::json!({
                 "type": "string", "minLength": 1,
                 "description": "明确的 Git 仓库目录（相对会话执行目录或原生绝对路径）；省略时使用当前执行目录。不注册项目，不继承项目记忆。"
+            });
+        }
+        if self.requires_repository()
+            || matches!(
+                self,
+                Self::FileRead
+                    | Self::ViewImage
+                    | Self::FileWrite
+                    | Self::FilePatch
+                    | Self::ApplyPatch
+                    | Self::FileRemove
+                    | Self::FileMkdir
+                    | Self::FileCopy
+                    | Self::FileMove
+                    | Self::SearchText
+                    | Self::ShellExec
+                    | Self::DiffPreview
+                    | Self::ImageGenerate
+                    | Self::SearchSemantic
+                    | Self::KnowledgeGraphQuery
+                    | Self::CodeSymbols
+            )
+        {
+            schema["properties"]["source_folder_id"] = serde_json::json!({
+                "type": "string", "minLength": 1,
+                "description": "选择本次已授权的项目源文件夹 ID；相对路径和默认 cwd 从该目录的实际执行根解析。省略时使用本轮冻结的默认目录。只可使用当前目录映射提供的 ID；个人会话省略。"
             });
         }
         schema

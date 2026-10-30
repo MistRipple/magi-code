@@ -69,6 +69,10 @@ pub struct ToolExecutionContext {
     pub access_profile: magi_core::AccessProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<PathBuf>,
+    /// 本次可信执行允许使用的全部项目源目录及其实际执行根。
+    /// 模型输入不能修改此映射；路径解析、权限预检、写保护和工具执行共用它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_directory_map: Option<magi_core::ProjectDirectoryExecutionMap>,
     /// 当前模型轮次捕获的浏览器能力快照。
     ///
     /// 该快照只在当前 Turn 内使用；执行阶段不得用实时 Host revision 替换或

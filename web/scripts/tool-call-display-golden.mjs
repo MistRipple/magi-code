@@ -654,6 +654,7 @@ await withGoldenViteServer(async (server) => {
     toolName: 'file_patch',
     arguments: {
       path: 'styles.css',
+      source_folder_id: 'source-b',
       old_string: 'button,\ninput {',
       new_string: 'button,\ninput,\nselect {',
     },
@@ -666,6 +667,7 @@ await withGoldenViteServer(async (server) => {
   assert.equal(filePatchBlocks.length, 1, 'file_patch success should project as one file_change block');
   assert.equal(filePatchBlocks[0].type, 'file_change', 'file_patch should not render as raw JSON ToolCall');
   assert.equal(filePatchBlocks[0].fileChange.filePath, 'styles.css');
+  assert.equal(filePatchBlocks[0].fileChange.sourceFolderId, 'source-b', '文件产物保留原工具的源目录身份，不能跟随当前目录选择');
   assert.equal(filePatchBlocks[0].fileChange.changeType, 'modify');
   assert.match(filePatchBlocks[0].fileChange.diff, /-button,/);
   assert.match(filePatchBlocks[0].fileChange.diff, /\+select \{/);

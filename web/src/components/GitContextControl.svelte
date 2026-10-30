@@ -16,6 +16,7 @@
   } from '../stores/git-context.svelte';
   import { isSessionIsolated } from '../stores/session-isolation-store.svelte';
   import Icon from './Icon.svelte';
+  import { selectedComposerSourceFolderId } from '../stores/composer-workspace.svelte';
   import { RUNTIME_CONNECTION_EVENT, type AgentConnectionEventDetail } from '../web/agent-api';
 
   interface Props {
@@ -37,6 +38,7 @@
       workspaceId: workspace.workspaceId,
       workspacePath: workspace.rootPathRef?.trim() || workspace.rootPath.trim(),
       sessionId: sessionId.trim() || undefined,
+      sourceFolderId: selectedComposerSourceFolderId(workspace.workspaceId, sessionId),
     };
   });
   const bindingKey = $derived(binding ? gitContextBindingKey(binding) : '');

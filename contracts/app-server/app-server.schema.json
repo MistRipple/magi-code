@@ -537,6 +537,13 @@
             "null"
           ]
         },
+        "sourceFolderId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
         "name": {
           "type": "string",
           "minLength": 1
@@ -772,6 +779,15 @@
             "string",
             "null"
           ]
+        },
+        "sourceFolderId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "x-rust-default": true,
+          "description": "本轮默认执行源目录。可访问目录集合由 daemon 接纳时固定。"
         },
         "text": {
           "type": [
@@ -4675,14 +4691,41 @@
     "SessionQueueUpdateParams": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["sessionId", "queueId", "expectedRevision", "request"],
+      "required": [
+        "sessionId",
+        "queueId",
+        "expectedRevision",
+        "request"
+      ],
       "properties": {
-        "sessionId": { "type": "string", "minLength": 1 },
-        "workspaceId": { "type": ["string", "null"] },
-        "workspacePath": { "type": ["string", "null"] },
-        "queueId": { "type": "string", "minLength": 1 },
-        "expectedRevision": { "type": "integer", "minimum": 1, "x-rust-type": "u64" },
-        "request": { "$ref": "#/$defs/TurnStartParams" }
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspacePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "queueId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 1,
+          "x-rust-type": "u64"
+        },
+        "request": {
+          "$ref": "#/$defs/TurnStartParams"
+        }
       }
     },
     "SessionQueueGuideParams": {
@@ -4794,6 +4837,13 @@
             "string",
             "null"
           ]
+        },
+        "sourceFolderId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-rust-default": true
         },
         "acceptedAt": {
           "type": "integer",

@@ -24,6 +24,7 @@
     type GitWorktree,
   } from '../web/agent-api';
   import Icon from './Icon.svelte';
+  import { selectedComposerSourceFolderId } from '../stores/composer-workspace.svelte';
   import { RUNTIME_CONNECTION_EVENT, type AgentConnectionEventDetail } from '../web/agent-api';
 
   let advancedOpen = $state(false);
@@ -40,6 +41,7 @@
     workspaceId: messagesState.currentWorkspaceId?.trim() || '',
     workspacePath: messagesState.currentWorkspacePath?.trim() || '',
     sessionId: messagesState.currentSessionId?.trim() || undefined,
+    sourceFolderId: selectedComposerSourceFolderId(messagesState.currentWorkspaceId || '', messagesState.currentSessionId),
   }));
   const bindingKey = $derived(gitContextBindingKey(binding));
   const stateMatches = $derived(Boolean(bindingKey) && gitContextState.bindingKey === bindingKey);
@@ -317,8 +319,8 @@
                 </div>
                 {#if !branch.isCurrent}
                   <div class="git-row-actions">
-                    <button type="button" disabled={interactionLocked || Boolean(gitContextState.status?.hasUncommitted) || gitContextState.contextDrift} onclick={() => void mergeBranch(branch.name)}>{i18n.t('input.branch.merge')}</button>
-                    <button type="button" class="danger" disabled={interactionLocked || Boolean(branch.worktreePath) || gitContextState.contextDrift} onclick={() => void deleteLocalBranch(branch.name)}>{i18n.t('input.branch.delete')}</button>
+                    <button type="button" class="btn btn--secondary btn--sm" disabled={interactionLocked || Boolean(gitContextState.status?.hasUncommitted) || gitContextState.contextDrift} onclick={() => void mergeBranch(branch.name)}>{i18n.t('input.branch.merge')}</button>
+                    <button type="button" class="btn btn--error btn--sm" disabled={interactionLocked || Boolean(branch.worktreePath) || gitContextState.contextDrift} onclick={() => void deleteLocalBranch(branch.name)}>{i18n.t('input.branch.delete')}</button>
                   </div>
                 {/if}
               </div>
@@ -334,7 +336,7 @@
                 <div class="git-row">
                   <div class="git-row-main"><span title={branch}>{branch}</span></div>
                   <div class="git-row-actions">
-                    <button type="button" class="danger" disabled={interactionLocked || gitContextState.contextDrift} onclick={() => void deleteRemoteBranch(branch)}>{i18n.t('input.branch.deleteRemote')}</button>
+                    <button type="button" class="btn btn--error btn--sm" disabled={interactionLocked || gitContextState.contextDrift} onclick={() => void deleteRemoteBranch(branch)}>{i18n.t('input.branch.deleteRemote')}</button>
                   </div>
                 </div>
               {/each}
@@ -351,7 +353,7 @@
             {#if worktreeMode === 'writable'}
               <input bind:value={worktreeBranch} placeholder={i18n.t('input.branch.worktreeBranchPlaceholder')} disabled={interactionLocked || gitContextState.contextDrift} />
             {/if}
-            <button type="button" disabled={interactionLocked || gitContextState.contextDrift} onclick={() => void createWorktree()}>{i18n.t('input.branch.worktreeCreate')}</button>
+            <button type="button" class="btn btn--primary btn--sm" disabled={interactionLocked || gitContextState.contextDrift} onclick={() => void createWorktree()}>{i18n.t('input.branch.worktreeCreate')}</button>
           </div>
           {#if worktreesLoading}
             <div class="git-empty">{i18n.t('input.branch.loading')}</div>
@@ -368,7 +370,7 @@
                   {#if worktree.path === gitContextState.worktreePath}
                     <small>{i18n.t('input.branch.currentWorktree')}</small>
                   {:else if worktree.managed}
-                    <div class="git-row-actions"><button type="button" class="danger" disabled={interactionLocked} onclick={() => void removeWorktree(worktree.path)}>{i18n.t('input.branch.worktreeRemove')}</button></div>
+                    <div class="git-row-actions"><button type="button" class="btn btn--error btn--sm" disabled={interactionLocked} onclick={() => void removeWorktree(worktree.path)}>{i18n.t('input.branch.worktreeRemove')}</button></div>
                   {:else}
                     <small>{i18n.t('input.branch.externalWorktree')}</small>
                   {/if}
@@ -406,10 +408,7 @@
   .git-row-main { max-width: 100%; display: flex; flex-direction: column; min-width: 0; }
   .git-row-main > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); font-size: var(--text-xs); }
   .git-row small, .git-row-main small { max-width: min(360px, 100%); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground-muted); font-size: var(--text-xs); }
-  .git-row-actions { display: inline-flex; gap: 4px; flex: 0 0 auto; }
-  .git-row-actions button, .git-worktree-create button { height: 24px; padding: 0 7px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; font-size: var(--text-xs); }
-  .git-row-actions button:hover:not(:disabled), .git-worktree-create button:hover:not(:disabled) { background: var(--surface-hover); color: var(--foreground); }
-  .git-row-actions button.danger:hover:not(:disabled) { border-color: color-mix(in srgb, var(--error) 46%, var(--border-subtle)); color: var(--error); }
+  .git-row-actions { display: inline-flex; flex-wrap: wrap; gap: var(--space-2); flex: 0 1 auto; }
   button:disabled { cursor: not-allowed; opacity: 0.48; }
   .git-worktree-create { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
   .git-worktree-create input { min-width: 130px; height: 26px; padding: 0 7px; border: var(--magi-hairline) solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--background); color: var(--foreground); font-size: var(--text-xs); }

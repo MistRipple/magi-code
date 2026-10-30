@@ -803,6 +803,9 @@ pub struct TaskRecoveryCheckpoint {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskExecutorBinding {
+    /// 接纳任务时冻结的项目目录授权；恢复和子任务不能按当前项目成员重新扩权。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_directories: Option<crate::ProjectDirectoryBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_selection: Option<crate::AgentModelSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

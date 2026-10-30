@@ -204,20 +204,28 @@ pub struct SessionCodeContextRegistry {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum SessionContextKey {
-    Project(String),
     Repository { session_id: String, root: PathBuf },
 }
 
 impl SessionCodeContextRegistry {
+    /// 仅兼容唯一项目仓库的旧读入口；多仓库时不猜测默认仓库。
     pub fn get(&self, session_id: &str) -> Option<SessionCodeContext> {
-        self.contexts
-            .read()
-            .expect("session code context read lock poisoned")
-            .get(&SessionContextKey::Project(session_id.to_string()))
-            .cloned()
+        let mut contexts = self
+            .for_session(session_id)
+            .into_iter()
+            .filter(|context| !context.workspace_id.is_empty());
+        let only = contexts.next()?;
+        contexts.next().is_none().then_some(only)
     }
 
-    /// 个人会话按实际仓库分别保存 Git 基线，不改变会话默认 cwd 或项目归属。
+    pub fn for_session(&self, session_id: &str) -> Vec<SessionCodeContext> {
+        self.all()
+            .into_iter()
+            .filter(|context| context.session_id == session_id)
+            .collect()
+    }
+
+    /// 项目和个人会话都按实际 worktree 保存独立 Git 基线。
     pub fn get_repository(&self, session_id: &str, root: &Path) -> Option<SessionCodeContext> {
         self.contexts
             .read()
@@ -226,15 +234,43 @@ impl SessionCodeContextRegistry {
             .cloned()
     }
 
-    fn context_key(session_id: &str, workspace_id: &str, root: &Path) -> SessionContextKey {
-        if workspace_id.is_empty() {
-            SessionContextKey::Repository {
-                session_id: session_id.to_string(),
-                root: canonical_or_original(root),
-            }
-        } else {
-            SessionContextKey::Project(session_id.to_string())
+    /// 寻找实际执行路径所属仓库（包括子代理 worktree）。不跨到另一个任意仓库。
+    pub fn get_for_path(&self, session_id: &str, path: &Path) -> Option<SessionCodeContext> {
+        let path = canonical_or_original(path);
+        let contexts = self.for_session(session_id);
+        let mut candidates = contexts
+            .into_iter()
+            .filter_map(|context| {
+                let longest = std::iter::once(&context.execution_root)
+                    .chain(context.runtime_workspace_roots.iter())
+                    .filter_map(|root| {
+                        let root = canonical_or_original(root);
+                        path.starts_with(&root).then_some(root.components().count())
+                    })
+                    .max()?;
+                Some((longest, context))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
+        if candidates.len() > 1 && candidates[0].0 == candidates[1].0 {
+            return None;
         }
+        candidates.into_iter().next().map(|(_, context)| context)
+    }
+
+    fn context_key(session_id: &str, _workspace_id: &str, root: &Path) -> SessionContextKey {
+        SessionContextKey::Repository {
+            session_id: session_id.to_string(),
+            root: canonical_or_original(root),
+        }
+    }
+
+    fn unambiguous_root(&self, session_id: &str) -> Result<PathBuf, SessionContextError> {
+        self.get(session_id)
+            .map(|context| context.execution_root)
+            .ok_or_else(|| SessionContextError::Missing {
+                session_id: session_id.to_string(),
+            })
     }
 
     pub fn all(&self) -> Vec<SessionCodeContext> {
@@ -293,9 +329,20 @@ impl SessionCodeContextRegistry {
             .contexts
             .write()
             .expect("session code context write lock poisoned");
-        let main = contexts.remove(&SessionContextKey::Project(session_id.to_string()));
+        let only = contexts
+            .values()
+            .filter(|context| context.session_id == session_id)
+            .cloned()
+            .collect::<Vec<_>>();
         contexts.retain(|_, context| context.session_id != session_id);
-        main
+        (only.len() == 1).then(|| only[0].clone())
+    }
+
+    pub fn remove_for_root(&self, session_id: &str, root: &Path) -> Option<SessionCodeContext> {
+        self.contexts
+            .write()
+            .expect("session code context write lock poisoned")
+            .remove(&Self::context_key(session_id, "", root))
     }
 
     /// 只刷新观测值，不接受外部 branch/HEAD 变化为新的期望基线。
@@ -337,14 +384,24 @@ impl SessionCodeContextRegistry {
         session_id: &str,
         expected_revision: Option<u64>,
     ) -> Result<(), SessionContextError> {
+        let root = self.unambiguous_root(session_id)?;
+        self.validate_revision_for_root(session_id, &root, expected_revision)
+    }
+
+    pub fn validate_revision_for_root(
+        &self,
+        session_id: &str,
+        root: &Path,
+        expected_revision: Option<u64>,
+    ) -> Result<(), SessionContextError> {
         let Some(expected_revision) = expected_revision else {
             return Ok(());
         };
-        let context = self
-            .get(session_id)
-            .ok_or_else(|| SessionContextError::Missing {
-                session_id: session_id.to_string(),
-            })?;
+        let context =
+            self.get_repository(session_id, root)
+                .ok_or_else(|| SessionContextError::Missing {
+                    session_id: session_id.to_string(),
+                })?;
         if context.context_revision == expected_revision {
             Ok(())
         } else {
@@ -360,12 +417,22 @@ impl SessionCodeContextRegistry {
         session_id: &str,
         agent_worktree: AgentWorktreeContext,
     ) -> Result<SessionCodeContext, SessionContextError> {
+        let root = self.unambiguous_root(session_id)?;
+        self.register_agent_worktree_for_root(session_id, &root, agent_worktree)
+    }
+
+    pub fn register_agent_worktree_for_root(
+        &self,
+        session_id: &str,
+        root: &Path,
+        agent_worktree: AgentWorktreeContext,
+    ) -> Result<SessionCodeContext, SessionContextError> {
         let mut contexts = self
             .contexts
             .write()
             .expect("session code context write lock poisoned");
         let context = contexts
-            .get_mut(&SessionContextKey::Project(session_id.to_string()))
+            .get_mut(&Self::context_key(session_id, "", root))
             .ok_or_else(|| SessionContextError::Missing {
                 session_id: session_id.to_string(),
             })?;
@@ -391,12 +458,22 @@ impl SessionCodeContextRegistry {
         session_id: &str,
         task_id: &str,
     ) -> Result<SessionCodeContext, SessionContextError> {
+        let root = self.unambiguous_root(session_id)?;
+        self.release_agent_worktree_for_root(session_id, &root, task_id)
+    }
+
+    pub fn release_agent_worktree_for_root(
+        &self,
+        session_id: &str,
+        root: &Path,
+        task_id: &str,
+    ) -> Result<SessionCodeContext, SessionContextError> {
         let mut contexts = self
             .contexts
             .write()
             .expect("session code context write lock poisoned");
         let context = contexts
-            .get_mut(&SessionContextKey::Project(session_id.to_string()))
+            .get_mut(&Self::context_key(session_id, "", root))
             .ok_or_else(|| SessionContextError::Missing {
                 session_id: session_id.to_string(),
             })?;
@@ -424,12 +501,32 @@ impl SessionCodeContextRegistry {
         result_head: String,
         changed_paths: Vec<String>,
     ) -> Result<SessionCodeContext, SessionContextError> {
+        let root = self.unambiguous_root(session_id)?;
+        self.record_agent_worktree_result_for_root(
+            session_id,
+            &root,
+            task_id,
+            lease_id,
+            result_head,
+            changed_paths,
+        )
+    }
+
+    pub fn record_agent_worktree_result_for_root(
+        &self,
+        session_id: &str,
+        root: &Path,
+        task_id: &str,
+        lease_id: &str,
+        result_head: String,
+        changed_paths: Vec<String>,
+    ) -> Result<SessionCodeContext, SessionContextError> {
         let mut contexts = self
             .contexts
             .write()
             .expect("session code context write lock poisoned");
         let context = contexts
-            .get_mut(&SessionContextKey::Project(session_id.to_string()))
+            .get_mut(&Self::context_key(session_id, "", root))
             .ok_or_else(|| SessionContextError::Missing {
                 session_id: session_id.to_string(),
             })?;
@@ -455,12 +552,23 @@ impl SessionCodeContextRegistry {
         task_id: &str,
         result_head: &str,
     ) -> Result<SessionCodeContext, SessionContextError> {
+        let root = self.unambiguous_root(session_id)?;
+        self.mark_agent_worktree_applied_for_root(session_id, &root, task_id, result_head)
+    }
+
+    pub fn mark_agent_worktree_applied_for_root(
+        &self,
+        session_id: &str,
+        root: &Path,
+        task_id: &str,
+        result_head: &str,
+    ) -> Result<SessionCodeContext, SessionContextError> {
         let mut contexts = self
             .contexts
             .write()
             .expect("session code context write lock poisoned");
         let context = contexts
-            .get_mut(&SessionContextKey::Project(session_id.to_string()))
+            .get_mut(&Self::context_key(session_id, "", root))
             .ok_or_else(|| SessionContextError::Missing {
                 session_id: session_id.to_string(),
             })?;
@@ -486,12 +594,23 @@ impl SessionCodeContextRegistry {
         task_id: &str,
         lease_id: &str,
     ) -> Result<SessionCodeContext, SessionContextError> {
+        let root = self.unambiguous_root(session_id)?;
+        self.release_agent_worktree_for_lease_for_root(session_id, &root, task_id, lease_id)
+    }
+
+    pub fn release_agent_worktree_for_lease_for_root(
+        &self,
+        session_id: &str,
+        root: &Path,
+        task_id: &str,
+        lease_id: &str,
+    ) -> Result<SessionCodeContext, SessionContextError> {
         let mut contexts = self
             .contexts
             .write()
             .expect("session code context write lock poisoned");
         let context = contexts
-            .get_mut(&SessionContextKey::Project(session_id.to_string()))
+            .get_mut(&Self::context_key(session_id, "", root))
             .ok_or_else(|| SessionContextError::Missing {
                 session_id: session_id.to_string(),
             })?;
@@ -523,12 +642,24 @@ impl SessionCodeContextRegistry {
         lease_id: &str,
         worker_id: &str,
     ) -> Result<SessionCodeContext, SessionContextError> {
+        let root = self.unambiguous_root(session_id)?;
+        self.reattach_agent_worktree_for_root(session_id, &root, expected, lease_id, worker_id)
+    }
+
+    pub fn reattach_agent_worktree_for_root(
+        &self,
+        session_id: &str,
+        root: &Path,
+        expected: &AgentWorktreeContext,
+        lease_id: &str,
+        worker_id: &str,
+    ) -> Result<SessionCodeContext, SessionContextError> {
         let mut contexts = self
             .contexts
             .write()
             .expect("session code context write lock poisoned");
         let context = contexts
-            .get_mut(&SessionContextKey::Project(session_id.to_string()))
+            .get_mut(&Self::context_key(session_id, "", root))
             .ok_or_else(|| SessionContextError::Missing {
                 session_id: session_id.to_string(),
             })?;
@@ -612,6 +743,16 @@ impl SessionCodeContextRegistry {
         let old_worktree = context.git.worktree_path.clone();
         context.workspace_id = workspace_id.to_string();
         context.execution_root = observation.worktree_path.clone();
+        // 刷新主线观测不能撤销仍在执行的子代理目录归属。
+        runtime_workspace_roots.extend(
+            context
+                .agent_worktrees
+                .iter()
+                .filter(|agent| agent.active)
+                .map(|agent| agent.path.clone()),
+        );
+        runtime_workspace_roots.sort();
+        runtime_workspace_roots.dedup();
         context.runtime_workspace_roots = runtime_workspace_roots;
         context.git.repository_root = observation.repository_root.clone();
         context.git.git_common_dir = observation.git_common_dir.clone();
@@ -655,8 +796,9 @@ pub struct WorkspaceGitOperationCoordinator {
 
 #[derive(Default)]
 struct WorkspaceGitOperationState {
-    active_executions: HashMap<String, PathBuf>,
+    active_executions: HashMap<(String, PathBuf), ()>,
     active_mutations: HashSet<PathBuf>,
+    suspended_executions: HashMap<String, Vec<PathBuf>>,
     /// 因仓库被占用而排队的 session，按先后顺序。只有队首能在仓库空闲时拿到租约，
     /// 否则一个连续续跑的目标会在每轮之间抢先重新占用，其它会话永远等不到。
     waiters: Vec<ExecutionWaiter>,
@@ -664,7 +806,7 @@ struct WorkspaceGitOperationState {
 
 struct ExecutionWaiter {
     session_id: String,
-    repository_key: PathBuf,
+    repository_keys: Vec<PathBuf>,
     refreshed_at: std::time::Instant,
 }
 
@@ -698,8 +840,17 @@ impl WorkspaceGitOperationCoordinator {
         self.state
             .lock()
             .ok()
-            .and_then(|state| state.active_executions.get(session_id).cloned())
-            .is_some_and(|active_repository| same_path(&active_repository, &repository_key))
+            .and_then(|state| {
+                state
+                    .active_executions
+                    .keys()
+                    .any(|(active_session, active_repository)| {
+                        active_session == session_id
+                            && same_path(active_repository, &repository_key)
+                    })
+                    .then_some(())
+            })
+            .is_some()
     }
 
     pub fn begin_execution(
@@ -707,55 +858,160 @@ impl WorkspaceGitOperationCoordinator {
         session_id: &str,
         git_common_dir: &Path,
     ) -> Result<(), GitCoordinationError> {
-        let repository_key = canonical_or_original(git_common_dir);
+        // 运行中的子代理也用此入口复核占用；失败不能释放同会话其它任务正在用的租约。
+        self.acquire_execution_set(session_id, &[git_common_dir.to_path_buf()], false)
+    }
+
+    /// 在同一把协调锁里获取规范化、排序、去重后的整组仓库。无法全部取得时
+    /// 释放该会话已持有的整组资源，再由调用者等待/重试，避免交叉持有死锁。
+    pub fn begin_execution_set(
+        &self,
+        session_id: &str,
+        git_common_dirs: &[PathBuf],
+    ) -> Result<(), GitCoordinationError> {
+        self.acquire_execution_set(session_id, git_common_dirs, true)
+    }
+
+    fn acquire_execution_set(
+        &self,
+        session_id: &str,
+        git_common_dirs: &[PathBuf],
+        release_on_failure: bool,
+    ) -> Result<(), GitCoordinationError> {
         let mut state = self
             .state
             .lock()
             .map_err(|error| GitCoordinationError::Internal(error.to_string()))?;
-        if state.active_mutations.contains(&repository_key) {
-            return Err(GitCoordinationError::MutationActive { repository_key });
-        }
-        if let Some(existing) = state.active_executions.get(session_id) {
-            if same_path(existing, &repository_key) {
+        let mut desired = git_common_dirs
+            .iter()
+            .map(|root| canonical_or_original(root))
+            .chain(
+                state
+                    .active_executions
+                    .keys()
+                    .filter(|(id, _)| id == session_id)
+                    .map(|(_, path)| path.clone()),
+            )
+            .collect::<Vec<_>>();
+        desired.sort();
+        desired.dedup();
+        state.prune_stale_waiters();
+        let check = desired.iter().try_for_each(|repository_key| {
+            if state
+                .active_executions
+                .contains_key(&(session_id.to_string(), repository_key.clone()))
+            {
                 return Ok(());
             }
-            return Err(GitCoordinationError::SessionAlreadyBound {
-                session_id: session_id.to_string(),
-                repository_key: existing.clone(),
-            });
-        }
-        let active_session_ids = state
-            .active_executions
-            .iter()
-            .filter(|(_, active_repository)| same_path(active_repository, &repository_key))
-            .map(|(active_session_id, _)| active_session_id.clone())
-            .collect::<Vec<_>>();
-        if !active_session_ids.is_empty() {
-            return Err(GitCoordinationError::ExecutionActive {
-                repository_key,
-                active_session_ids,
-            });
-        }
-        // 仓库空闲时也要让排在前面的等待者先拿：只有队首（或没有等待者）才能占用。
-        state.prune_stale_waiters();
-        if let Some(head) = state
-            .waiters
-            .iter()
-            .find(|waiter| same_path(&waiter.repository_key, &repository_key))
-            && head.session_id != session_id
-        {
-            return Err(GitCoordinationError::ExecutionActive {
-                repository_key,
-                active_session_ids: vec![head.session_id.clone()],
-            });
+            if state.active_mutations.contains(repository_key) {
+                return Err(GitCoordinationError::MutationActive {
+                    repository_key: repository_key.clone(),
+                });
+            }
+            let active_session_ids = state
+                .active_executions
+                .keys()
+                .filter(|(id, repository)| {
+                    id != session_id && same_path(repository, repository_key)
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            if !active_session_ids.is_empty() {
+                return Err(GitCoordinationError::ExecutionActive {
+                    repository_key: repository_key.clone(),
+                    active_session_ids,
+                });
+            }
+            if let Some(head) = state
+                .waiters
+                .iter()
+                .find(|waiter| waiter.repository_keys.contains(repository_key))
+                && head.session_id != session_id
+            {
+                return Err(GitCoordinationError::ExecutionActive {
+                    repository_key: repository_key.clone(),
+                    active_session_ids: vec![head.session_id.clone()],
+                });
+            }
+            Ok(())
+        });
+        if let Err(error) = check {
+            if release_on_failure {
+                state
+                    .active_executions
+                    .retain(|(id, _), _| id != session_id);
+            }
+            return Err(error);
         }
         state
             .waiters
             .retain(|waiter| waiter.session_id != session_id);
-        state
-            .active_executions
-            .insert(session_id.to_string(), repository_key);
+        for root in desired {
+            state
+                .active_executions
+                .insert((session_id.to_string(), root), ());
+        }
         Ok(())
+    }
+
+    pub fn execution_roots(&self, session_id: &str) -> Vec<PathBuf> {
+        let mut roots = self
+            .state
+            .lock()
+            .map(|state| {
+                state
+                    .active_executions
+                    .keys()
+                    .filter(|(id, _)| id == session_id)
+                    .map(|(_, path)| path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        roots.sort();
+        roots
+    }
+
+    /// 等人时保留原租约集合，恢复不能从当前项目成员或历史 context 扩张范围。
+    pub fn suspend_execution(&self, session_id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            let roots = state
+                .active_executions
+                .keys()
+                .filter(|(id, _)| id == session_id)
+                .map(|(_, path)| path.clone())
+                .collect::<Vec<_>>();
+            if !roots.is_empty() {
+                state.suspended_executions.insert(session_id.into(), roots);
+            }
+            state
+                .active_executions
+                .retain(|(id, _), _| id != session_id);
+        }
+    }
+
+    pub fn try_resume_execution(&self, session_id: &str) -> Result<(), GitCoordinationError> {
+        let roots = self
+            .state
+            .lock()
+            .map_err(|error| GitCoordinationError::Internal(error.to_string()))?
+            .suspended_executions
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        let result = self.begin_execution_set(session_id, &roots);
+        match &result {
+            Ok(()) => {
+                if let Ok(mut state) = self.state.lock() {
+                    state.suspended_executions.remove(session_id);
+                }
+            }
+            Err(_) => {
+                for root in &roots {
+                    self.register_waiter(session_id, root);
+                }
+            }
+        }
+        result
     }
 
     /// 登记（或刷新）一个因仓库被占用而等待的 session。等待者每次重试 `begin_execution`
@@ -764,17 +1020,23 @@ impl WorkspaceGitOperationCoordinator {
         let repository_key = canonical_or_original(git_common_dir);
         if let Ok(mut state) = self.state.lock() {
             state.prune_stale_waiters();
+            // 每个会话占据一个全局队列位置，全部仓库共享该次序。逐仓库排队会
+            // 因 A→B 与 B→A 的登记顺序形成两个互相等待的队首。
             if let Some(waiter) = state
                 .waiters
                 .iter_mut()
                 .find(|waiter| waiter.session_id == session_id)
             {
                 waiter.refreshed_at = std::time::Instant::now();
+                if !waiter.repository_keys.contains(&repository_key) {
+                    waiter.repository_keys.push(repository_key);
+                    waiter.repository_keys.sort();
+                }
                 return;
             }
             state.waiters.push(ExecutionWaiter {
                 session_id: session_id.to_string(),
-                repository_key,
+                repository_keys: vec![repository_key],
                 refreshed_at: std::time::Instant::now(),
             });
         }
@@ -791,10 +1053,40 @@ impl WorkspaceGitOperationCoordinator {
 
     pub fn end_execution(&self, session_id: &str) {
         if let Ok(mut state) = self.state.lock() {
-            state.active_executions.remove(session_id);
+            state
+                .active_executions
+                .retain(|(id, _), _| id != session_id);
+            state.suspended_executions.remove(session_id);
             state
                 .waiters
                 .retain(|waiter| waiter.session_id != session_id);
+        }
+    }
+
+    pub fn end_execution_for_repository(&self, session_id: &str, git_common_dir: &Path) {
+        let repository_key = canonical_or_original(git_common_dir);
+        if let Ok(mut state) = self.state.lock() {
+            state.active_executions.retain(|(id, repository), _| {
+                !(id == session_id && same_path(repository, &repository_key))
+            });
+            if let Some(roots) = state.suspended_executions.get_mut(session_id) {
+                roots.retain(|root| !same_path(root, &repository_key));
+                if roots.is_empty() {
+                    state.suspended_executions.remove(session_id);
+                }
+            }
+            for waiter in state
+                .waiters
+                .iter_mut()
+                .filter(|waiter| waiter.session_id == session_id)
+            {
+                waiter
+                    .repository_keys
+                    .retain(|root| !same_path(root, &repository_key));
+            }
+            state
+                .waiters
+                .retain(|waiter| !waiter.repository_keys.is_empty());
         }
     }
 
@@ -810,8 +1102,8 @@ impl WorkspaceGitOperationCoordinator {
         let active_session_ids = state
             .active_executions
             .iter()
-            .filter(|(_, active_repository)| same_path(active_repository, &repository_key))
-            .map(|(session_id, _)| session_id.clone())
+            .filter(|((_, active_repository), _)| same_path(active_repository, &repository_key))
+            .map(|((session_id, _), _)| session_id.clone())
             .collect::<Vec<_>>();
         if !active_session_ids.is_empty() {
             return Err(GitCoordinationError::ExecutionActive {
@@ -837,11 +1129,6 @@ pub enum GitCoordinationError {
     ExecutionActive {
         repository_key: PathBuf,
         active_session_ids: Vec<String>,
-    },
-    #[error("session {session_id} 已绑定到另一个运行中 repository")]
-    SessionAlreadyBound {
-        session_id: String,
-        repository_key: PathBuf,
     },
     #[error("Git coordination state 不可用: {0}")]
     Internal(String),
@@ -2904,6 +3191,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_repository_contexts_keep_independent_revisions_outputs_and_restart_state() {
+        let repo = repository();
+        let second = repository();
+        let service = GitService::new();
+        let linked_parent = tempfile::tempdir().unwrap();
+        let linked = linked_parent.path().join("linked");
+        service
+            .worktree_create(
+                repo.path(),
+                WorktreeCreateOptions {
+                    path: linked.clone(),
+                    base: "HEAD".into(),
+                    branch: Some("linked-project".into()),
+                    create_branch: true,
+                    detached: false,
+                    precondition: GitPrecondition::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let observations = [
+            service.observe(repo.path()).await.unwrap(),
+            service.observe(second.path()).await.unwrap(),
+            service.observe(&linked).await.unwrap(),
+        ];
+        assert_eq!(
+            observations[0].git_common_dir,
+            observations[2].git_common_dir
+        );
+        let registry = SessionCodeContextRegistry::default();
+        for (index, observation) in observations.iter().enumerate() {
+            registry.accept("project-session", "project", vec![], observation);
+            registry
+                .register_agent_worktree_for_root(
+                    "project-session",
+                    &observation.worktree_path,
+                    AgentWorktreeContext {
+                        task_id: "same-task".into(),
+                        lease_id: Some("same-lease".into()),
+                        worker_id: "worker".into(),
+                        path: linked_parent.path().join(format!("agent-{index}")),
+                        mode: AgentWorktreeMode::Writable,
+                        base_head: observation.head.clone().unwrap(),
+                        branch: None,
+                        active: true,
+                        result_head: None,
+                        changed_paths: vec![],
+                        applied: false,
+                    },
+                )
+                .unwrap();
+        }
+        assert!(registry.get("project-session").is_none());
+        assert!(
+            registry
+                .register_agent_worktree(
+                    "project-session",
+                    registry.all()[0].agent_worktrees[0].clone()
+                )
+                .is_err()
+        );
+        let untouched = registry
+            .get_repository("project-session", &observations[1].worktree_path)
+            .unwrap();
+        git(repo.path(), &["switch", "-c", "external-change"]);
+        let current = service.observe(repo.path()).await.unwrap();
+        let drifted = registry.observe("project-session", "project", vec![], &current);
+        assert!(drifted.has_external_drift());
+        assert_eq!(
+            registry
+                .get_repository("project-session", &observations[1].worktree_path)
+                .unwrap(),
+            untouched
+        );
+        assert_eq!(
+            registry
+                .get_for_path(
+                    "project-session",
+                    &linked_parent.path().join("agent-0/src/index.ts")
+                )
+                .unwrap()
+                .execution_root,
+            current.worktree_path
+        );
+        assert!(
+            registry
+                .validate_revision_for_root(
+                    "project-session",
+                    &current.worktree_path,
+                    Some(untouched.context_revision)
+                )
+                .is_err()
+        );
+        registry
+            .validate_revision_for_root(
+                "project-session",
+                &untouched.execution_root,
+                Some(untouched.context_revision),
+            )
+            .unwrap();
+        registry
+            .record_agent_worktree_result_for_root(
+                "project-session",
+                &current.worktree_path,
+                "same-task",
+                "same-lease",
+                "result-a".into(),
+                vec!["src/index.ts".into()],
+            )
+            .unwrap();
+        assert!(
+            registry
+                .get_repository("project-session", &untouched.execution_root)
+                .unwrap()
+                .agent_worktrees[0]
+                .result_head
+                .is_none()
+        );
+        let persisted = serde_json::to_vec(&registry.all()).unwrap();
+        let restored = SessionCodeContextRegistry::default();
+        assert_eq!(
+            restored.restore_after_restart(serde_json::from_slice(&persisted).unwrap()),
+            3
+        );
+        assert_eq!(restored.for_session("project-session").len(), 3);
+        for context in restored.all() {
+            assert!(!context.agent_worktrees[0].active);
+            assert_eq!(
+                context.runtime_workspace_roots,
+                vec![context.execution_root.clone()]
+            );
+        }
+        assert_eq!(
+            restored
+                .get_repository("project-session", &current.worktree_path)
+                .unwrap()
+                .agent_worktrees[0]
+                .result_head
+                .as_deref(),
+            Some("result-a")
+        );
+        restored
+            .remove_for_root("project-session", &current.worktree_path)
+            .unwrap();
+        assert_eq!(restored.for_session("project-session").len(), 2);
+        restored.remove("project-session");
+        assert!(restored.for_session("project-session").is_empty());
+    }
+
+    #[tokio::test]
     async fn agent_worktree_recovery_preserves_dirty_files_and_rebinds_only_the_old_lease() {
         let repo = repository();
         let service = GitService::new();
@@ -3975,6 +4412,61 @@ mod tests {
         coordinator
             .begin_execution("session-a", &repository)
             .expect("a is last and gets it now");
+    }
+
+    #[test]
+    fn workspace_coordinator_repository_sets_release_partial_ownership_and_share_queue_order() {
+        let coordinator = WorkspaceGitOperationCoordinator::default();
+        let a = PathBuf::from("/tmp/magi-multi-lease-a/.git");
+        let b = PathBuf::from("/tmp/magi-multi-lease-b/.git");
+        coordinator.begin_execution("first", &a).unwrap();
+        coordinator.begin_execution("second", &b).unwrap();
+        assert!(
+            coordinator
+                .begin_execution_set("first", &[b.clone(), a.clone()])
+                .is_err()
+        );
+        assert!(coordinator.execution_roots("first").is_empty());
+        // 刻意交叉登记；队列次序必须以会话为单位，不能形成两个仓库的不同队首。
+        coordinator.register_waiter("first", &a);
+        coordinator.register_waiter("second", &b);
+        coordinator.register_waiter("first", &b);
+        coordinator.register_waiter("second", &a);
+        assert!(
+            coordinator
+                .begin_execution_set("second", &[a.clone(), b.clone()])
+                .is_err()
+        );
+        assert!(coordinator.execution_roots("second").is_empty());
+        coordinator
+            .begin_execution_set("first", &[b.clone(), a.clone(), b.clone()])
+            .unwrap();
+        assert_eq!(
+            coordinator.execution_roots("first"),
+            vec![a.clone(), b.clone()]
+        );
+        coordinator.suspend_execution("first");
+        coordinator.suspend_execution("first");
+        coordinator
+            .begin_execution_set("second", &[a.clone(), b.clone()])
+            .unwrap();
+        assert!(coordinator.try_resume_execution("first").is_err());
+        assert!(coordinator.execution_roots("first").is_empty());
+        coordinator.end_execution("second");
+        coordinator.try_resume_execution("first").unwrap();
+        assert_eq!(
+            coordinator.execution_roots("first"),
+            vec![a.clone(), b.clone()]
+        );
+        coordinator.end_execution_for_repository("first", &a);
+        assert_eq!(coordinator.execution_roots("first"), vec![b]);
+        coordinator.suspend_execution("first");
+        coordinator.end_execution("first");
+        coordinator.try_resume_execution("first").unwrap();
+        assert!(
+            coordinator.execution_roots("first").is_empty(),
+            "取消后不能重新取得旧租约"
+        );
     }
 
     #[test]

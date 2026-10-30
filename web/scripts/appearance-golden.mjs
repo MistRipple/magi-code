@@ -109,7 +109,7 @@ assert.match(settingsRules, /form-textarea user-rules-textarea/, '规则设置�
 assert.match(settingsSafeguard, /form-input safeguard-add-input/, '安全设置必须复用全局输入');
 assert.match(settingsTools, /btn btn--primary btn--sm[\s\S]*?btn-icon btn-icon--sm/, '工具设置必须复用全局按钮和图标按钮');
 assert.match(webFolderPicker, /btn btn--secondary btn--sm[\s\S]*?btn btn--primary btn--sm/, '文件夹选择器必须复用全局按钮');
-assert.match(workbenchShell, /btn btn--secondary[\s\S]*?btn btn--danger/, '工作区确认弹窗必须复用全局按钮');
+assert.match(workbenchShell, /btn btn--secondary[\s\S]*?btn btn--error/, '工作区确认弹窗必须复用全局按钮');
 assert.doesNotMatch(
   [settingsPanel, settingsAppearance, modelConfigForm, settingsRules, settingsSafeguard, settingsTools, webFolderPicker, workbenchShell, settingsCss].join('\n'),
   /apple-action-btn|(?<!header-)settings-btn|modal-btn|llm-config-input|llm-config-select|profile-textarea|btn-icon--error/,

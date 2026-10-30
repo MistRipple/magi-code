@@ -446,13 +446,13 @@ try {
   check("添加菜单「管理插件」直达设置页插件分类", true);
   await click(page, '[data-testid="plugin-guide-toggle"]');
   await waitFor(() => exists(page, '[data-testid="plugin-guide"]'), "插件中心展开开发规范", 30_000);
-  check("插件开发规范以弹窗展示", ((await text(page, '[data-testid="plugin-guide"]')) ?? "").includes("Magi 插件作者指南"));
-  check("弹窗提供复制与导出 Markdown", (await exists(page, '[data-testid="plugin-guide-copy"]')) && (await exists(page, '[data-testid="plugin-guide-export"]')));
+  check("插件开发规范在详情页展示", ((await text(page, '[data-testid="plugin-guide"]')) ?? "").includes("Magi 插件作者指南"));
+  check("详情页提供复制与导出 Markdown", (await exists(page, '[data-testid="plugin-guide-copy"]')) && (await exists(page, '[data-testid="plugin-guide-export"]')));
   await click(page, '[data-testid="plugin-guide-copy"]');
   await waitFor(async () => ((await text(page, '[data-testid="plugin-guide-copy"]')) ?? "").includes("已复制"), "复制后按钮提示已复制", 10_000);
   check("复制后给出已复制反馈", true);
-  await click(page, '[data-testid="plugin-guide-close"]');
-  await waitFor(async () => !(await exists(page, '[data-testid="plugin-guide"]')), "关闭规范弹窗", 10_000);
+  await click(page, '[data-settings-detail-page] .detail-back-row button');
+  await waitFor(async () => !(await exists(page, '[data-testid="plugin-guide"]')), "返回插件列表", 10_000);
   check("未安装 GPT Web 插件时设置导航没有它的独立分类", !(await exists(page, '[data-testid="settings-nav-webModel"]')));
 
   await openPluginDetail();
@@ -683,15 +683,15 @@ try {
   await waitFor(() => exists(page, '[data-mcp-create-open="1"]'), "MCP 客户端设置出现");
   await click(page, '[data-mcp-create-open="1"]');
   await waitFor(() => exists(page, '[data-mcp-approval-mode="1"]'), "MCP 客户端授权方式选择器出现");
-  check("创建 MCP 时展示完整工作区路径与固定绑定说明", await text(page, `[data-mcp-bound-workspace="${workspaceId}"]`).then((value) => value.includes(workspaceRoot))
-    && await documentBodyIncludes("不随外部客户端当前项目切换"));
+  check("创建 MCP 时展示授权源目录与固定绑定说明", await text(page, '[data-mcp-bound-folders="new"]').then((value) => value.includes(workspaceRoot))
+    && await documentBodyIncludes("项目新增目录不会扩展此连接的权限"));
   check("新令牌默认完整工具目录并逐次询问", await page.evaluate(`(() => ({
     hasProfile: Boolean(document.querySelector('[data-mcp-profile="1"]')),
-    approval: document.querySelector('[data-mcp-approval-mode="1"]')?.value,
-    hasDeny: [...(document.querySelector('[data-mcp-approval-mode="1"]')?.options ?? [])].some((option) => option.value === 'deny'),
+    approval: document.querySelector('[data-mcp-approval-mode="1"] select')?.value,
+    hasDeny: [...(document.querySelector('[data-mcp-approval-mode="1"] select')?.options ?? [])].some((option) => option.value === 'deny'),
   }))()`).then((state) => !state.hasProfile && state.approval === 'ask' && !state.hasDeny));
   await page.evaluate(`(() => {
-    const select = document.querySelector('[data-mcp-approval-mode="1"]');
+    const select = document.querySelector('[data-mcp-approval-mode="1"] select');
     select.value = 'always';
     select.dispatchEvent(new Event('change', { bubbles: true }));
   })()`);
@@ -891,11 +891,7 @@ try {
   }
   await post(page, "/api/settings/update", { key: "conversationDisplayMode", value: "original" });
   await page.call("Page.reload", { ignoreCache: true });
-  await waitFor(async () => (await page.evaluate(`document.body.innerText`)).includes("external-read.txt"), "时间线里出现外部调用的工具卡片", 30_000).catch(async (error) => {
-    const dom = await page.evaluate(`JSON.stringify({ thread: document.querySelector('.thread-panel')?.innerText?.slice(0, 300), html: document.querySelector('.main-content')?.innerHTML?.replace(/<style[\\s\\S]*?<\\/style>/g, '').slice(0, 1200), bar: Boolean(document.querySelector('[data-testid="external-session-bar"]')), settings: Boolean(document.querySelector('[data-testid="settings-page"]')?.getClientRects().length), vis: document.visibilityState })`);
-    const api_ = (await api(page, `/api/messages?scope=workspace&workspaceId=${encodeURIComponent(workspaceId)}&sessionId=${encodeURIComponent(externalSession.sessionId)}`)).body;
-    throw new Error(`${error.message}；${dom}；API=${api_.slice(0, 900)}`);
-  });
+  await waitFor(() => page.evaluate(`Boolean([...document.querySelectorAll('.tool-call')].find(card => card.textContent.includes('external-read.txt')))`), "时间线里出现外部调用的工具卡片", 30_000);
   check("外部调用在时间线里按工具卡片展示（读取的文件名）", true);
   // 写入需要在 Magi 中确认：确认出现在会话自己的授权托盘里（和内部对话同一个组件），允许一次后写入成功。
   // 窗口不在前台时，新的待确认发系统通知（验收里用桩捕获 Notification 调用）。
@@ -909,7 +905,7 @@ try {
   await page.evaluate(`(() => { const button = [...document.querySelectorAll('[data-approval-id] button')].find((el) => el.innerText.includes('允许一次') || el.innerText.includes('Allow once')); if (!button) throw new Error('缺少单次授权按钮'); button.click(); })()`);
   const written = await writing;
   check("在会话里批准后外部写入成功", written.result?.isError !== true, JSON.stringify(written).slice(0, 200));
-  await waitFor(async () => (await page.evaluate(`document.body.innerText`)).includes("ext-write.txt"), "写入展示为带文件名的卡片", 30_000);
+  await waitFor(() => page.evaluate(`Boolean([...document.querySelectorAll('.tool-call')].find(card => card.textContent.includes('ext-write.txt')))`), "写入展示为带文件名的卡片", 30_000);
   check("外部写入在会话里展示为带文件名的卡片", true);
   const writingAgain = mcpCall("magi.fs.write", { path: "ext-write-again.txt", content: "written by external after another prompt\n" });
   const secondApprovalAppeared = await waitFor(() => exists(page, '[data-approval-id]'), "下一次写入再次出现单次确认", 30_000).then(() => true).catch(() => false);
@@ -984,7 +980,15 @@ try {
   })()`), "吊销命令的会话卡片显示已取消");
   check("吊销后会话卡片显示实际取消状态", true);
 
-  await post(page, "/api/workspaces/remove", { workspaceId });
+  // 外部工具结果已交付后，canonical 活动段仍需由 daemon 的空闲结算完成。
+  // 项目移除守卫在此期间按合同返回 409；等待原活动段收口后再移除。
+  const removedWorkspace = await waitFor(async () => {
+    const response = await post(page, "/api/workspaces/remove", { workspaceId });
+    if (response.status === 409) return null;
+    if (response.status !== 200) throw new Error(`移除项目失败：${response.status} ${response.body}`);
+    return response;
+  }, "外部活动段结算后移除项目", 45_000, 1000);
+  check("项目移除事务成功", JSON.parse(removedWorkspace.body).removed === true);
   const removedHistory = JSON.parse((await api(page, "/api/mcp-server/sessions")).body).sessions;
   check("移除工作区后保留历史并标记不可用", removedHistory.some((session) => session.sessionId === revokedSession.sessionId && session.workspaceAvailable === false));
   await click(page, '[data-testid="sidebar-refresh"]');

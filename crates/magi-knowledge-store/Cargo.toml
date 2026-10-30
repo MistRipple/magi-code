@@ -12,6 +12,7 @@ magi-core = { path = "../magi-core" }
 magi-snapshot = { path = "../magi-snapshot" }
 tokio = { workspace = true }
 tracing.workspace = true
+sha2.workspace = true
 tree-sitter = "0.27"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"

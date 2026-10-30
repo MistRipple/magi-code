@@ -2,6 +2,7 @@ mod agent_turns;
 mod background_jobs;
 mod execution_steps;
 mod goals;
+mod history_import;
 mod inputs;
 mod interactions;
 mod model_steps;

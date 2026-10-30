@@ -12,6 +12,7 @@
   } from '../stores/session-isolation-store.svelte';
   import { isolationOriginBlockingSession } from '../lib/isolation-merge';
   import Icon from './Icon.svelte';
+  import { selectedComposerSourceFolderId } from '../stores/composer-workspace.svelte';
 
   interface Props {
     workspace: ComposerWorkspaceOption | null;
@@ -29,6 +30,7 @@
     if (!workspace) return null;
     return {
       workspaceId: workspace.workspaceId,
+      sourceFolderId: selectedComposerSourceFolderId(workspace.workspaceId, sessionId),
       workspacePath: workspace.rootPathRef?.trim() || workspace.rootPath.trim(),
     };
   });

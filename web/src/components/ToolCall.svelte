@@ -460,6 +460,7 @@
       return {
         ...generatedImagePreview,
         src: agentUrl('/api/files/raw', buildFilePreviewQuery(generatedImagePreview.path, {
+          sourceFolderId: filePreviewScope?.sourceFolderId,
           workspaceId: filePreviewScope?.workspaceId,
           workspacePath: filePreviewScope?.workspacePath,
           sessionId: filePreviewScope?.sessionId,
@@ -897,6 +898,7 @@
       type: 'openFile',
       filepath: toolFilepath,
       sessionId: filePreviewScope?.sessionId || getCurrentSessionId() || undefined,
+      sourceFolderId: filePreviewScope?.sourceFolderId,
       workspaceId: filePreviewScope?.workspaceId,
       workspacePath: filePreviewScope?.workspacePath,
     });

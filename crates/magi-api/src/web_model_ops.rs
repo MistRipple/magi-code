@@ -169,13 +169,77 @@ impl magi_web_model::SavedConversationSink for ApiSavedSink {
     }
 }
 
-/// GPT Web 回复里的图片：保存到会话所属项目的 `generated-images/`（与 Magi 自己的生图工具同一个位置），
-/// 文件名取内容摘要，同一张图重复保存是幂等的。
+/// 一次 Web 请求的派生绑定，不拥有项目或 Turn 状态。
+#[derive(Clone)]
+struct WebImageScope {
+    session_id: String,
+    project_id: String,
+    slot_turn_id: u64,
+    canonical_turn_id: String,
+    directories: Option<magi_core::ProjectDirectoryBinding>,
+    execution_root: std::path::PathBuf,
+}
+
+/// 回复图片沿原 Turn 的默认执行目录保存，文件名按内容摘要去重。
 struct ApiImageSink {
     state: ApiState,
+    scope: Option<WebImageScope>,
 }
 
 impl magi_web_model::WebImageSink for ApiImageSink {
+    fn for_turn(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        slot_turn_id: u64,
+    ) -> Result<Arc<dyn magi_web_model::WebImageSink>, String> {
+        let session = SessionId::new(session_id);
+        let canonical_turn_id = self
+            .state
+            .session_store
+            .runtime_sidecar(&session)
+            .and_then(|sidecar| sidecar.current_turn)
+            .ok_or("原 Web Turn 不存在")?
+            .turn_id;
+        let turn = self.state.web_turn_for_slot(
+            session_id,
+            project_id,
+            slot_turn_id,
+            &canonical_turn_id,
+        )?;
+        let original = crate::task_dispatch::canonical_project_directory_binding(&turn)
+            .map_err(|error| format!("原 Web Turn 目录绑定无效: {error}"))?;
+        let workspace = (!project_id.is_empty()).then(|| WorkspaceId::new(project_id));
+        let directories = crate::task_dispatch::validate_or_migrate_directory_binding(
+            &self.state,
+            workspace.as_ref(),
+            original,
+        )
+        .map_err(|error| error.message().to_string())?;
+        let root = match &directories {
+            Some(binding) => {
+                crate::task_dispatch::bound_project_execution_root(&self.state, &session, binding)
+            }
+            None => self.state.personal_session_execution_root(&session),
+        }
+        .map_err(|error| error.message().to_string())?;
+        let canonical = root.canonicalize().map_err(|_| "本次执行目录已不可用")?;
+        if directories.is_some() && canonical != root {
+            return Err("本次执行目录身份已变化".into());
+        }
+        Ok(Arc::new(Self {
+            state: self.state.clone(),
+            scope: Some(WebImageScope {
+                session_id: session_id.into(),
+                project_id: project_id.into(),
+                slot_turn_id,
+                canonical_turn_id,
+                directories,
+                execution_root: canonical,
+            }),
+        }))
+    }
+
     fn store(
         &self,
         session_id: &str,
@@ -193,14 +257,32 @@ impl magi_web_model::WebImageSink for ApiImageSink {
         if image.bytes.is_empty() {
             return Err("图片内容为空".to_string());
         }
-        // 项目会话落到项目目录；没有项目的个人会话落到 Magi 管理的私有目录。
-        let root = self
+        let scope = self.scope.as_ref().ok_or("图片缺少原 Turn 绑定")?;
+        if scope.session_id != session_id || scope.project_id != project_id {
+            return Err("图片的会话归属不匹配".into());
+        }
+        let session = SessionId::new(session_id);
+        let _guard = self
             .state
-            .workspace_root_path(&Some(WorkspaceId::new(project_id)))
-            .unwrap_or_else(|| {
-                self.state
-                    .personal_session_execution_root_path(&SessionId::new(session_id))
-            });
+            .try_lock_session_turn_commit(&session)
+            .map_err(|error| error.message().to_string())?;
+        self.state.web_turn_for_slot(
+            session_id,
+            project_id,
+            scope.slot_turn_id,
+            &scope.canonical_turn_id,
+        )?;
+        let root = match &scope.directories {
+            Some(binding) => {
+                crate::task_dispatch::bound_project_execution_root(&self.state, &session, binding)
+                    .map_err(|error| error.message().to_string())?
+            }
+            None => self.state.personal_session_execution_root_path(&session),
+        };
+        if root.canonicalize().ok().as_ref() != Some(&scope.execution_root) {
+            return Err("原 Web Turn 执行目录已变化或不可用".into());
+        }
+        let root = &scope.execution_root;
         let digest = Sha256::digest(&image.bytes);
         let name: String = digest
             .iter()
@@ -208,20 +290,82 @@ impl magi_web_model::WebImageSink for ApiImageSink {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         let relative = format!("generated-images/web-{name}.{extension}");
+        let parent = root.join("generated-images");
+        match std::fs::create_dir(&parent) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("创建图片目录失败：{error}")),
+        }
+        if !std::fs::symlink_metadata(&parent).is_ok_and(|metadata| metadata.is_dir())
+            || parent.canonicalize().ok().as_ref() != Some(&parent)
+        {
+            return Err("图片目录不能通过符号链接离开原执行目录".into());
+        }
         let target = root.join(&relative);
-        if !target.exists() {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|error| format!("创建目录失败：{error}"))?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(&image.bytes)
+                    .map_err(|error| format!("写入图片失败：{error}"))?;
             }
-            std::fs::write(&target, &image.bytes)
-                .map_err(|error| format!("写入图片失败：{error}"))?;
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !std::fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.is_file())
+                    || std::fs::read(&target).ok().as_deref() != Some(image.bytes.as_slice())
+                {
+                    return Err("图片目标已存在且不是原内容，未覆盖文件".into());
+                }
+            }
+            Err(error) => return Err(format!("创建图片失败：{error}")),
         }
         Ok(relative)
     }
 }
 
 impl ApiState {
+    pub(crate) fn web_turn_for_slot(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        slot_turn_id: u64,
+        canonical_turn_id: &str,
+    ) -> Result<magi_session_store::CanonicalTurn, String> {
+        let (owner, active) = self
+            .web_model
+            .bindings()
+            .and_then(|slots| slots.active_context())
+            .ok_or("GPT Web 槽位已失效")?;
+        if owner.session_id != session_id
+            || owner.project_id != project_id
+            || active != slot_turn_id
+        {
+            return Err("GPT Web 调用归属已变化".into());
+        }
+        let session_id = SessionId::new(session_id);
+        let session = self
+            .session_store
+            .session(&session_id)
+            .ok_or("槽位拥有者会话不存在")?;
+        if session.workspace_id.as_deref().unwrap_or("") != project_id {
+            return Err("GPT Web 会话项目归属已变化".into());
+        }
+        if !self
+            .session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .is_some_and(|turn| turn.turn_id == canonical_turn_id)
+        {
+            return Err("原 Web Turn 已被替换".into());
+        }
+        self.session_store
+            .canonical_turn_for_session_turn_id(&session_id, canonical_turn_id)
+            .filter(|turn| !turn.status.is_terminal())
+            .ok_or_else(|| "原 Web Turn 已关闭".into())
+    }
+
     fn require_web_model_plugin(&self) -> Result<(), WebModelError> {
         if self.web_model_plugin_active() {
             Ok(())
@@ -236,6 +380,7 @@ impl ApiState {
     pub fn web_image_sink(&self) -> Arc<dyn magi_web_model::WebImageSink> {
         Arc::new(ApiImageSink {
             state: self.clone(),
+            scope: None,
         })
     }
 
@@ -906,6 +1051,291 @@ pub(crate) fn ensure_app_home_tab(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image_sink_fixture(
+        root: &std::path::Path,
+    ) -> (ApiState, Arc<magi_web_model::WebSlotTable>, SessionId) {
+        let state_root = root.join("state");
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(magi_event_bus::InMemoryEventBus::new(32)),
+            Arc::new(magi_session_store::SessionStore::default()),
+            Arc::new(magi_workspace::WorkspaceStore::default()),
+            Arc::new(magi_governance::GovernanceService::default()),
+        )
+        .with_runtime_persistence(Arc::new(crate::state::RuntimeStatePersistence::new(
+            &state_root,
+            state_root.join("workspaces.json"),
+            state_root.join("knowledge.json"),
+        )));
+        let slots = Arc::new(magi_web_model::WebSlotTable::new());
+        state.web_model.set_bindings(slots.clone());
+        (state, slots, SessionId::new("web-image-session"))
+    }
+
+    fn accept_image_turn(
+        state: &ApiState,
+        session: &SessionId,
+        turn_id: &str,
+        binding: Option<&magi_core::ProjectDirectoryBinding>,
+    ) {
+        let mut metadata = serde_json::json!({});
+        if let Some(binding) = binding {
+            metadata["projectDirectories"] = serde_json::to_value(binding).unwrap();
+        }
+        state
+            .session_store
+            .accept_conversation_turn_with_timeline_entry(
+                session.clone(),
+                binding.map(|binding| binding.workspace_id.clone()),
+                magi_session_store::TimelineEntryInput::new(
+                    format!("input-{turn_id}"),
+                    magi_session_store::TimelineEntryKind::UserMessage,
+                    "generate image",
+                    UtcMillis::now(),
+                ),
+                serde_json::from_value(serde_json::json!({
+                    "turnId": turn_id, "turnSeq": 1, "acceptedAt": UtcMillis::now(),
+                    "status": "running", "userMessage": "generate image", "items": [{
+                        "itemId": format!("user-{turn_id}"), "itemSeq": 1, "kind": "user_message",
+                        "status": "completed", "source": "user", "sourceThreadId": "main",
+                        "content": "generate image", "metadata": metadata,
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn web_image(bytes: &[u8]) -> magi_web_model::WebImage {
+        magi_web_model::WebImage {
+            mime: "image/png".into(),
+            bytes: bytes.to_vec(),
+            alt: "image".into(),
+        }
+    }
+
+    #[test]
+    fn web_images_keep_original_source_and_isolation_and_reject_revoked_or_stale_turns() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let (state, slots, session) = image_sink_fixture(&root);
+        let sources = [root.join("a"), root.join("b")];
+        for source in &sources {
+            std::fs::create_dir(source).unwrap();
+        }
+        let workspace = WorkspaceId::new("web-image-project");
+        let first = state
+            .workspace_registry
+            .register_native_path(workspace.clone(), sources[0].clone())
+            .unwrap();
+        let mut second = first.primary_source_folder().clone();
+        second.source_folder_id = "b".into();
+        second.path = magi_core::AbsolutePath::new(sources[1].display().to_string());
+        second.path_ref = magi_core::HostPath::from_path(sources[1].clone())
+            .to_path_ref()
+            .as_str()
+            .to_string();
+        let folders = vec![first.primary_source_folder().clone(), second.clone()];
+        let project = state
+            .workspace_registry
+            .edit_project(
+                &workspace,
+                1,
+                magi_workspace::WorkspaceProjectEdit {
+                    name: None,
+                    source_folders: folders.clone(),
+                    primary_source_folder_id: first.primary_source_folder_id.clone(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let binding = state
+            .workspace_registry
+            .capture_directory_binding(&workspace, None, None)
+            .unwrap();
+        state
+            .session_store
+            .create_session_for_workspace(session.clone(), "images", Some(workspace.to_string()))
+            .unwrap();
+        accept_image_turn(&state, &session, "images-1", Some(&binding));
+        for (index, source) in sources.iter().enumerate() {
+            let copy = root.join(format!("copy-{index}"));
+            let outcome = magi_session_isolation::create_isolated_copy(source, &copy).unwrap();
+            state
+                .session_isolations
+                .insert(magi_session_isolation::SessionIsolation {
+                    session_id: session.to_string(),
+                    workspace_id: workspace.to_string(),
+                    source_root: source.clone(),
+                    root: copy,
+                    origin: magi_session_isolation::IsolationOrigin::Manual,
+                    strategy: outcome.strategy,
+                    linked_dirs: outcome.linked_dirs,
+                    git_available: outcome.git_available,
+                    created_at_ms: 1,
+                });
+        }
+        let owner = magi_web_model::WebSlotOwner::new(session.as_str(), workspace.as_str());
+        slots
+            .claim(owner.clone(), WebConversationBinding::temporary(), "page")
+            .unwrap();
+        let lease = slots.begin_turn(&owner).unwrap();
+        let sink = state
+            .web_image_sink()
+            .for_turn(session.as_str(), workspace.as_str(), lease.turn_id())
+            .unwrap();
+        state
+            .workspace_registry
+            .edit_project(
+                &workspace,
+                project.revision,
+                magi_workspace::WorkspaceProjectEdit {
+                    name: Some("renamed".into()),
+                    source_folders: folders,
+                    primary_source_folder_id: "b".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let path = sink
+            .store(session.as_str(), workspace.as_str(), web_image(b"first"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("copy-0").join(&path)).unwrap(),
+            b"first"
+        );
+        assert!(!root.join("copy-1").join(&path).exists());
+        assert!(
+            sources
+                .iter()
+                .all(|source| !source.join("generated-images").exists())
+        );
+        assert_eq!(
+            sink.store(session.as_str(), workspace.as_str(), web_image(b"first"))
+                .unwrap(),
+            path
+        );
+        assert!(
+            sink.store("another-session", workspace.as_str(), web_image(b"wrong"))
+                .is_err()
+        );
+        drop(lease);
+        let next = slots.begin_turn(&owner).unwrap();
+        assert!(
+            sink.store(session.as_str(), workspace.as_str(), web_image(b"late"))
+                .is_err()
+        );
+        let sink = state
+            .web_image_sink()
+            .for_turn(session.as_str(), workspace.as_str(), next.turn_id())
+            .unwrap();
+        state
+            .session_store
+            .update_current_turn_status_for_turn_with_change(
+                &session,
+                Some("images-1"),
+                "completed",
+            )
+            .unwrap();
+        accept_image_turn(&state, &session, "images-2", Some(&binding));
+        assert!(
+            sink.store(
+                session.as_str(),
+                workspace.as_str(),
+                web_image(b"old canonical turn")
+            )
+            .is_err()
+        );
+        let sink = state
+            .web_image_sink()
+            .for_turn(session.as_str(), workspace.as_str(), next.turn_id())
+            .unwrap();
+        state
+            .workspace_registry
+            .edit_project(
+                &workspace,
+                project.revision + 1,
+                magi_workspace::WorkspaceProjectEdit {
+                    name: None,
+                    source_folders: vec![second],
+                    primary_source_folder_id: "b".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(
+            sink.store(session.as_str(), workspace.as_str(), web_image(b"revoked"))
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("copy-0/generated-images"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert!(
+            !state
+                .personal_session_execution_root_path(&session)
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn web_images_keep_personal_scope_and_reject_linked_directories_and_existing_targets() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let (state, slots, session) = image_sink_fixture(&root);
+        state
+            .session_store
+            .create_session(session.clone(), "personal images")
+            .unwrap();
+        accept_image_turn(&state, &session, "personal-images", None);
+        let owner = magi_web_model::WebSlotOwner::new(session.as_str(), "");
+        slots
+            .claim(owner.clone(), WebConversationBinding::temporary(), "page")
+            .unwrap();
+        let lease = slots.begin_turn(&owner).unwrap();
+        let sink = state
+            .web_image_sink()
+            .for_turn(session.as_str(), "", lease.turn_id())
+            .unwrap();
+        let execution = state.personal_session_execution_root_path(&session);
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, execution.join("generated-images")).unwrap();
+        assert!(
+            sink.store(session.as_str(), "", web_image(b"blocked"))
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        std::fs::remove_file(execution.join("generated-images")).unwrap();
+        let path = sink
+            .store(session.as_str(), "", web_image(b"personal"))
+            .unwrap();
+        assert_eq!(std::fs::read(execution.join(&path)).unwrap(), b"personal");
+        std::fs::remove_file(execution.join(&path)).unwrap();
+        let protected = outside.join("protected.png");
+        std::fs::write(&protected, b"keep").unwrap();
+        std::os::unix::fs::symlink(&protected, execution.join(&path)).unwrap();
+        assert!(
+            sink.store(session.as_str(), "", web_image(b"personal"))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&protected).unwrap(), b"keep");
+        assert!(
+            state
+                .web_image_sink()
+                .for_turn(session.as_str(), "unknown-project", lease.turn_id())
+                .is_err()
+        );
+        slots.release(&owner);
+        assert!(
+            sink.store(session.as_str(), "", web_image(b"released"))
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn stopping_web_model_cancels_the_owned_turn_in_personal_and_workspace_sessions() {

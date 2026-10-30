@@ -118,7 +118,7 @@ assert.doesNotMatch(
 );
 assert.match(
   workbenchShellSource,
-  /import\('\.\/ProjectFileTree\.svelte'\)[\s\S]*?import\('\.\/RightPane\.svelte'\)[\s\S]*?import\('\.\/WebFolderPicker\.svelte'\)/,
+  /import\('\.\/ProjectFileTrees\.svelte'\)[\s\S]*?import\('\.\/RightPane\.svelte'\)[\s\S]*?import\('\.\/WebFolderPicker\.svelte'\)/,
   '文件树、右侧面板和工作区选择器必须按实际可见状态动态加载',
 );
 
@@ -341,7 +341,7 @@ assert.match(
 );
 assert.match(
   gitContextStoreSource,
-  /if \(workspaceId\) return `id:\$\{workspaceId\}\\u0000\$\{sessionId\}`;/,
+  /if \(workspaceId\) return `id:\$\{workspaceId\}\\u0000\$\{sessionId\}\\u0000\$\{sourceFolderId\}`;/,
   '统一 Git 状态必须优先使用工作区 ID 作为主键，避免路径引用格式造成双状态',
 );
 assert.match(

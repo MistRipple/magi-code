@@ -1,7 +1,36 @@
 use magi_bridge_client::ChatToolCall;
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+pub(crate) fn snapshot_tool_context(
+    snapshot_root: &Path,
+    selected_root: Option<&Path>,
+    context: &magi_snapshot::ToolHookCtx,
+) -> magi_snapshot::ToolHookCtx {
+    let mut context = context.clone();
+    let snapshot_root = magi_tool_runtime::canonicalize_tool_permission_path(snapshot_root);
+    context.declared_paths = context
+        .declared_paths
+        .into_iter()
+        .filter_map(|path| {
+            let path = if let Some(value) = path.to_str() {
+                magi_core::HostPath::resolve_native_input(value, selected_root, None)
+                    .ok()?
+                    .into_path_buf()
+            } else if path.is_absolute() {
+                path
+            } else {
+                selected_root?.join(path)
+            };
+            let path = magi_tool_runtime::canonicalize_tool_permission_path(&path);
+            path.strip_prefix(&snapshot_root)
+                .ok()
+                .map(|relative| snapshot_root.join(relative))
+        })
+        .collect();
+    context
+}
 
 /// 从 tool_call 参数推断可能被改写的路径，供 SnapshotSession 的 after_tool 强制拍后态。
 /// 覆盖 canonical 文件工具（file_write / file_patch / apply_patch / file_remove / file_mkdir）

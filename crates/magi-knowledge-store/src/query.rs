@@ -1,20 +1,25 @@
 use crate::{
-    CodeIndexSource, KnowledgeAuditLink, KnowledgeGovernanceLink, KnowledgeIndexer, KnowledgeKind,
-    KnowledgeMatch, KnowledgeQuery, KnowledgeQueryResult, KnowledgeQueryService, KnowledgeRecord,
+    KnowledgeIndexer, KnowledgeKind, KnowledgeMatch, KnowledgeQuery, KnowledgeQueryResult,
+    KnowledgeQueryService, KnowledgeRecord, KnowledgeState,
     normalization::{merge_unique_terms, normalize_tags, tokenize_business_text},
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 impl KnowledgeQueryService {
     pub fn execute(
-        entries: &HashMap<String, KnowledgeRecord>,
-        index_terms: &HashMap<String, Vec<String>>,
-        term_postings: &HashMap<String, HashSet<String>>,
-        code_sources: &HashMap<String, CodeIndexSource>,
-        audit_links: &HashMap<String, KnowledgeAuditLink>,
-        governance_links: &HashMap<String, KnowledgeGovernanceLink>,
+        state: &KnowledgeState,
         query: &KnowledgeQuery,
+        code_scope: Option<&crate::CodeIndexScope>,
     ) -> KnowledgeQueryResult {
+        let KnowledgeState {
+            entries,
+            index_terms,
+            term_postings,
+            code_sources,
+            audit_links,
+            governance_links,
+            ..
+        } = state;
         let query_terms = query
             .text
             .as_deref()
@@ -48,6 +53,14 @@ impl KnowledgeQueryService {
                     .is_none_or(|workspace_id| record.workspace_id.as_ref() == Some(workspace_id))
             })
             .filter(|record| query.kind.is_none_or(|kind| record.kind == kind))
+            .filter(|record| {
+                record.kind != KnowledgeKind::CodeIndex || {
+                    code_sources
+                        .get(&record.knowledge_id)
+                        .and_then(|source| source.code_scope.as_ref())
+                        == code_scope
+                }
+            })
             .filter_map(|record| {
                 let indexed_terms = index_terms
                     .get(&record.knowledge_id)

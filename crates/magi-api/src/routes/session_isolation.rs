@@ -45,6 +45,8 @@ struct IsolationScope {
     workspace_id: Option<String>,
     #[serde(default)]
     workspace_path: Option<String>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
 }
 
 impl IsolationScope {
@@ -58,11 +60,27 @@ impl IsolationScope {
         )?;
         Ok((session_id, scope))
     }
+
+    fn source(
+        &self,
+        state: &ApiState,
+        scope: &SessionScope,
+    ) -> Result<std::path::PathBuf, ApiError> {
+        let workspace = scope
+            .workspace_id()
+            .ok_or_else(|| ApiError::InvalidInput("个人会话没有项目隔离副本".into()))?;
+        state
+            .workspace_registry
+            .resolve_source_folder(&workspace, self.source_folder_id.as_deref())
+            .map(|(_, root)| root)
+            .map_err(|error| ApiError::InvalidInput(error.to_string()))
+    }
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IsolationDto {
+    source_folder_id: Option<String>,
     root: String,
     source_root: String,
     origin: IsolationOrigin,
@@ -72,9 +90,22 @@ struct IsolationDto {
     created_at_ms: u64,
 }
 
-impl From<SessionIsolation> for IsolationDto {
-    fn from(isolation: SessionIsolation) -> Self {
+impl IsolationDto {
+    fn from_record(state: &ApiState, isolation: SessionIsolation) -> Self {
+        let source_folder_id = state
+            .workspace_registry
+            .project(&magi_core::WorkspaceId::new(&isolation.workspace_id))
+            .and_then(|project| {
+                project.source_folders.into_iter().find(|folder| {
+                    std::fs::canonicalize(folder.native_path())
+                        .unwrap_or_else(|_| folder.native_path())
+                        == std::fs::canonicalize(&isolation.source_root)
+                            .unwrap_or_else(|_| isolation.source_root.clone())
+                })
+            })
+            .map(|folder| folder.source_folder_id);
         Self {
+            source_folder_id,
             root: isolation.root.to_string_lossy().into_owned(),
             source_root: isolation.source_root.to_string_lossy().into_owned(),
             origin: isolation.origin,
@@ -156,14 +187,25 @@ struct SessionIsolationResponse {
     session_id: SessionId,
     enabled: bool,
     isolation: Option<IsolationDto>,
+    isolations: Vec<IsolationDto>,
 }
 
 fn response(state: &ApiState, session_id: SessionId) -> SessionIsolationResponse {
-    let isolation = state.session_isolation(&session_id).map(IsolationDto::from);
+    let enabled = state.session_isolations.contains(session_id.as_str());
+    let isolation = state
+        .session_isolation(&session_id)
+        .map(|record| IsolationDto::from_record(state, record));
+    let isolations = state
+        .session_isolations
+        .for_session(session_id.as_str())
+        .into_iter()
+        .map(|record| IsolationDto::from_record(state, record))
+        .collect();
     SessionIsolationResponse {
         session_id,
-        enabled: isolation.is_some(),
+        enabled,
         isolation,
+        isolations,
     }
 }
 
@@ -190,8 +232,21 @@ async fn enable_session_isolation(
     let workspace_id = scope
         .workspace_id()
         .ok_or_else(|| ApiError::InvalidInput("个人会话没有可隔离的工作区".to_string()))?;
+    let binding = state
+        .workspace_registry
+        .capture_directory_binding(
+            &workspace_id,
+            request.scope.source_folder_id.as_deref(),
+            None,
+        )
+        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
     state
-        .enable_session_isolation(&session_id, &workspace_id, IsolationOrigin::Manual)
+        .enable_session_isolation_set_at_boundary(
+            &session_id,
+            &binding,
+            IsolationOrigin::Manual,
+            None,
+        )
         .await?;
     Ok(Json(response(&state, session_id)))
 }
@@ -211,13 +266,17 @@ async fn discard_session_isolation(
     Json(request): Json<DiscardRequest>,
 ) -> Result<Json<SessionIsolationResponse>, ApiError> {
     let (session_id, _) = request.scope.resolve(&state)?;
-    if !request.discard_changes && state.session_isolation(&session_id).is_some() {
-        let plan = state.isolation_merge_plan(&session_id).await?;
-        if !plan.entries.is_empty() {
-            return Err(ApiError::conflict(
-                "隔离副本里还有未合并的改动，先合并，或确认丢弃",
-                session_id.as_str(),
-            ));
+    if !request.discard_changes && state.session_isolations.contains(session_id.as_str()) {
+        for isolation in state.session_isolations.for_session(session_id.as_str()) {
+            let plan = state
+                .isolation_merge_plan_for_source(&session_id, Some(&isolation.source_root))
+                .await?;
+            if !plan.entries.is_empty() {
+                return Err(ApiError::conflict(
+                    "隔离副本里还有未合并的改动，先合并，或确认丢弃",
+                    session_id.as_str(),
+                ));
+            }
         }
     }
     state.discard_session_isolation(&session_id).await?;
@@ -236,8 +295,11 @@ async fn plan_session_isolation_merge(
     State(state): State<ApiState>,
     Json(request): Json<EnableRequest>,
 ) -> Result<Json<MergePlanResponse>, ApiError> {
-    let (session_id, _) = request.scope.resolve(&state)?;
-    let plan = state.isolation_merge_plan(&session_id).await?;
+    let (session_id, scope) = request.scope.resolve(&state)?;
+    let source = request.scope.source(&state, &scope)?;
+    let plan = state
+        .isolation_merge_plan_for_source(&session_id, Some(&source))
+        .await?;
     Ok(Json(MergePlanResponse { session_id, plan }))
 }
 
@@ -266,10 +328,12 @@ async fn apply_session_isolation_merge(
     State(state): State<ApiState>,
     Json(request): Json<MergeRequest>,
 ) -> Result<Json<MergeResponse>, ApiError> {
-    let (session_id, _) = request.scope.resolve(&state)?;
+    let (session_id, scope) = request.scope.resolve(&state)?;
+    let source = request.scope.source(&state, &scope)?;
     let outcome = state
-        .isolation_merge_apply(
+        .isolation_merge_apply_for_source(
             &session_id,
+            Some(&source),
             MergeSelection {
                 paths: request.paths,
                 resolutions: request.resolutions,
@@ -490,6 +554,120 @@ mod tests {
             std::fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
             "unmerged"
         );
+    }
+
+    #[tokio::test]
+    async fn multi_source_routes_keep_diff_approval_and_merge_on_the_selected_copy() {
+        let state = test_state();
+        let fixture = tempfile::tempdir().unwrap();
+        let parent = fixture.path().canonicalize().unwrap();
+        let roots = [parent.join("a/shared"), parent.join("b/shared")];
+        for (index, root) in roots.iter().enumerate() {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(root.join("same.txt"), format!("original {index}\n")).unwrap();
+        }
+        let workspace = WorkspaceId::new("multi-isolation-route");
+        state
+            .workspace_registry
+            .register_native_path(workspace.clone(), roots[0].clone())
+            .unwrap();
+        let project = crate::routes::test_project_fixtures::add_source(
+            &state,
+            workspace.as_str(),
+            "second",
+            &roots[1],
+        );
+        let session = SessionId::new("multi-isolation-route-session");
+        state
+            .session_store
+            .create_session_for_workspace(session.clone(), "multi", Some(workspace.to_string()))
+            .unwrap();
+        let scope = serde_json::json!({"sessionId":session,"workspaceId":workspace});
+        let (status, enabled) = call(
+            &state,
+            "POST",
+            "/api/session/isolation/enable",
+            Some(scope.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{enabled}");
+        assert!(enabled["isolation"].is_null());
+        assert_eq!(enabled["isolations"].as_array().unwrap().len(), 2);
+        for (index, root) in roots.iter().enumerate() {
+            let execution = state
+                .session_execution_root_for_source(&session, root)
+                .unwrap();
+            std::fs::write(execution.join("same.txt"), format!("changed {index}\n")).unwrap();
+        }
+        let (status, ambiguous) = call(
+            &state,
+            "POST",
+            "/api/session/isolation/merge",
+            Some(scope.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{ambiguous}");
+        let ids = [&project.primary_source_folder_id, "second"];
+        let mut snapshots = Vec::new();
+        for (index, id) in ids.iter().enumerate() {
+            let query = format!(
+                "/api/changes/diff?sessionId={session}&workspaceId={workspace}&sourceFolderId={id}&filePath=same.txt"
+            );
+            let (status, diff) = call(&state, "GET", &query, None).await;
+            assert_eq!(status, StatusCode::OK, "{diff}");
+            assert_eq!(diff["currentContent"], format!("changed {index}\n"));
+            assert_eq!(diff["sourceFolderId"], *id);
+            let query = format!(
+                "/api/changes?sessionId={session}&workspaceId={workspace}&sourceFolderId={id}"
+            );
+            let (status, changes) = call(&state, "GET", &query, None).await;
+            assert_eq!(status, StatusCode::OK, "{changes}");
+            assert_eq!(changes["pendingChanges"].as_array().unwrap().len(), 1);
+            let changed = &changes["pendingChanges"][0];
+            assert_eq!(changed["sourceFolderId"], *id);
+            snapshots.push(changed["snapshotId"].clone());
+        }
+        assert_ne!(snapshots[0], snapshots[1]);
+        let mut selected = scope.clone();
+        selected["sourceFolderId"] = serde_json::json!("second");
+        selected["filePath"] = serde_json::json!("same.txt");
+        let (status, approved) = call(&state, "POST", "/api/changes/approve", Some(selected)).await;
+        assert_eq!(status, StatusCode::OK, "{approved}");
+        assert_eq!(
+            std::fs::read_to_string(roots[0].join("same.txt")).unwrap(),
+            "original 0\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(roots[1].join("same.txt")).unwrap(),
+            "changed 1\n"
+        );
+        let (status, refused) = call(
+            &state,
+            "POST",
+            "/api/session/isolation/discard",
+            Some(scope.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        let mut selected = scope.clone();
+        selected["sourceFolderId"] = serde_json::json!(project.primary_source_folder_id);
+        let (status, merged) = call(
+            &state,
+            "POST",
+            "/api/session/isolation/merge",
+            Some(selected),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{merged}");
+        let (status, discarded) = call(
+            &state,
+            "POST",
+            "/api/session/isolation/discard",
+            Some(scope),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{discarded}");
+        assert_eq!(discarded["enabled"], false);
     }
 
     #[tokio::test]

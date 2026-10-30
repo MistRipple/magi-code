@@ -9,6 +9,7 @@
   import { MessageCategory } from '../shared/protocol/message-protocol';
   import { ensureArray } from '../lib/utils';
   import Icon from './Icon.svelte';
+  import { selectedComposerSourceFolderId } from '../stores/composer-workspace.svelte';
   import FileName from './FileName.svelte';
   import FileTypeIcon from './FileTypeIcon.svelte';
   import KnowledgeGraphPanel from './KnowledgeGraphPanel.svelte';
@@ -87,7 +88,7 @@
   const currentWorkspaceKey = $derived.by(() => {
     const workspaceId = typeof appState.currentWorkspaceId === 'string' ? appState.currentWorkspaceId.trim() : '';
     const workspacePath = typeof appState.currentWorkspacePath === 'string' ? appState.currentWorkspacePath.trim() : '';
-    return `${workspaceId}::${workspacePath}`;
+    return `${workspaceId}::${workspacePath}::${selectedComposerSourceFolderId(workspaceId, appState.currentSessionId)}`;
   });
   let currentTab = $state<'overview' | 'adr' | 'faq' | 'learning' | 'graph'>('overview');
   let isLoading = $state(false);
@@ -205,9 +206,11 @@
   /** Electron 中 HTML 入口进入 Browser；其他文件和 Web 端进入文件视图。 */
   function previewEntryPoint(filepath: string) {
     if (!filepath) return;
-    if (requestOpenHtmlFileInBrowser(filepath)) return;
+    const previewScope = knowledgeWorkspaceScope(currentKnowledgeWorkspaceRequest(), true);
+    if (requestOpenHtmlFileInBrowser(filepath, previewScope)) return;
     openCodeTab(null, filepath, {
       sessionId: '',
+      sourceFolderId: selectedComposerSourceFolderId(messagesState.currentWorkspaceId || '', messagesState.currentSessionId),
       workspaceId: messagesState.currentWorkspaceId ?? undefined,
       workspacePath: messagesState.currentWorkspacePath || undefined,
     });
@@ -632,6 +635,7 @@
   interface KnowledgeWorkspaceRequest {
     workspaceKey: string;
     workspaceGeneration: number;
+    sourceFolderId: string;
     workspaceId: string;
     workspacePath: string;
   }
@@ -645,7 +649,8 @@
     const workspaceId = typeof appState.currentWorkspaceId === 'string' ? appState.currentWorkspaceId.trim() : '';
     const workspacePath = typeof appState.currentWorkspacePath === 'string' ? appState.currentWorkspacePath.trim() : '';
     return {
-      workspaceKey: `${workspaceId}::${workspacePath}`,
+      workspaceKey: currentWorkspaceKey,
+      sourceFolderId: selectedComposerSourceFolderId(workspaceId, appState.currentSessionId),
       workspaceGeneration: knowledgeWorkspaceGeneration,
       workspaceId,
       workspacePath,
@@ -656,11 +661,12 @@
     return Boolean(request.workspaceId || request.workspacePath);
   }
 
-  function knowledgeWorkspaceScope(request: KnowledgeWorkspaceRequest): { scope: 'workspace'; workspaceId: string; workspacePath: string } {
+  function knowledgeWorkspaceScope(request: KnowledgeWorkspaceRequest, includeSourceFolder = false): { scope: 'workspace'; workspaceId: string; workspacePath: string; sourceFolderId?: string } {
     return {
       scope: 'workspace',
       workspaceId: request.workspaceId,
       workspacePath: request.workspacePath,
+      ...(includeSourceFolder && request.sourceFolderId ? { sourceFolderId: request.sourceFolderId } : {}),
     };
   }
 
@@ -705,7 +711,7 @@
   function resolvePayloadWorkspaceKey(payload: Record<string, unknown> | null | undefined): string {
     const workspaceId = typeof payload?.workspaceId === 'string' ? payload.workspaceId.trim() : '';
     const workspacePath = typeof payload?.workspacePath === 'string' ? payload.workspacePath.trim() : '';
-    return workspaceId || workspacePath ? `${workspaceId}::${workspacePath}` : '';
+    return workspaceId || workspacePath ? `${workspaceId}::${workspacePath}::${typeof payload?.sourceFolderId === 'string' ? payload.sourceFolderId : selectedComposerSourceFolderId(workspaceId, appState.currentSessionId)}` : '';
   }
 
   function payloadMatchesCurrentWorkspace(payload: Record<string, unknown> | null | undefined): boolean {
@@ -750,11 +756,11 @@
 
   async function fetchKnowledgeViaApi(request: KnowledgeLoadRequest, reindex: boolean) {
     if (reindex) {
-      await reindexAgentProjectKnowledge(knowledgeWorkspaceScope(request));
+      await reindexAgentProjectKnowledge(knowledgeWorkspaceScope(request, true));
     }
     const [res, relationPayload] = await Promise.all([
-      getAgentProjectKnowledge(knowledgeWorkspaceScope(request)),
-      listAgentKnowledgeRelations(knowledgeWorkspaceScope(request)),
+      getAgentProjectKnowledge(knowledgeWorkspaceScope(request, true)),
+      listAgentKnowledgeRelations(knowledgeWorkspaceScope(request, true)),
     ]);
     if (!isCurrentKnowledgeLoadRequest(request)) {
       return;
@@ -786,7 +792,7 @@
           maxNodes: 120,
           maxEdges: 240,
         },
-        knowledgeWorkspaceScope(request),
+        knowledgeWorkspaceScope(request, true),
       );
       if (requestSeq !== graphRequestSeq || !isCurrentKnowledgeWorkspaceRequest(request)) return;
       if (payloadMatchesCurrentWorkspace(payload)) {
@@ -883,7 +889,7 @@
 
   async function createKnowledgeRelation(relation: AgentKnowledgeRelationDraft): Promise<void> {
     const request = currentKnowledgeWorkspaceRequest();
-    await addAgentKnowledgeRelation(relation, knowledgeWorkspaceScope(request));
+    await addAgentKnowledgeRelation(relation, knowledgeWorkspaceScope(request, true));
     if (isCurrentKnowledgeWorkspaceRequest(request)) {
       requestKnowledgeLoad(false);
     }
@@ -891,7 +897,7 @@
 
   async function editKnowledgeRelation(relation: AgentKnowledgeRelationDraft & { relationId: string }): Promise<void> {
     const request = currentKnowledgeWorkspaceRequest();
-    await updateAgentKnowledgeRelation(relation, knowledgeWorkspaceScope(request));
+    await updateAgentKnowledgeRelation(relation, knowledgeWorkspaceScope(request, true));
     if (isCurrentKnowledgeWorkspaceRequest(request)) {
       requestKnowledgeLoad(false);
     }
@@ -899,7 +905,7 @@
 
   async function removeKnowledgeRelation(relationId: string): Promise<void> {
     const request = currentKnowledgeWorkspaceRequest();
-    await deleteAgentKnowledgeRelation(relationId, knowledgeWorkspaceScope(request));
+    await deleteAgentKnowledgeRelation(relationId, knowledgeWorkspaceScope(request, true));
     if (isCurrentKnowledgeWorkspaceRequest(request)) {
       requestKnowledgeLoad(false);
     }
@@ -1061,7 +1067,7 @@
           </button>
         {/if}
       </div>
-      <button class="kp-add-btn" onclick={() => openCreateEditor(currentTab as EditableKnowledgeKind)}>
+          <button class="btn btn--secondary btn--sm" onclick={() => openCreateEditor(currentTab as EditableKnowledgeKind)}>
         <Icon name="plus" size={12} />
         <span>{i18n.t('knowledge.actions.add')}</span>
       </button>
@@ -1111,8 +1117,8 @@
           <div class="kp-editor-error">{formError}</div>
         {/if}
         <div class="kp-editor-actions">
-          <button class="kp-editor-btn" onclick={closeEditor} disabled={isSaving}>{i18n.t('knowledge.actions.cancel')}</button>
-          <button class="kp-editor-btn kp-editor-btn--primary" onclick={saveEditor} disabled={isSaving}>{i18n.t('knowledge.actions.save')}</button>
+          <button class="btn btn--secondary btn--sm" onclick={closeEditor} disabled={isSaving}>{i18n.t('knowledge.actions.cancel')}</button>
+          <button class="btn btn--primary btn--sm" onclick={saveEditor} disabled={isSaving}>{i18n.t('knowledge.actions.save')}</button>
         </div>
       </div>
     {/if}
@@ -1536,7 +1542,7 @@
     background: var(--error-muted);
     color: var(--error);
   }
-  .kp-icon-btn:disabled, .kp-editor-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .kp-icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .kp-search-bar {
     display: flex;
     align-items: center;
@@ -1563,27 +1569,6 @@
   }
   .kp-search-input::placeholder { color: var(--foreground-muted); }
   .kp-search-clear { width: 24px; height: 24px; }
-  .kp-add-btn, .kp-editor-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    gap: var(--space-1);
-    min-height: 32px;
-    padding: 5px 10px;
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground);
-    font-size: var(--text-xs);
-    cursor: pointer;
-  }
-  .kp-add-btn:hover, .kp-editor-btn:hover:not(:disabled) { background: var(--surface-hover); }
-  .kp-editor-btn--primary {
-    background: var(--primary);
-    color: var(--primary-foreground);
-  }
-  .kp-editor-btn--primary:hover:not(:disabled) { background: var(--primary-hover, var(--primary)); }
   .kp-editor-card {
     display: flex;
     flex-direction: column;
@@ -1725,6 +1710,5 @@
     .kp-card-actions { grid-column: 1 / -1; grid-row: 2; justify-self: end; }
     .kp-list-toolbar { flex-wrap: wrap; }
     .kp-search-bar { flex-basis: 100%; }
-    .kp-add-btn { margin-left: auto; }
   }
 </style>

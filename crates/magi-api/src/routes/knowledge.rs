@@ -197,6 +197,8 @@ struct KnowledgeWorkspaceRequest {
     workspace_id: Option<String>,
     #[serde(default)]
     workspace_path: Option<String>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,6 +211,8 @@ struct KnowledgeRelationsQuery {
     #[serde(default)]
     workspace_path: Option<String>,
     #[serde(default)]
+    source_folder_id: Option<String>,
+    #[serde(default)]
     limit: Option<usize>,
 }
 
@@ -216,6 +220,11 @@ async fn clear_knowledge(
     State(state): State<ApiState>,
     Json(request): Json<KnowledgeWorkspaceRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
+    if request.source_folder_id.is_some() {
+        return Err(ApiError::InvalidInput(
+            "清空知识是项目操作，请省略 sourceFolderId".into(),
+        ));
+    }
     let (workspace_id, _) = require_registered_workspace_binding(
         &state,
         request.workspace_id.as_deref(),
@@ -291,6 +300,8 @@ struct KnowledgeGraphQuery {
     #[serde(default)]
     workspace_path: Option<String>,
     #[serde(default)]
+    source_folder_id: Option<String>,
+    #[serde(default)]
     focus: Option<String>,
     #[serde(default)]
     depth: Option<usize>,
@@ -332,7 +343,9 @@ async fn get_knowledge_graph(
         query.workspace_id.as_deref(),
         query.workspace_path.as_deref(),
     )?;
-    let load_state = ensure_workspace_code_index(&state, &workspace_id)?;
+    let (index_store, index_root) =
+        resolve_code_index_store(&state, &workspace_id, query.source_folder_id.as_deref())?;
+    let load_state = ensure_workspace_code_index(&state, &workspace_id, &index_store, &index_root)?;
     let node_kinds = parse_graph_csv(
         query.node_kinds.as_deref(),
         "nodeKinds",
@@ -358,7 +371,8 @@ async fn get_knowledge_graph(
         max_edges: query.max_edges.unwrap_or(240),
     };
 
-    let graph = graph_payload_for_workspace(&state, &workspace_id, &load_state, &graph_query)?;
+    let graph =
+        graph_payload_for_workspace(&index_store, &workspace_id, &load_state, &graph_query)?;
     let mut response = graph.as_object().cloned().ok_or_else(|| {
         ApiError::internal_assembly("知识图谱响应无效", "graph payload is not an object")
     })?;
@@ -369,6 +383,14 @@ async fn get_knowledge_graph(
     response.insert(
         "workspacePath".to_string(),
         serde_json::json!(workspace_path),
+    );
+    response.insert(
+        "sourceFolderId".into(),
+        serde_json::json!(
+            index_store
+                .code_index_scope()
+                .map(|scope| scope.source_folder_id.as_str())
+        ),
     );
     Ok(Json(serde_json::Value::Object(response)))
 }
@@ -385,7 +407,7 @@ fn empty_graph_payload(status: &str, reason_code: Option<&str>) -> serde_json::V
 }
 
 fn graph_payload_for_workspace(
-    state: &ApiState,
+    index_store: &magi_knowledge_store::KnowledgeStore,
     workspace_id: &WorkspaceId,
     load_state: &WorkspaceCodeIndexLoadState,
     query: &magi_knowledge_store::GraphQuery,
@@ -399,8 +421,7 @@ fn graph_payload_for_workspace(
             outcome.reason_code.as_ref().map(|reason| reason.as_str()),
         ));
     }
-    let graph = state
-        .knowledge_store
+    let graph = index_store
         .query_workspace_graph(workspace_id, query)
         .ok_or_else(|| {
             ApiError::internal_assembly("知识图谱索引不可用", "workspace graph index missing")
@@ -424,6 +445,8 @@ struct KnowledgeRelationRequest {
     workspace_id: Option<String>,
     #[serde(default)]
     workspace_path: Option<String>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
     relation_id: Option<String>,
     source: GraphNodeRef,
     kind: GraphEdgeKind,
@@ -478,6 +501,7 @@ fn relation_from_request(
             .or_else(|| (origin == GraphEdgeOrigin::Inferred).then_some(now))
     };
     Ok(KnowledgeRelation {
+        code_scope: None,
         relation_id,
         workspace_id,
         source: request.source,
@@ -508,7 +532,8 @@ async fn list_knowledge_relations(
         .limit
         .unwrap_or(DEFAULT_KNOWLEDGE_RELATION_LIMIT)
         .clamp(1, MAX_KNOWLEDGE_RELATION_LIMIT);
-    let mut relations = state.knowledge_store.list_relations(&workspace_id);
+    let store = relation_store(&state, &workspace_id, query.source_folder_id.as_deref())?;
+    let mut relations = store.list_relations(&workspace_id);
     let total_relations = relations.len();
     relations.sort_by(|left, right| {
         relation_status_priority(left.status)
@@ -526,6 +551,7 @@ async fn list_knowledge_relations(
     Ok(Json(serde_json::json!({
         "workspaceId": workspace_id.as_str(),
         "workspacePath": workspace_path,
+        "sourceFolderId": store.code_index_scope().map(|scope| scope.source_folder_id.as_str()),
         "relations": relations.iter().map(relation_json).collect::<Vec<_>>(),
         "totalRelations": total_relations,
         "truncated": total_relations > limit,
@@ -541,6 +567,30 @@ fn relation_status_priority(status: GraphEdgeStatus) -> u8 {
     }
 }
 
+fn relation_store(
+    state: &ApiState,
+    workspace_id: &WorkspaceId,
+    source_folder_id: Option<&str>,
+) -> Result<magi_knowledge_store::KnowledgeStore, ApiError> {
+    match source_folder_id {
+        Some(_) => {
+            resolve_code_index_store(state, workspace_id, source_folder_id).map(|(store, _)| store)
+        }
+        None => {
+            let project = state
+                .workspace_registry
+                .project(workspace_id)
+                .ok_or_else(|| ApiError::not_found("项目不存在", workspace_id.as_str()))?;
+            if project.source_folders.len() > 1 {
+                return Err(ApiError::InvalidInput(
+                    "多源目录项目的知识关系必须指定 sourceFolderId".into(),
+                ));
+            }
+            Ok(state.knowledge_store.as_ref().clone())
+        }
+    }
+}
+
 async fn add_knowledge_relation(
     State(state): State<ApiState>,
     Json(request): Json<KnowledgeRelationRequest>,
@@ -550,9 +600,10 @@ async fn add_knowledge_relation(
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
     )?;
-    let relation = relation_from_request(request, workspace_id.clone(), None)?;
-    state
-        .knowledge_store
+    let store = relation_store(&state, &workspace_id, request.source_folder_id.as_deref())?;
+    let mut relation = relation_from_request(request, workspace_id.clone(), None)?;
+    relation.code_scope = store.code_index_scope().cloned();
+    store
         .upsert_relation(relation.clone())
         .map_err(map_relation_error)?;
     state.persist_knowledge_state_for_api()?;
@@ -577,13 +628,13 @@ async fn update_knowledge_relation(
         .relation_id
         .as_deref()
         .ok_or_else(|| ApiError::InvalidInput("relationId 不能为空".to_string()))?;
-    let existing = state
-        .knowledge_store
+    let store = relation_store(&state, &workspace_id, request.source_folder_id.as_deref())?;
+    let existing = store
         .relation(relation_id, &workspace_id)
         .ok_or_else(|| ApiError::not_found("关系不存在", relation_id))?;
-    let relation = relation_from_request(request, workspace_id.clone(), Some(&existing))?;
-    state
-        .knowledge_store
+    let mut relation = relation_from_request(request, workspace_id.clone(), Some(&existing))?;
+    relation.code_scope = store.code_index_scope().cloned();
+    store
         .replace_relation(relation.clone(), &workspace_id)
         .map_err(map_relation_error)?;
     state.persist_knowledge_state_for_api()?;
@@ -604,6 +655,8 @@ struct DeleteKnowledgeRelationRequest {
     workspace_id: Option<String>,
     #[serde(default)]
     workspace_path: Option<String>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
     relation_id: String,
 }
 
@@ -616,8 +669,8 @@ async fn delete_knowledge_relation(
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
     )?;
-    state
-        .knowledge_store
+    let store = relation_store(&state, &workspace_id, request.source_folder_id.as_deref())?;
+    store
         .delete_relation_in_workspace(&request.relation_id, &workspace_id)
         .map_err(map_relation_error)?;
     state.persist_knowledge_state_for_api()?;
@@ -691,7 +744,10 @@ async fn get_project_knowledge(
         query.workspace_id.as_deref(),
         query.workspace_path.as_deref(),
     )?;
-    let index_load_state = ensure_workspace_code_index(&state, &workspace_id)?;
+    let (index_store, index_root) =
+        resolve_code_index_store(&state, &workspace_id, query.source_folder_id.as_deref())?;
+    let index_load_state =
+        ensure_workspace_code_index(&state, &workspace_id, &index_store, &index_root)?;
 
     let kq = KnowledgeQuery {
         kind: None,
@@ -708,15 +764,14 @@ async fn get_project_knowledge(
         .map(|m| knowledge_item_json(&m.record))
         .collect::<Vec<_>>();
 
-    let code_index_summary = state
-        .knowledge_store
-        .code_index_summary_for_workspace(&workspace_id);
+    let code_index_summary = index_store.code_index_summary_for_workspace(&workspace_id);
     let code_index_status = code_index_status_json(code_index_summary.as_ref(), &index_load_state);
     let code_index = code_index_summary
         .map(|summary| {
             serde_json::json!({
                 "files": summary.files.iter().map(|f| serde_json::json!({
                     "path": f.path,
+                    "sourceFolderId": index_store.code_index_scope().map(|scope| scope.source_folder_id.as_str()),
                     "lines": f.lines,
                     "size": f.size,
                 })).collect::<Vec<_>>(),
@@ -727,7 +782,7 @@ async fn get_project_knowledge(
         .unwrap_or(serde_json::Value::Null);
 
     let graph = graph_payload_for_workspace(
-        &state,
+        &index_store,
         &workspace_id,
         &index_load_state,
         &magi_knowledge_store::GraphQuery::default(),
@@ -737,6 +792,7 @@ async fn get_project_knowledge(
         "workspaceId": workspace_id.as_str(),
         "workspacePath": workspace_path,
         "items": items,
+        "sourceFolderId": index_store.code_index_scope().map(|scope| scope.source_folder_id.as_str()),
         "codeIndex": code_index,
         "codeIndexStatus": code_index_status,
         "graph": graph,
@@ -748,40 +804,67 @@ enum WorkspaceCodeIndexLoadState {
     Indexing,
 }
 
+fn resolve_code_index_store(
+    state: &ApiState,
+    workspace_id: &WorkspaceId,
+    source_folder_id: Option<&str>,
+) -> Result<(magi_knowledge_store::KnowledgeStore, PathBuf), ApiError> {
+    let project = state
+        .workspace_registry
+        .project(workspace_id)
+        .ok_or_else(|| ApiError::not_found("项目不存在", workspace_id.as_str()))?;
+    let Some(source_id) = source_folder_id else {
+        if project.source_folders.len() != 1 {
+            return Err(ApiError::InvalidInput(
+                "多源目录项目必须指定 sourceFolderId".into(),
+            ));
+        }
+        return Ok((
+            state.knowledge_store.as_ref().clone(),
+            project.native_root_path(),
+        ));
+    };
+    let folder = project
+        .source_folder(source_id)
+        .ok_or_else(|| ApiError::InvalidInput("项目源文件夹不存在".into()))?;
+    let root = folder.native_path();
+    if std::fs::canonicalize(&root).is_ok_and(|canonical| canonical != root) {
+        return Err(ApiError::Conflict("源文件夹原登记路径已变化".into()));
+    }
+    let store = state
+        .knowledge_store
+        .for_source_folder(source_id, &root)
+        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+    Ok((store, root))
+}
+
 fn ensure_workspace_code_index(
     state: &ApiState,
     workspace_id: &WorkspaceId,
+    index_store: &magi_knowledge_store::KnowledgeStore,
+    root: &std::path::Path,
 ) -> Result<WorkspaceCodeIndexLoadState, ApiError> {
-    let Some(workspace) = state
-        .workspace_registry
-        .workspaces()
-        .into_iter()
-        .find(|workspace| workspace.workspace_id == *workspace_id)
-    else {
-        return Err(ApiError::not_found("工作区不存在", workspace_id.as_str()));
-    };
-    let workspace_root = workspace.native_root_path();
-
-    if workspace_root_scan_failure(&workspace_root).is_some() {
-        let outcome = state
-            .knowledge_store
-            .build_workspace_index(workspace_id, &workspace_root);
+    if workspace_root_scan_failure(root).is_some() {
+        let outcome = index_store.build_workspace_index(workspace_id, root);
         state.persist_knowledge_state_for_api()?;
         return Ok(WorkspaceCodeIndexLoadState::Ready(outcome));
     }
-    if state.knowledge_store.workspace_index_building(workspace_id) {
+    if index_store.workspace_index_building(workspace_id) {
         return Ok(WorkspaceCodeIndexLoadState::Indexing);
     }
-    if state.knowledge_store.workspace_index_ready(workspace_id) {
+    if index_store.workspace_index_ready(workspace_id) {
         return Ok(WorkspaceCodeIndexLoadState::Ready(
             CodeIndexScanOutcome::indexed_existing(),
         ));
     }
-    if let Some(outcome) = state.knowledge_store.workspace_index_outcome(workspace_id) {
+    if let Some(outcome) = index_store.workspace_index_outcome(workspace_id) {
         return Ok(WorkspaceCodeIndexLoadState::Ready(outcome));
     }
-
-    state.schedule_workspace_code_index(workspace_id.clone(), workspace_root);
+    state.schedule_code_index(
+        workspace_id.clone(),
+        root.to_path_buf(),
+        index_store.clone(),
+    );
     Ok(WorkspaceCodeIndexLoadState::Indexing)
 }
 
@@ -819,8 +902,9 @@ async fn reindex_knowledge(
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
     )?;
-    let scheduled =
-        state.schedule_workspace_code_index(workspace_id.clone(), PathBuf::from(&workspace_path));
+    let (index_store, index_root) =
+        resolve_code_index_store(&state, &workspace_id, request.source_folder_id.as_deref())?;
+    let scheduled = state.schedule_code_index(workspace_id.clone(), index_root, index_store);
     Ok(Json(serde_json::json!({
         "accepted": scheduled,
         "workspaceId": workspace_id.as_str(),
@@ -1550,6 +1634,250 @@ mod tests {
             "background index should include the workspace source file"
         );
         assert_eq!(ready_payload["codeIndexStatus"]["status"], "indexed");
+    }
+
+    #[tokio::test]
+    async fn knowledge_relations_keep_same_paths_in_distinct_source_folders() {
+        let state = state_with_knowledge_store(KnowledgeStore::new());
+        let fixture = tempfile::tempdir().unwrap();
+        let a = fixture.path().join("a");
+        let b = fixture.path().join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let id = WorkspaceId::new("relation-source-boundary");
+        state
+            .workspace_registry
+            .register_native_path(id.clone(), a)
+            .unwrap();
+        let project =
+            crate::routes::test_project_fixtures::add_source(&state, id.as_str(), "b", &b);
+        state.knowledge_store.upsert(KnowledgeRecord {
+            knowledge_id: "shared-adr".into(),
+            kind: KnowledgeKind::Adr,
+            title: "Shared decision".into(),
+            content: "Applies independently to each source".into(),
+            tags: vec![],
+            workspace_id: Some(id.clone()),
+            source_ref: None,
+            created_at: UtcMillis(1),
+            updated_at: UtcMillis(1),
+        });
+        let body = |source: &str, relation: &str| {
+            serde_json::json!({
+                "workspaceId": id.as_str(), "sourceFolderId": source, "relationId": relation,
+                "source": {"kind":"knowledge", "knowledgeId":"shared-adr"},
+                "kind":"applies_to", "target":{"kind":"file", "path":"src/index.ts"}
+            })
+        };
+        let first = &project.primary_source_folder_id;
+        let mut ambiguous = body(first, "ambiguous-relation");
+        ambiguous.as_object_mut().unwrap().remove("sourceFolderId");
+        assert!(matches!(
+            add_knowledge_relation(
+                State(state.clone()),
+                Json(serde_json::from_value(ambiguous).unwrap()),
+            )
+            .await,
+            Err(ApiError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            list_knowledge_relations(
+                State(state.clone()),
+                Query(serde_json::from_value(serde_json::json!({"workspaceId": id})).unwrap()),
+            )
+            .await,
+            Err(ApiError::InvalidInput(_))
+        ));
+        for source in [first.as_str(), "b"] {
+            let relation_id = format!("relation-{source}");
+            let response = add_knowledge_relation(
+                State(state.clone()),
+                Json(serde_json::from_value(body(source, &relation_id)).unwrap()),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(response["relation"]["codeScope"]["sourceFolderId"], source);
+            let response = list_knowledge_relations(
+                State(state.clone()),
+                Query(
+                    serde_json::from_value(serde_json::json!({
+                        "workspaceId": id.as_str(), "sourceFolderId": source
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(response["relations"].as_array().unwrap().len(), 1);
+            assert_eq!(response["relations"][0]["relationId"], relation_id);
+        }
+        let first_relation = format!("relation-{first}");
+        for update in [false, true] {
+            let request = Json(serde_json::from_value(body("b", &first_relation)).unwrap());
+            let result = if update {
+                update_knowledge_relation(State(state.clone()), request).await
+            } else {
+                add_knowledge_relation(State(state.clone()), request).await
+            };
+            assert!(result.is_err(), "不能用另一目录覆盖原关系");
+        }
+        let deletion = |source: &str, relation: &str| {
+            Json(
+                serde_json::from_value(serde_json::json!({
+                    "workspaceId": id.as_str(), "sourceFolderId": source, "relationId": relation
+                }))
+                .unwrap(),
+            )
+        };
+        assert!(
+            delete_knowledge_relation(State(state.clone()), deletion("b", &first_relation))
+                .await
+                .is_err()
+        );
+        let _ = delete_knowledge_relation(State(state.clone()), deletion(first, &first_relation))
+            .await
+            .unwrap();
+        assert!(
+            state
+                .knowledge_store
+                .for_source_folder("b", &b)
+                .unwrap()
+                .relation("relation-b", &id)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn project_knowledge_keeps_source_indexes_and_revocation_separate() {
+        let state = state_with_knowledge_store(KnowledgeStore::new());
+        let fixture = tempfile::tempdir().unwrap();
+        let a = fixture.path().join("a");
+        let b = fixture.path().join("b");
+        for (root, content) in [
+            (&a, "export function onlyAlpha() {}\n"),
+            (&b, "export function onlyBeta() {}\n"),
+        ] {
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(root.join("src/index.ts"), content).unwrap();
+        }
+        let id = WorkspaceId::new("knowledge-multi-source");
+        let original = state
+            .workspace_registry
+            .register_native_path(id.clone(), a.clone())
+            .unwrap();
+        let a_id = original.primary_source_folder_id.clone();
+        let mut second = original.primary_source_folder().clone();
+        second.source_folder_id = "b".into();
+        let host = magi_core::HostPath::canonicalize(&b).unwrap();
+        second.path = AbsolutePath::new(host.display_string());
+        second.path_ref = host.to_path_ref().as_str().into();
+        let mut members = original.source_folders.clone();
+        members.push(second.clone());
+        state
+            .workspace_registry
+            .edit_project(
+                &id,
+                1,
+                magi_workspace::WorkspaceProjectEdit {
+                    name: Some("multi-source".into()),
+                    source_folders: members,
+                    primary_source_folder_id: "b".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let request = |source: Option<&str>| {
+            Request::builder()
+                .uri(format!(
+                    "/knowledge?workspaceId={}{}",
+                    id.as_str(),
+                    source
+                        .map(|id| format!("&sourceFolderId={id}"))
+                        .unwrap_or_default()
+                ))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(request(None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        for source in [a_id.as_str(), "b"] {
+            let response = routes()
+                .with_state(state.clone())
+                .oneshot(request(Some(source)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let root = if source == "b" { &b } else { &a };
+            let view = state
+                .knowledge_store
+                .for_source_folder(source, root)
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while view.workspace_index_building(&id) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let response = routes()
+                .with_state(state.clone())
+                .oneshot(request(Some(source)))
+                .await
+                .unwrap();
+            let payload = read_json(response).await;
+            assert_eq!(payload["sourceFolderId"], source);
+            assert_eq!(payload["codeIndex"]["files"][0]["path"], "src/index.ts");
+            assert_eq!(payload["codeIndex"]["files"][0]["sourceFolderId"], source);
+            let nodes = payload["graph"]["nodes"].as_array().unwrap();
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| node["metadata"]["sourceFolderId"] == source)
+            );
+            assert!(!nodes.iter().any(|node| node["label"]
+                == if source == "b" {
+                    "onlyAlpha"
+                } else {
+                    "onlyBeta"
+                }));
+        }
+        fs::remove_dir_all(&b).unwrap();
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(request(Some("b")))
+            .await
+            .unwrap();
+        let payload = read_json(response).await;
+        assert_eq!(payload["codeIndexStatus"]["status"], "failed");
+        assert!(payload["codeIndex"].is_null());
+        assert!(!b.exists());
+        // 撤销成员后，旧缓存仍不能被旧目录 ID 重新取出。
+        state
+            .workspace_registry
+            .edit_project(
+                &id,
+                2,
+                magi_workspace::WorkspaceProjectEdit {
+                    name: Some("renamed".into()),
+                    source_folders: original.source_folders,
+                    primary_source_folder_id: a_id.clone(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(request(Some("b")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        state.knowledge_store.clear_workspace(&id);
     }
 
     #[tokio::test]

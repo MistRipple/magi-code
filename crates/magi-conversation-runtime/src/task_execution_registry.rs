@@ -348,6 +348,30 @@ impl TaskExecutionRegistry {
             .clone()
     }
 
+    /// Recheck the frozen directory authorization at each tool boundary, including
+    /// after an approval wait or process restart.
+    pub(crate) fn validate_project_directories(
+        &self,
+        task: &magi_core::Task,
+        workspace_id: &Option<magi_core::WorkspaceId>,
+    ) -> Result<(), String> {
+        let Some(binding) = task
+            .executor_binding
+            .as_ref()
+            .and_then(|executor| executor.project_directories.as_ref())
+        else {
+            return Ok(());
+        };
+        if workspace_id.as_ref() != Some(&binding.workspace_id) {
+            return Err("Task 源文件夹授权与当前项目不匹配".into());
+        }
+        self.agent_spawn_preflight_runtime()
+            .workspace_registry
+            .ok_or_else(|| "缺少项目目录权威，不能执行已绑定任务".to_string())?
+            .validate_directory_binding(binding)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn insert(
         &self,
         task_id: TaskId,
@@ -747,8 +771,29 @@ impl TaskExecutionRegistry {
             .agent_spawn_preflight_runtime()
             .session_code_contexts
             .as_ref()
-            .and_then(|registry| registry.get(session_id.as_str()))
-            .is_some();
+            .is_some_and(|registry| {
+                if let Some(binding) = child_task
+                    .executor_binding
+                    .as_ref()
+                    .and_then(|executor| executor.project_directories.as_ref())
+                {
+                    !binding.source_folders.is_empty()
+                        && binding.source_folders.iter().all(|grant| {
+                            magi_core::HostPath::from_path_ref(&grant.source_path_ref)
+                                .ok()
+                                .and_then(|source| {
+                                    registry.get_for_path(session_id.as_str(), source.as_path())
+                                })
+                                .is_some()
+                        })
+                } else {
+                    match inherited_execution_root.as_deref() {
+                        Some(root) => registry.get_for_path(session_id.as_str(), root),
+                        None => registry.get(session_id.as_str()),
+                    }
+                    .is_some()
+                }
+            });
         if !isolated_by_git
             && writes(child_task)
             && task_store

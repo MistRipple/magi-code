@@ -1755,6 +1755,7 @@ mod tests {
         });
 
         let ctx = ToolExecutionContext {
+            project_directory_map: None,
             caller_scope: magi_tool_runtime::ToolCallerScope::DelegatedTask,
             worker_id: Some(magi_core::WorkerId::new("wk-skill")),
             task_id: Some(magi_core::TaskId::new("td-skill")),

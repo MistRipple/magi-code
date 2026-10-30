@@ -2,8 +2,7 @@
 //!
 //! 优先使用文件系统的写时复制（macOS APFS 的 `clonefile`、Linux 的 reflink）：整个目录
 //! 几乎不占空间、秒级完成，`node_modules` 之类的大目录也包含在内且互相独立。文件系统不支持
-//! （跨卷、ext4、Windows 等）时退回普通复制，并把依赖/构建产物这类体积巨大的目录改为指回
-//! 主工作区的符号链接，避免复制几个 GB 的内容。
+//! （跨卷、ext4、Windows 等）时退回完整普通复制；不生成指回源目录的依赖或构建目录链接。
 use crate::error::{IsolationError, IsolationResult};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -17,7 +16,7 @@ const STATE_DIR_NAME: &str = ".magi";
 pub enum CloneStrategy {
     /// 写时复制，副本完整且互相独立。
     Clone,
-    /// 普通复制；体积巨大的依赖目录以符号链接指回主工作区。
+    /// 完整普通复制，依赖与构建产物也保持独立。
     Copy,
 }
 
@@ -25,7 +24,7 @@ pub enum CloneStrategy {
 #[serde(rename_all = "camelCase")]
 pub struct CloneOutcome {
     pub strategy: CloneStrategy,
-    /// 普通复制时被替换为符号链接的目录（相对路径）。
+    /// 旧副本记录中的共享目录（相对路径）。新副本不再创建共享链接。
     pub linked_dirs: Vec<String>,
     /// 副本里是否有可用的独立 Git 仓库。主工作区是 linked worktree / submodule 时
     /// `.git` 只是指向外部 gitdir 的文件，原样复制会让副本与主工作区共用同一份索引，
@@ -48,20 +47,49 @@ pub(crate) fn create_isolated_copy_with(
     if dest.exists() {
         return Err(IsolationError::DestinationExists(dest.to_path_buf()));
     }
-    fs::create_dir_all(dest)
-        .map_err(|error| IsolationError::io("创建隔离副本目录", dest, error))?;
+    let canonical_source = fs::canonicalize(source)
+        .map_err(|error| IsolationError::io("规范化源目录", source, error))?;
+    let parent = dest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|error| IsolationError::io("规范化副本父目录", parent, error))?;
+    if canonical_parent.starts_with(&canonical_source) {
+        return Err(IsolationError::UnsafePath(
+            "副本不能创建在源目录内部".into(),
+        ));
+    }
+    // 独占创建成功后才拥有目标；失败时绝不清理调用者已存在的目录。
+    fs::create_dir(dest).map_err(|error| IsolationError::io("创建隔离副本目录", dest, error))?;
+    let result = copy_owned_directory(source, dest, allow_clone);
+    if result.is_err() {
+        let _ = fs::remove_dir_all(dest);
+    }
+    result
+}
 
+fn copy_owned_directory(
+    source: &Path,
+    dest: &Path,
+    allow_clone: bool,
+) -> IsolationResult<CloneOutcome> {
     let dot_git = source.join(".git");
-    let skip_git = dot_git.is_file();
-    let git_available = dot_git.is_dir();
+    let git_link =
+        fs::symlink_metadata(&dot_git).is_ok_and(|metadata| metadata.file_type().is_symlink());
+    let skip_git = dot_git.is_file() || git_link;
+    let git_available = dot_git.is_dir() && !git_link;
     let entries = fs::read_dir(source)
         .map_err(|error| IsolationError::io("读取源目录", source, error))?
-        .filter_map(Result::ok)
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| IsolationError::io("读取源目录条目", source, error))?
+        .into_iter()
         .filter(|entry| {
-            let name = entry.file_name();
-            name != STATE_DIR_NAME && !(skip_git && name == ".git")
+            entry
+                .file_name()
+                .is_some_and(|name| name != STATE_DIR_NAME && !(skip_git && name == ".git"))
         })
-        .map(|entry| entry.path())
         .collect::<Vec<_>>();
 
     if allow_clone && entries.iter().all(|entry| clone_entry(entry, dest)) {
@@ -73,25 +101,18 @@ pub(crate) fn create_isolated_copy_with(
     }
     // 写时复制不可用或中途失败：清掉半成品，改用普通复制。
     if allow_clone {
-        let _ = fs::remove_dir_all(dest);
-        fs::create_dir_all(dest)
+        fs::remove_dir_all(dest)
+            .map_err(|error| IsolationError::io("清理未完成的写时复制", dest, error))?;
+        fs::create_dir(dest)
             .map_err(|error| IsolationError::io("创建隔离副本目录", dest, error))?;
     }
-    let mut linked_dirs = Vec::new();
     for entry in &entries {
         let name = entry.file_name().expect("directory entry has a name");
-        copy_entry(
-            entry,
-            &dest.join(name),
-            true,
-            Path::new(name),
-            &mut linked_dirs,
-        )?;
+        copy_entry(entry, &dest.join(name))?;
     }
-    linked_dirs.sort();
     Ok(CloneOutcome {
         strategy: CloneStrategy::Copy,
-        linked_dirs,
+        linked_dirs: Vec::new(),
         git_available,
     })
 }
@@ -117,18 +138,7 @@ fn clone_entry(entry: &Path, dest_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// 普通复制时指回主工作区、不复制内容的目录。
-fn is_linked_dir(name: &str, at_root: bool) -> bool {
-    matches!(name, "node_modules" | ".venv" | "venv") || (at_root && name == "target")
-}
-
-fn copy_entry(
-    source: &Path,
-    dest: &Path,
-    at_root: bool,
-    relative: &Path,
-    linked_dirs: &mut Vec<String>,
-) -> IsolationResult<()> {
+pub(crate) fn copy_entry(source: &Path, dest: &Path) -> IsolationResult<()> {
     let file_type = fs::symlink_metadata(source)
         .map_err(|error| IsolationError::io("读取文件信息", source, error))?
         .file_type();
@@ -139,31 +149,13 @@ fn copy_entry(
             .map_err(|error| IsolationError::io("创建符号链接", dest, error));
     }
     if file_type.is_dir() {
-        let name = source
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if is_linked_dir(&name, at_root) {
-            let absolute = fs::canonicalize(source)
-                .map_err(|error| IsolationError::io("解析目录路径", source, error))?;
-            if create_symlink(&absolute, dest, true).is_ok() {
-                linked_dirs.push(relative.to_string_lossy().replace('\\', "/"));
-                return Ok(());
-            }
-        }
         fs::create_dir(dest).map_err(|error| IsolationError::io("创建目录", dest, error))?;
-        for child in fs::read_dir(source)
-            .map_err(|error| IsolationError::io("读取目录", source, error))?
-            .filter_map(Result::ok)
+        for child in
+            fs::read_dir(source).map_err(|error| IsolationError::io("读取目录", source, error))?
         {
+            let child = child.map_err(|error| IsolationError::io("读取目录条目", source, error))?;
             let child_name = child.file_name();
-            copy_entry(
-                &child.path(),
-                &dest.join(&child_name),
-                false,
-                &relative.join(&child_name),
-                linked_dirs,
-            )?;
+            copy_entry(&child.path(), &dest.join(&child_name))?;
         }
         if let Ok(metadata) = fs::metadata(source) {
             let _ = fs::set_permissions(dest, metadata.permissions());
@@ -230,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_fallback_replicates_files_and_links_heavy_directories() {
+    fn copy_fallback_keeps_dependencies_and_build_artifacts_independent() {
         let source = fixture();
         let dest_parent = tempfile::tempdir().unwrap();
         let dest = dest_parent.path().join("copy");
@@ -246,18 +238,23 @@ mod tests {
             "# demo\n"
         );
         assert!(!dest.join(".magi").exists(), "Magi 运行态不属于副本");
-        assert_eq!(outcome.linked_dirs, vec!["node_modules", "target"]);
+        assert!(outcome.linked_dirs.is_empty());
         assert!(
-            fs::symlink_metadata(dest.join("node_modules"))
+            !fs::symlink_metadata(dest.join("node_modules"))
                 .unwrap()
                 .file_type()
                 .is_symlink()
         );
-        // 链接指回主工作区：副本里能读到依赖，但没有复制它们。
+        // 依赖、构建产物与源码遵循同一份隔离边界。
         assert_eq!(
             fs::read_to_string(dest.join("node_modules/pkg/index.js")).unwrap(),
             "module.exports = 1;\n"
         );
+        for file in ["node_modules/pkg/index.js", "target/debug/out"] {
+            let original = fs::read(source.path().join(file)).unwrap();
+            fs::write(dest.join(file), "changed dependency").unwrap();
+            assert_eq!(fs::read(source.path().join(file)).unwrap(), original);
+        }
         // 改副本不影响主工作区。
         fs::write(dest.join("src/main.rs"), "changed").unwrap();
         assert_eq!(
@@ -331,6 +328,21 @@ mod tests {
             !dest.join(".git").exists(),
             "指向外部 gitdir 的 .git 文件会让副本共用主工作区的索引"
         );
+        #[cfg(unix)]
+        {
+            fs::remove_file(source.path().join(".git")).unwrap();
+            let external = tempfile::tempdir().unwrap();
+            fs::write(external.path().join("HEAD"), "original metadata").unwrap();
+            std::os::unix::fs::symlink(external.path(), source.path().join(".git")).unwrap();
+            let other_copy = dest_parent.path().join("symlink-copy");
+            let outcome = create_isolated_copy(source.path(), &other_copy).unwrap();
+            assert!(!outcome.git_available);
+            assert!(fs::symlink_metadata(other_copy.join(".git")).is_err());
+            assert_eq!(
+                fs::read_to_string(external.path().join("HEAD")).unwrap(),
+                "original metadata"
+            );
+        }
     }
 
     #[test]
@@ -349,10 +361,34 @@ mod tests {
     fn existing_destination_is_rejected() {
         let source = fixture();
         let dest = tempfile::tempdir().unwrap();
+        fs::write(dest.path().join("keep.txt"), "existing output").unwrap();
         assert!(matches!(
             create_isolated_copy(source.path(), dest.path()),
             Err(IsolationError::DestinationExists(_))
         ));
+        assert_eq!(
+            fs::read_to_string(dest.path().join("keep.txt")).unwrap(),
+            "existing output"
+        );
+    }
+
+    #[test]
+    fn destination_inside_source_is_rejected_before_creating_any_copy() {
+        let source = fixture();
+        let dest = source.path().join("nested-copy");
+        assert!(matches!(
+            create_isolated_copy(source.path(), &dest),
+            Err(IsolationError::UnsafePath(_))
+        ));
+        assert!(!dest.exists());
+        #[cfg(unix)]
+        {
+            let parent = tempfile::tempdir().unwrap();
+            let alias = parent.path().join("source-alias");
+            std::os::unix::fs::symlink(source.path(), &alias).unwrap();
+            assert!(create_isolated_copy(source.path(), &alias.join("nested-copy")).is_err());
+            assert!(!dest.exists());
+        }
     }
 
     #[test]

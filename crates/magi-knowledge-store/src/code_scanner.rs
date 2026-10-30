@@ -2,7 +2,7 @@ use crate::{CodeIndexIngestion, CodeIndexSource};
 use magi_core::UtcMillis;
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// 可索引的源代码扩展名集合（含点号，小写）
 const INDEXED_EXTENSIONS: &[&str] = &[
@@ -57,6 +57,40 @@ const IGNORE_PATTERNS: &[&str] = &[
 /// 知识库概览需要的是项目源码结构，不应因为锁文件、生成产物或供应商源码中的
 /// 巨型 JSON/Markdown/YAML 文件拖住整个 UI 加载。
 const MAX_INDEXED_FILE_BYTES: u64 = 1_048_576;
+
+/// 索引快照只保存相对路径。每次读盘重新检查路径，文件被换成链接后不能
+/// 从旧索引条目读取根外内容；读取量也不跟随后来增长的文件无限扩大。
+pub(crate) fn index_file_path(root: &Path, relative: &str) -> Option<PathBuf> {
+    let relative = Path::new(relative);
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return None;
+    }
+    let root = std::fs::canonicalize(root).ok()?;
+    let expected = root.join(relative);
+    let canonical = std::fs::canonicalize(&expected).ok()?;
+    let metadata = std::fs::symlink_metadata(&expected).ok()?;
+    (canonical == expected && metadata.is_file() && metadata.len() <= MAX_INDEXED_FILE_BYTES)
+        .then_some(canonical)
+}
+
+pub(crate) fn read_index_file(root: &Path, relative: &str) -> std::io::Result<String> {
+    let invalid = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "索引路径不可读取");
+    let path = index_file_path(root, relative).ok_or_else(invalid)?;
+    let mut content = String::new();
+    std::fs::File::open(&path)?
+        .take(MAX_INDEXED_FILE_BYTES + 1)
+        .read_to_string(&mut content)?;
+    if content.len() as u64 > MAX_INDEXED_FILE_BYTES
+        || index_file_path(root, relative).as_ref() != Some(&path)
+    {
+        return Err(invalid());
+    }
+    Ok(content)
+}
 
 /// 入口文件检测模式
 const ENTRY_PATTERNS: &[&str] = &[
@@ -357,6 +391,7 @@ pub(crate) fn code_index_ingestion_for_summary(
         source_ref: Some(workspace_root.to_string_lossy().to_string()),
         updated_at: UtcMillis::now(),
         source: CodeIndexSource {
+            code_scope: None,
             path: workspace_root.to_string_lossy().to_string(),
             language: None,
             repo_ref: None,

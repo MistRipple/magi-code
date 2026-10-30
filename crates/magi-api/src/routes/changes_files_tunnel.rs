@@ -25,6 +25,7 @@ use magi_snapshot::{ToolHook, ToolHookCtx};
 use crate::scope_binding::{
     SessionScope, parse_session_id, require_registered_workspace_binding,
     resolve_existing_session_scope, resolve_optional_session_workspace_scope,
+    resolve_project_source_directory,
 };
 use crate::{
     change_projection::{
@@ -112,6 +113,7 @@ fn session_scope_binding(scope: &SessionChangeScope) -> serde_json::Value {
         "sessionId": scope.session_id.as_str(),
         "workspaceId": scope.workspace_id.as_str(),
         "workspacePath": workspace_path_string(&scope.workspace_root),
+        "sourceFolderId": scope.source_folder_id,
         "executionGroupId": scope.execution_group_id,
     })
 }
@@ -121,6 +123,7 @@ fn workspace_scope_binding(scope: &WorkspaceChangeScope) -> serde_json::Value {
         "sessionId": serde_json::Value::Null,
         "workspaceId": scope.workspace_id.as_str(),
         "workspacePath": workspace_path_string(&scope.workspace_root),
+        "sourceFolderId": scope.source_folder_id,
         "executionGroupId": serde_json::Value::Null,
     })
 }
@@ -163,9 +166,10 @@ fn resolve_workspace_change_scope_from_request(
     state: &ApiState,
     workspace_id: Option<&str>,
     workspace_path: Option<&str>,
+    source_folder_id: Option<&str>,
 ) -> Result<WorkspaceChangeScope, ApiError> {
     let binding = require_registered_workspace_binding(state, workspace_id, workspace_path)?;
-    resolve_workspace_change_scope(state, &binding.workspace_id)
+    resolve_workspace_change_scope(state, &binding.workspace_id, source_folder_id)
 }
 
 fn resolve_session_change_scope_from_request(
@@ -174,6 +178,7 @@ fn resolve_session_change_scope_from_request(
     workspace_id: Option<&str>,
     workspace_path: Option<&str>,
     execution_group_id: Option<&str>,
+    source_folder_id: Option<&str>,
 ) -> Result<SessionChangeScope, ApiError> {
     let request_scope = resolve_optional_session_workspace_scope(
         state,
@@ -181,6 +186,12 @@ fn resolve_session_change_scope_from_request(
         workspace_id,
         workspace_path,
     )?;
+    if let Some(workspace_id) = request_scope.workspace_id() {
+        state
+            .workspace_registry
+            .resolve_source_folder(workspace_id, source_folder_id)
+            .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+    }
     let resolved_workspace_id = request_scope
         .workspace_id()
         .map(|workspace_id| workspace_id.as_str().to_string());
@@ -189,6 +200,7 @@ fn resolve_session_change_scope_from_request(
         session_id,
         resolved_workspace_id.as_deref(),
         execution_group_id,
+        source_folder_id,
     )
 }
 
@@ -202,6 +214,8 @@ struct ChangesQuery {
     workspace_path: Option<String>,
     #[serde(default)]
     force_refresh: bool,
+    #[serde(default)]
+    source_folder_id: Option<String>,
 }
 
 async fn list_changes(
@@ -215,13 +229,18 @@ async fn list_changes(
         query.workspace_id.as_deref(),
         query.workspace_path.as_deref(),
         None,
+        query.source_folder_id.as_deref(),
     )?;
     require_snapshot_session(&state, &scope, query.force_refresh).await?;
-    let projection = collect_session_pending_changes_with_state(
+    let mut projection = collect_session_pending_changes_with_state(
         &state,
         &scope.session_id,
         Some(scope.workspace_id.as_str()),
     )?;
+    projection
+        .pending_changes
+        .retain(|change| change.source_folder_id == scope.source_folder_id);
+    projection.state.pending_count = projection.pending_changes.len();
     Ok(Json(serde_json::json!({
         "generatedAt": UtcMillis::now().0,
         "sessionId": scope.session_id.as_str(),
@@ -240,6 +259,8 @@ struct DiffQuery {
     workspace_id: Option<String>,
     workspace_path: Option<String>,
     execution_group_id: Option<String>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
 }
 
 async fn get_diff(
@@ -261,6 +282,7 @@ async fn get_diff(
                 query.workspace_id.as_deref(),
                 query.workspace_path.as_deref(),
                 query.execution_group_id.as_deref(),
+                query.source_folder_id.as_deref(),
             )?;
             let snapshot = require_snapshot_session(&state, &scope, true).await?;
             let pending = snapshot
@@ -328,6 +350,7 @@ async fn get_diff(
                 &state,
                 query.workspace_id.as_deref(),
                 query.workspace_path.as_deref(),
+                query.source_folder_id.as_deref(),
             )?;
             let pending_state = pending_changes_state(
                 "unavailable",
@@ -370,6 +393,8 @@ struct ApproveChangeRequest {
     session_id: Option<String>,
     workspace_id: Option<String>,
     workspace_path: Option<String>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
 }
 
 async fn approve_change(
@@ -383,13 +408,19 @@ async fn approve_change(
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
         None,
+        request.source_folder_id.as_deref(),
     )?;
     let rel = safe_relative_path(&request.file_path)?.to_string();
-    if state.session_isolation(&session_id).is_some() {
+    if state
+        .session_isolations
+        .get_for_root(session_id.as_str(), &scope.workspace_root)
+        .is_some()
+    {
         // 隔离会话的「批准」就是把这个改动合并回主工作区；与主工作区冲突的文件要到合并面板里决定。
         let outcome = state
-            .isolation_merge_apply(
+            .isolation_merge_apply_for_source(
                 &session_id,
+                Some(&scope.workspace_root),
                 magi_session_isolation::MergeSelection {
                     paths: Some(vec![rel.clone()]),
                     resolutions: Default::default(),
@@ -420,6 +451,7 @@ async fn approve_change(
         "sessionId": scope.session_id.as_str(),
         "workspaceId": scope.workspace_id.as_str(),
         "workspacePath": workspace_path_string(&scope.workspace_root),
+        "sourceFolderId": scope.source_folder_id,
         "executionGroupId": scope.execution_group_id,
     })))
 }
@@ -431,6 +463,8 @@ struct RevertChangeRequest {
     session_id: Option<String>,
     workspace_id: Option<String>,
     workspace_path: Option<String>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
 }
 
 async fn revert_change(
@@ -444,6 +478,7 @@ async fn revert_change(
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
         None,
+        request.source_folder_id.as_deref(),
     )?;
     let rel = safe_relative_path(&request.file_path)?.to_string();
     let snapshot = require_snapshot_session(&state, &scope, true).await?;
@@ -456,6 +491,7 @@ async fn revert_change(
         "sessionId": scope.session_id.as_str(),
         "workspaceId": scope.workspace_id.as_str(),
         "workspacePath": workspace_path_string(&scope.workspace_root),
+        "sourceFolderId": scope.source_folder_id,
         "executionGroupId": scope.execution_group_id,
     })))
 }
@@ -466,6 +502,8 @@ struct ApproveAllRequest {
     session_id: Option<String>,
     workspace_id: Option<String>,
     workspace_path: Option<String>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
 }
 
 async fn approve_all_changes(
@@ -479,12 +517,18 @@ async fn approve_all_changes(
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
         None,
+        request.source_folder_id.as_deref(),
     )?;
-    if state.session_isolation(&session_id).is_some() {
+    if state
+        .session_isolations
+        .get_for_root(session_id.as_str(), &scope.workspace_root)
+        .is_some()
+    {
         // 隔离会话的「全部批准」合并所有没有冲突的改动；有冲突的留在副本里，由合并面板处理。
         let outcome = state
-            .isolation_merge_apply(
+            .isolation_merge_apply_for_source(
                 &session_id,
+                Some(&scope.workspace_root),
                 magi_session_isolation::MergeSelection::default(),
             )
             .await?;
@@ -524,6 +568,7 @@ async fn approve_all_changes(
         "sessionId": scope.session_id.as_str(),
         "workspaceId": scope.workspace_id.as_str(),
         "workspacePath": workspace_path_string(&scope.workspace_root),
+        "sourceFolderId": scope.source_folder_id,
         "executionGroupId": scope.execution_group_id,
     })))
 }
@@ -534,6 +579,8 @@ struct RevertAllRequest {
     session_id: Option<String>,
     workspace_id: Option<String>,
     workspace_path: Option<String>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
 }
 
 async fn revert_all_changes(
@@ -547,6 +594,7 @@ async fn revert_all_changes(
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
         None,
+        request.source_folder_id.as_deref(),
     )?;
     let snapshot = require_snapshot_session(&state, &scope, true).await?;
     let pending = snapshot
@@ -562,6 +610,7 @@ async fn revert_all_changes(
         "sessionId": scope.session_id.as_str(),
         "workspaceId": scope.workspace_id.as_str(),
         "workspacePath": workspace_path_string(&scope.workspace_root),
+        "sourceFolderId": scope.source_folder_id,
         "executionGroupId": scope.execution_group_id,
     })))
 }
@@ -573,6 +622,8 @@ struct RevertExecutionGroupRequest {
     session_id: Option<String>,
     workspace_id: Option<String>,
     workspace_path: Option<String>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
 }
 
 async fn revert_execution_group_changes(
@@ -586,6 +637,7 @@ async fn revert_execution_group_changes(
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
         None,
+        request.source_folder_id.as_deref(),
     )?;
     let snapshot = require_snapshot_session(&state, &scope, true).await?;
     if !snapshot
@@ -631,6 +683,8 @@ struct FileContentQuery {
     workspace_id: Option<String>,
     workspace_path: Option<String>,
     execution_group_id: Option<String>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -640,6 +694,8 @@ struct FileRevealTargetRequest {
     session_id: Option<String>,
     workspace_id: Option<String>,
     workspace_path: Option<String>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
 }
 
 /// 文件读取按会话归属解析；项目变更账本不拥有个人会话的文件。
@@ -654,10 +710,14 @@ pub(super) fn resolve_file_access_scope(
     workspace_id: Option<&str>,
     workspace_path: Option<&str>,
     execution_group_id: Option<&str>,
+    source_folder_id: Option<&str>,
 ) -> Result<FileAccessScope, ApiError> {
     if let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
         let session_id = parse_session_id(Some(session_id))?;
         match resolve_existing_session_scope(state, &session_id, workspace_id, workspace_path)? {
+            SessionScope::Personal if source_folder_id.is_some() => {
+                Err(ApiError::InvalidInput("个人会话不能选择源文件夹".into()))
+            }
             SessionScope::Personal => Ok(FileAccessScope {
                 root: state.personal_session_execution_root_path(&session_id),
                 binding: serde_json::json!({
@@ -665,26 +725,42 @@ pub(super) fn resolve_file_access_scope(
                     "workspacePath": null, "executionGroupId": null,
                 }),
             }),
-            SessionScope::Workspace(_) => {
+            SessionScope::Workspace(workspace) => {
+                let source = resolve_project_source_directory(
+                    state,
+                    &workspace.workspace_id,
+                    Some(&session_id),
+                    source_folder_id,
+                )?;
                 let scope = resolve_session_change_scope_from_request(
                     state,
                     &session_id,
                     workspace_id,
                     workspace_path,
                     execution_group_id,
+                    source_folder_id,
                 )?;
                 Ok(FileAccessScope {
-                    root: state.snapshot_root_for_session(&session_id, &scope.workspace_root),
-                    binding: session_scope_binding(&scope),
+                    root: source.execution_root,
+                    binding: {
+                        let mut value = session_scope_binding(&scope);
+                        value["sourceFolderId"] = serde_json::json!(source.source_folder_id);
+                        value["workspacePath"] = serde_json::json!(source.display_source_path);
+                        value
+                    },
                 })
             }
         }
     } else {
-        let scope =
-            resolve_workspace_change_scope_from_request(state, workspace_id, workspace_path)?;
+        let scope = resolve_workspace_change_scope_from_request(
+            state,
+            workspace_id,
+            workspace_path,
+            source_folder_id,
+        )?;
         Ok(FileAccessScope {
-            root: scope.workspace_root.clone(),
             binding: workspace_scope_binding(&scope),
+            root: scope.workspace_root,
         })
     }
 }
@@ -705,6 +781,7 @@ async fn resolve_file_reveal_target(
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
         None,
+        request.source_folder_id.as_deref(),
     )?;
     let workspace_root = scope.root;
     let (target_path, _) = safe_workspace_path(&workspace_root, file_path)?;
@@ -754,6 +831,7 @@ async fn get_file_content(
         query.workspace_id.as_deref(),
         query.workspace_path.as_deref(),
         query.execution_group_id.as_deref(),
+        query.source_folder_id.as_deref(),
     )?;
     let absolute_path = safe_file_preview_path(&state, &scope.root, path)?;
     let binding = scope.binding;
@@ -812,6 +890,7 @@ async fn get_file_raw(
         query.workspace_id.as_deref(),
         query.workspace_path.as_deref(),
         query.execution_group_id.as_deref(),
+        query.source_folder_id.as_deref(),
     )?;
     let absolute_path = safe_file_preview_path(&state, &scope.root, path)?;
 
@@ -840,6 +919,7 @@ async fn download_file(
         query.workspace_id.as_deref(),
         query.workspace_path.as_deref(),
         query.execution_group_id.as_deref(),
+        query.source_folder_id.as_deref(),
     )?;
     let file = safe_file_preview_path(&state, &scope.root, path)?;
     let bytes =
@@ -870,6 +950,8 @@ struct FilesystemListQuery {
     path: Option<String>,
     workspace_id: Option<String>,
     workspace_path: Option<String>,
+    #[serde(default)]
+    source_folder_id: Option<String>,
     #[serde(default)]
     show_hidden: Option<String>,
 }
@@ -943,6 +1025,7 @@ async fn list_filesystem(
         query.workspace_id.as_deref(),
         query.workspace_path.as_deref(),
         None,
+        query.source_folder_id.as_deref(),
     )?;
     if scope.binding["workspaceId"].is_null() && !scope.root.exists() && query.path.is_none() {
         return Ok(Json(serde_json::json!({
@@ -969,6 +1052,7 @@ async fn list_filesystem(
         "sessionId": scope.binding["sessionId"],
         "workspaceId": scope.binding["workspaceId"],
         "workspacePath": scope.binding["workspacePath"],
+        "sourceFolderId": scope.binding["sourceFolderId"],
         "path": display_path(&path),
         "pathRef": path_ref(&path),
         "parent": display_path(&parent),
@@ -2352,6 +2436,129 @@ mod tests {
         .with_task_store(Arc::new(TaskStore::new()))
     }
 
+    #[tokio::test]
+    async fn project_files_keep_source_identity_across_primary_change_and_revocation() {
+        use super::super::test_project_fixtures::{add_source, set_members};
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        let outside = root.path().join("outside");
+        for (path, content) in [(&a, "A"), (&b, "B"), (&outside, "outside")] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("report.md"), content).unwrap();
+            fs::write(path.join("image.png"), content).unwrap();
+        }
+        let state = build_state_with_workspace_root(&a, "files-project");
+        let project = add_source(&state, "files-project", "second", &b);
+        let first = project.primary_source_folder_id;
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("files-session"),
+                "files",
+                Some("files-project".into()),
+            )
+            .unwrap();
+        let app = routes().with_state(state.clone());
+        let request = |path: String| Request::builder().uri(path).body(Body::empty()).unwrap();
+        let binding = "sessionId=files-session&workspaceId=files-project";
+        for (id, content) in [(&first, "A"), (&"second".to_string(), "B")] {
+            let response = app
+                .clone()
+                .oneshot(request(format!(
+                    "/files/content?{binding}&sourceFolderId={id}&filePath=report.md"
+                )))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = read_json_response(response).await;
+            assert_eq!(value["content"], content);
+            assert_eq!(value["sourceFolderId"], id.as_str());
+            for endpoint in ["/files/download", "/files/raw", "/filesystem/list"] {
+                let file = if endpoint == "/filesystem/list" {
+                    ""
+                } else {
+                    "&filePath=image.png"
+                };
+                let response = app
+                    .clone()
+                    .oneshot(request(format!(
+                        "{endpoint}?{binding}&sourceFolderId={id}{file}"
+                    )))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            }
+            let draft = app.clone().oneshot(request(format!(
+                "/files/content?workspaceId=files-project&sourceFolderId={id}&filePath=report.md"
+            ))).await.unwrap();
+            assert_eq!(draft.status(), StatusCode::OK);
+            let draft = read_json_response(draft).await;
+            assert_eq!(draft["content"], content);
+            assert_eq!(draft["sourceFolderId"], id.as_str());
+            let diff = app
+                .clone()
+                .oneshot(request(format!(
+                    "/changes/diff?workspaceId=files-project&sourceFolderId={id}"
+                )))
+                .await
+                .unwrap();
+            assert_eq!(diff.status(), StatusCode::OK);
+            let diff = read_json_response(diff).await;
+            assert_eq!(diff["sourceFolderId"], id.as_str());
+            assert_eq!(diff["pendingChangesState"]["reasonCode"], "session_unbound");
+        }
+        set_members(&state, "files-project", &[&first, "second"], "second");
+        let original_uri =
+            format!("/files/content?{binding}&sourceFolderId={first}&filePath=report.md");
+        assert_eq!(
+            read_json_response(
+                app.clone()
+                    .oneshot(request(original_uri.clone()))
+                    .await
+                    .unwrap()
+            )
+            .await["content"],
+            "A"
+        );
+        for path in [
+            "/changes/diff?workspaceId=files-project".to_string(),
+            "/files/content?workspaceId=files-project&filePath=report.md".to_string(),
+            format!("/files/content?{binding}&filePath=report.md"),
+            format!("/files/content?{binding}&sourceFolderId=ungranted&filePath=report.md"),
+            format!("/files/content?{binding}&sourceFolderId={first}&filePath=../b/report.md"),
+            format!("/filesystem/list?{binding}&sourceFolderId={first}&path=../outside"),
+        ] {
+            let response = app.clone().oneshot(request(path.clone())).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.join("report.md"), a.join("escape.md")).unwrap();
+            let response = app
+                .clone()
+                .oneshot(request(format!(
+                    "/files/download?{binding}&sourceFolderId={first}&filePath=escape.md"
+                )))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        set_members(&state, "files-project", &["second"], "second");
+        let response = app.clone().oneshot(request(original_uri)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        fs::remove_dir_all(&b).unwrap();
+        let response = app
+            .oneshot(request(format!(
+                "/filesystem/list?{binding}&sourceFolderId=second"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!b.exists());
+        assert!(a.join("report.md").exists());
+    }
+
     fn build_state_with_workspace_root(root: &Path, workspace_id: &str) -> ApiState {
         let state = build_state();
         state
@@ -2536,7 +2743,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let payload = read_json_response(response).await;
         assert_eq!(payload["workspaceId"], "workspace-filesystem-path");
-        assert_eq!(payload["workspacePath"], root.to_string_lossy().as_ref());
+        assert_eq!(
+            payload["workspacePath"],
+            root.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
         let entries = payload["entries"].as_array().expect("entries array");
         assert!(
             entries.iter().any(|entry| entry["name"] == "from-path.txt"),
@@ -3060,7 +3270,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let payload = read_json_response(response).await;
         assert_eq!(payload["workspaceId"], "workspace-path-diff");
-        assert_eq!(payload["workspacePath"], root.to_string_lossy().as_ref());
+        assert_eq!(
+            payload["workspacePath"],
+            root.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
         assert_eq!(payload["diff"], "");
         assert_eq!(
             payload["pendingChangesState"]["reasonCode"],
@@ -3401,7 +3614,10 @@ mod tests {
         let payload = read_json_response(response).await;
         assert_eq!(payload["sessionId"], "sess-session-path-diff");
         assert_eq!(payload["workspaceId"], "ws-session-path-diff");
-        assert_eq!(payload["workspacePath"], root.to_string_lossy().as_ref());
+        assert_eq!(
+            std::fs::canonicalize(payload["workspacePath"].as_str().unwrap()).unwrap(),
+            std::fs::canonicalize(&root).unwrap()
+        );
         assert!(
             payload["diff"]
                 .as_str()
@@ -3817,7 +4033,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let payload = read_json_response(response).await;
         assert_eq!(payload["workspaceId"], "workspace-content-path");
-        assert_eq!(payload["workspacePath"], root.to_string_lossy().as_ref());
+        assert_eq!(
+            payload["workspacePath"],
+            root.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
         assert_eq!(payload["content"], "alpha from bound path\n");
     }
 

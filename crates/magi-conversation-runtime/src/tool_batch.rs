@@ -8,10 +8,7 @@
 
 use std::{
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
     thread,
 };
 
@@ -35,7 +32,9 @@ use magi_session_store::{
     GoalRevisionExpectation, GoalStatus, SessionStore, TimelineEntryKind,
     timeline_entry_visible_text,
 };
-use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
+#[cfg(test)]
+use magi_snapshot::SnapshotSession;
+use magi_snapshot::{ToolHook, ToolHookCtx};
 use magi_tool_runtime::{
     BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy,
     ToolExecutionProgress, ToolRegistry, builtin_permission_engine, canonical_builtin_tool_name,
@@ -86,6 +85,25 @@ const TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR: &str = "该操作需要你的确�
 pub(crate) struct ToolPreflightDecision {
     pub(crate) payload: String,
     pub(crate) status: ExecutionResultStatus,
+}
+
+fn project_directory_rejection(
+    registry: &TaskExecutionRegistry,
+    task: &magi_core::Task,
+    workspace_id: &Option<WorkspaceId>,
+    tool: &str,
+) -> Option<(String, ExecutionResultStatus)> {
+    let error = registry
+        .validate_project_directories(task, workspace_id)
+        .err()?;
+    Some((
+        serde_json::json!({
+            "tool": tool, "status": "rejected", "error_code": "project_directory_invalid",
+            "execution_started": false, "error": format!("原任务的源文件夹授权已失效：{error}"),
+        })
+        .to_string(),
+        ExecutionResultStatus::Rejected,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -212,7 +230,7 @@ pub(crate) fn execute_task_tool_call_batch(
     tool_calls: &[ChatToolCall],
     tool_execution_ledger: &mut ToolExecutionLedger,
     on_progress: Option<&(dyn Fn(ToolExecutionProgress) -> Result<(), String> + Sync)>,
-    snapshot_session: Option<Arc<SnapshotSession>>,
+    workspace_resources: Option<crate::workspace_execution::WorkspaceExecutionResources>,
     execution_group_id: Option<String>,
     execution_allowed: &(dyn Fn() -> bool + Sync),
 ) -> Vec<(String, ExecutionResultStatus)> {
@@ -222,6 +240,35 @@ pub(crate) fn execute_task_tool_call_batch(
             .map(|call| tool_interrupted_before_execution_result(&call.function.name))
             .collect();
     }
+    if let Some((payload, status)) =
+        project_directory_rejection(execution_registry, task, workspace_id, "tool_batch")
+    {
+        return tool_calls
+            .iter()
+            .map(|call| {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(&payload).expect("rejection JSON");
+                value["tool"] = serde_json::json!(call.function.name);
+                (value.to_string(), status)
+            })
+            .collect();
+    }
+    if let Some(binding) = task
+        .executor_binding
+        .as_ref()
+        .and_then(|executor| executor.project_directories.as_ref())
+    {
+        let valid = workspace_resources
+            .as_ref()
+            .ok_or_else(|| "缺少完整项目执行映射".to_string())
+            .and_then(|resources| resources.validate_for_binding(binding));
+        if let Err(error) = valid {
+            return tool_calls.iter().map(|call| (serde_json::json!({
+                "tool":call.function.name,"status":"rejected","error_code":"project_directory_invalid",
+                "execution_started":false,"error":error,
+            }).to_string(),ExecutionResultStatus::Rejected)).collect();
+        }
+    }
     if tool_calls.len() > 1
         && tool_calls
             .iter()
@@ -229,6 +276,11 @@ pub(crate) fn execute_task_tool_call_batch(
     {
         return tool_calls.iter().map(|call|(serde_json::json!({"tool":call.function.name,"status":"rejected","error_code":"execution_steps_separate_batch","execution_started":false,"error":"请单独提交 update_execution_steps；步骤更新成功后再调用实际工具。"}).to_string(),ExecutionResultStatus::Rejected)).collect();
     }
+    tool_execution_ledger.rebind_project_directories(
+        workspace_resources
+            .as_ref()
+            .and_then(|resources| resources.directories.as_ref()),
+    );
     tool_execution_ledger.execute_batch_with(tool_calls, tool_registry, |execution_calls| {
         execute_task_tool_call_batch_unchecked(
             event_bus,
@@ -252,7 +304,7 @@ pub(crate) fn execute_task_tool_call_batch(
             browser_capability_snapshot.clone(),
             execution_calls,
             on_progress,
-            snapshot_session.clone(),
+            workspace_resources.clone(),
             execution_group_id.clone(),
             execution_allowed,
         )
@@ -282,7 +334,7 @@ fn execute_task_tool_call_batch_unchecked(
     browser_capability_snapshot: Option<BrowserCapabilitySnapshot>,
     tool_calls: &[ChatToolCall],
     on_progress: Option<&(dyn Fn(ToolExecutionProgress) -> Result<(), String> + Sync)>,
-    snapshot_session: Option<Arc<SnapshotSession>>,
+    workspace_resources: Option<crate::workspace_execution::WorkspaceExecutionResources>,
     execution_group_id: Option<String>,
     execution_allowed: &(dyn Fn() -> bool + Sync),
 ) -> Vec<(String, ExecutionResultStatus)> {
@@ -310,10 +362,45 @@ fn execute_task_tool_call_batch_unchecked(
     };
     let results = run_tool_call_batches(tool_calls, &batch_execution_allowed, &|tool_index| {
         let mut hook_ctx = hook_contexts[tool_index].clone();
-        if let Some(snapshot) = snapshot_session.as_deref() {
-            snapshot.before_tool(&hook_ctx);
-        }
         let tool_call = &tool_calls[tool_index];
+        let selected_root = ToolExecutionContext {
+            workspace_id: workspace_id.clone(),
+            working_directory: workspace_root_path.cloned(),
+            project_directory_map: workspace_resources
+                .as_ref()
+                .and_then(|resources| resources.directories.clone()),
+            ..Default::default()
+        }
+        .for_tool_arguments(&tool_call.function.arguments)
+        .ok()
+        .and_then(|context| context.working_directory);
+        let snapshot_context = |snapshot: &magi_snapshot::SnapshotSession,
+                                context: &ToolHookCtx| {
+            crate::tool_declared_paths::snapshot_tool_context(
+                snapshot.workspace_root(),
+                selected_root.as_deref(),
+                context,
+            )
+        };
+        let snapshots = workspace_resources
+            .as_ref()
+            .map(|resources| {
+                resources
+                    .snapshots
+                    .iter()
+                    .filter(|snapshot| {
+                        tool_call.function.name == BuiltinToolName::ShellExec.as_str()
+                            || hook_ctx.declared_paths.is_empty()
+                            || !snapshot_context(snapshot, &hook_ctx)
+                                .declared_paths
+                                .is_empty()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for snapshot in &snapshots {
+            snapshot.before_tool(&snapshot_context(snapshot, &hook_ctx));
+        }
         let result = execute_task_tool_call_with_lifecycle(
             TaskToolLifecycleContext {
                 event_bus,
@@ -348,24 +435,25 @@ fn execute_task_tool_call_batch_unchecked(
                     tool_call,
                     on_progress,
                     execution_allowed,
+                    workspace_resources.as_ref(),
                 )
             },
         );
         append_result_declared_paths(&mut hook_ctx.declared_paths, &result.0);
-        if let Some(snapshot) = snapshot_session.as_deref() {
-            snapshot.after_tool(&hook_ctx);
+        for snapshot in &snapshots {
+            snapshot.after_tool(&snapshot_context(snapshot, &hook_ctx));
         }
         result
     });
-    if let Some(snapshot) = snapshot_session.as_deref()
-        && let Err(err) = snapshot.reconcile()
-    {
-        tracing::warn!(
-            session_id = %session_id.as_str(),
-            task_id = %task.task_id.as_str(),
-            error = %err,
-            "snapshot reconcile after task tool batch failed"
-        );
+    if let Some(resources) = workspace_resources.as_ref() {
+        for snapshot in &resources.snapshots {
+            if let Err(err) = snapshot.reconcile() {
+                tracing::warn!(
+                    session_id = %session_id.as_str(), task_id = %task.task_id.as_str(),
+                    error = %err, "snapshot reconcile after task tool batch failed"
+                );
+            }
+        }
     }
     results
 }
@@ -807,6 +895,14 @@ fn execute_agent_spawn(
     };
 
     let mut child = child;
+    child
+        .executor_binding
+        .as_mut()
+        .expect("child executor binding")
+        .project_directories = task
+        .executor_binding
+        .as_ref()
+        .and_then(|binding| binding.project_directories.clone());
     child
         .executor_binding
         .as_mut()
@@ -2543,9 +2639,18 @@ fn execute_task_tool_call(
     tool_call: &ChatToolCall,
     on_progress: Option<&(dyn Fn(ToolExecutionProgress) -> Result<(), String> + Sync)>,
     execution_allowed: &(dyn Fn() -> bool + Sync),
+    workspace_resources: Option<&crate::workspace_execution::WorkspaceExecutionResources>,
 ) -> (String, ExecutionResultStatus) {
     if !execution_allowed() {
         return tool_interrupted_before_execution_result(&tool_call.function.name);
+    }
+    if let Some(rejection) = project_directory_rejection(
+        execution_registry,
+        task,
+        workspace_id,
+        &tool_call.function.name,
+    ) {
+        return rejection;
     }
     // S7-E：协调器工具（agent_spawn）由 orchestration 层拦截，
     // 不进 BuiltinTool::execute —— 它需要 task_store / event_bus 等上下文。
@@ -2596,6 +2701,7 @@ fn execute_task_tool_call(
 
         None
     };
+
     if let Some(rejection) = live_skill_rejection() {
         return rejection;
     }
@@ -2621,13 +2727,83 @@ fn execute_task_tool_call(
         );
     }
 
+    // 执行映射由 dispatcher 的实际 cwd 派生，原 Task 只保存目录授权。
+    // 多根映射必须由资源准备入口逐项提供；未准备完整映射时拒绝工具调用。
+    let project_directory_map: magi_core::DomainResult<_> = task
+        .executor_binding
+        .as_ref()
+        .and_then(|executor| executor.project_directories.as_ref())
+        .map(|binding| {
+            let map = workspace_resources
+                .and_then(|resources| resources.directories.clone())
+                .ok_or_else(|| magi_core::DomainError::Validation {
+                    message: "本轮缺少完整项目目录执行映射，工具未执行".into(),
+                })?;
+            map.validate_for_binding(binding)?;
+            Ok(map)
+        })
+        .transpose();
+    let project_directory_map = match project_directory_map {
+        Ok(map) => map,
+        Err(error) => {
+            return (
+                serde_json::json!({
+                    "tool": tool_call.function.name,
+                    "status": "failed",
+                    "error_code": "project_directory_invalid",
+                    "error": error.to_string(),
+                    "execution_started": false,
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let selected_context = match (ToolExecutionContext {
+        workspace_id: workspace_id.clone(),
+        working_directory: workspace_root_path.cloned(),
+        project_directory_map: project_directory_map.clone(),
+        ..Default::default()
+    }).for_tool_arguments(&tool_call.function.arguments) {
+        Ok(context) => context,
+        Err(error) => return (serde_json::json!({
+            "tool":tool_call.function.name, "status":"rejected", "error_code":"project_directory_invalid",
+            "error":error.to_string(), "execution_started":false,
+        }).to_string(), ExecutionResultStatus::Rejected),
+    };
+    let workspace_root_path = selected_context.working_directory.as_ref();
+    let projected_policy = task
+        .policy_snapshot
+        .as_ref()
+        .map(|policy| {
+            let mut tool_policy = ToolExecutionPolicy::default();
+            tool_policy.apply_task_policy(policy);
+            selected_context
+                .project_execution_policy(&tool_policy)
+                .map(|projected| {
+                    let mut policy = policy.clone();
+                    policy.allowed_paths = projected.allowed_paths;
+                    policy.denied_paths = projected.denied_paths;
+                    policy.read_only_paths = projected.read_only_paths;
+                    policy
+                })
+        })
+        .transpose();
+    let projected_policy = match projected_policy {
+        Ok(policy) => policy,
+        Err(error) => return (serde_json::json!({
+            "tool":tool_call.function.name, "status":"rejected", "error_code":"project_directory_invalid",
+            "error":error.to_string(), "execution_started":false,
+        }).to_string(), ExecutionResultStatus::Rejected),
+    };
     let mut approval_granted = false;
-    if let Some(decision) = task_tool_preflight_decision(
-        task,
+    if let Some(decision) = policy_tool_preflight_decision_in_context(
+        projected_policy.as_ref(),
         safety_gate,
         &tool_call.function.name,
         &tool_call.function.arguments,
         workspace_root_path,
+        Some(&selected_context),
     ) {
         if decision.status == ExecutionResultStatus::NeedsApproval {
             match run_with_task_execution_wait(
@@ -2645,6 +2821,7 @@ fn execute_task_tool_call(
                         session_id,
                         workspace_id,
                         workspace_root_path,
+                        project_directory_map.as_ref(),
                         tool_call,
                         &decision,
                         on_progress,
@@ -2665,6 +2842,21 @@ fn execute_task_tool_call(
 
     if approval_granted && let Some(rejection) = live_skill_rejection() {
         return rejection;
+    }
+    if let Some(rejection) = project_directory_rejection(
+        execution_registry,
+        task,
+        workspace_id,
+        &tool_call.function.name,
+    ) {
+        return rejection;
+    }
+
+    if let Err(error) = selected_context.for_tool_arguments(&tool_call.function.arguments) {
+        return (serde_json::json!({
+            "tool":tool_call.function.name,"status":"rejected","error_code":"project_directory_invalid",
+            "error":error.to_string(),"execution_started":false,
+        }).to_string(), ExecutionResultStatus::Rejected);
     }
 
     if let Some(canonical) =
@@ -2914,6 +3106,20 @@ fn execute_task_tool_call(
         if let Some(rejection) = live_skill_rejection() {
             return rejection;
         }
+        if let Some(rejection) = project_directory_rejection(
+            execution_registry,
+            task,
+            workspace_id,
+            &tool_call.function.name,
+        ) {
+            return rejection;
+        }
+        if let Err(error) = selected_context.for_tool_arguments(&tool_call.function.arguments) {
+            return (serde_json::json!({
+                "tool":tool_call.function.name,"status":"rejected","error_code":"project_directory_invalid",
+                "error":error.to_string(),"execution_started":false,
+            }).to_string(), ExecutionResultStatus::Rejected);
+        }
         if let Some((tool_skill_name, binding_id)) =
             parse_skill_custom_tool_name(&tool_call.function.name)
         {
@@ -2943,6 +3149,7 @@ fn execute_task_tool_call(
                     workspace_id: workspace_id.clone(),
                     access_profile: effective_access_profile,
                     working_directory: workspace_root_path.cloned(),
+                    project_directory_map: project_directory_map.clone(),
                     browser_capability_snapshot: browser_capability_snapshot.clone(),
                     browser_execution_id: Some(format!("task:{}", task.task_id)),
                 },
@@ -2989,6 +3196,7 @@ fn execute_task_tool_call(
             workspace_id: workspace_id.clone(),
             access_profile: tool_policy.access_profile,
             working_directory: workspace_root_path.cloned(),
+            project_directory_map: project_directory_map.clone(),
             browser_capability_snapshot: browser_capability_snapshot.clone(),
             browser_execution_id: Some(format!("task:{}", task.task_id)),
         };
@@ -3088,6 +3296,7 @@ fn execute_task_tool_call(
                     session_id,
                     workspace_id,
                     workspace_root_path,
+                    project_directory_map.as_ref(),
                     tool_call,
                     &runtime_decision,
                     on_progress,
@@ -3461,6 +3670,22 @@ fn tool_progress_persist_failure(
     )
 }
 
+fn tool_approval_policy_snapshot(
+    task: &magi_core::Task,
+    directories: Option<&magi_core::ProjectDirectoryExecutionMap>,
+) -> serde_json::Value {
+    let mut policy = serde_json::json!({"policy":task.policy_snapshot,"workspaceScope":task.workspace_scope,"writeScope":task.write_scope});
+    if let Some(binding) = task
+        .executor_binding
+        .as_ref()
+        .and_then(|executor| executor.project_directories.as_ref())
+    {
+        policy["projectDirectories"] = serde_json::json!(binding);
+        policy["projectExecutionMap"] = serde_json::json!(directories);
+    }
+    policy
+}
+
 #[allow(clippy::too_many_arguments)]
 fn await_task_tool_approval(
     event_bus: &InMemoryEventBus,
@@ -3471,6 +3696,7 @@ fn await_task_tool_approval(
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     workspace_root_path: Option<&PathBuf>,
+    directories: Option<&magi_core::ProjectDirectoryExecutionMap>,
     tool_call: &ChatToolCall,
     decision: &ToolPreflightDecision,
     on_progress: Option<&(dyn Fn(ToolExecutionProgress) -> Result<(), String> + Sync)>,
@@ -3498,7 +3724,7 @@ fn await_task_tool_approval(
         Ok(root) => root,
         Err(error) => return Err(tool_progress_persist_failure(tool_call, error.to_string())),
     };
-    let policy = serde_json::json!({"policy":task.policy_snapshot,"workspaceScope":task.workspace_scope,"writeScope":task.write_scope});
+    let policy = tool_approval_policy_snapshot(task, directories);
     let mut sources = vec![task.task_id.clone()];
     let mut source = task.recovery_checkpoint().cloned();
     while let Some(checkpoint) = source {
@@ -3513,6 +3739,14 @@ fn await_task_tool_approval(
             || previous.mission_id != task.mission_id
             || previous.workspace_scope != task.workspace_scope
             || previous.write_scope != task.write_scope
+            || previous
+                .executor_binding
+                .as_ref()
+                .and_then(|executor| executor.project_directories.as_ref())
+                != task
+                    .executor_binding
+                    .as_ref()
+                    .and_then(|executor| executor.project_directories.as_ref())
         {
             return Err(tool_progress_persist_failure(
                 tool_call,
@@ -3526,7 +3760,7 @@ fn await_task_tool_approval(
         let current = task_store.get_task(&task.task_id).ok_or_else(|| {
             tool_progress_persist_failure(tool_call, "审批目标任务已不存在".into())
         })?;
-        let current_policy = serde_json::json!({"policy":current.policy_snapshot,"workspaceScope":current.workspace_scope,"writeScope":current.write_scope});
+        let current_policy = tool_approval_policy_snapshot(&current, directories);
         if !execution_allowed()
             || !matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
             || current_policy != policy
@@ -3881,6 +4115,7 @@ fn task_policy_tool_decision(
     )
 }
 
+#[cfg(test)]
 fn task_tool_preflight_decision(
     task: &magi_core::Task,
     safety_gate: Option<&magi_safety_gate::SafetyGate>,
@@ -3897,6 +4132,7 @@ fn task_tool_preflight_decision(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn policy_tool_preflight_decision(
     policy_snapshot: Option<&TaskPolicy>,
     safety_gate: Option<&magi_safety_gate::SafetyGate>,
@@ -3904,8 +4140,32 @@ pub(crate) fn policy_tool_preflight_decision(
     arguments: &str,
     workspace_root_path: Option<&PathBuf>,
 ) -> Option<ToolPreflightDecision> {
+    policy_tool_preflight_decision_in_context(
+        policy_snapshot,
+        safety_gate,
+        requested_tool_name,
+        arguments,
+        workspace_root_path,
+        None,
+    )
+}
+
+pub(crate) fn policy_tool_preflight_decision_in_context(
+    policy_snapshot: Option<&TaskPolicy>,
+    safety_gate: Option<&magi_safety_gate::SafetyGate>,
+    requested_tool_name: &str,
+    arguments: &str,
+    workspace_root_path: Option<&PathBuf>,
+    context: Option<&ToolExecutionContext>,
+) -> Option<ToolPreflightDecision> {
     let task_policy_decision = policy_snapshot.and_then(|policy| {
-        policy_tool_decision(policy, requested_tool_name, arguments, workspace_root_path)
+        policy_tool_decision_in_context(
+            policy,
+            requested_tool_name,
+            arguments,
+            workspace_root_path,
+            context,
+        )
     });
     // S8：SafetyGate 语义判定。它和 TaskPolicy 都属于执行前判定：
     // HardBlock 必须压过常规风险拦截，TaskPolicy 的 Rejected 也不能被 SafetyGate
@@ -3942,6 +4202,22 @@ pub(crate) fn policy_tool_decision(
     arguments: &str,
     workspace_root_path: Option<&PathBuf>,
 ) -> Option<ToolPreflightDecision> {
+    policy_tool_decision_in_context(
+        policy_snapshot,
+        requested_tool_name,
+        arguments,
+        workspace_root_path,
+        None,
+    )
+}
+
+fn policy_tool_decision_in_context(
+    policy_snapshot: &TaskPolicy,
+    requested_tool_name: &str,
+    arguments: &str,
+    workspace_root_path: Option<&PathBuf>,
+    context: Option<&ToolExecutionContext>,
+) -> Option<ToolPreflightDecision> {
     let canonical_tool_name = canonical_builtin_tool_name(requested_tool_name)
         .unwrap_or_else(|| requested_tool_name.trim().to_string());
     // no_tools 是 PermissionEngine 三维之外的全局开关，本层先单独拦截。
@@ -3957,18 +4233,21 @@ pub(crate) fn policy_tool_decision(
         ));
     }
 
-    access_profile_tool_decision(AccessProfileToolDecisionInput {
-        access_profile: policy_snapshot.access_profile,
-        command_mode: &policy_snapshot.command_mode,
-        allowed_tools: &policy_snapshot.allowed_tools,
-        denied_tools: &policy_snapshot.denied_tools,
-        allowed_paths: &policy_snapshot.allowed_paths,
-        denied_paths: &policy_snapshot.denied_paths,
-        read_only_paths: &policy_snapshot.read_only_paths,
-        requested_tool_name,
-        arguments,
-        workspace_root_path,
-    })
+    access_profile_tool_decision_in_context(
+        AccessProfileToolDecisionInput {
+            access_profile: policy_snapshot.access_profile,
+            command_mode: &policy_snapshot.command_mode,
+            allowed_tools: &policy_snapshot.allowed_tools,
+            denied_tools: &policy_snapshot.denied_tools,
+            allowed_paths: &policy_snapshot.allowed_paths,
+            denied_paths: &policy_snapshot.denied_paths,
+            read_only_paths: &policy_snapshot.read_only_paths,
+            requested_tool_name,
+            arguments,
+            workspace_root_path,
+        },
+        context,
+    )
 }
 
 pub(crate) struct AccessProfileToolDecisionInput<'a> {
@@ -3984,8 +4263,16 @@ pub(crate) struct AccessProfileToolDecisionInput<'a> {
     pub workspace_root_path: Option<&'a PathBuf>,
 }
 
+#[cfg(test)]
 pub(crate) fn access_profile_tool_decision(
     input: AccessProfileToolDecisionInput<'_>,
+) -> Option<ToolPreflightDecision> {
+    access_profile_tool_decision_in_context(input, None)
+}
+
+fn access_profile_tool_decision_in_context(
+    input: AccessProfileToolDecisionInput<'_>,
+    context: Option<&ToolExecutionContext>,
 ) -> Option<ToolPreflightDecision> {
     let AccessProfileToolDecisionInput {
         access_profile,
@@ -4003,7 +4290,7 @@ pub(crate) fn access_profile_tool_decision(
     let canonical_tool_name = canonical_builtin_tool_name(requested_tool_name)
         .unwrap_or_else(|| requested_tool_name.trim().to_string());
     // PermissionEngine 比对工具名是按字面比对，因此把 policy 中的别名先 canonical 化。
-    let canonical_policy = magi_permissions::PermissionPolicy {
+    let mut canonical_policy = magi_permissions::PermissionPolicy {
         allowed_tools: allowed_tools
             .iter()
             .map(|tool| {
@@ -4027,6 +4314,21 @@ pub(crate) fn access_profile_tool_decision(
         ),
         command_mode: command_mode.to_string(),
     };
+    if let Some(context) = context {
+        canonical_policy = magi_tool_runtime::execution_permission_policy(
+            &ToolExecutionPolicy {
+                access_profile,
+                command_mode: command_mode.into(),
+                allowed_tool_names: (!allowed_tools.is_empty()).then(|| allowed_tools.to_vec()),
+                denied_tool_names: denied_tools.to_vec(),
+                allowed_paths: allowed_paths.to_vec(),
+                denied_paths: denied_paths.to_vec(),
+                read_only_paths: read_only_paths.to_vec(),
+                ..Default::default()
+            },
+            context,
+        );
+    }
     let engine = builtin_permission_engine();
     let is_write_tool = BuiltinToolName::from_name(canonical_tool_name.as_str())
         .is_some_and(|tool| tool.is_access_profile_write_operation());
@@ -4090,6 +4392,18 @@ pub(crate) fn access_profile_tool_decision(
         workspace_root_path.map(|path| path.as_path()),
         effective_access_profile,
     ) {
+        if context.is_some_and(|context| {
+            context
+                .references_retired_project_root(&path_request.absolute_path)
+                .unwrap_or(true)
+        }) {
+            return Some(task_policy_decision_payload(
+                &canonical_tool_name,
+                ExecutionResultStatus::Rejected,
+                "路径指向已隔离的源目录，工具未执行".into(),
+                Some(effective_access_profile),
+            ));
+        }
         if path_request.kind == magi_permissions::PathAccessKind::Write
             && normalized_read_only_paths
                 .iter()
@@ -5662,6 +5976,7 @@ mod tests {
                     },
                     None,
                     &|| true,
+                    None,
                 )
             };
             let (catalog, status) = invoke("tool_catalog", serde_json::json!({}));
@@ -5818,6 +6133,7 @@ mod tests {
                 },
                 None,
                 &|| true,
+                None,
             )
         };
         assert_eq!(
@@ -5953,6 +6269,7 @@ mod tests {
             &tool_call,
             None,
             &|| true,
+            None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("plan payload json");
 
@@ -6074,6 +6391,7 @@ mod tests {
                 &call,
                 None,
                 &|| true,
+                None,
             );
             let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
             assert_eq!(payload["goal"]["status"], "complete");
@@ -6160,6 +6478,7 @@ mod tests {
                 &tool_call,
                 None,
                 &|| true,
+                None,
             );
             (
                 serde_json::from_str::<serde_json::Value>(&payload).expect("payload is json"),
@@ -6279,6 +6598,7 @@ mod tests {
                 &tool_call,
                 None,
                 &|| true,
+                None,
             )
         };
 
@@ -7606,6 +7926,33 @@ mod tests {
     }
 
     #[test]
+    fn project_directory_revocation_during_approval_prevents_real_file_remove() {
+        for tool in [
+            "file_remove",
+            "mcp__approval__remove",
+            "plugin__approval__remove",
+        ] {
+            for child in [false, true] {
+                run_remove_approval_case(tool, child, Some("revoke_directory"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_copy_replaced_during_approval_prevents_builtin_and_external_side_effects() {
+        for tool in [
+            "file_remove",
+            "mcp__approval__remove",
+            "plugin__approval__remove",
+        ] {
+            for child in [false, true] {
+                run_remove_approval_case(tool, child, Some("replace_copy"));
+            }
+        }
+    }
+
+    #[test]
     fn obsolete_execution_after_approval_cannot_remove_file() {
         run_remove_approval_case("file_remove", false, Some("revoke_execution"));
     }
@@ -7631,7 +7978,6 @@ mod tests {
         let event_bus = InMemoryEventBus::new(16);
         let task_store = TaskStore::new();
         let session_store = SessionStore::new();
-        let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
         let plan_store = crate::test_plan_store("test-plan");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
@@ -7657,7 +8003,40 @@ mod tests {
         );
         tool_registry.register_default_builtins();
         let dir = tempdir().expect("temp dir");
-        let target = dir.path().join("probe.txt");
+        let source_root = if failure_stage == Some("replace_copy") {
+            let source = dir.path().join("source");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("probe.txt"), "source content").unwrap();
+            source
+        } else {
+            dir.path().to_path_buf()
+        };
+        let execution_root = if failure_stage == Some("replace_copy") {
+            let copy = dir.path().join("copy");
+            std::fs::create_dir(&copy).unwrap();
+            copy
+        } else {
+            source_root.clone()
+        };
+        let workspace_store = Arc::new(magi_workspace::WorkspaceStore::new());
+        let directory_workspace = WorkspaceId::new("workspace-file-remove");
+        workspace_store
+            .register_native_path(directory_workspace.clone(), source_root.clone())
+            .unwrap();
+        let directory_binding = matches!(failure_stage, Some("revoke_directory" | "replace_copy"))
+            .then(|| {
+                workspace_store
+                    .capture_directory_binding(&directory_workspace, None, None)
+                    .unwrap()
+            });
+        let execution_registry = TaskExecutionRegistry::default()
+            .with_agent_spawn_preflight_runtime(
+                crate::task_execution_registry::AgentSpawnPreflightRuntime {
+                    workspace_registry: Some(workspace_store.clone()),
+                    ..Default::default()
+                },
+            );
+        let target = execution_root.join("probe.txt");
         std::fs::write(&target, "probe").expect("write probe");
         let external_calls = Arc::new(AtomicUsize::new(0));
         let calls = external_calls.clone();
@@ -7713,11 +8092,22 @@ mod tests {
             );
         let mut task = coordinator_task(test_task("task-file-remove", "task-file-remove", None));
         if child {
-            let parent = test_task("approval-parent", "approval-parent", None);
+            let mut parent = test_task("approval-parent", "approval-parent", None);
+            parent.executor_binding = Some(TaskExecutorBinding::for_role("coordinator"));
+            parent
+                .executor_binding
+                .as_mut()
+                .unwrap()
+                .project_directories = directory_binding.clone();
             task.root_task_id = parent.task_id.clone();
             task.parent_task_id = Some(parent.task_id.clone());
             task.executor_binding = Some(TaskExecutorBinding::for_role("executor"));
             task_store.insert_task(parent).unwrap();
+        }
+        if let Some(binding) = directory_binding {
+            task.executor_binding
+                .get_or_insert_with(|| TaskExecutorBinding::for_role("coordinator"))
+                .project_directories = Some(binding);
         }
         if matches!(failure_stage, Some("read_only" | "full_access")) {
             let mut policy = default_agent_spawn_policy();
@@ -7812,6 +8202,21 @@ mod tests {
         persist_test_approval_tool(&session_store, &session_id, &task, &tool_call);
         let interrupted = std::sync::Mutex::new(None);
         let execution_active = std::sync::atomic::AtomicBool::new(true);
+        let workspace_resources = task
+            .executor_binding
+            .as_ref()
+            .and_then(|executor| executor.project_directories.as_ref())
+            .map(
+                |binding| crate::workspace_execution::WorkspaceExecutionResources {
+                    directories: Some(
+                        magi_core::ProjectDirectoryExecutionMap::from_binding(binding, |_| {
+                            Ok(std::fs::canonicalize(&execution_root).unwrap())
+                        })
+                        .unwrap(),
+                    ),
+                    snapshots: Vec::new(),
+                },
+            );
         let result = thread::scope(|scope| {
             let resolver = scope.spawn(|| {
                 if matches!(
@@ -7868,6 +8273,14 @@ mod tests {
                 if failure_stage == Some("revoke_execution") && payload["status"] == "running" {
                     execution_active.store(false, Ordering::SeqCst);
                 }
+                if failure_stage == Some("revoke_directory") && payload["status"] == "running" {
+                    workspace_store.deregister(&directory_workspace).unwrap();
+                }
+                #[cfg(unix)]
+                if failure_stage == Some("replace_copy") && payload["status"] == "running" {
+                    std::fs::rename(&execution_root, dir.path().join("retained-copy")).unwrap();
+                    std::os::unix::fs::symlink(&source_root, &execution_root).unwrap();
+                }
                 if failure_stage.is_some() && payload["status"].as_str() == failure_stage {
                     Err("injected durable write failure".to_string())
                 } else {
@@ -7897,7 +8310,7 @@ mod tests {
                 &[tool_call],
                 &mut ToolExecutionLedger::default(),
                 Some(&progress),
-                None,
+                workspace_resources.clone(),
                 None,
                 &|| execution_active.load(Ordering::SeqCst),
             );
@@ -7925,6 +8338,30 @@ mod tests {
         if failure_stage == Some("revoke_execution") {
             assert_eq!(result[0].1, ExecutionResultStatus::Cancelled);
             assert!(target.exists(), "批准后执行资格失效必须阻止真实删除");
+            return;
+        }
+        if matches!(failure_stage, Some("revoke_directory" | "replace_copy")) {
+            assert_eq!(
+                result[0].1,
+                ExecutionResultStatus::Rejected,
+                "{}",
+                result[0].0
+            );
+            let value: serde_json::Value = serde_json::from_str(&result[0].0).unwrap();
+            assert_eq!(value["error_code"], "project_directory_invalid");
+            assert_eq!(value["execution_started"], false);
+            assert!(target.exists(), "批准后目录授权撤销不得执行真实删除");
+            assert_eq!(external_calls.load(Ordering::SeqCst), 0);
+            if failure_stage == Some("replace_copy") {
+                assert_eq!(
+                    std::fs::read_to_string(source_root.join("probe.txt")).unwrap(),
+                    "source content"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join("retained-copy/probe.txt")).unwrap(),
+                    "probe"
+                );
+            }
             return;
         }
         if failure_stage == Some("revoke_skill") {
@@ -8046,6 +8483,7 @@ mod tests {
                     &call,
                     Some(&progress),
                     &|| true,
+                    None,
                 );
                 assert_eq!(status, ExecutionResultStatus::Succeeded, "{payload}");
                 assert!(!target.exists());
@@ -8241,6 +8679,7 @@ mod tests {
                     &task,
                     &session_id,
                     &workspace_id,
+                    None,
                     None,
                     &tool_call,
                     &decision,
@@ -8596,7 +9035,11 @@ mod tests {
             &[tool_call],
             &mut ToolExecutionLedger::default(),
             None,
-            Some(snapshot.clone()),
+            Some(
+                crate::workspace_execution::WorkspaceExecutionResources::from_snapshot(
+                    snapshot.clone(),
+                ),
+            ),
             Some(task.mission_id.to_string()),
             &|| true,
         );
@@ -8653,7 +9096,11 @@ mod tests {
             &[mainline_tool_call],
             &mut ToolExecutionLedger::default(),
             None,
-            Some(snapshot.clone()),
+            Some(
+                crate::workspace_execution::WorkspaceExecutionResources::from_snapshot(
+                    snapshot.clone(),
+                ),
+            ),
             Some(task.mission_id.to_string()),
             &|| true,
         );
@@ -8674,6 +9121,193 @@ mod tests {
             mainline_change.execution_group_id.as_deref(),
             Some("mission-mailbox")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn project_tool_batch_uses_each_copy_for_permissions_and_same_name_snapshot_attribution()
+    {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let sources = [root.join("source-a"), root.join("source-b")];
+        let copies = [root.join("copy-a"), root.join("copy-b")];
+        for path in sources.iter().chain(copies.iter()) {
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("same.txt"), "baseline").unwrap();
+        }
+        let workspaces = Arc::new(magi_workspace::WorkspaceStore::default());
+        let workspace = WorkspaceId::new("multi-copy-tools");
+        let project = workspaces
+            .register_native_path(workspace.clone(), sources[0].clone())
+            .unwrap();
+        let mut second = project.primary_source_folder().clone();
+        let host = magi_core::HostPath::from_path(sources[1].clone());
+        second.source_folder_id = "second".into();
+        second.path = magi_core::AbsolutePath::new(host.display_string());
+        second.path_ref = host.to_path_ref().as_str().into();
+        let mut folders = project.source_folders;
+        folders.push(second);
+        workspaces
+            .edit_project(
+                &workspace,
+                project.revision,
+                magi_workspace::WorkspaceProjectEdit {
+                    name: None,
+                    source_folders: folders,
+                    primary_source_folder_id: project.primary_source_folder_id,
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let binding = workspaces
+            .capture_directory_binding(&workspace, None, None)
+            .unwrap();
+        let map = magi_core::ProjectDirectoryExecutionMap::from_binding(&binding, |grant| {
+            Ok(if grant.source_folder_id == "second" {
+                copies[1].clone()
+            } else {
+                copies[0].clone()
+            })
+        })
+        .unwrap();
+        let session = SessionId::new("multi-copy-tools");
+        let manager = magi_snapshot::SnapshotManager::new();
+        let snapshots = vec![
+            manager
+                .start_session(session.to_string(), copies[0].clone())
+                .await
+                .unwrap(),
+            manager
+                .start_session(session.to_string(), copies[1].clone())
+                .await
+                .unwrap(),
+        ];
+        let resources = crate::workspace_execution::WorkspaceExecutionResources {
+            directories: Some(map),
+            snapshots: snapshots.clone(),
+        };
+        let mut task = coordinator_task(test_task("multi-copy-task", "multi-copy-task", None));
+        task.executor_binding.as_mut().unwrap().project_directories = Some(binding);
+        task.policy_snapshot = Some(default_agent_spawn_policy());
+        task.policy_snapshot.as_mut().unwrap().denied_paths = vec!["protected.txt".into()];
+        let tasks = TaskStore::new();
+        tasks.insert_task(task.clone()).unwrap();
+        let sessions = SessionStore::new();
+        let execution = TaskExecutionRegistry::default().with_agent_spawn_preflight_runtime(
+            crate::task_execution_registry::AgentSpawnPreflightRuntime {
+                workspace_registry: Some(workspaces),
+                ..Default::default()
+            },
+        );
+        let conversations = ConversationRegistry::new();
+        let plans = crate::test_plan_store("multi-copy-tools");
+        let roles = magi_agent_role::AgentRoleRegistry::load_default();
+        let bus = InMemoryEventBus::new(32);
+        let worker = magi_core::WorkerId::new("multi-copy-worker");
+        let mut registry = ToolRegistry::new(
+            Arc::new(magi_governance::GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(16)),
+        );
+        registry.register_default_builtins();
+        let invoke = |id: &str, arguments: serde_json::Value| {
+            execute_task_tool_call_batch(
+                &bus,
+                Some(&registry),
+                &roles,
+                None,
+                None,
+                None,
+                &tasks,
+                &sessions,
+                &execution,
+                &conversations,
+                None,
+                &plans,
+                None,
+                &task,
+                &session,
+                &Some(workspace.clone()),
+                Some(&copies[0]),
+                Some(&worker),
+                None,
+                &[ChatToolCall {
+                    id: id.into(),
+                    kind: "function".into(),
+                    function: ChatToolFunction {
+                        name: "file_write".into(),
+                        arguments: arguments.to_string(),
+                    },
+                }],
+                &mut ToolExecutionLedger::default(),
+                None,
+                Some(resources.clone()),
+                None,
+                &|| true,
+            )
+            .remove(0)
+        };
+        for (id, arguments) in [
+            (
+                "first",
+                serde_json::json!({"path":"same.txt","content":"first copy"}),
+            ),
+            (
+                "second",
+                serde_json::json!({"source_folder_id":"second","path":"same.txt","content":"second copy"}),
+            ),
+            (
+                "second-policy",
+                serde_json::json!({"source_folder_id":"second","path":"protected.txt","content":"permitted second root"}),
+            ),
+        ] {
+            let result = invoke(id, arguments);
+            assert_eq!(result.1, ExecutionResultStatus::Succeeded, "{}", result.0);
+        }
+        for (id, arguments) in [
+            (
+                "first-denied",
+                serde_json::json!({"path":"protected.txt","content":"blocked"}),
+            ),
+            (
+                "source-denied",
+                serde_json::json!({"path":sources[1].join("same.txt"),"content":"blocked"}),
+            ),
+            (
+                "unknown-source",
+                serde_json::json!({"source_folder_id":"third","path":"same.txt","content":"blocked"}),
+            ),
+        ] {
+            let result = invoke(id, arguments);
+            assert_eq!(result.1, ExecutionResultStatus::Rejected, "{}", result.0);
+        }
+        for source in &sources {
+            assert_eq!(
+                std::fs::read_to_string(source.join("same.txt")).unwrap(),
+                "baseline"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(copies[0].join("same.txt")).unwrap(),
+            "first copy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(copies[1].join("same.txt")).unwrap(),
+            "second copy"
+        );
+        assert!(!copies[0].join("protected.txt").exists());
+        for (index, snapshot) in snapshots.iter().enumerate() {
+            let changes = snapshot.pending_changes().unwrap();
+            let same = changes
+                .iter()
+                .find(|change| change.path == "same.txt")
+                .unwrap();
+            assert_eq!(same.source, magi_snapshot::SourceKind::Tool);
+            assert_eq!(
+                same.tool_call_id.as_deref(),
+                Some(["first", "second"][index])
+            );
+            assert_eq!(same.worker_id.as_deref(), Some(worker.as_str()));
+            assert_eq!(changes.len(), [1, 2][index]);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -8765,7 +9399,11 @@ mod tests {
             &tool_calls,
             &mut ToolExecutionLedger::default(),
             None,
-            Some(snapshot.clone()),
+            Some(
+                crate::workspace_execution::WorkspaceExecutionResources::from_snapshot(
+                    snapshot.clone(),
+                ),
+            ),
             Some(task.mission_id.to_string()),
             &|| true,
         );
@@ -10628,6 +11266,7 @@ mod tests {
                     &call,
                     None,
                     &|| true,
+                    None,
                 )
             });
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);

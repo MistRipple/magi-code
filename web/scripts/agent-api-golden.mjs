@@ -757,5 +757,42 @@ await withGoldenViteServer(async (server) => {
     }
   }
 
+  const probeOriginalWindow = globalThis.window;
+  const probeOriginalStorage = globalThis.localStorage;
+  const probeFetch = globalThis.fetch;
+  const storage = new Map([[agentApi.RUNTIME_BASE_URL_STORAGE_KEY, 'http://127.0.0.1:38123']]);
+  try {
+    globalThis.localStorage = {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, value),
+    };
+    globalThis.window = {
+      location: { href: 'http://127.0.0.1:38239/web.html?agentBaseUrl=http://127.0.0.1:38123' },
+      __AGENT_BASE_URL__: 'http://127.0.0.1:38123',
+      setTimeout, clearTimeout,
+    };
+    const requests = [];
+    globalThis.fetch = async (url) => {
+      requests.push(String(url));
+      if (new URL(url).port === '38239') throw new Error('temporary daemon outage');
+      return new Response('{}', { status: 200 });
+    };
+    assert.equal(await agentApi.probeReachableAgentBaseUrl(), null);
+    assert.deepEqual(requests, ['http://127.0.0.1:38239/health'], '独立 daemon 断开时不能回退其它端口');
+    assert.equal(agentApi.resolveAgentBaseUrl(), 'http://127.0.0.1:38239');
+    globalThis.fetch = async (url) => {
+      assert.equal(String(url), 'http://127.0.0.1:38239/health');
+      return new Response('{}', { status: 200 });
+    };
+    assert.equal(await agentApi.probeReachableAgentBaseUrl(), 'http://127.0.0.1:38239');
+    assert.equal(storage.get(agentApi.RUNTIME_BASE_URL_STORAGE_KEY), 'http://127.0.0.1:38239');
+  } finally {
+    if (probeOriginalWindow === undefined) delete globalThis.window;
+    else globalThis.window = probeOriginalWindow;
+    if (probeOriginalStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = probeOriginalStorage;
+    globalThis.fetch = probeFetch;
+  }
+
   console.log('agent api golden replay passed');
 });

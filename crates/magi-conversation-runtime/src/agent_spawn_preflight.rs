@@ -924,29 +924,42 @@ fn preflight_workspace_and_git(
         .and_then(|plan| match plan {
             TaskExecutionPlan::Dispatch { execution_root, .. } => execution_root,
         });
-    let context = runtime
-        .session_code_contexts
-        .as_ref()
-        .and_then(|registry| registry.get(session_id.as_str()));
     let workspace_root = execution_root
         .cloned()
+        .or(parent_root)
         .or_else(|| {
-            context
-                .as_ref()
-                .map(|context| context.execution_root.clone())
+            parent_task
+                .executor_binding
+                .as_ref()?
+                .project_directories
+                .as_ref()?
+                .grant(None)
+                .ok()
+                .and_then(|grant| magi_core::HostPath::from_path_ref(&grant.source_path_ref).ok())
+                .map(magi_core::HostPath::into_path_buf)
+        })
+        .or_else(|| {
+            runtime
+                .session_code_contexts
+                .as_ref()?
+                .get(session_id.as_str())
+                .map(|context| context.execution_root)
         })
         .or_else(|| {
             workspace_id.as_ref().and_then(|workspace_id| {
                 runtime.workspace_registry.as_ref().and_then(|registry| {
                     registry
-                        .workspaces()
-                        .into_iter()
-                        .find(|workspace| workspace.workspace_id == *workspace_id)
-                        .map(|workspace| workspace.native_root_path())
+                        .resolve_source_folder(workspace_id, None)
+                        .ok()
+                        .map(|(_, root)| root)
                 })
             })
-        })
-        .or(parent_root);
+        });
+    let context = runtime.session_code_contexts.as_ref().and_then(|registry| {
+        workspace_root
+            .as_deref()
+            .and_then(|root| registry.get_for_path(session_id.as_str(), root))
+    });
 
     let runtime_has_workspace_facts = runtime.session_code_contexts.is_some()
         || runtime.workspace_registry.is_some()

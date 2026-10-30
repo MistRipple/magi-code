@@ -7,6 +7,26 @@ globalThis.$state = (value) => value;
 
 await withGoldenViteServer(async (server) => {
   const rightPane = await server.ssrLoadModule('/src/stores/right-pane.svelte.ts');
+  // 同一个项目内的同名文件必须按源目录区分；更新 B 不得清除 A 的 diff。
+  for (const sourceFolderId of ['a', 'b']) {
+    rightPane.openCodeTab('multi-source-session', 'src/index.ts', {
+      workspaceId: 'multi-source-project', sourceFolderId,
+      isChangeDiff: true, changeRevision: 'snapshot:1', diff: `diff-${sourceFolderId}`,
+    });
+  }
+  const multiPane = rightPane.getRightPaneState('multi-source-project\u0000multi-source-session');
+  assert.equal(multiPane.openTabs.length, 2);
+  rightPane.synchronizeChangeDiffTabs('multi-source-project', 'multi-source-session', [
+    { sourceFolderId: 'a', filePath: 'src/index.ts', snapshotId: 'snapshot', updatedAt: 1 },
+    { sourceFolderId: 'b', filePath: 'src/index.ts', snapshotId: 'snapshot', updatedAt: 2 },
+  ]);
+  assert.equal(multiPane.openTabs.find(tab => tab.payload.sourceFolderId === 'a').payload.diff, 'diff-a');
+  assert.equal(multiPane.openTabs.find(tab => tab.payload.sourceFolderId === 'b').payload.diff, undefined);
+  rightPane.synchronizeChangeDiffTabs('multi-source-project', 'multi-source-session', [
+    { sourceFolderId: 'b', filePath: 'src/index.ts', snapshotId: 'snapshot', updatedAt: 2 },
+  ]);
+  assert.deepEqual(multiPane.openTabs.map(tab => tab.payload.sourceFolderId), ['b'], '移除 A 的变更不关闭 B 的同名文件');
+  rightPane.closeTab('multi-source-project\u0000multi-source-session', multiPane.openTabs[0].id);
   rightPane.activateRightPaneSession('', '');
   assert.equal(rightPane.rightPaneState.activeScopeKey, 'personal');
 

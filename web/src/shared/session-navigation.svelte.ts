@@ -116,9 +116,7 @@ function navigationTargetsEqual(
   }
   const leftWorkspaceId = 'workspaceId' in left ? left.workspaceId : '';
   const rightWorkspaceId = 'workspaceId' in right ? right.workspaceId : '';
-  const leftWorkspacePath = 'workspacePath' in left ? left.workspacePath : '';
-  const rightWorkspacePath = 'workspacePath' in right ? right.workspacePath : '';
-  if (leftWorkspaceId !== rightWorkspaceId || leftWorkspacePath !== rightWorkspacePath) {
+  if (leftWorkspaceId !== rightWorkspaceId) {
     return false;
   }
   return !('sessionId' in left) || left.sessionId === (('sessionId' in right) ? right.sessionId : '');
@@ -192,10 +190,9 @@ function commitTargetMatches(
   const actualWorkspaceId = target.workspaceId?.trim() || '';
   const actualWorkspacePath = target.workspacePath?.trim() || '';
   if (pending.target.scope === 'workspace') {
-    if (
-      pending.target.workspaceId !== actualWorkspaceId
-      || pending.target.workspacePath !== actualWorkspacePath
-    ) {
+    // 项目身份稳定，主要目录和展示路径可在导航请求期间变化。
+    // daemon 返回的同项目新路径不应让正确会话的导航事务失败。
+    if (pending.target.workspaceId !== actualWorkspaceId) {
       return false;
     }
   } else if (actualWorkspaceId || actualWorkspacePath) {

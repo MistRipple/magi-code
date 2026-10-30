@@ -17,6 +17,7 @@
     modalClass?: string;
     bodyClass?: string;
     showHeader?: boolean;
+    initialFocusSelector?: string;
     children?: Snippet;
     header?: Snippet;
     footer?: Snippet;
@@ -32,6 +33,7 @@
     modalClass = '',
     bodyClass = '',
     showHeader = true,
+    initialFocusSelector,
     children,
     header,
     footer,
@@ -88,7 +90,7 @@
     tick().then(() => {
       if (dialogEl && topOverlay(layer)) {
         // Focus first element or dialog itself
-        const focusable = dialogEl.querySelector<HTMLElement>(
+        const focusable = (initialFocusSelector ? dialogEl.querySelector<HTMLElement>(initialFocusSelector) : null) ?? dialogEl.querySelector<HTMLElement>(
           'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
         );
         if (focusable) {

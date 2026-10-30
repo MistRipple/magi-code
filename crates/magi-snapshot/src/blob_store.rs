@@ -134,27 +134,77 @@ impl BlobStore {
 
     /// 释放一个引用，引用计数归零时从磁盘删除。
     pub fn release(&self, hash: &str) -> SnapshotResult<()> {
-        let drop_now = {
-            let mut counts = self.refcount.lock().expect("refcount poisoned");
-            match counts.get_mut(hash) {
-                Some(c) if *c > 1 => {
-                    *c -= 1;
-                    false
-                }
-                Some(_) => {
-                    counts.remove(hash);
-                    true
-                }
-                None => true,
+        // 判定最后一个拥有方与删除必须和 put/retain 串行，否则释放旧引用
+        // 可能删除另一线程刚获得的新引用。
+        let mut counts = self.refcount.lock().expect("refcount poisoned");
+        let drop_now = match counts.get_mut(hash) {
+            Some(c) if *c > 1 => {
+                *c -= 1;
+                false
             }
+            Some(_) => {
+                counts.remove(hash);
+                true
+            }
+            None => true,
         };
         if drop_now {
+            // 未按需加载或已归档会话仍是持久拥有方。只看内存计数会在
+            // 重启后删除其它会话尚未加载的 baseline，破坏恢复与回退。
+            if self.has_durable_reference(hash)? {
+                return Ok(());
+            }
             let path = self.blob_path(hash);
             if path.exists() {
                 fs::remove_file(&path).map_err(|e| SnapshotError::io(&path, e))?;
             }
         }
         Ok(())
+    }
+
+    fn has_durable_reference(&self, hash: &str) -> SnapshotResult<bool> {
+        use crate::baseline_index::{BaselineIndex, RefsIndex, baseline_path, refs_path};
+        use crate::change_log::ChangeLog;
+        let Some(root) = self.root.parent() else {
+            return Ok(false);
+        };
+        let indices = root.join("index");
+        let entries = match fs::read_dir(&indices) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(SnapshotError::io(&indices, error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| SnapshotError::io(&indices, error))?;
+            let dir = entry.path();
+            if !entry
+                .file_type()
+                .map_err(|error| SnapshotError::io(&dir, error))?
+                .is_dir()
+            {
+                continue;
+            }
+            if BaselineIndex::load(&baseline_path(&dir))?
+                .entries
+                .values()
+                .chain(RefsIndex::load(&refs_path(&dir))?.entries.values())
+                .any(|meta| meta.blob_hash.as_deref() == Some(hash))
+            {
+                return Ok(true);
+            }
+            let events = dir.join("events.log");
+            if events.exists()
+                && ChangeLog::read_path(&events)?.iter().any(|event| {
+                    [event.before.as_ref(), event.after.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|meta| meta.blob_hash.as_deref() == Some(hash))
+                })
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// 全量扫描 refcount，返回当前 0 引用的 blob hash 列表，不主动删除。

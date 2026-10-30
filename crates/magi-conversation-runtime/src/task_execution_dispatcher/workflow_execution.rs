@@ -988,9 +988,7 @@ impl LlmTaskDispatcher {
             .as_ref()
             .map(|prepared| &prepared.task)
             .unwrap_or(task);
-        let snapshot_session = prepared
-            .as_ref()
-            .and_then(|prepared| prepared.snapshot.clone());
+        let workspace_resources = prepared.as_ref().map(|prepared| prepared.resources.clone());
         let call = ChatToolCall {
             id: format!("workflow-tool-{}-{action_id}", task.task_id),
             kind: "function".into(),
@@ -1001,11 +999,9 @@ impl LlmTaskDispatcher {
         };
         let plan_store = magi_plan::PlanStore::new(self.session_store.clone(), session_id.clone());
         let safety_gate = self.build_safety_gate(self.settings_store.as_ref());
-        let project_memory = execution_root.and_then(|root| {
-            self.project_memory_registry
-                .get_or_open(&magi_core::WorkspaceRootPath::new(root.to_string_lossy()))
-                .ok()
-        });
+        let project_memory = workspace_id
+            .as_ref()
+            .and_then(|workspace_id| self.project_memory_registry.get_or_open(workspace_id).ok());
         let active_skill = self.workflow_active_skill(task);
         execute_task_tool_call_batch(
             self.event_bus.as_ref(),
@@ -1032,7 +1028,7 @@ impl LlmTaskDispatcher {
             &[call],
             ledger,
             None,
-            snapshot_session,
+            workspace_resources,
             Some(task.mission_id.to_string()),
             &|| execution_guard.is_active(),
         )
@@ -1974,7 +1970,7 @@ mod tests {
         let store = Arc::clone(&harness.dispatcher.session_store);
         harness.dispatcher = harness
             .dispatcher
-            .with_workspace_execution_preparer(Arc::new(move |session, _, turn| {
+            .with_workspace_execution_preparer(Arc::new(move |session, _, turn, _, _| {
                 store
                     .update_current_turn_status_for_turn_with_change(
                         session,
@@ -1982,7 +1978,7 @@ mod tests {
                         "cancelled",
                     )
                     .unwrap();
-                Ok(None)
+                Ok(Default::default())
             }));
         let task = harness
             .dispatcher
@@ -2379,8 +2375,9 @@ mod tests {
             None,
         );
         harness.attach_turn();
-        harness.dispatcher.workspace_execution_preparer =
-            Some(Arc::new(|_, _, _| Err("injected resource failure".into())));
+        harness.dispatcher.workspace_execution_preparer = Some(Arc::new(|_, _, _, _, _| {
+            Err("injected resource failure".into())
+        }));
         let error = failure(harness.run());
         assert!(error.contains("workspace_preparation_failed"), "{error}");
         let TaskRuntimePayload::Workflow {

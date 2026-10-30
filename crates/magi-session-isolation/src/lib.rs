@@ -11,11 +11,13 @@
 
 pub mod clone;
 pub mod error;
+mod legacy;
 pub mod merge;
 pub mod registry;
 
 pub use clone::{CloneOutcome, CloneStrategy, create_isolated_copy};
 pub use error::{IsolationError, IsolationResult};
+pub use legacy::materialize_legacy_shared_directories;
 pub use merge::{
     ConflictKind, ConflictResolution, MergeAction, MergeEntry, MergeOutcome, MergePlan,
     MergeSelection, MergeState, apply_merge, plan_merge,

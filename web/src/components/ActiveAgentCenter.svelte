@@ -524,8 +524,9 @@
                   {#each availableActions as action (action)}
                     <button
                       type="button"
-                      class:run-recovery-action--primary={isPrimaryAgentRunAction(action, availableActions)}
-                      class="run-recovery-action run-recovery-action--{action}"
+                      class:btn--primary={isPrimaryAgentRunAction(action, availableActions)}
+                      class:btn--secondary={!isPrimaryAgentRunAction(action, availableActions)}
+                      class="btn btn--sm run-recovery-action--{action}"
                       disabled={agentRunState.actionInFlight !== null}
                       onclick={() => requestAction(action)}
                     >
@@ -611,10 +612,10 @@
       >
         <p class="restart-confirm-message">{i18n.t('activeAgentCenter.restartConfirm.message')}</p>
         {#snippet footer()}
-          <button type="button" class="restart-confirm-action restart-confirm-action--cancel" onclick={cancelRestart}>
+          <button type="button" class="btn btn--secondary btn--sm" onclick={cancelRestart}>
             {i18n.t('activeAgentCenter.restartConfirm.cancel')}
           </button>
-          <button type="button" class="restart-confirm-action restart-confirm-action--confirm" onclick={confirmRestart}>
+          <button type="button" class="btn btn--primary btn--sm" onclick={confirmRestart}>
             <Icon name="restart" size={13} />
             {i18n.t('activeAgentCenter.restartConfirm.confirm')}
           </button>
@@ -852,85 +853,12 @@
     margin-top: 2px;
   }
 
-  .run-recovery-action {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    min-height: 27px;
-    padding: 0 8px;
-    border: var(--magi-hairline) solid var(--border-subtle);
-    border-radius: var(--radius-md);
-    background: var(--surface-raised);
-    color: var(--foreground);
-    font-size: var(--text-xs);
-    cursor: pointer;
-  }
-
-  .run-recovery-action:hover:not(:disabled) {
-    border-color: var(--border-strong);
-    background: var(--surface-hover);
-  }
-
-  .run-recovery-action--primary {
-    border-color: var(--primary);
-    background: var(--primary);
-    color: var(--primary-foreground);
-  }
-
-  .run-recovery-action--primary:hover:not(:disabled) {
-    border-color: var(--primary-hover);
-    background: var(--primary-hover);
-    color: var(--primary-foreground);
-  }
-
-  .run-recovery-action--restart,
-  .run-recovery-action--archive {
-    border-color: transparent;
-    background: transparent;
-    color: var(--foreground-muted);
-  }
-
-  .run-recovery-action--restart:hover:not(:disabled) {
-    border-color: color-mix(in srgb, var(--warning) 28%, transparent);
-    background: color-mix(in srgb, var(--warning) 8%, transparent);
-    color: var(--warning);
-  }
-
-  .run-recovery-action--archive {
-    color: var(--foreground-muted);
-  }
-
   .restart-confirm-message {
     margin: 0;
     color: var(--foreground);
     line-height: 1.55;
   }
 
-  .restart-confirm-action {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 5px;
-    min-height: 30px;
-    padding: 0 10px;
-    border: var(--magi-hairline) solid var(--border-subtle);
-    border-radius: var(--radius-md);
-    font-size: var(--text-sm);
-    cursor: pointer;
-  }
-
-  .restart-confirm-action--cancel {
-    background: transparent;
-    color: var(--foreground-muted);
-  }
-
-  .restart-confirm-action--confirm {
-    border-color: var(--warning);
-    background: var(--warning);
-    color: var(--background);
-  }
-
-  .run-recovery-action:disabled,
   .panel-clear:disabled {
     cursor: default;
     opacity: 0.55;

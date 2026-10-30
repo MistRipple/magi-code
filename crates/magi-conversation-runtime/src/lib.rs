@@ -56,6 +56,8 @@ pub mod turn_stream_buffer;
 pub mod usage_recording;
 pub mod user_question;
 pub mod web_history_import;
+pub mod workspace_execution;
+mod workspace_rules;
 
 pub use builtin_tool_schema::{
     internal_builtin_tool_rejection_payload, public_builtin_tool_definitions,

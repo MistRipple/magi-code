@@ -34,6 +34,8 @@ export async function withGoldenViteServer(callback, options = {}) {
   } finally {
     await options.cleanup?.();
     await server.close();
-    await rm(cacheDir, { recursive: true, force: true });
+    // Vite 的依赖优化器可能在 close() 返回后短暂完成临时目录清理；
+    // 使用 Node 的重试参数，避免并发 golden 在 macOS 上因 ENOTEMPTY 抖动失败。
+    await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 }

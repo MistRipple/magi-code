@@ -632,6 +632,10 @@ impl TaskStore {
         tasks: &HashMap<TaskId, Task>,
         task: &Task,
     ) -> DomainResult<()> {
+        Self::validate_project_directory_inheritance(
+            task,
+            task.parent_task_id.as_ref().and_then(|id| tasks.get(id)),
+        )?;
         if task.agent_run_transfer().is_some() {
             return Err(DomainError::InvalidState {
                 message: "创建任务不能携带已转交状态，必须从显式转交事务接纳".into(),
@@ -756,6 +760,29 @@ impl TaskStore {
             }
             _ => Err(DomainError::InvalidState {
                 message: "Agent activation 来源缺失或代际冲突".into(),
+            }),
+        }
+    }
+
+    fn validate_project_directory_inheritance(
+        task: &Task,
+        parent: Option<&Task>,
+    ) -> DomainResult<()> {
+        let binding = task
+            .executor_binding
+            .as_ref()
+            .and_then(|binding| binding.project_directories.as_ref());
+        let parent_binding = parent
+            .and_then(|task| task.executor_binding.as_ref())
+            .and_then(|binding| binding.project_directories.as_ref());
+        if let Some(binding) = binding {
+            binding.validate()?;
+        }
+        match (binding, parent_binding, task.parent_task_id.as_ref()) {
+            (Some(child), Some(parent), Some(_)) => child.validate_inherited_from(parent),
+            (None, None, _) | (Some(_), None, None) => Ok(()),
+            _ => Err(DomainError::InvalidState {
+                message: "子任务缺少父目录授权或试图自行扩大项目范围".into(),
             }),
         }
     }
@@ -3737,6 +3764,13 @@ impl TaskStore {
             .map(|task| (&task.task_id, task))
             .collect::<HashMap<_, _>>();
         for task in &checkpoint.tasks {
+            Self::validate_project_directory_inheritance(
+                task,
+                task.parent_task_id
+                    .as_ref()
+                    .and_then(|id| all.get(id).copied()),
+            )
+            .map_err(|error| Self::invalid_projection(error.to_string()))?;
             if task.delegation_allowed() && task.agent_activation().is_none() {
                 return Err(Self::invalid_projection(
                     "受委派代理缺少持久 activation 身份",
@@ -4118,6 +4152,82 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn project_directory_inheritance_rejects_expansion_and_corrupt_reload() {
+        let root = tempfile::tempdir().unwrap();
+        let grant = |id: &str| magi_core::ProjectSourceFolderGrant {
+            source_folder_id: id.into(),
+            source_path_ref: magi_core::HostPath::from_path(root.path().join(id))
+                .to_path_ref()
+                .as_str()
+                .into(),
+        };
+        let directories = magi_core::ProjectDirectoryBinding {
+            workspace_id: magi_core::WorkspaceId::new("project"),
+            project_revision: 1,
+            default_source_folder_id: "a".into(),
+            source_folders: vec![grant("a"), grant("b")],
+        };
+        let store = TaskStore::new();
+        let mut parent = rooted_task("directory-parent", "directory-parent");
+        let mut executor = magi_core::TaskExecutorBinding::for_role("coordinator");
+        executor.project_directories = Some(directories.clone());
+        parent.executor_binding = Some(executor);
+        store.insert_task(parent.clone()).unwrap();
+        let mut child = rooted_task("directory-parent", "directory-child");
+        child.parent_task_id = Some(parent.task_id.clone());
+        assert!(
+            store.insert_task(child.clone()).is_err(),
+            "不得通过缺少绑定回落其他目录"
+        );
+        let mut inherited = directories.clone();
+        inherited.source_folders = vec![grant("b")];
+        inherited.default_source_folder_id = "b".into();
+        let mut executor = magi_core::TaskExecutorBinding::for_role("executor");
+        executor.project_directories = Some(inherited);
+        child.executor_binding = Some(executor);
+        store.insert_task(child.clone()).unwrap();
+        let projection = root.path().join("tasks");
+        TaskStore::checkpoint_snapshot_to_projection_directory(&store.snapshot(), &projection)
+            .unwrap();
+        let restored = TaskStore::restore_from_projection_directory(&projection)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.get_task(&child.task_id).unwrap().executor_binding,
+            child.executor_binding
+        );
+        let mut snapshot = store.snapshot();
+        let bad_child = snapshot
+            .tasks
+            .iter_mut()
+            .find(|task| task.task_id == child.task_id)
+            .unwrap();
+        bad_child
+            .executor_binding
+            .as_mut()
+            .unwrap()
+            .project_directories
+            .as_mut()
+            .unwrap()
+            .source_folders
+            .push(grant("outside"));
+        assert!(
+            TaskStore::restore_checked(TaskStoreCheckpoint {
+                tasks: snapshot.tasks,
+                leases: snapshot.leases,
+            })
+            .is_err()
+        );
+        let mut unbound_parent = rooted_task("other-parent", "other-parent");
+        unbound_parent.executor_binding = None;
+        store.insert_task(unbound_parent.clone()).unwrap();
+        child.task_id = TaskId::new("invented-project-child");
+        child.root_task_id = unbound_parent.task_id.clone();
+        child.parent_task_id = Some(unbound_parent.task_id);
+        assert!(store.insert_task(child).is_err());
     }
 
     #[test]

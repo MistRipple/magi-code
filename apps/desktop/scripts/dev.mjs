@@ -26,8 +26,13 @@ const child = spawn(executable, [join(repositoryRoot, "apps", "desktop")], {
     ...process.env,
     NODE_ENV: "development",
     // 开发 daemon 由 scripts/dev-daemon.sh 托管；Electron 只连接它，
-    // 避免桌面宿主再启动第二个实例争抢 38123 端口。
+    // 避免桌面宿主再启动第二个实例争抢端口。MAGI_PORT 是 dev-daemon.sh
+    // 的入口配置；若调用方没有单独覆盖 Desktop 端口，必须把同一端口传给 Main。
     MAGI_DESKTOP_REUSE_DAEMON: "1",
+    MAGI_DESKTOP_DAEMON_PORT:
+      process.env.MAGI_DESKTOP_DAEMON_PORT?.trim()
+      || process.env.MAGI_PORT?.trim()
+      || "38123",
   },
   stdio: "inherit",
 });

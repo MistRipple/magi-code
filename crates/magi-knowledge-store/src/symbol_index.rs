@@ -111,7 +111,9 @@ impl SymbolIndex {
             if meta.len() > 500 * 1024 {
                 continue;
             }
-            if let Ok(content) = std::fs::read_to_string(&full_path) {
+            if let Ok(content) =
+                crate::code_scanner::read_index_file(std::path::Path::new(project_root), path)
+            {
                 self.extract_symbols(path, &content);
             }
         }
@@ -350,7 +352,9 @@ impl SymbolIndex {
         if meta.len() > 500 * 1024 {
             return;
         }
-        if let Ok(content) = std::fs::read_to_string(&full_path) {
+        if let Ok(content) =
+            crate::code_scanner::read_index_file(std::path::Path::new(project_root), file_path)
+        {
             self.extract_symbols(file_path, &content);
         }
     }

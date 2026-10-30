@@ -57,7 +57,7 @@
   <div class="tool-approval-actions">
     <button
       type="button"
-      class="approval-button approval-button--primary"
+      class="btn btn--primary btn--sm"
       disabled={Boolean(resolving) || resolved || !approvalIsActive}
       onclick={() => void resolve('allow_once')}
     >
@@ -68,7 +68,7 @@
     {#if !isExternalApproval}
       <button
         type="button"
-        class="approval-button"
+        class="btn btn--secondary btn--sm"
         disabled={Boolean(resolving) || resolved || !approvalIsActive}
         onclick={() => void resolve('allow_for_turn')}
       >
@@ -79,7 +79,7 @@
     {/if}
     <button
       type="button"
-      class="approval-button"
+      class="btn btn--secondary btn--sm"
       disabled={Boolean(resolving) || resolved || !approvalIsActive}
       onclick={() => void resolve('deny')}
     >
@@ -143,38 +143,6 @@
     align-items: center;
     flex-wrap: wrap;
     gap: var(--space-2);
-  }
-
-  .approval-button {
-    min-height: 28px;
-    padding: 0 var(--space-3);
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    cursor: pointer;
-  }
-
-  .approval-button:hover:not(:disabled) {
-    background: var(--surface-1);
-    color: var(--foreground);
-  }
-
-  .approval-button--primary {
-    border-color: var(--primary);
-    background: var(--primary);
-    color: var(--primary-foreground, #fff);
-  }
-
-  .approval-button--primary:hover:not(:disabled) {
-    background: var(--primary-hover, var(--primary));
-    color: var(--primary-foreground, #fff);
-  }
-
-  .approval-button:disabled {
-    opacity: 0.55;
-    cursor: default;
   }
 
   .tool-approval-status,

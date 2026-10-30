@@ -199,4 +199,51 @@ check('switch model respects session and input locks', () => {
   assert.deepEqual(makeModelActionHarness({})({ kind: 'openView' }), { open: false, loads: 0 });
 });
 
+const workspaceHandlers = ['selectWorkspace', 'selectSourceFolder'].map(name => {
+  const declaration = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
+  assert.ok(declaration, `missing workspace handler ${name}`);
+  return declaration.getText(ast);
+}).join('\n');
+const makeWorkspaceHarness = new Function('options', ts.transpileModule(`
+  const currentSessionId = options.sessionId || '';
+  const isDraftSession = !currentSessionId;
+  const sessionInputLocked = options.locked || false;
+  const isInteractionBlocking = options.blocking || false;
+  const editingQueuedMessage = options.editingQueue || false;
+  const editingTurn = options.editingTurn || false;
+  const composerWorkspace = options.personal ? null : { workspaceId: 'project-a' };
+  const composerWorkspaceState = { workspaces: [{ workspaceId: 'project-b', rootPath: '/b' }] };
+  const calls = [];
+  let workspacePickerOpen = true;
+  let sourceFolderPickerOpen = true;
+  function workspaceNavigationPath(workspace) { return workspace.rootPath; }
+  function selectComposerSourceFolder(...binding) { calls.push({ folder: binding }); }
+  function closeSourceFolderPicker() { sourceFolderPickerOpen = false; }
+  function navigateSession(target) { calls.push({ navigation: target }); }
+  ${workspaceHandlers}
+  return {
+    folder: selectSourceFolder,
+    project: selectWorkspace,
+    snapshot: () => ({ calls, open: sourceFolderPickerOpen }),
+  };
+`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText);
+
+check('existing session may select the next input directory without changing its project', () => {
+  const harness = makeWorkspaceHarness({ sessionId: 'existing-session' });
+  harness.folder('source-b');
+  harness.project('project-b');
+  assert.deepEqual(harness.snapshot(), { calls: [{ folder: ['project-a', 'existing-session', 'source-b'] }], open: false });
+});
+
+check('project directory selection respects input locks and cannot rewrite edited inputs', () => {
+  for (const options of [{ locked: true }, { blocking: true }, { editingQueue: true }, { editingTurn: true }, { personal: true }]) {
+    const harness = makeWorkspaceHarness(options);
+    harness.folder('source-b');
+    assert.deepEqual(harness.snapshot(), { calls: [], open: true });
+  }
+  const draft = makeWorkspaceHarness({});
+  draft.folder('source-b');
+  assert.deepEqual(draft.snapshot().calls, [{ folder: ['project-a', '', 'source-b'] }]);
+});
+
 console.log(`composer input golden checks passed (${scenarios} scenarios)`);

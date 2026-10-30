@@ -9,6 +9,7 @@ import {
 interface FileChangeProjectionInput {
   blockIdBase: string;
   sessionId: string;
+  defaultSourceFolderId?: string;
   toolName: string;
   arguments: unknown;
   result?: unknown;
@@ -132,6 +133,7 @@ function fileChangeBlock(
     content: '',
     fileChange: {
       sessionId: input.sessionId,
+      sourceFolderId: firstString(coerceToolArgumentsRecord(input.arguments).source_folder_id) || input.defaultSourceFolderId,
       toolCallId: input.blockIdBase,
       ...(input.origin ? { origin: input.origin } : {}),
       contentKind: 'text',

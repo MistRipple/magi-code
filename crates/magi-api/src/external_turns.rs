@@ -66,6 +66,9 @@ impl ExternalTurns {
         workspace_id: &WorkspaceId,
         client_name: &str,
     ) -> Result<String, String> {
+        let _project_admission = state
+            .try_project_directory_admission(workspace_id)
+            .map_err(|error| error.message().to_owned())?;
         let mut open = self.open.lock().expect("external turns poisoned");
         let now = now_ms();
         let current_turn = state

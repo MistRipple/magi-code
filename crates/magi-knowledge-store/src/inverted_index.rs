@@ -82,8 +82,9 @@ impl InvertedIndex {
         self.avg_doc_len = 0.0;
 
         for (path, file_type) in files {
-            let full_path = format!("{}/{}", project_root, path);
-            if let Ok(content) = std::fs::read_to_string(&full_path) {
+            if let Ok(content) =
+                crate::code_scanner::read_index_file(std::path::Path::new(project_root), path)
+            {
                 self.add_document(project_root, path, &content, file_type);
             }
         }
@@ -167,8 +168,9 @@ impl InvertedIndex {
 
     pub fn update_file(&mut self, project_root: &str, file_path: &str, file_type: &str) {
         self.remove_file(file_path);
-        let full_path = format!("{}/{}", project_root, file_path);
-        if let Ok(content) = std::fs::read_to_string(&full_path) {
+        if let Ok(content) =
+            crate::code_scanner::read_index_file(std::path::Path::new(project_root), file_path)
+        {
             self.add_document(project_root, file_path, &content, file_type);
             self.recalculate_stats();
         }

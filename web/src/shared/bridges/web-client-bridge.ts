@@ -665,6 +665,7 @@ function requestScopeFromMessage(
         scope: 'workspace',
         workspaceId: workspaceScope.workspaceId,
         workspacePath: workspaceScope.workspacePath,
+        sourceFolderId: trimBridgeString(message.sourceFolderId) || undefined,
         ...(sessionId ? { sessionId } : {}),
       }
     : { scope: 'personal', ...(sessionId ? { sessionId } : {}) };
@@ -687,6 +688,7 @@ function requireWorkspaceRequestScope(scope: BridgeRequestScope): WorkspaceAgent
     workspaceId: workspaceScope.workspaceId,
     workspacePath: workspaceScope.workspacePath,
     sessionId: scope.sessionId,
+    sourceFolderId: scope.scope === 'workspace' ? scope.sourceFolderId : undefined,
   };
 }
 
@@ -695,6 +697,7 @@ function changeMutationScopeKey(scope: BridgeRequestScope): string {
     sessionId: scope.sessionId?.trim() || '',
     workspaceId: scope.workspaceId?.trim() || '',
     workspacePath: scope.workspacePath?.trim() || '',
+    sourceFolderId: scope.scope === 'workspace' ? scope.sourceFolderId?.trim() || '' : '',
   });
 }
 
@@ -704,6 +707,7 @@ function emitChangeMutationStatus(scope: BridgeRequestScope, isMutating: boolean
     sessionId: scope.sessionId?.trim() || null,
     workspaceId: scope.workspaceId?.trim() || null,
     workspacePath: scope.workspacePath?.trim() || null,
+    sourceFolderId: scope.scope === 'workspace' ? scope.sourceFolderId?.trim() || null : null,
     updatedAt: Date.now(),
   });
 }
@@ -3981,6 +3985,7 @@ export async function autoConnectAgentRunTracking(
 }
 
 interface ExecuteTaskInput {
+  sourceFolderId?: string;
   text?: string | null;
   workspaceId?: string;
   workspacePath?: string;
@@ -4005,6 +4010,7 @@ interface ExecuteTaskInput {
     kind: 'file' | 'directory';
     path: string;
     pathRef?: string;
+    sourceFolderId?: string;
     name: string;
   }>;
   browserAnnotationRefs?: string[];
@@ -4032,6 +4038,7 @@ function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
     text: turn.text ?? null,
     workspaceId: turn.workspaceId ?? undefined,
     workspacePath: turn.workspacePath?.trim() || undefined,
+    sourceFolderId: turn.sourceFolderId || undefined,
     sessionId: turn.sessionId,
     createdAt: turn.acceptedAt,
     command: turn.command === 'compact' ? 'compact' : null,
@@ -4041,7 +4048,7 @@ function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
     goalMode: turn.goalMode === true,
     accessProfile: turn.accessProfile ?? null,
     images: turn.images,
-    contextReferences: turn.contextReferences.map(reference => ({ ...reference, pathRef: reference.pathRef ?? undefined })),
+    contextReferences: turn.contextReferences.map(reference => ({ ...reference, pathRef: reference.pathRef ?? undefined, sourceFolderId: reference.sourceFolderId ?? undefined })),
     browserAnnotationRefs: turn.browserAnnotationRefs,
     browserNodeSelections: turn.browserNodeSelections,
     pluginSelections: turn.pluginSelections ?? [],
@@ -4233,6 +4240,9 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
         ...(typeof reference.pathRef === 'string' && reference.pathRef.trim()
           ? { pathRef: reference.pathRef.trim() }
           : {}),
+        ...(typeof reference.sourceFolderId === 'string' && reference.sourceFolderId.trim()
+          ? { sourceFolderId: reference.sourceFolderId.trim() }
+          : {}),
         name: typeof reference.name === 'string' && reference.name.trim()
           ? reference.name.trim()
           : reference.path.trim().split(/[\\/]/u).filter(Boolean).pop() || reference.path.trim(),
@@ -4361,6 +4371,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
         console.warn('[web-client-bridge] 发送前事件流预连接失败，提交继续执行:', preflightError);
       });
     const turnResult = await submitSessionTurn({
+      sourceFolderId: input.sourceFolderId || null,
       text,
       skillName,
       locale: i18n.locale,
@@ -5632,6 +5643,7 @@ export function createWebClientBridge(): ClientBridge {
           ) {
             void executeTask({
               text: typeof message.text === 'string' ? message.text : null,
+              sourceFolderId: typeof message.sourceFolderId === 'string' ? message.sourceFolderId : undefined,
               workspaceId: typeof message.workspaceId === 'string' ? message.workspaceId : undefined,
               workspacePath: typeof message.workspacePath === 'string' ? message.workspacePath : undefined,
               sessionId: typeof message.sessionId === 'string' ? message.sessionId : undefined,
@@ -5661,6 +5673,7 @@ export function createWebClientBridge(): ClientBridge {
                     kind: 'file' | 'directory';
                     path: string;
                     pathRef?: string;
+                    sourceFolderId?: string;
                     name: string;
                   }>
                 : [],

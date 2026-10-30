@@ -428,6 +428,31 @@ impl ToolRegistry {
             self.record_invocation(&input, &context, &output);
             return output;
         }
+        context = match context.for_tool_arguments(&input.input) {
+            Ok(context) => context,
+            Err(error) => {
+                let output = self.build_policy_rejection(
+                    &input,
+                    format!("project_directory_invalid: {error}"),
+                    context.access_profile,
+                );
+                self.record_invocation(&input, &context, &output);
+                return output;
+            }
+        };
+        let projected_policy = match context.project_execution_policy(policy) {
+            Ok(policy) => policy,
+            Err(error) => {
+                let output = self.build_policy_rejection(
+                    &input,
+                    format!("project_directory_invalid: {error}"),
+                    context.access_profile,
+                );
+                self.record_invocation(&input, &context, &output);
+                return output;
+            }
+        };
+        let policy = &projected_policy;
         let access_mode = self.resolve_access_mode(&input);
         if let Some(output) = self.enforce_access_profile_policy(&input, &context, policy) {
             self.record_invocation(&input, &context, &output);
@@ -491,10 +516,8 @@ impl ToolRegistry {
                     resources.cancellation = cancellation.clone();
                     resources.execution_policy = Some(policy.clone());
                     // 读工具只做读取：与权限预检同一规则，读取不受默认的工作区范围约束。
-                    let execution_policy = crate::policy::execution_permission_policy(
-                        policy,
-                        context.working_directory.as_deref(),
-                    );
+                    let execution_policy =
+                        crate::policy::execution_permission_policy(policy, &context);
                     resources.file_read_policy = crate::policy::path_access_policy(
                         &execution_policy,
                         input.tool_name.trim(),
@@ -514,8 +537,11 @@ impl ToolRegistry {
                             tool.execute(&input.tool_call_id, &input.input, &context, &resources)
                         }
                     };
-                    let payload =
-                        append_workspace_changed_paths(payload, before_changes.as_ref(), &context);
+                    let payload = append_workspace_changed_paths(
+                        payload,
+                        before_changes.as_deref(),
+                        &context,
+                    );
                     drop(write_guard);
                     ToolExecutionOutput {
                         tool_call_id: input.tool_call_id.clone(),

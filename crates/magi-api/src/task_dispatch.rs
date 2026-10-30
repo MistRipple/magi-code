@@ -40,6 +40,76 @@ use magi_session_store::{
     SessionGoal,
 };
 
+/// 恢复/继续执行只能沿原任务绑定；只有旧版单目录任务允许在首次读取时补齐绑定。
+pub(crate) fn validate_or_migrate_directory_binding(
+    state: &ApiState,
+    workspace_id: Option<&WorkspaceId>,
+    original: Option<magi_core::ProjectDirectoryBinding>,
+) -> Result<Option<magi_core::ProjectDirectoryBinding>, ApiError> {
+    let Some(workspace_id) = workspace_id else {
+        if original.is_some() {
+            return Err(ApiError::Conflict("个人会话不能携带项目目录绑定".into()));
+        }
+        return Ok(None);
+    };
+    if let Some(binding) = original {
+        if binding.workspace_id != *workspace_id {
+            return Err(ApiError::Conflict("原任务目录绑定与当前项目不匹配".into()));
+        }
+        state
+            .workspace_registry
+            .validate_directory_membership(&binding)
+            .map_err(|error| ApiError::Conflict(format!("原任务的源文件夹授权已失效: {error}")))?;
+        return Ok(Some(binding));
+    }
+    let project = state
+        .workspace_registry
+        .project(workspace_id)
+        .ok_or_else(|| ApiError::not_found("workspace 不存在", workspace_id.as_str()))?;
+    if project.source_folders.len() != 1
+        || project.revision != 1
+        || project.primary_source_folder_id != format!("{workspace_id}-source-0")
+    {
+        return Err(ApiError::Conflict(
+            "旧任务缺少源文件夹绑定，项目已编辑或缺少原单目录身份，不能重解释".into(),
+        ));
+    }
+    state
+        .workspace_registry
+        .capture_directory_binding(workspace_id, None, None)
+        .map(Some)
+        .map_err(|error| ApiError::Conflict(format!("补齐旧任务目录绑定失败: {error}")))
+}
+
+/// 新接纳、主线继续和独立代理继续共用原目录绑定与会话副本解析。
+pub(crate) fn bound_project_execution_root(
+    state: &ApiState,
+    session_id: &SessionId,
+    binding: &magi_core::ProjectDirectoryBinding,
+) -> Result<std::path::PathBuf, ApiError> {
+    let source = state
+        .workspace_registry
+        .resolve_bound_source_directory(binding, None)
+        .map_err(|error| ApiError::Conflict(format!("原任务的源文件夹不可用: {error}")))?;
+    state.session_execution_root_for_source(session_id, &source)
+}
+
+pub(crate) fn canonical_project_directory_binding(
+    turn: &magi_session_store::CanonicalTurn,
+) -> Result<Option<magi_core::ProjectDirectoryBinding>, serde_json::Error> {
+    turn.items
+        .iter()
+        .find_map(|item| {
+            item.metadata.get("projectDirectories").or_else(|| {
+                item.metadata
+                    .get("pendingDispatch")
+                    .and_then(|request| request.get("project_directories"))
+            })
+        })
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+}
+
 /// 必须在 dispatcher / RunnerManager 装配前调用；捕获的状态只持有共享业务依赖，
 /// 不持有正在构造的 dispatcher，避免运行时引用环。
 pub fn workspace_execution_preparer(
@@ -48,7 +118,7 @@ pub fn workspace_execution_preparer(
 {
     let state = state.clone();
     let runtime = tokio::runtime::Handle::try_current().ok();
-    std::sync::Arc::new(move |session_id, workspace_id, turn_id| {
+    std::sync::Arc::new(move |session_id, workspace_id, turn_id, binding, mode| {
         let runtime = runtime
             .as_ref()
             .ok_or_else(|| "工作区执行准备缺少异步运行时".to_string())?;
@@ -75,38 +145,176 @@ pub fn workspace_execution_preparer(
                                 .is_some_and(|canonical| !canonical.status.is_terminal())
                     })
             };
-            if !still_active() {
+            let execution = mode == magi_conversation_runtime::workspace_execution::WorkspacePreparationMode::Execution;
+            if execution && !still_active() {
                 return Err("工作区准备目标 Turn 已关闭或变化".to_string());
             }
-            state
-                .isolate_on_workspace_contention(session_id, workspace_id, turn_id)
-                .await;
+            let binding = validate_or_migrate_directory_binding(
+                &state,
+                workspace_id.as_ref(),
+                binding.cloned(),
+            )
+            .map_err(|error| error.message().to_string())?;
+            if execution && let Some(binding) = binding.as_ref() {
+                state
+                    .isolate_on_workspace_contention(session_id, binding, turn_id)
+                    .await;
+            }
             record_stage("isolation_checked");
-            if !still_active() {
+            if execution && !still_active() {
                 return Err("隔离目录准备期间 Turn 已关闭或变化".to_string());
             }
-            state
-                .ensure_session_code_context(session_id, workspace_id)
-                .await
-                .map_err(|error| format!("{error:?}"))?;
-            record_stage("git_context_ready");
-            let snapshot = state
-                .ensure_snapshot_session_for_workspace_id(session_id, workspace_id)
-                .await
-                .map_err(|error| format!("{error:?}"))?;
-            record_stage("snapshot_ready");
-            if !still_active() {
-                return Err("工作区准备期间 Turn 已关闭或变化".to_string());
+            let Some(binding) = binding.as_ref() else {
+                return Ok(Default::default());
+            };
+            let directories =
+                magi_core::ProjectDirectoryExecutionMap::from_binding(binding, |grant| {
+                    let source = state
+                        .workspace_registry
+                        .resolve_bound_source_directory(binding, Some(&grant.source_folder_id))?;
+                    state
+                        .session_execution_root_for_source(session_id, &source)
+                        .map_err(|error| magi_core::DomainError::Validation {
+                            message: error.message().into(),
+                        })
+                        .and_then(|root| std::fs::canonicalize(root).map_err(|error| magi_core::DomainError::Validation { message: format!("项目执行目录不可用: {error}") }))
+                })
+                .map_err(|error| error.to_string())?;
+            if !execution {
+                return Ok(magi_conversation_runtime::workspace_execution::WorkspaceExecutionResources {
+                    directories: Some(directories), snapshots: Vec::new(),
+                });
             }
-            Ok(snapshot)
+            let mut repositories = Vec::new();
+            for directory in &directories.roots {
+                let source = directory.source_root().map_err(|error| error.to_string())?;
+                let execution = directory
+                    .execution_root()
+                    .map_err(|error| error.to_string())?;
+                if source != execution {
+                    continue;
+                }
+                match state.git_service.observe(&execution).await {
+                    Ok(observation) => repositories.push(observation.git_common_dir),
+                    Err(magi_git::GitError::NotRepository { .. }) => {}
+                    Err(error) => return Err(format!("观测项目仓库失败: {error}")),
+                }
+            }
+            state
+                .begin_session_git_execution_set(session_id, &repositories, Some(turn_id))
+                .await
+                .map_err(|error| error.message().to_string())?;
+            let prepared = async {
+                let mut snapshots = Vec::new();
+                for directory in &directories.roots {
+                    if !still_active() {
+                        return Err("工作区准备期间 Turn 已关闭或变化".to_string());
+                    }
+                    state
+                        .workspace_registry
+                        .validate_directory_binding(binding)
+                        .map_err(|error| error.to_string())?;
+                    let source = directory.source_root().map_err(|error| error.to_string())?;
+                    let execution = directory
+                        .execution_root()
+                        .map_err(|error| error.to_string())?;
+                    if std::fs::canonicalize(state
+                        .session_execution_root_for_source(session_id, &source)
+                        .map_err(|error| error.message().to_string())?).map_err(|error| error.to_string())?
+                        != execution
+                    {
+                        return Err("准备期间项目执行映射已变化".into());
+                    }
+                    let context = state
+                        .ensure_session_code_context_for_root(
+                            session_id,
+                            &binding.workspace_id,
+                            &source,
+                        )
+                        .await
+                        .map_err(|error| format!("{error:?}"))?;
+                    if context
+                        .as_ref()
+                        .is_some_and(|context| !repositories.contains(&context.git.git_common_dir))
+                    {
+                        return Err("准备期间项目仓库身份已变化".into());
+                    }
+                    snapshots.push(
+                        state
+                            .ensure_snapshot_session(session_id, &source)
+                            .await
+                            .map_err(|error| format!("{error:?}"))?,
+                    );
+                }
+                if !still_active() {
+                    return Err("工作区准备期间 Turn 已关闭或变化".to_string());
+                }
+                record_stage("resources_ready");
+                Ok(
+                    magi_conversation_runtime::workspace_execution::WorkspaceExecutionResources {
+                        directories: Some(directories),
+                        snapshots,
+                    },
+                )
+            }
+            .await;
+            if prepared.is_err() {
+                state.release_session_git_execution_lease(session_id);
+            }
+            prepared
         })
     })
+}
+
+/// 显式项目文件引用必须仍属于原冻结授权；引用身份不能用来授权项目外路径。
+pub(crate) fn validate_project_context_references(
+    binding: Option<&magi_core::ProjectDirectoryBinding>,
+    references: &[magi_conversation_runtime::context_reference::SessionContextReference],
+) -> Result<(), ApiError> {
+    for reference in references {
+        let Some(source_id) = reference.source_folder_id.as_deref() else {
+            continue;
+        };
+        let binding = binding
+            .ok_or_else(|| ApiError::InvalidInput("个人会话不能携带项目源文件夹引用".into()))?;
+        let grant = binding
+            .grant(Some(source_id))
+            .map_err(|error| ApiError::InvalidInput(format!("上下文引用目录未获授权: {error}")))?;
+        let root = magi_core::HostPath::from_path_ref(&grant.source_path_ref)
+            .map_err(|error| ApiError::InvalidInput(error.to_string()))?
+            .into_path_buf();
+        let canonical = std::fs::canonicalize(&reference.path).map_err(|_| {
+            ApiError::InvalidInput(format!("上下文引用已不可用: {}", reference.path.display()))
+        })?;
+        if !canonical.starts_with(&root) {
+            return Err(ApiError::InvalidInput(
+                "上下文引用不属于指定源文件夹".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn submit_dispatch_submission(
     state: &ApiState,
     mut request: DispatchSubmissionRequest,
 ) -> Result<DispatchSubmissionAccepted, ApiError> {
+    request.project_directories = validate_or_migrate_directory_binding(
+        state,
+        request.workspace_id.as_ref(),
+        request.project_directories.take(),
+    )?;
+    validate_project_context_references(
+        request.project_directories.as_ref(),
+        &request.context_references,
+    )?;
+    if let Some(binding) = request.project_directories.as_ref() {
+        request.execution_root = Some(bound_project_execution_root(
+            state,
+            &request.session_id,
+            binding,
+        )?);
+    }
     ensure_dispatch_submission_acceptance_available(&state.session_store, &request)
         .map_err(dispatch_accept_error_to_api_error)?;
     // 排队输入在实际接纳为 Turn 时才选择插件包。这个不可变选择随原 accepted
@@ -203,16 +411,7 @@ pub fn submit_dispatch_submission(
         );
         ApiError::internal_assembly("构建任务派发运行时", "task_store 未配置")
     })?;
-    let workspace_root_path =
-        if let Some(context) = state.session_code_contexts.get(request.session_id.as_str()) {
-            Some(context.execution_root)
-        } else if let Some(root) = state.workspace_root_path(&request.workspace_id) {
-            Some(root)
-        } else if request.workspace_id.is_none() {
-            Some(state.personal_session_execution_root_path(&request.session_id))
-        } else {
-            None
-        };
+    let workspace_root_path = request.execution_root.clone();
     let runtime = DispatchSubmissionRuntime {
         session_store: &state.session_store,
         task_store,
@@ -294,17 +493,12 @@ pub(crate) fn materialize_dispatch_submission_after_acceptance(
     accepted: &DispatchSubmissionAccepted,
 ) -> Result<(), ApiError> {
     let request = &accepted.request;
-    let workspace_root_path = state
-        .session_code_contexts
-        .get(request.session_id.as_str())
-        .map(|context| context.execution_root)
-        .or_else(|| state.workspace_root_path(&request.workspace_id))
-        .or_else(|| {
-            request
-                .workspace_id
-                .is_none()
-                .then(|| state.personal_session_execution_root_path(&request.session_id))
-        });
+    validate_or_migrate_directory_binding(
+        state,
+        request.workspace_id.as_ref(),
+        request.project_directories.clone(),
+    )?;
+    let workspace_root_path = request.execution_root.clone();
     let task_store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("装配任务派发", "task_store 未配置"))?;
@@ -512,6 +706,43 @@ pub(crate) async fn accept_session_task_submission_at(
 /// 它和普通主线 Turn 共用 DispatchSubmission / Runner / ConversationLoop；仅以
 /// `DispatchTurnOrigin::GoalContinuation` 让 canonical 时间线写入系统通知，并保证
 /// 当前 Turn 不出现虚假的 user_message。
+fn goal_directory_binding(
+    state: &ApiState,
+    goal: &SessionGoal,
+) -> Result<Option<magi_core::ProjectDirectoryBinding>, ApiError> {
+    let Some(owner) = goal.created_by_turn_id.as_deref() else {
+        return Ok(None);
+    };
+    // 原生 Goal 工具以 Task ID 保存创建者，普通 Conversation 则使用 Turn ID。
+    if let Some(task) = state
+        .task_store()
+        .and_then(|tasks| tasks.get_task(&magi_core::TaskId::new(owner)))
+    {
+        return Ok(task
+            .executor_binding
+            .and_then(|binding| binding.project_directories));
+    }
+    let original = state
+        .session_store
+        .canonical_turns_for_session(&goal.session_id)
+        .into_iter()
+        .find(|turn| {
+            turn.turn_id == owner
+                || turn.items.iter().any(|item| {
+                    item.worker
+                        .as_ref()
+                        .and_then(|worker| worker.task_id.as_ref())
+                        .is_some_and(|id| id.as_str() == owner)
+                })
+        });
+    original
+        .as_ref()
+        .map(canonical_project_directory_binding)
+        .transpose()
+        .map(Option::flatten)
+        .map_err(|error| ApiError::internal_assembly("恢复 Goal 原目录绑定", error))
+}
+
 pub(crate) async fn accept_goal_continuation_task_submission(
     state: &ApiState,
     session_id: SessionId,
@@ -520,12 +751,15 @@ pub(crate) async fn accept_goal_continuation_task_submission(
     execution_goal: String,
     accepted_at: UtcMillis,
 ) -> Result<DispatchSubmissionAccepted, ApiError> {
-    let execution_root = state.session_execution_root_override(&session_id, &workspace_id);
+    let execution_root = workspace_id
+        .is_none()
+        .then(|| state.personal_session_execution_root_path(&session_id));
     let entry_id = format!(
         "timeline-goal-continuation-{}-{}",
         session_id, accepted_at.0
     );
     let dispatch = DispatchSubmissionRequest {
+        project_directories: goal_directory_binding(state, goal)?,
         accepted_at,
         session_id: session_id.clone(),
         workspace_id,
@@ -619,16 +853,10 @@ async fn execute_dispatch_submission(
         placeholder_title,
         accepted_at,
     )?;
-    let execution_root = state.session_isolation_root(&session_id).or_else(|| {
-        workspace_id
-            .as_ref()
-            .and_then(|workspace_id| state.workspace_root_path(&Some(workspace_id.clone())))
-            .or(if workspace_id.is_none() {
-                Some(state.personal_session_execution_root_path(&session_id))
-            } else {
-                None
-            })
-    });
+    // 项目 cwd 由 submit_dispatch_submission 沿冻结绑定统一解析。
+    let execution_root = workspace_id
+        .is_none()
+        .then(|| state.personal_session_execution_root_path(&session_id));
     let browser_annotation_refs = match resolve_browser_annotation_context(
         state,
         &session_id,
@@ -715,6 +943,7 @@ async fn execute_dispatch_submission(
     let action_task_title = format_action_task_title(&mission_title);
 
     let dispatch = DispatchSubmissionRequest {
+        project_directories: request.project_directories.clone(),
         accepted_at,
         session_id: session_id.clone(),
         workspace_id: workspace_id.clone(),
@@ -1515,6 +1744,238 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_directory_binding_survives_acceptance_reload_and_primary_change() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("a");
+        let second = root.path().join("b");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(source.join("same.txt"), "original").unwrap();
+        std::fs::write(second.join("same.txt"), "other").unwrap();
+        let source = std::fs::canonicalize(source).unwrap();
+        let second = std::fs::canonicalize(second).unwrap();
+        let tasks = Arc::new(TaskStore::new());
+        let state = test_state().with_task_store(tasks.clone());
+        let workspace_id = WorkspaceId::new("frozen-project");
+        let project = state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), source.clone())
+            .unwrap();
+        let binding = state
+            .workspace_registry
+            .capture_directory_binding(&workspace_id, None, None)
+            .unwrap();
+        let session = SessionId::new("frozen-session");
+        state
+            .session_store
+            .create_session_for_workspace(session.clone(), "frozen", Some(workspace_id.to_string()))
+            .unwrap();
+        let queued_session = SessionId::new("frozen-queued-session");
+        state
+            .session_store
+            .create_session_for_workspace(
+                queued_session.clone(),
+                "queue",
+                Some(workspace_id.to_string()),
+            )
+            .unwrap();
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &state.session_store,
+            state.turn_coordinator(),
+            &queued_session,
+            "busy-turn",
+            1,
+            UtcMillis::now(),
+            "running",
+            "busy",
+        );
+        let queued_request: crate::dto::SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "sessionId": queued_session, "scope": "workspace", "workspaceId": workspace_id,
+            "text": "queued", "requestId": "frozen-queue-request", "userMessageId": "frozen-queue-user"
+        })).unwrap();
+        let queued_response = crate::turn_service::TurnService::new(state.clone())
+            .submit(queued_request.clone())
+            .await
+            .unwrap();
+        assert!(queued_response.queued);
+        let queued = state
+            .peek_next_regular_session_turn(&queued_session)
+            .unwrap();
+        assert_eq!(queued.project_directories.as_ref(), Some(&binding));
+        let request: DispatchSubmissionRequest = serde_json::from_value(serde_json::json!({
+            "accepted_at": UtcMillis::now(), "session_id": session, "workspace_id": workspace_id,
+            "project_directories": binding, "execution_root": second,
+            "entry_id": "frozen-input", "timeline_message": "inspect", "created_session": false,
+            "mission_title": "inspect", "task_title": "inspect", "trimmed_text": "inspect",
+            "execution_goal": "inspect", "task_tier": magi_core::TaskTier::ExecutionChain,
+            "context_references": [], "browser_annotation_refs": [], "browser_node_selections": [],
+            "plugin_selections": [], "goal_mode": false, "target_role": "coordinator",
+            "required_tool_chain": [], "completion_contract": magi_core::TaskCompletionContract::default(),
+            "denied_tools": [], "user_message_metadata": {},
+            "turn_origin": magi_conversation_runtime::dispatch_submission::DispatchTurnOrigin::User
+        })).unwrap();
+        let accepted = super::submit_dispatch_submission(&state, request).unwrap();
+        assert_eq!(accepted.request.execution_root.as_ref(), Some(&source));
+        let mut other = project.primary_source_folder().clone();
+        let host = magi_core::HostPath::from_path(second);
+        other.source_folder_id = "other".into();
+        other.path = AbsolutePath::new(host.display_string());
+        other.path_ref = host.to_path_ref().as_str().into();
+        let mut members = project.source_folders;
+        members.push(other.clone());
+        state
+            .workspace_registry
+            .edit_project(
+                &workspace_id,
+                1,
+                magi_workspace::WorkspaceProjectEdit {
+                    name: Some("renamed".into()),
+                    source_folders: members,
+                    primary_source_folder_id: "other".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            super::bound_project_execution_root(&state, &session, &binding).unwrap(),
+            source,
+            "主线和独立代理继续使用原绑定，不能随主要源目录切换"
+        );
+        assert!(
+            super::validate_or_migrate_directory_binding(&state, Some(&workspace_id), None)
+                .is_err()
+        );
+        let replay = crate::turn_service::TurnService::new(state.clone())
+            .submit(queued_request)
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(
+            state
+                .peek_next_regular_session_turn(&queued_session)
+                .unwrap()
+                .project_directories
+                .as_ref(),
+            Some(&binding)
+        );
+        let recovered =
+            magi_conversation_runtime::dispatch_submission::recover_dispatch_submission_request(
+                &state.session_store.runtime_sidecar(&session).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(recovered.project_directories.as_ref(), Some(&binding));
+        assert_eq!(recovered.execution_root.as_ref(), Some(&source));
+        let projection = root.path().join("tasks");
+        TaskStore::checkpoint_snapshot_to_projection_directory(&tasks.snapshot(), &projection)
+            .unwrap();
+        let restored = TaskStore::restore_from_projection_directory(&projection)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored
+                .get_task(&accepted.root_task_id)
+                .unwrap()
+                .executor_binding
+                .unwrap()
+                .project_directories
+                .as_ref(),
+            Some(&binding)
+        );
+        let prepare = super::workspace_execution_preparer(&state);
+        let session_to_prepare = session.clone();
+        let workspace_to_prepare = workspace_id.clone();
+        let frozen = binding.clone();
+        let resources = tokio::task::spawn_blocking(move || {
+            prepare(
+                &session_to_prepare,
+                &Some(workspace_to_prepare),
+                &accepted.turn_id,
+                Some(&frozen),
+                magi_conversation_runtime::workspace_execution::WorkspacePreparationMode::Execution,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let directory = resources.directories.as_ref().unwrap().root(None).unwrap();
+        assert_eq!(directory.source_root().unwrap(), source);
+        let expected_execution = state
+            .session_execution_root_for_source(&session, &source)
+            .unwrap();
+        assert_eq!(
+            super::bound_project_execution_root(&state, &session, &binding).unwrap(),
+            expected_execution,
+            "续跑必须使用已建立的原会话执行副本"
+        );
+        let snapshot = resources.snapshots.into_iter().next().unwrap();
+        assert_eq!(
+            snapshot.workspace_root(),
+            std::fs::canonicalize(expected_execution).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(snapshot.workspace_root().join("same.txt")).unwrap(),
+            "original"
+        );
+        let goal = state
+            .session_store
+            .create_goal(
+                session.clone(),
+                state
+                    .session_store
+                    .ensure_session_mission(&session, UtcMillis::now(), || {
+                        MissionId::new("goal-binding-test")
+                    })
+                    .1,
+                accepted.root_task_id.as_str(),
+                "continue original source",
+                magi_core::AccessProfile::Restricted,
+            )
+            .unwrap();
+        assert_eq!(
+            super::goal_directory_binding(&state, &goal)
+                .unwrap()
+                .as_ref(),
+            Some(&binding)
+        );
+        tasks.remove_task(&accepted.root_task_id).unwrap();
+        assert_eq!(
+            super::goal_directory_binding(&state, &goal)
+                .unwrap()
+                .as_ref(),
+            Some(&binding),
+            "原 Task 已被清理时仍从原 canonical 请求恢复，不能从当前项目默认值推导"
+        );
+        state
+            .workspace_registry
+            .edit_project(
+                &workspace_id,
+                2,
+                magi_workspace::WorkspaceProjectEdit {
+                    name: None,
+                    source_folders: vec![other],
+                    primary_source_folder_id: "other".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(super::bound_project_execution_root(&state, &session, &binding).is_err());
+        assert!(
+            super::validate_or_migrate_directory_binding(
+                &state,
+                Some(&workspace_id),
+                Some(binding)
+            )
+            .is_err()
+        );
+        assert!(
+            super::validate_or_migrate_directory_binding(&state, Some(&workspace_id), None)
+                .is_err(),
+            "目录更换后即使只剩一个成员，也不能把旧无绑定任务迁到新目录"
+        );
+        state.cleanup_session_isolation(&session).await;
+    }
+
+    #[tokio::test]
     async fn workflow_acceptance_freezes_the_host_package_in_task_and_pending_request() {
         let root = tempfile::tempdir().unwrap();
         let package = magi_plugin_system::PluginPackage::from_manifest_and_source(
@@ -1826,6 +2287,7 @@ mod tests {
         let state = test_state().with_task_store(task_store.clone());
         let accepted = DispatchSubmissionAccepted {
             request: DispatchSubmissionRequest {
+                project_directories: None,
                 accepted_at: now,
                 session_id: SessionId::new("session-dispatch-direct-error"),
                 workspace_id: None,

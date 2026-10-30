@@ -33,7 +33,9 @@ pub(crate) fn session_turn_queue_response(
         .enumerate()
         .map(|(index, queued)| {
             let text = queued.request.trimmed_text();
-            let guide = session_turn_guide_capability(state, session_id, &queued.request);
+            let mut guide_request = queued.request.clone();
+            guide_request.project_directories = queued.project_directories.clone();
+            let guide = session_turn_guide_capability(state, session_id, &guide_request);
             let interruption_error = inputs
                 .iter()
                 .find(|input| input.input_id == queued.queue_id)
@@ -54,6 +56,7 @@ pub(crate) fn session_turn_queue_response(
                     .as_ref()
                     .map(ToString::to_string),
                 workspace_path: queued.request.workspace_path.clone(),
+                source_folder_id: queued.request.source_folder_id.clone(),
                 accepted_at: queued.accepted_at.0,
                 content: queued.request.timeline_content(text.as_deref()),
                 text,
@@ -212,6 +215,7 @@ pub(crate) async fn update_session_turn_queue_item(
     )?;
     if original_scope != replacement_scope
         || replacement.requested_session_id().as_ref() != Some(&session_id)
+        || replacement.source_folder_id != queued.request.source_folder_id
         || replacement.resume
         || replacement.steer_current_turn
         || replacement.expected_turn_id.is_some()
@@ -244,6 +248,10 @@ pub(crate) async fn update_session_turn_queue_item(
     candidate
         .validate_context_references()
         .map_err(ApiError::InvalidInput)?;
+    crate::task_dispatch::validate_project_context_references(
+        candidate.project_directories.as_ref(),
+        &candidate.context_references(),
+    )?;
     candidate
         .validate_browser_node_selections()
         .map_err(ApiError::InvalidInput)?;
@@ -453,6 +461,7 @@ pub(crate) async fn guide_session_turn_queue_item(
             ));
         }
         let mut steer_request = queued.request.clone();
+        steer_request.project_directories = queued.project_directories.clone();
         steer_request.session_id = Some(session_id.to_string());
         steer_request.workspace_id = scope.workspace_id().as_ref().map(ToString::to_string);
         steer_request.steer_current_turn = true;

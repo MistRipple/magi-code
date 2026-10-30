@@ -2334,6 +2334,8 @@ mod tests {
 
     fn session_turn_request(text: &str) -> SessionTurnRequestDto {
         SessionTurnRequestDto {
+            source_folder_id: None,
+            project_directories: None,
             desktop_browser_tools_allowed: true,
             session_id: None,
             scope: crate::dto::SessionScopeKindDto::Personal,
@@ -2587,6 +2589,7 @@ mod tests {
         request.user_message_id = Some(format!("user-{queue_id}"));
         request.placeholder_message_id = Some(format!("assistant-{queue_id}"));
         QueuedRegularSessionTurn {
+            project_directories: None,
             request,
             request_fingerprint: None,
             requested_workspace_id: Some(workspace_id.clone()),
@@ -4515,7 +4518,13 @@ mod tests {
         let prepare_session = session_id.clone();
         let turn_id = body["turnId"].as_str().unwrap().to_owned();
         let error = tokio::task::spawn_blocking(move || {
-            prepare(&prepare_session, &Some(workspace_id), &turn_id)
+            prepare(
+                &prepare_session,
+                &Some(workspace_id),
+                &turn_id,
+                None,
+                magi_conversation_runtime::workspace_execution::WorkspacePreparationMode::Execution,
+            )
         })
         .await
         .unwrap()
@@ -5383,7 +5392,13 @@ mod tests {
         let prepare_session = session_id.clone();
         let turn_id = body["turnId"].as_str().unwrap().to_owned();
         tokio::task::spawn_blocking(move || {
-            prepare(&prepare_session, &Some(workspace_id), &turn_id)
+            prepare(
+                &prepare_session,
+                &Some(workspace_id),
+                &turn_id,
+                None,
+                magi_conversation_runtime::workspace_execution::WorkspacePreparationMode::Execution,
+            )
         })
         .await
         .unwrap()
@@ -7325,6 +7340,7 @@ mod tests {
             .unwrap();
         state
             .enqueue_regular_session_turn(QueuedRegularSessionTurn {
+                project_directories: None,
                 request: session_turn_request("排队消息"),
                 request_fingerprint: None,
                 requested_workspace_id: Some(workspace_id.clone()),

@@ -97,6 +97,7 @@
   let editTtl = $state('');
 
   const workspaces = $derived(composerWorkspaceState.workspaces);
+  const selectedWorkspace = $derived(workspaces.find((workspace) => workspace.workspaceId === workspaceId));
   const hasNetworkToken = $derived(
     (status?.tokens ?? []).some((token) => token.network && token.state === 'active'),
   );
@@ -159,7 +160,8 @@
   const canCreate = $derived(
     !busy
       && clientName.trim() !== ''
-      && workspaceId !== '',
+      && Boolean(selectedWorkspace?.primarySourceFolderId)
+      && Boolean(selectedWorkspace?.sourceFolders?.length),
   );
 
   function messageOf(error: unknown): string {
@@ -208,10 +210,16 @@
   }
 
   function createToken(): Promise<void> {
+    const workspace = selectedWorkspace;
+    if (!canCreate || !workspace?.primarySourceFolderId || !workspace.sourceFolders?.length) return Promise.resolve();
+    const sourceFolderIds = workspace.sourceFolders.map((folder) => folder.sourceFolderId);
+    const sourceFolderId = workspace.primarySourceFolderId;
     return act(async () => {
       const created = await createMcpServerToken({
         clientName: clientName.trim(),
-        workspaceId,
+        workspaceId: workspace.workspaceId,
+        sourceFolderIds,
+        sourceFolderId,
         approvalMode,
         ttlDays,
         allowNetwork: allowNetwork ? true : undefined,
@@ -521,12 +529,26 @@
   });
 </script>
 
-{#snippet workspaceBinding(id: string, showHint = true)}
+{#snippet workspaceBinding(id: string, token: McpServerToken | null = null, showHint = true)}
   {@const workspace = workspaces.find((entry) => entry.workspaceId === id)}
+  {@const folderIds = token ? token.sourceFolderIds : (workspace?.sourceFolders ?? []).map((folder) => folder.sourceFolderId)}
+  {@const defaultId = token ? token.defaultSourceFolderId : workspace?.primarySourceFolderId}
   <p class="meta ui-meta" data-mcp-bound-workspace={id}>
     <span>{i18n.t('mcpServer.token.boundWorkspace', { workspace: workspaceName(id) })}</span>
-    <code>{workspace?.rootPath ?? i18n.t('mcpServer.token.workspaceUnavailable')}</code>
   </p>
+  <div class="meta" data-mcp-bound-folders={token?.tokenId ?? 'new'}>
+    {#each folderIds as folderId (folderId)}
+      {@const folder = workspace?.sourceFolders?.find((entry) => entry.sourceFolderId === folderId)}
+      <p class="meta ui-meta" data-mcp-bound-folder={folderId}>
+        {#if folder?.name}<span>{folder.name}</span>{/if}
+        <code>{folder?.path ?? folderId}</code>
+        {#if folderId === defaultId}<span>{i18n.t('mcpServer.token.defaultFolder')}</span>{/if}
+        {#if !folder}<span>{i18n.t('mcpServer.token.folderUnavailable')}</span>{/if}
+      </p>
+    {:else}
+      <p class="meta">{i18n.t('mcpServer.token.folderUnavailable')}</p>
+    {/each}
+  </div>
   {#if showHint}<p class="meta">{i18n.t('mcpServer.token.workspaceFixedHint')}</p>{/if}
 {/snippet}
 
@@ -655,7 +677,7 @@
             <SelectField bind:value={quickAddTokenId} data-mcp-quick-add-token="1" label={i18n.t('mcpServer.quickAdd.token')}
               options={remoteTokens.map(token => ({ value: token.tokenId, label: `${token.clientName}: ${workspaceName(token.workspaceId)}: ${token.prefix}…` }))} />
           </div>
-          {#if quickAddToken}{@render workspaceBinding(quickAddToken.workspaceId)}{/if}
+          {#if quickAddToken}{@render workspaceBinding(quickAddToken.workspaceId, quickAddToken)}{/if}
           {#if quickAddToken && !quickAddToken.hasSecret}
             <p class="meta" data-mcp-quick-add-no-secret="1">{i18n.t('mcpServer.snippets.noSecretHint')}</p>
           {:else if quickAddSnippets?.remoteJson}
@@ -842,7 +864,7 @@
               {#if !token.workspaceAvailable}
                 <p class="meta">{i18n.t('mcpServer.token.workspaceRestoreHint')}</p>
               {/if}
-              {@render workspaceBinding(token.workspaceId, false)}
+              {@render workspaceBinding(token.workspaceId, token, false)}
               <span class="meta ui-meta">
                 <span>{token.expiresAtMs === null ? i18n.t('mcpServer.token.neverExpires') : i18n.t('mcpServer.token.expiresAt', { time: formatTime(token.expiresAtMs) })}</span>
                 <span>{token.lastUsedAtMs === null ? i18n.t('mcpServer.token.neverUsed') : i18n.t('mcpServer.token.lastUsed', { time: formatTime(token.lastUsedAtMs) })}</span>
@@ -867,7 +889,7 @@
           </li>
           {#if viewingTokenId === token.tokenId}
             <li class="detail" data-mcp-token-detail={token.tokenId}>
-              {@render workspaceBinding(token.workspaceId, false)}
+              {@render workspaceBinding(token.workspaceId, token, false)}
               {#if viewingSecret}
                 <div class="snippet-head">
                   <span class="settings-row-title">{i18n.t('mcpServer.token.secret')}</span>
@@ -963,7 +985,7 @@
         <span>{i18n.t('mcpServer.token.workspace')}</span>
         <SelectField bind:value={workspaceId} data-mcp-workspace="1" disabled={workspaces.length === 0}
           label={i18n.t('mcpServer.token.workspace')}
-          options={workspaces.length ? workspaces.map(workspace => ({ value: workspace.workspaceId, label: `${workspace.name}: ${workspace.rootPath}` })) : [{ value: '', label: i18n.t('mcpServer.token.workspaceEmpty') }]} />
+          options={workspaces.length ? workspaces.map(workspace => ({ value: workspace.workspaceId, label: workspace.name })) : [{ value: '', label: i18n.t('mcpServer.token.workspaceEmpty') }]} />
       </div>
       {#if workspaceId}{@render workspaceBinding(workspaceId)}{/if}
       <div class="field">
@@ -1010,7 +1032,7 @@
           label={i18n.t('mcpServer.snippets.useToken')}
           options={[{ value: '', label: i18n.t('mcpServer.snippets.placeholderOption') }, ...connectTokens.map(token => ({ value: token.tokenId, label: `${token.clientName}: ${workspaceName(token.workspaceId)}: ${token.prefix}…${token.hasSecret ? '' : ` (${i18n.t('mcpServer.snippets.noSecretOption')})`}`, disabled: !token.hasSecret }))]} />
       </div>
-      {#if connectToken}{@render workspaceBinding(connectToken.workspaceId)}{/if}
+      {#if connectToken}{@render workspaceBinding(connectToken.workspaceId, connectToken)}{/if}
       {#if connectTokens.some((token) => !token.hasSecret)}
         <p class="meta">{i18n.t('mcpServer.snippets.noSecretHint')}</p>
       {/if}

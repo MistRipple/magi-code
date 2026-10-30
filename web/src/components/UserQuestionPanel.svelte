@@ -228,14 +228,14 @@
     <span class="uq-keyhint dock-meta">{i18n.t('userQuestion.keyHint')}</span>
     <span class="uq-spacer"></span>
     {#if pending.canSkip !== false}
-    <button type="button" class="uq-button dock-btn" disabled={submitting} onclick={() => void skip()}>
+    <button type="button" class="uq-button btn btn--secondary btn--sm" disabled={submitting} onclick={() => void skip()}>
       {i18n.t('userQuestion.skip')}
     </button>
     {/if}
     {#if !isLast}
       <button
         type="button"
-        class="uq-button dock-btn dock-btn--primary"
+        class="uq-button btn btn--primary btn--sm"
         disabled={submitting || !isUserQuestionAnswered(draft)}
         onclick={advance}
       >
@@ -244,7 +244,7 @@
     {:else}
       <button
         type="button"
-        class="uq-button dock-btn dock-btn--primary"
+        class="uq-button btn btn--primary btn--sm"
         disabled={submitting || !allAnswered}
         onclick={() => void submit()}
       >

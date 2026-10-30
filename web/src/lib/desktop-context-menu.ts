@@ -50,6 +50,7 @@ async function resolveRevealTarget(
       workspaceId: context.fileScope.workspaceId?.trim() || '',
       workspacePath: context.fileScope.workspacePath?.trim() || '',
       sessionId: context.fileScope.sessionId?.trim() || undefined,
+      sourceFolderId: context.fileScope.sourceFolderId?.trim() || undefined,
     }, controller.signal);
   } catch {
     return null;

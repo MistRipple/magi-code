@@ -5,6 +5,152 @@ use crate::{
     KnowledgeRecord, KnowledgeRelation, KnowledgeStore,
     code_scanner::{CodeIndexFile, CodeIndexScanStatus, CodeIndexSummary},
 };
+
+#[test]
+fn source_folder_indexes_keep_same_paths_and_execution_copies_separate() {
+    let fixture = std::env::temp_dir().join(format!(
+        "magi-source-index-{}-{}",
+        std::process::id(),
+        UtcMillis::now().0
+    ));
+    let roots = ["a", "b", "copy"].map(|name| fixture.join(name));
+    for (root, symbol) in roots.iter().zip([
+        "authenticateAccountAlpha",
+        "authenticateAccountBeta",
+        "authenticateAccountCopy",
+    ]) {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/index.ts"),
+            format!("export function {symbol}() {{ return true; }}\n"),
+        )
+        .unwrap();
+    }
+    let store = KnowledgeStore::new();
+    let project = WorkspaceId::new("project-source-index");
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "shared-auth".into(),
+        kind: KnowledgeKind::Adr,
+        title: "Authenticate account".into(),
+        content: "Authenticate account rules".into(),
+        tags: vec![],
+        workspace_id: Some(project.clone()),
+        source_ref: None,
+        created_at: UtcMillis(1),
+        updated_at: UtcMillis(1),
+    });
+    let views = [
+        store.for_source_folder("a", &roots[0]).unwrap(),
+        store.for_source_folder("b", &roots[1]).unwrap(),
+        store.for_source_folder("a", &roots[2]).unwrap(),
+    ];
+    for (view, root) in views.iter().zip(&roots) {
+        view.build_workspace_index(&project, root);
+    }
+    for (view, expected) in views.iter().zip([
+        "authenticateAccountAlpha",
+        "authenticateAccountBeta",
+        "authenticateAccountCopy",
+    ]) {
+        let symbols = view.list_file_symbols(&project, "src/index.ts").unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, expected);
+        assert!(view.workspace_index_available(&project));
+        let records = view.governed_query(&KnowledgeQuery {
+            kind: Some(KnowledgeKind::CodeIndex),
+            text: None,
+            tags: vec![],
+            workspace_id: Some(project.clone()),
+            limit: 10,
+        });
+        assert_eq!(records.results.len(), 1);
+        assert_eq!(
+            records.results[0]
+                .code_source
+                .as_ref()
+                .unwrap()
+                .code_scope
+                .as_ref(),
+            view.code_index_scope()
+        );
+        assert!(!view.list_relations(&project).is_empty());
+    }
+    assert_eq!(
+        store
+            .governed_query(&KnowledgeQuery {
+                kind: Some(KnowledgeKind::CodeIndex),
+                text: None,
+                tags: vec![],
+                workspace_id: Some(project.clone()),
+                limit: 10
+            })
+            .total_matches,
+        0
+    );
+    let graphs = views
+        .iter()
+        .map(|view| {
+            view.query_workspace_graph(&project, &crate::GraphQuery::default())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let file_ids = graphs
+        .iter()
+        .map(|graph| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.path.as_deref() == Some("src/index.ts")
+                        && node.kind == crate::GraphNodeKind::File
+                })
+                .unwrap()
+                .id
+                .clone()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(file_ids.len(), 3);
+    for (graph, view) in graphs.iter().zip(&views) {
+        for relation in view.list_relations(&project) {
+            assert!(
+                graph
+                    .edges
+                    .iter()
+                    .any(|edge| edge.id == relation.relation_id)
+            );
+        }
+    }
+    let restored = KnowledgeStore::from_state(store.export_state());
+    for (view, root) in views.iter().zip(&roots) {
+        let reloaded = restored
+            .for_source_folder(&view.code_index_scope().unwrap().source_folder_id, root)
+            .unwrap();
+        assert_eq!(
+            reloaded
+                .code_index_summary_for_workspace(&project)
+                .unwrap()
+                .files[0]
+                .path,
+            "src/index.ts"
+        );
+        assert_eq!(
+            reloaded.list_relations(&project).len(),
+            view.list_relations(&project).len()
+        );
+    }
+    // 重用一个 view 不能把它指向另一目录；失败不能清除其它执行副本的索引。
+    assert_eq!(
+        views[0].build_workspace_index(&project, &roots[1]).status,
+        crate::code_scanner::CodeIndexScanStatus::Failed
+    );
+    assert!(views[1].workspace_index_available(&project));
+    assert!(views[2].workspace_index_available(&project));
+    store.clear_workspace(&project);
+    for view in &views {
+        assert!(!view.workspace_index_available(&project));
+    }
+    std::fs::remove_dir_all(fixture).unwrap();
+}
 use magi_core::{UtcMillis, WorkspaceId};
 
 #[test]
@@ -28,6 +174,7 @@ fn knowledge_revision_changes_when_knowledge_and_relations_change() {
     assert!(after_knowledge > 0);
 
     let relation = KnowledgeRelation {
+        code_scope: None,
         relation_id: "revision-relation".into(),
         workspace_id: workspace_id.clone(),
         source: GraphNodeRef::Knowledge {
@@ -79,6 +226,7 @@ fn knowledge_relations_are_workspace_scoped_persisted_and_cascaded() {
         updated_at: UtcMillis(1),
     });
     let relation = KnowledgeRelation {
+        code_scope: None,
         relation_id: "relation-persisted".into(),
         workspace_id: workspace_id.clone(),
         source: GraphNodeRef::Knowledge {
@@ -131,6 +279,7 @@ fn knowledge_relations_reject_cross_workspace_and_invalid_confidence() {
         });
     }
     let base = KnowledgeRelation {
+        code_scope: None,
         relation_id: "relation-invalid".into(),
         workspace_id: workspace_a.clone(),
         source: GraphNodeRef::Knowledge {
@@ -472,6 +621,7 @@ fn inferred_relation_requires_review_before_activation() {
         updated_at: UtcMillis(1),
     });
     let relation = KnowledgeRelation {
+        code_scope: None,
         relation_id: "inferred-review-invalid".into(),
         workspace_id: workspace_id.clone(),
         source: GraphNodeRef::Knowledge {
@@ -845,6 +995,7 @@ fn sample_code_index(knowledge_id: &str) -> CodeIndexIngestion {
         source_ref: Some("src/query.rs#execute".to_string()),
         updated_at: UtcMillis(100),
         source: CodeIndexSource {
+            code_scope: None,
             path: "crates/magi-knowledge-store/src/query.rs".to_string(),
             language: Some("Rust".to_string()),
             repo_ref: Some("magi-rust-rewrite".to_string()),
@@ -1099,6 +1250,7 @@ fn project_code_index_summary(path: &str, updated_at: UtcMillis) -> CodeIndexIng
         source_ref: Some(path.to_string()),
         updated_at,
         source: CodeIndexSource {
+            code_scope: None,
             path: path.to_string(),
             language: Some("Rust".to_string()),
             repo_ref: None,
@@ -1500,6 +1652,7 @@ fn watcher_file_deletion_projects_knowledge_relation_as_dangling() {
     });
     store
         .upsert_relation(KnowledgeRelation {
+            code_scope: None,
             relation_id: "relation-graph-dangling".into(),
             workspace_id: workspace_id.clone(),
             source: GraphNodeRef::Knowledge {

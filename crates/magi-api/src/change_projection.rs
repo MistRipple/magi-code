@@ -19,6 +19,7 @@ pub(crate) struct SessionChangeScope {
     pub session_id: SessionId,
     pub workspace_id: WorkspaceId,
     pub workspace_root: PathBuf,
+    pub source_folder_id: String,
     pub execution_group_id: String,
     pub contributors: Vec<String>,
 }
@@ -27,6 +28,7 @@ pub(crate) struct SessionChangeScope {
 pub(crate) struct WorkspaceChangeScope {
     pub workspace_id: WorkspaceId,
     pub workspace_root: PathBuf,
+    pub source_folder_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -57,6 +59,7 @@ pub struct PendingChangeDto {
     pub session_id: String,
     pub workspace_id: String,
     pub workspace_path: String,
+    pub source_folder_id: String,
     pub file_path: String,
     pub snapshot_id: String,
     pub updated_at: UtcMillis,
@@ -103,6 +106,7 @@ pub(crate) fn resolve_session_change_scope(
     session_id: &SessionId,
     workspace_id: Option<&str>,
     execution_group_id_override: Option<&str>,
+    source_folder_id: Option<&str>,
 ) -> Result<SessionChangeScope, ApiError> {
     let session = state
         .session_store
@@ -143,7 +147,14 @@ pub(crate) fn resolve_session_change_scope(
         })
         .expect("session execution group must always have a stable id");
 
-    let workspace_root = resolve_workspace_root(state, &bound_workspace_id)?;
+    let directory = crate::scope_binding::resolve_project_source_directory(
+        state,
+        &bound_workspace_id,
+        Some(session_id),
+        source_folder_id,
+    )?;
+    let workspace_root = directory.execution_root;
+    let source_folder_id = directory.source_folder_id;
     let contributors = state
         .session_store
         .runtime_sidecar(session_id)
@@ -171,6 +182,7 @@ pub(crate) fn resolve_session_change_scope(
         session_id: session_id.clone(),
         workspace_id: bound_workspace_id,
         workspace_root,
+        source_folder_id,
         execution_group_id,
         contributors,
     })
@@ -179,11 +191,18 @@ pub(crate) fn resolve_session_change_scope(
 pub(crate) fn resolve_workspace_change_scope(
     state: &ApiState,
     workspace_id: &WorkspaceId,
+    source_folder_id: Option<&str>,
 ) -> Result<WorkspaceChangeScope, ApiError> {
-    let workspace_root = resolve_workspace_root(state, workspace_id)?;
+    let directory = crate::scope_binding::resolve_project_source_directory(
+        state,
+        workspace_id,
+        None,
+        source_folder_id,
+    )?;
     Ok(WorkspaceChangeScope {
         workspace_id: workspace_id.clone(),
-        workspace_root,
+        workspace_root: directory.execution_root,
+        source_folder_id: directory.source_folder_id,
     })
 }
 
@@ -231,7 +250,7 @@ pub(crate) fn collect_session_pending_changes_with_state(
             ),
         });
     };
-    let Some(workspace_root) = state.workspace_root_path(&Some(bound_workspace_id.clone())) else {
+    let Some(project) = state.workspace_registry.project(&bound_workspace_id) else {
         return Ok(SessionPendingChangesProjection {
             pending_changes: Vec::new(),
             state: pending_changes_state(
@@ -244,68 +263,58 @@ pub(crate) fn collect_session_pending_changes_with_state(
             ),
         });
     };
-    if state
-        .snapshot_session(session_id, &workspace_root)
-        .is_none()
-    {
-        return Ok(SessionPendingChangesProjection {
-            pending_changes: Vec::new(),
-            state: pending_changes_state(
-                "not_ready",
-                Some(session_id),
-                Some(&bound_workspace_id),
-                Some(&workspace_root),
-                0,
-                Some("changes_preparing"),
+    let mut changes = Vec::new();
+    let mut status = "ready";
+    for folder in &project.source_folders {
+        let scope = match resolve_session_change_scope(
+            state,
+            session_id,
+            workspace_id,
+            None,
+            Some(&folder.source_folder_id),
+        ) {
+            Ok(scope) => scope,
+            Err(_) => {
+                status = "error";
+                continue;
+            }
+        };
+        let Some(snapshot) = state.snapshot_session(session_id, &scope.workspace_root) else {
+            if status != "error" {
+                status = "not_ready";
+            }
+            continue;
+        };
+        match snapshot.pending_changes() {
+            Ok(pending) => changes.extend(
+                pending
+                    .into_iter()
+                    .map(|change| convert_pending(&scope, change)),
             ),
-        });
-    }
-    let scope = resolve_session_change_scope(state, session_id, workspace_id, None)?;
-    let Some(snapshot_session) = state.snapshot_session(&scope.session_id, &scope.workspace_root)
-    else {
-        return Ok(SessionPendingChangesProjection {
-            pending_changes: Vec::new(),
-            state: pending_changes_state(
-                "not_ready",
-                Some(&scope.session_id),
-                Some(&scope.workspace_id),
-                Some(&scope.workspace_root),
-                0,
-                Some("changes_preparing"),
-            ),
-        });
-    };
-    let pending = match snapshot_session.pending_changes() {
-        Ok(pending) => pending,
-        Err(_) => {
-            return Ok(SessionPendingChangesProjection {
-                pending_changes: Vec::new(),
-                state: pending_changes_state(
-                    "error",
-                    Some(&scope.session_id),
-                    Some(&scope.workspace_id),
-                    Some(&scope.workspace_root),
-                    0,
-                    Some("changes_unavailable"),
-                ),
-            });
+            Err(_) => status = "error",
         }
-    };
-    let mut pending_changes = pending
-        .into_iter()
-        .map(|change| convert_pending(&scope, change))
-        .collect::<Vec<_>>();
-    pending_changes.sort_by(|left, right| left.file_path.cmp(&right.file_path));
+    }
+    changes.sort_by(|left, right| {
+        left.source_folder_id
+            .cmp(&right.source_folder_id)
+            .then_with(|| left.file_path.cmp(&right.file_path))
+    });
     Ok(SessionPendingChangesProjection {
         state: pending_changes_state(
-            "ready",
-            Some(&scope.session_id),
-            Some(&scope.workspace_id),
-            Some(&scope.workspace_root),
-            pending_changes.len(),
-            None,
+            status,
+            Some(session_id),
+            Some(&bound_workspace_id),
+            (project.source_folders.len() == 1)
+                .then(|| project.native_root_path())
+                .as_deref(),
+            changes.len(),
+            match status {
+                "error" => Some("changes_unavailable"),
+                "not_ready" => Some("changes_preparing"),
+                _ => None,
+            },
         ),
-        pending_changes,
+        pending_changes: changes,
     })
 }
 
@@ -329,8 +338,15 @@ fn convert_pending(scope: &SessionChangeScope, change: PendingChange) -> Pending
         session_id: scope.session_id.as_str().to_string(),
         workspace_id: scope.workspace_id.as_str().to_string(),
         workspace_path: scope.workspace_root.to_string_lossy().to_string(),
+        source_folder_id: scope.source_folder_id.clone(),
         file_path: change.path.clone(),
-        snapshot_id: format!("{}:{}", execution_group_id, change.path),
+        snapshot_id: serde_json::to_string(&(
+            scope.session_id.as_str(),
+            &execution_group_id,
+            &scope.source_folder_id,
+            &change.path,
+        ))
+        .expect("snapshot identity serializes"),
         updated_at: UtcMillis(change.timestamp_ms),
         r#type,
         additions,
@@ -499,18 +515,6 @@ fn path_access_error(context: &'static str, path: &Path, error: impl Display) ->
         "workspace path access failed"
     );
     ApiError::InvalidInput("路径不可读取或不存在".to_string())
-}
-
-fn resolve_workspace_root(
-    state: &ApiState,
-    workspace_id: &WorkspaceId,
-) -> Result<PathBuf, ApiError> {
-    let workspaces = state.workspace_registry.workspaces();
-    let workspace = workspaces
-        .iter()
-        .find(|workspace| workspace.workspace_id == *workspace_id)
-        .ok_or_else(|| ApiError::not_found("workspace 不存在", workspace_id.as_str()))?;
-    Ok(workspace.native_root_path())
 }
 
 fn session_execution_group_id(session_id: &SessionId) -> String {
@@ -766,6 +770,7 @@ mod tests {
             session_id: SessionId::new("session-change-error"),
             workspace_id: WorkspaceId::new("workspace-change-error"),
             workspace_root: unique_temp_dir("magi-change-projection-error"),
+            source_folder_id: "test-source".into(),
             execution_group_id: "execution-error".to_string(),
             contributors: Vec::new(),
         };
@@ -806,6 +811,7 @@ mod tests {
             session_id: SessionId::new("session-change-summary"),
             workspace_id: WorkspaceId::new("workspace-change-summary"),
             workspace_root: unique_temp_dir("magi-change-projection-summary"),
+            source_folder_id: "test-source".into(),
             execution_group_id: "execution-summary".to_string(),
             contributors: Vec::new(),
         };

@@ -635,6 +635,10 @@ mod tests {
                 if seq == 1 {
                     item.kind = CanonicalTurnItemKind::UserMessage;
                     item.tool = None;
+                    item.metadata.insert(
+                        "projectDirectories".into(),
+                        json!({"defaultSourceFolderId":"original-source"}),
+                    );
                 }
                 item
             })
@@ -644,6 +648,11 @@ mod tests {
 
         assert_eq!(public.items.len(), HISTORY_TURN_ITEM_WINDOW + 1);
         assert_eq!(public.items[0].item_id, "item-0001", "用户消息必须始终保留");
+        assert_eq!(
+            public.items[0].metadata["projectDirectories"]["defaultSourceFolderId"],
+            "original-source",
+            "分页必须保留原目录绑定，不能让工具预览猜当前主要目录"
+        );
         assert_eq!(public.items.last().unwrap().item_id, "item-0400");
         let first_windowed = 400 - HISTORY_TURN_ITEM_WINDOW + 1;
         assert_eq!(public.items[1].item_seq, first_windowed);

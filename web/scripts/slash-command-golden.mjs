@@ -137,6 +137,14 @@ await withGoldenViteServer(async (server) => {
     [{ kind: 'file', path: '/Users/xie/code/TEST/README.md', name: 'README.md' }],
     'transport payload must exclude frontend-only identity fields',
   );
+  let scopedReferences = [];
+  for (const sourceFolderId of ['a', 'b', 'a']) {
+    scopedReferences = contextReferences.addComposerContextReference(scopedReferences, {
+      kind: 'file', path: 'src/index.ts', name: 'index.ts', sourceFolderId,
+    });
+  }
+  assert.equal(scopedReferences.length, 2, '同名相对文件只在同一源目录内去重');
+  assert.deepEqual(contextReferences.toSessionContextReferencePayload(scopedReferences).map((item) => item.sourceFolderId), ['a', 'b']);
 
   console.log('slash command golden replay passed');
 }, { configFile: 'vite.web.config.ts' });

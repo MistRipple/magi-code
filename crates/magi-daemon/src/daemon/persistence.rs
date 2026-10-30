@@ -1,3 +1,5 @@
+mod project_migration;
+
 use super::config::DaemonError;
 use super::session_event_log::SessionConversationProjection;
 use magi_core::{DomainError, DomainResult, SessionId, Task};
@@ -145,7 +147,7 @@ fn trim_resident_event_projections(
     }
 }
 
-const STATE_LAYOUT_VERSION: u32 = 18;
+const STATE_LAYOUT_VERSION: u32 = 19;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -163,6 +165,10 @@ impl StateRepository {
             event_accepted_submissions: Arc::new(Mutex::new(Vec::new())),
             unavailable_sessions: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub(crate) fn shared_write_lock(&self) -> Arc<Mutex<()>> {
+        self.write_lock.clone()
     }
 
     pub(crate) fn save_session_projection_state(
@@ -471,7 +477,42 @@ impl StateRepository {
         &self,
         workspace_roots: &[(String, PathBuf)],
     ) -> Result<(SessionDurableState, SessionExecutionSidecarStoreState), DaemonError> {
+        self.load_session_projections_scoped(workspace_roots, false)
+    }
+
+    pub(crate) fn load_project_session_projections(
+        &self,
+        project: &magi_workspace::WorkspaceRecord,
+    ) -> Result<
+        (
+            SessionDurableState,
+            SessionExecutionSidecarStoreState,
+            Vec<UnavailableSession>,
+        ),
+        DaemonError,
+    > {
+        // 热导入使用独立读取缓存和同一持久写锁。SessionStore 校验冲突失败时，
+        // 不能先覆盖其它会话的缓存；后续正常写入会从同一事件日志按需加载。
+        let mut reader = Self::new(self.state_root.clone());
+        reader.write_lock = self.write_lock.clone();
+        let (durable, sidecars) = reader.load_session_projections_scoped(
+            &[(project.workspace_id.to_string(), project.native_root_path())],
+            true,
+        )?;
+        Ok((durable, sidecars, reader.unavailable_sessions()))
+    }
+
+    fn load_session_projections_scoped(
+        &self,
+        workspace_roots: &[(String, PathBuf)],
+        project_only: bool,
+    ) -> Result<(SessionDurableState, SessionExecutionSidecarStoreState), DaemonError> {
         self.recover_session_projection_transaction(workspace_roots)?;
+        let _project_read_guard = project_only.then(|| {
+            self.write_lock
+                .lock()
+                .expect("state repository write lock poisoned")
+        });
         self.restore_quarantined_session_events(workspace_roots)?;
         let mut durable = SessionDurableState::default();
         let mut sidecars = SessionExecutionSidecarStoreState::default();
@@ -481,14 +522,20 @@ impl StateRepository {
         let mut loaded_snapshots = HashSet::<magi_core::SessionId>::new();
         let mut unavailable = Vec::<UnavailableSession>::new();
         let workspace_root_by_id = workspace_roots.iter().cloned().collect::<HashMap<_, _>>();
-        let mut roots = vec![(String::new(), self.state_root.clone())];
+        let mut roots = if project_only {
+            Vec::new()
+        } else {
+            vec![(String::new(), self.state_root.clone())]
+        };
         roots.extend(workspace_roots.iter().cloned());
 
-        for (workspace_id, workspace_root) in &roots {
+        for (workspace_id, _workspace_root) in &roots {
             let projection_root = if workspace_id.is_empty() {
                 self.session_projection_root()
             } else {
-                workspace_root.join(".magi").join("session-projections")
+                self.project_storage_root(workspace_id)
+                    .join(".magi")
+                    .join("session-projections")
             };
             if projection_root.exists() {
                 for entry in fs::read_dir(&projection_root)? {
@@ -658,7 +705,8 @@ impl StateRepository {
             }
 
             if !workspace_id.is_empty() {
-                let meta_path = workspace_root
+                let meta_path = self
+                    .project_storage_root(workspace_id)
                     .join(".magi")
                     .join("session-workspace-meta.json");
                 if meta_path.exists() {
@@ -677,7 +725,7 @@ impl StateRepository {
         // 事件目录本身是权威源，必须从目录发现并恢复这类 session，不能把它误判成
         // 没有归属的孤立目录后丢弃。
         let event_parent = self.state_root.join("session-events");
-        if event_parent.exists() {
+        if !project_only && event_parent.exists() {
             let mut event_roots = fs::read_dir(&event_parent)?
                 .map(|entry| entry.map(|entry| entry.path()))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -804,7 +852,7 @@ impl StateRepository {
         }
 
         let current_path = self.state_root.join("session-current.json");
-        if current_path.exists() {
+        if !project_only && current_path.exists() {
             let content = fs::read_to_string(&current_path)?;
             let current: Option<magi_core::SessionId> =
                 serde_json::from_str(&content).map_err(|error| {
@@ -818,7 +866,7 @@ impl StateRepository {
         }
 
         let app_meta_path = self.state_root.join("session-app-meta.json");
-        if app_meta_path.exists() {
+        if !project_only && app_meta_path.exists() {
             let content = fs::read_to_string(&app_meta_path)?;
             let meta: SessionDurableState = serde_json::from_str(&content)?;
             durable.notifications.extend(meta.notifications);
@@ -1049,11 +1097,11 @@ impl StateRepository {
         }
         let event_parent = self.state_root.join("session-events");
         let mut projection_roots = vec![self.session_projection_root()];
-        projection_roots.extend(
-            workspace_roots
-                .iter()
-                .map(|(_, root)| root.join(".magi").join("session-projections")),
-        );
+        projection_roots.extend(workspace_roots.iter().map(|(id, _)| {
+            self.project_storage_root(id)
+                .join(".magi")
+                .join("session-projections")
+        }));
         for projection_root in projection_roots {
             let Ok(entries) = fs::read_dir(&projection_root) else {
                 continue;
@@ -1141,7 +1189,7 @@ impl StateRepository {
         let layout_path = self.state_layout_marker_path();
         if layout_path.exists() {
             let marker: StateLayoutMarker = self.read_json_strict(&layout_path)?;
-            if matches!(marker.version, 2..=17) {
+            if matches!(marker.version, 2..=18) {
                 // 升级写屏障，防止旧 daemon 重写新 Agent activation 与 Goal/Step。
                 let backup = self
                     .state_root
@@ -1345,15 +1393,16 @@ impl StateRepository {
     ) -> Result<PathBuf, DaemonError> {
         let projection_root = match workspace_id {
             None => self.session_projection_root(),
-            Some(workspace_id) => workspace_roots
-                .get(workspace_id)
-                .ok_or_else(|| {
-                    DaemonError::internal(format!(
+            Some(workspace_id) => {
+                if !workspace_roots.contains_key(workspace_id) {
+                    return Err(DaemonError::internal(format!(
                         "session {session_id} 引用了未注册 workspace，拒绝回落到全局目录: {workspace_id}"
-                    ))
-                })?
-                .join(".magi")
-                .join("session-projections"),
+                    )));
+                }
+                self.project_storage_root(workspace_id)
+                    .join(".magi")
+                    .join("session-projections")
+            }
         };
         Ok(projection_root.join(Self::session_projection_file_name(session_id)))
     }
@@ -1801,7 +1850,7 @@ impl StateRepository {
         }
 
         if !partial_snapshot {
-            for (workspace_id, root) in workspace_roots {
+            for workspace_id in workspace_roots.keys() {
                 let meta = SessionDurableState {
                     notifications: durable
                         .notifications
@@ -1817,7 +1866,10 @@ impl StateRepository {
                         .collect(),
                     ..SessionDurableState::default()
                 };
-                let path = root.join(".magi").join("session-workspace-meta.json");
+                let path = self
+                    .project_storage_root(workspace_id)
+                    .join(".magi")
+                    .join("session-workspace-meta.json");
                 let content = serde_json::to_vec_pretty(&meta).map_err(DaemonError::from)?;
                 let content = String::from_utf8(content).map_err(|error| {
                     DaemonError::internal(format!("workspace meta 不是 UTF-8: {error}"))
@@ -2689,7 +2741,8 @@ mod tests {
             .expect("initial projection should save");
 
         let file_name = StateRepository::session_projection_file_name(&session_id);
-        let canonical_path = duplicate_root
+        let canonical_path = repository
+            .project_storage_root("duplicate-root")
             .join(".magi")
             .join("session-projections")
             .join(&file_name);
@@ -3184,7 +3237,8 @@ mod tests {
                 .unwrap()
                 .session_sidecars_flushed
         );
-        let offline_path = workspace_root
+        let offline_path = repository
+            .project_storage_root(workspace.as_str())
             .join(".magi/session-projections")
             .join(StateRepository::session_projection_file_name(&offline));
         let healthy_path = repository
@@ -3775,6 +3829,24 @@ mod tests {
         let _ = fs::remove_dir_all(state_root);
     }
 
+    fn migrate_legacy_project_fixture(repository: &StateRepository, id: &str, root: &Path) {
+        let host = magi_core::HostPath::from_path(root.to_path_buf());
+        let legacy = serde_json::json!({
+            "active_workspace_id": id, "workspaces": [{
+                "workspaceId": id, "name": "legacy", "rootPath": host.display_string(),
+                "rootPathRef": host.to_path_ref().as_str(), "worktreeRoot": null,
+                "status": "Registered", "createdAt": 1, "updatedAt": 1
+            }], "worktree_allocations": [], "snapshots": []
+        });
+        repository
+            .write_json_atomically(repository.state_root.join("workspaces.json"), &legacy)
+            .unwrap();
+        repository
+            .verify_state_layout(&[(id.into(), root.to_path_buf())])
+            .unwrap();
+        repository.migrate_project_storage().unwrap();
+    }
+
     #[test]
     fn detached_workspace_projection_imports_into_an_empty_event_state_root() {
         let source_state_root = unique_temp_dir("magi-workspace-import-source");
@@ -3817,6 +3889,23 @@ mod tests {
             fs::read(&projection_path).expect("portable projection bytes");
 
         let target_repository = StateRepository::new(target_state_root.clone());
+        let identity = magi_workspace::resolve_or_create_workspace_identity(
+            &workspace_root,
+            WorkspaceId::new("unused-new-identity"),
+        )
+        .unwrap();
+        assert_eq!(identity.as_str(), "workspace-import");
+        let projects = WorkspaceStore::new();
+        projects
+            .register_native_path(identity, workspace_root.clone())
+            .unwrap();
+        target_repository
+            .save_workspace_durable_state(&projects.durable_state())
+            .unwrap();
+        target_repository
+            .verify_state_layout(&[("workspace-import".into(), workspace_root.clone())])
+            .unwrap();
+        target_repository.migrate_project_storage().unwrap();
         let (restored, _) = target_repository
             .load_session_projections(&[("workspace-import".to_string(), workspace_root.clone())])
             .expect("detached workspace projection should import into an empty event root");
@@ -3919,6 +4008,7 @@ mod tests {
         let original_content = fs::read(&projection_path).expect("source projection bytes");
 
         let target_repository = StateRepository::new(target_state_root.clone());
+        migrate_legacy_project_fixture(&target_repository, "workspace-registered", &workspace_root);
         let (restored, _) = target_repository
             .load_session_projections(&[(
                 "workspace-registered".to_string(),
@@ -4024,6 +4114,11 @@ mod tests {
         assert!(!event_root.exists());
 
         let restarted_repository = StateRepository::new(target_state_root.clone());
+        migrate_legacy_project_fixture(
+            &restarted_repository,
+            "workspace-import-journal",
+            &workspace_root,
+        );
         let (restored, _) = restarted_repository
             .load_session_projections(&[(
                 "workspace-import-journal".to_string(),

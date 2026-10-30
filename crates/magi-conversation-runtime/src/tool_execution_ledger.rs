@@ -32,6 +32,7 @@ pub(crate) struct ToolExecutionLedger {
     successful_idempotent_calls: BTreeMap<ToolCallFingerprint, String>,
     current_file_facts: BTreeMap<PathBuf, CurrentFileFact>,
     workspace_root_path: Option<PathBuf>,
+    project_directory_map: Option<magi_core::ProjectDirectoryExecutionMap>,
     successful_recovered_side_effect_calls: BTreeMap<ToolCallFingerprint, String>,
     interrupted_non_idempotent_calls: BTreeMap<ToolCallFingerprint, String>,
     executed_call_counts: BTreeMap<String, usize>,
@@ -346,6 +347,18 @@ impl ToolExecutionLedger {
         self.successful_idempotent_calls.clear();
     }
 
+    /// 默认 cwd 不变时，其他源目录也可能切换到执行副本。读缓存必须跟随完整
+    /// 执行映射；已知/未知副作用记录保留，不能因为换目录重新执行旧写入。
+    pub(crate) fn rebind_project_directories(
+        &mut self,
+        map: Option<&magi_core::ProjectDirectoryExecutionMap>,
+    ) {
+        if self.project_directory_map.as_ref() != map {
+            self.project_directory_map = map.cloned();
+            self.successful_idempotent_calls.clear();
+        }
+    }
+
     /// 为一个模型响应生成执行决策。相同只读调用在同一响应内只允许一个
     /// 真实执行代表；跨响应则直接复用已经成功的结果。
     pub(crate) fn plan(
@@ -613,12 +626,24 @@ impl ToolExecutionLedger {
     fn reuse_current_file_fact(&self, tool_call: &ChatToolCall) -> Option<String> {
         let arguments = serde_json::from_str::<Value>(&tool_call.function.arguments).ok()?;
         let requested_path = arguments.get("path").and_then(Value::as_str)?;
-        let requested_path = PathBuf::from(requested_path);
-        let absolute_path = if requested_path.is_absolute() {
-            requested_path
-        } else {
-            self.workspace_root_path.as_ref()?.join(requested_path)
-        };
+        let context = magi_tool_runtime::ToolExecutionContext {
+            workspace_id: self
+                .project_directory_map
+                .as_ref()
+                .map(|map| map.workspace_id.clone()),
+            working_directory: self.workspace_root_path.clone(),
+            project_directory_map: self.project_directory_map.clone(),
+            ..Default::default()
+        }
+        .for_tool_arguments(&tool_call.function.arguments)
+        .ok()?;
+        let absolute_path = magi_core::HostPath::resolve_native_input(
+            requested_path,
+            context.working_directory.as_deref(),
+            None,
+        )
+        .ok()?
+        .into_path_buf();
         let fact = self
             .current_file_facts
             .get(&normalize_existing_path(&absolute_path))?;
@@ -2471,6 +2496,108 @@ mod tests {
         };
         let payload: Value = serde_json::from_str(result).unwrap();
         assert_eq!(payload["source_result"]["content"], content);
+    }
+
+    #[test]
+    fn project_file_facts_resolve_each_selected_root_and_invalidate_changed_maps() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let roots = [root.join("first"), root.join("second"), root.join("copy")];
+        let mut facts = Vec::new();
+        for (index, root) in roots.iter().enumerate() {
+            std::fs::create_dir(root).unwrap();
+            let path = root.join("same.txt");
+            let content = format!("root {index}");
+            std::fs::write(&path, &content).unwrap();
+            let hash = magi_snapshot::path_content_hash(&path).unwrap();
+            facts.push(CurrentFileFact {
+                absolute_path: path.display().to_string(), content_hash: hash.clone(),
+                result: serde_json::json!({"tool":"file_read","status":"succeeded","mode":"file",
+                    "path":path,"content_hash":hash,"file_size_bytes":content.len(),"max_bytes":4096,
+                    "bytes_read":content.len(),"truncated":false,"start_line":1,
+                    "requested_end_line":null,"content":content}).to_string(),
+                summary: content,
+            });
+        }
+        let binding = magi_core::ProjectDirectoryBinding {
+            workspace_id: magi_core::WorkspaceId::new("facts-project"),
+            project_revision: 1,
+            default_source_folder_id: "first".into(),
+            source_folders: ["first", "second"]
+                .iter()
+                .zip(&roots)
+                .map(|(id, root)| magi_core::ProjectSourceFolderGrant {
+                    source_folder_id: (*id).into(),
+                    source_path_ref: magi_core::HostPath::from_path(root.clone())
+                        .to_path_ref()
+                        .as_str()
+                        .into(),
+                })
+                .collect(),
+        };
+        let map = magi_core::ProjectDirectoryExecutionMap::from_binding(&binding, |grant| {
+            Ok(roots[usize::from(grant.source_folder_id == "second")].clone())
+        })
+        .unwrap();
+        let mut ledger =
+            ToolExecutionLedger::default().with_current_file_facts(&facts, Some(&roots[0]));
+        ledger.rebind_project_directories(Some(&map));
+        for (index, id) in ["first", "second"].iter().enumerate() {
+            let request = call(
+                id,
+                "file_read",
+                &serde_json::json!({"source_folder_id":id,"path":"same.txt","max_bytes":4096})
+                    .to_string(),
+            );
+            let plan = ledger.plan(&[request], None);
+            let ToolCallExecutionDecision::Reuse { result } = &plan[0] else {
+                panic!("must reuse matching root")
+            };
+            assert_eq!(
+                serde_json::from_str::<Value>(result).unwrap()["source_result"]["content"],
+                format!("root {index}")
+            );
+        }
+        let read = call(
+            "read-second",
+            "search_text",
+            r#"{"source_folder_id":"second","query":"root"}"#,
+        );
+        let decision = ledger.plan(std::slice::from_ref(&read), None);
+        let ToolCallExecutionDecision::Execute { fingerprint } = &decision[0] else {
+            panic!("first search")
+        };
+        ledger.record_execution(
+            &read,
+            fingerprint.as_ref(),
+            &(
+                r#"{"status":"succeeded"}"#.into(),
+                ExecutionResultStatus::Succeeded,
+            ),
+        );
+        let mut changed = map;
+        changed.roots[1].execution_root_ref = magi_core::HostPath::from_path(roots[2].clone())
+            .to_path_ref()
+            .as_str()
+            .into();
+        ledger.rebind_project_directories(Some(&changed));
+        assert!(matches!(
+            ledger.plan(&[read], None)[0],
+            ToolCallExecutionDecision::Execute { .. }
+        ));
+        let read = call(
+            "copy",
+            "file_read",
+            r#"{"source_folder_id":"second","path":"same.txt","max_bytes":4096}"#,
+        );
+        let plan = ledger.plan(&[read], None);
+        let ToolCallExecutionDecision::Reuse { result } = &plan[0] else {
+            panic!("must use copy fact")
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(result).unwrap()["source_result"]["content"],
+            "root 2"
+        );
     }
 
     #[test]

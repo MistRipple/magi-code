@@ -12,6 +12,7 @@ import {
 import { refreshPendingChangesProjection } from '../lib/pending-changes-refresh';
 
 export interface IsolationBinding {
+  sourceFolderId?: string;
   workspaceId: string;
   workspacePath: string;
 }

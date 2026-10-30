@@ -73,6 +73,17 @@ export interface AgentWorkspaceSummary {
   rootPath: string;
   rootPathRef?: string;
   isActive: boolean;
+  revision: number;
+  primarySourceFolderId: string;
+  sourceFolders: AgentWorkspaceSourceFolder[];
+}
+
+export interface AgentWorkspaceSourceFolder {
+  sourceFolderId: string;
+  path: string;
+  pathRef?: string;
+  name?: string;
+  isPrimary: boolean;
 }
 
 export interface AgentSessionSummary {
@@ -135,6 +146,15 @@ interface RawAgentWorkspaceSummary {
   rootPathRef?: string | null;
   name?: string | null;
   isActive?: boolean;
+  revision?: number;
+  primarySourceFolderId?: string;
+  sourceFolders?: Array<{
+    sourceFolderId?: string;
+    path?: string;
+    pathRef?: string | null;
+    name?: string | null;
+    isPrimary?: boolean;
+  }>;
 }
 
 interface RawAgentSessionSummary {
@@ -619,12 +639,31 @@ function deriveWorkspaceName(rootPath: string, workspaceId: string): string {
 function normalizeWorkspaceSummary(raw: RawAgentWorkspaceSummary): AgentWorkspaceSummary {
   const workspaceId = raw.workspaceId?.trim() || '';
   const rootPath = raw.rootPath?.trim() || '';
+  const projectedFolders = Array.isArray(raw.sourceFolders)
+      ? raw.sourceFolders.flatMap((folder) => {
+          const sourceFolderId = folder.sourceFolderId?.trim() || '';
+          const path = folder.path?.trim() || '';
+          return sourceFolderId && path
+            ? [{
+                sourceFolderId,
+                path,
+                pathRef: folder.pathRef?.trim() || undefined,
+                name: folder.name?.trim() || undefined,
+                isPrimary: folder.isPrimary === true,
+              }]
+            : [];
+        })
+      : [];
+  const sourceFolders = projectedFolders;
   return {
     workspaceId,
     rootPath,
     rootPathRef: raw.rootPathRef?.trim() || undefined,
-    name: deriveWorkspaceName(rootPath, workspaceId),
+    name: raw.name?.trim() || deriveWorkspaceName(rootPath, workspaceId),
     isActive: raw.isActive === true,
+    revision: typeof raw.revision === 'number' && Number.isFinite(raw.revision) ? Math.max(1, Math.floor(raw.revision)) : 1,
+    primarySourceFolderId: raw.primarySourceFolderId?.trim() || sourceFolders.find((folder) => folder.isPrimary)?.sourceFolderId || '',
+    sourceFolders,
   };
 }
 
@@ -639,6 +678,9 @@ function findCachedWorkspaceSummary(workspaceId: string): AgentWorkspaceSummary 
     rootPath: '',
     name: workspaceId || 'workspace',
     isActive: false,
+    revision: 1,
+    primarySourceFolderId: '',
+    sourceFolders: [],
   };
 }
 
@@ -690,11 +732,13 @@ function collectAgentBaseUrlCandidates(): string[] {
     && (currentUrl.pathname === '/' || currentUrl.pathname === '/web.html' || currentUrl.pathname.startsWith('/assets/'))
     ? currentUrl.origin
     : '';
+  // daemon 提供的页面绑定该实例。断线时不能探测默认端口或其它实例，
+  // 否则独立状态根的 Desktop/Web 会在恢复期间切换到用户日常 daemon。
+  if (servedByAgentOrigin) return [servedByAgentOrigin];
   const candidates = [
-    servedByAgentOrigin,
     queryBaseUrl,
     injectedBaseUrl,
-    configuredProxyTarget && servedByAgentOrigin ? servedByAgentOrigin : '',
+    configuredProxyTarget,
     configuredBaseUrl,
     getStoredAgentBaseUrl(),
     getDefaultAgentBaseUrl(),
@@ -826,10 +870,6 @@ export function resolveAgentBaseUrl(): string {
     persistAgentBaseUrl(fromQuery);
     return fromQuery;
   }
-  if (servedByAgent) {
-    persistAgentBaseUrl(currentUrl.origin);
-    return currentUrl.origin;
-  }
   return getStoredAgentBaseUrl() || getDefaultAgentBaseUrl();
 }
 
@@ -847,6 +887,7 @@ export function agentUrl(pathname: string, query?: string): string {
 }
 
 export interface TerminalSessionRequest {
+  sourceFolderId?: string;
   terminalTabId: string;
   workspaceId?: string | null;
   workspacePath?: string;
@@ -865,6 +906,7 @@ function terminalSessionUrl(request: TerminalSessionRequest, channel: boolean): 
   const hasWorkspaceBinding = Boolean(workspaceId || workspacePath);
   url.searchParams.set('scope', hasWorkspaceBinding ? 'workspace' : 'personal');
   if (workspaceId) url.searchParams.set('workspaceId', workspaceId);
+  if (hasWorkspaceBinding && request.sourceFolderId) url.searchParams.set('sourceFolderId', request.sourceFolderId);
   url.searchParams.set('sessionId', request.sessionId.trim());
   if (workspacePath) url.searchParams.set('workspacePath', workspacePath);
   if (request.cols) url.searchParams.set('cols', String(request.cols));
@@ -1797,7 +1839,7 @@ function buildBoundQuery(
 
 export function buildFilePreviewQuery(
   filePath: string,
-  options: { includeSession?: boolean; sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+  options: { includeSession?: boolean; sessionId?: string; workspaceId?: string; workspacePath?: string; sourceFolderId?: string } = {},
 ): string {
   const explicitSessionId = typeof options.sessionId === 'string' && options.sessionId.trim().length > 0;
   const workspaceId = options.workspaceId?.trim() || '';
@@ -1808,7 +1850,7 @@ export function buildFilePreviewQuery(
       ? { scope: 'personal', sessionId: options.sessionId }
       : { sessionId: options.sessionId };
   return buildBoundQueryWithOverride(
-    { filePath },
+    { filePath, ...(options.sourceFolderId ? { sourceFolderId: options.sourceFolderId } : {}) },
     bindingOverride,
     {
       includeScope: false,
@@ -1836,6 +1878,7 @@ function resolveBindingWithOverride(
     scope: 'workspace',
     workspaceId: bindingOverride.workspaceId.trim(),
     workspacePath: bindingOverride.workspacePath.trim(),
+    sourceFolderId: bindingOverride.sourceFolderId?.trim() || undefined,
     sessionId,
   };
 }
@@ -1853,6 +1896,7 @@ function buildBoundQueryWithOverride(
   if (binding.scope === 'workspace') {
     if (binding.workspaceId) query.set('workspaceId', binding.workspaceId);
     if (binding.workspacePath) query.set('workspacePath', binding.workspacePath);
+    if (binding.sourceFolderId) query.set('sourceFolderId', binding.sourceFolderId);
   }
   if (options.includeSession !== false && binding.sessionId) query.set('sessionId', binding.sessionId);
   for (const [key, value] of Object.entries(extra)) {
@@ -1884,6 +1928,7 @@ async function postJsonWithBinding<T>(
   try {
     const binding = resolveBindingWithOverride(bindingOverride);
     const bindingPayload = {
+      ...(binding.scope === 'workspace' && binding.sourceFolderId ? { sourceFolderId: binding.sourceFolderId } : {}),
       ...(options.includeWorkspaceBinding !== false && binding.scope === 'workspace' && binding.workspaceId
         ? { workspaceId: binding.workspaceId }
         : {}),
@@ -1930,8 +1975,12 @@ async function postWorkspacePathBoundJson<T>(
   if (binding.scope !== 'workspace') {
     throw new AgentApiError(400, '工作区作用域不完整', action);
   }
-  const workspacePath = binding.workspacePath.trim()
-    || findCachedWorkspaceSummary(binding.workspaceId).rootPath.trim();
+  const project = findCachedWorkspaceSummary(binding.workspaceId);
+  const folder = binding.sourceFolderId
+    ? project.sourceFolders.find((folder) => folder.sourceFolderId === binding.sourceFolderId)
+    : null;
+  if (binding.sourceFolderId && !folder) throw new AgentApiError(400, '源文件夹已不可用，请重新选择', action);
+  const workspacePath = folder?.pathRef || folder?.path || binding.workspacePath.trim() || project.rootPath.trim();
   if (!workspacePath) {
     throw new AgentApiError(400, 'workspacePath 不能为空', action);
   }
@@ -1939,7 +1988,7 @@ async function postWorkspacePathBoundJson<T>(
     pathname,
     { ...payload, workspacePath },
     action,
-    bindingOverride,
+    { ...binding, sourceFolderId: undefined },
     true,
     undefined,
     { includeWorkspaceBinding: false },
@@ -1987,6 +2036,45 @@ export async function registerAgentWorkspace(rootPath: string): Promise<AgentWor
     }
     throw error;
   }
+}
+
+export async function createAgentProject(
+  name: string,
+  sourceFolders: Array<{ sourceFolderId?: string; path: string; name?: string }>,
+  primarySourceFolderId?: string,
+): Promise<AgentWorkspaceSummary> {
+  const response = await getTransport().request(agentUrl('/api/workspaces/create'), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, sourceFolders, ...(primarySourceFolderId ? { primarySourceFolderId } : {}) }),
+  });
+  const payload = await parseAgentJson<{ workspace?: RawAgentWorkspaceSummary }>(response, 'create project');
+  if (!payload.workspace) throw new Error('项目创建响应缺少 workspace');
+  const project = normalizeWorkspaceSummary(payload.workspace);
+  cacheWorkspaceSummaries([...cachedWorkspaceSummaries.filter((item) => item.workspaceId !== project.workspaceId), project]);
+  return project;
+}
+
+export async function updateAgentProject(
+  workspace: AgentWorkspaceSummary,
+  name: string,
+  sourceFolders: Array<{ sourceFolderId: string; path: string; name?: string }>,
+  primarySourceFolderId: string,
+): Promise<AgentWorkspaceSummary> {
+  const response = await getTransport().request(agentUrl('/api/workspaces/update'), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      workspaceId: workspace.workspaceId,
+      expectedRevision: workspace.revision,
+      name,
+      sourceFolders,
+      primarySourceFolderId,
+    }),
+  });
+  const payload = await parseAgentJson<{ workspace?: RawAgentWorkspaceSummary }>(response, 'update project');
+  if (!payload.workspace) throw new Error('项目更新响应缺少 workspace');
+  const project = normalizeWorkspaceSummary(payload.workspace);
+  cacheWorkspaceSummaries(cachedWorkspaceSummaries.map((item) => item.workspaceId === project.workspaceId ? project : item));
+  return project;
 }
 
 export async function removeAgentWorkspace(workspaceId: string): Promise<AgentWorkspaceSummary[]> {
@@ -2102,6 +2190,7 @@ export async function listAgentDirectory(
   showHidden: boolean,
   workspaceId: string,
   sessionId?: string,
+  sourceFolderId?: string,
 ): Promise<WorkspaceDirectoryListResult> {
   try {
     const query = new URLSearchParams();
@@ -2109,6 +2198,7 @@ export async function listAgentDirectory(
       query.set('path', dirPath);
     }
     if (workspaceId) query.set('workspaceId', workspaceId);
+    if (sourceFolderId) query.set('sourceFolderId', sourceFolderId);
     if (sessionId) query.set('sessionId', sessionId);
     if (showHidden) {
       query.set('showHidden', '1');
@@ -2175,7 +2265,7 @@ export async function resolveAgentFileRevealTarget(
 ): Promise<AgentFileRevealTarget> {
   return await postJsonWithBinding<AgentFileRevealTarget>(
     '/api/files/reveal-target',
-    { filePath },
+    { filePath, ...(scope.scope === 'workspace' && scope.sourceFolderId ? { sourceFolderId: scope.sourceFolderId } : {}) },
     'resolve workspace file reveal target',
     scope,
     true,
@@ -2514,6 +2604,7 @@ export async function resolveAgentNotification(
 
 export async function submitSessionTurn(
   payload: {
+    sourceFolderId?: string | null;
     text?: string | null;
     skillName?: string | null;
     locale?: string;
@@ -2527,6 +2618,7 @@ export async function submitSessionTurn(
       kind: 'file' | 'directory';
       path: string;
       pathRef?: string;
+      sourceFolderId?: string;
       name: string;
     }>;
     browserAnnotationRefs?: string[];
@@ -2554,6 +2646,7 @@ export async function submitSessionTurn(
         scope: binding.scope,
         workspaceId: binding.scope === 'workspace' ? binding.workspaceId || null : null,
         workspacePath: binding.scope === 'workspace' ? binding.workspacePath || null : null,
+        sourceFolderId: payload.sourceFolderId || null,
         text: payload.text ?? null,
         skillName: payload.skillName ?? null,
         locale: payload.locale ?? i18n.locale,
@@ -2578,6 +2671,7 @@ export async function submitSessionTurn(
           kind: reference.kind,
           path: reference.path,
           ...(reference.pathRef ? { pathRef: reference.pathRef } : {}),
+          ...(reference.sourceFolderId ? { sourceFolderId: reference.sourceFolderId } : {}),
           name: reference.name,
         })),
         browserAnnotationRefs: (payload.browserAnnotationRefs ?? [])
@@ -2711,6 +2805,7 @@ export async function getAgentSessionTurnQueue(
   if (binding.scope === 'workspace') {
     if (binding.workspaceId) query.set('workspaceId', binding.workspaceId);
     if (binding.workspacePath) query.set('workspacePath', binding.workspacePath);
+    if (binding.sourceFolderId) query.set('sourceFolderId', binding.sourceFolderId);
   }
   const response = await getTransport().request(agentUrl('/api/session/queue', query.toString()));
   return await parseAgentJson<SessionTurnQueueResponseDto>(response, 'get session turn queue');
@@ -2903,12 +2998,12 @@ export async function resolveAgentUserQuestion(
 
 function isolationBinding(
   sessionId: string,
-  binding: { workspaceId?: string; workspacePath?: string } | undefined,
+  binding: { workspaceId?: string; workspacePath?: string; sourceFolderId?: string } | undefined,
 ): AgentBindingOverride {
   const workspaceId = binding?.workspaceId?.trim() || '';
   const workspacePath = binding?.workspacePath?.trim() || '';
   return workspaceId || workspacePath
-    ? { scope: 'workspace', workspaceId, workspacePath, sessionId }
+    ? { scope: 'workspace', workspaceId, workspacePath, sessionId, sourceFolderId: binding?.sourceFolderId }
     : { scope: 'personal', sessionId };
 }
 
@@ -2940,7 +3035,7 @@ export async function listAgentSessionWorkspaceWaits(): Promise<WorkspaceWaitLis
 
 export async function getAgentSessionIsolation(
   sessionId: string,
-  binding?: { workspaceId?: string; workspacePath?: string },
+  binding?: { workspaceId?: string; workspacePath?: string; sourceFolderId?: string },
 ): Promise<SessionIsolationResponseDto> {
   const normalized = requireIsolationSessionId(sessionId, 'load session isolation');
   const query = buildBoundQueryWithOverride(
@@ -2957,7 +3052,7 @@ export async function getAgentSessionIsolation(
 
 export async function enableAgentSessionIsolation(
   sessionId: string,
-  binding?: { workspaceId?: string; workspacePath?: string },
+  binding?: { workspaceId?: string; workspacePath?: string; sourceFolderId?: string },
 ): Promise<SessionIsolationResponseDto> {
   const normalized = requireIsolationSessionId(sessionId, 'enable session isolation');
   return await postBoundJson<SessionIsolationResponseDto>(
@@ -2971,7 +3066,7 @@ export async function enableAgentSessionIsolation(
 export async function discardAgentSessionIsolation(
   sessionId: string,
   discardChanges: boolean,
-  binding?: { workspaceId?: string; workspacePath?: string },
+  binding?: { workspaceId?: string; workspacePath?: string; sourceFolderId?: string },
 ): Promise<SessionIsolationResponseDto> {
   const normalized = requireIsolationSessionId(sessionId, 'discard session isolation');
   return await postBoundJson<SessionIsolationResponseDto>(
@@ -2984,7 +3079,7 @@ export async function discardAgentSessionIsolation(
 
 export async function planAgentIsolationMerge(
   sessionId: string,
-  binding?: { workspaceId?: string; workspacePath?: string },
+  binding?: { workspaceId?: string; workspacePath?: string; sourceFolderId?: string },
 ): Promise<IsolationMergePlanDto> {
   const normalized = requireIsolationSessionId(sessionId, 'plan isolation merge');
   return await postBoundJson<IsolationMergePlanDto>(
@@ -3001,7 +3096,7 @@ export async function applyAgentIsolationMerge(
     paths?: string[];
     resolutions?: Record<string, IsolationConflictResolutionDto>;
   },
-  binding?: { workspaceId?: string; workspacePath?: string },
+  binding?: { workspaceId?: string; workspacePath?: string; sourceFolderId?: string },
 ): Promise<IsolationMergeOutcomeDto> {
   const normalized = requireIsolationSessionId(sessionId, 'apply isolation merge');
   return await postBoundJson<IsolationMergeOutcomeDto>(
@@ -3972,6 +4067,19 @@ export async function getAgentPendingChanges(
   },
 ): Promise<AgentPendingChangesPayload> {
   try {
+    const project = findCachedWorkspaceSummary(options.workspaceId);
+    if (!options.sourceFolderId && project.sourceFolders.length > 1) {
+      const projections = await Promise.all(project.sourceFolders.map((folder) => getAgentPendingChanges({ ...options, sourceFolderId: folder.sourceFolderId })));
+      const count = projections.reduce((total, projection) => total + projection.pendingChanges.length, 0);
+      const states = projections.map((projection) => projection.pendingChangesState as Record<string, unknown>);
+      const state = states.find((state) => state?.status === 'error') || states.find((state) => state?.status !== 'ready') || states[0];
+      return {
+        ...projections[0], workspacePath: project.rootPath,
+        generatedAt: Math.min(...projections.map((projection) => projection.generatedAt)),
+        pendingChanges: projections.flatMap((projection) => projection.pendingChanges),
+        pendingChangesState: { ...state, pendingCount: count },
+      };
+    }
     const query = buildBoundQueryWithOverride(
       options.forceRefresh ? { forceRefresh: 'true' } : {},
       options,
@@ -3992,7 +4100,7 @@ export async function getAgentChangeDiff(
   options: WorkspaceAgentBindingOverride,
 ): Promise<AgentChangeDiffPayload> {
   try {
-    const query = buildBoundQueryWithOverride({ filePath }, options, { includeScope: false });
+    const query = buildBoundQueryWithOverride({ filePath, ...(options.sourceFolderId ? { sourceFolderId: options.sourceFolderId } : {}) }, options, { includeScope: false });
     const response = await getTransport().request(agentUrl(`/api/changes/diff`, query));
     return await parseAgentJson<AgentChangeDiffPayload>(response, 'load change diff');
   } catch (error) {
@@ -4005,7 +4113,7 @@ export async function getAgentChangeDiff(
 
 export async function getAgentFilePreview(
   filePath: string,
-  options: { includeSession?: boolean; sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+  options: { includeSession?: boolean; sessionId?: string; workspaceId?: string; workspacePath?: string; sourceFolderId?: string } = {},
 ): Promise<AgentFilePreviewPayload> {
   try {
     const query = buildFilePreviewQuery(filePath, options);
@@ -4033,28 +4141,37 @@ export async function revertAgentChange(
   await postBoundJson('/api/changes/revert', { filePath }, 'revert change', options);
 }
 
+async function mutateProjectFolders(
+  options: WorkspaceAgentBindingOverride,
+  action: (binding: WorkspaceAgentBindingOverride) => Promise<unknown>,
+): Promise<void> {
+  const folders = options.sourceFolderId ? [] : findCachedWorkspaceSummary(options.workspaceId).sourceFolders;
+  const bindings = folders.length > 1 ? folders.map((folder) => ({ ...options, sourceFolderId: folder.sourceFolderId })) : [options];
+  for (const binding of bindings) await action(binding);
+}
+
 export async function approveAllAgentChanges(
   options: WorkspaceAgentBindingOverride,
 ): Promise<void> {
-  await postBoundJson('/api/changes/approve-all', {}, 'approve all changes', options);
+  await mutateProjectFolders(options, (binding) => postBoundJson('/api/changes/approve-all', {}, 'approve all changes', binding));
 }
 
 export async function revertAllAgentChanges(
   options: WorkspaceAgentBindingOverride,
 ): Promise<void> {
-  await postBoundJson('/api/changes/revert-all', {}, 'revert all changes', options);
+  await mutateProjectFolders(options, (binding) => postBoundJson('/api/changes/revert-all', {}, 'revert all changes', binding));
 }
 
 export async function revertAgentExecutionGroupChanges(
   executionGroupId: string,
   options: WorkspaceAgentBindingOverride,
 ): Promise<void> {
-  await postBoundJson(
+  await mutateProjectFolders(options, (binding) => postBoundJson(
     '/api/changes/revert-execution-group',
     { executionGroupId },
     'revert execution group changes',
-    options,
-  );
+    binding,
+  ));
 }
 
 // ── Magi MCP 服务（对外暴露 Magi 工具的标准 MCP 入口）─────────────────────────
@@ -4066,6 +4183,8 @@ export interface McpServerToken {
   prefix: string;
   clientName: string;
   workspaceId: string;
+  sourceFolderIds: string[];
+  defaultSourceFolderId: string | null;
   workspaceAvailable: boolean;
   approvalMode: McpServerApprovalMode;
   attribution: 'external' | 'follow_web_slot';
@@ -4127,6 +4246,8 @@ export interface McpServerStatus {
 export interface McpServerCreateTokenRequest {
   clientName: string;
   workspaceId: string;
+  sourceFolderIds?: string[];
+  sourceFolderId?: string;
   approvalMode?: McpServerApprovalMode;
   /** 有效期天数；缺省 90，0 表示不过期。 */
   ttlDays?: number;
