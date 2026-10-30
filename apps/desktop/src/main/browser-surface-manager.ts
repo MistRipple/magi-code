@@ -232,6 +232,8 @@ interface BrowserSurfaceRecord {
   closed: boolean;
   automationInputDepth: number;
   agentControlled: boolean;
+  /** 视口是代理取得控制时从自适应「钉」成当前尺寸的；代理释放控制时必须还原为自适应。 */
+  viewportPinnedByAgent: boolean;
   agentControl: Extract<BrowserControl, { mode: "agent" }> | null;
   /** 展示目标可能在取消后尚未到达；相同坐标的新动作仍需确认到位。 */
   cursorPresentationReady: boolean;
@@ -886,6 +888,7 @@ export class BrowserSurfaceManager {
       closed: false,
       automationInputDepth: 0,
       agentControlled: false,
+      viewportPinnedByAgent: false,
       agentControl: null,
       cursorPresentationReady: false,
       cursor: { visible: false, x: null, y: null, action: null },
@@ -2225,6 +2228,8 @@ export class BrowserSurfaceManager {
     this.assertRenderableBinding(binding);
     if (!userInitiated && !record.agentControlled) throw new Error("browser_user_control_held");
     record.viewport = viewport;
+    // 用户或代理显式选择的视口是有意的，释放控制时不能被当成「钉住的」自动还原。
+    record.viewportPinnedByAgent = false;
     // 显式提交即使与宿主记录相同，也必须重新写入当前 Chromium session。
     // 这使调用方可以校正外部调试动作造成的实际状态漂移，宿主缓存只用于
     // 合并内部重复生命周期事件，不能替代浏览器事实。
@@ -2251,6 +2256,15 @@ export class BrowserSurfaceManager {
       const state = await this.readViewport(binding);
       if (!record.agentControlled) throw new Error("browser_user_control_held");
       await this.setViewport(binding, { mode: "fixed", ...state.actual_viewport });
+      // 钉住只为让一条命令执行期间布局稳定；它不是用户选的视口，代理释放控制时要还原为自适应。
+      record.viewportPinnedByAgent = true;
+    }
+    if (!record.agentControlled && record.viewportPinnedByAgent) {
+      record.viewportPinnedByAgent = false;
+      if (record.viewport.mode === "fixed") {
+        record.viewport = { mode: "auto" };
+        this.scheduleViewportCommit(record, true);
+      }
     }
     if (!record.agentControlled) this.setAgentRetained(tabId, false);
     this.setAgentCursor(
@@ -5210,6 +5224,7 @@ export class BrowserSurfaceManager {
     if (record.closed || !record.agentControlled) return;
     record.agentControlled = false;
     record.agentControl = null;
+    record.viewportPinnedByAgent = false;
     this.setAgentCursor(record, false, null, null, null);
     // 只有介入 AI 控制才自动恢复响应式；用户显式选固定设备时保留其选择。
     if (followPanel && record.viewport.mode === "fixed") {

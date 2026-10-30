@@ -816,8 +816,12 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       if (Array.isArray(forbidSubmitIn) && forbidSubmitIn.length) {
         const control = element.closest?.('button, input, [role="button"]') || element;
         const typeAttr = control.getAttribute?.('type');
+        // 现代页面的对话框确认按钮常常不在 <form> 里（点击处理函数提交）：对话框内标着保存/创建/确认的按钮同样算提交。
+        const label = String(control.getAttribute?.('aria-label') || control.textContent || '').trim().toLowerCase();
+        const confirmLike = Boolean(control.closest?.('[role="dialog"], dialog'))
+          && ['save', 'create', 'submit', 'confirm', 'apply', 'delete', 'remove', '保存', '创建', '提交', '确认', '应用', '删除'].some(prefix => label.startsWith(prefix));
         const submitLike = (control.tagName === 'BUTTON' && control.form && (typeAttr === null || typeAttr === 'submit'))
-          || (control.tagName === 'INPUT' && typeAttr === 'submit') || typeAttr === 'submit';
+          || (control.tagName === 'INPUT' && typeAttr === 'submit') || typeAttr === 'submit' || confirmLike;
         if (submitLike) {
           const scope = control.closest?.('[role="dialog"], dialog, form') || control.form;
           const context = String(scope?.innerText || scope?.textContent || '').toLowerCase();

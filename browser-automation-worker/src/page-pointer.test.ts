@@ -129,20 +129,23 @@ test('目标在动作后被移出文档会如实回报，用于识别菜单项�
 
 test('受保护资源的表单提交按钮被结构性拒绝，与按钮文案和语言无关；其他按钮不受影响', () => {
   const cases = [
-    { name: '提交按钮 + 密钥对话框', type: 'submit', context: 'Create new secret key\nName\n创建', forbidden: true },
-    { name: '中文对话框', type: 'submit', context: '创建新的密钥\n名称', forbidden: true },
-    { name: '同一对话框里的取消按钮', type: 'button', context: 'Create new secret key', forbidden: false },
-    { name: '无关表单的提交按钮', type: 'submit', context: 'Create tunnel\nName', forbidden: false },
+    { name: '提交按钮 + 密钥对话框', type: 'submit', form: true, label: '确定', context: 'Create new secret key\nName\n创建', forbidden: true },
+    { name: '中文对话框', type: 'submit', form: true, label: '确定', context: '创建新的密钥\n名称', forbidden: true },
+    { name: '同一对话框里的取消按钮', type: 'button', form: true, label: 'Cancel', context: 'Create new secret key', forbidden: false },
+    { name: '无关表单的提交按钮', type: 'submit', form: true, label: '确定', context: 'Create tunnel\nName', forbidden: false },
+    { name: '不在 form 里的 Save：编辑已有 Tunnel 的对话框', type: 'button', form: false, label: 'Save', context: 'Edit tunnel\nName *\nDescription *', forbidden: true },
+    { name: '同一编辑对话框里的 Cancel', type: 'button', form: false, label: 'Cancel', context: 'Edit tunnel\nName *', forbidden: false },
+    { name: '无关对话框里的 Save', type: 'button', form: false, label: 'Save', context: 'Rename project\nName', forbidden: false },
   ];
   for (const item of cases) {
     const f = pointerFixture();
     const dialog = { innerText: item.context, textContent: item.context };
     Object.assign(f.element, {
-      tagName: 'BUTTON', form: {},
-      getAttribute: (name: string) => name === 'type' ? item.type : name === 'aria-label' ? '确定' : null,
+      tagName: 'BUTTON', form: item.form ? {} : null, textContent: item.label,
+      getAttribute: (name: string) => name === 'type' ? item.type : name === 'aria-label' ? item.label : null,
       closest: (selector: string) => selector.includes('dialog') ? dialog : selector.includes('button') ? f.element : null,
     });
-    const call = () => f.runtime.preparePointer(f.runtime.reference(f.element), 'pointer', 'click', null, false, ['secret key', '密钥']);
+    const call = () => f.runtime.preparePointer(f.runtime.reference(f.element), 'pointer', 'click', null, false, ['secret key', '密钥', 'edit tunnel']);
     if (item.forbidden) assert.throws(call, /browser_submit_forbidden/u, item.name);
     else assert.doesNotThrow(call, item.name);
   }

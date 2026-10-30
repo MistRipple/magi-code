@@ -29,7 +29,10 @@ const PAGE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const READ_STATE_RETRIES: usize = 30;
 /// 配置期间页面的桌面布局尺寸：足以显示组织切换、导航和完整表单。
 /// 所在表单/对话框出现这些词时，配置 Agent 不得点击其提交按钮（密钥只能由用户生成）。
-const SETUP_FORBIDDEN_SUBMIT_CONTEXT: [&str; 4] = ["secret key", "api key", "密钥", "机密密钥"];
+/// 配置 Agent 不得提交的表单：生成密钥（只能由用户点），以及编辑已有 Tunnel（配置只读取它的名称和 ID，
+/// 不修改账号里已有的资源）。判断依据是提交按钮所在对话框/表单的文字，与按钮文案和语言无关。
+const SETUP_FORBIDDEN_SUBMIT_CONTEXT: [&str; 5] =
+    ["secret key", "api key", "密钥", "机密密钥", "edit tunnel"];
 const READ_STATE_RETRY_DELAY: Duration = Duration::from_millis(300);
 const NAVIGATE_RETRIES: usize = 30;
 const NAVIGATE_RETRY_DELAY: Duration = Duration::from_millis(400);
