@@ -189,7 +189,7 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 
 除以上各条外，本文件关于显示路径、安全边界、popup、视口、焦点、协议与恢复的全部规则对 `webSession` 同样适用。
 
-Desktop Control 3.8 要求 GPT Web 配置写命令携带 Agent lease/fence（旧宿主在版本握手时拒绝）。GPT Web 配置使用同一 Authority lease 与原生输入链，复用 Main `agent_cursor` 与 Renderer Top Layer 覆盖层。配置 Worker 的每次 CDP 请求绑定本次 lease/fence，Main 在 Surface lane 中检查控制仍有效；用户接管后拒绝后续输入，配置脚本不允许合成事件或直接改写文本字段绕过控制。每条配置命令结算后释放控制，登录、验证码和密钥输入阶段交由用户处理。
+Desktop Control 3.8 要求 GPT Web 配置写命令携带 Agent lease/fence（旧宿主在版本握手时拒绝）。GPT Web 配置使用同一 Authority lease 与原生输入链，复用 Main `agent_cursor` 与 Renderer Top Layer 覆盖层。配置的每次 CDP 请求绑定本次 lease/fence，Main 在 Surface lane 中检查控制仍有效；页面里不运行配置脚本，也不合成事件或直接改写文本字段绕过控制。配置运行期间 Agent 持有这张租约并跨命令保留（剩余有效期不足时续租），运行结束（交接、完成、取消、失败）一律释放，登录、验证码和密钥输入阶段交由用户处理。用户在 Agent 思考期间动页面时 Main 识别为接管并撤销租约，daemon 等用户停手（无输入 2.5 秒）后清掉接管并重新取得控制，被打断的那一步不执行、由 Agent 依据最新快照重新规划；等不到停手才交还用户手动继续。Agent 取得控制时 Main 会把自适应视口钉成当前尺寸，释放时还原为自适应（用户或工具显式选的固定视口不受影响）。
 
 ### 4.4 自动化不改布局与代理保留页面
 

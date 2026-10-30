@@ -1164,7 +1164,7 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
       : action.kind === 'text' ? card.items[action.item]?.textInput : action.kind === 'custom' ? card.items[action.item]?.customNode : card.items[action.item]?.nodes[action.index];
     if (!node || node.disabled || node.getAttribute('aria-disabled') === 'true') throw new Error('web_question_target_unavailable:页面控件不可用');
     if (!exposed(node)) throw new Error('web_question_target_unavailable:页面控件已隐藏');
-    await globalThis.__magiSetupInput.perform(action.kind === 'text' ? 'type' : 'click', node, action.text);
+    await globalThis.__magiNativeInput.perform(action.kind === 'text' ? 'type' : 'click', node, action.text);
     return true;
   };
 

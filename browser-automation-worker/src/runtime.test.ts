@@ -243,7 +243,7 @@ function webScriptedPort(responses: WebScriptResponses): ScriptedPort {
     if (expression.includes("globalThis.__magiWebModel.savedMessages()")) {
       return { result: { value: responses.savedMessages ?? null } };
     }
-    if (expression.includes("globalThis.__magiSetupInput") && expression.includes(".snapshot()")) {
+    if (expression.includes("globalThis.__magiNativeInput") && expression.includes(".snapshot()")) {
       return { result: { value: { done: true, failed: false, value: setupValue, request: null } } };
     }
 

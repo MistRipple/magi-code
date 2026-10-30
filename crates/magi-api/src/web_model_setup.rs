@@ -588,8 +588,7 @@ impl ApiState {
         if !matches!(
             record.stage.as_str(),
             "credentials" | "tunnel" | "connecting"
-        ) && !(record.stage == "connector" && record.reason == "connector_access_denied")
-        {
+        ) {
             return Err(ApiError::Conflict("当前步骤不接受凭据".into()));
         }
         let mut config = self.web_model.configured().unwrap_or_default();
@@ -957,8 +956,7 @@ mod tests {
     async fn inline_credentials_can_repair_connection_stages_but_not_reopen_completed_setup() {
         for (stage, reason, allowed) in [
             ("connecting", "client_exit", true),
-            ("connector", "connector_access_denied", true),
-            ("connector", "connector_write_started", false),
+            ("connector", "agent_handoff", false),
             ("complete", "", false),
             ("cancelled", "", false),
         ] {

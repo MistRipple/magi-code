@@ -1,4 +1,4 @@
-import { INSTALL_WEB_SETUP_INPUT } from "./web-setup-input.js";
+import { INSTALL_WEB_NATIVE_INPUT } from "./web-native-input.js";
 import { createHash, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute } from "node:path";
@@ -353,7 +353,7 @@ export class BrowserAutomationRuntime {
         const { selector, text, mode, expect_text_digest: expectDigest } = command.payload;
         const timeoutMs = normalizeWebCommandTimeout(command.payload.timeout_ms);
         const expectedText = normalizeComposerText(text);
-        const observed = await this.runSetupInput(
+        const observed = await this.runNativeInput(
           binding,
           `globalThis.__magiWebModel.writeText(${JSON.stringify({
             selector,
@@ -457,7 +457,7 @@ export class BrowserAutomationRuntime {
         await this.ensureWebModelAdapter(binding);
         // 提交只负责「把输入交给站点并观察输入框是否清空」；是否被接受由
         // `web_turn_state` 的消息计数证据判定，不以返回成功为准（§5.6 步骤 4）。
-        const submitted = await this.runSetupInput(binding, "globalThis.__magiWebModel.submit()");
+        const submitted = await this.runNativeInput(binding, "globalThis.__magiWebModel.submit()");
         if (!isWebSubmitResult(submitted)) {
           throw protocolFailure(
             "web_submit_result_invalid",
@@ -838,10 +838,10 @@ export class BrowserAutomationRuntime {
   }
 
   /** 配置页面只识别目标；写入共享通用工具的原生输入、命中检查和确认。 */
-  private async runSetupInput(binding: BrowserSurfaceBinding, expression: string): Promise<unknown> {
+  private async runNativeInput(binding: BrowserSurfaceBinding, expression: string): Promise<unknown> {
     const id = randomUUID();
-    const state = "globalThis.__magiSetupInput";
-    await this.evaluate(binding, `${INSTALL_WEB_SETUP_INPUT}(${JSON.stringify(id)}, ${JSON.stringify(expression)})`);
+    const state = "globalThis.__magiNativeInput";
+    await this.evaluate(binding, `${INSTALL_WEB_NATIVE_INPUT}(${JSON.stringify(id)}, ${JSON.stringify(expression)})`);
     let inputStarted = false;
     try {
       const deadline = Date.now() + 90_000;
@@ -850,9 +850,9 @@ export class BrowserAutomationRuntime {
           done: boolean; failed: boolean; value: unknown;
           request: { kind: string; ref: string; value: string | null } | null;
         }>(binding, `${state}?.id === ${JSON.stringify(id)} ? ${state}.snapshot() : null`);
-        if (!next) throw protocolFailure("browser_setup_input_closed", "配置操作已失效", true);
+        if (!next) throw protocolFailure("browser_native_input_closed", "配置操作已失效", true);
         if (next.done) {
-          if (next.failed) throw protocolFailure("browser_setup_input_failed", "配置页面操作未确认", true);
+          if (next.failed) throw protocolFailure("browser_native_input_failed", "配置页面操作未确认", true);
           return next.value;
         }
         const request = next.request;
@@ -868,11 +868,11 @@ export class BrowserAutomationRuntime {
             // 再复用 Worker 已有的受控 select 语义写入和回读确认，不合成 click 事件。
             await this.pointerAction(binding, "mousemove", request.ref, null);
             await this.setSelectValue(binding, target, request.value, false);
-          } else throw protocolFailure("browser_setup_input_invalid", "配置输入类型无效");
+          } else throw protocolFailure("browser_native_input_invalid", "配置输入类型无效");
           await this.evaluate(binding, `${state}?.id === ${JSON.stringify(id)} && ${state}.settle()`);
         } else await waitWithSignal(50, this.#cdp.currentSignal());
       }
-      throw protocolFailure("browser_setup_input_timeout", "配置操作超时，请检查页面", true);
+      throw protocolFailure("browser_native_input_timeout", "配置操作超时，请检查页面", true);
     } catch (cause) {
       throw inputStarted ? sideEffectFailure(cause) : cause;
     } finally {
@@ -1649,7 +1649,7 @@ export class BrowserAutomationRuntime {
         if (!confirmed) throw protocolFailure("web_question_answer_unconfirmed", "页面没有确认选项或输入，未提交", true);
       }
       try {
-        const activated = await this.runSetupInput(binding,
+        const activated = await this.runNativeInput(binding,
           `globalThis.__magiWebModel.activateQuestionAction(${JSON.stringify(questionId)}, ${JSON.stringify(action)})`);
         if (activated !== true) throw protocolFailure("web_question_answer_unconfirmed", "页面操作未确认", true);
       } catch (cause) { throw sideEffectFailure(cause); }
