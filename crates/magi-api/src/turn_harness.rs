@@ -719,7 +719,12 @@ impl HarnessModelClient {
                 }
                 let current_messages = &messages[messages
                     .iter()
-                    .rposition(|message| message.role == "user")
+                    .rposition(|message| {
+                        // 末尾追加的引用/计划等运行时上下文也是 user 角色，不是回合起点。
+                        message.role == "user"
+                            && message.context_origin
+                                == magi_bridge_client::ChatMessageOrigin::Conversation
+                    })
                     .unwrap_or(0)..];
                 let spawn_count = current_messages
                     .iter()

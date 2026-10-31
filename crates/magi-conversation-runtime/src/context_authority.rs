@@ -1780,6 +1780,30 @@ pub(crate) fn estimate_tool_definition_tokens(tools: Option<&[ChatToolDefinition
         .unwrap_or_default()
 }
 
+/// 刚读取的文件结果在创建时就是“当前”事实，直接带上与历史校验相同的 `fact_state` 标注。
+///
+/// 回合边界重建历史时 `validate_workspace_file_facts` 会给未变化的读取结果补上同一标注；
+/// 如果实时消息创建时不带它，下一回合同一条结果的字节就变了，其后的整段历史缓存全部失效。
+pub(crate) fn with_current_file_fact(content: String) -> String {
+    let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return content;
+    };
+    if payload.get("tool").and_then(serde_json::Value::as_str) != Some("file_read")
+        || payload
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        || payload
+            .get("content_hash")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return content;
+    }
+    payload["fact_state"] = serde_json::Value::String("current".to_string());
+    payload.to_string()
+}
+
 fn validate_workspace_file_facts(history: &mut [ThreadChatMessage]) {
     for message in history.iter_mut().filter(|message| message.role == "tool") {
         let Some(content) = message.content.as_deref() else {
@@ -2097,6 +2121,43 @@ fn choose_thread_history_compaction_split(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_fresh_file_read_matches_the_next_turn_history_rebuild_byte_for_byte() {
+        use super::{validate_workspace_file_facts, with_current_file_fact};
+        let dir = std::env::temp_dir().join(format!("magi-fact-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let hash = magi_snapshot::path_content_hash(&file).unwrap();
+        let raw = serde_json::json!({
+            "tool": "file_read",
+            "path": file.to_string_lossy(),
+            "content_hash": hash,
+            "content": "hello",
+        })
+        .to_string();
+
+        // 实时消息创建时的形态，与下一回合从历史重建出的形态必须字节一致。
+        let live = with_current_file_fact(raw.clone());
+        let mut history = vec![ThreadChatMessage {
+            input_request_id: None,
+            role: "tool".to_string(),
+            content: Some(raw),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call-1".to_string()),
+            provider_context: Vec::new(),
+        }];
+        validate_workspace_file_facts(&mut history);
+        assert_eq!(history[0].content.as_deref(), Some(live.as_str()));
+        assert!(live.contains("\"fact_state\":\"current\""));
+
+        // 非 file_read 结果保持原样。
+        let other = serde_json::json!({"tool": "shell_exec", "stdout": "x"}).to_string();
+        assert_eq!(with_current_file_fact(other.clone()), other);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     use super::ContextAuthority;
     use super::{
         ContextCompactionProgress, ContextCompactionProgressGate, MAX_COMPACTION_SUMMARY_TOKENS,

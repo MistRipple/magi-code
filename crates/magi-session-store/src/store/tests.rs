@@ -5996,6 +5996,185 @@ fn rebuilding_thread_projection_while_assistant_text_streams_does_not_duplicate_
     assert_eq!(history[1].content.as_deref(), Some(full_text));
 }
 
+#[test]
+fn thread_projection_keeps_one_model_step_as_a_single_assistant_message() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-thread-step-batch");
+    store
+        .create_session(session_id.clone(), "Thread Step Batch")
+        .expect("session should be creatable");
+    let (_mission_id, thread_id) = store.ensure_session_mission(&session_id, UtcMillis(1), || {
+        MissionId::new("mission-thread-step-batch")
+    });
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-thread-step-batch", "running", 10),
+    );
+    let upsert = |item: ActiveExecutionTurnItem| {
+        store
+            .upsert_current_turn_item_for_turn(&session_id, Some("turn-thread-step-batch"), item)
+            .expect("item should upsert");
+    };
+    let mut user = test_turn_item("user-step-batch", "读两个文件");
+    user.item_seq = 1;
+    user.source_thread_id = thread_id.clone();
+    upsert(user);
+
+    // 一个模型 Step 同时发起两个调用：reasoning 与 function_call 属于同一次输出。
+    let mut step = test_turn_item("assistant-step-batch", "");
+    step.kind = "assistant_stream".to_string();
+    step.source = "assistant".to_string();
+    step.item_seq = 2;
+    step.content = None;
+    step.source_thread_id = thread_id.clone();
+    step.metadata.insert(
+        "toolCalls".to_string(),
+        json!([
+            {"id": "call-a", "type": "function", "function": {"name": "file_read", "arguments": "{}"}},
+            {"id": "call-b", "type": "function", "function": {"name": "file_read", "arguments": "{}"}},
+            {"id": "call-unrecorded", "type": "function", "function": {"name": "file_read", "arguments": "{}"}}
+        ]),
+    );
+    step.metadata.insert(
+        "providerContext".to_string(),
+        json!([{"provider": "openai_responses", "kind": "response_output_item", "data": {"type": "reasoning", "id": "rs_1"}}]),
+    );
+    upsert(step);
+    for (seq, call_id) in [(3, "call-a"), (4, "call-b")] {
+        let mut tool = test_turn_item(&format!("tool-{call_id}"), "");
+        tool.kind = "tool_call_result".to_string();
+        tool.source = "tool".to_string();
+        tool.item_seq = seq;
+        tool.tool_call_id = Some(call_id.to_string());
+        tool.tool_name = Some("file_read".to_string());
+        tool.tool_status = Some("completed".to_string());
+        tool.tool_result = Some(format!("{{\"tool\":\"file_read\",\"id\":\"{call_id}\"}}"));
+        tool.source_thread_id = thread_id.clone();
+        upsert(tool);
+    }
+
+    for round in 0..3 {
+        store
+            .rebuild_thread_message_projection(&thread_id, UtcMillis(100 + round))
+            .expect("projection should rebuild");
+    }
+    let history = store.thread_message_history(&thread_id);
+    let roles = history.iter().map(|m| m.role.as_str()).collect::<Vec<_>>();
+    assert_eq!(roles, ["user", "assistant", "tool", "tool"], "{history:?}");
+    let ids = history[1]
+        .tool_calls
+        .iter()
+        .map(|call| call.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        ["call-a", "call-b", "call-unrecorded"],
+        "调用列表取模型输出的完整列表，重建时槽位稳定"
+    );
+    assert_eq!(history[1].provider_context.len(), 1);
+    assert_eq!(history[2].tool_call_id.as_deref(), Some("call-a"));
+    assert_eq!(history[3].tool_call_id.as_deref(), Some("call-b"));
+}
+
+#[test]
+fn rebuilding_while_a_batch_executes_keeps_one_assistant_message_per_step() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-thread-batch-progress");
+    store
+        .create_session(session_id.clone(), "Thread Batch Progress")
+        .expect("session should be creatable");
+    let (_mission_id, thread_id) = store.ensure_session_mission(&session_id, UtcMillis(1), || {
+        MissionId::new("mission-thread-batch-progress")
+    });
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-thread-batch-progress", "running", 10),
+    );
+    let upsert = |item: ActiveExecutionTurnItem| {
+        store
+            .upsert_current_turn_item_for_turn(
+                &session_id,
+                Some("turn-thread-batch-progress"),
+                item,
+            )
+            .expect("item should upsert");
+    };
+    let mut user = test_turn_item("user-batch-progress", "并行读文件");
+    user.item_seq = 1;
+    user.source_thread_id = thread_id.clone();
+    upsert(user);
+    let mut step = test_turn_item("assistant-batch-progress", "");
+    step.kind = "assistant_stream".to_string();
+    step.source = "assistant".to_string();
+    step.item_seq = 2;
+    step.content = None;
+    step.source_thread_id = thread_id.clone();
+    step.metadata.insert(
+        "toolCalls".to_string(),
+        json!([
+            {"id": "call-a", "type": "function", "function": {"name": "file_read", "arguments": "{}"}},
+            {"id": "call-b", "type": "function", "function": {"name": "file_read", "arguments": "{}"}}
+        ]),
+    );
+    upsert(step);
+    // 工具条目一个个出现，每次都重建投影：assistant 槽位必须稳定，不随调用逐个出现而增长。
+    for (seq, call_id) in [(3, "call-a"), (4, "call-b")] {
+        let mut tool = test_turn_item(&format!("tool-{call_id}"), "");
+        tool.kind = "tool_call_started".to_string();
+        tool.source = "tool".to_string();
+        tool.item_seq = seq;
+        tool.tool_call_id = Some(call_id.to_string());
+        tool.tool_name = Some("file_read".to_string());
+        tool.tool_status = Some("running".to_string());
+        tool.source_thread_id = thread_id.clone();
+        upsert(tool);
+        store
+            .rebuild_thread_message_projection(&thread_id, UtcMillis(100 + seq as u64))
+            .expect("projection should rebuild");
+    }
+    for (seq, call_id) in [(3, "call-a"), (4, "call-b")] {
+        let mut tool = test_turn_item(&format!("tool-{call_id}"), "");
+        tool.kind = "tool_call_result".to_string();
+        tool.source = "tool".to_string();
+        tool.item_seq = seq;
+        tool.tool_call_id = Some(call_id.to_string());
+        tool.tool_name = Some("file_read".to_string());
+        tool.tool_status = Some("completed".to_string());
+        tool.tool_result = Some(format!("{{\"tool\":\"file_read\",\"id\":\"{call_id}\"}}"));
+        tool.source_thread_id = thread_id.clone();
+        upsert(tool);
+        store
+            .rebuild_thread_message_projection(&thread_id, UtcMillis(200 + seq as u64))
+            .expect("projection should rebuild");
+    }
+
+    let history = store.thread_message_history(&thread_id);
+    let shape = history
+        .iter()
+        .map(|message| (message.role.as_str(), message.tool_calls.len()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shape,
+        [("user", 0), ("assistant", 2), ("tool", 0), ("tool", 0)],
+        "{history:?}"
+    );
+    let ids = history[1]
+        .tool_calls
+        .iter()
+        .map(|call| call.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["call-a", "call-b"]);
+    assert!(
+        history[2..].iter().all(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|c| c.contains("\"tool\":\"file_read\""))),
+        "运行中的占位必须被真实结果替换: {history:?}"
+    );
+}
+
 fn thread_message(role: &str, content: &str) -> ThreadChatMessage {
     ThreadChatMessage {
         input_request_id: None,

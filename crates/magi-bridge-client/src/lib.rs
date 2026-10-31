@@ -13,6 +13,7 @@ mod mcp_loopback;
 mod model_loopback;
 pub mod protocol;
 pub mod reasoning;
+mod request_fingerprint;
 pub mod structured_dispatch;
 pub mod tool_concurrency;
 mod transport;

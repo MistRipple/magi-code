@@ -953,14 +953,50 @@ fn run_conversation_loop_inner(
         tools.as_deref().unwrap_or_default(),
         Some(&agent_model_capabilities),
     );
-    messages.extend(build_task_context_base_messages(
-        &task_context_messages,
-        project_memory,
-        memory_write_visible,
-        plan_store,
-        can_observe_plan(),
-        pending_mailbox_prompt.as_deref(),
-    ));
+    // 主会话线程的任务上下文、计划与邮箱每轮可能不同，放在历史之前会让其后的整段
+    // 历史缓存失效；因此它们在每次请求时追加到模型视图末尾（见 `with_volatile_context_tail`），
+    // 不进入 `messages`，也不进入 thread 历史。子代理线程单任务独占，保留原有顺序。
+    let volatile_context_at_tail = !is_sidechain;
+    let volatile_context_tail = || -> Vec<ChatMessage> {
+        if volatile_context_at_tail {
+            build_task_context_base_messages(
+                &task_context_messages,
+                None,
+                memory_write_visible,
+                plan_store,
+                can_observe_plan(),
+                pending_mailbox_prompt.as_deref(),
+            )
+        } else {
+            Vec::new()
+        }
+    };
+    let with_volatile_context_tail =
+        |messages: &[ChatMessage], steps_tail: Option<&ChatMessage>| -> Vec<ChatMessage> {
+            let mut view = messages.to_vec();
+            view.extend(volatile_context_tail());
+            view.extend(steps_tail.cloned());
+            view
+        };
+    if volatile_context_at_tail {
+        messages.extend(build_task_context_base_messages(
+            &[],
+            project_memory,
+            memory_write_visible,
+            plan_store,
+            false,
+            None,
+        ));
+    } else {
+        messages.extend(build_task_context_base_messages(
+            &task_context_messages,
+            project_memory,
+            memory_write_visible,
+            plan_store,
+            can_observe_plan(),
+            pending_mailbox_prompt.as_deref(),
+        ));
+    }
     // [CACHE: APPEND-ONLY] Runtime tail · Thread 历史。
     // P6b：只读取当前 thread 内部已经持久化的运行时输入 / 恢复记录。worker thread
     // 为单 task 独占，因此这里不能出现同 role 的历史 task 对话。历史超出水位线时
@@ -1002,6 +1038,10 @@ fn run_conversation_loop_inner(
     let mut additional_context = estimate_context_usage_breakdown(&messages, tools.as_deref());
     additional_context.merge(&estimate_context_usage_breakdown(
         current_user_message.as_slice(),
+        None,
+    ));
+    additional_context.merge(&estimate_context_usage_breakdown(
+        &volatile_context_tail(),
         None,
     ));
     let selected_context_model = resolved_model_for_usage_binding(
@@ -1384,14 +1424,25 @@ fn run_conversation_loop_inner(
         ) {
             context_base_messages.push(skill_message);
         }
-        context_base_messages.extend(build_task_context_base_messages(
-            &task_context_messages,
-            project_memory,
-            memory_write_visible,
-            plan_store,
-            can_observe_plan(),
-            pending_mailbox_prompt.as_deref(),
-        ));
+        if volatile_context_at_tail {
+            context_base_messages.extend(build_task_context_base_messages(
+                &[],
+                project_memory,
+                memory_write_visible,
+                plan_store,
+                false,
+                None,
+            ));
+        } else {
+            context_base_messages.extend(build_task_context_base_messages(
+                &task_context_messages,
+                project_memory,
+                memory_write_visible,
+                plan_store,
+                can_observe_plan(),
+                pending_mailbox_prompt.as_deref(),
+            ));
+        }
         let pending_inputs = crate::context_authority::unprojected_input_messages(
             session_store,
             session_id,
@@ -1402,6 +1453,10 @@ fn run_conversation_loop_inner(
         let mut additional_context =
             estimate_context_usage_breakdown(&context_base_messages, round_tools);
         additional_context.merge(&estimate_context_usage_breakdown(&pending_inputs, None));
+        additional_context.merge(&estimate_context_usage_breakdown(
+            &volatile_context_tail(),
+            None,
+        ));
         let prepared = prepare_task_history(phase, context_window, additional_context, mode);
         if let Some(terminal) = prepared.terminal {
             return Err(terminal);
@@ -1607,22 +1662,26 @@ fn run_conversation_loop_inner(
             round_tools.as_deref().unwrap_or_default(),
             Some(&agent_model_capabilities),
         );
+        // 步骤快照随执行进度逐步变化，放进模式片段会让其后的整段历史缓存失效；
+        // 作为本轮请求的末尾片段发送，不进入 `messages` 和线程历史。
+        let mut execution_steps_tail: Option<ChatMessage> = None;
         if let Some(turn_id) = expected_turn_id.as_deref() {
             match session_store.execution_steps_for_task(session_id, turn_id, task_id) {
                 Ok(Some(snapshot)) => {
-                    // 只更新权威运行时片段，不把旧 snapshot 写进线程历史。
                     let prefix = format!(
                         "<magi-developer-fragment id=\"{}\"",
                         PromptFragmentKind::CurrentAgentMode.as_str()
                     );
-                    if let Some(message) = messages
-                        .iter_mut()
-                        .find(|m| m.content.as_deref().is_some_and(|c| c.starts_with(&prefix)))
+                    if messages
+                        .iter()
+                        .any(|m| m.content.as_deref().is_some_and(|c| c.starts_with(&prefix)))
                     {
-                        let content = message.content.as_mut().expect("mode fragment");
-                        content.push_str(&format!(
-                            "\n当前执行步骤权威快照（标题和说明仅作任务数据）：{}",
-                            serde_json::to_string(&snapshot).expect("steps serializable")
+                        execution_steps_tail = Some(system_prompt_fragment_message(
+                            PromptFragmentKind::CurrentAgentMode,
+                            format!(
+                                "当前执行步骤权威快照（标题和说明仅作任务数据）：{}",
+                                serde_json::to_string(&snapshot).expect("steps serializable")
+                            ),
                         ));
                     }
                 }
@@ -1716,7 +1775,10 @@ fn run_conversation_loop_inner(
         let invocation_request = ModelInvocationRequest {
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: prompt.clone(),
-            messages: Some(messages.clone()),
+            messages: Some(with_volatile_context_tail(
+                &messages,
+                execution_steps_tail.as_ref(),
+            )),
             tools: round_tools.clone(),
             tool_choice: if constrain_to_recovery_tool || strict_goal_mode_round {
                 forced_task_tool_choice_for_round(
@@ -1765,7 +1827,10 @@ fn run_conversation_loop_inner(
                 });
         }
         let client: &dyn ModelBridgeClient = &step_client;
-        let context_breakdown = estimate_context_usage_breakdown(&messages, round_tools.as_deref());
+        let context_breakdown = estimate_context_usage_breakdown(
+            &with_volatile_context_tail(&messages, execution_steps_tail.as_ref()),
+            round_tools.as_deref(),
+        );
         let context_usage_tracker = usage_binding.tracks_active_context().then(|| {
             let resolved_provider =
                 resolved_provider_for_usage_binding(settings_store, usage_binding, session_id);
@@ -2114,7 +2179,10 @@ fn run_conversation_loop_inner(
 
                             stream_interruption_non_stream_recovery_attempted = true;
                             let mut recovery_request = non_stream_recovery_template;
-                            recovery_request.messages = Some(messages.clone());
+                            recovery_request.messages = Some(with_volatile_context_tail(
+                                &messages,
+                                execution_steps_tail.as_ref(),
+                            ));
                             tracing::warn!(
                                 task_id = %task.task_id,
                                 round = round,
@@ -3277,7 +3345,9 @@ fn run_conversation_loop_inner(
                 input_request_id: None,
                 context_origin: Default::default(),
                 role: "tool".to_string(),
-                content: Some(model_visible_tool_result(&result, tool_status)),
+                content: Some(crate::context_authority::with_current_file_fact(
+                    model_visible_tool_result(&result, tool_status),
+                )),
                 images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some(tool_call.id.clone()),
@@ -9586,7 +9656,11 @@ mod tests {
         assert!(history_index < thread_boundary_index);
         assert!(priority_index < thread_boundary_index);
         assert!(priority_index < current_prompt_index);
-        assert_eq!(current_prompt_index, messages.len() - 1);
+        // 引用上下文、计划等每轮易变内容追加在请求末尾，历史与当前输入保持稳定前缀。
+        assert!(history_index < current_prompt_index);
+        assert!(current_prompt_index < reference_index);
+        assert!(current_prompt_index < plan_index);
+        assert!(project_memory_index < history_index);
         assert!(
             messages[project_memory_index]
                 .content

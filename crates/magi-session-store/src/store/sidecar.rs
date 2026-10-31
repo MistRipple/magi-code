@@ -2639,6 +2639,18 @@ impl SessionStore {
             .iter()
             .filter(|turn| turn.session_id == thread.session_id && !turn.is_session_command())
         {
+            // 一个模型 Step 的输出（reasoning + 一批 function_call）作为一条 assistant 消息投影，
+            // 与实时循环写入 thread 的形态一致；否则回合边界重建出的历史与上一轮实际发送的
+            // 前缀字节不同，提示词缓存在整段历史处失效。调用列表取模型输出的完整列表，
+            // 不随 ToolCall 条目逐个出现而增长，这样每次重建命中同一个历史槽位。
+            let recorded_call_ids = turn
+                .items
+                .iter()
+                .filter(|item| item.source_thread_id == *thread_id)
+                .filter_map(|item| item.tool.as_ref().map(|tool| tool.call_id.clone()))
+                .collect::<std::collections::HashSet<_>>();
+            let mut batched_calls = Vec::<(String, String)>::new();
+            let mut batched_call_ids = std::collections::HashSet::<String>::new();
             for item in turn.items.iter().filter(|item| {
                 item.source_thread_id == *thread_id
                     || (thread.role_id != ORCHESTRATOR_ROLE_ID
@@ -2673,10 +2685,19 @@ impl SessionStore {
                         }
                     }
                     CanonicalTurnItemKind::AssistantText => {
+                        let batch_tool_calls = item
+                            .metadata
+                            .get("toolCalls")
+                            .and_then(|value| {
+                                serde_json::from_value::<Vec<ThreadChatToolCall>>(value.clone())
+                                    .ok()
+                            })
+                            .unwrap_or_default();
                         if item
                             .content
                             .as_deref()
                             .is_some_and(|content| !content.trim().is_empty())
+                            || !batch_tool_calls.is_empty()
                         {
                             let provider_context = item
                                 .metadata
@@ -2688,14 +2709,13 @@ impl SessionStore {
                                     .ok()
                                 })
                                 .unwrap_or_default();
-                            let tool_calls = item
-                                .metadata
-                                .get("toolCalls")
-                                .and_then(|value| {
-                                    serde_json::from_value::<Vec<ThreadChatToolCall>>(value.clone())
-                                        .ok()
-                                })
-                                .unwrap_or_default();
+                            let tool_calls = batch_tool_calls;
+                            for call in &tool_calls {
+                                if batched_call_ids.insert(call.id.clone()) {
+                                    batched_calls
+                                        .push((call.id.clone(), call.function.name.clone()));
+                                }
+                            }
                             projected.push(ThreadChatMessage {
                                 input_request_id: None,
                                 role: "assistant".to_string(),
@@ -2711,26 +2731,28 @@ impl SessionStore {
                         let Some(tool) = item.tool.as_ref() else {
                             continue;
                         };
-                        projected.push(ThreadChatMessage {
-                            input_request_id: None,
-                            role: "assistant".to_string(),
-                            content: None,
-                            images: Vec::new(),
-                            tool_calls: vec![ThreadChatToolCall {
-                                id: tool.call_id.clone(),
-                                kind: "function".to_string(),
-                                function: ThreadChatToolFunction {
-                                    name: tool.name.clone(),
-                                    arguments: tool
-                                        .arguments
-                                        .as_ref()
-                                        .map(value_text)
-                                        .unwrap_or_else(|| "{}".to_string()),
-                                },
-                            }],
-                            tool_call_id: None,
-                            provider_context: Vec::new(),
-                        });
+                        if !batched_call_ids.contains(&tool.call_id) {
+                            projected.push(ThreadChatMessage {
+                                input_request_id: None,
+                                role: "assistant".to_string(),
+                                content: None,
+                                images: Vec::new(),
+                                tool_calls: vec![ThreadChatToolCall {
+                                    id: tool.call_id.clone(),
+                                    kind: "function".to_string(),
+                                    function: ThreadChatToolFunction {
+                                        name: tool.name.clone(),
+                                        arguments: tool
+                                            .arguments
+                                            .as_ref()
+                                            .map(value_text)
+                                            .unwrap_or_else(|| "{}".to_string()),
+                                    },
+                                }],
+                                tool_call_id: None,
+                                provider_context: Vec::new(),
+                            });
+                        }
                         // 等待授权的调用尚未执行（批准后会先改写为 running）；它记录的进度
                         // 不是工具结果，投影为“中断、未执行”，恢复后可以重新申请授权。
                         let question_result = item
@@ -2801,6 +2823,32 @@ impl SessionStore {
                     CanonicalTurnItemKind::AssistantThinking
                     | CanonicalTurnItemKind::TaskStatus
                     | CanonicalTurnItemKind::SystemNotice => {}
+                }
+            }
+            // 回合已经结束，但模型输出的某些调用从未开始执行：补“未执行”结果，避免历史里留下
+            // 没有结果的悬空调用。回合仍在运行时由实时循环写入结果，这里不预先占位。
+            if turn.status.is_terminal() {
+                for (call_id, tool_name) in &batched_calls {
+                    if recorded_call_ids.contains(call_id) {
+                        continue;
+                    }
+                    projected.push(ThreadChatMessage {
+                        input_request_id: None,
+                        role: "tool".to_string(),
+                        content: Some(
+                            serde_json::json!({
+                                "tool": tool_name,
+                                "status": "interrupted",
+                                "execution": "not_started",
+                                "reason": "task_interrupted_before_tool_execution_started",
+                            })
+                            .to_string(),
+                        ),
+                        images: Vec::new(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: Some(call_id.clone()),
+                        provider_context: Vec::new(),
+                    });
                 }
             }
         }

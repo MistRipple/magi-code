@@ -101,6 +101,18 @@ pub type WorkspaceExecutionPreparer = dyn Fn(
     + Send
     + Sync;
 
+/// 任务标题是目标开头的截断副本（`执行: <目标前缀>`）时返回 true。
+fn task_title_is_derived_from_goal(title: &str, goal: &str) -> bool {
+    let title = title.trim();
+    let stem = title
+        .strip_prefix("执行:")
+        .or_else(|| title.strip_prefix("执行："))
+        .unwrap_or(title)
+        .trim()
+        .trim_end_matches(['…', '.']);
+    !stem.is_empty() && goal.trim_start().starts_with(stem)
+}
+
 fn tool_requires_workspace_execution_preparation(name: &str, arguments: &str) -> bool {
     BuiltinToolName::from_name(name)
         .map(|tool| tool.requires_workspace_execution_preparation(arguments))
@@ -2752,6 +2764,10 @@ impl LlmTaskDispatcher {
     ) {
         let base_prompt = if task.goal.is_empty() {
             task.title.clone()
+        } else if task_title_is_derived_from_goal(&task.title, &task.goal) {
+            // 用户回合的任务标题只是目标的截断副本；把它再拼一遍会让模型看到的输入与
+            // thread 历史里的原始用户消息不同，回合边界重建后缓存前缀在此处失效。
+            task.goal.clone()
         } else {
             format!("{}\n\n{}", task.title, task.goal)
         };
@@ -4208,6 +4224,18 @@ pub fn safety_gate_from_settings(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_title_that_only_truncates_the_goal_is_not_repeated_in_the_prompt() {
+        let goal = "只读任务,不要修改任何文件:请读取 docs/README.md 并总结仓库结构。";
+        assert!(task_title_is_derived_from_goal(
+            "执行: 只读任务,不要修改任何文件:请读取 docs/README.md",
+            goal
+        ));
+        // 标题携带目标之外的信息时保留。
+        assert!(!task_title_is_derived_from_goal("执行: 目标自动推进", goal));
+        assert!(!task_title_is_derived_from_goal("", goal));
+    }
+
     use super::*;
     use crate::CanonicalTurnEventSink;
     use crate::model_config::{
@@ -5924,7 +5952,8 @@ mod tests {
 
         let (prompt, context_messages, summary) =
             dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id));
-        assert_eq!(prompt, format!("{}\n\n{}", task.title, task.goal));
+        // 标题与目标相同（或只是其截断副本）时只发送一份目标。
+        assert_eq!(prompt, task.goal);
         let context = context_messages
             .iter()
             .filter_map(|message| message.content.as_deref())

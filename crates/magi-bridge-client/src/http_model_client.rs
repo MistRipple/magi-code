@@ -258,6 +258,11 @@ impl HttpModelBridgeClient {
                     message: format!("invalid base_url: {reason}"),
                 }
             })?;
+        crate::request_fingerprint::record_request_fingerprint(
+            &self.model,
+            &adapted.url_path,
+            &adapted.body,
+        );
         headers.append(&mut adapted.extra_headers);
         Ok(HttpModelRequest {
             url,
