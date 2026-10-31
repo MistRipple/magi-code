@@ -92,8 +92,22 @@ fn remember_response(history: &mut Vec<ChatMessage>, response: ModelResponse, re
         reply.tool_call_id = Some(call.id);
         history.push(reply);
     }
-    // Trim complete exchanges, never leave an orphan tool result in the request.
-    while history.len() > 20 {
+    trim_history(history);
+}
+
+/// 历史上限（消息条数）：超过后一次性裁到下限，而不是每步丢一轮。
+///
+/// 模型服务按前缀缓存提示词。每步都从头部删一轮会让除系统提示以外的前缀逐步全部改变，
+/// 缓存只能命中约 3k token；成批裁剪后，两次裁剪之间的每一步都只在末尾追加，历史部分也能命中。
+const HISTORY_HIGH_WATER: usize = 24;
+const HISTORY_LOW_WATER: usize = 12;
+
+/// 裁掉最早的完整轮次，绝不在请求里留下孤立的工具结果。头两条（系统提示与任务）永远保留。
+fn trim_history(history: &mut Vec<ChatMessage>) {
+    if history.len() <= HISTORY_HIGH_WATER {
+        return;
+    }
+    while history.len() > HISTORY_LOW_WATER {
         history.remove(2);
         while history.get(2).is_some_and(|message| message.role == "tool") {
             history.remove(2);
@@ -478,6 +492,32 @@ enum ActionFlow {
 }
 
 /// 批量中某一步之后是否必须停止：没有得到预期的确认结果，或旧节点引用已不可用。
+/// 把同一轮的多个原生工具调用折成一次 `setup_actions` 的参数。
+///
+/// 只接受可批量的表单动作；导航、快照、等待和检查点会改变或结束观察，必须单独成轮。
+fn calls_as_batch(calls: &[magi_bridge_client::ChatToolCall]) -> Result<Value, String> {
+    if calls.len() > MAX_BATCH_STEPS {
+        return Err(format!("同一轮最多 {MAX_BATCH_STEPS} 个动作"));
+    }
+    let mut steps = Vec::with_capacity(calls.len());
+    for call in calls {
+        let name = call.function.name.as_str();
+        if !BATCH_TOOLS.contains(&name) {
+            return Err(format!(
+                "同一轮返回多个工具时只允许 browser_click、browser_type、browser_fill_form、browser_press、browser_scroll、browser_hover；{name} 需要单独一轮（导航、快照、等待和 setup_checkpoint 都要先看结果）"
+            ));
+        }
+        let mut step: Value = serde_json::from_str(&call.function.arguments)
+            .map_err(|_| "工具参数不是合法 JSON".to_string())?;
+        let Some(object) = step.as_object_mut() else {
+            return Err("工具参数必须是对象".into());
+        };
+        object.insert("tool".into(), json!(name));
+        steps.push(step);
+    }
+    Ok(json!({ "steps": steps }))
+}
+
 fn batch_should_stop(tool: &str, result: &Value) -> bool {
     if result.get("error").is_some() {
         return true;
@@ -872,22 +912,39 @@ pub(crate) async fn run(
         tracing::info!(
             step,
             tool_count = response.tool_calls.len(),
+            tools = %response
+                .tool_calls
+                .iter()
+                .map(|call| call.function.name.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
             "GPT Web AI 配置决策"
         );
         pending_response = Some(response.clone());
-        if response.tool_calls.len() != 1 {
-            last_result = json!({"error":"每轮只执行一个工具操作，操作后重新观察；完成或人工交接必须使用 setup_checkpoint"});
+        if response.tool_calls.is_empty() {
+            last_result = json!({"error":"没有调用工具。需要操作页面时调用浏览器工具；完成或人工交接必须使用 setup_checkpoint"});
             continue;
         }
         let call = &response.tool_calls[0];
-        let args: Value = match serde_json::from_str(&call.function.arguments) {
-            Ok(args) => args,
-            Err(_) => {
-                last_result = json!({"error":"工具参数不是合法 JSON"});
-                continue;
+        let (name, args): (&str, Value) = if response.tool_calls.len() == 1 {
+            match serde_json::from_str(&call.function.arguments) {
+                Ok(args) => (call.function.name.as_str(), args),
+                Err(_) => {
+                    last_result = json!({"error":"工具参数不是合法 JSON"});
+                    continue;
+                }
+            }
+        } else {
+            // 模型在同一轮并行返回了多个原生工具调用：等价于一次 setup_actions，沿用同一套
+            // 逐步校验与“未确认即停止”规则，而不是丢弃这一轮再让模型重来。
+            match calls_as_batch(&response.tool_calls) {
+                Ok(args) => ("setup_actions", args),
+                Err(error) => {
+                    last_result = json!({"error":error});
+                    continue;
+                }
             }
         };
-        let name = call.function.name.as_str();
         if name == "setup_checkpoint" {
             match serde_json::from_value::<Checkpoint>(args)
                 .map_err(|error| error.to_string())
@@ -1493,6 +1550,104 @@ mod tests {
         let second = format!("{:?}", model.requests.lock().unwrap()[1].messages);
         assert!(second.contains("batch"));
         assert!(second.contains("批量全部执行完成"));
+    }
+    fn parallel(calls: Vec<(&str, Value)>) -> ModelResponse {
+        let mut response = ModelResponse::completed("");
+        response.status = magi_bridge_client::ModelResponseStatus::RequiresToolExecution;
+        for (index, (name, args)) in calls.into_iter().enumerate() {
+            response.tool_calls.push(ChatToolCall {
+                id: format!("call-{index}"),
+                kind: "function".into(),
+                function: ChatToolFunction {
+                    name: name.into(),
+                    arguments: args.to_string(),
+                },
+            });
+        }
+        response
+    }
+    #[test]
+    fn history_is_trimmed_in_batches_so_the_cached_prefix_stays_stable() {
+        let exchange = |id: usize| {
+            let mut response = tool("browser_click", json!({"element_ref":"a"}));
+            response.tool_calls[0].id = format!("call-{id}");
+            response
+        };
+        let mut history = vec![
+            message("system", "s".into()),
+            message("user", "task".into()),
+        ];
+        let mut prefix_changes = 0;
+        let mut previous_third: Option<String> = None;
+        for id in 0..60 {
+            remember_response(&mut history, exchange(id), &json!({"ok":true}));
+            assert!(history.len() <= HISTORY_HIGH_WATER);
+            assert_eq!(history[0].role, "system");
+            assert_eq!(history[1].role, "user");
+            assert_ne!(history[2].role, "tool", "裁剪后不能以孤立的工具结果开头");
+            let third = format!("{:?}", history[2].tool_calls);
+            if previous_third
+                .as_deref()
+                .is_some_and(|value| value != third)
+            {
+                prefix_changes += 1;
+            }
+            previous_third = Some(third);
+        }
+        assert!(
+            prefix_changes <= 12,
+            "60 步里历史头部只应在批量裁剪时改变，实际改变 {prefix_changes} 次"
+        );
+    }
+    #[tokio::test]
+    async fn parallel_tool_calls_run_as_one_batch_instead_of_wasting_the_round() {
+        let page = json!({"url":"https://platform.openai.com/x","elements":[
+            {"element_ref":"a","role":"button","name":"One"},
+            {"element_ref":"b","role":"button","name":"Two"}]});
+        let two = parallel(vec![
+            ("browser_click", json!({"element_ref":"a"})),
+            ("browser_click", json!({"element_ref":"b"})),
+        ]);
+        let done = tool(
+            "setup_checkpoint",
+            json!({"outcome":"human_required","handoff_stage":"login","detail":"x","evidence":["One"]}),
+        );
+        let (state, session, model, driver) = fixture(vec![two, done], vec![page], false);
+        run(&state, &session, &driver, None, &RunCancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            driver.actions.lock().unwrap().len(),
+            2,
+            "两个并行调用都应执行"
+        );
+        let second = format!("{:?}", model.requests.lock().unwrap()[1].messages);
+        assert!(second.contains("批量全部执行完成"));
+    }
+    #[tokio::test]
+    async fn parallel_calls_that_include_navigation_or_checkpoint_are_rejected_unexecuted() {
+        let page = json!({"url":"https://platform.openai.com/x","elements":[{"element_ref":"a","role":"button","name":"One"}]});
+        let mixed = parallel(vec![
+            ("browser_click", json!({"element_ref":"a"})),
+            (
+                "browser_navigate",
+                json!({"url":"https://platform.openai.com/"}),
+            ),
+        ]);
+        let done = tool(
+            "setup_checkpoint",
+            json!({"outcome":"human_required","handoff_stage":"login","detail":"x","evidence":["One"]}),
+        );
+        let (state, session, model, driver) = fixture(vec![mixed, done], vec![page], false);
+        run(&state, &session, &driver, None, &RunCancellation::default())
+            .await
+            .unwrap();
+        assert!(
+            driver.actions.lock().unwrap().is_empty(),
+            "含导航的并行调用不得部分执行"
+        );
+        let second = format!("{:?}", model.requests.lock().unwrap()[1].messages);
+        assert!(second.contains("需要单独一轮"));
     }
     #[tokio::test]
     async fn a_batch_stops_at_the_first_step_without_a_confirmed_result() {
