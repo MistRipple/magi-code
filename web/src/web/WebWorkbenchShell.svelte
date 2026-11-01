@@ -5,7 +5,7 @@
   $effect(() => { document.documentElement.lang = i18n.locale; });
   import { onMount, tick, untrack, type Component } from 'svelte';
   import App from '../App.svelte';
-  import { recentSessionList } from '../lib/recent-sessions';
+  import { personalSessionList } from '../lib/personal-sessions';
   import { workspacePathHints } from '../lib/workspace-display';
   import { beginPanelResize } from '../lib/panel-resize';
   import { imeEnterGuard } from '../lib/ime-enter-guard';
@@ -176,13 +176,13 @@ import {
 
   // 这些 storage key 必须先于下方 `$state` 初始化器声明——它们被
   // readInitialExpandedWorkspaces / readInitialSidebarMode / readInitialWorkspacesCollapsed /
-  // readInitialRecentSessionsCollapsed
+  // readInitialPersonalSessionsCollapsed
   // 在 $state 初始化时读取，
   // 普通的 const 受 TDZ 约束，定义在文件下方会触发 ReferenceError。
   const SIDEBAR_EXPANDED_WORKSPACES_KEY = 'magi-sidebar-expanded-workspaces';
   const SIDEBAR_MODE_KEY = 'magi-sidebar-mode';
   const SIDEBAR_WORKSPACES_COLLAPSED_KEY = 'magi-sidebar-workspaces-collapsed';
-  const SIDEBAR_RECENT_SESSIONS_COLLAPSED_KEY = 'magi-sidebar-recent-sessions-collapsed';
+  const SIDEBAR_PERSONAL_SESSIONS_COLLAPSED_KEY = 'magi-sidebar-personal-sessions-collapsed';
 
   let loading = $state(true);
   let loadError = $state('');
@@ -201,9 +201,13 @@ import {
   let workspaceSessionErrors = $state<Record<string, string>>({});
   let personalSessionsLoading = $state(true);
   let personalSessionsError = $state('');
+  // 对话区只列无项目会话；项目会话归属项目分组，不在此重复出现。
+  const personalSessionRows = $derived(
+    personalSessionList(personalSessions).filter((session) => !isInternalSession(session)),
+  );
   let expandedWorkspaceIds = $state<Record<string, boolean>>(readInitialExpandedWorkspaces());
   let workspacesCollapsed = $state(readInitialWorkspacesCollapsed());
-  let recentSessionsCollapsed = $state(readInitialRecentSessionsCollapsed());
+  let personalSessionsCollapsed = $state(readInitialPersonalSessionsCollapsed());
   let viewportWidth = $state(typeof window !== 'undefined' ? window.innerWidth : 1440);
   let sidebarOpen = $state(false);
   let workspaceActionPending = $state(false);
@@ -220,7 +224,7 @@ import {
   let projectEditError = $state('');
   const projectEditorFormId = $props.id();
   let showDeleteSessionDialog = $state(false);
-  let pendingDeleteSession = $state<{ workspace: AgentWorkspaceSummary | null; session: Session } | null>(null);
+  let pendingDeleteSession = $state<{ workspace: AgentWorkspaceSummary | null; session: Session; unavailable?: boolean } | null>(null);
   let editingSession = $state<{ workspaceId: string | null; sessionId: string } | null>(null);
   let sessionRenameDraft = $state('');
   let sessionRenameError = $state('');
@@ -1135,7 +1139,7 @@ import {
   });
 
   // 个人会话没有 workspace 指针，不能沿用上一次工作区的侧栏选择。
-  // bootstrap 完成后同步本地侧栏指针，确保最近会话的 active 状态与主对话一致。
+  // bootstrap 完成后同步本地侧栏指针，确保无项目对话的 active 状态与主对话一致。
   $effect(() => {
     if (!messagesState.bootstrapped || loading || workspaceActionPending) {
       return;
@@ -1229,45 +1233,6 @@ import {
 
   function externalAwaitingCountForSession(session: McpExternalSession): number {
     return externalApprovals.approvals.filter((approval) => approval.tokenId === session.tokenId).length;
-  }
-
-  // 最近是同一目录事实的排序视图，不持有另一份会话或项目归属。
-  function getRecentSessionList(): Session[] {
-    return recentSessionList(personalSessions, sessionsByWorkspace)
-      .filter((session) => !isInternalSession(session));
-  }
-
-  function recentSessionWorkspace(session: Session): AgentWorkspaceSummary | undefined {
-    return workspaces.find((workspace) => workspace.workspaceId === session.workspaceId);
-  }
-
-  function switchRecentSession(session: Session): void {
-    const workspace = recentSessionWorkspace(session);
-    if (workspace) switchSession(workspace, session.id);
-    else if (!session.workspaceId) switchPersonalSession(session.id);
-  }
-
-  function isEditingRecentSession(session: Session): boolean {
-    return editingSession?.sessionId === session.id
-      && (editingSession.workspaceId || '') === (session.workspaceId || '');
-  }
-
-  function beginRecentSessionRename(session: Session): Promise<void> {
-    const workspace = recentSessionWorkspace(session);
-    if (workspace) return beginSessionRename(workspace, session);
-    return session.workspaceId ? Promise.resolve() : beginPersonalSessionRename(session);
-  }
-
-  function saveRecentSessionRename(session: Session): Promise<void> {
-    const workspace = recentSessionWorkspace(session);
-    if (workspace) return saveSessionRename(workspace, session);
-    return session.workspaceId ? Promise.resolve() : savePersonalSessionRename(session);
-  }
-
-  function openRecentDeleteSessionDialog(session: Session): void {
-    const workspace = recentSessionWorkspace(session);
-    if (workspace) openDeleteSessionDialog(workspace, session);
-    else if (!session.workspaceId) openPersonalDeleteSessionDialog(session);
   }
 
   function currentSessionDirectoryEpoch(): string | null {
@@ -1592,9 +1557,9 @@ import {
     return stored === 'files' ? 'files' : 'projects';
   }
 
-  function readInitialRecentSessionsCollapsed(): boolean {
+  function readInitialPersonalSessionsCollapsed(): boolean {
     if (typeof window === 'undefined') return false;
-    return window.localStorage.getItem(SIDEBAR_RECENT_SESSIONS_COLLAPSED_KEY) === '1';
+    return window.localStorage.getItem(SIDEBAR_PERSONAL_SESSIONS_COLLAPSED_KEY) === '1';
   }
 
   function readInitialWorkspacesCollapsed(): boolean {
@@ -1615,13 +1580,13 @@ import {
     }
   }
 
-  function persistRecentSessionsCollapsed(): void {
+  function persistPersonalSessionsCollapsed(): void {
     if (typeof window === 'undefined') return;
     try {
-      if (recentSessionsCollapsed) {
-        window.localStorage.setItem(SIDEBAR_RECENT_SESSIONS_COLLAPSED_KEY, '1');
+      if (personalSessionsCollapsed) {
+        window.localStorage.setItem(SIDEBAR_PERSONAL_SESSIONS_COLLAPSED_KEY, '1');
       } else {
-        window.localStorage.removeItem(SIDEBAR_RECENT_SESSIONS_COLLAPSED_KEY);
+        window.localStorage.removeItem(SIDEBAR_PERSONAL_SESSIONS_COLLAPSED_KEY);
       }
     } catch {
       // 持久化失败不影响当前导航状态。
@@ -1645,14 +1610,14 @@ import {
     persistSidebarMode();
   });
   $effect(() => {
-    persistRecentSessionsCollapsed();
+    persistPersonalSessionsCollapsed();
   });
   $effect(() => {
     persistWorkspacesCollapsed();
   });
 
-  function toggleRecentSessions(): void {
-    recentSessionsCollapsed = !recentSessionsCollapsed;
+  function togglePersonalSessions(): void {
+    personalSessionsCollapsed = !personalSessionsCollapsed;
   }
 
   function toggleWorkspaces(): void {
@@ -2561,6 +2526,22 @@ import {
       return;
     }
     pendingDeleteSession = { workspace: null, session };
+    showDeleteSessionDialog = true;
+  }
+
+  // 无法加载的会话没有会话记录，只能凭持久化记录里的 ID 请求删除。
+  function openUnavailableSessionDeleteDialog(
+    workspace: AgentWorkspaceSummary | null,
+    unavailable: AgentUnavailableSession,
+  ): void {
+    if (pendingNavigation || messagesState.sessionHydrating) {
+      return;
+    }
+    pendingDeleteSession = {
+      workspace,
+      session: { id: unavailable.sessionId, name: unavailable.sessionId, createdAt: 0, updatedAt: 0 },
+      unavailable: true,
+    };
     showDeleteSessionDialog = true;
   }
 
@@ -3653,7 +3634,10 @@ import {
                         {/each}
                       </div>
                     {/if}
-                    <UnavailableSessionList sessions={unavailableSessionsByWorkspace[workspace.workspaceId] ?? []} />
+                    <UnavailableSessionList
+                      sessions={unavailableSessionsByWorkspace[workspace.workspaceId] ?? []}
+                      onDelete={(session) => openUnavailableSessionDeleteDialog(workspace, session)}
+                    />
                   </div>
                 {/if}
               </div>
@@ -3751,19 +3735,19 @@ import {
       {/if}
 
       {#if sidebarMode === 'projects'}
-      <section class="recent-sessions-section" class:recent-sessions-section--after-collapsed={workspacesCollapsed}>
-        <div class="section-title-row recent-sessions-header">
+      <section class="personal-sessions-section" class:personal-sessions-section--after-collapsed={workspacesCollapsed}>
+        <div class="section-title-row personal-sessions-header">
           <button
             type="button"
             class="section-title-toggle"
-            aria-expanded={!recentSessionsCollapsed}
-            aria-controls="recent-session-content"
-            aria-label={recentSessionsCollapsed ? i18n.t('web.expandRecentSessions') : i18n.t('web.collapseRecentSessions')}
-            title={recentSessionsCollapsed ? i18n.t('web.expandRecentSessions') : i18n.t('web.collapseRecentSessions')}
-            onclick={toggleRecentSessions}
+            aria-expanded={!personalSessionsCollapsed}
+            aria-controls="personal-session-content"
+            aria-label={personalSessionsCollapsed ? i18n.t('web.expandPersonalSessions') : i18n.t('web.collapsePersonalSessions')}
+            title={personalSessionsCollapsed ? i18n.t('web.expandPersonalSessions') : i18n.t('web.collapsePersonalSessions')}
+            onclick={togglePersonalSessions}
           >
-            <span class="section-title">{i18n.t('web.recentSessions')}</span>
-            <span class="section-title-chevron" class:section-title-chevron--collapsed={recentSessionsCollapsed} aria-hidden="true">
+            <span class="section-title">{i18n.t('web.personalSessions')}</span>
+            <span class="section-title-chevron" class:section-title-chevron--collapsed={personalSessionsCollapsed} aria-hidden="true">
               <Icon name="chevronDown" size={11} />
             </span>
           </button>
@@ -3780,50 +3764,53 @@ import {
             </button>
           </div>
         </div>
-        {#if !recentSessionsCollapsed}
-          <div id="recent-session-content">
-            {#if personalSessionsLoading && getRecentSessionList().length === 0}
+        {#if !personalSessionsCollapsed}
+          <div id="personal-session-content">
+            {#if personalSessionsLoading && personalSessionRows.length === 0}
               <div class="sidebar-empty sidebar-empty--nested">{i18n.t('common.loading')}</div>
-            {:else if personalSessionsError && getRecentSessionList().length === 0}
+            {:else if personalSessionsError && personalSessionRows.length === 0}
               <div class="sidebar-error">{personalSessionsError}</div>
-            {:else if getRecentSessionList().length === 0}
-              <div class="sidebar-empty sidebar-empty--nested">{i18n.t('web.noRecentSessions')}</div>
+            {:else if personalSessionRows.length === 0}
+              <div class="sidebar-empty sidebar-empty--nested">{i18n.t('web.noPersonalSessions')}</div>
             {:else}
               <div class="session-list session-list--nested">
-                {#each getRecentSessionList() as session (session.id)}
+                {#each personalSessionRows as session (session.id)}
                 {@const sessionRunning = isSessionRunning(session.workspaceId || '', session)}
                 {@const sessionIndicator = resolveSessionActivityIndicator({ isRunning: sessionRunning, hasUnreadCompletion: session.hasUnreadCompletion === true })}
                 {@const sessionLabel = session.name?.trim() || i18n.t('header.unnamedSession')}
                 {@const sessionActivityLabel = sessionIndicator === 'running' ? i18n.t('web.sessionRunning') : sessionIndicator === 'unread' ? i18n.t('web.sessionUnreadCompletion') : ''}
                 {@const sessionSelected = session.id === currentSessionId && (session.workspaceId || '') === currentBootstrapWorkspaceId()}
-                <div class="session-row recent-session-row" class:active={sessionSelected} class:editing={isEditingRecentSession(session)}>
-                  {#if isEditingRecentSession(session)}
+                <div class="session-row personal-session-row" class:active={sessionSelected} class:editing={isEditingPersonalSession(session.id)}>
+                  {#if isEditingPersonalSession(session.id)}
                     <div class="session-rename-editor">
                       <div class="session-rename-controls">
-                        <input bind:this={sessionRenameInput} bind:value={sessionRenameDraft} class:invalid={Boolean(sessionRenameError)} class="session-rename-input" maxlength={SESSION_NAME_MAX_CHARS} aria-label={i18n.t('header.renameSession')} oninput={() => { sessionRenameError = ''; }} onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void saveRecentSessionRename(session); } else if (event.key === 'Escape') { event.preventDefault(); cancelSessionRename(); } }} />
-                        <button type="button" class="btn-icon btn-icon--sm" title={i18n.t('header.saveSessionName')} onclick={() => void saveRecentSessionRename(session)}><Icon name="check" size={12} /></button>
+                        <input bind:this={sessionRenameInput} bind:value={sessionRenameDraft} class:invalid={Boolean(sessionRenameError)} class="session-rename-input" maxlength={SESSION_NAME_MAX_CHARS} aria-label={i18n.t('header.renameSession')} oninput={() => { sessionRenameError = ''; }} onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void savePersonalSessionRename(session); } else if (event.key === 'Escape') { event.preventDefault(); cancelSessionRename(); } }} />
+                        <button type="button" class="btn-icon btn-icon--sm" title={i18n.t('header.saveSessionName')} onclick={() => void savePersonalSessionRename(session)}><Icon name="check" size={12} /></button>
                         <button type="button" class="btn-icon btn-icon--sm" title={i18n.t('header.cancelSessionRename')} onclick={cancelSessionRename}><Icon name="x" size={12} /></button>
                       </div>
                       {#if sessionRenameError}<span class="session-rename-error">{sessionRenameError}</span>{/if}
                     </div>
                   {:else}
-                    <button type="button" class="session-item recent-session-item" class:active={sessionSelected} class:pending={session.id === pendingSessionSwitchId && (pendingSessionSwitchWorkspaceId || '') === (session.workspaceId || '')} data-session-id={session.id} aria-current={sessionSelected ? 'page' : undefined} aria-label={sessionActivityLabel ? `${sessionLabel}, ${sessionActivityLabel}` : sessionLabel} title={sessionLabel} onclick={() => switchRecentSession(session)}>
-                      <span class="recent-session-indicator" class:running={sessionIndicator === 'running'} class:unread={sessionIndicator === 'unread'} title={sessionActivityLabel || undefined} aria-hidden="true">
+                    <button type="button" class="session-item personal-session-item" class:active={sessionSelected} class:pending={session.id === pendingSessionSwitchId && (pendingSessionSwitchWorkspaceId || '') === (session.workspaceId || '')} data-session-id={session.id} aria-current={sessionSelected ? 'page' : undefined} aria-label={sessionActivityLabel ? `${sessionLabel}, ${sessionActivityLabel}` : sessionLabel} title={sessionLabel} onclick={() => switchPersonalSession(session.id)}>
+                      <span class="personal-session-indicator" class:running={sessionIndicator === 'running'} class:unread={sessionIndicator === 'unread'} title={sessionActivityLabel || undefined} aria-hidden="true">
                         {#if sessionIndicator === 'running'}<Icon name="loader" size={12} />{/if}
                       </span>
-                      <span class="session-name recent-session-name">{sessionLabel}</span>
-                      <span class="session-meta recent-session-meta"><span class="session-time">{formatRelativeTime(session.updatedAt || session.createdAt, relativeTimeNow, i18n.locale)}</span></span>
+                      <span class="session-name personal-session-name">{sessionLabel}</span>
+                      <span class="session-meta personal-session-meta"><span class="session-time">{formatRelativeTime(session.updatedAt || session.createdAt, relativeTimeNow, i18n.locale)}</span></span>
                     </button>
                     <div class="session-actions">
-                      <button type="button" class="btn-icon btn-icon--sm" title={i18n.t('header.renameSession')} aria-label={i18n.t('header.renameSession')} onclick={() => void beginRecentSessionRename(session)}><Icon name="pencil" size={12} /></button>
-                      <button type="button" class="btn-icon btn-icon--sm btn-icon--danger" title={i18n.t('header.deleteSession')} aria-label={i18n.t('header.deleteSession')} onclick={() => openRecentDeleteSessionDialog(session)}><Icon name="delete" size={12} /></button>
+                      <button type="button" class="btn-icon btn-icon--sm" title={i18n.t('header.renameSession')} aria-label={i18n.t('header.renameSession')} onclick={() => void beginPersonalSessionRename(session)}><Icon name="pencil" size={12} /></button>
+                      <button type="button" class="btn-icon btn-icon--sm btn-icon--danger" title={i18n.t('header.deleteSession')} aria-label={i18n.t('header.deleteSession')} onclick={() => openPersonalDeleteSessionDialog(session)}><Icon name="delete" size={12} /></button>
                     </div>
                   {/if}
                 </div>
                 {/each}
               </div>
             {/if}
-            <UnavailableSessionList sessions={unavailablePersonalSessions} />
+            <UnavailableSessionList
+              sessions={unavailablePersonalSessions}
+              onDelete={(session) => openUnavailableSessionDeleteDialog(null, session)}
+            />
           </div>
         {/if}
       </section>
@@ -4078,7 +4065,9 @@ import {
     size="sm"
     closeOnBackdrop={true}
   >
-    <p>{i18n.t('header.deleteSessionConfirm', { name: pendingDeleteSession.session.name || i18n.t('header.unnamedSession') })}</p>
+    <p>{pendingDeleteSession.unavailable
+      ? i18n.t('web.unavailableSessionDeleteConfirm', { name: pendingDeleteSession.session.id })
+      : i18n.t('header.deleteSessionConfirm', { name: pendingDeleteSession.session.name || i18n.t('header.unnamedSession') })}</p>
 
     {#snippet footer()}
       <button class="btn btn--secondary" type="button" onclick={closeDeleteSessionDialog}>{i18n.t('header.cancel')}</button>
@@ -4530,7 +4519,7 @@ import {
     gap: 2px;
   }
 
-  .recent-sessions-section {
+  .personal-sessions-section {
     display: flex;
     flex: 0 0 auto;
     flex-direction: column;
@@ -4539,7 +4528,7 @@ import {
     margin-top: var(--space-4);
   }
 
-  .recent-sessions-section--after-collapsed {
+  .personal-sessions-section--after-collapsed {
     margin-top: 0;
   }
 
@@ -4839,18 +4828,18 @@ import {
     gap: 1px;
   }
 
-  .session-item.recent-session-item {
+  .session-item.personal-session-item {
     align-items: center;
     gap: 8px;
     padding: 4px 10px;
     min-height: 28px;
   }
 
-  .recent-session-name {
+  .personal-session-name {
     line-height: 20px;
   }
 
-  .recent-session-indicator {
+  .personal-session-indicator {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -4860,11 +4849,11 @@ import {
     color: var(--info);
   }
 
-  .recent-session-indicator.running :global(svg) {
-    animation: recent-session-spin 1.2s linear infinite;
+  .personal-session-indicator.running :global(svg) {
+    animation: personal-session-spin 1.2s linear infinite;
   }
 
-  .recent-session-indicator.unread::before {
+  .personal-session-indicator.unread::before {
     content: '';
     width: 5px;
     height: 5px;
@@ -4872,39 +4861,39 @@ import {
     background: var(--foreground-muted);
   }
 
-  .recent-session-row .recent-session-meta {
+  .personal-session-row .personal-session-meta {
     min-width: 54px;
     line-height: 20px;
     font-variant-numeric: tabular-nums;
   }
 
-  .recent-session-row .session-actions {
+  .personal-session-row .session-actions {
     background: transparent;
   }
 
-  .recent-session-item:focus-visible {
+  .personal-session-item:focus-visible {
     outline: 2px solid var(--border-focus);
     outline-offset: -2px;
   }
 
   @media (hover: none) {
-    .session-item.recent-session-item {
+    .session-item.personal-session-item {
       padding-block: 8px;
       min-height: 36px;
     }
 
-    .recent-session-row .session-actions {
+    .personal-session-row .session-actions {
       opacity: 1;
       pointer-events: auto;
     }
 
-    .recent-session-row .recent-session-meta {
+    .personal-session-row .personal-session-meta {
       opacity: 0;
       pointer-events: none;
     }
   }
 
-  @keyframes recent-session-spin {
+  @keyframes personal-session-spin {
     to { transform: rotate(360deg); }
   }
 

@@ -17,6 +17,9 @@ fn apply_delta(
     next.raw_output_tokens += delta.raw_output_tokens;
     next.cache_read_tokens += delta.cache_read_tokens;
     next.cache_write_tokens += delta.cache_write_tokens;
+    next.cache_observed_call_count += delta.cache_observed_call_count;
+    next.cache_hit_call_count += delta.cache_hit_call_count;
+    next.cache_observed_input_tokens += delta.cache_observed_input_tokens;
     next.net_input_tokens += delta.net_input_tokens;
     next.net_output_tokens += delta.net_output_tokens;
     next.total_tokens += delta.total_tokens;

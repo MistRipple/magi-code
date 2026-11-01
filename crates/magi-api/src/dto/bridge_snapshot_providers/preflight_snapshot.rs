@@ -66,6 +66,8 @@ fn capture_model_preflight_checks(
         "invoke",
         LOOPBACK_MODEL_PROVIDER,
         client.invoke(ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: "bridge preflight ping".to_string(),
             messages: None,
@@ -84,6 +86,8 @@ fn capture_model_preflight_checks(
             "invoke",
             "openai-compatible",
             client.invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: "openai-compatible".to_string(),
                 prompt: "bridge preflight ping".to_string(),
                 messages: None,

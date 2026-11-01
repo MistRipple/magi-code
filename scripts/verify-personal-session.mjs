@@ -222,7 +222,8 @@ try {
   await waitFor(() => page.evaluate('document.body.innerText.includes("PERSONAL_A_DONE")'), '历史恢复');
   await waitFor(() => page.evaluate('Boolean(document.querySelector(".generated-image-block img")?.naturalWidth)'), '个人生成图片从原会话加载');
   assert.ok(await page.evaluate('document.querySelector(".ia-workspace-btn").textContent.includes("未关联项目")'));
-  await waitFor(() => page.evaluate(`document.querySelectorAll('.recent-sessions-section [data-session-id]').length === ${runToolMatrix ? 4 + personalMatrixMarkers.length : 4}`), '最近包含个人与项目会话');
+  await waitFor(() => page.evaluate(`document.querySelectorAll('.personal-sessions-section [data-session-id]').length === ${runToolMatrix ? 3 + personalMatrixMarkers.length : 3}`), '对话区只包含无项目会话');
+  assert.equal(await page.evaluate(`Boolean(document.querySelector('.personal-sessions-section [data-session-id="${project.sessionId}"]'))`), false, '项目会话不在对话区重复出现');
   await page.evaluate('document.querySelector("button[data-sidebar-mode=files]").click()');
   await waitFor(() => page.evaluate('document.querySelector("[role=tree]")?.innerText.includes("report")'), '会话文件树');
   await page.evaluate('[...document.querySelectorAll("[role=treeitem] button")].find(button => button.title.endsWith("report.md")).click()');
@@ -250,12 +251,14 @@ try {
   await waitFor(() => page.evaluate(`performance.timeOrigin !== ${previousDocument} && document.body.innerText.includes("PERSONAL_A_DONE") && Boolean(document.querySelector(".generated-image-block img")?.naturalWidth)`), '重启后刷新恢复历史与文件引用');
   await waitFor(() => page.evaluate('Boolean(document.querySelector("button[data-sidebar-mode=projects]"))'), '文件树返回按钮');
   await page.evaluate('document.querySelector("button[data-sidebar-mode=projects]").click()');
-  await waitFor(() => page.evaluate(`Boolean(document.querySelector('.recent-sessions-section [data-session-id="${project.sessionId}"]'))`), '重启后最近目录恢复');
-  await page.evaluate(`document.querySelector('.recent-sessions-section [data-session-id="${project.sessionId}"]').click()`);
-  await waitFor(() => page.evaluate('document.body.innerText.includes("PROJECT_CASE_DONE") && !document.querySelector(".ia-workspace-btn").textContent.includes("未关联项目")'), '从最近进入项目会话保持项目归属');
+  await waitFor(() => page.evaluate(`Boolean(document.querySelector('.workspace-header-btn[data-workspace-id="${workspaceId}"]'))`), '重启后项目分组恢复');
+  await page.evaluate(`(() => { const header = document.querySelector('.workspace-header-btn[data-workspace-id="${workspaceId}"]'); if (header.getAttribute('aria-expanded') !== 'true') header.click(); })()`);
+  await waitFor(() => page.evaluate(`Boolean(document.querySelector('[data-session-id="${project.sessionId}"]:not(.personal-session-item)'))`), '重启后项目目录恢复');
+  await page.evaluate(`document.querySelector('[data-session-id="${project.sessionId}"]:not(.personal-session-item)').click()`);
+  await waitFor(() => page.evaluate('document.body.innerText.includes("PROJECT_CASE_DONE") && !document.querySelector(".ia-workspace-btn").textContent.includes("未关联项目")'), '从项目分组进入项目会话保持项目归属');
   await page.evaluate('document.querySelector("[data-testid=sidebar-new-session]").click()');
   await waitFor(() => page.evaluate('document.querySelector(".ia-workspace-btn")?.textContent.includes("未关联项目") && !new URL(location.href).searchParams.get("sessionId")'), '项目会话中全局新建仍进入无项目草稿');
-  await page.evaluate(`document.querySelector('.recent-sessions-section [data-session-id="${a.sessionId}"]').click()`);
+  await page.evaluate(`document.querySelector('.personal-sessions-section [data-session-id="${a.sessionId}"]').click()`);
   await waitFor(() => page.evaluate('document.body.innerText.includes("PERSONAL_A_DONE") && document.querySelector(".ia-workspace-btn").textContent.includes("未关联项目")'), '从最近返回个人会话无项目上下文泄漏');
   assert.equal((await json(`/api/files/content?sessionId=${a.sessionId}&filePath=report.md`)).content, 'PERSONAL_A report\n');
   assert.equal((await rpc('session/read', { sessionId: a.sessionId, includeTurns: true })).session.workspaceId, null);
@@ -265,7 +268,7 @@ try {
   assert.equal(await readFile(join(fixture, 'state/personal-sessions', b.sessionId, 'report.md'), 'utf8'), 'PERSONAL_B report\n');
   assert.ok((await rpc('session/read', { sessionId: project.sessionId })).session.workspaceId);
   assert.deepEqual(errors, []);
-  console.log('✓ Chromium 最近导航、全局新建不继承项目、文件预览/下载、重启刷新不重放、删除隔离、项目历史保留');
+  console.log('✓ Chromium 项目与对话区导航、全局新建不继承项目、文件预览/下载、重启刷新不重放、删除隔离、项目历史保留');
 } catch (error) {
   console.error(logs.slice(-5000)); if (providerFailure) console.error(providerFailure);
   if (page) { console.error(await page.evaluate('document.body.innerText').catch(() => '')); console.error(errors); }

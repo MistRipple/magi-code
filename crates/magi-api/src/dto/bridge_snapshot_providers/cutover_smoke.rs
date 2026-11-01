@@ -159,6 +159,8 @@ fn capture_model_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<Brid
         LOOPBACK_MODEL_PROVIDER,
         loopback_profile,
         client.invoke(ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: "bridge cutover smoke".to_string(),
             messages: None,
@@ -180,6 +182,8 @@ fn capture_model_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<Brid
             "openai-compatible",
             profile,
             client.invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: "openai-compatible".to_string(),
                 prompt: "bridge cutover smoke".to_string(),
                 messages: None,
@@ -223,6 +227,8 @@ fn capture_direct_http_model_cutover_check(
         target,
         "openai-compatible-direct-http-v1".to_string(),
         client.invoke(ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "direct-http".to_string(),
             prompt: "bridge cutover smoke".to_string(),
             messages: None,

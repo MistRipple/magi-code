@@ -9,24 +9,18 @@ await withGoldenViteServer(async (server) => {
   const setup = await server.ssrLoadModule('/src/web/web-model-setup.ts');
   for (const [label, projection, available] of [
     ['未安装或未激活', { manifests: [], commands: [] }, false],
-    ['旧版未贡献配置命令', { manifests: [{ id: 'openai.chatgpt-web' }], commands: [] }, false],
+    ['旧版未贡献配置 Skill', { manifests: [{ id: 'openai.chatgpt-web', contributions: {} }], commands: [] }, false],
     ['残留命令无激活清单', { manifests: [], commands: [{ id: setup.WEB_MODEL_SETUP_COMMAND }] }, false],
     ['其他插件的同名命令', { manifests: [{ id: 'openai.chatgpt-web' }], commands: [{ id: 'plugin/other/setup' }] }, false],
-    ['激活且贡献配置命令', { manifests: [{ id: 'openai.chatgpt-web' }], commands: [{ id: setup.WEB_MODEL_SETUP_COMMAND }] }, true],
+    ['激活且贡献配置 Skill', { manifests: [{ id: 'openai.chatgpt-web', contributions: { skills: [{ id: 'gpt-web-setup' }] } }], commands: [] }, true],
   ]) {
     assert.equal(setup.webModelSetupAvailable(projection), available, label);
-    assert.equal(setup.isWebModelSetupRequest('帮我配置 GPT Web', setup.webModelSetupAvailable(projection)), available, label);
   }
-  for (const text of ['帮我配置 GPT Web', '请帮我配置一下gpt web插件', '配置 GPT Web', 'Please help me configure GPT Web']) {
-    assert.equal(setup.isWebModelSetupRequest(text, true), true, text);
-    assert.equal(setup.isWebModelSetupRequest(text, false), false, '未激活插件不拦截普通消息：' + text);
-  }
-  for (const text of ['不要配置 GPT Web', 'GPT Web 怎么配置？', '解释配置 GPT Web 的代码', 'configure GPT Web and delete files', 'sk-private-configure-gpt-web']) {
-    assert.equal(setup.isWebModelSetupRequest(text, true), false, text);
-  }
-  for (const stage of ['tunnel', 'credentials', 'connecting']) assert.equal(setup.setupCanEditCredentials({ stage }), true);
-  for (const stage of ['login', 'complete', 'cancelled', 'busy', 'failed']) assert.equal(setup.setupCanEditCredentials({ stage }), false);
-  assert.equal(setup.setupCanEditCredentials({ stage: 'connector', reason: 'agent_handoff' }), false);
+  for (const text of ['sk-private-secret-1234', 'sk_proj_secret0123456789']) assert.equal(setup.containsSetupSecret(text), true);
+  for (const text of ['帮我配置 GPT Web', '解释一下权限', '先别配置', 'task-local-agent-1234567890']) assert.equal(setup.containsSetupSecret(text), false);
+  assert.equal(setup.setupCanEditCredentials({ stage: 'credentials', allowedActions: ['save_credentials'] }), true);
+  assert.equal(setup.setupCanEditCredentials({ stage: 'credentials', allowedActions: [] }), false);
+  assert.equal(setup.setupCanEditCredentials({ stage: 'connector', allowedActions: ['continue'] }), false);
   const { buildStoreItems, storeGroup } = await server.ssrLoadModule('/src/lib/plugin-store.ts');
   const oldPlugin = { manifest: { id: 'openai.chatgpt-web', name: 'GPT Web', version: '1.1.0' }, activeScopes: ['application'], draining: [] };
   const bundled = { ...oldPlugin.manifest, version: '1.2.0' };
@@ -58,6 +52,9 @@ await withGoldenViteServer(async (server) => {
   }
   assert.equal(setup.setupHintKey({ stage: 'connecting', reason: 'runtime_not_ready' }, false), 'webModel.setup.hint.connecting');
   assert.equal(setup.setupHintKey({ stage: 'connecting', reason: 'stop_failed' }, false, true), 'webModel.setup.reason.connectionFailed');
+  assert.equal(setup.setupHintKey({ stage: 'connecting', continueState: 'saved_not_continued' }, false), 'webModel.setup.continueFailed');
+  assert.equal(setup.setupHintKey({ stage: 'connecting', continueState: 'waiting_channel' }, false), 'webModel.setup.waitingChannel');
+  assert.equal(setup.setupHintKey({ stage: 'connector', reason: 'connector_attribution_pending' }, false), 'webModel.setup.reason.connectorAttribution');
   for (const stage of ['tunnel', 'credentials', 'connecting', 'connector']) {
     const fresh = setup.setupCredentialInput(stage, 'tunnel_new', '', false);
     assert.equal(fresh.required, stage !== 'tunnel');

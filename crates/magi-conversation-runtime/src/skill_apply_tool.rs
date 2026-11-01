@@ -6,7 +6,7 @@ use magi_skill_runtime::{SkillIdResolution, SkillRuntime};
 
 pub const SKILL_APPLY_TOOL_NAME: &str = "skill_apply";
 
-const SKILL_APPLY_TOOL_DESCRIPTION: &str = "Load and activate one registered skill for the current turn. Use the canonical ID or a unique short name from the list below.";
+const SKILL_APPLY_TOOL_DESCRIPTION: &str = "Load a registered skill. mode=activate (default) selects the current turn's skill; mode=reference reads instructions without replacing the active skill or granting tools. When a skill is already active, use reference only. Use a canonical ID or unique short name below.";
 const SKILL_APPLY_UNAVAILABLE_PUBLIC_ERROR: &str = "Skill 能力暂不可用，请稍后重试";
 const SKILL_APPLY_INVALID_ARGUMENTS_PUBLIC_ERROR: &str = "Skill 调用参数不可用，请重新选择 Skill";
 const SKILL_APPLY_MISSING_NAME_PUBLIC_ERROR: &str = "缺少要应用的 Skill 名称";
@@ -47,6 +47,7 @@ pub fn skill_apply_tool_definition(skill_runtime: &SkillRuntime) -> ChatToolDefi
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "mode": {"type":"string", "enum":["activate", "reference"]},
                     "skill_name": {
                         "type": "string",
                         "description": "Name of the skill to apply"
@@ -107,6 +108,18 @@ pub fn execute_skill_apply_from_runtime(
         .get("context")
         .and_then(|value| value.as_str())
         .map(ToOwned::to_owned);
+    let mode = parsed
+        .get("mode")
+        .and_then(|value| value.as_str())
+        .unwrap_or("activate");
+    if !matches!(mode, "activate" | "reference") {
+        return skill_apply_failed(
+            "skill_apply_invalid_arguments",
+            SKILL_APPLY_INVALID_ARGUMENTS_PUBLIC_ERROR,
+            None,
+            vec![],
+        );
+    }
     let registry = skill_runtime.registry();
     let available_skills = registry
         .list()
@@ -159,6 +172,7 @@ pub fn execute_skill_apply_from_runtime(
             "tool": SKILL_APPLY_TOOL_NAME,
             "status": "succeeded",
             "skill_name": skill.skill_id,
+            "mode": mode,
             "title": skill.title,
             "instruction": skill.instruction,
             "allowed_tools": skill.allowed_tools,

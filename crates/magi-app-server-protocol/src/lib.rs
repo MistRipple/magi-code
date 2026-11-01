@@ -9,6 +9,11 @@ use serde_json::Value;
 
 pub mod generated;
 pub use generated::{
+    ModelTransportOutcome, ModelTransportRecord, ModelTransportUsage, ModelUsageContext,
+    ModelUsageModelConfig, ModelUsagePhase, ModelUsageSourceRole,
+};
+
+pub use generated::{
     AccessProfile, AppServerMethodKind, AppServerMethodSignature, AppServerNotificationMethod,
     AppServerNotificationParams, AppServerRequestMethod, AppServerRequestParams, AppServerResult,
     ApprovalDecision, ApprovalRequestParams, BrowserCapabilitySnapshot, BrowserHostStatus,

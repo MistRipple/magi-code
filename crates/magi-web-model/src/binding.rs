@@ -177,6 +177,19 @@ impl WebSlotTable {
         Ok(())
     }
 
+    /// 转交维护资格时始终保留预约，聊天不能插入导航；拥有者 CAS 失败不改变事实。
+    pub fn transfer_maintenance(&self, owner: &str, next: &str) -> Result<(), WebModelError> {
+        let mut state = self.state.lock().expect("web slot lock poisoned");
+        if state.slot.is_some() || state.maintenance_owner.as_deref() != Some(owner) {
+            return Err(WebModelError::new(
+                WebModelErrorCode::WebSessionBusy,
+                "配置维护归属已变化",
+            ));
+        }
+        state.maintenance_owner = Some(next.to_owned());
+        Ok(())
+    }
+
     pub fn release_maintenance(&self, owner: &str) {
         let mut state = self.state.lock().expect("web slot lock poisoned");
         if state.maintenance_owner.as_deref() == Some(owner) {
@@ -435,6 +448,24 @@ impl Drop for WebTurnLease {
 mod tests {
     use super::*;
 
+    #[test]
+    fn setup_transfer_keeps_reservation_and_old_owner_cannot_release_it() {
+        let slots = WebSlotTable::new();
+        slots.reserve_maintenance("a").unwrap();
+        assert!(slots.transfer_maintenance("foreign", "b").is_err());
+        slots.transfer_maintenance("a", "b").unwrap();
+        slots.release_maintenance("a");
+        assert_eq!(slots.maintenance_owner().as_deref(), Some("b"));
+        assert!(
+            slots
+                .claim(
+                    WebSlotOwner::new("chat", "project"),
+                    WebConversationBinding::temporary(),
+                    "page"
+                )
+                .is_err()
+        );
+    }
     #[test]
     fn setup_reservation_excludes_chat_and_other_setup_owners() {
         let slots = WebSlotTable::new();

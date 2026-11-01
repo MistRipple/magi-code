@@ -1,6 +1,26 @@
-use magi_usage_authority::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+/// 递归规范化 JSON 对象键顺序，保证等价工具 schema 的 wire 表示稳定。
+/// 数组顺序是协议语义的一部分，保持原顺序；对象键顺序不是语义，统一按字典序重建。
+pub fn canonicalize_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut normalized = Map::new();
+            for key in keys {
+                normalized.insert(
+                    key.clone(),
+                    canonicalize_json(object.get(key).expect("object key collected")),
+                );
+            }
+            Value::Object(normalized)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json).collect()),
+        _ => value.clone(),
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -281,33 +301,11 @@ pub enum LlmMessageContent {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LlmMessage {
+    /// 来自可信上下文装配器的生命周期，永远不从正文推断或向模型发送。
+    #[serde(skip)]
+    pub origin: crate::ChatMessageOrigin,
     pub role: String,
     pub content: LlmMessageContent,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LlmMessageParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_capability: Option<crate::reasoning::ReasoningCapability>,
-    pub messages: Vec<LlmMessage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<ToolDefinition>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stream: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system_prompt: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<ToolChoice>,
-    /// 推理强度配置：必须透传到协议层（OpenAI Chat 走顶层 `reasoning_effort`，
-    /// OpenAI Responses 走 `reasoning.effort`，Anthropic Messages 走
-    /// `thinking.budget_tokens` 映射）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -523,6 +521,7 @@ pub fn sanitize_summary_hijack_messages(messages: &[LlmMessage]) -> Vec<LlmMessa
 
                 if !filtered.is_empty() {
                     sanitized.push(LlmMessage {
+                        origin: message.origin,
                         role: message.role.clone(),
                         content: LlmMessageContent::Blocks(filtered),
                     });
@@ -676,10 +675,12 @@ pub fn sanitize_tool_order(messages: &[LlmMessage]) -> Vec<LlmMessage> {
                     }
 
                     cleaned.push(LlmMessage {
+                        origin: msg.origin,
                         role: "assistant".to_string(),
                         content: LlmMessageContent::Blocks(normalized_blocks),
                     });
                     cleaned.push(LlmMessage {
+                        origin: next_msg.origin,
                         role: next_msg.role.clone(),
                         content: LlmMessageContent::Blocks(result_normalized),
                     });
@@ -703,6 +704,7 @@ pub fn sanitize_tool_order(messages: &[LlmMessage]) -> Vec<LlmMessage> {
                         .collect();
                     if !retained.is_empty() {
                         cleaned.push(LlmMessage {
+                            origin: msg.origin,
                             role: msg.role.clone(),
                             content: LlmMessageContent::Blocks(retained),
                         });

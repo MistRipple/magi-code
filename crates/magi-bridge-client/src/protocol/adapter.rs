@@ -1,8 +1,9 @@
+use crate::prompt_ir::PromptIr;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
-use crate::llm_types::{LlmMessageParams, LlmResponse, LlmUsage, ToolCall};
+use crate::llm_types::{LlmResponse, LlmUsage, ToolCall};
 use crate::types::{ChatCompletionPayload, ChatToolCall, ChatToolFunction, ModelResponse};
 
 use super::utils::compatible_tool_call_id;
@@ -119,11 +120,7 @@ impl From<AdaptedResponse> for ModelResponse {
 pub trait ProviderAdapter: Send + Sync {
     fn family(&self) -> ProviderFamily;
 
-    fn build_request(
-        &self,
-        params: &LlmMessageParams,
-        model: &str,
-    ) -> Result<AdaptedRequest, String>;
+    fn build_request(&self, params: &PromptIr, model: &str) -> Result<AdaptedRequest, String>;
 
     fn parse_response(&self, status: u16, body: &str) -> Result<AdaptedResponse, String>;
 

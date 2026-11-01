@@ -42,11 +42,52 @@ impl InMemoryEventBus {
         }
     }
 
-    pub fn publish(&self, mut event: EventEnvelope) -> u64 {
+    pub fn publish(&self, event: EventEnvelope) -> u64 {
+        self.publish_internal(event, false)
+            .expect("ordinary events are not filtered")
+    }
+
+    /// 持久事实的统计投影：检查与追加共用事件锁，重放不能重复计费或复活已重置/过期的统计。
+    pub fn publish_usage_projection(&self, event: EventEnvelope) -> Option<u64> {
+        self.publish_internal(event, true)
+    }
+
+    fn publish_internal(&self, mut event: EventEnvelope, usage_projection: bool) -> Option<u64> {
         let mut recent_events = self
             .recent_events
             .write()
             .expect("event bus recent events write lock poisoned");
+        if usage_projection {
+            if event.category != crate::EventCategory::Usage {
+                return None;
+            }
+            let ledger = self
+                .audit_usage_ledger
+                .read()
+                .expect("event bus ledger lock poisoned");
+            if let Some(existing) = ledger
+                .usage_entries
+                .iter()
+                .rev()
+                .find(|entry| entry.event_id == event.event_id.as_str())
+            {
+                return Some(existing.sequence);
+            }
+            let reset_at = ledger
+                .usage_entries
+                .iter()
+                .rev()
+                .find(|entry| entry.event_type == crate::USAGE_STATS_RESET_EVENT_TYPE)
+                .map(|entry| entry.occurred_at.0);
+            if reset_at.is_some_and(|at| event.occurred_at.0 <= at)
+                || event.occurred_at.0
+                    < UtcMillis::now()
+                        .0
+                        .saturating_sub(crate::AUDIT_USAGE_LEDGER_RETENTION_MILLIS)
+            {
+                return None;
+            }
+        }
         let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
         event.sequence = sequence;
         recent_events.push(event.clone());
@@ -70,7 +111,7 @@ impl InMemoryEventBus {
         // Event retention and ledger updates are already committed above. The absence of a
         // live stream subscriber should not make the bus fail closed for normal API writes.
         let _ = self.sender.send(event);
-        sequence
+        Some(sequence)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
@@ -309,6 +350,56 @@ mod tests {
     use magi_core::EventId;
     use serde_json::json;
     use std::{fs, thread, time::Duration};
+
+    #[test]
+    fn usage_projection_is_atomic_and_does_not_resurrect_reset_or_expired_records() {
+        let bus = Arc::new(InMemoryEventBus::new(32));
+        let now = UtcMillis::now().0;
+        let usage = |id: &str, at| {
+            let mut event =
+                EventEnvelope::usage(EventId::new(id), "model.usage.recorded", json!({}));
+            event.occurred_at = UtcMillis(at);
+            event
+        };
+        let candidate = usage("same-attempt", now);
+        let threads = (0..8)
+            .map(|_| {
+                let bus = bus.clone();
+                let event = candidate.clone();
+                thread::spawn(move || bus.publish_usage_projection(event))
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            assert!(thread.join().unwrap().is_some());
+        }
+        assert_eq!(bus.audit_usage_ledger_status().usage_count, 1);
+        let mut reset = EventEnvelope::usage(
+            EventId::new("reset"),
+            crate::USAGE_STATS_RESET_EVENT_TYPE,
+            json!({}),
+        );
+        reset.occurred_at = UtcMillis(now + 1);
+        bus.publish(reset);
+        assert!(
+            bus.publish_usage_projection(usage("lost-before-reset", now))
+                .is_none()
+        );
+        assert!(
+            bus.publish_usage_projection(usage("after-reset", now + 2))
+                .is_some()
+        );
+        let fresh_bus = InMemoryEventBus::new(4);
+        assert!(
+            fresh_bus
+                .publish_usage_projection(usage(
+                    "expired",
+                    now.saturating_sub(crate::AUDIT_USAGE_LEDGER_RETENTION_MILLIS + 1000)
+                ))
+                .is_none()
+        );
+        assert_eq!(bus.audit_usage_ledger_status().usage_count, 3);
+        assert_eq!(fresh_bus.audit_usage_ledger_status().usage_count, 0);
+    }
 
     fn event(category: EventCategory, event_type: &str, sequence: u64) -> EventEnvelope {
         let mut event = match category {

@@ -1,7 +1,18 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import ts from 'typescript';
-import { aggregateUsageStatsForDisplay } from '../src/lib/usage-stats-aggregation.ts';
+import { aggregateUsageStatsForDisplay, aggregatePromptCacheStats } from '../src/lib/usage-stats-aggregation.ts';
+
+assert.equal(aggregatePromptCacheStats([{}]).requestHitRate, null, '缺失缓存 usage 必须保持未观测');
+const cache = (read, input, hits, observed) => ({ cache: {
+  observedCallCount: observed, hitCallCount: hits, inputTokens: input, readTokens: read,
+  writeTokens: 0, tokenHitRate: input ? read / input : null, requestHitRate: observed ? hits / observed : null,
+} });
+assert.equal(aggregatePromptCacheStats([cache(0, 100, 0, 1)]).tokenHitRate, 0, 'Provider 明确返回零命中不能显示为未观测');
+const weightedCache = aggregatePromptCacheStats([cache(900, 1000, 1, 1), cache(0, 9000, 0, 9), {}]);
+assert.equal(weightedCache.tokenHitRate, 0.09, '跨连接合计必须加总 token 后计算，不能平均命中率');
+assert.equal(weightedCache.requestHitRate, 0.1);
+assert.equal(weightedCache.observedCallCount, 10);
 
 const settingsStoreSource = await readFile(
   new URL('../src/stores/settings-store.svelte.ts', import.meta.url),
@@ -295,7 +306,7 @@ assert.match(
 );
 assert.match(
   settingsStatsTabSource,
-  /const selectedBreakdown = \$derived\.by[\s\S]*?identityKeys\.has\(binding\.modelIdentityKey as string\)/s,
+  /const selectedBindings = \$derived\.by[\s\S]*?identityKeys\.has\(binding\.modelIdentityKey as string\)/s,
   '点击模型时必须按模型身份筛选并展示角色明细',
 );
 assert.match(

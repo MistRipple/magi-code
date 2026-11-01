@@ -6424,6 +6424,7 @@ fn indeterminate_tool_result_can_be_written_and_restored_without_failing_the_tur
 fn test_model_step(id: &str, input_request_ids: Vec<String>) -> crate::ModelStep {
     crate::ModelStep {
         attempts: vec![crate::ModelAttempt {
+            transport: None,
             attempt_id: format!("{id}:attempt:1"),
             started_at: UtcMillis(10),
             settled_at: None,
@@ -6449,6 +6450,8 @@ fn test_model_step(id: &str, input_request_ids: Vec<String>) -> crate::ModelStep
         settled_at: None,
         status: crate::ModelStepStatus::Started,
         response_fingerprint: None,
+        prompt_frame: None,
+        cache_epoch: 0,
     }
 }
 
@@ -6937,6 +6940,64 @@ fn goal_step_accounting_is_shared_durable_and_resumes_without_resetting_usage() 
 }
 
 #[test]
+fn goal_step_charges_reported_retry_usage_once_including_native_failures() {
+    use crate::{ModelTransportOutcome, ModelTransportRecord, ModelTransportUsage};
+    let store = SessionStore::new();
+    let session = SessionId::new("goal-transport-usage");
+    store
+        .create_session(session.clone(), "retry usage")
+        .unwrap();
+    accept_test_turn(&store, &session, test_turn("retry-turn", "running", 10));
+    create_test_goal(&store, &session, "retry-turn", "retry goal");
+    store
+        .begin_model_step(
+            &session,
+            "retry-turn",
+            test_model_step("retry-step", vec![]),
+        )
+        .unwrap();
+    for index in 0..2 {
+        let record = ModelTransportRecord {
+            observed_at: None,
+            request_fingerprint: "e".repeat(64),
+            http_status: Some(200),
+            usage: Some(ModelTransportUsage {
+                input_tokens: 11,
+                output_tokens: 1,
+                cache_read_tokens: Some(5),
+                cache_write_tokens: None,
+                cache_read_included_in_input: true,
+            }),
+            outcome: Some(ModelTransportOutcome::Failed),
+        };
+        store
+            .record_model_step_transport(&session, "retry-turn", "retry-step", record)
+            .unwrap();
+        if index == 0 {
+            store
+                .start_model_step_retry(&session, "retry-turn", "retry-step")
+                .unwrap();
+        }
+    }
+    store
+        .settle_model_step(&session, "retry-turn", "retry-step", None, None, None)
+        .unwrap();
+    assert_eq!(store.current_goal(&session).unwrap().tokens_used, 24);
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    assert_eq!(restored.current_goal(&session).unwrap().tokens_used, 24);
+    assert!(
+        restored
+            .settle_model_step(&session, "retry-turn", "retry-step", None, None, None)
+            .is_err()
+    );
+    assert_eq!(restored.current_goal(&session).unwrap().tokens_used, 24);
+}
+
+#[test]
 fn failed_goal_step_settlement_cannot_publish_usage_or_release_result() {
     let store = SessionStore::new();
     let session = SessionId::new("session-goal-budget-write-failure");
@@ -7238,6 +7299,7 @@ fn shared_transport_safety_limit_blocks_new_steps_and_retries_after_restart() {
     let mut step = test_model_step("safety-step", vec![]);
     step.attempts = (1..=10_000)
         .map(|index| crate::ModelAttempt {
+            transport: None,
             attempt_id: format!("safety-step:attempt:{index}"),
             started_at: UtcMillis(10),
             settled_at: (index < 10_000).then_some(UtcMillis(10)),

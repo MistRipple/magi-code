@@ -248,7 +248,7 @@ app.whenReady().then(() => { const win = new BrowserWindow({ show: false, webPre
   await send("INBOX_GUIDE 请在当前任务下一步生效。");
   const pending = await waitFor(async () => { const rows = await queue(); return rows.length === 1 && rows[0]; }, "消息进入持久队列");
   assert.equal(pending.disabled, false, pending.title);
-  const sessionId = await page.evaluate(`document.querySelector('#recent-session-content .session-item.active[data-session-id]')?.getAttribute('data-session-id')`);
+  const sessionId = await page.evaluate(`document.querySelector('#personal-session-content .session-item.active[data-session-id]')?.getAttribute('data-session-id')`);
   assert.ok(sessionId, "队列验收需要当前真实会话身份");
   await waitFor(() => page.evaluate(`!!document.querySelector('[data-session-id="${sessionId}"] .session-running-dot.running')`), '运行中的会话显示运行灯');
   const readQueue = async () => {

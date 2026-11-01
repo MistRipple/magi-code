@@ -5,6 +5,9 @@ pub struct NormalizedUsageTotals {
     pub raw_output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    pub cache_observed_call_count: u64,
+    pub cache_hit_call_count: u64,
+    pub cache_observed_input_tokens: u64,
     pub net_input_tokens: u64,
     pub net_output_tokens: u64,
     pub total_tokens: u64,
@@ -26,6 +29,15 @@ pub fn normalize_usage_delta(delta: &UsageEventUsageDelta) -> NormalizedUsageTot
         raw_output_tokens,
         cache_read_tokens,
         cache_write_tokens,
+        cache_observed_call_count: u64::from(delta.cache_read_tokens.is_some()),
+        cache_hit_call_count: u64::from(cache_read_tokens > 0),
+        cache_observed_input_tokens: if delta.cache_read_tokens.is_some() {
+            net_input_tokens
+                .saturating_add(cache_read_tokens)
+                .saturating_add(cache_write_tokens)
+        } else {
+            0
+        },
         net_input_tokens,
         net_output_tokens,
         total_tokens: net_input_tokens.saturating_add(net_output_tokens),

@@ -1,12 +1,12 @@
+use crate::prompt_ir::PromptIr;
 use serde_json::{Value, json};
 
 use super::adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderFamily};
 use super::capability::resolve_capability_profile;
 use super::utils::reasoning_effort_label;
-use crate::cache_boundary::PROMPT_CACHE_BOUNDARY;
 use crate::llm_types::{
-    ImageSource, LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams, ToolCall,
-    ToolChoice, ToolDefinition, parse_tool_arguments,
+    ImageSource, LlmContentBlock, LlmMessage, LlmMessageContent, ToolCall, ToolChoice,
+    ToolDefinition, parse_tool_arguments,
 };
 use crate::types::ModelProviderContext;
 
@@ -24,11 +24,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
         ProviderFamily::OpenAiResponses
     }
 
-    fn build_request(
-        &self,
-        params: &LlmMessageParams,
-        model: &str,
-    ) -> Result<AdaptedRequest, String> {
+    fn build_request(&self, params: &PromptIr, model: &str) -> Result<AdaptedRequest, String> {
         let mut input = Vec::new();
         let response_call_history = ResponseCallHistory::from_messages(&params.messages);
         let mut emitted_call_ids = std::collections::HashSet::new();
@@ -47,14 +43,14 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
             "model": model,
             "input": input,
         });
-
-        if let Some(instructions) = params
-            .system_prompt
+        if let Some(key) = params
+            .prompt_cache_key
             .as_deref()
-            .filter(|value| !value.trim().is_empty())
+            .filter(|key| !key.is_empty())
         {
-            body["instructions"] = json!(instructions);
+            body["prompt_cache_key"] = json!(key);
         }
+
         if let Some(max_output_tokens) = params.max_tokens {
             body["max_output_tokens"] = json!(max_output_tokens);
         }
@@ -166,12 +162,10 @@ fn append_response_input_items(
 ) -> Result<(), String> {
     match &message.content {
         LlmMessageContent::Text(text) => {
-            if text != PROMPT_CACHE_BOUNDARY {
-                input.push(response_message_item(
-                    &message.role,
-                    vec![response_text_part(&message.role, text)],
-                ));
-            }
+            input.push(response_message_item(
+                &message.role,
+                vec![response_text_part(&message.role, text)],
+            ));
         }
         LlmMessageContent::Blocks(blocks) => {
             // Responses 的 reasoning 模型要求后续请求按原顺序回放上轮 output item。
@@ -192,10 +186,7 @@ fn append_response_input_items(
             for block in blocks {
                 match block {
                     LlmContentBlock::Text { text } => {
-                        if !has_raw_response_message
-                            && !text.is_empty()
-                            && text != PROMPT_CACHE_BOUNDARY
-                        {
+                        if !has_raw_response_message && !text.is_empty() {
                             message_parts.push(response_text_part(&message.role, text));
                         }
                     }
@@ -525,17 +516,19 @@ fn truncate(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_types::{LlmMessage, LlmMessageContent, LlmMessageParams, ToolInputSchema};
+    use crate::llm_types::{LlmMessage, LlmMessageContent, ToolInputSchema};
 
-    fn params(messages: Vec<LlmMessage>) -> LlmMessageParams {
-        LlmMessageParams {
+    fn params(messages: Vec<LlmMessage>) -> PromptIr {
+        PromptIr {
+            prompt_cache_key: None,
+
             reasoning_capability: None,
             messages,
             max_tokens: Some(512),
             temperature: None,
             tools: None,
             stream: Some(true),
-            system_prompt: None,
+
             tool_choice: None,
             reasoning_effort: None,
         }
@@ -547,10 +540,12 @@ mod tests {
             .build_request(
                 &params(vec![
                     LlmMessage {
+                        origin: Default::default(),
                         role: "developer".to_string(),
                         content: LlmMessageContent::Text("当前权限快照".to_string()),
                     },
                     LlmMessage {
+                        origin: Default::default(),
                         role: "user".to_string(),
                         content: LlmMessageContent::Text("继续执行".to_string()),
                     },
@@ -570,10 +565,12 @@ mod tests {
     fn builds_responses_message_and_function_output_items() {
         let mut request_params = params(vec![
             LlmMessage {
+                origin: Default::default(),
                 role: "user".to_string(),
                 content: LlmMessageContent::Text("run pwd".to_string()),
             },
             LlmMessage {
+                origin: Default::default(),
                 role: "assistant".to_string(),
                 content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolUse {
                     id: "call_1".to_string(),
@@ -582,6 +579,7 @@ mod tests {
                 }]),
             },
             LlmMessage {
+                origin: Default::default(),
                 role: "user".to_string(),
                 content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
                     tool_use_id: "call_1".to_string(),
@@ -691,10 +689,12 @@ mod tests {
             .build_request(
                 &params(vec![
                     LlmMessage {
+                        origin: Default::default(),
                         role: "assistant".to_string(),
                         content: LlmMessageContent::Blocks(assistant_blocks),
                     },
                     LlmMessage {
+                        origin: Default::default(),
                         role: "user".to_string(),
                         content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
                             tool_use_id: "call_123".to_string(),
@@ -726,6 +726,7 @@ mod tests {
             .build_request(
                 &params(vec![
                     LlmMessage {
+                        origin: Default::default(),
                         role: "assistant".to_string(),
                         content: LlmMessageContent::Blocks(vec![
                             LlmContentBlock::ProviderContext {
@@ -749,6 +750,7 @@ mod tests {
                         ]),
                     },
                     LlmMessage {
+                        origin: Default::default(),
                         role: "user".to_string(),
                         content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
                             tool_use_id: "call_orphan_result".to_string(),
@@ -775,6 +777,7 @@ mod tests {
             .build_request(
                 &params(vec![
                     LlmMessage {
+                        origin: Default::default(),
                         role: "assistant".to_string(),
                         content: LlmMessageContent::Blocks(vec![
                             LlmContentBlock::ProviderContext {
@@ -797,6 +800,7 @@ mod tests {
                         ]),
                     },
                     LlmMessage {
+                        origin: Default::default(),
                         role: "user".to_string(),
                         content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
                             tool_use_id: "call_current".to_string(),
@@ -863,6 +867,7 @@ mod tests {
             .build_request(
                 &params(vec![
                     LlmMessage {
+                        origin: Default::default(),
                         role: "assistant".to_string(),
                         content: LlmMessageContent::Blocks(vec![
                             LlmContentBlock::ProviderContext { context: raw_call },
@@ -874,6 +879,7 @@ mod tests {
                         ]),
                     },
                     LlmMessage {
+                        origin: Default::default(),
                         role: "user".to_string(),
                         content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
                             tool_use_id: "call_paired".to_string(),

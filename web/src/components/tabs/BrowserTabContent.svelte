@@ -196,6 +196,11 @@
   const surfaceSlotVisible = $derived(hostVisible && surfaceSlotWidth > 0 && surfaceSlotHeight > 0);
   let sessionError = $state('');
   let actionError = $state('');
+  // 当前 actionError 是否来自 webview 登记失败；登记成功后只清除这一类，不误清其它操作的错误。
+  let registrationFailureShown = false;
+  // 登记因身份过期被拒后的连续重试次数；成功即清零，用于界定“追不上”才展示错误。
+  let staleRegistrationRetries = 0;
+  const WEBVIEW_REGISTRATION_MAX_ATTEMPTS = 40;
   let busy = $state(false);
   let viewportResizeElement = $state<TopLayerPopoverElement | undefined>();
   type ViewportResizeEdge = 'left' | 'right' | 'bottom' | 'corner';
@@ -489,12 +494,16 @@
         || registeredWebviewRelease?.webContentsId !== release.webContentsId
       ) return;
       lastDisplaySizeKey = '';
+      if (isStaleSurfaceIdentityError(cause)) {
+        void synchronizeDesktopSurface();
+        return;
+      }
       actionError = errorMessage(cause);
     });
   }
 
   function scheduleWebviewRegistration(delay = 0): void {
-    if (webviewRegistrationTimer !== null || webviewRegistrationAttempts >= 40) return;
+    if (webviewRegistrationTimer !== null || webviewRegistrationAttempts >= WEBVIEW_REGISTRATION_MAX_ATTEMPTS) return;
     const run = () => {
       webviewRegistrationTimer = null;
       registerCurrentWebview();
@@ -558,6 +567,11 @@
       if (registeredWebviewKey !== key) return;
       applyDesktopViewport(next);
       webviewRegistered = true;
+      staleRegistrationRetries = 0;
+      if (registrationFailureShown) {
+        actionError = '';
+        registrationFailureShown = false;
+      }
       registeredWebviewRelease = {
         tabId: identity.tabId,
         browserSessionId,
@@ -571,7 +585,14 @@
       registeredWebviewKey = '';
       lastDisplaySizeKey = '';
       webviewRegistered = false;
+      if (isStaleSurfaceIdentityError(cause) && staleRegistrationRetries < WEBVIEW_REGISTRATION_MAX_ATTEMPTS) {
+        staleRegistrationRetries += 1;
+        void synchronizeDesktopSurface();
+        scheduleWebviewRegistration(Math.min(250, 40 + staleRegistrationRetries * 5));
+        return;
+      }
       actionError = errorMessage(cause);
+      registrationFailureShown = true;
       scheduleWebviewRegistration(250);
     });
   }
@@ -584,6 +605,13 @@
 
   function errorMessage(value: unknown): string {
     return value instanceof Error ? value.message : String(value);
+  }
+
+  // Main 在 daemon 重建 Surface 或导航时会推进 navigationRevision；渲染进程拿着旧身份登记
+  // 或同步显示尺寸会被拒绝。这是身份切换途中的预期状态，不是用户可处理的错误：
+  // 拉取最新身份后重试即可，只有长时间追不上才向用户展示。
+  function isStaleSurfaceIdentityError(value: unknown): boolean {
+    return /browser_navigation_revision_stale|browser_browser_session_stale/u.test(errorMessage(value));
   }
 
   async function refreshSession(initialLoad = false): Promise<void> {

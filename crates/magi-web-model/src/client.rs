@@ -1316,6 +1316,8 @@ mod tests {
             provider_context: Vec::new(),
         });
         ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "chatgpt_web".to_string(),
             prompt: prompt.to_string(),
             messages: Some(messages),

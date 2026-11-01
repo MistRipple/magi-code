@@ -1211,11 +1211,11 @@ async function rendererState(page) {
       expanded: item.querySelector('.conversation-phase-header')?.getAttribute('aria-expanded'),
     })),
     sessionIds: [...document.querySelectorAll('[data-session-id]')].map((item) => item.getAttribute('data-session-id')),
-    personalSessionIds: [...new Set([...document.querySelectorAll('#recent-session-content [data-session-id]')]
+    personalSessionIds: [...new Set([...document.querySelectorAll('#personal-session-content [data-session-id]')]
       .map((item) => item.getAttribute('data-session-id'))
       .filter(Boolean))],
     activePersonalSessionId: document
-      .querySelector('#recent-session-content .session-item.active[data-session-id]')
+      .querySelector('#personal-session-content .session-item.active[data-session-id]')
       ?.getAttribute('data-session-id') || null,
     workspaceIds: [...document.querySelectorAll('[data-workspace-id]')].map((item) => item.getAttribute('data-workspace-id')),
     goalCard: (() => {
@@ -2419,7 +2419,7 @@ async function waitForComposerReady(page, label) {
   }
 }
 
-// 默认沿当前作用域新建；显式个人会话必须使用最近会话栏入口。
+// 默认沿当前作用域新建；显式个人会话必须使用对话区入口。
 async function openSessionDraft(page, { personal = false } = {}) {
   const previous = await waitFor(async () => {
     const state = await rendererState(page);
@@ -2435,7 +2435,7 @@ async function openSessionDraft(page, { personal = false } = {}) {
     const button = workspace && !personal
       ? workspace.closest('.workspace-row')?.querySelector('button.row-action[aria-label]')
       : document.querySelector(personal
-        ? '.recent-sessions-header .btn-icon'
+        ? '.personal-sessions-header .btn-icon'
         : '[data-testid="sidebar-new-session"]');
     if (!button || button.disabled) throw new Error('new session button unavailable');
     button.click();
@@ -2539,7 +2539,7 @@ async function createGitConflictRepository(repositoryRoot) {
 async function selectMostRecentPersonalSession(page) {
   await waitFor(async () => (await rendererState(page)).sessionIds.length > 0, "个人会话进入侧栏");
   await page.evaluate(`(() => {
-    const sessions = [...document.querySelectorAll('#recent-session-content [data-session-id]')];
+    const sessions = [...document.querySelectorAll('#personal-session-content [data-session-id]')];
     const target = sessions.at(-1) || sessions[0];
     if (!target) throw new Error('personal session missing');
     target.click();
@@ -2555,7 +2555,7 @@ async function selectPersonalSessionById(page, sessionId) {
   const escaped = JSON.stringify(sessionId);
   await page.evaluate(`(() => {
     const sessionId = ${escaped};
-    const target = [...document.querySelectorAll('#recent-session-content [data-session-id]')]
+    const target = [...document.querySelectorAll('#personal-session-content [data-session-id]')]
       .find((item) => item.getAttribute('data-session-id') === sessionId);
     if (!target) throw new Error('personal session id missing: ' + sessionId);
     target.click();

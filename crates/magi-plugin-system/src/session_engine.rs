@@ -565,6 +565,8 @@ mod tests {
 
     fn model_request() -> ModelInvocationRequest {
         ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "plugin/example/engine".into(),
             prompt: "current input".into(),
             messages: Some(

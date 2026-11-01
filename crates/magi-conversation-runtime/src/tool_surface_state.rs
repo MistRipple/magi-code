@@ -126,8 +126,11 @@ pub(crate) fn activated_skill_id_from_tool_result(
     if tool_name != SKILL_APPLY_TOOL_NAME || status != ExecutionResultStatus::Succeeded {
         return None;
     }
-    serde_json::from_str::<serde_json::Value>(payload)
-        .ok()?
+    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    if value["mode"] == "reference" {
+        return None;
+    }
+    value
         .get("skill_name")?
         .as_str()
         .map(str::trim)
@@ -278,6 +281,31 @@ mod tests {
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     };
+
+    #[test]
+    fn reference_loading_does_not_replace_the_active_skill() {
+        let reference=serde_json::json!({"status":"succeeded","mode":"reference","skill_name":"plugin/openai.chatgpt-web/gpt-web-setup"}).to_string();
+        assert_eq!(
+            activated_skill_id_from_tool_result(
+                SKILL_APPLY_TOOL_NAME,
+                &reference,
+                ExecutionResultStatus::Succeeded
+            ),
+            None
+        );
+        let activation =
+            serde_json::json!({"status":"succeeded","mode":"activate","skill_name":"code-review"})
+                .to_string();
+        assert_eq!(
+            activated_skill_id_from_tool_result(
+                SKILL_APPLY_TOOL_NAME,
+                &activation,
+                ExecutionResultStatus::Succeeded
+            )
+            .as_deref(),
+            Some("code-review")
+        );
+    }
 
     #[test]
     fn browser_tool_surface_uses_one_round_scoped_capability_snapshot() {

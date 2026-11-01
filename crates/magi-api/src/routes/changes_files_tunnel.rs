@@ -1610,6 +1610,8 @@ async fn prompt_suggestions(
     let response = invoke_auxiliary_model_with_usage(
         client,
         ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: BUSINESS_MODEL_PROVIDER.to_string(),
             prompt: build_prompt_suggestions_instruction(
                 request.locale.as_deref(),
@@ -1628,15 +1630,12 @@ async fn prompt_suggestions(
             settings_store: Some(&state.settings_store),
             session_id: session_id.as_ref(),
             workspace_id: &workspace_binding,
-            call_id: format!(
-                "auxiliary-prompt-suggestions-{}-{}",
-                session_id
+            call_id: magi_core::EventId::unique(format!("auxiliary-prompt-suggestions-{}", session_id
                     .as_ref()
                     .map(ToString::to_string)
-                    .unwrap_or_else(|| "draft".to_string()),
-                UtcMillis::now().0
-            ),
+                    .unwrap_or_else(|| "draft".to_string()))).to_string(),
             phase: magi_usage_authority::UsagePhase::Integration,
+            purpose: magi_conversation_runtime::usage_recording::AuxiliaryModelPurpose::PromptSuggestions,
             expected_turn_id: None,
         },
     )
@@ -1837,6 +1836,8 @@ async fn enhance_prompt(
     };
 
     let invocation = ModelInvocationRequest {
+        cache_affinity_key: None,
+        prompt_cache_key: None,
         provider: BUSINESS_MODEL_PROVIDER.to_string(),
         prompt: build_enhance_prompt_instruction(
             prompt,
@@ -1849,14 +1850,14 @@ async fn enhance_prompt(
         tool_choice: None,
     };
 
-    let call_id = format!(
-        "auxiliary-prompt-enhance-{}-{}",
+    let call_id = magi_core::EventId::unique(format!(
+        "auxiliary-prompt-enhance-{}",
         session_id
             .as_ref()
             .map(ToString::to_string)
-            .unwrap_or_else(|| "draft".to_string()),
-        UtcMillis::now().0
-    );
+            .unwrap_or_else(|| "draft".to_string())
+    ))
+    .to_string();
     let response = match invoke_auxiliary_model_with_usage(
         client,
         invocation,
@@ -1868,6 +1869,8 @@ async fn enhance_prompt(
             workspace_id: &workspace_binding,
             call_id,
             phase: magi_usage_authority::UsagePhase::Integration,
+            purpose:
+                magi_conversation_runtime::usage_recording::AuxiliaryModelPurpose::PromptEnhance,
             expected_turn_id: None,
         },
     ) {

@@ -33,6 +33,9 @@ pub const WEB_MODEL_TUNNEL_SECTION: &str = "webModelTunnel";
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WebModelTunnelConfig {
+    /// 已提交的私有凭据版本引用，不包含密钥或摘要。旧配置沿用固定文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_version: Option<String>,
     /// 用户在自己的 OpenAI 账号创建的 Tunnel id。
     #[serde(default)]
     pub tunnel_id: String,
@@ -74,6 +77,24 @@ pub(crate) fn api_key_path(state_root: &std::path::Path) -> PathBuf {
     state_root.join("web-model").join("tunnel-api-key")
 }
 
+fn configured_api_key_path(
+    root: &std::path::Path,
+    config: Option<&WebModelTunnelConfig>,
+) -> PathBuf {
+    match config.and_then(|config| config.credential_version.as_deref()) {
+        Some(version)
+            if !version.is_empty()
+                && version
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') =>
+        {
+            root.join("web-model").join(format!("credential-{version}"))
+        }
+        Some(_) => root.join("web-model").join("invalid-credential-reference"),
+        None => api_key_path(root),
+    }
+}
+
 pub(crate) fn validate_api_key(api_key: &str) -> Result<(), String> {
     let key = api_key.trim();
     if key.is_empty() || key.len() > 512 || key.chars().any(char::is_whitespace) {
@@ -83,10 +104,15 @@ pub(crate) fn validate_api_key(api_key: &str) -> Result<(), String> {
 }
 
 /// 写入密钥文件（用户私有权限、原子写）。密钥原文不进日志、settings 或任何返回值。
+#[cfg(test)]
 fn write_api_key(state_root: &std::path::Path, api_key: &str) -> Result<(), String> {
     validate_api_key(api_key)?;
+    write_api_key_file(&api_key_path(state_root), api_key)
+}
+
+fn write_api_key_file(path: &std::path::Path, api_key: &str) -> Result<(), String> {
+    validate_api_key(api_key)?;
     let key = api_key.trim();
-    let path = api_key_path(state_root);
     let parent = path.parent().ok_or("密钥路径无效")?;
     std::fs::create_dir_all(parent).map_err(|error| format!("无法创建密钥目录：{error}"))?;
     let tmp = path.with_extension("tmp");
@@ -105,7 +131,7 @@ fn write_api_key(state_root: &std::path::Path, api_key: &str) -> Result<(), Stri
         file.write_all(key.as_bytes())
             .map_err(|error| format!("无法保存 API 密钥：{error}"))?;
     }
-    std::fs::rename(&tmp, &path).map_err(|error| format!("无法保存 API 密钥：{error}"))
+    std::fs::rename(&tmp, path).map_err(|error| format!("无法保存 API 密钥：{error}"))
 }
 
 /// 通道状态投影（HTTP 响应形状；不含任何凭据内容）。
@@ -143,6 +169,7 @@ struct ChannelInner {
 
 /// daemon 内的 GPT Web 工具通道运行时。
 pub struct WebModelChannelRuntime {
+    pub(crate) setup_scope: Mutex<Option<crate::web_model_setup_tools::SetupScope>>,
     pub(crate) setup_lock: tokio::sync::Mutex<()>,
     channel: Arc<WebModelChannelState>,
     inner: Mutex<ChannelInner>,
@@ -161,16 +188,14 @@ pub struct WebModelChannelRuntime {
     driver: Mutex<Option<Arc<dyn magi_web_model::WebModelPageDriver>>>,
     /// 最近一次配置时的 state root（读取密钥是否存在用）。
     state_root: Mutex<Option<PathBuf>>,
-    /// 槽位端点最近一次响应 `tools/list` 的时间（毫秒，0 表示从未）。
-    /// 这是 ChatGPT 经 Tunnel 实际读取过 Magi 工具目录的 daemon 侧事实。
-    slot_catalog_served_at: AtomicU64,
-    /// 正在运行的配置 Agent 的取消句柄。结束配置必须能打断正在持锁的运行，而不是排队等它跑完。
-    setup_run: Mutex<Option<magi_plugin_system::RunCancellation>>,
+    /// 槽位目录观察游标及产生它的通道代际。socket 本身不能证明连接器身份。
+    slot_catalog_observation: Mutex<(u64, u64)>,
 }
 
 impl WebModelChannelRuntime {
     pub fn new() -> Self {
         Self {
+            setup_scope: Mutex::new(None),
             setup_lock: tokio::sync::Mutex::new(()),
             channel: Arc::new(WebModelChannelState::new()),
             inner: Mutex::new(ChannelInner {
@@ -188,8 +213,7 @@ impl WebModelChannelRuntime {
             runtime: Mutex::new(None),
             driver: Mutex::new(None),
             state_root: Mutex::new(None),
-            slot_catalog_served_at: AtomicU64::new(0),
-            setup_run: Mutex::new(None),
+            slot_catalog_observation: Mutex::new((0, 0)),
         }
     }
 
@@ -244,6 +268,14 @@ impl WebModelChannelRuntime {
 
     pub fn configured(&self) -> Option<WebModelTunnelConfig> {
         self.lock().config.clone()
+    }
+
+    pub(crate) fn set_setup_config(&self, config: WebModelTunnelConfig) {
+        self.lock().config = Some(config);
+    }
+
+    pub(crate) fn channel_generation(&self) -> u64 {
+        self.launch_generation.load(Ordering::SeqCst)
     }
 
     pub fn status(&self) -> WebModelTunnelStatus {
@@ -335,7 +367,7 @@ impl WebModelChannelRuntime {
             .lock()
             .expect("web model state root lock poisoned")
             .as_deref()
-            .is_some_and(|root| api_key_path(root).is_file())
+            .is_some_and(|root| configured_api_key_path(root, self.configured().as_ref()).is_file())
     }
 
     /// 读取已保存的完整密钥：只给桌面端的「显示」按钮用，其余路径都只用遮罩预览。
@@ -345,7 +377,7 @@ impl WebModelChannelRuntime {
             .lock()
             .expect("web model state root lock poisoned")
             .clone()?;
-        std::fs::read_to_string(api_key_path(&root))
+        std::fs::read_to_string(configured_api_key_path(&root, self.configured().as_ref()))
             .ok()
             .map(|key| key.trim().to_string())
             .filter(|key| !key.is_empty())
@@ -367,6 +399,36 @@ impl WebModelChannelRuntime {
     fn set_phase(&self, phase: Option<(&str, String)>) {
         self.lock().phase = phase.map(|(code, detail)| (code.to_string(), detail));
         self.status();
+    }
+
+    pub(crate) fn persist_credentials(
+        &self,
+        state: &ApiState,
+        mut config: WebModelTunnelConfig,
+        api_key: Option<&str>,
+        version: Option<String>,
+    ) -> Result<WebModelTunnelConfig, String> {
+        let root = state
+            .runtime_persistence()
+            .and_then(|persistence| persistence.state_root())
+            .ok_or("没有 state root，无法保存凭据")?;
+        if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
+            config.credential_version = Some(
+                version.unwrap_or_else(|| magi_plugin_system::next_invocation_id("credential")),
+            );
+            write_api_key_file(&configured_api_key_path(root, Some(&config)), key)?;
+        } else if let Some(version) = version {
+            // 沿用密钥同样建立本次提交版本；不以 hasApiKey 冒认本次保存。
+            let key = std::fs::read_to_string(configured_api_key_path(root, Some(&config)))
+                .map_err(|_| "没有可沿用的密钥")?;
+            config.credential_version = Some(version);
+            write_api_key_file(&configured_api_key_path(root, Some(&config)), &key)?;
+        }
+        state
+            .settings_store
+            .set_section(WEB_MODEL_TUNNEL_SECTION, serde_json::json!(&config))
+            .map_err(|_| "保存凭据引用失败")?;
+        Ok(config)
     }
 
     /// 应用通道配置：保存密钥（如有）、重建托管，并在**后台**完成组件安装与启动。
@@ -395,14 +457,20 @@ impl WebModelChannelRuntime {
             self.stop_tunnel_inner(state).await?;
             let Some(config) = config else {
                 // 显式清除：连密钥文件一起删除。
+                state
+                    .settings_store
+                    .set_section(WEB_MODEL_TUNNEL_SECTION, serde_json::Value::Null)
+                    .map_err(|_| "清除通道配置失败")?;
+                let _ = std::fs::remove_file(configured_api_key_path(
+                    &state_root,
+                    self.configured().as_ref(),
+                ));
                 let _ = std::fs::remove_file(api_key_path(&state_root));
                 self.lock().config = None;
                 self.refresh_channel_status();
                 return Ok(self.status());
             };
-            if let Some(api_key) = api_key.filter(|key| !key.trim().is_empty()) {
-                write_api_key(&state_root, &api_key)?;
-            }
+            let config = self.persist_credentials(state, config, api_key.as_deref(), None)?;
             self.lock().config = Some(config.clone());
             self.launch_generation.fetch_add(1, Ordering::SeqCst) + 1
         };
@@ -420,8 +488,14 @@ impl WebModelChannelRuntime {
         )));
         let runtime = Arc::clone(self);
         let state = state.clone();
+        let deadline_state = state.clone();
         tokio::spawn(async move {
             runtime.launch(&state, state_root, launch).await;
+            state.wake_setup_continuation();
+        });
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(180)).await;
+            deadline_state.wake_setup_continuation();
         });
         Ok(self.status())
     }
@@ -469,7 +543,7 @@ impl WebModelChannelRuntime {
         let tunnel = Arc::new(TunnelManager::new(TunnelRuntimeConfig {
             client_binary: binary,
             expected_client_sha256: None,
-            credential_file: api_key_path(&state_root),
+            credential_file: configured_api_key_path(&state_root, Some(&config)),
             tunnel_id: config.tunnel_id.trim().to_string(),
             mcp_binary,
             local_endpoint: slot_endpoint,
@@ -502,7 +576,7 @@ impl WebModelChannelRuntime {
         ) {
             // `runtimes connect` 可能在托管进程健康但本地 ready 探测尚未翻转时返回：
             // 保持端点，由监视器发布最终的就绪状态，而不是拆掉一个仍在启动的运行时。
-            self.start_status_monitor(Arc::clone(&tunnel));
+            self.start_status_monitor(Arc::clone(&tunnel), state.clone());
         } else {
             state.mcp_service.stop_slot_gateway().await;
             self.lock().slot_endpoint = None;
@@ -576,7 +650,7 @@ impl WebModelChannelRuntime {
     /// 在 daemon 的异步 worker 线程之外轮询 tunnel-client 控制面。
     /// `TunnelManager::status` 刻意使用厂商 CLI 的同步状态命令；没有这个监视器时，启动后退出的
     /// tunnel 会让共享通道一直停在 `ready=true`。
-    fn start_status_monitor(&self, tunnel: Arc<TunnelManager>) {
+    fn start_status_monitor(&self, tunnel: Arc<TunnelManager>, state: ApiState) {
         let generation = self.monitor_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let monitor_generation = Arc::clone(&self.monitor_generation);
         let (stop, mut receiver) = tokio::sync::oneshot::channel();
@@ -600,6 +674,7 @@ impl WebModelChannelRuntime {
                             TunnelClientStatus::Running { .. } | TunnelClientStatus::NotReady { .. }
                         );
                         channel.set(status_from_tunnel(Some(&status)));
+                        state.wake_setup_continuation();
                         if !active {
                             break;
                         }
@@ -660,35 +735,32 @@ pub async fn restore_configured_channel(state: &ApiState) -> Option<WebModelTunn
 }
 
 impl WebModelChannelRuntime {
-    pub(crate) fn begin_setup_run(&self, cancellation: magi_plugin_system::RunCancellation) {
-        *self.setup_run.lock().expect("setup run lock poisoned") = Some(cancellation);
-    }
-
-    pub(crate) fn finish_setup_run(&self) {
-        *self.setup_run.lock().expect("setup run lock poisoned") = None;
-    }
-
-    /// 通知正在运行的配置在下一个阶段边界停止；没有运行时是空操作。
-    pub(crate) fn cancel_running_setup(&self) {
-        if let Some(cancellation) = self
-            .setup_run
+    pub(crate) fn record_slot_catalog_served(&self, channel_generation: u64) {
+        let mut observation = self
+            .slot_catalog_observation
             .lock()
-            .expect("setup run lock poisoned")
-            .as_ref()
-        {
-            cancellation.cancel();
+            .expect("catalog observation lock poisoned");
+        if channel_generation == self.channel_generation() {
+            *observation = (channel_generation, observation.1.saturating_add(1));
         }
     }
 
-    pub(crate) fn record_slot_catalog_served(&self) {
-        self.slot_catalog_served_at
-            .store(magi_core::UtcMillis::now().0, Ordering::SeqCst);
+    pub(crate) fn slot_catalog_cursor(&self) -> u64 {
+        self.slot_catalog_observation
+            .lock()
+            .expect("catalog observation lock poisoned")
+            .1
     }
 
-    /// `since` 之后是否有远端客户端经槽位端点读取过工具目录。
-    pub(crate) fn slot_catalog_served_since(&self, since: u64) -> bool {
-        let served = self.slot_catalog_served_at.load(Ordering::SeqCst);
-        served != 0 && served >= since
+    /// 当前通道在本次窗口内响应过目录；不能据此推断来源为目标 ChatGPT 连接器。
+    pub(crate) fn slot_catalog_served_after(&self, generation: u64, cursor: u64) -> bool {
+        let observation = self
+            .slot_catalog_observation
+            .lock()
+            .expect("catalog observation lock poisoned");
+        generation == self.channel_generation()
+            && observation.0 == generation
+            && observation.1 > cursor
     }
 }
 
@@ -705,6 +777,28 @@ fn resolve_mcp_binary() -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn slot_catalog_observations_require_the_current_channel_and_a_new_cursor() {
+        let runtime = super::WebModelChannelRuntime::new();
+        let cursor = runtime.slot_catalog_cursor();
+        runtime.record_slot_catalog_served(0);
+        assert!(runtime.slot_catalog_served_after(0, cursor));
+        assert!(!runtime.slot_catalog_served_after(0, runtime.slot_catalog_cursor()));
+        runtime
+            .launch_generation
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(!runtime.slot_catalog_served_after(0, cursor));
+        assert!(!runtime.slot_catalog_served_after(1, cursor));
+        let next_cursor = runtime.slot_catalog_cursor();
+        runtime.record_slot_catalog_served(0);
+        assert_eq!(
+            runtime.slot_catalog_cursor(),
+            next_cursor,
+            "旧连接迟到响应不能成为新通道证据"
+        );
+        runtime.record_slot_catalog_served(1);
+        assert!(runtime.slot_catalog_served_after(1, next_cursor));
+    }
     use super::*;
 
     #[test]
@@ -763,6 +857,7 @@ mod tests {
     #[test]
     fn the_persisted_config_holds_no_credential_material() {
         let config = WebModelTunnelConfig {
+            credential_version: None,
             tunnel_id: "t".to_string(),
             tool_profile: Some("read_only".to_string()),
             approval_mode: Some("always".to_string()),

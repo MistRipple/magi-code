@@ -48,6 +48,8 @@ impl BridgeDispatchRuntime {
                             bridge_kind: BridgeBindingKind::Model,
                         })?;
                 let request = ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: binding.bridge_target.clone(),
                     prompt: input.payload.clone(),
                     messages: None,

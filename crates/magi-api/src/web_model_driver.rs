@@ -28,8 +28,8 @@ const PAGE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 // `browser_surface_*` 交接错误是暂时的，要等得够久（约 9–12 秒），不能几秒就当作发送失败。
 const READ_STATE_RETRIES: usize = 30;
 /// 配置期间页面的桌面布局尺寸：足以显示组织切换、导航和完整表单。
-/// 所在表单/对话框出现这些词时，配置 Agent 不得点击其提交按钮（密钥只能由用户生成）。
-/// 配置 Agent 不得提交的表单：生成密钥（只能由用户点），以及编辑已有 Tunnel（配置只读取它的名称和 ID，
+/// 所在表单/对话框出现这些词时，配置执行期间不得点击其提交按钮（密钥只能由用户生成）。
+/// 配置执行期间不得提交的表单：生成密钥（只能由用户点），以及编辑已有 Tunnel（配置只读取它的名称和 ID，
 /// 不修改账号里已有的资源）。判断依据是提交按钮所在对话框/表单的文字，与按钮文案和语言无关。
 const SETUP_FORBIDDEN_SUBMIT_CONTEXT: [&str; 5] =
     ["secret key", "api key", "密钥", "机密密钥", "edit tunnel"];
@@ -44,10 +44,6 @@ const SAVED_LIST_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// 配置运行期间控制租约的有效期；剩余不足 `SETUP_CONTROL_RENEW_MARGIN` 时重新取得。
 const SETUP_CONTROL_TTL_MS: u64 = 300_000;
 const SETUP_CONTROL_RENEW_MARGIN_MS: u64 = 60_000;
-/// 用户停手这么久才算「操作完了」：期间代理不抢控制；等待上限到了才交还用户手动继续。
-const SETUP_USER_IDLE_MS: u64 = 2_500;
-const SETUP_USER_YIELD_MAX: Duration = Duration::from_secs(600);
-const SETUP_USER_YIELD_POLL: Duration = Duration::from_millis(400);
 const SETUP_COMMAND_ATTEMPTS: usize = 24;
 const SETUP_COMMAND_DELAY: Duration = Duration::from_millis(700);
 
@@ -55,13 +51,27 @@ static WEB_SETUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 tokio::task_local! {
     static WEB_SETUP_TURN: String;
+    static WEB_SETUP_CANCELLED: magi_plugin_system::RunCancellation;
 }
 
 pub(crate) async fn with_web_setup_turn<T>(
     turn_id: String,
+    cancelled: magi_plugin_system::RunCancellation,
     future: impl std::future::Future<Output = T>,
 ) -> T {
-    WEB_SETUP_TURN.scope(turn_id, future).await
+    WEB_SETUP_TURN
+        .scope(turn_id, WEB_SETUP_CANCELLED.scope(cancelled, future))
+        .await
+}
+
+fn check_setup_cancelled() -> Result<(), WebModelError> {
+    if WEB_SETUP_CANCELLED
+        .try_with(|cancellation| cancellation.is_cancelled())
+        .unwrap_or(false)
+    {
+        return Err(WebModelError::cancelled());
+    }
+    Ok(())
 }
 
 pub struct HostWebModelPageDriver {
@@ -86,7 +96,7 @@ fn setup_control_reusable(
         && active_lease == Some(&held.lease_id)
 }
 
-/// 配置 Agent 在一次运行内持有的控制：跨命令保留，用户在两条命令之间碰页面才会被 Main 识别为接管。
+/// 配置执行期间在一次运行内持有的控制：跨命令保留，用户在两条命令之间碰页面才会被 Main 识别为接管。
 #[derive(Clone)]
 struct RetainedSetupControl {
     lease_id: BrowserLeaseId,
@@ -535,7 +545,9 @@ impl HostWebModelPageDriver {
         command: BrowserHostCommand,
         failure_code: WebModelErrorCode,
     ) -> Result<serde_json::Value, WebModelError> {
+        check_setup_cancelled()?;
         let reply = self.client()?.request(command).await.map_err(host_error)?;
+        check_setup_cancelled()?;
         match reply.response.outcome {
             BrowserHostCommandOutcome::Succeeded(result) => match *result {
                 BrowserHostCommandResult::Json { value } => Ok(value),
@@ -568,8 +580,12 @@ impl HostWebModelPageDriver {
     }
 
     async fn setup_snapshot_once(&self) -> Result<serde_json::Value, WebModelError> {
+        check_setup_cancelled()?;
         let tab_id = self.home_tab()?;
-        self.refresh_primary_binding(&tab_id).await?;
+        let binding = self.refresh_primary_binding(&tab_id).await?;
+        self.ensure_setup_control(&self.client()?, &tab_id, &binding)
+            .await
+            .map_err(|(error, _)| error)?;
         let (navigation_revision, snapshot_revision) = {
             let mut authority = self
                 .authority
@@ -591,6 +607,7 @@ impl HostWebModelPageDriver {
             })
             .await
             .map_err(host_error)?;
+        check_setup_cancelled()?;
         match reply.response.outcome {
             BrowserHostCommandOutcome::Succeeded(result) => match *result {
                 BrowserHostCommandResult::Snapshot(snapshot) if snapshot.tab_id == tab_id => {
@@ -606,6 +623,7 @@ impl HostWebModelPageDriver {
                     let mut value = crate::browser_tool_runtime::browser_tool_snapshot_value(
                         &snapshot, &tab_id,
                     );
+                    value["snapshot_revision"] = serde_json::json!(snapshot.snapshot_revision);
                     let body = self
                         .json_read_command(
                             BrowserHostCommand::Devtools {
@@ -643,7 +661,7 @@ impl HostWebModelPageDriver {
     }
 
     /// 应用级配置也沿 Authority lease → Main 控制投影 → Worker 原生输入链执行。
-    /// 每个窄命令结算后释放控制，等待登录、密钥或确认时不会残留 Agent 光标。
+    /// 同一执行保留租约，交接、暂停与终态统一释放。
     async fn native_setup_command(
         &self,
         build: impl Fn(BrowserTabId, BrowserHostControl) -> BrowserHostCommand,
@@ -653,6 +671,7 @@ impl HostWebModelPageDriver {
             if attempt > 0 {
                 tokio::time::sleep(SETUP_COMMAND_DELAY).await;
             }
+            check_setup_cancelled()?;
             let (result, retry_safe) = self.native_setup_attempt(&build).await?;
             if !retry_safe {
                 return result;
@@ -670,6 +689,7 @@ impl HostWebModelPageDriver {
         tab_id: &BrowserTabId,
         binding: &magi_browser_authority::BrowserSurfaceBinding,
     ) -> Result<(BrowserLeaseId, u64), (WebModelError, bool)> {
+        check_setup_cancelled().map_err(|error| (error, false))?;
         let now = UtcMillis::now();
         let user_held = self
             .authority
@@ -677,8 +697,7 @@ impl HostWebModelPageDriver {
             .map_err(|_| (unavailable("浏览器权威状态不可用"), false))?
             .user_control_held(tab_id);
         if user_held {
-            // 用户在 Agent 持有控制期间动了页面：这条命令是按旧页面规划的，不执行；
-            // 等用户停手、清掉接管、重新取得控制，让 Agent 依据最新快照重新规划。
+            // 用户接管后立即拒绝旧动作；只能由下一次明确继续重新准入。
             return Err((self.yield_to_user(tab_id).await, false));
         }
         let stale = {
@@ -701,8 +720,7 @@ impl HostWebModelPageDriver {
             // 过期、换了 Surface 或租约已被撤销：先清掉旧的再取新的。
             self.drop_setup_control();
         }
-        // 用户正在操作页面时不去抢：等他停手再取得控制。
-        self.wait_for_user_idle(tab_id).await;
+        // 仅在主对话明确继续并重新准入后才会走到这里。
         // 上一次运行（或被打断的运行）遗留的本驱动租约：释放后才能重新取得。
         if let Ok(mut authority) = self.authority.lock()
             && let Some(lease) = authority
@@ -797,63 +815,10 @@ impl HostWebModelPageDriver {
         }
     }
 
-    /// 等用户停手（没有输入记录视为已停手），有上限。
-    async fn wait_for_user_idle(&self, tab_id: &BrowserTabId) {
-        let started = tokio::time::Instant::now();
-        loop {
-            let idle = self
-                .authority
-                .lock()
-                .ok()
-                .and_then(|authority| authority.user_idle_ms(tab_id, UtcMillis::now()));
-            if idle.is_none_or(|ms| ms >= SETUP_USER_IDLE_MS)
-                || started.elapsed() >= SETUP_USER_YIELD_MAX
-            {
-                return;
-            }
-            tokio::time::sleep(SETUP_USER_YIELD_POLL).await;
-        }
-    }
-
-    /// 用户接管了页面：等他停手，清掉接管并释放旧租约，返回「被用户打断」让 Agent 重新规划。
-    /// 一直等不到用户停手才返回接管错误，交还用户手动继续。
-    async fn yield_to_user(&self, tab_id: &BrowserTabId) -> WebModelError {
-        self.yield_to_user_within(
-            tab_id,
-            SETUP_USER_IDLE_MS,
-            SETUP_USER_YIELD_MAX,
-            SETUP_USER_YIELD_POLL,
-        )
-        .await
-    }
-
-    async fn yield_to_user_within(
-        &self,
-        tab_id: &BrowserTabId,
-        idle_ms: u64,
-        max_wait: Duration,
-        poll: Duration,
-    ) -> WebModelError {
+    /// 接管本身撤销当前执行资格；停手不是重新授予控制的授权。
+    async fn yield_to_user(&self, _tab_id: &BrowserTabId) -> WebModelError {
         self.drop_setup_control();
-        let started = tokio::time::Instant::now();
-        loop {
-            let idle = self
-                .authority
-                .lock()
-                .ok()
-                .and_then(|authority| authority.user_idle_ms(tab_id, UtcMillis::now()));
-            if idle.is_none_or(|ms| ms >= idle_ms) {
-                break;
-            }
-            if started.elapsed() >= max_wait {
-                return unavailable("browser_user_control_held");
-            }
-            tokio::time::sleep(poll).await;
-        }
-        if let Ok(mut authority) = self.authority.lock() {
-            let _ = authority.release_user_control(tab_id);
-        }
-        unavailable("browser_user_yielded")
+        unavailable("browser_user_control_held")
     }
 
     /// 配置运行结束：释放保留的控制，页面上不残留 Agent 光标，用户可以自由操作而不被当成接管。
@@ -912,6 +877,7 @@ impl HostWebModelPageDriver {
             Err((error, retry_safe)) => return Ok((Err(error), retry_safe)),
         };
         let result = async {
+            check_setup_cancelled()?;
             let reply = client
                 .request(build(
                     tab_id.clone(),
@@ -922,6 +888,7 @@ impl HostWebModelPageDriver {
                 ))
                 .await
                 .map_err(host_error)?;
+            check_setup_cancelled()?;
             let retry_safe = can_retry_setup_before_input(&reply.response.outcome);
             Ok(match reply.response.outcome {
                 BrowserHostCommandOutcome::Succeeded(result) => (
@@ -1008,8 +975,10 @@ impl HostWebModelPageDriver {
     ) -> Result<serde_json::Value, WebModelError> {
         let mut last = None;
         for attempt in 0..=READ_STATE_RETRIES {
+            check_setup_cancelled()?;
             if attempt > 0 {
                 tokio::time::sleep(READ_STATE_RETRY_DELAY).await;
+                check_setup_cancelled()?;
                 if let Ok(tab_id) = self.home_tab()
                     && let Err(refresh) = self.refresh_primary_binding(&tab_id).await
                 {
@@ -1603,9 +1572,40 @@ impl WebModelPageDriver for HostWebModelPageDriver {
                     | "browser_fill_form"
                     | "browser_hover"
                     | "browser_navigate"
+                    | "browser_read"
+                    | "browser_viewport"
+                    | "browser_wait_for"
             ) {
                 return Err(invalid("配置浏览器操作不支持"));
             }
+            // 参数由共享 catalog 和 setup policy 校验，原生 Host 仍拥有实际视口/页面事实。
+            let viewport = if tool == "browser_viewport" && args["action"] == "set" {
+                Some(if args["mode"] == "auto" {
+                    BrowserLogicalViewport::Auto
+                } else {
+                    BrowserLogicalViewport::Fixed {
+                        width: args["width"]
+                            .as_u64()
+                            .ok_or_else(|| invalid("缺少 width"))?
+                            as u32,
+                        height: args["height"]
+                            .as_u64()
+                            .ok_or_else(|| invalid("缺少 height"))?
+                            as u32,
+                        device_scale_factor_millis: args["device_scale_factor_millis"]
+                            .as_u64()
+                            .unwrap_or(1000)
+                            as u32,
+                        device_type: if args["device_type"] == "mobile" {
+                            magi_browser_authority::BrowserDeviceType::Mobile
+                        } else {
+                            magi_browser_authority::BrowserDeviceType::Desktop
+                        },
+                    }
+                })
+            } else {
+                None
+            };
             let target = magi_browser_authority::BrowserSnapshotTarget {
                 element_ref: args["element_ref"].as_str().unwrap_or_default().to_string(),
             };
@@ -1639,6 +1639,24 @@ impl WebModelPageDriver for HostWebModelPageDriver {
                     target: None,
                     delta_x: args["delta_x"].as_f64().unwrap_or(0.0),
                     delta_y: args["delta_y"].as_f64().unwrap_or(0.0),
+                },
+                "browser_viewport" => match viewport {
+                    Some(viewport) => BrowserHostCommand::SetLogicalViewport { tab_id, viewport },
+                    None => BrowserHostCommand::GetLogicalViewport { tab_id },
+                },
+                "browser_read" | "browser_wait_for" => BrowserHostCommand::Devtools {
+                    tab_id,
+                    control: Some(control),
+                    operation: tool.trim_start_matches("browser_").into(),
+                    arguments: {
+                        let mut args = args.clone();
+                        if tool == "browser_wait_for" {
+                            args["timeout_ms"] = serde_json::json!(
+                                args["timeout_ms"].as_u64().unwrap_or(5000).min(5000)
+                            );
+                        }
+                        args
+                    },
                 },
                 "browser_fill_form" | "browser_hover" => BrowserHostCommand::Devtools {
                     tab_id,
@@ -1917,6 +1935,8 @@ fn setup_observation_is_transient(message: &str) -> bool {
         || [
             "browser_snapshot_stale",
             "browser_snapshot_revision",
+            "browser snapshot revision changed",
+            "browser navigation revision changed",
             "browser_navigation_stale",
             "browser_navigation_revision_mismatch",
             "browser navigation revision moved backwards",
@@ -2061,68 +2081,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_takeover_yields_after_the_user_goes_idle_and_clears_the_hold() {
-        use std::time::Duration;
-        let (driver, tab, _dir) = driver_with_tab();
-        {
-            let mut authority = driver.authority.lock().unwrap();
-            authority.hold_user_control(&tab).unwrap();
-            authority.record_user_activity(&tab, UtcMillis::now());
-        }
-        let started = std::time::Instant::now();
-        let error = driver
-            .yield_to_user_within(&tab, 150, Duration::from_secs(5), Duration::from_millis(20))
-            .await;
-        // 用户刚操作过：先等他停手（至少约 150ms），之后清掉接管并让 Agent 重新规划，而不是停下等用户点继续。
-        assert!(started.elapsed() >= Duration::from_millis(100));
-        assert!(
-            error.message.contains("browser_user_yielded"),
-            "{}",
-            error.message
-        );
-        assert!(!driver.authority.lock().unwrap().user_control_held(&tab));
+    async fn stopped_setup_does_not_start_or_retry_a_host_command() {
+        use magi_web_model::WebModelPageDriver;
+        let (driver, _tab, _dir) = driver_with_tab();
+        let flag = magi_plugin_system::RunCancellation::default();
+        flag.cancel();
+        let error = super::with_web_setup_turn(
+            "cancelled-turn".into(),
+            flag,
+            driver.setup_browser(
+                "browser_navigate",
+                &serde_json::json!({"url":"https://chatgpt.com"}),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_cancelled());
     }
 
     #[tokio::test]
-    async fn a_user_who_never_stops_hands_the_page_back_for_a_manual_continue() {
-        use std::time::Duration;
+    async fn user_takeover_requires_explicit_continue_even_when_idle() {
         let (driver, tab, _dir) = driver_with_tab();
-        {
-            let mut authority = driver.authority.lock().unwrap();
-            authority.hold_user_control(&tab).unwrap();
-            authority.record_user_activity(&tab, UtcMillis::now());
-        }
-        let keep_active = {
-            let authority = driver.authority.clone();
-            let tab = tab.clone();
-            tokio::spawn(async move {
-                for _ in 0..60 {
-                    authority
-                        .lock()
-                        .unwrap()
-                        .record_user_activity(&tab, UtcMillis::now());
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-        };
-        let error = driver
-            .yield_to_user_within(
-                &tab,
-                100,
-                Duration::from_millis(300),
-                Duration::from_millis(20),
-            )
-            .await;
-        keep_active.abort();
-        assert!(
-            error.message.contains("browser_user_control_held"),
-            "{}",
-            error.message
-        );
-        assert!(
-            driver.authority.lock().unwrap().user_control_held(&tab),
-            "等不到停手时保持接管"
-        );
+        driver
+            .authority
+            .lock()
+            .unwrap()
+            .hold_user_control(&tab)
+            .unwrap();
+        let error = driver.yield_to_user(&tab).await;
+        assert!(error.message.contains("browser_user_control_held"));
+        assert!(driver.authority.lock().unwrap().user_control_held(&tab));
     }
 
     #[tokio::test]
@@ -2305,6 +2293,24 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 0);
     }
 
+    #[test]
+    fn setup_observation_retries_authority_revision_races_without_replaying_input() {
+        for error in [
+            magi_browser_authority::BrowserAuthorityError::SnapshotRevisionMismatch {
+                expected: 17,
+                provided: 18,
+            },
+            magi_browser_authority::BrowserAuthorityError::NavigationRevisionMismatch {
+                expected: 2,
+                provided: 1,
+            },
+        ] {
+            assert!(super::setup_observation_is_transient(&error.to_string()));
+        }
+        assert!(!super::setup_observation_is_transient(
+            "browser_user_control_held"
+        ));
+    }
     #[test]
     fn only_surface_handoff_errors_count_as_a_possibly_submitted_message() {
         // 点击提交后页面内路由换代：命令可能已经生效，不能当作「消息未被接受」。

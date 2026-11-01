@@ -417,7 +417,53 @@ pub enum AppServerResult {
     AgentContinue(AgentContinueResult),
 }
 
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebModelSetupCredentialsParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "setupRunId")]
+    pub setup_run_id: String,
+    #[serde(rename = "expectedRevision")]
+    pub expected_revision: i64,
+    #[serde(rename = "handoffId")]
+    pub handoff_id: String,
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    #[serde(rename = "tunnelId")]
+    pub tunnel_id: String,
+    #[serde(rename = "apiKey")]
+    pub api_key: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "continueAfterSave")]
+    pub continue_after_save: Option<bool>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WebModelSetupControlAction {
+    #[serde(rename = "pause")]
+    Pause,
+    #[serde(rename = "cancel")]
+    Cancel,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebModelSetupControlParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "setupRunId")]
+    pub setup_run_id: String,
+    #[serde(rename = "expectedRevision")]
+    pub expected_revision: i64,
+    #[serde(rename = "executionGeneration")]
+    pub execution_generation: i64,
+    pub action: WebModelSetupControlAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WebModelSetupStatus {
     #[serde(rename = "sessionId")]
@@ -427,6 +473,71 @@ pub struct WebModelSetupStatus {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "setupRunId")]
+    pub setup_run_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i64>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "executionGeneration")]
+    pub execution_generation: Option<i64>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "executionTurnId")]
+    pub execution_turn_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "executionTaskId")]
+    pub execution_task_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "pluginDigest")]
+    pub plugin_digest: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "handoffId")]
+    pub handoff_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "runState")]
+    pub run_state: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "allowedActions")]
+    pub allowed_actions: Option<Vec<String>>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "saveRequestId")]
+    pub save_request_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "saveRequestBinding")]
+    pub save_request_binding: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "savedCredentialVersion")]
+    pub saved_credential_version: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "pendingCredentialVersion")]
+    pub pending_credential_version: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "continuationInputId")]
+    pub continuation_input_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "continueState")]
+    pub continue_state: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     #[serde(rename = "updatedAt")]
     pub updated_at: i64,
 }
@@ -1567,6 +1678,15 @@ pub struct PluginToolContribution {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginSkillContribution {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub instruction: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PluginViewPlacement {
     #[serde(rename = "settings")]
@@ -1635,6 +1755,8 @@ pub struct PluginNamedContribution {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginContributions {
+    #[serde(default)]
+    pub skills: Vec<PluginSkillContribution>,
     #[serde(default)]
     pub tools: Vec<PluginToolContribution>,
     #[serde(default)]
@@ -1992,6 +2114,118 @@ pub enum ModelStepStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CacheInvalidationReason {
+    #[serde(rename = "initial")]
+    Initial,
+    #[serde(rename = "model_changed")]
+    ModelChanged,
+    #[serde(rename = "provider_changed")]
+    ProviderChanged,
+    #[serde(rename = "reasoning_changed")]
+    ReasoningChanged,
+    #[serde(rename = "permission_changed")]
+    PermissionChanged,
+    #[serde(rename = "skill_changed")]
+    SkillChanged,
+    #[serde(rename = "stable_prefix_changed")]
+    StablePrefixChanged,
+    #[serde(rename = "tool_surface_changed")]
+    ToolSurfaceChanged,
+    #[serde(rename = "compaction")]
+    Compaction,
+    #[serde(rename = "history_rewritten")]
+    HistoryRewritten,
+    #[serde(rename = "tool_history_demoted")]
+    ToolHistoryDemoted,
+    #[serde(rename = "file_facts_refreshed")]
+    FileFactsRefreshed,
+    #[serde(rename = "provider_context_changed")]
+    ProviderContextChanged,
+    #[serde(rename = "renderer_changed")]
+    RendererChanged,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelCacheBinding {
+    #[serde(rename = "lineageId")]
+    pub lineage_id: String,
+    #[serde(rename = "cacheKey")]
+    pub cache_key: String,
+    #[serde(rename = "providerHash")]
+    pub provider_hash: String,
+    #[serde(rename = "modelHash")]
+    pub model_hash: String,
+    #[serde(rename = "reasoningHash")]
+    pub reasoning_hash: String,
+    #[serde(rename = "executionScopeHash")]
+    pub execution_scope_hash: String,
+    #[serde(rename = "skillScopeHash")]
+    pub skill_scope_hash: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "historyEpochHash")]
+    pub history_epoch_hash: Option<String>,
+    #[serde(rename = "invalidationReason")]
+    pub invalidation_reason: Option<CacheInvalidationReason>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelPromptFrame {
+    #[serde(rename = "irVersion")]
+    pub ir_version: u32,
+    #[serde(rename = "stablePrefixHash")]
+    pub stable_prefix_hash: String,
+    #[serde(rename = "appendOnlyHistoryHash")]
+    pub append_only_history_hash: String,
+    #[serde(rename = "toolSurfaceHash")]
+    pub tool_surface_hash: String,
+    #[serde(rename = "volatileTailHash")]
+    pub volatile_tail_hash: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "providerContextHash")]
+    pub provider_context_hash: Option<String>,
+    #[serde(rename = "postBoundaryHash")]
+    pub post_boundary_hash: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "historyMessageCount")]
+    pub history_message_count: Option<usize>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "historyChainHash")]
+    pub history_chain_hash: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "historyProjection")]
+    pub history_projection: Option<HistoryProjection>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "prefixBytes")]
+    pub prefix_bytes: Option<u64>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "tailBytes")]
+    pub tail_bytes: Option<u64>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "cacheBinding")]
+    pub cache_binding: Option<ModelCacheBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoryProjection {
+    #[serde(rename = "demotedToolResults")]
+    pub demoted_tool_results: usize,
+    #[serde(rename = "staleFileFacts")]
+    pub stale_file_facts: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelStep {
     #[serde(rename = "stepId")]
@@ -2045,6 +2279,14 @@ pub struct ModelStep {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub purpose: Option<ModelStepPurpose>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "promptFrame")]
+    pub prompt_frame: Option<ModelPromptFrame>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "cacheEpoch")]
+    pub cache_epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2057,6 +2299,9 @@ pub struct ModelAttempt {
     #[serde(rename = "settledAt")]
     pub settled_at: Option<i64>,
     pub status: ModelStepStatus,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<ModelTransportRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2068,6 +2313,10 @@ pub struct ModelStepBinding {
     pub binding_revision: u32,
     #[serde(rename = "settingsRevision")]
     pub settings_revision: u64,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "usageContext")]
+    pub usage_context: Option<ModelUsageContext>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3033,4 +3282,123 @@ pub struct ExecutionSteps {
     pub created_at: u64,
     #[serde(rename = "updatedAt")]
     pub updated_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelTransportUsage {
+    #[serde(rename = "inputTokens")]
+    pub input_tokens: u64,
+    #[serde(rename = "outputTokens")]
+    pub output_tokens: u64,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "cacheReadTokens")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "cacheWriteTokens")]
+    pub cache_write_tokens: Option<u64>,
+    #[serde(rename = "cacheReadIncludedInInput")]
+    pub cache_read_included_in_input: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelTransportOutcome {
+    #[serde(rename = "succeeded")]
+    Succeeded,
+    #[serde(rename = "failed")]
+    Failed,
+    #[serde(rename = "cancelled")]
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelTransportRecord {
+    #[serde(rename = "requestFingerprint")]
+    pub request_fingerprint: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "httpStatus")]
+    pub http_status: Option<u16>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ModelTransportUsage>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ModelTransportOutcome>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "observedAt")]
+    pub observed_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelUsageSourceRole {
+    #[serde(rename = "worker")]
+    Worker,
+    #[serde(rename = "orchestrator")]
+    Orchestrator,
+    #[serde(rename = "auxiliary")]
+    Auxiliary,
+    #[serde(rename = "image_generation")]
+    ImageGeneration,
+    #[serde(rename = "vision")]
+    Vision,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelUsagePhase {
+    #[serde(rename = "planning")]
+    Planning,
+    #[serde(rename = "execution")]
+    Execution,
+    #[serde(rename = "verification")]
+    Verification,
+    #[serde(rename = "integration")]
+    Integration,
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelUsageModelConfig {
+    pub provider: String,
+    pub model: String,
+    #[serde(rename = "baseUrl")]
+    pub base_url: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "accountFingerprint")]
+    pub account_fingerprint: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "reasoningEffort")]
+    pub reasoning_effort: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelUsageContext {
+    #[serde(rename = "templateId")]
+    pub template_id: String,
+    #[serde(rename = "engineId")]
+    pub engine_id: String,
+    #[serde(rename = "bindingRevision")]
+    pub binding_revision: u32,
+    pub role: ModelUsageSourceRole,
+    pub phase: ModelUsagePhase,
+    #[serde(rename = "modelConfig")]
+    pub model_config: ModelUsageModelConfig,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "assignmentId")]
+    pub assignment_id: Option<String>,
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
 }

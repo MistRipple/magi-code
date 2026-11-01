@@ -6,6 +6,9 @@ use crate::model_config::{
     NormalizedModelConfig, configured_role_engine_model_config, resolve_orchestrator_model_config,
 };
 use crate::model_context_window::resolve_model_context_window;
+use crate::prompt_lineage::{
+    CacheInvalidationReason, PromptBranchScope, PromptFrame, PromptLineage, ProviderCacheScope,
+};
 use magi_bridge_client::{
     BridgeClientError, ModelBridgeClient, ModelInvocationRequest, ModelResponse,
 };
@@ -27,6 +30,29 @@ use std::sync::Arc;
 
 const CONTEXT_USAGE_EMIT_INTERVAL_MS: u64 = 300;
 const CONTEXT_USAGE_EMIT_TOKEN_DELTA: u64 = 128;
+
+/// 辅助调用的逻辑用途与用量阶段无关：标题、强化、建议和提取通常都处于
+/// Integration，但不能因此竞争同一缓存路由分支。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuxiliaryModelPurpose {
+    SessionTitle,
+    PromptEnhance,
+    PromptSuggestions,
+    KnowledgeExtraction,
+    SessionMemoryExtraction,
+}
+
+impl AuxiliaryModelPurpose {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionTitle => "session_title",
+            Self::PromptEnhance => "prompt_enhance",
+            Self::PromptSuggestions => "prompt_suggestions",
+            Self::KnowledgeExtraction => "knowledge_extraction",
+            Self::SessionMemoryExtraction => "session_memory_extraction",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ModelUsageBinding {
@@ -180,6 +206,24 @@ pub struct ModelUsageRecordInput<'a> {
     pub error_code: Option<String>,
 }
 
+pub(crate) fn model_step_usage_context(
+    settings: Option<&Arc<SettingsStore>>,
+    binding: &ModelUsageBinding,
+    session_id: &SessionId,
+) -> Option<magi_app_server_protocol::ModelUsageContext> {
+    let config = prepare_llm_config_for_persistence(usage_model_config_for_binding(
+        settings, binding, session_id,
+    )?);
+    Some(
+        serde_json::from_value(serde_json::json!({
+            "templateId": binding.template_id, "engineId": binding.engine_id,
+            "bindingRevision": binding.binding_revision, "role": binding.role,
+            "phase": binding.phase, "modelConfig": config,
+        }))
+        .expect("trusted usage binding matches its schema"),
+    )
+}
+
 pub struct AuxiliaryModelUsageContext<'a> {
     pub event_bus: &'a InMemoryEventBus,
     pub session_store: &'a SessionStore,
@@ -189,6 +233,7 @@ pub struct AuxiliaryModelUsageContext<'a> {
     pub workspace_id: &'a Option<WorkspaceId>,
     pub call_id: String,
     pub phase: UsagePhase,
+    pub purpose: AuxiliaryModelPurpose,
     /// 若辅助调用由某个执行 Turn 派生，固定其用量归属，避免异步回写落到后续 Turn。
     pub expected_turn_id: Option<&'a str>,
 }
@@ -229,18 +274,105 @@ pub fn vision_model_usage_binding() -> ModelUsageBinding {
 /// 调用辅助模型并把这次调用写入统一用量账本。
 pub fn invoke_auxiliary_model_with_usage(
     client: Arc<dyn ModelBridgeClient>,
-    request: ModelInvocationRequest,
+    mut request: ModelInvocationRequest,
     context: AuxiliaryModelUsageContext<'_>,
 ) -> Result<ModelResponse, BridgeClientError> {
-    let binding = auxiliary_model_usage_binding(context.phase);
-    match client.invoke(request) {
+    // 复用实际 Bridge 的 Prompt IR 预处理；HTTP 连接在此完成工具 wire
+    // name 编码，缓存摘要不能继续基于未编码的 canonical 工具面。
+    let prompt_frame = PromptFrame::from_ir(&client.cache_prompt_ir(&request));
+    let lineage = context.session_id.map(|session_id| {
+        let branch = PromptBranchScope::Auxiliary {
+            purpose: context.purpose.as_str().to_string(),
+        };
+        let scope = ProviderCacheScope::from_client(client.as_ref()).unwrap_or_else(|| {
+            ProviderCacheScope {
+                provider: Some(request.provider.clone()),
+                ..Default::default()
+            }
+        });
+        let epoch = prompt_frame.cache_epoch(&scope, 0, None);
+        PromptLineage::for_branch(session_id, branch)
+            .with_provider_scope(scope)
+            .with_epoch(epoch, CacheInvalidationReason::Initial)
+    });
+    request.cache_affinity_key = lineage.as_ref().map(|lineage| lineage.lineage_id.clone());
+    request.prompt_cache_key = lineage.as_ref().map(PromptLineage::cache_key);
+    let mut binding = auxiliary_model_usage_binding(context.phase);
+    let mut frozen_context = context.session_id.and_then(|session_id| {
+        model_step_usage_context(context.settings_store, &binding, session_id)
+    });
+    if let Some(frozen) = frozen_context.as_mut() {
+        frozen.workspace_id = context.workspace_id.as_ref().map(ToString::to_string);
+        binding.model_config = serde_json::from_value(
+            serde_json::to_value(&frozen.model_config).expect("safe config serializes"),
+        )
+        .ok();
+    }
+    let receipts = std::cell::RefCell::new(magi_bridge_client::ModelTransportRecorder::default());
+    let response = client.invoke_observed(
+        request,
+        magi_bridge_client::ModelInvocationOptions {
+            on_delta: None,
+            on_retry: &|_| {},
+            is_cancelled: &|| false,
+            max_output_tokens: None,
+        },
+        &|event| {
+            let mut receipts = receipts.borrow_mut();
+            let transport = receipts.apply(event)?.clone();
+            if let (Some(session_id), Some(frozen)) = (context.session_id, frozen_context.as_ref())
+            {
+                crate::auxiliary_usage::write_fact(
+                    context.event_bus,
+                    &crate::auxiliary_usage::AuxiliaryUsageFact {
+                        schema_version: 1,
+                        session_id: session_id.clone(),
+                        turn_id: context.expected_turn_id.map(str::to_string),
+                        call_id: context.call_id.clone(),
+                        attempt: receipts.attempts.len(),
+                        context: frozen.clone(),
+                        transport,
+                        call_status: None,
+                    },
+                )?;
+            }
+            Ok(())
+        },
+    );
+    let receipts = receipts.into_inner().attempts;
+    if let (Some(session_id), Some(frozen)) = (context.session_id, frozen_context.as_ref())
+        && !receipts.is_empty()
+    {
+        for (index, transport) in receipts.iter().enumerate() {
+            let last = index + 1 == receipts.len();
+            let fact = crate::auxiliary_usage::AuxiliaryUsageFact {
+                schema_version: 1,
+                session_id: session_id.clone(),
+                turn_id: context.expected_turn_id.map(str::to_string),
+                call_id: context.call_id.clone(),
+                attempt: index + 1,
+                context: frozen.clone(),
+                transport: transport.clone(),
+                call_status: last.then_some(if response.is_ok() {
+                    UsageCallStatus::Success
+                } else {
+                    UsageCallStatus::Failed
+                }),
+            };
+            if last {
+                crate::auxiliary_usage::write_fact(context.event_bus, &fact)?;
+            }
+            crate::auxiliary_usage::publish_fact_usage(context.event_bus, &fact);
+        }
+        return response;
+    }
+    match response {
         Ok(response) => {
             if let Some(session_id) = context.session_id {
-                publish_model_usage_record_for_turn(
+                publish_model_usage_record_internal(
                     context.event_bus,
                     context.session_store,
                     context.settings_store,
-                    context.expected_turn_id,
                     ModelUsageRecordInput {
                         context_breakdown: None,
                         session_id,
@@ -252,17 +384,22 @@ pub fn invoke_auxiliary_model_with_usage(
                         assignment_id: None,
                         error_code: None,
                     },
+                    PublishModelUsageOptions {
+                        explicit_model_config: None,
+                        expected_turn_id: context.expected_turn_id,
+                        context_window_override: None,
+                        transport_records: Some(&receipts),
+                    },
                 );
             }
             Ok(response)
         }
         Err(error) => {
             if let Some(session_id) = context.session_id {
-                publish_model_usage_record_for_turn(
+                publish_model_usage_record_internal(
                     context.event_bus,
                     context.session_store,
                     context.settings_store,
-                    context.expected_turn_id,
                     ModelUsageRecordInput {
                         context_breakdown: None,
                         session_id,
@@ -273,6 +410,12 @@ pub fn invoke_auxiliary_model_with_usage(
                         status: UsageCallStatus::Failed,
                         assignment_id: None,
                         error_code: Some("auxiliary_model_invocation_failed".to_string()),
+                    },
+                    PublishModelUsageOptions {
+                        explicit_model_config: None,
+                        expected_turn_id: context.expected_turn_id,
+                        context_window_override: None,
+                        transport_records: Some(&receipts),
                     },
                 );
             }
@@ -346,9 +489,12 @@ pub fn publish_model_usage_record(
         session_store,
         settings_store,
         input,
-        None,
-        None,
-        None,
+        PublishModelUsageOptions {
+            explicit_model_config: None,
+            expected_turn_id: None,
+            context_window_override: None,
+            transport_records: None,
+        },
     );
 }
 
@@ -368,9 +514,12 @@ pub fn publish_model_usage_record_for_turn(
         session_store,
         settings_store,
         input,
-        None,
-        expected_turn_id,
-        None,
+        PublishModelUsageOptions {
+            explicit_model_config: None,
+            expected_turn_id,
+            context_window_override: None,
+            transport_records: None,
+        },
     );
 }
 
@@ -391,9 +540,12 @@ pub fn publish_model_usage_record_for_turn_with_context_window(
         session_store,
         settings_store,
         input,
-        None,
-        expected_turn_id,
-        Some(context_window_tokens),
+        PublishModelUsageOptions {
+            explicit_model_config: None,
+            expected_turn_id,
+            context_window_override: Some(context_window_tokens),
+            transport_records: None,
+        },
     );
 }
 
@@ -409,9 +561,12 @@ pub fn publish_model_usage_record_with_config(
         session_store,
         settings_store,
         input,
-        Some(model_config),
-        None,
-        None,
+        PublishModelUsageOptions {
+            explicit_model_config: Some(model_config),
+            expected_turn_id: None,
+            context_window_override: None,
+            transport_records: None,
+        },
     );
 }
 
@@ -542,14 +697,19 @@ pub fn publish_context_usage_update(
     );
 }
 
+struct PublishModelUsageOptions<'a> {
+    explicit_model_config: Option<LlmConfig>,
+    expected_turn_id: Option<&'a str>,
+    context_window_override: Option<u64>,
+    transport_records: Option<&'a [magi_session_store::ModelTransportRecord]>,
+}
+
 fn publish_model_usage_record_internal(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
     settings_store: Option<&Arc<SettingsStore>>,
     input: ModelUsageRecordInput<'_>,
-    explicit_model_config: Option<LlmConfig>,
-    expected_turn_id: Option<&str>,
-    context_window_override: Option<u64>,
+    options: PublishModelUsageOptions<'_>,
 ) {
     let ModelUsageRecordInput {
         session_id,
@@ -562,6 +722,21 @@ fn publish_model_usage_record_internal(
         error_code,
         context_breakdown,
     } = input;
+    let canonical_step = options
+        .expected_turn_id
+        .and_then(|turn_id| session_store.canonical_turn_for_session_turn_id(session_id, turn_id))
+        .and_then(|turn| {
+            turn.model_steps
+                .into_iter()
+                .find(|step| step.step_id == call_id)
+        });
+    let frozen_config = canonical_step
+        .as_ref()
+        .and_then(|step| step.binding.as_ref()?.usage_context.as_ref())
+        .and_then(|context| {
+            serde_json::from_value::<LlmConfig>(serde_json::to_value(&context.model_config).ok()?)
+                .ok()
+        });
     let usage = match usage_tokens_from_payload(usage) {
         Some(usage) => usage,
         None => UsageTokenInput {
@@ -573,7 +748,8 @@ fn publish_model_usage_record_internal(
             cache_read_included_in_input: false,
         },
     };
-    let Some(model_config) = explicit_model_config
+    let Some(model_config) = frozen_config
+        .or(options.explicit_model_config)
         .or_else(|| usage_model_config_for_binding(settings_store, binding, session_id))
     else {
         tracing::warn!(
@@ -593,10 +769,38 @@ fn publish_model_usage_record_internal(
     let usage_scope_key = workspace_id_value
         .clone()
         .unwrap_or_else(|| "personal".to_string());
+    let attempts = if let Some(records) = options.transport_records {
+        records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                (
+                    format!("{call_id}:attempt:{}", index + 1),
+                    Some(record.clone()),
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        canonical_step
+            .clone()
+            .filter(|step| {
+                step.attempts
+                    .iter()
+                    .any(|attempt| attempt.transport.is_some())
+            })
+            .map(|step| {
+                step.attempts
+                    .into_iter()
+                    .map(|attempt| (attempt.attempt_id, attempt.transport))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let input = UsageCallRecordInput {
         workspace_id: workspace_id_value,
         session_id: session_id.to_string(),
-        turn_id: expected_turn_id
+        turn_id: options
+            .expected_turn_id
             .map(str::to_string)
             .or_else(|| current_turn_id(session_store, session_id)),
         dispatch_wave_id: None,
@@ -614,6 +818,7 @@ fn publish_model_usage_record_internal(
         },
         model_config: prepare_llm_config_for_persistence(model_config),
         call_identity: UsageCallIdentity {
+            transport: None,
             call_id,
             parent_call_id: None,
             source: binding.role,
@@ -623,34 +828,80 @@ fn publish_model_usage_record_internal(
         status,
         error_code,
     };
-    let payload = match serde_json::to_value(&input) {
-        Ok(payload) => payload,
-        Err(error) => {
-            tracing::warn!(?error, "序列化模型用量记录失败");
-            return;
+    let canonical_records = canonical_step
+        .as_ref()
+        .filter(|step| {
+            !attempts.is_empty()
+                && step
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.usage_context.is_some())
+        })
+        .map(|step| {
+            crate::canonical_usage::model_step_usage_records(
+                session_id,
+                options.expected_turn_id.expect("canonical step has turn"),
+                step,
+            )
+        });
+    if let Some(records) = canonical_records {
+        for record in records {
+            publish_usage_call_input(event_bus, workspace_id, session_id, &record);
         }
-    };
-    let _ = event_bus.publish(
-        EventEnvelope::usage(
-            EventId::new(
-                input
-                    .event_id
-                    .clone()
-                    .unwrap_or_else(|| format!("model-usage-{}", UtcMillis::now().0)),
-            ),
-            "model.usage.recorded",
-            payload,
-        )
-        .with_context(EventContext {
-            workspace_id: workspace_id.clone(),
-            session_id: Some(session_id.clone()),
-            assignment_id: input
-                .assignment_id
-                .clone()
-                .map(magi_core::AssignmentId::new),
-            ..EventContext::default()
-        }),
-    );
+    } else if attempts.is_empty() {
+        publish_usage_call_input(event_bus, workspace_id, session_id, &input);
+    } else {
+        for (index, (attempt_id, transport)) in attempts.iter().enumerate() {
+            let mut attempt = input.clone();
+            attempt.call_identity.call_id = attempt_id.clone();
+            attempt.call_identity.parent_call_id = Some(input.call_identity.call_id.clone());
+            attempt.call_identity.transport =
+                transport
+                    .as_ref()
+                    .map(|record| magi_usage_authority::UsageTransportIdentity {
+                        request_fingerprint: record.request_fingerprint.clone(),
+                        http_status: record.http_status,
+                    });
+            attempt.event_id = Some(format!(
+                "model-usage:{usage_scope_key}:{session_id}:{attempt_id}"
+            ));
+            let payload = transport
+                .as_ref()
+                .and_then(|record| record.usage.as_ref())
+                .and_then(|usage| serde_json::to_value(usage).ok());
+            attempt.usage =
+                usage_tokens_from_payload(payload.as_ref()).unwrap_or(UsageTokenInput {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: Some(0),
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    cache_read_included_in_input: false,
+                });
+            let last = index + 1 == attempts.len();
+            attempt.status = match transport
+                .as_ref()
+                .and_then(|record| record.outcome.as_ref())
+            {
+                Some(magi_session_store::ModelTransportOutcome::Cancelled) => {
+                    UsageCallStatus::Cancelled
+                }
+                Some(magi_session_store::ModelTransportOutcome::Succeeded) if last => input.status,
+                _ => UsageCallStatus::Failed,
+            };
+            if !last {
+                attempt.error_code = Some(
+                    transport
+                        .as_ref()
+                        .and_then(|record| record.http_status)
+                        .filter(|status| *status >= 400)
+                        .map(|status| format!("provider_http_{status}"))
+                        .unwrap_or_else(|| "model_transport_retry".into()),
+                );
+            }
+            publish_usage_call_input(event_bus, workspace_id, session_id, &attempt);
+        }
+    }
     if publishes_authoritative_context {
         let thread_id = session_store
             .orchestrator_thread_for_session(session_id)
@@ -669,7 +920,7 @@ fn publish_model_usage_record_internal(
             &input.call_identity.call_id,
             &resolved_model,
             authoritative_context_tokens,
-            context_window_override,
+            options.context_window_override,
             thread_id.as_ref(),
             Some(&model_provider),
             binding.binding_revision,
@@ -679,6 +930,44 @@ fn publish_model_usage_record_internal(
             context_breakdown.as_ref(),
         );
     }
+}
+
+pub(crate) fn publish_usage_call_input(
+    event_bus: &InMemoryEventBus,
+    workspace_id: &Option<WorkspaceId>,
+    session_id: &SessionId,
+    input: &UsageCallRecordInput,
+) {
+    let payload = match serde_json::to_value(input) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(?error, "序列化模型用量记录失败");
+            return;
+        }
+    };
+    let mut event = EventEnvelope::usage(
+        EventId::new(
+            input
+                .event_id
+                .clone()
+                .unwrap_or_else(|| format!("model-usage-{}", UtcMillis::now().0)),
+        ),
+        "model.usage.recorded",
+        payload,
+    )
+    .with_context(EventContext {
+        workspace_id: workspace_id.clone(),
+        session_id: Some(session_id.clone()),
+        assignment_id: input
+            .assignment_id
+            .clone()
+            .map(magi_core::AssignmentId::new),
+        ..EventContext::default()
+    });
+    if let Some(at) = input.timestamp {
+        event.occurred_at = UtcMillis(at);
+    }
+    event_bus.publish_usage_projection(event);
 }
 
 pub(crate) fn model_usage_tokens(usage: Option<&serde_json::Value>) -> Option<u64> {
@@ -824,9 +1113,6 @@ fn usage_tokens_from_payload(usage: Option<&serde_json::Value>) -> Option<UsageT
     } else {
         input_tokens
     };
-    if input_tokens == 0 && output_tokens == 0 {
-        return None;
-    }
     let included_cache_read_tokens = usage_u64_pointer(
         usage,
         &[
@@ -850,7 +1136,7 @@ fn usage_tokens_from_payload(usage: Option<&serde_json::Value>) -> Option<UsageT
         &["cache_read_included_in_input", "cacheReadIncludedInInput"],
     )
     .unwrap_or(included_cache_read_tokens.is_some());
-    Some(UsageTokenInput {
+    let tokens = UsageTokenInput {
         input_tokens,
         output_tokens,
         total_tokens: (total_tokens > 0).then_some(total_tokens),
@@ -865,7 +1151,13 @@ fn usage_tokens_from_payload(usage: Option<&serde_json::Value>) -> Option<UsageT
             ],
         ),
         cache_read_included_in_input,
-    })
+    };
+    // Anthropic 的 input_tokens 不含缓存，失败/取消响应可能只剩缓存用量。
+    (input_tokens > 0
+        || output_tokens > 0
+        || tokens.cache_read_tokens.is_some()
+        || tokens.cache_write_tokens.is_some())
+    .then_some(tokens)
 }
 
 fn usage_u64_field(usage: &serde_json::Value, keys: &[&str]) -> Option<u64> {
@@ -886,6 +1178,145 @@ fn usage_bool_field(usage: &serde_json::Value, keys: &[&str]) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_step_usage_context_freezes_sanitized_connection_and_account_identity() {
+        use super::*;
+        let settings = Arc::new(SettingsStore::new());
+        let session = SessionId::new("safe-usage-binding");
+        settings.set_section("orchestrator", serde_json::json!({
+            "baseUrl":"https://url-user:url-password@example.test/v1?api_key=url-token#fragment",
+            "apiProtocol":"openai_chat", "apiKey":"private-key",
+        })).unwrap();
+        settings
+            .set_session_section(
+                &session,
+                "orchestrator",
+                serde_json::json!({"model":"original-model"}),
+            )
+            .unwrap();
+        let frozen = model_step_usage_context(
+            Some(&settings),
+            &session_turn_model_usage_binding(true),
+            &session,
+        )
+        .unwrap();
+        magi_session_store::validate_model_usage_context(&frozen).unwrap();
+        assert_eq!(frozen.model_config.base_url, "https://example.test/v1");
+        assert!(frozen.model_config.account_fingerprint.is_some());
+        let serialized = serde_json::to_string(&frozen).unwrap();
+        for secret in [
+            "url-user",
+            "url-password",
+            "url-token",
+            "private-key",
+            "fragment",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+        settings
+            .set_session_section(
+                &session,
+                "orchestrator",
+                serde_json::json!({"model":"later-model"}),
+            )
+            .unwrap();
+        assert_eq!(frozen.model_config.model, "original-model");
+    }
+    #[test]
+    fn attempt_usage_uses_physical_identities_and_replay_does_not_double_charge() {
+        use super::*;
+        use magi_session_store::{
+            ModelTransportOutcome, ModelTransportRecord, ModelTransportUsage,
+        };
+        let bus = InMemoryEventBus::new(16);
+        let store = SessionStore::new();
+        let session = SessionId::new("transport-ledger");
+        let workspace = Some(WorkspaceId::new("workspace-transport"));
+        let binding = auxiliary_model_usage_binding(UsagePhase::Integration);
+        let receipts = vec![
+            ModelTransportRecord {
+                observed_at: None,
+                request_fingerprint: "a".repeat(64),
+                http_status: Some(200),
+                usage: Some(ModelTransportUsage {
+                    input_tokens: 11,
+                    output_tokens: 1,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    cache_read_included_in_input: false,
+                }),
+                outcome: Some(ModelTransportOutcome::Failed),
+            },
+            ModelTransportRecord {
+                observed_at: None,
+                request_fingerprint: "b".repeat(64),
+                http_status: Some(200),
+                usage: Some(ModelTransportUsage {
+                    input_tokens: 20,
+                    output_tokens: 2,
+                    cache_read_tokens: Some(10),
+                    cache_write_tokens: None,
+                    cache_read_included_in_input: true,
+                }),
+                outcome: Some(ModelTransportOutcome::Succeeded),
+            },
+        ];
+        for _ in 0..2 {
+            publish_model_usage_record_internal(
+                &bus,
+                &store,
+                None,
+                ModelUsageRecordInput {
+                    session_id: &session,
+                    workspace_id: &workspace,
+                    binding: &binding,
+                    call_id: "logical-call".into(),
+                    usage: None,
+                    context_breakdown: None,
+                    status: UsageCallStatus::Success,
+                    assignment_id: None,
+                    error_code: None,
+                },
+                PublishModelUsageOptions {
+                    explicit_model_config: Some(LlmConfig {
+                        provider: "test".into(),
+                        model: "test".into(),
+                        base_url: "http://localhost".into(),
+                        api_key: None,
+                        account_fingerprint: None,
+                        reasoning_effort: None,
+                    }),
+                    expected_turn_id: Some("original-turn"),
+                    context_window_override: None,
+                    transport_records: Some(&receipts),
+                },
+            );
+        }
+        let mut authority = magi_usage_authority::UsageAuthority::new();
+        let events = bus.snapshot().recent_events;
+        assert_eq!(events.len(), 2);
+        for event in events {
+            let record: UsageCallRecordInput = serde_json::from_value(event.payload).unwrap();
+            assert_eq!(
+                record.call_identity.parent_call_id.as_deref(),
+                Some("logical-call")
+            );
+            assert_eq!(record.turn_id.as_deref(), Some("original-turn"));
+            assert_eq!(
+                record.call_identity.transport.as_ref().unwrap().http_status,
+                Some(200)
+            );
+            authority.append_call_record(record);
+        }
+        let snapshot = authority.get_session_snapshot("workspace-transport", session.as_str());
+        assert_eq!(snapshot.totals.llm_call_count, 2);
+        assert_eq!(snapshot.totals.raw_input_tokens, 31);
+        assert_eq!(snapshot.totals.raw_output_tokens, 3);
+        assert_eq!(snapshot.totals.total_tokens, 24);
+        assert_eq!(snapshot.totals.cache_read_tokens, 10);
+        assert_eq!(snapshot.totals.cache_observed_call_count, 1);
+        assert_eq!(snapshot.totals.failure_count, 1);
+    }
     use super::*;
     use magi_event_bus::InMemoryEventBus;
     use magi_session_store::SessionStore;
@@ -908,6 +1339,102 @@ mod tests {
         assert!(matches!(planning.role, UsageSourceRole::Orchestrator));
         assert!(matches!(planning.phase, UsagePhase::Planning));
         assert!(matches!(execution.phase, UsagePhase::Execution));
+    }
+
+    #[test]
+    fn auxiliary_cache_is_partitioned_by_real_purpose_and_drafts_have_no_identity() {
+        struct Capture(std::sync::Mutex<Vec<Option<String>>>);
+        impl ModelBridgeClient for Capture {
+            fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+                magi_bridge_client::native_executor_capabilities()
+            }
+            fn invoke(
+                &self,
+                request: ModelInvocationRequest,
+            ) -> Result<ModelResponse, BridgeClientError> {
+                self.0.lock().unwrap().push(request.prompt_cache_key);
+                Ok(ModelResponse::completed("ok"))
+            }
+            fn invoke_streaming(
+                &self,
+                request: ModelInvocationRequest,
+                _: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
+            ) -> Result<ModelResponse, BridgeClientError> {
+                self.invoke(request)
+            }
+        }
+        let client = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        let store = SessionStore::new();
+        let session = SessionId::new("purpose-cache-session");
+        store.create_session(session.clone(), "cache").unwrap();
+        let bus = InMemoryEventBus::new(32);
+        let purposes = [
+            AuxiliaryModelPurpose::SessionTitle,
+            AuxiliaryModelPurpose::PromptEnhance,
+            AuxiliaryModelPurpose::PromptSuggestions,
+            AuxiliaryModelPurpose::KnowledgeExtraction,
+            AuxiliaryModelPurpose::SessionMemoryExtraction,
+        ];
+        for (index, purpose) in purposes
+            .into_iter()
+            .chain(purposes)
+            .chain([purposes[0]])
+            .enumerate()
+        {
+            invoke_auxiliary_model_with_usage(
+                client.clone(),
+                ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: Some("must-be-replaced".into()),
+                    provider: "test".into(),
+                    prompt: format!("input {index}"),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                AuxiliaryModelUsageContext {
+                    event_bus: &bus,
+                    session_store: &store,
+                    settings_store: None,
+                    session_id: (index < 10).then_some(&session),
+                    workspace_id: &None,
+                    call_id: format!("call-{index}"),
+                    phase: UsagePhase::Integration,
+                    purpose,
+                    expected_turn_id: None,
+                },
+            )
+            .unwrap();
+        }
+        let keys = client.0.lock().unwrap();
+        assert_eq!(keys[..5], keys[5..10]);
+        assert_eq!(
+            keys[..5]
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            5
+        );
+        assert!(keys[10].is_none());
+    }
+
+    #[test]
+    fn cache_only_usage_is_recorded_without_fabricating_uncached_input() {
+        let usage = usage_tokens_from_payload(Some(&json!({
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 200,
+        })))
+        .expect("cache-only usage");
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.cache_read_tokens, Some(1000));
+        assert_eq!(provider_context_tokens_from_usage(&usage), 1200);
+        let zero = usage_tokens_from_payload(Some(&json!({
+            "input_tokens": 0, "output_tokens": 0,
+            "input_tokens_details": { "cached_tokens": 0 }
+        })))
+        .expect("explicit zero cache observation");
+        assert_eq!(zero.cache_read_tokens, Some(0));
+        assert!(usage_tokens_from_payload(Some(&json!({}))).is_none());
     }
 
     #[test]
@@ -1270,6 +1797,8 @@ mod tests {
         let response = invoke_auxiliary_model_with_usage(
             Arc::new(SuccessfulAuxiliaryClient),
             ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: "openai-compatible".to_string(),
                 prompt: "测试辅助模型用量记录".to_string(),
                 messages: None,
@@ -1284,6 +1813,7 @@ mod tests {
                 workspace_id: &workspace_id,
                 call_id: "auxiliary-success-call".to_string(),
                 phase: UsagePhase::Integration,
+                purpose: AuxiliaryModelPurpose::KnowledgeExtraction,
                 expected_turn_id: None,
             },
         )

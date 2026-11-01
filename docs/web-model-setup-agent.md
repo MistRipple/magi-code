@@ -1,43 +1,42 @@
-# GPT Web AI 配置改造目标与验收
+# GPT Web 主对话配置运行合同
 
-## 目标
+本轮重构的产品目标见 [会话化配置方案](gpt-web-conversational-setup-product-plan.md)。本文描述源码中的运行边界；真实账号与工具往返的验收另见 [配置验收](gpt-web-setup-validation.md)。旧独立配置模型循环已经删除。
 
-Magi 使用用户现有的原生工具模型，从实时页面内容自主规划完整 GPT Web 配置。参考地址和任务约束是模型上下文，不是页面规则引擎。后台只负责真实资源、安全边界及持久事实，不替 AI 选择控件或维护点击序列。
+## 执行与所有权
 
-## 交付边界
+用户自然语言保留为普通输入。设置入口同样提交普通主对话 Task，使用当前会话的模型、推理强度、权限、canonical 历史与用量链。插件贡献 `gpt-web-setup` Skill 和 `configure` 领域工具；Skill 按需加载，已有 active Skill 时只允许 reference 读取补充说明，原限制持续有效。
 
-| 项目 | 实现 |
-| --- | --- |
-| 唯一入口 | 插件已安装、启用、授权、激活且清单贡献 `setup` 命令（`ApiState::web_model_setup_available`）。动作只有 start / continue / cancel；设置里的“检查并配置连接器”、卡片继续、重试连接都复用 continue |
-| 自主操作 | 快照和正文 → AI 原生工具调用 → 通用浏览器原语 → 新快照；导航、顺序、等待和重规划由 AI 决定 |
-| 单一浏览器链 | Authority/lease → Desktop Control → Worker → Main CDP → 当前应用级 guest |
-| 本地事实 | daemon 保存 Tunnel、密钥、通道健康和维护占用；UI 只展示检查点及实际提示 |
-| 人工交接 | 登录、验证码、密钥生成/复制/安全保存、组织/项目歧义；保留当前表单继续观察。用户接管浏览器时 daemon 立即停止本次运行（reason=`user_takeover`），继续前先重新快照。**运行期间 Agent 持有页面控制租约**，跨命令保留（剩余有效期不足时续租），运行结束（交接、完成、取消、失败）一律释放；若每条命令后就释放，Agent 等模型决策的那几秒里没有任何控制，用户此刻碰页面 Main 无法识别为接管，Agent 会拿着旧计划继续操作 |
-| 作用域核对 | `tunnel_ready` 须带页面当前显示的组织，`key_prepared` 须带组织和项目，均须逐字出现在最新快照；daemon 把它们写进用户可见说明，供生成密钥前核对 |
-| 完成证据 | `connector_ready` 除页面证据外，daemon 必须观察到本次运行内 ChatGPT 经槽位端点读取了 Magi 工具目录（`tools/list`）；这次读取同时就是 Tunnel 归属的证明（ChatGPT 的连接器详情页不显示它绑定的 Tunnel，同名但绑定别的 Tunnel 的连接器不可能让本机槽位收到读取）；只靠页面文案不会被接受。真实工具往返另行验收 |
-| 操作边界 | 点击最终的 Create secret key 按钮和删除/撤销类控件被拒绝；打开表单的入口可点击。诊断日志只记录页面路径，不含查询串、正文或凭据 |
-| 结果不确定 | 不重放写入；先观察是否生效。导航交接只重试只读快照，不重复点击 |
-| 重复配置 | 核对名称后复用，归属由本次运行内 daemon 观察到的 `tools/list` 证明；禁止盲目新增、删除或撤销 |
-| 运行记录 | 模型调用进入 ModelStep/用量记录；浏览器操作进入 canonical 工具项；模型收到标准 assistant/tool 历史 |
-| 凭据隔离 | 模型和工具历史脱敏；安全输入沿专用 Desktop 请求保存，不进聊天和命令参数 |
-| 旧路径 | 固定站点配置脚本、专用 wire 命令（含连接器只读检查 `web_connector_status`）、兼容分支和对应原因码已删除，仅保留 AI 自主配置入口 |
+配置工具负责 inspect、begin、checkpoint、pause、cancel 和显式 transfer。插件激活、权限、来源与 digest 每次执行重新检查。begin 将执行绑定 Session/Turn/Task、配置运行、执行代际及应用级目标。人工交接关闭本轮 scope 并释放物理控制；下一普通 Turn 可以解释或调整计划，用户明确继续时才 begin。已交接的同一 Turn 不可再次 begin。
 
-## 完成条件
+Browser 页面事实由 Authority 和受限 driver 拥有。配置期间复用 `browser_snapshot/read/click/type/fill_form/hover/press/scroll/navigate/viewport/wait_for`，其他入口默认拒绝。只接受允许 HTTPS origin、最新节点及当前页面；不接受脚本、选择器、其他 Tab、隐式提交或生成密钥的最终按钮。正文读取有预算，等待最多 5 秒，写入后旧引用失效。用户接管不会因停手自动归还控制。
 
-1. 单元和协议回归覆盖节点失效、未知创建结果、凭据脱敏、插件门禁、取消、恢复与资源归属。
-2. 真实 Electron 中验证通用点击/输入/悬浮、导航后观察、用户接管与恢复；受控平台页标注为受控验收。
-3. 真实账号从空配置完成 Tunnel、人工密钥交接、通道和连接器配置，然后用随机文件完成工具往返并独立核对。
-4. 复用已有匹配连接器、同名不匹配连接器和中断恢复分别验证；不得把配置成功或旧连接器启用等同于工具往返成功。
-5. 每次验收注明构建和真实/受控范围。旧固定脚本的成功轮次不能作为本次 AI 改造完成证据。
+浏览器链保持 Authority/lease → Desktop Control → Worker → Main CDP → guest。普通项目工具不因配置获得新权限。显式转交先结算原控制、撤销旧代际并迁移维护预约，目标会话仍需明确继续。 配置 scope 与每次 Browser 插件租约共用取消信号：用户接管、停止或在途撤权会阻止后续命令、重试和追加快照，已送达操作仍先等待回执结算。关闭 scope 使旧克隆身份失效，旧代际不能关闭新 scope。未结算的凭据保存必须先核对回执才能转交；上一拥有者结束后，新会话不需要旧私有 revision 即可开始新运行。
 
-## 代码地图
+## 凭据、异步继续与恢复
 
-- AI 指令及执行：`crates/magi-api/src/web_model_setup_agent.{md,rs}`。
-- daemon 检查点和凭据交接：`crates/magi-api/src/web_model_setup.rs`。
-- 通用页面驱动：`crates/magi-api/src/web_model_driver.rs`。
-- 工具目录读取事实：`magi-mcp-server` 的 `with_catalog_observer` → `WebModelChannelRuntime::slot_catalog_served_since`。
-- 受控验收：`scripts/verify-electron-gpt-web-setup.mjs`（夹具模型只依据快照内容决策，夹具页面刷新时经槽位 socket 真实读取一次工具目录）。
-- 原生浏览器原语：`browser-automation-worker/src/runtime.ts`、`page-script.ts`。
-- 卡片与设置：`web/src/components/WebModelSetupPanel.svelte`、`SettingsWebModelSection.svelte`。
+凭据只通过可信 Desktop 安全接口提交。请求绑定 Session、setupRunId、配置 revision、handoffId 与 requestId；同一请求的非秘密参数改变返回冲突，重放只读原回执，不再次写密钥。新运行或转交替换当前请求时，旧回执与替换记录在同一 Settings 事务提交；历史回执不能重新获得执行权。
 
-真实测试结果以当次运行记录为准；未完成真实空配置和工具往返前不得宣称稳定交付。
+私有凭据以不可变版本文件写入，settings 提交版本引用后才算保存。配置记录先登记 pending 版本，随后提交 saved 版本；断线/重启通过引用核对本次保存，不从全局 hasApiKey 推断成功。安全请求 DTO 不实现 Debug。秘密不进入 settings、普通日志、模型或聊天。
+
+“保存并继续”登记一个持久 Session Input，绑定运行身份、配置 revision、插件 digest、通道代际、daemon epoch 和期限。通道完成、失败或期限到达由 daemon 唤醒；UI 轮询只读状态。人工新输入、暂停、取消、停用或重启撤销自动继续。保存与继续分别回执，接续失败不要求重复粘贴密钥。
+
+快照、配置进度和健康变化不递增配置 revision；配置事实变化才递增。执行 generation 和页面 snapshot revision 分别保护控制资格与节点引用。重启保留检查点和保存结果，清空旧交接与执行 scope。
+
+## 完成与面板
+
+连接器核验至少要求最新页面证据、当前通道 ready、相同通道代际以及本次执行期间槽位收到 tools/list。当前 stdio 槽位只提供共享 principal，daemon 无法可靠地将一次目录读取归因到目标 ChatGPT 连接器；因此目录读取只能显示“通道可达、连接器归属待核验”，不能单独把配置标记为 completed。来源证明仍需补齐；工具目录证据本身也不等于工具执行往返，真实往返独立验收。
+
+面板消费 daemon 的允许动作和运行状态。插件未激活隐藏；开始时紧凑展示，新交接展开；收起清空未提交密钥并提前提示。同一交接的轮询不反复展开，不抢焦点。保存响应丢失时按 requestId 查询原回执，不重传秘密。暂停/取消走结构化控制；普通聊天忙碌不冒充配置运行。Web 只显示脱敏摘要和回本机指引。
+
+## 代码与验证
+
+- 插件稳定说明与贡献：`crates/magi-api/src/bundled_plugins.rs`。
+- 持久状态、安全请求与继续 Input：`crates/magi-api/src/web_model_setup.rs`。
+- 主助手工具与 scope：`crates/magi-api/src/web_model_setup_tools.rs`。
+- 动作、证据及脱敏：`crates/magi-api/src/web_model_setup_policy.rs`。
+- 原生 Browser adapter：`crates/magi-api/src/web_model_driver.rs`。
+- 通道、私有凭据引用与目录观察：`crates/magi-api/src/web_model_channel.rs`。
+- 面板：`web/src/components/WebModelSetupPanel.svelte`。
+- 受控 Electron：`scripts/verify-electron-gpt-web-setup.mjs`。
+
+定向验证使用 `cargo test -p magi-api web_model --lib`、Skill/主循环相关测试、`npm --prefix web run check`、`npm --prefix web run test:web-model` 与 `npm run protocol:check`。受控模型和离线站点不能证明真实账号规划质量或 Provider 缓存命中率。

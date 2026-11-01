@@ -3078,6 +3078,14 @@ fn execute_task_tool_call(
     );
 
     if tool_call.function.name == SKILL_APPLY_TOOL_NAME {
+        if skill_name.is_some()
+            && serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+                .ok()
+                .is_none_or(|args| args["mode"] != "reference")
+        {
+            return (serde_json::json!({"status":"rejected", "error_code":"skill_scope_conflict",
+                "error":"已有 active Skill，仅允许 mode=reference 读取补充说明；原权限限制继续有效"}).to_string(), ExecutionResultStatus::Rejected);
+        }
         return execute_skill_apply_from_runtime(&tool_call.function.arguments, skill_runtime);
     }
 
@@ -9533,6 +9541,8 @@ mod tests {
             };
             let thread = magi_core::ThreadId::new("partial-thread");
             let request = || ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: "fixture".into(),
                 prompt: "inspect".into(),
                 messages: None,

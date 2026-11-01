@@ -27,9 +27,8 @@ use crate::tool_call_validation::{
 };
 use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::tool_result_utils::{
-    DEFAULT_TOOL_RETRY_LIMIT, MAX_POLICY_REJECTIONS_PER_TASK, bound_model_visible_tool_history,
-    emergency_model_round_failure, infer_tool_call_status, model_visible_tool_history_budget_bytes,
-    model_visible_tool_result, non_retryable_tool_failure, summarize_tool_result,
+    DEFAULT_TOOL_RETRY_LIMIT, MAX_POLICY_REJECTIONS_PER_TASK, emergency_model_round_failure,
+    infer_tool_call_status, non_retryable_tool_failure, summarize_tool_result,
     tool_interrupted_before_execution_payload, tool_payload_waits_for_user,
     turn_item_status_for_tool_result,
 };
@@ -554,6 +553,9 @@ fn validated_task_completion(
     final_response: String,
     evidence: Vec<TaskCompletionEvidence>,
 ) -> Result<TaskOutcome, String> {
+    if let Some(reason) = setup_phase_recovery_prompt(&evidence) {
+        return Err(reason);
+    }
     let attempt = TaskCompletionAttempt {
         output_refs,
         final_response: Some(final_response),
@@ -561,6 +563,23 @@ fn validated_task_completion(
     };
     task.completion_contract().validate(&attempt)?;
     Ok(TaskOutcome::Completed { attempt })
+}
+
+/// 配置运行可跨 Turn；只有可信领域回执证明交接/暂停/完成，才允许本轮阶段交付。
+fn setup_phase_recovery_prompt(evidence: &[TaskCompletionEvidence]) -> Option<String> {
+    let name = magi_plugin_system::model_tool_name("openai.chatgpt-web", "configure");
+    let latest = evidence.iter().rev().find_map(|evidence| {
+        if let TaskCompletionEvidence::SuccessfulToolCall {
+            tool_name, result, ..
+        } = evidence
+            && tool_name == &name
+        {
+            return serde_json::from_str::<serde_json::Value>(result).ok();
+        }
+        None
+    })?;
+    (latest["configuration"]["runState"] == "running").then(||
+        "本轮配置尚无已提交的交接或完成证据。请继续推进，或用配置工具提交真实人工交接/暂停，再给本轮阶段答复；不得把正在运行说成配置完成。".into())
 }
 
 fn task_round_tool_definitions(
@@ -861,36 +880,13 @@ fn run_conversation_loop_inner(
             workspace_rules
         ),
     ));
-    // ---- Cache breakpoint · STATIC → NON-STATIC ----
-    // 上面 Tier A 三段同一角色 / workspace / mission 多轮不变，是 prompt
-    // 缓存命中的真正受益面。这里插入一条 boundary 标记消息，下游
-    // `AnthropicMessagesAdapter` 在 join system 后据此切分 content blocks,
-    // 给静态前缀打 `cache_control: {type: ephemeral}`。其他不支持
-    // cache_control 的 adapter 会透明剥离这个标记，不影响输出语义。
-    //
-    // 仅在 STATIC 段实际产出过至少一条消息时插入，避免空前缀触发退化路径。
-    if static_context_messages
-        .iter()
-        .any(|m| matches!(m.role.as_str(), "system" | "developer"))
-    {
-        static_context_messages.push(ChatMessage {
-            input_request_id: None,
-            context_origin: Default::default(),
-            role: "system".to_string(),
-            content: Some(magi_bridge_client::cache_boundary::PROMPT_CACHE_BOUNDARY.to_string()),
-            images: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            provider_context: Vec::new(),
-        });
-    }
-
     let memory_write_visible = tools.as_ref().is_some_and(|definitions| {
         definitions
             .iter()
             .any(|definition| definition.function.name == "memory_write")
     });
-    let pending_mailbox_prompt = render_task_signals_for_prompt(&initial_signals);
+    // Mailbox 是 Task 生命周期内的运行时投递视图，不能伪装成已持久化的 transcript。
+    let runtime_signals = std::cell::RefCell::new(initial_signals);
     let is_primary_execution = !is_sidechain && task.parent_task_id.is_none();
     let can_observe_plan = || {
         session_store
@@ -953,50 +949,71 @@ fn run_conversation_loop_inner(
         tools.as_deref().unwrap_or_default(),
         Some(&agent_model_capabilities),
     );
-    // 主会话线程的任务上下文、计划与邮箱每轮可能不同，放在历史之前会让其后的整段
-    // 历史缓存失效；因此它们在每次请求时追加到模型视图末尾（见 `with_volatile_context_tail`），
-    // 不进入 `messages`，也不进入 thread 历史。子代理线程单任务独占，保留原有顺序。
-    let volatile_context_at_tail = !is_sidechain;
-    let volatile_context_tail = || -> Vec<ChatMessage> {
-        if volatile_context_at_tail {
-            build_task_context_base_messages(
-                &task_context_messages,
-                None,
-                memory_write_visible,
-                plan_store,
-                can_observe_plan(),
-                pending_mailbox_prompt.as_deref(),
-            )
-        } else {
-            Vec::new()
-        }
-    };
-    let with_volatile_context_tail =
-        |messages: &[ChatMessage], steps_tail: Option<&ChatMessage>| -> Vec<ChatMessage> {
-            let mut view = messages.to_vec();
-            view.extend(volatile_context_tail());
-            view.extend(steps_tail.cloned());
-            view
-        };
-    if volatile_context_at_tail {
-        messages.extend(build_task_context_base_messages(
-            &[],
-            project_memory,
-            memory_write_visible,
-            plan_store,
-            false,
-            None,
-        ));
+    // 主线 branch 跨 task/Turn，当前任务引用属于尾部；worker branch 只拥有一个 task，
+    // 冻结的交接引用在该 branch 生命周期内稳定，可以放在历史前。计划、邮箱和
+    // 非持久历史说明对所有分支都属于易变尾部，不进入 transcript。
+    let stable_task_context = if is_sidechain {
+        task_context_messages.as_slice()
     } else {
-        messages.extend(build_task_context_base_messages(
-            &task_context_messages,
-            project_memory,
+        &[]
+    };
+    let round_task_context = if is_sidechain {
+        &[]
+    } else {
+        task_context_messages.as_slice()
+    };
+    // 历史边界说明只在回合开始或压缩重建时才存在，不会写进 thread 历史；若插在历史与当前
+    // 输入之间，下一回合重建历史时它消失，上一回合的整段内容都会错位而无法复用缓存。
+    // 因此所有分支把它放在易变尾部，位置随每次请求稳定在当前输入之后。
+    let mut request_controls = crate::request_controls::RequestControls::default();
+    let history_boundary_note = std::cell::Cell::new(None::<&'static str>);
+    // 最近一次请求视图对已有结果的改写量，随 Step 一起冻结，用于缓存断代归因。
+    let history_projection = std::cell::Cell::new(magi_session_store::HistoryProjection::default());
+    let volatile_context_tail = || -> Vec<ChatMessage> {
+        let mut tail = Vec::new();
+        let mailbox_prompt = render_task_signals_for_prompt(&runtime_signals.borrow());
+        if let Some(note) = history_boundary_note.get() {
+            tail.push(system_prompt_fragment_message(
+                PromptFragmentKind::ThreadHistoryBoundary,
+                note,
+            ));
+        }
+        tail.extend(build_task_context_base_messages(
+            round_task_context,
+            None,
             memory_write_visible,
             plan_store,
             can_observe_plan(),
-            pending_mailbox_prompt.as_deref(),
+            mailbox_prompt.as_deref(),
         ));
-    }
+        tail
+    };
+    let with_volatile_context_tail = |messages: &[ChatMessage],
+                                      context_window_tokens: u64,
+                                      steps_tail: Option<&ChatMessage>,
+                                      controls: &crate::request_controls::RequestControls,
+                                      discovery_warning: Option<&ChatMessage>|
+     -> Vec<ChatMessage> {
+        // 总预算只作用于原始结果序列的副本：`messages` 保持原样，视图才是它的纯函数。
+        let (history, projection) =
+            crate::history_projection::bounded_request_history(messages, context_window_tokens);
+        history_projection.set(projection);
+        controls.view(
+            &history,
+            volatile_context_tail()
+                .into_iter()
+                .chain(steps_tail.cloned())
+                .chain(discovery_warning.cloned()),
+        )
+    };
+    messages.extend(build_task_context_base_messages(
+        stable_task_context,
+        project_memory,
+        memory_write_visible,
+        plan_store,
+        false,
+        None,
+    ));
     // [CACHE: APPEND-ONLY] Runtime tail · Thread 历史。
     // P6b：只读取当前 thread 内部已经持久化的运行时输入 / 恢复记录。worker thread
     // 为单 task 独占，因此这里不能出现同 role 的历史 task 对话。历史超出水位线时
@@ -1264,10 +1281,8 @@ fn run_conversation_loop_inner(
             .map(thread_chat_message_to_chat_message)
             .collect::<Vec<_>>();
         messages.extend(routed_history);
-        messages.push(system_prompt_fragment_message(
-            PromptFragmentKind::ThreadHistoryBoundary,
-            "以上是当前 task 已持久化的运行记录。它们是恢复后的工作事实：已完成的工具结果必须直接继承，不要从头重复；结果未知的外部操作必须先检查当前状态。后续当前任务输入必须以当前任务为准。",
-        ));
+        const PERSISTED_HISTORY_NOTE: &str = "本轮请求中的历史消息是当前 task 已持久化的运行记录，其中最近一条用户输入是本轮当前任务。它们是恢复后的工作事实：已完成的工具结果必须直接继承，不要从头重复；结果未知的外部操作必须先检查当前状态。历史与当前任务冲突时，以当前任务为准。";
+        history_boundary_note.set(Some(PERSISTED_HISTORY_NOTE));
     }
     // [CACHE: DYNAMIC] Runtime tail · 本轮 user 输入。
     // 新 task 首次启动才追加该输入；恢复 runner 必须复用 thread 中已持久化的原始
@@ -1399,7 +1414,8 @@ fn run_conversation_loop_inner(
                                 context_window: u64,
                                 round_tools: Option<&[ChatToolDefinition]>,
                                 active_skill_name: Option<&str>,
-                                mode: ContextCompactionMode| {
+                                mode: ContextCompactionMode,
+                                round_context: &[ChatMessage]| {
         let mut context_base_messages = static_context_messages.to_vec();
         context_base_messages.push(system_prompt_fragment_message(
             PromptFragmentKind::CurrentAccessProfile,
@@ -1424,25 +1440,14 @@ fn run_conversation_loop_inner(
         ) {
             context_base_messages.push(skill_message);
         }
-        if volatile_context_at_tail {
-            context_base_messages.extend(build_task_context_base_messages(
-                &[],
-                project_memory,
-                memory_write_visible,
-                plan_store,
-                false,
-                None,
-            ));
-        } else {
-            context_base_messages.extend(build_task_context_base_messages(
-                &task_context_messages,
-                project_memory,
-                memory_write_visible,
-                plan_store,
-                can_observe_plan(),
-                pending_mailbox_prompt.as_deref(),
-            ));
-        }
+        context_base_messages.extend(build_task_context_base_messages(
+            stable_task_context,
+            project_memory,
+            memory_write_visible,
+            plan_store,
+            false,
+            None,
+        ));
         let pending_inputs = crate::context_authority::unprojected_input_messages(
             session_store,
             session_id,
@@ -1453,10 +1458,7 @@ fn run_conversation_loop_inner(
         let mut additional_context =
             estimate_context_usage_breakdown(&context_base_messages, round_tools);
         additional_context.merge(&estimate_context_usage_breakdown(&pending_inputs, None));
-        additional_context.merge(&estimate_context_usage_breakdown(
-            &volatile_context_tail(),
-            None,
-        ));
+        additional_context.merge(&estimate_context_usage_breakdown(round_context, None));
         let prepared = prepare_task_history(phase, context_window, additional_context, mode);
         if let Some(terminal) = prepared.terminal {
             return Err(terminal);
@@ -1469,10 +1471,9 @@ fn run_conversation_loop_inner(
                     .iter()
                     .map(thread_chat_message_to_chat_message),
             );
-            rebuilt.push(system_prompt_fragment_message(
-                PromptFragmentKind::ThreadHistoryBoundary,
-                "以上是当前 task 的压缩检查点与最近完整运行记录。仅使用其中当前有效事实继续执行。",
-            ));
+            const COMPACTED_HISTORY_NOTE: &str =
+                "本轮请求中的历史消息是当前 task 的压缩检查点与最近完整运行记录。仅使用其中当前有效事实继续执行。";
+            history_boundary_note.set(Some(COMPACTED_HISTORY_NOTE));
             for input in pending_inputs {
                 if !rebuilt
                     .iter()
@@ -1506,10 +1507,9 @@ fn run_conversation_loop_inner(
             };
             return (TaskOutcome::Failed { error }, context_summary);
         }
-        append_task_runtime_signals(
-            &mut messages,
-            conversation_registry.drain_task_signals(session_id, task_id),
-        );
+        runtime_signals
+            .borrow_mut()
+            .extend(conversation_registry.drain_task_signals(session_id, task_id));
         if !is_sidechain && let Some(turn_id) = expected_turn_id.as_deref() {
             crate::session_turn_execution::append_session_turn_steers_to_messages(
                 &mut messages,
@@ -1738,10 +1738,10 @@ fn run_conversation_loop_inner(
             );
             return (TaskOutcome::Failed { error }, context_summary);
         }
-        if discovery_progress.should_warn() {
-            messages.push(runtime_context_message(PromptFragmentKind::CurrentTurnPriority,
-                "最近多轮探索没有获得新观测。请依据已有证据综合结论，或明确换一个尚未检查的证据范围；不要重复相同读取。"));
-        }
+        let discovery_warning = discovery_progress.should_warn().then(|| {
+            runtime_context_message(PromptFragmentKind::CurrentTurnPriority,
+                "最近多轮探索没有获得新观测。请依据已有证据综合结论，或明确换一个尚未检查的证据范围；不要重复相同读取。")
+        });
         if context_budget_recheck_required && !proactive_context_compaction_completed {
             match rebuild_task_context(
                 &static_context_messages,
@@ -1751,6 +1751,13 @@ fn run_conversation_loop_inner(
                 round_tools.as_deref(),
                 active_skill_name.as_deref(),
                 ContextCompactionMode::Automatic,
+                &with_volatile_context_tail(
+                    &[],
+                    effective_context_window,
+                    execution_steps_tail.as_ref(),
+                    &request_controls,
+                    discovery_warning.as_ref(),
+                ),
             ) {
                 Ok(Some(rebuilt_messages)) => {
                     messages = rebuilt_messages;
@@ -1770,14 +1777,18 @@ fn run_conversation_loop_inner(
             }
         }
         context_budget_recheck_required = false;
-        bound_model_visible_chat_tool_results(&mut messages, effective_context_window);
         let model_round_wall_started_at = Instant::now();
         let invocation_request = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: prompt.clone(),
             messages: Some(with_volatile_context_tail(
                 &messages,
+                effective_context_window,
                 execution_steps_tail.as_ref(),
+                &request_controls,
+                discovery_warning.as_ref(),
             )),
             tools: round_tools.clone(),
             tool_choice: if constrain_to_recovery_tool || strict_goal_mode_round {
@@ -1800,7 +1811,15 @@ fn run_conversation_loop_inner(
             thread_id,
             &round_call_id,
         )
-        .with_model_binding(settings_store, usage_binding);
+        .with_model_binding(settings_store, usage_binding)
+        .with_usage_assignment(lease_id.to_string())
+        .with_history_projection(history_projection.get());
+        if is_sidechain {
+            step_client =
+                step_client.with_prompt_branch(crate::prompt_lineage::PromptBranchScope::Worker {
+                    task_id: task_id.as_str().to_string(),
+                });
+        }
         if let Some(policy) = prepared_execution_task
             .as_ref()
             .unwrap_or(task)
@@ -1828,7 +1847,13 @@ fn run_conversation_loop_inner(
         }
         let client: &dyn ModelBridgeClient = &step_client;
         let context_breakdown = estimate_context_usage_breakdown(
-            &with_volatile_context_tail(&messages, execution_steps_tail.as_ref()),
+            &with_volatile_context_tail(
+                &messages,
+                effective_context_window,
+                execution_steps_tail.as_ref(),
+                &request_controls,
+                discovery_warning.as_ref(),
+            ),
             round_tools.as_deref(),
         );
         let context_usage_tracker = usage_binding.tracks_active_context().then(|| {
@@ -1986,14 +2011,6 @@ fn run_conversation_loop_inner(
                 ) {
                     Ok(response) => response,
                     Err(error) => {
-                        if invocation_cancelled() {
-                            return (
-                                TaskOutcome::Failed {
-                                    error: "任务已中断".to_string(),
-                                },
-                                context_summary,
-                            );
-                        }
                         let raw_error_message = error.to_string();
                         let classification = classify_model_invocation_error(&raw_error_message);
                         let error_message = classification.public_message.to_string();
@@ -2008,13 +2025,16 @@ fn run_conversation_loop_inner(
                                 session_id,
                                 workspace_id,
                                 binding: usage_binding,
-                                call_id: round_call_id.clone(),
+                                call_id: step_client
+                                    .last_step_id()
+                                    .unwrap_or_else(|| round_call_id.clone()),
                                 usage: None,
                                 status: UsageCallStatus::Failed,
                                 assignment_id: Some(lease_id.to_string()),
                                 error_code: Some(classification.code.to_string()),
                             },
                         );
+
                         if error.context_overflow().is_some() && !context_limit_recovery_attempted {
                             context_limit_recovery_attempted = true;
                             let reported_context_limit = error
@@ -2034,6 +2054,13 @@ fn run_conversation_loop_inner(
                                 round_tools.as_deref(),
                                 active_skill_name.as_deref(),
                                 ContextCompactionMode::Recovery,
+                                &with_volatile_context_tail(
+                                    &[],
+                                    effective_context_window,
+                                    execution_steps_tail.as_ref(),
+                                    &request_controls,
+                                    discovery_warning.as_ref(),
+                                ),
                             ) {
                                 Ok(Some(rebuilt_messages)) => {
                                     messages = rebuilt_messages;
@@ -2067,19 +2094,9 @@ fn run_conversation_loop_inner(
                                 < MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS
                         {
                             empty_response_recovery_attempts += 1;
-                            messages.push(ChatMessage {
-                                input_request_id: None,
-                                context_origin: Default::default(),
-                                role: "user".to_string(),
-                                content: Some(
-                                    model_empty_response_recovery_prompt(had_tool_calls)
-                                        .to_string(),
-                                ),
-                                images: Vec::new(),
-                                tool_calls: Vec::new(),
-                                tool_call_id: None,
-                                provider_context: Vec::new(),
-                            });
+                            request_controls.recover(
+                                model_empty_response_recovery_prompt(had_tool_calls).to_string(),
+                            );
                             tracing::warn!(
                                 task_id = %task.task_id,
                                 round,
@@ -2151,16 +2168,7 @@ fn run_conversation_loop_inner(
                             let recovery_prompt = model_stream_interruption_recovery_prompt(
                                 !partial_visible_content.is_empty(),
                             );
-                            messages.push(ChatMessage {
-                                input_request_id: None,
-                                context_origin: Default::default(),
-                                role: "user".to_string(),
-                                content: Some(recovery_prompt.to_string()),
-                                images: Vec::new(),
-                                tool_calls: Vec::new(),
-                                tool_call_id: None,
-                                provider_context: Vec::new(),
-                            });
+                            request_controls.recover(recovery_prompt.to_string());
                             if stream_interruption_recovery_attempts
                                 < MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS
                             {
@@ -2181,7 +2189,10 @@ fn run_conversation_loop_inner(
                             let mut recovery_request = non_stream_recovery_template;
                             recovery_request.messages = Some(with_volatile_context_tail(
                                 &messages,
+                                effective_context_window,
                                 execution_steps_tail.as_ref(),
+                                &request_controls,
+                                discovery_warning.as_ref(),
                             ));
                             tracing::warn!(
                                 task_id = %task.task_id,
@@ -2213,10 +2224,9 @@ fn run_conversation_loop_inner(
                                             session_id,
                                             workspace_id,
                                             binding: usage_binding,
-                                            call_id: format!(
-                                                "task-{}-{}-{round}-non-stream-recovery",
-                                                task_id, lease_id
-                                            ),
+                                            call_id: step_client
+                                                .last_step_id()
+                                                .unwrap_or_else(|| round_call_id.clone()),
                                             usage: None,
                                             status: UsageCallStatus::Failed,
                                             assignment_id: Some(lease_id.to_string()),
@@ -2348,13 +2358,23 @@ fn run_conversation_loop_inner(
                             session_id,
                             workspace_id,
                             binding: usage_binding,
-                            call_id: round_call_id.clone(),
+                            call_id: step_client
+                                .last_step_id()
+                                .unwrap_or_else(|| round_call_id.clone()),
                             usage: None,
                             status: UsageCallStatus::Failed,
                             assignment_id: Some(lease_id.to_string()),
                             error_code: Some(classification.code.to_string()),
                         },
                     );
+                    if invocation_cancelled() {
+                        return (
+                            TaskOutcome::Failed {
+                                error: "任务已中断".to_string(),
+                            },
+                            context_summary,
+                        );
+                    }
                     if error.context_overflow().is_some() && !context_limit_recovery_attempted {
                         context_limit_recovery_attempted = true;
                         let reported_context_limit = error
@@ -2371,6 +2391,13 @@ fn run_conversation_loop_inner(
                             round_tools.as_deref(),
                             active_skill_name.as_deref(),
                             ContextCompactionMode::Recovery,
+                            &with_volatile_context_tail(
+                                &[],
+                                effective_context_window,
+                                execution_steps_tail.as_ref(),
+                                &request_controls,
+                                discovery_warning.as_ref(),
+                            ),
                         ) {
                             Ok(Some(rebuilt_messages)) => {
                                 messages = rebuilt_messages;
@@ -2401,18 +2428,9 @@ fn run_conversation_loop_inner(
                             < MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS
                     {
                         empty_response_recovery_attempts += 1;
-                        messages.push(ChatMessage {
-                            input_request_id: None,
-                            context_origin: Default::default(),
-                            role: "user".to_string(),
-                            content: Some(
-                                model_empty_response_recovery_prompt(had_tool_calls).to_string(),
-                            ),
-                            images: Vec::new(),
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                            provider_context: Vec::new(),
-                        });
+                        request_controls.recover(
+                            model_empty_response_recovery_prompt(had_tool_calls).to_string(),
+                        );
                         tracing::warn!(
                             task_id = %task.task_id,
                             round,
@@ -2635,6 +2653,9 @@ fn run_conversation_loop_inner(
             return (TaskOutcome::Failed { error }, context_summary);
         }
         let has_actionable_output = completed_stream_content.is_some() || round_has_tool_calls;
+        if has_actionable_output {
+            request_controls.clear();
+        }
         let response_contract_failure = match parsed.status {
             ModelResponseStatus::Incomplete => Some(ModelFailureDiagnostic::incomplete_response(
                 parsed.finish_reason.as_deref(),
@@ -2659,7 +2680,9 @@ fn run_conversation_loop_inner(
                 session_id,
                 workspace_id,
                 binding: usage_binding,
-                call_id: round_call_id.clone(),
+                call_id: step_client
+                    .last_step_id()
+                    .unwrap_or_else(|| round_call_id.clone()),
                 usage: parsed.usage.as_ref(),
                 status: if has_actionable_output && response_contract_failure.is_none() {
                     UsageCallStatus::Success
@@ -2776,6 +2799,8 @@ fn run_conversation_loop_inner(
                 agent_coordination_recovery_prompt(task, task_store, &tool_call_records)
             {
                 Some(recovery_prompt)
+            } else if let Some(prompt) = setup_phase_recovery_prompt(&completion_evidence) {
+                Some(prompt)
             } else if execution_steps_unfinished().unwrap_or(true) {
                 Some("执行步骤尚未收口。请继续实际工作并调用 update_execution_steps 更新当前 revision；完成必须引用真实成功工具的 itemId/toolCallId。确实受阻或不再执行的步骤应填写 blocked/canceled 和 reason，不得虚报完成。".into())
             } else if owns_active_plan() {
@@ -2789,16 +2814,7 @@ fn run_conversation_loop_inner(
                 }
                 completion_recovery_attempts += 1;
                 messages.push(assistant_response_message.clone());
-                messages.push(ChatMessage {
-                    input_request_id: None,
-                    context_origin: Default::default(),
-                    role: "user".to_string(),
-                    content: Some(recovery_prompt),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                });
+                request_controls.recover(recovery_prompt);
                 continue;
             }
             if !has_actionable_output
@@ -2808,16 +2824,8 @@ fn run_conversation_loop_inner(
                 if !assistant_response_message.provider_context.is_empty() {
                     messages.push(assistant_response_message.clone());
                 }
-                messages.push(ChatMessage {
-                    input_request_id: None,
-                    context_origin: Default::default(),
-                    role: "user".to_string(),
-                    content: Some(model_empty_response_recovery_prompt(had_tool_calls).to_string()),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                });
+                request_controls
+                    .recover(model_empty_response_recovery_prompt(had_tool_calls).to_string());
                 continue;
             }
             // 先取走全部已接纳输入；只有引导和代理信号都为空时才关闭通道和授权。
@@ -2830,7 +2838,7 @@ fn run_conversation_loop_inner(
             ) {
                 TaskSignalBoundary::Pending(signals) => {
                     messages.push(assistant_response_message.clone());
-                    append_task_runtime_signals(&mut messages, signals);
+                    runtime_signals.borrow_mut().extend(signals);
                     continue;
                 }
                 TaskSignalBoundary::PendingSteers(steers) => {
@@ -3345,8 +3353,9 @@ fn run_conversation_loop_inner(
                 input_request_id: None,
                 context_origin: Default::default(),
                 role: "tool".to_string(),
-                content: Some(crate::context_authority::with_current_file_fact(
-                    model_visible_tool_result(&result, tool_status),
+                content: Some(crate::history_projection::project_tool_result(
+                    &result,
+                    tool_status,
                 )),
                 images: Vec::new(),
                 tool_calls: Vec::new(),
@@ -3647,31 +3656,6 @@ fn run_conversation_loop_inner(
     (outcome, context_summary)
 }
 
-/// 在每次模型请求前限制当前 turn 的工具结果总量。
-///
-/// thread 中的完整结果仍由 session store 保留；这里仅收敛本轮模型视图，避免
-/// 长时间只读探索把每个旧 file_read/search 结果永久累加到下一轮 prefill。
-fn bound_model_visible_chat_tool_results(messages: &mut [ChatMessage], context_window_tokens: u64) {
-    let indices = messages
-        .iter()
-        .enumerate()
-        .filter_map(|(index, message)| {
-            (message.role == "tool" && message.content.is_some()).then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let results = indices
-        .iter()
-        .filter_map(|index| messages[*index].content.clone())
-        .collect::<Vec<_>>();
-    let bounded = bound_model_visible_tool_history(
-        &results,
-        model_visible_tool_history_budget_bytes(context_window_tokens),
-    );
-    for (index, result) in indices.into_iter().zip(bounded) {
-        messages[index].content = Some(result);
-    }
-}
-
 fn discovery_tool_call(tool_call: &ChatToolCall) -> bool {
     let canonical_name = canonical_tool_call_name(&tool_call.function.name);
     if matches!(
@@ -3710,15 +3694,6 @@ fn render_task_signals_for_prompt(signals: &[RuntimeSignal]) -> Option<String> {
         ));
     }
     Some(rendered)
-}
-
-fn append_task_runtime_signals(messages: &mut Vec<ChatMessage>, signals: Vec<RuntimeSignal>) {
-    if let Some(rendered) = render_task_signals_for_prompt(&signals) {
-        messages.push(system_prompt_fragment_message(
-            PromptFragmentKind::Mailbox,
-            rendered,
-        ));
-    }
 }
 
 fn agent_coordination_recovery_prompt(
@@ -4626,6 +4601,35 @@ fn task_stream_item_id(task_id: &TaskId, round: usize, streaming_entry_id: Optio
 }
 
 #[cfg(test)]
+mod setup_phase_tests {
+    use super::*;
+    fn receipt(state: &str) -> TaskCompletionEvidence {
+        TaskCompletionEvidence::SuccessfulToolCall {
+            call_id: "setup".into(),
+            tool_name: magi_plugin_system::model_tool_name("openai.chatgpt-web", "configure"),
+            arguments: serde_json::json!({"action":"inspect"}),
+            result: serde_json::json!({"configuration":{"runState":state}}).to_string(),
+        }
+    }
+    #[test]
+    fn active_setup_requires_phase_delivery_but_a_handoff_allows_discussion_to_finish() {
+        assert!(setup_phase_recovery_prompt(&[receipt("running")]).is_some());
+        for state in [
+            "waiting_user",
+            "paused",
+            "blocked",
+            "completed",
+            "cancelled",
+        ] {
+            assert!(
+                setup_phase_recovery_prompt(&[receipt("running"), receipt(state)]).is_none(),
+                "{state}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use magi_bridge_client::{
@@ -5384,6 +5388,8 @@ mod tests {
         assert_eq!(input.images.len(), 1);
         assert_eq!(input.images[0].data, "AA==");
         let request = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "test".into(),
             prompt: String::new(),
             messages: Some(
@@ -6542,14 +6548,19 @@ mod tests {
                     message: "provider response invalid: empty stream response".to_string(),
                 });
             }
-            assert!(
-                request
-                    .messages
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|message| message.content.as_deref()
-                        == Some(model_empty_response_recovery_prompt(false)))
+            let controls = request
+                .messages
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter(|message| {
+                    message.content.as_deref() == Some(model_empty_response_recovery_prompt(false))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(controls.len(), 1, "重复恢复只能保留当前控制提示");
+            assert_eq!(
+                controls[0].context_origin,
+                magi_bridge_client::ChatMessageOrigin::RoundContext
             );
             on_delta(&ModelStreamingDelta {
                 content: "子代理在暂态空响应后完成。".to_string(),
@@ -7487,10 +7498,29 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(references.len(), 1, "压缩前后都只能装配一次当前引用");
+            // 引用按 branch 所有权声明生命周期：worker 的冻结交接包在该 task 内稳定。
             assert_eq!(
                 references[0].context_origin,
-                magi_bridge_client::ChatMessageOrigin::ContextReference
+                if is_sidechain {
+                    magi_bridge_client::ChatMessageOrigin::ContextReference
+                } else {
+                    magi_bridge_client::ChatMessageOrigin::RoundContext
+                }
             );
+            for message in request.messages.as_ref().unwrap().iter().filter(|message| {
+                message.content.as_deref().is_some_and(|content| {
+                    content.starts_with("<magi-context-fragment id=\"user_plan\"")
+                        || (content.starts_with("<magi-context-fragment id=\"thread_history_boundary\"")
+                            // 压缩检查点也是 transcript 包装，但属于权威历史，不能误当临时说明。
+                            && !content.contains("[context_compaction]"))
+                })
+            }) {
+                assert_eq!(
+                    message.context_origin,
+                    magi_bridge_client::ChatMessageOrigin::RoundContext,
+                    "计划和非持久历史说明不因 worker 的任务稳定性而提前到历史前"
+                );
+            }
         }
         assert!(
             requests[2]
@@ -9614,7 +9644,7 @@ mod tests {
         assert!(rules.contains("不能覆盖本轮用户明确要求"));
         assert_eq!(
             messages[reference_index].context_origin,
-            magi_bridge_client::ChatMessageOrigin::ContextReference
+            magi_bridge_client::ChatMessageOrigin::RoundContext
         );
         let breakdown = estimate_context_usage_breakdown(&messages, None);
         assert!(breakdown.context_reference_tokens > 0);
@@ -9647,7 +9677,7 @@ mod tests {
         let project_memory_index = content_at("旧偏好要求输出 OLD_REFERENCE_RESULT");
         let plan_index = content_at("当前用户可见计划");
         let history_index = content_at("历史要求：输出 OLD_REFERENCE_RESULT");
-        let thread_boundary_index = content_at("必须以当前任务为准");
+        let thread_boundary_index = content_at("已持久化的运行记录");
         let priority_index = content_at("上下文优先级（本轮必须遵守）");
         let current_prompt_index = content_at(&prompt);
 
@@ -9655,11 +9685,28 @@ mod tests {
         assert!(priority_index < plan_index);
         assert!(history_index < thread_boundary_index);
         assert!(priority_index < thread_boundary_index);
+        // 历史边界说明不插在历史与当前输入之间：它不写进 thread 历史，
+        // 下一回合重建历史时若夹在中间就会让上一回合整段内容错位。
+        assert!(current_prompt_index < thread_boundary_index);
+        assert_eq!(
+            messages[thread_boundary_index].context_origin,
+            magi_bridge_client::ChatMessageOrigin::RoundContext
+        );
         assert!(priority_index < current_prompt_index);
         // 引用上下文、计划等每轮易变内容追加在请求末尾，历史与当前输入保持稳定前缀。
         assert!(history_index < current_prompt_index);
         assert!(current_prompt_index < reference_index);
         assert!(current_prompt_index < plan_index);
+        // 易变尾部是紧跟当前输入的连续一段，适配器据此把缓存断点放在它之前。
+        let tail_len = messages
+            .iter()
+            .rev()
+            .take_while(|message| {
+                message.context_origin == magi_bridge_client::ChatMessageOrigin::RoundContext
+            })
+            .count();
+        assert!(tail_len >= 2);
+        assert_eq!(messages.len() - tail_len, current_prompt_index + 1);
         assert!(project_memory_index < history_index);
         assert!(
             messages[project_memory_index]
@@ -10532,7 +10579,8 @@ mod tests {
                             .is_some_and(|content| content.contains("已保留此前可见内容"))
                 })
                 .count(),
-            MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS + 1
+            1,
+            "重复恢复只保留当前请求控制提示"
         );
 
         let turn = session_store

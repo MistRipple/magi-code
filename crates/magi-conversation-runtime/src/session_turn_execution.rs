@@ -686,6 +686,7 @@ struct RebuildMessagesForContextWindowInput<'a> {
     knowledge_context_prompt: Option<&'a str>,
     context_window: u64,
     messages: &'a mut Vec<ChatMessage>,
+    request_context: &'a [ChatMessage],
     persist_session_state: Option<&'a SessionStatePersistCallback>,
     settings_store: Option<&'a Arc<SettingsStore>>,
     skill_runtime: Option<&'a magi_skill_runtime::SkillRuntime>,
@@ -705,6 +706,7 @@ fn rebuild_messages_for_context_window(
         knowledge_context_prompt,
         context_window,
         messages,
+        request_context,
         persist_session_state,
         settings_store,
         skill_runtime,
@@ -762,7 +764,11 @@ fn rebuild_messages_for_context_window(
         recovery_history: Vec::new(),
         phase: "context_limit_recovery",
         context_window_tokens: context_window,
-        additional_context: estimate_context_usage_breakdown(&fixed_messages, None),
+        additional_context: {
+            let mut usage = estimate_context_usage_breakdown(&fixed_messages, None);
+            usage.merge(&estimate_context_usage_breakdown(request_context, None));
+            usage
+        },
         persist_checkpoint,
         model_identity: None,
         mode: ContextCompactionMode::Recovery,
@@ -1188,6 +1194,7 @@ fn run_session_turn_execution_inner(
                 )
             })?;
     }
+    let mut request_controls = crate::request_controls::RequestControls::default();
     let mut final_content: Option<String> = None;
     let mut final_item_id: Option<String> = None;
     let mut final_model_round: Option<usize> = None;
@@ -1212,6 +1219,7 @@ fn run_session_turn_execution_inner(
                 usage_binding: &usage_binding,
                 prompt: &prompt,
                 messages: &mut messages,
+                request_controls: &mut request_controls,
                 provider_retry_attempts: &provider_retry_attempts,
                 stream_interruption_recovery_attempts,
                 round,
@@ -1306,16 +1314,8 @@ fn run_session_turn_execution_inner(
                     && empty_response_recovery_attempts < MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS
                 {
                     empty_response_recovery_attempts += 1;
-                    messages.push(ChatMessage {
-                        input_request_id: None,
-                        context_origin: Default::default(),
-                        role: "user".to_string(),
-                        content: Some(model_empty_response_recovery_prompt(false).to_string()),
-                        images: Vec::new(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                        provider_context: Vec::new(),
-                    });
+                    request_controls
+                        .recover(model_empty_response_recovery_prompt(false).to_string());
                     tracing::warn!(
                         session_id = %request.session_id,
                         round,
@@ -1344,6 +1344,7 @@ fn run_session_turn_execution_inner(
                             knowledge_context_prompt: knowledge_context_prompt.as_deref(),
                             context_window: effective_context_window,
                             messages: &mut messages,
+                            request_context: &request_controls.view(&[], []),
                             persist_session_state,
                             settings_store,
                             skill_runtime,
@@ -1408,6 +1409,7 @@ fn run_session_turn_execution_inner(
         }
 
         if let Some(content) = streamed_content.final_content {
+            request_controls.clear();
             match conversation_registry
                 .turn_coordinator()
                 .take_session_turn_steers_or_close(&request.session_id, &request.turn_id)
@@ -1451,16 +1453,7 @@ fn run_session_turn_execution_inner(
             });
         }
         empty_response_recovery_attempts += 1;
-        messages.push(ChatMessage {
-            input_request_id: None,
-            context_origin: Default::default(),
-            role: "user".to_string(),
-            content: Some(model_empty_response_recovery_prompt(false).to_string()),
-            images: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            provider_context: Vec::new(),
-        });
+        request_controls.recover(model_empty_response_recovery_prompt(false).to_string());
         round = round.saturating_add(1);
     }
 
@@ -1617,6 +1610,7 @@ struct SessionTurnRoundRuntime<'a> {
     usage_binding: &'a ModelUsageBinding,
     prompt: &'a str,
     messages: &'a mut Vec<ChatMessage>,
+    request_controls: &'a mut crate::request_controls::RequestControls,
     provider_retry_attempts: &'a std::cell::Cell<usize>,
     stream_interruption_recovery_attempts: usize,
     round: usize,
@@ -1688,6 +1682,7 @@ fn stream_session_turn_round(
         usage_binding,
         prompt,
         messages,
+        request_controls,
         provider_retry_attempts,
         stream_interruption_recovery_attempts,
         round,
@@ -1746,7 +1741,8 @@ fn stream_session_turn_round(
             .unwrap_or_default();
     let resolved_provider =
         resolved_provider_for_usage_binding(settings_store, usage_binding, &request.session_id);
-    let context_breakdown = estimate_context_usage_breakdown(messages, None);
+    let context_breakdown =
+        estimate_context_usage_breakdown(&request_controls.view(messages, []), None);
     let context_usage_tracker = (usage_binding.tracks_active_context() && !web_engine).then(|| {
         ContextUsageRuntimeTracker::start(ContextUsageRuntimeTrackerInput {
             event_bus,
@@ -1951,9 +1947,11 @@ fn stream_session_turn_round(
         );
     };
     let invocation_request = ModelInvocationRequest {
+        cache_affinity_key: None,
+        prompt_cache_key: None,
         provider: BUSINESS_MODEL_PROVIDER.to_string(),
         prompt: prompt.to_string(),
-        messages: Some(messages.clone()),
+        messages: Some(request_controls.view(messages, [])),
         tools: None,
         tool_choice: None,
     };
@@ -1977,9 +1975,6 @@ fn stream_session_turn_round(
     ) {
         Ok(response) => response,
         Err(error) => {
-            if !request_turn_is_writable(session_store, request) {
-                return Ok(SessionTurnRoundOutput::interrupted(None));
-            }
             let raw_error = error.to_string();
             let classification = classify_model_invocation_error(&raw_error);
             publish_model_usage_record_for_turn(
@@ -1992,13 +1987,18 @@ fn stream_session_turn_round(
                     session_id: &request.session_id,
                     workspace_id: &request.workspace_id,
                     binding: usage_binding,
-                    call_id: call_id.clone(),
+                    call_id: step_client
+                        .last_step_id()
+                        .unwrap_or_else(|| call_id.clone()),
                     usage: None,
                     status: UsageCallStatus::Failed,
                     assignment_id: None,
                     error_code: Some(classification.code.to_string()),
                 },
             );
+            if !request_turn_is_writable(session_store, request) {
+                return Ok(SessionTurnRoundOutput::interrupted(None));
+            }
             let partial_visible_content = streamed_visible_content.borrow().trim().to_string();
             let partial_thinking = streamed_thinking.borrow().trim().to_string();
             if classification.code != "model_stream_interrupted" {
@@ -2099,19 +2099,10 @@ fn stream_session_turn_round(
                     provider_context: Vec::new(),
                 });
             }
-            messages.push(ChatMessage {
-                input_request_id: None,
-                context_origin: Default::default(),
-                role: "user".to_string(),
-                content: Some(
-                    model_stream_interruption_recovery_prompt(!partial_visible_content.is_empty())
-                        .to_string(),
-                ),
-                images: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                provider_context: Vec::new(),
-            });
+            request_controls.recover(
+                model_stream_interruption_recovery_prompt(!partial_visible_content.is_empty())
+                    .to_string(),
+            );
             if stream_interruption_recovery_attempts
                 < MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS
             {
@@ -2128,7 +2119,7 @@ fn stream_session_turn_round(
             }
 
             let mut recovery_request = non_stream_recovery_template;
-            recovery_request.messages = Some(messages.clone());
+            recovery_request.messages = Some(request_controls.view(messages, []));
             tracing::warn!(
                 session_id = %request.session_id,
                 round,
@@ -2155,7 +2146,9 @@ fn stream_session_turn_round(
                             session_id: &request.session_id,
                             workspace_id: &request.workspace_id,
                             binding: usage_binding,
-                            call_id: format!("{call_id}-non-stream-recovery"),
+                            call_id: step_client
+                                .last_step_id()
+                                .unwrap_or_else(|| call_id.clone()),
                             usage: None,
                             status: UsageCallStatus::Failed,
                             assignment_id: None,
@@ -2213,7 +2206,7 @@ fn stream_session_turn_round(
             session_id: &request.session_id,
             workspace_id: &request.workspace_id,
             binding: usage_binding,
-            call_id,
+            call_id: step_client.last_step_id().unwrap_or(call_id),
             usage: parsed.usage.as_ref(),
             status: if has_actionable_output && response_contract_failure.is_none() {
                 UsageCallStatus::Success
@@ -3233,14 +3226,19 @@ mod tests {
                     message: "provider response invalid: empty stream response".to_string(),
                 });
             }
-            assert!(
-                request
-                    .messages
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|message| message.content.as_deref()
-                        == Some(model_empty_response_recovery_prompt(false)))
+            let controls = request
+                .messages
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter(|message| {
+                    message.content.as_deref() == Some(model_empty_response_recovery_prompt(false))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(controls.len(), 1, "重复恢复只能保留当前控制提示");
+            assert_eq!(
+                controls[0].context_origin,
+                magi_bridge_client::ChatMessageOrigin::RoundContext
             );
             on_delta(&ModelStreamingDelta {
                 content: "主线在暂态空流后完成。".to_string(),
@@ -4620,7 +4618,8 @@ mod tests {
                             .is_some_and(|content| content.contains("已保留此前可见内容"))
                 })
                 .count(),
-            MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS + 1
+            1,
+            "重复恢复只保留当前请求控制提示"
         );
         let turn = store
             .runtime_sidecar(&session_id)
@@ -4804,6 +4803,7 @@ mod tests {
             usage_binding: &usage_binding,
             prompt: &request.prompt,
             messages: &mut messages,
+            request_controls: &mut crate::request_controls::RequestControls::default(),
             provider_retry_attempts: &std::cell::Cell::new(0),
             stream_interruption_recovery_attempts: 0,
             round: 0,
@@ -4925,6 +4925,7 @@ mod tests {
             usage_binding: &usage_binding,
             prompt: &request.prompt,
             messages: &mut messages,
+            request_controls: &mut crate::request_controls::RequestControls::default(),
             provider_retry_attempts: &std::cell::Cell::new(0),
             stream_interruption_recovery_attempts: 0,
             round: 0,
@@ -6317,6 +6318,7 @@ mod tests {
             knowledge_context_prompt: None,
             context_window: 4_000,
             messages: &mut messages,
+            request_context: &[],
             persist_session_state: None,
             settings_store: None,
             skill_runtime: None,
@@ -6421,6 +6423,7 @@ mod tests {
             knowledge_context_prompt: None,
             context_window: 4_000,
             messages: &mut messages,
+            request_context: &[],
             persist_session_state: None,
             settings_store: None,
             skill_runtime: None,
@@ -6522,6 +6525,7 @@ mod tests {
             knowledge_context_prompt: None,
             context_window: 4_000,
             messages: &mut messages,
+            request_context: &[],
             persist_session_state: None,
             settings_store: None,
             skill_runtime: None,

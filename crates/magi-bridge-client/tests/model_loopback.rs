@@ -132,6 +132,8 @@ fn model_client_round_trips_through_loopback_server() {
 
     let response = client
         .invoke(ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: "hello".to_string(),
             messages: None,
@@ -164,6 +166,8 @@ fn openai_compatible_provider_executes_real_http_smoke_path() {
 
     let response = client
         .invoke(ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai".to_string(),
             prompt: "say hi".to_string(),
             messages: None,
@@ -226,6 +230,8 @@ fn openai_compatible_provider_surfaces_structured_success_payload() {
 
     let response = client
         .invoke(ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai-compatible".to_string(),
             prompt: "say hi".to_string(),
             messages: None,
@@ -284,6 +290,8 @@ fn openai_compatible_provider_accepts_tool_call_only_success_payload() {
 
     let response = client
         .invoke(ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai-compatible".to_string(),
             prompt: "say hi".to_string(),
             messages: None,
@@ -335,6 +343,8 @@ fn openai_compatible_provider_treats_null_tool_calls_as_empty() {
 
     let response = client
         .invoke(ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai-compatible".to_string(),
             prompt: "say hi".to_string(),
             messages: None,
@@ -379,6 +389,8 @@ fn openai_compatible_provider_surfaces_refusal_only_payload() {
 
     let response = client
         .invoke(ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai-compatible".to_string(),
             prompt: "say hi".to_string(),
             messages: None,
@@ -433,6 +445,8 @@ fn openai_compatible_provider_prefers_refusal_when_content_parts_are_empty() {
 
     let response = client
         .invoke(ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai-compatible".to_string(),
             prompt: "say hi".to_string(),
             messages: None,
@@ -487,6 +501,8 @@ fn openai_compatible_provider_tolerates_structured_tool_call_arguments() {
 
     let response = client
         .invoke(ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai-compatible".to_string(),
             prompt: "say hi".to_string(),
             messages: None,
@@ -543,6 +559,8 @@ fn openai_compatible_provider_flattens_content_parts_without_structured_metadata
 
     let response = client
         .invoke(ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai-compatible".to_string(),
             prompt: "say hi".to_string(),
             messages: None,

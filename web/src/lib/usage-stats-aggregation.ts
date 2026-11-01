@@ -1,3 +1,20 @@
+import type { PromptCacheStats } from '../web/agent-api';
+
+export function aggregatePromptCacheStats(items: { cache?: PromptCacheStats }[]): PromptCacheStats {
+  const sum = (field: 'observedCallCount' | 'hitCallCount' | 'inputTokens' | 'readTokens' | 'writeTokens') =>
+    items.reduce((total, item) => total + (item.cache?.[field] ?? 0), 0);
+  const observedCallCount = sum('observedCallCount');
+  const hitCallCount = sum('hitCallCount');
+  const inputTokens = sum('inputTokens');
+  const readTokens = sum('readTokens');
+  return {
+    observedCallCount, hitCallCount, inputTokens, readTokens,
+    writeTokens: sum('writeTokens'),
+    tokenHitRate: inputTokens > 0 ? readTokens / inputTokens : null,
+    requestHitRate: observedCallCount > 0 ? hitCallCount / observedCallCount : null,
+  };
+}
+
 export interface UsageStatsItemLike {
   templateId: string;
   engineId: string;

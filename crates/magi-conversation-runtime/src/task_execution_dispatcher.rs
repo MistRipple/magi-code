@@ -1893,12 +1893,19 @@ impl LlmTaskDispatcher {
             })
             .filter(|definition| definition.function.name != SKILL_APPLY_TOOL_NAME)
             .collect::<Vec<_>>();
-        if self.skill_runtime.is_some() && skill_name.is_none() {
-            definitions.push(skill_apply_tool_definition(
+        if self.skill_runtime.is_some() {
+            let mut definition = skill_apply_tool_definition(
                 self.skill_runtime
                     .as_deref()
                     .expect("skill runtime checked above"),
-            ));
+            );
+            if skill_name.is_some() {
+                definition.function.parameters["properties"]["mode"] =
+                    serde_json::json!({"type":"string","enum":["reference"]});
+                definition.function.parameters["required"] =
+                    serde_json::json!(["skill_name", "mode"]);
+            }
+            definitions.push(definition);
         }
         if let (Some(skill_name), Some(skill_runtime)) = (skill_name, self.skill_runtime.as_ref()) {
             let plan = skill_runtime.build_tool_runtime_plan(magi_skill_runtime::SkillSelection {
@@ -2751,12 +2758,15 @@ impl LlmTaskDispatcher {
         ordered_parts
     }
 
+    /// `main_thread` 为真时，模型请求本来就带着完整的会话线程历史：近期回合和文件读取摘要
+    /// 只是历史的投影副本，每轮重复放在请求尾部会多发数千 token 且永远命不中缓存，因此不再装配。
     fn assemble_prompt(
         &self,
         _settings_store: Option<&Arc<SettingsStore>>,
         task: &magi_core::Task,
         session_id: &SessionId,
         workspace_id: &Option<WorkspaceId>,
+        main_thread: bool,
     ) -> (
         String,
         Vec<magi_bridge_client::ChatMessage>,
@@ -2841,6 +2851,10 @@ impl LlmTaskDispatcher {
             context_budget.max_turns = 0;
             context_budget.max_memory = 0;
             context_budget.max_shared_items = 0;
+        }
+        if main_thread {
+            context_budget.max_turns = 0;
+            context_budget.max_file_summaries = 0;
         }
         refresh_file_summary_projection(
             ctx_runtime,
@@ -3379,8 +3393,13 @@ impl LlmTaskDispatcher {
                 None,
             );
         }
-        let (prompt, task_context_messages, context_summary) =
-            self.assemble_prompt(execution_settings, task, session_id, workspace_id);
+        let (prompt, task_context_messages, context_summary) = self.assemble_prompt(
+            execution_settings,
+            task,
+            session_id,
+            workspace_id,
+            !is_sidechain,
+        );
         let developer_prompt = compose_developer_instructions(
             system_prompt.as_deref(),
             self.resolve_user_rules_prompt(execution_settings)
@@ -3851,17 +3870,17 @@ fn extract_learnings_via_auxiliary(
     } = context;
     let prompt = build_knowledge_extraction_prompt(text);
     let request = ModelInvocationRequest {
+        cache_affinity_key: None,
+        prompt_cache_key: None,
         provider: BUSINESS_MODEL_PROVIDER.to_string(),
         prompt,
         messages: None,
         tools: None,
         tool_choice: None,
     };
-    let call_id = format!(
-        "auxiliary-knowledge-extraction-{}-{}",
-        session_id,
-        UtcMillis::now().0
-    );
+    let call_id =
+        magi_core::EventId::unique(format!("auxiliary-knowledge-extraction-{session_id}"))
+            .to_string();
     let response = match invoke_auxiliary_model_with_usage(
         client,
         request,
@@ -3873,6 +3892,7 @@ fn extract_learnings_via_auxiliary(
             workspace_id,
             call_id,
             phase: UsagePhase::Integration,
+            purpose: crate::usage_recording::AuxiliaryModelPurpose::KnowledgeExtraction,
             expected_turn_id,
         },
     ) {
@@ -3981,17 +4001,16 @@ fn extract_session_memory_via_auxiliary(
     } = context;
     let prompt = build_session_memory_prompt(text);
     let request = ModelInvocationRequest {
+        cache_affinity_key: None,
+        prompt_cache_key: None,
         provider: BUSINESS_MODEL_PROVIDER.to_string(),
         prompt,
         messages: None,
         tools: None,
         tool_choice: None,
     };
-    let call_id = format!(
-        "auxiliary-session-memory-{}-{}",
-        session_id,
-        UtcMillis::now().0
-    );
+    let call_id =
+        magi_core::EventId::unique(format!("auxiliary-session-memory-{session_id}")).to_string();
     let response = match invoke_auxiliary_model_with_usage(
         client,
         request,
@@ -4003,6 +4022,7 @@ fn extract_session_memory_via_auxiliary(
             workspace_id,
             call_id,
             phase: UsagePhase::Integration,
+            purpose: crate::usage_recording::AuxiliaryModelPurpose::SessionMemoryExtraction,
             expected_turn_id,
         },
     ) {
@@ -5842,8 +5862,13 @@ mod tests {
             accesses: Vec::new(),
         };
 
-        let (prompt, context_messages, summary) =
-            dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id.clone()));
+        let (prompt, context_messages, summary) = dispatcher.assemble_prompt(
+            None,
+            &task,
+            &session_id,
+            &Some(workspace_id.clone()),
+            false,
+        );
         assert_eq!(prompt, format!("{}\n\n{}", task.title, task.goal));
         let context = context_messages
             .iter()
@@ -5859,10 +5884,24 @@ mod tests {
         assert_eq!(summary.used_turns, 0);
         assert_eq!(summary.used_file_summaries, 1);
 
+        // 主会话线程的请求本来就带完整线程历史，文件读取摘要只是它的投影副本，不再装配。
+        let (_, main_thread_context, main_thread_summary) =
+            dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id.clone()), true);
+        assert!(
+            main_thread_context
+                .iter()
+                .filter_map(|message| message.content.as_deref())
+                .all(
+                    |content| !content.contains("Important file summary from current workspace")
+                        && !content.contains("[reference:file-summary]")
+                ),
+        );
+        assert_eq!(main_thread_summary.expect("summary").used_file_summaries, 0);
+
         std::fs::write(&file_path, "Externally changed content.")
             .expect("change projected file fact");
         let (prompt, context_messages, summary) =
-            dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id));
+            dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id), false);
         assert_eq!(prompt, format!("{}\n\n{}", task.title, task.goal));
         let context = context_messages
             .iter()
@@ -5903,7 +5942,7 @@ mod tests {
         let task = task_with_role("executor", TaskTier::ExecutionChain);
 
         let (prompt, context_messages, summary) =
-            dispatcher.assemble_prompt(None, &task, &session_id, &None);
+            dispatcher.assemble_prompt(None, &task, &session_id, &None, false);
         assert_eq!(prompt, format!("{}\n\n{}", task.title, task.goal));
         let context = context_messages
             .iter()
@@ -5951,7 +5990,7 @@ mod tests {
         task.goal = "读取 README 文件".to_string();
 
         let (prompt, context_messages, summary) =
-            dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id));
+            dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id), false);
         // 标题与目标相同（或只是其截断副本）时只发送一份目标。
         assert_eq!(prompt, task.goal);
         let context = context_messages
@@ -6009,7 +6048,7 @@ mod tests {
         task.goal = "说明为什么运行态采用单一事实源架构".to_string();
 
         let (prompt, context_messages, summary) =
-            dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id));
+            dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id), false);
         assert_eq!(prompt, format!("{}\n\n{}", task.title, task.goal));
         let context = context_messages
             .iter()
@@ -6325,7 +6364,7 @@ mod tests {
             .unwrap()
         };
         let (_, coordinator_context, _) =
-            dispatcher.assemble_prompt(None, &coordinator_task, &session_id, &workspace_id);
+            dispatcher.assemble_prompt(None, &coordinator_task, &session_id, &workspace_id, false);
         assert!(
             coordinator_context.iter().all(|message| {
                 !message
@@ -6851,15 +6890,15 @@ mod tests {
         }));
         let mut task = task_with_role("coordinator", TaskTier::ExecutionChain);
         let workspace = WorkspaceId::new("test-workspace");
-        let names = dispatcher
-            .build_tool_definitions(
-                &task,
-                Some("code-review"),
-                magi_core::AccessProfile::Restricted,
-                Some(&workspace),
-            )
-            .into_iter()
-            .map(|definition| definition.function.name)
+        let definitions = dispatcher.build_tool_definitions(
+            &task,
+            Some("code-review"),
+            magi_core::AccessProfile::Restricted,
+            Some(&workspace),
+        );
+        let names = definitions
+            .iter()
+            .map(|definition| definition.function.name.clone())
             .collect::<Vec<_>>();
 
         assert!(
@@ -6868,7 +6907,15 @@ mod tests {
                 .any(|name| name == "skill__code-review__review-mcp"),
             "active skill custom binding should surface as callable tool"
         );
-        assert!(!names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
+        assert!(names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
+        let reference = definitions
+            .iter()
+            .find(|tool| tool.function.name == SKILL_APPLY_TOOL_NAME)
+            .unwrap();
+        assert_eq!(
+            reference.function.parameters["properties"]["mode"]["enum"],
+            serde_json::json!(["reference"])
+        );
         assert!(
             !names.iter().any(|name| name == "file_read"),
             "active skill 没有声明 allowed_tools 时不应暴露普通内置工具"
@@ -6893,8 +6940,8 @@ mod tests {
                 .iter()
                 .map(|definition| definition.function.name.as_str())
                 .collect::<Vec<_>>(),
-            ["update_execution_steps"],
-            "同名 Skill 收紧为封闭空集合后不能继续发布缓存的自定义工具，但执行步骤工具仍须可用"
+            ["update_execution_steps", "skill_apply"],
+            "Skill 收紧后只保留执行步骤和只读说明加载，不能复活原自定义工具"
         );
         skills.register(original);
         for denied in [false, true] {
@@ -6925,7 +6972,7 @@ mod tests {
     }
 
     #[test]
-    fn active_skill_is_injected_directly_without_reexposing_skill_apply() {
+    fn active_skill_is_injected_directly_and_only_allows_reference_loading() {
         let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
             let registry = magi_skill_runtime::SkillRegistry::new();
             registry.register(magi_skill_runtime::SkillDefinition {
@@ -6944,18 +6991,26 @@ mod tests {
             magi_skill_runtime::SkillRuntime::new(registry)
         }));
 
-        let names = dispatcher
-            .build_tool_definitions(
-                &task_with_role("coordinator", TaskTier::ExecutionChain),
-                Some("direct-skill"),
-                magi_core::AccessProfile::Restricted,
-                Some(&WorkspaceId::new("test-workspace")),
-            )
-            .into_iter()
-            .map(|definition| definition.function.name)
+        let definitions = dispatcher.build_tool_definitions(
+            &task_with_role("coordinator", TaskTier::ExecutionChain),
+            Some("direct-skill"),
+            magi_core::AccessProfile::Restricted,
+            Some(&WorkspaceId::new("test-workspace")),
+        );
+        let names = definitions
+            .iter()
+            .map(|definition| definition.function.name.clone())
             .collect::<Vec<_>>();
 
-        assert!(!names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
+        assert!(names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
+        let reference = definitions
+            .iter()
+            .find(|tool| tool.function.name == SKILL_APPLY_TOOL_NAME)
+            .unwrap();
+        assert_eq!(
+            reference.function.parameters["properties"]["mode"]["enum"],
+            serde_json::json!(["reference"])
+        );
         assert!(
             names.iter().any(|name| name == "file_read"),
             "未声明 allowed_tools 的 prompt-only Skill 应继承标准只读工具"
@@ -7045,20 +7100,28 @@ mod tests {
             magi_skill_runtime::SkillRuntime::new(registry)
         }));
 
-        let names = dispatcher
-            .build_tool_definitions(
-                &task_with_role("coordinator", TaskTier::ExecutionChain),
-                Some("prompt-only"),
-                magi_core::AccessProfile::Restricted,
-                Some(&WorkspaceId::new("test-workspace")),
-            )
-            .into_iter()
-            .map(|definition| definition.function.name)
+        let definitions = dispatcher.build_tool_definitions(
+            &task_with_role("coordinator", TaskTier::ExecutionChain),
+            Some("prompt-only"),
+            magi_core::AccessProfile::Restricted,
+            Some(&WorkspaceId::new("test-workspace")),
+        );
+        let names = definitions
+            .iter()
+            .map(|definition| definition.function.name.clone())
             .collect::<Vec<_>>();
 
         assert!(names.iter().any(|name| name == "file_read"));
         assert!(!names.iter().any(|name| name == "mcp__repo-tools__inspect"));
-        assert!(!names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
+        assert!(names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
+        let reference = definitions
+            .iter()
+            .find(|tool| tool.function.name == SKILL_APPLY_TOOL_NAME)
+            .unwrap();
+        assert_eq!(
+            reference.function.parameters["properties"]["mode"]["enum"],
+            serde_json::json!(["reference"])
+        );
     }
 
     #[test]
@@ -7227,19 +7290,27 @@ mod tests {
         }));
         let task = task_with_role("coordinator", TaskTier::ExecutionChain);
 
-        let names = dispatcher
-            .build_tool_definitions(
-                &task,
-                Some("read-only-skill"),
-                magi_core::AccessProfile::Restricted,
-                Some(&WorkspaceId::new("test-workspace")),
-            )
-            .into_iter()
-            .map(|definition| definition.function.name)
+        let definitions = dispatcher.build_tool_definitions(
+            &task,
+            Some("read-only-skill"),
+            magi_core::AccessProfile::Restricted,
+            Some(&WorkspaceId::new("test-workspace")),
+        );
+        let names = definitions
+            .iter()
+            .map(|definition| definition.function.name.clone())
             .collect::<Vec<_>>();
 
         assert!(names.iter().any(|name| name == "file_read"));
-        assert!(!names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
+        assert!(names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
+        let reference = definitions
+            .iter()
+            .find(|tool| tool.function.name == SKILL_APPLY_TOOL_NAME)
+            .unwrap();
+        assert_eq!(
+            reference.function.parameters["properties"]["mode"]["enum"],
+            serde_json::json!(["reference"])
+        );
         assert!(!names.iter().any(|name| name == "search_text"));
         assert!(!names.iter().any(|name| name == "shell_exec"));
         assert!(!names.iter().any(|name| name == "agent_spawn"));
@@ -7300,7 +7371,10 @@ mod tests {
                 .map(|definition| definition.function.name)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(tools(), ["search_text", "update_execution_steps"]);
+        assert_eq!(
+            tools(),
+            ["search_text", "update_execution_steps", "skill_apply"]
+        );
         let available =
             dispatcher.build_tool_definitions(&task, None, AccessProfile::Restricted, None);
         assert!(
@@ -7313,7 +7387,7 @@ mod tests {
                 .contains("read-only-skill")
         );
         registry.replace([]);
-        assert_eq!(tools(), ["update_execution_steps"]);
+        assert_eq!(tools(), ["update_execution_steps", "skill_apply"]);
         let available =
             dispatcher.build_tool_definitions(&task, None, AccessProfile::Restricted, None);
         assert!(

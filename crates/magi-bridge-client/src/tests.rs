@@ -166,6 +166,8 @@ fn json_rpc_clients_share_the_same_transport_abstraction() {
     assert_eq!(
         model
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: "openai".to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -206,6 +208,8 @@ fn json_rpc_model_client_publishes_probe_only_capabilities() {
 
     assert_eq!(capabilities, crate::text_executor_capabilities());
     let mut request = ModelInvocationRequest {
+        cache_affinity_key: None,
+        prompt_cache_key: None,
         provider: "loopback".to_string(),
         prompt: "probe".to_string(),
         messages: None,
@@ -267,6 +271,8 @@ fn json_rpc_model_client_rejects_legacy_bridge_response_shape() {
 
     let error = client
         .invoke(ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai".to_string(),
             prompt: "hello".to_string(),
             messages: None,
@@ -564,10 +570,12 @@ fn sanitize_tool_order_removes_orphan_tool_results() {
     use crate::llm_types::*;
     let messages = vec![
         LlmMessage {
+            origin: Default::default(),
             role: "user".into(),
             content: LlmMessageContent::Text("hello".into()),
         },
         LlmMessage {
+            origin: Default::default(),
             role: "user".into(),
             content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
                 tool_use_id: "orphan".into(),
@@ -588,10 +596,12 @@ fn sanitize_tool_order_preserves_valid_pairs() {
     use crate::llm_types::*;
     let messages = vec![
         LlmMessage {
+            origin: Default::default(),
             role: "user".into(),
             content: LlmMessageContent::Text("hello".into()),
         },
         LlmMessage {
+            origin: Default::default(),
             role: "assistant".into(),
             content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolUse {
                 id: "t1".into(),
@@ -600,6 +610,7 @@ fn sanitize_tool_order_preserves_valid_pairs() {
             }]),
         },
         LlmMessage {
+            origin: Default::default(),
             role: "user".into(),
             content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
                 tool_use_id: "t1".into(),

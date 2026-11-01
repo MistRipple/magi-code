@@ -1,4 +1,5 @@
-use crate::llm_types::{LlmContentBlock, LlmMessageContent, LlmMessageParams};
+use crate::llm_types::{LlmContentBlock, LlmMessageContent};
+use crate::prompt_ir::PromptIr;
 
 #[derive(Clone, Debug)]
 pub struct ConformanceViolation {
@@ -16,7 +17,7 @@ pub enum ViolationSeverity {
 pub struct ConformanceValidator;
 
 impl ConformanceValidator {
-    pub fn validate(params: &LlmMessageParams) -> Vec<ConformanceViolation> {
+    pub fn validate(params: &PromptIr) -> Vec<ConformanceViolation> {
         let mut violations = Vec::new();
 
         if params.messages.is_empty() {
@@ -92,17 +93,19 @@ impl ConformanceValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_types::{LlmMessage, LlmMessageContent, LlmMessageParams};
+    use crate::llm_types::{LlmMessage, LlmMessageContent};
 
-    fn params(messages: Vec<LlmMessage>) -> LlmMessageParams {
-        LlmMessageParams {
+    fn params(messages: Vec<LlmMessage>) -> PromptIr {
+        PromptIr {
+            prompt_cache_key: None,
+
             reasoning_capability: None,
             messages,
             max_tokens: None,
             temperature: None,
             tools: None,
             stream: None,
-            system_prompt: None,
+
             tool_choice: None,
             reasoning_effort: None,
         }
@@ -110,6 +113,7 @@ mod tests {
 
     fn message(role: &str, content: &str) -> LlmMessage {
         LlmMessage {
+            origin: Default::default(),
             role: role.to_string(),
             content: LlmMessageContent::Text(content.to_string()),
         }

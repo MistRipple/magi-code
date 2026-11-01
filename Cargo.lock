@@ -1484,6 +1484,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "image",
+ "jsonschema",
  "magi-agent-role",
  "magi-app-server-protocol",
  "magi-appearance",
@@ -1571,6 +1572,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -1941,6 +1943,7 @@ dependencies = [
  "magi-event-bus",
  "magi-governance",
  "magi-tool-runtime",
+ "magi-usage-authority",
  "serde",
  "serde_json",
 ]
@@ -2018,6 +2021,7 @@ version = "3.0.61"
 dependencies = [
  "magi-core",
  "serde",
+ "serde_json",
  "sha2",
  "url",
 ]

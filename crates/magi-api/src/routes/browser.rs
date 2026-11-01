@@ -87,8 +87,12 @@ pub fn routes() -> Router<ApiState> {
         .route("/browser/web-models/probe", post(probe_web_model))
         .route("/browser/web-models/setup", get(get_web_model_setup))
         .route(
+            "/browser/web-models/setup/control",
+            post(control_web_model_setup),
+        )
+        .route(
             "/browser/web-models/setup/credentials",
-            post(save_web_model_setup_credentials),
+            post(save_web_model_setup_credentials).get(get_web_model_setup_receipt),
         )
         .route(
             "/browser/web-models/ensure-home",
@@ -1300,10 +1304,24 @@ async fn configure_web_model_tunnel(
     require_desktop_browser_capability(&state, &headers, None)?;
     let _serial = state.web_model.setup_lock.lock().await;
     require_web_model_plugin(&state)?;
+    if state.read_setup_record().is_some_and(|record| {
+        !matches!(
+            record.run_state.as_deref(),
+            Some("completed" | "cancelled" | "revoked")
+        )
+    }) {
+        return Err(ApiError::Conflict(
+            "配置会话正在维护通道，请先结束配置，或使用该会话的安全表单".into(),
+        ));
+    }
     let config = if request.clear {
         None
     } else {
         Some(crate::web_model_channel::WebModelTunnelConfig {
+            credential_version: state
+                .web_model
+                .configured()
+                .and_then(|config| config.credential_version),
             tunnel_id: request.tunnel_id.trim().to_string(),
             tool_profile: match request.tool_profile.as_deref().map(str::trim) {
                 None | Some("") => None,
@@ -1322,11 +1340,6 @@ async fn configure_web_model_tunnel(
             ),
         })
     };
-    let stored = match config.as_ref() {
-        Some(config) => serde_json::to_value(config)
-            .map_err(|error| ApiError::internal_assembly("序列化 T3 通道配置失败", error))?,
-        None => Value::Null,
-    };
     if let Some(config) = config.as_ref() {
         if !magi_web_model::tunnel::valid_tunnel_id(&config.tunnel_id) {
             return Err(ApiError::InvalidInput("Tunnel id 格式不正确".into()));
@@ -1339,10 +1352,6 @@ async fn configure_web_model_tunnel(
             crate::web_model_channel::validate_api_key(key).map_err(ApiError::InvalidInput)?;
         }
     }
-    state
-        .settings_store
-        .set_section(crate::web_model_channel::WEB_MODEL_TUNNEL_SECTION, stored)
-        .map_err(crate::errors::settings_persistence_error)?;
     let status = state
         .web_model
         .clone()
@@ -5177,35 +5186,51 @@ async fn get_web_model_setup(
             "GPT Web 配置需要先安装并激活 GPT Web 插件".into(),
         ));
     }
-    require_desktop_browser_capability(&state, &headers, None)?;
     let session = SessionId::new(query.session_id);
     if state.session_store.session(&session).is_none() {
         return Err(ApiError::NotFound("会话不存在".into()));
     }
-    Ok(Json(state.web_model_setup_status(&session)))
+    let mut status = state.web_model_setup_status(&session);
+    if require_desktop_browser_capability(&state, &headers, None).is_err()
+        && let Some(record) = status.as_mut()
+    {
+        record.allowed_actions = Some(vec![]);
+    }
+    Ok(Json(status))
 }
 
-// 不派生 Debug，避免密钥原文进入诊断；该请求不进入 Turn/canonical。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WebModelSetupCredentials {
+struct SetupReceiptQuery {
     session_id: String,
-    tunnel_id: Option<String>,
-    api_key: String,
+    request_id: String,
+}
+async fn get_web_model_setup_receipt(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<SetupReceiptQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
+    let _serial = state.web_model.setup_lock.lock().await;
+    state
+        .setup_save_receipt(&SessionId::new(query.session_id), &query.request_id)
+        .map(Json)
 }
 
 async fn save_web_model_setup_credentials(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(request): Json<WebModelSetupCredentials>,
+    Json(request): Json<magi_app_server_protocol::generated::WebModelSetupCredentialsParams>,
 ) -> Result<Json<Value>, ApiError> {
     require_desktop_browser_capability(&state, &headers, None)?;
-    state
-        .save_setup_credentials(
-            &SessionId::new(request.session_id),
-            request.tunnel_id,
-            request.api_key,
-        )
-        .await?;
-    Ok(Json(serde_json::json!({"saved": true})))
+    Ok(Json(state.save_setup_credentials_request(request).await?))
+}
+
+async fn control_web_model_setup(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<magi_app_server_protocol::generated::WebModelSetupControlParams>,
+) -> Result<Json<Value>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
+    state.control_setup_request(request).await.map(Json)
 }

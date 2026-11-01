@@ -5,9 +5,10 @@
 
   interface Props {
     sessions: AgentUnavailableSession[];
+    onDelete: (session: AgentUnavailableSession) => void;
   }
 
-  let { sessions }: Props = $props();
+  let { sessions, onDelete }: Props = $props();
 </script>
 
 {#if sessions.length > 0}
@@ -23,6 +24,15 @@
         <Icon name="warning" size={12} class="unavailable-session-icon" />
         <span class="unavailable-session-label">{i18n.t('web.unavailableSession')}</span>
         <span class="unavailable-session-id">{session.sessionId}</span>
+        <button
+          type="button"
+          class="btn-icon btn-icon--sm btn-icon--danger unavailable-session-delete"
+          title={i18n.t('header.deleteSession')}
+          aria-label={i18n.t('header.deleteSession')}
+          onclick={() => onDelete(session)}
+        >
+          <Icon name="delete" size={12} />
+        </button>
       </li>
     {/each}
   </ul>
@@ -43,7 +53,12 @@
     padding: var(--space-1) var(--space-2);
     color: var(--foreground-muted);
     font-size: var(--text-sm);
-    cursor: help;
+  }
+
+  /* 关键补救操作不依赖 hover：始终可见，避免触屏和键盘用户找不到入口。 */
+  .unavailable-session-delete {
+    margin-inline-start: auto;
+    flex-shrink: 0;
   }
 
   .unavailable-session :global(.unavailable-session-icon) {

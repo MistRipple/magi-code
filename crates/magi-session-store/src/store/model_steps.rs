@@ -9,6 +9,113 @@ use magi_core::{DomainError, DomainResult, SessionId};
 pub const MAX_TRANSPORT_ATTEMPTS_PER_EXECUTION_TREE: usize = 10_000;
 
 impl SessionStore {
+    pub fn model_usage_projection_steps(&self) -> Vec<super::ModelUsageProjectionStep> {
+        let state = self.state.read().expect("session state lock poisoned");
+        state
+            .canonical_turns
+            .iter()
+            .flat_map(|turn| {
+                turn.model_steps
+                    .iter()
+                    .filter(|step| {
+                        step.binding
+                            .as_ref()
+                            .is_some_and(|binding| binding.usage_context.is_some())
+                    })
+                    .map(move |step| super::ModelUsageProjectionStep {
+                        session_id: turn.session_id.clone(),
+                        turn_id: turn.turn_id.clone(),
+                        step: step.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    /// HTTP 只提交规范化摘要；仍使用原 canonical Step 事务和通知，不建旁路日志。
+    pub fn record_model_step_transport(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+        step_id: &str,
+        transport: crate::ModelTransportRecord,
+    ) -> DomainResult<()> {
+        let _barrier = self
+            .canonical_commit_barrier
+            .read()
+            .expect("canonical barrier poisoned");
+        let lock = self.canonical_commit_lock_for(session_id);
+        let guard = lock.lock().expect("canonical session lock poisoned");
+        let mutation = {
+            let state = self.state.read().expect("session state lock poisoned");
+            let previous = state
+                .canonical_turns
+                .iter()
+                .find(|turn| &turn.session_id == session_id && turn.turn_id == turn_id)
+                .ok_or(DomainError::NotFound {
+                    entity: "canonical_turn",
+                })?;
+            let mut next = previous.clone();
+            let step = next
+                .model_steps
+                .iter_mut()
+                .find(|step| step.step_id == step_id)
+                .ok_or(DomainError::NotFound {
+                    entity: "model_step",
+                })?;
+            if step.status != crate::ModelStepStatus::Started {
+                return Err(DomainError::InvalidState {
+                    message: "已结算 Step 不能改写 transport 证据".into(),
+                });
+            }
+            step.attempts
+                .last_mut()
+                .expect("validated attempts")
+                .transport = Some(transport);
+            next.validate_update_from(previous)?;
+            CanonicalTurnMutation {
+                previous: Some(previous.clone()),
+                next,
+            }
+        };
+        self.persist_session_transaction(session_id, std::slice::from_ref(&mutation), &[], None)?;
+        super::sidecar::apply_canonical_turn_in_state(
+            &mut self.state.write().expect("session state lock poisoned"),
+            mutation.next,
+        );
+        drop(guard);
+        drop(_barrier);
+        self.notify_model_step_commit(session_id, turn_id, step_id);
+        Ok(())
+    }
+
+    /// 从已提交的 canonical Step 找同一逻辑分支；重启不依赖进程内缓存。
+    /// 不复制 Turn 正文，也不把并发 worker 或压缩请求当作主线前驱。
+    pub fn latest_model_step_for_cache_lineage(
+        &self,
+        session_id: &SessionId,
+        lineage_id: &str,
+    ) -> Option<crate::ModelStep> {
+        let state = self.state.read().expect("session state lock poisoned");
+        state
+            .canonical_turns
+            .iter()
+            .filter(|turn| &turn.session_id == session_id)
+            .flat_map(|turn| {
+                turn.model_steps
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, step)| ((turn.turn_seq, index), step))
+            })
+            .filter(|(_, step)| {
+                step.prompt_frame
+                    .as_ref()
+                    .and_then(|frame| frame.cache_binding.as_ref())
+                    .is_some_and(|binding| binding.lineage_id == lineage_id)
+            })
+            .max_by_key(|(order, _)| *order)
+            .map(|(_, step)| step.clone())
+    }
+
     pub fn model_step_goal(
         &self,
         session_id: &SessionId,
@@ -103,6 +210,17 @@ impl SessionStore {
                 validate_goal_model_admission(goal)?;
                 step.goal_id = Some(goal.goal_id.clone());
             }
+            if let Some(context) = step
+                .binding
+                .as_mut()
+                .and_then(|binding| binding.usage_context.as_mut())
+            {
+                context.workspace_id = state
+                    .sessions
+                    .iter()
+                    .find(|session| &session.session_id == session_id)
+                    .and_then(|session| session.workspace_id.clone());
+            }
             let mut next_turn = previous.clone();
             next_turn.model_steps.push(step.clone());
             next_turn.validate_update_from(previous)?;
@@ -185,11 +303,7 @@ impl SessionStore {
         usage_tokens: Option<u64>,
         executor_failure: Option<&magi_core::ExecutorFailureEvidence>,
     ) -> DomainResult<()> {
-        if executor_failure.is_some() && response_fingerprint.is_some()
-            || response_fingerprint.is_none()
-                && usage_tokens.is_some()
-                && executor_failure.is_none()
-        {
+        if executor_failure.is_some() && response_fingerprint.is_some() {
             return Err(DomainError::InvalidState {
                 message: "失败用量必须绑定外部执行证据，不能与成功响应混用".into(),
             });
@@ -223,6 +337,24 @@ impl SessionStore {
                 crate::ModelStepStatus::OutcomeUnknown
             };
             step.response_fingerprint = response_fingerprint;
+            let usage_tokens = if step
+                .attempts
+                .iter()
+                .any(|attempt| attempt.transport.is_some())
+            {
+                step.observed_transport_tokens()
+            } else {
+                usage_tokens
+            };
+            if step.response_fingerprint.is_none()
+                && executor_failure.is_none()
+                && usage_tokens.is_some()
+                && step.observed_transport_tokens() != usage_tokens
+            {
+                return Err(DomainError::InvalidState {
+                    message: "原生失败用量必须来自已冻结的 transport 证据".into(),
+                });
+            }
             step.usage_tokens = usage_tokens;
             step.goal_tokens_after =
                 step.goal_id
@@ -414,6 +546,7 @@ impl SessionStore {
             last.status = crate::ModelStepStatus::OutcomeUnknown;
             last.settled_at = Some(now);
             step.attempts.push(crate::ModelAttempt {
+                transport: None,
                 attempt_id: format!("{}:attempt:{}", step_id, step.attempts.len() + 1),
                 started_at: now,
                 settled_at: None,
@@ -570,6 +703,7 @@ mod tests {
     fn step(id: &str, task_id: Option<TaskId>, thread_id: &str, attempts: usize) -> ModelStep {
         let attempts = (1..=attempts)
             .map(|index| ModelAttempt {
+                transport: None,
                 attempt_id: format!("{id}:attempt:{index}"),
                 started_at: UtcMillis(index as u64),
                 settled_at: (index < attempts).then_some(UtcMillis(index as u64)),
@@ -602,6 +736,8 @@ mod tests {
             settled_at: None,
             status: ModelStepStatus::Started,
             response_fingerprint: None,
+            prompt_frame: None,
+            cache_epoch: 0,
         }
     }
 

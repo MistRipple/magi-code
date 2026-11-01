@@ -645,12 +645,6 @@ impl magi_bridge_client::ModelBridgeClient for UnavailableBusinessModelBridgeCli
     }
 }
 
-#[derive(Clone)]
-struct SettingsBackedBusinessModelBridgeClient {
-    state_root: PathBuf,
-    bridge_env: Vec<(String, String)>,
-}
-
 struct OpenAiCompatEnvConfig {
     base_url: String,
     api_key: Option<String>,
@@ -665,138 +659,6 @@ fn orchestrator_settings_is_configured(value: &serde_json::Value) -> bool {
             .is_some_and(|text| !text.trim().is_empty())
     };
     field_is_present("baseUrl") && field_is_present("model")
-}
-
-impl SettingsBackedBusinessModelBridgeClient {
-    fn new(state_root: PathBuf, bridge_env: &[(&str, &str)]) -> Self {
-        Self {
-            state_root,
-            bridge_env: bridge_env
-                .iter()
-                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-                .collect(),
-        }
-    }
-
-    fn build_client(&self) -> Result<HttpModelBridgeClient, magi_bridge_client::BridgeClientError> {
-        let bridge_env = self
-            .bridge_env
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect::<Vec<_>>();
-        DaemonRuntime::try_build_http_model_client(&bridge_env)
-            .map(|(client, _)| client)
-            .ok_or_else(|| {
-                UnavailableBusinessModelBridgeClient::new(self.state_root.clone()).error()
-            })
-    }
-}
-
-impl magi_bridge_client::ModelBridgeClient for SettingsBackedBusinessModelBridgeClient {
-    fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
-        magi_bridge_client::native_executor_capabilities()
-    }
-
-    fn invoke_streaming_with_output_limit(
-        &self,
-        request: magi_bridge_client::ModelInvocationRequest,
-        max_output_tokens: u32,
-        on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
-        on_retry: &dyn Fn(&magi_bridge_client::ModelRetryRuntimeEvent),
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
-        self.build_client()?.invoke_streaming_with_output_limit(
-            request,
-            max_output_tokens,
-            on_delta,
-            on_retry,
-            is_cancelled,
-        )
-    }
-    fn invoke(
-        &self,
-        request: magi_bridge_client::ModelInvocationRequest,
-    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
-        self.build_client()?.invoke(request)
-    }
-
-    fn invoke_with_cancellation(
-        &self,
-        request: magi_bridge_client::ModelInvocationRequest,
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
-        self.build_client()?
-            .invoke_with_cancellation(request, is_cancelled)
-    }
-
-    fn invoke_with_retry_events_and_cancellation(
-        &self,
-        request: magi_bridge_client::ModelInvocationRequest,
-        on_retry: &dyn Fn(&magi_bridge_client::ModelRetryRuntimeEvent),
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
-        self.build_client()?
-            .invoke_with_retry_events_and_cancellation(request, on_retry, is_cancelled)
-    }
-
-    fn invoke_with_cancellation_and_output_limit(
-        &self,
-        request: magi_bridge_client::ModelInvocationRequest,
-        max_output_tokens: u32,
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
-        self.build_client()?
-            .invoke_with_cancellation_and_output_limit(request, max_output_tokens, is_cancelled)
-    }
-
-    fn invoke_with_retry_events_cancellation_and_output_limit(
-        &self,
-        request: magi_bridge_client::ModelInvocationRequest,
-        max_output_tokens: u32,
-        on_retry: &dyn Fn(&magi_bridge_client::ModelRetryRuntimeEvent),
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
-        self.build_client()?
-            .invoke_with_retry_events_cancellation_and_output_limit(
-                request,
-                max_output_tokens,
-                on_retry,
-                is_cancelled,
-            )
-    }
-
-    fn invoke_streaming_with_retry_events(
-        &self,
-        request: magi_bridge_client::ModelInvocationRequest,
-        on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
-        on_retry: &dyn Fn(&magi_bridge_client::ModelRetryRuntimeEvent),
-    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
-        self.build_client()?
-            .invoke_streaming_with_retry_events(request, on_delta, on_retry)
-    }
-
-    fn invoke_streaming_with_cancellation(
-        &self,
-        request: magi_bridge_client::ModelInvocationRequest,
-        on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
-        on_retry: &dyn Fn(&magi_bridge_client::ModelRetryRuntimeEvent),
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
-        self.build_client()?.invoke_streaming_with_cancellation(
-            request,
-            on_delta,
-            on_retry,
-            is_cancelled,
-        )
-    }
-
-    fn invoke_streaming(
-        &self,
-        request: magi_bridge_client::ModelInvocationRequest,
-        on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
-    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
-        self.build_client()?.invoke_streaming(request, on_delta)
-    }
 }
 
 #[cfg(test)]
@@ -1010,6 +872,19 @@ impl DaemonRuntime {
         );
 
         Self::restore_ledger(&state_repository, &event_bus)?;
+        let repaired_usage =
+            magi_conversation_runtime::canonical_usage::recover_model_usage_projections(
+                &event_bus,
+                &session_store,
+            )
+            .map_err(|error| DaemonError::internal(format!("恢复模型用量投影失败: {error}")))?;
+        if repaired_usage > 0 {
+            event_bus
+                .refresh_audit_usage_ledger_persistence()
+                .map_err(|error| {
+                    DaemonError::internal(format!("模型用量恢复投影落盘失败: {error}"))
+                })?;
+        }
         Self::persist_restored_runtime_state(
             &state_repository,
             &runtime_persistence,
@@ -1522,9 +1397,36 @@ impl DaemonRuntime {
         // ToolRegistry 在 ApiState 之前装配；只捕获共享依赖，避免完整 ApiState 引用环。
         let browser_automation_dependencies =
             Arc::new(OnceLock::<magi_api::BrowserToolRuntimeDependencies>::new());
+        let setup_services = Arc::new(OnceLock::<magi_api::ApiState>::new());
+        let plugin_tool_executor: magi_tool_runtime::PluginToolExecutor = {
+            let holder = setup_services.clone();
+            let fallback = self.plugins.tool_executor();
+            Arc::new(move |name, arguments, context| {
+                if name == magi_api::web_model_setup_tools::tool_name() {
+                    return holder.get().map_or_else(
+                        || {
+                            (
+                                "{\"status\":\"failed\",\"error_code\":\"setup_not_initialized\"}"
+                                    .into(),
+                                magi_core::ExecutionResultStatus::Failed,
+                            )
+                        },
+                        |state| state.execute_web_model_setup_tool(arguments, context),
+                    );
+                }
+                fallback(name, arguments, context)
+            })
+        };
         let browser_tool_executor: magi_tool_runtime::BrowserToolExecutor = {
             let holder = Arc::clone(&browser_automation_dependencies);
+            let setup = setup_services.clone();
             Arc::new(move |tool_call_id, tool_name, input, context| {
+                if let Some(result) = setup
+                    .get()
+                    .and_then(|state| state.execute_setup_browser(tool_name, input, context))
+                {
+                    return result;
+                }
                 holder.get().map_or_else(
                     || {
                         (
@@ -1569,10 +1471,7 @@ impl DaemonRuntime {
             .with_knowledge_store(self.knowledge_store.clone())
             .with_external_tool_catalog_provider(external_tool_catalog_provider)
             .with_external_mcp_tool_executor(external_mcp_tool_executor)
-            .with_plugin_tools(
-                self.plugins.tool_catalog_provider(),
-                self.plugins.tool_executor(),
-            )
+            .with_plugin_tools(self.plugins.tool_catalog_provider(), plugin_tool_executor)
             .with_agent_role_catalog_provider(agent_role_catalog_provider)
             .with_image_generation_runtime(
                 image_generation_executor,
@@ -1610,11 +1509,10 @@ impl DaemonRuntime {
             match model_bridge_override.clone() {
                 Some(client) => client,
                 None => {
-                    if direct_http_probe_result.is_some() {
-                        Arc::new(SettingsBackedBusinessModelBridgeClient::new(
-                            self.state_root.clone(),
-                            bridge_env,
-                        ))
+                    if let Some((client, _)) = direct_http_probe_result {
+                        // 环境配置只在 bootstrap 解析一次。实际 HTTP client 同时
+                        // 拥有缓存 IR、连接身份和传输合同，不经另一层重建/转发。
+                        Arc::new(client)
                     } else {
                         warn!(
                             state_root = %self.state_root.display(),
@@ -1805,6 +1703,14 @@ impl DaemonRuntime {
             })
         })
         .with_session_state_checkpoint_persist(session_state_checkpoint_persist)
+        .with_unavailable_session_discard({
+            let repository = self.state_repository.clone();
+            Arc::new(move |session_id| {
+                repository
+                    .discard_unavailable_session(session_id)
+                    .map_err(|error| ApiError::internal_assembly("删除不可用会话失败", error))
+            })
+        })
         .with_session_projection_persist({
             let repository = self.state_repository.clone();
             Arc::new(move |durable, sidecars, mode| {
@@ -1924,12 +1830,10 @@ impl DaemonRuntime {
                 }))?;
         let workflow_core_factory = self.plugins.workflow_core_factory()?;
         state.restore_web_model_setup_reservation();
-        let plugin_command_executor = Arc::new(
-            magi_api::web_model_setup::WebModelSetupCommandExecutor::new(
-                state.clone(),
-                self.plugins.command_executor(),
-            ),
-        );
+        setup_services
+            .set(state.web_model_setup_service_state())
+            .map_err(|_| DaemonError::internal("重复装配配置领域服务"))?;
+        let plugin_command_executor = self.plugins.command_executor();
         let mut llm_task_dispatcher = llm_task_dispatcher;
         llm_task_dispatcher = llm_task_dispatcher
             .with_session_engine_factory(session_engine_factory)
@@ -2008,6 +1912,9 @@ impl DaemonRuntime {
                     new_status,
                     TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
                 ) {
+                    if let Some(state) = setup_services.get() {
+                        state.finish_web_model_setup_task(task_id);
+                    }
                     match terminal_task_context(
                         &session_store,
                         &task_execution_registry_for_status,
@@ -4110,6 +4017,133 @@ done
         );
     }
 
+    #[test]
+    fn restart_repairs_missing_model_usage_from_canonical_receipts_once() {
+        use magi_session_store::{
+            ActiveExecutionTurn, ModelStep, ModelTransportOutcome, ModelTransportRecord,
+            ModelTransportUsage, TimelineEntryInput, TimelineEntryKind,
+        };
+        for settled in [false, true] {
+            let state_root = temp_state_root(if settled {
+                "usage-after-settlement"
+            } else {
+                "usage-before-settlement"
+            });
+            let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
+            let fixture = DaemonRuntime::restore_with_test_fixture(&config).unwrap();
+            let session = SessionId::new("test-session-001");
+            let at = UtcMillis::now();
+            fixture
+                .session_store
+                .accept_current_turn_with_timeline_entry(
+                    session.clone(),
+                    TimelineEntryInput::new(
+                        "usage-timeline",
+                        TimelineEntryKind::UserMessage,
+                        "work",
+                        at,
+                    ),
+                    ActiveExecutionTurn {
+                        turn_id: "usage-turn".into(),
+                        turn_seq: 1,
+                        accepted_at: at,
+                        completed_at: None,
+                        status: "running".into(),
+                        user_message: Some("work".into()),
+                        items: vec![],
+                    },
+                )
+                .unwrap();
+            let step: ModelStep = serde_json::from_value(serde_json::json!({
+                "stepId":"usage-step", "attempts":[{"attemptId":"usage-step:attempt:1", "startedAt":at.0,"settledAt":null,"status":"started"}],
+                "threadId":"usage-thread", "checkpointGeneration":0,"requestFingerprint":"a".repeat(64),"provider":"configured",
+                "messageCount":1,"toolCount":0,"inputRequestIds":[],"startedAt":at.0,"settledAt":null,"status":"started","responseFingerprint":null,
+                "binding":{"model":"frozen-model","provider":"configured","bindingRevision":1,"settingsRevision":1,
+                    "usageContext":{"templateId":"orchestrator","engineId":"orchestrator","bindingRevision":1,"role":"orchestrator","phase":"execution",
+                        "modelConfig":{"provider":"configured","model":"frozen-model","baseUrl":"https://frozen.test/v1"}}}
+            })).unwrap();
+            fixture
+                .session_store
+                .begin_model_step(&session, "usage-turn", step)
+                .unwrap();
+            fixture
+                .session_store
+                .record_model_step_transport(
+                    &session,
+                    "usage-turn",
+                    "usage-step",
+                    ModelTransportRecord {
+                        observed_at: Some(at.0),
+                        request_fingerprint: "b".repeat(64),
+                        http_status: Some(200),
+                        usage: Some(ModelTransportUsage {
+                            input_tokens: 100,
+                            output_tokens: 5,
+                            cache_read_tokens: Some(40),
+                            cache_write_tokens: None,
+                            cache_read_included_in_input: true,
+                        }),
+                        outcome: Some(ModelTransportOutcome::Succeeded),
+                    },
+                )
+                .unwrap();
+            if settled {
+                fixture
+                    .session_store
+                    .settle_model_step(
+                        &session,
+                        "usage-turn",
+                        "usage-step",
+                        Some("c".repeat(64)),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(fixture.event_bus.audit_usage_ledger_status().usage_count, 0);
+            drop(fixture);
+            for _ in 0..2 {
+                let restored = DaemonRuntime::restore(&config).unwrap();
+                let ledger = restored.event_bus.audit_usage_ledger_snapshot();
+                assert_eq!(ledger.usage_entries.len(), 1);
+                assert_eq!(
+                    ledger.usage_entries[0].payload["modelConfig"]["model"],
+                    "frozen-model"
+                );
+                assert_eq!(ledger.usage_entries[0].payload["usage"]["inputTokens"], 100);
+                assert_eq!(
+                    ledger.usage_entries[0].payload["callIdentity"]["callId"],
+                    "usage-step:attempt:1"
+                );
+                assert_eq!(
+                    restored
+                        .state_repository
+                        .load_audit_usage_ledger()
+                        .unwrap()
+                        .usage_entries
+                        .len(),
+                    1
+                );
+                let step = restored
+                    .session_store
+                    .canonical_turn_for_session_turn_id(&session, "usage-turn")
+                    .unwrap()
+                    .model_steps
+                    .remove(0);
+                assert_eq!(step.usage_tokens, Some(105));
+                assert_eq!(step.attempts.len(), 1, "恢复不得触发请求重放");
+                assert_eq!(
+                    step.status,
+                    if settled {
+                        magi_session_store::ModelStepStatus::ResponseReceived
+                    } else {
+                        magi_session_store::ModelStepStatus::OutcomeUnknown
+                    }
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn knowledge_endpoint_returns_code_index_after_bootstrap_scan() {
         let state_root = temp_state_root("knowledge-code-index");
@@ -5069,6 +5103,44 @@ done
     }
 
     #[tokio::test]
+    async fn daemon_business_model_environment_fallback_exposes_the_actual_http_cache_ir() {
+        let _env = OpenAiCompatEnvGuard::unset();
+        let state_root = temp_state_root("business-model-cache-ir");
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore_with_test_fixture(&config).unwrap();
+        let (_app, state) = runtime.router_with_bridge_env_for_tests(
+            "daemon-test".into(),
+            &[
+                ("MAGI_OPENAI_COMPAT_BASE_URL", "https://relay.example/v1"),
+                ("MAGI_OPENAI_COMPAT_MODEL", "environment-model"),
+            ],
+        );
+        let client = state.model_bridge_client().unwrap();
+        let identity = client.cache_identity().expect("actual HTTP identity");
+        assert_eq!(identity.model, "environment-model");
+        assert_eq!(identity.protocol, "openai_chat");
+        let ir = client.cache_prompt_ir(&ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: Some("not-supported-by-unknown-chat".into()),
+            provider: "fallback".into(),
+            prompt: "inspect".into(),
+            messages: None,
+            tools: Some(vec![magi_bridge_client::ChatToolDefinition {
+                kind: "function".into(),
+                origin: magi_bridge_client::ChatToolOrigin::ExternalMcp,
+                function: magi_bridge_client::ChatToolFunctionDefinition {
+                    name: "mcp__repo__inspect".into(),
+                    description: "inspect".into(),
+                    parameters: json!({"type":"object"}),
+                },
+            }]),
+            tool_choice: None,
+        });
+        assert!(ir.prompt_cache_key.is_none());
+        assert_eq!(ir.tools.unwrap()[0].name, "magi_mcp_mcp__repo__inspect");
+    }
+
+    #[tokio::test]
     async fn daemon_business_model_without_real_config_reports_configuration_error() {
         let _env = OpenAiCompatEnvGuard::unset();
         let state_root = temp_state_root("business-model-unavailable");
@@ -5084,6 +5156,8 @@ done
         let err = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "magi-business-model".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,

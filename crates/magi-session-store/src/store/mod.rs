@@ -8,6 +8,7 @@ mod interactions;
 mod model_steps;
 mod queries;
 mod sidecar;
+pub use sidecar::GOAL_DERIVED_TURN_METADATA_KEYS;
 mod tool_approvals;
 mod user_questions;
 
@@ -58,6 +59,13 @@ pub struct ModelStepCommitNotice {
     pub session_id: SessionId,
     pub workspace_id: Option<String>,
     pub turn: CanonicalTurn,
+    pub step: crate::ModelStep,
+}
+
+/// 用量恢复只读取请求摘要与统计绑定，避免复制 canonical Turn 的正文。
+pub struct ModelUsageProjectionStep {
+    pub session_id: SessionId,
+    pub turn_id: String,
     pub step: crate::ModelStep,
 }
 
@@ -530,6 +538,24 @@ impl SessionStore {
             .filter(|session| session.workspace_id.as_deref() == workspace_id)
             .cloned()
             .collect()
+    }
+
+    /// 按会话 ID 查找启动时无法加载的会话，不限工作区。
+    pub fn unavailable_session(&self, session_id: &SessionId) -> Option<UnavailableSession> {
+        self.unavailable_sessions
+            .read()
+            .expect("unavailable sessions lock poisoned")
+            .iter()
+            .find(|session| &session.session_id == session_id)
+            .cloned()
+    }
+
+    /// 原文件已被持久层清理后，把会话从不可用列表中摘掉。
+    pub fn forget_unavailable_session(&self, session_id: &SessionId) {
+        self.unavailable_sessions
+            .write()
+            .expect("unavailable sessions lock poisoned")
+            .retain(|session| &session.session_id != session_id);
     }
 
     pub fn from_persisted_parts(

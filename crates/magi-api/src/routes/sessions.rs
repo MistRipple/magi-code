@@ -524,6 +524,28 @@ async fn delete_session(
 ) -> Result<Json<BootstrapDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
     let _lifecycle_guard = state.lock_session_lifecycle(&session_id).await;
+    // 启动时无法加载的会话不在会话状态里，只能清理它的持久化文件。
+    if state.session_store.session(&session_id).is_none()
+        && state
+            .session_store
+            .unavailable_session(&session_id)
+            .is_some()
+    {
+        let entry = state
+            .discard_unavailable_session_after_lifecycle_lock(&session_id)
+            .await?;
+        let workspace_id = entry.workspace_id.map(WorkspaceId::new);
+        publish_session_directory_event(
+            &state,
+            "session.deleted",
+            &session_id,
+            workspace_id.as_ref(),
+        );
+        return Ok(Json(state.bootstrap_dto_for_workspace_session(
+            workspace_id.as_ref().map(WorkspaceId::as_str),
+            None,
+        )?));
+    }
     let scope = resolve_existing_session_scope(
         &state,
         &session_id,
@@ -2589,6 +2611,7 @@ mod tests {
         request.user_message_id = Some(format!("user-{queue_id}"));
         request.placeholder_message_id = Some(format!("assistant-{queue_id}"));
         QueuedRegularSessionTurn {
+            readiness: None,
             project_directories: None,
             request,
             request_fingerprint: None,
@@ -5071,6 +5094,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_session_discards_unavailable_session_through_persistence_hook() {
+        let discarded = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let hook_discarded = discarded.clone();
+        let state = test_state().with_unavailable_session_discard(Arc::new(move |session_id| {
+            hook_discarded.lock().unwrap().push(session_id.to_string());
+            Ok(magi_session_store::UnavailableSession {
+                session_id: session_id.clone(),
+                workspace_id: Some("workspace-a".to_string()),
+                source_path: "/tmp/unavailable.json".to_string(),
+                reason: "损坏".to_string(),
+            })
+        }));
+        register_workspace(&state, "workspace-a", "delete-unavailable-a");
+        state.session_store.set_unavailable_sessions(vec![
+            magi_session_store::UnavailableSession {
+                session_id: SessionId::new("session-unavailable"),
+                workspace_id: Some("workspace-a".to_string()),
+                source_path: "/tmp/unavailable.json".to_string(),
+                reason: "损坏".to_string(),
+            },
+        ]);
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/delete",
+            serde_json::json!({
+                "workspaceId": "workspace-a",
+                "sessionId": "session-unavailable",
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(*discarded.lock().unwrap(), vec!["session-unavailable"]);
+        assert!(
+            state
+                .session_store
+                .unavailable_sessions(Some("workspace-a"))
+                .is_empty(),
+            "清理后不能继续出现在不可用列表"
+        );
+    }
+
+    #[tokio::test]
     async fn delete_session_rejects_workspace_mismatched_session() {
         let state = test_state();
         register_workspace(&state, "workspace-a", "delete-mismatch-a");
@@ -7340,6 +7407,7 @@ mod tests {
             .unwrap();
         state
             .enqueue_regular_session_turn(QueuedRegularSessionTurn {
+                readiness: None,
                 project_directories: None,
                 request: session_turn_request("排队消息"),
                 request_fingerprint: None,

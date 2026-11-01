@@ -1,33 +1,32 @@
 import { getTransport } from '../shared/transport';
 import { agentUrl } from './agent-api';
-import type { PluginManifest, WebModelSetupStatus } from '../shared/app-server-protocol.generated';
+import type { PluginManifest, WebModelSetupStatus, WebModelSetupCredentialsParams, WebModelSetupControlParams } from '../shared/app-server-protocol.generated';
 import { WEB_MODEL_SETUP_COMMAND_ID } from '../lib/user-message-command';
 import { WEB_MODEL_PLUGIN_ID } from '../shared/web-model';
 
 export const WEB_MODEL_SETUP_COMMAND = WEB_MODEL_SETUP_COMMAND_ID;
 export const WEB_MODEL_SETUP_REQUEST = 'magi:gptWebSetup';
-export type SetupAction = 'start' | 'continue' | 'cancel';
+export const WEB_MODEL_SETUP_UPDATED = 'magi:gptWebSetupUpdated';
+export type SetupAction = 'start' | 'continue' | 'pause' | 'cancel';
 
 /** 安装本身不注册辅助能力；只消费 daemon 已激活清单及命令投影。 */
 export function webModelSetupAvailable(projection: {
-  manifests: Pick<PluginManifest, 'id'>[];
+  manifests: Pick<PluginManifest, 'id' | 'contributions'>[];
   commands: { id: string }[];
 }): boolean {
-  return projection.manifests.some(manifest => manifest.id === WEB_MODEL_PLUGIN_ID)
-    && projection.commands.some(command => command.id === WEB_MODEL_SETUP_COMMAND);
+  return projection.manifests.some(manifest => manifest.id === WEB_MODEL_PLUGIN_ID
+    && manifest.contributions?.skills?.some(skill => skill.id === 'gpt-web-setup'));
 }
 
-/** 插件未贡献配置命令时保留普通消息语义；讨论、否定或引用也不触发账号操作。 */
-export function isWebModelSetupRequest(text: string, available: boolean): boolean {
-  return available && /^(?:(?:请|麻烦)?(?:帮我|帮忙|协助我)?(?:开始|进行)?(?:配置|设置|绑定|连接)(?:一下)?\s*(?:magi\s*(?:的)?)?gpt\s*web(?:\s*插件)?(?:\s*的)?(?:\s*(?:工具通道|连接器))?(?:吧|。|！|!)?|(?:please\s+)?(?:help me\s+)?(?:set up|configure|connect)\s+gpt\s*web[.!]?)$/iu.test(text.trim());
-}
+/** 在普通聊天提交之前拦截意外粘贴的密钥；自然语言不被改写为命令。 */
+export function containsSetupSecret(text: string): boolean { return /(?<![A-Za-z0-9_-])sk[-_][A-Za-z0-9_-]{8,}/u.test(text); }
 
 export function setupCanEditCredentials(status: WebModelSetupStatus | null): boolean {
-  return Boolean(status && ['tunnel', 'credentials', 'connecting'].includes(status.stage));
+  return status?.allowedActions?.includes('save_credentials') === true;
 }
 
 export function setupIsActive(status: WebModelSetupStatus | null): boolean {
-  return Boolean(status && !['complete', 'cancelled', 'busy'].includes(status.stage));
+  return Boolean(status && !['completed', 'cancelled', 'revoked'].includes(status.runState ?? '') && !['complete', 'cancelled', 'busy'].includes(status.stage));
 }
 
 /** 必填规则和占位文案分别消费服务端保存事实，不能把“可稍后填写”当成已有密钥。 */
@@ -52,6 +51,9 @@ export function setupReasonKey(reason: string): string | null {
 /** 一个检查点只展示一条主指引，人工交接不能同时声称正在自动处理。 */
 export function setupHintKey(status: WebModelSetupStatus, busy: boolean, connectionFailed = false): string {
   if (busy) return 'webModel.setup.workingHint';
+  if (status.reason === 'connector_attribution_pending') return 'webModel.setup.reason.connectorAttribution';
+  if (status.continueState === 'saved_not_continued') return 'webModel.setup.continueFailed';
+  if (status.stage === 'connecting' && status.continueState === 'waiting_channel') return 'webModel.setup.waitingChannel';
   if (status.stage === 'connecting' && connectionFailed) return 'webModel.setup.reason.connectionFailed';
   if (status.stage === 'credentials' && status.reason === 'runtime_key_required') return 'webModel.setup.reason.keyPreparation';
   return setupReasonKey(status.reason) ?? `webModel.setup.hint.${status.stage}`;
@@ -70,9 +72,20 @@ export async function getWebModelSetup(sessionId: string): Promise<WebModelSetup
 }
 
 /** 凭据单独提交，不经过 executeTask、Turn、模型或浏览器工具。 */
-export async function saveWebModelSetupCredentials(sessionId: string, tunnelId: string, apiKey: string): Promise<void> {
-  await read(await getTransport().request(agentUrl('/api/browser/web-models/setup/credentials'), {
+export async function saveWebModelSetupCredentials(request: WebModelSetupCredentialsParams): Promise<{ saved: boolean; status: string; configuration: WebModelSetupStatus }> {
+  return read(await getTransport().request(agentUrl('/api/browser/web-models/setup/credentials'), {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ sessionId, tunnelId: tunnelId.trim() || null, apiKey }),
+    body: JSON.stringify(request),
   }));
+}
+
+export async function controlWebModelSetup(request: WebModelSetupControlParams): Promise<{ configuration: WebModelSetupStatus }> {
+  return read(await getTransport().request(agentUrl('/api/browser/web-models/setup/control'), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request),
+  }));
+}
+
+/** 只查询脱敏回执，不重传秘密或创建继续输入。 */
+export async function getWebModelSetupReceipt(sessionId: string, requestId: string): Promise<{ saved: boolean; status: string; configuration: WebModelSetupStatus }> {
+  return read(await getTransport().request(agentUrl(`/api/browser/web-models/setup/credentials?sessionId=${encodeURIComponent(sessionId)}&requestId=${encodeURIComponent(requestId)}`), { cache: 'no-store' }));
 }

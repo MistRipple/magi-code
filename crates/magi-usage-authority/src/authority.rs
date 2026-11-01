@@ -230,6 +230,7 @@ pub fn build_usage_call_identity(
     phase: Option<UsagePhase>,
 ) -> UsageCallIdentity {
     UsageCallIdentity {
+        transport: None,
         call_id: call_id.to_string(),
         parent_call_id: parent_call_id.map(|s| s.to_string()),
         source,

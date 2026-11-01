@@ -112,4 +112,10 @@ assert.match(schema, /magi-desktop:register-browser-webview/u);
 assert.match(schema, /magi-desktop:update-browser-display-size/u);
 assert.doesNotMatch(schema, /open-overlay|close-overlay|overlay-ready|overlay-action|set-blocking-overlay/u);
 
+// Main 推进 navigationRevision 时，渲染进程登记/同步显示尺寸会被拒绝。这是身份切换途中的预期
+// 状态：必须静默拉取最新身份并重试，成功后清除登记失败留下的错误，而不是把 IPC 原始错误挂给用户。
+assert.match(browserTab, /function isStaleSurfaceIdentityError[\s\S]*?browser_navigation_revision_stale/u);
+assert.match(browserTab, /isStaleSurfaceIdentityError\(cause\) && staleRegistrationRetries < WEBVIEW_REGISTRATION_MAX_ATTEMPTS[\s\S]*?synchronizeDesktopSurface\(\)/u);
+assert.match(browserTab, /if \(registrationFailureShown\) \{\s*actionError = '';/u);
+
 console.log('desktop right-pane intent golden passed');

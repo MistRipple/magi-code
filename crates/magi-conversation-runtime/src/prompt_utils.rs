@@ -412,6 +412,11 @@ pub enum PromptFragmentKind {
 impl PromptFragmentKind {
     pub fn context_origin(self) -> magi_bridge_client::ChatMessageOrigin {
         use magi_bridge_client::ChatMessageOrigin;
+        if self.stability() == PromptStability::Static
+            && self.trust() == PromptTrustLevel::TrustedInstruction
+        {
+            return ChatMessageOrigin::StaticPolicy;
+        }
         match self {
             Self::ProjectMemory => ChatMessageOrigin::ProjectContext,
             Self::ContextReferences
@@ -869,6 +874,15 @@ mod tests {
 
     #[test]
     fn system_prompt_fragment_message_marks_fragment_kind() {
+        assert_eq!(
+            system_prompt_fragment_message(PromptFragmentKind::Role, "规则").context_origin,
+            magi_bridge_client::ChatMessageOrigin::StaticPolicy
+        );
+        assert_eq!(
+            system_prompt_fragment_message(PromptFragmentKind::CurrentAccessProfile, "权限")
+                .context_origin,
+            magi_bridge_client::ChatMessageOrigin::SystemInstruction
+        );
         let message = system_prompt_fragment_message(PromptFragmentKind::ProjectMemory, "记忆内容");
 
         assert_eq!(message.role, "user");

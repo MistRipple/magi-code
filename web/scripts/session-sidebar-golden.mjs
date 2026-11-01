@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { withGoldenViteServer } from './golden-vite.mjs';
 
 await withGoldenViteServer(async (server) => {
@@ -29,3 +30,17 @@ await withGoldenViteServer(async (server) => {
 });
 
 console.log('session sidebar golden checks passed');
+
+// 无法加载的会话必须能被用户删除：按钮常显（关键补救操作不依赖 hover），
+// 点击经同一个确认框和 deleteSession 桥接，两处列表（项目分组与无项目对话）都要接线。
+const unavailableList = readFileSync(new URL('../src/components/UnavailableSessionList.svelte', import.meta.url), 'utf8');
+const shell = readFileSync(new URL('../src/web/WebWorkbenchShell.svelte', import.meta.url), 'utf8');
+assert.match(unavailableList, /onclick=\{\(\) => onDelete\(session\)\}/, '不可用会话行必须提供删除入口');
+assert.doesNotMatch(unavailableList, /unavailable-session-delete[^}]*opacity:\s*0/, '删除按钮不能只在悬停时出现');
+assert.equal(
+  (shell.match(/<UnavailableSessionList[\s\S]*?onDelete=\{/g) ?? []).length,
+  2,
+  '项目分组与无项目对话两处不可用列表都必须接入删除',
+);
+assert.match(shell, /unavailable: true,/, '不可用会话删除使用专门的确认文案');
+console.log('session sidebar unavailable-delete golden checks passed');

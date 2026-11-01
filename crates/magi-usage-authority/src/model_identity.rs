@@ -107,5 +107,7 @@ pub fn prepare_llm_config_for_persistence(mut model_config: LlmConfig) -> LlmCon
         model_config.account_fingerprint = fingerprint_secret(model_config.api_key.as_deref());
     }
     model_config.api_key = None;
+    // 持久统计身份不需要 URL userinfo/query/fragment，也不能保留其中的凭据。
+    model_config.base_url = canonicalize_base_url(&model_config.base_url);
     model_config
 }

@@ -20,7 +20,7 @@
 
 ## 本地定向回归
 
-无项目会话收口：`npm --prefix web run test:personal-session`，真实 daemon + Chromium 验收用 `npm run test:personal-session-live`。覆盖文件/Shell/执行步骤、项目规则隔离、最近目录、文件预览下载、重启不重放和会话删除回收；只使用独立状态根与本地 Provider。
+无项目会话收口：`npm --prefix web run test:personal-session`，真实 daemon + Chromium 验收用 `npm run test:personal-session-live`。覆盖文件/Shell/执行步骤、项目规则隔离、项目与对话区导航、文件预览下载、重启不重放和会话删除回收；只使用独立状态根与本地 Provider。
 
 无项目工具完整矩阵：`npm run test:personal-tools-live` 在同一隔离 daemon/Chromium/App Server 中增加 41 种工具的实际调用与 Provider 回灌，涵盖完整文件操作、图片生成/查看、提问答复、后台进程读写/等待/停止、12 个 Git 工具（remote 为本地 bare 仓库）、Goal/Plan 与代理发送/上下文检索/答复/取消；基础场景另执行 `update_execution_steps`。确认子代理取消已结算且主线继续完成，重启不重放副作用。模型和图片 Provider 均为本地替身，不调用 GPT Web 或用户模型配置。
 
@@ -95,6 +95,12 @@ Windows CI 的多命令 PowerShell 步骤启用 `$PSNativeCommandUseErrorActionP
 | Renderer | frontend_event_received → reducer_completed → projection_completed → dom_painted |
 
 每条记录关联 session_id、turn_id、request_id、实际执行 profile、场景和 outcome；事件序号只用服务端事实，缺失阶段保持缺失。比较时记录源码、构建、模型参数、输入和历史形态。P50/P95 另定样本量与口径并保留失败样本，少量行为用例不能作为稳定 P95 的证据。本地 Provider 只证明 Magi 行为，上游可用性与延迟须独立测量。
+
+Prompt 缓存使用 `npm run test:prompt-cache`（或直接运行 `node scripts/verify-prompt-cache.mjs`）：从已有 `target/debug/magi-daemon-app` 启动独立 daemon、状态目录和只读临时工作区，覆盖连续三轮对话、两次文件读取、explorer worker 和两次提示词强化，同时保留标题/知识提取等自然辅助请求。默认为本地 Provider，usage 明确标记为合成数据；检查工具目录稳定、原始用量账本与总量/角色/模型缓存统计一致。本地夹具每次返回带 encrypted_content 的合成 reasoning item，并验证主线和 worker 后续真实请求确实回放该上下文；固定配置下只允许 initial/continued，出现意外 epoch 轮换直接失败。真实请求须显式加 `--live`，只在内存读取现有 Responses 主连接和辅助连接的凭据，向它们转发合成任务，不更改用户设置或重启已有 daemon。
+
+用 `--baseline /绝对路径/magi-daemon-app` 增加旧版对照，`--output /绝对路径/产物目录` 保存请求/工具哈希、首字节/首文本/总耗时、Provider usage、账本核对和失败阶段；不保存完整模型请求或上游凭据。`--max-calls 56` 限制**两版合计**的上游请求数（默认 48，最多 96），包含自然辅助调用和传输重试，超限返回不重试的 400 并保留失败证据。HTTP 传输次数与账本逻辑调用次数分开，重试不能虚增账本命中率；未报告缓存 usage 或价格保持未知。实际记录和对照限制见 [Prompt 缓存分析与优化记录](prompt-cache-optimization.md)。
+
+跨模型入口为 `npm run test:prompt-cache-models -- --live`（等价于直接运行 `scripts/verify-prompt-cache-models.mjs --live`）。目录内所有文本模型逐项探测，成功项以同一模型分别承接主线与辅助调用，执行三轮 smoke；生图等非文本项跳过，失败/暂不可用项留证。并发最多两个独立验收进程，每模型一条探测、smoke 最多 12 次，完整对照最多 56 次；报告记录整轮请求上限。`--tool-turns` 追加“同一会话内：纯对话、读取两个约 25 KB 文件的工具回合、两轮纯对话”，用来观察回合边界上上一回合的工具历史能否被缓存复用（此时 smoke 最多 28 次，若追加完整场景则完整上限自动提升到 56 次，以覆盖 worker/工具循环）。`--model <id>` 可重复以限制模型集合；`--full-model <id>` 可重复以追加完整场景，配合 `--baseline /绝对路径/旧二进制` 比较旧新版。主脚本也可用 `--smoke` 和 `--aux-model <id>` 单独运行这些路径。`completed` 只表示矩阵已遍历，`outcome` 区分通过和验证失败；任何已可用模型的 smoke/完整场景失败使脚本非零退出，不能用目录探测成功替代三轮/工具完成。
 
 ## 文档与脚本维护
 

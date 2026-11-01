@@ -7,13 +7,12 @@ await withGoldenViteServer(async server => {
   composer.syncComposerWorkspaces([{ workspaceId: 'project', rootPath: '/tmp/project', name: 'Project', isActive: true }]);
   assert.equal(composer.resolveComposerWorkspace('', ''), null, '个人草稿不能继承活动项目');
   assert.equal(composer.resolveComposerWorkspace('project', '/tmp/project').workspaceId, 'project');
-  const { recentSessionList } = await server.ssrLoadModule('/src/lib/recent-sessions.ts');
+  const { personalSessionList } = await server.ssrLoadModule('/src/lib/personal-sessions.ts');
   const personal = { id: 'personal', createdAt: 1, updatedAt: 3 };
+  const olderPersonal = { id: 'personal-old', createdAt: 1, updatedAt: 2 };
   const project = { id: 'project-chat', workspaceId: 'project', createdAt: 1, updatedAt: 4 };
-  const rows = recentSessionList([personal], { project: [project] });
-  assert.deepEqual(rows, [project, personal]);
-  assert.equal(rows[1].workspaceId, undefined);
-  assert.deepEqual(recentSessionList([personal], {}), [personal], '移除项目不会改变个人会话归属');
+  assert.deepEqual(personalSessionList([olderPersonal, personal]), [personal, olderPersonal], '无项目会话按活动时间排序');
+  assert.deepEqual(personalSessionList([personal, project]), [personal], '项目会话只属于项目分组，不进入无项目列表');
   const binding = await server.ssrLoadModule('/src/web/agent-binding-context.ts');
   const api = await server.ssrLoadModule('/src/web/agent-api.ts');
   binding.setAgentBindingContext({ scope: 'workspace', workspaceId: 'project', workspacePath: '/tmp/project', sessionId: 'other' });

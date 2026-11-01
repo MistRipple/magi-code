@@ -35,6 +35,10 @@ pub fn model_visible_tool_history_budget_bytes(context_window_tokens: u64) -> us
         .max(MODEL_VISIBLE_TOOL_HISTORY_MIN_BYTES)
 }
 const MODEL_VISIBLE_TOOL_RESULT_FIELD_MAX_BYTES: usize = 2 * 1024;
+/// 旧工具结果降级后的摘要上限。固定值，摘要形态因此只取决于结果本身。
+const TOOL_HISTORY_STUB_MAX_BYTES: usize = 1024;
+/// 更早的旧工具结果只留的最小标记上限。
+const TOOL_HISTORY_MINIMAL_STUB_MAX_BYTES: usize = 96;
 const MODEL_VISIBLE_TOOL_RESULT_MARKER: &str = "...[model output truncated]...";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -449,6 +453,7 @@ pub fn model_visible_tool_result(result: &str, status: ExecutionResultStatus) ->
             "message",
             "path",
             "content_hash",
+            "fact_state",
             "exit_code",
             "file_size_bytes",
             "bytes_read",
@@ -534,6 +539,12 @@ pub fn model_visible_tool_result(result: &str, status: ExecutionResultStatus) ->
 ///
 /// 最近结果优先保留完整内容；较早结果降为结构化事实摘要。该函数不调用
 /// 模型、不修改持久化结果，调用方只应把返回值用于下一次模型请求的上下文视图。
+///
+/// 提供方缓存只复用逐字节相同的前缀，而这个视图每轮都会重算。因此降级的边界不能随
+/// 总量逐条移动，否则超出预算后每一轮都会改写旧结果，其后的整段历史都命不中缓存：
+/// - 每条旧结果的摘要形态只由它自己决定，与结果条数、预算余量无关；
+/// - 降级边界只落在从头累计的“块”边界上（块大小约为预算的一半），新结果追加时边界保持不变，
+///   直到最近的完整结果装不下才整块前移一次，两次前移之间历史逐字节不变。
 pub fn bound_model_visible_tool_history(results: &[String], budget_bytes: usize) -> Vec<String> {
     if results.is_empty() {
         return Vec::new();
@@ -547,6 +558,74 @@ pub fn bound_model_visible_tool_history(results: &[String], budget_bytes: usize)
         return visible;
     }
 
+    let block_bytes = (budget_bytes / 2).max(1);
+    let mut boundaries = Vec::new();
+    let mut accumulated = 0usize;
+    for (index, result) in visible.iter().enumerate() {
+        accumulated = accumulated.saturating_add(result.len());
+        if accumulated >= block_bytes {
+            boundaries.push(index + 1);
+            accumulated = 0;
+        }
+    }
+    // 紧挨着保留段之前的那一块保留较完整的摘要，更早的块只留最小标记，
+    // 否则成百上千条旧摘要会把预算吃光，迫使边界频繁前移。
+    let recent_stubs = visible
+        .iter()
+        .map(|result| compact_historical_tool_result(result, TOOL_HISTORY_STUB_MAX_BYTES))
+        .collect::<Vec<_>>();
+    let minimal_stubs = visible
+        .iter()
+        .map(|result| compact_historical_tool_result(result, TOOL_HISTORY_MINIMAL_STUB_MAX_BYTES))
+        .collect::<Vec<_>>();
+    let prefix_sums = |items: &[String]| {
+        let mut sums = Vec::with_capacity(items.len() + 1);
+        sums.push(0usize);
+        for item in items {
+            sums.push(sums[sums.len() - 1] + item.len());
+        }
+        sums
+    };
+    let recent_sums = prefix_sums(&recent_stubs);
+    let minimal_sums = prefix_sums(&minimal_stubs);
+    let visible_sums = prefix_sums(&visible);
+    // 最近一条结果始终完整保留；取能让总量落进预算的最靠前的块边界。
+    let mut previous_boundary = 0usize;
+    let mut chosen = None;
+    for &cut in &boundaries {
+        if cut >= visible.len() {
+            break;
+        }
+        let bytes = minimal_sums[previous_boundary]
+            + (recent_sums[cut] - recent_sums[previous_boundary])
+            + (visible_sums[visible.len()] - visible_sums[cut]);
+        if bytes <= budget_bytes {
+            chosen = Some((previous_boundary, cut));
+            break;
+        }
+        previous_boundary = cut;
+    }
+    let Some((minimal_end, cut)) = chosen else {
+        return bound_tool_history_by_share(visible, budget_bytes);
+    };
+    visible
+        .into_iter()
+        .enumerate()
+        .map(|(index, full)| {
+            if index < minimal_end {
+                minimal_stubs[index].clone()
+            } else if index < cut {
+                recent_stubs[index].clone()
+            } else {
+                full
+            }
+        })
+        .collect()
+}
+
+/// 固定摘要形态放不进预算时（成千上万条结果）的兜底：旧结果按预算均分。
+/// 这个形态会随条数变化，只在上面的块边界方案无解时使用。
+fn bound_tool_history_by_share(visible: Vec<String>, budget_bytes: usize) -> Vec<String> {
     // 至少给最近一批结果留出一半预算；它们最可能直接决定下一步动作。
     let recent_budget = budget_bytes / 2;
     let mut recent_start = visible.len();
@@ -565,15 +644,17 @@ pub fn bound_model_visible_tool_history(results: &[String], budget_bytes: usize)
     }
     let old_budget = budget_bytes.saturating_sub(recent_bytes);
     let per_old_budget = old_budget / old_count;
-    let mut bounded = Vec::with_capacity(visible.len());
-    for (index, result) in visible.into_iter().enumerate() {
-        if index < recent_start {
-            bounded.push(compact_historical_tool_result(&result, per_old_budget));
-        } else {
-            bounded.push(result);
-        }
-    }
-    bounded
+    visible
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            if index < recent_start {
+                compact_historical_tool_result(&result, per_old_budget)
+            } else {
+                result
+            }
+        })
+        .collect()
 }
 
 fn compact_historical_tool_result(result: &str, max_bytes: usize) -> String {
@@ -891,6 +972,67 @@ mod tests {
                 .iter()
                 .all(|result| { serde_json::from_str::<Value>(result).is_ok() })
         );
+    }
+
+    #[test]
+    fn tool_history_compaction_moves_rarely_so_the_cached_prefix_survives_appends() {
+        let result = |index: usize| {
+            serde_json::json!({
+                "tool": "file_read",
+                "status": "succeeded",
+                "path": format!("src/file-{index}.rs"),
+                "content_hash": format!("sha256:{index:064}"),
+                "content": "x".repeat(6_000),
+            })
+            .to_string()
+        };
+        let budget = MODEL_VISIBLE_TOOL_HISTORY_MIN_BYTES;
+        let mut results = Vec::new();
+        let mut previous: Vec<String> = Vec::new();
+        let mut rewrites = 0usize;
+        let mut over_budget_steps = 0usize;
+        for index in 0..200 {
+            results.push(result(index));
+            let bounded = bound_model_visible_tool_history(&results, budget);
+            assert!(bounded.iter().map(String::len).sum::<usize>() <= budget);
+            if results.iter().map(String::len).sum::<usize>() > budget {
+                over_budget_steps += 1;
+            }
+            // 追加一条结果后，上一轮的输出必须原样作为前缀保留，除非降级边界整块前移。
+            if !previous.is_empty() && !bounded.starts_with(&previous) {
+                rewrites += 1;
+            }
+            previous = bounded;
+        }
+        assert!(over_budget_steps > 150);
+        // 块大小是预算的一半（24 KiB，约 4 条 6 KiB 的结果），所以每约 4 条才允许改写一次。
+        assert!(
+            rewrites * 3 <= over_budget_steps,
+            "rewrites={rewrites} over_budget_steps={over_budget_steps}"
+        );
+    }
+
+    #[test]
+    fn a_compacted_stub_depends_only_on_its_own_result() {
+        let make = |count: usize| {
+            (0..count)
+                .map(|index| {
+                    serde_json::json!({
+                        "tool": "file_read",
+                        "status": "succeeded",
+                        "path": format!("src/file-{index}.rs"),
+                        "content_hash": format!("sha256:{index:064}"),
+                        "content": "x".repeat(6_000),
+                    })
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        let budget = MODEL_VISIBLE_TOOL_HISTORY_MIN_BYTES;
+        let short = bound_model_visible_tool_history(&make(30), budget);
+        let long = bound_model_visible_tool_history(&make(60), budget);
+        assert!(short[0].contains("history_compacted"));
+        assert_eq!(short[0], long[0], "摘要形态不能随结果条数变化");
     }
 
     #[test]

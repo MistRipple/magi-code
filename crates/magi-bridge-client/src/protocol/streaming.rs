@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::prompt_ir::PromptIr;
 use serde_json::Value;
 
 use super::adapter::{AdaptedResponse, ProviderFamily};
@@ -725,6 +727,14 @@ struct ActiveToolCall {
 }
 
 impl StreamAccumulator {
+    pub fn usage_snapshot(&self) -> LlmUsage {
+        self.usage.clone()
+    }
+
+    /// 用 Provider 的终态 usage 覆盖此前收到的中间快照。
+    pub fn replace_usage(&mut self, usage: LlmUsage) {
+        self.usage = usage;
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -1027,7 +1037,7 @@ fn tool_call_argument_fragment(arguments: Option<&Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_types::{LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams};
+    use crate::llm_types::{LlmContentBlock, LlmMessage, LlmMessageContent};
     use crate::protocol::{OpenAiResponsesAdapter, ProviderAdapter};
 
     #[test]
@@ -1586,14 +1596,18 @@ mod tests {
             .collect();
         let request = OpenAiResponsesAdapter
             .build_request(
-                &LlmMessageParams {
+                &PromptIr {
+                    prompt_cache_key: None,
+
                     reasoning_capability: None,
                     messages: vec![
                         LlmMessage {
+                            origin: Default::default(),
                             role: "assistant".to_string(),
                             content: LlmMessageContent::Blocks(assistant_blocks),
                         },
                         LlmMessage {
+                            origin: Default::default(),
                             role: "user".to_string(),
                             content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
                                 tool_use_id: "call_1".to_string(),
@@ -1607,7 +1621,7 @@ mod tests {
                     temperature: None,
                     tools: None,
                     stream: Some(true),
-                    system_prompt: None,
+
                     tool_choice: None,
                     reasoning_effort: None,
                 },

@@ -326,6 +326,10 @@ EventBus 只负责实时传输，不作为恢复依据。断线或序号缺口�
 
 取消由 Coordinator 发起并传播到 Provider、Task scheduler、工具进程、Browser/Git 资源；一个 Turn 只产生一个 `turn.cancelled`。迟到回调不能修改当前 Turn、下一 Turn 或可见消息。测试宿主关闭必须先停止新接纳，再取消活动 Turn，最后等待真实 settlement promise。`accepted/preparing` 尚未建立 execution chain 时，也必须经同一个 canonical sink 收口，不能因缺少可恢复链而留下非终态 Turn；桌面退出的重入事件不得绕过这段等待。
 
+启动时 session projection 缓存与同游标的事件重放结果必须逐项一致，否则该会话标记为不可用并保留原文件。`goalId` 与 `responseDurationScope` 是目标状态在恢复时重新推导的 Turn 标注（`GOAL_DERIVED_TURN_METADATA_KEYS`），不属于事件事实：事件日志按写入当时的目标状态记录它们，目标之后结束或阻塞会使推导结果改变，因此一致性校验忽略这两个 key。校验失败的错误信息带出第一处差异的 JSON 路径与两侧摘要，便于区分事实被改写与派生字段变化。
+
+无法加载的会话在侧栏以“会话无法加载”行展示，行内常显删除入口（关键补救操作不依赖 hover）。`POST /session/delete` 识别不在会话状态、只在不可用记录里的会话，改走持久层清理：投影文件与 canonical 事件目录在同一个 projection 事务里移除，并把仍指向它的 `session-current.json` 改写为空，避免删除后下次启动因“current 指向不存在的 session”整体失败；路径取自本次加载记录，不接受调用方给定。无项目会话同时回收私有执行目录，规则与正常删除一致（dirty/占用的 Git 资源保留成果）。
+
 ### 5.3 权限、Git、Browser、MCP 与前端
 
 - profile 在 accepted 事实中冻结；模型输出不能把 `conversation` 变成 `task`。

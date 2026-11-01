@@ -97,17 +97,19 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 
 - [模型推理能力与选择交互](model-reasoning-capabilities.md)：daemon 能力解析、服务商声明、子代理按次强度与恢复快照、实际传输参数和模型选择器验收。
 
-- [无项目会话与最近对话](personal-session-architecture.md)：个人归属、独立执行目录、项目能力边界、文件生命周期和历史兼容。
+- [无项目会话与对话列表](personal-session-architecture.md)：个人归属、独立执行目录、项目能力边界、文件生命周期和历史兼容。
 
 - [Magi 插件系统：需求与方案设计](./plugin-system-requirements-design.md)：统一安装、授权、生命周期、版本化资源、插件工具与工作流、会话引擎路由、隔离视图、第一方 GPT Web/MCP 服务插件壳及插件中心已接入；平台验证、取消结算与通用 Browser surface 的限制见 §10.1。作者合同见[插件作者指南](./plugin-authoring.md)。
 - [Magi 内置浏览器完整设计](./browser-runtime-design.md)：Browser Authority、Browser Automation Worker、Goal/子代理租约、右侧预览、页面标记与跨平台发布基线。
 - [内置工具的失败合同](./builtin-tool-failure-contract.md)：工具失败时必须告诉模型什么、暂态重试的唯一负责层、结构化错误字段，以及文件、shell 与后台进程、web、搜索、Git、update_plan 等内置工具的具体约定。
 - [对话展示：详细模式与摘要模式](./conversation-display-modes.md)：两种显示模式共用的事实投影、摘要模式折叠与分组规则、工具卡片状态（含结果未确认）与流式稳定性约束。
 - [Magi 上下文压力与压缩统一架构](./context-pressure-compaction-architecture.md)：token 语义、压力快照、连续压缩、检查点、超限恢复、模型隔离与测试门禁。
+- [Prompt 缓存分析与优化记录](./prompt-cache-optimization.md)：Codex CLI、pi、OpenCode 机制参考、主线/worker/辅助调用的历史基线、会话缓存键、协议断点与统计口径。
+- [Prompt Lineage 与缓存根架构](./prompt-cache-lineage-architecture.md)：把提示词 IR、分支 lineage、cache epoch、Provider Cache Contract 和 logical/transport usage 统一为 daemon 一级事实。
 - [知识图谱设计与维护](./knowledge-graph-design.md)：图谱事实源、候选审阅、检索预算、索引维护与定向验证。
 - [用户自定义子代理角色](./custom-worker-role-design.md)：角色定义、持久化、注册表热更新、导入导出与调度合同。
 - [Magi GPT Web 最终开发文档](./web-model-browser-development.md)：**当前唯一开发基线**；单宿主、单槽位、临时 / 已保存对话、单向 Web → 本地、工具能力通过 Magi MCP 服务接入、状态所有权和验收口径。
-- [GPT Web AI 配置改造目标与验收](./web-model-setup-agent.md)：配置 Agent 的边界、检查点闸门、人工交接与代码地图；验收入口见[GPT Web 配置验收](./gpt-web-setup-validation.md)。
+- [GPT Web AI 配置改造目标与验收](./web-model-setup-agent.md)：主助手的 GPT Web 配置任务的边界、检查点闸门、人工交接与代码地图；验收入口见[GPT Web 配置验收](./gpt-web-setup-validation.md)。
 - [Magi MCP 服务设计](./magi-mcp-server-design.md)：Magi 对外提供的标准 MCP 服务端，任何 MCP 客户端可在已注册工作区使用文件、搜索、只读 git、变更账本等工具；令牌与授权方式、审批、路径限制、审计，本机 stdio / 回环 HTTP 与 Cloudflare Quick Tunnel 网络模式（**均已实现**）；动态网关目录含内置工具、下游 MCP 与 Skill handler；§12 记录 GPT Web 槽位端点的最终接线（无令牌、槽位表派生身份与归属、OpenAI Tunnel 通道、代码地图）。
 
 - [Turn、事件事实与对话执行架构](./conversation-response-core-architecture-redesign.md)：统一接纳、任务调度、终态、恢复和权限边界。

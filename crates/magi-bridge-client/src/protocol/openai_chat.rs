@@ -1,3 +1,4 @@
+use crate::prompt_ir::PromptIr;
 use serde_json::{Value, json};
 
 use super::adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderFamily};
@@ -6,10 +7,7 @@ use super::utils::{
     compatible_tool_call_id, convert_messages_to_openai, parse_openai_usage,
     reasoning_effort_label, serialize_tool_definitions,
 };
-use crate::cache_boundary::PROMPT_CACHE_BOUNDARY;
-use crate::llm_types::{
-    LlmMessageContent, LlmMessageParams, ToolCall, ToolChoice, parse_tool_arguments,
-};
+use crate::llm_types::{ToolCall, ToolChoice, parse_tool_arguments};
 
 pub struct OpenAiChatCompletionsAdapter;
 
@@ -18,26 +16,20 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
         ProviderFamily::OpenAiChat
     }
 
-    fn build_request(
-        &self,
-        params: &LlmMessageParams,
-        model: &str,
-    ) -> Result<AdaptedRequest, String> {
-        // PROMPT_CACHE_BOUNDARY 标记仅服务于 Anthropic content-block 切分，
-        // 对 ChatCompletions 协议没有语义；在喂进 convert_messages_to_openai
-        // 之前过滤掉，避免泄漏到 OpenAI 兼容模型的 prompt。
-        let filtered_messages: Vec<crate::llm_types::LlmMessage> = params
-            .messages
-            .iter()
-            .filter(|m| !is_cache_boundary_marker(&m.content))
-            .cloned()
-            .collect();
-        let messages = convert_messages_to_openai(&filtered_messages);
+    fn build_request(&self, params: &PromptIr, model: &str) -> Result<AdaptedRequest, String> {
+        let messages = convert_messages_to_openai(&params.messages);
 
         let mut body = json!({
             "model": model,
             "messages": messages,
         });
+        if let Some(key) = params
+            .prompt_cache_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+        {
+            body["prompt_cache_key"] = json!(key);
+        }
 
         if let Some(max_tokens) = params.max_tokens {
             body["max_tokens"] = json!(max_tokens);
@@ -189,13 +181,6 @@ fn openai_compatible_text(value: &Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn is_cache_boundary_marker(content: &LlmMessageContent) -> bool {
-    match content {
-        LlmMessageContent::Text(text) => text.as_str() == PROMPT_CACHE_BOUNDARY,
-        LlmMessageContent::Blocks(_) => false,
-    }
-}
-
 /// 把统一的 `ToolChoice` enum 翻译成 OpenAI Chat Completions 协议形态。
 ///
 /// - `ToolChoice::Simple(s)`（"auto" / "none" / "required"）：原样作为字符串透传；
@@ -260,17 +245,19 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_types::{LlmMessage, LlmMessageContent, LlmMessageParams};
+    use crate::llm_types::{LlmMessage, LlmMessageContent};
 
-    fn base_params(messages: Vec<LlmMessage>) -> LlmMessageParams {
-        LlmMessageParams {
+    fn base_params(messages: Vec<LlmMessage>) -> PromptIr {
+        PromptIr {
+            prompt_cache_key: None,
+
             reasoning_capability: None,
             messages,
             max_tokens: None,
             temperature: None,
             tools: None,
             stream: None,
-            system_prompt: None,
+
             tool_choice: None,
             reasoning_effort: None,
         }
@@ -280,10 +267,12 @@ mod tests {
     fn developer_message_role_is_preserved_for_chat_completions() {
         let params = base_params(vec![
             LlmMessage {
+                origin: Default::default(),
                 role: "developer".to_string(),
                 content: LlmMessageContent::Text("当前权限快照".to_string()),
             },
             LlmMessage {
+                origin: Default::default(),
                 role: "user".to_string(),
                 content: LlmMessageContent::Text("继续执行".to_string()),
             },
@@ -299,17 +288,21 @@ mod tests {
     }
 
     #[test]
-    fn cache_boundary_marker_message_is_stripped() {
+    fn former_cache_marker_is_ordinary_prompt_text() {
+        const PROMPT_CACHE_BOUNDARY: &str = "<<<MAGI_PROMPT_CACHE_BOUNDARY:STATIC_END>>>";
         let params = base_params(vec![
             LlmMessage {
+                origin: Default::default(),
                 role: "system".to_string(),
                 content: LlmMessageContent::Text("static prompt".to_string()),
             },
             LlmMessage {
+                origin: Default::default(),
                 role: "system".to_string(),
                 content: LlmMessageContent::Text(PROMPT_CACHE_BOUNDARY.to_string()),
             },
             LlmMessage {
+                origin: Default::default(),
                 role: "system".to_string(),
                 content: LlmMessageContent::Text("dynamic prompt".to_string()),
             },
@@ -318,16 +311,16 @@ mod tests {
             .build_request(&params, "gpt-4o")
             .expect("build");
         let messages = adapted.body["messages"].as_array().expect("messages");
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["content"], "static prompt");
-        assert_eq!(messages[1]["content"], "dynamic prompt");
-        let text = adapted.body.to_string();
-        assert!(!text.contains(PROMPT_CACHE_BOUNDARY));
+        assert_eq!(messages[1]["content"], PROMPT_CACHE_BOUNDARY);
+        assert_eq!(messages[2]["content"], "dynamic prompt");
     }
 
     #[test]
     fn reasoning_effort_only_emitted_on_capability_models() {
         let mut params = base_params(vec![LlmMessage {
+            origin: Default::default(),
             role: "user".to_string(),
             content: LlmMessageContent::Text("hi".to_string()),
         }]);
@@ -349,6 +342,7 @@ mod tests {
     #[test]
     fn tool_choice_typed_translates_to_openai_shape() {
         let mut params = base_params(vec![LlmMessage {
+            origin: Default::default(),
             role: "user".to_string(),
             content: LlmMessageContent::Text("classify".to_string()),
         }]);
@@ -377,6 +371,7 @@ mod tests {
     #[test]
     fn streaming_sets_include_usage() {
         let mut params = base_params(vec![LlmMessage {
+            origin: Default::default(),
             role: "user".to_string(),
             content: LlmMessageContent::Text("hi".to_string()),
         }]);

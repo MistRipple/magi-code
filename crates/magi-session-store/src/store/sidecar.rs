@@ -34,6 +34,15 @@ const TURN_SUPERSEDED_REASON_METADATA_KEY: &str = "supersededReason";
 const TURN_SUPERSEDED_BY_TURN_ID_METADATA_KEY: &str = "supersededByTurnId";
 const TURN_GOAL_ID_METADATA_KEY: &str = "goalId";
 const TURN_RESPONSE_DURATION_SCOPE_METADATA_KEY: &str = "responseDurationScope";
+/// 由目标状态在恢复时重新推导的 Turn 标注，不属于事件事实。
+///
+/// 事件日志按写入当时的目标状态记录它们；目标之后结束或阻塞，
+/// `reconcile_goal_response_duration_scopes` 会按最新目标状态重新推导，缓存 projection
+/// 因此与冻结的事件日志必然不同。事件与缓存的一致性校验必须忽略这些 key。
+pub const GOAL_DERIVED_TURN_METADATA_KEYS: [&str; 2] = [
+    TURN_GOAL_ID_METADATA_KEY,
+    TURN_RESPONSE_DURATION_SCOPE_METADATA_KEY,
+];
 const TURN_RESPONSE_DURATION_SCOPE_GOAL_PROGRESS: &str = "goal_progress";
 const GOAL_CONTINUATION_USER_INTERRUPTED: &str = "user_interrupted";
 const GOAL_CONTINUATION_DAEMON_RESTART_INTERRUPTED: &str = "daemon_restart_interrupted";

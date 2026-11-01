@@ -223,7 +223,7 @@ function rustStruct(name, definition) {
     }
     return [...attributes, `    pub ${field}: ${type},`].join('\n');
   });
-  const derives = ['Clone', 'Debug', 'PartialEq', 'Serialize', 'Deserialize'];
+  const derives = definition['x-rust-sensitive'] ? ['Clone', 'PartialEq', 'Serialize', 'Deserialize'] : ['Clone', 'Debug', 'PartialEq', 'Serialize', 'Deserialize'];
   if (definition['x-rust-derive-default']) derives.push('Default');
   if (definition['x-rust-derive-eq']) derives.push('Eq');
   const declaration = fields.length

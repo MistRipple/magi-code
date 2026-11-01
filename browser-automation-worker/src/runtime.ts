@@ -1361,7 +1361,7 @@ export class BrowserAutomationRuntime {
         return { hovered: true, target };
       }
       case "click_guarded": {
-        // 配置 Agent 使用：与普通点击相同的原生输入链，但拒绝点击会提交受保护资源（如生成密钥）的表单按钮。
+        // 主对话配置流程使用：与普通点击相同的原生输入链，但拒绝点击会提交受保护资源（如生成密钥）的表单按钮。
         const words = Array.isArray(args.forbid_submit_in)
           ? args.forbid_submit_in.filter((word): word is string => typeof word === "string" && word.length > 0).slice(0, 16)
           : [];

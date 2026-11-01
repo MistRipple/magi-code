@@ -178,21 +178,15 @@ WebConversationBinding {
 - 在同一会话里选择本地模型，即时生效：清除会话里的 Web `engineId`，释放槽位并关闭页面，下一轮由本地 client 读取 canonical 历史继续。之后该会话不能再选回 Web（W3）。
 - 这是用户显式结束 Web 绑定的操作，语义等同于释放槽位；不能因为右栏隐藏、切换项目或普通 UI 重绘而触发。
 
-### 4.7 Magi 的 AI 配置 Agent
+### 4.7 主对话中的 GPT Web 配置
 
-目标是让 Magi 使用用户配置的原生工具模型，根据真实页面自主完成 GPT Web 配置。页面路径、控件选择、操作顺序、等待和异常恢复由 AI 决定；daemon 只拥有插件授权、页面维护占用、凭据存储、通道健康与持久检查点。配置细节、验收边界见 [AI 配置改造目标与验证](web-model-setup-agent.md)。
+配置入口复用当前主对话的普通 Task、模型与权限。插件激活后动态贡献配置 Skill 和领域工具，按需加载说明；已有 Skill 限制持续有效。输入区不重写自然语言，没有独立配置 Agent、第二份模型历史或单独推理强度。
 
-入口只在 GPT Web 插件已安装、启用、授权、激活且贡献 `setup` 命令时存在（daemon 以 `web_model_setup_available` 为唯一准入事实）。主对话短请求、插件命令、设置中的“检查并配置连接器”都进入同一个普通 Turn/canonical 命令，动作只有开始、继续和取消。配置需要可用的 Magi 原生工具模型；不能用待配置的 GPT Web 控制自己，模型调用失败不切换模型。未安装插件不拦截输入、不自动跳转插件管理；daemon 在命令接纳、执行、读取状态与保存凭据时独立校验。
+配置 scope 将既有 Browser 工具绑定到应用级目标；daemon 拥有插件准入、维护预约、持久检查点、安全凭据与通道证据。登录、验证码和密钥生成交还用户，关闭当前页面控制后结束阶段响应。用户可以继续讨论，明确继续时才重新观察并取得控制；停手和 UI 轮询都不能触发自动接管。
 
-Agent 读取同一应用级 guest 的快照与正文，调用目录中的导航、点击、输入、选择、悬浮、滚动和等待原语。所有写入沿 Authority lease → Desktop Control → Worker → Main CDP → guest 原生输入链执行。模型不能传脚本、选择器或其他 Tab 身份。页面导航或节点失效后重新观察；只有观察的交接错误能有界重试，未知写入结果先回读而不重放。固定配置脚本、专用写命令、兼容解码及旧执行分支全部移除；配置只使用 AI 工具循环与通用浏览器原语。
+安全保存绑定运行、revision、交接与请求身份。凭据私有版本引用支持断线回执核对；保存成功与继续接纳分别报告。保存并继续沿持久 Session Input 由 daemon 等待通道并幂等推进，暂停、取消、停用与重启均撤销旧自动继续资格。
 
-AI 自行核对登录、查找或创建专用 Tunnel、准备密钥表单、检查和复用/创建连接器。只有持久事实发生变化才提交检查点；daemon 不按固定站点步骤导航。Tunnel ID 必须来自当前平台页面；完成连接器前必须在本次真实页面核对与当前 Tunnel 的对应关系，并确认本次连接/刷新和工具可用；daemon 还要求本次运行内观察到 ChatGPT 经槽位端点读取了工具目录。Tunnel 和密钥表单的检查点必须带页面当前显示的组织和项目。通道健康由 daemon 判定，不能由模型或 UI 猜测。
-
-登录、验证码、密钥生成/复制/保存及组织或项目歧义交还用户；卡片展示 AI 对当前页面的具体指引。密钥只通过可信 Desktop 安全表单进入原私有存储，不通过聊天、Turn、插件命令或模型上下文。快照、工具结果和展示文案对凭据脱敏。人工交接保留当前页面和表单，继续时先观察；重启仅恢复维护占用和检查点，不自动重放操作。
-
-同名连接器优先核对身份后复用；不自动删除或撤销现有资源。用户接管页面时 daemon 立即停止本次运行并隐藏光标，继续配置才交还控制，继续前先重新快照。配置不抢占已有网页对话，关闭右栏只隐藏 guest。停止配置、删除拥有者会话或停用插件释放维护占用，已保存 Tunnel/密钥保留。
-
-定向验证：`cargo test -p magi-api web_model_setup`、`npm --prefix web run test:web-model`、Worker 的 `runtime.test.ts` / `web-model-site.test.ts`。受控 Electron 验收只能证明本机工具链和安全交接；真实账号的 AI 规划与工具往返必须另行实测，不沿用旧脚本成功轮次。
+详细动作矩阵、完成证据与验收边界见 [主对话配置运行合同](web-model-setup-agent.md)、[产品方案](gpt-web-conversational-setup-product-plan.md)及[配置验收](gpt-web-setup-validation.md)。
 
 ---
 
@@ -331,7 +325,7 @@ ChatGPT 连接器需要一个从 OpenAI 云端可达的入口。可用形态（�
 | stdio 中继 | Magi 自己 | daemon 可执行文件的 `mcp-relay` 子命令，随 daemon 分发 |
 | 槽位端点、profile 目录、runtime 别名 | Magi 生成 | 自动生成，用户不可见 |
 | 工具权限档 | Magi 设置 | 设置里选择（没有 `exec`）；槽位端点不接收令牌 |
-| ChatGPT 侧的 MCP 应用（连接 = 隧道） | AI 配置 Agent | 根据实时页面自主检查、创建或复用；核对 Tunnel 归属，回读本次连接/刷新和工具状态；不执行固定页面脚本 |
+| ChatGPT 侧的 MCP 应用（连接 = 隧道） | AI 主助手的 GPT Web 配置任务 | 根据实时页面自主检查、创建或复用；核对 Tunnel 归属，回读本次连接/刷新和工具状态；不执行固定页面脚本 |
 | Developer mode / 工作区与 Tunnel 的关联 | ChatGPT 与 OpenAI 平台的账号 / 工作区策略 | Magi 不能也不应代改；创建失败或看不到入口时显示具体原因与去哪里处理 |
 
 现有 Magi 的“远程访问”Cloudflare 通道面向 Magi Web / 手机访问，不能直接作为连接器地址；其 sidecar 托管与监控可复用，但不得复用用户会话路由、访问令牌，也不得把 `/api/*` 暴露给 ChatGPT。
@@ -369,7 +363,7 @@ ChatGPT 连接器需要一个从 OpenAI 云端可达的入口。可用形态（�
 | BrowserAuthority | App owner 会话、不被孤儿回收、不参与 `browser_*` 工具、资源回收排除 | `crates/magi-browser-authority`、`crates/magi-api/src/routes/browser.rs`、`state.rs` |
 | 推理通道 | 槽位、存活判定、发送与接收、取消、错误映射；实现 `ModelBridgeClient`（仅流式 + 可取消，非流式 `invoke` 显式报错） | `crates/magi-web-model`（精简后的 `client.rs`） |
 | 宿主驱动 | 把推理通道的页面驱动契约映射为桌面控制命令，唯一入口 | `crates/magi-api/src/web_model_driver.rs` |
-| 工具（连接器与通道联动） | AI 配置、槽位身份和通道生命周期；MCP 的权限与审批沿既有服务 | `crates/magi-api/src/{web_model_setup,web_model_setup_agent,web_model_channel,web_model_ops,web_slot_mcp}.rs` |
+| 工具（连接器与通道联动） | AI 配置、槽位身份和通道生命周期；MCP 的权限与审批沿既有服务 | `crates/magi-api/src/{web_model_setup,web_model_setup_tools,web_model_setup_policy,web_model_channel,web_model_ops,web_slot_mcp}.rs` |
 | 会话与设置 | 引擎类型固定、单向转换校验、子代理不继承 Web | `crates/magi-conversation-runtime/src/model_config.rs`、`crates/magi-api/src/routes/settings.rs` |
 | 前端 | 右栏第三项 GPT Web（单宿主）、模型选择器、失效与占用提示、停止并释放 | `web/src/web/RightPane.svelte`、`stores/right-pane.svelte.ts`、`components/tabs/WebModelTabContent.svelte`、`components/InputArea.svelte` |
 
@@ -423,7 +417,7 @@ ChatGPT 连接器需要一个从 OpenAI 云端可达的入口。可用形态（�
 - 诊断：登录/站点/通道错误可见；额度按发送条数展示，不折算 token。
 
 ### 当前交付状态（与源码核对）
-已实现并有自动化覆盖：单槽位（占用即拒绝、结束 / 释放钩子）、临时 / 已保存模式、只发送本轮原文与图片、图片上传 / 取消 / 失败撤销与私有暂存文件清理、原生选择卡片映射与多阶段作答、窄面板换行与局部滚动、存活判定与 `web_context_lost`、取消、登录过期 / 站点被拦等错误上报到引擎可用性投影、已保存对话的绑定（单向导入）/ 发送前尾部同步 / 同步指针前移、停止 / 释放（切本地、会话删除、清除数据）、重启后自动恢复探测、选择器固定入口与对话方式 / 历史选择、设置分区（登录与可用性、占用与停止、OpenAI Tunnel 与权限档、连接器配置入口（进入 AI 配置 Agent）、清除数据）、槽位端点网关（内置 + 下游 MCP + Skill，审批、规范工具条目）。
+已实现并有自动化覆盖：单槽位（占用即拒绝、结束 / 释放钩子）、临时 / 已保存模式、只发送本轮原文与图片、图片上传 / 取消 / 失败撤销与私有暂存文件清理、原生选择卡片映射与多阶段作答、窄面板换行与局部滚动、存活判定与 `web_context_lost`、取消、登录过期 / 站点被拦等错误上报到引擎可用性投影、已保存对话的绑定（单向导入）/ 发送前尾部同步 / 同步指针前移、停止 / 释放（切本地、会话删除、清除数据）、重启后自动恢复探测、选择器固定入口与对话方式 / 历史选择、设置分区（登录与可用性、占用与停止、OpenAI Tunnel 与权限档、连接器配置入口（进入 AI 主助手的 GPT Web 配置任务）、清除数据）、槽位端点网关（内置 + 下游 MCP + Skill，审批、规范工具条目）。
 
 真实环境验收必须按构建单独记录：上游原生卡片生成与作答、登录方式与跨重启保持、风控、页面失效 / 取消恢复、已保存历史列表与分支 / 账号切换、OpenAI Tunnel 连接器握手与挂起上限。受控卡片页面只能证明桥接，不代表真实账号能生成卡片。端到端入口依赖打包产物，前置条件及场景开关见[验证入口](validation.md)。
 
@@ -440,7 +434,7 @@ ChatGPT 连接器需要一个从 OpenAI 云端可达的入口。可用形态（�
 | 风险 / 待定 | 影响 | 处理 |
 | --- | --- | --- |
 | **合规与账号风险** | 程序化驱动网页版可能违反使用条款，账号有被限制的风险 | 需要产品与法务在正式开放前给出结论；本文不替产品判断 |
-| 站点 DOM 改版 | 消息读取适配可能失效；配置入口或控件变化 | 聊天适配层显式报告；配置 Agent 重新观察和规划，不添加页面特例脚本 |
+| 站点 DOM 改版 | 消息读取适配可能失效；配置入口或控件变化 | 聊天适配层显式报告；主助手的 GPT Web 配置任务 重新观察和规划，不添加页面特例脚本 |
 | 额度与限流 | 每个用户消息、失败重试和多步工具任务都可能消耗账号消息条数 | 界面显示实际发送条数；工具结果必须在同一 `tools/call` / 同一回复内返回，不做下一条回填 |
 | 槽位派生归属（W9，`follow_web_slot`） | 别处同账号调用可能被误归到进行中的 turn | 审批不可绕过；写入类默认需要确认；记录为已知取舍（MCP 文档 §12） |
 | ChatGPT Connector / MCP 能力差异 | 自定义连接器可能不支持某些 Resource、Prompt 或长挂起行为 | 核心交付只依赖标准 `tools/list` / `tools/call`；真实通道验证，不用文本协议兜底 |

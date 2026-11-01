@@ -5,7 +5,8 @@
 //! 都不会把本地工具名与上游原生能力混在同一个命名空间内。
 
 use super::adapter::AdaptedResponse;
-use crate::llm_types::{LlmContentBlock, LlmMessageContent, LlmMessageParams, ToolChoice};
+use crate::llm_types::{LlmContentBlock, LlmMessageContent, ToolChoice};
+use crate::prompt_ir::PromptIr;
 use crate::types::ChatToolOrigin;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,7 +25,7 @@ impl ProviderToolNameCodec {
     /// 除当前轮的工具定义外，历史 tool_use 与指定 tool_choice 也会纳入映射，
     /// 使多轮请求中的工具名始终保持可逆。没有归属信息的旧历史记录被明确标为
     /// `unspecified`，而非把它们原样暴露给上游。
-    pub fn for_params(params: &LlmMessageParams) -> Self {
+    pub fn for_params(params: &PromptIr) -> Self {
         let mut identities = BTreeMap::new();
         for tool in params.tools.as_deref().unwrap_or_default() {
             register_identity(&mut identities, &tool.name, tool.origin);
@@ -80,7 +81,7 @@ impl ProviderToolNameCodec {
 
     /// 在请求离开 Magi 前统一编码。覆盖工具定义、工具选择及历史 assistant
     /// tool-call，确保同一轮和后续轮次使用同一套 wire 名称。
-    pub fn encode_request_params(&self, params: &mut LlmMessageParams) {
+    pub fn encode_request_params(&self, params: &mut PromptIr) {
         if let Some(tools) = params.tools.as_mut() {
             for tool in tools {
                 tool.name = self.encode_name(&tool.name);
@@ -252,10 +253,13 @@ mod tests {
         }
     }
 
-    fn params() -> LlmMessageParams {
-        LlmMessageParams {
+    fn params() -> PromptIr {
+        PromptIr {
+            prompt_cache_key: None,
+
             reasoning_capability: None,
             messages: vec![LlmMessage {
+                origin: Default::default(),
                 role: "assistant".to_string(),
                 content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolUse {
                     id: "call-1".to_string(),
@@ -273,7 +277,7 @@ mod tests {
                 tool("skill__review__inspect", ChatToolOrigin::Skill),
             ]),
             stream: Some(true),
-            system_prompt: None,
+
             tool_choice: Some(ToolChoice::Typed {
                 kind: "tool".to_string(),
                 name: Some("web_search".to_string()),

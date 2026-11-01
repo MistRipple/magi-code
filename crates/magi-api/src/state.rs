@@ -146,6 +146,11 @@ pub enum SessionProjectionPersistMode {
     },
 }
 
+/// 删除一个启动时无法加载的会话的持久化文件；由 daemon 的状态仓库实现。
+pub type UnavailableSessionDiscard = Arc<
+    dyn Fn(&SessionId) -> Result<magi_session_store::UnavailableSession, ApiError> + Send + Sync,
+>;
+
 pub type SessionProjectionPersist = Arc<
     dyn Fn(
             &SessionDurableState,
@@ -180,6 +185,8 @@ fn snapshot_baseline_patch(
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct QueuedRegularSessionTurn {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<crate::web_model_setup::SetupContinuation>,
     pub request: SessionTurnRequestDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_directories: Option<magi_core::ProjectDirectoryBinding>,
@@ -1448,6 +1455,7 @@ pub struct ApiState {
     canonical_event_next_sequence_provider: Option<CanonicalEventNextSequenceProvider>,
     session_state_checkpoint_persist: Option<SessionStateCheckpointPersist>,
     session_projection_persist: Option<SessionProjectionPersist>,
+    unavailable_session_discard: Option<UnavailableSessionDiscard>,
     workspace_history_restore: Option<WorkspaceHistoryRestore>,
     bridge_probe_snapshot_provider: BridgeProbeSnapshotProvider,
     bridge_preflight_snapshot_provider: BridgePreflightSnapshotProvider,
@@ -2109,14 +2117,30 @@ fn browser_authority_api_error(error: BrowserAuthorityError) -> ApiError {
 }
 
 impl ApiState {
+    /// 工具服务只捕获共享权威服务；切断 ToolRegistry/dispatcher 的反向引用。
+    pub fn web_model_setup_service_state(&self) -> Self {
+        let mut state = self.clone();
+        state.tool_registry = None;
+        state.execution_pipeline = None;
+        state.skill_dispatch_runtime = None;
+        state.session_turn_dispatcher = None;
+        state.runner_manager = None;
+        state.execution_resources = ExecutionResourceCoordinator::new(
+            state.browser_authority.clone(),
+            state.browser_write_lock.clone(),
+            state.browser_host_client.clone(),
+            state.event_bus.clone(),
+        );
+        state
+    }
     /// GPT Web 的原生宿主只能在第一方插件的应用实例激活后使用。
     /// 这是 daemon 侧的准入事实，UI 隐藏入口不能替代它。
     pub(crate) fn web_model_plugin_active(&self) -> bool {
         self.plugin_active(magi_web_model::WEB_MODEL_PLUGIN_ID)
     }
 
-    /// GPT Web 配置能力：插件已安装、启用、授权并激活，且清单贡献了 `setup` 命令。
-    /// 设置入口、配置 API 和配置 Agent 都以这一个事实为准。
+    /// GPT Web 配置能力：插件已安装、启用、授权并激活，且清单贡献了配置 Skill。
+    /// 设置入口、配置 API 和配置执行都以这一个事实为准。
     pub(crate) fn web_model_setup_available(&self) -> bool {
         if !self.web_model_plugin_active() {
             return false;
@@ -2128,9 +2152,9 @@ impl ApiState {
                     package
                         .manifest()
                         .contributions
-                        .commands
+                        .skills
                         .iter()
-                        .any(|command| command.id == "setup")
+                        .any(|skill| skill.id == "gpt-web-setup")
                 })
                 .unwrap_or(false)
         })
@@ -2293,6 +2317,12 @@ impl ApiState {
         }));
         let model_step_event_bus = Arc::clone(&event_bus);
         session_store.install_model_step_commit_observer(Arc::new(move |notice| {
+            magi_conversation_runtime::canonical_usage::publish_model_step_usage(
+                &model_step_event_bus,
+                &notice.session_id,
+                &notice.turn.turn_id,
+                &notice.step,
+            );
             let context = EventContext {
                 session_id: Some(notice.session_id.clone()),
                 workspace_id: notice.workspace_id.map(WorkspaceId::new),
@@ -2361,6 +2391,7 @@ impl ApiState {
             canonical_event_next_sequence_provider: None,
             session_state_checkpoint_persist: None,
             session_projection_persist: None,
+            unavailable_session_discard: None,
             workspace_history_restore: None,
             bridge_probe_snapshot_provider: BridgeProbeSnapshotProvider::default(),
             bridge_preflight_snapshot_provider: BridgePreflightSnapshotProvider::default(),
@@ -2722,6 +2753,10 @@ impl ApiState {
         manager: Arc<Mutex<magi_plugin_system::PluginManager>>,
     ) -> Self {
         self.plugin_manager = manager;
+        // Builder 的装配顺序不能让实时 Skill provider 永久捕获临时 manager。
+        if let Some(runtime) = self.skill_runtime.clone() {
+            self = self.with_skill_runtime(runtime);
+        }
         self
     }
 
@@ -4161,6 +4196,11 @@ impl ApiState {
         self
     }
 
+    pub fn with_unavailable_session_discard(mut self, discard: UnavailableSessionDiscard) -> Self {
+        self.unavailable_session_discard = Some(discard);
+        self
+    }
+
     pub fn with_workspace_history_restore(mut self, restore: WorkspaceHistoryRestore) -> Self {
         self.workspace_history_restore = Some(restore);
         self
@@ -5438,6 +5478,12 @@ impl ApiState {
         });
         inputs
             .into_iter()
+            .filter(|input| {
+                serde_json::from_value::<QueuedRegularSessionTurn>(input.payload.clone())
+                    .ok()
+                    .and_then(|turn| turn.readiness)
+                    .is_none_or(|readiness| self.setup_continuation_ready(&readiness))
+            })
             .map(|input| {
                 serde_json::from_value(input.payload).expect("validated queued input payload")
             })
@@ -5523,7 +5569,7 @@ impl ApiState {
     }
 
     pub(crate) fn queued_regular_session_turn_count(&self, session_id: &SessionId) -> usize {
-        self.session_store.pending_input_count(session_id)
+        self.queued_regular_session_turns(session_id).len()
     }
     pub(crate) fn queued_regular_session_ids(&self) -> Vec<SessionId> {
         self.session_store.pending_input_session_ids()
@@ -5705,6 +5751,33 @@ impl ApiState {
         Ok(())
     }
 
+    /// 删除一个启动时无法加载的会话。它没有进入会话状态，没有运行态、任务或锁需要回收，
+    /// 只需移除持久化文件与会话私有数据；调用方负责持有该会话的生命周期锁。
+    pub(crate) async fn discard_unavailable_session_after_lifecycle_lock(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<magi_session_store::UnavailableSession, ApiError> {
+        let discard = self.unavailable_session_discard.as_ref().ok_or_else(|| {
+            ApiError::internal_assembly("删除不可用会话失败", "daemon 未注入不可用会话清理入口")
+        })?;
+        let entry = discard(session_id)?;
+        self.session_store.forget_unavailable_session(session_id);
+        self.settings_store
+            .remove_session(session_id)
+            .map_err(crate::errors::settings_persistence_error)?;
+        // 无项目会话的私有执行目录：与正常删除同一规则，dirty/占用的 Git 资源保留成果。
+        if entry.workspace_id.is_none() && self.cleanup_session_git_resources(session_id).await {
+            let root = self.personal_session_execution_root_path(session_id);
+            let result = tokio::task::spawn_blocking(move || fs::remove_dir_all(root)).await;
+            if let Ok(Err(error)) = result
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(%session_id, %error, "删除不可用个人会话文件失败");
+            }
+        }
+        Ok(entry)
+    }
+
     fn replacement_session_for_delete(&self, session_id: &SessionId) -> Option<SessionId> {
         if self.session_store.current_session_id().as_ref() != Some(session_id) {
             return None;
@@ -5744,6 +5817,44 @@ impl ApiState {
         mut self,
         skill_runtime: Arc<magi_skill_runtime::SkillRuntime>,
     ) -> Self {
+        let manager = self.plugin_manager.clone();
+        skill_runtime
+            .registry()
+            .set_live_provider(Arc::new(move || {
+                let manifests = manager
+                    .lock()
+                    .ok()
+                    .and_then(|manager| {
+                        manager
+                            .manifests_for_scope(magi_plugin_system::APPLICATION_SCOPE)
+                            .ok()
+                    })
+                    .unwrap_or_default();
+                manifests
+                    .into_iter()
+                    .flat_map(|manifest| {
+                        let plugin_id = manifest.id;
+                        manifest.contributions.skills.into_iter().map(move |skill| {
+                            magi_skill_runtime::SkillDefinition {
+                                skill_id: magi_plugin_system::ContributionRef::new(
+                                    &plugin_id, skill.id,
+                                )
+                                .identity(),
+                                title: skill.title,
+                                instruction: skill.instruction,
+                                metadata: magi_skill_runtime::SkillMetadata {
+                                    category: "plugin".into(),
+                                    tags: vec![plugin_id.clone()],
+                                },
+                                restrict_standard_tools: false,
+                                allowed_tools: vec![],
+                                custom_tool_bindings: vec![],
+                                prompt_priority: 50,
+                            }
+                        })
+                    })
+                    .collect()
+            }));
         self.skill_runtime = Some(skill_runtime);
         self
     }
@@ -6384,6 +6495,7 @@ mod tests {
         accepted_at: u64,
     ) -> QueuedRegularSessionTurn {
         QueuedRegularSessionTurn {
+            readiness: None,
             project_directories: None,
             request: SessionTurnRequestDto {
                 source_folder_id: None,

@@ -1,4 +1,3 @@
-pub mod cache_boundary;
 mod clients;
 mod dispatch;
 mod executor_capabilities;
@@ -11,6 +10,7 @@ mod local_process_protocol;
 mod mcp_client;
 mod mcp_loopback;
 mod model_loopback;
+pub mod prompt_ir;
 pub mod protocol;
 pub mod reasoning;
 mod request_fingerprint;
@@ -68,7 +68,9 @@ pub use types::{
     McpManagerListServersResponse, McpManagerServerHealthUpdateRequest,
     McpManagerServerLifecycleState, McpManagerServerOperationResponse,
     McpManagerServerRegistrationRequest, McpManagerServerSelectionRequest, McpToolCallRequest,
-    ModelBridgeClient, ModelExecutionScope, ModelInvocationRequest, ModelProviderContext,
-    ModelResponse, ModelResponseStatus, ModelRetryRuntimeEvent, ModelRetryRuntimePhase,
-    ModelStreamingDelta, model_invocation_cancelled_error, model_invocation_error_is_cancelled,
+    ModelBridgeClient, ModelCacheIdentity, ModelExecutionScope, ModelInvocationOptions,
+    ModelInvocationRequest, ModelProviderContext, ModelResponse, ModelResponseStatus,
+    ModelRetryRuntimeEvent, ModelRetryRuntimePhase, ModelStreamingDelta, ModelTransportEvent,
+    ModelTransportObserver, ModelTransportRecorder, canonical_tool_surface,
+    model_invocation_cancelled_error, model_invocation_error_is_cancelled,
 };

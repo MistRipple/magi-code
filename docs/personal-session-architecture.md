@@ -1,4 +1,4 @@
-# 无项目会话与最近对话
+# 无项目会话与对话列表
 
 `magi-daemon` 拥有所有会话、任务、权限、文件执行目录和持久事实。会话从创建起属于 `personal` 或明确的项目；`workspaceId = None` 是合法的个人归属，不允许借用活动项目、最近项目或第一项项目。UI 导航和任务接纳都服从这一事实。已有会话不通过项目选择器改绑，历史 Turn、审批和文件证据保持原归属；项目选择只作用于新草稿。
 
@@ -24,9 +24,9 @@ GPT Web 槽位通过 daemon 的当前 owner session + active turn 解析执行�
 
 页面预览携带来源会话，不借用侧栏或当前 Tab 的项目。个人会话文件可以在文件树中打开、预览和下载，生成图片同样按来源会话加载。HTML 与相对 CSS/JS 共用文件作用域解析，在 `site.localhost` 隔离来源执行；资源凭据绑定来源会话，删除后不可继续读取。项目会话预览使用其隔离副本，项目文件树与变更审阅仍使用原合同。重连和重启恢复会话与文件引用，不重新执行工具。删除会话先停止执行并持久提交删除，再安全回收会话管理的干净 worktree、Git 基线和私有执行目录，不清理外部仓库或其他会话目录；无法安全回收的 dirty/占用 worktree 保留目录与上下文，禁止强制丢弃成果。
 
-## 最近列表
+## 对话列表
 
-“最近对话”是 daemon 个人目录与已加载项目目录的活动时间排序视图；项目分组与最近列表引用同一个 sessionId 和投影，不新增归属、会话副本或第二份持久列表。项目行显示项目名称，导航、重命名、删除使用该行真实归属。全局新建进入无项目草稿，项目分组的新增入口明确创建项目草稿；输入框显示“未关联项目”，不再显示伪项目“Magi 空间”。
+侧栏“对话”区只列无项目会话，来自 daemon 个人目录，按活动时间排序；项目会话只出现在所属项目分组，不在对话区重复出现，同一个 sessionId 不会同时占两行。导航、重命名、删除使用该行真实归属。全局新建进入无项目草稿，项目分组的新增入口明确创建项目草稿；输入框显示“未关联项目”，不再显示伪项目“Magi 空间”。
 
 ## 历史与兼容
 
@@ -34,7 +34,7 @@ GPT Web 槽位通过 daemon 的当前 owner session + active turn 解析执行�
 
 ## 验证
 
-`npm --prefix web run test:personal-session` 验证目录选择、最近排序与预览来源；Rust 的 `personal_files_keep_session_boundary_and_do_not_require_project_snapshot` 与 `personal_site_preview_keeps_assets_in_the_owning_session_and_expires_on_delete` 验证路径、错绑和删除边界。`npm run test:personal-session-live` 使用独立状态根、真实 daemon/App Server/Chromium 和本地 Provider，验证个人与项目任务、文件/Shell/执行步骤、图片生成、HTML/CSS/JS 真实渲染与来源隔离、最近导航、全局新建、预览下载、重启刷新不重放和删除隔离，不连接用户模型服务。
+`npm --prefix web run test:personal-session` 验证目录选择、无项目对话排序与预览来源；Rust 的 `personal_files_keep_session_boundary_and_do_not_require_project_snapshot` 与 `personal_site_preview_keeps_assets_in_the_owning_session_and_expires_on_delete` 验证路径、错绑和删除边界。`npm run test:personal-session-live` 使用独立状态根、真实 daemon/App Server/Chromium 和本地 Provider，验证个人与项目任务、文件/Shell/执行步骤、图片生成、HTML/CSS/JS 真实渲染与来源隔离、项目与对话区导航、全局新建、预览下载、重启刷新不重放和删除隔离，不连接用户模型服务。
 
 2026-10-25 验收：上述真实链路已通过，另通过 Web 类型检查与构建、会话导航/输入框/右栏/文件引用定向回归、`magi-conversation-runtime` 与 `magi-tool-runtime` 库测试、API 个人会话/文件/网页预览定向测试、daemon 编译检查、协议与 Browser 工具目录一致性检查、Browser core 验收。新增回归覆盖删除持久化失败保留成果、转交个人代理不依赖 Git 注册表。工具库保留一项已有 ignored 测试。该验收使用本地模型替身，没有调用外部真实模型，也不等于安装包发布或完整 Desktop guest 验收。
 

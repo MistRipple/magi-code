@@ -77,7 +77,7 @@
   import { dispatchWebModelAction } from '../web/web-model-actions';
   import WebModelSetupPanel from './WebModelSetupPanel.svelte';
   import type { WebModelSetupStatus } from '../shared/app-server-protocol.generated';
-  import { WEB_MODEL_SETUP_COMMAND, WEB_MODEL_SETUP_REQUEST, setupIsActive, webModelSetupAvailable, isWebModelSetupRequest, type SetupAction } from '../web/web-model-setup';
+  import { WEB_MODEL_SETUP_REQUEST, webModelSetupAvailable, containsSetupSecret, controlWebModelSetup, type SetupAction } from '../web/web-model-setup';
   import { loadedPluginProjection } from '../stores/plugin-registry.svelte';
   import { openSettings, closeSettings } from '../stores/shell-ui.svelte';
   import { createAppBrowserSession } from '../web/agent-api';
@@ -227,8 +227,6 @@
   let setupSubmitting = $state(false);
   let setupRequestId = $state<string | null>(null);
   const setupAvailable = $derived(webModelSetupAvailable(pluginProjection(APPLICATION_PLUGIN_SCOPE)));
-  const setupActive = $derived(setupAvailable && setupIsActive(setupStatus));
-  const setupInputRequest = $derived(isWebModelSetupRequest(inputValue, setupAvailable));
 
   /**
    * 配置时右栏必须展开并切到 GPT Web 标签，用户才看得到 Agent 在操作什么。
@@ -247,6 +245,14 @@
   }
 
   async function submitWebSetup(action: SetupAction): Promise<boolean> {
+    if ((action === 'cancel' || action === 'pause') && setupStatus?.setupRunId && setupStatus.revision !== undefined && setupStatus.executionGeneration !== undefined) {
+      try {
+        const response = await controlWebModelSetup({ sessionId: setupStatus.sessionId, setupRunId: setupStatus.setupRunId,
+          expectedRevision: setupStatus.revision, executionGeneration: setupStatus.executionGeneration, action });
+        if (currentSessionId === response.configuration.sessionId) setupStatus = response.configuration;
+        return true;
+      } catch { addToast('error', i18n.t('webModel.setup.failed')); return false; }
+    }
     if (setupSubmitting || setupRequestId || isSending || sessionInputLocked || isInteractionBlocking) return false;
     const origin = `${currentWorkspaceId || ''}|${currentWorkspacePath || ''}|${currentSessionId || ''}`;
     setupSubmitting = true;
@@ -267,9 +273,9 @@
       if (currentSessionId?.trim() !== sessionId) return false;
       setupRequestId = generateId();
       void revealSetupWebModelTab();
-      vscode.postMessage({ type: 'executeTask', text: action, requestId: setupRequestId,
+      vscode.postMessage({ type: 'executeTask', text: i18n.t(`webModel.setup.request.${action}`), requestId: setupRequestId,
         sessionId, workspaceId: target?.workspaceId || '', workspacePath: target ? workspaceNavigationPath(target) : '',
-        pluginCommandId: WEB_MODEL_SETUP_COMMAND, accessProfile: selectedAccessProfile,
+        skillName: selectedSkill?.skillId ?? 'plugin/openai.chatgpt-web/gpt-web-setup', accessProfile: selectedAccessProfile,
       });
       return true;
     } catch (error) {
@@ -278,6 +284,14 @@
       return false;
     } finally { setupSubmitting = false; }
   }
+  const revealedSetupRuns = new Set<string>();
+  $effect(() => {
+    const run = setupStatus?.setupRunId;
+    if (setupAvailable && setupStatus?.runState === 'running' && run && !revealedSetupRuns.has(run)) {
+      revealedSetupRuns.add(run);
+      void revealSetupWebModelTab();
+    }
+  });
   onMount(() => {
     const start = () => { if (setupAvailable) void submitWebSetup('start'); };
     window.addEventListener(WEB_MODEL_SETUP_REQUEST, start);
@@ -662,7 +676,7 @@
     const previousScopeKey = composerReferenceScopeKey;
     // 编辑暂时借用输入区，原草稿已在进入编辑时保存；导航不能用编辑内容覆盖它。
     if (!loadedEditingTurnId) {
-      if (composerHasDraft()) {
+      if (composerHasDraft() && !containsSetupSecret(resolveComposerRawContent())) {
         scopedComposerDrafts.set(previousScopeKey, captureComposerSubmissionDraft(resolveComposerRawContent()));
       } else {
         scopedComposerDrafts.delete(previousScopeKey);
@@ -752,7 +766,7 @@
     if (isSending) {
       return i18n.t('input.followUp.queueTitle');
     }
-    if (!mainModelReady && !setupInputRequest && !setupActive && !(setupAvailable && selectedPluginCommand?.pluginCommandId === WEB_MODEL_SETUP_COMMAND)) {
+    if (!mainModelReady) {
       return i18n.t('input.mainModelRequired');
     }
     return i18n.t('input.send');
@@ -762,8 +776,8 @@
   let webInfoStatus = $state<WebSessionBanner | null>(null);
   // 首条消息确认 sessionId 前不能追加提交，否则会被识别成另一条新会话请求。
   const sendDisabled = $derived.by(() => (
-    sessionInputLocked || (!editingQueuedMessage && isInteractionBlocking) || sendPreparing || Boolean(setupRequestId) || pendingImageReadCount > 0 || (!editingQueuedMessage && !mainModelReady && !(setupAvailable && selectedPluginCommand?.pluginCommandId === WEB_MODEL_SETUP_COMMAND) && !setupActive && !setupInputRequest)
-    || (isDraftSession && isSending) || (!editingQueuedMessage && webSendBlocked && !setupActive && !setupInputRequest)
+    sessionInputLocked || (!editingQueuedMessage && isInteractionBlocking) || sendPreparing || Boolean(setupRequestId) || pendingImageReadCount > 0 || (!editingQueuedMessage && !mainModelReady)
+    || (isDraftSession && isSending) || (!editingQueuedMessage && webSendBlocked)
   ));
 
   // 按钮双态状态 - 使用 $derived 计算
@@ -1111,7 +1125,7 @@
     selectComposerSourceFolder(currentWorkspaceId || '', currentSessionId, draft.sourceFolderId || '');
     queueEditConflict = '';
     if (draft.accessProfile) selectedAccessProfile = draft.accessProfile;
-    inputValue = draft.text;
+    inputValue = containsSetupSecret(draft.text) ? '' : draft.text;
     pendingCaretOffset = draft.text.length;
     selectedImages = draft.images.map((image) => ({ ...image }));
     selectedContextReferences = draft.contextReferences.map((reference) => ({ ...reference }));
@@ -1166,7 +1180,7 @@
     if (draft.turnId === loadedEditingTurnId) return;
     const scopeKey = currentComposerReferenceScopeKey();
     if (!loadedEditingTurnId) {
-      if (composerHasDraft()) {
+      if (composerHasDraft() && !containsSetupSecret(resolveComposerRawContent())) {
         scopedComposerDrafts.set(scopeKey, captureComposerSubmissionDraft(resolveComposerRawContent()));
       } else {
         scopedComposerDrafts.delete(scopeKey);
@@ -1177,7 +1191,7 @@
     invalidateEnhanceState();
     editingQueuedMessage = null;
     queueEditConflict = '';
-    inputValue = draft.text;
+    inputValue = containsSetupSecret(draft.text) ? '' : draft.text;
     pendingCaretOffset = draft.text.length;
     selectedImages = draft.images.map((image) => ({
       id: generateId(),
@@ -2233,39 +2247,10 @@
       await waitForPendingImageReads();
       const rawContent = resolveComposerRawContent();
       const normalizedContent = rawContent.trim();
+      if (containsSetupSecret(rawContent)) { addToast('warning', i18n.t('webModel.setup.secretHint')); return; }
       if (editingQueuedMessage) { await saveQueuedMessage(rawContent); return; }
-      if (!editingTurn && !selectedSessionCommand && !selectedWorkflow && !selectedSkill && !selectedPluginCommand && !selectedGoalMode && isWebModelSetupRequest(normalizedContent, setupAvailable)) {
-        if (attachmentTotal > 0) { addToast('warning', i18n.t('webModel.setup.noAttachments')); return; }
-        if (await submitWebSetup('start')) inputValue = '';
-        return;
-      }
-      // 配置正在等待用户时，短回复作为明确的配置控制输入；不交给 GPT Web 回发。
-      if (setupActive) {
-        if (/\bsk[-_][A-Za-z0-9_-]{8,}/u.test(normalizedContent)) {
-          addToast('warning', i18n.t('webModel.setup.secretHint'));
-          return;
-        }
-        const action: SetupAction | null = /^(?:继续|好了|已完成|完成了|continue|done)$/iu.test(normalizedContent)
-          ? 'continue' : /^(?:取消配置|结束配置|cancel)$/iu.test(normalizedContent) ? 'cancel' : null;
-        if (action && attachmentTotal === 0) { if (await submitWebSetup(action)) inputValue = ''; return; }
-        if (!mainModelReady) {
-          addToast('info', i18n.t('webModel.setup.commandHint'));
-          return;
-        }
-      }
+      // 配置期间普通问题、补充方案和暂停说明都进入主对话；只有面板明确操作才提交控制动作。
 
-      if (selectedPluginCommand?.pluginCommandId === WEB_MODEL_SETUP_COMMAND) {
-        if (attachmentTotal > 0) { addToast('warning', i18n.t('webModel.setup.noAttachments')); return; }
-        if (normalizedContent && !/^(?:开始|start|继续|continue|取消配置|cancel)$/iu.test(normalizedContent)) {
-          addToast('warning', i18n.t('webModel.setup.commandHint')); return;
-        }
-        if (await submitWebSetup(/^(?:取消配置|cancel)$/iu.test(normalizedContent) ? 'cancel'
-          : /^(?:继续|continue)$/iu.test(normalizedContent) ? 'continue' : 'start')) {
-          selectedPluginCommand = null;
-          inputValue = '';
-        }
-        return;
-      }
 
       if (
         (!normalizedContent && selectedSessionCommand === null && selectedWorkflow === null && selectedPluginCommand === null && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0 && selectedBrowserNodeSelections.length === 0 && selectedPluginSelections.length === 0)
@@ -3369,7 +3354,7 @@
     </div>
   {/if}
   <GoalRunDrawers bind:count={drawersCount} />
-  <WebModelSetupPanel sessionId={currentSessionId?.trim() || ''} busy={isSending || setupSubmitting || Boolean(setupRequestId)} bind:status={setupStatus} onaction={async action => { await submitWebSetup(action); }} />
+  <WebModelSetupPanel sessionId={currentSessionId?.trim() || ''} busy={setupSubmitting || Boolean(setupRequestId)} bind:status={setupStatus} onaction={async action => { await submitWebSetup(action); }} />
   <WebModelSessionBanner
     usesWeb={currentSessionUsesWebEngine}
     sessionId={currentSessionId?.trim() || ''}

@@ -1,3 +1,4 @@
+use crate::prompt_ir::PromptIr;
 use serde_json::{Value, json};
 
 use super::adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderFamily};
@@ -6,8 +7,7 @@ use super::utils::{
     convert_messages_to_anthropic, parse_anthropic_usage, reasoning_effort_label,
     serialize_anthropic_tool_definitions,
 };
-use crate::cache_boundary::split_at_cache_boundary;
-use crate::llm_types::{LlmMessageParams, ToolCall, ToolChoice};
+use crate::llm_types::{ToolCall, ToolChoice};
 use magi_usage_authority::ReasoningEffort;
 
 /// Anthropic Extended Thinking 默认预算（tokens）。
@@ -41,38 +41,66 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         ProviderFamily::Anthropic
     }
 
-    fn build_request(
-        &self,
-        params: &LlmMessageParams,
-        model: &str,
-    ) -> Result<AdaptedRequest, String> {
-        // Anthropic 没有独立的 developer role。Magi 的 developer 前缀在这里
-        // 收敛到 Anthropic system 字段，避免把受信任的运行时约束降级成普通 user。
-        let (system_messages, non_system): (Vec<_>, Vec<_>) = params
+    fn build_request(&self, params: &PromptIr, model: &str) -> Result<AdaptedRequest, String> {
+        // Anthropic 没有独立的 developer role，system 字段又排在整段 messages 之前。
+        // 因此只有开头那一段 system/developer 消息收敛进 system；对话开始之后出现的
+        // （例如易变尾部里的执行步骤快照）留在原位置按 user 发送，片段自带的信任标记
+        // 仍写在正文里。把它们并进 system 会让每轮变化的内容挡在全部历史前面。
+        let conversation_starts_at = params
             .messages
             .iter()
-            .partition(|m| matches!(m.role.as_str(), "system" | "developer"));
-
+            .position(|message| {
+                !matches!(message.role.as_str(), "system" | "developer")
+                    || message.origin == crate::ChatMessageOrigin::RoundContext
+            })
+            .unwrap_or(params.messages.len());
         let mut system_parts = Vec::new();
-        if let Some(system_prompt) = params
-            .system_prompt
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            system_parts.push(system_prompt);
+        let mut static_parts = Vec::new();
+        let mut static_prefix_open = true;
+        for message in &params.messages[..conversation_starts_at] {
+            if let crate::llm_types::LlmMessageContent::Text(text) = &message.content {
+                if static_prefix_open
+                    && matches!(
+                        message.origin,
+                        crate::ChatMessageOrigin::StaticPolicy | crate::ChatMessageOrigin::Skill
+                    )
+                {
+                    static_parts.push(text.as_str());
+                } else {
+                    static_prefix_open = false;
+                    system_parts.push(text.as_str());
+                }
+            }
         }
-        system_parts.extend(
-            system_messages
-                .iter()
-                .filter_map(|message| match &message.content {
-                    crate::llm_types::LlmMessageContent::Text(text) => Some(text.as_str()),
-                    _ => None,
-                }),
-        );
+        let map_role = |message: &crate::llm_types::LlmMessage| {
+            let mut message = message.clone();
+            if matches!(message.role.as_str(), "system" | "developer") {
+                message.role = "user".into();
+            }
+            message
+        };
+        // 历史与尾部分别渲染。协议可能合并消息或展开图片，不能用原消息条数
+        // 对已经转换的数组做减法，否则断点可能落进易变尾部。
+        let history_end = params.history_end().max(conversation_starts_at);
+        let history = params.messages[conversation_starts_at..history_end]
+            .iter()
+            .map(map_role)
+            .collect::<Vec<_>>();
+        let tail = params.messages[history_end..]
+            .iter()
+            .map(map_role)
+            .collect::<Vec<_>>();
+        let mut messages = convert_messages_to_anthropic(&history);
+        if let Some(message) = messages
+            .iter_mut()
+            .rev()
+            .find(|message| message["role"] == "user")
+        {
+            mark_cache_breakpoint(message);
+        }
+        messages.extend(convert_messages_to_anthropic(&tail));
+        let static_text = static_parts.join("\n");
         let system_text = system_parts.join("\n");
-
-        let non_system_owned: Vec<_> = non_system.into_iter().cloned().collect();
-        let messages = convert_messages_to_anthropic(&non_system_owned);
 
         // thinking / beta header / temperature 全部由能力表驱动；
         // 不再保留"配置覆盖能力"的 OR 语义——未知 / 不支持 thinking 的模型
@@ -136,8 +164,8 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
             "max_tokens": max_tokens,
         });
 
-        if !system_text.is_empty() {
-            body["system"] = build_system_field(&system_text);
+        if !static_text.is_empty() || !system_text.is_empty() {
+            body["system"] = build_system_field(&static_text, &system_text);
         }
 
         if let Some(thinking) = thinking_value {
@@ -159,7 +187,11 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         if let Some(ref tools) = params.tools
             && !tools.is_empty()
         {
-            body["tools"] = json!(serialize_anthropic_tool_definitions(tools));
+            let mut definitions = serialize_anthropic_tool_definitions(tools);
+            if let Some(last) = definitions.last_mut() {
+                last["cache_control"] = json!({"type": "ephemeral"});
+            }
+            body["tools"] = json!(definitions);
             if let Some(ref tc) = params.tool_choice {
                 body["tool_choice"] = translate_tool_choice_for_anthropic(tc);
             }
@@ -350,55 +382,54 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// 根据 system_text 中是否含 [`PROMPT_CACHE_BOUNDARY`] 标记，决定 `system`
-/// 字段的形态：
-///
-/// - 含标记：切成 `[static_prefix, dynamic_suffix]` 两段 content blocks，
-///   静态前缀打 `cache_control: {type: ephemeral}`，命中后输入计费按 1/10。
-/// - 不含标记 / 任一段为空：回退到原有单 string 形态，保持向后兼容
-///   （没有提示词侧 boundary 的旧调用方不受影响）。
-///
-/// [`PROMPT_CACHE_BOUNDARY`]: crate::cache_boundary::PROMPT_CACHE_BOUNDARY
-fn build_system_field(system_text: &str) -> Value {
-    let Some((static_part, dynamic_part)) = split_at_cache_boundary(system_text) else {
-        return json!(system_text);
-    };
-    let static_trimmed = static_part.trim();
-    let dynamic_trimmed = dynamic_part.trim();
-    // 任一段为空意味着 boundary 出现在最前或最后——退化场景，不值得
-    // 引入 cache breakpoint，回退到去掉标记后的单 string。
-    if static_trimmed.is_empty() || dynamic_trimmed.is_empty() {
-        let cleaned = system_text.replace(crate::cache_boundary::PROMPT_CACHE_BOUNDARY, "");
-        return json!(cleaned);
+/// 只根据可信 IR 层级放置静态断点，正文中的标记字符串没有控制语义。
+fn build_system_field(static_text: &str, session_text: &str) -> Value {
+    if static_text.is_empty() {
+        return json!(session_text);
     }
-    json!([
-        {
-            "type": "text",
-            "text": static_trimmed,
-            "cache_control": {"type": "ephemeral"}
-        },
-        {
-            "type": "text",
-            "text": dynamic_trimmed
-        }
-    ])
+    let mut blocks = vec![json!({
+        "type": "text", "text": static_text, "cache_control": {"type": "ephemeral"}
+    })];
+    if !session_text.is_empty() {
+        blocks.push(json!({"type": "text", "text": session_text}));
+    }
+    json!(blocks)
+}
+
+/// 给 user 消息的末个受支持内容块打 `ephemeral` 断点；字符串内容先转成等价 text block。
+/// 不碰 assistant 的 thinking/signature，也不改变 `tool_result` 结构。
+fn mark_cache_breakpoint(message: &mut Value) {
+    if let Some(text) = message["content"].as_str().filter(|text| !text.is_empty()) {
+        message["content"] = json!([{"type": "text", "text": text}]);
+    }
+    if let Some(block) = message["content"]
+        .as_array_mut()
+        .and_then(|blocks| blocks.last_mut())
+        && matches!(
+            block["type"].as_str(),
+            Some("text" | "image" | "tool_result")
+        )
+    {
+        block["cache_control"] = json!({"type": "ephemeral"});
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache_boundary::PROMPT_CACHE_BOUNDARY;
-    use crate::llm_types::{LlmMessage, LlmMessageContent, LlmMessageParams};
+    use crate::llm_types::{LlmMessage, LlmMessageContent};
 
-    fn base_params(messages: Vec<LlmMessage>) -> LlmMessageParams {
-        LlmMessageParams {
+    fn base_params(messages: Vec<LlmMessage>) -> PromptIr {
+        PromptIr {
+            prompt_cache_key: None,
+
             reasoning_capability: None,
             messages,
             max_tokens: None,
             temperature: None,
             tools: None,
             stream: None,
-            system_prompt: None,
+
             tool_choice: None,
             reasoning_effort: None,
         }
@@ -406,14 +437,254 @@ mod tests {
 
     #[test]
     fn build_system_field_returns_plain_string_without_boundary() {
-        let value = build_system_field("plain system prompt");
+        let value = build_system_field("", "plain system prompt");
         assert_eq!(value, json!("plain system prompt"));
     }
 
     #[test]
-    fn build_system_field_returns_blocks_array_with_boundary() {
-        let text = format!("STATIC PREFIX{}DYNAMIC SUFFIX", PROMPT_CACHE_BOUNDARY);
-        let value = build_system_field(&text);
+    fn cache_breakpoints_cover_tools_static_system_and_rolling_tool_results() {
+        let mut params = base_params(vec![
+            LlmMessage {
+                origin: crate::ChatMessageOrigin::StaticPolicy,
+                role: "system".into(),
+                content: LlmMessageContent::Text("static".into()),
+            },
+            LlmMessage {
+                origin: crate::ChatMessageOrigin::SystemInstruction,
+                role: "system".into(),
+                content: LlmMessageContent::Text("dynamic".into()),
+            },
+            LlmMessage {
+                origin: Default::default(),
+                role: "user".into(),
+                content: LlmMessageContent::Blocks(vec![
+                    crate::llm_types::LlmContentBlock::ToolResult {
+                        tool_use_id: "call-1".into(),
+                        content: "result".into(),
+                        is_error: false,
+                        images: vec![],
+                    },
+                ]),
+            },
+        ]);
+        params.tools = Some(vec![crate::llm_types::ToolDefinition {
+            name: "file_read".into(),
+            description: "read".into(),
+            origin: crate::types::ChatToolOrigin::Builtin,
+            input_schema: crate::llm_types::ToolInputSchema::from_json_schema(
+                &json!({"type":"object"}),
+            ),
+        }]);
+        let body = AnthropicMessagesAdapter
+            .build_request(&params, "claude-test")
+            .unwrap()
+            .body;
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(body["system"][1].get("cache_control").is_none());
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(body["messages"][0]["content"][0]["content"], "result");
+        let text_params = base_params(vec![LlmMessage {
+            origin: Default::default(),
+            role: "user".into(),
+            content: LlmMessageContent::Text("work".into()),
+        }]);
+        let text_body = AnthropicMessagesAdapter
+            .build_request(&text_params, "claude-test")
+            .unwrap()
+            .body;
+        assert_eq!(
+            text_body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    fn text_message(role: &str, text: &str) -> LlmMessage {
+        LlmMessage {
+            origin: Default::default(),
+            role: role.into(),
+            content: LlmMessageContent::Text(text.into()),
+        }
+    }
+
+    fn tool_round(id: &str) -> [LlmMessage; 2] {
+        [
+            LlmMessage {
+                origin: Default::default(),
+                role: "assistant".into(),
+                content: LlmMessageContent::Blocks(vec![
+                    crate::llm_types::LlmContentBlock::ToolUse {
+                        id: id.into(),
+                        name: "file_read".into(),
+                        input: json!({}),
+                    },
+                ]),
+            },
+            LlmMessage {
+                origin: Default::default(),
+                role: "user".into(),
+                content: LlmMessageContent::Blocks(vec![
+                    crate::llm_types::LlmContentBlock::ToolResult {
+                        tool_use_id: id.into(),
+                        content: format!("result of {id}"),
+                        is_error: false,
+                        images: vec![],
+                    },
+                ]),
+            },
+        ]
+    }
+
+    fn request_with_round_tail(rounds: usize, tail: &[(&str, &str)]) -> serde_json::Value {
+        let mut messages = vec![
+            LlmMessage {
+                origin: crate::ChatMessageOrigin::StaticPolicy,
+                ..text_message("system", "static")
+            },
+            text_message("system", "dynamic"),
+            text_message("user", "goal"),
+        ];
+        for round in 0..rounds {
+            messages.extend(tool_round(&format!("call-{round}")));
+        }
+        messages.extend(tail.iter().map(|(role, text)| LlmMessage {
+            origin: crate::ChatMessageOrigin::RoundContext,
+            ..text_message(role, text)
+        }));
+        let params = base_params(messages);
+        AnthropicMessagesAdapter
+            .build_request(&params, "claude-test")
+            .unwrap()
+            .body
+    }
+
+    #[test]
+    fn round_tail_never_enters_system_and_never_carries_the_rolling_breakpoint() {
+        let body = request_with_round_tail(
+            1,
+            &[("developer", "STEPS-SNAPSHOT"), ("user", "TASK-CONTEXT")],
+        );
+        assert!(!body["system"].to_string().contains("STEPS-SNAPSHOT"));
+        let messages = body["messages"].as_array().unwrap();
+        // goal, tool_use, tool_result, 两条尾部消息
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            messages[2]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        for tail in &messages[3..] {
+            assert_eq!(tail["role"], "user");
+            assert!(!tail.to_string().contains("cache_control"));
+        }
+        assert!(messages[3].to_string().contains("STEPS-SNAPSHOT"));
+    }
+
+    /// 提供方缓存按渲染后的完整前缀匹配，不看 `cache_control` 标记本身；
+    /// 比较前去掉标记，其余字节必须逐一相同。
+    fn without_markers(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.iter()
+                    .filter(|(key, _)| key.as_str() != "cache_control")
+                    .map(|(key, value)| (key.clone(), without_markers(value)))
+                    .collect(),
+            ),
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(without_markers).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    #[test]
+    fn consecutive_tool_loop_requests_keep_the_previous_request_as_a_prefix() {
+        let first =
+            request_with_round_tail(1, &[("developer", "STEPS rev=1"), ("user", "CONTEXT a")]);
+        let next =
+            request_with_round_tail(2, &[("developer", "STEPS rev=2"), ("user", "CONTEXT b")]);
+        assert_eq!(first["system"], next["system"]);
+        assert_eq!(first["tools"], next["tools"]);
+        let first_history = &first["messages"].as_array().unwrap()[..3];
+        let next_history = &next["messages"].as_array().unwrap()[..3];
+        assert_eq!(
+            without_markers(&json!(first_history)),
+            without_markers(&json!(next_history))
+        );
+        // 滚动断点前移：上一次的标记不会残留在下一次的旧位置。
+        assert!(!next["messages"][2].to_string().contains("cache_control"));
+        assert_eq!(
+            next["messages"][4]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn developer_message_after_the_conversation_started_is_sent_in_place_not_hoisted() {
+        let params = {
+            let mut messages = vec![
+                text_message("developer", "HEAD-RULES"),
+                text_message("user", "goal"),
+            ];
+            messages.extend(tool_round("c0"));
+            messages.push(text_message("developer", "MID-RUN-NOTICE"));
+            base_params(messages)
+        };
+        let body = AnthropicMessagesAdapter
+            .build_request(&params, "claude-test")
+            .unwrap()
+            .body;
+        let system = body["system"].to_string();
+        assert!(system.contains("HEAD-RULES"));
+        assert!(!system.contains("MID-RUN-NOTICE"));
+        assert_eq!(body["messages"][3]["role"], "user");
+    }
+
+    #[test]
+    fn first_round_context_protects_all_following_retry_messages() {
+        let params = base_params(vec![
+            text_message("developer", "HEAD"),
+            text_message("user", "history"),
+            LlmMessage {
+                origin: crate::ChatMessageOrigin::RoundContext,
+                ..text_message("developer", "tail")
+            },
+            text_message("user", "retry guidance"),
+        ]);
+        let body = AnthropicMessagesAdapter
+            .build_request(&params, "claude-test")
+            .unwrap()
+            .body;
+        assert_eq!(body["system"], "HEAD");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        for message in &body["messages"].as_array().unwrap()[1..] {
+            assert!(!message.to_string().contains("cache_control"));
+        }
+    }
+
+    #[test]
+    fn prompt_text_cannot_create_a_static_cache_boundary() {
+        let marker = "<<<MAGI_PROMPT_CACHE_BOUNDARY:STATIC_END>>>";
+        let params = base_params(vec![
+            text_message("system", marker),
+            text_message("user", "work"),
+        ]);
+        let body = AnthropicMessagesAdapter
+            .build_request(&params, "claude-test")
+            .unwrap()
+            .body;
+        assert_eq!(body["system"], marker);
+    }
+
+    #[test]
+    fn build_system_field_uses_explicit_static_and_session_segments() {
+        let value = build_system_field("STATIC PREFIX", "DYNAMIC SUFFIX");
         let arr = value.as_array().expect("应当是 content blocks 数组");
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["type"], "text");
@@ -426,31 +697,32 @@ mod tests {
 
     #[test]
     fn build_system_field_degenerates_when_static_part_empty() {
-        let text = format!("{}DYNAMIC ONLY", PROMPT_CACHE_BOUNDARY);
-        let value = build_system_field(&text);
+        let value = build_system_field("", "DYNAMIC ONLY");
         assert_eq!(value, json!("DYNAMIC ONLY"));
     }
 
     #[test]
-    fn build_system_field_degenerates_when_dynamic_part_empty() {
-        let text = format!("STATIC ONLY{}", PROMPT_CACHE_BOUNDARY);
-        let value = build_system_field(&text);
-        assert_eq!(value, json!("STATIC ONLY"));
+    fn build_system_field_caches_a_pure_static_prefix() {
+        let value = build_system_field("STATIC ONLY", "");
+        assert_eq!(value[0]["text"], "STATIC ONLY");
+        assert_eq!(value[0]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]
-    fn developer_and_explicit_system_prompt_are_combined_in_anthropic_system_field() {
-        let mut params = base_params(vec![
+    fn leading_system_and_developer_messages_keep_one_ordered_source() {
+        let params = base_params(vec![
+            text_message("system", "平台安全规则"),
             LlmMessage {
+                origin: Default::default(),
                 role: "developer".to_string(),
                 content: LlmMessageContent::Text("当前权限快照".to_string()),
             },
             LlmMessage {
+                origin: Default::default(),
                 role: "user".to_string(),
                 content: LlmMessageContent::Text("继续执行".to_string()),
             },
         ]);
-        params.system_prompt = Some("平台安全规则".to_string());
 
         let adapted = AnthropicMessagesAdapter
             .build_request(&params, "claude-test")
@@ -467,6 +739,7 @@ mod tests {
     #[test]
     fn opus_4_7_emits_adaptive_thinking_with_output_config_and_beta_header() {
         let mut params = base_params(vec![LlmMessage {
+            origin: Default::default(),
             role: "user".to_string(),
             content: LlmMessageContent::Text("hi".to_string()),
         }]);
@@ -491,6 +764,7 @@ mod tests {
     #[test]
     fn opus_4_7_default_effort_is_medium() {
         let params = base_params(vec![LlmMessage {
+            origin: Default::default(),
             role: "user".to_string(),
             content: LlmMessageContent::Text("hi".to_string()),
         }]);
@@ -504,6 +778,7 @@ mod tests {
     #[test]
     fn tool_round_keeps_extended_thinking_enabled() {
         let mut params = base_params(vec![LlmMessage {
+            origin: Default::default(),
             role: "user".to_string(),
             content: LlmMessageContent::Text("请查询后回答".to_string()),
         }]);
@@ -563,6 +838,7 @@ mod tests {
         );
 
         let params = base_params(vec![LlmMessage {
+            origin: Default::default(),
             role: "assistant".to_string(),
             content: LlmMessageContent::Blocks(vec![
                 crate::llm_types::LlmContentBlock::ProviderContext {
@@ -596,6 +872,7 @@ mod tests {
     #[test]
     fn opus_4_8_uses_adaptive_thinking_profile() {
         let mut params = base_params(vec![LlmMessage {
+            origin: Default::default(),
             role: "user".to_string(),
             content: LlmMessageContent::Text("hi".to_string()),
         }]);
@@ -611,6 +888,7 @@ mod tests {
     #[test]
     fn explicit_output_limit_is_never_raised_to_the_thinking_default() {
         let mut params = base_params(vec![LlmMessage {
+            origin: Default::default(),
             role: "user".into(),
             content: LlmMessageContent::Text("bounded".into()),
         }]);
@@ -638,6 +916,7 @@ mod tests {
     #[test]
     fn legacy_claude_uses_budget_tokens_from_effort() {
         let mut params = base_params(vec![LlmMessage {
+            origin: Default::default(),
             role: "user".to_string(),
             content: LlmMessageContent::Text("hi".to_string()),
         }]);
@@ -663,6 +942,7 @@ mod tests {
     #[test]
     fn unknown_model_omits_thinking_even_with_configured_effort() {
         let mut params = base_params(vec![LlmMessage {
+            origin: Default::default(),
             role: "user".to_string(),
             content: LlmMessageContent::Text("hi".to_string()),
         }]);

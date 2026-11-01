@@ -31,14 +31,17 @@ pub use models::{
     active_execution_turn_request_id, timeline_entry_visible_text,
 };
 pub use store::{
-    CanonicalItemCommitNotice, CanonicalTurnMutation, ModelStepCommitNotice, SessionEventWriter,
-    SessionInputCommitNotice, SessionInputMutation,
+    CanonicalItemCommitNotice, CanonicalTurnMutation, ModelStepCommitNotice,
+    ModelUsageProjectionStep, SessionEventWriter, SessionInputCommitNotice, SessionInputMutation,
 };
 pub use store::{
-    ORCHESTRATOR_ROLE_ID, SESSION_TITLE_MAX_CHARS, SessionMutationTransactionError, SessionStore,
-    TimelineEntryInput, UnavailableSession,
+    GOAL_DERIVED_TURN_METADATA_KEYS, ORCHESTRATOR_ROLE_ID, SESSION_TITLE_MAX_CHARS,
+    SessionMutationTransactionError, SessionStore, TimelineEntryInput, UnavailableSession,
 };
 
 pub use model_step::{
-    ModelAttempt, ModelStep, ModelStepBinding, ModelStepPurpose, ModelStepStatus,
+    CacheInvalidationReason, HistoryProjection, ModelAttempt, ModelCacheBinding, ModelPromptFrame,
+    ModelStep, ModelStepBinding, ModelStepPurpose, ModelStepStatus, ModelTransportOutcome,
+    ModelTransportRecord, ModelTransportUsage, validate_model_transport_update,
+    validate_model_usage_context,
 };

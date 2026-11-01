@@ -1,11 +1,9 @@
 use crate::{
+    history_projection::{bound_tool_results, refresh_file_facts},
     model_config::NormalizedModelConfig,
     model_context_window::resolve_model_context_window_with_override,
     prompt_utils::{PromptFragmentKind, render_prompt_fragment},
-    tool_result_utils::{
-        bound_model_visible_tool_history, infer_tool_call_status,
-        model_visible_tool_history_budget_bytes,
-    },
+    tool_result_utils::infer_tool_call_status,
     usage_recording::{
         ModelUsageRecordInput, auxiliary_model_usage_binding, publish_model_usage_record_for_turn,
     },
@@ -498,8 +496,11 @@ impl<'a> ContextAuthority<'a> {
                 }
             }
         }
-        validate_workspace_file_facts(&mut history);
-        bound_model_visible_tool_results(&mut history, context_window);
+        refresh_file_facts(&mut history);
+        // 返回给调用方的是校验后的原始序列；总预算只用于下面的压缩判定，视图投影由请求构造处完成。
+        // 把降级后的结果交给实时循环再叠加一次预算，会让降级边界与下一回合的重建结果分叉。
+        let unbounded = history.clone();
+        bound_tool_results(&mut history, context_window);
         let original_count = history.len();
         let original_tokens = estimate_thread_history_tokens(&history);
         let usage_observation = latest_session_usage_observation(self.event_bus, self.session_id)
@@ -558,7 +559,7 @@ impl<'a> ContextAuthority<'a> {
                 "thread 历史未达到上下文压缩阈值"
             );
             return PreparedThreadHistory {
-                messages: history,
+                messages: unbounded,
                 compaction: None,
                 terminal: None,
             };
@@ -585,7 +586,7 @@ impl<'a> ContextAuthority<'a> {
                 "主动上下文压缩已熔断，本轮使用未压缩历史"
             );
             return PreparedThreadHistory {
-                messages: history,
+                messages: unbounded,
                 compaction: None,
                 terminal: None,
             };
@@ -607,7 +608,7 @@ impl<'a> ContextAuthority<'a> {
                     let _ = self.notify_compaction(ContextCompactionProgress::Skipped);
                 }
                 return PreparedThreadHistory {
-                    messages: history,
+                    messages: unbounded,
                     compaction: None,
                     terminal: None,
                 };
@@ -626,14 +627,14 @@ impl<'a> ContextAuthority<'a> {
                         "上下文语义压缩已取消"
                     );
                     return PreparedThreadHistory {
-                        messages: history,
+                        messages: unbounded,
                         compaction: None,
                         terminal: Some(ContextCompactionTerminal::Cancelled),
                     };
                 }
                 return self.compaction_failed(
                     request.phase,
-                    history,
+                    unbounded,
                     &decision,
                     request.additional_context.total_tokens() as usize,
                     &request.mode,
@@ -656,7 +657,7 @@ impl<'a> ContextAuthority<'a> {
                 }
             };
             return PreparedThreadHistory {
-                messages: history,
+                messages: unbounded,
                 compaction: None,
                 terminal: Some(terminal),
             };
@@ -757,7 +758,7 @@ impl<'a> ContextAuthority<'a> {
             if !installed {
                 return self.compaction_failed(
                     request.phase,
-                    history,
+                    unbounded,
                     &decision,
                     request.additional_context.total_tokens() as usize,
                     &request.mode,
@@ -815,8 +816,10 @@ impl<'a> ContextAuthority<'a> {
         let consecutive_failures = self
             .session_store
             .record_thread_context_compaction_failure(self.thread_id);
+        let mut bounded = history.clone();
+        bound_tool_results(&mut bounded, decision.context_window_tokens());
         let fits = request_fits_hard_limit(
-            estimate_thread_history_tokens(&history),
+            estimate_thread_history_tokens(&bounded),
             additional_token_estimate,
             decision.context_window_tokens(),
         );
@@ -1138,6 +1141,8 @@ impl<'a> ContextAuthority<'a> {
             source,
         );
         let request = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "context-compaction".to_string(),
             prompt: prompt.clone(),
             messages: Some(vec![ChatMessage {
@@ -1660,13 +1665,6 @@ pub(crate) fn estimate_thread_history_tokens(history: &[ThreadChatMessage]) -> u
 }
 
 fn estimate_chat_message_tokens(message: &ChatMessage) -> usize {
-    // 协议适配器剥离的缓存边界不是模型上下文。
-    if matches!(message.role.as_str(), "system" | "developer")
-        && message.content.as_deref()
-            == Some(magi_bridge_client::cache_boundary::PROMPT_CACHE_BOUNDARY)
-    {
-        return 0;
-    }
     let mut total = estimate_text_tokens(&message.role) + 4;
     if let Some(content) = message.content.as_deref() {
         total += estimate_text_tokens(content);
@@ -1709,10 +1707,14 @@ pub(crate) fn estimate_context_usage_breakdown(
                 &mut breakdown.system_instruction_tokens
             }
             ChatMessageOrigin::Conversation => &mut breakdown.conversation_tokens,
-            ChatMessageOrigin::SystemInstruction => &mut breakdown.system_instruction_tokens,
+            ChatMessageOrigin::SystemInstruction | ChatMessageOrigin::StaticPolicy => {
+                &mut breakdown.system_instruction_tokens
+            }
             ChatMessageOrigin::ProjectContext => &mut breakdown.project_context_tokens,
             ChatMessageOrigin::Skill => &mut breakdown.skill_tokens,
-            ChatMessageOrigin::ContextReference => &mut breakdown.context_reference_tokens,
+            ChatMessageOrigin::ContextReference | ChatMessageOrigin::RoundContext => {
+                &mut breakdown.context_reference_tokens
+            }
         };
         *target = target.saturating_add(tokens);
     }
@@ -1778,97 +1780,6 @@ pub(crate) fn estimate_tool_definition_tokens(tools: Option<&[ChatToolDefinition
         })
         .map(|serialized| estimate_text_tokens(&serialized))
         .unwrap_or_default()
-}
-
-/// 刚读取的文件结果在创建时就是“当前”事实，直接带上与历史校验相同的 `fact_state` 标注。
-///
-/// 回合边界重建历史时 `validate_workspace_file_facts` 会给未变化的读取结果补上同一标注；
-/// 如果实时消息创建时不带它，下一回合同一条结果的字节就变了，其后的整段历史缓存全部失效。
-pub(crate) fn with_current_file_fact(content: String) -> String {
-    let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return content;
-    };
-    if payload.get("tool").and_then(serde_json::Value::as_str) != Some("file_read")
-        || payload
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .is_none()
-        || payload
-            .get("content_hash")
-            .and_then(serde_json::Value::as_str)
-            .is_none()
-    {
-        return content;
-    }
-    payload["fact_state"] = serde_json::Value::String("current".to_string());
-    payload.to_string()
-}
-
-fn validate_workspace_file_facts(history: &mut [ThreadChatMessage]) {
-    for message in history.iter_mut().filter(|message| message.role == "tool") {
-        let Some(content) = message.content.as_deref() else {
-            continue;
-        };
-        let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(content) else {
-            continue;
-        };
-        if payload.get("tool").and_then(serde_json::Value::as_str) != Some("file_read") {
-            continue;
-        }
-        let path = payload
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let expected_hash = payload
-            .get("content_hash")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let is_current =
-            path.as_deref()
-                .zip(expected_hash.as_deref())
-                .is_some_and(|(path, expected_hash)| {
-                    magi_snapshot::path_content_hash(Path::new(path))
-                        .is_ok_and(|actual_hash| actual_hash == expected_hash)
-                });
-        if is_current {
-            payload["fact_state"] = serde_json::Value::String("current".to_string());
-            message.content = Some(payload.to_string());
-            continue;
-        }
-        message.content = Some(
-            serde_json::json!({
-                "tool": "file_read",
-                "status": "stale",
-                "fact_state": "stale",
-                "path": path,
-                "previous_content_hash": expected_hash,
-                "reason": "workspace_content_changed",
-                "message": "该文件读取事实已因工作区内容变化失效；如当前任务仍依赖它，必须重新读取。"
-            })
-            .to_string(),
-        );
-    }
-}
-
-fn bound_model_visible_tool_results(history: &mut [ThreadChatMessage], context_window_tokens: u64) {
-    let indices = history
-        .iter()
-        .enumerate()
-        .filter_map(|(index, message)| {
-            (message.role == "tool" && message.content.is_some()).then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let results = indices
-        .iter()
-        .filter_map(|index| history[*index].content.clone())
-        .collect::<Vec<_>>();
-    let bounded = bound_model_visible_tool_history(
-        &results,
-        model_visible_tool_history_budget_bytes(context_window_tokens),
-    );
-    for (index, result) in indices.into_iter().zip(bounded) {
-        history[index].content = Some(result);
-    }
 }
 
 pub(crate) fn current_session_file_facts(
@@ -2123,7 +2034,7 @@ fn choose_thread_history_compaction_split(
 mod tests {
     #[test]
     fn a_fresh_file_read_matches_the_next_turn_history_rebuild_byte_for_byte() {
-        use super::{validate_workspace_file_facts, with_current_file_fact};
+        use crate::history_projection::{refresh_file_facts, with_current_file_fact};
         let dir = std::env::temp_dir().join(format!("magi-fact-state-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("a.txt");
@@ -2148,7 +2059,7 @@ mod tests {
             tool_call_id: Some("call-1".to_string()),
             provider_context: Vec::new(),
         }];
-        validate_workspace_file_facts(&mut history);
+        refresh_file_facts(&mut history);
         assert_eq!(history[0].content.as_deref(), Some(live.as_str()));
         assert!(live.contains("\"fact_state\":\"current\""));
 
@@ -2158,12 +2069,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn a_truncated_file_read_matches_the_next_turn_history_rebuild_byte_for_byte() {
+        use crate::history_projection::{project_tool_result, refresh_file_facts};
+        let dir = std::env::temp_dir().join(format!("magi-fact-large-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("big.txt");
+        let body = "line of deterministic text\n".repeat(2_000);
+        std::fs::write(&file, &body).unwrap();
+        let raw = serde_json::json!({
+            "tool": "file_read",
+            "path": file.to_string_lossy(),
+            "content_hash": magi_snapshot::path_content_hash(&file).unwrap(),
+            "content": body,
+        })
+        .to_string();
+
+        let live = project_tool_result(&raw, magi_core::ExecutionResultStatus::Succeeded);
+        assert!(
+            live.contains("\"model_truncated\":true"),
+            "fixture must exceed the per-result cap"
+        );
+        assert!(
+            live.contains("\"fact_state\":\"current\""),
+            "truncation must not drop the fact state"
+        );
+        let mut history = vec![ThreadChatMessage {
+            input_request_id: None,
+            role: "tool".to_string(),
+            content: Some(raw),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call-1".to_string()),
+            provider_context: Vec::new(),
+        }];
+        refresh_file_facts(&mut history);
+        crate::history_projection::bound_tool_results(&mut history, 200_000);
+        assert_eq!(history[0].content.as_deref(), Some(live.as_str()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     use super::ContextAuthority;
     use super::{
         ContextCompactionProgress, ContextCompactionProgressGate, MAX_COMPACTION_SUMMARY_TOKENS,
-        MIN_COMPACTION_SUMMARY_TOKENS, bound_model_visible_tool_results,
-        compaction_summary_output_limit_tokens, compaction_summary_target_tokens,
-        serialize_compaction_source, validate_compaction_budget, validate_compaction_summary,
+        MIN_COMPACTION_SUMMARY_TOKENS, compaction_summary_output_limit_tokens,
+        compaction_summary_target_tokens, serialize_compaction_source, validate_compaction_budget,
+        validate_compaction_summary,
     };
     use magi_bridge_client::{ModelBridgeClient, ModelInvocationRequest};
     use magi_core::{SessionId, ThreadId, UtcMillis};
@@ -2506,7 +2457,7 @@ mod tests {
             provider_context: Vec::new(),
         }];
 
-        bound_model_visible_tool_results(&mut history, 128_000);
+        crate::history_projection::bound_tool_results(&mut history, 128_000);
 
         let visible = history[0].content.as_deref().expect("tool result");
         assert!(visible.len() < original.len());

@@ -175,8 +175,89 @@
   },
   "$ref": "#/$defs/JsonRpcMessage",
   "$defs": {
+    "WebModelSetupCredentialsParams": {
+      "x-rust-sensitive": true,
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "setupRunId",
+        "expectedRevision",
+        "handoffId",
+        "requestId",
+        "tunnelId",
+        "apiKey"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "setupRunId": {
+          "type": "string"
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "handoffId": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 192
+        },
+        "tunnelId": {
+          "type": "string"
+        },
+        "apiKey": {
+          "type": "string"
+        },
+        "continueAfterSave": {
+          "type": "boolean"
+        }
+      }
+    },
+    "WebModelSetupControlAction": {
+      "type": "string",
+      "enum": [
+        "pause",
+        "cancel"
+      ]
+    },
+    "WebModelSetupControlParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "setupRunId",
+        "expectedRevision",
+        "executionGeneration",
+        "action"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "setupRunId": {
+          "type": "string"
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "executionGeneration": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "action": {
+          "$ref": "#/$defs/WebModelSetupControlAction"
+        }
+      }
+    },
     "WebModelSetupStatus": {
       "type": "object",
+      "x-rust-derive-default": true,
       "additionalProperties": false,
       "required": [
         "sessionId",
@@ -194,7 +275,65 @@
         "reason": {
           "type": "string"
         },
-        "detail": {"type": "string"},
+        "detail": {
+          "type": "string"
+        },
+        "setupRunId": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "executionGeneration": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "executionTurnId": {
+          "type": "string"
+        },
+        "executionTaskId": {
+          "type": "string"
+        },
+        "pluginDigest": {
+          "type": "string"
+        },
+        "handoffId": {
+          "type": "string"
+        },
+        "runState": {
+          "type": "string"
+        },
+        "allowedActions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "saveRequestId": {
+          "type": "string"
+        },
+        "saveRequestBinding": {
+          "type": "string"
+        },
+        "savedCredentialVersion": {
+          "type": "string"
+        },
+        "pendingCredentialVersion": {
+          "type": "string"
+        },
+        "continuationInputId": {
+          "type": "string"
+        },
+        "continueState": {
+          "type": "string"
+        },
+        "organization": {
+          "type": "string"
+        },
+        "project": {
+          "type": "string"
+        },
         "updatedAt": {
           "type": "integer",
           "minimum": 0
@@ -2407,6 +2546,35 @@
         }
       }
     },
+    "PluginSkillContribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "description",
+        "instruction"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "instruction": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536
+        }
+      }
+    },
     "PluginViewPlacement": {
       "type": "string",
       "enum": [
@@ -2534,6 +2702,14 @@
       "additionalProperties": false,
       "x-rust-derive-default": true,
       "properties": {
+        "skills": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginSkillContribution"
+          },
+          "maxItems": 32,
+          "x-rust-default": true
+        },
         "tools": {
           "type": "array",
           "items": {
@@ -3243,6 +3419,171 @@
         "outcome_unknown"
       ]
     },
+    "CacheInvalidationReason": {
+      "type": "string",
+      "enum": [
+        "initial",
+        "model_changed",
+        "provider_changed",
+        "reasoning_changed",
+        "permission_changed",
+        "skill_changed",
+        "stable_prefix_changed",
+        "tool_surface_changed",
+        "compaction",
+        "history_rewritten",
+        "tool_history_demoted",
+        "file_facts_refreshed",
+        "provider_context_changed",
+        "renderer_changed"
+      ]
+    },
+    "ModelCacheBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lineageId",
+        "cacheKey",
+        "providerHash",
+        "modelHash",
+        "reasoningHash",
+        "executionScopeHash",
+        "skillScopeHash",
+        "invalidationReason"
+      ],
+      "properties": {
+        "lineageId": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "cacheKey": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "providerHash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "modelHash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "reasoningHash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "executionScopeHash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "skillScopeHash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "historyEpochHash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "invalidationReason": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/CacheInvalidationReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "ModelPromptFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "irVersion",
+        "stablePrefixHash",
+        "appendOnlyHistoryHash",
+        "toolSurfaceHash",
+        "volatileTailHash",
+        "postBoundaryHash"
+      ],
+      "properties": {
+        "irVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "x-rust-type": "u32"
+        },
+        "stablePrefixHash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "appendOnlyHistoryHash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "toolSurfaceHash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "volatileTailHash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "providerContextHash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "postBoundaryHash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "historyMessageCount": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "usize"
+        },
+        "historyChainHash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "historyProjection": {
+          "$ref": "#/$defs/HistoryProjection"
+        },
+        "prefixBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "tailBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "cacheBinding": {
+          "$ref": "#/$defs/ModelCacheBinding"
+        }
+      }
+    },
+    "HistoryProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "demotedToolResults",
+        "staleFileFacts"
+      ],
+      "properties": {
+        "demotedToolResults": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "usize"
+        },
+        "staleFileFacts": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "usize"
+        }
+      }
+    },
     "ModelStep": {
       "type": "object",
       "additionalProperties": false,
@@ -3394,6 +3735,22 @@
               "type": "null"
             }
           ]
+        },
+        "promptFrame": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ModelPromptFrame"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cacheEpoch": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "x-rust-type": "u64"
         }
       }
     },
@@ -3424,6 +3781,9 @@
         },
         "status": {
           "$ref": "#/$defs/ModelStepStatus"
+        },
+        "transport": {
+          "$ref": "#/$defs/ModelTransportRecord"
         }
       }
     },
@@ -3458,6 +3818,9 @@
           "type": "integer",
           "minimum": 0,
           "x-rust-type": "u64"
+        },
+        "usageContext": {
+          "$ref": "#/$defs/ModelUsageContext"
         }
       }
     },
@@ -5420,6 +5783,179 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "ModelTransportUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "x-rust-derive-eq": true,
+      "required": [
+        "inputTokens",
+        "outputTokens",
+        "cacheReadIncludedInInput"
+      ],
+      "properties": {
+        "inputTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "outputTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "cacheReadTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "cacheWriteTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "cacheReadIncludedInInput": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ModelTransportOutcome": {
+      "type": "string",
+      "enum": [
+        "succeeded",
+        "failed",
+        "cancelled"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "ModelTransportRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "x-rust-derive-eq": true,
+      "required": [
+        "requestFingerprint"
+      ],
+      "properties": {
+        "requestFingerprint": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "httpStatus": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599,
+          "x-rust-type": "u16"
+        },
+        "usage": {
+          "$ref": "#/$defs/ModelTransportUsage"
+        },
+        "outcome": {
+          "$ref": "#/$defs/ModelTransportOutcome"
+        },
+        "observedAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        }
+      }
+    },
+    "ModelUsageSourceRole": {
+      "type": "string",
+      "x-rust-derive-eq": true,
+      "enum": [
+        "worker",
+        "orchestrator",
+        "auxiliary",
+        "image_generation",
+        "vision"
+      ]
+    },
+    "ModelUsagePhase": {
+      "type": "string",
+      "x-rust-derive-eq": true,
+      "enum": [
+        "planning",
+        "execution",
+        "verification",
+        "integration",
+        "unknown"
+      ]
+    },
+    "ModelUsageModelConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "x-rust-derive-eq": true,
+      "required": [
+        "provider",
+        "model",
+        "baseUrl"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "baseUrl": {
+          "type": "string"
+        },
+        "accountFingerprint": {
+          "type": "string"
+        },
+        "reasoningEffort": {
+          "type": "string"
+        }
+      }
+    },
+    "ModelUsageContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "x-rust-derive-eq": true,
+      "required": [
+        "templateId",
+        "engineId",
+        "bindingRevision",
+        "role",
+        "phase",
+        "modelConfig",
+        "workspaceId"
+      ],
+      "properties": {
+        "templateId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "engineId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bindingRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u32"
+        },
+        "role": {
+          "$ref": "#/$defs/ModelUsageSourceRole"
+        },
+        "phase": {
+          "$ref": "#/$defs/ModelUsagePhase"
+        },
+        "modelConfig": {
+          "$ref": "#/$defs/ModelUsageModelConfig"
+        },
+        "assignmentId": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     }
   }
 }

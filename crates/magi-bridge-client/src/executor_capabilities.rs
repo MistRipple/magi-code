@@ -137,6 +137,8 @@ mod tests {
 
     fn request() -> ModelInvocationRequest {
         ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "test".into(),
             prompt: "work".into(),
             messages: None,

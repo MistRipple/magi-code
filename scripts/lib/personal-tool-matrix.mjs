@@ -51,7 +51,7 @@ export function personalMatrixStep(marker, results, messages, origin) {
       ['file_move', { source: 'scratch/copied.txt', destination: 'scratch/moved.txt' }],
       ['search_text', { query: 'gamma', root: 'scratch' }],
       ['diff_preview', { before_path: 'scratch/source.txt', after_path: 'scratch/added.txt' }],
-      ['diagram_render', { kind: 'flow', graph: { nodes: [{ id: 'a', label: '最近对话' }, { id: 'b', label: '工具执行' }], edges: [{ source: 'a', target: 'b' }] } }],
+      ['diagram_render', { kind: 'flow', graph: { nodes: [{ id: 'a', label: '无项目对话' }, { id: 'b', label: '工具执行' }], edges: [{ source: 'a', target: 'b' }] } }],
       ['tool_catalog', { include_schema: true, include_internal: true }],
       ['web_fetch', { url: `${origin}/health` }],
       ['image_generate', { prompt: 'fixture image', output_path: 'matrix.png' }],

@@ -428,7 +428,18 @@ export function settingsBootstrapMatchesCurrentWorkspace(
     : snapshotWorkspacePath === binding.workspacePath;
 }
 
+export interface PromptCacheStats {
+  observedCallCount: number;
+  hitCallCount: number;
+  inputTokens: number;
+  readTokens: number;
+  writeTokens: number;
+  tokenHitRate: number | null;
+  requestHitRate: number | null;
+}
+
 export interface AgentExecutionStatsItem {
+  cache?: PromptCacheStats;
   templateId: string;
   engineId: string;
   bindingRevision: number;
@@ -462,6 +473,7 @@ export interface AgentExecutionStatsPayload {
   lastAppliedLedgerSeq?: number;
   updatedAt: number;
   totals: {
+    cache?: PromptCacheStats;
     llmCallCount: number;
     assignmentCount: number;
     turnCount: number;

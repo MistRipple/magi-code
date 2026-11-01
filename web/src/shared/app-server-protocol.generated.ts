@@ -217,11 +217,49 @@ export const APP_SERVER_METHOD_SIGNATURES = {
   }
 } as const;
 
+export interface WebModelSetupCredentialsParams {
+  sessionId: string;
+  setupRunId: string;
+  expectedRevision: number;
+  handoffId: string;
+  requestId: string;
+  tunnelId: string;
+  apiKey: string;
+  continueAfterSave?: boolean;
+}
+
+export type WebModelSetupControlAction = "pause" | "cancel";
+
+export interface WebModelSetupControlParams {
+  sessionId: string;
+  setupRunId: string;
+  expectedRevision: number;
+  executionGeneration: number;
+  action: WebModelSetupControlAction;
+}
+
 export interface WebModelSetupStatus {
   sessionId: string;
   stage: string;
   reason: string;
   detail?: string;
+  setupRunId?: string;
+  revision?: number;
+  executionGeneration?: number;
+  executionTurnId?: string;
+  executionTaskId?: string;
+  pluginDigest?: string;
+  handoffId?: string;
+  runState?: string;
+  allowedActions?: Array<string>;
+  saveRequestId?: string;
+  saveRequestBinding?: string;
+  savedCredentialVersion?: string;
+  pendingCredentialVersion?: string;
+  continuationInputId?: string;
+  continueState?: string;
+  organization?: string;
+  project?: string;
   updatedAt: number;
 }
 
@@ -704,6 +742,13 @@ export interface PluginToolContribution {
   readOnly: boolean;
 }
 
+export interface PluginSkillContribution {
+  id: string;
+  title: string;
+  description: string;
+  instruction: string;
+}
+
 export type PluginViewPlacement = "settings" | "home" | "main" | "rightPane" | "homeCard";
 
 export interface PluginViewContribution {
@@ -735,6 +780,7 @@ export interface PluginNamedContribution {
 }
 
 export interface PluginContributions {
+  skills?: Array<PluginSkillContribution>;
   tools?: Array<PluginToolContribution>;
   commands?: Array<PluginNamedContribution>;
   views?: Array<PluginViewContribution>;
@@ -907,6 +953,41 @@ export interface SessionInboxCursor {
 
 export type ModelStepStatus = "started" | "response_received" | "outcome_unknown";
 
+export type CacheInvalidationReason = "initial" | "model_changed" | "provider_changed" | "reasoning_changed" | "permission_changed" | "skill_changed" | "stable_prefix_changed" | "tool_surface_changed" | "compaction" | "history_rewritten" | "tool_history_demoted" | "file_facts_refreshed" | "provider_context_changed" | "renderer_changed";
+
+export interface ModelCacheBinding {
+  lineageId: string;
+  cacheKey: string;
+  providerHash: string;
+  modelHash: string;
+  reasoningHash: string;
+  executionScopeHash: string;
+  skillScopeHash: string;
+  historyEpochHash?: string;
+  invalidationReason: CacheInvalidationReason | null;
+}
+
+export interface ModelPromptFrame {
+  irVersion: number;
+  stablePrefixHash: string;
+  appendOnlyHistoryHash: string;
+  toolSurfaceHash: string;
+  volatileTailHash: string;
+  providerContextHash?: string;
+  postBoundaryHash: string;
+  historyMessageCount?: number;
+  historyChainHash?: string;
+  historyProjection?: HistoryProjection;
+  prefixBytes?: number;
+  tailBytes?: number;
+  cacheBinding?: ModelCacheBinding;
+}
+
+export interface HistoryProjection {
+  demotedToolResults: number;
+  staleFileFacts: number;
+}
+
 export interface ModelStep {
   stepId: string;
   taskId: string | null;
@@ -929,6 +1010,8 @@ export interface ModelStep {
   goalTokensAfter?: number | null;
   executorCapabilities?: ExecutorCapabilities | null;
   purpose?: ModelStepPurpose | null;
+  promptFrame?: ModelPromptFrame | null;
+  cacheEpoch?: number;
 }
 
 export interface ModelAttempt {
@@ -936,6 +1019,7 @@ export interface ModelAttempt {
   startedAt: number;
   settledAt: number | null;
   status: ModelStepStatus;
+  transport?: ModelTransportRecord;
 }
 
 export interface ModelStepBinding {
@@ -943,6 +1027,7 @@ export interface ModelStepBinding {
   provider: string | null;
   bindingRevision: number;
   settingsRevision: number;
+  usageContext?: ModelUsageContext;
 }
 
 export interface SessionGoalUsageChanged {
@@ -1369,4 +1454,45 @@ export interface ExecutionSteps {
   explanation?: string;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface ModelTransportUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  cacheReadIncludedInInput: boolean;
+}
+
+export type ModelTransportOutcome = "succeeded" | "failed" | "cancelled";
+
+export interface ModelTransportRecord {
+  requestFingerprint: string;
+  httpStatus?: number;
+  usage?: ModelTransportUsage;
+  outcome?: ModelTransportOutcome;
+  observedAt?: number;
+}
+
+export type ModelUsageSourceRole = "worker" | "orchestrator" | "auxiliary" | "image_generation" | "vision";
+
+export type ModelUsagePhase = "planning" | "execution" | "verification" | "integration" | "unknown";
+
+export interface ModelUsageModelConfig {
+  provider: string;
+  model: string;
+  baseUrl: string;
+  accountFingerprint?: string;
+  reasoningEffort?: string;
+}
+
+export interface ModelUsageContext {
+  templateId: string;
+  engineId: string;
+  bindingRevision: number;
+  role: ModelUsageSourceRole;
+  phase: ModelUsagePhase;
+  modelConfig: ModelUsageModelConfig;
+  assignmentId?: string;
+  workspaceId: string | null;
 }

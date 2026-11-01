@@ -1,4 +1,5 @@
 //! 两种原生入口共用的调用边界；恢复请求也必须先冻结，收到结果后才允许执行工具。
+use crate::prompt_lineage::{PromptBranchScope, PromptFrame};
 use magi_bridge_client::{
     BridgeClientError, BridgeErrorLayer, ModelBridgeClient, ModelInvocationRequest, ModelResponse,
     ModelRetryRuntimeEvent, ModelStreamingDelta,
@@ -21,7 +22,9 @@ pub struct StepModelClient<'a> {
     sequence: AtomicUsize,
     binding: Option<ModelStepBinding>,
     purpose: magi_session_store::ModelStepPurpose,
+    prompt_branch: Option<PromptBranchScope>,
     execution_scope: Option<magi_bridge_client::ModelExecutionScope>,
+    history_projection: Option<magi_session_store::HistoryProjection>,
 }
 
 impl<'a> StepModelClient<'a> {
@@ -45,12 +48,28 @@ impl<'a> StepModelClient<'a> {
             sequence: AtomicUsize::new(0),
             binding: None,
             purpose: magi_session_store::ModelStepPurpose::Execution,
+            prompt_branch: None,
             execution_scope: None,
+            history_projection: None,
         }
     }
 
     pub fn with_purpose(mut self, purpose: magi_session_store::ModelStepPurpose) -> Self {
         self.purpose = purpose;
+        self
+    }
+
+    pub fn with_prompt_branch(mut self, branch: PromptBranchScope) -> Self {
+        self.prompt_branch = Some(branch);
+        self
+    }
+
+    /// 本次请求视图对已有历史的改写量；缓存断代据此区分“有意改写”和未声明的改写。
+    pub fn with_history_projection(
+        mut self,
+        projection: magi_session_store::HistoryProjection,
+    ) -> Self {
+        self.history_projection = Some(projection);
         self
     }
 
@@ -65,6 +84,11 @@ impl<'a> StepModelClient<'a> {
         binding: &crate::usage_recording::ModelUsageBinding,
     ) -> Self {
         self.binding = Some(ModelStepBinding {
+            usage_context: crate::usage_recording::model_step_usage_context(
+                settings,
+                binding,
+                self.session_id,
+            ),
             model: crate::usage_recording::resolved_model_for_usage_binding(
                 settings,
                 binding,
@@ -78,6 +102,17 @@ impl<'a> StepModelClient<'a> {
             binding_revision: binding.binding_revision(),
             settings_revision: settings.map_or(0, |settings| settings.revision()),
         });
+        self
+    }
+
+    pub fn with_usage_assignment(mut self, assignment_id: String) -> Self {
+        if let Some(context) = self
+            .binding
+            .as_mut()
+            .and_then(|binding| binding.usage_context.as_mut())
+        {
+            context.assignment_id = Some(assignment_id);
+        }
         self
     }
 
@@ -102,26 +137,64 @@ impl<'a> StepModelClient<'a> {
             retry,
             cancelled,
             limit,
-            |client, request, retry, stopped, limit| {
+            |client, request, retry, stopped, limit, observer| {
                 let on_delta = |value: &ModelStreamingDelta| {
                     if !stopped() {
                         delta(value);
                     }
                 };
-                match limit {
-                    Some(limit) => client.invoke_streaming_with_output_limit(
-                        request, limit, &on_delta, retry, stopped,
-                    ),
-                    None => client
-                        .invoke_streaming_with_cancellation(request, &on_delta, retry, stopped),
-                }
+                client.invoke_observed(
+                    request,
+                    magi_bridge_client::ModelInvocationOptions {
+                        on_delta: Some(&on_delta),
+                        on_retry: retry,
+                        is_cancelled: stopped,
+                        max_output_tokens: limit,
+                    },
+                    observer,
+                )
             },
         )
     }
 
+    /// 把本次请求的缓存表现拆成“Magi 保持稳定的前缀”“每次重发的尾部”和“provider 未服务的部分”。
+    /// 只写日志，不新增持久事实：诊断时与 Step 里的尺寸记录和用量对照即可复算。
+    fn log_cache_reuse(
+        &self,
+        step_id: &str,
+        previous: Option<&magi_session_store::ModelPromptFrame>,
+        current: &magi_session_store::ModelPromptFrame,
+        usage: Option<&magi_app_server_protocol::ModelTransportUsage>,
+    ) {
+        let Some(usage) = usage else {
+            return;
+        };
+        let read = usage.cache_read_tokens.unwrap_or(0);
+        let input = usage.input_tokens
+            + if usage.cache_read_included_in_input {
+                0
+            } else {
+                read
+            };
+        if let Some(account) =
+            crate::prompt_lineage::cache_reuse_account(previous, current, input, read)
+        {
+            tracing::info!(
+                target: "magi::prompt_cache",
+                step_id,
+                input_tokens = input,
+                cache_read_tokens = read,
+                expected_cached_tokens = account.expected_cached_tokens,
+                volatile_tail_tokens = account.volatile_tail_tokens,
+                provider_shortfall_tokens = account.provider_shortfall_tokens,
+                "缓存核算"
+            );
+        }
+    }
+
     fn invoke_recorded(
         &self,
-        request: ModelInvocationRequest,
+        mut request: ModelInvocationRequest,
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
         cancelled: &dyn Fn() -> bool,
         max_output_tokens: Option<u32>,
@@ -131,11 +204,25 @@ impl<'a> StepModelClient<'a> {
             &dyn Fn(&ModelRetryRuntimeEvent),
             &dyn Fn() -> bool,
             Option<u32>,
+            &magi_bridge_client::ModelTransportObserver<'_>,
         ) -> Result<ModelResponse, BridgeClientError>,
     ) -> Result<ModelResponse, BridgeClientError> {
         if cancelled() {
             return Err(magi_bridge_client::model_invocation_cancelled_error());
         }
+        let branch = self.prompt_branch.clone().unwrap_or_else(|| {
+            if self.purpose == magi_session_store::ModelStepPurpose::ContextCompaction {
+                PromptBranchScope::Auxiliary {
+                    purpose: "context_compaction".to_string(),
+                }
+            } else {
+                PromptBranchScope::Orchestrator
+            }
+        });
+        let history_generation = self
+            .store
+            .thread_context_checkpoint(self.thread_id)
+            .map_or(0, |checkpoint| checkpoint.generation);
         // 缓存 client 不保存某个 Task 的权限。每次真实调用重新绑定本 Step 的可信作用域；
         // 外部工具循环必须确认绑定成功，不能把默认 Ok(None) 当作已继承权限。
         let bound = self
@@ -148,7 +235,40 @@ impl<'a> StepModelClient<'a> {
             return Err(magi_bridge_client::model_invocation_cancelled_error());
         }
         let client = bound.as_deref().unwrap_or(self.inner);
+        // 缓存摘要必须读取与实际 Provider renderer 相同的规范化 IR。HTTP
+        // client 会在这里完成工具 wire name 编码和能力降级；不能基于原始
+        // canonical 工具名先生成一份与真实请求不同的缓存身份。
+        let mut prompt_frame = PromptFrame::from_ir(&client.cache_prompt_ir(&request));
+        prompt_frame.history_projection = self.history_projection;
         let capabilities = client.executor_capabilities();
+        let provider_scope = crate::prompt_lineage::ProviderCacheScope::from_client(client)
+            .unwrap_or_else(|| crate::prompt_lineage::ProviderCacheScope {
+                provider: self
+                    .binding
+                    .as_ref()
+                    .and_then(|binding| binding.provider.clone())
+                    .or_else(|| Some(request.provider.clone())),
+                resolved_model: self
+                    .binding
+                    .as_ref()
+                    .and_then(|binding| binding.model.clone()),
+                ..Default::default()
+            });
+        let lineage = crate::prompt_lineage::PromptLineage::for_branch(self.session_id, branch)
+            .with_provider_scope(provider_scope);
+        let previous = self
+            .store
+            .latest_model_step_for_cache_lineage(self.session_id, &lineage.lineage_id);
+        let (lineage, cache_binding) = prompt_frame.bind_lineage(
+            lineage,
+            history_generation,
+            self.execution_scope.as_ref(),
+            previous.as_ref(),
+        );
+        let cache_epoch = lineage.cache_epoch;
+        request.cache_affinity_key = Some(lineage.lineage_id);
+        request.prompt_cache_key = Some(cache_binding.cache_key.clone());
+
         if capabilities.tools == magi_bridge_client::ExecutorToolMode::ExecutorOwned
             && bound.is_none()
         {
@@ -182,7 +302,14 @@ impl<'a> StepModelClient<'a> {
             });
         }
         let Some(turn_id) = self.turn_id else {
-            let response = invoke(client, request, on_retry, cancelled, max_output_tokens)?;
+            let response = invoke(
+                client,
+                request,
+                on_retry,
+                cancelled,
+                max_output_tokens,
+                &|_| Ok(()),
+            )?;
             magi_bridge_client::validate_executor_response(&capabilities, &response)?;
             return Ok(response);
         };
@@ -214,11 +341,15 @@ impl<'a> StepModelClient<'a> {
         input_request_ids.sort();
         input_request_ids.dedup();
         let now = UtcMillis::now();
+        let mut persisted_frame: magi_session_store::ModelPromptFrame = (&prompt_frame).into();
+        persisted_frame.cache_binding = Some(cache_binding);
+        let frame_for_account = persisted_frame.clone();
         let step = ModelStep {
             step_id: step_id.clone(),
             task_id: self.task_id.cloned(),
             thread_id: self.thread_id.clone(),
             attempts: vec![ModelAttempt {
+                transport: None,
                 attempt_id: format!("{step_id}:attempt:1"),
                 started_at: now,
                 settled_at: None,
@@ -227,13 +358,13 @@ impl<'a> StepModelClient<'a> {
             goal_id: None,
             usage_tokens: None,
             goal_tokens_after: None,
-            checkpoint_generation: self
-                .store
-                .thread_context_checkpoint(self.thread_id)
-                .map_or(0, |checkpoint| checkpoint.generation),
+            checkpoint_generation: history_generation,
             request_fingerprint: fingerprint(&serde_json::json!({
                 "request": request, "maxOutputTokens": max_output_tokens,
                 "executorCapabilities": capabilities, "purpose": self.purpose,
+                "promptFrame": prompt_frame,
+                "cacheEpoch": cache_epoch,
+                "historyGeneration": history_generation,
                 "executionScope": self.execution_scope.as_ref().map(|scope| serde_json::json!({
                     "workingDir": scope.working_dir,
                     "policy": scope.policy,
@@ -253,6 +384,8 @@ impl<'a> StepModelClient<'a> {
             settled_at: None,
             status: ModelStepStatus::Started,
             response_fingerprint: None,
+            prompt_frame: Some(persisted_frame),
+            cache_epoch,
         };
         self.store
             .begin_model_step(self.session_id, turn_id, step)
@@ -276,12 +409,22 @@ impl<'a> StepModelClient<'a> {
                     .expect("retry journal lock")
                     .is_some()
         };
+        let transport_record =
+            std::sync::Mutex::new(magi_bridge_client::ModelTransportRecorder::default());
+        let on_transport = |event: &magi_bridge_client::ModelTransportEvent| {
+            let mut records = transport_record.lock().expect("transport observation lock");
+            let record = records.apply(event)?;
+            self.store
+                .record_model_step_transport(self.session_id, turn_id, &step_id, record.clone())
+                .map_err(journal_error)
+        };
         let result = invoke(
             client,
             request,
             &recorded_retry,
             &stopped,
             max_output_tokens,
+            &on_transport,
         );
         if let Some(error) = retry_write_error.into_inner().expect("retry journal lock") {
             return Err(step_start_error(error));
@@ -306,6 +449,21 @@ impl<'a> StepModelClient<'a> {
                 executor_failure,
             )
             .map_err(journal_error)?;
+        // 逐次传输回执是用量的权威来源；流式响应的 usage 只出现在这里，不在响应体上。
+        let final_transport_usage = transport_record
+            .lock()
+            .expect("transport observation lock")
+            .attempts
+            .last()
+            .and_then(|record| record.usage.clone());
+        self.log_cache_reuse(
+            &step_id,
+            previous
+                .as_ref()
+                .and_then(|step| step.prompt_frame.as_ref()),
+            &frame_for_account,
+            final_transport_usage.as_ref(),
+        );
         // 允许迟到响应结算用量，但不能向已关闭的执行交付工具或正文。
         if cancelled()
             || self
@@ -336,6 +494,17 @@ impl<'a> StepModelClient<'a> {
 }
 
 impl ModelBridgeClient for StepModelClient<'_> {
+    fn cache_prompt_ir(
+        &self,
+        request: &ModelInvocationRequest,
+    ) -> magi_bridge_client::prompt_ir::PromptIr {
+        self.inner.cache_prompt_ir(request)
+    }
+
+    fn cache_identity(&self) -> Option<magi_bridge_client::ModelCacheIdentity> {
+        self.inner.cache_identity()
+    }
+
     fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
         self.inner.executor_capabilities()
     }
@@ -360,11 +529,17 @@ impl ModelBridgeClient for StepModelClient<'_> {
             retry,
             cancelled,
             None,
-            |client, request, retry, stopped, limit| match limit {
-                Some(limit) => client.invoke_with_retry_events_cancellation_and_output_limit(
-                    request, limit, retry, stopped,
-                ),
-                None => client.invoke_with_retry_events_and_cancellation(request, retry, stopped),
+            |client, request, retry, stopped, limit, observer| {
+                client.invoke_observed(
+                    request,
+                    magi_bridge_client::ModelInvocationOptions {
+                        on_delta: None,
+                        on_retry: retry,
+                        is_cancelled: stopped,
+                        max_output_tokens: limit,
+                    },
+                    observer,
+                )
             },
         )
     }
@@ -393,12 +568,16 @@ impl ModelBridgeClient for StepModelClient<'_> {
             retry,
             cancelled,
             Some(limit),
-            |client, request, retry, stopped, limit| {
-                client.invoke_with_retry_events_cancellation_and_output_limit(
+            |client, request, retry, stopped, limit, observer| {
+                client.invoke_observed(
                     request,
-                    limit.expect("explicit output limit"),
-                    retry,
-                    stopped,
+                    magi_bridge_client::ModelInvocationOptions {
+                        on_delta: None,
+                        on_retry: retry,
+                        is_cancelled: stopped,
+                        max_output_tokens: limit,
+                    },
+                    observer,
                 )
             },
         )
@@ -466,10 +645,31 @@ fn journal_error(error: impl std::fmt::Display) -> BridgeClientError {
     }
 }
 fn fingerprint(value: &impl serde::Serialize) -> Result<String, BridgeClientError> {
-    // 转 Value 后按 key 排序，消除 HashMap 插入顺序对请求身份的影响。
+    // 递归规范化后再生成身份，消除嵌套 schema 的对象插入顺序差异。
     let value = serde_json::to_value(value).map_err(journal_error)?;
+    let value = magi_bridge_client::llm_types::canonicalize_json(&value);
     let bytes = serde_json::to_vec(&value).map_err(journal_error)?;
     Ok(magi_core::hex_lower(Sha256::digest(bytes)))
+}
+
+impl From<&PromptFrame> for magi_session_store::ModelPromptFrame {
+    fn from(frame: &PromptFrame) -> Self {
+        Self {
+            ir_version: frame.ir_version,
+            stable_prefix_hash: frame.stable_prefix_hash.clone(),
+            append_only_history_hash: frame.append_only_history_hash.clone(),
+            tool_surface_hash: frame.tool_surface_hash.clone(),
+            volatile_tail_hash: frame.volatile_tail_hash.clone(),
+            provider_context_hash: frame.provider_context_hash.clone(),
+            post_boundary_hash: frame.post_boundary_hash.clone(),
+            history_message_count: Some(frame.history_message_count),
+            history_chain_hash: Some(frame.history_chain_hash.clone()),
+            history_projection: frame.history_projection,
+            prefix_bytes: Some(frame.prefix_bytes),
+            tail_bytes: Some(frame.tail_bytes),
+            cache_binding: None,
+        }
+    }
 }
 
 pub(crate) fn root_input_request_id(
@@ -532,12 +732,788 @@ mod tests {
     }
     fn request(text: &str) -> ModelInvocationRequest {
         ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "test".into(),
             prompt: text.into(),
             messages: None,
             tools: None,
             tool_choice: None,
         }
+    }
+
+    fn http_fixture(
+        responses: Vec<(&'static str, &'static str)>,
+    ) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let thread = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for (status, body) in responses {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':')
+                        && key.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).unwrap();
+                bodies.push(serde_json::from_slice(&bytes).unwrap());
+                let mut stream = reader.into_inner();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            bodies
+        });
+        (url, thread)
+    }
+
+    #[test]
+    fn http_retry_records_actual_wire_status_and_usage_in_the_original_step() {
+        let (url, server) = http_fixture(vec![
+            (
+                "500 Internal Server Error",
+                r#"{"error":{"message":"temporarily overloaded"}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"choices":[{"message":{"content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":30,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":20}}}"#,
+            ),
+        ]);
+        let client = magi_bridge_client::HttpModelBridgeClient::new(url, None, "test".into());
+        let (store, session, thread) = store();
+        StepModelClient::new(
+            &client,
+            &store,
+            &session,
+            Some("turn-journal-client"),
+            None,
+            &thread,
+            "http-call",
+        )
+        .invoke(request("work"))
+        .unwrap();
+        let bodies = server.join().unwrap();
+        let step = store
+            .canonical_turn_for_session_turn_id(&session, "turn-journal-client")
+            .unwrap()
+            .model_steps
+            .remove(0);
+        assert_eq!(step.attempts.len(), 2);
+        for (attempt, body) in step.attempts.iter().zip(bodies) {
+            let actual = magi_core::hex_lower(Sha256::digest(body.to_string().as_bytes()));
+            assert_eq!(
+                attempt.transport.as_ref().unwrap().request_fingerprint,
+                actual
+            );
+        }
+        let first = step.attempts[0].transport.as_ref().unwrap();
+        assert_eq!(first.http_status, Some(500));
+        assert_eq!(
+            first.outcome,
+            Some(magi_session_store::ModelTransportOutcome::Failed)
+        );
+        assert!(first.usage.is_none());
+        let last = step.attempts[1].transport.as_ref().unwrap();
+        assert_eq!(last.http_status, Some(200));
+        assert_eq!(last.usage.as_ref().unwrap().cache_read_tokens, Some(20));
+        assert_eq!(
+            last.outcome,
+            Some(magi_session_store::ModelTransportOutcome::Succeeded)
+        );
+        let restored = SessionStore::from_persisted_parts(
+            store.durable_state(),
+            store.execution_sidecar_store_state(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored
+                .canonical_turn_for_session_turn_id(&session, "turn-journal-client")
+                .unwrap()
+                .model_steps[0],
+            step
+        );
+    }
+
+    #[test]
+    fn empty_sse_attempt_keeps_observed_usage_before_transport_retry() {
+        let (url, server) = http_fixture(vec![
+            (
+                "200 OK",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n",
+            ),
+            (
+                "200 OK",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":10}}}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let client = magi_bridge_client::HttpModelBridgeClient::new(url, None, "test".into());
+        let (store, session, thread) = store();
+        StepModelClient::new(
+            &client,
+            &store,
+            &session,
+            Some("turn-journal-client"),
+            None,
+            &thread,
+            "sse-call",
+        )
+        .invoke_streaming(request("work"), &|_| {})
+        .unwrap();
+        assert_eq!(server.join().unwrap().len(), 2);
+        let step = store
+            .canonical_turn_for_session_turn_id(&session, "turn-journal-client")
+            .unwrap()
+            .model_steps
+            .remove(0);
+        assert_eq!(step.attempts.len(), 2);
+        let first = step.attempts[0].transport.as_ref().unwrap();
+        assert_eq!(first.http_status, Some(200));
+        assert_eq!(first.usage.as_ref().unwrap().input_tokens, 11);
+        assert_eq!(first.usage.as_ref().unwrap().cache_read_tokens, None);
+        assert_eq!(
+            first.outcome,
+            Some(magi_session_store::ModelTransportOutcome::Failed)
+        );
+        let last = step.attempts[1].transport.as_ref().unwrap();
+        assert_eq!(last.usage.as_ref().unwrap().cache_read_tokens, Some(10));
+        assert_eq!(first.request_fingerprint, last.request_fingerprint);
+        assert_eq!(
+            step.usage_tokens,
+            Some(34),
+            "Step 必须累计失败重试的实际用量"
+        );
+    }
+
+    #[test]
+    fn transport_observation_failure_prevents_sending_the_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = magi_bridge_client::HttpModelBridgeClient::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            None,
+            "test".into(),
+        );
+        let error = client
+            .invoke_observed(
+                request("work"),
+                magi_bridge_client::ModelInvocationOptions {
+                    on_delta: None,
+                    on_retry: &|_| {},
+                    is_cancelled: &|| false,
+                    max_output_tokens: None,
+                },
+                &|_| Err(journal_error("injected durable write failure")),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("injected durable write failure"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn native_stream_failure_settles_observed_usage_without_delivering_a_response() {
+        let (url, server) = http_fixture(vec![(
+            "200 OK",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":1}}\n\n",
+        )]);
+        let client = magi_bridge_client::HttpModelBridgeClient::new(url, None, "test".into());
+        let (store, session, thread) = store();
+        assert!(
+            StepModelClient::new(
+                &client,
+                &store,
+                &session,
+                Some("turn-journal-client"),
+                None,
+                &thread,
+                "partial-call"
+            )
+            .invoke_streaming(request("work"), &|_| {})
+            .is_err()
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+        let step = store
+            .canonical_turn_for_session_turn_id(&session, "turn-journal-client")
+            .unwrap()
+            .model_steps
+            .remove(0);
+        assert_eq!(step.status, ModelStepStatus::OutcomeUnknown);
+        assert_eq!(step.usage_tokens, Some(12));
+        assert!(step.response_fingerprint.is_none());
+        step.validate_snapshot().unwrap();
+    }
+
+    #[test]
+    fn cache_affinity_uses_lineage_across_steps_and_isolates_worker_branch() {
+        struct Capture(std::sync::Mutex<Vec<String>>);
+        impl ModelBridgeClient for Capture {
+            fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+                magi_bridge_client::native_executor_capabilities()
+            }
+            fn invoke(
+                &self,
+                request: ModelInvocationRequest,
+            ) -> Result<ModelResponse, BridgeClientError> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(request.prompt_cache_key.expect("session key"));
+                Ok(ModelResponse::completed("ok"))
+            }
+            fn invoke_streaming(
+                &self,
+                request: ModelInvocationRequest,
+                _: &dyn Fn(&ModelStreamingDelta),
+            ) -> Result<ModelResponse, BridgeClientError> {
+                self.invoke(request)
+            }
+        }
+        let (store, session, thread) = store();
+        let capture = Capture(std::sync::Mutex::new(vec![]));
+        for (revision, call) in ["first", "next-turn", "after-restart"].iter().enumerate() {
+            let mut client =
+                StepModelClient::new(&capture, &store, &session, None, None, &thread, call);
+            client.binding = Some(ModelStepBinding {
+                usage_context: None,
+                model: Some("same-model".into()),
+                provider: Some("same-provider".into()),
+                binding_revision: revision as u32,
+                settings_revision: revision as u64,
+            });
+            client.invoke(request(call)).unwrap();
+        }
+        let worker_thread = ThreadId::new("worker-thread");
+        let worker_task = TaskId::new("worker-task");
+        StepModelClient::new(
+            &capture,
+            &store,
+            &session,
+            None,
+            Some(&worker_task),
+            &worker_thread,
+            "worker",
+        )
+        .with_prompt_branch(crate::prompt_lineage::PromptBranchScope::Worker {
+            task_id: worker_task.as_str().to_string(),
+        })
+        .invoke(request("work"))
+        .unwrap();
+        let other_session = SessionId::new("other-session");
+        StepModelClient::new(
+            &capture,
+            &store,
+            &other_session,
+            None,
+            None,
+            &thread,
+            "other",
+        )
+        .invoke(request("other"))
+        .unwrap();
+        let keys = capture.0.lock().unwrap();
+        assert!(keys[..3].iter().all(|key| key == &keys[0]));
+        assert_ne!(keys[3], keys[0]);
+        assert_eq!(keys[0].len(), 64);
+        assert_ne!(keys[0], keys[4]);
+    }
+
+    #[test]
+    fn compaction_generation_rotates_cache_epoch_but_history_append_does_not() {
+        let make_request = |texts: &[&str]| ModelInvocationRequest {
+            messages: Some(
+                texts
+                    .iter()
+                    .map(|text| magi_bridge_client::ChatMessage {
+                        input_request_id: None,
+                        context_origin: Default::default(),
+                        role: "user".into(),
+                        content: Some((*text).into()),
+                        images: vec![],
+                        tool_calls: vec![],
+                        tool_call_id: None,
+                        provider_context: vec![],
+                    })
+                    .collect(),
+            ),
+            ..request("")
+        };
+        let before = PromptFrame::from_request(&make_request(&["first"]));
+        let appended = PromptFrame::from_request(&make_request(&["first", "second"]));
+        let scope = crate::prompt_lineage::ProviderCacheScope::default();
+        assert_eq!(
+            before.cache_epoch(&scope, 0, None),
+            appended.cache_epoch(&scope, 0, None)
+        );
+        assert_ne!(
+            before.cache_epoch(&scope, 0, None),
+            appended.cache_epoch(&scope, 1, None)
+        );
+    }
+
+    #[test]
+    fn history_rewrites_are_attributed_to_the_declared_projection() {
+        use crate::prompt_lineage::CacheInvalidationReason;
+        use magi_session_store::HistoryProjection;
+        struct Echo;
+        impl ModelBridgeClient for Echo {
+            fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+                magi_bridge_client::native_executor_capabilities()
+            }
+            fn invoke(
+                &self,
+                _: ModelInvocationRequest,
+            ) -> Result<ModelResponse, BridgeClientError> {
+                Ok(ModelResponse::completed("ok"))
+            }
+            fn invoke_streaming(
+                &self,
+                request: ModelInvocationRequest,
+                _: &dyn Fn(&ModelStreamingDelta),
+            ) -> Result<ModelResponse, BridgeClientError> {
+                self.invoke(request)
+            }
+        }
+        let (store, session, thread) = store();
+        let message = |role: &str, text: &str| magi_bridge_client::ChatMessage {
+            input_request_id: None,
+            context_origin: Default::default(),
+            role: role.into(),
+            content: Some(text.into()),
+            images: vec![],
+            tool_calls: vec![],
+            tool_call_id: None,
+            provider_context: vec![],
+        };
+        let invoke = |first: &str, projection: HistoryProjection, call: &str| {
+            let client = StepModelClient::new(
+                &Echo,
+                &store,
+                &session,
+                Some("turn-journal-client"),
+                None,
+                &thread,
+                call,
+            )
+            .with_history_projection(projection);
+            client
+                .invoke(ModelInvocationRequest {
+                    messages: Some(vec![
+                        message("user", first),
+                        message("assistant", "reply"),
+                        message("user", "next"),
+                    ]),
+                    ..request("")
+                })
+                .unwrap();
+        };
+        let none = HistoryProjection::default();
+        invoke("a", none, "initial");
+        invoke(
+            "b",
+            HistoryProjection {
+                demoted_tool_results: 2,
+                stale_file_facts: 0,
+            },
+            "demoted",
+        );
+        invoke(
+            "c",
+            HistoryProjection {
+                demoted_tool_results: 2,
+                stale_file_facts: 1,
+            },
+            "stale",
+        );
+        invoke(
+            "d",
+            HistoryProjection {
+                demoted_tool_results: 2,
+                stale_file_facts: 1,
+            },
+            "undeclared",
+        );
+        let turn = store
+            .canonical_turn_for_session_turn_id(&session, "turn-journal-client")
+            .unwrap();
+        let reasons = turn
+            .model_steps
+            .iter()
+            .map(|step| {
+                step.prompt_frame
+                    .as_ref()
+                    .unwrap()
+                    .cache_binding
+                    .as_ref()
+                    .unwrap()
+                    .invalidation_reason
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons,
+            vec![
+                Some(CacheInvalidationReason::Initial),
+                Some(CacheInvalidationReason::ToolHistoryDemoted),
+                Some(CacheInvalidationReason::FileFactsRefreshed),
+                Some(CacheInvalidationReason::HistoryRewritten),
+            ]
+        );
+    }
+
+    #[test]
+    fn recorded_lineage_detects_history_rewrites_and_survives_restart() {
+        use crate::prompt_lineage::{CacheInvalidationReason, ProviderCacheScope};
+        struct Capture(std::sync::Mutex<Vec<(String, String)>>);
+        impl ModelBridgeClient for Capture {
+            fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+                magi_bridge_client::native_executor_capabilities()
+            }
+            fn cache_identity(&self) -> Option<magi_bridge_client::ModelCacheIdentity> {
+                Some(magi_bridge_client::ModelCacheIdentity {
+                    protocol: "openai_responses".into(),
+                    endpoint: "https://relay.example/v1/responses".into(),
+                    model: "actual-model".into(),
+                    reasoning_profile: "{}".into(),
+                })
+            }
+            fn invoke(
+                &self,
+                request: ModelInvocationRequest,
+            ) -> Result<ModelResponse, BridgeClientError> {
+                self.0.lock().unwrap().push((
+                    request.prompt_cache_key.unwrap(),
+                    request.cache_affinity_key.unwrap(),
+                ));
+                Ok(ModelResponse::completed("ok"))
+            }
+            fn invoke_streaming(
+                &self,
+                request: ModelInvocationRequest,
+                _: &dyn Fn(&ModelStreamingDelta),
+            ) -> Result<ModelResponse, BridgeClientError> {
+                self.invoke(request)
+            }
+        }
+        let capture = Capture(std::sync::Mutex::new(Vec::new()));
+        let (store, session, thread) = store();
+        let make_request = |texts: &[&str]| ModelInvocationRequest {
+            messages: Some(
+                std::iter::once(magi_bridge_client::ChatMessage {
+                    input_request_id: None,
+                    context_origin: magi_bridge_client::ChatMessageOrigin::StaticPolicy,
+                    role: "developer".into(),
+                    content: Some("stable policy".into()),
+                    images: vec![],
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    provider_context: vec![],
+                })
+                .chain(texts.iter().enumerate().map(|(index, text)| {
+                    magi_bridge_client::ChatMessage {
+                        input_request_id: None,
+                        context_origin: Default::default(),
+                        role: if index == 0 { "user" } else { "assistant" }.into(),
+                        content: Some((*text).into()),
+                        images: vec![],
+                        tool_calls: vec![],
+                        tool_call_id: None,
+                        provider_context: if index == 0 {
+                            vec![]
+                        } else {
+                            vec![magi_bridge_client::ModelProviderContext {
+                                provider: "openai".into(),
+                                kind: "response_output_item".into(),
+                                data: serde_json::json!({
+                                    "type": "reasoning", "id": format!("rs_{index}"),
+                                    "encrypted_content": format!("signature-{text}"), "summary": [],
+                                }),
+                            }]
+                        },
+                    }
+                }))
+                .collect(),
+            ),
+            ..request("")
+        };
+        let invoke = |store: &SessionStore, texts: &[&str], call: &str| {
+            let mut client = StepModelClient::new(
+                &capture,
+                store,
+                &session,
+                Some("turn-journal-client"),
+                None,
+                &thread,
+                call,
+            );
+            // 设置快照和路由别名不是真实 transport 身份。
+            client.binding = Some(ModelStepBinding {
+                usage_context: None,
+                model: Some(call.into()),
+                provider: Some(call.into()),
+                binding_revision: call.len() as u32,
+                settings_revision: call.len() as u64,
+            });
+            client.invoke(make_request(texts)).unwrap();
+        };
+        invoke(&store, &["first"], "first");
+        invoke(&store, &["first", "second"], "appended");
+        let store = SessionStore::from_persisted_parts(
+            store.durable_state(),
+            store.execution_sidecar_store_state(),
+        )
+        .unwrap();
+        invoke(&store, &["first", "second", "third"], "after-restart");
+        invoke(&store, &["rewritten", "second", "third"], "rewrite");
+        invoke(
+            &store,
+            &["rewritten", "second", "third", "fourth"],
+            "append-after-rewrite",
+        );
+        invoke(
+            &store,
+            &["rewritten", "second", "third"],
+            "truncate-to-rewrite-boundary",
+        );
+        invoke(
+            &store,
+            &["rewritten", "second", "third", "fourth"],
+            "append-after-truncation",
+        );
+        let turn = store
+            .canonical_turn_for_session_turn_id(&session, "turn-journal-client")
+            .unwrap();
+        let steps = &turn.model_steps;
+        let bindings = steps
+            .iter()
+            .map(|step| {
+                step.prompt_frame
+                    .as_ref()
+                    .unwrap()
+                    .cache_binding
+                    .as_ref()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bindings[0].invalidation_reason,
+            Some(CacheInvalidationReason::Initial)
+        );
+        assert_eq!(bindings[1].invalidation_reason, None);
+        assert_eq!(bindings[2].invalidation_reason, None);
+        assert_eq!(
+            bindings[3].invalidation_reason,
+            Some(CacheInvalidationReason::HistoryRewritten)
+        );
+        assert_eq!(bindings[4].invalidation_reason, None);
+        assert_eq!(
+            bindings[5].invalidation_reason,
+            Some(CacheInvalidationReason::HistoryRewritten)
+        );
+        assert_eq!(bindings[6].invalidation_reason, None);
+        let captured = capture.0.lock().unwrap();
+        let keys = captured
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            captured
+                .iter()
+                .all(|(_, affinity)| affinity == &bindings[0].lineage_id)
+        );
+        assert_eq!(keys[0], keys[1]);
+        assert_eq!(keys[1], keys[2]);
+        assert_ne!(keys[2], keys[3]);
+        assert_eq!(keys[3], keys[4]);
+        assert_ne!(keys[4], keys[5]);
+        assert_eq!(keys[5], keys[6]);
+        assert_eq!(bindings[4].cache_key, keys[4]);
+
+        // 对同一持久前驱分类真实环境变化；不把每一次调用都写成 initial。
+        let frame =
+            PromptFrame::from_request(&make_request(&["rewritten", "second", "third", "fourth"]));
+        let scope = ProviderCacheScope::from_client(&capture).unwrap();
+        let lineage = || {
+            crate::prompt_lineage::PromptLineage::for_session(&session)
+                .with_provider_scope(scope.clone())
+        };
+        let previous = &steps[4];
+        for (scope, expected) in [
+            (
+                ProviderCacheScope {
+                    endpoint_fingerprint: Some("different".into()),
+                    ..scope.clone()
+                },
+                CacheInvalidationReason::ProviderChanged,
+            ),
+            (
+                ProviderCacheScope {
+                    resolved_model: Some("different".into()),
+                    ..scope.clone()
+                },
+                CacheInvalidationReason::ModelChanged,
+            ),
+            (
+                ProviderCacheScope {
+                    reasoning_profile: Some("different".into()),
+                    ..scope.clone()
+                },
+                CacheInvalidationReason::ReasoningChanged,
+            ),
+        ] {
+            let (_, binding) = frame.bind_lineage(
+                lineage().with_provider_scope(scope),
+                0,
+                None,
+                Some(previous),
+            );
+            assert_eq!(binding.invalidation_reason, Some(expected));
+            assert_ne!(binding.cache_key, bindings[4].cache_key);
+        }
+        let (_, binding) = frame.bind_lineage(lineage(), 1, None, Some(previous));
+        assert_eq!(
+            binding.invalidation_reason,
+            Some(CacheInvalidationReason::Compaction)
+        );
+        assert_ne!(binding.cache_key, bindings[4].cache_key);
+
+        for (mut changed, reason) in [
+            (frame.clone(), CacheInvalidationReason::RendererChanged),
+            (frame.clone(), CacheInvalidationReason::SkillChanged),
+            (frame.clone(), CacheInvalidationReason::ToolSurfaceChanged),
+            (frame.clone(), CacheInvalidationReason::StablePrefixChanged),
+        ] {
+            match reason {
+                CacheInvalidationReason::RendererChanged => changed.ir_version += 1,
+                CacheInvalidationReason::SkillChanged => {
+                    changed.skill_hash = "a".repeat(64);
+                    changed.stable_prefix_hash = "b".repeat(64);
+                }
+                CacheInvalidationReason::ToolSurfaceChanged => {
+                    changed.tool_surface_hash = "c".repeat(64)
+                }
+                CacheInvalidationReason::StablePrefixChanged => {
+                    changed.stable_prefix_hash = "d".repeat(64)
+                }
+                _ => unreachable!(),
+            }
+            let (_, binding) = changed.bind_lineage(lineage(), 0, None, Some(previous));
+            assert_eq!(binding.invalidation_reason, Some(reason));
+            assert_ne!(binding.cache_key, bindings[4].cache_key);
+        }
+        let mut volatile = frame.clone();
+        volatile.volatile_tail_hash = "e".repeat(64);
+        let (_, continued) = volatile.bind_lineage(lineage(), 0, None, Some(previous));
+        assert_eq!(continued.invalidation_reason, None);
+        assert_eq!(continued.cache_key, bindings[4].cache_key);
+
+        // 首个 RoundContext 后的所有消息都属于本次发送视图，不能把恢复
+        // 说明或其私有上下文当成旧历史的新增/改写。
+        let mut tail_request = make_request(&["rewritten", "second", "third", "fourth"]);
+        let mut tail = tail_request.messages.as_ref().unwrap()[2].clone();
+        tail.context_origin = magi_bridge_client::ChatMessageOrigin::RoundContext;
+        tail_request.messages.as_mut().unwrap().push(tail.clone());
+        tail.context_origin = magi_bridge_client::ChatMessageOrigin::Conversation;
+        tail.content = Some("transient recovery".into());
+        tail_request.messages.as_mut().unwrap().push(tail);
+        let tail_frame = PromptFrame::from_request(&tail_request);
+        let (_, continued) = tail_frame.bind_lineage(lineage(), 0, None, Some(previous));
+        assert_eq!(
+            tail_frame.history_message_count,
+            frame.history_message_count
+        );
+        assert_eq!(continued.invalidation_reason, None);
+        assert_eq!(continued.cache_key, bindings[4].cache_key);
+
+        // 历史之外的稳定私有上下文仍明确断代，不因上述修复被忽略。
+        let mut prefix_request = make_request(&["rewritten", "second", "third", "fourth"]);
+        prefix_request.messages.as_mut().unwrap()[0]
+            .provider_context
+            .push(magi_bridge_client::ModelProviderContext {
+                provider: "openai".into(),
+                kind: "response_output_item".into(),
+                data: serde_json::json!({"type":"reasoning", "encrypted_content":"stable"}),
+            });
+        let (_, changed) = PromptFrame::from_request(&prefix_request).bind_lineage(
+            lineage(),
+            0,
+            None,
+            Some(previous),
+        );
+        assert_eq!(
+            changed.invalidation_reason,
+            Some(CacheInvalidationReason::ProviderContextChanged)
+        );
+        assert_ne!(changed.cache_key, bindings[4].cache_key);
+
+        let mut execution = magi_bridge_client::ModelExecutionScope {
+            working_dir: None,
+            policy: crate::agent_spawn_preflight::agent_spawn_child_policy_snapshot(None),
+            requires_native_tools: true,
+            closed_skill_scope: false,
+        };
+        let (scoped, binding) = frame.bind_lineage(lineage(), 0, Some(&execution), Some(previous));
+        assert_eq!(
+            binding.invalidation_reason,
+            Some(CacheInvalidationReason::PermissionChanged)
+        );
+        let mut scoped_previous = previous.clone();
+        scoped_previous.cache_epoch = scoped.cache_epoch;
+        scoped_previous.prompt_frame.as_mut().unwrap().cache_binding = Some(binding);
+        execution.closed_skill_scope = true;
+        let (_, binding) =
+            frame.bind_lineage(lineage(), 0, Some(&execution), Some(&scoped_previous));
+        assert_eq!(
+            binding.invalidation_reason,
+            Some(CacheInvalidationReason::SkillChanged)
+        );
+
+        let mut rewritten_provider_context =
+            make_request(&["rewritten", "second", "third", "fourth"]);
+        rewritten_provider_context.messages.as_mut().unwrap()[1]
+            .provider_context
+            .push(magi_bridge_client::ModelProviderContext {
+                provider: "openai".into(),
+                kind: "response_output_item".into(),
+                data: serde_json::json!({"signature": "changed"}),
+            });
+        let (_, binding) = PromptFrame::from_request(&rewritten_provider_context).bind_lineage(
+            lineage(),
+            0,
+            None,
+            Some(previous),
+        );
+        assert_eq!(
+            binding.invalidation_reason,
+            Some(CacheInvalidationReason::HistoryRewritten)
+        );
+
+        // 生成 DTO 和领域快照必须读取同一份事实，并且不包含提示词正文或端点原文。
+        let value = serde_json::to_value(previous).unwrap();
+        serde_json::from_value::<magi_app_server_protocol::generated::ModelStep>(value.clone())
+            .unwrap();
+        let encoded = value.to_string();
+        assert!(!encoded.contains("https://relay.example"));
+        assert!(!encoded.contains("rewritten"));
+        assert!(encoded.len() < 5000, "每 Step 的缓存元数据应保持常量大小");
     }
 
     #[test]
@@ -1297,6 +2273,7 @@ mod tests {
                 ModelStep {
                     step_id: "before-pause".into(),
                     attempts: vec![ModelAttempt {
+                        transport: None,
                         attempt_id: "before-pause:attempt:1".into(),
                         started_at: now,
                         settled_at: None,
@@ -1321,6 +2298,8 @@ mod tests {
                     settled_at: None,
                     status: ModelStepStatus::Started,
                     response_fingerprint: None,
+                    prompt_frame: None,
+                    cache_epoch: 0,
                 },
             )
             .unwrap();

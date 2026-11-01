@@ -1689,6 +1689,7 @@ mod tests {
             .push(magi_session_store::ModelStep {
                 step_id: "external".into(),
                 attempts: vec![magi_session_store::ModelAttempt {
+                    transport: None,
                     attempt_id: "external:attempt:1".into(),
                     started_at: now,
                     settled_at: None,
@@ -1713,6 +1714,8 @@ mod tests {
                 settled_at: None,
                 status: magi_session_store::ModelStepStatus::Started,
                 response_fingerprint: None,
+                prompt_frame: None,
+                cache_epoch: 0,
             });
         let canonical =
             SessionStore::from_persisted_parts(durable, canonical.execution_sidecar_store_state())

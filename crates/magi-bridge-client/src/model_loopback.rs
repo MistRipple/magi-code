@@ -1,4 +1,5 @@
-use crate::llm_types::{LlmMessage, LlmMessageContent, LlmMessageParams};
+use crate::llm_types::{LlmMessage, LlmMessageContent};
+use crate::prompt_ir::PromptIr;
 use crate::protocol::{OpenAiChatCompletionsAdapter, ProviderAdapter};
 use crate::{
     LOOPBACK_MODEL_PROVIDER, ModelInvocationRequest, ModelResponse,
@@ -644,9 +645,12 @@ impl OpenAiCompatibleProviderRuntime {
             .map_err(|reason| openai_provider_misconfigured_error(provider, base_url, &reason))?;
         let adapted = OpenAiChatCompletionsAdapter
             .build_request(
-                &LlmMessageParams {
+                &PromptIr {
+                    prompt_cache_key: None,
+
                     reasoning_capability: None,
                     messages: vec![LlmMessage {
+                        origin: Default::default(),
                         role: "user".to_string(),
                         content: LlmMessageContent::Text(prompt.to_string()),
                     }],
@@ -654,7 +658,7 @@ impl OpenAiCompatibleProviderRuntime {
                     temperature: None,
                     tools: None,
                     stream: Some(false),
-                    system_prompt: None,
+
                     tool_choice: None,
                     reasoning_effort: None,
                 },
@@ -1433,6 +1437,8 @@ mod tests {
 
         let response = shim
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: OPENAI_PROVIDER_ALIAS.to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -1481,6 +1487,8 @@ mod tests {
 
         let error = shim
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: OPENAI_COMPAT_PROVIDER.to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -1510,6 +1518,8 @@ mod tests {
 
         let error = shim
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: OPENAI_COMPAT_PROVIDER.to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -1535,6 +1545,8 @@ mod tests {
 
         let error = shim
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: OPENAI_COMPAT_PROVIDER.to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -1589,6 +1601,8 @@ mod tests {
 
         let response = shim
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: OPENAI_COMPAT_PROVIDER.to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -1640,6 +1654,8 @@ mod tests {
 
         let response = shim
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: OPENAI_COMPAT_PROVIDER.to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -1678,6 +1694,8 @@ mod tests {
 
         let response = shim
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: OPENAI_COMPAT_PROVIDER.to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -1718,6 +1736,8 @@ mod tests {
 
         let response = shim
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: OPENAI_COMPAT_PROVIDER.to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -1768,6 +1788,8 @@ mod tests {
 
         let response = shim
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: OPENAI_COMPAT_PROVIDER.to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -1813,6 +1835,8 @@ mod tests {
 
         let response = shim
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: OPENAI_COMPAT_PROVIDER.to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -1847,6 +1871,8 @@ mod tests {
 
         let error = shim
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: OPENAI_COMPAT_PROVIDER.to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -1876,6 +1902,8 @@ mod tests {
 
         let error = shim
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: OPENAI_COMPAT_PROVIDER.to_string(),
                 prompt: "hello".to_string(),
                 messages: None,

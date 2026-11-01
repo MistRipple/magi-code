@@ -68,6 +68,15 @@ pub struct UsageCallIdentity {
     pub parent_call_id: Option<String>,
     pub source: UsageSourceRole,
     pub phase: UsagePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<UsageTransportIdentity>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageTransportIdentity {
+    pub request_fingerprint: String,
+    pub http_status: Option<u16>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -141,6 +150,14 @@ pub struct UsageTotals {
     pub raw_output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// 只有 Provider 明确返回 cache read（包括零）的调用才计入观测样本。
+    #[serde(default)]
+    pub cache_observed_call_count: u64,
+    #[serde(default)]
+    pub cache_hit_call_count: u64,
+    /// 已观测调用的完整输入量，统一包含缓存读取/写入；可作 token 命中率分母。
+    #[serde(default)]
+    pub cache_observed_input_tokens: u64,
     pub net_input_tokens: u64,
     pub net_output_tokens: u64,
     pub total_tokens: u64,
@@ -158,6 +175,11 @@ impl UsageTotals {
             raw_output_tokens: self.raw_output_tokens + other.raw_output_tokens,
             cache_read_tokens: self.cache_read_tokens + other.cache_read_tokens,
             cache_write_tokens: self.cache_write_tokens + other.cache_write_tokens,
+            cache_observed_call_count: self.cache_observed_call_count
+                + other.cache_observed_call_count,
+            cache_hit_call_count: self.cache_hit_call_count + other.cache_hit_call_count,
+            cache_observed_input_tokens: self.cache_observed_input_tokens
+                + other.cache_observed_input_tokens,
             net_input_tokens: self.net_input_tokens + other.net_input_tokens,
             net_output_tokens: self.net_output_tokens + other.net_output_tokens,
             total_tokens: self.total_tokens + other.total_tokens,

@@ -17,7 +17,7 @@ use magi_conversation_runtime::session_turn_execution::BUSINESS_MODEL_PROVIDER;
 use magi_conversation_runtime::usage_recording::{
     AuxiliaryModelUsageContext, invoke_auxiliary_model_with_usage,
 };
-use magi_core::{EventId, SessionId, UtcMillis, WorkspaceId};
+use magi_core::{EventId, SessionId, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::SessionStore;
 use magi_settings_store::SettingsStore;
@@ -179,17 +179,16 @@ fn generate_new_session_title(
     let trimmed = first_message.trim();
     let prompt = build_title_prompt(trimmed);
     let request = ModelInvocationRequest {
+        cache_affinity_key: None,
+        prompt_cache_key: None,
         provider: BUSINESS_MODEL_PROVIDER.to_string(),
         prompt,
         messages: None,
         tools: None,
         tool_choice: None,
     };
-    let call_id = format!(
-        "auxiliary-session-title-{}-{}",
-        session_id,
-        UtcMillis::now().0
-    );
+    let call_id =
+        magi_core::EventId::unique(format!("auxiliary-session-title-{session_id}")).to_string();
     let response = match usage_context {
         Some(usage_context) => {
             let workspace_binding = Some(usage_context.workspace_id.clone());
@@ -204,6 +203,7 @@ fn generate_new_session_title(
                     workspace_id: &workspace_binding,
                     call_id,
                     phase: UsagePhase::Integration,
+            purpose: magi_conversation_runtime::usage_recording::AuxiliaryModelPurpose::SessionTitle,
                     expected_turn_id: None,
                 },
             )

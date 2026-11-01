@@ -470,6 +470,8 @@ impl LlmTaskDispatcher {
                         )
                     };
                     let request = ModelInvocationRequest {
+                        cache_affinity_key: None,
+                        prompt_cache_key: None,
                         provider: "workflow".into(),
                         prompt: prompt.clone(),
                         messages: Some(vec![magi_bridge_client::ChatMessage {
@@ -518,7 +520,8 @@ impl LlmTaskDispatcher {
                         thread_id,
                         &call_id,
                     )
-                    .with_model_binding(settings, usage_binding);
+                    .with_model_binding(settings, usage_binding)
+                    .with_usage_assignment(task.task_id.to_string());
                     if let Some(policy) = task.policy_snapshot.as_ref() {
                         // model_request 只负责生成模型结果；工具动作由工作流下一步提交，
                         // 不能让 ExecutorOwned 在模型动作内部执行第二套工具循环。

@@ -21,6 +21,53 @@ fn make_llm_config() -> LlmConfig {
     }
 }
 
+#[test]
+fn cache_observation_excludes_missing_usage_and_normalizes_provider_denominators() {
+    let mut authority = UsageAuthority::new();
+    for (index, (read, included)) in [
+        (Some(400), true),
+        (Some(0), true),
+        (None, true),
+        (Some(400), false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut input = make_call_record_input("session-cache", &format!("call-{index}"), 1000, 10);
+        input.usage.cache_read_tokens = read;
+        input.usage.cache_read_included_in_input = included;
+        input.usage.cache_write_tokens = (!included).then_some(200);
+        let copy = input.clone();
+        authority.append_call_record(input);
+        authority.append_call_record(copy);
+    }
+    let snapshot = authority.get_session_snapshot("ws-1", "session-cache");
+    assert_eq!(snapshot.totals.llm_call_count, 4);
+    assert_eq!(snapshot.totals.cache_observed_call_count, 3);
+    assert_eq!(snapshot.totals.cache_hit_call_count, 2);
+    assert_eq!(snapshot.totals.cache_observed_input_tokens, 3600);
+    assert_eq!(snapshot.totals.cache_read_tokens, 800);
+    let workspace = authority.get_workspace_snapshot("ws-1");
+    for totals in [
+        &workspace.totals,
+        &snapshot.by_execution_binding[0].totals,
+        &snapshot.by_model_identity[0].totals,
+    ] {
+        assert_eq!(totals.cache_observed_call_count, 3);
+        assert_eq!(totals.cache_observed_input_tokens, 3600);
+    }
+    let mut old = serde_json::to_value(&snapshot.totals).unwrap();
+    for key in [
+        "cacheObservedCallCount",
+        "cacheHitCallCount",
+        "cacheObservedInputTokens",
+    ] {
+        old.as_object_mut().unwrap().remove(key);
+    }
+    let old: UsageTotals = serde_json::from_value(old).unwrap();
+    assert_eq!(old.cache_observed_call_count, 0);
+}
+
 fn make_call_record_input(
     session_id: &str,
     call_id: &str,

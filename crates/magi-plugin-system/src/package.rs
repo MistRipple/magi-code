@@ -277,6 +277,12 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
         }
         Ok(())
     };
+    for skill in &c.skills {
+        check(&skill.id, &skill.title, &skill.description)?;
+        if skill.instruction.trim().is_empty() || skill.instruction.len() > 65_536 {
+            return Err(invalid("Skill 说明为空或超出上限"));
+        }
+    }
     for tool in &c.tools {
         check(&tool.id, &tool.title, &tool.description)?;
         validate_object_schema(&tool.input_schema)?;

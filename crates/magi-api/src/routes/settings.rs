@@ -315,6 +315,8 @@ async fn execute_connection_probe(config: &NormalizedModelConfig) -> Result<(), 
         .to_http_model_client()
         .ok_or_else(|| ApiError::InvalidInput("模型配置缺少 model".to_string()))?;
     let request = ModelInvocationRequest {
+        cache_affinity_key: None,
+        prompt_cache_key: None,
         provider: "probe".to_string(),
         prompt: "ping".to_string(),
         messages: None,
@@ -2025,6 +2027,7 @@ fn usage_binding_item_json(
         "totalTokens": binding.totals.total_tokens,
         "netInputTokens": binding.totals.net_input_tokens,
         "netOutputTokens": binding.totals.net_output_tokens,
+        "cache": usage_cache_json(&binding.totals),
     })
 }
 
@@ -2038,6 +2041,21 @@ fn usage_totals_json(totals: &UsageTotals) -> serde_json::Value {
         "netOutputTokens": totals.net_output_tokens,
         "successCount": totals.success_count,
         "failureCount": totals.failure_count,
+        "cache": usage_cache_json(totals),
+    })
+}
+
+fn usage_cache_json(totals: &UsageTotals) -> serde_json::Value {
+    serde_json::json!({
+        "observedCallCount": totals.cache_observed_call_count,
+        "hitCallCount": totals.cache_hit_call_count,
+        "inputTokens": totals.cache_observed_input_tokens,
+        "readTokens": totals.cache_read_tokens,
+        "writeTokens": totals.cache_write_tokens,
+        "tokenHitRate": (totals.cache_observed_input_tokens > 0).then(||
+            totals.cache_read_tokens as f64 / totals.cache_observed_input_tokens as f64),
+        "requestHitRate": (totals.cache_observed_call_count > 0).then(||
+            totals.cache_hit_call_count as f64 / totals.cache_observed_call_count as f64),
     })
 }
 
@@ -2573,7 +2591,8 @@ mod tests {
             Some("2023-06-01")
         );
         assert_eq!(payload["model"], json!("claude-sonnet-test"));
-        assert_eq!(payload["messages"][0]["content"], json!("ping"));
+        // 末条 user 消息带滚动缓存断点，内容以等价 text block 发送。
+        assert_eq!(payload["messages"][0]["content"][0]["text"], json!("ping"));
         (
             StatusCode::OK,
             [(CONTENT_TYPE, "text/event-stream")],
@@ -5828,6 +5847,18 @@ mod tests {
         assert_eq!(payload["totals"]["netInputTokens"], serde_json::json!(12));
         assert_eq!(payload["totals"]["netOutputTokens"], serde_json::json!(5));
         assert_eq!(payload["totals"]["totalTokens"], serde_json::json!(17));
+        for cache in [
+            &payload["totals"]["cache"],
+            &payload["models"][0]["totals"]["cache"],
+            &payload["items"][0]["cache"],
+        ] {
+            assert_eq!(cache["observedCallCount"], 1);
+            assert_eq!(cache["hitCallCount"], 1);
+            assert_eq!(cache["readTokens"], 4);
+            assert_eq!(cache["writeTokens"], 3);
+            assert_eq!(cache["inputTokens"], 19);
+            assert_eq!(cache["requestHitRate"], 1.0);
+        }
         assert!(payload["totals"].get("cacheReadTokens").is_none());
         assert!(payload["totals"].get("cacheWriteTokens").is_none());
         assert!(
@@ -5855,6 +5886,8 @@ mod tests {
             .expect("global stats should build after reset")
             .0;
         assert_eq!(payload["totals"]["totalTokens"], serde_json::json!(0));
+        assert!(payload["totals"]["cache"]["tokenHitRate"].is_null());
+        assert!(payload["totals"]["cache"]["requestHitRate"].is_null());
         assert_eq!(payload["items"].as_array().unwrap().len(), 0);
         assert_eq!(payload["models"].as_array().unwrap().len(), 0);
     }

@@ -50,7 +50,7 @@ pub struct ModelCapabilityProfile {
     /// 是否支持顶层 `reasoning_effort` 字段（OpenAI Chat Completions 协议）。
     ///
     /// 命中此项的模型（GPT-5 / o3 / o4 系列）才会把
-    /// `LlmMessageParams::reasoning_effort` 注入到 OpenAI 兼容请求体。
+    /// `crate::prompt_ir::PromptIr::reasoning_effort` 注入到 OpenAI 兼容请求体。
     pub supports_openai_reasoning_effort: bool,
     /// 默认 thinking budget tokens（仅在 [`ThinkingKind::BudgetTokens`]
     /// 形态下被读取）。`0` 表示无显式默认，由适配器使用其内置默认预算。

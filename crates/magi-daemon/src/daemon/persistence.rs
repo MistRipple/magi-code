@@ -7,9 +7,9 @@ use magi_event_bus::AuditUsageLedgerSnapshot;
 use magi_knowledge_store::KnowledgeState;
 use magi_orchestrator::task_store::{TaskStore, TaskStoreSnapshot};
 use magi_session_store::{
-    CanonicalTurnMutation, SessionAcceptanceRecord, SessionDurableState, SessionEventWriter,
-    SessionExecutionSidecarStoreState, SessionInputMutation, SessionRuntimeSidecar, SessionStore,
-    UnavailableSession,
+    CanonicalTurnMutation, GOAL_DERIVED_TURN_METADATA_KEYS, SessionAcceptanceRecord,
+    SessionDurableState, SessionEventWriter, SessionExecutionSidecarStoreState,
+    SessionInputMutation, SessionRuntimeSidecar, SessionStore, UnavailableSession,
 };
 use magi_worker_runtime::{WorkerRuntime, WorkerRuntimeDurableSnapshot};
 use magi_workspace::{WorkspaceDurableState, WorkspaceRecoverySidecarStoreState, WorkspaceStore};
@@ -924,6 +924,77 @@ impl StateRepository {
         Ok((durable, sidecars))
     }
 
+    /// 删除一个启动时无法加载的会话：投影文件与 canonical 事件目录在同一个持久事务里移除，
+    /// 随后从不可用列表摘掉。只处理本次加载记录在案的会话，路径取自记录，不接受调用方给定的路径。
+    pub(crate) fn discard_unavailable_session(
+        &self,
+        session_id: &magi_core::SessionId,
+    ) -> Result<UnavailableSession, DaemonError> {
+        let workspace_roots = self.workspace_projection_roots()?;
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("state repository write lock poisoned");
+        let mut unavailable = self
+            .unavailable_sessions
+            .lock()
+            .expect("unavailable sessions lock poisoned");
+        let index = unavailable
+            .iter()
+            .position(|session| &session.session_id == session_id)
+            .ok_or_else(|| DaemonError::internal(format!("会话不在不可用列表中: {session_id}")))?;
+        let entry = unavailable[index].clone();
+        // 加载时只在内存里清除了指向该会话的 current；磁盘指针仍在。会话文件删除后
+        // 若指针还指着它，下一次启动会因“current 指向不存在的 session”整体失败，
+        // 因此在同一个事务里把指针改写为空。
+        let current_path = self.state_root.join("session-current.json");
+        let points_at_session = match fs::read_to_string(&current_path) {
+            Ok(content) => serde_json::from_str::<Option<magi_core::SessionId>>(&content)
+                .is_ok_and(|current| current.as_ref() == Some(session_id)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        let current_cleared = String::from("null");
+        let transaction = SessionProjectionTransaction {
+            schema_version: SESSION_PROJECTION_TRANSACTION_SCHEMA_VERSION,
+            transaction_id: format!(
+                "discard-unavailable-session-{}",
+                magi_core::UtcMillis::now().0
+            ),
+            writes: if points_at_session {
+                vec![SessionProjectionWrite {
+                    path: current_path.clone(),
+                    content: current_cleared.clone(),
+                }]
+            } else {
+                Vec::new()
+            },
+            removals: vec![
+                SessionProjectionRemoval {
+                    path: PathBuf::from(&entry.source_path),
+                    kind: SessionProjectionRemovalKind::File,
+                },
+                SessionProjectionRemoval {
+                    path: self.session_event_root(session_id),
+                    kind: SessionProjectionRemovalKind::Directory,
+                },
+            ],
+        };
+        self.commit_session_projection_transaction_locked(&transaction, &workspace_roots)?;
+        if points_at_session {
+            self.session_projection_cache
+                .lock()
+                .expect("session projection cache lock poisoned")
+                .global = Some((current_path, ContentDigest::of(&current_cleared)));
+        }
+        self.session_event_cache
+            .lock()
+            .expect("session event cache lock poisoned")
+            .remove(session_id);
+        unavailable.remove(index);
+        Ok(entry)
+    }
+
     /// 最近一次加载中被判定不可用的会话。
     pub(crate) fn unavailable_sessions(&self) -> Vec<UnavailableSession> {
         self.unavailable_sessions
@@ -1496,6 +1567,25 @@ impl StateRepository {
         Ok(session_id)
     }
 
+    /// 只保留事件日志负责记录的 Turn 事实；目标状态推导出的标注在恢复时重新计算，
+    /// 不参与缓存与事件重放的一致性比较。
+    fn event_fact_turns(
+        turns: &[magi_session_store::CanonicalTurn],
+    ) -> Result<serde_json::Value, DaemonError> {
+        let mut value = serde_json::to_value(turns).map_err(DaemonError::from)?;
+        for turn in value.as_array_mut().into_iter().flatten() {
+            if let Some(metadata) = turn
+                .get_mut("metadata")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                for key in GOAL_DERIVED_TURN_METADATA_KEYS {
+                    metadata.remove(key);
+                }
+            }
+        }
+        Ok(value)
+    }
+
     fn validate_cached_canonical_projection(
         cached_turns: &[magi_session_store::CanonicalTurn],
         cached_event_seq: u64,
@@ -1503,12 +1593,11 @@ impl StateRepository {
         path: &Path,
     ) -> Result<(), DaemonError> {
         if cached_event_seq == replayed.last_event_seq() {
-            let cached = serde_json::to_value(cached_turns).map_err(DaemonError::from)?;
-            let authoritative =
-                serde_json::to_value(replayed.canonical_turns()).map_err(DaemonError::from)?;
-            if !json_values_semantically_equal(&cached, &authoritative) {
+            let cached = Self::event_fact_turns(cached_turns)?;
+            let authoritative = Self::event_fact_turns(replayed.canonical_turns())?;
+            if let Some(difference) = first_json_difference(&cached, &authoritative, "$") {
                 return Err(DaemonError::internal(format!(
-                    "session projection 与相同游标的 canonical 事件重放结果不一致: {}",
+                    "session projection 与相同游标的 canonical 事件重放结果不一致（{difference}）: {}",
                     path.display()
                 )));
             }
@@ -2196,35 +2285,85 @@ impl StateRepository {
 /// 会把正常的表示差异误判为事实损坏，导致 daemon 无法恢复既有配置和会话。
 /// 事件日志仍是唯一事实源，调用方在校验后始终用重放结果覆盖缓存 projection。
 fn json_values_semantically_equal(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    first_json_difference(left, right, "$").is_none()
+}
+
+/// 返回两份 JSON 第一处语义差异的路径与两侧摘要；没有差异时返回 `None`。
+/// 校验失败必须指出具体字段，否则只能看到“不一致”而无法判断是哪份事实被改写。
+fn first_json_difference(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+    path: &str,
+) -> Option<String> {
+    fn brief(value: &serde_json::Value) -> String {
+        let text = value.to_string();
+        if text.chars().count() > 160 {
+            format!("{}…", text.chars().take(160).collect::<String>())
+        } else {
+            text
+        }
+    }
+    let differs = || {
+        Some(format!(
+            "{path}: 缓存={} 重放={}",
+            brief(left),
+            brief(right)
+        ))
+    };
     match (left, right) {
-        (serde_json::Value::Null, serde_json::Value::Null)
-        | (serde_json::Value::Bool(_), serde_json::Value::Bool(_))
-        | (serde_json::Value::String(_), serde_json::Value::String(_)) => left == right,
-        (serde_json::Value::Number(left), serde_json::Value::Number(right)) => {
-            left == right
-                || match (left.as_f64(), right.as_f64()) {
-                    (Some(left), Some(right)) => {
-                        left.is_finite() && right.is_finite() && left == right
+        (serde_json::Value::Null, serde_json::Value::Null) => None,
+        (serde_json::Value::Bool(left_value), serde_json::Value::Bool(right_value)) => {
+            (left_value != right_value).then(differs).flatten()
+        }
+        (serde_json::Value::String(left_value), serde_json::Value::String(right_value)) => {
+            (left_value != right_value).then(differs).flatten()
+        }
+        (serde_json::Value::Number(left_value), serde_json::Value::Number(right_value)) => {
+            let equal = left_value == right_value
+                || match (left_value.as_f64(), right_value.as_f64()) {
+                    (Some(left_value), Some(right_value)) => {
+                        left_value.is_finite()
+                            && right_value.is_finite()
+                            && left_value == right_value
                     }
                     _ => false,
-                }
+                };
+            (!equal).then(differs).flatten()
         }
-        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| json_values_semantically_equal(left, right))
-        }
-        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
-            left.len() == right.len()
-                && left.iter().all(|(key, left)| {
-                    right
-                        .get(key)
-                        .is_some_and(|right| json_values_semantically_equal(left, right))
+        (serde_json::Value::Array(left_items), serde_json::Value::Array(right_items)) => {
+            if left_items.len() != right_items.len() {
+                return Some(format!(
+                    "{path}: 数组长度 缓存={} 重放={}",
+                    left_items.len(),
+                    right_items.len()
+                ));
+            }
+            left_items
+                .iter()
+                .zip(right_items)
+                .enumerate()
+                .find_map(|(index, (left, right))| {
+                    first_json_difference(left, right, &format!("{path}[{index}]"))
                 })
         }
-        _ => false,
+        (serde_json::Value::Object(left_fields), serde_json::Value::Object(right_fields)) => {
+            if let Some(key) = left_fields
+                .keys()
+                .find(|key| !right_fields.contains_key(*key))
+            {
+                return Some(format!("{path}.{key}: 仅缓存存在"));
+            }
+            if let Some(key) = right_fields
+                .keys()
+                .find(|key| !left_fields.contains_key(*key))
+            {
+                return Some(format!("{path}.{key}: 仅重放存在"));
+            }
+            left_fields.iter().find_map(|(key, left)| {
+                first_json_difference(left, &right_fields[key], &format!("{path}.{key}"))
+            })
+        }
+        _ => differs(),
     }
 }
 
@@ -2517,6 +2656,36 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn cached_projection_ignores_goal_derived_turn_metadata() {
+        // 事件日志在目标仍活跃时记录了 goal_progress；目标之后阻塞于该 Turn，
+        // 恢复推导会去掉该标注。两者不能被判成“事实被改写”。
+        let turn = |scope: Option<&str>| {
+            let mut turn: magi_session_store::CanonicalTurn =
+                serde_json::from_value(serde_json::json!({
+                    "sessionId": "s", "turnId": "t", "turnSeq": 1, "acceptedAt": 1,
+                    "completedAt": 2, "status": "failed", "responseDurationMs": 1,
+                    "items": [], "metadata": {"goalId": "g"}
+                }))
+                .expect("turn fixture should deserialize");
+            if let Some(scope) = scope {
+                turn.metadata.insert(
+                    "responseDurationScope".to_string(),
+                    serde_json::Value::String(scope.to_string()),
+                );
+            }
+            turn
+        };
+        let with_scope = StateRepository::event_fact_turns(&[turn(Some("goal_progress"))]).unwrap();
+        let without_scope = StateRepository::event_fact_turns(&[turn(None)]).unwrap();
+        assert!(json_values_semantically_equal(&with_scope, &without_scope));
+
+        let mut changed = turn(None);
+        changed.status = magi_session_store::CanonicalTurnStatus::Completed;
+        let changed = StateRepository::event_fact_turns(&[changed]).unwrap();
+        assert!(!json_values_semantically_equal(&without_scope, &changed));
+    }
+
     fn accepted_session_store(
         session_id: &str,
         workspace_id: Option<&str>,
@@ -2625,6 +2794,71 @@ mod tests {
             created_at: UtcMillis(accepted_at),
             updated_at: UtcMillis(accepted_at),
         }
+    }
+
+    #[test]
+    fn discarding_an_unavailable_session_removes_only_its_files() {
+        let state_root = unique_temp_dir("magi-discard-unavailable-session");
+        let repository = StateRepository::new(state_root.clone());
+        let store = SessionStore::new();
+        let healthy_id = SessionId::new("session-healthy");
+        let corrupted_id = SessionId::new("session-corrupted");
+        for (id, title) in [(&healthy_id, "healthy"), (&corrupted_id, "corrupted")] {
+            store
+                .create_session(id.clone(), title)
+                .expect("session should create");
+        }
+        store
+            .persist_projection_with(|durable, sidecars| {
+                repository.save_session_projection_state(durable, sidecars)
+            })
+            .expect("projections should save");
+        let corrupted_path = repository
+            .session_projection_root()
+            .join(StateRepository::session_projection_file_name(&corrupted_id));
+        fs::write(&corrupted_path, b"{\"version\":2,<<<<<<< HEAD").expect("corrupt projection");
+        let event_root = repository.session_event_root(&corrupted_id);
+        fs::create_dir_all(&event_root).expect("event root");
+        fs::write(
+            event_root.join("00000000000000000001-00000000000000000001.json"),
+            b"{}",
+        )
+        .expect("event file");
+
+        let restarted = StateRepository::new(state_root.clone());
+        restarted
+            .load_session_projections(&[])
+            .expect("单个会话损坏不能阻止其余会话启动");
+        assert!(
+            restarted
+                .discard_unavailable_session(&SessionId::new("session-healthy"))
+                .is_err(),
+            "只有记录在案的不可用会话可以被清理"
+        );
+
+        let discarded = restarted
+            .discard_unavailable_session(&corrupted_id)
+            .expect("unavailable session should be discarded");
+        assert_eq!(discarded.session_id, corrupted_id);
+        assert!(!corrupted_path.exists(), "投影文件必须被删除");
+        assert!(!event_root.exists(), "事件目录必须被删除");
+        assert!(restarted.unavailable_sessions().is_empty());
+        assert!(
+            repository
+                .session_projection_root()
+                .join(StateRepository::session_projection_file_name(&healthy_id))
+                .exists(),
+            "健康会话文件不能被牵连"
+        );
+
+        let reloaded = StateRepository::new(state_root.clone());
+        let (restored, _) = reloaded
+            .load_session_projections(&[])
+            .expect("清理后应能正常启动");
+        assert_eq!(restored.sessions.len(), 1);
+        assert!(reloaded.unavailable_sessions().is_empty());
+
+        let _ = fs::remove_dir_all(state_root);
     }
 
     #[test]
@@ -4471,6 +4705,7 @@ mod tests {
                     &turn_id,
                     magi_session_store::ModelStep {
                         attempts: vec![magi_session_store::ModelAttempt {
+                            transport: None,
                             attempt_id: format!("{step_id}:attempt:1"),
                             started_at: now,
                             settled_at: None,
@@ -4498,6 +4733,31 @@ mod tests {
                         settled_at: None,
                         status: magi_session_store::ModelStepStatus::Started,
                         response_fingerprint: None,
+                        prompt_frame: (index == 0).then(|| {
+                            serde_json::from_value(serde_json::json!({
+                                "irVersion": 2,
+                                "stablePrefixHash": "a".repeat(64),
+                                "appendOnlyHistoryHash": "b".repeat(64),
+                                "toolSurfaceHash": "c".repeat(64),
+                                "volatileTailHash": "d".repeat(64),
+                                "providerContextHash": "e".repeat(64),
+                                "postBoundaryHash": "f".repeat(64),
+                                "historyMessageCount": 1,
+                                "historyChainHash": "1".repeat(64),
+                                "cacheBinding": {
+                                    "lineageId": "2".repeat(64),
+                                    "cacheKey": "3".repeat(64),
+                                    "providerHash": "4".repeat(64),
+                                    "modelHash": "5".repeat(64),
+                                    "reasoningHash": "6".repeat(64),
+                                    "executionScopeHash": "7".repeat(64),
+                                    "skillScopeHash": "8".repeat(64),
+                                    "invalidationReason": "initial"
+                                }
+                            }))
+                            .unwrap()
+                        }),
+                        cache_epoch: if index == 0 { 42 } else { 0 },
                     },
                 )
                 .unwrap();

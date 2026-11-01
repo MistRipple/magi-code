@@ -1,24 +1,32 @@
-use crate::llm_types::{
-    LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams, ToolChoice, ToolDefinition,
-    ToolInputSchema, parse_tool_result_model_content,
-};
+#[cfg(test)]
+use crate::llm_types::{LlmMessage, LlmMessageContent};
+use crate::llm_types::{ToolChoice, canonicalize_json};
+use crate::prompt_ir::PromptIr;
+use crate::prompt_ir::compile_prompt_ir;
+#[cfg(test)]
+use crate::prompt_ir::normalize_chat_tool_call_history;
 #[cfg(test)]
 use crate::protocol::AdaptedResponse;
 use crate::protocol::streaming::{
     SseLineParser, StreamAccumulator, parse_stream_event, parse_stream_provider_context,
 };
 use crate::protocol::{
-    AnthropicMessagesAdapter, OpenAiChatCompletionsAdapter, OpenAiResponsesAdapter,
+    AdaptedRequest, AnthropicMessagesAdapter, OpenAiChatCompletionsAdapter, OpenAiResponsesAdapter,
     ProviderAdapter, ProviderFamily, ProviderToolNameCodec,
 };
+#[cfg(test)]
+use crate::types::ChatMessageOrigin;
 use crate::types::{
     BridgeClientError, BridgeErrorLayer, ModelBridgeClient, ModelInvocationRequest, ModelResponse,
     ModelRetryRuntimeEvent, ModelRetryRuntimePhase, ModelStreamingDelta,
     model_invocation_cancelled_error, model_invocation_error_is_cancelled,
 };
+use crate::{ModelInvocationOptions, ModelTransportEvent, ModelTransportObserver};
+use magi_app_server_protocol::{ModelTransportOutcome, ModelTransportUsage};
 use magi_usage_authority::ReasoningEffort;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
@@ -76,6 +84,33 @@ pub enum HttpModelBridgeProtocol {
     AnthropicMessages,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderCacheRouteKey {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderCacheControl {
+    None,
+    AnthropicEphemeral,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderContinuation {
+    None,
+    PreviousResponseId,
+    Websocket,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderCacheContract {
+    pub route_key: ProviderCacheRouteKey,
+    pub cache_control: ProviderCacheControl,
+    pub continuation: ProviderContinuation,
+}
+
 /// 直接通过 HTTP 调用已配置的模型提供方，绕过 JSON-RPC 子进程 loopback。
 ///
 /// HTTP I/O 放在独立线程执行，避免与调用方已经存在的 tokio runtime 冲突。
@@ -96,6 +131,61 @@ struct HttpModelRequest {
     body: serde_json::Value,
     headers: Vec<(String, String)>,
     tool_name_codec: ProviderToolNameCodec,
+}
+
+fn transport_started(
+    body: &Value,
+    observer: &ModelTransportObserver<'_>,
+) -> Result<(), BridgeClientError> {
+    observer(&ModelTransportEvent::Started {
+        request_fingerprint: magi_core::hex_lower(Sha256::digest(body.to_string().as_bytes())),
+    })
+}
+
+fn transport_finished<T>(
+    result: &Result<T, BridgeClientError>,
+    observer: &ModelTransportObserver<'_>,
+) -> Result<(), BridgeClientError> {
+    observer(&ModelTransportEvent::Finished {
+        outcome: match result {
+            Ok(_) => ModelTransportOutcome::Succeeded,
+            Err(error) if model_invocation_error_is_cancelled(error) => {
+                ModelTransportOutcome::Cancelled
+            }
+            Err(_) => ModelTransportOutcome::Failed,
+        },
+    })
+}
+
+fn transport_usage(usage: &crate::llm_types::LlmUsage) -> ModelTransportUsage {
+    ModelTransportUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        cache_read_included_in_input: usage.cache_read_included_in_input,
+    }
+}
+
+fn model_response_transport_usage(
+    response: &crate::types::ModelResponse,
+) -> Option<ModelTransportUsage> {
+    let usage = response.usage.as_ref()?.clone();
+    let usage = serde_json::from_value::<crate::llm_types::LlmUsage>(usage).ok()?;
+    Some(transport_usage(&usage))
+}
+
+fn observed_response_usage(family: ProviderFamily, body: &str) -> Option<ModelTransportUsage> {
+    // 缺少 usage 不是零用量；只有提供方明确返回时才规范化并记录。
+    let raw: Value = serde_json::from_str(body).ok()?;
+    raw.get("usage").filter(|usage| usage.is_object())?;
+    let response = match family {
+        ProviderFamily::OpenAiChat => OpenAiChatCompletionsAdapter.parse_response(200, body),
+        ProviderFamily::OpenAiResponses => OpenAiResponsesAdapter.parse_response(200, body),
+        ProviderFamily::Anthropic => AnthropicMessagesAdapter.parse_response(200, body),
+    }
+    .ok()?;
+    Some(transport_usage(&response.usage))
 }
 
 #[cfg(test)]
@@ -174,6 +264,36 @@ impl HttpModelBridgeClient {
         }
     }
 
+    /// Provider 缓存能力的唯一协议合同；未知能力保持保守，不猜测兼容代理行为。
+    pub fn cache_contract(&self) -> ProviderCacheContract {
+        match self.protocol {
+            HttpModelBridgeProtocol::Responses => ProviderCacheContract {
+                route_key: ProviderCacheRouteKey::Supported,
+                cache_control: ProviderCacheControl::None,
+                continuation: ProviderContinuation::None,
+            },
+            HttpModelBridgeProtocol::ChatCompletions => {
+                let direct_openai = reqwest::Url::parse(&self.base_url)
+                    .ok()
+                    .is_some_and(|url| url.host_str() == Some("api.openai.com"));
+                ProviderCacheContract {
+                    route_key: if direct_openai {
+                        ProviderCacheRouteKey::Supported
+                    } else {
+                        ProviderCacheRouteKey::Unknown
+                    },
+                    cache_control: ProviderCacheControl::None,
+                    continuation: ProviderContinuation::None,
+                }
+            }
+            HttpModelBridgeProtocol::AnthropicMessages => ProviderCacheContract {
+                route_key: ProviderCacheRouteKey::Unsupported,
+                cache_control: ProviderCacheControl::AnthropicEphemeral,
+                continuation: ProviderContinuation::None,
+            },
+        }
+    }
+
     fn request_headers(&self) -> Vec<(String, String)> {
         match self.protocol {
             HttpModelBridgeProtocol::ChatCompletions | HttpModelBridgeProtocol::Responses => self
@@ -189,6 +309,7 @@ impl HttpModelBridgeClient {
         }
     }
 
+    #[cfg(test)]
     fn build_http_request(
         &self,
         request: &ModelInvocationRequest,
@@ -204,13 +325,63 @@ impl HttpModelBridgeClient {
         max_output_tokens: Option<u32>,
     ) -> Result<HttpModelRequest, BridgeClientError> {
         let mut headers = self.request_headers();
-        let mut params = llm_message_params_from_invocation(
-            request,
-            stream,
-            self.reasoning_effort,
-            max_output_tokens,
+        // 多账号网关按会话把请求固定到同一个上游账号（各账号的提示词缓存互不共享）。
+        // 头部用稳定 branch 摘要；Provider 缓存键随 epoch 断代不应重新分配上游账号。
+        if let Some(key) = request
+            .cache_affinity_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+        {
+            headers.push(("X-Session-Id".to_string(), key.to_string()));
+        }
+        let (params, tool_name_codec) = self.prepare_prompt_ir(request, stream, max_output_tokens);
+        let mut adapted = self.adapt_request(&params)?;
+        let url =
+            build_protocol_endpoint_url(&self.base_url, &adapted.url_path).map_err(|reason| {
+                BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::Protocol,
+                    code: None,
+                    message: format!("invalid base_url: {reason}"),
+                }
+            })?;
+        crate::request_fingerprint::record_request_fingerprint(
+            &self.model,
+            &adapted.url_path,
+            &adapted.body,
+            params.volatile_tail_messages(),
         );
+        headers.append(&mut adapted.extra_headers);
+        Ok(HttpModelRequest {
+            url,
+            body: adapted.body,
+            headers,
+            tool_name_codec,
+        })
+    }
+
+    /// 真实发送与缓存摘要共用的 Prompt IR 预处理。
+    ///
+    /// 这里是唯一同时处理 provider 能力降级和工具 wire name 编码的入口。
+    /// `cache_prompt_ir` 调用同一函数，避免缓存身份仍基于 canonical 工具名而
+    /// 实际请求使用编码后的名称。
+    fn prepare_prompt_ir(
+        &self,
+        request: &ModelInvocationRequest,
+        stream: bool,
+        max_output_tokens: Option<u32>,
+    ) -> (PromptIr, ProviderToolNameCodec) {
+        let mut params =
+            compile_prompt_ir(request, stream, self.reasoning_effort, max_output_tokens);
         params.reasoning_capability = self.reasoning_capability.clone();
+        // Chat Completions 兼容服务不保证接受 OpenAI 缓存扩展；直接 OpenAI
+        // 连接才自动发送。Responses 沿其标准字段，Anthropic 由断点负责。
+        if matches!(
+            self.cache_contract().route_key,
+            ProviderCacheRouteKey::Unknown | ProviderCacheRouteKey::Unsupported
+        ) && matches!(self.protocol, HttpModelBridgeProtocol::ChatCompletions)
+        {
+            params.prompt_cache_key = None;
+        }
         if matches!(params.tool_choice, Some(ToolChoice::Typed { .. })) {
             match self.forced_tool_choice_capability() {
                 ForcedToolChoiceCapability::Required => {
@@ -227,49 +398,33 @@ impl HttpModelBridgeClient {
         }
         let tool_name_codec = ProviderToolNameCodec::for_params(&params);
         tool_name_codec.encode_request_params(&mut params);
-        let mut adapted = match self.protocol {
+        (params, tool_name_codec)
+    }
+
+    fn adapt_request(&self, params: &PromptIr) -> Result<AdaptedRequest, BridgeClientError> {
+        match self.protocol {
             HttpModelBridgeProtocol::ChatCompletions => OpenAiChatCompletionsAdapter
-                .build_request(&params, &self.model)
+                .build_request(params, &self.model)
                 .map_err(|reason| BridgeClientError::CallFailed {
                     layer: BridgeErrorLayer::Protocol,
                     code: None,
                     message: format!("build openai chat request failed: {reason}"),
-                })?,
+                }),
             HttpModelBridgeProtocol::Responses => OpenAiResponsesAdapter
-                .build_request(&params, &self.model)
+                .build_request(params, &self.model)
                 .map_err(|reason| BridgeClientError::CallFailed {
                     layer: BridgeErrorLayer::Protocol,
                     code: None,
                     message: format!("build openai responses request failed: {reason}"),
-                })?,
+                }),
             HttpModelBridgeProtocol::AnthropicMessages => AnthropicMessagesAdapter
-                .build_request(&params, &self.model)
+                .build_request(params, &self.model)
                 .map_err(|reason| BridgeClientError::CallFailed {
                     layer: BridgeErrorLayer::Protocol,
                     code: None,
                     message: format!("build anthropic request failed: {reason}"),
-                })?,
-        };
-        let url =
-            build_protocol_endpoint_url(&self.base_url, &adapted.url_path).map_err(|reason| {
-                BridgeClientError::CallFailed {
-                    layer: BridgeErrorLayer::Protocol,
-                    code: None,
-                    message: format!("invalid base_url: {reason}"),
-                }
-            })?;
-        crate::request_fingerprint::record_request_fingerprint(
-            &self.model,
-            &adapted.url_path,
-            &adapted.body,
-        );
-        headers.append(&mut adapted.extra_headers);
-        Ok(HttpModelRequest {
-            url,
-            body: adapted.body,
-            headers,
-            tool_name_codec,
-        })
+                }),
+        }
     }
 
     #[cfg(test)]
@@ -286,6 +441,8 @@ impl HttpModelBridgeClient {
     #[cfg(test)]
     pub fn build_probe_request(&self) -> Result<ModelProbeRequest, BridgeClientError> {
         let request = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "probe".to_string(),
             prompt: "ping".to_string(),
             messages: None,
@@ -320,6 +477,7 @@ impl HttpModelBridgeClient {
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
         is_cancelled: &dyn Fn() -> bool,
         max_output_tokens: Option<u32>,
+        observer: &ModelTransportObserver<'_>,
     ) -> Result<ModelResponse, BridgeClientError> {
         if request.prompt.trim().is_empty() && request.messages.is_none() {
             return Err(BridgeClientError::CallFailed {
@@ -349,8 +507,11 @@ impl HttpModelBridgeClient {
                         on_delta(delta);
                     }
                 },
-                on_retry,
-                is_cancelled,
+                TransportRetryControls {
+                    on_retry,
+                    is_cancelled,
+                    observer,
+                },
             );
 
             match result {
@@ -427,6 +588,7 @@ struct ModelProviderPermit {
 }
 
 impl ModelProviderGate {
+    #[cfg(test)]
     fn acquire(&self, key: &str) -> ModelProviderPermit {
         let cancellation = AtomicBool::new(false);
         self.acquire_cancellable(key, &cancellation)
@@ -555,24 +717,6 @@ fn shared_request_http_client() -> Result<reqwest::Client, BridgeClientError> {
     }
 }
 
-fn shared_blocking_http_client() -> Result<reqwest::blocking::Client, BridgeClientError> {
-    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
-    match CLIENT.get_or_init(|| {
-        reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(client) => Ok(client.clone()),
-        Err(message) => Err(BridgeClientError::CallFailed {
-            layer: BridgeErrorLayer::Transport,
-            code: Some(-32005),
-            message: format!("HTTP blocking client build failed: {message}"),
-        }),
-    }
-}
-
 fn normalize_provider_base_url(base_url: &str) -> String {
     base_url.trim().trim_end_matches('/').to_string()
 }
@@ -695,7 +839,7 @@ fn is_transient_provider_error_text(normalized: &str) -> bool {
 }
 
 fn retryable_bridge_error(error: &BridgeClientError) -> bool {
-    if model_invocation_error_is_cancelled(error) {
+    if model_invocation_error_is_cancelled(error) || error.code() == Some(-32096) {
         return false;
     }
     match error {
@@ -757,17 +901,6 @@ fn provider_stream_idle_timeout() -> Duration {
     )
 }
 
-fn sleep_before_retry(retry_attempt: usize) {
-    sleep_retry_delay(provider_retry_delay(retry_attempt, None));
-}
-
-fn sleep_retry_delay(delay: Duration) {
-    #[cfg(not(test))]
-    std::thread::sleep(delay);
-    #[cfg(test)]
-    let _ = delay;
-}
-
 fn sleep_retry_delay_cancellable(delay: Duration, is_cancelled: &dyn Fn() -> bool) -> bool {
     #[cfg(test)]
     {
@@ -796,6 +929,10 @@ fn sleep_retry_delay_cancellable(delay: Duration, is_cancelled: &dyn Fn() -> boo
 }
 
 type HttpPostResult = Result<(u16, String, Option<Duration>), BridgeClientError>;
+enum HttpPostMessage {
+    Headers(u16),
+    Done(HttpPostResult),
+}
 type StreamingHttpResult = Result<ModelResponse, BridgeClientError>;
 type ToolChoiceFallbackHttpResult = Result<
     (
@@ -808,12 +945,21 @@ type ToolChoiceFallbackHttpResult = Result<
     BridgeClientError,
 >;
 
+/// 一次 transport retry loop 共用的控制回调。把取消、重试生命周期和持久化
+/// 观测作为同一组依赖传递，避免不同协议路径继续扩张参数列表或遗漏其中一项。
+struct TransportRetryControls<'a> {
+    on_retry: &'a dyn Fn(&ModelRetryRuntimeEvent),
+    is_cancelled: &'a dyn Fn() -> bool,
+    observer: &'a ModelTransportObserver<'a>,
+}
+
 fn receive_cancellable_http_result(
-    rx: mpsc::Receiver<HttpPostResult>,
+    rx: mpsc::Receiver<HttpPostMessage>,
     cancellation_tx: tokio::sync::oneshot::Sender<()>,
     cancellation: &AtomicBool,
     is_cancelled: &dyn Fn() -> bool,
     disconnected_message: &'static str,
+    observer: &ModelTransportObserver<'_>,
 ) -> HttpPostResult {
     let mut cancellation_tx = Some(cancellation_tx);
     let mut cancellation_requested = false;
@@ -826,7 +972,11 @@ fn receive_cancellable_http_result(
             cancellation_requested = true;
         }
         match rx.recv_timeout(MODEL_CANCELLATION_POLL_INTERVAL) {
-            Ok(result) => {
+            Ok(HttpPostMessage::Headers(status)) => observer(&ModelTransportEvent::Updated {
+                http_status: Some(status),
+                usage: None,
+            })?,
+            Ok(HttpPostMessage::Done(result)) => {
                 return if cancellation_requested {
                     Err(model_invocation_cancelled_error())
                 } else {
@@ -845,70 +995,13 @@ fn receive_cancellable_http_result(
     }
 }
 
-/// Execute a blocking HTTP POST on a dedicated thread so we never conflict
-/// with a tokio runtime that may be active in the caller's context.
-///
-/// This avoids the "Cannot drop a runtime in a context where blocking is not
-/// allowed" panic that `reqwest::blocking::Client` triggers when constructed
-/// or dropped inside a `#[tokio::test]` or other async context.
-fn execute_http_post(
-    provider_key: String,
-    url: String,
-    body: serde_json::Value,
-    headers: Vec<(String, String)>,
-) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
-    std::thread::spawn(move || {
-        let _permit = model_provider_gate().acquire(&provider_key);
-        let client = shared_blocking_http_client()?;
-
-        let mut req_builder = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .json(&body);
-
-        for (name, value) in headers {
-            req_builder = req_builder.header(name.as_str(), value.as_str());
-        }
-
-        let response = req_builder
-            .send()
-            .map_err(|error| BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::Transport,
-                code: Some(-32005),
-                message: format!("provider transport failed: {error}"),
-            })?;
-
-        let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| parse_retry_after(value, SystemTime::now()));
-        let response_body = response
-            .text()
-            .map_err(|error| BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::Transport,
-                code: Some(-32005),
-                message: format!("reading response body failed: {error}"),
-            })?;
-
-        Ok((status, response_body, retry_after))
-    })
-    .join()
-    .map_err(|_| BridgeClientError::CallFailed {
-        layer: BridgeErrorLayer::Transport,
-        code: Some(-32005),
-        message: "HTTP request thread panicked".to_string(),
-    })?
-}
-
 fn execute_cancellable_http_post(
     provider_key: String,
     url: String,
     body: serde_json::Value,
     headers: Vec<(String, String)>,
     is_cancelled: &dyn Fn() -> bool,
+    observer: &ModelTransportObserver<'_>,
 ) -> HttpPostResult {
     let cancellation = Arc::new(AtomicBool::new(false));
     let worker_cancellation = cancellation.clone();
@@ -919,11 +1012,11 @@ fn execute_cancellable_http_post(
             .acquire_cancellable(&provider_key, worker_cancellation.as_ref())
         {
             Some(_permit) => shared_http_runtime().and_then(|runtime| {
-                runtime.block_on(async_http_post_io(url, body, headers, cancellation_rx))
+                runtime.block_on(async_http_post_io(url, body, headers, cancellation_rx, &tx))
             }),
             None => Err(model_invocation_cancelled_error()),
         };
-        let _ = tx.send(result);
+        let _ = tx.send(HttpPostMessage::Done(result));
     });
 
     receive_cancellable_http_result(
@@ -932,6 +1025,7 @@ fn execute_cancellable_http_post(
         cancellation.as_ref(),
         is_cancelled,
         "HTTP request thread terminated unexpectedly",
+        observer,
     )
 }
 
@@ -940,6 +1034,7 @@ async fn async_http_post_io(
     body: serde_json::Value,
     headers: Vec<(String, String)>,
     mut cancellation_rx: tokio::sync::oneshot::Receiver<()>,
+    progress: &mpsc::Sender<HttpPostMessage>,
 ) -> HttpPostResult {
     let client = shared_request_http_client()?;
     let mut request = client
@@ -960,6 +1055,7 @@ async fn async_http_post_io(
         message: format!("provider transport failed: {error}"),
     })?;
     let status = response.status().as_u16();
+    let _ = progress.send(HttpPostMessage::Headers(status));
     let retry_after = response
         .headers()
         .get(reqwest::header::RETRY_AFTER)
@@ -982,12 +1078,18 @@ fn execute_cancellable_http_post_with_retries(
     url: String,
     body: serde_json::Value,
     headers: Vec<(String, String)>,
-    on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
-    is_cancelled: &dyn Fn() -> bool,
+    provider_family: ProviderFamily,
+    controls: TransportRetryControls<'_>,
 ) -> HttpPostResult {
     let mut retries = 0usize;
     loop {
-        if is_cancelled() {
+        if (controls.is_cancelled)() {
+            return Err(model_invocation_cancelled_error());
+        }
+        transport_started(&body, controls.observer)?;
+        if (controls.is_cancelled)() {
+            let result = Err(model_invocation_cancelled_error());
+            transport_finished::<()>(&result, controls.observer)?;
             return Err(model_invocation_cancelled_error());
         }
         let result = execute_cancellable_http_post(
@@ -995,8 +1097,28 @@ fn execute_cancellable_http_post_with_retries(
             url.clone(),
             body.clone(),
             headers.clone(),
-            is_cancelled,
+            controls.is_cancelled,
+            controls.observer,
         );
+        if let Ok((status, response_body, _)) = &result {
+            let usage = observed_response_usage(provider_family, response_body);
+            (controls.observer)(&ModelTransportEvent::Updated {
+                http_status: Some(*status),
+                usage,
+            })?;
+        }
+        let outcome = match &result {
+            Ok((status, body, _))
+                if (200..300).contains(status) && provider_error_message(body).is_none() =>
+            {
+                ModelTransportOutcome::Succeeded
+            }
+            Err(error) if model_invocation_error_is_cancelled(error) => {
+                ModelTransportOutcome::Cancelled
+            }
+            _ => ModelTransportOutcome::Failed,
+        };
+        (controls.observer)(&ModelTransportEvent::Finished { outcome })?;
         let delay = match &result {
             Ok((status, response_body, retry_after))
                 if retryable_http_response(*status, response_body)
@@ -1011,7 +1133,7 @@ fn execute_cancellable_http_post_with_retries(
         };
         let Some(delay) = delay else {
             if retries > 0 {
-                on_retry(&ModelRetryRuntimeEvent {
+                (controls.on_retry)(&ModelRetryRuntimeEvent {
                     phase: ModelRetryRuntimePhase::Settled,
                     attempt: retries,
                     max_attempts: MODEL_PROVIDER_MAX_RETRIES,
@@ -1021,16 +1143,16 @@ fn execute_cancellable_http_post_with_retries(
             return result;
         };
         retries += 1;
-        on_retry(&ModelRetryRuntimeEvent {
+        (controls.on_retry)(&ModelRetryRuntimeEvent {
             phase: ModelRetryRuntimePhase::Scheduled,
             attempt: retries,
             max_attempts: MODEL_PROVIDER_MAX_RETRIES,
             delay_ms: Some(delay.as_millis() as u64),
         });
-        if !sleep_retry_delay_cancellable(delay, is_cancelled) {
+        if !sleep_retry_delay_cancellable(delay, controls.is_cancelled) {
             return Err(model_invocation_cancelled_error());
         }
-        on_retry(&ModelRetryRuntimeEvent {
+        (controls.on_retry)(&ModelRetryRuntimeEvent {
             phase: ModelRetryRuntimePhase::AttemptStarted,
             attempt: retries,
             max_attempts: MODEL_PROVIDER_MAX_RETRIES,
@@ -1039,43 +1161,9 @@ fn execute_cancellable_http_post_with_retries(
     }
 }
 
-fn execute_http_post_with_retries(
-    provider_key: String,
-    url: String,
-    body: serde_json::Value,
-    headers: Vec<(String, String)>,
-) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
-    let mut retries = 0usize;
-    loop {
-        let result = execute_http_post(
-            provider_key.clone(),
-            url.clone(),
-            body.clone(),
-            headers.clone(),
-        );
-        match result {
-            Ok((status, response_body, retry_after))
-                if retryable_http_response(status, &response_body)
-                    && retries < MODEL_PROVIDER_MAX_RETRIES =>
-            {
-                retries += 1;
-                sleep_retry_delay(provider_retry_delay(retries, retry_after));
-                continue;
-            }
-            Err(error)
-                if retryable_bridge_error(&error) && retries < MODEL_PROVIDER_MAX_RETRIES =>
-            {
-                retries += 1;
-                sleep_before_retry(retries);
-                continue;
-            }
-            other => return other,
-        }
-    }
-}
-
 /// 流式 HTTP 线程发回的消息类型。
 enum StreamMessage {
+    Observation(ModelTransportEvent),
     /// LLM 增量快照——携带已累积的正文与上游 thinking。
     Chunk(ModelStreamingDelta),
     /// HTTP I/O 结束——携带最终结果。
@@ -1166,6 +1254,25 @@ fn apply_provider_stream_event(
 
     let llm_chunks = parse_stream_event(provider_family, event);
     accumulator.apply_all(&llm_chunks);
+    // Responses 兼容网关可能先发 usage snapshot，再在 response.completed
+    // 给出最终结算。最终事件是该 attempt 的权威 usage，不能继续用 max 合并，
+    // 否则隐藏推理/中间统计会把 ledger 与 completed response 的 output tokens
+    // 分叉。
+    if provider_family == ProviderFamily::OpenAiResponses
+        && is_responses_terminal_event(event)
+        && let Some(usage) = llm_chunks
+            .iter()
+            .rev()
+            .find_map(|chunk| chunk.usage.clone())
+    {
+        accumulator.replace_usage(usage);
+    }
+    if llm_chunks.iter().any(|chunk| chunk.usage.is_some()) {
+        let _ = tx.send(StreamMessage::Observation(ModelTransportEvent::Updated {
+            http_status: None,
+            usage: Some(transport_usage(&accumulator.usage_snapshot())),
+        }));
+    }
     if let Some(context) = parse_stream_provider_context(provider_family, event) {
         accumulator.apply_provider_context(context);
     }
@@ -1214,6 +1321,17 @@ fn apply_provider_stream_event(
     Ok(false)
 }
 
+fn is_responses_terminal_event(event: &crate::protocol::streaming::SseEvent) -> bool {
+    let parsed_type = serde_json::from_str::<serde_json::Value>(&event.data)
+        .ok()
+        .and_then(|value| value["type"].as_str().map(str::to_string));
+    let event_type = event.event_type.as_deref().or(parsed_type.as_deref());
+    matches!(
+        event_type,
+        Some("response.completed" | "response.incomplete" | "response.failed")
+    )
+}
+
 /// `full` 相对已发送长度 `sent` 新增的后缀；若 `sent` 不落在字符边界上（上游把已发内容改写了），
 /// 退回整段并标记为改写。
 fn new_suffix(full: &str, sent: usize) -> (String, bool) {
@@ -1246,6 +1364,7 @@ fn execute_streaming_http_post(
     tool_name_codec: ProviderToolNameCodec,
     on_chunk: &dyn Fn(&ModelStreamingDelta),
     is_cancelled: &dyn Fn() -> bool,
+    observer: &ModelTransportObserver<'_>,
 ) -> StreamingHttpResult {
     let cancellation = Arc::new(AtomicBool::new(false));
     let worker_cancellation = cancellation.clone();
@@ -1292,6 +1411,7 @@ fn execute_streaming_http_post(
                 let mut completed_result = None;
                 while let Ok(message) = rx.try_recv() {
                     match message {
+                        StreamMessage::Observation(event) => observer(&event)?,
                         StreamMessage::Chunk(next_delta) => delta.merge(next_delta),
                         StreamMessage::Done(result) => {
                             completed_result = Some(result);
@@ -1318,6 +1438,7 @@ fn execute_streaming_http_post(
                     result
                 };
             }
+            Ok(StreamMessage::Observation(event)) => observer(&event)?,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(BridgeClientError::CallFailed {
@@ -1341,13 +1462,17 @@ fn execute_streaming_http_post_with_retries(
     provider_family: ProviderFamily,
     tool_name_codec: ProviderToolNameCodec,
     on_chunk: &dyn Fn(&ModelStreamingDelta),
-    on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
-    is_cancelled: &dyn Fn() -> bool,
+    controls: TransportRetryControls<'_>,
 ) -> StreamingHttpResult {
     let mut retries = 0usize;
     let mut timeout_retries = 0usize;
     loop {
-        if is_cancelled() {
+        if (controls.is_cancelled)() {
+            return Err(model_invocation_cancelled_error());
+        }
+        transport_started(&request.body, controls.observer)?;
+        if (controls.is_cancelled)() {
+            transport_finished::<()>(&Err(model_invocation_cancelled_error()), controls.observer)?;
             return Err(model_invocation_cancelled_error());
         }
         let emitted_delta = AtomicBool::new(false);
@@ -1363,8 +1488,21 @@ fn execute_streaming_http_post_with_retries(
             provider_family,
             tool_name_codec.clone(),
             &guarded_chunk,
-            is_cancelled,
+            controls.is_cancelled,
+            controls.observer,
         );
+        // SSE usage 可能先发中间快照，最终 ModelResponse 才是该 attempt 的
+        // Provider 结算事实。以最终响应覆盖快照，避免 ledger 与 wire response
+        // 的 input/output/cache usage 分叉。
+        if let Ok(response) = &result
+            && let Some(usage) = model_response_transport_usage(response)
+        {
+            (controls.observer)(&ModelTransportEvent::Updated {
+                http_status: None,
+                usage: Some(usage),
+            })?;
+        }
+        transport_finished(&result, controls.observer)?;
         let can_retry =
             !emitted_delta.load(Ordering::SeqCst) && retries < MODEL_PROVIDER_MAX_RETRIES;
         let can_retry_empty_stream = retries < MODEL_PROVIDER_EMPTY_STREAM_RETRIES;
@@ -1391,16 +1529,16 @@ fn execute_streaming_http_post_with_retries(
                 } else {
                     MODEL_PROVIDER_MAX_RETRIES
                 };
-                on_retry(&ModelRetryRuntimeEvent {
+                (controls.on_retry)(&ModelRetryRuntimeEvent {
                     phase: ModelRetryRuntimePhase::Scheduled,
                     attempt: retries,
                     max_attempts,
                     delay_ms: Some(delay.as_millis() as u64),
                 });
-                if !sleep_retry_delay_cancellable(delay, is_cancelled) {
+                if !sleep_retry_delay_cancellable(delay, controls.is_cancelled) {
                     return Err(model_invocation_cancelled_error());
                 }
-                on_retry(&ModelRetryRuntimeEvent {
+                (controls.on_retry)(&ModelRetryRuntimeEvent {
                     phase: ModelRetryRuntimePhase::AttemptStarted,
                     attempt: retries,
                     max_attempts,
@@ -1416,7 +1554,7 @@ fn execute_streaming_http_post_with_retries(
                         .filter(|error| retryable_empty_stream_error(error))
                         .map(|_| MODEL_PROVIDER_EMPTY_STREAM_RETRIES)
                         .unwrap_or(MODEL_PROVIDER_MAX_RETRIES);
-                    on_retry(&ModelRetryRuntimeEvent {
+                    (controls.on_retry)(&ModelRetryRuntimeEvent {
                         phase: ModelRetryRuntimePhase::Settled,
                         attempt: retries,
                         max_attempts,
@@ -1489,6 +1627,10 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
     };
 
     let status = response.status().as_u16();
+    let _ = tx.send(StreamMessage::Observation(ModelTransportEvent::Updated {
+        http_status: Some(status),
+        usage: None,
+    }));
     tracing::info!(
         target: "magi.performance",
         provider_key = %provider_key,
@@ -1690,48 +1832,82 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
 }
 
 impl ModelBridgeClient for HttpModelBridgeClient {
+    fn cache_prompt_ir(&self, request: &ModelInvocationRequest) -> PromptIr {
+        self.prepare_prompt_ir(request, false, None).0
+    }
+
+    fn invoke_observed(
+        &self,
+        request: ModelInvocationRequest,
+        options: ModelInvocationOptions<'_>,
+        observer: &ModelTransportObserver<'_>,
+    ) -> Result<ModelResponse, BridgeClientError> {
+        match options.on_delta {
+            Some(delta) => self.invoke_streaming_observed(
+                request,
+                delta,
+                options.on_retry,
+                options.is_cancelled,
+                options.max_output_tokens,
+                observer,
+            ),
+            None => self.invoke_cancellable_with_output_limit(
+                request,
+                options.max_output_tokens,
+                options.on_retry,
+                options.is_cancelled,
+                observer,
+            ),
+        }
+    }
     fn executor_capabilities(&self) -> crate::ExecutorCapabilities {
         crate::native_executor_capabilities()
     }
 
+    fn cache_identity(&self) -> Option<crate::ModelCacheIdentity> {
+        let protocol = match self.protocol {
+            HttpModelBridgeProtocol::ChatCompletions => "openai_chat",
+            HttpModelBridgeProtocol::Responses => "openai_responses",
+            HttpModelBridgeProtocol::AnthropicMessages => "anthropic_messages",
+        };
+        // 与真实请求共用 renderer。未实际发送的 effort/capability 元数据不应轮换缓存。
+        let request = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
+            provider: String::new(),
+            prompt: "cache identity".into(),
+            messages: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let mut params = compile_prompt_ir(&request, false, self.reasoning_effort, None);
+        params.reasoning_capability = self.reasoning_capability.clone();
+        let adapted = self.adapt_request(&params).ok()?;
+        let reasoning = ["reasoning_effort", "reasoning", "thinking", "output_config"]
+            .into_iter()
+            .filter_map(|field| {
+                adapted
+                    .body
+                    .get(field)
+                    .map(|value| (field.into(), value.clone()))
+            })
+            .collect::<serde_json::Map<String, Value>>();
+        let endpoint = build_protocol_endpoint_url(&self.base_url, &adapted.url_path).ok()?;
+        let mut endpoint = reqwest::Url::parse(&endpoint).ok()?;
+        endpoint.set_username("").ok()?;
+        endpoint.set_password(None).ok()?;
+        endpoint.set_query(None);
+        endpoint.set_fragment(None);
+        Some(crate::ModelCacheIdentity {
+            protocol: protocol.into(),
+            endpoint: endpoint.to_string(),
+            model: self.model.clone(),
+            reasoning_profile: canonicalize_json(&Value::Object(reasoning)).to_string(),
+        })
+    }
+
     fn invoke(&self, request: ModelInvocationRequest) -> Result<ModelResponse, BridgeClientError> {
-        if request.prompt.trim().is_empty() && request.messages.is_none() {
-            return Err(BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::RemoteBusiness,
-                code: Some(-32002),
-                message: "empty prompt".to_string(),
-            });
-        }
-
-        let http_request = self.build_http_request(&request, false)?;
-
-        let (accepted_request, status, response_body, retry_after, fallback_capability) =
-            execute_with_tool_choice_fallback(http_request, self.provider_family(), |request| {
-                execute_http_post_with_retries(
-                    self.provider_request_key(),
-                    request.url,
-                    request.body,
-                    request.headers,
-                )
-            })?;
-
-        if !(200..300).contains(&status) {
-            return Err(provider_http_status_error(
-                status,
-                &response_body,
-                retry_after,
-            ));
-        }
-
-        if let Some(capability) = fallback_capability.or_else(|| {
-            capability_from_accepted_tool_choice_request(&accepted_request, self.provider_family())
-        }) {
-            self.mark_forced_tool_choice_capability(capability);
-        }
-
-        let response =
-            self.parse_success_payload(&response_body, &accepted_request.tool_name_codec)?;
-        Ok(response)
+        self.invoke_with_cancellation(request, &|| false)
     }
 
     fn invoke_with_cancellation(
@@ -1739,7 +1915,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         request: ModelInvocationRequest,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<ModelResponse, BridgeClientError> {
-        self.invoke_cancellable_with_output_limit(request, None, &|_| {}, is_cancelled)
+        self.invoke_cancellable_with_output_limit(request, None, &|_| {}, is_cancelled, &|_| Ok(()))
     }
 
     fn invoke_with_retry_events_and_cancellation(
@@ -1748,7 +1924,13 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<ModelResponse, BridgeClientError> {
-        self.invoke_cancellable_with_output_limit(request, None, on_retry, is_cancelled)
+        self.invoke_cancellable_with_output_limit(
+            request,
+            None,
+            on_retry,
+            is_cancelled,
+            &|_| Ok(()),
+        )
     }
 
     fn invoke_with_cancellation_and_output_limit(
@@ -1762,6 +1944,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
             Some(max_output_tokens),
             &|_| {},
             is_cancelled,
+            &|_| Ok(()),
         )
     }
 
@@ -1777,6 +1960,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
             Some(max_output_tokens),
             on_retry,
             is_cancelled,
+            &|_| Ok(()),
         )
     }
 
@@ -1785,7 +1969,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         request: ModelInvocationRequest,
         on_delta: &dyn Fn(&ModelStreamingDelta),
     ) -> Result<ModelResponse, BridgeClientError> {
-        self.invoke_streaming_observed(request, on_delta, &|_| {}, &|| false, None)
+        self.invoke_streaming_observed(request, on_delta, &|_| {}, &|| false, None, &|_| Ok(()))
     }
 
     fn invoke_streaming_with_retry_events(
@@ -1794,7 +1978,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         on_delta: &dyn Fn(&ModelStreamingDelta),
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
     ) -> Result<ModelResponse, BridgeClientError> {
-        self.invoke_streaming_observed(request, on_delta, on_retry, &|| false, None)
+        self.invoke_streaming_observed(request, on_delta, on_retry, &|| false, None, &|_| Ok(()))
     }
 
     fn invoke_streaming_with_cancellation(
@@ -1804,7 +1988,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<ModelResponse, BridgeClientError> {
-        self.invoke_streaming_observed(request, on_delta, on_retry, is_cancelled, None)
+        self.invoke_streaming_observed(request, on_delta, on_retry, is_cancelled, None, &|_| Ok(()))
     }
 
     fn invoke_streaming_with_output_limit(
@@ -1821,6 +2005,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
             on_retry,
             is_cancelled,
             Some(max_output_tokens),
+            &|_| Ok(()),
         )
     }
 }
@@ -1832,6 +2017,7 @@ impl HttpModelBridgeClient {
         max_output_tokens: Option<u32>,
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
         is_cancelled: &dyn Fn() -> bool,
+        observer: &ModelTransportObserver<'_>,
     ) -> Result<ModelResponse, BridgeClientError> {
         if request.prompt.trim().is_empty() && request.messages.is_none() {
             return Err(BridgeClientError::CallFailed {
@@ -1860,8 +2046,12 @@ impl HttpModelBridgeClient {
                     request.url,
                     request.body,
                     request.headers,
-                    on_retry,
-                    is_cancelled,
+                    self.provider_family(),
+                    TransportRetryControls {
+                        on_retry,
+                        is_cancelled,
+                        observer,
+                    },
                 )
             })?;
 
@@ -1941,9 +2131,12 @@ fn read_non_empty_env(key: &str) -> Option<String> {
 fn build_anthropic_messages_url_for_test(base_url: &str) -> Result<String, String> {
     let request = AnthropicMessagesAdapter
         .build_request(
-            &LlmMessageParams {
+            &PromptIr {
+                prompt_cache_key: None,
+
                 reasoning_capability: None,
                 messages: vec![LlmMessage {
+                    origin: Default::default(),
                     role: "user".to_string(),
                     content: LlmMessageContent::Text("ping".to_string()),
                 }],
@@ -1951,7 +2144,7 @@ fn build_anthropic_messages_url_for_test(base_url: &str) -> Result<String, Strin
                 temperature: None,
                 tools: None,
                 stream: None,
-                system_prompt: None,
+
                 tool_choice: None,
                 reasoning_effort: None,
             },
@@ -1988,194 +2181,6 @@ fn build_protocol_endpoint_url(base_url: &str, endpoint_path: &str) -> Result<St
     }
 
     Ok(format!("{normalized}{endpoint_path}"))
-}
-
-fn llm_message_params_from_invocation(
-    request: &ModelInvocationRequest,
-    stream: bool,
-    reasoning_effort: Option<ReasoningEffort>,
-    max_output_tokens: Option<u32>,
-) -> LlmMessageParams {
-    let messages = request
-        .messages
-        .as_ref()
-        .map(|messages| {
-            normalize_chat_tool_call_history(messages)
-                .iter()
-                .map(llm_message_from_chat_message)
-                .collect()
-        })
-        .unwrap_or_else(|| {
-            vec![LlmMessage {
-                role: "user".to_string(),
-                content: LlmMessageContent::Text(request.prompt.clone()),
-            }]
-        });
-    LlmMessageParams {
-        reasoning_capability: None,
-        messages,
-        max_tokens: max_output_tokens,
-        temperature: None,
-        tools: request.tools.as_ref().map(|tools| {
-            tools
-                .iter()
-                .map(tool_definition_from_chat_tool)
-                .collect::<Vec<_>>()
-        }),
-        stream: Some(stream),
-        system_prompt: None,
-        tool_choice: request
-            .tool_choice
-            .as_ref()
-            .map(|choice| ToolChoice::Typed {
-                kind: "tool".to_string(),
-                name: Some(choice.function.name.clone()),
-            }),
-        reasoning_effort,
-    }
-}
-
-fn normalize_chat_tool_call_history(
-    messages: &[crate::types::ChatMessage],
-) -> Vec<crate::types::ChatMessage> {
-    let mut normalized = Vec::with_capacity(messages.len());
-    let mut result_ids = HashMap::<String, VecDeque<Option<String>>>::new();
-
-    for message in messages {
-        if !message.tool_calls.is_empty() {
-            let mut message = message.clone();
-            let mut calls = Vec::with_capacity(message.tool_calls.len());
-            let mut seen = HashMap::<String, (String, String)>::new();
-            let mut used_ids = HashSet::<String>::new();
-
-            for (index, mut tool_call) in message.tool_calls.into_iter().enumerate() {
-                let original_id = tool_call.id.trim().to_string();
-                let fingerprint = (
-                    tool_call.function.name.clone(),
-                    tool_call.function.arguments.clone(),
-                );
-                if !original_id.is_empty() && seen.get(&original_id) == Some(&fingerprint) {
-                    result_ids.entry(original_id).or_default().push_back(None);
-                    continue;
-                }
-
-                if original_id.is_empty() || used_ids.contains(&original_id) {
-                    let base = crate::protocol::compatible_tool_call_id(
-                        index,
-                        &tool_call.function.name,
-                        &tool_call.function.arguments,
-                    );
-                    let mut candidate = base.clone();
-                    let mut suffix = 1usize;
-                    while used_ids.contains(&candidate) {
-                        candidate = format!("{base}_{suffix}");
-                        suffix += 1;
-                    }
-                    tool_call.id = candidate;
-                } else {
-                    tool_call.id = original_id.clone();
-                }
-
-                seen.insert(original_id.clone(), fingerprint);
-                used_ids.insert(tool_call.id.clone());
-                result_ids
-                    .entry(original_id)
-                    .or_default()
-                    .push_back(Some(tool_call.id.clone()));
-                calls.push(tool_call);
-            }
-
-            message.tool_calls = calls;
-            normalized.push(message);
-            continue;
-        }
-
-        if let Some(original_id) = message.tool_call_id.as_ref()
-            && let Some(ids) = result_ids.get_mut(original_id)
-            && let Some(normalized_id) = ids.pop_front()
-        {
-            if let Some(normalized_id) = normalized_id {
-                let mut message = message.clone();
-                message.tool_call_id = Some(normalized_id);
-                normalized.push(message);
-            }
-            continue;
-        }
-
-        normalized.push(message.clone());
-    }
-
-    normalized
-}
-
-fn llm_message_from_chat_message(message: &crate::types::ChatMessage) -> LlmMessage {
-    if let Some(tool_call_id) = message.tool_call_id.as_ref() {
-        let tool_result_content = parse_tool_result_model_content(message.content.as_deref());
-        return LlmMessage {
-            role: "user".to_string(),
-            content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
-                tool_use_id: tool_call_id.clone(),
-                content: tool_result_content.text,
-                is_error: false,
-                images: tool_result_content.images,
-            }]),
-        };
-    }
-
-    let mut blocks = message
-        .provider_context
-        .iter()
-        .cloned()
-        .map(|context| LlmContentBlock::ProviderContext { context })
-        .collect::<Vec<_>>();
-    if let Some(content) = message
-        .content
-        .as_ref()
-        .filter(|content| !content.is_empty())
-    {
-        blocks.push(LlmContentBlock::Text {
-            text: content.clone(),
-        });
-    }
-    for image in &message.images {
-        blocks.push(LlmContentBlock::Image {
-            source: image.clone(),
-        });
-    }
-    for tool_call in &message.tool_calls {
-        let input = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
-            .unwrap_or_else(|_| json!({}));
-        blocks.push(LlmContentBlock::ToolUse {
-            id: tool_call.id.clone(),
-            name: tool_call.function.name.clone(),
-            input,
-        });
-    }
-
-    let content = if blocks.is_empty()
-        || (message.provider_context.is_empty()
-            && blocks.len() == 1
-            && message.images.is_empty()
-            && message.tool_calls.is_empty())
-    {
-        LlmMessageContent::Text(message.content.clone().unwrap_or_default())
-    } else {
-        LlmMessageContent::Blocks(blocks)
-    };
-    LlmMessage {
-        role: message.role.clone(),
-        content,
-    }
-}
-
-fn tool_definition_from_chat_tool(tool: &crate::types::ChatToolDefinition) -> ToolDefinition {
-    let parameters = &tool.function.parameters;
-    ToolDefinition {
-        name: tool.function.name.clone(),
-        description: tool.function.description.clone(),
-        input_schema: ToolInputSchema::from_json_schema(parameters),
-        origin: tool.origin,
-    }
 }
 
 /// 安全地将字节切片解码为 UTF-8 字符串，不丢弃尾部不完整的多字节序列。
@@ -2461,10 +2466,66 @@ fn capability_from_accepted_tool_choice_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ModelTransportRecorder;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn non_streaming_body_failure_preserves_received_http_status() {
+        use std::io::BufRead;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            reader.into_inner().write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{").unwrap();
+        });
+        let status = std::cell::Cell::new(None);
+        let result = execute_cancellable_http_post(
+            "test-body-failure".into(),
+            url,
+            json!({}),
+            vec![],
+            &|| false,
+            &|event| {
+                if let ModelTransportEvent::Updated {
+                    http_status: Some(value),
+                    ..
+                } = event
+                {
+                    status.set(Some(*value));
+                }
+                Ok(())
+            },
+        );
+        server.join().unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reading response body failed")
+        );
+        assert_eq!(status.get(), Some(503));
+    }
 
     fn chat_tool_call(id: &str, path: &str) -> crate::types::ChatToolCall {
         crate::types::ChatToolCall {
@@ -2501,6 +2562,353 @@ mod tests {
     }
 
     #[test]
+    fn round_context_tail_is_excluded_from_the_anthropic_cached_history() {
+        let message =
+            |role: &str, text: &str, origin: ChatMessageOrigin| crate::types::ChatMessage {
+                input_request_id: None,
+                context_origin: origin,
+                role: role.into(),
+                content: Some(text.into()),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                provider_context: Vec::new(),
+            };
+        let client = HttpModelBridgeClient::new_with_protocol(
+            "https://api.anthropic.com".into(),
+            None,
+            "test".into(),
+            HttpModelBridgeProtocol::AnthropicMessages,
+            None,
+        );
+        let request = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
+            provider: "test".into(),
+            prompt: String::new(),
+            messages: Some(vec![
+                message("developer", "HEAD", ChatMessageOrigin::SystemInstruction),
+                message("user", "goal", ChatMessageOrigin::Conversation),
+                message("developer", "STEPS", ChatMessageOrigin::RoundContext),
+                message("user", "CONTEXT", ChatMessageOrigin::RoundContext),
+            ]),
+            tools: None,
+            tool_choice: None,
+        };
+        let body = client.build_http_request(&request, true).unwrap().body;
+        assert!(!body["system"].to_string().contains("STEPS"));
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(!messages[1].to_string().contains("cache_control"));
+        assert!(!messages[2].to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn prompt_cache_keys_are_stable_across_streaming_and_obey_protocol_support() {
+        let request = ModelInvocationRequest {
+            cache_affinity_key: Some("stable-branch-key".into()),
+            prompt_cache_key: Some("stable-session-key".into()),
+            provider: "test".into(),
+            prompt: "first".into(),
+            messages: None,
+            tools: None,
+            tool_choice: None,
+        };
+        for (protocol, base_url, supported) in [
+            (
+                HttpModelBridgeProtocol::Responses,
+                "https://relay.example/v1",
+                true,
+            ),
+            (
+                HttpModelBridgeProtocol::ChatCompletions,
+                "https://api.openai.com/v1",
+                true,
+            ),
+            (
+                HttpModelBridgeProtocol::ChatCompletions,
+                "https://api.openai.com.example/v1",
+                false,
+            ),
+            (
+                HttpModelBridgeProtocol::AnthropicMessages,
+                "https://api.anthropic.com",
+                false,
+            ),
+        ] {
+            let client = HttpModelBridgeClient::new_with_protocol(
+                base_url.into(),
+                None,
+                "test".into(),
+                protocol,
+                None,
+            );
+            assert_eq!(
+                client.cache_contract().route_key == ProviderCacheRouteKey::Supported,
+                supported
+            );
+            for stream in [true, false] {
+                let mut next = request.clone();
+                next.prompt = "second".into();
+                let built = client.build_http_request(&request, stream).unwrap();
+                // 会话头部与请求体支持情况无关：任何协议、任何端点都带同一个稳定摘要。
+                assert!(
+                    built.headers.iter().any(
+                        |(name, value)| name == "X-Session-Id" && value == "stable-branch-key"
+                    )
+                );
+                let first = built.body;
+                let second = client
+                    .build_http_request_with_output_limit(&next, stream, Some(128))
+                    .unwrap()
+                    .body;
+                assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+                assert_eq!(first.get("prompt_cache_key").is_some(), supported);
+                if supported {
+                    assert_eq!(first["prompt_cache_key"], "stable-session-key");
+                }
+                next.prompt_cache_key = Some("next-epoch-key".into());
+                let next_epoch = client.build_http_request(&next, stream).unwrap();
+                assert!(next_epoch.headers.iter().any(|(name, value)| name == "X-Session-Id" && value == "stable-branch-key"));
+                if supported {
+                    assert_eq!(next_epoch.body["prompt_cache_key"], "next-epoch-key");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cache_key_without_branch_affinity_does_not_invent_a_session_header() {
+        let client = HttpModelBridgeClient::new_with_protocol(
+            "https://relay.example/v1".into(),
+            None,
+            "test".into(),
+            HttpModelBridgeProtocol::Responses,
+            None,
+        );
+        let mut request = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
+            provider: "probe".into(),
+            prompt: "ping".into(),
+            messages: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let built = client.build_http_request(&request, false).unwrap();
+        assert!(built.headers.iter().all(|(name, _)| name != "X-Session-Id"));
+        request.prompt_cache_key = Some("provider-epoch-only".into());
+        let built = client.build_http_request(&request, false).unwrap();
+        assert!(built.headers.iter().all(|(name, _)| name != "X-Session-Id"));
+    }
+
+    #[test]
+    fn tool_registry_order_does_not_change_wire_prefix_but_schema_changes_do() {
+        let tool = |name: &str| crate::types::ChatToolDefinition {
+            kind: "function".into(),
+            origin: crate::types::ChatToolOrigin::Builtin,
+            function: crate::types::ChatToolFunctionDefinition {
+                name: name.into(),
+                description: name.into(),
+                parameters: json!({"type":"object"}),
+            },
+        };
+        let client = HttpModelBridgeClient::new_with_protocol(
+            "https://relay.example".into(),
+            None,
+            "test".into(),
+            HttpModelBridgeProtocol::Responses,
+            None,
+        );
+        let mut request = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
+            provider: "test".into(),
+            prompt: "work".into(),
+            messages: None,
+            tools: Some(vec![tool("web_search"), tool("file_read")]),
+            tool_choice: None,
+        };
+        let first = client.build_request_body(&request);
+        request.tools.as_mut().unwrap().reverse();
+        assert_eq!(first, client.build_request_body(&request));
+        request.tools.as_mut().unwrap()[0].function.description = "changed policy".into();
+        assert_ne!(first["tools"], client.build_request_body(&request)["tools"]);
+
+        let schema_a = json!({
+            "type": "object",
+            "properties": {
+                "z": {"description": "last", "type": "string"},
+                "a": {"type": "integer", "description": "first"}
+            },
+            "required": ["a"]
+        });
+        let schema_b = json!({
+            "required": ["a"],
+            "properties": {
+                "a": {"description": "first", "type": "integer"},
+                "z": {"type": "string", "description": "last"}
+            },
+            "type": "object"
+        });
+        let schema_tool = |parameters| crate::types::ChatToolDefinition {
+            kind: "function".into(),
+            origin: crate::types::ChatToolOrigin::Builtin,
+            function: crate::types::ChatToolFunctionDefinition {
+                name: "schema_tool".into(),
+                description: "schema_tool".into(),
+                parameters,
+            },
+        };
+        let mut schema_request = request;
+        schema_request.tools = Some(vec![schema_tool(schema_a)]);
+        let canonical_a = client.build_request_body(&schema_request);
+        schema_request.tools = Some(vec![schema_tool(schema_b)]);
+        assert_eq!(
+            canonical_a["tools"],
+            client.build_request_body(&schema_request)["tools"]
+        );
+    }
+
+    #[test]
+    fn cache_identity_uses_actual_transport_and_excludes_credentials() {
+        let make = |url: &str, key: &str, model: &str, protocol, effort| {
+            HttpModelBridgeClient::new_with_protocol(
+                url.into(),
+                Some(key.into()),
+                model.into(),
+                protocol,
+                effort,
+            )
+            .cache_identity()
+            .unwrap()
+        };
+        let first = make(
+            "https://relay.example/v1/",
+            "first-secret",
+            "gpt-5",
+            HttpModelBridgeProtocol::Responses,
+            Some(ReasoningEffort::Low),
+        );
+        let equivalent = make(
+            "https://relay.example/v1/responses",
+            "second-secret",
+            "gpt-5",
+            HttpModelBridgeProtocol::Responses,
+            Some(ReasoningEffort::Low),
+        );
+        assert_eq!(first, equivalent);
+        assert_ne!(
+            first,
+            make(
+                "https://other.example/v1",
+                "first-secret",
+                "gpt-5",
+                HttpModelBridgeProtocol::Responses,
+                Some(ReasoningEffort::Low)
+            )
+        );
+        assert_ne!(
+            first,
+            make(
+                "https://relay.example/v1",
+                "first-secret",
+                "other-model",
+                HttpModelBridgeProtocol::Responses,
+                Some(ReasoningEffort::Low)
+            )
+        );
+        assert_ne!(
+            first,
+            make(
+                "https://relay.example/v1",
+                "first-secret",
+                "gpt-5",
+                HttpModelBridgeProtocol::ChatCompletions,
+                Some(ReasoningEffort::Low)
+            )
+        );
+        assert_ne!(
+            first,
+            make(
+                "https://relay.example/v1",
+                "first-secret",
+                "gpt-5",
+                HttpModelBridgeProtocol::Responses,
+                Some(ReasoningEffort::High)
+            )
+        );
+        let credentials = make(
+            "https://user:password@relay.example/v1/responses?token=secret#private",
+            "api-secret",
+            "gpt-5",
+            HttpModelBridgeProtocol::Responses,
+            None,
+        );
+        assert_eq!(credentials.endpoint, "https://relay.example/v1/responses");
+        assert!(!format!("{credentials:?}").contains("secret"));
+    }
+
+    #[test]
+    fn cache_reasoning_identity_follows_rendered_parameters_only() {
+        let make = |model: &str, protocol, effort| {
+            HttpModelBridgeClient::new_with_protocol(
+                "https://relay.example/v1".into(),
+                None,
+                model.into(),
+                protocol,
+                effort,
+            )
+        };
+        for protocol in [
+            HttpModelBridgeProtocol::Responses,
+            HttpModelBridgeProtocol::ChatCompletions,
+            HttpModelBridgeProtocol::AnthropicMessages,
+        ] {
+            let low = make("unknown-model", protocol, Some(ReasoningEffort::Low));
+            let high = make("unknown-model", protocol, Some(ReasoningEffort::High));
+            assert_eq!(
+                low.cache_identity(),
+                high.cache_identity(),
+                "未发送的 effort 不影响缓存身份"
+            );
+        }
+        for (model, protocol, field) in [
+            ("gpt-5", HttpModelBridgeProtocol::Responses, "reasoning"),
+            (
+                "gpt-5",
+                HttpModelBridgeProtocol::ChatCompletions,
+                "reasoning_effort",
+            ),
+            (
+                "claude-sonnet-4-20250514",
+                HttpModelBridgeProtocol::AnthropicMessages,
+                "thinking",
+            ),
+        ] {
+            let low = make(model, protocol, Some(ReasoningEffort::Low));
+            let high = make(model, protocol, Some(ReasoningEffort::High));
+            assert_ne!(low.cache_identity(), high.cache_identity());
+            let identity = low.cache_identity().unwrap();
+            let profile: Value = serde_json::from_str(&identity.reasoning_profile).unwrap();
+            let request = ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
+                provider: "test".into(),
+                prompt: "hello".into(),
+                messages: None,
+                tools: None,
+                tool_choice: None,
+            };
+            assert_eq!(profile[field], low.build_request_body(&request)[field]);
+        }
+    }
+
+    #[test]
     fn stream_idle_timeout_uses_bounded_optional_runtime_override() {
         assert_eq!(
             provider_stream_idle_timeout_from_env(None),
@@ -2533,6 +2941,8 @@ mod tests {
         );
 
         let body = client.build_request_body(&ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai".to_string(),
             prompt: "hello world".to_string(),
             messages: None,
@@ -2570,6 +2980,8 @@ mod tests {
         });
 
         let body = client.build_request_body(&ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai".to_string(),
             prompt: "ignored when messages exist".to_string(),
             messages: Some(vec![crate::types::ChatMessage {
@@ -2712,6 +3124,8 @@ mod tests {
         );
 
         let body = client.build_request_body(&ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai".to_string(),
             prompt: "ignored when messages exist".to_string(),
             messages: Some(vec![crate::types::ChatMessage {
@@ -2749,6 +3163,8 @@ mod tests {
         );
 
         let body = client.build_request_body(&ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai".to_string(),
             prompt: "classify".to_string(),
             messages: None,
@@ -2787,6 +3203,8 @@ mod tests {
             "any-openai-compatible-model".to_string(),
         );
         let body = client.build_request_body(&ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai".to_string(),
             prompt: "搜索最新消息".to_string(),
             messages: Some(vec![crate::types::ChatMessage {
@@ -2869,15 +3287,15 @@ mod tests {
             );
         }
         assert_eq!(
-            body["tools"][0]["function"]["name"],
+            body["tools"][3]["function"]["name"],
             "magi_builtin_web_search"
         );
         assert_eq!(
-            body["tools"][2]["function"]["name"],
+            body["tools"][0]["function"]["name"],
             "magi_mcp_mcp__repo__inspect"
         );
         assert_eq!(
-            body["tools"][3]["function"]["name"],
+            body["tools"][2]["function"]["name"],
             "magi_skill_skill__review__inspect"
         );
         assert!(body["tools"][0].get("origin").is_none());
@@ -2885,10 +3303,42 @@ mod tests {
         assert!(body["tools"][3].get("origin").is_none());
         assert_eq!(
             body["tool_choice"]["function"]["name"],
-            body["tools"][0]["function"]["name"]
+            body["tools"][3]["function"]["name"]
         );
         assert_eq!(
             body["messages"][0]["tool_calls"][0]["function"]["name"],
+            body["tools"][3]["function"]["name"]
+        );
+    }
+
+    #[test]
+    fn cache_prompt_ir_uses_the_same_wire_tool_names_as_the_request() {
+        let client = HttpModelBridgeClient::new(
+            "https://api.example.com/v1".to_string(),
+            None,
+            "cache-ir-model".to_string(),
+        );
+        let request = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
+            provider: "openai".to_string(),
+            prompt: "inspect".to_string(),
+            messages: None,
+            tools: Some(vec![crate::types::ChatToolDefinition {
+                kind: "function".to_string(),
+                function: crate::types::ChatToolFunctionDefinition {
+                    name: "mcp__repo__inspect".to_string(),
+                    description: "inspect".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                origin: crate::types::ChatToolOrigin::ExternalMcp,
+            }]),
+            tool_choice: None,
+        };
+        let body = client.build_request_body(&request);
+        let ir = client.cache_prompt_ir(&request);
+        assert_eq!(
+            ir.tools.as_ref().unwrap()[0].name,
             body["tools"][0]["function"]["name"]
         );
     }
@@ -2901,6 +3351,8 @@ mod tests {
             "any-openai-compatible-model".to_string(),
         );
         let invocation = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai".to_string(),
             prompt: "search".to_string(),
             messages: None,
@@ -2953,6 +3405,8 @@ mod tests {
         let codec = client
             .build_http_request(
                 &ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "test".to_string(),
                     messages: None,
@@ -3005,6 +3459,8 @@ mod tests {
             origin: crate::types::ChatToolOrigin::Builtin,
         };
         let invocation = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai-compatible".to_string(),
             prompt: "搜索 Magi".to_string(),
             messages: None,
@@ -3105,20 +3561,20 @@ mod tests {
                 }
             }),
             headers: Vec::new(),
-            tool_name_codec: ProviderToolNameCodec::for_params(
-                &llm_message_params_from_invocation(
-                    &ModelInvocationRequest {
-                        provider: "test".to_string(),
-                        prompt: "test".to_string(),
-                        messages: None,
-                        tools: None,
-                        tool_choice: None,
-                    },
-                    false,
-                    None,
-                    None,
-                ),
-            ),
+            tool_name_codec: ProviderToolNameCodec::for_params(&compile_prompt_ir(
+                &ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
+                    provider: "test".to_string(),
+                    prompt: "test".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                false,
+                None,
+                None,
+            )),
         };
         let error_body = r#"{"error":{"message":"tool_choice does not support required or object in thinking mode"}}"#;
 
@@ -3169,20 +3625,20 @@ mod tests {
                 "tool_choice": "required"
             }),
             headers: Vec::new(),
-            tool_name_codec: ProviderToolNameCodec::for_params(
-                &llm_message_params_from_invocation(
-                    &ModelInvocationRequest {
-                        provider: "test".to_string(),
-                        prompt: "test".to_string(),
-                        messages: None,
-                        tools: None,
-                        tool_choice: None,
-                    },
-                    false,
-                    None,
-                    None,
-                ),
-            ),
+            tool_name_codec: ProviderToolNameCodec::for_params(&compile_prompt_ir(
+                &ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
+                    provider: "test".to_string(),
+                    prompt: "test".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                false,
+                None,
+                None,
+            )),
         };
 
         let (capability, fallback) =
@@ -3221,6 +3677,8 @@ mod tests {
         );
 
         let body = client.build_request_body(&ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "anthropic".to_string(),
             prompt: "ignored when messages exist".to_string(),
             messages: Some(vec![
@@ -3266,7 +3724,11 @@ mod tests {
         assert_eq!(body["model"], "claude-sonnet-test");
         assert_eq!(body["system"], "系统约束");
         assert_eq!(body["messages"][0]["role"], "user");
-        assert_eq!(body["messages"][0]["content"], "你好");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "你好");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
         assert_eq!(body["tools"][0]["name"], "magi_builtin_shell_exec");
         assert_eq!(body["tools"][0]["input_schema"]["required"][0], "cmd");
         assert_eq!(body["tool_choice"]["type"], "tool");
@@ -3293,6 +3755,8 @@ mod tests {
                 Some(effort),
             );
             let body = client.build_request_body(&ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: "openai".to_string(),
                 prompt: "ping".to_string(),
                 messages: None,
@@ -3335,6 +3799,8 @@ mod tests {
                 )
                 .with_reasoning_capability(capability);
                 let request = ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "fixture".into(),
                     prompt: "test".into(),
                     messages: None,
@@ -3395,6 +3861,8 @@ mod tests {
                 let body = client
                     .build_http_request(
                         &ModelInvocationRequest {
+                            cache_affinity_key: None,
+                            prompt_cache_key: None,
                             provider: "fixture".into(),
                             prompt: "ping".into(),
                             messages: None,
@@ -3420,6 +3888,8 @@ mod tests {
             "gpt-test".to_string(),
         );
         let body = client.build_request_body(&ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai".to_string(),
             prompt: "ping".to_string(),
             messages: None,
@@ -3435,6 +3905,8 @@ mod tests {
     #[test]
     fn compaction_output_limit_is_forwarded_to_provider_request() {
         let request = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "context-compaction".to_string(),
             prompt: "summarize".to_string(),
             messages: None,
@@ -3502,6 +3974,8 @@ mod tests {
                 Some(effort),
             );
             let body = client.build_request_body(&ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: "anthropic".to_string(),
                 prompt: "ping".to_string(),
                 messages: None,
@@ -3639,6 +4113,8 @@ mod tests {
         );
 
         let result = client.invoke(ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai".to_string(),
             prompt: "   ".to_string(),
             messages: None,
@@ -3741,6 +4217,8 @@ mod tests {
             None,
         );
         let request = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai".to_string(),
             prompt: "读取文件".to_string(),
             messages: None,
@@ -3797,6 +4275,8 @@ mod tests {
         let response = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-responses".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -4100,6 +4580,8 @@ mod tests {
 
         let response = client
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: "openai-compatible".to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -4155,6 +4637,8 @@ mod tests {
         let error = client
             .invoke_with_cancellation(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -4196,6 +4680,8 @@ mod tests {
         let error = client
             .invoke_streaming_with_cancellation(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -4240,6 +4726,8 @@ mod tests {
 
         let error = client
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: "openai-compatible".to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -4278,6 +4766,8 @@ mod tests {
         let response = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -4306,6 +4796,65 @@ mod tests {
     }
 
     #[test]
+    fn responses_terminal_usage_replaces_intermediate_snapshot_in_transport_receipt() {
+        let server = spawn_mock_server_with_response_text(
+            200,
+            "text/event-stream",
+            concat!(
+                "event: response.output_item.added\ndata: {\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"content\":[]}}\n\n",
+                "event: response.output_text.delta\ndata: {\"output_index\":0,\"delta\":\"ok\"}\n\n",
+                "event: response.output_item.done\ndata: {\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}}\n\n",
+                "event: response.usage.updated\ndata: {\"type\":\"response.usage.updated\",\"usage\":{\"input_tokens\":10,\"output_tokens\":166}}\n\n",
+                "event: response.completed\ndata: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":103}}}\n\n",
+            )
+            .to_string(),
+        );
+        let client = HttpModelBridgeClient::new_with_protocol(
+            server.address,
+            None,
+            "gpt-6-luna".to_string(),
+            HttpModelBridgeProtocol::Responses,
+            None,
+        );
+        let recorder = std::cell::RefCell::new(ModelTransportRecorder::default());
+        let on_delta = |_delta: &ModelStreamingDelta| {};
+        let on_retry = |_event: &ModelRetryRuntimeEvent| {};
+        let cancelled = || false;
+        let observer = |event: &ModelTransportEvent| recorder.borrow_mut().apply(event).map(|_| ());
+        let response = client
+            .invoke_observed(
+                ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
+                    provider: "openai-responses".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                ModelInvocationOptions {
+                    on_delta: Some(&on_delta),
+                    on_retry: &on_retry,
+                    is_cancelled: &cancelled,
+                    max_output_tokens: None,
+                },
+                &observer,
+            )
+            .expect("Responses stream should complete");
+        let usage: crate::llm_types::LlmUsage =
+            serde_json::from_value(response.usage.expect("response usage")).unwrap();
+        assert_eq!(usage.output_tokens, 103);
+        assert_eq!(
+            recorder.borrow().attempts[0]
+                .usage
+                .as_ref()
+                .expect("transport usage")
+                .output_tokens,
+            103
+        );
+    }
+
+    #[test]
     fn streaming_coalesces_backlogged_increments_without_losing_content() {
         let mut response_text = String::new();
         for _ in 0..200 {
@@ -4327,6 +4876,8 @@ mod tests {
         let response = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -4383,6 +4934,8 @@ mod tests {
             "gateway-model-v2026".to_string(),
         );
         let request = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai-compatible".to_string(),
             prompt: "执行工具".to_string(),
             messages: None,
@@ -4470,6 +5023,8 @@ mod tests {
         );
         let deltas = std::cell::RefCell::new(Vec::new());
         let request = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "openai-compatible".to_string(),
             prompt: "执行工具".to_string(),
             messages: None,
@@ -4550,6 +5105,8 @@ mod tests {
         );
         let deltas = std::cell::RefCell::new(Vec::new());
         let request = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
             provider: "anthropic".to_string(),
             prompt: "执行工具".to_string(),
             messages: None,
@@ -4612,6 +5169,8 @@ mod tests {
         let error = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -4651,6 +5210,8 @@ mod tests {
         let response = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -4685,6 +5246,8 @@ mod tests {
         let response = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -4724,6 +5287,8 @@ mod tests {
         let error = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "anthropic".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -4768,6 +5333,8 @@ mod tests {
         let response = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "anthropic".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -4852,6 +5419,8 @@ mod tests {
         let client_handle = std::thread::spawn(move || {
             let result = client.invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -4955,6 +5524,8 @@ mod tests {
         let client_handle = std::thread::spawn(move || {
             let result = client.invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -5011,6 +5582,8 @@ mod tests {
         let error = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -5067,6 +5640,8 @@ mod tests {
         let response = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -5104,6 +5679,8 @@ mod tests {
         let error = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -5160,6 +5737,8 @@ mod tests {
         let response = client
             .invoke_with_retry_events_and_cancellation(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -5295,6 +5874,8 @@ mod tests {
         let response = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -5344,6 +5925,8 @@ mod tests {
         let response = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -5392,6 +5975,8 @@ mod tests {
         client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -5451,6 +6036,8 @@ mod tests {
         let response = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "anthropic".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -5606,6 +6193,8 @@ mod tests {
         client
             .invoke_streaming_with_retry_events(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "openai-compatible".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -5693,6 +6282,8 @@ mod tests {
         let error = client
             .invoke_streaming(
                 ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
                     provider: "anthropic".to_string(),
                     prompt: "hello".to_string(),
                     messages: None,
@@ -5734,6 +6325,8 @@ mod tests {
 
         let response = client
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: "openai".to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -5781,6 +6374,8 @@ mod tests {
 
         let response = client
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: "anthropic".to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -5811,7 +6406,7 @@ mod tests {
             serde_json::from_str(&recorded.body).expect("body should be json");
         assert_eq!(body["model"], "claude-sonnet-test");
         assert_eq!(body["messages"][0]["role"], "user");
-        assert_eq!(body["messages"][0]["content"], "hello");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
         assert_eq!(body["stream"], false);
     }
 
@@ -5836,6 +6431,8 @@ mod tests {
 
         let error = client
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: "openai".to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -5879,6 +6476,8 @@ mod tests {
 
         let error = client
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: "openai".to_string(),
                 prompt: "hello".to_string(),
                 messages: None,
@@ -5916,6 +6515,8 @@ mod tests {
 
         let response = client
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: "openai".to_string(),
                 prompt: "hello".to_string(),
                 messages: None,

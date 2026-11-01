@@ -1,6 +1,7 @@
 <script lang="ts">
   import { i18n } from '../stores/i18n.svelte';
   import { getAgentColor } from '../lib/agent-colors';
+  import { aggregatePromptCacheStats } from '../lib/usage-stats-aggregation';
   import Icon from './Icon.svelte';
   import type { ModelStatus, ModelStatusMap } from '../types/message';
   import type {
@@ -446,23 +447,25 @@
   const selectedRow = $derived(rows.find((r) => r.key === selectedKey) || null);
   const selectedColor = $derived(selectedRow ? getAgentColor(selectedRow.avatarSeed) : null);
 
-  const selectedBreakdown = $derived.by<UsageBreakdownRow[]>(() => {
+  const selectedBindings = $derived.by<AgentExecutionStatsItem[]>(() => {
     if (!selectedRow) return [];
-
     if (perspective === 'engine') {
       const identityKeys = new Set(selectedRow.engineRow?.identityKeys || []);
-      return aggregateUsageBreakdown(
-        bindingUsageStats.filter((binding: AgentExecutionStatsItem) => (
-          Boolean(binding.modelIdentityKey) && identityKeys.has(binding.modelIdentityKey as string)
-        )),
-        bindingRoleKey,
-        (binding) => workerLabel(bindingRoleKey(binding)),
-      );
+      return bindingUsageStats.filter((binding) => (
+        Boolean(binding.modelIdentityKey) && identityKeys.has(binding.modelIdentityKey as string)
+      ));
     }
-
     const roleKey = selectedRow.roleAtom?.worker || selectedRow.key;
+    return bindingUsageStats.filter((binding) => bindingRoleKey(binding) === roleKey);
+  });
+  const selectedCache = $derived(aggregatePromptCacheStats(selectedBindings));
+
+  const selectedBreakdown = $derived.by<UsageBreakdownRow[]>(() => {
+    if (perspective === 'engine') {
+      return aggregateUsageBreakdown(selectedBindings, bindingRoleKey, (binding) => workerLabel(bindingRoleKey(binding)));
+    }
     return aggregateUsageBreakdown(
-      bindingUsageStats.filter((binding: AgentExecutionStatsItem) => bindingRoleKey(binding) === roleKey),
+      selectedBindings,
       (binding) => bindingModelLabel(binding).toLocaleLowerCase(),
       bindingModelLabel,
     );
@@ -668,6 +671,23 @@
             <div class="kpi-block">
               <span class="kpi-value">{formatPct(selectedRow.successRate)}</span>
               <span class="kpi-label">{i18n.t('settings.stats.kpiSuccess')}</span>
+            </div>
+          </div>
+
+          <div class="settings-rows">
+            <div class="settings-row">
+              <div class="settings-row-copy">
+                <span class="settings-row-title">{i18n.t('settings.stats.cacheTokenHitRate')}</span>
+                <span class="settings-row-desc">{i18n.t('settings.stats.cacheTokenDetail', { read: formatTokens(selectedCache.readTokens), input: formatTokens(selectedCache.inputTokens) })}</span>
+              </div>
+              <span>{selectedCache.tokenHitRate === null ? i18n.t('settings.stats.cacheUnobserved') : formatPct(selectedCache.tokenHitRate)}</span>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-copy">
+                <span class="settings-row-title">{i18n.t('settings.stats.cacheRequestHitRate')}</span>
+                <span class="settings-row-desc">{i18n.t('settings.stats.cacheObservationDetail', { observed: selectedCache.observedCallCount, total: selectedRow.calls, hits: selectedCache.hitCallCount })}</span>
+              </div>
+              <span>{selectedCache.requestHitRate === null ? i18n.t('settings.stats.cacheUnobserved') : formatPct(selectedCache.requestHitRate)}</span>
             </div>
           </div>
 

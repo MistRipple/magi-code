@@ -801,6 +801,9 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
             }
         }
         BrowserHostEvent::UserTakeover { binding } => {
+            if is_current_primary_binding(state, &binding) {
+                state.notify_web_model_setup_takeover(&binding.tab_id);
+            }
             // 用户直接操作页面后由用户保持控制：代理不能在用户未交还前自动抢回。
             revoke_surface_control(
                 state,

@@ -218,9 +218,21 @@ pub struct SkillDispatchRuntime {
     bridge_runtime: BridgeDispatchRuntime,
 }
 
-#[derive(Clone, Debug, Default)]
+type LiveSkillProvider = Arc<dyn Fn() -> Vec<SkillDefinition> + Send + Sync>;
+
+#[derive(Clone, Default)]
 pub struct SkillRegistry {
     skills: Arc<RwLock<HashMap<String, SkillDefinition>>>,
+    live_provider: Arc<RwLock<Option<LiveSkillProvider>>>,
+}
+
+impl std::fmt::Debug for SkillRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SkillRegistry")
+            .field("skills", &self.list())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -238,6 +250,23 @@ pub enum SkillIdResolution {
 impl SkillRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 插件说明随权威生命周期实时解析；本地 Skill 重载不覆盖插件来源。
+    pub fn set_live_provider(&self, provider: LiveSkillProvider) {
+        *self
+            .live_provider
+            .write()
+            .expect("live skill provider lock poisoned") = Some(provider);
+    }
+
+    fn live_skills(&self) -> Vec<SkillDefinition> {
+        let provider = self
+            .live_provider
+            .read()
+            .expect("live skill provider lock poisoned")
+            .clone();
+        provider.map(|provider| provider()).unwrap_or_default()
     }
 
     /// 原子替换注册快照，避免热重载期间短暂发布空 Skill 目录。
@@ -261,6 +290,13 @@ impl SkillRegistry {
     }
 
     pub fn get(&self, skill_id: &str) -> Option<SkillDefinition> {
+        // plugin/ 是可信贡献命名空间；停用后不得回落到同名本地说明。
+        if skill_id.starts_with("plugin/") {
+            return self
+                .live_skills()
+                .into_iter()
+                .find(|skill| skill.skill_id == skill_id);
+        }
         self.skills
             .read()
             .expect("skill registry read lock poisoned")
@@ -274,8 +310,10 @@ impl SkillRegistry {
             .read()
             .expect("skill registry read lock poisoned")
             .values()
+            .filter(|skill| !skill.skill_id.starts_with("plugin/"))
             .cloned()
             .collect::<Vec<_>>();
+        skills.extend(self.live_skills());
         skills.sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
         skills
     }
@@ -285,17 +323,14 @@ impl SkillRegistry {
         if requested.is_empty() {
             return SkillIdResolution::NotFound;
         }
-        let skills = self
-            .skills
-            .read()
-            .expect("skill registry read lock poisoned");
-        if skills.contains_key(requested) {
+        let skills = self.list();
+        if skills.iter().any(|skill| skill.skill_id == requested) {
             return SkillIdResolution::Found(requested.to_string());
         }
 
         let requested_normalized = requested.to_ascii_lowercase();
         let mut matches = skills
-            .values()
+            .iter()
             .filter(|skill| {
                 let skill_id = skill.skill_id.trim();
                 let short_name = skill_id.rsplit('/').next().unwrap_or(skill_id);
@@ -331,14 +366,16 @@ impl SkillRegistry {
     }
 
     fn selected_skills(&self, selection: &SkillSelection) -> Vec<SkillDefinition> {
-        let skills = self
-            .skills
-            .read()
-            .expect("skill registry read lock poisoned");
+        let skills = self.list();
         selection
             .skill_ids
             .iter()
-            .filter_map(|skill_id| skills.get(skill_id).cloned())
+            .filter_map(|skill_id| {
+                skills
+                    .iter()
+                    .find(|skill| &skill.skill_id == skill_id)
+                    .cloned()
+            })
             .collect()
     }
 

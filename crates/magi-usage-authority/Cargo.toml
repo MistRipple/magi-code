@@ -8,3 +8,6 @@ serde.workspace = true
 magi-core = { path = "../magi-core" }
 sha2.workspace = true
 url = "2"
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1400,6 +1400,7 @@ fn slots_provider(
 fn assemble_server(
     state: ApiState,
     backend: Arc<ApiToolBackend>,
+    slot_channel_generation: Option<u64>,
 ) -> Arc<magi_mcp_server::McpServer> {
     Arc::new(
         magi_mcp_server::McpServer::new(
@@ -1428,9 +1429,11 @@ fn assemble_server(
             state: state.clone(),
         }))
         .with_catalog_observer(Arc::new(move |principal| {
-            if principal.token_id == crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID {
-                state.web_model.record_slot_catalog_served();
-                tracing::info!("GPT Web 槽位工具目录已被读取（ChatGPT 经 Tunnel 到达本机）");
+            if let Some(generation) = slot_channel_generation
+                && principal.token_id == crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID
+            {
+                state.web_model.record_slot_catalog_served(generation);
+                tracing::info!(generation, "GPT Web 槽位工具目录已被读取，连接器来源待核验");
             }
         })),
     )
@@ -1442,12 +1445,17 @@ pub(crate) fn build_mcp_server(
     tokens: Arc<TokenStore>,
 ) -> Arc<magi_mcp_server::McpServer> {
     let backend = Arc::new(ApiToolBackend::new(state.clone(), tokens));
-    assemble_server(state, backend)
+    assemble_server(state, backend, None)
 }
 
 /// 组装 GPT Web 槽位端点的 MCP 服务实例。槽位调用的身份与归属来自槽位表，不使用令牌。
 pub(crate) fn build_slot_mcp_server(state: ApiState) -> Arc<magi_mcp_server::McpServer> {
-    build_mcp_server(state, Arc::new(TokenStore::new()))
+    let generation = state.web_model.channel_generation();
+    let backend = Arc::new(ApiToolBackend::new(
+        state.clone(),
+        Arc::new(TokenStore::new()),
+    ));
+    assemble_server(state, backend, Some(generation))
 }
 
 #[cfg(test)]
@@ -2887,7 +2895,13 @@ mod tests {
     async fn slot_tools_list_is_a_subset_of_the_token_catalog() {
         // GPT Web 槽位按槽位工具档过滤目录，比令牌的完整目录少。
         let f = fixture(Duration::from_secs(5));
-        assert!(!f.state.web_model.slot_catalog_served_since(1));
+        let generation = f.state.web_model.channel_generation();
+        let cursor = f.state.web_model.slot_catalog_cursor();
+        assert!(
+            !f.state
+                .web_model
+                .slot_catalog_served_after(generation, cursor)
+        );
         let slot_principal = magi_mcp_server::ClientPrincipal {
             project_directories: None,
             token_id: crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID.to_string(),
@@ -2912,7 +2926,9 @@ mod tests {
             .await
             .expect("slot tools/list responds");
         assert!(
-            f.state.web_model.slot_catalog_served_since(1),
+            f.state
+                .web_model
+                .slot_catalog_served_after(generation, cursor),
             "槽位读取目录必须留下 daemon 侧事实"
         );
         let slot_count = response["result"]["tools"].as_array().unwrap().len();

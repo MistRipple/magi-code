@@ -272,7 +272,7 @@ assert.match(
 assert.match(
   shellSource,
   /个人会话没有 workspace 指针[\s\S]*?if \(!messagesState\.bootstrapped \|\| loading \|\| workspaceActionPending\)[\s\S]*?if \(currentBootstrapWorkspaceId\(\)\)[\s\S]*?selectedWorkspaceId = ''[\s\S]*?currentSessionId !== nextSessionId[\s\S]*?currentSessionId = nextSessionId;/,
-  '切换到最近会话后必须清除旧工作区侧栏选择，并同步当前个人会话的 active 指针',
+  '切换到无项目对话后必须清除旧工作区侧栏选择，并同步当前个人会话的 active 指针',
 );
 
 console.log('workspace onboarding golden passed');

@@ -1971,7 +1971,7 @@ strong, b { font-weight: var(--font-bold); }
     .generated-image-progress > span, .ia-context-ring.estimating .ring-fill,
     .notice-icon.compacting, .ia-context-picker-loading svg, .loading-dot,
     .agent-cursor-dots span, .update-status-action-icon--spinning,
-    .update-status-progress-ring--indeterminate, .recent-session-indicator.running svg,
+    .update-status-progress-ring--indeterminate, .personal-session-indicator.running svg,
     .external-dot.running, .streaming-badge, .image-tray-pending
   ),
   .conversation-process-row.streaming .process-marker::before,

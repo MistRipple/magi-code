@@ -86,6 +86,15 @@ async fn submit_session_turn_internal(
     state: ApiState,
     mut request: SessionTurnRequestDto,
 ) -> Result<SessionTurnResponseDto, ApiError> {
+    if request
+        .text
+        .as_deref()
+        .is_some_and(crate::web_model_setup_policy::contains_secret)
+    {
+        return Err(ApiError::InvalidInput(
+            "疑似凭据不能进入聊天或排队输入，请使用安全配置表单".into(),
+        ));
+    }
     request.skill_name = request
         .skill_name
         .as_deref()
@@ -203,6 +212,30 @@ async fn submit_session_turn_internal(
     // 经过当前能力校验，不能借重放路径绕过准入。
     validate_workflow_selection(&state, &request)?;
     validate_plugin_command_selection(&state, &request)?;
+    if let Some(session) = request.requested_session_id() {
+        state.invalidate_setup_continuation(&session, request.request_id().as_deref())?;
+    }
+    // 保留的显式插件命令仅规范化为普通主对话任务；不再执行独立配置循环。
+    if request.plugin_command_id.as_deref() == Some(crate::web_model_setup::SETUP_COMMAND_ID) {
+        if request_targets_web_engine(&state, &request) {
+            return Err(ApiError::Conflict(
+                "当前使用 GPT Web 引擎，请明确切换到支持工具的本地模型后配置，不能让网页控制自身"
+                    .into(),
+            ));
+        }
+        let text = match request.trimmed_text().as_deref().unwrap_or("") {
+            "cancel" => "请结束本次 GPT Web 配置，结算页面操作并保留已保存配置。",
+            "continue" => "请继续本会话的 GPT Web 配置；先检查最新检查点和页面，不重放未知写入。",
+            _ => {
+                "请帮我配置 GPT Web；使用当前主模型，遇到登录或生成密钥时交还我操作，并保持本会话可以讨论。"
+            }
+        };
+        request.text = Some(text.into());
+        request.plugin_command_id = None;
+        request
+            .skill_name
+            .get_or_insert_with(|| crate::web_model_setup_tools::SKILL_ID.into());
+    }
     let decision = decide_session_turn(&state, &request)?;
     request.source_folder_id =
         trimmed_non_empty(request.source_folder_id.as_deref()).map(str::to_string);
@@ -568,6 +601,7 @@ fn enqueue_session_turn_response(
     let queued_request_id = Some(request_id);
     let queued_user_message_id = Some(user_message_item_id.clone());
     let queue_position = state.enqueue_regular_session_turn(QueuedRegularSessionTurn {
+        readiness: None,
         project_directories: request.project_directories.clone(),
         request,
         request_fingerprint: Some(request_fingerprint),
@@ -1132,6 +1166,15 @@ fn steer_input_error(error: SessionTurnInputError) -> ApiError {
 }
 
 pub(crate) fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), ApiError> {
+    if request
+        .text
+        .as_deref()
+        .is_some_and(crate::web_model_setup_policy::contains_secret)
+    {
+        return Err(ApiError::InvalidInput(
+            "疑似凭据不能进入聊天或排队输入，请使用安全表单".into(),
+        ));
+    }
     if let Some(target) = &request.interrupt_turn_id
         && (target.trim().is_empty()
             || request.requested_session_id().is_none()
@@ -3284,6 +3327,13 @@ pub(crate) async fn drain_next_queued_regular_session_turn(
         queued.accepted_at
     };
     let mut queued_request = queued.request;
+    if queued
+        .readiness
+        .as_ref()
+        .is_some_and(|condition| state.setup_continuation_ready(condition))
+    {
+        queued_request.desktop_browser_tools_allowed = true;
+    }
     queued_request.project_directories = queued.project_directories;
     // 出队时重新验证请求声明的 session scope。排队期间请求结构可能来自持久化
     // 恢复，不能只相信入队时解析出的 workspace_id；否则一个被篡改或失效的
@@ -3357,7 +3407,15 @@ pub(crate) async fn drain_next_queued_regular_session_turn(
         },
     };
     match submit_result {
-        Ok(_) => QueuedRegularSessionTurnDrainOutcome::Started,
+        Ok(_) => {
+            if let Err(error) = state
+                .settle_setup_continuation(&session_id, &failed_event_queue_id, true)
+                .await
+            {
+                tracing::error!(%session_id, ?error, "配置继续已接纳，保存回执待核对");
+            }
+            QueuedRegularSessionTurnDrainOutcome::Started
+        }
         Err(error) => {
             tracing::error!(
                 session_id = %failed_event_session_id,
@@ -3421,6 +3479,16 @@ pub(crate) async fn drain_next_queued_regular_session_turn(
                         "移除失败的排队消息失败"
                     );
                     return QueuedRegularSessionTurnDrainOutcome::RetainedAfterFailure;
+                }
+                if let Err(error) = state
+                    .settle_setup_continuation(
+                        &failed_event_session_id,
+                        &failed_event_queue_id,
+                        false,
+                    )
+                    .await
+                {
+                    tracing::error!(session_id = %failed_event_session_id, ?error, "配置继续未接纳，保存回执待核对");
                 }
                 schedule_next_queued_regular_session_turn(
                     state.clone(),

@@ -10,6 +10,7 @@ getrandom.workspace = true
 magi-app-server-protocol = { path = "../magi-app-server-protocol" }
 magi-core = { path = "../magi-core" }
 magi-tool-runtime = { path = "../magi-tool-runtime" }
+magi-usage-authority = { path = "../magi-usage-authority" }
 
 [dev-dependencies]
 magi-event-bus = { path = "../magi-event-bus" }

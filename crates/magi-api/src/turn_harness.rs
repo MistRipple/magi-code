@@ -4401,6 +4401,8 @@ done
 
         let error = provider
             .invoke(ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
                 provider: "harness".to_string(),
                 prompt: "执行一个工具任务".to_string(),
                 messages: None,
@@ -16075,11 +16077,14 @@ done
                         .iter()
                         .filter(|request| {
                             request.tools.as_ref().is_some_and(|tools| {
-                                tools.len() == 2
+                                // 已激活的 Skill 只允许 skill_apply 的 reference 模式读取补充说明，
+                                // 因此收紧后的工具面是读取工具、步骤工具加这一个只读入口。
+                                tools.len() == 3
                                     && tools.iter().any(|tool| tool.function.name == "file_read")
                                     && tools
                                         .iter()
                                         .any(|tool| tool.function.name == "update_execution_steps")
+                                    && tools.iter().any(|tool| tool.function.name == "skill_apply")
                             })
                         })
                         .count();
@@ -17958,24 +17963,34 @@ done
             })
             .collect::<Vec<_>>();
         use sha2::Digest;
-        let first_request_hash = magi_core::hex_lower(sha2::Sha256::digest(
-            serde_json::to_vec(&serde_json::json!({
-                "request": requests[0], "maxOutputTokens": null,
-                "executorCapabilities": harness.provider.executor_capabilities(),
-                "purpose": magi_session_store::ModelStepPurpose::Execution,
-                "executionScope": scope_values[0],
-            }))
-            .unwrap(),
-        ));
-        let second_request_hash = magi_core::hex_lower(sha2::Sha256::digest(
-            serde_json::to_vec(&serde_json::json!({
-                "request": requests[1], "maxOutputTokens": null,
-                "executorCapabilities": harness.provider.executor_capabilities(),
-                "purpose": magi_session_store::ModelStepPurpose::Execution,
-                "executionScope": scope_values[1],
-            }))
-            .unwrap(),
-        ));
+        let expected_request_hash =
+            |request: &magi_bridge_client::ModelInvocationRequest,
+             step: &magi_session_store::ModelStep,
+             execution_scope: &serde_json::Value| {
+                let mut request_intent = request.clone();
+                request_intent.prompt_cache_key = None;
+                let prompt_frame = magi_conversation_runtime::prompt_lineage::PromptFrame::from_ir(
+                    &harness.provider.cache_prompt_ir(&request_intent),
+                );
+                let value = serde_json::json!({
+                    "request": request_intent,
+                    "maxOutputTokens": null,
+                    "executorCapabilities": harness.provider.executor_capabilities(),
+                    "purpose": magi_session_store::ModelStepPurpose::Execution,
+                    "promptFrame": prompt_frame,
+                    "cacheEpoch": step.cache_epoch,
+                    "historyGeneration": step.checkpoint_generation,
+                    "executionScope": execution_scope,
+                });
+                let canonical = magi_bridge_client::llm_types::canonicalize_json(&value);
+                magi_core::hex_lower(sha2::Sha256::digest(
+                    serde_json::to_vec(&canonical).unwrap(),
+                ))
+            };
+        let first_request_hash =
+            expected_request_hash(&requests[0], &terminal.model_steps[0], &scope_values[0]);
+        let second_request_hash =
+            expected_request_hash(&requests[1], &terminal.model_steps[1], &scope_values[1]);
         assert_eq!(root_step.request_fingerprint, first_request_hash);
         assert_eq!(steer_step.request_fingerprint, second_request_hash);
         assert_eq!(terminal.model_steps.len(), requests.len());

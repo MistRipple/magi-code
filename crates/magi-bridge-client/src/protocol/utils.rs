@@ -465,6 +465,7 @@ mod tests {
     #[test]
     fn openai_tool_result_with_image_emits_tool_result_and_user_image() {
         let messages = vec![LlmMessage {
+            origin: Default::default(),
             role: "user".to_string(),
             content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
                 tool_use_id: "call_1".to_string(),
@@ -490,6 +491,7 @@ mod tests {
     #[test]
     fn openai_assistant_message_replays_reasoning_content_from_chat_context() {
         let messages = vec![LlmMessage {
+            origin: Default::default(),
             role: "assistant".to_string(),
             content: LlmMessageContent::Blocks(vec![
                 LlmContentBlock::ProviderContext {
@@ -516,6 +518,7 @@ mod tests {
     #[test]
     fn openai_assistant_message_converts_responses_reasoning_context() {
         let messages = vec![LlmMessage {
+            origin: Default::default(),
             role: "assistant".to_string(),
             content: LlmMessageContent::Blocks(vec![
                 LlmContentBlock::ProviderContext {
@@ -544,6 +547,7 @@ mod tests {
     #[test]
     fn anthropic_tool_result_with_image_keeps_image_inside_tool_result_content() {
         let messages = vec![LlmMessage {
+            origin: Default::default(),
             role: "user".to_string(),
             content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
                 tool_use_id: "call_1".to_string(),

@@ -29,6 +29,14 @@ pub enum BridgeErrorLayer {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelInvocationRequest {
+    /// 稳定逻辑分支的网关账号亲和身份；不随模型、工具面或权限的 cache epoch 轮换。
+    /// 仅由 daemon lineage authority 提供，不参与请求意图序列化。
+    #[serde(skip)]
+    pub cache_affinity_key: Option<String>,
+    /// 由运行时从 branch/provider/epoch 派生的 Provider 缓存键，不使用 Turn、Step 或重试 ID。
+    /// 它是传输投影；冻结后的身份由 ModelStep 的缓存摘要拥有，不参与请求意图序列化。
+    #[serde(skip)]
+    pub prompt_cache_key: Option<String>,
     pub provider: String,
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,7 +82,8 @@ pub struct ChatMessage {
     /// 可信输入装配端提供的原始 request 身份；只用于冻结消费集合，不发送给 Provider。
     #[serde(skip)]
     pub input_request_id: Option<String>,
-    /// 由消息装配端指定的统计来源；仅供本地上下文估算，不发送给模型。
+    /// 由消息装配端指定的来源；用于本地上下文估算，以及适配器识别请求末尾的
+    /// `RoundContext` 易变尾部（决定缓存断点位置），不会发送给模型。
     #[serde(skip)]
     pub context_origin: ChatMessageOrigin,
     pub role: String,
@@ -99,9 +108,14 @@ pub enum ChatMessageOrigin {
     #[default]
     Conversation,
     SystemInstruction,
+    /// 上下文装配器确认的静态规则前缀；缓存策略不得从消息正文中的字符串推断。
+    StaticPolicy,
     ProjectContext,
     Skill,
     ContextReference,
+    /// 只存在于本次请求视图末尾、每轮重建的易变上下文，不属于可被提供方缓存的历史。
+    /// 适配器据此把缓存断点放在它之前；上下文统计仍按引用资料计入。
+    RoundContext,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -129,6 +143,17 @@ pub struct ChatToolDefinition {
     /// 通过维护一份名称白名单猜测工具身份。
     #[serde(default)]
     pub origin: ChatToolOrigin,
+}
+
+/// IR 与 transport 共用同一规范化工具面；数组（含 required/enum）顺序保留，
+/// 只规范化对象键和目录顺序。权限撤销或 schema 内容变化仍真实改变输出。
+pub fn canonical_tool_surface(tools: &[ChatToolDefinition]) -> Vec<ChatToolDefinition> {
+    let mut tools = tools.to_vec();
+    for tool in &mut tools {
+        tool.function.parameters = crate::llm_types::canonicalize_json(&tool.function.parameters);
+    }
+    tools.sort_by(|left, right| left.function.name.cmp(&right.function.name));
+    tools
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -715,9 +740,158 @@ pub trait BridgeTransport: Send + Sync {
     ) -> Result<BridgeTransportResponse, BridgeTransportError>;
 }
 
+/// 实际 transport 的不可变缓存环境。只由可信客户端提供，不接受模型请求传入。
+/// endpoint 不含 userinfo、query、fragment；运行时仅持久化其摘要。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelCacheIdentity {
+    pub protocol: String,
+    pub endpoint: String,
+    pub model: String,
+    pub reasoning_profile: String,
+}
+
+/// 一次真实 HTTP 尝试的证据。回调失败必须阻止后续发送，不写请求正文或连接凭据。
+pub enum ModelTransportEvent {
+    Started {
+        request_fingerprint: String,
+    },
+    Updated {
+        http_status: Option<u16>,
+        usage: Option<magi_app_server_protocol::ModelTransportUsage>,
+    },
+    Finished {
+        outcome: magi_app_server_protocol::ModelTransportOutcome,
+    },
+}
+
+/// 只持有本次调用的规范化传输回执；canonical 写入和用量投影复用同一个 reducer。
+#[derive(Default)]
+pub struct ModelTransportRecorder {
+    pub attempts: Vec<magi_app_server_protocol::ModelTransportRecord>,
+}
+
+impl ModelTransportRecorder {
+    pub fn apply(
+        &mut self,
+        event: &ModelTransportEvent,
+    ) -> Result<&magi_app_server_protocol::ModelTransportRecord, BridgeClientError> {
+        let invalid = || BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Protocol,
+            code: Some(-32096),
+            message: "transport observation order invalid".into(),
+        };
+        match event {
+            ModelTransportEvent::Started {
+                request_fingerprint,
+            } => {
+                if self
+                    .attempts
+                    .last()
+                    .is_some_and(|record| record.outcome.is_none())
+                {
+                    return Err(invalid());
+                }
+                self.attempts
+                    .push(magi_app_server_protocol::ModelTransportRecord {
+                        observed_at: None,
+                        request_fingerprint: request_fingerprint.clone(),
+                        http_status: None,
+                        usage: None,
+                        outcome: None,
+                    });
+            }
+            ModelTransportEvent::Updated { http_status, usage } => {
+                let record = self
+                    .attempts
+                    .last_mut()
+                    .filter(|record| record.outcome.is_none())
+                    .ok_or_else(invalid)?;
+                if let Some(status) = http_status {
+                    record.http_status = Some(*status);
+                }
+                if let Some(usage) = usage {
+                    record.usage = Some(usage.clone());
+                }
+            }
+            ModelTransportEvent::Finished { outcome } => {
+                let record = self
+                    .attempts
+                    .last_mut()
+                    .filter(|record| record.outcome.is_none())
+                    .ok_or_else(invalid)?;
+                record.outcome = Some(outcome.clone());
+            }
+        }
+        let record = self.attempts.last_mut().ok_or_else(invalid)?;
+        record.observed_at = Some(
+            magi_core::UtcMillis::now()
+                .0
+                .max(record.observed_at.unwrap_or(0)),
+        );
+        Ok(record)
+    }
+}
+
+pub type ModelTransportObserver<'a> =
+    dyn Fn(&ModelTransportEvent) -> Result<(), BridgeClientError> + 'a;
+
+pub struct ModelInvocationOptions<'a> {
+    pub on_delta: Option<&'a dyn Fn(&ModelStreamingDelta)>,
+    pub on_retry: &'a dyn Fn(&ModelRetryRuntimeEvent),
+    pub is_cancelled: &'a dyn Fn() -> bool,
+    pub max_output_tokens: Option<u32>,
+}
+
 pub trait ModelBridgeClient: Send + Sync {
+    /// 返回与本次真实 Provider 请求共用的规范化 Prompt IR。
+    ///
+    /// 缓存摘要必须在同一个入口完成工具名称编码、协议前置归一化等操作；
+    /// 调用方不能先对原始请求做一份摘要，再让 adapter 对另一份 IR 发包。
+    /// 非 HTTP/未知执行器沿用通用编译器，保持“未观测”而不猜测其 wire 语义。
+    fn cache_prompt_ir(&self, request: &ModelInvocationRequest) -> crate::prompt_ir::PromptIr {
+        crate::prompt_ir::compile_prompt_ir(request, false, None, None)
+    }
+
+    /// 未实现 HTTP 观测的执行器保持未知，不用逻辑响应伪造 transport 证据。
+    fn invoke_observed(
+        &self,
+        request: ModelInvocationRequest,
+        options: ModelInvocationOptions<'_>,
+        _observer: &ModelTransportObserver<'_>,
+    ) -> Result<ModelResponse, BridgeClientError> {
+        match (options.on_delta, options.max_output_tokens) {
+            (Some(delta), Some(limit)) => self.invoke_streaming_with_output_limit(
+                request,
+                limit,
+                delta,
+                options.on_retry,
+                options.is_cancelled,
+            ),
+            (Some(delta), None) => self.invoke_streaming_with_cancellation(
+                request,
+                delta,
+                options.on_retry,
+                options.is_cancelled,
+            ),
+            (None, Some(limit)) => self.invoke_with_retry_events_cancellation_and_output_limit(
+                request,
+                limit,
+                options.on_retry,
+                options.is_cancelled,
+            ),
+            (None, None) => self.invoke_with_retry_events_and_cancellation(
+                request,
+                options.on_retry,
+                options.is_cancelled,
+            ),
+        }
+    }
     /// 每个可信适配器必须显式声明实现的合同，包装器必须转发，不默认赋予原生能力。
     fn executor_capabilities(&self) -> crate::ExecutorCapabilities;
+    /// 未声明的执行器保持未知，不能从请求的 provider 路由名猜测实际连接。
+    fn cache_identity(&self) -> Option<ModelCacheIdentity> {
+        None
+    }
     /// 预留的外部执行器接口；当前没有具体外部 Agent 适配器。
     /// 将来接入时须在缓存 client 之外绑定本次 Task 的可信权限/目录。
     /// 普通模型没有本地执行面，保持原 client。返回的新 client 只用于本次执行。

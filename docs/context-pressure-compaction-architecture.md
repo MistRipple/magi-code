@@ -69,16 +69,37 @@ transcript 重建；图片输入从 canonical 用户 item 的受控 metadata 恢
 
 ### 3.4.1 提示词前缀稳定
 
-提供方的提示词缓存只复用逐字节相同的前缀，所以每次模型请求都必须是上一次请求加上末尾追加。主会话线程遵守以下约束：
+提供方的提示词缓存要求渲染后的完整前缀匹配。在模型、规则、权限和工具面不变的稳定区间，已发送历史保持不变，只追加新消息；本轮动态尾部允许替换，压缩和能力变化是明确边界。主会话线程遵守以下约束：
 
 - 前缀顺序是静态角色与工作区规则、半静态项目记忆，然后是线程历史，最后是当前用户输入和本轮易变内容。
 - 任务上下文、引用资料、用户计划、邮箱和执行步骤快照每轮都可能变化，只作为模型视图末尾的片段追加，不进入 `messages`，也不写入 thread 历史。子代理线程单任务独占，保持原有顺序。
 - thread 历史是 canonical Turn 的纯投影。一个模型 Step 的输出（推理项加一批调用）投影为一条 assistant 消息，调用列表取模型输出的完整列表，不随工具条目逐个出现而增长。
 - 实时消息和回合边界重建出的历史必须逐字节一致。新增会在历史重建时改写内容的标注，例如文件读取的 `fact_state`，必须在实时消息创建时就写入同样的形态。
 - 单个用户回合的任务标题只是目标的截断副本时，提示只发送一份目标。
-- 工具结果总预算只在超出窗口比例后才会重写旧结果；超出后会让缓存失效一次，属于预期代价。
+- 历史边界说明（“以上是已持久化的运行记录”）只在回合开始或压缩重建时才生成，不写进 thread 历史。主线把它放在易变尾部；放在历史与当前输入之间会让它在下一回合的历史里消失，上一回合从当前输入起的全部内容（工具调用与结果）因此整段错位，下一回合首个请求读不到缓存。
+- 主线请求本来就带着完整线程历史，近期回合和文件读取摘要只是历史的投影副本，不再装配成引用上下文；它们每轮重复放在尾部会多发数千 token，且永远命不中缓存。子代理没有主线历史，仍按任务装配。
+- 单条工具结果的模型可见形态必须由同一条流水线产生：实时消息与回合边界重建都先补事实标注（`fact_state`），再做单条上限裁剪，裁剪外壳保留该标注。顺序或字段不一致时，超过单条上限的大文件读取会在下一回合变成不同字节。
+- 工具结果总预算超出后，旧结果降级的边界只落在从头累计的块边界上（块约为预算的一半），旧结果的摘要形态只由结果自身决定。新结果追加时降级边界保持不变，历史逐字节相同，直到保留段装不下才整块前移一次；此前每增加一条结果就改写一遍全部旧结果，超出预算后每一轮都破坏缓存。
+- 总预算只作用于“原始（仅经单条裁剪）结果序列”，输出是它的纯函数：实时循环的 `messages` 保存原始序列，每次构造请求时在副本上投影；回合边界重建同样从原文投影。禁止把投影结果写回原始序列再叠加预算——那样降级边界会按已降级的体积重新计算，第 12 次追加起就与重建结果分叉（已由 `history_projection` 的一致性测试覆盖）。该投影的唯一实现是 `history_projection.rs`，见 [Prompt Lineage 与缓存根架构](prompt-cache-lineage-architecture.md)。
+- 末尾那段易变内容在模型视图里统一标为 `ChatMessageOrigin::RoundContext`，适配器据此识别历史与尾部的边界。Anthropic 适配器只把请求开头那一段 system/developer 消息并进 system 字段（system 排在全部 messages 之前，并进去会让每轮变化的内容挡住整段历史）；对话开始之后出现的 developer 消息，包括执行步骤快照和运行中追加的提示，按 user 角色留在原位置，信任标记写在片段正文里。滚动缓存断点放在尾部之前的最后一条 user 消息上，不放在每轮重建的尾部上。OpenAI 两种协议本来就把 developer 留在原位置，不受影响。
 
-`MAGI_MODEL_REQUEST_FINGERPRINT_DIR` 打开后，把每次请求的工具表、系统提示和输入项哈希写入 JSONL，用于比对连续请求的第一个差异位置；额外设置 `MAGI_MODEL_REQUEST_FINGERPRINT_FULL` 才写完整请求体，仅用于本机字节级比对，默认关闭。
+`MAGI_MODEL_REQUEST_FINGERPRINT_DIR` 打开后，把每次请求的工具表、系统提示和输入项哈希写入 JSONL，用于比对连续请求的第一个差异位置；每条记录带 `prefix` 字段，与同一会话键、同一模型、同为带工具/不带工具的上一次请求比较：`append_only`（历史只追加，上一次末尾的易变尾部除外）、`history_rewritten`（附第一个不同的位置和片段标识）、`tools_changed`、`instructions_changed`、`parameters_changed` 或 `first_request`。额外设置 `MAGI_MODEL_REQUEST_FINGERPRINT_FULL` 才写完整请求体，仅用于本机字节级比对，默认关闭。
+
+### 3.4.2 缓存机制的开源参考
+
+下表来自 2026-10 对 `openai/codex`、`earendil-works/pi`、`anomalyco/opencode` 源码的阅读，不是对它们实际命中率的测量；上游代码会变化，引用前以当时源码为准。"Magi 现状"只描述本仓库当前行为，未实现的项明确标出。
+
+| 机制 | 参考实现 | Magi 现状与取舍 |
+| --- | --- | --- |
+| 会话路由键 | Codex 把会话 ID 作为 `prompt_cache_key`，内部子会话用 `{来源}:{父线程 ID}`，子代理继承父线程的策略（`codex-rs/core/src/client.rs`、`agent/control/spawn.rs`）。pi 把 `sessionId` 截到 64 字符作为 key（`packages/ai/src/api/openai-prompt-cache.ts`）。opencode 取父会话或 fork 来源的 ID，同时写入 `x-session-affinity` 等请求头，并按 provider 声明是否支持（`packages/core/src/session/affinity.ts`、`model-request.ts`） | **已完成。** `PromptLineage` 为主线、worker task 和 auxiliary purpose 生成不同的 64 字符 branch 摘要键；同一 branch 的恢复/重试复用键。Responses 和已确认的路由头使用该摘要；Provider/model scope、epoch 和 Prompt IR 已统一接入。没有会话的草稿/探测不虚构键 |
+| 增量续写与前缀比对 | Codex 的 Responses WebSocket 用 `previous_response_id` 续写：除 `input` 外的请求属性（模型、工具、推理、`prompt_cache_key` 等）全部不变，且输入是上一次输入加输出的延长，才算增量；否则记录原因（`model_changed`、`tools_changed`、`input_shortened`、`input_mismatch` 等）。结构体解构写全，新增字段必须显式决定是否影响复用 | **未采用 WebSocket 续写。** 借鉴其"变化原因枚举"：指纹工具已按上一次请求自动标注 `prefix.reason`（见 3.4.1）；模型、权限、Skill、压缩等边界原因仍需调用方对照，不能从指纹推出 |
+| 断点放置 | opencode 默认在最后一个工具定义、首尾 system 片段和对话尾部各放一个，共不超过 4 个，尾部随工具结果前移；Gemini 路由不放断点，Qwen 不放工具断点，OpenAI 隐式前缀协议整体跳过（`packages/ai/src/cache-policy.ts`）。pi 在 system、最后工具和末条消息上放 `cache_control`（`packages/ai/src/api/anthropic-messages.ts`） | Anthropic 保留静态系统前缀断点，并补上最后工具定义及易变尾部之前最后一条 user 消息的末个受支持内容块，最多三个断点；不标记 assistant thinking/signature，不给 OpenAI 协议发 Anthropic 标记。对话开始之后的 developer 消息不再并进 system（见 3.4.1），尾部不再承载断点。以上只有请求体层面的回归测试，没有对真实 Anthropic 账号实测 |
+| 批量改写，而不是逐步改写 | opencode 的图片超过 25MiB 才开始丢最旧的，一次降到 15MiB 以下，被替换的前缀在两次裁剪之间不变（`boundImages`） | 工具结果总预算只在超出窗口比例后重写（见 3.4.1）；旧配置 Agent 的 24/12 条高低水位随该 Agent 一起删除，配置任务沿主循环的同一预算 |
+| 参数变化不破坏缓存 | opencode 在支持的协议上，推理强度变化不改顶层参数，而是在历史里追加一条强度更新消息（`effort-updates.ts`） | **未实现。** 用户在主对话切换强度会使缓存失效一次，属于 GPT Web 方案 §13 里需记录原因的边界 |
+| 保留期与预热 | pi 的 `cacheRetention` 为 none/short/long，long 在 Anthropic 上请求 1 小时 TTL；缓存预热在 TTL 的 90% 处用单 token 输出重放请求，只有"续写概率 × 未命中额外成本 − 预热成本"至少 0.05 美元时才发送，空闲预热最长 30 分钟（`packages/coding-agent/src/core/cache-warmer.ts`） | **不采用。** 预热让空闲会话持续产生计费请求，且依赖按模型的价格表；等 provider 层有统一的缓存读写计费口径后再评估 |
+| 用量口径 | pi 的 usage 区分 `cacheRead`、`cacheWrite`、`cacheWrite1h`；opencode 统一为"输入含缓存"的口径，再还原非缓存输入 | Magi 的账本已有 `cacheReadTokens`、`cache_write_tokens` 与 `cacheReadIncludedInInput`（`usage_recording.rs`）；不区分 1 小时与默认 TTL 的写入量 |
+
+这些参考不改变 3.4.1 的主约束：保持稳定区间的历史前缀，再处理 provider 标记和路由键。2026-10-31 的真实历史账本基线、本轮实现、验证和仍未验收的范围见[Prompt 缓存分析与优化记录](prompt-cache-optimization.md)。新增 key 不代表真实命中率已提升，现代 OpenAI 模型的 key 也不能一概视为必要条件。
 
 ### 3.5 复杂度受控
 
