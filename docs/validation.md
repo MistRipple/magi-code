@@ -102,6 +102,8 @@ Prompt 缓存使用 `npm run test:prompt-cache`（或直接运行 `node scripts/
 
 跨模型入口为 `npm run test:prompt-cache-models -- --live`（等价于直接运行 `scripts/verify-prompt-cache-models.mjs --live`）。目录内所有文本模型逐项探测，成功项以同一模型分别承接主线与辅助调用，执行三轮 smoke；生图等非文本项跳过，失败/暂不可用项留证。并发最多两个独立验收进程，每模型一条探测、smoke 最多 12 次，完整对照最多 56 次；报告记录整轮请求上限。`--tool-turns` 追加“同一会话内：纯对话、读取两个约 25 KB 文件的工具回合、两轮纯对话”，用来观察回合边界上上一回合的工具历史能否被缓存复用（此时 smoke 最多 28 次，若追加完整场景则完整上限自动提升到 56 次，以覆盖 worker/工具循环）。`--model <id>` 可重复以限制模型集合；`--full-model <id>` 可重复以追加完整场景，配合 `--baseline /绝对路径/旧二进制` 比较旧新版。主脚本也可用 `--smoke` 和 `--aux-model <id>` 单独运行这些路径。`completed` 只表示矩阵已遍历，`outcome` 区分通过和验证失败；任何已可用模型的 smoke/完整场景失败使脚本非零退出，不能用目录探测成功替代三轮/工具完成。
 
+定期检查真实使用的缓存命中用 `npm run report:cache-usage`（等价于 `node scripts/report-cache-usage.mjs`）：只读本机 `~/.magi/audit-usage-ledger`（`MAGI_STATE_ROOT` 或 `--ledger` 可指定其他状态根），不启动 daemon、不访问网络。按模型/角色和按日期汇总调用数、输入、缓存读取和 Token 命中率；`--since YYYY-MM-DD` / `--until` 用来比较改动落地前后，`--by model|day|both` 选择视图，`--json` 输出机器可读结果。口径：按 attempt 的 eventId 去重；上游没有报告缓存读取值的调用单独计为“未报告”，不进入命中率；辅助请求输入通常只有数百 Token，低于多数提供方的缓存最小前缀，命中率低是结构性的，应与 orchestrator/worker 分开看。新构建的 Step 另外在 daemon 日志里用 `magi::prompt_cache` 记录每次请求的缓存核算（实际读取、按 Magi 保持稳定的前缀本应可复用的量、易变尾部、provider 侧缺口），用来区分“Magi 前缀被破坏”和“provider 没服务”，见 [Prompt Lineage 与缓存根架构](prompt-cache-lineage-architecture.md)。
+
 ## 文档与脚本维护
 
 - 架构约束保留在对应设计文档；完成后的阶段计划、一次性进度/验收报告从活动文档移除，历史通过 Git 追溯。
