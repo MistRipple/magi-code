@@ -49,7 +49,7 @@ pub fn cancel_external_approvals(
     token_id: &str,
 ) {
     registry.remove_task(session_id, &external_approval_task_id(token_id));
-    // 槽位审批也复用这个取消入口；不能清掉该会话里的普通审批。
+    // 只移除外部审批，不能清掉该会话里的普通审批。
     registry.remove_external_session(session_id);
 }
 

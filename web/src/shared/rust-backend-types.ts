@@ -3,7 +3,6 @@
 // Formerly maintained in support/frontend-contract/src/contracts.ts.
 
 import type { AgentContinueParams, AgentTransferParams, AgentTransferTarget, PluginSelection, QueuedSessionTurn, SessionQueueSnapshot } from './app-server-protocol.generated';
-import type { ModelApiProtocol } from './types/agent-types';
 
 export type EventCategory = 'Domain' | 'Audit' | 'Usage' | 'Projection' | 'System';
 
@@ -1145,22 +1144,6 @@ export interface AgentTemplateIdRequestDto {
   templateId: string;
 }
 
-/**
- * 会话内主模型选择器里的 GPT Web 入口（daemon 投影，W18）。
- *
- * 登录后只有一个固定入口 `plugin/openai.chatgpt-web/default`，不复制网页的模型菜单；未登录或探测失败时
- * 不出现。工具能力是可选增强：通道不可用时入口照常可用，`tools.available=false` 并说明缺什么。
- */
-export interface PickerWebEngineDto {
-  id: string;
-  displayName?: string;
-  apiProtocol?: ModelApiProtocol;
-  status?: string;
-  tools?: { available: boolean; code?: string; detail?: string };
-  origin?: { kind?: string; accountHint?: string };
-  probedAt?: number;
-}
-
 export interface ModelReasoningCapability {
   supportedEfforts: import('./orchestrator-session-config').OrchestratorReasoningEffort[];
   defaultEffort: import('./orchestrator-session-config').OrchestratorReasoningEffort | null;
@@ -1175,8 +1158,6 @@ export interface FetchModelsResponseDto {
   success: boolean;
   target: string;
   models: string[];
-  /** Web 引擎由 daemon 单独投影，绝不混进 `models` 当普通模型名（A22）。 */
-  webEngines?: PickerWebEngineDto[];
   orchestratorSessionDefaults?: Record<string, unknown> | null;
   requestedAt: number;
 }

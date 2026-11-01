@@ -80,7 +80,6 @@ Users can extend tools, user interfaces, and execution workflows without modifyi
 - **Unified lifecycle**: Managed by `PluginManager`, offering verification, versioned resources, permission grants, activation, and safe uninstallation.
 - **Isolated execution sandbox**: Plugins run in an isolated QuickJS Worker environment to safeguard host stability.
 - **Deep UI integration**: Plugins can contribute settings tabs, workbench entries, and custom data panels rendered in isolated iframes inside the right pane.
-- **Plugin Center**: Built-in official plugin center (`plugin-center`) for discovering and installing extensions; ships with a first-party GPT Web plugin wrapper.
 
 #### 4. Dual MCP ecosystem (Client + Standard Server)
 

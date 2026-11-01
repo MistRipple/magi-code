@@ -1,12 +1,3 @@
-//! MCP 请求分发与调用管线。
-//!
-//! 服务是**薄的协议与策略层**：不复制工具实现，也不持有审批与账本。一次 `tools/call`
-//! 的顺序固定为：
-//!
-//! MCP 客户端使用完整工具目录（GPT Web 槽位按设置过滤）→ 归属解析 → 工作区路径校验 → 审批处置 → 后端执行 → 审计。
-//!
-//! 任何一步失败都以 MCP 工具错误返回，后续步骤不执行；网络与本机客户端走同一条管线。
-
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -23,7 +14,7 @@ use crate::catalog::{
 };
 use crate::path_guard::{PathGuard, PathRequest};
 use crate::profile::ApprovalMode;
-use crate::profile::{Disposition, Profile, ToolClass};
+use crate::profile::{Profile, ToolClass};
 use crate::protocol::{
     JSONRPC_INVALID_PARAMS, JSONRPC_INVALID_REQUEST, JSONRPC_METHOD_NOT_FOUND, JsonRpcRequest,
     error, initialize_result, ping_result, success, tool_failure, tool_success,
@@ -58,7 +49,6 @@ impl From<&TokenRecord> for ClientPrincipal {
             client_name: record.client_name.clone(),
             workspace_id: record.workspace_id.clone(),
             project_directories: record.project_directories.clone(),
-            // 令牌统一开放完整工具目录；工具档只属于 GPT Web 槽位的 principal。
             profile: Profile::Exec,
             approval_mode: record.approval_mode,
             attribution: record.attribution,
@@ -71,16 +61,8 @@ impl From<&TokenRecord> for ClientPrincipal {
 pub enum AttributionTarget {
     /// 该令牌自己的外部工具会话。
     ExternalSession { token_id: String },
-    /// GPT Web 槽位拥有者进行中的 turn。
-    WebSlotTurn {
-        session_id: String,
-        /// 槽位租约代际，与 canonical Turn ID 分属不同身份。
-        turn_id: String,
-        canonical_turn_id: String,
-    },
 }
 
-/// 归属被拒绝（例如 `follow_web_slot` 时没有进行中的 turn）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttributionRefusal(pub String);
 
@@ -89,7 +71,6 @@ pub trait AttributionResolver: Send + Sync {
     -> Result<AttributionTarget, AttributionRefusal>;
 }
 
-/// 默认实现：`external` 归到外部工具会话；`follow_web_slot` 没有 GPT Web 联动时一律拒绝。
 #[derive(Debug, Default)]
 pub struct ExternalOnlyAttribution;
 
@@ -102,9 +83,6 @@ impl AttributionResolver for ExternalOnlyAttribution {
             AttributionMode::External => Ok(AttributionTarget::ExternalSession {
                 token_id: principal.token_id.clone(),
             }),
-            AttributionMode::FollowWebSlot => Err(AttributionRefusal(
-                "当前没有可归属的进行中的 GPT Web 对话".to_string(),
-            )),
         }
     }
 }
@@ -696,7 +674,6 @@ impl McpServer {
 
         let requires_approval = match principal.attribution {
             AttributionMode::External => principal.approval_mode == ApprovalMode::Ask,
-            AttributionMode::FollowWebSlot => requires_approval(principal.profile, &mapping),
         };
         let invocation = ToolInvocation {
             principal: principal.clone(),
@@ -747,10 +724,6 @@ impl McpServer {
             tool_success(text)
         })
     }
-}
-
-fn requires_approval(profile: Profile, mapping: &ResolvedTool) -> bool {
-    profile.decide(mapping.class) == Disposition::RequireApproval
 }
 
 /// 超出上限时在字符边界截断并明确提示，不做静默截断。
@@ -950,33 +923,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_never_falls_back_to_another_workspace_or_binds_a_web_slot() {
-        let h = harness();
-        let mut p = principal(Profile::ReadOnly);
-        p.workspace_id = "unregistered".into();
-        let response = h
-            .server
-            .handle(&p, request("initialize", Some(json!(1)), json!({})), 1)
-            .await
-            .unwrap();
-        assert!(response.get("error").is_some());
-        assert!(
-            !response
-                .to_string()
-                .contains(&h._dir.path().display().to_string())
-        );
-
-        p.attribution = AttributionMode::FollowWebSlot;
-        let response = h
-            .server
-            .handle(&p, request("initialize", Some(json!(2)), json!({})), 1)
-            .await
-            .unwrap();
-        assert!(response["result"].get("instructions").is_none());
-        assert_eq!(response["result"]["serverInfo"]["name"], "magi-mcp");
-    }
-
-    #[tokio::test]
     async fn malformed_requests_are_rejected_without_touching_the_backend() {
         let h = harness();
         let mut bad = request("tools/list", Some(json!(true)), json!({}));
@@ -1128,20 +1074,6 @@ mod tests {
         let events = h.audit.0.lock().unwrap();
         assert!(matches!(events[0].outcome, AuditOutcome::Denied { .. }));
         assert_eq!(events[0].paths, vec!["../escape.txt".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn follow_web_slot_without_an_active_turn_is_refused() {
-        let h = harness();
-        let mut p = principal(Profile::Edit);
-        p.attribution = AttributionMode::FollowWebSlot;
-        let response = h
-            .server
-            .handle(&p, call("magi.fs.read", json!({"path": "a.txt"})), 1)
-            .await
-            .unwrap();
-        assert!(is_error(&response));
-        assert!(h.backend.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

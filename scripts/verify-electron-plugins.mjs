@@ -440,7 +440,6 @@ try {
   await waitFor(() => exists(page, '.right-pane-add-menu button[data-kind="managePlugins"]'), "添加菜单出现管理插件入口");
   const pluginItem = await page.evaluate(`(() => { const el = document.querySelector('.right-pane-add-menu button[data-kind="plugin"]'); return el ? { pluginId: el.dataset.pluginId, contributionId: el.dataset.contributionId, disabled: el.disabled } : null; })()`);
   check("添加菜单的插件视图项携带插件与贡献身份且可用", pluginItem?.pluginId === PLUGIN_ID && Boolean(pluginItem.contributionId) && pluginItem.disabled === false, JSON.stringify(pluginItem));
-  check("未安装 GPT Web 插件时添加菜单不出现其入口（不是置灰）", !(await exists(page, '.right-pane-add-menu button[data-kind="webSession"]')));
   await click(page, '.right-pane-add-menu button[data-kind="managePlugins"]');
   await waitFor(() => exists(page, '[data-testid="plugin-list"]'), "管理插件直达设置页插件分类", 30_000);
   check("添加菜单「管理插件」直达设置页插件分类", true);
@@ -453,7 +452,6 @@ try {
   check("复制后给出已复制反馈", true);
   await click(page, '[data-settings-detail-page] .detail-back-row button');
   await waitFor(async () => !(await exists(page, '[data-testid="plugin-guide"]')), "返回插件列表", 10_000);
-  check("未安装 GPT Web 插件时设置导航没有它的独立分类", !(await exists(page, '[data-testid="settings-nav-webModel"]')));
 
   await openPluginDetail();
   await waitFor(() => exists(page, currentRow), "设置页当前作用域行");
@@ -735,7 +733,7 @@ try {
     body: JSON.stringify({ jsonrpc: "2.0", ...(id === null ? {} : { id }), method, params }),
   });
   const transportIds = [];
-  for (const name of ["gpt-web-test", "claude-test"]) {
+  for (const name of ["example-test", "claude-test"]) {
     const initialized = await transportRpc(null, "initialize", { clientInfo: { name, version: "1" } });
     transportIds.push(initialized.headers.get("mcp-session-id"));
   }

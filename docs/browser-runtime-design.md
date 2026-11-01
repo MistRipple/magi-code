@@ -2,7 +2,6 @@
 
 > 状态：当前产品唯一架构基线
 >
-> 更新日期：2026-09-30（`webSession` 最终口径同步《[Magi GPT Web 最终开发文档](./web-model-browser-development.md)》：单宿主、单 WebView、单槽位；除该例外外的规则不变）
 
 本文定义 Magi Desktop 内置浏览器、右侧多功能面板、Rust daemon、浏览器自动化 Worker 和 Web/手机 Web 降级行为。实现必须收敛到本文件描述的单一路径，不保留旧坐标映射、截图投影或双轨兼容实现。
 
@@ -28,7 +27,6 @@ Web 和手机 Web 不伪造可接管的浏览器。它们可以展示 URL、只�
 | `terminal` | xterm 终端、输出、连接状态和终端生命周期 |
 | `agent` | Agent 任务状态、工具输出和详情 |
 | `browser` | 地址栏、导航、网页交互、视口、截图、标记和 DOM 选择 |
-| `webSession` | GPT Web 应用级宿主：同一内容槽内一个主页 / 对话 WebView，单槽位串行承载临时或已保存对话（见 §4.3） |
 
 图片、Markdown、Diff 是代码视图的内容模式，不因浏览器改造拆成新的右栏外壳。未来新增类型必须只实现自己的内容组件，不能复制右栏壳或改变公共布局。
 
@@ -47,7 +45,6 @@ Electron BrowserWindow
                 ├── terminal: 终端
                 ├── agent: Agent 详情
                 ├── browser: BrowserTabContent + 一个 <webview>
-                └── webSession: WebModelTabContent + 一个应用级 <webview>（例外，见 §4.3）
 ```
 
 浏览器只能出现在当前 `browser` Tab 的内容槽中，不能覆盖右栏 Tab 栏、工具栏、弹出菜单或其他内容类型。右栏宽度和拖动只由现有 DOM/CSS 布局负责，浏览器实现不得读取或计算窗口坐标。Renderer 只允许把当前内容槽的瞬时宽高作为 fixed 设备画布的 Chromium 显示比例输入；该宽高不是窗口坐标，不得用于设置原生 bounds 或持久化布局。
@@ -81,7 +78,7 @@ Desktop App Renderer 的 `BrowserTabContent.svelte` 在浏览器内容槽直接�
 - 非活动 Browser Tab 保持自己的 guest 和页面状态，但不进入命中区域、不持有 App 焦点，切换只改变 DOM 路由；
 - Browser Tab 内禁止子 Tab。`target=_blank`、`window.open` 和网页 popup 统一进入 Main 的单一决策链；只对可证明不依赖独立窗口的请求复用当前顶级 Tab，其余请求明确阻止，绝不创建第二个 Electron guest、BrowserWindow 或 Magi 子 Tab。
 
-**唯一例外是应用级 Web 模型会话（`webSession`，§4.3）**：它的 `<webview>` 属于应用级宿主，不随项目 / Magi 会话或右栏可见性卸载，并通过单槽位串行承载一个 Web 对话。其余所有内容类型仍各自只有一个 guest。
+其余所有内容类型仍各自只有一个 guest。
 
 这不是截图、canvas、iframe 投影或原生坐标覆盖方案。旧 `WebContentsView` 浏览器显示路径、浏览器几何 IPC、内容槽租约和原生浮层必须删除。
 
@@ -157,7 +154,6 @@ Browser 工具、任务和消息最终都进入同一 Session/Turn/Item 主链�
 - 关闭一个窗口只释放该窗口的 Surface。若同一逻辑 Tab 仍有其他 Surface，提升一个替代 Primary；若不存在替代者，发送 `primary_surface_closed`，Authority 只清除精确匹配的 binding、撤销其 lease，并把逻辑 Tab 转为 Suspended。
 - 点击右栏 Tab 的关闭按钮是全局关闭逻辑 Tab：Authority 关闭 Tab，Desktop 释放该 Tab 的全部 Surface；该路径不再发送 per-window Primary 关闭事件。任务结束只释放 lease，保留 Tab、URL 和页面。
 - stale epoch、旧 `surfaceRevision`、旧导航代次或已经被替代的关闭事件不得覆盖或清除当前 Primary。
-- **显式例外**：应用级 Web 模型会话（`webSession`）的关闭按钮**只隐藏视图**（从 Tab 条移除、保留逻辑 Tab 与 guest），不执行上面的「全局关闭逻辑 Tab」；它同时豁免「折叠右栏即卸载」的规则。完整边界见 §4.3。
 
 ### 4.2 右栏内容生命周期矩阵
 
@@ -167,29 +163,10 @@ Browser 工具、任务和消息最终都进入同一 Session/Turn/Item 主链�
 | Terminal | 销毁当前 xterm/WebSocket，Rust PTY 继续运行并缓存最近 2 MiB 输出；切回同 ID 重连 | Desktop 当前 BrowserWindow 的 `sessionStorage` 恢复 Terminal Tab 身份，重连同一 PTY并先重放输出、后发布生命周期 | 不恢复 Terminal Tab；daemon 关闭时终止 PTY | 先从 UI 移除，再调用 DELETE 终止精确 TerminalBinding；会话关闭终止其全部 PTY |
 | Code/Image | 当前视图卸载，保留轻量路径/类型元数据；大文本、diff 和图片 data URL 不写存储 | 从当前窗口 `sessionStorage` 恢复元数据并按权威文件/Artifact 重取 | 不恢复 Desktop 窗口级 Tab；Web 端仍按原 localStorage 规则 | 释放当前视图缓存，不影响其他内容类型 |
 | Agent | 当前视图卸载，任务继续由 canonical task/turn/item 事实驱动 | 从当前窗口 `sessionStorage` 恢复 `agentRunId` 并重建投影 | 不恢复 Desktop 窗口级 Tab；任务事实仍属于会话 | 只关闭观察视图，不取消或终止任务 |
-| Web 模型（`webSession`，应用级，§4.3） | **不卸载**：内容槽与单 guest 保持挂载，推理不中断（方案 A） | daemon 投影重建应用级宿主，重新注册 guest；登录态在持久分区 | 登录态和主页可恢复；临时对话上下文不可恢复并标记失效；已保存对话用 `conversation_id` 重新绑定 | **只隐藏视图**：从 Tab 条移除、保留宿主与 guest，不调 `closeBrowserTab`；只有「停止 / 退出 / 清除数据」或显式切到本地才释放 |
 
 Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一窗口 Renderer 重载；Web 使用 `localStorage`。两端都不保存 Browser 实体，避免与 BrowserAuthority 形成双事实源。正常窗口关闭必须经过 Electron `before-quit` 事务；强制进程终止属于崩溃边界，不得伪装成正常关闭完成。
 
-会话级 Tab 关闭由 daemon 的 `browser_tool_runtime::close_browser_tab` 统一提交：先持久化逻辑关闭并发布 `browser.tab.closed`，让 Renderer 卸载内容槽，再通知 Host 释放物理 guest。用户关闭、任务结束清理和 Magi 会话关闭复用该事务；应用级 GPT Web 不进入会话关闭路径，其固定主页身份与停止操作由 `web_model_ops` 管理。
-
-### 4.3 应用级 Web 模型会话（GPT Web）的显式例外
-
-本节是对本文件既有「折叠即卸载」「关闭 Tab = 全局关闭逻辑 Tab」「每个内容槽只有一个 guest」三条规则的**唯一显式例外**，只为应用级 GPT Web 会话（`webSession`）引入，并以《[Magi GPT Web 最终开发文档](./web-model-browser-development.md)》为实现口径。理由：该会话承载的是应用级、登录态长期保留的 ChatGPT 页面，且推理必须能在视图不可见时继续——而 `<webview>` guest 会随宿主组件卸载而销毁，与「后台可驱动」直接冲突。
-
-| 关注点 | 规则 |
-| --- | --- |
-| 内容槽与挂载 | 只要存在应用级 Web 宿主，其右栏内容槽（`WebModelTabContent`）**全程挂载**：折叠右栏只做视觉隐藏（`display: none` + `aria-hidden`），不卸载组件、不销毁单一 `<webview>`；无应用级 Web 宿主时，右栏折叠维持本文件既有的「卸载」语义 |
-| 单宿主 / 单槽位 | 同一内容槽内只有**一个 WebView**；主页、临时对话和已保存对话在同一页面内切换。同一时间只允许一个 Magi 会话、一个 Web 对话和一个进行中的 Web turn，不设并发池、排队或接管 |
-| 关闭按钮 | 只从 Tab 条隐藏该视图、保留在应用级 Tab 集合（`appTabs`）并保持挂载：**不调用 `closeBrowserTab`、不发起任何 Authority 关闭命令、不弹确认、不取消进行中的推理**；登录态与后台推理都保留。仅「设置停止 / Tab 退出 / 清除 Web 数据」、显式切到本地或应用退出才释放 guest |
-| 驱动路径 | 应用级 owner 走**不激活路径**：目标 Tab 的 Surface 已在当前窗口注册且 content-slot 绑定有效时，命令直接复用该 binding，**不写 `right_pane_visibility` / `active_panel`**；只有 Surface 尚未注册时才物化，且物化不附带激活意图。该不激活路径已推广为所有浏览器自动化的统一规则（§4.4） |
-| Primary / 多窗口 | 仍遵守 §4.1：同一逻辑 Tab 全局只有一个 Primary，推理只使用承载该 Tab Primary 的窗口；非 Primary 窗口显示「本窗口未承载当前推理，打开主窗口继续」，不复制用于推理的第二份 Surface |
-| 会话隔离与释放 | 该宿主不随项目 / 会话切换释放，也不参与 `/browser/resources/reclaim`（`is_reclaimable_tab` 拒绝回收应用级 owner 的页面）；槽位 owner、模式和项目范围在内存中固定；「清理浏览数据」按应用级分区粒度执行，执行前先取消进行中的推理并失效绑定 |
-| 登录态 | 使用带 `persist:` 前缀的专用分区 `persist:magi-web-model`（本文件既有的 partition 白名单与 `clearBrowsingData` 规则按此扩展放行），因此登录态可跨应用重启保留 |
-
-除以上各条外，本文件关于显示路径、安全边界、popup、视口、焦点、协议与恢复的全部规则对 `webSession` 同样适用。
-
-Desktop Control 3.8 要求 GPT Web 配置写命令携带 Agent lease/fence（旧宿主在版本握手时拒绝）。GPT Web 配置使用同一 Authority lease 与原生输入链，复用 Main `agent_cursor` 与 Renderer Top Layer 覆盖层。配置的每次 CDP 请求绑定本次 lease/fence，Main 在 Surface lane 中检查控制仍有效；页面里不运行配置脚本，也不合成事件或直接改写文本字段绕过控制。配置运行期间 Agent 持有这张租约并跨命令保留（剩余有效期不足时续租），运行结束（交接、完成、取消、失败）一律释放，登录、验证码和密钥输入阶段交由用户处理。用户在 Agent 思考期间动页面时 Main 识别为接管并撤销租约；接管后不会因停手自动恢复，必须由用户明确继续并重新读取快照。Agent 取得控制时 Main 会把自适应视口钉成当前尺寸，释放时还原为自适应（用户或工具显式选的固定视口不受影响）。
+会话级 Tab 关闭由 daemon 的 `browser_tool_runtime::close_browser_tab` 统一提交：先持久化逻辑关闭并发布 `browser.tab.closed`，让 Renderer 卸载内容槽，再通知 Host 释放物理 guest。
 
 ### 4.4 自动化不改布局与代理保留页面
 
@@ -390,7 +367,6 @@ App Server 的 `initialize/initialized` 只在可信 Desktop 传输且客户端�
 8. 运行 LLM 浏览器任务，确认虚拟鼠标、工具调用、标题读取、DOM 选择、截图、取消、超时、完成后保留当前 Tab。
 9. 重启 daemon、Worker 和 Desktop，确认逻辑 URL、标记、消息引用和多会话归属恢复，迟到事件不会污染其他 Tab。
 10. 检查控制台和日志，不得有 `setBounds` 浏览器调用、Overlay IPC、黑屏、focus 串位、Surface stale 误报或无限连接等待。
-11. 应用级 Web 模型会话（§4.3）：登录 GPT Web 后折叠右栏、关闭该视图、切换项目 / 会话，确认右栏现有标签与活动面板不被夺走、单一 guest 不被销毁、后台推理继续；重启 Magi 后登录态仍在（`persist:magi-web-model`），临时对话失效、已保存对话按 `conversation_id` 重绑，且不会恢复第二个 WebView。
 12. 链接入口（§2.2）：在**右栏从未挂载**的状态下点击消息里的 HTTP(S) 链接，确认右栏自动展开并出现新的顶级 `browser` Tab、目标页真实加载、同 URL 重复点击复用同一 Tab、不同 URL 新建 Tab、Tab 归属当前 Magi 会话（而非 `browser-session-app-*`）。
 
 `npm run test:electron-right-pane-links` 覆盖第 12 条：用打包 Electron 与本地 OpenAI-compatible Provider 让回复带上两个链接，从全新状态根（右栏未挂载）开始逐步断言上述行为。

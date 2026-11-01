@@ -5,16 +5,7 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { connectAppPage, createReporter, launchApp, pageTools, waitFor } from "./lib/electron-harness.mjs";
 
-/**
- * 「消息里的超链接点击 → 右栏展开顶级 Tab」的真实 Electron 验收。
- *
- * 这是本次改动的关键回归：创建入口原先挂在懒加载的右栏组件上，右栏未挂载
- * 时点击被静默丢弃。因此验收必须从**右栏从未挂载**的状态开始（全新状态根，
- * 且不打开 GPT Web 视图），再点击消息里的链接。
- *
- * 环境变量：MAGI_LINKS_APP_EXECUTABLE、MAGI_LINKS_CDP_PORT（9341）、
- * MAGI_LINKS_DAEMON_PORT（38951）、MAGI_LINKS_SCREENSHOTS。
- */
+
 
 const repositoryRoot = new URL("..", import.meta.url).pathname.replace(/\/$/u, "");
 const appExecutable = process.env.MAGI_LINKS_APP_EXECUTABLE?.trim()
@@ -96,21 +87,21 @@ try {
     return candidate;
   }, "打包 Electron App Renderer 就绪", 60_000, 500);
   tools = pageTools(page);
-  check("打包 Electron 启动并渲染工作台", true);
-
-  // 先装好并激活 GPT Web 插件（右栏此时仍未挂载：入口只是菜单项，应用级宿主要等用户
-  // 点「新增 → GPT Web」才会创建），随后重载让渲染端投影出插件入口。
-  const PLUGIN_ID = "openai.chatgpt-web";
-  const installed = await tools.post(`/api/plugins/bundled/${PLUGIN_ID}/install`, {});
-  check("第一方 GPT Web 插件安装成功", installed.status === 200, installed.body.slice(0, 200));
-  const pluginManifest = JSON.parse(installed.body).plugins.find((item) => item.manifest.id === PLUGIN_ID).manifest;
-  await tools.post(`/api/plugins/${PLUGIN_ID}/enable`, { scope: "application" });
-  await tools.post(`/api/plugins/${PLUGIN_ID}/authorize`, { scope: "application", grants: pluginManifest.permissions.map((permission) => ({ ...permission })) });
-  const activated = await tools.post(`/api/plugins/${PLUGIN_ID}/activate`, { scope: "application" });
-  check("GPT Web 插件应用级激活成功", activated.status === 200, activated.body.slice(0, 200));
-
-  await page.call("Page.reload", { ignoreCache: true });
-  await waitFor(() => tools.exists('[data-testid="input-textarea"]'), "重载后工作台", 30_000, 400);
+  check("Electron 启动并渲染工作台", true);
+  const bundled = await tools.api('/api/plugins/bundled');
+  const manifests = JSON.parse(bundled.body);
+  check("内置插件目录仅保留 Magi MCP 服务", bundled.status === 200
+    && manifests.length === 1 && manifests[0].id === 'magi.mcp-server');
+  const mcpId = 'magi.mcp-server';
+  const installed = await tools.post(`/api/plugins/bundled/${mcpId}/install`, {});
+  await tools.post(`/api/plugins/${mcpId}/enable`, { scope: 'application' });
+  await tools.post(`/api/plugins/${mcpId}/authorize`, { scope: 'application', grants: manifests[0].permissions });
+  const activated = await tools.post(`/api/plugins/${mcpId}/activate`, { scope: 'application' });
+  check("Magi MCP 服务仍可安装和激活", installed.status === 200 && activated.status === 200);
+  await tools.click('[data-testid="sidebar-settings"]');
+  await waitFor(() => tools.exists('[data-testid="settings-nav-mcpServer"]'), "MCP 设置入口可见");
+  check("真实设置页保留 MCP 服务入口", true);
+  await tools.click('[data-testid="settings-back"]');
 
   const rightPaneVisible = () => page.evaluate(
     `(() => { const el = document.querySelector('.desktop-right-pane-column'); if (!el) return false; return !el.hidden && el.getAttribute('aria-hidden') !== 'true' && el.getClientRects().length > 0; })()`,
@@ -181,7 +172,6 @@ try {
   const afterSecond = await browserTabIds();
   check("不同 URL 新建第二个顶级 Tab", afterSecond.length === 2, JSON.stringify(afterSecond));
 
-  // 5. 浏览器 Tab 归属当前 Magi 会话，而不是 GPT Web 的应用级会话。
   const sessionId = await page.evaluate(`new URL(location.href).searchParams.get('sessionId') || ''`);
   let browserSessionId = '';
   if (sessionId) {
@@ -199,39 +189,7 @@ try {
     check("浏览器 Tab 归属当前 Magi 会话", false, "未取到当前会话 id");
   }
 
-  // 6. GPT Web（应用级）视图处于激活态时点链接：新 Tab 必须成为内容槽当前项，
-  //    而不是只进 Tab 条；GPT Web 宿主保持挂载（后台推理不中断）。
-  // 打开 GPT Web 视图：沿用 verify-electron-gpt-web 已验证的真实入口（设置 → GPT Web → 连接）。
-  await waitFor(async () => {
-    const visible = await page.evaluate(`Boolean(document.querySelector('[data-testid="settings-page"]')?.getClientRects().length)`);
-    if (!visible) await tools.click('[data-testid="sidebar-settings"]');
-    await sleep(1200);
-    await tools.click('[data-testid="settings-nav-webModel"]').catch(() => {});
-    await sleep(600);
-    return page.evaluate(`Boolean(document.getElementById('web-model-title'))`);
-  }, "设置页出现独立的 GPT Web 分类", 30_000, 500);
-  await page.evaluate(`document.querySelector('[data-web-model-connect]').click()`);
-  await waitFor(() => tools.exists(".web-model-content webview"), "GPT Web webview 挂载", 45_000, 500);
-  await tools.click('[data-testid="settings-back"]');
-  // 连接只挂载宿主（标签默认隐藏）；与用户一致，经「新增 → GPT Web」把视图显示为当前 Tab。
-  await waitFor(() => tools.exists(".right-pane-add-tab"), "右栏新增按钮可见", 30_000, 400);
-  await page.evaluate(`document.querySelector('.right-pane-add-tab').click()`);
-  await waitFor(() => page.evaluate(`Boolean(document.querySelector('.right-pane-add-menu-item[data-kind="webSession"]:not([disabled])'))`), "新增菜单出现可用的 GPT Web 入口", 30_000, 400);
-  await page.evaluate(`document.querySelector('.right-pane-add-menu-item[data-kind="webSession"]').click()`);
-  await waitFor(() => page.evaluate(`Boolean(document.querySelector('.right-pane-tabbar [data-tab-id="webSession:app"].active'))`), "GPT Web 视图成为当前 Tab", 45_000, 400);
-  check("GPT Web 视图处于激活态", true);
-
-  const activeTabId = () => page.evaluate(`document.querySelector('.right-pane-tabbar .right-pane-tab.active')?.getAttribute('data-tab-id') || ''`);
-  await page.evaluate(`document.querySelectorAll('.md-link')[2].click()`);
-  await waitFor(async () => (await browserTabIds()).length >= 3, "GPT Web 激活时点链接新建第三个 Tab", 60_000, 400);
-  const activeAfterThird = await waitFor(async () => {
-    const id = await activeTabId();
-    return id.startsWith("browser:") ? id : null;
-  }, "新建的浏览器 Tab 成为当前 Tab", 20_000, 300).catch(() => null);
-  check("GPT Web 激活时点链接，新 Tab 成为当前 Tab（而不是留在 GPT Web）", Boolean(activeAfterThird), `active=${await activeTabId()}`);
-  check("GPT Web 宿主仍保留在 Tab 条中（未被销毁）", await page.evaluate(`Boolean(document.querySelector('.right-pane-tabbar [data-tab-id="webSession:app"]'))`));
-
-  // 用户关闭与会话结束复用 daemon 的 Tab 关闭事务，应用级 GPT Web 保持独立。
+  const activeAfterThird = await page.evaluate(`document.querySelector('.right-pane-tabbar .right-pane-tab.active')?.getAttribute('data-tab-id') || ''`);
   await tools.click(`[data-tab-id="${activeAfterThird}"] .right-pane-tab-close`);
   await waitFor(async () => !(await browserTabIds()).includes(activeAfterThird), "逻辑关闭事件移除真实右栏 Tab");
   check("关闭后的 Tab 从真实界面移除", true);
@@ -242,8 +200,6 @@ try {
   check("会话关闭后 Browser 会话已关闭且没有活动 Tab", currentAfterClose.status === 200
     && closedSession.lifecycle === 'closed' && closedSession.activeTabId === null
     && closedSession.tabs.every(tab => tab.lifecycle === 'closed'), currentAfterClose.body.slice(0, 400));
-  const appSession = await tools.api('/api/browser/sessions/app');
-  check("会话关闭保留应用级 GPT Web 宿主", appSession.status === 200 && JSON.parse(appSession.body).session?.lifecycle !== 'closed', appSession.body.slice(0, 300));
 
   check("验收期间 App Renderer 无运行时异常", rendererErrors.length === 0, rendererErrors.slice(0, 3).join(" | "));
 } finally {

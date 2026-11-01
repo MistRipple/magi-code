@@ -31,7 +31,6 @@ use crate::state::ApiState;
 /// 等待 Magi 界面人工确认的默认时限。超时后调用以工具错误收口，不会稍后补执行。
 pub(crate) const EXTERNAL_APPROVAL_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// 每次调用唯一的 id：同一毫秒内的并发调用也不会撞号；审批、活动与槽位写回共用它。
 fn next_call_id(token_id: &str) -> String {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     format!(
@@ -127,29 +126,6 @@ pub(crate) fn workspace_name(state: &ApiState, workspace_id: &str) -> Option<Str
         })
 }
 
-impl RegistryWorkspaces {
-    fn web_turn(
-        &self,
-        principal: &magi_mcp_server::ClientPrincipal,
-        target: &AttributionTarget,
-    ) -> Result<magi_session_store::CanonicalTurn, String> {
-        let AttributionTarget::WebSlotTurn {
-            session_id,
-            turn_id,
-            canonical_turn_id,
-        } = target
-        else {
-            return Err("调用不是 GPT Web Turn".into());
-        };
-        self.state.web_turn_for_slot(
-            session_id,
-            &principal.workspace_id,
-            turn_id.parse().map_err(|_| "GPT Web 槽位代际无效")?,
-            canonical_turn_id,
-        )
-    }
-}
-
 impl WorkspaceResolver for RegistryWorkspaces {
     fn root_of(&self, workspace_id: &str) -> Option<PathBuf> {
         self.state
@@ -161,15 +137,6 @@ impl WorkspaceResolver for RegistryWorkspaces {
         principal: &magi_mcp_server::ClientPrincipal,
         target: &AttributionTarget,
     ) -> Option<PathBuf> {
-        if let AttributionTarget::WebSlotTurn { session_id, .. } = target
-            && principal.workspace_id.is_empty()
-        {
-            self.web_turn(principal, target).ok()?;
-            return self
-                .state
-                .personal_session_execution_root(&SessionId::new(session_id))
-                .ok();
-        }
         self.execution_directories(principal, target)
             .ok()
             .flatten()
@@ -185,27 +152,16 @@ impl WorkspaceResolver for RegistryWorkspaces {
         principal: &magi_mcp_server::ClientPrincipal,
         target: &AttributionTarget,
     ) -> Result<Option<magi_core::ProjectDirectoryExecutionMap>, String> {
-        let web_turn = match target {
-            AttributionTarget::WebSlotTurn { .. } => Some(self.web_turn(principal, target)?),
-            AttributionTarget::ExternalSession { .. } => None,
-        };
         if principal.workspace_id.is_empty() {
-            if web_turn.is_none() {
-                return Err("外部令牌缺少项目授权".into());
-            }
-            return Ok(None);
+            return Err("外部令牌缺少项目授权".into());
         }
         let workspace = WorkspaceId::new(&principal.workspace_id);
-        let original = match web_turn {
-            None => Some(
-                principal
-                    .project_directories
-                    .clone()
-                    .ok_or("令牌缺少已持久化的目录授权")?,
-            ),
-            Some(turn) => crate::task_dispatch::canonical_project_directory_binding(&turn)
-                .map_err(|error| format!("原 Web Turn 目录绑定无效: {error}"))?,
-        };
+        let original = Some(
+            principal
+                .project_directories
+                .clone()
+                .ok_or("令牌缺少已持久化的目录授权")?,
+        );
         let binding = crate::task_dispatch::validate_or_migrate_directory_binding(
             &self.state,
             Some(&workspace),
@@ -215,7 +171,6 @@ impl WorkspaceResolver for RegistryWorkspaces {
         .ok_or("项目缺少目录授权")?;
         let session_id = match target {
             AttributionTarget::ExternalSession { token_id } => external_session_id(token_id),
-            AttributionTarget::WebSlotTurn { session_id, .. } => SessionId::new(session_id),
         };
         self.state
             .workspace_registry
@@ -264,10 +219,7 @@ impl AuditSink for EventBusAudit {
                 detail: detail.clone(),
                 at_ms: event.at_ms,
             });
-        // 在进入工具前就被拒绝的外部调用也要在外部会话里看得到（GPT Web 槽位的调用归它自己的会话）。
-        if let AuditOutcome::Denied { reason } = &event.outcome
-            && event.token_id != crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID
-        {
+        if let AuditOutcome::Denied { reason } = &event.outcome {
             record_denied_external_call(&self.state, &event, reason);
         }
         let workspace_id =
@@ -299,7 +251,6 @@ impl AuditSink for EventBusAudit {
     }
 }
 
-/// 内置工具在网关里的风险类别：供 GPT Web 槽位按工具档决策；MCP 令牌不按类别过滤，由授权方式统一处理。
 fn builtin_tool_class(tool: BuiltinToolName) -> ToolClass {
     match tool {
         BuiltinToolName::ShellExec
@@ -525,8 +476,6 @@ impl ApiToolBackend {
         }
     }
 
-    /// 调用归属的会话：外部令牌取（必要时创建）自己的外部工具会话；
-    /// 槽位令牌取槽位拥有者的会话，并确认该 turn 仍在进行。
     fn resolve_session(&self, invocation: &ToolInvocation) -> Result<SessionId, String> {
         match &invocation.attribution {
             AttributionTarget::ExternalSession { token_id } => ensure_external_session(
@@ -535,21 +484,6 @@ impl ApiToolBackend {
                 &invocation.principal.client_name,
                 &invocation.principal.workspace_id,
             ),
-            AttributionTarget::WebSlotTurn { session_id, .. } => {
-                if !(RegistryWorkspaces {
-                    state: self.state.clone(),
-                })
-                .root_for(&invocation.principal, &invocation.attribution)
-                .is_some()
-                {
-                    return Err("当前没有可归属的进行中的 GPT Web 对话".to_string());
-                }
-                let session_id = SessionId::new(session_id.clone());
-                if self.state.session_store.session(&session_id).is_none() {
-                    return Err("槽位拥有者会话不存在".to_string());
-                }
-                Ok(session_id)
-            }
         }
     }
 
@@ -657,7 +591,6 @@ fn record_denied_external_call(state: &ApiState, event: &AuditEvent, reason: &st
         session_id: &session_id,
         workspace_id: &workspace_id,
         turn_id: Some(&turn_id),
-        origin: None,
     };
     let arguments = serde_json::json!({ "paths": event.paths }).to_string();
     // 与其他策略拒绝同一种结构，工具卡片按拒绝展示，而不是“执行异常”。
@@ -683,19 +616,17 @@ fn record_denied_external_call(state: &ApiState, event: &AuditEvent, reason: &st
     turns.end_call(state, &session_id);
 }
 
-/// 一个“可能产生外部待审批”的调用方：令牌，或 GPT Web 槽位端点。
 pub(crate) struct ApprovalOwner {
     pub token_id: String,
     pub client_name: String,
     pub token_prefix: String,
     pub workspace_id: String,
-    /// 待审批记录挂在哪个会话上：令牌的外部工具会话，或槽位拥有者的会话。
     pub session_id: SessionId,
 }
 
 /// 当前所有可能持有外部待审批的调用方。跨会话待确认入口只扫描它们。
 pub(crate) fn approval_owners(state: &ApiState) -> Vec<ApprovalOwner> {
-    let mut owners = state
+    let owners = state
         .mcp_service
         .list_tokens()
         .into_iter()
@@ -707,48 +638,10 @@ pub(crate) fn approval_owners(state: &ApiState) -> Vec<ApprovalOwner> {
             workspace_id: record.workspace_id,
         })
         .collect::<Vec<_>>();
-    if let Some(snapshot) = state
-        .web_model
-        .bindings()
-        .and_then(|slots| slots.snapshot())
-    {
-        owners.push(ApprovalOwner {
-            token_id: crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID.to_string(),
-            client_name: crate::web_slot_mcp::WEB_SLOT_CLIENT_NAME.to_string(),
-            token_prefix: crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID.to_string(),
-            workspace_id: snapshot.owner_project_id,
-            session_id: SessionId::new(snapshot.owner_session_id),
-        });
-    }
+
     owners
 }
 
-impl ApiState {
-    /// 装配槽位表的 turn 结束 / 释放回调（daemon 装配槽位表之后调用）。
-    pub fn install_web_slot_hooks(&self) {
-        install_web_slot_end_hook(self);
-    }
-}
-
-/// 槽位拥有者 turn 结束或槽位释放时，取消该槽位遗留的待审批（等待方以“已取消”收口，不补执行）。
-pub(crate) fn install_web_slot_end_hook(state: &ApiState) {
-    let Some(slots) = state.web_model.bindings() else {
-        return;
-    };
-    let approvals = state.conversation_registry.tool_approvals().clone();
-    slots.set_end_hook(Some(Arc::new(
-        move |owner: &magi_web_model::WebSlotOwner| {
-            magi_conversation_runtime::external_approval::cancel_external_approvals(
-                &approvals,
-                &SessionId::new(owner.session_id.clone()),
-                crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID,
-            );
-        },
-    )));
-}
-
-/// 调用存活判据：外部令牌要求同一密钥仍有效；槽位调用要求它归属的 Web turn 仍在进行
-/// （槽位释放或 turn 结束都会使它失效）。
 fn liveness(
     state: &ApiState,
     tokens: &Arc<TokenStore>,
@@ -776,17 +669,6 @@ fn liveness(
             .execution_directories(&principal, &attribution)
             .is_ok_and(|current| current == directories)
             && match &attribution {
-                AttributionTarget::WebSlotTurn {
-                    session_id,
-                    turn_id,
-                    ..
-                } => state
-                    .web_model
-                    .bindings()
-                    .and_then(|slots| slots.active_context())
-                    .is_some_and(|(owner, active)| {
-                        owner.session_id == *session_id && active.to_string() == *turn_id
-                    }),
                 AttributionTarget::ExternalSession { .. } => {
                     tokens.records().iter().any(|record| {
                         record.token_id == token_id
@@ -873,26 +755,6 @@ impl ToolBackend for ApiToolBackend {
             .unwrap_or_default()
     }
 
-    fn tool_available(&self, principal: &magi_mcp_server::ClientPrincipal, name: &str) -> bool {
-        if principal.attribution != magi_mcp_server::AttributionMode::FollowWebSlot {
-            return true;
-        }
-        let Some(snapshot) = self
-            .state
-            .web_model
-            .bindings()
-            .and_then(|slots| slots.snapshot())
-        else {
-            return true;
-        };
-        if snapshot.owner_project_id.is_empty() {
-            return !name.starts_with("changes_")
-                && !BuiltinToolName::from_name(name)
-                    .is_some_and(|tool| tool.requires_workspace_context());
-        }
-        true
-    }
-
     fn path_requests(
         &self,
         internal_name: &str,
@@ -928,25 +790,13 @@ impl ToolBackend for ApiToolBackend {
     fn invoke<'a>(&'a self, invocation: ToolInvocation) -> BoxFuture<'a, InvocationOutcome> {
         Box::pin(async move {
             let call_id = next_call_id(&invocation.principal.token_id);
-            // 记录开始项前也检查真实会话与槽位代际，不能先向旧归属写入。
             if let Err(error) = self.resolve_session(&invocation) {
                 return error_outcome(error);
             }
             let workspace_id = (!invocation.principal.workspace_id.is_empty())
                 .then(|| WorkspaceId::new(invocation.principal.workspace_id.clone()));
             let turns = &self.state.mcp_service.external_turns;
-            // 调用都作为普通工具项写进 canonical（§8.4）：GPT Web 槽位写进拥有者会话当前的 Turn，
-            // 外部令牌写进它自己外部会话的活动段 Turn。
             let target = match &invocation.attribution {
-                AttributionTarget::WebSlotTurn {
-                    session_id,
-                    canonical_turn_id,
-                    ..
-                } => Some((
-                    SessionId::new(session_id.clone()),
-                    Some(canonical_turn_id.clone()),
-                    Some(magi_conversation_runtime::session_writeback::TOOL_ORIGIN_CHATGPT_WEB),
-                )),
                 AttributionTarget::ExternalSession { .. } => {
                     let session_id = match self.resolve_session(&invocation) {
                         Ok(id) => id,
@@ -958,7 +808,7 @@ impl ToolBackend for ApiToolBackend {
                         &WorkspaceId::new(invocation.principal.workspace_id.clone()),
                         &invocation.principal.client_name,
                     ) {
-                        Ok(turn_id) => Some((session_id, Some(turn_id), None)),
+                        Ok(turn_id) => Some((session_id, Some(turn_id))),
                         Err(error) => {
                             // 记录失败不应让外部客户端的调用整体不可用：照常执行，只是这次没有展示。
                             tracing::warn!(%error, "外部调用无法写入外部会话时间线");
@@ -967,12 +817,7 @@ impl ToolBackend for ApiToolBackend {
                     }
                 }
             };
-            let external_session_id = matches!(
-                invocation.attribution,
-                AttributionTarget::ExternalSession { .. }
-            )
-            .then(|| target.as_ref().map(|(session_id, _, _)| session_id.clone()))
-            .flatten();
+            let external_session_id = target.as_ref().map(|(session_id, _)| session_id.clone());
             let save_content = self.state.mcp_service.save_content();
             let recorded_arguments = if save_content {
                 invocation.arguments.to_string()
@@ -980,22 +825,18 @@ impl ToolBackend for ApiToolBackend {
                 redact_arguments(&invocation.arguments)
             };
             let tool_name = invocation.internal_name.clone();
-            let writer = target.as_ref().map(|(session_id, turn_id, origin)| {
+            let writer = target.as_ref().map(|(session_id, turn_id)| {
                 magi_conversation_runtime::session_writeback::ExternalToolItemWriter {
                     session_store: &self.state.session_store,
                     event_bus: &self.state.event_bus,
                     session_id,
                     workspace_id: &workspace_id,
                     turn_id: turn_id.as_deref(),
-                    origin: *origin,
                 }
             });
             if let Some(writer) = &writer
                 && let Err(error) = writer.started(&call_id, &tool_name, &recorded_arguments)
             {
-                if external_session_id.is_none() {
-                    return error_outcome(format!("无法记录到当前 Web 对话：{error}"));
-                }
                 tracing::warn!(%error, "外部调用开始项写入失败");
             }
             // 身份失效也须停止在途调用，而不只是拒绝下一条请求。复用工具运行时取消
@@ -1193,42 +1034,6 @@ impl ApiToolBackend {
     }
 }
 
-/// GPT Web 槽位按设置里的工具档和授权方式处理；外部令牌按令牌的授权方式处理。
-fn slot_approval_mode(
-    state: &ApiState,
-    invocation: &ToolInvocation,
-) -> crate::web_model_channel::WebApprovalMode {
-    if matches!(
-        invocation.attribution,
-        AttributionTarget::WebSlotTurn { .. }
-    ) {
-        effective_approval_mode(state.web_model.approval_mode(), invocation.class)
-    } else {
-        match invocation.principal.approval_mode {
-            ApprovalMode::Ask => crate::web_model_channel::WebApprovalMode::Ask,
-            ApprovalMode::Always => crate::web_model_channel::WebApprovalMode::Always,
-        }
-    }
-}
-
-/// GPT Web 的「始终授权」保留高风险操作的逐次确认边界；MCP 令牌的开放权限由上游直接处理。
-fn effective_approval_mode(
-    mode: crate::web_model_channel::WebApprovalMode,
-    class: magi_mcp_server::ToolClass,
-) -> crate::web_model_channel::WebApprovalMode {
-    use crate::web_model_channel::WebApprovalMode;
-    match (mode, class) {
-        (
-            WebApprovalMode::Always,
-            magi_mcp_server::ToolClass::Destructive | magi_mcp_server::ToolClass::Exec,
-        ) => WebApprovalMode::Ask,
-        (mode, _) => mode,
-    }
-}
-
-const WEB_APPROVAL_DENIED_BY_SETTING: &str =
-    "GPT Web 的授权方式设置为「拒绝」：需要授权的操作一律不执行。";
-
 /// 发起人工确认并阻塞等待；`Err` 携带终态结果文本。
 #[allow(clippy::too_many_arguments)]
 fn approve_blocking(
@@ -1241,12 +1046,10 @@ fn approve_blocking(
     workspace_id: Option<&WorkspaceId>,
     root: &Path,
 ) -> Result<(), String> {
-    match slot_approval_mode(state, invocation) {
-        crate::web_model_channel::WebApprovalMode::Always => return Ok(()),
-        crate::web_model_channel::WebApprovalMode::Deny => {
-            return Err(WEB_APPROVAL_DENIED_BY_SETTING.to_string());
-        }
-        crate::web_model_channel::WebApprovalMode::Ask => {}
+    match invocation.principal.approval_mode {
+        ApprovalMode::Always => return Ok(()),
+
+        ApprovalMode::Ask => {}
     }
     let is_alive = liveness(state, tokens, invocation);
     let approval = await_external_tool_approval(
@@ -1308,23 +1111,20 @@ fn run_blocking(
         )
     };
 
-    let approval_mode = slot_approval_mode(state, invocation);
+    let approval_mode = invocation.principal.approval_mode;
     if invocation.cancellation.is_cancelled() {
         return cancelled_outcome();
     }
     // MCP 的开放权限代表用户已授予完整工具调用；传入 granted 让既有执行链跳过重复审批，
     // 但路径越界等硬性策略仍由执行层拒绝。
-    let mut granted = approval_mode == crate::web_model_channel::WebApprovalMode::Always;
+    let mut granted = approval_mode == ApprovalMode::Always;
     if invocation.requires_approval {
         match approval_mode {
-            crate::web_model_channel::WebApprovalMode::Always => {}
-            crate::web_model_channel::WebApprovalMode::Ask => {
+            ApprovalMode::Always => {}
+            ApprovalMode::Ask => {
                 if let Err((payload, _)) = approve(call_id) {
                     return error_outcome(payload);
                 }
-            }
-            crate::web_model_channel::WebApprovalMode::Deny => {
-                return error_outcome(WEB_APPROVAL_DENIED_BY_SETTING);
             }
         }
         granted = true;
@@ -1357,10 +1157,6 @@ fn run_blocking(
     );
     // Magi 自己的安全规则要求授权（例如 SafetyGate 对敏感操作）时，补一次人工确认后重入。
     if result.1 == ExecutionResultStatus::NeedsApproval && !granted {
-        if slot_approval_mode(state, invocation) == crate::web_model_channel::WebApprovalMode::Deny
-        {
-            return error_outcome(WEB_APPROVAL_DENIED_BY_SETTING);
-        }
         if let Err((payload, _)) = approve(&format!("{call_id}-safety")) {
             return error_outcome(payload);
         }
@@ -1381,8 +1177,6 @@ fn run_blocking(
     }
 }
 
-/// 执行层访问档映射：只读 GPT Web 槽位收紧为 ReadOnly；其余使用 Restricted。
-/// MCP 的 `always` 会在既有执行链中请求授权后的 FullAccess，但仍受路径和硬性策略限制。
 fn access_profile_for(profile: Profile) -> AccessProfile {
     match profile {
         Profile::ReadOnly => AccessProfile::ReadOnly,
@@ -1390,17 +1184,9 @@ fn access_profile_for(profile: Profile) -> AccessProfile {
     }
 }
 
-fn slots_provider(
-    state: &ApiState,
-) -> Arc<dyn Fn() -> Option<Arc<magi_web_model::WebSlotTable>> + Send + Sync> {
-    let harness = state.web_model.clone();
-    Arc::new(move || harness.bindings())
-}
-
 fn assemble_server(
     state: ApiState,
     backend: Arc<ApiToolBackend>,
-    slot_channel_generation: Option<u64>,
 ) -> Arc<magi_mcp_server::McpServer> {
     Arc::new(
         magi_mcp_server::McpServer::new(
@@ -1411,31 +1197,7 @@ fn assemble_server(
                 state: state.clone(),
             }),
         )
-        .with_attribution(Arc::new(crate::web_slot_mcp::SlotAttribution {
-            slots: slots_provider(&state),
-            canonical_turn: {
-                let sessions = state.session_store.clone();
-                Arc::new(move |id| {
-                    let session_id = SessionId::new(id);
-                    let turn_id = sessions.runtime_sidecar(&session_id)?.current_turn?.turn_id;
-                    sessions
-                        .canonical_turn_for_session_turn_id(&session_id, &turn_id)
-                        .filter(|turn| !turn.status.is_terminal())
-                        .map(|turn| turn.turn_id)
-                })
-            },
-        }))
-        .with_audit(Arc::new(EventBusAudit {
-            state: state.clone(),
-        }))
-        .with_catalog_observer(Arc::new(move |principal| {
-            if let Some(generation) = slot_channel_generation
-                && principal.token_id == crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID
-            {
-                state.web_model.record_slot_catalog_served(generation);
-                tracing::info!(generation, "GPT Web 槽位工具目录已被读取，连接器来源待核验");
-            }
-        })),
+        .with_audit(Arc::new(EventBusAudit { state })),
     )
 }
 
@@ -1445,17 +1207,7 @@ pub(crate) fn build_mcp_server(
     tokens: Arc<TokenStore>,
 ) -> Arc<magi_mcp_server::McpServer> {
     let backend = Arc::new(ApiToolBackend::new(state.clone(), tokens));
-    assemble_server(state, backend, None)
-}
-
-/// 组装 GPT Web 槽位端点的 MCP 服务实例。槽位调用的身份与归属来自槽位表，不使用令牌。
-pub(crate) fn build_slot_mcp_server(state: ApiState) -> Arc<magi_mcp_server::McpServer> {
-    let generation = state.web_model.channel_generation();
-    let backend = Arc::new(ApiToolBackend::new(
-        state.clone(),
-        Arc::new(TokenStore::new()),
-    ));
-    assemble_server(state, backend, Some(generation))
+    assemble_server(state, backend)
 }
 
 #[cfg(test)]
@@ -1471,17 +1223,6 @@ mod tests {
             super::dynamic_public_name("knowledge_graph_query"),
             "magi.knowledge.graph_query"
         );
-    }
-
-    #[test]
-    fn always_approval_never_covers_destructive_or_exec_tools() {
-        use crate::web_model_channel::WebApprovalMode::{Always, Ask, Deny};
-        assert_eq!(effective_approval_mode(Always, ToolClass::Write), Always);
-        assert_eq!(effective_approval_mode(Always, ToolClass::Read), Always);
-        assert_eq!(effective_approval_mode(Always, ToolClass::Destructive), Ask);
-        assert_eq!(effective_approval_mode(Always, ToolClass::Exec), Ask);
-        assert_eq!(effective_approval_mode(Deny, ToolClass::Destructive), Deny);
-        assert_eq!(effective_approval_mode(Ask, ToolClass::Write), Ask);
     }
 
     use super::*;
@@ -1583,34 +1324,10 @@ mod tests {
         registry.register_default_builtins();
         std::mem::forget(state_dir);
         let state = base.with_tool_registry(registry);
-        let package =
-            crate::bundled_plugins::bundled_plugin_package(magi_web_model::WEB_MODEL_PLUGIN_ID)
-                .unwrap();
-        let permissions = package.manifest().permissions.clone();
-        {
-            let mut manager = state.plugin_manager.lock().unwrap();
-            manager
-                .install(
-                    &package,
-                    magi_plugin_system::PluginSource::Builtin {
-                        name: magi_web_model::WEB_MODEL_PLUGIN_ID.into(),
-                    },
-                )
-                .unwrap();
-            manager
-                .authorize(
-                    magi_web_model::WEB_MODEL_PLUGIN_ID,
-                    "application",
-                    permissions,
-                )
-                .unwrap();
-            manager
-                .enable(magi_web_model::WEB_MODEL_PLUGIN_ID, "application")
-                .unwrap();
-            manager
-                .activate(magi_web_model::WEB_MODEL_PLUGIN_ID, "application")
-                .unwrap();
-        }
+        crate::bundled_plugins::activate_bundled_for_test(
+            &state,
+            crate::bundled_plugins::MCP_SERVER_PLUGIN_ID,
+        );
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         state
@@ -2889,55 +2606,6 @@ mod tests {
             !names.contains(&"magi.shell_exec".to_string()),
             "内部名不得作为公开名重复出现"
         );
-    }
-
-    #[tokio::test]
-    async fn slot_tools_list_is_a_subset_of_the_token_catalog() {
-        // GPT Web 槽位按槽位工具档过滤目录，比令牌的完整目录少。
-        let f = fixture(Duration::from_secs(5));
-        let generation = f.state.web_model.channel_generation();
-        let cursor = f.state.web_model.slot_catalog_cursor();
-        assert!(
-            !f.state
-                .web_model
-                .slot_catalog_served_after(generation, cursor)
-        );
-        let slot_principal = magi_mcp_server::ClientPrincipal {
-            project_directories: None,
-            token_id: crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID.to_string(),
-            token_prefix: crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID.to_string(),
-            client_name: "GPT Web".to_string(),
-            workspace_id: String::new(),
-            profile: crate::web_slot_mcp::slot_profile_from_setting(None),
-            approval_mode: ApprovalMode::Ask,
-            attribution: magi_mcp_server::AttributionMode::FollowWebSlot,
-        };
-        let response = build_slot_mcp_server(f.state.clone())
-            .handle(
-                &slot_principal,
-                magi_mcp_server::JsonRpcRequest {
-                    jsonrpc: "2.0".to_string(),
-                    id: Some(serde_json::json!(1)),
-                    method: "tools/list".to_string(),
-                    params: Some(serde_json::json!({})),
-                },
-                1,
-            )
-            .await
-            .expect("slot tools/list responds");
-        assert!(
-            f.state
-                .web_model
-                .slot_catalog_served_after(generation, cursor),
-            "槽位读取目录必须留下 daemon 侧事实"
-        );
-        let slot_count = response["result"]["tools"].as_array().unwrap().len();
-        let token_names = tool_names(&f).await;
-        assert!(
-            token_names.len() > slot_count,
-            "令牌的完整目录比槽位目录多出命令执行等工具"
-        );
-        assert!(token_names.contains(&"magi.shell.exec".to_string()));
     }
 
     #[tokio::test]

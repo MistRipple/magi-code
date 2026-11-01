@@ -580,57 +580,6 @@ test("ensure_surface 在逻辑 Surface 尚未绑定 guest 时后台物化、要�
   }
 });
 
-test("GPT Web ensure_surface 只走后台物化，不激活右栏", async () => {
-  const appSurface = {
-    ...bindingForTab("tab-web-model"),
-    browser_context_id: "browser-session-app-1759000000000-0",
-  };
-  let backgroundCalls = 0;
-  let backgroundInput: unknown = null;
-  const retained: string[] = [];
-  const worker = {
-    execute: async () => failedOutcome("unused"),
-    forwardSurfaceEvent: () => undefined,
-  } as unknown as AutomationWorker;
-  const { server, socketPath } = createControlServer(worker, {
-    bindings: [appSurface],
-    primaryTabId: appSurface.tab_id,
-    bindingAvailable: () => backgroundCalls > 0,
-    onRetainForAgent: (tabId) => retained.push(tabId),
-    ensureBrowserSurfaceInBackground: async (input) => {
-      backgroundCalls += 1;
-      backgroundInput = input;
-    },
-  });
-  await server.start();
-  const client = await connect(socketPath);
-  try {
-    const responsePromise = nextJsonMatching(
-      client,
-      (message) => message.request_id === "ensure-web-model-surface",
-    );
-    client.send(JSON.stringify(request("ensure-web-model-surface", {
-      type: "ensure_surface",
-      payload: { tab_id: appSurface.tab_id },
-    })));
-    const response = await responsePromise;
-    assert.equal(response.outcome?.status, "succeeded");
-    assert.equal(backgroundCalls, 1);
-    assert.deepEqual(retained, [], "应用级页面本身全程挂载，不需要代理保留");
-    assert.deepEqual(backgroundInput, {
-      windowId: appSurface.window_id,
-      tabId: appSurface.tab_id,
-      browserSessionId: appSurface.browser_context_id,
-      url: "https://example.test/",
-      navigationRevision: appSurface.navigation_revision,
-      viewport: { mode: "auto" },
-    });
-  } finally {
-    await closeSocket(client);
-    await server.close();
-  }
-});
-
 test("已绑定内容槽的页面直接复用，不触发物化也不改布局", async () => {
   const surface = bindingForTab("tab-bound-surface");
   let ensureCalls = 0;

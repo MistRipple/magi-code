@@ -6,7 +6,7 @@
 
 use crate::context_authority::{
     ContextAuthority, ContextCompactionMode, ContextCompactionTerminal, ContextPrepareRequest,
-    PreparedThreadHistory, estimate_context_usage_breakdown,
+    estimate_context_usage_breakdown,
 };
 #[cfg(test)]
 use crate::context_authority::{ContextCompactionProgress, ContextCompactionRecord};
@@ -1003,13 +1003,7 @@ fn run_session_turn_execution_inner(
         .and_then(|config| config.to_usage_llm_config())
         .map(|config| config.model)
         .unwrap_or_default();
-    // GPT Web owns the remote conversation context.  Do not run Magi's context
-    // authority/compaction pipeline for this path: it would spend local work on
-    // a context that is never sent to the page and would make the Web engine
-    // appear to participate in Magi's token-pressure accounting.
-    let web_engine = settings_store
-        .and_then(|store| resolve_orchestrator_model_config(store, Some(&request.session_id)).ok())
-        .is_some_and(|config| config.is_chatgpt_web());
+
     let current_turn_contains_images = !request.images.is_empty();
     let vision_execution_config = resolve_vision_execution_config(
         settings_store.map(Arc::as_ref),
@@ -1089,13 +1083,7 @@ fn run_session_turn_execution_inner(
         execution_started.elapsed().as_millis(),
         None,
     );
-    let prepared_history = if web_engine {
-        PreparedThreadHistory {
-            messages: Vec::new(),
-            compaction: None,
-            terminal: None,
-        }
-    } else {
+    let prepared_history = {
         ContextAuthority::new(
             client,
             event_bus,
@@ -1226,7 +1214,6 @@ fn run_session_turn_execution_inner(
                 context_window_tokens: effective_context_window,
                 orchestrator_thread_id: &orchestrator_thread_id,
                 persist_session_state,
-                web_engine,
             }),
         };
         let streamed_content = match round_result {
@@ -1618,8 +1605,6 @@ struct SessionTurnRoundRuntime<'a> {
     /// session 主线 thread：该 turn 内所有 session_turn_item 的 source_thread_id。
     orchestrator_thread_id: &'a magi_core::ThreadId,
     persist_session_state: Option<&'a SessionStatePersistCallback>,
-    /// GPT Web 引擎自己维护网页上下文：Magi 不为它做上下文占用跟踪。
-    web_engine: bool,
 }
 
 struct SessionTurnRoundOutput {
@@ -1689,7 +1674,6 @@ fn stream_session_turn_round(
         context_window_tokens,
         orchestrator_thread_id,
         persist_session_state,
-        web_engine,
     } = runtime;
 
     let stream_item_id = if round == 0 {
@@ -1743,7 +1727,7 @@ fn stream_session_turn_round(
         resolved_provider_for_usage_binding(settings_store, usage_binding, &request.session_id);
     let context_breakdown =
         estimate_context_usage_breakdown(&request_controls.view(messages, []), None);
-    let context_usage_tracker = (usage_binding.tracks_active_context() && !web_engine).then(|| {
+    let context_usage_tracker = (usage_binding.tracks_active_context()).then(|| {
         ContextUsageRuntimeTracker::start(ContextUsageRuntimeTrackerInput {
             event_bus,
             settings_store: settings_store.map(Arc::as_ref),
@@ -4810,7 +4794,6 @@ mod tests {
             context_window_tokens: 256_000,
             orchestrator_thread_id: &orchestrator_thread_id,
             persist_session_state: None,
-            web_engine: false,
         })
         .expect("round should stream");
 
@@ -4932,7 +4915,6 @@ mod tests {
             context_window_tokens: 256_000,
             orchestrator_thread_id: &orchestrator_thread_id,
             persist_session_state: None,
-            web_engine: false,
         })
         .expect("round should complete after retry");
 

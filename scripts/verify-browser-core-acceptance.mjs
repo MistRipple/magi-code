@@ -40,9 +40,6 @@ assert.match(sources.surface, /registerEmbeddedWebview\(/u);
 assert.match(sources.surface, /webContents\.fromId\(input\.webContentsId\)/u);
 assert.match(sources.surface, /guest\.getType\(\) !== "webview"/u);
 assert.match(sources.surface, /guest\.hostWebContents !== host/u);
-// Partition creation is centralized so the application-level persistent GPT Web
-// partition does not accidentally get reopened as an in-memory session. Ordinary
-// browser tabs may still use cache:false; the helper is the contract we verify.
 assert.match(sources.surface, /browserSessionForPartition\(record\.partitionId\)/u);
 assert.match(
   sources.surface,

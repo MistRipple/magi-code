@@ -54,9 +54,6 @@ fn is_product_entry_executable() -> bool {
         .is_some_and(|stem| stem.eq_ignore_ascii_case("magi"))
 }
 
-/// `magi-daemon-app mcp-relay ...`：GPT Web 的 OpenAI Tunnel 以 stdio 拉起的 MCP 中继。
-/// 复用 daemon 自己的可执行文件，避免再单独分发一个 `magi-mcp`。必须在 tokio 运行时之前分流，
-/// 中继自己持有运行时。
 const MCP_RELAY_SUBCOMMAND: &str = "mcp-relay";
 
 fn main() -> Result<process::ExitCode, Box<dyn std::error::Error>> {

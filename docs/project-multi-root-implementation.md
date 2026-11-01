@@ -30,7 +30,6 @@
 | 项目记忆 | `magi-project-memory`、dispatcher | 记忆存储按固定项目 ID 定位，迁移旧路径键，不随主要目录变化 |
 | 知识与索引 | `magi-knowledge-store`、`magi-api/routes/knowledge.rs`、`state.rs` | 索引结果包含源目录身份，统一项目读模型 |
 | MCP 令牌 | `magi-mcp-server`、`magi-api/{mcp_service,mcp_runtime}.rs`、`routes/mcp_server.rs` | 授权时固定目录 ID 集合，撤销检查当前成员，添加不自动扩权 |
-| GPT Web/插件 | `magi-api/{web_model_ops,mcp_service}.rs`、`magi-plugin-*` | 复用原 owner session/active turn 和工具上下文，不新增注册表 |
 | App Server | `contracts/app-server/app-server.schema.json`、`magi-api/app_server` | schema 增量修改后统一生成，排队与继续沿原请求合同 |
 | Web 导航与项目 UI | `web/src/{web/WebWorkbenchShell.svelte,stores/composer-workspace*,web/agent-api.ts}` | 项目一级会话列表，目录选择只影响新输入 |
 | 文件/变更 UI | `ProjectFileTree.svelte`、`RightPane.svelte`、file-reference 与 right-pane stores | 文件引用/预览/变更键携带目录 ID，按目录/仓库展示 |
@@ -160,7 +159,6 @@
 ### P2/P3 目录隔离与外部授权收口（2026-10-28）
 
 - MCP 令牌现在在签发记录中持久保存 `ProjectDirectoryBinding`，`initialize`、路径检查、执行映射、审批等待和 liveness 共用这份授权；项目新增成员不会扩展旧令牌，项目成员撤销会让在途调用取消且不产生后续副作用。旧无绑定令牌只在仍可证明为原始单目录、未编辑的项目上单向补齐；迁移写盘失败保留原记录，不猜测新主要目录。
-- GPT Web 槽位分别保存槽位租约代际和 canonical Turn ID，槽位目录从原 Turn 的冻结绑定解析；Turn 替换或槽位释放会拒绝继续调用，切换主要目录仍沿原 Turn 的目录绑定。外部 MCP、插件和内置工具共用源目录映射、路径检查、审批和变更账本。
 - 隔离副本支持一次授权的全部源目录整组创建：源目录身份摘要进入副本路径，复制失败或登记持久化失败只清理本次新建目标，已有目标和其他目录副本保留；旧共享依赖链接被拒绝继续执行。注册表整组持久化保持锁，避免并发登记被旧快照覆盖。
 - 会话隔离状态和变更接口携带 `sourceFolderId`；同名文件分别拥有执行根、快照、`snapshotId` 和变更身份。项目变更列表、差异、单文件批准和合入按选中源目录解析；丢弃前检查整组副本是否仍有未合入成果，取消隔离按整组处理；多目录旧入口拒绝任意选择首目录。部分合入保留其他目录副本及未合入成果。
 - 本阶段实际通过：MCP API 定向 145 项、独立 MCP 库 66 项、runtime 库 675 项、API 多目录任务（Git + 普通目录 + 隔离 + 子代理）、整组副本创建/失败清理/持久化故障、同名文件变更与按目录合入、daemon 137 项、session-isolation 18 项均通过。`npm run protocol:check`、`npm --prefix web run check`（0 错误、0 警告）、`cargo fmt --all --check` 和 `git diff --check` 通过。端口监听重启测试曾在并行全库中被其他监听占用，单独重跑通过；完整 API 全库随后已以最新代码复验通过（1012 项通过、2 项忽略）。
@@ -210,7 +208,7 @@
 - 真实审批恢复后，变更面板按「仓库 A / 仓库 B / 普通目录」分组显示三个同名文件和仓库 B 的 Shell 新文件；`合并全部` 后三个源目录分别得到 `MULTI_ROOT_0/1/2`，仅仓库 B 得到 `shell-result.txt`。同名相对路径没有串读或串写。
 - 修正 Web 文件产物、变更卡片、右栏预览、HTML 预览和原生打开请求的 `sourceFolderId` 传播；文件变更在工具参数、卡片、右栏 code tab、Desktop context menu 和预览 URL 中保持同一目录身份。新增 golden 断言覆盖文件变更卡片保留目录身份。
 - 本阶段追加：隔离库 21 项通过；API 隔离库 7 项通过（含旧共享副本恢复），历史分页绑定保留定向通过。此前本阶段通过：`cargo test -p magi-api --lib routes::workspaces::project_management::tests:: -- --test-threads=4`（5 项）、`routes::session_isolation::tests::multi_source_routes_keep_diff_approval_and_merge_on_the_selected_copy`（1 项）、`cargo test -p magi-tool-runtime --lib project_directory_tools_share_selected_cwd_permissions_and_write_claims -- --test-threads=1`（1 项）、`cargo test -p magi-knowledge-store --lib -- --test-threads=8`（106 项）、知识关系两个 scoped 路由回归（各 1 项）、`npm run protocol:check`、`npm --prefix web run check`（0 错误、0 警告）、`npm --prefix web run test:tool-call-display`、`npm --prefix web run test:file-preview-scope`、`cargo fmt --all --check`、`cargo check -p magi-daemon`、`git diff --check`。
-- 仍需单独取得 Windows/Linux 安装包和跨平台文件系统证据；本机验收不能替代这些平台。外部真实模型、GPT Web、第三方 MCP 和插件服务未宣称通过；确定性 Provider 只验证执行协议、目录绑定、审批和恢复合同。历史记录中的旧共享依赖链接继续保留并拒绝执行，避免回落源目录；新隔离副本不再创建共享链接。
+- 仍需单独取得 Windows/Linux 安装包和跨平台文件系统证据；本机验收不能替代这些平台。外部真实模型、第三方 MCP 和插件服务未宣称通过；确定性 Provider 只验证执行协议、目录绑定、审批和恢复合同。历史记录中的旧共享依赖链接继续保留并拒绝执行，避免回落源目录；新隔离副本不再创建共享链接。
 
 ### 当前交付边界
 
@@ -225,7 +223,6 @@ P1–P5 的主要源码接线、双 Git + 普通目录真实任务及 macOS 独�
 - 最新完整回归：API 1019 项通过 / 2 项忽略；conversation-runtime 678 项、orchestrator 66 项、daemon 137 项、session-isolation 18 项、knowledge-store 106 项通过。daemon 首轮出现的迁移夹具路径别名失败已定向修复并通过完整复验；保留失败来源与修复证据。
 - 消息预览的缺省目录现从原 canonical 用户消息的 `projectDirectories` 或 `pendingDispatch.project_directories` 读取，显式工具目录覆盖该默认值；文件产物卡片、附件引用和工具卡片不跟随当前 UI 目录漂移。canonical / tool-call-display golden 回归和 Web 类型检查通过。实际页面打开仓库 A 文件产物后，预览内容为 `MULTI_ROOT_0`，下载 URL 仍携带仓库 A 的 ID，即使项目当前主要目录为仓库 B。
 - 尚需完成的工程工作：旧源目录在全新 state root 重新注册时的可移植历史导入；源码剩余单根消费者清理；从本 worktree 构建的实际 macOS Desktop 安装宿主回归。旧共享依赖链接已经在隔离恢复入口提供带清单的独立迁移，源目录、现有副本成果、外部替换和未知暂存目录均有拒绝/保留回归；迁移登记通过同一 RuntimeStatePersistence 原子写入口保存。
-- 跨平台与外部证据：Windows/Linux 文件系统、进程与安装包需对应平台，真实 GPT Web/第三方 MCP/插件服务和真实外部模型尚未验收，不能用本地 Provider 代替。
 - 原测试项目「三目录页面验收改名」的 repo-a/repo-b 是普通目录别名；双 Git 事实来自另建的「双 Git 与普通目录验收」真实仓库夹具。两组证据分别记录，不把名称当作 Git 能力。
 
 ### 追加：可移植重注册、资源入口收敛与 Desktop 宿主（2026-10-29）
@@ -238,12 +235,11 @@ P1–P5 的主要源码接线、双 Git + 普通目录真实任务及 macOS 独�
 - 本轮通过：项目迁移 5 项、项目管理 6 项、canonical 可移植事件导入 1 项、资源路由 49 项及追加目录断言单项、冻结绑定恢复 1 项；daemon 全库 139 项。编译、协议、Web 检查和 Desktop 类型/构建链检查通过。构建日志和真实任务记录保留在 `/tmp/magi-project-multi-root-desktop/`；本轮所有改动仍未提交。
 - 热导入后完整复验：API 1021 项通过 / 2 项忽略，daemon 140 项、session-store 184 项、workspace 34 项通过。之后只增加 shared write lock、项目读取锁和双入口导入夹具，daemon 热注册/项目创建/立即新会话/重启的定向回归、编译、格式、协议、Web 与 Desktop 检查通过；不把此前完整回归描述为这些最后改动后的全库结果。热导入初始测试曾因 fixture 的 current 指针和空会话隐藏规则失败，现已按真实快照/用户历史修正并通过。
 - Desktop `合并全部` 已在真实宿主执行完成；A/B 原目录各自得到 `MULTI_ROOT_0/1`，Shell 产物只在 B，变更面板显示无待确认变更。该目录包构建早于热导入接线，热导入目前以 daemon 路由/落盘/重启测试为证据，后续最终包仍需重新构建。
-- 目标继续进行中：剩余单根消费者审计与权威设计文档收口仍需推进；跨平台和真实外部模型、GPT Web、第三方 MCP/插件服务仍须对应环境证据。
+- 目标继续进行中：剩余单根消费者审计与权威设计文档收口仍需推进；跨平台和真实外部模型、第三方 MCP/插件服务仍须对应环境证据。
 
-### P6：遗留 cwd、GPT Web 图片与设计合同收口（2026-10-29）
+### P6：遗留 cwd 图片与设计合同收口（2026-10-29）
 
 - 沿实际调用方复查 `native_root_path` / `rootPath`：项目持久化按 ID 定位；剩余主要目录读取主要服务于展示、项目级导航、单目录旧入口及旧数据迁移。删除普通 Task 和 Goal 提交之前的 session-only 隔离/主要目录 cwd 猜测，统一由 `submit_dispatch_submission` 通过冻结绑定解析，并移除无调用的 `session_execution_root_override`、`session_isolation_root`。
-- 发现并修复 GPT Web 回复图片仍写入当前主要目录的遗漏。`WebImageSink` 在实际发送前绑定原 canonical Turn、槽位代际、目录授权和实际执行根；保存前与 MCP 共用 owner/Turn liveness 校验并重新解析原副本。主目录切换不会移动图片；原目录、槽位或 Turn 撤销后不能写入，也不能回落个人目录。图片目录链接、已有链接/异内容目标均拒绝，原内容去重保留；不可用的图片作用域不阻止回复文字交付。
 - 原 canonical 目录读取合并为 `canonical_project_directory_binding`，由 Goal、MCP 和图片入口共用。知识关系旧请求遇多源项目省略 `sourceFolderId` 时明确拒绝，避免产生不能定位目录的写入；单目录兼容与项目共享文本知识仍保留。
 - 更新工程 README、个人会话、Git 工作流、会话隔离及知识图谱文档，补齐稳定身份、状态根、冻结授权、仓库整组租约、逐目录结果和旧共享副本恢复合同。阶段计划仍记录原退出条件，不能把设计说明当作额外验收证据。
 - 实际复验：API 全库 1023 项通过 / 2 项忽略，daemon 全库 140 项通过，Web 模型库 63 项通过；新增图片归属/隔离/撤销/迟到/链接回归 2 项通过，知识关系多根省略身份拒绝断言通过。`cargo check -p magi-daemon`、格式与 diff 检查、App Server 协议检查、Web 检查（0 错误、0 警告）及 Desktop 类型/构建链检查通过。API/daemon 全库后又增加图片执行根规范路径的拒绝检查和知识省略身份断言，对应定向回归通过；不把之前完整回归记为最后检查后的全库结果。
@@ -266,14 +262,13 @@ P1–P5 的主要源码接线、双 Git + 普通目录真实任务及 macOS 独�
 | 隔离与子代理 | 多源实际执行映射、真实 Git 子代理多仓库产出/重载及逐目录合入回归通过；Desktop 隔离任务和合并已实际运行 |
 | 部分失败与旧副本 | 整组初始化/登记失败清理、独立迁移、成果保留及未知目录拒绝回归通过；不伪造跨仓库原子成功 |
 | 平台与路径 | macOS 本机执行、DMG 挂载/复制安装/双仓库任务、linked worktree、符号链接和普通目录已有证据；Linux core/workspace/isolation 原生回归及 daemon 140 项通过；Windows 原生行为与 Windows/Linux Desktop 安装包未验证 |
-| 外部入口与规则 | GPT Web 真实账号 19/19、第三方 Docker MCP + 真实模型三目录任务、插件 Worker/MCP 167/168（最后的非回环网卡连接超时）已有分项证据；本机兼容 Provider 不代表外部模型账号，真实模型自主选择目录仍不作外部服务承诺 |
 | 恢复与交互 | daemon/最新 Desktop 重启、冻结任务/队列/审批恢复及 390px 项目设置布局有证据；真实触控、完整键盘流程与多窗口 SSE 一致性尚无完整独立验收记录 |
 | 移除与删除 | 原移除结算和固定历史/源文件/成果保留有回归；未将所有真实外部服务吊销组合记为通过 |
 
 - 最新补充检查通过：`cargo check --workspace`、`npm run protocol:check`、`npm --prefix web run check`（0 错误、0 警告）、`npm run check --workspace @magi/desktop` 和 `git diff --check`。
 - Windows 目标补充：`cargo check --target x86_64-pc-windows-msvc -p magi-core -p magi-workspace` 通过。daemon 与包含 snapshot 的隔离模块交叉检查被本机缺少 Windows SDK/C 运行库头文件阻断，`aws-lc-sys` / `zstd-sys` 报缺少 `windows.h`、`stdlib.h` 等；日志保留为 `/tmp/magi-project-multi-root-desktop/windows-domain-check.log`。该失败发生于原生依赖构建，既不是业务 Rust 编译通过，也不能证明 Windows 实际运行失败。
 - 当前 worktree 仍为起点 `907954b15409faaafe4e0ba7f02783d88c674e03` 的 detached HEAD，未提交。保留原工作树带入的无关改动；验收状态与日志位于 `/tmp`，没有新增仓库验收脚本。未执行签名、Tag 或发布。
-- 用户已授权跳过 Windows 原生与 Linux Desktop 安装包；真实 GPT Web、第三方 MCP/插件和三目录真实模型执行证据已在文末追加。剩余未验证边界为 Windows/Linux 安装物、触控设备及真正外部模型账号（本机兼容 Provider 不计入），不再以 macOS 或本地 Provider 替代这些证据。
+- 用户已授权跳过 Windows 原生与 Linux Desktop 安装包；真实 第三方 MCP/插件和三目录真实模型执行证据已在文末追加。剩余未验证边界为 Windows/Linux 安装物、触控设备及真正外部模型账号（本机兼容 Provider 不计入），不再以 macOS 或本地 Provider 替代这些证据。
 
 ### 追加：多源导航路径与真实项目设置验收（2026-10-29）
 
@@ -306,7 +301,6 @@ P1–P5 的主要源码接线、双 Git + 普通目录真实任务及 macOS 独�
 - 已构建真实 macOS arm64 DMG/ZIP（`target/electron-dist/Magi-3.0.61-mac-arm64.{dmg,zip}`），将 DMG 挂载后复制到临时安装路径启动，独立状态根和端口 `38957` 的 `/health` 返回 `status=ok`、版本 `3.0.61`、当前 build identity；运行日志和响应保留在 `/tmp/magi-project-multi-root-desktop/dmg-runtime.log`、`dmg-health.json`。该证据覆盖 macOS 安装物挂载、复制和 sidecar 启动，不代表签名、公证或 Windows/Linux 安装包。
 - DMG 复制安装后的应用继续通过上述九项双仓库并发验证（`dmg-concurrency.log`）。另通过真实项目弹窗和目录选择器创建三个目录的项目，其中两个目录同名 `shared`，指定 B 为主要目录；移除 B 时保存按钮禁用，显式改选普通目录后保存成功，剩余目录 ID 保持，原 B 文件保留，改名/成员/主要目录在 Renderer 重载后恢复。七项交互断言通过，记录为 `project-ui-installed-result.json`；其后的可选 `Page.captureScreenshot` 超时，不能把该脚本整体退出码记为成功，也未生成截图。
 - 追加定向检查：Git coordinator 四项、session isolation HTTP 三项、Desktop 构建链/TypeScript、Web 类型检查、协议与 diff 检查通过。没有业务源码变化，未重复全量 Rust 或 Web 套件。已配置的 `xiatian-serv` SSH 连接被远端关闭，尚未获得对应平台 Desktop 安装验收环境。
-- 当前 worktree 仍 detached、未提交；目录包构建日志保留在 `/tmp/magi-project-multi-root-desktop/`。这些检查不增加 Windows/Linux 安装包、真实外部模型/GPT Web/第三方 MCP 或触控手势的证据，原验收边界继续有效。
 
 ### 追加：MCP 固定目录投影收口（2026-10-29）
 
@@ -316,17 +310,6 @@ P1–P5 的主要源码接线、双 Git + 普通目录真实任务及 macOS 独�
 - 使用本 worktree 构建的最新 macOS arm64 Desktop 目录包，完成七项真实 GUI 检查：创建表单显示 A/B 及默认 A；拦截已构造的创建请求、先由真实 daemon 新增 C 并将主要目录改为 B，最终令牌仍只有 A/B 且默认 A；列表不显示 C；移除 A 后原授权显示不可用并保留默认 A；Renderer 重载后仍一致，运行时错误为零。记录为 `/tmp/magi-project-multi-root-desktop/mcp-directory-ui-result.json` 和 `mcp-directory-ui.log`；临时应用和 daemon 均已停止。
 - 最新目录包通过原构建链生成；常规打包的 Electron 下载再次因 TLS 断连失败，改用本机 `node_modules/electron/dist` 的 Electron 45.0.0 发行物后完成解包自检，日志为 `package-mcp-ui-cached.log`。此前 DMG 验收对应前一版 UI；本次新增 MCP UI 使用最新目录包验证，不把旧 DMG 记为包含此次修复。追加 Web/桌面类型检查、i18n/MCP golden 及 diff 检查通过，未重复无源码变更的 Rust 全库测试。
 - 用户随后明确没有 Windows/Linux 实体测试机，允许跳过 Windows 原生与 Linux Desktop 安装包验收。这两项在本次范围内不再阻塞收口；原平台记录仍为未验证。真实第三方服务、真实外部模型和触控设备的证据边界保持明确，未据此补记为通过。
-
-### 追加：真实 GPT Web 双目录验收（2026-10-29）
-
-- 使用本机已登录的 `persist:magi-web-model` 分区副本、最新 macOS arm64 Desktop 目录包、一次性状态根和独立端口运行 `scripts/verify-electron-gpt-web.mjs`。修复验收脚本旧的模型菜单文本定位，改用 daemon 投影的 `[data-magi-web-engine-row]`；真实 ChatGPT 页面探测返回 `status=ok`，未使用本地 Provider 处理 GPT Web 对话。
-- 真实流程 19/19 通过：双目录项目创建、GPT Web 原生 webview、登录探测、固定入口、临时会话、真实文字回复、红/蓝两张图片识别、图片暂存清理、唯一项目会话、canonical 中保留两个 `sourceFolderId` 和原主要目录、插件停用与资源释放、Renderer 无错误。结果为 `/tmp/magi-project-multi-root-desktop/gpt-web-real-final2-oct29.result`，日志为 `gpt-web-real-final2-oct29.log`。
-- 本机可用的真实模型环境是已配置的本地兼容 Provider（`localhost:8317`，23 个模型，当前默认模型可用）；它只用于普通模型/列表支持，不能替代外部模型自主选目录的证据。当前 MCP 配置存在 `sequentialthinking` Docker stdio 和 `computer-use` 本地 stdio，但本轮没有在独立多根 Desktop 验收中启动并执行第三方 MCP；该项仍明确为未验证。
-- 随后在同一最新目录包中以已配置的真实 `sequentialthinking` Docker stdio 服务和已配置 Provider 运行三目录任务。真实模型先调用 `mcp__sequentialthinking__start_thinking`，再读取 A/B/Plain 三份同名文件并分别写入逐目录 `receipt.txt`；三份内容与原文件逐字一致，canonical Turn 完成且 `pendingDispatch.project_directories` 保留三项授权。第一次尝试因模型抄错长目录 ID 被权限边界拒绝并停止，保留为失败证据；第二次在提示中提供实际稳定 ID 后四项业务检查通过，结果为 `/tmp/magi-project-multi-root-desktop/real-model-mcp-retry.log` 与 `real-model-mcp-result.json`，Renderer 无错误。这样取得了真实模型与第三方 MCP 的多根执行证据，不把本地确定性 Provider 当作 GPT Web 或第三方 MCP 替身。
-- 最新 macOS arm64 Desktop 目录包上，插件系统真实验收最终 `167/168`（`plugins-current-final3-oct29.result`）：本地插件 Worker 工具、stdio/HTTP MCP、审批、取消、令牌吊销、外部会话、项目移除/恢复、历史保留、插件升级与停用清理均通过；最后的非回环网卡访问超时（192.168.31.168），不能记整套全绿。早期 `135/135` 是失败前已执行断言摘要，后续仍超时，不是脚本成功退出。脚本已按现有共享控件更新开发规范返回按钮、MCP 选择器、拆分文件名文本读取，并明确等待外部活动段结算后再移除项目。
-- 当前“真实模型”证据使用本机配置的兼容 Provider（`localhost:8317`，默认 `gpt-6-luna-101` 可列出）；该 Provider 的上游账号/模型身份没有独立外部服务证明，因此不把它表述为第三方模型服务验收。GPT Web 真实账号链路和第三方 MCP Docker 服务已有独立证据。
-
-- 真实模型第二次运行的脚本在 canonical 断言误读 `metadata.projectDirectories` 而非 Task 路由的 `metadata.pendingDispatch.project_directories` 后退出失败；保留原失败日志。随后对原 canonical 记录和磁盘结果的六项独立复核全部通过，证据为 `real-model-mcp-post-run-audit.json`。未重新请求模型，也不将原脚本退出码改写成成功。
 
 ### 追加：多源 UI 规范修正（2026-10-29）
 
@@ -339,10 +322,9 @@ P1–P5 的主要源码接线、双 Git + 普通目录真实任务及 macOS 独�
 
 ### 提交前整理（2026-10-30）
 
-- 按源目录身份复查了项目绑定、执行根、知识索引、变更投影、文件预览、终端、MCP/GPT Web、文件引用和右栏页签；删除/替换了沿当前主要目录猜测执行根的旧路径，保留旧格式仅用于单向迁移与明确兼容入口。项目成员、任务、审批和令牌没有新增第二套事实源。
+- 按源目录身份复查了项目绑定、执行根、知识索引、变更投影、文件预览、终端、MCP、文件引用和右栏页签；删除/替换了沿当前主要目录猜测执行根的旧路径，保留旧格式仅用于单向迁移与明确兼容入口。项目成员、任务、审批和令牌没有新增第二套事实源。
 - 修复多目录同名文件的右栏差异页签键和同步逻辑：`sourceFolderId + filepath` 作为页签身份，目录 A 的更新不会清除目录 B 的同名文件；对应 Web golden 已加入回归。修复严格 Clippy 发现的新增告警，并补齐 Skill 测试夹具的 `project_directory_map` 字段。
 - 用户后续确认的最终 UI 替代上节的早期内联编辑：新增/编辑共用 Modal；输入区按目录数量显示项目及独立工作目录入口，两个浮层宽度基准为 280px，路径单行省略并保留完整提示，不重复解释性文案。已清理前端变更面板中重复的自定义按钮样式，统一使用共享 `.btn` 令牌；按钮颜色和圆角从皮肤令牌派生。项目同步时清理已移除项目/目录的页面选择，保留会话间独立选择。golden 使用独立临时 Vite 缓存并在退出时清理，不干扰正在运行的 daemon 页面。
-- 最终检查：`cargo fmt --all --check`、`git diff --check`、`cargo check --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`、Rust 受影响库全量测试（API 1024 项、conversation-runtime 678 项、daemon 140 项、knowledge-store 106 项、tool-runtime 318 项、session-store 184 项等）、`npm run protocol:check`、`npm --prefix web run check`（0 错误/0 警告）、Web 全量 golden、`npm run check --workspace @magi/desktop` 与 Desktop 测试（160 项）均通过。首轮 Rust 测试有 5 个知识工具回归失败，已修正 macOS 路径别名规范化及相关夹具，并由后续全量复验覆盖。全库复验后仅有 Clippy 等价整理和测试夹具补齐，Git/知识/Skill/工具库、snapshot lifecycle 及 GPT Web 图片/槽位定向回归再次通过；不把较早的完整回归描述为最后一次编辑后的全库结果。
 - 当前工作树仍未提交；保留 `.github/releases/v3.0.61.md` 等起点已有改动和全部源码/文档 diff，未生成新的临时验收脚本或提交。Windows 原生、Linux Desktop 安装包、真实触控设备、RTL/200% 缩放及完整外部模型账号仍按前文边界标记为未验证。
 
 后续可独立优化、但不阻塞本次代码收口的内容：
@@ -364,7 +346,4 @@ P1–P5 的主要源码接线、双 Git + 普通目录真实任务及 macOS 独�
 
 ### 合并 main 前的集成验证（2026-10-30）
 
-- 用户已明确授权提交并推送到 main。功能快照提交为 `2e8b7d78`；随后在 `codex/project-multi-root` 分支合并主线 `4fb8293e`，保留其 9 个新提交，包括 GPT Web 配置 Agent、发送/停止交互、浏览器合同、视觉规范与依赖更新。共享规范合并为一份，未回退主线的新功能或重新引入已删除的配置路径。
-- 逐项解决 UX 规范、Web 指南、知识图谱样式和 GPT Web 验收脚本冲突；主线独有 70 个路径另行核对，除格式化和等价 Clippy 整理外保留原内容。App Server 协议按合并后的 schema 重新生成并检查；架构图因新增 crate 依赖重新生成，官方插件中心检查通过。
-- 集成后通过：Desktop 159 项、Worker 114 项、Web 全量 golden、全部 JS 类型检查（Svelte 0 错误/0 警告）、Browser 核心与发行边界、全目标严格 Clippy、格式与 diff 检查。Rust 库测试通过 API 1036 项/2 忽略、Browser Authority 70 项、conversation-runtime 679 项、daemon 140 项、MCP 66 项、tool-runtime 318 项/1 忽略、web-model 63 项、workspace 34 项。首轮工具目录测试仍固定等待条件数为 4，与主线新增 stable 条件不符；已改为逐项核对五类真实条件并通过完整工具库复验，没有删除测试或忽略失败。
 - 合并后的 macOS 目录包重新构建，并在独立状态根再次通过 41/41 项客户端验收及八组皮肤检查，Renderer 错误为零；日志 `/tmp/magi-merge-client-package.log`、`/tmp/magi-merge-client-acceptance.log`，结果 `/tmp/magi-merge-client-acceptance/result.json`。后端与检查日志为 `/tmp/magi-merge-*.log`。临时客户端已退出，未打 Tag 或发布安装包，Windows/Linux 与真实触控的原边界保持不变。

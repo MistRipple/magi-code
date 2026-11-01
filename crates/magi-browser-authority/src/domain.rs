@@ -69,11 +69,6 @@ impl BrowserSessionLifecycle {
     }
 }
 
-/// Browser Session 的归属作用域。
-///
-/// `Session` 与 Magi 会话保持同一作用域：个人会话没有伪造的 workspace。
-/// `App` 是应用级唯一会话（GPT Web 模型），不属于任何会话或工作区，
-/// 全局唯一、ID 持久稳定，登录态落在固定持久分区里。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrowserSessionOwner {

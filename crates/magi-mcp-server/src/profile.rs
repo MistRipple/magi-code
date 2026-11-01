@@ -1,11 +1,5 @@
-//! GPT Web 槽位的工具档与 MCP 授权方式。
-//!
-//! 工具档决策只依赖两个输入：槽位的工具档、工具的风险类别，是**纯函数**。MCP 令牌不使用
-//! 工具档：它们固定开放完整工具目录，只由 [`ApprovalMode`] 决定逐次询问还是自动执行。
-
 use serde::{Deserialize, Serialize};
 
-/// GPT Web 槽位按设置选择的工具档。MCP 令牌不携带工具档，对外一律完整工具目录。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Profile {

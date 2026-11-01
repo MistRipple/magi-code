@@ -71,20 +71,19 @@
 
 ## 补充：全仓滑块与分段选择检查
 
-范围包括 `web/src` 共用 Web / Desktop Renderer、`apps` 和 `examples` 内的 UI 源码。开关共 9 个 Toggle 调用点（工具 2、浏览器 4、安全 1、外观 1、MCP 编辑 1），另有 MCP 服务页 5 个原生开关声明；范围滑块共 6 个声明（浅深对比度各 1、焦点水平/垂直、遮光、模糊）。分段选择另核对 MCP 连接方式、GPT Web 方式选择器及工具栏、Markdown 预览模式与知识图谱视图。普通复选框和下划线 Tab 保留各自用途，不套用开关外观。当前模型表单已没有 URL 路径分段选择；未恢复并行工作中移除的控件。
+范围包括 `web/src` 共用 Web / Desktop Renderer、`apps` 和 `examples` 内的 UI 源码。开关共 9 个 Toggle 调用点（工具 2、浏览器 4、安全 1、外观 1、MCP 编辑 1），另有 MCP 服务页 5 个原生开关声明；范围滑块共 6 个声明（浅深对比度各 1、焦点水平/垂直、遮光、模糊）。分段选择另核对 MCP 连接方式 方式选择器及工具栏、Markdown 预览模式与知识图谱视图。普通复选框和下划线 Tab 保留各自用途，不套用开关外观。当前模型表单已没有 URL 路径分段选择；未恢复并行工作中移除的控件。
 
 | 检查项 | 发现 / 修复 |
 | --- | --- |
 | 开关几何 | 原 Toggle 的布局边框在 0.5px / 1px 下影响滑块位置，默认及小号左右端点不对称；改为共享内部描边，36×20px 轨道 / 14px 滑块 / 3px 边距，28×16px 轨道 / 12px 滑块 / 2px 边距，用 transform 切换端点 |
 | 重复样式 | MCP 服务页另写 32×18px 开关，继承全局文本框样式的风险未隔离；5 处统一使用 `.control-switch`，清除未使用的 `.toggle-switch` 旧 CSS |
 | 可点击、焦点、禁用 | Toggle 隐藏输入原本宽高为 0；现在覆盖至少 24px 高的 label，保留原生 Space 和禁用行为，使用双环阴影；MCP 原生 label 也至少 24px 高 |
-| 语义 | 开关使用原生 checkbox + `role=switch`，补齐新增 MCP 开关名称、工具/技能对象名；GPT Web 两处模式按钮增加 `aria-pressed`，文档模式按钮增加 Tab / `aria-selected` |
 | 范围滑块 | 实测原来带 8px padding、文本框底色及内部描边；现在 padding 0、透明底、无默认描边，28px 高、键盘焦点可见；百分比 / px 使用 `aria-valuetext`，数值等宽，Grid 中间列可收缩 |
 | MCP 分段几何 | 34px 轨道不再装固定 24px 按钮；按钮伸展为 30px，上下各 2px，切换后高度不变 |
 
 真实 daemon 入口复核：浏览器四个禁用开关、安全页小号开关、工具页对象名称、MCP 服务连接/网络/活动开关、MCP 新增分段切换及草稿启用开关。MCP 草稿实测点击关闭 → Space 开启，焦点环可见；没有提交配置或改变服务、网络与安全规则。外观深色预览实测水平焦点 62% → 63%、Home → 0%、End → 100%，恢复 62%；浅色预览实测对比度 52 → 53 → 52，退出恢复活动主题。截图：`range-controls-dark.png`、`range-controls-light.png`、`switch-controls-final.png`，均在 `target/ui-audit-2026-10-24/`。
 
-检查与 build 通过；定向 `test:appearance`、`test:mcp-server`、`test:browser-settings`、`test:conversation-disclosure`、`test:web-model`、`test:right-pane` 通过。本轮验证使用 macOS 当前 Chromium 页面，没有新增 Safari、Windows/Linux 或各触屏设备实测；GPT Web 条件入口与冲突合并选项仅核对源码，未触发真实对话绑定或合并写入。相关文件 `git diff --check` 通过；全仓检查曾报告并行工作文件 `crates/magi-bridge-client/src/tests.rs:889` 末尾空行，未修改该无关文件。
+相关文件 `git diff --check` 通过；全仓检查曾报告并行工作文件 `crates/magi-bridge-client/src/tests.rs:889` 末尾空行，未修改该无关文件。
 
 ## 补充：中性提示与只读值的背景清理
 
@@ -126,7 +125,7 @@
 | 界面/动作 | 已取得的证据 |
 | --- | --- |
 | 浅深主题聊天 | 实际切换并截图；正文计算字重分别为 400/360；输入区焦点无 outline，父容器呈现双环阴影；代码高亮可加载 |
-| 设置全部分类 | 模型、工具、浏览器、代理、偏好、安全、统计、外观、项目、插件、GPT Web、MCP 服务逐页打开；桌面浅深主题及 390px 深色窄屏均检查；内容区 scrollWidth 等于 clientWidth，页面无水平溢出 |
+| 设置全部分类 | 模型、工具、浏览器、代理、偏好、安全、统计、外观、项目、插件、MCP 服务逐页打开；桌面浅深主题及 390px 深色窄屏均检查；内容区 scrollWidth 等于 clientWidth，页面无水平溢出 |
 | Web 分屏 | 实际双击分割条：1066px 内容轨道分为 529px + 8px + 529px；实际拖过 82% 后右栏收起 |
 | Electron 分屏 | 实际开启右栏、双击分割条、打开新增面板菜单；重启旧开发宿主后右栏与高亮恢复正常加载 |
 | 长文件名 | 打开 `conversation-response-core-architecture-redesign.md`：文件树主名可见宽 220px、实际内容 268px，Tab 主名可见宽 103px、实际内容 318px；两处 `.md` 后缀均保持约 20px 完整可见，文件预览正常 |
@@ -198,7 +197,6 @@
 | `ModelConfigForm` 模型候选 | 可输入模型名及候选列表：保留输入、拉取和 portal 定位，补长列表搜索和无匹配提示 |
 | `SettingsMcpServerAudit` | 数据筛选：带框 Select，与清理等操作按钮区分 |
 | `GitContextControl` 分支 | 数据选择：保留已有搜索与分支选中态 |
-| `WebModelModeChooser` 已保存会话 | 点击后绑定会话的操作列表：保留原展开区域和绑定入口，补长列表搜索与无匹配提示，移除不完整的 listbox 语义 |
 | `TurnNavigationRail`、浏览器批注历史 | 导航命令：保留 menu / menuitem，长列表补搜索；不回填命令文字 |
 | 添加上下文、右栏新增面板、浏览器更多操作 | 命令 Dropdown：保留图标 / 文字触发与点选执行 |
 | 目录根位置、设备预设 | 保留原生下拉；路径与视口数值继续允许直接输入 |
@@ -207,7 +205,7 @@
 
 ### 第四组验证
 
-`npm --prefix web run check` 为 0 errors / 0 warnings，生产构建通过。定向 `test:composer-input`（59 场景）、`test:appearance`、`test:context-ring`、`test:mcp-server`、`test:web-model`、`test:settings-store`、`test:overlay-interaction`、`test:turn-navigation`、`test:right-pane-browser` 通过。轮次回归原先硬编码旧布局边框，已更新为检查现行 inset 描边；未为测试恢复旧样式。Web 改动的 `git diff --check` 通过。
+`npm --prefix web run check` 为 0 errors / 0 warnings，生产构建通过。轮次回归原先硬编码旧布局边框，已更新为检查现行 inset 描边；未为测试恢复旧样式。Web 改动的 `git diff --check` 通过。
 
 真实 daemon 页面验收：主对话权限按钮展开三个候选，当前值保持不变；配置页请求协议与推理级别均为原生下拉。代理引擎共 12 项，未过滤面板实测 260px 且可滚动；搜索“演示引擎 09”只显示对应引擎，搜索无匹配有明确提示；Esc 关闭候选、设置页保持打开、焦点回到“代理引擎”，重开恢复 12 项。主对话模型搜索无匹配时保留原模型与推理级别。未保存或修改模型绑定、权限、令牌等真实配置。截图：`target/ui-audit-2026-10-24/selection-search-final.png`。其他条件入口以源码与上述定向回归核对；未宣称全部状态均已逐一真实操作，也未运行 Windows / Linux 发行包验收。
 

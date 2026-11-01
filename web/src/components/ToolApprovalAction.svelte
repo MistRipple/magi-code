@@ -18,7 +18,7 @@
   let resolved = $state(false);
   let actionError = $state('');
   const isExternalApproval = $derived(
-    approval.taskId.startsWith('external:') && approval.taskId !== 'external:web-slot',
+    approval.taskId.startsWith('external:'),
   );
   const approvalIsActive = $derived(
     !toolApprovalState.hydrated

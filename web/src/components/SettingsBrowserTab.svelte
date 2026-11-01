@@ -7,7 +7,6 @@
     getBrowserCapabilities,
     getBrowserResources,
     reclaimBrowserResources,
-    resetWebModels,
     updateBrowserSettings,
     type BrowserCapabilitiesSnapshot,
     type BrowserCapabilitySettings,
@@ -18,7 +17,6 @@
     checkForDesktopUpdate,
     desktopUpdaterState,
   } from '../stores/desktop-updater.svelte';
-  import { applyWebModelRuntime, markWebModelStoppedByUser } from '../stores/web-model-runtime.svelte';
   import { confirmAction } from '../stores/confirm-dialog.svelte';
 
   type DesktopAction = 'refresh-components' | 'restart-automation' | 'clear-data' | 'check-updates';
@@ -248,15 +246,9 @@
           tone: 'danger',
         });
         if (!confirmed) return;
-        // 通用清理也会清掉 GPT Web 的登录分区：必须先让 daemon 取消在飞回复、释放槽位并隐藏入口，
-        // 否则槽位会悬挂在一个已失效的页面上。顺序与设置里 GPT Web 的「清除数据」一致。
-        await resetWebModels();
-        markWebModelStoppedByUser(true);
-        applyWebModelRuntime(null);
         try {
           await desktop.clearBrowserData();
         } catch (error) {
-          // GPT Web 此时已经停止：明确告诉用户处于「已停止、数据未清」的中间状态，而不是笼统的失败。
           throw new Error(i18n.t('settings.browser.clearDataPartial', { reason: errorMessage(error) }));
         }
         showActionNotice(i18n.t('settings.browser.clearDataSucceeded'));

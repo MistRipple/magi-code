@@ -22,7 +22,6 @@ import {
   type WorkspaceAgentBindingOverride,
 } from '../../web/agent-binding-context';
 import { PLUGIN_REGISTRY_CHANGED_EVENT } from '../../web/plugin-api';
-import { WEB_MODEL_SETUP_UPDATED } from '../../web/web-model-setup';
 import { i18n } from '../../stores/i18n.svelte';
 import { DEFAULT_LOCALE, isSupportedLocale } from '../../i18n/locales';
 import type { PluginSelection, SessionTurnCommand, TurnStartParams } from '../app-server-protocol.generated';
@@ -2095,13 +2094,6 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
         sessionId: rustEventSessionId(event) || currentSessionId,
         payload: event.payload ?? {},
       },
-    }));
-    return;
-  }
-
-  if (eventType === 'web_setup.updated') {
-    window.dispatchEvent(new CustomEvent(WEB_MODEL_SETUP_UPDATED, {
-      detail: { sessionId: rustEventSessionId(event) || currentSessionId },
     }));
     return;
   }

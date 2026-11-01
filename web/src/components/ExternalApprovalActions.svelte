@@ -5,15 +5,11 @@
   import { i18n } from '../stores/i18n.svelte';
   import type { McpServerApproval } from '../web/agent-api';
   import {
-    alwaysAllowExternalApproval,
     externalApprovals,
     resolveExternalApproval,
   } from '../stores/external-approvals.svelte';
 
   let { approval }: { approval: McpServerApproval } = $props();
-
-  /** GPT Web 槽位发起的调用（令牌 id 固定为 web-slot）可以切到「始终允许」。 */
-  const isWebSlot = $derived(approval.tokenId === 'web-slot');
   const secondsLeft = $derived(Math.max(0, Math.ceil((approval.expiresAtMs - externalApprovals.now) / 1000)));
 </script>
 
@@ -21,11 +17,7 @@
   <button type="button" class="btn btn--sm btn--primary" disabled={externalApprovals.busy} onclick={() => void resolveExternalApproval(approval, 'allow_once')}>
     {i18n.t('mcpServer.approvals.allow')}
   </button>
-  {#if isWebSlot}
-    <button type="button" class="btn btn--sm btn--secondary" disabled={externalApprovals.busy} onclick={() => void alwaysAllowExternalApproval(approval)}>
-      {i18n.t('mcpServer.approvals.alwaysAllow')}
-    </button>
-  {/if}
+
   <button type="button" class="btn btn--sm btn--secondary" disabled={externalApprovals.busy} onclick={() => void resolveExternalApproval(approval, 'deny')}>
     {i18n.t('mcpServer.approvals.deny')}
   </button>

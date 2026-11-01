@@ -217,52 +217,6 @@ export const APP_SERVER_METHOD_SIGNATURES = {
   }
 } as const;
 
-export interface WebModelSetupCredentialsParams {
-  sessionId: string;
-  setupRunId: string;
-  expectedRevision: number;
-  handoffId: string;
-  requestId: string;
-  tunnelId: string;
-  apiKey: string;
-  continueAfterSave?: boolean;
-}
-
-export type WebModelSetupControlAction = "pause" | "cancel";
-
-export interface WebModelSetupControlParams {
-  sessionId: string;
-  setupRunId: string;
-  expectedRevision: number;
-  executionGeneration: number;
-  action: WebModelSetupControlAction;
-}
-
-export interface WebModelSetupStatus {
-  sessionId: string;
-  stage: string;
-  reason: string;
-  detail?: string;
-  setupRunId?: string;
-  revision?: number;
-  executionGeneration?: number;
-  executionTurnId?: string;
-  executionTaskId?: string;
-  pluginDigest?: string;
-  handoffId?: string;
-  runState?: string;
-  allowedActions?: Array<string>;
-  saveRequestId?: string;
-  saveRequestBinding?: string;
-  savedCredentialVersion?: string;
-  pendingCredentialVersion?: string;
-  continuationInputId?: string;
-  continueState?: string;
-  organization?: string;
-  project?: string;
-  updatedAt: number;
-}
-
 export type JsonRpcVersion = "2.0";
 
 export type JsonRpcRequestId = string | number;

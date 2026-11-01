@@ -1,15 +1,13 @@
-import { INSTALL_WEB_NATIVE_INPUT } from "./web-native-input.js";
+
 import { createHash, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
-import { basename, isAbsolute } from "node:path";
+import { isAbsolute } from "node:path";
 import type {
   BrowserCommandOutcome,
   BrowserActionEffect,
   BrowserActionTarget,
   BrowserCommandResult,
   BrowserHostCommand,
-  BrowserWebQuestionAnswer,
-  BrowserWebQuestion,
   BrowserSnapshot,
   BrowserSnapshotTarget,
   BrowserSurfaceBinding,
@@ -18,22 +16,6 @@ import type {
 import { isAllowedBrowserChildTarget } from "@magi/desktop-browser-contracts";
 import { CdpClient } from "./cdp-client.js";
 import { INSTALL_PAGE_RUNTIME, MAGI_AUTOMATION_WORLD } from "./page-script.js";
-import { firstTextDivergence } from "./web-model-site.js";
-import {
-  INSTALL_WEB_MODEL_ADAPTER,
-  WEB_MODEL_SITE_REVISION,
-  composerTextDigest,
-  composerTextReadbackMatches,
-  contentEditableBlockBoundaryVariant,
-  isOpenAiPlatformOrigin,
-  openAiPlatformProbe,
-  isSupportedChatGptOrigin,
-  normalizeComposerText,
-  normalizeWebModelProbe,
-  normalizeWebModelTurnState,
-  type WebModelRawSnapshot,
-  type WebModelRawTurnState,
-} from "./web-model-site.js";
 
 interface PageRuntimeState {
   binding: BrowserSurfaceBinding;
@@ -66,8 +48,6 @@ interface NativeDialogOpenedResult {
 }
 
 const DIALOG_WAIT_TIMEOUT_MS = 2_000;
-/** 图片附加到 GPT Web 输入框并上传完成的上限。 */
-const WEB_ATTACH_TIMEOUT_MS = 60_000;
 const sleep = (milliseconds: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 interface HeapSnapshotData {
@@ -256,287 +236,6 @@ export class BrowserAutomationRuntime {
             payload: { value: await this.devtools(binding, command.payload.operation, command.payload.arguments) },
           },
         };
-      case "web_model_probe": {
-        // 标签页停在 OpenAI 平台页面时不安装 ChatGPT 适配器，只报告页面类型。
-        if (isOpenAiPlatformOrigin(await this.evaluate<string>(binding, "location.origin"))) {
-          const platform = openAiPlatformProbe();
-          return {
-            result: {
-              type: "json",
-              payload: {
-                value: {
-                  site_revision: platform.siteRevision,
-                  login_state: platform.loginState,
-                  composer_available: platform.composerAvailable,
-                  page_kind: platform.pageKind,
-                  account_hint: platform.accountHint,
-                },
-              },
-            },
-          };
-        }
-        await this.ensureWebModelAdapter(binding);
-        const raw = await this.evaluate<WebModelRawSnapshot>(
-          binding,
-          "globalThis.__magiWebModel.probe()",
-        );
-        if (!isRawWebModelSnapshot(raw)) {
-          throw protocolFailure(
-            "web_model_probe_result_invalid",
-            "页面适配器返回的探测快照缺少稳定的 origin / composer / conversation 字段",
-          );
-        }
-        const probe = normalizeWebModelProbe(raw);
-        if (!isSupportedChatGptOrigin(raw.origin)) {
-          throw protocolFailure(
-            "web_model_site_origin_invalid",
-            `站点 origin 不受支持：${raw.origin || "<empty>"}；仅允许 chatgpt.com 或 chat.openai.com`,
-          );
-        }
-        return {
-          result: {
-            type: "json",
-            payload: {
-              value: {
-                site_revision: probe.siteRevision,
-                login_state: probe.loginState,
-                composer_available: probe.composerAvailable,
-                page_kind: probe.pageKind,
-                account_hint: probe.accountHint,
-              },
-            },
-          },
-        };
-      }
-      case "web_saved_conversations": {
-        await this.ensureWebModelAdapter(binding);
-        const value = await this.evaluate<unknown>(binding, "globalThis.__magiWebModel.savedConversations()");
-        if (!isSavedConversationsResult(value)) {
-          throw protocolFailure(
-            "web_saved_conversations_result_invalid",
-            "页面适配器返回的已保存对话列表缺少 conversation_id / title",
-          );
-        }
-        return { result: { type: "json", payload: { value } } };
-      }
-      case "web_saved_messages": {
-        await this.ensureWebModelAdapter(binding);
-        const value = await this.evaluate<unknown>(binding, "globalThis.__magiWebModel.savedMessages()");
-        if (!isSavedMessagesResult(value)) {
-          throw protocolFailure(
-            "web_saved_messages_result_invalid",
-            "页面适配器返回的已保存对话消息缺少 role / text / remote_id",
-          );
-        }
-        return { result: { type: "json", payload: { value } } };
-      }
-      case "web_read_image": {
-        await this.ensureWebModelAdapter(binding);
-        const value = await this.evaluate<unknown>(
-          binding,
-          `globalThis.__magiWebModel.readImage(${JSON.stringify({
-            source: command.payload.source,
-            offset: command.payload.offset,
-            length: command.payload.length,
-          })})`,
-        );
-        if (!isImageChunkResult(value)) {
-          throw protocolFailure(
-            "web_read_image_result_invalid",
-            "页面适配器返回的图片分块缺少 mime / total / offset / data_base64 / done",
-          );
-        }
-        return { result: { type: "json", payload: { value } } };
-      }
-      case "web_write_text": {
-        await this.ensureWebModelAdapter(binding);
-        const { selector, text, mode, expect_text_digest: expectDigest } = command.payload;
-        const timeoutMs = normalizeWebCommandTimeout(command.payload.timeout_ms);
-        const expectedText = normalizeComposerText(text);
-        const observed = await this.runNativeInput(
-          binding,
-          `globalThis.__magiWebModel.writeText(${JSON.stringify({
-            selector,
-            text,
-            mode,
-            timeout_ms: timeoutMs,
-          })})`,
-        ) as { text: string; charCount: number; becameAttachment: boolean } | null;
-        if (
-          !observed
-          || typeof observed.text !== "string"
-          || typeof observed.charCount !== "number"
-          || !Number.isSafeInteger(observed.charCount)
-          || observed.charCount < 0
-          || typeof observed.becameAttachment !== "boolean"
-        ) {
-          throw protocolFailure(
-            "web_write_text_result_invalid",
-            "页面适配器未返回完整的 text / charCount / becameAttachment 回读事实",
-          );
-        }
-        const digest = composerTextDigest(observed.text);
-        // 写入与回读用同一归一化与摘要；未给期望摘要时退回语义比对，
-        // 绝不把「命令返回成功」当成「内容已正确进入输入框」。
-        const observedText = normalizeComposerText(observed.text);
-        const expectedTextDigest = composerTextDigest(expectedText);
-        const expectedChars = Array.from(expectedText);
-        const observedChars = Array.from(observedText);
-        const observedSuffix = observedChars
-          .slice(Math.max(0, observedChars.length - expectedChars.length))
-          .join("");
-        const tailMatched = mode === "append"
-          && (expectedText.length === 0
-            || observedText.endsWith(expectedText)
-            || observedText.endsWith(contentEditableBlockBoundaryVariant(expectedText)));
-        const digestMatched = expectDigest === undefined
-          || expectDigest === null
-          || digest === expectDigest
-          || (mode === "append" && expectedTextDigest === expectDigest);
-        const confirmed = !observed.becameAttachment
-          && (mode === "append" ? tailMatched : composerTextReadbackMatches(expectedText, observedText))
-          && digestMatched;
-        // 未确认时只带分歧位置与两侧长度：诊断需要定位站点改写了什么，
-        // 但不需要（也不应该）把整段正文复制进日志。
-        const mismatch = confirmed
-          ? null
-          : firstTextDivergence(
-            expectedText,
-            mode === "append"
-              ? observedSuffix
-              : observedText,
-          );
-        return {
-          result: {
-            type: "json",
-            payload: {
-              value: {
-                confirmed,
-                digest,
-                char_count: observed.charCount,
-                became_attachment: observed.becameAttachment,
-                mismatch,
-                diagnostic: confirmed
-                  ? null
-                  : observed.becameAttachment
-                    ? "content_became_attachment"
-                    : !digestMatched
-                      ? "digest_mismatch"
-                    : mode === "append" && !tailMatched
-                      ? "append_suffix_mismatch"
-                      : "composer_readback_mismatch",
-              },
-            },
-          },
-        };
-      }
-      case "web_observe": {
-        await this.ensureWebModelAdapter(binding);
-        const payload = command.payload;
-        const observed = await this.evaluate<{
-          revision: number;
-          nodes: Array<Record<string, unknown>>;
-        }>(
-          binding,
-          `globalThis.__magiWebModel.observe(${JSON.stringify({
-            selector: payload.selector,
-            fields: payload.fields,
-            attribute: payload.attribute ?? null,
-          })})`,
-        );
-        if (!isWebObserveResult(observed)) {
-          throw protocolFailure(
-            "web_observe_result_invalid",
-            "页面适配器返回的观察结果缺少 revision 或 nodes",
-          );
-        }
-        // selector 不可达不报错：页面脚本返回 found:false，完成谓词由调用方判定。
-        return { result: { type: "json", payload: { value: observed } } };
-      }
-      case "web_submit": {
-        await this.ensureWebModelAdapter(binding);
-        // 提交只负责「把输入交给站点并观察输入框是否清空」；是否被接受由
-        // `web_turn_state` 的消息计数证据判定，不以返回成功为准（§5.6 步骤 4）。
-        const submitted = await this.runNativeInput(binding, "globalThis.__magiWebModel.submit()");
-        if (!isWebSubmitResult(submitted)) {
-          throw protocolFailure(
-            "web_submit_result_invalid",
-            "页面适配器返回的提交结果缺少 submitted / composer_empty / reason",
-          );
-        }
-        return { result: { type: "json", payload: { value: submitted } } };
-      }
-      case "web_attach_files": {
-        await this.ensureWebModelAdapter(binding);
-        const paths = command.payload.file_paths;
-        const authorizedPaths = await this.validateUploadPaths(paths);
-        const attached = await this.attachWebModelFiles(binding, authorizedPaths);
-        return { result: { type: "json", payload: { value: attached } } };
-      }
-      case "web_clear_attachments": {
-        await this.ensureWebModelAdapter(binding);
-        const cleared = await this.evaluate<{ remaining: number }>(
-          binding,
-          "globalThis.__magiWebModel.clearAttachments()",
-        );
-        return { result: { type: "json", payload: { value: cleared } } };
-      }
-      case "web_answer_question": {
-        await this.ensureWebModelAdapter(binding);
-        await this.answerWebQuestion(binding, command.payload.question_id, command.payload.answer);
-        return { result: { type: "json", payload: { value: { answered: true } } } };
-      }
-      case "web_turn_state": {
-        await this.ensureWebModelAdapter(binding);
-        const raw = await this.evaluate<WebModelRawTurnState>(
-          binding,
-          "globalThis.__magiWebModel.turnState()",
-        );
-        if (!isRawWebModelTurnState(raw)) {
-          throw protocolFailure(
-            "web_turn_state_result_invalid",
-            "页面适配器返回的回合状态缺少登录、消息计数或助手正文事实",
-          );
-        }
-        const state = normalizeWebModelTurnState(raw);
-        return {
-          result: {
-            type: "json",
-            payload: {
-              value: {
-                site_revision: state.siteRevision,
-                login_state: state.loginState,
-                blocked: state.blocked,
-                generating: state.generating,
-                composer_found: state.composerFound,
-                user_message_count: state.userMessageCount,
-                assistant_message_count: state.assistantMessageCount,
-                assistant_text: state.assistantText,
-                thinking_text: state.thinkingText,
-                question: state.question,
-                last_message_role: state.lastMessageRole,
-                last_message_text: state.lastMessageText,
-              },
-            },
-          },
-        };
-      }
-      case "web_cancel_generation": {
-        await this.ensureWebModelAdapter(binding);
-        const cancelled = await this.evaluate<boolean>(
-          binding,
-          "globalThis.__magiWebModel.cancelGeneration()",
-        );
-        if (typeof cancelled !== "boolean") {
-          throw protocolFailure("web_cancel_result_invalid", "页面适配器返回的取消结果不是 boolean");
-        }
-        return {
-          result: {
-            type: "json",
-            payload: { value: { cancelled } },
-          },
-        };
-      }
       case "ping":
         return { result: { type: "pong", payload: { monotonic_millis: Math.floor(performance.now()) } } };
       default:
@@ -715,44 +414,6 @@ export class BrowserAutomationRuntime {
     }
   }
 
-  /**
-   * 惰性安装 ChatGPT 站点适配器（幂等）。
-   *
-   * 与页面自动化运行时同处一个 isolated world，但只在真正用到站点适配命令时
-   * 安装，普通浏览器工具不会承担这份脚本成本。
-   */
-  private async ensureWebModelAdapter(binding: BrowserSurfaceBinding): Promise<void> {
-    const origin = await this.evaluate<string>(binding, "location.origin");
-    if (!isSupportedChatGptOrigin(origin)) {
-      throw protocolFailure(
-        "web_model_site_origin_invalid",
-        `当前页面不是受支持的 ChatGPT Web origin：${origin || "<empty>"}`,
-      );
-    }
-    const installed = await this.evaluate<boolean>(
-      binding,
-      `Boolean(globalThis.__magiWebModel
-        && globalThis.__magiWebModel.adapter_epoch === ${JSON.stringify(WEB_MODEL_SITE_REVISION)}
-        && ["probe", "writeText", "observe", "submit", "turnState", "cancelGeneration"]
-          .every((name) => typeof globalThis.__magiWebModel[name] === "function"))`,
-    );
-    if (installed) return;
-    await this.evaluate(binding, INSTALL_WEB_MODEL_ADAPTER);
-    const verified = await this.evaluate<boolean>(
-      binding,
-      `Boolean(globalThis.__magiWebModel
-        && globalThis.__magiWebModel.adapter_epoch === ${JSON.stringify(WEB_MODEL_SITE_REVISION)}
-        && ["probe", "writeText", "observe", "submit", "turnState", "cancelGeneration"]
-          .every((name) => typeof globalThis.__magiWebModel[name] === "function"))`,
-    );
-    if (!verified) {
-      throw protocolFailure(
-        "web_model_adapter_missing",
-        "ChatGPT Web 页面适配器安装后未暴露完整命令集合",
-      );
-    }
-  }
-
   private async evaluate<T>(
     binding: BrowserSurfaceBinding,
     expression: string,
@@ -835,51 +496,6 @@ export class BrowserAutomationRuntime {
       binding,
       `globalThis.__magiBrowserAutomation.setAnnotations(${JSON.stringify(annotations)})`,
     );
-  }
-
-  /** 配置页面只识别目标；写入共享通用工具的原生输入、命中检查和确认。 */
-  private async runNativeInput(binding: BrowserSurfaceBinding, expression: string): Promise<unknown> {
-    const id = randomUUID();
-    const state = "globalThis.__magiNativeInput";
-    await this.evaluate(binding, `${INSTALL_WEB_NATIVE_INPUT}(${JSON.stringify(id)}, ${JSON.stringify(expression)})`);
-    let inputStarted = false;
-    try {
-      const deadline = Date.now() + 90_000;
-      while (Date.now() < deadline) {
-        const next = await this.evaluate<{
-          done: boolean; failed: boolean; value: unknown;
-          request: { kind: string; ref: string; value: string | null } | null;
-        }>(binding, `${state}?.id === ${JSON.stringify(id)} ? ${state}.snapshot() : null`);
-        if (!next) throw protocolFailure("browser_native_input_closed", "配置操作已失效", true);
-        if (next.done) {
-          if (next.failed) throw protocolFailure("browser_native_input_failed", "配置页面操作未确认", true);
-          return next.value;
-        }
-        const request = next.request;
-        if (request) {
-          // 后续轮询遇到导航也不能抹掉先前输入可能已生效的事实。
-          inputStarted = true;
-          const target = { element_ref: request.ref };
-          if (request.kind === "click") await this.click(binding, target);
-          else if (request.kind === "type" && typeof request.value === "string") {
-            await this.typeText(binding, target, request.value, true, null);
-          } else if (request.kind === "select" && typeof request.value === "string") {
-            // 原生 select 的系统菜单无法稳定接受跨进程按键；先把光标移动到真实控件，
-            // 再复用 Worker 已有的受控 select 语义写入和回读确认，不合成 click 事件。
-            await this.pointerAction(binding, "mousemove", request.ref, null);
-            await this.setSelectValue(binding, target, request.value, false);
-          } else throw protocolFailure("browser_native_input_invalid", "配置输入类型无效");
-          await this.evaluate(binding, `${state}?.id === ${JSON.stringify(id)} && ${state}.settle()`);
-        } else await waitWithSignal(50, this.#cdp.currentSignal());
-      }
-      throw protocolFailure("browser_native_input_timeout", "配置操作超时，请检查页面", true);
-    } catch (cause) {
-      throw inputStarted ? sideEffectFailure(cause) : cause;
-    } finally {
-      if (!this.navigationAdvanced(binding) && !this.#cdp.currentSignal()?.aborted) {
-        await this.evaluate(binding, `${state}?.id === ${JSON.stringify(id)} && ${state}.dispose()`).catch(() => undefined);
-      }
-    }
   }
 
   private async target(binding: BrowserSurfaceBinding, target: BrowserSnapshotTarget): Promise<PageTarget> {
@@ -1631,82 +1247,6 @@ export class BrowserAutomationRuntime {
       expression: `globalThis.__magiBrowserDialogResolve?.(${JSON.stringify({ action, promptText })})`,
       returnByValue: true,
     });
-  }
-
-  private async answerWebQuestion(
-    binding: BrowserSurfaceBinding,
-    questionId: string,
-    answer: BrowserWebQuestionAnswer,
-  ): Promise<void> {
-    // 一次校验整组回答，任何越界/不支持的输入都必须在首次点击之前拒绝。
-    const actions = await this.evaluate<Array<{ kind: string; item?: number; index?: number; text?: string }>>(
-      binding, `globalThis.__magiWebModel.questionActions(${JSON.stringify(questionId)}, ${JSON.stringify(answer)})`,
-    );
-    for (const action of actions) {
-      if (action.kind === "submit") {
-        const confirmed = await this.evaluate<boolean>(binding,
-          `globalThis.__magiWebModel.verifyQuestionAnswer(${JSON.stringify(questionId)}, ${JSON.stringify(answer)})`);
-        if (!confirmed) throw protocolFailure("web_question_answer_unconfirmed", "页面没有确认选项或输入，未提交", true);
-      }
-      try {
-        const activated = await this.runNativeInput(binding,
-          `globalThis.__magiWebModel.activateQuestionAction(${JSON.stringify(questionId)}, ${JSON.stringify(action)})`);
-        if (activated !== true) throw protocolFailure("web_question_answer_unconfirmed", "页面操作未确认", true);
-      } catch (cause) { throw sideEffectFailure(cause); }
-      await sleep(100);
-    }
-    // 站点激活后回读结果；相同卡片还留在页面时 client 等它换阶段，不再次回写。
-  }
-
-  /**
-   * 把文件附加到 GPT Web 输入框：经文件输入设置文件，再等「附件数增加 N 且没有上传中标志」。
-   * 超时或找不到文件输入时撤掉本次已附加的文件再报错，保证失败不留下半截附件。
-   */
-  private async attachWebModelFiles(
-    binding: BrowserSurfaceBinding,
-    paths: string[],
-  ): Promise<{ attached: number; total: number }> {
-    const before = await this.evaluate<{ count: number; uploading: boolean }>(
-      binding,
-      "globalThis.__magiWebModel.attachmentState()",
-    );
-    if (before.count !== 0) throw protocolFailure("web_attach_draft_conflict", "网页已有未发送附件，未覆盖用户草稿");
-    const selector = await this.evaluate<string | null>(binding, "globalThis.__magiWebModel.fileInputTarget()");
-    if (!selector) {
-      throw protocolFailure("web_attach_input_missing", "ChatGPT 页面里找不到接收图片的文件输入");
-    }
-    const document = await this.#cdp.send<{ root: { nodeId: number } }>(binding, "DOM.getDocument", { depth: -1, pierce: true });
-    const node = await this.#cdp.send<{ nodeId?: number }>(binding, "DOM.querySelector", { nodeId: document.root.nodeId, selector });
-    if (!node.nodeId) {
-      throw protocolFailure("web_attach_input_missing", "接收图片的文件输入已不在页面中");
-    }
-    await this.evaluate(binding, `globalThis.__magiWebModel.beginAttachmentUpload(${JSON.stringify(paths.map((path) => basename(path)))})`);
-    // 设置文件一旦开始就可能留下附件；后续任何异常均进入清理路径。
-    try {
-      await this.#cdp.send(binding, "DOM.setFileInputFiles", { nodeId: node.nodeId, files: paths });
-      const expected = paths.length;
-      const deadline = Date.now() + WEB_ATTACH_TIMEOUT_MS;
-      let state = before;
-      while (Date.now() < deadline) {
-        await sleep(250);
-        state = await this.evaluate<{ count: number; uploading: boolean }>(
-          binding,
-          "globalThis.__magiWebModel.attachmentState()",
-        );
-        if (state.count >= expected && !state.uploading) {
-          return { attached: paths.length, total: state.count };
-        }
-      }
-      throw protocolFailure(
-        "web_attach_timeout",
-        `图片未能在 ${WEB_ATTACH_TIMEOUT_MS / 1000} 秒内上传完成（已识别 ${state.count}/${expected}）`,
-      );
-    } catch (cause) {
-      // 当前命令取消后 CDP 会拒绝继续执行。仍须标记可能已附图，daemon 用新命令清理。
-      const cleared = await this.evaluate<{ remaining: number }>(binding, "globalThis.__magiWebModel.clearAttachments()").catch(() => null);
-      if (!cleared || cleared.remaining !== 0) throw sideEffectFailure(cause);
-      throw cause;
-    }
   }
 
   private async uploadFile(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
@@ -2581,16 +2121,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function isRawWebModelSnapshot(value: unknown): value is WebModelRawSnapshot {
-  return isRecord(value)
-    && typeof value.origin === "string"
-    && typeof value.path === "string"
-    && typeof value.blocked === "boolean"
-    && typeof value.composerFound === "boolean"
-    && typeof value.conversationFound === "boolean"
-    && (value.accountHint === null || typeof value.accountHint === "string");
-}
-
 function isSavedConversationsResult(value: unknown): boolean {
   return isRecord(value)
     && Array.isArray(value.conversations)
@@ -2614,60 +2144,6 @@ function isSavedMessagesResult(value: unknown): boolean {
     && (value.updated_at === null || typeof value.updated_at === "string");
 }
 
-function isWebObserveResult(value: unknown): value is { revision: number; nodes: Array<Record<string, unknown>> } {
-  return isRecord(value)
-    && typeof value.revision === "number"
-    && Number.isSafeInteger(value.revision)
-    && value.revision >= 0
-    && Array.isArray(value.nodes)
-    && value.nodes.every((node) => isRecord(node) && typeof node.found === "boolean");
-}
-
-function isWebSubmitResult(value: unknown): value is {
-  submitted: boolean;
-  composer_empty: boolean;
-  reason: string | null;
-} {
-  return isRecord(value)
-    && typeof value.submitted === "boolean"
-    && typeof value.composer_empty === "boolean"
-    && (value.reason === null || typeof value.reason === "string");
-}
-
-function isWebQuestion(value: unknown): value is BrowserWebQuestion {
-  return isRecord(value) && typeof value.id === "string" && value.id.length > 0
-    && typeof value.can_skip === "boolean" && Array.isArray(value.questions) && value.questions.length > 0
-    && value.questions.every((item) => isRecord(item) && typeof item.question === "string" && item.question.length > 0
-      && typeof item.multi_select === "boolean" && typeof item.allows_text === "boolean"
-      && Array.isArray(item.options) && item.options.length >= 2
-      && item.options.every((option) => isRecord(option) && typeof option.label === "string"
-        && option.label.length > 0 && typeof option.description === "string"));
-}
-
-function isRawWebModelTurnState(value: unknown): value is WebModelRawTurnState {
-  return isRecord(value)
-    && typeof value.origin === "string"
-    && typeof value.path === "string"
-    && typeof value.blocked === "boolean"
-    && typeof value.generating === "boolean"
-    && typeof value.conversation_found === "boolean"
-    && typeof value.composer_found === "boolean"
-    && typeof value.user_message_count === "number"
-    && Number.isSafeInteger(value.user_message_count)
-    && value.user_message_count >= 0
-    && typeof value.assistant_message_count === "number"
-    && Number.isSafeInteger(value.assistant_message_count)
-    && value.assistant_message_count >= 0
-    && typeof value.assistant_text === "string"
-    && typeof value.thinking_text === "string"
-    && (value.last_message_role === null
-      || value.last_message_role === "user"
-      || value.last_message_role === "assistant")
-    && (value.last_message_text === null || typeof value.last_message_text === "string")
-    && (value.account_hint === null || typeof value.account_hint === "string")
-    && (value.question === undefined || value.question === null || isWebQuestion(value.question));
-}
-
 function protocolFailure(code: string, message: string, sideEffectStarted = false): Error {
   const error = new Error(`${code}:${message}`);
   error.name = "BrowserAutomationError";
@@ -2678,14 +2154,6 @@ function protocolFailure(code: string, message: string, sideEffectStarted = fals
 function sideEffectFailure(cause: unknown): Error {
   const error = cause instanceof Error ? cause : new Error(String(cause));
   return Object.assign(error, { side_effect_started: true });
-}
-
-function normalizeWebCommandTimeout(value: number | null | undefined): number {
-  if (value === undefined || value === null) return 250;
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw protocolFailure("web_command_timeout_invalid", "timeout_ms must be a non-negative integer");
-  }
-  return value;
 }
 
 async function withTraceTimeout(promise: Promise<void>): Promise<void> {

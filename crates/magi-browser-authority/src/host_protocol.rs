@@ -2,22 +2,6 @@ use crate::{BrowserDeviceType, BrowserNormalizedRect};
 use magi_core::{BrowserCommandId, BrowserLeaseId, BrowserSessionId, BrowserTabId};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BrowserWebQuestionSelection {
-    pub selected: Vec<usize>,
-    pub text: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum BrowserWebQuestionAnswer {
-    Answered {
-        answers: Vec<BrowserWebQuestionSelection>,
-    },
-    Skipped,
-}
-
 pub const BROWSER_HOST_PROTOCOL_MAJOR: u16 = 3;
 pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 8;
 pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 96;
@@ -253,88 +237,7 @@ pub enum BrowserHostCommand {
         surface_id: String,
         control: BrowserHostControlUpdate,
     },
-    /// ChatGPT 站点只读探测：登录态、账号能力、模型菜单、effort、连接器支持性。
-    ///
-    /// 只读、不写页面、不下单、不改变用户当前会话状态；只由发现通道使用，
-    /// 不进入模型可见的浏览器工具目录（设计基线 §5.5、C10）。
-    WebModelProbe {
-        tab_id: BrowserTabId,
-    },
-    /// 站点内原子纯文本写入 + 回读校验（设计基线 §5.6 步骤 3）。
-    ///
-    /// 不复用 `Type`：后者走 CDP `Input.insertText`，没有回读校验，对长文本的
-    /// contenteditable 富文本编辑器不可靠。回读不一致或内容被站点转成附件即失败，
-    /// 由调用方映射为 `ContextLengthExceeded`（§5.9.6）。
-    WebWriteText {
-        tab_id: BrowserTabId,
-        selector: String,
-        text: String,
-        mode: BrowserWebWriteMode,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expect_text_digest: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        timeout_ms: Option<u64>,
-    },
-    /// 站点短轮询观察：返回单次快照，`revision` 单调递增供调用方判断内容变化。
-    ///
-    /// 长等待会占住该 Surface 的命令 lane，因此观察必须短轮询（§5.6 末）。
-    WebObserve {
-        tab_id: BrowserTabId,
-        selector: String,
-        fields: Vec<BrowserWebObserveField>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        attribute: Option<String>,
-    },
-    /// 提交 composer：把输入交给站点，并回读输入框是否已清空。
-    ///
-    /// 「是否被接受」不以本命令返回成功为准，而由 `WebTurnState` 的消息计数
-    /// 证据判定（设计基线 §5.6 步骤 4）。
-    WebSubmit {
-        tab_id: BrowserTabId,
-    },
-    /// 把图片附加到 GPT Web 输入框并等待上传完成。
-    ///
-    /// 文件由 daemon 落在 Magi 私有目录，只传绝对路径（图片字节不过控制通道）。附加失败时
-    /// Worker 先撤掉本次已附加的文件再报错，调用方据此判定本次消息未提交。
-    WebAttachFiles {
-        tab_id: BrowserTabId,
-        file_paths: Vec<String>,
-    },
-    /// 撤销 Magi 上传且尚未发送的附件，不接管用户的网页草稿。
-    WebClearAttachments {
-        tab_id: BrowserTabId,
-    },
-    /// 回写当前网页选择卡片；卡片身份与回答由站点适配层校验，副作用不得重放。
-    WebAnswerQuestion {
-        tab_id: BrowserTabId,
-        question_id: String,
-        answer: BrowserWebQuestionAnswer,
-    },
-    /// 回合语义状态：生成中标志、助手与思考文本、消息计数、原生问题。
-    /// 完成谓词由推理通道跨读取周期判定；页面存在问题时继续等待用户。
-    WebTurnState {
-        tab_id: BrowserTabId,
-    },
-    /// 中断 GPT Web 页面当前生成；只影响网页侧生成，不关闭逻辑 Tab。
-    WebCancelGeneration {
-        tab_id: BrowserTabId,
-    },
-    /// 读取 ChatGPT 已保存对话列表（侧栏历史）：`conversation_id`、标题、更新时间。只读。
-    WebSavedConversations {
-        tab_id: BrowserTabId,
-    },
-    /// 读取当前已保存对话页面（`/c/<id>`）的远端事实：`conversation_id`、标题、可见消息及其稳定 id。只读。
-    WebSavedMessages {
-        tab_id: BrowserTabId,
-    },
-    /// 分块读取 GPT Web 回复里的一张图片字节（`source` 是页面上某个 `<img>` 的地址，如 `blob:`）。
-    /// 控制通道单条消息有上限，所以按 `offset` / `length` 分块，由调用方拼接。只读。
-    WebReadImage {
-        tab_id: BrowserTabId,
-        source: String,
-        offset: u64,
-        length: u64,
-    },
+
     /// daemon 持有的浏览器网络策略开关，推送给 Electron Main 在 guest 网络层执行。
     /// Host 连接建立时先推送、设置变化时再推送；Main 重启后默认拒绝局域网，直到收到推送。
     ConfigureNetworkPolicy {
@@ -354,13 +257,7 @@ impl BrowserHostCommand {
             | Self::Click { .. }
             | Self::Type { .. }
             | Self::Press { .. }
-            | Self::Scroll { .. }
-            | Self::WebWriteText { .. }
-            | Self::WebSubmit { .. }
-            | Self::WebAttachFiles { .. }
-            | Self::WebClearAttachments { .. }
-            | Self::WebAnswerQuestion { .. }
-            | Self::WebCancelGeneration { .. } => true,
+            | Self::Scroll { .. } => true,
             Self::Ping
             | Self::Cancel { .. }
             | Self::CreatePage { .. }
@@ -378,34 +275,10 @@ impl BrowserHostCommand {
             | Self::Screenshot { .. }
             | Self::HitTest { .. }
             | Self::UpdateControl { .. }
-            | Self::WebModelProbe { .. }
-            | Self::WebObserve { .. }
-            | Self::WebTurnState { .. }
-            | Self::WebSavedConversations { .. }
-            | Self::WebSavedMessages { .. }
-            | Self::WebReadImage { .. }
             | Self::ConfigureNetworkPolicy { .. }
             | Self::Shutdown => false,
         }
     }
-}
-
-/// `WebWriteText` 的写入模式：整段替换或追加到现有文本之后。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BrowserWebWriteMode {
-    Replace,
-    Append,
-}
-
-/// `WebObserve` 可以回读的字段集合。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BrowserWebObserveField {
-    Text,
-    Html,
-    Existence,
-    Attribute,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -866,60 +739,6 @@ pub enum BrowserAgentCursorAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn web_attachment_commands_match_typescript_contract() {
-        let attach = BrowserHostCommand::WebAttachFiles {
-            tab_id: BrowserTabId::new("tab-1"),
-            file_paths: vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()],
-        };
-        let wire = serde_json::json!({
-            "type": "web_attach_files",
-            "payload": { "tab_id": "tab-1", "file_paths": ["/tmp/a.png", "/tmp/b.png"] }
-        });
-        assert_eq!(serde_json::to_value(&attach).expect("serialize"), wire);
-        assert_eq!(
-            serde_json::from_value::<BrowserHostCommand>(wire).expect("deserialize"),
-            attach
-        );
-        assert!(attach.is_side_effecting());
-
-        let clear = BrowserHostCommand::WebClearAttachments {
-            tab_id: BrowserTabId::new("tab-1"),
-        };
-        assert_eq!(
-            serde_json::to_value(&clear).expect("serialize"),
-            serde_json::json!({ "type": "web_clear_attachments", "payload": { "tab_id": "tab-1" } })
-        );
-        assert!(clear.is_side_effecting());
-
-        let answer = BrowserHostCommand::WebAnswerQuestion {
-            tab_id: BrowserTabId::new("tab-1"),
-            question_id: "card-1".to_string(),
-            answer: BrowserWebQuestionAnswer::Answered {
-                answers: vec![BrowserWebQuestionSelection {
-                    selected: vec![1],
-                    text: None,
-                }],
-            },
-        };
-        let answer_wire = serde_json::json!({
-            "type": "web_answer_question",
-            "payload": {
-                "tab_id": "tab-1", "question_id": "card-1",
-                "answer": { "kind": "answered", "answers": [{ "selected": [1], "text": null }] }
-            }
-        });
-        assert_eq!(
-            serde_json::to_value(&answer).expect("serialize"),
-            answer_wire
-        );
-        assert_eq!(
-            serde_json::from_value::<BrowserHostCommand>(answer_wire).expect("deserialize"),
-            answer
-        );
-        assert!(answer.is_side_effecting());
-    }
 
     #[test]
     fn desktop_handshake_matches_typescript_contract() {

@@ -1,5 +1,3 @@
-# 主对话 Git 上下文与安全分支工作流
-
 ## 1. 概念边界
 
 | 概念 | 权威实体 | 含义 | 不是 |
@@ -12,8 +10,6 @@
 `magi-workspace::WorktreeAllocation` 是历史执行路径登记模型，不会调用
 `git worktree add/remove`。真实 Git worktree 生命周期由 `magi-git::GitService` 管理，
 两者不能因为名称相似而混用。
-
-## 2. 当前实现
 
 ### 2.1 结构化 Git 服务
 

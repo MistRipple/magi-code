@@ -553,9 +553,6 @@ fn validated_task_completion(
     final_response: String,
     evidence: Vec<TaskCompletionEvidence>,
 ) -> Result<TaskOutcome, String> {
-    if let Some(reason) = setup_phase_recovery_prompt(&evidence) {
-        return Err(reason);
-    }
     let attempt = TaskCompletionAttempt {
         output_refs,
         final_response: Some(final_response),
@@ -563,23 +560,6 @@ fn validated_task_completion(
     };
     task.completion_contract().validate(&attempt)?;
     Ok(TaskOutcome::Completed { attempt })
-}
-
-/// 配置运行可跨 Turn；只有可信领域回执证明交接/暂停/完成，才允许本轮阶段交付。
-fn setup_phase_recovery_prompt(evidence: &[TaskCompletionEvidence]) -> Option<String> {
-    let name = magi_plugin_system::model_tool_name("openai.chatgpt-web", "configure");
-    let latest = evidence.iter().rev().find_map(|evidence| {
-        if let TaskCompletionEvidence::SuccessfulToolCall {
-            tool_name, result, ..
-        } = evidence
-            && tool_name == &name
-        {
-            return serde_json::from_str::<serde_json::Value>(result).ok();
-        }
-        None
-    })?;
-    (latest["configuration"]["runState"] == "running").then(||
-        "本轮配置尚无已提交的交接或完成证据。请继续推进，或用配置工具提交真实人工交接/暂停，再给本轮阶段答复；不得把正在运行说成配置完成。".into())
 }
 
 fn task_round_tool_definitions(
@@ -2799,8 +2779,6 @@ fn run_conversation_loop_inner(
                 agent_coordination_recovery_prompt(task, task_store, &tool_call_records)
             {
                 Some(recovery_prompt)
-            } else if let Some(prompt) = setup_phase_recovery_prompt(&completion_evidence) {
-                Some(prompt)
             } else if execution_steps_unfinished().unwrap_or(true) {
                 Some("执行步骤尚未收口。请继续实际工作并调用 update_execution_steps 更新当前 revision；完成必须引用真实成功工具的 itemId/toolCallId。确实受阻或不再执行的步骤应填写 blocked/canceled 和 reason，不得虚报完成。".into())
             } else if owns_active_plan() {
@@ -4598,35 +4576,6 @@ fn task_stream_item_id(task_id: &TaskId, round: usize, streaming_entry_id: Optio
             .unwrap_or_else(|| format!("turn-item-assistant-stream-{task_id}-{round}"));
     }
     format!("turn-item-assistant-stream-{task_id}-{round}")
-}
-
-#[cfg(test)]
-mod setup_phase_tests {
-    use super::*;
-    fn receipt(state: &str) -> TaskCompletionEvidence {
-        TaskCompletionEvidence::SuccessfulToolCall {
-            call_id: "setup".into(),
-            tool_name: magi_plugin_system::model_tool_name("openai.chatgpt-web", "configure"),
-            arguments: serde_json::json!({"action":"inspect"}),
-            result: serde_json::json!({"configuration":{"runState":state}}).to_string(),
-        }
-    }
-    #[test]
-    fn active_setup_requires_phase_delivery_but_a_handoff_allows_discussion_to_finish() {
-        assert!(setup_phase_recovery_prompt(&[receipt("running")]).is_some());
-        for state in [
-            "waiting_user",
-            "paused",
-            "blocked",
-            "completed",
-            "cancelled",
-        ] {
-            assert!(
-                setup_phase_recovery_prompt(&[receipt("running"), receipt(state)]).is_none(),
-                "{state}"
-            );
-        }
-    }
 }
 
 #[cfg(test)]

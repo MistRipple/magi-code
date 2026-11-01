@@ -185,8 +185,6 @@ fn snapshot_baseline_patch(
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct QueuedRegularSessionTurn {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub readiness: Option<crate::web_model_setup::SetupContinuation>,
     pub request: SessionTurnRequestDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_directories: Option<magi_core::ProjectDirectoryBinding>,
@@ -1374,26 +1372,6 @@ fn spawn_browser_control_sync(client: BrowserHostClient, control: BrowserSurface
     }
 }
 
-/// 最近一次 GPT Web 只读探测的结论。
-///
-/// 会话内模型选择器**只**按它决定是否投影固定的 GPT Web 入口（§9、W18）：没有探测结论、
-/// 或结论不是“已登录可用”时一律不投影，绝不用上一次结果占位。它只驻 daemon 进程内存，不落盘。
-#[derive(Clone, Debug)]
-pub struct WebModelProbeSnapshot {
-    /// 单次探测状态：`ok` / `login_required` / `site_blocked` / `selectors_drift` /
-    /// `desktop_unavailable`。
-    pub status: String,
-    pub account_hint: String,
-    pub probed_at: u64,
-}
-
-impl WebModelProbeSnapshot {
-    /// 该状态是否允许把 GPT Web 入口投影到会话内模型选择器（只有已登录且页面可用）。
-    pub fn is_visible_in_picker(&self) -> bool {
-        self.status == "ok"
-    }
-}
-
 /// 在后台执行一段需要 session Turn 锁的异步工作。
 ///
 /// TaskStore 状态回调可能运行在普通的提交后线程上，不能在没有 runtime 的线程里直接
@@ -1495,14 +1473,7 @@ pub struct ApiState {
     pub plugin_manager: Arc<Mutex<magi_plugin_system::PluginManager>>,
     /// 升级时执行插件数据格式转换的 Worker 执行者；未装配时需要转换的升级被拒绝。
     pub plugin_data_migrator: Option<Arc<dyn magi_plugin_system::PluginDataMigrator>>,
-    /// GPT Web 工具通道（OpenAI Tunnel 托管 + 槽位端点装配）。通道状态与槽位只驻进程内存。
-    pub web_model: Arc<crate::web_model_channel::WebModelChannelRuntime>,
-    /// 统一 Magi MCP 服务。GPT Web、OpenAI Tunnel 与其他 MCP 客户端都只能
-    /// 通过这一份服务进入工具运行时，不能再创建 GPT Web 专用的第二条工具链。
     pub(crate) mcp_service: Arc<crate::mcp_runtime::McpServiceRuntime>,
-    /// 最近一次 GPT Web 只读探测的结论：Web 引擎是否投影到会话内模型选择器的
-    /// 唯一判据（§5.5 fail closed、§5.11）。只驻内存，daemon 重启即清空。
-    web_model_probe: Arc<RwLock<Option<WebModelProbeSnapshot>>>,
     pub snapshot_manager: Arc<SnapshotManager>,
     pub conversation_registry: Arc<ConversationRegistry>,
     /// Session Turn 的单一生命周期所有者。只保存轻量身份与 attempt，不复制正文。
@@ -1860,49 +1831,6 @@ fn default_browser_authority(state_root: &Path) -> Result<BrowserAuthority, Brow
     Ok(authority)
 }
 
-/// Web 推理页是 daemon 进程内的绑定表和页面副本，不能作为 BrowserAuthority 的
-/// 可恢复事实落盘。主页仍然是应用级 durable Tab；只有由绑定键派生的推理页在重启
-/// 时被丢弃，下一次发送才会走「无绑定 + 全量重放」路径（A20）。
-const WEB_MODEL_INFERENCE_TAB_PREFIX: &str = "web-model-page-";
-
-fn is_web_model_inference_tab(tab_id: &magi_core::BrowserTabId) -> bool {
-    tab_id.as_str().starts_with(WEB_MODEL_INFERENCE_TAB_PREFIX)
-}
-
-fn strip_transient_web_model_tabs(mut durable: BrowserDurableState) -> (BrowserDurableState, bool) {
-    let app_session_ids = durable
-        .sessions
-        .iter()
-        .filter(|session| session.owner.is_app())
-        .map(|session| session.browser_session_id.clone())
-        .collect::<HashSet<_>>();
-    let removed_tab_ids = durable
-        .tabs
-        .iter()
-        .filter(|tab| {
-            app_session_ids.contains(&tab.browser_session_id)
-                && is_web_model_inference_tab(&tab.tab_id)
-        })
-        .map(|tab| tab.tab_id.clone())
-        .collect::<HashSet<_>>();
-    if removed_tab_ids.is_empty() {
-        return (durable, false);
-    }
-
-    durable.sessions.iter_mut().for_each(|session| {
-        session
-            .tab_ids
-            .retain(|tab_id| !removed_tab_ids.contains(tab_id))
-    });
-    durable
-        .tabs
-        .retain(|tab| !removed_tab_ids.contains(&tab.tab_id));
-    durable
-        .annotations
-        .retain(|annotation| !removed_tab_ids.contains(&annotation.tab_id));
-    (durable, true)
-}
-
 /// 浏览器物理控制的串行化按 Tab 进行：同一页面上的接管、导航、关闭与代理控制同步
 /// 互斥，不同页面互不阻塞，一条慢的 Host 命令不会拖住其他会话。
 #[derive(Clone, Default)]
@@ -1984,7 +1912,7 @@ pub(crate) fn commit_browser_authority_mutation<T>(
 }
 
 fn browser_durable_state_for_persistence(authority: &BrowserAuthority) -> BrowserDurableState {
-    strip_transient_web_model_tabs(authority.durable_state()).0
+    authority.durable_state()
 }
 
 fn parse_browser_durable_state(bytes: &[u8]) -> Result<BrowserDurableState, String> {
@@ -2031,13 +1959,10 @@ fn load_browser_authority(
         Err(error) => return Err(Box::new(error)),
     };
     let (restored, stripped_transient_tabs) = match parse_browser_durable_state(&bytes) {
-        Ok(durable) => {
-            let (durable, stripped) = strip_transient_web_model_tabs(durable);
-            (
-                BrowserAuthority::restore_durable(durable, UtcMillis::now()),
-                stripped,
-            )
-        }
+        Ok(durable) => (
+            BrowserAuthority::restore_durable(durable, UtcMillis::now()),
+            false,
+        ),
         Err(error) => {
             tracing::warn!(
                 path = %path.display(),
@@ -2117,49 +2042,6 @@ fn browser_authority_api_error(error: BrowserAuthorityError) -> ApiError {
 }
 
 impl ApiState {
-    /// 工具服务只捕获共享权威服务；切断 ToolRegistry/dispatcher 的反向引用。
-    pub fn web_model_setup_service_state(&self) -> Self {
-        let mut state = self.clone();
-        state.tool_registry = None;
-        state.execution_pipeline = None;
-        state.skill_dispatch_runtime = None;
-        state.session_turn_dispatcher = None;
-        state.runner_manager = None;
-        state.execution_resources = ExecutionResourceCoordinator::new(
-            state.browser_authority.clone(),
-            state.browser_write_lock.clone(),
-            state.browser_host_client.clone(),
-            state.event_bus.clone(),
-        );
-        state
-    }
-    /// GPT Web 的原生宿主只能在第一方插件的应用实例激活后使用。
-    /// 这是 daemon 侧的准入事实，UI 隐藏入口不能替代它。
-    pub(crate) fn web_model_plugin_active(&self) -> bool {
-        self.plugin_active(magi_web_model::WEB_MODEL_PLUGIN_ID)
-    }
-
-    /// GPT Web 配置能力：插件已安装、启用、授权并激活，且清单贡献了配置 Skill。
-    /// 设置入口、配置 API 和配置执行都以这一个事实为准。
-    pub(crate) fn web_model_setup_available(&self) -> bool {
-        if !self.web_model_plugin_active() {
-            return false;
-        }
-        self.plugin_manager.lock().ok().is_some_and(|manager| {
-            manager
-                .package(magi_web_model::WEB_MODEL_PLUGIN_ID)
-                .map(|package| {
-                    package
-                        .manifest()
-                        .contributions
-                        .skills
-                        .iter()
-                        .any(|skill| skill.id == "gpt-web-setup")
-                })
-                .unwrap_or(false)
-        })
-    }
-
     /// Magi MCP 服务（对外开放工具）只能在第一方插件的应用实例激活后使用。
     pub(crate) fn mcp_server_plugin_active(&self) -> bool {
         self.plugin_active(crate::bundled_plugins::MCP_SERVER_PLUGIN_ID)
@@ -2175,77 +2057,6 @@ impl ApiState {
                     .ok()
             })
             .unwrap_or(false)
-    }
-
-    /// 记录一次只读探测结论（唯一投影来源，§5.11）。
-    pub(crate) fn record_web_model_probe(&self, snapshot: WebModelProbeSnapshot) {
-        *self
-            .web_model_probe
-            .write()
-            .expect("web model probe lock poisoned") = Some(snapshot);
-    }
-
-    /// 清除探测结论（退出登录、清除 Web 数据）：立即隐藏 Web 模型（§5.13）。
-    pub(crate) fn forget_web_model_probe(&self) {
-        *self
-            .web_model_probe
-            .write()
-            .expect("web model probe lock poisoned") = None;
-    }
-
-    pub(crate) fn web_model_probe_snapshot(&self) -> Option<WebModelProbeSnapshot> {
-        self.web_model_probe
-            .read()
-            .expect("web model probe lock poisoned")
-            .clone()
-    }
-
-    /// 会话内主模型选择器看到的 GPT Web 入口（W18）。
-    ///
-    /// 未登录或探测未完成时为空；登录后只有**一个固定入口** `plugin/openai.chatgpt-web/default`，不复制网页的模型菜单。
-    /// 工具能力单独投影：它是可选增强，通道不可用时入口照常可用，只是没有项目工具并说明缺什么。
-    pub fn web_model_picker_engines(&self) -> Vec<serde_json::Value> {
-        let plugin_ready = self
-            .plugin_manager
-            .lock()
-            .ok()
-            .and_then(|manager| {
-                manager
-                    .is_active_for_scope(
-                        magi_web_model::WEB_MODEL_PLUGIN_ID,
-                        magi_plugin_system::APPLICATION_SCOPE,
-                    )
-                    .ok()
-            })
-            .unwrap_or(false);
-        if !plugin_ready {
-            return Vec::new();
-        }
-        let Some(probe) = self.web_model_probe_snapshot() else {
-            return Vec::new();
-        };
-        if !probe.is_visible_in_picker() {
-            return Vec::new();
-        }
-        let channel = self.web_model.channel().get();
-        let tools = if channel.ready {
-            serde_json::json!({ "available": true })
-        } else {
-            serde_json::json!({
-                "available": false,
-                "code": "web_tunnel_unavailable",
-                "detail": channel.detail,
-            })
-        };
-        vec![serde_json::json!({
-            "id": magi_web_model::WEB_MODEL_ENGINE_ID,
-            "displayName": "GPT Web",
-            "apiProtocol": "chatgpt_web",
-            "origin": { "kind": "web", "accountHint": probe.account_hint },
-            "status": "available",
-            "tools": tools,
-            "probedAt": probe.probed_at,
-        })]
     }
 }
 
@@ -2433,9 +2244,7 @@ impl ApiState {
                 .expect("in-memory ApiState plugin manager should initialize"),
             )),
             plugin_data_migrator: None,
-            web_model: Arc::new(crate::web_model_channel::WebModelChannelRuntime::new()),
             mcp_service: Arc::new(crate::mcp_runtime::McpServiceRuntime::in_memory()),
-            web_model_probe: Arc::new(RwLock::new(None)),
             snapshot_manager: Arc::new(SnapshotManager::new()),
             conversation_registry,
             turn_coordinator,
@@ -3947,14 +3756,6 @@ impl ApiState {
             }
         }
         self
-    }
-
-    /// daemon 组装完工具运行时后调用。已显式开启的 MCP 服务在重启后恢复，
-    /// 失败只保留可诊断的关闭状态，不阻塞主 daemon 启动。
-    /// 进程退出前停掉对外通道：GPT Web 的 OpenAI Tunnel 由厂商 CLI 以脱离进程的托管运行时
-    /// 持有，不在 daemon 的子进程树里，只能显式发停止命令。
-    pub async fn shutdown_external_channels(&self) {
-        self.web_model.shutdown(self).await;
     }
 
     /// 只有 MCP 服务插件已激活才按已保存的配置恢复监听；daemon 启动与插件激活共用此入口。
@@ -5478,12 +5279,6 @@ impl ApiState {
         });
         inputs
             .into_iter()
-            .filter(|input| {
-                serde_json::from_value::<QueuedRegularSessionTurn>(input.payload.clone())
-                    .ok()
-                    .and_then(|turn| turn.readiness)
-                    .is_none_or(|readiness| self.setup_continuation_ready(&readiness))
-            })
             .map(|input| {
                 serde_json::from_value(input.payload).expect("validated queued input payload")
             })
@@ -5624,8 +5419,6 @@ impl ApiState {
                 .await
                 .map_err(|error| ApiError::internal_assembly("删除会话时停止执行失败", error))?;
         }
-        // 会话持有 GPT Web 槽位时一并释放，避免槽位悬挂在已不存在的会话上。
-        self.release_web_slot_for_session(session_id).await;
         self.close_browser_session_for_magi_session(session_id)
             .await?;
         self.remove_browser_artifacts_for_session(session_id);
@@ -6495,7 +6288,6 @@ mod tests {
         accepted_at: u64,
     ) -> QueuedRegularSessionTurn {
         QueuedRegularSessionTurn {
-            readiness: None,
             project_directories: None,
             request: SessionTurnRequestDto {
                 source_folder_id: None,
@@ -8285,97 +8077,6 @@ mod tests {
                 "{name}: browser recovery must not enter Failed"
             );
         }
-    }
-
-    #[test]
-    fn browser_restart_drops_web_bindings_and_transient_inference_tabs_but_keeps_home_tab() {
-        let root = tempfile::tempdir().expect("browser state root should create");
-        let state = state_for_browser_persistence_test(root.path());
-        let now = UtcMillis(100);
-        let app_session_id = magi_core::BrowserSessionId::new("browser-session-app-restart");
-        let home_tab_id = magi_core::BrowserTabId::new("browser-tab-web-model-home");
-        let inference_tab_id = magi_core::BrowserTabId::new("web-model-page-restart-epoch-1");
-
-        state
-            .mutate_browser_authority(|authority| {
-                authority.create_session(magi_browser_authority::CreateBrowserSession {
-                    browser_session_id: app_session_id.clone(),
-                    owner: magi_browser_authority::BrowserSessionOwner::App,
-                    profile_id: BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID),
-                    now,
-                })?;
-                authority.transition_session(
-                    &app_session_id,
-                    BrowserSessionLifecycle::Ready,
-                    now,
-                )?;
-                authority.create_tab(magi_browser_authority::CreateBrowserTab {
-                    tab_id: home_tab_id.clone(),
-                    browser_session_id: app_session_id.clone(),
-                    url: magi_web_model::chatgpt_web_home_url(),
-                    now,
-                })?;
-                authority.transition_tab(
-                    &home_tab_id,
-                    magi_browser_authority::BrowserTabLifecycle::Ready,
-                    now,
-                )?;
-                authority.create_tab(magi_browser_authority::CreateBrowserTab {
-                    tab_id: inference_tab_id.clone(),
-                    browser_session_id: app_session_id.clone(),
-                    url: magi_web_model::chatgpt_web_temporary_chat_url(),
-                    now,
-                })?;
-                authority.transition_tab(
-                    &inference_tab_id,
-                    magi_browser_authority::BrowserTabLifecycle::Ready,
-                    now,
-                )?;
-                Ok(())
-            })
-            .expect("app session and web tabs should create");
-        state
-            .persist_browser_durable_state()
-            .expect("browser state should persist");
-
-        // This is the restart boundary: bindings are intentionally not loaded from any file,
-        // and the durable BrowserAuthority input contains only the app/home pointer after the
-        // next state is constructed.
-        let restarted = state_for_browser_persistence_test(root.path());
-        let authority = restarted
-            .browser_authority
-            .lock()
-            .expect("browser authority lock should hold");
-        let app_session = authority
-            .app_session()
-            .expect("app session should survive restart");
-        assert_eq!(app_session.browser_session_id, app_session_id);
-        assert!(
-            authority.tab(&home_tab_id).is_some(),
-            "home tab must survive restart"
-        );
-        assert!(
-            authority.tab(&inference_tab_id).is_none(),
-            "transient Web inference page must not be reused after restart"
-        );
-        drop(authority);
-
-        let persisted: BrowserDurableState = serde_json::from_slice(
-            &fs::read(root.path().join("browser/state.json"))
-                .expect("state should remain readable"),
-        )
-        .expect("state after restart should parse");
-        assert!(
-            persisted
-                .tabs
-                .iter()
-                .all(|tab| tab.tab_id != inference_tab_id),
-            "restart persistence must not reintroduce the transient inference page"
-        );
-        assert!(
-            !root.path().join("web-model-bindings.json").exists(),
-            "Web binding table must not be persisted"
-        );
     }
 
     #[tokio::test]

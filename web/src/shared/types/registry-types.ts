@@ -46,7 +46,7 @@ export interface ModelEngine {
    * 连接配置（baseUrl / apiKey / model）。
    */
   llm?: LLMConfig;
-  /** 协议标签；GPT Web 不是注册表引擎，这里只会是用户自填的 provider 协议。 */
+
   apiProtocol?: ModelApiProtocol;
   runtime?: {
     requestTimeoutMs?: number;

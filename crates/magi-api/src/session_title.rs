@@ -54,9 +54,6 @@ pub(crate) fn spawn_new_session_title_refinement(
     let session_id = session_id.clone();
     let first_message = first_message.to_string();
     let placeholder_title = placeholder_title.to_string();
-    // 辅助模型调用是同步阻塞的 HTTP：必须放进阻塞线程池（见 `refine_new_session_title_and_publish`），
-    // 不能在「独立线程 + Handle::block_on」里直接执行——那样会让整个异步运行时冻住数秒，
-    // 期间 Electron 收不到心跳回包而断开浏览器控制连接，正在进行的 GPT Web 回合随之失败。
     runtime_handle.spawn(refine_new_session_title_and_publish(
         state,
         session_id,

@@ -56,8 +56,7 @@ const DEFAULT_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const NAVIGATION_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const LONG_RUNNING_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const WAIT_FOR_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(62);
-// 网页端上传图片实测要十几秒；Worker 自己等待上传最多 60 秒，客户端要比它多留收口余量。
-const WEB_ATTACH_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
+
 // Worker 配置流程最多 90 秒，Desktop 允许 100 秒；Host 还需留出结果及取消结算余量。
 const CANCEL_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -371,9 +370,7 @@ fn request_timeout_for(command: &BrowserHostCommand, default: Duration) -> Durat
     if matches!(command, BrowserHostCommand::Navigate { .. }) {
         return default.max(NAVIGATION_BROWSER_HOST_REQUEST_TIMEOUT);
     }
-    if matches!(command, BrowserHostCommand::WebAttachFiles { .. }) {
-        return default.max(WEB_ATTACH_BROWSER_HOST_REQUEST_TIMEOUT);
-    }
+
     if matches!(
         command,
         BrowserHostCommand::Devtools { operation, .. }
@@ -722,18 +719,6 @@ mod tests {
         assert_eq!(
             request_timeout_for(&devtools("lighthouse"), Duration::from_secs(180)),
             Duration::from_secs(180)
-        );
-    }
-
-    #[test]
-    fn web_attach_outlasts_the_worker_upload_wait() {
-        let attach = BrowserHostCommand::WebAttachFiles {
-            tab_id: magi_core::BrowserTabId::new("test-tab"),
-            file_paths: vec!["/tmp/a.png".to_string()],
-        };
-        assert_eq!(
-            request_timeout_for(&attach, Duration::from_secs(30)),
-            Duration::from_secs(75)
         );
     }
 

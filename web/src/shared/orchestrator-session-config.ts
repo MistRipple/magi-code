@@ -1,16 +1,5 @@
 export type OrchestratorReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
 
-const CHATGPT_WEB_ENGINE_PREFIX = 'plugin/openai.chatgpt-web/';
-
-function isChatGptWebEngine(value: unknown): boolean {
-  return typeof value === 'string' && value.trim().startsWith(CHATGPT_WEB_ENGINE_PREFIX);
-}
-
-/** The GPT Web engine uses `default` as an internal family placeholder. */
-function isProviderPlaceholderModel(value: unknown): boolean {
-  return typeof value === 'string' && value.trim().toLowerCase() === 'default';
-}
-
 
 export function normalizeOrchestratorReasoningEffort(
   value: unknown,
@@ -34,7 +23,6 @@ export function resolveOrchestratorReasoningEffort(
 export function resolveOrchestratorModel(
   sessionConfig: Record<string, unknown> | null | undefined,
   effectiveConfig: Record<string, unknown> | null | undefined,
-  providerModels: readonly string[] = [],
 ): string {
   const candidates = [
     sessionConfig?.model,
@@ -43,12 +31,6 @@ export function resolveOrchestratorModel(
   for (const candidate of candidates) {
     if (typeof candidate === 'string' && candidate.trim()) {
       const model = candidate.trim();
-      if (isProviderPlaceholderModel(model)
-        && !isChatGptWebEngine(sessionConfig?.engineId)
-        && effectiveConfig?.apiProtocol !== 'chatgpt_web'
-        && !providerModels.includes(model)) {
-        continue;
-      }
       return model;
     }
   }
@@ -75,12 +57,8 @@ export function copyOrchestratorSessionConfig(
   sessionConfig: Record<string, unknown> | null | undefined,
   effectiveConfig: Record<string, unknown> | null | undefined,
 ): Record<string, unknown> {
-  const sourceUsesWebEngine = isChatGptWebEngine(sessionConfig?.engineId)
-    || effectiveConfig?.apiProtocol === 'chatgpt_web';
-  const model = sourceUsesWebEngine ? '' : resolveOrchestratorModel(sessionConfig, effectiveConfig);
-  const reasoningEffort = sourceUsesWebEngine
-    ? null
-    : resolveOrchestratorReasoningEffort(sessionConfig, effectiveConfig);
+  const model = resolveOrchestratorModel(sessionConfig, effectiveConfig);
+  const reasoningEffort = resolveOrchestratorReasoningEffort(sessionConfig, effectiveConfig);
   return {
     ...(model ? { model } : {}),
     reasoningEffort,

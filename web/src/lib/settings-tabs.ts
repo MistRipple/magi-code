@@ -11,7 +11,6 @@ export type SettingsTabId =
   | 'appearance'
   | 'project'
   | 'plugins'
-  | 'webModel'
   | 'mcpServer';
 
 export interface SettingsTabDefinition {
@@ -35,6 +34,5 @@ export const SETTINGS_TABS: readonly SettingsTabDefinition[] = [
   { id: 'appearance', icon: 'sparkles', titleKey: 'settings.zone.appearance', descKey: 'settings.zone.appearanceDesc' },
   { id: 'project', icon: 'git-branch', titleKey: 'settings.zone.project', descKey: 'settings.zone.projectDesc' },
   { id: 'plugins', icon: 'settings', titleKey: 'settings.zone.plugins', descKey: 'settings.zone.pluginsDesc' },
-  { id: 'webModel', icon: 'globe', titleKey: 'settings.zone.webModel', descKey: 'settings.zone.webModelDesc', requiresPlugin: 'openai.chatgpt-web' },
   { id: 'mcpServer', icon: 'plug', titleKey: 'settings.zone.mcpServer', descKey: 'settings.zone.mcpServerDesc', requiresPlugin: 'magi.mcp-server' },
 ];

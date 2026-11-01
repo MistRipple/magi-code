@@ -223,7 +223,7 @@ await withGoldenViteServer(async (server) => {
   assert.doesNotMatch(browserSource, /\.toolbar-edge-button\[data-tooltip\]::after/u);
   assert.match(browserSource, /\.browser-surface-slot \{[\s\S]*display: flex;[\s\S]*flex: 1;[\s\S]*overflow: hidden;/u);
   assert.match(browserSource, /\.browser-webview \{[\s\S]*width: 100%;[\s\S]*height: 100%;/u);
-  assert.match(browserSource, /\{#if mobileEmulation && !appLevelSurface\}[\s\S]*class="viewport-toolbar"/u);
+  assert.match(browserSource, /\{#if mobileEmulation\}[\s\S]*class="viewport-toolbar"/u);
   assert.match(browserSource, /\{#if actionsMenuOpen\}[\s\S]*class="browser-actions-popover"/u);
   assert.match(browserSource, /\.annotation-editor \{[\s\S]*top: calc\(anchor\(bottom\) - 12px\);[\s\S]*transform: translateY\(-100%\)/u);
   assert.match(browserSource, /\.browser-download-panel \{[\s\S]*top: calc\(anchor\(bottom\) - 10px\);[\s\S]*transform: translateY\(-100%\)/u);
@@ -242,41 +242,6 @@ await withGoldenViteServer(async (server) => {
   );
   assert.doesNotMatch(browserSource, /transform:\s*scale\(|object-fit:\s*(?:fill|cover)/u);
 
-  // 应用级 GPT Web Tab（A2 / A4 / A25、设计基线 §5.2）
-  assert.equal(rightPane.rightPaneState.appTabs.length, 0);
-  rightPane.activateRightPaneSession('workspace-golden', 'session-golden');
-  const homeHost = {
-    tabId: 'browser-tab-web-model-home',
-    lifecycle: 'ready',
-    url: 'https://chatgpt.com/',
-    navigationRevision: 3,
-  };
-  // 启动 / 重启时由 daemon 投影挂载宿主：标签默认隐藏，右栏保持为空，直到用户主动打开。
-  rightPane.synchronizeWebModelAppSession('browser-session-app-1-0', homeHost, [homeHost]);
-  assert.equal(rightPane.rightPaneState.appTabs.length, 1);
-  assert.equal(rightPane.appWebModelTab().payload.viewHidden, true);
-  assert.equal(rightPane.rightPaneState.activeAppTabId, null);
-  rightPane.openWebModelTab('browser-session-app-1-0', homeHost);
-  assert.equal(rightPane.rightPaneState.appTabs.length, 1);
-  assert.equal(rightPane.rightPaneState.activeAppTabId, 'webSession:app');
-  assert.equal(rightPane.appWebModelTab().kind, 'webSession');
-  // 应用级 Tab 不得进入会话级容器，否则会被持久化并在切换会话时丢失。
-  const sessionPane = rightPane.getRightPaneState('session-golden');
-  assert.equal(
-    sessionPane.openTabs.some((tab) => tab.kind === 'webSession'),
-    false,
-  );
-  // 关闭按钮只隐藏视图：保留挂载、保留对话实例指针，不取消推理。
-  rightPane.hideWebModelTabView();
-  assert.equal(rightPane.rightPaneState.appTabs.length, 1);
-  assert.equal(rightPane.appWebModelTab().payload.viewHidden, true);
-  assert.equal(rightPane.rightPaneState.activeAppTabId, null);
-  // 重新打开是激活既有视图，不新建。
-  rightPane.activateWebModelTab();
-  assert.equal(rightPane.rightPaneState.appTabs.length, 1);
-  assert.equal(rightPane.appWebModelTab().payload.viewHidden, false);
-  assert.equal(rightPane.rightPaneState.activeAppTabId, 'webSession:app');
-  // 切换项目 / 会话不动 appTabs（A2）。
   // 草稿里打开了右栏，发出第一条消息得到真实会话 id 后右栏必须保持展开，标签也跟过去。
   // 草稿没有会话 id（空串），右栏状态挂在项目作用域上；草稿被固定为真实会话时显式交接。
   rightPane.activateRightPaneSession('workspace-draft', '');
@@ -324,73 +289,5 @@ await withGoldenViteServer(async (server) => {
   assert.equal(rightPane.getRightPaneState('personal').collapsed, false);
 
   rightPane.activateRightPaneSession('workspace-other', 'session-other');
-  assert.equal(rightPane.rightPaneState.appTabs.length, 1);
-  assert.equal(rightPane.rightPaneState.activeAppTabId, 'webSession:app');
-  // 幂等：同 kind 同 key 只激活既有视图。
-  rightPane.openWebModelTab('browser-session-app-1-0', homeHost);
-  assert.equal(rightPane.rightPaneState.appTabs.length, 1);
-  // Tab 条顺序：GPT Web 排在它显示那一刻最后一个 Tab 之后，之后新开的 Tab 继续往右叠加。
-  rightPane.synchronizeWebModelAppSession(null, null);
-  rightPane.activateRightPaneSession('workspace-order', 'session-order');
-  rightPane.synchronizeWebModelAppSession('browser-session-app-1-0', homeHost, [homeHost]);
-  rightPane.openCodeTab('session-order', '/tmp/first.txt', { label: 'first', workspaceId: 'workspace-order' });
-  rightPane.openWebModelTab('browser-session-app-1-0', homeHost);
-  rightPane.openCodeTab('session-order', '/tmp/second.txt', { label: 'second', workspaceId: 'workspace-order' });
-  rightPane.openCodeTab('session-order', '/tmp/third.txt', { label: 'third', workspaceId: 'workspace-order' });
-  const orderScope = rightPane.rightPaneState.activeScopeKey;
-  const labels = () => rightPane
-    .orderPaneTabsForDisplay(rightPane.getRightPaneState(orderScope).openTabs, rightPane.rightPaneState.appTabs)
-    .map((tab) => tab.kind === 'webSession' ? 'web' : tab.label);
-  assert.deepEqual(labels(), ['first', 'web', 'second', 'third']);
-  // 隐藏后重新显示：位置重新固定在当时最后一个 Tab 之后。
-  rightPane.hideWebModelTabView();
-  rightPane.activateWebModelTab();
-  assert.deepEqual(labels(), ['first', 'second', 'third', 'web']);
-  // 应用级会话消失时释放视图指针。
-  rightPane.synchronizeWebModelAppSession(null, null);
-  assert.equal(rightPane.rightPaneState.appTabs.length, 0);
-  assert.equal(rightPane.rightPaneState.activeAppTabId, null);
-
-  // GPT Web 视图激活时，用户点击打开的任意会话级 Tab（浏览器、文件、终端）都要离开应用级
-  // 视图，否则 Tab 只进 Tab 条而内容槽仍停在 GPT Web。视图本身保持挂载。
-  rightPane.activateRightPaneSession('workspace-leave', 'session-leave');
-  rightPane.synchronizeWebModelAppSession('browser-session-app-1-0', homeHost, [homeHost]);
-  for (const open of [
-    () => rightPane.openBrowserTab('browser-session-leave', 'browser-tab-leave', {
-      workspaceId: 'workspace-leave',
-      sessionId: 'session-leave',
-      url: 'https://example.com/',
-    }),
-    () => rightPane.openCodeTab('session-leave', '/tmp/leave.txt', { workspaceId: 'workspace-leave' }),
-    () => rightPane.openTerminalTab({ workspaceId: 'workspace-leave', sessionId: 'session-leave' }),
-  ]) {
-    rightPane.openWebModelTab('browser-session-app-1-0', homeHost);
-    assert.equal(rightPane.rightPaneState.activeAppTabId, 'webSession:app');
-    open();
-    assert.equal(rightPane.rightPaneState.activeAppTabId, null);
-    assert.equal(rightPane.rightPaneState.appTabs.length, 1, '离开应用级视图不销毁宿主');
-  }
-  // Authority 同步（activate=false）不是用户意图，不能抢走应用级视图。
-  rightPane.openWebModelTab('browser-session-app-1-0', homeHost);
-  rightPane.synchronizeBrowserTabs('workspace-leave', '/tmp', 'session-leave', {
-    browserSessionId: 'browser-session-sync',
-    revision: 1,
-    agentOccupied: false,
-    activeTabId: 'browser-tab-sync',
-    tabs: [{
-      tabId: 'browser-tab-sync',
-      lifecycle: 'ready',
-      url: 'https://example.org/',
-      title: 'Sync',
-      navigationRevision: 1,
-    }],
-  });
-  assert.equal(
-    rightPane.rightPaneState.activeAppTabId,
-    'webSession:app',
-    'Authority 同步不得夺走应用级视图',
-  );
-  rightPane.synchronizeWebModelAppSession(null, null);
-
   console.log('right pane golden replay passed');
 });

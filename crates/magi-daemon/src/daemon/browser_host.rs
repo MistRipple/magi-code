@@ -197,18 +197,6 @@ pub(super) fn start_controller(state: &ApiState, lifecycle: &BrowserHostControll
         return;
     };
 
-    // 通道配置只保存 Tunnel id 与权限档（API 密钥在 state root 下的私有文件里），运行态
-    // 不落盘。daemon 重启后必须从 settings 重新装配 harness / tunnel；否则首个
-    // Web turn 会在通道仍是默认 `none` 时静默降到 T2，用户必须再次打开设置页
-    // 才能恢复 T3。恢复只针对 GPT Web 插件已激活的情形（见 `restore_configured_channel`），
-    // 且只启动用户已经明确配置过的通道。
-    if state.runtime_persistence().is_some() {
-        let state = state.clone();
-        handle.spawn(async move {
-            magi_api::restore_configured_channel(&state).await;
-        });
-    }
-
     let state = state.clone();
     handle.spawn(monitor_desktop_parent_process(
         state.clone(),
@@ -801,9 +789,7 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
             }
         }
         BrowserHostEvent::UserTakeover { binding } => {
-            if is_current_primary_binding(state, &binding) {
-                state.notify_web_model_setup_takeover(&binding.tab_id);
-            }
+            if is_current_primary_binding(state, &binding) {}
             // 用户直接操作页面后由用户保持控制：代理不能在用户未交还前自动抢回。
             revoke_surface_control(
                 state,
@@ -1169,7 +1155,6 @@ fn browser_tab_context(state: &ApiState, tab_id: &BrowserTabId) -> Option<Browse
     let session = authority.session(&tab.browser_session_id)?;
     Some(BrowserTabContext {
         workspace_id: session.owner_workspace_id().cloned(),
-        // 应用级（GPT Web）Tab 不属于任何 Magi 会话，不参与会话级事件投影。
         session_id: session.magi_session_id()?.clone(),
     })
 }
@@ -1349,7 +1334,6 @@ fn suspend_browser_sessions_for_host_disconnect(state: &ApiState) -> Vec<Browser
 fn interrupt_all_tasks_for_daemon_shutdown(state: &ApiState) {
     let sessions = suspend_browser_sessions_for_host_disconnect(state);
     for browser_session in sessions {
-        // 应用级（GPT Web）会话没有归属会话与 Turn，不参与 Turn 收口。
         let Some(session_id) = browser_session.magi_session_id().cloned() else {
             continue;
         };

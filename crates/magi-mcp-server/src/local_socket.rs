@@ -48,17 +48,15 @@ pub fn local_endpoint_for(state_root: &Path) -> PathBuf {
 pub struct StdioRelay;
 
 impl StdioRelay {
-    /// `token = None` 用于“槽位端点”：该端点不做令牌握手，调用方身份由 daemon 按槽位事实决定。
-    pub async fn run(endpoint: &Path, token: Option<&str>) -> std::io::Result<()> {
+    pub async fn run(endpoint: &Path, token: &str) -> std::io::Result<()> {
         let stream = imp::connect(endpoint).await?;
         let (mut socket_read, mut socket_write) = tokio::io::split(stream);
-        if let Some(token) = token {
-            let mut handshake = serde_json::to_vec(&json!({ "magiMcpToken": token }))
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-            handshake.push(b'\n');
-            socket_write.write_all(&handshake).await?;
-            socket_write.flush().await?;
-        }
+
+        let mut handshake = serde_json::to_vec(&json!({ "magiMcpToken": token }))
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        handshake.push(b'\n');
+        socket_write.write_all(&handshake).await?;
+        socket_write.flush().await?;
 
         let mut stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
@@ -121,33 +119,10 @@ impl LocalSocketServer {
     }
 }
 
-/// 调用方身份由宿主按“当前事实”动态给出（例如 GPT Web 槽位的拥有者）。
-/// 返回 `None` 表示此刻没有可用的身份，该请求被拒绝。
-pub type PrincipalProvider = Arc<dyn Fn() -> Option<ClientPrincipal> + Send + Sync>;
-
-/// 本地 socket 的认证方式。
-#[derive(Clone)]
-pub enum SocketAuth {
-    /// 连接后先发一行令牌握手，之后**每条请求**重新认证（令牌端点）。
-    Token(Arc<TokenStore>),
-    /// 不做握手，身份由宿主按当前事实动态给出（槽位端点）。
-    /// 端点仍然只有当前 OS 用户可访问；它不接受也不签发令牌。
-    Principal(PrincipalProvider),
-}
-
-/// 启动令牌端点（连接后先握手令牌）。
+/// 启动 daemon 侧的本地 socket 监听（仅当前用户可访问）。
 pub async fn serve_local_socket(
     server: Arc<McpServer>,
     tokens: Arc<TokenStore>,
-    endpoint: PathBuf,
-) -> std::io::Result<LocalSocketServer> {
-    serve_local_socket_with_auth(server, SocketAuth::Token(tokens), endpoint).await
-}
-
-/// 启动 daemon 侧的本地 socket 监听（仅当前用户可访问）。
-pub async fn serve_local_socket_with_auth(
-    server: Arc<McpServer>,
-    auth: SocketAuth,
     endpoint: PathBuf,
 ) -> std::io::Result<LocalSocketServer> {
     let mut listener = imp::bind(&endpoint).await?;
@@ -163,10 +138,10 @@ pub async fn serve_local_socket_with_auth(
                 accepted = imp::accept(&mut listener) => {
                     let Ok(stream) = accepted else { break };
                     let server = Arc::clone(&server);
-                    let auth = auth.clone();
+                    let tokens = tokens.clone();
                     let connections = stream_connections.clone();
                     streams.spawn(async move {
-                        let _ = serve_stream(stream, server, auth, connections).await;
+                        let _ = serve_stream(stream, server, tokens, connections).await;
                     });
                 }
             }
@@ -198,7 +173,7 @@ impl Drop for ConnectedStream {
 async fn serve_stream<S>(
     stream: S,
     server: Arc<McpServer>,
-    auth: SocketAuth,
+    tokens: Arc<TokenStore>,
     connections: Arc<AtomicUsize>,
 ) -> std::io::Result<()>
 where
@@ -210,23 +185,15 @@ where
     let scope = server.connection_scope();
 
     // 令牌端点：第一行必须是令牌握手。失败统一回 unauthorized 并关闭，不区分原因。
-    let secret = match &auth {
-        SocketAuth::Token(tokens) => {
-            let secret = match read_bounded_line(&mut reader, MAX_HANDSHAKE_BYTES).await? {
-                Some(line) => serde_json::from_slice::<Value>(&line)
-                    .ok()
-                    .and_then(|value| value.get("magiMcpToken")?.as_str().map(str::to_string)),
-                None => None,
-            };
-            let Some(secret) =
-                secret.filter(|secret| tokens.authenticate(secret, now_ms()).is_ok())
-            else {
-                write_line(&writer, &json!({ "error": "unauthorized" })).await?;
-                return Ok(());
-            };
-            Some(secret)
-        }
-        SocketAuth::Principal(_) => None,
+    let secret = match read_bounded_line(&mut reader, MAX_HANDSHAKE_BYTES).await? {
+        Some(line) => serde_json::from_slice::<Value>(&line)
+            .ok()
+            .and_then(|v| v.get("magiMcpToken")?.as_str().map(str::to_string)),
+        None => None,
+    };
+    let Some(secret) = secret.filter(|secret| tokens.authenticate(secret, now_ms()).is_ok()) else {
+        write_line(&writer, &json!({"error":"unauthorized"})).await?;
+        return Ok(());
     };
 
     connections.fetch_add(1, Ordering::Relaxed);
@@ -237,36 +204,17 @@ where
         if line.is_empty() {
             continue;
         }
-        // 每条请求都重新认证 / 重新取身份：吊销、过期、权限档与槽位变更立即生效。
         let now = now_ms();
-        let principal = match (&auth, &secret) {
-            (SocketAuth::Token(tokens), Some(secret)) => match tokens.authenticate(secret, now) {
-                Ok(record) => ClientPrincipal::from(&record),
-                Err(_) => {
-                    write_line(
-                        &writer,
-                        &error(Value::Null, JSONRPC_UNAUTHORIZED, "令牌已失效"),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            },
-            (SocketAuth::Principal(provider), _) => match provider() {
-                Some(principal) => principal,
-                None => {
-                    // 没有可用身份（例如槽位已释放）：该请求失败，连接保持，下一条请求重新判定。
-                    let id = serde_json::from_str::<JsonRpcRequest>(&line)
-                        .map(|request| request.response_id())
-                        .unwrap_or(Value::Null);
-                    write_line(
-                        &writer,
-                        &error(id, JSONRPC_UNAUTHORIZED, "当前没有可用的调用身份"),
-                    )
-                    .await?;
-                    continue;
-                }
-            },
-            (SocketAuth::Token(_), None) => return Ok(()),
+        let principal = match tokens.authenticate(&secret, now) {
+            Ok(record) => ClientPrincipal::from(&record),
+            Err(_) => {
+                write_line(
+                    &writer,
+                    &error(Value::Null, JSONRPC_UNAUTHORIZED, "令牌已失效"),
+                )
+                .await?;
+                return Ok(());
+            }
         };
         let server = Arc::clone(&server);
         let writer = Arc::clone(&writer);
@@ -442,7 +390,7 @@ mod tests {
     use super::*;
     use crate::catalog::{ToolSchema, ToolSchemaProvider};
     use crate::path_guard::PathRequest;
-    use crate::profile::{ApprovalMode, Profile};
+    use crate::profile::ApprovalMode;
     use crate::server::{
         BoxFuture, InvocationOutcome, ToolBackend, ToolInvocation, WorkspaceResolver,
     };
@@ -520,25 +468,32 @@ mod tests {
             Arc::new(CancellableBackend(sender)),
             Arc::new(Root),
         ));
-        let principal = ClientPrincipal {
-            project_directories: None,
-            token_id: "client".into(),
-            token_prefix: "prefix".into(),
-            client_name: "test".into(),
-            workspace_id: "workspace".into(),
-            profile: Profile::Exec,
-            approval_mode: ApprovalMode::Always,
-            attribution: AttributionMode::External,
-        };
+        let tokens = Arc::new(TokenStore::new());
+        let issued = tokens
+            .issue(
+                IssueTokenRequest {
+                    project_directories: None,
+                    client_name: "test".into(),
+                    workspace_id: "workspace".into(),
+                    approval_mode: ApprovalMode::Always,
+                    attribution: AttributionMode::External,
+                    ttl_ms: None,
+                    network: false,
+                },
+                now_ms(),
+            )
+            .unwrap();
         for disconnect in [false, true] {
             let (mut client, stream) = tokio::io::duplex(4096);
-            let principal = principal.clone();
+
             let serving = tokio::spawn(serve_stream(
                 stream,
                 server.clone(),
-                SocketAuth::Principal(Arc::new(move || Some(principal.clone()))),
+                tokens.clone(),
                 Arc::new(AtomicUsize::new(0)),
             ));
+            let handshake = format!("{}\n", json!({ "magiMcpToken": issued.secret }));
+            client.write_all(handshake.as_bytes()).await.unwrap();
             client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"magi.fs.read\"}}\n").await.unwrap();
             if !disconnect {
                 client.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n").await.unwrap();
@@ -753,84 +708,5 @@ mod tests {
         assert_ne!(endpoint, local_endpoint_for(Path::new("/other")));
         assert!(!endpoint.to_string_lossy().contains("alice"));
         assert!(endpoint.to_string_lossy().len() < 100);
-    }
-
-    #[tokio::test]
-    async fn principal_endpoint_needs_no_handshake_and_follows_the_provider_per_request() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static SEQ2: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "mms-slot-{}-{}",
-            std::process::id() % 100_000,
-            SEQ2.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let endpoint = dir.join("slot.sock");
-        let available = Arc::new(AtomicBool::new(false));
-        let provider: PrincipalProvider = {
-            let available = available.clone();
-            Arc::new(move || {
-                available.load(Ordering::SeqCst).then(|| ClientPrincipal {
-                    project_directories: None,
-                    token_id: "web-slot".to_string(),
-                    token_prefix: "web-slot".to_string(),
-                    client_name: "GPT Web".to_string(),
-                    workspace_id: "ws".to_string(),
-                    profile: Profile::Edit,
-                    approval_mode: ApprovalMode::Ask,
-                    attribution: AttributionMode::External,
-                })
-            })
-        };
-        let server = Arc::new(McpServer::new(
-            "magi",
-            "test",
-            Arc::new(Backend),
-            Arc::new(Root),
-        ));
-        let handle =
-            serve_local_socket_with_auth(server, SocketAuth::Principal(provider), endpoint.clone())
-                .await
-                .unwrap();
-        let stream = imp::connect(&endpoint).await.unwrap();
-        let (read, mut write) = tokio::io::split(stream);
-        let mut lines = BufReader::new(read).lines();
-
-        // 没有身份：这条请求失败，但连接保持。
-        write
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n")
-            .await
-            .unwrap();
-        let first: Value =
-            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-        assert_eq!(first["error"]["code"], -32001, "{first}");
-        assert_eq!(first["id"], 1);
-
-        // 身份出现后，同一连接上的下一条请求立即可用。
-        available.store(true, Ordering::SeqCst);
-        write
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n")
-            .await
-            .unwrap();
-        let second: Value =
-            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-        assert!(
-            second["result"]["tools"]
-                .as_array()
-                .is_some_and(|tools| !tools.is_empty()),
-            "{second}"
-        );
-
-        // 身份消失（槽位释放）：立即失效。
-        available.store(false, Ordering::SeqCst);
-        write
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}\n")
-            .await
-            .unwrap();
-        let third: Value =
-            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-        assert_eq!(third["error"]["code"], -32001);
-        handle.stop();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

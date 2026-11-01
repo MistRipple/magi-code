@@ -79,33 +79,6 @@ fn install_enable_authorize_activate_and_reopen_use_one_immutable_package() {
 }
 
 #[test]
-fn reserved_first_party_identity_cannot_be_claimed_by_external_packages() {
-    let root = tempdir().unwrap();
-    let mut manager = PluginManager::open(root.path()).unwrap();
-    let mut manifest = manifest(false);
-    manifest["id"] = json!("openai.chatgpt-web");
-    let package = package_from_manifest(manifest);
-    assert!(
-        manager
-            .install(
-                &package,
-                PluginSource::Local {
-                    name: "spoof.zip".into(),
-                },
-            )
-            .is_err()
-    );
-    manager
-        .install(
-            &package,
-            PluginSource::Builtin {
-                name: "openai.chatgpt-web".into(),
-            },
-        )
-        .unwrap();
-}
-
-#[test]
 fn lifecycle_rejects_out_of_manifest_grants_and_uninstall_with_enabled_scope() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();
@@ -1663,4 +1636,56 @@ fn repeated_reopen_and_uninstall_preserve_all_referenced_version_packages() {
     let reopened = PluginManager::open(root.path()).unwrap();
     assert_eq!(reopened.projection().unwrap().plugins.len(), 1);
     assert!(reopened.package("acme.second").is_ok());
+}
+
+#[test]
+fn retired_builtin_is_removed_on_reopen_without_erasing_resources() {
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    let package = package(false);
+    manager.install(&package, local("retired.zip")).unwrap();
+    manager.enable("acme.lifecycle", "application").unwrap();
+    manager.activate("acme.lifecycle", "application").unwrap();
+    let state_path = root.path().join("state.json");
+    // 模拟旧宿主曾经发布的内置包；新宿主目录不再声明该身份。
+    let mut state = serde_json::to_value(manager.state()).unwrap();
+    state["plugins"]["acme.lifecycle"]["source"] = json!({"builtin":{"name":"acme.lifecycle"}});
+    drop(manager);
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    let mut resources = PluginResourceStore::open(root.path().join("resources.json")).unwrap();
+    resources
+        .write(
+            "acme.lifecycle",
+            "application",
+            "cache",
+            0,
+            json!({"saved":true}),
+        )
+        .unwrap();
+    let retained = std::fs::read(root.path().join("resources.json")).unwrap();
+    let reopened = PluginManager::open(root.path()).unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("resources.json")).unwrap(),
+        retained
+    );
+    assert!(!reopened.state().plugins.contains_key("acme.lifecycle"));
+    assert!(root.path().join("resources.json").exists());
+    assert!(std::fs::read_dir(root.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("retired-builtins")
+    }));
+    let mut reopened = reopened;
+    assert!(
+        reopened
+            .install(
+                &package,
+                PluginSource::Builtin {
+                    name: "acme.lifecycle".into()
+                }
+            )
+            .is_err()
+    );
 }

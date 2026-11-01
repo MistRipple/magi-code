@@ -267,7 +267,6 @@ impl BrowserAuthority {
         })
     }
 
-    /// 应用级（GPT Web）会话全局唯一；不存在时返回 `None`。
     pub fn app_session(&self) -> Option<&BrowserSession> {
         self.sessions
             .values()
@@ -429,15 +428,7 @@ impl BrowserAuthority {
         let Some(tab) = self.tabs.get(tab_id) else {
             return false;
         };
-        // 应用级（GPT Web）页面不参与资源回收：它的登录态与后台推理都需要常驻，
-        // 只能通过「清除数据」显式处理（设计基线 §5.3）。
-        if self
-            .sessions
-            .get(&tab.browser_session_id)
-            .is_some_and(|session| session.owner.is_app())
-        {
-            return false;
-        }
+
         matches!(
             tab.lifecycle,
             BrowserTabLifecycle::Suspended | BrowserTabLifecycle::Crashed
@@ -814,11 +805,7 @@ impl BrowserAuthority {
             return Err(BrowserAuthorityError::TabAlreadyExists(input.tab_id));
         }
         let session = self.require_ready_session(&input.browser_session_id)?;
-        // 应用级（GPT Web）会话不适用每会话上限：它承载主页与每个活跃对话实例的
-        // 推理页面，只受 `MAX_BROWSER_TABS_TOTAL` 约束（设计基线 §5.3）。
-        if !session.owner.is_app()
-            && self.live_tab_count_for_session(session) >= MAX_BROWSER_TABS_PER_SESSION
-        {
+        if self.live_tab_count_for_session(session) >= MAX_BROWSER_TABS_PER_SESSION {
             return Err(BrowserAuthorityError::SessionTabLimitReached {
                 browser_session_id: input.browser_session_id.clone(),
                 limit: MAX_BROWSER_TABS_PER_SESSION,
@@ -859,73 +846,6 @@ impl BrowserAuthority {
         session.tab_ids.push(tab.tab_id.clone());
         session.revision = session.revision.saturating_add(1);
         session.updated_at = input.now;
-        self.bump_revision();
-        Ok(tab)
-    }
-
-    /// Reopen a previously closed logical Tab without changing its stable id.
-    ///
-    /// The app-scoped GPT Web home Tab deliberately has a fixed id. A UI/session
-    /// cleanup can leave the durable row in `Closed` while the app session stays
-    /// open; treating that row as if it were still usable makes the next
-    /// `ensure_app_session` return an empty session and strands the persisted
-    /// Chromium partition. Reopening is restricted to an existing closed row
-    /// owned by the requested ready session and starts a fresh navigation
-    /// generation so stale Surface events cannot be accepted.
-    pub fn reopen_closed_tab(
-        &mut self,
-        browser_session_id: &BrowserSessionId,
-        tab_id: &BrowserTabId,
-        url: String,
-        now: UtcMillis,
-    ) -> Result<BrowserTab, BrowserAuthorityError> {
-        let _session = self.require_ready_session(browser_session_id)?;
-        let existing = self
-            .tabs
-            .get(tab_id)
-            .cloned()
-            .ok_or_else(|| BrowserAuthorityError::UnknownTab(tab_id.clone()))?;
-        if existing.browser_session_id != *browser_session_id {
-            return Err(BrowserAuthorityError::TabSessionMismatch {
-                tab_id: tab_id.clone(),
-                browser_session_id: browser_session_id.clone(),
-            });
-        }
-        if existing.lifecycle != BrowserTabLifecycle::Closed {
-            return Err(BrowserAuthorityError::InvalidTabTransition {
-                from: existing.lifecycle,
-                to: BrowserTabLifecycle::Creating,
-            });
-        }
-        if self.live_tab_count() >= MAX_BROWSER_TABS_TOTAL {
-            return Err(BrowserAuthorityError::GlobalTabLimitReached {
-                limit: MAX_BROWSER_TABS_TOTAL,
-            });
-        }
-
-        let tab = self
-            .tabs
-            .get_mut(tab_id)
-            .expect("closed tab was validated before reopening");
-        tab.lifecycle = BrowserTabLifecycle::Creating;
-        tab.url = url;
-        tab.origin = None;
-        tab.title.clear();
-        tab.display_label = None;
-        tab.navigation_revision = tab.navigation_revision.saturating_add(1);
-        tab.snapshot_revision = tab.snapshot_revision.saturating_add(1);
-        tab.updated_at = now;
-        let tab = tab.clone();
-
-        let session = self
-            .sessions
-            .get_mut(browser_session_id)
-            .expect("ready session was validated before reopening");
-        if !session.tab_ids.iter().any(|candidate| candidate == tab_id) {
-            session.tab_ids.push(tab_id.clone());
-        }
-        session.revision = session.revision.saturating_add(1);
-        session.updated_at = now;
         self.bump_revision();
         Ok(tab)
     }

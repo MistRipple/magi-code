@@ -17,10 +17,6 @@ pub(crate) use magi_conversation_runtime::model_config::{
     validate_vision_model_settings,
 };
 
-fn is_web_placeholder_model(value: &str) -> bool {
-    value.trim().eq_ignore_ascii_case("default")
-}
-
 fn orchestrator_session_override_request(config: &Value) -> Result<Value, ApiError> {
     let Some(config) = config.as_object() else {
         return Err(ApiError::InvalidInput(
@@ -34,9 +30,6 @@ fn orchestrator_session_override_request(config: &Value) -> Result<Value, ApiErr
     {
         override_config.insert("model".to_string(), Value::String(model.to_string()));
     }
-    // 引擎绑定（A22）：会话级 `engineId` 是「继承 vs 显式」的唯一字段。
-    // 空串是合法的显式「继承编排模型」写法，必须原样保留，不能当无效输入拒绝；
-    // 否则选择器无法把会话从 Web 引擎切回 provider 模型。
     if config.contains_key("engineId") {
         match config.get("engineId") {
             Some(Value::String(value)) => {
@@ -51,20 +44,7 @@ fn orchestrator_session_override_request(config: &Value) -> Result<Value, ApiErr
             None => {}
         }
     }
-    // GPT Web 对话方式（临时 / 已保存）：只在会话首条消息之前可以设置，落到会话级
-    // `webConversation` 绑定，不进入 orchestrator section（避免第二份事实）。
-    if let Some(mode) = config.get("webMode") {
-        match mode.as_str().map(str::trim) {
-            Some(mode @ ("temporary" | "saved")) => {
-                override_config.insert("webMode".to_string(), Value::String(mode.to_string()));
-            }
-            _ => {
-                return Err(ApiError::InvalidInput(
-                    "webMode 只能是 temporary 或 saved".to_string(),
-                ));
-            }
-        }
-    }
+
     if config.contains_key("reasoningEffort") {
         match config.get("reasoningEffort") {
             Some(Value::Null) => {
@@ -154,11 +134,7 @@ pub(crate) fn ensure_orchestrator_session_defaults_from_models(
             let has_model = fields
                 .get("model")
                 .and_then(Value::as_str)
-                .is_some_and(|value| {
-                    !value.trim().is_empty()
-                        && (!is_web_placeholder_model(value)
-                            || models.iter().any(|listed| listed == value))
-                });
+                .is_some_and(|value| !value.trim().is_empty());
             if !has_model && let Some(model) = first_model.as_ref() {
                 fields.insert("model".to_string(), Value::String(model.clone()));
                 fields.insert("reasoningEffort".into(), Value::Null);
@@ -174,67 +150,21 @@ pub(crate) fn save_orchestrator_session_override_for_session(
     session_id: &SessionId,
     config: &Value,
 ) -> Result<Option<Value>, ApiError> {
-    save_orchestrator_session_override_for_session_with_policy(state, session_id, config, false)
-}
-
-/// 保存刚创建会话的首条请求所携带的模型绑定。
-///
-/// 任务接纳会先写入 canonical 用户消息，再在异步 preparation 阶段保存初始
-/// session 配置。此时普通方向门禁会看到“刚刚写入的第一条消息”，误判为本地
-/// 会话转 Web。调用方必须已经证明这是本次请求创建的新会话；该入口不能用于
-/// 修改已有会话。
-pub(crate) fn save_initial_orchestrator_session_override_for_new_session(
-    state: &ApiState,
-    session_id: &SessionId,
-    config: &Value,
-) -> Result<Option<Value>, ApiError> {
-    save_orchestrator_session_override_for_session_with_policy(state, session_id, config, true)
-}
-
-fn save_orchestrator_session_override_for_session_with_policy(
-    state: &ApiState,
-    session_id: &SessionId,
-    config: &Value,
-    allow_new_session_initial_web_binding: bool,
-) -> Result<Option<Value>, ApiError> {
     let override_config = orchestrator_session_override_request(config)?;
     let Some(override_fields) = override_config.as_object() else {
         return Ok(None);
     };
-    let mut override_fields = override_fields.clone();
-    let web_mode = override_fields
-        .remove("webMode")
-        .and_then(|value| value.as_str().map(ToOwned::to_owned));
-    if let Some(mode) = web_mode.as_deref() {
-        state.set_web_conversation_mode(
-            session_id,
-            mode,
-            &override_fields,
-            allow_new_session_initial_web_binding,
-        )?;
-    }
+    let override_fields = override_fields.clone();
+
     if override_fields.is_empty() {
         return Ok(None);
     }
     let override_fields = &override_fields;
 
-    // 会话转换是单向的（设计基线 A26）：空白会话可以启动 GPT Web；已有本地
-    // canonical 历史的会话不能再把历史导入网页端。Web 会话切回 provider 不会
-    // 进入这里的 Web 分支，因此自然保留 canonical 历史并清除 engineId。
-    ensure_web_session_direction_allowed(
-        state,
-        session_id,
-        override_fields,
-        allow_new_session_initial_web_binding,
-    )?;
-
     let mut next_config = state
         .settings_store
         .get_session_section(session_id, "orchestrator");
-    let was_web = next_config
-        .get("engineId")
-        .and_then(Value::as_str)
-        .is_some_and(magi_web_model::is_chatgpt_web_engine_id);
+
     if !next_config.is_object() {
         next_config = json!({});
     }
@@ -266,16 +196,11 @@ fn save_orchestrator_session_override_for_session_with_policy(
                 json!(requested.filter(|value| capability.supported_efforts.contains(value)));
         }
     }
-    let next_config_is_web = next_config
-        .get("engineId")
-        .and_then(Value::as_str)
-        .is_some_and(magi_web_model::is_chatgpt_web_engine_id);
+
     let mut next_defaults = orchestrator_session_defaults(state);
     // Web's `default` family is session-owned. Never promote it to the
     // provider defaults used by the next local conversation.
-    if !next_config_is_web {
-        merge_orchestrator_session_override(&mut next_defaults, &next_config);
-    }
+    merge_orchestrator_session_override(&mut next_defaults, &next_config);
     state
         .settings_store
         .set_session_and_global_sections(
@@ -286,20 +211,7 @@ fn save_orchestrator_session_override_for_session_with_policy(
             next_defaults,
         )
         .map_err(settings_persistence_error)?;
-    let now_web = next_config
-        .get("engineId")
-        .and_then(Value::as_str)
-        .is_some_and(magi_web_model::is_chatgpt_web_engine_id);
-    if was_web && !now_web {
-        // Web → 本地：槽位随会话切走立即释放（W11），本地历史保留。
-        let state = state.clone();
-        let session_id = session_id.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                state.release_web_slot_for_session(&session_id).await;
-            });
-        }
-    }
+
     let workspace_id = state
         .session_store
         .session(session_id)
@@ -324,64 +236,6 @@ fn save_orchestrator_session_override_for_session_with_policy(
         }),
     );
     Ok(Some(next_config))
-}
-
-/// 拒绝「已有本地历史 → GPT Web」的会话迁移。
-///
-/// 只把真正的 Web 引擎绑定视为方向切换；清空 `engineId`（Web → provider）
-/// 不受限制。空白会话也不受限制，因为它会在首条消息时成为新的 GPT Web 会话。
-fn ensure_web_session_direction_allowed(
-    state: &ApiState,
-    session_id: &SessionId,
-    override_fields: &Map<String, Value>,
-    allow_new_session_initial_web_binding: bool,
-) -> Result<(), ApiError> {
-    let Some(requested_engine_id) = override_fields
-        .get("engineId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(());
-    };
-
-    // GPT Web 是固定入口 `plugin/openai.chatgpt-web/default`：只按引擎 id 命名空间判定，不查引擎注册表。
-    let is_web_engine_id = magi_web_model::is_chatgpt_web_engine_id;
-    let requested_is_web = is_web_engine_id(requested_engine_id);
-    if !requested_is_web {
-        return Ok(());
-    }
-
-    // Web → Web（换模型 / effort）仍是 Web 会话内部操作，不属于本地 → Web
-    // 转换；只有当前会话尚未使用 Web 时才需要拦截。
-    let current_engine_id = state
-        .settings_store
-        .get_session_section(session_id, "orchestrator")
-        .get("engineId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    let current_is_web = current_engine_id.as_deref().is_some_and(is_web_engine_id);
-    if current_is_web {
-        return Ok(());
-    }
-
-    if allow_new_session_initial_web_binding {
-        return Ok(());
-    }
-
-    let has_canonical_user_history = state
-        .session_store
-        .session(session_id)
-        .and_then(|session| session.message_count)
-        .is_some_and(|message_count| message_count > 0);
-    if has_canonical_user_history {
-        return Err(ApiError::InvalidInput(
-            "当前本地会话已有历史，暂不支持转为 GPT Web；请新建 GPT Web 会话。GPT Web 会话可以切回本地模型并保留历史".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 pub(crate) fn require_orchestrator_session_model(
@@ -506,14 +360,6 @@ fn default_agent_binding(template_id: &str, order: usize) -> Value {
         "bindingRevision": 0,
         "order": order,
     })
-}
-
-/// 判定某个引擎条目是否是 GPT Web 引擎（`apiProtocol = chatgpt_web`）。
-pub(crate) fn is_chatgpt_web_engine(entry: &Value) -> bool {
-    entry
-        .get("apiProtocol")
-        .and_then(Value::as_str)
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("chatgpt_web"))
 }
 
 fn normalize_engine_entry(entry: &Value) -> Option<Value> {
@@ -804,13 +650,6 @@ pub(crate) fn registered_role_template_ids(state: &ApiState) -> Vec<String> {
 }
 
 pub(crate) fn upsert_engine(state: &ApiState, request: &Value) -> Result<Value, ApiError> {
-    if is_chatgpt_web_engine(request) {
-        // GPT Web 入口由登录状态自动提供（固定的 `plugin/openai.chatgpt-web/default`），不写入引擎注册表：
-        // 注册表里的条目都是 HTTP 引擎，Web 不是第二种“模型”。
-        return Err(ApiError::InvalidInput(
-            "GPT Web 入口由登录状态自动提供，不能写入模型引擎注册表".to_string(),
-        ));
-    }
     if let Some(llm) = request.get("llm") {
         reject_unknown_model_config_fields(llm).map_err(ApiError::InvalidInput)?;
         NormalizedModelConfig::from_settings_value(llm).map_err(ApiError::InvalidInput)?;

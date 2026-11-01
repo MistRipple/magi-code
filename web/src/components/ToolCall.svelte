@@ -1,6 +1,5 @@
 <script lang="ts">
-  import type { ToolCallStatus, ToolOrigin } from '../types/message';
-  import ToolOriginBadge from './ToolOriginBadge.svelte';
+  import type { ToolCallStatus } from '../types/message';
   import Icon from './Icon.svelte';
   import ToolCardMeta from './ToolCardMeta.svelte';
   import FileSpan from './FileSpan.svelte';
@@ -70,7 +69,6 @@
   interface Props {
     name: string;
     id?: string;
-    origin?: ToolOrigin;
     input?: unknown;
     output?: unknown;
     error?: string;
@@ -89,7 +87,6 @@
   let {
     name,
     id,
-    origin,
     input,
     output,
     error,
@@ -930,7 +927,7 @@
     {/if}
   </span>
 
-  <ToolCardMeta status={statusInfo.class} label={toolStatusLabel(visualStatus)} expanded={canExpand ? !collapsed : undefined} {duration}><ToolOriginBadge {origin} /></ToolCardMeta>
+  <ToolCardMeta status={statusInfo.class} label={toolStatusLabel(visualStatus)} expanded={canExpand ? !collapsed : undefined} {duration}></ToolCardMeta>
 {/snippet}
 
 {#if isAgentSpawn && agentSpawnDisplay}

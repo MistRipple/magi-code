@@ -971,8 +971,6 @@ impl SessionStore {
         sessions
     }
 
-    /// 读取单个会话的当前权威记录，供应用级能力（例如 GPT Web Gateway）
-    /// 将工具调用绑定回会话所属工作区。返回副本，不暴露内部锁。
     pub fn session_record(&self, session_id: &SessionId) -> Option<SessionRecord> {
         let state = self.state.read().expect("session state read lock poisoned");
         state

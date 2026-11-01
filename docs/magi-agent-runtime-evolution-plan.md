@@ -216,7 +216,6 @@ flowchart TB
   C --> A[Agent Runtime：统一 Inbox 与 Step Loop]
   A --> X[Context Builder 与用量/压缩]
   X --> E[Executor Adapter]
-  E --> M[原生模型 Provider / GPT Web / 现有插件]
   A --> G[工具执行入口：权限、审批、资源校验]
   G --> T[内置 / MCP / 插件 / Browser 工具]
   A --> S[现有 TaskStore / Scheduler / Checkpoint]
@@ -337,7 +336,7 @@ ExecutorCapabilities {
 }
 ```
 
-只发布已经实现并验证的能力。GPT Web、原生 API 模型和现有插件按实际能力声明：不支持 steer 的引擎显示原因并允许下一轮输入；不能恢复的执行保留部分产物和明确状态；适配器必须在交付边界拒绝空或不完整结果，不得在消息已提交后静默重发。保留的外部 Executor 接口不代表已有可选执行器，也不增加当前设置项或交付要求。
+只发布已经实现并验证的能力。原生 API 模型和现有插件按实际能力声明：不支持 steer 的引擎显示原因并允许下一轮输入；不能恢复的执行保留部分产物和明确状态；适配器必须在交付边界拒绝空或不完整结果，不得在消息已提交后静默重发。保留的外部 Executor 接口不代表已有可选执行器，也不增加当前设置项或交付要求。
 
 ### 7.3 按需准备执行资源
 
@@ -458,7 +457,7 @@ Desktop GUI 与 Web 工作台使用同一个 daemon 接纳、事件和交互合�
 | P2：统一能力决策 | 目录/schema/执行同源；明确发现与授权；开放子代理合理的 Git 查询与提问；Skill 语义类型化 | ToolRegistry、permissions/governance、task_helpers、tool_surface_state、tool_batch、Skill runtime、Browser 能力 | 可见性与预检合同一致；所有拒绝可解释；权限收紧即时生效；角色不隐式提权；已有显式限制保留 |
 | P3：统一原生 Step Loop | 主/子代理相同输入与恢复内核；Step/attempt/request 固定；昂贵执行资源延迟准备；用量统计与部分结果 | conversation_loop、session_turn_execution、task_execution_dispatcher、context/usage、TaskStore/worker checkpoint | 相同场景通过同一测试合同；普通会话不被不必要 Git 准备阻塞；用户可暂停和继续；用量不控制执行；旧通用 loop 删除 |
 | P4：持续代理与后台 Job | 保留 Agent 身份、可继续 activation、明确子树转交、资源结算、受控嵌套试点 | TaskStore/Runner、agent_spawn/send/wait、process、BrowserAuthority、交互托盘 | 父子树取消无泄漏、无双计费、无运行保护绕过、无错误完成；后台审批和提问可恢复 |
-| P5：现有插件兼容性收尾 | 已完成当前产品边界：现有原生模型、GPT Web 与插件能力声明及兼容性门禁；外部 Executor 只保留接口 | plugin/runtime、App Server、Desktop 与 Web | 不支持的功能明确拒绝；插件禁用/升级正确结算；没有 CLI、独立移动端或具体外部执行器的交付依赖 |
+| P5：现有插件兼容性收尾 | 已完成当前产品边界：现有原生模型 与插件能力声明及兼容性门禁；外部 Executor 只保留接口 | plugin/runtime、App Server、Desktop 与 Web | 不支持的功能明确拒绝；插件禁用/升级正确结算；没有 CLI、独立移动端或具体外部执行器的交付依赖 |
 
 P1 与 P2 可按低冲突模块安排工程并行，但协议与所有权决策先统一。P3 依赖其合同稳定；P4 的嵌套开放依赖取消、权限和资源树完成。优先完成 P0–P2，直接改善当前用户问题，再扩展代理规模。
 
@@ -520,6 +519,6 @@ P1 与 P2 可按低冲突模块安排工程并行，但协议与所有权决策�
 
 P0–P3 的持久输入、能力限制、Step/attempt 与资源按需准备已完成当前产品边界验收；P4 的身份、Job、转交、交互恢复、取消结算与失败前工具证据回执已完成当前产品边界验收。插件工作流在接纳时固定包摘要，恢复核对原版本与请求/任务一致性，缺少固定身份的旧检查点不会自动交给当前实现；主线角色支持实际工作流类型，完成摘要随原结果持久化。真实 daemon + Worker 已验收检查点推进、终态摘要、停用/升级/重启后的原请求回执保持，新请求仍须经过当前准入。Job 结算现在覆盖启动、运行、完成和取消写盘失败：待提交终态及资源屏障保留，重复停止和并发结算读取同一持久回执，结果未知保持明确拒绝；模型预检允许已发布的 job_id 控制合同，不再强制短期 terminal_id，重试只补交原结果；Shell 根进程退出后仍先回收原进程组的派生进程，再发布完成事实。转交代理的迟到终态通知不能归档已经替换的主线执行链，归档前会核对当前 canonical Turn 的 task 身份。原生独立代理重启后的显式继续已从真实 daemon/App Server 与 Web 验收：原交互先处理，原 Task/Thread 新建 Turn，原 Skill/目录/审批范围继承，未知副作用不自动重放，重复 operation 只读回执；旧中断记录与后续主线保持原终态。macOS 与 Windows 目录包均已验收排队、停止/继续、子代理真实卡片与详情、Git 按需准备、daemon/应用重启及退出结算；固定代理选择决策样本已完成，未来模型升级仍需重跑评测，不能把固定样本当成统计性能承诺。
 
-Magi CLI 已废弃，源码、构建与专用验收入口均已撤下；核心控制回归直接验证 App Server。独立移动端及 Connect 产品规划撤下，保留 Web 响应式适配。具体 Codex 执行器、设置选项和专用验收代码已撤下；外部 Executor 只预留通用接口和历史证据读取。能力快照继续服务现有插件/GPT Web 的引导与恢复门禁，不是外部 Executor 的完成证明。这三项不计入当前产品改造的剩余交付量。
+Magi CLI 已废弃，源码、构建与专用验收入口均已撤下；核心控制回归直接验证 App Server。独立移动端及 Connect 产品规划撤下，保留 Web 响应式适配。具体 Codex 执行器、设置选项和专用验收代码已撤下；外部 Executor 只预留通用接口和历史证据读取。这三项不计入当前产品改造的剩余交付量。
 
 当前源码所有权、清理决定、验证入口与遗留项统一见[收敛审计](runtime-consolidation-audit.md)，不继续逐轮追加状态叙事。

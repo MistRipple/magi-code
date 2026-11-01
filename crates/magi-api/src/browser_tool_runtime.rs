@@ -3079,10 +3079,6 @@ pub(crate) fn browser_tab_scope(
     Ok((tab, session))
 }
 
-/// 会话作用域的 Magi 会话身份。
-///
-/// App 级（GPT Web）会话不属于任何 Magi 会话，`browser_*` 路由一律不暴露它
-/// 。
 pub(crate) fn require_session_scope(session: &BrowserSession) -> Result<&SessionId, ApiError> {
     session.magi_session_id().ok_or_else(|| {
         ApiError::not_found("浏览器会话不存在", "应用级浏览器会话不支持会话作用域操作")

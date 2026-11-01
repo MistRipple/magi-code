@@ -60,7 +60,6 @@ pub mod turn_contract;
 pub mod turn_stream_buffer;
 pub mod usage_recording;
 pub mod user_question;
-pub mod web_history_import;
 pub mod workspace_execution;
 mod workspace_rules;
 

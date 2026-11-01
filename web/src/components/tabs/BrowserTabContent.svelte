@@ -11,10 +11,8 @@
     browserScreenshotUrl,
     browserClientPlatform,
     getBrowserSession,
-    getAppBrowserSession,
     isReferenceableBrowserAnnotation,
     navigateBrowserTab,
-    reloadWebModelPage,
     releaseBrowserUserControl,
     type BrowserAnnotationSnapshot,
     type BrowserAnnotationSelection,
@@ -30,7 +28,6 @@
   import { synchronizeBrowserSessionSnapshot } from '../../stores/right-pane.svelte';
   import type { MessageBrowserNodeSelection } from '../../types/message';
   import { normalizeOptionalDomNodeId, type BrowserAgentCursorPresentation, type BrowserAgentCursorPresentationResult } from '@magi/desktop-browser-contracts';
-  import { browserPartitionForSession } from '../../shared/web-model';
 
   interface Props {
     browserSessionId: string;
@@ -41,16 +38,7 @@
     sessionId?: string;
     onTitleChange?: (label: string) => void;
     desktopSurface?: boolean;
-    /**
-     * 承载身份来源（A25、R49）。
-     *
-     * - `session`（默认）：会话级 Browser Tab，承载身份来自窗口布局的活动指针
-     *   （`activePanelKind` / `activeTabId` / `activeSurfaceId`），注册前必须先
-     *   激活右栏——这正是既有语义。
-     * - `app`：应用级 GPT Web 宿主。它**不允许**写任何激活意图，因此身份只能来自
-     *   窗口快照的 `browserSurfaces` 投影；注册、显隐都不再依赖活动面板。
-     */
-    surfaceScope?: 'session' | 'app';
+
     /**
      * 代理保留页面从窗口快照取得承载身份，读取与导航仍走会话级接口。
      * 是否在前台展示由 hostVisible 单独投影，保留状态不代表不可见。
@@ -148,13 +136,11 @@
     sessionId,
     onTitleChange,
     desktopSurface = false,
-    surfaceScope = 'session',
     retainedForAgent = false,
     hostVisible = true,
   }: Props = $props();
-  const appLevelSurface = $derived(surfaceScope === 'app');
   // 承载身份是否只来自窗口快照（不依赖活动面板）：应用级宿主与会话级后台承载。
-  const snapshotIdentity = $derived(appLevelSurface || retainedForAgent);
+  const snapshotIdentity = $derived(retainedForAgent);
   // Browser Tab 的运行通道由右栏宿主显式决定。Desktop 使用主 Renderer
   // 直接承载 Electron <webview>；Main 只负责控制 guest 的生命周期和 CDP，
   // 不参与右栏几何计算。
@@ -620,26 +606,17 @@
     const generation = ++refreshGeneration;
     if (initialLoad) loading = true;
     try {
-      // 应用级 GPT Web 会话不属于任何 Magi 会话；它必须通过专用的
-      // `/browser/sessions/app` 读取入口，不能把 app scope 误送进会话级
-      // Browser API。后者会按设计拒绝并显示“浏览器会话不存在”。
-      const next = appLevelSurface
-        ? await getAppBrowserSession()
-        : await getBrowserSession(expectedSessionId);
+      const next = await getBrowserSession(expectedSessionId);
       if (!next) {
         throw new Error('browser_app_session_not_found');
       }
       if (generation !== refreshGeneration || expectedSessionId !== browserSessionId || expectedTabId !== tabId) return;
       snapshot = next;
-      // BrowserAuthority 事件可能发生在会话导航完成之前，导致 App 层错过该事件。
-      // 当前 Browser Tab 自己拿到的完整权威快照必须回写同一个右栏投影入口，
-      // 否则本地仍停留在 creating，尽管 authority 和 Main Surface 已经 ready。
-      if (!appLevelSurface) {
         synchronizeBrowserSessionSnapshot(next, workspacePath, {
           workspaceId,
           sessionId,
         });
-      }
+
       const nextTab = next.tabs.find((candidate) => candidate.tabId === expectedTabId && candidate.lifecycle !== 'closed');
       const nextUrl = nextTab?.url ?? '';
       if (initialLoad || !addressEditing) address = nextUrl;
@@ -1354,16 +1331,6 @@
     if (!tab || !browserReady) return;
     addressEditing = false;
     clearNodeInspection();
-    if (appLevelSurface) {
-      // 应用级（GPT Web）页面不属于任何 Magi 会话，会话作用域的导航接口一律拒绝；
-      // 失败面板的「重试」只能走应用级刷新。
-      if (action !== 'reload') return;
-      void run(async () => {
-        await reloadWebModelPage();
-        await refreshSession();
-      });
-      return;
-    }
     void run(async () => {
       const updated = await navigateBrowserTab(tab.tabId, action, action === 'url' ? address : undefined);
       address = updated.url;
@@ -1947,6 +1914,8 @@
     };
   });
 
+
+function browserPartitionForSession(browserSessionId: string): string { return `magi-browser-${browserSessionId.replace(/[^A-Za-z0-9._-]/gu, '_')}`; }
 </script>
 
 {#snippet browserActions(inMenu: boolean)}
@@ -1962,10 +1931,7 @@
   class="browser-pane"
   aria-label={i18n.t('browser.pane.label')}
 >
-  <!-- 应用级 GPT Web 不渲染这条工具栏：前进 / 后退 / 刷新 / 改网址会让临时对话上下文丢失或让页面离开
-       ChatGPT，视口 / 元素选取 / 截图 / 标注属于 agent 浏览器工具，对它没有意义。GPT Web 的标题栏
-       （WebModelTabContent）统一承担只读地址、连接状态与显式动作。 -->
-  {#if !appLevelSurface}
+
   <div
     bind:this={browserToolbar}
     bind:clientWidth={toolbarWidth}
@@ -2020,9 +1986,9 @@
       <span class="record-status" role="status">{activeTab ? i18n.t('browser.status.recordOnly') : i18n.t('browser.status.noTab')}</span>
     {/if}
   </div>
-  {/if}
 
-  {#if mobileEmulation && !appLevelSurface}
+
+  {#if mobileEmulation}
     <div class="viewport-toolbar" role="toolbar" aria-label={i18n.t('browser.viewport.control')}>
       <select class="viewport-preset" aria-label={i18n.t('browser.viewport.deviceSize')} title={i18n.t('browser.viewport.deviceSizeHint')} value={mobileViewportPreset} onchange={selectMobileViewportPreset} disabled={busy || !browserReady}>
         <option value="" disabled>{i18n.t('browser.viewport.custom')}</option>

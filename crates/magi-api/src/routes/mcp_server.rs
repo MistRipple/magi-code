@@ -22,8 +22,6 @@ use crate::{errors::ApiError, state::ApiState};
 const DEFAULT_TOKEN_TTL_DAYS: u32 = 90;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// 管理面按插件门控：MCP 服务插件未安装或未激活时，开关、令牌、隧道、配置与审计都拒绝。
-/// 待确认列表不在此列——GPT Web 的槽位调用也经它审批，由 GPT Web 或 MCP 任一插件放行。
 pub fn routes(state: ApiState) -> Router<ApiState> {
     let management = Router::new()
         .route("/mcp-server/status", get(get_status))
@@ -77,9 +75,9 @@ async fn require_approval_plugin(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, ApiError> {
-    if !state.mcp_server_plugin_active() && !state.web_model_plugin_active() {
+    if !state.mcp_server_plugin_active() {
         return Err(ApiError::Forbidden(
-            "MCP 服务与 GPT Web 插件均未激活，没有待确认的外部调用".into(),
+            "MCP 服务未激活，没有待确认的外部调用".into(),
         ));
     }
     Ok(next.run(request).await)
@@ -476,7 +474,6 @@ async fn create_token(
             client_name: request.client_name,
             workspace_id: request.workspace_id,
             approval_mode: request.approval_mode,
-            // 令牌只归到自己的外部工具会话；follow_web_slot 由 GPT Web 槽位内部签发。
             attribution: AttributionMode::External,
             ttl_ms,
             network: request.allow_network,
@@ -518,11 +515,7 @@ async fn update_token(
         .into_iter()
         .find(|record| record.token_id == token_id)
         .ok_or_else(|| ApiError::not_found("令牌不存在", &token_id))?;
-    if current.attribution != AttributionMode::External {
-        return Err(ApiError::InvalidInput(
-            "GPT Web 内部令牌由系统管理，不能编辑".to_string(),
-        ));
-    }
+
     let updated = state
         .mcp_service
         .update_token(
@@ -635,12 +628,8 @@ async fn rotate_token(
     Path(token_id): Path<String>,
 ) -> Result<Json<CreateTokenResponse>, ApiError> {
     require_local(&headers)?;
-    let current = find_token(&state, &token_id)?;
-    if current.attribution != AttributionMode::External {
-        return Err(ApiError::InvalidInput(
-            "GPT Web 内部令牌由系统管理，不能重新生成".to_string(),
-        ));
-    }
+    find_token(&state, &token_id)?;
+
     let (record, secret) = state
         .mcp_service
         .rotate_token(&state, &token_id)
@@ -858,7 +847,7 @@ fn pending_external_approvals(state: &ApiState) -> Vec<ExternalApprovalDto> {
             .tool_approvals()
             .pending_for_session(&owner.session_id)
         {
-            // 槽位拥有者的会话里也会有它自己的普通审批，只取属于该调用方的外部审批。
+            // 按令牌任务标识筛选，只取属于该调用方的外部审批。
             if pending.task_id != task_id {
                 continue;
             }
@@ -936,7 +925,7 @@ async fn resolve_approval(
         })
         .map(|owner| owner.session_id)
         .ok_or_else(|| ApiError::not_found("授权请求不存在或已处理", &request.approval_id))?;
-    // 托盘与会话卡片必须沿同一结算入口发布 resolved 事件；否则槽位工具已继续，
+    // 托盘与会话卡片必须沿同一结算入口发布 resolved 事件；否则外部工具已继续，
     // 会话中的待审批投影仍会锁住输入框。
     crate::interaction_service::resolve_approval(
         &state,
@@ -1180,66 +1169,6 @@ mod tests {
             .await
             .unwrap();
         (status, serde_json::from_slice(&bytes).unwrap_or_default())
-    }
-
-    #[tokio::test]
-    async fn management_routes_are_refused_until_the_plugin_is_active_but_approvals_follow_either_plugin()
-     {
-        let (active, _dir) = state_with_workspace();
-        // 一个没有激活任何插件的状态：管理面与待确认列表都拒绝。
-        let inactive = ApiState::new(
-            "magi-test",
-            std::sync::Arc::new(InMemoryEventBus::new(16)),
-            std::sync::Arc::new(SessionStore::default()),
-            std::sync::Arc::new(WorkspaceStore::default()),
-            std::sync::Arc::new(GovernanceService::default()),
-        );
-        for (method, path) in [
-            ("GET", "/mcp-server/status"),
-            ("POST", "/mcp-server/enabled"),
-            ("POST", "/mcp-server/tokens"),
-            ("GET", "/mcp-server/config-snippets"),
-            ("GET", "/mcp-server/audit"),
-            ("GET", "/mcp-server/approvals"),
-        ] {
-            let (status, _) = call(&inactive, method, path, serde_json::json!({}), false).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
-        }
-
-        // 只激活 GPT Web：槽位调用仍需要在待确认托盘里审批，管理面依旧关闭。
-        crate::bundled_plugins::activate_bundled_for_test(
-            &inactive,
-            magi_web_model::WEB_MODEL_PLUGIN_ID,
-        );
-        let (status, _) = call(
-            &inactive,
-            "GET",
-            "/mcp-server/approvals",
-            serde_json::json!({}),
-            false,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let (status, _) = call(
-            &inactive,
-            "GET",
-            "/mcp-server/status",
-            serde_json::json!({}),
-            false,
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-
-        // 激活 MCP 插件后管理面可用。
-        let (status, _) = call(
-            &active,
-            "GET",
-            "/mcp-server/status",
-            serde_json::json!({}),
-            false,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]

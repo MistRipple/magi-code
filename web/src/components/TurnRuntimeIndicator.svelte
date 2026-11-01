@@ -3,7 +3,6 @@
   import { formatElapsed } from '../lib/utils';
   import { messagesState, retryRuntimeState } from '../stores/messages.svelte';
   import { uiClockState, retainUiClock } from '../stores/ui-clock.svelte';
-  import { webModelTurnStage } from '../stores/web-model-runtime.svelte';
   import { getWorkspaceWait } from '../stores/workspace-wait-store.svelte';
   import { resolveCurrentSessionTitle } from '../lib/session-title';
 
@@ -11,26 +10,15 @@
     elapsedSeconds: number;
     /** 摘要轮次标题已经计时，过程行只保留运行和重试状态。 */
     showElapsed?: boolean;
-    /**
-     * 承载该运行指示的会话 id。
-     *
-     * 不传时用当前会话——Web 阶段投影只对「这个会话正在跑 Web 引擎」有意义，
-     * 拿不到归属就不显示专属阶段，宁可少一行也不张冠李戴。
-     */
+
     sessionId?: string;
   }
 
   let { elapsedSeconds, sessionId, showElapsed = true }: Props = $props();
   const elapsedLabel = $derived(formatElapsed(Math.max(0, elapsedSeconds)));
 
-  /**
-   * daemon 投影的 GPT Web turn 阶段。单槽位没有排队：槽位被占用时发送直接被拒绝，
-   * 所以这里只有「正在生成」一种专属阶段。
-   */
+
   const ownerSessionId = $derived(sessionId?.trim() || messagesState.currentSessionId || '');
-  const webStage = $derived(
-    ownerSessionId ? webModelTurnStage(ownerSessionId) : null,
-  );
   // 这一轮在排队等别的会话用完工作区：优先说明在等谁，比「正在生成」更有信息量。
   const workspaceWait = $derived(ownerSessionId ? getWorkspaceWait(ownerSessionId) : null);
   const blockingTitle = $derived(
@@ -80,7 +68,7 @@
         ? i18n.t('isolation.wait.for', { session: blockingTitle })
         : i18n.t('isolation.wait.generic');
     }
-    return webStage ? i18n.t('webModel.turnStage.generating') : '';
+    return '';
   });
 </script>
 
@@ -89,7 +77,7 @@
   <span class="turn-runtime-dot"></span>
   <span class="turn-runtime-dot"></span>
   {#if stageLabel}
-    <span class="turn-runtime-stage" data-web-model-stage={webStage?.stage}>{stageLabel}</span>
+    <span class="turn-runtime-stage">{stageLabel}</span>
   {/if}
   {#if showElapsed}
     <span class="turn-runtime-elapsed-time">{elapsedLabel}</span>

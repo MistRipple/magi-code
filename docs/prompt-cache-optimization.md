@@ -1,6 +1,6 @@
 # Prompt 缓存分析与优化记录
 
-更新：2026-11-01。范围：HTTP 主对话、worker、会话辅助调用及主助手承接的 GPT Web 配置任务。
+更新：2026-11-01。
 
 ## 1. 结论与历史基线
 
@@ -18,7 +18,7 @@
 
 辅助请求的完整输入平均约 459 Token，中位数 200.5 Token，280 / 308 次少于 1,024 Token。短输入、共享前缀短和一次性内容能解释其复用机会少；不同模型的缓存门槛不同，不能据此认定每个 miss 的原因。禁止为了增加命中率填充无用提示词。
 
-历史 worker 样本以 explorer 为主（356 次），reviewer 和 executor 各 15 次；不能将总体结果直接推广到所有子代理角色。账本没有独立 web-setup 绑定记录，不能给它虚构独立命中率。当前配置任务已复用主线，新增调用归主对话统计。
+历史 worker 样本以 explorer 为主（356 次），reviewer 和 executor 各 15 次；不能将总体结果直接推广到所有子代理角色。
 
 ## 2. 开源参考与采用边界
 
@@ -65,7 +65,7 @@ pi 当前仓库为 `earendil-works/pi`，旧 `badlogic/pi-mono` 地址发生迁�
 
 Provider 响应 → 原有 usage 解析 → 原有 `model.usage.recorded` 账本 → `magi-usage-authority` reducer → 执行统计 API → 统计页。没有增加第二套业务存储。
 
-`UsageTotals` 新增可从原账本重建的三个聚合值：已观测调用数、命中调用数、已观测完整输入 Token。旧快照缺少字段时按零读取；实际统计仍从原始账本重建。只有 `cache_read_tokens` 为 Some（包括 0）的调用进入观测分母；缺失字段的失败、GPT Web 或其他执行器调用不冒充 miss。只有缓存读写量的响应也保留其用量。
+`UsageTotals` 新增可从原账本重建的三个聚合值：已观测调用数、命中调用数、已观测完整输入 Token。旧快照缺少字段时按零读取；实际统计仍从原始账本重建。只有 `cache_read_tokens` 为 Some（包括 0）的调用进入观测分母；缺失字段的失败 或其他执行器调用不冒充 miss。只有缓存读写量的响应也保留其用量。
 
 执行统计的总量、模型项和角色项都增加 `cache` 对象：
 
@@ -87,7 +87,7 @@ Provider 响应 → 原有 usage 解析 → 原有 `model.usage.recorded` 账本
 - `cargo test -p magi-conversation-runtime --lib usage_recording::tests::`：16 项，包含 cache-only usage。
 - `cargo test -p magi-api --lib execution_stats_`：8 项，覆盖账本权威、模型/角色/总量缓存投影与重置。
 - `npm --prefix web run check`、`test:settings-store`、`test:i18n`：类型、加权聚合和本地化验证。
-- `cargo check -p magi-bridge-client -p magi-web-model -p magi-plugin-system -p magi-daemon --tests`：涉及新请求字段的附属测试目标均可编译。
+- `cargo check -p magi-bridge-client -p magi-plugin-system -p magi-daemon --tests`：涉及新请求字段的附属测试目标均可编译。
 - 通过 daemon 的 `http://127.0.0.1:38123/web.html` 验收统计页：1280px 浅色布局与 375px 窄屏可读，窄屏 body 宽度为 375px，缓存统计行位于视口内。该次浏览器验收只覆盖旧 daemon 返回缺失 cache 字段时的“未观测”展示；正命中、零命中与加权计算由上述 API/聚合回归覆盖。未做深色、全部译文和真实新版 daemon 的完整视觉验收。
 
 以上为首轮离线/旧版 UI 验证；后续独立 daemon 与真实模型验收见第 5 节。用户正在使用的 daemon 未重启，仍为不返回新增 cache 投影的旧构建，因此该进程上的热更新前端可显示“未观测”；这不是新的真实 miss。
@@ -148,7 +148,7 @@ node scripts/verify-prompt-cache.mjs --live --baseline /absolute/path/baseline/m
 
 最终真实产物为 `/tmp/magi-cache-final.NNonUQ/benchmark.json`，SHA-256 为 `d696b00819f5577369954b5a40dbb91778b8bc7ce35a366f0582b9728f8af9a7`。旧版二进制 SHA-256 为 `526b27f0fc49c312ef5dab6dd1e8409a6dd716c2ba86a37dabd00c16b8806c65`；新版为 `d436dd4fd90f6ad18d8b9b2248dd87eef360a9f1a0b043910666aeb7e0686c54`。这些临时产物不是仓库内持久附件，长期结论以本文口径和可重复入口为准。验收前后用户 daemon 的 `runtimeEpoch`、`startupNonce` 相同，未被重启。
 
-下一步聚焦尚未覆盖的边界：在同模型/权限/工具面下扩充并交错旧新版采样，再单独验证 Skill/权限变化和压缩后的前缀差异；Anthropic 的真实命中表现与自定义 Chat 代理能力按各自协议处理。GPT Web 配置任务的真实账号工具往返仍按其独立验收文档推进，本次 HTTP 缓存结果不能替代该验收。
+下一步聚焦尚未覆盖的边界：在同模型/权限/工具面下扩充并交错旧新版采样，再单独验证 Skill/权限变化和压缩后的前缀差异；Anthropic 的真实命中表现与自定义 Chat 代理能力按各自协议处理。
 
 ## 6. 模型矩阵尝试
 

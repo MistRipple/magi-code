@@ -17,7 +17,6 @@
 | 直接读取项目文件、执行 shell、调用远端 API | 通用插件 SDK 暂不支持；后台没有文件、进程或网络接口 | 这类需求不能仅靠申请权限实现 |
 | 在插件后台直接调用任意模型或其他工具 | 没有通用 `sdk.call` 接口；工作流可提交受控动作 | 先读第 10 节限制，再决定是否适用 |
 | 接入 MCP 服务、安装 Skill | Magi 有各自的配置入口；当前不支持把它们声明进此 ZIP 清单 | 使用对应功能入口 |
-| 驱动浏览器、保持后台常驻、监听任意宿主事件 | 没有通用第三方 SDK；内置 GPT Web/MCP 插件的专用能力不对外开放 | 不适合作为本文的入门目标 |
 
 插件的安装、授权、启用和数据都对所有工作区共用一份。切换工作区不会获得一份新的便签或配置；不要用插件数据保存另一套 Magi 会话或任务状态。
 
@@ -711,7 +710,6 @@ if (kind === 'engine' && id === 'echo') {
 ### 当前不开放的通用扩展
 
 - **原生浏览器**：`browserSurfaces` 是声明，不提供第三方页面驱动或任意 URL 挂载 API。字段 `scope` 允许 `application/workspace`、`persistence` 允许 `persistent/ephemeral`、`closeAction` 允许 `hide/destroy`，其余两个字段为布尔值；当前宿主只接受 `scope:'application', persistence:'persistent', keepMounted:true, closeAction:'hide'`，后台推理为真时还必须保持挂载。该组合也不代表任意第三方 surface 都已有挂载实现。
-- **第一方宿主能力**：GPT Web 与 Magi MCP 服务由内置插件壳启用，内部站点、浏览器和通道实现不属于通用 SDK。`openai.chatgpt-web`、`magi.mcp-server` 是保留 ID，外部 ZIP 不能使用。
 - **其他扩展**：当前没有通用 Skill/MCP 服务清单贡献、生命周期脚本钩子、插件间依赖、插件自带外部程序或后台常驻任务接口。不要把其他产品的插件清单直接套用到 Magi。
 
 ### 插件中心目录与可选签名

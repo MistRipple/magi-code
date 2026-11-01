@@ -86,15 +86,6 @@ async fn submit_session_turn_internal(
     state: ApiState,
     mut request: SessionTurnRequestDto,
 ) -> Result<SessionTurnResponseDto, ApiError> {
-    if request
-        .text
-        .as_deref()
-        .is_some_and(crate::web_model_setup_policy::contains_secret)
-    {
-        return Err(ApiError::InvalidInput(
-            "疑似凭据不能进入聊天或排队输入，请使用安全配置表单".into(),
-        ));
-    }
     request.skill_name = request
         .skill_name
         .as_deref()
@@ -212,30 +203,9 @@ async fn submit_session_turn_internal(
     // 经过当前能力校验，不能借重放路径绕过准入。
     validate_workflow_selection(&state, &request)?;
     validate_plugin_command_selection(&state, &request)?;
-    if let Some(session) = request.requested_session_id() {
-        state.invalidate_setup_continuation(&session, request.request_id().as_deref())?;
-    }
+
     // 保留的显式插件命令仅规范化为普通主对话任务；不再执行独立配置循环。
-    if request.plugin_command_id.as_deref() == Some(crate::web_model_setup::SETUP_COMMAND_ID) {
-        if request_targets_web_engine(&state, &request) {
-            return Err(ApiError::Conflict(
-                "当前使用 GPT Web 引擎，请明确切换到支持工具的本地模型后配置，不能让网页控制自身"
-                    .into(),
-            ));
-        }
-        let text = match request.trimmed_text().as_deref().unwrap_or("") {
-            "cancel" => "请结束本次 GPT Web 配置，结算页面操作并保留已保存配置。",
-            "continue" => "请继续本会话的 GPT Web 配置；先检查最新检查点和页面，不重放未知写入。",
-            _ => {
-                "请帮我配置 GPT Web；使用当前主模型，遇到登录或生成密钥时交还我操作，并保持本会话可以讨论。"
-            }
-        };
-        request.text = Some(text.into());
-        request.plugin_command_id = None;
-        request
-            .skill_name
-            .get_or_insert_with(|| crate::web_model_setup_tools::SKILL_ID.into());
-    }
+
     let decision = decide_session_turn(&state, &request)?;
     request.source_folder_id =
         trimmed_non_empty(request.source_folder_id.as_deref()).map(str::to_string);
@@ -601,7 +571,6 @@ fn enqueue_session_turn_response(
     let queued_request_id = Some(request_id);
     let queued_user_message_id = Some(user_message_item_id.clone());
     let queue_position = state.enqueue_regular_session_turn(QueuedRegularSessionTurn {
-        readiness: None,
         project_directories: request.project_directories.clone(),
         request,
         request_fingerprint: Some(request_fingerprint),
@@ -1127,7 +1096,7 @@ fn session_executor_accepts_steer(
         &state.settings_store,
         Some(session_id),
     )
-    .is_ok_and(|config| config.is_plugin() || config.is_chatgpt_web())
+    .is_ok_and(|config| config.is_plugin())
 }
 
 pub(crate) fn session_turn_request_is_steerable_input(request: &SessionTurnRequestDto) -> bool {
@@ -1166,15 +1135,6 @@ fn steer_input_error(error: SessionTurnInputError) -> ApiError {
 }
 
 pub(crate) fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), ApiError> {
-    if request
-        .text
-        .as_deref()
-        .is_some_and(crate::web_model_setup_policy::contains_secret)
-    {
-        return Err(ApiError::InvalidInput(
-            "疑似凭据不能进入聊天或排队输入，请使用安全表单".into(),
-        ));
-    }
     if let Some(target) = &request.interrupt_turn_id
         && (target.trim().is_empty()
             || request.requested_session_id().is_none()
@@ -1257,26 +1217,6 @@ pub(crate) fn validate_plugin_command_selection(
         return Ok(());
     };
     let selected = parse_contribution_selection("插件命令", command_id)?;
-    if command_id == crate::web_model_setup::SETUP_COMMAND_ID {
-        if !request.desktop_browser_tools_allowed {
-            return Err(ApiError::Forbidden(
-                "GPT Web 配置只能从本机 Magi Desktop 发起".into(),
-            ));
-        }
-        if !state.web_model_setup_available() {
-            return Err(ApiError::Forbidden(
-                "GPT Web 插件未安装、未激活或不提供配置命令，请先到设置 → 插件安装并激活".into(),
-            ));
-        }
-        if !matches!(
-            request.trimmed_text().as_deref().unwrap_or(""),
-            "" | "start" | "continue" | "cancel"
-        ) {
-            return Err(ApiError::InvalidInput(
-                "配置命令只接受开始、继续、重试创建、连接器确认或取消；密钥请使用配置卡片的安全输入框".into(),
-            ));
-        }
-    }
 
     if request.command.is_some()
         || request.workflow_id.is_some()
@@ -1345,11 +1285,6 @@ fn validate_session_turn_command(request: &SessionTurnRequestDto) -> Result<(), 
     Ok(())
 }
 
-/// 会话命令不经过意图分类，固定作为 conversation Turn 执行。
-/// 入口决策只读结构化输入：会话命令、GPT Web 引擎、“继续”恢复标志和目标模式开关。
-///
-/// 不再按用户文本中的关键词决定路由、协作模式或必调工具：其余所有消息都进入带工具的
-/// 主线，是否读代码、执行命令、派发代理由模型根据完整工具面自行判断。
 fn session_turn_command_decision() -> SessionTurnIntentDecision {
     SessionTurnIntentDecision::new(SessionTurnRouteDto::Chat)
 }
@@ -1378,11 +1313,7 @@ pub(crate) fn decide_session_turn(
     if request.workflow_id.is_some() {
         return Ok(SessionTurnIntentDecision::new(SessionTurnRouteDto::Execute));
     }
-    // GPT Web 会话的每条消息都是普通对话：原样交给网页，网页自己维护上下文，工具由
-    // ChatGPT 侧经 Magi MCP 使用，不能把任务上下文和工具规则塞进网页输入框。
-    if request_targets_web_engine(state, request) {
-        return Ok(SessionTurnIntentDecision::new(SessionTurnRouteDto::Chat));
-    }
+
     if request.resume {
         return decide_resume_turn(state, request);
     }
@@ -1425,24 +1356,6 @@ fn decide_resume_turn(
     Err(ApiError::InvalidInput(
         "当前会话没有可继续的执行".to_string(),
     ))
-}
-
-/// 本条消息的目标会话是否使用 GPT Web 引擎：已有会话读会话设置，新会话首条消息读请求里携带的引擎配置。
-fn request_targets_web_engine(state: &ApiState, request: &SessionTurnRequestDto) -> bool {
-    let from_request = request
-        .orchestrator_session_config
-        .as_ref()
-        .and_then(|config| config.get("engineId"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(magi_web_model::is_chatgpt_web_engine_id);
-    from_request
-        || request.requested_session_id().is_some_and(|session_id| {
-            magi_conversation_runtime::model_config::orchestrator_web_engine_id(
-                &state.settings_store,
-                Some(&session_id),
-            )
-            .is_some()
-        })
 }
 
 struct UserInterruptedTurnResume {
@@ -1657,7 +1570,7 @@ async fn submit_conversation_session_turn(
     // canonical Turn，确保后台执行读取到与 accepted 请求一致的 Provider 配置。
     if let Some(config) = request.orchestrator_session_config.as_ref() {
         let save_result = if created_session {
-            crate::model_config::save_initial_orchestrator_session_override_for_new_session(
+            crate::model_config::save_orchestrator_session_override_for_session(
                 &state,
                 &session_id,
                 config,
@@ -1938,9 +1851,6 @@ async fn submit_conversation_session_turn(
             }),
     };
     schedule_conversation_execution(state.clone(), execution_request, attempt, trace);
-    // 新会话的标题：交给辅助模型根据首条消息精修（未配置辅助模型时静默保留占位标题）。
-    // 之前只有任务路线接了这一步，聊天路线（包括 GPT Web 会话）创建的会话永远叫「新会话」。
-    // 已保存的 GPT Web 对话之后仍以 ChatGPT 的标题为准（见 `record_saved_web_progress`）。
     if created_session
         && let Some(first_message) = request
             .trimmed_text()
@@ -3327,13 +3237,7 @@ pub(crate) async fn drain_next_queued_regular_session_turn(
         queued.accepted_at
     };
     let mut queued_request = queued.request;
-    if queued
-        .readiness
-        .as_ref()
-        .is_some_and(|condition| state.setup_continuation_ready(condition))
-    {
-        queued_request.desktop_browser_tools_allowed = true;
-    }
+
     queued_request.project_directories = queued.project_directories;
     // 出队时重新验证请求声明的 session scope。排队期间请求结构可能来自持久化
     // 恢复，不能只相信入队时解析出的 workspace_id；否则一个被篡改或失效的
@@ -3407,15 +3311,7 @@ pub(crate) async fn drain_next_queued_regular_session_turn(
         },
     };
     match submit_result {
-        Ok(_) => {
-            if let Err(error) = state
-                .settle_setup_continuation(&session_id, &failed_event_queue_id, true)
-                .await
-            {
-                tracing::error!(%session_id, ?error, "配置继续已接纳，保存回执待核对");
-            }
-            QueuedRegularSessionTurnDrainOutcome::Started
-        }
+        Ok(_) => QueuedRegularSessionTurnDrainOutcome::Started,
         Err(error) => {
             tracing::error!(
                 session_id = %failed_event_session_id,
@@ -3480,16 +3376,7 @@ pub(crate) async fn drain_next_queued_regular_session_turn(
                     );
                     return QueuedRegularSessionTurnDrainOutcome::RetainedAfterFailure;
                 }
-                if let Err(error) = state
-                    .settle_setup_continuation(
-                        &failed_event_session_id,
-                        &failed_event_queue_id,
-                        false,
-                    )
-                    .await
-                {
-                    tracing::error!(session_id = %failed_event_session_id, ?error, "配置继续未接纳，保存回执待核对");
-                }
+
                 schedule_next_queued_regular_session_turn(
                     state.clone(),
                     failed_event_session_id,

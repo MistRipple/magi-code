@@ -312,13 +312,8 @@ export interface ToolPolicyPayload {
   activeInstructionSkillName?: string;
 }
 
-// 工具调用
-/** 工具调用的来源：Magi 自己的 agent 发起的调用没有来源标记；GPT Web 网页里的模型经 MCP 回调的工具标为 chatgpt_web。 */
-export type ToolOrigin = 'chatgpt_web';
-
 export interface ToolCall {
   id: string;
-  origin?: ToolOrigin;
   name: string;
   arguments: Record<string, unknown>;
   status: ToolCallStatus;
@@ -410,7 +405,6 @@ export interface ContentBlock {
     headSummary?: string;
     tailSummary?: string;
     toolCallId?: string;
-    origin?: ToolOrigin;
   };
   plan?: {
     goal: string;

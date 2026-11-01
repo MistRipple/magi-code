@@ -1,11 +1,3 @@
-//! 外部会话的活动段 Turn：外部 MCP 客户端没有“用户消息 → 模型回复”，但它在 Magi 里是一个真正的会话，
-//! 调用必须作为普通工具项写进 canonical 时间线，和内部对话、GPT Web 同一套事实、同一套展示。
-//!
-//! canonical 的工具项必须挂在一个 Turn 上，所以把一段连续的外部活动收成一个 Turn：
-//! 第一次调用打开 Turn（开场是一条系统提示，说明是哪个客户端），之后的调用都写进它，
-//! 空闲一段时间或持续太久后收口为 completed，下一次调用再开新 Turn。
-//! 走与普通 Turn 相同的 Coordinator + canonical sink（同 `web_history_import`），不开第二条写入路径。
-
 use std::collections::HashMap;
 
 use magi_core::{SessionId, UtcMillis, WorkspaceId};
@@ -208,7 +200,6 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace,
             turn_id: Some("external-turn-1"),
-            origin: None,
         };
         writer
             .started("call-1", "file_read", "{\"path\":\"a.txt\"}")

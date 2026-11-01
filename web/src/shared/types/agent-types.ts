@@ -52,13 +52,8 @@ export interface TokenUsage {
 /** 走 HTTP 传输的连接协议：只有这三种。 */
 export type HttpModelApiProtocol = 'openai_chat' | 'openai_responses' | 'anthropic_messages';
 
-/**
- * 引擎协议标签全集。
- *
- * `chatgpt_web` **没有 HTTP 传输**：推理由内置浏览器里的 ChatGPT 网页完成，
- * 引擎条目不写 `llm`，也不带 baseUrl / apiKey / model（设计基线 A7、A22）。
- */
-export type ModelApiProtocol = HttpModelApiProtocol | 'chatgpt_web';
+
+export type ModelApiProtocol = HttpModelApiProtocol;
 
 export interface LLMConfig {
   baseUrl: string;

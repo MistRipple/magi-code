@@ -2,8 +2,6 @@
 
 本文覆盖 daemon 中两类只增不减的持久日志：审计/用量账本与会话 canonical 事件日志。两者的共同问题是写入或启动成本随历史总量线性增长；本设计让写入成本只与新增量相关，启动成本只与最近一次压缩之后的增量相关。
 
-## 1. 审计/用量账本
-
 ### 1.1 状态所有权
 
 InMemoryEventBus 持有审计/用量快照与刷盘水位，StateRepository 负责启动加载。磁盘使用分段 JSONL，执行统计重置通过 usage.stats.reset 事件记录。
@@ -34,8 +32,6 @@ state_root/audit-usage-ledger/
 ### 1.4 只接受分段格式
 
 持久化账本只有段目录这一种格式。`StateRepository::load_audit_usage_ledger` 只从段目录加载，不做旧格式迁移，也不识别任何旧版账本文件。
-
-## 2. 会话 canonical 事件日志
 
 ### 2.1 状态所有权
 

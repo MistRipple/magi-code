@@ -35,7 +35,7 @@ const SETTINGS_RESOURCE_ID: &str = "__settings";
 const UPGRADE_OPERATION_FILE: &str = "upgrade-operation.json";
 /// 第一方插件身份由 Magi 自己提供，外部包不能占用同一身份再获得原生宿主能力。
 /// 新增第一方插件时必须同时加入这里，并继续通过统一的包安装入口落盘。
-const BUILTIN_PLUGIN_IDS: &[&str] = &["openai.chatgpt-web", "magi.mcp-server"];
+const BUILTIN_PLUGIN_IDS: &[&str] = &["magi.mcp-server"];
 /// 停用与升级时等待在途运行自然结束的期限，到期后统一取消。
 pub const PLUGIN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// 取消在途运行后等待其结算并释放租约的期限。
@@ -192,6 +192,37 @@ impl PluginManager {
         };
         // 先按原提交事实完成数据转换，不能把已提交升级误判成未提交并丢弃暂存数据。
         manager.recover_upgrade_operation()?;
+        // 内置包目录是宿主支持能力的唯一入口；停发的内置包不能在重启后恢复激活。
+        // 先备份安装事实，再移除注册表记录。资源数据保留，不把退役包当作外部插件加载。
+        let retired: Vec<_> = manager
+            .state
+            .plugins
+            .values()
+            .filter(|plugin| {
+                matches!(plugin.source, PluginSource::Builtin { .. })
+                    && !BUILTIN_PLUGIN_IDS.contains(&plugin.id.as_str())
+            })
+            .map(|plugin| plugin.id.clone())
+            .collect();
+        if !retired.is_empty() {
+            let backup = manager.root.join(format!(
+                "{STATE_FILE}.retired-builtins-{}-{}",
+                UtcMillis::now().0,
+                std::process::id()
+            ));
+            write_atomic(
+                &backup,
+                serde_json::to_vec_pretty(&manager.state)
+                    .map_err(|error| PluginError::CorruptState(error.to_string()))?,
+            )?;
+            let mut next = manager.state.clone();
+            for id in &retired {
+                next.plugins.remove(id);
+            }
+            manager.commit(next)?;
+            missing.retain(|id| !retired.contains(id));
+        }
+
         if !missing.is_empty() {
             // 旧版 Windows 曾误删仍被引用的 ZIP。隔离缺包记录，让其他功能正常启动；
             // 原始记录和资源保留，重新安装须显式启用和授权。
@@ -885,6 +916,12 @@ fn ensure_host_supports_surfaces(manifest: &PluginManifest) -> Result<(), Plugin
 }
 
 fn ensure_builtin_source(id: &str, source: &PluginSource) -> Result<(), PluginError> {
+    if let PluginSource::Builtin { name } = source
+        && (!BUILTIN_PLUGIN_IDS.contains(&id) || name != id)
+    {
+        return Err(conflict("该内置插件不在当前宿主支持目录中"));
+    }
+
     if BUILTIN_PLUGIN_IDS.contains(&id) && !matches!(source, PluginSource::Builtin { .. }) {
         return Err(conflict("第一方插件身份只能由 Magi 内置包提供"));
     }

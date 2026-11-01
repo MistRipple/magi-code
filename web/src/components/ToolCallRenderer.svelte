@@ -122,7 +122,6 @@
   <ToolCall
     name={toolName}
     id={block.toolCall?.id}
-    origin={block.toolCall?.origin}
     input={block.toolCall?.arguments}
     status={toolStatus}
     output={effectiveToolCall?.result}

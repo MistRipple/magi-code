@@ -622,26 +622,8 @@ async fn convert_plugin_data(
         .map_err(plugin_error)
 }
 
-/// GPT Web 的应用实例拥有唯一的页面、槽位和 Tunnel；应用级停用或升级提交后立即
-/// 释放这些宿主资源，不能让通道在插件已不可调用时继续存活。
-///
-/// Tunnel 释放失败时保留待清理状态并返回冲突：生命周期操作不得在资源未真正释放时
-/// 报告完成，调用方可以修复后重试。
-async fn release_web_model_host(state: &ApiState) -> Result<(), ApiError> {
-    state.forget_web_model_probe();
-    state.stop_web_model().await;
-    state.web_model.stop_tunnel(state).await.map_err(|error| {
-        ApiError::Conflict(format!(
-            "GPT Web 工具通道未能确认停止，已保留待清理状态，可重试：{error}"
-        ))
-    })
-}
-
-/// 第一方插件的应用级实例拥有宿主资源（GPT Web 的页面、槽位与 Tunnel；MCP 服务的监听与隧道）。
-/// 应用级停用或升级提交后立即释放；其他插件没有宿主资源。
 async fn release_application_resources(state: &ApiState, plugin_id: &str) -> Result<(), ApiError> {
     match plugin_id {
-        magi_web_model::WEB_MODEL_PLUGIN_ID => release_web_model_host(state).await,
         crate::bundled_plugins::MCP_SERVER_PLUGIN_ID => {
             // 只停监听与隧道，不改持久化的开关：重新激活后按原配置恢复。
             state.mcp_service.release().await;
@@ -655,11 +637,6 @@ async fn release_application_resources(state: &ApiState, plugin_id: &str) -> Res
 fn restore_application_resources(state: &ApiState, plugin_id: &str) {
     let state = state.clone();
     match plugin_id {
-        magi_web_model::WEB_MODEL_PLUGIN_ID => {
-            tokio::spawn(async move {
-                crate::web_model_channel::restore_configured_channel(&state).await;
-            });
-        }
         crate::bundled_plugins::MCP_SERVER_PLUGIN_ID => state.start_mcp_service_if_enabled(),
         _ => {}
     }
@@ -705,15 +682,7 @@ async fn deactivate(
     Json(request): Json<ScopeRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     // 上一次停用已提交但 Tunnel 释放失败：插件已不可用，这里只重试待清理的资源释放。
-    if id == magi_web_model::WEB_MODEL_PLUGIN_ID
-        && request.scope == "application"
-        && state.web_model.cleanup_pending()
-        && !state.web_model_plugin_active()
-    {
-        release_web_model_host(&state).await?;
-        let manager = locked(&state, "读取停用后的插件状态")?;
-        return snapshot(&manager);
-    }
+
     let drain = PluginManager::begin_deactivation(
         std::sync::Arc::clone(&state.plugin_manager),
         &id,
@@ -752,11 +721,6 @@ async fn uninstall(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    if id == magi_web_model::WEB_MODEL_PLUGIN_ID && state.web_model.cleanup_pending() {
-        return Err(ApiError::Conflict(
-            "GPT Web 工具通道仍有待清理的托管运行时，请先重试停用后再卸载".into(),
-        ));
-    }
     let mut manager = locked(&state, "卸载插件")?;
     manager.uninstall(&id).map_err(plugin_error)?;
     publish_plugin_registry_changed(&state);
@@ -970,20 +934,6 @@ mod tests {
         .with_plugin_manager(Arc::new(std::sync::Mutex::new(manager)))
     }
 
-    async fn install_bundled_request(state: &ApiState) -> axum::response::Response {
-        routes()
-            .with_state(state.clone())
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/plugins/bundled/openai.chatgpt-web/install")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-    }
-
     async fn post_json(
         state: &ApiState,
         uri: &str,
@@ -1110,54 +1060,6 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let (_, again) = post_json(&state, "/plugins/preview", request(None)).await;
         assert_eq!(again["operation"], "unchanged");
-    }
-
-    #[tokio::test]
-    async fn bundled_gpt_web_install_uses_the_plugin_manager_contract() {
-        let root = tempfile::tempdir().unwrap();
-        let state = bare_state(root.path());
-        let response = install_bundled_request(&state).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let manager = state.plugin_manager.lock().unwrap();
-        let installed = manager.package("openai.chatgpt-web").unwrap();
-        assert_eq!(installed.manifest().id, "openai.chatgpt-web");
-        assert!(matches!(
-            manager.state().plugins["openai.chatgpt-web"].source,
-            PluginSource::Builtin { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn bundled_install_upgrades_an_older_first_party_package_through_the_drain_path() {
-        let root = tempfile::tempdir().unwrap();
-        let state = bare_state(root.path());
-        let mut older = crate::bundled_plugins::gpt_web_plugin_manifest();
-        older.version = "0.9.0".into();
-        let older =
-            PluginPackage::from_manifest_and_source(older, "export default () => ({})").unwrap();
-        state
-            .plugin_manager
-            .lock()
-            .unwrap()
-            .install(
-                &older,
-                PluginSource::Builtin {
-                    name: "openai.chatgpt-web".into(),
-                },
-            )
-            .unwrap();
-
-        let response = install_bundled_request(&state).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let manager = state.plugin_manager.lock().unwrap();
-        assert_eq!(
-            manager
-                .package("openai.chatgpt-web")
-                .unwrap()
-                .manifest()
-                .version,
-            crate::bundled_plugins::gpt_web_plugin_manifest().version
-        );
     }
 
     async fn active_resource_state() -> (ApiState, tempfile::TempDir) {

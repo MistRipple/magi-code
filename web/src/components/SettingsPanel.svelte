@@ -10,11 +10,10 @@ import SettingsBrowserTab from './SettingsBrowserTab.svelte';
 import SettingsProjectTab from './SettingsProjectTab.svelte';
 import SettingsAppearanceTab from './SettingsAppearanceTab.svelte';
 import SettingsPluginsTab from './SettingsPluginsTab.svelte';
-import SettingsWebModelSection from './SettingsWebModelSection.svelte';
 import SettingsMcpServerSection from './SettingsMcpServerSection.svelte';
 import PluginTabContent from './tabs/PluginTabContent.svelte';
 import PluginSettingsForm from './PluginSettingsForm.svelte';
-import { onMount, tick, untrack } from 'svelte';
+import { tick, untrack } from 'svelte';
 import Icon from './Icon.svelte';
 import Modal from './Modal.svelte';
 import SettingsDetailPage from './SettingsDetailPage.svelte';
@@ -23,13 +22,7 @@ import { i18n } from '../stores/i18n.svelte';
 import WebFolderPicker from '../web/WebFolderPicker.svelte';
 import { getAgentColor } from '../lib/agent-colors';
 import { SETTINGS_TABS } from '../lib/settings-tabs';
-import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection, loadedPluginProjection } from '../stores/plugin-registry.svelte';
-import {
-  WEB_MODEL_SETTINGS_READY_EVENT,
-  WEB_MODEL_SETTINGS_REQUEST_EVENT,
-  consumeWebModelSettingsRequest,
-  type WebModelSettingsRequest,
-} from '../web/web-model-actions';
+import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
 
   import { useSettingsStore } from '../stores/settings-store.svelte';
   import { shellUi } from '../stores/shell-ui.svelte';
@@ -99,7 +92,6 @@ import {
   $effect(() => {
     trackPluginProjection(APPLICATION_PLUGIN_SCOPE);
   });
-  const isDesktopRuntime = typeof window !== 'undefined' && window.magiDesktop?.runtime === 'electron';
   const activeTabDefinition = $derived(
     visibleSettingsTabs.find((tab) => tab.id === store.activeTab)
       ?? pluginSettingsTabs.find((item) => item.tabId === store.activeTab)
@@ -156,37 +148,6 @@ import {
     event.preventDefault();
     void goBack();
   }
-
-  /** 失败卡片动作可在设置页尚未挂载时到达，使用 actions 模块的 pending 请求接住。 */
-  async function applyWebModelSettingsRequest(request: WebModelSettingsRequest | null): Promise<void> {
-    if (!request) return;
-    const projection = await loadedPluginProjection(APPLICATION_PLUGIN_SCOPE);
-    if (!projection.manifests.some((manifest) => manifest.id === 'openai.chatgpt-web')) {
-      store.activeTab = 'plugins';
-      return;
-    }
-    store.activeTab = 'webModel';
-    void tick().then(() => {
-      window.dispatchEvent(new CustomEvent<WebModelSettingsRequest>(
-        WEB_MODEL_SETTINGS_READY_EVENT,
-        { detail: request },
-      ));
-    });
-  }
-
-  onMount(() => {
-    const handleWebModelSettingsRequest = (event: Event) => {
-      applyWebModelSettingsRequest(
-        (event as CustomEvent<WebModelSettingsRequest>).detail ?? null,
-      );
-    };
-    window.addEventListener(WEB_MODEL_SETTINGS_REQUEST_EVENT, handleWebModelSettingsRequest);
-    applyWebModelSettingsRequest(consumeWebModelSettingsRequest());
-    return () => window.removeEventListener(
-      WEB_MODEL_SETTINGS_REQUEST_EVENT,
-      handleWebModelSettingsRequest,
-    );
-  });
 
   // 其他视图（如右栏添加菜单）请求设置页落到指定分类。
   $effect(() => {
@@ -755,8 +716,6 @@ import {
         <SettingsBrowserTab />
       {:else if store.activeTab === 'plugins'}
         <SettingsPluginsTab />
-      {:else if store.activeTab === 'webModel' && visibleSettingsTabs.some((tab) => tab.id === 'webModel')}
-        <SettingsWebModelSection isDesktop={isDesktopRuntime} />
       {:else if store.activeTab === 'mcpServer'}
         <div class="apple-manager"><div class="apple-scroller-proxy"><div class="settings-section">
           <SettingsMcpServerSection />

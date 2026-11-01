@@ -33,7 +33,6 @@ const CRATE_META = {
   'magi-plugin-runtime': ['exec', 'QuickJS ESM 与受管插件 Worker 执行边界'],
   'magi-plugin-system': ['bus', '插件包、贡献合同与 daemon 生命周期管理'],
   'magi-session-isolation': ['storage', '会话隔离工作副本与合并'],
-  'magi-web-model': ['bus', 'GPT Web 槽位客户端与远端会话同步'],
   'magi-agent-role': ['exec', 'AgentRole：角色定义、注册表与文件加载'],
   'magi-api': ['api', 'HTTP / 路由、MCP 配置、session 标题'],
   'magi-bridge-client': ['bus', 'LLM 桥接客户端：适配器、决策引擎、最终文本策略'],

@@ -58,7 +58,7 @@ assert.match(browserTab, /function toggleDeviceEmulation\(\)/u);
 assert.match(browserTab, /function toggleActionsMenu\(\)/u);
 assert.match(browserTab, /event\.type === 'popup_blocked'[\s\S]*popupBlockedMessage/u);
 assert.match(browserTab, /class="browser-action-error"[\s\S]*popover="manual"/u);
-assert.match(browserTab, /\{#if mobileEmulation && !appLevelSurface\}/u);
+assert.match(browserTab, /\{#if mobileEmulation\}/u);
 assert.match(browserTab, /\{#if actionsMenuOpen\}/u);
 assert.match(browserTab, /data-tooltip=/u);
 assert.match(browserTab, /\.browser-toolbar \{[\s\S]*z-index: 10[\s\S]*isolation: isolate/u);

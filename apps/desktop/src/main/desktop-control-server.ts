@@ -33,7 +33,6 @@ import type {
   BrowserSurfaceEvent,
   BrowserSurfaceManager,
 } from "./browser-surface-manager.js";
-import { isWebModelBrowserSession } from "./web-model-session.js";
 
 const HEARTBEAT_INTERVAL_MS = 2_000;
 const MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
@@ -862,11 +861,7 @@ export class DesktopControlServer {
           awaitPageLoad: false,
           reannouncePrimary: true,
         };
-        const binding = isWebModelBrowserSession(
-          command.payload.browser_session_id,
-        )
-          ? await this.#materializeBrowserSurfaceInBackground(materializeInput)
-          : await this.#surfaceManager.materialize(materializeOptions);
+        const binding = await this.#surfaceManager.materialize(materializeOptions);
         // create_page 只负责登记逻辑 Browser Tab。真正的 guest 由右栏
         // <webview> 随后注册；此阶段不能等待或伪造 WebContents binding。
         const contents = binding
@@ -1196,9 +1191,7 @@ export class DesktopControlServer {
     // 自动化永远不改用户的布局：页面已绑定内容槽时直接复用；否则后台物化，并要求
     // Renderer 让该页面保持挂载（不可见时离屏），用户切换会话、切换 Tab 或折叠右栏
     // 都不会卸载代理正在使用的页面。
-    if (!isWebModelBrowserSession(activation.browserSessionId)) {
-      this.#surfaceManager.retainForAgent(tabId);
-    }
+    this.#surfaceManager.retainForAgent(tabId);
     const existing = this.#surfaceManager.primaryBindingForTab(tabId);
     if (!existing || !this.#surfaceManager.isContentSlotBoundBinding(existing)) {
       await this.#ensureBrowserSurfaceInBackground(activation);

@@ -1772,26 +1772,34 @@ fn duplicate_app_scoped_sessions_in_snapshot_are_rejected() {
 }
 
 #[test]
-fn app_scoped_tabs_ignore_per_session_quota_and_are_never_reclaimable() {
+fn app_scoped_tabs_share_session_quota_and_reclamation_rules() {
     let mut authority = BrowserAuthority::new();
     register_profile(&mut authority);
     let browser_session_id = ready_app_session(&mut authority, "browser-session-app");
-    for index in 0..(crate::MAX_BROWSER_TABS_PER_SESSION + 1) {
+    for index in 0..crate::MAX_BROWSER_TABS_PER_SESSION {
         let tab_id = BrowserTabId::new(format!("browser-tab-app-{index}"));
         authority
             .create_tab(CreateBrowserTab {
                 tab_id: tab_id.clone(),
                 browser_session_id: browser_session_id.clone(),
-                url: "about:blank".to_string(),
+                url: "about:blank".into(),
                 now: at(10),
             })
-            .expect("app tab beyond the per-session quota should create");
+            .unwrap();
         authority
             .transition_tab(&tab_id, BrowserTabLifecycle::Suspended, at(11))
-            .expect("app tab should suspend");
-        // 主页与推理页面常驻：应用级页面不参与资源回收。
-        assert!(!authority.is_reclaimable_tab(&tab_id, at(12)));
+            .unwrap();
+        assert!(authority.is_reclaimable_tab(&tab_id, at(12)));
     }
+    assert!(matches!(
+        authority.create_tab(CreateBrowserTab {
+            tab_id: BrowserTabId::new("beyond-quota"),
+            browser_session_id,
+            url: "about:blank".into(),
+            now: at(13)
+        }),
+        Err(crate::BrowserAuthorityError::SessionTabLimitReached { .. })
+    ));
 }
 
 #[test]

@@ -43,18 +43,9 @@ mod task_dispatch;
 pub mod task_turn_finalize;
 mod terminal_runtime;
 pub mod tunnel;
-mod tunnel_client_install;
 #[cfg(test)]
 mod turn_harness;
 mod turn_service;
-mod web_model_channel;
-mod web_model_driver;
-pub mod web_model_ops;
-pub mod web_model_setup;
-mod web_model_setup_policy;
-pub mod web_model_setup_tools;
-mod web_question;
-pub mod web_slot_mcp;
 
 pub use browser_tool_runtime::BrowserToolRuntimeDependencies;
 pub use dto::{DaemonIdentity, DirectHttpModelProbeConfig};
@@ -69,8 +60,3 @@ pub use state::{
     recover_role_delete_transaction,
 };
 pub use task_dispatch::{schedule_restored_session_task_dispatches, workspace_execution_preparer};
-pub use web_model_channel::{
-    WEB_MODEL_TUNNEL_SECTION, WebModelChannelRuntime, WebModelTunnelConfig, WebModelTunnelStatus,
-    restore_configured_channel,
-};
-pub use web_model_driver::{HostWebModelPageDriver, WebModelHostFactory};

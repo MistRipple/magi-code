@@ -1397,36 +1397,11 @@ impl DaemonRuntime {
         // ToolRegistry 在 ApiState 之前装配；只捕获共享依赖，避免完整 ApiState 引用环。
         let browser_automation_dependencies =
             Arc::new(OnceLock::<magi_api::BrowserToolRuntimeDependencies>::new());
-        let setup_services = Arc::new(OnceLock::<magi_api::ApiState>::new());
-        let plugin_tool_executor: magi_tool_runtime::PluginToolExecutor = {
-            let holder = setup_services.clone();
-            let fallback = self.plugins.tool_executor();
-            Arc::new(move |name, arguments, context| {
-                if name == magi_api::web_model_setup_tools::tool_name() {
-                    return holder.get().map_or_else(
-                        || {
-                            (
-                                "{\"status\":\"failed\",\"error_code\":\"setup_not_initialized\"}"
-                                    .into(),
-                                magi_core::ExecutionResultStatus::Failed,
-                            )
-                        },
-                        |state| state.execute_web_model_setup_tool(arguments, context),
-                    );
-                }
-                fallback(name, arguments, context)
-            })
-        };
+
         let browser_tool_executor: magi_tool_runtime::BrowserToolExecutor = {
             let holder = Arc::clone(&browser_automation_dependencies);
-            let setup = setup_services.clone();
+
             Arc::new(move |tool_call_id, tool_name, input, context| {
-                if let Some(result) = setup
-                    .get()
-                    .and_then(|state| state.execute_setup_browser(tool_name, input, context))
-                {
-                    return result;
-                }
                 holder.get().map_or_else(
                     || {
                         (
@@ -1471,7 +1446,10 @@ impl DaemonRuntime {
             .with_knowledge_store(self.knowledge_store.clone())
             .with_external_tool_catalog_provider(external_tool_catalog_provider)
             .with_external_mcp_tool_executor(external_mcp_tool_executor)
-            .with_plugin_tools(self.plugins.tool_catalog_provider(), plugin_tool_executor)
+            .with_plugin_tools(
+                self.plugins.tool_catalog_provider(),
+                self.plugins.tool_executor(),
+            )
             .with_agent_role_catalog_provider(agent_role_catalog_provider)
             .with_image_generation_runtime(
                 image_generation_executor,
@@ -1724,11 +1702,6 @@ impl DaemonRuntime {
                             sidecars,
                             target_session_id.as_ref(),
                         ),
-                    // 已知只有哪几个会话变了（新建 / 重命名 / 删除后的替代会话 / 通知 / 续跑……）时只提交它们。
-                    // 不能走全量快照：全量保存要重新序列化全部会话和回合（本仓库实测 5–14 秒），而这一步
-                    // 是在会话存储的锁里执行的——所有读会话的工作线程都会被它挡住，整个异步运行时随之冻住，
-                    // Electron 等不到心跳回包就会断开浏览器控制连接，正在进行的 GPT Web 回合也跟着失败。
-                    // 被删会话的文件由持久化层按「不再保留」的会话列表清理。
                     SessionProjectionPersistMode::Sessions { session_ids } => repository
                         .save_session_projection_state_for_sessions(
                             durable,
@@ -1790,49 +1763,10 @@ impl DaemonRuntime {
             },
             self.state_root.clone(),
         );
-        // GPT Web 引擎的 client 工厂：宿主实现把驱动映射到 Desktop 宿主命令。
-        // 应用级浏览器会话按需创建，因此这里只装配共享引用，不固定会话 id。
-        let web_model_factory: Option<Arc<dyn magi_plugin_system::SessionEngineFactory>> = {
-            let browser_dependencies = state.browser_tool_runtime_dependencies();
-            match magi_api::WebModelHostFactory::new(
-                Arc::clone(&browser_dependencies.host_client),
-                Arc::clone(&browser_dependencies.authority),
-                self.plugins.manager(),
-                self.state_root.join("web-uploads"),
-            ) {
-                Ok(factory) => {
-                    state.web_model.set_bindings(Arc::clone(factory.bindings()));
-                    state.web_model.set_runtime(Arc::clone(factory.runtime()));
-                    state.web_model.set_driver(Arc::clone(factory.driver()));
-                    // 槽位的 turn 结束 / 释放要取消该槽位遗留的外部待审批。
-                    state.install_web_slot_hooks();
-                    Some(Arc::new(
-                        factory
-                            .with_saved_sink(state.web_saved_sink())
-                            .with_image_sink(state.web_image_sink())
-                            .with_question_sink(state.web_question_sink()),
-                    ))
-                }
-                Err(error) => {
-                    // 失败关闭：宿主驱动装配失败时不装配 Web 引擎。
-                    warn!(error = %error, "GPT Web 宿主驱动不可用，Web 引擎将不可用");
-                    None
-                }
-            }
-        };
-        let session_engine_factory =
-            self.plugins
-                .session_engine_factory(web_model_factory.map(|factory| {
-                    (
-                        magi_web_model::WEB_MODEL_ENGINE_ID_NAMESPACE.to_string(),
-                        factory,
-                    )
-                }))?;
+
+        let session_engine_factory = self.plugins.session_engine_factory(None)?;
         let workflow_core_factory = self.plugins.workflow_core_factory()?;
-        state.restore_web_model_setup_reservation();
-        setup_services
-            .set(state.web_model_setup_service_state())
-            .map_err(|_| DaemonError::internal("重复装配配置领域服务"))?;
+
         let plugin_command_executor = self.plugins.command_executor();
         let mut llm_task_dispatcher = llm_task_dispatcher;
         llm_task_dispatcher = llm_task_dispatcher
@@ -1912,9 +1846,6 @@ impl DaemonRuntime {
                     new_status,
                     TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
                 ) {
-                    if let Some(state) = setup_services.get() {
-                        state.finish_web_model_setup_task(task_id);
-                    }
                     match terminal_task_context(
                         &session_store,
                         &task_execution_registry_for_status,
@@ -2250,18 +2181,8 @@ impl DaemonRuntime {
         );
     }
 
-    #[cfg(test)]
     pub(crate) fn router(&self, service_name: String) -> Result<axum::Router, DaemonError> {
         Ok(build_router(self.build_api_state(service_name)?))
-    }
-
-    /// 同 `router`，并交出 `ApiState`，供服务器关闭后收尾对外通道。
-    pub(crate) fn router_with_state(
-        &self,
-        service_name: String,
-    ) -> Result<(axum::Router, ApiState), DaemonError> {
-        let state = self.build_api_state(service_name)?;
-        Ok((build_router(state.clone()), state))
     }
 
     #[cfg(test)]

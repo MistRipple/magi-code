@@ -1,13 +1,3 @@
-//! stdio 中继的命令行入口（`magi-mcp` 与 `magi-daemon-app mcp-relay` 共用）。
-//!
-//! ```text
-//! magi-mcp --stdio (--state-root <path> | --endpoint <path>) [--token-file <path> | --slot]
-//! ```
-//!
-//! 令牌只从 `--token-file` 或环境变量 `MAGI_MCP_TOKEN` 读取，**不接受命令行明文参数**，
-//! 避免出现在进程列表里。`--slot` 连接 GPT Web 槽位端点：不需要令牌，身份由 daemon 按槽位事实决定。
-//! 本进程不监听 TCP、不写端口文件；令牌校验与调用管线都在 daemon 侧。
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -45,16 +35,7 @@ fn run(args: &[String]) -> Result<(), String> {
             _ => return Err("需要 --endpoint、--state-root 或环境变量 MAGI_STATE_ROOT".to_string()),
         },
     };
-    // 槽位端点（GPT Web）：不做令牌握手，身份由 daemon 按槽位事实决定。
-    if args.iter().any(|arg| arg == "--slot") {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| format!("运行时初始化失败：{error}"))?;
-        return runtime
-            .block_on(StdioRelay::run(&endpoint, None))
-            .map_err(|error| format!("中继结束：{error}"));
-    }
+
     let token = match value_of(args, "--token-file") {
         Some(path) => {
             std::fs::read_to_string(&path).map_err(|error| format!("无法读取令牌文件：{error}"))?
@@ -71,7 +52,7 @@ fn run(args: &[String]) -> Result<(), String> {
         .build()
         .map_err(|error| format!("运行时初始化失败：{error}"))?;
     runtime
-        .block_on(StdioRelay::run(&endpoint, Some(&token)))
+        .block_on(StdioRelay::run(&endpoint, &token))
         .map_err(|error| format!("中继结束：{error}"))
 }
 

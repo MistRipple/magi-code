@@ -35,3 +35,5 @@ Bridge 可以拥有不同传输实现，但不得重新定义同形状的 wire D
 `CacheInvalidationReason` 因此增加 `tool_history_demoted` 与 `file_facts_refreshed`：已发送历史
 的改写有对应计数增长时按它们归因，没有任何声明的改写仍为 `history_rewritten`。旧记录缺失该
 字段时按未声明处理，读取方不得据此推断“未改写”。
+
+网页模型专属配置 DTO、发现/对话绑定字段和浏览器内部命令已从 schema 与生成物中移除；相关端点不再注册。标准 MCP 令牌、外部会话与审批合同保持独立，本地 stdio 中继始终进行令牌握手。

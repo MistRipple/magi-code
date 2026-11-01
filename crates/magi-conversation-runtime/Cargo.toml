@@ -7,7 +7,6 @@ edition.workspace = true
 magi-app-server-protocol = { path = "../magi-app-server-protocol" }
 magi-core = { path = "../magi-core" }
 magi-browser-authority = { path = "../magi-browser-authority" }
-magi-web-model = { path = "../magi-web-model" }
 magi-bridge-client = { path = "../magi-bridge-client" }
 magi-context-runtime = { path = "../magi-context-runtime" }
 magi-event-bus = { path = "../magi-event-bus" }

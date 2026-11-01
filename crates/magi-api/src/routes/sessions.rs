@@ -2428,40 +2428,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn web_engine_sessions_always_route_as_plain_chat_even_for_tool_like_text() {
-        let state = test_state();
-        let text = "请用 Magi 连接器里的工具依次完成：创建目录 e2e-dir，写入文件，搜索文本，并运行测试修改代码";
-
-        // 本地引擎：所有普通消息都进入带工具的主线。
-        let local = session_turn_request(text);
-        let local_decision = decide_session_turn(&state, &local).unwrap();
-        assert!(matches!(local_decision.route, SessionTurnRouteDto::Execute));
-
-        // 新会话首条消息携带 GPT Web 引擎配置：固定普通对话，没有任务标题 / 工具意图改写。
-        let mut first_message = session_turn_request(text);
-        first_message.orchestrator_session_config =
-            Some(serde_json::json!({ "engineId": "plugin/openai.chatgpt-web/default" }));
-        let decision = decide_session_turn(&state, &first_message).unwrap();
-        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-        assert!(decision.task_title.is_none() && decision.execution_goal.is_none());
-
-        // 已有会话：读会话设置里的引擎。
-        let session_id = magi_core::SessionId::new("session-web-routing");
-        state
-            .settings_store
-            .set_session_section(
-                &session_id,
-                "orchestrator",
-                serde_json::json!({ "engineId": "plugin/openai.chatgpt-web/default" }),
-            )
-            .unwrap();
-        let mut existing = session_turn_request(text);
-        existing.session_id = Some(session_id.to_string());
-        let decision = decide_session_turn(&state, &existing).unwrap();
-        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-    }
-
     #[tokio::test]
     async fn compact_command_acceptance_preserves_visible_command_and_argument_separation() {
         for text in [None, Some("保留接口约束")] {
@@ -2611,7 +2577,6 @@ mod tests {
         request.user_message_id = Some(format!("user-{queue_id}"));
         request.placeholder_message_id = Some(format!("assistant-{queue_id}"));
         QueuedRegularSessionTurn {
-            readiness: None,
             project_directories: None,
             request,
             request_fingerprint: None,
@@ -7407,7 +7372,6 @@ mod tests {
             .unwrap();
         state
             .enqueue_regular_session_turn(QueuedRegularSessionTurn {
-                readiness: None,
                 project_directories: None,
                 request: session_turn_request("排队消息"),
                 request_fingerprint: None,

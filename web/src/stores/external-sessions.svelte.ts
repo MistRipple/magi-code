@@ -1,10 +1,4 @@
-/**
- * 外部会话：外部 MCP 客户端（Cursor、Claude Desktop、远程 agent 等）通过 Magi MCP 调用本机工具的过程。
- *
- * 外部会话是一个真正的会话（类型为外部工具），调用过程在它的 canonical 时间线里，和内部对话、GPT Web 同一套
- * 事实与展示；点开它就是切换到这个会话。这里只缓存侧栏入口所需的概要（哪些客户端有会话），事实在 daemon，
- * 收到 `mcp.activity` 事件后重新读取。
- */
+
 import { AgentApiError, listMcpExternalSessions, type McpExternalSession } from '../web/agent-api';
 import { MCP_ACTIVITY_EVENT } from '../lib/mcp-server-events';
 

@@ -23,8 +23,6 @@ pub enum AttributionMode {
     /// 归到该令牌自己的外部工具会话（默认）。
     #[default]
     External,
-    /// 归到 GPT Web 槽位拥有者进行中的 turn（仅 GPT Web 连接器使用）。
-    FollowWebSlot,
 }
 
 /// 持久化的令牌元数据。**不含原文。**

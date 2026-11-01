@@ -4,7 +4,7 @@
 
 脚本的执行入口以各 workspace 的 package.json、Cargo target 和 .github/workflows 为准。本文区分离线检查、真实集成验收与发布，不把源码断言当作真实 Chromium 或 Provider 验收。
 
-模型档位与切换：`npm run test:model-reasoning-live` 使用隔离状态、真实 daemon/App Server/Chromium 和本地 Provider，覆盖三/六档、强度实际参数、切模校正、无默认档位重置、设置页覆盖保存、草稿刷新与重启恢复。数据归属和离线回归见[模型推理能力与选择交互](model-reasoning-capabilities.md)；不调用 GPT Web 或用户的外部模型服务。
+模型档位与切换：`npm run test:model-reasoning-live` 使用隔离状态、真实 daemon/App Server/Chromium 和本地 Provider，覆盖三/六档、强度实际参数、切模校正、无默认档位重置、设置页覆盖保存、草稿刷新与重启恢复。数据归属和离线回归见[模型推理能力与选择交互](model-reasoning-capabilities.md)；不调用 用户的外部模型服务。
 
 ## 日常开发与构建
 
@@ -22,7 +22,7 @@
 
 无项目会话收口：`npm --prefix web run test:personal-session`，真实 daemon + Chromium 验收用 `npm run test:personal-session-live`。覆盖文件/Shell/执行步骤、项目规则隔离、项目与对话区导航、文件预览下载、重启不重放和会话删除回收；只使用独立状态根与本地 Provider。
 
-无项目工具完整矩阵：`npm run test:personal-tools-live` 在同一隔离 daemon/Chromium/App Server 中增加 41 种工具的实际调用与 Provider 回灌，涵盖完整文件操作、图片生成/查看、提问答复、后台进程读写/等待/停止、12 个 Git 工具（remote 为本地 bare 仓库）、Goal/Plan 与代理发送/上下文检索/答复/取消；基础场景另执行 `update_execution_steps`。确认子代理取消已结算且主线继续完成，重启不重放副作用。模型和图片 Provider 均为本地替身，不调用 GPT Web 或用户模型配置。
+无项目工具完整矩阵：`npm run test:personal-tools-live` 在同一隔离 daemon/Chromium/App Server 中增加 41 种工具的实际调用与 Provider 回灌，涵盖完整文件操作、图片生成/查看、提问答复、后台进程读写/等待/停止、12 个 Git 工具（remote 为本地 bare 仓库）、Goal/Plan 与代理发送/上下文检索/答复/取消；基础场景另执行 `update_execution_steps`。确认子代理取消已结算且主线继续完成，重启不重放副作用。模型和图片 Provider 均为本地替身，不调用 用户模型配置。
 
 83 个内置工具按以下口径全量核对，不能把目录检查或模拟宿主当作真实页面验收：
 
@@ -36,7 +36,7 @@
 
 `cargo test -p magi-conversation-runtime --lib personal_session_catalog` 逐项核对全部 83 个工具在个人主线和普通子代理中的目录范围。代理补充回归 `agent_send_pending_to_running_race` 验证 Pending → Running 竞态只提交一次、持久失败无半写和无唤醒；API `personal_agent_cancel_preserves` 复用 daemon 的终态通知入口，验证普通子代理的 Killed 只释放子资源，不收口父 Turn。独立 Agent Turn 的既有终态仍由原绑定拥有。
 
-无项目 Git 与工具边界：`cargo test -p magi-api --lib personal_` 覆盖多仓库基线、持久恢复、外部漂移 CAS，以及删除时仅回收干净自有 worktree、保留 dirty/占用资源和外部仓库；`cargo test -p magi-api --lib web_slot_mcp::tests` 经真实 MCP socket 验证个人 GPT Web 的读写、原会话审批与工具记录、Git 查询、权限限制及槽位撤销。`cargo test -p magi-tool-runtime --lib personal_git_permissions` 验证外部仓库及 linked worktree 元数据均在执行前授权；`cargo test -p magi-project-memory --lib personal_memory_write` 验证误注入项目存储时也不能写入项目记忆。上述 live 脚本另经真实 Turn 链路执行 Shell 建仓、Git 查询/切分支和双仓库隔离；Provider 为本地替身，不代表外部模型或已登录 GPT 网站验收。
+`cargo test -p magi-tool-runtime --lib personal_git_permissions` 验证外部仓库及 linked worktree 元数据均在执行前授权；`cargo test -p magi-project-memory --lib personal_memory_write` 验证误注入项目存储时也不能写入项目记忆。上述 live 脚本另经真实 Turn 链路执行 Shell 建仓、Git 查询/切分支和双仓库隔离；Provider 为本地替身，不代表外部模型或已登录 GPT 网站验收。
 
 - Web：`npm --prefix web run check` 和 web/package.json 中对应的 `test:*`。`test:transport` 包括实时传输、App Server 客户端、滚动协调和数据加载恢复回归；`test:data-loading` 单独验证临时失败、旧请求、插件修订失效和交互作用域切换。`test:notification-runtime` 覆盖后台目录、全局错误与切换会话后的异步错误归属。
 - Desktop：`npm run check --workspace @magi/desktop`、`npm run test --workspace @magi/desktop`。
@@ -66,9 +66,8 @@ Rust 摘要、压缩或语言解析依赖升级时，运行 `cargo test -p magi-
 | `npm run test:electron-conversation-dom` | 已打包 Electron 与脚本提供的本地 HTTP Provider；验证 DOM、首轮接纳期间草稿保留、排队与会话归属、停止和继续、后台 Job 事件等待/持久终态/真实文件结果、重启恢复及时序。脚本按当前平台解析目录包、Shell 写入和进程树；应用路径、端口及场景通过 MAGI_ELECTRON_DOM_* 设置，见脚本头部。CI Windows 门禁会构建 `win-unpacked` 目录包并上传 JSON/日志证据 |
 | `npm run test:electron-plugins` | 已打包 Electron、独立状态根与本地 Provider；覆盖插件安装、授权激活、设置、隔离视图与资源同步、工具/命令、升级排空与数据转换、插件中心和停用；MCP 覆盖服务生命周期、完整工具目录、询问/开放模式、外部会话排序与审批、拒绝写入、变更账本、审计与内容留存、实际生成的 stdio 配置握手与文件读写、越界及错误令牌拒绝、HTTP 吊销。通过 MAGI_ELECTRON_PLUGINS_* 设置应用路径与端口 |
 | `cargo test -p magi-plugin-system --test catalog_tool` | 用 `scripts/plugin-center.mjs` 发布工具签名目录，再由 daemon 的 `PluginCatalog::verify` 校验；需要 Node.js，缺失时跳过 |
-| `npm run test:electron-gpt-web` | 已打包 Electron；复制本机已登录的 `persist:magi-web-model` 分区到一次性状态根，向真实 ChatGPT 发送文字和两张图片，验证收发、暂存清理与停用；`MAGI_GPT_WEB_MODE=saved` 验证已保存模式，默认临时模式。`MAGI_GPT_WEB_FRESH=1` 只验证需要登录；`MAGI_GPT_WEB_QUESTION_FIXTURE=1 MAGI_GPT_WEB_LAYOUT_CHECK=1` 验证受控问答与布局；`MAGI_GPT_WEB_REAL_QUESTION=1` 单独验证真账号原生卡片，不能以受控页面替代。未找到登录分区时真实账号场景跳过 |
 | `npm run test:electron-browser-permission-matrix` | 打包 macOS Apple Silicon Electron 的 Browser 权限代表场景；需本机图形环境及空闲 daemon/CDP 端口 |
-| `npm run test:electron-right-pane-links` | 已打包 Electron、全新状态根与本地 Provider；从右栏未挂载开始，验证链接点击展开、真实页面加载、同 URL 复用、会话绑定、GPT Web 激活时切换、关闭 Tab 和关闭会话后 Browser 资源结算 |
+| `npm run test:electron-right-pane-links` | 已打包 Electron、全新状态根与本地 Provider；从右栏未挂载开始，验证链接点击展开、真实页面加载、同 URL 复用、会话绑定 激活时切换、关闭 Tab 和关闭会话后 Browser 资源结算 |
 
 核心集成按改动触发，不接入日常 npm test。Browser actions 负责页面交互和快照，network policy 负责 Chromium 网络边界；DOM 入口负责消息、工具、审批、取消和重启恢复；Browser live 检查当前 Tab 的物理生命周期，权限矩阵验证真实工具授权，MCP 入口验证 HTTP/stdio 对外协议。
 
@@ -265,11 +264,11 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 ### Executor 能力与历史恢复
 
-当前仅验收原生模型、GPT Web、现有插件及通用接口/历史读取边界；具体外部执行器和专用验收已撤下，不属于当前产品交付。Magi CLI 已废弃，手机使用同一 Web 工作台。
+当前仅验收原生模型、现有插件及通用接口/历史读取边界；具体外部执行器和专用验收已撤下，不属于当前产品交付。Magi CLI 已废弃，手机使用同一 Web 工作台。
 
 定向入口：`cargo test -p magi-bridge-client executor_capabilities --lib`、`cargo test -p magi-plugin-system session_engine --lib`、`cargo test -p magi-conversation-runtime model_step --lib`、`cargo test -p magi-conversation-runtime executor_owned_source --lib`、`cargo test -p magi-api unsupported_executor_preserves --lib`。持久化入口：`cargo test -p magi-daemon model_step_journal_replays --lib` 与 `cargo test -p magi-daemon prior_state_layouts_upgrade --lib`。
 
-覆盖发送前拒绝、完整插件文字历史、唯一终态、Step 能力重载、历史外部工具不重复执行、切换模型不能绕过来源恢复限制，以及不支持引导时保留队列。队列 Web 投影还必须保留服务端 revision、workflow/plugin 选择、停止并改做元数据和 `unsupported_executor` 原因；否则编辑/重试会丢 CAS 身份，排队输入会退化成普通消息。`cargo test -p magi-conversation-runtime --lib conversation_loop_streams_tool_round_content_like_main_chat` 核对原生模型最终签名经最终化和 Thread 重建保留，不能被之前的工具响应签名替换。Web 同时运行 check、bridge golden 与 protocol:check；`npm run test:daemon-input-queue` 从真实 daemon + Chromium 复验原生引导、队列消费与无预算 Goal。GPT Web 的离线 Driver 回归不代表已登录网站、打包 Desktop 或 Windows 原生验收。
+覆盖发送前拒绝、完整插件文字历史、唯一终态、Step 能力重载、历史外部工具不重复执行、切换模型不能绕过来源恢复限制，以及不支持引导时保留队列。队列 Web 投影还必须保留服务端 revision、workflow/plugin 选择、停止并改做元数据和 `unsupported_executor` 原因；否则编辑/重试会丢 CAS 身份，排队输入会退化成普通消息。`cargo test -p magi-conversation-runtime --lib conversation_loop_streams_tool_round_content_like_main_chat` 核对原生模型最终签名经最终化和 Thread 重建保留，不能被之前的工具响应签名替换。Web 同时运行 check、bridge golden 与 protocol:check；`npm run test:daemon-input-queue` 从真实 daemon + Chromium 复验原生引导、队列消费与无预算 Goal。
 
 ### 受控两层代理与资源归属
 

@@ -991,34 +991,6 @@ mod tests {
         assert_eq!(manager.lock().unwrap().plugin_lease_count("test.engine"), 0);
     }
 
-    #[test]
-    fn native_plugin_namespace_keeps_engine_routing_single_owner() {
-        let root = tempfile::tempdir().expect("create plugin manager root");
-        let manager = PluginManager::open(root.path()).expect("open empty plugin manager");
-        let factory = PluginSessionEngineFactory::new(
-            Arc::new(std::sync::Mutex::new(manager)),
-            magi_plugin_runtime::PluginHost::new(
-                std::path::PathBuf::from("/tmp/magi-plugin-worker"),
-                magi_process::ManagedProcessGroup::default(),
-            ),
-            Arc::new(RejectingCapabilityHandler),
-            magi_plugin_runtime::RuntimeLimits::default(),
-        )
-        .with_excluded_namespaces(["plugin/openai.chatgpt-web"]);
-        assert!(factory.supports("plugin/example/engine"));
-        assert!(!factory.supports("plugin/openai.chatgpt-web/default"));
-
-        let native = NativeSessionEngineFactory::new(vec![(
-            "plugin/openai.chatgpt-web".into(),
-            Arc::new(NamespaceFactory("plugin/openai.chatgpt-web")),
-        )])
-        .expect("native engine registry");
-        let router = SessionEngineRouter::new(vec![Arc::new(factory), Arc::new(native)])
-            .expect("router should register host and plugin factories");
-        assert!(router.supports("plugin/openai.chatgpt-web/default"));
-        assert!(router.supports("plugin/example/engine"));
-    }
-
     impl SessionEngineFactory for NamespaceFactory {
         fn supports(&self, engine_id: &str) -> bool {
             engine_id.starts_with(self.0)

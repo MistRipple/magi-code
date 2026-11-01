@@ -5,7 +5,7 @@
 ## 项目定位
 
 - Magi 只提供 Electron 桌面 GUI 与 Web 工作台，不提供 Magi CLI 或独立移动端应用；手机和平板通过同一 Web 工作台的响应式布局访问。
-- 外部 Agent Executor 当前只预留通用扩展接口，不提供具体执行器、设置入口或试点交付；现有原生模型、GPT Web 与插件运行能力继续维护。
+- 外部 Agent Executor 当前只预留通用扩展接口，不提供具体执行器、设置入口或试点交付；现有原生模型 与插件运行能力继续维护。
 - Rust 后端已完成重构与协议冻结，当前处于正式运行阶段
 - 前端基于现有 `magi` 产品方案迁移完成，持续完善产品体验
 - 后端重构历史文档已归档清理，当前以代码和真实运行链路为唯一事实源
@@ -16,7 +16,6 @@
 - 前端以现有产品方案为基线，不发散成新的 UI 产品方向
 - UI 层可以继续完善产品表达，但不能反向定义后端协议
 - 禁止长期双实现、回退逻辑与补丁式兼容分支
-- HTTP 模型连接统一填写 API 基础地址，由显式 `apiProtocol` 生成标准端点；仅提供 OpenAI Responses（新配置默认）、OpenAI Chat Completions 与 Anthropic Messages。已有配置保留所选协议，启动时移除废弃的路径模式字段。GPT Web 与插件引擎继续使用各自的非 HTTP 入口。
 - JS 构建要求 Node.js >=24.22.1。Electron 45、Desktop Main 和 Browser Automation Worker 均以 Electron 内置 Node 24 为运行目标；Web 使用 Vite 8/Rolldown 与 Oxc；TypeScript 统一使用 6.x，因为当前 svelte-check 4.x 的正式检查合同仍不支持直接切换 TypeScript 7。
 - Rust HTTP 使用 reqwest 0.13 默认的 Rustls、系统证书验证与系统代理。摘要和快照依赖升级保持已有 SHA-256 十六进制标识及 zstd 存储格式兼容，不要求迁移用户数据。
 
@@ -85,7 +84,6 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 | 文件与变更 | HTTP 资源使用 `sourceFolderId`，文件引用、预览、下载、终端、变更和 Git 面板保留该身份。多目录项目的单目录资源请求省略身份时拒绝猜测；同名相对路径分别寻址。 |
 | 状态存储 | 项目历史、规则、记忆与账本按 `<state>/projects/<workspaceId 的 UTF-8 十六进制编码>` 定位，canonical 事件沿原 state 根保存。主要目录仅是新请求的默认 cwd，DTO 的 `rootPath` 仅为主要目录展示投影。 |
 | 旧数据 | 原单根记录和源目录 `.magi` 只用于单向迁移/可移植导入；清单、布局写屏障、原子写入和冲突拒绝保护原数据。固定项目根存在后不再扫描保留备份，防止会话删除后复活。移除项目保留源文件和历史。 |
-| 规则与外部调用 | 项目共享 `AGENTS.md` 位于固定项目状态根，各源目录规则从实际执行根读取。MCP 固定签发时的目录集合；GPT Web 从 owner session 与原 canonical Turn 解析目录，回复图片也保留原槽位代际和执行副本。 |
 
 会话隔离、Git 与知识图谱的具体边界分别见[隔离设计](session-isolation.md)、[Git 工作流](session-git-workflow.md)和[知识图谱](knowledge-graph-design.md)。[个人会话](personal-session-architecture.md)继续使用独立会话执行目录，不能在项目资源失效时成为回落路径。
 
@@ -99,7 +97,6 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 
 - [无项目会话与对话列表](personal-session-architecture.md)：个人归属、独立执行目录、项目能力边界、文件生命周期和历史兼容。
 
-- [Magi 插件系统：需求与方案设计](./plugin-system-requirements-design.md)：统一安装、授权、生命周期、版本化资源、插件工具与工作流、会话引擎路由、隔离视图、第一方 GPT Web/MCP 服务插件壳及插件中心已接入；平台验证、取消结算与通用 Browser surface 的限制见 §10.1。作者合同见[插件作者指南](./plugin-authoring.md)。
 - [Magi 内置浏览器完整设计](./browser-runtime-design.md)：Browser Authority、Browser Automation Worker、Goal/子代理租约、右侧预览、页面标记与跨平台发布基线。
 - [内置工具的失败合同](./builtin-tool-failure-contract.md)：工具失败时必须告诉模型什么、暂态重试的唯一负责层、结构化错误字段，以及文件、shell 与后台进程、web、搜索、Git、update_plan 等内置工具的具体约定。
 - [对话展示：详细模式与摘要模式](./conversation-display-modes.md)：两种显示模式共用的事实投影、摘要模式折叠与分组规则、工具卡片状态（含结果未确认）与流式稳定性约束。
@@ -108,9 +105,6 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 - [Prompt Lineage 与缓存根架构](./prompt-cache-lineage-architecture.md)：把提示词 IR、分支 lineage、cache epoch、Provider Cache Contract 和 logical/transport usage 统一为 daemon 一级事实。
 - [知识图谱设计与维护](./knowledge-graph-design.md)：图谱事实源、候选审阅、检索预算、索引维护与定向验证。
 - [用户自定义子代理角色](./custom-worker-role-design.md)：角色定义、持久化、注册表热更新、导入导出与调度合同。
-- [Magi GPT Web 最终开发文档](./web-model-browser-development.md)：**当前唯一开发基线**；单宿主、单槽位、临时 / 已保存对话、单向 Web → 本地、工具能力通过 Magi MCP 服务接入、状态所有权和验收口径。
-- [GPT Web AI 配置改造目标与验收](./web-model-setup-agent.md)：主助手的 GPT Web 配置任务的边界、检查点闸门、人工交接与代码地图；验收入口见[GPT Web 配置验收](./gpt-web-setup-validation.md)。
-- [Magi MCP 服务设计](./magi-mcp-server-design.md)：Magi 对外提供的标准 MCP 服务端，任何 MCP 客户端可在已注册工作区使用文件、搜索、只读 git、变更账本等工具；令牌与授权方式、审批、路径限制、审计，本机 stdio / 回环 HTTP 与 Cloudflare Quick Tunnel 网络模式（**均已实现**）；动态网关目录含内置工具、下游 MCP 与 Skill handler；§12 记录 GPT Web 槽位端点的最终接线（无令牌、槽位表派生身份与归属、OpenAI Tunnel 通道、代码地图）。
 
 - [Turn、事件事实与对话执行架构](./conversation-response-core-architecture-redesign.md)：统一接纳、任务调度、终态、恢复和权限边界。
 - [持久日志的追加写入与压缩](./durable-log-compaction-design.md)：用量账本分段、canonical 事件检查点和崩溃恢复。

@@ -38,7 +38,6 @@
         "magi-desktop:get-browser-component-info",
         "magi-desktop:restart-browser-automation",
         "magi-desktop:clear-browser-data",
-        "magi-desktop:clear-web-model-data",
         "magi-desktop:check-for-updates",
         "magi-desktop:download-update",
         "magi-desktop:install-update"
@@ -76,7 +75,6 @@
     { "$ref": "#/$defs/getBrowserComponentInfo" },
     { "$ref": "#/$defs/restartBrowserAutomation" },
     { "$ref": "#/$defs/clearBrowserData" },
-    { "$ref": "#/$defs/clearWebModelData" },
     { "$ref": "#/$defs/checkForUpdates" },
     { "$ref": "#/$defs/downloadUpdate" },
     { "$ref": "#/$defs/installUpdate" }
@@ -639,15 +637,6 @@
       "required": ["channel", "payload"],
       "properties": {
         "channel": { "const": "magi-desktop:clear-browser-data" },
-        "payload": { "$ref": "#/$defs/empty" }
-      }
-    },
-    "clearWebModelData": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["channel", "payload"],
-      "properties": {
-        "channel": { "const": "magi-desktop:clear-web-model-data" },
         "payload": { "$ref": "#/$defs/empty" }
       }
     },

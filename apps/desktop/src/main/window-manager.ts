@@ -73,12 +73,7 @@ function resolveWindowTitle(sessionTitle: string): string {
   return normalized || DEFAULT_WINDOW_TITLE;
 }
 
-/**
- * 应用级（GPT Web）Surface 等待 Renderer 内容槽注册的上限。
- *
- * 必须明显小于 daemon 侧 `BROWSER_SURFACE_WAIT_TIMEOUT`（5 s），这样 Renderer
- * 迟到时命令以「未注册」收口，由调用方重试，而不是把 5 s 预算耗在超时上。
- */
+
 const CONTENT_SLOT_REGISTRATION_WAIT_MILLIS = 4_000;
 const CONTENT_SLOT_REGISTRATION_POLL_MILLIS = 50;
 
@@ -95,13 +90,7 @@ export interface DesktopWindowSnapshot {
   } | null;
   activeBrowserNavigationRevision: number | null;
   activeBrowserDownloads: BrowserDownloadRuntimeSnapshot[];
-  /**
-   * 本窗口内每个 Browser Tab 的承载身份（含没有激活意图的应用级 Tab）。
-   *
-   * 会话级 Tab 仍以 `layout.activeSurfaceId` 为准；应用级 GPT Web 会话不允许
-   * 写激活意图（A25、R49），只能靠这份清单拿到 `surfaceId` 与
-   * `navigationRevision` 才能注册 `<webview>`。
-   */
+
   browserSurfaces: BrowserSurfaceRuntimeSnapshot[];
 }
 
@@ -460,15 +449,7 @@ export class WindowManager {
     this.resolveBrowserSurfaceReadiness(record);
   }
 
-  /**
-   * 自动化取得页面的后台驱动路径（会话级 Tab 与应用级 GPT Web 共用）。
-   *
-   * **不写任何布局意图**：不设置 `right_pane_visibility`、不切 `active_panel`、
-   * 不推进 activation generation，因此代理操作不会抢走右栏或切换用户正在看的 Tab。
-   *
-   * Surface 已注册时直接返回既有 primary binding；未注册时只物化并广播快照，
-   * Renderer 按快照把该页面挂载在（可能离屏的）内容槽中完成 guest 注册。
-   */
+
   async ensureBrowserSurfaceInBackground(
     input: BrowserSurfaceActivationInput,
   ): Promise<BrowserSurfaceBinding | null> {
@@ -1045,13 +1026,7 @@ export class WindowManager {
     return snapshot;
   }
 
-  /**
-   * 发布当前窗口的完整运行时快照，而不触碰窗口布局。
-   *
-   * App 级 GPT Web 的后台 materialize 需要在没有 `active_panel` 或右栏可见性
-   * 变化时，把新建的 `browserSurfaces` 投影给 Renderer；因此快照发布必须成为
-   * 独立事务，而不能隐含在 `applyLayout` 的布局事务里。
-   */
+
   private publishSnapshot(record: DesktopWindowRecord): DesktopWindowSnapshot {
     const snapshot = this.snapshot(record.windowId);
     this.resolveBrowserSurfaceReadiness(record);

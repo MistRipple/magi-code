@@ -51,7 +51,6 @@
 
 - `npm --prefix web run check`：0 errors / 0 warnings。
 - `npm --prefix web run build`：成功。
-- 相关回归通过：`test:tool-call-display`、`test:conversation-disclosure`、`test:image-generation-preview`、`test:chat-interaction`、`test:appearance`、`test:tool-display`、`test:web-model`、`test:mermaid-source`、`test:user-question`、`test:file-reference`、`test:tool-error`。
 - 浏览器正式组件矩阵：8 个皮肤 × 详细/摘要 × 820/420/320px，共 48 组。检查内容列与标题栏溢出、状态点/箭头垂直中心、尾栏相对卡片外缘 13px 的基准、真实图片加载，结果均通过。
 - 手动展开后追加运行工具、再结束输出：已有工具组和搜索卡保持展开；新工具组由蓝点转为绿点。
 - Mermaid 真实渲染成功；已生成图片通过 daemon 文件读取入口加载成功；长文件名保留 `.svelte` 后缀。

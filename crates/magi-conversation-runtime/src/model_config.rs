@@ -122,11 +122,7 @@ pub enum ModelApiProtocol {
     OpenAiChat,
     OpenAiResponses,
     AnthropicMessages,
-    /// GPT Web 模型：推理由内置浏览器里的 ChatGPT 网页完成，**没有 HTTP 传输**。
-    ///
-    /// 它不写 `llm`、不带 `baseUrl / apiKey / model`，因此任何把协议当 HTTP
-    /// 处理的分支都必须显式拒绝它，不得回退到 `openai_chat`（设计基线 §5.6、A7）。
-    ChatGptWeb,
+
     /// 插件会话引擎：消息由已注册插件工厂承载，没有 HTTP 传输。
     Plugin,
 }
@@ -137,21 +133,18 @@ impl ModelApiProtocol {
             "openai_chat" => Some(Self::OpenAiChat),
             "openai_responses" => Some(Self::OpenAiResponses),
             "anthropic_messages" => Some(Self::AnthropicMessages),
-            "chatgpt_web" => Some(Self::ChatGptWeb),
+
             "plugin" => Some(Self::Plugin),
             _ => None,
         }
     }
 
-    /// 归一为 HTTP 传输协议；`None` 表示该协议**没有 HTTP 传输**。
-    ///
-    /// 返回 `Option` 让调用方在编译期就无法把 Web 引擎当成 HTTP 协议处理。
     fn to_http_protocol(self) -> Option<HttpModelBridgeProtocol> {
         match self {
             Self::OpenAiChat => Some(HttpModelBridgeProtocol::ChatCompletions),
             Self::OpenAiResponses => Some(HttpModelBridgeProtocol::Responses),
             Self::AnthropicMessages => Some(HttpModelBridgeProtocol::AnthropicMessages),
-            Self::ChatGptWeb => None,
+
             Self::Plugin => None,
         }
     }
@@ -161,7 +154,7 @@ impl ModelApiProtocol {
             Self::OpenAiChat => "openai",
             Self::OpenAiResponses => "openai",
             Self::AnthropicMessages => "anthropic",
-            Self::ChatGptWeb => "chatgpt_web",
+
             Self::Plugin => "plugin",
         }
     }
@@ -198,7 +191,7 @@ impl NormalizedModelConfig {
             .any(|field| value.get(*field).is_some());
         let api_protocol = match string_field(value, "apiProtocol") {
             Some(label) => ModelApiProtocol::from_label(&label).ok_or_else(|| {
-                "apiProtocol 无效，必须是 openai_chat、openai_responses、anthropic_messages、chatgpt_web 或 plugin"
+                "apiProtocol 无效，必须是 openai_chat、openai_responses、anthropic_messages 或 plugin"
                     .to_string()
             })?,
             None if has_connection_fields => {
@@ -306,14 +299,8 @@ impl NormalizedModelConfig {
         self
     }
 
-    /// 该配置的 HTTP 传输协议；`None` 表示非 HTTP 引擎（GPT Web）。
     pub fn api_protocol(&self) -> Option<HttpModelBridgeProtocol> {
         self.api_protocol.to_http_protocol()
-    }
-
-    /// 该配置是否就是非 HTTP 的 GPT Web 引擎。
-    pub fn is_chatgpt_web(&self) -> bool {
-        self.api_protocol == ModelApiProtocol::ChatGptWeb
     }
 
     pub fn is_plugin(&self) -> bool {
@@ -384,8 +371,6 @@ impl NormalizedModelConfig {
     }
 
     pub fn to_http_model_client(&self) -> Option<HttpModelBridgeClient> {
-        // GPT Web 引擎没有 HTTP 传输：显式拒绝，绝不回退到任何 HTTP 协议
-        // （设计基线 §5.6：宁可报错，不得静默换 HTTP 模型）。
         let protocol = self.api_protocol.to_http_protocol()?;
         let base_url = self.normalized_http_base_url().ok()?;
         let model = self.model.as_deref()?.trim();
@@ -753,14 +738,8 @@ pub fn resolve_orchestrator_model_config(
     let session_override = session_id
         .map(|session_id| settings_store.get_session_section(session_id, "orchestrator"))
         .unwrap_or(serde_json::Value::Null);
-    // 引擎绑定（A22）：会话级 `engineId` 决定该会话由哪个引擎承载。绑定了引擎就
-    // 只读该引擎，绝不叠加全局 base——否则用户选中的 Web 引擎会被 HTTP 模型顶替，
-    // 或反过来让 Web 引擎拿到不相干的连接配置。
     if let Some(engine_id) = orchestrator_engine_id(settings_store, session_id) {
-        let mut config = if magi_web_model::is_chatgpt_web_engine_id(&engine_id) {
-            // GPT Web 是固定入口，不在引擎注册表里：引擎 id 命名空间就是它的全部事实。
-            chatgpt_web_engine_config(&engine_id)
-        } else if engine_id.starts_with("plugin/") {
+        let mut config = if engine_id.starts_with("plugin/") {
             serde_json::json!({ "apiProtocol": "plugin", "model": engine_id })
         } else {
             let entry = engine_entry(settings_store, &engine_id)
@@ -807,56 +786,6 @@ pub fn role_bound_engine_id(
     role_id: &str,
 ) -> Option<String> {
     role_engine_binding(settings_store, role_id).map(|binding| binding.engine_id)
-}
-
-/// 角色绑定的引擎是否就是 GPT Web 引擎。
-///
-/// 角色继承编排模型时（`engineId` 为空）返回 `false`：继承的判定在
-/// conversation dispatcher，不在这里重复。
-pub fn role_engine_is_chatgpt_web(
-    settings_store: &magi_settings_store::SettingsStore,
-    role_id: &str,
-) -> bool {
-    let Some(binding) = role_engine_binding(settings_store, role_id) else {
-        return false;
-    };
-    magi_web_model::is_chatgpt_web_engine_id(&binding.engine_id)
-}
-
-/// 会话级 Web 对话绑定所在的会话 section（W11、§3.1）：只存模式与远端引用，
-/// 不存任何网页上下文。读不出来就当作“临时对话”。
-pub const SESSION_WEB_CONVERSATION_SECTION: &str = "webConversation";
-
-/// 读取会话的 Web 对话绑定；缺失或无法解析时是未绑定的临时对话。
-pub fn session_web_conversation_binding(
-    settings_store: &magi_settings_store::SettingsStore,
-    session_id: &SessionId,
-) -> magi_web_model::WebConversationBinding {
-    serde_json::from_value(
-        settings_store.get_session_section(session_id, SESSION_WEB_CONVERSATION_SECTION),
-    )
-    .unwrap_or_else(|_| magi_web_model::WebConversationBinding::temporary())
-}
-
-/// 会话绑定的 GPT Web 入口 id；会话没有绑定 Web 引擎时返回 `None`。
-///
-/// GPT Web 没有会话级运行期开关：模型与强度由网页自己选，工具能力只取决于 MCP 通道，
-/// 工具轮数、“每轮新建对话”都不存在（W1、W8、W16）。
-pub fn orchestrator_web_engine_id(
-    settings_store: &magi_settings_store::SettingsStore,
-    session_id: Option<&SessionId>,
-) -> Option<String> {
-    orchestrator_engine_id(settings_store, session_id)
-        .filter(|engine_id| magi_web_model::is_chatgpt_web_engine_id(engine_id))
-}
-
-/// Web 入口没有 HTTP 连接配置：只有协议标签与（占位的）模型名。
-fn chatgpt_web_engine_config(engine_id: &str) -> serde_json::Value {
-    let family = engine_id
-        .strip_prefix(magi_web_model::WEB_MODEL_ENGINE_ID_NAMESPACE)
-        .and_then(|value| value.strip_prefix('/'))
-        .unwrap_or(engine_id);
-    serde_json::json!({ "apiProtocol": "chatgpt_web", "model": family })
 }
 
 pub fn ensure_orchestrator_reasoning_effort(config: &mut serde_json::Value) {
@@ -911,9 +840,6 @@ pub fn merge_orchestrator_session_override(
             serde_json::Value::String(model.trim().to_string()),
         );
     }
-    // 引擎绑定（A22）：会话级 `engineId` 与其它字段同一条合并路径。
-    // 空串是显式的「继承编排模型」，必须**删除**已有绑定，否则选择器无法把
-    // 会话从 Web 引擎切回 provider 模型。
     if let Some(engine_id) = override_map.get("engineId")
         && let Some(engine_id) = engine_id.as_str()
     {
@@ -1032,63 +958,6 @@ mod tests {
 
     fn model_config(value: Value) -> NormalizedModelConfig {
         NormalizedModelConfig::from_settings_value(&value).expect("模型配置应符合当前协议")
-    }
-
-    #[test]
-    fn session_engine_binding_resolves_the_fixed_web_entry_without_llm_or_registry() {
-        let store = magi_settings_store::SettingsStore::new();
-        let session_id = SessionId::new("session-web-engine");
-        // 注册表里没有任何 Web 条目：固定入口只由引擎 id 命名空间决定。
-        store
-            .set_session_section(
-                &session_id,
-                "orchestrator",
-                json!({ "engineId": "plugin/openai.chatgpt-web/default", "reasoningEffort": "high" }),
-            )
-            .expect("写入会话级覆盖");
-        let config = resolve_orchestrator_model_config(&store, Some(&session_id))
-            .expect("固定的 Web 入口应当解析成功");
-        assert!(
-            config.is_chatgpt_web(),
-            "绑定 Web 引擎后协议必须是 chatgpt_web"
-        );
-        assert!(config.to_http_model_client().is_none());
-        assert_eq!(config.provider(), "chatgpt_web");
-        assert_eq!(
-            orchestrator_web_engine_id(&store, Some(&session_id)).as_deref(),
-            Some("plugin/openai.chatgpt-web/default")
-        );
-        // 绑定默认是临时对话；已保存对话只存远端引用。
-        assert_eq!(
-            session_web_conversation_binding(&store, &session_id).mode,
-            magi_web_model::WebConversationMode::Temporary
-        );
-        store
-            .set_session_section(
-                &session_id,
-                SESSION_WEB_CONVERSATION_SECTION,
-                serde_json::to_value(magi_web_model::WebConversationBinding::saved("conv-1"))
-                    .unwrap(),
-            )
-            .expect("写入绑定");
-        let binding = session_web_conversation_binding(&store, &session_id);
-        assert_eq!(binding.mode, magi_web_model::WebConversationMode::Saved);
-        assert_eq!(binding.remote_conversation_id.as_deref(), Some("conv-1"));
-    }
-
-    #[test]
-    fn a_local_session_never_reports_a_web_engine() {
-        let store = magi_settings_store::SettingsStore::new();
-        let session_id = SessionId::new("session-local");
-        assert!(orchestrator_web_engine_id(&store, Some(&session_id)).is_none());
-        store
-            .set_session_section(
-                &session_id,
-                "orchestrator",
-                json!({ "engineId": "engine-http", "model": "m" }),
-            )
-            .unwrap();
-        assert!(orchestrator_web_engine_id(&store, Some(&session_id)).is_none());
     }
 
     #[test]
@@ -1236,26 +1105,6 @@ mod tests {
         .expect_err("已配置连接不得缺少 apiProtocol");
 
         assert!(error.contains("缺少 apiProtocol"));
-    }
-
-    #[test]
-    fn chatgpt_web_engine_has_no_http_transport() {
-        // Web 引擎承认 chatgpt_web 这个协议标签，但不得派生出任何 HTTP 传输；
-        // 任何把它当 HTTP 处理的分支都会在编译期强制显式处理 `None`（A7、§5.6）。
-        let config = NormalizedModelConfig::from_settings_value(&json!({
-            "apiProtocol": "chatgpt_web"
-        }))
-        .expect("chatgpt_web 是已知协议");
-
-        assert!(config.is_chatgpt_web());
-        assert_eq!(config.api_protocol(), None);
-        assert_eq!(config.provider(), "chatgpt_web");
-        assert!(config.to_http_model_client().is_none());
-        assert!(config.to_http_vision_client().is_none());
-        assert!(
-            config.to_http_image_generation_client().is_err(),
-            "Web 引擎不得构造 HTTP 图片生成客户端"
-        );
     }
 
     #[test]

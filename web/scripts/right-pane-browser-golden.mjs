@@ -410,39 +410,6 @@ await withGoldenViteServer(async (server) => {
   const personalBrowserSession = calls.find((call) => call.path === '/api/browser/sessions');
   assert.equal(personalBrowserSession?.body.scope, 'personal');
 
-  // 11. GPT Web（应用级）视图处于激活态时，点链接新建的 Tab 必须成为内容槽当前项，
-  //     而不是只进 Tab 条。
-  rightPane.activateRightPaneSession('workspace-golden', 'session-golden');
-  const gptHome = {
-    tabId: 'browser-tab-web-model-home',
-    lifecycle: 'ready',
-    url: 'https://chatgpt.com/',
-    navigationRevision: 1,
-  };
-  rightPane.openWebModelTab('browser-session-app-golden', gptHome);
-  assert.equal(rightPane.rightPaneState.activeAppTabId, 'webSession:app');
-  calls = installDaemonStub();
-  assert.equal(
-    await browser.openUrlInRightPaneBrowser('https://example.com/while-gpt-web', {
-      workspaceId: 'workspace-golden',
-      workspacePath: '/tmp',
-      sessionId: 'session-golden',
-    }),
-    'opened',
-  );
-  assert.equal(
-    rightPane.rightPaneState.activeAppTabId,
-    null,
-    'GPT Web 视图激活时点链接，必须离开应用级视图，新 Tab 才会显示',
-  );
-  const gptPane = rightPane.getRightPaneState('workspace-golden\u0000session-golden');
-  assert.ok(gptPane.activeTabId?.startsWith('browser:'), '新建的浏览器 Tab 成为会话级当前项');
-  assert.equal(
-    rightPane.rightPaneState.appTabs.length,
-    1,
-    '离开应用级视图不销毁它：GPT Web 宿主仍挂载，后台推理不中断',
-  );
-
   for (const binding of [
     { workspaceId: '', workspacePath: '', sessionId: 'personal-html' },
     { workspaceId: 'workspace-golden', workspacePath: '/tmp', sessionId: 'project-html' },

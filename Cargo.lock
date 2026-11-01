@@ -1512,7 +1512,6 @@ dependencies = [
  "magi-snapshot",
  "magi-tool-runtime",
  "magi-usage-authority",
- "magi-web-model",
  "magi-worker-runtime",
  "magi-workspace",
  "portable-pty",
@@ -1637,7 +1636,6 @@ dependencies = [
  "magi-snapshot",
  "magi-tool-runtime",
  "magi-usage-authority",
- "magi-web-model",
  "magi-worker-runtime",
  "magi-workspace",
  "regex",
@@ -1694,7 +1692,6 @@ dependencies = [
  "magi-snapshot",
  "magi-tool-runtime",
  "magi-usage-authority",
- "magi-web-model",
  "magi-worker-runtime",
  "magi-workspace",
  "reqwest",
@@ -2024,21 +2021,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "url",
-]
-
-[[package]]
-name = "magi-web-model"
-version = "3.0.61"
-dependencies = [
- "magi-bridge-client",
- "magi-browser-authority",
- "magi-process",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
 ]
 
 [[package]]

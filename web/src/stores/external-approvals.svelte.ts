@@ -1,7 +1,4 @@
-/**
- * 外部调用（外部 MCP 客户端、GPT Web 槽位）的待确认。事实在 daemon，这里只缓存读取结果：
- * 全局托盘和外部会话视图读同一份，批准或拒绝走同一个入口。
- */
+
 import { i18n } from './i18n.svelte';
 import { addToast } from './messages.svelte';
 import {
@@ -10,7 +7,6 @@ import {
   type AgentConnectionEventDetail,
   listMcpServerApprovals,
   resolveMcpServerApproval,
-  setWebModelToolPolicy,
   type McpServerApproval,
 } from '../web/agent-api';
 import { MCP_APPROVALS_CHANGED_EVENT } from '../lib/mcp-server-events';
@@ -25,10 +21,7 @@ export const externalApprovals = $state({
   now: Date.now(),
 });
 
-/**
- * 没有管理权限（经公网隧道访问，或 MCP 服务 / GPT Web 插件尚未激活）：请求失败后停用，不反复轮询；
- * daemon 推来新的待确认事件时再试一次（插件可能刚被激活）。
- */
+
 let disabled = false;
 let syncRevision = 0;
 let retryPending = false;
@@ -107,25 +100,6 @@ export async function resolveExternalApproval(
   retryPending = false;
   try {
     externalApprovals.approvals = await resolveMcpServerApproval(approval.approvalId, decision);
-  } catch (error) {
-    reportFailure(error);
-    retryPending = true;
-  } finally {
-    externalApprovals.busy = false;
-    if (retryPending) await refreshExternalApprovals();
-  }
-}
-
-/** 「始终允许」：把 GPT Web 的授权方式切到始终授权，并放行这一次。随时可在设置里改回。 */
-export async function alwaysAllowExternalApproval(approval: McpServerApproval): Promise<void> {
-  if (externalApprovals.busy) return;
-  ++syncRevision;
-  externalApprovals.busy = true;
-  retryPending = false;
-  try {
-    await setWebModelToolPolicy({ approvalMode: 'always' });
-    externalApprovals.approvals = await resolveMcpServerApproval(approval.approvalId, 'allow_once');
-    addToast('info', i18n.t('mcpServer.approvals.alwaysSet'));
   } catch (error) {
     reportFailure(error);
     retryPending = true;

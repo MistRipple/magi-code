@@ -3353,23 +3353,23 @@ await withGoldenViteServer(async (server) => {
   sessionTurnInterceptors.push(() => electronTurnResponse(3));
   bridge.postMessage({
     type: 'executeTask',
-    pluginCommandId: 'plugin/openai.chatgpt-web/setup',
+    pluginCommandId: 'plugin/example/setup',
     text: null,
-    requestId: 'request-gpt-setup-command',
+    requestId: 'request-plugin-command',
     workspaceId: RACE_WORKSPACE_ID,
     workspacePath: RACE_WORKSPACE_PATH,
     sessionId: RACE_SESSION_ID,
   });
   await waitFor(
-    () => capturedTurnBodies.some((body) => body.requestId === 'request-gpt-setup-command'),
+    () => capturedTurnBodies.some((body) => body.requestId === 'request-plugin-command'),
     '没有正文的插件配置命令也必须进入 canonical Turn 入口',
   );
   assert.equal(
-    capturedTurnBodies.find((body) => body.requestId === 'request-gpt-setup-command').pluginCommandId,
-    'plugin/openai.chatgpt-web/setup',
+    capturedTurnBodies.find((body) => body.requestId === 'request-plugin-command').pluginCommandId,
+    'plugin/example/setup',
     'Renderer Bridge 不得丢弃插件命令身份，否则配置会被当成模型对话',
   );
-  messagesStore.clearRequestBinding('request-gpt-setup-command');
+  messagesStore.clearRequestBinding('request-plugin-command');
 
   sessionTurnInterceptors.push(() => electronTurnResponse(3));
   bridge.postMessage({

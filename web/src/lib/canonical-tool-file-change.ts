@@ -1,4 +1,4 @@
-import type { ToolCallStatus, ToolOrigin } from '../types/message';
+import type { ToolCallStatus } from '../types/message';
 import type { ContentBlock } from '../types/message';
 import {
   coerceToolArgumentsRecord,
@@ -14,7 +14,6 @@ interface FileChangeProjectionInput {
   arguments: unknown;
   result?: unknown;
   status: ToolCallStatus;
-  origin?: ToolOrigin;
 }
 
 interface TextPatch {
@@ -135,7 +134,6 @@ function fileChangeBlock(
       sessionId: input.sessionId,
       sourceFolderId: firstString(coerceToolArgumentsRecord(input.arguments).source_folder_id) || input.defaultSourceFolderId,
       toolCallId: input.blockIdBase,
-      ...(input.origin ? { origin: input.origin } : {}),
       contentKind: 'text',
       ...change,
     },

@@ -33,10 +33,6 @@ import {
 } from "@magi/desktop-browser-contracts";
 import { BrowserSurfaceRegistry } from "./browser-surface-registry.js";
 import { matchesNavigationRevision } from "./browser-navigation-revision.js";
-import {
-  browserPartitionForSession,
-  WEB_MODEL_PARTITION,
-} from "./web-model-session.js";
 import { evaluateBrowserRequestTarget } from "./browser-network-policy.js";
 import {
   currentBrowserNetworkPolicy,
@@ -1108,16 +1104,7 @@ export class BrowserSurfaceManager {
       : null;
   }
 
-  /**
-   * 本窗口内所有承载当前 primary Surface 的 Tab 身份。
-   *
-   * 会话级 Browser Tab 的承载身份来自窗口布局的 `activeSurfaceId`（活动面板），
-   * 但应用级 GPT Web 会话**没有、也不许有**激活意图（A25、R49）。Renderer 的
-   * `<webview>` 注册必须先知道 `tabId → surfaceId + navigationRevision`，因此
-   * 这里按窗口投影一份只读清单，让应用级内容槽能在不激活右栏的前提下完成注册。
-   *
-   * 包含身份与光标展示事实，不返回 WebContents、partition 或页面内容。
-   */
+
   browserSurfaceSnapshotsForWindow(
     windowId: string,
   ): BrowserSurfaceRuntimeSnapshot[] {
@@ -1252,13 +1239,7 @@ export class BrowserSurfaceManager {
       : null;
   }
 
-  /**
-   * 返回指定窗口承载的 Primary binding。
-   *
-   * `primaryBindingForTab` 是全局逻辑 Tab 查询；后台 GPT Web 驱动还必须把
-   * `windowId` 纳入校验，否则多窗口下可能把另一窗口的 guest 绑定返回给当前
-   * 内容槽（A24）。
-   */
+
   primaryBindingForTabInWindow(
     tabId: string,
     windowId: string,
@@ -2974,7 +2955,6 @@ export class BrowserSurfaceManager {
     // 应用级持久分区必须无条件纳入清理：它可能还没有 guest 挂载，
     // 也可能因为注册表尚未落盘而不在已知集合里（设计基线 §5.13）。
     const partitions = new Set([
-      WEB_MODEL_PARTITION,
       ...this.#knownPartitions,
       ...this.#configuredPartitions,
     ]);
@@ -3000,39 +2980,6 @@ export class BrowserSurfaceManager {
           DEFAULT_NAVIGATION_TIMEOUT_MS,
         );
       }),
-    );
-  }
-
-  /**
-   * 只清应用级 GPT Web 分区（设计基线 §5.13、实现计划 3.11）。
-   *
-   * 与 `clearBrowsingData` 的区别是**不动**其他 `magi-browser-*` 分区：那些分区
-   * 属于用户各自的浏览器 Tab，站点登录态不能被本功能的清理静默牵连。重载也只
-   * 针对应用级分区里的 guest，其他 Tab 的页面不重新加载。
-   */
-  async clearWebModelBrowsingData(): Promise<void> {
-    // 这里只清 GPT Web 的持久分区。不要调用全局 `clearDownloads()`：普通
-    // Browser Tab 的下载记录不属于 GPT Web，清理登录态不应牵连用户资产。
-    const browserSession = browserSessionForPartition(WEB_MODEL_PARTITION);
-    await Promise.all([
-      browserSession.clearCache(),
-      browserSession.clearStorageData(),
-    ]);
-    await Promise.all(
-      [...this.#surfaces.values()]
-        .filter((record) => record.partitionId === WEB_MODEL_PARTITION)
-        .map((record) => {
-          const contents = record.contents;
-          if (record.closed || !contents || contents.isDestroyed())
-            return Promise.resolve();
-          return this.runNavigationAction(
-            record,
-            "reload",
-            contents.getURL() || "about:blank",
-            () => contents.reloadIgnoringCache(),
-            DEFAULT_NAVIGATION_TIMEOUT_MS,
-          );
-        }),
     );
   }
 
@@ -6289,11 +6236,12 @@ function browserPartitionId(browserSessionId: string): string {
   return browserPartitionForSession(browserSessionId);
 }
 
-/**
- * Keep the session lookup policy identical at creation, guest registration and
- * data clearing. In particular, never open the fixed Web Model partition as an
- * in-memory session just because a caller supplied `cache: false`.
- */
+
+function browserPartitionForSession(browserSessionId: string): string {
+ const safe = browserSessionId.replace(/[^A-Za-z0-9._-]/gu, "_");
+ return `magi-browser-${safe}`;
+}
+
 function browserSessionForPartition(partitionId: string) {
   return partitionId.startsWith("persist:")
     ? session.fromPartition(partitionId)
@@ -6303,7 +6251,7 @@ function browserSessionForPartition(partitionId: string) {
 /** 持久分区（应用级）与内存会话分区（普通 Tab）的注册表过滤规则。 */
 function isKnownBrowserPartition(entry: string): boolean {
   return (
-    entry === WEB_MODEL_PARTITION ||
+
     /^magi-browser-[A-Za-z0-9._-]+$/u.test(entry)
   );
 }

@@ -1,4 +1,5 @@
 <script lang="ts">
+
   import FileName from './FileName.svelte';
   import FileTypeIcon from './FileTypeIcon.svelte';
   import { onMount, tick, type Component } from 'svelte';
@@ -33,7 +34,6 @@
     settingsBootstrapMatchesCurrentWorkspace,
   } from '../web/agent-api';
   import type { PluginSelection } from '../shared/app-server-protocol.generated';
-  import type { PickerWebEngineDto } from '../shared/rust-backend-types';
   import type { AgentBindingOverride } from '../web/agent-binding-context';
   import Icon from './Icon.svelte';
   import UserQuestionPanel from './UserQuestionPanel.svelte';
@@ -70,21 +70,8 @@
     sessionNavigationState,
     waitForSessionNavigation,
   } from '../shared/session-navigation.svelte';
-  import WebModelModeChooser from './WebModelModeChooser.svelte';
-  import WebModelSessionBanner from './WebModelSessionBanner.svelte';
-  import type { WebSessionBanner } from '../web/web-model-session-banner';
-  import { WEB_MODEL_ACTION_EVENT, type WebModelActionDetail } from '../web/web-model-actions';
-  import { dispatchWebModelAction } from '../web/web-model-actions';
-  import WebModelSetupPanel from './WebModelSetupPanel.svelte';
-  import type { WebModelSetupStatus } from '../shared/app-server-protocol.generated';
-  import { WEB_MODEL_SETUP_REQUEST, webModelSetupAvailable, containsSetupSecret, controlWebModelSetup, type SetupAction } from '../web/web-model-setup';
-  import { loadedPluginProjection } from '../stores/plugin-registry.svelte';
-  import { openSettings, closeSettings } from '../stores/shell-ui.svelte';
-  import { createAppBrowserSession } from '../web/agent-api';
-  import { projectWebModelAppSession } from '../web/web-model-session-projection';
-  import { activateWebModelTab, appWebModelTab, setRightPaneCollapsed } from '../stores/right-pane.svelte';
   import ImageAttachmentTray from './ImageAttachmentTray.svelte';
-  import { bindWebSavedConversation, materializeSession } from '../web/agent-api';
+  import { materializeSession } from '../web/agent-api';
   import { canFetchModelList } from '../shared/model-governance';
   import {
     resolveOrchestratorModel,
@@ -223,81 +210,6 @@
 
   // 输入内容
   let inputValue = $state('');
-  let setupStatus = $state<WebModelSetupStatus | null>(null);
-  let setupSubmitting = $state(false);
-  let setupRequestId = $state<string | null>(null);
-  const setupAvailable = $derived(webModelSetupAvailable(pluginProjection(APPLICATION_PLUGIN_SCOPE)));
-
-  /**
-   * 配置时右栏必须展开并切到 GPT Web 标签，用户才看得到 Agent 在操作什么。
-   * 应用级主页标签由 daemon 打开页面后才进入投影，所以不能只尝试一次：
-   * 标签出现前 `activateWebModelTab` 是空操作。成功展开一次即停止，之后用户可自行收起。
-   */
-  async function revealSetupWebModelTab(): Promise<void> {
-    for (let attempt = 0; attempt < 24; attempt++) {
-      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 500));
-      if (!appWebModelTab()) await projectWebModelAppSession();
-      if (!appWebModelTab()) continue;
-      setRightPaneCollapsed(rightPaneState.activeScopeKey, false);
-      activateWebModelTab();
-      return;
-    }
-  }
-
-  async function submitWebSetup(action: SetupAction): Promise<boolean> {
-    if ((action === 'cancel' || action === 'pause') && setupStatus?.setupRunId && setupStatus.revision !== undefined && setupStatus.executionGeneration !== undefined) {
-      try {
-        const response = await controlWebModelSetup({ sessionId: setupStatus.sessionId, setupRunId: setupStatus.setupRunId,
-          expectedRevision: setupStatus.revision, executionGeneration: setupStatus.executionGeneration, action });
-        if (currentSessionId === response.configuration.sessionId) setupStatus = response.configuration;
-        return true;
-      } catch { addToast('error', i18n.t('webModel.setup.failed')); return false; }
-    }
-    if (setupSubmitting || setupRequestId || isSending || sessionInputLocked || isInteractionBlocking) return false;
-    const origin = `${currentWorkspaceId || ''}|${currentWorkspacePath || ''}|${currentSessionId || ''}`;
-    setupSubmitting = true;
-    try {
-      if (!isDesktopRuntime()) { addToast('warning', i18n.t('settings.browser.webModel.needDesktop')); return false; }
-      const projection = await loadedPluginProjection(APPLICATION_PLUGIN_SCOPE);
-      if (!webModelSetupAvailable(projection)) {
-        addToast('warning', i18n.t('webModel.setup.pluginRequired'));
-        openSettings('plugins');
-        return false;
-      }
-      if (origin !== `${currentWorkspaceId || ''}|${currentWorkspacePath || ''}|${currentSessionId || ''}`) return false;
-      const target = resolveSubmissionWorkspace();
-      const sessionId = await materializeDraftSession();
-      closeSettings();
-      await createAppBrowserSession();
-      await projectWebModelAppSession();
-      if (currentSessionId?.trim() !== sessionId) return false;
-      setupRequestId = generateId();
-      void revealSetupWebModelTab();
-      vscode.postMessage({ type: 'executeTask', text: i18n.t(`webModel.setup.request.${action}`), requestId: setupRequestId,
-        sessionId, workspaceId: target?.workspaceId || '', workspacePath: target ? workspaceNavigationPath(target) : '',
-        skillName: selectedSkill?.skillId ?? 'plugin/openai.chatgpt-web/gpt-web-setup', accessProfile: selectedAccessProfile,
-      });
-      return true;
-    } catch (error) {
-      setupRequestId = null;
-      addToast('error', error instanceof Error ? error.message : i18n.t('webModel.setup.failed'));
-      return false;
-    } finally { setupSubmitting = false; }
-  }
-  const revealedSetupRuns = new Set<string>();
-  $effect(() => {
-    const run = setupStatus?.setupRunId;
-    if (setupAvailable && setupStatus?.runState === 'running' && run && !revealedSetupRuns.has(run)) {
-      revealedSetupRuns.add(run);
-      void revealSetupWebModelTab();
-    }
-  });
-  onMount(() => {
-    const start = () => { if (setupAvailable) void submitWebSetup('start'); };
-    window.addEventListener(WEB_MODEL_SETUP_REQUEST, start);
-    return () => window.removeEventListener(WEB_MODEL_SETUP_REQUEST, start);
-  });
-
   // 斜杠快捷引用：Goal 决定持续推进生命周期，Skill 决定本轮执行方法，两者可同时引用。
   let selectedGoalMode = $state(false);
   let selectedSessionCommand = $state<ComposerSessionCommand | null>(null);
@@ -386,14 +298,6 @@
   let workspaceSearch = $state('');
   const filteredPickerModels = $derived(pickerModels.filter(model =>
     `${pickerModelDisplayNames[model] ?? ''} ${model}`.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())));
-  /**
-   * 从 Web 加载的引擎（`apiProtocol = chatgpt_web`，A22）。
-   *
-   * 与 provider 模型名并列展示在会话内主模型选择器里：选择它们会把会话绑定到
-   * 引擎（`engineId`），而不是改写 provider 连接。清单来自 daemon 的引擎注册表
-   * 投影，前端不保留第二份 Web 模型列表。
-   */
-  let pickerWebEngines = $state<PickerWebEngineDto[]>([]);
   let pickerError = $state<string | null>(null);
   let pickerLoadedOnce = false;
   let pickerModelsConfigKey = '';
@@ -503,23 +407,9 @@
   let selectedAccessProfile = $state<AccessProfile>('restricted');
   const currentPickerModel = $derived.by(() => readOrchestratorModel());
   const mainModelReady = $derived.by(() => currentPickerModel.trim().length > 0);
-  /** 会话级引擎绑定：非空表示当前会话由某个引擎承载（当前只有 Web 引擎）。 */
+
   const currentPickerEngineId = $derived.by(() => readOrchestratorEngineId());
-  const currentPickerWebEngine = $derived.by(() => (
-    pickerWebEngines.find((engine) => engine.id === currentPickerEngineId) ?? null
-  ));
-  const currentSessionUsesWebEngine = $derived.by(() => (
-    currentPickerEngineId.trim().startsWith('plugin/openai.chatgpt-web/')
-  ));
-  const canSelectPickerWebEngine = $derived.by(() => (
-    isDraftSession || !currentSessionHasCanonicalHistory || currentSessionUsesWebEngine
-  ));
-  /** 按钮上的显示名：Web 引擎用引擎显示名，其余仍用 provider 模型名。 */
-  const currentPickerLabel = $derived.by(() => (
-    currentPickerWebEngine?.displayName?.trim()
-    // GPT Web 的“模型名”只是占位（default），界面上始终显示固定入口名。
-    || (currentSessionUsesWebEngine ? i18n.t('webModel.entryName') : pickerModelDisplayNames[currentPickerModel] || currentPickerModel)
-  ));
+ const currentPickerLabel = $derived(pickerModelDisplayNames[currentPickerModel] || currentPickerModel);
   const projectedReasoningCapability = $derived(
     pickerCapabilities[currentPickerModel]
       ?? (getEffectiveOrchestratorConfigSnapshot()?.model === currentPickerModel ? messagesState.settingsBootstrapSnapshot?.orchestratorReasoningCapability : null)
@@ -530,11 +420,11 @@
     const projected = projectedReasoningCapability;
     const model = currentPickerModel;
     const config = getOrchestratorConfigSnapshot();
-    const web = currentSessionUsesWebEngine;
+
     void reasoningRetry;
     fallbackReasoningCapability = null;
     reasoningReadStatus = projected ? 'ready' : 'loading';
-    if ((projected && projected.source !== 'unknown') || web || !model || !config) return;
+    if ((projected && projected.source !== 'unknown') || !model || !config) return;
     let cancelled = false;
     void resolveAgentModelReasoning(config, model).then(value => {
       if (!cancelled) { fallbackReasoningCapability = value; reasoningReadStatus = 'ready'; }
@@ -595,24 +485,6 @@
   const currentWorkspacePath = $derived(messagesState.currentWorkspacePath);
   const selectedSourceFolderId = $derived(selectedComposerSourceFolderId(currentWorkspaceId || '', currentSessionId));
   const isDraftSession = $derived.by(() => !currentSessionId?.trim());
-  /**
-   * 会话方向边界。已有本地 canonical 历史时不提供“导入 Web”
-   * 的 UI 路径；daemon 保存入口还会再次校验，避免直接调用 API 绕过限制。
-   */
-  const currentSessionHasCanonicalHistory = $derived.by(() => {
-    const sessionId = currentSessionId?.trim() || '';
-    if (!sessionId) return false;
-    // 与 daemon 的 A26 门禁保持同一口径：只有 canonical 用户消息计数才
-    // 决定“已有本地历史”。不要用 timeline projection 的 artifacts 数量推断，
-    // 因为其中可能包含通知、状态或非用户条目，导致 UI 比后端过早禁用 Web。
-    const sessionProjections = [
-      messagesState.workspaceSessionProjection.sessions,
-      messagesState.personalSessionProjection.sessions,
-    ];
-    return sessionProjections.some((sessions) => sessions.some((session) => (
-      session.id === sessionId && Number(session.messageCount ?? 0) > 0
-    )));
-  });
   const isPersonalSession = $derived.by(() => (
     !currentWorkspaceId?.trim()
     && !currentWorkspacePath?.trim()
@@ -630,9 +502,8 @@
   const filteredSourceFolders = $derived((composerWorkspace?.sourceFolders || []).filter(folder =>
     `${folder.name || ''} ${folder.path}`.toLocaleLowerCase().includes(sourceFolderSearch.trim().toLocaleLowerCase())));
   const selectedSourceFolder = $derived(composerWorkspace?.sourceFolders?.find((folder) => folder.sourceFolderId === selectedSourceFolderId));
-  const filteredPickerWebEngines = $derived(pickerWebEngines.filter(engine => `${engine.displayName} ${engine.id}`.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())));
   const filteredWorkspaces = $derived(workspaceOptions.filter(workspace => `${workspace.name} ${workspace.rootPath}`.toLocaleLowerCase().includes(workspaceSearch.trim().toLocaleLowerCase())));
-  $effect(() => { if (!pickerOpen || pickerModels.length + pickerWebEngines.length <= 10) modelSearch = ''; });
+  $effect(() => { if (!pickerOpen || pickerModels.length <= 10) modelSearch = ''; });
   $effect(() => { if (!workspacePickerOpen || workspaceOptions.length <= 10) workspaceSearch = ''; });
   $effect(() => { if (!sourceFolderPickerOpen || (composerWorkspace?.sourceFolders?.length || 0) <= 10) sourceFolderSearch = ''; });
   const agentRunState = $derived(getAgentRunState(currentSessionId, currentWorkspaceId));
@@ -676,7 +547,7 @@
     const previousScopeKey = composerReferenceScopeKey;
     // 编辑暂时借用输入区，原草稿已在进入编辑时保存；导航不能用编辑内容覆盖它。
     if (!loadedEditingTurnId) {
-      if (composerHasDraft() && !containsSetupSecret(resolveComposerRawContent())) {
+      if (composerHasDraft()) {
         scopedComposerDrafts.set(previousScopeKey, captureComposerSubmissionDraft(resolveComposerRawContent()));
       } else {
         scopedComposerDrafts.delete(previousScopeKey);
@@ -740,7 +611,7 @@
   });
   function continueSession(): void {
     if (!canContinueSession || resumeSubmitting || isSending || sessionInputLocked
-      || isInteractionBlocking || composerHasDraft() || webSendBlocked) return;
+      || isInteractionBlocking || composerHasDraft()) return;
     vscode.postMessage({ type: 'continueTask', sessionId: currentSessionId });
   }
 
@@ -771,13 +642,10 @@
     }
     return i18n.t('input.send');
   });
-  /** GPT Web 状态条判定发送必然被 daemon 拒绝（对话已失效 / 冲突 / 被占用）。 */
-  let webSendBlocked = $state(false);
-  let webInfoStatus = $state<WebSessionBanner | null>(null);
   // 首条消息确认 sessionId 前不能追加提交，否则会被识别成另一条新会话请求。
   const sendDisabled = $derived.by(() => (
-    sessionInputLocked || (!editingQueuedMessage && isInteractionBlocking) || sendPreparing || Boolean(setupRequestId) || pendingImageReadCount > 0 || (!editingQueuedMessage && !mainModelReady)
-    || (isDraftSession && isSending) || (!editingQueuedMessage && webSendBlocked)
+    sessionInputLocked || (!editingQueuedMessage && isInteractionBlocking) || sendPreparing || pendingImageReadCount > 0 || (!editingQueuedMessage && !mainModelReady)
+    || (isDraftSession && isSending)
   ));
 
   // 按钮双态状态 - 使用 $derived 计算
@@ -1125,7 +993,7 @@
     selectComposerSourceFolder(currentWorkspaceId || '', currentSessionId, draft.sourceFolderId || '');
     queueEditConflict = '';
     if (draft.accessProfile) selectedAccessProfile = draft.accessProfile;
-    inputValue = containsSetupSecret(draft.text) ? '' : draft.text;
+    inputValue = draft.text;
     pendingCaretOffset = draft.text.length;
     selectedImages = draft.images.map((image) => ({ ...image }));
     selectedContextReferences = draft.contextReferences.map((reference) => ({ ...reference }));
@@ -1180,7 +1048,7 @@
     if (draft.turnId === loadedEditingTurnId) return;
     const scopeKey = currentComposerReferenceScopeKey();
     if (!loadedEditingTurnId) {
-      if (composerHasDraft() && !containsSetupSecret(resolveComposerRawContent())) {
+      if (composerHasDraft()) {
         scopedComposerDrafts.set(scopeKey, captureComposerSubmissionDraft(resolveComposerRawContent()));
       } else {
         scopedComposerDrafts.delete(scopeKey);
@@ -1191,7 +1059,7 @@
     invalidateEnhanceState();
     editingQueuedMessage = null;
     queueEditConflict = '';
-    inputValue = containsSetupSecret(draft.text) ? '' : draft.text;
+    inputValue = draft.text;
     pendingCaretOffset = draft.text.length;
     selectedImages = draft.images.map((image) => ({
       id: generateId(),
@@ -2088,25 +1956,10 @@
       const detail = (event as CustomEvent<{ requestId?: unknown; status?: unknown }>).detail;
       const requestId = typeof detail?.requestId === 'string' ? detail.requestId.trim() : '';
       if (!requestId) return;
-      if (setupRequestId === requestId) setupRequestId = null;
       const draft = submittedComposerDrafts.get(requestId);
       submittedComposerDrafts.delete(requestId);
       if (detail.status !== 'failed' || !draft || !composerIsPristineForSubmissionRecovery()) return;
       restoreComposerSubmissionDraft(draft);
-    }
-    function handleComposerWebModelAction(event: Event): void {
-      const detail = (event as CustomEvent<WebModelActionDetail>).detail;
-      if (detail?.kind !== 'switchModel') return;
-      if (detail.sessionId && detail.sessionId !== currentSessionId) return;
-      if (sessionInputLocked || isInteractionBlocking) return;
-      pickerOpen = true;
-      pickerView = 'models';
-      if (!pickerLoadedOnce && !pickerLoading) {
-        void loadPickerModels();
-      }
-    }
-    function handleFocusWebModelComposer(): void {
-      queueMicrotask(focusEditor);
     }
     function handlePickerOutsidePointerDown(event: PointerEvent) {
       const target = event.target;
@@ -2152,8 +2005,6 @@
     window.addEventListener('magi:pluginSelectionInvalidated', handlePluginSelectionInvalidated as EventListener);
     window.addEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
     window.addEventListener('magi:sessionTurnSubmissionSettled', handleSessionTurnSubmissionSettled as EventListener);
-    window.addEventListener(WEB_MODEL_ACTION_EVENT, handleComposerWebModelAction);
-    window.addEventListener('magi:webModelFocusComposer', handleFocusWebModelComposer);
     window.addEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
     window.addEventListener('storage', handleStoredAccessProfileChange);
     document.addEventListener('pointerdown', handlePickerOutsidePointerDown, true);
@@ -2169,8 +2020,6 @@
       window.removeEventListener('magi:pluginSelectionInvalidated', handlePluginSelectionInvalidated as EventListener);
       window.removeEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
       window.removeEventListener('magi:sessionTurnSubmissionSettled', handleSessionTurnSubmissionSettled as EventListener);
-      window.removeEventListener(WEB_MODEL_ACTION_EVENT, handleComposerWebModelAction);
-      window.removeEventListener('magi:webModelFocusComposer', handleFocusWebModelComposer);
       window.removeEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
       window.removeEventListener('storage', handleStoredAccessProfileChange);
       document.removeEventListener('pointerdown', handlePickerOutsidePointerDown, true);
@@ -2247,7 +2096,6 @@
       await waitForPendingImageReads();
       const rawContent = resolveComposerRawContent();
       const normalizedContent = rawContent.trim();
-      if (containsSetupSecret(rawContent)) { addToast('warning', i18n.t('webModel.setup.secretHint')); return; }
       if (editingQueuedMessage) { await saveQueuedMessage(rawContent); return; }
       // 配置期间普通问题、补充方案和暂停说明都进入主对话；只有面板明确操作才提交控制动作。
 
@@ -2686,7 +2534,6 @@
     return resolveOrchestratorModel(
       getCurrentOrchestratorSessionConfigSnapshot(),
       getEffectiveOrchestratorConfigSnapshot(),
-      pickerModels,
     );
   }
 
@@ -2709,21 +2556,6 @@
 
   function reasoningEffortLabel(value: ReasoningEffort | null): string {
     return value ? i18n.t(`input.mainModelPicker.reasoning.${value}`) : '';
-  }
-
-  /** 只有 daemon 判为可用的 GPT Web 入口可选；未登录时入口根本不会出现。 */
-  function pickerWebEngineUsable(engine: PickerWebEngineDto): boolean {
-    return (engine.status ?? 'available').trim() === 'available';
-  }
-
-  function pickerWebEngineStatusText(engine: PickerWebEngineDto): string {
-    if (!canSelectPickerWebEngine) {
-      return i18n.t('input.mainModelPicker.webLocalSessionBlocked');
-    }
-    if (engine.tools && !engine.tools.available) {
-      return i18n.t('webModel.tools.unavailable');
-    }
-    return i18n.t('webModel.tools.available');
   }
 
   function objectRecord(value: unknown): Record<string, unknown> {
@@ -2798,7 +2630,7 @@
     const snapshot = messagesState.settingsBootstrapSnapshot;
     if (snapshot && settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
       const currentSessionConfig = objectRecord(snapshot.orchestratorSessionConfig);
-      const currentModel = resolveOrchestratorModel(currentSessionConfig, undefined, pickerModels);
+      const currentModel = resolveOrchestratorModel(currentSessionConfig, undefined);
       const shouldInitialize = !currentModel && (isDraftSession || !currentSessionConfig.model);
       const resolvedSessionConfig = { ...currentSessionConfig, ...defaults };
       messagesState.settingsBootstrapSnapshot = {
@@ -2815,19 +2647,11 @@
     }
     if (isDraftSession) {
       const draftConfig = messagesState.draftOrchestratorSessionConfig;
-      const draftModel = resolveOrchestratorModel(draftConfig, undefined, pickerModels);
+      const draftModel = resolveOrchestratorModel(draftConfig, undefined);
       messagesState.draftOrchestratorSessionConfig = draftModel
         ? { ...defaults, ...draftConfig }
         : { ...draftConfig, ...defaults };
     }
-  }
-
-  async function refreshPickerSettingsSnapshot() {
-    const latest = await getAgentSettingsBootstrap({ bootstrapScope: 'core', accessProfile: selectedAccessProfile });
-    if (!settingsBootstrapMatchesCurrentWorkspace(latest)) {
-      return;
-    }
-    messagesState.settingsBootstrapSnapshot = latest;
   }
 
   // 主线模型 picker：打开 / 关闭 + 模型列表惰性拉取。
@@ -2842,7 +2666,6 @@
     if (!pickerLoadedOnce && !pickerLoading) {
       await loadPickerModels();
     } else {
-      // HTTP 模型目录与 GPT Web 可用性都可能变化，每次打开同步整份目录。
       await refreshPickerModels();
     }
   }
@@ -2853,9 +2676,6 @@
       return;
     }
     const loadPromise = (async () => {
-      // GPT Web 是独立的模型来源，不要求用户先配置 provider 的
-      // baseUrl/apiKey。空配置仍通过同一个 models/fetch 响应取回 daemon
-      // 投影的 Web 引擎；有 provider 配置时则同时返回两类模型。
       const orchestratorConfig = getOrchestratorConfigSnapshot() ?? {};
       const configKey = orchestratorModelListConfigKey(orchestratorConfig);
       if (pickerLoadedOnce && pickerModelsConfigKey === configKey && pickerModels.length > 0) {
@@ -2873,9 +2693,6 @@
         pickerModels = Array.isArray(payload.models) ? payload.models : [];
         pickerModelDisplayNames = payload.modelDisplayNames ?? {};
         pickerCapabilities = payload.modelCapabilities ?? {};
-        // Web 引擎只来自 daemon 的可用性投影：未登录、未确认说明或
-        // 引擎不在本次探测候选里时这里就是空数组，前端不保留上一次的旧列表。
-        pickerWebEngines = Array.isArray(payload.webEngines) ? payload.webEngines : [];
         applyOrchestratorSessionDefaults(
           objectRecord(payload.orchestratorSessionDefaults),
         );
@@ -2901,9 +2718,6 @@
     }
   }
   async function refreshPickerModels() {
-    // A probe can make GPT Web available while the initial provider catalog
-    // request is still in flight. Wait for that request before refreshing, or
-    // the first picker open can keep the pre-probe empty Web list.
     if (pickerLoading) {
       const pending = pickerLoadPromise;
       if (pending) await pending;
@@ -2916,8 +2730,6 @@
     if (pickerSavingModel || pickerSavingReasoning) return;
     const normalizedModel = model.trim();
     if (!normalizedModel) return;
-    // Web 引擎的 `model` 是其族名，可能与 provider 列表中的模型同名；
-    // 只要仍有 Web `engineId`，点击 provider 条目就必须继续执行单向 Web → 本地。
     if (normalizedModel === currentPickerModel && !currentPickerEngineId) {
       pickerView = 'effort';
       return;
@@ -2937,8 +2749,7 @@
       messagesState.draftOrchestratorSessionConfig = withOrchestratorReasoningEffort(
         messagesState.draftOrchestratorSessionConfig,
         reasoningEffort,
-        // 切回本地模型：GPT Web 的对话方式随之丢弃，避免首条消息被 daemon 以“非 GPT Web 会话”拒绝。
-        { model: normalizedModel, engineId: '', webMode: undefined },
+        { model: normalizedModel, engineId: '' },
       );
       pickerError = null;
       pickerView = 'effort';
@@ -2947,7 +2758,6 @@
     }
     pickerSavingModel = normalizedModel;
     pickerError = null;
-    // 选择 provider 模型即显式解绑引擎：否则用户以为切走了，实际仍由 Web 引擎承载。
     const nextSessionConfig = withOrchestratorReasoningEffort(
       getOrchestratorSessionConfigSnapshot(),
       reasoningEffort,
@@ -2978,58 +2788,6 @@
     }
   }
 
-  /**
-   * 选中一个从 Web 加载的引擎。
-   *
-   * 与选择 provider 模型的区别只有两点：
-   * - 写入会话级 `engineId` 绑定；`model` 写引擎自身的族名（与 daemon 从
-   *   `plugin/openai.chatgpt-web/<family>` 推导的值一致），避免会话里残留 provider 模型名；
-   * - Web 的推理强度由网页管理，本地不生成档位。
-   */
-  /**
-   * GPT Web 对话方式（临时 / 已保存）。方式只在首条消息前可以设置，daemon 把它落到会话级
-   * `webConversation` 绑定；这里只保留“选择器当前显示哪一项”的 UI 状态。
-   */
-  const webConversationMode = $derived.by((): 'temporary' | 'saved' => {
-    if (isDraftSession) {
-      return messagesState.draftOrchestratorSessionConfig?.webMode === 'saved' ? 'saved' : 'temporary';
-    }
-    const snapshot = messagesState.settingsBootstrapSnapshot;
-    if (!settingsBootstrapMatchesCurrentWorkspace(snapshot)) return 'temporary';
-    return snapshot?.webConversation?.mode === 'saved' ? 'saved' : 'temporary';
-  });
-
-  function currentWebBinding(sessionId: string): AgentBindingOverride {
-    const workspaceId = currentWorkspaceId?.trim() || '';
-    const workspacePath = currentWorkspacePath?.trim() || '';
-    return workspaceId || workspacePath
-      ? { scope: 'workspace', workspaceId, workspacePath, sessionId }
-      : { scope: 'personal', sessionId };
-  }
-
-  async function applyWebConversationMode(mode: 'temporary' | 'saved'): Promise<void> {
-    if (mode === webConversationMode) return;
-    const sessionId = currentSessionId?.trim() || '';
-    if (!sessionId) {
-      // 草稿会话：随首条消息创建会话时由 daemon 落库。
-      messagesState.draftOrchestratorSessionConfig = {
-        ...messagesState.draftOrchestratorSessionConfig,
-        webMode: mode,
-      };
-      return;
-    }
-    try {
-      await saveAgentOrchestratorSessionConfig(
-        { ...getOrchestratorSessionConfigSnapshot(), webMode: mode },
-        currentWebBinding(sessionId),
-      );
-      await refreshPickerSettingsSnapshot();
-    } catch (error) {
-      console.warn('[InputArea] 设置 GPT Web 对话方式失败:', error);
-      addToast('error', i18n.t('webModel.mode.saveFailed'));
-    }
-  }
-
   /** 草稿会话先落成真实会话并切换过去；已经是真实会话则原样返回它的 ID。 */
   async function materializeDraftSession(): Promise<string> {
     const existing = currentSessionId?.trim() || '';
@@ -3044,98 +2802,9 @@
     const navigation = navigateSession(workspaceId
       ? { kind: 'session', scope: 'workspace', workspaceId, workspacePath, sessionId }
       : { kind: 'session', scope: 'personal', sessionId });
-    if (!navigation) throw new Error(i18n.t('webModel.saved.bindFailed'));
+    if (!navigation) throw new Error(i18n.t('web.workbenchActionFailed', { action: i18n.t('header.newSession') }));
     await waitForSessionNavigation(navigation);
     return sessionId;
-  }
-
-  /**
-   * 把已保存的 ChatGPT 对话绑定到当前（空白）会话。草稿会话先物化为真实会话并写入
-   * GPT Web 引擎，再绑定；历史由 daemon 单向导入。
-   */
-  async function bindSavedWebConversation(conversationId: string): Promise<void> {
-    const wasDraft = !(currentSessionId?.trim());
-    const sessionId = await materializeDraftSession();
-    if (wasDraft) {
-      const engineId = currentPickerEngineId || 'plugin/openai.chatgpt-web/default';
-      await saveAgentOrchestratorSessionConfig(
-        withOrchestratorReasoningEffort(
-          messagesState.draftOrchestratorSessionConfig,
-          readOrchestratorReasoningEffort(),
-          { engineId, model: engineId.split('/').pop() || engineId },
-        ),
-        currentWebBinding(sessionId),
-      );
-    }
-    await bindWebSavedConversation(sessionId, conversationId);
-    await refreshPickerSettingsSnapshot();
-    addToast('success', i18n.t('webModel.saved.bound'));
-  }
-
-  async function selectPickerWebEngine(engine: PickerWebEngineDto) {
-    if (!canSelectPickerWebEngine) {
-      const message = i18n.t('input.mainModelPicker.webLocalSessionBlocked');
-      pickerError = message;
-      addToast('warning', message);
-      return;
-    }
-    const engineId = engine.id.trim();
-    if (!engineId) return;
-    if (engineId === currentPickerEngineId) {
-      pickerOpen = false;
-      return;
-    }
-    const family = engineId.startsWith('plugin/openai.chatgpt-web/')
-      ? engineId.split('/').pop() || engineId
-      : (engine.displayName || engineId);
-    // 强度由网页自己选择，Magi 不改写会话的 reasoningEffort。
-    const reasoningEffort = readOrchestratorReasoningEffort();
-    const patch = { engineId, model: family };
-    const sessionId = currentSessionId?.trim() || '';
-    const workspaceId = currentWorkspaceId?.trim() || '';
-    const workspacePath = currentWorkspacePath?.trim() || '';
-    const binding: AgentBindingOverride = workspaceId || workspacePath
-      ? { scope: 'workspace', workspaceId, workspacePath, sessionId }
-      : { scope: 'personal', sessionId };
-    if (!sessionId) {
-      messagesState.draftOrchestratorSessionConfig = withOrchestratorReasoningEffort(
-        messagesState.draftOrchestratorSessionConfig,
-        reasoningEffort,
-        patch,
-      );
-      pickerError = null;
-      pickerOpen = false;
-      return;
-    }
-    pickerSavingModel = engineId;
-    pickerError = null;
-    const nextSessionConfig = withOrchestratorReasoningEffort(
-      getOrchestratorSessionConfigSnapshot(),
-      reasoningEffort,
-      patch,
-    );
-    try {
-      const saved = await saveAgentOrchestratorSessionConfig(nextSessionConfig, binding);
-      applyLocalOrchestratorSessionConfig(
-        objectRecord(saved.orchestratorSessionConfig),
-        objectRecord(saved.effectiveOrchestratorConfig),
-        sessionId,
-        (saved.orchestratorReasoningCapability ?? null) as ModelReasoningCapability | null,
-      );
-      try {
-        await refreshPickerSettingsSnapshot();
-      } catch (error) {
-        console.warn('[InputArea] 切换 Web 引擎后刷新设置快照失败:', error);
-        addToast('warning', i18n.t('input.modelSavedSyncPending'));
-      }
-      pickerOpen = false;
-    } catch (error) {
-      console.warn('[InputArea] 保存 Web 引擎绑定失败:', error);
-      pickerError = i18n.t('input.modelSaveFailed');
-      addToast('error', pickerError);
-    } finally {
-      pickerSavingModel = null;
-    }
   }
 
   async function selectPickerReasoningEffort(value: ReasoningEffort | null) {
@@ -3261,6 +2930,13 @@
     clearEnhanceSnapshot();
     queueMicrotask(focusEditor);
   }
+async function refreshPickerSettingsSnapshot() {
+    const latest = await getAgentSettingsBootstrap({ bootstrapScope: 'core', accessProfile: selectedAccessProfile });
+    if (!settingsBootstrapMatchesCurrentWorkspace(latest)) {
+      return;
+    }
+    messagesState.settingsBootstrapSnapshot = latest;
+  }
 </script>
 
 <div class="ia-container">
@@ -3354,18 +3030,8 @@
     </div>
   {/if}
   <GoalRunDrawers bind:count={drawersCount} />
-  <WebModelSetupPanel sessionId={currentSessionId?.trim() || ''} busy={setupSubmitting || Boolean(setupRequestId)} bind:status={setupStatus} onaction={async action => { await submitWebSetup(action); }} />
-  <WebModelSessionBanner
-    usesWeb={currentSessionUsesWebEngine}
-    sessionId={currentSessionId?.trim() || ''}
-    projection={messagesState.settingsBootstrapSnapshot?.webConversation}
-    turnActive={messagesState.isProcessing}
-    toolsAvailable={currentPickerWebEngine?.tools ? currentPickerWebEngine.tools.available : null}
-    toolsDetail={currentPickerWebEngine?.tools?.detail}
-    bind:blocksSend={webSendBlocked}
-    bind:infoStatus={webInfoStatus}
-    onOwnershipLost={() => void refreshPickerSettingsSnapshot()}
-  />
+
+
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     class="ia-wrapper"
@@ -3943,11 +3609,8 @@
             aria-expanded={pickerOpen}
           >
             <span class="ia-picker-btn-label">{currentPickerLabel || i18n.t('input.mainModelPicker.buttonEmpty')}</span>
-            {#if currentPickerEngineId}
-              <!-- 按钮空间有限（右栏打开时会截断名称）：来源徽标只放在下拉列表里，这里只留标记属性。 -->
-              <span class="ia-model-web-marker" data-magi-web-engine={currentPickerEngineId} hidden></span>
-            {/if}
-            {#if currentPickerReasoningLabel && !currentSessionUsesWebEngine}
+
+            {#if currentPickerReasoningLabel}
               <span class="ia-model-effort">{currentPickerReasoningLabel}</span>
             {/if}
             <Icon name="chevron-down" size={10} />
@@ -3960,12 +3623,12 @@
               {#if pickerView === 'effort'}
                 <div class="ia-model-summary">
                   <div class="ia-effort-summary-header">
-                    <span class="ia-effort-current" aria-live="polite">{#key displayedReasoning}<span class="ia-effort-value">{currentSessionUsesWebEngine ? i18n.t('input.mainModelPicker.reasoning.webManaged') : reasoningEffortLabel(displayedReasoning) || i18n.t('input.mainModelPicker.reasoning.providerDefault')}</span>{/key}</span>
+                    <span class="ia-effort-current" aria-live="polite">{#key displayedReasoning}<span class="ia-effort-value">{reasoningEffortLabel(displayedReasoning) || i18n.t('input.mainModelPicker.reasoning.providerDefault')}</span>{/key}</span>
                   </div>
                   <button type="button" class="ia-summary-model" aria-label={i18n.t('input.mainModelPicker.chooseModel')} onclick={() => { pickerView = 'models'; modelSearch = ''; }}>
                     <span>{currentPickerLabel || i18n.t('input.mainModelPicker.buttonEmpty')}</span><Icon name="chevron-right" size={13} />
                   </button>
-                  {#if !currentSessionUsesWebEngine && reasoningOptions.length > 1}
+                  {#if reasoningOptions.length > 1}
                     <div class="ia-reasoning-slider" style:--effort-progress={`${reasoningIndex / (reasoningOptions.length - 1) * 100}%`}>
                       <div class="ia-reasoning-control">
                       <div class="ia-reasoning-track" aria-hidden="true"><span class="ia-reasoning-fill"></span><span class="ia-reasoning-thumb"></span></div>
@@ -3974,7 +3637,7 @@
                       <div class="ia-reasoning-ticks" aria-hidden="true">{#each reasoningOptions as effort}<span class:active={effort === displayedReasoning}></span>{/each}</div>
                     </div>
                   {/if}
-                  {#if !currentSessionUsesWebEngine}
+
                     {#if reasoningOptions.length === 1}
                       <div class="ia-reasoning-actions">
                         <button type="button" class="btn btn--sm btn--secondary" aria-pressed={currentPickerReasoningEffort === reasoningOptions[0]} disabled={pickerSavingReasoning !== null || pickerSavingModel !== null} onclick={() => void selectPickerReasoningEffort(reasoningOptions[0])}>{reasoningEffortLabel(reasoningOptions[0])}</button>
@@ -3985,7 +3648,7 @@
                     {:else if !reasoningOptions.length}<p class="ia-reasoning-hint">{i18n.t(currentReasoningCapability?.source === 'unknown' ? 'input.mainModelPicker.reasoning.unknown' : 'input.mainModelPicker.reasoning.unsupported')}</p>
                     {/if}
                     {#if reasoningAdjusted}<p class="ia-reasoning-hint" role="status">{i18n.t('settings.model.reasoning.adjusted')}</p>{/if}
-                  {/if}
+
                   {#if pickerError}<p class="ia-picker-status-error" role="alert">{pickerError}</p>{/if}
                 </div>
               {:else}
@@ -4003,7 +3666,7 @@
                     <Icon name="refresh" size={13} class={pickerLoading ? 'spinning' : ''} />
                   </button>
                 </div>
-                {#if pickerModels.length + pickerWebEngines.length > 10}
+                {#if pickerModels.length > 10}
                   <input type="search" class="form-input" bind:value={modelSearch} placeholder={i18n.t('selection.search')} aria-label={i18n.t('selection.searchFor', { label: i18n.t('input.mainModelPicker.header') })} />
                 {/if}
                 {#if pickerLoading}
@@ -4017,10 +3680,10 @@
                       onclick={() => { pickerError = null; loadPickerModels(); }}
                     >{i18n.t('input.mainModelPicker.retry')}</button>
                   </div>
-                {:else if pickerModels.length === 0 && pickerWebEngines.length === 0}
+                {:else if pickerModels.length === 0}
                   <div class="ia-picker-status">{i18n.t('input.mainModelPicker.empty')}</div>
                 {:else}
-                  {#if filteredPickerModels.length === 0 && filteredPickerWebEngines.length === 0}
+                  {#if filteredPickerModels.length === 0}
                     <div class="ia-picker-status" role="status">{i18n.t('selection.empty')}</div>
                   {/if}
                   <div class="ia-picker-list" role="listbox" aria-label={i18n.t('input.mainModelPicker.header')}>
@@ -4044,103 +3707,17 @@
                       </button>
                     {/each}
                   </div>
-                  {#if pickerWebEngines.length > 0}
-                    <div class="ia-picker-divider"></div>
-                    <div class="ia-picker-header">{i18n.t('input.mainModelPicker.webSection')}</div>
-                    <div class="ia-picker-list" role="listbox" aria-label={i18n.t('input.mainModelPicker.webSection')}>
-                      {#each filteredPickerWebEngines as engine (engine.id)}
-                        <button
-                          type="button"
-                          class="ia-picker-item ia-picker-row"
-                          class:selected={currentPickerEngineId === engine.id}
-                          role="option" aria-selected={currentPickerEngineId === engine.id}
-                          data-magi-web-engine-row={engine.id}
-                          onclick={() => void selectPickerWebEngine(engine)}
-                          disabled={pickerSavingModel !== null
-                            || pickerSavingReasoning !== null
-                            || !pickerWebEngineUsable(engine)
-                            || !canSelectPickerWebEngine}
-                          title={pickerWebEngineStatusText(engine)}
-                        >
-                          <span class="ia-picker-item-label">{engine.displayName || engine.id}</span>
-                          <span class="ia-model-web-badge">{i18n.t('webModel.badge.fromWeb')}</span>
-                          {#if isPersonalSession || (engine.tools && !engine.tools.available)}
-                            <span class="ia-model-tier" data-web-model-tools="off">
-                              {i18n.t('webModel.tools.unavailableShort')}
-                            </span>
-                          {/if}
-                          {#if pickerSavingModel === engine.id}
-                            <Icon name="loader" size={12} class="spinning" />
-                          {:else if currentPickerEngineId === engine.id}
-                            <span class="ia-picker-check"><Icon name="check" size={13} /></span>
-                          {/if}
-                        </button>
-                      {/each}
-                    </div>
-                  {/if}
+
                 {/if}
-                {#if currentSessionUsesWebEngine && !currentSessionHasCanonicalHistory}
-                  <WebModelModeChooser
-                    mode={webConversationMode}
-                    disabled={pickerSavingModel !== null || pickerSavingReasoning !== null}
-                    onModeChange={applyWebConversationMode}
-                    onBindSaved={bindSavedWebConversation}
-                  />
-                {/if}
-                {#if pickerWebEngines.length > 0 && !canSelectPickerWebEngine}
-                  <p class="ia-picker-notice ia-picker-notice--warning">
-                    {i18n.t('input.mainModelPicker.webLocalSessionBlocked')}
-                  </p>
-                {/if}
+
+
               </div>
               {/if}
             </div>
           {/if}
           </div>
-          {#if webInfoStatus}
-            <button type="button" class="ia-enhance" data-web-model-info={webInfoStatus.id}
-              title={i18n.t(webInfoStatus.textKey, webInfoStatus.params)}
-              aria-label={i18n.t(webInfoStatus.textKey, webInfoStatus.params)}
-              onclick={() => webInfoStatus?.action
-                ? dispatchWebModelAction({ kind: webInfoStatus.action.kind, sessionId: currentSessionId?.trim() || '' })
-                : (pickerOpen = !pickerOpen)}>
-              <Icon name="info" size={14} />
-            </button>
-          {/if}
-          {#if currentSessionUsesWebEngine}
-            <!-- GPT Web 对话方式：临时 / 已保存。首条消息前可切换，之后固定（只读显示）。
-                 常驻在工具栏而不是藏在模型选择器里：用户新开 Web 会话时第一眼就能看到并选择。 -->
-            {#if currentSessionHasCanonicalHistory}
-              <span
-                class="ia-web-mode ia-web-mode--locked"
-                data-web-model-mode-locked={webConversationMode}
-                title={i18n.t('webModel.mode.lockedTitle')}
-              >{webConversationMode === 'saved' ? i18n.t('webModel.mode.chip.saved') : i18n.t('webModel.mode.chip.temporary')}</span>
-            {:else}
-              <div class="ia-web-mode" role="group" aria-label={i18n.t('webModel.mode.header')} data-web-model-mode-chip={webConversationMode}>
-                <button
-                  type="button"
-                  class="ia-web-mode-btn"
-                  class:selected={webConversationMode === 'temporary'}
-                  aria-pressed={webConversationMode === 'temporary'}
-                  data-web-model-mode-chip-option="temporary"
-                  disabled={sessionInputLocked || isInteractionBlocking || pickerSavingModel !== null || pickerSavingReasoning !== null}
-                  title={i18n.t('webModel.mode.temporaryHint')}
-                  onclick={() => void applyWebConversationMode('temporary')}
-                >{i18n.t('webModel.mode.chip.temporary')}</button>
-                <button
-                  type="button"
-                  class="ia-web-mode-btn"
-                  class:selected={webConversationMode === 'saved'}
-                  aria-pressed={webConversationMode === 'saved'}
-                  data-web-model-mode-chip-option="saved"
-                  disabled={sessionInputLocked || isInteractionBlocking || pickerSavingModel !== null || pickerSavingReasoning !== null}
-                  title={i18n.t('webModel.mode.savedHint')}
-                  onclick={() => void applyWebConversationMode('saved')}
-                >{i18n.t('webModel.mode.chip.saved')}</button>
-              </div>
-            {/if}
-          {/if}
+
+
           <button
           type="button"
           class="ia-enhance"
@@ -4181,7 +3758,7 @@
             class="ia-send ready"
             data-testid="input-continue-button"
             onclick={continueSession}
-            disabled={resumeSubmitting || sessionInputLocked || isInteractionBlocking || webSendBlocked || Boolean(setupRequestId)}
+            disabled={resumeSubmitting || sessionInputLocked || isInteractionBlocking}
             title={i18n.t(resumeSubmitting ? 'input.continuing' : 'input.continue')}
             aria-label={i18n.t(resumeSubmitting ? 'input.continuing' : 'input.continue')}
           >
@@ -4694,45 +4271,6 @@
     max-width: 132px;
     color: inherit;
   }
-  .ia-web-mode {
-    flex: 0 0 auto;
-    display: inline-flex;
-    align-items: center;
-    height: 24px;
-    border: 0;
-    background: var(--surface-2);
-    border-radius: var(--radius-full);
-    overflow: hidden;
-    font-size: var(--text-xs);
-    line-height: 1;
-  }
-  .ia-web-mode-btn {
-    height: 100%;
-    padding: 0 8px;
-    border: 0;
-    background: transparent;
-    color: var(--foreground-muted, inherit);
-    font: inherit;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .ia-web-mode-btn:hover:not(:disabled):not(.selected) {
-    background: color-mix(in srgb, var(--primary) 8%, transparent);
-  }
-  .ia-web-mode-btn.selected {
-    background: color-mix(in srgb, var(--primary) 14%, transparent);
-    color: var(--primary);
-    font-weight: calc(var(--font-semibold) + 50);
-  }
-  .ia-web-mode-btn:disabled {
-    cursor: default;
-    opacity: 0.55;
-  }
-  .ia-web-mode--locked {
-    padding: 0 8px;
-    color: var(--foreground-muted, inherit);
-    cursor: default;
-  }
   .ia-model-effort {
     flex: 0 0 auto;
     display: inline-flex;
@@ -5127,26 +4665,6 @@
     color: var(--primary);
     font-size: 13px;
     line-height: 1;
-  }
-  /* Web 引擎的当前工具档位：与来源标注并列，只做提示，不参与判断。 */
-  .ia-model-tier {
-    flex: 0 0 auto;
-    margin-left: 4px;
-    font-size: var(--text-xs);
-    letter-spacing: 0.04em;
-    color: var(--foreground-muted);
-  }
-  /* Web 引擎的来源标注（A6 / S4）：与设置分区的 badge 同义，只是尺寸更小。 */
-  .ia-model-web-badge {
-    flex: 0 0 auto;
-    margin-left: 6px;
-    padding: 0 6px;
-    border-radius: 999px;
-    font-size: var(--text-xs);
-    line-height: 16px;
-    white-space: nowrap;
-    background: var(--primary-soft, rgba(80, 140, 255, 0.16));
-    color: var(--primary);
   }
   .ia-picker-notice {
     margin: 6px 6px 0;

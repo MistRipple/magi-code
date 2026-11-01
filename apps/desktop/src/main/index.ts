@@ -746,11 +746,6 @@ function registerIpc(): void {
     trustedAppSender(event.sender.id);
     await surfaceManager!.clearBrowsingData();
   });
-  handleIpc("magi-desktop:clear-web-model-data", async (event) => {
-    trustedAppSender(event.sender.id);
-    // 只清应用级 GPT Web 分区：其他浏览器 Tab 的站点数据不受影响（§5.13）。
-    await surfaceManager!.clearWebModelBrowsingData();
-  });
   handleIpc("magi-desktop:check-for-updates", (event) => {
     trustedAppSender(event.sender.id);
     return updateManager!.check();

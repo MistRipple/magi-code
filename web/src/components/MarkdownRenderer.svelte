@@ -32,7 +32,6 @@
     link: MdLink,
     image: MdImage,
     rawtext: MdText,
-    // 公式：GPT Web 回复里的 $…$ / $$…$$ 以及模型自己输出的 TeX。不渲染的话 `\,`、`_`、`*` 会被当成 Markdown 语法吃掉。
     inlineKatex: KatexRenderer,
     blockKatex: KatexRenderer,
   };

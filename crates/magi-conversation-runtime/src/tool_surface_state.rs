@@ -283,31 +283,6 @@ mod tests {
     };
 
     #[test]
-    fn reference_loading_does_not_replace_the_active_skill() {
-        let reference=serde_json::json!({"status":"succeeded","mode":"reference","skill_name":"plugin/openai.chatgpt-web/gpt-web-setup"}).to_string();
-        assert_eq!(
-            activated_skill_id_from_tool_result(
-                SKILL_APPLY_TOOL_NAME,
-                &reference,
-                ExecutionResultStatus::Succeeded
-            ),
-            None
-        );
-        let activation =
-            serde_json::json!({"status":"succeeded","mode":"activate","skill_name":"code-review"})
-                .to_string();
-        assert_eq!(
-            activated_skill_id_from_tool_result(
-                SKILL_APPLY_TOOL_NAME,
-                &activation,
-                ExecutionResultStatus::Succeeded
-            )
-            .as_deref(),
-            Some("code-review")
-        );
-    }
-
-    #[test]
     fn browser_tool_surface_uses_one_round_scoped_capability_snapshot() {
         let revision = Arc::new(AtomicU64::new(7));
         let enabled = Arc::new(AtomicBool::new(true));

@@ -16,9 +16,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use magi_conversation_runtime::external_approval::cancel_external_approvals;
 use magi_core::UtcMillis;
 use magi_mcp_server::http::{HttpConfig, HttpState, router};
-use magi_mcp_server::local_socket::{
-    LocalSocketServer, local_endpoint_for, serve_local_socket, serve_local_socket_with_auth,
-};
+use magi_mcp_server::local_socket::{LocalSocketServer, local_endpoint_for, serve_local_socket};
 use magi_mcp_server::{IssueTokenRequest, IssuedToken, TokenPatch, TokenRecord, TokenStore};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -385,8 +383,6 @@ pub(crate) struct McpServiceRuntime {
     tunnel_hosts: Arc<RwLock<Vec<String>>>,
     public_hosts: Arc<RwLock<Vec<String>>>,
     network_generation: Arc<AtomicU64>,
-    /// GPT Web 槽位端点（本地 socket，无令牌；身份与归属由槽位表决定）。
-    slot_socket: AsyncMutex<Option<LocalSocketServer>>,
     path: Option<PathBuf>,
     tokens: Arc<TokenStore>,
     /// 令牌原文（token_id → 原文），与校验用的哈希分开存放在 `mcp-token-secrets.json`（0600），
@@ -415,7 +411,6 @@ impl McpServiceRuntime {
             tunnel_hosts: Arc::new(RwLock::new(Vec::new())),
             public_hosts: Arc::new(RwLock::new(Vec::new())),
             network_generation: Arc::new(AtomicU64::new(0)),
-            slot_socket: AsyncMutex::new(None),
             path: None,
             tokens: Arc::new(TokenStore::new()),
             secrets: Mutex::new(Default::default()),
@@ -471,7 +466,6 @@ impl McpServiceRuntime {
             tunnel_hosts: Arc::new(RwLock::new(Vec::new())),
             public_hosts: Arc::new(RwLock::new(Vec::new())),
             network_generation: Arc::new(AtomicU64::new(0)),
-            slot_socket: AsyncMutex::new(None),
             path: Some(path),
             tokens,
             secrets: Mutex::new(secrets),
@@ -882,60 +876,6 @@ impl McpServiceRuntime {
                 // abort 只请求取消；等待任务退出，确保重新绑定前监听端口已释放。
                 let _ = running.task.await;
             }
-        }
-    }
-
-    /// 启动 GPT Web 槽位端点（本地 socket）。幂等；不依赖用户是否启用了“MCP 服务”开关。
-    ///
-    /// 端点只有当前 OS 用户可访问，不接受也不签发令牌；身份与归属完全由槽位表决定。
-    pub(crate) async fn start_slot_gateway(
-        &self,
-        state: &ApiState,
-    ) -> Result<PathBuf, McpRuntimeError> {
-        if !state.web_model_plugin_active() {
-            return Err(McpRuntimeError::Token(
-                "GPT Web 插件未在应用作用域激活".into(),
-            ));
-        }
-        let state_root = self
-            .state_root()
-            .map(std::path::Path::to_path_buf)
-            .ok_or_else(|| McpRuntimeError::Persist("没有 state root，无法创建槽位端点".into()))?;
-        let endpoint = slot_endpoint_for(&state_root);
-        let mut slot = self.slot_socket.lock().await;
-        if slot.is_some() {
-            return Ok(endpoint);
-        }
-        let server = crate::mcp_service::build_slot_mcp_server(state.clone());
-        let harness = state.web_model.clone();
-        let auth = crate::web_slot_mcp::slot_principal_provider(
-            {
-                let harness = harness.clone();
-                Arc::new(move || harness.bindings())
-            },
-            Arc::new(move || {
-                crate::web_slot_mcp::slot_profile_from_setting(
-                    harness
-                        .configured()
-                        .and_then(|config| config.tool_profile)
-                        .as_deref(),
-                )
-            }),
-        );
-        let socket = serve_local_socket_with_auth(server, auth, endpoint.clone())
-            .await
-            .map_err(|error| McpRuntimeError::Bind {
-                host: "stdio".to_string(),
-                port: 0,
-                reason: error.to_string(),
-            })?;
-        *slot = Some(socket);
-        Ok(endpoint)
-    }
-
-    pub(crate) async fn stop_slot_gateway(&self) {
-        if let Some(socket) = self.slot_socket.lock().await.take() {
-            socket.stop();
         }
     }
 
@@ -1469,11 +1409,6 @@ fn cancel_pending(state: &ApiState, token_id: &str) {
         &external_session_id(token_id),
         token_id,
     );
-}
-
-/// GPT Web 槽位端点的文件位置（与令牌端点不同的 socket）。
-pub(crate) fn slot_endpoint_for(state_root: &std::path::Path) -> PathBuf {
-    local_endpoint_for(&state_root.join("web-slot"))
 }
 
 #[derive(Serialize, Deserialize)]

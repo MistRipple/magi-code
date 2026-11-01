@@ -41,7 +41,7 @@ Canonical Turn Log + TaskStore -> Read Models -> SSE / App Server notification
 
 ### 2.1 `conversation`
 
-只用于会话命令（如 `/compact`）和 GPT Web 引擎会话。不得创建 `TaskRun`、root Task、lease、Runner、Git execution context 或 task execution snapshot；可以创建只读的 `context_snapshot_id`，用于固定本轮输入和配置。
+不得创建 `TaskRun`、root Task、lease、Runner、Git execution context 或 task execution snapshot；可以创建只读的 `context_snapshot_id`，用于固定本轮输入和配置。
 
 `ConversationExecutor` 读取冻结的 Conversation History Projection，把历史版本、模型配置、工具目录、技能/MCP、知识上下文和 profile 适用的权限快照固化为 `context_snapshot_id`，然后调用共享 Provider。它不得准备或记录 Git execution context，也不得另写一份模型历史。
 
@@ -55,13 +55,12 @@ Canonical Turn Log + TaskStore -> Read Models -> SSE / App Server notification
 
 接纳只读取结构化输入，不按用户文本中的关键词推断路由、协作模式、必调工具或完成证据：
 
-- 会话命令、GPT Web 引擎会话：`conversation`。
+- 会话命令 引擎会话：`conversation`。
 - 界面“继续”按钮发出的 `resume`：恢复可恢复的执行链，或从最近失败、中断、用户主动停止的主线轮次检查点继续；缺少原 Task/Thread 时拒绝。控制输入保留在 canonical 中，通过已有 `visibility.renderable=false` 隐藏用户气泡；用户手动发送的文字“继续”仍作为正常消息展示。入口统一在输入框主按钮：无草稿时显示播放图标，有新文字、附件或命令时恢复发送图标；不在历史消息旁提供恢复操作，也不额外添加输入区提示。
 - 目标模式开关 `goalMode`：`task`，要求维护计划并开放 Goal 工具。
 - 其余所有消息：带完整工具面的 `task` 主线。是否读代码、执行命令、建立计划或派发代理，由模型根据任务自行判断；用户明确要求或禁止使用子代理时由模型遵循，运行时不再设置协作模式。
 - 不得在模型输出后切换 profile。
 
-原生主线与子代理使用同一个 `conversation_loop`；`conversation` 执行器只承载命令和 GPT Web 的独立上下文合同。
 
 资源按实际工具调用准备：主线的纯文本、文件读取/检索、网络与 Browser 工具不因绑定 workspace 而建立完整快照或取得 Git 执行租约。首次写入、Shell、结构化 Git 或代理派发前，经 daemon 注入的准备入口检查工作区争用、按条件创建隔离副本、建立变更账本、校验 Git 基线并取得租约；失败先记录未执行回执并重建线程投影，再沿原 Task/Turn 收口。Continue 与工作流共用这一路径。子代理在首次本地工具前才建立隔离 worktree；纯文本和网络调用不提前分配。目录改变时同步投影路径权限、刷新 workspace 提示并清除旧读取缓存，引用旧绝对路径的调用明确拒绝执行。子代理分支产出不记入主目录变更账本；自动隔离后的派发继承当前副本目录。
 
@@ -86,7 +85,7 @@ Goal、Continue、子代理等待和恢复都是 `TaskRun` 内部行为，不创
 
 HTTP 和 App Server 适配器必须调用同一个 `TurnService`。当前提交业务实现位于 `crates/magi-api/src/turn_service.rs`；HTTP 提交路由只补充可信 Desktop 来源标记并传入 DTO，App Server 也调用该服务。队列推进、Goal 自动续轮与任务终态回调引用同一份服务实现。
 
-服务依赖按职责归位：`scope_binding` 统一校验会话/工作区归属并解析 Turn 所属会话；`task_dispatch` 负责 Task Turn 的接纳、准备、调度及恢复；`model_config` 负责会话模型绑定、Web 转换门禁、持久化与配置更新事件；浏览器标记上下文及 artifact 边界由 `browser_tool_runtime` 从 BrowserAuthority 读取。输入转换和接纳时间由 `TurnService` 管理，接纳时间以原子更新保证并发唯一、递增。上述业务模块不反向引用路由，路由直接调用对应实现，不保留辅助逻辑的旧转导出。中断、生命周期取消和显式继续执行也由 Turn 服务统一负责；HTTP、浏览器用户接管、GPT Web 停止和代理继续动作直接调用服务，不能通过构造 HTTP extractor 或调用路由函数执行业务。角色模板、引擎与角色绑定的读取和写入统一归 `model_config`，`ApiState` 不依赖设置路由。
+服务依赖按职责归位：`scope_binding` 统一校验会话/工作区归属并解析 Turn 所属会话；`task_dispatch` 负责 Task Turn 的接纳、准备、调度及恢复；`model_config` 负责会话模型绑定、Web 转换门禁、持久化与配置更新事件；浏览器标记上下文及 artifact 边界由 `browser_tool_runtime` 从 BrowserAuthority 读取。输入转换和接纳时间由 `TurnService` 管理，接纳时间以原子更新保证并发唯一、递增。上述业务模块不反向引用路由，路由直接调用对应实现，不保留辅助逻辑的旧转导出。中断、生命周期取消和显式继续执行也由 Turn 服务统一负责；HTTP、浏览器用户接管 停止和代理继续动作直接调用服务，不能通过构造 HTTP extractor 或调用路由函数执行业务。角色模板、引擎与角色绑定的读取和写入统一归 `model_config`，`ApiState` 不依赖设置路由。
 
 它负责：
 
@@ -180,7 +179,7 @@ Session/Goal Agent 的 Step、工具、审批与提问属于独立 canonical Tur
 
 MCP 与插件按同一个副作用/访问档判定组装工具面、目录和执行回执：声明只读的工具允许使用；有副作用的工具在 ReadOnly 下拒绝、Restricted 下等待原调用审批、FullAccess 下放行。Task/Skill 的显式禁用与白名单范围仍独立生效，批准不能解除它们，等待期间撤销 Skill 也须阻止执行。目录可展示被拒绝或缺执行器的条目及原因；schema 加载不等于授权，缺 MCP 执行器时不向模型发布该工具定义。插件的目录和执行器沿既有成对注册入口接入。
 
-人工提问以原 canonical 工具 item 的 `userQuestion` 为权威：请求/等待原子提交，答复或跳过先持久化再唤醒等待者，取消状态不可回退。等待注册表仅承载进程内通道。原生 Task 重启后的未答问题保留在原 interrupted Turn；先回答/跳过再从既有 Continue 恢复，恢复领取与答复提交使用同一个 canonical Session 锁。已答内容从 canonical metadata 投影到工具历史，工具线程尚未来得及写结果不导致答案丢失。迟到进度/快照不能删除交互或覆盖已确认答复。GPT Web 答复也先持久化，但重启后的网页步骤不自动重放。
+人工提问以原 canonical 工具 item 的 `userQuestion` 为权威：请求/等待原子提交，答复或跳过先持久化再唤醒等待者，取消状态不可回退。等待注册表仅承载进程内通道。原生 Task 重启后的未答问题保留在原 interrupted Turn；先回答/跳过再从既有 Continue 恢复，恢复领取与答复提交使用同一个 canonical Session 锁。已答内容从 canonical metadata 投影到工具历史，工具线程尚未来得及写结果不导致答案丢失。迟到进度/快照不能删除交互或覆盖已确认答复。
 
 原生工具审批以同一工具 item 的 `toolApproval` 为权威，包含参数指纹、执行目录、权限快照、决定及单次执行领取。重启后的待审批仍由原审批 ID 处理；批准本身不执行工具，先处理交互再显式 Continue。恢复只领取同一 Task 恢复链、相同参数/真实目录/权限快照的未执行批准，来源领取与目标 running 原子提交；写盘失败阻止执行。取消、过期、拒绝和已领取批准不能放行副作用。实际工具执行仍重查 Skill、任务状态和租约；已领取后结果未知时不自动重放。state layout 12 保护交互事实；外部 MCP 合成调用继续沿用活跃客户端合同，不承诺重启重放。
 
@@ -351,7 +350,7 @@ EventBus 只负责实时传输，不作为恢复依据。断线或序号缺口�
 | 会话运行时（`conversation_loop` / `session_turn_execution`） | 内容已开始输出后的流中断、模型空响应、上下文超限 | 语义恢复（带已输出片段续写、追加提示、压缩上下文），次数有限；不重放整条请求 |
 | 目标 | 目标已创建后的轮次失败；目标起始轮在创建目标之前失败 | 连续 3 次失败才受阻，间隔 5s、10s、20s…；起始轮按失败轮的 `modelFailure.retryable` 判断，退避 5s、10s 后把原请求重新排进会话队列，连同首次最多 3 次 |
 
-鉴权失败、模型不存在、请求被拒、地区限制、上下文超长、工具不支持属于确定性错误，任何一层都不重试。GPT Web 引擎不自动重试，重试会重复向账号发消息。普通（非目标）轮次在 HTTP 调用层放弃后以失败收口，由用户决定是否重发。
+鉴权失败、模型不存在、请求被拒、地区限制、上下文超长、工具不支持属于确定性错误，任何一层都不重试。普通（非目标）轮次在 HTTP 调用层放弃后以失败收口，由用户决定是否重发。
 
 ## 6. 验证合同
 
@@ -407,7 +406,6 @@ EventBus 只负责实时传输，不作为恢复依据。断线或序号缺口�
 遇到以下任一情况，应暂停实现并重新评审，而不是继续堆加兼容分支：
 
 - 需要新增数据库、远程队列、跨进程 outbox 或独立 Task Domain Log；
-- 会话命令或 GPT Web 的 conversation profile 被要求创建 Task/lease/Runner 才能返回；
 - 同一个 Turn 仍由多个 store、Runner 或前端分别决定终态；
 - 需要“新路径失败后回退旧路径”；
 - 只能通过 sleep、轮询、前端 loading 或 bootstrap 刷新掩盖响应延迟；
@@ -417,10 +415,10 @@ EventBus 只负责实时传输，不作为恢复依据。断线或序号缺口�
 
 ### Executor 能力边界
 
-当前只维护原生 Provider、现有插件和 GPT Web。外部 Executor 仅预留通用接口和历史证据读取，没有具体适配器或配置入口。
+外部 Executor 仅预留通用接口和历史证据读取，没有具体适配器或配置入口。
 
-`ExecutorCapabilities` 来自可信宿主适配器，复用 App Server schema。原生 Provider、通用文本插件和 GPT Web 分别声明输入、工具、引导、恢复、供应商输出上限与上下文所有权。`StepModelClient` 在写入 Step/消费输入前校验请求；能力及 `execution / context_compaction` 用途与请求一同冻结，辅助压缩不能改变主执行器的引导能力。响应指纹与用量先持久化，合同外的原生工具不向工具循环交付。
+`ExecutorCapabilities` 来自可信宿主适配器，复用 App Server schema。`StepModelClient` 在写入 Step/消费输入前校验请求；能力及 `execution / context_compaction` 用途与请求一同冻结，辅助压缩不能改变主执行器的引导能力。响应指纹与用量先持久化，合同外的原生工具不向工具循环交付。
 
-通用插件不再截取最后一条消息：完整文字历史以带角色的 JSON prompt 传递；图片、原生工具及输出上限不能静默忽略。无 checkpoint 恢复能力的空响应/中断不会进入原生自动补发；Magi Continue 拒绝恢复该任务，即使后来已切换为原生模型，仍以来源 Step 的能力为准。GPT Web 的远端会话续接保持其原有专用合同，不等于支持 Magi 的工具检查点重放。
+通用插件不再截取最后一条消息：完整文字历史以带角色的 JSON prompt 传递；图片、原生工具及输出上限不能静默忽略。无 checkpoint 恢复能力的空响应/中断不会进入原生自动补发；Magi Continue 拒绝恢复该任务，即使后来已切换为原生模型，仍以来源 Step 的能力为准。
 
 排队转引导与直接引导共用服务端能力检查；不支持时返回 `unsupported_executor` 原因并保留 Pending 输入。运行中优先读取冻结的主线 execution Step，未发送前对现有插件/网页配置保守关闭引导。state layout 13 保护新增 Step 能力及用途，2–12 自动升级并保留原 marker；旧历史字段缺失保留未知。

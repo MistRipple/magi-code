@@ -10,7 +10,7 @@
 
 支持的强度枚举为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`；枚举全集不表示每个模型都支持全部档位。JSON `null` 表示使用模型默认，保存后仍保留 `null`，执行时才按能力解析默认档位；字符串 `none` 表示明确关闭推理，二者不可混同。新会话默认使用 `null`，已有明确四档配置继续保留。不属于目标模型能力的旧值在保存时恢复 `null` 并说明原因。尚无能力声明的历史值保留以兼容配置，但运行时不会发送它。
 
-OpenAI Chat 写入 `reasoning_effort`，Responses 写入 `reasoning.effort`。Anthropic 按能力选择 `output_config.effort` 或旧式 `thinking.budget_tokens`；旧式预算档位是 Magi 的预算预设。没有可调能力时不生成推理参数。GPT Web 的模型与推理由网页管理，本地选择器只展示该事实。
+OpenAI Chat 写入 `reasoning_effort`，Responses 写入 `reasoning.effort`。Anthropic 按能力选择 `output_config.effort` 或旧式 `thinking.budget_tokens`；旧式预算档位是 Magi 的预算预设。没有可调能力时不生成推理参数。
 
 交互入口首先展示当前模型和强度，离散滑块只包含该模型支持的档位；点击模型名进入可搜索的模型列表，选择后回到强度面板。面板只保留当前强度、模型切换和可用档位，不展示恢复默认按钮或常驻用量说明；未显式选档时仍沿用服务端模型默认值。未知、不支持调整及单一档位不显示无意义滑块。切换模型保留仍合法的当前档位，否则使用目标模型默认。草稿刷新目录不覆盖已选择的模型与强度；已有会话沿原设置入口持久化。
 
@@ -20,9 +20,9 @@ OpenAI Chat 写入 `reasoning_effort`，Responses 写入 `reasoning.effort`。An
 
 预检沿唯一模型解析入口生成 `AgentModelSelection`，在 TaskExecutorBinding 中与子任务一同原子注册、持久化。快照固定模型、引擎身份与绑定代际、连接摘要、能力/传输方式、上下文窗口、请求和实际强度；不保存 API Key。排队、重试、恢复和工具后续轮次均使用此快照。运行期设置快照继续负责凭据与原权限；重启恢复从原连接取凭据并核对连接摘要，原引擎移除或连接/账号变化明确失败。角色重新绑定、引擎模型/默认强度改变或能力目录刷新不能悄悄改变既有任务。新 activation 重新进行派发选择，旧任务事实不被改写。
 
-同一快照产生实际 HTTP 请求和用量模型身份；不同强度分别归因。派发回执、事件及代理卡片展示实际模型和强度。提示词提醒选择足够完成任务的强度，高档通常增加延迟与 token；该提示不保证每次选择都最优，也不声称固定节省比例。GPT Web 不参与本轮变更与验证。
+同一快照产生实际 HTTP 请求和用量模型身份；不同强度分别归因。派发回执、事件及代理卡片展示实际模型和强度。提示词提醒选择足够完成任务的强度，高档通常增加延迟与 token；该提示不保证每次选择都最优，也不声称固定节省比例。
 
-定向验证：`cargo test -p magi-bridge-client --lib reasoning`、`cargo test -p magi-bridge-client --lib declared_alias`、`cargo test -p magi-api --lib routes::settings::tests`、Web check 与相关 golden；`npm run test:model-reasoning-live` 使用隔离状态、真实 daemon/App Server/Chromium 和本地模型服务，验证真实 agent_spawn/agent_wait、绑定/继承/默认/非法/未知能力、实际请求、持久化快照，以及切模、滑块、默认状态保留、设置保存及重启恢复。该验收不代表真实外部服务商或发行包验收，也不测试 GPT Web 网站。
+定向验证：`cargo test -p magi-bridge-client --lib reasoning`、`cargo test -p magi-bridge-client --lib declared_alias`、`cargo test -p magi-api --lib routes::settings::tests`、Web check 与相关 golden；`npm run test:model-reasoning-live` 使用隔离状态、真实 daemon/App Server/Chromium 和本地模型服务，验证真实 agent_spawn/agent_wait、绑定/继承/默认/非法/未知能力、实际请求、持久化快照，以及切模、滑块、默认状态保留、设置保存及重启恢复。
 
 本轮验收（2026-10-26）：daemon 编译检查、模型能力/派发/用量/配置清理定向 Rust 回归、设置 API 回归、代理读模型回归、Web check、设置/会话配置/工具卡片/i18n golden 与协议生成检查均通过。隔离真实 daemon + App Server + Electron Chromium 验收通过绑定/继承/默认、显式 none、未知模型不携带强度、非法档位零创建、实际请求参数、按强度用量归因、代理卡片与详情、动态滑块、设置保存/测试、能力读取失败重试及重启恢复。另在子代理等待回答时强制终止测试 daemon，修改角色绑定及引擎模型/默认强度，重启后回答原问题并继续原 Task；原模型/强度保持不变、提问不重放、历史代理投影保持原模型。模型响应使用本地确定性服务，验证执行合同，不代表真实模型自主选档质量、外部服务商网络或发行包已验收。
 

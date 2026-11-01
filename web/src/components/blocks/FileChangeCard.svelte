@@ -7,7 +7,6 @@
   import type { FilePreviewScope } from '../../lib/file-reference';
   import Icon from '../Icon.svelte';
   import ToolCardMeta from '../ToolCardMeta.svelte';
-  import ToolOriginBadge from '../ToolOriginBadge.svelte';
   import FileSpan from '../FileSpan.svelte';
   import type { IconName } from '../../lib/icons';
   import { i18n } from '../../stores/i18n.svelte';
@@ -172,7 +171,7 @@
       </span>
 
       <ToolCardMeta status={change.error ? 'error' : 'success'} label={i18n.t(change.error ? 'terminalSession.status.error' : 'terminalSession.status.success')} expanded={!collapsed}>
-        <ToolOriginBadge origin={change.origin} />
+
       {#if hasStatsBadge && isText}
         <span class="stats-badge">
           {#if additionsCount > 0}

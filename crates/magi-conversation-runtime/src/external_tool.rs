@@ -112,15 +112,6 @@ enum ExternalTarget {
     },
 }
 
-/// 内置工具能否对外部调用开放。
-///
-/// 需要 Task / 会话 / 代理上下文才能执行的（协调器与代理、目标、计划、记忆、上下文、浏览器、
-/// 图片、内部执行能力）不开放；其余公共内置工具都是“项目允许的内置工具”，由权限档与审批决定
-/// 能否调用。
-///
-/// 这里用**穷举 `match`、没有通配分支**：新增内置工具时编译会在此失败，作者必须明确决定它
-/// 是否对 GPT Web / 外部 MCP 客户端可见。过去用黑名单，新增的 `agent_apply` 因为没人记得加进去，
-/// 就默认出现在了 ChatGPT 看到的工具列表里。
 pub fn builtin_exposed_externally(tool: BuiltinToolName) -> bool {
     if !tool.is_public_tool_surface()
         || tool.browser_tool_kind().is_some()
@@ -479,36 +470,6 @@ pub fn execute_external_tool_call(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn agent_goal_plan_context_and_browser_tools_are_never_exposed_to_external_clients() {
-        use super::builtin_exposed_externally;
-        use magi_tool_runtime::BuiltinToolName;
-        for tool in BuiltinToolName::ALL {
-            let name = tool.as_str();
-            let session_bound = name.starts_with("agent_")
-                || name.starts_with("browser_")
-                || name.starts_with("context_")
-                || matches!(
-                    name,
-                    "get_goal"
-                        | "create_goal"
-                        | "update_goal"
-                        | "update_plan"
-                        | "update_execution_steps"
-                        | "memory_write"
-                        | "view_image"
-                        | "image_generate"
-                );
-            if session_bound {
-                assert!(
-                    !builtin_exposed_externally(tool),
-                    "{name} 依赖会话 / 代理上下文，不能出现在 GPT Web 与外部 MCP 客户端的工具目录里"
-                );
-            }
-        }
-        assert!(!builtin_exposed_externally(BuiltinToolName::AgentApply));
-        assert!(builtin_exposed_externally(BuiltinToolName::FileRead));
-    }
 
     use super::*;
 

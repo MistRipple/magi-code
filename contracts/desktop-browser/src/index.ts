@@ -174,11 +174,9 @@ export type BrowserNavigation =
       handle_before_unload?: "accept" | "dismiss";
       timeout_ms?: number;
     };
-
-export type BrowserHostCommand =
-  | { type: "ping" }
-  | { type: "cancel"; payload: { request_id: BrowserCommandId } }
-  | {
+export type BrowserHostCommand = { type: "ping" }
+ | { type: "cancel"; payload: { request_id: BrowserCommandId } }
+ | {
       type: "create_page" | "restore_page";
       payload: {
         tab_id: BrowserTabId;
@@ -190,30 +188,30 @@ export type BrowserHostCommand =
         allow_page_eviction?: boolean;
       };
     }
-  | {
+ | {
       type: "ensure_surface";
       payload: { tab_id: BrowserTabId };
     }
-  | {
+ | {
       type: "set_logical_viewport";
       payload: { tab_id: BrowserTabId; viewport: BrowserLogicalViewport };
     }
-  | {
+ | {
       type: "get_logical_viewport";
       payload: { tab_id: BrowserTabId };
     }
-  | {
+ | {
       type: "set_annotations";
       payload: { tab_id: BrowserTabId; annotations: unknown[] };
     }
-  | {
+ | {
       type: "configure_network_policy";
       payload: { lan_access_enabled: boolean };
     }
-  | { type: "inspect_start"; payload: BrowserSurfaceIdentity }
-  | { type: "inspect_stop"; payload: BrowserSurfaceIdentity }
-  | { type: "close_page"; payload: { tab_id: BrowserTabId } }
-  | {
+ | { type: "inspect_start"; payload: BrowserSurfaceIdentity }
+ | { type: "inspect_stop"; payload: BrowserSurfaceIdentity }
+ | { type: "close_page"; payload: { tab_id: BrowserTabId } }
+ | {
       type: "navigate";
       payload: {
         tab_id: BrowserTabId;
@@ -221,13 +219,8 @@ export type BrowserHostCommand =
         navigation: BrowserNavigation;
       };
     }
-  /**
-   * 立即中断当前 Tab 的 Chromium 导航。该命令是唯一允许绕过同一 Tab
-   * 普通资源队列的高优先级控制命令；它不会创建新 Surface，也不会改变
-   * 右栏布局或 Browser Tab 身份。
-   */
-  | { type: "stop_navigation"; payload: { tab_id: BrowserTabId } }
-  | {
+ | { type: "stop_navigation"; payload: { tab_id: BrowserTabId } }
+ | {
       type: "snapshot";
       payload: {
         tab_id: BrowserTabId;
@@ -237,7 +230,7 @@ export type BrowserHostCommand =
         selector?: string;
       };
     }
-  | {
+ | {
       type: "click";
       payload: {
         tab_id: BrowserTabId;
@@ -245,7 +238,7 @@ export type BrowserHostCommand =
         target: BrowserSnapshotTarget;
       };
     }
-  | {
+ | {
       type: "type";
       payload: {
         tab_id: BrowserTabId;
@@ -256,11 +249,11 @@ export type BrowserHostCommand =
         submit_key?: string | null;
       };
     }
-  | {
+ | {
       type: "press";
       payload: { tab_id: BrowserTabId; control: BrowserControl; key: string };
     }
-  | {
+ | {
       type: "scroll";
       payload: {
         tab_id: BrowserTabId;
@@ -270,7 +263,7 @@ export type BrowserHostCommand =
         delta_y: number;
       };
     }
-  | {
+ | {
       type: "devtools";
       payload: {
         tab_id: BrowserTabId;
@@ -279,7 +272,7 @@ export type BrowserHostCommand =
         arguments: Record<string, unknown>;
       };
     }
-  | {
+ | {
       type: "screenshot";
       payload: {
         tab_id: BrowserTabId;
@@ -291,7 +284,7 @@ export type BrowserHostCommand =
         quality?: number;
       };
     }
-  | {
+ | {
       type: "hit_test";
       payload: {
         tab_id: BrowserTabId;
@@ -302,7 +295,7 @@ export type BrowserHostCommand =
         normalized_y: number;
       };
     }
-  | {
+ | {
       type: "update_control";
       payload: {
         tab_id: BrowserTabId;
@@ -310,110 +303,7 @@ export type BrowserHostCommand =
         control: BrowserControlUpdate;
       };
     }
-  /**
-   * ChatGPT 站点只读探测。
-   *
-   * 只读页面事实（登录态、composer、模型菜单、账号能力、连接器支持性），
-   * 绝不写页面；不进入模型可见的浏览器工具目录（C10）。
-   */
-  | {
-      type: "web_model_probe";
-      payload: { tab_id: BrowserTabId };
-    }
-  /**
-   * 站点内原子纯文本写入 + 回读校验。
-   *
-   * 不复用 `type`（它走 CDP `Input.insertText`，没有回读校验，且对长文本的
-   * contenteditable 富文本编辑器不可靠）。回读不一致或内容被站点转成附件即失败。
-   */
-  | {
-      type: "web_write_text";
-      payload: {
-        tab_id: BrowserTabId;
-        selector: string;
-        text: string;
-        mode: "replace" | "append";
-        expect_text_digest?: string | null;
-        timeout_ms?: number | null;
-      };
-    }
-  /**
-   * 站点短轮询观察。
-   *
-   * 返回单次快照；`revision` 单调递增，供推理通道判断内容是否变化。长等待会占住
-   * 该 Surface 的命令 lane，因此观察必须短轮询，不复用 `wait_for`。
-   */
-  | {
-      type: "web_observe";
-      payload: {
-        tab_id: BrowserTabId;
-        selector: string;
-        fields: Array<"text" | "html" | "existence" | "attribute">;
-        attribute?: string | null;
-      };
-    }
-  /**
-   * 提交 composer。
-   *
-   * 只负责把输入交给站点并回读输入框是否清空；「是否被接受」由
-   * `web_turn_state` 的消息计数证据判定，不以命令返回成功为准。
-   */
-  | {
-      type: "web_submit";
-      payload: { tab_id: BrowserTabId };
-    }
-  /**
-   * 把图片附加到 GPT Web 输入框。
-   *
-   * 文件由 daemon 落在 Magi 私有目录后只传绝对路径（图片字节不过控制通道）；Worker 通过文件输入
-   * 附加并等待上传完成。附加失败时 Worker 会撤掉本次已附加的文件，调用方据此判定未提交。
-   */
-  | {
-      type: "web_attach_files";
-      payload: { tab_id: BrowserTabId; file_paths: string[] };
-    }
-  /** 只撤销 Magi 上传且尚未发送的附件，不接管用户的网页草稿。 */
-  | {
-      type: "web_clear_attachments";
-      payload: { tab_id: BrowserTabId };
-    }
-  /** 校验卡片身份后回写用户回答；副作用不得自动重放。 */
-  | {
-      type: "web_answer_question";
-      payload: { tab_id: BrowserTabId; question_id: string; answer: BrowserWebQuestionAnswer };
-    }
-  /** 页面原始回合快照；完成谓词与原生问题等待由推理通道负责。 */
-  | {
-      type: "web_turn_state";
-      payload: { tab_id: BrowserTabId };
-    }
-  /**
-   * 中断当前 GPT Web 页面生成，不改变页面 / Tab 身份。
-   * 取消 Magi turn 时必须显式停止网页侧生成，不能只停止 daemon 轮询。
-   */
-  | {
-      type: "web_cancel_generation";
-      payload: { tab_id: BrowserTabId };
-    }
-  /** 读取 ChatGPT 已保存对话列表（侧栏历史）。只读。 */
-  | {
-      type: "web_saved_conversations";
-      payload: { tab_id: BrowserTabId };
-    }
-  /** 读取当前已保存对话页面的远端事实（id、标题、可见消息与其稳定 id）。只读。 */
-  | {
-      type: "web_saved_messages";
-      payload: { tab_id: BrowserTabId };
-    }
-  /**
-   * 分块读取 GPT Web 回复里的一张图片（`source` 必须是当前页面上某个 `<img>` 的地址，例如 `blob:`）。
-   * 图片字节只存在于页面里，Main/Worker 控制通道单条消息有上限，所以按块读取，由 daemon 拼接。
-   */
-  | {
-      type: "web_read_image";
-      payload: { tab_id: BrowserTabId; source: string; offset: number; length: number };
-    }
-  | { type: "shutdown" };
+ | { type: "shutdown" };
 
 export interface BrowserHostRequestEnvelope {
   request_id: string;
@@ -427,115 +317,6 @@ export interface BrowserCommandError {
   recoverable: boolean;
   side_effect_started: boolean;
   diagnostic?: string | null;
-}
-
-/** `web_model_probe` 的归一化结果：只有登录与页面可用性，不含网页的模型菜单。 */
-export interface BrowserWebModelProbe {
-  /** 站点适配层结构版本；selector 漂移时由实现推进。 */
-  site_revision: string;
-  login_state: "signed_in" | "signed_out" | "blocked";
-  /** 登录态判定需要两项证据：会话有效与输入框可用。 */
-  composer_available: boolean;
-  /** 当前页面类型：对话页、ChatGPT 二级页面（没有输入框是正常的），或 OpenAI 平台页面。 */
-  page_kind?: "chat" | "other" | "platform";
-  account_hint: "plus" | "pro" | "free" | "unknown";
-}
-
-/** `web_saved_conversations` 的结果。 */
-export interface BrowserWebSavedConversations {
-  conversations: Array<{
-    conversation_id: string;
-    title: string;
-    updated_at: string | null;
-  }>;
-}
-
-/** `web_saved_messages` 的结果：当前已保存对话页面的远端事实。 */
-export interface BrowserWebSavedMessages {
-  /** 页面不是已保存对话（`/c/<id>`）时为 null。 */
-  conversation_id: string | null;
-  title: string | null;
-  messages: Array<{
-    role: "user" | "assistant";
-    text: string;
-    remote_id: string | null;
-  }>;
-  last_message_id: string | null;
-  updated_at: string | null;
-}
-
-/** `web_write_text` 的回读校验结果。 */
-export interface BrowserWebWriteTextResult {
-  confirmed: boolean;
-  digest: string;
-  char_count: number;
-  /** 站点把内容转成附件时不保证全部进入上下文。 */
-  became_attachment: boolean;
-}
-
-/** `web_observe` 的单次快照。 */
-export interface BrowserWebObserveResult {
-  revision: number;
-  nodes: Array<{
-    found: boolean;
-    text?: string;
-    html?: string;
-    attributes?: Record<string, string>;
-  }>;
-}
-
-/** `web_submit` 的提交结果。 */
-export interface BrowserWebSubmitResult {
-  submitted: boolean;
-  /**
-   * 提交后输入框是否已清空。它只是页面清理的即时观察值；受控输入框可能延迟清空，
-   * 因此 false 不能单独证明消息未被接受，最终以 web_turn_state 的消息事实为准。
-   */
-  composer_empty: boolean;
-  reason: "composer_missing" | "composer_empty" | null;
-}
-
-/** 一道网页问题的用户回答：选项索引或自定义文字。 */
-export interface BrowserWebQuestionSelection {
-  selected: number[];
-  text: string | null;
-}
-
-export type BrowserWebQuestionAnswer =
-  | { kind: "answered"; answers: BrowserWebQuestionSelection[] }
-  | { kind: "skipped" };
-
-export interface BrowserWebQuestion {
-  id: string;
-  questions: Array<{
-    question: string;
-    options: Array<{ label: string; description: string }>;
-    multi_select: boolean;
-    allows_text: boolean;
-  }>;
-  can_skip: boolean;
-}
-
-/** `web_turn_state` 的回合语义状态。 */
-export interface BrowserWebTurnStateResult {
-  site_revision: string;
-  login_state: "signed_in" | "signed_out" | "blocked";
-  /** 风险 / 验证页。 */
-  blocked: boolean;
-  /** 生成中标志；完成判定要求它为 false。 */
-  generating: boolean;
-  composer_found: boolean;
-  /** 提交是否被接受以用户消息计数为准（步骤 4）。 */
-  user_message_count: number;
-  assistant_message_count: number;
-  /** 最后一条助手消息的可见文本；流式回调以它的累积快照为准。 */
-  assistant_text: string;
-  /** 隐藏推理文本，映射到 `thinking`。 */
-  thinking_text: string;
-  /** 页面当前最后一条可见消息，用于临时 Web 对话存活判定。 */
-  last_message_role: "user" | "assistant" | null;
-  last_message_text: string | null;
-  question: BrowserWebQuestion | null;
 }
 
 export type BrowserCommandResult =

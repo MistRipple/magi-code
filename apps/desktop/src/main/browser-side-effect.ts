@@ -15,12 +15,6 @@ export function isSideEffectingBrowserCommand(command: BrowserHostCommand): bool
     case "type":
     case "press":
     case "scroll":
-    case "web_write_text":
-    case "web_submit":
-    case "web_attach_files":
-    case "web_clear_attachments":
-    case "web_answer_question":
-    case "web_cancel_generation":
       return true;
     case "ping":
     case "cancel":
@@ -40,12 +34,6 @@ export function isSideEffectingBrowserCommand(command: BrowserHostCommand): bool
     case "screenshot":
     case "hit_test":
     case "update_control":
-    case "web_model_probe":
-    case "web_observe":
-    case "web_turn_state":
-    case "web_saved_conversations":
-    case "web_saved_messages":
-    case "web_read_image":
     case "shutdown":
       return false;
     default: {

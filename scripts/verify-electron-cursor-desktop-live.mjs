@@ -216,7 +216,7 @@ try {
   assert.equal(await guest.evaluate(`document.querySelector('#mdbook-theme-toggle').getAttribute('aria-expanded')`), 'true');
   await screenshot('06-returned-to-agent'); await finish(returned, 2);
   console.log('PASS hand-back resumes agent control and native page interaction');
-  assert.deepEqual(errors.filter(e => !e.includes('GPT Web 插件未安装或未激活')), [], 'App Renderer exceptions');
+  assert.deepEqual(errors, [], 'App Renderer exceptions');
   await writeFile(join(artifact, 'results.json'), JSON.stringify({ results: Object.fromEntries(results), errors,
     motions: await page.evaluate('window.__cursorLiveMotions'), samples: await page.evaluate('window.__cursorLiveSamples') }, null, 2));
   console.log('PASS full Desktop public-web cursor acceptance complete');

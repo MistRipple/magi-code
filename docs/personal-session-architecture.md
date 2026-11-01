@@ -14,7 +14,6 @@
 
 个人 Git 复用 `GitService`、仓库并发协调器和 `SessionCodeContextRegistry`；同一会话的不同仓库拥有独立基线，持久化仍使用 `session-git-contexts.json`。既有合同的空 `workspaceId` 表示没有项目，注册表按 sessionId + 规范工作树根区分仓库，不能被当作主项目上下文。每次调用取得仓库租约后重新观测；写操作受 branch/HEAD/path CAS 与权限保护。外部漂移先由 `git_status` 展示，修改需明确提供匹配当前观测的前置条件。个人子代理只查询获授仓库；主线修改 branch/HEAD 前须等待子代理完成，`agent_apply` 仍要求真实项目与受管理的代理产出。
 
-GPT Web 槽位通过 daemon 的当前 owner session + active turn 解析执行目录与可选项目，MCP 令牌继续只访问令牌授权的注册项目。个人槽位可以调用连接器权限档允许的通用工具与 Git；项目知识和变更账本隐藏并在调用时再次拒绝，Shell 不因支持个人会话而开放。审批、canonical 工具项、取消与结果归原会话；槽位释放、turn 结束或 owner 改变后拒绝旧调用。连接器定义指纹只跟随工具 schema 和权限档变化，不因个人/项目会话切换触发重新配置。
 
 提示词分别描述个人执行目录和项目上下文，不能把个人目录称为“当前项目”。没有项目时，不应宣称所有本地工具都不可用；可用工具以本轮实际定义和执行策略为准。
 
@@ -38,4 +37,4 @@ GPT Web 槽位通过 daemon 的当前 owner session + active turn 解析执行�
 
 2026-10-25 验收：上述真实链路已通过，另通过 Web 类型检查与构建、会话导航/输入框/右栏/文件引用定向回归、`magi-conversation-runtime` 与 `magi-tool-runtime` 库测试、API 个人会话/文件/网页预览定向测试、daemon 编译检查、协议与 Browser 工具目录一致性检查、Browser core 验收。新增回归覆盖删除持久化失败保留成果、转交个人代理不依赖 Git 注册表。工具库保留一项已有 ignored 测试。该验收使用本地模型替身，没有调用外部真实模型，也不等于安装包发布或完整 Desktop guest 验收。
 
-Git 与 GPT Web 边界追加验收覆盖真实 Turn 的 Shell 建仓、查询、切分支与双仓库隔离，MCP socket 的个人目录读写、原会话审批和槽位失效；删除回归使用真实 Git worktree，确认干净自有副本回收、dirty/占用副本及上下文保留、其他会话与外部仓库不受影响。项目记忆误注入拒绝、外部仓库和 linked worktree 元数据授权也有执行前回归。验证命令与外部模型验收限制见[脚本与验证入口](validation.md)。
+项目记忆误注入拒绝、外部仓库和 linked worktree 元数据授权也有执行前回归。验证命令与外部模型验收限制见[脚本与验证入口](validation.md)。
