@@ -701,7 +701,6 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
             magi_core::TaskRuntimePayload::ContextAnchors {
                 references: browser_annotation_refs.to_vec(),
                 node_selections: browser_node_selections.to_vec(),
-                plugin_selections: Vec::new(),
             }
         },
         created_at: now,

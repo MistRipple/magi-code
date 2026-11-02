@@ -43,7 +43,10 @@ use crate::{
         model_usage_binding_for_worker_with_settings,
     },
 };
-use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest};
+use magi_bridge_client::{
+    BridgeClientError, BridgeErrorLayer, ChatToolDefinition, ModelBridgeClient,
+    ModelInvocationRequest, ModelResponse, ModelStreamingDelta,
+};
 use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
     FileSummaryItem, FileSummaryRecord, KnowledgeConsumer, KnowledgeContextRequest,
@@ -281,6 +284,7 @@ pub struct LlmTaskDispatcher {
     skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
     extension_hooks: Option<Arc<dyn crate::extension_hooks::ExtensionHooks>>,
+    plugin_command_executor: Option<Arc<dyn crate::plugin_command::PluginCommandExecutor>>,
     snapshot_manager: Option<Arc<magi_snapshot::SnapshotManager>>,
     workspace_execution_preparer: Option<Arc<WorkspaceExecutionPreparer>>,
     /// 主线和子代理共用的运行时输入与交互投递入口，不持有独立 Turn 状态。
@@ -518,6 +522,36 @@ pub enum RoleTarget<'a> {
     Orchestrator,
     Auxiliary,
     Agent { role_id: &'a str },
+}
+
+/// 插件命令不依赖模型配置，但 conversation 执行合同仍要求携带一个 client。
+/// 这个占位 client 只会在插件命令已经在执行入口短路时传入，任何模型调用都会显式失败。
+struct PluginCommandPlaceholderClient;
+
+impl ModelBridgeClient for PluginCommandPlaceholderClient {
+    fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+        magi_bridge_client::text_executor_capabilities()
+    }
+
+    fn invoke(&self, _request: ModelInvocationRequest) -> Result<ModelResponse, BridgeClientError> {
+        Err(BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Protocol,
+            code: None,
+            message: "插件命令不允许调用模型".into(),
+        })
+    }
+
+    fn invoke_streaming(
+        &self,
+        _request: ModelInvocationRequest,
+        _on_delta: &dyn Fn(&ModelStreamingDelta),
+    ) -> Result<ModelResponse, BridgeClientError> {
+        Err(BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Protocol,
+            code: None,
+            message: "插件命令不允许调用模型".into(),
+        })
+    }
 }
 
 pub const ORCHESTRATOR_THREAD_ID: &str = "orchestrator";
@@ -915,6 +949,7 @@ impl LlmTaskDispatcher {
             tool_registry: None,
             skill_runtime: None,
             skill_dispatch_runtime: None,
+            plugin_command_executor: None,
             extension_hooks: None,
             snapshot_manager: None,
             workspace_execution_preparer: None,
@@ -1048,6 +1083,14 @@ impl LlmTaskDispatcher {
     }
 
     /// 注入扩展钩子端口（`tool.call` / `tool.result`）。
+    pub fn with_plugin_command_executor(
+        mut self,
+        executor: Arc<dyn crate::plugin_command::PluginCommandExecutor>,
+    ) -> Self {
+        self.plugin_command_executor = Some(executor);
+        self
+    }
+
     pub fn with_extension_hooks(
         mut self,
         hooks: Arc<dyn crate::extension_hooks::ExtensionHooks>,
@@ -2958,7 +3001,12 @@ impl LlmTaskDispatcher {
         let execution_settings_snapshot = self.execution_settings_snapshot();
         let execution_settings =
             self.execution_settings_or_live(execution_settings_snapshot.as_ref());
-        let client: Arc<dyn ModelBridgeClient> = {
+        let client: Arc<dyn ModelBridgeClient> = if matches!(
+            request.command,
+            Some(crate::session_turn_execution::SessionTurnCommand::Plugin { .. })
+        ) {
+            Arc::new(PluginCommandPlaceholderClient)
+        } else {
             match self.resolve_model_client_for_task(
                 execution_settings,
                 None,
@@ -3088,6 +3136,7 @@ impl LlmTaskDispatcher {
             knowledge_context_prompt,
             persist_session_state: self.session_state_persist_callback.as_deref(),
             live_settings_store: self.settings_store.clone(),
+            plugin_command_executor: self.plugin_command_executor.clone(),
             extension_hooks: self.extension_hooks.as_deref(),
         })
     }
@@ -3096,14 +3145,6 @@ impl LlmTaskDispatcher {
         &self,
         input: TaskLlmInvocationInput<'_>,
     ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
-        if input.task.kind == TaskKind::LocalWorkflow {
-            return (
-                TaskOutcome::Failed {
-                    error: "工作流核心已随 QuickJS 插件后台移除，当前没有可执行的工作流任务".into(),
-                },
-                None,
-            );
-        }
         let TaskLlmInvocationInput {
             task,
             lease_id,
@@ -4028,9 +4069,6 @@ pub fn safety_gate_from_settings(
 
 #[cfg(test)]
 mod tests {
-    use magi_bridge_client::{
-        BridgeClientError, BridgeErrorLayer, ModelResponse, ModelStreamingDelta,
-    };
     #[test]
     fn a_title_that_only_truncates_the_goal_is_not_repeated_in_the_prompt() {
         let goal = "只读任务,不要修改任何文件:请读取 docs/README.md 并总结仓库结构。";

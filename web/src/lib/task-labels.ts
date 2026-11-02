@@ -37,7 +37,6 @@ export function getTaskDisplayText(text: string | null | undefined): string {
 export function getTaskKindLabel(kind: TaskKind): string {
   switch (kind) {
     case 'local_agent': return i18n.t('taskLabels.kind.local_agent');
-    case 'local_workflow': return i18n.t('taskLabels.kind.local_workflow');
     case 'remote_agent': return i18n.t('taskLabels.kind.remote_agent');
     case 'monitor_mcp': return i18n.t('taskLabels.kind.monitor_mcp');
     case 'in_process_teammate': return i18n.t('taskLabels.kind.in_process_teammate');
@@ -48,7 +47,6 @@ export function getTaskKindLabel(kind: TaskKind): string {
 
 export const USER_VISIBLE_TASK_KINDS: readonly TaskKind[] = [
   'local_agent',
-  'local_workflow',
   'remote_agent',
   'monitor_mcp',
   'in_process_teammate',

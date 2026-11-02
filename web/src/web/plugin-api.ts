@@ -20,6 +20,16 @@ export type InstalledPluginProjection = PluginInstalled;
 
 export const PLUGIN_REGISTRY_CHANGED_EVENT = 'magi-plugin-registry-changed';
 
+/** 已激活插件声明的用户命令；身份形如 `plugin/{插件}/{命令}`。 */
+export interface PluginCommandProjection {
+  id: string;
+  pluginId: string;
+  contributionId: string;
+  version: string;
+  title: string;
+  description: string;
+}
+
 async function pluginRequest(path: string, init?: RequestInit): Promise<Response> {
   return getTransport().request(agentUrl(path), init);
 }
@@ -169,6 +179,13 @@ export async function loadActivePluginManifests(scope = APPLICATION_PLUGIN_SCOPE
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.manifest'), response);
   const payload = await response.json() as unknown;
   return Array.isArray(payload) ? payload as PluginManifestProjection[] : [];
+}
+
+export async function loadActivePluginCommands(scope = APPLICATION_PLUGIN_SCOPE): Promise<PluginCommandProjection[]> {
+  const response = await pluginRequest(`/api/plugins/commands?scope=${encodeURIComponent(scope)}`);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.commands'), response);
+  const payload = await response.json() as unknown;
+  return Array.isArray(payload) ? payload as PluginCommandProjection[] : [];
 }
 
 export function subscribePluginResource(

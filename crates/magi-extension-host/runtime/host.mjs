@@ -32,6 +32,7 @@ let generation = null;
 let configValues = null;
 const handlers = new Map(); // hook name -> handler
 const toolHandlers = new Map(); // tool id -> handler
+const commandHandlers = new Map(); // command id -> handler
 const inflight = new Map(); // invocationId -> AbortController
 
 function send(message) {
@@ -93,6 +94,28 @@ async function handleRequest(id, method, params) {
       } catch (error) {
         // 工具自身抛出的错误是模型可见的工具失败，不是协议错误。
         return send({ id, result: { isError: true, output: String(error?.message ?? error).slice(0, 4096) } });
+      } finally {
+        inflight.delete(ctx.invocationId);
+      }
+    }
+    if (method === 'command.invoke') {
+      const ctx = params?.ctx ?? {};
+      if (generation !== null && ctx.generation !== generation) {
+        return send({ id, error: rpcError('StaleGeneration', '实例代次不符') });
+      }
+      const handler = commandHandlers.get(params.command);
+      if (!handler) return send({ id, error: rpcError('MethodNotFound', `命令 ${params.command} 未绑定`) });
+      const controller = new AbortController();
+      inflight.set(ctx.invocationId, controller);
+      try {
+        const output = await handler(params.input, { ...ctx, signal: controller.signal });
+        const content = typeof output === 'string' ? output : output?.content;
+        if (typeof content !== 'string' || !content.trim()) {
+          return send({ id, result: { isError: true, content: '命令必须返回非空文本，或 { content: string }' } });
+        }
+        return send({ id, result: { content: content.slice(0, 1048576) } });
+      } catch (error) {
+        return send({ id, result: { isError: true, content: String(error?.message ?? error).slice(0, 4096) } });
       } finally {
         inflight.delete(ctx.invocationId);
       }
@@ -161,6 +184,12 @@ const api = Object.freeze({
     if (typeof handler !== 'function') throw new TypeError('handler 必须是函数');
     await request('register.tool', { name: id });
     toolHandlers.set(id, handler);
+  },
+  /** 绑定用户命令处理器；命令必须已在清单中声明。返回字符串或 `{ content }`。 */
+  async command(id, handler) {
+    if (typeof handler !== 'function') throw new TypeError('handler 必须是函数');
+    await request('register.command', { name: id });
+    commandHandlers.set(id, handler);
   },
   log(message) {
     send({ method: 'host.log', params: { message: String(message).slice(0, 4096) } });

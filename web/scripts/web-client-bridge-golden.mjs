@@ -3375,6 +3375,27 @@ await withGoldenViteServer(async (server) => {
   );
   messagesStore.clearRequestBinding('request-electron-reuse-1');
   messagesStore.clearRequestBinding('request-electron-reuse-2');
+  sessionTurnInterceptors.push(() => electronTurnResponse(3));
+  bridge.postMessage({
+    type: 'executeTask',
+    pluginCommandId: 'plugin/example/setup',
+    text: null,
+    requestId: 'request-plugin-command',
+    workspaceId: RACE_WORKSPACE_ID,
+    workspacePath: RACE_WORKSPACE_PATH,
+    sessionId: RACE_SESSION_ID,
+  });
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === 'request-plugin-command'),
+    '没有正文的插件命令也必须进入 canonical Turn 入口',
+  );
+  assert.equal(
+    capturedTurnBodies.find((body) => body.requestId === 'request-plugin-command').pluginCommandId,
+    'plugin/example/setup',
+    'Renderer Bridge 不得丢弃插件命令身份，否则命令会被当成模型对话',
+  );
+  messagesStore.clearRequestBinding('request-plugin-command');
+
   const externalApprovalEvents = [];
   const onExternalApproval = () => externalApprovalEvents.push(true);
   window.addEventListener('magi:mcp-approvals-changed', onExternalApproval);
@@ -3423,6 +3444,7 @@ await withGoldenViteServer(async (server) => {
   assert.equal(messagesStore.messagesState.queuedMessages.length, 0, '旧服务端版本不能复活已消费输入');
 
   const queueMetadata = [
+    { pluginCommandId: 'plugin/queue/command' },
     { interruptTurnId: 'turn-interrupted-queue', interruptionError: '资源尚未结算' },
   ];
   let metadataInboxRead = false;
@@ -3436,7 +3458,7 @@ await withGoldenViteServer(async (server) => {
       })) });
   });
   inboxEvent(20002);
-  await waitFor(() => metadataInboxRead && messagesStore.messagesState.queuedMessages.length === 1,
+  await waitFor(() => metadataInboxRead && messagesStore.messagesState.queuedMessages.length === 2,
     'Inbox metadata must pass through the real bridge projection');
   for (const [index, metadata] of queueMetadata.entries()) {
     const projected = messagesStore.messagesState.queuedMessages[index];

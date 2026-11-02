@@ -418,6 +418,7 @@ async fn a_host_that_exits_before_connecting_fails_fast_instead_of_waiting_for_t
 async fn tools_are_invoked_through_the_real_host_and_failures_stay_tool_results() {
     let mut env = env("tools", Vec::new());
     env.config.tools = vec!["echo".into(), "slow".into(), "boom".into()];
+    env.config.commands = vec!["hello".into(), "bad".into(), "slow-cmd".into()];
     let bus = ExtensionBus::new(BusPolicy::default());
     bus.register_plugin("acme.guard", &[]).unwrap();
     let instance = up(&env, &bus).await;
@@ -491,6 +492,43 @@ async fn tools_are_invoked_through_the_real_host_and_failures_stay_tool_results(
         .await
         .unwrap();
     assert_eq!(again["output"]["echoed"], 1);
+    // 用户命令：返回文本；抛错与空返回是命令失败；调用方取消立即返回。
+    let hello = instance
+        .invoke_command(
+            "hello",
+            json!({"text": "Magi"}),
+            json!({"invocationId": "c1"}),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hello["content"], "你好，Magi");
+    let bad = instance
+        .invoke_command(
+            "bad",
+            json!({}),
+            json!({"invocationId": "c2"}),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad["isError"], true);
+    let stopped = instance
+        .invoke_command(
+            "slow-cmd",
+            json!({}),
+            json!({"invocationId": "c3"}),
+            Duration::from_secs(30),
+            tokio::time::sleep(Duration::from_millis(100)),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        stopped.kind(),
+        magi_extension_host::protocol::ErrorKind::Cancelled
+    );
     // 未绑定的工具不会被分发。
     assert!(
         instance

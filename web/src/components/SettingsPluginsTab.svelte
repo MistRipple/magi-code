@@ -284,12 +284,10 @@
             </div>
           {/if}
           {#if preview.dataSchemaFrom !== undefined}
-            <div class="settings-notice" class:settings-notice--error={preview.dataSchemaBlocked} role={preview.dataSchemaBlocked ? 'alert' : undefined}>
-              {preview.dataSchemaBlocked
-                ? i18n.t('settings.plugins.candidate.dataBlocked', { from: preview.dataSchemaFrom, to: preview.manifest.dataSchemaVersion })
-                : preview.dataConversion
-                  ? i18n.t('settings.plugins.candidate.dataConverts', { from: preview.dataSchemaFrom, to: preview.manifest.dataSchemaVersion })
-                  : i18n.t('settings.plugins.candidate.dataChanged', { from: preview.dataSchemaFrom, to: preview.manifest.dataSchemaVersion })}
+            <div class="settings-notice" class:settings-notice--error={preview.dataReset} role={preview.dataReset ? 'alert' : undefined}>
+              {preview.dataReset
+                ? i18n.t('settings.plugins.candidate.dataReset', { from: preview.dataSchemaFrom, to: preview.manifest.dataSchemaVersion })
+                : i18n.t('settings.plugins.candidate.dataChanged', { from: preview.dataSchemaFrom, to: preview.manifest.dataSchemaVersion })}
             </div>
           {/if}
           <div class="settings-row-desc">
@@ -299,7 +297,7 @@
         </div>
         <div class="settings-card-foot">
           <button class="btn btn--sm btn--secondary" data-action="cancel-candidate" onclick={() => { staged = null; }} disabled={busy}>{i18n.t('settings.plugins.candidate.cancel')}</button>
-          <button class="btn btn--sm btn--primary" data-action="confirm-candidate" onclick={() => void confirmStaged()} disabled={busy || preview.dataSchemaBlocked}>
+          <button class="btn btn--sm btn--primary" data-action="confirm-candidate" onclick={() => void confirmStaged()} disabled={busy}>
             {preview.operation === 'upgrade' ? i18n.t('settings.plugins.candidate.confirmUpgrade') : i18n.t('settings.plugins.candidate.confirmInstall')}
           </button>
         </div>

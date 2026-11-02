@@ -580,12 +580,6 @@ impl RunnerManager {
                         let backoff_ms = 200u64.saturating_mul(waiting_streak as u64).min(2_000);
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     }
-                    RunCycleOutcome::UserInputRequired => {
-                        let mut status = bg_handle.status.lock().expect("status lock should hold");
-                        *status = "waiting_user".to_string();
-                        bg_active.store(false, Ordering::Relaxed);
-                        break;
-                    }
                     RunCycleOutcome::Unrunnable(task_ids) => {
                         let runner_status =
                             match task_runner.finalize_unrunnable_outcome(&root_id, &task_ids) {
@@ -6289,6 +6283,7 @@ mod tests {
         QueuedRegularSessionTurn {
             project_directories: None,
             request: SessionTurnRequestDto {
+                plugin_command_id: None,
                 source_folder_id: None,
                 project_directories: None,
                 desktop_browser_tools_allowed: false,

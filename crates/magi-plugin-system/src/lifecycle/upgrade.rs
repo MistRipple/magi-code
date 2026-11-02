@@ -10,7 +10,7 @@ impl PluginManager {
     ///
     /// 授权绑定到具体包摘要，不跨版本继承：切换后保留各作用域的启用意愿，
     /// 但所有激活与授权清空，须用户对新包重新授权后激活。不保留双版本并发或
-    /// 自动回退；已有持久数据的数据格式版本变化没有转换器，直接拒绝。
+    /// 自动回退；数据格式版本变化且已有持久数据时没有转换通道，切换后清空该插件的数据。
     pub fn upgrade(
         &mut self,
         package: &PluginPackage,
@@ -30,13 +30,10 @@ impl PluginManager {
         if drain.plugin_id() != id || drain.scopes() != [PLUGIN_WIDE_DRAIN_SCOPE] {
             return Err(conflict("升级必须先关闭该插件全部作用域的准入"));
         }
-        let from = self.package(id)?.manifest().data_schema_version;
-        let to = package.manifest().data_schema_version;
-        if from != to && self.resources.has_data(id) {
-            return Err(conflict(format!(
-                "新版插件的数据格式版本为 {to}，插件已有数据格式 {from} 的数据，当前没有数据转换通道；升级已拒绝"
-            )));
-        }
+        // 没有数据转换通道：数据格式版本变化时，旧格式数据在切换后清空（预览阶段已告知）。
+        let reset_data = self.package(id)?.manifest().data_schema_version
+            != package.manifest().data_schema_version
+            && self.resources.has_data(id);
         let enabled_scopes = current.enabled_scopes.clone();
         let relative = self.write_version(package)?;
         let replacement = InstalledPlugin {
@@ -55,6 +52,9 @@ impl PluginManager {
             let _ = fs::remove_file(self.root.join(relative));
             return Err(error);
         }
+        if reset_data {
+            self.resources.replace_plugin(id, &[])?;
+        }
         cleanup_unreferenced_packages(&self.root, &self.state)?;
         Ok(())
     }
@@ -62,8 +62,8 @@ impl PluginManager {
     /// 准备阶段：只比较候选包与已安装版本，不写入任何状态，也不激活任何贡献。
     ///
     /// 权限按（种类、作用域、目标集合）整体比较：目标范围扩大会同时表现为新增与移除，
-    /// 界面据此要求重新授权。数据格式版本变化且已有持久数据时标记为阻塞，
-    /// 与 [`PluginManager::upgrade`] 的拒绝条件一致。
+    /// 界面据此要求重新授权。数据格式版本变化且已有持久数据时标记 `data_reset`，
+    /// 与 [`PluginManager::upgrade`] 的清空条件一致。
     pub fn preview(
         &self,
         package: &PluginPackage,
@@ -81,8 +81,7 @@ impl PluginManager {
                 added_permissions: manifest.permissions.clone(),
                 removed_permissions: Vec::new(),
                 data_schema_from: None,
-                data_schema_blocked: false,
-                data_conversion: false,
+                data_reset: false,
             });
         };
         let installed = self.package(&manifest.id)?;
@@ -90,7 +89,7 @@ impl PluginManager {
         let unchanged = current.digest == package.digest();
         let from_version = installed.manifest().data_schema_version;
         let schema_changed = from_version != manifest.data_schema_version;
-        let needs_conversion = schema_changed && self.resources.has_data(&manifest.id);
+        let data_reset = schema_changed && self.resources.has_data(&manifest.id);
         Ok(PluginCandidatePreview {
             manifest: manifest.clone(),
             digest: package.digest().to_owned(),
@@ -104,8 +103,7 @@ impl PluginManager {
             added_permissions: permission_difference(&manifest.permissions, previous),
             removed_permissions: permission_difference(previous, &manifest.permissions),
             data_schema_from: schema_changed.then_some(installed.manifest().data_schema_version),
-            data_schema_blocked: needs_conversion,
-            data_conversion: false,
+            data_reset,
         })
     }
 }

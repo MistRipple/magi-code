@@ -23,8 +23,6 @@ pub enum RunCycleOutcome {
     },
     /// 其他 Runner 抢先取得租约，本轮未派发任务，等待下一轮重试。
     Waiting,
-    /// 工作流明确请求用户输入；Runner 退出等待，由恢复入口重新启动。
-    UserInputRequired,
     /// 当前任务图仍有非终态任务，但这些任务在现有结构下无法进入可运行状态。
     Unrunnable(Vec<TaskId>),
     /// An unexpected error occurred during the cycle.

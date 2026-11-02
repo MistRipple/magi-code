@@ -2356,6 +2356,7 @@ mod tests {
 
     fn session_turn_request(text: &str) -> SessionTurnRequestDto {
         SessionTurnRequestDto {
+            plugin_command_id: None,
             source_folder_id: None,
             project_directories: None,
             desktop_browser_tools_allowed: true,

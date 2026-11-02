@@ -11312,7 +11312,10 @@ fn stopping_a_session_cancels_running_plugin_tool_calls() {
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while registry.cancel_active_executions(&query) == 0 {
-        assert!(std::time::Instant::now() < deadline, "调用应登记为可取消操作");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "调用应登记为可取消操作"
+        );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let (_, status) = worker.join().unwrap().unwrap();

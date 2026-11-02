@@ -20,7 +20,6 @@ pub struct WorkerInfo {
 pub fn default_task_role_for_kind(kind: TaskKind) -> Option<&'static str> {
     match kind {
         TaskKind::LocalAgent => Some("executor"),
-        TaskKind::LocalWorkflow => Some("executor"),
         TaskKind::RemoteAgent => Some("executor"),
         TaskKind::MonitorMcp => Some("executor"),
         TaskKind::InProcessTeammate => Some("executor"),

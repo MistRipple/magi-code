@@ -1600,6 +1600,7 @@ impl MagiTurnHarness {
     ) -> Result<SessionTurnResponseDto, crate::errors::ApiError> {
         let response = TurnService::new(self.state.clone())
             .submit(SessionTurnRequestDto {
+                plugin_command_id: None,
                 source_folder_id: None,
                 project_directories: None,
                 desktop_browser_tools_allowed: false,
@@ -1682,6 +1683,7 @@ impl MagiTurnHarness {
         self.provider.begin_timing();
         let response = TurnService::new(self.state.clone())
             .submit(SessionTurnRequestDto {
+                plugin_command_id: None,
                 source_folder_id: None,
                 project_directories: None,
                 desktop_browser_tools_allowed: false,
@@ -1730,6 +1732,7 @@ impl MagiTurnHarness {
         self.provider.begin_timing();
         let response = TurnService::new(self.state.clone())
             .submit(SessionTurnRequestDto {
+                plugin_command_id: None,
                 source_folder_id: None,
                 project_directories: None,
                 desktop_browser_tools_allowed: false,
@@ -1776,6 +1779,7 @@ impl MagiTurnHarness {
         self.provider.begin_timing();
         TurnService::new(self.state.clone())
             .submit(SessionTurnRequestDto {
+                plugin_command_id: None,
                 source_folder_id: None,
                 project_directories: None,
                 desktop_browser_tools_allowed: false,
@@ -1816,6 +1820,7 @@ impl MagiTurnHarness {
     ) -> Result<SessionTurnResponseDto, crate::errors::ApiError> {
         TurnService::new(self.state.clone())
             .submit(SessionTurnRequestDto {
+                plugin_command_id: None,
                 source_folder_id: None,
                 project_directories: None,
                 desktop_browser_tools_allowed: false,

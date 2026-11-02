@@ -612,6 +612,11 @@ impl PluginManager {
         Ok(packages)
     }
 
+    /// 插件是否有持久数据（资源或设置）。
+    pub fn has_resource_data(&self, plugin_id: &str) -> bool {
+        self.resources.has_data(plugin_id)
+    }
+
     pub fn manifests_for_scope(&self, scope: &str) -> Result<Vec<PluginManifest>, PluginError> {
         Ok(self
             .active_packages(scope)?
@@ -647,6 +652,31 @@ impl PluginManager {
             }
         }
         Ok(tools)
+    }
+
+    /// 已激活插件声明的用户命令目录。
+    pub fn command_contributions_for_scope(
+        &self,
+        scope: &str,
+    ) -> Result<
+        Vec<(
+            PluginManifest,
+            magi_app_server_protocol::PluginNamedContribution,
+        )>,
+        PluginError,
+    > {
+        Ok(self
+            .active_packages(scope)?
+            .iter()
+            .flat_map(|package| {
+                let manifest = package.manifest();
+                manifest
+                    .contributions
+                    .commands
+                    .iter()
+                    .map(move |command| (manifest.clone(), command.clone()))
+            })
+            .collect())
     }
 
     /// 解析并校验一次模型发起的工具调用：工具必须在当前作用域的目录内，参数必须是

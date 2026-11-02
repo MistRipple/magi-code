@@ -6,6 +6,12 @@ export interface ComposerSkillOption {
   description: string;
 }
 
+export interface ComposerPluginCommandOption {
+  pluginCommandId: string;
+  name: string;
+  description: string;
+}
+
 /** 会话命令：由 daemon 执行的独立轮次，不调用主模型回复。 */
 export type ComposerSessionCommand = 'compact';
 
@@ -53,6 +59,13 @@ export type ComposerAction =
       name: string;
       description: string;
       skill: ComposerSkillOption;
+    }
+  | {
+      kind: 'plugin-command';
+      id: string;
+      name: string;
+      description: string;
+      pluginCommand: ComposerPluginCommandOption;
     };
 
 function fuzzyMatch(text: string, query: string): boolean {
@@ -69,6 +82,7 @@ export function buildComposerActions(
   labels: ComposerActionLabels,
   options: {
     sessionCommandDisabledReason?: SessionCommandDisabledReason | null;
+    pluginCommands?: ComposerPluginCommandOption[];
   } = {},
 ): ComposerAction[] {
   return [
@@ -101,6 +115,13 @@ export function buildComposerActions(
       name: skill.name,
       description: skill.description,
       skill,
+    })),
+    ...(options.pluginCommands ?? []).map<ComposerAction>((pluginCommand) => ({
+      kind: 'plugin-command',
+      id: pluginCommand.pluginCommandId,
+      name: pluginCommand.name,
+      description: pluginCommand.description,
+      pluginCommand,
     })),
   ];
 }

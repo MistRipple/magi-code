@@ -150,7 +150,6 @@ pub fn validate_role_id(id: &str) -> Result<(), String> {
 #[serde(rename_all = "snake_case")]
 pub enum TaskKindLabel {
     LocalAgent,
-    LocalWorkflow,
     RemoteAgent,
     MonitorMcp,
     InProcessTeammate,
@@ -161,7 +160,6 @@ impl TaskKindLabel {
     pub fn to_task_kind(self) -> TaskKind {
         match self {
             Self::LocalAgent => TaskKind::LocalAgent,
-            Self::LocalWorkflow => TaskKind::LocalWorkflow,
             Self::RemoteAgent => TaskKind::RemoteAgent,
             Self::MonitorMcp => TaskKind::MonitorMcp,
             Self::InProcessTeammate => TaskKind::InProcessTeammate,
@@ -172,7 +170,6 @@ impl TaskKindLabel {
     fn parse(label: &str) -> Option<Self> {
         match label {
             "local_agent" => Some(Self::LocalAgent),
-            "local_workflow" => Some(Self::LocalWorkflow),
             "remote_agent" => Some(Self::RemoteAgent),
             "monitor_mcp" => Some(Self::MonitorMcp),
             "in_process_teammate" => Some(Self::InProcessTeammate),
@@ -1171,7 +1168,6 @@ impl TaskKindLabel {
     fn as_str(self) -> &'static str {
         match self {
             Self::LocalAgent => "local_agent",
-            Self::LocalWorkflow => "local_workflow",
             Self::RemoteAgent => "remote_agent",
             Self::MonitorMcp => "monitor_mcp",
             Self::InProcessTeammate => "in_process_teammate",
@@ -1388,7 +1384,7 @@ mod tests {
 
     #[test]
     fn parse_role_markdown_handles_all_fields() {
-        let raw = "---\nid: ml-engineer\nsupported_kinds: [local_agent, local_workflow]\nparallelism_limit: 2\ncoordinator_mode: false\nversion: 1\n---\n你是机器学习工程师\n";
+        let raw = "---\nid: ml-engineer\nsupported_kinds: [local_agent, remote_agent]\nparallelism_limit: 2\ncoordinator_mode: false\nversion: 1\n---\n你是机器学习工程师\n";
         let role = parse_role_markdown(raw).expect("解析成功");
         assert_eq!(role.id, "ml-engineer");
         assert_eq!(role.system_prompt, "你是机器学习工程师");
@@ -1480,7 +1476,7 @@ mod tests {
         let path = dir.join("ml-engineer.md");
         fs::write(
             &path,
-            "---\nid: ml-engineer\nsupported_kinds: [local_agent, local_workflow]\nparallelism_limit: 2\n---\n你是机器学习工程师\n",
+            "---\nid: ml-engineer\nsupported_kinds: [local_agent, remote_agent]\nparallelism_limit: 2\n---\n你是机器学习工程师\n",
         )
         .unwrap();
         let role = load_file(&path).unwrap();

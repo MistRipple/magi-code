@@ -350,6 +350,7 @@ export interface TurnStartParams {
   goalMode?: boolean;
   resume?: boolean;
   command?: SessionTurnCommand | null;
+  pluginCommandId?: string | null;
   images?: Array<SessionTurnImage>;
   contextReferences?: Array<SessionContextReference>;
   browserAnnotationRefs?: Array<string>;
@@ -724,6 +725,7 @@ export interface PluginNamedContribution {
 export interface PluginContributions {
   skills?: Array<PluginSkillContribution>;
   tools?: Array<PluginToolContribution>;
+  commands?: Array<PluginNamedContribution>;
   views?: Array<PluginViewContribution>;
   resources?: Array<PluginNamedContribution>;
   browserSurfaces?: Array<PluginBrowserSurfaceContribution>;
@@ -782,8 +784,7 @@ export interface PluginCandidatePreview {
   addedPermissions: Array<PluginPermission>;
   removedPermissions: Array<PluginPermission>;
   dataSchemaFrom?: number;
-  dataSchemaBlocked: boolean;
-  dataConversion: boolean;
+  dataReset: boolean;
 }
 
 export interface PluginScopeGrant {
@@ -1293,6 +1294,7 @@ export interface QueuedSessionTurn {
   content: string;
   text: string | null;
   command: SessionTurnCommand | null;
+  pluginCommandId: string | null;
   skillName: string | null;
   goalMode: boolean;
   accessProfile: AccessProfile | null;

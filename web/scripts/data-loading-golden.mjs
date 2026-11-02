@@ -110,6 +110,7 @@ await withGoldenViteServer(async server => {
   const manifestsPath = '/api/plugins/manifests';
   const pluginResponse = manifestResponse => {
     queue(manifestsPath, manifestResponse);
+    queue('/api/plugins/commands', () => json([]));
   };
   pluginResponse(() => json([plugin]));
   await registry.loadedPluginProjection('application');

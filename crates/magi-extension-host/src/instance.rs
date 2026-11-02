@@ -39,6 +39,8 @@ pub struct LaunchConfig {
     pub hooks: Vec<HookRegistration>,
     /// 清单声明且已获 `tools` 授权的工具 ID；宿主只能绑定其中的工具。
     pub tools: Vec<String>,
+    /// 清单声明的用户命令 ID。
+    pub commands: Vec<String>,
     pub config: Value,
     pub connect_timeout: Duration,
     pub handshake_timeout: Duration,
@@ -64,6 +66,7 @@ impl LaunchConfig {
             grants: Vec::new(),
             hooks: Vec::new(),
             tools: Vec::new(),
+            commands: Vec::new(),
             config: Value::Null,
             connect_timeout: Duration::from_secs(15),
             handshake_timeout: Duration::from_secs(5),
@@ -108,6 +111,7 @@ pub struct HostInstance {
     approved: HashMap<String, ApprovedHook>,
     bound: Arc<Mutex<HashSet<String>>>,
     bound_tools: Arc<Mutex<HashSet<String>>>,
+    bound_commands: Arc<Mutex<HashSet<String>>>,
     stop: Arc<Notify>,
     exited: watch::Receiver<bool>,
 }
@@ -133,6 +137,13 @@ impl HostInstance {
             .contains(tool)
     }
 
+    pub fn is_command_bound(&self, command: &str) -> bool {
+        self.bound_commands
+            .lock()
+            .expect("bound commands lock poisoned")
+            .contains(command)
+    }
+
     /// 向宿主发起一次工具调用。超时时通知宿主取消并返回 `DeadlineExceeded`。
     ///
     /// `cancelled` 完成表示调用方已取消（用户停止 Turn/任务）：宿主收到 `host.cancel`，
@@ -151,6 +162,48 @@ impl HostInstance {
                 format!("工具 {tool} 未被宿主绑定"),
             ));
         }
+        self.invoke_bound("tool.invoke", "tool", tool, input, ctx, timeout, cancelled)
+            .await
+    }
+
+    /// 向宿主发起一次用户命令调用；取消与期限语义同 [`HostInstance::invoke_tool`]。
+    pub async fn invoke_command(
+        &self,
+        command: &str,
+        input: Value,
+        ctx: Value,
+        timeout: Duration,
+        cancelled: impl std::future::Future<Output = ()>,
+    ) -> Result<Value, RpcError> {
+        if !self.is_command_bound(command) {
+            return Err(RpcError::new(
+                ErrorKind::MethodNotFound,
+                format!("命令 {command} 未被宿主绑定"),
+            ));
+        }
+        self.invoke_bound(
+            "command.invoke",
+            "command",
+            command,
+            input,
+            ctx,
+            timeout,
+            cancelled,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn invoke_bound(
+        &self,
+        method: &str,
+        key: &str,
+        name: &str,
+        input: Value,
+        ctx: Value,
+        timeout: Duration,
+        cancelled: impl std::future::Future<Output = ()>,
+    ) -> Result<Value, RpcError> {
         let invocation_id = ctx
             .get("invocationId")
             .and_then(Value::as_str)
@@ -160,8 +213,8 @@ impl HostInstance {
         ctx["generation"] = json!(self.generation);
         ctx["deadlineMs"] = json!(timeout.as_millis() as u64);
         let request = self.peer.request(
-            "tool.invoke",
-            json!({"tool": tool, "ctx": ctx, "input": input}),
+            method,
+            json!({key: name, "ctx": ctx, "input": input}),
             timeout,
         );
         let result = tokio::select! {
@@ -228,6 +281,8 @@ struct HostHandler {
     bound: Arc<Mutex<HashSet<String>>>,
     approved_tools: HashSet<String>,
     bound_tools: Arc<Mutex<HashSet<String>>>,
+    approved_commands: HashSet<String>,
+    bound_commands: Arc<Mutex<HashSet<String>>>,
     ready: watch::Sender<bool>,
 }
 
@@ -267,6 +322,24 @@ impl Incoming for HostHandler {
                     Err(RpcError::new(
                         ErrorKind::RegistrationDenied,
                         format!("工具 {name} 未在清单中声明或未获授权"),
+                    ))
+                }
+            }
+            "register.command" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if self.approved_commands.contains(name) {
+                    self.bound_commands
+                        .lock()
+                        .expect("bound commands lock poisoned")
+                        .insert(name.to_string());
+                    Ok(json!({}))
+                } else {
+                    Err(RpcError::new(
+                        ErrorKind::RegistrationDenied,
+                        format!("命令 {name} 未在清单中声明"),
                     ))
                 }
             }
@@ -424,6 +497,7 @@ pub async fn launch(
 
     let bound: Arc<Mutex<HashSet<String>>> = Arc::default();
     let bound_tools: Arc<Mutex<HashSet<String>>> = Arc::default();
+    let bound_commands: Arc<Mutex<HashSet<String>>> = Arc::default();
     let (ready_tx, mut ready_rx) = watch::channel(false);
     let handler = Arc::new(HostHandler {
         plugin_id: config.plugin_id.clone(),
@@ -431,6 +505,8 @@ pub async fn launch(
         bound: Arc::clone(&bound),
         approved_tools: config.tools.iter().cloned().collect(),
         bound_tools: Arc::clone(&bound_tools),
+        approved_commands: config.commands.iter().cloned().collect(),
+        bound_commands: Arc::clone(&bound_commands),
         ready: ready_tx,
     });
     let peer = Peer::spawn(stream, handler, config.limits);
@@ -457,6 +533,7 @@ pub async fn launch(
         approved,
         bound,
         bound_tools,
+        bound_commands,
         stop,
         exited: exited_rx,
     }))
@@ -512,7 +589,7 @@ where
                     "frameBytes": limit, "pending": config.limits.pending,
                 },
                 "grants": config.grants,
-                "registrations": {"hooks": registrations, "tools": config.tools},
+                "registrations": {"hooks": registrations, "tools": config.tools, "commands": config.commands},
                 "config": {"revision": 1, "values": config.config},
                 "features": features,
             });

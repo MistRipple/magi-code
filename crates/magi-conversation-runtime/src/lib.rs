@@ -25,6 +25,7 @@ pub mod external_session_turn;
 pub mod external_tool;
 mod goal_tool_failure;
 mod history_projection;
+pub mod plugin_command;
 pub use history_projection::{
     EXTENSION_REWRITE_HOOKS, ExtensionRewriteProposal, ExtensionRewriteRejection,
     apply_extension_rewrites,

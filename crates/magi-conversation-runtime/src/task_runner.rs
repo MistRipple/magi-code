@@ -236,9 +236,7 @@ impl TaskRunner {
                 return RunCycleOutcome::Continue;
             }
             let task_ids = self.collect_non_terminal_task_ids(root_task_id);
-            return if self.store.has_pending_user_input(root_task_id) {
-                RunCycleOutcome::UserInputRequired
-            } else if task_ids.is_empty() {
+            return if task_ids.is_empty() {
                 RunCycleOutcome::Waiting
             } else {
                 RunCycleOutcome::Unrunnable(task_ids)
@@ -368,11 +366,7 @@ impl TaskRunner {
                 reason,
             }
         } else if unmatched.is_empty() {
-            if self.store.has_pending_user_input(root_task_id) {
-                RunCycleOutcome::UserInputRequired
-            } else {
-                RunCycleOutcome::Waiting
-            }
+            RunCycleOutcome::Waiting
         } else {
             RunCycleOutcome::Unrunnable(unmatched)
         }

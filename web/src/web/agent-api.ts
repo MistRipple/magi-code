@@ -2273,6 +2273,7 @@ export async function submitSessionTurn(
     goalMode?: boolean;
     resume?: boolean;
     command?: SessionTurnCommand | null;
+    pluginCommandId?: string | null;
     images: AgentSessionTurnImagePayload[];
     contextReferences?: Array<{
       kind: 'file' | 'directory';
@@ -2312,6 +2313,7 @@ export async function submitSessionTurn(
         goalMode: payload.goalMode === true,
         resume: payload.resume === true,
         command: payload.command ?? null,
+        pluginCommandId: payload.pluginCommandId ?? null,
         accessProfile: payload.accessProfile ?? null,
         requestId: payload.requestId ?? null,
         userMessageId: payload.userMessageId ?? null,

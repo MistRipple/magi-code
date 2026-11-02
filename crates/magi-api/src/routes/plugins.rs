@@ -59,6 +59,7 @@ pub fn routes() -> Router<ApiState> {
         )
         .route("/plugins/center/install", post(center_install))
         .route("/plugins/guide", get(guide))
+        .route("/plugins/commands", get(commands))
         .route("/plugins/manifests", get(manifests))
         .route(
             "/plugins/{id}/resources/{resource}/events",
@@ -494,6 +495,32 @@ async fn upgrade_installed_plugin(
     }
     publish_plugin_registry_changed(state);
     Ok(())
+}
+
+/// 已激活插件声明的用户命令。身份固定为 `plugin/{插件}/{贡献}`，供输入框斜杠菜单使用。
+async fn commands(
+    State(state): State<ApiState>,
+    Query(query): Query<ScopeQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let manager = locked(&state, "读取插件命令")?;
+    let entries = manager
+        .command_contributions_for_scope(&query.scope)
+        .map_err(plugin_error)?;
+    Ok(Json(
+        entries
+            .into_iter()
+            .map(|(manifest, command)| {
+                serde_json::json!({
+                    "id": magi_plugin_system::ContributionRef::new(&manifest.id, &command.id).identity(),
+                    "pluginId": manifest.id,
+                    "contributionId": command.id,
+                    "version": manifest.version,
+                    "title": command.title,
+                    "description": command.description,
+                })
+            })
+            .collect(),
+    ))
 }
 
 async fn authorize(

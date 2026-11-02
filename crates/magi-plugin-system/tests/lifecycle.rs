@@ -196,7 +196,7 @@ fn upgrade_drains_the_plugin_then_keeps_enablement_but_not_activation_or_grants(
 }
 
 #[test]
-fn data_schema_change_is_refused_only_when_stored_data_would_need_conversion() {
+fn data_schema_change_clears_stored_data_and_is_announced_by_the_preview() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();
     let with_resource = |mut value: Value| {
@@ -217,7 +217,7 @@ fn data_schema_change_is_refused_only_when_stored_data_would_need_conversion() {
     changed["dataSchemaVersion"] = json!(2);
     let next = package_from_manifest(changed);
 
-    // 有持久数据（这里是设置）时，需要转换器，升级被拒绝且版本不变。
+    // 有持久数据时升级成功，但该插件的数据被清空；预览阶段已标记 data_reset。
     manager.enable("acme.lifecycle", "application").unwrap();
     manager
         .authorize("acme.lifecycle", "application", vec![grant()])
@@ -229,14 +229,27 @@ fn data_schema_change_is_refused_only_when_stored_data_would_need_conversion() {
     manager.deactivate("acme.lifecycle", "application").unwrap();
     manager.disable("acme.lifecycle", "application").unwrap();
     let manager = Arc::new(Mutex::new(manager));
-    let error = upgrade_with_drain(&manager, &next, "next.zip").unwrap_err();
-    assert!(error.to_string().contains("数据"), "{error}");
-    assert_eq!(
-        manager.lock().unwrap().state().plugins["acme.lifecycle"].version,
-        "1.0.0"
+    assert!(
+        manager
+            .lock()
+            .unwrap()
+            .preview(
+                &next,
+                &PluginSource::Local {
+                    name: "next.zip".into()
+                }
+            )
+            .unwrap()
+            .data_reset
     );
+    upgrade_with_drain(&manager, &next, "next.zip").unwrap();
+    {
+        let manager = manager.lock().unwrap();
+        assert_eq!(manager.state().plugins["acme.lifecycle"].version, "2.0.0");
+        assert!(!manager.has_resource_data("acme.lifecycle"));
+    }
 
-    // 没有任何数据时无需转换，可以直接切换到新的数据格式版本。
+    // 没有任何数据时直接切换到新的数据格式版本。
     let fresh_root = tempdir().unwrap();
     let mut fresh = PluginManager::open(fresh_root.path()).unwrap();
     fresh
@@ -661,7 +674,7 @@ fn preview_of_an_upgrade_reports_permission_diff_and_blocked_data_migration() {
     assert_eq!(preview.installed_version.as_deref(), Some("1.0.0"));
     assert_eq!(preview.added_permissions, vec![grant()]);
     assert!(preview.removed_permissions.is_empty());
-    assert!(!preview.data_schema_blocked);
+    assert!(!preview.data_reset);
 
     // 目标范围变化被视为新增加移除，而不是静默沿用；目标顺序不影响判断。
     let mut base = manifest(true);
@@ -709,7 +722,7 @@ fn preview_of_an_upgrade_reports_permission_diff_and_blocked_data_migration() {
         .unwrap();
     let preview = third.preview(&schema, &local("v2.zip")).unwrap();
     assert_eq!(preview.data_schema_from, Some(1));
-    assert!(!preview.data_schema_blocked);
+    assert!(!preview.data_reset);
     third.enable("acme.lifecycle", "application").unwrap();
     third
         .authorize("acme.lifecycle", "application", vec![grant()])
@@ -718,12 +731,7 @@ fn preview_of_an_upgrade_reports_permission_diff_and_blocked_data_migration() {
     third
         .write_resource("acme.lifecycle", "application", "cache", 0, json!({"k": 1}))
         .unwrap();
-    assert!(
-        third
-            .preview(&schema, &local("v2.zip"))
-            .unwrap()
-            .data_schema_blocked
-    );
+    assert!(third.preview(&schema, &local("v2.zip")).unwrap().data_reset);
 }
 
 #[test]

@@ -281,6 +281,8 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 扩展工具：`cargo test -p magi-extension-host --test host tools`（真实 Node：绑定、输出、抛错作为工具失败、超时与调用方取消、取消后宿主可继续服务、未批准工具注册使激活失败）、`cargo test -p magi-daemon --lib extension_tools`（授权前目录为空、授权后可见、参数校验拒绝、工具失败回执、未知工具拒绝）、`cargo test -p magi-tool-runtime plugin_side_effect stopping_a_session`（与 MCP 相同的访问档位与审批续跑合同；停止会话取消运行中的插件工具调用）、`cargo test -p magi-plugin-system --test package extension_tools`（清单校验）。未覆盖：真实模型回合里的调用与真实停止按钮的端到端、Windows。
 
+用户命令：`cargo test -p magi-extension-host --test host tools`（含命令绑定、抛错、取消）、`cargo test -p magi-daemon --lib extension_commands`（真实 Node：执行、失败、未声明命令拒绝、停止取消）、`cargo test -p magi-api --lib plugin_commands`（命令只对已激活声明开放，不与其他控制输入混用）、`npm --prefix web run test:bridge`（命令身份经桥进入 Turn 并随队列回显）。未覆盖：真实 Electron 里的斜杠菜单与一轮完整命令、Windows。
+
 钩子接线：`cargo test -p magi-extension-host`（目录与已接线模式）、`cargo test -p magi-conversation-runtime --lib extension_hooks`（子代理 guard、改写重新校验）、`model_step_notifies_observers_after_commit_without_prompt_content`（模型观察）、`cargo test -p magi-daemon --lib extension_bridge`（真实 Node 扩展经 input/subagent.spawn guard 与领域事件转发的完整链路）、`cargo test -p magi-api --lib blocked_input_is_rejected`（被阻止的输入不留任何会话或 Turn 事实）。
 
 随包 Node：`node apps/desktop/scripts/node-runtime.mjs stage <目录>` 下载固定版本、校验归档摘要并在清空环境下执行校验；打包时 afterPack 对最终制品再做同样的执行校验（清单必须含该文件与版本）。以 `MAGI_EXTENSION_NODE` 指向该 Node 运行 `cargo test -p magi-extension-host --test host` 与 `cargo test -p magi-daemon --lib extension` 已在 macOS 通过；其余钩子未接线；macOS 以外平台未运行。

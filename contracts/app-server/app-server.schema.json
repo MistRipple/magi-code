@@ -759,6 +759,15 @@
           ],
           "x-rust-default": true
         },
+        "pluginCommandId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 192,
+          "x-rust-default": true
+        },
         "images": {
           "type": "array",
           "items": {
@@ -2478,6 +2487,13 @@
           },
           "x-rust-default": true
         },
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginNamedContribution"
+          },
+          "x-rust-default": true
+        },
         "views": {
           "type": "array",
           "items": {
@@ -2694,8 +2710,7 @@
         "operation",
         "addedPermissions",
         "removedPermissions",
-        "dataSchemaBlocked",
-        "dataConversion"
+        "dataReset"
       ],
       "properties": {
         "manifest": {
@@ -2729,12 +2744,9 @@
           "type": "integer",
           "minimum": 1
         },
-        "dataSchemaBlocked": {
-          "type": "boolean"
-        },
-        "dataConversion": {
+        "dataReset": {
           "type": "boolean",
-          "description": "为 true 时升级会用新版声明的转换器转换已有数据。"
+          "description": "数据格式版本变化且插件已有持久数据：升级会清空该插件的全部资源数据与设置（没有数据转换通道）。"
         }
       }
     },
@@ -4953,6 +4965,7 @@
         "content",
         "text",
         "command",
+        "pluginCommandId",
         "skillName",
         "goalMode",
         "accessProfile",
@@ -5029,6 +5042,12 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "pluginCommandId": {
+          "type": [
+            "string",
+            "null"
           ]
         },
         "skillName": {

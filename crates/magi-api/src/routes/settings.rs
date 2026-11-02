@@ -4089,7 +4089,7 @@ mod tests {
         ));
 
         let mut missing_local_agent = role_payload("bad-kind");
-        missing_local_agent["role"]["supportedKinds"] = json!(["local_workflow"]);
+        missing_local_agent["role"]["supportedKinds"] = json!(["remote_agent"]);
         assert!(matches!(
             upsert_role(State(state.clone()), Json(missing_local_agent)).await,
             Err(ApiError::InvalidInput(message)) if message.contains("local_agent")

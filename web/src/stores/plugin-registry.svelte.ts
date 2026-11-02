@@ -9,8 +9,10 @@
 import { untrack } from 'svelte';
 import {
   APPLICATION_PLUGIN_SCOPE,
+  loadActivePluginCommands,
   loadActivePluginManifests,
   PLUGIN_REGISTRY_CHANGED_EVENT,
+  type PluginCommandProjection,
   type PluginManifestProjection,
 } from '../web/plugin-api';
 import { RUNTIME_CONNECTION_EVENT, type AgentConnectionEventDetail } from '../web/agent-api';
@@ -19,12 +21,14 @@ export { APPLICATION_PLUGIN_SCOPE };
 
 interface PluginScopeProjection {
   manifests: PluginManifestProjection[];
+  commands: PluginCommandProjection[];
   /** 当前修订读取成功；加载中或失败时不能据旧清单判断插件“不存在”。 */
   loaded: boolean;
 }
 
 const EMPTY_PROJECTION: PluginScopeProjection = {
   manifests: [],
+  commands: [],
   loaded: false,
 };
 
@@ -54,9 +58,12 @@ export function trackPluginProjection(scope: string): void {
     projections[scope] = { ...(projections[scope] ?? EMPTY_PROJECTION), loaded: false };
   });
   const isCurrent = () => registry.revision === revision && requestedRevision.get(scope) === revision;
-  const loading = loadActivePluginManifests(scope).then((manifests) => {
+  const loading = Promise.all([
+    loadActivePluginManifests(scope),
+    loadActivePluginCommands(scope),
+  ]).then(([manifests, commands]) => {
     if (!isCurrent()) return;
-    projections[scope] = { manifests, loaded: true };
+    projections[scope] = { manifests, commands, loaded: true };
   }).catch(() => {
     if (!isCurrent()) return;
     // 网络失败不是撤权事实：保留最近一次成功投影，也不能将首次失败标成已加载。

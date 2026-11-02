@@ -347,7 +347,6 @@ fn agent_role_model_binding_status(
 fn task_kind_label(kind: magi_core::TaskKind) -> String {
     match kind {
         magi_core::TaskKind::LocalAgent => "local_agent",
-        magi_core::TaskKind::LocalWorkflow => "local_workflow",
         magi_core::TaskKind::RemoteAgent => "remote_agent",
         magi_core::TaskKind::MonitorMcp => "monitor_mcp",
         magi_core::TaskKind::InProcessTeammate => "in_process_teammate",
@@ -1771,6 +1770,10 @@ impl DaemonRuntime {
         > = extension_hooks_adapter.clone();
         let llm_task_dispatcher = Arc::new(
             llm_task_dispatcher
+                .with_plugin_command_executor(
+                    self.plugins
+                        .command_executor(tokio::runtime::Handle::current()),
+                )
                 .with_model_bridge_client(business_model_client.clone())
                 .with_completion_notifier(completion_notifier.clone())
                 .with_knowledge_store(state.knowledge_store.clone())

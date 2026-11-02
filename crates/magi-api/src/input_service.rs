@@ -42,6 +42,7 @@ pub(crate) fn session_turn_queue_response(
                 .and_then(|input| input.interruption.as_ref())
                 .and_then(|interruption| interruption.error.clone());
             QueuedSessionTurnDto {
+                plugin_command_id: queued.request.plugin_command_id.clone(),
                 revision: inputs
                     .iter()
                     .find(|input| input.input_id == queued.queue_id)
@@ -236,6 +237,7 @@ pub(crate) async fn update_session_turn_queue_item(
     candidate.skill_name = replacement.skill_name;
     candidate.goal_mode = replacement.goal_mode;
     candidate.command = replacement.command;
+    candidate.plugin_command_id = replacement.plugin_command_id;
     candidate.access_profile = replacement.access_profile;
     candidate.locale = replacement.locale;
     crate::turn_service::validate_session_turn_input(candidate)?;
@@ -250,6 +252,7 @@ pub(crate) async fn update_session_turn_queue_item(
         .validate_browser_node_selections()
         .map_err(ApiError::InvalidInput)?;
     candidate.parsed_images().map_err(ApiError::InvalidInput)?;
+    crate::turn_service::validate_plugin_command_selection(&state, candidate)?;
     let decision = crate::turn_service::decide_session_turn(&state, candidate)?;
     queued.route = decision.route;
     queued.task_title = decision.task_title;

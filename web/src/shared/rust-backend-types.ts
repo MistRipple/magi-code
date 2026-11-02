@@ -1492,7 +1492,6 @@ export interface MessagesResponseDto {
 
 export type TaskKind =
   | 'local_agent'
-  | 'local_workflow'
   | 'remote_agent'
   | 'monitor_mcp'
   | 'in_process_teammate'

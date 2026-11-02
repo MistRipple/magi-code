@@ -206,6 +206,9 @@ pub struct SessionTurnRequestDto {
     /// 用户显式选择的会话命令（如 `/compact`）；`text` 只包含命令参数，命令身份单独存储。
     #[serde(default)]
     pub command: Option<magi_app_server_protocol::SessionTurnCommand>,
+    /// 用户为本次独立命令选择的插件命令身份；由 daemon 按当前作用域校验。
+    #[serde(default)]
+    pub plugin_command_id: Option<String>,
     #[serde(default)]
     pub images: Vec<SessionTurnImageDto>,
     #[serde(default)]
@@ -528,6 +531,7 @@ impl SessionTurnRequestDto {
             "goalMode": normalized.goal_mode,
             "resume": normalized.resume,
             "command": normalized.command,
+            "pluginCommandId": trimmed_non_empty(normalized.plugin_command_id.as_deref()),
             "images": normalized.images,
             "contextReferences": context_references,
             "browserAnnotationRefs": normalized.browser_annotation_refs(),
@@ -813,6 +817,7 @@ mod tests {
     #[test]
     fn timeline_content_uses_user_text_directly() {
         let request = SessionTurnRequestDto {
+            plugin_command_id: None,
             source_folder_id: None,
             project_directories: None,
             desktop_browser_tools_allowed: true,
@@ -1132,6 +1137,13 @@ mod tests {
         );
 
         request.steer_current_turn = false;
+        let before = request.request_fingerprint().unwrap();
+        request.plugin_command_id = Some("plugin/acme.tools/open".into());
+        assert_ne!(
+            request.request_fingerprint().unwrap(),
+            before,
+            "插件命令身份必须参与幂等指纹"
+        );
     }
 
     #[test]

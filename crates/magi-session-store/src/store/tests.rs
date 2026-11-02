@@ -8590,7 +8590,7 @@ fn transferred_agent_rejects_missing_query_or_mismatched_task_without_mutation()
                     .unwrap()
                     .transferred_at = UtcMillis(1)
             }
-            10 => transferred.kind = magi_core::TaskKind::LocalWorkflow,
+            10 => transferred.kind = magi_core::TaskKind::RemoteAgent,
             11 => transferred.task_id = TaskId::new("foreign-agent"),
             _ => {
                 transferred

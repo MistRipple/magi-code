@@ -1,6 +1,6 @@
 ---
 id: coordinator
-supported_kinds: [local_agent, local_workflow]
+supported_kinds: [local_agent]
 coordinator_mode: true
 version: 1
 capabilities: ["general_engineering"]

@@ -18,7 +18,6 @@ pub fn routes() -> Router<ApiState> {
         .route("/agent-runs/action", post(perform_task_action))
         .route("/agent-runs/transfer", post(transfer_agent_run))
         .route("/agent-runs/continue", post(continue_agent_run))
-        .route("/agent-runs/workflow-answer", post(answer_workflow))
 }
 
 async fn continue_agent_run(
@@ -37,114 +36,6 @@ async fn transfer_agent_run(
     crate::agent_service::transfer_agent_run(&state, request)
         .await
         .map(Json)
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkflowAnswerRequest {
-    operation_id: String,
-    task_id: String,
-    input: String,
-    session_id: Option<String>,
-    scope: SessionScopeKindDto,
-    workspace_id: Option<String>,
-    #[serde(default)]
-    workspace_path: Option<String>,
-}
-
-async fn answer_workflow(
-    State(state): State<ApiState>,
-    Json(request): Json<WorkflowAnswerRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    if request.operation_id.trim().is_empty() || request.input.trim().is_empty() {
-        return Err(ApiError::InvalidInput(
-            "operationId 和 input 不能为空".into(),
-        ));
-    }
-    let scope = require_task_request_scope(
-        &state,
-        request.session_id.as_deref(),
-        request.scope,
-        request.workspace_id.as_deref(),
-        request.workspace_path.as_deref(),
-    )?;
-    let manager = state
-        .runner_manager()
-        .ok_or_else(|| ApiError::internal_assembly("回答工作流", "runner_manager 未配置"))?;
-    let _session_guard = manager.lock_session_lifecycle(&scope.session_id).await;
-    let (_, task) = require_session_owned_task(
-        &state,
-        request.session_id.as_deref(),
-        request.scope,
-        request.workspace_id.as_deref(),
-        request.workspace_path.as_deref(),
-        request.task_id.trim(),
-    )?;
-    let _restart_guard = manager.lock_for_restart(task.root_task_id.as_str()).await;
-    // 用户可能在挂起 dispatch 尚未退出时回答；先等待旧执行链结算。
-    manager
-        .quiesce_for_restart(task.root_task_id.as_str())
-        .await;
-    let store = state
-        .task_store()
-        .ok_or_else(|| ApiError::internal_assembly("回答工作流", "task_store 未配置"))?;
-    store
-        .resume_workflow_with_user_input(&task.task_id, &request.operation_id, request.input)
-        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
-    manager
-        .start_after_quiesce(task.root_task_id.as_str(), Some(scope.session_id.clone()))
-        .map_err(|error| {
-            let message = match error {
-                crate::state::RunnerStartError::NotFound => "根任务不存在",
-                crate::state::RunnerStartError::AlreadyRunning => "恢复锁内仍存在活动 runner",
-                crate::state::RunnerStartError::SessionUnavailable => "当前会话不可用",
-            };
-            ApiError::internal_assembly("恢复工作流失败", message)
-        })?;
-    Ok(Json(json!({
-        "action": "workflow_answer",
-        "operationId": request.operation_id,
-        "taskId": task.task_id,
-        "rootTaskId": task.root_task_id,
-    })))
-}
-
-fn require_session_owned_task(
-    state: &ApiState,
-    session_id_value: Option<&str>,
-    requested_scope: SessionScopeKindDto,
-    workspace_id_value: Option<&str>,
-    workspace_path_value: Option<&str>,
-    task_id: &str,
-) -> Result<(SessionRequestScope, magi_core::Task), ApiError> {
-    let scope = require_task_request_scope(
-        state,
-        session_id_value,
-        requested_scope,
-        workspace_id_value,
-        workspace_path_value,
-    )?;
-    let ownership = state
-        .session_store
-        .execution_ownership(&scope.session_id)
-        .ok_or_else(|| ApiError::session_not_found(scope.session_id.as_str()))?;
-    let mission_id = ownership
-        .mission_id
-        .ok_or_else(|| ApiError::InvalidInput("当前会话没有活跃任务".to_string()))?;
-    let store = state
-        .task_store()
-        .ok_or_else(|| ApiError::internal_assembly("session task guard", "task_store 未配置"))?;
-    let tid = TaskId::new(task_id);
-    let task = store
-        .get_task(&tid)
-        .ok_or_else(|| ApiError::not_found("任务不存在", task_id))?;
-    if task.mission_id != mission_id {
-        return Err(ApiError::InvalidInput(format!(
-            "任务 {} 不属于当前会话 {}",
-            task_id, scope.session_id
-        )));
-    }
-    Ok((scope, task))
 }
 
 fn require_task_request_scope(

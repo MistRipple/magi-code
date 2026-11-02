@@ -756,6 +756,10 @@ pub struct TurnStartParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<SessionTurnCommand>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "pluginCommandId")]
+    pub plugin_command_id: Option<String>,
+    #[serde(default)]
     pub images: Vec<SessionTurnImage>,
     #[serde(default)]
     #[serde(rename = "contextReferences")]
@@ -1605,6 +1609,8 @@ pub struct PluginContributions {
     #[serde(default)]
     pub tools: Vec<PluginToolContribution>,
     #[serde(default)]
+    pub commands: Vec<PluginNamedContribution>,
+    #[serde(default)]
     pub views: Vec<PluginViewContribution>,
     #[serde(default)]
     pub resources: Vec<PluginNamedContribution>,
@@ -1729,10 +1735,8 @@ pub struct PluginCandidatePreview {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "dataSchemaFrom")]
     pub data_schema_from: Option<i64>,
-    #[serde(rename = "dataSchemaBlocked")]
-    pub data_schema_blocked: bool,
-    #[serde(rename = "dataConversion")]
-    pub data_conversion: bool,
+    #[serde(rename = "dataReset")]
+    pub data_reset: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2909,6 +2913,8 @@ pub struct QueuedSessionTurn {
     pub content: String,
     pub text: Option<String>,
     pub command: Option<SessionTurnCommand>,
+    #[serde(rename = "pluginCommandId")]
+    pub plugin_command_id: Option<String>,
     #[serde(rename = "skillName")]
     pub skill_name: Option<String>,
     #[serde(rename = "goalMode")]

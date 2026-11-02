@@ -109,10 +109,118 @@ impl PluginServices {
         })
     }
 
+    /// 用户命令的执行端口：对话执行器在阻塞线程上同步调用。
+    pub(super) fn command_executor(
+        &self,
+        handle: tokio::runtime::Handle,
+    ) -> Arc<dyn magi_conversation_runtime::plugin_command::PluginCommandExecutor> {
+        Arc::new(NodeCommandExecutor {
+            manager: Arc::clone(&self.manager),
+            bus: Arc::clone(&self.extension_bus),
+            handle,
+        })
+    }
+
     pub(super) fn manager(&self) -> Arc<Mutex<PluginManager>> {
         Arc::clone(&self.manager)
     }
 }
+
+pub(super) struct NodeCommandExecutor {
+    manager: Arc<Mutex<PluginManager>>,
+    bus: Arc<magi_extension_host::bus::ExtensionBus>,
+    handle: tokio::runtime::Handle,
+}
+
+impl NodeCommandExecutor {
+    #[cfg(test)]
+    pub(super) fn for_test(
+        manager: Arc<Mutex<PluginManager>>,
+        bus: Arc<magi_extension_host::bus::ExtensionBus>,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            manager,
+            bus,
+            handle,
+        }
+    }
+}
+
+impl magi_conversation_runtime::plugin_command::PluginCommandExecutor for NodeCommandExecutor {
+    fn invoke(
+        &self,
+        invocation: magi_conversation_runtime::plugin_command::PluginCommandInvocation,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<magi_conversation_runtime::plugin_command::PluginCommandResult, String> {
+        use magi_conversation_runtime::plugin_command::PluginCommandResult;
+        let selected = magi_plugin_system::ContributionRef::parse("命令", &invocation.command_id)?;
+        // 与目录同一判定：命令必须来自当前激活的插件。
+        let digest = {
+            let manager = self
+                .manager
+                .lock()
+                .map_err(|_| "插件管理器不可用".to_string())?;
+            let available = manager
+                .command_contributions_for_scope(APPLICATION_SCOPE)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .any(|(manifest, command)| {
+                    manifest.id == selected.plugin_id && command.id == selected.contribution_id
+                });
+            if !available {
+                return Err("插件命令未在当前作用域激活".into());
+            }
+            manager
+                .package(&selected.plugin_id)
+                .map_err(|error| error.to_string())?
+                .digest()
+                .to_owned()
+        };
+        let instance = self
+            .bus
+            .instance(&selected.plugin_id)
+            .ok_or_else(|| "扩展宿主未运行".to_string())?;
+        if instance.digest != digest {
+            return Err("扩展宿主不是当前授权的版本".into());
+        }
+        let ctx = json!({
+            "invocationId": format!("cmd_{}_{}", invocation.turn_id, selected.contribution_id),
+            "owner": {"sessionId": invocation.session_id, "turnId": invocation.turn_id},
+            "binding": {"workspaceId": invocation.workspace_id},
+        });
+        let wait_cancelled = async {
+            while !cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        let value = self
+            .handle
+            .block_on(instance.invoke_command(
+                &selected.contribution_id,
+                json!({"text": invocation.input}),
+                ctx,
+                COMMAND_TIMEOUT,
+                wait_cancelled,
+            ))
+            .map_err(|error| error.to_string())?;
+        let content = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if value.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+            return Err(content);
+        }
+        if content.trim().is_empty() || content.len() > 1_048_576 {
+            return Err("插件命令返回文本为空或超出上限".into());
+        }
+        Ok(PluginCommandResult { content })
+    }
+}
+
+/// 单次插件命令的上限；命令可能比工具更久，但仍受期限与停止取消约束。
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 单次插件工具调用的上限；超时后宿主收到取消信号。
 const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);

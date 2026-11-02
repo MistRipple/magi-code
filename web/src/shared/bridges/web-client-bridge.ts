@@ -4040,6 +4040,7 @@ interface ExecuteTaskInput {
   /** 用户点击“继续”恢复被中断或可恢复的执行。 */
   resume?: boolean;
   command?: SessionTurnCommand | null;
+  pluginCommandId?: string | null;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
   replaceTurnId?: string | null;
@@ -4083,6 +4084,7 @@ function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
     sessionId: turn.sessionId,
     createdAt: turn.acceptedAt,
     command: turn.command === 'compact' ? 'compact' : null,
+    pluginCommandId: turn.pluginCommandId ?? null,
     skillName: turn.skillName ?? null,
     goalMode: turn.goalMode === true,
     accessProfile: turn.accessProfile ?? null,
@@ -4313,7 +4315,10 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       .filter((selection) => selection.browserSessionId && selection.tabId && selection.surfaceId)
     : [];
   const command = input.command === 'compact' ? input.command : null;
-  if (!command && !normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0 && browserNodeSelections.length === 0) {
+  const pluginCommandId = typeof input.pluginCommandId === 'string' && input.pluginCommandId.trim()
+    ? input.pluginCommandId.trim()
+    : null;
+  if (!command && !pluginCommandId && !normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0 && browserNodeSelections.length === 0) {
     return false;
   }
   const requestId = trimBridgeString(input.requestId) || generateMessageId();
@@ -4371,6 +4376,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       ...(skillName ? { skillName } : {}),
       ...(input.goalMode === true ? { goalMode: true } : {}),
       ...(command ? { sessionCommand: command } : {}),
+      ...(pluginCommandId ? { pluginCommandId } : {}),
     },
   };
   beginLocalTurnSubmission({
@@ -4399,6 +4405,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       goalMode: input.goalMode === true,
       resume: input.resume === true,
       command,
+      pluginCommandId,
       images,
       contextReferences,
       browserAnnotationRefs,
@@ -5654,6 +5661,7 @@ export function createWebClientBridge(): ClientBridge {
             || (Array.isArray(message.contextReferences) && message.contextReferences.length > 0)
             || (Array.isArray(message.browserAnnotationRefs) && message.browserAnnotationRefs.length > 0)
             || (Array.isArray(message.browserNodeSelections) && message.browserNodeSelections.length > 0)
+            || (typeof message.pluginCommandId === 'string' && message.pluginCommandId.trim())
             || message.command === 'compact'
           ) {
             void executeTask({
@@ -5666,6 +5674,7 @@ export function createWebClientBridge(): ClientBridge {
               skillName: typeof message.skillName === 'string' ? message.skillName : null,
               goalMode: message.goalMode === true,
               command: message.command === 'compact' ? 'compact' : null,
+              pluginCommandId: typeof message.pluginCommandId === 'string' ? message.pluginCommandId : null,
               accessProfile: message.accessProfile === 'read_only'
                 || message.accessProfile === 'restricted'
                 || message.accessProfile === 'full_access'

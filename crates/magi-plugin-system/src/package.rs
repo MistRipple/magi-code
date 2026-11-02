@@ -208,8 +208,13 @@ fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
         }
         return Ok(());
     };
-    if extension.hooks.is_empty() && manifest.contributions.tools.is_empty() {
-        return Err(invalid("声明 extension 的包必须至少声明一个钩子或一个工具"));
+    if extension.hooks.is_empty()
+        && manifest.contributions.tools.is_empty()
+        && manifest.contributions.commands.is_empty()
+    {
+        return Err(invalid(
+            "声明 extension 的包必须至少声明一个钩子、工具或命令",
+        ));
     }
     // 改写已装配历史会让缓存前缀失效并改变模型看到的上下文，必须由用户单独授权。
     let rewrites_history = extension
@@ -341,6 +346,13 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
                 tool.id
             )));
         }
+    }
+    // 命令由用户在输入框主动调用，执行在 Node 扩展里；授权由 `extension` 完全信任覆盖。
+    if !c.commands.is_empty() && manifest.extension.is_none() {
+        return Err(invalid("声明命令贡献的包必须同时声明 extension"));
+    }
+    for command in &c.commands {
+        check(&command.id, &command.title, &command.description)?;
     }
     for view in &c.views {
         check(&view.id, &view.title, "")?;

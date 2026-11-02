@@ -86,8 +86,10 @@
     resolveSlashTrigger,
     type ComposerAction,
     type ComposerSessionCommand,
+    type ComposerPluginCommandOption,
     type ComposerSkillOption,
   } from '../lib/composer-actions';
+  import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
   import {
     composerAttachmentTotal,
     MAX_COMPOSER_IMAGE_BYTES,
@@ -152,6 +154,7 @@
     goalMode: boolean;
     sessionCommand: ComposerSessionCommand | null;
     skill: SkillOption | null;
+    pluginCommand: ComposerPluginCommandOption | null;
   }
 
   // 输入框可识别的 instruction skill。来源：bootstrap 中的 skillsConfig.instructionSkills，
@@ -204,6 +207,7 @@
   let selectedGoalMode = $state(false);
   let selectedSessionCommand = $state<ComposerSessionCommand | null>(null);
   let selectedSkill = $state<SkillOption | null>(null);
+  let selectedPluginCommand = $state<ComposerPluginCommandOption | null>(null);
   let selectedContextReferences = $state<ComposerContextReference[]>([]);
   let selectedBrowserAnnotations = $state<SelectedBrowserAnnotation[]>([]);
   let selectedBrowserNodeSelections = $state<MessageBrowserNodeSelection[]>([]);
@@ -641,7 +645,7 @@
       || pendingImageReadCount > 0
       || selectedContextReferences.length > 0
       || selectedBrowserAnnotations.length > 0
-      || Boolean(selectedGoalMode || selectedSessionCommand || selectedSkill)
+      || Boolean(selectedGoalMode || selectedSessionCommand || selectedSkill || selectedPluginCommand || selectedPluginCommand)
       || selectedBrowserNodeSelections.length > 0;
   });
 
@@ -681,6 +685,24 @@
     attachmentTotal,
   }));
 
+  // 命令入口只来自 daemon 的激活投影，并随插件注册表变化一起刷新。
+  const pluginScope = APPLICATION_PLUGIN_SCOPE;
+  $effect(() => {
+    trackPluginProjection(pluginScope);
+  });
+  const availablePluginCommands = $derived<ComposerPluginCommandOption[]>(
+    pluginProjection(pluginScope).commands
+      .filter((entry) => entry.id.startsWith('plugin/'))
+      .map((entry) => ({ pluginCommandId: entry.id, name: entry.title, description: entry.description })),
+  );
+  // 已选命令失效（插件停用）时撤销选择，避免提交已不可用的身份。
+  $effect(() => {
+    if (!pluginProjection(pluginScope).loaded) return;
+    if (selectedPluginCommand && !availablePluginCommands.some((command) => command.pluginCommandId === selectedPluginCommand?.pluginCommandId)) {
+      selectedPluginCommand = null;
+    }
+  });
+
   const composerActions = $derived.by<ComposerAction[]>(() => buildComposerActions(
     availableSkills,
     {
@@ -699,6 +721,7 @@
     },
     {
       sessionCommandDisabledReason: compactDisabledReason,
+      pluginCommands: availablePluginCommands,
     },
   ));
 
@@ -709,7 +732,9 @@
         ? !selectedGoalMode
         : command.kind === 'command'
           ? command.id !== selectedSessionCommand
-        : command.id !== selectedSkill?.skillId
+        : command.kind === 'skill'
+          ? command.id !== selectedSkill?.skillId
+          : command.id !== selectedPluginCommand?.pluginCommandId
     ));
   });
 
@@ -749,6 +774,7 @@
     selectedGoalMode = false;
     selectedSessionCommand = null;
     selectedSkill = null;
+    selectedPluginCommand = null;
     addMenuOpen = false;
     contextPickerOpen = false;
     invalidateEnhanceState();
@@ -913,6 +939,7 @@
       goalMode: selectedGoalMode,
       sessionCommand: selectedSessionCommand,
       skill: selectedSkill ? { ...selectedSkill } : null,
+      pluginCommand: selectedPluginCommand ? { ...selectedPluginCommand } : null,
     };
   }
 
@@ -925,7 +952,8 @@
       && selectedBrowserNodeSelections.length === 0
       && !selectedGoalMode
       && selectedSessionCommand === null
-      && selectedSkill === null;
+      && selectedSkill === null
+      && selectedPluginCommand === null;
   }
 
   function restoreComposerSubmissionDraft(draft: ComposerSubmissionDraft): void {
@@ -943,6 +971,7 @@
     selectedGoalMode = draft.goalMode;
     selectedSessionCommand = draft.sessionCommand;
     selectedSkill = draft.skill ? { ...draft.skill } : null;
+    selectedPluginCommand = draft.pluginCommand ? { ...draft.pluginCommand } : null;
     queueMicrotask(focusEditor);
   }
 
@@ -961,6 +990,7 @@
       || selectedGoalMode
       || selectedSessionCommand !== null
       || selectedSkill !== null
+      || selectedPluginCommand !== null
       || editingTurn !== null,
     );
   });
@@ -1148,14 +1178,16 @@
 
   // 压缩命令不能带附件：用户主动添加附件时让命令让位并说明，附件不丢。
   function dropSessionCommandForAttachment(): void {
-    if (selectedSessionCommand === null) return;
+    if (selectedSessionCommand === null && selectedPluginCommand === null) return;
     selectedSessionCommand = null;
+    selectedPluginCommand = null;
     addToast('info', i18n.t('input.compact.removedForAttachment'), undefined, { forceVisible: true });
   }
 
   function activeModeLabel(): string | null {
     if (selectedGoalMode) return i18n.t('input.goalMode.name');
     if (selectedSessionCommand) return i18n.t('input.compact.name');
+    if (selectedPluginCommand) return selectedPluginCommand.name;
     if (selectedSkill) return selectedSkill.name;
     return null;
   }
@@ -1436,6 +1468,7 @@
     }
     const previousMode = activeModeLabel();
     noteModeReplaced(previousMode, command.name);
+    selectedPluginCommand = null;
     if (command.kind === 'goal') {
       selectedGoalMode = true;
       selectedSessionCommand = null;
@@ -1444,6 +1477,11 @@
       selectedGoalMode = false;
       selectedSessionCommand = command.id;
       selectedSkill = null;
+    } else if (command.kind === 'plugin-command') {
+      selectedGoalMode = false;
+      selectedSessionCommand = null;
+      selectedSkill = null;
+      selectedPluginCommand = command.pluginCommand;
     } else {
       selectedGoalMode = false;
       selectedSessionCommand = null;
@@ -1493,6 +1531,8 @@
     }
     const previousMode = activeModeLabel();
     if (previousMode !== action.name) noteModeReplaced(previousMode, action.name);
+    const previousPluginCommand = selectedPluginCommand;
+    selectedPluginCommand = null;
     if (action.kind === 'goal') {
       selectedGoalMode = !selectedGoalMode;
       selectedSessionCommand = null;
@@ -1501,6 +1541,13 @@
       selectedGoalMode = false;
       selectedSessionCommand = selectedSessionCommand === action.id ? null : action.id;
       selectedSkill = null;
+    } else if (action.kind === 'plugin-command') {
+      selectedGoalMode = false;
+      selectedSessionCommand = null;
+      selectedSkill = null;
+      selectedPluginCommand = previousPluginCommand?.pluginCommandId === action.pluginCommand.pluginCommandId
+        ? null
+        : action.pluginCommand;
     } else {
       selectedGoalMode = false;
       selectedSessionCommand = null;
@@ -1954,7 +2001,7 @@
 
 
       if (
-        (!normalizedContent && selectedSessionCommand === null && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0 && selectedBrowserNodeSelections.length === 0)
+        (!normalizedContent && selectedSessionCommand === null && selectedPluginCommand === null && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0 && selectedBrowserNodeSelections.length === 0)
         || sessionInputLocked
         || (isInteractionBlocking && !interruptTurnId)
         || (isDraftSession && isSending)
@@ -1996,7 +2043,7 @@
       const replaceTurnId = editingTurn?.sessionId === messagesState.currentSessionId
         ? editingTurn.turnId
         : null;
-      if (interruptTurnId && (replaceTurnId || selectedSessionCommand)) return;
+      if (interruptTurnId && (replaceTurnId || selectedSessionCommand || selectedPluginCommand)) return;
       if (!replaceTurnId) {
         submittedComposerDrafts.set(requestId, captureComposerSubmissionDraft(rawContent));
       }
@@ -2011,6 +2058,7 @@
         skillName: selectedSkill?.skillId ?? null,
         goalMode: selectedGoalMode,
         command: selectedSessionCommand,
+        pluginCommandId: selectedPluginCommand?.pluginCommandId ?? null,
         accessProfile: selectedAccessProfile,
         ...(isDraftSession ? { orchestratorSessionConfig } : {}),
         replaceTurnId,
@@ -2175,6 +2223,10 @@
       goalMode: target.goalMode === true,
       sessionCommand: target.command === 'compact' ? 'compact' : null,
       skill: restoredSkill,
+      pluginCommand: target.pluginCommandId
+        ? availablePluginCommands.find((command) => command.pluginCommandId === target.pluginCommandId)
+          ?? { pluginCommandId: target.pluginCommandId, name: target.pluginCommandId, description: '' }
+        : null,
     };
     restoreComposerSubmissionDraft(draft);
   }
@@ -2210,6 +2262,7 @@
             sessionId: target.sessionId, workspaceId: target.workspaceId || null, workspacePath: target.workspacePath || null,
             sourceFolderId: target.sourceFolderId || null,
             text, skillName: selectedSkill?.skillId ?? null, goalMode: selectedGoalMode, command: selectedSessionCommand,
+            pluginCommandId: selectedPluginCommand?.pluginCommandId ?? null,
             accessProfile: selectedAccessProfile, locale: i18n.locale,
             images: selectedImages.map(image => ({ name: image.name, dataUrl: image.dataUrl })),
             contextReferences: toSessionContextReferencePayload(selectedContextReferences),
@@ -2981,6 +3034,22 @@ async function refreshPickerSettingsSnapshot() {
             </button>
           </span>
         {/if}
+        {#if selectedPluginCommand}
+          <span class="ia-reference-chip ia-reference-chip-goal" title={selectedPluginCommand.description}>
+            <Icon name="tool" size={11} />
+            <span class="ia-reference-chip-label">/{selectedPluginCommand.name}</span>
+            {#if selectedPluginCommand.description}<span class="ia-reference-chip-desc">{selectedPluginCommand.description}</span>{/if}
+            <button
+              type="button"
+              class="ia-reference-chip-remove"
+              onclick={() => { selectedPluginCommand = null; queueMicrotask(focusEditor); }}
+              title={i18n.t('input.removePluginCommand')}
+              aria-label={i18n.t('input.removePluginCommand')}
+            >
+              <Icon name="close" size={10} />
+            </button>
+          </span>
+        {/if}
         {#if selectedSkill}
           <span class="ia-skill-chip" title={selectedSkill.description}>
             <Icon name="skill" size={11} />
@@ -3048,7 +3117,9 @@ async function refreshPickerSettingsSnapshot() {
                   ? i18n.t('input.slash.modeGroup')
                   : command.kind === 'command'
                     ? i18n.t('input.slash.commandGroup')
-                  : i18n.t('input.slash.skillGroup')}
+                  : command.kind === 'plugin-command'
+                    ? i18n.t('input.slash.pluginCommandGroup')
+                    : i18n.t('input.slash.skillGroup')}
               </div>
             {/if}
             <button
@@ -3063,7 +3134,7 @@ async function refreshPickerSettingsSnapshot() {
               onmousedown={(e) => { e.preventDefault(); commitSlashCommand(command); }}
             >
               <span class="ia-slash-item-icon" class:goal={command.kind === 'goal'}>
-                <Icon name={command.kind === 'goal' ? 'infinity' : command.kind === 'command' ? 'refresh' : 'skill'} size={12} />
+                <Icon name={command.kind === 'goal' ? 'infinity' : command.kind === 'command' ? 'refresh' : command.kind === 'plugin-command' ? 'tool' : 'skill'} size={12} />
               </span>
               <span class="ia-slash-item-content">
                 <span class="ia-slash-item-label">/{command.kind === 'goal' ? 'goal' : command.kind === 'command' ? command.id : command.name}</span>
@@ -3107,7 +3178,9 @@ async function refreshPickerSettingsSnapshot() {
                         ? i18n.t('input.slash.modeGroup')
                         : action.kind === 'command'
                           ? i18n.t('input.slash.commandGroup')
-                        : i18n.t('input.slash.skillGroup')}
+                        : action.kind === 'plugin-command'
+                          ? i18n.t('input.slash.pluginCommandGroup')
+                          : i18n.t('input.slash.skillGroup')}
                   </div>
                 {/if}
                 <button
@@ -3121,6 +3194,8 @@ async function refreshPickerSettingsSnapshot() {
                       ? selectedSessionCommand === action.id
                     : action.kind === 'skill'
                       ? selectedSkill?.skillId === action.skill.skillId
+                    : action.kind === 'plugin-command'
+                      ? selectedPluginCommand?.pluginCommandId === action.pluginCommand.pluginCommandId
                     : false}
                   onclick={() => applyAddMenuAction(action)}
                   role="menuitem"
@@ -3133,6 +3208,8 @@ async function refreshPickerSettingsSnapshot() {
                           ? 'infinity'
                           : action.kind === 'command'
                             ? 'refresh'
+                          : action.kind === 'plugin-command'
+                            ? 'tool'
                           : 'skill'}
                       size={13}
                     />
@@ -3547,7 +3624,7 @@ async function refreshPickerSettingsSnapshot() {
               class="ia-queue-action btn btn--secondary btn--sm"
               data-testid="input-replace-button"
               onclick={() => interruptTargetTurnId && sendMessage(interruptTargetTurnId)}
-              disabled={sessionInputLocked || sendPreparing || pendingImageReadCount > 0 || !mainModelReady || !interruptTargetTurnId || Boolean(editingTurn || editingQueuedMessage || selectedSessionCommand)}
+              disabled={sessionInputLocked || sendPreparing || pendingImageReadCount > 0 || !mainModelReady || !interruptTargetTurnId || Boolean(editingTurn || editingQueuedMessage || selectedSessionCommand || selectedPluginCommand)}
               title={i18n.t('input.followUp.replaceTitle')}
             >{i18n.t('input.followUp.replace')}</button>
             <button

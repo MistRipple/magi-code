@@ -312,6 +312,13 @@ impl ExtensionRuntime {
             .iter()
             .map(|tool| tool.id.clone())
             .collect();
+        config.commands = package
+            .manifest()
+            .contributions
+            .commands
+            .iter()
+            .map(|command| command.id.clone())
+            .collect();
         config.grants = vec!["extension:full-trust".into()];
         config.config = serde_json::json!({});
         let supervisor = supervise(
@@ -538,6 +545,12 @@ export default async function activate(api) {
 export default async function activate(api) {
   await api.tool('echo', async (input) => ({ echoed: input.text }));
   await api.tool('boom', async () => { throw new Error('工具失败'); });
+  await api.command('hello', async (input) => `你好，${input.text || '世界'}`);
+  await api.command('bad', async () => { throw new Error('命令失败'); });
+  await api.command('wait', async (_input, ctx) => {
+    await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve, { once: true }));
+    return 'aborted';
+  });
   await api.tool('slow', async (_input, ctx) => {
     await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve, { once: true }));
     return 'aborted';
@@ -559,7 +572,11 @@ export default async function activate(api) {
             ],
             "dataSchemaVersion": 1,
             "settingsSchema": {"type": "object", "additionalProperties": false},
-            "contributions": {"tools": [
+            "contributions": {"commands": [
+                {"id": "hello", "title": "Hello", "description": "打招呼"},
+                {"id": "bad", "title": "Bad", "description": "总是失败"},
+                {"id": "wait", "title": "Wait", "description": "等待取消"}
+            ], "tools": [
                 {"id": "echo", "title": "Echo", "description": "回显", "readOnly": true,
                  "inputSchema": {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}, "additionalProperties": false}},
                 {"id": "boom", "title": "Boom", "description": "总是失败", "readOnly": true,
@@ -582,6 +599,98 @@ export default async function activate(api) {
             writer.write_all(&bytes).unwrap();
         }
         PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_commands_run_through_the_real_host_and_follow_stop_requests() {
+        use magi_conversation_runtime::plugin_command::{
+            PluginCommandExecutor, PluginCommandInvocation,
+        };
+        use std::sync::atomic::AtomicBool;
+        let fixture = fixture(Some(test_node()));
+        let package = tool_package();
+        {
+            let mut manager = fixture.manager.lock().unwrap();
+            manager
+                .install(
+                    &package,
+                    PluginSource::Local {
+                        name: "c.zip".into(),
+                    },
+                )
+                .unwrap();
+            manager.enable("acme.guard", "application").unwrap();
+            manager
+                .authorize(
+                    "acme.guard",
+                    "application",
+                    package.manifest().permissions.clone(),
+                )
+                .unwrap();
+            manager.activate("acme.guard", "application").unwrap();
+            assert_eq!(
+                manager
+                    .command_contributions_for_scope("application")
+                    .unwrap()
+                    .len(),
+                3
+            );
+        }
+        fixture.runtime.reconcile().await;
+        fixture
+            .runtime
+            .running
+            .lock()
+            .await
+            .get("acme.guard")
+            .and_then(|entry| entry.supervisor.as_ref())
+            .expect("已启动监管")
+            .wait_for(|state| matches!(state, SupervisorState::Running { .. }))
+            .await;
+        let executor = Arc::new(super::super::plugin_bridge::NodeCommandExecutor::for_test(
+            Arc::clone(&fixture.manager),
+            Arc::clone(&fixture.bus),
+            tokio::runtime::Handle::current(),
+        ));
+        let call = |command: &'static str, flag: Arc<AtomicBool>| {
+            let executor = Arc::clone(&executor);
+            tokio::task::spawn_blocking(move || {
+                executor.invoke(
+                    PluginCommandInvocation {
+                        command_id: format!("plugin/acme.guard/{command}"),
+                        session_id: "s".into(),
+                        turn_id: "t".into(),
+                        workspace_id: None,
+                        input: "Magi".into(),
+                    },
+                    &flag,
+                )
+            })
+        };
+        let ok = call("hello", Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ok.content, "你好，Magi");
+        let error = call("bad", Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("命令失败"), "{error}");
+        // 未声明的命令身份在到达宿主之前被拒绝。
+        assert!(
+            call("ghost", Arc::new(AtomicBool::new(false)))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        // 停止所属 Turn：运行中的命令立即返回错误，宿主收到取消。
+        let flag = Arc::new(AtomicBool::new(false));
+        let waiting = call("wait", Arc::clone(&flag));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let stopped = waiting.await.unwrap().unwrap_err();
+        assert!(stopped.contains("取消"), "{stopped}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
