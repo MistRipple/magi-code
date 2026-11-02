@@ -854,6 +854,7 @@ export interface PluginCenterEntry {
   name: string;
   description: string;
   version: string;
+  sha256: string;
   size: number;
   state: PluginCenterEntryState;
   installedVersion?: string | null;
@@ -868,6 +869,7 @@ export interface PluginCenterProjection {
 
 export interface PluginCenterInstallRequest {
   id: string;
+  expectedSha256: string;
   version?: string | null;
 }
 

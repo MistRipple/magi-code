@@ -10,6 +10,11 @@ pub(super) const CENTER_SETTINGS_SECTION: &str = "pluginCenter";
 /// 用户不需要任何配置就能浏览官方插件。开发和验收可用环境变量覆盖（空值表示不提供默认地址）。
 pub(super) const OFFICIAL_PLUGIN_CENTER_URL: &str =
     "https://raw.githubusercontent.com/MistRipple/magi-code/main/plugin-center/catalog.json";
+/// 官方插件中心的发布验签公钥（keyId、Base64 Ed25519 公钥），随 Magi 发行。官方目录只有在
+/// 通过这些公钥验签后才算“已验证”；地址相同不代表可信。公钥由发布者在建立签名发布流程时写入，
+/// 在此之前官方目录按未验证目录对待，其条目不会获得插件中心来源标识。
+pub(super) const OFFICIAL_CENTER_KEYS: &[(&str, &str)] = &[];
+const CENTER_STATE_SECTION: &str = "pluginCenterState";
 pub(super) const OFFICIAL_PLUGIN_CENTER_ENV: &str = "MAGI_PLUGIN_CENTER_DEFAULT_URL";
 
 pub(super) fn official_center_url() -> String {
@@ -44,6 +49,7 @@ pub(super) fn read_center_config(state: &ApiState) -> PluginCenterConfig {
 /// 没有配置公钥时接受普通目录：来自官方地址的目录可信（信任来自 Magi 仓库本身），
 /// 其余按指定地址的信任级别对待。目录里的相对包地址按目录自身地址解析。
 pub(super) async fn fetch_catalog(
+    state: &ApiState,
     config: &PluginCenterConfig,
 ) -> Result<(PluginCatalog, bool), ApiError> {
     if config.url.trim().is_empty() {
@@ -51,33 +57,61 @@ pub(super) async fn fetch_catalog(
     }
     let url = validated_remote_url(&config.url)?;
     let bytes = download_bytes(&url, MAX_CATALOG_BYTES, "插件中心目录").await?;
-    let trusted = config
-        .trusted_keys
-        .iter()
-        .map(|key| TrustedKey {
-            key_id: key.key_id.clone(),
-            public_key: key.public_key.clone(),
-        })
-        .collect::<Vec<_>>();
+    let official = config.trusted_keys.is_empty() && is_official_center(&url);
+    let trusted = if official {
+        OFFICIAL_CENTER_KEYS
+            .iter()
+            .map(|(key_id, public_key)| TrustedKey {
+                key_id: (*key_id).into(),
+                public_key: (*public_key).into(),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        config
+            .trusted_keys
+            .iter()
+            .map(|key| TrustedKey {
+                key_id: key.key_id.clone(),
+                public_key: key.public_key.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
     let parsed = PluginCatalog::parse(&bytes, &trusted)
         .map_err(|error| ApiError::Forbidden(error.to_string()))?;
     let mut catalog = parsed.catalog;
+    if parsed.signed {
+        // 已验签目录才有时效与防回滚语义：过期或序号倒退都拒绝，通过后记下已见最高序号。
+        let mut seen = state.settings_store.get_section(CENTER_STATE_SECTION);
+        let last = seen.get(&url).and_then(|v| v.as_u64()).unwrap_or(0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        catalog
+            .check_freshness(now_ms, last)
+            .map_err(|error| ApiError::Forbidden(error.to_string()))?;
+        if catalog.sequence > last {
+            if !seen.is_object() {
+                seen = serde_json::json!({});
+            }
+            seen[&url] = catalog.sequence.into();
+            state
+                .settings_store
+                .set_section(CENTER_STATE_SECTION, seen)
+                .map_err(|error| ApiError::internal_assembly("记录插件中心序号失败", error))?;
+        }
+    }
     let base =
         reqwest::Url::parse(&url).map_err(|_| ApiError::InvalidInput("插件中心地址无效".into()))?;
     for entry in &mut catalog.plugins {
         let resolved = base
             .join(&entry.url)
             .map_err(|_| ApiError::InvalidInput(format!("插件 {} 的包地址无效", entry.id)))?;
-        if !matches!(resolved.scheme(), "http" | "https") {
-            return Err(ApiError::InvalidInput(format!(
-                "插件 {} 的包地址只支持 HTTP(S)",
-                entry.id
-            )));
-        }
+        download::check_url_shape(&resolved).map_err(|_| {
+            ApiError::InvalidInput(format!("插件 {} 的包地址必须是 HTTPS 地址", entry.id))
+        })?;
         entry.url = resolved.to_string();
     }
-    let official = config.trusted_keys.is_empty() && is_official_center(&url);
-    Ok((catalog, parsed.signed || official))
+    Ok((catalog, parsed.signed))
 }
 
 pub(super) async fn center(
@@ -92,7 +126,7 @@ pub(super) async fn center(
             error: None,
         }));
     }
-    let (entries, verified, error) = match fetch_catalog(&config).await {
+    let (entries, verified, error) = match fetch_catalog(&state, &config).await {
         Ok((catalog, verified)) => {
             let manager = locked(&state, "读取插件中心")?;
             (center_entries(&manager, &catalog), verified, None)
@@ -138,6 +172,7 @@ pub(super) fn center_entries(
                 name: entry.name.clone(),
                 description: entry.description.clone(),
                 version: entry.version.clone(),
+                sha256: entry.sha256.clone(),
                 size: entry.size,
                 state,
                 installed_version: installed,
@@ -196,15 +231,23 @@ pub(super) async fn center_install(
     State(state): State<ApiState>,
     Json(request): Json<PluginCenterInstallRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    let (catalog, verified) = fetch_catalog(&read_center_config(&state)).await?;
+    let (catalog, verified) = fetch_catalog(&state, &read_center_config(&state)).await?;
     let entry: &CatalogEntry = match request.version.as_deref().filter(|v| !v.trim().is_empty()) {
-        Some(version) => catalog
-            .plugins
-            .iter()
-            .find(|entry| entry.id == request.id && entry.version == version),
+        Some(version) => catalog.plugins.iter().find(|entry| {
+            entry.id == request.id
+                && entry.version == version
+                && !catalog.is_revoked(&entry.id, &entry.version)
+        }),
         None => catalog.latest(&request.id),
     }
     .ok_or_else(|| ApiError::NotFound("插件中心目录中没有该插件或版本".into()))?;
+    // 用户确认的是列表里看到的那一份发布包：目录在确认后更新或被替换时必须拒绝，
+    // 不能让用户批准 A 却安装 B。
+    if entry.sha256 != request.expected_sha256 {
+        return Err(ApiError::Conflict(
+            "插件中心目录已更新，请刷新后再确认安装".into(),
+        ));
+    }
     let bytes = download_bytes(&entry.url, entry.size as usize, "插件包").await?;
     let package = PluginPackage::from_archive(&bytes)
         .map_err(|error| ApiError::InvalidInput(error.to_string()))?;

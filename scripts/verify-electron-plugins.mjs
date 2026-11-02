@@ -198,7 +198,8 @@ try {
   check("打包 Electron 启动并渲染工作台", true);
 
   // 1. 安装（本地包）+ 工作区
-  const installed = await post(page, "/api/plugins/install", { source: `local:${archive}` });
+  const preview1 = JSON.parse((await post(page, "/api/plugins/preview", { source: `local:${archive}` })).body);
+  const installed = await post(page, "/api/plugins/install", { source: `local:${archive}`, expectedDigest: preview1.digest });
   check("本地包安装成功", installed.status === 200, installed.body.slice(0, 200));
   const registered = await post(page, "/api/workspaces/register", { path: workspaceRoot });
   const workspaceId = JSON.parse(registered.body).workspaceId;

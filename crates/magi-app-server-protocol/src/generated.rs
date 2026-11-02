@@ -1871,6 +1871,7 @@ pub struct PluginCenterEntry {
     pub name: String,
     pub description: String,
     pub version: String,
+    pub sha256: String,
     pub size: u64,
     pub state: PluginCenterEntryState,
     #[serde(default)]
@@ -1894,6 +1895,8 @@ pub struct PluginCenterProjection {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginCenterInstallRequest {
     pub id: String,
+    #[serde(rename = "expectedSha256")]
+    pub expected_sha256: String,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,

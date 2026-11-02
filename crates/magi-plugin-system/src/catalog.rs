@@ -52,13 +52,36 @@ pub struct PluginCatalog {
     /// 发布时间（毫秒）。手写的目录可以省略。
     #[serde(default)]
     pub issued_at: u64,
+    /// 单调递增的发布序号，用于拒绝回滚到更旧的目录。手写目录可以省略（0 表示不参与防回滚）。
+    #[serde(default)]
+    pub sequence: u64,
+    /// 目录失效时间（毫秒）；0 表示不过期。过期目录不再提供安装入口，防止被冻结的旧目录长期有效。
+    #[serde(default)]
+    pub expires_at: u64,
+    /// 撤销列表：被撤销的插件版本（`version` 为空表示该插件全部版本）不再可安装。
+    #[serde(default)]
+    pub revoked: Vec<RevokedEntry>,
     pub plugins: Vec<CatalogEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RevokedEntry {
+    pub id: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CatalogError {
     #[error("插件中心目录无效：{0}")]
     Invalid(String),
+    #[error("插件中心目录已过期，请联系发布者更新")]
+    Expired,
+    #[error("插件中心目录发布序号回退，疑似被回滚")]
+    Rollback,
     #[error("插件中心目录签名未通过受信公钥校验")]
     Untrusted,
     #[error("已配置受信公钥，但该插件中心目录没有签名")]
@@ -163,11 +186,29 @@ impl PluginCatalog {
         Ok(())
     }
 
-    /// 目录中某插件的最新版本（按 SemVer）。
+    /// 按当前时间与已见最高序号校验时效。仅签名目录有意义；序号为 0 的手写目录不参与防回滚。
+    pub fn check_freshness(&self, now_ms: u64, last_sequence: u64) -> Result<(), CatalogError> {
+        if self.expires_at != 0 && now_ms >= self.expires_at {
+            return Err(CatalogError::Expired);
+        }
+        if self.sequence != 0 && self.sequence < last_sequence {
+            return Err(CatalogError::Rollback);
+        }
+        Ok(())
+    }
+
+    /// 条目是否被目录撤销。
+    pub fn is_revoked(&self, id: &str, version: &str) -> bool {
+        self.revoked.iter().any(|revoked| {
+            revoked.id == id && revoked.version.as_deref().is_none_or(|v| v == version)
+        })
+    }
+
+    /// 目录中某插件的最新未撤销版本（按 SemVer）。
     pub fn latest(&self, id: &str) -> Option<&CatalogEntry> {
         self.plugins
             .iter()
-            .filter(|entry| entry.id == id)
+            .filter(|entry| entry.id == id && !self.is_revoked(&entry.id, &entry.version))
             .max_by_key(|entry| semver::Version::parse(&entry.version).ok())
     }
 }
@@ -372,6 +413,27 @@ mod tests {
             PluginCatalog::verify(&catalog_json(), &[]),
             Err(CatalogError::Untrusted)
         );
+    }
+
+    #[test]
+    fn expired_rolled_back_and_revoked_entries_are_not_installable() {
+        let mut catalog = PluginCatalog::parse(&catalog_json(), &[]).unwrap().catalog;
+        catalog.sequence = 5;
+        catalog.expires_at = 1_000;
+        assert_eq!(catalog.check_freshness(999, 5), Ok(()));
+        assert_eq!(
+            catalog.check_freshness(1_000, 5),
+            Err(CatalogError::Expired)
+        );
+        assert_eq!(catalog.check_freshness(10, 6), Err(CatalogError::Rollback));
+        catalog.revoked = vec![RevokedEntry {
+            id: "acme.board".into(),
+            version: Some("1.10.0".into()),
+            reason: "漏洞".into(),
+        }];
+        assert_eq!(catalog.latest("acme.board").unwrap().version, "1.2.0");
+        catalog.revoked[0].version = None;
+        assert!(catalog.latest("acme.board").is_none());
     }
 
     #[test]

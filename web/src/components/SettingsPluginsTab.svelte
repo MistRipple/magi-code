@@ -229,7 +229,7 @@
     if (item.bundled) {
       await run(() => installBundledPlugin(item.id));
     } else if (item.catalog) {
-      await run(() => installFromPluginCenter(item.id, item.catalog!.version));
+      await run(() => installFromPluginCenter(item.catalog!));
     }
   }
 
@@ -239,7 +239,7 @@
       return;
     }
     if (!item.catalog) return;
-    await run(() => installFromPluginCenter(item.id, item.catalog!.version));
+    await run(() => installFromPluginCenter(item.catalog!));
   }
 
   $effect(() => {

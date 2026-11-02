@@ -32,9 +32,11 @@ const PLUGIN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOURCE_SUBSCRIPTION_RECHECK: Duration = Duration::from_millis(500);
 
 mod center;
+mod download;
 #[cfg(test)]
 use center::{OFFICIAL_PLUGIN_CENTER_URL, is_official_center, read_center_config};
 use center::{center, center_install, guide, write_center_config};
+use download::download_bytes;
 
 type InstallRequest = magi_app_server_protocol::PluginInstallRequest;
 type ScopeRequest = magi_app_server_protocol::PluginScopeRequest;
@@ -438,6 +440,14 @@ async fn load_package(
     Ok(package)
 }
 
+/// 安装与升级只接受用户在预览中确认过的摘要：没有预览凭据的写入请求一律拒绝，
+/// 所有来源（本地、地址、内联包）统一走“先预览、再确认”。
+fn confirmed_digest(expected: Option<&str>) -> Result<&str, ApiError> {
+    expected
+        .filter(|digest| !digest.trim().is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("安装前必须先预览候选包并携带预览摘要".into()))
+}
+
 /// 读取本地插件包。路径必须是绝对路径，读取量以包大小上限为界，避免把任意大文件读入内存。
 async fn read_local_package(path: &str) -> Result<Vec<u8>, ApiError> {
     use tokio::io::AsyncReadExt;
@@ -462,44 +472,6 @@ async fn download_package(url: &str) -> Result<Vec<u8>, ApiError> {
     download_bytes(url, MAX_PACKAGE_BYTES, "插件包").await
 }
 
-async fn download_bytes(url: &str, limit: usize, what: &str) -> Result<Vec<u8>, ApiError> {
-    let client = reqwest::Client::builder()
-        .timeout(PLUGIN_DOWNLOAD_TIMEOUT)
-        .build()
-        .map_err(|error| {
-            ApiError::internal_assembly(&format!("获取{what}失败"), error.to_string())
-        })?;
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| ApiError::InvalidInput(format!("获取{what}失败: {error}")))?;
-    if !response.status().is_success() {
-        return Err(ApiError::InvalidInput(format!(
-            "获取{what}返回 HTTP {}",
-            response.status()
-        )));
-    }
-    if response
-        .content_length()
-        .is_some_and(|size| size > limit as u64)
-    {
-        return Err(ApiError::InvalidInput(format!("{what}大小超限")));
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| ApiError::InvalidInput(format!("读取{what}失败: {error}")))?
-    {
-        if body.len().saturating_add(chunk.len()) > limit {
-            return Err(ApiError::InvalidInput(format!("{what}大小超限")));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
 /// 准备阶段：解析并校验候选包，返回与已安装版本的差异，不写入任何状态。
 async fn preview(
     State(state): State<ApiState>,
@@ -522,7 +494,7 @@ async fn install(
     let package = load_package(
         &source,
         request.archive_base64,
-        request.expected_digest.as_deref(),
+        Some(confirmed_digest(request.expected_digest.as_deref())?),
     )
     .await?;
     let mut manager = locked(&state, "安装插件")?;
@@ -539,7 +511,7 @@ async fn upgrade(
     let package = load_package(
         &source,
         request.archive_base64,
-        request.expected_digest.as_deref(),
+        Some(confirmed_digest(request.expected_digest.as_deref())?),
     )
     .await?;
     upgrade_installed_plugin(&state, &package, source).await?;
@@ -851,11 +823,7 @@ fn parse_source(source: &str) -> Result<PluginSource, ApiError> {
 fn validated_remote_url(value: &str) -> Result<String, ApiError> {
     let url = reqwest::Url::parse(value)
         .map_err(|_| ApiError::InvalidInput("插件来源地址无效".into()))?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(ApiError::InvalidInput(
-            "插件来源只支持带主机的 HTTP(S) 地址".into(),
-        ));
-    }
+    download::check_url_shape(&url)?;
     Ok(url.to_string())
 }
 
@@ -1126,8 +1094,7 @@ mod tests {
                 .unwrap();
             writer.write_all(&bytes).unwrap();
         }
-        let package =
-            PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap();
+        let package = PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap();
         let root = tempfile::tempdir().unwrap();
         let mut manager = PluginManager::open(root.path()).unwrap();
         manager
@@ -1284,6 +1251,15 @@ mod tests {
             "source": "local:/tmp/acme-resources-1.1.0.zip",
             "archiveBase64": base64::engine::general_purpose::STANDARD.encode(archive("1.1.0")),
         });
+        // 没有预览摘要的升级一律拒绝。
+        let (status, _) = post_json(&state, "/plugins/upgrade", body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let digest = PluginPackage::from_archive(&archive("1.1.0"))
+            .unwrap()
+            .digest()
+            .to_string();
+        let mut body = body;
+        body["expectedDigest"] = digest.into();
         let response = routes()
             .with_state(state.clone())
             .oneshot(
@@ -1336,19 +1312,39 @@ mod tests {
         package_bytes: Vec<u8>,
         advertised_sha256: String,
     ) -> CenterFixture {
+        start_center_with(
+            signing,
+            key_id,
+            package_bytes,
+            advertised_sha256,
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    async fn start_center_with(
+        signing: &ring::signature::Ed25519KeyPair,
+        key_id: &str,
+        package_bytes: Vec<u8>,
+        advertised_sha256: String,
+        extra: serde_json::Value,
+    ) -> CenterFixture {
         use base64::Engine as _;
         let package = Arc::new(std::sync::Mutex::new(package_bytes.clone()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let catalog = serde_json::to_vec(&serde_json::json!({
+        let mut catalog = serde_json::json!({
             "format": 1, "issuedAt": 1,
             "plugins": [{
                 "id": "acme.resources", "name": "Resources", "description": "",
                 "version": "1.0.0", "url": format!("{base}/package.zip"),
                 "sha256": advertised_sha256, "size": package_bytes.len()
             }]
-        }))
-        .unwrap();
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            catalog[key] = value.clone();
+        }
+        let catalog = serde_json::to_vec(&catalog).unwrap();
         let b64 = base64::engine::general_purpose::STANDARD;
         let envelope = serde_json::to_vec(&serde_json::json!({
             "payload": b64.encode(&catalog),
@@ -1426,7 +1422,7 @@ mod tests {
         let (signing, public) = center_signing_key();
         let archive = archive("1.0.0");
         let digest = package().digest().to_string();
-        let center = start_center(&signing, "center-1", archive.clone(), digest).await;
+        let center = start_center(&signing, "center-1", archive.clone(), digest.clone()).await;
         let root = tempfile::tempdir().unwrap();
         let state = bare_state(root.path());
 
@@ -1444,6 +1440,17 @@ mod tests {
         let (_, body) = call(&state, "GET", "/plugins/center", None).await;
         assert_eq!(body["error"], serde_json::Value::Null, "{body}");
         assert_eq!(body["entries"][0]["state"], "available");
+        assert_eq!(body["entries"][0]["sha256"], digest);
+
+        // 用户确认的是旧摘要：目录已变化时拒绝，不安装未经确认的候选。
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/plugins/center/install",
+            Some(serde_json::json!({"id": "acme.resources", "expectedSha256": "0".repeat(64)})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
 
         // 发布服务被入侵：包内容被替换，但目录签名仍绑定原摘要，安装必须失败且不落盘。
         *center.package.lock().unwrap() = self::archive("1.0.1");
@@ -1451,7 +1458,7 @@ mod tests {
             &state,
             "POST",
             "/plugins/center/install",
-            Some(serde_json::json!({"id": "acme.resources"})),
+            Some(serde_json::json!({"id": "acme.resources", "expectedSha256": digest})),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -1470,13 +1477,106 @@ mod tests {
             &state,
             "POST",
             "/plugins/center/install",
-            Some(serde_json::json!({"id": "acme.resources"})),
+            Some(serde_json::json!({"id": "acme.resources", "expectedSha256": digest})),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["plugins"][0]["source"]["kind"], "center");
         let (_, body) = call(&state, "GET", "/plugins/center", None).await;
         assert_eq!(body["entries"][0]["state"], "installed");
+    }
+
+    #[tokio::test]
+    async fn expired_and_revoked_center_catalogs_offer_nothing_to_install() {
+        let (signing, public) = center_signing_key();
+        let digest = package().digest().to_string();
+        let configure = |base: &str| {
+            serde_json::json!({
+                "url": format!("{base}/catalog.json"),
+                "trustedKeys": [{"keyId": "center-1", "publicKey": public}],
+            })
+        };
+        let body =
+            |digest: &str| serde_json::json!({"id": "acme.resources", "expectedSha256": digest});
+
+        // 已过期的签名目录：不展示条目，也不能安装。
+        let expired = start_center_with(
+            &signing,
+            "center-1",
+            archive("1.0.0"),
+            digest.clone(),
+            serde_json::json!({"sequence": 1, "expiresAt": 1}),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let state = bare_state(root.path());
+        call(
+            &state,
+            "PUT",
+            "/plugins/center/config",
+            Some(configure(&expired.base)),
+        )
+        .await;
+        let (_, view) = call(&state, "GET", "/plugins/center", None).await;
+        assert_eq!(view["entries"], serde_json::json!([]));
+        assert!(view["error"].as_str().unwrap().contains("过期"), "{view}");
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/plugins/center/install",
+            Some(body(&digest)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // 被撤销的版本：不再出现在目录里，按版本指定也不能安装。
+        let revoked = start_center_with(
+            &signing, "center-1", archive("1.0.0"), digest.clone(),
+            serde_json::json!({"sequence": 2, "revoked": [{"id": "acme.resources", "reason": "漏洞"}]}),
+        )
+        .await;
+        call(
+            &state,
+            "PUT",
+            "/plugins/center/config",
+            Some(configure(&revoked.base)),
+        )
+        .await;
+        let (_, view) = call(&state, "GET", "/plugins/center", None).await;
+        assert_eq!(view["entries"], serde_json::json!([]), "{view}");
+        let mut pinned = body(&digest);
+        pinned["version"] = "1.0.0".into();
+        let (status, _) = call(&state, "POST", "/plugins/center/install", Some(pinned)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // 序号回退：该地址已见过更高序号，序号 1 的目录视为回滚。
+        let rolled_back = start_center_with(
+            &signing,
+            "center-1",
+            archive("1.0.0"),
+            digest.clone(),
+            serde_json::json!({"sequence": 1}),
+        )
+        .await;
+        state
+            .settings_store
+            .set_section(
+                "pluginCenterState",
+                serde_json::json!({ format!("{}/catalog.json", rolled_back.base): 2 }),
+            )
+            .unwrap();
+        call(
+            &state,
+            "PUT",
+            "/plugins/center/config",
+            Some(configure(&rolled_back.base)),
+        )
+        .await;
+        let (_, view) = call(&state, "GET", "/plugins/center", None).await;
+        assert!(
+            view["error"].as_str().unwrap_or("<none>").contains("回滚"),
+            "{view}"
+        );
     }
 
     #[tokio::test]
@@ -1498,7 +1598,7 @@ mod tests {
             &state,
             "POST",
             "/plugins/center/install",
-            Some(serde_json::json!({"id": "acme.resources"})),
+            Some(serde_json::json!({"id": "acme.resources", "expectedSha256": "a".repeat(64)})),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);

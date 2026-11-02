@@ -3037,6 +3037,7 @@
         "name",
         "description",
         "version",
+        "sha256",
         "size",
         "state"
       ],
@@ -3052,6 +3053,10 @@
         },
         "version": {
           "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
         },
         "size": {
           "type": "integer",
@@ -3106,13 +3111,18 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "id"
+        "id",
+        "expectedSha256"
       ],
       "properties": {
         "id": {
           "type": "string",
           "minLength": 1,
           "maxLength": 96
+        },
+        "expectedSha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
         },
         "version": {
           "type": [

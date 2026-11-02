@@ -18,7 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use blocking::run_invocation_blocking;
 pub use catalog::{
-    CatalogEntry, CatalogError, MAX_CATALOG_BYTES, ParsedCatalog, PluginCatalog, TrustedKey,
+    CatalogEntry, CatalogError, MAX_CATALOG_BYTES, ParsedCatalog, PluginCatalog, RevokedEntry,
+    TrustedKey,
 };
 pub use command::{
     PluginCommandExecutor, PluginCommandInvocation, PluginCommandResult, PluginCommandRunner,

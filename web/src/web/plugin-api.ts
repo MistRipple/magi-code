@@ -4,6 +4,7 @@ import { agentUrl } from './agent-api';
 import type {
   PluginCandidatePreview,
   PluginCenterConfig,
+  PluginCenterEntry,
   PluginCenterProjection,
   PluginInstalled,
   PluginList,
@@ -136,11 +137,11 @@ export async function savePluginCenterConfig(config: PluginCenterConfig): Promis
 }
 
 /** 从已签名目录安装或升级：包内容须与目录签名绑定的摘要一致。 */
-export async function installFromPluginCenter(id: string, version?: string): Promise<void> {
+export async function installFromPluginCenter(entry: PluginCenterEntry): Promise<void> {
   const response = await pluginRequest('/api/plugins/center/install', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id, version: version ?? null }),
+    body: JSON.stringify({ id: entry.id, version: entry.version, expectedSha256: entry.sha256 }),
   });
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.installCenter'), response);
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));

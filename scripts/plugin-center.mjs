@@ -98,9 +98,13 @@ function publish(positional, options) {
   const { key, 'key-id': keyId, 'base-url': baseUrl, out, prefix = '' } = options;
   // 允许 0 个包：生成空目录（官方插件中心在没有上架插件时就是空目录）。
   if (!out || Boolean(key) !== Boolean(keyId)) {
-    fail('用法: publish --out <目录文件> [--base-url <包所在目录URL>] [--key <私钥文件> --key-id <标识>] <包.zip...>（--key 与 --key-id 须同时给出或同时省略）');
+    fail('用法: publish --out <目录文件> [--base-url <包所在目录URL>] [--expires-in-days <天数>] [--revoked <撤销列表.json>] [--key <私钥文件> --key-id <标识>] <包.zip...>（--key 与 --key-id 须同时给出或同时省略）');
   }
   if (baseUrl && !/^https?:\/\//u.test(baseUrl)) fail('--base-url 必须是 http(s) 地址');
+  const expiresInDays = options['expires-in-days'] === undefined ? 0 : Number(options['expires-in-days']);
+  if (!Number.isFinite(expiresInDays) || expiresInDays < 0) fail('--expires-in-days 必须是非负数字');
+  // 撤销列表：JSON 数组文件，元素 { id, version?, reason? }；缺省 version 表示该插件全部版本。
+  const revoked = options.revoked ? JSON.parse(readFileSync(options.revoked, 'utf8')) : [];
   const plugins = positional.map((file) => {
     const bytes = readFileSync(file);
     let manifest;
@@ -123,7 +127,15 @@ function publish(positional, options) {
   // --reproducible 省略发布时间，使同样的输入得到逐字节相同的目录（官方目录据此做一致性检查）。
   const catalog = options.reproducible === 'true'
     ? { format: CATALOG_FORMAT, plugins }
-    : { format: CATALOG_FORMAT, issuedAt: Date.now(), plugins };
+    : {
+      format: CATALOG_FORMAT,
+      issuedAt: Date.now(),
+      // 发布序号单调递增：客户端据此拒绝回滚到更旧的目录。
+      sequence: Date.now(),
+      ...(expiresInDays > 0 ? { expiresAt: Date.now() + expiresInDays * 86_400_000 } : {}),
+      ...(revoked.length > 0 ? { revoked } : {}),
+      plugins,
+    };
   let serialized;
   if (key) {
     const privateKey = createPrivateKey(readFileSync(key));
