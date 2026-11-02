@@ -1,6 +1,6 @@
 # 插件执行边界
 
-本 crate 实现[插件系统方案](../../docs/plugin-system-requirements-design.md)第 4.1、5.1 节选定的唯一后台执行基线：QuickJS 和独立受管 Worker。构建与 Desktop 打包已纳入 Worker；插件安装服务、生命周期 API 和右栏视图已接入，资源、设置、工具与工作流桥接沿 daemon 的原生权限和执行入口接入。
+本 crate 当前实现 QuickJS 和独立受管 Worker；下文记录现有源码，Node 替换尚未实现。[插件系统方案第 7 节](../../docs/plugin-system-requirements-design.md#7-quickjs-直接替换与删除边界)已确定直接用 Node 替换未投入使用的 QuickJS，不保留 SDK 1 兼容或双运行时；目标职责见方案第 5 节。现有构建与 Desktop 打包已纳入 Worker，安装、资源、设置及业务桥接是可复用基础，旧执行与发行接线按第 7 节同批替换。
 
 ## 所有权
 
@@ -15,7 +15,7 @@
 
 后台格式固定为 QuickJS + ESM，独立 Worker 复用 daemon 的受管进程生命周期。WASM 组件和插件自带原生程序不属于后台加载合同；历史选型实验通过 Git 追溯，不维护第二套运行时。
 
-macOS 与 Linux 的 OS 沙箱由 `--sandbox-selftest` 检查；Windows 没有 Worker 级 OS 限制，只依靠 JavaScript API 隔离与资源上限，自检如实报告 `enforced=false`（设计文档 §5.1 的已接受取舍）。平台执行、正式安装器和异步 SDK 取消结算仍需分别取得对应源码/构建的运行证据，不能用某次本机 preflight 或目录包通过替代全部交付门禁。
+macOS 与 Linux 的 OS 沙箱由 `--sandbox-selftest` 检查；Windows 没有 Worker 级 OS 限制，只依靠 JavaScript API 隔离与资源上限，自检如实报告 `enforced=false`（设计文档 §7.3 记录的待替换实现差异）。平台执行、正式安装器和异步 SDK 取消结算仍需分别取得对应源码/构建的运行证据，不能用某次本机 preflight 或目录包通过替代全部交付门禁。
 
 ## 产品构建与发行边界
 

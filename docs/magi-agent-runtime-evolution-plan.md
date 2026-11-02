@@ -1,6 +1,6 @@
 # Magi 产品与 Agent 运行时演进方案
 
-更新：2026-10-21。当前进入存量收敛，暂停新增能力。本文保留目标、取舍与阶段退出条件；当前保留/移除项和验证结论以[收敛审计](runtime-consolidation-audit.md)为准。阶段编号不代表完成百分比，旧分轮实施记录已合并，避免早期状态覆盖当前事实。
+更新：2026-10-21。当前进入存量收敛，暂停新增能力；插件系统的受信扩展宿主是已确定的例外，按[插件系统设计](plugin-system-requirements-design.md)作为独立交付线推进，不受本条冻结约束，也不并入下文 P0–P5。本文保留目标、取舍与阶段退出条件；当前保留/移除项和验证结论以[收敛审计](runtime-consolidation-audit.md)为准。阶段编号不代表完成百分比，旧分轮实施记录已合并，避免早期状态覆盖当前事实。
 
 ## 1. 核心判断
 
@@ -14,6 +14,8 @@ Magi 应定位为**以主对话承接用户意图、以可持续运行的 Agent 
 2. 主代理和子代理复用 Agent Loop、Inbox、Step、工具调用和恢复机制；控制权按资源范围授予。
 3. 工具发现、工具加载、执行权限、宿主可用性、资源租约和运行保护分别表达，由同一解析结果驱动展示与执行。
 4. 把长期工作从“反复强迫模型继续”改成有检查点、资源归属和明确停止原因的运行。
+
+此外，插件运行时单独替换为受信 Node 扩展宿主，经 daemon 内唯一的 ExtensionBus 接入上述运行时；它不属于这四项，职责、钩子目录与失败策略以[插件系统设计](plugin-system-requirements-design.md)为准。
 
 现有设计有合理基础，也存在已经影响产品行为的建模问题。只补 UI、解除所有限制，或直接重写整个 Rust 后端，都不能完整解决这些问题。
 
@@ -163,7 +165,7 @@ Magi 当前规则为：默认主线直接推进；仅在用户明确要求，或
 | Turn 幂等、attempt 身份、终态收口 | 显式 Input、Step、消费记录和资源结算 |
 | TaskStore、调度、检查点 | Agent 身份与某次 Task 执行解耦，恢复可以复用 agent |
 | BrowserAuthority 与物理宿主分工 | 统一 Agent 工具能力视图和 Browser 资源委派 |
-| 插件注册与受限执行体系 | 扩展执行器能力协商，插件继续经过可信内核 |
+| 插件包、安装、授权与生命周期基础 | 后台执行替换为受信 Node 扩展宿主，经 ExtensionBus 接入可信内核（[插件系统设计](plugin-system-requirements-design.md)） |
 | 权限、工具审计、用量和压缩设施 | 同一决策驱动目录、schema、审批、执行与错误解释 |
 
 ## 4. 产品应该是什么样
@@ -394,7 +396,7 @@ Skill 默认提供流程说明、资源与工具建议；只有显式声明为�
 
 Browser Tab、终端、worktree、插件资源均绑定 `owner_agent_id`、`run_id` 与 generation。共享登录 profile 不等于隔离浏览器环境；需要独立身份的任务必须显式分配独立 profile。共享 Tab 的改变由租约协调，用户接管提升 generation，旧代理调用被拒绝。
 
-Worktree 解决代码变更冲突，不提供文件或网络安全沙箱；仅隐藏 Write/Edit 也不能阻止 Shell/MCP 写入。严格只读/受限模式的产品保证必须覆盖实际进程、下游 MCP 和插件边界；不能覆盖的能力标明限制或禁止组合，不伪造“安全只读”。本次未做全仓 OS 沙箱安全审计。
+Worktree 解决代码变更冲突，不提供文件或网络安全沙箱；仅隐藏 Write/Edit 也不能阻止 Shell/MCP 写入。严格只读/受限模式的产品保证必须覆盖实际进程、下游 MCP 和插件边界；不能覆盖的能力标明限制或禁止组合，不伪造“安全只读”。受信扩展层以用户权限运行，与要求强制 OS 只读的环境不并存：此类环境拒绝激活受信层，不以单个 Task 的钩子过滤代替隔离（[插件系统设计](plugin-system-requirements-design.md) D12）。本次未做全仓 OS 沙箱安全审计。
 
 ### 8.5 用量与防循环
 
@@ -438,9 +440,9 @@ result、运行结束、资源释放和代码合入分别记录。`agent_apply` 
 
 ## 10. 插件、GUI/Web 和预留接口的边界
 
-保留现有 Magi 插件系统，围绕 Tool、Context contribution、Executor、Workflow、Artifact renderer、Lifecycle observer 定义小而稳定的扩展面。默认工作流可实现同一接口，但权限裁决、持久事务、来源身份和终态校验属于可信内核。
+保留 Magi 插件的包、安装、授权与生命周期基础，后台执行由受信 Node 扩展宿主承担，所有扩展调用经 daemon 内唯一的 ExtensionBus 分发与裁决。扩展面围绕 Tool、Context contribution、Executor、Workflow、子代理派发、输入接纳、压缩，以及对模型请求与用量的只读观察，具体钩子、结果语义与调用链落点见[插件系统设计](plugin-system-requirements-design.md)第 5 节。默认工作流可实现同一接口，但权限裁决、持久事务、来源身份和终态校验属于可信内核。
 
-Hook 改写了工具参数时，必须重新进行权限校验；插件不能从 `deny` 改为 `allow` 绕过用户授权。配置 reload 影响新的 Step/activation，正在执行的调用保留其已冻结版本与最新撤销约束。禁用插件停止新接纳，等待或取消其已接纳工作并完成资源结算。
+Hook 改写了工具参数时，必须重新进行权限校验；插件不能从 `deny` 改为 `allow` 绕过用户授权。钩子分 observe、advise、guard 三种模式：guard 是用户启用的必经规则，失败、超时或熔断都阻止受影响动作，不静默放行。后台工作持有 daemon 签发的插件作业身份，持久定时由原生调度服务拥有，没有作业或 Turn 身份的模型调用被拒绝。配置 reload 影响新的 Step/activation，正在执行的调用保留其已冻结版本与最新撤销约束。禁用插件停止新接纳，等待或取消其已接纳工作并完成资源结算。受信扩展直接使用用户权限访问文件、网络和进程，Magi 管理的接口约束业务提案，不对这些直接副作用提供隔离、审计或撤销保证。
 
 Desktop GUI 与 Web 工作台使用同一个 daemon 接纳、事件和交互合同。手机访问同一 Web 工作台，浏览器关闭、UI 重连和宿主重启不改变任务归属。Web 的响应式与触控适配继续维护，不增加独立移动客户端、客户端持久队列或权限引擎。
 
@@ -461,6 +463,8 @@ Desktop GUI 与 Web 工作台使用同一个 daemon 接纳、事件和交互合�
 
 P1 与 P2 可按低冲突模块安排工程并行，但协议与所有权决策先统一。P3 依赖其合同稳定；P4 的嵌套开放依赖取消、权限和资源树完成。优先完成 P0–P2，直接改善当前用户问题，再扩展代理规模。
 
+受信扩展宿主按[插件系统设计](plugin-system-requirements-design.md)第 11 节的阶段独立推进，与 P0–P5 无前后依赖。二者只在 ExtensionBus 的接线点（输入接纳、工具批、上下文装配、子代理派发）相遇：P3 统一 Step Loop 落地后，钩子落点以统一后的入口为准，不在已计划删除的旧通用 loop 上新增接线；P3 之前接入的落点必须覆盖 task 与 conversation 两条现有入口，并在 P3 合并时一并迁移。
+
 ### 11.1 迁移与回退
 
 1. 先为现有行为建立跨 HTTP/App Server 的合同测试与故障注入点。
@@ -480,7 +484,7 @@ P1 与 P2 可按低冲突模块安排工程并行，但协议与所有权决策�
 | `custom-worker-role-design.md` | P2/P4 更新角色、硬约束、Agent 身份与 activation；角色 registry 继续复用 |
 | `context-pressure-compaction-architecture.md` | 保留 usage/compaction 权威；P3 增加 Step 绑定与未消费输入保护 |
 | `browser-runtime-design.md` | 保留逻辑/物理边界；P2/P4 补 Agent 委派与资源代际合同 |
-| `plugin-system-requirements-design.md` | 保留可信宿主与生命周期；P5 核对现有插件能力声明及兼容性 |
+| `plugin-system-requirements-design.md` | 已按终局设计重写：受信 Node 单路径，QuickJS 后台删除；保留安装、授权、生命周期与资源基础，作为独立交付线 |
 | `docs/README.md` | 立即把本文作为新提案入口，实施后再更新当前事实描述 |
 
 不把旧文档里的“已完成”“冻结”视为阻止这次重新设计的前提，也不在实现前把新提案写成已交付基线。

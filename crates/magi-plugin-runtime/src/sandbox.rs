@@ -189,7 +189,7 @@ mod platform {
     use std::io;
 
     // Worker 自身的 AppContainer/受限令牌尚未实现：`ENFORCED` 为 false，发行校验会如实
-    // 报告，阶段 A 门禁在 Windows 上保持未关闭，见方案 §5.1。
+    // 报告，阶段 A 门禁在 Windows 上保持未关闭，见方案 §7.3。
     pub fn apply() -> io::Result<()> {
         Ok(())
     }

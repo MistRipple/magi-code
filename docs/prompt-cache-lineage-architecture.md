@@ -179,7 +179,7 @@ HTTP 观测与重试进度是两个合同：重试通知继续负责在再次发
 
 ## 声明式前缀改写
 
-改写已发送前缀只有两类原因，由投影声明，而不是靠事后比对猜测：
+改写已发送前缀目前只有两类原因，由投影声明，而不是靠事后比对猜测（受信扩展的第三类见下一小节，尚未实现）：
 
 | 原因 | 来源 | 声明方式 |
 | --- | --- | --- |
@@ -187,6 +187,23 @@ HTTP 观测与重试进度是两个合同：重试通知继续负责在再次发
 | `file_facts_refreshed` | 工作区文件变化，读取事实 current → stale | `HistoryProjection.staleFileFacts` 增长 |
 
 `HistoryProjection` 随请求冻结进 `ModelPromptFrame.historyProjection`。历史链哈希发现旧历史被改写时，`bind_lineage` 先按上表归因；没有任何计数增长的改写才是 `history_rewritten`，它表示前缀被意外破坏，会记录警告，应当视为缺陷而不是正常现象。模型/权限/Skill/工具面/压缩等其他断代原因保持原有的判定顺序。读取旧记录缺失该字段时按未声明处理。
+
+### 目标：扩展改写（`extension_rewrite`，未实现）
+
+受信扩展经 `context.assemble` 与 `compaction.before` 提出的受控历史改写（[插件系统设计](plugin-system-requirements-design.md) D5）是第三类声明式原因，同样由投影声明，而不是事后比对：
+
+| 原因 | 来源 | 声明方式 |
+| --- | --- | --- |
+| `extension_rewrite` | 已授权 `contextRewrite` 的扩展改写已装配历史 | `HistoryProjection.extensionRewrites` 增长，每项含插件与贡献身份、改写范围、原文引用 |
+
+约束：
+
+- 改写只发生在投影；canonical 日志与原文不变，原文引用可回溯。
+- 原生系统段、工具调用与结果的配对、压缩检查点边界不可改写；违反则拒绝该提案。
+- 未声明并获用户授权 `contextRewrite` 的扩展提交此类提案一律拒绝，不降级为未声明改写。
+- 每次改写都记录缓存代际变化，界面显示“扩展改写了历史，缓存已重建”及来源；`bind_lineage` 先按该原因归因，因此不会产生 `history_rewritten` 警告。
+- 成本以供应商真实 usage 为准，不估算“本来可命中”的反事实费用。
+- 本合同实现并通过回归之前，插件系统不得开放这两个钩子的改写能力。
 
 ## 缓存核算
 
@@ -219,6 +236,7 @@ Magi 保持稳定的部分如果没有被读到，缺口归因到 provider 侧�
 | Context Authority / 对话装配器 | 源消息及其可信生命周期、history generation、compaction epoch |
 | Prompt IR compiler | 规范化正文、工具调用与 schema，向摘要和 renderer 提供同一套结构规则 |
 | History Projection | 模型可见历史的唯一纯函数投影：单条形态、文件事实、总预算，并声明对已有结果的改写量 |
+| ExtensionBus（目标） | 校验并裁决扩展的上下文贡献与改写提案，向 History Projection 声明 `extension_rewrite`；不生成缓存身份 |
 | Tool Surface Authority | 工具目录、授权、规范化 schema、tool surface hash |
 | Prompt Lineage Authority | branch、provider scope、cache epoch、cache key、失效原因 |
 | Provider Adapter | IR → wire renderer、协议断点、usage parser |
@@ -234,6 +252,7 @@ Magi 保持稳定的部分如果没有被读到，缺口归因到 provider 侧�
 4. 将 Provider adapter 改为消费 IR，并为 Anthropic、Responses、Chat 和自定义代理分别实现 CacheContract。（已完成三种协议及未知代理的保守合同；未知能力仍不视为支持）
 5. 将账本升级为 logical call / transport attempt 两层，接入失效事件和统计页。 空响应、中断与补证控制提示已迁移到 `RequestControls`，重复恢复替换当前原因，得到可用输出后清除；已确认的片段仍沿 canonical 历史追加。探索停滞提醒由当前状态逐请求重建。逐 attempt 的 HTTP 证据、统计和重启补账已接入；辅助请求不创建虚构 Turn，使用独立持久传输事实。
 6. 通过连续对话、文件工具、worker、auxiliary、模型矩阵和真实 Anthropic 账号验收。当前生产代码已无 v1 键生成器；主线与辅助入口都调用同一个 lineage 算法。不得为等待真实账号验收保留第二套运行时缓存策略。
+7. （目标，未实现）为受信扩展的受控改写增加 `extension_rewrite` 失效原因与记录合同，实现位于 `history_projection` 的唯一投影中，并补齐归因、拒绝路径与重启重建的一致性回归；完成前不开放扩展改写。
 
 缓存预热、WebSocket continuation 和长期 TTL 暂不进入迁移；它们必须建立在 lineage、contract 和 cost ledger 稳定之后。
 
