@@ -458,9 +458,12 @@ impl PromptFrame {
         &self,
         previous: &magi_session_store::ModelPromptFrame,
     ) -> CacheInvalidationReason {
-        let before = previous.history_projection.unwrap_or_default();
-        let now = self.history_projection.unwrap_or_default();
-        if now.stale_file_facts > before.stale_file_facts {
+        let before = previous.history_projection.clone().unwrap_or_default();
+        let now = self.history_projection.clone().unwrap_or_default();
+        // 扩展改写以“生效集合是否变化”声明：新增、替换或被撤销都会改变前缀，都属于该原因。
+        if now.extension_rewrites != before.extension_rewrites {
+            CacheInvalidationReason::ExtensionRewrite
+        } else if now.stale_file_facts > before.stale_file_facts {
             CacheInvalidationReason::FileFactsRefreshed
         } else if now.demoted_tool_results > before.demoted_tool_results {
             CacheInvalidationReason::ToolHistoryDemoted

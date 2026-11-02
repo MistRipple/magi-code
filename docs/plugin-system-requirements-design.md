@@ -313,7 +313,7 @@
 
 【目标】稳定贡献使用插件、贡献 ID、包摘要、配置快照及内容摘要确定身份，不能夹入时间戳或随机数；易变内容放 RoundContext 尾部。最终请求贡献先入来源标记与预算，再由实际 Bridge 的 cache_prompt_ir 计算；不能在该步骤后改 provider 请求体。插件不生成 cache key，不维护另一份 transcript。
 
-【目标】扩展可经 context.assemble 与 compaction.before 提出对已装配历史的受控改写，作为现有声明式前缀改写合同的新增原因 ExtensionRewrite：每次改写必须记录插件与贡献身份、改写范围、原文引用（canonical 日志不变，只改投影）和触发的缓存代际变化，并在界面显示“扩展改写了历史，缓存已重建”；原生系统段与工具配对约束不可改写；未声明并获授权 contextRewrite 的插件提交此类提案一律拒绝。该合同须先在[缓存架构](prompt-cache-lineage-architecture.md#声明式前缀改写)中落为正式失效原因，此前不得开放这两个钩子的改写能力。最强反方：改写会破坏前缀缓存、推高成本；以显式授权、可见代价和代际记录约束，而不是整体禁止。
+【目标】扩展可经 context.assemble 与 compaction.before 提出对已装配历史的受控改写，作为现有声明式前缀改写合同的新增原因 ExtensionRewrite：每次改写必须记录插件与贡献身份、改写范围、原文引用（canonical 日志不变，只改投影）和触发的缓存代际变化，并在界面显示“扩展改写了历史，缓存已重建”；原生系统段与工具配对约束不可改写；未声明并获授权 contextRewrite 的插件提交此类提案一律拒绝。该合同已在[缓存架构](prompt-cache-lineage-architecture.md#扩展改写extension_rewrite)中落为正式失效原因（含记录合同、唯一投影和归因回归），但提案持久化、`contextRewrite` 授权项与钩子接线尚未完成，此前不得开放这两个钩子的改写能力。最强反方：改写会破坏前缀缓存、推高成本；以显式授权、可见代价和代际记录约束，而不是整体禁止。
 
 ### 5.10 包、清单、权限与信任
 
@@ -582,7 +582,7 @@
 | 状态 | 文档 | 承载内容 | 来源决策 |
 | --- | --- | --- | --- |
 | 现状 | [演进方案](magi-agent-runtime-evolution-plan.md#1-核心判断) 第 1、3.5、8.4、10、11 节 | 插件系统作为独立交付线、不受“暂停新增能力”约束；ExtensionBus、钩子模式与插件作业；受信层与严格只读不并存；与 P3 统一 Step Loop 的接线顺序 | D1、D4、D9、D12 |
-| 现状 | [缓存架构](prompt-cache-lineage-architecture.md#目标扩展改写extension_rewrite未实现) | `extension_rewrite` 失效原因及其记录合同，实现前不开放扩展改写 | D5 |
+| 现状 | [缓存架构](prompt-cache-lineage-architecture.md#扩展改写extension_rewrite) | `extension_rewrite` 失效原因、记录合同与唯一投影（已实现并有回归）；提案持久化、授权项与钩子接线完成前不开放扩展改写 | D5 |
 | 现状 | [项目架构文档](README.md) | 扩展宿主进程与进程拓扑、随包 Node、文档索引 | D3 |
 | 现状 | [验证入口](validation.md) | 第 12 节验收面的登记处；当前没有对应命令 | 第 12 节 |
 | 目标 | [扩展协议 v1](extension-protocol-v1.md) | 线协议规范：传输与帧、握手与版本、调用身份、方法目录、注册、逐钩子合同、重入、迁移会话、失败与错误码、协议层验收（尚未实现） | 5.5～5.8、D1、D4 |

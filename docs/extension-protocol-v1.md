@@ -14,7 +14,7 @@
 | `session.created` `session.deleted` `turn.accepted` `turn.end` `usage.update` | observe | 领域事件总线的先提交后发布事实，经 daemon 转发器投影为有限、脱敏字段（不含正文、提示词、凭据）；`turn.end` 由 `session.turn.item` 事件里的终态派生并按 Turn 去重；事件总线是广播通道，消费落后会丢事件（只记日志，观察钩子不承诺完整送达） |
 | `model.resolved` `model.request` `model.response` | observe | `StepModelClient` 在 Step 事实提交后通知，仅限任务主线（`conversation_loop`）；纯会话 profile 的模型调用尚未接线 |
 
-**刻意未接线**：`prompt.contribute`、`context.assemble`、`compaction.before` 需要先把 `extension_rewrite` 落为缓存架构里的正式失效原因（见[缓存架构](prompt-cache-lineage-architecture.md)），在此之前不开放；`input` 与 `model.request` 的 advise 改写、`subagent.spawn` 的收窄尚未实现。
+**刻意未接线**：`prompt.contribute`、`context.assemble`、`compaction.before`。`extension_rewrite` 失效原因、记录合同与唯一投影已在[缓存架构](prompt-cache-lineage-architecture.md#扩展改写extension_rewrite)落地并有回归，但提案/裁决的持久化、`contextRewrite` 授权项与 ExtensionBus 接线尚未完成，因此仍不开放；`input` 与 `model.request` 的 advise 改写、`subagent.spawn` 的收窄尚未实现。
 
 **尚未实现**：`command/tool/job/migration` 方法、`model.invoke`/`tool.call`/`task.spawn`/`resource.*`/`credential.ref`/blob 等宿主→daemon 服务、`hook.invoke` 的 `ctx` 中的 `deadline` 绝对时间戳（当前传 `deadlineMs`）、Windows 命名管道路径（已编写、未编译验证）、以及对 conversation-runtime 实际调用链的接线——其余钩子目前不会被真实 Turn 触发。落点引用沿用设计文档 5.6 的核对结果。
 - 【目标】协议只有一条执行路径，服务 Node 宿主；不为 QuickJS 或 SDK 1 提供任何子集（设计文档 I14、D1）。

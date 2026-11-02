@@ -250,7 +250,7 @@ impl<'a> StepModelClient<'a> {
         // client 会在这里完成工具 wire name 编码和能力降级；不能基于原始
         // canonical 工具名先生成一份与真实请求不同的缓存身份。
         let mut prompt_frame = PromptFrame::from_ir(&client.cache_prompt_ir(&request));
-        prompt_frame.history_projection = self.history_projection;
+        prompt_frame.history_projection = self.history_projection.clone();
         let capabilities = client.executor_capabilities();
         let provider_scope = crate::prompt_lineage::ProviderCacheScope::from_client(client)
             .unwrap_or_else(|| crate::prompt_lineage::ProviderCacheScope {
@@ -724,7 +724,7 @@ impl From<&PromptFrame> for magi_session_store::ModelPromptFrame {
             post_boundary_hash: frame.post_boundary_hash.clone(),
             history_message_count: Some(frame.history_message_count),
             history_chain_hash: Some(frame.history_chain_hash.clone()),
-            history_projection: frame.history_projection,
+            history_projection: frame.history_projection.clone(),
             prefix_bytes: Some(frame.prefix_bytes),
             tail_bytes: Some(frame.tail_bytes),
             cache_binding: None,
@@ -1269,6 +1269,7 @@ mod tests {
             HistoryProjection {
                 demoted_tool_results: 2,
                 stale_file_facts: 0,
+                ..Default::default()
             },
             "demoted",
         );
@@ -1277,6 +1278,7 @@ mod tests {
             HistoryProjection {
                 demoted_tool_results: 2,
                 stale_file_facts: 1,
+                ..Default::default()
             },
             "stale",
         );
@@ -1285,6 +1287,7 @@ mod tests {
             HistoryProjection {
                 demoted_tool_results: 2,
                 stale_file_facts: 1,
+                ..Default::default()
             },
             "undeclared",
         );
@@ -1312,6 +1315,148 @@ mod tests {
                 Some(CacheInvalidationReason::FileFactsRefreshed),
                 Some(CacheInvalidationReason::HistoryRewritten),
             ]
+        );
+    }
+
+    #[test]
+    fn extension_rewrites_are_attributed_added_changed_and_revoked_and_survive_restart() {
+        use crate::prompt_lineage::CacheInvalidationReason;
+        use magi_session_store::{ExtensionRewriteRecord, HistoryProjection};
+        struct Echo;
+        impl ModelBridgeClient for Echo {
+            fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+                magi_bridge_client::native_executor_capabilities()
+            }
+            fn invoke(
+                &self,
+                _: ModelInvocationRequest,
+            ) -> Result<ModelResponse, BridgeClientError> {
+                Ok(ModelResponse::completed("ok"))
+            }
+            fn invoke_streaming(
+                &self,
+                request: ModelInvocationRequest,
+                _: &dyn Fn(&ModelStreamingDelta),
+            ) -> Result<ModelResponse, BridgeClientError> {
+                self.invoke(request)
+            }
+        }
+        let message = |role: &str, text: &str| magi_bridge_client::ChatMessage {
+            input_request_id: None,
+            context_origin: Default::default(),
+            role: role.into(),
+            content: Some(text.into()),
+            images: vec![],
+            tool_calls: vec![],
+            tool_call_id: None,
+            provider_context: vec![],
+        };
+        let record = |digest: &str| ExtensionRewriteRecord {
+            plugin_id: "acme.summary".into(),
+            contribution_id: "summarize".into(),
+            hook: "context.assemble".into(),
+            from: 0,
+            to: 1,
+            original_digest: digest.into(),
+            replacement_digest: format!("replacement-{digest}"),
+        };
+        let projection = |records: Vec<ExtensionRewriteRecord>| HistoryProjection {
+            extension_rewrites: records,
+            ..Default::default()
+        };
+        let (store, session, thread) = store();
+        let invoke = |texts: &[&str], projection: HistoryProjection, call: &str| {
+            StepModelClient::new(
+                &Echo,
+                &store,
+                &session,
+                Some("turn-journal-client"),
+                None,
+                &thread,
+                call,
+            )
+            .with_history_projection(projection)
+            .invoke(ModelInvocationRequest {
+                messages: Some(
+                    texts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| message(if i % 2 == 0 { "user" } else { "assistant" }, t))
+                        .collect(),
+                ),
+                ..request("")
+            })
+            .unwrap();
+        };
+        invoke(&["原文", "reply"], projection(vec![]), "initial");
+        // 扩展改写生效：首条被摘要替换。
+        invoke(
+            &["摘要A", "reply"],
+            projection(vec![record("a")]),
+            "applied",
+        );
+        // 同一改写下追加新消息：继续追加，不是新的失效。
+        invoke(
+            &["摘要A", "reply", "next"],
+            projection(vec![record("a")]),
+            "appended",
+        );
+        // 改写内容变化（扩展换了摘要）。
+        invoke(
+            &["摘要B", "reply", "next"],
+            projection(vec![record("b")]),
+            "changed",
+        );
+        // 扩展被停用：改写撤销，历史回到原文，仍然是被声明的变化。
+        invoke(&["原文", "reply", "next"], projection(vec![]), "revoked");
+        // 没有任何声明的内容变化才是未声明的前缀破坏。
+        invoke(
+            &["悄悄改了", "reply", "next"],
+            projection(vec![]),
+            "undeclared",
+        );
+        let turn = store
+            .canonical_turn_for_session_turn_id(&session, "turn-journal-client")
+            .unwrap();
+        let reasons = turn
+            .model_steps
+            .iter()
+            .map(|step| {
+                step.prompt_frame
+                    .as_ref()
+                    .unwrap()
+                    .cache_binding
+                    .as_ref()
+                    .unwrap()
+                    .invalidation_reason
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons,
+            vec![
+                Some(CacheInvalidationReason::Initial),
+                Some(CacheInvalidationReason::ExtensionRewrite),
+                None,
+                Some(CacheInvalidationReason::ExtensionRewrite),
+                Some(CacheInvalidationReason::ExtensionRewrite),
+                Some(CacheInvalidationReason::HistoryRewritten),
+            ]
+        );
+        // 记录随 Step 事实持久化，重启后从同一事实读回逐项相同。
+        let persisted = turn.model_steps[1]
+            .prompt_frame
+            .as_ref()
+            .unwrap()
+            .history_projection
+            .clone();
+        let restored: magi_session_store::ModelPromptFrame = serde_json::from_value(
+            serde_json::to_value(turn.model_steps[1].prompt_frame.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored.history_projection, persisted);
+        assert_eq!(
+            restored.history_projection.unwrap().extension_rewrites,
+            vec![record("a")]
         );
     }
 

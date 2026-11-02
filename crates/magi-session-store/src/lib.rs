@@ -40,8 +40,8 @@ pub use store::{
 };
 
 pub use model_step::{
-    CacheInvalidationReason, HistoryProjection, ModelAttempt, ModelCacheBinding, ModelPromptFrame,
-    ModelStep, ModelStepBinding, ModelStepPurpose, ModelStepStatus, ModelTransportOutcome,
-    ModelTransportRecord, ModelTransportUsage, validate_model_transport_update,
-    validate_model_usage_context,
+    CacheInvalidationReason, ExtensionRewriteRecord, HistoryProjection, ModelAttempt,
+    ModelCacheBinding, ModelPromptFrame, ModelStep, ModelStepBinding, ModelStepPurpose,
+    ModelStepStatus, ModelTransportOutcome, ModelTransportRecord, ModelTransportUsage,
+    validate_model_transport_update, validate_model_usage_context,
 };

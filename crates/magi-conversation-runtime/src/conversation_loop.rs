@@ -951,7 +951,8 @@ fn run_conversation_loop_inner(
     let mut request_controls = crate::request_controls::RequestControls::default();
     let history_boundary_note = std::cell::Cell::new(None::<&'static str>);
     // 最近一次请求视图对已有结果的改写量，随 Step 一起冻结，用于缓存断代归因。
-    let history_projection = std::cell::Cell::new(magi_session_store::HistoryProjection::default());
+    let history_projection =
+        std::cell::RefCell::new(magi_session_store::HistoryProjection::default());
     let volatile_context_tail = || -> Vec<ChatMessage> {
         let mut tail = Vec::new();
         let mailbox_prompt = render_task_signals_for_prompt(&runtime_signals.borrow());
@@ -980,7 +981,7 @@ fn run_conversation_loop_inner(
         // 总预算只作用于原始结果序列的副本：`messages` 保持原样，视图才是它的纯函数。
         let (history, projection) =
             crate::history_projection::bounded_request_history(messages, context_window_tokens);
-        history_projection.set(projection);
+        *history_projection.borrow_mut() = projection;
         controls.view(
             &history,
             volatile_context_tail()
@@ -1796,7 +1797,7 @@ fn run_conversation_loop_inner(
         )
         .with_model_binding(settings_store, usage_binding)
         .with_usage_assignment(lease_id.to_string())
-        .with_history_projection(history_projection.get())
+        .with_history_projection(history_projection.borrow().clone())
         .with_extension_hooks(extension_hooks);
         if is_sidechain {
             step_client =

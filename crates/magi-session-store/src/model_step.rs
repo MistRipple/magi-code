@@ -107,16 +107,39 @@ pub enum CacheInvalidationReason {
     /// Provider 私有上下文（例如 reasoning signature）发生变化；它属于
     /// 已发送历史的 wire 事实，不能继续复用上一代前缀。
     ProviderContextChanged,
+    /// 已授权 `contextRewrite` 的受信扩展改写了已装配历史（投影声明，见
+    /// `HistoryProjection.extension_rewrites`）。改写生效、变化或被撤销都属于该原因。
+    ExtensionRewrite,
     RendererChanged,
 }
 
-/// 模型可见历史投影对已有结果的改写量。两个计数只增不减地描述“历史为何会被有意改写”，
-/// 用来把前缀变化归因到明确原因；没有对应计数增长的改写才是未声明的 `HistoryRewritten`。
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// 受信扩展对模型可见历史的一次受控改写记录。canonical 日志与原文不变；
+/// `original_digest` 是被替换消息序列化后的 SHA-256，用来回溯原文。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExtensionRewriteRecord {
+    pub plugin_id: String,
+    pub contribution_id: String,
+    /// 提出改写的钩子（`context.assemble` 或 `compaction.before`）。
+    pub hook: String,
+    /// 被替换的消息区间 [from, to)，下标相对改写前的装配历史。
+    pub from: usize,
+    pub to: usize,
+    pub original_digest: String,
+    pub replacement_digest: String,
+}
+
+/// 模型可见历史投影对已有结果的改写量。计数只增不减地描述“历史为何会被有意改写”，
+/// 扩展改写记录则描述当前生效的改写集合；两者都用来把前缀变化归因到明确原因，
+/// 没有任何声明变化的改写才是未声明的 `HistoryRewritten`。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryProjection {
     pub demoted_tool_results: usize,
     pub stale_file_facts: usize,
+    /// 当前生效的扩展改写。读取缺失该字段的旧记录按“没有扩展改写”处理。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_rewrites: Vec<ExtensionRewriteRecord>,
 }
 
 /// 缓存身份只随原 ModelStep 事务提交；不建立第二份 lineage 状态或恢复日志。

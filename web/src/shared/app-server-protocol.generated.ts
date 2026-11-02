@@ -922,7 +922,7 @@ export interface SessionInboxCursor {
 
 export type ModelStepStatus = "started" | "response_received" | "outcome_unknown";
 
-export type CacheInvalidationReason = "initial" | "model_changed" | "provider_changed" | "reasoning_changed" | "permission_changed" | "skill_changed" | "stable_prefix_changed" | "tool_surface_changed" | "compaction" | "history_rewritten" | "tool_history_demoted" | "file_facts_refreshed" | "provider_context_changed" | "renderer_changed";
+export type CacheInvalidationReason = "initial" | "model_changed" | "provider_changed" | "reasoning_changed" | "permission_changed" | "skill_changed" | "stable_prefix_changed" | "tool_surface_changed" | "compaction" | "history_rewritten" | "tool_history_demoted" | "file_facts_refreshed" | "provider_context_changed" | "extension_rewrite" | "renderer_changed";
 
 export interface ModelCacheBinding {
   lineageId: string;
@@ -952,9 +952,20 @@ export interface ModelPromptFrame {
   cacheBinding?: ModelCacheBinding;
 }
 
+export interface ExtensionRewriteRecord {
+  pluginId: string;
+  contributionId: string;
+  hook: string;
+  from: number;
+  to: number;
+  originalDigest: string;
+  replacementDigest: string;
+}
+
 export interface HistoryProjection {
   demotedToolResults: number;
   staleFileFacts: number;
+  extensionRewrites?: Array<ExtensionRewriteRecord>;
 }
 
 export interface ModelStep {

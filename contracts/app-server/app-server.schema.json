@@ -3331,6 +3331,7 @@
         "tool_history_demoted",
         "file_facts_refreshed",
         "provider_context_changed",
+        "extension_rewrite",
         "renderer_changed"
       ]
     },
@@ -3460,6 +3461,46 @@
         }
       }
     },
+    "ExtensionRewriteRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pluginId",
+        "contributionId",
+        "hook",
+        "from",
+        "to",
+        "originalDigest",
+        "replacementDigest"
+      ],
+      "properties": {
+        "pluginId": {
+          "type": "string"
+        },
+        "contributionId": {
+          "type": "string"
+        },
+        "hook": {
+          "type": "string"
+        },
+        "from": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "usize"
+        },
+        "to": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "usize"
+        },
+        "originalDigest": {
+          "type": "string"
+        },
+        "replacementDigest": {
+          "type": "string"
+        }
+      }
+    },
     "HistoryProjection": {
       "type": "object",
       "additionalProperties": false,
@@ -3477,6 +3518,13 @@
           "type": "integer",
           "minimum": 0,
           "x-rust-type": "usize"
+        },
+        "extensionRewrites": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExtensionRewriteRecord"
+          },
+          "x-rust-default": true
         }
       }
     },

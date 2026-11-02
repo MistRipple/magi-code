@@ -2047,6 +2047,8 @@ pub enum CacheInvalidationReason {
     FileFactsRefreshed,
     #[serde(rename = "provider_context_changed")]
     ProviderContextChanged,
+    #[serde(rename = "extension_rewrite")]
+    ExtensionRewrite,
     #[serde(rename = "renderer_changed")]
     RendererChanged,
 }
@@ -2123,11 +2125,30 @@ pub struct ModelPromptFrame {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExtensionRewriteRecord {
+    #[serde(rename = "pluginId")]
+    pub plugin_id: String,
+    #[serde(rename = "contributionId")]
+    pub contribution_id: String,
+    pub hook: String,
+    pub from: usize,
+    pub to: usize,
+    #[serde(rename = "originalDigest")]
+    pub original_digest: String,
+    #[serde(rename = "replacementDigest")]
+    pub replacement_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HistoryProjection {
     #[serde(rename = "demotedToolResults")]
     pub demoted_tool_results: usize,
     #[serde(rename = "staleFileFacts")]
     pub stale_file_facts: usize,
+    #[serde(default)]
+    #[serde(rename = "extensionRewrites")]
+    pub extension_rewrites: Vec<ExtensionRewriteRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

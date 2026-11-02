@@ -179,7 +179,7 @@ HTTP 观测与重试进度是两个合同：重试通知继续负责在再次发
 
 ## 声明式前缀改写
 
-改写已发送前缀目前只有两类原因，由投影声明，而不是靠事后比对猜测（受信扩展的第三类见下一小节，尚未实现）：
+改写已发送前缀有三类原因，由投影声明，而不是靠事后比对猜测（第三类受信扩展改写见下一小节，合同已落地、钩子未接线）：
 
 | 原因 | 来源 | 声明方式 |
 | --- | --- | --- |
@@ -188,22 +188,28 @@ HTTP 观测与重试进度是两个合同：重试通知继续负责在再次发
 
 `HistoryProjection` 随请求冻结进 `ModelPromptFrame.historyProjection`。历史链哈希发现旧历史被改写时，`bind_lineage` 先按上表归因；没有任何计数增长的改写才是 `history_rewritten`，它表示前缀被意外破坏，会记录警告，应当视为缺陷而不是正常现象。模型/权限/Skill/工具面/压缩等其他断代原因保持原有的判定顺序。读取旧记录缺失该字段时按未声明处理。
 
-### 目标：扩展改写（`extension_rewrite`，未实现）
+### 扩展改写（`extension_rewrite`）
 
-受信扩展经 `context.assemble` 与 `compaction.before` 提出的受控历史改写（[插件系统设计](plugin-system-requirements-design.md) D5）是第三类声明式原因，同样由投影声明，而不是事后比对：
+受信扩展经 `context.assemble` 与 `compaction.before` 提出的受控历史改写（[插件系统设计](plugin-system-requirements-design.md) D5）是第三类声明式原因，同样由投影声明，而不是事后比对。**本合同已落地为失效原因、记录合同与唯一投影函数；扩展钩子本身尚未接线，因此生产中还没有任何扩展改写发生。**
 
 | 原因 | 来源 | 声明方式 |
 | --- | --- | --- |
-| `extension_rewrite` | 已授权 `contextRewrite` 的扩展改写已装配历史 | `HistoryProjection.extensionRewrites` 增长，每项含插件与贡献身份、改写范围、原文引用 |
+| `extension_rewrite` | 已授权 `contextRewrite` 的扩展改写已装配历史 | `HistoryProjection.extensionRewrites`（当前生效的改写记录集合）相对上一请求发生变化 |
 
-约束：
+与前两类“计数只增不减”不同，扩展改写以**生效集合是否变化**声明：新增、替换内容、扩展被停用而撤销，都会改变已发送前缀，都归因到该原因；因此 `bind_lineage` 对它的判定优先于另外两类，也不会产生 `history_rewritten` 警告。同一集合下继续追加新消息仍是正常追加，不构成新的失效。
 
-- 改写只发生在投影；canonical 日志与原文不变，原文引用可回溯。
-- 原生系统段、工具调用与结果的配对、压缩检查点边界不可改写；违反则拒绝该提案。
-- 未声明并获用户授权 `contextRewrite` 的扩展提交此类提案一律拒绝，不降级为未声明改写。
-- 每次改写都记录缓存代际变化，界面显示“扩展改写了历史，缓存已重建”及来源；`bind_lineage` 先按该原因归因，因此不会产生 `history_rewritten` 警告。
+每条记录（`ExtensionRewriteRecord`）含：插件身份、贡献身份、提案钩子、被替换区间 `[from, to)`（相对改写前的装配历史）、原文与替换内容的 SHA-256。记录随请求冻结进 `ModelPromptFrame.historyProjection`，因此重启后读回逐项相同。
+
+唯一投影是 `history_projection::apply_extension_rewrites`：输入原始装配历史，输出新的模型可见副本和记录，输出是（输入、授权、提案）的纯函数，实时视图与回合边界/重启后重建的视图逐字节一致。规则：
+
+- 只发生在投影；canonical 日志与原文不变，原文可由 `originalDigest` 回溯。
+- 只允许 `context.assemble` 与 `compaction.before` 两个钩子提案；插件必须已获用户授权 `contextRewrite`，否则**整批拒绝**，不降级为未声明改写，也不部分应用。
+- 被替换的区间只能是纯 user/assistant 对话文本：系统/项目/Skill/引用来源消息、工具调用与结果、带图片或提供方私有上下文的消息一律不可改写，因此工具调用与结果的配对不会被切断或丢失；`rewritable_from` 之前（系统段与压缩检查点边界）不可改写。
+- 替换内容必须是非空的纯 user/assistant 文本；区间不得为空、越界或重叠。
+- 每次改写在界面应显示“扩展改写了历史，缓存已重建”及来源（界面尚未实现，数据已具备：`invalidationReason = extension_rewrite` 与记录）。
 - 成本以供应商真实 usage 为准，不估算“本来可命中”的反事实费用。
-- 本合同实现并通过回归之前，插件系统不得开放这两个钩子的改写能力。
+
+**尚未做、也因此仍不得开放这两个钩子的改写**：提案与裁决的原生持久化（重启后要重放改写必须有持久的替换内容；当前记录只保存摘要）、`contextRewrite` 授权项进入清单与授权面板、ExtensionBus 对这两个钩子的接线，以及界面提示。
 
 ## 缓存核算
 
@@ -236,7 +242,7 @@ Magi 保持稳定的部分如果没有被读到，缺口归因到 provider 侧�
 | Context Authority / 对话装配器 | 源消息及其可信生命周期、history generation、compaction epoch |
 | Prompt IR compiler | 规范化正文、工具调用与 schema，向摘要和 renderer 提供同一套结构规则 |
 | History Projection | 模型可见历史的唯一纯函数投影：单条形态、文件事实、总预算，并声明对已有结果的改写量 |
-| ExtensionBus（目标） | 校验并裁决扩展的上下文贡献与改写提案，向 History Projection 声明 `extension_rewrite`；不生成缓存身份 |
+| ExtensionBus | 校验并裁决扩展的上下文贡献与改写提案，向 History Projection 声明 `extension_rewrite`（投影与归因已实现，钩子未接线）；不生成缓存身份 |
 | Tool Surface Authority | 工具目录、授权、规范化 schema、tool surface hash |
 | Prompt Lineage Authority | branch、provider scope、cache epoch、cache key、失效原因 |
 | Provider Adapter | IR → wire renderer、协议断点、usage parser |
@@ -252,7 +258,7 @@ Magi 保持稳定的部分如果没有被读到，缺口归因到 provider 侧�
 4. 将 Provider adapter 改为消费 IR，并为 Anthropic、Responses、Chat 和自定义代理分别实现 CacheContract。（已完成三种协议及未知代理的保守合同；未知能力仍不视为支持）
 5. 将账本升级为 logical call / transport attempt 两层，接入失效事件和统计页。 空响应、中断与补证控制提示已迁移到 `RequestControls`，重复恢复替换当前原因，得到可用输出后清除；已确认的片段仍沿 canonical 历史追加。探索停滞提醒由当前状态逐请求重建。逐 attempt 的 HTTP 证据、统计和重启补账已接入；辅助请求不创建虚构 Turn，使用独立持久传输事实。
 6. 通过连续对话、文件工具、worker、auxiliary、模型矩阵和真实 Anthropic 账号验收。当前生产代码已无 v1 键生成器；主线与辅助入口都调用同一个 lineage 算法。不得为等待真实账号验收保留第二套运行时缓存策略。
-7. （目标，未实现）为受信扩展的受控改写增加 `extension_rewrite` 失效原因与记录合同，实现位于 `history_projection` 的唯一投影中，并补齐归因、拒绝路径与重启重建的一致性回归；完成前不开放扩展改写。
+7. （已完成合同，钩子未接线）为受信扩展的受控改写增加 `extension_rewrite` 失效原因与记录合同，实现位于 `history_projection` 的唯一投影中，并有归因（新增、替换、撤销、追加）、拒绝路径与重启重建一致性的回归；开放扩展改写前仍须完成上文列出的持久化、授权项与接线。
 
 缓存预热、WebSocket continuation 和长期 TTL 暂不进入迁移；它们必须建立在 lineage、contract 和 cost ledger 稳定之后。
 
