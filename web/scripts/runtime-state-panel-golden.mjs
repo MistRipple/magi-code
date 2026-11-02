@@ -120,12 +120,6 @@ await withGoldenViteServer(async (server) => {
   assert.equal(panel.shouldShowRuntimePhase('idle', 'idle'), false);
   assert.equal(panel.shouldShowRuntimePhase('running', 'verify'), true);
 
-  assert.equal(panel.shouldShowRuntimeBudget('normal'), false);
-  assert.equal(panel.shouldShowRuntimeBudget(undefined), false);
-  assert.equal(panel.shouldShowRuntimeBudget('notice'), true);
-  assert.equal(panel.shouldShowRuntimeBudget('warning'), true);
-  assert.equal(panel.shouldShowRuntimeBudget('danger'), true);
-
   assert.equal(panel.shouldShowRuntimeCache('healthy'), false);
   assert.equal(panel.shouldShowRuntimeCache('cold'), false);
   assert.equal(panel.shouldShowRuntimeCache('degraded'), true);
@@ -139,6 +133,8 @@ await withGoldenViteServer(async (server) => {
     { completed: 2, failed: 1, running: 2, total: 5, percent: 40 },
   );
   assert.equal(panel.resolveRuntimeTaskProgress(undefined), null);
+  assert.equal(panel.resolveRuntimeTaskProgress({}), null, 'missing task counts remain unknown');
+  assert.equal(panel.resolveRuntimeTaskProgress({ requiredTotal: 0 }).total, 0, 'confirmed empty task counts remain zero');
 
   const runningRecords = conversationRecords.buildConversationRuntimeRecords([{
     key: 'latest-tool',
@@ -703,6 +699,38 @@ await withGoldenViteServer(async (server) => {
     workspacePath: '/workspace/runtime',
     sessionId: 'session-runtime-resumed',
   });
+  // 停止后能否继续只来自 daemon 读模型的 continuation，Web 不从轮次或任务状态推断。
+  const continuationPayload = (continuation) => ({
+    generatedAt: 1_700_000_003_000,
+    currentSession: { sessionId: 'session-runtime-continue', workspaceId: 'workspace-runtime', title: '继续', createdAt: 1, updatedAt: 2 },
+    sessions: [{ sessionId: 'session-runtime-continue', workspaceId: 'workspace-runtime', title: '继续', createdAt: 1, updatedAt: 2 }],
+    workspaces: [{ workspaceId: 'workspace-runtime', rootPath: '/workspace/runtime' }],
+    runtimeReadModel: {
+      details: {
+        sessions: [{
+          session_id: 'session-runtime-continue',
+          current_status: 'detached',
+          last_update: 2,
+          ...(continuation === undefined ? {} : { continuation }),
+        }],
+        tasks: [],
+      },
+    },
+    canonicalTurns: [{
+      sessionId: 'session-runtime-continue', turnId: 'turn-continue', turnSeq: 1,
+      acceptedAt: 1, completedAt: 2, status: 'failed',
+      items: [],
+    }],
+    recentEvents: [],
+  });
+  const continuationOf = (continuation) => rustContract.normalizeRustBootstrapPayload(
+    continuationPayload(continuation),
+    { workspaceId: 'workspace-runtime', workspacePath: '/workspace/runtime', sessionId: 'session-runtime-continue' },
+  ).orchestratorRuntimeState?.continuation;
+  assert.equal(continuationOf('resume_turn'), 'resume_turn');
+  assert.equal(continuationOf('resume_chain'), 'resume_chain');
+  assert.equal(continuationOf(undefined), undefined, '失败的轮次本身不足以让 Web 判定可继续');
+  assert.equal(continuationOf('restart'), undefined, '未知取值一律视为不可继续');
   assert.equal(
     resumed.orchestratorRuntimeState?.status,
     'completed',

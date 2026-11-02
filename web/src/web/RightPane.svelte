@@ -1,18 +1,23 @@
 <script lang="ts">
-import { rightPaneState, getRightPaneState, closeTab, setActiveRightPaneTab, updateRightPaneTabLabel, setRightPaneCollapsed, clearBrowserTabClosePending, markBrowserTabClosePending, type RightPaneTab, type CodeTabPayload, type AgentTabPayload, type BrowserTabPayload, type TerminalTabPayload, type PluginTabPayload, synchronizeBrowserSessionSnapshot, openTerminalTab, openPluginTab } from '../stores/right-pane.svelte';
+import { rightPaneState, getRightPaneState, closeTab, setActiveRightPaneTab, updateRightPaneTabLabel, setRightPaneCollapsed, clearBrowserTabClosePending, markBrowserTabClosePending, type RightPaneTab, type CodeTabPayload, type AgentTabPayload, type BrowserTabPayload, type TerminalTabPayload, type PluginTabPayload, synchronizeBrowserSessionSnapshot, openTerminalTab, openPluginTab, openCodeTab, openAgentTab, openLauncherTab, LAUNCHER_TAB_ID } from '../stores/right-pane.svelte';
+import { recentPaneItems, recordRecentPaneItem, forgetRecentPaneItem, recentCodeKey, recentWebKey, recordableWebUrl, type RecentPaneItem } from '../stores/right-pane-recent.svelte';
 import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession, getBrowserCapabilities, getAgentChangeDiff, getAgentFilePreview, isPublicTunnelAccess, type BrowserCapabilitiesSnapshot } from './agent-api';
   import FileName from '../components/FileName.svelte';
   import FileTypeIcon from '../components/FileTypeIcon.svelte';
   import { resolveComposerSourceFolder } from '../stores/composer-workspace.svelte';
   import { onMount, tick } from 'svelte';
   import Icon from '../components/Icon.svelte';
-  import { getAgentRunColor } from '../lib/agent-colors';
+  import { getAgentBrandInfo, getAgentRunColor } from '../lib/agent-colors';
+  import { selectLauncherAgents } from '../lib/active-agent-center';
+  import { getAgentRunState, selectAgentRun } from '../stores/agent-run-store.svelte';
   import MarkdownContent from '../components/MarkdownContent.svelte';
   import DiffCodeBlock from '../components/blocks/DiffCodeBlock.svelte';
   import AgentTabContent from '../components/tabs/AgentTabContent.svelte';
   import BrowserTabContent from '../components/tabs/BrowserTabContent.svelte';
   import TerminalTabContent from '../components/tabs/TerminalTabContent.svelte';
   import PluginTabContent from '../components/tabs/PluginTabContent.svelte';
+  import AgentListTabContent from '../components/tabs/AgentListTabContent.svelte';
+  import LauncherTabContent, { type LauncherAgent, type LauncherTool } from '../components/tabs/LauncherTabContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { highlightCode } from '../lib/code-highlighter';
   import {
@@ -126,16 +131,21 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     });
   });
 
+  // 右栏展开而没有任何 tab（例如恢复上次的展开状态）时默认打开新标签页。
+  // Desktop 的浏览器 Tab 由 BrowserAuthority 异步投影，先等权威快照到达，避免它们之前先冒出一个空白页。
+  $effect(() => {
+    if (paneState.collapsed || openTabs.length > 0) return;
+    if (desktopSurface && !paneState.browserAuthoritySynchronized) return;
+    openLauncherTab(paneScopeKey);
+  });
+
   function closePane(): void {
     setRightPaneCollapsed(paneScopeKey, true);
   }
   /** 「新增 → 浏览器」在途：只驱动按钮的 loading 表现。 */
   let creatingBrowserPane = $state(false);
   let browserCapabilities = $state<BrowserCapabilitiesSnapshot | null>(null);
-  let domAddPaneMenuOpen = $state(false);
-  let addPaneMenuElement = $state<HTMLDivElement | undefined>(undefined);
   const pluginManifests = $derived(pluginProjection(APPLICATION_PLUGIN_SCOPE).manifests);
-  const addPaneMenuOpen = $derived(domAddPaneMenuOpen);
   const canCreateBrowserPane = $derived(Boolean(
     desktopSurface
       && window.magiDesktop
@@ -153,20 +163,6 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
   function applyBrowserCapabilities(snapshot: BrowserCapabilitiesSnapshot): void {
     browserCapabilities = snapshot;
   }
-
-  // 新增菜单必须进入 Renderer Top Layer。普通绝对定位元素会被活动
-  // Browser Tab 的原生 webview 合成层覆盖，导致右栏其他功能无法操作。
-  // 菜单的开关、Escape 和外部点击统一交给 Chromium 原生 popover，避免
-  // Renderer 捕获层与菜单项 click 产生竞态。
-  $effect(() => {
-    const menu = addPaneMenuElement;
-    if (!menu) return;
-    if (addPaneMenuOpen) {
-      if (!menu.matches(':popover-open')) menu.showPopover?.();
-    } else if (menu.matches(':popover-open')) {
-      menu.hidePopover?.();
-    }
-  });
 
   $effect(() => {
     trackPluginProjection(APPLICATION_PLUGIN_SCOPE);
@@ -200,7 +196,6 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     window.addEventListener('magi:browserCapabilitiesChanged', handleCapabilitiesChanged);
     return () => {
       window.removeEventListener('magi:browserCapabilitiesChanged', handleCapabilitiesChanged);
-      domAddPaneMenuOpen = false;
     };
   });
 
@@ -247,39 +242,24 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     }
   }
 
-  function createTerminalPane(): void {
-    if (!canCreateTerminalPane) return;
-    openTerminalTab({
+  function createTerminalPane(): boolean {
+    if (!canCreateTerminalPane) return false;
+    return openTerminalTab({
       sourceFolderId: resolveComposerSourceFolder(rightPaneState.activeWorkspaceId || '', rightPaneState.activeSessionId)?.sourceFolderId,
       workspaceId: rightPaneState.activeWorkspaceId,
       workspacePath: workspaceRoot,
       sessionId: rightPaneState.activeSessionId,
-    });
+    }) !== null;
   }
 
-  type RightPaneCreationKind = 'browser' | 'terminal' | 'plugin' | 'managePlugins';
-  interface AddPaneItem {
-    /** 菜单项唯一键：多个插件视图共用 kind，不能用 kind 做 each 的 key。 */
-    key: string;
-    kind: RightPaneCreationKind;
-    label: string;
-    /** 次要说明（插件视图显示所属插件名）。 */
-    detail?: string;
-    icon: 'terminal' | 'globe' | 'plug';
-    enabled: boolean;
-    disabledReason: string;
-    /** 分组首项前画分隔线。 */
-    separatorBefore?: boolean;
-    pluginId?: string;
-    contributionId?: string;
-  }
+  type LauncherToolKind = 'browser' | 'terminal' | 'plugin' | 'managePlugins';
 
   const pluginViews = $derived.by(() => pluginManifests.flatMap((manifest) => manifest.contributions?.views?.filter((view) => view.placements.includes('rightPane')).map((view) => ({ manifest, view })) ?? []));
   const pluginViewNeedsSession = $derived(!rightPaneState.activeSessionId.trim());
-  const addablePaneKinds = $derived<AddPaneItem[]>([
+  const launcherTools = $derived<LauncherTool[]>([
     {
       key: 'terminal',
-      kind: 'terminal',
+      kind: 'terminal' satisfies LauncherToolKind,
       label: i18n.t('rightPane.addPanelTerminal'),
       icon: 'terminal',
       enabled: canCreateTerminalPane,
@@ -293,7 +273,7 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
       enabled: canCreateBrowserPane,
       disabledReason: browserDisabledReason,
     },
-    ...(pluginViewNeedsSession ? [] : pluginViews.map(({ manifest, view }, index): AddPaneItem => ({
+    ...(pluginViewNeedsSession ? [] : pluginViews.map(({ manifest, view }): LauncherTool => ({
       key: `plugin:${manifest.id}:${view.id}`,
       kind: 'plugin',
       label: view.title,
@@ -301,7 +281,6 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
       icon: 'plug',
       enabled: true,
       disabledReason: '',
-      separatorBefore: index === 0,
       pluginId: manifest.id,
       contributionId: view.id,
     }))),
@@ -312,32 +291,63 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
       icon: 'plug',
       enabled: true,
       disabledReason: '',
-      separatorBefore: true,
     },
   ]);
-  const canOpenAddPaneMenu = $derived(addablePaneKinds.length > 0);
+  /** 本会话正在做事的代理；数据来自代理运行投影，和运行中心同源，这里不另存状态。 */
+  const launcherAgents = $derived.by<LauncherAgent[]>(() => {
+    const sessionId = rightPaneState.activeSessionId.trim();
+    if (!sessionId) return [];
+    const projection = getAgentRunState(sessionId, rightPaneState.activeWorkspaceId).projection;
+    return selectLauncherAgents(projection?.agents ?? []).map((agent) => ({
+      agentRunId: agent.agentRunId,
+      label: agent.displayName.trim() || getAgentBrandInfo(agent.role, (key) => i18n.t(key)).label,
+      goal: agent.goal.trim(),
+      statusLabel: agent.statusLabel,
+      queued: agent.status === 'pending' || agent.lifecycle === 'queued',
+      color: getAgentRunColor(agent.agentRunId).color,
+    }));
+  });
 
-  function toggleAddPaneMenu(): void {
-    if (!canOpenAddPaneMenu) return;
-    domAddPaneMenuOpen = !domAddPaneMenuOpen;
+  function openLauncherAgent(agent: LauncherAgent): void {
+    const sessionId = rightPaneState.activeSessionId.trim();
+    if (!sessionId) return;
+    // 与运行中心打开代理的方式一致：先选中该次运行，再打开它的 tab。
+    selectAgentRun(sessionId, agent.agentRunId, rightPaneState.activeWorkspaceId, workspaceRoot);
+    openAgentTab(sessionId, agent.agentRunId, {
+      label: agent.label,
+      workspaceId: rightPaneState.activeWorkspaceId,
+      workspacePath: workspaceRoot,
+    });
+    closeLauncher();
   }
 
-  function handleAddPaneMenuToggle(event: ToggleEvent): void {
-    domAddPaneMenuOpen = event.newState === 'open';
+  /** 「+」直接新增（或回到）一个新标签页，不再先弹菜单。 */
+  function openLauncher(): void {
+    openLauncherTab(paneScopeKey);
   }
 
-  async function chooseAddPane(kind: RightPaneCreationKind, pluginId?: string, contributionId?: string): Promise<void> {
-    domAddPaneMenuOpen = false;
+  /** 选定后新标签页自己退场：目标面板已经打开并激活，空白页不再有用。 */
+  function closeLauncher(): void {
+    closeTab(paneScopeKey, LAUNCHER_TAB_ID);
+  }
+
+  function browserCreationScope() {
+    return {
+      workspaceId: rightPaneState.activeWorkspaceId.trim(),
+      workspacePath: workspaceRoot.trim(),
+      sessionId: rightPaneState.activeSessionId.trim(),
+    };
+  }
+
+  async function chooseLauncherTool(tool: LauncherTool): Promise<void> {
+    const kind = tool.kind as LauncherToolKind;
     if (kind === 'browser') {
       // 与消息里的链接共用同一个创建入口；空白页不参与同 URL 复用。
       if (creatingBrowserPane) return;
       creatingBrowserPane = true;
       try {
-        await openUrlInRightPaneBrowser('about:blank', {
-          workspaceId: rightPaneState.activeWorkspaceId.trim(),
-          workspacePath: workspaceRoot.trim(),
-          sessionId: rightPaneState.activeSessionId.trim(),
-        });
+        await openUrlInRightPaneBrowser('about:blank', browserCreationScope());
+        closeLauncher();
       } finally {
         creatingBrowserPane = false;
       }
@@ -348,11 +358,74 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
       return;
     }
     if (kind === 'plugin') {
-      const item = pluginViews.find(({ manifest, view }) => manifest.id === pluginId && view.id === contributionId);
-      if (item) openPluginTab({ pluginId: item.manifest.id, contributionId: item.view.id, entry: item.view.entry, label: `${item.manifest.name}: ${item.view.title}`, workspaceId: rightPaneState.activeWorkspaceId, workspacePath: workspaceRoot, sessionId: rightPaneState.activeSessionId });
+      const item = pluginViews.find(({ manifest, view }) => manifest.id === tool.pluginId && view.id === tool.contributionId);
+      if (item) {
+        openPluginTab({ pluginId: item.manifest.id, contributionId: item.view.id, entry: item.view.entry, label: `${item.manifest.name}: ${item.view.title}`, workspaceId: rightPaneState.activeWorkspaceId, workspacePath: workspaceRoot, sessionId: rightPaneState.activeSessionId });
+        closeLauncher();
+      }
       return;
     }
-    createTerminalPane();
+    if (createTerminalPane()) closeLauncher();
+  }
+
+  async function openRecent(item: RecentPaneItem): Promise<void> {
+    if (item.kind === 'code') {
+      openCodeTab(item.sessionId ?? rightPaneState.activeSessionId, item.filepath, {
+        label: item.label,
+        displayPath: item.displayPath,
+        sourceFolderId: item.sourceFolderId,
+        workspaceId: item.workspaceId,
+        workspacePath: item.workspacePath,
+        sessionId: item.sessionId,
+      });
+      forgetRecentPaneItem(paneScopeKey, item.key);
+      closeLauncher();
+      return;
+    }
+    if (creatingBrowserPane || !canCreateBrowserPane) return;
+    creatingBrowserPane = true;
+    try {
+      await openUrlInRightPaneBrowser(item.url, browserCreationScope());
+      forgetRecentPaneItem(paneScopeKey, item.key);
+      closeLauncher();
+    } finally {
+      creatingBrowserPane = false;
+    }
+  }
+
+  /** 用户关闭文件或网页时记入「最近」；自动收敛的变更对比页不记。 */
+  function rememberClosedTab(tab: RightPaneTab): void {
+    const at = Date.now();
+    if (tab.kind === 'code') {
+      const payload = tab.payload as CodeTabPayload;
+      if (payload.isChangeDiff || payload.diff) return;
+      recordRecentPaneItem(paneScopeKey, {
+        kind: 'code',
+        key: recentCodeKey(payload.sourceFolderId, payload.filepath),
+        label: tab.label,
+        filepath: payload.filepath,
+        displayPath: payload.displayPath,
+        sourceFolderId: payload.sourceFolderId,
+        workspaceId: payload.workspaceId,
+        workspacePath: payload.workspacePath,
+        sessionId: payload.sessionId,
+        at,
+      });
+    } else if (tab.kind === 'browser') {
+      const payload = tab.payload as BrowserTabPayload;
+      const url = recordableWebUrl(payload.url);
+      if (!url) return;
+      recordRecentPaneItem(paneScopeKey, {
+        kind: 'web',
+        key: recentWebKey(url),
+        label: tab.label,
+        url,
+        workspaceId: payload.workspaceId,
+        workspacePath: payload.workspacePath,
+        sessionId: payload.sessionId || undefined,
+        at,
+      });
+    }
   }
   const activeTab = $derived.by<RightPaneTab | null>(() => {
     const scopeKey = rightPaneState.activeScopeKey;
@@ -824,11 +897,15 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
 
   function tabLabel(tab: RightPaneTab): string {
     if (tab.kind === 'terminal') return i18n.t('terminalPanel.title');
+    if (tab.kind === 'launcher') return i18n.t('rightPane.newTab');
+    if (tab.kind === 'agents') return i18n.t('rightPane.agents.title');
     return tab.label;
   }
 
-  function tabIcon(tab: RightPaneTab): 'chevron-right' | 'globe' | 'terminal' {
+  function tabIcon(tab: RightPaneTab): 'chevron-right' | 'globe' | 'terminal' | 'plus' | 'bot' {
     if (tab.kind === 'browser') return 'globe';
+    if (tab.kind === 'agents') return 'bot';
+    if (tab.kind === 'launcher') return 'plus';
     return tab.kind === 'terminal' ? 'terminal' : 'chevron-right';
   }
 
@@ -878,6 +955,7 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     event.stopPropagation();
     if (recentlyDragged()) return;
     const tab = openTabs.find((item) => item.id === tabId);
+    if (tab) rememberClosedTab(tab);
     closeTab(paneScopeKey, tabId);
     if (tab?.kind === 'browser') {
       const browserPayload = tab.payload as BrowserTabPayload;
@@ -1040,59 +1118,20 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
         </div>
       {/each}
     </div>
-    {#if canOpenAddPaneMenu}
-      <div class="right-pane-add-wrap">
-        <button
+    <div class="right-pane-add-wrap">
+      <button
         type="button"
         class="right-pane-add-tab"
         data-open-tab-count={openTabs.length}
-          onclick={toggleAddPaneMenu}
-          disabled={!canOpenAddPaneMenu}
-          title={i18n.t('rightPane.addPanel')}
-          aria-label={i18n.t('rightPane.addPanel')}
-          aria-haspopup="menu"
-          aria-expanded={addPaneMenuOpen}
-          aria-busy={creatingBrowserPane}
-        >
-          <Icon name={creatingBrowserPane ? 'loader' : 'plus'} size={14} />
-        </button>
-      </div>
-    {/if}
+        onclick={openLauncher}
+        title={i18n.t('rightPane.addPanel')}
+        aria-label={i18n.t('rightPane.addPanel')}
+        aria-busy={creatingBrowserPane}
+      >
+        <Icon name={creatingBrowserPane ? 'loader' : 'plus'} size={14} />
+      </button>
+    </div>
   </header>
-
-  <div
-    bind:this={addPaneMenuElement}
-    class="right-pane-add-menu-row"
-    popover="auto"
-    ontoggle={handleAddPaneMenuToggle}
-    aria-hidden={!addPaneMenuOpen}
-  >
-      <div class="right-pane-add-menu" role="menu" aria-label={i18n.t('rightPane.addPanel')}>
-        {#each addablePaneKinds as item (item.key)}
-          <button
-            type="button"
-            class="right-pane-add-menu-item"
-            class:right-pane-add-menu-item--separated={item.separatorBefore}
-            role="menuitem"
-            disabled={!item.enabled}
-            title={item.enabled ? item.label : item.disabledReason}
-            data-kind={item.kind}
-            data-plugin-id={item.pluginId}
-            data-contribution-id={item.contributionId}
-            onclick={() => chooseAddPane(item.kind, item.pluginId, item.contributionId)}
-          >
-            <Icon name={item.icon} size={14} />
-            <span>{item.label}</span>
-            {#if item.detail}
-              <span class="right-pane-add-menu-reason">{item.detail}</span>
-            {/if}
-            {#if !item.enabled}
-              <span class="right-pane-add-menu-reason">{item.disabledReason}</span>
-            {/if}
-          </button>
-        {/each}
-      </div>
-  </div>
 
   <!-- 当前 code tab 的副标题：路径 + 文档预览操作 -->
   {#if activeTab && activeTab.kind === 'code'}
@@ -1138,6 +1177,20 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     </div>
   {/if}
 
+{#snippet launcherPage()}
+    <LauncherTabContent
+      tools={launcherTools}
+      agents={launcherAgents}
+      recent={recentPaneItems(paneScopeKey)}
+      webAvailable={canCreateBrowserPane}
+      webUnavailableReason={browserDisabledReason}
+      busy={creatingBrowserPane}
+      onChooseTool={(tool) => void chooseLauncherTool(tool)}
+      onOpenAgent={openLauncherAgent}
+      onOpenRecent={(item) => void openRecent(item)}
+    />
+{/snippet}
+
   <!-- Body：浏览器 guest 始终保留在右栏内容槽中，只切换显示状态。
        切换代码、图片、终端或 Agent 时不销毁 Chromium 文档和会话。 -->
   <div
@@ -1177,11 +1230,8 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
 
 
     {#if !activeTab}
-      <div class="right-pane-state">
-        <Icon name="sidebar-toggle" size={22} />
-        <span>{i18n.t('rightPane.empty.title')}</span>
-        <span class="right-pane-meta-line">{i18n.t('rightPane.empty.hint')}</span>
-      </div>
+      <!-- 正常情况下展开的右栏总有一个新标签页 tab；这里只覆盖 Desktop 等待浏览器快照期间没有 tab 的瞬间，避免闪出空白。 -->
+      {@render launcherPage()}
     {:else if activeTab.kind === 'agent'}
       {@const agentPayload = activeTab.payload as AgentTabPayload}
       <AgentTabContent
@@ -1203,6 +1253,10 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
       {/key}
     {:else if activeTab.kind === 'browser'}
       <!-- BrowserTabContent 已在上方的内容槽中渲染；这里不能再进入文件预览分支。 -->
+    {:else if activeTab.kind === 'launcher'}
+      {@render launcherPage()}
+    {:else if activeTab.kind === 'agents'}
+      <AgentListTabContent />
     {:else if activeTab.kind === 'plugin'}
       {@const pluginPayload = activeTab.payload as PluginTabPayload}
       <PluginTabContent
@@ -1369,6 +1423,8 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
 
   /* ============ Tab 条 ============ */
   .right-pane-tabbar {
+    --tab-inset: var(--space-2);
+    --tab-radius: max(0px, calc(var(--radius-lg) - var(--tab-inset)));
     position: relative;
     z-index: 1;
     display: flex;
@@ -1377,7 +1433,7 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     height: 38px;
     flex-shrink: 0;
     background: transparent;
-    padding-right: var(--space-2);
+    padding-inline-end: var(--space-2);
   }
 
   .right-pane-tabs {
@@ -1396,11 +1452,10 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
 
   .right-pane-tabbar--overlay {
     gap: 4px;
-    padding: 0 6px;
+    padding: 0 var(--space-2);
   }
 
   .right-pane-add-tab {
-    anchor-name: --right-pane-add-anchor;
     flex: 0 0 auto;
     align-self: center;
     width: 28px;
@@ -1422,77 +1477,6 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     flex: 0 0 auto;
     display: flex;
     align-items: center;
-  }
-
-  .right-pane-add-menu-row {
-    position: fixed;
-    position-anchor: --right-pane-add-anchor;
-    top: calc(anchor(bottom) + 4px);
-    left: calc(anchor(right) - 6px);
-    z-index: 1200;
-    display: block;
-    box-sizing: border-box;
-    width: min(240px, calc(100% - 12px));
-    min-width: 0;
-    margin: 0;
-    pointer-events: auto;
-    transform: translateX(-100%);
-  }
-  .right-pane-add-menu-row:not(:popover-open) { display: none; }
-
-  .right-pane-add-menu {
-    width: min(240px, 100%);
-    min-width: min(168px, 100%);
-    box-sizing: border-box;
-    padding: 4px;
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: calc(var(--radius-sm) + 4px);
-    background: var(--dropdown-bg);
-    box-shadow: var(--shadow-lg);
-  }
-
-  /* 图标 + 名称在第一行，不可用原因在名称下方换行显示：原因文案较长，
-     和名称挤在同一行只会撑出菜单。 */
-  .right-pane-add-menu-item {
-    width: 100%;
-    min-height: 32px;
-    padding: 6px 8px;
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr);
-    align-items: center;
-    column-gap: 8px;
-    row-gap: 2px;
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground);
-    font: inherit;
-    text-align: left;
-    cursor: pointer;
-  }
-
-  .right-pane-add-menu-item:hover:not(:disabled),
-  .right-pane-add-menu-item:focus-visible {
-    background: var(--surface-hover);
-  }
-
-  .right-pane-add-menu-reason {
-    grid-column: 2;
-    color: var(--muted-foreground);
-    font-size: var(--text-xs);
-    line-height: 1.4;
-    white-space: normal;
-    overflow-wrap: anywhere;
-  }
-
-  .right-pane-add-menu-item--separated {
-    border-top: var(--magi-hairline) solid var(--border-subtle);
-    margin-top: 4px;
-    padding-top: 8px;
-  }
-  .right-pane-add-menu-item:disabled {
-    opacity: 0.45;
-    cursor: default;
   }
 
   .right-pane-add-tab:hover:not(:disabled),
@@ -1544,7 +1528,8 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     flex: 0 0 auto;
     max-width: 180px;
     min-width: 90px;
-    padding: 0 var(--space-3) 0 var(--space-4);
+    padding-block: 0;
+    padding-inline: calc(var(--tab-inset) + var(--space-3));
     height: 100%;
     display: inline-flex;
     align-items: center;
@@ -1556,27 +1541,67 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     font-weight: var(--font-medium);
     cursor: pointer;
     position: relative;
-    border-right: var(--magi-hairline) solid var(--border-subtle);
-    transition: background var(--transition-fast), color var(--transition-fast);
+    isolation: isolate;
+    transition: color var(--transition-fast);
+  }
+
+  /* 选中与悬停的「气泡」是内缩的视觉层；tab 本身仍占满整条高度，作为完整的点击热区。 */
+  .right-pane-tab::before {
+    content: '';
+    position: absolute;
+    inset: var(--tab-inset);
+    z-index: -1;
+    border-radius: var(--tab-radius);
+    background: transparent;
+    transition: background var(--transition-fast), box-shadow var(--transition-fast);
+  }
+
+  /* 未选中的 tab 之间只留一条很短的淡分隔线，不再用整高的竖线切开。 */
+  .right-pane-tab::after {
+    content: '';
+    position: absolute;
+    right: 0;
+    top: 50%;
+    width: 1px;
+    height: 14px;
+    transform: translateY(-50%);
+    background: var(--border-subtle);
+    transition: opacity var(--transition-fast);
+  }
+
+  /* 与气泡相邻、最后一个 tab 以及被悬停的 tab 两侧不显示分隔线，避免线贴着气泡边缘。 */
+  .right-pane-tab:last-child::after,
+  .right-pane-tab.active::after,
+  .right-pane-tab:has(+ .right-pane-tab.active)::after,
+  .right-pane-tab:hover::after,
+  .right-pane-tab:has(+ .right-pane-tab:hover)::after {
+    opacity: 0;
   }
 
   .right-pane-tab:hover {
-    background: var(--surface-hover);
     color: var(--foreground);
   }
 
+  .right-pane-tab:hover::before {
+    background: var(--surface-2);
+  }
+
   .right-pane-tab.active {
-    background: var(--surface-1);
     color: var(--foreground);
     font-weight: var(--font-semibold);
   }
 
   .right-pane-tab.active::before {
-    content: '';
-    position: absolute;
-    left: 0; right: 0; top: 0;
-    height: 2px;
-    background: var(--tab-accent, var(--primary));
+    background: var(--surface-3);
+    box-shadow: inset 0 0 0 1px var(--border-subtle);
+  }
+
+  .right-pane-tab:focus-visible {
+    outline: none;
+  }
+
+  .right-pane-tab:focus-visible::before {
+    box-shadow: inset 0 0 0 2px var(--primary);
   }
 
   .right-pane-tab-icon {

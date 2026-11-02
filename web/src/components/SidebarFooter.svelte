@@ -51,21 +51,30 @@
 
 <style>
   .sidebar-footer {
+    --btn-height-md: var(--btn-height-lg);
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    gap: var(--space-2);
+    gap: var(--space-3);
+    min-inline-size: 0;
     flex-shrink: 0;
     /* 分隔线与侧栏底缘之间上下等距：内容居中。侧栏自身有底部内边距，
        用等量负外边距把它让出来，再由这里的 padding 重新分配。 */
     padding: var(--space-3) 0;
-    margin-bottom: calc(var(--space-4) * -1);
+    margin-block-end: calc(var(--space-4) * -1);
     border-top: var(--magi-hairline) solid color-mix(in srgb, var(--border) 60%, transparent);
   }
 
   .sidebar-footer-tools {
     display: flex;
     align-items: center;
-    gap: var(--space-1);
+    flex: 0 0 auto;
+    gap: var(--space-2);
+  }
+
+  @media (hover: none), (pointer: coarse) {
+    .sidebar-footer { --btn-height-md: 44px; }
+    .sidebar-footer-tools { gap: var(--space-3); }
   }
 </style>

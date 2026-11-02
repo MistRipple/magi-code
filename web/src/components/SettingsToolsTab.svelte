@@ -945,9 +945,7 @@
                       <div class="mcp-tools-header">
                         <div class="mcp-tools-heading">
                           <span>{i18n.t('settings.tools.toolList')}</span>
-                          {#if mcpServerTools[server.id]?.length}
-                            <span class="mcp-tools-count">{mcpServerTools[server.id].length}</span>
-                          {/if}
+                          <span class="mcp-tools-count">{mcpServerTools[server.id]?.length ?? '—'}</span>
                         </div>
                         <button class="btn-icon btn-icon--sm" class:refreshing={mcpRefreshingServers.has(server.id)} title={i18n.t('settings.tools.refreshTools')}
                           onclick={() => refreshMCPTools(server.id)} disabled={mcpRefreshingServers.has(server.id)}>
@@ -1056,7 +1054,7 @@
                     <p class="skill-desc" title={skill.description}>{skill.description || i18n.t('settings.tools.skillNoDescription')}</p>
                     {#if skill.source !== 'custom'}
                       <div class="skill-meta">
-                        {#if skill.version}<span>{i18n.t('settings.tools.skillVersion', { version: skill.version })}</span>{/if}
+                        <span>{i18n.t('settings.tools.skillVersion', { version: skill.version || i18n.t('common.notProvided') })}</span>
                         {#if skill.repositoryName}<span title={skill.repositoryName}>{skill.repositoryName}</span>{/if}
                         <span>{skill.lastCheckedAt
                           ? i18n.t('settings.tools.skillCheckedAt', { time: formatSkillCheckedAt(skill.lastCheckedAt) })

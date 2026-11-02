@@ -1135,29 +1135,30 @@
         <span class="kp-spinner"><Icon name="loader" size={20} /></span>
         <span>{i18n.t('knowledge.loading')}</span>
       </div>
-    {:else if currentTab === 'overview'}
+    {/if}
+    {#if currentTab === 'overview'}
       <!-- 概览 -->
       <div class="kp-overview">
         <!-- 紧凑统计条 -->
         <div class="kp-stats-row">
           <div class="kp-stat">
-            <span class="kp-stat-value">{fileCount.toLocaleString(i18n.locale)}</span>
+            <span class="kp-stat-value">{isLoading || loadError ? '—' : fileCount.toLocaleString(i18n.locale)}</span>
             <span class="kp-stat-label">{i18n.t('knowledge.overview.files')}</span>
           </div>
           <div class="kp-stat">
-            <span class="kp-stat-value">{totalLines.toLocaleString(i18n.locale)}</span>
+            <span class="kp-stat-value">{isLoading || loadError ? '—' : totalLines.toLocaleString(i18n.locale)}</span>
             <span class="kp-stat-label">{i18n.t('knowledge.overview.lines')}</span>
           </div>
           <div class="kp-stat">
-            <span class="kp-stat-value">{adrs.length}</span>
+            <span class="kp-stat-value">{isLoading || loadError ? '—' : adrs.length}</span>
             <span class="kp-stat-label">{i18n.t('knowledge.overview.adr')}</span>
           </div>
           <div class="kp-stat">
-            <span class="kp-stat-value">{faqs.length}</span>
+            <span class="kp-stat-value">{isLoading || loadError ? '—' : faqs.length}</span>
             <span class="kp-stat-label">{i18n.t('knowledge.overview.faq')}</span>
           </div>
           <div class="kp-stat">
-            <span class="kp-stat-value">{learnings.length}</span>
+            <span class="kp-stat-value">{isLoading || loadError ? '—' : learnings.length}</span>
             <span class="kp-stat-label">{i18n.t('knowledge.tabs.learning')}</span>
           </div>
         </div>
@@ -1256,7 +1257,7 @@
         {/if}
       </div>
 
-    {:else if currentTab === 'graph'}
+    {:else if !isLoading && currentTab === 'graph'}
       <KnowledgeGraphPanel
         payload={graphPayload as { status?: 'indexing' | 'ready' | 'empty' | 'failed'; reasonCode?: string | null; nodes?: unknown[]; edges?: unknown[]; stats?: Record<string, number>; truncated?: boolean } | null}
         knowledgeOptions={[
@@ -1277,7 +1278,7 @@
         onDeleteRelation={removeKnowledgeRelation}
       />
 
-    {:else if currentTab === 'adr'}
+    {:else if !isLoading && currentTab === 'adr'}
       <!-- ADR Tab -->
       <div class="kp-list">
         {#if filteredAdrs.length === 0}
@@ -1337,7 +1338,7 @@
         {/if}
       </div>
 
-    {:else if currentTab === 'faq'}
+    {:else if !isLoading && currentTab === 'faq'}
       <!-- FAQ Tab -->
       <div class="kp-list">
         {#if filteredFaqs.length === 0}
@@ -1397,7 +1398,7 @@
         {/if}
       </div>
 
-    {:else if currentTab === 'learning'}
+    {:else if !isLoading && currentTab === 'learning'}
       <!-- Learning Tab -->
       <div class="kp-list">
         {#if filteredLearnings.length === 0}

@@ -53,6 +53,27 @@ const USER_ITEM_ID = 'user-bridge-live-adopt';
 const ACCEPTED_AT = 1780390000000;
 const RUNTIME_EPOCH = 'bridge-golden-runtime';
 const EVENT_STREAM_NEXT_SEQUENCE = 10;
+
+function verifyUsageNotifications(send) {
+  const notified = [];
+  const listener = event => notified.push(event.detail.sessionId);
+  window.addEventListener('magi:usageChanged', listener);
+  try {
+    for (const [index, [role, sessionId]] of [
+      ['orchestrator', SESSION_ID], ['worker', SESSION_ID], ['worker', 'background-stats-session'],
+    ].entries()) {
+      send({ event_id: `stats-${role}-${index}`, event_type: 'model.usage.recorded', category: 'usage',
+        occurred_at: ACCEPTED_AT, sequence: 0, session_id: sessionId, workspace_id: WORKSPACE_ID,
+        payload: { sessionId, executionBinding: { role } } });
+    }
+    send({ event_id: 'stats-global-reset', event_type: 'usage.stats.reset', category: 'usage',
+      occurred_at: ACCEPTED_AT, sequence: 0, payload: {} });
+    assert.deepEqual(notified, [SESSION_ID, SESSION_ID, 'background-stats-session', ''],
+      'main, worker, background session and global reset must notify statistics consumers');
+  } finally {
+    window.removeEventListener('magi:usageChanged', listener);
+  }
+}
 let acceptedPublished = false;
 let terminalPublished = false;
 let summaryMessageCount = 1;
@@ -1217,6 +1238,7 @@ await withGoldenViteServer(async (server) => {
   );
   const recoveredStream = FakeEventSource.instances.at(-1);
   recoveredStream.onopen?.();
+  verifyUsageNotifications(event => recoveredStream.onmessage?.({ data: JSON.stringify(event) }));
 
   // 不打开后台工作区，也必须更新其目录；突发通知按工作区合并。
   const directoryWorkspaceId = 'workspace-never-opened';
@@ -3315,6 +3337,9 @@ await withGoldenViteServer(async (server) => {
   );
   replyWebSocket(electronSocket, lastWebSocketRequest(electronSocket, 'events/subscribe'), appServerSubscribeResult());
   await new Promise((resolve) => setTimeout(resolve, 0));
+  verifyUsageNotifications(event => electronSocket.message({
+    jsonrpc: '2.0', method: `event/${event.event_type}`, params: { sequence: 0, event },
+  }));
   const appServerSocketCountAfterFirst = FakeWebSocket.instances.length;
   const initializeCountAfterFirst = electronSocket.sent.filter((message) => message.method === 'initialize').length;
   const subscribeCountAfterFirst = electronSocket.sent.filter((message) => message.method === 'events/subscribe').length;

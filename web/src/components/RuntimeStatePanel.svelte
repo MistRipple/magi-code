@@ -15,7 +15,6 @@
     resolveRuntimeTaskProgress,
     resolveRuntimePanelStatus,
     runtimeAssignmentIsActive,
-    shouldShowRuntimeBudget,
     shouldShowRuntimePanel,
     shouldShowRuntimePhase,
   } from '../lib/runtime-state-panel';
@@ -110,9 +109,6 @@
     return names.slice(0, 4).join('、');
   });
   const summaryEntries = $derived.by(() => {
-    if (!runtimeState) {
-      return [] as Array<{ label: string; value: string }>;
-    }
     const entries: Array<{ label: string; value: string }> = [];
     if (executionGroupSummary?.title) {
       entries.unshift({
@@ -132,10 +128,8 @@
         value: activeWorkerSummary,
       });
     }
-    if (runtimeState.startedAt) {
-      entries.push({ label: i18n.t('runtimeState.summary.startedAt'), value: formatDateTime(runtimeState.startedAt) });
-    }
-    const statusReason = sanitizeRuntimeDisplayText(runtimeState.statusReason);
+    entries.push({ label: i18n.t('runtimeState.summary.startedAt'), value: runtimeState?.startedAt != null ? formatDateTime(runtimeState.startedAt) : '--' });
+    const statusReason = sanitizeRuntimeDisplayText(runtimeState?.statusReason);
     if (statusReason) {
       entries.push({ label: i18n.t('runtimeState.summary.reason'), value: statusReason });
     }
@@ -299,17 +293,7 @@
   });
 
   const taskProgress = $derived(resolveRuntimeTaskProgress(runtimeState?.runtimeSnapshot));
-  const visibleMetrics = $derived.by(() => {
-    const snapshot = runtimeState?.runtimeSnapshot;
-    if (!snapshot) return false;
-    return Boolean(
-      (taskProgress && taskProgress.total > 0)
-      || ((snapshot.reviewState?.total ?? 0) > 0)
-      || ((snapshot.blockerState?.open ?? 0) > 0)
-      || ((snapshot.blockerState?.externalWaitOpen ?? 0) > 0)
-      || shouldShowRuntimeBudget(snapshot.budgetState?.warningLevel),
-    );
-  });
+  const snap = $derived(runtimeState?.runtimeSnapshot);
   const panelVisible = $derived(shouldShowRuntimePanel({
     status: effectiveStatus,
     isProcessing: canonicalProcessingActive,
@@ -475,7 +459,7 @@
   }
 
   function formatDuration(ms: number | undefined): string {
-    if (!ms || !Number.isFinite(ms)) return '--';
+    if (ms == null || !Number.isFinite(ms)) return '--';
     if (ms < 1000) return `${ms}ms`;
     const s = Math.round(ms / 1000);
     if (s < 60) return `${s}s`;
@@ -830,66 +814,56 @@
         </div>
       {/if}
 
-      {#if runtimeState?.runtimeSnapshot && visibleMetrics}
-        {@const snap = runtimeState.runtimeSnapshot}
         <div class="metrics-grid">
-          {#if taskProgress && taskProgress.total > 0}
             <div class="metric-card">
               <div class="metric-card__header">
                 <Icon name="list" size={12} class="metric-card__icon" />
                 <span class="metric-card__title">{i18n.t('runtimeDiagnostics.taskProgress')}</span>
               </div>
-              <div class="metric-card__value">{taskProgress.completed}/{taskProgress.total}</div>
+              <div class="metric-card__value">{taskProgress?.completed ?? '--'}/{taskProgress?.total ?? '--'}</div>
               <div class="progress-bar">
-                <div class="progress-bar__fill" style="width: {taskProgress.percent}%"></div>
+                <div class="progress-bar__fill" style="width: {taskProgress?.percent ?? 0}%"></div>
               </div>
-              {#if taskProgress.failed > 0}
+              {#if taskProgress && taskProgress.failed > 0}
                 <div class="metric-card__sub metric-card__sub--warn">{i18n.t('runtimeDiagnostics.failedCount', { count: taskProgress.failed })}</div>
               {/if}
             </div>
-          {/if}
-
-          {#if snap.reviewState && (snap.reviewState.total ?? 0) > 0}
             <div class="metric-card">
               <div class="metric-card__header">
                 <Icon name="check-circle" size={12} class="metric-card__icon" />
                 <span class="metric-card__title">{i18n.t('runtimeDiagnostics.review')}</span>
               </div>
               <div class="metric-card__value">
-                {snap.reviewState.accepted ?? 0}/{snap.reviewState.total ?? 0}
+                {snap?.reviewState?.accepted ?? '--'}/{snap?.reviewState?.total ?? '--'}
               </div>
               <div class="metric-card__sub"
-                   class:metric-card__sub--ok={(snap.reviewState.accepted ?? 0) >= (snap.reviewState.total ?? 0) && (snap.reviewState.total ?? 0) > 0}>
-                {#if (snap.reviewState.accepted ?? 0) >= (snap.reviewState.total ?? 0) && (snap.reviewState.total ?? 0) > 0}
+                   class:metric-card__sub--ok={snap?.reviewState?.accepted != null && snap.reviewState.total != null && snap.reviewState.accepted >= snap.reviewState.total && snap.reviewState.total > 0}>
+                {#if snap?.reviewState?.accepted != null && snap.reviewState.total != null && snap.reviewState.accepted >= snap.reviewState.total && snap.reviewState.total > 0}
                   {i18n.t('runtimeDiagnostics.allPassed')}
-                {:else}
+                {:else if (snap?.reviewState?.total ?? 0) > 0}
                   {i18n.t('runtimeDiagnostics.inProgress')}
+                {:else}
+                  —
                 {/if}
               </div>
             </div>
-          {/if}
-
-          {#if snap.blockerState && ((snap.blockerState.open ?? 0) > 0 || (snap.blockerState.externalWaitOpen ?? 0) > 0)}
             <div class="metric-card">
               <div class="metric-card__header">
-                <Icon name={(snap.blockerState.open ?? 0) > 0 ? 'alert-triangle' : 'check-circle'} size={12} class="metric-card__icon" />
+                <Icon name={(snap?.blockerState?.open ?? 0) > 0 ? 'alert-triangle' : 'check-circle'} size={12} class="metric-card__icon" />
                 <span class="metric-card__title">{i18n.t('runtimeDiagnostics.blocker')}</span>
               </div>
               <div class="metric-card__value"
-                   class:metric-card__value--warn={(snap.blockerState.open ?? 0) > 0}>
-                {snap.blockerState.open ?? 0}
+                   class:metric-card__value--warn={(snap?.blockerState?.open ?? 0) > 0}>
+                {snap?.blockerState?.open ?? '--'}
               </div>
-              {#if (snap.blockerState.externalWaitOpen ?? 0) > 0}
+              {#if (snap?.blockerState?.externalWaitOpen ?? 0) > 0}
                 <div class="metric-card__sub metric-card__sub--warn">
-                  {i18n.t('runtimeDiagnostics.externalWait', { count: snap.blockerState.externalWaitOpen ?? 0 })}
+                  {i18n.t('runtimeDiagnostics.externalWait', { count: snap?.blockerState?.externalWaitOpen ?? 0 })}
                 </div>
-              {:else}
+              {:else if snap?.blockerState?.open === 0}
                 <div class="metric-card__sub metric-card__sub--ok">{i18n.t('runtimeDiagnostics.noBlocker')}</div>
               {/if}
             </div>
-          {/if}
-
-          {#if snap.budgetState && shouldShowRuntimeBudget(snap.budgetState.warningLevel)}
             <div class="metric-card">
               <div class="metric-card__header">
                 <Icon name="clock" size={12} class="metric-card__icon" />
@@ -897,48 +871,37 @@
               </div>
               <div
                 class="metric-card__value"
-                class:metric-card__value--notice={resolveBudgetTone(snap.budgetState.warningLevel) === 'notice'}
-                class:metric-card__value--warn={resolveBudgetTone(snap.budgetState.warningLevel) === 'warning' || resolveBudgetTone(snap.budgetState.warningLevel) === 'danger'}
+                class:metric-card__value--notice={resolveBudgetTone(snap?.budgetState?.warningLevel) === 'notice'}
+                class:metric-card__value--warn={resolveBudgetTone(snap?.budgetState?.warningLevel) === 'warning' || resolveBudgetTone(snap?.budgetState?.warningLevel) === 'danger'}
               >
-                {formatDuration(snap.budgetState.elapsedMs)}
+                {formatDuration(snap?.budgetState?.elapsedMs)}
               </div>
-              {#if snap.budgetState.usageRatio != null}
                 <div class="progress-bar">
                   <div
-                    class={`progress-bar__fill ${resolveBudgetFillClass(snap.budgetState.warningLevel)}`}
-                    style="width: {Math.max(0, Math.min(100, Math.round((snap.budgetState.usageRatio ?? 0) * 100)))}%"
+                    class={`progress-bar__fill ${resolveBudgetFillClass(snap?.budgetState?.warningLevel)}`}
+                    style="width: {Math.max(0, Math.min(100, Math.round((snap?.budgetState?.usageRatio ?? 0) * 100)))}%"
                   ></div>
                 </div>
-              {/if}
               <div class="metric-card__sub ui-meta">
-                <span>{i18n.t('runtimeDiagnostics.tokens', { value: formatTokens(snap.budgetState.tokenUsed) })}</span>
-                {#if snap.budgetState.tokenLimit != null}
-                  <span>{i18n.t('runtimeDiagnostics.tokenLimit', { value: formatTokens(snap.budgetState.tokenLimit) })}</span>
-                {/if}
-                {#if snap.budgetState.remainingTokens != null}
-                  <span>{i18n.t('runtimeDiagnostics.remainingTokens', { value: formatTokens(snap.budgetState.remainingTokens) })}</span>
-                {/if}
-                {#if snap.budgetState.errorRate != null && snap.budgetState.errorRate > 0}
+                <span>{i18n.t('runtimeDiagnostics.tokens', { value: formatTokens(snap?.budgetState?.tokenUsed) })}</span>
+                <span>{i18n.t('runtimeDiagnostics.tokenLimit', { value: formatTokens(snap?.budgetState?.tokenLimit) })}</span>
+                <span>{i18n.t('runtimeDiagnostics.remainingTokens', { value: formatTokens(snap?.budgetState?.remainingTokens) })}</span>
+                {#if snap?.budgetState?.errorRate != null && snap.budgetState.errorRate > 0}
                   <span>{i18n.t('runtimeDiagnostics.errorRate', { rate: Math.round(snap.budgetState.errorRate * 100) })}</span>
                 {/if}
               </div>
-              {#if snap.budgetState.usageRatio != null}
                 <div
                   class="metric-card__sub ui-meta"
-                  class:metric-card__sub--notice={resolveBudgetTone(snap.budgetState.warningLevel) === 'notice'}
-                  class:metric-card__sub--warn={resolveBudgetTone(snap.budgetState.warningLevel) === 'warning'}
-                  class:metric-card__sub--danger={resolveBudgetTone(snap.budgetState.warningLevel) === 'danger'}
+                  class:metric-card__sub--notice={resolveBudgetTone(snap?.budgetState?.warningLevel) === 'notice'}
+                  class:metric-card__sub--warn={resolveBudgetTone(snap?.budgetState?.warningLevel) === 'warning'}
+                  class:metric-card__sub--danger={resolveBudgetTone(snap?.budgetState?.warningLevel) === 'danger'}
                 >
-                  <span>{resolveBudgetToneLabel(snap.budgetState.warningLevel)}</span>
-                  <span>{i18n.t('runtimeDiagnostics.usageRatio', { value: formatUsageRatio(snap.budgetState.usageRatio) })}</span>
+                  {#if snap?.budgetState?.warningLevel}<span>{resolveBudgetToneLabel(snap.budgetState.warningLevel)}</span>{/if}
+                  <span>{i18n.t('runtimeDiagnostics.usageRatio', { value: formatUsageRatio(snap?.budgetState?.usageRatio) })}</span>
                 </div>
-              {/if}
             </div>
-          {/if}
 
         </div>
-      {/if}
-
       {#if assignmentSummaries.length > 0}
       <div class="runtime-diagnostics__block runtime-diagnostics__block--assignments">
         <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.assignmentTitle')}</div>

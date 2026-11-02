@@ -429,20 +429,12 @@
             <div class="terminal-meta-item">{i18n.t('terminalSession.title', { id: terminalId })}</div>
           {/if}
           <div class="terminal-meta-item">{i18n.t('terminalSession.status')}: {displayStatusLabel}</div>
-          {#if displayModeLabel}
-            <div class="terminal-meta-item">{i18n.t('terminalSession.mode')}: {displayModeLabel}</div>
-          {/if}
-          {#if displayPhaseLabel}
-            <div class="terminal-meta-item">{i18n.t('terminalSession.phase')}: {displayPhaseLabel}</div>
-          {/if}
+          <div class="terminal-meta-item">{i18n.t('terminalSession.mode')}: {displayModeLabel || i18n.t('common.notProvided')}</div>
+          <div class="terminal-meta-item">{i18n.t('terminalSession.phase')}: {displayPhaseLabel || i18n.t('common.notProvided')}</div>
         </div>
 
-        {#if displayCommand}
-          <div class="terminal-meta">{i18n.t('terminalSession.command')}: <code>{displayCommand}</code></div>
-        {/if}
-        {#if displayCwd}
-          <div class="terminal-meta">{i18n.t('terminalSession.cwd')}: <code>{displayCwd}</code></div>
-        {/if}
+        <div class="terminal-meta">{i18n.t('terminalSession.command')}: <code>{displayCommand || i18n.t('common.notProvided')}</code></div>
+        <div class="terminal-meta">{i18n.t('terminalSession.cwd')}: <code>{displayCwd || i18n.t('common.notProvided')}</code></div>
 
         <div class="terminal-section-label">{i18n.t('terminalSession.output')}</div>
         {#if showOutput}

@@ -1489,6 +1489,25 @@ function canonicalTurnSeqFromResult(result: {
   return typeof canonicalTurnSeq === 'number' ? canonicalTurnSeq : undefined;
 }
 
+/**
+ * 失败、中断、被停止之后能否继续只有 daemon 知道（读模型的 continuation）：
+ * 终态事实到达就取一次权威快照，不在 Web 里按轮次状态猜。
+ */
+function syncContinuationFromDaemon(eventSessionId: string, reason: string): void {
+  if (eventSessionId && eventSessionId !== currentSessionId.trim()) return;
+  void fetchBootstrap({
+    forceFresh: true,
+    refreshSessionTurnQueueAfterBootstrap: false,
+  }).catch((bootstrapError) => {
+    reportExpectedRecoveryFailure(
+      i18n.t('bridge.action.syncTurnState'),
+      '[web-client-bridge] 会话停止后同步继续状态失败:',
+      bootstrapError,
+    );
+    scheduleRecovery(`${reason}_continuation_sync`, bootstrapError, true);
+  });
+}
+
 function handleSessionTurnItemEvent(event: RustEventEnvelope): boolean {
   const canonicalEvent = parseCanonicalTurnEventFromRustEvent(event);
   if (!canonicalEvent) {
@@ -1499,6 +1518,16 @@ function handleSessionTurnItemEvent(event: RustEventEnvelope): boolean {
   if (isCanonicalTerminalEvent(canonicalEvent)) {
     if (canonicalEvent.sessionId || currentSessionId) {
       scheduleSessionSummaryRefresh('canonical_turn_terminal');
+    }
+    // 事件类型对失败、取消也是 turn_completed，只能看轮次最终状态。
+    const settledStatus = canonicalEvent.turn?.status;
+    if (
+      canonicalEvent.kind !== 'turn_superseded'
+      && settledStatus !== undefined
+      && settledStatus !== 'completed'
+      && settledStatus !== 'superseded'
+    ) {
+      syncContinuationFromDaemon(canonicalEvent.sessionId, 'canonical_turn_stopped');
     }
   }
   return true;
@@ -1921,6 +1950,10 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
 
   advanceEventStreamCursorFromEvent(event);
+
+  if (eventType === 'model.usage.recorded' || eventType === 'usage.stats.reset') {
+    window.dispatchEvent(new CustomEvent('magi:usageChanged', { detail: { sessionId: rustEventSessionId(event) } }));
+  }
 
   if (eventType === 'plugin.registry.changed') {
     window.dispatchEvent(new Event(PLUGIN_REGISTRY_CHANGED_EVENT));
@@ -2346,6 +2379,9 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
         : eventType === 'session.turn.queue_failed'
           ? (terminalErrorCode || 'queued_session_turn_failed')
         : 'session_turn_completed';
+    if (eventType !== 'session.turn.completed') {
+      syncContinuationFromDaemon(rustEventSessionId(event), terminalReason);
+    }
     if (!hasCanonicalTerminal) {
       if (terminalIdentity) {
         emitForcedProcessingTerminal({

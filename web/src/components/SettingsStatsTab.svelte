@@ -130,7 +130,7 @@
         totalTokens: totalIn + totalOut,
         calls,
         successCount,
-        successRate: stats?.successRate ?? null,
+        successRate: calls > 0 ? stats?.successRate ?? null : null,
         tokenOptional: worker === 'imageGeneration',
       };
     })
@@ -459,6 +459,7 @@
     return bindingUsageStats.filter((binding) => bindingRoleKey(binding) === roleKey);
   });
   const selectedCache = $derived(aggregatePromptCacheStats(selectedBindings));
+  const cacheTokensKnown = $derived(selectedCache.observedCallCount > 0 || selectedRow?.calls === 0);
 
   const selectedBreakdown = $derived.by<UsageBreakdownRow[]>(() => {
     if (perspective === 'engine') {
@@ -623,7 +624,7 @@
                 <span class="row-name-txt" title={row.label}>{row.label}</span>
                 <span class="row-model-txt" title={row.subLabel}>{row.subLabel}</span>
               </div>
-              <div class="row-metric num" data-label={i18n.t('settings.stats.colCalls')}>{row.calls || '--'}</div>
+              <div class="row-metric num" data-label={i18n.t('settings.stats.colCalls')}>{formatTokens(row.calls)}</div>
               <div
                 class="row-metric num"
                 data-label={i18n.t('settings.stats.colSuccess')}
@@ -665,7 +666,7 @@
               <span class="kpi-label">{i18n.t('settings.stats.kpiToken')}</span>
             </div>
             <div class="kpi-block">
-              <span class="kpi-value">{selectedRow.calls || '--'}</span>
+              <span class="kpi-value">{formatTokens(selectedRow.calls)}</span>
               <span class="kpi-label">{i18n.t('settings.stats.kpiCalls')}</span>
             </div>
             <div class="kpi-block">
@@ -678,7 +679,7 @@
             <div class="settings-row">
               <div class="settings-row-copy">
                 <span class="settings-row-title">{i18n.t('settings.stats.cacheTokenHitRate')}</span>
-                <span class="settings-row-desc">{i18n.t('settings.stats.cacheTokenDetail', { read: formatTokens(selectedCache.readTokens), input: formatTokens(selectedCache.inputTokens) })}</span>
+                <span class="settings-row-desc">{i18n.t('settings.stats.cacheTokenDetail', { read: cacheTokensKnown ? formatTokens(selectedCache.readTokens) : i18n.t('common.notProvided'), input: cacheTokensKnown ? formatTokens(selectedCache.inputTokens) : i18n.t('common.notProvided') })}</span>
               </div>
               <span>{selectedCache.tokenHitRate === null ? i18n.t('settings.stats.cacheUnobserved') : formatPct(selectedCache.tokenHitRate)}</span>
             </div>
@@ -717,7 +718,7 @@
                       </span>
                       <span title={breakdown.label}>{breakdown.label}</span>
                     </div>
-                    <span class="breakdown-metric num">{breakdown.calls || '--'}</span>
+                    <span class="breakdown-metric num">{formatTokens(breakdown.calls)}</span>
                     <span class="breakdown-metric num">{formatPct(breakdown.successRate)}</span>
                     <span class="breakdown-metric num">{formatUsageTokens(breakdown.totalTokens, breakdown.calls, breakdown.tokenOptional)}</span>
                   </div>
@@ -735,7 +736,7 @@
             </div>
             {#if selectedTokenUnavailable}
               <div class="token-usage-note">{i18n.t('settings.stats.imageUsageMetricHint')}</div>
-            {:else}
+            {/if}
               <div class="bar-list">
                 <div class="bar-item">
                   <span class="bar-label">{i18n.t('settings.stats.barInputLabel')}</span>
@@ -743,7 +744,7 @@
                     <div class="bar-fill" style="width: {(selectedRow.totalIn / barMaxIO) * 100}%"></div>
                   </div>
                   <span class="bar-meta">
-                    <span class="strong">{formatTokens(selectedRow.totalIn)}</span>
+                    <span class="strong">{selectedTokenUnavailable ? i18n.t('settings.stats.tokenNotReported') : formatTokens(selectedRow.totalIn)}</span>
                   </span>
                 </div>
                 <div class="bar-item muted">
@@ -752,11 +753,10 @@
                     <div class="bar-fill" style="width: {(selectedRow.totalOut / barMaxIO) * 100}%"></div>
                   </div>
                   <span class="bar-meta">
-                    <span class="strong">{formatTokens(selectedRow.totalOut)}</span>
+                    <span class="strong">{selectedTokenUnavailable ? i18n.t('settings.stats.tokenNotReported') : formatTokens(selectedRow.totalOut)}</span>
                   </span>
                 </div>
               </div>
-            {/if}
           </div>
 
           {#if selectedRow.errorMsg}

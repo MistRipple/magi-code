@@ -76,10 +76,6 @@ export function shouldShowRuntimePhase(status: string | undefined, phase: string
   );
 }
 
-export function shouldShowRuntimeBudget(warningLevel: string | undefined): boolean {
-  return warningLevel === 'notice' || warningLevel === 'warning' || warningLevel === 'danger';
-}
-
 export function shouldShowRuntimeCache(health: string | undefined): boolean {
   return health === 'degraded';
 }
@@ -87,7 +83,7 @@ export function shouldShowRuntimeCache(health: string | undefined): boolean {
 export function resolveRuntimeTaskProgress(
   snapshot: RuntimeTaskProgressSnapshot | null | undefined,
 ): RuntimeTaskProgress | null {
-  if (!snapshot) return null;
+  if (snapshot?.requiredTotal == null) return null;
   const total = Math.max(0, snapshot.requiredTotal ?? 0);
   const failed = Math.max(0, snapshot.failedRequired ?? 0);
   const running = Math.max(0, snapshot.runningOrPendingRequired ?? 0);

@@ -595,17 +595,15 @@
       />
       <span>{i18n.t('mcpServer.enable')}</span>
       <span class="settings-chip settings-chip--ok" class:badge--off={!status?.running}>
-        {status?.running ? i18n.t('mcpServer.status.running') : i18n.t('mcpServer.status.stopped')}
+        {status == null ? i18n.t('common.notProvided') : status.running ? i18n.t('mcpServer.status.running') : i18n.t('mcpServer.status.stopped')}
       </span>
     </label>
     <p class="meta">{i18n.t('mcpServer.enableHint')}</p>
-    {#if status?.running}
-      {#if status.url}<p class="meta"><code>{i18n.t('mcpServer.status.url', { url: status.url })}</code></p>{/if}
-      {#if status.stdioEndpoint}<p class="meta"><code>{i18n.t('mcpServer.status.stdio', { endpoint: status.stdioEndpoint })}</code></p>{/if}
-      {#if status.port}<p class="meta">{i18n.t('mcpServer.status.port', { port: status.port })}</p>{/if}
-      <p class="meta" data-mcp-connections="1">{i18n.t('mcpServer.status.connections', { http: status.httpSessions, local: status.localConnections })}</p>
+      <p class="meta"><code>{i18n.t('mcpServer.status.url', { url: status?.url || '—' })}</code></p>
+      <p class="meta"><code>{i18n.t('mcpServer.status.stdio', { endpoint: status?.stdioEndpoint || '—' })}</code></p>
+      <p class="meta">{i18n.t('mcpServer.status.port', { port: status?.port ?? '—' })}</p>
+      <p class="meta" data-mcp-connections="1">{i18n.t('mcpServer.status.connections', { http: status?.httpSessions ?? '—', local: status?.localConnections ?? '—' })}</p>
       <p class="meta">{i18n.t('mcpServer.status.connectionsHint')}</p>
-    {/if}
   </div>
 
   {/if}

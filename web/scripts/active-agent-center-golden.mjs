@@ -83,60 +83,28 @@ await withGoldenViteServer(async (server) => {
     '正常完成与主动终止代理必须进入本轮已完成分组',
   );
 
-  assert.equal(
-    center.shouldShowActiveAgentCenter(grouped),
-    true,
-    '存在运行中或异常代理时必须显示活跃代理中心',
-  );
+  // 异常停止后的“继续推进”是会话级动作，由 daemon 判定；运行视图不再有自己的继续入口。
+  assert.equal(center.composerRunAction, undefined, '运行视图不得再提供继续入口');
 
-  const settled = center.groupActiveAgents([
-    agent({ agentRunId: 'completed', status: 'completed', lifecycle: 'completed' }),
-  ]);
-  assert.equal(
-    center.shouldShowActiveAgentCenter(settled),
-    true,
-    '代理全部完成但主线仍在汇总时必须继续显示',
+  // 状态条与列表标题共用的一句话概括：按异常、排队、运行的优先级给出。
+  const t = (key, vars = {}) => `${key}:${JSON.stringify(vars)}`;
+  const summaryOf = (agents, outcome = null) => center.summarizeActiveAgentRun(
+    center.buildActiveAgentSummary(center.groupActiveAgents(agents)), outcome, t,
   );
-  assert.equal(
-    center.shouldShowActiveAgentCenter(settled),
-    true,
-    '代理完成后入口必须持续显示，直到用户清空或新一轮代理替换',
+  assert.match(summaryOf([agent()]), /summaryRunning/, '只有运行中的代理');
+  assert.match(
+    summaryOf([agent(), agent({ agentRunId: 'q', status: 'pending', lifecycle: 'queued' })]),
+    /summaryQueuedRunning/,
   );
-
-  const failed = center.groupActiveAgents([
-    agent({ agentRunId: 'failed', status: 'failed', lifecycle: 'failed' }),
-  ]);
-  assert.equal(
-    center.shouldShowActiveAgentCenter(failed),
-    true,
-    '主线结束后异常代理仍必须持续显示',
-  );
-  assert.equal(
-    center.shouldShowActiveAgentCenter(center.groupActiveAgents([]), 'failed'),
-    true,
-    'root 失败即使没有子代理，也必须保留权威恢复入口',
-  );
+  assert.match(summaryOf([agent({ status: 'failed', lifecycle: 'failed' })]), /summaryAttention/);
+  assert.match(summaryOf([agent({ status: 'completed', lifecycle: 'completed' })]), /summaryCompleted/);
+  assert.match(summaryOf([], 'failed'), /summaryFailed/, '整轮失败时以权威结论为先，即使没有子代理');
+  assert.match(summaryOf([agent()], 'recoverable'), /summaryRecoverable/);
 
   assert.deepEqual(
     center.buildActiveAgentSummary(grouped),
     { queuedCount: 1, activeCount: 1, attentionCount: 2, completedCount: 2, triggerCount: 6 },
     '入口数量必须统计当前固定列表中的全部代理',
-  );
-
-  assert.equal(
-    center.isPrimaryAgentRunAction('continue', ['continue', 'restart', 'archive']),
-    true,
-    '存在可恢复检查点时，继续执行必须是主操作',
-  );
-  assert.equal(
-    center.isPrimaryAgentRunAction('restart', ['restart', 'archive']),
-    true,
-    '没有可恢复检查点时，重新执行必须成为主操作',
-  );
-  assert.equal(
-    center.isPrimaryAgentRunAction('restart', ['continue', 'restart', 'archive']),
-    false,
-    '存在继续执行时，重新执行必须降为次级操作',
   );
 
   assert.equal(
@@ -200,57 +168,42 @@ await withGoldenViteServer(async (server) => {
   );
 });
 
-const threadPanelSource = await readFile(
-  new URL('../src/components/ThreadPanel.svelte', import.meta.url),
-  'utf8',
-);
-const activeAgentCenterSource = await readFile(
-  new URL('../src/components/ActiveAgentCenter.svelte', import.meta.url),
-  'utf8',
-);
-const goalRunDrawersSource = await readFile(
-  new URL('../src/components/GoalRunDrawers.svelte', import.meta.url),
-  'utf8',
-);
-const daemonClientSource = await readFile(
-  new URL('../src/shared/rust-daemon-client.ts', import.meta.url),
-  'utf8',
-);
+const read = (path) => readFile(new URL(path, import.meta.url), 'utf8');
+const threadPanelSource = await read('../src/components/ThreadPanel.svelte');
+const headerSource = await read('../src/components/Header.svelte');
+const chipSource = await read('../src/components/AgentStatusChip.svelte');
+const bannerSource = await read('../src/components/AgentRunBanner.svelte');
+const rowSource = await read('../src/components/AgentRow.svelte');
+const listSource = await read('../src/components/tabs/AgentListTabContent.svelte');
+const runStoreSource = await read('../src/stores/active-agent-run.svelte.ts');
+const goalRunDrawersSource = await read('../src/components/GoalRunDrawers.svelte');
+const daemonClientSource = await read('../src/shared/rust-daemon-client.ts');
+const agentTabContentSource = await read('../src/components/tabs/AgentTabContent.svelte');
+const messageListSource = await read('../src/components/MessageList.svelte');
 
+// 入口形态：状态条常驻顶栏、恢复横幅在消息下方，对话流式布局里不再有会让内容跳动的浮层入口。
+assert.doesNotMatch(threadPanelSource, /ActiveAgentCenter/, '旧的悬浮代理中心已移除');
 assert.match(
   threadPanelSource,
-  /<RuntimeStatePanel[\s\S]*?\/\>\s*<ActiveAgentCenter\s*\/\>\s*<div class="main-content">\s*<MessageList/,
-  '活跃代理中心必须在主内容容器外参与线程布局，不能覆盖首条消息或被消息滚动容器裁剪',
+  /<ConversationApprovalTray[\s\S]*?\/>\s*<AgentRunBanner\s*\/>/,
+  '恢复横幅与工具审批同位：消息列表下方、输入区上方，不遮挡消息',
 );
-assert.match(
-  activeAgentCenterSource,
-  /openAgentTab\(/,
-  '点击代理必须复用右侧面板的增量代理 Tab',
-);
+assert.match(headerSource, /<div class="header-actions">\s*<AgentStatusChip\s*\/>/, '代理状态条常驻在顶栏右侧');
+assert.match(chipSource, /activeAgentRun\.openList\(\)/, '点击状态条打开右栏的代理列表，而不是遮住消息的浮层');
+assert.doesNotMatch(chipSource, /position:\s*(absolute|fixed)[\s\S]*agent-center-panel/, '状态条不再带弹层');
+assert.match(chipSource, /aria-pressed=\{open\}/, '状态条要体现代理列表是否已打开');
+assert.match(listSource, /activeAgentRun\.groups/, '列表只读共用的运行投影');
+assert.match(listSource, /retainUiClock\(\)/, '进行中的耗时必须注册统一 UI 时钟');
+assert.match(runStoreSource, /openAgentTab\(/, '点击代理必须复用右侧面板的增量代理 Tab');
+assert.match(runStoreSource, /selectAgentRun\(/, '打开代理前先选中这次运行，与右栏保持一致');
 
-const agentTabContentSource = await readFile(
-  new URL('../src/components/tabs/AgentTabContent.svelte', import.meta.url),
-  'utf8',
-);
-const messageListSource = await readFile(
-  new URL('../src/components/MessageList.svelte', import.meta.url),
-  'utf8',
-);
 assert.match(
   agentTabContentSource,
   /runtimeCompletedAt=\{agentRuntimeCompletedAt\}[\s\S]*runtimeDurationMs=\{agentRuntimeDurationMs\}/,
   '代理详情必须把完成时刻与总耗时传给统一消息时间线',
 );
-assert.match(
-  agentTabContentSource,
-  /uiClockState\.now/,
-  '代理详情中的运行耗时必须读取统一 UI 时钟',
-);
-assert.match(
-  agentTabContentSource,
-  /retainUiClock\(\)/,
-  '代理详情中的运行耗时必须注册统一 UI 时钟消费者',
-);
+assert.match(agentTabContentSource, /uiClockState\.now/, '代理详情中的运行耗时必须读取统一 UI 时钟');
+assert.match(agentTabContentSource, /retainUiClock\(\)/, '代理详情中的运行耗时必须注册统一 UI 时钟消费者');
 assert.match(
   messageListSource,
   /displayContext === 'task'[\s\S]*normalizedRuntimeStartedAt[\s\S]*hasRuntimeToTrack[\s\S]*runtimeActive/,
@@ -261,61 +214,76 @@ assert.match(
   /shouldShowRuntimeSummary[\s\S]*normalizedRuntimeCompletedAt[\s\S]*normalizedRuntimeDurationMs[\s\S]*TurnRuntimeSummary/,
   '任务详情必须在终态渲染与主线一致的总耗时和结束时间',
 );
-assert.match(
-  activeAgentCenterSource,
-  /localStorage/,
-  '代理中心必须按会话持久化用户清空标记',
-);
+assert.match(runStoreSource, /localStorage/, '运行视图必须按会话持久化用户归档标记');
 assert.doesNotMatch(
-  activeAgentCenterSource,
+  runStoreSource,
   /pinnedRootTaskId|readPersistedState[\s\S]*fetchAgentRunProjection\(/,
-  '组件不能从本地固定状态反向加载 root；root 选择只能由权威运行投影驱动',
+  '不能从本地固定状态反向加载 root；root 选择只能由权威运行投影驱动',
+);
+assert.match(
+  runStoreSource,
+  /performAgentRunAction\(/,
+  '失败态操作必须统一提交任务动作',
+);
+assert.match(
+  bannerSource,
+  /availableActions\.includes\('archive'\)[\s\S]*runAction\('archive'\)/,
+  '横幅的操作由后端 availableActions 驱动，只保留归档',
 );
 assert.doesNotMatch(
-  activeAgentCenterSource,
-  /expanded\s*=\s*!mobile/,
-  '恢复已有代理任务时，悬浮面板必须保持收起，只保留入口按钮供用户主动展开',
+  `${bannerSource}${runStoreSource}${rowSource}`,
+  /restartConfirm|requestAction|confirmRestart|action\.restart|'restart'/,
+  '不再提供重新执行：需要时直接发新消息',
+);
+const agentRunStoreSource = await read('../src/stores/agent-run-store.svelte.ts');
+assert.doesNotMatch(
+  `${runStoreSource}${agentRunStoreSource}`,
+  /new_attempt|startedNewAttempt|newRootTaskId|composerAction|composerRunAction/,
+  '运行视图只剩归档：继续与新的执行尝试都由 daemon 在会话级统一决定',
 );
 assert.match(
-  activeAgentCenterSource,
-  /availableActions[\s\S]*performAgentRunAction\(/,
-  '失败态操作必须完全由后端 availableActions 驱动，并统一提交任务动作',
+  runStoreSource,
+  /await performAgentRunAction\([\s\S]*dismissedRootTaskId = rootTaskId/,
+  '只有后端归档成功后才能清理本地固定状态',
 );
 assert.match(
-  activeAgentCenterSource,
-  /restartConfirmationOpen[\s\S]*activeAgentCenter\.restartConfirm\.title/,
-  '重新执行必须先展示明确确认信息，不能直接创建新任务尝试',
-);
-assert.match(
-  activeAgentCenterSource,
-  /isPrimaryAgentRunAction\(action, availableActions\)/,
-  '恢复动作必须根据任务状态区分主次操作，避免继续与重新执行同权重',
-);
-assert.match(
-  activeAgentCenterSource,
-  /action === 'archive'[\s\S]*dismissedRootTaskId = rootTaskId/,
-  '只有后端归档成功后才能清理本地固定面板状态',
-);
-assert.match(
-  activeAgentCenterSource,
+  runStoreSource,
   /reportIncident\(message,[\s\S]*failureStage: `agent_run_\$\{action\}`/,
   '失败操作必须把真实后端错误写入统一通知中心，不能只显示泛化提示',
 );
 assert.match(
-  activeAgentCenterSource,
+  rowSource,
   /formatAgentDuration\(agentDurationSeconds\(/,
   '代理行必须展示运行中或已固定的实际耗时',
 );
 assert.match(
-  activeAgentCenterSource,
-  /@media \(max-width:\s*768px\)[\s\S]*?\.agent-center-panel\s*\{[\s\S]*?position:\s*fixed;[\s\S]*?bottom:\s*8px;/,
-  '手机端必须使用底部抽屉而不是右上角悬浮层',
+  rowSource,
+  /class="agent-goal"[\s\S]*agent-diagnostic/,
+  '代理行是两行主信息：名称与状态一行，目标一行；诊断只在真的发生时多一行',
+);
+const inputAreaSource = await read('../src/components/InputArea.svelte');
+assert.match(
+  inputAreaSource,
+  /const canContinue = \$derived\(activeAgentRun\.continuation !== null\)/,
+  '输入框的继续按钮只由 daemon 下发的 continuation 决定，Web 不自行推断',
 );
 assert.match(
-  activeAgentCenterSource,
-  /\.active-agent-center\s*\{[\s\S]*?position:\s*relative;[\s\S]*?flex:\s*0 0 44px;[\s\S]*?height:\s*44px;/,
-  '活跃代理入口必须在消息列表前预留稳定布局高度',
+  inputAreaSource,
+  /type: 'continueTask'/,
+  '所有停止的继续都走同一个会话级动作',
 );
+assert.doesNotMatch(
+  inputAreaSource,
+  /composerCanContinue|runContinueAction|activeAgentRun\.runAction\('continue'\)|canResume/,
+  '输入框不得保留第二套继续判定或第二条继续路径',
+);
+assert.doesNotMatch(inputAreaSource, /continueUsesRestart/, '输入框的继续按钮不再有重新执行形态');
+assert.match(
+  bannerSource,
+  /const canContinue = \$derived\(activeAgentRun\.continuation !== null\)/,
+  '横幅知道继续由输入框承担，只给出提示，不重复按钮',
+);
+assert.doesNotMatch(rowSource, /agent-model-line|<span class="agent-goal" title=\{model\}/, '模型不再平铺成独立一行');
 assert.doesNotMatch(
   goalRunDrawersSource,
   /agent-run-panel|agentRunDrawerExpanded|stopCurrentAgentRun|restartCurrentAgentRun/,
@@ -341,5 +309,22 @@ assert.doesNotMatch(
   /goalCanResume[\s\S]{0,300}currentPlanPaused|goalCanResume[\s\S]{0,300}currentPlanBlocked/,
   '前端不能再根据计划展示状态推导目标恢复权限',
 );
+
+await withGoldenViteServer(async (server) => {
+  const center = await server.ssrLoadModule('/src/lib/active-agent-center.ts');
+  const picked = center.selectLauncherAgents([
+    agent({ agentRunId: 'done', status: 'completed', lifecycle: 'completed', startedAt: 500 }),
+    agent({ agentRunId: 'queued-new', status: 'pending', lifecycle: 'queued', startedAt: 400 }),
+    agent({ agentRunId: 'running-old', startedAt: 100 }),
+    agent({ agentRunId: 'failed', status: 'failed', lifecycle: 'failed', startedAt: 600 }),
+    agent({ agentRunId: 'running-new', startedAt: 300 }),
+    agent({ agentRunId: 'queued-old', status: 'pending', lifecycle: 'queued', startedAt: 50 }),
+  ]).map((item) => item.agentRunId);
+  assert.deepEqual(
+    picked,
+    ['running-new', 'running-old', 'queued-new', 'queued-old'],
+    '新标签页只列执行中和排队中的代理，执行中在前，同组较新的在前；已完成和失败的不重复列出',
+  );
+});
 
 console.log('active agent center golden tests passed');

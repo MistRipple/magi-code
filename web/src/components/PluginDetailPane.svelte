@@ -123,17 +123,12 @@
   <dl class="pane-facts">
     <div><dt>{i18n.t('settings.plugins.detail.type')}</dt><dd>{item.bundled ? i18n.t('settings.plugins.detail.kindBuiltin') : i18n.t('settings.plugins.detail.kindExtension')}</dd></div>
     <div><dt>{i18n.t('settings.plugins.detail.version')}</dt><dd>v{item.version}{#if item.updatable} → v{item.bundled?.version ?? item.catalog?.version}{/if}</dd></div>
-    {#if plugin}
-      <div data-testid="plugin-source" class:pane-warn={plugin.source.kind === 'address' || plugin.source.kind === 'local'}>
+      <div data-testid="plugin-source" class:pane-warn={plugin?.source.kind === 'address' || plugin?.source.kind === 'local'}>
         <dt>{i18n.t('settings.plugins.detail.source')}</dt>
-        <dd>{sourceLabel(plugin)} <span class="settings-mono" title={plugin.source.location}>{plugin.source.location}</span></dd>
+        <dd>{#if plugin}{sourceLabel(plugin)} <span class="settings-mono" title={plugin.source.location}>{plugin.source.location}</span>{:else}{i18n.t(item.bundled ? 'settings.plugins.source.builtin' : item.catalog ? 'settings.plugins.source.center' : 'common.notProvided')}{/if}</dd>
       </div>
-      <div><dt>{i18n.t('settings.plugins.detail.digest')}</dt><dd class="settings-mono" title={plugin.digest}>{plugin.digest.slice(0, 16)}</dd></div>
-    {:else if item.catalog}
-      <div><dt>{i18n.t('settings.plugins.detail.size')}</dt><dd>{Math.max(1, Math.round(item.catalog.size / 1024))} KB</dd></div>
-    {:else if item.bundled}
-      <div><dt>{i18n.t('settings.plugins.detail.source')}</dt><dd>{i18n.t('settings.plugins.source.builtin')}</dd></div>
-    {/if}
+      <div><dt>{i18n.t('settings.plugins.detail.digest')}</dt><dd class="settings-mono" title={plugin?.digest}>{plugin?.digest.slice(0, 16) || i18n.t('common.notProvided')}</dd></div>
+      <div><dt>{i18n.t('settings.plugins.detail.size')}</dt><dd>{!plugin && item.catalog ? `${Math.round(item.catalog.size / 1024)} KB` : i18n.t('common.notProvided')}</dd></div>
   </dl>
 
   <section class="pane-section">

@@ -17,7 +17,7 @@
   import { isExternalSessionId } from '../stores/external-sessions.svelte';
   import InputArea from './InputArea.svelte';
   import RuntimeStatePanel from './RuntimeStatePanel.svelte';
-  import ActiveAgentCenter from './ActiveAgentCenter.svelte';
+  import AgentRunBanner from './AgentRunBanner.svelte';
   import { parseToolApprovalPayload } from '../lib/tool-error-payload';
   import {
     syncToolApprovals,
@@ -107,10 +107,10 @@
     processingStartedAt={messagesState.thinkingStartAt}
     turnStage={messagesState.turnStage}
   />
-  <ActiveAgentCenter />
   <div class="main-content">
     <MessageList renderItems={threadRenderItems} isActive={isTopActive} />
     <ConversationApprovalTray approvals={unanchoredApprovals} />
+    <AgentRunBanner />
   </div>
 
   <!-- 输入区域：外部会话只读，这里换成来源提示和待确认 -->

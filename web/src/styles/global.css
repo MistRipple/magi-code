@@ -540,6 +540,17 @@ a:hover {
   text-decoration: underline;
 }
 
+/* 输入区卡片的标题统一排版；各容器只负责与自身内容对齐。 */
+.composer-popover-title {
+  margin: 0;
+  min-inline-size: 0;
+  color: var(--foreground-muted);
+  font-size: var(--text-xs);
+  font-weight: var(--font-normal);
+  line-height: var(--leading-normal);
+  text-wrap: balance;
+}
+
 /* 按钮基础样式 */
 button {
   font-family: inherit;

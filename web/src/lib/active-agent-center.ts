@@ -1,5 +1,4 @@
 import type {
-  AgentRunActionKind,
   AgentProjectionDto,
   AgentRunOutcome,
 } from '../shared/rust-backend-types';
@@ -104,17 +103,6 @@ function outcomeRequiresAgentCenter(outcome: AgentRunOutcome | null | undefined)
     || outcome === 'killed';
 }
 
-export function shouldShowActiveAgentCenter(
-  groups: ActiveAgentGroups,
-  outcome?: AgentRunOutcome | null,
-): boolean {
-  return groups.running.length > 0
-    || groups.queued.length > 0
-    || groups.attention.length > 0
-    || groups.completed.length > 0
-    || outcomeRequiresAgentCenter(outcome);
-}
-
 export function buildActiveAgentSummary(groups: ActiveAgentGroups): ActiveAgentSummary {
   const queuedCount = groups.queued.length;
   const activeCount = groups.running.length;
@@ -129,12 +117,37 @@ export function buildActiveAgentSummary(groups: ActiveAgentGroups): ActiveAgentS
   };
 }
 
-export function isPrimaryAgentRunAction(
-  action: AgentRunActionKind,
-  availableActions: ReadonlyArray<AgentRunActionKind>,
-): boolean {
-  return action === 'continue'
-    || (action === 'restart' && !availableActions.includes('continue'));
+/**
+ * 新标签页要列出的“正在做事”的代理：执行中的在前（较新启动的优先），排队中的在后。
+ * 已完成的归运行中心的完成分组，失败/降级的由运行中心提示，两者都不在这里重复。
+ */
+export function selectLauncherAgents(
+  agents: ReadonlyArray<AgentProjectionDto>,
+): AgentProjectionDto[] {
+  const groups = groupActiveAgents(agents);
+  const newestFirst = (left: AgentProjectionDto, right: AgentProjectionDto) => right.startedAt - left.startedAt;
+  return [...groups.running].sort(newestFirst).concat([...groups.queued].sort(newestFirst));
+}
+
+/** 一句话概括当前这轮代理运行；状态条的提示和代理列表的标题共用。 */
+export function summarizeActiveAgentRun(
+  summary: ActiveAgentSummary,
+  outcome: AgentRunOutcome | null | undefined,
+  t: (key: string, params?: Record<string, string | number>) => string,
+): string {
+  if (outcome === 'recoverable') return t('activeAgentCenter.summaryRecoverable');
+  if (outcome === 'failed') return t('activeAgentCenter.summaryFailed');
+  if (outcome === 'killed') return t('activeAgentCenter.summaryKilled');
+  if (outcome === 'degraded') return t('activeAgentCenter.summaryDegraded');
+  if (summary.attentionCount > 0) {
+    return t('activeAgentCenter.summaryAttention', { active: summary.activeCount, attention: summary.attentionCount });
+  }
+  if (summary.queuedCount > 0 && summary.activeCount > 0) {
+    return t('activeAgentCenter.summaryQueuedRunning', { queued: summary.queuedCount, active: summary.activeCount });
+  }
+  if (summary.queuedCount > 0) return t('activeAgentCenter.summaryQueued', { count: summary.queuedCount });
+  if (summary.activeCount > 0) return t('activeAgentCenter.summaryRunning', { count: summary.activeCount });
+  return t('activeAgentCenter.summaryCompleted', { count: summary.completedCount });
 }
 
 export function agentDurationSeconds(agent: AgentProjectionDto, nowMs: number): number {

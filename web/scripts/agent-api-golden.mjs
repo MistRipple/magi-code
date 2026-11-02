@@ -702,6 +702,10 @@ await withGoldenViteServer(async (server) => {
     const statsUrl = new URL(statsRequestUrls[0]);
     assert.equal(statsUrl.pathname, '/api/settings/stats');
     assert.equal(statsUrl.searchParams.has('sessionId'), false);
+    await agentApi.getAgentExecutionStats('session-stats-golden');
+    const scopedStatsUrl = new URL(statsRequestUrls[1]);
+    assert.equal(scopedStatsUrl.searchParams.get('sessionId'), 'session-stats-golden',
+      'composer statistics must request the owning session explicitly');
   } finally {
     if (statsFetchBefore === undefined) {
       delete globalThis.fetch;

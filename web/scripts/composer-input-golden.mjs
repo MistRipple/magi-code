@@ -33,17 +33,22 @@ function visibleMainActions(node, state) {
   }
   return (node.children ?? []).flatMap(child => visibleMainActions(child, state));
 }
-const baseState = { editingQueuedMessage: null, resumeSubmitting: false, isSending: false, hasContent: false, editingTurn: null, canContinueSession: false };
+const baseState = { editingQueuedMessage: null, continueSubmitting: false, isSending: false, hasContent: false, editingTurn: null, canContinue: false };
 for (const [state, expected] of [
   [{ isSending: true }, 'input-stop-button'],
   [{ isSending: true, hasContent: true }, 'input-followup-send-button'],
   [{ isSending: true, hasContent: false }, 'input-stop-button'],
   [{ hasContent: true }, 'input-send-button'],
   [{}, 'disabled-send'],
-  [{ canContinueSession: true }, 'input-continue-button'],
-  [{ canContinueSession: true, hasContent: true }, 'input-send-button'],
+  // 主线轮次中断、或子代理运行异常停止（canContinue 合并了两者）：输入框为空时发送按钮变成继续推进。
+  [{ canContinue: true }, 'input-continue-button'],
+  [{ canContinue: true, hasContent: true }, 'input-send-button'],
   [{ isSending: true, hasContent: true, editingQueuedMessage: {} }, 'input-queue-save-button'],
-  [{ isSending: true, resumeSubmitting: true }, 'input-continue-button'],
+  [{ isSending: true, continueSubmitting: true }, 'input-continue-button'],
+  // 只要输入框有内容就一定是发送，哪怕继续正在提交。
+  [{ continueSubmitting: true, hasContent: true }, 'input-send-button'],
+  [{ isSending: true, continueSubmitting: true, hasContent: true }, 'input-followup-send-button'],
+  [{ canContinue: true, isSending: true }, 'input-stop-button'],
 ]) {
   assert.deepEqual(visibleMainActions(primaryAction, { ...baseState, ...state }), [expected],
     `composer must display exactly one main action: ${JSON.stringify(state)}`);

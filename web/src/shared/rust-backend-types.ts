@@ -738,6 +738,8 @@ export interface SessionRuntimeSummaryDto {
   recovery_ref?: string | null;
   has_recoverable_chain?: boolean;
   recoverable_branch_count?: number;
+  /** daemon 判定的“停止后如何继续”；缺省表示这个会话现在没有可继续的停止。 */
+  continuation?: SessionContinuation;
   active_branches: SessionRuntimeBranchSummaryDto[];
 }
 
@@ -1718,7 +1720,16 @@ export type AgentRunOutcome =
   | 'failed'
   | 'killed';
 
-export type AgentRunActionKind = 'continue' | 'restart' | 'archive';
+/**
+ * 会话停止（失败、中断、用户主动停止）后的唯一继续方式，由 daemon 判定并随读模型下发：
+ * - `resume_chain`：沿原执行链从检查点恢复；
+ * - `resume_turn`：重新激活最近一轮主线，继承它已有的证据继续推进。
+ * 客户端只据此显示“继续”，不再自行从轮次或任务状态推断。
+ */
+export type SessionContinuation = 'resume_chain' | 'resume_turn';
+
+/** 运行视图上的操作只剩归档；继续是会话级动作，见 `SessionContinuation`。 */
+export type AgentRunActionKind = 'archive';
 
 export interface AgentRunFailureSummaryDto {
   rootFailed: boolean;
@@ -1744,11 +1755,8 @@ export interface AgentRunActionResponseDto {
   workspaceId?: string | null;
   workspacePath?: string;
   rootTaskId: string;
-  oldRootTaskId?: string;
-  newRootTaskId?: string;
   status?: string;
   archived?: boolean;
-  restarted?: boolean;
 }
 
 export interface ProgressSummaryDto {

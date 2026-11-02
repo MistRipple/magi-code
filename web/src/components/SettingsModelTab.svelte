@@ -615,9 +615,7 @@
               </div>
               <div class="engine-identity">
                 <span class="engine-name">{getWorkerDisplayName(workerId)}</span>
-                {#if workerConfigs[workerId]?.model}
-                  <span class="engine-model-tag">{workerConfigs[workerId].model}</span>
-                {/if}
+                <span class="engine-model-tag">{workerConfigs[workerId]?.model || i18n.t('settings.status.notConfigured')}</span>
               </div>
               <div class="engine-consumers">
                 {#if consumers.length > 0}

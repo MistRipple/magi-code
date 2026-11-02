@@ -84,7 +84,7 @@ export function resolveEffectiveUsageRatio(input: ContextRingInput): number | nu
     && tokenLimit != null
     && Number.isFinite(tokenUsed)
     && Number.isFinite(tokenLimit)
-    && tokenUsed > 0
+    && tokenUsed >= 0
     && tokenLimit > 0
   ) {
     return tokenUsed / tokenLimit;
@@ -163,9 +163,6 @@ export function formatCompactionReason(reason: string | null | undefined, t: Tra
 }
 
 export function buildRingDetailItems(input: ContextRingInput, t: Translate): ContextRingDetailItem[] {
-  if (!hasUsageData(resolveEffectiveUsageRatio(input))) {
-    return [];
-  }
   const items: ContextRingDetailItem[] = [
     { key: 'usage', text: t('input.contextRing.usage', { value: formatRingTokens(input.tokenUsed) }) },
     {
@@ -195,12 +192,10 @@ export function buildRingDetailItems(input: ContextRingInput, t: Translate): Con
 
 export function buildRingTooltip(input: ContextRingInput, t: Translate): string {
   const effectiveUsageRatio = resolveEffectiveUsageRatio(input);
-  if (!hasUsageData(effectiveUsageRatio)) {
-    return t('input.contextRing.empty');
-  }
   const percent = formatRingPercent(effectiveUsageRatio);
   return [
-    `${t('input.contextRing.label')} ${percent}%`,
+    `${t('input.contextRing.label')} ${hasUsageData(effectiveUsageRatio) ? `${percent}%` : percent}`,
     ...buildRingDetailItems(input, t).map((item) => item.text),
+    ...(!hasUsageData(effectiveUsageRatio) ? [t('input.contextRing.empty')] : []),
   ].join(', ');
 }

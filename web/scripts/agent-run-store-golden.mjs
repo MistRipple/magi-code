@@ -17,7 +17,7 @@ const SLOW_SESSION_ID = 'session-agent-run-slow';
 const SLOW_ROOT_TASK_ID = 'task-root-agent-run-slow';
 const ACTION_SESSION_ID = 'session-agent-run-action';
 const ACTION_ROOT_TASK_ID = 'task-root-agent-run-action';
-const RESTARTED_ROOT_TASK_ID = 'task-root-agent-run-restarted';
+const NEXT_ROOT_TASK_ID = 'task-root-agent-run-next';
 const ARCHIVE_SESSION_ID = 'session-agent-run-archive';
 const ARCHIVE_ROOT_TASK_ID = 'task-root-agent-run-archive';
 let releaseSlowProjection = null;
@@ -147,19 +147,6 @@ function installFetchStub(fetches, terminalAgentRunRootIds, actionRequests) {
     if (parsed.pathname === '/api/agent-runs/action') {
       const payload = JSON.parse(String(init.body || '{}'));
       actionRequests.push(payload);
-      if (payload.action === 'restart') {
-        return jsonResponse({
-          action: 'restart',
-          operationId: payload.operationId,
-          sessionId: payload.sessionId,
-          workspaceId: payload.workspaceId,
-          workspacePath: payload.workspacePath,
-          rootTaskId: RESTARTED_ROOT_TASK_ID,
-          oldRootTaskId: payload.taskId,
-          newRootTaskId: RESTARTED_ROOT_TASK_ID,
-          restarted: true,
-        });
-      }
       if (payload.action === 'archive') {
         return jsonResponse({
           action: 'archive',
@@ -171,15 +158,7 @@ function installFetchStub(fetches, terminalAgentRunRootIds, actionRequests) {
           archived: true,
         });
       }
-      return jsonResponse({
-        action: 'continue',
-        operationId: payload.operationId,
-        sessionId: payload.sessionId,
-        workspaceId: payload.workspaceId,
-        workspacePath: payload.workspacePath,
-        rootTaskId: payload.taskId,
-        status: 'continued',
-      });
+      return new Response('unsupported action', { status: 422 });
     }
     return new Response('not found', { status: 404 });
   };
@@ -399,13 +378,13 @@ await withGoldenViteServer(async (server) => {
   );
   const switchedProjection = agentRunStore.fetchAgentRunProjection(
     SLOW_SESSION_ID,
-    RESTARTED_ROOT_TASK_ID,
+    NEXT_ROOT_TASK_ID,
     WORKSPACE_ID,
     WORKSPACE_PATH,
   );
   await delay(0);
   assert.equal(
-    agentRunFetches.filter((url) => url.pathname.endsWith(RESTARTED_ROOT_TASK_ID)).length,
+    agentRunFetches.filter((url) => url.pathname.endsWith(NEXT_ROOT_TASK_ID)).length,
     1,
     '切换 root attempt 必须立即启动新投影请求，不能被旧 root 的 loading 状态阻塞',
   );
@@ -413,7 +392,7 @@ await withGoldenViteServer(async (server) => {
   await Promise.all([firstSlowProjection, secondSlowProjection, switchedProjection]);
   await delay(50);
   const switchedState = agentRunStore.getAgentRunState(SLOW_SESSION_ID, WORKSPACE_ID);
-  assert.equal(switchedState.rootTaskId, RESTARTED_ROOT_TASK_ID);
+  assert.equal(switchedState.rootTaskId, NEXT_ROOT_TASK_ID);
   assert.equal(switchedState.loading, false, '旧 root 请求结束后不能把新 root 留在永久 loading 状态');
   const oldRootReads = agentRunFetches.filter((url) => url.pathname.endsWith(SLOW_ROOT_TASK_ID)).length;
   await agentRunStore.fetchAgentRunProjection(SLOW_SESSION_ID, SLOW_ROOT_TASK_ID, WORKSPACE_ID, WORKSPACE_PATH);
@@ -429,23 +408,17 @@ await withGoldenViteServer(async (server) => {
     WORKSPACE_ID,
     WORKSPACE_PATH,
   );
-  const restartResponse = await agentRunStore.performAgentRunAction(
+  // 用户重新发消息会产生新的 root：运行视图只是切换到 daemon 给出的新 root，不存在“重新执行”动作。
+  await agentRunStore.fetchAgentRunProjection(
     ACTION_SESSION_ID,
-    ACTION_ROOT_TASK_ID,
-    'restart',
+    NEXT_ROOT_TASK_ID,
     WORKSPACE_ID,
     WORKSPACE_PATH,
   );
-  assert.equal(restartResponse?.newRootTaskId, RESTARTED_ROOT_TASK_ID);
   assert.equal(
     agentRunStore.getAgentRunState(ACTION_SESSION_ID, WORKSPACE_ID).rootTaskId,
-    RESTARTED_ROOT_TASK_ID,
-    '重新执行必须切换到新 root attempt，而不是复用或覆盖失败任务树',
-  );
-  assert.equal(
-    actionRequests.at(-1)?.operationId?.startsWith('agent-run-restart-'),
-    true,
-    '统一动作请求必须携带幂等 operationId',
+    NEXT_ROOT_TASK_ID,
+    '新的 root 必须成为当前运行，而不是复用或覆盖失败任务树',
   );
 
   const transferRequest = {
@@ -460,12 +433,12 @@ await withGoldenViteServer(async (server) => {
   assert.equal(agentRunStore.getAgentRunState(SESSION_ID_B, WORKSPACE_ID).transferInFlight, null);
   assert.equal(await agentRunStore.transferAgentRun(transferRequest), null, '重复点击不能创建并发转交');
   const actionCount = actionRequests.length;
-  assert.equal(await agentRunStore.performAgentRunAction(ACTION_SESSION_ID, RESTARTED_ROOT_TASK_ID, 'archive', WORKSPACE_ID), null);
+  assert.equal(await agentRunStore.performAgentRunAction(ACTION_SESSION_ID, NEXT_ROOT_TASK_ID, 'archive', WORKSPACE_ID), null);
   assert.equal(actionRequests.length, actionCount, '转交与主线控制不得并发提交');
   releaseTransfer();
   assert.equal((await transferring).taskId, transferRequest.taskId);
   assert.deepEqual(transferRequests[0], transferRequest, 'UI 必须原样提交服务端命令，不能推断代际或拥有方');
-  assert.equal(agentRunStore.getAgentRunState(ACTION_SESSION_ID, WORKSPACE_ID).rootTaskId, RESTARTED_ROOT_TASK_ID,
+  assert.equal(agentRunStore.getAgentRunState(ACTION_SESSION_ID, WORKSPACE_ID).rootTaskId, NEXT_ROOT_TASK_ID,
     '旧代理转交不能把当前主线切回原 root 或改为子 Task');
 
   rejectTransfer = true;

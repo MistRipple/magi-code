@@ -234,14 +234,12 @@
     {/if}
     <div class="panel-body">
       <p class="panel-desc">{i18n.t('lanAccess.description')}</p>
-      {#if lanUrl}
         <div class="url-row">
-          <input class="url-input" type="text" value={lanUrl} readonly />
-          <button class="btn-icon btn-icon--lg copy-btn" class:copied data-copy-feedback={copied} onclick={copyUrl} title={copied ? i18n.t('lanAccess.copied') : i18n.t('lanAccess.copy')}>
+          <input class="url-input" type="text" value={lanUrl || ''} placeholder={i18n.t('common.notProvided')} aria-label={i18n.t('lanAccess.sectionLan')} readonly />
+          <button class="btn-icon btn-icon--lg copy-btn" class:copied data-copy-feedback={copied} disabled={!lanUrl} onclick={copyUrl} title={copied ? i18n.t('lanAccess.copied') : i18n.t('lanAccess.copy')}>
             {#if copied}<Icon name="check" size={14} />{:else}<Icon name="copy" size={14} />{/if}
           </button>
         </div>
-      {/if}
     </div>
   </div>
   <div class="section tunnel-section">

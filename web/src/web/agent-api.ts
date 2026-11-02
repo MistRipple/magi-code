@@ -421,7 +421,19 @@ export function settingsBootstrapMatchesCurrentWorkspace(
     : snapshotWorkspacePath === binding.workspacePath;
 }
 
+export interface ModelPerformanceStats {
+  ttftSampleCount: number;
+  ttftTotalMs: number;
+  tpsSampleCount: number;
+  textOutputTokens: number;
+  contentDurationMs: number;
+  lastObservedAt: number;
+  lastTtftMs: number | null;
+  lastTps: number | null;
+}
+
 export interface PromptCacheStats {
+  writeObservedCallCount?: number;
   observedCallCount: number;
   hitCallCount: number;
   inputTokens: number;
@@ -432,11 +444,14 @@ export interface PromptCacheStats {
 }
 
 export interface AgentExecutionStatsItem {
+  tokenObservedCallCount?: number;
+  performance?: ModelPerformanceStats;
+  inputTokens?: number;
   cache?: PromptCacheStats;
   templateId: string;
   engineId: string;
   bindingRevision: number;
-  role: 'worker' | 'orchestrator' | 'auxiliary' | 'image_generation';
+  role: 'worker' | 'orchestrator' | 'auxiliary' | 'image_generation' | 'vision';
   displayName: string;
   provider?: string;
   declaredModelSpec?: string;
@@ -466,6 +481,9 @@ export interface AgentExecutionStatsPayload {
   lastAppliedLedgerSeq?: number;
   updatedAt: number;
   totals: {
+    tokenObservedCallCount?: number;
+    performance?: ModelPerformanceStats;
+    inputTokens?: number;
     cache?: PromptCacheStats;
     llmCallCount: number;
     assignmentCount: number;
@@ -2871,9 +2889,10 @@ export async function deleteSafeguardAudit(
   );
 }
 
-export async function getAgentExecutionStats(): Promise<AgentExecutionStatsPayload> {
+export async function getAgentExecutionStats(sessionId?: string): Promise<AgentExecutionStatsPayload> {
   try {
-    const response = await getTransport().request(agentUrl('/api/settings/stats'));
+    const query = sessionId ? new URLSearchParams({ sessionId }).toString() : undefined;
+    const response = await getTransport().request(agentUrl('/api/settings/stats', query));
     return await parseAgentJson<AgentExecutionStatsPayload>(response, 'load execution stats');
   } catch (error) {
     if (error instanceof TypeError) {

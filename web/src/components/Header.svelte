@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { getUnreadNotificationCount } from '../stores/messages.svelte';
+  import AgentStatusChip from './AgentStatusChip.svelte';
   import Icon from './Icon.svelte';
   import LanAccessPanel from './LanAccessPanel.svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -79,6 +80,7 @@
   </div>
 
   <div class="header-actions">
+    <AgentStatusChip />
     <div class="header-popover-anchor" data-shell-popover="lan">
       <button
         type="button"

@@ -43,14 +43,16 @@ assert.match(
 );
 assert.match(
   statusSource,
-  /<span class="update-status-action-slot">[\s\S]*<button[\s\S]*update-status-action[\s\S]*<\/button>[\s\S]*<span class="update-status-version">/,
-  '更新按钮必须固定在版本号之前，避免状态变化挤压后续顶部操作',
+  /<button[\s\S]*onclick=\{activateAction\}[\s\S]*<span class="update-status-version"[^>]*>[\s\S]*<span class="update-status-action-slot"[^>]*>[\s\S]*<\/button>/,
+  '版本在前、更新状态在后，同属一个按钮热区，点击版本也应执行更新动作',
 );
 assert.match(
   statusSource,
   /class=\{`btn-icon btn-icon--md update-status-action /,
-  '更新动作必须复用统一的固定尺寸图标按钮，状态切换时版本号不得移动',
+  '更新入口必须复用统一图标按钮的反馈，状态切换时版本号不得移动',
 );
+assert.match(statusSource, /aria-describedby=\{versionId\}/, '更新操作须关联当前版本的可访问说明');
+assert.match(statusSource, /class="update-status-version"[^>]*dir="ltr"/, '版本标识保持 LTR');
 assert.doesNotMatch(
   statusSource,
   /update-status-action--expanded|update-status-action-label|expanded:\s*(?:true|false)/,

@@ -119,7 +119,7 @@
 
     {#if open && isolation}
       <div class="session-isolation-popover" use:constrainPanelWidth={{ align: 'start' }} data-magi-surface="popover" role="menu">
-        <div class="session-isolation-heading">{i18n.t('isolation.chip.menuTitle')}</div>
+        <div class="session-isolation-heading composer-popover-title">{i18n.t('isolation.chip.menuTitle')}</div>
         <button type="button" class="session-isolation-item" role="menuitem" onclick={openMerge}>
           <Icon name="git-merge" size={12} />
           <span>{i18n.t('isolation.menu.merge')}</span>
@@ -199,8 +199,6 @@
 
   .session-isolation-heading {
     padding: 4px 8px 6px;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
   }
 
   .session-isolation-item {

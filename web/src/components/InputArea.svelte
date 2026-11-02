@@ -18,6 +18,7 @@
   } from '../stores/messages.svelte';
   import type { MessageBrowserNodeSelection, QueuedMessage } from '../types/message';
   import { getAgentRunState } from '../stores/agent-run-store.svelte';
+  import { activeAgentRun } from '../stores/active-agent-run.svelte';
   import {
     enhanceAgentPrompt,
     fetchAgentModelList,
@@ -42,6 +43,7 @@
   import Modal from './Modal.svelte';
   import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
   import ContextUsageRing from './ContextUsageRing.svelte';
+  import SessionStats from './SessionStats.svelte';
   import { projectSessionContextBudget } from '../lib/context-usage-ring';
   import { resolveUserMessageCommandLabel } from '../lib/user-message-command';
   import GitContextControl from './GitContextControl.svelte';
@@ -92,7 +94,6 @@
   import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
   import {
     composerAttachmentTotal,
-    composerCanContinue,
     MAX_COMPOSER_IMAGE_BYTES,
     MAX_COMPOSER_IMAGES,
     queuedMessageEditable,
@@ -594,12 +595,11 @@
   $effect(() => {
     if (resumeSubmittingSessionId && resumeSubmittingSessionId !== currentSessionId) resumeSubmittingSessionId = '';
   });
-  const canContinueSession = $derived(composerCanContinue({
-    sessionId: currentSessionId?.trim() || '',
-    turns: turnStoreState.reducer.turns,
-    runtimeCanResume: messagesState.orchestratorRuntimeState?.sessionId === currentSessionId
-      && messagesState.orchestratorRuntimeState?.canResume === true,
-  }));
+  // 停止后的“继续推进”只有一种动作：任何停止（失败、中断、用户主动停止）都由 daemon 判定
+  // 能否继续并随读模型下发，发送按钮据此显示，Web 不再从轮次或任务状态自行推断。
+  const canContinue = $derived(activeAgentRun.continuation !== null);
+  const continueSubmitting = $derived(resumeSubmitting);
+  const continueTitle = $derived(i18n.t(continueSubmitting ? 'input.continuing' : 'input.continue'));
   onMount(() => {
     const handleContinueStatus = (event: Event) => {
       const detail = (event as CustomEvent<{ sessionId: string; status: string }>).detail;
@@ -610,7 +610,7 @@
     return () => window.removeEventListener('magi:interruptedRecoveryContinueStatus', handleContinueStatus);
   });
   function continueSession(): void {
-    if (!canContinueSession || resumeSubmitting || isSending || sessionInputLocked
+    if (!canContinue || continueSubmitting || isSending || sessionInputLocked
       || isInteractionBlocking || composerHasDraft()) return;
     vscode.postMessage({ type: 'continueTask', sessionId: currentSessionId });
   }
@@ -3544,7 +3544,7 @@ async function refreshPickerSettingsSnapshot() {
               <!-- svelte-ignore a11y_no_static_element_interactions -->
               <div class="ia-popover-backdrop" onclick={() => (accessProfilePickerOpen = false)}></div>
               <div class="ia-picker-popover ia-access-popover" data-magi-surface="popover" role="group" aria-label={i18n.t('input.access.title')}>
-                <div class="ia-picker-header">{i18n.t('input.access.title')}</div>
+                <div class="ia-picker-header composer-popover-title">{i18n.t('input.access.title')}</div>
                 <div class="ia-picker-list" role="listbox" aria-label={i18n.t('input.access.title')}>
                   {#each accessProfileOptions as option (option.value)}
                     <button
@@ -3573,6 +3573,7 @@ async function refreshPickerSettingsSnapshot() {
             {/if}
           </div>
           <span class="ia-toolbar-divider" aria-hidden="true"></span>
+          <SessionStats sessionId={persistedSessionId} running={isSending} />
           <ContextUsageRing
             model={currentPickerModel}
             configuredTokenLimit={configuredContextWindow}
@@ -3654,7 +3655,7 @@ async function refreshPickerSettingsSnapshot() {
               {:else}
               <div class="ia-model-list-section">
                 <div class="ia-section-header-row">
-                  <div class="ia-picker-header">{i18n.t('input.mainModelPicker.header')}</div>
+                  <div class="ia-picker-header composer-popover-title">{i18n.t('input.mainModelPicker.header')}</div>
                   <button
                     type="button"
                     class="ia-picker-refresh"
@@ -3752,17 +3753,19 @@ async function refreshPickerSettingsSnapshot() {
           >
             <Icon name={sendPreparing ? 'loader' : 'check'} size={14} class={sendPreparing ? 'spinning' : ''} />
           </button>
-          {:else if resumeSubmitting || (!isSending && !hasContent && !editingTurn && canContinueSession)}
+          <!-- 输入框有内容时一定是发送；只有没有内容时才可能是继续（包括继续正在提交的瞬间）。 -->
+          {:else if !hasContent && !editingTurn && (continueSubmitting || (!isSending && canContinue))}
           <button
             type="button"
             class="ia-send ready"
             data-testid="input-continue-button"
+            data-continue-action={activeAgentRun.continuation}
             onclick={continueSession}
-            disabled={resumeSubmitting || sessionInputLocked || isInteractionBlocking}
-            title={i18n.t(resumeSubmitting ? 'input.continuing' : 'input.continue')}
-            aria-label={i18n.t(resumeSubmitting ? 'input.continuing' : 'input.continue')}
+            disabled={continueSubmitting || sessionInputLocked || isInteractionBlocking}
+            title={continueTitle}
+            aria-label={continueTitle}
           >
-            <Icon name={resumeSubmitting ? 'loader' : 'play'} size={14} class={resumeSubmitting ? 'spinning' : ''} />
+            <Icon name={continueSubmitting ? 'loader' : 'play'} size={14} class={continueSubmitting ? 'spinning' : ''} />
           </button>
           {:else if isSending && hasContent}
             <button
@@ -4477,10 +4480,6 @@ async function refreshPickerSettingsSnapshot() {
     justify-content: space-between;
     gap: 8px;
   }
-  .ia-section-header-row .ia-picker-header {
-    margin-bottom: 0;
-    border-bottom: none;
-  }
   .ia-picker-refresh {
     display: inline-grid;
     place-items: center;
@@ -4516,11 +4515,7 @@ async function refreshPickerSettingsSnapshot() {
     border-top: 0;
   }
   .ia-access-popover .ia-picker-header {
-    margin: 0;
     padding: 1px 6px 4px;
-    border-bottom: 0;
-    font-size: var(--text-xs);
-    line-height: 16px;
   }
   .ia-picker-item.ia-access-option {
     display: grid;
@@ -4597,11 +4592,7 @@ async function refreshPickerSettingsSnapshot() {
     box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warning) 4%, transparent);
   }
   .ia-picker-header {
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
     padding: 2px 6px 6px;
-    border-bottom: 1px dashed var(--border-subtle);
-    margin-bottom: 4px;
   }
   .ia-picker-item {
     display: flex;

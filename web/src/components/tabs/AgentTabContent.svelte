@@ -463,12 +463,10 @@
       {/if}
     </section>
   {/if}
-  {#if modelSelection}
     <div class="agent-capabilities" data-testid="agent-model-selection">
-      <strong>{i18n.t('settings.model.field.model')}</strong><span>{modelSelection.model}</span>
-      <strong>{i18n.t('settings.model.field.level')}</strong><span>{modelSelection.effective_effort ? i18n.t(`input.mainModelPicker.reasoning.${modelSelection.effective_effort}`) : i18n.t('input.mainModelPicker.reasoning.providerDefault')}</span>
+      <strong>{i18n.t('settings.model.field.model')}</strong><span>{modelSelection?.model || i18n.t('common.notProvided')}</span>
+      <strong>{i18n.t('settings.model.field.level')}</strong><span>{!modelSelection ? i18n.t('common.notProvided') : modelSelection.effective_effort ? i18n.t(`input.mainModelPicker.reasoning.${modelSelection.effective_effort}`) : i18n.t('input.mainModelPicker.reasoning.providerDefault')}</span>
     </div>
-  {/if}
   {#if activeCapabilityIds.length > 0}
     <div class="agent-capabilities" aria-label={i18n.t('settings.agents.sectionCapabilities')}>
       <strong>{i18n.t('settings.agents.sectionCapabilities')}</strong>

@@ -71,29 +71,27 @@
     .filter(item => item.key === 'compaction'));
   const breakdownRows = $derived.by(() => {
     const categories = [
-      ['messages', 'input.contextRing.category.messages', contextBreakdown?.conversationTokens ?? 0],
-      ['images', 'input.contextRing.category.images', contextBreakdown?.imageTokens ?? 0],
-      ['system', 'input.contextRing.category.system', contextBreakdown?.systemInstructionTokens ?? 0],
-      ['project', 'input.contextRing.category.project', contextBreakdown?.projectContextTokens ?? 0],
-      ['skills', 'input.contextRing.category.skills', contextBreakdown?.skillTokens ?? 0],
-      ['references', 'input.contextRing.category.references', contextBreakdown?.contextReferenceTokens ?? 0],
-      ['builtin-tools', 'input.contextRing.category.builtinTools', contextBreakdown?.builtinToolTokens ?? 0],
-      ['mcp-tools', 'input.contextRing.category.mcpTools', contextBreakdown?.mcpToolTokens ?? 0],
-      ['skill-tools', 'input.contextRing.category.skillTools', contextBreakdown?.skillToolTokens ?? 0],
-      ['other-tools', 'input.contextRing.category.otherTools', contextBreakdown?.otherToolTokens ?? 0],
+      ['messages', 'input.contextRing.category.messages', contextBreakdown?.conversationTokens],
+      ['images', 'input.contextRing.category.images', contextBreakdown?.imageTokens],
+      ['system', 'input.contextRing.category.system', contextBreakdown?.systemInstructionTokens],
+      ['project', 'input.contextRing.category.project', contextBreakdown?.projectContextTokens],
+      ['skills', 'input.contextRing.category.skills', contextBreakdown?.skillTokens],
+      ['references', 'input.contextRing.category.references', contextBreakdown?.contextReferenceTokens],
+      ['builtin-tools', 'input.contextRing.category.builtinTools', contextBreakdown?.builtinToolTokens],
+      ['mcp-tools', 'input.contextRing.category.mcpTools', contextBreakdown?.mcpToolTokens],
+      ['skill-tools', 'input.contextRing.category.skillTools', contextBreakdown?.skillToolTokens],
+      ['other-tools', 'input.contextRing.category.otherTools', contextBreakdown?.otherToolTokens],
     ] as const;
-    const total = categories.reduce((sum, [, , tokens]) => sum + Math.max(0, tokens), 0);
+    const total = categories.reduce((sum, [, , tokens]) => sum + Math.max(0, tokens ?? 0), 0);
     return categories
-      .filter(([, , tokens]) => tokens > 0)
       .map(([key, labelKey, tokens]) => ({
         key,
         label: i18n.t(labelKey),
         tokens,
-        percent: formatRingPercent(tokens / total),
-        width: tokens / total * 100,
+        percent: tokens == null || total === 0 ? '--' : `${formatRingPercent(tokens / total)}%`,
+        width: tokens != null && total > 0 ? tokens / total * 100 : 0,
       }));
   });
-  const hasBreakdown = $derived(breakdownRows.length > 0);
   const popoverId = `context-usage-ring-${Math.random().toString(36).slice(2)}`;
 
   let rootEl = $state<HTMLSpanElement | null>(null);
@@ -182,9 +180,9 @@
       if (target && root.contains(target)) return;
       pinned = false;
     };
-    window.addEventListener('click', handleWindowClick);
+    window.addEventListener('click', handleWindowClick, true);
     return () => {
-      window.removeEventListener('click', handleWindowClick);
+      window.removeEventListener('click', handleWindowClick, true);
     };
   });
 </script>
@@ -235,20 +233,18 @@
     onkeydown={handleKeydown}
   >
     <div class="context-popover-title">
-      <span>{i18n.t('input.contextRing.label')}</span>
-      {#if view.hasData}<strong class="context-usage-percent tone-{view.tone}">{view.labelText}</strong>{/if}
+      <h2 class="composer-popover-title">{i18n.t('input.contextRing.label')}</h2>
+      <strong class="context-usage-percent tone-{view.tone}">{view.labelText}</strong>
     </div>
-    {#if view.hasData}
       <div class="context-usage-summary">
-        <strong>{formatRingTokens(tokenUsed)}</strong>
-        <span>/ {formatRingTokens(tokenLimit)}</span>
+        <strong>{i18n.t('input.contextRing.usage', { value: formatRingTokens(tokenUsed) })}</strong>
+        <span>/ {i18n.t('input.contextRing.limit', { value: formatRingTokens(tokenLimit) })}</span>
       </div>
       <div class="context-usage-track tone-{view.tone}" aria-hidden="true">
         <span style:width={`${view.clampedRatio * 100}%`}></span>
       </div>
       <div class="context-usage-remaining">{i18n.t('input.contextRing.remaining', { value: formatRingTokens(remainingTokens) })}</div>
       {#if measurement === 'estimated'}<p class="context-note">{i18n.t('input.contextRing.estimated')}</p>{/if}
-      {#if hasBreakdown}
         <div class="context-breakdown-section">
           <div class="context-breakdown-heading">{i18n.t('input.contextRing.breakdown')}</div>
           <div class="context-breakdown-bar" role="img" aria-label={i18n.t('input.contextRing.breakdown')}>
@@ -262,27 +258,23 @@
                 <span class="context-breakdown-swatch category-{row.key}" aria-hidden="true"></span>
                 <span class="context-breakdown-name">{row.label}</span>
                 <span class="context-breakdown-tokens">{formatRingTokens(row.tokens)}</span>
-                <span class="context-breakdown-percent">{row.percent}%</span>
+                <span class="context-breakdown-percent">{row.percent}</span>
               </div>
             {/each}
           </div>
         </div>
-      {/if}
       {#each compactionItems as item (item.key)}<p class="context-note">{item.text}</p>{/each}
-      {#if responseReserveTokens != null || recoveryBufferTokens != null || proactiveThresholdTokens != null}
         <div class="context-budget-notes">
           <div class="context-breakdown-heading">{i18n.t('input.contextRing.budget')}</div>
           <dl class="context-budget-list">
-            {#if responseReserveTokens != null}<div><dt>{i18n.t('input.contextRing.outputReserve')}</dt><dd>{formatRingTokens(responseReserveTokens)}</dd></div>{/if}
-            {#if recoveryBufferTokens != null}<div><dt>{i18n.t('input.contextRing.recoveryBuffer')}</dt><dd>{formatRingTokens(recoveryBufferTokens)}</dd></div>{/if}
-            {#if proactiveThresholdTokens != null}<div><dt>{i18n.t('input.contextRing.compactionThreshold')}</dt><dd>{formatRingTokens(proactiveThresholdTokens)}</dd></div>{/if}
+            <div><dt>{i18n.t('input.contextRing.outputReserve')}</dt><dd>{formatRingTokens(responseReserveTokens)}</dd></div>
+            <div><dt>{i18n.t('input.contextRing.recoveryBuffer')}</dt><dd>{formatRingTokens(recoveryBufferTokens)}</dd></div>
+            <div><dt>{i18n.t('input.contextRing.compactionThreshold')}</dt><dd>{formatRingTokens(proactiveThresholdTokens)}</dd></div>
           </dl>
         </div>
-      {/if}
-    {:else}
+    {#if !view.hasData}
       <div class="context-popover-empty">{i18n.t('input.contextRing.empty')}</div>
     {/if}
-    {#if onSaveContextWindow && model}
       <div class="context-window-editor">
         {#if editing}
           <label class="context-window-label" for={`${popoverId}-window`}>{i18n.t('input.contextRing.configuredWindow')}</label>
@@ -326,14 +318,13 @@
           <div class="context-window-setting">
             <span>{i18n.t('input.contextRing.configuredWindow')}</span>
             <strong>{formatRingTokens(configuredTokenLimit ?? tokenLimit)}</strong>
-            <button type="button" class="context-window-icon-button" bind:this={editButton}
+            {#if onSaveContextWindow && model}<button type="button" class="context-window-icon-button" bind:this={editButton}
               title={i18n.t('input.contextRing.edit')} aria-label={i18n.t('input.contextRing.edit')} onclick={beginEditing}>
               <Icon name="edit" size={13} />
-            </button>
+            </button>{/if}
           </div>
         {/if}
       </div>
-    {/if}
   </div>
 </span>
 
@@ -435,7 +426,7 @@
     transform: translateY(0);
   }
 
-  .context-popover-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--foreground-muted); }
+  .context-popover-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .context-usage-percent { color: var(--primary); font-weight: var(--font-semibold); font-variant-numeric: tabular-nums; }
   .context-usage-summary { display: flex; align-items: baseline; flex-wrap: wrap; gap: 5px; color: var(--foreground-muted); font-variant-numeric: tabular-nums; }
   .context-usage-summary strong { color: var(--foreground); font-size: 18px; line-height: 1.25; font-weight: var(--font-semibold); }

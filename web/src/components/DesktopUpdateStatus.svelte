@@ -16,6 +16,7 @@
   import { showFeedback } from '../lib/notifications';
 
   const desktopRuntime = isDesktopRuntime();
+  const versionId = $props.id();
   const currentVersion = $derived(desktopUpdaterState.currentVersion);
   const update = $derived(desktopUpdaterState.update);
   const phase = $derived(desktopUpdaterState.phase);
@@ -191,16 +192,18 @@
 
 {#if desktopRuntime && currentVersion}
   <div class="update-status" data-update-phase={phase} aria-live="polite">
-    <span class="update-status-action-slot">
-      <button
-        type="button"
-        class={`btn-icon btn-icon--md update-status-action update-status-action--${actionPresentation.tone}`}
-        aria-label={actionTitle}
-        title={actionTitle}
-        aria-busy={phase === 'checking' || phase === 'downloading' || phase === 'installing'}
-        aria-disabled={actionDisabled}
-        onclick={activateAction}
-      >
+    <button
+      type="button"
+      class={`btn-icon btn-icon--md update-status-action update-status-action--${actionPresentation.tone}`}
+      aria-label={actionTitle}
+      aria-describedby={versionId}
+      title={`v${currentVersion} · ${actionTitle}`}
+      aria-busy={phase === 'checking' || phase === 'downloading' || phase === 'installing'}
+      aria-disabled={actionDisabled}
+      onclick={activateAction}
+    >
+      <span class="update-status-version" id={versionId} dir="ltr">v{currentVersion}</span>
+      <span class="update-status-action-slot" aria-hidden="true">
         {#if actionPresentation.progress}
           <span class="update-status-progress">
             <svg
@@ -230,9 +233,8 @@
             class={`update-status-action-icon${actionPresentation.spinning ? ' update-status-action-icon--spinning' : ''}`}
           />
         {/if}
-      </button>
-    </span>
-    <span class="update-status-version">v{currentVersion}</span>
+      </span>
+    </button>
   </div>
 {/if}
 
@@ -240,18 +242,16 @@
   .update-status {
     display: inline-flex;
     align-items: center;
-    gap: 1px;
-    flex: 0 0 auto;
+    flex: 0 1 auto;
     min-width: 0;
+    max-inline-size: 100%;
+    margin-inline-start: auto;
   }
 
   .update-status-version {
-    flex: 0 0 auto;
-    height: var(--btn-height-md);
-    padding: 0 4px;
-    display: inline-flex;
-    align-items: center;
-    color: var(--foreground-muted);
+    min-inline-size: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
@@ -259,12 +259,23 @@
 
   .update-status-action-slot {
     display: inline-flex;
+    align-items: center;
+    justify-content: center;
     flex: 0 0 auto;
+    inline-size: 20px;
+    block-size: 20px;
+    color: var(--update-tone);
   }
 
-  /* 尺寸、圆角、hover 由全局 .btn-icon 提供，这里只表达更新阶段的色调。 */
+  /* 版本与更新共用一个热区，复用图标工具按钮的反馈；状态槽固定，切换时不挤动版本。 */
   .update-status-action {
-    color: var(--update-tone);
+    inline-size: auto;
+    max-inline-size: 100%;
+    min-block-size: var(--btn-height-md);
+    block-size: auto;
+    padding: var(--space-2) var(--space-3);
+    gap: var(--space-3);
+    line-height: 1.5;
   }
 
   .update-status-action--idle {
@@ -297,10 +308,6 @@
 
   .update-status-action--error {
     --update-tone: var(--error, #dc2626);
-  }
-
-  .update-status-action--idle:hover:not([aria-disabled='true']) {
-    color: var(--foreground);
   }
 
   .update-status-action[aria-disabled='true'] {
@@ -392,9 +399,4 @@
     }
   }
 
-  @media (max-width: 768px) {
-    .update-status {
-      gap: 1px;
-    }
-  }
 </style>

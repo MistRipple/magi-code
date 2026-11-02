@@ -7,6 +7,7 @@ import type { AgentId, AnyAgentId } from '../shared/types/agent-types';
 import type { LocaleCode } from '../i18n/locales';
 import type { ProcessingStateSnapshot } from '../shared/protocol/processing-state';
 import type { PluginSelection, SessionTurnGuideCapability } from '../shared/app-server-protocol.generated';
+import type { SessionContinuation } from '../shared/rust-backend-types';
 
 // --- 从 orchestrator/runtime/orchestration-runtime-state-types 内联前端所需子集 ---
 
@@ -553,7 +554,8 @@ export interface OrchestratorRuntimeState {
   status: OrchestrationRuntimeStateStatus;
   phase: string;
   statusReason?: string;
-  canResume?: boolean;
+  /** daemon 判定的停止后继续方式；缺省即现在不可继续。 */
+  continuation?: SessionContinuation;
   runtimeReason?: string;
   failureReason?: string;
   errors: string[];

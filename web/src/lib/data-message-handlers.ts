@@ -1113,6 +1113,28 @@ function canonicalTurnsForSession(sessionId: string, turns: unknown): CanonicalT
     .sort((left, right) => left.turnSeq - right.turnSeq || left.turnId.localeCompare(right.turnId));
 }
 
+/**
+ * 只采用快照里的 continuation（daemon 对“当前这次停止”的判定），不采用其余运行状态。
+ * 仅当本地最新轮次仍处于停止态时才生效，已重新运行或完成的会话不会被旧快照重新点亮。
+ */
+function adoptDaemonContinuation(
+  sessionId: string,
+  snapshotState: OrchestratorRuntimeState | null | undefined,
+): void {
+  const current = messagesState.orchestratorRuntimeState;
+  if (!current || current.sessionId !== sessionId) return;
+  const latest = canonicalTurnsForSession(sessionId, turnStoreState.reducer.turns).at(-1);
+  const stopped = latest?.status === 'failed'
+    || latest?.status === 'cancelled'
+    || latest?.status === 'interrupted';
+  const next = stopped && snapshotState?.sessionId === sessionId
+    ? snapshotState.continuation
+    : undefined;
+  if (current.continuation === next) return;
+  const { continuation: _stale, ...rest } = current;
+  replaceOrchestratorRuntimeState({ ...rest, ...(next ? { continuation: next } : {}) });
+}
+
 function reconcileRuntimeStateFromCanonicalTurns(sessionId: string): void {
   const latestTurn = canonicalTurnsForSession(sessionId, turnStoreState.reducer.turns).at(-1);
   if (!latestTurn) {
@@ -1136,12 +1158,13 @@ function reconcileRuntimeStateFromCanonicalTurns(sessionId: string): void {
     ...latestTurn.items.map((item) => item.updatedAt),
   );
   const current = messagesState.orchestratorRuntimeState;
+  // continuation 是 daemon 对“当前这次停止”的判定，轮次数据推不出它：
+  // 最新轮次重新运行、完成或阻塞后它必然已失效，只有仍处于停止态时才保留 daemon 最近给出的值。
+  const { continuation, ...retained } = current ?? { errors: [], assignments: [], lastEventAt: statusChangedAt };
+  const stillStopped = status === 'failed' || status === 'cancelled';
   replaceOrchestratorRuntimeState({
-    ...(current ?? {
-      errors: [],
-      assignments: [],
-      lastEventAt: statusChangedAt,
-    }),
+    ...retained,
+    ...(stillStopped && continuation ? { continuation } : {}),
     sessionId,
     status,
     phase: status,
@@ -1483,6 +1506,13 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
         replaceOrchestratorRuntimeState(
           (snapshot.orchestratorRuntimeState as OrchestratorRuntimeState | null | undefined) ?? null,
         );
+      } else {
+        // 快照里的轮次可能比本地旧而不被采用，但停止后能否继续是 daemon 的独立判定，
+        // 不依赖轮次水位；仍处于停止态时直接采用它的最新值。
+        adoptDaemonContinuation(
+          sessionId,
+          snapshot.orchestratorRuntimeState as OrchestratorRuntimeState | null | undefined,
+        );
       }
 
       if (snapshot.notifications) {
@@ -1654,7 +1684,9 @@ function handleOrchestratorRuntimeState(message: ClientBridgeMessage) {
     ...(typeof message.statusReason === 'string' && message.statusReason.trim().length > 0
       ? { statusReason: message.statusReason.trim() }
       : {}),
-    ...(message.canResume === true ? { canResume: true } : {}),
+    ...(message.continuation === 'resume_chain' || message.continuation === 'resume_turn'
+      ? { continuation: message.continuation }
+      : {}),
     ...(typeof message.runtimeReason === 'string' && message.runtimeReason.trim().length > 0
       ? { runtimeReason: message.runtimeReason.trim() }
       : {}),

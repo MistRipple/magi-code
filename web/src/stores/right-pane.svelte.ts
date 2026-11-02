@@ -15,7 +15,12 @@
 
 import type { BrowserSessionSnapshot } from '../web/agent-api';
 
-export type RightPaneTabKind = 'agent' | 'code' | 'browser' | 'terminal' | 'plugin';
+/** 启动页在作用域内只有一个，id 固定。 */
+export const LAUNCHER_TAB_ID = 'launcher';
+/** 代理列表在作用域内同样只有一个。 */
+export const AGENTS_TAB_ID = 'agents';
+
+export type RightPaneTabKind = 'agent' | 'code' | 'browser' | 'terminal' | 'plugin' | 'launcher' | 'agents';
 
 /** Agent tab payload —— 代理运行 ID，内容由 canonical projection 按 metadata.taskId 过滤运行输出 */
 export interface AgentTabPayload {
@@ -110,7 +115,20 @@ export interface BrowserAuthoritySessionProjection {
   tabs: BrowserAuthorityTabProjection[];
 }
 
-export type RightPaneTabPayload = AgentTabPayload | CodeTabPayload | BrowserTabPayload | TerminalTabPayload | PluginTabPayload;
+/**
+ * 新标签页（启动页）：只是右栏里的一个界面入口，不拥有任何业务事实。
+ * 选择工具后由启动页自己关闭并打开对应面板；不持久化，也不进入 Desktop 面板协议。
+ */
+export interface LauncherTabPayload {
+  launcher: true;
+}
+
+/** 代理列表：当前会话的代理运行视图，数据来自代理运行投影；只是界面入口，不持久化。 */
+export interface AgentsTabPayload {
+  agents: true;
+}
+
+export type RightPaneTabPayload = AgentTabPayload | CodeTabPayload | BrowserTabPayload | TerminalTabPayload | PluginTabPayload | LauncherTabPayload | AgentsTabPayload;
 
 export interface RightPaneTab {
   id: string;
@@ -268,7 +286,9 @@ function sanitizeTabForPersist(tab: RightPaneTab): RightPaneTab {
 function tabsForPersist(tabs: RightPaneTab[]): RightPaneTab[] {
   // BrowserAuthority 在 daemon 重启和运行组件升级时负责恢复浏览器 Tab。
   // 不把浏览器实体复制到前端存储，避免先挂载已经失效的 Host 引用。
-  return tabs.filter((tab) => tab.kind !== 'browser' && tab.kind !== 'plugin').map(sanitizeTabForPersist);
+  return tabs
+    .filter((tab) => tab.kind !== 'browser' && tab.kind !== 'plugin' && tab.kind !== 'launcher' && tab.kind !== 'agents')
+    .map(sanitizeTabForPersist);
 }
 
 function isRestorableTab(tab: RightPaneTab): boolean {
@@ -485,6 +505,13 @@ function tabKey(kind: RightPaneTabKind, payload: RightPaneTabPayload): string {
     const plugin = payload as PluginTabPayload;
     return `plugin:${plugin.pluginId}:${plugin.contributionId}`;
   }
+  if (kind === 'agents') {
+    return AGENTS_TAB_ID;
+  }
+  if (kind === 'launcher') {
+    // 一个作用域同时只保留一个启动页：再次点「+」只是回到它，不堆叠空白页。
+    return LAUNCHER_TAB_ID;
+  }
   const browserPayload = payload as BrowserTabPayload;
   return `browser:${browserPayload.browserSessionId}:${browserPayload.tabId}`;
 }
@@ -605,7 +632,8 @@ function desktopPanelTabId(tab: RightPaneTab): string {
 }
 
 function rememberDesktopPanelIntent(scopeKey: string, tab: RightPaneTab): void {
-  if (!isDesktopRenderer()) return;
+  // 启动页不是 Desktop 面板，Main 的布局快照里没有对应项；记录意图会让快照同步一直等待。
+  if (!isDesktopRenderer() || tab.kind === 'launcher' || tab.kind === 'agents') return;
   pendingDesktopPanelIntent = {
     scopeKey,
     kind: tab.kind,
@@ -953,6 +981,20 @@ export function openTerminalTab(options: {
   return terminalTabId;
 }
 
+/** 打开（或回到）本作用域的新标签页。 */
+export function openLauncherTab(scopeKeyOrSessionId: string | null | undefined): string | null {
+  const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
+  if (!scopeKey) return null;
+  return upsertTab(scopeKey, 'launcher', { launcher: true }, 'New tab')?.id ?? null;
+}
+
+/** 打开（或回到）本作用域的代理列表。 */
+export function openAgentsTab(scopeKeyOrSessionId: string | null | undefined): string | null {
+  const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
+  if (!scopeKey) return null;
+  return upsertTab(scopeKey, 'agents', { agents: true }, 'Agents')?.id ?? null;
+}
+
 /** 打开已激活插件的隔离视图；入口和身份由 daemon 清单提供。 */
 export function openPluginTab(options: {
   pluginId: string;
@@ -1282,6 +1324,19 @@ export function setRightPaneCollapsed(
   }
   const session = ensureSession(scopeKey);
   session.collapsed = collapsed;
+  // 展开一个没有任何 tab 的右栏时默认打开一个新标签页：展开后总是有内容可选，
+  // 右栏也就不存在“展开但为空”的状态。
+  if (!collapsed && session.openTabs.length === 0) {
+    const tab: RightPaneTab = {
+      id: LAUNCHER_TAB_ID,
+      kind: 'launcher',
+      label: 'New tab',
+      payload: { launcher: true },
+      lastActivatedAt: now(),
+    };
+    session.openTabs = [tab];
+    session.activeTabId = tab.id;
+  }
 }
 
 /** 切换 active tab；更新 lastActivatedAt */

@@ -477,18 +477,15 @@
       <div class="settings-row">
         <div class="settings-row-copy">
           <span class="settings-row-title">
-            {browserResources
-              ? i18n.t('settings.browser.resourcesUsage', {
-                  used: browserResources.liveTabs,
-                  max: browserResources.maxTabs,
-                })
-              : i18n.t('settings.browser.resourcesReading')}
+            {i18n.t('settings.browser.resourcesUsage', {
+              used: browserResources?.liveTabs ?? '—',
+              max: browserResources?.maxTabs ?? '—',
+            })}
           </span>
           <span class="settings-row-desc">
-            {browserResources
-              ? i18n.t('settings.browser.resourcesReclaimable', { count: browserResources.reclaimableTabs })
-              : i18n.t('settings.browser.resourcesReadingDescription')}
+            {i18n.t('settings.browser.resourcesReclaimable', { count: browserResources?.reclaimableTabs ?? '—' })}
           </span>
+          {#if resourceLoading && !browserResources}<span class="settings-row-desc" role="status">{i18n.t('settings.browser.resourcesReading')}</span>{/if}
         </div>
         <button
           type="button"

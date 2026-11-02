@@ -23,6 +23,7 @@ import type {
   SubTaskItem,
 } from '../../types/message';
 import { buildEmptyWorkspaceAppState } from './empty-workspace-state';
+import type { SessionContinuation } from '../rust-backend-types';
 
 export type BootstrapPayload = SessionBootstrapSnapshot & {
   scope: 'personal' | 'workspace';
@@ -202,6 +203,7 @@ interface RustSessionRuntimeSummary {
   recovery_ref?: string | null;
   has_recoverable_chain?: boolean;
   recoverable_branch_count?: number;
+  continuation?: SessionContinuation;
   active_branches?: RustSessionRuntimeBranchSummary[];
   current_turn?: RustSessionRuntimeTurnSummary | null;
   turn_items?: RustSessionRuntimeTurnItemSummary[];
@@ -437,6 +439,11 @@ function normalizeString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+/** 只接受 daemon 约定的继续方式；其它取值一律视为不可继续，不在客户端猜测。 */
+function normalizeSessionContinuation(value: unknown): SessionContinuation | undefined {
+  return value === 'resume_chain' || value === 'resume_turn' ? value : undefined;
+}
+
 function normalizeNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : fallback;
 }
@@ -553,6 +560,7 @@ function normalizeSessionRuntimeEntries(
       recoverable_branch_count: typeof entry.recoverable_branch_count === 'number'
         ? Math.floor(entry.recoverable_branch_count)
         : undefined,
+      continuation: normalizeSessionContinuation(entry.continuation),
       active_branches: Array.isArray(entry.active_branches)
         ? entry.active_branches
           .map((branch) => normalizeObjectRecord(branch))
@@ -1901,8 +1909,7 @@ function deriveRuntimeState(
   );
   const rawRootTaskStatus = normalizeString(activeSession?.root_task_status || activeSession?.current_status);
   const rootTaskStatus = normalizeSubTaskStatus(rawRootTaskStatus);
-  const rootAllowsResume = rootTaskStatus !== 'completed' && rootTaskStatus !== 'cancelled';
-  const hasRecoverableChain = activeSession?.has_recoverable_chain === true && rootAllowsResume;
+  const hasRecoverableChain = activeSession?.has_recoverable_chain === true;
   const recoverableBranchCount = typeof activeSession?.recoverable_branch_count === 'number'
     ? activeSession.recoverable_branch_count
     : 0;
@@ -1972,7 +1979,7 @@ function deriveRuntimeState(
     errors: failureDetails,
     statusChangedAt: Math.max(normalizeNumber(activeSession?.last_update, generatedAt), latestTurnAt),
     lastEventAt: Math.max(normalizeNumber(activeSession?.last_update, generatedAt), latestTurnAt),
-    canResume: hasRecoverableChain,
+    ...(activeSession?.continuation ? { continuation: activeSession.continuation } : {}),
     runtimeReason: activeSession?.latest_event_type || undefined,
     assignments,
     chain: activeSession?.execution_chain_ref

@@ -672,13 +672,11 @@ import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } fro
                             {/if}
                           </div>
                           <div class="skill-library-desc" title={skill.description || ''}>{skill.description || ''}</div>
-                          {#if skill.author || skill.version || skill.category}
                             <div class="skill-library-meta">
-                              {#if skill.author}<span class="skill-library-meta-item">{i18n.t('settings.skillLibrary.author', { name: skill.author })}</span>{/if}
-                              {#if skill.version}<span class="skill-library-meta-item">{i18n.t('settings.skillLibrary.version', { version: skill.version })}</span>{/if}
-                              {#if skill.category}<span class="skill-library-meta-item">{i18n.t('settings.skillLibrary.category', { category: skill.category })}</span>{/if}
+                              <span class="skill-library-meta-item">{i18n.t('settings.skillLibrary.author', { name: skill.author || i18n.t('common.notProvided') })}</span>
+                              <span class="skill-library-meta-item">{i18n.t('settings.skillLibrary.version', { version: skill.version || i18n.t('common.notProvided') })}</span>
+                              <span class="skill-library-meta-item">{i18n.t('settings.skillLibrary.category', { category: skill.category || i18n.t('common.notProvided') })}</span>
                             </div>
-                          {/if}
                         </div>
                         <div class="skill-library-actions">
                           <button

@@ -286,10 +286,8 @@
         </div>
       </div>
       <div class="git-repository-stats">
-        {#if gitContextState.status?.additions || gitContextState.status?.deletions}
-          <span class="add">+{gitContextState.status?.additions ?? 0}</span>
-          <span class="del">-{gitContextState.status?.deletions ?? 0}</span>
-        {/if}
+          <span class="add">+{gitContextState.status?.additions ?? '—'}</span>
+          <span class="del">-{gitContextState.status?.deletions ?? '—'}</span>
         <button type="button" class:loading={gitContextState.loading} title={i18n.t('input.branch.refresh')} onclick={() => void refreshRepository()}>
           <Icon name="refresh" size={13} />
         </button>

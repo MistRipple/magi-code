@@ -495,11 +495,13 @@
           </div>
         {/if}
 
-        {#if showAdvancedOptions && config?.model}
+        {#if showAdvancedOptions}
           <div class="llm-config-field">
             <span class="form-label" id={fieldId('level-label')}>{i18n.t(formType === 'worker' ? 'settings.model.reasoning.workerDefault' : 'settings.model.field.level')}</span>
             <div class="reasoning-control" role="group" aria-labelledby={fieldId('level-label')}>
-              {#if reasoningStatus === 'loading'}
+              {#if !config?.model}
+                <div class="reasoning-status">{i18n.t('settings.status.notConfigured')}</div>
+              {:else if reasoningStatus === 'loading'}
                 <div class="reasoning-status" role="status"><Icon name="loader" size={14} class="spinning" />{i18n.t('settings.model.reasoning.loading')}</div>
               {:else if reasoningStatus === 'failed'}
                 <div class="reasoning-status reasoning-status--error">

@@ -45,13 +45,15 @@ assert.match(
   '链接点击的消费者必须在 Shell 上，右栏未挂载时也不能丢事件',
 );
 assert.match(shell, /decideDesktopPanelActivation\(/u);
-const chooseAddPane = rightPane.match(/async function chooseAddPane\([\s\S]*?\n  \}/u)?.[0] ?? '';
+const chooseAddPane = rightPane.match(/async function chooseLauncherTool\([\s\S]*?\n  \}\n/u)?.[0] ?? '';
 assert.match(chooseAddPane, /kind === 'browser'/u);
-assert.match(chooseAddPane, /openUrlInRightPaneBrowser\('about:blank', \{[\s\S]*?workspacePath: workspaceRoot/u);
+assert.match(chooseAddPane, /openUrlInRightPaneBrowser\('about:blank', browserCreationScope\(\)\)/u);
+assert.match(rightPane, /function browserCreationScope\(\) \{[\s\S]*?workspacePath: workspaceRoot/u);
 assert.match(chooseAddPane, /createTerminalPane\(\)/u);
+assert.match(chooseAddPane, /closeLauncher\(\)/u, '创建面板后启动页退场');
 assert.match(rightPane, /class="right-pane-browser-tab-host"/u);
 assert.match(rightPane, /class="right-pane-body"/u);
-assert.match(rightPane, /\.right-pane-add-menu-row \{[\s\S]*left: calc\(anchor\(right\) - 6px\);[\s\S]*transform: translateX\(-100%\)/u);
+assert.match(shell, /activeTab\.kind === 'launcher' \|\| activeTab\.kind === 'agents'[\s\S]*kind: null/u, '新标签页和代理列表不是 Desktop 面板');
 assert.match(browserTab, /<webview[\s\S]*allowpopups=\{false\}/u);
 assert.match(browserTab, /webpreferences="focusOnNavigation=no"/u);
 assert.match(browserTab, /function toggleDeviceEmulation\(\)/u);

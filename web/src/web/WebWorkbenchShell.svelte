@@ -608,6 +608,10 @@ import {
       // 防御分支：应用级视图不应出现在 perSession 容器里。
       return { scopeKey, kind: null, tabId: null, browserSessionId: null, browser: null };
     }
+    if (activeTab.kind === 'launcher' || activeTab.kind === 'agents') {
+      // 新标签页和代理列表只是右栏里的界面入口，Desktop 没有对应面板；与空面板一样不激活任何原生面板。
+      return { scopeKey, kind: null, tabId: null, browserSessionId: null, browser: null };
+    }
     return {
       scopeKey,
       kind: activeTab.kind,
@@ -3291,12 +3295,22 @@ import {
               class="btn-icon btn-icon--sm"
               class:sidebar-refreshing={sidebarRefreshing}
               data-testid="sidebar-refresh"
-              data-tooltip={i18n.t('common.refresh')}
-              aria-label={i18n.t('common.refresh')}
+              data-tooltip={i18n.t('web.refreshSidebar')}
+              aria-label={i18n.t('web.refreshSidebar')}
               disabled={sidebarRefreshing}
               onclick={() => void refreshSidebar()}
             >
-              <Icon name="refresh" size={13} />
+              <Icon name="refresh" size={14} />
+            </button>
+            <button
+              type="button"
+              class="btn-icon btn-icon--sm"
+              data-tooltip={i18n.t('web.projectFiles')}
+              data-sidebar-mode="files"
+              aria-label={i18n.t('web.projectFiles')}
+              onclick={applySidebarModeFromEvent}
+            >
+              <Icon name="list" size={14} />
             </button>
             <button
               type="button"
@@ -3307,18 +3321,7 @@ import {
               disabled={workspaceActionPending || !!loadError}
               onclick={openAddWorkspaceDialog}
             >
-              <Icon name="plus" size={16} />
-            </button>
-            <button
-              type="button"
-              class="btn-icon btn-icon--sm"
-              data-tooltip={i18n.t('web.projectFiles')}
-              data-sidebar-mode="files"
-              aria-label={i18n.t('web.projectFiles')}
-              onpointerdown={applySidebarModeFromEvent}
-              onclick={applySidebarModeFromEvent}
-            >
-              <Icon name="list" size={13} />
+              <Icon name="plus" size={14} />
             </button>
           </div>
         </div>
@@ -3386,12 +3389,13 @@ import {
                       void openWorkspaceDraft(workspace);
                     }}
                   >
-                    <Icon name="plus" size={12} />
+                    <Icon name="plus" size={14} />
                   </button>
                   <button
                     type="button"
                     class="btn-icon btn-icon--sm row-action"
                     data-workspace-action="edit"
+                    data-tooltip={i18n.t('web.editWorkspaceTitle')}
                     title={i18n.t('web.editWorkspaceTitle')}
                     aria-label={i18n.t('web.editWorkspaceAria', { name: workspace.name })}
                     disabled={workspaceActionPending}
@@ -3400,20 +3404,7 @@ import {
                       openProjectEditor(workspace, event.currentTarget);
                     }}
                   >
-                    <Icon name="edit" size={12} />
-                  </button>
-                  <button
-                    type="button"
-                    class="btn-icon btn-icon--sm btn-icon--danger row-action"
-                    data-workspace-action="remove"
-                    title={i18n.t('web.removeWorkspaceTitle')}
-                    aria-label={i18n.t('web.removeWorkspaceAria', { name: workspace.name })}
-                    onclick={(event) => {
-                      event.stopPropagation();
-                      openRemoveWorkspaceDialog(workspace);
-                    }}
-                  >
-                    <Icon name="x" size={12} />
+                    <Icon name="edit" size={14} />
                   </button>
                 </div>
                 {#if expandedWorkspaceIds[workspace.workspaceId]}
@@ -3614,7 +3605,6 @@ import {
             title={i18n.t('web.projectFilesBack')}
             aria-label={i18n.t('web.projectFilesBack')}
             data-sidebar-mode="projects"
-            onpointerdown={applySidebarModeFromEvent}
             onclick={applySidebarModeFromEvent}
           >
             <span class="file-tree-back-chevron" aria-hidden="true">
@@ -3630,12 +3620,12 @@ import {
               class="btn-icon btn-icon--sm"
               class:sidebar-refreshing={sidebarRefreshing}
               data-testid="sidebar-refresh"
-              data-tooltip={i18n.t('common.refresh')}
-              aria-label={i18n.t('common.refresh')}
+              data-tooltip={i18n.t('web.refreshSidebar')}
+              aria-label={i18n.t('web.refreshSidebar')}
               disabled={sidebarRefreshing || (!selectedWorkspace?.rootPath && !currentSessionId)}
               onclick={() => void refreshSidebar()}
             >
-              <Icon name="refresh" size={13} />
+              <Icon name="refresh" size={14} />
             </button>
             <button
               type="button"
@@ -3647,7 +3637,7 @@ import {
               disabled={!selectedWorkspace?.rootPath && !currentSessionId}
               onclick={() => { fileTreeShowHidden = !fileTreeShowHidden; }}
             >
-              <Icon name={fileTreeShowHidden ? 'eye' : 'eye-slash'} size={13} />
+              <Icon name={fileTreeShowHidden ? 'eye' : 'eye-slash'} size={14} />
             </button>
           </div>
         </div>
@@ -3699,7 +3689,7 @@ import {
               disabled={workspaceActionPending || messagesState.sessionHydrating}
               onclick={openPersonalDraft}
             >
-              <Icon name="plus" size={13} />
+              <Icon name="plus" size={14} />
             </button>
           </div>
         </div>
@@ -4553,10 +4543,12 @@ import {
   }
 
   .workspace-row {
-    position: relative;
-    display: flex;
+    --btn-height-sm: var(--btn-height-md);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) repeat(2, var(--btn-height-sm));
     align-items: center;
-    gap: 2px;
+    gap: var(--space-2);
+    padding-inline-end: var(--space-2);
     border-radius: var(--radius-md);
     transition: background var(--transition-fast);
   }
@@ -4571,25 +4563,14 @@ import {
     background: var(--surface-hover);
   }
 
-  /* 行内操作：默认隐藏，仅悬停该行或该按钮获得键盘可见焦点时出现。
-     不用 focus-within：鼠标点击后行会保留焦点，操作不能因此持续显示。 */
+  /* 操作占据固定列，显隐不挤动名称；键盘可见焦点和触摸同样可达。 */
   .row-action {
-    position: absolute;
-    inset-inline-end: 4px;
-    width: 24px;
-    height: 24px;
     opacity: 0;
     pointer-events: none;
   }
 
-  .row-action[data-workspace-action="new"] { inset-inline-end: 56px; }
-  .row-action[data-workspace-action="edit"] { inset-inline-end: 30px; }
-
-  .workspace-row:is(:hover, :has(.row-action:focus-visible)) .workspace-header-btn {
-    padding-inline-end: 86px;
-  }
-
   .workspace-row:hover .row-action,
+  .workspace-row:has(.workspace-header-btn:focus-visible) .row-action,
   .row-action:focus-visible {
     opacity: 1;
     pointer-events: auto;
@@ -4601,9 +4582,10 @@ import {
 
   /* 项目入口常显；其他分区工具在悬停或键盘聚焦时出现。 */
   .section-title-tools {
+    --btn-height-sm: var(--btn-height-md);
     display: flex;
     align-items: center;
-    gap: 2px;
+    gap: var(--space-1);
     flex-shrink: 0;
     opacity: 0;
     transition: opacity var(--transition-fast);
@@ -5440,19 +5422,17 @@ import {
 
   /* 触控能力决定操作是否常驻，窄桌面窗口仍使用紧凑鼠标布局。 */
   @media (hover: none), (pointer: coarse) {
+    .workspace-row { --btn-height-sm: 44px; }
+    .section-title-tools { gap: var(--space-2); }
     .row-action,
     .section-title-tools { opacity: 1; pointer-events: auto; }
-    .row-action { position: static; flex-shrink: 0; }
     .row-action:disabled { opacity: 0.35; }
     .row-action,
     .section-title-tools :global(.btn-icon),
     .sidebar-header-tools :global(.btn-icon),
     .project-editor :global(.btn-icon) { width: 44px; height: 44px; flex: 0 0 44px; padding: 14px; }
-    .workspace-row { flex-wrap: wrap; gap: 8px; padding: 4px; }
-    .workspace-header-btn { min-height: 44px; flex-basis: 100%; }
-    .workspace-row .row-action { margin-inline-end: 0; }
-    .workspace-row .row-action[data-workspace-action="remove"] { margin-inline-start: auto; }
-    .workspace-row:is(:hover, :has(.row-action:focus-visible)) .workspace-header-btn { padding-inline-end: 8px; }
+    .workspace-row { gap: var(--space-3); padding: var(--space-2); }
+    .workspace-header-btn { min-height: 44px; }
     .project-editor :global(.btn) { min-block-size: 44px; }
     .project-editor :global(.form-input) { min-block-size: 44px; }
   }

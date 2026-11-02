@@ -81,40 +81,9 @@ await withGoldenViteServer(async (server) => {
     sessionId: 'session-resume', turnId: `turn-${status}`, turnSeq: 1,
     acceptedAt: 1, status, items,
   });
-  assert.equal(policy.composerCanContinue({
-    sessionId: 'session-resume', turns: [canonicalTurn('completed')], runtimeCanResume: false,
-  }), false, 'completed sessions do not show continue');
-  assert.equal(policy.composerCanContinue({
-    sessionId: 'session-resume', turns: [canonicalTurn('failed')], runtimeCanResume: true,
-  }), true, 'recoverable runtime state shows continue');
-  assert.equal(policy.composerCanContinue({
-    sessionId: 'session-resume', turns: [canonicalTurn('cancelled', [{
-      kind: 'user_message', content: '原任务', worker: { taskId: 'task-1' },
-      metadata: { interruptionSource: 'user' },
-    }])], runtimeCanResume: false,
-  }), true, 'a user-stopped task shows continue after reload');
-  assert.equal(policy.composerCanContinue({
-    sessionId: 'session-resume', turns: [canonicalTurn('cancelled', [{
-      kind: 'user_message', content: '原任务', worker: { taskId: 'task-1' },
-    }])], runtimeCanResume: false,
-  }), false, 'an unrelated cancelled turn does not show continue');
-
   const failedWithTask = canonicalTurn('failed', [{ kind: 'user_message', content: '原任务', worker: { taskId: 'task-1' } }]);
-  assert.equal(policy.composerCanContinue({ sessionId: 'session-resume', turns: [failedWithTask], runtimeCanResume: false }), true);
-  assert.equal(policy.composerCanContinue({ sessionId: 'other', turns: [failedWithTask], runtimeCanResume: true }), false);
-  for (const status of ['pending', 'running', 'blocked', 'completed', 'superseded']) {
-    assert.equal(policy.composerCanContinue({ sessionId: 'session-resume', turns: [canonicalTurn(status)], runtimeCanResume: true }), false,
-      `${status} cannot resume even if a stale runtime projection says it can`);
-  }
-  assert.equal(policy.composerCanContinue({ sessionId: 'session-resume', turns: [
-    failedWithTask, { ...canonicalTurn('completed'), turnSeq: 2 },
-  ], runtimeCanResume: true }), false, 'new completed mainline supersedes earlier failed work');
-  assert.equal(policy.composerCanContinue({ sessionId: 'session-resume', turns: [
-    failedWithTask, { ...canonicalTurn('completed'), turnSeq: 2, metadata: { agentExecution: { taskId: 'child' } } },
-  ], runtimeCanResume: false }), true, 'child terminal state cannot replace the current mainline');
-  assert.equal(policy.composerCanContinue({ sessionId: 'session-resume', turns: [
-    canonicalTurn('interrupted', [{ metadata: { noticeKind: 'session_interrupted', recoveryState: 'ready' } }]),
-  ], runtimeCanResume: false }), true, 'restart readiness is an authoritative recovery fact');
+  // 能否继续由 daemon 判定并随读模型下发，策略层不再提供从轮次推断“可继续”的函数。
+  assert.equal(policy.composerCanContinue, undefined, '继续资格不得在 Web 自行推断');
   assert.equal(policy.isLatestMainlineTurn({
     sessionId: 'session-resume', turnId: failedWithTask.turnId, turns: [
       failedWithTask,

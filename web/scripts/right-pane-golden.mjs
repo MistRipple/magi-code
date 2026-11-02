@@ -28,6 +28,57 @@ await withGoldenViteServer(async (server) => {
   assert.deepEqual(multiPane.openTabs.map(tab => tab.payload.sourceFolderId), ['b'], '移除 A 的变更不关闭 B 的同名文件');
   rightPane.closeTab('multi-source-project\u0000multi-source-session', multiPane.openTabs[0].id);
   rightPane.activateRightPaneSession('', '');
+  // 新标签页：同一作用域只有一个，重复点「+」只是回到它；选择后由调用方关闭。
+  const launcherScope = 'launcher-scope';
+  const firstLauncher = rightPane.openLauncherTab(launcherScope);
+  rightPane.openCodeTab('launcher-session', 'a.ts', { workspaceId: '' });
+  assert.equal(rightPane.openLauncherTab(launcherScope), firstLauncher);
+  assert.equal(rightPane.getRightPaneState(launcherScope).openTabs.filter(tab => tab.kind === 'launcher').length, 1);
+  assert.equal(rightPane.getRightPaneState(launcherScope).activeTabId, rightPane.LAUNCHER_TAB_ID);
+  rightPane.closeTab(launcherScope, rightPane.LAUNCHER_TAB_ID);
+  assert.equal(rightPane.getRightPaneState(launcherScope).openTabs.length, 0);
+  rightPane.activateRightPaneSession('', '');
+
+  // 代理列表：同一作用域只有一个，重复打开只是回到它；不持久化、不是 Desktop 面板。
+  const agentsScope = 'agents-scope';
+  const agentsTab = rightPane.openAgentsTab(agentsScope);
+  assert.equal(rightPane.openAgentsTab(agentsScope), agentsTab);
+  assert.equal(rightPane.getRightPaneState(agentsScope).openTabs.filter(tab => tab.kind === 'agents').length, 1);
+  assert.equal(rightPane.getRightPaneState(agentsScope).activeTabId, rightPane.AGENTS_TAB_ID);
+  rightPane.closeTab(agentsScope, rightPane.AGENTS_TAB_ID);
+  rightPane.activateRightPaneSession('', '');
+
+  // 展开一个空的右栏：默认打开新标签页；折叠不会打开；已有 tab 时不会额外打开。
+  const emptyScope = 'empty-pane-scope';
+  rightPane.setRightPaneCollapsed(emptyScope, true);
+  assert.equal(rightPane.getRightPaneState(emptyScope).openTabs.length, 0);
+  rightPane.setRightPaneCollapsed(emptyScope, false);
+  assert.deepEqual(rightPane.getRightPaneState(emptyScope).openTabs.map(tab => tab.kind), ['launcher']);
+  assert.equal(rightPane.getRightPaneState(emptyScope).activeTabId, rightPane.LAUNCHER_TAB_ID);
+  rightPane.closeTab(emptyScope, rightPane.LAUNCHER_TAB_ID);
+  assert.equal(rightPane.getRightPaneState(emptyScope).collapsed, true, '关掉最后一个 tab 仍然折叠右栏');
+  rightPane.setRightPaneCollapsed(emptyScope, false);
+  rightPane.setRightPaneCollapsed(emptyScope, false);
+  assert.equal(rightPane.getRightPaneState(emptyScope).openTabs.length, 1, '重复展开不会堆叠新标签页');
+
+  // 「最近」：只记身份，网页 URL 去掉 query/hash，同一项只保留最新一次，数量有上限。
+  const recent = await server.ssrLoadModule('/src/stores/right-pane-recent.svelte.ts');
+  assert.equal(recent.recordableWebUrl('https://example.com/a/b?token=secret#frag'), 'https://example.com/a/b');
+  assert.equal(recent.recordableWebUrl('about:blank'), null);
+  assert.equal(recent.recordableWebUrl('file:///etc/passwd'), null);
+  const recentScope = 'recent-scope';
+  const item = (index, at = index) => ({ kind: 'code', key: `code:f${index}`, label: `f${index}`, filepath: `f${index}`, at });
+  for (let index = 0; index < recent.MAX_RECENT_PER_SCOPE + 3; index += 1) recent.recordRecentPaneItem(recentScope, item(index));
+  assert.equal(recent.recentPaneItems(recentScope).length, recent.MAX_RECENT_PER_SCOPE);
+  assert.equal(recent.recentPaneItems(recentScope)[0].key, `code:f${recent.MAX_RECENT_PER_SCOPE + 2}`, '最新的排在最前');
+  recent.recordRecentPaneItem(recentScope, item(5, 99));
+  assert.equal(recent.recentPaneItems(recentScope)[0].key, 'code:f5');
+  assert.equal(recent.recentPaneItems(recentScope).filter(entry => entry.key === 'code:f5').length, 1, '同一项去重');
+  recent.forgetRecentPaneItem(recentScope, 'code:f5');
+  assert.ok(!recent.recentPaneItems(recentScope).some(entry => entry.key === 'code:f5'));
+  recent.recordRecentPaneItem(recentScope, { kind: 'web', key: 'web:x', label: 'x', url: 'javascript:alert(1)', at: 1 });
+  assert.ok(!recent.recentPaneItems(recentScope).some(entry => entry.key === 'web:x'), '非 http(s) 的网页不记录');
+
   assert.equal(rightPane.rightPaneState.activeScopeKey, 'personal');
 
   rightPane.synchronizeBrowserTabs(
@@ -149,12 +200,25 @@ await withGoldenViteServer(async (server) => {
   assert.match(rightPaneSource, /class="right-pane-tabbar"/u);
   assert.match(rightPaneSource, /class="right-pane-body"/u);
   assert.match(rightPaneSource, /class="right-pane-browser-tab-host"[\s\S]*hidden=\{/u);
-  assert.match(rightPaneSource, /class="right-pane-add-menu-row"[\s\S]*popover="auto"[\s\S]*ontoggle=\{handleAddPaneMenuToggle\}/u);
-  assert.doesNotMatch(rightPaneSource, /addPaneMenuOpen[\s\S]*window\.addEventListener\('pointerdown'/u);
-  assert.match(rightPaneSource, /\.right-pane-add-menu-row \{[\s\S]*position-anchor: --right-pane-add-anchor/u);
-  assert.match(rightPaneSource, /\.right-pane-add-menu-row \{[\s\S]*left: calc\(anchor\(right\) - 6px\);[\s\S]*transform: translateX\(-100%\)/u);
-  assert.doesNotMatch(rightPaneSource, /right:\s*calc\(100vw\s*-\s*anchor\(right\)/u);
-  assert.match(rightPaneSource, /\.right-pane-add-tab \{[\s\S]*anchor-name: --right-pane-add-anchor/u);
+  // 「+」直接新增新标签页：不再弹出菜单，创建与最近项由启动页回传给 RightPane。
+  assert.match(rightPaneSource, /class="right-pane-add-tab"[\s\S]*onclick=\{openLauncher\}/u);
+  assert.doesNotMatch(rightPaneSource, /hasContentTabs/u, '「+」始终显示，不依赖 tab 数量');
+  assert.match(
+    rightPaneSource,
+    /if \(paneState\.collapsed \|\| openTabs\.length > 0\) return;[\s\S]*openLauncherTab\(paneScopeKey\)/u,
+    '展开而没有 tab 的右栏默认打开新标签页',
+  );
+  assert.doesNotMatch(rightPaneSource, /popover="auto"|right-pane-add-menu|anchor-name: --right-pane-add-anchor/u);
+  assert.match(rightPaneSource, /<LauncherTabContent[\s\S]*onChooseTool=[\s\S]*onOpenRecent=/u);
+  assert.match(
+    rightPaneSource,
+    /function openLauncherAgent\([\s\S]*?selectAgentRun\([\s\S]*?openAgentTab\([\s\S]*?closeLauncher\(\)/u,
+    '新标签页里的代理与运行中心一样先选中运行再打开 tab，然后退场',
+  );
+  assert.match(rightPaneSource, /selectLauncherAgents\(projection\?\.agents/u, '代理列表来自运行投影，不另存状态');
+  assert.match(storeSource, /tab\.kind !== 'launcher' && tab\.kind !== 'agents'/u, '新标签页和代理列表不持久化');
+  assert.match(rightPaneSource, /activeTab\.kind === 'agents'\}[\s\S]*<AgentListTabContent \/>/u, '代理列表由右栏渲染');
+  assert.match(storeSource, /tab\.kind === 'launcher' \|\| tab\.kind === 'agents'\) return;/u, '新标签页和代理列表不记录 Desktop 激活意图');
   assert.match(rightPaneSource, /<BrowserTabContent[\s\S]*desktopSurface=\{desktopSurface\}/u);
   assert.match(rightPaneSource, /<AgentTabContent/u);
   assert.match(rightPaneSource, /<TerminalTabContent/u);

@@ -516,32 +516,12 @@ export async function performAgentRunAction(
       workspaceId: normalizedWorkspaceId || undefined,
       workspacePath: normalizedWorkspacePath || undefined,
     });
-    if (action === 'archive') {
-      clearAgentRunProjection(
-        normalizedSessionId,
-        normalizedRootTaskId,
-        normalizedWorkspaceId,
-      );
-      return response;
-    }
-    const nextRootTaskId = action === 'restart'
-      ? (response.newRootTaskId?.trim() || response.rootTaskId.trim())
-      : response.rootTaskId.trim();
-    if (action === 'restart') {
-      retiredSessionRootIds.add(sessionRootKey(
-        normalizedWorkspaceId,
-        normalizedSessionId,
-        normalizedRootTaskId,
-      ));
-    }
-    if (nextRootTaskId) {
-      await fetchAgentRunProjection(
-        normalizedSessionId,
-        nextRootTaskId,
-        normalizedWorkspaceId,
-        normalizedWorkspacePath,
-      );
-    }
+    // 运行视图的操作只剩归档：投影被清掉，继续是会话级动作，不经过这里。
+    clearAgentRunProjection(
+      normalizedSessionId,
+      normalizedRootTaskId,
+      normalizedWorkspaceId,
+    );
     return response;
   } catch (error) {
     state.actionError = agentRunActionErrorMessage(error);

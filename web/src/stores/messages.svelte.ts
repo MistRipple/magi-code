@@ -776,7 +776,9 @@ function normalizeOrchestratorRuntimeState(
   const statusReason = typeof input.statusReason === 'string' && input.statusReason.trim().length > 0
     ? input.statusReason.trim()
     : undefined;
-  const canResume = input.canResume === true ? true : undefined;
+  const continuation = input.continuation === 'resume_chain' || input.continuation === 'resume_turn'
+    ? input.continuation
+    : undefined;
   const runtimeReason = typeof input.runtimeReason === 'string' && input.runtimeReason.trim().length > 0
     ? input.runtimeReason.trim()
     : undefined;
@@ -824,7 +826,7 @@ function normalizeOrchestratorRuntimeState(
     ...(requestId ? { requestId } : {}),
     ...(chain ? { chain } : {}),
     ...(statusReason ? { statusReason } : {}),
-    ...(canResume ? { canResume } : {}),
+    ...(continuation ? { continuation } : {}),
     ...(runtimeReason ? { runtimeReason } : {}),
     ...(failureReason ? { failureReason } : {}),
     ...(startedAt ? { startedAt } : {}),

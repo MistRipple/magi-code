@@ -117,8 +117,10 @@ await withGoldenViteServer(async (server) => {
     assert.equal(view.tone, 'normal', 'empty state defaults to normal tone');
     assert.equal(view.geometry.dashOffset, view.geometry.circumference,
       'empty ring draws zero progress (offset == circumference)');
-    assert.equal(ring.buildRingTooltip({}, t), '暂无上下文用量',
-      'empty tooltip shows the dedicated empty copy');
+    assert.equal(ring.buildRingTooltip({}, t), '上下文 --, 已用 --, 剩余 --, 窗口 --, 暂无上下文用量',
+      'empty tooltip preserves fixed labels and adds the empty note');
+    assert.equal(ring.resolveRingView({ tokenUsed: 0, tokenLimit: 1000 }).labelText, '0%',
+      'confirmed zero tokens resolve to zero percent');
   }
 
   // 场景 2：null/NaN/Infinity 也算无数据。
@@ -294,8 +296,12 @@ await withGoldenViteServer(async (server) => {
     );
     assert.deepEqual(
       ring.buildRingDetailItems({}, t),
-      [],
-      'empty ring has no detail rows and renders the dedicated empty copy instead',
+      [
+        { key: 'usage', text: '已用 --' },
+        { key: 'remaining', text: '剩余 --' },
+        { key: 'limit', text: '窗口 --' },
+      ],
+      'empty ring preserves all fixed detail rows',
     );
   }
 
