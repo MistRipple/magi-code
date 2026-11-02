@@ -110,7 +110,7 @@
 | 状态与依据类型 | 编号 | 严重度 | 位置与缺陷 | 建议顺序 |
 | --- | --- | --- | --- | --- |
 | 现状·读码推断 | G1 | P1 | [host.rs:173](../crates/magi-plugin-runtime/src/host.rs#L173) 的能力取消结算受 [host.rs:210](../crates/magi-plugin-runtime/src/host.rs#L210) 外层 biased select 抢先返回；处理器 future 可先被丢弃，100ms 通知结算路径未获保证。当前 SDK 主要同步存储，不能据此认定已存在脱离的网络副作用 | 随旧宿主替换消除该路径；新宿主必须回归处理器收到取消及结算顺序，不先扩建 QuickJS |
-| 现状·读码推断 | G2 | P1 | [plugins.rs:272](../crates/magi-api/src/routes/plugins.rs#L272) 缺响应级 sandbox，直接导航可能获得 daemon 同源身份 | 第一批，补响应隔离及真实浏览器验证 |
+| 现状·已运行验证（响应头） | G2 | P1 | [plugins.rs:272](../crates/magi-api/src/routes/plugins.rs#L272) 缺响应级 sandbox，直接导航可能获得 daemon 同源身份 | 响应头已补 `sandbox allow-scripts`，单元回归 `view_resources_carry_a_response_level_sandbox` 通过；真实浏览器直接导航验证仍待做，在此之前不标为已验证修复 |
 | 现状·读码推断 | G3 | P1 | [package.rs:244](../crates/magi-plugin-system/src/package.rs#L244) 接受无强制点的文件/网络权限；与实际 SDK 不符 | 新清单区分完全信任与 Magi 服务授权；删除装饰性 OS 权限，不为未投产 SDK 1 保留授权转换层 |
 | 现状·读码推断 | G4 | P2 | [lifecycle.rs:61](../crates/magi-plugin-system/src/lifecycle.rs#L61)、[lifecycle.rs:1000](../crates/magi-plugin-system/src/lifecycle.rs#L1000) 全局单一 scope 仍使用集合、键和排空通配符；[board:9](../examples/plugins/board/manifest.json#L9) 仍声明 workspace 权限。两种 scope 含义混杂，不能说示例必然被拒绝 | 新合同直接收敛并重写示例；不保留旧 scope 解释器或双写 |
 | 现状·读码推断 | G5 | P1 | [center.rs:195](../crates/magi-api/src/routes/plugins/center.rs#L195) 安装重新拉目录、无用户预览摘要绑定；普通安装的 expectedDigest 也为可选，[plugins.rs:430](../crates/magi-api/src/routes/plugins.rs#L430)。目录摘要校验仍存在，但不能保证用户确认的候选未变 | 第一批，所有来源统一预览凭据 |

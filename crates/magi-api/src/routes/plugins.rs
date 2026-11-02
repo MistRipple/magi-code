@@ -272,7 +272,7 @@ async fn resource(
     response.headers_mut().insert(
         "content-security-policy",
         HeaderValue::from_static(
-            "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; object-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'; connect-src 'none'",
+            "sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; object-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'; connect-src 'none'",
         ),
     );
     response.headers_mut().insert(
@@ -1097,6 +1097,81 @@ mod tests {
         )
         .with_plugin_manager(manager);
         (api_state, root)
+    }
+
+    #[tokio::test]
+    async fn view_resources_carry_a_response_level_sandbox() {
+        let manifest = serde_json::json!({
+            "sdkVersion": 1,
+            "id": "acme.viewer",
+            "version": "1.0.0",
+            "name": "Viewer",
+            "description": "",
+            "backend": "plugin.mjs",
+            "permissions": [],
+            "dataSchemaVersion": 1,
+            "settingsSchema": {"type":"object","additionalProperties":false},
+            "contributions": {"views":[{
+                "id": "page", "title": "Page", "entry": "ui/index.html",
+                "placements": ["main"]
+            }]}
+        });
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in [
+            ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
+            ("plugin.mjs", b"export default () => ({})".to_vec()),
+            ("ui/index.html", b"<!doctype html><title>x</title>".to_vec()),
+        ] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        let package =
+            PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = PluginManager::open(root.path()).unwrap();
+        manager
+            .install(
+                &package,
+                PluginSource::Local {
+                    name: "viewer.zip".into(),
+                },
+            )
+            .unwrap();
+        manager.enable("acme.viewer", "application").unwrap();
+        manager
+            .authorize("acme.viewer", "application", Vec::new())
+            .unwrap();
+        manager.activate("acme.viewer", "application").unwrap();
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(magi_event_bus::InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_plugin_manager(Arc::new(std::sync::Mutex::new(manager)));
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/plugins/acme.viewer/ui/index.html?scope=application")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.starts_with("sandbox allow-scripts;"), "{csp}");
+        assert!(csp.contains("connect-src 'none'"), "{csp}");
+        drop(root);
     }
 
     #[tokio::test]
