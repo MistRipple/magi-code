@@ -4087,27 +4087,33 @@ async function refreshPickerSettingsSnapshot() {
     flex-shrink: 0;
   }
 
-  /* 发送按钮：圆形 */
+  /* 主操作以高对比实心圆区别于工具图标，配色复用共享主按钮令牌。 */
   .ia-send {
     display: flex;
     align-items: center;
     justify-content: center;
     width: 28px;
     height: 28px;
+    flex-shrink: 0;
     padding: 0;
     background: var(--surface-2);
     border: none;
     border-radius: var(--radius-full);
     color: var(--foreground-muted);
     cursor: pointer;
-    transition: all var(--transition-fast);
+    transition: background var(--transition-fast), color var(--transition-fast), opacity var(--transition-fast);
   }
 
-  .ia-send.ready { background: var(--primary); color: white; }
-  .ia-send.ready:hover { background: var(--primary-hover); transform: scale(1.08); }
+  .ia-send.ready:not(:disabled) {
+    background: var(--btn-primary-bg);
+    color: var(--btn-primary-fg);
+  }
+  .ia-send.ready:hover:not(:disabled) { background: var(--btn-primary-hover-bg); }
+  .ia-send.ready:active:not(:disabled) {
+    background: color-mix(in srgb, var(--btn-primary-bg) 76%, var(--btn-primary-fg));
+  }
   .ia-send:disabled { opacity: 0.35; cursor: not-allowed; }
   .ia-send.stop { background: var(--error); color: white; animation: ia-pulse 1.2s ease-in-out infinite; }
-  @keyframes ia-spin { to { transform: rotate(360deg); } }
   @keyframes ia-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.65; } }
 
   .ia-enhance {
@@ -5138,6 +5144,7 @@ async function refreshPickerSettingsSnapshot() {
     background: var(--surface-active, var(--surface-hover));
   }
   @media (hover: none), (pointer: coarse) {
+    .ia-send { width: 44px; height: 44px; flex: 0 0 44px; }
     .ia-actions { flex-wrap: wrap; gap: 8px; }
     .ia-left { flex: 1 1 100%; flex-wrap: wrap; gap: 8px; max-width: 100%; }
     .ia-right { flex: 1 1 100%; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }

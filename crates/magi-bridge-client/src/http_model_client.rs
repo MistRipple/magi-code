@@ -1257,6 +1257,13 @@ struct BodyStreamTiming {
     usage_observed: bool,
 }
 
+#[derive(Default)]
+struct StreamDeltaProgress {
+    content_len: usize,
+    thinking_len: usize,
+    tool_call_count: usize,
+}
+
 impl BodyStreamTiming {
     fn observe(
         &mut self,
@@ -1357,9 +1364,7 @@ fn apply_provider_stream_event(
     provider_family: ProviderFamily,
     event: &crate::protocol::streaming::SseEvent,
     accumulator: &mut StreamAccumulator,
-    last_content_delta_len: &mut usize,
-    last_thinking_delta_len: &mut usize,
-    last_tool_call_count: &mut usize,
+    delta_progress: &mut StreamDeltaProgress,
     tx: &std::sync::mpsc::Sender<StreamMessage>,
     timing: &mut BodyStreamTiming,
     received_at: Duration,
@@ -1410,15 +1415,15 @@ fn apply_provider_stream_event(
     let accumulated_thinking = accumulator.accumulated_thinking();
     let accumulated_tool_calls = accumulator.accumulated_tool_calls();
     let tool_call_count = accumulated_tool_calls.len();
-    if accumulated_content.len() > *last_content_delta_len
-        || accumulated_thinking.len() > *last_thinking_delta_len
-        || tool_call_count > *last_tool_call_count
+    if accumulated_content.len() > delta_progress.content_len
+        || accumulated_thinking.len() > delta_progress.thinking_len
+        || tool_call_count > delta_progress.tool_call_count
     {
         // 只发这一帧新增的部分：流式就是增量，不能每帧把到目前为止的全文再发一遍。
         let (mut content, content_rewritten) =
-            new_suffix(&accumulated_content, *last_content_delta_len);
+            new_suffix(&accumulated_content, delta_progress.content_len);
         let (mut thinking, thinking_rewritten) =
-            new_suffix(&accumulated_thinking, *last_thinking_delta_len);
+            new_suffix(&accumulated_thinking, delta_progress.thinking_len);
         let replace = content_rewritten || thinking_rewritten;
         if replace {
             // 改写帧两个字段都携带完整文字。
@@ -1426,12 +1431,12 @@ fn apply_provider_stream_event(
             thinking = accumulated_thinking.clone();
         }
         let new_tool_calls = accumulated_tool_calls
-            .get(*last_tool_call_count..)
+            .get(delta_progress.tool_call_count..)
             .map(<[_]>::to_vec)
             .unwrap_or_default();
-        *last_content_delta_len = accumulated_content.len();
-        *last_thinking_delta_len = accumulated_thinking.len();
-        *last_tool_call_count = tool_call_count;
+        delta_progress.content_len = accumulated_content.len();
+        delta_progress.thinking_len = accumulated_thinking.len();
+        delta_progress.tool_call_count = tool_call_count;
         if tx
             .send(StreamMessage::Chunk(ModelStreamingDelta {
                 content,
@@ -1808,9 +1813,7 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
     // 用于累积跨 read 调用的不完整 UTF-8 字节，防止多字节字符（如中文 3 字节）
     // 被 4096 buffer 边界切割后 lossy 替换为 U+FFFD 导致数据损坏。
     let mut utf8_remainder: Vec<u8> = Vec::new();
-    let mut last_content_delta_len = 0usize;
-    let mut last_thinking_delta_len = 0usize;
-    let mut last_tool_call_count = 0usize;
+    let mut delta_progress = StreamDeltaProgress::default();
     let mut saw_sse_event = false;
     let mut saw_protocol_terminal = false;
     let mut terminal_drain_deadline = None;
@@ -1883,9 +1886,7 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
                 provider_family,
                 &sse_event,
                 &mut accumulator,
-                &mut last_content_delta_len,
-                &mut last_thinking_delta_len,
-                &mut last_tool_call_count,
+                &mut delta_progress,
                 &tx,
                 &mut body_timing,
                 received_at,
@@ -1894,9 +1895,9 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
                 break 'stream_read;
             }
             if !first_delta_reported
-                && (last_content_delta_len > 0
-                    || last_thinking_delta_len > 0
-                    || last_tool_call_count > 0)
+                && (delta_progress.content_len > 0
+                    || delta_progress.thinking_len > 0
+                    || delta_progress.tool_call_count > 0)
             {
                 first_delta_reported = true;
                 tracing::info!(
@@ -1921,9 +1922,7 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
                 provider_family,
                 &sse_event,
                 &mut accumulator,
-                &mut last_content_delta_len,
-                &mut last_thinking_delta_len,
-                &mut last_tool_call_count,
+                &mut delta_progress,
                 &tx,
                 &mut body_timing,
                 received_at,

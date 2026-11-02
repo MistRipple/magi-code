@@ -1897,14 +1897,13 @@ async fn execution_stats(
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = parse_optional_query_string(&query, "sessionId");
-    if let Some(id) = &session_id {
-        if state
+    if let Some(id) = &session_id
+        && state
             .session_store
             .session(&magi_core::SessionId::new(id.clone()))
             .is_none()
-        {
-            return Err(ApiError::session_not_found(id));
-        }
+    {
+        return Err(ApiError::session_not_found(id));
     }
     let mut authority = state.event_bus.with_audit_usage_ledger(|ledger| {
         usage_authority_from_usage_entries_filtered(&ledger.usage_entries, session_id.as_deref())
