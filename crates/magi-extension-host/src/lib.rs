@@ -4,6 +4,9 @@
 //! 尚未接入 conversation-runtime 的实际调用链。
 
 pub mod breaker;
+
+/// 允许提案改写已装配历史的钩子；缓存归因与保护规则见 `docs/prompt-cache-lineage-architecture.md`。
+pub const EXTENSION_REWRITE_HOOKS: [&str; 2] = ["context.assemble", "compaction.before"];
 pub mod bus;
 pub mod frame;
 pub mod instance;

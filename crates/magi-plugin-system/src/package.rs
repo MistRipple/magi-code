@@ -239,15 +239,31 @@ fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
         permission.kind == PluginPermissionKind::Extension && permission.targets == ["full-trust"]
     });
     let Some(extension) = &manifest.extension else {
-        if manifest
-            .permissions
-            .iter()
-            .any(|permission| permission.kind == PluginPermissionKind::Extension)
-        {
-            return Err(invalid("extension 权限只能由声明了 extension 的包使用"));
+        if manifest.permissions.iter().any(|permission| {
+            matches!(
+                permission.kind,
+                PluginPermissionKind::Extension | PluginPermissionKind::ContextRewrite
+            )
+        }) {
+            return Err(invalid(
+                "extension / contextRewrite 权限只能由声明了 extension 的包使用",
+            ));
         }
         return Ok(());
     };
+    // 改写已装配历史会让缓存前缀失效并改变模型看到的上下文，必须由用户单独授权。
+    let rewrites_history = extension
+        .hooks
+        .iter()
+        .any(|hook| magi_extension_host::EXTENSION_REWRITE_HOOKS.contains(&hook.name.as_str()));
+    let rewrite_declared = manifest.permissions.iter().any(|permission| {
+        permission.kind == PluginPermissionKind::ContextRewrite && permission.targets == ["history"]
+    });
+    if rewrites_history != rewrite_declared {
+        return Err(invalid(
+            "context.assemble / compaction.before 钩子必须且只能与权限 contextRewrite:[\"history\"] 一同声明",
+        ));
+    }
     if !trust_declared {
         return Err(invalid(
             "声明 extension 的包必须声明权限 extension:[\"full-trust\"]，用户据此确认扩展以其用户权限运行",

@@ -188,6 +188,8 @@ pub(crate) struct ContextAuthority<'a> {
         Option<&'a (dyn Fn(ContextCompactionProgress) -> Result<(), String> + Sync)>,
     is_cancelled: Option<&'a (dyn Fn() -> bool + Sync)>,
     compaction_progress_gate: Mutex<ContextCompactionProgressGate>,
+    /// 扩展 `compaction.before` 端口；None 表示没有可执行扩展。
+    extension_hooks: Option<&'a dyn crate::extension_hooks::ExtensionHooks>,
 }
 
 /// 上下文压缩策略。
@@ -331,7 +333,16 @@ impl<'a> ContextAuthority<'a> {
             compaction_observer: None,
             is_cancelled: None,
             compaction_progress_gate: Mutex::new(ContextCompactionProgressGate::default()),
+            extension_hooks: None,
         }
+    }
+
+    pub(crate) fn with_extension_hooks(
+        mut self,
+        hooks: Option<&'a dyn crate::extension_hooks::ExtensionHooks>,
+    ) -> Self {
+        self.extension_hooks = hooks;
+        self
     }
 
     pub(crate) fn with_compaction_runtime(
@@ -994,15 +1005,43 @@ impl<'a> ContextAuthority<'a> {
             total_chunks: 1,
         })?;
         let source = serialize_compaction_source(&history[..split])?;
-        let summary = self.build_compaction_summary(
-            &summary_model,
-            &source,
-            source_budget,
-            summary_output_limit,
-            0,
-            1,
-            instructions,
-        )?;
+        // 扩展 `compaction.before`：范围、配对与预算已由上面决定，扩展只能继续、取消或给出摘要。
+        // 取消按既有压缩失败语义处理（请求仍在窗口内则继续，否则停住）；自定义摘要仍须通过
+        // 与模型摘要相同的质量门禁，随后走同一条检查点安装与预算校验链路。
+        let extension_summary = match self.extension_hooks.map(|hooks| {
+            const SOURCE_CAP_CHARS: usize = 256 * 1024;
+            let capped: String = source.chars().take(SOURCE_CAP_CHARS).collect();
+            hooks.compaction_before(&crate::extension_hooks::CompactionView {
+                session_id: self.session_id.as_str(),
+                reason: decision.reason_label(),
+                compacted_messages: split,
+                original_tokens,
+                summary_budget_tokens: summary_output_limit,
+                source: &capped,
+            })
+        }) {
+            Some(crate::extension_hooks::CompactionDecision::Cancel { plugin, reason }) => {
+                return Err(format!("扩展 {plugin} 取消了本次上下文压缩：{reason}"));
+            }
+            Some(crate::extension_hooks::CompactionDecision::Summary { plugin, summary }) => {
+                let validated = validate_compaction_summary(&summary)
+                    .map_err(|error| format!("扩展 {plugin} 的自定义摘要未通过门禁：{error}"))?;
+                Some(validated)
+            }
+            Some(crate::extension_hooks::CompactionDecision::Proceed) | None => None,
+        };
+        let summary = match extension_summary {
+            Some(summary) => summary,
+            None => self.build_compaction_summary(
+                &summary_model,
+                &source,
+                source_budget,
+                summary_output_limit,
+                0,
+                1,
+                instructions,
+            )?,
+        };
         self.notify_compaction(ContextCompactionProgress::Advanced {
             stage: "history_summary",
             completed_chunks: 1,

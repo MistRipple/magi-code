@@ -972,6 +972,8 @@ fn run_conversation_loop_inner(
         ));
         tail
     };
+    let rewrite_memo = crate::extension_hooks::RewriteMemo::default();
+    let current_round = std::cell::Cell::new(0usize);
     let with_volatile_context_tail = |messages: &[ChatMessage],
                                       context_window_tokens: u64,
                                       steps_tail: Option<&ChatMessage>,
@@ -979,8 +981,26 @@ fn run_conversation_loop_inner(
                                       discovery_warning: Option<&ChatMessage>|
      -> Vec<ChatMessage> {
         // 总预算只作用于原始结果序列的副本：`messages` 保持原样，视图才是它的纯函数。
-        let (history, projection) =
+        let (history, mut projection) =
             crate::history_projection::bounded_request_history(messages, context_window_tokens);
+        // 扩展 `context.assemble`：在预算投影之后、成为请求视图之前征询并裁决；canonical 原文不变。
+        let history = match extension_hooks {
+            Some(hooks) => crate::extension_hooks::apply_context_assemble(
+                hooks,
+                &crate::extension_hooks::ToolHookScope {
+                    session_id: session_id.as_str(),
+                    task_id: task_id.as_str(),
+                    workspace_id: workspace_id.as_ref().map(|id| id.as_str()),
+                    worker_id: worker_id.map(|id| id.as_str()),
+                    round: current_round.get(),
+                },
+                &rewrite_memo,
+                history,
+                context_window_tokens,
+                &mut projection,
+            ),
+            None => history,
+        };
         *history_projection.borrow_mut() = projection;
         controls.view(
             &history,
@@ -1148,6 +1168,7 @@ fn run_conversation_loop_inner(
         )
         .with_expected_turn_id(expected_turn_id.as_deref())
         .with_task_id(task_id)
+        .with_extension_hooks(extension_hooks)
         .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
         .prepare(ContextPrepareRequest {
             recovery_history: Vec::new(),
@@ -1476,6 +1497,7 @@ fn run_conversation_loop_inner(
     let mut prepared_execution_task = None;
     let mut retired_workspace_root = None;
     'conversation_round: for round in 0usize.. {
+        current_round.set(round);
         if let Some(failure) = emergency_model_round_failure(round) {
             let error = match append_task_error_turn_item(
                 turn_writeback_context,
@@ -5130,6 +5152,140 @@ mod tests {
             decision,
             ThreadHistoryCompactionDecision::EstimatedPrefill { .. }
         ));
+    }
+
+    /// 压缩前钩子的脚本化替身；调用模型会 panic，用来证明自定义摘要/取消时没有再调用摘要模型。
+    struct CompactionPolicy(crate::extension_hooks::CompactionDecision);
+    impl crate::extension_hooks::ExtensionHooks for CompactionPolicy {
+        fn tool_call(
+            &self,
+            _: &crate::extension_hooks::ToolHookScope<'_>,
+            _: &ChatToolCall,
+        ) -> crate::extension_hooks::ToolCallDecision {
+            unreachable!()
+        }
+        fn tool_result(
+            &self,
+            _: &crate::extension_hooks::ToolHookScope<'_>,
+            _: &ChatToolCall,
+            _: crate::extension_hooks::ToolResultView<'_>,
+        ) -> Option<String> {
+            unreachable!()
+        }
+        fn compaction_before(
+            &self,
+            view: &crate::extension_hooks::CompactionView<'_>,
+        ) -> crate::extension_hooks::CompactionDecision {
+            assert!(view.compacted_messages > 0 && !view.source.is_empty());
+            self.0.clone()
+        }
+    }
+    struct NoModelCalls;
+    impl ModelBridgeClient for NoModelCalls {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+        fn invoke(&self, _: ModelInvocationRequest) -> Result<ModelResponse, BridgeClientError> {
+            panic!("扩展接管摘要或取消压缩时不应调用摘要模型")
+        }
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<ModelResponse, BridgeClientError> {
+            self.invoke(request)
+        }
+    }
+
+    fn compact_with(
+        hooks: &CompactionPolicy,
+        label: &str,
+    ) -> (
+        crate::context_authority::PreparedThreadHistory,
+        SessionStore,
+        ThreadId,
+    ) {
+        let client = NoModelCalls;
+        let session_store = SessionStore::new();
+        let session_id = SessionId::new(format!("session-ext-compaction-{label}"));
+        session_store
+            .create_session(session_id.clone(), "ext compaction")
+            .unwrap();
+        let (_, thread_id) =
+            session_store.ensure_session_mission(&session_id, UtcMillis(1), || {
+                MissionId::new(format!("mission-ext-compaction-{label}"))
+            });
+        let event_bus = InMemoryEventBus::new(32);
+        let workspace_id = Some(WorkspaceId::new("workspace-ext-compaction"));
+        let prepared = ContextAuthority::new(
+            &client,
+            &event_bus,
+            &session_store,
+            &session_id,
+            &workspace_id,
+            &thread_id,
+            None,
+        )
+        .with_extension_hooks(Some(hooks))
+        .prepare(ContextPrepareRequest {
+            recovery_history: repeated_thread_history(1_000, 1_000),
+            phase: "pre_turn",
+            context_window_tokens: 256_000,
+            additional_context: Default::default(),
+            persist_checkpoint: true,
+            model_identity: None,
+            mode: ContextCompactionMode::Automatic,
+        });
+        (prepared, session_store, thread_id)
+    }
+
+    const EXTENSION_SUMMARY: &str = "## 目标与完成标准\n- 扩展摘要。\n## 约束与权限\n- 无。\n## 工作区事实\n- 无。\n## 工具与外部操作\n- 无。\n## 代理状态\n- 无。\n## 已确认决策\n- 无。\n## 阻塞与风险\n- 无。\n## 下一步\n- 继续。\n## 禁止重复\n- 无。";
+
+    #[test]
+    fn extension_summary_replaces_the_model_summary_but_goes_through_the_same_checkpoint_path() {
+        use crate::extension_hooks::CompactionDecision;
+        let hooks = CompactionPolicy(CompactionDecision::Summary {
+            plugin: "acme.summary".into(),
+            summary: EXTENSION_SUMMARY.into(),
+        });
+        let (prepared, store, thread) = compact_with(&hooks, "summary");
+        assert!(prepared.compaction.is_some(), "{:?}", prepared.terminal);
+        let checkpoint = store
+            .thread_context_checkpoint(&thread)
+            .expect("检查点按原路径安装");
+        assert!(
+            checkpoint
+                .summary_message
+                .content
+                .unwrap()
+                .contains("扩展摘要")
+        );
+        // 原始 transcript 不被替换。
+        assert_eq!(store.thread_message_history(&thread).len(), 1_000);
+    }
+
+    #[test]
+    fn a_custom_summary_that_fails_the_quality_gate_does_not_install_a_checkpoint() {
+        use crate::extension_hooks::CompactionDecision;
+        let hooks = CompactionPolicy(CompactionDecision::Summary {
+            plugin: "acme.summary".into(),
+            summary: "太短，缺少交接字段".into(),
+        });
+        let (prepared, store, thread) = compact_with(&hooks, "bad");
+        assert!(prepared.compaction.is_none());
+        assert!(store.thread_context_checkpoint(&thread).is_none());
+    }
+
+    #[test]
+    fn a_cancelled_compaction_follows_the_existing_failure_semantics_and_installs_nothing() {
+        use crate::extension_hooks::CompactionDecision;
+        let hooks = CompactionPolicy(CompactionDecision::Cancel {
+            plugin: "acme.guard".into(),
+            reason: "稍后再压缩".into(),
+        });
+        let (prepared, store, thread) = compact_with(&hooks, "cancel");
+        assert!(prepared.compaction.is_none());
+        assert!(store.thread_context_checkpoint(&thread).is_none());
     }
 
     #[test]

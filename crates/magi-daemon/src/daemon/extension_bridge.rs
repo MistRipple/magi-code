@@ -3,10 +3,15 @@
 //! 对话循环在阻塞线程上同步执行工具；适配器用 daemon 的 tokio Handle 等待 ExtensionBus 的
 //! 异步分发。没有任何扩展登记 `tool.call` / `tool.result` 时直接放行，不产生分发开销。
 
+use magi_bridge_client::ChatMessage;
 use magi_bridge_client::ChatToolCall;
-use magi_conversation_runtime::extension_hooks::{
-    ExtensionHooks, InputDecision, InputGuard, InputView, SpawnDecision, SubagentSpawnView,
-    ToolCallDecision, ToolHookScope, ToolResultView,
+use magi_conversation_runtime::{
+    ExtensionRewriteProposal,
+    extension_hooks::{
+        AssembleView, CompactionDecision, CompactionView, ExtensionHooks, InputDecision,
+        InputGuard, InputView, SpawnDecision, SubagentSpawnView, ToolCallDecision, ToolHookScope,
+        ToolResultView,
+    },
 };
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_extension_host::bus::{ExtensionBus, HookContext, TraceOutcome, Verdict};
@@ -111,9 +116,160 @@ impl InputGuard for ExtensionBusHooks {
     }
 }
 
+/// 给扩展看的历史视图的上限：单条正文与总量。超出部分以 `truncated`/`omitted` 如实标注。
+const ASSEMBLE_TEXT_CAP_CHARS: usize = 8 * 1024;
+const ASSEMBLE_TOTAL_CAP_BYTES: usize = 1024 * 1024;
+
+fn assemble_input(view: &AssembleView<'_>) -> Value {
+    let mut total = 0usize;
+    let mut omitted = 0usize;
+    let mut messages = Vec::new();
+    for index in view.rewritable.clone() {
+        let message = &view.messages[index];
+        let full = message.content.as_deref().unwrap_or_default();
+        let text: String = full.chars().take(ASSEMBLE_TEXT_CAP_CHARS).collect();
+        total += text.len();
+        if total > ASSEMBLE_TOTAL_CAP_BYTES {
+            omitted += 1;
+            continue;
+        }
+        messages.push(json!({
+            "index": index,
+            "role": message.role,
+            "text": text,
+            "truncated": text.chars().count() < full.chars().count(),
+            "hasToolCalls": !message.tool_calls.is_empty() || message.tool_call_id.is_some(),
+        }));
+    }
+    json!({
+        "sessionId": view.session_id,
+        "contextWindowTokens": view.context_window_tokens,
+        "rewritable": {"from": view.rewritable.start, "to": view.rewritable.end},
+        "messages": messages,
+        "omitted": omitted,
+    })
+}
+
+/// 把插件补丁里的 `rewrites` 解析成提案；形态不符的补丁整体忽略（advise 失败保留原生视图）。
+fn parse_rewrites(
+    plugin: &str,
+    hook: &str,
+    patch: &Value,
+) -> Option<Vec<ExtensionRewriteProposal>> {
+    let list = patch.get("rewrites")?.as_array()?;
+    list.iter()
+        .map(|entry| {
+            let replacement = entry
+                .get("replacement")?
+                .as_array()?
+                .iter()
+                .map(|message| {
+                    Some(ChatMessage {
+                        input_request_id: None,
+                        context_origin: Default::default(),
+                        role: message.get("role")?.as_str()?.to_string(),
+                        content: Some(message.get("text")?.as_str()?.to_string()),
+                        images: Vec::new(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        provider_context: Vec::new(),
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(ExtensionRewriteProposal {
+                plugin_id: plugin.to_string(),
+                contribution_id: hook.to_string(),
+                hook: hook.to_string(),
+                from: usize::try_from(entry.get("from")?.as_u64()?).ok()?,
+                to: usize::try_from(entry.get("to")?.as_u64()?).ok()?,
+                replacement,
+            })
+        })
+        .collect()
+}
+
 impl ExtensionHooks for ExtensionBusHooks {
     fn observe(&self, hook: &'static str, payload: Value) {
         self.bus.notify(hook, payload);
+    }
+
+    fn context_assemble(
+        &self,
+        scope: &ToolHookScope<'_>,
+        view: &AssembleView<'_>,
+    ) -> Vec<ExtensionRewriteProposal> {
+        if !self.bus.has_hook("context.assemble") {
+            return Vec::new();
+        }
+        let mut ctx = HookContext::new(format!("inv_assemble_{}_{}", scope.task_id, scope.round));
+        ctx.owner = json!({
+            "sessionId": scope.session_id,
+            "taskId": scope.task_id,
+            "stepId": scope.round,
+            "workerId": scope.worker_id,
+        });
+        ctx.binding = json!({"workspaceId": scope.workspace_id});
+        let Ok(outcome) = self.handle.block_on(self.bus.invoke(
+            "context.assemble",
+            &ctx,
+            assemble_input(view),
+        )) else {
+            return Vec::new();
+        };
+        outcome
+            .patches
+            .iter()
+            .filter_map(|(plugin, patch)| {
+                let parsed = parse_rewrites(plugin, "context.assemble", patch);
+                if parsed.is_none() {
+                    tracing::warn!(%plugin, "context.assemble 补丁形态无效，已忽略");
+                }
+                parsed
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn context_rewrite_authorized(&self, plugin_id: &str) -> bool {
+        self.bus.is_context_rewrite_authorized(plugin_id)
+    }
+
+    fn compaction_before(&self, view: &CompactionView<'_>) -> CompactionDecision {
+        if !self.bus.has_hook("compaction.before") {
+            return CompactionDecision::Proceed;
+        }
+        let mut ctx = HookContext::new(format!("inv_compaction_{}", view.session_id));
+        ctx.owner = json!({"sessionId": view.session_id});
+        let input = json!({
+            "reason": view.reason,
+            "compactedMessages": view.compacted_messages,
+            "originalTokens": view.original_tokens,
+            "summaryBudgetTokens": view.summary_budget_tokens,
+            "source": view.source,
+        });
+        let Ok(outcome) = self
+            .handle
+            .block_on(self.bus.invoke("compaction.before", &ctx, input))
+        else {
+            return CompactionDecision::Proceed;
+        };
+        if let Verdict::Blocked { plugin, reason } = outcome.verdict {
+            return CompactionDecision::Cancel { plugin, reason };
+        }
+        // 自定义摘要需要 contextRewrite 授权；未授权的提案被忽略（advise 保留原生摘要）。
+        outcome
+            .patches
+            .iter()
+            .filter(|(plugin, _)| self.bus.is_context_rewrite_authorized(plugin))
+            .find_map(|(plugin, patch)| {
+                patch.get("summary").and_then(Value::as_str).map(|summary| {
+                    CompactionDecision::Summary {
+                        plugin: plugin.clone(),
+                        summary: summary.to_string(),
+                    }
+                })
+            })
+            .unwrap_or(CompactionDecision::Proceed)
     }
 
     fn subagent_spawn(
@@ -749,6 +905,173 @@ mod tests {
             "{log}"
         );
         assert!(lines.contains("usage:m1:7"), "{log}");
+        instance.stop().await;
+    }
+
+    /// 改写类钩子经真实 Node 扩展：历史改写提案、授权开关、压缩前的取消与自定义摘要。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn history_rewrite_hooks_reach_a_real_node_extension_and_respect_authorization() {
+        use magi_extension_host::{
+            bus::BusPolicy,
+            instance::{LaunchConfig, launch},
+            protocol::{HookMode, HookRegistration},
+        };
+        use std::path::Path;
+
+        let host_crate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../magi-extension-host");
+        let dir = tempfile::tempdir().unwrap();
+        let declared = vec![
+            HookRegistration {
+                name: "context.assemble".into(),
+                mode: HookMode::Advise,
+                deadline_ms: Some(3000),
+            },
+            HookRegistration {
+                name: "compaction.before".into(),
+                mode: HookMode::Advise,
+                deadline_ms: Some(3000),
+            },
+        ];
+        let node = std::env::var_os("MAGI_EXTENSION_NODE")
+            .map(std::path::PathBuf::from)
+            .or_else(|| magi_process::resolve_executable("node"))
+            .expect("需要 Node");
+        let mut config = LaunchConfig::new(
+            node,
+            host_crate.join("runtime/host.mjs"),
+            host_crate.join("tests/fixtures/guard/extension/index.mjs"),
+            dir.path().join("sock"),
+        );
+        config.plugin_id = "acme.guard".into();
+        config.version = "1.0.0".into();
+        config.config = json!({"marker": null, "hooks": ["context.assemble", "compaction.before"]});
+        config.hooks = declared.clone();
+        let bus = Arc::new(ExtensionBus::new(BusPolicy::default()));
+        bus.register_plugin("acme.guard", &declared).unwrap();
+        let group = magi_process::ManagedProcessGroup::new();
+        let instance = launch(&group, config, 1).await.expect("launch");
+        assert!(bus.attach(Arc::clone(&instance)));
+        let hooks = Arc::new(ExtensionBusHooks::new(Arc::clone(&bus), Handle::current()));
+
+        assert!(
+            !hooks.context_rewrite_authorized("acme.guard"),
+            "默认未授权"
+        );
+        bus.set_context_rewrite_authorized("acme.guard", true);
+        assert!(hooks.context_rewrite_authorized("acme.guard"));
+
+        let result = tokio::task::spawn_blocking({
+            let hooks = Arc::clone(&hooks);
+            move || {
+                let message = |role: &str, text: &str| ChatMessage {
+                    input_request_id: None,
+                    context_origin: Default::default(),
+                    role: role.into(),
+                    content: Some(text.into()),
+                    images: vec![],
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    provider_context: vec![],
+                };
+                let history = vec![
+                    message("user", "OLD 目标"),
+                    message("assistant", "OLD 回答"),
+                    message("user", "新问题"),
+                    message("assistant", "新回答"),
+                    message("user", "当前输入"),
+                ];
+                let scope = ToolHookScope {
+                    session_id: "s1",
+                    task_id: "t",
+                    workspace_id: None,
+                    worker_id: None,
+                    round: 1,
+                };
+                let rewritable = 0..4;
+                let proposals = hooks.context_assemble(
+                    &scope,
+                    &AssembleView {
+                        session_id: "s1",
+                        messages: &history,
+                        rewritable: &rewritable,
+                        context_window_tokens: 100_000,
+                    },
+                );
+                let view = magi_conversation_runtime::apply_extension_rewrites(
+                    &history,
+                    rewritable.clone(),
+                    &|plugin| hooks.context_rewrite_authorized(plugin),
+                    &proposals,
+                );
+                let compaction = |source: &str| {
+                    hooks.compaction_before(&CompactionView {
+                        session_id: "s1",
+                        reason: "threshold",
+                        compacted_messages: 10,
+                        original_tokens: 1000,
+                        summary_budget_tokens: 500,
+                        source,
+                    })
+                };
+                (
+                    proposals,
+                    view,
+                    compaction("plain"),
+                    compaction("CANCELME"),
+                    compaction("CUSTOMSUMMARY"),
+                )
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.0.len(), 1);
+        assert_eq!(
+            (
+                result.0[0].plugin_id.as_str(),
+                result.0[0].from,
+                result.0[0].to
+            ),
+            ("acme.guard", 0, 2)
+        );
+        let (view, records) = result.1.expect("授权的提案被采纳");
+        assert_eq!(
+            view.iter()
+                .map(|m| m.content.clone().unwrap())
+                .collect::<Vec<_>>(),
+            ["[扩展摘要]", "新问题", "新回答", "当前输入"]
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(result.2, CompactionDecision::Proceed);
+        assert_eq!(
+            result.3,
+            CompactionDecision::Cancel {
+                plugin: "acme.guard".into(),
+                reason: "稍后再压缩".into()
+            }
+        );
+        assert!(
+            matches!(result.4, CompactionDecision::Summary { ref plugin, ref summary } if plugin == "acme.guard" && summary.contains("扩展摘要"))
+        );
+
+        // 撤销授权：自定义摘要被忽略（保留原生摘要），历史改写提案会被唯一投影拒绝。
+        bus.set_context_rewrite_authorized("acme.guard", false);
+        let revoked = tokio::task::spawn_blocking({
+            let hooks = Arc::clone(&hooks);
+            move || {
+                hooks.compaction_before(&CompactionView {
+                    session_id: "s1",
+                    reason: "threshold",
+                    compacted_messages: 10,
+                    original_tokens: 1000,
+                    summary_budget_tokens: 500,
+                    source: "CUSTOMSUMMARY",
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(revoked, CompactionDecision::Proceed);
         instance.stop().await;
     }
 }

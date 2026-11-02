@@ -202,6 +202,14 @@ impl ExtensionRuntime {
         if let Err(error) = self.bus.register_plugin(id, &hooks) {
             return failed(format!("钩子登记被拒绝: {error}"));
         }
+        // 能激活就说明清单声明的权限已全部授权；contextRewrite 授权决定历史改写提案是否被采纳。
+        self.bus.set_context_rewrite_authorized(
+            id,
+            package.manifest().permissions.iter().any(|permission| {
+                permission.kind
+                    == magi_app_server_protocol::generated::PluginPermissionKind::ContextRewrite
+            }),
+        );
         let Some(node) = self.node.clone() else {
             return failed(format!(
                 "未找到随包 Node（应位于 daemon 同级的 node/ 目录；开发时可设置 {EXTENSION_NODE_ENV}）"

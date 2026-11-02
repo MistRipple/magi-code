@@ -14,7 +14,10 @@
 | `session.created` `session.deleted` `turn.accepted` `turn.end` `usage.update` | observe | 领域事件总线的先提交后发布事实，经 daemon 转发器投影为有限、脱敏字段（不含正文、提示词、凭据）；`turn.end` 由 `session.turn.item` 事件里的终态派生并按 Turn 去重；事件总线是广播通道，消费落后会丢事件（只记日志，观察钩子不承诺完整送达） |
 | `model.resolved` `model.request` `model.response` | observe | `StepModelClient` 在 Step 事实提交后通知，仅限任务主线（`conversation_loop`）；纯会话 profile 的模型调用尚未接线 |
 
-**刻意未接线**：`prompt.contribute`、`context.assemble`、`compaction.before`。`extension_rewrite` 失效原因、记录合同与唯一投影已在[缓存架构](prompt-cache-lineage-architecture.md#扩展改写extension_rewrite)落地并有回归，但提案/裁决的持久化、`contextRewrite` 授权项与 ExtensionBus 接线尚未完成，因此仍不开放；`input` 与 `model.request` 的 advise 改写、`subagent.spawn` 的收窄尚未实现。
+| `context.assemble` | advise | `conversation_loop` 的请求视图构造处：预算投影之后、成为请求之前。扩展看到可改写区域的消息（逐条截断、总量有界，标注 `truncated`/`omitted`），返回 `{rewrites:[{from,to,replacement:[{role,text}]}]}`；提案经唯一投影裁决，需用户授权 `contextRewrite`（清单必须与改写钩子一同声明 `contextRewrite:["history"]`，反之亦然），生效记录写进 `HistoryProjection.extensionRewrites` 并由缓存归因 `extension_rewrite`。提案被拒或扩展失败时保留原生视图。同一输入在一个 Step 内只征询一次 |
+| `compaction.before` | advise（`block` 即取消） | `ContextAuthority` 在 daemon 决定压缩范围、配对与预算之后、调用摘要模型之前。取消按既有压缩失败语义处理（请求仍在窗口内则继续，否则停住）；自定义 `{summary}` 需 `contextRewrite` 授权，必须通过与模型摘要相同的九段质量门禁和预算校验，然后走同一条检查点安装链路（因此摘要正文随检查点持久化） |
+
+**刻意未接线**：`prompt.contribute`（稳定片段进入前缀、预算与来源标记的合同尚未定案）。仅主线任务循环接入，纯会话 profile 未接。`context.assemble` 的改写**不持久化替换内容**：每个新 Step 的新输入都会重新征询扩展，重启后同样重新征询；稳定性是扩展的责任，内容变化会按 `extension_rewrite` 归因并在记录里可见，审计靠 `originalDigest`/`replacementDigest`；`input` 与 `model.request` 的 advise 改写、`subagent.spawn` 的收窄尚未实现。
 
 **尚未实现**：`command/tool/job/migration` 方法、`model.invoke`/`tool.call`/`task.spawn`/`resource.*`/`credential.ref`/blob 等宿主→daemon 服务、`hook.invoke` 的 `ctx` 中的 `deadline` 绝对时间戳（当前传 `deadlineMs`）、Windows 命名管道路径（已编写、未编译验证）、以及对 conversation-runtime 实际调用链的接线——其余钩子目前不会被真实 Turn 触发。落点引用沿用设计文档 5.6 的核对结果。
 - 【目标】协议只有一条执行路径，服务 Node 宿主；不为 QuickJS 或 SDK 1 提供任何子集（设计文档 I14、D1）。

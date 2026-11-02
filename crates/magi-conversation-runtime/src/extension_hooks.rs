@@ -81,7 +81,164 @@ pub trait InputGuard: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = InputDecision> + Send + 'a>>;
 }
 
+/// `context.assemble` 给扩展看的装配历史（有限视图：正文按条截断，不含图片与私有上下文）。
+#[derive(Clone, Copy, Debug)]
+pub struct AssembleView<'a> {
+    pub session_id: &'a str,
+    /// 全部装配消息（含系统段）；`rewritable` 之外的下标不可改写。
+    pub messages: &'a [magi_bridge_client::ChatMessage],
+    pub rewritable: &'a std::ops::Range<usize>,
+    pub context_window_tokens: u64,
+}
+
+/// 同一份输入只征询一次扩展：一个 Step 内会多次构造请求视图（估算、恢复、真实请求），
+/// 它们必须看到同一组提案，既避免重复调用，也避免同一 Step 内视图不一致。
+#[derive(Default)]
+pub(crate) struct RewriteMemo(
+    std::cell::RefCell<Option<(String, Vec<crate::ExtensionRewriteProposal>)>>,
+);
+
+/// 压缩检查点摘要消息的标记；其及之前的历史属于检查点边界，不可改写。
+const COMPACTION_MARKER: &str = "[context_compaction]";
+
+/// 可改写区域：压缩检查点之后、当前（最后一条）用户输入之前。
+pub(crate) fn rewritable_range(view: &[magi_bridge_client::ChatMessage]) -> std::ops::Range<usize> {
+    let start = view
+        .iter()
+        .rposition(|message| {
+            message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains(COMPACTION_MARKER))
+        })
+        .map_or(0, |index| index + 1);
+    let end = view
+        .iter()
+        .rposition(|message| {
+            message.role == "user"
+                && message.context_origin == magi_bridge_client::ChatMessageOrigin::Conversation
+        })
+        .unwrap_or(view.len());
+    let end = end.max(start);
+    // 前导的系统/项目/Skill 等非对话段不属于可改写区域。
+    let start = (start..end)
+        .find(|index| {
+            view[*index].context_origin == magi_bridge_client::ChatMessageOrigin::Conversation
+        })
+        .unwrap_or(end);
+    start..end
+}
+
+/// `context.assemble` 的唯一应用点：在请求视图上征询扩展、经唯一投影裁决，并把生效的
+/// 改写记录写进投影报告（随 Step 冻结，缓存据此归因 `extension_rewrite`）。
+///
+/// advise 语义：提案被拒绝或扩展失败时保留原生视图，不改变行为。
+pub(crate) fn apply_context_assemble(
+    hooks: &dyn ExtensionHooks,
+    scope: &ToolHookScope<'_>,
+    memo: &RewriteMemo,
+    history: Vec<magi_bridge_client::ChatMessage>,
+    context_window_tokens: u64,
+    projection: &mut magi_session_store::HistoryProjection,
+) -> Vec<magi_bridge_client::ChatMessage> {
+    let rewritable = rewritable_range(&history);
+    if rewritable.is_empty() {
+        return history;
+    }
+    let key = {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(&(&history, &rewritable)).unwrap_or_default();
+        magi_core::hex_lower(Sha256::digest(bytes))
+    };
+    let cached = memo
+        .0
+        .borrow()
+        .as_ref()
+        .filter(|(cached_key, _)| *cached_key == key)
+        .map(|(_, proposals)| proposals.clone());
+    let proposals = cached.unwrap_or_else(|| {
+        let proposals = hooks.context_assemble(
+            scope,
+            &AssembleView {
+                session_id: scope.session_id,
+                messages: &history,
+                rewritable: &rewritable,
+                context_window_tokens,
+            },
+        );
+        *memo.0.borrow_mut() = Some((key, proposals.clone()));
+        proposals
+    });
+    if proposals.is_empty() {
+        return history;
+    }
+    match crate::apply_extension_rewrites(
+        &history,
+        rewritable,
+        &|plugin| hooks.context_rewrite_authorized(plugin),
+        &proposals,
+    ) {
+        Ok((view, records)) => {
+            projection.extension_rewrites = records;
+            view
+        }
+        Err(rejection) => {
+            tracing::warn!(?rejection, "扩展的历史改写提案被拒绝，保留原生视图");
+            history
+        }
+    }
+}
+
+/// `compaction.before` 的裁决：继续（原生摘要）、取消，或由扩展给出自定义摘要。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompactionDecision {
+    Proceed,
+    /// 取消本次压缩。压缩仍按既有失败语义处理：请求仍在窗口内则继续，否则停住，不强行继续。
+    Cancel {
+        plugin: String,
+        reason: String,
+    },
+    /// 自定义摘要提案，仍须通过与模型摘要相同的质量门禁和预算校验。
+    Summary {
+        plugin: String,
+        summary: String,
+    },
+}
+
+/// 压缩即将开始时 daemon 已决定的事实：范围、配对与预算不由扩展决定。
+#[derive(Clone, Copy, Debug)]
+pub struct CompactionView<'a> {
+    pub session_id: &'a str,
+    pub reason: &'a str,
+    /// 被压缩的历史条数（前缀 [0, compacted_messages)）。
+    pub compacted_messages: usize,
+    pub original_tokens: usize,
+    pub summary_budget_tokens: usize,
+    /// 被压缩前缀的序列化原文（已按宿主上限截断）。
+    pub source: &'a str,
+}
+
 pub trait ExtensionHooks: Send + Sync {
+    /// `context.assemble`：对本次请求的装配历史提出受控改写。返回的提案由唯一投影
+    /// （[`crate::apply_extension_rewrites`]）裁决，插件必须已获 `contextRewrite` 授权。
+    fn context_assemble(
+        &self,
+        _scope: &ToolHookScope<'_>,
+        _view: &AssembleView<'_>,
+    ) -> Vec<crate::ExtensionRewriteProposal> {
+        Vec::new()
+    }
+
+    /// 插件是否已被用户授权 `contextRewrite`。
+    fn context_rewrite_authorized(&self, _plugin_id: &str) -> bool {
+        false
+    }
+
+    /// `compaction.before`：压缩范围与预算已由 daemon 决定，扩展只能继续、取消或给出摘要。
+    fn compaction_before(&self, _view: &CompactionView<'_>) -> CompactionDecision {
+        CompactionDecision::Proceed
+    }
+
     /// 观察类钩子：只通知已提交的事实，不阻塞、不返回结果。
     fn observe(&self, _hook: &'static str, _payload: serde_json::Value) {}
 
@@ -483,5 +640,135 @@ mod tests {
         let results = batch.merge(Vec::new());
         assert_eq!(results[0].1, ExecutionResultStatus::Rejected);
         assert!(results[0].0.contains("extension_rewrite_invalid"));
+    }
+
+    struct AssemblePolicy {
+        authorized: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl ExtensionHooks for AssemblePolicy {
+        fn tool_call(&self, _: &ToolHookScope<'_>, _: &ChatToolCall) -> ToolCallDecision {
+            unreachable!()
+        }
+        fn tool_result(
+            &self,
+            _: &ToolHookScope<'_>,
+            _: &ChatToolCall,
+            _: ToolResultView<'_>,
+        ) -> Option<String> {
+            None
+        }
+        fn context_assemble(
+            &self,
+            _: &ToolHookScope<'_>,
+            view: &AssembleView<'_>,
+        ) -> Vec<crate::ExtensionRewriteProposal> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // 把可改写区域的前两条合并成一条摘要。
+            vec![crate::ExtensionRewriteProposal {
+                plugin_id: "acme.summary".into(),
+                contribution_id: "context.assemble".into(),
+                hook: "context.assemble".into(),
+                from: view.rewritable.start,
+                to: view.rewritable.start + 2,
+                replacement: vec![msg("assistant", "摘要")],
+            }]
+        }
+        fn context_rewrite_authorized(&self, plugin_id: &str) -> bool {
+            self.authorized && plugin_id == "acme.summary"
+        }
+    }
+
+    fn msg(role: &str, text: &str) -> magi_bridge_client::ChatMessage {
+        magi_bridge_client::ChatMessage {
+            input_request_id: None,
+            context_origin: Default::default(),
+            role: role.into(),
+            content: Some(text.into()),
+            images: vec![],
+            tool_calls: vec![],
+            tool_call_id: None,
+            provider_context: vec![],
+        }
+    }
+
+    fn assembled() -> Vec<magi_bridge_client::ChatMessage> {
+        let mut system = msg("system", "规则");
+        system.context_origin = magi_bridge_client::ChatMessageOrigin::SystemInstruction;
+        vec![
+            system,
+            msg("user", "u0"),
+            msg("assistant", "a0"),
+            msg("user", "u1"),
+            msg("assistant", "a1"),
+            msg("user", "当前输入"),
+        ]
+    }
+
+    #[test]
+    fn the_rewritable_range_excludes_system_segments_the_checkpoint_and_the_current_input() {
+        assert_eq!(rewritable_range(&assembled()), 1..5);
+        let mut with_checkpoint = assembled();
+        with_checkpoint[2].content =
+            Some("[context_compaction]\n摘要\n[/context_compaction]".into());
+        assert_eq!(rewritable_range(&with_checkpoint), 3..5);
+        // 没有对话段时区域为空。
+        assert!(rewritable_range(&[assembled().remove(0)]).is_empty());
+    }
+
+    #[test]
+    fn a_proposal_inside_the_rewritable_region_is_applied_recorded_and_not_asked_twice() {
+        let history = assembled();
+        let hooks = AssemblePolicy {
+            authorized: true,
+            calls: Default::default(),
+        };
+        let memo = RewriteMemo::default();
+        let mut projection = magi_session_store::HistoryProjection::default();
+        let view = apply_context_assemble(
+            &hooks,
+            &scope(),
+            &memo,
+            history.clone(),
+            128_000,
+            &mut projection,
+        );
+        assert_eq!(
+            view.iter()
+                .map(|m| m.content.clone().unwrap())
+                .collect::<Vec<_>>(),
+            ["规则", "摘要", "u1", "a1", "当前输入"]
+        );
+        assert_eq!(projection.extension_rewrites.len(), 1);
+        assert_eq!(projection.extension_rewrites[0].plugin_id, "acme.summary");
+        // 同一输入再次构造视图（估算、恢复、真实请求）：不再征询，结果一致。
+        let mut again = magi_session_store::HistoryProjection::default();
+        let second = apply_context_assemble(&hooks, &scope(), &memo, history, 128_000, &mut again);
+        assert_eq!(hooks.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            serde_json::to_string(&view).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+        assert_eq!(projection, again);
+    }
+
+    #[test]
+    fn unauthorized_plugins_never_change_the_view() {
+        let history = assembled();
+        let hooks = AssemblePolicy {
+            authorized: false,
+            calls: Default::default(),
+        };
+        let mut projection = magi_session_store::HistoryProjection::default();
+        let view = apply_context_assemble(
+            &hooks,
+            &scope(),
+            &RewriteMemo::default(),
+            history.clone(),
+            128_000,
+            &mut projection,
+        );
+        assert_eq!(view.len(), history.len());
+        assert!(projection.extension_rewrites.is_empty());
     }
 }

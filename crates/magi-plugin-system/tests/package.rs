@@ -384,3 +384,34 @@ fn node_extension_packages_reject_every_ambiguous_or_unsupported_shape() {
             .is_err()
     );
 }
+
+#[test]
+fn history_rewrite_hooks_require_the_separate_context_rewrite_authorization() {
+    let rewrite_hook = json!([{"name":"context.assemble","mode":"advise"}]);
+    let trust = json!({"kind":"extension","scope":"application","targets":["full-trust"]});
+    let rewrite = json!({"kind":"contextRewrite","scope":"application","targets":["history"]});
+    let build = |hooks: &Value, permissions: Vec<&Value>| {
+        let mut value = extension_manifest();
+        value["extension"]["hooks"] = hooks.clone();
+        value["permissions"] = json!(permissions);
+        PluginPackage::from_archive(&extension_archive(&value, ENTRY))
+    };
+    assert!(build(&rewrite_hook, vec![&trust, &rewrite]).is_ok());
+    assert!(
+        build(&rewrite_hook, vec![&trust]).is_err(),
+        "改写钩子必须声明 contextRewrite"
+    );
+    assert!(
+        build(
+            &json!([{"name":"tool.call","mode":"guard"}]),
+            vec![&trust, &rewrite]
+        )
+        .is_err(),
+        "没有改写钩子就不能申请 contextRewrite"
+    );
+    let wrong_target = json!({"kind":"contextRewrite","scope":"application","targets":["all"]});
+    assert!(build(&rewrite_hook, vec![&trust, &wrong_target]).is_err());
+    let mut qjs = manifest();
+    qjs["permissions"] = json!([rewrite]);
+    assert!(PluginPackage::from_archive(&archive(&qjs, &[])).is_err());
+}

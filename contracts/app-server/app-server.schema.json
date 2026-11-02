@@ -2320,7 +2320,8 @@
         "tools",
         "models",
         "browser",
-        "extension"
+        "extension",
+        "contextRewrite"
       ]
     },
     "PluginPermission": {

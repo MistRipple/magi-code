@@ -1524,6 +1524,8 @@ pub enum PluginPermissionKind {
     Browser,
     #[serde(rename = "extension")]
     Extension,
+    #[serde(rename = "contextRewrite")]
+    ContextRewrite,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

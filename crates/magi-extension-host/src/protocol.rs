@@ -242,7 +242,7 @@ pub const HOOKS: &[HookSpec] = &[
     HookSpec {
         name: "context.assemble",
         modes: ADVISE,
-        wired: NONE,
+        wired: ADVISE,
         replace: true,
         patch_limit: 64 * KIB,
     },
@@ -277,7 +277,7 @@ pub const HOOKS: &[HookSpec] = &[
     HookSpec {
         name: "compaction.before",
         modes: ADVISE,
-        wired: NONE,
+        wired: ADVISE,
         replace: true,
         patch_limit: 64 * KIB,
     },
@@ -438,6 +438,8 @@ mod tests {
             ("subagent.spawn", HookMode::Guard),
             ("turn.end", HookMode::Observe),
             ("model.request", HookMode::Observe),
+            ("context.assemble", HookMode::Advise),
+            ("compaction.before", HookMode::Advise),
         ] {
             assert!(reg(name, mode).validate_wired().is_ok(), "{name} {mode:?}");
         }
@@ -445,8 +447,6 @@ mod tests {
             ("input", HookMode::Advise),
             ("model.request", HookMode::Advise),
             ("prompt.contribute", HookMode::Advise),
-            ("context.assemble", HookMode::Advise),
-            ("compaction.before", HookMode::Advise),
             ("subagent.spawn", HookMode::Advise),
         ] {
             assert!(reg(name, mode).validate_wired().is_err(), "{name} {mode:?}");

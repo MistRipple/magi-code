@@ -1619,6 +1619,7 @@ dependencies = [
  "magi-context-runtime",
  "magi-core",
  "magi-event-bus",
+ "magi-extension-host",
  "magi-git",
  "magi-governance",
  "magi-knowledge-store",

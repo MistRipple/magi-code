@@ -34,4 +34,25 @@ export default async function activate(api) {
     event.role === 'reviewer' ? { decision: 'block', reason: '禁止评审代理' } : { decision: 'continue' });
   await on('session.created', (event) => { note(`session.created:${event.sessionId}`); });
   await on('usage.update', (event) => { note(`usage:${event.model}:${event.inputTokens}`); });
+  await on('context.assemble', async (event) => {
+    const messages = event.messages;
+    if (messages.length >= 2 && messages[0].text.includes('OLD')) {
+      return {
+        decision: 'replace',
+        patch: { rewrites: [{
+          from: messages[0].index,
+          to: messages[1].index + 1,
+          replacement: [{ role: 'assistant', text: '[扩展摘要]' }],
+        }] },
+      };
+    }
+    return { decision: 'continue' };
+  });
+  await on('compaction.before', async (event) => {
+    if (event.source.includes('CANCELME')) return { decision: 'block', reason: '稍后再压缩' };
+    if (event.source.includes('CUSTOMSUMMARY')) {
+      return { decision: 'replace', patch: { summary: event.source.includes('BADFORM') ? '太短' : '## 目标与完成标准\n- 扩展摘要。\n## 约束与权限\n- 无。\n## 工作区事实\n- 无。\n## 工具与外部操作\n- 无。\n## 代理状态\n- 无。\n## 已确认决策\n- 无。\n## 阻塞与风险\n- 无。\n## 下一步\n- 继续。\n## 禁止重复\n- 无。' } };
+    }
+    return { decision: 'continue' };
+  });
 }

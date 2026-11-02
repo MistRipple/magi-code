@@ -190,7 +190,7 @@ HTTP 观测与重试进度是两个合同：重试通知继续负责在再次发
 
 ### 扩展改写（`extension_rewrite`）
 
-受信扩展经 `context.assemble` 与 `compaction.before` 提出的受控历史改写（[插件系统设计](plugin-system-requirements-design.md) D5）是第三类声明式原因，同样由投影声明，而不是事后比对。**本合同已落地为失效原因、记录合同与唯一投影函数；扩展钩子本身尚未接线，因此生产中还没有任何扩展改写发生。**
+受信扩展经 `context.assemble` 与 `compaction.before` 提出的受控历史改写（[插件系统设计](plugin-system-requirements-design.md) D5）是第三类声明式原因，同样由投影声明，而不是事后比对。**本合同已落地为失效原因、记录合同与唯一投影函数，并已接入 `context.assemble` / `compaction.before`；生产中只有用户安装、授权并激活了声明 `contextRewrite` 的扩展后才会发生改写。**
 
 | 原因 | 来源 | 声明方式 |
 | --- | --- | --- |
@@ -209,7 +209,7 @@ HTTP 观测与重试进度是两个合同：重试通知继续负责在再次发
 - 每次改写在界面应显示“扩展改写了历史，缓存已重建”及来源（界面尚未实现，数据已具备：`invalidationReason = extension_rewrite` 与记录）。
 - 成本以供应商真实 usage 为准，不估算“本来可命中”的反事实费用。
 
-**尚未做、也因此仍不得开放这两个钩子的改写**：提案与裁决的原生持久化（重启后要重放改写必须有持久的替换内容；当前记录只保存摘要）、`contextRewrite` 授权项进入清单与授权面板、ExtensionBus 对这两个钩子的接线，以及界面提示。
+**接线现状**：`context.assemble` 与 `compaction.before` 已接入主线任务循环（纯会话 profile 未接）。授权项 `contextRewrite` 已进入清单与授权面板；历史改写不持久化替换内容——每个 Step 的新输入重新征询扩展并经唯一投影裁决，一个 Step 内同一输入只征询一次，因此稳定性是扩展自己的责任，内容变化会被 `extension_rewrite` 归因并记录摘要，成本如实可见；`compaction.before` 的自定义摘要走原检查点安装链路，正文随检查点持久化。**仍缺**：界面提示“扩展改写了历史，缓存已重建”，以及纯会话 profile 的接入。
 
 ## 缓存核算
 
@@ -258,7 +258,7 @@ Magi 保持稳定的部分如果没有被读到，缺口归因到 provider 侧�
 4. 将 Provider adapter 改为消费 IR，并为 Anthropic、Responses、Chat 和自定义代理分别实现 CacheContract。（已完成三种协议及未知代理的保守合同；未知能力仍不视为支持）
 5. 将账本升级为 logical call / transport attempt 两层，接入失效事件和统计页。 空响应、中断与补证控制提示已迁移到 `RequestControls`，重复恢复替换当前原因，得到可用输出后清除；已确认的片段仍沿 canonical 历史追加。探索停滞提醒由当前状态逐请求重建。逐 attempt 的 HTTP 证据、统计和重启补账已接入；辅助请求不创建虚构 Turn，使用独立持久传输事实。
 6. 通过连续对话、文件工具、worker、auxiliary、模型矩阵和真实 Anthropic 账号验收。当前生产代码已无 v1 键生成器；主线与辅助入口都调用同一个 lineage 算法。不得为等待真实账号验收保留第二套运行时缓存策略。
-7. （已完成合同，钩子未接线）为受信扩展的受控改写增加 `extension_rewrite` 失效原因与记录合同，实现位于 `history_projection` 的唯一投影中，并有归因（新增、替换、撤销、追加）、拒绝路径与重启重建一致性的回归；开放扩展改写前仍须完成上文列出的持久化、授权项与接线。
+7. （已完成并接入主线任务循环）为受信扩展的受控改写增加 `extension_rewrite` 失效原因与记录合同，实现位于 `history_projection` 的唯一投影中，并有归因（新增、替换、撤销、追加）、拒绝路径与重启重建一致性的回归；接线现状与剩余缺口见上一小节。
 
 缓存预热、WebSocket continuation 和长期 TTL 暂不进入迁移；它们必须建立在 lineage、contract 和 cost ledger 稳定之后。
 

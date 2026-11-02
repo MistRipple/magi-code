@@ -93,6 +93,9 @@ pub enum Verdict {
 pub struct HookOutcome {
     pub verdict: Verdict,
     pub trace: Vec<TraceEntry>,
+    /// 每个提出 `replace` 的插件各自的补丁（按调用顺序）。合并后的候选无法区分来源，
+    /// 需要按插件归因的钩子（如扩展改写记录）读取这里。
+    pub patches: Vec<(String, Value)>,
 }
 
 /// (序号, 钩子名, 输入)。
@@ -137,6 +140,8 @@ struct Slot {
     instance: RwLock<Option<Arc<HostInstance>>>,
     breaker: Mutex<Breaker>,
     observe: Arc<ObserveQueue>,
+    /// 用户已授权 `contextRewrite`：只有这样的插件提出的历史改写才会被采纳。
+    context_rewrite: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -179,6 +184,7 @@ impl ExtensionBus {
             instance: RwLock::new(None),
             breaker: Mutex::new(Breaker::new(self.policy.breaker)),
             observe: Arc::new(ObserveQueue::new(self.policy.observe_queue)),
+            context_rewrite: std::sync::atomic::AtomicBool::new(false),
         });
         self.slots
             .write()
@@ -193,6 +199,25 @@ impl ExtensionBus {
             .write()
             .expect("slots poisoned")
             .remove(plugin_id);
+    }
+
+    /// 记录插件是否已被授权 `contextRewrite`（由插件管理的授权事实驱动）。
+    pub fn set_context_rewrite_authorized(&self, plugin_id: &str, authorized: bool) {
+        if let Some(slot) = self.slots.read().expect("slots poisoned").get(plugin_id) {
+            slot.context_rewrite
+                .store(authorized, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    pub fn is_context_rewrite_authorized(&self, plugin_id: &str) -> bool {
+        self.slots
+            .read()
+            .expect("slots poisoned")
+            .get(plugin_id)
+            .is_some_and(|slot| {
+                slot.context_rewrite
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            })
     }
 
     pub fn set_order(&self, order: Vec<String>) {
@@ -335,6 +360,7 @@ impl ExtensionBus {
 
         let mut candidate = input;
         let mut trace = Vec::new();
+        let mut patches: Vec<(String, Value)> = Vec::new();
         for slot in slots {
             let approved = slot.hooks[hook];
             let plugin = slot.plugin_id.clone();
@@ -371,7 +397,13 @@ impl ExtensionBus {
                 .admit(Instant::now());
             if admission == Admission::Rejected {
                 match fail(&mut trace, ErrorKind::Backpressure, "扩展熔断已打开") {
-                    Some(verdict) => return Ok(HookOutcome { verdict, trace }),
+                    Some(verdict) => {
+                        return Ok(HookOutcome {
+                            verdict,
+                            trace,
+                            patches: Vec::new(),
+                        });
+                    }
                     None => continue,
                 }
             }
@@ -385,7 +417,13 @@ impl ExtensionBus {
                         .record(Instant::now(), false);
                 }
                 match fail(&mut trace, ErrorKind::HostGone, "扩展宿主不可用") {
-                    Some(verdict) => return Ok(HookOutcome { verdict, trace }),
+                    Some(verdict) => {
+                        return Ok(HookOutcome {
+                            verdict,
+                            trace,
+                            patches: Vec::new(),
+                        });
+                    }
                     None => continue,
                 }
             };
@@ -398,7 +436,13 @@ impl ExtensionBus {
                     ErrorKind::DeadlineExceeded,
                     "钩子点总期限已用尽",
                 ) {
-                    Some(verdict) => return Ok(HookOutcome { verdict, trace }),
+                    Some(verdict) => {
+                        return Ok(HookOutcome {
+                            verdict,
+                            trace,
+                            patches: Vec::new(),
+                        });
+                    }
                     None => continue,
                 }
             }
@@ -444,6 +488,7 @@ impl ExtensionBus {
                         .lock()
                         .expect("breaker poisoned")
                         .record(Instant::now(), true);
+                    patches.push((plugin.clone(), patch.clone()));
                     merge(&mut candidate, patch);
                     trace.push(TraceEntry {
                         plugin,
@@ -464,6 +509,7 @@ impl ExtensionBus {
                     return Ok(HookOutcome {
                         verdict: Verdict::Blocked { plugin, reason },
                         trace,
+                        patches,
                     });
                 }
                 Err(error) => {
@@ -472,7 +518,11 @@ impl ExtensionBus {
                         .expect("breaker poisoned")
                         .record(Instant::now(), false);
                     if let Some(verdict) = fail(&mut trace, error.kind(), "扩展调用失败") {
-                        return Ok(HookOutcome { verdict, trace });
+                        return Ok(HookOutcome {
+                            verdict,
+                            trace,
+                            patches: Vec::new(),
+                        });
                     }
                 }
             }
@@ -480,6 +530,7 @@ impl ExtensionBus {
         Ok(HookOutcome {
             verdict: Verdict::Proceed(candidate),
             trace,
+            patches,
         })
     }
 }

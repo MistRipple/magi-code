@@ -180,7 +180,7 @@ pub(crate) fn bounded_request_history(
 }
 
 /// 扩展提出改写所用的钩子；其余钩子不允许改写历史。
-pub const EXTENSION_REWRITE_HOOKS: [&str; 2] = ["context.assemble", "compaction.before"];
+pub use magi_extension_host::EXTENSION_REWRITE_HOOKS;
 
 /// 扩展对已装配历史提出的一次改写提案（已通过 ExtensionBus 逐项调用，尚未裁决）。
 #[derive(Clone, Debug)]
@@ -231,11 +231,11 @@ fn plain_conversation_text(message: &ChatMessage) -> bool {
 /// canonical 日志与输入序列不变，输出是 (输入, 授权, 提案) 的纯函数，因此实时视图与
 /// 回合边界/重启后从持久化事实重建的视图逐字节一致。
 ///
-/// `rewritable_from` 是可改写区域的起点（其之前是系统段与压缩检查点边界）。被改写的
+/// `rewritable` 是可改写区域（其之前是系统段与压缩检查点边界，其之后是当前输入）。被改写的
 /// 区间只能是纯 user/assistant 文本，因此工具调用与结果的配对天然不会被切断或丢失。
 pub fn apply_extension_rewrites(
     messages: &[ChatMessage],
-    rewritable_from: usize,
+    rewritable: std::ops::Range<usize>,
     is_authorized: &dyn Fn(&str) -> bool,
     proposals: &[ExtensionRewriteProposal],
 ) -> Result<
@@ -261,7 +261,8 @@ pub fn apply_extension_rewrites(
         }
         if proposal.from >= proposal.to
             || proposal.to > messages.len()
-            || proposal.from < rewritable_from
+            || proposal.from < rewritable.start
+            || proposal.to > rewritable.end
         {
             return Err(ExtensionRewriteRejection::InvalidRange {
                 from: proposal.from,
@@ -508,8 +509,13 @@ mod tests {
     fn authorized_rewrites_replace_only_the_projection_and_record_digests_of_the_originals() {
         let original = history();
         let allow = |plugin: &str| plugin == "acme.summary";
-        let (view, records) =
-            apply_extension_rewrites(&original, 0, &allow, &[proposal(1, 4, "摘要")]).unwrap();
+        let (view, records) = apply_extension_rewrites(
+            &original,
+            0..original.len(),
+            &allow,
+            &[proposal(1, 4, "摘要")],
+        )
+        .unwrap();
         assert_eq!(
             view.iter()
                 .map(|m| m.content.clone().unwrap())
@@ -539,7 +545,13 @@ mod tests {
         let allow = |plugin: &str| plugin == "acme.summary";
         let original = history();
         let reject = |proposals: &[ExtensionRewriteProposal], rewritable_from| {
-            apply_extension_rewrites(&original, rewritable_from, &allow, proposals).unwrap_err()
+            apply_extension_rewrites(
+                &original,
+                rewritable_from..original.len(),
+                &allow,
+                proposals,
+            )
+            .unwrap_err()
         };
         // 未授权 contextRewrite：拒绝，不降级。
         let mut other = proposal(1, 2, "x");
@@ -590,7 +602,7 @@ mod tests {
         assert!(
             apply_extension_rewrites(
                 &original,
-                0,
+                0..original.len(),
                 &allow,
                 &[proposal(0, 1, "ok"), proposal(9, 10, "bad")]
             )
@@ -604,7 +616,13 @@ mod tests {
         let mut protected = history();
         protected[1].context_origin = magi_bridge_client::ChatMessageOrigin::SystemInstruction;
         assert_eq!(
-            apply_extension_rewrites(&protected, 0, &allow, &[proposal(0, 3, "x")]).unwrap_err(),
+            apply_extension_rewrites(
+                &protected,
+                0..protected.len(),
+                &allow,
+                &[proposal(0, 3, "x")]
+            )
+            .unwrap_err(),
             ExtensionRewriteRejection::ProtectedMessage(1)
         );
         // 工具调用与其结果：任意一侧落入区间都拒绝，因此配对不会被切断或丢失。
@@ -624,12 +642,20 @@ mod tests {
         };
         for range in [(1, 2), (2, 3), (0, 4)] {
             assert!(matches!(
-                apply_extension_rewrites(&paired, 0, &allow, &[proposal(range.0, range.1, "x")]),
+                apply_extension_rewrites(
+                    &paired,
+                    0..paired.len(),
+                    &allow,
+                    &[proposal(range.0, range.1, "x")]
+                ),
                 Err(ExtensionRewriteRejection::ProtectedMessage(_))
             ));
         }
         // 区间避开配对时仍可改写。
-        assert!(apply_extension_rewrites(&paired, 0, &allow, &[proposal(3, 5, "x")]).is_ok());
+        assert!(
+            apply_extension_rewrites(&paired, 0..paired.len(), &allow, &[proposal(3, 5, "x")])
+                .is_ok()
+        );
         let mut signed = history();
         signed[1].provider_context = vec![magi_bridge_client::ModelProviderContext {
             provider: "openai".into(),
@@ -637,7 +663,7 @@ mod tests {
             data: serde_json::json!({"type": "reasoning"}),
         }];
         assert!(matches!(
-            apply_extension_rewrites(&signed, 0, &allow, &[proposal(1, 2, "x")]),
+            apply_extension_rewrites(&signed, 0..signed.len(), &allow, &[proposal(1, 2, "x")]),
             Err(ExtensionRewriteRejection::ProtectedMessage(1))
         ));
     }
@@ -647,9 +673,9 @@ mod tests {
         let allow = |_: &str| true;
         let proposals = [proposal(3, 5, "尾部摘要"), proposal(0, 2, "头部摘要")];
         // 实时：提案乱序提交；重建：从持久化提案按另一顺序重放。结果必须逐字节一致。
-        let live = apply_extension_rewrites(&history(), 0, &allow, &proposals).unwrap();
+        let live = apply_extension_rewrites(&history(), 0..5, &allow, &proposals).unwrap();
         let reversed: Vec<_> = proposals.iter().rev().cloned().collect();
-        let rebuilt = apply_extension_rewrites(&history(), 0, &allow, &reversed).unwrap();
+        let rebuilt = apply_extension_rewrites(&history(), 0..5, &allow, &reversed).unwrap();
         assert_eq!(
             serde_json::to_string(&live.0).unwrap(),
             serde_json::to_string(&rebuilt.0).unwrap()

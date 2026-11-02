@@ -680,7 +680,7 @@ export type ServerResponse = JsonRpcServerResponse;
 
 export type PluginScopeKind = "application";
 
-export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension";
+export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite";
 
 export interface PluginPermission {
   kind: PluginPermissionKind;
