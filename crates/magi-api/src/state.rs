@@ -1468,6 +1468,8 @@ pub struct ApiState {
     execution_resources: ExecutionResourceCoordinator,
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     pub skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
+    /// 受信扩展宿主的运行状态来源；None 表示没有扩展宿主（例如纯 API 测试）。
+    pub(crate) extension_status: Option<Arc<dyn ExtensionStatusSource>>,
     /// 扩展 `input` 钩子端口；None 表示没有可执行扩展。
     pub(crate) input_guard: Option<Arc<dyn magi_conversation_runtime::extension_hooks::InputGuard>>,
     pub tunnel_manager: crate::tunnel::TunnelManager,
@@ -2043,6 +2045,15 @@ fn browser_authority_api_error(error: BrowserAuthorityError) -> ApiError {
     }
 }
 
+/// 受信扩展宿主运行状态的只读来源（daemon 的 ExtensionRuntime 实现它）。
+/// 状态属于宿主监管，插件管理器与 API 都不持有第二份。
+pub trait ExtensionStatusSource: Send + Sync {
+    fn status(
+        &self,
+        plugin_id: &str,
+    ) -> Option<magi_app_server_protocol::generated::PluginRuntimeStatus>;
+}
+
 impl ApiState {
     pub(crate) async fn lock_app_server_request(
         &self,
@@ -2217,6 +2228,7 @@ impl ApiState {
             execution_resources,
             skill_runtime: None,
             skill_dispatch_runtime: None,
+            extension_status: None,
             input_guard: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
             plugin_manager: Arc::new(Mutex::new(
@@ -5648,6 +5660,11 @@ impl ApiState {
                     .collect()
             }));
         self.skill_runtime = Some(skill_runtime);
+        self
+    }
+
+    pub fn with_extension_status(mut self, source: Arc<dyn ExtensionStatusSource>) -> Self {
+        self.extension_status = Some(source);
         self
     }
 

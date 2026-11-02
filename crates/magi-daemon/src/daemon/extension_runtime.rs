@@ -6,13 +6,14 @@
 //! - 不再激活、被卸载或摘要变化：停止监管并注销登记（用户显式停用才解除 guard）；
 //! - 找不到随包 Node：登记仍保留但不启动宿主，因此 guard 钩子 fail-closed。
 
-use magi_event_bus::InMemoryEventBus;
+use magi_app_server_protocol::generated::{PluginRuntimeState, PluginRuntimeStatus};
+use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_extension_host::{
     HOST_RUNTIME_SOURCE,
     bus::ExtensionBus,
     instance::LaunchConfig,
     protocol::{HookMode, HookRegistration},
-    supervisor::{PluginSupervisor, RestartPolicy, supervise},
+    supervisor::{PluginSupervisor, RestartPolicy, SupervisorState, supervise},
 };
 use magi_plugin_system::{APPLICATION_SCOPE, PluginManager, PluginPackage};
 use magi_process::ManagedProcessGroup;
@@ -59,6 +60,52 @@ pub(super) struct ExtensionRuntime {
     node: Option<PathBuf>,
     policy: RestartPolicy,
     running: Arc<tokio::sync::Mutex<HashMap<String, Running>>>,
+    /// 各扩展的运行状态（监管状态的只读投影），界面经 API 读取；变化时发布事件。
+    board: Arc<std::sync::RwLock<HashMap<String, PluginRuntimeStatus>>>,
+    events: Arc<std::sync::OnceLock<Arc<InMemoryEventBus>>>,
+}
+
+/// 把监管状态映射为界面可见的运行状态。`blocking` 是在宿主不可用期间正被 fail-closed 的
+/// guard 钩子：用户据此知道为什么某些动作被阻止，以及该去停用哪个扩展。
+fn runtime_status(
+    state: &SupervisorState,
+    guards: &[String],
+    crashes_seen: u64,
+) -> PluginRuntimeStatus {
+    let (runtime_state, reason, generation, crashes) = match state {
+        SupervisorState::Starting => (PluginRuntimeState::Starting, None, 0, crashes_seen),
+        SupervisorState::Running { generation } => (
+            PluginRuntimeState::Running,
+            None,
+            *generation,
+            generation.saturating_sub(1).max(crashes_seen),
+        ),
+        SupervisorState::Backoff { crashes, reason } => (
+            PluginRuntimeState::Restarting,
+            Some(reason.clone()),
+            0,
+            *crashes as u64,
+        ),
+        SupervisorState::Failed(reason) => (
+            PluginRuntimeState::Failed,
+            Some(reason.clone()),
+            0,
+            crashes_seen,
+        ),
+        SupervisorState::Stopped => (PluginRuntimeState::Stopped, None, 0, crashes_seen),
+    };
+    let blocking = if runtime_state == PluginRuntimeState::Running {
+        Vec::new()
+    } else {
+        guards.to_vec()
+    };
+    PluginRuntimeStatus {
+        state: runtime_state,
+        reason,
+        generation,
+        crashes,
+        blocking,
+    }
 }
 
 impl ExtensionRuntime {
@@ -80,11 +127,31 @@ impl ExtensionRuntime {
             node,
             policy: RestartPolicy::default(),
             running: Arc::default(),
+            board: Arc::default(),
+            events: Arc::default(),
+        }
+    }
+
+    fn set_status(&self, id: &str, status: Option<PluginRuntimeStatus>) {
+        let changed = {
+            let mut board = self.board.write().expect("status board poisoned");
+            match status {
+                Some(status) => board.insert(id.to_string(), status.clone()) != Some(status),
+                None => board.remove(id).is_some(),
+            }
+        };
+        if changed && let Some(events) = self.events.get() {
+            events.publish(EventEnvelope::domain(
+                magi_core::EventId::unique("plugin-extension-status-changed"),
+                "plugin.extension.status.changed",
+                serde_json::json!({}),
+            ));
         }
     }
 
     /// 启动时收敛一次，之后随插件注册表事件持续收敛。
     pub(super) fn start(&self, events: Arc<InMemoryEventBus>) {
+        let _ = self.events.set(Arc::clone(&events));
         let runtime = self.clone();
         let mut receiver = events.subscribe();
         tokio::spawn(async move {
@@ -143,6 +210,7 @@ impl ExtensionRuntime {
                     supervisor.stop().await;
                 }
                 self.bus.unregister_plugin(&id);
+                self.set_status(&id, None);
             }
         }
 
@@ -172,8 +240,20 @@ impl ExtensionRuntime {
 
     fn start_plugin(&self, id: &str, package: &PluginPackage) -> Running {
         let digest = package.digest().to_string();
+        let guards: Vec<String> = package
+            .manifest()
+            .extension
+            .iter()
+            .flat_map(|extension| extension.hooks.iter())
+            .filter(|hook| hook.mode == magi_app_server_protocol::generated::PluginHookMode::Guard)
+            .map(|hook| hook.name.clone())
+            .collect();
         let failed = |reason: String| {
             tracing::error!(plugin = %id, %reason, "受信扩展无法启动");
+            self.set_status(
+                id,
+                Some(runtime_status(&SupervisorState::Failed(reason), &guards, 0)),
+            );
             Running {
                 digest: digest.clone(),
                 supervisor: None,
@@ -232,6 +312,28 @@ impl ExtensionRuntime {
             config,
             self.policy,
         );
+        // 监管状态的每次变化都同步到状态板并通知界面；崩溃次数在状态间保留。
+        let mut changes = supervisor.subscribe();
+        let runtime = self.clone();
+        let plugin_id = id.to_string();
+        tokio::spawn(async move {
+            let mut crashes_seen = 0u64;
+            loop {
+                let state = changes.borrow_and_update().clone();
+                if let SupervisorState::Backoff { crashes, .. } = &state {
+                    crashes_seen = crashes_seen.max(*crashes as u64);
+                }
+                runtime.set_status(
+                    &plugin_id,
+                    Some(runtime_status(&state, &guards, crashes_seen)),
+                );
+                if matches!(state, SupervisorState::Stopped | SupervisorState::Failed(_))
+                    || changes.changed().await.is_err()
+                {
+                    return;
+                }
+            }
+        });
         Running {
             digest,
             supervisor: Some(supervisor),
@@ -262,6 +364,12 @@ impl ExtensionRuntime {
             .ok_or_else(|| std::io::Error::other("包没有 extension/index.mjs"))?;
         write_if_absent(&entry, source)?;
         Ok((host_script, entry))
+    }
+}
+
+impl magi_api::ExtensionStatusSource for ExtensionRuntime {
+    fn status(&self, plugin_id: &str) -> Option<PluginRuntimeStatus> {
+        self.board.read().ok()?.get(plugin_id).cloned()
     }
 }
 
@@ -532,6 +640,98 @@ export default async function activate(api) {
         assert!(
             matches!(outcome.verdict, Verdict::Blocked { .. }),
             "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn supervisor_states_map_to_user_visible_runtime_status_with_the_blocking_guards() {
+        let guards = vec!["tool.call".to_string()];
+        let running = runtime_status(&SupervisorState::Running { generation: 3 }, &guards, 1);
+        assert_eq!(running.state, PluginRuntimeState::Running);
+        assert_eq!(
+            (running.generation, running.crashes),
+            (3, 2),
+            "代次推出的重启次数"
+        );
+        assert!(running.blocking.is_empty(), "运行中没有被阻止的动作");
+
+        let restarting = runtime_status(
+            &SupervisorState::Backoff {
+                crashes: 2,
+                reason: "宿主进程退出".into(),
+            },
+            &guards,
+            0,
+        );
+        assert_eq!(restarting.state, PluginRuntimeState::Restarting);
+        assert_eq!(restarting.reason.as_deref(), Some("宿主进程退出"));
+        assert_eq!(
+            restarting.blocking, guards,
+            "不可用期间 guard 钩子在阻止动作"
+        );
+
+        let failed = runtime_status(&SupervisorState::Failed("崩溃过于频繁".into()), &guards, 6);
+        assert_eq!(
+            (failed.state, failed.crashes),
+            (PluginRuntimeState::Failed, 6)
+        );
+        assert_eq!(failed.blocking, guards);
+    }
+
+    #[tokio::test]
+    async fn runtime_status_follows_the_lifecycle_and_notifies_the_ui() {
+        use magi_api::ExtensionStatusSource;
+        let fixture = fixture(Some(test_node()));
+        let events = Arc::new(InMemoryEventBus::new(32));
+        let mut feed = events.subscribe();
+        fixture.runtime.start(Arc::clone(&events));
+        activate(&fixture, &package());
+        fixture.runtime.reconcile().await;
+        // 状态变化事件到达，状态最终为运行中，且没有被阻止的动作。
+        let mut running = None;
+        for _ in 0..100 {
+            if let Some(status) = fixture.runtime.status("acme.guard")
+                && status.state == PluginRuntimeState::Running
+            {
+                running = Some(status);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let running = running.expect("扩展应进入运行状态");
+        assert!(running.blocking.is_empty());
+        let mut saw_event = false;
+        while let Ok(event) = feed.try_recv() {
+            saw_event |= event.event_type == "plugin.extension.status.changed";
+        }
+        assert!(saw_event, "状态变化必须通知界面");
+        // 停用后状态消失（界面回到普通的已停用显示）。
+        fixture
+            .manager
+            .lock()
+            .unwrap()
+            .deactivate("acme.guard", "application")
+            .unwrap();
+        fixture.runtime.reconcile().await;
+        assert!(fixture.runtime.status("acme.guard").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_missing_node_runtime_is_visible_as_failed_with_the_reason_and_blocking_guards() {
+        use magi_api::ExtensionStatusSource;
+        let fixture = fixture(None);
+        activate(&fixture, &package());
+        fixture.runtime.reconcile().await;
+        let status = fixture
+            .runtime
+            .status("acme.guard")
+            .expect("失败也必须可见");
+        assert_eq!(status.state, PluginRuntimeState::Failed);
+        assert!(status.reason.unwrap().contains("随包 Node"));
+        assert_eq!(
+            status.blocking,
+            ["tool.call"],
+            "用户要能看到哪些动作正被 guard 阻止"
         );
     }
 }

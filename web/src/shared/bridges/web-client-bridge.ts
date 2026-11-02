@@ -1955,7 +1955,8 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     window.dispatchEvent(new CustomEvent('magi:usageChanged', { detail: { sessionId: rustEventSessionId(event) } }));
   }
 
-  if (eventType === 'plugin.registry.changed') {
+  // 受信扩展宿主的运行状态变化（启动、崩溃重启、失败）与注册表变化一样触发插件列表刷新。
+  if (eventType === 'plugin.registry.changed' || eventType === 'plugin.extension.status.changed') {
     window.dispatchEvent(new Event(PLUGIN_REGISTRY_CHANGED_EVENT));
     return;
   }

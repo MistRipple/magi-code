@@ -54,9 +54,9 @@ pub use routes::build_router;
 pub use routes::{write_plugin_resource_with_event, write_plugin_settings_with_event};
 pub use state::{
     ApiState, BrowserHostConnectionConfig, BrowserHostStatusSnapshot,
-    ExecutionResourceCancellationReport, ExecutionResourceCoordinator, RunnerManager,
-    RunnerStartError, RunnerStopError, RuntimeStatePersistence, SessionProjectionPersistMode,
-    TaskCheckpointPersist, build_runtime_capability_dependency_provider,
-    recover_role_delete_transaction,
+    ExecutionResourceCancellationReport, ExecutionResourceCoordinator, ExtensionStatusSource,
+    RunnerManager, RunnerStartError, RunnerStopError, RuntimeStatePersistence,
+    SessionProjectionPersistMode, TaskCheckpointPersist,
+    build_runtime_capability_dependency_provider, recover_role_delete_transaction,
 };
 pub use task_dispatch::{schedule_restored_session_task_dispatches, workspace_execution_preparer};

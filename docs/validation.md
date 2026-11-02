@@ -273,6 +273,8 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 缓存失效原因：`cargo test -p magi-conversation-runtime --lib extension_rewrites_are_attributed`（新增、追加、替换、撤销与未声明改写的归因，记录随 Step 持久化后读回一致）与 `history_projection` 下的扩展改写测试（授权、保护区、工具配对、纯函数重建一致）。
 
+运行状态进界面：`cargo test -p magi-daemon --lib extension_runtime`（状态映射、随生命周期变化并通知界面、缺少 Node 时可见为失败并列出被阻止的 guard）、`cargo test -p magi-api --lib plugin_list_merges`（列表与变更操作返回都合并运行状态且不另存）；Web 侧只做了类型检查与 i18n/布局/桥接 golden，**未在真实浏览器里验收**。
+
 钩子接线：`cargo test -p magi-extension-host`（目录与已接线模式）、`cargo test -p magi-conversation-runtime --lib extension_hooks`（子代理 guard、改写重新校验）、`model_step_notifies_observers_after_commit_without_prompt_content`（模型观察）、`cargo test -p magi-daemon --lib extension_bridge`（真实 Node 扩展经 input/subagent.spawn guard 与领域事件转发的完整链路）、`cargo test -p magi-api --lib blocked_input_is_rejected`（被阻止的输入不留任何会话或 Turn 事实）。
 
 随包 Node：`node apps/desktop/scripts/node-runtime.mjs stage <目录>` 下载固定版本、校验归档摘要并在清空环境下执行校验；打包时 afterPack 对最终制品再做同样的执行校验（清单必须含该文件与版本）。以 `MAGI_EXTENSION_NODE` 指向该 Node 运行 `cargo test -p magi-extension-host --test host` 与 `cargo test -p magi-daemon --lib extension` 已在 macOS 通过；其余钩子未接线；macOS 以外平台未运行。

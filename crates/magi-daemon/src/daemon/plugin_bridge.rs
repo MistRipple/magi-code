@@ -77,6 +77,11 @@ impl PluginServices {
         self.extensions.start(events);
     }
 
+    /// 扩展宿主运行状态的只读来源，供插件列表投影合并。
+    pub(super) fn extension_status(&self) -> Arc<dyn magi_api::ExtensionStatusSource> {
+        Arc::new(self.extensions.clone())
+    }
+
     pub(super) fn extension_bus(&self) -> Arc<magi_extension_host::bus::ExtensionBus> {
         Arc::clone(&self.extension_bus)
     }

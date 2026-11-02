@@ -3010,6 +3010,60 @@
           "items": {
             "$ref": "#/$defs/PluginDrainingScope"
           }
+        },
+        "runtime": {
+          "$ref": "#/$defs/PluginRuntimeStatus"
+        }
+      }
+    },
+    "PluginRuntimeState": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "running",
+        "restarting",
+        "failed",
+        "stopped"
+      ]
+    },
+    "PluginRuntimeStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "crashes",
+        "blocking"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/PluginRuntimeState"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-rust-default": true
+        },
+        "generation": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "x-rust-type": "u64",
+          "x-rust-default": true
+        },
+        "crashes": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "blocking": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     },

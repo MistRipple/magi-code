@@ -1648,6 +1648,7 @@ impl DaemonRuntime {
         .with_agent_role_registry(agent_role_registry)
         .with_tunnel_port(self.local_port)
         .with_plugin_manager(self.plugins.manager())
+        .with_extension_status(self.plugins.extension_status())
         .with_plugin_data_migrator(self.plugins.data_migrator())
         .with_runtime_persistence(runtime_persistence)
         .with_workspace_history_restore({

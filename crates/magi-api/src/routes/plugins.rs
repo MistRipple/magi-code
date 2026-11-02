@@ -93,7 +93,7 @@ async fn list(
         .plugin_manager
         .lock()
         .map_err(|_| ApiError::internal_assembly("读取插件状态失败", "插件锁已损坏"))?;
-    manager.projection().map(Json).map_err(plugin_error)
+    snapshot(&state, &manager)
 }
 
 async fn manifests(
@@ -484,7 +484,7 @@ async fn install(
     let mut manager = locked(&state, "安装插件")?;
     manager.install(&package, source).map_err(plugin_error)?;
     publish_plugin_registry_changed(&state);
-    snapshot(&manager)
+    snapshot(&state, &manager)
 }
 
 async fn upgrade(
@@ -501,7 +501,7 @@ async fn upgrade(
     upgrade_installed_plugin(&state, &package, source).await?;
     {
         let manager = locked(&state, "读取插件升级结果")?;
-        snapshot(&manager)
+        snapshot(&state, &manager)
     }
 }
 
@@ -588,7 +588,7 @@ async fn authorize(
         .authorize(&id, &request.scope, request.grants)
         .map_err(plugin_error)?;
     publish_plugin_registry_changed(&state);
-    snapshot(&manager)
+    snapshot(&state, &manager)
 }
 async fn enable(
     State(state): State<ApiState>,
@@ -634,7 +634,7 @@ async fn deactivate(
     publish_plugin_registry_changed(&state);
     {
         let manager = locked(&state, "读取停用后的插件状态")?;
-        snapshot(&manager)
+        snapshot(&state, &manager)
     }
 }
 async fn disable(
@@ -651,7 +651,7 @@ async fn uninstall(
     let mut manager = locked(&state, "卸载插件")?;
     manager.uninstall(&id).map_err(plugin_error)?;
     publish_plugin_registry_changed(&state);
-    snapshot(&manager)
+    snapshot(&state, &manager)
 }
 
 // 只发布注册表失效事实；所有客户端经原清单入口读取，不复制激活或权限状态。
@@ -674,7 +674,7 @@ where
     let mut manager = locked(state, action)?;
     operation(&mut manager).map_err(plugin_error)?;
     publish_plugin_registry_changed(state);
-    snapshot(&manager)
+    snapshot(state, &manager)
 }
 fn locked<'a>(
     state: &'a ApiState,
@@ -685,10 +685,18 @@ fn locked<'a>(
         .lock()
         .map_err(|_| ApiError::internal_assembly(action, "插件锁已损坏"))
 }
+/// 插件列表投影 = 管理器的安装/授权/生命周期事实 + 扩展宿主的运行状态（只读合并，不另存）。
 fn snapshot(
+    state: &ApiState,
     manager: &magi_plugin_system::PluginManager,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    manager.projection().map(Json).map_err(plugin_error)
+    let mut list = manager.projection().map_err(plugin_error)?;
+    if let Some(source) = state.extension_status.as_ref() {
+        for plugin in &mut list.plugins {
+            plugin.runtime = source.status(&plugin.manifest.id);
+        }
+    }
+    Ok(Json(list))
 }
 fn plugin_error(error: magi_plugin_system::PluginError) -> ApiError {
     match error {
@@ -1440,6 +1448,48 @@ mod tests {
         assert_eq!(body["plugins"][0]["source"]["kind"], "center");
         let (_, body) = call(&state, "GET", "/plugins/center", None).await;
         assert_eq!(body["entries"][0]["state"], "installed");
+    }
+
+    #[tokio::test]
+    async fn plugin_list_merges_the_extension_runtime_status_without_storing_it() {
+        use magi_app_server_protocol::generated::{PluginRuntimeState, PluginRuntimeStatus};
+        struct Board;
+        impl crate::ExtensionStatusSource for Board {
+            fn status(&self, plugin_id: &str) -> Option<PluginRuntimeStatus> {
+                (plugin_id == "acme.resources").then(|| PluginRuntimeStatus {
+                    state: PluginRuntimeState::Restarting,
+                    reason: Some("宿主进程退出".into()),
+                    generation: 0,
+                    crashes: 2,
+                    blocking: vec!["tool.call".into()],
+                })
+            }
+        }
+        let (state, root) = active_resource_state().await;
+        // 没有状态来源：不带 runtime 字段。
+        let (_, body) = call(&state, "GET", "/plugins", None).await;
+        assert!(body["plugins"][0].get("runtime").is_none(), "{body}");
+        // 有状态来源：合并进每个插件的投影，来源是宿主监管而不是插件管理器。
+        let state = state.with_extension_status(std::sync::Arc::new(Board));
+        let (_, body) = call(&state, "GET", "/plugins", None).await;
+        let runtime = &body["plugins"][0]["runtime"];
+        assert_eq!(runtime["state"], "restarting");
+        assert_eq!(runtime["reason"], "宿主进程退出");
+        assert_eq!(runtime["crashes"], 2);
+        assert_eq!(runtime["blocking"], serde_json::json!(["tool.call"]));
+        // 变更类操作返回的列表同样带运行状态。
+        let (_, body) = call(
+            &state,
+            "POST",
+            "/plugins/acme.resources/deactivate",
+            Some(serde_json::json!({"scope": "application"})),
+        )
+        .await;
+        assert_eq!(
+            body["plugins"][0]["runtime"]["state"], "restarting",
+            "{body}"
+        );
+        drop(root);
     }
 
     #[tokio::test]

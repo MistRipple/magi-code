@@ -5,7 +5,7 @@
    */
   import { i18n } from '../stores/i18n.svelte';
   import type { InstalledPluginProjection } from '../web/plugin-api';
-  import type { PluginManifest, PluginPermission } from '../shared/app-server-protocol.generated';
+  import type { PluginManifest, PluginPermission, PluginRuntimeStatus } from '../shared/app-server-protocol.generated';
   import { pluginSettingsTab, type StoreItem } from '../lib/plugin-store';
   import { APPLICATION_PLUGIN_SCOPE } from '../stores/plugin-registry.svelte';
   import Icon from './Icon.svelte';
@@ -61,6 +61,17 @@
     if (installed.activeScopes.includes(APPLICATION_PLUGIN_SCOPE)) return { state: 'active', seconds };
     if (installed.enabledScopes.includes(APPLICATION_PLUGIN_SCOPE)) return { state: 'enabled', seconds };
     return { state: 'off', seconds };
+  }
+
+  /** 受信扩展的宿主运行状态；只有声明了 extension 的插件才有这一行。 */
+  const runtime = $derived(plugin?.runtime ?? null);
+  const isExtension = $derived(Boolean(manifest?.extension));
+  const runtimeProblem = $derived(runtime !== null && (runtime.state === 'failed' || runtime.state === 'restarting'));
+
+  function runtimeText(status: PluginRuntimeStatus | null): string {
+    if (!status) return i18n.t('settings.plugins.runtime.state.notRunning');
+    const suffix = status.crashes > 0 ? i18n.t('settings.plugins.runtime.crashes', { count: status.crashes }) : '';
+    return `${i18n.t(`settings.plugins.runtime.state.${status.state}`)}${suffix}`;
   }
 
   function stateText(row: ActivationRow): string {
@@ -124,6 +135,15 @@
 
   <dl class="pane-facts">
     <div><dt>{i18n.t('settings.plugins.detail.type')}</dt><dd>{i18n.t('settings.plugins.detail.kindExtension')}</dd></div>
+    {#if isExtension}
+      <div data-testid="plugin-runtime" class:pane-warn={runtimeProblem}>
+        <dt>{i18n.t('settings.plugins.runtime.label')}</dt>
+        <dd>
+          {#if runtimeProblem}<Icon name="warning" size={13} />{/if}
+          <span>{runtimeText(runtime)}</span>
+        </dd>
+      </div>
+    {/if}
     <div><dt>{i18n.t('settings.plugins.detail.version')}</dt><dd>v{item.version}{#if item.updatable} → v{item.catalog?.version}{/if}</dd></div>
       <div data-testid="plugin-source" class:pane-warn={plugin?.source.kind === 'address' || plugin?.source.kind === 'local'}>
         <dt>{i18n.t('settings.plugins.detail.source')}</dt>
@@ -132,6 +152,18 @@
       <div><dt>{i18n.t('settings.plugins.detail.digest')}</dt><dd class="settings-mono" title={plugin?.digest}>{plugin?.digest.slice(0, 16) || i18n.t('common.notProvided')}</dd></div>
       <div><dt>{i18n.t('settings.plugins.detail.size')}</dt><dd>{!plugin && item.catalog ? `${Math.round(item.catalog.size / 1024)} KB` : i18n.t('common.notProvided')}</dd></div>
   </dl>
+
+  {#if runtime?.reason}
+    <p class="settings-notice settings-notice--{runtimeProblem ? 'error' : 'warn'}" role="status" data-testid="plugin-runtime-reason">
+      <Icon name="warning" size={13} /><span>{runtime.reason}</span>
+    </p>
+  {/if}
+  {#if runtime && runtime.blocking.length > 0}
+    <p class="settings-notice settings-notice--warn" role="status" data-testid="plugin-runtime-blocking">
+      <Icon name="shield" size={13} />
+      <span>{i18n.t('settings.plugins.runtime.blocking', { hooks: runtime.blocking.join(', ') })}</span>
+    </p>
+  {/if}
 
   <section class="pane-section">
     <h4>{i18n.t('settings.plugins.permissions')}</h4>

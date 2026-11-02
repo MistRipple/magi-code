@@ -843,6 +843,17 @@ export interface PluginInstalled {
   grants: Array<PluginScopeGrant>;
   source: PluginSourceProjection;
   draining: Array<PluginDrainingScope>;
+  runtime?: PluginRuntimeStatus;
+}
+
+export type PluginRuntimeState = "starting" | "running" | "restarting" | "failed" | "stopped";
+
+export interface PluginRuntimeStatus {
+  state: PluginRuntimeState;
+  reason?: string | null;
+  generation?: number | null;
+  crashes: number;
+  blocking: Array<string>;
 }
 
 export interface PluginList {

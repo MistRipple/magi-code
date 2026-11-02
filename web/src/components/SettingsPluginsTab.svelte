@@ -384,7 +384,14 @@
                   <span class="store-item-desc">{item.description}</span>
                 </span>
                 <span class="store-item-state" data-state={entry.group === 'updatable' ? 'updatable' : item.status}>
-                  {#if entry.group === 'updatable'}
+                  {#if item.installed?.runtime && (item.installed.runtime.state === 'failed' || item.installed.runtime.state === 'restarting')}
+                    <span
+                      class="store-item-alert"
+                      role="img"
+                      aria-label={i18n.t(`settings.plugins.runtime.state.${item.installed.runtime.state}`)}
+                      title={i18n.t(`settings.plugins.runtime.state.${item.installed.runtime.state}`)}
+                    ><Icon name="warning" size={14} /></span>
+                  {:else if entry.group === 'updatable'}
                     <Icon name="download" size={14} />
                   {:else if item.status === 'working'}
                     <Icon name="refresh" size={14} />
@@ -540,6 +547,7 @@
   /* 状态一眼可辨：有更新用主题色向下箭头，已启用为绿色对勾，已安装未启用为灰色对勾，未安装为加号。 */
   .store-item-state { display: inline-flex; flex-direction: column; align-items: center; gap: 2px; flex: 0 0 auto; min-width: 40px; color: var(--foreground-muted); }
   .store-item-state[data-state='updatable'] { color: var(--primary); }
+  .store-item-alert { display: inline-flex; color: var(--warning); }
   .store-item-state[data-state='active'] { color: var(--success); }
   .store-item-state[data-state='working'] { color: var(--primary); }
   .store-item-version { font-size: var(--text-xs); font-variant-numeric: tabular-nums; }

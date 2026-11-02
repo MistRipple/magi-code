@@ -80,8 +80,10 @@ pub enum SupervisorState {
     Running {
         generation: u64,
     },
+    /// 崩溃或启动失败后等待重启；`reason` 是最近一次失败的原因。
     Backoff {
         crashes: usize,
+        reason: String,
     },
     /// 自动重启已停止，等待用户手动重启。
     Failed(String),
@@ -97,6 +99,11 @@ pub struct PluginSupervisor {
 impl PluginSupervisor {
     pub fn state(&self) -> SupervisorState {
         self.state.borrow().clone()
+    }
+
+    /// 订阅状态变化（管理面据此刷新界面）。
+    pub fn subscribe(&self) -> watch::Receiver<SupervisorState> {
+        self.state.clone()
     }
 
     /// 等待状态满足条件（测试与管理面使用）。
@@ -168,6 +175,7 @@ pub fn supervise(
                 RestartDecision::After(delay) => {
                     state_tx.send_replace(SupervisorState::Backoff {
                         crashes: tracker.crashes.len(),
+                        reason: reason.clone(),
                     });
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}

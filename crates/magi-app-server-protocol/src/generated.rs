@@ -1856,6 +1856,37 @@ pub struct PluginInstalled {
     pub grants: Vec<PluginScopeGrant>,
     pub source: PluginSourceProjection,
     pub draining: Vec<PluginDrainingScope>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<PluginRuntimeStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginRuntimeState {
+    #[serde(rename = "starting")]
+    Starting,
+    #[serde(rename = "running")]
+    Running,
+    #[serde(rename = "restarting")]
+    Restarting,
+    #[serde(rename = "failed")]
+    Failed,
+    #[serde(rename = "stopped")]
+    Stopped,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginRuntimeStatus {
+    pub state: PluginRuntimeState,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub generation: u64,
+    pub crashes: u64,
+    pub blocking: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

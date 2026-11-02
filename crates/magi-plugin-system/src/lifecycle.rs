@@ -836,6 +836,8 @@ impl PluginManager {
                             .collect(),
                         source: installed.source.projection(),
                         draining: self.draining_projection(&installed.id, now),
+                        // 扩展宿主的运行状态属于 daemon 的 ExtensionRuntime，由 API 层合并，管理器不持有它。
+                        runtime: None,
                     })
                 })
                 .collect::<Result<_, PluginError>>()?,

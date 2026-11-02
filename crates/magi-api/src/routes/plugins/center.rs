@@ -267,7 +267,7 @@ pub(super) async fn center_install(
         }
     };
     install_or_upgrade(&state, &package, source).await?;
-    snapshot(&*locked(&state, "读取插件安装结果")?)
+    snapshot(&state, &*locked(&state, "读取插件安装结果")?)
 }
 
 /// 作者指南随 daemon 发布，与仓库文档是同一份内容；插件中心在界面内直接展示，
