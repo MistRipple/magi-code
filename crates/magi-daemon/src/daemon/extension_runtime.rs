@@ -452,7 +452,7 @@ export default async function activate(api) {
 
     fn package() -> PluginPackage {
         let manifest: PluginManifest = serde_json::from_value(json!({
-            "sdkVersion": 1, "id": "acme.guard", "version": "1.0.0", "name": "Guard", "description": "",
+            "sdkVersion": 2, "id": "acme.guard", "version": "1.0.0", "name": "Guard", "description": "",
             "extension": {"hooks": [{"name": "tool.call", "mode": "guard", "deadlineMs": 3000}]},
             "permissions": [{"kind": "extension", "scope": "application", "targets": ["full-trust"]}],
             "dataSchemaVersion": 1,

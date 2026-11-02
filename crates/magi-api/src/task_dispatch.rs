@@ -317,24 +317,6 @@ pub fn submit_dispatch_submission(
     }
     ensure_dispatch_submission_acceptance_available(&state.session_store, &request)
         .map_err(dispatch_accept_error_to_api_error)?;
-    // 排队输入在实际接纳为 Turn 时才选择插件包。这个不可变选择随原 accepted
-    // 请求恢复，materialize 和后续工作流激活不能从当前安装版本重新推导。
-    if let Some(workflow_id) = request.workflow_id.as_deref() {
-        let selected = magi_plugin_system::ContributionRef::parse("工作流核心", workflow_id)
-            .map_err(ApiError::InvalidInput)?;
-        let manager = state
-            .plugin_manager
-            .lock()
-            .map_err(|_| ApiError::internal_assembly("固定工作流版本", "插件锁已损坏"))?;
-        let package = manager
-            .prepare_workflow(&selected)
-            .map_err(|_| ApiError::Forbidden("所选插件工作流未激活或正在排空".into()))?;
-        request.user_message_metadata.insert(
-            "magi.workflowPackageDigest".into(),
-            serde_json::Value::String(package.digest().to_string()),
-        );
-    }
-
     // Task 与 Conversation 共用同一个 SessionTurnCoordinator。Task 的 root task
     // 仍由 TaskStore 管理，但 Turn 身份、attempt 和 request 幂等必须先注册，
     // 再进入 pending task / canonical accepted 事务；否则两个并发提交可能各自
@@ -616,12 +598,6 @@ pub(crate) async fn accept_session_task_submission_at(
         serde_json::Value::String(request_fingerprint),
     );
     user_message_metadata.insert("traceId".to_string(), serde_json::Value::String(trace_id));
-    if let Some(workflow_id) = request.workflow_id.as_deref() {
-        user_message_metadata.insert(
-            "magi.workflowId".to_string(),
-            serde_json::Value::String(workflow_id.to_string()),
-        );
-    }
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_content(trimmed_text.as_deref());
     let mission_title = task_title
@@ -732,7 +708,6 @@ pub(crate) async fn accept_goal_continuation_task_submission(
         context_references: Vec::new(),
         browser_annotation_refs: Vec::new(),
         browser_node_selections: Vec::new(),
-        plugin_selections: Vec::new(),
         created_session: false,
         mission_title: "目标自动推进".to_string(),
         task_title: "执行: 目标自动推进".to_string(),
@@ -744,7 +719,6 @@ pub(crate) async fn accept_goal_continuation_task_submission(
         goal_mode: true,
         use_tools: true,
         target_role: None,
-        workflow_id: None,
         request_id: None,
         user_message_id: None,
         placeholder_message_id: None,
@@ -868,38 +842,6 @@ async fn execute_dispatch_submission(
         }
         Err(error) => return Err(ApiError::InvalidInput(error)),
     };
-    let plugin_selection_scope = magi_plugin_system::APPLICATION_SCOPE;
-    let plugin_selection_result = request.validate_plugin_selections_with(|selection| {
-        let manager = state
-            .plugin_manager
-            .lock()
-            .map_err(|_| "插件管理器不可用".to_string())?;
-        // 读取资源会同时核对：作用域已激活、资源由清单声明、存储权限已授予。
-        let current = manager
-            .read_resource(
-                &selection.plugin_id,
-                plugin_selection_scope,
-                &selection.resource_id,
-            )
-            .map_err(|error| error.to_string())?;
-        if selection.version > current.version {
-            return Err("选中对象的资源版本高于当前版本".to_string());
-        }
-        Ok(())
-    });
-    let plugin_selections = match plugin_selection_result {
-        Ok(selections) => selections,
-        Err(error) if created_session => {
-            return Err(rollback_created_session_on_dispatch_error(
-                state,
-                &session_id,
-                previous_current_session_id.clone(),
-                ApiError::InvalidInput(error),
-            )
-            .await);
-        }
-        Err(error) => return Err(ApiError::InvalidInput(error)),
-    };
     let user_timeline_entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let action_task_title = format_action_task_title(&mission_title);
 
@@ -916,7 +858,6 @@ async fn execute_dispatch_submission(
         context_references: request.context_references(),
         browser_annotation_refs,
         browser_node_selections,
-        plugin_selections,
         created_session,
         mission_title,
         task_title: action_task_title,
@@ -928,10 +869,6 @@ async fn execute_dispatch_submission(
         goal_mode: request.goal_mode,
         use_tools,
         target_role,
-        workflow_id: user_message_metadata
-            .get("magi.workflowId")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
         request_id: request.request_id(),
         user_message_id: request.user_message_id(),
         placeholder_message_id: request.placeholder_message_id(),
@@ -1936,216 +1873,6 @@ mod tests {
         state.cleanup_session_isolation(&session).await;
     }
 
-    #[tokio::test]
-    async fn workflow_acceptance_freezes_the_host_package_in_task_and_pending_request() {
-        let root = tempfile::tempdir().unwrap();
-        let package = magi_plugin_system::PluginPackage::from_manifest_and_source(
-            serde_json::from_value(serde_json::json!({
-                "sdkVersion":1,"id":"test.flow","version":"1.0.0","name":"Flow","description":"",
-                "backend":"plugin.mjs","permissions":[],"dataSchemaVersion":1,
-                "settingsSchema":{"type":"object","additionalProperties":false},
-                "contributions":{"workflows":[{"id":"main","title":"Flow","description":""}]}
-            }))
-            .unwrap(),
-            "export default () => null;",
-        )
-        .unwrap();
-        let mut manager = magi_plugin_system::PluginManager::open(root.path()).unwrap();
-        manager
-            .install(
-                &package,
-                magi_plugin_system::PluginSource::Local {
-                    name: "flow.zip".into(),
-                },
-            )
-            .unwrap();
-        manager.enable("test.flow", "application").unwrap();
-        manager.activate("test.flow", "application").unwrap();
-        let tasks = Arc::new(TaskStore::new());
-        let manager = Arc::new(std::sync::Mutex::new(manager));
-        let state = test_state()
-            .with_task_store(tasks.clone())
-            .with_plugin_manager(manager.clone());
-        let session = SessionId::new("workflow-package-session");
-        state
-            .session_store
-            .create_session(session.clone(), "工作流包版本")
-            .unwrap();
-        let original: crate::dto::SessionTurnRequestDto =
-            serde_json::from_value(serde_json::json!({
-                "sessionId":session,"scope":"personal","text":"运行工作流",
-                "workflowId":"plugin/test.flow/main","requestId":"workflow-package-request",
-                "userMessageId":"workflow-package-user"
-            }))
-            .unwrap();
-        let mut request: DispatchSubmissionRequest = serde_json::from_value(serde_json::json!({
-            "accepted_at":UtcMillis::now(),"session_id":session,"entry_id":"workflow-package-input",
-            "timeline_message":"运行工作流","created_session":false,"mission_title":"工作流",
-            "task_title":"工作流","trimmed_text":"运行工作流","execution_goal":"执行已选工作流","task_tier":magi_core::TaskTier::ExecutionChain,
-            "context_references":[],"browser_annotation_refs":[],"browser_node_selections":[],"plugin_selections":[],
-            "goal_mode":false,"target_role":"coordinator","workflow_id":"plugin/test.flow/main",
-            "required_tool_chain":[],"completion_contract":magi_core::TaskCompletionContract::default(),
-            "denied_tools":[],"user_message_metadata":{"magi.workflowPackageDigest":"caller-forged-digest"},
-            "turn_origin":magi_conversation_runtime::dispatch_submission::DispatchTurnOrigin::User
-        })).unwrap();
-        request.request_id = original.request_id();
-        request.user_message_id = original.user_message_id();
-        request.user_message_metadata.insert(
-            "requestFingerprint".into(),
-            original.request_fingerprint().unwrap().into(),
-        );
-        let mut unsupported = request.clone();
-        unsupported.target_role = Some("executor".into());
-        assert!(super::submit_dispatch_submission(&state, unsupported).is_err());
-        assert!(
-            tasks.all_tasks().is_empty(),
-            "不支持工作流的角色必须在接纳前拒绝"
-        );
-        let accepted = super::submit_dispatch_submission(&state, request).unwrap();
-        assert_eq!(
-            accepted.request.user_message_metadata["magi.workflowPackageDigest"],
-            package.digest()
-        );
-        let task = tasks.get_task(&accepted.root_task_id).unwrap();
-        assert_eq!(
-            magi_orchestrator::task_worker_catalog::resolve_task_role(
-                &task,
-                &state.agent_role_registry
-            ),
-            Some("coordinator")
-        );
-        assert!(
-            matches!(task.runtime_payload, TaskRuntimePayload::Workflow {package_digest:Some(ref digest), ..} if digest == package.digest())
-        );
-        let snapshot = tasks.snapshot();
-        let projection = root.path().join("tasks");
-        TaskStore::checkpoint_snapshot_to_projection_directory(&snapshot, &projection).unwrap();
-        let restored = TaskStore::restore_from_projection_directory(&projection)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            restored
-                .get_task(&accepted.root_task_id)
-                .unwrap()
-                .runtime_payload,
-            task.runtime_payload
-        );
-        let session_path = root.path().join("session.json");
-        state
-            .session_store
-            .persist_projection_with(|durable, sidecars| {
-                std::fs::write(
-                    &session_path,
-                    serde_json::to_vec(&(durable, sidecars)).unwrap(),
-                )
-            })
-            .unwrap();
-        let drain =
-            magi_plugin_system::PluginManager::begin_upgrade_drain(manager.clone(), "test.flow")
-                .unwrap();
-        let service = crate::turn_service::TurnService::new(state.clone());
-        let replay = service
-            .submit(original.clone())
-            .await
-            .expect("排空不能阻止读取原回执");
-        assert!(replay.replayed);
-        assert_eq!(replay.turn_id.as_deref(), Some(accepted.turn_id.as_str()));
-        let mut new_request = original.clone();
-        new_request.request_id = Some("workflow-package-new-request".into());
-        new_request.user_message_id = Some("workflow-package-new-user".into());
-        assert!(matches!(
-            service.submit(new_request).await,
-            Err(ApiError::Forbidden(_))
-        ));
-        let mut manifest = serde_json::to_value(package.manifest()).unwrap();
-        manifest["version"] = serde_json::json!("1.1.0");
-        let upgraded = magi_plugin_system::PluginPackage::from_manifest_and_source(
-            serde_json::from_value(manifest).unwrap(),
-            "export default () => null;",
-        )
-        .unwrap();
-        {
-            let mut manager = manager.lock().unwrap();
-            manager
-                .upgrade(
-                    &upgraded,
-                    magi_plugin_system::PluginSource::Local {
-                        name: "flow.zip".into(),
-                    },
-                    &drain,
-                    None,
-                )
-                .unwrap();
-            drain.commit(&mut manager);
-        }
-        let (durable, sidecars) =
-            serde_json::from_slice(&std::fs::read(&session_path).unwrap()).unwrap();
-        let sessions = Arc::new(SessionStore::from_persisted_parts(durable, sidecars).unwrap());
-        let recovered =
-            magi_conversation_runtime::dispatch_submission::recover_dispatch_submission_request(
-                &sessions.runtime_sidecar(&session).unwrap(),
-            )
-            .unwrap();
-        assert_eq!(
-            recovered.user_message_metadata["magi.workflowPackageDigest"],
-            package.digest()
-        );
-        let state = ApiState::new(
-            "magi-test",
-            Arc::new(InMemoryEventBus::new(32)),
-            sessions,
-            Arc::new(WorkspaceStore::default()),
-            Arc::new(GovernanceService::default()),
-        )
-        .with_task_store(Arc::new(restored))
-        .with_plugin_manager(Arc::new(std::sync::Mutex::new(
-            magi_plugin_system::PluginManager::open(root.path()).unwrap(),
-        )));
-        let replay = crate::turn_service::TurnService::new(state.clone())
-            .submit(original)
-            .await
-            .expect("升级和重启不能阻止读取原回执");
-        assert!(replay.replayed);
-        assert_eq!(replay.turn_id.as_deref(), Some(accepted.turn_id.as_str()));
-        let mut mismatched = recovered.clone();
-        mismatched.user_message_metadata.insert(
-            "magi.workflowPackageDigest".into(),
-            upgraded.digest().into(),
-        );
-        let error = super::materialize_dispatch_submission_after_acceptance(
-            &state,
-            &DispatchSubmissionAccepted {
-                request: mismatched,
-                ..accepted.clone()
-            },
-        )
-        .unwrap_err();
-        assert!(error.message().contains("运行负载与持久化请求不一致"));
-        assert!(
-            state
-                .session_store
-                .thread_registry_snapshot(&session)
-                .is_empty()
-        );
-        super::materialize_dispatch_submission_after_acceptance(
-            &state,
-            &DispatchSubmissionAccepted {
-                request: recovered,
-                ..accepted.clone()
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            state
-                .task_store()
-                .unwrap()
-                .get_task(&accepted.root_task_id)
-                .unwrap()
-                .runtime_payload,
-            task.runtime_payload
-        );
-    }
-
     #[test]
     fn turn_payload_only_initializes_model_for_a_new_session() {
         let state = test_state();
@@ -2260,7 +1987,6 @@ mod tests {
                 context_references: Vec::new(),
                 browser_annotation_refs: Vec::new(),
                 browser_node_selections: Vec::new(),
-                plugin_selections: Vec::new(),
                 created_session: false,
                 mission_title: "派发失败诊断".to_string(),
                 task_title: "派发失败诊断".to_string(),
@@ -2272,7 +1998,6 @@ mod tests {
                 goal_mode: false,
                 use_tools: true,
                 target_role: None,
-                workflow_id: None,
                 request_id: None,
                 user_message_id: None,
                 placeholder_message_id: None,

@@ -34,7 +34,6 @@
     type AgentSettingsBootstrapSnapshot,
     settingsBootstrapMatchesCurrentWorkspace,
   } from '../web/agent-api';
-  import type { PluginSelection } from '../shared/app-server-protocol.generated';
   import type { AgentBindingOverride } from '../web/agent-binding-context';
   import Icon from './Icon.svelte';
   import UserQuestionPanel from './UserQuestionPanel.svelte';
@@ -87,11 +86,8 @@
     resolveSlashTrigger,
     type ComposerAction,
     type ComposerSessionCommand,
-    type ComposerPluginCommandOption,
     type ComposerSkillOption,
-    type ComposerWorkflowOption,
   } from '../lib/composer-actions';
-  import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
   import {
     composerAttachmentTotal,
     MAX_COMPOSER_IMAGE_BYTES,
@@ -135,10 +131,6 @@
     | 'screenshotArtifactId'
   >;
 
-  function pluginSelectionKey(selection: PluginSelection): string {
-    return `${selection.pluginId}/${selection.resourceId}@${selection.version}:${JSON.stringify(selection.selection ?? null)}`;
-  }
-
   interface QueuedMessageEdit {
     sourceFolderId?: string;
     queueId: string;
@@ -157,12 +149,9 @@
     contextReferences: ComposerContextReference[];
     browserAnnotations: SelectedBrowserAnnotation[];
     browserNodeSelections: MessageBrowserNodeSelection[];
-    pluginSelections: PluginSelection[];
     goalMode: boolean;
     sessionCommand: ComposerSessionCommand | null;
     skill: SkillOption | null;
-    workflow: ComposerWorkflowOption | null;
-    pluginCommand: ComposerPluginCommandOption | null;
   }
 
   // 输入框可识别的 instruction skill。来源：bootstrap 中的 skillsConfig.instructionSkills，
@@ -215,12 +204,9 @@
   let selectedGoalMode = $state(false);
   let selectedSessionCommand = $state<ComposerSessionCommand | null>(null);
   let selectedSkill = $state<SkillOption | null>(null);
-  let selectedWorkflow = $state<ComposerWorkflowOption | null>(null);
-  let selectedPluginCommand = $state<ComposerPluginCommandOption | null>(null);
   let selectedContextReferences = $state<ComposerContextReference[]>([]);
   let selectedBrowserAnnotations = $state<SelectedBrowserAnnotation[]>([]);
   let selectedBrowserNodeSelections = $state<MessageBrowserNodeSelection[]>([]);
-  let selectedPluginSelections = $state<PluginSelection[]>([]);
   let editingBrowserAnnotation = $state<SelectedBrowserAnnotation | null>(null);
   let editingBrowserAnnotationComment = $state('');
   let browserAnnotationSaving = $state(false);
@@ -655,9 +641,8 @@
       || pendingImageReadCount > 0
       || selectedContextReferences.length > 0
       || selectedBrowserAnnotations.length > 0
-      || Boolean(selectedGoalMode || selectedSessionCommand || selectedSkill || selectedWorkflow || selectedPluginCommand)
-      || selectedBrowserNodeSelections.length > 0
-      || selectedPluginSelections.length > 0;
+      || Boolean(selectedGoalMode || selectedSessionCommand || selectedSkill)
+      || selectedBrowserNodeSelections.length > 0;
   });
 
   // bootstrap 是全局缓存，新会话/设置变更都会同步更新这里，所以输入框可以直接派生。
@@ -684,38 +669,12 @@
     return out;
   });
 
-  // 命令与工作流入口只来自 daemon 的激活投影，并随插件注册表变化一起刷新。
-  const pluginScope = APPLICATION_PLUGIN_SCOPE;
-  $effect(() => {
-    trackPluginProjection(pluginScope);
-  });
-  const availableWorkflows = $derived<ComposerWorkflowOption[]>(
-    pluginProjection(pluginScope).workflows
-      .filter((entry) => entry.id.startsWith('plugin/'))
-      .map((entry) => ({ workflowId: entry.id, name: entry.title, description: entry.description })),
-  );
-  const availablePluginCommands = $derived<ComposerPluginCommandOption[]>(
-    pluginProjection(pluginScope).commands
-      .filter((entry) => entry.id.startsWith('plugin/'))
-      .map((entry) => ({ pluginCommandId: entry.id, name: entry.title, description: entry.description })),
-  );
-  // 已选入口失效（插件停用或工作区切换）时撤销选择，避免提交已不可用的身份。
-  $effect(() => {
-    if (!pluginProjection(pluginScope).loaded) return;
-    if (selectedWorkflow && !availableWorkflows.some((workflow) => workflow.workflowId === selectedWorkflow?.workflowId)) {
-      selectedWorkflow = null;
-    }
-    if (selectedPluginCommand && !availablePluginCommands.some((command) => command.pluginCommandId === selectedPluginCommand?.pluginCommandId)) {
-      selectedPluginCommand = null;
-    }
-  });
-
   // 压缩命令与附件互斥：草稿会话没有可压缩的历史，带附件时 daemon 会拒绝，这里提前说明而不是让它消失。
   const attachmentTotal = $derived(composerAttachmentTotal({
     images: selectedImages.length + pendingImageReadCount,
     contextReferences: selectedContextReferences.length,
     browserAnnotations: selectedBrowserAnnotations.length,
-    browserNodeSelections: selectedBrowserNodeSelections.length + selectedPluginSelections.length,
+    browserNodeSelections: selectedBrowserNodeSelections.length,
   }));
   const compactDisabledReason = $derived(sessionCommandDisabledReason({
     sessionCommandsAvailable: !isDraftSession,
@@ -740,8 +699,6 @@
     },
     {
       sessionCommandDisabledReason: compactDisabledReason,
-      workflows: availableWorkflows,
-      pluginCommands: availablePluginCommands,
     },
   ));
 
@@ -752,11 +709,7 @@
         ? !selectedGoalMode
         : command.kind === 'command'
           ? command.id !== selectedSessionCommand
-        : command.kind === 'skill'
-          ? command.id !== selectedSkill?.skillId
-          : command.kind === 'workflow'
-            ? command.id !== selectedWorkflow?.workflowId
-            : command.id !== selectedPluginCommand?.pluginCommandId
+        : command.id !== selectedSkill?.skillId
     ));
   });
 
@@ -793,12 +746,9 @@
     selectedContextReferences = [];
     selectedBrowserAnnotations = [];
     selectedBrowserNodeSelections = [];
-    selectedPluginSelections = [];
     selectedGoalMode = false;
     selectedSessionCommand = null;
     selectedSkill = null;
-    selectedWorkflow = null;
-    selectedPluginCommand = null;
     addMenuOpen = false;
     contextPickerOpen = false;
     invalidateEnhanceState();
@@ -812,12 +762,9 @@
       || selectedContextReferences.length > 0
       || selectedBrowserAnnotations.length > 0
       || selectedBrowserNodeSelections.length > 0
-      || selectedPluginSelections.length > 0
       || selectedGoalMode
       || selectedSessionCommand !== null
-      || selectedSkill
-      || selectedWorkflow
-      || selectedPluginCommand,
+      || selectedSkill,
     );
   }
 
@@ -963,12 +910,9 @@
       contextReferences: selectedContextReferences.map((reference) => ({ ...reference })),
       browserAnnotations: selectedBrowserAnnotations.map((annotation) => ({ ...annotation })),
       browserNodeSelections: selectedBrowserNodeSelections.map(cloneBrowserNodeSelection),
-      pluginSelections: selectedPluginSelections.map((selection) => ({ ...selection })),
       goalMode: selectedGoalMode,
       sessionCommand: selectedSessionCommand,
       skill: selectedSkill ? { ...selectedSkill } : null,
-      workflow: selectedWorkflow ? { ...selectedWorkflow } : null,
-      pluginCommand: selectedPluginCommand ? { ...selectedPluginCommand } : null,
     };
   }
 
@@ -979,12 +923,9 @@
       && selectedContextReferences.length === 0
       && selectedBrowserAnnotations.length === 0
       && selectedBrowserNodeSelections.length === 0
-      && selectedPluginSelections.length === 0
       && !selectedGoalMode
       && selectedSessionCommand === null
-      && selectedSkill === null
-      && selectedWorkflow === null
-      && selectedPluginCommand === null;
+      && selectedSkill === null;
   }
 
   function restoreComposerSubmissionDraft(draft: ComposerSubmissionDraft): void {
@@ -999,12 +940,9 @@
     selectedContextReferences = draft.contextReferences.map((reference) => ({ ...reference }));
     selectedBrowserAnnotations = draft.browserAnnotations.map((annotation) => ({ ...annotation }));
     selectedBrowserNodeSelections = draft.browserNodeSelections.map(cloneBrowserNodeSelection);
-    selectedPluginSelections = draft.pluginSelections.map((selection) => ({ ...selection }));
     selectedGoalMode = draft.goalMode;
     selectedSessionCommand = draft.sessionCommand;
     selectedSkill = draft.skill ? { ...draft.skill } : null;
-    selectedWorkflow = draft.workflow ? { ...draft.workflow } : null;
-    selectedPluginCommand = draft.pluginCommand ? { ...draft.pluginCommand } : null;
     queueMicrotask(focusEditor);
   }
 
@@ -1020,12 +958,9 @@
       || selectedContextReferences.length > 0
       || selectedBrowserAnnotations.length > 0
       || selectedBrowserNodeSelections.length > 0
-      || selectedPluginSelections.length > 0
       || selectedGoalMode
       || selectedSessionCommand !== null
       || selectedSkill !== null
-      || selectedWorkflow !== null
-      || selectedPluginCommand !== null
       || editingTurn !== null,
     );
   });
@@ -1081,14 +1016,11 @@
       attributes: { ...selection.attributes },
       bounds: selection.bounds ? { ...selection.bounds } : selection.bounds,
     }));
-    selectedPluginSelections = [];
     selectedGoalMode = draft.goalMode;
     selectedSessionCommand = null;
     selectedSkill = draft.skillName
       ? (availableSkills.find((skill) => skill.skillId === draft.skillName) || null)
       : null;
-    selectedWorkflow = null;
-    selectedPluginCommand = null;
     queueMicrotask(focusEditor);
   });
 
@@ -1215,24 +1147,15 @@
   }
 
   // 压缩命令不能带附件：用户主动添加附件时让命令让位并说明，附件不丢。
-  function dropSessionCommandForAttachment(reason: 'attachment' | 'plugin-selection' = 'attachment'): void {
-    if (selectedSessionCommand === null && selectedPluginCommand === null) return;
+  function dropSessionCommandForAttachment(): void {
+    if (selectedSessionCommand === null) return;
     selectedSessionCommand = null;
-    if (selectedPluginCommand !== null) selectedPluginCommand = null;
-    addToast(
-      'info',
-      reason === 'attachment'
-        ? i18n.t('input.compact.removedForAttachment')
-        : i18n.t('input.pluginCommand.removedForSelection'),
-      undefined,
-      { forceVisible: true },
-    );
+    addToast('info', i18n.t('input.compact.removedForAttachment'), undefined, { forceVisible: true });
   }
 
   function activeModeLabel(): string | null {
     if (selectedGoalMode) return i18n.t('input.goalMode.name');
     if (selectedSessionCommand) return i18n.t('input.compact.name');
-    if (selectedPluginCommand) return selectedPluginCommand.name;
     if (selectedSkill) return selectedSkill.name;
     return null;
   }
@@ -1517,32 +1440,14 @@
       selectedGoalMode = true;
       selectedSessionCommand = null;
       selectedSkill = null;
-      selectedWorkflow = null;
-      selectedPluginCommand = null;
     } else if (command.kind === 'command') {
       selectedGoalMode = false;
       selectedSessionCommand = command.id;
       selectedSkill = null;
-      selectedWorkflow = null;
-      selectedPluginCommand = null;
-    } else if (command.kind === 'workflow') {
-      selectedGoalMode = false;
-      selectedSessionCommand = null;
-      selectedSkill = null;
-      selectedWorkflow = command.workflow;
-      selectedPluginCommand = null;
-    } else if (command.kind === 'plugin-command') {
-      selectedGoalMode = false;
-      selectedSessionCommand = null;
-      selectedSkill = null;
-      selectedWorkflow = null;
-      selectedPluginCommand = command.pluginCommand;
     } else {
       selectedGoalMode = false;
       selectedSessionCommand = null;
       selectedSkill = command.skill;
-      selectedWorkflow = null;
-      selectedPluginCommand = null;
     }
     if (inputTextareaEl && slashTriggerStart !== null) {
       invalidateEnhanceState();
@@ -1592,34 +1497,14 @@
       selectedGoalMode = !selectedGoalMode;
       selectedSessionCommand = null;
       selectedSkill = null;
-      selectedWorkflow = null;
-      selectedPluginCommand = null;
     } else if (action.kind === 'command') {
       selectedGoalMode = false;
       selectedSessionCommand = selectedSessionCommand === action.id ? null : action.id;
       selectedSkill = null;
-      selectedWorkflow = null;
-      selectedPluginCommand = null;
-    } else if (action.kind === 'workflow') {
-      selectedGoalMode = false;
-      selectedSessionCommand = null;
-      selectedSkill = null;
-      selectedWorkflow = selectedWorkflow?.workflowId === action.workflow.workflowId ? null : action.workflow;
-      selectedPluginCommand = null;
-    } else if (action.kind === 'plugin-command') {
-      selectedGoalMode = false;
-      selectedSessionCommand = null;
-      selectedSkill = null;
-      selectedWorkflow = null;
-      selectedPluginCommand = selectedPluginCommand?.pluginCommandId === action.pluginCommand.pluginCommandId
-        ? null
-        : action.pluginCommand;
     } else {
       selectedGoalMode = false;
       selectedSessionCommand = null;
       selectedSkill = selectedSkill?.skillId === action.skill.skillId ? null : action.skill;
-      selectedWorkflow = null;
-      selectedPluginCommand = null;
     }
     closeAddMenu();
     queueMicrotask(focusEditor);
@@ -1893,34 +1778,6 @@
       selectedBrowserNodeSelections = [...selectedBrowserNodeSelections, cloneBrowserNodeSelection(selection)];
       queueMicrotask(focusEditor);
     }
-    function handlePluginSelectionAdded(event: Event) {
-      const detail = (event as CustomEvent<PluginSelection>).detail;
-      if (
-        !detail
-        || typeof detail.pluginId !== 'string' || !detail.pluginId.trim()
-        || typeof detail.resourceId !== 'string' || !detail.resourceId.trim()
-        || typeof detail.version !== 'number'
-        || typeof detail.label !== 'string' || !detail.label.trim()
-      ) return;
-      const key = pluginSelectionKey(detail);
-      if (selectedPluginSelections.some((item) => pluginSelectionKey(item) === key)) return;
-      if (selectedPluginSelections.length >= 8) {
-        addToast('warning', i18n.t('input.pluginSelection.limit'));
-        return;
-      }
-      dropSessionCommandForAttachment('plugin-selection');
-      selectedPluginSelections = [...selectedPluginSelections, { ...detail }];
-      // 输入区只在“对话”标签里可见：从主内容区插件页面选中时，明确告知引用已加入。
-      if (messagesState.currentTopTab !== 'thread') {
-        addToast('info', i18n.t('input.pluginSelection.added', { label: detail.label }), undefined, { forceVisible: true });
-      }
-      queueMicrotask(focusEditor);
-    }
-    function handlePluginSelectionInvalidated(event: Event) {
-      const pluginId = (event as CustomEvent<{ pluginId?: unknown }>).detail?.pluginId;
-      if (typeof pluginId !== 'string') return;
-      selectedPluginSelections = selectedPluginSelections.filter((selection) => selection.pluginId !== pluginId);
-    }
     function handleBrowserNodeSelectionInvalidated(event: Event) {
       const detail = (event as CustomEvent<{
         browserSessionId?: unknown;
@@ -2001,8 +1858,6 @@
     window.addEventListener('magi:browserAnnotationUpdated', handleBrowserAnnotationUpdated as EventListener);
     window.addEventListener('magi:browserNodeSelected', handleBrowserNodeSelected as EventListener);
     window.addEventListener('magi:browserNodeSelectionInvalidated', handleBrowserNodeSelectionInvalidated as EventListener);
-    window.addEventListener('magi:pluginSelectionAdded', handlePluginSelectionAdded as EventListener);
-    window.addEventListener('magi:pluginSelectionInvalidated', handlePluginSelectionInvalidated as EventListener);
     window.addEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
     window.addEventListener('magi:sessionTurnSubmissionSettled', handleSessionTurnSubmissionSettled as EventListener);
     window.addEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
@@ -2016,8 +1871,6 @@
       window.removeEventListener('magi:browserAnnotationUpdated', handleBrowserAnnotationUpdated as EventListener);
       window.removeEventListener('magi:browserNodeSelected', handleBrowserNodeSelected as EventListener);
       window.removeEventListener('magi:browserNodeSelectionInvalidated', handleBrowserNodeSelectionInvalidated as EventListener);
-      window.removeEventListener('magi:pluginSelectionAdded', handlePluginSelectionAdded as EventListener);
-      window.removeEventListener('magi:pluginSelectionInvalidated', handlePluginSelectionInvalidated as EventListener);
       window.removeEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
       window.removeEventListener('magi:sessionTurnSubmissionSettled', handleSessionTurnSubmissionSettled as EventListener);
       window.removeEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
@@ -2101,7 +1954,7 @@
 
 
       if (
-        (!normalizedContent && selectedSessionCommand === null && selectedWorkflow === null && selectedPluginCommand === null && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0 && selectedBrowserNodeSelections.length === 0 && selectedPluginSelections.length === 0)
+        (!normalizedContent && selectedSessionCommand === null && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0 && selectedBrowserNodeSelections.length === 0)
         || sessionInputLocked
         || (isInteractionBlocking && !interruptTurnId)
         || (isDraftSession && isSending)
@@ -2120,8 +1973,6 @@
               ? i18n.t('browser.annotation.context')
             : selectedBrowserNodeSelections.length > 0
               ? i18n.t('browser.nodeSelection.context')
-            : selectedPluginSelections.length > 0
-              ? i18n.t('input.pluginSelection.context')
             : null;
       const submissionLength = submissionText?.length ?? 0;
 
@@ -2145,7 +1996,7 @@
       const replaceTurnId = editingTurn?.sessionId === messagesState.currentSessionId
         ? editingTurn.turnId
         : null;
-      if (interruptTurnId && (replaceTurnId || selectedSessionCommand || selectedPluginCommand)) return;
+      if (interruptTurnId && (replaceTurnId || selectedSessionCommand)) return;
       if (!replaceTurnId) {
         submittedComposerDrafts.set(requestId, captureComposerSubmissionDraft(rawContent));
       }
@@ -2160,8 +2011,6 @@
         skillName: selectedSkill?.skillId ?? null,
         goalMode: selectedGoalMode,
         command: selectedSessionCommand,
-        workflowId: selectedWorkflow?.workflowId ?? null,
-        pluginCommandId: selectedPluginCommand?.pluginCommandId ?? null,
         accessProfile: selectedAccessProfile,
         ...(isDraftSession ? { orchestratorSessionConfig } : {}),
         replaceTurnId,
@@ -2173,7 +2022,6 @@
         contextReferences: toSessionContextReferencePayload(selectedContextReferences),
         browserAnnotationRefs: selectedBrowserAnnotations.map((annotation) => annotation.annotationId),
         browserNodeSelections: selectedBrowserNodeSelections.map(cloneBrowserNodeSelection),
-        pluginSelections: selectedPluginSelections.map((selection) => ({ ...selection })),
       });
       if (!replaceTurnId) {
         clearComposerState();
@@ -2324,18 +2172,9 @@
       contextReferences: references,
       browserAnnotations: [],
       browserNodeSelections: (target.browserNodeSelections ?? []).map(cloneBrowserNodeSelection),
-      pluginSelections: (target.pluginSelections ?? []).map((selection) => ({ ...selection })),
       goalMode: target.goalMode === true,
       sessionCommand: target.command === 'compact' ? 'compact' : null,
       skill: restoredSkill,
-      workflow: target.workflowId
-        ? availableWorkflows.find((workflow) => workflow.workflowId === target.workflowId)
-          ?? { workflowId: target.workflowId, name: target.workflowId, description: '' }
-        : null,
-      pluginCommand: target.pluginCommandId
-        ? availablePluginCommands.find((command) => command.pluginCommandId === target.pluginCommandId)
-          ?? { pluginCommandId: target.pluginCommandId, name: target.pluginCommandId, description: '' }
-        : null,
     };
     restoreComposerSubmissionDraft(draft);
   }
@@ -2371,13 +2210,11 @@
             sessionId: target.sessionId, workspaceId: target.workspaceId || null, workspacePath: target.workspacePath || null,
             sourceFolderId: target.sourceFolderId || null,
             text, skillName: selectedSkill?.skillId ?? null, goalMode: selectedGoalMode, command: selectedSessionCommand,
-            workflowId: selectedWorkflow?.workflowId ?? null, pluginCommandId: selectedPluginCommand?.pluginCommandId ?? null,
             accessProfile: selectedAccessProfile, locale: i18n.locale,
             images: selectedImages.map(image => ({ name: image.name, dataUrl: image.dataUrl })),
             contextReferences: toSessionContextReferencePayload(selectedContextReferences),
             browserAnnotationRefs: selectedBrowserAnnotations.map(annotation => annotation.annotationId),
             browserNodeSelections: selectedBrowserNodeSelections.map(cloneBrowserNodeSelection),
-            pluginSelections: selectedPluginSelections.map(selection => ({ ...selection })),
           } });
       });
       if (!result.updated) {
@@ -3052,7 +2889,7 @@ async function refreshPickerSettingsSnapshot() {
     {/if}
 
     <!-- 快捷引用保持结构化状态，不把 /goal 或 Skill 名称注入用户正文。 -->
-    {#if selectedContextReferences.length > 0 || selectedBrowserAnnotations.length > 0 || selectedBrowserNodeSelections.length > 0 || selectedPluginSelections.length > 0 || selectedGoalMode || selectedSessionCommand || selectedSkill || selectedWorkflow || selectedPluginCommand}
+    {#if selectedContextReferences.length > 0 || selectedBrowserAnnotations.length > 0 || selectedBrowserNodeSelections.length > 0 || selectedGoalMode || selectedSessionCommand || selectedSkill}
       <div class="ia-reference-chip-row">
         {#each selectedContextReferences as reference (reference.id)}
           <span class="ia-reference-chip ia-context-reference-chip" title={reference.path}>
@@ -3112,21 +2949,6 @@ async function refreshPickerSettingsSnapshot() {
             </button>
           </span>
         {/each}
-        {#each selectedPluginSelections as selection, selectionIndex (pluginSelectionKey(selection))}
-          <span class="ia-reference-chip" data-testid="plugin-selection-chip" title={selection.summary || selection.label}>
-            <Icon name="settings" size={11} />
-            <span class="ia-reference-chip-label">{selection.label}</span>
-            <button
-              type="button"
-              class="ia-reference-chip-remove"
-              onclick={() => { selectedPluginSelections = selectedPluginSelections.filter((_, index) => index !== selectionIndex); }}
-              title={i18n.t('input.pluginSelection.remove')}
-              aria-label={i18n.t('input.pluginSelection.remove')}
-            >
-              <Icon name="close" size={10} />
-            </button>
-          </span>
-        {/each}
         {#if selectedGoalMode}
           <span class="ia-reference-chip ia-reference-chip-goal" title={i18n.t('input.goalMode.description')}>
             <Icon name="infinity" size={11} />
@@ -3172,38 +2994,6 @@ async function refreshPickerSettingsSnapshot() {
               onclick={removeSelectedSkill}
               title={i18n.t('input.removeSkill')}
               aria-label={i18n.t('input.removeSkill')}
-            >
-              <Icon name="close" size={10} />
-            </button>
-          </span>
-        {/if}
-        {#if selectedWorkflow}
-          <span class="ia-reference-chip ia-reference-chip-goal" title={selectedWorkflow.description}>
-            <Icon name="settings" size={11} />
-            <span class="ia-reference-chip-label">/{selectedWorkflow.name}</span>
-            {#if selectedWorkflow.description}<span class="ia-reference-chip-desc">{selectedWorkflow.description}</span>{/if}
-            <button
-              type="button"
-              class="ia-reference-chip-remove"
-              onclick={() => { selectedWorkflow = null; queueMicrotask(focusEditor); }}
-              title={i18n.t('input.removeWorkflow')}
-              aria-label={i18n.t('input.removeWorkflow')}
-            >
-              <Icon name="close" size={10} />
-            </button>
-          </span>
-        {/if}
-        {#if selectedPluginCommand}
-          <span class="ia-reference-chip ia-reference-chip-goal" title={selectedPluginCommand.description}>
-            <Icon name="tool" size={11} />
-            <span class="ia-reference-chip-label">/{selectedPluginCommand.name}</span>
-            {#if selectedPluginCommand.description}<span class="ia-reference-chip-desc">{selectedPluginCommand.description}</span>{/if}
-            <button
-              type="button"
-              class="ia-reference-chip-remove"
-              onclick={() => { selectedPluginCommand = null; queueMicrotask(focusEditor); }}
-              title={i18n.t('input.removePluginCommand')}
-              aria-label={i18n.t('input.removePluginCommand')}
             >
               <Icon name="close" size={10} />
             </button>
@@ -3258,11 +3048,7 @@ async function refreshPickerSettingsSnapshot() {
                   ? i18n.t('input.slash.modeGroup')
                   : command.kind === 'command'
                     ? i18n.t('input.slash.commandGroup')
-                  : command.kind === 'workflow'
-                      ? i18n.t('input.slash.workflowGroup')
-                      : command.kind === 'plugin-command'
-                        ? i18n.t('input.slash.pluginCommandGroup')
-                        : i18n.t('input.slash.skillGroup')}
+                  : i18n.t('input.slash.skillGroup')}
               </div>
             {/if}
             <button
@@ -3277,7 +3063,7 @@ async function refreshPickerSettingsSnapshot() {
               onmousedown={(e) => { e.preventDefault(); commitSlashCommand(command); }}
             >
               <span class="ia-slash-item-icon" class:goal={command.kind === 'goal'}>
-                <Icon name={command.kind === 'goal' ? 'infinity' : command.kind === 'command' ? 'refresh' : command.kind === 'workflow' ? 'settings' : command.kind === 'plugin-command' ? 'tool' : 'skill'} size={12} />
+                <Icon name={command.kind === 'goal' ? 'infinity' : command.kind === 'command' ? 'refresh' : 'skill'} size={12} />
               </span>
               <span class="ia-slash-item-content">
                 <span class="ia-slash-item-label">/{command.kind === 'goal' ? 'goal' : command.kind === 'command' ? command.id : command.name}</span>
@@ -3321,11 +3107,7 @@ async function refreshPickerSettingsSnapshot() {
                         ? i18n.t('input.slash.modeGroup')
                         : action.kind === 'command'
                           ? i18n.t('input.slash.commandGroup')
-                        : action.kind === 'workflow'
-                            ? i18n.t('input.slash.workflowGroup')
-                            : action.kind === 'plugin-command'
-                              ? i18n.t('input.slash.pluginCommandGroup')
-                              : i18n.t('input.slash.skillGroup')}
+                        : i18n.t('input.slash.skillGroup')}
                   </div>
                 {/if}
                 <button
@@ -3339,11 +3121,7 @@ async function refreshPickerSettingsSnapshot() {
                       ? selectedSessionCommand === action.id
                     : action.kind === 'skill'
                       ? selectedSkill?.skillId === action.skill.skillId
-                    : action.kind === 'workflow'
-                      ? selectedWorkflow?.workflowId === action.workflow.workflowId
-                      : action.kind === 'plugin-command'
-                        ? selectedPluginCommand?.pluginCommandId === action.pluginCommand.pluginCommandId
-                        : false}
+                    : false}
                   onclick={() => applyAddMenuAction(action)}
                   role="menuitem"
                 >
@@ -3355,10 +3133,6 @@ async function refreshPickerSettingsSnapshot() {
                           ? 'infinity'
                           : action.kind === 'command'
                             ? 'refresh'
-                          : action.kind === 'workflow'
-                            ? 'settings'
-                            : action.kind === 'plugin-command'
-                              ? 'tool'
                           : 'skill'}
                       size={13}
                     />
@@ -3773,7 +3547,7 @@ async function refreshPickerSettingsSnapshot() {
               class="ia-queue-action btn btn--secondary btn--sm"
               data-testid="input-replace-button"
               onclick={() => interruptTargetTurnId && sendMessage(interruptTargetTurnId)}
-              disabled={sessionInputLocked || sendPreparing || pendingImageReadCount > 0 || !mainModelReady || !interruptTargetTurnId || Boolean(editingTurn || editingQueuedMessage || selectedSessionCommand || selectedPluginCommand)}
+              disabled={sessionInputLocked || sendPreparing || pendingImageReadCount > 0 || !mainModelReady || !interruptTargetTurnId || Boolean(editingTurn || editingQueuedMessage || selectedSessionCommand)}
               title={i18n.t('input.followUp.replaceTitle')}
             >{i18n.t('input.followUp.replace')}</button>
             <button

@@ -65,7 +65,7 @@ Rust 摘要、压缩或语言解析依赖升级时，运行 `cargo test -p magi-
 | `npm run test:daemon-continuation` | 构建 Web 后，通过 `scripts/dev-daemon.sh` 启动独立 daemon、状态目录和本地 Provider；Chromium 验收三种情形：用户主动停止后读模型给出 `continuation=resume_turn`、发送按钮变为继续且与 daemon 一致，点击后以 `resume=true` 重新激活并完成，完成后按钮恢复为发送；模型拒绝请求导致失败后给出 `resume_chain`，点击继续后完成；正常完成的会话没有 continuation，daemon 拒绝 `resume` 请求。输入框有内容时一定是发送。另覆盖：停止后重载页面按钮由 daemon 快照恢复、连点三次继续只提交一次 `resume`、连续停止两次每次都能继续、被新输入取代的取消不可继续、多会话切换互不串扰、daemon 强杀重启后中断的会话可继续且不自动重放。不接管用户进程、不使用真实模型，不是打包 Desktop 验收 |
 | `npm run test:daemon-input-queue` | 构建 Web 后，通过 `scripts/dev-daemon.sh` 启动独立 daemon、状态目录和本地 Provider；Chromium 访问 daemon 主入口，验收 task 补充、页面重载、下一轮队列消费、无重复用户消息，以及缺失 usage 时继续执行、实际用量统计和无预算的目标完成；同时覆盖 Web 显式转交原代理、停止父轮、下一轮主线、SIGKILL 重启后点击继续原代理及独立完成和详情展示，不接管用户进程、不使用真实模型。不是打包 Desktop 验收 |
 | `npm run test:electron-conversation-dom` | 已打包 Electron 与脚本提供的本地 HTTP Provider；验证 DOM、首轮接纳期间草稿保留、排队与会话归属、停止和继续、后台 Job 事件等待/持久终态/真实文件结果、重启恢复及时序。脚本按当前平台解析目录包、Shell 写入和进程树；应用路径、端口及场景通过 MAGI_ELECTRON_DOM_* 设置，见脚本头部。CI Windows 门禁会构建 `win-unpacked` 目录包并上传 JSON/日志证据 |
-| `npm run test:electron-plugins` | 已打包 Electron、独立状态根与本地 Provider；覆盖插件安装、授权激活、设置、隔离视图与资源同步、工具/命令、升级排空与数据转换、插件中心和停用；MCP 覆盖服务生命周期、完整工具目录、询问/开放模式、外部会话排序与审批、拒绝写入、变更账本、审计与内容留存、实际生成的 stdio 配置握手与文件读写、越界及错误令牌拒绝、HTTP 吊销。通过 MAGI_ELECTRON_PLUGINS_* 设置应用路径与端口 |
+| `npm run test:electron-plugins` | 已打包 Electron、独立状态根与本地 Provider；覆盖工作区侧栏导航；MCP 覆盖服务生命周期、完整工具目录、询问/开放模式、外部会话排序与审批、拒绝写入、变更账本、审计与内容留存、实际生成的 stdio 配置握手与文件读写、越界及错误令牌拒绝、HTTP 吊销。通过 MAGI_ELECTRON_PLUGINS_* 设置应用路径与端口 |
 | `cargo test -p magi-plugin-system --test catalog_tool` | 用 `scripts/plugin-center.mjs` 发布工具签名目录，再由 daemon 的 `PluginCatalog::verify` 校验；需要 Node.js，缺失时跳过 |
 | `npm run test:electron-browser-permission-matrix` | 打包 macOS Apple Silicon Electron 的 Browser 权限代表场景；需本机图形环境及空闲 daemon/CDP 端口 |
 | `npm run test:electron-right-pane-links` | 已打包 Electron、全新状态根与本地 Provider；从右栏未挂载开始，验证链接点击展开、真实页面加载、同 URL 复用、会话绑定 激活时切换、关闭 Tab 和关闭会话后 Browser 资源结算 |
@@ -283,7 +283,7 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 随包 Node：`node apps/desktop/scripts/node-runtime.mjs stage <目录>` 下载固定版本、校验归档摘要并在清空环境下执行校验；打包时 afterPack 对最终制品再做同样的执行校验（清单必须含该文件与版本）。以 `MAGI_EXTENSION_NODE` 指向该 Node 运行 `cargo test -p magi-extension-host --test host` 与 `cargo test -p magi-daemon --lib extension` 已在 macOS 通过；其余钩子未接线；macOS 以外平台未运行。
 
-[插件系统设计](plugin-system-requirements-design.md)第 12 节定义了完整的验收面，除上述入口外目前没有对应的脚本或测试命令，不能把下列条目当作已有入口；协议层验收清单见[扩展协议 v1](extension-protocol-v1.md#13-一致性验收协议层)。现有 `test:electron-plugins`、工作流与会话引擎相关回归验证的是即将被替换的 QuickJS 实现，替换交付时随之改写，不并行保留两套验收。
+[插件系统设计](plugin-system-requirements-design.md)第 12 节定义了完整的验收面，除上述入口外目前没有对应的脚本或测试命令，不能把下列条目当作已有入口；协议层验收清单见[扩展协议 v1](extension-protocol-v1.md#13-一致性验收协议层)。`test:electron-plugins` 原有的 SDK 1 插件段（工具/命令、升级排空与数据转换、插件中心安装）已随 QuickJS 删除，现仅保留工作区导航与 MCP 验收；受信 Node 扩展在发行包中的真实验收尚未接入。
 
 实现该能力时必须新增并在本文登记的验证面：
 

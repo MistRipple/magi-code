@@ -1598,7 +1598,6 @@ fn run_conversation_loop_inner(
                     allowed_tools,
                     denied_tools,
                     include_external: deferred_mcp_tools_loaded,
-                    workspace_id: workspace_id.as_ref(),
                 });
         }
         active_tools = constrain_task_tool_definitions(active_tools, task.policy_snapshot.as_ref());

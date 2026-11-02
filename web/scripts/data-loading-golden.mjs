@@ -110,19 +110,14 @@ await withGoldenViteServer(async server => {
   const manifestsPath = '/api/plugins/manifests';
   const pluginResponse = manifestResponse => {
     queue(manifestsPath, manifestResponse);
-    queue('/api/plugins/commands', () => json([]));
-    queue('/api/plugins/workflows', () => json([]));
   };
-  let invalidations = 0;
-  window.addEventListener('magi:pluginSelectionInvalidated', () => invalidations++);
   pluginResponse(() => json([plugin]));
   await registry.loadedPluginProjection('application');
   window.dispatchEvent(new Event('magi-plugin-registry-changed'));
   pluginResponse(() => json({ message: 'temporary' }, 503));
   const failed = await registry.loadedPluginProjection('application');
   assert.equal(failed.manifests[0].id, plugin.id);
-  assert.equal(invalidations, 0, '临时读取失败不能撤销插件选择或关闭页面');
-  assert.equal(failed.loaded, false, '旧清单仍可展示，但读取失败后不能据其缺项撤销选择');
+  assert.equal(failed.loaded, false, '旧清单仍可展示，但读取失败后不能据其缺项判断插件已被移除');
   pluginResponse(() => json([plugin]));
   assert.equal((await registry.loadedPluginProjection('application')).loaded, true, '失败读取允许重试');
   pluginResponse(() => json({ message: 'offline' }, 503));
@@ -137,7 +132,6 @@ await withGoldenViteServer(async server => {
   oldPlugins.resolve(json([plugin]));
   const settled = await oldLoad;
   assert.deepEqual(settled.manifests, [], '旧注册表请求不能恢复已停用插件');
-  assert.equal(invalidations, 1, '成功读取到插件确实被移除后才撤销选择');
   const invalidatedPlugins = deferred();
   window.dispatchEvent(new Event('magi-plugin-registry-changed'));
   pluginResponse(() => invalidatedPlugins.promise);

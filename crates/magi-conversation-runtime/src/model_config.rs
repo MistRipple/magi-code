@@ -122,9 +122,6 @@ pub enum ModelApiProtocol {
     OpenAiChat,
     OpenAiResponses,
     AnthropicMessages,
-
-    /// 插件会话引擎：消息由已注册插件工厂承载，没有 HTTP 传输。
-    Plugin,
 }
 
 impl ModelApiProtocol {
@@ -134,7 +131,6 @@ impl ModelApiProtocol {
             "openai_responses" => Some(Self::OpenAiResponses),
             "anthropic_messages" => Some(Self::AnthropicMessages),
 
-            "plugin" => Some(Self::Plugin),
             _ => None,
         }
     }
@@ -144,8 +140,6 @@ impl ModelApiProtocol {
             Self::OpenAiChat => Some(HttpModelBridgeProtocol::ChatCompletions),
             Self::OpenAiResponses => Some(HttpModelBridgeProtocol::Responses),
             Self::AnthropicMessages => Some(HttpModelBridgeProtocol::AnthropicMessages),
-
-            Self::Plugin => None,
         }
     }
 
@@ -154,8 +148,6 @@ impl ModelApiProtocol {
             Self::OpenAiChat => "openai",
             Self::OpenAiResponses => "openai",
             Self::AnthropicMessages => "anthropic",
-
-            Self::Plugin => "plugin",
         }
     }
 }
@@ -191,7 +183,7 @@ impl NormalizedModelConfig {
             .any(|field| value.get(*field).is_some());
         let api_protocol = match string_field(value, "apiProtocol") {
             Some(label) => ModelApiProtocol::from_label(&label).ok_or_else(|| {
-                "apiProtocol 无效，必须是 openai_chat、openai_responses、anthropic_messages 或 plugin"
+                "apiProtocol 无效，必须是 openai_chat、openai_responses或 anthropic_messages"
                     .to_string()
             })?,
             None if has_connection_fields => {
@@ -301,10 +293,6 @@ impl NormalizedModelConfig {
 
     pub fn api_protocol(&self) -> Option<HttpModelBridgeProtocol> {
         self.api_protocol.to_http_protocol()
-    }
-
-    pub fn is_plugin(&self) -> bool {
-        self.api_protocol == ModelApiProtocol::Plugin
     }
 
     pub fn context_window_tokens(&self) -> Option<u64> {
@@ -739,20 +727,15 @@ pub fn resolve_orchestrator_model_config(
         .map(|session_id| settings_store.get_session_section(session_id, "orchestrator"))
         .unwrap_or(serde_json::Value::Null);
     if let Some(engine_id) = orchestrator_engine_id(settings_store, session_id) {
-        let mut config = if engine_id.starts_with("plugin/") {
-            serde_json::json!({ "apiProtocol": "plugin", "model": engine_id })
-        } else {
-            let entry = engine_entry(settings_store, &engine_id)
-                .ok_or_else(|| format!("会话绑定的模型引擎不存在：{engine_id}"))?;
-            let llm = entry
-                .get("llm")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            if llm.as_object().is_none_or(|object| object.is_empty()) {
-                return Err(format!("模型引擎 {engine_id} 缺少 llm 配置"));
-            }
-            llm
-        };
+        let entry = engine_entry(settings_store, &engine_id)
+            .ok_or_else(|| format!("会话绑定的模型引擎不存在：{engine_id}"))?;
+        let mut config = entry
+            .get("llm")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if config.as_object().is_none_or(|object| object.is_empty()) {
+            return Err(format!("模型引擎 {engine_id} 缺少 llm 配置"));
+        }
         merge_orchestrator_session_override(&mut config, &defaults);
         merge_orchestrator_session_override(&mut config, &session_override);
         ensure_orchestrator_reasoning_effort(&mut config);
@@ -1105,19 +1088,6 @@ mod tests {
         .expect_err("已配置连接不得缺少 apiProtocol");
 
         assert!(error.contains("缺少 apiProtocol"));
-    }
-
-    #[test]
-    fn plugin_engine_has_no_http_transport() {
-        let config = NormalizedModelConfig::from_settings_value(&json!({
-            "apiProtocol": "plugin",
-            "model": "plugin/example/engine"
-        }))
-        .expect("plugin protocol is a valid session engine");
-        assert!(config.is_plugin());
-        assert_eq!(config.api_protocol(), None);
-        assert_eq!(config.provider(), "plugin");
-        assert!(config.to_http_model_client().is_none());
     }
 
     #[test]

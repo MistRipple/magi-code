@@ -5,7 +5,7 @@
 ## 项目定位
 
 - Magi 只提供 Electron 桌面 GUI 与 Web 工作台，不提供 Magi CLI 或独立移动端应用；手机和平板通过同一 Web 工作台的响应式布局访问。
-- 外部 Agent Executor 当前只预留通用扩展接口，不提供具体执行器、设置入口或试点交付；现有原生模型继续维护。插件后台将由受信 Node 扩展宿主取代现有 QuickJS 执行（[插件系统设计](plugin-system-requirements-design.md)），替换交付前现有插件运行能力继续维护。
+- 外部 Agent Executor 当前只预留通用扩展接口，不提供具体执行器、设置入口或试点交付；现有原生模型继续维护。插件后台已由受信 Node 扩展宿主取代，QuickJS 与 SDK 1 已删除（[插件系统设计](plugin-system-requirements-design.md)）；插件提供的工具、命令、工作流与会话引擎尚未在 Node 上重建。
 - Rust 后端已完成重构与协议冻结，当前处于正式运行阶段
 - 前端基于现有 `magi` 产品方案迁移完成，持续完善产品体验
 - 后端重构历史文档已归档清理，当前以代码和真实运行链路为唯一事实源
@@ -96,6 +96,8 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 
 - [模型推理能力与选择交互](model-reasoning-capabilities.md)：daemon 能力解析、服务商声明、子代理按次强度与恢复快照、实际传输参数和模型选择器验收。
 
+- [Magi Laya/Jev 决策路由接入方案](laya-jev-decision-routing-integration-design.md)：远程或本地 HTTP 决策服务的价值边界、浏览器有界控制片段、离线基线、缓存约束与逐 head 准入；当前为方案草案，未代表已实现在线接入。
+
 - [无项目会话与对话列表](personal-session-architecture.md)：个人归属、独立执行目录、项目能力边界、文件生命周期和历史兼容。
 
 - [Magi 内置浏览器完整设计](./browser-runtime-design.md)：Browser Authority、Browser Automation Worker、Goal/子代理租约、右侧预览、页面标记与跨平台发布基线。
@@ -106,7 +108,7 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 - [Prompt Lineage 与缓存根架构](./prompt-cache-lineage-architecture.md)：把提示词 IR、分支 lineage、cache epoch、Provider Cache Contract 和 logical/transport usage 统一为 daemon 一级事实。
 - [知识图谱设计与维护](./knowledge-graph-design.md)：图谱事实源、候选审阅、检索预算、索引维护与定向验证。
 - [用户自定义子代理角色](./custom-worker-role-design.md)：角色定义、持久化、注册表热更新、导入导出与调度合同。
-- [Magi 插件系统：需求与架构设计](./plugin-system-requirements-design.md)：受信 Node 扩展宿主、ExtensionBus 与钩子目录、包与授权、生命周期与升级、pi/DSH 兼容来源，以及现有 QuickJS 实现的审计缺陷；[扩展协议 v1](./extension-protocol-v1.md)是受信宿主的线协议规范（尚未实现）；[插件作者指南](./plugin-authoring.md)描述现有 SDK 1，随 QuickJS 一并删除。
+- [Magi 插件系统：需求与架构设计](./plugin-system-requirements-design.md)：受信 Node 扩展宿主、ExtensionBus 与钩子目录、包与授权、生命周期与升级、pi/DSH 兼容来源，以及已删除的 QuickJS 实现的审计缺陷；[扩展协议 v1](./extension-protocol-v1.md)是受信宿主的线协议规范（已实现，13 个钩子均已接线）；[插件作者指南](./plugin-authoring.md)描述 SDK 2。
 
 - [Turn、事件事实与对话执行架构](./conversation-response-core-architecture-redesign.md)：统一接纳、任务调度、终态、恢复和权限边界。
 - [持久日志的追加写入与压缩](./durable-log-compaction-design.md)：用量账本分段、canonical 事件检查点和崩溃恢复。

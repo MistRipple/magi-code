@@ -9,8 +9,8 @@ use serde_json::Value;
 
 pub mod generated;
 pub use generated::{
-    ModelResponseTiming, ModelTransportOutcome, ModelTransportRecord, ModelTransportUsage, ModelUsageContext,
-    ModelUsageModelConfig, ModelUsagePhase, ModelUsageSourceRole,
+    ModelResponseTiming, ModelTransportOutcome, ModelTransportRecord, ModelTransportUsage,
+    ModelUsageContext, ModelUsageModelConfig, ModelUsagePhase, ModelUsageSourceRole,
 };
 
 pub use generated::{
@@ -42,11 +42,10 @@ pub use generated::{
 };
 
 pub use generated::{
-    PluginAuthorizeRequest, PluginBackendEntry, PluginContributions, PluginInstallRequest,
-    PluginInstalled, PluginList, PluginManifest, PluginNamedContribution, PluginPermission,
-    PluginPermissionKind, PluginResource, PluginResourceWriteRequest, PluginScopeGrant,
-    PluginScopeKind, PluginScopeRequest, PluginToolContribution, PluginViewContribution,
-    PluginViewPlacement,
+    PluginAuthorizeRequest, PluginContributions, PluginInstallRequest, PluginInstalled, PluginList,
+    PluginManifest, PluginNamedContribution, PluginPermission, PluginPermissionKind,
+    PluginResource, PluginResourceWriteRequest, PluginScopeGrant, PluginScopeKind,
+    PluginScopeRequest, PluginViewContribution, PluginViewPlacement,
 };
 
 pub use generated::{

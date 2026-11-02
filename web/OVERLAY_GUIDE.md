@@ -37,7 +37,6 @@
 | `ActiveAgentCenter` | 代理详情为原有面板，重启确认 Modal；不改变运行状态所有权 |
 | `MessageItem` / `ImageAttachmentTray` | 图片只读 Lightbox，允许关闭；无待保存表单 |
 | Electron Main | 启动失败用原生错误提示 + “重试/打开日志位置/退出”；保存文件使用 OS Picker；guest 的 JS dialog 保留受控 bridge，不改网页语义 |
-| `examples/plugins/board/ui/index.html` | 示例隔离 iframe，无浮层需求；继续经宿主消息桥读写 |
 
 `GoalRunDrawers` 实际是输入框上方的目标/计划折叠卡，不是侧边 Drawer；暂保留内部代码名避免无关重命名。移动端导航侧栏仍按原布局收放，不改为编辑抽屉。
 

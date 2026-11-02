@@ -2,7 +2,7 @@ import { getDefaultAgentBaseUrl } from '../shared/agent-shared-config';
 import { getTransport } from '../shared/transport';
 import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
 import type { RoleTemplate } from '../shared/types/role-templates';
-import type { PluginSelection, SessionTurnCommand } from '../shared/app-server-protocol.generated';
+import type { SessionTurnCommand } from '../shared/app-server-protocol.generated';
 import type {
   SettingsBootstrapPayload,
   SettingsBuiltinTool,
@@ -2273,8 +2273,6 @@ export async function submitSessionTurn(
     goalMode?: boolean;
     resume?: boolean;
     command?: SessionTurnCommand | null;
-    workflowId?: string | null;
-    pluginCommandId?: string | null;
     images: AgentSessionTurnImagePayload[];
     contextReferences?: Array<{
       kind: 'file' | 'directory';
@@ -2285,7 +2283,6 @@ export async function submitSessionTurn(
     }>;
     browserAnnotationRefs?: string[];
     browserNodeSelections?: MessageBrowserNodeSelection[];
-    pluginSelections?: PluginSelection[];
     accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
     orchestratorSessionConfig?: Record<string, unknown> | null;
     requestId?: string | null;
@@ -2315,8 +2312,6 @@ export async function submitSessionTurn(
         goalMode: payload.goalMode === true,
         resume: payload.resume === true,
         command: payload.command ?? null,
-        workflowId: payload.workflowId ?? null,
-        pluginCommandId: payload.pluginCommandId ?? null,
         accessProfile: payload.accessProfile ?? null,
         requestId: payload.requestId ?? null,
         userMessageId: payload.userMessageId ?? null,
@@ -2344,7 +2339,6 @@ export async function submitSessionTurn(
           attributes: { ...selection.attributes },
           bounds: selection.bounds ? { ...selection.bounds } : selection.bounds,
         })),
-        pluginSelections: (payload.pluginSelections ?? []).map((selection) => ({ ...selection })),
         orchestratorSessionConfig: payload.orchestratorSessionConfig ?? null,
       }),
     });

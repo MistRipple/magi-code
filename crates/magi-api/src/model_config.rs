@@ -457,57 +457,13 @@ fn align_engine_llm_with_worker_configs(
     }
 }
 
-/// 返回当前真正可用的引擎投影：插件全局生效，激活的插件引擎对所有工作区一致。
+/// 返回模型设置拥有的引擎投影。
 pub(crate) fn load_registry_engines(state: &ApiState) -> Vec<Value> {
     let raw_engines = state.settings_store.get_section("engines");
     let mut normalized = normalize_engine_entries(&raw_engines);
     let worker_configs =
         normalize_worker_model_config_entries(&state.settings_store.get_section("workers"));
     align_engine_llm_with_worker_configs(&mut normalized, &worker_configs);
-    if let Ok(manager) = state.plugin_manager.lock()
-        && let Ok(contributions) =
-            manager.engine_contributions_for_scope(magi_plugin_system::APPLICATION_SCOPE)
-    {
-        for (manifest, engine) in contributions {
-            let id = magi_plugin_system::ContributionRef::new(&manifest.id, &engine.id).identity();
-            if normalized
-                .iter()
-                .any(|entry| entry.get("id") == Some(&Value::String(id.clone())))
-            {
-                continue;
-            }
-            normalized.push(serde_json::json!({
-                "id": id,
-                "displayName": engine.title,
-                "description": engine.description,
-                "source": "plugin",
-                "pluginId": manifest.id,
-                "pluginContributionId": engine.id,
-                "llm": {
-                    "apiProtocol": "plugin",
-                    "model": id,
-                },
-            }));
-        }
-    }
-    normalized
-}
-
-/// 返回模型设置真正拥有的引擎。插件引擎只是插件清单的运行时投影，不能被
-/// 普通模型设置的写入路径带回 `engines` 持久化段，避免卸载后留下影子配置。
-fn load_user_registry_engines(state: &ApiState) -> Vec<Value> {
-    let raw_engines = state.settings_store.get_section("engines");
-    let mut normalized = normalize_engine_entries(&raw_engines);
-    let worker_configs =
-        normalize_worker_model_config_entries(&state.settings_store.get_section("workers"));
-    align_engine_llm_with_worker_configs(&mut normalized, &worker_configs);
-    normalized.retain(|entry| {
-        entry.get("source").and_then(Value::as_str) != Some("plugin")
-            && entry
-                .get("id")
-                .and_then(Value::as_str)
-                .is_none_or(|id| !id.starts_with("plugin/"))
-    });
     normalized
 }
 
@@ -661,12 +617,7 @@ pub(crate) fn upsert_engine(state: &ApiState, request: &Value) -> Result<Value, 
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::InvalidInput("引擎配置缺少有效的 id".to_string()))?
         .to_string();
-    if engine_id.starts_with("plugin/") {
-        return Err(ApiError::InvalidInput(
-            "插件会话引擎由插件清单管理，不能通过模型设置改写".to_string(),
-        ));
-    }
-    let mut engines = load_user_registry_engines(state);
+    let mut engines = load_registry_engines(state);
     if let Some(position) = engines.iter().position(|entry| {
         entry
             .get("id")
@@ -689,12 +640,7 @@ pub(crate) fn remove_engine(state: &ApiState, request: &Value) -> Result<Value, 
         .get("engineId")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    if engine_id.starts_with("plugin/") {
-        return Err(ApiError::InvalidInput(
-            "插件会话引擎由插件清单管理，不能通过模型设置移除".to_string(),
-        ));
-    }
-    let mut engines = load_user_registry_engines(state);
+    let mut engines = load_registry_engines(state);
     engines.retain(|entry| {
         entry
             .get("id")

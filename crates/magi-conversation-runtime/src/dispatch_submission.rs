@@ -33,8 +33,8 @@ use crate::context_reference::{
     SessionContextReference, browser_annotation_artifact_paths,
     browser_annotation_reference_input_refs, browser_annotation_references_metadata,
     browser_node_selection_input_refs, browser_node_selections_metadata,
-    plugin_selection_input_refs, plugin_selections_metadata, session_context_reference_input_refs,
-    session_context_reference_paths, session_context_references_metadata,
+    session_context_reference_input_refs, session_context_reference_paths,
+    session_context_references_metadata,
 };
 use crate::session_images::SessionTurnImage;
 use crate::task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry};
@@ -332,7 +332,6 @@ pub struct DispatchSubmissionRequest {
     pub browser_annotation_refs: Vec<serde_json::Value>,
     /// 已由 Magi API 严格校验的当前 Browser Surface DOM 节点观察结果。
     pub browser_node_selections: Vec<serde_json::Value>,
-    pub plugin_selections: Vec<serde_json::Value>,
     pub created_session: bool,
     pub mission_title: String,
     pub task_title: String,
@@ -348,8 +347,6 @@ pub struct DispatchSubmissionRequest {
     #[serde(default = "default_use_tools")]
     pub use_tools: bool,
     pub target_role: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow_id: Option<String>,
     pub request_id: Option<String>,
     pub user_message_id: Option<String>,
     pub placeholder_message_id: Option<String>,
@@ -623,8 +620,6 @@ struct DispatchTaskInput<'a> {
     goal: String,
     now: UtcMillis,
     target_role: &'a str,
-    workflow_id: Option<String>,
-    workflow_package_digest: Option<String>,
     active_skill_id: Option<&'a str>,
     task_tier: TaskTier,
     access_profile: AccessProfile,
@@ -637,7 +632,6 @@ struct DispatchTaskInput<'a> {
     plan_item_id: Option<PlanItemId>,
     browser_annotation_refs: &'a [serde_json::Value],
     browser_node_selections: &'a [serde_json::Value],
-    plugin_selections: &'a [serde_json::Value],
 }
 
 fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
@@ -648,8 +642,6 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         goal,
         now,
         target_role,
-        workflow_id,
-        workflow_package_digest,
         active_skill_id,
         task_tier,
         access_profile,
@@ -662,7 +654,6 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         plan_item_id,
         browser_annotation_refs,
         browser_node_selections,
-        plugin_selections,
     } = input;
     let executor_binding = TaskExecutorBinding::for_role(target_role)
         .with_active_skill_id(active_skill_id.map(str::to_string))
@@ -674,18 +665,13 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         browser_annotation_refs,
     ));
     input_refs.extend(browser_node_selection_input_refs(browser_node_selections));
-    input_refs.extend(plugin_selection_input_refs(plugin_selections));
 
     magi_core::Task {
         task_id: task_id.clone(),
         mission_id,
         root_task_id: task_id,
         parent_task_id: None,
-        kind: if workflow_id.is_some() {
-            TaskKind::LocalWorkflow
-        } else {
-            TaskKind::LocalAgent
-        },
+        kind: TaskKind::LocalAgent,
         title,
         goal,
         status: TaskStatus::Pending,
@@ -708,26 +694,14 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         output_refs: Vec::new(),
         evidence_refs: Vec::new(),
         retry_count: 0,
-        runtime_payload: if let Some(workflow_id) = workflow_id {
-            magi_core::TaskRuntimePayload::Workflow {
-                workflow_id,
-                package_digest: workflow_package_digest,
-                checkpoint_version: 1,
-                stage: "start".into(),
-                checkpoint: serde_json::Value::Null,
-                pending_action: None,
-                last_result: None,
-            }
-        } else if browser_annotation_refs.is_empty()
-            && browser_node_selections.is_empty()
-            && plugin_selections.is_empty()
+        runtime_payload: if browser_annotation_refs.is_empty() && browser_node_selections.is_empty()
         {
             magi_core::TaskRuntimePayload::None
         } else {
             magi_core::TaskRuntimePayload::ContextAnchors {
                 references: browser_annotation_refs.to_vec(),
                 node_selections: browser_node_selections.to_vec(),
-                plugin_selections: plugin_selections.to_vec(),
+                plugin_selections: Vec::new(),
             }
         },
         created_at: now,
@@ -826,11 +800,7 @@ fn validate_dispatch_request(
             "目标模式只能绑定主线 coordinator，不能下发到 worker 或 sidechain".to_string(),
         ));
     }
-    let task_kind = if request.workflow_id.is_some() {
-        TaskKind::LocalWorkflow
-    } else {
-        TaskKind::LocalAgent
-    };
+    let task_kind = TaskKind::LocalAgent;
     if !runtime
         .agent_role_registry
         .role_supports_task_kind(target_role, task_kind)
@@ -856,19 +826,12 @@ fn validate_dispatch_request(
         goal: execution_goal.to_string(),
         now,
         target_role,
-        workflow_id: request.workflow_id.clone(),
-        workflow_package_digest: request
-            .user_message_metadata
-            .get("magi.workflowPackageDigest")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
         active_skill_id: request.skill_name.as_deref(),
         task_tier: request.task_tier,
         access_profile: request.access_profile,
         context_references: &request.context_references,
         browser_annotation_refs: &request.browser_annotation_refs,
         browser_node_selections: &request.browser_node_selections,
-        plugin_selections: &request.plugin_selections,
         required_tool_chain: request.required_tool_chain.clone(),
         goal_mode: request.goal_mode,
         completion_contract: request.completion_contract.clone(),
@@ -959,7 +922,6 @@ fn build_active_execution_chain(
                 metadata.extend(browser_node_selections_metadata(
                     &request.browser_node_selections,
                 ));
-                metadata.extend(plugin_selections_metadata(&request.plugin_selections));
                 if let Some(replace_turn_id) = request.replace_turn_id.as_ref() {
                     metadata.insert(
                         "replacesTurnId".to_string(),
@@ -1818,7 +1780,6 @@ mod tests {
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
             browser_node_selections: Vec::new(),
-            plugin_selections: Vec::new(),
             created_session: false,
             mission_title: "执行装配回滚".to_string(),
             task_title: "执行: 装配回滚".to_string(),
@@ -1830,7 +1791,6 @@ mod tests {
             goal_mode: false,
             use_tools: true,
             target_role: Some(target_role.to_string()),
-            workflow_id: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -2026,7 +1986,6 @@ mod tests {
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
             browser_node_selections: Vec::new(),
-            plugin_selections: Vec::new(),
             created_session: false,
             mission_title: "当前任务推进".to_string(),
             task_title: "当前任务推进".to_string(),
@@ -2038,7 +1997,6 @@ mod tests {
             goal_mode: false,
             use_tools: true,
             target_role: Some("executor".to_string()),
-            workflow_id: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -2118,7 +2076,6 @@ mod tests {
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
             browser_node_selections: Vec::new(),
-            plugin_selections: Vec::new(),
             created_session: false,
             mission_title: "连续上下文".to_string(),
             task_title: "连续上下文".to_string(),
@@ -2130,7 +2087,6 @@ mod tests {
             goal_mode: false,
             use_tools: true,
             target_role: None,
-            workflow_id: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -2215,7 +2171,6 @@ mod tests {
             context_references: Vec::new(),
             browser_annotation_refs: vec![annotation.clone()],
             browser_node_selections: Vec::new(),
-            plugin_selections: Vec::new(),
             created_session: false,
             mission_title: "浏览器标记检查".to_string(),
             task_title: "浏览器标记检查".to_string(),
@@ -2227,7 +2182,6 @@ mod tests {
             goal_mode: false,
             use_tools: true,
             target_role: None,
-            workflow_id: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -2435,8 +2389,6 @@ mod tests {
             goal: "验证中断任务恢复".to_string(),
             now,
             target_role: "coordinator",
-            workflow_id: None,
-            workflow_package_digest: None,
             active_skill_id: None,
             task_tier: TaskTier::ExecutionChain,
             access_profile: AccessProfile::Restricted,
@@ -2449,7 +2401,6 @@ mod tests {
             plan_item_id: None,
             browser_annotation_refs: &[],
             browser_node_selections: &[],
-            plugin_selections: &[],
         });
         CanonicalTurnEventSink::for_store(&session_store, None)
             .accept_active_execution_chain_with_timeline_entry_and_task(
@@ -2532,7 +2483,6 @@ mod tests {
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
             browser_node_selections: Vec::new(),
-            plugin_selections: Vec::new(),
             created_session: false,
             mission_title: "继续中断任务".to_string(),
             task_title: "继续: 画当前项目流程图".to_string(),
@@ -2544,7 +2494,6 @@ mod tests {
             goal_mode: false,
             use_tools: true,
             target_role: None,
-            workflow_id: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -2661,8 +2610,6 @@ mod tests {
             goal: "验证恢复校验".to_string(),
             now,
             target_role: "coordinator",
-            workflow_id: None,
-            workflow_package_digest: None,
             active_skill_id: None,
             task_tier: TaskTier::ExecutionChain,
             access_profile: AccessProfile::Restricted,
@@ -2675,7 +2622,6 @@ mod tests {
             plan_item_id: None,
             browser_annotation_refs: &[],
             browser_node_selections: &[],
-            plugin_selections: &[],
         });
         CanonicalTurnEventSink::for_store(&session_store, None)
             .accept_active_execution_chain_with_timeline_entry_and_task(
@@ -2790,7 +2736,6 @@ mod tests {
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
             browser_node_selections: Vec::new(),
-            plugin_selections: Vec::new(),
             created_session: false,
             mission_title: "继续中断任务".to_string(),
             task_title: "继续: 验证恢复原子性".to_string(),
@@ -2802,7 +2747,6 @@ mod tests {
             goal_mode: false,
             use_tools: true,
             target_role: None,
-            workflow_id: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -2896,7 +2840,6 @@ mod tests {
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
             browser_node_selections: Vec::new(),
-            plugin_selections: Vec::new(),
             created_session: false,
             mission_title: "修复 bug + 验证".to_string(),
             task_title: "修复 bug + 验证".to_string(),
@@ -2908,7 +2851,6 @@ mod tests {
             goal_mode: false,
             use_tools: true,
             target_role: Some("executor".to_string()),
-            workflow_id: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -3009,7 +2951,6 @@ mod tests {
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
             browser_node_selections: Vec::new(),
-            plugin_selections: Vec::new(),
             created_session: false,
             mission_title: "继续计划".to_string(),
             task_title: "继续计划".to_string(),
@@ -3021,7 +2962,6 @@ mod tests {
             goal_mode: false,
             use_tools: true,
             target_role: None,
-            workflow_id: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -3083,7 +3023,6 @@ mod tests {
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
             browser_node_selections: Vec::new(),
-            plugin_selections: Vec::new(),
             created_session: false,
             mission_title: "Skill 子代理继承".to_string(),
             task_title: "Skill 子代理继承".to_string(),
@@ -3095,7 +3034,6 @@ mod tests {
             goal_mode: false,
             use_tools: true,
             target_role: None,
-            workflow_id: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -3162,7 +3100,6 @@ mod tests {
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
             browser_node_selections: Vec::new(),
-            plugin_selections: Vec::new(),
             created_session: false,
             mission_title: "代码审查".to_string(),
             task_title: "代码审查".to_string(),
@@ -3174,7 +3111,6 @@ mod tests {
             goal_mode: false,
             use_tools: true,
             target_role: Some("reviewer".to_string()),
-            workflow_id: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -3248,7 +3184,6 @@ mod tests {
             }],
             browser_annotation_refs: Vec::new(),
             browser_node_selections: Vec::new(),
-            plugin_selections: Vec::new(),
             created_session: false,
             mission_title: "检查引用文件".to_string(),
             task_title: "检查引用文件".to_string(),
@@ -3260,7 +3195,6 @@ mod tests {
             goal_mode: false,
             use_tools: true,
             target_role: None,
-            workflow_id: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -3352,7 +3286,6 @@ mod tests {
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
             browser_node_selections: Vec::new(),
-            plugin_selections: Vec::new(),
             created_session: false,
             mission_title: "目标自动推进".to_string(),
             task_title: "执行: 目标自动推进".to_string(),
@@ -3364,7 +3297,6 @@ mod tests {
             goal_mode: true,
             use_tools: true,
             target_role: None,
-            workflow_id: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -3480,7 +3412,6 @@ mod tests {
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
             browser_node_selections: Vec::new(),
-            plugin_selections: Vec::new(),
             created_session: false,
             mission_title: "目标自动推进".to_string(),
             task_title: "执行: 目标自动推进".to_string(),
@@ -3492,7 +3423,6 @@ mod tests {
             goal_mode: true,
             use_tools: true,
             target_role: None,
-            workflow_id: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,

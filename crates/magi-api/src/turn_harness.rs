@@ -1626,9 +1626,6 @@ impl MagiTurnHarness {
                 replace_turn_id: None,
                 interrupt_turn_id: None,
                 command: None,
-                workflow_id: None,
-                plugin_command_id: None,
-                plugin_selections: Vec::new(),
             })
             .await;
         if response.is_ok() {
@@ -1711,9 +1708,6 @@ impl MagiTurnHarness {
                 replace_turn_id: None,
                 interrupt_turn_id: None,
                 command: None,
-                workflow_id: None,
-                plugin_command_id: None,
-                plugin_selections: Vec::new(),
             })
             .await;
         if response.is_ok() {
@@ -1762,9 +1756,6 @@ impl MagiTurnHarness {
                 replace_turn_id: None,
                 interrupt_turn_id: None,
                 command: None,
-                workflow_id: None,
-                plugin_command_id: None,
-                plugin_selections: Vec::new(),
             })
             .await;
         if response.is_ok() {
@@ -1811,9 +1802,6 @@ impl MagiTurnHarness {
                 replace_turn_id: None,
                 interrupt_turn_id: None,
                 command: None,
-                workflow_id: None,
-                plugin_command_id: None,
-                plugin_selections: Vec::new(),
             })
             .await
     }
@@ -1854,9 +1842,6 @@ impl MagiTurnHarness {
                 replace_turn_id: None,
                 interrupt_turn_id: None,
                 command: None,
-                workflow_id: None,
-                plugin_command_id: None,
-                plugin_selections: Vec::new(),
             })
             .await
     }

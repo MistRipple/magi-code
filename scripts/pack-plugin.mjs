@@ -2,7 +2,7 @@
 // 把插件目录打成 Magi 发布包（ZIP）。无第三方依赖，输出可复现（固定时间戳、按路径排序）。
 //
 // 用法：node scripts/pack-plugin.mjs <插件目录> [输出文件]
-// 目录须包含 manifest.json 与 plugin.mjs，视图资源放在 ui/ 下。
+// 目录须包含 manifest.json；声明 extension 的包还须包含 extension/index.mjs，视图资源放在 ui/ 下。
 // 这里只做打包；包的结构、大小和内容校验由 Magi 安装时统一执行，不在脚本里重复一套规则。
 import { deflateRawSync, crc32 } from 'node:zlib';
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
@@ -26,7 +26,7 @@ function collect(dir) {
 const files = collect(root)
   .map((full) => relative(root, full).split(sep).join('/'))
   .sort();
-for (const required of ['manifest.json', 'plugin.mjs']) {
+for (const required of ['manifest.json']) {
   if (!files.includes(required)) throw new Error(`缺少 ${required}`);
 }
 

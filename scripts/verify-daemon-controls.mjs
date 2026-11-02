@@ -351,65 +351,6 @@ try {
   await writeFile(join(liveStepSkill,'config.json'),'{');
   await installLocalSkill(liveStepSkill);
   await assertUnavailableSkill('control-corrupt-skill','live-step-skill');
-  // 真实工作流 Worker、摘要展示与原请求在停用/升级/重启后的只读回执。
-  const flowId='test.controls-flow', flowDirectory=join(fixture,'workflow'), flowArchive=join(fixture,'workflow.zip');
-  await mkdir(flowDirectory);
-  const flowManifest={sdkVersion:1,id:flowId,version:'1.0.0',name:'Controls Flow',description:'',
-    backend:'plugin.mjs',permissions:[],dataSchemaVersion:1,settingsSchema:{type:'object',additionalProperties:false},
-    contributions:{workflows:[{id:'main',title:'Controls Flow',description:''}]}};
-  await writeFile(join(flowDirectory,'plugin.mjs'), `export default (input) => ({
-    checkpoint_version:1, stage:input.stage === 'start' ? 'saved' : input.stage === 'saved' && input.user_input.includes('CONTROL_WORKFLOW_SCOPE_LIVE') ? 'activated' : 'modeled',
-    action:input.stage === 'start' ? {kind:'save_stage',action_id:input.action_id,stage:'saved',checkpoint:{saved:true}} :
-      input.stage === 'saved' && input.user_input.includes('CONTROL_WORKFLOW_SCOPE_LIVE') ? {kind:'tool_call',action_id:input.action_id,tool:'skill_apply',input:{skill_name:'closed-workflow'}} :
-      ['saved','activated'].includes(input.stage) ? {kind:'model_request',action_id:input.action_id,model:null,system:'CONTROL_WORKFLOW_MODEL',context_refs:[],tools:[input.user_input.includes('CONTROL_WORKFLOW_SCOPE_') ? 'get_goal' : 'web_fetch']} :
-      {kind:'complete',action_id:input.action_id,summary:input.config.saved && input.model_result?.content === 'CONTROL_WORKFLOW_MODEL_RESULT' ? 'CONTROL_WORKFLOW_DONE' : 'WORKFLOW_RESULT_LOST'}
-  });`);
-  const pluginPost=async(path,body)=>{
-    const response=await fetch(`${origin}/api/plugins/${path}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
-    const result=await response.json();assert.equal(response.status,200,JSON.stringify(result));return result;
-  };
-  const packFlow=async()=>{
-    await writeFile(join(flowDirectory,'manifest.json'),JSON.stringify(flowManifest));
-    const packed=await processResult(spawn(process.execPath,[join(root,'scripts/pack-plugin.mjs'),flowDirectory,flowArchive],{cwd:root,stdio:['ignore','pipe','pipe']}));
-    assert.equal(packed.code,0,packed.stderr);
-  };
-  await packFlow();await pluginPost('install',{source:`local:${flowArchive}`});
-  await pluginPost(`${flowId}/enable`,{scope:'application'});await pluginPost(`${flowId}/activate`,{scope:'application'});
-  const originalRequest={requestId:'control-workflow',workflowId:`plugin/${flowId}/main`,skillName:'closed-workflow'};
-  const flowStarted=await submit(originalRequest);
-  const flowTurn=(await terminal(flowStarted.sessionId,'CONTROL_WORKFLOW_DONE')).turns.find(turn=>turn.turnId===flowStarted.turnId);
-  assert.equal(flowTurn.modelSteps.length,1,'工作流模型调用必须进入原生 Step 日志');
-  assert.equal(flowTurn.modelSteps[0].status,'response_received');
-  assert.equal(flowTurn.modelSteps[0].toolCount,1);
-  const oldDigest=flowTurn.items.find(item=>item.kind==='user_message').metadata['magi.workflowPackageDigest'];assert.ok(oldDigest);
-  for (const live of [false,true]) {
-    const beforeDeniedWorkflow=providerRequests;
-    const deniedWorkflow=await submit({...originalRequest,requestId:`control-workflow-scope-${live}`,
-      skillName:live?null:'closed-workflow',text:live?'CONTROL_WORKFLOW_SCOPE_LIVE':'CONTROL_WORKFLOW_SCOPE_DENIED'});
-    const deniedSnapshot=await waitFor(async()=>{const snapshot=await read(deniedWorkflow.sessionId);
-      return !snapshot.session.isRunning&&snapshot.turns.find(turn=>turn.turnId===deniedWorkflow.turnId)?.status==='failed'&&snapshot;
-    },'真实工作流拒绝初始/运行中 Skill 范围外的工具');
-    const deniedTurn=deniedSnapshot.turns.find(turn=>turn.turnId===deniedWorkflow.turnId);
-    assert.equal(deniedTurn.modelSteps.length,0);
-    assert.match(JSON.stringify(deniedTurn),/get_goal/u);
-    assert.equal(providerRequests,beforeDeniedWorkflow,'Skill 范围外的工具不能进入模型请求');
-  }
-  await pluginPost(`${flowId}/deactivate`,{scope:'application'});
-  assert.equal((await submit(originalRequest)).turnId,flowStarted.turnId);
-  await rejected(submit({...originalRequest,requestId:'control-workflow-disabled'}));
-  flowManifest.version='1.1.0';await packFlow();await pluginPost('upgrade',{source:`local:${flowArchive}`});
-  await pluginPost(`${flowId}/activate`,{scope:'application'});
-  const nextFlow=await submit({...originalRequest,sessionId:flowStarted.sessionId,requestId:'control-workflow-upgraded'});
-  const upgradedFlow=await terminal(nextFlow.sessionId,'CONTROL_WORKFLOW_DONE');
-  const newDigest=upgradedFlow.turns.find(turn=>turn.turnId===nextFlow.turnId).items
-    .find(item=>item.kind==='user_message').metadata['magi.workflowPackageDigest'];assert.notEqual(newDigest,oldDigest);
-  const beforeFlowRestart=providerRequests;
-  await stopDaemon('SIGKILL');await startDaemon();
-  assert.equal((await submit(originalRequest)).turnId,flowStarted.turnId);
-  const restoredFlow=(await read(flowStarted.sessionId)).turns;
-  assert.equal(restoredFlow.length,2,'升级和重放不能产生第三个 Turn');
-  assert.deepEqual(restoredFlow.find(turn=>turn.turnId===flowStarted.turnId).items,flowTurn.items);
-  assert.equal(providerRequests,beforeFlowRestart,'工作流重启或重放不能重复调用模型');
   const rejectedSpawn = await submit({requestId:'control-delegation-gate',text:'CONTROL_DELEGATION_GATE 普通检查直接完成'});
   const afterGate = await terminal(rejectedSpawn.sessionId,'CONTROL_DELEGATION_MAINLINE_DONE');
   const gateTurn = afterGate.turns.find(turn=>turn.turnId===rejectedSpawn.turnId);
@@ -767,7 +708,7 @@ try {
   const completed=await waitFor(async()=>{const snapshot=await scoped('goal/read',goalSession,{scope:'personal'});return snapshot.goal?.status==='complete'&&snapshot;},'Goal 恢复后完成',30000);
   assert.ok(completed.goal.tokensUsed>0);assert.equal('tokenBudget' in completed.goal,false);
   const cleared=await scoped('goal/clear',goalSession,goalParams(completed));assert.equal(cleared.goal,null);assert.equal(cleared.plan,null);
-  process.stdout.write(JSON.stringify({passed:true,providerRequests,checks:['同一 Turn 内 Skill 工具目录热更新与拒绝保持','真实工作流 Worker/摘要/升级重启/原回执保持','完成/失败/取消 Job 重复停止与 SIGKILL 后原回执保持','子代理写入后失败的等待/取消/重启证据一致且不重放','无效代理决策拒绝/主线接管/SIGKILL 后回执保留','真实 App Server 待交互读取','明确答复/跳过','双客户端一次提交','错误交互身份拒绝','SIGKILL 后问题/审批身份恢复','独立 Agent Turn 的交互/显式 Continue/再次重启','父轮仍运行时代理原 Turn 已完成','App Server 转交版本检查/幂等/主线停止后独立完成','转交后 SIGKILL/交互恢复/读取回执不重放','直接与嵌套转交子树显式继续','双客户端同 operation 单次接纳','原中断记录保持终态','批准后显式 Continue','文件删除仅执行一次','Goal 暂停/更新/恢复/完成/清除','旧 revision 拒绝','用量仅统计']} )+'\n');
+  process.stdout.write(JSON.stringify({passed:true,providerRequests,checks:['同一 Turn 内 Skill 工具目录热更新与拒绝保持','完成/失败/取消 Job 重复停止与 SIGKILL 后原回执保持','子代理写入后失败的等待/取消/重启证据一致且不重放','无效代理决策拒绝/主线接管/SIGKILL 后回执保留','真实 App Server 待交互读取','明确答复/跳过','双客户端一次提交','错误交互身份拒绝','SIGKILL 后问题/审批身份恢复','独立 Agent Turn 的交互/显式 Continue/再次重启','父轮仍运行时代理原 Turn 已完成','App Server 转交版本检查/幂等/主线停止后独立完成','转交后 SIGKILL/交互恢复/读取回执不重放','直接与嵌套转交子树显式继续','双客户端同 operation 单次接纳','原中断记录保持终态','批准后显式 Continue','文件删除仅执行一次','Goal 暂停/更新/恢复/完成/清除','旧 revision 拒绝','用量仅统计']} )+'\n');
 } catch(error) {
   if (process.env.MAGI_KEEP_TEST_FIXTURE === '1') await writeFile(join(fixture, 'last-provider-request.json'), JSON.stringify(lastProviderRequest, null, 2));
   process.stderr.write(logs.slice(-12000)+'\n');throw error;

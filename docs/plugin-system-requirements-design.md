@@ -2,6 +2,8 @@
 
 【目标】文档日期：2026-11-02。本文是终局设计，受信宿主、公开扩展协议和翻译器均未交付，不能当作可用接口手册；源码核对基于当日工作区（含未提交内容）。工程约束以 [AGENTS.md](../AGENTS.md) 为入口。
 
+【现状·已运行验证（单元回归与全工作区检查）】**QuickJS 已删除（2026-11-02）**：`magi-plugin-runtime` crate、`magi-plugin-worker` 二进制、`rquickjs` 依赖及许可打包、插件工具目录与执行桥、插件命令/工作流/会话引擎工厂与路由、数据转换 Worker、在途运行租约与排空/取消结算、`workflowId`/`pluginCommandId`/`pluginSelections` 协议字段与对应界面（工作流与插件命令入口、视图选中内容引用）、`examples/plugins/board`、Worker 预检与 CI 步骤均已移除；`sdkVersion` 现为 2，`sdkVersion: 1` 或声明 `backend` 的包在校验阶段以明确原因拒绝。以下正文中引用已删除文件的行（含缺陷表 G1/G7/G8/G10/G12/G14 与第 7 节的删除清单）记录的是删除前的审计依据，其对象已不存在，不再作为待办。**能力缺口**：插件提供的模型工具、会话命令、工作流、会话引擎和数据格式迁移尚未在 Node 上重建（设计项 D10/D11），清单里不能声明它们；数据格式版本变化且已有数据时升级被拒绝。已知残留：`magi-core` 的任务持久化类型仍保留 `TaskKind::LocalWorkflow`、`TaskRuntimePayload::Workflow` 与上下文锚点里的 `plugin_selections` 字段（仅为已落盘数据的形状；LocalWorkflow 任务现在以明确错误失败），`ChatToolOrigin::Plugin` 枚举值无生产者；`test:electron-plugins` 里受信 Node 扩展的发行包验收尚未接入。
+
 ## 1. 结论、约定与需求
 
 ### 1.1 结论摘要
@@ -584,9 +586,9 @@
 | 现状 | [演进方案](magi-agent-runtime-evolution-plan.md#1-核心判断) 第 1、3.5、8.4、10、11 节 | 插件系统作为独立交付线、不受“暂停新增能力”约束；ExtensionBus、钩子模式与插件作业；受信层与严格只读不并存；与 P3 统一 Step Loop 的接线顺序 | D1、D4、D9、D12 |
 | 现状 | [缓存架构](prompt-cache-lineage-architecture.md#扩展改写extension_rewrite) | `extension_rewrite` 失效原因、记录合同与唯一投影（已实现并有回归），已接入 `context.assemble` / `compaction.before`；剩余缺口：界面提示 | D5 |
 | 现状 | [项目架构文档](README.md) | 扩展宿主进程与进程拓扑、随包 Node、文档索引 | D3 |
-| 现状 | [验证入口](validation.md) | 第 12 节验收面的登记处；当前没有对应命令 | 第 12 节 |
-| 目标 | [扩展协议 v1](extension-protocol-v1.md) | 线协议规范：传输与帧、握手与版本、调用身份、方法目录、注册、逐钩子合同、重入、迁移会话、失败与错误码、协议层验收（尚未实现） | 5.5～5.8、D1、D4 |
-| 目标 | [作者指南](plugin-authoring.md) | Node 公开 API 发布时整体重写；SDK 1 指南随 QuickJS 一并删除 | D1、D2 |
+| 现状 | [验证入口](validation.md) | 第 12 节验收面的登记处；已登记命令见该文档，其余验收面尚无命令 | 第 12 节 |
+| 目标 | [扩展协议 v1](extension-protocol-v1.md) | 线协议规范：传输与帧、握手与版本、调用身份、方法目录、注册、逐钩子合同、重入、迁移会话、失败与错误码、协议层验收（宿主与 13 个钩子已实现，迁移会话等未实现） | 5.5～5.8、D1、D4 |
+| 现状 | [作者指南](plugin-authoring.md) | 已改写为 SDK 2（声明式贡献与 Node 扩展钩子）；Node 公开 API 随协议扩展继续补全 | D1、D2 |
 
 ### 13.3 未核实事项与局限
 

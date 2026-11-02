@@ -61,8 +61,6 @@ pub(crate) fn session_turn_queue_response(
                 content: queued.request.timeline_content(text.as_deref()),
                 text,
                 command: queued.request.command.clone(),
-                workflow_id: queued.request.workflow_id.clone(),
-                plugin_command_id: queued.request.plugin_command_id.clone(),
                 skill_name: queued.request.skill_name.clone(),
                 goal_mode: queued.request.goal_mode,
                 access_profile: wire_projection(queued.request.access_profile),
@@ -70,7 +68,6 @@ pub(crate) fn session_turn_queue_response(
                 context_references: wire_projection(queued.request.context_references),
                 browser_annotation_refs: queued.request.browser_annotation_refs,
                 browser_node_selections: wire_projection(queued.request.browser_node_selections),
-                plugin_selections: queued.request.plugin_selections,
                 guide,
                 retry_count: queued.retry_count,
                 interrupt_turn_id: queued.request.interrupt_turn_id,
@@ -236,12 +233,9 @@ pub(crate) async fn update_session_turn_queue_item(
     candidate.context_references = replacement.context_references;
     candidate.browser_annotation_refs = replacement.browser_annotation_refs;
     candidate.browser_node_selections = replacement.browser_node_selections;
-    candidate.plugin_selections = replacement.plugin_selections;
     candidate.skill_name = replacement.skill_name;
     candidate.goal_mode = replacement.goal_mode;
     candidate.command = replacement.command;
-    candidate.workflow_id = replacement.workflow_id;
-    candidate.plugin_command_id = replacement.plugin_command_id;
     candidate.access_profile = replacement.access_profile;
     candidate.locale = replacement.locale;
     crate::turn_service::validate_session_turn_input(candidate)?;
@@ -256,8 +250,6 @@ pub(crate) async fn update_session_turn_queue_item(
         .validate_browser_node_selections()
         .map_err(ApiError::InvalidInput)?;
     candidate.parsed_images().map_err(ApiError::InvalidInput)?;
-    crate::turn_service::validate_workflow_selection(&state, candidate)?;
-    crate::turn_service::validate_plugin_command_selection(&state, candidate)?;
     let decision = crate::turn_service::decide_session_turn(&state, candidate)?;
     queued.route = decision.route;
     queued.task_title = decision.task_title;

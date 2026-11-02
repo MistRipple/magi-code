@@ -18,8 +18,8 @@ use magi_app_server_protocol::generated::{
 use magi_core::EventId;
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_plugin_system::{
-    CatalogEntry, ContributionRef, MAX_CATALOG_BYTES, MAX_PACKAGE_BYTES, PluginCatalog,
-    PluginManager, PluginPackage, PluginSource, TrustedKey,
+    CatalogEntry, MAX_CATALOG_BYTES, MAX_PACKAGE_BYTES, PluginCatalog, PluginManager,
+    PluginPackage, PluginSource, TrustedKey,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -60,8 +60,6 @@ pub fn routes() -> Router<ApiState> {
         .route("/plugins/center/install", post(center_install))
         .route("/plugins/guide", get(guide))
         .route("/plugins/manifests", get(manifests))
-        .route("/plugins/commands", get(commands))
-        .route("/plugins/workflows", get(workflows))
         .route(
             "/plugins/{id}/resources/{resource}/events",
             get(resource_events),
@@ -105,57 +103,6 @@ async fn manifests(
         .manifests_for_scope(&query.scope)
         .map_err(plugin_error)?;
     Ok(Json(manifests))
-}
-
-async fn commands(
-    State(state): State<ApiState>,
-    Query(query): Query<ScopeQuery>,
-) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let manager = locked(&state, "读取插件命令")?;
-    let entries = manager
-        .command_contributions_for_scope(&query.scope)
-        .map_err(plugin_error)?;
-    Ok(Json(contribution_entries(&manager, entries)))
-}
-
-async fn workflows(
-    State(state): State<ApiState>,
-    Query(query): Query<ScopeQuery>,
-) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let manager = locked(&state, "读取插件工作流")?;
-    let entries = manager
-        .workflow_contributions_for_scope(&query.scope)
-        .map_err(plugin_error)?;
-    Ok(Json(contribution_entries(&manager, entries)))
-}
-
-/// 命令与工作流共用的投影：身份固定为 `plugin/{插件}/{贡献}`，并携带激活包摘要，
-/// 使用方据此把一次运行固定到精确版本。
-fn contribution_entries(
-    manager: &PluginManager,
-    entries: Vec<(
-        magi_app_server_protocol::PluginManifest,
-        magi_app_server_protocol::PluginNamedContribution,
-    )>,
-) -> Vec<serde_json::Value> {
-    entries
-        .into_iter()
-        .map(|(manifest, contribution)| {
-            let digest = manager
-                .package(&manifest.id)
-                .map(|package| package.digest().to_string())
-                .unwrap_or_default();
-            serde_json::json!({
-                "id": ContributionRef::new(&manifest.id, &contribution.id).identity(),
-                "pluginId": manifest.id,
-                "contributionId": contribution.id,
-                "version": manifest.version,
-                "digest": digest,
-                "title": contribution.title,
-                "description": contribution.description,
-            })
-        })
-        .collect()
 }
 
 async fn resource_events(
@@ -527,8 +474,7 @@ async fn install_or_upgrade(
     }
 }
 
-/// 升级的唯一入口：关闭该插件全部作用域的准入，等待（必要时取消）在途运行结算，
-/// 再原子切换到新包。任一步失败都保持旧版本与旧激活状态不变。
+/// 升级的唯一入口：关闭该插件全部作用域的准入，再原子切换到新包。任一步失败都保持旧版本与旧激活状态不变。
 async fn upgrade_installed_plugin(
     state: &ApiState,
     package: &PluginPackage,
@@ -539,43 +485,15 @@ async fn upgrade_installed_plugin(
         &package.manifest().id,
     )
     .map_err(plugin_error)?;
-    PluginManager::settle_runtime_leases(&state.plugin_manager, &drain)
-        .await
-        .map_err(plugin_error)?;
-    // 旧写入者已停止：此时读取并转换数据。转换失败只让升级失败，旧版本与旧数据保持原状。
-    let converted = convert_plugin_data(state, package).await?;
     {
         let mut manager = locked(state, "升级插件")?;
         manager
-            .upgrade(package, source, &drain, converted)
+            .upgrade(package, source, &drain)
             .map_err(plugin_error)?;
         drain.commit(&mut manager);
     }
     publish_plugin_registry_changed(state);
     Ok(())
-}
-
-/// 数据格式版本变化且已有数据时，由新版插件在 Worker 中转换（纯函数，无任何宿主能力）。
-async fn convert_plugin_data(
-    state: &ApiState,
-    package: &PluginPackage,
-) -> Result<Option<magi_plugin_system::ConvertedData>, ApiError> {
-    let plan = locked(state, "读取插件待转换数据")?
-        .plan_data_migration(package)
-        .map_err(plugin_error)?;
-    let Some(plan) = plan else {
-        return Ok(None);
-    };
-    let migrator = state
-        .plugin_data_migrator
-        .clone()
-        .ok_or_else(|| ApiError::InternalAssemblyError("插件数据转换执行器不可用".into()))?;
-    let package = package.clone();
-    tokio::task::spawn_blocking(move || migrator.convert(&package, &plan))
-        .await
-        .map_err(|_| ApiError::InternalAssemblyError("插件数据转换线程异常退出".into()))?
-        .map(Some)
-        .map_err(plugin_error)
 }
 
 async fn authorize(
@@ -619,11 +537,6 @@ async fn deactivate(
         &request.scope,
     )
     .map_err(plugin_error)?;
-    // 先给在途运行一个自然完成的排空期；到期后统一取消并再给有限的结算窗口。
-    // 仍未结算时保留激活状态并报告冲突，不在调用未结算时强行停用。
-    PluginManager::settle_runtime_leases(&state.plugin_manager, &drain)
-        .await
-        .map_err(plugin_error)?;
     {
         let mut manager = locked(&state, "停用插件")?;
         manager
@@ -814,12 +727,11 @@ mod tests {
 
     fn archive(version: &str) -> Vec<u8> {
         let manifest = serde_json::json!({
-            "sdkVersion": 1,
+            "sdkVersion": 2,
             "id": "acme.resources",
             "version": version,
             "name": "Resources",
             "description": "",
-            "backend": "plugin.mjs",
             "permissions": [{
                 "kind": "storage",
                 "scope":"application",
@@ -830,10 +742,8 @@ mod tests {
             "contributions": {"resources":[{"id":"dashboard","title":"Dashboard","description":""}]}
         });
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-        for (name, bytes) in [
-            ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
-            ("plugin.mjs", b"export default () => ({})".to_vec()),
-        ] {
+        {
+            let (name, bytes) = ("manifest.json", serde_json::to_vec(&manifest).unwrap());
             writer
                 .start_file(name, zip::write::SimpleFileOptions::default())
                 .unwrap();
@@ -1033,12 +943,11 @@ mod tests {
     #[tokio::test]
     async fn view_resources_carry_a_response_level_sandbox() {
         let manifest = serde_json::json!({
-            "sdkVersion": 1,
+            "sdkVersion": 2,
             "id": "acme.viewer",
             "version": "1.0.0",
             "name": "Viewer",
             "description": "",
-            "backend": "plugin.mjs",
             "permissions": [],
             "dataSchemaVersion": 1,
             "settingsSchema": {"type":"object","additionalProperties":false},
@@ -1050,7 +959,6 @@ mod tests {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         for (name, bytes) in [
             ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
-            ("plugin.mjs", b"export default () => ({})".to_vec()),
             ("ui/index.html", b"<!doctype html><title>x</title>".to_vec()),
         ] {
             writer
@@ -1209,7 +1117,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upgrade_route_drains_the_plugin_and_requires_reauthorization() {
+    async fn upgrade_route_switches_the_package_and_requires_reauthorization() {
         let (state, root) = active_resource_state().await;
         let body = serde_json::json!({
             "source": "local:/tmp/acme-resources-1.1.0.zip",
@@ -1252,8 +1160,6 @@ mod tests {
         assert_eq!(plugin["enabledScopes"], serde_json::json!(["application"]));
         assert_eq!(plugin["activeScopes"], serde_json::json!([]));
         assert_eq!(plugin["grants"], serde_json::json!([]));
-        assert_eq!(plugin["draining"], serde_json::json!([]));
-        assert_eq!(list["lifecycle"]["drainTimeoutMs"], 30_000);
         assert_eq!(plugin["source"]["kind"], "local");
         drop(root);
     }

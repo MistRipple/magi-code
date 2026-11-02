@@ -900,11 +900,7 @@ impl DaemonRuntime {
         runtime_maintenance.publish_runtime_status_event("system-runtime-maintenance-ready");
 
         let managed_process_group = ManagedProcessGroup::new();
-        let plugins = PluginServices::open(
-            &config.state_root,
-            event_bus.clone(),
-            managed_process_group.clone(),
-        )?;
+        let plugins = PluginServices::open(&config.state_root, managed_process_group.clone())?;
         Ok(Self {
             state_root: config.state_root.clone(),
             state_repository,
@@ -1446,10 +1442,6 @@ impl DaemonRuntime {
             .with_knowledge_store(self.knowledge_store.clone())
             .with_external_tool_catalog_provider(external_tool_catalog_provider)
             .with_external_mcp_tool_executor(external_mcp_tool_executor)
-            .with_plugin_tools(
-                self.plugins.tool_catalog_provider(),
-                self.plugins.tool_executor(),
-            )
             .with_agent_role_catalog_provider(agent_role_catalog_provider)
             .with_image_generation_runtime(
                 image_generation_executor,
@@ -1649,7 +1641,6 @@ impl DaemonRuntime {
         .with_tunnel_port(self.local_port)
         .with_plugin_manager(self.plugins.manager())
         .with_extension_status(self.plugins.extension_status())
-        .with_plugin_data_migrator(self.plugins.data_migrator())
         .with_runtime_persistence(runtime_persistence)
         .with_workspace_history_restore({
             let repository = self.state_repository.clone();
@@ -1765,10 +1756,6 @@ impl DaemonRuntime {
             self.state_root.clone(),
         );
 
-        let session_engine_factory = self.plugins.session_engine_factory(None)?;
-        let workflow_core_factory = self.plugins.workflow_core_factory()?;
-
-        let plugin_command_executor = self.plugins.command_executor();
         self.plugins.start_extensions(self.event_bus.clone());
         let extension_hooks_adapter = Arc::new(super::extension_bridge::ExtensionBusHooks::new(
             self.plugins.extension_bus(),
@@ -1777,11 +1764,6 @@ impl DaemonRuntime {
         let extension_bus_hooks: Arc<
             dyn magi_conversation_runtime::extension_hooks::ExtensionHooks,
         > = extension_hooks_adapter.clone();
-        let mut llm_task_dispatcher = llm_task_dispatcher;
-        llm_task_dispatcher = llm_task_dispatcher
-            .with_session_engine_factory(session_engine_factory)
-            .with_workflow_core_factory(workflow_core_factory)
-            .with_plugin_command_executor(plugin_command_executor);
         let llm_task_dispatcher = Arc::new(
             llm_task_dispatcher
                 .with_model_bridge_client(business_model_client.clone())

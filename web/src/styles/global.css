@@ -1977,7 +1977,7 @@ strong, b { font-weight: var(--font-bold); }
     .sidebar-empty--recovering svg, .settings-loading svg, .sidebar-refreshing svg,
     .right-pane-add-tab[aria-busy='true'] svg, .git-repository-stats button.loading svg,
     .refreshing svg, .ghost-action.saving svg, .skill-row-progress,
-    .btn:is(.is-testing, .is-saving) svg, .apple-indicator.checking, .settings-dot--busy,
+    .btn:is(.is-testing, .is-saving) svg, .apple-indicator.checking,
     .turn-runtime-dot, .tool-card-meta .status-dot.pulsing, .executor-status .status-dot.running,
     .generated-image-progress > span, .ia-context-ring.estimating .ring-fill,
     .notice-icon.compacting, .ia-context-picker-loading svg, .loading-dot,

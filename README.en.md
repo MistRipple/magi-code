@@ -78,7 +78,7 @@ Magi seamlessly integrates a multi-purpose workbench pane with an authentic Chro
 Users can extend tools, user interfaces, and execution workflows without modifying Magi source code or rebuilding binaries:
 
 - **Unified lifecycle**: Managed by `PluginManager`, offering verification, versioned resources, permission grants, activation, and safe uninstallation.
-- **Isolated execution sandbox**: Plugins run in an isolated QuickJS Worker environment to safeguard host stability.
+- **Trusted extension host**: Plugins run as separate Node processes that observe or guard session events through hooks; after the user grants full trust they run with the user's privileges, while core facts remain owned by the daemon.
 - **Deep UI integration**: Plugins can contribute settings tabs, workbench entries, and custom data panels rendered in isolated iframes inside the right pane.
 
 #### 4. Dual MCP ecosystem (Client + Standard Server)
@@ -211,7 +211,7 @@ Magi turns raw model intelligence into a local, durable, reviewable engineering 
 - **Full execution visibility**: Goals, tasks, agent lifecycles, tool calls, and diffs are tracked on one continuous timeline.
 - **Accumulate institutional memory**: Code indexing, ADRs, FAQs, and engineering experience stay anchored to your local repo.
 - **Unified tool & browser governance**: Files, shell, symbol search, embedded Chromium, and MCP share one sandbox and permission model.
-- **Bidirectional extensibility**: Sandboxed QuickJS plugins plus an exposed standard MCP server.
+- **Bidirectional extensibility**: Trusted Node extension plugins plus an exposed standard MCP server.
 - **User-owned runtime**: Workspaces, sessions, model keys, and history remain strictly in your local environment.
 - **Multi-client consistency**: Desktop, browser, LAN devices, and tunnels connect to the same backend daemon.
 - **Engineered for real delivery**: Cancellation, recovery, failure diagnostics, change reviews, and pre-release gates.
@@ -285,7 +285,7 @@ crates/
   magi-usage-authority/           Token metering, context pressure prediction, and continuous compaction
   magi-orchestrator/              Task scheduling, TaskStore dependency graph, and TaskRunSupervisor
   magi-mcp-server/                Standard MCP server implementation (stdio, local HTTP, Cloudflare tunnel)
-  magi-plugin-system/             Plugin manager, QuickJS sandbox, versioned resources, and extension loading
+  magi-plugin-system/             Plugin manager, package validation, versioned resources, and signed catalogs
   magi-permissions/               Workspace path boundaries and tool permission evaluation
   magi-session-isolation/         Workspace contention checks and Git worktree isolated replicas
   magi-agent-role/                Specialist agent role templates and registry

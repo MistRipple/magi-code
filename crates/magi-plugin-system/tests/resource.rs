@@ -57,22 +57,18 @@ fn resource_updates_are_versioned_and_conflicts_are_explicit() {
 fn resource_capabilities_require_a_manifest_resource_identity() {
     let dir = tempdir().unwrap();
     let manifest = serde_json::json!({
-        "sdkVersion": 1,
+        "sdkVersion":2,
         "id": "acme.dashboard",
         "version": "1.0.0",
         "name": "Dashboard",
-        "description": "",
-        "backend": "plugin.mjs",
-        "permissions": [],
+        "description": "", "permissions": [],
         "dataSchemaVersion": 1,
         "settingsSchema": {"type":"object","additionalProperties":false},
         "contributions": {"resources":[{"id":"board","title":"Board","description":""}]}
     });
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-    for (name, bytes) in [
-        ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
-        ("plugin.mjs", b"export default () => ({})".to_vec()),
-    ] {
+    {
+        let (name, bytes) = ("manifest.json", serde_json::to_vec(&manifest).unwrap());
         writer
             .start_file(name, zip::write::SimpleFileOptions::default())
             .unwrap();
@@ -126,22 +122,18 @@ fn failed_persistence_does_not_advance_the_in_memory_resource_version() {
 
 fn dashboard_package() -> PluginPackage {
     let manifest = serde_json::json!({
-        "sdkVersion": 1,
+        "sdkVersion":2,
         "id": "acme.dashboard",
         "version": "1.0.0",
         "name": "Dashboard",
-        "description": "",
-        "backend": "plugin.mjs",
-        "permissions": [{"kind":"storage","scope":"application","targets":["board"]}],
+        "description": "", "permissions": [{"kind":"storage","scope":"application","targets":["board"]}],
         "dataSchemaVersion": 1,
         "settingsSchema": {"type":"object","additionalProperties":false},
         "contributions": {"resources":[{"id":"board","title":"Board","description":""}]}
     });
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-    for (name, bytes) in [
-        ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
-        ("plugin.mjs", b"export default () => ({})".to_vec()),
-    ] {
+    {
+        let (name, bytes) = ("manifest.json", serde_json::to_vec(&manifest).unwrap());
         writer
             .start_file(name, zip::write::SimpleFileOptions::default())
             .unwrap();

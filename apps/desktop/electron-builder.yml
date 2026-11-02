@@ -29,8 +29,6 @@ extraResources:
       - model_bridge_loopback.exe
       - mcp_bridge_loopback
       - mcp_bridge_loopback.exe
-      - magi-plugin-worker
-      - magi-plugin-worker.exe
   - from: dist/node-runtime
     to: daemon/node
     filter:
@@ -81,7 +79,6 @@ mac:
     - Contents/Resources/daemon/magi-daemon-app
     - Contents/Resources/daemon/model_bridge_loopback
     - Contents/Resources/daemon/mcp_bridge_loopback
-    - Contents/Resources/daemon/magi-plugin-worker
     - Contents/Resources/daemon/node/node
   target:
     - dmg

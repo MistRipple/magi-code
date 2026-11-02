@@ -1,15 +1,10 @@
-use crate::{
-    ConvertedData, DataMigrationPlan, MigrationEntry, PluginError, PluginPackage, PluginResource,
-    PluginResourceStore, invalid,
-};
+use crate::{PluginError, PluginPackage, PluginResource, PluginResourceStore, invalid};
 use magi_app_server_protocol::generated::{
-    PluginCandidateOperation, PluginCandidatePreview, PluginDrainPhase, PluginDrainingScope,
-    PluginInstalled as PluginInstalledProjection, PluginLifecycleLimits, PluginList,
-    PluginScopeGrant, PluginSourceKind, PluginSourceProjection,
+    PluginCandidateOperation, PluginCandidatePreview, PluginInstalled as PluginInstalledProjection,
+    PluginList, PluginScopeGrant, PluginSourceKind, PluginSourceProjection,
 };
 use magi_app_server_protocol::{PluginManifest, PluginPermission, PluginPermissionKind};
 use magi_core::{UtcMillis, fs_atomic::write_atomic};
-use magi_plugin_runtime::RunCancellation;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -17,28 +12,21 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 mod drain;
 mod upgrade;
 
-pub use drain::{PluginDrainGuard, PluginRuntimeLease};
-use upgrade::UpgradeOperation;
+pub use drain::PluginDrainGuard;
 
 const STATE_FILE: &str = "state.json";
 const STATE_VERSION: u16 = 1;
 /// 设置沿用资源版本存储，使用清单资源 ID 不可能出现的保留键。
 const SETTINGS_RESOURCE_ID: &str = "__settings";
-const UPGRADE_OPERATION_FILE: &str = "upgrade-operation.json";
 /// 第一方插件身份由 Magi 自己提供，外部包不能占用同一身份再获得原生宿主能力。
 /// 原生功能（如 MCP 服务）不再借占位包显示为插件，目前没有第一方插件包；
 /// 旧版本遗留的内置记录在打开时退役（见 `retired_builtins`）。
 const BUILTIN_PLUGIN_IDS: &[&str] = &[];
-/// 停用与升级时等待在途运行自然结束的期限，到期后统一取消。
-pub const PLUGIN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-/// 取消在途运行后等待其结算并释放租约的期限。
-pub const PLUGIN_CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -78,14 +66,6 @@ impl Default for PluginManagerState {
     }
 }
 
-/// 已通过目录、授权和参数校验、可以交给 Worker 执行的工具调用。
-pub struct PreparedToolCall {
-    pub plugin_id: String,
-    pub package: Arc<PluginPackage>,
-    pub tool: magi_app_server_protocol::PluginToolContribution,
-    pub input: Value,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActivePlugin {
     pub id: String,
@@ -103,12 +83,9 @@ pub struct PluginManager {
     /// 已校验包的内存副本，按插件 ID 缓存并以摘要核对；包文件不可变，
     /// 避免每次投影、准入或调用都重新读盘并解压 ZIP。
     packages: Mutex<BTreeMap<String, Arc<PluginPackage>>>,
-    runtime_leases: BTreeMap<(String, String), BTreeMap<u64, RunCancellation>>,
-    next_lease_id: u64,
     /// 正在关闭准入的 (插件, 作用域)，值为开始排空的时间。
     draining_scopes: BTreeMap<(String, String), UtcMillis>,
     /// 已提交但暂存数据尚未应用的升级操作：期间拒绝激活，避免新代码读到旧格式数据。
-    pending_upgrade: Option<UpgradeOperation>,
     /// 本次打开时退役的旧内置插件记录，供宿主把对应原生功能迁到自己的开关上。
     retired_builtins: Vec<RetiredBuiltin>,
 }
@@ -139,29 +116,6 @@ impl PluginSource {
 }
 
 impl PluginManager {
-    /// 工作流选择与工厂构造共用同一准入，版本从当前安装事实读取。
-    pub fn prepare_workflow(
-        &self,
-        selected: &crate::ContributionRef,
-    ) -> Result<Arc<PluginPackage>, PluginError> {
-        let id = selected.plugin_id.as_str();
-        self.ensure_scope_not_draining(id, crate::APPLICATION_SCOPE)?;
-        if !self.is_active_for_scope(id, crate::APPLICATION_SCOPE)? {
-            return Err(PluginError::NotAuthorized("插件工作流未激活".into()));
-        }
-        let package = self.package(id)?;
-        if !package
-            .manifest()
-            .contributions
-            .workflows
-            .iter()
-            .any(|workflow| workflow.id == selected.contribution_id)
-        {
-            return Err(PluginError::NotFound("插件工作流贡献不存在".into()));
-        }
-        Ok(package)
-    }
-
     /// 本次打开时退役的内置插件记录。
     pub fn retired_builtins(&self) -> &[RetiredBuiltin] {
         &self.retired_builtins
@@ -198,14 +152,10 @@ impl PluginManager {
             state,
             resources,
             packages: Mutex::new(BTreeMap::new()),
-            runtime_leases: BTreeMap::new(),
-            next_lease_id: 0,
             draining_scopes: BTreeMap::new(),
-            pending_upgrade: None,
             retired_builtins: Vec::new(),
         };
         // 先按原提交事实完成数据转换，不能把已提交升级误判成未提交并丢弃暂存数据。
-        manager.recover_upgrade_operation()?;
         // 内置包目录是宿主支持能力的唯一入口；停发的内置包不能在重启后恢复激活。
         // 先备份安装事实，再移除注册表记录。资源数据保留，不把退役包当作外部插件加载。
         let retired_records: Vec<_> = manager
@@ -533,10 +483,6 @@ impl PluginManager {
             installed.active_scopes.remove(scope);
         }
         self.commit(next)?;
-        if !complete {
-            // 撤权优先于排空租约：该范围内在途调用立即收到取消，不等待自然结束。
-            self.cancel_runtime_leases_for_deactivation(id, scope);
-        }
         Ok(())
     }
 
@@ -554,8 +500,6 @@ impl PluginManager {
     }
 
     pub fn activate(&mut self, id: &str, scope: &str) -> Result<ActivePlugin, PluginError> {
-        // 升级已提交但暂存数据尚未应用时先重试；仍失败就拒绝激活，避免新代码读到旧格式数据。
-        self.apply_pending_upgrade()?;
         let package = self.package(id)?;
         validate_scope_key(scope)?;
         self.ensure_scope_not_draining(id, scope)?;
@@ -588,9 +532,6 @@ impl PluginManager {
     pub fn deactivate(&mut self, id: &str, scope: &str) -> Result<(), PluginError> {
         self.package(id)?;
         validate_scope_key(scope)?;
-        if self.runtime_lease_count(id, scope) > 0 {
-            return Err(conflict("插件仍有在途运行，必须先完成或取消后再停用"));
-        }
         let mut next = self.state.clone();
         let installed = next
             .plugins
@@ -649,36 +590,6 @@ impl PluginManager {
             && permissions_granted_for_scope(package.manifest(), installed, scope))
     }
 
-    /// 校验 Worker 调用仍绑定到激活时的包版本和作用域实例。
-    ///
-    /// Worker 运行期间可能跨过禁用、升级或重启边界；仅检查插件当前处于激活
-    /// 状态会把迟到的旧调用错误地交给新包。所有能力桥都必须先通过这一个入口，
-    /// 由当前安装事实核对不可变摘要和实例作用域。
-    pub fn validate_runtime_identity(
-        &self,
-        id: &str,
-        package_digest: &str,
-        instance_scope: &str,
-        scope: &str,
-    ) -> Result<(), PluginError> {
-        validate_scope_key(scope)?;
-        if instance_scope != scope {
-            return Err(PluginError::Conflict("插件实例作用域不匹配".into()));
-        }
-        let installed = self
-            .state
-            .plugins
-            .get(id)
-            .ok_or_else(|| conflict("插件未安装"))?;
-        if package_digest != installed.digest {
-            return Err(PluginError::Conflict("插件执行包已过期".into()));
-        }
-        if !self.is_active_for_scope(id, scope)? {
-            return Err(PluginError::Conflict("插件作用域未激活".into()));
-        }
-        Ok(())
-    }
-
     /// 目标作用域内已激活插件的包。清单是贡献来源，这里是当前可用性的唯一投影。
     fn active_packages(&self, scope: &str) -> Result<Vec<Arc<PluginPackage>>, PluginError> {
         validate_scope_key(scope)?;
@@ -691,23 +602,6 @@ impl PluginManager {
         Ok(packages)
     }
 
-    fn contributions_for_scope<T: Clone>(
-        &self,
-        scope: &str,
-        select: impl Fn(&PluginManifest) -> &[T],
-    ) -> Result<Vec<(PluginManifest, T)>, PluginError> {
-        Ok(self
-            .active_packages(scope)?
-            .iter()
-            .flat_map(|package| {
-                let manifest = package.manifest();
-                select(manifest)
-                    .iter()
-                    .map(move |item| (manifest.clone(), item.clone()))
-            })
-            .collect())
-    }
-
     pub fn manifests_for_scope(&self, scope: &str) -> Result<Vec<PluginManifest>, PluginError> {
         Ok(self
             .active_packages(scope)?
@@ -716,105 +610,7 @@ impl PluginManager {
             .collect())
     }
 
-    /// 模型可见且可执行的工具目录。只包含已获 `tools` 授权的贡献，目录与实际执行
-    /// （[`PluginManager::prepare_tool_call`]）使用同一判定，不会向模型暴露必然被拒绝的工具。
-    pub fn tool_contributions_for_scope(
-        &self,
-        scope: &str,
-    ) -> Result<
-        Vec<(
-            PluginManifest,
-            magi_app_server_protocol::PluginToolContribution,
-        )>,
-        PluginError,
-    > {
-        let mut tools =
-            self.contributions_for_scope(scope, |manifest| &manifest.contributions.tools)?;
-        tools.retain(|(manifest, tool)| {
-            self.permission_allowed(&manifest.id, scope, PluginPermissionKind::Tools, &tool.id)
-                .unwrap_or(false)
-        });
-        Ok(tools)
-    }
-
-    /// 解析并校验一次模型发起的工具调用：工具必须在当前作用域的目录内，参数必须是
-    /// 合法 JSON 且符合插件声明的 `inputSchema`。校验失败时不会启动 Worker。
-    pub fn prepare_tool_call(
-        &self,
-        scope: &str,
-        model_tool_name: &str,
-        arguments: &str,
-    ) -> Result<PreparedToolCall, PluginError> {
-        let (manifest, tool) = self
-            .tool_contributions_for_scope(scope)?
-            .into_iter()
-            .find(|(manifest, tool)| {
-                crate::model_tool_name(&manifest.id, &tool.id) == model_tool_name
-            })
-            .ok_or_else(|| PluginError::NotFound("插件工具未激活或未授权".into()))?;
-        // 部分模型对无参数工具发送空字符串，按空对象处理。
-        let input: Value = if arguments.trim().is_empty() {
-            Value::Object(Default::default())
-        } else {
-            serde_json::from_str(arguments)
-                .map_err(|_| PluginError::InvalidInput("工具参数不是合法 JSON".into()))?
-        };
-        let validator = jsonschema::validator_for(&tool.input_schema)
-            .map_err(|error| invalid(format!("插件工具 schema 无效：{error}")))?;
-        if !validator.is_valid(&input) {
-            return Err(PluginError::InvalidInput(
-                "工具参数不符合插件声明的 inputSchema".into(),
-            ));
-        }
-        Ok(PreparedToolCall {
-            package: self.package(&manifest.id)?,
-            plugin_id: manifest.id,
-            tool,
-            input,
-        })
-    }
-
-    pub fn command_contributions_for_scope(
-        &self,
-        scope: &str,
-    ) -> Result<
-        Vec<(
-            PluginManifest,
-            magi_app_server_protocol::PluginNamedContribution,
-        )>,
-        PluginError,
-    > {
-        self.contributions_for_scope(scope, |manifest| &manifest.contributions.commands)
-    }
-
-    pub fn engine_contributions_for_scope(
-        &self,
-        scope: &str,
-    ) -> Result<
-        Vec<(
-            PluginManifest,
-            magi_app_server_protocol::PluginNamedContribution,
-        )>,
-        PluginError,
-    > {
-        self.contributions_for_scope(scope, |manifest| &manifest.contributions.engines)
-    }
-
-    pub fn workflow_contributions_for_scope(
-        &self,
-        scope: &str,
-    ) -> Result<
-        Vec<(
-            PluginManifest,
-            magi_app_server_protocol::PluginNamedContribution,
-        )>,
-        PluginError,
-    > {
-        self.contributions_for_scope(scope, |manifest| &manifest.contributions.workflows)
-    }
-
     pub fn projection(&self) -> Result<PluginList, PluginError> {
-        let now = UtcMillis::now();
         Ok(PluginList {
             plugins: self
                 .state
@@ -835,40 +631,12 @@ impl PluginManager {
                             })
                             .collect(),
                         source: installed.source.projection(),
-                        draining: self.draining_projection(&installed.id, now),
                         // 扩展宿主的运行状态属于 daemon 的 ExtensionRuntime，由 API 层合并，管理器不持有它。
                         runtime: None,
                     })
                 })
                 .collect::<Result<_, PluginError>>()?,
-            lifecycle: PluginLifecycleLimits {
-                drain_timeout_ms: PLUGIN_DRAIN_TIMEOUT.as_millis() as u64,
-                cancel_settle_timeout_ms: PLUGIN_CANCEL_SETTLE_TIMEOUT.as_millis() as u64,
-            },
         })
-    }
-
-    /// 排空阶段由开始时间与固定期限推出，不另存会与时间漂移的第二份状态。
-    fn draining_projection(&self, id: &str, now: UtcMillis) -> Vec<PluginDrainingScope> {
-        let drain = PLUGIN_DRAIN_TIMEOUT.as_millis() as u64;
-        let settle = PLUGIN_CANCEL_SETTLE_TIMEOUT.as_millis() as u64;
-        self.draining_scopes
-            .iter()
-            .filter(|((plugin_id, _), _)| plugin_id == id)
-            .map(|((_, scope), started)| {
-                let cancelling = now.0.saturating_sub(started.0) >= drain;
-                PluginDrainingScope {
-                    scope: scope.clone(),
-                    phase: if cancelling {
-                        PluginDrainPhase::Cancelling
-                    } else {
-                        PluginDrainPhase::Draining
-                    },
-                    started_at_ms: started.0,
-                    deadline_ms: started.0 + drain + if cancelling { settle } else { 0 },
-                }
-            })
-            .collect()
     }
 
     pub fn uninstall(&mut self, id: &str) -> Result<(), PluginError> {
@@ -877,11 +645,6 @@ impl PluginManager {
             .plugins
             .get(id)
             .ok_or_else(|| conflict("插件未安装"))?;
-        // 禁用/撤权只会发送取消信号；租约在调用真正结算前仍代表旧包正在被使用。
-        // 先删除包会让迟到的 Worker 失去可核对的版本事实，并把取消误报成资源释放。
-        if self.plugin_lease_count(id) > 0 {
-            return Err(conflict("插件仍有在途运行，必须完成资源结算后再卸载"));
-        }
         if !installed.active_scopes.is_empty() || !installed.enabled_scopes.is_empty() {
             return Err(conflict("插件仍有启用作用域或激活实例"));
         }

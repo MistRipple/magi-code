@@ -666,21 +666,6 @@ pub struct BrowserNodeSelectionBounds {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginSelection {
-    #[serde(rename = "pluginId")]
-    pub plugin_id: String,
-    #[serde(rename = "resourceId")]
-    pub resource_id: String,
-    pub version: u64,
-    pub label: String,
-    pub summary: String,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selection: Option<Value>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrowserNodeSelection {
     #[serde(rename = "tabId")]
     pub tab_id: String,
@@ -771,14 +756,6 @@ pub struct TurnStartParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<SessionTurnCommand>,
     #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "workflowId")]
-    pub workflow_id: Option<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "pluginCommandId")]
-    pub plugin_command_id: Option<String>,
-    #[serde(default)]
     pub images: Vec<SessionTurnImage>,
     #[serde(default)]
     #[serde(rename = "contextReferences")]
@@ -820,9 +797,6 @@ pub struct TurnStartParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "replaceTurnId")]
     pub replace_turn_id: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "pluginSelections")]
-    pub plugin_selections: Vec<PluginSelection>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "interruptTurnId")]
@@ -1538,18 +1512,6 @@ pub struct PluginPermission {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginToolContribution {
-    pub id: String,
-    pub title: String,
-    pub description: String,
-    #[serde(rename = "inputSchema")]
-    pub input_schema: Value,
-    #[serde(rename = "readOnly")]
-    pub read_only: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginSkillContribution {
     pub id: String,
     pub title: String,
@@ -1629,27 +1591,12 @@ pub struct PluginContributions {
     #[serde(default)]
     pub skills: Vec<PluginSkillContribution>,
     #[serde(default)]
-    pub tools: Vec<PluginToolContribution>,
-    #[serde(default)]
-    pub commands: Vec<PluginNamedContribution>,
-    #[serde(default)]
     pub views: Vec<PluginViewContribution>,
-    #[serde(default)]
-    pub workflows: Vec<PluginNamedContribution>,
-    #[serde(default)]
-    pub engines: Vec<PluginNamedContribution>,
     #[serde(default)]
     pub resources: Vec<PluginNamedContribution>,
     #[serde(default)]
     #[serde(rename = "browserSurfaces")]
     pub browser_surfaces: Vec<PluginBrowserSurfaceContribution>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PluginBackendEntry {
-    #[serde(rename = "plugin.mjs")]
-    PluginMjs,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1682,13 +1629,6 @@ pub struct PluginExtension {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginDataMigration {
-    #[serde(rename = "fromVersions")]
-    pub from_versions: Vec<i64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginManifest {
     #[serde(rename = "sdkVersion")]
     pub sdk_version: u16,
@@ -1698,9 +1638,6 @@ pub struct PluginManifest {
     pub description: String,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub backend: Option<PluginBackendEntry>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<PluginExtension>,
     pub permissions: Vec<PluginPermission>,
     pub contributions: PluginContributions,
@@ -1708,10 +1645,6 @@ pub struct PluginManifest {
     pub settings_schema: Value,
     #[serde(rename = "dataSchemaVersion")]
     pub data_schema_version: i64,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "dataMigration")]
-    pub data_migration: Option<PluginDataMigration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1816,35 +1749,6 @@ pub struct PluginSourceProjection {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PluginDrainPhase {
-    #[serde(rename = "draining")]
-    Draining,
-    #[serde(rename = "cancelling")]
-    Cancelling,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginDrainingScope {
-    pub scope: String,
-    pub phase: PluginDrainPhase,
-    #[serde(rename = "startedAtMs")]
-    pub started_at_ms: u64,
-    #[serde(rename = "deadlineMs")]
-    pub deadline_ms: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginLifecycleLimits {
-    #[serde(rename = "drainTimeoutMs")]
-    pub drain_timeout_ms: u64,
-    #[serde(rename = "cancelSettleTimeoutMs")]
-    pub cancel_settle_timeout_ms: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginInstalled {
     pub manifest: PluginManifest,
@@ -1855,7 +1759,6 @@ pub struct PluginInstalled {
     pub active_scopes: Vec<String>,
     pub grants: Vec<PluginScopeGrant>,
     pub source: PluginSourceProjection,
-    pub draining: Vec<PluginDrainingScope>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<PluginRuntimeStatus>,
@@ -1893,7 +1796,6 @@ pub struct PluginRuntimeStatus {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginList {
     pub plugins: Vec<PluginInstalled>,
-    pub lifecycle: PluginLifecycleLimits,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2010,8 +1912,6 @@ pub struct SessionTurnGuideInputSupport {
     pub context_references: bool,
     #[serde(rename = "browserAnnotationRefs")]
     pub browser_annotation_refs: bool,
-    #[serde(rename = "pluginSelections")]
-    pub plugin_selections: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2995,10 +2895,6 @@ pub struct QueuedSessionTurn {
     pub content: String,
     pub text: Option<String>,
     pub command: Option<SessionTurnCommand>,
-    #[serde(rename = "workflowId")]
-    pub workflow_id: Option<String>,
-    #[serde(rename = "pluginCommandId")]
-    pub plugin_command_id: Option<String>,
     #[serde(rename = "skillName")]
     pub skill_name: Option<String>,
     #[serde(rename = "goalMode")]
@@ -3012,8 +2908,6 @@ pub struct QueuedSessionTurn {
     pub browser_annotation_refs: Vec<String>,
     #[serde(rename = "browserNodeSelections")]
     pub browser_node_selections: Vec<BrowserNodeSelection>,
-    #[serde(rename = "pluginSelections")]
-    pub plugin_selections: Vec<PluginSelection>,
     pub guide: SessionTurnGuideCapability,
     #[serde(rename = "retryCount")]
     pub retry_count: u8,

@@ -3,7 +3,6 @@ import { access, readFile, readdir } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { extractFile, listPackage } from "@electron/asar";
 import { runBridgePreflight } from "./bridge-preflight.mjs";
-import { pluginWorkerFileName, runPluginWorkerPreflight } from "./plugin-worker-preflight.mjs";
 import { nodeRuntimeFileName, runNodeRuntimePreflight } from "./node-runtime.mjs";
 
 export async function afterPack(context) {
@@ -42,11 +41,6 @@ export async function afterPack(context) {
     }
   }
   await runBridgePreflight(join(resources, "daemon"), "Electron resources bridge");
-  if (manifest.components.pluginWorker?.path !== `daemon/${pluginWorkerFileName}`
-      || !manifest.files.some((file) => file.path === `daemon/${pluginWorkerFileName}`)) {
-    throw new Error("发行资源清单缺少插件 Worker");
-  }
-  await runPluginWorkerPreflight(join(resources, "daemon"), manifest.productVersion);
   if (manifest.components.nodeRuntime?.path !== `daemon/node/${nodeRuntimeFileName}`
       || !manifest.files.some((file) => file.path === `daemon/node/${nodeRuntimeFileName}`)) {
     throw new Error("发行资源清单缺少随包 Node");

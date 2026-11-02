@@ -3208,14 +3208,6 @@ fn execute_task_tool_call(
             browser_capability_snapshot: browser_capability_snapshot.clone(),
             browser_execution_id: Some(format!("task:{}", task.task_id)),
         };
-        if let Some(result) = registry.execute_plugin_tool(
-            &tool_call.function.name,
-            &tool_call.function.arguments,
-            &context,
-            effective_access_profile,
-        ) {
-            return result;
-        }
         // 等待 Job 不占模型执行名额；后台进程仍可能写入，不能让出仓库租约。
         let job_wait = (tool_call.function.name == BuiltinToolName::ShellExec.as_str()
             && serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
@@ -5875,7 +5867,6 @@ mod tests {
         let workspace = Some(WorkspaceId::new("task-catalog-workspace"));
         let external_calls = Arc::new(AtomicUsize::new(0));
         let mcp_calls = external_calls.clone();
-        let plugin_calls = external_calls.clone();
         let mut tools = ToolRegistry::new(
             Arc::new(magi_governance::GovernanceService::default()),
             Arc::new(InMemoryEventBus::new(16)),
@@ -5902,29 +5893,7 @@ mod tests {
                 r#"{"status":"succeeded"}"#.into(),
                 ExecutionResultStatus::Succeeded,
             )
-        }))
-        .with_plugin_tools(
-            Arc::new(|_| {
-                ["read", "blocked", "excluded"]
-                    .map(|name| magi_tool_runtime::PluginToolCatalogEntry {
-                        plugin_id: "repo".into(),
-                        contribution_id: name.into(),
-                        model_tool_name: format!("plugin__repo__{name}"),
-                        title: name.into(),
-                        description: name.into(),
-                        read_only: true,
-                        input_schema: serde_json::json!({"type":"object"}),
-                    })
-                    .into()
-            }),
-            Arc::new(move |_, _, _| {
-                plugin_calls.fetch_add(1, Ordering::SeqCst);
-                (
-                    r#"{"status":"succeeded"}"#.into(),
-                    ExecutionResultStatus::Succeeded,
-                )
-            }),
-        );
+        }));
         tools.register_default_builtins();
 
         for child in [false, true] {
@@ -5943,13 +5912,11 @@ mod tests {
                 "tool_catalog",
                 "file_read",
                 "mcp__repo__read",
-                "plugin__repo__read",
                 "mcp__repo__blocked",
-                "plugin__repo__blocked",
             ]
             .map(str::to_string)
             .into();
-            policy.denied_tools = ["file_remove", "mcp__repo__blocked", "plugin__repo__blocked"]
+            policy.denied_tools = ["file_remove", "mcp__repo__blocked"]
                 .map(str::to_string)
                 .into();
             task.policy_snapshot = Some(policy);
@@ -6014,7 +5981,7 @@ mod tests {
                     ExecutionResultStatus::Rejected
                 );
             }
-            for (key, prefix) in [("mcp_tools", "mcp"), ("plugin_tools", "plugin")] {
+            for (key, prefix) in [("mcp_tools", "mcp")] {
                 for (suffix, reason) in [
                     ("read", None),
                     ("blocked", Some("tool_explicitly_denied")),
@@ -6151,7 +6118,6 @@ mod tests {
         skill_registry.register(skill(true));
         for name in [
             "mcp__repo__inspect",
-            "plugin__repo__inspect",
             "agent_spawn",
             "update_plan",
             "file_write",
@@ -7935,11 +7901,7 @@ mod tests {
 
     #[test]
     fn project_directory_revocation_during_approval_prevents_real_file_remove() {
-        for tool in [
-            "file_remove",
-            "mcp__approval__remove",
-            "plugin__approval__remove",
-        ] {
+        for tool in ["file_remove", "mcp__approval__remove"] {
             for child in [false, true] {
                 run_remove_approval_case(tool, child, Some("revoke_directory"));
             }
@@ -7949,11 +7911,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn project_copy_replaced_during_approval_prevents_builtin_and_external_side_effects() {
-        for tool in [
-            "file_remove",
-            "mcp__approval__remove",
-            "plugin__approval__remove",
-        ] {
+        for tool in ["file_remove", "mcp__approval__remove"] {
             for child in [false, true] {
                 run_remove_approval_case(tool, child, Some("replace_copy"));
             }
@@ -7967,7 +7925,7 @@ mod tests {
 
     #[test]
     fn mainline_and_child_external_tools_obey_approval_and_live_revocation() {
-        for tool_name in ["mcp__approval__remove", "plugin__approval__remove"] {
+        for tool_name in ["mcp__approval__remove"] {
             for child in [false, true] {
                 for outcome in [
                     None,
@@ -8073,31 +8031,9 @@ mod tests {
                     ..Default::default()
                 }
             }))
-            .with_external_mcp_tool_executor(Arc::new(move |_, _, arguments| mcp_remove(arguments)))
-            .with_plugin_tools(
-                Arc::new(|_| {
-                    vec![magi_tool_runtime::PluginToolCatalogEntry {
-                        plugin_id: "approval".into(),
-                        contribution_id: "remove".into(),
-                        model_tool_name: "plugin__approval__remove".into(),
-                        title: "Remove".into(),
-                        description: "Remove file".into(),
-                        read_only: false,
-                        input_schema: serde_json::json!({"type":"object"}),
-                    }]
-                }),
-                Arc::new(move |_, arguments, context| {
-                    assert_eq!(
-                        context.caller_scope,
-                        if child {
-                            magi_tool_runtime::ToolCallerScope::DelegatedTask
-                        } else {
-                            magi_tool_runtime::ToolCallerScope::SessionMainline
-                        }
-                    );
-                    execute_remove(arguments)
-                }),
-            );
+            .with_external_mcp_tool_executor(Arc::new(move |_, _, arguments| {
+                mcp_remove(arguments)
+            }));
         let mut task = coordinator_task(test_task("task-file-remove", "task-file-remove", None));
         if child {
             let mut parent = test_task("approval-parent", "approval-parent", None);

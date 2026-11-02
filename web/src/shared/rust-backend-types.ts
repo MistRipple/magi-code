@@ -2,7 +2,7 @@
 // Source of truth for all DTO types returned by the Rust daemon HTTP API.
 // Formerly maintained in support/frontend-contract/src/contracts.ts.
 
-import type { AgentContinueParams, AgentTransferParams, AgentTransferTarget, PluginSelection, QueuedSessionTurn, SessionQueueSnapshot } from './app-server-protocol.generated';
+import type { AgentContinueParams, AgentTransferParams, AgentTransferTarget, QueuedSessionTurn, SessionQueueSnapshot } from './app-server-protocol.generated';
 
 export type EventCategory = 'Domain' | 'Audit' | 'Usage' | 'Projection' | 'System';
 
@@ -76,7 +76,6 @@ export interface SessionTurnRequestDto {
   }>;
   browserAnnotationRefs?: string[];
   browserNodeSelections?: SessionBrowserNodeSelectionDto[];
-  pluginSelections?: PluginSelection[];
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
   requestId?: string | null;

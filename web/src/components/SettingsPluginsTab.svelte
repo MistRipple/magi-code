@@ -28,7 +28,6 @@
   let address = $state('');
   let busy = $state(false);
   let message = $state('');
-  let now = $state(Date.now());
   let center = $state<PluginCenterProjection | null>(null);
   let centerUrl = $state('');
   let centerKeyId = $state('');
@@ -42,7 +41,6 @@
   /** 已通过准备阶段、等待用户确认的候选包；确认前不写入任何安装状态。 */
   let staged = $state<{ candidate: PluginCandidate; preview: PluginCandidatePreview } | null>(null);
   const plugins = $derived(list?.plugins ?? []);
-  const anyDraining = $derived(plugins.some((plugin) => plugin.draining.length > 0));
 
   async function refresh(): Promise<void> {
     const requestSeq = ++listRequestSeq;
@@ -98,16 +96,6 @@
   $effect(() => {
     void pluginRegistryRevision();
     void refresh().catch((error) => { message = describe(error); });
-  });
-
-  // 停用与升级会等待在途运行，期间持续读取 daemon 的排空状态并倒计时，而不是让界面静止。
-  $effect(() => {
-    if (!busy && !anyDraining) return;
-    const timer = window.setInterval(() => {
-      now = Date.now();
-      void refresh().catch(() => undefined);
-    }, 1000);
-    return () => window.clearInterval(timer);
   });
 
   /** 执行一次改变状态的操作并刷新 daemon 事实；成功由界面状态本身体现，只有失败才提示。 */
@@ -393,8 +381,6 @@
                     ><Icon name="warning" size={14} /></span>
                   {:else if entry.group === 'updatable'}
                     <Icon name="download" size={14} />
-                  {:else if item.status === 'working'}
-                    <Icon name="refresh" size={14} />
                   {:else if item.installed}
                     <Icon name="check-circle" size={14} />
                   {:else}
@@ -428,7 +414,6 @@
           {#key selected.id}
             <PluginDetailPane
               item={selected}
-              {now}
               {busy}
               onInstall={() => void installItem(selected)}
               onUpdateFromCenter={() => void updateFromCenter(selected)}
@@ -445,15 +430,6 @@
         {/if}
       </section>
     </div>
-
-    {#if list?.lifecycle}
-      <p class="settings-hint">
-        {i18n.t('settings.plugins.drainHint', {
-          drain: Math.round(list.lifecycle.drainTimeoutMs / 1000),
-          settle: Math.round(list.lifecycle.cancelSettleTimeoutMs / 1000),
-        })}
-      </p>
-    {/if}
   </div>
 </div>
 </div>

@@ -12,7 +12,6 @@
 
   interface Props {
     item: StoreItem;
-    now: number;
     busy: boolean;
     onInstall: () => void;
     onUpdateFromCenter: () => void;
@@ -24,17 +23,13 @@
     onOpenSettings: (tab: string) => void;
   }
   let {
-    item, now, busy, onInstall, onUpdateFromCenter, onUpgradeFile,
+    item, busy, onInstall, onUpdateFromCenter, onUpgradeFile,
     onUninstall, onActivate, onDeactivate, onDisable, onOpenSettings,
   }: Props = $props();
 
   interface ActivationRow {
-    state: 'active' | 'enabled' | 'draining' | 'cancelling' | 'upgrading' | 'off';
-    seconds: number;
+    state: 'active' | 'enabled' | 'off';
   }
-
-  /** 排空键 `*` 表示整个插件正在升级。 */
-  const UPGRADE_DRAIN_SCOPE = '*';
 
   const plugin = $derived(item.installed);
   const manifest = $derived<PluginManifest | null>(plugin?.manifest ?? null);
@@ -52,15 +47,11 @@
     return i18n.t(`settings.plugins.source.${installed.source.kind}`);
   }
 
-  /** 插件全局生效，只有一个启用状态；排空中的状态来自 daemon 的投影。 */
+  /** 插件全局生效，只有一个启用状态。 */
   function activationRow(installed: InstalledPluginProjection): ActivationRow {
-    const draining = installed.draining.find((entry) => entry.scope === APPLICATION_PLUGIN_SCOPE || entry.scope === UPGRADE_DRAIN_SCOPE);
-    const seconds = draining ? Math.max(0, Math.ceil((draining.deadlineMs - now) / 1000)) : 0;
-    if (draining?.scope === UPGRADE_DRAIN_SCOPE) return { state: 'upgrading', seconds };
-    if (draining) return { state: draining.phase, seconds };
-    if (installed.activeScopes.includes(APPLICATION_PLUGIN_SCOPE)) return { state: 'active', seconds };
-    if (installed.enabledScopes.includes(APPLICATION_PLUGIN_SCOPE)) return { state: 'enabled', seconds };
-    return { state: 'off', seconds };
+    if (installed.activeScopes.includes(APPLICATION_PLUGIN_SCOPE)) return { state: 'active' };
+    if (installed.enabledScopes.includes(APPLICATION_PLUGIN_SCOPE)) return { state: 'enabled' };
+    return { state: 'off' };
   }
 
   /** 受信扩展的宿主运行状态；只有声明了 extension 的插件才有这一行。 */
@@ -75,8 +66,6 @@
   }
 
   function stateText(row: ActivationRow): string {
-    if (row.state === 'draining') return i18n.t('settings.plugins.scopeState.draining', { seconds: row.seconds });
-    if (row.state === 'cancelling') return i18n.t('settings.plugins.scopeState.cancelling', { seconds: row.seconds });
     return i18n.t(`settings.plugins.scopeState.${row.state}`);
   }
 </script>
@@ -87,8 +76,7 @@
       <h3>{item.name}</h3>
       <span class="settings-chip">v{item.version}</span>
       {#if item.status === 'active'}<span class="settings-chip settings-chip--ok">{i18n.t('settings.plugins.status.active')}</span>
-      {:else if item.status === 'working'}<span class="settings-chip settings-chip--accent">{i18n.t('settings.plugins.status.working')}</span>
-      {:else if item.status === 'installed'}<span class="settings-chip">{i18n.t('settings.plugins.status.installed')}</span>
+            {:else if item.status === 'installed'}<span class="settings-chip">{i18n.t('settings.plugins.status.installed')}</span>
       {:else}<span class="settings-chip">{i18n.t('settings.plugins.status.notInstalled')}</span>{/if}
       {#if item.updatable}<span class="settings-chip settings-chip--accent">{i18n.t('settings.plugins.status.updatable')}</span>{/if}
     </div>
@@ -185,7 +173,7 @@
       <h4>{i18n.t('settings.plugins.scopes')}</h4>
       <div class="pane-scopes">
         <div class="pane-scope" data-testid="plugin-scope-row" data-scope={APPLICATION_PLUGIN_SCOPE} data-state={activation.state}>
-          <span class="settings-dot" class:settings-dot--ok={activation.state === 'active'} class:settings-dot--warn={activation.state === 'enabled'} class:settings-dot--busy={activation.state === 'draining' || activation.state === 'cancelling' || activation.state === 'upgrading'} aria-hidden="true"></span>
+          <span class="settings-dot" class:settings-dot--ok={activation.state === 'active'} class:settings-dot--warn={activation.state === 'enabled'} aria-hidden="true"></span>
           <div class="settings-row-copy">
             <span class="settings-row-title">{i18n.t('settings.plugins.scope.application')}</span>
             <span class="settings-row-desc">{stateText(activation)}</span>

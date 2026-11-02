@@ -3375,48 +3375,6 @@ await withGoldenViteServer(async (server) => {
   );
   messagesStore.clearRequestBinding('request-electron-reuse-1');
   messagesStore.clearRequestBinding('request-electron-reuse-2');
-  sessionTurnInterceptors.push(() => electronTurnResponse(3));
-  bridge.postMessage({
-    type: 'executeTask',
-    pluginCommandId: 'plugin/example/setup',
-    text: null,
-    requestId: 'request-plugin-command',
-    workspaceId: RACE_WORKSPACE_ID,
-    workspacePath: RACE_WORKSPACE_PATH,
-    sessionId: RACE_SESSION_ID,
-  });
-  await waitFor(
-    () => capturedTurnBodies.some((body) => body.requestId === 'request-plugin-command'),
-    '没有正文的插件配置命令也必须进入 canonical Turn 入口',
-  );
-  assert.equal(
-    capturedTurnBodies.find((body) => body.requestId === 'request-plugin-command').pluginCommandId,
-    'plugin/example/setup',
-    'Renderer Bridge 不得丢弃插件命令身份，否则配置会被当成模型对话',
-  );
-  messagesStore.clearRequestBinding('request-plugin-command');
-
-  sessionTurnInterceptors.push(() => electronTurnResponse(3));
-  bridge.postMessage({
-    type: 'executeTask',
-    text: null,
-    requestId: 'request-workflow-command',
-    workflowId: 'plugin/queue/workflow',
-    workspaceId: RACE_WORKSPACE_ID,
-    workspacePath: RACE_WORKSPACE_PATH,
-    sessionId: RACE_SESSION_ID,
-  });
-  await waitFor(
-    () => capturedTurnBodies.some((body) => body.requestId === 'request-workflow-command'),
-    '没有正文的工作流选择也必须进入 canonical Turn 入口',
-  );
-  assert.equal(
-    capturedTurnBodies.find((body) => body.requestId === 'request-workflow-command').workflowId,
-    'plugin/queue/workflow',
-    'Renderer Bridge 不得丢弃 workflowId，否则选择工作流会退化成普通对话',
-  );
-  messagesStore.clearRequestBinding('request-workflow-command');
-
   const externalApprovalEvents = [];
   const onExternalApproval = () => externalApprovalEvents.push(true);
   window.addEventListener('magi:mcp-approvals-changed', onExternalApproval);
@@ -3464,13 +3422,7 @@ await withGoldenViteServer(async (server) => {
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(messagesStore.messagesState.queuedMessages.length, 0, '旧服务端版本不能复活已消费输入');
 
-  const pluginSelection = {
-    pluginId: 'plugin-queue', resourceId: 'resource-queue', version: 3,
-    label: '选中资源', summary: '原始上下文摘要', selection: { ids: ['selected-1'] },
-  };
   const queueMetadata = [
-    { workflowId: 'plugin/queue/workflow', pluginSelections: [pluginSelection] },
-    { pluginCommandId: 'plugin/queue/command' },
     { interruptTurnId: 'turn-interrupted-queue', interruptionError: '资源尚未结算' },
   ];
   let metadataInboxRead = false;
@@ -3484,7 +3436,7 @@ await withGoldenViteServer(async (server) => {
       })) });
   });
   inboxEvent(20002);
-  await waitFor(() => metadataInboxRead && messagesStore.messagesState.queuedMessages.length === 3,
+  await waitFor(() => metadataInboxRead && messagesStore.messagesState.queuedMessages.length === 1,
     'Inbox metadata must pass through the real bridge projection');
   for (const [index, metadata] of queueMetadata.entries()) {
     const projected = messagesStore.messagesState.queuedMessages[index];

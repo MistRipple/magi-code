@@ -1476,7 +1476,6 @@ pub struct ApiState {
     /// 插件安装、授权和生命周期的唯一 daemon 领域服务。
     pub plugin_manager: Arc<Mutex<magi_plugin_system::PluginManager>>,
     /// 升级时执行插件数据格式转换的 Worker 执行者；未装配时需要转换的升级被拒绝。
-    pub plugin_data_migrator: Option<Arc<dyn magi_plugin_system::PluginDataMigrator>>,
     pub(crate) mcp_service: Arc<crate::mcp_runtime::McpServiceRuntime>,
     pub snapshot_manager: Arc<SnapshotManager>,
     pub conversation_registry: Arc<ConversationRegistry>,
@@ -2239,7 +2238,6 @@ impl ApiState {
                 )))
                 .expect("in-memory ApiState plugin manager should initialize"),
             )),
-            plugin_data_migrator: None,
             mcp_service: Arc::new(crate::mcp_runtime::McpServiceRuntime::in_memory()),
             snapshot_manager: Arc::new(SnapshotManager::new()),
             conversation_registry,
@@ -2562,14 +2560,6 @@ impl ApiState {
         if let Some(runtime) = self.skill_runtime.clone() {
             self = self.with_skill_runtime(runtime);
         }
-        self
-    }
-
-    pub fn with_plugin_data_migrator(
-        mut self,
-        migrator: Arc<dyn magi_plugin_system::PluginDataMigrator>,
-    ) -> Self {
-        self.plugin_data_migrator = Some(migrator);
         self
     }
 
@@ -5850,20 +5840,6 @@ fn normalize_public_mcp_tool_catalog_json(raw: &serde_json::Value) -> serde_json
     item
 }
 
-fn normalize_public_plugin_tool_catalog_json(raw: &serde_json::Value) -> serde_json::Value {
-    let mut item = serde_json::json!({
-        "pluginId": raw.get("plugin_id"),
-        "contributionId": raw.get("contribution_id"),
-        "modelToolName": raw.get("model_tool_name"),
-        "title": raw.get("title"),
-        "description": raw.get("description"),
-        "readOnly": raw.get("read_only"),
-        "inputSchema": raw.get("input_schema"),
-    });
-    project_tool_availability_fields(raw, &mut item);
-    item
-}
-
 fn normalize_public_agent_role_catalog_json(raw: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "roleId": raw.get("role_id").cloned().unwrap_or(serde_json::Value::Null),
@@ -5921,7 +5897,6 @@ fn public_tool_catalog_response_json(raw: &serde_json::Value) -> serde_json::Val
         "skillTools": public_tool_catalog_array(raw, "skill_tools", normalize_public_skill_tool_json),
         "mcpServers": public_tool_catalog_array(raw, "mcp_servers", normalize_public_mcp_server_catalog_json),
         "mcpTools": public_tool_catalog_array(raw, "mcp_tools", normalize_public_mcp_tool_catalog_json),
-        "pluginTools": public_tool_catalog_array(raw, "plugin_tools", normalize_public_plugin_tool_catalog_json),
         "agentRoles": public_tool_catalog_array(raw, "agent_roles", normalize_public_agent_role_catalog_json),
     })
 }
@@ -6330,7 +6305,6 @@ mod tests {
                 context_references: Vec::new(),
                 browser_annotation_refs: Vec::new(),
                 browser_node_selections: Vec::new(),
-                plugin_selections: Vec::new(),
                 access_profile: None,
                 orchestrator_session_config: None,
                 request_id: Some(format!("request-{queue_id}")),
@@ -6341,8 +6315,6 @@ mod tests {
                 replace_turn_id: None,
                 interrupt_turn_id: None,
                 command: None,
-                workflow_id: None,
-                plugin_command_id: None,
             },
             request_fingerprint: None,
             requested_workspace_id: Some(workspace_id.clone()),
@@ -9400,13 +9372,6 @@ mod tests {
                 "reason_code": "tool_explicitly_denied",
                 "input_schema": {"type": "object", "properties": {}}
             }],
-            "plugin_tools": [{
-                "plugin_id":"acme.tools", "contribution_id":"inspect",
-                "model_tool_name":"plugin__acme.tools__inspect", "title":"Inspect",
-                "description":"Inspect", "read_only":false,
-                "input_schema":{"type":"object"},
-                "model_available":true, "availability":"needs_approval", "reason_code":null
-            }],
             "agent_roles": [{
                 "role_id": "executor",
                 "spawnable": true,
@@ -9457,12 +9422,6 @@ mod tests {
             public["mcpTools"][0]["reasonCode"],
             "tool_explicitly_denied"
         );
-        assert_eq!(
-            public["pluginTools"][0]["modelToolName"],
-            "plugin__acme.tools__inspect"
-        );
-        assert_eq!(public["pluginTools"][0]["availability"], "needs_approval");
-        assert_eq!(public["pluginTools"][0]["modelAvailable"], true);
         assert_eq!(public["agentRoles"][0]["roleId"], "executor");
         assert_eq!(public["agentRoles"][0]["parallelismLimit"], 2);
     }

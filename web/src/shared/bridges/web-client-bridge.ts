@@ -24,7 +24,7 @@ import {
 import { PLUGIN_REGISTRY_CHANGED_EVENT } from '../../web/plugin-api';
 import { i18n } from '../../stores/i18n.svelte';
 import { DEFAULT_LOCALE, isSupportedLocale } from '../../i18n/locales';
-import type { PluginSelection, SessionTurnCommand, TurnStartParams } from '../app-server-protocol.generated';
+import type { SessionTurnCommand, TurnStartParams } from '../app-server-protocol.generated';
 import { getHostApi, getTransport, initTransport } from '../transport';
 import {
   approveAgentChange,
@@ -4040,8 +4040,6 @@ interface ExecuteTaskInput {
   /** 用户点击“继续”恢复被中断或可恢复的执行。 */
   resume?: boolean;
   command?: SessionTurnCommand | null;
-  workflowId?: string | null;
-  pluginCommandId?: string | null;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
   replaceTurnId?: string | null;
@@ -4059,7 +4057,6 @@ interface ExecuteTaskInput {
   }>;
   browserAnnotationRefs?: string[];
   browserNodeSelections?: MessageBrowserNodeSelection[];
-  pluginSelections?: PluginSelection[];
 }
 
 function bridgeRuntimeIsBusy(): boolean {
@@ -4086,8 +4083,6 @@ function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
     sessionId: turn.sessionId,
     createdAt: turn.acceptedAt,
     command: turn.command === 'compact' ? 'compact' : null,
-    workflowId: turn.workflowId ?? null,
-    pluginCommandId: turn.pluginCommandId ?? null,
     skillName: turn.skillName ?? null,
     goalMode: turn.goalMode === true,
     accessProfile: turn.accessProfile ?? null,
@@ -4095,7 +4090,6 @@ function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
     contextReferences: turn.contextReferences.map(reference => ({ ...reference, pathRef: reference.pathRef ?? undefined, sourceFolderId: reference.sourceFolderId ?? undefined })),
     browserAnnotationRefs: turn.browserAnnotationRefs,
     browserNodeSelections: turn.browserNodeSelections,
-    pluginSelections: turn.pluginSelections ?? [],
     guide: turn.guide,
     interruptTurnId: turn.interruptTurnId,
     interruptionError: turn.interruptionError,
@@ -4318,23 +4312,8 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       }))
       .filter((selection) => selection.browserSessionId && selection.tabId && selection.surfaceId)
     : [];
-  const pluginSelections = Array.isArray(input.pluginSelections)
-    ? input.pluginSelections.filter((selection) => (
-      Boolean(selection)
-      && typeof selection.pluginId === 'string' && selection.pluginId.trim().length > 0
-      && typeof selection.resourceId === 'string' && selection.resourceId.trim().length > 0
-      && typeof selection.version === 'number'
-      && typeof selection.label === 'string' && selection.label.trim().length > 0
-    )).map((selection) => ({ ...selection }))
-    : [];
   const command = input.command === 'compact' ? input.command : null;
-  const workflowId = typeof input.workflowId === 'string' && input.workflowId.trim()
-    ? input.workflowId.trim()
-    : null;
-  const pluginCommandId = typeof input.pluginCommandId === 'string' && input.pluginCommandId.trim()
-    ? input.pluginCommandId.trim()
-    : null;
-  if (!command && !workflowId && !pluginCommandId && !normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0 && browserNodeSelections.length === 0 && pluginSelections.length === 0) {
+  if (!command && !normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0 && browserNodeSelections.length === 0) {
     return false;
   }
   const requestId = trimBridgeString(input.requestId) || generateMessageId();
@@ -4392,8 +4371,6 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       ...(skillName ? { skillName } : {}),
       ...(input.goalMode === true ? { goalMode: true } : {}),
       ...(command ? { sessionCommand: command } : {}),
-      ...(workflowId ? { workflowId } : {}),
-      ...(pluginCommandId ? { pluginCommandId } : {}),
     },
   };
   beginLocalTurnSubmission({
@@ -4422,13 +4399,10 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       goalMode: input.goalMode === true,
       resume: input.resume === true,
       command,
-      workflowId,
-      pluginCommandId,
       images,
       contextReferences,
       browserAnnotationRefs,
       browserNodeSelections,
-      pluginSelections,
       accessProfile: input.accessProfile ?? null,
       orchestratorSessionConfig: input.orchestratorSessionConfig ?? null,
       requestId,
@@ -5680,9 +5654,6 @@ export function createWebClientBridge(): ClientBridge {
             || (Array.isArray(message.contextReferences) && message.contextReferences.length > 0)
             || (Array.isArray(message.browserAnnotationRefs) && message.browserAnnotationRefs.length > 0)
             || (Array.isArray(message.browserNodeSelections) && message.browserNodeSelections.length > 0)
-            || (Array.isArray(message.pluginSelections) && message.pluginSelections.length > 0)
-            || (typeof message.workflowId === 'string' && message.workflowId.trim())
-            || (typeof message.pluginCommandId === 'string' && message.pluginCommandId.trim())
             || message.command === 'compact'
           ) {
             void executeTask({
@@ -5695,8 +5666,6 @@ export function createWebClientBridge(): ClientBridge {
               skillName: typeof message.skillName === 'string' ? message.skillName : null,
               goalMode: message.goalMode === true,
               command: message.command === 'compact' ? 'compact' : null,
-              workflowId: typeof message.workflowId === 'string' ? message.workflowId : null,
-              pluginCommandId: typeof message.pluginCommandId === 'string' ? message.pluginCommandId : null,
               accessProfile: message.accessProfile === 'read_only'
                 || message.accessProfile === 'restricted'
                 || message.accessProfile === 'full_access'
@@ -5726,9 +5695,6 @@ export function createWebClientBridge(): ClientBridge {
                 : [],
               browserNodeSelections: Array.isArray(message.browserNodeSelections)
                 ? message.browserNodeSelections as MessageBrowserNodeSelection[]
-                : [],
-              pluginSelections: Array.isArray(message.pluginSelections)
-                ? message.pluginSelections as PluginSelection[]
                 : [],
             });
           }

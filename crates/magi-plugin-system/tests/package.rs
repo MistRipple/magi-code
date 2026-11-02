@@ -5,10 +5,9 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 
 fn manifest() -> Value {
     json!({
-        "sdkVersion":1,"id":"acme.dashboard","version":"1.0.0","name":"Dashboard","description":"",
-        "backend":"plugin.mjs","permissions":[],"dataSchemaVersion":1,
+        "sdkVersion":2,"id":"acme.dashboard","version":"1.0.0","name":"Dashboard","description":"", "permissions":[],"dataSchemaVersion":1,
         "settingsSchema":{"type":"object","additionalProperties":false},
-        "contributions":{"commands":[{"id":"open","title":"Open","description":""}],"views":[{"id":"dashboard","title":"Dashboard","entry":"ui/index.html","placements":["rightPane","main"]}]}
+        "contributions":{"resources":[{"id":"open","title":"Open","description":""}],"views":[{"id":"dashboard","title":"Dashboard","entry":"ui/index.html","placements":["rightPane","main"]}]}
     })
 }
 
@@ -16,7 +15,6 @@ fn archive(manifest: &Value, extra: &[(&str, &[u8])]) -> Vec<u8> {
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     for (name, bytes) in [
         ("manifest.json", serde_json::to_vec(manifest).unwrap()),
-        ("plugin.mjs", b"export default (input) => input".to_vec()),
         ("ui/index.html", b"<!doctype html><p>dashboard</p>".to_vec()),
     ] {
         writer
@@ -39,7 +37,6 @@ fn source_views_and_manifest_come_from_one_immutable_validated_package() {
     let package = PluginPackage::from_archive(&bytes).unwrap();
     assert_eq!(package.manifest().id, "acme.dashboard");
     assert_eq!(package.digest().len(), 64);
-    assert_eq!(package.source(), "export default (input) => input");
     assert!(package.files().contains_key("ui/index.html"));
     assert_eq!(
         PluginPackage::from_archive(&bytes).unwrap().digest(),
@@ -48,13 +45,14 @@ fn source_views_and_manifest_come_from_one_immutable_validated_package() {
 }
 
 #[test]
-fn bundled_manifest_uses_the_same_archive_validation_path() {
-    let mut value = manifest();
-    value["contributions"]["views"] = json!([]);
-    let typed = serde_json::from_value(value).unwrap();
-    let package = PluginPackage::from_manifest_and_source(typed, "export default input").unwrap();
-    assert_eq!(package.manifest().id, "acme.dashboard");
-    assert_eq!(package.source(), "export default input");
+fn sdk_one_packages_are_rejected_with_an_explicit_reason() {
+    for (field, value) in [("sdkVersion", json!(1)), ("backend", json!("plugin.mjs"))] {
+        let mut m = manifest();
+        m[field] = value;
+        let error = PluginPackage::from_archive(&archive(&m, &[("plugin.mjs", b"x")]))
+            .expect_err("SDK 1 必须被拒绝");
+        assert!(error.to_string().contains("SDK 1"), "{field}: {error}");
+    }
 }
 
 #[test]
@@ -78,8 +76,7 @@ fn malicious_archive_paths_and_native_payloads_are_rejected() {
 fn undeclared_schema_versions_fields_and_contribution_conflicts_are_rejected() {
     let original = manifest();
     for (field, value) in [
-        ("sdkVersion", json!(2)),
-        ("backend", json!("plugin.wasm")),
+        ("sdkVersion", json!(3)),
         ("unknownField", json!(true)),
         ("id", json!("../escape")),
         ("version", json!("latest")),
@@ -218,7 +215,6 @@ fn settings_form_keeps_the_field_order_the_author_wrote() {
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     for (name, bytes) in [
         ("manifest.json", raw.as_bytes()),
-        ("plugin.mjs", b"export default (input) => input".as_slice()),
         (
             "ui/index.html",
             b"<!doctype html><p>dashboard</p>".as_slice(),
@@ -280,7 +276,7 @@ fn extension_archive(manifest: &Value, files: &[(&str, &[u8])]) -> Vec<u8> {
 
 fn extension_manifest() -> Value {
     json!({
-        "sdkVersion":1,"id":"acme.guard","version":"1.0.0","name":"Guard","description":"",
+        "sdkVersion":2,"id":"acme.guard","version":"1.0.0","name":"Guard","description":"",
         "extension":{"hooks":[{"name":"tool.call","mode":"guard","deadlineMs":3000}]},
         "permissions":[{"kind":"extension","scope":"application","targets":["full-trust"]}],
         "dataSchemaVersion":1,
@@ -295,7 +291,7 @@ const ENTRY: &[(&str, &[u8])] = &[("extension/index.mjs", b"export default async
 fn node_extension_packages_carry_hooks_trust_and_a_single_bundled_entry() {
     let package =
         PluginPackage::from_archive(&extension_archive(&extension_manifest(), ENTRY)).unwrap();
-    assert!(package.manifest().backend.is_none());
+    assert!(package.manifest().extension.is_some());
     assert_eq!(
         package.extension_entry(),
         Some(&b"export default async () => {}"[..])
@@ -316,12 +312,12 @@ fn node_extension_packages_reject_every_ambiguous_or_unsupported_shape() {
     reject(
         |_| {},
         &[ENTRY[0], ("plugin.mjs", b"x")],
-        "不得同时携带 QuickJS 后台",
+        "不得携带 SDK 1 后台入口",
     );
     reject(
         |m| m["backend"] = "plugin.mjs".into(),
-        &[ENTRY[0], ("plugin.mjs", b"x")],
-        "不得同时声明两种后台",
+        ENTRY,
+        "不得声明 SDK 1 后台",
     );
     reject(
         |m| m["permissions"] = json!([]),
@@ -346,11 +342,6 @@ fn node_extension_packages_reject_every_ambiguous_or_unsupported_shape() {
         },
         ENTRY,
         "钩子重复",
-    );
-    reject(
-        |m| m["contributions"] = json!({"tools":[{"id":"t","title":"T","description":"","inputSchema":{"type":"object"}}]}),
-        ENTRY,
-        "Node 暂不支持工具贡献",
     );
     reject(
         |m| m["extension"]["hooks"] = json!([{"name":"model.request","mode":"advise"}]),

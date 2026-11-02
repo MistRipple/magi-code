@@ -23,34 +23,6 @@ pub struct PluginPackage {
 }
 
 impl PluginPackage {
-    /// 为随 Magi 发布的第一方插件生成同一 ZIP 合同的不可变包。
-    ///
-    /// 第一方插件也必须经过与用户包完全相同的解析、schema 校验和摘要流程，
-    /// 不能另建一条“内置包直接注册”的执行路径。
-    pub fn from_manifest_and_source(
-        manifest: PluginManifest,
-        source: &str,
-    ) -> Result<Self, PluginError> {
-        use std::io::Write;
-        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        let options = zip::write::SimpleFileOptions::default();
-        writer
-            .start_file("manifest.json", options)
-            .map_err(|_| invalid("内置插件包生成失败"))?;
-        writer.write_all(
-            &serde_json::to_vec(&manifest).map_err(|_| invalid("插件清单序列化失败"))?,
-        )?;
-        writer
-            .start_file("plugin.mjs", options)
-            .map_err(|_| invalid("内置插件包生成失败"))?;
-        writer.write_all(source.as_bytes())?;
-        let bytes = writer
-            .finish()
-            .map_err(|_| invalid("内置插件包生成失败"))?
-            .into_inner();
-        Self::from_archive(&bytes)
-    }
-
     pub fn from_archive(bytes: &[u8]) -> Result<Self, PluginError> {
         if bytes.is_empty() || bytes.len() > MAX_PACKAGE_BYTES {
             return Err(invalid("发布包大小超限"));
@@ -102,38 +74,16 @@ impl PluginPackage {
         let manifest_bytes = files
             .get("manifest.json")
             .ok_or_else(|| invalid("缺少 manifest.json"))?;
+        reject_removed_sdk(manifest_bytes)?;
         let mut manifest: PluginManifest = serde_json::from_slice(manifest_bytes)
             .map_err(|_| invalid("manifest.json 不符合插件合同"))?;
         validate_manifest(&manifest)?;
         annotate_settings_order(&mut manifest, manifest_bytes);
-        match (&manifest.backend, &manifest.extension) {
-            (Some(_), Some(_)) => {
-                return Err(invalid("插件不能同时声明 QuickJS 后台与 Node 扩展"));
-            }
-            (None, None) => {
-                return Err(invalid(
-                    "插件必须声明后台（backend）或 Node 扩展（extension）",
-                ));
-            }
-            (Some(_), None) => {
-                let source = files
-                    .get("plugin.mjs")
-                    .ok_or_else(|| invalid("缺少 plugin.mjs"))?;
-                if source.len() > 512 * 1024 {
-                    return Err(invalid("后台 ESM bundle 超过 512KiB"));
-                }
-                if files.contains_key("extension/index.mjs") {
-                    return Err(invalid("声明 backend 的包不得携带 extension/index.mjs"));
-                }
-            }
-            (None, Some(_)) => {
-                if !files.contains_key("extension/index.mjs") {
-                    return Err(invalid("缺少 extension/index.mjs"));
-                }
-                if files.contains_key("plugin.mjs") {
-                    return Err(invalid("声明 extension 的包不得携带 plugin.mjs"));
-                }
-            }
+        // 声明 extension 的包必须携带入口；纯声明式包（技能、视图、资源、浏览器 surface）不携带任何可执行文件。
+        if manifest.extension.is_some() != files.contains_key("extension/index.mjs") {
+            return Err(invalid(
+                "extension 声明与 extension/index.mjs 必须同时存在或同时缺失",
+            ));
         }
         for view in &manifest.contributions.views {
             if !valid_path(&view.entry)
@@ -164,12 +114,6 @@ impl PluginPackage {
     pub(crate) fn archive_bytes(&self) -> &[u8] {
         &self.archive
     }
-    /// QuickJS 后台源码。Node 扩展包没有 `plugin.mjs`，且校验阶段已禁止它声明任何由 QuickJS 执行的贡献。
-    pub fn source(&self) -> &str {
-        // from_archive 已验证固定入口存在且为 UTF-8；之后内容不可变。
-        std::str::from_utf8(&self.files["plugin.mjs"]).expect("validated plugin source")
-    }
-
     /// Node 扩展入口源码（`extension/index.mjs`）。仅声明了 `extension` 的包有。
     pub fn extension_entry(&self) -> Option<&[u8]> {
         self.manifest
@@ -177,6 +121,19 @@ impl PluginPackage {
             .as_ref()
             .and_then(|_| self.files.get("extension/index.mjs").map(Vec::as_slice))
     }
+}
+
+/// SDK 1（QuickJS 后台）已移除：给出明确原因，而不是笼统的“不符合插件合同”。
+fn reject_removed_sdk(manifest_bytes: &[u8]) -> Result<(), PluginError> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(manifest_bytes) else {
+        return Ok(());
+    };
+    let legacy = value.get("sdkVersion").and_then(|v| v.as_u64()) == Some(1)
+        || value.get("backend").is_some();
+    if legacy {
+        return Err(invalid(REMOVED_SDK_MESSAGE));
+    }
+    Ok(())
 }
 
 /// 设置表单按作者书写的顺序展示字段。JSON 对象在内存中按键排序，原始顺序会丢失，
@@ -231,7 +188,7 @@ fn annotate_settings_order(manifest: &mut PluginManifest, manifest_bytes: &[u8])
 }
 
 /// Node 扩展声明的规则：钩子必须在目录内、模式合法且不重复；必须有“完全信任”授权项；
-/// 不得声明由 QuickJS 执行的贡献或迁移（Node 的对应能力尚未提供，不静默降级）。
+///
 fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
     use magi_app_server_protocol::generated::PluginHookMode;
     use magi_extension_host::protocol::{HookMode, HookRegistration};
@@ -269,17 +226,6 @@ fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
             "声明 extension 的包必须声明权限 extension:[\"full-trust\"]，用户据此确认扩展以其用户权限运行",
         ));
     }
-    let c = &manifest.contributions;
-    if !(c.tools.is_empty()
-        && c.commands.is_empty()
-        && c.workflows.is_empty()
-        && c.engines.is_empty())
-        || manifest.data_migration.is_some()
-    {
-        return Err(invalid(
-            "Node 扩展暂不支持工具、命令、工作流、会话引擎或数据迁移贡献",
-        ));
-    }
     let mut seen = HashSet::new();
     for hook in &extension.hooks {
         let registration = HookRegistration {
@@ -315,7 +261,7 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
     if !validator.is_valid(&serialized) {
         return Err(invalid("插件清单违反版本、字段或大小合同"));
     }
-    if manifest.sdk_version != 1 || manifest.data_schema_version < 1 {
+    if manifest.sdk_version != 2 || manifest.data_schema_version < 1 {
         return Err(invalid("仅支持 SDK 1，数据格式版本必须为正整数"));
     }
     if manifest.id.len() > 96
@@ -331,18 +277,6 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
         || manifest.description.len() > 4096
     {
         return Err(invalid("插件版本、名称或说明无效"));
-    }
-    if let Some(migration) = &manifest.data_migration {
-        let mut seen = HashSet::new();
-        if migration
-            .from_versions
-            .iter()
-            .any(|from| *from < 1 || *from >= manifest.data_schema_version || !seen.insert(*from))
-        {
-            return Err(invalid(
-                "dataMigration.fromVersions 必须是互不相同且小于当前数据格式版本的版本号",
-            ));
-        }
     }
     validate_extension(manifest)?;
     let mut permissions = HashSet::new();
@@ -386,10 +320,6 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
         if skill.instruction.trim().is_empty() || skill.instruction.len() > 65_536 {
             return Err(invalid("Skill 说明为空或超出上限"));
         }
-    }
-    for tool in &c.tools {
-        check(&tool.id, &tool.title, &tool.description)?;
-        validate_object_schema(&tool.input_schema)?;
     }
     for view in &c.views {
         check(&view.id, &view.title, "")?;
@@ -440,13 +370,7 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
             return Err(invalid("浏览器 surface 必须声明对应作用域的 browser 权限"));
         }
     }
-    for item in c
-        .commands
-        .iter()
-        .chain(&c.workflows)
-        .chain(&c.engines)
-        .chain(&c.resources)
-    {
+    for item in &c.resources {
         check(&item.id, &item.title, &item.description)?;
     }
     // 只开关宿主能力的第一方插件（如 MCP 服务）没有贡献，但必须声明它所需的权限。
@@ -543,11 +467,16 @@ fn valid_path(path: &str) -> bool {
         })
 }
 
+const REMOVED_SDK_MESSAGE: &str =
+    "该插件使用已移除的 SDK 1（QuickJS 后台）；请改用声明 extension 的 SDK 2（Node 扩展）重新打包";
+
 fn validate_file(name: &str, bytes: &[u8]) -> Result<(), PluginError> {
+    if name == "plugin.mjs" {
+        return Err(invalid(REMOVED_SDK_MESSAGE));
+    }
     let extension = name.rsplit('.').next().unwrap_or("");
     let text = matches!(extension, "html" | "css" | "js" | "mjs" | "json" | "svg");
     if name != "manifest.json"
-        && name != "plugin.mjs"
         && name != "extension/index.mjs"
         && (!name.starts_with("ui/")
             || !matches!(

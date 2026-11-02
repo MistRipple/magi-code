@@ -70,31 +70,13 @@
     send({ type: 'response', requestId, ok: true });
   }
 
-  /**
-   * 视图把用户选中的对象交给宿主：只携带资源、版本、名称和简短摘要。插件身份来自本视图实例，
-   * 不采信消息里自报的插件；是否合法由 daemon 在提交时按作用域和授权再次校验。
-   */
-  function selectContext(data: Record<string, unknown>): void {
-    const resourceId = typeof data.resourceId === 'string' ? data.resourceId.trim() : '';
-    const label = typeof data.label === 'string' ? data.label.trim() : '';
-    if (!resourceId || resourceId.length > 64 || !label || label.length > 128 || typeof data.version !== 'number' || !Number.isSafeInteger(data.version) || data.version < 0) {
-      throw new Error('插件选择需要有效的资源、版本和名称');
-    }
-    const summary = typeof data.summary === 'string' ? data.summary.trim().slice(0, 1024) : '';
-    const selection = data.selection === undefined ? null : data.selection;
-    if (JSON.stringify(selection).length > 4096) throw new Error('插件选中对象超过大小上限');
-    window.dispatchEvent(new CustomEvent('magi:pluginSelectionAdded', {
-      detail: { pluginId, resourceId, version: data.version, label, summary, selection },
-    }));
-  }
-
   async function handleMessage(event: MessageEvent): Promise<void> {
     if ((event.origin !== resourceOrigin && event.origin !== 'null')
       || event.source !== iframe?.contentWindow || !event.data || event.data.channel !== 'magi-plugin-v1'
       || event.data.instanceId !== instanceId || event.data.type !== 'request') return;
     const requestId = typeof event.data.requestId === 'string' ? event.data.requestId : '';
     const operation = event.data.operation;
-    if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write', 'context.select'].includes(operation)) return;
+    if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write'].includes(operation)) return;
     try {
       const resourceId = typeof event.data.resourceId === 'string' ? event.data.resourceId : '';
       if (operation.startsWith('resource.') && (!resourceId || resourceId.length > 256)) {
@@ -102,11 +84,6 @@
       }
       if (operation.endsWith('.write') && JSON.stringify(event.data.value ?? null).length > MAX_WRITE_BYTES) {
         throw new Error('插件写入内容超过大小上限');
-      }
-      if (operation === 'context.select') {
-        selectContext(event.data);
-        send({ type: 'response', requestId, ok: true });
-        return;
       }
       if (operation === 'resource.subscribe') {
         handleResourceSubscriptionRequest(requestId, resourceId);

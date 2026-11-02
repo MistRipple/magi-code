@@ -2,8 +2,7 @@ use crate::{
     AgentRoleCatalogProvider, BrowserCapabilityProvider, BrowserToolExecutor, BuiltinTool,
     BuiltinToolAccessMode, BuiltinToolName, BuiltinToolSpec, ExternalMcpToolExecutor,
     ExternalToolCatalogProvider, ExternalToolCatalogSnapshot, GitToolExecutor,
-    ImageGenerationExecutor, ImageGenerationReadinessProvider, PluginToolCatalogEntry,
-    PluginToolCatalogProvider, PluginToolExecutor, RuntimeCapabilityDependencyProvider,
+    ImageGenerationExecutor, ImageGenerationReadinessProvider, RuntimeCapabilityDependencyProvider,
     ToolExecutionContext, ToolExecutionContextQuery, ToolExecutionInput, ToolExecutionOutput,
     ToolExecutionPolicy, ToolExecutionProgress, ToolExecutionSummary, ToolInvocationRecord,
     ToolRuntimeResources,
@@ -80,53 +79,6 @@ impl ToolRegistry {
     /// 尚未完成时提前返回 schema，因此不能把“有目录”误当成“可执行”。
     pub fn external_mcp_tool_executor_available(&self) -> bool {
         self.runtime_resources.external_mcp_tool_executor.is_some()
-    }
-
-    pub fn with_plugin_tools(
-        mut self,
-        provider: PluginToolCatalogProvider,
-        executor: PluginToolExecutor,
-    ) -> Self {
-        self.runtime_resources.plugin_tool_catalog_provider = Some(provider);
-        self.runtime_resources.plugin_tool_executor = Some(executor);
-        self
-    }
-
-    pub fn plugin_tool_catalog(
-        &self,
-        workspace_id: Option<&magi_core::WorkspaceId>,
-    ) -> Vec<PluginToolCatalogEntry> {
-        self.runtime_resources
-            .plugin_tool_catalog_provider
-            .as_ref()
-            .map(|provider| provider(workspace_id))
-            .unwrap_or_default()
-    }
-
-    pub fn execute_plugin_tool(
-        &self,
-        model_tool_name: &str,
-        arguments: &str,
-        context: &ToolExecutionContext,
-        access_profile: AccessProfile,
-    ) -> Option<(String, ExecutionResultStatus)> {
-        let entry = self
-            .plugin_tool_catalog(context.workspace_id.as_ref())
-            .into_iter()
-            .find(|entry| entry.model_tool_name == model_tool_name)?;
-        if let Some(result) = external_tool_access_rejection(
-            model_tool_name,
-            entry.read_only,
-            access_profile,
-            "plugin",
-            "插件",
-        ) {
-            return Some(result);
-        }
-        self.runtime_resources
-            .plugin_tool_executor
-            .as_ref()
-            .map(|executor| executor(&entry.model_tool_name, arguments, context))
     }
 
     pub fn external_tool_catalog_snapshot(&self) -> ExternalToolCatalogSnapshot {

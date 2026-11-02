@@ -557,51 +557,6 @@
         }
       }
     },
-    "PluginSelection": {
-      "type": "object",
-      "additionalProperties": false,
-      "description": "用户在插件视图中选中的对象引用。只描述插件、资源、版本和简短摘要，不携带整页内容；由 daemon 按作用域校验后进入统一上下文装配。",
-      "required": [
-        "pluginId",
-        "resourceId",
-        "version",
-        "label",
-        "summary"
-      ],
-      "properties": {
-        "pluginId": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 96
-        },
-        "resourceId": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 64
-        },
-        "version": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991,
-          "x-rust-type": "u64"
-        },
-        "label": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128
-        },
-        "summary": {
-          "type": "string",
-          "maxLength": 1024
-        },
-        "selection": {
-          "$ref": "#/$defs/JsonValue",
-          "x-rust-type": "Option<Value>",
-          "x-ts-type": "JsonValue | null",
-          "x-rust-default": true
-        }
-      }
-    },
     "BrowserNodeSelection": {
       "type": "object",
       "additionalProperties": false,
@@ -804,24 +759,6 @@
           ],
           "x-rust-default": true
         },
-        "workflowId": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "minLength": 1,
-          "maxLength": 192,
-          "x-rust-default": true
-        },
-        "pluginCommandId": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "minLength": 1,
-          "maxLength": 192,
-          "x-rust-default": true
-        },
         "images": {
           "type": "array",
           "items": {
@@ -913,15 +850,6 @@
             "string",
             "null"
           ]
-        },
-        "pluginSelections": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PluginSelection"
-          },
-          "maxItems": 8,
-          "default": [],
-          "x-rust-default": true
         },
         "interruptTurnId": {
           "type": [
@@ -2348,37 +2276,6 @@
         }
       }
     },
-    "PluginToolContribution": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "id",
-        "title",
-        "description",
-        "inputSchema",
-        "readOnly"
-      ],
-      "properties": {
-        "id": {
-          "type": "string",
-          "maxLength": 64
-        },
-        "title": {
-          "type": "string",
-          "maxLength": 128
-        },
-        "description": {
-          "type": "string",
-          "maxLength": 4096
-        },
-        "inputSchema": {
-          "type": "object"
-        },
-        "readOnly": {
-          "type": "boolean"
-        }
-      }
-    },
     "PluginSkillContribution": {
       "type": "object",
       "additionalProperties": false,
@@ -2543,38 +2440,10 @@
           "maxItems": 32,
           "x-rust-default": true
         },
-        "tools": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PluginToolContribution"
-          },
-          "x-rust-default": true
-        },
-        "commands": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PluginNamedContribution"
-          },
-          "x-rust-default": true
-        },
         "views": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/PluginViewContribution"
-          },
-          "x-rust-default": true
-        },
-        "workflows": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PluginNamedContribution"
-          },
-          "x-rust-default": true
-        },
-        "engines": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PluginNamedContribution"
           },
           "x-rust-default": true
         },
@@ -2593,12 +2462,6 @@
           "x-rust-default": true
         }
       }
-    },
-    "PluginBackendEntry": {
-      "type": "string",
-      "enum": [
-        "plugin.mjs"
-      ]
     },
     "PluginHookMode": {
       "type": "string",
@@ -2652,24 +2515,6 @@
         }
       }
     },
-    "PluginDataMigration": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "fromVersions"
-      ],
-      "properties": {
-        "fromVersions": {
-          "type": "array",
-          "items": {
-            "type": "integer",
-            "minimum": 1
-          },
-          "minItems": 1,
-          "maxItems": 8
-        }
-      }
-    },
     "PluginManifest": {
       "type": "object",
       "additionalProperties": false,
@@ -2687,8 +2532,8 @@
       "properties": {
         "sdkVersion": {
           "type": "integer",
-          "minimum": 1,
-          "maximum": 1
+          "minimum": 2,
+          "maximum": 2
         },
         "id": {
           "type": "string",
@@ -2707,9 +2552,6 @@
         "description": {
           "type": "string",
           "maxLength": 4096
-        },
-        "backend": {
-          "$ref": "#/$defs/PluginBackendEntry"
         },
         "extension": {
           "$ref": "#/$defs/PluginExtension"
@@ -2730,9 +2572,6 @@
         "dataSchemaVersion": {
           "type": "integer",
           "minimum": 1
-        },
-        "dataMigration": {
-          "$ref": "#/$defs/PluginDataMigration"
         }
       }
     },
@@ -2906,65 +2745,6 @@
         }
       }
     },
-    "PluginDrainPhase": {
-      "type": "string",
-      "enum": [
-        "draining",
-        "cancelling"
-      ]
-    },
-    "PluginDrainingScope": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "scope",
-        "phase",
-        "startedAtMs",
-        "deadlineMs"
-      ],
-      "properties": {
-        "scope": {
-          "type": "string"
-        },
-        "phase": {
-          "$ref": "#/$defs/PluginDrainPhase"
-        },
-        "startedAtMs": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991,
-          "x-rust-type": "u64"
-        },
-        "deadlineMs": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991,
-          "x-rust-type": "u64"
-        }
-      }
-    },
-    "PluginLifecycleLimits": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "drainTimeoutMs",
-        "cancelSettleTimeoutMs"
-      ],
-      "properties": {
-        "drainTimeoutMs": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991,
-          "x-rust-type": "u64"
-        },
-        "cancelSettleTimeoutMs": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991,
-          "x-rust-type": "u64"
-        }
-      }
-    },
     "PluginInstalled": {
       "type": "object",
       "additionalProperties": false,
@@ -2974,8 +2754,7 @@
         "enabledScopes",
         "activeScopes",
         "grants",
-        "source",
-        "draining"
+        "source"
       ],
       "properties": {
         "manifest": {
@@ -3004,12 +2783,6 @@
         },
         "source": {
           "$ref": "#/$defs/PluginSourceProjection"
-        },
-        "draining": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PluginDrainingScope"
-          }
         },
         "runtime": {
           "$ref": "#/$defs/PluginRuntimeStatus"
@@ -3071,8 +2844,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "plugins",
-        "lifecycle"
+        "plugins"
       ],
       "properties": {
         "plugins": {
@@ -3080,9 +2852,6 @@
           "items": {
             "$ref": "#/$defs/PluginInstalled"
           }
-        },
-        "lifecycle": {
-          "$ref": "#/$defs/PluginLifecycleLimits"
         }
       }
     },
@@ -3298,8 +3067,7 @@
         "text",
         "images",
         "contextReferences",
-        "browserAnnotationRefs",
-        "pluginSelections"
+        "browserAnnotationRefs"
       ],
       "properties": {
         "text": {
@@ -3312,9 +3080,6 @@
           "type": "boolean"
         },
         "browserAnnotationRefs": {
-          "type": "boolean"
-        },
-        "pluginSelections": {
           "type": "boolean"
         }
       }
@@ -5151,8 +4916,6 @@
         "content",
         "text",
         "command",
-        "workflowId",
-        "pluginCommandId",
         "skillName",
         "goalMode",
         "accessProfile",
@@ -5160,7 +4923,6 @@
         "contextReferences",
         "browserAnnotationRefs",
         "browserNodeSelections",
-        "pluginSelections",
         "guide",
         "retryCount",
         "interruptTurnId",
@@ -5232,18 +4994,6 @@
             }
           ]
         },
-        "workflowId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "pluginCommandId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "skillName": {
           "type": [
             "string",
@@ -5285,12 +5035,6 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/BrowserNodeSelection"
-          }
-        },
-        "pluginSelections": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PluginSelection"
           }
         },
         "guide": {

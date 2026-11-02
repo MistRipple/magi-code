@@ -6,7 +6,7 @@ import type { ContextUsageBreakdown } from '../lib/context-usage-breakdown';
 import type { AgentId, AnyAgentId } from '../shared/types/agent-types';
 import type { LocaleCode } from '../i18n/locales';
 import type { ProcessingStateSnapshot } from '../shared/protocol/processing-state';
-import type { PluginSelection, SessionTurnGuideCapability } from '../shared/app-server-protocol.generated';
+import type { SessionTurnGuideCapability } from '../shared/app-server-protocol.generated';
 import type { SessionContinuation } from '../shared/rust-backend-types';
 
 // --- 从 orchestrator/runtime/orchestration-runtime-state-types 内联前端所需子集 ---
@@ -779,8 +779,6 @@ export interface QueuedMessage {
   text?: string | null;
   createdAt: number;
   command: 'compact' | null;
-  workflowId?: string | null;
-  pluginCommandId?: string | null;
   skillName?: string | null;
   goalMode?: boolean;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
@@ -788,7 +786,6 @@ export interface QueuedMessage {
   contextReferences?: QueuedMessageContextReference[];
   browserAnnotationRefs?: string[];
   browserNodeSelections?: QueuedMessageBrowserNodeSelection[];
-  pluginSelections?: PluginSelection[];
   guide?: SessionTurnGuideCapability;
 }
 

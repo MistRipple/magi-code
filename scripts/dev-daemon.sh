@@ -63,8 +63,8 @@ restart_fixed_port() {
 restart_fixed_port
 
 cd "$ROOT_DIR"
-# 先编译产品自带的 bridge 和插件 Worker，避免 cargo clean 后只构建 daemon 缺少运行资源。
-cargo build -p magi-bridge-client -p magi-plugin-runtime --bins --locked
+# 先编译产品自带的 bridge，避免 cargo clean 后只构建 daemon 缺少运行资源。
+cargo build -p magi-bridge-client --bins --locked
 
 DAEMON_ENV=(
   "MAGI_WEB_DEV=${MAGI_WEB_DEV:-1}"

@@ -29,10 +29,17 @@ fn catalog_signed_by_the_publish_tool_is_accepted_by_the_daemon_verifier() {
     };
     let path = |name: &str| work.join(name).to_string_lossy().into_owned();
 
-    let archive = path("board.zip");
+    let source = work.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("manifest.json"),
+        r#"{"sdkVersion":2,"id":"example.notes","version":"1.0.0","name":"示例","description":"","permissions":[{"kind":"storage","scope":"application","targets":["notes"]}],"dataSchemaVersion":1,"settingsSchema":{"type":"object","additionalProperties":false},"contributions":{"resources":[{"id":"notes","title":"笔记","description":""}]}}"#,
+    )
+    .unwrap();
+    let archive = path("notes.zip");
     let packed = node(&[
         &script("pack-plugin.mjs"),
-        &root.join("examples/plugins/board").to_string_lossy(),
+        &source.to_string_lossy(),
         &archive,
     ])
     .unwrap();
@@ -91,14 +98,14 @@ fn catalog_signed_by_the_publish_tool_is_accepted_by_the_daemon_verifier() {
         public_key,
     }];
     let catalog = PluginCatalog::verify(&bytes, &trusted).unwrap();
-    let entry = catalog.latest("example.board").expect("目录包含示例插件");
+    let entry = catalog.latest("example.notes").expect("目录包含示例插件");
     let package = PluginPackage::from_archive(&std::fs::read(&archive).unwrap()).unwrap();
     assert_eq!(
         entry.sha256,
         package.digest(),
         "目录摘要与安装包摘要是同一定义"
     );
-    assert_eq!(entry.url, "https://example.test/plugins/board.zip");
+    assert_eq!(entry.url, "https://example.test/plugins/notes.zip");
 
     // 被篡改的目录或不受信的公钥都不能通过。
     let mut tampered = bytes.clone();
@@ -131,7 +138,7 @@ fn catalog_signed_by_the_publish_tool_is_accepted_by_the_daemon_verifier() {
     );
     let parsed = PluginCatalog::parse(&std::fs::read(&plain_file).unwrap(), &[]).unwrap();
     assert!(!parsed.signed);
-    assert_eq!(parsed.catalog.plugins[0].url, "board.zip");
+    assert_eq!(parsed.catalog.plugins[0].url, "notes.zip");
     assert_eq!(parsed.catalog.plugins[0].sha256, package.digest());
     // 配置了公钥的用户不会接受这份未签名目录。
     assert_eq!(

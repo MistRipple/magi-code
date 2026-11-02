@@ -17,7 +17,6 @@ use magi_core::{
 };
 use magi_core::{SessionLifecycleStatus, TaskStatus};
 use magi_event_bus::{EventContext, EventEnvelope};
-use magi_plugin_system::ContributionRef;
 use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn,
     CanonicalTurnItemKind, SessionGoal, TimelineEntryInput, TimelineEntryKind,
@@ -90,14 +89,6 @@ async fn submit_session_turn_internal(
         .skill_name
         .as_deref()
         .and_then(|skill_name| trimmed_non_empty(Some(skill_name)).map(str::to_string));
-    request.workflow_id = request
-        .workflow_id
-        .as_deref()
-        .and_then(|workflow_id| trimmed_non_empty(Some(workflow_id)).map(str::to_string));
-    request.plugin_command_id = request
-        .plugin_command_id
-        .as_deref()
-        .and_then(|command_id| trimmed_non_empty(Some(command_id)).map(str::to_string));
     validate_session_turn_input(&request)?;
     request.interrupt_turn_id = request
         .interrupt_turn_id
@@ -203,8 +194,6 @@ async fn submit_session_turn_internal(
     // 经过当前能力校验，不能借重放路径绕过准入。
     // 扩展 `input` guard：新请求在任何状态被创建之前征询；幂等重放已在上面返回，不会再次调用。
     check_input_guard(&state, &request, "turn").await?;
-    validate_workflow_selection(&state, &request)?;
-    validate_plugin_command_selection(&state, &request)?;
 
     // 保留的显式插件命令仅规范化为普通主对话任务；不再执行独立配置循环。
 
@@ -1087,7 +1076,6 @@ pub(crate) fn session_turn_guide_capability(
             images: images_supported,
             context_references: false,
             browser_annotation_refs: false,
-            plugin_selections: false,
         }),
     }
 }
@@ -1126,18 +1114,12 @@ fn session_executor_accepts_steer(
                     .input_modalities
                     .contains(&magi_bridge_client::ExecutorInputModality::Image));
     }
-    !magi_conversation_runtime::model_config::resolve_orchestrator_model_config(
-        &state.settings_store,
-        Some(session_id),
-    )
-    .is_ok_and(|config| config.is_plugin())
+    true
 }
 
 pub(crate) fn session_turn_request_is_steerable_input(request: &SessionTurnRequestDto) -> bool {
     request.interrupt_turn_id.is_none()
         && request.command.is_none()
-        && request.workflow_id.is_none()
-        && request.plugin_command_id.is_none()
         && (request.trimmed_text().is_some() || !request.images.is_empty())
         && request
             .skill_name
@@ -1147,7 +1129,6 @@ pub(crate) fn session_turn_request_is_steerable_input(request: &SessionTurnReque
         && request.context_references.is_empty()
         && request.browser_annotation_refs.is_empty()
         && request.browser_node_selections.is_empty()
-        && request.plugin_selections.is_empty()
 }
 
 fn steer_input_error(error: SessionTurnInputError) -> ApiError {
@@ -1176,8 +1157,7 @@ pub(crate) fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Re
             || request.replace_turn_id().is_some()
             || request.expected_turn_id().is_some()
             || request.resume
-            || request.command.is_some()
-            || request.plugin_command_id.is_some())
+            || request.command.is_some())
     {
         return Err(ApiError::InvalidInput(
             "停止并改做需要明确 sessionId/interruptTurnId，不能混合引导、编辑重发、恢复或会话命令"
@@ -1198,9 +1178,6 @@ pub(crate) fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Re
         && request.context_references.is_empty()
         && request.browser_annotation_refs.is_empty()
         && request.browser_node_selections.is_empty()
-        && request.plugin_selections.is_empty()
-        && request.workflow_id.is_none()
-        && request.plugin_command_id.is_none()
     {
         return Err(ApiError::InvalidInput("会话输入不能为空".to_string()));
     }
@@ -1215,76 +1192,6 @@ pub(crate) fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Re
         ));
     }
     Ok(())
-}
-
-/// 请求里选择的插件贡献身份：长度受限，形态固定为 `plugin/{插件}/{贡献}`。
-fn parse_contribution_selection(kind: &str, identity: &str) -> Result<ContributionRef, ApiError> {
-    if identity.len() > 192 {
-        return Err(ApiError::InvalidInput(format!("{kind}身份无效")));
-    }
-    ContributionRef::parse(kind, identity).map_err(ApiError::InvalidInput)
-}
-
-pub(crate) fn validate_workflow_selection(
-    state: &ApiState,
-    request: &SessionTurnRequestDto,
-) -> Result<(), ApiError> {
-    let Some(workflow_id) = request.workflow_id.as_deref() else {
-        return Ok(());
-    };
-    let selected = parse_contribution_selection("工作流核心", workflow_id)?;
-    let manager = state
-        .plugin_manager
-        .lock()
-        .map_err(|_| ApiError::internal_assembly("校验工作流核心失败", "插件锁已损坏"))?;
-    manager
-        .prepare_workflow(&selected)
-        .map(|_| ())
-        .map_err(|_| ApiError::Forbidden("所选插件工作流未激活或正在排空".into()))
-}
-
-pub(crate) fn validate_plugin_command_selection(
-    state: &ApiState,
-    request: &SessionTurnRequestDto,
-) -> Result<(), ApiError> {
-    let Some(command_id) = request.plugin_command_id.as_deref() else {
-        return Ok(());
-    };
-    let selected = parse_contribution_selection("插件命令", command_id)?;
-
-    if request.command.is_some()
-        || request.workflow_id.is_some()
-        || request
-            .skill_name
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-        || request.goal_mode
-        || !request.images.is_empty()
-        || !request.context_references.is_empty()
-        || !request.browser_annotation_refs.is_empty()
-        || !request.browser_node_selections.is_empty()
-        || !request.plugin_selections.is_empty()
-        || request.steer_current_turn
-        || request.replace_turn_id().is_some()
-    {
-        return Err(ApiError::InvalidInput(
-            "插件命令不能与其他控制输入同时提交".into(),
-        ));
-    }
-    let manager = state
-        .plugin_manager
-        .lock()
-        .map_err(|_| ApiError::internal_assembly("校验插件命令失败", "插件锁已损坏"))?;
-    let available = manager
-        .command_contributions_for_scope(magi_plugin_system::APPLICATION_SCOPE)
-        .map_err(|error| ApiError::internal_assembly("读取插件命令失败", error.to_string()))?
-        .into_iter()
-        .any(|(manifest, command)| ContributionRef::new(manifest.id, command.id) == selected);
-    if available {
-        Ok(())
-    } else {
-        Err(ApiError::Forbidden("所选插件命令未激活".into()))
-    }
 }
 
 /// 会话命令只能作为已有会话中的独立轮次提交；文本是命令参数。
@@ -1302,10 +1209,7 @@ fn validate_session_turn_command(request: &SessionTurnRequestDto) -> Result<(), 
         || !request.images.is_empty()
         || !request.context_references.is_empty()
         || !request.browser_annotation_refs.is_empty()
-        || !request.browser_node_selections.is_empty()
-        || !request.plugin_selections.is_empty()
-        || request.workflow_id.is_some()
-        || request.plugin_command_id.is_some();
+        || !request.browser_node_selections.is_empty();
     if combined_with_other_input {
         return Err(ApiError::InvalidInput(
             "会话命令不能与技能、目标模式、图片或上下文引用同时提交".to_string(),
@@ -1340,12 +1244,6 @@ pub(crate) fn decide_session_turn(
     }
     if request.command.is_some() {
         return Ok(session_turn_command_decision());
-    }
-    if request.plugin_command_id.is_some() {
-        return Ok(session_turn_command_decision());
-    }
-    if request.workflow_id.is_some() {
-        return Ok(SessionTurnIntentDecision::new(SessionTurnRouteDto::Execute));
     }
 
     if request.resume {
@@ -1652,12 +1550,6 @@ async fn submit_conversation_session_turn(
             serde_json::to_value(command).expect("session command must serialize"),
         );
     }
-    if let Some(plugin_command_id) = request.plugin_command_id.as_ref() {
-        metadata.insert(
-            "pluginCommandId".to_string(),
-            serde_json::Value::String(plugin_command_id.clone()),
-        );
-    }
     metadata.extend([
         (
             "route".to_string(),
@@ -1820,25 +1712,13 @@ async fn submit_conversation_session_turn(
         request_id: Some(request_id),
         user_message_id: Some(user_message_id.clone()),
         placeholder_message_id: request.placeholder_message_id(),
-        command: request
-            .command
-            .as_ref()
-            .map(|command| match command {
-                magi_app_server_protocol::SessionTurnCommand::Compact => {
-                    SessionTurnCommand::CompactContext {
-                        instructions: request.trimmed_text(),
-                    }
+        command: request.command.as_ref().map(|command| match command {
+            magi_app_server_protocol::SessionTurnCommand::Compact => {
+                SessionTurnCommand::CompactContext {
+                    instructions: request.trimmed_text(),
                 }
-            })
-            .or_else(|| {
-                request
-                    .plugin_command_id
-                    .as_ref()
-                    .map(|command_id| SessionTurnCommand::Plugin {
-                        command_id: command_id.clone(),
-                        arguments: request.trimmed_text(),
-                    })
-            }),
+            }
+        }),
     };
     schedule_conversation_execution(state.clone(), execution_request, attempt, trace);
     if created_session
@@ -2445,12 +2325,11 @@ async fn submit_mainline_session_turn(
     trace.mark("submit_received", &requested_session_label, None, None);
     let route = decision.route;
     let user_text = request.trimmed_text().unwrap_or_else(|| {
-        request
-            .workflow_id
-            .as_deref()
-            .map(|workflow_id| format!("执行工作流 {workflow_id}"))
-            .or_else(|| (!request.images.is_empty()).then(|| "[图片输入]".to_string()))
-            .unwrap_or_else(|| request.timeline_content(None))
+        if request.images.is_empty() {
+            request.timeline_content(None)
+        } else {
+            "[图片输入]".to_string()
+        }
     });
     let goal_mode = request.goal_mode;
     let execution_goal = if goal_mode {

@@ -20,16 +20,6 @@ export type InstalledPluginProjection = PluginInstalled;
 
 export const PLUGIN_REGISTRY_CHANGED_EVENT = 'magi-plugin-registry-changed';
 
-export interface PluginContributionProjection {
-  id: string;
-  pluginId: string;
-  contributionId: string;
-  version: string;
-  digest: string;
-  title: string;
-  description: string;
-}
-
 async function pluginRequest(path: string, init?: RequestInit): Promise<Response> {
   return getTransport().request(agentUrl(path), init);
 }
@@ -179,20 +169,6 @@ export async function loadActivePluginManifests(scope = APPLICATION_PLUGIN_SCOPE
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.manifest'), response);
   const payload = await response.json() as unknown;
   return Array.isArray(payload) ? payload as PluginManifestProjection[] : [];
-}
-
-export async function loadActivePluginCommands(scope = APPLICATION_PLUGIN_SCOPE): Promise<PluginContributionProjection[]> {
-  const response = await pluginRequest(`/api/plugins/commands?scope=${encodeURIComponent(scope)}`);
-  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.commands'), response);
-  const payload = await response.json() as unknown;
-  return Array.isArray(payload) ? payload as PluginContributionProjection[] : [];
-}
-
-export async function loadActivePluginWorkflows(scope = APPLICATION_PLUGIN_SCOPE): Promise<PluginContributionProjection[]> {
-  const response = await pluginRequest(`/api/plugins/workflows?scope=${encodeURIComponent(scope)}`);
-  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.workflows'), response);
-  const payload = await response.json() as unknown;
-  return Array.isArray(payload) ? payload as PluginContributionProjection[] : [];
 }
 
 export function subscribePluginResource(

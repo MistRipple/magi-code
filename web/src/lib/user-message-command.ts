@@ -1,7 +1,6 @@
 export interface UserMessageCommandMetadata {
   [key: string]: unknown;
   sessionCommand?: unknown;
-  pluginCommandId?: unknown;
   goalMode?: unknown;
   skillName?: unknown;
 }
@@ -11,11 +10,6 @@ export function resolveUserMessageCommandLabel(
   metadata: UserMessageCommandMetadata | undefined,
 ): string {
   if (metadata?.sessionCommand === 'compact') return '/compact';
-
-  const pluginCommandId = typeof metadata?.pluginCommandId === 'string'
-    ? metadata.pluginCommandId.trim()
-    : '';
-  if (pluginCommandId) return `/${pluginCommandId}`;
 
   const skillId = typeof metadata?.skillName === 'string'
     ? metadata.skillName.trim()

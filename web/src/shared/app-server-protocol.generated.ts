@@ -314,15 +314,6 @@ export interface BrowserNodeSelectionBounds {
   height: number;
 }
 
-export interface PluginSelection {
-  pluginId: string;
-  resourceId: string;
-  version: number;
-  label: string;
-  summary: string;
-  selection?: JsonValue | null;
-}
-
 export interface BrowserNodeSelection {
   tabId: string;
   surfaceId: string;
@@ -359,8 +350,6 @@ export interface TurnStartParams {
   goalMode?: boolean;
   resume?: boolean;
   command?: SessionTurnCommand | null;
-  workflowId?: string | null;
-  pluginCommandId?: string | null;
   images?: Array<SessionTurnImage>;
   contextReferences?: Array<SessionContextReference>;
   browserAnnotationRefs?: Array<string>;
@@ -373,7 +362,6 @@ export interface TurnStartParams {
   steerCurrentTurn?: boolean;
   expectedTurnId?: string | null;
   replaceTurnId?: string | null;
-  pluginSelections?: Array<PluginSelection>;
   interruptTurnId?: string | null;
 }
 
@@ -688,14 +676,6 @@ export interface PluginPermission {
   targets: Array<string>;
 }
 
-export interface PluginToolContribution {
-  id: string;
-  title: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
-  readOnly: boolean;
-}
-
 export interface PluginSkillContribution {
   id: string;
   title: string;
@@ -735,16 +715,10 @@ export interface PluginNamedContribution {
 
 export interface PluginContributions {
   skills?: Array<PluginSkillContribution>;
-  tools?: Array<PluginToolContribution>;
-  commands?: Array<PluginNamedContribution>;
   views?: Array<PluginViewContribution>;
-  workflows?: Array<PluginNamedContribution>;
-  engines?: Array<PluginNamedContribution>;
   resources?: Array<PluginNamedContribution>;
   browserSurfaces?: Array<PluginBrowserSurfaceContribution>;
 }
-
-export type PluginBackendEntry = "plugin.mjs";
 
 export type PluginHookMode = "observe" | "advise" | "guard";
 
@@ -758,23 +732,17 @@ export interface PluginExtension {
   hooks: Array<PluginHookDeclaration>;
 }
 
-export interface PluginDataMigration {
-  fromVersions: Array<number>;
-}
-
 export interface PluginManifest {
   sdkVersion: number;
   id: string;
   version: string;
   name: string;
   description: string;
-  backend?: PluginBackendEntry;
   extension?: PluginExtension;
   permissions: Array<PluginPermission>;
   contributions: PluginContributions;
   settingsSchema: Record<string, unknown>;
   dataSchemaVersion: number;
-  dataMigration?: PluginDataMigration;
 }
 
 export type JsonRpcMessage = JsonRpcRequest | JsonRpcNotification | JsonRpcResponse;
@@ -821,20 +789,6 @@ export interface PluginSourceProjection {
   location: string;
 }
 
-export type PluginDrainPhase = "draining" | "cancelling";
-
-export interface PluginDrainingScope {
-  scope: string;
-  phase: PluginDrainPhase;
-  startedAtMs: number;
-  deadlineMs: number;
-}
-
-export interface PluginLifecycleLimits {
-  drainTimeoutMs: number;
-  cancelSettleTimeoutMs: number;
-}
-
 export interface PluginInstalled {
   manifest: PluginManifest;
   digest: string;
@@ -842,7 +796,6 @@ export interface PluginInstalled {
   activeScopes: Array<string>;
   grants: Array<PluginScopeGrant>;
   source: PluginSourceProjection;
-  draining: Array<PluginDrainingScope>;
   runtime?: PluginRuntimeStatus;
 }
 
@@ -858,7 +811,6 @@ export interface PluginRuntimeStatus {
 
 export interface PluginList {
   plugins: Array<PluginInstalled>;
-  lifecycle: PluginLifecycleLimits;
 }
 
 export interface PluginCenterKey {
@@ -916,7 +868,6 @@ export interface SessionTurnGuideInputSupport {
   images: boolean;
   contextReferences: boolean;
   browserAnnotationRefs: boolean;
-  pluginSelections: boolean;
 }
 
 export interface SessionTurnGuideCapability {
@@ -1333,8 +1284,6 @@ export interface QueuedSessionTurn {
   content: string;
   text: string | null;
   command: SessionTurnCommand | null;
-  workflowId: string | null;
-  pluginCommandId: string | null;
   skillName: string | null;
   goalMode: boolean;
   accessProfile: AccessProfile | null;
@@ -1342,7 +1291,6 @@ export interface QueuedSessionTurn {
   contextReferences: Array<SessionContextReference>;
   browserAnnotationRefs: Array<string>;
   browserNodeSelections: Array<BrowserNodeSelection>;
-  pluginSelections: Array<PluginSelection>;
   guide: SessionTurnGuideCapability;
   retryCount: number;
   interruptTurnId: string | null;

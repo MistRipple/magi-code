@@ -9,11 +9,8 @@
 import { untrack } from 'svelte';
 import {
   APPLICATION_PLUGIN_SCOPE,
-  loadActivePluginCommands,
   loadActivePluginManifests,
-  loadActivePluginWorkflows,
   PLUGIN_REGISTRY_CHANGED_EVENT,
-  type PluginContributionProjection,
   type PluginManifestProjection,
 } from '../web/plugin-api';
 import { RUNTIME_CONNECTION_EVENT, type AgentConnectionEventDetail } from '../web/agent-api';
@@ -22,16 +19,12 @@ export { APPLICATION_PLUGIN_SCOPE };
 
 interface PluginScopeProjection {
   manifests: PluginManifestProjection[];
-  commands: PluginContributionProjection[];
-  workflows: PluginContributionProjection[];
   /** 当前修订读取成功；加载中或失败时不能据旧清单判断插件“不存在”。 */
   loaded: boolean;
 }
 
 const EMPTY_PROJECTION: PluginScopeProjection = {
   manifests: [],
-  commands: [],
-  workflows: [],
   loaded: false,
 };
 
@@ -56,39 +49,20 @@ export function trackPluginProjection(scope: string): void {
   const revision = registry.revision;
   if (requestedRevision.get(scope) === revision) return;
   requestedRevision.set(scope, revision);
-  // 保留已有入口，但在新修订确认前不以旧清单的缺项撤销用户选择。
+  // 保留已有入口，但在新修订确认前不以旧清单的缺项判断插件不存在。
   untrack(() => {
     projections[scope] = { ...(projections[scope] ?? EMPTY_PROJECTION), loaded: false };
   });
   const isCurrent = () => registry.revision === revision && requestedRevision.get(scope) === revision;
-  const loading = Promise.all([
-    loadActivePluginManifests(scope),
-    loadActivePluginCommands(scope),
-    loadActivePluginWorkflows(scope),
-  ]).then(([manifests, commands, workflows]) => {
+  const loading = loadActivePluginManifests(scope).then((manifests) => {
     if (!isCurrent()) return;
-    revokeSelectionsOfRemovedPlugins(projections[scope]?.manifests ?? [], manifests);
-    projections[scope] = { manifests, commands, workflows, loaded: true };
+    projections[scope] = { manifests, loaded: true };
   }).catch(() => {
     if (!isCurrent()) return;
     // 网络失败不是撤权事实：保留最近一次成功投影，也不能将首次失败标成已加载。
     requestedRevision.delete(scope);
   });
   inflight.set(scope, loading);
-}
-
-/** 插件从作用域的激活投影中消失（停用、撤权、升级）：输入区里尚未提交的该插件选择随之失效。 */
-function revokeSelectionsOfRemovedPlugins(
-  previous: PluginManifestProjection[],
-  next: PluginManifestProjection[],
-): void {
-  if (typeof window === 'undefined') return;
-  const alive = new Set(next.map((manifest) => `${manifest.id}@${manifest.version}`));
-  for (const manifest of previous) {
-    if (!alive.has(`${manifest.id}@${manifest.version}`)) {
-      window.dispatchEvent(new CustomEvent('magi:pluginSelectionInvalidated', { detail: { pluginId: manifest.id } }));
-    }
-  }
 }
 
 /** 当前注册表修订；读取它的 effect 会在注册表变化（含窗口重新获得焦点）后重新执行。 */

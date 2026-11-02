@@ -2372,7 +2372,6 @@ mod tests {
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
             browser_node_selections: Vec::new(),
-            plugin_selections: Vec::new(),
             access_profile: None,
             orchestrator_session_config: None,
             request_id: None,
@@ -2383,8 +2382,6 @@ mod tests {
             replace_turn_id: None,
             interrupt_turn_id: None,
             command: None,
-            workflow_id: None,
-            plugin_command_id: None,
         }
     }
 
