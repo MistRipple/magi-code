@@ -90,6 +90,10 @@ jobs:
           cache-on-failure: true
 
       - name: 验证 Windows 子进程与桌面宿主
+        # Long fixture IDs plus the default user temp path can exceed Windows MAX_PATH.
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           cargo test -p magi-core --test host_path --locked
