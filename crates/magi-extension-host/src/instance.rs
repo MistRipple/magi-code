@@ -98,6 +98,8 @@ pub struct ApprovedHook {
 pub struct HostInstance {
     pub plugin_id: String,
     pub version: String,
+    /// 插件包摘要；提示贡献的片段身份包含它。
+    pub digest: String,
     pub generation: u64,
     pub(crate) peer: Peer,
     approved: HashMap<String, ApprovedHook>,
@@ -364,6 +366,7 @@ pub async fn launch(
     Ok(Arc::new(HostInstance {
         plugin_id: config.plugin_id,
         version: config.version,
+        digest: config.digest,
         generation,
         peer,
         approved,

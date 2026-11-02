@@ -177,7 +177,7 @@ impl PromptSection {
     }
 }
 
-fn stable_prompt_hash(value: &str) -> u64 {
+pub(crate) fn stable_prompt_hash(value: &str) -> u64 {
     value
         .as_bytes()
         .iter()

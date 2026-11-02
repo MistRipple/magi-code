@@ -188,7 +188,6 @@ pub struct HookSpec {
     pub patch_limit: usize,
 }
 
-const NONE: &[HookMode] = &[];
 const GUARD: &[HookMode] = &[HookMode::Guard];
 const OBSERVE: &[HookMode] = &[HookMode::Observe];
 const GUARD_ADVISE: &[HookMode] = &[HookMode::Guard, HookMode::Advise];
@@ -235,7 +234,7 @@ pub const HOOKS: &[HookSpec] = &[
     HookSpec {
         name: "prompt.contribute",
         modes: ADVISE,
-        wired: NONE,
+        wired: ADVISE,
         replace: true,
         patch_limit: 256 * KIB,
     },
@@ -440,13 +439,13 @@ mod tests {
             ("model.request", HookMode::Observe),
             ("context.assemble", HookMode::Advise),
             ("compaction.before", HookMode::Advise),
+            ("prompt.contribute", HookMode::Advise),
         ] {
             assert!(reg(name, mode).validate_wired().is_ok(), "{name} {mode:?}");
         }
         for (name, mode) in [
             ("input", HookMode::Advise),
             ("model.request", HookMode::Advise),
-            ("prompt.contribute", HookMode::Advise),
             ("subagent.spawn", HookMode::Advise),
         ] {
             assert!(reg(name, mode).validate_wired().is_err(), "{name} {mode:?}");

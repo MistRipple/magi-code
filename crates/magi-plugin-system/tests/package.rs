@@ -353,7 +353,7 @@ fn node_extension_packages_reject_every_ambiguous_or_unsupported_shape() {
         "Node 暂不支持工具贡献",
     );
     reject(
-        |m| m["extension"]["hooks"] = json!([{"name":"prompt.contribute","mode":"advise"}]),
+        |m| m["extension"]["hooks"] = json!([{"name":"model.request","mode":"advise"}]),
         ENTRY,
         "未接线的钩子不得在清单里声明",
     );

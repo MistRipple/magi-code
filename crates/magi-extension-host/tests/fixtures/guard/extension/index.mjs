@@ -55,4 +55,15 @@ export default async function activate(api) {
     }
     return { decision: 'continue' };
   });
+  await on('prompt.contribute', async (event) => {
+    if (event.phase === 'start') {
+      return { decision: 'replace', patch: { fragments: [
+        { id: 'house-style', stability: 'stable', priority: 1, text: '团队约定：提交信息使用中文。' },
+        { id: 'oops', stability: 'volatile', text: '启动阶段不接受易变片段' },
+      ] } };
+    }
+    return { decision: 'replace', patch: { fragments: [
+      { id: 'round-note', stability: 'volatile', text: `第 ${event.round} 轮上下文提醒` },
+    ] } };
+  });
 }

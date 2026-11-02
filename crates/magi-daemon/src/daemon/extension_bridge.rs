@@ -8,8 +8,9 @@ use magi_bridge_client::ChatToolCall;
 use magi_conversation_runtime::{
     ExtensionRewriteProposal,
     extension_hooks::{
-        AssembleView, CompactionDecision, CompactionView, ExtensionHooks, InputDecision,
-        InputGuard, InputView, SpawnDecision, SubagentSpawnView, ToolCallDecision, ToolHookScope,
+        AssembleView, CompactionDecision, CompactionView, ContributePhase, ContributeView,
+        ContributionStability, ExtensionHooks, InputDecision, InputGuard, InputView,
+        PromptContribution, SpawnDecision, SubagentSpawnView, ToolCallDecision, ToolHookScope,
         ToolResultView,
     },
 };
@@ -188,9 +189,83 @@ fn parse_rewrites(
         .collect()
 }
 
+/// 把插件补丁里的 `fragments` 解析成提示贡献。形态不符的片段被忽略；稳定性、预算与内容规则
+/// 由对话运行时的唯一接纳点（`accept_contributions`）校验。
+fn parse_fragments(plugin: &str, digest: &str, patch: &Value) -> Vec<PromptContribution> {
+    let Some(list) = patch.get("fragments").and_then(Value::as_array) else {
+        tracing::warn!(%plugin, "prompt.contribute 补丁形态无效，已忽略");
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|entry| {
+            let stability = match entry.get("stability")?.as_str()? {
+                "stable" => ContributionStability::Stable,
+                "volatile" => ContributionStability::Volatile,
+                _ => return None,
+            };
+            Some(PromptContribution {
+                plugin_id: plugin.to_string(),
+                package_digest: digest.to_string(),
+                fragment_id: entry.get("id")?.as_str()?.to_string(),
+                stability,
+                priority: entry.get("priority").and_then(Value::as_i64).unwrap_or(0),
+                text: entry.get("text")?.as_str()?.to_string(),
+            })
+        })
+        .collect()
+}
+
 impl ExtensionHooks for ExtensionBusHooks {
     fn observe(&self, hook: &'static str, payload: Value) {
         self.bus.notify(hook, payload);
+    }
+
+    fn prompt_contribute(
+        &self,
+        scope: &ToolHookScope<'_>,
+        view: &ContributeView<'_>,
+    ) -> Vec<PromptContribution> {
+        if !self.bus.has_hook("prompt.contribute") {
+            return Vec::new();
+        }
+        let phase = match view.phase {
+            ContributePhase::Start => "start",
+            ContributePhase::Round => "round",
+        };
+        let mut ctx = HookContext::new(format!(
+            "inv_contribute_{}_{phase}_{}",
+            view.task_id, view.round
+        ));
+        ctx.owner = json!({
+            "sessionId": scope.session_id,
+            "taskId": scope.task_id,
+            "stepId": view.round,
+            "workerId": scope.worker_id,
+        });
+        ctx.binding = json!({"workspaceId": scope.workspace_id});
+        let input = json!({
+            "target": "task",
+            "phase": phase,
+            "round": view.round,
+            "budget": {
+                "maxFragmentChars": view.max_fragment_chars,
+                "maxTotalChars": view.max_total_chars,
+            },
+        });
+        let Ok(outcome) = self
+            .handle
+            .block_on(self.bus.invoke("prompt.contribute", &ctx, input))
+        else {
+            return Vec::new();
+        };
+        outcome
+            .patches
+            .iter()
+            .flat_map(|(plugin, patch)| {
+                let digest = self.bus.plugin_digest(plugin).unwrap_or_default();
+                parse_fragments(plugin, &digest, patch)
+            })
+            .collect()
     }
 
     fn context_assemble(
@@ -1072,6 +1147,90 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(revoked, CompactionDecision::Proceed);
+        instance.stop().await;
+    }
+
+    /// `prompt.contribute` 经真实 Node 扩展：包摘要进入片段身份，阶段/稳定性/预算由唯一接纳点裁决。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prompt_contributions_from_a_real_node_extension_carry_the_package_digest() {
+        use magi_extension_host::{
+            bus::BusPolicy,
+            instance::{LaunchConfig, launch},
+            protocol::{HookMode, HookRegistration},
+        };
+        use std::path::Path;
+
+        let host_crate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../magi-extension-host");
+        let dir = tempfile::tempdir().unwrap();
+        let declared = vec![HookRegistration {
+            name: "prompt.contribute".into(),
+            mode: HookMode::Advise,
+            deadline_ms: Some(3000),
+        }];
+        let node = std::env::var_os("MAGI_EXTENSION_NODE")
+            .map(std::path::PathBuf::from)
+            .or_else(|| magi_process::resolve_executable("node"))
+            .expect("需要 Node");
+        let mut config = LaunchConfig::new(
+            node,
+            host_crate.join("runtime/host.mjs"),
+            host_crate.join("tests/fixtures/guard/extension/index.mjs"),
+            dir.path().join("sock"),
+        );
+        config.plugin_id = "acme.guard".into();
+        config.version = "1.0.0".into();
+        config.digest = "0123456789abcdef0123456789abcdef".into();
+        config.config = json!({"marker": null, "hooks": ["prompt.contribute"]});
+        config.hooks = declared.clone();
+        let bus = Arc::new(ExtensionBus::new(BusPolicy::default()));
+        bus.register_plugin("acme.guard", &declared).unwrap();
+        let group = magi_process::ManagedProcessGroup::new();
+        let instance = launch(&group, config, 1).await.expect("launch");
+        assert!(bus.attach(Arc::clone(&instance)));
+        let hooks = Arc::new(ExtensionBusHooks::new(Arc::clone(&bus), Handle::current()));
+
+        let (start, round) = tokio::task::spawn_blocking({
+            let hooks = Arc::clone(&hooks);
+            move || {
+                let scope = ToolHookScope {
+                    session_id: "s1",
+                    task_id: "t1",
+                    workspace_id: None,
+                    worker_id: None,
+                    round: 0,
+                };
+                let view = |phase, round| ContributeView {
+                    session_id: "s1",
+                    task_id: "t1",
+                    phase,
+                    round,
+                    max_fragment_chars: 8192,
+                    max_total_chars: 16384,
+                };
+                (
+                    hooks.prompt_contribute(&scope, &view(ContributePhase::Start, 0)),
+                    hooks.prompt_contribute(&scope, &view(ContributePhase::Round, 3)),
+                )
+            }
+        })
+        .await
+        .unwrap();
+
+        // 扩展在启动阶段同时提了稳定与易变片段：解析层都交出，由接纳点按阶段裁决。
+        assert_eq!(start.len(), 2);
+        let stable = start
+            .iter()
+            .find(|c| c.fragment_id == "house-style")
+            .unwrap();
+        assert_eq!(stable.stability, ContributionStability::Stable);
+        assert_eq!(stable.priority, 1);
+        assert_eq!(
+            stable.package_digest, "0123456789abcdef0123456789abcdef",
+            "片段身份带包摘要"
+        );
+        assert_eq!(stable.plugin_id, "acme.guard");
+        assert_eq!(round.len(), 1);
+        assert!(round[0].text.contains("第 3 轮"));
         instance.stop().await;
     }
 }

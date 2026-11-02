@@ -209,6 +209,19 @@ impl ExtensionBus {
         }
     }
 
+    /// 运行中实例的包摘要（宿主不可用时为 None）。
+    pub fn plugin_digest(&self, plugin_id: &str) -> Option<String> {
+        self.slots
+            .read()
+            .expect("slots poisoned")
+            .get(plugin_id)?
+            .instance
+            .read()
+            .expect("instance poisoned")
+            .as_ref()
+            .map(|instance| instance.digest.clone())
+    }
+
     pub fn is_context_rewrite_authorized(&self, plugin_id: &str) -> bool {
         self.slots
             .read()
