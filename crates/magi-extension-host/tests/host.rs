@@ -391,3 +391,25 @@ async fn stopping_the_supervisor_terminates_the_host_process() {
         .unwrap();
     assert!(matches!(after.verdict, Verdict::Blocked { .. }));
 }
+
+#[tokio::test]
+async fn a_host_that_exits_before_connecting_fails_fast_instead_of_waiting_for_the_deadline() {
+    let mut env = env("guard", vec![]);
+    // 入口脚本立即退出：不会连接套接字。
+    env.config.runtime_entry = fixtures().join("exit-immediately.mjs");
+    env.config.connect_timeout = Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    let error = launch(&env.group, env.config.clone(), 1)
+        .await
+        .err()
+        .expect("must fail");
+    assert!(
+        matches!(error, LaunchError::ExitedBeforeConnect(_)),
+        "{error}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "必须快速失败: {:?}",
+        started.elapsed()
+    );
+}

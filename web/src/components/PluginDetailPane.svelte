@@ -170,7 +170,7 @@
     {#if manifest}
       <div class="settings-chips">
         {#each manifest.permissions as permission}
-          <span class="settings-chip settings-mono">{permissionText(permission)}</span>
+          <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite'}>{permissionText(permission)}</span>
         {:else}
           <span class="settings-row-desc">{i18n.t('settings.plugins.noPermissions')}</span>
         {/each}

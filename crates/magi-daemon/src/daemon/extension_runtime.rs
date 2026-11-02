@@ -320,8 +320,13 @@ impl ExtensionRuntime {
             let mut crashes_seen = 0u64;
             loop {
                 let state = changes.borrow_and_update().clone();
-                if let SupervisorState::Backoff { crashes, .. } = &state {
-                    crashes_seen = crashes_seen.max(*crashes as u64);
+                match &state {
+                    SupervisorState::Backoff { crashes, .. } => {
+                        crashes_seen = crashes_seen.max(*crashes as u64);
+                    }
+                    // 监管只在最后一次崩溃后放弃重启，该次崩溃不再经过 Backoff，这里补上。
+                    SupervisorState::Failed(_) => crashes_seen += 1,
+                    _ => {}
                 }
                 runtime.set_status(
                     &plugin_id,

@@ -78,6 +78,8 @@ pub enum LaunchError {
     Endpoint(std::io::Error),
     #[error("宿主未在期限内连接{0}")]
     ConnectTimeout(String),
+    #[error("宿主在连接前已退出{0}")]
+    ExitedBeforeConnect(String),
     #[error("握手失败: {0}")]
     Handshake(String),
     #[error("扩展激活失败或超时{0}")]
@@ -293,15 +295,30 @@ pub async fn launch(
     });
     let abort = |stop: &Arc<Notify>| stop.notify_one();
 
-    let stream = match tokio::time::timeout(config.connect_timeout, listener.accept()).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => {
-            abort(&stop);
-            return Err(LaunchError::Endpoint(error));
+    // 进程在连接前就退出（被杀、入口崩溃）时立即失败，不必等满连接期限。
+    let mut exited_early = exited_rx.clone();
+    let child_gone = async {
+        while !*exited_early.borrow_and_update() {
+            if exited_early.changed().await.is_err() {
+                break;
+            }
         }
-        Err(_) => {
+    };
+    let stream = tokio::select! {
+        accepted = tokio::time::timeout(config.connect_timeout, listener.accept()) => match accepted {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                abort(&stop);
+                return Err(LaunchError::Endpoint(error));
+            }
+            Err(_) => {
+                abort(&stop);
+                return Err(LaunchError::ConnectTimeout(tail_text(&stderr_tail)));
+            }
+        },
+        _ = child_gone => {
             abort(&stop);
-            return Err(LaunchError::ConnectTimeout(tail_text(&stderr_tail)));
+            return Err(LaunchError::ExitedBeforeConnect(tail_text(&stderr_tail)));
         }
     };
     drop(listener);

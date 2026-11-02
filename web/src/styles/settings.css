@@ -295,6 +295,8 @@
     border: 0; border-radius: 999px; background: var(--surface-2);
     font-size: var(--text-xs); color: var(--foreground-muted); white-space: nowrap; font-weight: var(--font-normal, 400);
   }
+  /* 长说明（如完全信任、改写上下文）不能被截成胶囊：允许换行并改用圆角矩形。 */
+  .settings-chip--wrap { white-space: normal; border-radius: 10px; padding: 3px var(--space-2); min-width: 0; max-width: 100%; overflow-wrap: anywhere; line-height: 1.5; }
   .settings-chip--ok { color: var(--success); border-color: color-mix(in srgb, var(--success) 40%, transparent); }
   .settings-chip--warn { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent); }
   .settings-chip--accent { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 45%, transparent); }

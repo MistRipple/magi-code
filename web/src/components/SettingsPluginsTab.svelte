@@ -279,7 +279,7 @@
             <span class="settings-row-title">{i18n.t('settings.plugins.candidate.added')}</span>
             <div class="settings-chips">
               {#each preview.addedPermissions as permission}
-                <span class="settings-chip settings-mono">{permissionText(permission)}</span>
+                <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite'}>{permissionText(permission)}</span>
               {:else}
                 <span class="settings-row-desc">{i18n.t('settings.plugins.candidate.noneAdded')}</span>
               {/each}
@@ -290,7 +290,7 @@
               <span class="settings-row-title">{i18n.t('settings.plugins.candidate.removed')}</span>
               <div class="settings-chips">
                 {#each preview.removedPermissions as permission}
-                  <span class="settings-chip settings-mono">{permissionText(permission)}</span>
+                  <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite'}>{permissionText(permission)}</span>
                 {/each}
               </div>
             </div>

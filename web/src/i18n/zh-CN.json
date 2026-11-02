@@ -884,7 +884,7 @@
   "settings.plugins.runtime.state.starting": "启动中",
   "settings.plugins.runtime.state.running": "运行中",
   "settings.plugins.runtime.state.restarting": "重启中",
-  "settings.plugins.runtime.state.failed": "已停止自动重启",
+  "settings.plugins.runtime.state.failed": "不可用",
   "settings.plugins.runtime.state.stopped": "已停止",
   "settings.plugins.runtime.state.notRunning": "未运行",
   "settings.plugins.uninstall": "卸载",

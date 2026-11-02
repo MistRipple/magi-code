@@ -884,7 +884,7 @@
   "settings.plugins.runtime.state.starting": "Starting",
   "settings.plugins.runtime.state.running": "Running",
   "settings.plugins.runtime.state.restarting": "Restarting",
-  "settings.plugins.runtime.state.failed": "Automatic restart stopped",
+  "settings.plugins.runtime.state.failed": "Unavailable",
   "settings.plugins.runtime.state.stopped": "Stopped",
   "settings.plugins.runtime.state.notRunning": "Not running",
   "settings.plugins.uninstall": "Uninstall",

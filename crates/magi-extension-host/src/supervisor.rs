@@ -169,7 +169,16 @@ pub fn supervise(
             };
             match tracker.on_crash(Instant::now()) {
                 RestartDecision::GiveUp => {
-                    state_tx.send_replace(SupervisorState::Failed(reason));
+                    let window = policy.window.as_secs();
+                    let window = if window >= 60 && window.is_multiple_of(60) {
+                        format!("{} 分钟", window / 60)
+                    } else {
+                        format!("{window} 秒")
+                    };
+                    state_tx.send_replace(SupervisorState::Failed(format!(
+                        "{window}内崩溃超过 {} 次，已停止自动重启；最近一次：{reason}",
+                        policy.max_crashes
+                    )));
                     return;
                 }
                 RestartDecision::After(delay) => {
