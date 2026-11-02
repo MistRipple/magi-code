@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import Disclosure from './Disclosure.svelte';
   import FileName from './FileName.svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -648,6 +649,7 @@
   const DESC_POPOVER_MAX_HEIGHT = 240;
   const DESC_CLOSE_GRACE_MS = 120;
   let descAnchor = $state<{ x: number; y: number; width: number; description: string } | null>(null);
+  let descTrigger: HTMLElement | null = null;
   let closeTimer: ReturnType<typeof setTimeout> | null = null;
 
   function clearCloseTimer() {
@@ -659,13 +661,43 @@
 
   function scheduleClose() {
     clearCloseTimer();
-    closeTimer = setTimeout(() => {
-      descAnchor = null;
-      closeTimer = null;
-    }, DESC_CLOSE_GRACE_MS);
+    closeTimer = setTimeout(closeDesc, DESC_CLOSE_GRACE_MS);
   }
 
-  function openDesc(description: string, e: MouseEvent) {
+  function closeDesc() {
+    clearCloseTimer();
+    descTrigger = null;
+    descAnchor = null;
+  }
+
+  $effect(() => {
+    if (!descAnchor) return;
+    const trigger = descTrigger;
+    const scroll = (event: Event) => {
+      // The description itself remains scrollable; only moving its anchor closes it.
+      if (event.target instanceof Element && event.target.closest('.mcp-tool-desc-popover')) return;
+      closeDesc();
+    };
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeDesc();
+    };
+    const observer = new MutationObserver(() => {
+      if (!trigger?.isConnected || !trigger.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) closeDesc();
+    });
+    if (trigger) observer.observe(trigger.closest('.tools-manager') ?? trigger, {
+      subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'style', 'hidden', 'inert'],
+    });
+    window.addEventListener('scroll', scroll, true);
+    window.addEventListener('keydown', keydown, true);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('scroll', scroll, true);
+      window.removeEventListener('keydown', keydown, true);
+    };
+  });
+  onDestroy(clearCloseTimer);
+
+  function openDesc(description: string, e: MouseEvent | FocusEvent) {
     clearCloseTimer();
     const btn = e.currentTarget as HTMLElement;
     const rect = btn.getBoundingClientRect();
@@ -684,11 +716,12 @@
       top = window.innerHeight - DESC_POPOVER_MAX_HEIGHT - gutter;
     }
     if (top < gutter) top = gutter;
+    descTrigger = btn;
     descAnchor = { x: left, y: top, width, description };
   }
 </script>
 
-<svelte:window onresize={() => { descAnchor = null; }} />
+<svelte:window onresize={closeDesc} onblur={closeDesc} />
 
 <div class="apple-manager tools-manager">
   <div class="apple-scroller-proxy">
@@ -974,10 +1007,10 @@
                                 {#if tool.description}
                                   <button
                                     class="mcp-tool-desc-btn"
-                                    title={i18n.t('settings.tools.viewDesc')}
+                                    aria-label={i18n.t('settings.tools.viewDesc')}
                                     onmouseenter={(e) => openDesc(tool.description, e)}
                                     onmouseleave={scheduleClose}
-                                    onfocus={(e) => openDesc(tool.description, e as unknown as MouseEvent)}
+                                    onfocus={(e) => openDesc(tool.description, e)}
                                     onblur={scheduleClose}
                                   >
                                     <Icon name="info" size={12} />

@@ -1533,19 +1533,11 @@ async fn submit_conversation_session_turn(
     // Conversation 也支持请求级主模型覆盖；先持久化会话模型身份，再接纳
     // canonical Turn，确保后台执行读取到与 accepted 请求一致的 Provider 配置。
     if let Some(config) = request.orchestrator_session_config.as_ref() {
-        let save_result = if created_session {
-            crate::model_config::save_orchestrator_session_override_for_session(
-                &state,
-                &session_id,
-                config,
-            )
-        } else {
-            crate::model_config::save_orchestrator_session_override_for_session(
-                &state,
-                &session_id,
-                config,
-            )
-        };
+        let save_result = crate::model_config::save_orchestrator_session_override_for_session(
+            &state,
+            &session_id,
+            config,
+        );
         if let Err(error) = save_result {
             if created_session {
                 let _ = state

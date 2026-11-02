@@ -15525,7 +15525,7 @@ done
             let kind = crate::continuation::decide_continuation(
                 crate::turn_service::session_recoverable_branch_count(&harness.state, &session),
                 export.resume_candidate.as_ref(),
-                Some(&store),
+                Some(store),
             );
             assert!(kind.is_some(), "用户停止的主线必须可以继续: {export:?}");
             return;

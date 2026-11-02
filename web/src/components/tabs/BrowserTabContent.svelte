@@ -3,6 +3,7 @@
   import FileName from '../FileName.svelte';
   import { onMount, tick, untrack } from 'svelte';
   import Icon from '../Icon.svelte';
+  import { delegatedTooltip } from '../../lib/delegated-tooltip';
   import AgentCursorOverlay, { type AgentCursorSignal } from './AgentCursorOverlay.svelte';
   import { agentCursorPoint, normalizeAgentCursorAction } from '../../lib/agent-cursor';
   import { i18n } from '../../stores/i18n.svelte';
@@ -1179,13 +1180,6 @@
     );
   }
 
-  function tooltipTarget(event: Event): HTMLElement | null {
-    const target = event.target;
-    return target instanceof Element
-      ? target.closest<HTMLElement>('[data-tooltip]')
-      : null;
-  }
-
   function clearToolbarTooltip(): void {
     if (tooltipAnchorElement) {
       if (tooltipAnchorPreviousValue) {
@@ -1204,8 +1198,7 @@
     tooltipText = '';
   }
 
-  function updateToolbarTooltip(event: Event): void {
-    const target = tooltipTarget(event);
+  function updateToolbarTooltip(target: HTMLElement | null): void {
     const text = target?.dataset.tooltip?.trim() ?? '';
     if (!target || !text || target.matches(':disabled')) {
       clearToolbarTooltip();
@@ -1224,24 +1217,10 @@
     tooltipText = text;
   }
 
-  function handleToolbarPointerOut(event: PointerEvent): void {
-    const target = tooltipTarget(event);
-    const related = event.relatedTarget;
-    if (target && related instanceof Node && target.contains(related)) return;
-    if (related instanceof Node && browserToolbar?.contains(related)) return;
-    clearToolbarTooltip();
-  }
-
   function restoreOverlayTriggerFocus(
     target: HTMLButtonElement | undefined,
   ): void {
     void tick().then(() => target?.focus());
-  }
-
-  function handleToolbarFocusOut(event: FocusEvent): void {
-    const related = event.relatedTarget;
-    if (related instanceof Node && browserToolbar?.contains(related)) return;
-    clearToolbarTooltip();
   }
 
   async function openDesktopAnnotationCreation(): Promise<void> {
@@ -1939,10 +1918,7 @@ function browserPartitionForSession(browserSessionId: string): string { return `
     style:anchor-name={toolbarAnchorName}
     role="toolbar"
     tabindex="-1"
-    onpointerover={updateToolbarTooltip}
-    onpointerout={handleToolbarPointerOut}
-    onfocusin={updateToolbarTooltip}
-    onfocusout={handleToolbarFocusOut}
+    use:delegatedTooltip={updateToolbarTooltip}
   >
     {#if desktopRuntime}
       <button type="button" class="icon-button flip" onclick={() => navigate('back')} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.navigation.back')} aria-label={i18n.t('browser.navigation.back')}><Icon name="chevron-right" size={13} /></button>

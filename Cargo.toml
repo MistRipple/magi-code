@@ -39,7 +39,7 @@ members = [
 ]
 
 [workspace.package]
-version = "3.0.61"
+version = "3.0.62"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Magi contributors"]

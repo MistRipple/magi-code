@@ -11,6 +11,7 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock, broadcast, mpsc};
 
 const WORKSPACE_WATCH_EVENT_CAPACITY: usize = 2_048;
+const STORAGE_MIGRATION_MANIFEST: &str = "storage-migration-v1.json";
 
 struct WorkspaceWatcher {
     _watcher: FsWatcher,
@@ -427,7 +428,6 @@ fn resolve_relative_path(base: &Path, path: &Path) -> PathBuf {
 /// 失败不留下半迁移目标，不删除或覆盖旧数据。
 fn migrate_snapshot_storage(from: &Path, to: &Path) -> SnapshotResult<()> {
     use sha2::{Digest, Sha256};
-    const MANIFEST: &str = "storage-migration-v1.json";
     if to.starts_with(from) || from.starts_with(to) {
         return Err(SnapshotError::InvalidRoot(
             "新旧快照存储目录不能重叠".into(),
@@ -444,13 +444,7 @@ fn migrate_snapshot_storage(from: &Path, to: &Path) -> SnapshotResult<()> {
         ));
     }
     if to.is_dir() {
-        let path = to.join(MANIFEST);
-        let actual: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&path).map_err(|error| SnapshotError::io(&path, error))?,
-        )?;
-        if actual != manifest {
-            return Err(SnapshotError::InvalidRoot("快照存储迁移身份不匹配".into()));
-        }
+        validate_existing_migration(to, &manifest)?;
         return Ok(());
     }
     if to.exists() {
@@ -477,7 +471,7 @@ fn migrate_snapshot_storage(from: &Path, to: &Path) -> SnapshotResult<()> {
         if from.exists() {
             copy_snapshot_directory(from, &staging)?;
         }
-        let manifest_path = staging.join(MANIFEST);
+        let manifest_path = staging.join(STORAGE_MIGRATION_MANIFEST);
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -490,7 +484,7 @@ fn migrate_snapshot_storage(from: &Path, to: &Path) -> SnapshotResult<()> {
         std::fs::File::open(&staging)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| SnapshotError::io(&staging, error))?;
-        std::fs::rename(&staging, to).map_err(|error| SnapshotError::io(to, error))?;
+        publish_migration_directory(&staging, to, &manifest)?;
         #[cfg(unix)]
         std::fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
@@ -501,6 +495,34 @@ fn migrate_snapshot_storage(from: &Path, to: &Path) -> SnapshotResult<()> {
         let _ = std::fs::remove_dir_all(&staging);
     }
     result
+}
+
+fn validate_existing_migration(to: &Path, expected: &serde_json::Value) -> SnapshotResult<()> {
+    let path = to.join(STORAGE_MIGRATION_MANIFEST);
+    let actual: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).map_err(|error| SnapshotError::io(&path, error))?,
+    )?;
+    if actual != *expected {
+        return Err(SnapshotError::InvalidRoot("快照存储迁移身份不匹配".into()));
+    }
+    Ok(())
+}
+
+fn publish_migration_directory(
+    staging: &Path,
+    to: &Path,
+    manifest: &serde_json::Value,
+) -> SnapshotResult<()> {
+    match std::fs::rename(staging, to) {
+        Ok(()) => Ok(()),
+        Err(_) if to.is_dir() && validate_existing_migration(to, manifest).is_ok() => {
+            // Another initializer may publish the same snapshot root first. Windows reports
+            // ERROR_ACCESS_DENIED when the destination directory already exists.
+            std::fs::remove_dir_all(staging).map_err(|error| SnapshotError::io(staging, error))?;
+            Ok(())
+        }
+        Err(rename_error) => Err(SnapshotError::io(to, rename_error)),
+    }
 }
 
 fn copy_snapshot_directory(from: &Path, to: &Path) -> SnapshotResult<()> {
@@ -568,6 +590,40 @@ mod tests {
             .current_dir(root)
             .output()
             .expect("git command should run")
+    }
+
+    #[test]
+    fn migration_publication_accepts_a_matching_target_committed_by_another_initializer() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join("staging");
+        let target = root.path().join("snapshots");
+        let manifest = serde_json::json!({"version": 1, "sourceIdentity": "same-source"});
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(
+            staging.join(STORAGE_MIGRATION_MANIFEST),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            target.join(STORAGE_MIGRATION_MANIFEST),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        publish_migration_directory(&staging, &target, &manifest).unwrap();
+
+        assert!(
+            !staging.exists(),
+            "losing initializer must clean its staging tree"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(target.join(STORAGE_MIGRATION_MANIFEST)).unwrap()
+            )
+            .unwrap(),
+            manifest
+        );
     }
 
     #[tokio::test]

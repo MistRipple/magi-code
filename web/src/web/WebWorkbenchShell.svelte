@@ -13,6 +13,7 @@
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { setWebSidebarContext } from './sidebar-context';
   import Icon from '../components/Icon.svelte';
+  import { delegatedTooltip } from '../lib/delegated-tooltip';
   import UnavailableSessionList from '../components/UnavailableSessionList.svelte';
   import NotificationCenter from '../components/NotificationCenter.svelte';
   import ExternalApprovalTray from '../components/ExternalApprovalTray.svelte';
@@ -249,8 +250,6 @@ import {
     align: 'start' | 'end';
   };
   let sidebarTooltip = $state<SidebarTooltipState | null>(null);
-  let sidebarTooltipTarget = $state<HTMLElement | null>(null);
-  let sidebarTooltipFrame: number | null = null;
   let desktopRightPaneVisible = $state(false);
   let desktopSnapshot = $state<MagiDesktopWindowSnapshot | null>(null);
   let workbenchElement = $state<HTMLElement | null>(null);
@@ -2600,27 +2599,12 @@ import {
     }
   }
 
-  function sidebarTooltipTargetFromEvent(event: Event): HTMLElement | null {
-    const eventTarget = event.target instanceof Element
-      ? event.target.closest<HTMLElement>('[data-tooltip]')
-      : null;
-    if (!eventTarget || !sidebarElement?.contains(eventTarget)) {
-      return null;
-    }
-    return eventTarget;
-  }
-
   function clearSidebarTooltip(): void {
-    if (sidebarTooltipFrame !== null && typeof window !== 'undefined') {
-      window.cancelAnimationFrame(sidebarTooltipFrame);
-      sidebarTooltipFrame = null;
-    }
-    sidebarTooltipTarget = null;
     sidebarTooltip = null;
   }
 
-  function positionSidebarTooltip(target: HTMLElement | null = sidebarTooltipTarget): void {
-    if (!target || !target.isConnected || !sidebarElement?.contains(target)) {
+  function positionSidebarTooltip(target: HTMLElement | null): void {
+    if (!target) {
       clearSidebarTooltip();
       return;
     }
@@ -2643,62 +2627,6 @@ import {
       Math.max(viewportPadding, window.innerWidth - viewportPadding),
     );
     sidebarTooltip = { text, left, top, placement, align };
-  }
-
-  function scheduleSidebarTooltipPosition(): void {
-    if (!sidebarTooltipTarget || sidebarTooltipFrame !== null || typeof window === 'undefined') {
-      return;
-    }
-    sidebarTooltipFrame = window.requestAnimationFrame(() => {
-      sidebarTooltipFrame = null;
-      positionSidebarTooltip();
-    });
-  }
-
-  function showSidebarTooltip(event: Event): void {
-    const target = sidebarTooltipTargetFromEvent(event);
-    if (!target) return;
-    const text = target.dataset.tooltip?.trim() || '';
-    if (!text) return;
-    sidebarTooltipTarget = target;
-    positionSidebarTooltip(target);
-  }
-
-  function handleSidebarTooltipPointerOver(event: PointerEvent): void {
-    const target = sidebarTooltipTargetFromEvent(event);
-    const relatedTarget = event.relatedTarget;
-    if (!target || (relatedTarget instanceof Node && target.contains(relatedTarget))) {
-      return;
-    }
-    showSidebarTooltip(event);
-  }
-
-  function handleSidebarTooltipPointerOut(event: PointerEvent): void {
-    const target = sidebarTooltipTargetFromEvent(event);
-    const relatedTarget = event.relatedTarget;
-    if (target && relatedTarget instanceof Node && target.contains(relatedTarget)) {
-      return;
-    }
-    if (!relatedTarget || target === sidebarTooltipTarget) {
-      clearSidebarTooltip();
-    }
-  }
-
-  function handleSidebarTooltipFocusIn(event: FocusEvent): void {
-    showSidebarTooltip(event);
-  }
-
-  function handleSidebarTooltipFocusOut(event: FocusEvent): void {
-    const target = sidebarTooltipTargetFromEvent(event);
-    const relatedTarget = event.relatedTarget;
-    if (target && relatedTarget instanceof Node && target.contains(relatedTarget)) {
-      return;
-    }
-    clearSidebarTooltip();
-  }
-
-  function handleSidebarTooltipViewportChange(): void {
-    scheduleSidebarTooltipPosition();
   }
 
   $effect(() => {
@@ -3111,7 +3039,6 @@ import {
     // 先于 handlePanelEscape 注册：弹出面板消费 Escape 后，抽屉与右栏不再连带关闭。
     const stopPopoverDismiss = installShellPopoverDismiss();
     window.addEventListener('resize', handleResize);
-    window.addEventListener('scroll', handleSidebarTooltipViewportChange, true);
     window.addEventListener('magi:previewFile', handlePreviewFile as EventListener);
     window.addEventListener(OPEN_HTML_FILE_IN_BROWSER_EVENT, handleOpenHtmlFileInBrowser as EventListener);
     window.addEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser as EventListener);
@@ -3139,7 +3066,6 @@ import {
       stopDesktopFileDrop?.();
       desktopDropIndicator = null;
       window.removeEventListener('resize', handleResize);
-      window.removeEventListener('scroll', handleSidebarTooltipViewportChange, true);
       window.removeEventListener('magi:previewFile', handlePreviewFile as EventListener);
       window.removeEventListener(OPEN_HTML_FILE_IN_BROWSER_EVENT, handleOpenHtmlFileInBrowser as EventListener);
       window.removeEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser as EventListener);
@@ -3218,10 +3144,7 @@ import {
     class:workbench-view--away={shellUi.settingsOpen}
     inert={shellUi.settingsOpen}
     class:sidebar--open={sidebarIsDrawer && sidebarOpen}
-    onpointerover={handleSidebarTooltipPointerOver}
-    onpointerout={handleSidebarTooltipPointerOut}
-    onfocusin={handleSidebarTooltipFocusIn}
-    onfocusout={handleSidebarTooltipFocusOut}
+    use:delegatedTooltip={positionSidebarTooltip}
   >
     <div class="sidebar-header">
       <button
@@ -3289,7 +3212,7 @@ import {
               <Icon name="chevronDown" size={11} />
             </span>
           </button>
-          <div class="section-title-tools section-title-tools--projects">
+          <div class="section-title-tools">
             <button
               type="button"
               class="btn-icon btn-icon--sm"
@@ -3381,7 +3304,6 @@ import {
                     class="btn-icon btn-icon--sm row-action"
                     data-workspace-action="new"
                     data-tooltip={i18n.t('web.newWorkspaceSessionTitle')}
-                    title={i18n.t('web.newWorkspaceSessionTitle')}
                     aria-label={i18n.t('web.newWorkspaceSessionAria', { name: workspace.name })}
                     disabled={workspaceActionPending || messagesState.sessionHydrating}
                     onclick={(event) => {
@@ -3396,7 +3318,6 @@ import {
                     class="btn-icon btn-icon--sm row-action"
                     data-workspace-action="edit"
                     data-tooltip={i18n.t('web.editWorkspaceTitle')}
-                    title={i18n.t('web.editWorkspaceTitle')}
                     aria-label={i18n.t('web.editWorkspaceAria', { name: workspace.name })}
                     disabled={workspaceActionPending}
                     onclick={(event) => {
@@ -4580,7 +4501,7 @@ import {
     opacity: 0.35;
   }
 
-  /* 项目入口常显；其他分区工具在悬停或键盘聚焦时出现。 */
+  /* 分区工具默认隐藏，悬停或键盘聚焦时出现；保留占位避免标题跳动。 */
   .section-title-tools {
     --btn-height-sm: var(--btn-height-md);
     display: flex;
@@ -4588,14 +4509,14 @@ import {
     gap: var(--space-1);
     flex-shrink: 0;
     opacity: 0;
+    pointer-events: none;
     transition: opacity var(--transition-fast);
   }
 
-  .section-title-tools--projects,
   .section-title-row:hover .section-title-tools,
-  .section-title-row:focus-within .section-title-tools,
-  .section-title-tools:has(.btn-icon--active) {
+  .section-title-row:has(:focus-visible) .section-title-tools {
     opacity: 1;
+    pointer-events: auto;
   }
 
   /* 文件树模式的标题：左侧箭头兼任“返回项目”，名称保持原大小写。 */

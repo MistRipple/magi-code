@@ -626,7 +626,7 @@ pub(crate) struct ApprovalOwner {
 
 /// 当前所有可能持有外部待审批的调用方。跨会话待确认入口只扫描它们。
 pub(crate) fn approval_owners(state: &ApiState) -> Vec<ApprovalOwner> {
-    let owners = state
+    state
         .mcp_service
         .list_tokens()
         .into_iter()
@@ -637,9 +637,7 @@ pub(crate) fn approval_owners(state: &ApiState) -> Vec<ApprovalOwner> {
             token_prefix: record.prefix,
             workspace_id: record.workspace_id,
         })
-        .collect::<Vec<_>>();
-
-    owners
+        .collect::<Vec<_>>()
 }
 
 fn liveness(

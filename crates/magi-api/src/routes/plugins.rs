@@ -636,9 +636,8 @@ async fn release_application_resources(state: &ApiState, plugin_id: &str) -> Res
 /// 应用级激活后按已保存的配置恢复宿主资源（持久配置只是“用户配置过”，不会在未激活时复活）。
 fn restore_application_resources(state: &ApiState, plugin_id: &str) {
     let state = state.clone();
-    match plugin_id {
-        crate::bundled_plugins::MCP_SERVER_PLUGIN_ID => state.start_mcp_service_if_enabled(),
-        _ => {}
+    if plugin_id == crate::bundled_plugins::MCP_SERVER_PLUGIN_ID {
+        state.start_mcp_service_if_enabled();
     }
 }
 
