@@ -134,6 +134,39 @@ HTTP 观测与重试进度是两个合同：重试通知继续负责在再次发
 - 传输重试是否产生额外 usage；
 - 失效是 Magi 前缀变化、provider 能力未知，还是 provider 没有命中。
 
+## 输入区会话统计
+
+输入区的 `SessionStats` 与上下文圆环分别展示累计调用用量和当前上下文压力，二者不合并分母。
+`GET /api/settings/stats?sessionId=…` 沿原用量账本与 `UsageAuthority` reducer 过滤会话，
+全局设置页仍复用同一入口。全部调用包括图片/视觉等角色，主对话、子代理和辅助调用可独立筛选。
+调用数按 HTTP attempt 计数；统计继承账本保留期与全局清零边界，不承诺被清零或过期前的终身累计。
+
+- 缓存 token 命中率 = 已报告缓存读取 / 同一观测样本的完整输入；请求命中率 = 命中请求 / 已观测请求。
+  零与缺失分别保留；缓存写入单独统计观测覆盖，不能用读取观测推断写入已报告。
+  OpenAI Chat 与 DeepSeek 的 `prompt_cache_hit_tokens` 共用同一流式/非流式解析器；
+  DeepSeek hit 已包含在 prompt token 内，不重复加入完整输入。
+  输入已含缓存但缓存读取超过完整输入的异常回执不计入命中样本，不能用饱和相减制造 100% 命中。
+- `ModelTransportRecord.responseTiming` 在 HTTP I/O 线程采集正文首段和末段时间，沿原 Step /
+  auxiliary 回执持久化。仅成功交付的正文流参与性能累计；TTFT 按有效流次数平均，TPS 按可配对
+  正文 token 总量 / 首末正文网络接收间隔总和计算，不平均各次速度。同一 HTTP read 的所有
+  SSE 事件共用接收时间，不能把解析 CPU 耗时当作生成间隔。它是受网络与上游缓冲影响的客户端
+  观测吞吐，不声称是模型内部纯解码速度。OpenAI 协议缺少明确推理 token 拆分、
+  混有工具参数/音频/其他非正文输出、Anthropic 含未拆分或 redacted thinking、同批接收或
+  非流式输出时不推算 TPS。推理明细必须来自与最终输出数相同的一份 usage，不能沿用中间拆分。
+- `ModelTransportRecord.usageObserved` 冻结 Provider 是否实际报告用量；投影到
+  `callIdentity.transport.usageReported` 并提供用量覆盖次数。缺失/空 usage 不能被 adapter 的零默认值补造。
+  全部缺失时累计 Token 显示未知，部分缺失时展示已报告合计及覆盖数；不能把缺失用量解释为零成本。
+  旧记录缺少存在性标记且全零时保持未知；有实际非零 token 或显式缓存字段时保守纳入已知样本。
+- Chat 的完整 usage 和 Responses 终态 usage 可修正较早快照；Anthropic 保留协议规定的分段合并。
+  持久化约束冻结请求身份和接收顺序；在途快照允许计数修正，用量不能整体丢失。
+  计时与用量配对后、HTTP outcome 确认后都不可再改写；canonical 恢复消费最新冻结回执。
+- 运行中显示已结算值与待返回提示，不把字符数当作真实 token。旧记录缺少 timing 时保留未知；
+  恢复与重复事件仍按 attempt 去重。UI 仅投影服务端数据，切换会话丢弃旧请求结果；刷新失败保留
+  上次结果并提供重试，不持久化第二份统计。
+- 统计入口在宽容器显示速度与缓存摘要，窄容器收为图标；沿原向上方向展开，按会话列和
+  visual viewport 约束尺寸，复用原生 Popover 层避免会话导航穿透。触控入口为 44 CSS px 热区，
+  与上下文入口互斥，支持点击外部关闭及 Esc 返回焦点。
+
 ## 历史投影唯一权威
 
 模型可见历史是 canonical 状态的**纯函数**，只有一个实现：`magi-conversation-runtime::history_projection`。它拥有三件事——单条工具结果的模型可见形态（先补事实标注，再做单条上限裁剪）、文件读取事实的有效性校验（重建时按工作区当前内容判定 current/stale）、工具结果总预算（降级边界只落在从头累计的块边界上）。

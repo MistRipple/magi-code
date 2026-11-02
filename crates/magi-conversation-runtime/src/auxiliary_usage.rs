@@ -187,7 +187,7 @@ mod tests {
                 "templateId":"auxiliary","engineId":"auxiliary","bindingRevision":1,"role":"auxiliary","phase":"integration",
                 "workspaceId":null,"modelConfig":{"provider":"configured","model":"frozen-aux","baseUrl":"https://original.test/v1"}
             })).unwrap(),
-            transport: ModelTransportRecord { observed_at: Some(at), request_fingerprint: "d".repeat(64), http_status: Some(200),
+            transport: ModelTransportRecord { usage_observed: None, response_timing: None, observed_at: Some(at), request_fingerprint: "d".repeat(64), http_status: Some(200),
                 usage: Some(ModelTransportUsage { input_tokens: 12, output_tokens: 3, cache_read_tokens: None, cache_write_tokens: None, cache_read_included_in_input: false }),
                 outcome: Some(ModelTransportOutcome::Succeeded) },
             call_status: None,

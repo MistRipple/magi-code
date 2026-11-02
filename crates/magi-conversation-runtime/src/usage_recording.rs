@@ -858,10 +858,7 @@ fn publish_model_usage_record_internal(
             attempt.call_identity.transport =
                 transport
                     .as_ref()
-                    .map(|record| magi_usage_authority::UsageTransportIdentity {
-                        request_fingerprint: record.request_fingerprint.clone(),
-                        http_status: record.http_status,
-                    });
+                    .map(magi_usage_authority::UsageTransportIdentity::from_receipt);
             attempt.event_id = Some(format!(
                 "model-usage:{usage_scope_key}:{session_id}:{attempt_id}"
             ));
@@ -1121,7 +1118,7 @@ fn usage_tokens_from_payload(usage: Option<&serde_json::Value>) -> Option<UsageT
             "/promptTokensDetails/cachedTokens",
             "/inputTokensDetails/cachedTokens",
         ],
-    );
+    ).or_else(|| usage_u64_field(usage, &["prompt_cache_hit_tokens", "promptCacheHitTokens"]));
     let explicit_cache_read_tokens = usage_u64_field(
         usage,
         &[
@@ -1235,6 +1232,8 @@ mod tests {
         let binding = auxiliary_model_usage_binding(UsagePhase::Integration);
         let receipts = vec![
             ModelTransportRecord {
+                usage_observed: None,
+                response_timing: None,
                 observed_at: None,
                 request_fingerprint: "a".repeat(64),
                 http_status: Some(200),
@@ -1248,6 +1247,8 @@ mod tests {
                 outcome: Some(ModelTransportOutcome::Failed),
             },
             ModelTransportRecord {
+                usage_observed: None,
+                response_timing: None,
                 observed_at: None,
                 request_fingerprint: "b".repeat(64),
                 http_status: Some(200),
@@ -1416,6 +1417,16 @@ mod tests {
             5
         );
         assert!(keys[10].is_none());
+    }
+
+    #[test]
+    fn deepseek_cache_hit_tokens_are_included_in_prompt_tokens() {
+        let usage = usage_tokens_from_payload(Some(&json!({
+            "prompt_tokens":100, "completion_tokens":10, "prompt_cache_hit_tokens":60, "prompt_cache_miss_tokens":40
+        }))).unwrap();
+        assert_eq!(usage.cache_read_tokens, Some(60));
+        assert!(usage.cache_read_included_in_input);
+        assert_eq!(provider_context_tokens_from_usage(&usage), 100);
     }
 
     #[test]

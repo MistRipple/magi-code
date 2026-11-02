@@ -9,7 +9,7 @@ use serde_json::Value;
 
 pub mod generated;
 pub use generated::{
-    ModelTransportOutcome, ModelTransportRecord, ModelTransportUsage, ModelUsageContext,
+    ModelResponseTiming, ModelTransportOutcome, ModelTransportRecord, ModelTransportUsage, ModelUsageContext,
     ModelUsageModelConfig, ModelUsagePhase, ModelUsageSourceRole,
 };
 

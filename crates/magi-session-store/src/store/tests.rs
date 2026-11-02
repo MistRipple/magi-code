@@ -6958,6 +6958,8 @@ fn goal_step_charges_reported_retry_usage_once_including_native_failures() {
         .unwrap();
     for index in 0..2 {
         let record = ModelTransportRecord {
+            usage_observed: None,
+            response_timing: None,
             observed_at: None,
             request_fingerprint: "e".repeat(64),
             http_status: Some(200),

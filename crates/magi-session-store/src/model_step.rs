@@ -43,26 +43,20 @@ fn valid_transport_update(
         (Some(old), Some(next)) if old.outcome.is_some() => old == next,
         (Some(old), Some(next)) => {
             old.request_fingerprint == next.request_fingerprint
+                && old.usage_observed.is_none_or(|observed| next.usage_observed.is_some_and(|next| !observed || next))
+                && old.response_timing.as_ref().is_none_or(|timing| {
+                    next.response_timing.as_ref() == Some(timing)
+                        && next.usage == old.usage
+                })
                 && old
                     .observed_at
                     .is_none_or(|at| next.observed_at.is_some_and(|next| next >= at))
                 && old
                     .http_status
                     .is_none_or(|status| next.http_status == Some(status))
-                && old.usage.as_ref().is_none_or(|usage| {
-                    next.usage.as_ref().is_some_and(|next| {
-                        next.input_tokens >= usage.input_tokens
-                            && next.output_tokens >= usage.output_tokens
-                            && usage.cache_read_tokens.is_none_or(|value| {
-                                next.cache_read_tokens.is_some_and(|next| next >= value)
-                            })
-                            && usage.cache_write_tokens.is_none_or(|value| {
-                                next.cache_write_tokens.is_some_and(|next| next >= value)
-                            })
-                            && (!usage.cache_read_included_in_input
-                                || next.cache_read_included_in_input)
-                    })
-                })
+                // Provider usage is a revisable snapshot while HTTP is in flight.
+                // Identity / receipt order remain fixed; outcome freezes the entire receipt above.
+                && old.usage.as_ref().is_none_or(|_| next.usage.is_some())
         }
     }
 }
@@ -75,7 +69,7 @@ pub fn validate_model_transport_update(
         Ok(())
     } else {
         Err(DomainError::InvalidState {
-            message: "模型 transport 证据已冻结或用量回退".into(),
+            message: "模型 transport 证据已冻结或已观测用量丢失".into(),
         })
     }
 }
@@ -546,10 +540,12 @@ mod tests {
     }
 
     #[test]
-    fn transport_evidence_is_monotonic_and_settled_receipts_are_immutable() {
+    fn transport_evidence_preserves_identity_and_freezes_at_settlement() {
         let original = step();
         let mut started = original.clone();
         started.attempts[0].transport = Some(ModelTransportRecord {
+            usage_observed: None,
+            response_timing: None,
             observed_at: None,
             request_fingerprint: "c".repeat(64),
             http_status: None,
@@ -569,6 +565,21 @@ mod tests {
         });
         next.validate_update_from(&started).unwrap();
         next.validate_terminal_settlement_from(&started).unwrap();
+        let untimed = next.clone();
+        next.attempts[0].transport.as_mut().unwrap().response_timing =
+            Some(magi_app_server_protocol::ModelResponseTiming {
+                first_content_ms: 300,
+                content_duration_ms: 1000,
+                text_output_tokens: Some(3),
+            });
+        next.validate_update_from(&untimed).unwrap();
+        let mut lost_timing = next.clone();
+        lost_timing.attempts[0]
+            .transport
+            .as_mut()
+            .unwrap()
+            .response_timing = None;
+        assert!(lost_timing.validate_update_from(&next).is_err());
         let mut rewritten = next.clone();
         rewritten.attempts[0]
             .transport
@@ -576,7 +587,7 @@ mod tests {
             .unwrap()
             .request_fingerprint = "d".repeat(64);
         assert!(rewritten.validate_update_from(&next).is_err());
-        rewritten = next.clone();
+        rewritten = untimed.clone();
         rewritten.attempts[0]
             .transport
             .as_mut()
@@ -585,7 +596,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .output_tokens = 2;
-        assert!(rewritten.validate_update_from(&next).is_err());
+        rewritten.validate_update_from(&untimed).unwrap();
         started = next.clone();
         next.attempts[0].transport.as_mut().unwrap().outcome = Some(ModelTransportOutcome::Failed);
         next.validate_update_from(&started).unwrap();

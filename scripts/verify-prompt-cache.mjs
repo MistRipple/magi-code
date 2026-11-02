@@ -14,12 +14,14 @@ const args = process.argv.slice(2);
 const option = name => args.includes(name) ? args[args.indexOf(name) + 1] : undefined;
 const live = args.includes('--live');
 const smoke = args.includes('--smoke');
+const sessionStats = args.includes('--session-stats');
 // 同一会话内：先一个带工具调用的回合，再两个纯对话回合。用于观察回合边界处上一回合的工具历史能否被缓存复用。
 const toolTurns = args.includes('--tool-turns');
 const root = fileURLToPath(new URL('..', import.meta.url));
 const output = resolve(option('--output') ?? await mkdtemp(join(tmpdir(), 'magi-prompt-cache-')));
 const candidate = resolve(option('--candidate') ?? join(root, 'target/debug/magi-daemon-app'));
 const baseline = option('--baseline') && resolve(option('--baseline'));
+assert.ok(!sessionStats || (!live && !baseline && !smoke), '--session-stats requires the full controlled candidate run');
 const maxCalls = Number(option('--max-calls') ?? 48);
 assert.ok(Number.isSafeInteger(maxCalls) && maxCalls > 0 && maxCalls <= 96, '--max-calls must be 1..96');
 await mkdir(output, { recursive: true });
@@ -54,12 +56,13 @@ const calls = [], phases = [], rejectedCalls = [];
 let phase, scenario, daemon, currentCalls = [], lastInputByLane = new Map();
 let fixtureOrigin, fixtureWorkspace, fixtureReadTurn = false;
 
-const emptyCache = () => ({ observedCallCount: 0, hitCallCount: 0, inputTokens: 0, readTokens: 0, writeTokens: 0 });
+const emptyCache = () => ({ observedCallCount: 0, hitCallCount: 0, inputTokens: 0, readTokens: 0, writeTokens: 0, writeObservedCallCount: 0 });
 function cacheFromLedger(records) {
   const cache = emptyCache();
   for (const { usage } of records) {
     const read = usage?.cacheReadTokens ?? 0, write = usage?.cacheWriteTokens ?? 0;
     cache.readTokens += read; cache.writeTokens += write;
+    cache.writeObservedCallCount += Number(usage?.cacheWriteTokens != null);
     if (usage?.cacheReadTokens == null) continue;
     cache.observedCallCount++; cache.hitCallCount += Number(read > 0);
     cache.inputTokens += Math.max(0, (usage.inputTokens ?? 0) - (usage.cacheReadIncludedInInput ? read : 0)) + read + write;
@@ -76,7 +79,9 @@ async function readLedger(stateRoot) {
   const reset = Math.max(0, ...entries.filter(entry => entry.event_type === 'usage.stats.reset').map(entry => entry.sequence));
   const records = new Map();
   for (const entry of entries) if (entry.sequence > reset && entry.event_type === 'model.usage.recorded') {
-    records.set(entry.payload.eventId ?? entry.event_id, entry.payload);
+    const key = entry.payload.eventId ?? entry.event_id;
+    if (sessionStats) assert.ok(!records.has(key), 'physical usage ledger must not contain duplicate attempt events');
+    records.set(key, entry.payload);
   }
   return [...records.values()];
 }
@@ -104,6 +109,8 @@ function verifyLedger(stats, records, label) {
         && (record.usage.cacheReadTokens ?? null) === wire.usage.cachedTokens
       ));
       assert.ok(index >= 0, 'usage transport identity and provider usage match a real wire request');
+      assert.equal(record.executionBinding.role, { main: 'orchestrator', worker: 'worker', auxiliary: 'auxiliary' }[bucket[index].lane], 'actual main/worker/auxiliary wire lane retains its role');
+      assert.equal(identity.source, record.executionBinding.role, 'call and binding roles agree');
       bucket.splice(index, 1);
     }
     for (const key of Object.keys(emptyCache())) assert.equal(stats.models.reduce((sum, model) => sum + model.totals.cache[key], 0), cache[key], `models: ${key}`);
@@ -120,6 +127,47 @@ function verifyLedger(stats, records, label) {
     roles[role] = { calls: selected.length, failedCalls: selected.filter(record => record.status !== 'success').length, cache: cacheFromLedger(selected) };
   }
   return { verified: true, calls: records.length, cache, roles };
+}
+
+// Independently reconcile the public projection with persisted physical receipts.
+function verifySessionStats(stats, records) {
+  const sum = (rows, field) => rows.reduce((total, row) => total + row[field], 0);
+  function verify(totals, selected, label) {
+    assert.equal(totals.llmCallCount, selected.length, `${label}: attempts`);
+    assert.equal(totals.tokenObservedCallCount, selected.filter(record => record.callIdentity.transport?.usageReported).length, `${label}: usage coverage`);
+    assert.equal(totals.netOutputTokens, sum(selected.map(record => record.usage), 'outputTokens'), `${label}: output`);
+    assert.equal(totals.inputTokens, selected.reduce((total, { usage }) => total + usage.inputTokens
+      + (usage.cacheReadIncludedInInput ? 0 : usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0), 0), `${label}: full input`);
+    assert.deepEqual(totals.cache, cacheFromLedger(selected), `${label}: cache`);
+    const measured = selected.filter(record => record.status === 'success' && record.callIdentity.transport?.responseTiming);
+    const timing = measured.map(record => record.callIdentity.transport.responseTiming);
+    const paired = timing.filter(item => item.textOutputTokens > 0 && item.contentDurationMs > 0);
+    const perf = totals.performance;
+    assert.equal(perf.ttftSampleCount, timing.length, `${label}: TTFT coverage`);
+    assert.equal(perf.ttftTotalMs, sum(timing, 'firstContentMs'), `${label}: TTFT sum`);
+    assert.equal(perf.tpsSampleCount, paired.length, `${label}: TPS coverage`);
+    assert.equal(perf.textOutputTokens, sum(paired, 'textOutputTokens'), `${label}: body tokens`);
+    assert.equal(perf.contentDurationMs, sum(paired, 'contentDurationMs'), `${label}: body duration`);
+    const last = measured.reduce((last, record) => !last || record.timestamp >= last.timestamp ? record : last, null);
+    const lastTiming = last?.callIdentity.transport.responseTiming;
+    assert.equal(perf.lastObservedAt, last?.timestamp ?? 0, `${label}: latest observation`);
+    assert.equal(perf.lastTtftMs, lastTiming?.firstContentMs ?? null, `${label}: latest TTFT`);
+    assert.equal(perf.lastTps, lastTiming?.textOutputTokens > 0 && lastTiming.contentDurationMs > 0
+      ? lastTiming.textOutputTokens * 1000 / lastTiming.contentDurationMs : null, `${label}: latest TPS`);
+    for (const item of paired) {
+      assert.equal(item.textOutputTokens, 12, `${label}: reasoning tokens excluded`);
+      assert.ok(item.contentDurationMs >= 40, `${label}: separately flushed body chunks`);
+    }
+  }
+  verify(stats.totals, records, 'total');
+  for (const item of stats.items) {
+    const selected = records.filter(record => record.executionBinding.role === item.role
+      && record.executionBinding.templateId === item.templateId
+      && record.executionBinding.engineId === item.engineId
+      && record.executionBinding.bindingRevision === item.bindingRevision
+      && record.modelConfig.model === item.resolvedModel);
+    verify(item, selected, `${item.role}/${item.templateId}`);
+  }
 }
 
 function fixtureEnvelope(body) {
@@ -154,6 +202,7 @@ function fixtureEnvelope(body) {
   const reasoning = { type: 'reasoning', id: `rs_${calls.length}`, summary: [], encrypted_content: `synthetic-reasoning-${calls.length}` };
   return { id: `resp_${calls.length}`, object: 'response', status: 'completed', output: [reasoning, item], usage: {
     input_tokens: 4096, output_tokens: 16, input_tokens_details: { cached_tokens: prior ? 2048 : 0 },
+    ...(sessionStats ? { output_tokens_details: { reasoning_tokens: 4 } } : {}),
   } };
 }
 function summarizeUsage(usage) {
@@ -213,11 +262,19 @@ const provider = createServer(async (request, response) => {
       sample.firstByteMs = performance.now() - started;
       if (body.stream) {
         response.writeHead(200, { 'content-type': 'text/event-stream' });
+        if (sessionStats) { response.flushHeaders(); await pause(30); }
         for (const [index, item] of envelope.output.entries()) {
           const initial = item.type === 'function_call' ? {...item,arguments:''} : item.type === 'message' ? {...item,content:[]} : item;
           response.write(`event: response.output_item.added\ndata: ${JSON.stringify({type:'response.output_item.added',output_index:index,item:initial})}\n\n`);
           const text = item.type === 'message' ? item.content[0].text : '';
-          if (text) { sample.firstTextMs = performance.now() - started; response.write(`event: response.output_text.delta\ndata: ${JSON.stringify({type:'response.output_text.delta',item_id:item.id,output_index:index,content_index:0,delta:text})}\n\n`); }
+          if (text) {
+            sample.firstTextMs = performance.now() - started;
+            const parts = sessionStats ? [text.slice(0, 6), text.slice(6)] : [text];
+            for (const [partIndex, delta] of parts.entries()) {
+              if (partIndex) await pause(80);
+              response.write(`event: response.output_text.delta\ndata: ${JSON.stringify({type:'response.output_text.delta',item_id:item.id,output_index:index,content_index:0,delta})}\n\n`);
+            }
+          }
           response.write(`event: response.output_item.done\ndata: ${JSON.stringify({type:'response.output_item.done',output_index:index,item})}\n\n`);
         }
         response.end(`event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: envelope })}\n\n`);
@@ -290,11 +347,14 @@ async function run(label, binary) {
   let logs = '';
   const result = { label, binarySha256: digest(await readFile(binary)), completed: false, measurements: [], stats: null,
     transportCalls: 0, usageSource: live ? 'configured upstream; model identity and caching behavior not independently attested' : 'synthetic fixture usage; not a provider cache measurement' };
-  daemon = spawn(binary, [], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env,
-    MAGI_PORT: String(port), MAGI_HOST: '127.0.0.1', MAGI_STATE_ROOT: join(phaseRoot, 'state'), MAGI_WEB_DEV: '0', MAGI_OPEN_BROWSER: '0',
-    MAGI_BUILD_ID: `cache-${label}-${digest(await readFile(binary)).slice(0, 16)}`,
-  } });
-  for (const stream of [daemon.stdout, daemon.stderr]) stream.on('data', chunk => { logs = (logs + chunk).slice(-64000); });
+  const startDaemon = () => {
+    daemon = spawn(binary, [], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env,
+      MAGI_PORT: String(port), MAGI_HOST: '127.0.0.1', MAGI_STATE_ROOT: join(phaseRoot, 'state'), MAGI_WEB_DEV: '0', MAGI_OPEN_BROWSER: '0',
+      MAGI_BUILD_ID: `cache-${label}-${result.binarySha256.slice(0, 16)}`,
+    } });
+    for (const stream of [daemon.stdout, daemon.stderr]) stream.on('data', chunk => { logs = (logs + chunk).slice(-64000); });
+  };
+  startDaemon();
   const json = async (path, body) => {
     const response = await fetch(`${origin}${path}`, body === undefined ? {} : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
     assert.ok(response.ok, `${label} ${path}: ${response.status}`); return response.json();
@@ -419,7 +479,34 @@ async function run(label, binary) {
     result.health = await json('/health');
     // 账本由 daemon 批量刷盘，优雅关闭完成后再核对磁盘事实。
     await stop();
-    result.ledgerVerification = verifyLedger(stats, await readLedger(join(phaseRoot, 'state')), label);
+    const records = await readLedger(join(phaseRoot, 'state'));
+    result.ledgerVerification = verifyLedger(stats, records, label);
+    if (sessionStats) {
+      verifySessionStats(stats, records);
+      for (const role of ['orchestrator', 'worker']) {
+        assert.ok(stats.items.some(item => item.role === role && item.performance.tpsSampleCount > 0), `${role}: real streaming performance must reach the API`);
+      }
+      const callsBeforeRestart = currentCalls.length;
+      startDaemon();
+      await until(async () => {
+        assert.equal(daemon.exitCode, null, 'restarted daemon exited');
+        try { return (await fetch(`${origin}/health`)).ok; } catch { return false; }
+      }, 'daemon restart');
+      const restored = await json('/api/settings/stats');
+      assert.deepEqual(restored.totals, stats.totals, 'restart preserves aggregate measurements');
+      const sessions = [];
+      for (const id of new Set(records.map(record => record.sessionId))) {
+        const selected = records.filter(record => record.sessionId === id);
+        const scoped = await json(`/api/settings/stats?sessionId=${encodeURIComponent(id)}`);
+        verifySessionStats(scoped, selected);
+        sessions.push({ sessionId: id, roles: [...new Set(selected.map(record => record.executionBinding.role))], totals: scoped.totals });
+      }
+      assert.ok(sessions.some(session => session.roles.includes('orchestrator') && session.roles.includes('worker')), 'worker and main usage belongs to the same visible session');
+      await stop();
+      assert.equal(currentCalls.length, callsBeforeRestart, 'statistics recovery must not invoke the model');
+      assert.equal((await readLedger(join(phaseRoot, 'state'))).length, records.length, 'recovery must not duplicate physical attempts');
+      result.sessionStatsVerification = { verified: true, restartVerified: true, sessions };
+    }
     result.completed = true;
     console.log(`${label}: ${currentCalls.length} HTTP calls; ledger/statistics verified`);
   } catch (error) {
@@ -439,7 +526,7 @@ try {
   await run('candidate', candidate);
 } finally {
   await stop(); provider.closeAllConnections(); await new Promise(resolve => provider.close(resolve));
-  await writeFile(join(output, 'benchmark.json'), JSON.stringify({ mode: live ? 'live' : 'controlled', smoke, mainModel, auxiliaryModel, reasoningEffort: effort,
+  await writeFile(join(output, 'benchmark.json'), JSON.stringify({ mode: live ? 'live' : 'controlled', smoke, sessionStats, mainModel, auxiliaryModel, reasoningEffort: effort,
     maxCalls, providerCacheUsage: live ? 'observed only when upstream reports cached tokens' : 'synthetic',
     monetaryCost: 'unpriced unless the configured upstream reports usage.cost; no retail pricing assumed for aliases', phases, calls, rejectedCalls,
   }, null, 2));

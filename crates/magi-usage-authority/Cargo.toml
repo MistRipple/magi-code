@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+magi-app-server-protocol = { path = "../magi-app-server-protocol" }
 serde.workspace = true
 magi-core = { path = "../magi-core" }
 sha2.workspace = true

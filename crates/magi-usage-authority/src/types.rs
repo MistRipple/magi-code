@@ -75,8 +75,37 @@ pub struct UsageCallIdentity {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageTransportIdentity {
+    /// Explicit provider usage presence; old receipts keep None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_reported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_timing: Option<magi_app_server_protocol::ModelResponseTiming>,
     pub request_fingerprint: String,
     pub http_status: Option<u16>,
+}
+
+impl UsageTransportIdentity {
+    pub fn from_receipt(record: &magi_app_server_protocol::ModelTransportRecord) -> Self {
+        // Pre-provenance receipts could contain fabricated all-zero adapter defaults.
+        let usage_reported = record.usage_observed.or_else(|| {
+            record
+                .usage
+                .as_ref()
+                .filter(|usage| {
+                    usage.input_tokens > 0
+                        || usage.output_tokens > 0
+                        || usage.cache_read_tokens.is_some()
+                        || usage.cache_write_tokens.is_some()
+                })
+                .map(|_| true)
+        });
+        Self {
+            usage_reported,
+            response_timing: record.response_timing.clone(),
+            request_fingerprint: record.request_fingerprint.clone(),
+            http_status: record.http_status,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -140,9 +169,47 @@ pub struct UsageEvent {
     pub error_code: Option<String>,
 }
 
+/// Only successful, observed body streams contribute. Missing timing stays unknown.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsagePerformanceTotals {
+    pub ttft_sample_count: u64,
+    pub ttft_total_ms: u64,
+    pub tps_sample_count: u64,
+    pub text_output_tokens: u64,
+    pub content_duration_ms: u64,
+    pub last_observed_at: u64,
+    pub last_ttft_ms: Option<u64>,
+    pub last_tps: Option<f64>,
+}
+
+impl UsagePerformanceTotals {
+    pub fn add(&self, other: &Self) -> Self {
+        let last = if other.last_observed_at >= self.last_observed_at {
+            other
+        } else {
+            self
+        };
+        Self {
+            ttft_sample_count: self.ttft_sample_count + other.ttft_sample_count,
+            ttft_total_ms: self.ttft_total_ms + other.ttft_total_ms,
+            tps_sample_count: self.tps_sample_count + other.tps_sample_count,
+            text_output_tokens: self.text_output_tokens + other.text_output_tokens,
+            content_duration_ms: self.content_duration_ms + other.content_duration_ms,
+            last_observed_at: last.last_observed_at,
+            last_ttft_ms: last.last_ttft_ms,
+            last_tps: last.last_tps,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageTotals {
+    #[serde(default)]
+    pub token_observed_call_count: u64,
+    #[serde(default)]
+    pub performance: UsagePerformanceTotals,
     pub llm_call_count: u64,
     pub assignment_count: u64,
     pub turn_count: u64,
@@ -150,6 +217,8 @@ pub struct UsageTotals {
     pub raw_output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub cache_write_observed_call_count: u64,
     /// 只有 Provider 明确返回 cache read（包括零）的调用才计入观测样本。
     #[serde(default)]
     pub cache_observed_call_count: u64,
@@ -168,6 +237,8 @@ pub struct UsageTotals {
 impl UsageTotals {
     pub fn add(&self, other: &UsageTotals) -> UsageTotals {
         UsageTotals {
+            performance: self.performance.add(&other.performance),
+            token_observed_call_count: self.token_observed_call_count + other.token_observed_call_count,
             llm_call_count: self.llm_call_count + other.llm_call_count,
             assignment_count: self.assignment_count + other.assignment_count,
             turn_count: self.turn_count + other.turn_count,
@@ -175,6 +246,7 @@ impl UsageTotals {
             raw_output_tokens: self.raw_output_tokens + other.raw_output_tokens,
             cache_read_tokens: self.cache_read_tokens + other.cache_read_tokens,
             cache_write_tokens: self.cache_write_tokens + other.cache_write_tokens,
+            cache_write_observed_call_count: self.cache_write_observed_call_count + other.cache_write_observed_call_count,
             cache_observed_call_count: self.cache_observed_call_count
                 + other.cache_observed_call_count,
             cache_hit_call_count: self.cache_hit_call_count + other.cache_hit_call_count,

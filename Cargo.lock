@@ -2016,6 +2016,7 @@ dependencies = [
 name = "magi-usage-authority"
 version = "3.0.61"
 dependencies = [
+ "magi-app-server-protocol",
  "magi-core",
  "serde",
  "serde_json",

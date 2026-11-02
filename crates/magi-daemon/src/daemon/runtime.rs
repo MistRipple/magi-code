@@ -3994,6 +3994,8 @@ done
                     "usage-turn",
                     "usage-step",
                     ModelTransportRecord {
+                        usage_observed: None,
+                        response_timing: None,
                         observed_at: Some(at.0),
                         request_fingerprint: "b".repeat(64),
                         http_status: Some(200),

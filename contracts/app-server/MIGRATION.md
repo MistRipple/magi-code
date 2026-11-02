@@ -37,3 +37,16 @@ Bridge 可以拥有不同传输实现，但不得重新定义同形状的 wire D
 字段时按未声明处理，读取方不得据此推断“未改写”。
 
 网页模型专属配置 DTO、发现/对话绑定字段和浏览器内部命令已从 schema 与生成物中移除；相关端点不再注册。标准 MCP 令牌、外部会话与审批合同保持独立，本地 stdio 中继始终进行令牌握手。
+
+`ModelTransportRecord.responseTiming` 为可选的正文流式计时事实：`firstContentMs` 从实际 HTTP
+发送到首段正文网络接收，`contentDurationMs` 为首末正文网络接收间隔，`textOutputTokens` 只在 Provider
+输出能扣除推理且不混入工具参数时提供。计时在 HTTP I/O 线程采集，不计本地排队、持久化或 UI
+回调耗时。缺失字段表示未知；旧记录与非流式调用不补零。逐次回执沿 canonical Step / 辅助调用
+账本持久化，恢复投影使用原 timing，不能从历史时间戳反推速度。
+同一批 HTTP 字节内解析出的 SSE 事件共享接收时间，不按解析 CPU 时长制造速度。该值为客户端
+观测值，受网络和上游缓冲影响。计时与最终用量配对后冻结；在此之前 Provider usage 快照允许
+修正计数或撤回中间缓存明细，HTTP outcome 冻结后保持整份回执不可变。
+
+`ModelTransportRecord.usageObserved` 为可选的 Provider 用量存在性证据。新 HTTP 记录起始为
+false，只有解析到实际 Token 数字段时才变为 true；缺失或空 usage 不得由 adapter 的零默认值
+补造。旧记录缺少此字段且计数全零时保持未知，不能事后当成已确认零用量。

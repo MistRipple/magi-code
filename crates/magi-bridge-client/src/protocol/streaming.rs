@@ -686,14 +686,7 @@ fn parse_anthropic_stream_event(event_type: Option<&str>, data: &str) -> Vec<Llm
 }
 
 fn parse_openai_usage_value(usage: &Value) -> LlmUsage {
-    let cache_read_tokens = usage["prompt_tokens_details"]["cached_tokens"].as_u64();
-    LlmUsage {
-        input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
-        output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
-        cache_read_tokens,
-        cache_write_tokens: None,
-        cache_read_included_in_input: cache_read_tokens.is_some(),
-    }
+    super::utils::parse_openai_usage(usage)
 }
 
 fn parse_anthropic_usage_value(usage: &Value) -> LlmUsage {

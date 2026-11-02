@@ -5,6 +5,7 @@ pub struct NormalizedUsageTotals {
     pub raw_output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    pub cache_write_observed_call_count: u64,
     pub cache_observed_call_count: u64,
     pub cache_hit_call_count: u64,
     pub cache_observed_input_tokens: u64,
@@ -16,7 +17,11 @@ pub struct NormalizedUsageTotals {
 pub fn normalize_usage_delta(delta: &UsageEventUsageDelta) -> NormalizedUsageTotals {
     let raw_input_tokens = delta.raw_input_tokens;
     let raw_output_tokens = delta.raw_output_tokens;
-    let cache_read_tokens = delta.cache_read_tokens.unwrap_or(0);
+    // Preserve the raw receipt for audit, but reject impossible included-cache observations.
+    let observed_cache_read = delta
+        .cache_read_tokens
+        .filter(|read| !delta.cache_read_included_in_input || *read <= raw_input_tokens);
+    let cache_read_tokens = observed_cache_read.unwrap_or(0);
     let cache_write_tokens = delta.cache_write_tokens.unwrap_or(0);
     let net_input_tokens = if delta.cache_read_included_in_input {
         raw_input_tokens.saturating_sub(cache_read_tokens)
@@ -29,9 +34,10 @@ pub fn normalize_usage_delta(delta: &UsageEventUsageDelta) -> NormalizedUsageTot
         raw_output_tokens,
         cache_read_tokens,
         cache_write_tokens,
-        cache_observed_call_count: u64::from(delta.cache_read_tokens.is_some()),
+        cache_write_observed_call_count: u64::from(delta.cache_write_tokens.is_some()),
+        cache_observed_call_count: u64::from(observed_cache_read.is_some()),
         cache_hit_call_count: u64::from(cache_read_tokens > 0),
-        cache_observed_input_tokens: if delta.cache_read_tokens.is_some() {
+        cache_observed_input_tokens: if observed_cache_read.is_some() {
             net_input_tokens
                 .saturating_add(cache_read_tokens)
                 .saturating_add(cache_write_tokens)

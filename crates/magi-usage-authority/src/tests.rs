@@ -695,3 +695,138 @@ fn test_empty_session_snapshot() {
     assert_eq!(snapshot.totals.llm_call_count, 0);
     assert!(snapshot.by_execution_binding.is_empty());
 }
+
+#[test]
+fn response_performance_is_weighted_deduplicated_and_excludes_failed_calls() {
+    use magi_app_server_protocol::ModelResponseTiming;
+    let mut authority = UsageAuthority::new();
+    for (id, ttft, tokens, duration, status) in [
+        ("body-a", 200, Some(20), 1000, UsageCallStatus::Success),
+        ("body-b", 600, Some(180), 3000, UsageCallStatus::Success),
+        (
+            "body-no-token-pair",
+            400,
+            None,
+            2000,
+            UsageCallStatus::Success,
+        ),
+        ("single-frame", 800, Some(10), 0, UsageCallStatus::Success),
+        ("interrupted", 9000, Some(9999), 1, UsageCallStatus::Failed),
+    ] {
+        let mut call = make_call_record_input("perf-session", id, 200, 200);
+        call.call_identity.transport = Some(UsageTransportIdentity {
+            usage_reported: Some(true),
+            request_fingerprint: "a".repeat(64),
+            http_status: Some(200),
+            response_timing: Some(ModelResponseTiming {
+                first_content_ms: ttft,
+                content_duration_ms: duration,
+                text_output_tokens: tokens,
+            }),
+        });
+        call.status = status;
+        authority.append_call_record(call.clone());
+        authority.append_call_record(call);
+    }
+    let snapshot = authority.get_session_snapshot("ws-1", "perf-session");
+    let perf = &snapshot.totals.performance;
+    assert_eq!(snapshot.totals.llm_call_count, 5);
+    assert_eq!(perf.ttft_sample_count, 4);
+    assert_eq!(perf.ttft_total_ms, 2000);
+    assert_eq!(perf.tps_sample_count, 2);
+    assert_eq!(perf.text_output_tokens, 200);
+    assert_eq!(perf.content_duration_ms, 4000);
+    assert_eq!(
+        snapshot.by_execution_binding[0]
+            .totals
+            .performance
+            .text_output_tokens,
+        200
+    );
+    assert_eq!(
+        authority
+            .get_workspace_snapshot("ws-1")
+            .totals
+            .performance
+            .ttft_sample_count,
+        4
+    );
+    // Old receipts retain unknown performance and cache-write presence.
+    let mut old = serde_json::to_value(&snapshot.totals).unwrap();
+    old.as_object_mut().unwrap().remove("performance");
+    old.as_object_mut()
+        .unwrap()
+        .remove("cacheWriteObservedCallCount");
+    let old: UsageTotals = serde_json::from_value(old).unwrap();
+    assert_eq!(old.performance.ttft_sample_count, 0);
+    assert_eq!(old.cache_write_observed_call_count, 0);
+}
+
+#[test]
+fn token_presence_and_invalid_cache_do_not_become_zero_or_fabricated_hits() {
+    let mut authority = UsageAuthority::new();
+    for (id, reported) in [
+        ("unknown", Some(false)),
+        ("confirmed-zero", Some(true)),
+        ("old-zero", None),
+    ] {
+        let mut call = make_call_record_input("observations", id, 0, 0);
+        call.usage.cache_read_tokens = None;
+        call.usage.cache_write_tokens = None;
+        call.call_identity.transport = Some(UsageTransportIdentity {
+            usage_reported: reported,
+            response_timing: None,
+            request_fingerprint: "f".repeat(64),
+            http_status: Some(200),
+        });
+        authority.append_call_record(call);
+    }
+    let totals = authority
+        .get_session_snapshot("ws-1", "observations")
+        .totals;
+    assert_eq!(totals.llm_call_count, 3);
+    assert_eq!(totals.token_observed_call_count, 1);
+    assert_eq!(totals.cache_observed_call_count, 0);
+
+    let mut invalid = make_call_record_input("bad-cache", "call", 1000, 10);
+    invalid.usage.cache_read_tokens = Some(2000);
+    invalid.usage.cache_read_included_in_input = true;
+    invalid.usage.cache_write_tokens = None;
+    authority.append_call_record(invalid);
+    let totals = authority.get_session_snapshot("ws-1", "bad-cache").totals;
+    assert_eq!(totals.cache_observed_call_count, 0);
+    assert_eq!(totals.cache_hit_call_count, 0);
+    assert_eq!(totals.cache_read_tokens, 0);
+    assert_eq!(totals.cache_observed_input_tokens, 0);
+    assert_eq!(
+        totals.net_input_tokens, 1000,
+        "bad cache metadata cannot inflate complete input or erase ordinary input"
+    );
+}
+
+#[test]
+fn transport_usage_presence_distinguishes_new_explicit_zero_from_old_placeholders() {
+    let mut receipt: magi_app_server_protocol::ModelTransportRecord = serde_json::from_value(serde_json::json!({
+        "requestFingerprint":"a".repeat(64), "usage":{"inputTokens":0,"outputTokens":0,"cacheReadIncludedInInput":false}
+    })).unwrap();
+    assert_eq!(
+        UsageTransportIdentity::from_receipt(&receipt).usage_reported,
+        None
+    );
+    receipt.usage_observed = Some(true);
+    assert_eq!(
+        UsageTransportIdentity::from_receipt(&receipt).usage_reported,
+        Some(true)
+    );
+    let restored = serde_json::from_value(serde_json::to_value(&receipt).unwrap()).unwrap();
+    assert_eq!(
+        UsageTransportIdentity::from_receipt(&restored).usage_reported,
+        Some(true)
+    );
+    receipt.usage_observed = None;
+    receipt.usage.as_mut().unwrap().output_tokens = 10;
+    assert_eq!(
+        UsageTransportIdentity::from_receipt(&receipt).usage_reported,
+        Some(true)
+    );
+}

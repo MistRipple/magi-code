@@ -759,6 +759,7 @@ pub enum ModelTransportEvent {
         http_status: Option<u16>,
         usage: Option<magi_app_server_protocol::ModelTransportUsage>,
     },
+    ResponseTiming(magi_app_server_protocol::ModelResponseTiming),
     Finished {
         outcome: magi_app_server_protocol::ModelTransportOutcome,
     },
@@ -793,6 +794,8 @@ impl ModelTransportRecorder {
                 }
                 self.attempts
                     .push(magi_app_server_protocol::ModelTransportRecord {
+                        usage_observed: Some(false),
+                        response_timing: None,
                         observed_at: None,
                         request_fingerprint: request_fingerprint.clone(),
                         http_status: None,
@@ -811,7 +814,16 @@ impl ModelTransportRecorder {
                 }
                 if let Some(usage) = usage {
                     record.usage = Some(usage.clone());
+                    record.usage_observed = Some(true);
                 }
+            }
+            ModelTransportEvent::ResponseTiming(timing) => {
+                let record = self
+                    .attempts
+                    .last_mut()
+                    .filter(|record| record.outcome.is_none() && record.response_timing.is_none())
+                    .ok_or_else(invalid)?;
+                record.response_timing = Some(timing.clone());
             }
             ModelTransportEvent::Finished { outcome } => {
                 let record = self

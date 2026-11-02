@@ -1426,6 +1426,8 @@ export interface ModelTransportRecord {
   usage?: ModelTransportUsage;
   outcome?: ModelTransportOutcome;
   observedAt?: number;
+  responseTiming?: ModelResponseTiming;
+  usageObserved?: boolean;
 }
 
 export type ModelUsageSourceRole = "worker" | "orchestrator" | "auxiliary" | "image_generation" | "vision";
@@ -1449,4 +1451,10 @@ export interface ModelUsageContext {
   modelConfig: ModelUsageModelConfig;
   assignmentId?: string;
   workspaceId: string | null;
+}
+
+export interface ModelResponseTiming {
+  firstContentMs: number;
+  contentDurationMs: number;
+  textOutputTokens?: number;
 }

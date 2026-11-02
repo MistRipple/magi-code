@@ -1894,27 +1894,55 @@ async fn model_reasoning_capability(
 
 async fn execution_stats(
     State(state): State<ApiState>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let mut authority = usage_authority_from_model_usage_ledger(&state);
-    let snapshot = authority.get_workspace_snapshot("all");
+    let session_id = parse_optional_query_string(&query, "sessionId");
+    if let Some(id) = &session_id {
+        if state
+            .session_store
+            .session(&magi_core::SessionId::new(id.clone()))
+            .is_none()
+        {
+            return Err(ApiError::session_not_found(id));
+        }
+    }
+    let mut authority = state.event_bus.with_audit_usage_ledger(|ledger| {
+        usage_authority_from_usage_entries_filtered(&ledger.usage_entries, session_id.as_deref())
+    });
+    let (version, updated_at, totals, bindings, models) = if let Some(id) = &session_id {
+        let snapshot = authority.get_session_snapshot("all", id);
+        (
+            snapshot.version,
+            snapshot.updated_at,
+            snapshot.totals,
+            snapshot.by_execution_binding,
+            snapshot.by_model_identity,
+        )
+    } else {
+        let snapshot = authority.get_workspace_snapshot("all");
+        (
+            snapshot.version,
+            snapshot.updated_at,
+            snapshot.totals,
+            snapshot.by_execution_binding,
+            snapshot.by_model_identity,
+        )
+    };
     Ok(Json(serde_json::json!({
-        "version": snapshot.version,
-        "lastAppliedLedgerSeq": snapshot.version,
-        "updatedAt": snapshot.updated_at,
-        "totals": usage_totals_json(&snapshot.totals),
-        "items": snapshot.by_execution_binding.into_iter().map(usage_binding_item_json).collect::<Vec<_>>(),
-        "models": snapshot.by_model_identity.into_iter().map(usage_model_item_json).collect::<Vec<_>>(),
+        "version": version,
+        "lastAppliedLedgerSeq": version,
+        "updatedAt": updated_at,
+        "totals": usage_totals_json(&totals),
+        "items": bindings.into_iter().map(usage_binding_item_json).collect::<Vec<_>>(),
+        "models": models.into_iter().map(usage_model_item_json).collect::<Vec<_>>(),
     })))
 }
 
-fn usage_authority_from_model_usage_ledger(state: &ApiState) -> UsageAuthority {
-    state
-        .event_bus
-        .with_audit_usage_ledger(|ledger| usage_authority_from_usage_entries(&ledger.usage_entries))
-}
-
 /// 执行统计只计入最后一次 `usage.stats.reset` 之后的用量条目；账本本身只追加，重置不删除历史。
-fn usage_authority_from_usage_entries(usage_entries: &[AuditUsageLedgerEntry]) -> UsageAuthority {
+fn usage_authority_from_usage_entries_filtered(
+    usage_entries: &[AuditUsageLedgerEntry],
+    session_id: Option<&str>,
+) -> UsageAuthority {
     let reset_through = usage_entries
         .iter()
         .rev()
@@ -1935,6 +1963,9 @@ fn usage_authority_from_usage_entries(usage_entries: &[AuditUsageLedgerEntry]) -
             );
             continue;
         };
+        if session_id.is_some_and(|id| input.session_id != id) {
+            continue;
+        }
         if input.event_id.is_none() {
             input.event_id = Some(entry.event_id.clone());
         }
@@ -1968,7 +1999,10 @@ fn usage_binding_item_json(
         "totalTokens": binding.totals.total_tokens,
         "netInputTokens": binding.totals.net_input_tokens,
         "netOutputTokens": binding.totals.net_output_tokens,
+        "tokenObservedCallCount": binding.totals.token_observed_call_count,
         "cache": usage_cache_json(&binding.totals),
+        "performance": binding.totals.performance,
+        "inputTokens": binding.totals.net_input_tokens + binding.totals.cache_read_tokens + binding.totals.cache_write_tokens,
     })
 }
 
@@ -1982,7 +2016,10 @@ fn usage_totals_json(totals: &UsageTotals) -> serde_json::Value {
         "netOutputTokens": totals.net_output_tokens,
         "successCount": totals.success_count,
         "failureCount": totals.failure_count,
+        "tokenObservedCallCount": totals.token_observed_call_count,
         "cache": usage_cache_json(totals),
+        "performance": totals.performance,
+        "inputTokens": totals.net_input_tokens + totals.cache_read_tokens + totals.cache_write_tokens,
     })
 }
 
@@ -1993,6 +2030,7 @@ fn usage_cache_json(totals: &UsageTotals) -> serde_json::Value {
         "inputTokens": totals.cache_observed_input_tokens,
         "readTokens": totals.cache_read_tokens,
         "writeTokens": totals.cache_write_tokens,
+        "writeObservedCallCount": totals.cache_write_observed_call_count,
         "tokenHitRate": (totals.cache_observed_input_tokens > 0).then(||
             totals.cache_read_tokens as f64 / totals.cache_observed_input_tokens as f64),
         "requestHitRate": (totals.cache_observed_call_count > 0).then(||
@@ -5384,9 +5422,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_stats_session_filter_preserves_missing_cache_and_performance() {
+        let state = test_state();
+        for id in ["stats-a", "stats-b"] {
+            state
+                .session_store
+                .create_session(magi_core::SessionId::new(id), id)
+                .unwrap();
+        }
+        for (index, session) in ["stats-a", "stats-a", "stats-b"].into_iter().enumerate() {
+            let id = format!("filtered-{index}");
+            let mut payload =
+                model_usage_payload(&id, "ws-1", session, &id, UtcMillis::now().0, 1000, 100);
+            payload["usage"]
+                .as_object_mut()
+                .unwrap()
+                .remove("cacheReadTokens");
+            payload["usage"]
+                .as_object_mut()
+                .unwrap()
+                .remove("cacheWriteTokens");
+            if index == 0 {
+                payload["usage"]["cacheReadTokens"] = json!(600);
+                payload["usage"]["cacheReadIncludedInInput"] = json!(true);
+                payload["callIdentity"]["transport"] = json!({
+                    "requestFingerprint":"a".repeat(64), "httpStatus":200,
+                    "responseTiming":{"firstContentMs":200,"contentDurationMs":1000,"textOutputTokens":40}
+                });
+            }
+            state.event_bus.publish(EventEnvelope::usage(
+                EventId::new(id),
+                "model.usage.recorded",
+                payload,
+            ));
+        }
+        let query = HashMap::from([("sessionId".into(), "stats-a".into())]);
+        let result = execution_stats(State(state.clone()), Query(query.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(result["totals"]["llmCallCount"], 2);
+        assert_eq!(result["totals"]["tokenObservedCallCount"], 2);
+        assert_eq!(result["totals"]["cache"]["observedCallCount"], 1);
+        assert_eq!(result["totals"]["cache"]["tokenHitRate"], 0.6);
+        assert_eq!(result["totals"]["performance"]["ttftSampleCount"], 1);
+        assert_eq!(result["totals"]["performance"]["textOutputTokens"], 40);
+        assert_eq!(result["items"][0]["performance"]["contentDurationMs"], 1000);
+        assert_eq!(
+            execution_stats(State(state.clone()), Query(HashMap::new()))
+                .await
+                .unwrap()
+                .0["totals"]["llmCallCount"],
+            3
+        );
+        assert!(
+            execution_stats(
+                State(state.clone()),
+                Query(HashMap::from([("sessionId".into(), "missing".into())]))
+            )
+            .await
+            .is_err()
+        );
+        state.event_bus.publish(EventEnvelope::usage(
+            EventId::new("stats-filter-reset"),
+            USAGE_STATS_RESET_EVENT_TYPE,
+            json!({}),
+        ));
+        let reset = execution_stats(State(state), Query(query)).await.unwrap().0;
+        assert_eq!(reset["totals"]["llmCallCount"], 0);
+        assert_eq!(reset["totals"]["performance"]["ttftSampleCount"], 0);
+    }
+
+    #[tokio::test]
     async fn execution_stats_returns_frontend_stats_contract() {
         let state = test_state();
-        let payload = execution_stats(State(state))
+        let payload = execution_stats(State(state), Query(HashMap::new()))
             .await
             .expect("global stats should build")
             .0;
@@ -5429,7 +5539,7 @@ mod tests {
             }),
         );
 
-        let payload = execution_stats(State(state.clone()))
+        let payload = execution_stats(State(state.clone()), Query(HashMap::new()))
             .await
             .expect("global stats should build")
             .0;
@@ -5471,7 +5581,7 @@ mod tests {
         let _ = reset_stats(State(state.clone()), Json(serde_json::json!({})))
             .await
             .expect("reset stats");
-        let payload = execution_stats(State(state))
+        let payload = execution_stats(State(state), Query(HashMap::new()))
             .await
             .expect("global stats should build after reset")
             .0;
@@ -5539,12 +5649,13 @@ mod tests {
             }),
         );
 
-        let payload = execution_stats(State(state))
+        let payload = execution_stats(State(state), Query(HashMap::new()))
             .await
             .expect("image stats should build")
             .0;
 
         assert_eq!(payload["totals"]["llmCallCount"], json!(1));
+        assert_eq!(payload["totals"]["tokenObservedCallCount"], json!(0));
         assert_eq!(payload["totals"]["totalTokens"], json!(0));
         assert_eq!(payload["items"][0]["role"], json!("image_generation"));
         assert_eq!(payload["items"][0]["templateId"], json!("imageGeneration"));
@@ -5591,7 +5702,7 @@ mod tests {
             );
         }
 
-        let payload = execution_stats(State(state))
+        let payload = execution_stats(State(state), Query(HashMap::new()))
             .await
             .expect("global stats should keep switched models")
             .0;
@@ -5649,7 +5760,7 @@ mod tests {
             );
         }
 
-        let payload = execution_stats(State(state))
+        let payload = execution_stats(State(state), Query(HashMap::new()))
             .await
             .expect("global stats should expose model and role dimensions")
             .0;
@@ -5662,7 +5773,7 @@ mod tests {
 
     #[tokio::test]
     async fn execution_stats_does_not_require_workspace_binding() {
-        let payload = execution_stats(State(test_state()))
+        let payload = execution_stats(State(test_state()), Query(HashMap::new()))
             .await
             .expect("global stats should not require workspace binding")
             .0;
@@ -5701,7 +5812,7 @@ mod tests {
             }),
         );
 
-        let payload = execution_stats(State(state))
+        let payload = execution_stats(State(state), Query(HashMap::new()))
             .await
             .expect("personal session usage should be included in global stats")
             .0;
@@ -5743,7 +5854,7 @@ mod tests {
             );
         }
 
-        let payload = execution_stats(State(state))
+        let payload = execution_stats(State(state), Query(HashMap::new()))
             .await
             .expect("global stats should aggregate all workspaces")
             .0;
@@ -5802,7 +5913,7 @@ mod tests {
             json!({ "tool": "file_read" }),
         ));
 
-        let before_reset = execution_stats(State(state.clone()))
+        let before_reset = execution_stats(State(state.clone()), Query(HashMap::new()))
             .await
             .expect("global stats should build before reset")
             .0;
@@ -5812,7 +5923,7 @@ mod tests {
             .await
             .expect("reset stats should succeed");
 
-        let after_reset = execution_stats(State(state.clone()))
+        let after_reset = execution_stats(State(state.clone()), Query(HashMap::new()))
             .await
             .expect("global stats should build after reset")
             .0;
@@ -5846,7 +5957,7 @@ mod tests {
                 1,
             ),
         ));
-        let after_new_usage = execution_stats(State(state.clone()))
+        let after_new_usage = execution_stats(State(state.clone()), Query(HashMap::new()))
             .await
             .expect("global stats should build after new usage")
             .0;

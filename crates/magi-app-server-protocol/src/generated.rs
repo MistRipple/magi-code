@@ -3208,6 +3208,14 @@ pub struct ModelTransportRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "observedAt")]
     pub observed_at: Option<u64>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "responseTiming")]
+    pub response_timing: Option<ModelResponseTiming>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "usageObserved")]
+    pub usage_observed: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
@@ -3276,4 +3284,17 @@ pub struct ModelUsageContext {
     pub assignment_id: Option<String>,
     #[serde(rename = "workspaceId")]
     pub workspace_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelResponseTiming {
+    #[serde(rename = "firstContentMs")]
+    pub first_content_ms: u64,
+    #[serde(rename = "contentDurationMs")]
+    pub content_duration_ms: u64,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "textOutputTokens")]
+    pub text_output_tokens: Option<u64>,
 }

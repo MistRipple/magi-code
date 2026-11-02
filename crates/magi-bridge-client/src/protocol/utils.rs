@@ -384,7 +384,9 @@ pub fn convert_messages_to_anthropic(messages: &[LlmMessage]) -> Vec<Value> {
 }
 
 pub fn parse_openai_usage(usage: &Value) -> LlmUsage {
-    let cache_read_tokens = usage["prompt_tokens_details"]["cached_tokens"].as_u64();
+    let cache_read_tokens = usage["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .or_else(|| usage["prompt_cache_hit_tokens"].as_u64());
     LlmUsage {
         input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
         output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
@@ -407,6 +409,32 @@ pub fn parse_anthropic_usage(usage: &Value) -> LlmUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openai_and_deepseek_cache_usage_share_streaming_and_non_streaming_semantics() {
+        use crate::protocol::streaming::{parse_stream_event, SseEvent};
+        use crate::protocol::adapter::ProviderFamily;
+        for (metadata, expected) in [
+            (serde_json::json!({"prompt_cache_hit_tokens":60,"prompt_cache_miss_tokens":40}), Some(60)),
+            (serde_json::json!({"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":100}), Some(0)),
+            (serde_json::json!({"prompt_tokens_details":{"cached_tokens":30},"prompt_cache_hit_tokens":60}), Some(30)),
+            (serde_json::json!({}), None),
+        ] {
+            let mut usage = metadata;
+            usage["prompt_tokens"] = serde_json::json!(100);
+            usage["completion_tokens"] = serde_json::json!(10);
+            let direct = parse_openai_usage(&usage);
+            let event = SseEvent { event_type: None, data: serde_json::json!({"choices":[],"usage":usage}).to_string() };
+            let streamed = parse_stream_event(ProviderFamily::OpenAiChat, &event).into_iter().find_map(|chunk| chunk.usage).unwrap();
+            for parsed in [direct, streamed] {
+                assert_eq!(parsed.input_tokens, 100);
+                assert_eq!(parsed.output_tokens, 10);
+                assert_eq!(parsed.cache_read_tokens, expected);
+                assert_eq!(parsed.cache_read_included_in_input, expected.is_some());
+            }
+        }
+    }
+
     use crate::llm_types::{ImageSource, ToolInputSchema};
 
     fn image_source() -> ImageSource {

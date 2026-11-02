@@ -5691,6 +5691,12 @@
           "type": "integer",
           "minimum": 0,
           "x-rust-type": "u64"
+        },
+        "responseTiming": {
+          "$ref": "#/$defs/ModelResponseTiming"
+        },
+        "usageObserved": {
+          "type": "boolean"
         }
       }
     },
@@ -5789,6 +5795,32 @@
             "string",
             "null"
           ]
+        }
+      }
+    },
+    "ModelResponseTiming": {
+      "type": "object",
+      "additionalProperties": false,
+      "x-rust-derive-eq": true,
+      "required": [
+        "firstContentMs",
+        "contentDurationMs"
+      ],
+      "properties": {
+        "firstContentMs": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "contentDurationMs": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "textOutputTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
         }
       }
     }

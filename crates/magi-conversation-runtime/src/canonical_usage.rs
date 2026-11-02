@@ -99,10 +99,7 @@ pub(crate) fn transport_usage_record(input: TransportUsageInput<'_>) -> UsageCal
             parent_call_id: Some(logical_call_id.into()),
             source: role,
             phase,
-            transport: Some(UsageTransportIdentity {
-                request_fingerprint: transport.request_fingerprint.clone(),
-                http_status: transport.http_status,
-            }),
+            transport: Some(UsageTransportIdentity::from_receipt(transport)),
         },
         usage: transport
             .usage
@@ -197,6 +194,14 @@ mod tests {
     use serde_json::json;
 
     fn recorded_call(settled: bool, observed_at: u64) -> (SessionStore, SessionId) {
+        recorded_call_for_role(settled, observed_at, "orchestrator")
+    }
+
+    fn recorded_call_for_role(
+        settled: bool,
+        observed_at: u64,
+        role: &str,
+    ) -> (SessionStore, SessionId) {
         let store = SessionStore::new();
         let session = SessionId::new("usage-recovery");
         store
@@ -228,20 +233,49 @@ mod tests {
             "provider":"configured", "messageCount":1, "toolCount":0, "inputRequestIds":[], "startedAt":observed_at,
             "settledAt":null, "status":"started", "responseFingerprint":null,
             "binding":{"model":"original-model", "provider":"configured", "bindingRevision":1,"settingsRevision":1,
-                "usageContext":{"templateId":"orchestrator","engineId":"orchestrator","bindingRevision":1,
-                    "role":"orchestrator","phase":"execution","assignmentId":"original-lease",
+                "usageContext":{"templateId":role,"engineId":role,"bindingRevision":1,
+                    "role":role,"phase":"execution","assignmentId":"original-lease",
                     "modelConfig":{"provider":"configured","model":"original-model","baseUrl":"https://original.test/v1","accountFingerprint":"1234567890abcdef"}}}
         })).unwrap();
         store
             .begin_model_step(&session, "usage-turn", step)
             .unwrap();
         for index in 0..2 {
+            // Intermediate snapshots can over-report tokens/cache; persist the final correction.
             store
                 .record_model_step_transport(
                     &session,
                     "usage-turn",
                     "usage-step",
                     ModelTransportRecord {
+                        usage_observed: None,
+                        response_timing: None,
+                        observed_at: Some(observed_at),
+                        request_fingerprint: "b".repeat(64),
+                        http_status: Some(200),
+                        usage: Some(ModelTransportUsage {
+                            input_tokens: 30,
+                            output_tokens: 9,
+                            cache_read_tokens: Some(20),
+                            cache_write_tokens: None,
+                            cache_read_included_in_input: true,
+                        }),
+                        outcome: None,
+                    },
+                )
+                .unwrap();
+            store
+                .record_model_step_transport(
+                    &session,
+                    "usage-turn",
+                    "usage-step",
+                    ModelTransportRecord {
+                        usage_observed: None,
+                        response_timing: Some(magi_app_server_protocol::ModelResponseTiming {
+                            first_content_ms: 250,
+                            content_duration_ms: 1000,
+                            text_output_tokens: Some(2),
+                        }),
                         observed_at: Some(observed_at),
                         request_fingerprint: "b".repeat(64),
                         http_status: Some(200),
@@ -282,6 +316,65 @@ mod tests {
     }
 
     #[test]
+    fn main_and_worker_retry_measurements_survive_restore_without_double_counting() {
+        for role in ["orchestrator", "worker"] {
+            let (store, session) = recorded_call_for_role(true, UtcMillis::now().0, role);
+            let restored = SessionStore::from_persisted_parts(
+                store.durable_state(),
+                store.execution_sidecar_store_state(),
+            )
+            .unwrap();
+            let bus = InMemoryEventBus::new(16);
+            assert_eq!(recover_model_usage_projections(&bus, &restored).unwrap(), 2);
+            assert_eq!(recover_model_usage_projections(&bus, &restored).unwrap(), 0);
+            let mut authority = magi_usage_authority::UsageAuthority::new();
+            for entry in bus.audit_usage_ledger_snapshot().usage_entries {
+                let input: UsageCallRecordInput = serde_json::from_value(entry.payload).unwrap();
+                assert_eq!(
+                    serde_json::to_value(input.execution_binding.role).unwrap(),
+                    role
+                );
+                assert_eq!(
+                    serde_json::to_value(input.call_identity.source).unwrap(),
+                    role
+                );
+                assert_eq!(input.session_id, session.as_str());
+                authority.append_call_record(input.clone());
+                authority.append_call_record(input);
+            }
+            let snapshot = authority.get_session_snapshot("personal", session.as_str());
+            let totals = &snapshot.totals;
+            assert_eq!(totals.llm_call_count, 2, "both physical attempts count");
+            assert_eq!(totals.success_count, 1);
+            assert_eq!(totals.failure_count, 1);
+            assert_eq!(totals.token_observed_call_count, 2);
+            assert_eq!(totals.raw_input_tokens, 40);
+            assert_eq!(totals.net_output_tokens, 4);
+            assert_eq!(totals.cache_observed_call_count, 1);
+            assert_eq!(totals.cache_hit_call_count, 1);
+            assert_eq!(totals.cache_observed_input_tokens, 20);
+            assert_eq!(totals.cache_read_tokens, 10);
+            assert_eq!(
+                totals.performance.ttft_sample_count, 1,
+                "failed attempts do not skew TTFT"
+            );
+            assert_eq!(totals.performance.ttft_total_ms, 250);
+            assert_eq!(totals.performance.tps_sample_count, 1);
+            assert_eq!(totals.performance.text_output_tokens, 2);
+            assert_eq!(totals.performance.content_duration_ms, 1000);
+            assert_eq!(totals.performance.last_tps, Some(2.0));
+            assert_eq!(snapshot.by_execution_binding.len(), 1);
+            assert_eq!(
+                snapshot.by_execution_binding[0]
+                    .totals
+                    .performance
+                    .ttft_total_ms,
+                250
+            );
+        }
+    }
+
+    #[test]
     fn missing_projection_is_rebuilt_once_using_frozen_model_and_original_attempt_ids() {
         let (store, session) = recorded_call(true, UtcMillis::now().0);
         let restored = SessionStore::from_persisted_parts(
@@ -297,6 +390,18 @@ mod tests {
         for entry in &entries {
             let input: UsageCallRecordInput =
                 serde_json::from_value(entry.payload.clone()).unwrap();
+            assert_eq!(
+                input
+                    .call_identity
+                    .transport
+                    .as_ref()
+                    .unwrap()
+                    .response_timing
+                    .as_ref()
+                    .unwrap()
+                    .first_content_ms,
+                250
+            );
             assert_eq!(input.model_config.model, "original-model");
             assert_eq!(input.model_config.base_url, "https://original.test/v1");
             assert_eq!(input.assignment_id.as_deref(), Some("original-lease"));

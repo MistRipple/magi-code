@@ -175,10 +175,23 @@ fn model_response_transport_usage(
     Some(transport_usage(&usage))
 }
 
+fn has_reported_token_counts(usage: &Value) -> bool {
+    [
+        "input_tokens",
+        "output_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .iter()
+    .any(|field| usage.get(*field).and_then(Value::as_u64).is_some())
+}
+
 fn observed_response_usage(family: ProviderFamily, body: &str) -> Option<ModelTransportUsage> {
     // 缺少 usage 不是零用量；只有提供方明确返回时才规范化并记录。
     let raw: Value = serde_json::from_str(body).ok()?;
-    raw.get("usage").filter(|usage| usage.is_object())?;
+    raw.get("usage").filter(|usage| has_reported_token_counts(usage))?;
     let response = match family {
         ProviderFamily::OpenAiChat => OpenAiChatCompletionsAdapter.parse_response(200, body),
         ProviderFamily::OpenAiResponses => OpenAiResponsesAdapter.parse_response(200, body),
@@ -1233,6 +1246,113 @@ fn provider_stream_event_error(
     })
 }
 
+/// Receive timestamps belong to HTTP reads, never to individual SSE parsing steps.
+#[derive(Default)]
+struct BodyStreamTiming {
+    first: Option<Duration>,
+    last: Option<Duration>,
+    usage_output_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+    non_text_output: bool,
+    usage_observed: bool,
+}
+
+impl BodyStreamTiming {
+    fn observe(
+        &mut self,
+        event: &crate::protocol::streaming::SseEvent,
+        has_content: bool,
+        received_at: Duration,
+    ) -> bool {
+        if has_content {
+            self.first.get_or_insert(received_at);
+            self.last = Some(received_at);
+        }
+        if let Ok(raw) = serde_json::from_str::<Value>(&event.data) {
+            // A redacted thinking block has no visible thinking text, but still consumes output tokens.
+            self.non_text_output |= raw
+                .get("content_block")
+                .and_then(|block| block.get("type"))
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "text");
+            self.non_text_output |= raw
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str)
+                .is_some_and(|kind| !matches!(kind, "message" | "reasoning"));
+            self.non_text_output |=
+                raw.get("choices")
+                    .and_then(Value::as_array)
+                    .is_some_and(|choices| {
+                        choices.iter().any(|choice| {
+                            choice["index"].as_u64().is_some_and(|index| index > 0)
+                                || choice["delta"]
+                                    .get("audio")
+                                    .is_some_and(|audio| !audio.is_null())
+                        })
+                    });
+            self.non_text_output |= raw
+                .get("part")
+                .and_then(|part| part.get("type"))
+                .and_then(Value::as_str)
+                .is_some_and(|kind| !matches!(kind, "output_text" | "refusal"));
+            self.non_text_output |= raw.get("type").and_then(Value::as_str).is_some_and(|kind| {
+                kind.starts_with("response.audio.") || kind.starts_with("response.output_audio.")
+            });
+            let usage = raw
+                .get("usage")
+                .or_else(|| raw.pointer("/response/usage"))
+                .or_else(|| raw.pointer("/message/usage"));
+            if let Some(usage) = usage.filter(|usage| has_reported_token_counts(usage)) {
+                self.usage_observed = true;
+                // Replace the pair together. Intermediate reasoning metadata cannot be paired with a later total.
+                self.usage_output_tokens = usage
+                    .get("completion_tokens")
+                    .or_else(|| usage.get("output_tokens"))
+                    .and_then(Value::as_u64);
+                self.reasoning_tokens = usage
+                    .pointer("/completion_tokens_details/reasoning_tokens")
+                    .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
+                    .and_then(Value::as_u64);
+                self.non_text_output |= usage
+                    .pointer("/completion_tokens_details/audio_tokens")
+                    .or_else(|| usage.pointer("/output_tokens_details/audio_tokens"))
+                    .and_then(Value::as_u64)
+                    .is_some_and(|tokens| tokens > 0);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn finish(
+        &self,
+        family: ProviderFamily,
+        output_tokens: u64,
+        has_thinking: bool,
+        has_tools: bool,
+    ) -> Option<magi_app_server_protocol::ModelResponseTiming> {
+        let first = self.first?;
+        let text_output_tokens =
+            if self.usage_output_tokens != Some(output_tokens) || has_tools || self.non_text_output
+            {
+                None
+            } else if let Some(reasoning) = self.reasoning_tokens {
+                output_tokens.checked_sub(reasoning)
+            } else if family == ProviderFamily::Anthropic && !has_thinking {
+                Some(output_tokens)
+            } else {
+                None
+            };
+        Some(magi_app_server_protocol::ModelResponseTiming {
+            first_content_ms: first.as_millis() as u64,
+            content_duration_ms: self.last.unwrap_or(first).saturating_sub(first).as_millis()
+                as u64,
+            text_output_tokens,
+        })
+    }
+}
+
 fn apply_provider_stream_event(
     provider_family: ProviderFamily,
     event: &crate::protocol::streaming::SseEvent,
@@ -1241,6 +1361,8 @@ fn apply_provider_stream_event(
     last_thinking_delta_len: &mut usize,
     last_tool_call_count: &mut usize,
     tx: &std::sync::mpsc::Sender<StreamMessage>,
+    timing: &mut BodyStreamTiming,
+    received_at: Duration,
 ) -> Result<bool, BridgeClientError> {
     if let Some(error) = provider_stream_event_error(provider_family, event) {
         return Err(error);
@@ -1252,14 +1374,22 @@ fn apply_provider_stream_event(
         return Ok(true);
     }
 
-    let llm_chunks = parse_stream_event(provider_family, event);
+    let mut llm_chunks = parse_stream_event(provider_family, event);
+    let has_usage = timing.observe(
+        event,
+        llm_chunks.iter().any(|chunk| {
+            chunk.content.as_ref().is_some_and(|text| !text.is_empty())
+        }),
+        received_at,
+    );
+    if !has_usage { llm_chunks.retain(|chunk| chunk.usage.is_none()); }
     accumulator.apply_all(&llm_chunks);
     // Responses 兼容网关可能先发 usage snapshot，再在 response.completed
     // 给出最终结算。最终事件是该 attempt 的权威 usage，不能继续用 max 合并，
     // 否则隐藏推理/中间统计会把 ledger 与 completed response 的 output tokens
     // 分叉。
-    if provider_family == ProviderFamily::OpenAiResponses
-        && is_responses_terminal_event(event)
+    if (provider_family == ProviderFamily::OpenAiChat
+        || (provider_family == ProviderFamily::OpenAiResponses && is_responses_terminal_event(event)))
         && let Some(usage) = llm_chunks
             .iter()
             .rev()
@@ -1590,7 +1720,6 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
         tx,
         mut cancellation_rx,
     } = request;
-    let started_at = Instant::now();
     let client = shared_streaming_http_client()?;
     let stream_idle_timeout = provider_stream_idle_timeout();
 
@@ -1604,6 +1733,7 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
         req_builder = req_builder.header(name.as_str(), value.as_str());
     }
 
+    let started_at = Instant::now();
     let mut response = tokio::select! {
         _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
         result = tokio::time::timeout(stream_idle_timeout, req_builder.send()) => {
@@ -1686,6 +1816,8 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
     let mut terminal_drain_deadline = None;
     let mut raw_response = String::new();
     let mut first_delta_reported = false;
+    let mut body_timing = BodyStreamTiming::default();
+    let mut received_at = Duration::ZERO;
 
     'stream_read: loop {
         let chunk_result = if let Some(deadline) = terminal_drain_deadline {
@@ -1732,6 +1864,8 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
             break;
         };
 
+        received_at = started_at.elapsed();
+        // All SSE events in this HTTP read share its receipt time.
         // 将 remainder 与新读取的字节合并后做安全的 UTF-8 解码
         utf8_remainder.extend_from_slice(&chunk);
         let (valid_str, consumed) = decode_utf8_safe(&utf8_remainder);
@@ -1753,6 +1887,8 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
                 &mut last_thinking_delta_len,
                 &mut last_tool_call_count,
                 &tx,
+                &mut body_timing,
+                received_at,
             )? {
                 saw_protocol_terminal = true;
                 break 'stream_read;
@@ -1789,6 +1925,8 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
                 &mut last_thinking_delta_len,
                 &mut last_tool_call_count,
                 &tx,
+                &mut body_timing,
+                received_at,
             )? {
                 saw_protocol_terminal = true;
                 break;
@@ -1828,7 +1966,13 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
             message: "provider response invalid: empty stream response".to_string(),
         });
     }
-    Ok(adapted.into())
+    if let Some(timing) = body_timing.finish(provider_family, adapted.usage.output_tokens,
+        adapted.thinking.as_ref().is_some_and(|text| !text.is_empty()), !adapted.tool_calls.is_empty()) {
+        let _ = tx.send(StreamMessage::Observation(ModelTransportEvent::ResponseTiming(timing)));
+    }
+    let mut response: ModelResponse = adapted.into();
+    if !body_timing.usage_observed { response.usage = None; }
+    Ok(response)
 }
 
 impl ModelBridgeClient for HttpModelBridgeClient {
@@ -2471,6 +2615,310 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn body_timing_uses_network_receipts_and_paired_final_usage() {
+        use crate::protocol::streaming::SseEvent;
+        let event = |data: &str| SseEvent {
+            event_type: None,
+            data: data.into(),
+        };
+        let mut timing = BodyStreamTiming::default();
+        timing.observe(
+            &event(r#"{"choices":[{"delta":{"reasoning_content":"thinking"}}]}"#),
+            false,
+            Duration::from_millis(50),
+        );
+        timing.observe(&event("{}"), true, Duration::from_millis(200));
+        timing.observe(&event("{}"), true, Duration::from_millis(200));
+        assert_eq!(
+            timing
+                .finish(ProviderFamily::OpenAiChat, 100, true, false)
+                .unwrap()
+                .content_duration_ms,
+            0,
+            "multiple SSE events from one HTTP read must not manufacture a TPS interval"
+        );
+        timing.observe(&event("{}"), true, Duration::from_millis(1200));
+        timing.observe(&event(r#"{"usage":{"completion_tokens":100,"completion_tokens_details":{"reasoning_tokens":60}}}"#), false, Duration::from_millis(1500));
+        let result = timing
+            .finish(ProviderFamily::OpenAiChat, 100, true, false)
+            .unwrap();
+        assert_eq!(result.first_content_ms, 200);
+        assert_eq!(
+            result.content_duration_ms, 1000,
+            "usage-tail delay is not body generation time"
+        );
+        assert_eq!(result.text_output_tokens, Some(40));
+        assert_eq!(
+            timing
+                .finish(ProviderFamily::OpenAiChat, 101, true, false)
+                .unwrap()
+                .text_output_tokens,
+            None
+        );
+        assert_eq!(
+            timing
+                .finish(ProviderFamily::OpenAiChat, 100, true, true)
+                .unwrap()
+                .text_output_tokens,
+            None
+        );
+        timing.observe(
+            &event(r#"{"usage":{"completion_tokens":80}}"#),
+            false,
+            Duration::from_millis(1800),
+        );
+        assert_eq!(
+            timing
+                .finish(ProviderFamily::OpenAiChat, 80, false, false)
+                .unwrap()
+                .text_output_tokens,
+            None,
+            "final usage missing reasoning metadata cannot inherit an intermediate split"
+        );
+        timing.observe(&event(r#"{"usage":{"completion_tokens":20,"completion_tokens_details":{"reasoning_tokens":25}}}"#), false, Duration::from_millis(1900));
+        assert_eq!(
+            timing
+                .finish(ProviderFamily::OpenAiChat, 20, true, false)
+                .unwrap()
+                .text_output_tokens,
+            None
+        );
+    }
+
+    #[test]
+    fn body_timing_excludes_redacted_thinking_audio_and_unknown_output_items() {
+        use crate::protocol::streaming::SseEvent;
+        for (family, non_text) in [
+            (
+                ProviderFamily::Anthropic,
+                r#"{"content_block":{"type":"redacted_thinking","data":"encrypted"}}"#,
+            ),
+            (
+                ProviderFamily::OpenAiResponses,
+                r#"{"item":{"type":"image_generation_call"}}"#,
+            ),
+            (
+                ProviderFamily::OpenAiChat,
+                r#"{"choices":[{"index":0,"delta":{"audio":{"data":"bytes"}}}]}"#,
+            ),
+            (
+                ProviderFamily::OpenAiChat,
+                r#"{"choices":[{"index":1,"delta":{"content":"other choice"}}]}"#,
+            ),
+        ] {
+            let mut timing = BodyStreamTiming::default();
+            let event = |data: &str| SseEvent {
+                event_type: None,
+                data: data.into(),
+            };
+            timing.observe(&event(non_text), false, Duration::from_millis(10));
+            timing.observe(&event("{}"), true, Duration::from_millis(200));
+            timing.observe(&event("{}"), true, Duration::from_millis(1200));
+            timing.observe(
+                &event(
+                    r#"{"usage":{"output_tokens":100,"output_tokens_details":{"reasoning_tokens":0}}}"#,
+                ),
+                false,
+                Duration::from_millis(1500),
+            );
+            assert_eq!(
+                timing
+                    .finish(family, 100, false, false)
+                    .unwrap()
+                    .text_output_tokens,
+                None
+            );
+        }
+        let mut plain = BodyStreamTiming {
+            first: Some(Duration::from_millis(200)),
+            last: Some(Duration::from_millis(1200)),
+            usage_output_tokens: Some(100),
+            usage_observed: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            plain
+                .finish(ProviderFamily::Anthropic, 100, false, false)
+                .unwrap()
+                .text_output_tokens,
+            Some(100)
+        );
+        assert_eq!(
+            plain
+                .finish(ProviderFamily::Anthropic, 100, true, false)
+                .unwrap()
+                .text_output_tokens,
+            None
+        );
+        plain.usage_output_tokens = None;
+        assert_eq!(
+            plain
+                .finish(ProviderFamily::Anthropic, 0, false, false)
+                .unwrap()
+                .text_output_tokens,
+            None
+        );
+    }
+
+    #[test]
+    fn timed_http_stream_receipt_matches_usage_authority_without_ui_estimates() {
+        use magi_usage_authority::*;
+        use std::io::BufRead;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nodelay(true).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            let mut stream = reader.into_inner();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+            let mut send = |body: &str| {
+                write!(stream, "{:x}\r\n{}\r\n", body.len(), body).unwrap();
+                stream.flush().unwrap();
+            };
+            send(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n",
+            );
+            ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            send("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A\"}}]}\n\n");
+            ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            std::thread::sleep(Duration::from_millis(80));
+            send("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"B\"}}]}\n\n");
+            send(
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"prompt_tokens_details\":{\"cached_tokens\":600},\"completion_tokens\":100,\"completion_tokens_details\":{\"reasoning_tokens\":80}}}\n\ndata: [DONE]\n\n",
+            );
+            stream.write_all(b"0\r\n\r\n").unwrap();
+        });
+        let client = HttpModelBridgeClient::new(url.clone(), None, "timing-test".into());
+        let recorder = std::cell::RefCell::new(ModelTransportRecorder::default());
+        let delta = |delta: &ModelStreamingDelta| {
+            if !delta.thinking.is_empty() || delta.content == "A" {
+                ack_tx.send(()).unwrap();
+            }
+        };
+        let response = client
+            .invoke_observed(
+                ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
+                    provider: "test".into(),
+                    prompt: "test".into(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                ModelInvocationOptions {
+                    on_delta: Some(&delta),
+                    on_retry: &|_| {},
+                    is_cancelled: &|| false,
+                    max_output_tokens: None,
+                },
+                &|event| recorder.borrow_mut().apply(event).map(|_| ()),
+            )
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(response.content.as_deref(), Some("AB"));
+        let receipt = recorder.borrow().attempts[0].clone();
+        let timing = receipt.response_timing.clone().unwrap();
+        assert!(
+            timing.first_content_ms >= 50,
+            "thinking is not the first body token"
+        );
+        assert!(
+            timing.content_duration_ms >= 80,
+            "only distinct HTTP receipts establish body duration"
+        );
+        assert_eq!(timing.text_output_tokens, Some(20));
+        let usage = receipt.usage.as_ref().unwrap();
+        assert_eq!(receipt.usage_observed, Some(true));
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens
+            ),
+            (1000, 100, Some(600))
+        );
+        let mut identity =
+            build_usage_call_identity("attempt-1", None, UsageSourceRole::Orchestrator, None);
+        identity.transport = Some(UsageTransportIdentity {
+            usage_reported: Some(true),
+            response_timing: Some(timing.clone()),
+            request_fingerprint: receipt.request_fingerprint,
+            http_status: receipt.http_status,
+        });
+        let call = UsageCallRecordInput {
+            workspace_id: Some("ws".into()),
+            session_id: "session".into(),
+            turn_id: None,
+            dispatch_wave_id: None,
+            assignment_id: None,
+            event_id: Some("timed-receipt".into()),
+            timestamp: Some(1),
+            execution_binding: build_execution_binding_identity(
+                "main",
+                "native",
+                1,
+                UsageSourceRole::Orchestrator,
+            ),
+            model_config: LlmConfig {
+                provider: "test".into(),
+                model: "timing-test".into(),
+                base_url: url,
+                api_key: None,
+                account_fingerprint: None,
+                reasoning_effort: None,
+            },
+            call_identity: identity,
+            usage: UsageTokenInput {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                total_tokens: None,
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+                cache_read_included_in_input: usage.cache_read_included_in_input,
+            },
+            status: UsageCallStatus::Success,
+            error_code: None,
+        };
+        let mut authority = UsageAuthority::new();
+        authority.append_call_record(call.clone());
+        authority.append_call_record(call);
+        let stats = authority.get_session_snapshot("ws", "session").totals;
+        assert_eq!(stats.llm_call_count, 1);
+        assert_eq!(stats.token_observed_call_count, 1);
+        assert_eq!(
+            stats.cache_read_tokens * 100 / stats.cache_observed_input_tokens,
+            60
+        );
+        assert_eq!(stats.performance.ttft_total_ms, timing.first_content_ms);
+        assert_eq!(stats.performance.text_output_tokens, 20);
+        assert_eq!(
+            stats.performance.content_duration_ms,
+            timing.content_duration_ms
+        );
+    }
 
     #[test]
     fn non_streaming_body_failure_preserves_received_http_status() {
@@ -4796,6 +5244,109 @@ mod tests {
     }
 
     #[test]
+    fn streaming_missing_or_empty_usage_remains_unknown_in_response_and_receipt() {
+        for tail in [
+            "",
+            "data: {\"choices\":[],\"usage\":{}}\n\n",
+            "data: {\"choices\":[],\"usage\":null}\n\n",
+        ] {
+            let server = spawn_mock_server_with_response_text(
+                200,
+                "text/event-stream",
+                format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"ok\"}}}}]}}\n\n{tail}data: [DONE]\n\n"
+                ),
+            );
+            let client = HttpModelBridgeClient::new(server.address, None, "test".into());
+            let recorder = std::cell::RefCell::new(ModelTransportRecorder::default());
+            let response = client
+                .invoke_observed(
+                    ModelInvocationRequest {
+                        cache_affinity_key: None,
+                        prompt_cache_key: None,
+                        provider: "test".into(),
+                        prompt: "test".into(),
+                        messages: None,
+                        tools: None,
+                        tool_choice: None,
+                    },
+                    ModelInvocationOptions {
+                        on_delta: Some(&|_| {}),
+                        on_retry: &|_| {},
+                        is_cancelled: &|| false,
+                        max_output_tokens: None,
+                    },
+                    &|event| recorder.borrow_mut().apply(event).map(|_| ()),
+                )
+                .unwrap();
+            assert!(
+                response.usage.is_none(),
+                "adapter defaults must not fabricate reported zero usage"
+            );
+            let receipt = &recorder.borrow().attempts[0];
+            assert!(receipt.usage.is_none());
+            assert_eq!(receipt.usage_observed, Some(false));
+            assert!(
+                receipt.response_timing.is_some(),
+                "TTFT can still be measured without token usage"
+            );
+            assert_eq!(
+                receipt.response_timing.as_ref().unwrap().text_output_tokens,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn chat_final_usage_corrects_intermediate_counts_and_missing_cache_is_unknown() {
+        let server = spawn_mock_server_with_response_text(200, "text/event-stream", concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":100,\"prompt_tokens_details\":{\"cached_tokens\":600},\"completion_tokens_details\":{\"reasoning_tokens\":60}}}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":800,\"completion_tokens\":50}}\n\n",
+                "data: [DONE]\n\n",
+            ).into());
+        let client = HttpModelBridgeClient::new(server.address, None, "test".into());
+        let recorder = std::cell::RefCell::new(ModelTransportRecorder::default());
+        let response = client
+            .invoke_observed(
+                ModelInvocationRequest {
+                    cache_affinity_key: None,
+                    prompt_cache_key: None,
+                    provider: "test".into(),
+                    prompt: "test".into(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                ModelInvocationOptions {
+                    on_delta: Some(&|_| {}),
+                    on_retry: &|_| {},
+                    is_cancelled: &|| false,
+                    max_output_tokens: None,
+                },
+                &|event| recorder.borrow_mut().apply(event).map(|_| ()),
+            )
+            .unwrap();
+        let usage: crate::llm_types::LlmUsage =
+            serde_json::from_value(response.usage.unwrap()).unwrap();
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens
+            ),
+            (800, 50, None)
+        );
+        let receipt = &recorder.borrow().attempts[0];
+        assert_eq!(receipt.usage.as_ref().unwrap().output_tokens, 50);
+        assert_eq!(receipt.usage.as_ref().unwrap().cache_read_tokens, None);
+        assert_eq!(
+            receipt.response_timing.as_ref().unwrap().text_output_tokens,
+            None
+        );
+    }
+
+    #[test]
     fn responses_terminal_usage_replaces_intermediate_snapshot_in_transport_receipt() {
         let server = spawn_mock_server_with_response_text(
             200,
@@ -4805,7 +5356,7 @@ mod tests {
                 "event: response.output_text.delta\ndata: {\"output_index\":0,\"delta\":\"ok\"}\n\n",
                 "event: response.output_item.done\ndata: {\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}}\n\n",
                 "event: response.usage.updated\ndata: {\"type\":\"response.usage.updated\",\"usage\":{\"input_tokens\":10,\"output_tokens\":166}}\n\n",
-                "event: response.completed\ndata: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":103}}}\n\n",
+                "event: response.completed\ndata: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":103,\"output_tokens_details\":{\"reasoning_tokens\":80}}}}\n\n",
             )
             .to_string(),
         );
@@ -4844,6 +5395,9 @@ mod tests {
         let usage: crate::llm_types::LlmUsage =
             serde_json::from_value(response.usage.expect("response usage")).unwrap();
         assert_eq!(usage.output_tokens, 103);
+        let timing = recorder.borrow().attempts[0].response_timing.clone().expect("body stream timing must reach the persisted receipt");
+        assert_eq!(timing.text_output_tokens, Some(23));
+        assert_eq!(timing.content_duration_ms, 0, "a single body chunk has no measurable generation interval");
         assert_eq!(
             recorder.borrow().attempts[0]
                 .usage

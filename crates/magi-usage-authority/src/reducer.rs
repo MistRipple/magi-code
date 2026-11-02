@@ -10,13 +10,62 @@ fn apply_delta(
     totals: &UsageTotals,
     delta: &crate::costing::NormalizedUsageTotals,
     status: Option<UsageCallStatus>,
+    event: &UsageEvent,
 ) -> UsageTotals {
     let mut next = totals.clone();
+    if status == Some(UsageCallStatus::Success)
+        && let Some(timing) = event
+            .call_identity
+            .as_ref()
+            .and_then(|call| call.transport.as_ref())
+            .and_then(|transport| transport.response_timing.as_ref())
+    {
+        let tps = timing
+            .text_output_tokens
+            .filter(|tokens| *tokens > 0 && *tokens <= delta.raw_output_tokens)
+            .filter(|_| timing.content_duration_ms > 0)
+            .map(|tokens| tokens as f64 * 1000.0 / timing.content_duration_ms as f64);
+        let sample = crate::types::UsagePerformanceTotals {
+            ttft_sample_count: 1,
+            ttft_total_ms: timing.first_content_ms,
+            tps_sample_count: u64::from(tps.is_some()),
+            text_output_tokens: if tps.is_some() {
+                timing.text_output_tokens.unwrap_or(0)
+            } else {
+                0
+            },
+            content_duration_ms: if tps.is_some() {
+                timing.content_duration_ms
+            } else {
+                0
+            },
+            last_observed_at: event.timestamp,
+            last_ttft_ms: Some(timing.first_content_ms),
+            last_tps: tps,
+        };
+        next.performance = next.performance.add(&sample);
+    }
+    // Historical all-zero placeholders cannot prove the provider reported zero usage.
+    let reported = event
+        .call_identity
+        .as_ref()
+        .and_then(|call| call.transport.as_ref())
+        .and_then(|transport| transport.usage_reported)
+        .unwrap_or_else(|| {
+            event.usage_delta.as_ref().is_some_and(|usage| {
+                usage.raw_input_tokens > 0
+                    || usage.raw_output_tokens > 0
+                    || usage.cache_read_tokens.is_some()
+                    || usage.cache_write_tokens.is_some()
+            })
+        });
+    next.token_observed_call_count += u64::from(reported);
     next.llm_call_count += 1;
     next.raw_input_tokens += delta.raw_input_tokens;
     next.raw_output_tokens += delta.raw_output_tokens;
     next.cache_read_tokens += delta.cache_read_tokens;
     next.cache_write_tokens += delta.cache_write_tokens;
+    next.cache_write_observed_call_count += delta.cache_write_observed_call_count;
     next.cache_observed_call_count += delta.cache_observed_call_count;
     next.cache_hit_call_count += delta.cache_hit_call_count;
     next.cache_observed_input_tokens += delta.cache_observed_input_tokens;
@@ -111,7 +160,7 @@ pub fn rebuild_session_snapshot_from_events(
         };
 
         let normalized = normalize_usage_delta(usage_delta);
-        snapshot.totals = apply_delta(&snapshot.totals, &normalized, event.status);
+        snapshot.totals = apply_delta(&snapshot.totals, &normalized, event.status, event);
 
         if let Some(aid) = &event.assignment_id
             && seen_assignments.insert(aid.clone())
@@ -137,6 +186,7 @@ pub fn rebuild_session_snapshot_from_events(
                 .unwrap_or(&UsageTotals::default()),
             &normalized,
             event.status,
+            event,
         );
         if let Some(aid) = &event.assignment_id {
             let key = format!(
@@ -177,6 +227,7 @@ pub fn rebuild_session_snapshot_from_events(
                 .unwrap_or(&UsageTotals::default()),
             &normalized,
             event.status,
+            event,
         );
         snapshot.by_model_identity = upsert_model_snapshot(
             &snapshot.by_model_identity,
