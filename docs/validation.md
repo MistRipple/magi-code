@@ -269,7 +269,7 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 ### 受信扩展宿主（部分实现）
 
-宿主内核已有定向入口：`cargo test -p magi-extension-host`，包含帧、对端、熔断、重启退避的单元测试，以及与真实 Node 进程的端到端测试（握手令牌与版本拒绝、未声明钩子拒绝、guard 阻止/改写/超时取消/崩溃、advise 失败保留原生行为、observe 顺序与序号、监管重启与停机）。宿主内核之外，`cargo test -p magi-conversation-runtime --lib tool_hooks` 与 `extension_tool_call_hooks` 在真实对话循环里验证 `tool.call` 阻止/改写与 `tool.result` 投影，`cargo test -p magi-daemon --lib extension_bridge` 验证真实 Node 扩展经 ExtensionBus 与适配器到工具管线端口的完整链路。daemon 里的总线尚无插件登记，因此这些钩子在生产中还不会触发；其余钩子未接线；macOS 以外平台未运行。
+宿主内核已有定向入口：`cargo test -p magi-extension-host`，包含帧、对端、熔断、重启退避的单元测试，以及与真实 Node 进程的端到端测试（握手令牌与版本拒绝、未声明钩子拒绝、guard 阻止/改写/超时取消/崩溃、advise 失败保留原生行为、observe 顺序与序号、监管重启与停机）。宿主内核之外，`cargo test -p magi-conversation-runtime --lib tool_hooks` 与 `extension_tool_call_hooks` 在真实对话循环里验证 `tool.call` 阻止/改写与 `tool.result` 投影，`cargo test -p magi-daemon --lib extension_bridge` 验证真实 Node 扩展经 ExtensionBus 与适配器到工具管线端口的完整链路。`cargo test -p magi-daemon --lib extension_runtime` 用真实 Node 包验证“激活 → 拉起 → 钩子生效 → 停用回收”、注册表事件驱动收敛、缺少 Node 时 guard fail-closed；`cargo test -p magi-plugin-system --test package` 覆盖 Node 扩展包的清单规则。生产中仍需 `MAGI_EXTENSION_NODE` 指向 Node（随包交付未做）；其余钩子未接线；macOS 以外平台未运行。
 
 [插件系统设计](plugin-system-requirements-design.md)第 12 节定义了完整的验收面，除上述入口外目前没有对应的脚本或测试命令，不能把下列条目当作已有入口；协议层验收清单见[扩展协议 v1](extension-protocol-v1.md#13-一致性验收协议层)。现有 `test:electron-plugins`、工作流与会话引擎相关回归验证的是即将被替换的 QuickJS 实现，替换交付时随之改写，不并行保留两套验收。
 

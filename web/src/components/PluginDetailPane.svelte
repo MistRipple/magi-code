@@ -43,6 +43,7 @@
   const removable = $derived(Boolean(plugin) && plugin!.activeScopes.length === 0 && plugin!.enabledScopes.length === 0);
 
   function permissionText(permission: PluginPermission): string {
+    if (permission.kind === 'extension') return i18n.t('settings.plugins.permission.extensionFullTrust');
     return `${permission.kind}: ${permission.scope}${permission.targets.length ? `, ${permission.targets.join(', ')}` : ''}`;
   }
 

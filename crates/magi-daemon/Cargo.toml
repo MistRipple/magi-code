@@ -48,3 +48,4 @@ magi-runtime-state = { path = "../magi-runtime-state" }
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
 tempfile = "3"
+zip.workspace = true

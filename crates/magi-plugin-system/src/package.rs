@@ -106,11 +106,34 @@ impl PluginPackage {
             .map_err(|_| invalid("manifest.json 不符合插件合同"))?;
         validate_manifest(&manifest)?;
         annotate_settings_order(&mut manifest, manifest_bytes);
-        let source = files
-            .get("plugin.mjs")
-            .ok_or_else(|| invalid("缺少 plugin.mjs"))?;
-        if source.len() > 512 * 1024 {
-            return Err(invalid("后台 ESM bundle 超过 512KiB"));
+        match (&manifest.backend, &manifest.extension) {
+            (Some(_), Some(_)) => {
+                return Err(invalid("插件不能同时声明 QuickJS 后台与 Node 扩展"));
+            }
+            (None, None) => {
+                return Err(invalid(
+                    "插件必须声明后台（backend）或 Node 扩展（extension）",
+                ));
+            }
+            (Some(_), None) => {
+                let source = files
+                    .get("plugin.mjs")
+                    .ok_or_else(|| invalid("缺少 plugin.mjs"))?;
+                if source.len() > 512 * 1024 {
+                    return Err(invalid("后台 ESM bundle 超过 512KiB"));
+                }
+                if files.contains_key("extension/index.mjs") {
+                    return Err(invalid("声明 backend 的包不得携带 extension/index.mjs"));
+                }
+            }
+            (None, Some(_)) => {
+                if !files.contains_key("extension/index.mjs") {
+                    return Err(invalid("缺少 extension/index.mjs"));
+                }
+                if files.contains_key("plugin.mjs") {
+                    return Err(invalid("声明 extension 的包不得携带 plugin.mjs"));
+                }
+            }
         }
         for view in &manifest.contributions.views {
             if !valid_path(&view.entry)
@@ -141,9 +164,18 @@ impl PluginPackage {
     pub(crate) fn archive_bytes(&self) -> &[u8] {
         &self.archive
     }
+    /// QuickJS 后台源码。Node 扩展包没有 `plugin.mjs`，且校验阶段已禁止它声明任何由 QuickJS 执行的贡献。
     pub fn source(&self) -> &str {
         // from_archive 已验证固定入口存在且为 UTF-8；之后内容不可变。
         std::str::from_utf8(&self.files["plugin.mjs"]).expect("validated plugin source")
+    }
+
+    /// Node 扩展入口源码（`extension/index.mjs`）。仅声明了 `extension` 的包有。
+    pub fn extension_entry(&self) -> Option<&[u8]> {
+        self.manifest
+            .extension
+            .as_ref()
+            .and_then(|_| self.files.get("extension/index.mjs").map(Vec::as_slice))
     }
 }
 
@@ -198,6 +230,61 @@ fn annotate_settings_order(manifest: &mut PluginManifest, manifest_bytes: &[u8])
     }
 }
 
+/// Node 扩展声明的规则：钩子必须在目录内、模式合法且不重复；必须有“完全信任”授权项；
+/// 不得声明由 QuickJS 执行的贡献或迁移（Node 的对应能力尚未提供，不静默降级）。
+fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
+    use magi_app_server_protocol::generated::PluginHookMode;
+    use magi_extension_host::protocol::{HookMode, HookRegistration};
+    let trust_declared = manifest.permissions.iter().any(|permission| {
+        permission.kind == PluginPermissionKind::Extension && permission.targets == ["full-trust"]
+    });
+    let Some(extension) = &manifest.extension else {
+        if manifest
+            .permissions
+            .iter()
+            .any(|permission| permission.kind == PluginPermissionKind::Extension)
+        {
+            return Err(invalid("extension 权限只能由声明了 extension 的包使用"));
+        }
+        return Ok(());
+    };
+    if !trust_declared {
+        return Err(invalid(
+            "声明 extension 的包必须声明权限 extension:[\"full-trust\"]，用户据此确认扩展以其用户权限运行",
+        ));
+    }
+    let c = &manifest.contributions;
+    if !(c.tools.is_empty()
+        && c.commands.is_empty()
+        && c.workflows.is_empty()
+        && c.engines.is_empty())
+        || manifest.data_migration.is_some()
+    {
+        return Err(invalid(
+            "Node 扩展暂不支持工具、命令、工作流、会话引擎或数据迁移贡献",
+        ));
+    }
+    let mut seen = HashSet::new();
+    for hook in &extension.hooks {
+        let registration = HookRegistration {
+            name: hook.name.clone(),
+            mode: match hook.mode {
+                PluginHookMode::Observe => HookMode::Observe,
+                PluginHookMode::Advise => HookMode::Advise,
+                PluginHookMode::Guard => HookMode::Guard,
+            },
+            deadline_ms: hook.deadline_ms.map(|ms| ms as u64),
+        };
+        registration
+            .validate()
+            .map_err(|error| invalid(format!("扩展钩子声明无效：{}", error.message)))?;
+        if !seen.insert(hook.name.clone()) {
+            return Err(invalid(format!("扩展钩子 {} 重复声明", hook.name)));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
     static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
     let validator = VALIDATOR.get_or_init(|| {
@@ -241,6 +328,7 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
             ));
         }
     }
+    validate_extension(manifest)?;
     let mut permissions = HashSet::new();
     if manifest.permissions.len() > 64 {
         return Err(invalid("权限声明超限"));
@@ -444,6 +532,7 @@ fn validate_file(name: &str, bytes: &[u8]) -> Result<(), PluginError> {
     let text = matches!(extension, "html" | "css" | "js" | "mjs" | "json" | "svg");
     if name != "manifest.json"
         && name != "plugin.mjs"
+        && name != "extension/index.mjs"
         && (!name.starts_with("ui/")
             || !matches!(
                 extension,

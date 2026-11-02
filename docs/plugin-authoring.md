@@ -1,5 +1,7 @@
 # Magi 插件作者指南
 
+> 【Node 扩展】清单可改用 `extension` 声明受信 Node 扩展钩子（`extension/index.mjs` 默认导出 `activate(api)`，`api.on(hook, handler)` 绑定钩子），详见[扩展协议 v1](extension-protocol-v1.md)；扩展包不能同时带 QuickJS 后台，暂不支持工具/命令等贡献。本指南其余部分描述 SDK 1。
+>
 > **状态说明（2026-11-02）：** 本文正文记录当前源码中的 SDK 1（QuickJS）旧实现，停止作为新插件的开发合同。产品已确定直接使用受信 Node 后台替换尚未实际使用的 QuickJS，不提供 SDK 1 兼容执行或旧包自动转换；Node 插件 API、pi/DSH 翻译器和兼容来源尚未交付，请勿把本文示例视为 Node 插件示例。当前源码另有两点需纠正下文支持表：`contributions.skills` 已能接入原生 Skill 目录，但包仍必须含 `plugin.mjs`；MCP 服务声明尚不支持。现有 Windows Worker 没有自身的操作系统级沙箱；目标 Node 后台在 macOS、Windows 均以用户权限运行，独立进程用于故障回收。
 
 这是一份可以单独保存、复制给其他开发者或交给 AI 使用的 Magi SDK 1 开发手册。开发不需要 Magi 源码、项目文档或项目脚本。你需要了解基本 JavaScript 和 JSON；增加页面时需要基本 HTML。插件运行者只需安装 Magi，作者打包时可使用本文提供的 Python 3 脚本。

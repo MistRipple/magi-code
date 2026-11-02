@@ -1522,6 +1522,8 @@ pub enum PluginPermissionKind {
     Models,
     #[serde(rename = "browser")]
     Browser,
+    #[serde(rename = "extension")]
+    Extension,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1649,6 +1651,34 @@ pub enum PluginBackendEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginHookMode {
+    #[serde(rename = "observe")]
+    Observe,
+    #[serde(rename = "advise")]
+    Advise,
+    #[serde(rename = "guard")]
+    Guard,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginHookDeclaration {
+    pub name: String,
+    pub mode: PluginHookMode,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "deadlineMs")]
+    pub deadline_ms: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginExtension {
+    pub hooks: Vec<PluginHookDeclaration>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginDataMigration {
     #[serde(rename = "fromVersions")]
@@ -1664,7 +1694,12 @@ pub struct PluginManifest {
     pub version: String,
     pub name: String,
     pub description: String,
-    pub backend: PluginBackendEntry,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<PluginBackendEntry>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<PluginExtension>,
     pub permissions: Vec<PluginPermission>,
     pub contributions: PluginContributions,
     #[serde(rename = "settingsSchema")]

@@ -169,6 +169,7 @@
   }
 
   function permissionText(permission: PluginPermission): string {
+    if (permission.kind === 'extension') return i18n.t('settings.plugins.permission.extensionFullTrust');
     return `${permission.kind}: ${permission.scope}${permission.targets.length ? `, ${permission.targets.join(', ')}` : ''}`;
   }
 

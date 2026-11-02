@@ -680,7 +680,7 @@ export type ServerResponse = JsonRpcServerResponse;
 
 export type PluginScopeKind = "application";
 
-export type PluginPermissionKind = "storage" | "tools" | "models" | "browser";
+export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension";
 
 export interface PluginPermission {
   kind: PluginPermissionKind;
@@ -746,6 +746,18 @@ export interface PluginContributions {
 
 export type PluginBackendEntry = "plugin.mjs";
 
+export type PluginHookMode = "observe" | "advise" | "guard";
+
+export interface PluginHookDeclaration {
+  name: string;
+  mode: PluginHookMode;
+  deadlineMs?: number | null;
+}
+
+export interface PluginExtension {
+  hooks: Array<PluginHookDeclaration>;
+}
+
 export interface PluginDataMigration {
   fromVersions: Array<number>;
 }
@@ -756,7 +768,8 @@ export interface PluginManifest {
   version: string;
   name: string;
   description: string;
-  backend: PluginBackendEntry;
+  backend?: PluginBackendEntry;
+  extension?: PluginExtension;
   permissions: Array<PluginPermission>;
   contributions: PluginContributions;
   settingsSchema: Record<string, unknown>;

@@ -1706,6 +1706,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
+ "zip",
 ]
 
 [[package]]
@@ -1873,6 +1874,7 @@ dependencies = [
  "magi-app-server-protocol",
  "magi-bridge-client",
  "magi-core",
+ "magi-extension-host",
  "magi-plugin-runtime",
  "magi-process",
  "ring",

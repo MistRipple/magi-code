@@ -260,3 +260,117 @@ fn permissions_without_an_enforcement_point_are_rejected() {
         );
     }
 }
+
+fn extension_archive(manifest: &Value, files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer
+        .start_file("manifest.json", SimpleFileOptions::default())
+        .unwrap();
+    writer
+        .write_all(&serde_json::to_vec(manifest).unwrap())
+        .unwrap();
+    for (name, bytes) in files {
+        writer
+            .start_file(*name, SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+fn extension_manifest() -> Value {
+    json!({
+        "sdkVersion":1,"id":"acme.guard","version":"1.0.0","name":"Guard","description":"",
+        "extension":{"hooks":[{"name":"tool.call","mode":"guard","deadlineMs":3000}]},
+        "permissions":[{"kind":"extension","scope":"application","targets":["full-trust"]}],
+        "dataSchemaVersion":1,
+        "settingsSchema":{"type":"object","additionalProperties":false},
+        "contributions":{}
+    })
+}
+
+const ENTRY: &[(&str, &[u8])] = &[("extension/index.mjs", b"export default async () => {}")];
+
+#[test]
+fn node_extension_packages_carry_hooks_trust_and_a_single_bundled_entry() {
+    let package =
+        PluginPackage::from_archive(&extension_archive(&extension_manifest(), ENTRY)).unwrap();
+    assert!(package.manifest().backend.is_none());
+    assert_eq!(
+        package.extension_entry(),
+        Some(&b"export default async () => {}"[..])
+    );
+}
+
+#[test]
+fn node_extension_packages_reject_every_ambiguous_or_unsupported_shape() {
+    let reject = |mutate: fn(&mut Value), files: &[(&str, &[u8])], why: &str| {
+        let mut value = extension_manifest();
+        mutate(&mut value);
+        assert!(
+            PluginPackage::from_archive(&extension_archive(&value, files)).is_err(),
+            "{why}"
+        );
+    };
+    reject(|_| {}, &[], "缺少入口");
+    reject(
+        |_| {},
+        &[ENTRY[0], ("plugin.mjs", b"x")],
+        "不得同时携带 QuickJS 后台",
+    );
+    reject(
+        |m| m["backend"] = "plugin.mjs".into(),
+        &[ENTRY[0], ("plugin.mjs", b"x")],
+        "不得同时声明两种后台",
+    );
+    reject(
+        |m| m["permissions"] = json!([]),
+        ENTRY,
+        "必须声明完全信任权限",
+    );
+    reject(
+        |m| m["extension"]["hooks"] = json!([{"name":"turn.end","mode":"guard"}]),
+        ENTRY,
+        "观察钩子不能是 guard",
+    );
+    reject(
+        |m| m["extension"]["hooks"] = json!([{"name":"nope","mode":"observe"}]),
+        ENTRY,
+        "目录外钩子",
+    );
+    reject(
+        |m| {
+            m["extension"]["hooks"] = json!([
+                {"name":"tool.call","mode":"guard"},{"name":"tool.call","mode":"advise"}
+            ])
+        },
+        ENTRY,
+        "钩子重复",
+    );
+    reject(
+        |m| m["contributions"] = json!({"tools":[{"id":"t","title":"T","description":"","inputSchema":{"type":"object"}}]}),
+        ENTRY,
+        "Node 暂不支持工具贡献",
+    );
+    reject(
+        |m| m["extension"]["hooks"] = json!([]),
+        ENTRY,
+        "至少一个钩子",
+    );
+    reject(|m| m["extension"]["extra"] = json!(1), ENTRY, "未知字段");
+    reject(
+        |m| m["extension"]["hooks"][0]["deadlineMs"] = json!(60000),
+        ENTRY,
+        "deadline 超出协议上限",
+    );
+    // 声明 extension 权限的包若没有 extension 声明同样无效。
+    let mut qjs = manifest();
+    qjs["permissions"] =
+        json!([{"kind":"extension","scope":"application","targets":["full-trust"]}]);
+    assert!(PluginPackage::from_archive(&archive(&qjs, &[])).is_err());
+    // 同时携带两种入口文件。
+    assert!(
+        PluginPackage::from_archive(&archive(&manifest(), &[("extension/index.mjs", b"x")]))
+            .is_err()
+    );
+}

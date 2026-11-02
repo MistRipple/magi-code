@@ -319,6 +319,8 @@
 
 【现状·读码推断】包为 ZIP，16MiB 压缩、32MiB 展开、512 条目、单文件 4MiB；校验路径、大小写冲突、文件模式、文件类型和原生程序魔数；SHA-256 标识内容，不标识作者。[package.rs:10](../crates/magi-plugin-system/src/package.rs#L10)、[package.rs:54](../crates/magi-plugin-system/src/package.rs#L54)。
 
+【现状·部分实现】清单已有 `extension`（`hooks: [{name, mode, deadlineMs?}]`）与权限种类 `extension:["full-trust"]`：声明 extension 的包不得同时有 `backend`/`plugin.mjs`，必须带固定入口 `extension/index.mjs`（单文件 ≤4MiB，随现有包上限），钩子须在协议目录内且模式合法，暂不允许工具/命令/工作流/引擎/数据迁移贡献。这是 SDK 1 清单上的过渡增量，完整的新清单版本（manifestVersion、extensionApi、迁移声明等）仍属目标。
+
 【目标】统一 manifestVersion、插件身份、语义版本、说明、可选 Node 后台入口、扩展 API 版本、贡献、设置 schema、数据 schema 和迁移声明。Node ESM 是作者已构建的纯 JS 产物，依赖打包并固定版本，入口和大小属于 D2。仅 Skill/MCP 声明的包允许无后台；不生成空 UI，不要求不必要的完全信任。SDK 1 清单必须在校验阶段明确拒绝，不沿用旧版本号解释 Node 代码，也不自动转换旧包。
 
 【目标】删除 filesRead/filesWrite/network 形式的装饰性 OS 权限；storage、tools、models、browser 等服务权限仅在具备真实强制点时纳入新合同。启用可执行后台先确认“此扩展以您的用户权限运行，可读文件与凭据、联网和启动进程，Magi 无法限制”，再展示 hook/注册清单。后者只强制**Magi 路由与注册范围**，不强制限制 Node OS 权限。钩子注册须声明 mode、deadline 与触发条件；contextRewrite、externalMigration 作为需要显式授权的能力项出现在清单与授权面板。授权绑定包摘要、来源身份和 API 契约；升级新内容不得静默继承执行信任。

@@ -1768,6 +1768,7 @@ impl DaemonRuntime {
         let workflow_core_factory = self.plugins.workflow_core_factory()?;
 
         let plugin_command_executor = self.plugins.command_executor();
+        self.plugins.start_extensions(self.event_bus.clone());
         let extension_tool_hooks: Arc<dyn magi_conversation_runtime::tool_hooks::ToolHooks> =
             Arc::new(super::extension_bridge::ExtensionToolHooks::new(
                 self.plugins.extension_bus(),

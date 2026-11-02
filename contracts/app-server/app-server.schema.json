@@ -2319,7 +2319,8 @@
         "storage",
         "tools",
         "models",
-        "browser"
+        "browser",
+        "extension"
       ]
     },
     "PluginPermission": {
@@ -2598,6 +2599,58 @@
         "plugin.mjs"
       ]
     },
+    "PluginHookMode": {
+      "type": "string",
+      "enum": [
+        "observe",
+        "advise",
+        "guard"
+      ]
+    },
+    "PluginHookDeclaration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "mode"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "mode": {
+          "$ref": "#/$defs/PluginHookMode"
+        },
+        "deadlineMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 30000,
+          "x-rust-default": true
+        }
+      }
+    },
+    "PluginExtension": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hooks"
+      ],
+      "properties": {
+        "hooks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginHookDeclaration"
+          },
+          "minItems": 1,
+          "maxItems": 32
+        }
+      }
+    },
     "PluginDataMigration": {
       "type": "object",
       "additionalProperties": false,
@@ -2625,7 +2678,6 @@
         "version",
         "name",
         "description",
-        "backend",
         "permissions",
         "contributions",
         "settingsSchema",
@@ -2657,6 +2709,9 @@
         },
         "backend": {
           "$ref": "#/$defs/PluginBackendEntry"
+        },
+        "extension": {
+          "$ref": "#/$defs/PluginExtension"
         },
         "permissions": {
           "type": "array",

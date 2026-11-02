@@ -876,6 +876,7 @@
   "settings.plugins.activate": "Authorize and activate",
   "settings.plugins.deactivate": "Deactivate",
   "settings.plugins.disable": "Disable",
+  "settings.plugins.permission.extensionFullTrust": "Full trust: runs with your user privileges and can read files and credentials, use the network and start processes. Magi cannot restrict it",
   "settings.plugins.uninstall": "Uninstall",
   "settings.plugins.permissions": "Required permissions",
   "settings.plugins.noPermissions": "This plugin declares no additional permissions.",

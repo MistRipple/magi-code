@@ -11,3 +11,6 @@ pub mod peer;
 pub mod protocol;
 pub mod supervisor;
 pub mod transport;
+
+/// Node 侧宿主运行时（`runtime/host.mjs`）。daemon 在状态目录里按内容摘要落盘后交给 Node 执行。
+pub const HOST_RUNTIME_SOURCE: &str = include_str!("../runtime/host.mjs");

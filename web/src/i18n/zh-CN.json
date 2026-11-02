@@ -876,6 +876,7 @@
   "settings.plugins.activate": "授权并激活",
   "settings.plugins.deactivate": "停用",
   "settings.plugins.disable": "禁用",
+  "settings.plugins.permission.extensionFullTrust": "完全信任：以你的用户权限运行，可读写文件与凭据、联网、启动进程，Magi 无法限制",
   "settings.plugins.uninstall": "卸载",
   "settings.plugins.permissions": "需要权限",
   "settings.plugins.noPermissions": "此插件未声明额外权限。",

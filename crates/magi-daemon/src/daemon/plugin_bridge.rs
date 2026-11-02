@@ -37,6 +37,7 @@ pub(super) struct PluginServices {
     handler: Arc<PluginCapabilityHandler>,
     /// 受信扩展钩子的唯一分发入口。目前没有插件管理流程向它登记扩展，因此总线为空。
     extension_bus: Arc<magi_extension_host::bus::ExtensionBus>,
+    extensions: super::extension_runtime::ExtensionRuntime,
 }
 
 impl PluginServices {
@@ -48,6 +49,13 @@ impl PluginServices {
         let manager = PluginManager::open(state_root.join("plugins"))
             .map_err(|error| DaemonError::internal(format!("加载插件状态失败: {error}")))?;
         let manager = Arc::new(Mutex::new(manager));
+        let extension_bus = Arc::<magi_extension_host::bus::ExtensionBus>::default();
+        let extensions = super::extension_runtime::ExtensionRuntime::new(
+            Arc::clone(&manager),
+            Arc::clone(&extension_bus),
+            processes.clone(),
+            state_root,
+        );
         Ok(Self {
             host: PluginHost::new(plugin_worker_path(), processes),
             handler: Arc::new(PluginCapabilityHandler {
@@ -55,8 +63,14 @@ impl PluginServices {
                 event_bus,
             }),
             manager,
-            extension_bus: Arc::default(),
+            extension_bus,
+            extensions,
         })
+    }
+
+    /// 启动受信扩展协调器：收敛一次，之后随插件注册表事件持续收敛。
+    pub(super) fn start_extensions(&self, events: Arc<InMemoryEventBus>) {
+        self.extensions.start(events);
     }
 
     pub(super) fn extension_bus(&self) -> Arc<magi_extension_host::bus::ExtensionBus> {

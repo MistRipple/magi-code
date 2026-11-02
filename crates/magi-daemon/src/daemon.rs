@@ -3,6 +3,7 @@ mod browser_host;
 mod config;
 mod events;
 mod extension_bridge;
+mod extension_runtime;
 mod maintenance;
 mod persistence;
 mod plugin_bridge;

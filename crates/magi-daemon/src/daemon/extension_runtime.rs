@@ -1,0 +1,475 @@
+//! 受信扩展的运行时协调：把“已安装、已授权、应用级激活”的 Node 扩展包变成受监管的宿主进程。
+//!
+//! 协调器只读取插件管理服务的事实（激活状态与不可变包），不持有第二份启用意愿。
+//! 每次 `plugin.registry.changed` 事件后收敛到期望集合：
+//! - 激活且声明了 `extension` 的包：登记到 ExtensionBus 并启动监管；
+//! - 不再激活、被卸载或摘要变化：停止监管并注销登记（用户显式停用才解除 guard）；
+//! - 找不到随包 Node：登记仍保留但不启动宿主，因此 guard 钩子 fail-closed。
+
+use magi_event_bus::InMemoryEventBus;
+use magi_extension_host::{
+    HOST_RUNTIME_SOURCE,
+    bus::ExtensionBus,
+    instance::LaunchConfig,
+    protocol::{HookMode, HookRegistration},
+    supervisor::{PluginSupervisor, RestartPolicy, supervise},
+};
+use magi_plugin_system::{APPLICATION_SCOPE, PluginManager, PluginPackage};
+use magi_process::ManagedProcessGroup;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+/// 产品随包 Node 的覆盖入口。随包交付落地前，这是唯一的 Node 来源；不回退到用户 PATH。
+pub(super) const EXTENSION_NODE_ENV: &str = "MAGI_EXTENSION_NODE";
+
+struct Running {
+    digest: String,
+    supervisor: Option<PluginSupervisor>,
+}
+
+#[derive(Clone)]
+pub(super) struct ExtensionRuntime {
+    manager: Arc<Mutex<PluginManager>>,
+    bus: Arc<ExtensionBus>,
+    group: ManagedProcessGroup,
+    root: PathBuf,
+    node: Option<PathBuf>,
+    policy: RestartPolicy,
+    running: Arc<tokio::sync::Mutex<HashMap<String, Running>>>,
+}
+
+impl ExtensionRuntime {
+    pub(super) fn new(
+        manager: Arc<Mutex<PluginManager>>,
+        bus: Arc<ExtensionBus>,
+        group: ManagedProcessGroup,
+        state_root: &Path,
+    ) -> Self {
+        let node = std::env::var_os(EXTENSION_NODE_ENV)
+            .map(PathBuf::from)
+            .filter(|path| path.is_file());
+        Self {
+            manager,
+            bus,
+            group,
+            root: state_root.join("extensions"),
+            node,
+            policy: RestartPolicy::default(),
+            running: Arc::default(),
+        }
+    }
+
+    /// 启动时收敛一次，之后随插件注册表事件持续收敛。
+    pub(super) fn start(&self, events: Arc<InMemoryEventBus>) {
+        let runtime = self.clone();
+        let mut receiver = events.subscribe();
+        tokio::spawn(async move {
+            runtime.reconcile().await;
+            loop {
+                match receiver.recv().await {
+                    Ok(event) if event.event_type == "plugin.registry.changed" => {
+                        runtime.reconcile().await;
+                    }
+                    Ok(_) => {}
+                    // 落后丢事件后无法知道漏了什么，直接再收敛一次。
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        runtime.reconcile().await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) async fn supervisor_state(
+        &self,
+        id: &str,
+    ) -> Option<magi_extension_host::supervisor::SupervisorState> {
+        let running = self.running.lock().await;
+        running
+            .get(id)?
+            .supervisor
+            .as_ref()
+            .map(PluginSupervisor::state)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn is_running(&self, id: &str) -> bool {
+        self.running.lock().await.contains_key(id)
+    }
+
+    pub(super) async fn reconcile(&self) {
+        let desired = self.desired_packages();
+        let mut running = self.running.lock().await;
+
+        // 先停掉不再期望或摘要变化的实例。
+        let stale: Vec<String> = running
+            .iter()
+            .filter(|(id, entry)| {
+                desired
+                    .get(*id)
+                    .is_none_or(|package| package.digest() != entry.digest)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            if let Some(entry) = running.remove(&id) {
+                if let Some(supervisor) = entry.supervisor {
+                    supervisor.stop().await;
+                }
+                self.bus.unregister_plugin(&id);
+            }
+        }
+
+        for (id, package) in desired {
+            if running.contains_key(&id) {
+                continue;
+            }
+            let entry = self.start_plugin(&id, &package);
+            running.insert(id, entry);
+        }
+    }
+
+    fn desired_packages(&self) -> HashMap<String, Arc<PluginPackage>> {
+        let Ok(manager) = self.manager.lock() else {
+            return HashMap::new();
+        };
+        manager
+            .state()
+            .plugins
+            .values()
+            .filter(|plugin| plugin.active_scopes.contains(APPLICATION_SCOPE))
+            .filter_map(|plugin| manager.package(&plugin.id).ok())
+            .filter(|package| package.manifest().extension.is_some())
+            .map(|package| (package.manifest().id.clone(), package))
+            .collect()
+    }
+
+    fn start_plugin(&self, id: &str, package: &PluginPackage) -> Running {
+        let digest = package.digest().to_string();
+        let failed = |reason: String| {
+            tracing::error!(plugin = %id, %reason, "受信扩展无法启动");
+            Running {
+                digest: digest.clone(),
+                supervisor: None,
+            }
+        };
+        let Some(extension) = package.manifest().extension.as_ref() else {
+            return failed("包未声明 extension".into());
+        };
+        let hooks: Vec<HookRegistration> = extension
+            .hooks
+            .iter()
+            .map(|hook| {
+                use magi_app_server_protocol::generated::PluginHookMode;
+                HookRegistration {
+                    name: hook.name.clone(),
+                    mode: match hook.mode {
+                        PluginHookMode::Observe => HookMode::Observe,
+                        PluginHookMode::Advise => HookMode::Advise,
+                        PluginHookMode::Guard => HookMode::Guard,
+                    },
+                    deadline_ms: hook.deadline_ms.map(|ms| ms as u64),
+                }
+            })
+            .collect();
+        // 登记先于启动：宿主不可用期间 guard 钩子仍然生效（fail-closed）。
+        if let Err(error) = self.bus.register_plugin(id, &hooks) {
+            return failed(format!("钩子登记被拒绝: {error}"));
+        }
+        let Some(node) = self.node.clone() else {
+            return failed(format!(
+                "未找到随包 Node（设置 {EXTENSION_NODE_ENV} 指向产品携带的 Node 可执行文件）"
+            ));
+        };
+        let (host_script, entry) = match self.materialize(id, package) {
+            Ok(paths) => paths,
+            Err(error) => return failed(format!("落盘扩展文件失败: {error}")),
+        };
+        let mut config = LaunchConfig::new(node, host_script, entry, self.root.join("sock"));
+        config.plugin_id = id.to_string();
+        config.version = package.manifest().version.clone();
+        config.digest = digest.clone();
+        config.hooks = hooks;
+        config.grants = vec!["extension:full-trust".into()];
+        config.config = serde_json::json!({});
+        let supervisor = supervise(
+            self.group.clone(),
+            Arc::clone(&self.bus),
+            config,
+            self.policy,
+        );
+        Running {
+            digest,
+            supervisor: Some(supervisor),
+        }
+    }
+
+    /// 把宿主运行时与扩展入口按内容摘要落盘（已存在则复用）。
+    fn materialize(
+        &self,
+        id: &str,
+        package: &PluginPackage,
+    ) -> std::io::Result<(PathBuf, PathBuf)> {
+        let host_digest = magi_core::hex_lower(Sha256::digest(HOST_RUNTIME_SOURCE.as_bytes()));
+        let host_script = self
+            .root
+            .join("host")
+            .join(format!("host-{}.mjs", &host_digest[..16]));
+        write_if_absent(&host_script, HOST_RUNTIME_SOURCE.as_bytes())?;
+        let entry = self
+            .root
+            .join("packages")
+            .join(id)
+            .join(package.digest())
+            .join("extension")
+            .join("index.mjs");
+        let source = package
+            .extension_entry()
+            .ok_or_else(|| std::io::Error::other("包没有 extension/index.mjs"))?;
+        write_if_absent(&entry, source)?;
+        Ok((host_script, entry))
+    }
+}
+
+fn write_if_absent(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if path.is_file() {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("无父目录"))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(&temporary, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magi_app_server_protocol::PluginManifest;
+    use magi_extension_host::{
+        bus::{BusPolicy, HookContext, Verdict},
+        supervisor::SupervisorState,
+    };
+    use magi_plugin_system::PluginSource;
+    use serde_json::json;
+    use std::io::Write;
+
+    const ENTRY: &str = r#"
+export default async function activate(api) {
+  await api.on('tool.call', async (event) => {
+    if (event.input?.command?.includes('rm')) return { decision: 'block', reason: '禁止 rm' };
+    return { decision: 'continue' };
+  });
+}
+"#;
+
+    fn package() -> PluginPackage {
+        let manifest: PluginManifest = serde_json::from_value(json!({
+            "sdkVersion": 1, "id": "acme.guard", "version": "1.0.0", "name": "Guard", "description": "",
+            "extension": {"hooks": [{"name": "tool.call", "mode": "guard", "deadlineMs": 3000}]},
+            "permissions": [{"kind": "extension", "scope": "application", "targets": ["full-trust"]}],
+            "dataSchemaVersion": 1,
+            "settingsSchema": {"type": "object", "additionalProperties": false},
+            "contributions": {}
+        }))
+        .unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes) in [
+            ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
+            ("extension/index.mjs", ENTRY.as_bytes().to_vec()),
+        ] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap()
+    }
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        manager: Arc<Mutex<PluginManager>>,
+        bus: Arc<ExtensionBus>,
+        runtime: ExtensionRuntime,
+    }
+
+    fn fixture(node: Option<PathBuf>) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(Mutex::new(
+            PluginManager::open(dir.path().join("plugins")).unwrap(),
+        ));
+        let bus = Arc::new(ExtensionBus::new(BusPolicy::default()));
+        let mut runtime = ExtensionRuntime::new(
+            Arc::clone(&manager),
+            Arc::clone(&bus),
+            ManagedProcessGroup::new(),
+            dir.path(),
+        );
+        runtime.node = node;
+        Fixture {
+            _dir: dir,
+            manager,
+            bus,
+            runtime,
+        }
+    }
+
+    fn activate(fixture: &Fixture, package: &PluginPackage) {
+        let mut manager = fixture.manager.lock().unwrap();
+        manager
+            .install(
+                package,
+                PluginSource::Local {
+                    name: "guard.zip".into(),
+                },
+            )
+            .unwrap();
+        manager.enable("acme.guard", "application").unwrap();
+        manager
+            .authorize(
+                "acme.guard",
+                "application",
+                package.manifest().permissions.clone(),
+            )
+            .unwrap();
+        manager.activate("acme.guard", "application").unwrap();
+    }
+
+    fn call(command: &str) -> serde_json::Value {
+        json!({"input": {"command": command}})
+    }
+
+    #[tokio::test]
+    async fn activated_extension_packages_become_supervised_hosts_and_stop_on_deactivation() {
+        let fixture = fixture(Some(
+            magi_process::resolve_executable("node").expect("需要 Node"),
+        ));
+        let package = package();
+        activate(&fixture, &package);
+        fixture.runtime.reconcile().await;
+        fixture
+            .runtime
+            .running
+            .lock()
+            .await
+            .get("acme.guard")
+            .and_then(|entry| entry.supervisor.as_ref())
+            .expect("已启动监管")
+            .wait_for(|state| matches!(state, SupervisorState::Running { .. }))
+            .await;
+
+        let ctx = HookContext::new("inv");
+        let blocked = fixture
+            .bus
+            .invoke("tool.call", &ctx, call("rm -rf x"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(blocked.verdict, Verdict::Blocked { .. }),
+            "{blocked:?}"
+        );
+        let ok = fixture
+            .bus
+            .invoke("tool.call", &ctx, call("ls"))
+            .await
+            .unwrap();
+        assert_eq!(ok.verdict, Verdict::Proceed(call("ls")));
+
+        // 用户停用：先排空并回收宿主，再注销登记，之后才按变更后的策略放行。
+        fixture
+            .manager
+            .lock()
+            .unwrap()
+            .deactivate("acme.guard", "application")
+            .unwrap();
+        fixture.runtime.reconcile().await;
+        assert!(!fixture.runtime.is_running("acme.guard").await);
+        let freed = fixture
+            .bus
+            .invoke("tool.call", &ctx, call("rm -rf x"))
+            .await
+            .unwrap();
+        assert_eq!(freed.verdict, Verdict::Proceed(call("rm -rf x")));
+    }
+
+    #[tokio::test]
+    async fn registry_change_events_drive_the_reconciler() {
+        use magi_event_bus::EventEnvelope;
+        let fixture = fixture(Some(
+            magi_process::resolve_executable("node").expect("需要 Node"),
+        ));
+        let events = Arc::new(InMemoryEventBus::new(32));
+        fixture.runtime.start(Arc::clone(&events));
+        activate(&fixture, &package());
+        events.publish(EventEnvelope::domain(
+            magi_core::EventId::unique("plugin-registry-changed"),
+            "plugin.registry.changed",
+            json!({}),
+        ));
+        let mut blocked = false;
+        for _ in 0..100 {
+            let outcome = fixture
+                .bus
+                .invoke("tool.call", &HookContext::new("inv"), call("rm x"))
+                .await
+                .unwrap();
+            if matches!(outcome.verdict, Verdict::Blocked { ref reason, .. } if reason.contains("禁止 rm"))
+            {
+                blocked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(blocked, "事件之后扩展必须被拉起并生效");
+        fixture
+            .manager
+            .lock()
+            .unwrap()
+            .deactivate("acme.guard", "application")
+            .unwrap();
+        events.publish(EventEnvelope::domain(
+            magi_core::EventId::unique("plugin-registry-changed"),
+            "plugin.registry.changed",
+            json!({}),
+        ));
+        for _ in 0..100 {
+            if !fixture.runtime.is_running("acme.guard").await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("停用事件之后扩展必须被回收");
+    }
+
+    #[tokio::test]
+    async fn without_a_node_runtime_guard_hooks_fail_closed_instead_of_silently_disappearing() {
+        let fixture = fixture(None);
+        let package = package();
+        activate(&fixture, &package);
+        fixture.runtime.reconcile().await;
+        assert!(
+            fixture
+                .runtime
+                .supervisor_state("acme.guard")
+                .await
+                .is_none()
+        );
+        let outcome = fixture
+            .bus
+            .invoke("tool.call", &HookContext::new("inv"), call("ls"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome.verdict, Verdict::Blocked { .. }),
+            "{outcome:?}"
+        );
+    }
+}
