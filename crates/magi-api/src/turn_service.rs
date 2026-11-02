@@ -201,6 +201,8 @@ async fn submit_session_turn_internal(
     // 幂等重放必须先读取已提交事实，再检查当前插件准入。插件可能正处于排空、升级
     // 或已停用状态；这些状态不能让客户端无法读取原 accepted 回执。新请求仍在此处
     // 经过当前能力校验，不能借重放路径绕过准入。
+    // 扩展 `input` guard：新请求在任何状态被创建之前征询；幂等重放已在上面返回，不会再次调用。
+    check_input_guard(&state, &request, "turn").await?;
     validate_workflow_selection(&state, &request)?;
     validate_plugin_command_selection(&state, &request)?;
 
@@ -630,6 +632,7 @@ async fn submit_steer_current_turn(
     if let Some(replay) = replay_existing_submission(state, request, request_fingerprint, false)? {
         return Ok(replay);
     }
+    check_input_guard(state, request, "steer").await?;
     submit_steer_current_turn_after_turn_commit(
         state,
         request,
@@ -638,6 +641,37 @@ async fn submit_steer_current_turn(
         request_fingerprint,
     )
     .await
+}
+
+/// 征询扩展 `input` guard。被阻止的输入在写入任何会话、Turn 或队列事实之前就被拒绝。
+async fn check_input_guard(
+    state: &ApiState,
+    request: &SessionTurnRequestDto,
+    kind: &'static str,
+) -> Result<(), ApiError> {
+    use magi_conversation_runtime::extension_hooks::{InputDecision, InputView};
+    let Some(guard) = state.input_guard.as_ref() else {
+        return Ok(());
+    };
+    let session_id = request.requested_session_id().map(|id| id.to_string());
+    let workspace_id = request.requested_workspace_id();
+    let request_id = request.request_id();
+    let decision = guard
+        .check(InputView {
+            session_id: session_id.as_deref(),
+            workspace_id: workspace_id.as_deref(),
+            request_id: request_id.as_deref(),
+            text: request.text.as_deref().unwrap_or_default(),
+            image_count: request.images.len(),
+            kind,
+        })
+        .await;
+    match decision {
+        InputDecision::Proceed => Ok(()),
+        InputDecision::Blocked { plugin, reason } => Err(ApiError::Forbidden(format!(
+            "扩展 {plugin} 阻止了该输入：{reason}"
+        ))),
+    }
 }
 
 /// requestId 幂等的唯一判定：返回同一请求已有的 canonical Turn 或排队位置。
@@ -4522,6 +4556,68 @@ pub(crate) fn cancel_active_session_turn_for_lifecycle(
 #[cfg(test)]
 mod tests {
     use super::monotonic_accepted_at;
+
+    struct DenyForbidden;
+    impl magi_conversation_runtime::extension_hooks::InputGuard for DenyForbidden {
+        fn check<'a>(
+            &'a self,
+            view: magi_conversation_runtime::extension_hooks::InputView<'a>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = magi_conversation_runtime::extension_hooks::InputDecision,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            use magi_conversation_runtime::extension_hooks::InputDecision;
+            Box::pin(async move {
+                if view.text.contains("forbidden") {
+                    InputDecision::Blocked {
+                        plugin: "acme.guard".into(),
+                        reason: "输入违规".into(),
+                    }
+                } else {
+                    InputDecision::Proceed
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_input_is_rejected_before_any_session_or_turn_fact_exists() {
+        let mut harness = crate::turn_harness::MagiTurnHarness::new_task("不会执行");
+        harness.state.input_guard = Some(std::sync::Arc::new(DenyForbidden));
+        let sessions_before = harness.state.session_store.sessions().len();
+        let error = harness
+            .submit(None, "this is forbidden", "req-blocked", "msg-blocked")
+            .await
+            .expect_err("被扩展阻止的输入必须被拒绝");
+        assert!(
+            matches!(&error, crate::errors::ApiError::Forbidden(message) if message.contains("acme.guard") && message.contains("输入违规")),
+            "{error:?}"
+        );
+        assert_eq!(
+            harness.state.session_store.sessions().len(),
+            sessions_before,
+            "被阻止的输入不得创建会话"
+        );
+        assert!(
+            harness
+                .state
+                .session_store
+                .canonical_turn_for_request_id("req-blocked")
+                .is_none(),
+            "被阻止的输入不得留下 Turn 事实"
+        );
+        // 正常输入不受影响。
+        assert!(
+            harness
+                .submit(None, "hello", "req-ok", "msg-ok")
+                .await
+                .is_ok()
+        );
+    }
 
     #[test]
     fn acceptance_time_is_unique_and_monotonic_under_concurrent_submissions() {

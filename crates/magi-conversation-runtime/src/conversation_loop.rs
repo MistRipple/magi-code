@@ -174,7 +174,7 @@ pub struct ConversationLoopRequest<'a> {
     pub execution_group_id: Option<String>,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
     /// 扩展钩子端口（`tool.call` / `tool.result`）；None 表示没有可执行扩展。
-    pub tool_hooks: Option<&'a dyn crate::tool_hooks::ToolHooks>,
+    pub extension_hooks: Option<&'a dyn crate::extension_hooks::ExtensionHooks>,
 }
 
 fn direct_runtime_error(error: &BridgeClientError, default_message: &str) -> String {
@@ -740,7 +740,7 @@ fn run_conversation_loop_inner(
         prepare_workspace,
         execution_group_id,
         persist_session_state,
-        tool_hooks,
+        extension_hooks,
     } = request;
     let execution_guard = crate::task_execution_guard::TaskExecutionGuard::new(
         task_store,
@@ -1796,7 +1796,8 @@ fn run_conversation_loop_inner(
         )
         .with_model_binding(settings_store, usage_binding)
         .with_usage_assignment(lease_id.to_string())
-        .with_history_projection(history_projection.get());
+        .with_history_projection(history_projection.get())
+        .with_extension_hooks(extension_hooks);
         if is_sidechain {
             step_client =
                 step_client.with_prompt_branch(crate::prompt_lineage::PromptBranchScope::Worker {
@@ -3180,10 +3181,10 @@ fn run_conversation_loop_inner(
         } else {
             // 扩展 `tool.call`：在账本指纹、路径与并发分类、权限和审批之前生效；
             // 被阻止的调用不进入原生管线，改写后的参数已用本轮工具定义重新校验。
-            let hooked = tool_hooks.map(|hooks| {
-                crate::tool_hooks::prepare_tool_calls(
+            let hooked = extension_hooks.map(|hooks| {
+                crate::extension_hooks::prepare_tool_calls(
                     hooks,
-                    &crate::tool_hooks::ToolHookScope {
+                    &crate::extension_hooks::ToolHookScope {
                         session_id: session_id.as_str(),
                         task_id: task_id.as_str(),
                         workspace_id: workspace_id.as_ref().map(|id| id.as_str()),
@@ -3358,9 +3359,9 @@ fn run_conversation_loop_inner(
             // 原始回执已在上方写入 canonical 事实；扩展 `tool.result` 只能改模型可见投影。
             let mut model_visible =
                 crate::history_projection::project_tool_result(&result, tool_status);
-            if let Some(hooks) = tool_hooks
+            if let Some(hooks) = extension_hooks
                 && let Some(replaced) = hooks.tool_result(
-                    &crate::tool_hooks::ToolHookScope {
+                    &crate::extension_hooks::ToolHookScope {
                         session_id: session_id.as_str(),
                         task_id: task_id.as_str(),
                         workspace_id: workspace_id.as_ref().map(|id| id.as_str()),
@@ -3368,7 +3369,7 @@ fn run_conversation_loop_inner(
                         round,
                     },
                     tool_call,
-                    crate::tool_hooks::ToolResultView {
+                    crate::extension_hooks::ToolResultView {
                         status: tool_status.wire_label(),
                         projection: &model_visible,
                     },
@@ -7263,7 +7264,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         assert!(
@@ -7446,7 +7447,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         assert!(
@@ -7704,7 +7705,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -7903,7 +7904,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -8407,7 +8408,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
         (outcome, client.invocations.load(Ordering::SeqCst))
     }
@@ -8486,7 +8487,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -8588,7 +8589,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -8856,7 +8857,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         match outcome {
@@ -8924,12 +8925,12 @@ mod tests {
         calls: Mutex<Vec<String>>,
     }
 
-    impl crate::tool_hooks::ToolHooks for ScriptedToolHooks {
+    impl crate::extension_hooks::ExtensionHooks for ScriptedToolHooks {
         fn tool_call(
             &self,
-            _scope: &crate::tool_hooks::ToolHookScope<'_>,
+            _scope: &crate::extension_hooks::ToolHookScope<'_>,
             call: &ChatToolCall,
-        ) -> crate::tool_hooks::ToolCallDecision {
+        ) -> crate::extension_hooks::ToolCallDecision {
             self.calls
                 .lock()
                 .unwrap()
@@ -8939,15 +8940,15 @@ mod tests {
                 .and_then(|value| value["command"].as_str().map(str::to_owned))
                 .unwrap_or_default();
             match command.as_str() {
-                "blocked" => crate::tool_hooks::ToolCallDecision::Blocked {
+                "blocked" => crate::extension_hooks::ToolCallDecision::Blocked {
                     plugin: "acme.guard".into(),
                     reason: "不允许".into(),
                 },
-                "rewrite" => crate::tool_hooks::ToolCallDecision::Proceed {
+                "rewrite" => crate::extension_hooks::ToolCallDecision::Proceed {
                     arguments: Some(r#"{"command":"rewritten"}"#.into()),
                     rewritten_by: vec!["acme.guard".into()],
                 },
-                _ => crate::tool_hooks::ToolCallDecision::Proceed {
+                _ => crate::extension_hooks::ToolCallDecision::Proceed {
                     arguments: None,
                     rewritten_by: vec![],
                 },
@@ -8956,9 +8957,9 @@ mod tests {
 
         fn tool_result(
             &self,
-            _scope: &crate::tool_hooks::ToolHookScope<'_>,
+            _scope: &crate::extension_hooks::ToolHookScope<'_>,
             _call: &ChatToolCall,
-            view: crate::tool_hooks::ToolResultView<'_>,
+            view: crate::extension_hooks::ToolResultView<'_>,
         ) -> Option<String> {
             view.projection
                 .contains("rewritten")
@@ -9095,7 +9096,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: Some(&hooks),
+            extension_hooks: Some(&hooks),
         });
         assert!(
             matches!(outcome, TaskOutcome::Completed { .. }),
@@ -9213,7 +9214,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         match outcome {
@@ -9442,7 +9443,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -9591,7 +9592,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -9708,7 +9709,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -9879,7 +9880,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -10317,7 +10318,7 @@ mod tests {
                 prepare_workspace: None,
                 execution_group_id: None,
                 persist_session_state: None,
-                tool_hooks: None,
+                extension_hooks: None,
             })
         };
 
@@ -10545,7 +10546,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Failed { .. }));
@@ -10681,7 +10682,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -10814,7 +10815,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -10964,7 +10965,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         let output_refs = match outcome {
@@ -11167,7 +11168,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         assert!(
@@ -11381,7 +11382,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
-            tool_hooks: None,
+            extension_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));

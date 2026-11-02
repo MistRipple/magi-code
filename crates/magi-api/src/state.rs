@@ -1468,6 +1468,8 @@ pub struct ApiState {
     execution_resources: ExecutionResourceCoordinator,
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     pub skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
+    /// 扩展 `input` 钩子端口；None 表示没有可执行扩展。
+    pub(crate) input_guard: Option<Arc<dyn magi_conversation_runtime::extension_hooks::InputGuard>>,
     pub tunnel_manager: crate::tunnel::TunnelManager,
     /// 插件安装、授权和生命周期的唯一 daemon 领域服务。
     pub plugin_manager: Arc<Mutex<magi_plugin_system::PluginManager>>,
@@ -2215,6 +2217,7 @@ impl ApiState {
             execution_resources,
             skill_runtime: None,
             skill_dispatch_runtime: None,
+            input_guard: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
             plugin_manager: Arc::new(Mutex::new(
                 magi_plugin_system::PluginManager::open(std::env::temp_dir().join(format!(
@@ -5645,6 +5648,14 @@ impl ApiState {
                     .collect()
             }));
         self.skill_runtime = Some(skill_runtime);
+        self
+    }
+
+    pub fn with_input_guard(
+        mut self,
+        guard: Arc<dyn magi_conversation_runtime::extension_hooks::InputGuard>,
+    ) -> Self {
+        self.input_guard = Some(guard);
         self
     }
 

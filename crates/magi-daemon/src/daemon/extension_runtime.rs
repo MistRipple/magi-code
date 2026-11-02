@@ -407,9 +407,7 @@ export default async function activate(api) {
 
     #[tokio::test]
     async fn activated_extension_packages_become_supervised_hosts_and_stop_on_deactivation() {
-        let fixture = fixture(Some(
-            magi_process::resolve_executable("node").expect("需要 Node"),
-        ));
+        let fixture = fixture(Some(test_node()));
         let package = package();
         activate(&fixture, &package);
         fixture.runtime.reconcile().await;
@@ -461,9 +459,7 @@ export default async function activate(api) {
     #[tokio::test]
     async fn registry_change_events_drive_the_reconciler() {
         use magi_event_bus::EventEnvelope;
-        let fixture = fixture(Some(
-            magi_process::resolve_executable("node").expect("需要 Node"),
-        ));
+        let fixture = fixture(Some(test_node()));
         let events = Arc::new(InMemoryEventBus::new(32));
         fixture.runtime.start(Arc::clone(&events));
         activate(&fixture, &package());

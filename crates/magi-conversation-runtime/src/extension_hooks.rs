@@ -39,7 +39,62 @@ pub struct ToolResultView<'a> {
     pub projection: &'a str,
 }
 
-pub trait ToolHooks: Send + Sync {
+/// 即将派发的子代理（来自 `agent_spawn` 调用的有限视图）。
+#[derive(Clone, Copy, Debug)]
+pub struct SubagentSpawnView<'a> {
+    pub tool_call_id: &'a str,
+    pub role: &'a str,
+    pub task_name: &'a str,
+    pub goal: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpawnDecision {
+    Proceed,
+    Blocked { plugin: String, reason: String },
+}
+
+/// 用户输入被接纳前的有限视图（`input` 钩子）。
+#[derive(Clone, Copy, Debug)]
+pub struct InputView<'a> {
+    pub session_id: Option<&'a str>,
+    pub workspace_id: Option<&'a str>,
+    pub request_id: Option<&'a str>,
+    pub text: &'a str,
+    pub image_count: usize,
+    /// "turn"（新 Turn 或排队）或 "steer"（引导当前回复）。
+    pub kind: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputDecision {
+    Proceed,
+    Blocked { plugin: String, reason: String },
+}
+
+/// 输入接纳前的 guard 端口。HTTP 与 App Server 都经 `TurnService` 单一入口调用它；
+/// 它运行在异步上下文里，因此与同步的 `ExtensionHooks` 分开。
+pub trait InputGuard: Send + Sync {
+    fn check<'a>(
+        &'a self,
+        view: InputView<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = InputDecision> + Send + 'a>>;
+}
+
+pub trait ExtensionHooks: Send + Sync {
+    /// 观察类钩子：只通知已提交的事实，不阻塞、不返回结果。
+    fn observe(&self, _hook: &'static str, _payload: serde_json::Value) {}
+
+    /// 子代理即将派发：在完整预检之前征询；之后原生预检（角色、模型绑定、工具面）照常重新执行。
+    /// 只能阻止，不能指定或覆盖模型（模型由角色绑定决定）。
+    fn subagent_spawn(
+        &self,
+        _scope: &ToolHookScope<'_>,
+        _request: &SubagentSpawnView<'_>,
+    ) -> SpawnDecision {
+        SpawnDecision::Proceed
+    }
+
     /// 一个工具调用即将进入原生管线。
     fn tool_call(&self, scope: &ToolHookScope<'_>, call: &ChatToolCall) -> ToolCallDecision;
     /// 工具结果的模型可见投影即将交给模型；返回 `Some` 替换投影。
@@ -84,7 +139,7 @@ fn rejected(
 }
 
 pub(crate) fn prepare_tool_calls(
-    hooks: &dyn ToolHooks,
+    hooks: &dyn ExtensionHooks,
     scope: &ToolHookScope<'_>,
     calls: &[ChatToolCall],
     definitions: &[ChatToolDefinition],
@@ -97,7 +152,43 @@ pub(crate) fn prepare_tool_calls(
     };
     for (index, call) in calls.iter().enumerate() {
         let tool = call.function.name.as_str();
-        match hooks.tool_call(scope, call) {
+        let decision = hooks.tool_call(scope, call);
+        // 通过 tool.call 之后、仍可能被改写：子代理钩子看到的是最终要执行的参数。
+        let spawn_arguments = match &decision {
+            ToolCallDecision::Proceed {
+                arguments: Some(arguments),
+                ..
+            } => arguments.as_str(),
+            _ => call.function.arguments.as_str(),
+        };
+        let spawn_block = (matches!(decision, ToolCallDecision::Proceed { .. })
+            && crate::task_helpers::canonical_tool_call_name(tool) == "agent_spawn")
+            .then(|| spawn_view(spawn_arguments))
+            .flatten()
+            .and_then(|view| {
+                match hooks.subagent_spawn(
+                    scope,
+                    &SubagentSpawnView {
+                        tool_call_id: &call.id,
+                        role: &view.0,
+                        task_name: &view.1,
+                        goal: &view.2,
+                    },
+                ) {
+                    SpawnDecision::Proceed => None,
+                    SpawnDecision::Blocked { plugin, reason } => Some((plugin, reason)),
+                }
+            });
+        if let Some((plugin, reason)) = spawn_block {
+            batch.immediate[index] = Some(rejected(
+                tool,
+                "extension_blocked",
+                &format!("扩展 {plugin} 阻止了该子代理派发：{reason}"),
+                Some(&plugin),
+            ));
+            continue;
+        }
+        match decision {
             ToolCallDecision::Blocked { plugin, reason } => {
                 batch.immediate[index] = Some(rejected(
                     tool,
@@ -141,6 +232,19 @@ pub(crate) fn prepare_tool_calls(
         }
     }
     batch
+}
+
+/// 从 `agent_spawn` 参数里取出钩子可见的有限字段（角色、任务名、目标摘要）。
+fn spawn_view(arguments: &str) -> Option<(String, String, String)> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let text = |key: &str, limit: usize| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(|text| text.chars().take(limit).collect::<String>())
+            .unwrap_or_default()
+    };
+    Some((text("role", 96), text("task_name", 96), text("goal", 2048)))
 }
 
 impl HookedBatch {
@@ -216,7 +320,7 @@ mod tests {
     }
 
     struct Scripted(fn(&ChatToolCall) -> ToolCallDecision);
-    impl ToolHooks for Scripted {
+    impl ExtensionHooks for Scripted {
         fn tool_call(&self, _: &ToolHookScope<'_>, call: &ChatToolCall) -> ToolCallDecision {
             (self.0)(call)
         }
@@ -292,6 +396,79 @@ mod tests {
             json!(["acme.guard"])
         );
         assert_eq!(results[2].0, "plain text");
+    }
+
+    struct SpawnPolicy;
+    impl ExtensionHooks for SpawnPolicy {
+        fn tool_call(&self, _: &ToolHookScope<'_>, _: &ChatToolCall) -> ToolCallDecision {
+            ToolCallDecision::Proceed {
+                arguments: None,
+                rewritten_by: vec![],
+            }
+        }
+        fn tool_result(
+            &self,
+            _: &ToolHookScope<'_>,
+            _: &ChatToolCall,
+            _: ToolResultView<'_>,
+        ) -> Option<String> {
+            None
+        }
+        fn subagent_spawn(
+            &self,
+            _: &ToolHookScope<'_>,
+            request: &SubagentSpawnView<'_>,
+        ) -> SpawnDecision {
+            if request.role == "reviewer" {
+                SpawnDecision::Blocked {
+                    plugin: "acme.policy".into(),
+                    reason: "禁止评审代理".into(),
+                }
+            } else {
+                SpawnDecision::Proceed
+            }
+        }
+    }
+
+    #[test]
+    fn subagent_spawn_guard_blocks_only_matching_agent_spawn_calls() {
+        let defs = vec![ChatToolDefinition {
+            kind: "function".into(),
+            origin: Default::default(),
+            function: ChatToolFunctionDefinition {
+                name: "agent_spawn".into(),
+                description: String::new(),
+                parameters: json!({"type": "object"}),
+            },
+        }];
+        let calls = [
+            call(
+                "a",
+                "agent_spawn",
+                r#"{"role":"reviewer","task_name":"r1","goal":"审查"}"#,
+            ),
+            call(
+                "b",
+                "agent_spawn",
+                r#"{"role":"worker","task_name":"w1","goal":"实现"}"#,
+            ),
+            call("c", "shell_exec", r#"{"role":"reviewer"}"#),
+        ];
+        let batch = prepare_tool_calls(&SpawnPolicy, &scope(), &calls, &defs);
+        assert_eq!(
+            batch
+                .execute
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "c"],
+            "只有匹配角色的 agent_spawn 被阻止，其他工具不受影响"
+        );
+        let results = batch.merge(vec![("ok".into(), ExecutionResultStatus::Succeeded); 2]);
+        assert!(
+            results[0].0.contains("extension_blocked") && results[0].0.contains("禁止评审代理")
+        );
+        assert_eq!(results[1].0, "ok");
     }
 
     #[test]

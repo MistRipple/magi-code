@@ -4,7 +4,19 @@
 
 ## 0. 状态与适用范围
 
-- 【现状·部分实现】[`magi-extension-host`](../crates/magi-extension-host) 已实现：帧、握手、对端、`register.hook`/`host.ready`、`hook.invoke`/`hook.notify`/`hook.gap`/`host.cancel`/`host.ping`/`host.shutdown`、ExtensionBus 的 guard/advise/observe 分发、熔断与重启监管，并有真实 Node 进程的端到端测试（macOS 已运行）。已接入对话循环：`tool.call`（账本指纹、路径与并发分类、权限和审批之前，改写后用本轮工具定义重新校验）与 `tool.result`（只改模型可见投影，原始回执先写入 canonical 事实），经 `magi-conversation-runtime::tool_hooks` 端口和 daemon 的适配器接入；真实循环与真实 Node 进程各有端到端测试，并已由 daemon 的 `ExtensionRuntime` 协调器接上插件管理：已安装、已授权、应用级激活且声明 `extension` 的包会被落盘、登记到 ExtensionBus 并受监管启动，停用或摘要变化时回收并注销（找不到 Node 时登记仍保留，guard 钩子 fail-closed）。Node 来自发行包随带的固定版本（`apps/desktop/node-runtime.json` 固定版本与归档摘要，daemon 只在自身同级 `node/` 目录查找，开发时用 `MAGI_EXTENSION_NODE` 覆盖），永不回退到用户 PATH；监管状态尚未进入插件管理的界面投影，失败只写日志。**尚未实现**：其余 13 个钩子的接线、`command/tool/job/migration` 方法、`model.invoke`/`tool.call`/`task.spawn`/`resource.*`/`credential.ref`/blob 等宿主→daemon 服务、`hook.invoke` 的 `ctx` 中的 `deadline` 绝对时间戳（当前传 `deadlineMs`）、Windows 命名管道路径（已编写、未编译验证）、以及对 conversation-runtime 实际调用链的接线——其余钩子目前不会被真实 Turn 触发。落点引用沿用设计文档 5.6 的核对结果。
+- 【现状·部分实现】[`magi-extension-host`](../crates/magi-extension-host) 已实现：帧、握手、对端、`register.hook`/`host.ready`、`hook.invoke`/`hook.notify`/`hook.gap`/`host.cancel`/`host.ping`/`host.shutdown`、ExtensionBus 的 guard/advise/observe 分发、熔断与重启监管，并有真实 Node 进程的端到端测试（macOS 已运行）。已接入对话循环：`tool.call`（账本指纹、路径与并发分类、权限和审批之前，改写后用本轮工具定义重新校验）与 `tool.result`（只改模型可见投影，原始回执先写入 canonical 事实），经 `magi-conversation-runtime::tool_hooks` 端口和 daemon 的适配器接入；真实循环与真实 Node 进程各有端到端测试，并已由 daemon 的 `ExtensionRuntime` 协调器接上插件管理：已安装、已授权、应用级激活且声明 `extension` 的包会被落盘、登记到 ExtensionBus 并受监管启动，停用或摘要变化时回收并注销（找不到 Node 时登记仍保留，guard 钩子 fail-closed）。Node 来自发行包随带的固定版本（`apps/desktop/node-runtime.json` 固定版本与归档摘要，daemon 只在自身同级 `node/` 目录查找，开发时用 `MAGI_EXTENSION_NODE` 覆盖），永不回退到用户 PATH；监管状态尚未进入插件管理的界面投影，失败只写日志。**钩子接线现状**（清单声明未接线的钩子/模式会在安装阶段被拒绝，不留永不触发的声明）：
+
+| 钩子 | 已接线模式 | 来源与语义 |
+| --- | --- | --- |
+| `tool.call` `tool.result` | guard、advise | 工具管线，见上 |
+| `input` | guard（只能阻止） | `TurnService` 单一入口，幂等重放之后、任何会话/Turn 事实创建之前；steer 同样经过；扩展提出改写按失败处理（fail-closed），文本转换尚未支持 |
+| `subagent.spawn` | guard（只能阻止） | 在 `agent_spawn` 完整预检之前征询（看到 `tool.call` 改写后的最终参数），之后原生预检照常重新执行；不能指定或覆盖模型 |
+| `session.created` `session.deleted` `turn.accepted` `turn.end` `usage.update` | observe | 领域事件总线的先提交后发布事实，经 daemon 转发器投影为有限、脱敏字段（不含正文、提示词、凭据）；`turn.end` 由 `session.turn.item` 事件里的终态派生并按 Turn 去重；事件总线是广播通道，消费落后会丢事件（只记日志，观察钩子不承诺完整送达） |
+| `model.resolved` `model.request` `model.response` | observe | `StepModelClient` 在 Step 事实提交后通知，仅限任务主线（`conversation_loop`）；纯会话 profile 的模型调用尚未接线 |
+
+**刻意未接线**：`prompt.contribute`、`context.assemble`、`compaction.before` 需要先把 `extension_rewrite` 落为缓存架构里的正式失效原因（见[缓存架构](prompt-cache-lineage-architecture.md)），在此之前不开放；`input` 与 `model.request` 的 advise 改写、`subagent.spawn` 的收窄尚未实现。
+
+**尚未实现**：`command/tool/job/migration` 方法、`model.invoke`/`tool.call`/`task.spawn`/`resource.*`/`credential.ref`/blob 等宿主→daemon 服务、`hook.invoke` 的 `ctx` 中的 `deadline` 绝对时间戳（当前传 `deadlineMs`）、Windows 命名管道路径（已编写、未编译验证）、以及对 conversation-runtime 实际调用链的接线——其余钩子目前不会被真实 Turn 触发。落点引用沿用设计文档 5.6 的核对结果。
 - 【目标】协议只有一条执行路径，服务 Node 宿主；不为 QuickJS 或 SDK 1 提供任何子集（设计文档 I14、D1）。
 - 本文使用 MUST / SHOULD / MAY 表达规范强度。数值默认值与设计文档 5.8 一致，需压力测试校准，偏离须同步修订两处。
 - 规范性示例使用 JSON；字段名一律 camelCase；未知字段在 v1 内一律拒绝（`deny_unknown_fields` 语义），新增字段只能经小版本并由握手声明启用。

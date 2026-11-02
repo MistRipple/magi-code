@@ -1769,11 +1769,13 @@ impl DaemonRuntime {
 
         let plugin_command_executor = self.plugins.command_executor();
         self.plugins.start_extensions(self.event_bus.clone());
-        let extension_tool_hooks: Arc<dyn magi_conversation_runtime::tool_hooks::ToolHooks> =
-            Arc::new(super::extension_bridge::ExtensionToolHooks::new(
-                self.plugins.extension_bus(),
-                tokio::runtime::Handle::current(),
-            ));
+        let extension_hooks_adapter = Arc::new(super::extension_bridge::ExtensionBusHooks::new(
+            self.plugins.extension_bus(),
+            tokio::runtime::Handle::current(),
+        ));
+        let extension_bus_hooks: Arc<
+            dyn magi_conversation_runtime::extension_hooks::ExtensionHooks,
+        > = extension_hooks_adapter.clone();
         let mut llm_task_dispatcher = llm_task_dispatcher;
         llm_task_dispatcher = llm_task_dispatcher
             .with_session_engine_factory(session_engine_factory)
@@ -1799,10 +1801,11 @@ impl DaemonRuntime {
                 .with_skill_runtime(app_skill_runtime)
                 .with_snapshot_manager(state.snapshot_manager.clone())
                 .with_workspace_execution_preparer(magi_api::workspace_execution_preparer(&state))
-                .with_tool_hooks(extension_tool_hooks),
+                .with_extension_hooks(extension_bus_hooks),
         );
         let session_turn_dispatcher = llm_task_dispatcher.clone();
         state = state
+            .with_input_guard(extension_hooks_adapter)
             .with_session_turn_dispatcher(session_turn_dispatcher)
             .with_model_bridge_client(business_model_client);
         // Runner 只负责调度与资源循环。任务终态由 TaskStore durable status

@@ -180,11 +180,16 @@ pub fn response_err(id: &str, error: &RpcError) -> Value {
 #[derive(Clone, Copy, Debug)]
 pub struct HookSpec {
     pub name: &'static str,
+    /// 协议允许的模式。
     pub modes: &'static [HookMode],
+    /// 当前 daemon 实际接线的模式。声明了未接线模式的包在安装阶段被拒绝（不留装饰性声明，I5）。
+    pub wired: &'static [HookMode],
     pub replace: bool,
     pub patch_limit: usize,
 }
 
+const NONE: &[HookMode] = &[];
+const GUARD: &[HookMode] = &[HookMode::Guard];
 const OBSERVE: &[HookMode] = &[HookMode::Observe];
 const GUARD_ADVISE: &[HookMode] = &[HookMode::Guard, HookMode::Advise];
 const ADVISE: &[HookMode] = &[HookMode::Advise];
@@ -195,90 +200,105 @@ pub const HOOKS: &[HookSpec] = &[
     HookSpec {
         name: "session.created",
         modes: OBSERVE,
+        wired: OBSERVE,
         replace: false,
         patch_limit: 0,
     },
     HookSpec {
         name: "session.deleted",
         modes: OBSERVE,
+        wired: OBSERVE,
         replace: false,
         patch_limit: 0,
     },
     HookSpec {
         name: "turn.accepted",
         modes: OBSERVE,
+        wired: OBSERVE,
         replace: false,
         patch_limit: 0,
     },
     HookSpec {
         name: "turn.end",
         modes: OBSERVE,
+        wired: OBSERVE,
         replace: false,
         patch_limit: 0,
     },
     HookSpec {
         name: "input",
         modes: GUARD_ADVISE,
+        wired: GUARD,
         replace: true,
         patch_limit: 1024 * KIB,
     },
     HookSpec {
         name: "prompt.contribute",
         modes: ADVISE,
+        wired: NONE,
         replace: true,
         patch_limit: 256 * KIB,
     },
     HookSpec {
         name: "context.assemble",
         modes: ADVISE,
+        wired: NONE,
         replace: true,
         patch_limit: 64 * KIB,
     },
     HookSpec {
         name: "model.request",
         modes: OBSERVE_ADVISE,
+        wired: OBSERVE,
         replace: true,
         patch_limit: 64 * KIB,
     },
     HookSpec {
         name: "model.response",
         modes: OBSERVE,
+        wired: OBSERVE,
         replace: false,
         patch_limit: 0,
     },
     HookSpec {
         name: "tool.call",
         modes: GUARD_ADVISE,
+        wired: GUARD_ADVISE,
         replace: true,
         patch_limit: 1024 * KIB,
     },
     HookSpec {
         name: "tool.result",
         modes: GUARD_ADVISE,
+        wired: GUARD_ADVISE,
         replace: true,
         patch_limit: 1024 * KIB,
     },
     HookSpec {
         name: "compaction.before",
         modes: ADVISE,
+        wired: NONE,
         replace: true,
         patch_limit: 64 * KIB,
     },
     HookSpec {
         name: "subagent.spawn",
         modes: GUARD_ADVISE,
+        wired: GUARD,
         replace: true,
         patch_limit: 64 * KIB,
     },
     HookSpec {
         name: "model.resolved",
         modes: OBSERVE,
+        wired: OBSERVE,
         replace: false,
         patch_limit: 0,
     },
     HookSpec {
         name: "usage.update",
         modes: OBSERVE,
+        wired: OBSERVE,
         replace: false,
         patch_limit: 0,
     },
@@ -299,6 +319,23 @@ pub struct HookRegistration {
 }
 
 impl HookRegistration {
+    /// 在 `validate` 之外要求该模式已被 daemon 接线；安装与激活用它，避免声明永远不会触发的钩子。
+    pub fn validate_wired(&self) -> Result<Duration, RpcError> {
+        let deadline = self.validate()?;
+        let spec = hook_spec(&self.name).expect("validated hook exists");
+        if spec.wired.contains(&self.mode) {
+            Ok(deadline)
+        } else {
+            Err(RpcError::new(
+                ErrorKind::RegistrationDenied,
+                format!(
+                    "钩子 {} 的 {:?} 模式尚未接入 daemon 调用链",
+                    self.name, self.mode
+                ),
+            ))
+        }
+    }
+
     /// 校验目录与模式组合，返回生效的 deadline（受模式上限约束）。
     pub fn validate(&self) -> Result<Duration, RpcError> {
         let spec = hook_spec(&self.name).ok_or_else(|| {
@@ -385,5 +422,36 @@ mod tests {
                 .is_err()
         );
         assert!(reg("nope", HookMode::Observe, None).validate().is_err());
+    }
+
+    #[test]
+    fn only_wired_hook_modes_are_accepted_for_production_registration() {
+        let reg = |name: &str, mode| HookRegistration {
+            name: name.into(),
+            mode,
+            deadline_ms: None,
+        };
+        for (name, mode) in [
+            ("tool.call", HookMode::Guard),
+            ("tool.call", HookMode::Advise),
+            ("input", HookMode::Guard),
+            ("subagent.spawn", HookMode::Guard),
+            ("turn.end", HookMode::Observe),
+            ("model.request", HookMode::Observe),
+        ] {
+            assert!(reg(name, mode).validate_wired().is_ok(), "{name} {mode:?}");
+        }
+        for (name, mode) in [
+            ("input", HookMode::Advise),
+            ("model.request", HookMode::Advise),
+            ("prompt.contribute", HookMode::Advise),
+            ("context.assemble", HookMode::Advise),
+            ("compaction.before", HookMode::Advise),
+            ("subagent.spawn", HookMode::Advise),
+        ] {
+            assert!(reg(name, mode).validate_wired().is_err(), "{name} {mode:?}");
+        }
+        // 目录允许但未接线的组合仍然通过协议级校验（测试与未来接线使用）。
+        assert!(reg("model.request", HookMode::Advise).validate().is_ok());
     }
 }

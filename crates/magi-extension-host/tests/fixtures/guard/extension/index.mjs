@@ -28,4 +28,10 @@ export default async function activate(api) {
     if (input.projection.includes('secret')) return { decision: 'replace', patch: { projection: '[redacted]' } };
     return { decision: 'continue' };
   });
+  await on('input', async (event) =>
+    event.raw?.text?.includes('forbidden') ? { decision: 'block', reason: '输入违规' } : { decision: 'continue' });
+  await on('subagent.spawn', async (event) =>
+    event.role === 'reviewer' ? { decision: 'block', reason: '禁止评审代理' } : { decision: 'continue' });
+  await on('session.created', (event) => { note(`session.created:${event.sessionId}`); });
+  await on('usage.update', (event) => { note(`usage:${event.model}:${event.inputTokens}`); });
 }

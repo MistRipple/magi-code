@@ -70,6 +70,10 @@ impl PluginServices {
 
     /// 启动受信扩展协调器：收敛一次，之后随插件注册表事件持续收敛。
     pub(super) fn start_extensions(&self, events: Arc<InMemoryEventBus>) {
+        super::extension_bridge::spawn_event_forwarder(
+            Arc::clone(&self.extension_bus),
+            Arc::clone(&events),
+        );
         self.extensions.start(events);
     }
 

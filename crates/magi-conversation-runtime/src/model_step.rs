@@ -25,6 +25,8 @@ pub struct StepModelClient<'a> {
     prompt_branch: Option<PromptBranchScope>,
     execution_scope: Option<magi_bridge_client::ModelExecutionScope>,
     history_projection: Option<magi_session_store::HistoryProjection>,
+    /// 扩展观察钩子（`model.resolved` / `model.request` / `model.response`）。
+    extension_hooks: Option<&'a dyn crate::extension_hooks::ExtensionHooks>,
 }
 
 impl<'a> StepModelClient<'a> {
@@ -51,7 +53,16 @@ impl<'a> StepModelClient<'a> {
             prompt_branch: None,
             execution_scope: None,
             history_projection: None,
+            extension_hooks: None,
         }
+    }
+
+    pub fn with_extension_hooks(
+        mut self,
+        hooks: Option<&'a dyn crate::extension_hooks::ExtensionHooks>,
+    ) -> Self {
+        self.extension_hooks = hooks;
+        self
     }
 
     pub fn with_purpose(mut self, purpose: magi_session_store::ModelStepPurpose) -> Self {
@@ -387,9 +398,47 @@ impl<'a> StepModelClient<'a> {
             prompt_frame: Some(persisted_frame),
             cache_epoch,
         };
+        // 观察通知在 Step 事实提交之后发出，且只带有限字段（不含提示词、消息正文或凭据）。
+        let observed = self.extension_hooks.map(|hooks| {
+            (
+                hooks,
+                serde_json::json!({
+                    "sessionId": self.session_id.as_str(),
+                    "turnId": turn_id,
+                    "stepId": step_id,
+                    "purpose": self.purpose,
+                }),
+                serde_json::json!({
+                    "provider": step.provider,
+                    "model": step.binding.as_ref().and_then(|binding| binding.model.clone()),
+                    "messageCount": step.message_count,
+                    "toolCount": step.tool_count,
+                    "maxOutputTokens": step.max_output_tokens,
+                    "requestFingerprint": step.request_fingerprint,
+                    "cacheEpoch": step.cache_epoch,
+                }),
+            )
+        });
         self.store
             .begin_model_step(self.session_id, turn_id, step)
             .map_err(step_start_error)?;
+        if let Some((hooks, identity, request_view)) = &observed {
+            let merged = |extra: &serde_json::Value| {
+                let mut value = identity.clone();
+                if let (Some(target), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
+                    target.extend(extra.clone());
+                }
+                value
+            };
+            hooks.observe(
+                "model.resolved",
+                merged(&serde_json::json!({
+                    "provider": request_view["provider"],
+                    "model": request_view["model"],
+                })),
+            );
+            hooks.observe("model.request", merged(request_view));
+        }
         let retry_write_error = std::sync::Mutex::new(None::<magi_core::DomainError>);
         let recorded_retry = |event: &ModelRetryRuntimeEvent| {
             if event.phase == magi_bridge_client::ModelRetryRuntimePhase::AttemptStarted
@@ -456,6 +505,17 @@ impl<'a> StepModelClient<'a> {
             .attempts
             .last()
             .and_then(|record| record.usage.clone());
+        if let Some((hooks, identity, _)) = &observed {
+            let mut payload = identity.clone();
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("ok".into(), result.is_ok().into());
+                object.insert(
+                    "usageTokens".into(),
+                    crate::usage_recording::model_usage_tokens(usage).into(),
+                );
+            }
+            hooks.observe("model.response", payload);
+        }
         self.log_cache_reuse(
             &step_id,
             previous
@@ -783,6 +843,82 @@ mod tests {
             bodies
         });
         (url, thread)
+    }
+
+    #[test]
+    fn model_step_notifies_observers_after_commit_without_prompt_content() {
+        struct Echo;
+        impl ModelBridgeClient for Echo {
+            fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+                magi_bridge_client::native_executor_capabilities()
+            }
+            fn invoke(
+                &self,
+                _: ModelInvocationRequest,
+            ) -> Result<ModelResponse, BridgeClientError> {
+                Ok(ModelResponse::completed("ok"))
+            }
+            fn invoke_streaming(
+                &self,
+                request: ModelInvocationRequest,
+                _: &dyn Fn(&ModelStreamingDelta),
+            ) -> Result<ModelResponse, BridgeClientError> {
+                self.invoke(request)
+            }
+        }
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<(&'static str, serde_json::Value)>>);
+        impl crate::extension_hooks::ExtensionHooks for Recorder {
+            fn tool_call(
+                &self,
+                _: &crate::extension_hooks::ToolHookScope<'_>,
+                _: &magi_bridge_client::ChatToolCall,
+            ) -> crate::extension_hooks::ToolCallDecision {
+                unreachable!("模型步骤不会触发工具钩子")
+            }
+            fn tool_result(
+                &self,
+                _: &crate::extension_hooks::ToolHookScope<'_>,
+                _: &magi_bridge_client::ChatToolCall,
+                _: crate::extension_hooks::ToolResultView<'_>,
+            ) -> Option<String> {
+                unreachable!("模型步骤不会触发工具钩子")
+            }
+            fn observe(&self, hook: &'static str, payload: serde_json::Value) {
+                self.0.lock().unwrap().push((hook, payload));
+            }
+        }
+        let (store, session, thread) = store();
+        let recorder = Recorder::default();
+        StepModelClient::new(
+            &Echo,
+            &store,
+            &session,
+            Some("turn-journal-client"),
+            None,
+            &thread,
+            "observed-call",
+        )
+        .with_extension_hooks(Some(&recorder))
+        .invoke(request("机密提示词"))
+        .unwrap();
+        let events = recorder.0.lock().unwrap();
+        assert_eq!(
+            events.iter().map(|(hook, _)| *hook).collect::<Vec<_>>(),
+            ["model.resolved", "model.request", "model.response"]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|(_, payload)| payload["stepId"] == "observed-call")
+        );
+        assert_eq!(events[2].1["ok"], true);
+        assert!(
+            events
+                .iter()
+                .all(|(_, payload)| !payload.to_string().contains("机密提示词")),
+            "观察载荷不得包含提示词正文"
+        );
     }
 
     #[test]

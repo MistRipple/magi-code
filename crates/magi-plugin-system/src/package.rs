@@ -276,7 +276,7 @@ fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
             deadline_ms: hook.deadline_ms.map(|ms| ms as u64),
         };
         registration
-            .validate()
+            .validate_wired()
             .map_err(|error| invalid(format!("扩展钩子声明无效：{}", error.message)))?;
         if !seen.insert(hook.name.clone()) {
             return Err(invalid(format!("扩展钩子 {} 重复声明", hook.name)));

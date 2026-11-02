@@ -319,7 +319,7 @@ pub struct LlmTaskDispatcher {
     tool_registry: Option<ToolRegistry>,
     skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
-    tool_hooks: Option<Arc<dyn crate::tool_hooks::ToolHooks>>,
+    extension_hooks: Option<Arc<dyn crate::extension_hooks::ExtensionHooks>>,
     snapshot_manager: Option<Arc<magi_snapshot::SnapshotManager>>,
     workspace_execution_preparer: Option<Arc<WorkspaceExecutionPreparer>>,
     /// 主线和子代理共用的运行时输入与交互投递入口，不持有独立 Turn 状态。
@@ -1043,7 +1043,7 @@ impl LlmTaskDispatcher {
             tool_registry: None,
             skill_runtime: None,
             skill_dispatch_runtime: None,
-            tool_hooks: None,
+            extension_hooks: None,
             snapshot_manager: None,
             workspace_execution_preparer: None,
             conversation_registry,
@@ -1211,8 +1211,11 @@ impl LlmTaskDispatcher {
     }
 
     /// 注入扩展钩子端口（`tool.call` / `tool.result`）。
-    pub fn with_tool_hooks(mut self, hooks: Arc<dyn crate::tool_hooks::ToolHooks>) -> Self {
-        self.tool_hooks = Some(hooks);
+    pub fn with_extension_hooks(
+        mut self,
+        hooks: Arc<dyn crate::extension_hooks::ExtensionHooks>,
+    ) -> Self {
+        self.extension_hooks = Some(hooks);
         self
     }
 
@@ -3505,7 +3508,7 @@ impl LlmTaskDispatcher {
             tool_registry: self.tool_registry.as_ref(),
             skill_runtime: self.skill_runtime.as_deref(),
             skill_dispatch_runtime: self.skill_dispatch_runtime.as_deref(),
-            tool_hooks: self.tool_hooks.as_deref(),
+            extension_hooks: self.extension_hooks.as_deref(),
             skill_name: skill_name.clone(),
             task_store: self.pipeline.execution_runtime.task_store(),
             execution_registry: &self.execution_registry,
