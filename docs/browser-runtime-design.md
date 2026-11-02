@@ -15,7 +15,7 @@ Web 和手机 Web 不伪造可接管的浏览器。它们可以展示 URL、只�
 
 右栏不是浏览器容器，而是通用多功能面板。`RightPane.svelte` 唯一负责：
 
-- 顶级 Tab 集合、活动 Tab、关闭和新增菜单；
+- 顶级 Tab 集合、活动 Tab、关闭，以及新增时的新标签页（工具与最近项）；
 - 右栏工具栏、折叠状态、宽度拖动和通用浮层；
 - 内容区域的裁剪、层级、主题和焦点边界。
 
@@ -57,7 +57,7 @@ Electron BrowserWindow
 | --- | --- |
 | 消息 / 代码块里的 HTTP(S) 链接 | `WebWorkbenchShell` 监听 `OPEN_URL_IN_BROWSER_EVENT` |
 | 工作区 HTML 文件作为可运行网页 | `WebWorkbenchShell`（文件树与 `magi:previewFile` 分流） |
-| 右栏「新增 → 浏览器」 | `RightPane` 的 `chooseAddPane` |
+| 右栏「新标签页 → 浏览器」 | `RightPane` 的 `chooseLauncherTool` |
 
 消费者必须在**始终挂载**的 `WebWorkbenchShell` 上：右栏是懒加载且按可见性条件挂载的组件，把链接监听的归属放在右栏会让「右栏折叠 / 从未打开过右栏」时的点击被静默丢弃。右栏组件只负责展示与移除，不再承担「点击链接」的消费。
 

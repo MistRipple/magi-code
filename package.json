@@ -24,6 +24,7 @@
     "test:electron-cursor-presentation": "node scripts/verify-electron-cursor-presentation.mjs",
     "test:electron-cursor-desktop-live": "node scripts/verify-electron-cursor-desktop-live.mjs",
     "test:electron-conversation-dom": "node scripts/verify-electron-conversation-dom.mjs",
+    "test:electron-session-stats-live": "node scripts/verify-electron-session-stats-live.mjs",
     "test:daemon-input-queue": "npm --prefix web run build && node scripts/verify-daemon-input-queue.mjs",
     "test:daemon-continuation": "npm --prefix web run build && node scripts/verify-daemon-continuation.mjs",
     "test:data-loading-live": "npm --prefix web run build && node scripts/verify-data-loading.mjs",

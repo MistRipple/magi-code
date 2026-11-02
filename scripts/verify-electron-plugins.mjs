@@ -408,13 +408,13 @@ try {
   void session;
 
   // 9. 右栏视图 + 停用清理
+  // 展开空右栏会默认打开一个新标签页。
   await waitFor(async () => {
     await page.evaluate(`document.querySelector('[aria-label="展开右侧面板"]')?.click()`);
-    return exists(page, '[aria-label="新增面板"]');
-  }, "右栏新增面板按钮", 30_000, 500);
-  await click(page, '[aria-label="新增面板"]');
-  await waitFor(() => exists(page, '.right-pane-add-menu button[data-kind="plugin"]'), "右栏新增菜单出现插件视图");
-  await click(page, '.right-pane-add-menu button[data-kind="plugin"]');
+    return exists(page, '[data-testid="right-pane-launcher"]');
+  }, "右栏展开后默认打开新标签页", 30_000, 500);
+  await waitFor(() => exists(page, '[data-testid=\"right-pane-launcher\"] .launcher-tool[data-kind="plugin"]'), "右栏新标签页出现插件视图");
+  await click(page, '[data-testid=\"right-pane-launcher\"] .launcher-tool[data-kind="plugin"]');
   await waitFor(() => exists(page, '.right-pane iframe[data-testid="plugin-view"]'), "右栏插件视图 iframe");
   const rightFrameUrl = await page.evaluate(`document.querySelector('.right-pane iframe[data-testid="plugin-view"]').src`);
   await waitFor(async () => (await inFrame(`document.getElementById('title')?.textContent`, '.right-pane iframe[data-testid="plugin-view"]')) === "验收看板", "右栏视图与主页面共用同一设置与资源");
@@ -427,22 +427,21 @@ try {
     await waitFor(async () => !(await exists(page, '.right-pane iframe[data-testid="plugin-view"]')), "右栏插件视图关闭");
     await waitFor(async () => {
       await page.evaluate(`document.querySelector('[aria-label="展开右侧面板"]')?.click()`);
-      return exists(page, '[aria-label="新增面板"]');
+      return exists(page, '[data-testid="right-pane-launcher"]');
     }, "关闭后重新展开右栏");
-    await click(page, '[aria-label="新增面板"]');
-    await click(page, '.right-pane-add-menu button[data-kind="plugin"]');
+    await click(page, '[data-testid=\"right-pane-launcher\"] .launcher-tool[data-kind="plugin"]');
     await waitFor(async () => (await inFrame(`document.getElementById('title')?.textContent`, '.right-pane iframe[data-testid="plugin-view"]')) === "验收看板", "重新挂载的右栏插件视图读取设置");
   }
   check("右栏连续关闭重开六次仍读取同一设置且主页面保持独立", (await inFrame(`document.getElementById('title').textContent`)) === "验收看板");
 
-  // 添加菜单由插件投影驱动：插件视图项带稳定身份，末尾固定「管理插件」直达设置页插件分类。
+  // 新标签页的工具由插件投影驱动：插件视图项带稳定身份，末尾固定「管理插件」直达设置页插件分类。
   await click(page, '[aria-label="新增面板"]');
-  await waitFor(() => exists(page, '.right-pane-add-menu button[data-kind="managePlugins"]'), "添加菜单出现管理插件入口");
-  const pluginItem = await page.evaluate(`(() => { const el = document.querySelector('.right-pane-add-menu button[data-kind="plugin"]'); return el ? { pluginId: el.dataset.pluginId, contributionId: el.dataset.contributionId, disabled: el.disabled } : null; })()`);
-  check("添加菜单的插件视图项携带插件与贡献身份且可用", pluginItem?.pluginId === PLUGIN_ID && Boolean(pluginItem.contributionId) && pluginItem.disabled === false, JSON.stringify(pluginItem));
-  await click(page, '.right-pane-add-menu button[data-kind="managePlugins"]');
+  await waitFor(() => exists(page, '[data-testid=\"right-pane-launcher\"] .launcher-tool[data-kind="managePlugins"]'), "新标签页出现管理插件入口");
+  const pluginItem = await page.evaluate(`(() => { const el = document.querySelector('[data-testid=\"right-pane-launcher\"] .launcher-tool[data-kind="plugin"]'); return el ? { pluginId: el.dataset.pluginId, contributionId: el.dataset.contributionId, disabled: el.getAttribute('aria-disabled') === 'true' } : null; })()`);
+  check("新标签页的插件视图项携带插件与贡献身份且可用", pluginItem?.pluginId === PLUGIN_ID && Boolean(pluginItem.contributionId) && pluginItem.disabled === false, JSON.stringify(pluginItem));
+  await click(page, '[data-testid=\"right-pane-launcher\"] .launcher-tool[data-kind="managePlugins"]');
   await waitFor(() => exists(page, '[data-testid="plugin-list"]'), "管理插件直达设置页插件分类", 30_000);
-  check("添加菜单「管理插件」直达设置页插件分类", true);
+  check("新标签页「管理插件」直达设置页插件分类", true);
   await click(page, '[data-testid="plugin-guide-toggle"]');
   await waitFor(() => exists(page, '[data-testid="plugin-guide"]'), "插件中心展开开发规范", 30_000);
   check("插件开发规范在详情页展示", ((await text(page, '[data-testid="plugin-guide"]')) ?? "").includes("Magi 插件作者指南"));

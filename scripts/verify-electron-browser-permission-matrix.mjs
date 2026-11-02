@@ -369,10 +369,9 @@ async function openBrowserPane(page) {
     "App Renderer 主界面挂载",
   );
   await page.evaluate("document.querySelector('.header-right-pane-btn')?.click(); true");
-  await waitFor(async () => page.evaluate("Boolean(document.querySelector('.right-pane-add-tab'))"), "右侧面板挂载");
-  await page.evaluate("document.querySelector('.right-pane-add-tab')?.click(); true");
-  await waitFor(async () => page.evaluate("[...document.querySelectorAll('.right-pane-add-menu-item')].some((item) => item.innerText.trim() === '浏览器')"), "浏览器新增菜单");
-  await page.evaluate("[...document.querySelectorAll('.right-pane-add-menu-item')].find((item) => item.innerText.trim() === '浏览器')?.click(); true");
+  // 展开空右栏会默认打开一个新标签页，直接选择工具。
+  await waitFor(async () => page.evaluate("Boolean(document.querySelector('[data-testid=\"right-pane-launcher\"] .launcher-tool[data-kind=\"browser\"]'))"), "新标签页的浏览器工具");
+  await page.evaluate("document.querySelector('[data-testid=\"right-pane-launcher\"] .launcher-tool[data-kind=\"browser\"]')?.click(); true");
   return waitFor(async () => {
     const sessionId = await page.evaluate("new URL(location.href).searchParams.get('sessionId') || ''");
     if (!sessionId) return null;

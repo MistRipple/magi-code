@@ -98,6 +98,10 @@ Windows CI 的多命令 PowerShell 步骤启用 `$PSNativeCommandUseErrorActionP
 
 Prompt 缓存使用 `npm run test:prompt-cache`（或直接运行 `node scripts/verify-prompt-cache.mjs`）：从已有 `target/debug/magi-daemon-app` 启动独立 daemon、状态目录和只读临时工作区，覆盖连续三轮对话、两次文件读取、explorer worker 和两次提示词强化，同时保留标题/知识提取等自然辅助请求。默认为本地 Provider，usage 明确标记为合成数据；检查工具目录稳定、原始用量账本与总量/角色/模型缓存统计一致。本地夹具每次返回带 encrypted_content 的合成 reasoning item，并验证主线和 worker 后续真实请求确实回放该上下文；固定配置下只允许 initial/continued，出现意外 epoch 轮换直接失败。真实请求须显式加 `--live`，只在内存读取现有 Responses 主连接和辅助连接的凭据，向它们转发合成任务，不更改用户设置或重启已有 daemon。
 
+输入区统计的跨层验收先执行 `cargo build -p magi-daemon-app`，再运行 `node scripts/verify-prompt-cache.mjs --session-stats --output /绝对路径/产物目录`。该模式只接受完整的本地夹具运行：分批发送正文并明确报告最终推理 token 拆分，要求主对话和 worker 都有真实 HTTP 接收计时；逐角色、绑定及会话核对 token、缓存读写观测覆盖、TTFT 总和、正文 token 与生成区间。关闭后读取持久账本，再从同一状态目录重启，确认统计不变、会话包含所属 worker、不重复追加 attempt、不调用模型。报告中的 `sessionStatsVerification` 保留各会话结果；合成的命中率和 TPS 只用于验证核算，不能作为真实供应商的缓存或速度结论。重试、失败和恢复另用 `cargo test -p magi-conversation-runtime main_and_worker_retry_measurements` 覆盖两个角色；界面筛选及跨模型加权用 `npm --prefix web run test:session-stats` 验证。
+
+真实桌面端连续验收使用 `npm run test:electron-session-stats-live`：从当前源码构建的 Electron Desktop 启动独立 daemon、真实 App Renderer 和本地受控 HTTP Provider，通过真实输入区连续完成主对话与 worker，再读取会话统计接口和统计面板，切换 worker 筛选，关闭并重新启动 Desktop 后核对同一 session 的 totals 不变。该验收保存 `electron_session_stats_live` 证据，验证真实桌面链路的归属和恢复；Provider 仍为本地受控夹具，不作为供应商缓存效果结论。
+
 用 `--baseline /绝对路径/magi-daemon-app` 增加旧版对照，`--output /绝对路径/产物目录` 保存请求/工具哈希、首字节/首文本/总耗时、Provider usage、账本核对和失败阶段；不保存完整模型请求或上游凭据。`--max-calls 56` 限制**两版合计**的上游请求数（默认 48，最多 96），包含自然辅助调用和传输重试，超限返回不重试的 400 并保留失败证据。HTTP 传输次数与账本逻辑调用次数分开，重试不能虚增账本命中率；未报告缓存 usage 或价格保持未知。实际记录和对照限制见 [Prompt 缓存分析与优化记录](prompt-cache-optimization.md)。
 
 跨模型入口为 `npm run test:prompt-cache-models -- --live`（等价于直接运行 `scripts/verify-prompt-cache-models.mjs --live`）。目录内所有文本模型逐项探测，成功项以同一模型分别承接主线与辅助调用，执行三轮 smoke；生图等非文本项跳过，失败/暂不可用项留证。并发最多两个独立验收进程，每模型一条探测、smoke 最多 12 次，完整对照最多 56 次；报告记录整轮请求上限。`--tool-turns` 追加“同一会话内：纯对话、读取两个约 25 KB 文件的工具回合、两轮纯对话”，用来观察回合边界上上一回合的工具历史能否被缓存复用（此时 smoke 最多 28 次，若追加完整场景则完整上限自动提升到 56 次，以覆盖 worker/工具循环）。`--model <id>` 可重复以限制模型集合；`--full-model <id>` 可重复以追加完整场景，配合 `--baseline /绝对路径/旧二进制` 比较旧新版。主脚本也可用 `--smoke` 和 `--aux-model <id>` 单独运行这些路径。`completed` 只表示矩阵已遍历，`outcome` 区分通过和验证失败；任何已可用模型的 smoke/完整场景失败使脚本非零退出，不能用目录探测成功替代三轮/工具完成。
@@ -160,7 +164,7 @@ Git 漂移/冲突场景现在允许先请求模型，实际写入/Shell/Git/代�
 - `cargo test -p magi-tool-runtime --lib agent_delegation`：四种目的、并行父任务工作、未知字段、空白/null/超长输入及规范化回执。
 - `cargo test -p magi-conversation-runtime --lib agent_spawn`：真实工具 Schema、直接入口复用预检与拒绝后无 Task/Thread/计划残留；决策不能恢复未授予的工具，调用方不能提交模型、Provider、引擎或推理强度覆盖。
 - `cargo test -p magi-conversation-runtime --lib role_engine_model_config`：按选定角色解析绑定；共用引擎与角色/引擎同名时不混淆身份，未绑定可继承，显式绑定失效返回错误。
-- `npm --prefix web run test:active-agent-center`：代理中心按服务端角色身份显示标签，不用引擎 ID 反查角色；覆盖共用模型、角色/引擎同名及 registry 展示路径。
+- `npm --prefix web run test:active-agent-center`：代理运行视图（顶栏状态条、右栏代理列表、对话里的恢复横幅）按服务端角色身份显示标签，不用引擎 ID 反查角色；覆盖共用模型、角色/引擎同名及 registry 展示路径、分组与状态概括、运行视图操作由后端 `availableActions` 驱动（只有归档，横幅不放继续）、归档后才清本地标记；输入框继续按钮只由 daemon 随读模型下发的 `continuation` 决定，输入框和 Web 状态里不得残留自行推断继续资格的代码（`npm --prefix web run test:composer-policy`、`test:runtime-state` 分别核对策略层已无 `composerCanContinue`、`continuation` 从读模型透传且未知取值视为不可继续）。后端侧 `cargo test -p magi-api agent_run` 覆盖 `continue`/`restart` 已不是运行视图的协议动作；`cargo test -p magi-api continuation` 与 `turn_harness::tests::agent_run_root_actions_reject_child_targets_without_restarting_or_archiving_mainline` 核对可恢复链优先于被停止的主线轮次、用户停止后读模型与继续动作用同一判定；`cargo test -p magi-session-store mainline_resume_candidate` 覆盖失败、用户主动停止可继续，被新消息取代的取消与已完成后的旧失败不可继续。
 - `cargo test -p magi-conversation-runtime --lib agent_cancel`：取消只影响直接子树，终态与资源结算分开；结算失败保留原回执，再次核对不覆盖产物。
 - `cargo test -p magi-conversation-runtime --lib dispatch_quiesce`：按子树等待全部执行退出，不等待调用者或兄弟任务。
 - `cargo test -p magi-conversation-runtime --lib task_runner::tests`：执行范围隔离、旧扫描后的领取/失败拒绝、孤儿清理与准入名额；已转交子树不受原 Runner 的终态影响。

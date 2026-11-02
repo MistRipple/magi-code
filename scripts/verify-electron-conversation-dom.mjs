@@ -385,10 +385,17 @@ async function collectSourceIdentity() {
   };
 }
 
-function openAiStream(content) {
+function openAiStream(content, { promptTokens = 128, cachedTokens = 0 } = {}) {
+  const completionTokens = Math.max(1, Math.ceil(content.length / 4));
   return [
     `data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: null }] })}\n\n`,
     `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [], usage: {
+      prompt_tokens: promptTokens,
+      prompt_tokens_details: { cached_tokens: cachedTokens },
+      completion_tokens: completionTokens,
+      completion_tokens_details: { reasoning_tokens: 0 },
+    } })}\n\n`,
     "data: [DONE]\n\n",
   ].join("");
 }
@@ -1234,11 +1241,12 @@ async function rendererState(page) {
       } : null;
     })(),
     agentCenter: (() => {
-      const trigger = document.querySelector('.agent-center-trigger');
-      const panel = document.querySelector('.agent-center-panel');
+      // 代理状态条常驻顶栏；有代理时 data-agent-count > 0，点击后在右栏打开代理列表。
+      const trigger = document.querySelector('[data-testid="agent-status-chip"]');
+      const panel = document.querySelector('[data-testid="right-pane-agent-list"]');
       return {
-        visible: Boolean(trigger),
-        expanded: trigger?.getAttribute('aria-expanded') || null,
+        visible: Number(trigger?.getAttribute('data-agent-count') || 0) > 0,
+        expanded: trigger?.getAttribute('aria-pressed') || null,
         text: panel?.innerText || '',
         rows: [...document.querySelectorAll('.agent-row')].map((item) => item.innerText || ''),
         agentCards: [...document.querySelectorAll('[data-tool-name="agent_spawn"]')].map((item) => ({
@@ -1531,6 +1539,27 @@ async function checkDeferredGitPreparation(page, { label, root, workspaceId, sce
     inputHash: hashText(prompt), providerDispatch: "dispatched",
     providerRequestCount: provider.requests.length - requestsBefore, settlementRequired: true,
   }));
+}
+
+async function verifyDesktopSessionStats(page, sessionId) {
+  const payload = await page.evaluate(`fetch('/api/settings/stats?sessionId=' + encodeURIComponent(${JSON.stringify(sessionId)})).then(async (response) => ({ status: response.status, body: await response.json() }))`);
+  check("桌面端统计接口按当前会话返回", payload.status === 200 && payload.body?.items?.length > 0, JSON.stringify(payload.body));
+  check("桌面端统计包含主对话调用", payload.body.items.some((item) => item.role === "orchestrator" && item.llmCallCount > 0));
+  check("桌面端统计包含 worker 调用", payload.body.items.some((item) => item.role === "worker" && item.llmCallCount > 0));
+  check("桌面端统计包含真实 token coverage", payload.body.totals.tokenObservedCallCount === payload.body.totals.llmCallCount);
+  check("桌面端统计包含 TTFT 样本", payload.body.totals.performance?.ttftSampleCount > 0);
+  await waitFor(() => page.evaluate(`Boolean(document.querySelector('[data-testid="session-stats-trigger"]'))`), "桌面端统计入口");
+  await page.evaluate(`document.querySelector('[data-testid="session-stats-trigger"]')?.click()`);
+  const panelText = await waitFor(() => page.evaluate(`document.querySelector('.session-stats-popover')?.innerText || ''`), "桌面端统计面板");
+  check("桌面端统计面板展示 TTFT/TPS", /TTFT|首字/u.test(panelText) && /TPS|输出速度/u.test(panelText), panelText);
+  check("桌面端统计面板展示缓存命中", /缓存|cache/iu.test(panelText), panelText);
+  const workerSelect = await page.evaluate(`document.querySelector('.session-stats-popover select')?.value || ''`);
+  check("桌面端统计面板提供角色筛选", workerSelect === "all");
+  await page.evaluate(`(() => { const select = document.querySelector('.session-stats-popover select'); if (!select) return false; select.value = 'worker'; select.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  await waitFor(() => page.evaluate(`/worker|子代理/u.test(document.querySelector('.session-stats-popover')?.innerText || '')`), "桌面端 worker 统计筛选");
+  check("桌面端统计面板可切换 worker", true);
+  await page.evaluate(`document.querySelector('[data-testid="session-stats-trigger"]')?.click()`);
+  return { sessionId, totals: payload.body.totals, items: payload.body.items };
 }
 
 async function runGitDriftConflictChecks(page) {
@@ -3528,9 +3557,16 @@ try {
     return text.includes(responseText) ? text : null;
   }, "子代理详情页展示真实 Task", 45_000);
   check("子代理详情页展示真实执行结果", agentDetail.includes(responseText));
+  const agentStatsSessionId = new URL((await rendererState(page)).url).searchParams.get("sessionId")
+    || agentResult.activePersonalSessionId;
+  check("主对话与 worker 使用同一桌面会话", Boolean(agentStatsSessionId));
+  const desktopStats = await verifyDesktopSessionStats(page, agentStatsSessionId);
+  check("桌面端 worker 统计与接口调用数一致", desktopStats.items
+    .filter((item) => item.role === "worker")
+    .reduce((sum, item) => sum + item.llmCallCount, 0) > 0);
   const agentCenterBeforeExpand = await rendererState(page);
   if (agentCenterBeforeExpand.agentCenter.visible) {
-    await page.evaluate(`document.querySelector('.agent-center-trigger')?.click()`);
+    await page.evaluate(`document.querySelector('[data-testid="agent-status-chip"]')?.click()`);
     const expandedAgentCenter = await waitFor(async () => {
       const state = await rendererState(page);
       return state.agentCenter.expanded === "true" && state.agentCenter.rows.length > 0 ? state : null;
@@ -3576,7 +3612,7 @@ try {
   check("子代理失败卡片未伪造 child task id", !failedAgent.agentCenter.agentCards.at(-1)?.taskId);
   check("未创建的代理卡片不可打开", failedAgent.agentCenter.agentCards.at(-1)?.disabled);
   if (failedAgent.agentCenter.visible) {
-    await page.evaluate(`document.querySelector('.agent-center-trigger')?.click()`);
+    await page.evaluate(`document.querySelector('[data-testid="agent-status-chip"]')?.click()`);
     const failedAgentCenter = await waitFor(async () => {
       const state = await rendererState(page);
       return state.agentCenter.expanded === "true"
@@ -3654,14 +3690,14 @@ try {
     && multiCards.some(card => card.status.includes('status-error')));
   if (multiAgentCenter.agentCenter.visible) {
     if (multiAgentCenter.agentCenter.expanded !== "true") {
-      await page.evaluate(`document.querySelector('.agent-center-trigger')?.click()`);
+      await page.evaluate(`document.querySelector('[data-testid="agent-status-chip"]')?.click()`);
       await waitFor(async () => {
         const state = await rendererState(page);
         return state.agentCenter.expanded === "true" ? state : null;
       }, "子代理多状态运行中心展开");
     }
     await page.evaluate(`(() => {
-      const toggle = document.querySelector('.agent-center-panel .group-heading--toggle');
+      const toggle = document.querySelector('[data-testid="right-pane-agent-list"] .group-heading--toggle');
       if (toggle?.getAttribute('aria-expanded') !== 'true') toggle?.click();
     })()`);
     const expandedMultiAgentCenter = await waitFor(async () => {
