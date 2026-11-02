@@ -15,6 +15,7 @@ import {
   runBridgePreflight,
 } from "./bridge-preflight.mjs";
 import { assertPluginWorker, pluginWorkerFileName, runPluginWorkerPreflight } from "./plugin-worker-preflight.mjs";
+import { nodeRuntimeFileName, readNodeRuntimePin, runNodeRuntimePreflight, stageNodeRuntime } from "./node-runtime.mjs";
 
 const execFileAsync = promisify(execFile);
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
@@ -24,6 +25,7 @@ export const repositoryRoot = resolve(desktopRoot, "../..");
 export const desktopDist = join(desktopRoot, "dist");
 export const workerDist = join(repositoryRoot, "browser-automation-worker", "dist");
 export const lighthouseRuntimeDist = join(desktopDist, "lighthouse-runtime");
+export const nodeRuntimeDist = join(desktopDist, "node-runtime");
 export const webDist = join(repositoryRoot, "web", "dist");
 
 const runtimePackages = ["electron", "electron-updater", "ws", "devtools-protocol", "lighthouse"];
@@ -136,6 +138,7 @@ export async function prepareReleaseMetadata() {
   await cp(join(repositoryRoot, "LICENSE"), join(resources, "licenses", "Magi-LICENSE"));
   await stageRuntimeLicenses(join(resources, "licenses"));
   await stagePluginRuntimeLicenses(join(resources, "licenses"));
+  await stageNodeRuntimeLicense(join(resources, "licenses"));
 
   const [productVersion, electronVersions, git, protocolVersion] = await Promise.all([
     readProductVersion(),
@@ -156,6 +159,7 @@ export async function prepareReleaseMetadata() {
       bridgeResourcePath(binaryName),
     );
   }
+  await appendFileHash(files, join(nodeRuntimeDist, nodeRuntimeFileName), `daemon/node/${nodeRuntimeFileName}`);
   await appendFileHash(files, join(workerDist, "index.cjs"), "browser-automation-worker/index.cjs");
   await appendTreeHashes(files, lighthouseRuntimeDist, "browser-automation-worker");
   await appendTreeHashes(files, webDist, "web/dist");
@@ -170,6 +174,10 @@ export async function prepareReleaseMetadata() {
       "browser-automation-worker/index.cjs",
     ),
     daemon: await componentHash(daemonBinary("release"), daemonResourcePath()),
+    nodeRuntime: {
+      ...(await componentHash(join(nodeRuntimeDist, nodeRuntimeFileName), `daemon/node/${nodeRuntimeFileName}`)),
+      version: (await readNodeRuntimePin()).version,
+    },
     pluginWorker: await componentHash(join(bridgeBinariesRoot("release"), pluginWorkerFileName), `daemon/${pluginWorkerFileName}`),
     bridgeBinaries: Object.fromEntries(
       await Promise.all(bridgeBinaryNames.map(async (binaryName) => [
@@ -241,9 +249,27 @@ export async function assertReleaseInputs() {
     assertFile(join(desktopDist, "resources", "browser-capability-manifest.json"), "能力清单"),
     assertBridgeBinaries(bridgeBinariesRoot("release"), "Rust release bridge"),
     assertPluginWorker(bridgeBinariesRoot("release")),
+    assertFile(join(nodeRuntimeDist, nodeRuntimeFileName), "随包 Node"),
   ]);
+  await runNodeRuntimePreflight(nodeRuntimeDist);
   await runBridgePreflight(bridgeBinariesRoot("release"), "Rust release bridge");
   await runPluginWorkerPreflight(bridgeBinariesRoot("release"), await readProductVersion());
+}
+
+/** 准备扩展宿主使用的固定版本 Node（归档摘要固定在 node-runtime.json）。 */
+export async function stageExtensionNode() {
+  return stageNodeRuntime(nodeRuntimeDist);
+}
+
+/** Node 许可证与来源声明随发行物一起交付。 */
+export async function stageNodeRuntimeLicense(destination) {
+  const pin = await readNodeRuntimePin();
+  await cp(join(nodeRuntimeDist, "LICENSE"), join(destination, "Node-LICENSE"));
+  await writeFile(
+    join(destination, "NODE-RUNTIME-NOTICE.json"),
+    `${JSON.stringify({ name: "node", version: pin.version, license: "MIT", source: `${pin.source}/${pin.archive.file}`, sha256: pin.archive.sha256 }, null, 2)}\n`,
+    "utf8",
+  );
 }
 
 export async function stagePluginRuntimeLicenses(destination) {

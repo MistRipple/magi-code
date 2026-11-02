@@ -4,6 +4,7 @@ import { join, relative, sep } from "node:path";
 import { extractFile, listPackage } from "@electron/asar";
 import { runBridgePreflight } from "./bridge-preflight.mjs";
 import { pluginWorkerFileName, runPluginWorkerPreflight } from "./plugin-worker-preflight.mjs";
+import { nodeRuntimeFileName, runNodeRuntimePreflight } from "./node-runtime.mjs";
 
 export async function afterPack(context) {
   const resources = context.electronPlatformName === "darwin"
@@ -46,6 +47,12 @@ export async function afterPack(context) {
     throw new Error("发行资源清单缺少插件 Worker");
   }
   await runPluginWorkerPreflight(join(resources, "daemon"), manifest.productVersion);
+  if (manifest.components.nodeRuntime?.path !== `daemon/node/${nodeRuntimeFileName}`
+      || !manifest.files.some((file) => file.path === `daemon/node/${nodeRuntimeFileName}`)) {
+    throw new Error("发行资源清单缺少随包 Node");
+  }
+  // 校验最终制品里的 Node 能在清空环境下真实执行，且与固定版本一致。
+  await runNodeRuntimePreflight(join(resources, "daemon", "node"));
 
   const packagedPaths = [
     ...listPackage(asarPath).map((path) => `app.asar/${path}`),

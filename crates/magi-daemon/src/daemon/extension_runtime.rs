@@ -23,8 +23,27 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-/// 产品随包 Node 的覆盖入口。随包交付落地前，这是唯一的 Node 来源；不回退到用户 PATH。
+/// 开发与测试用的 Node 覆盖入口（`npm run` 的 `node scripts/node-runtime.mjs stage` 可准备固定版本 Node）。
+/// 发行版不设置它：daemon 使用与自身可执行文件同级的 `node/` 目录里的随包 Node。
 pub(super) const EXTENSION_NODE_ENV: &str = "MAGI_EXTENSION_NODE";
+
+/// 随包 Node 相对 daemon 可执行文件的位置：`<daemon 目录>/node/node[.exe]`。
+/// Desktop 与无头入口使用同一合同；永远不使用用户 PATH 里的 Node。
+fn bundled_node(executable: &Path) -> Option<PathBuf> {
+    let name = if cfg!(windows) { "node.exe" } else { "node" };
+    let path = executable.parent()?.join("node").join(name);
+    path.is_file().then_some(path)
+}
+
+fn resolve_node(
+    configured: Option<std::ffi::OsString>,
+    executable: Option<PathBuf>,
+) -> Option<PathBuf> {
+    configured
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| executable.as_deref().and_then(bundled_node))
+}
 
 struct Running {
     digest: String,
@@ -49,9 +68,10 @@ impl ExtensionRuntime {
         group: ManagedProcessGroup,
         state_root: &Path,
     ) -> Self {
-        let node = std::env::var_os(EXTENSION_NODE_ENV)
-            .map(PathBuf::from)
-            .filter(|path| path.is_file());
+        let node = resolve_node(
+            std::env::var_os(EXTENSION_NODE_ENV),
+            std::env::current_exe().ok(),
+        );
         Self {
             manager,
             bus,
@@ -184,7 +204,7 @@ impl ExtensionRuntime {
         }
         let Some(node) = self.node.clone() else {
             return failed(format!(
-                "未找到随包 Node（设置 {EXTENSION_NODE_ENV} 指向产品携带的 Node 可执行文件）"
+                "未找到随包 Node（应位于 daemon 同级的 node/ 目录；开发时可设置 {EXTENSION_NODE_ENV}）"
             ));
         };
         let (host_script, entry) = match self.materialize(id, package) {
@@ -259,6 +279,36 @@ mod tests {
         supervisor::SupervisorState,
     };
     use magi_plugin_system::PluginSource;
+
+    #[test]
+    fn node_is_resolved_from_the_override_or_next_to_the_daemon_and_never_from_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = dir.path().join("magi-daemon-app");
+        std::fs::write(&daemon, b"").unwrap();
+        // 没有随包 Node，也没有覆盖：即使 PATH 里有 node 也不使用。
+        assert_eq!(resolve_node(None, Some(daemon.clone())), None);
+
+        let name = if cfg!(windows) { "node.exe" } else { "node" };
+        std::fs::create_dir_all(dir.path().join("node")).unwrap();
+        let bundled = dir.path().join("node").join(name);
+        std::fs::write(&bundled, b"").unwrap();
+        assert_eq!(
+            resolve_node(None, Some(daemon.clone())),
+            Some(bundled.clone())
+        );
+
+        // 覆盖入口优先（开发/测试）；指向不存在的文件则不生效，回到随包 Node。
+        let custom = dir.path().join("custom-node");
+        std::fs::write(&custom, b"").unwrap();
+        assert_eq!(
+            resolve_node(Some(custom.clone().into()), Some(daemon.clone())),
+            Some(custom)
+        );
+        assert_eq!(
+            resolve_node(Some(dir.path().join("missing").into()), Some(daemon)),
+            Some(bundled)
+        );
+    }
     use serde_json::json;
     use std::io::Write;
 
@@ -270,6 +320,14 @@ export default async function activate(api) {
   });
 }
 "#;
+
+    /// 测试用 Node：优先 `MAGI_EXTENSION_NODE`（可指向随包的固定版本），否则 PATH 中的 node。
+    fn test_node() -> PathBuf {
+        std::env::var_os(EXTENSION_NODE_ENV)
+            .map(PathBuf::from)
+            .or_else(|| magi_process::resolve_executable("node"))
+            .expect("需要 Node")
+    }
 
     fn package() -> PluginPackage {
         let manifest: PluginManifest = serde_json::from_value(json!({

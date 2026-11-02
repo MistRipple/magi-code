@@ -25,7 +25,7 @@
 - `magi-daemon` 是唯一业务内核。桌面端通过受控 sidecar 启动它，Magi UI 与内置浏览器共用同一 Chromium Desktop Host；浏览器自动化通过私有 Desktop Control 协议接管当前 Browser WebContents。
 - 主窗口关闭后默认隐藏到系统托盘，daemon 继续运行；只有托盘中的“退出 Magi”或操作系统显式退出动作会触发优雅关闭。
 - `magi-daemon-app` 承载开发、无头部署及桌面包中的 daemon sidecar 入口；业务实现复用 `magi-daemon`，不复制 Electron 宿主逻辑。
-- 扩展宿主（目标，尚未实现）：每个启用的可执行插件由 daemon 直接托管一个独立 Node 进程；Node 随产品携带固定版本、不依赖用户 PATH，Desktop 与无头入口使用同一合同，不经 Electron utilityProcess。插件以用户权限运行，业务提案经 daemon 内唯一的 ExtensionBus 裁决，设计见[插件系统设计](plugin-system-requirements-design.md)。
+- 扩展宿主（目标，尚未实现）：每个启用的可执行插件由 daemon 直接托管一个独立 Node 进程；Node 随产品携带固定版本、不依赖用户 PATH，Desktop 与无头入口使用同一合同，不经 Electron utilityProcess。插件以用户权限运行，业务提案经 daemon 内唯一的 ExtensionBus 裁决，设计见[插件系统设计](plugin-system-requirements-design.md)。已实现的交付：发行包把固定版本 Node（版本与各平台归档摘要固定在 `apps/desktop/node-runtime.json`）放在 `daemon/node/`，daemon 只在自身同级 `node/` 目录查找，不读用户 PATH；开发时可用 `node apps/desktop/scripts/node-runtime.mjs stage <目录>` 准备同一份 Node，并设置 `MAGI_EXTENSION_NODE` 指向它。
 - 正式 Desktop 通过专属 stdin 管道托管 daemon（`MAGI_DAEMON_OWNER_PIPE=1`）：退出先关闭管道，daemon 收到 EOF 后沿原关闭入口结算 Turn、工具和持久化，宿主等待退出，超时才强制终止。开发/无头入口不设置此标记，stdin EOF 不影响其生命周期；系统信号仍走原关闭入口。
 
 开发模式仍使用 daemon 托管入口：

@@ -14,8 +14,12 @@ use std::{
     time::Duration,
 };
 
+/// 优先使用 `MAGI_EXTENSION_NODE`（可指向随包的固定版本 Node），否则用 PATH 里的 node。
 fn node() -> PathBuf {
-    magi_process::resolve_executable("node").expect("集成测试需要 Node（产品随包 Node 的替身）")
+    std::env::var_os("MAGI_EXTENSION_NODE")
+        .map(PathBuf::from)
+        .or_else(|| magi_process::resolve_executable("node"))
+        .expect("集成测试需要 Node")
 }
 
 fn fixtures() -> PathBuf {
