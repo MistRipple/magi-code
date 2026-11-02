@@ -104,7 +104,7 @@ app.whenReady().then(() => { const win = new BrowserWindow({ show: false, webPre
   browser.stderr.on('data', appendLog);
   const errors = [];
   await waitFor(async () => { try { page = await connectAppPage(cdpPort, port, errors); return true; } catch { return false; } }, 'Chromium renderer');
-  await waitFor(() => page.evaluate(`(() => { const button = document.querySelector('.tool-approval .approval-button--primary'); if (!button || button.disabled) return false; button.click(); return true; })()`), 'restored approval button');
+  await waitFor(() => page.evaluate(`(() => { const button = document.querySelector('.tool-approval .btn--primary'); if (!button || button.disabled) return false; button.click(); return true; })()`), 'restored approval button');
   await waitFor(async () => (await readApprovals()).length === 0, 'approval acknowledged');
   assert.equal(await exists(), true, 'approval alone must not start an interrupted task');
   const continued = await post('session/continue', { sessionId, workspaceId, workspacePath,
@@ -116,7 +116,7 @@ app.whenReady().then(() => { const win = new BrowserWindow({ show: false, webPre
   assert.equal(providerRequests, 3, 'one original request, one resumed call and one final result');
   assert.deepEqual(errors, []);
   const layout = JSON.parse(await readFile(join(fixture, 'state', 'state-layout.json'), 'utf8'));
-  assert.equal(layout.version, 18);
+  assert.equal(layout.version, 19);
   process.stdout.write(JSON.stringify({ passed: true, providerRequests, checks: [
     'original operation blocked before approval', 'stable approval restored after SIGKILL',
     'Chromium approval button works after restart', 'approval acknowledgement has no side effect',

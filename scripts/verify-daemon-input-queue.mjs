@@ -250,7 +250,7 @@ app.whenReady().then(() => { const win = new BrowserWindow({ show: false, webPre
   assert.equal(pending.disabled, false, pending.title);
   const sessionId = await page.evaluate(`document.querySelector('#personal-session-content .session-item.active[data-session-id]')?.getAttribute('data-session-id')`);
   assert.ok(sessionId, "队列验收需要当前真实会话身份");
-  await waitFor(() => page.evaluate(`!!document.querySelector('[data-session-id="${sessionId}"] .session-running-dot.running')`), '运行中的会话显示运行灯');
+  await waitFor(() => page.evaluate(`!!document.querySelector('[data-session-id="${sessionId}"] .personal-session-indicator.running')`), '运行中的会话显示运行灯');
   const readQueue = async () => {
     const response = await fetch(`${origin}/api/session/queue?sessionId=${encodeURIComponent(sessionId)}`);
     assert.equal(response.status, 200);
@@ -387,7 +387,7 @@ app.whenReady().then(() => { const win = new BrowserWindow({ show: false, webPre
   assert.ok(replacementTurns[2].items.some(item => item.kind === 'user_message' && item.content.includes('REPLACE_FIFO')));
   assert.equal((await queue()).length, 0);
 
-  await waitFor(() => page.evaluate(`!!document.querySelector('[data-session-id="${sessionId}"] .session-running-dot:not(.running)')`), '停止并换轮完成后，个人会话运行灯熄灭');
+  await waitFor(() => page.evaluate(`!!document.querySelector('[data-session-id="${sessionId}"] .personal-session-indicator:not(.running)')`), '停止并换轮完成后，个人会话运行灯熄灭');
 
   const readGoal = async () => {
     const response = await fetch(`${origin}/api/goals/current?scope=personal&sessionId=${encodeURIComponent(sessionId)}`);
@@ -486,7 +486,8 @@ app.whenReady().then(() => { const win = new BrowserWindow({ show: false, webPre
     const card = document.querySelector('[data-agent-task-id="${agent.agentRunId}"]');
     const rect = card?.getBoundingClientRect();
     return rect && rect.left >= 0 && rect.right <= innerWidth && card.scrollWidth <= card.clientWidth
-      && card.innerText.includes('运行中') && card.innerText.includes('查看详情');
+      && card.innerText.includes('运行中') && (card.getAttribute('aria-label') || '').includes('查看详情')
+      && !!card.querySelector('.agent-spawn-chevron');
   })()`), '详细模式窄屏保留状态与详情入口且不溢出');
   await captureAgentLayout('agent-original-narrow');
   await page.call('Emulation.clearDeviceMetricsOverride');
