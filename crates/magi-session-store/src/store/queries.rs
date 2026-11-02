@@ -1,11 +1,85 @@
 use super::{SessionStore, cmp_sessions_newest_first, with_session_message_count};
 use crate::models::{
-    ActiveExecutionChain, NotificationContext, NotificationRecord, SessionAcceptanceRecord,
-    SessionDurableState, SessionExecutionSidecarStoreState, SessionProjectionInput, SessionRecord,
-    SessionRuntimeSidecar, SessionRuntimeSidecarExport, SessionSidecarFlushMetadata, TimelineEntry,
+    ActiveExecutionChain, CanonicalTurnItemKind, CanonicalTurnStatus, MainlineResumeCandidate,
+    NotificationContext, NotificationRecord, SessionAcceptanceRecord, SessionDurableState,
+    SessionExecutionSidecarStoreState, SessionProjectionInput, SessionRecord,
+    SessionRuntimeSidecar, SessionRuntimeSidecarExport, SessionSidecarFlushMetadata,
+    SessionStoreState, TimelineEntry,
 };
 use magi_core::{ExecutionOwnership, SessionId, TaskId};
 use std::collections::HashSet;
+
+/// 见 [`SessionStore::mainline_resume_candidate`]。读模型与继续动作共用这一份判定。
+fn mainline_resume_candidate_in(
+    state: &SessionStoreState,
+    session_id: &SessionId,
+) -> Option<MainlineResumeCandidate> {
+    let mut turn = state
+        .canonical_turns
+        .iter()
+        .filter(|turn| {
+            &turn.session_id == session_id
+                && !turn.is_session_command()
+                && !turn.metadata.contains_key("agentExecution")
+        })
+        .max_by(|left, right| {
+            left.turn_seq
+                .cmp(&right.turn_seq)
+                .then_with(|| left.turn_id.cmp(&right.turn_id))
+        })?
+        .clone();
+    turn.normalize();
+    if !matches!(
+        turn.status,
+        CanonicalTurnStatus::Cancelled
+            | CanonicalTurnStatus::Failed
+            | CanonicalTurnStatus::Interrupted
+    ) {
+        return None;
+    }
+    let user_item = turn
+        .items
+        .iter()
+        .find(|item| item.kind == CanonicalTurnItemKind::UserMessage)?;
+    // 被新消息取代的取消不是“停止”，只有用户主动停止才可以继续。
+    if turn.status == CanonicalTurnStatus::Cancelled
+        && user_item
+            .metadata
+            .get("interruptionSource")
+            .and_then(serde_json::Value::as_str)
+            != Some("user")
+    {
+        return None;
+    }
+    let original_user_message = user_item.content.as_deref()?.trim().to_string();
+    if original_user_message.is_empty() {
+        return None;
+    }
+    let source_task_id = user_item
+        .worker
+        .as_ref()
+        .and_then(|worker| worker.task_id.as_ref())
+        .cloned()?;
+    let source_thread_id = state
+        .thread_registry
+        .iter()
+        .filter(|thread| {
+            &thread.session_id == session_id && thread.handled_task_ids.contains(&source_task_id)
+        })
+        .max_by(|left, right| {
+            left.last_used_at
+                .cmp(&right.last_used_at)
+                .then_with(|| left.thread_id.as_str().cmp(right.thread_id.as_str()))
+        })?
+        .thread_id
+        .clone();
+    Some(MainlineResumeCandidate {
+        turn_id: turn.turn_id,
+        original_user_message,
+        source_task_id,
+        source_thread_id,
+    })
+}
 
 impl SessionStore {
     pub fn export_state(&self) -> crate::models::SessionStoreState {
@@ -697,19 +771,35 @@ impl SessionStore {
     }
 
     pub fn execution_sidecar_exports(&self) -> Vec<SessionRuntimeSidecarExport> {
-        self.state
-            .read()
-            .expect("session state read lock poisoned")
-            .execution_sidecar_store
-            .export_views()
+        let state = self.state.read().expect("session state read lock poisoned");
+        let mut exports = state.execution_sidecar_store.export_views();
+        for export in &mut exports {
+            export.resume_candidate = mainline_resume_candidate_in(&state, &export.session_id);
+        }
+        exports
     }
 
     pub fn execution_sidecar_export(
         &self,
         session_id: &SessionId,
     ) -> Option<SessionRuntimeSidecarExport> {
-        self.runtime_sidecar(session_id)
-            .map(|sidecar| sidecar.export_view())
+        let mut export = self
+            .runtime_sidecar(session_id)
+            .map(|sidecar| sidecar.export_view())?;
+        export.resume_candidate = self.mainline_resume_candidate(session_id);
+        Some(export)
+    }
+
+    /// 主线最近一轮被停止后可以重新激活并继续推进的来源；没有则不可继续。
+    ///
+    /// 只有最近一轮主线轮次是失败、中断，或被用户主动停止（被新消息取代的取消不算）时才有；
+    /// 轮次必须带有用户目标和执行它的任务与线程，才能让新的执行继承已有证据。
+    pub fn mainline_resume_candidate(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<MainlineResumeCandidate> {
+        let state = self.state.read().expect("session state read lock poisoned");
+        mainline_resume_candidate_in(&state, session_id)
     }
 
     pub fn active_execution_chain(&self, session_id: &SessionId) -> Option<ActiveExecutionChain> {

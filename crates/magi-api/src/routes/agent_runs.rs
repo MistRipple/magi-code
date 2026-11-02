@@ -728,10 +728,7 @@ fn agent_run_projection_response(
     agents: Vec<AgentProjectionDto>,
 ) -> AgentRunProjectionResponseDto {
     let outcome = agent_run_outcome(&projection);
-    let available_actions = available_agent_run_actions(
-        projection.root_task.status,
-        projection.has_recoverable_chain,
-    );
+    let available_actions = available_agent_run_actions(projection.root_task.status);
     let failure_summary = agent_run_failure_summary(&projection);
     AgentRunProjectionResponseDto {
         projection,
@@ -788,6 +785,26 @@ fn agent_run_failure_summary(projection: &AgentRunProjection) -> Option<AgentRun
     })
 }
 
+fn recoverable_branch_count(
+    state: &ApiState,
+    session_id: &magi_core::SessionId,
+    root_task_id: &TaskId,
+) -> usize {
+    let Some(chain) = state.session_store.active_execution_chain(session_id) else {
+        return 0;
+    };
+    if &chain.root_task_id != root_task_id {
+        return 0;
+    }
+    chain
+        .branches
+        .iter()
+        .filter(|branch| {
+            active_execution_branch_is_continue_recoverable(state.task_store(), &chain, branch)
+        })
+        .count()
+}
+
 fn apply_recoverable_chain_summary(
     state: &ApiState,
     session_id_value: Option<&str>,
@@ -795,23 +812,7 @@ fn apply_recoverable_chain_summary(
     projection: &mut AgentRunProjection,
 ) -> Result<(), ApiError> {
     let session_id = parse_session_id(session_id_value)?;
-    let Some(chain) = state.session_store.active_execution_chain(&session_id) else {
-        projection.has_recoverable_chain = false;
-        projection.recoverable_branch_count = 0;
-        return Ok(());
-    };
-    if &chain.root_task_id != root_task_id {
-        projection.has_recoverable_chain = false;
-        projection.recoverable_branch_count = 0;
-        return Ok(());
-    }
-    let count = chain
-        .branches
-        .iter()
-        .filter(|branch| {
-            active_execution_branch_is_continue_recoverable(state.task_store(), &chain, branch)
-        })
-        .count();
+    let count = recoverable_branch_count(state, &session_id, root_task_id);
     projection.has_recoverable_chain = count > 0;
     projection.recoverable_branch_count = count;
     Ok(())
@@ -985,11 +986,8 @@ mod tests {
 
         assert_eq!(agent_run_outcome(&projection), "failed");
         assert_eq!(
-            available_agent_run_actions(
-                projection.root_task.status,
-                projection.has_recoverable_chain,
-            ),
-            vec![AgentRunActionKind::Restart, AgentRunActionKind::Archive]
+            available_agent_run_actions(projection.root_task.status),
+            vec![AgentRunActionKind::Archive]
         );
         let failure = agent_run_failure_summary(&projection).expect("failure should exist");
         assert!(failure.root_failed);
@@ -999,16 +997,10 @@ mod tests {
         projection.has_recoverable_chain = true;
         projection.recoverable_branch_count = 1;
         assert_eq!(agent_run_outcome(&projection), "recoverable");
+        // 可恢复与否只改变 outcome；继续是会话级动作，不在运行视图的动作里。
         assert_eq!(
-            available_agent_run_actions(
-                projection.root_task.status,
-                projection.has_recoverable_chain,
-            ),
-            vec![
-                AgentRunActionKind::Continue,
-                AgentRunActionKind::Restart,
-                AgentRunActionKind::Archive,
-            ]
+            available_agent_run_actions(projection.root_task.status),
+            vec![AgentRunActionKind::Archive]
         );
         assert!(
             !agent_run_failure_summary(&projection)

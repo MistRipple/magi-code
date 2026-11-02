@@ -659,6 +659,7 @@ mod tests {
             session_projection_with_current("session-1"),
             empty_workspace_projection(),
             vec![SessionRuntimeSidecarExport {
+                resume_candidate: None,
                 session_id: SessionId::new("session-1"),
                 current_status: SessionExecutionSidecarStatus::Resumed,
                 last_update: UtcMillis::now(),
@@ -768,6 +769,7 @@ mod tests {
             empty_workspace_projection(),
             vec![
                 SessionRuntimeSidecarExport {
+                    resume_candidate: None,
                     session_id: session_id.clone(),
                     current_status: SessionExecutionSidecarStatus::Bound,
                     last_update: now,
@@ -778,6 +780,7 @@ mod tests {
                     active_execution_chain: None,
                 },
                 SessionRuntimeSidecarExport {
+                    resume_candidate: None,
                     session_id: other_session_id.clone(),
                     current_status: SessionExecutionSidecarStatus::Bound,
                     last_update: now,

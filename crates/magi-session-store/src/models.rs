@@ -1005,6 +1005,18 @@ pub struct SessionRuntimeSidecar {
     pub updated_at: UtcMillis,
 }
 
+/// 主线最近一轮被停止（失败、中断或用户主动停止）后，可以重新激活并继续推进的来源。
+///
+/// 这是“继续”的唯一事实来源：读模型据此告诉客户端是否可以继续，继续动作据此决定从哪里
+/// 接着做。客户端不能再根据轮次状态自行推断。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MainlineResumeCandidate {
+    pub turn_id: String,
+    pub original_user_message: String,
+    pub source_task_id: TaskId,
+    pub source_thread_id: ThreadId,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionRuntimeSidecarExport {
     pub session_id: SessionId,
@@ -1018,6 +1030,9 @@ pub struct SessionRuntimeSidecarExport {
     pub current_turn: Option<ActiveExecutionTurn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_execution_chain: Option<ActiveExecutionChain>,
+    /// 由会话存储按主线轮次事实计算，不属于 sidecar 的持久化内容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_candidate: Option<MainlineResumeCandidate>,
 }
 
 /// accepted journal 用于在完整 session snapshot 尚未异步落盘前保留一条可恢复的提交事实。
@@ -1046,6 +1061,7 @@ impl SessionRuntimeSidecar {
             recovery_ref: self.recovery_id.clone(),
             current_turn: self.current_turn.clone(),
             active_execution_chain: self.active_execution_chain.clone(),
+            resume_candidate: None,
         }
     }
 }

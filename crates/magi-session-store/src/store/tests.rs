@@ -10269,3 +10269,89 @@ fn execution_steps_persistence_failure_does_not_advance_snapshot_or_sidecar() {
     );
     assert_store_mutation_snapshot_unchanged(&store, &before);
 }
+
+/// 在会话里放一个主线轮次：用户消息带来源任务，且有处理过该任务的线程。
+fn seed_mainline_turn(
+    store: &SessionStore,
+    session_id: &SessionId,
+    turn_id: &str,
+    status: &str,
+    accepted_at: u64,
+    user_metadata: &[(&str, Value)],
+) -> TaskId {
+    let task_id = TaskId::new(format!("task-{turn_id}"));
+    let mut turn = test_turn(turn_id, status, accepted_at);
+    let mut user_item = test_turn_item(&format!("item-{turn_id}-user"), "把测试补完");
+    user_item.item_seq = 1;
+    user_item.task_id = Some(task_id.clone());
+    for (key, value) in user_metadata {
+        user_item.metadata.insert((*key).to_string(), value.clone());
+    }
+    turn.items = vec![user_item];
+    accept_test_turn(store, session_id, turn);
+    let mut thread = sample_thread(
+        &format!("thread-{turn_id}"),
+        session_id,
+        &MissionId::new(format!("mission-{turn_id}")),
+        "executor",
+        UtcMillis(accepted_at),
+        ExecutionThreadStatus::Idle,
+    );
+    thread.handled_task_ids.push(task_id.clone());
+    store
+        .register_thread(thread)
+        .expect("thread should register");
+    task_id
+}
+
+#[test]
+fn mainline_resume_candidate_exists_for_failed_and_user_stopped_turns_only() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-resume-candidate");
+    store
+        .create_session(session_id.clone(), "Resume Candidate")
+        .expect("session should be creatable");
+
+    // 没有轮次、或最近一轮已完成：没有可继续的来源。
+    assert!(store.mainline_resume_candidate(&session_id).is_none());
+    seed_mainline_turn(&store, &session_id, "turn-completed", "completed", 10, &[]);
+    assert!(store.mainline_resume_candidate(&session_id).is_none());
+
+    // 失败的最近一轮：可继续，来源是它的任务与线程，目标是用户原话。
+    let failed_task = seed_mainline_turn(&store, &session_id, "turn-failed", "failed", 20, &[]);
+    let candidate = store
+        .mainline_resume_candidate(&session_id)
+        .expect("失败的主线轮次应可继续");
+    assert_eq!(candidate.turn_id, "turn-failed");
+    assert_eq!(candidate.source_task_id, failed_task);
+    assert_eq!(candidate.source_thread_id.as_str(), "thread-turn-failed");
+    assert_eq!(candidate.original_user_message, "把测试补完");
+
+    // 之后出现新的已完成轮次：旧的失败不再是“最近一轮”，不可继续。
+    seed_mainline_turn(&store, &session_id, "turn-after", "completed", 30, &[]);
+    assert!(store.mainline_resume_candidate(&session_id).is_none());
+
+    // 被新消息取代的取消不算停止；用户主动停止才算。
+    seed_mainline_turn(&store, &session_id, "turn-superseded", "cancelled", 40, &[]);
+    assert!(store.mainline_resume_candidate(&session_id).is_none());
+    seed_mainline_turn(
+        &store,
+        &session_id,
+        "turn-user-stopped",
+        "cancelled",
+        50,
+        &[("interruptionSource", json!("user"))],
+    );
+    let candidate = store
+        .mainline_resume_candidate(&session_id)
+        .expect("用户主动停止的轮次应可继续");
+    assert_eq!(candidate.turn_id, "turn-user-stopped");
+
+    // 读模型导出的是同一份判定。
+    let export = store
+        .execution_sidecar_export(&session_id)
+        .map(|export| export.resume_candidate);
+    if let Some(exported) = export {
+        assert_eq!(exported, Some(candidate));
+    }
+}

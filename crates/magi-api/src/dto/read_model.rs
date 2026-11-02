@@ -238,6 +238,7 @@ fn merge_session_sidecars(
         entry.active_branches.clear();
         entry.has_recoverable_chain = false;
         entry.recoverable_branch_count = 0;
+        entry.continuation = None;
         entry.mission_id = None;
         entry.root_task_id = None;
         entry.root_task_status = None;
@@ -273,6 +274,13 @@ fn merge_session_sidecars(
             }
             push_unique(&mut entry.recovery_ids, chain.recovery_ref.clone());
         }
+        // 停止后能否继续：与继续动作共用同一份判定，客户端只消费这个结果。
+        entry.continuation = crate::continuation::decide_continuation(
+            entry.recoverable_branch_count,
+            export.resume_candidate.as_ref(),
+            task_store,
+        )
+        .map(|kind| kind.as_str().to_string());
         if session_sidecar_is_runtime_active(export)
             && !session_root_task_is_terminal(entry.root_task_status.as_deref())
         {
@@ -823,6 +831,7 @@ mod tests {
         let runtime_read_model = runtime_read_model_dto(
             RuntimeReadModelInput::default(),
             &[SessionRuntimeSidecarExport {
+                resume_candidate: None,
                 session_id: SessionId::new("session-1"),
                 current_status: SessionExecutionSidecarStatus::Resumed,
                 last_update: UtcMillis::now(),
@@ -889,6 +898,7 @@ mod tests {
         let runtime_read_model = runtime_read_model_dto(
             RuntimeReadModelInput::default(),
             &[SessionRuntimeSidecarExport {
+                resume_candidate: None,
                 session_id: SessionId::new("session-tool-text"),
                 current_status: SessionExecutionSidecarStatus::Bound,
                 last_update: UtcMillis::now(),
@@ -1055,6 +1065,7 @@ mod tests {
         let runtime_read_model = runtime_read_model_dto(
             RuntimeReadModelInput::default(),
             &[SessionRuntimeSidecarExport {
+                resume_candidate: None,
                 session_id: SessionId::new("session-projection-authority"),
                 current_status: SessionExecutionSidecarStatus::Bound,
                 last_update: now,
@@ -1235,6 +1246,7 @@ mod tests {
         let runtime_read_model = runtime_read_model_dto(
             RuntimeReadModelInput::default(),
             &[SessionRuntimeSidecarExport {
+                resume_candidate: None,
                 session_id: SessionId::new("session-recoverable-1"),
                 current_status: SessionExecutionSidecarStatus::Bound,
                 last_update: UtcMillis::now(),
@@ -1366,6 +1378,8 @@ mod tests {
 
         let session = &runtime_read_model.details.sessions[0];
         assert!(session.has_recoverable_chain);
+        // 可恢复的执行链先于主线轮次：读模型把继续的方式投影给客户端，客户端不再自行推断。
+        assert_eq!(session.continuation.as_deref(), Some("resume_chain"));
         assert_eq!(session.recoverable_branch_count, 2);
         assert_eq!(session.active_branches.len(), 5);
     }
@@ -1419,6 +1433,7 @@ mod tests {
         let runtime_read_model = runtime_read_model_dto(
             RuntimeReadModelInput::default(),
             &[SessionRuntimeSidecarExport {
+                resume_candidate: None,
                 session_id: SessionId::new("session-terminal-recoverable"),
                 current_status: SessionExecutionSidecarStatus::Bound,
                 last_update: now,
@@ -1501,6 +1516,7 @@ mod tests {
             .expect("session summary should exist");
         assert!(!session.has_recoverable_chain);
         assert_eq!(session.recoverable_branch_count, 0);
+        assert_eq!(session.continuation, None);
         assert!(session.active_task_ids.is_empty());
         assert!(session.active_execution_group_ids.is_empty());
         assert!(
@@ -1769,6 +1785,7 @@ mod tests {
         let runtime_read_model = runtime_read_model_dto(
             RuntimeReadModelInput::default(),
             &[SessionRuntimeSidecarExport {
+                resume_candidate: None,
                 session_id: SessionId::new("session-bound"),
                 current_status: SessionExecutionSidecarStatus::Bound,
                 last_update: UtcMillis::now(),
@@ -1881,6 +1898,7 @@ mod tests {
         let runtime_read_model = runtime_read_model_dto(
             input,
             &[SessionRuntimeSidecarExport {
+                resume_candidate: None,
                 session_id: SessionId::new("session-stale"),
                 current_status: SessionExecutionSidecarStatus::Bound,
                 last_update: UtcMillis::now(),
@@ -2025,6 +2043,7 @@ mod tests {
         let runtime_read_model = runtime_read_model_dto(
             RuntimeReadModelInput::default(),
             &[SessionRuntimeSidecarExport {
+                resume_candidate: None,
                 session_id: SessionId::new("session-turn-completed"),
                 current_status: SessionExecutionSidecarStatus::Bound,
                 last_update: accepted_at,

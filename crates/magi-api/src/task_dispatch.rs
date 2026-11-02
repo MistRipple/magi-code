@@ -8,7 +8,7 @@ use crate::{
     performance::PerformanceTrace,
     scope_binding::resolve_turn_session,
     state::{ApiState, RunnerStartError},
-    turn_service::{monotonic_accepted_at, publish_session_user_message_event},
+    turn_service::publish_session_user_message_event,
 };
 use magi_conversation_runtime::dispatch_submission::{
     DispatchSubmissionAcceptError, DispatchSubmissionGraph, DispatchSubmissionRuntime,
@@ -561,38 +561,6 @@ fn dispatch_accept_error_to_api_error(error: DispatchSubmissionAcceptError) -> A
             ApiError::InternalAssemblyError(format!("任务派发接受失败: {}", message))
         }
     }
-}
-
-pub(crate) async fn accept_session_task_submission(
-    state: &ApiState,
-    request: &SessionTurnRequestDto,
-    images: Vec<SessionTurnImage>,
-    workspace_id: Option<WorkspaceId>,
-    task_title: Option<String>,
-    execution_goal: Option<String>,
-    task_tier: TaskTier,
-) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
-    accept_session_task_submission_at(
-        state,
-        request,
-        SessionTaskSubmissionInput {
-            creation_request_fingerprint: None,
-            images,
-            workspace_id,
-            task_title,
-            execution_goal,
-            task_tier,
-            use_tools: true,
-            accepted_at: monotonic_accepted_at(),
-            required_tool_chain: Vec::new(),
-            completion_contract: TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            denied_tools: Vec::new(),
-            user_message_metadata: Default::default(),
-        },
-    )
-    .await
-    .map(|(accepted, event_id, _event_seq, _occurred_at)| (accepted, event_id))
 }
 
 pub(crate) struct SessionTaskSubmissionInput {

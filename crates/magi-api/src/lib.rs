@@ -9,6 +9,7 @@ mod browser_tool_runtime;
 pub mod builtin_skills;
 mod bundled_plugins;
 mod change_projection;
+mod continuation;
 mod dto;
 mod errors;
 mod external_turns;

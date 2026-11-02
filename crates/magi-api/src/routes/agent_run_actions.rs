@@ -1,18 +1,17 @@
-use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
-use magi_core::{EventId, SessionId, TaskId, TaskStatus, TaskTier, UtcMillis};
+use axum::{Json, Router, extract::State, routing::post};
+use magi_core::{EventId, SessionId, TaskId, TaskStatus, UtcMillis};
 use magi_event_bus::{EventContext, EventEnvelope};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    dto::{SessionScopeKindDto, SessionTurnRequestDto},
+    dto::SessionScopeKindDto,
     errors::ApiError,
     scope_binding::{SessionRequestScope, require_session_request_scope},
     state::ApiState,
-    task_dispatch::{accept_session_task_submission, schedule_session_task_dispatch},
 };
 use magi_orchestrator::task_store::TaskStore;
-use magi_session_store::{ActiveExecutionTurn, SessionPlan};
+use magi_session_store::ActiveExecutionTurn;
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -245,19 +244,20 @@ fn require_session_historical_task(
     Ok((scope, task))
 }
 
+/// 运行视图上对一轮已结束运行的操作。
+///
+/// “继续”不在这里：任何停止（失败、中断、用户主动停止）后的继续都是会话级的同一个动作，
+/// 由会话 Turn 的 `resume` 经 `continuation::decide_continuation` 统一判定和执行，
+/// 读模型把可否继续投影给客户端。这里只剩与继续无关的归档。
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum AgentRunActionKind {
-    Continue,
-    Restart,
     Archive,
 }
 
 impl AgentRunActionKind {
     pub(super) fn supports_status(self, status: TaskStatus) -> bool {
         match self {
-            Self::Continue => status == TaskStatus::Failed,
-            Self::Restart => matches!(status, TaskStatus::Failed | TaskStatus::Killed),
             Self::Archive => matches!(
                 status,
                 TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
@@ -266,21 +266,11 @@ impl AgentRunActionKind {
     }
 }
 
-pub(super) fn available_agent_run_actions(
-    status: TaskStatus,
-    has_recoverable_chain: bool,
-) -> Vec<AgentRunActionKind> {
-    [
-        AgentRunActionKind::Continue,
-        AgentRunActionKind::Restart,
-        AgentRunActionKind::Archive,
-    ]
-    .into_iter()
-    .filter(|action| {
-        action.supports_status(status)
-            && (*action != AgentRunActionKind::Continue || has_recoverable_chain)
-    })
-    .collect()
+pub(super) fn available_agent_run_actions(status: TaskStatus) -> Vec<AgentRunActionKind> {
+    [AgentRunActionKind::Archive]
+        .into_iter()
+        .filter(|action| action.supports_status(status))
+        .collect()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -297,7 +287,6 @@ struct TaskIdRequest {
 }
 
 async fn perform_task_action(
-    headers: HeaderMap,
     State(state): State<ApiState>,
     Json(request): Json<TaskIdRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -305,12 +294,6 @@ async fn perform_task_action(
         return Err(ApiError::InvalidInput("operationId 不能为空".to_string()));
     }
     match request.action {
-        AgentRunActionKind::Continue => continue_task(state, request).await,
-        AgentRunActionKind::Restart => {
-            let desktop_browser_tools_allowed =
-                super::is_trusted_desktop_renderer_request(&state, &headers);
-            restart_task(state, request, desktop_browser_tools_allowed).await
-        }
         AgentRunActionKind::Archive => archive_task(state, request).await,
     }
 }
@@ -334,8 +317,8 @@ fn ensure_terminal_root_action(
     Ok(root_task)
 }
 
-/// 运行中心的 Continue/Restart/Archive 是执行链级操作，不能把某个子代理的
-/// task_id 当成 root task_id 处理。否则收到子代理的“重新执行”请求时，
+/// 运行视图的 Continue/Archive 是执行链级操作，不能把某个子代理的
+/// task_id 当成 root task_id 处理。否则收到子代理的“继续”请求时，
 /// 旧实现会静默重启整条主线，造成错误的唤起和重复副作用。
 fn ensure_root_action_target(task: &magi_core::Task, action: &str) -> Result<(), ApiError> {
     if task.task_id != task.root_task_id || task.parent_task_id.is_some() {
@@ -358,267 +341,6 @@ fn ensure_supported_root_action(
         "当前任务状态为 {:?}，不能{action_label}",
         root_task.status
     )))
-}
-
-fn restart_active_skill_id(root_task: &magi_core::Task) -> Option<String> {
-    root_task
-        .executor_binding_active_skill_id()
-        .map(str::to_string)
-}
-
-fn resume_blocked_plan_for_retry(
-    state: &ApiState,
-    session_id: &SessionId,
-    workspace_id: Option<&magi_core::WorkspaceId>,
-    root_task_id: &TaskId,
-) -> Result<Option<SessionPlan>, ApiError> {
-    let plan_store = magi_plan::PlanStore::from_store(&state.session_store, session_id.clone());
-    let Some(previous_plan) = plan_store.snapshot() else {
-        return Ok(None);
-    };
-    let Some(item_id) = previous_plan.task_bindings.get(root_task_id) else {
-        return Ok(None);
-    };
-    if !previous_plan
-        .items
-        .iter()
-        .any(|item| &item.item_id == item_id && item.status == magi_core::PlanItemStatus::Blocked)
-    {
-        return Ok(None);
-    }
-    let resumed = plan_store
-        .resume()
-        .map_err(|error| ApiError::InvalidInput(error.to_string()))?
-        .ok_or_else(|| ApiError::internal_assembly("恢复阻塞计划失败", "plan disappeared"))?;
-    let root_task = state
-        .task_store()
-        .and_then(|store| store.get_task(root_task_id))
-        .ok_or_else(|| ApiError::not_found("根任务不存在", root_task_id.as_str()))?;
-    magi_plan::publish_plan_event(
-        &state.event_bus,
-        magi_plan::plan_event_type(&resumed),
-        &resumed,
-        workspace_id,
-        Some(root_task_id),
-        Some(&root_task.mission_id),
-    );
-    Ok(Some(previous_plan))
-}
-
-fn restore_plan_after_retry_rejection(
-    state: &ApiState,
-    session_id: &SessionId,
-    previous_plan: Option<SessionPlan>,
-) {
-    let Some(previous_plan) = previous_plan else {
-        return;
-    };
-    let expected_revision = state
-        .session_store
-        .plan(session_id)
-        .map(|plan| plan.revision);
-    if let Err(error) =
-        state
-            .session_store
-            .upsert_plan(session_id, previous_plan, expected_revision)
-    {
-        tracing::error!(
-            session_id = %session_id,
-            ?error,
-            "重新执行任务接收失败后还原计划状态失败"
-        );
-    }
-}
-
-async fn continue_task(
-    state: ApiState,
-    request: TaskIdRequest,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let task_id = request.task_id.trim();
-    if task_id.is_empty() {
-        return Err(ApiError::InvalidInput("taskId 不能为空".to_string()));
-    }
-    let (scope, task) = require_session_historical_task(
-        &state,
-        request.session_id.as_deref(),
-        request.scope,
-        request.workspace_id.as_deref(),
-        request.workspace_path.as_deref(),
-        task_id,
-    )?;
-    ensure_root_action_target(&task, "继续")?;
-    let root_task = ensure_terminal_root_action(&state, &task.root_task_id, "继续")?;
-    ensure_supported_root_action(&root_task, AgentRunActionKind::Continue, "继续")?;
-    let response = crate::turn_service::continue_session_with_expected_root(
-        &state,
-        crate::dto::ContinueSessionRequest {
-            session_id: scope.session_id.to_string(),
-            workspace_id: scope.workspace_id().as_ref().map(ToString::to_string),
-            workspace_path: None,
-            prompt_text: Some("继续执行中断的任务".to_string()),
-            requested_agent_ids: Vec::new(),
-            request_id: None,
-            user_message_id: None,
-            placeholder_message_id: None,
-        },
-        Some(&task.task_id),
-    )
-    .await?;
-    let mut payload = serde_json::to_value(response)
-        .map_err(|error| ApiError::internal_assembly("序列化任务继续结果失败", error))?;
-    payload["action"] = json!("continue");
-    payload["operationId"] = json!(request.operation_id);
-    Ok(Json(payload))
-}
-
-/// 重新执行当前 root 任务：创建新的执行链，旧任务树只保留为历史事实。
-async fn restart_task(
-    state: ApiState,
-    request: TaskIdRequest,
-    desktop_browser_tools_allowed: bool,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let now = UtcMillis::now();
-    let task_id = request.task_id.trim();
-    if task_id.is_empty() {
-        return Err(ApiError::InvalidInput("taskId 不能为空".to_string()));
-    }
-    let (scope, task) = require_session_historical_task(
-        &state,
-        request.session_id.as_deref(),
-        request.scope,
-        request.workspace_id.as_deref(),
-        request.workspace_path.as_deref(),
-        task_id,
-    )?;
-    ensure_root_action_target(&task, "重新执行")?;
-    let session_id = scope.session_id.clone();
-    let requested_root_task = ensure_terminal_root_action(&state, &task.root_task_id, "重新执行")?;
-    let manager = state
-        .runner_manager()
-        .ok_or_else(|| ApiError::internal_assembly("重新执行失败", "runner_manager 未配置"))?;
-    // Restart 与 Continue 使用相同的锁顺序：navigation -> session Turn -> Runner
-    // lifecycle -> root restart。旧 runner 必须在创建新执行链前完全退出，避免两条
-    // 执行链并存，也避免与删除/关闭形成锁反转。
-    let _session_lifecycle_guard = state.lock_session_lifecycle(&session_id).await;
-    let _restart_guard = manager
-        .lock_for_restart(requested_root_task.task_id.as_str())
-        .await;
-    manager
-        .quiesce_for_restart(requested_root_task.task_id.as_str())
-        .await;
-    let root_task = ensure_terminal_root_action(&state, &task.root_task_id, "重新执行")?;
-    ensure_supported_root_action(&root_task, AgentRunActionKind::Restart, "重新执行")?;
-    let previous_plan = resume_blocked_plan_for_retry(
-        &state,
-        &session_id,
-        scope.workspace_id().as_ref(),
-        &root_task.task_id,
-    )?;
-    let restart_text = if root_task.goal.trim().is_empty() {
-        root_task.title.trim().to_string()
-    } else {
-        root_task.goal.trim().to_string()
-    };
-    let restart_request = SessionTurnRequestDto {
-        source_folder_id: None,
-        project_directories: None,
-        desktop_browser_tools_allowed,
-        session_id: Some(session_id.to_string()),
-        scope: request.scope,
-        workspace_id: scope.workspace_id().map(|id| id.to_string()),
-        workspace_path: scope.workspace_path(),
-        text: Some(restart_text),
-        skill_name: restart_active_skill_id(&root_task),
-        locale: None,
-        goal_mode: false,
-        resume: false,
-        images: Vec::new(),
-        context_references: Vec::new(),
-        browser_annotation_refs: Vec::new(),
-        browser_node_selections: Vec::new(),
-        access_profile: root_task
-            .policy_snapshot
-            .as_ref()
-            .map(|policy| policy.access_profile),
-        orchestrator_session_config: None,
-        request_id: Some(request.operation_id.clone()),
-        user_message_id: None,
-        placeholder_message_id: None,
-        steer_current_turn: false,
-        expected_turn_id: None,
-        replace_turn_id: None,
-        interrupt_turn_id: None,
-        command: None,
-        workflow_id: None,
-        plugin_command_id: None,
-        plugin_selections: Vec::new(),
-    };
-    let task_tier = root_task
-        .policy_snapshot
-        .as_ref()
-        .map(|policy| policy.task_tier)
-        .unwrap_or(TaskTier::ExecutionChain);
-    let accepted_result = accept_session_task_submission(
-        &state,
-        &restart_request,
-        Vec::new(),
-        scope.workspace_id(),
-        Some(root_task.title.clone()),
-        Some(root_task.goal.clone()),
-        task_tier,
-    )
-    .await;
-    let (accepted, event_id) = match accepted_result {
-        Ok(accepted) => accepted,
-        Err(error) => {
-            restore_plan_after_retry_rejection(&state, &session_id, previous_plan);
-            return Err(error);
-        }
-    };
-    schedule_session_task_dispatch(state.clone(), accepted.clone());
-    let execution_chain_ref = state
-        .session_store
-        .runtime_sidecar(&accepted.session_id)
-        .and_then(|sidecar| sidecar.ownership.execution_chain_ref);
-    let event = EventEnvelope::domain(
-        EventId::unique("event-task-restart"),
-        "task.restart.requested",
-        json!({
-            "task_id": task_id,
-            "old_root_task_id": task.root_task_id.to_string(),
-            "new_root_task_id": accepted.root_task_id.to_string(),
-            "session_id": accepted.session_id.to_string(),
-            "workspace_id": scope.workspace_id().map(|id| id.to_string()),
-            "requested_at": now.0,
-        }),
-    )
-    .with_context(EventContext {
-        workspace_id: scope.workspace_id(),
-        session_id: Some(accepted.session_id.clone()),
-        mission_id: Some(root_task.mission_id.clone()),
-        task_id: Some(accepted.root_task_id.clone()),
-        ..EventContext::default()
-    });
-    state.event_bus.publish(event);
-
-    Ok(Json(json!({
-        "action": "restart",
-        "operationId": request.operation_id,
-        "restarted": true,
-        "sessionId": accepted.session_id.to_string(),
-        "entryId": accepted.entry_id,
-        "eventId": event_id.to_string(),
-        "acceptedAt": accepted.accepted_at.0,
-        "createdSession": accepted.created_session,
-        "rootTaskId": accepted.root_task_id.to_string(),
-        "actionTaskId": accepted.action_task_id.to_string(),
-        "executionChainRef": execution_chain_ref,
-        "requestedAt": now.0,
-        "workspaceId": scope.workspace_id().map(|id| id.to_string()),
-        "workspacePath": scope.workspace_path(),
-        "oldRootTaskId": task.root_task_id.to_string(),
-        "newRootTaskId": accepted.root_task_id.to_string(),
-    })))
 }
 
 /// 从目标面板归档当前 root 任务：只移除会话当前执行链指针，不删除 TaskStore 历史。
@@ -688,7 +410,7 @@ mod tests {
     use super::*;
     use magi_core::{
         AccessProfile, MissionId, Task, TaskExecutorBinding, TaskKind, TaskPolicy,
-        TaskRuntimePayload, TaskStatus,
+        TaskRuntimePayload, TaskStatus, TaskTier,
     };
 
     fn terminal_root_task_with_binding(binding: TaskExecutorBinding) -> Task {
@@ -737,41 +459,33 @@ mod tests {
     }
 
     #[test]
-    fn restart_uses_active_skill_id_not_legacy_skill_name_binding() {
-        let task = terminal_root_task_with_binding(
-            TaskExecutorBinding::for_role("reviewer")
-                .with_active_skill_id(Some("code-review".to_string())),
-        );
-
+    fn archive_is_the_only_run_action_and_only_for_ended_runs() {
         assert_eq!(
-            restart_active_skill_id(&task).as_deref(),
-            Some("code-review")
-        );
-    }
-
-    #[test]
-    fn action_policy_is_shared_by_projection_and_execution() {
-        assert_eq!(
-            available_agent_run_actions(TaskStatus::Running, false),
+            available_agent_run_actions(TaskStatus::Running),
             Vec::<AgentRunActionKind>::new()
         );
+        for status in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Killed,
+        ] {
+            assert_eq!(
+                available_agent_run_actions(status),
+                vec![AgentRunActionKind::Archive]
+            );
+        }
+    }
+
+    /// “继续”不再是运行视图的动作：它是会话级的同一个动作，线上不得再接受这个词。
+    #[test]
+    fn continue_and_restart_are_not_run_wire_actions() {
+        for removed in ["continue", "restart"] {
+            assert!(serde_json::from_str::<AgentRunActionKind>(&format!("\"{removed}\"")).is_err());
+        }
         assert_eq!(
-            available_agent_run_actions(TaskStatus::Failed, false),
-            vec![AgentRunActionKind::Restart, AgentRunActionKind::Archive]
+            serde_json::from_str::<AgentRunActionKind>("\"archive\"").unwrap(),
+            AgentRunActionKind::Archive
         );
-        assert_eq!(
-            available_agent_run_actions(TaskStatus::Failed, true),
-            vec![
-                AgentRunActionKind::Continue,
-                AgentRunActionKind::Restart,
-                AgentRunActionKind::Archive,
-            ]
-        );
-        assert_eq!(
-            available_agent_run_actions(TaskStatus::Completed, false),
-            vec![AgentRunActionKind::Archive]
-        );
-        assert!(!AgentRunActionKind::Restart.supports_status(TaskStatus::Completed));
     }
 
     #[test]
@@ -780,9 +494,7 @@ mod tests {
         child.task_id = TaskId::new("task-child");
         child.root_task_id = TaskId::new("task-root");
         child.parent_task_id = Some(TaskId::new("task-root"));
-        for action in ["继续", "重新执行", "从面板移除"] {
-            let error = ensure_root_action_target(&child, action).unwrap_err();
-            assert!(matches!(error, ApiError::InvalidInput(message) if message.contains("根任务")));
-        }
+        let error = ensure_root_action_target(&child, "从面板移除").unwrap_err();
+        assert!(matches!(error, ApiError::InvalidInput(message) if message.contains("根任务")));
     }
 }

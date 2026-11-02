@@ -15437,7 +15437,7 @@ done
                 serde_json::to_value(harness.state.session_store.active_execution_chain(&session))
                     .unwrap();
             let requests = harness.provider.requests().len();
-            for operation in ["restart", "archive", "continue"] {
+            for operation in ["archive"] {
                 let response = crate::routes::build_router(harness.state.clone())
                     .oneshot(
                         Request::builder()
@@ -15466,9 +15466,6 @@ done
                     "{operation}: {}",
                     String::from_utf8_lossy(&body)
                 );
-                if operation == "restart" {
-                    assert!(String::from_utf8_lossy(&body).contains("根任务"));
-                }
                 assert_eq!(
                     serde_json::to_value(store.snapshot().tasks).unwrap(),
                     before_tasks
@@ -15492,6 +15489,45 @@ done
                 );
                 assert_eq!(harness.provider.requests().len(), requests);
             }
+            // “继续”不是运行视图的动作：线上不再接受 continue / restart，两者都在改动任何事实前被拒绝。
+            let root_task_id = store.get_task(&child_id).unwrap().root_task_id;
+            for removed in ["continue", "restart"] {
+                let response = crate::routes::build_router(harness.state.clone())
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/agent-runs/action")
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({
+                                    "operationId": format!("root-{removed}"), "sessionId": session,
+                                    "scope": "workspace", "workspaceId": workspace,
+                                    "taskId": root_task_id, "action": removed,
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(response.status().is_client_error(), "{removed}");
+            }
+            assert_eq!(
+                serde_json::to_value(store.snapshot().tasks).unwrap(),
+                before_tasks
+            );
+            // 用户停止后的继续是会话级的同一个动作：读模型投影和继续动作用的是同一个判定。
+            let export = harness
+                .state
+                .session_store
+                .execution_sidecar_export(&session)
+                .unwrap();
+            let kind = crate::continuation::decide_continuation(
+                crate::turn_service::session_recoverable_branch_count(&harness.state, &session),
+                export.resume_candidate.as_ref(),
+                Some(&store),
+            );
+            assert!(kind.is_some(), "用户停止的主线必须可以继续: {export:?}");
             return;
         }
         let mut transfer_request = serde_json::json!({

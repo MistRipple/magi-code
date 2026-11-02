@@ -1325,8 +1325,8 @@ pub(crate) fn decide_session_turn(
     Ok(SessionTurnIntentDecision::new(SessionTurnRouteDto::Execute))
 }
 
-/// 用户点击“继续”：优先恢复可恢复的执行链（daemon 中断等），其次从失败、中断或用户
-/// 主动停止的最近主线检查点继续；两者都没有时拒绝。
+/// 用户点击“继续”。是否可继续、从哪里继续由 `continuation::decide_continuation` 决定，
+/// 与读模型投影给客户端的结果是同一份判定；这里只负责把判定落成执行路径。
 fn decide_resume_turn(
     state: &ApiState,
     request: &SessionTurnRequestDto,
@@ -1334,28 +1334,38 @@ fn decide_resume_turn(
     let Some(session_id) = request.requested_session_id() else {
         return Err(ApiError::InvalidInput("继续执行需要指定会话".to_string()));
     };
-    if session_has_recoverable_chain(state, &session_id) {
-        return Ok(SessionTurnIntentDecision::new(
-            SessionTurnRouteDto::Continue,
-        ));
+    let candidate = state.session_store.mainline_resume_candidate(&session_id);
+    // 编辑替换某一轮时不沿用“最近停止的轮次”，只允许恢复执行链。
+    let candidate_for_decision = candidate
+        .as_ref()
+        .filter(|_| request.replace_turn_id().is_none());
+    let kind = crate::continuation::decide_continuation(
+        session_recoverable_branch_count(state, &session_id),
+        candidate_for_decision,
+        state.task_store(),
+    );
+    match (kind, candidate) {
+        (Some(crate::continuation::ContinuationKind::ResumeChain), _) => Ok(
+            SessionTurnIntentDecision::new(SessionTurnRouteDto::Continue),
+        ),
+        (Some(crate::continuation::ContinuationKind::ResumeTurn), Some(candidate)) => {
+            let resume = interrupted_turn_resume_from(state, &session_id, candidate)
+                .ok_or_else(|| ApiError::InvalidInput("当前会话没有可继续的执行".to_string()))?;
+            let mut decision = SessionTurnIntentDecision::new(SessionTurnRouteDto::Execute);
+            decision.task_title = Some(format!("继续: {}", resume.original_user_message));
+            decision.execution_goal = Some(interrupted_turn_resume_goal(
+                &resume,
+                request.trimmed_text().as_deref().unwrap_or("继续"),
+            ));
+            decision.required_tool_chain = resume.required_tool_chain;
+            decision.completion_contract = resume.completion_contract;
+            decision.recovery_checkpoint = Some(resume.recovery_checkpoint);
+            Ok(decision)
+        }
+        _ => Err(ApiError::InvalidInput(
+            "当前会话没有可继续的执行".to_string(),
+        )),
     }
-    if request.replace_turn_id().is_none()
-        && let Some(resume) = user_interrupted_turn_resume(state, request)
-    {
-        let mut decision = SessionTurnIntentDecision::new(SessionTurnRouteDto::Execute);
-        decision.task_title = Some(format!("继续: {}", resume.original_user_message));
-        decision.execution_goal = Some(interrupted_turn_resume_goal(
-            &resume,
-            request.trimmed_text().as_deref().unwrap_or("继续"),
-        ));
-        decision.required_tool_chain = resume.required_tool_chain;
-        decision.completion_contract = resume.completion_contract;
-        decision.recovery_checkpoint = Some(resume.recovery_checkpoint);
-        return Ok(decision);
-    }
-    Err(ApiError::InvalidInput(
-        "当前会话没有可继续的执行".to_string(),
-    ))
 }
 
 struct UserInterruptedTurnResume {
@@ -1366,73 +1376,23 @@ struct UserInterruptedTurnResume {
     recovery_checkpoint: TaskRecoveryCheckpoint,
 }
 
-fn user_interrupted_turn_resume(
+/// 把共享的继续来源补全为执行所需的任务契约；来源任务缺失时与判定一致地视为不可继续。
+fn interrupted_turn_resume_from(
     state: &ApiState,
-    request: &SessionTurnRequestDto,
+    session_id: &SessionId,
+    candidate: magi_session_store::MainlineResumeCandidate,
 ) -> Option<UserInterruptedTurnResume> {
-    let session_id = request.requested_session_id()?;
-    let turn = state
-        .session_store
-        .canonical_turns_for_session(&session_id)
-        .into_iter()
-        .filter(|turn| !turn.is_session_command() && !turn.metadata.contains_key("agentExecution"))
-        .max_by(|left, right| {
-            left.turn_seq
-                .cmp(&right.turn_seq)
-                .then_with(|| left.turn_id.cmp(&right.turn_id))
-        })?;
-    if !matches!(
-        turn.status,
-        magi_session_store::CanonicalTurnStatus::Cancelled
-            | magi_session_store::CanonicalTurnStatus::Failed
-            | magi_session_store::CanonicalTurnStatus::Interrupted
-    ) {
-        return None;
-    }
-    let user_item = turn
-        .items
-        .iter()
-        .find(|item| item.kind == CanonicalTurnItemKind::UserMessage)?;
-    if turn.status == magi_session_store::CanonicalTurnStatus::Cancelled
-        && user_item
-            .metadata
-            .get("interruptionSource")
-            .and_then(serde_json::Value::as_str)
-            != Some("user")
-    {
-        return None;
-    }
-    let original_user_message = user_item.content.as_deref()?.trim().to_string();
-    if original_user_message.is_empty() {
-        return None;
-    }
-    let source_task_id = user_item
-        .worker
-        .as_ref()
-        .and_then(|worker| worker.task_id.as_ref())
-        .cloned()?;
-    let source_task = state.task_store()?.get_task(&source_task_id)?;
-    let source_thread_id = state
-        .session_store
-        .thread_registry_snapshot(&session_id)
-        .into_iter()
-        .filter(|thread| thread.handled_task_ids.contains(&source_task_id))
-        .max_by(|left, right| {
-            left.last_used_at
-                .cmp(&right.last_used_at)
-                .then_with(|| left.thread_id.as_str().cmp(right.thread_id.as_str()))
-        })?
-        .thread_id;
+    let source_task = state.task_store()?.get_task(&candidate.source_task_id)?;
     Some(UserInterruptedTurnResume {
-        turn_id: turn.turn_id.clone(),
-        original_user_message,
+        turn_id: candidate.turn_id.clone(),
+        original_user_message: candidate.original_user_message,
         required_tool_chain: source_task.required_tool_chain().to_vec(),
         completion_contract: source_task.completion_contract().clone(),
         recovery_checkpoint: TaskRecoveryCheckpoint {
-            source_session_id: session_id,
-            source_task_id,
-            source_turn_id: turn.turn_id,
-            source_thread_id,
+            source_session_id: session_id.clone(),
+            source_task_id: candidate.source_task_id,
+            source_turn_id: candidate.turn_id,
+            source_thread_id: candidate.source_thread_id,
         },
     })
 }
@@ -1446,13 +1406,17 @@ fn interrupted_turn_resume_goal(resume: &UserInterruptedTurnResume, current_inpu
     )
 }
 
-fn session_has_recoverable_chain(state: &ApiState, session_id: &SessionId) -> bool {
+pub(crate) fn session_recoverable_branch_count(state: &ApiState, session_id: &SessionId) -> usize {
     let Some(chain) = state.session_store.active_execution_chain(session_id) else {
-        return false;
+        return 0;
     };
-    chain.branches.iter().any(|branch| {
-        active_execution_branch_is_continue_recoverable(state.task_store(), &chain, branch)
-    })
+    chain
+        .branches
+        .iter()
+        .filter(|branch| {
+            active_execution_branch_is_continue_recoverable(state.task_store(), &chain, branch)
+        })
+        .count()
 }
 
 /// 主线工具面的结构化裁剪：Goal 工具只在目标模式开放；浏览器工具只在可信桌面连接可用。

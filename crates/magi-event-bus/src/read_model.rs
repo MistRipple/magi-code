@@ -421,6 +421,10 @@ pub struct SessionRuntimeSummaryEntry {
     pub recovery_ref: Option<String>,
     pub has_recoverable_chain: bool,
     pub recoverable_branch_count: usize,
+    /// 这个会话停止后能否重新激活并继续推进，以及用哪种方式（`resume_chain` / `resume_turn`）。
+    /// 由 daemon 按同一份判定计算，客户端不得再根据轮次状态自行推断。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
     pub active_branches: Vec<SessionRuntimeBranchSummaryEntry>,
     pub current_turn: Option<SessionRuntimeTurnSummaryEntry>,
     pub turn_items: Vec<SessionRuntimeTurnItemSummaryEntry>,
