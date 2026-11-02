@@ -269,7 +269,7 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 ### 受信扩展宿主（目标，尚无验收入口）
 
-[插件系统设计](plugin-system-requirements-design.md)第 12 节定义了受信 Node 扩展宿主的验收面，当前没有对应的脚本或测试命令，不能把下列条目当作已有入口。现有 `test:electron-plugins`、工作流与会话引擎相关回归验证的是即将被替换的 QuickJS 实现，替换交付时随之改写，不并行保留两套验收。
+[插件系统设计](plugin-system-requirements-design.md)第 12 节定义了受信 Node 扩展宿主的验收面，当前没有对应的脚本或测试命令，不能把下列条目当作已有入口；协议层验收清单见[扩展协议 v1](extension-protocol-v1.md#13-一致性验收协议层)。现有 `test:electron-plugins`、工作流与会话引擎相关回归验证的是即将被替换的 QuickJS 实现，替换交付时随之改写，不并行保留两套验收。
 
 实现该能力时必须新增并在本文登记的验证面：
 

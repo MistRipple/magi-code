@@ -106,7 +106,7 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 - [Prompt Lineage 与缓存根架构](./prompt-cache-lineage-architecture.md)：把提示词 IR、分支 lineage、cache epoch、Provider Cache Contract 和 logical/transport usage 统一为 daemon 一级事实。
 - [知识图谱设计与维护](./knowledge-graph-design.md)：图谱事实源、候选审阅、检索预算、索引维护与定向验证。
 - [用户自定义子代理角色](./custom-worker-role-design.md)：角色定义、持久化、注册表热更新、导入导出与调度合同。
-- [Magi 插件系统：需求与架构设计](./plugin-system-requirements-design.md)：受信 Node 扩展宿主、ExtensionBus 与钩子目录、包与授权、生命周期与升级、pi/DSH 兼容来源，以及现有 QuickJS 实现的审计缺陷；[插件作者指南](./plugin-authoring.md)描述现有 SDK 1，随 QuickJS 一并删除。
+- [Magi 插件系统：需求与架构设计](./plugin-system-requirements-design.md)：受信 Node 扩展宿主、ExtensionBus 与钩子目录、包与授权、生命周期与升级、pi/DSH 兼容来源，以及现有 QuickJS 实现的审计缺陷；[扩展协议 v1](./extension-protocol-v1.md)是受信宿主的线协议规范（尚未实现）；[插件作者指南](./plugin-authoring.md)描述现有 SDK 1，随 QuickJS 一并删除。
 
 - [Turn、事件事实与对话执行架构](./conversation-response-core-architecture-redesign.md)：统一接纳、任务调度、终态、恢复和权限边界。
 - [持久日志的追加写入与压缩](./durable-log-compaction-design.md)：用量账本分段、canonical 事件检查点和崩溃恢复。

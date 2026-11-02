@@ -248,7 +248,7 @@
 
 ### 5.5 公开协议与版本演进
 
-【目标】Extension Protocol 与扩展 API、包格式、资源 schema 分开版本化。握手声明 protocolVersion、extensionApi、宿主运行时能力与必需功能；不支持的主契约或必需功能拒绝加载。兼容的小版本新增只能在双方声明支持时使用；不靠缺字段猜旧协议，不维护第二条执行实现。版本规则：manifestVersion（包格式）、extensionApi、protocol、数据 schema 是四条独立版本轴，各为主.次两段；主版本不同即拒绝，次版本只增不删且须双方声明才可使用。宿主只接受其发布时的当前主版本，其余明确拒绝，作者按新主版本重新发布。后台入口固定为包内 extension/index.mjs，入口产物至多 8MiB，仍受 32MiB 展开总量约束；这些是宿主策略上限，不由清单自抬。
+【目标】Extension Protocol 与扩展 API、包格式、资源 schema 分开版本化；线协议的帧、握手、方法与逐钩子 schema 见[扩展协议 v1](extension-protocol-v1.md)。握手声明 protocolVersion、extensionApi、宿主运行时能力与必需功能；不支持的主契约或必需功能拒绝加载。兼容的小版本新增只能在双方声明支持时使用；不靠缺字段猜旧协议，不维护第二条执行实现。版本规则：manifestVersion（包格式）、extensionApi、protocol、数据 schema 是四条独立版本轴，各为主.次两段；主版本不同即拒绝，次版本只增不删且须双方声明才可使用。宿主只接受其发布时的当前主版本，其余明确拒绝，作者按新主版本重新发布。后台入口固定为包内 extension/index.mjs，入口产物至多 8MiB，仍受 32MiB 展开总量约束；这些是宿主策略上限，不由清单自抬。
 
 【目标】daemon 签发插件 ID、精确版本、摘要、实例代次、调用 ID、hook ID、deadline、配置快照；有执行归属时附 Session、Turn、Task、Step、attempt、目录绑定与父调用。缺少归属的后台任务要先取得原生任务或插件作业身份，不冒充用户输入。
 
@@ -583,6 +583,7 @@
 | 现状 | [缓存架构](prompt-cache-lineage-architecture.md#目标扩展改写extension_rewrite未实现) | `extension_rewrite` 失效原因及其记录合同，实现前不开放扩展改写 | D5 |
 | 现状 | [项目架构文档](README.md) | 扩展宿主进程与进程拓扑、随包 Node、文档索引 | D3 |
 | 现状 | [验证入口](validation.md) | 第 12 节验收面的登记处；当前没有对应命令 | 第 12 节 |
+| 目标 | [扩展协议 v1](extension-protocol-v1.md) | 线协议规范：传输与帧、握手与版本、调用身份、方法目录、注册、逐钩子合同、重入、迁移会话、失败与错误码、协议层验收（尚未实现） | 5.5～5.8、D1、D4 |
 | 目标 | [作者指南](plugin-authoring.md) | Node 公开 API 发布时整体重写；SDK 1 指南随 QuickJS 一并删除 | D1、D2 |
 
 ### 13.3 未核实事项与局限
