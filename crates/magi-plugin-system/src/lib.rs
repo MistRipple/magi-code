@@ -14,7 +14,7 @@ pub use catalog::{
 };
 pub use lifecycle::{
     ActivePlugin, InstalledPlugin, PluginDrainGuard, PluginManager, PluginManagerState,
-    PluginSource, RetiredBuiltin,
+    PluginSource, PreparedToolCall, RetiredBuiltin,
 };
 pub use magi_app_server_protocol::{
     PluginManifest, PluginPermission, PluginPermissionKind, PluginScopeKind,
@@ -53,6 +53,34 @@ impl ContributionRef {
     pub fn identity(&self) -> String {
         format!("plugin/{}/{}", self.plugin_id, self.contribution_id)
     }
+}
+
+/// 暴露给模型的工具名。模型接口通常只接受 `[a-zA-Z0-9_-]{1,64}`，而插件 ID 必含 `.`，
+/// 因此清洗字符后追加原始身份的摘要：不同的 (插件, 贡献) 即使清洗后相同也不会冲突，
+/// 并且名称总在长度上限内。
+pub fn model_tool_name(plugin_id: &str, contribution_id: &str) -> String {
+    const MAX_LEN: usize = 64;
+    const DIGEST_HEX: usize = 12;
+    let safe = |value: &str| -> String {
+        value
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(
+        format!("{plugin_id}\u{1f}{contribution_id}").as_bytes(),
+    );
+    let suffix = &magi_core::hex_lower(digest)[..DIGEST_HEX];
+    let readable = format!("plugin__{}__{}", safe(plugin_id), safe(contribution_id));
+    let keep = MAX_LEN - DIGEST_HEX - 1;
+    let readable: String = readable.chars().take(keep).collect();
+    format!("{readable}_{suffix}")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -96,5 +124,34 @@ mod tests {
         assert!(ContributionRef::parse("命令", "acme.tools/open").is_err());
         assert!(ContributionRef::parse("命令", "plugin//open").is_err());
         assert!(ContributionRef::parse("命令", "plugin/acme.tools/").is_err());
+    }
+
+    #[test]
+    fn model_tool_names_are_valid_unique_and_bounded() {
+        let valid = |name: &str| {
+            !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        };
+        let name = model_tool_name("example.board", "board-summary");
+        assert!(valid(&name), "{name}");
+        assert!(
+            name.starts_with("plugin__example_board__board-summary_"),
+            "{name}"
+        );
+        // 清洗后相同的两个身份仍然不同。
+        assert_ne!(model_tool_name("a.b", "c"), model_tool_name("a_b", "c"),);
+        // 超长身份被截断但仍合法，并保持唯一。
+        let long_a = model_tool_name(&format!("acme.{}", "x".repeat(90)), &"y".repeat(64));
+        let long_b = model_tool_name(&format!("acme.{}", "x".repeat(91)), &"y".repeat(64));
+        assert!(valid(&long_a) && valid(&long_b));
+        assert_ne!(long_a, long_b);
+        assert_eq!(
+            name,
+            model_tool_name("example.board", "board-summary"),
+            "同一身份的名称必须稳定"
+        );
     }
 }

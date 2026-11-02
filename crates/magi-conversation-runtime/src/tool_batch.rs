@@ -3208,6 +3208,14 @@ fn execute_task_tool_call(
             browser_capability_snapshot: browser_capability_snapshot.clone(),
             browser_execution_id: Some(format!("task:{}", task.task_id)),
         };
+        if let Some(result) = registry.execute_plugin_tool(
+            &tool_call.function.name,
+            &tool_call.function.arguments,
+            &context,
+            effective_access_profile,
+        ) {
+            return result;
+        }
         // 等待 Job 不占模型执行名额；后台进程仍可能写入，不能让出仓库租约。
         let job_wait = (tool_call.function.name == BuiltinToolName::ShellExec.as_str()
             && serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)

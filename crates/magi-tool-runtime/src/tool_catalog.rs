@@ -227,18 +227,29 @@ pub(crate) fn build_tool_catalog_value(
     let builtin_total = builtin_categories.len();
     let public_count = public_categories.len();
     let internal_count = internal_categories.len();
-    let external_catalog_status =
-        if include_external && resources.external_tool_catalog_provider.is_some() {
-            "available"
-        } else if include_external {
-            "unavailable"
-        } else {
-            "disabled"
-        };
+    let external_catalog_status = if include_external
+        && (resources.external_tool_catalog_provider.is_some()
+            || resources.plugin_tool_catalog_provider.is_some())
+    {
+        "available"
+    } else if include_external {
+        "unavailable"
+    } else {
+        "disabled"
+    };
     let agent_role_catalog_status = if resources.agent_role_catalog_provider.is_some() {
         "available"
     } else {
         "unavailable"
+    };
+    let plugin_tools = if include_external {
+        resources
+            .plugin_tool_catalog_provider
+            .as_ref()
+            .map(|provider| provider())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
     };
     let external_tool_value =
         |tool: serde_json::Value, name: &str, read_only: bool, executor_available: bool| {
@@ -262,7 +273,18 @@ pub(crate) fn build_tool_catalog_value(
             )
         })
         .collect::<Vec<_>>();
-    let summary = tool_catalog_summary(ToolCatalogSummaryInput {
+    let plugin_values = plugin_tools
+        .iter()
+        .map(|tool| {
+            external_tool_value(
+                serde_json::json!(tool),
+                &tool.model_tool_name,
+                tool.read_only,
+                resources.plugin_tool_executor.is_some(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut summary = tool_catalog_summary(ToolCatalogSummaryInput {
         public_count,
         instruction_skill_count,
         skill_tool_count,
@@ -274,6 +296,10 @@ pub(crate) fn build_tool_catalog_value(
         runtime_warning_count,
     });
 
+    if !plugin_tools.is_empty() {
+        summary.push_str(&format!("，{} 个插件工具", plugin_tools.len()));
+    }
+
     serde_json::json!({
         "tool": "tool_catalog",
         "status": "succeeded",
@@ -282,7 +308,7 @@ pub(crate) fn build_tool_catalog_value(
         "workspace_bound": context.workspace_id.is_some(),
         "approval_policy_summary": approval_policy_summary(access_profile),
         "summary": summary,
-        "total": tools.len() + skill_tool_count + external_mcp_tools.len(),
+        "total": tools.len() + skill_tool_count + external_mcp_tools.len() + plugin_tools.len(),
         "builtin_total": builtin_total,
         "public_count": public_count,
         "internal_count": internal_count,
@@ -314,6 +340,7 @@ pub(crate) fn build_tool_catalog_value(
         } else {
             Vec::new()
         },
+        "plugin_tools": plugin_values,
         "agent_roles": if include_agent_roles {
             serde_json::to_value(agent_roles).unwrap_or_else(|_| serde_json::json!([]))
         } else {

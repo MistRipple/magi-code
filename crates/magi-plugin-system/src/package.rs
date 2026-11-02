@@ -208,6 +208,9 @@ fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
         }
         return Ok(());
     };
+    if extension.hooks.is_empty() && manifest.contributions.tools.is_empty() {
+        return Err(invalid("声明 extension 的包必须至少声明一个钩子或一个工具"));
+    }
     // 改写已装配历史会让缓存前缀失效并改变模型看到的上下文，必须由用户单独授权。
     let rewrites_history = extension
         .hooks
@@ -319,6 +322,24 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
         check(&skill.id, &skill.title, &skill.description)?;
         if skill.instruction.trim().is_empty() || skill.instruction.len() > 65_536 {
             return Err(invalid("Skill 说明为空或超出上限"));
+        }
+    }
+    // 工具由 Node 扩展提供；每个工具须有同名 `tools` 权限，用户授权后才对模型可见。
+    if !c.tools.is_empty() && manifest.extension.is_none() {
+        return Err(invalid("声明工具贡献的包必须同时声明 extension"));
+    }
+    for tool in &c.tools {
+        check(&tool.id, &tool.title, &tool.description)?;
+        validate_object_schema(&tool.input_schema)?;
+        let permitted = manifest.permissions.iter().any(|permission| {
+            permission.kind == PluginPermissionKind::Tools
+                && permission.targets.iter().any(|target| target == &tool.id)
+        });
+        if !permitted {
+            return Err(invalid(format!(
+                "工具 `{}` 必须有包含它的 tools 权限声明",
+                tool.id
+            )));
         }
     }
     for view in &c.views {

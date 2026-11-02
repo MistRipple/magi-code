@@ -2305,6 +2305,37 @@
         }
       }
     },
+    "PluginToolContribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "description",
+        "inputSchema",
+        "readOnly"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "inputSchema": {
+          "type": "object"
+        },
+        "readOnly": {
+          "type": "boolean"
+        }
+      }
+    },
     "PluginViewPlacement": {
       "type": "string",
       "enum": [
@@ -2440,6 +2471,13 @@
           "maxItems": 32,
           "x-rust-default": true
         },
+        "tools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginToolContribution"
+          },
+          "x-rust-default": true
+        },
         "views": {
           "type": "array",
           "items": {
@@ -2510,7 +2548,6 @@
           "items": {
             "$ref": "#/$defs/PluginHookDeclaration"
           },
-          "minItems": 1,
           "maxItems": 32
         }
       }

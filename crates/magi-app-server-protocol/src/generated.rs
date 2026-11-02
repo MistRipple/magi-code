@@ -1520,6 +1520,18 @@ pub struct PluginSkillContribution {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginToolContribution {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    #[serde(rename = "inputSchema")]
+    pub input_schema: Value,
+    #[serde(rename = "readOnly")]
+    pub read_only: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PluginViewPlacement {
     #[serde(rename = "settings")]
@@ -1590,6 +1602,8 @@ pub struct PluginNamedContribution {
 pub struct PluginContributions {
     #[serde(default)]
     pub skills: Vec<PluginSkillContribution>,
+    #[serde(default)]
+    pub tools: Vec<PluginToolContribution>,
     #[serde(default)]
     pub views: Vec<PluginViewContribution>,
     #[serde(default)]

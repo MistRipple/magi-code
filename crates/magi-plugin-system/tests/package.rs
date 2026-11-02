@@ -406,3 +406,36 @@ fn history_rewrite_hooks_require_the_separate_context_rewrite_authorization() {
     qjs["permissions"] = json!([rewrite]);
     assert!(PluginPackage::from_archive(&archive(&qjs, &[])).is_err());
 }
+
+fn tool_manifest() -> Value {
+    let mut m = extension_manifest();
+    m["extension"]["hooks"] = json!([]);
+    m["permissions"] = json!([
+        {"kind":"extension","scope":"application","targets":["full-trust"]},
+        {"kind":"tools","scope":"application","targets":["echo"]}
+    ]);
+    m["contributions"] = json!({"tools":[{
+        "id":"echo","title":"Echo","description":"","readOnly":true,
+        "inputSchema":{"type":"object"}
+    }]});
+    m
+}
+
+#[test]
+fn extension_tools_need_a_tools_permission_and_an_extension() {
+    let ok = PluginPackage::from_archive(&extension_archive(&tool_manifest(), ENTRY));
+    assert!(ok.is_ok(), "{:?}", ok.err());
+    // 缺少覆盖该工具的 tools 权限。
+    let mut m = tool_manifest();
+    m["permissions"] = json!([{"kind":"extension","scope":"application","targets":["full-trust"]}]);
+    assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
+    // 没有 extension 的包不能声明工具。
+    let mut m = tool_manifest();
+    m.as_object_mut().unwrap().remove("extension");
+    m["permissions"] = json!([{"kind":"tools","scope":"application","targets":["echo"]}]);
+    assert!(PluginPackage::from_archive(&extension_archive(&m, &[])).is_err());
+    // 工具参数 schema 必须是有界的 object schema。
+    let mut m = tool_manifest();
+    m["contributions"]["tools"][0]["inputSchema"] = json!({"type":"string"});
+    assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
+}

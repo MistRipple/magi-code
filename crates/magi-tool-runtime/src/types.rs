@@ -271,6 +271,15 @@ impl ToolExecutionSummary {
 
 pub type ExternalToolCatalogProvider =
     Arc<dyn Fn() -> ExternalToolCatalogSnapshot + Send + Sync + 'static>;
+/// 受信 Node 扩展提供的模型工具目录。
+pub type PluginToolCatalogProvider =
+    Arc<dyn Fn() -> Vec<PluginToolCatalogEntry> + Send + Sync + 'static>;
+pub type PluginToolExecutor = Arc<
+    dyn Fn(&str, &str, &ToolExecutionContext) -> (String, ExecutionResultStatus)
+        + Send
+        + Sync
+        + 'static,
+>;
 pub type ExternalMcpToolExecutor =
     Arc<dyn Fn(&str, &str, &str) -> (String, ExecutionResultStatus) + Send + Sync + 'static>;
 pub type AgentRoleCatalogProvider =
@@ -332,6 +341,17 @@ pub struct ExternalToolCatalogSnapshot {
     pub skill_tools: Vec<ExternalToolCatalogEntry>,
     pub mcp_servers: Vec<ExternalMcpServerCatalogEntry>,
     pub mcp_tools: Vec<ExternalMcpToolCatalogEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PluginToolCatalogEntry {
+    pub plugin_id: String,
+    pub contribution_id: String,
+    pub model_tool_name: String,
+    pub title: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -466,6 +486,8 @@ pub struct ToolRuntimeResources {
     pub knowledge_store: Option<Arc<magi_knowledge_store::KnowledgeStore>>,
     pub external_tool_catalog_provider: Option<ExternalToolCatalogProvider>,
     pub external_mcp_tool_executor: Option<ExternalMcpToolExecutor>,
+    pub plugin_tool_catalog_provider: Option<PluginToolCatalogProvider>,
+    pub plugin_tool_executor: Option<PluginToolExecutor>,
     pub agent_role_catalog_provider: Option<AgentRoleCatalogProvider>,
     pub runtime_capability_dependency_provider: Option<RuntimeCapabilityDependencyProvider>,
     pub image_generation_executor: Option<ImageGenerationExecutor>,

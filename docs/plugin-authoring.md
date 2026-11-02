@@ -1,6 +1,6 @@
 # Magi 插件作者指南
 
-> **状态说明（2026-11-02）：** 本指南描述 SDK 2。SDK 1（QuickJS 后台，`backend` / `plugin.mjs`）已移除：安装这类包会被明确拒绝，不提供兼容执行或自动转换。SDK 2 目前提供两类内容：声明式贡献（技能、视图、资源、浏览器 surface）和受信 Node 扩展（对会话、Turn、模型与工具事件挂钩子）。插件提供的模型工具、会话命令、工作流、会话引擎与数据格式迁移尚未在 Node 上重建，清单里不能声明它们。
+> **状态说明（2026-11-02）：** 本指南描述 SDK 2。SDK 1（QuickJS 后台，`backend` / `plugin.mjs`）已移除：安装这类包会被明确拒绝，不提供兼容执行或自动转换。SDK 2 目前提供三类内容：声明式贡献（技能、视图、资源、浏览器 surface）、受信 Node 扩展（对会话、Turn、模型与工具事件挂钩子）和扩展提供的模型工具。会话命令、工作流、会话引擎与数据格式迁移尚未在 Node 上重建，清单里不能声明它们。
 
 这是一份可以单独保存、复制给其他开发者或交给 AI 使用的 Magi 插件开发手册。你需要了解基本 JavaScript 和 JSON；增加页面时需要基本 HTML。
 
@@ -12,7 +12,8 @@
 | 增加设置表单、主页面、右侧面板 | 声明式 | `contributions.views` 与 `settingsSchema`，页面在隔离 iframe 中运行 |
 | 让页面和宿主共享一份带版本的数据 | 声明式 | `contributions.resources` 与 `storage` 权限 |
 | 观察或拦截会话事件：工具调用前后、用户输入、子代理派发、模型请求与响应、用量 | Node 扩展 | `extension.hooks`，需要“完全信任”授权 |
-| 为模型提供新的工具、命令或工作流 | 暂不支持 | 尚未在 Node 上重建，不能声明 |
+| 为模型提供新的工具 | Node 扩展 | `contributions.tools` 声明、`api.tool` 实现，第 5 节 |
+| 为用户提供命令，或工作流、会话引擎 | 暂不支持 | 尚未在 Node 上重建，不能声明 |
 
 插件的安装、授权、启用和数据都对所有工作区共用一份。
 
@@ -81,7 +82,35 @@ export default async function activate(api) {
 
 扩展以用户权限运行在宿主随包提供的 Node 里，没有操作系统级沙箱：它能读写用户有权访问的一切。因此必须声明权限 `extension: ["full-trust"]`，用户在授权时明确确认。会话、Turn、任务与审批的事实仍只归 Magi 内核所有，扩展只能通过钩子的返回值影响它们。
 
-## 5. 打包与分发
+## 5. 模型工具
+
+声明工具需要三处一致：`contributions.tools` 条目、覆盖该工具 ID 的 `tools` 权限、`extension/index.mjs` 里的 `api.tool` 绑定。包必须同时声明 `extension`（只提供工具时 `hooks` 可为空数组）。
+
+```json
+"permissions": [
+  { "kind": "extension", "scope": "application", "targets": ["full-trust"] },
+  { "kind": "tools", "scope": "application", "targets": ["word-count"] }
+],
+"extension": { "hooks": [] },
+"contributions": { "tools": [{
+  "id": "word-count", "title": "字数统计", "description": "统计文本的词数",
+  "readOnly": true,
+  "inputSchema": { "type": "object", "required": ["text"], "properties": { "text": { "type": "string" } }, "additionalProperties": false }
+}] }
+```
+
+```js
+export default async function activate(api) {
+  await api.tool('word-count', async (input, ctx) => ({ words: input.text.split(/\s+/).filter(Boolean).length }));
+}
+```
+
+- 模型看到的工具名由宿主生成（`plugin__…`），不要依赖它。参数先按 `inputSchema` 校验，不合法的调用不会到达你的代码。
+- `readOnly` 决定审批：只读工具在只读模式下可用；非只读工具在“逐次询问”下需要用户批准，在“只读”下被拒绝。
+- 处理器返回的值（任意 JSON）作为工具输出；抛出的错误会作为工具失败返回给模型，不是协议错误。单次调用上限 60 秒，超时后 `ctx.signal` 中止。
+- 工具通过用户授权的 `tools` 权限才对模型可见；停用、撤权或宿主不可用时目录中不再出现或调用失败。
+
+## 6. 打包与分发
 
 把插件目录打成 ZIP（根目录即包根，不要多套一层文件夹）。仓库提供 `scripts/pack-plugin.mjs`，输出可重现的 ZIP：
 
@@ -91,6 +120,6 @@ node scripts/pack-plugin.mjs <插件目录> <输出.zip>
 
 用户在设置 → 插件中安装本地包，安装前会预览权限与版本差异，并把确认绑定到包摘要。官方插件中心与自建目录使用签名目录（序号、过期时间、吊销列表），详见插件中心说明。
 
-## 6. 升级
+## 7. 升级
 
 升级会保留各作用域的启用意愿，但清空授权与激活，用户须对新包重新授权。已有持久数据时，`dataSchemaVersion` 变化会被拒绝，目前没有数据转换通道。

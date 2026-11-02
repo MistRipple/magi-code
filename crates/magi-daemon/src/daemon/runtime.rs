@@ -1442,6 +1442,11 @@ impl DaemonRuntime {
             .with_knowledge_store(self.knowledge_store.clone())
             .with_external_tool_catalog_provider(external_tool_catalog_provider)
             .with_external_mcp_tool_executor(external_mcp_tool_executor)
+            .with_plugin_tools(
+                self.plugins.tool_catalog_provider(),
+                self.plugins
+                    .tool_executor(tokio::runtime::Handle::current()),
+            )
             .with_agent_role_catalog_provider(agent_role_catalog_provider)
             .with_image_generation_runtime(
                 image_generation_executor,

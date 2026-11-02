@@ -287,6 +287,16 @@ impl ExtensionBus {
         true
     }
 
+    /// 运行中的宿主实例（供工具调用等不经钩子分发的路径使用）。
+    pub fn instance(&self, plugin_id: &str) -> Option<Arc<HostInstance>> {
+        self.slots
+            .read()
+            .expect("slots poisoned")
+            .get(plugin_id)
+            .and_then(|slot| slot.instance.read().expect("instance poisoned").clone())
+            .filter(|instance| instance.is_alive())
+    }
+
     pub fn detach(&self, plugin_id: &str) {
         if let Some(slot) = self.slots.read().expect("slots poisoned").get(plugin_id) {
             *slot.instance.write().expect("instance poisoned") = None;

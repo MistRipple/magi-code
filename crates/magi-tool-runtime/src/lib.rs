@@ -42,10 +42,11 @@ pub use types::{
     ExternalMcpToolExecutor, ExternalToolCatalogEntry, ExternalToolCatalogProvider,
     ExternalToolCatalogSnapshot, GeneratedImageData, GitToolExecutor,
     ImageGenerationExecutionContext, ImageGenerationExecutor, ImageGenerationReadinessProvider,
-    ImageGenerationRequest, RuntimeCapabilityDependencyEntry, RuntimeCapabilityDependencyProvider,
-    ToolCallerScope, ToolExecutionContext, ToolExecutionContextQuery, ToolExecutionInput,
-    ToolExecutionOutput, ToolExecutionPolicy, ToolExecutionProgress, ToolExecutionSummary,
-    ToolInvocationRecord, ToolNameRejection, ToolRuntimeResources, WriteProtectionScope,
+    ImageGenerationRequest, PluginToolCatalogEntry, PluginToolCatalogProvider, PluginToolExecutor,
+    RuntimeCapabilityDependencyEntry, RuntimeCapabilityDependencyProvider, ToolCallerScope,
+    ToolExecutionContext, ToolExecutionContextQuery, ToolExecutionInput, ToolExecutionOutput,
+    ToolExecutionPolicy, ToolExecutionProgress, ToolExecutionSummary, ToolInvocationRecord,
+    ToolNameRejection, ToolRuntimeResources, WriteProtectionScope,
 };
 
 #[cfg(test)]

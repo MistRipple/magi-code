@@ -413,3 +413,53 @@ async fn a_host_that_exits_before_connecting_fails_fast_instead_of_waiting_for_t
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn tools_are_invoked_through_the_real_host_and_failures_stay_tool_results() {
+    let mut env = env("tools", Vec::new());
+    env.config.tools = vec!["echo".into(), "slow".into(), "boom".into()];
+    let bus = ExtensionBus::new(BusPolicy::default());
+    bus.register_plugin("acme.guard", &[]).unwrap();
+    let instance = up(&env, &bus).await;
+    assert!(instance.is_tool_bound("echo"));
+    let ctx = json!({"invocationId": "inv-1"});
+    let ok = instance
+        .invoke_tool("echo", json!({"a": 1}), ctx.clone(), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(ok["output"]["echoed"], json!({"a": 1}));
+    assert_eq!(ok["output"]["invocation"], "inv-1");
+    let failed = instance
+        .invoke_tool("boom", json!({}), ctx.clone(), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(failed["isError"], true);
+    assert!(failed["output"].as_str().unwrap().contains("boom failed"));
+    // 超时：宿主收到取消信号，调用返回 DeadlineExceeded。
+    let slow = instance
+        .invoke_tool("slow", json!({}), ctx, Duration::from_millis(300))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        slow.kind(),
+        magi_extension_host::protocol::ErrorKind::DeadlineExceeded
+    );
+    // 未绑定的工具不会被分发。
+    assert!(
+        instance
+            .invoke_tool("missing", json!({}), json!({}), Duration::from_secs(1))
+            .await
+            .is_err()
+    );
+    instance.stop().await;
+}
+
+#[tokio::test]
+async fn registering_an_unapproved_tool_fails_activation() {
+    let mut env = env("tools", Vec::new());
+    env.config.tools = vec!["echo".into()];
+    let bus = ExtensionBus::new(BusPolicy::default());
+    bus.register_plugin("acme.guard", &[]).unwrap();
+    let error = launch(&env.group, env.config.clone(), 1).await.err();
+    assert!(error.is_some(), "未获批的工具注册必须使激活失败");
+}

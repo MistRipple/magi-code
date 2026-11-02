@@ -66,6 +66,16 @@ impl Default for PluginManagerState {
     }
 }
 
+/// 已通过目录、授权和参数校验、可以交给扩展宿主执行的工具调用。
+#[derive(Clone, Debug)]
+pub struct PreparedToolCall {
+    pub plugin_id: String,
+    /// 校验时的包摘要；执行方据此确认宿主仍是同一版本。
+    pub digest: String,
+    pub tool: magi_app_server_protocol::PluginToolContribution,
+    pub input: serde_json::Value,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActivePlugin {
     pub id: String,
@@ -608,6 +618,73 @@ impl PluginManager {
             .iter()
             .map(|package| package.manifest().clone())
             .collect())
+    }
+
+    /// 模型可见且可执行的工具目录：只含已获 `tools` 授权的贡献。目录与执行
+    /// （[`PluginManager::prepare_tool_call`]）使用同一判定，不向模型暴露必然被拒绝的工具。
+    pub fn tool_contributions_for_scope(
+        &self,
+        scope: &str,
+    ) -> Result<
+        Vec<(
+            PluginManifest,
+            magi_app_server_protocol::PluginToolContribution,
+        )>,
+        PluginError,
+    > {
+        let mut tools = Vec::new();
+        for package in self.active_packages(scope)? {
+            let manifest = package.manifest();
+            for tool in &manifest.contributions.tools {
+                if self.permission_allowed(
+                    &manifest.id,
+                    scope,
+                    PluginPermissionKind::Tools,
+                    &tool.id,
+                )? {
+                    tools.push((manifest.clone(), tool.clone()));
+                }
+            }
+        }
+        Ok(tools)
+    }
+
+    /// 解析并校验一次模型发起的工具调用：工具必须在当前作用域的目录内，参数必须是
+    /// 合法 JSON 且符合插件声明的 `inputSchema`。校验失败时不会启动任何扩展调用。
+    pub fn prepare_tool_call(
+        &self,
+        scope: &str,
+        model_tool_name: &str,
+        arguments: &str,
+    ) -> Result<PreparedToolCall, PluginError> {
+        let (manifest, tool) = self
+            .tool_contributions_for_scope(scope)?
+            .into_iter()
+            .find(|(manifest, tool)| {
+                crate::model_tool_name(&manifest.id, &tool.id) == model_tool_name
+            })
+            .ok_or_else(|| PluginError::NotFound("插件工具未激活或未授权".into()))?;
+        let digest = self.package(&manifest.id)?.digest().to_owned();
+        // 部分模型对无参数工具发送空字符串，按空对象处理。
+        let input: serde_json::Value = if arguments.trim().is_empty() {
+            serde_json::Value::Object(Default::default())
+        } else {
+            serde_json::from_str(arguments)
+                .map_err(|_| PluginError::InvalidInput("工具参数不是合法 JSON".into()))?
+        };
+        let validator = jsonschema::validator_for(&tool.input_schema)
+            .map_err(|error| invalid(format!("插件工具 schema 无效：{error}")))?;
+        if !validator.is_valid(&input) {
+            return Err(PluginError::InvalidInput(
+                "工具参数不符合插件声明的 inputSchema".into(),
+            ));
+        }
+        Ok(PreparedToolCall {
+            plugin_id: manifest.id,
+            digest,
+            tool,
+            input,
+        })
     }
 
     pub fn projection(&self) -> Result<PluginList, PluginError> {

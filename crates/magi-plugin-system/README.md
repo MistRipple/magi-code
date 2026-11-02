@@ -2,7 +2,7 @@
 
 本 crate 属于 daemon 的插件领域，不是第二套 Agent 或界面宿主。插件的可执行部分只有受信 Node 扩展，由 [`magi-extension-host`](../magi-extension-host) 承载；会话/任务/权限继续由原生领域服务持有。SDK 1（QuickJS 后台）已移除：`sdkVersion: 1` 或声明 `backend` 的包在校验阶段被明确拒绝。
 
-这里拥有：不可变发布包读取与校验、daemon 唯一的安装/升级/授权/启用/激活/释放状态服务、版本化资源存储、已签名插件目录与插件设置 API、视图资源入口和右栏隔离 iframe 承载。插件提供的模型工具、会话命令、工作流、会话引擎和数据格式迁移已随 QuickJS 删除，尚未在 Node 上重建；清单里不能声明它们。
+这里拥有：不可变发布包读取与校验、daemon 唯一的安装/升级/授权/启用/激活/释放状态服务、版本化资源存储、已签名插件目录与插件设置 API、视图资源入口和右栏隔离 iframe 承载。插件提供的模型工具由 Node 扩展承载（`contributions.tools`，需 `extension` 与覆盖该工具的 `tools` 权限；目录与参数校验在这里，执行在 `magi-extension-host`）。会话命令、工作流、会话引擎和数据格式迁移已随 QuickJS 删除，尚未在 Node 上重建；清单里不能声明它们。
 
 ## 唯一合同
 

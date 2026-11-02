@@ -304,6 +304,14 @@ impl ExtensionRuntime {
         config.version = package.manifest().version.clone();
         config.digest = digest.clone();
         config.hooks = hooks;
+        // 激活意味着清单声明的权限已全部授权，因此声明的工具都已获 `tools` 授权。
+        config.tools = package
+            .manifest()
+            .contributions
+            .tools
+            .iter()
+            .map(|tool| tool.id.clone())
+            .collect();
         config.grants = vec!["extension:full-trust".into()];
         config.config = serde_json::json!({});
         let supervisor = supervise(
@@ -524,6 +532,132 @@ export default async function activate(api) {
 
     fn call(command: &str) -> serde_json::Value {
         json!({"input": {"command": command}})
+    }
+
+    const TOOL_ENTRY: &str = r#"
+export default async function activate(api) {
+  await api.tool('echo', async (input) => ({ echoed: input.text }));
+  await api.tool('boom', async () => { throw new Error('工具失败'); });
+}
+"#;
+
+    fn tool_package() -> PluginPackage {
+        let manifest: PluginManifest = serde_json::from_value(json!({
+            "sdkVersion": 2, "id": "acme.guard", "version": "1.0.0", "name": "Tools", "description": "",
+            "extension": {"hooks": []},
+            "permissions": [
+                {"kind": "extension", "scope": "application", "targets": ["full-trust"]},
+                {"kind": "tools", "scope": "application", "targets": ["echo", "boom"]}
+            ],
+            "dataSchemaVersion": 1,
+            "settingsSchema": {"type": "object", "additionalProperties": false},
+            "contributions": {"tools": [
+                {"id": "echo", "title": "Echo", "description": "回显", "readOnly": true,
+                 "inputSchema": {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}, "additionalProperties": false}},
+                {"id": "boom", "title": "Boom", "description": "总是失败", "readOnly": true,
+                 "inputSchema": {"type": "object"}}
+            ]}
+        }))
+        .unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes) in [
+            ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
+            ("extension/index.mjs", TOOL_ENTRY.as_bytes().to_vec()),
+        ] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_tools_are_listed_only_when_authorized_and_execute_through_the_real_host() {
+        use super::super::plugin_bridge::execute_tool;
+        use magi_core::ExecutionResultStatus::{Failed, Rejected, Succeeded};
+        let fixture = fixture(Some(test_node()));
+        let package = tool_package();
+        {
+            let mut manager = fixture.manager.lock().unwrap();
+            manager
+                .install(
+                    &package,
+                    PluginSource::Local {
+                        name: "t.zip".into(),
+                    },
+                )
+                .unwrap();
+            manager.enable("acme.guard", "application").unwrap();
+            // 未授权时目录为空，也无法执行。
+            assert!(
+                manager
+                    .tool_contributions_for_scope("application")
+                    .unwrap()
+                    .is_empty()
+            );
+            manager
+                .authorize(
+                    "acme.guard",
+                    "application",
+                    package.manifest().permissions.clone(),
+                )
+                .unwrap();
+            manager.activate("acme.guard", "application").unwrap();
+            assert_eq!(
+                manager
+                    .tool_contributions_for_scope("application")
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+        fixture.runtime.reconcile().await;
+        fixture
+            .runtime
+            .running
+            .lock()
+            .await
+            .get("acme.guard")
+            .and_then(|entry| entry.supervisor.as_ref())
+            .expect("已启动监管")
+            .wait_for(|state| matches!(state, SupervisorState::Running { .. }))
+            .await;
+
+        let handle = tokio::runtime::Handle::current();
+        let manager = Arc::clone(&fixture.manager);
+        let bus = Arc::clone(&fixture.bus);
+        let echo = magi_plugin_system::model_tool_name("acme.guard", "echo");
+        let boom = magi_plugin_system::model_tool_name("acme.guard", "boom");
+        let run = move |name: String, args: &'static str| {
+            let (manager, bus, handle) = (Arc::clone(&manager), Arc::clone(&bus), handle.clone());
+            tokio::task::spawn_blocking(move || {
+                execute_tool(
+                    &manager,
+                    &bus,
+                    &handle,
+                    &name,
+                    args,
+                    &magi_tool_runtime::ToolExecutionContext::default(),
+                )
+            })
+        };
+        let (ok, status) = run(echo.clone(), r#"{"text":"hi"}"#).await.unwrap();
+        assert_eq!(status, Succeeded, "{ok}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ok).unwrap()["output"]["echoed"],
+            "hi"
+        );
+        // 参数不符合 inputSchema：不会到达宿主。
+        let (_, status) = run(echo, r#"{"text":1}"#).await.unwrap();
+        assert_eq!(status, Rejected);
+        // 工具抛错是模型可见的工具失败。
+        let (failed, status) = run(boom, "{}").await.unwrap();
+        assert_eq!(status, Failed);
+        assert!(failed.contains("工具失败"), "{failed}");
+        // 未知工具名被拒绝。
+        let (_, status) = run("plugin__nope".into(), "{}").await.unwrap();
+        assert_eq!(status, Rejected);
     }
 
     #[tokio::test]

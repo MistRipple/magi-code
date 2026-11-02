@@ -10776,6 +10776,128 @@ fn file_read_ranges_preserve_line_numbers_utf8_and_full_content_version() {
 }
 
 #[test]
+fn plugin_side_effect_tools_share_the_mcp_approval_resume_contract() {
+    use crate::{PluginToolCatalogEntry, PluginToolCatalogProvider, PluginToolExecutor};
+    let entry = |name: &str, read_only: bool| PluginToolCatalogEntry {
+        plugin_id: "acme.tools".into(),
+        contribution_id: name.into(),
+        model_tool_name: format!("plugin__acme.tools__{name}"),
+        title: name.into(),
+        description: String::new(),
+        input_schema: serde_json::json!({"type": "object"}),
+        read_only,
+    };
+    let catalog_calls = Arc::new(AtomicUsize::new(0));
+    let catalog_counter = catalog_calls.clone();
+    let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let active = enabled.clone();
+    let provider: PluginToolCatalogProvider = Arc::new(move || {
+        catalog_counter.fetch_add(1, Ordering::SeqCst);
+        if active.load(Ordering::SeqCst) {
+            vec![entry("read", true), entry("write", false)]
+        } else {
+            Vec::new()
+        }
+    });
+    let executor: PluginToolExecutor = Arc::new(|_, _, _| {
+        (
+            "{\"ran\":true}".to_string(),
+            ExecutionResultStatus::Succeeded,
+        )
+    });
+    let registry = make_registry().with_plugin_tools(provider, executor);
+    let context = test_workspace_context();
+    let call = |name: &str, profile| {
+        registry
+            .execute_plugin_tool(
+                &format!("plugin__acme.tools__{name}"),
+                "{}",
+                &context,
+                profile,
+            )
+            .expect("plugin tool is in the catalog")
+    };
+
+    let (_, status) = call("read", magi_core::AccessProfile::ReadOnly);
+    assert_eq!(status, ExecutionResultStatus::Succeeded);
+
+    for (access_profile, availability) in [
+        (magi_core::AccessProfile::ReadOnly, "denied"),
+        (magi_core::AccessProfile::Restricted, "needs_approval"),
+        (magi_core::AccessProfile::FullAccess, "available"),
+    ] {
+        let before = catalog_calls.load(Ordering::SeqCst);
+        let catalog = registry.tool_catalog_value(
+            "{}",
+            &ToolExecutionContext {
+                access_profile,
+                ..context.clone()
+            },
+        );
+        let plugins = catalog["plugin_tools"].as_array().unwrap();
+        assert_eq!(catalog["external_catalog_status"], "available");
+        assert_eq!(plugins[0]["availability"], "available");
+        assert_eq!(plugins[1]["availability"], availability);
+        assert_eq!(plugins[1]["model_available"], availability != "denied");
+        assert_eq!(
+            catalog_calls.load(Ordering::SeqCst) - before,
+            1,
+            "每次目录读取只取得一个插件快照"
+        );
+    }
+
+    let (payload, status) = call("write", magi_core::AccessProfile::Restricted);
+    assert_eq!(status, ExecutionResultStatus::NeedsApproval);
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        payload["approval_resume_safe"], true,
+        "审批续跑合同要求回执声明可安全重放，否则授权后会被判为契约失败"
+    );
+
+    let (_, status) = call("write", magi_core::AccessProfile::ReadOnly);
+    assert_eq!(status, ExecutionResultStatus::Rejected);
+    let (payload, status) = call("write", magi_core::AccessProfile::FullAccess);
+    assert_eq!(status, ExecutionResultStatus::Succeeded);
+    assert_eq!(payload, "{\"ran\":true}");
+
+    assert!(
+        registry
+            .execute_plugin_tool(
+                "plugin__other__tool",
+                "{}",
+                &context,
+                magi_core::AccessProfile::FullAccess
+            )
+            .is_none(),
+        "不在目录内的名称不属于插件工具"
+    );
+    let before = catalog_calls.load(Ordering::SeqCst);
+    let disabled = registry.tool_catalog_value(r#"{"include_external":false}"#, &context);
+    assert_eq!(disabled["plugin_tools"], serde_json::json!([]));
+    assert_eq!(
+        catalog_calls.load(Ordering::SeqCst),
+        before,
+        "关闭外部目录不能加载插件"
+    );
+    enabled.store(false, Ordering::SeqCst);
+    assert_eq!(
+        registry.tool_catalog_value("{}", &context)["plugin_tools"],
+        serde_json::json!([])
+    );
+    assert!(
+        registry
+            .execute_plugin_tool(
+                "plugin__acme.tools__read",
+                "{}",
+                &context,
+                magi_core::AccessProfile::FullAccess
+            )
+            .is_none(),
+        "停用后旧目录不授权新调用"
+    );
+}
+
+#[test]
 fn tool_name_scope_keeps_deny_only_inheritance_and_closed_empty_distinct() {
     let policy = crate::ToolExecutionPolicy {
         denied_tool_names: vec!["file_remove".into()],

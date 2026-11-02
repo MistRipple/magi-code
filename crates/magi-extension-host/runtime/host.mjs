@@ -31,6 +31,7 @@ const pending = new Map();
 let generation = null;
 let configValues = null;
 const handlers = new Map(); // hook name -> handler
+const toolHandlers = new Map(); // tool id -> handler
 const inflight = new Map(); // invocationId -> AbortController
 
 function send(message) {
@@ -73,6 +74,25 @@ async function handleRequest(id, method, params) {
       try {
         const result = await handler(params.input, { ...ctx, signal: controller.signal });
         return send({ id, result: normalizeDecision(result) });
+      } finally {
+        inflight.delete(ctx.invocationId);
+      }
+    }
+    if (method === 'tool.invoke') {
+      const ctx = params?.ctx ?? {};
+      if (generation !== null && ctx.generation !== generation) {
+        return send({ id, error: rpcError('StaleGeneration', '实例代次不符') });
+      }
+      const handler = toolHandlers.get(params.tool);
+      if (!handler) return send({ id, error: rpcError('MethodNotFound', `工具 ${params.tool} 未绑定`) });
+      const controller = new AbortController();
+      inflight.set(ctx.invocationId, controller);
+      try {
+        const output = await handler(params.input, { ...ctx, signal: controller.signal });
+        return send({ id, result: { output: output === undefined ? null : output } });
+      } catch (error) {
+        // 工具自身抛出的错误是模型可见的工具失败，不是协议错误。
+        return send({ id, result: { isError: true, output: String(error?.message ?? error).slice(0, 4096) } });
       } finally {
         inflight.delete(ctx.invocationId);
       }
@@ -135,6 +155,12 @@ const api = Object.freeze({
     if (typeof handler !== 'function') throw new TypeError('handler 必须是函数');
     await request('register.hook', { name: hook });
     handlers.set(hook, handler);
+  },
+  /** 绑定工具处理器；工具必须已在清单中声明并获得 `tools` 授权。 */
+  async tool(id, handler) {
+    if (typeof handler !== 'function') throw new TypeError('handler 必须是函数');
+    await request('register.tool', { name: id });
+    toolHandlers.set(id, handler);
   },
   log(message) {
     send({ method: 'host.log', params: { message: String(message).slice(0, 4096) } });

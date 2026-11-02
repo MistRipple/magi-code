@@ -178,7 +178,10 @@ pub(crate) fn refresh_live_mcp_tool_definitions_with_mode(
         denied_tools,
         include_external,
     } = input;
-    definitions.retain(|definition| !definition.function.name.starts_with("mcp__"));
+    definitions.retain(|definition| {
+        !definition.function.name.starts_with("mcp__")
+            && !definition.function.name.starts_with("plugin__")
+    });
     let skill_allowed_tools = active_skill_allowed_tools(skill_runtime, active_skill_id);
     if include_external {
         for tool in tool_registry.external_tool_catalog_snapshot().mcp_tools {
@@ -228,6 +231,42 @@ pub(crate) fn refresh_live_mcp_tool_definitions_with_mode(
                 origin: ChatToolOrigin::ExternalMcp,
             });
         }
+    }
+    for tool in tool_registry.plugin_tool_catalog() {
+        if magi_tool_runtime::external_tool_access_decision(tool.read_only, access_profile)
+            == Some(ExecutionResultStatus::Rejected)
+            || denied_tools
+                .iter()
+                .any(|denied| denied == &tool.model_tool_name)
+            || allowed_tools
+                .is_some_and(|allowed| !allowed.iter().any(|name| name == &tool.model_tool_name))
+            || skill_allowed_tools
+                .as_ref()
+                .is_some_and(|allowed| !allowed.iter().any(|name| name == &tool.model_tool_name))
+            || definitions
+                .iter()
+                .any(|definition| definition.function.name == tool.model_tool_name)
+        {
+            continue;
+        }
+        let parameters = if tool.input_schema.is_object() {
+            tool.input_schema
+        } else {
+            serde_json::json!({ "type": "object", "properties": {} })
+        };
+        definitions.push(ChatToolDefinition {
+            kind: "function".to_string(),
+            function: ChatToolFunctionDefinition {
+                name: tool.model_tool_name,
+                description: if tool.description.trim().is_empty() {
+                    tool.title
+                } else {
+                    tool.description
+                },
+                parameters,
+            },
+            origin: ChatToolOrigin::Plugin,
+        });
     }
     definitions
 }

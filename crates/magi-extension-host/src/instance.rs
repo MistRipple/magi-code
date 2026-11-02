@@ -37,6 +37,8 @@ pub struct LaunchConfig {
     pub grants: Vec<String>,
     /// 清单声明并获批的钩子。
     pub hooks: Vec<HookRegistration>,
+    /// 清单声明且已获 `tools` 授权的工具 ID；宿主只能绑定其中的工具。
+    pub tools: Vec<String>,
     pub config: Value,
     pub connect_timeout: Duration,
     pub handshake_timeout: Duration,
@@ -61,6 +63,7 @@ impl LaunchConfig {
             digest: String::new(),
             grants: Vec::new(),
             hooks: Vec::new(),
+            tools: Vec::new(),
             config: Value::Null,
             connect_timeout: Duration::from_secs(15),
             handshake_timeout: Duration::from_secs(5),
@@ -104,6 +107,7 @@ pub struct HostInstance {
     pub(crate) peer: Peer,
     approved: HashMap<String, ApprovedHook>,
     bound: Arc<Mutex<HashSet<String>>>,
+    bound_tools: Arc<Mutex<HashSet<String>>>,
     stop: Arc<Notify>,
     exited: watch::Receiver<bool>,
 }
@@ -119,6 +123,53 @@ impl HostInstance {
             .lock()
             .expect("bound lock poisoned")
             .contains(hook)
+    }
+
+    /// 宿主已通过 `register.tool` 绑定处理器的工具才可被调用。
+    pub fn is_tool_bound(&self, tool: &str) -> bool {
+        self.bound_tools
+            .lock()
+            .expect("bound tools lock poisoned")
+            .contains(tool)
+    }
+
+    /// 向宿主发起一次工具调用。超时时通知宿主取消并返回 `DeadlineExceeded`。
+    pub async fn invoke_tool(
+        &self,
+        tool: &str,
+        input: Value,
+        ctx: Value,
+        timeout: Duration,
+    ) -> Result<Value, RpcError> {
+        if !self.is_tool_bound(tool) {
+            return Err(RpcError::new(
+                ErrorKind::MethodNotFound,
+                format!("工具 {tool} 未被宿主绑定"),
+            ));
+        }
+        let invocation_id = ctx
+            .get("invocationId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let mut ctx = ctx;
+        ctx["generation"] = json!(self.generation);
+        ctx["deadlineMs"] = json!(timeout.as_millis() as u64);
+        let result = self
+            .peer
+            .request(
+                "tool.invoke",
+                json!({"tool": tool, "ctx": ctx, "input": input}),
+                timeout,
+            )
+            .await;
+        if matches!(&result, Err(e) if e.kind() == ErrorKind::DeadlineExceeded) {
+            let _ = self.peer.notify(
+                "host.cancel",
+                json!({"invocationId": invocation_id, "reason": "deadline"}),
+            );
+        }
+        result
     }
 
     pub fn is_alive(&self) -> bool {
@@ -164,6 +215,8 @@ struct HostHandler {
     plugin_id: String,
     approved: HashMap<String, ApprovedHook>,
     bound: Arc<Mutex<HashSet<String>>>,
+    approved_tools: HashSet<String>,
+    bound_tools: Arc<Mutex<HashSet<String>>>,
     ready: watch::Sender<bool>,
 }
 
@@ -185,6 +238,24 @@ impl Incoming for HostHandler {
                     Err(RpcError::new(
                         ErrorKind::RegistrationDenied,
                         format!("钩子 {name} 未在清单中声明或未获批准"),
+                    ))
+                }
+            }
+            "register.tool" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if self.approved_tools.contains(name) {
+                    self.bound_tools
+                        .lock()
+                        .expect("bound tools lock poisoned")
+                        .insert(name.to_string());
+                    Ok(json!({}))
+                } else {
+                    Err(RpcError::new(
+                        ErrorKind::RegistrationDenied,
+                        format!("工具 {name} 未在清单中声明或未获授权"),
                     ))
                 }
             }
@@ -341,11 +412,14 @@ pub async fn launch(
     }
 
     let bound: Arc<Mutex<HashSet<String>>> = Arc::default();
+    let bound_tools: Arc<Mutex<HashSet<String>>> = Arc::default();
     let (ready_tx, mut ready_rx) = watch::channel(false);
     let handler = Arc::new(HostHandler {
         plugin_id: config.plugin_id.clone(),
         approved: approved.clone(),
         bound: Arc::clone(&bound),
+        approved_tools: config.tools.iter().cloned().collect(),
+        bound_tools: Arc::clone(&bound_tools),
         ready: ready_tx,
     });
     let peer = Peer::spawn(stream, handler, config.limits);
@@ -371,6 +445,7 @@ pub async fn launch(
         peer,
         approved,
         bound,
+        bound_tools,
         stop,
         exited: exited_rx,
     }))
@@ -426,7 +501,7 @@ where
                     "frameBytes": limit, "pending": config.limits.pending,
                 },
                 "grants": config.grants,
-                "registrations": {"hooks": registrations},
+                "registrations": {"hooks": registrations, "tools": config.tools},
                 "config": {"revision": 1, "values": config.config},
                 "features": features,
             });

@@ -683,6 +683,14 @@ export interface PluginSkillContribution {
   instruction: string;
 }
 
+export interface PluginToolContribution {
+  id: string;
+  title: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  readOnly: boolean;
+}
+
 export type PluginViewPlacement = "settings" | "home" | "main" | "rightPane" | "homeCard";
 
 export interface PluginViewContribution {
@@ -715,6 +723,7 @@ export interface PluginNamedContribution {
 
 export interface PluginContributions {
   skills?: Array<PluginSkillContribution>;
+  tools?: Array<PluginToolContribution>;
   views?: Array<PluginViewContribution>;
   resources?: Array<PluginNamedContribution>;
   browserSurfaces?: Array<PluginBrowserSurfaceContribution>;

@@ -279,6 +279,8 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 运行状态进界面：`cargo test -p magi-daemon --lib extension_runtime`（状态映射、随生命周期变化并通知界面、缺少 Node 时可见为失败并列出被阻止的 guard）、`cargo test -p magi-api --lib plugin_list_merges`（列表与变更操作返回都合并运行状态且不另存）；**真实浏览器验收（macOS，内置浏览器，release 构建的 daemon + 固定版本 Node，隔离状态目录）已做**：经真实 API 安装、授权、激活一个声明 guard/advise/observe 与 `contextRewrite` 的扩展包；缺少 Node 时详情页显示“不可用”、原因与被阻止动作；随包 Node 就绪后重启 daemon 自动拉起并显示“运行中”；杀掉宿主进程后页面不刷新地依次显示“重启中（已崩溃 N 次）→启动中→运行中”，列表项警示标记同步出现/消失；连续崩溃超过阈值后显示“不可用”、停止自动重启与原因，点击“停用”后阻止提示消失，再“授权并激活”回到“运行中”；浅色、深色、375px 窄屏均无横向溢出且长文本换行。未覆盖：Windows/Linux、真实 Electron、真实对话里 guard 阻止工具调用的人工路径（由测试覆盖）。
 
+扩展工具：`cargo test -p magi-extension-host --test host tools`（真实 Node：绑定、输出、抛错作为工具失败、超时取消、未批准工具注册使激活失败）、`cargo test -p magi-daemon --lib extension_tools`（授权前目录为空、授权后可见、参数校验拒绝、工具失败回执、未知工具拒绝）、`cargo test -p magi-tool-runtime plugin_side_effect`（与 MCP 相同的访问档位与审批续跑合同）、`cargo test -p magi-plugin-system --test package extension_tools`（清单校验）。未覆盖：真实模型回合里的调用、Windows、Turn/任务取消令牌的传播。
+
 钩子接线：`cargo test -p magi-extension-host`（目录与已接线模式）、`cargo test -p magi-conversation-runtime --lib extension_hooks`（子代理 guard、改写重新校验）、`model_step_notifies_observers_after_commit_without_prompt_content`（模型观察）、`cargo test -p magi-daemon --lib extension_bridge`（真实 Node 扩展经 input/subagent.spawn guard 与领域事件转发的完整链路）、`cargo test -p magi-api --lib blocked_input_is_rejected`（被阻止的输入不留任何会话或 Turn 事实）。
 
 随包 Node：`node apps/desktop/scripts/node-runtime.mjs stage <目录>` 下载固定版本、校验归档摘要并在清空环境下执行校验；打包时 afterPack 对最终制品再做同样的执行校验（清单必须含该文件与版本）。以 `MAGI_EXTENSION_NODE` 指向该 Node 运行 `cargo test -p magi-extension-host --test host` 与 `cargo test -p magi-daemon --lib extension` 已在 macOS 通过；其余钩子未接线；macOS 以外平台未运行。

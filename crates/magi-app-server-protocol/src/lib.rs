@@ -45,7 +45,7 @@ pub use generated::{
     PluginAuthorizeRequest, PluginContributions, PluginInstallRequest, PluginInstalled, PluginList,
     PluginManifest, PluginNamedContribution, PluginPermission, PluginPermissionKind,
     PluginResource, PluginResourceWriteRequest, PluginScopeGrant, PluginScopeKind,
-    PluginScopeRequest, PluginViewContribution, PluginViewPlacement,
+    PluginScopeRequest, PluginToolContribution, PluginViewContribution, PluginViewPlacement,
 };
 
 pub use generated::{
