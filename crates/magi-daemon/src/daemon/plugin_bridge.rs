@@ -35,6 +35,8 @@ pub(super) struct PluginServices {
     manager: Arc<Mutex<PluginManager>>,
     host: PluginHost,
     handler: Arc<PluginCapabilityHandler>,
+    /// 受信扩展钩子的唯一分发入口。目前没有插件管理流程向它登记扩展，因此总线为空。
+    extension_bus: Arc<magi_extension_host::bus::ExtensionBus>,
 }
 
 impl PluginServices {
@@ -53,7 +55,12 @@ impl PluginServices {
                 event_bus,
             }),
             manager,
+            extension_bus: Arc::default(),
         })
+    }
+
+    pub(super) fn extension_bus(&self) -> Arc<magi_extension_host::bus::ExtensionBus> {
+        Arc::clone(&self.extension_bus)
     }
 
     pub(super) fn manager(&self) -> Arc<Mutex<PluginManager>> {

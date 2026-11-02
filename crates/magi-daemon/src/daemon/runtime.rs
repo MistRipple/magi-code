@@ -1768,6 +1768,11 @@ impl DaemonRuntime {
         let workflow_core_factory = self.plugins.workflow_core_factory()?;
 
         let plugin_command_executor = self.plugins.command_executor();
+        let extension_tool_hooks: Arc<dyn magi_conversation_runtime::tool_hooks::ToolHooks> =
+            Arc::new(super::extension_bridge::ExtensionToolHooks::new(
+                self.plugins.extension_bus(),
+                tokio::runtime::Handle::current(),
+            ));
         let mut llm_task_dispatcher = llm_task_dispatcher;
         llm_task_dispatcher = llm_task_dispatcher
             .with_session_engine_factory(session_engine_factory)
@@ -1792,7 +1797,8 @@ impl DaemonRuntime {
                 .with_tool_registry(tool_registry_for_dispatcher)
                 .with_skill_runtime(app_skill_runtime)
                 .with_snapshot_manager(state.snapshot_manager.clone())
-                .with_workspace_execution_preparer(magi_api::workspace_execution_preparer(&state)),
+                .with_workspace_execution_preparer(magi_api::workspace_execution_preparer(&state))
+                .with_tool_hooks(extension_tool_hooks),
         );
         let session_turn_dispatcher = llm_task_dispatcher.clone();
         state = state

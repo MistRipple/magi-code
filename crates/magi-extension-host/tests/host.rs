@@ -89,7 +89,11 @@ async fn guard_blocks_rewrites_and_continues_through_a_real_node_host() {
     assert_eq!(instance.generation, 1);
 
     let blocked = bus
-        .invoke("tool.call", &ctx(), json!({"command": "rm -rf /"}))
+        .invoke(
+            "tool.call",
+            &ctx(),
+            json!({"input": {"command": "rm -rf /"}}),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -101,10 +105,13 @@ async fn guard_blocks_rewrites_and_continues_through_a_real_node_host() {
     );
 
     let ok = bus
-        .invoke("tool.call", &ctx(), json!({"command": "ls"}))
+        .invoke("tool.call", &ctx(), json!({"input": {"command": "ls"}}))
         .await
         .unwrap();
-    assert_eq!(ok.verdict, Verdict::Proceed(json!({"command": "ls"})));
+    assert_eq!(
+        ok.verdict,
+        Verdict::Proceed(json!({"input": {"command": "ls"}}))
+    );
     assert_eq!(ok.trace[0].outcome, TraceOutcome::Continue);
 
     // guard 型钩子可以 replace（tool.call 允许）；候选被改写，仍待原生复核。
@@ -112,18 +119,18 @@ async fn guard_blocks_rewrites_and_continues_through_a_real_node_host() {
         .invoke(
             "tool.call",
             &ctx(),
-            json!({"command": "rewrite", "cwd": "/w"}),
+            json!({"input": {"command": "rewrite", "cwd": "/w"}}),
         )
         .await
         .unwrap();
     assert_eq!(
         rewritten.verdict,
-        Verdict::Proceed(json!({"command": "echo safe", "cwd": "/w"}))
+        Verdict::Proceed(json!({"input": {"command": "echo safe", "cwd": "/w"}}))
     );
 
     // 非法 decision（allow）是协议错误：guard 阻止，而不是放行。
     let bad = bus
-        .invoke("tool.call", &ctx(), json!({"command": "bad"}))
+        .invoke("tool.call", &ctx(), json!({"input": {"command": "bad"}}))
         .await
         .unwrap();
     assert!(matches!(bad.verdict, Verdict::Blocked { .. }), "{bad:?}");
@@ -138,7 +145,7 @@ async fn guard_timeout_cancels_the_extension_and_blocks() {
     let bus = ExtensionBus::new(BusPolicy::default());
     let instance = up(&env, &bus).await;
     let outcome = bus
-        .invoke("tool.call", &ctx(), json!({"command": "slow"}))
+        .invoke("tool.call", &ctx(), json!({"input": {"command": "slow"}}))
         .await
         .unwrap();
     assert!(
@@ -167,7 +174,7 @@ async fn host_crash_blocks_guard_actions_instead_of_defaulting_to_allow() {
     let bus = ExtensionBus::new(BusPolicy::default());
     let instance = up(&env, &bus).await;
     let crashed = bus
-        .invoke("tool.call", &ctx(), json!({"command": "crash"}))
+        .invoke("tool.call", &ctx(), json!({"input": {"command": "crash"}}))
         .await
         .unwrap();
     assert!(
@@ -177,7 +184,7 @@ async fn host_crash_blocks_guard_actions_instead_of_defaulting_to_allow() {
     instance.wait_exit().await;
     // 宿主已不在：登记仍保留，受影响动作继续被阻止。
     let after = bus
-        .invoke("tool.call", &ctx(), json!({"command": "ls"}))
+        .invoke("tool.call", &ctx(), json!({"input": {"command": "ls"}}))
         .await
         .unwrap();
     assert!(
@@ -187,10 +194,13 @@ async fn host_crash_blocks_guard_actions_instead_of_defaulting_to_allow() {
     // 用户显式停用（注销登记）后才按变更后的策略放行。
     bus.unregister_plugin("acme.guard");
     let freed = bus
-        .invoke("tool.call", &ctx(), json!({"command": "ls"}))
+        .invoke("tool.call", &ctx(), json!({"input": {"command": "ls"}}))
         .await
         .unwrap();
-    assert_eq!(freed.verdict, Verdict::Proceed(json!({"command": "ls"})));
+    assert_eq!(
+        freed.verdict,
+        Verdict::Proceed(json!({"input": {"command": "ls"}}))
+    );
 }
 
 #[tokio::test]
@@ -314,26 +324,29 @@ async fn supervisor_restarts_after_a_crash_and_stops_restarting_after_repeated_f
         .await;
 
     // 第一次崩溃：自动重启到下一代，代次递增。
-    bus.invoke("tool.call", &ctx(), json!({"command": "crash"}))
+    bus.invoke("tool.call", &ctx(), json!({"input": {"command": "crash"}}))
         .await
         .unwrap();
     supervisor
         .wait_for(|s| matches!(s, SupervisorState::Running { generation: 2 }))
         .await;
     let healthy = bus
-        .invoke("tool.call", &ctx(), json!({"command": "ls"}))
+        .invoke("tool.call", &ctx(), json!({"input": {"command": "ls"}}))
         .await
         .unwrap();
-    assert_eq!(healthy.verdict, Verdict::Proceed(json!({"command": "ls"})));
+    assert_eq!(
+        healthy.verdict,
+        Verdict::Proceed(json!({"input": {"command": "ls"}}))
+    );
 
     // 反复崩溃超过阈值：停止自动重启，guard 持续阻止。
-    bus.invoke("tool.call", &ctx(), json!({"command": "crash"}))
+    bus.invoke("tool.call", &ctx(), json!({"input": {"command": "crash"}}))
         .await
         .unwrap();
     supervisor
         .wait_for(|s| matches!(s, SupervisorState::Running { generation: 3 }))
         .await;
-    bus.invoke("tool.call", &ctx(), json!({"command": "crash"}))
+    bus.invoke("tool.call", &ctx(), json!({"input": {"command": "crash"}}))
         .await
         .unwrap();
     let state = supervisor
@@ -341,7 +354,7 @@ async fn supervisor_restarts_after_a_crash_and_stops_restarting_after_repeated_f
         .await;
     assert!(matches!(state, SupervisorState::Failed(_)));
     let blocked = bus
-        .invoke("tool.call", &ctx(), json!({"command": "ls"}))
+        .invoke("tool.call", &ctx(), json!({"input": {"command": "ls"}}))
         .await
         .unwrap();
     assert!(matches!(blocked.verdict, Verdict::Blocked { .. }));
@@ -369,7 +382,7 @@ async fn stopping_the_supervisor_terminates_the_host_process() {
     supervisor.stop().await;
     // 停止后宿主不再响应：guard 阻止（登记仍在，直到用户注销）。
     let after = bus
-        .invoke("tool.call", &ctx(), json!({"command": "ls"}))
+        .invoke("tool.call", &ctx(), json!({"input": {"command": "ls"}}))
         .await
         .unwrap();
     assert!(matches!(after.verdict, Verdict::Blocked { .. }));

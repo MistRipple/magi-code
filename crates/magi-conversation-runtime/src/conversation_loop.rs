@@ -173,6 +173,8 @@ pub struct ConversationLoopRequest<'a> {
     pub prepare_workspace: Option<&'a PrepareWorkspace<'a>>,
     pub execution_group_id: Option<String>,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
+    /// 扩展钩子端口（`tool.call` / `tool.result`）；None 表示没有可执行扩展。
+    pub tool_hooks: Option<&'a dyn crate::tool_hooks::ToolHooks>,
 }
 
 fn direct_runtime_error(error: &BridgeClientError, default_message: &str) -> String {
@@ -738,6 +740,7 @@ fn run_conversation_loop_inner(
         prepare_workspace,
         execution_group_id,
         persist_session_state,
+        tool_hooks,
     } = request;
     let execution_guard = crate::task_execution_guard::TaskExecutionGuard::new(
         task_store,
@@ -3175,7 +3178,28 @@ fn run_conversation_loop_inner(
                 "execution_root": workspace_root_path,
             }).to_string(), ExecutionResultStatus::Failed)).collect::<Vec<_>>()
         } else {
-            execute_task_tool_call_batch(
+            // 扩展 `tool.call`：在账本指纹、路径与并发分类、权限和审批之前生效；
+            // 被阻止的调用不进入原生管线，改写后的参数已用本轮工具定义重新校验。
+            let hooked = tool_hooks.map(|hooks| {
+                crate::tool_hooks::prepare_tool_calls(
+                    hooks,
+                    &crate::tool_hooks::ToolHookScope {
+                        session_id: session_id.as_str(),
+                        task_id: task_id.as_str(),
+                        workspace_id: workspace_id.as_ref().map(|id| id.as_str()),
+                        worker_id: turn_visibility.worker_id().map(|id| id.as_str()),
+                        round,
+                    },
+                    &valid_tool_calls,
+                    round_tools.as_deref().unwrap_or_default(),
+                )
+            });
+            let native_calls = hooked
+                .as_ref()
+                .map_or(valid_tool_calls.as_slice(), |hooked| {
+                    hooked.execute.as_slice()
+                });
+            let native_results = execute_task_tool_call_batch(
                 event_bus,
                 tool_registry,
                 agent_role_registry,
@@ -3195,13 +3219,17 @@ fn run_conversation_loop_inner(
                 workspace_root_path.as_ref(),
                 turn_visibility.worker_id(),
                 browser_capability_snapshot,
-                &valid_tool_calls,
+                native_calls,
                 &mut tool_execution_ledger,
                 Some(&tool_progress_callback),
                 workspace_resources.clone(),
                 execution_group_id.clone(),
                 &|| execution_guard.is_active(),
-            )
+            );
+            match hooked {
+                Some(hooked) => hooked.merge(native_results),
+                None => native_results,
+            }
         };
 
         if let Some(writeback_error) = take_task_writeback_error(turn_writeback_context) {
@@ -3327,14 +3355,32 @@ fn run_conversation_loop_inner(
             {
                 activated_skill_this_round = Some(skill_id);
             }
+            // 原始回执已在上方写入 canonical 事实；扩展 `tool.result` 只能改模型可见投影。
+            let mut model_visible =
+                crate::history_projection::project_tool_result(&result, tool_status);
+            if let Some(hooks) = tool_hooks
+                && let Some(replaced) = hooks.tool_result(
+                    &crate::tool_hooks::ToolHookScope {
+                        session_id: session_id.as_str(),
+                        task_id: task_id.as_str(),
+                        workspace_id: workspace_id.as_ref().map(|id| id.as_str()),
+                        worker_id: turn_visibility.worker_id().map(|id| id.as_str()),
+                        round,
+                    },
+                    tool_call,
+                    crate::tool_hooks::ToolResultView {
+                        status: tool_status.wire_label(),
+                        projection: &model_visible,
+                    },
+                )
+            {
+                model_visible = replaced;
+            }
             let tool_result_message = ChatMessage {
                 input_request_id: None,
                 context_origin: Default::default(),
                 role: "tool".to_string(),
-                content: Some(crate::history_projection::project_tool_result(
-                    &result,
-                    tool_status,
-                )),
+                content: Some(model_visible),
                 images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some(tool_call.id.clone()),
@@ -7217,6 +7263,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         assert!(
@@ -7399,6 +7446,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         assert!(
@@ -7656,6 +7704,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -7854,6 +7903,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -8357,6 +8407,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
         (outcome, client.invocations.load(Ordering::SeqCst))
     }
@@ -8435,6 +8486,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -8536,6 +8588,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -8803,6 +8856,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         match outcome {
@@ -8816,6 +8870,261 @@ mod tests {
             }
             other => panic!("optional tool failure must not fail a completed task, got {other:?}"),
         }
+    }
+
+    struct HookedToolModelBridgeClient {
+        command: &'static str,
+        invoke_count: AtomicUsize,
+        tool_message: Mutex<Option<String>>,
+    }
+
+    impl ModelBridgeClient for HookedToolModelBridgeClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<ModelResponse, BridgeClientError> {
+            let index = self.invoke_count.fetch_add(1, Ordering::SeqCst);
+            if index == 0 {
+                return Ok(model_response(serde_json::json!({
+                    "content": null,
+                    "finish_reason": "tool_calls",
+                    "tool_calls": [{
+                        "id": "hooked-call",
+                        "type": "function",
+                        "function": {"name": "hook_probe", "arguments": serde_json::json!({"command": self.command}).to_string()}
+                    }]
+                })));
+            }
+            *self.tool_message.lock().unwrap() = request
+                .messages
+                .iter()
+                .flatten()
+                .find(|message| message.role == "tool")
+                .and_then(|message| message.content.clone());
+            Ok(model_response(serde_json::json!({
+                "content": "钩子路径已完成。",
+                "finish_reason": "stop"
+            })))
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<ModelResponse, BridgeClientError> {
+            self.invoke(request)
+        }
+    }
+
+    struct ScriptedToolHooks {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl crate::tool_hooks::ToolHooks for ScriptedToolHooks {
+        fn tool_call(
+            &self,
+            _scope: &crate::tool_hooks::ToolHookScope<'_>,
+            call: &ChatToolCall,
+        ) -> crate::tool_hooks::ToolCallDecision {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(call.function.arguments.clone());
+            let command = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                .ok()
+                .and_then(|value| value["command"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            match command.as_str() {
+                "blocked" => crate::tool_hooks::ToolCallDecision::Blocked {
+                    plugin: "acme.guard".into(),
+                    reason: "不允许".into(),
+                },
+                "rewrite" => crate::tool_hooks::ToolCallDecision::Proceed {
+                    arguments: Some(r#"{"command":"rewritten"}"#.into()),
+                    rewritten_by: vec!["acme.guard".into()],
+                },
+                _ => crate::tool_hooks::ToolCallDecision::Proceed {
+                    arguments: None,
+                    rewritten_by: vec![],
+                },
+            }
+        }
+
+        fn tool_result(
+            &self,
+            _scope: &crate::tool_hooks::ToolHookScope<'_>,
+            _call: &ChatToolCall,
+            view: crate::tool_hooks::ToolResultView<'_>,
+        ) -> Option<String> {
+            view.projection
+                .contains("rewritten")
+                .then(|| "[扩展已改写工具结果]".to_string())
+        }
+    }
+
+    /// 返回 (模型看到的工具消息, 工具实际收到的输入次数)。
+    fn run_hooked_tool_loop(command: &'static str) -> (Option<String>, usize) {
+        struct CountingTool {
+            inputs: Arc<Mutex<Vec<String>>>,
+        }
+        impl BuiltinTool for CountingTool {
+            fn name(&self) -> &'static str {
+                "hook_probe"
+            }
+            fn execute(
+                &self,
+                _id: &magi_core::ToolCallId,
+                input: &str,
+                _context: &ToolExecutionContext,
+                _resources: &magi_tool_runtime::ToolRuntimeResources,
+            ) -> String {
+                self.inputs.lock().unwrap().push(input.to_string());
+                serde_json::json!({"tool": "hook_probe", "status": "succeeded", "input": input})
+                    .to_string()
+            }
+            fn spec(&self) -> BuiltinToolSpec {
+                BuiltinToolSpec {
+                    name: "hook_probe".into(),
+                    risk_level: RiskLevel::Low,
+                    approval_requirement: ApprovalRequirement::None,
+                }
+            }
+        }
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(64);
+        let session_id = SessionId::new("session-hooked-tool");
+        let workspace_id = Some(WorkspaceId::new("workspace-hooked-tool"));
+        let task_store = TaskStore::new();
+        let task = make_task_loop_test_task("task-hooked-tool");
+        task_store.insert_task(task.clone()).expect("任务应插入");
+        let worker_id = WorkerId::new("worker-hooked-tool");
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "executor",
+                60_000,
+            )
+            .expect("lease should be granted");
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+        let client = HookedToolModelBridgeClient {
+            command,
+            invoke_count: AtomicUsize::new(0),
+            tool_message: Mutex::new(None),
+        };
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_builtin(Arc::new(CountingTool {
+            inputs: Arc::clone(&inputs),
+        }));
+        session_store
+            .create_session(session_id.clone(), "hooked tool fixture")
+            .expect("session should be creatable");
+        let (_, thread_id) =
+            session_store
+                .ensure_session_mission(&session_id, UtcMillis::now(), || task.mission_id.clone());
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "执行钩子探测",
+        );
+        let hooks = ScriptedToolHooks {
+            calls: Mutex::new(Vec::new()),
+        };
+        let hook_tool = ChatToolDefinition {
+            kind: "function".to_string(),
+            function: magi_bridge_client::ChatToolFunctionDefinition {
+                name: "hook_probe".to_string(),
+                description: "test tool".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {"command": {"type": "string"}},
+                    "additionalProperties": false
+                }),
+            },
+            origin: magi_bridge_client::ChatToolOrigin::Builtin,
+        };
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+            refresh_tool_definitions: None,
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            live_settings_store: None,
+            tool_registry: Some(&tool_registry),
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
+            conversation_registry: &conversation_registry,
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            safety_gate: None,
+            plan_store: &crate::test_plan_store("test-plan"),
+            project_memory: None,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: "执行钩子探测".to_string(),
+            task_context_messages: Vec::new(),
+            images: Vec::new(),
+            tools: Some(vec![hook_tool]),
+            usage_binding: &usage_binding,
+            streaming_entry_id: None,
+            is_sidechain: false,
+            worker_id: Some(&worker_id),
+            thread_id: &thread_id,
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: None,
+            workspace_resources: None,
+            prepare_workspace: None,
+            execution_group_id: None,
+            persist_session_state: None,
+            tool_hooks: Some(&hooks),
+        });
+        assert!(
+            matches!(outcome, TaskOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        let executed = inputs.lock().unwrap().len();
+        (client.tool_message.lock().unwrap().clone(), executed)
+    }
+
+    #[test]
+    fn extension_tool_call_hooks_block_rewrite_and_project_results_through_the_real_loop() {
+        // 阻止：工具从未执行，模型看到的是被拒绝的结果而不是成功。
+        let (message, executed) = run_hooked_tool_loop("blocked");
+        assert_eq!(executed, 0, "被阻止的调用不得进入原生执行");
+        let message = message.expect("模型必须收到工具消息");
+        assert!(
+            message.contains("extension_blocked") && message.contains("acme.guard"),
+            "{message}"
+        );
+
+        // 改写：工具收到的是改写后的参数；tool.result 只替换模型可见投影。
+        let (message, executed) = run_hooked_tool_loop("rewrite");
+        assert_eq!(executed, 1);
+        assert_eq!(message.as_deref(), Some("[扩展已改写工具结果]"));
+
+        // 无扩展介入：原样执行，模型看到原生投影。
+        let (message, executed) = run_hooked_tool_loop("plain");
+        assert_eq!(executed, 1);
+        assert!(message.expect("工具消息").contains("succeeded"));
     }
 
     #[test]
@@ -8904,6 +9213,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         match outcome {
@@ -9132,6 +9442,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -9280,6 +9591,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -9396,6 +9708,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -9566,6 +9879,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -10003,6 +10317,7 @@ mod tests {
                 prepare_workspace: None,
                 execution_group_id: None,
                 persist_session_state: None,
+                tool_hooks: None,
             })
         };
 
@@ -10230,6 +10545,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Failed { .. }));
@@ -10365,6 +10681,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -10497,6 +10814,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
@@ -10646,6 +10964,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         let output_refs = match outcome {
@@ -10848,6 +11167,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         assert!(
@@ -11061,6 +11381,7 @@ mod tests {
             prepare_workspace: None,
             execution_group_id: None,
             persist_session_state: None,
+            tool_hooks: None,
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));

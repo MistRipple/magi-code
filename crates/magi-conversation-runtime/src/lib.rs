@@ -54,6 +54,7 @@ pub mod tool_batch;
 mod tool_call_validation;
 mod tool_declared_paths;
 mod tool_execution_ledger;
+pub mod tool_hooks;
 pub mod tool_result_utils;
 mod tool_surface_state;
 pub mod turn_contract;

@@ -279,6 +279,19 @@ impl ExtensionBus {
         chosen
     }
 
+    /// 是否有插件为该钩子登记了 guard/advise 模式。用于在无扩展时跳过分发。
+    pub fn has_hook(&self, hook: &str) -> bool {
+        self.slots
+            .read()
+            .expect("slots poisoned")
+            .values()
+            .any(|slot| {
+                slot.hooks
+                    .get(hook)
+                    .is_some_and(|h| h.mode != HookMode::Observe)
+            })
+    }
+
     /// 观察通知：有界异步队列，不阻塞调用方。
     pub fn notify(&self, hook: &str, input: Value) {
         for slot in self.frozen(hook, true) {
