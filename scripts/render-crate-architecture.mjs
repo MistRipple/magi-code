@@ -27,6 +27,7 @@ const CRATE_META = {
   'magi-app-server-protocol': ['bus', 'App Server schema 生成的协议与消息行为'],
   'magi-appearance': ['base', '跨宿主外观资产与主题资源'],
   'magi-browser-authority': ['bus', 'Browser Tab、Surface、租约与持久化权威'],
+  'magi-extension-host': ['exec', '受信 Node 扩展宿主：协议传输、宿主监管与 ExtensionBus（尚未接入对话调用链）'],
   'magi-git': ['storage', '结构化 Git 操作、仓库观测与 worktree'],
   'magi-mcp-server': ['api', '对外 MCP 服务、令牌、传输与网络入口'],
   'magi-process': ['base', '子进程、Shell 与跨平台进程生命周期'],

@@ -4,7 +4,7 @@
 
 ## 0. 状态与适用范围
 
-- 【目标】本文描述的协议**尚未实现**：仓库中没有 ExtensionBus、Node 宿主或下列任何方法。落点引用沿用设计文档 5.6 的核对结果，不代表 API 已存在。
+- 【现状·部分实现】[`magi-extension-host`](../crates/magi-extension-host) 已实现：帧、握手、对端、`register.hook`/`host.ready`、`hook.invoke`/`hook.notify`/`hook.gap`/`host.cancel`/`host.ping`/`host.shutdown`、ExtensionBus 的 guard/advise/observe 分发、熔断与重启监管，并有真实 Node 进程的端到端测试（macOS 已运行）。**尚未实现**：`command/tool/job/migration` 方法、`model.invoke`/`tool.call`/`task.spawn`/`resource.*`/`credential.ref`/blob 等宿主→daemon 服务、`hook.invoke` 的 `ctx` 中的 `deadline` 绝对时间戳（当前传 `deadlineMs`）、Windows 命名管道路径（已编写、未编译验证）、随包 Node 的交付，以及对 conversation-runtime 实际调用链的接线——钩子目前不会被真实 Turn 触发。落点引用沿用设计文档 5.6 的核对结果。
 - 【目标】协议只有一条执行路径，服务 Node 宿主；不为 QuickJS 或 SDK 1 提供任何子集（设计文档 I14、D1）。
 - 本文使用 MUST / SHOULD / MAY 表达规范强度。数值默认值与设计文档 5.8 一致，需压力测试校准，偏离须同步修订两处。
 - 规范性示例使用 JSON；字段名一律 camelCase；未知字段在 v1 内一律拒绝（`deny_unknown_fields` 语义），新增字段只能经小版本并由握手声明启用。
@@ -58,6 +58,7 @@ daemon → 宿主（结果）：
 - `registrations` 是 daemon 按清单与授权**批准**的集合；宿主能做的注册不超出它（第 5 节）。
 - 握手失败、超时或令牌重放：daemon 终止该进程，计入崩溃退避，不自动重试同一令牌。
 - 握手完成前宿主发出的任何其他方法一律拒绝并断开。
+- 握手响应中的 `config.values` 是配置快照；运行时把它以只读形式提供给入口的 `api.config`。入口约定：包内 `extension/index.mjs` 默认导出 `activate(api)`。
 
 ## 3. 调用身份与上下文
 
@@ -101,7 +102,9 @@ daemon 发给宿主的每个**业务请求**都带统一的 `ctx`：
 | 方法 | 类型 | 说明 |
 | --- | --- | --- |
 | `register.tool` / `register.command` / `register.skill` / `register.mcp` | request | 在清单已声明范围内绑定处理器或贡献，进入现有治理入口 |
+| `register.hook` | request | 绑定钩子处理器；钩子必须在握手 `registrations.hooks` 的获批集合内，否则 `RegistrationDenied`。只有已绑定的钩子才会收到分发 |
 | `register.dispose` | request | 注销；也在连接断开时由 daemon 隐式执行 |
+| `host.ready` | notification | 入口 `activate` 完成后发送；daemon 在期限内未收到即视为激活失败并回收进程 |
 | `session.snapshot` | request | 会话只读投影（有界、脱敏） |
 | `model.invoke` | request | 带归属的模型调用，走原生服务；**不接受 model 参数**（I12），只接受角色或默认绑定 |
 | `tool.call` | request | 经原生管线调用工具（含审批、权限、账本） |

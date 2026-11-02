@@ -1733,6 +1733,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "magi-extension-host"
+version = "3.0.62"
+dependencies = [
+ "getrandom 0.4.3",
+ "magi-process",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "magi-git"
 version = "3.0.62"
 dependencies = [

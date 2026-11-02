@@ -7,6 +7,7 @@ members = [
   "crates/magi-browser-authority",
   "crates/magi-mcp-server",
   "crates/magi-process",
+  "crates/magi-extension-host",
   "crates/magi-plugin-runtime",
   "crates/magi-plugin-system",
   "crates/magi-daemon",
