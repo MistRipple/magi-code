@@ -538,6 +538,14 @@ export default async function activate(api) {
 export default async function activate(api) {
   await api.tool('echo', async (input) => ({ echoed: input.text }));
   await api.tool('boom', async () => { throw new Error('工具失败'); });
+  await api.tool('slow', async (_input, ctx) => {
+    await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve, { once: true }));
+    return 'aborted';
+  });
+  await api.tool('slow-write', async (_input, ctx) => {
+    await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve, { once: true }));
+    return 'aborted';
+  });
 }
 "#;
 
@@ -547,7 +555,7 @@ export default async function activate(api) {
             "extension": {"hooks": []},
             "permissions": [
                 {"kind": "extension", "scope": "application", "targets": ["full-trust"]},
-                {"kind": "tools", "scope": "application", "targets": ["echo", "boom"]}
+                {"kind": "tools", "scope": "application", "targets": ["echo", "boom", "slow", "slow-write"]}
             ],
             "dataSchemaVersion": 1,
             "settingsSchema": {"type": "object", "additionalProperties": false},
@@ -555,6 +563,10 @@ export default async function activate(api) {
                 {"id": "echo", "title": "Echo", "description": "回显", "readOnly": true,
                  "inputSchema": {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}, "additionalProperties": false}},
                 {"id": "boom", "title": "Boom", "description": "总是失败", "readOnly": true,
+                 "inputSchema": {"type": "object"}},
+                {"id": "slow", "title": "Slow", "description": "等待取消", "readOnly": true,
+                 "inputSchema": {"type": "object"}},
+                {"id": "slow-write", "title": "SlowWrite", "description": "等待取消", "readOnly": false,
                  "inputSchema": {"type": "object"}}
             ]}
         }))
@@ -575,7 +587,10 @@ export default async function activate(api) {
     #[tokio::test(flavor = "multi_thread")]
     async fn extension_tools_are_listed_only_when_authorized_and_execute_through_the_real_host() {
         use super::super::plugin_bridge::execute_tool;
-        use magi_core::ExecutionResultStatus::{Failed, Rejected, Succeeded};
+        use magi_core::ExecutionResultStatus::{
+            Cancelled, Failed, Indeterminate, Rejected, Succeeded,
+        };
+        use std::sync::atomic::AtomicBool;
         let fixture = fixture(Some(test_node()));
         let package = tool_package();
         {
@@ -609,7 +624,7 @@ export default async function activate(api) {
                     .tool_contributions_for_scope("application")
                     .unwrap()
                     .len(),
-                2
+                4
             );
         }
         fixture.runtime.reconcile().await;
@@ -629,7 +644,7 @@ export default async function activate(api) {
         let bus = Arc::clone(&fixture.bus);
         let echo = magi_plugin_system::model_tool_name("acme.guard", "echo");
         let boom = magi_plugin_system::model_tool_name("acme.guard", "boom");
-        let run = move |name: String, args: &'static str| {
+        let run_with = move |name: String, args: &'static str, flag: Arc<AtomicBool>| {
             let (manager, bus, handle) = (Arc::clone(&manager), Arc::clone(&bus), handle.clone());
             tokio::task::spawn_blocking(move || {
                 execute_tool(
@@ -639,8 +654,12 @@ export default async function activate(api) {
                     &name,
                     args,
                     &magi_tool_runtime::ToolExecutionContext::default(),
+                    &flag,
                 )
             })
+        };
+        let run = |name: String, args: &'static str| {
+            run_with(name, args, Arc::new(AtomicBool::new(false)))
         };
         let (ok, status) = run(echo.clone(), r#"{"text":"hi"}"#).await.unwrap();
         assert_eq!(status, Succeeded, "{ok}");
@@ -655,6 +674,31 @@ export default async function activate(api) {
         let (failed, status) = run(boom, "{}").await.unwrap();
         assert_eq!(status, Failed);
         assert!(failed.contains("工具失败"), "{failed}");
+        // 用户停止：运行中的调用被取消，宿主收到取消信号；可能写入的工具记为 Indeterminate。
+        for (tool, expected) in [("slow", Cancelled), ("slow-write", Indeterminate)] {
+            let flag = Arc::new(AtomicBool::new(false));
+            let call = run_with(
+                magi_plugin_system::model_tool_name("acme.guard", tool),
+                "{}",
+                Arc::clone(&flag),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let started = std::time::Instant::now();
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let (payload, status) = call.await.unwrap();
+            assert_eq!(status, expected, "{payload}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        }
+        // 已取消的调用不会启动。
+        let flag = Arc::new(AtomicBool::new(true));
+        let (_, status) = run_with(
+            magi_plugin_system::model_tool_name("acme.guard", "echo"),
+            r#"{"text":"x"}"#,
+            flag,
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, Cancelled);
         // 未知工具名被拒绝。
         let (_, status) = run("plugin__nope".into(), "{}").await.unwrap();
         assert_eq!(status, Rejected);

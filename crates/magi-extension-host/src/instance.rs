@@ -134,12 +134,16 @@ impl HostInstance {
     }
 
     /// 向宿主发起一次工具调用。超时时通知宿主取消并返回 `DeadlineExceeded`。
+    ///
+    /// `cancelled` 完成表示调用方已取消（用户停止 Turn/任务）：宿主收到 `host.cancel`，
+    /// 本调用立即返回 `Cancelled`，不等待宿主响应。
     pub async fn invoke_tool(
         &self,
         tool: &str,
         input: Value,
         ctx: Value,
         timeout: Duration,
+        cancelled: impl std::future::Future<Output = ()>,
     ) -> Result<Value, RpcError> {
         if !self.is_tool_bound(tool) {
             return Err(RpcError::new(
@@ -155,14 +159,21 @@ impl HostInstance {
         let mut ctx = ctx;
         ctx["generation"] = json!(self.generation);
         ctx["deadlineMs"] = json!(timeout.as_millis() as u64);
-        let result = self
-            .peer
-            .request(
-                "tool.invoke",
-                json!({"tool": tool, "ctx": ctx, "input": input}),
-                timeout,
-            )
-            .await;
+        let request = self.peer.request(
+            "tool.invoke",
+            json!({"tool": tool, "ctx": ctx, "input": input}),
+            timeout,
+        );
+        let result = tokio::select! {
+            result = request => result,
+            _ = cancelled => {
+                let _ = self.peer.notify(
+                    "host.cancel",
+                    json!({"invocationId": invocation_id, "reason": "cancelled"}),
+                );
+                return Err(RpcError::new(ErrorKind::Cancelled, "调用已取消"));
+            }
+        };
         if matches!(&result, Err(e) if e.kind() == ErrorKind::DeadlineExceeded) {
             let _ = self.peer.notify(
                 "host.cancel",

@@ -274,8 +274,14 @@ pub type ExternalToolCatalogProvider =
 /// 受信 Node 扩展提供的模型工具目录。
 pub type PluginToolCatalogProvider =
     Arc<dyn Fn() -> Vec<PluginToolCatalogEntry> + Send + Sync + 'static>;
+/// 第四个参数是取消标志：用户停止所属 Turn/任务时置位，执行方应尽快停止并返回 `cancelled`。
 pub type PluginToolExecutor = Arc<
-    dyn Fn(&str, &str, &ToolExecutionContext) -> (String, ExecutionResultStatus)
+    dyn Fn(
+            &str,
+            &str,
+            &ToolExecutionContext,
+            &std::sync::atomic::AtomicBool,
+        ) -> (String, ExecutionResultStatus)
         + Send
         + Sync
         + 'static,

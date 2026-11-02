@@ -34,13 +34,13 @@ pub(crate) fn has_active_operations(query: &ToolExecutionContextQuery) -> bool {
         .any(|(scope, _)| scope.matches_query(query))
 }
 
-pub(super) struct OperationCancellation {
+pub(crate) struct OperationCancellation {
     id: u64,
     flag: Arc<AtomicBool>,
 }
 
 impl OperationCancellation {
-    pub(super) fn new(context: &ToolExecutionContext, resources: &ToolRuntimeResources) -> Self {
+    pub(crate) fn new(context: &ToolExecutionContext, resources: &ToolRuntimeResources) -> Self {
         let id = NEXT_OPERATION.fetch_add(1, Ordering::Relaxed);
         let flag = resources
             .cancellation
@@ -55,7 +55,7 @@ impl OperationCancellation {
             );
         Self { id, flag }
     }
-    pub(super) fn flag(&self) -> &AtomicBool {
+    pub(crate) fn flag(&self) -> &AtomicBool {
         &self.flag
     }
     pub(super) fn is_cancelled(&self) -> bool {

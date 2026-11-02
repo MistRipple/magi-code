@@ -424,30 +424,83 @@ async fn tools_are_invoked_through_the_real_host_and_failures_stay_tool_results(
     assert!(instance.is_tool_bound("echo"));
     let ctx = json!({"invocationId": "inv-1"});
     let ok = instance
-        .invoke_tool("echo", json!({"a": 1}), ctx.clone(), Duration::from_secs(5))
+        .invoke_tool(
+            "echo",
+            json!({"a": 1}),
+            ctx.clone(),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
         .await
         .unwrap();
     assert_eq!(ok["output"]["echoed"], json!({"a": 1}));
     assert_eq!(ok["output"]["invocation"], "inv-1");
     let failed = instance
-        .invoke_tool("boom", json!({}), ctx.clone(), Duration::from_secs(5))
+        .invoke_tool(
+            "boom",
+            json!({}),
+            ctx.clone(),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
         .await
         .unwrap();
     assert_eq!(failed["isError"], true);
     assert!(failed["output"].as_str().unwrap().contains("boom failed"));
     // 超时：宿主收到取消信号，调用返回 DeadlineExceeded。
     let slow = instance
-        .invoke_tool("slow", json!({}), ctx, Duration::from_millis(300))
+        .invoke_tool(
+            "slow",
+            json!({}),
+            ctx,
+            Duration::from_millis(300),
+            std::future::pending(),
+        )
         .await
         .unwrap_err();
     assert_eq!(
         slow.kind(),
         magi_extension_host::protocol::ErrorKind::DeadlineExceeded
     );
+    // 调用方取消：宿主收到取消信号，调用立即返回 Cancelled，不等待期限。
+    let started = std::time::Instant::now();
+    let cancelled = instance
+        .invoke_tool(
+            "slow",
+            json!({}),
+            json!({"invocationId": "inv-cancel"}),
+            Duration::from_secs(30),
+            tokio::time::sleep(Duration::from_millis(100)),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        cancelled.kind(),
+        magi_extension_host::protocol::ErrorKind::Cancelled
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // 取消后宿主仍可服务下一次调用，挂起槽位已释放。
+    let again = instance
+        .invoke_tool(
+            "echo",
+            json!(1),
+            json!({"invocationId": "inv-2"}),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again["output"]["echoed"], 1);
     // 未绑定的工具不会被分发。
     assert!(
         instance
-            .invoke_tool("missing", json!({}), json!({}), Duration::from_secs(1))
+            .invoke_tool(
+                "missing",
+                json!({}),
+                json!({}),
+                Duration::from_secs(1),
+                std::future::pending()
+            )
             .await
             .is_err()
     );

@@ -10799,7 +10799,7 @@ fn plugin_side_effect_tools_share_the_mcp_approval_resume_contract() {
             Vec::new()
         }
     });
-    let executor: PluginToolExecutor = Arc::new(|_, _, _| {
+    let executor: PluginToolExecutor = Arc::new(|_, _, _, _| {
         (
             "{\"ran\":true}".to_string(),
             ExecutionResultStatus::Succeeded,
@@ -11265,4 +11265,56 @@ fn project_directory_shell_uses_selected_copy_and_rejects_source_and_external_li
     );
     assert!(!outside.join("new.txt").exists());
     fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn stopping_a_session_cancels_running_plugin_tool_calls() {
+    use crate::{PluginToolCatalogEntry, PluginToolCatalogProvider, PluginToolExecutor};
+    let provider: PluginToolCatalogProvider = Arc::new(|| {
+        vec![PluginToolCatalogEntry {
+            plugin_id: "acme.tools".into(),
+            contribution_id: "slow".into(),
+            model_tool_name: "plugin__acme.tools__slow".into(),
+            title: "slow".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+            read_only: true,
+        }]
+    });
+    let executor: PluginToolExecutor = Arc::new(|_, _, _, cancelled| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cancelled.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "取消标志必须被置位");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        ("cancelled".to_string(), ExecutionResultStatus::Cancelled)
+    });
+    let registry = make_registry().with_plugin_tools(provider, executor);
+    let context = ToolExecutionContext {
+        session_id: Some(SessionId::new("plugin-cancel-session")),
+        ..test_workspace_context()
+    };
+    let worker = {
+        let registry = registry.clone();
+        let context = context.clone();
+        std::thread::spawn(move || {
+            registry.execute_plugin_tool(
+                "plugin__acme.tools__slow",
+                "{}",
+                &context,
+                magi_core::AccessProfile::FullAccess,
+            )
+        })
+    };
+    let query = ToolExecutionContextQuery {
+        session_id: context.session_id.clone(),
+        ..Default::default()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while registry.cancel_active_executions(&query) == 0 {
+        assert!(std::time::Instant::now() < deadline, "调用应登记为可取消操作");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let (_, status) = worker.join().unwrap().unwrap();
+    assert_eq!(status, ExecutionResultStatus::Cancelled);
 }

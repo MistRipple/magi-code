@@ -96,8 +96,16 @@ impl PluginServices {
     pub(super) fn tool_executor(&self, handle: tokio::runtime::Handle) -> PluginToolExecutor {
         let manager = Arc::clone(&self.manager);
         let bus = Arc::clone(&self.extension_bus);
-        Arc::new(move |model_tool_name, arguments, context| {
-            execute_tool(&manager, &bus, &handle, model_tool_name, arguments, context)
+        Arc::new(move |model_tool_name, arguments, context, cancelled| {
+            execute_tool(
+                &manager,
+                &bus,
+                &handle,
+                model_tool_name,
+                arguments,
+                context,
+                cancelled,
+            )
         })
     }
 
@@ -116,13 +124,19 @@ pub(super) fn execute_tool(
     model_tool_name: &str,
     arguments: &str,
     context: &ToolExecutionContext,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> (String, magi_core::ExecutionResultStatus) {
-    use magi_core::ExecutionResultStatus::{Failed, Rejected, Succeeded};
+    use magi_core::ExecutionResultStatus::{Cancelled, Failed, Indeterminate, Rejected, Succeeded};
     let failure = |status, code: &str, message: &str| {
         (
             json!({
                 "tool": model_tool_name,
-                "status": if status == Rejected { "rejected" } else { "failed" },
+                "status": match status {
+                    Rejected => "rejected",
+                    Cancelled => "cancelled",
+                    Indeterminate => "indeterminate",
+                    _ => "failed",
+                },
                 "error_code": code,
                 "error": message,
             })
@@ -172,11 +186,22 @@ pub(super) fn execute_tool(
         },
         "binding": {"workspaceId": context.workspace_id.as_ref().map(ToString::to_string)},
     });
+    // 开始前已取消则不启动调用；运行中由标志轮询转成宿主取消。
+    if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+        return failure(Cancelled, "tool_cancelled", "调用已取消，工具未执行");
+    }
+    let wait_cancelled = async {
+        while !cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    let read_only = prepared.tool.read_only;
     let result = handle.block_on(instance.invoke_tool(
         &prepared.tool.id,
         prepared.input,
         ctx,
         TOOL_CALL_TIMEOUT,
+        wait_cancelled,
     ));
     match result {
         Ok(value) => {
@@ -197,6 +222,11 @@ pub(super) fn execute_tool(
                     Succeeded,
                 )
             }
+        }
+        Err(error) if error.kind() == magi_extension_host::protocol::ErrorKind::Cancelled => {
+            // 只读工具取消后没有副作用；可能写入的工具无法确认是否已生效，不得自动重试。
+            let status = if read_only { Cancelled } else { Indeterminate };
+            failure(status, "tool_cancelled", "调用已取消")
         }
         Err(error) => failure(
             Failed,

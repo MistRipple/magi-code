@@ -120,10 +120,13 @@ impl ToolRegistry {
         ) {
             return Some(result);
         }
+        // 登记为可取消操作：`cancel_active_executions` 按所属 Turn/任务置位同一标志。
+        let operation =
+            builtin::cancellation::OperationCancellation::new(context, &self.runtime_resources);
         self.runtime_resources
             .plugin_tool_executor
             .as_ref()
-            .map(|executor| executor(&entry.model_tool_name, arguments, context))
+            .map(|executor| executor(&entry.model_tool_name, arguments, context, operation.flag()))
     }
 
     pub fn external_tool_catalog_snapshot(&self) -> ExternalToolCatalogSnapshot {

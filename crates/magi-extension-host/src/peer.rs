@@ -157,6 +157,14 @@ impl Peer {
                 "发送队列已满或连接已关闭",
             ));
         }
+        // 调用方丢弃本 future（如被取消）时同样释放挂起槽位，避免占满 `pending` 上限。
+        struct PendingGuard<'a>(&'a Inner, &'a str);
+        impl Drop for PendingGuard<'_> {
+            fn drop(&mut self) {
+                self.0.take_pending(self.1);
+            }
+        }
+        let _guard = PendingGuard(&self.inner, &id);
         match tokio::time::timeout(deadline, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(RpcError::new(ErrorKind::HostGone, "连接已关闭")),
