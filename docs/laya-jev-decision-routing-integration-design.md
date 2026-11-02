@@ -2,7 +2,7 @@
 
 > 状态：方案草案，尚未进入实现。在线 Provider 的开发以 §16 P0「离线基线与回放」的结论为前置条件；基线没有显示明确的收益方向前，不编写在线接入代码
 >
-> 更新日期：2026-11-01
+> 更新日期：2026-11-02
 >
 > 适用范围：通过 HTTP 接入远程或本地 Laya/Jev 兼容服务，用低延迟的类型化决策减少 Magi 对主 LLM 进行路由判断的次数、输入规模和模型成本。
 
@@ -14,7 +14,7 @@ Magi 不内置 Laya/Jev 模型，也不把它实现成插件。用户配置一�
 
 Magi 仍然拥有全部业务事实和安全边界：Session、Turn、Task、模型执行快照、工具权限、审批、BrowserAuthority、lease、fence、TaskStore、canonical 事件、恢复和终态。Laya/Jev 的输出是外部不可信的决策建议或候选动作，不是权限、事实或终态。
 
-**前置条件。** 本方案的收益目前是假设，不是 Magi 的实测。启用任何在线 head 之前，必须先完成离线基线（§10.4、§16 P0）：用现有用量账本和 canonical 轨迹大致看清各决策点在主模型调用、token 和失败中的占比，并在 Magi 自己的数据上回放评估。收益只需要判断到“值得做 / 不值得做 / 说不准”这个粒度，不追求精确数字。没有 Magi 专属模型、held-out 评估，也看不出对缓存没有明显负面影响，就没有 `gated`；通用 Laya 最多停留在离线回放或本机 `shadow`。
+**前置条件。** 本方案的收益目前是假设，不是 Magi 的实测。启用任何在线 head 之前，必须先完成离线基线（§10.4、§16 P0）：用现有用量账本和 canonical 轨迹大致看清各决策点在主模型调用、token 和失败中的占比，并在 Magi 自己的数据上回放评估。收益只需要判断到“值得做 / 不值得做 / 说不准”这个粒度，不追求精确数字。每个 head 还须指出接入后省掉的具体 LLM 请求或输入（§7.8）；没有通过 Magi 场景的 held-out 评估、版本身份核验和缓存收益检查，就没有 `gated`。是否需要专门微调由评测决定，通用 Laya、Jev 和微调模型采用相同准入标准。
 
 核心链路如下：
 
@@ -55,7 +55,7 @@ Laya Guard 展示了另一类接口：在工具执行前判断 `allow`、`ask` �
 
 公开评测也给出了必须纳入设计的限制：Laya 对选项顺序、相似候选和高基数候选较敏感，零样本模型路由不稳定；如果先筛选再调用 LLM，实际端到端节省可能显著低于只看路由器命中率得到的估计。[Fast Models, Slow Evidence](https://arxiv.org/abs/2610.02267)
 
-因此本方案不把 Laya/Jev 视为通用“意图分类器”，而把它视为**针对 Magi 决策头训练和校准的外部 System-1 Provider**。
+因此本方案不把 Laya/Jev 视为通用“意图分类器”，而把它视为**按 Magi 决策头验证、校准，并按需微调的外部 System-1 Provider**。
 
 上述外部资料是撰写本方案时的引用，未在 Magi 仓库内复现；其中的指标不能作为 Magi 的预期收益。尤其“端到端节省可能显著低于路由器命中率”一条，要求本方案以端到端调用数、token 和缓存命中率为准（§10）。
 
@@ -67,7 +67,7 @@ Laya Guard 展示了另一类接口：在工具执行前判断 `allow`、`ask` �
 
 ### 3.2 并非所有路由都需要 Laya
 
-对这些路径增加 Laya 不会减少 LLM 调用，反而增加一次 HTTP 请求。
+Session/Turn 接纳等已经由 daemon 规则完成的路径不消耗 LLM 路由调用；对它们增加 Laya 只会增加一次 HTTP 请求。主模型生成一次响应时也常常同时完成理解、规划、路由和参数构造，不能把其中一项判断替换后就算作少了一次 LLM 请求。
 
 真正适合 Laya 的是主模型目前通过自然语言或工具调用完成的有限选择：
 
@@ -77,9 +77,9 @@ Laya Guard 展示了另一类接口：在工具执行前判断 `allow`、`ask` �
 | 模型、推理强度 | 用户在会话中选择；角色显式绑定引擎；`agent_spawn` 只在已绑定模型的能力内选强度 | 暂缓：先要有产品决定（§7.1） | 切换模型会换 lineage，重写前缀 |
 | 工具面 | Magi 按策略、Skill、访问档位生成；工具表稳定排序；工具面哈希进入 `cache_epoch` | 暂缓：需通过缓存准入（§7.2、§10.4） | 变更工具表会使前缀失效 |
 | 浏览器动作和候选节点 | 主模型逐步选择 | 离线评估优先（§7.3） | 不改前缀；效果是减少主模型步数 |
-| 是否派发子代理 | 主模型语义判断，daemon 预检 | 优先评估，仅 advisory，提示写入易变尾部（§7.5） | 不改工具表则无影响 |
+| 是否派发子代理 | 主模型语义判断，daemon 预检 | 对照实验，仅 advisory；须证明减少后续子任务或模型轮次（§7.5） | 尾部不改变稳定前缀，但增加输入和 HTTP 延迟 |
 | 知识/记忆是否检索 | ContextRuntime 和知识查询 | 可评估，规则版优先 | 检索结果进入历史或尾部，不改前缀；须核对注入位置 |
-| 重复动作、无进展 | 尚无专门机制 | 先做确定性规则（§7.6） | 无 |
+| 重复动作、无进展 | 工具账本已有幂等结果复用、重复失败检测和未知副作用保护；更高层语义停滞尚待评估 | 复用现有规则，只评估未覆盖的语义停滞（§7.6） | 账本本身不改前缀；模型建议和后续动作须实测 |
 | 权限、审批、Browser lease | PermissionEngine、BrowserAuthority | 不接管 | — |
 | 工具执行结果和 Task 终态 | 原生执行与 TaskStore | 不接管 | — |
 | 上下文压缩边界 | Context Authority | 只提供相关性信号 | — |
@@ -107,11 +107,11 @@ Laya Guard 展示了另一类接口：在工具执行前判断 `allow`、`ask` �
 ### 4.1 目标
 
 1. 减少主 LLM 进行工具、模型、上下文和浏览器动作路由的次数。
-2. 对简单请求选择便宜模型或低推理强度，复杂请求才使用高成本模型。
+2. 在用户显式开启、并满足缓存与模型归属约束（§3.5、§7.1）的前提下，对简单请求选择更便宜的模型档位；默认不改变用户选择的模型。
 3. 对浏览器步骤，在具备领域模型时直接替代主 LLM 的动作选择调用。
 4. 缩小主模型可见的工具集合、候选集合和知识上下文。
 5. 用统一 HTTP 合同同时支持远程 Jev/Laya 和本地 Laya 服务。
-6. 用 `shadow` 数据测量真实的端到端收益，而不是只测分类准确率。
+6. 用离线回放和对照实验测量端到端收益，而不是只测分类准确率；`shadow` 只用于观测响应质量、覆盖率和额外延迟（§10.3）。
 7. 让所有决策都可追踪：输入摘要、候选集合、Provider、模型摘要、延迟、置信度、是否采用和回退原因。
 
 ### 4.2 非目标
@@ -186,7 +186,7 @@ Magi 内部使用自己的 `DecisionRequest` / `DecisionResponse`，由 HTTP 适
         "click": "点击当前页面中的一个候选元素",
         "type": "向输入控件输入用户要求的文本",
         "select": "选择下拉选项",
-        "done": "目标已经完成，不再执行动作"
+        "return_to_llm": "停止本段快速选择，把最新事实交还主模型核对"
       }
     },
     "target": {
@@ -224,7 +224,7 @@ Magi 内部使用自己的 `DecisionRequest` / `DecisionResponse`，由 HTTP 适
         "click": 0.96,
         "type": 0.01,
         "select": 0.01,
-        "done": 0.02
+        "return_to_llm": 0.02
       }
     },
     "target": {
@@ -246,7 +246,11 @@ Magi 内部使用自己的 `DecisionRequest` / `DecisionResponse`，由 HTTP 适
 }
 ```
 
-Provider 返回的 `value` 只能引用请求中已有的候选 ID。Magi 拒绝不存在的候选、未知问题、非法概率、非有限数字、超时结果和缺少模型摘要的 gated 结果。
+Provider 返回的 `value` 只能引用对应问题的 `criteria` 中已有的候选 ID。Magi 拒绝不存在的候选、未知问题、非法概率、非有限数字、超时结果和模型/服务版本身份未通过准入的 gated 结果。`return_to_llm` 不使用 `target` 答案，也不表示目标或 Task 完成；其他动作必须同时验证操作与目标的兼容性。
+
+示例是内部归一化合同，不要求外部 `/v1/systemone` 原样返回这些字段。`requestId` 由 HTTP 调用上下文绑定；`abstain` 可以由宿主按 head 策略计算；延迟以宿主端到端测量为准。`modelDigest` 是服务提供真实权重摘要时的可选字段，不是所有托管 Provider 都有的能力，不能用模型展示名或 URL 哈希冒充权重摘要。
+
+准入身份至少关联 Provider 配置 revision、明确的模型/服务版本、head/schema 版本和评估/校准版本。可验证的固定模型版本或服务发布标识可以替代权重摘要；仅有浮动别名、无法识别服务升级时，不开放 gated，保留离线或 shadow。身份变化使原准入失效，旧任务不静默切换到未评估版本。
 
 ### 6.3 批量和单次多问题
 
@@ -254,7 +258,7 @@ Provider 返回的 `value` 只能引用请求中已有的候选 ID。Magi 拒绝
 
 - 是否需要 Browser；
 - 浏览器动作类型；
-- 是否应使用强模型；
+- 是否应交还主模型核对；
 - 是否需要人工复核。
 
 不允许为每个布尔问题各发一次远程请求。批量请求需要保留每个问题的独立结果和阈值，不用一个总分掩盖某个关键问题的不确定性。
@@ -295,7 +299,7 @@ needs_user_input
 
 不能使用 Laya 重新加入被策略禁止的工具。工具执行仍经过同一权限、审批和审计入口。
 
-缓存约束：工具表变化会使前缀失效（§3.5）。因此首选形态是**不改工具表**，把 Laya 的结论作为尾部提示（例如“本轮优先考虑某类工具”）；只有离线证明“工具 token 节省 > 缓存损失”（§10.4）时，才允许缩小工具表，并且只在 Turn 或会话边界、`cache_epoch` 本来就会变化的位置生效。禁止按步骤动态增删工具。
+缓存约束：工具表变化会使前缀失效（§3.5）。因此首选形态是**不改工具表**，把 Laya 的结论作为尾部提示（例如“本轮优先考虑某类工具”）；只有按 §10.4 粗略判断“工具 token 节省明显大于缓存损失”时，才允许缩小工具表，并且只在 Turn 或会话边界、`cache_epoch` 本来就会变化的位置生效。禁止按步骤动态增删工具。
 
 ### 7.3 `magi.browser_action.v1`
 
@@ -313,10 +317,52 @@ needs_user_input
 
 前提条件：Magi 的浏览器表示（默认 96 节点、10 KiB 文本的自有快照格式）与公开微调实验的输入格式不同，公开结果不能外推。因此：
 
-1. 先用 canonical 轨迹中真实成功的 `element_ref + operation` 构建标注集，在 Magi 自己的候选格式上离线评估；
+1. 先把 canonical 轨迹中的 `element_ref + operation + outcome` 关联到当时快照和子目标，构建待复核样本；执行成功只产生弱标签，按 §11.1 核对目标相关性后才进入评测集；
 2. 浏览器步骤要拆开统计：“选择动作/候选”可以被替代，“理解页面内容、判断目标是否达成”仍需主模型；`done` 之类的目标完成判断不由本 head 决定（§15）；
-3. 在没有 Magi 专属模型和 held-out 成功率没有明显低于基线的证据前，不进入线上 `gated`；通用 Laya 只在离线回放或本机 `shadow` 中使用；
-4. 不可逆或带副作用的页面操作（提交、支付、删除、发送）不进入 gated，仍交给主模型和现有授权。
+3. 只有模型/服务版本可核验、在 Magi 输入格式上通过 held-out 与真实任务评估后，才进入 gated；通用或专门微调均可，尚未通过准入的模型只参与离线回放或获准的 shadow；
+4. 提交、支付、删除、发送等不可逆或有外部副作用的动作不进入 gated，交回主模型和现有授权。节点文本或 Laya 风险分数不能单独证明一次点击可逆；无法确定影响范围时也交回。
+
+#### 7.3.1 主模型交出的是有界子目标
+
+现有 `browser_*` 工具仍执行明确动作，不在 `browser_click` 或 `browser_snapshot` 内暗中扩展成自动控制循环。计划中的快速浏览器控制由原生 conversation loop 编排，进入点位于下一次 `StepModelClient` 请求冻结与发送之前：
+
+```text
+主模型理解总目标，提交一个有界 Browser 子目标
+    → 原 Task/Turn 固定子目标、允许动作、输入值来源和返回条件
+    → 获取当前快照和合法候选
+    → HTTP Decision 选择动作和节点（不创建 LLM Step）
+    → 原工具调度、账本、权限和 BrowserAuthority 校验并执行
+    → 保存真实 outcome；只在原允许范围内继续下一步
+    → 到达返回条件或不确定边界
+    → 把完整动作回执交回主模型核对和继续
+```
+
+该子目标请求是**待设计的原生运行合同**，当前代码没有这个入口。首期 shadow 只旁观已有步骤；进入 gated 前须沿唯一工具 catalog/schema 定义明确的委托入口、参数和回执，并同步 schema、canonical item 与恢复校验，不能通过提示文本、隐藏回调或改写已有工具语义启动。主模型可以在原本就要发送的规划响应中提交子目标；若为建立子目标额外增加了一次 LLM 请求，也计入成本。
+
+子目标最少固定：来源 Task/Turn/工具调用、目标 Tab、允许的操作与页面范围、可信输入值引用、遇到何种状态必须返回、一次控制片段的动作上限和总期限。上限用于限制这一段自动化授权与故障影响，不新增全任务 token/成本预算。片段可能跨越 Provider 的缓存保留时间，控制交回主模型时前缀可能已冷；这是 §10.3 冷热缓存对照要覆盖的实际成本，片段长度的取舍应参考该结果，而不只看动作数。新增用户指令、子目标变化、人工交互或 Task/Turn 结束都使当前片段停止。
+
+#### 7.3.2 Laya 只选择，宿主构造完整工具参数
+
+Laya 不生成任意输入文本、URL、脚本或路径。`type` 的文本来自子目标中已有的可信值引用；`select` 的值来自当前可用选项集合；参数不完整、操作与节点不兼容或需要理解新页面正文时，返回主模型补充。§6 中的多问题答案必须作为一个动作整体校验，不能把独立高分的 operation 和 target 强行拼接。
+
+宿主持有本次候选到真实 `element_ref` 的映射，并绑定 `tab_id`、Surface、`navigationRevision`、`snapshotRevision` 和当前执行租约。绑定与引用不是 Provider 可覆盖的字段；每次快照均使旧节点引用失效。Provider 返回后以及实际派发前，分别重查执行范围和页面代次，迟到结果只记录为过期，不能落到新页面或新租约。
+
+无关站点、新的登录/验证码/审批、需要自由文本推理的页面、影响范围不明的点击、`indeterminate`、`no_visible_change`、无合法候选、低置信度及额度/期限耗尽都结束控制片段。`navigated` 使旧候选失效；只有新页面仍在原子目标范围且只需下一步候选选择时，才重新采集并继续。`return_to_llm` 只表示交还控制，不表示成功或完成。
+
+含密码、令牌、密钥输入控件，或支付、账户安全、凭据生成类页面的快照，整页不构造 Decision 请求，直接结束片段交回主模型，不依赖字段级脱敏（§11.2）。
+
+#### 7.3.3 执行、历史和恢复沿原有事实源
+
+- 所有动作仍通过原工具调度入口执行，沿用 Task/Skill/访问档位、工具账本、审批、BrowserAuthority、取消与用户接管；runtime 不直接调用 CDP，不另建浏览器调度器。
+- 在派发动作前，原 Task 检查点和 canonical 工具记录持久化宿主动作 ID、冻结参数、子目标来源及 decision 身份；保存失败则不执行。现有记录若要求模型 Step 来源，须先增加显式的 `decision` 来源并覆盖重建/恢复校验，不能虚构 assistant 响应或成功的 LLM Step 来满足旧约束。
+- 动作和结果仍各有原 canonical 记录。控制交回后，主模型读到同一历史投影及一个易变尾部交接说明；不另存一套 transcript，也不让原生动作被序列化为不存在的 Provider 工具调用。历史表示和各模型协议的合法性须在 gated 前验收。
+- 崩溃恢复只读取原 Task/工具事实。已完成动作不重做；已派发而结果未知的动作按原未知副作用合同阻塞并核对；未派发的决定在重新验证范围、页面代次和候选之后才能继续。断线或超时不会触发模型版、Laya 版各执行一次同一动作。
+
+#### 7.3.4 哪些 LLM 请求实际消失
+
+可节省的是原循环中仅用于“看快照 → 选择下一动作”的中间请求。目标理解、子目标交付、页面内容分析、异常处理和最终核对仍由主模型完成。若每步都必须把页面交回主模型理解，则不启用快速循环；此时 Laya 只是额外建议，不宣称省调用。
+
+例如同一片段原来有 4 次纯动作选择请求，替换后有 4 次 Decision 请求且省去这 4 次 LLM 请求；如果为交付或交回子目标新增了 2 次 LLM 请求，净减少只能算 2 次。一次模型响应原本能批量提出多个工具时，应与原批量路径比较，不能把每个工具都算成一次被省掉的 LLM 请求。
 
 ### 7.4 `magi.context_need.v1`
 
@@ -339,7 +385,9 @@ independent_review
 
 当用户明确要求真实代理时，Laya 不能否决；当用户未明确要求时，Laya 只能以 advisory 提示（写入易变尾部）影响主模型是否派发；不通过增删 `agent_spawn` 工具定义实现，避免改变工具表而使缓存前缀失效（§3.5）。实际 `delegation.reason`、角色、上下文包、Task 注册和生命周期仍由原有入口负责。
 
-该 head 是首个建议评估的对象：`agent_spawn` 已有结构化的 `delegation.reason`，任务终态、产物、整合成本和重复工作拒绝（`existing_task_id`）都有真实事实可作为标签，不需要额外人工标注。[子代理唤起设计](subagent-delegation-design.md)也明确要求用固定回放评估不必要派发率；本 head 的离线评估可与该回放合并。
+该 head 定位为对照实验，不因为记录易取就优先上线。`delegation.reason` 是模型自述，任务终态、产物和重复工作拒绝可用于构造弱标签；整合成本可能需要补采，是否值得委派仍需复核或对照实验（§11.1）。离线评估可与[子代理唤起设计](subagent-delegation-design.md)中的固定回放合并。
+
+只给出 advisory 不消除当前主模型请求：主模型仍须理解目标、判断工作边界、选择角色并构造上下文包。效率收益只来自经对照确认减少的无效 child Task、子代理模型调用和后续收集/整合轮次。若主模型轨迹基本不变，新增 HTTP 和尾部 token 是净开销，应关闭该 head，不以“建议被采纳”计作节省。
 
 ### 7.6 `magi.execution_progress.v1`
 
@@ -347,7 +395,7 @@ independent_review
 
 该头只能触发“重新评估”或“请求主模型”，不能直接宣布完成、重放未知副作用或自动创建新代理。
 
-重复动作和无进展先用确定性规则实现（基于 `tool_execution_ledger` 的同工具同参数重复、连续无新证据计数等），这条规则版是模型版必须超过的对照基线；规则版已能覆盖的情形不引入 Provider 调用。
+先复用 `ToolExecutionLedger` 已有的幂等结果复用、重复失败检测和未知副作用保护；合法的动态页面读取、任务观察和状态轮询不因同参数自动判作停滞。只有这些规则未覆盖的语义无进展，才先建立离线规则对照，再比较 Provider。P0 不为评估新建一套生产循环控制器，规则版已能覆盖的情形不引入 HTTP 调用。
 
 ### 7.7 不纳入首期的决策头
 
@@ -359,29 +407,48 @@ independent_review
 - canonical 上下文压缩边界；
 - 用户请求的最终语义解释。
 
+### 7.8 每个 head 必须说明省掉的 LLM 工作
+
+| Head | 原路径实际做什么 | 采用后省掉什么 | 仍需 LLM 做什么 | 无收益时的处理 |
+| --- | --- | --- | --- | --- |
+| `route` | 用户选定模型直接处理；目前没有独立 LLM 选档请求 | 自动选档获准后可降低实际执行模型成本；不默认减少请求次数 | 理解、生成、工具参数和交付 | 对照包含错分后的升级/重做及缓存损失；无净收益则沿用户模型 |
+| `tool_surface` | daemon 已按权限生成工具表，主模型在同次响应中选工具 | 真正收窄稳定工具表才可能减少定义 token；纯尾部建议不节省定义 token | 工具选择、参数及任务推理 | 仅缩小“思考空间”不算收益；必须看到计费或延迟下降 |
+| `browser_action` | 原循环发送快照，由主模型产生后续动作 | 有界片段内的纯动作选择请求（§7.3.4） | 子目标、复杂页面理解、异常和最终核对 | 不能跳过模型发送就只留离线/shadow，不上 gated |
+| `context_need` | 已有规则检索并装配上下文 | 排除无关检索内容时减少后续输入；只有替代实际存在的模型检索轮次才算少调用 | 回答、推理和必要检索 | 以现有规则为基线，补检索及遗漏修复也计成本 |
+| `delegation_gate` | 主模型作委派判断并创建/收集子任务 | 有证据减少无效子任务及后续轮次；当前主模型请求仍存在 | 工作包、角色、理由和结果整合 | advisory 不改变后续执行则关闭 |
+| `execution_progress` | 账本已拦截部分重复与未知副作用，主模型继续推进 | 只计额外阻止的无效后续模型轮次 | 真实新计划与错误恢复 | 额外唤起主模型的检查也计开销；不胜过规则则不用 |
+
+每个 P0 报告标出原轨迹中拟被省掉的请求、替代后的发送点和保留请求，并区分“少调用”“更便宜模型”“少输入”三种收益。单个 LLM 响应混合了路由和业务推理时，先证明整次请求可被替代；不能按提示词中路由文字的比例折算出不存在的可省调用。优先级由可替代工作量、实现边界和净收益决定，数据易采或 shadow 一致率高不构成上线优先级。
+
 ## 8. 运行时接入架构
 
 ### 8.1 新增抽象
 
-首期不新增 crate。当前工作区已有 30 余个 crate，只有一种传输和一个 Provider 时，再拆两个新 crate 属于过早拆分。建议：
+首期不新增 crate。当前 `magi-conversation-runtime` 已依赖 `magi-bridge-client`，所以 Provider trait 和传输类型与 HTTP 实现一起放在下层；不能把 trait 放在 runtime 再要求 bridge-client 实现它。
 
 ```text
 magi-conversation-runtime
   decision/
-    DecisionProvider (trait)
     DecisionRouter
-    DecisionRequest / DecisionResponse
     DecisionPolicy
-    DecisionTrace
+    BrowserControlSegment（原 Task 内的有界控制片段）
+    DecisionTrace 的领域绑定与提交
 
 magi-bridge-client
+  decision
+    DecisionProvider (trait)
+    DecisionRequest / DecisionResponse / DecisionError
+    ProviderVersionIdentity
   decision_http
     HttpDecisionProvider
     Laya/Jev protocol adapter
-    timeout / cancellation / redaction / health
+    timeout / cancellation / response validation / health
+
+依赖方向：daemon / API → conversation-runtime → bridge-client
+          daemon / API → bridge-client
 ```
 
-决策类型与聊天模型的 `ModelBridgeClient` 分离、不共用响应事实模型；仅复用 `magi-bridge-client` 中已有的 HTTP 客户端、超时和凭据引用能力。当出现第二个 Provider 实现、或第二个独立消费者时，再按真实依赖抽出独立 crate。
+决策类型与聊天模型的 `ModelBridgeClient` 分离；复用适用的 HTTP 基础设施，由 daemon 沿现有配置/凭据入口构造客户端。字段选择、脱敏、授权候选、head 策略和 Task/Turn 身份属于 runtime/领域层；bridge-client 不读取 TaskStore，不判断 Browser 权限，不依赖上层 crate。ContextRuntime、ToolRuntime 等更低层消费者如需联动，由 runtime/daemon 装配回调或显式传入结果，不反向依赖 conversation-runtime。当出现真实的独立消费者需求时，再判断是否需要抽出共享 crate。
 
 聊天模型是生成内容和工具调用的流式协议；Laya/Jev 是固定候选上的类型化判断，二者不能共用同一个“模型响应”事实模型。
 
@@ -390,12 +457,13 @@ magi-bridge-client
 | 模块 | 接入方式 |
 | --- | --- |
 | `magi-api` | 读取和保存全局 Decision Provider 配置、连接测试和状态 DTO |
-| `magi-conversation-runtime` | 在模型 Step 前调用 route/tool-surface/context 头；在执行循环中调用 progress 头 |
-| `magi-api/src/browser_tool_runtime.rs` | 在候选节点已由 Worker 生成后调用 browser-action 头 |
-| `magi-conversation-runtime/src/tool_surface_state.rs` | 生成授权工具面后，允许 Laya 只做候选内缩小 |
-| `magi-context-runtime` | 允许 context-need 影响检索入口，不改变知识事实 |
-| `magi-tool-runtime` | 记录决策建议和采用结果，不允许 Provider 直接改权限结果 |
-| `magi-session-store` | 保存运行快照中的 Provider/model digest 和 adopted decision metadata；不保存 API Key |
+| `magi-bridge-client` | 定义独立 Decision 传输合同与 Provider trait，实现 HTTP 请求；不引用 runtime |
+| `magi-conversation-runtime` | 在模型 Step 冻结前决定发送 LLM 还是继续既有 Browser 控制片段；构造最小输入、采用策略并绑定原工具执行/账本 |
+| `magi-api/src/browser_tool_runtime.rs` | 保留快照和明确动作的原生执行依赖，由同一工具入口使用；不在模型已选好动作后增加隐藏自动化循环 |
+| `magi-conversation-runtime/src/tool_surface_state.rs` | 授权工具表是唯一候选源；advisory 不改表，收窄仅在缓存准入通过的稳定边界发生 |
+| `magi-context-runtime` | 原检索和预算入口继续拥有结果；runtime 可传入经过校验的检索选择，不增加反向依赖 |
+| `magi-tool-runtime` | 继续执行权限、工具参数和原工具执行；决策来源由上层绑定，不允许 Provider 改权限结果 |
+| `magi-session-store` / 原 Task 持久化边界 | 保存版本身份、子目标与动作来源、待决动作及实际结果；新增来源需走原 schema/校验，不保存密钥或另建日志 |
 
 ### 8.3 生命周期
 
@@ -412,7 +480,7 @@ magi-bridge-client
   → 写入 DecisionTrace
 ```
 
-配置修改只影响新 Turn。已经开始的 Task 继续使用原 Provider 配置、头版本和模型摘要；若运行中 Provider 消失，按该 Task 的回退策略收口，不静默改变事实。
+新接纳运行冻结 Provider 配置 revision、head/策略和模型/服务版本身份；已有 Task 的排队、重试和恢复沿原快照，新 activation 再按接纳合同解析。撤权、关闭外发或取消是即时安全边界，旧快照不能继续授权新请求；结束控制片段后回到本任务已冻结的主模型。Provider 消失或版本变化也按该任务策略收口，不静默换服务或模型。
 
 ## 9. 配置设计
 
@@ -427,15 +495,17 @@ magi-bridge-client
   "credentialRef": "secret:decision-provider/laya",
   "defaultMode": "off",
   "allowRemoteShadow": false,
-  "connectTimeoutMs": 300,
-  "requestTimeoutMs": 120,
+  "connectTimeoutMs": 100,
+  "requestTimeoutMs": 100,
+  "totalBudgetMs": 150,
+  "expectedServiceVersion": null,
   "healthCheck": false,
   "heads": {
-    "magi.route.v1": {"enabled": false, "mode": "off"},
-    "magi.tool_surface.v1": {"enabled": false, "mode": "off"},
-    "magi.browser_action.v1": {"enabled": false, "mode": "off"},
-    "magi.context_need.v1": {"enabled": false, "mode": "off"},
-    "magi.delegation_gate.v1": {"enabled": false, "mode": "off"}
+    "magi.route.v1": {"enabled": false, "mode": "off", "policyRef": null},
+    "magi.tool_surface.v1": {"enabled": false, "mode": "off", "policyRef": null},
+    "magi.browser_action.v1": {"enabled": false, "mode": "off", "policyRef": null},
+    "magi.context_need.v1": {"enabled": false, "mode": "off", "policyRef": null},
+    "magi.delegation_gate.v1": {"enabled": false, "mode": "off", "policyRef": null}
   }
 }
 ```
@@ -447,26 +517,26 @@ magi-bridge-client
 - `baseUrl` 必须是 HTTP(S) origin，禁止嵌入凭据、路径穿越和非 HTTP scheme；
 - 远程地址默认 HTTPS；loopback 地址允许 HTTP；
 - 每个 head 独立开关和模式；
+- `totalBudgetMs` 是单次 Decision 的总期限，连接与读取超时都受它约束（§13）；示例数值仅作示意；
+- `expectedServiceVersion` 固定准入评估所针对的模型/服务版本，gated 要求它非空且与实际响应一致，浮动别名不通过（§6.2）；
+- 采用阈值和 margin（§12）通过 head 的 `policyRef` 引用随评估发布的策略版本，不在设置里手填裸数字；具体字段以最终 schema 为准；
 - 不保存明文密钥；
 - 不把 Provider 连接失败伪装为“模型没有做出决定”；
 - UI 显示 `disabled`、`configured`、`healthy`、`degraded`、`unavailable`，不只显示一个布尔开关。
 
 ## 10. 效率模型
 
-每个 head 必须回答一个具体的效率问题：
+每个 head 必须回答 §7.8 中的具体效率问题。调用数、毫秒、token 和金额分开核算，不能直接相加；以下量均比较同一任务条件下的原路径与实验路径：
 
 ```text
-net_saving
-  = avoided_llm_calls
-  + cheaper_model_savings
-  + input_token_savings
-  - decision_http_latency_cost
-  - fallback_cost
-  - wrong_route_recovery_cost
-  - cache_loss
+net_llm_calls_saved = baseline_llm_calls - experiment_llm_calls
+net_latency_saved_ms = baseline_wall_time_ms - experiment_wall_time_ms
+net_cost_saved = baseline_total_cost - experiment_total_cost
 ```
 
-其中 `cache_loss` 指因前缀失效而多付的输入成本。这些项只用于判断方向和量级，不要求精确核算；但缓存损失不能被忽略。
+实验总量包含 Decision HTTP、额外交接/主模型核对、fallback、错误路由后的恢复与重做、worker 和辅助模型的全部调用。费用以实际 Provider 用量和有效费率为准；`cache_loss` 是缓存失效增加的输入成本，已包含在实验费用中，不重复扣除。没有费率时报告 token 与延迟，费用标未知，不编造金额。P0 可粗估方向，生产准入仍需质量不下降的实际对照。
+
+要求分两层：P0 只回答“值得做 / 不值得做 / 说不准”，用已有账本和轨迹粗估方向即可；下文 A/B/C 对照、事前声明 margin 和样本量，是进入 `advisory` 采用实验和 `gated` 的要求，不是 P0 的前置工作。
 
 不能用“Laya 分类准确率”代替端到端收益。至少记录以下基线和实验指标：
 
@@ -498,7 +568,11 @@ net_saving
 - Prompt cache 命中变化；
 - 失败任务的恢复成本。
 
-如果 `Laya latency + fallback latency` 大于被省掉的 LLM 路由成本，则该 head 不应进入 gated。
+如果实验无法减少 LLM 工作或实际成本，且总延迟还上升，该 head 不进入 gated。只降低金额却提高延迟的结果应明确列为权衡，不能声称同时提速。
+
+对照至少区分：A 为当前规则与主模型，B 为只增加相同确定性预筛选，C 为预筛选加 Decision。C 需要相对 B 有增量收益，不能把规则本身的优化归给 Laya/Jev。shadow 只能测试响应质量、覆盖率和额外延迟，不改变行为，不能单独证明省调用或提高成功率；这些结论需离线端到端回放或获准的真实采用实验。
+
+对照固定任务、权限、主/子模型及推理强度、候选构造、可复现的站点/文件状态，并报告冷热缓存、重试和失败样本。合格 margin 和样本量按 head 在实验前声明；P0 可以给出“说不准”，不能在结果出来后挑样本或改阈值来宣称通过。
 
 ### 10.4 在线启用准入条件
 
@@ -508,9 +582,9 @@ net_saving
 | --- | --- |
 | 编写在线 Provider 代码 | P0 离线基线显示该决策点在主模型调用、token 或失败中占比不可忽略，且粗略判断收益大于成本 |
 | `shadow`（线上数据流） | 有明确的数据最小化字段表；loopback 或用户已同意远程外发；有离线评估之外仍需线上数据的理由 |
-| `advisory` | 离线 held-out 上建议整体不比无建议差；建议只写入易变尾部，不改变工具表、系统前缀或模型；缓存命中率没有明显下降 |
-| 改变工具表或模型的采用 | 粗略判断“节省明显大于 `cache_loss`”；只在 Turn/会话边界采用；有用户可见的开关 |
-| `gated` | Magi 专属模型；held-out 与顺序扰动测试通过；真实任务成功率没有明显低于基线；主 LLM 调用数或成本有可感知的下降；fallback 后总延迟没有系统性变差 |
+| `advisory` | 用同一主模型回放有/无建议后的真实执行轨迹；质量不低于预先约定 margin；建议只写易变尾部；除 HTTP 和额外输入外确实减少后续调用/成本，否则仅保留实验 |
+| 改变工具表或模型的采用 | 按 §10 的实验总成本（已含 `cache_loss`）粗略判断节省明显大于损失；只在 Turn/会话边界采用；有用户可见的开关 |
+| `gated` | 模型/服务版本身份可核验，评估和校准与 head/候选格式绑定；Magi held-out、顺序扰动和真实采用评估通过；相对规则对照有净收益；质量与延迟满足预定门槛；不强制专属微调 |
 
 ## 11. 数据、训练和校准
 
@@ -525,7 +599,20 @@ net_saving
 - 工具失败、重试、取消和未知副作用；
 - ContextRuntime 的检索结果和最终采用情况。
 
-决策标签必须来自结果事实，而不是只来自模型文字。例如浏览器标签应来自真实成功的 `element_ref + operation`；子代理标签应来自任务完成时间、独立性、产物和整合成本；工具路由标签应来自工具实际是否解决目标。
+标签分成四层，不把执行事实自动等同于正确决策：
+
+| 层次 | 可以证明什么 | 不能据此推断什么 |
+| --- | --- | --- |
+| 执行事实 | 某动作已发生、收到何种 outcome、Task 以何状态结算 | 点击正确、任务确实满足用户意图、委派值得 |
+| 弱标签 | 从事实与规则派生的候选标签，保留来源和置信依据 | 可以当作 held-out 标准答案 |
+| 复核标签 | 人工或独立复核结合目标、当时状态和证据给出的判断；分歧明确记录 | 自动证明另一条未执行路径更优 |
+| 对照实验 | 固定条件下有/无决策路径的成功率、调用量和完成时间差异 | 单个历史成功样本的普遍因果收益 |
+
+浏览器样本必须能重建当时的候选表、`snapshotRevision`、动作、子目标和结果。可信 click 或 `Succeeded` 不证明目标正确；`no_visible_change`、未知结果和最终没有完成的轨迹也要保留。历史若只保留裁剪结果而无法复原候选，就标为不具备该项回放条件，不凭当前页面补造历史。
+
+`delegation.reason` 只是模型判断的原文，`existing_task_id` 只证明触发了已有去重合同。子任务成功不证明比主线直接完成更快；未派发轨迹也没有“派发后会怎样”的事实。委派价值需要复核独立工作边界，并在相同任务和固定子代理绑定下比较主线与委派执行；启动、等待、重复理解和整合成本均计入。缺失的成本先标未知，需要时离线补采，不宣称无需人工标注。
+
+划分数据集按任务、会话和站点等相关组隔离，避免同一轨迹的相邻快照进入训练与 held-out 两侧。所有标签保留 source、复核方式及版本，弱标签不能与复核标签混报准确率。
 
 ### 11.2 数据脱敏
 
@@ -540,11 +627,11 @@ net_saving
 
 ### 11.3 校准
 
-每个 head、候选规模、语言和 Provider/model digest 独立评估。阈值不能从一个 head 复制到另一个 head，也不能把公开 benchmark 的置信度直接当作 Magi 生产阈值。
+每个 head、候选规模、语言和模型/服务版本身份独立评估。阈值不能从一个 head 复制到另一个 head，也不能把公开 benchmark 的置信度直接当作 Magi 生产阈值；自有模型可按需微调，托管服务不要求提供权重。
 
 必须有：
 
-- 训练集、校准集、held-out 测试集；
+- 校准集、held-out 测试集；发生微调时另设训练集，三者隔离；
 - 选项顺序扰动测试；
 - 候选描述改写测试；
 - 相似候选测试；
@@ -558,7 +645,7 @@ net_saving
 ```text
 1. 生成合法候选
 2. 调用 Provider
-3. 校验候选、概率、模型摘要和请求绑定
+3. 校验候选、概率、模型/服务版本身份和请求绑定
 4. 检查 abstain、置信度、分布熵和稳定性
 5. 检查本地硬规则
 6. 满足 gated 条件才采用
@@ -572,7 +659,7 @@ net_saving
 - 选项顺序扰动稳定性；
 - 当前候选数量；
 - 是否存在截断；
-- Provider/model digest 是否已评估；
+- 模型/服务版本身份及 head/schema、校准版本是否已评估；
 - 当前动作是否可逆。
 
 低置信度时优先回退到主模型；高风险或不可逆动作不因高置信度自动放行。
@@ -587,9 +674,11 @@ net_saving
 | 响应非法 | 记录错误 | 忽略建议 | 回退并记录 provider_invalid_response |
 | 低置信度 | 记录 | 不采用 | abstain，回退或请求用户 |
 | 候选已过期 | 记录 | 不采用 | 拒绝采用，重新获取状态 |
-| 模型摘要变化 | 记录 | 不采用 | 需要重新评估或回退 |
+| 模型/服务版本身份变化 | 记录 | 不采用 | 原准入失效，回退并重新评估 |
 
 浏览器写操作一旦已经交给原生 Host，Laya 超时不能让调用方自动重放。未知副作用沿现有 Browser 失败合同处理。
+
+shadow 不阻塞真实工具派发：在线旁观使用原执行拥有方管理的有界并发与取消，过载直接跳过；不能留下无归属后台请求。advisory/gated 的等待计入交互关键路径，超过单次总期限后回到原路径，同一决策点不连续重试 Decision HTTP。参数中的连接、读取超时必须受同一个总期限约束，不能在连接阶段用完后再获得完整读取期限。
 
 ## 14. 决策事实与审计
 
@@ -601,7 +690,8 @@ request_id
 session_id / task_id / turn_id / step_id
 head_id / head_version
 provider_origin_hash
-model_id / model_digest
+model_id / provider_version / model_digest（可选）
+provider_config_revision / schema_version / evaluation_version / calibration_version
 candidate_ids_hash
 input_shape_hash
 mode
@@ -609,11 +699,15 @@ answer / probabilities summary
 confidence / abstain
 adopted
 fallback_reason
+control_segment_id / action_id（存在有界控制片段时）
+origin_kind / source_model_step_id（可空）
 latency_ms
 created_at
 ```
 
-它可以作为 canonical Step 的 metadata 或现有事件的附加投影保存，但不能单独证明工具成功、Task 完成、用户授权或 Browser 副作用已发生。
+advisory 可以关联实际存在的 canonical Step；被跳过的 LLM 请求没有 ModelStep，`source_model_step_id` 必须可空，不能为统计创建假的模型调用。原生 Decision 动作的执行意图与结果沿 §7.3.3 的 Task/工具事实保存，DecisionTrace 只是从这些来源产生的评估投影。新增来源及 metadata 的持久合同须在实现时同步原 schema、生成物、重建和恢复，不另建平行执行日志。
+
+Trace 不能单独证明工具成功、Task 完成、用户授权或 Browser 副作用已发生。“拟省掉的请求”只在对照报告中关联，实际用量账本只记录真实的 LLM transport 和 Decision HTTP 用量；不按动作次数虚报已避免的调用。
 
 ## 15. 安全边界
 
@@ -629,43 +723,45 @@ created_at
 
 阶段按“先证明有收益，再写线上代码”排序。每个阶段有退出条件，未满足则不进入下一阶段，方案可以在任一阶段止步。
 
-### P0：离线基线与回放（不接任何服务，不外发数据）
+### P0：离线基线与回放（不接入 Magi 在线执行，不外发数据）
 
+- 先核实现有 canonical 轨迹能否复原每步的候选表和 `snapshotRevision`：这决定浏览器评估有没有可用数据（§11.1），不能复原的部分直接标为缺口；
 - 从用量账本和 canonical Step/ToolCall 轨迹统计：每 Turn 主调用数、浏览器任务步数、各工具调用频次与失败率、`agent_spawn` 次数及后果、模型或工具面变化引起的 `cache_epoch` 变化次数；
-- 把浏览器步骤拆成“选择动作/候选”与“理解页面”，估算 `browser_action` 理论上可替代的主调用比例；
-- 以 `delegation.reason`、任务终态、产物、整合成本和重复工作拒绝为标签，建立子代理委派标注集，并与子代理设计中的固定回放合并；
-- 重复动作、无进展先实现确定性规则，作为后续模型必须超过的对照；
-- 在本机用可用模型（含通用 Laya 本地实例）对标注集离线回放，报告 top-1、校准误差、选项顺序扰动稳定性；
-- 退出条件：至少一个 head 看起来值得做，且缓存损失可接受；否则方案止步，不编写 Provider。
+- 按 §7.8 为每个 head 标明当前请求、拟消除请求/输入、仍需 LLM 的工作及新增开销；浏览器按整次模型请求区分纯动作选择与混合页面理解，保留原批量工具路径作为基线；
+- 按 §11.1 关联 Browser/Agent 事实并建立弱标签和复核集；委派样本与原固定回放合并，缺失候选或反事实结果明确列为缺口；
+- 先审计现有工具账本规则；未覆盖的停滞仅做离线规则对照，不为了 P0 改生产行为；
+- 以单独的离线回放脚本调用用户已有的本机 HTTP 决策服务，Magi 不带模型、不启动推理进程、不接在线链路；报告 held-out、校准与选项顺序稳定性；
+- 对比 A 当前路径、B 规则预筛选、C 规则加 Decision，区分可估算上限与已验证收益；
+- 退出条件：至少一个 head 有可省的具体工作、预期相对规则的净收益及可补齐的执行/恢复合同；否则止步。子代理数据易得不构成其首发理由。
 
 ### P1：协议与 `shadow`（仅对通过 P0 的 head）
 
-- 在 `magi-conversation-runtime` 增加 Decision 类型与 trait，在 `magi-bridge-client` 增加 `HttpDecisionProvider`；
+- 按 §8.1 在 `magi-bridge-client` 增加独立 Decision 合同、trait 和 HTTP 实现，在 `magi-conversation-runtime` 增加策略/领域装配，保持单向依赖；
 - 全局配置、凭据引用、连接测试；
 - 只支持 `shadow`；远程地址默认关闭，需用户同意（§5.3）；
 - DecisionTrace、脱敏、候选 hash；未配置时零请求；
-- 退出条件：线上 `shadow` 与离线结论一致，且没有产生缓存命中率回退。
+- 退出条件：shadow 能可靠绑定候选与执行事实，没有破坏原路径、取消和缓存；只能证明观测有效，不能据此宣称省掉实际调用。
 
-### P2：`advisory`（影响主模型，不改前缀）
+### P2：受控采用实验（按可省工作选择，不强制各 head 走同一路线）
 
-- 优先 `delegation_gate`：建议写入易变尾部，不改 `agent_spawn` 工具定义；
-- `context_need`：仅影响检索入口，且先与规则版比较；
-- 只有在存在 Magi 专属浏览器模型时才评估 `browser_action` 的 advisory；
-- 退出条件：不必要派发率或无效检索下降，缓存命中率、任务成功率没有明显变差。
+- `delegation_gate` 仅做有/无尾部建议的回放或获准实验；不改工具表，若无效子任务及总调用没有减少则停止，不进入默认在线路径；
+- `context_need` 与现有规则比较，只有实际输入缩减且任务质量不下降才采用；
+- `browser_action` 若模型/服务已通过 Magi 场景验证，则先补齐 §7.3 的显式子目标入口、Decision 来源的 canonical/工具合同、模型历史投影和取消/恢复测试，再做隔离站点的有界控制实验。该实验才用于检验是否真的跳过 LLM，无需先强制每步 advisory；
+- 退出条件：以 §10 的固定条件对照证明相对规则有收益，并且缓存、任务成功率及恢复语义满足预定门槛。只看到建议采纳率不算通过。
 
-### P3：`gated` 与专属模型
+### P3：逐 head 开放 `gated`
 
-- `browser_action`：需 Magi 专属模型、held-out 评估与真实任务成功率没有明显低于基线，且主 LLM 步数有可感知的下降；
+- `browser_action`：固定可核验的模型/服务版本，held-out 与真实采用评估通过；净主 LLM 请求数下降，包含交接、fallback 和错误恢复；来源、权限、历史与恢复验收完整。通用 Jev/Laya 和微调模型均可参评；
 - `route`（模型档位）：先有产品决定（§7.1），再只在会话首轮采用；
 - `tool_surface`（改工具表）：先通过 §10.4 的缓存准入，且只在 Turn/会话边界采用；
-- 任何 head 进入 gated 都需发布独立评估报告。
+- 任何 head 进入 gated 都需发布独立评估报告；`delegation_gate` 在当前方案中仍为 advisory，不因指标改善自动升级成 Task 创建或工具隐藏入口。
 
-### P4：持续训练与校准
+### P4：持续评估、校准与按需微调
 
 - 从 Magi canonical 轨迹持续构建 browser、delegation、route、progress 数据集；
 - 温度校准、选项顺序稳定性、候选描述改写、相似候选和截断状态测试；
-- 对每个 head、候选规模、语言和模型摘要分别发布评估；
-- 通用 Laya 通过测试不等于 Magi 专属 gated 可以启用。
+- 对每个 head、候选规模、语言和可核验模型/服务版本分别发布评估；
+- 泛化不足时再微调，Magi 不承担模型托管；某个 head/版本通过不能为其他 head、候选格式或后续版本授权。
 
 ## 17. 验收标准
 
@@ -689,22 +785,28 @@ created_at
 - 过期 `navigationRevision`、lease、fence 和候选引用全部拒绝；
 - Laya 不能执行未在候选列表中的节点；
 - 用户接管、导航、取消和 Guest 崩溃时不会重放旧动作；
-- gated 浏览器模型的真实任务成功率不低于当前基线，并且 LLM 步数确实下降。
+- gated 浏览器模型的真实任务成功率没有明显低于当前基线，并且 LLM 步数有可感知的下降；
+- 有界片段在原循环的模型发送前分支，真实执行轨迹证明确有 LLM 请求被跳过；不在已选好动作的工具处理器中事后追加 HTTP 冒充收益；
+- 子目标委托、Decision 动作来源及回执可持久化重建，不伪造 ModelStep；控制交回时模型读到完整工具事实，原工具/模型历史协议合法；
+- 覆盖“Decision 返回前取消”“意图保存失败”“已派发未收结果时崩溃”“用户接管”“控制交回”等路径，未知副作用不自动重放；
+- `type`/`select` 只使用可信值引用或现有有限选项；需新内容推理、敏感输入或影响范围不明时交回主模型；`return_to_llm` 不提交完成。
 
 ### 17.4 子代理
 
 - 用户明确要求代理时不能被 Laya 否决；
 - Laya 建议不能绕过 `agent_spawn` Schema、角色、Skill、工作区、重复工作和生命周期预检；
 - Laya 失败不产生虚构的 child Task；
-- 子代理建议只有在 held-out 轨迹中减少不必要派发时才进入 gated。
+- 子代理建议不自动创建 Task、不隐藏 `agent_spawn`；只有相同主/子模型条件下对照显示无效子任务及总成本下降，才保留 advisory；
+- 评测区分弱标签与复核标签，不能以 `delegation.reason`、子任务成功或去重拒绝作为委派价值的直接真值。
 
 ### 17.5 回归入口
 
-实现后至少增加：
+按实际改动选择验证，以下是可能涉及的现有入口，不把全套命令作为文档修改或每个阶段的默认要求：
 
 ```bash
 npm run protocol:check
 cargo check -p magi-api
+cargo check -p magi-bridge-client -p magi-conversation-runtime
 cargo test -p magi-conversation-runtime context_authority
 cargo test -p magi-browser-authority
 cargo test -p magi-tool-runtime
@@ -713,22 +815,26 @@ npm --prefix web run check
 
 真实 Provider 验收必须使用隔离状态根和脱敏测试数据，分别覆盖本地 HTTP、远程 HTTPS、超时、非法响应、低置信度、候选过期和回退路径。
 
+新增 Decision 的 HTTP 合同和超时/取消定向测试；只有启用 Browser 控制片段时才运行对应 canonical/工具账本、历史协议及恢复回归。浏览器工具 schema/catalog 改动还应运行 `npm run browser-tool-catalog:check`，执行语义改动运行 `npm run test:browser-core`，真实 Chromium 行为按局部规则验收。P0 离线脚本不需要启动 UI 或修改生产循环。
+
 ### 17.6 离线基线与缓存
 
 - P0 报告包含：各决策点在主调用、token 和失败中的大致占比，浏览器步骤大致可替代的部分，以及 `cache_epoch` 变化的大致情况；
 - 报告明确给出每个 head 是否进入下一阶段及理由，未通过的 head 不留下在线代码；
 - 任何会改变工具表、系统前缀或模型的采用路径，都有采用前后缓存命中率的对照；
-- 远程 `shadow` 默认关闭，关闭时零外发；开启后外发字段与字段表一致。
+- 远程 `shadow` 默认关闭，关闭时零外发；开启后外发字段与字段表一致；
+- 报告分别给出净 LLM 调用数、端到端延迟和可核算费用；包含规则版对照、额外交接、fallback、失败恢复和冷热缓存；
+- gated 不要求私有权重或专属微调，但必须有可核验版本身份和对应 head 的评估/校准记录；仅浮动模型别名不能通过。
 
 ## 18. 结论
 
 Magi 接入 Laya/Jev 的价值成立的前提，是它能够替代或缩小真实的 LLM 路由工作。最有潜力的路径不是 Session 基础分类，也不是把 Laya 当作普通工具，而是：
 
-1. 浏览器动作头直接替代每步主 LLM 的动作选择；
-2. Turn 边界模型等级和工具面路由，减少高成本模型和工具输入；
-3. 知识、记忆和上下文需求路由，减少无效上下文；
-4. 子代理和执行进展建议，减少无效委派和重复循环。
+1. 有界浏览器片段替代纯动作选择的中间模型请求，保留主模型的理解、交接和核对；
+2. 获准的稳定边界模型等级和工具面路由，实际降低模型费用或定义 token；
+3. 知识、记忆和上下文需求路由，相对现有规则减少无效输入；
+4. 子代理和执行进展建议，仅在对照确认减少后续子任务、模型调用或成本后保留。
 
 所有路径都必须遵守同一个原则：**Laya 可以减少 Magi 需要让 LLM 做的路由判断，但不能减少 Magi 自己必须执行的权限、事实、恢复和副作用校验。**
 
-落地顺序上，本方案接受的是“先量化、再接入”：P0 的离线基线决定哪些 head 值得做、是否值得做。其中模型档位和工具面路由受 Prompt 缓存与用户模型选择约束，优先级低于浏览器动作和子代理委派；若 P0 看不出明确收益，止步是合格的结论。
+落地顺序上，本方案接受的是“先量化、再接入”：P0 先说明哪次 LLM 请求或哪些输入会消失，再决定工程投入。浏览器片段具有直接省调用的可能，也需要补齐明确执行合同；模型档位和工具面受缓存及用户绑定约束；子代理 advisory 只是对照实验。按净收益排序，不按数据易取排序；若 P0 看不出明确收益，止步是合格的结论。
