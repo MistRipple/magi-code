@@ -37,7 +37,7 @@
   const UPGRADE_DRAIN_SCOPE = '*';
 
   const plugin = $derived(item.installed);
-  const manifest = $derived<PluginManifest | null>(plugin?.manifest ?? item.bundled);
+  const manifest = $derived<PluginManifest | null>(plugin?.manifest ?? null);
   const settingsTab = $derived(plugin && plugin.activeScopes.length > 0 ? pluginSettingsTab(plugin.manifest) : null);
   const activation = $derived(plugin ? activationRow(plugin) : null);
   const removable = $derived(Boolean(plugin) && plugin!.activeScopes.length === 0 && plugin!.enabledScopes.length === 0);
@@ -86,7 +86,7 @@
 
   <div class="pane-actions">
     {#if plugin}
-      {#if item.updatable && (item.bundled || item.catalog)}
+      {#if item.updatable && item.catalog}
         <button class="btn btn--lg btn--primary" data-testid="plugin-detail-update" onclick={onUpdateFromCenter} disabled={busy}>
           <Icon name="download" size={13} />
           <span>{i18n.t('settings.plugins.center.update', { from: plugin.manifest.version })}</span>
@@ -111,7 +111,7 @@
     {:else}
       <button class="btn btn--lg btn--primary" data-testid="plugin-detail-install" onclick={onInstall} disabled={busy}>
         <Icon name="download" size={13} />
-        <span>{i18n.t('settings.plugins.installBundled')}</span>
+        <span>{i18n.t('settings.plugins.installAddress')}</span>
       </button>
     {/if}
   </div>
@@ -121,11 +121,11 @@
   {/if}
 
   <dl class="pane-facts">
-    <div><dt>{i18n.t('settings.plugins.detail.type')}</dt><dd>{item.bundled ? i18n.t('settings.plugins.detail.kindBuiltin') : i18n.t('settings.plugins.detail.kindExtension')}</dd></div>
-    <div><dt>{i18n.t('settings.plugins.detail.version')}</dt><dd>v{item.version}{#if item.updatable} → v{item.bundled?.version ?? item.catalog?.version}{/if}</dd></div>
+    <div><dt>{i18n.t('settings.plugins.detail.type')}</dt><dd>{i18n.t('settings.plugins.detail.kindExtension')}</dd></div>
+    <div><dt>{i18n.t('settings.plugins.detail.version')}</dt><dd>v{item.version}{#if item.updatable} → v{item.catalog?.version}{/if}</dd></div>
       <div data-testid="plugin-source" class:pane-warn={plugin?.source.kind === 'address' || plugin?.source.kind === 'local'}>
         <dt>{i18n.t('settings.plugins.detail.source')}</dt>
-        <dd>{#if plugin}{sourceLabel(plugin)} <span class="settings-mono" title={plugin.source.location}>{plugin.source.location}</span>{:else}{i18n.t(item.bundled ? 'settings.plugins.source.builtin' : item.catalog ? 'settings.plugins.source.center' : 'common.notProvided')}{/if}</dd>
+        <dd>{#if plugin}{sourceLabel(plugin)} <span class="settings-mono" title={plugin.source.location}>{plugin.source.location}</span>{:else}{i18n.t(item.catalog ? 'settings.plugins.source.center' : 'common.notProvided')}{/if}</dd>
       </div>
       <div><dt>{i18n.t('settings.plugins.detail.digest')}</dt><dd class="settings-mono" title={plugin?.digest}>{plugin?.digest.slice(0, 16) || i18n.t('common.notProvided')}</dd></div>
       <div><dt>{i18n.t('settings.plugins.detail.size')}</dt><dd>{!plugin && item.catalog ? `${Math.round(item.catalog.size / 1024)} KB` : i18n.t('common.notProvided')}</dd></div>

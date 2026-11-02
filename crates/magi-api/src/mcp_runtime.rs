@@ -700,18 +700,19 @@ impl McpServiceRuntime {
         Ok(self.status_locked(&control).await)
     }
 
-    /// 释放监听与隧道，但**不改持久化的开关与配置**：插件应用级停用或升级时调用，
-    /// 重新激活后 `start_if_enabled` 按原配置恢复（命名隧道的网络模式也一并恢复）。
-    pub(crate) async fn release(&self) {
+    /// 关闭持久化的本机开关、网络模式与直连，令牌与其余配置保留。仅用于迁移：
+    /// 旧版内置插件未激活时，服务本就不应运行。
+    pub(crate) async fn disable_persisted(&self) {
         let mut control = self.control.lock().await;
-        if self.network_enabled.load(Ordering::SeqCst) {
-            control.restore_network = self
-                .named
-                .lock()
-                .expect("mcp named lock poisoned")
-                .is_some();
+        control.enabled = false;
+        control.restore_network = false;
+        self.direct
+            .lock()
+            .expect("mcp direct lock poisoned")
+            .enabled = false;
+        if let Err(error) = self.persist(false, control.port) {
+            tracing::warn!(%error, "关闭 MCP 服务持久开关失败");
         }
-        self.stop_locked(&mut control).await;
     }
 
     /// daemon 启动时调用：上次是开启的就恢复。失败只记日志，不影响 daemon。
@@ -1645,36 +1646,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_stops_listening_but_keeps_the_saved_configuration_for_reactivation() {
+    async fn disable_persisted_turns_the_switch_off_but_keeps_tokens() {
         let dir = tempfile::tempdir().unwrap();
         let (path, _) = runtime_path_with_port(dir.path().join("mcp-server.json"));
-        let runtime = McpServiceRuntime::load(path);
+        let runtime = McpServiceRuntime::load(path.clone());
         let state = state();
-        let issued = runtime.issue_token(request()).await.unwrap();
-        let status = runtime.set_enabled(&state, true).await.unwrap();
-        let url = status.url.clone().unwrap();
-        assert_eq!(post(&url, Some(&issued.secret)).await.unwrap(), 200);
+        runtime.issue_token(request()).await.unwrap();
+        runtime.set_enabled(&state, true).await.unwrap();
+        let url = runtime.status().await.url.unwrap();
 
-        runtime.release().await;
-        assert!(post(&url, None).await.is_err(), "释放后端口不应再可达");
-        let status = runtime.status().await;
-        assert!(
-            !status.running && status.enabled,
-            "开关与配置保留，只是未运行"
-        );
-        assert_eq!(runtime.list_tokens().len(), 1, "令牌保留");
-
-        // 重新激活等同于重启后的恢复：按已保存的配置重新监听，原令牌继续有效。
-        runtime.start_if_enabled(&state).await;
-        let status = runtime.status().await;
-        assert!(status.running);
-        assert_eq!(
-            post(&status.url.clone().unwrap(), Some(&issued.secret))
-                .await
-                .unwrap(),
-            200
-        );
+        // 迁移场景：服务尚未运行就关闭持久开关，之后启动不会监听。
         runtime.set_enabled(&state, false).await.unwrap();
+        assert!(post(&url, None).await.is_err());
+        runtime.disable_persisted().await;
+        let reloaded = McpServiceRuntime::load(path);
+        reloaded.start_if_enabled(&state).await;
+        let status = reloaded.status().await;
+        assert!(!status.running && !status.enabled);
+        assert_eq!(reloaded.list_tokens().len(), 1, "令牌保留");
     }
 
     #[tokio::test]

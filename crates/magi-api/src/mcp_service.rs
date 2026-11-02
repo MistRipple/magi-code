@@ -1322,10 +1322,6 @@ mod tests {
         registry.register_default_builtins();
         std::mem::forget(state_dir);
         let state = base.with_tool_registry(registry);
-        crate::bundled_plugins::activate_bundled_for_test(
-            &state,
-            crate::bundled_plugins::MCP_SERVER_PLUGIN_ID,
-        );
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         state

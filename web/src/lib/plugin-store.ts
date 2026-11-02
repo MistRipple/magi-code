@@ -1,5 +1,5 @@
 /**
- * 插件商店的列表模型：把已安装插件、Magi 内置插件和插件中心目录合并成一份按 ID 去重的列表。
+ * 插件商店的列表模型：把已安装插件和插件中心目录合并成一份按 ID 去重的列表。
  * 只做展示投影，安装与生命周期事实仍在 daemon。
  */
 import type {
@@ -7,7 +7,6 @@ import type {
   PluginInstalled,
   PluginManifest,
 } from '../shared/app-server-protocol.generated';
-import { SETTINGS_TABS } from './settings-tabs';
 
 export type StoreStatus = 'active' | 'working' | 'installed' | 'available';
 export type StoreFilter = 'all' | 'installed' | 'available' | 'updatable';
@@ -19,10 +18,9 @@ export interface StoreItem {
   /** 已安装时是已安装版本，否则是可安装版本。 */
   version: string;
   installed: PluginInstalled | null;
-  bundled: PluginManifest | null;
   catalog: PluginCenterEntry | null;
   status: StoreStatus;
-  /** 内置包或插件中心有比已安装版本更新的版本。 */
+  /** 插件中心有比已安装版本更新的版本。 */
   updatable: boolean;
 }
 
@@ -46,7 +44,6 @@ function statusOf(installed: PluginInstalled | null): StoreStatus {
 
 export function buildStoreItems(
   installedPlugins: PluginInstalled[],
-  bundled: PluginManifest[],
   catalog: PluginCenterEntry[],
   text: Text,
 ): StoreItem[] {
@@ -58,24 +55,8 @@ export function buildStoreItems(
       description: text(installed.manifest, 'description'),
       version: installed.manifest.version,
       installed,
-      bundled: bundled.find((manifest) => manifest.id === installed.manifest.id) ?? null,
       catalog: null,
       status: statusOf(installed),
-      updatable: bundled.some((manifest) => manifest.id === installed.manifest.id
-        && newerBundledVersion(manifest.version, installed.manifest.version)),
-    });
-  }
-  for (const manifest of bundled) {
-    if (items.has(manifest.id)) continue;
-    items.set(manifest.id, {
-      id: manifest.id,
-      name: text(manifest, 'name'),
-      description: text(manifest, 'description'),
-      version: manifest.version,
-      installed: null,
-      bundled: manifest,
-      catalog: null,
-      status: 'available',
       updatable: false,
     });
   }
@@ -83,7 +64,7 @@ export function buildStoreItems(
     const existing = items.get(entry.id);
     if (existing) {
       existing.catalog = entry;
-      if (!existing.bundled) existing.updatable = entry.state === 'updatable';
+      existing.updatable = entry.state === 'updatable';
       continue;
     }
     items.set(entry.id, {
@@ -92,7 +73,6 @@ export function buildStoreItems(
       description: entry.description,
       version: entry.version,
       installed: null,
-      bundled: null,
       catalog: entry,
       status: 'available',
       updatable: false,
@@ -103,17 +83,6 @@ export function buildStoreItems(
       || STATUS_ORDER[left.status] - STATUS_ORDER[right.status]
       || left.name.localeCompare(right.name),
   );
-}
-
-/** 内置清单使用稳定的 x.y.z 版本；未知格式不推断更新。 */
-function newerBundledVersion(candidate: string, installed: string): boolean {
-  if (!/^\d+\.\d+\.\d+$/u.test(candidate) || !/^\d+\.\d+\.\d+$/u.test(installed)) return false;
-  const left = candidate.split('.').map(Number);
-  const right = installed.split('.').map(Number);
-  for (let i = 0; i < 3; i++) {
-    if (left[i] !== right[i]) return left[i]! > right[i]!;
-  }
-  return false;
 }
 
 export function filterStoreItems(items: StoreItem[], filter: StoreFilter, query: string): StoreItem[] {
@@ -136,12 +105,10 @@ export function paginate<T>(items: T[], page: number, pageSize: number): { rows:
 }
 
 /**
- * 插件在设置里的专属分类（用于从插件中心一键跳转）：第一方插件有固定分类，
- * 其余插件取声明的设置视图或自动生成的设置表单。没有设置时返回 null。
+ * 插件在设置里的专属分类（用于从插件中心一键跳转）：取声明的设置视图或自动生成的设置表单。
+ * 没有设置时返回 null。
  */
 export function pluginSettingsTab(manifest: PluginManifest): string | null {
-  const fixed = SETTINGS_TABS.find((tab) => tab.requiresPlugin === manifest.id);
-  if (fixed) return fixed.id;
   const view = (manifest.contributions.views ?? []).find((entry) => entry.placements.includes('settings'));
   if (view) return `plugin:${manifest.id}:${view.id}`;
   const schema = manifest.settingsSchema as { properties?: Record<string, unknown> } | undefined;

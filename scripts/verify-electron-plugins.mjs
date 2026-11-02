@@ -651,28 +651,15 @@ try {
     centerServer.close();
   }
 
-  // 10d. MCP 服务插件壳：未激活时管理面拒绝且不监听；激活后可用；停用即释放；重新激活按原配置恢复
-  const MCP_ID = "magi.mcp-server";
+  // 10d. MCP 服务是原生功能：不依赖任何插件，管理面始终可用，监听只由自己的开关控制
+  check("MCP 内置插件目录入口已删除", [404, 405].includes((await api(page, "/api/plugins/bundled")).status));
   const before = await api(page, "/api/mcp-server/status");
-  check("未安装 MCP 服务插件时管理面被拒绝", before.status === 403, String(before.status));
-  check("未安装时设置导航没有 MCP 服务分类", !(await exists(page, '[data-testid="settings-nav-mcpServer"]')));
-  const mcpInstalled = await post(page, `/api/plugins/bundled/${MCP_ID}/install`, {});
-  const mcpManifest = JSON.parse(mcpInstalled.body).plugins.find((entry) => entry.manifest.id === MCP_ID)?.manifest;
-  check("内置 MCP 服务插件安装成功", mcpInstalled.status === 200 && Boolean(mcpManifest), mcpInstalled.body.slice(0, 160));
-  await post(page, `/api/plugins/${MCP_ID}/enable`, { scope: "application" });
-  await post(page, `/api/plugins/${MCP_ID}/authorize`, { scope: "application", grants: mcpManifest.permissions });
-  const mcpActivated = await post(page, `/api/plugins/${MCP_ID}/activate`, { scope: "application" });
-  check("MCP 服务插件应用级激活成功", mcpActivated.status === 200, mcpActivated.body.slice(0, 160));
+  check("未安装任何插件时 MCP 服务管理面可用", before.status === 200, String(before.status));
+  check("设置导航始终有 MCP 服务分类", await exists(page, '[data-testid="settings-nav-mcpServer"]'));
   const mcpEnabled = JSON.parse((await post(page, "/api/mcp-server/enabled", { enabled: true })).body);
-  check("激活后可开启服务并监听本机端口", mcpEnabled.running === true && /^http:\/\/127\.0\.0\.1:\d+/.test(mcpEnabled.url ?? ""), JSON.stringify(mcpEnabled).slice(0, 200));
+  check("可开启服务并监听本机端口", mcpEnabled.running === true && /^http:\/\/127\.0\.0\.1:\d+/.test(mcpEnabled.url ?? ""), JSON.stringify(mcpEnabled).slice(0, 200));
   const reachable = async (url) => fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }).then((response) => response.status).catch(() => null);
   check("监听端口要求令牌（无令牌 401）", (await reachable(mcpEnabled.url)) === 401);
-  const mcpOff = await post(page, `/api/plugins/${MCP_ID}/deactivate`, { scope: "application" });
-  check("停用 MCP 服务插件成功", mcpOff.status === 200, mcpOff.body.slice(0, 160));
-  check("停用后监听端口立即释放", (await reachable(mcpEnabled.url)) === null);
-  check("停用后管理面被拒绝", (await api(page, "/api/mcp-server/status")).status === 403);
-  await post(page, `/api/plugins/${MCP_ID}/authorize`, { scope: "application", grants: mcpManifest.permissions });
-  await post(page, `/api/plugins/${MCP_ID}/activate`, { scope: "application" });
   // MCP 客户端设置：工具目录固定完整开放，只选择逐次询问或开放全部权限。
   await page.call("Page.reload", { ignoreCache: true });
   await waitFor(() => exists(page, '[data-testid="input-textarea"]'), "MCP 激活后工作台重新加载");
@@ -695,11 +682,7 @@ try {
   })()`);
   check("开放权限无需第二个风险确认，网络开关仍独立可选", !(await exists(page, '[data-mcp-confirm-risk="1"]')) && await exists(page, '[data-mcp-allow-network="1"]'));
   await page.evaluate(`(() => [...document.querySelectorAll('form.create-form')].at(-1)?.querySelector('button[type="button"]')?.click())()`);
-  const restoredUrl = await waitFor(async () => {
-    const status = JSON.parse((await api(page, "/api/mcp-server/status")).body);
-    return status.running ? status.url : null;
-  }, "重新激活后服务按已保存的配置恢复", 30_000);
-  check("重新激活后按原配置恢复监听（端口不变）", restoredUrl === mcpEnabled.url, `${restoredUrl} vs ${mcpEnabled.url}`);
+  const restoredUrl = mcpEnabled.url;
   // 10e. 外部会话：外部 agent 通过 MCP 调用本地工具的过程，是对应工作区下的一个真正的（只读）会话，
   // 调用写进它的 canonical 时间线，在主对话区里和内部对话同一套展示
   await writeFile(join(workspaceRoot, "external-read.txt"), "hello from an external agent");
@@ -1036,7 +1019,6 @@ try {
   await api(page, "/api/mcp-server/direct", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: false }) });
   await click(page, '[data-testid="settings-back"]');
   await post(page, "/api/mcp-server/enabled", { enabled: false });
-  await post(page, `/api/plugins/${MCP_ID}/deactivate`, { scope: "application" });
 } catch (error) {
   failure = error;
   if (page) {

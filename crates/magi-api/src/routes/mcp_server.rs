@@ -22,8 +22,8 @@ use crate::{errors::ApiError, state::ApiState};
 const DEFAULT_TOKEN_TTL_DAYS: u32 = 90;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
-pub fn routes(state: ApiState) -> Router<ApiState> {
-    let management = Router::new()
+pub fn routes() -> Router<ApiState> {
+    Router::new()
         .route("/mcp-server/status", get(get_status))
         .route("/mcp-server/enabled", post(set_enabled))
         .route("/mcp-server/network", post(set_network))
@@ -45,42 +45,8 @@ pub fn routes(state: ApiState) -> Router<ApiState> {
         .route("/mcp-server/audit", get(list_audit).delete(clear_audit))
         .route("/mcp-server/sessions", get(list_sessions))
         .route("/mcp-server/external", put(set_external_retention))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            require_mcp_plugin,
-        ));
-    let approvals = Router::new()
         .route("/mcp-server/approvals", get(list_approvals))
         .route("/mcp-server/approvals/resolve", post(resolve_approval))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state,
-            require_approval_plugin,
-        ));
-    management.merge(approvals)
-}
-
-async fn require_mcp_plugin(
-    State(state): State<ApiState>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Result<axum::response::Response, ApiError> {
-    if !state.mcp_server_plugin_active() {
-        return Err(ApiError::Forbidden("MCP 服务插件未安装或未激活".into()));
-    }
-    Ok(next.run(request).await)
-}
-
-async fn require_approval_plugin(
-    State(state): State<ApiState>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Result<axum::response::Response, ApiError> {
-    if !state.mcp_server_plugin_active() {
-        return Err(ApiError::Forbidden(
-            "MCP 服务未激活，没有待确认的外部调用".into(),
-        ));
-    }
-    Ok(next.run(request).await)
 }
 
 fn require_local(headers: &HeaderMap) -> Result<(), ApiError> {
@@ -1139,10 +1105,6 @@ mod tests {
                 AbsolutePath::new(dir.path().display().to_string()),
             )
             .unwrap();
-        crate::bundled_plugins::activate_bundled_for_test(
-            &state,
-            crate::bundled_plugins::MCP_SERVER_PLUGIN_ID,
-        );
         (state, dir)
     }
 

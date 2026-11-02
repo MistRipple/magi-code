@@ -14,7 +14,7 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 fn manifest(with_permission: bool) -> Value {
     json!({
         "sdkVersion":1,"id":"acme.lifecycle","version":"1.0.0","name":"Lifecycle","description":"",
-        "backend":"plugin.mjs",        "permissions": if with_permission { json!([{"kind":"storage","scope":"workspace","targets":["cache"]}]) } else { json!([]) },
+        "backend":"plugin.mjs",        "permissions": if with_permission { json!([{"kind":"storage","scope":"application","targets":["cache"]}]) } else { json!([]) },
         "dataSchemaVersion":1,"settingsSchema":{"type":"object","additionalProperties":false},
         "contributions":{"commands":[{"id":"open","title":"Open","description":""}]}
     })
@@ -59,7 +59,7 @@ fn install_enable_authorize_activate_and_reopen_use_one_immutable_package() {
             "application",
             vec![magi_plugin_system::PluginPermission {
                 kind: magi_plugin_system::PluginPermissionKind::Storage,
-                scope: magi_plugin_system::PluginScopeKind::Workspace,
+                scope: magi_plugin_system::PluginScopeKind::Application,
                 targets: vec!["cache".into()],
             }],
         )
@@ -91,9 +91,9 @@ fn lifecycle_rejects_out_of_manifest_grants_and_uninstall_with_enabled_scope() {
         )
         .unwrap();
     let grant = magi_plugin_system::PluginPermission {
-        kind: magi_plugin_system::PluginPermissionKind::Network,
-        scope: magi_plugin_system::PluginScopeKind::Workspace,
-        targets: vec!["example.invalid".into()],
+        kind: magi_plugin_system::PluginPermissionKind::Storage,
+        scope: magi_plugin_system::PluginScopeKind::Application,
+        targets: vec!["undeclared-resource".into()],
     };
     assert!(
         manager
@@ -133,7 +133,7 @@ fn version_two() -> PluginPackage {
 fn grant() -> PluginPermission {
     PluginPermission {
         kind: PluginPermissionKind::Storage,
-        scope: PluginScopeKind::Workspace,
+        scope: PluginScopeKind::Application,
         targets: vec!["cache".into()],
     }
 }
@@ -823,7 +823,7 @@ fn resource_permission_is_required_for_each_declared_resource() {
             "application",
             vec![magi_plugin_system::PluginPermission {
                 kind: magi_plugin_system::PluginPermissionKind::Storage,
-                scope: magi_plugin_system::PluginScopeKind::Workspace,
+                scope: magi_plugin_system::PluginScopeKind::Application,
                 targets: vec!["cache".into()],
             }],
         )
@@ -859,7 +859,7 @@ fn activation_requires_every_declared_permission_to_be_granted() {
         "sdkVersion":1,"id":"acme.shared","version":"1.0.0","name":"Shared","description":"",
         "backend":"plugin.mjs","permissions":[
             {"kind":"storage","scope":"application","targets":["session"]},
-            {"kind":"storage","scope":"workspace","targets":["cache"]}
+            {"kind":"storage","scope":"application","targets":["cache"]}
         ],
         "dataSchemaVersion":1,"settingsSchema":{"type":"object","additionalProperties":false},
         "contributions":{"commands":[{"id":"open","title":"Open","description":""}]}
@@ -875,7 +875,7 @@ fn activation_requires_every_declared_permission_to_be_granted() {
     manager.enable("acme.shared", "application").unwrap();
     let workspace_grant = PluginPermission {
         kind: PluginPermissionKind::Storage,
-        scope: PluginScopeKind::Workspace,
+        scope: PluginScopeKind::Application,
         targets: vec!["cache".into()],
     };
     let application_grant = PluginPermission {
@@ -1099,7 +1099,7 @@ fn preview_of_an_upgrade_reports_permission_diff_and_blocked_data_migration() {
 
     let mut widened = manifest(false);
     widened["version"] = json!("1.2.0");
-    widened["permissions"] = json!([{"kind":"storage","scope":"workspace","targets":["cache"]}]);
+    widened["permissions"] = json!([{"kind":"storage","scope":"application","targets":["cache"]}]);
     let widened = package_from_manifest(widened);
     let preview = manager.preview(&widened, &local("v2.zip")).unwrap();
     assert_eq!(
@@ -1113,7 +1113,7 @@ fn preview_of_an_upgrade_reports_permission_diff_and_blocked_data_migration() {
 
     // 目标范围变化被视为新增加移除，而不是静默沿用；目标顺序不影响判断。
     let mut base = manifest(true);
-    base["permissions"] = json!([{"kind":"storage","scope":"workspace","targets":["b","a"]}]);
+    base["permissions"] = json!([{"kind":"storage","scope":"application","targets":["b","a"]}]);
     let root2 = tempdir().unwrap();
     let mut second = PluginManager::open(root2.path()).unwrap();
     second
@@ -1121,7 +1121,8 @@ fn preview_of_an_upgrade_reports_permission_diff_and_blocked_data_migration() {
         .unwrap();
     let mut reordered = manifest(true);
     reordered["version"] = json!("1.0.1");
-    reordered["permissions"] = json!([{"kind":"storage","scope":"workspace","targets":["a","b"]}]);
+    reordered["permissions"] =
+        json!([{"kind":"storage","scope":"application","targets":["a","b"]}]);
     let preview = second
         .preview(&package_from_manifest(reordered), &local("v2.zip"))
         .unwrap();
@@ -1129,7 +1130,7 @@ fn preview_of_an_upgrade_reports_permission_diff_and_blocked_data_migration() {
     let mut expanded = manifest(true);
     expanded["version"] = json!("1.0.2");
     expanded["permissions"] =
-        json!([{"kind":"storage","scope":"workspace","targets":["a","b","c"]}]);
+        json!([{"kind":"storage","scope":"application","targets":["a","b","c"]}]);
     let preview = second
         .preview(&package_from_manifest(expanded), &local("v3.zip"))
         .unwrap();
@@ -1217,14 +1218,14 @@ mod data_migration {
     fn full_grant() -> PluginPermission {
         PluginPermission {
             kind: PluginPermissionKind::Storage,
-            scope: PluginScopeKind::Workspace,
+            scope: PluginScopeKind::Application,
             targets: vec!["cache".into(), "extra".into()],
         }
     }
 
     fn with_resources(mut value: Value) -> Value {
         value["permissions"] = json!([
-            {"kind":"storage","scope":"workspace","targets":["cache","extra"]}
+            {"kind":"storage","scope":"application","targets":["cache","extra"]}
         ]);
         value["contributions"]["resources"] = json!([
             {"id":"cache","title":"Cache","description":""},
@@ -1669,6 +1670,13 @@ fn retired_builtin_is_removed_on_reopen_without_erasing_resources() {
         retained
     );
     assert!(!reopened.state().plugins.contains_key("acme.lifecycle"));
+    assert_eq!(
+        reopened.retired_builtins(),
+        [magi_plugin_system::RetiredBuiltin {
+            id: "acme.lifecycle".into(),
+            was_active: true
+        }]
+    );
     assert!(root.path().join("resources.json").exists());
     assert!(std::fs::read_dir(root.path()).unwrap().any(|entry| {
         entry

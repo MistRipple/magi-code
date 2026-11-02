@@ -2042,25 +2042,6 @@ fn browser_authority_api_error(error: BrowserAuthorityError) -> ApiError {
 }
 
 impl ApiState {
-    /// Magi MCP 服务（对外开放工具）只能在第一方插件的应用实例激活后使用。
-    pub(crate) fn mcp_server_plugin_active(&self) -> bool {
-        self.plugin_active(crate::bundled_plugins::MCP_SERVER_PLUGIN_ID)
-    }
-
-    fn plugin_active(&self, plugin_id: &str) -> bool {
-        self.plugin_manager
-            .lock()
-            .ok()
-            .and_then(|manager| {
-                manager
-                    .is_active_for_scope(plugin_id, magi_plugin_system::APPLICATION_SCOPE)
-                    .ok()
-            })
-            .unwrap_or(false)
-    }
-}
-
-impl ApiState {
     pub(crate) async fn lock_app_server_request(
         &self,
         request_id: &str,
@@ -3758,14 +3739,29 @@ impl ApiState {
         self
     }
 
-    /// 只有 MCP 服务插件已激活才按已保存的配置恢复监听；daemon 启动与插件激活共用此入口。
+    /// 按已保存的配置恢复 MCP 服务监听（daemon 启动时调用）。MCP 服务是原生功能，
+    /// 只由自己的开关控制，不依赖任何插件状态。
+    ///
+    /// 旧版本把它显示为内置插件：若退役的旧记录在退役前并未激活，则旧语义下服务本就不会运行，
+    /// 这里先把持久开关关闭，不让升级悄悄开启一个对外监听。
     pub fn start_mcp_service_if_enabled(&self) {
         let state = self.clone();
+        let was_inactive = self
+            .plugin_manager
+            .lock()
+            .map(|manager| {
+                manager
+                    .retired_builtins()
+                    .iter()
+                    .any(|retired| retired.id == "magi.mcp-server" && !retired.was_active)
+            })
+            .unwrap_or(false);
         tokio::spawn(async move {
-            if state.mcp_server_plugin_active() {
-                state.mcp_service.start_if_enabled(&state).await;
-                state.mcp_service.external_turns.start_maintenance(&state);
+            if was_inactive {
+                state.mcp_service.disable_persisted().await;
             }
+            state.mcp_service.start_if_enabled(&state).await;
+            state.mcp_service.external_turns.start_maintenance(&state);
         });
     }
 

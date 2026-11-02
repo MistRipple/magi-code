@@ -575,7 +575,7 @@ Windows 使用 `py -3 catalog.py example.echo-1.0.0.zip`。脚本生成只有这
 
 每条权限格式为 `{ "kind": "storage", "scope": "application", "targets": ["note"] }`。`targets` 为精确目标列表，每项非空且最长 1024，最多 64 项；`"*"` 不表示通配授权。完全相同的权限声明不能重复。激活前必须获得清单全部权限的授权；授权绑定本次 ZIP 摘要，升级后需要重新授权。
 
-插件全局安装、授权、启用并存储数据，运行作用域固定为 `application`。权限声明的 `scope` 字段允许 `application`、`workspace`，但 `workspace` 声明不会创建按工作区独立的插件实例或数据；新插件应使用 `application`。视图收到的 `scope` 也为 `application`，不要自行拼接工作区 ID。
+插件全局安装、授权、启用并存储数据，运行作用域固定为 `application`。权限与 Browser surface 声明的 `scope` 只接受 `application`；`workspace` 会在校验阶段被拒绝。视图收到的 `scope` 也为 `application`，不要自行拼接工作区 ID。
 
 | `kind` | `targets` 内容 | 当前可用能力 |
 | --- | --- | --- |
@@ -583,7 +583,8 @@ Windows 使用 `py -3 catalog.py example.echo-1.0.0.zip`。脚本生成只有这
 | `tools` | 本插件工具贡献 ID | 将对应工具暴露给模型并允许进入工具执行；写工具仍受会话访问模式约束 |
 | `models` | 引擎贡献 ID | 会话引擎准入检查；工作流模型动作由宿主按会话配置执行，不是任意模型调用 SDK |
 | `browser` | surface 贡献 ID，与 surface 的 `scope` 一致 | 原生 surface 授权检查；没有通用页面驱动 SDK |
-| `filesRead`、`filesWrite`、`network` | 清单可声明目标 | 当前通用后台没有对应 SDK 操作；申请这些权限不会获得文件或网络 API |
+
+清单**不接受** `filesRead`、`filesWrite`、`network`：它们没有任何强制点，声明会在校验阶段被拒绝。
 
 命令没有独立的 `commands` 权限种类；执行时要求插件已激活，其内部资源操作仍检查 `storage` 权限。插件设置不是秘密存储，不要把 API 密钥、密码放进资源、设置、工具结果或页面消息。
 
@@ -713,7 +714,7 @@ if (kind === 'engine' && id === 'echo') {
 
 ### 当前不开放的通用扩展
 
-- **原生浏览器**：`browserSurfaces` 是声明，不提供第三方页面驱动或任意 URL 挂载 API。字段 `scope` 允许 `application/workspace`、`persistence` 允许 `persistent/ephemeral`、`closeAction` 允许 `hide/destroy`，其余两个字段为布尔值；当前宿主只接受 `scope:'application', persistence:'persistent', keepMounted:true, closeAction:'hide'`，后台推理为真时还必须保持挂载。该组合也不代表任意第三方 surface 都已有挂载实现。
+- **原生浏览器**：`browserSurfaces` 是声明，不提供第三方页面驱动或任意 URL 挂载 API。字段 `scope` 只允许 `application`、`persistence` 允许 `persistent/ephemeral`、`closeAction` 允许 `hide/destroy`，其余两个字段为布尔值；当前宿主只接受 `scope:'application', persistence:'persistent', keepMounted:true, closeAction:'hide'`，后台推理为真时还必须保持挂载。该组合也不代表任意第三方 surface 都已有挂载实现。
 - **其他扩展**：当前没有通用 Skill/MCP 服务清单贡献、生命周期脚本钩子、插件间依赖、插件自带外部程序或后台常驻任务接口。不要把其他产品的插件清单直接套用到 Magi。
 
 ### 插件中心目录与可选签名

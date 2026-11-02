@@ -678,9 +678,9 @@ export type ServerNotification = JsonRpcServerNotification;
 
 export type ServerResponse = JsonRpcServerResponse;
 
-export type PluginScopeKind = "workspace" | "application";
+export type PluginScopeKind = "application";
 
-export type PluginPermissionKind = "storage" | "filesRead" | "filesWrite" | "network" | "tools" | "models" | "browser";
+export type PluginPermissionKind = "storage" | "tools" | "models" | "browser";
 
 export interface PluginPermission {
   kind: PluginPermissionKind;

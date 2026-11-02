@@ -7,9 +7,7 @@ use magi_app_server_protocol::generated::{
     PluginInstalled as PluginInstalledProjection, PluginLifecycleLimits, PluginList,
     PluginScopeGrant, PluginSourceKind, PluginSourceProjection,
 };
-use magi_app_server_protocol::{
-    PluginManifest, PluginPermission, PluginPermissionKind, PluginScopeKind,
-};
+use magi_app_server_protocol::{PluginManifest, PluginPermission, PluginPermissionKind};
 use magi_core::{UtcMillis, fs_atomic::write_atomic};
 use magi_plugin_runtime::RunCancellation;
 use serde::{Deserialize, Serialize};
@@ -34,8 +32,9 @@ const STATE_VERSION: u16 = 1;
 const SETTINGS_RESOURCE_ID: &str = "__settings";
 const UPGRADE_OPERATION_FILE: &str = "upgrade-operation.json";
 /// 第一方插件身份由 Magi 自己提供，外部包不能占用同一身份再获得原生宿主能力。
-/// 新增第一方插件时必须同时加入这里，并继续通过统一的包安装入口落盘。
-const BUILTIN_PLUGIN_IDS: &[&str] = &["magi.mcp-server"];
+/// 原生功能（如 MCP 服务）不再借占位包显示为插件，目前没有第一方插件包；
+/// 旧版本遗留的内置记录在打开时退役（见 `retired_builtins`）。
+const BUILTIN_PLUGIN_IDS: &[&str] = &[];
 /// 停用与升级时等待在途运行自然结束的期限，到期后统一取消。
 pub const PLUGIN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// 取消在途运行后等待其结算并释放租约的期限。
@@ -110,6 +109,15 @@ pub struct PluginManager {
     draining_scopes: BTreeMap<(String, String), UtcMillis>,
     /// 已提交但暂存数据尚未应用的升级操作：期间拒绝激活，避免新代码读到旧格式数据。
     pending_upgrade: Option<UpgradeOperation>,
+    /// 本次打开时退役的旧内置插件记录，供宿主把对应原生功能迁到自己的开关上。
+    retired_builtins: Vec<RetiredBuiltin>,
+}
+
+/// 被退役的内置插件：`was_active` 为退役前它是否在应用作用域激活。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetiredBuiltin {
+    pub id: String,
+    pub was_active: bool,
 }
 
 /// 覆盖插件全部作用域的排空键，仅供升级使用；不是合法的作用域标识。
@@ -154,6 +162,11 @@ impl PluginManager {
         Ok(package)
     }
 
+    /// 本次打开时退役的内置插件记录。
+    pub fn retired_builtins(&self) -> &[RetiredBuiltin] {
+        &self.retired_builtins
+    }
+
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, PluginError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
@@ -189,12 +202,13 @@ impl PluginManager {
             next_lease_id: 0,
             draining_scopes: BTreeMap::new(),
             pending_upgrade: None,
+            retired_builtins: Vec::new(),
         };
         // 先按原提交事实完成数据转换，不能把已提交升级误判成未提交并丢弃暂存数据。
         manager.recover_upgrade_operation()?;
         // 内置包目录是宿主支持能力的唯一入口；停发的内置包不能在重启后恢复激活。
         // 先备份安装事实，再移除注册表记录。资源数据保留，不把退役包当作外部插件加载。
-        let retired: Vec<_> = manager
+        let retired_records: Vec<_> = manager
             .state
             .plugins
             .values()
@@ -202,8 +216,12 @@ impl PluginManager {
                 matches!(plugin.source, PluginSource::Builtin { .. })
                     && !BUILTIN_PLUGIN_IDS.contains(&plugin.id.as_str())
             })
-            .map(|plugin| plugin.id.clone())
+            .map(|plugin| RetiredBuiltin {
+                id: plugin.id.clone(),
+                was_active: plugin.active_scopes.contains(crate::APPLICATION_SCOPE),
+            })
             .collect();
+        let retired: Vec<_> = retired_records.iter().map(|r| r.id.clone()).collect();
         if !retired.is_empty() {
             let backup = manager.root.join(format!(
                 "{STATE_FILE}.retired-builtins-{}-{}",
@@ -221,6 +239,7 @@ impl PluginManager {
             }
             manager.commit(next)?;
             missing.retain(|id| !retired.contains(id));
+            manager.retired_builtins = retired_records;
         }
 
         if !missing.is_empty() {
@@ -901,8 +920,7 @@ fn ensure_host_supports_surfaces(manifest: &PluginManifest) -> Result<(), Plugin
         .browser_surfaces
         .iter()
         .find(|surface| {
-            surface.scope != PluginScopeKind::Application
-                || surface.persistence != PluginSurfacePersistence::Persistent
+            surface.persistence != PluginSurfacePersistence::Persistent
                 || !surface.keep_mounted
                 || surface.close_action != PluginSurfaceCloseAction::Hide
         });

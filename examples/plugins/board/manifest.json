@@ -6,8 +6,8 @@
   "description": "展示工具、命令、资源同步、设置与隔离视图如何在同一个插件里协作的最小示例。",
   "backend": "plugin.mjs",
   "permissions": [
-    { "kind": "storage", "scope": "workspace", "targets": ["board", "__settings"] },
-    { "kind": "tools", "scope": "workspace", "targets": ["board-summary", "board-add"] }
+    { "kind": "storage", "scope": "application", "targets": ["board", "__settings"] },
+    { "kind": "tools", "scope": "application", "targets": ["board-summary", "board-add"] }
   ],
   "dataSchemaVersion": 1,
   "settingsSchema": {

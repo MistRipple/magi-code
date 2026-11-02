@@ -2310,7 +2310,6 @@
     "PluginScopeKind": {
       "type": "string",
       "enum": [
-        "workspace",
         "application"
       ]
     },
@@ -2318,9 +2317,6 @@
       "type": "string",
       "enum": [
         "storage",
-        "filesRead",
-        "filesWrite",
-        "network",
         "tools",
         "models",
         "browser"

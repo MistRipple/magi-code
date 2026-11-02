@@ -81,7 +81,7 @@ await withGoldenViteServer(async server => {
     assert.ok(model.includes(i18n.t('settings.status.notConfigured')));
     assert.ok(!model.includes(i18n.t('settings.model.reasoning.loading')), 'no model is unconfigured, not perpetually loading');
 
-    const item = { id: 'fixture', name: 'Fixture', description: '', version: '1.0', installed: null, bundled: null, catalog: null, status: 'available', updatable: false };
+    const item = { id: 'fixture', name: 'Fixture', description: '', version: '1.0', installed: null, catalog: null, status: 'available', updatable: false };
     const plugin = text(render(Plugin, { props: { item, now: 0, busy: false, onInstall: noop, onUpdateFromCenter: noop, onUpgradeFile: noop, onUninstall: noop, onActivate: noop, onDeactivate: noop, onDisable: noop, onOpenSettings: noop } }).body);
     for (const key of ['type', 'version', 'source', 'digest', 'size']) assert.ok(plugin.includes(i18n.t(`settings.plugins.detail.${key}`)));
     assert.ok(plugin.includes(missing()));

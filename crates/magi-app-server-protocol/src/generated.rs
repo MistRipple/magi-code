@@ -1507,8 +1507,6 @@ pub type ServerResponse = JsonRpcServerResponse;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PluginScopeKind {
-    #[serde(rename = "workspace")]
-    Workspace,
     #[serde(rename = "application")]
     Application,
 }
@@ -1518,12 +1516,6 @@ pub enum PluginScopeKind {
 pub enum PluginPermissionKind {
     #[serde(rename = "storage")]
     Storage,
-    #[serde(rename = "filesRead")]
-    FilesRead,
-    #[serde(rename = "filesWrite")]
-    FilesWrite,
-    #[serde(rename = "network")]
-    Network,
     #[serde(rename = "tools")]
     Tools,
     #[serde(rename = "models")]

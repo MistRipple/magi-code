@@ -7,9 +7,7 @@
     deactivatePlugin,
     disablePlugin,
     fetchPluginCenter,
-    installBundledPlugin,
     installFromPluginCenter,
-    listBundledPlugins,
     listInstalledPlugins,
     previewPluginCandidate,
     savePluginCenterConfig,
@@ -27,7 +25,6 @@
   import type { PluginCandidatePreview, PluginCenterProjection, PluginList, PluginManifest, PluginPermission } from '../shared/app-server-protocol.generated';
 
   let list = $state<PluginList | null>(null);
-  let bundledPlugins = $state<PluginManifest[]>([]);
   let address = $state('');
   let busy = $state(false);
   let message = $state('');
@@ -49,10 +46,9 @@
 
   async function refresh(): Promise<void> {
     const requestSeq = ++listRequestSeq;
-    const [installed, bundled] = await Promise.all([listInstalledPlugins(), listBundledPlugins()]);
+    const installed = await listInstalledPlugins();
     if (requestSeq !== listRequestSeq) return;
     list = installed;
-    bundledPlugins = bundled;
     await refreshCenter();
   }
 
@@ -178,11 +174,9 @@
 
   const hasCatalog = $derived(Boolean(center && center.entries.length > 0));
 
-  /** 第一方插件的名称与说明随界面语言翻译；其他插件显示清单原文。 */
+  /** 插件的名称与说明显示清单原文。 */
   function manifestText(manifest: PluginManifest, field: 'name' | 'description'): string {
-    const key = `settings.plugins.builtin.${manifest.id}.${field}`;
-    const text = i18n.t(key);
-    return text === key ? manifest[field] : text;
+    return manifest[field];
   }
 
   // ---- 商店：左侧列表（合并已安装、内置与插件中心，搜索 + 过滤 + 分页），右侧是所选插件的详情 ----
@@ -194,7 +188,7 @@
   let selectedId = $state<string | null>(null);
   let sourcesOpen = $state(false);
 
-  const items = $derived(buildStoreItems(plugins, bundledPlugins, center?.entries ?? [], manifestText));
+  const items = $derived(buildStoreItems(plugins, center?.entries ?? [], manifestText));
   const filtered = $derived(filterStoreItems(items, filter, query));
   const view = $derived(paginate(filtered, page, PAGE_SIZE));
   /** 默认选中当前页第一项；所选插件不在当前页（翻页、过滤后）时回到第一项。 */
@@ -225,19 +219,10 @@
   }
 
   async function installItem(item: StoreItem): Promise<void> {
-    // 内置包优先：第一方插件只接受内置来源，且离线可装。
-    if (item.bundled) {
-      await run(() => installBundledPlugin(item.id));
-    } else if (item.catalog) {
-      await run(() => installFromPluginCenter(item.catalog!));
-    }
+    if (item.catalog) await run(() => installFromPluginCenter(item.catalog!));
   }
 
   async function updateFromCenter(item: StoreItem): Promise<void> {
-    if (item.bundled) {
-      await run(() => installBundledPlugin(item.id));
-      return;
-    }
     if (!item.catalog) return;
     await run(() => installFromPluginCenter(item.catalog!));
   }
@@ -282,7 +267,7 @@
                   ? i18n.t('settings.plugins.candidate.versionChange', { from: preview.installedVersion, to: preview.manifest.version })
                   : `v${preview.manifest.version}`}
               </span>
-              <span class="settings-chip settings-chip--accent">{preview.operation === 'upgrade' ? i18n.t('settings.plugins.upgrade') : i18n.t('settings.plugins.installBundled')}</span>
+              <span class="settings-chip settings-chip--accent">{preview.operation === 'upgrade' ? i18n.t('settings.plugins.upgrade') : i18n.t('settings.plugins.installAddress')}</span>
             </div>
             <span class="settings-row-desc">{manifestText(preview.manifest, 'description') || preview.manifest.id}</span>
           </div>

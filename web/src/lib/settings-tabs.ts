@@ -18,8 +18,6 @@ export interface SettingsTabDefinition {
   icon: IconName;
   titleKey: string;
   descKey: string;
-  /** 仅当该第一方插件在应用作用域已激活时才出现在导航里。 */
-  requiresPlugin?: string;
 }
 
 /** 设置分类的唯一清单：导航与页头标题都从这里生成，顺序即导航顺序。 */
@@ -34,5 +32,5 @@ export const SETTINGS_TABS: readonly SettingsTabDefinition[] = [
   { id: 'appearance', icon: 'sparkles', titleKey: 'settings.zone.appearance', descKey: 'settings.zone.appearanceDesc' },
   { id: 'project', icon: 'git-branch', titleKey: 'settings.zone.project', descKey: 'settings.zone.projectDesc' },
   { id: 'plugins', icon: 'settings', titleKey: 'settings.zone.plugins', descKey: 'settings.zone.pluginsDesc' },
-  { id: 'mcpServer', icon: 'plug', titleKey: 'settings.zone.mcpServer', descKey: 'settings.zone.mcpServerDesc', requiresPlugin: 'magi.mcp-server' },
+  { id: 'mcpServer', icon: 'plug', titleKey: 'settings.zone.mcpServer', descKey: 'settings.zone.mcpServerDesc' },
 ];

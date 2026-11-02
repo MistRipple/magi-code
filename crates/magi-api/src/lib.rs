@@ -7,7 +7,6 @@ mod browser_image;
 pub mod browser_network_policy;
 mod browser_tool_runtime;
 pub mod builtin_skills;
-mod bundled_plugins;
 mod change_projection;
 mod continuation;
 mod dto;

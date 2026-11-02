@@ -84,16 +84,11 @@ import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } fro
       description: manifest.description,
     })));
   const pluginSettingsTabs = $derived([...pluginSettingsViews, ...pluginSettingsForms]);
-  // 第一方插件的专属设置分类：对应插件在应用作用域激活后才出现，停用即消失。
-  const visibleSettingsTabs = $derived(
-    SETTINGS_TABS.filter((tab) => !tab.requiresPlugin
-      || pluginProjection(APPLICATION_PLUGIN_SCOPE).manifests.some((manifest) => manifest.id === tab.requiresPlugin)),
-  );
   $effect(() => {
     trackPluginProjection(APPLICATION_PLUGIN_SCOPE);
   });
   const activeTabDefinition = $derived(
-    visibleSettingsTabs.find((tab) => tab.id === store.activeTab)
+    SETTINGS_TABS.find((tab) => tab.id === store.activeTab)
       ?? pluginSettingsTabs.find((item) => item.tabId === store.activeTab)
       ?? SETTINGS_TABS[0],
   );
@@ -104,14 +99,6 @@ import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } fro
     'descKey' in activeTabDefinition ? i18n.t(activeTabDefinition.descKey) : activeTabDefinition.description,
   );
 
-  $effect(() => {
-    // 当前分类对应的插件已停用：回到默认分类，而不是停在一个已消失的页面。
-    if (pluginProjection(APPLICATION_PLUGIN_SCOPE).loaded
-      && SETTINGS_TABS.some((tab) => tab.requiresPlugin && tab.id === store.activeTab)
-      && !visibleSettingsTabs.some((tab) => tab.id === store.activeTab)) {
-      store.activeTab = 'plugins';
-    }
-  });
   $effect(() => {
     if (pluginManifestsLoaded && store.activeTab.startsWith('plugin:')
       && !pluginSettingsTabs.some((item) => item.tabId === store.activeTab)) {
@@ -204,7 +191,7 @@ import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } fro
     </button>
     <div class="settings-nav-caption" aria-hidden="true">{i18n.t('settings.title')}</div>
     <nav class="settings-nav-list" aria-label={i18n.t('settings.title')}>
-      {#each visibleSettingsTabs as tab (tab.id)}
+      {#each SETTINGS_TABS as tab (tab.id)}
         <button
           type="button"
           class="settings-nav-item"

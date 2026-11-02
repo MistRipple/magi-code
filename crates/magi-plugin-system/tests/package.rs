@@ -243,6 +243,20 @@ fn a_plugin_without_contributions_must_still_declare_the_permissions_it_switches
     empty["contributions"] = json!({});
     assert!(PluginPackage::from_archive(&archive(&empty, &[])).is_err());
 
-    empty["permissions"] = json!([{"kind":"network","scope":"workspace","targets":["listener"]}]);
+    empty["permissions"] =
+        json!([{"kind":"storage","scope":"application","targets":["__settings"]}]);
     assert!(PluginPackage::from_archive(&archive(&empty, &[])).is_ok());
+}
+
+#[test]
+fn permissions_without_an_enforcement_point_are_rejected() {
+    // 文件与网络权限没有任何强制点：受信后台直接以用户权限运行，清单不能声明装饰性 OS 权限。
+    for kind in ["filesRead", "filesWrite", "network"] {
+        let mut value = manifest();
+        value["permissions"] = json!([{"kind": kind, "scope":"application", "targets": ["x"]}]);
+        assert!(
+            PluginPackage::from_archive(&archive(&value, &[])).is_err(),
+            "{kind}"
+        );
+    }
 }

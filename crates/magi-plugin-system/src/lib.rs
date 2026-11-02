@@ -33,7 +33,7 @@ pub use engine::{
 pub use lifecycle::{
     ActivePlugin, InstalledPlugin, PLUGIN_CANCEL_SETTLE_TIMEOUT, PLUGIN_DRAIN_TIMEOUT,
     PluginDrainGuard, PluginManager, PluginManagerState, PluginRuntimeLease, PluginSource,
-    PreparedToolCall,
+    PreparedToolCall, RetiredBuiltin,
 };
 pub use magi_app_server_protocol::{
     PluginManifest, PluginPermission, PluginPermissionKind, PluginScopeKind,

@@ -88,16 +88,8 @@ try {
   }, "打包 Electron App Renderer 就绪", 60_000, 500);
   tools = pageTools(page);
   check("Electron 启动并渲染工作台", true);
-  const bundled = await tools.api('/api/plugins/bundled');
-  const manifests = JSON.parse(bundled.body);
-  check("内置插件目录仅保留 Magi MCP 服务", bundled.status === 200
-    && manifests.length === 1 && manifests[0].id === 'magi.mcp-server');
-  const mcpId = 'magi.mcp-server';
-  const installed = await tools.post(`/api/plugins/bundled/${mcpId}/install`, {});
-  await tools.post(`/api/plugins/${mcpId}/enable`, { scope: 'application' });
-  await tools.post(`/api/plugins/${mcpId}/authorize`, { scope: 'application', grants: manifests[0].permissions });
-  const activated = await tools.post(`/api/plugins/${mcpId}/activate`, { scope: 'application' });
-  check("Magi MCP 服务仍可安装和激活", installed.status === 200 && activated.status === 200);
+  const retiredBundled = await tools.api('/api/plugins/bundled');
+  check("MCP 服务不再是内置插件（内置插件目录入口已删除）", retiredBundled.status === 404 || retiredBundled.status === 405);
   await tools.click('[data-testid="sidebar-settings"]');
   await waitFor(() => tools.exists('[data-testid="settings-nav-mcpServer"]'), "MCP 设置入口可见");
   check("真实设置页保留 MCP 服务入口", true);

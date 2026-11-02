@@ -52,21 +52,6 @@ export async function listInstalledPlugins(): Promise<PluginList> {
   return await response.json() as PluginList;
 }
 
-export async function listBundledPlugins(): Promise<PluginManifest[]> {
-  const response = await pluginRequest('/api/plugins/bundled');
-  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.bundled'), response);
-  const payload = await response.json() as unknown;
-  return Array.isArray(payload) ? payload as PluginManifest[] : [];
-}
-
-export async function installBundledPlugin(pluginId: string): Promise<void> {
-  const response = await pluginRequest(`/api/plugins/bundled/${encodeURIComponent(pluginId)}/install`, {
-    method: 'POST',
-  });
-  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.installBundled'), response);
-  window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
-}
-
 function encodeBase64(archive: ArrayBuffer): string {
   const bytes = new Uint8Array(archive);
   let binary = '';

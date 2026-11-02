@@ -507,8 +507,8 @@ assert.match(
 );
 assert.match(
   settingsPanelSource,
-  /visibleSettingsTabs = \$derived\(\s*SETTINGS_TABS\.filter[\s\S]*?\{#each visibleSettingsTabs as tab/,
-  '设置导航必须由唯一的分类清单生成（插件专属分类只做可见性过滤）',
+  /\{#each SETTINGS_TABS as tab/,
+  '设置导航必须由唯一的分类清单生成',
 );
 const projectTabSource = await readFile(
   new URL('../src/components/SettingsProjectTab.svelte', import.meta.url),

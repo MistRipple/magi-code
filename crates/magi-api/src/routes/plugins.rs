@@ -52,14 +52,12 @@ struct ScopeQuery {
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/plugins", get(list))
-        .route("/plugins/bundled", get(bundled))
         .route("/plugins/center", get(center))
         .route(
             "/plugins/center/config",
             axum::routing::put(write_center_config),
         )
         .route("/plugins/center/install", post(center_install))
-        .route("/plugins/bundled/{id}/install", post(install_bundled))
         .route("/plugins/guide", get(guide))
         .route("/plugins/manifests", get(manifests))
         .route("/plugins/commands", get(commands))
@@ -86,20 +84,6 @@ pub fn routes() -> Router<ApiState> {
         .route("/plugins/{id}/deactivate", post(deactivate))
         .route("/plugins/{id}/disable", post(disable))
         .route("/plugins/{id}/uninstall", post(uninstall))
-}
-
-async fn bundled() -> Json<Vec<magi_app_server_protocol::PluginManifest>> {
-    Json(crate::bundled_plugins::bundled_plugin_manifests())
-}
-
-async fn install_bundled(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    let package = crate::bundled_plugins::bundled_plugin_package(&id)?;
-    let source = PluginSource::Builtin { name: id };
-    install_or_upgrade(&state, &package, source).await?;
-    snapshot(&*locked(&state, "读取内置插件安装结果")?)
 }
 
 async fn list(
@@ -568,7 +552,7 @@ async fn upgrade_installed_plugin(
         drain.commit(&mut manager);
     }
     publish_plugin_registry_changed(state);
-    release_application_resources(state, &package.manifest().id).await
+    Ok(())
 }
 
 /// 数据格式版本变化且已有数据时，由新版插件在 Worker 中转换（纯函数，无任何宿主能力）。
@@ -592,25 +576,6 @@ async fn convert_plugin_data(
         .map_err(|_| ApiError::InternalAssemblyError("插件数据转换线程异常退出".into()))?
         .map(Some)
         .map_err(plugin_error)
-}
-
-async fn release_application_resources(state: &ApiState, plugin_id: &str) -> Result<(), ApiError> {
-    match plugin_id {
-        crate::bundled_plugins::MCP_SERVER_PLUGIN_ID => {
-            // 只停监听与隧道，不改持久化的开关：重新激活后按原配置恢复。
-            state.mcp_service.release().await;
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// 应用级激活后按已保存的配置恢复宿主资源（持久配置只是“用户配置过”，不会在未激活时复活）。
-fn restore_application_resources(state: &ApiState, plugin_id: &str) {
-    let state = state.clone();
-    if plugin_id == crate::bundled_plugins::MCP_SERVER_PLUGIN_ID {
-        state.start_mcp_service_if_enabled();
-    }
 }
 
 async fn authorize(
@@ -637,23 +602,17 @@ async fn activate(
     Path(id): Path<String>,
     Json(request): Json<ScopeRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    let result = mutate_scope(
+    mutate_scope(
         &state,
         |m| m.activate(&id, &request.scope).map(|_| ()),
         "激活插件",
-    )?;
-    if request.scope == "application" {
-        restore_application_resources(&state, &id);
-    }
-    Ok(result)
+    )
 }
 async fn deactivate(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(request): Json<ScopeRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    // 上一次停用已提交但 Tunnel 释放失败：插件已不可用，这里只重试待清理的资源释放。
-
     let drain = PluginManager::begin_deactivation(
         std::sync::Arc::clone(&state.plugin_manager),
         &id,
@@ -673,9 +632,6 @@ async fn deactivate(
         drain.commit(&mut manager);
     }
     publish_plugin_registry_changed(&state);
-    if request.scope == "application" {
-        release_application_resources(&state, &id).await?;
-    }
     {
         let manager = locked(&state, "读取停用后的插件状态")?;
         snapshot(&manager)
@@ -858,7 +814,7 @@ mod tests {
             "backend": "plugin.mjs",
             "permissions": [{
                 "kind": "storage",
-                "scope": "workspace",
+                "scope":"application",
                 "targets": ["dashboard"]
             }],
             "dataSchemaVersion": 1,
@@ -1047,7 +1003,7 @@ mod tests {
                 "application",
                 vec![PluginPermission {
                     kind: PluginPermissionKind::Storage,
-                    scope: PluginScopeKind::Workspace,
+                    scope: PluginScopeKind::Application,
                     targets: vec!["dashboard".into()],
                 }],
             )

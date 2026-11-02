@@ -132,7 +132,7 @@ fn dashboard_package() -> PluginPackage {
         "name": "Dashboard",
         "description": "",
         "backend": "plugin.mjs",
-        "permissions": [{"kind":"storage","scope":"workspace","targets":["board"]}],
+        "permissions": [{"kind":"storage","scope":"application","targets":["board"]}],
         "dataSchemaVersion": 1,
         "settingsSchema": {"type":"object","additionalProperties":false},
         "contributions": {"resources":[{"id":"board","title":"Board","description":""}]}
@@ -179,7 +179,7 @@ fn manager_resource_access_is_declared_authorized_and_scoped_in_one_place() {
             scope,
             vec![PluginPermission {
                 kind: PluginPermissionKind::Storage,
-                scope: PluginScopeKind::Workspace,
+                scope: PluginScopeKind::Application,
                 targets: vec!["board".into()],
             }],
         )
