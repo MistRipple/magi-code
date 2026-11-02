@@ -209,7 +209,7 @@ HTTP 观测与重试进度是两个合同：重试通知继续负责在再次发
 - 每次改写在界面应显示“扩展改写了历史，缓存已重建”及来源（界面尚未实现，数据已具备：`invalidationReason = extension_rewrite` 与记录）。
 - 成本以供应商真实 usage 为准，不估算“本来可命中”的反事实费用。
 
-**接线现状**：`context.assemble` 与 `compaction.before` 已接入主线任务循环（纯会话 profile 未接）。授权项 `contextRewrite` 已进入清单与授权面板；历史改写不持久化替换内容——每个 Step 的新输入重新征询扩展并经唯一投影裁决，一个 Step 内同一输入只征询一次，因此稳定性是扩展自己的责任，内容变化会被 `extension_rewrite` 归因并记录摘要，成本如实可见；`compaction.before` 的自定义摘要走原检查点安装链路，正文随检查点持久化。**仍缺**：界面提示“扩展改写了历史，缓存已重建”，以及纯会话 profile 的接入。
+**接线现状**：`context.assemble` 与 `compaction.before` 已接入主线任务循环与纯会话 profile。授权项 `contextRewrite` 已进入清单与授权面板；历史改写不持久化替换内容——每个 Step 的新输入重新征询扩展并经唯一投影裁决，一个 Step 内同一输入只征询一次，因此稳定性是扩展自己的责任，内容变化会被 `extension_rewrite` 归因并记录摘要，成本如实可见；`compaction.before` 的自定义摘要走原检查点安装链路，正文随检查点持久化。**仍缺**：界面提示“扩展改写了历史，缓存已重建”，以及纯会话 profile 的接入。
 
 ## 缓存核算
 

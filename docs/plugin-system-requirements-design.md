@@ -267,7 +267,7 @@
 | 目标 | session.created / session.deleted | 观察，不能否决已提交事实 | [sessions.rs:263](../crates/magi-api/src/routes/sessions.rs#L263)、[sessions.rs:572](../crates/magi-api/src/routes/sessions.rs#L572) 在成功创建/删除后发目录事件；不能把删除等同 pi 的 session_shutdown。后台恢复创建和 attach/detach 的统一通知仍需补覆盖 | 无；观察后提交的上下文按贡献规则计入 |
 | 目标 | turn.accepted / turn.end | 观察已接纳／已结算事实，不追加隐藏续跑 | [TurnService:74](../crates/magi-api/src/turn_service.rs#L74) → [task_dispatch:446](../crates/magi-api/src/task_dispatch.rs#L446) → [accept_dispatch_submission:1667](../crates/magi-conversation-runtime/src/dispatch_submission.rs#L1667) 的 canonical sink；终态走 [session_turn_finalize:925](../crates/magi-conversation-runtime/src/session_turn_finalize.rs#L925)。纯对话终态另在 session_turn_execution，接线须覆盖两类 profile | 无 |
 | 目标 | input | 拦截：继续、转换文本/附件、明确接管 | [turn_service.rs:85](../crates/magi-api/src/turn_service.rs#L85) 统一接纳，校验/身份/指纹从 101 行起生成；原始输入先保留，扩展转换另外记录，最终引用重新校验。队列、steer、重放必须共用一次处理身份，不在 HTTP 私加第二个入口 | 转换后输入追加；不能改写旧用户事实 |
-| 现状·部分实现 | prompt.contribute | 贡献：带来源、稳定性和预算的提示片段（任务主线已接入 `start`/`round` 两阶段与唯一接纳点，见[扩展协议](extension-protocol-v1.md)；纯会话入口未接） | task：dispatcher 产出 → [conversation_loop:825](../crates/magi-conversation-runtime/src/conversation_loop.rs#L825) 装静态片段；conversation：[build_session_turn_messages_with_runtime:490](../crates/magi-conversation-runtime/src/session_turn_execution.rs#L490)。两入口注入同一贡献解析服务，再进入实际请求 IR | 稳定片段改变使前缀失效；易变放尾部 |
+| 现状·部分实现 | prompt.contribute | 贡献：带来源、稳定性和预算的提示片段（任务主线与纯会话入口都已接入 `start`/`round` 两阶段与唯一接纳点，见[扩展协议](extension-protocol-v1.md)） | task：dispatcher 产出 → [conversation_loop:825](../crates/magi-conversation-runtime/src/conversation_loop.rs#L825) 装静态片段；conversation：[build_session_turn_messages_with_runtime:490](../crates/magi-conversation-runtime/src/session_turn_execution.rs#L490)。两入口注入同一贡献解析服务，再进入实际请求 IR | 稳定片段改变使前缀失效；易变放尾部 |
 | 目标 | context.assemble | 拦截：仅在扩展可控上下文段增删重排；不可破坏原生约束和工具配对 | [ContextAuthority::prepare:357](../crates/magi-conversation-runtime/src/context_authority.rs#L357) 被 [conversation_loop:1136](../crates/magi-conversation-runtime/src/conversation_loop.rs#L1136)、[session_turn_execution:752](../crates/magi-conversation-runtime/src/session_turn_execution.rs#L752) 使用；预算前接纳贡献，最终装配后、IR 前复核，无绕过预算的消息体 | 历史改写需显式原因与代际；不得只标稳定就绕过 |
 | 目标 | model.request | 观察＋受限参数提案，不换角色绑定或裸 provider body | task：[conversation_loop:1761](../crates/magi-conversation-runtime/src/conversation_loop.rs#L1761) → StepModelClient；conversation：[session_turn_execution:1942](../crates/magi-conversation-runtime/src/session_turn_execution.rs#L1942) → 同一 [invoke_recorded:195](../crates/magi-conversation-runtime/src/model_step.rs#L195)。最终提案必须在 cache_prompt_ir（241 行）、指纹与 begin_model_step（390 行）前校验/冻结 | 从最终实际请求计算，不能在指纹后再改 |
 | 目标 | model.response | 观察已结算结果；不提供正文替换 | [model_step:421](../crates/magi-conversation-runtime/src/model_step.rs#L421) invoke → settle_model_step → 迟到响应检查 → response 校验；流式正文可能早已交付，不能靠末端改写假装未展示 | 观察无 |
@@ -313,7 +313,7 @@
 
 【目标】稳定贡献使用插件、贡献 ID、包摘要、配置快照及内容摘要确定身份，不能夹入时间戳或随机数；易变内容放 RoundContext 尾部。最终请求贡献先入来源标记与预算，再由实际 Bridge 的 cache_prompt_ir 计算；不能在该步骤后改 provider 请求体。插件不生成 cache key，不维护另一份 transcript。
 
-【目标】扩展可经 context.assemble 与 compaction.before 提出对已装配历史的受控改写，作为现有声明式前缀改写合同的新增原因 ExtensionRewrite：每次改写必须记录插件与贡献身份、改写范围、原文引用（canonical 日志不变，只改投影）和触发的缓存代际变化，并在界面显示“扩展改写了历史，缓存已重建”；原生系统段与工具配对约束不可改写；未声明并获授权 contextRewrite 的插件提交此类提案一律拒绝。该合同已在[缓存架构](prompt-cache-lineage-architecture.md#扩展改写extension_rewrite)中落为正式失效原因（含记录合同、唯一投影和归因回归），并已接入主线任务循环；`contextRewrite` 授权项已进入清单与授权面板；历史改写不持久化替换内容，由扩展保证稳定、成本可见。仍缺界面提示与纯会话 profile 的接入。最强反方：改写会破坏前缀缓存、推高成本；以显式授权、可见代价和代际记录约束，而不是整体禁止。
+【目标】扩展可经 context.assemble 与 compaction.before 提出对已装配历史的受控改写，作为现有声明式前缀改写合同的新增原因 ExtensionRewrite：每次改写必须记录插件与贡献身份、改写范围、原文引用（canonical 日志不变，只改投影）和触发的缓存代际变化，并在界面显示“扩展改写了历史，缓存已重建”；原生系统段与工具配对约束不可改写；未声明并获授权 contextRewrite 的插件提交此类提案一律拒绝。该合同已在[缓存架构](prompt-cache-lineage-architecture.md#扩展改写extension_rewrite)中落为正式失效原因（含记录合同、唯一投影和归因回归），并已接入主线任务循环与纯会话 profile；`contextRewrite` 授权项已进入清单与授权面板；历史改写不持久化替换内容，由扩展保证稳定、成本可见。仍缺界面提示。最强反方：改写会破坏前缀缓存、推高成本；以显式授权、可见代价和代际记录约束，而不是整体禁止。
 
 ### 5.10 包、清单、权限与信任
 
@@ -582,7 +582,7 @@
 | 状态 | 文档 | 承载内容 | 来源决策 |
 | --- | --- | --- | --- |
 | 现状 | [演进方案](magi-agent-runtime-evolution-plan.md#1-核心判断) 第 1、3.5、8.4、10、11 节 | 插件系统作为独立交付线、不受“暂停新增能力”约束；ExtensionBus、钩子模式与插件作业；受信层与严格只读不并存；与 P3 统一 Step Loop 的接线顺序 | D1、D4、D9、D12 |
-| 现状 | [缓存架构](prompt-cache-lineage-architecture.md#扩展改写extension_rewrite) | `extension_rewrite` 失效原因、记录合同与唯一投影（已实现并有回归），已接入 `context.assemble` / `compaction.before`；剩余缺口：界面提示与纯会话 profile | D5 |
+| 现状 | [缓存架构](prompt-cache-lineage-architecture.md#扩展改写extension_rewrite) | `extension_rewrite` 失效原因、记录合同与唯一投影（已实现并有回归），已接入 `context.assemble` / `compaction.before`；剩余缺口：界面提示 | D5 |
 | 现状 | [项目架构文档](README.md) | 扩展宿主进程与进程拓扑、随包 Node、文档索引 | D3 |
 | 现状 | [验证入口](validation.md) | 第 12 节验收面的登记处；当前没有对应命令 | 第 12 节 |
 | 目标 | [扩展协议 v1](extension-protocol-v1.md) | 线协议规范：传输与帧、握手与版本、调用身份、方法目录、注册、逐钩子合同、重入、迁移会话、失败与错误码、协议层验收（尚未实现） | 5.5～5.8、D1、D4 |

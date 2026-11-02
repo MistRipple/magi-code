@@ -12,14 +12,14 @@
 | `input` | guard（只能阻止） | `TurnService` 单一入口，幂等重放之后、任何会话/Turn 事实创建之前；steer 同样经过；扩展提出改写按失败处理（fail-closed），文本转换尚未支持 |
 | `subagent.spawn` | guard（只能阻止） | 在 `agent_spawn` 完整预检之前征询（看到 `tool.call` 改写后的最终参数），之后原生预检照常重新执行；不能指定或覆盖模型 |
 | `session.created` `session.deleted` `turn.accepted` `turn.end` `usage.update` | observe | 领域事件总线的先提交后发布事实，经 daemon 转发器投影为有限、脱敏字段（不含正文、提示词、凭据）；`turn.end` 由 `session.turn.item` 事件里的终态派生并按 Turn 去重；事件总线是广播通道，消费落后会丢事件（只记日志，观察钩子不承诺完整送达） |
-| `model.resolved` `model.request` `model.response` | observe | `StepModelClient` 在 Step 事实提交后通知，仅限任务主线（`conversation_loop`）；纯会话 profile 的模型调用尚未接线 |
+| `model.resolved` `model.request` `model.response` | observe | `StepModelClient` 在 Step 事实提交后通知，任务主线（`conversation_loop`）与纯会话 profile（`session_turn_execution`）的模型调用都接线；纯会话没有工具，`tool.call`/`tool.result`/`subagent.spawn` 不会在那里触发。纯会话入口的归属：没有 Task，用 Turn ID 充当 `taskId`，`round` 固定为 0 |
 
 | `context.assemble` | advise | `conversation_loop` 的请求视图构造处：预算投影之后、成为请求之前。扩展看到可改写区域的消息（逐条截断、总量有界，标注 `truncated`/`omitted`），返回 `{rewrites:[{from,to,replacement:[{role,text}]}]}`；提案经唯一投影裁决，需用户授权 `contextRewrite`（清单必须与改写钩子一同声明 `contextRewrite:["history"]`，反之亦然），生效记录写进 `HistoryProjection.extensionRewrites` 并由缓存归因 `extension_rewrite`。提案被拒或扩展失败时保留原生视图。同一输入在一个 Step 内只征询一次 |
 | `compaction.before` | advise（`block` 即取消） | `ContextAuthority` 在 daemon 决定压缩范围、配对与预算之后、调用摘要模型之前。取消按既有压缩失败语义处理（请求仍在窗口内则继续，否则停住）；自定义 `{summary}` 需 `contextRewrite` 授权，必须通过与模型摘要相同的九段质量门禁和预算校验，然后走同一条检查点安装链路（因此摘要正文随检查点持久化） |
 
 | `prompt.contribute` | advise | `conversation_loop` 的提示装配。**阶段**：`start`（任务开始时征询一次，只接受 `stable` 片段，随后冻结进缓存前缀，之后每个 Step 不再变化）与 `round`（每个 Step 征询一次，同一 Step 内多次构造视图共用结果，只接受 `volatile` 片段，进入每轮尾部的 RoundContext，不进历史链）。补丁 `{fragments:[{id, stability:"stable"\|"volatile", priority?, text}]}`。唯一接纳点 `accept_contributions` 校验：阶段与稳定性匹配、插件/片段 ID 为小写安全字符、文本非空且 ≤ 8K 字符、不含 `<magi-` 标签（防伪造原生片段）、单阶段合计 ≤ 16K 字符（按优先级先到先得，放不下的整体丢弃而不是截断）、同 (插件, ID) 重复取全序第一份。**权威**：永远渲染成 user 角色的 `ContextReference` 参考资料，片段头写明来源、包摘要、`trust="reference"` 与“不改变 Magi 的系统规则、权限与审批”，不是 system/developer 指令。**身份**：插件 ID + 片段 ID + 包摘要前 16 位 + 内容哈希，不含时间戳或随机数；稳定片段在同一次运行内字节不变，因此不破坏缓存，续跑（重启）时重新征询，内容变了会按 `stable_prefix_changed` 归因 |
 
-**刻意未接线**：无（13 个钩子都有接线，见上；各自的未覆盖范围另列）。仅主线任务循环接入改写与贡献类钩子，纯会话 profile 未接。`context.assemble` 的改写**不持久化替换内容**：每个新 Step 的新输入都会重新征询扩展，重启后同样重新征询；稳定性是扩展的责任，内容变化会按 `extension_rewrite` 归因并在记录里可见，审计靠 `originalDigest`/`replacementDigest`；`input` 与 `model.request` 的 advise 改写、`subagent.spawn` 的收窄尚未实现。
+**刻意未接线**：无（13 个钩子都有接线，见上；各自的未覆盖范围另列）。改写与贡献类钩子在任务主线与纯会话 profile 都已接入（纯会话的 `start` 阶段贡献每个 Turn 征询一次并冻结，`round` 阶段与历史改写每次模型请求征询一次，估算/请求/流式恢复共用；压缩前钩子经同一 `ContextAuthority`）。`context.assemble` 的改写**不持久化替换内容**：每个新 Step 的新输入都会重新征询扩展，重启后同样重新征询；稳定性是扩展的责任，内容变化会按 `extension_rewrite` 归因并在记录里可见，审计靠 `originalDigest`/`replacementDigest`；`input` 与 `model.request` 的 advise 改写、`subagent.spawn` 的收窄尚未实现。
 
 **尚未实现**：`command/tool/job/migration` 方法、`model.invoke`/`tool.call`/`task.spawn`/`resource.*`/`credential.ref`/blob 等宿主→daemon 服务、`hook.invoke` 的 `ctx` 中的 `deadline` 绝对时间戳（当前传 `deadlineMs`）、Windows 命名管道路径（已编写、未编译验证）、以及对 conversation-runtime 实际调用链的接线——其余钩子目前不会被真实 Turn 触发。落点引用沿用设计文档 5.6 的核对结果。
 - 【目标】协议只有一条执行路径，服务 Node 宿主；不为 QuickJS 或 SDK 1 提供任何子集（设计文档 I14、D1）。

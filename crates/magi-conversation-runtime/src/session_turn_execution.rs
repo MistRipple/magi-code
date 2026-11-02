@@ -473,6 +473,7 @@ fn build_session_turn_messages(
         settings_store: None,
         safety_gate: None,
         skill_runtime: None,
+        stable_contributions: &[],
     })
 }
 
@@ -485,6 +486,8 @@ struct BuildSessionTurnMessagesWithRuntimeInput<'a> {
     settings_store: Option<&'a Arc<SettingsStore>>,
     safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
     skill_runtime: Option<&'a magi_skill_runtime::SkillRuntime>,
+    /// 扩展 `prompt.contribute`（start 阶段）已接纳的稳定片段：任务开始时征询一次，之后冻结。
+    stable_contributions: &'a [ChatMessage],
 }
 
 fn build_session_turn_messages_with_runtime(
@@ -499,6 +502,7 @@ fn build_session_turn_messages_with_runtime(
         settings_store,
         safety_gate,
         skill_runtime,
+        stable_contributions,
     } = input;
     let mut messages = Vec::new();
     let user_rules = settings_store.map(|store| {
@@ -521,6 +525,8 @@ fn build_session_turn_messages_with_runtime(
     {
         messages.push(skill_message);
     }
+    // 稳定贡献紧随静态规则，位于所有易变片段与历史之前，属于缓存前缀。
+    messages.extend(stable_contributions.iter().cloned());
     messages.push(system_prompt_fragment_message(
         PromptFragmentKind::CurrentAccessProfile,
         current_access_profile_prompt(request.access_profile, "full"),
@@ -691,6 +697,8 @@ struct RebuildMessagesForContextWindowInput<'a> {
     settings_store: Option<&'a Arc<SettingsStore>>,
     skill_runtime: Option<&'a magi_skill_runtime::SkillRuntime>,
     persist_checkpoint: bool,
+    stable_contributions: &'a [ChatMessage],
+    extension_hooks: Option<&'a dyn crate::extension_hooks::ExtensionHooks>,
 }
 
 fn rebuild_messages_for_context_window(
@@ -711,6 +719,8 @@ fn rebuild_messages_for_context_window(
         settings_store,
         skill_runtime,
         persist_checkpoint,
+        stable_contributions,
+        extension_hooks,
     } = input;
     let mut fixed_messages =
         build_session_turn_messages_with_runtime(BuildSessionTurnMessagesWithRuntimeInput {
@@ -722,6 +732,7 @@ fn rebuild_messages_for_context_window(
             settings_store,
             safety_gate: None,
             skill_runtime,
+            stable_contributions,
         });
     let pending_inputs = crate::context_authority::unprojected_input_messages(
         session_store,
@@ -759,6 +770,7 @@ fn rebuild_messages_for_context_window(
         settings_store,
     )
     .with_expected_turn_id(Some(&request.turn_id))
+    .with_extension_hooks(extension_hooks)
     .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
     .prepare(ContextPrepareRequest {
         recovery_history: Vec::new(),
@@ -798,6 +810,7 @@ fn rebuild_messages_for_context_window(
             settings_store,
             safety_gate: None,
             skill_runtime,
+            stable_contributions,
         });
     for input in pending_inputs {
         if !messages
@@ -825,6 +838,79 @@ pub struct SessionTurnExecutionRuntime<'a> {
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
     pub live_settings_store: Option<Arc<SettingsStore>>,
     pub plugin_command_executor: Option<Arc<dyn magi_plugin_system::PluginCommandExecutor>>,
+    /// 扩展钩子端口；None 表示没有可执行扩展。纯会话没有工具，所以只有提示贡献、上下文改写、
+    /// 压缩前与模型观察类钩子会被触发。
+    pub extension_hooks: Option<&'a dyn crate::extension_hooks::ExtensionHooks>,
+}
+
+/// 纯会话入口的扩展钩子归属：没有 Task，用 Turn ID 充当 `taskId`，`round` 固定为 0
+/// （会话的模型调用以 Turn 为单位，重试不改变归属）。
+fn hook_scope(request: &SessionTurnExecutionRequest) -> crate::extension_hooks::ToolHookScope<'_> {
+    crate::extension_hooks::ToolHookScope {
+        session_id: request.session_id.as_str(),
+        task_id: request.turn_id.as_str(),
+        workspace_id: request.workspace_id.as_ref().map(|id| id.as_str()),
+        worker_id: None,
+        round: 0,
+    }
+}
+
+/// 一次模型请求的扩展装配：`context.assemble` 改写已装配历史，`prompt.contribute`（round 阶段）
+/// 的易变片段进入尾部。同一次装配内多次构造视图（估算、请求、流式恢复）共用一次征询结果。
+struct ConversationAssembly<'a> {
+    hooks: Option<&'a dyn crate::extension_hooks::ExtensionHooks>,
+    request: &'a SessionTurnExecutionRequest,
+    context_window_tokens: u64,
+    rewrite_memo: crate::extension_hooks::RewriteMemo,
+    tail: Vec<ChatMessage>,
+    projection: std::cell::RefCell<magi_session_store::HistoryProjection>,
+}
+
+impl<'a> ConversationAssembly<'a> {
+    fn new(
+        hooks: Option<&'a dyn crate::extension_hooks::ExtensionHooks>,
+        request: &'a SessionTurnExecutionRequest,
+        context_window_tokens: u64,
+    ) -> Self {
+        let tail = hooks
+            .map(|hooks| {
+                crate::extension_hooks::contribute_prompt(
+                    hooks,
+                    &hook_scope(request),
+                    crate::extension_hooks::ContributePhase::Round,
+                )
+            })
+            .unwrap_or_default();
+        Self {
+            hooks,
+            request,
+            context_window_tokens,
+            rewrite_memo: Default::default(),
+            tail,
+            projection: Default::default(),
+        }
+    }
+
+    fn view(
+        &self,
+        messages: &[ChatMessage],
+        controls: &crate::request_controls::RequestControls,
+    ) -> Vec<ChatMessage> {
+        let mut projection = magi_session_store::HistoryProjection::default();
+        let history = match self.hooks {
+            Some(hooks) => crate::extension_hooks::apply_context_assemble(
+                hooks,
+                &hook_scope(self.request),
+                &self.rewrite_memo,
+                messages.to_vec(),
+                self.context_window_tokens,
+                &mut projection,
+            ),
+            None => messages.to_vec(),
+        };
+        *self.projection.borrow_mut() = projection;
+        controls.view(&history, self.tail.iter().cloned())
+    }
 }
 
 #[cfg(test)]
@@ -913,6 +999,7 @@ fn run_session_turn_execution_inner(
         persist_session_state,
         live_settings_store: _live_settings_store,
         plugin_command_executor,
+        extension_hooks,
     } = runtime;
 
     let execution_started = Instant::now();
@@ -1037,6 +1124,17 @@ fn run_session_turn_execution_inner(
             .as_ref()
             .and_then(|config| config.context_window_tokens()),
     );
+    // 扩展 `prompt.contribute`（start 阶段）：本 Turn 只征询一次，稳定片段随后冻结进前缀；
+    // 压缩重建与后续请求都复用这一份，不会因再次征询而改变前缀。
+    let stable_contributions: Vec<ChatMessage> = extension_hooks
+        .map(|hooks| {
+            crate::extension_hooks::contribute_prompt(
+                hooks,
+                &hook_scope(&request),
+                crate::extension_hooks::ContributePhase::Start,
+            )
+        })
+        .unwrap_or_default();
     let fixed_messages =
         build_session_turn_messages_with_runtime(BuildSessionTurnMessagesWithRuntimeInput {
             session_store,
@@ -1047,6 +1145,7 @@ fn run_session_turn_execution_inner(
             settings_store,
             safety_gate,
             skill_runtime,
+            stable_contributions: &stable_contributions,
         });
     let (compaction_phase, compaction_mode) = match request.command.as_ref() {
         Some(SessionTurnCommand::CompactContext { instructions }) => (
@@ -1094,6 +1193,7 @@ fn run_session_turn_execution_inner(
             settings_store,
         )
         .with_expected_turn_id(Some(&request.turn_id))
+        .with_extension_hooks(extension_hooks)
         .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
         .prepare(ContextPrepareRequest {
             recovery_history,
@@ -1151,6 +1251,7 @@ fn run_session_turn_execution_inner(
             settings_store,
             safety_gate,
             skill_runtime,
+            stable_contributions: &stable_contributions,
         });
     if let Some(identity_prompt) =
         model_identity_prompt_for_request(&request.prompt, &resolved_context_model)
@@ -1214,6 +1315,7 @@ fn run_session_turn_execution_inner(
                 context_window_tokens: effective_context_window,
                 orchestrator_thread_id: &orchestrator_thread_id,
                 persist_session_state,
+                extension_hooks,
             }),
         };
         let streamed_content = match round_result {
@@ -1336,6 +1438,8 @@ fn run_session_turn_execution_inner(
                             settings_store,
                             skill_runtime,
                             persist_checkpoint: vision_execution_config.is_none(),
+                            stable_contributions: &stable_contributions,
+                            extension_hooks,
                         },
                     ) {
                         Ok(compacted) => compacted,
@@ -1605,6 +1709,7 @@ struct SessionTurnRoundRuntime<'a> {
     /// session 主线 thread：该 turn 内所有 session_turn_item 的 source_thread_id。
     orchestrator_thread_id: &'a magi_core::ThreadId,
     persist_session_state: Option<&'a SessionStatePersistCallback>,
+    extension_hooks: Option<&'a dyn crate::extension_hooks::ExtensionHooks>,
 }
 
 struct SessionTurnRoundOutput {
@@ -1674,7 +1779,10 @@ fn stream_session_turn_round(
         context_window_tokens,
         orchestrator_thread_id,
         persist_session_state,
+        extension_hooks,
     } = runtime;
+    // 本次模型请求的扩展装配：round 阶段贡献与历史改写只征询一次，估算/请求/恢复共用。
+    let assembly = ConversationAssembly::new(extension_hooks, request, context_window_tokens);
 
     let stream_item_id = if round == 0 {
         request.placeholder_message_id.clone().unwrap_or_else(|| {
@@ -1726,7 +1834,7 @@ fn stream_session_turn_round(
     let resolved_provider =
         resolved_provider_for_usage_binding(settings_store, usage_binding, &request.session_id);
     let context_breakdown =
-        estimate_context_usage_breakdown(&request_controls.view(messages, []), None);
+        estimate_context_usage_breakdown(&assembly.view(messages, request_controls), None);
     let context_usage_tracker = (usage_binding.tracks_active_context()).then(|| {
         ContextUsageRuntimeTracker::start(ContextUsageRuntimeTrackerInput {
             event_bus,
@@ -1935,7 +2043,7 @@ fn stream_session_turn_round(
         prompt_cache_key: None,
         provider: BUSINESS_MODEL_PROVIDER.to_string(),
         prompt: prompt.to_string(),
-        messages: Some(request_controls.view(messages, [])),
+        messages: Some(assembly.view(messages, request_controls)),
         tools: None,
         tool_choice: None,
     };
@@ -1948,7 +2056,9 @@ fn stream_session_turn_round(
         orchestrator_thread_id,
         &call_id,
     )
-    .with_model_binding(settings_store, usage_binding);
+    .with_model_binding(settings_store, usage_binding)
+    .with_history_projection(assembly.projection.borrow().clone())
+    .with_extension_hooks(extension_hooks);
     let client: &dyn ModelBridgeClient = &step_client;
     let non_stream_recovery_template = invocation_request.clone();
     let response = match client.invoke_streaming_with_cancellation(
@@ -2103,7 +2213,7 @@ fn stream_session_turn_round(
             }
 
             let mut recovery_request = non_stream_recovery_template;
-            recovery_request.messages = Some(request_controls.view(messages, []));
+            recovery_request.messages = Some(assembly.view(messages, request_controls));
             tracing::warn!(
                 session_id = %request.session_id,
                 round,
@@ -3259,6 +3369,295 @@ mod tests {
         assert!(model_identity_prompt_for_request("读取 README.md", "grok-4").is_none());
     }
 
+    struct RecordingHooks {
+        events: std::sync::Mutex<Vec<(&'static str, serde_json::Value)>>,
+    }
+    impl crate::extension_hooks::ExtensionHooks for RecordingHooks {
+        fn tool_call(
+            &self,
+            _: &crate::extension_hooks::ToolHookScope<'_>,
+            _: &magi_bridge_client::ChatToolCall,
+        ) -> crate::extension_hooks::ToolCallDecision {
+            unreachable!("纯会话没有工具")
+        }
+        fn tool_result(
+            &self,
+            _: &crate::extension_hooks::ToolHookScope<'_>,
+            _: &magi_bridge_client::ChatToolCall,
+            _: crate::extension_hooks::ToolResultView<'_>,
+        ) -> Option<String> {
+            None
+        }
+        fn observe(&self, hook: &'static str, payload: serde_json::Value) {
+            self.events.lock().unwrap().push((hook, payload));
+        }
+        fn prompt_contribute(
+            &self,
+            _: &crate::extension_hooks::ToolHookScope<'_>,
+            view: &crate::extension_hooks::ContributeView<'_>,
+        ) -> Vec<crate::extension_hooks::PromptContribution> {
+            use crate::extension_hooks::{
+                ContributePhase, ContributionStability, PromptContribution,
+            };
+            let (id, stability, text) = match view.phase {
+                ContributePhase::Start => (
+                    "house-style",
+                    ContributionStability::Stable,
+                    "回答使用简体中文。",
+                ),
+                ContributePhase::Round => {
+                    ("round-note", ContributionStability::Volatile, "本轮提醒")
+                }
+            };
+            vec![PromptContribution {
+                plugin_id: "acme.style".into(),
+                package_digest: "feedfacefeedface".into(),
+                fragment_id: id.into(),
+                stability,
+                priority: 0,
+                text: text.into(),
+            }]
+        }
+    }
+
+    struct CaptureAndAnswerClient {
+        sent: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
+    }
+    impl ModelBridgeClient for CaptureAndAnswerClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<ModelResponse, BridgeClientError> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push(request.messages.clone().unwrap_or_default());
+            Ok(model_response(serde_json::json!({
+                "content": "已回答", "finish_reason": "stop"
+            })))
+        }
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<ModelResponse, BridgeClientError> {
+            on_delta(&ModelStreamingDelta {
+                content: "已回答".to_string(),
+                thinking: String::new(),
+                tool_calls: Vec::new(),
+                ..Default::default()
+            });
+            self.invoke(request)
+        }
+    }
+
+    #[test]
+    fn conversation_profile_applies_contributions_and_notifies_model_observers() {
+        let session_id = SessionId::new("session-conversation-hooks");
+        let turn_id = "turn-conversation-hooks".to_string();
+        let store = Arc::new(SessionStore::new());
+        store.create_session(session_id.clone(), "hooks").unwrap();
+        let (_mission, thread) = store.ensure_session_mission(&session_id, ts(900), || {
+            magi_core::MissionId::new("mission-conversation-hooks")
+        });
+        let coordinator = Arc::new(SessionTurnCoordinator::new());
+        seed_task_turn(
+            store.as_ref(),
+            &session_id,
+            &turn_id,
+            1,
+            ts(1_000),
+            "你好",
+            thread,
+            coordinator.as_ref(),
+        );
+        let registry = ConversationRegistry::with_turn_coordinator(coordinator);
+        registry
+            .turn_coordinator()
+            .begin_session_turn_input(session_id.clone(), turn_id.clone())
+            .unwrap();
+        let client = CaptureAndAnswerClient {
+            sent: Default::default(),
+        };
+        let hooks = RecordingHooks {
+            events: Default::default(),
+        };
+        let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
+        let output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
+            client: &client,
+            event_bus: &InMemoryEventBus::new(16),
+            session_store: store.as_ref(),
+            conversation_registry: &registry,
+            plan_store: &plan_store,
+            settings_store: None,
+            safety_gate: None,
+            skill_runtime: None,
+            request: SessionTurnExecutionRequest {
+                project_directories: None,
+                session_id,
+                turn_id,
+                workspace_id: None,
+                prompt: "你好".to_string(),
+                images: Vec::new(),
+                context_references: Vec::new(),
+                access_profile: AccessProfile::Restricted,
+                skill_name: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+                command: None,
+            },
+            prompt: "你好".to_string(),
+            knowledge_context_prompt: None,
+            persist_session_state: None,
+            live_settings_store: None,
+            plugin_command_executor: None,
+            extension_hooks: Some(&hooks),
+        })
+        .expect("会话轮次应完成");
+        assert!(!output.interrupted);
+        let sent = client.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let messages = &sent[0];
+        let find = |needle: &str| {
+            messages
+                .iter()
+                .position(|m| m.content.as_deref().is_some_and(|c| c.contains(needle)))
+        };
+        let stable = find("stability=\"stable\"").expect("稳定贡献在请求里");
+        let volatile = find("stability=\"volatile\"").expect("易变贡献在请求里");
+        let user = messages
+            .iter()
+            .position(|m| m.content.as_deref() == Some("你好"))
+            .expect("当前输入");
+        assert!(
+            stable < user && user < volatile,
+            "稳定在前缀，易变在当前输入之后"
+        );
+        assert_eq!(messages[stable].role, "user");
+        assert_eq!(
+            messages[stable].context_origin,
+            magi_bridge_client::ChatMessageOrigin::ContextReference
+        );
+        assert_eq!(
+            messages[volatile].context_origin,
+            magi_bridge_client::ChatMessageOrigin::RoundContext
+        );
+        // 模型观察钩子在 Step 提交后依次通知，且不带提示词正文。
+        let events = hooks.events.lock().unwrap();
+        let names: Vec<_> = events.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["model.resolved", "model.request", "model.response"]);
+        assert!(
+            events
+                .iter()
+                .all(|(_, payload)| !payload.to_string().contains("你好"))
+        );
+    }
+
+    struct RewritingHooks;
+    impl crate::extension_hooks::ExtensionHooks for RewritingHooks {
+        fn tool_call(
+            &self,
+            _: &crate::extension_hooks::ToolHookScope<'_>,
+            _: &magi_bridge_client::ChatToolCall,
+        ) -> crate::extension_hooks::ToolCallDecision {
+            unreachable!()
+        }
+        fn tool_result(
+            &self,
+            _: &crate::extension_hooks::ToolHookScope<'_>,
+            _: &magi_bridge_client::ChatToolCall,
+            _: crate::extension_hooks::ToolResultView<'_>,
+        ) -> Option<String> {
+            None
+        }
+        fn context_assemble(
+            &self,
+            _: &crate::extension_hooks::ToolHookScope<'_>,
+            view: &crate::extension_hooks::AssembleView<'_>,
+        ) -> Vec<crate::ExtensionRewriteProposal> {
+            vec![crate::ExtensionRewriteProposal {
+                plugin_id: "acme.summary".into(),
+                contribution_id: "context.assemble".into(),
+                hook: "context.assemble".into(),
+                from: view.rewritable.start,
+                to: view.rewritable.start + 2,
+                replacement: vec![ChatMessage {
+                    input_request_id: None,
+                    context_origin: Default::default(),
+                    role: "assistant".into(),
+                    content: Some("[摘要]".into()),
+                    images: vec![],
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    provider_context: vec![],
+                }],
+            }]
+        }
+        fn context_rewrite_authorized(&self, plugin_id: &str) -> bool {
+            plugin_id == "acme.summary"
+        }
+    }
+
+    #[test]
+    fn conversation_assembly_rewrites_history_records_it_and_keeps_the_tail() {
+        let request = SessionTurnExecutionRequest {
+            project_directories: None,
+            session_id: SessionId::new("s"),
+            turn_id: "t".into(),
+            workspace_id: None,
+            prompt: "当前".into(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            command: None,
+        };
+        let msg = |role: &str, text: &str| ChatMessage {
+            input_request_id: None,
+            context_origin: Default::default(),
+            role: role.into(),
+            content: Some(text.into()),
+            images: vec![],
+            tool_calls: vec![],
+            tool_call_id: None,
+            provider_context: vec![],
+        };
+        let history = vec![
+            msg("user", "u0"),
+            msg("assistant", "a0"),
+            msg("user", "u1"),
+            msg("assistant", "a1"),
+            msg("user", "当前"),
+        ];
+        let assembly = ConversationAssembly::new(Some(&RewritingHooks), &request, 100_000);
+        let view = assembly.view(
+            &history,
+            &crate::request_controls::RequestControls::default(),
+        );
+        assert_eq!(
+            view.iter()
+                .map(|m| m.content.clone().unwrap())
+                .collect::<Vec<_>>(),
+            ["[摘要]", "u1", "a1", "当前"]
+        );
+        let projection = assembly.projection.borrow().clone();
+        assert_eq!(projection.extension_rewrites.len(), 1);
+        assert_eq!(projection.extension_rewrites[0].plugin_id, "acme.summary");
+        // 没有扩展时视图与原控制视图一致。
+        let plain = ConversationAssembly::new(None, &request, 100_000).view(
+            &history,
+            &crate::request_controls::RequestControls::default(),
+        );
+        assert_eq!(plain.len(), history.len());
+    }
+
     #[test]
     fn session_turn_cancellation_interrupts_model_invocation() {
         let session_id = SessionId::new("session-model-cancellation");
@@ -3321,6 +3720,7 @@ mod tests {
             persist_session_state: None,
             live_settings_store: None,
             plugin_command_executor: None,
+            extension_hooks: None,
         })
         .expect("cancelled model invocation should resolve as interrupted turn");
         assert!(output.interrupted);
@@ -3465,6 +3865,7 @@ mod tests {
             persist_session_state: None,
             live_settings_store: Some(settings.clone()),
             plugin_command_executor: None,
+            extension_hooks: None,
         })
         .expect("识图模型必须完成整个会话轮次");
 
@@ -3552,6 +3953,7 @@ mod tests {
             persist_session_state: None,
             live_settings_store: Some(settings.clone()),
             plugin_command_executor: None,
+            extension_hooks: None,
         })
         .expect("识图后的纯文本轮次必须恢复主模型执行");
 
@@ -3840,6 +4242,7 @@ mod tests {
             persist_session_state: None,
             live_settings_store: None,
             plugin_command_executor: None,
+            extension_hooks: None,
         })
         .expect("steered turn should complete");
 
@@ -3994,6 +4397,7 @@ mod tests {
             persist_session_state: None,
             live_settings_store: None,
             plugin_command_executor: None,
+            extension_hooks: None,
         })
         .expect("ordinary turn should complete independently");
 
@@ -4163,6 +4567,7 @@ mod tests {
             persist_session_state: None,
             live_settings_store: None,
             plugin_command_executor: None,
+            extension_hooks: None,
         });
 
         assert!(matches!(
@@ -4261,6 +4666,7 @@ mod tests {
             persist_session_state: None,
             live_settings_store: None,
             plugin_command_executor: None,
+            extension_hooks: None,
         }) {
             Ok(_) => panic!("empty provider response should fail"),
             Err(error) => error,
@@ -4377,6 +4783,7 @@ mod tests {
             persist_session_state: None,
             live_settings_store: None,
             plugin_command_executor: None,
+            extension_hooks: None,
         })
         .expect("empty stream before output should be retried");
 
@@ -4465,6 +4872,7 @@ mod tests {
             persist_session_state: None,
             live_settings_store: None,
             plugin_command_executor: None,
+            extension_hooks: None,
         }) {
             Ok(_) => panic!("incomplete stream should fail the turn"),
             Err(error) => error,
@@ -4578,6 +4986,7 @@ mod tests {
             persist_session_state: None,
             live_settings_store: None,
             plugin_command_executor: None,
+            extension_hooks: None,
         })
         .expect("流中断应由非流式降级完成");
 
@@ -4684,6 +5093,7 @@ mod tests {
             persist_session_state: None,
             live_settings_store: None,
             plugin_command_executor: None,
+            extension_hooks: None,
         }) {
             Ok(_) => panic!("image provider empty stream should fail"),
             Err(error) => error,
@@ -4794,6 +5204,7 @@ mod tests {
             context_window_tokens: 256_000,
             orchestrator_thread_id: &orchestrator_thread_id,
             persist_session_state: None,
+            extension_hooks: None,
         })
         .expect("round should stream");
 
@@ -4915,6 +5326,7 @@ mod tests {
             context_window_tokens: 256_000,
             orchestrator_thread_id: &orchestrator_thread_id,
             persist_session_state: None,
+            extension_hooks: None,
         })
         .expect("round should complete after retry");
 
@@ -6305,6 +6717,8 @@ mod tests {
             settings_store: None,
             skill_runtime: None,
             persist_checkpoint: true,
+            stable_contributions: &[],
+            extension_hooks: None,
         });
 
         assert!(
@@ -6410,6 +6824,8 @@ mod tests {
             settings_store: None,
             skill_runtime: None,
             persist_checkpoint: true,
+            stable_contributions: &[],
+            extension_hooks: None,
         });
 
         assert_eq!(result, Err(ContextCompactionTerminal::Failed));
@@ -6512,6 +6928,8 @@ mod tests {
             settings_store: None,
             skill_runtime: None,
             persist_checkpoint: true,
+            stable_contributions: &[],
+            extension_hooks: None,
         });
 
         assert_eq!(result, Err(ContextCompactionTerminal::Cancelled));
