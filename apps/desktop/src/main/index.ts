@@ -37,6 +37,7 @@ import { DesktopControlServer } from "./desktop-control-server.js";
 import { openWorkspaceFolder, revealWorkspaceFile } from "./desktop-files.js";
 import { ProcessSupervisor } from "./process-supervisor.js";
 import { DesktopRuntimeRecoveryCoordinator } from "./desktop-runtime-recovery.js";
+import { diagnoseUserStateFileStartupFailure } from "./startup-config-failure.js";
 import { defaultStateRoot } from "./state-root.js";
 import { UpdateManager } from "./update-manager.js";
 import { WindowManager } from "./window-manager.js";
@@ -1287,7 +1288,7 @@ function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error ?? "unknown");
 }
 
-/** 启动 daemon；失败时让用户选择重试或退出，而不是无提示地退出应用。 */
+/** 启动 daemon；失败时向用户说明原因和下一步，而不是无提示地退出应用。 */
 async function startDaemonWithFailurePrompt(
   supervisor: ProcessSupervisor,
 ): Promise<void> {
@@ -1310,24 +1311,45 @@ async function promptDaemonFailure(
 ): Promise<"retry" | "exit"> {
   const logPath = supervisor.logFilePath;
   const recentOutput = supervisor.recentOutput.trim().split("\n").slice(-12).join("\n");
-  const detail = [
-    `原因：${describeError(error)}`,
-    recentOutput ? `最近输出：\n${recentOutput}` : "",
-    logPath ? `完整日志：${logPath}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+  const damagedStateFile = diagnoseUserStateFileStartupFailure(
+    describeError(error),
+    supervisor.recentOutput,
+    stateRoot,
+  );
+  const detail = damagedStateFile
+    ? [
+        `无法读取本机状态文件：${damagedStateFile.filePath}`,
+        "请退出 Magi，先备份并移走或清理这个文件，再重新启动 Magi。Magi 不会自动删除或覆盖状态文件。",
+        logPath ? `完整日志：${logPath}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n")
+    : [
+        `原因：${describeError(error)}`,
+        recentOutput ? `最近输出：\n${recentOutput}` : "",
+        logPath ? `完整日志：${logPath}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
   for (;;) {
     const { response } = await dialog.showMessageBox({
       type: "error",
       title: "Magi",
-      message: "Magi 后台服务无法启动",
+      message: damagedStateFile
+        ? "Magi 无法读取本机配置文件"
+        : "Magi 后台服务无法启动",
       detail,
-      buttons: ["重试", "打开日志位置", "退出"],
-      defaultId: 0,
+      buttons: damagedStateFile
+        ? ["打开配置文件", "打开日志位置", "退出"]
+        : ["重试", "打开日志位置", "退出"],
+      defaultId: damagedStateFile ? 2 : 0,
       cancelId: 2,
       noLink: true,
     });
+    if (response === 0 && damagedStateFile) {
+      shell.showItemInFolder(damagedStateFile.filePath);
+      continue;
+    }
     if (response === 0) return "retry";
     if (response === 1 && logPath) {
       shell.showItemInFolder(logPath);
