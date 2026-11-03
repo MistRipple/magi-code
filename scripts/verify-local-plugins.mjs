@@ -14,6 +14,7 @@ const port = Number(process.env.MAGI_PLUGIN_TEST_PORT || 38123);
 const origin = `http://127.0.0.1:${port}`;
 const run = promisify(execFile);
 const requests = [];
+const authorizations = [];
 let daemon, log = '', checks = 0;
 function check(name, value) { assert.ok(value, name); checks++; console.log(`✓ ${name}`); }
 async function wait(probe, label, timeout = 30000) {
@@ -38,7 +39,11 @@ const provider = createServer(async (req, res) => {
   if (req.url === '/health') return void res.end('ok');
   let bytes = ''; for await (const chunk of req) bytes += chunk;
   if (req.url !== '/v1/chat/completions') return void res.writeHead(404).end();
-  requests.push(JSON.parse(bytes));
+  const body = JSON.parse(bytes); requests.push(body); authorizations.push({model: body.model, authorization: req.headers.authorization});
+  if (body.stream) {
+    const chunk = (delta, finish_reason = null, extra = {}) => `data: ${JSON.stringify({id:'local', object:'chat.completion.chunk', choices:[{index:0, delta, finish_reason}], ...extra})}\n\n`;
+    return void res.writeHead(200, {'content-type':'text/event-stream'}).end(chunk({role:'assistant', content:'LOCAL_STREAM_OK'}) + chunk({}, 'stop') + chunk({}, null, {choices:[], usage:{prompt_tokens:10, completion_tokens:3, total_tokens:13}}) + 'data: [DONE]\n\n');
+  }
   res.writeHead(200, {'content-type':'application/json'}).end(JSON.stringify({id:'local', object:'chat.completion', choices:[{index:0, message:{role:'assistant', content:'LOCAL_MODEL_OK'}, finish_reason:'stop'}], usage:{prompt_tokens:10, completion_tokens:3, total_tokens:13}}));
 });
 await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve));
@@ -88,6 +93,18 @@ export default async api => {
 }`);
   const archive=join(work,`${version}.zip`); await run(process.execPath,[join(root,'scripts/pack-plugin.mjs'),directory,archive]);
   return {source:'local:test.zip',archiveBase64:(await readFile(archive)).toString('base64')};
+}
+// 只提供模型数据源的插件：把本地 provider 作为“第三方反代”贡献给主对话目录。
+async function packProxy() {
+  const directory = join(work, 'proxy'); await mkdir(join(directory, 'extension'), {recursive:true});
+  const manifest = {sdkVersion:2, id:'test.proxy', version:'1.0.0', name:'本地反代插件', description:'模型数据源纵向验收', permissions:[{kind:'extension',targets:['full-trust']},{kind:'modelSources',targets:['gateway']}], extension:{hooks:[]}, dataSchemaVersion:1, settingsSchema:{type:'object',additionalProperties:false}, contributions:{modelSources:[{id:'gateway',title:'本地反代',description:''}]}};
+  await writeFile(join(directory,'manifest.json'),JSON.stringify(manifest));
+  await writeFile(join(directory,'extension/index.mjs'), `
+export default async api => {
+  await api.modelSource.set('gateway', {baseUrl:${JSON.stringify(`${providerOrigin}/v1`)}, apiKey:'plugin-key', apiProtocol:'openai_chat', models:[{id:'proxy-model', displayName:'Proxy Model'}]});
+}`);
+  const archive=join(work,'proxy.zip'); await run(process.execPath,[join(root,'scripts/pack-plugin.mjs'),directory,archive]);
+  return {source:'local:proxy.zip',archiveBase64:(await readFile(archive)).toString('base64')};
 }
 async function verifyUi(session) {
   const electronRoot = join(root, 'node_modules/electron');
@@ -156,6 +173,28 @@ try {
   const reset=(await api('/api/plugins/test.local/resources/notes')).value; check('新版不会读到旧格式资源',reset.version===0&&reset.value===null);
   await post('/api/plugins/test.local/deactivate'); await post('/api/plugins/test.local/disable'); await post('/api/plugins/test.local/uninstall');
   check('卸载后插件与贡献消失',!(await installed()));
+  // ---- 插件贡献主对话模型数据源：授权预览、目录追加、真实请求走插件端点、撤销后不回退 ----
+  const proxy=await packProxy(); const proxyPreview=await post('/api/plugins/preview',proxy);
+  check('预览单独列出 modelSources 授权（区别于 models）',proxyPreview.addedPermissions.some(p=>p.kind==='modelSources'&&p.targets.includes('gateway'))&&!proxyPreview.addedPermissions.some(p=>p.kind==='models'));
+  await post('/api/plugins/install',{...proxy,expectedDigest:proxyPreview.digest});
+  const catalogGroups=async()=> (await api('/api/settings/models/catalog')).value.groups;
+  check('未激活的插件不向目录追加数据源',!(await catalogGroups()).some(g=>g.kind==='plugin'));
+  await post('/api/plugins/test.proxy/authorize',{grants:proxyPreview.manifest.permissions}); await post('/api/plugins/test.proxy/enable'); await post('/api/plugins/test.proxy/activate');
+  const group=await wait(async()=> (await catalogGroups()).find(g=>g.sourceId==='plugin/test.proxy/gateway'),'插件数据源进入目录');
+  check('插件数据源以插件分组追加，用户的环境数据源保持在前且不含连接信息',group.kind==='plugin'&&group.pluginId==='test.proxy'&&group.name==='本地反代'&&group.models[0].id==='proxy-model'&&(await catalogGroups())[0].kind==='custom'&&!JSON.stringify(await catalogGroups()).includes('plugin-key'));
+  const proxySession=(await post('/api/session/materialize',{scope:'personal'})).sessionId;
+  await post('/api/settings/orchestrator/session/save',{scope:'personal',sessionId:proxySession,config:{sourceId:'plugin/test.proxy/gateway',model:'proxy-model',reasoningEffort:null}});
+  const before=authorizations.length;
+  const proxied=await post('/api/session/turn',{scope:'personal',sessionId:proxySession,text:'PLUGIN_SOURCE_CHECK',requestId:'proxy-1',userMessageId:'proxy-user-1'});
+  const proxiedTurn=await settled(proxySession,proxied.turnId);
+  check('选用插件数据源的主对话请求真实发往插件提供的端点并带插件密钥',proxiedTurn.status==='completed'&&authorizations.slice(before).some(r=>r.model==='proxy-model'&&r.authorization==='Bearer plugin-key'));
+  await post('/api/plugins/test.proxy/deactivate');
+  await wait(async()=> !(await catalogGroups()).some(g=>g.kind==='plugin'),'插件停用后数据源撤销');
+  const afterRevoke=authorizations.length;
+  const orphan=await api('/api/session/turn',{scope:'personal',sessionId:proxySession,text:'AFTER_REVOKE',requestId:'proxy-2',userMessageId:'proxy-user-2'});
+  const orphanSettled=orphan.status===200 ? await settled(proxySession,orphan.value.turnId) : null;
+  check('插件数据源撤销后会话明确失败，不静默回退到其他模型',(orphan.status>=400||orphanSettled?.status==='failed')&&authorizations.length===afterRevoke);
+  await post('/api/plugins/test.proxy/disable'); await post('/api/plugins/test.proxy/uninstall');
   check('MCP 管理面不依赖插件',(await api('/api/mcp-server/status')).status===200);
 } catch(error) {console.error(error); console.error('plugin status:', JSON.stringify(await installed().catch(()=>null))); process.exitCode=1;}
 finally {

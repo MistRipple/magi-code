@@ -63,6 +63,10 @@ impl PluginServices {
         self.extensions.start(events);
     }
 
+    pub(super) fn bind_settings(&self, settings: &Arc<magi_settings_store::SettingsStore>) {
+        self.extensions.bind_settings(settings);
+    }
+
     pub(super) fn bind_native(
         &self,
         dispatcher: &Arc<magi_conversation_runtime::task_execution_dispatcher::LlmTaskDispatcher>,

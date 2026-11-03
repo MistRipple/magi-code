@@ -41,6 +41,9 @@ pub trait HostService: Send + Sync + 'static {
         method: String,
         params: Value,
     ) -> BoxFuture<Result<Value, RpcError>>;
+    /// 宿主实例已退出（崩溃、停止或被替换），进程树已回收。实现应撤销该插件在本次运行中
+    /// 登记的运行期事实（例如贡献的模型数据源）；下一个实例重新激活时自行提交。
+    fn instance_detached(&self, _plugin_id: &str) {}
 }
 
 /// Node 侧宿主运行时（`runtime/host.mjs`）。daemon 在状态目录里按内容摘要落盘后交给 Node 执行。

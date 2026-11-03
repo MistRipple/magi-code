@@ -66,7 +66,8 @@ use crate::{
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
         publish_model_usage_record_for_turn,
-        publish_model_usage_record_for_turn_with_context_window, resolved_model_for_usage_binding,
+        publish_model_usage_record_for_turn_with_context_window,
+        resolved_main_source_id_for_usage_binding, resolved_model_for_usage_binding,
         resolved_provider_for_usage_binding, vision_model_usage_binding,
     },
 };
@@ -1101,6 +1102,11 @@ fn run_conversation_loop_inner(
         session_id,
     )
     .unwrap_or_default();
+    let selected_main_source_id = resolved_main_source_id_for_usage_binding(
+        settings_store.or(live_settings_store),
+        usage_binding,
+        session_id,
+    );
     let current_turn_contains_images = !images.is_empty();
     let vision_execution_config = match resolve_vision_execution_config(
         settings_store.or(live_settings_store).map(Arc::as_ref),
@@ -1128,22 +1134,35 @@ fn run_conversation_loop_inner(
         .and_then(|config| config.require_model().ok())
         .unwrap_or(&selected_context_model)
         .to_string();
-    let mut effective_context_window = resolve_model_context_window_with_override(
-        // 与模型 client、vision 配置和 usage binding 使用同一份已接纳的执行快照。
-        // 不能在 Turn 执行中改用 live settings，否则模型仍是旧配置而窗口可能
-        // 来自新配置，/compact 会按错误的分母规划历史。
-        settings_store.or(live_settings_store).map(Arc::as_ref),
-        &resolved_context_model,
-        vision_execution_config
-            .as_ref()
-            .and_then(|config| config.context_window_tokens())
-            .or_else(|| {
-                task.executor_binding
-                    .as_ref()
-                    .and_then(|binding| binding.model_selection.as_ref())
-                    .and_then(|selection| selection.context_window_tokens)
-            }),
-    );
+    let context_settings = settings_store.or(live_settings_store).map(Arc::as_ref);
+    let configured_context_window = vision_execution_config
+        .as_ref()
+        .and_then(|config| config.context_window_tokens())
+        .or_else(|| {
+            task.executor_binding
+                .as_ref()
+                .and_then(|binding| binding.model_selection.as_ref())
+                .and_then(|selection| selection.context_window_tokens)
+        });
+    let mut effective_context_window = if vision_execution_config.is_none()
+        && let Some(source_id) = selected_main_source_id.as_deref()
+    {
+        crate::model_context_window::resolve_main_source_model_context_window(
+            context_settings,
+            source_id,
+            &resolved_context_model,
+            configured_context_window,
+        )
+    } else {
+        resolve_model_context_window_with_override(
+            // 与模型 client、vision 配置和 usage binding 使用同一份已接纳的执行快照。
+            // 不能在 Turn 执行中改用 live settings，否则模型仍是旧配置而窗口可能
+            // 来自新配置，/compact 会按错误的分母规划历史。
+            context_settings,
+            &resolved_context_model,
+            configured_context_window,
+        )
+    };
     let initial_skill_name = skill_name.clone();
     let turn_visibility = task_turn_visibility(
         task,
@@ -7568,6 +7587,7 @@ mod tests {
                 .set_section(
                     "orchestratorSessionDefaults",
                     serde_json::json!({
+                        "sourceId": "custom/test",
                         "model": "context-window-test-model"
                     }),
                 )
@@ -7576,19 +7596,22 @@ mod tests {
         live_settings
             .set_section(
                 "orchestrator",
-                serde_json::json!({
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiKey": "test-key",
-                    "apiProtocol": "openai_chat"
-                }),
+                crate::main_model_sources::test_sources(
+                    "https://api.example.com/v1",
+                    "test-key",
+                    &["context-window-test-model"],
+                ),
             )
             .expect("orchestrator settings should save");
-        crate::model_context_window::set_model_context_window(
-            live_settings.as_ref(),
-            "context-window-test-model",
-            16_000,
-        )
-        .expect("context window should save");
+        if configure_session_model {
+            crate::model_context_window::set_main_source_model_context_window(
+                live_settings.as_ref(),
+                crate::main_model_sources::TEST_SOURCE_IDENTITY,
+                "context-window-test-model",
+                16_000,
+            )
+            .expect("context window should save");
+        }
         let execution_settings = Arc::new(live_settings.execution_snapshot());
 
         let (outcome, _) = run_conversation_loop(ConversationLoopRequest {

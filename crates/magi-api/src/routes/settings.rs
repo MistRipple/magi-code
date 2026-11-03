@@ -9,7 +9,8 @@ use magi_bridge_client::{
     ModelInvocationRequest,
 };
 use magi_conversation_runtime::model_context_window::{
-    MODEL_CONTEXT_WINDOWS_SECTION, model_context_windows_with_update, set_model_context_window,
+    MODEL_CONTEXT_WINDOWS_SECTION, model_context_windows_with_update,
+    set_main_source_model_context_window, set_model_context_window,
 };
 use magi_core::{AccessProfile, EventId, UtcMillis};
 use magi_event_bus::{
@@ -29,8 +30,7 @@ use crate::{
     errors::{ApiError, settings_persistence_error},
     model_config::{
         DEFAULT_VISION_CONTEXT_WINDOW, NormalizedModelConfig, VISION_MODEL_SECTION,
-        builtin_text_model_rule_catalog, ensure_orchestrator_session_defaults_from_models,
-        load_agent_overrides, load_registry_engines, merge_orchestrator_session_override,
+        builtin_text_model_rule_catalog, load_agent_overrides, load_registry_engines,
         orchestrator_session_defaults, reject_unknown_model_config_fields, resolve_registry_agents,
         resolved_orchestrator_session_config, role_templates_for_registry,
         save_orchestrator_session_override_for_session, template_ids_for_registry,
@@ -59,18 +59,14 @@ fn model_settings_section_request(
 fn orchestrator_connection_section_request(
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
-    let config = model_settings_section_request(request)?;
-
-    // 主模型与推理强度归会话所有，全局 orchestrator 只保存连接配置。
-    if let Some(field) = ["model", "reasoningEffort"]
-        .into_iter()
-        .find(|field| config.get(*field).is_some())
-    {
-        return Err(ApiError::InvalidInput(format!(
-            "全局主模型连接配置不接受字段 {field}，主模型由会话选择"
-        )));
-    }
-    Ok(config)
+    let mut config = scoped_settings_section_request(request)?;
+    config
+        .as_object_mut()
+        .ok_or_else(|| ApiError::InvalidInput("主对话数据源配置必须是对象".into()))?
+        .remove("expectedRevision");
+    let config = magi_conversation_runtime::main_model_sources::parse(&config)
+        .map_err(ApiError::InvalidInput)?;
+    serde_json::to_value(config).map_err(|_| ApiError::InvalidInput("数据源配置无效".into()))
 }
 
 fn parse_optional_query_string(query: &HashMap<String, String>, key: &str) -> Option<String> {
@@ -142,7 +138,6 @@ fn parse_fetch_models_config(
     let config = NormalizedModelConfig::from_settings_value(&request.config)
         .map_err(ApiError::InvalidInput)?;
     config.require_base_url().map_err(ApiError::InvalidInput)?;
-    config.require_api_key().map_err(ApiError::InvalidInput)?;
     Ok((config, request.target))
 }
 
@@ -303,7 +298,6 @@ async fn fetch_model_catalog_for_config(
     config: &NormalizedModelConfig,
 ) -> Result<ModelCatalog, ApiError> {
     let url = config.models_list_url().map_err(ApiError::InvalidInput)?;
-    let api_key = config.require_api_key().map_err(ApiError::InvalidInput)?;
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -312,20 +306,22 @@ async fn fetch_model_catalog_for_config(
             "插件引擎没有 HTTP 模型列表接口".to_string(),
         ));
     };
-    match protocol {
-        HttpModelBridgeProtocol::ChatCompletions | HttpModelBridgeProtocol::Responses => {
-            let auth_value = HeaderValue::from_str(&format!("Bearer {}", api_key))
-                .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
-            headers.insert(AUTHORIZATION, auth_value);
-        }
-        HttpModelBridgeProtocol::AnthropicMessages => {
-            let key_value = HeaderValue::from_str(api_key)
-                .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
-            headers.insert(HeaderName::from_static("x-api-key"), key_value);
-            headers.insert(
-                HeaderName::from_static("anthropic-version"),
-                HeaderValue::from_static("2023-06-01"),
-            );
+    if let Some(api_key) = config.api_key() {
+        match protocol {
+            HttpModelBridgeProtocol::ChatCompletions | HttpModelBridgeProtocol::Responses => {
+                let auth_value = HeaderValue::from_str(&format!("Bearer {}", api_key))
+                    .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
+                headers.insert(AUTHORIZATION, auth_value);
+            }
+            HttpModelBridgeProtocol::AnthropicMessages => {
+                let key_value = HeaderValue::from_str(api_key)
+                    .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
+                headers.insert(HeaderName::from_static("x-api-key"), key_value);
+                headers.insert(
+                    HeaderName::from_static("anthropic-version"),
+                    HeaderValue::from_static("2023-06-01"),
+                );
+            }
         }
     }
 
@@ -532,6 +528,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/settings/registry/agents/upsert", post(upsert_agent))
         .route("/settings/registry/agents/remove", post(remove_agent))
         .route("/settings/models/fetch", post(fetch_models))
+        .route("/settings/models/catalog", get(main_model_catalog))
         .route(
             "/settings/models/reasoning",
             post(model_reasoning_capability),
@@ -577,45 +574,22 @@ async fn settings_bootstrap(
             json!(builtin_text_model_rule_catalog()),
         );
         object.insert("scope".to_string(), json!(scope.scope_kind()));
-        if let Some(session_id) = scope.session_id() {
-            let mut effective_orchestrator_config = object
-                .get("orchestratorConfig")
-                .cloned()
-                .unwrap_or(Value::Null);
-            let session_orchestrator_config =
-                resolved_orchestrator_session_config(&state, session_id);
-            merge_orchestrator_session_override(
-                &mut effective_orchestrator_config,
-                &session_orchestrator_config,
-            );
-
-            object.insert(
-                "orchestratorSessionConfig".to_string(),
-                session_orchestrator_config,
-            );
-            object.insert(
-                "effectiveOrchestratorConfig".to_string(),
-                effective_orchestrator_config,
-            );
-        } else {
-            let session_defaults = orchestrator_session_defaults(&state);
-            let mut effective_orchestrator_config = object
-                .get("orchestratorConfig")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            merge_orchestrator_session_override(
-                &mut effective_orchestrator_config,
-                &session_defaults,
-            );
-            object.insert(
-                "orchestratorSessionConfig".to_string(),
-                session_defaults.clone(),
-            );
-            object.insert(
-                "effectiveOrchestratorConfig".to_string(),
-                effective_orchestrator_config,
-            );
+        let selection = scope
+            .session_id()
+            .map(|session_id| resolved_orchestrator_session_config(&state, session_id))
+            .unwrap_or_else(|| orchestrator_session_defaults(&state));
+        let effective = magi_conversation_runtime::main_model_sources::effective_config(
+            &state.settings_store,
+            &selection,
+        );
+        if let Err(error) = &effective {
+            object.insert("orchestratorModelError".into(), json!(error));
         }
+        object.insert("orchestratorSessionConfig".into(), selection.clone());
+        object.insert(
+            "effectiveOrchestratorConfig".into(),
+            effective.unwrap_or(selection),
+        );
         if let Some(effective) = object.get("effectiveOrchestratorConfig")
             && let Ok(config) =
                 NormalizedModelConfig::from_settings_with_catalog(&state.settings_store, effective)
@@ -785,10 +759,32 @@ async fn save_orchestrator_config(
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let config = orchestrator_connection_section_request(&request)?;
-    state
+    let expected = request
+        .get("expectedRevision")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ApiError::InvalidInput("保存数据源需要 expectedRevision".into()))?;
+    let next_revision = expected
+        .checked_add(1)
+        .ok_or_else(|| ApiError::InvalidInput("数据源修订号已达到上限".into()))?;
+    let mut saved = config;
+    saved["revision"] = json!(next_revision);
+    let changed = state
         .settings_store
-        .set_section("orchestrator", config.clone())
+        .update_section("orchestrator", |current| {
+            let revision = current.get("revision").and_then(Value::as_u64).unwrap_or(0);
+            if revision != expected {
+                return false;
+            }
+            *current = saved.clone();
+            true
+        })
         .map_err(settings_persistence_error)?;
+    if !changed {
+        return Err(ApiError::InvalidInput(
+            "数据源已被其他窗口修改，请重新加载后再保存".into(),
+        ));
+    }
+    let config = saved;
     Ok(Json(serde_json::json!({ "saved": true, "config": config })))
 }
 
@@ -813,8 +809,11 @@ async fn save_orchestrator_session_config(
                     .get_session_section(&scope.session_id, "orchestrator")
             });
 
-    let mut effective_config = state.settings_store.get_section("orchestrator");
-    merge_orchestrator_session_override(&mut effective_config, &override_config);
+    let effective_config = magi_conversation_runtime::main_model_sources::effective_config(
+        &state.settings_store,
+        &override_config,
+    )
+    .map_err(ApiError::InvalidInput)?;
     let capability =
         NormalizedModelConfig::from_settings_with_catalog(&state.settings_store, &effective_config)
             .ok()
@@ -848,14 +847,38 @@ async fn save_model_context_window(
         .get("contextWindowTokens")
         .and_then(Value::as_u64)
         .ok_or_else(|| ApiError::InvalidInput("上下文窗口必须是整数".to_string()))?;
-    let entries = set_model_context_window(&state.settings_store, model, context_window_tokens)
+    let source_id = request
+        .get("sourceId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if request.get("sourceId").is_some() && source_id.is_none() {
+        return Err(ApiError::InvalidInput("sourceId 必须是非空字符串".into()));
+    }
+    let entries = if let Some(source_id) = source_id {
+        magi_conversation_runtime::main_model_sources::effective_config(
+            &state.settings_store,
+            &json!({"sourceId": source_id, "model": model}),
+        )
         .map_err(ApiError::InvalidInput)?;
+        set_main_source_model_context_window(
+            &state.settings_store,
+            source_id,
+            model,
+            context_window_tokens,
+        )
+        .map_err(ApiError::InvalidInput)?
+    } else {
+        set_model_context_window(&state.settings_store, model, context_window_tokens)
+            .map_err(ApiError::InvalidInput)?
+    };
     let updated_at = UtcMillis::now();
     let _ = state.event_bus.publish(EventEnvelope::domain(
         EventId::unique("event-model-context-window-updated"),
         "model.context_window.updated",
         json!({
             "model": model,
+            "sourceId": source_id,
             "contextWindowTokens": context_window_tokens,
             "modelContextWindows": entries,
             "updatedAt": updated_at.0,
@@ -864,6 +887,7 @@ async fn save_model_context_window(
     Ok(Json(json!({
         "saved": true,
         "model": model,
+        "sourceId": source_id,
         "contextWindowTokens": context_window_tokens,
         "modelContextWindows": entries,
     })))
@@ -1787,6 +1811,12 @@ async fn remove_agent(
     crate::model_config::remove_agent(&state, &request).map(Json)
 }
 
+async fn main_model_catalog(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    magi_conversation_runtime::main_model_sources::catalog(&state.settings_store)
+        .map(Json)
+        .map_err(ApiError::InvalidInput)
+}
+
 async fn fetch_models(
     State(state): State<ApiState>,
     Json(request): Json<FetchModelsRequest>,
@@ -1805,7 +1835,7 @@ async fn fetch_models(
     });
     let mut model_capabilities = serde_json::Map::new();
     let mut catalog_display_names = serde_json::Map::new();
-    let (models, session_defaults) = match provider_result {
+    let models = match provider_result {
         Ok((config, _)) => match fetch_model_catalog_for_config(&config).await {
             Ok(catalog) if !catalog.models.is_empty() => {
                 persist_model_reasoning_catalog(&state, &config, &catalog)?;
@@ -1825,10 +1855,7 @@ async fn fetch_models(
                         .insert(model.clone(), json!(resolved.reasoning_capability(model)));
                 }
 
-                let defaults = matches!(target.as_str(), "orch" | "orchestrator")
-                    .then(|| ensure_orchestrator_session_defaults_from_models(&state, &models))
-                    .transpose()?;
-                (models, defaults)
+                models
             }
 
             Ok(_) => {
@@ -1855,7 +1882,6 @@ async fn fetch_models(
         "models": models,
         "modelDisplayNames": catalog_display_names,
         "modelCapabilities": model_capabilities,
-        "orchestratorSessionDefaults": session_defaults,
         "requestedAt": now.0,
     })))
 }
@@ -1867,7 +1893,21 @@ async fn model_reasoning_capability(
     let raw = request
         .get("config")
         .ok_or_else(|| ApiError::InvalidInput("缺少模型配置".into()))?;
-    reject_unknown_model_config_fields(raw).map_err(ApiError::InvalidInput)?;
+    let resolved_source;
+    let raw = if raw.get("sourceId").is_some() {
+        resolved_source = magi_conversation_runtime::main_model_sources::effective_config(
+            &state.settings_store,
+            &json!({
+                "sourceId":raw.get("sourceId"), "model":request.get("model"),
+            }),
+        )
+        .map_err(ApiError::InvalidInput)?;
+        &resolved_source
+    } else {
+        reject_unknown_model_config_fields(raw).map_err(ApiError::InvalidInput)?;
+        raw
+    };
+
     let config = NormalizedModelConfig::from_settings_with_catalog(&state.settings_store, raw)
         .map_err(ApiError::InvalidInput)?;
     let model = request
@@ -2085,6 +2125,24 @@ mod tests {
         test_state_with_external_catalog_snapshot(None)
     }
 
+    fn main_source(id: &str, models: &[&str]) -> Value {
+        json!({
+            "id": id,
+            "name": id,
+            "baseUrl": format!("https://{id}.example.test/v1"),
+            "apiKey": format!("sk-{id}"),
+            "apiProtocol": "openai_chat",
+            "models": models.iter().map(|model| json!({"id": model})).collect::<Vec<_>>(),
+        })
+    }
+
+    fn seed_main_sources(state: &ApiState, sources: Vec<Value>) {
+        state
+            .settings_store
+            .set_section("orchestrator", json!({"revision": 1, "sources": sources}))
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn reasoning_metadata_is_connection_scoped_and_ignores_obsolete_overrides() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2227,7 +2285,7 @@ mod tests {
             first["modelDisplayNames"],
             json!({"opaque-id":"GPT Sol","camel-id":"Gemini Flash"})
         );
-        assert_eq!(first["orchestratorSessionDefaults"]["model"], "camel-id");
+        assert!(first.get("orchestratorSessionDefaults").is_none());
         // A refresh replaces the whole projection, including renamed/removed display names.
         *payload.write().unwrap() = json!({"data":[
             {"id":"opaque-id","display_name":"GPT Sol Updated","supportedEfforts":[]},
@@ -2243,11 +2301,12 @@ mod tests {
             refreshed["modelDisplayNames"],
             json!({"opaque-id":"GPT Sol Updated","new-id":"New Model"})
         );
-        assert_eq!(
+        assert!(
             state
                 .settings_store
-                .get_section("orchestratorSessionDefaults")["model"],
-            "camel-id"
+                .get_section("orchestratorSessionDefaults")
+                .is_null(),
+            "模型目录探测不得写会话默认值"
         );
         server.abort();
     }
@@ -2801,91 +2860,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orchestrator_model_catalog_initializes_first_model_once() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("stub listener should bind");
-        let base_url = format!(
-            "http://{}",
-            listener.local_addr().expect("stub addr should exist")
-        );
-        let app = Router::new().route(
-            "/v1/models",
-            get(|| async { Json(json!({"data": [{"id": "z-test"}, {"id": "gpt-test"}]})) }),
-        );
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("stub server should run");
-        });
+    async fn session_defaults_project_first_catalog_model_until_user_selects_one() {
         let state = test_state();
-        for previous in [
-            json!({}),
-            json!({ "model": "", "reasoningEffort": "xhigh" }),
-        ] {
+        state
+            .settings_store
+            .set_section(
+                "orchestrator",
+                json!({"revision": 1, "sources": [
+                    main_source("one", &["z-test", "gpt-test"]),
+                    main_source("two", &["other"])
+                ]}),
+            )
+            .unwrap();
+        let defaults = crate::model_config::orchestrator_session_defaults(&state);
+        assert_eq!(defaults["sourceId"], "custom/one");
+        assert_eq!(defaults["model"], "z-test");
+        assert!(defaults["reasoningEffort"].is_null());
+        assert!(
             state
                 .settings_store
-                .set_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION, previous)
-                .unwrap();
-            let first = fetch_models(
-                State(state.clone()),
-                Json(FetchModelsRequest {
-                    config: json!({
-                        "baseUrl": base_url,
-                        "apiKey": "test-key",
-                        "apiProtocol": "openai_chat"
-                    }),
-                    target: "orch".to_string(),
-                    workspace_id: None,
-                }),
-            )
-            .await
-            .expect("first catalog fetch should initialize the default")
-            .0;
-            assert_eq!(
-                first["orchestratorSessionDefaults"],
-                json!({ "model": "gpt-test", "reasoningEffort": null })
-            );
-
-            assert_eq!(
-                first["orchestratorSessionDefaults"]["model"],
-                first["models"][0]
-            );
-            assert_eq!(
-                crate::model_config::initial_session_orchestrator_config(&state, true, None)
-                    .unwrap(),
-                Some(first["orchestratorSessionDefaults"].clone()),
-                "首条请求必须继承已持久化的列表第一项"
-            );
-        }
+                .get_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION)
+                .is_null(),
+            "投影第一项不得写入持久化默认值"
+        );
+        assert_eq!(
+            crate::model_config::initial_session_orchestrator_config(&state, true, None).unwrap(),
+            Some(defaults),
+            "首条请求继承目录第一项"
+        );
 
         state
             .settings_store
             .set_section(
                 ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
-                json!({ "model": "model-last-used", "reasoningEffort": "high" }),
+                json!({"sourceId": "custom/two", "model": "other", "reasoningEffort": "high"}),
             )
             .unwrap();
-        let second = fetch_models(
-            State(state.clone()),
-            Json(FetchModelsRequest {
-                config: json!({
-                    "baseUrl": base_url,
-                    "apiKey": "test-key",
-                    "apiProtocol": "openai_chat"
-                }),
-                target: "orch".to_string(),
-                workspace_id: None,
-            }),
-        )
-        .await
-        .expect("later catalog fetch should preserve the latest selection")
-        .0;
-        assert_eq!(
-            second["orchestratorSessionDefaults"],
-            json!({ "model": "model-last-used", "reasoningEffort": "high" })
-        );
-        server.abort();
+        let selected = crate::model_config::orchestrator_session_defaults(&state);
+        assert_eq!(selected["sourceId"], "custom/two");
+        assert_eq!(selected["model"], "other");
     }
 
     #[tokio::test]
@@ -4543,27 +4556,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_orchestrator_config_writes_only_global_connection() {
+    async fn save_orchestrator_config_writes_only_the_source_catalog() {
         let state = test_state();
         let response = save_orchestrator_config(
             State(state.clone()),
             Json(json!({
-                "baseUrl": "https://api.example.com/v1",
-                "apiKey": "sk-global",
-                "apiProtocol": "openai_chat",
+                "expectedRevision": 0,
+                "sources": [main_source("one", &["m1"])],
                 "sessionId": "session-a",
                 "workspaceId": "workspace-a"
             })),
         )
         .await
-        .expect("orchestrator config should save")
+        .expect("source catalog should save")
         .0;
 
         let saved = state.settings_store.get_section("orchestrator");
-        assert_eq!(saved["baseUrl"], json!("https://api.example.com/v1"));
-        assert_eq!(saved["apiKey"], json!("sk-global"));
-        assert!(saved.get("model").is_none());
-        assert!(saved.get("reasoningEffort").is_none());
+        assert_eq!(saved["revision"], json!(1));
+        assert_eq!(saved["sources"][0]["id"], json!("one"));
+        assert_eq!(saved["sources"][0]["apiKey"], json!("sk-one"));
         assert!(saved.get("sessionId").is_none());
         assert!(saved.get("workspaceId").is_none());
         assert_eq!(response["config"], saved);
@@ -4572,23 +4583,30 @@ mod tests {
                 .settings_store
                 .get_session_section(&SessionId::new("session-a"), "orchestrator")
                 .is_null(),
-            "全局连接保存接口不得写会话模型覆盖"
+            "数据源保存接口不得写会话模型覆盖"
         );
 
-        for field in ["model", "reasoningEffort"] {
-            let mut config = json!({
-                "baseUrl": "https://api.example.com/v1",
-                "apiKey": "sk-global",
-                "apiProtocol": "openai_chat"
-            });
-            config[field] = json!("high");
-            let error = save_orchestrator_config(State(state.clone()), Json(config))
+        let stale = save_orchestrator_config(
+            State(state.clone()),
+            Json(json!({"expectedRevision": 0, "sources": []})),
+        )
+        .await
+        .expect_err("过期修订号必须被拒绝");
+        assert!(matches!(stale, ApiError::InvalidInput(_)));
+        assert_eq!(
+            state.settings_store.get_section("orchestrator")["revision"],
+            json!(1)
+        );
+
+        for invalid in [
+            json!({"expectedRevision": 1, "sources": [main_source("one", &["m"]), main_source("one", &["m"])]}),
+            json!({"expectedRevision": 1, "baseUrl": "https://old.example/v1", "apiKey": "k", "apiProtocol": "openai_chat"}),
+            json!({"sources": []}),
+        ] {
+            let error = save_orchestrator_config(State(state.clone()), Json(invalid))
                 .await
-                .expect_err("全局连接配置不得携带会话级模型字段");
-            match error {
-                ApiError::InvalidInput(message) => assert!(message.contains(field), "{message}"),
-                other => panic!("expected invalid input, got {other:?}"),
-            }
+                .expect_err("无效数据源配置必须被拒绝");
+            assert!(matches!(error, ApiError::InvalidInput(_)));
         }
     }
 
@@ -4762,17 +4780,18 @@ mod tests {
             &state,
             test_session_record(&session_id, "workspace-session-model", "会话模型覆盖"),
         );
-        state
-            .settings_store
-            .set_section(
-                "orchestrator",
-                json!({
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiKey": "sk-global",
-                    "apiProtocol": "openai_chat"
-                }),
-            )
-            .unwrap();
+        seed_main_sources(
+            &state,
+            vec![main_source(
+                "one",
+                &[
+                    "session-main-model",
+                    "personal-main-model",
+                    "model-before",
+                    "model-after",
+                ],
+            )],
+        );
 
         let response = save_orchestrator_session_config(
             State(state.clone()),
@@ -4781,8 +4800,7 @@ mod tests {
                 "scope": "workspace",
                 "workspaceId": "workspace-session-model",
                 "config": {
-                    "baseUrl": "https://malicious.example.com/v1",
-                    "apiKey": "sk-session-should-drop",
+                    "sourceId": "custom/one",
                     "model": "session-main-model",
                     "reasoningEffort": "high"
                 }
@@ -4794,11 +4812,11 @@ mod tests {
 
         assert_eq!(response["saved"], json!(true));
         let global = state.settings_store.get_section("orchestrator");
-        assert_eq!(global["baseUrl"], json!("https://api.example.com/v1"));
-        assert_eq!(global["apiKey"], json!("sk-global"));
+        assert_eq!(global["sources"][0]["apiKey"], json!("sk-one"));
         let saved = state
             .settings_store
             .get_session_section(&session_id, "orchestrator");
+        assert_eq!(saved["sourceId"], json!("custom/one"));
         assert_eq!(saved["model"], json!("session-main-model"));
         assert_eq!(saved["reasoningEffort"], json!("high"));
         assert!(
@@ -4807,7 +4825,7 @@ mod tests {
         );
         assert_eq!(
             response["effectiveOrchestratorConfig"]["baseUrl"],
-            json!("https://api.example.com/v1")
+            json!("https://one.example.test/v1")
         );
         assert_eq!(
             response["effectiveOrchestratorConfig"]["model"],
@@ -4837,6 +4855,7 @@ mod tests {
                 .settings_store
                 .get_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION),
             json!({
+                "sourceId": "custom/one",
                 "model": "session-main-model",
                 "reasoningEffort": "high"
             }),
@@ -4852,17 +4871,18 @@ mod tests {
             .session_store
             .create_session(session_id.clone(), "个人模型配置")
             .expect("personal session should be creatable");
-        state
-            .settings_store
-            .set_section(
-                "orchestrator",
-                json!({
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiKey": "sk-global",
-                    "apiProtocol": "openai_chat"
-                }),
-            )
-            .unwrap();
+        seed_main_sources(
+            &state,
+            vec![main_source(
+                "one",
+                &[
+                    "session-main-model",
+                    "personal-main-model",
+                    "model-before",
+                    "model-after",
+                ],
+            )],
+        );
 
         let response = save_orchestrator_session_config(
             State(state.clone()),
@@ -4870,6 +4890,7 @@ mod tests {
                 "sessionId": session_id.as_str(),
                 "scope": "personal",
                 "config": {
+                    "sourceId": "custom/one",
                     "model": "personal-main-model",
                     "reasoningEffort": "high"
                 }
@@ -4910,12 +4931,25 @@ mod tests {
                 "会话模型字段独立保存",
             ),
         );
+        seed_main_sources(
+            &state,
+            vec![main_source(
+                "one",
+                &[
+                    "session-main-model",
+                    "personal-main-model",
+                    "model-before",
+                    "model-after",
+                ],
+            )],
+        );
         state
             .settings_store
             .set_session_section(
                 &session_id,
                 "orchestrator",
                 json!({
+                    "sourceId": "custom/one",
                     "model": "model-before",
                     "reasoningEffort": "high"
                 }),
@@ -4957,6 +4991,7 @@ mod tests {
                 .settings_store
                 .get_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION),
             json!({
+                "sourceId": "custom/one",
                 "model": "model-after",
                 "reasoningEffort": "high"
             }),
@@ -4969,19 +5004,26 @@ mod tests {
     fn model_reselection_keeps_only_the_user_selected_model() {
         let state = test_state();
         let session_id = SessionId::new("session-model-reselection");
+        seed_main_sources(
+            &state,
+            vec![main_source(
+                "one",
+                &["verified-model", "candidate-a", "candidate-b"],
+            )],
+        );
         state
             .settings_store
             .set_session_section(
                 &session_id,
                 "orchestrator",
-                json!({ "model": "verified-model", "reasoningEffort": "medium" }),
+                json!({ "sourceId": "custom/one", "model": "verified-model", "reasoningEffort": "medium" }),
             )
             .unwrap();
 
         let first = save_orchestrator_session_override_for_session(
             &state,
             &session_id,
-            &json!({ "model": "candidate-a" }),
+            &json!({ "sourceId": "custom/one", "model": "candidate-a" }),
         )
         .unwrap()
         .unwrap();
@@ -4990,7 +5032,7 @@ mod tests {
         let second = save_orchestrator_session_override_for_session(
             &state,
             &session_id,
-            &json!({ "model": "candidate-b" }),
+            &json!({ "sourceId": "custom/one", "model": "candidate-b" }),
         )
         .unwrap()
         .unwrap();
@@ -5028,26 +5070,83 @@ mod tests {
         );
     }
 
-    #[test]
-    fn first_session_model_uses_model_default_reasoning() {
+    #[tokio::test]
+    async fn model_context_window_save_is_scoped_by_main_source() {
         let state = test_state();
-        let session_id = SessionId::new("session-model-default-effort");
         state
             .settings_store
             .set_section(
                 "orchestrator",
                 json!({
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiKey": "sk-global",
-                    "apiProtocol": "openai_chat"
+                    "sources": [
+                        {
+                            "id": "one",
+                            "name": "One",
+                            "baseUrl": "https://one.example/v1",
+                            "apiKey": "one-key",
+                            "apiProtocol": "openai_chat",
+                            "models": [{"id": "shared-model"}]
+                        },
+                        {
+                            "id": "two",
+                            "name": "Two",
+                            "baseUrl": "https://two.example/v1",
+                            "apiKey": "two-key",
+                            "apiProtocol": "openai_chat",
+                            "models": [{"id": "shared-model"}]
+                        }
+                    ]
                 }),
             )
             .unwrap();
 
+        for (source_id, context_window_tokens) in [("custom/one", 128_000), ("custom/two", 512_000)]
+        {
+            let response = save_model_context_window(
+                State(state.clone()),
+                Json(json!({
+                    "sourceId": source_id,
+                    "model": "shared-model",
+                    "contextWindowTokens": context_window_tokens
+                })),
+            )
+            .await
+            .expect("source model context window should save")
+            .0;
+            assert_eq!(response["sourceId"], json!(source_id));
+        }
+
+        let context_windows = state.settings_store.get_section("modelContextWindows");
+        assert_eq!(context_windows["custom/one::shared-model"], json!(128_000));
+        assert_eq!(context_windows["custom/two::shared-model"], json!(512_000));
+        assert_eq!(
+            magi_conversation_runtime::main_model_sources::effective_config(
+                &state.settings_store,
+                &json!({"sourceId":"custom/one", "model":"shared-model"})
+            )
+            .unwrap()["contextWindowTokens"],
+            json!(128_000)
+        );
+        assert_eq!(
+            magi_conversation_runtime::main_model_sources::effective_config(
+                &state.settings_store,
+                &json!({"sourceId":"custom/two", "model":"shared-model"})
+            )
+            .unwrap()["contextWindowTokens"],
+            json!(512_000)
+        );
+    }
+
+    #[test]
+    fn first_session_model_uses_model_default_reasoning() {
+        let state = test_state();
+        let session_id = SessionId::new("session-model-default-effort");
+        seed_main_sources(&state, vec![main_source("one", &["first-model"])]);
+
         let saved = save_orchestrator_session_override_for_session(
             &state,
             &session_id,
-            &json!({ "model": "first-model" }),
+            &json!({ "sourceId": "custom/one", "model": "first-model" }),
         )
         .expect("首次模型选择应保存")
         .expect("首次模型选择应生成会话覆盖");
@@ -5061,17 +5160,35 @@ mod tests {
     #[test]
     fn reasoning_defaults_and_model_switches_follow_the_target_capability() {
         let state = test_state();
-        state.settings_store.set_section("orchestrator", json!({
-            "baseUrl":"https://fixture.invalid/v1", "apiKey":"fixture", "apiProtocol":"openai_chat"
-        })).unwrap();
-        let defaults =
-            ensure_orchestrator_session_defaults_from_models(&state, &["gpt-5.1".into()]).unwrap();
+        state
+            .settings_store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "sources": [{
+                        "id": "fixture",
+                        "name": "Fixture",
+                        "baseUrl": "https://fixture.invalid/v1",
+                        "apiKey": "fixture",
+                        "apiProtocol": "openai_chat",
+                        "models": [
+                            { "id": "gpt-5.1" },
+                            { "id": "gpt-6.1-sol" },
+                            { "id": "gpt-4o" }
+                        ]
+                    }]
+                }),
+            )
+            .unwrap();
+        let defaults = orchestrator_session_defaults(&state);
+        assert_eq!(defaults["sourceId"], json!("custom/fixture"));
+        assert_eq!(defaults["model"], json!("gpt-5.1"));
         assert_eq!(defaults["reasoningEffort"], Value::Null);
         let session = SessionId::new("reasoning-switch");
         let first = save_orchestrator_session_override_for_session(
             &state,
             &session,
-            &json!({"model":"gpt-5.1"}),
+            &json!({"sourceId":"custom/fixture", "model":"gpt-5.1"}),
         )
         .unwrap()
         .unwrap();
@@ -5079,7 +5196,7 @@ mod tests {
         let switched = save_orchestrator_session_override_for_session(
             &state,
             &session,
-            &json!({"model":"gpt-6.1-sol"}),
+            &json!({"sourceId":"custom/fixture", "model":"gpt-6.1-sol"}),
         )
         .unwrap()
         .unwrap();
@@ -5095,7 +5212,7 @@ mod tests {
         let unsupported = save_orchestrator_session_override_for_session(
             &state,
             &session,
-            &json!({"model":"gpt-4o","reasoningEffort":"ultra"}),
+            &json!({"sourceId":"custom/fixture", "model":"gpt-4o","reasoningEffort":"ultra"}),
         )
         .unwrap()
         .unwrap();
@@ -5103,27 +5220,33 @@ mod tests {
     }
 
     #[test]
-    fn session_model_validation_rejects_missing_model() {
+    fn session_model_validation_rejects_missing_source_selection() {
         let state = test_state();
         let session_id = SessionId::new("session-model-missing");
+        let error = require_orchestrator_session_model(&state, &session_id)
+            .expect_err("未配置任何数据源时必须拒绝");
+        assert!(
+            matches!(&error, ApiError::InvalidInput(message) if message == "主对话尚未选择数据源，请选择数据源中的模型"),
+            "{error:?}"
+        );
+
+        // 配置了数据源但会话没有显式选择时，继承目录第一项。
+        seed_main_sources(&state, vec![main_source("one", &["m1"])]);
+        require_orchestrator_session_model(&state, &session_id).expect("目录第一项应作为默认选择");
         state
             .settings_store
-            .set_section(
+            .set_session_section(
+                &session_id,
                 "orchestrator",
-                json!({
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiProtocol": "openai_chat",
-                    "apiKey": "sk-global",
-                }),
+                json!({"sourceId": "custom/removed", "model": "m1"}),
             )
             .unwrap();
-
-        match require_orchestrator_session_model(&state, &session_id) {
-            Err(ApiError::InvalidInput(message)) => {
-                assert_eq!(message, "主线模型尚未选择，请刷新模型列表后重试");
-            }
-            other => panic!("缺少主线模型必须被拒绝，实际结果：{other:?}"),
-        }
+        let error = require_orchestrator_session_model(&state, &session_id)
+            .expect_err("会话引用的数据源被移除后不得静默回退");
+        assert!(
+            matches!(&error, ApiError::InvalidInput(message) if message.contains("已移除")),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
@@ -5139,23 +5262,25 @@ mod tests {
                 "会话有效主模型",
             ),
         );
-        state
-            .settings_store
-            .set_section(
-                "orchestrator",
-                json!({
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiKey": "sk-global",
-                    "apiProtocol": "openai_chat"
-                }),
-            )
-            .unwrap();
+        seed_main_sources(
+            &state,
+            vec![main_source(
+                "one",
+                &[
+                    "session-main-model",
+                    "personal-main-model",
+                    "model-before",
+                    "model-after",
+                ],
+            )],
+        );
         state
             .settings_store
             .set_session_section(
                 &session_id,
                 "orchestrator",
                 json!({
+                    "sourceId": "custom/one",
                     "model": "session-main-model",
                     "reasoningEffort": "xhigh"
                 }),
@@ -5719,6 +5844,69 @@ mod tests {
             .collect::<Vec<_>>();
         models.sort_unstable();
         assert_eq!(models, vec!["gpt-4.1", "gpt-5.6-luna"]);
+    }
+
+    #[tokio::test]
+    async fn execution_stats_keeps_same_named_models_separate_by_main_data_source() {
+        let state = test_state();
+        let _workspace_root = register_test_workspace(&state, "workspace-model-sources");
+        let mut first = model_usage_payload(
+            "usage-source-one",
+            "workspace-model-sources",
+            "session-model-sources",
+            "call-source-one",
+            101,
+            20,
+            6,
+        );
+        first["modelConfig"]["provider"] = json!("custom/source-one");
+        first["modelConfig"]["model"] = json!("shared-model");
+        let mut second = model_usage_payload(
+            "usage-source-two",
+            "workspace-model-sources",
+            "session-model-sources",
+            "call-source-two",
+            102,
+            30,
+            8,
+        );
+        second["modelConfig"]["provider"] = json!("custom/source-two");
+        second["modelConfig"]["model"] = json!("shared-model");
+
+        for (event_id, payload) in [("usage-source-one", first), ("usage-source-two", second)] {
+            state.event_bus.publish(
+                EventEnvelope::usage(EventId::new(event_id), "model.usage.recorded", payload)
+                    .with_context(EventContext {
+                        workspace_id: Some(WorkspaceId::new("workspace-model-sources")),
+                        session_id: Some(SessionId::new("session-model-sources")),
+                        ..EventContext::default()
+                    }),
+            );
+        }
+
+        let payload = execution_stats(State(state), Query(HashMap::new()))
+            .await
+            .expect("global stats should retain both main data sources")
+            .0;
+        let models = payload["models"]
+            .as_array()
+            .expect("models should be returned");
+        assert_eq!(models.len(), 2);
+        assert!(
+            models
+                .iter()
+                .all(|model| model["resolvedModel"] == "shared-model")
+        );
+        assert_eq!(
+            models
+                .iter()
+                .filter_map(|model| model["provider"].as_str())
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from(["custom/source-one", "custom/source-two"])
+        );
+        assert_ne!(models[0]["modelIdentityKey"], models[1]["modelIdentityKey"]);
+        assert_eq!(payload["totals"]["cache"]["observedCallCount"], json!(2));
+        assert_eq!(payload["totals"]["cache"]["readTokens"], json!(8));
     }
 
     #[tokio::test]

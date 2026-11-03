@@ -1159,7 +1159,6 @@ export interface FetchModelsResponseDto {
   success: boolean;
   target: string;
   models: string[];
-  orchestratorSessionDefaults?: Record<string, unknown> | null;
   requestedAt: number;
 }
 
@@ -1505,6 +1504,7 @@ export type TaskStatus =
   | 'killed';
 
 export interface AgentModelSelectionDto {
+  source_id?: string | null;
   engine_id: string | null;
   binding_revision: number;
   connection_key: string;

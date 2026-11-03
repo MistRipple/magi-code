@@ -66,6 +66,7 @@ pub(super) struct ExtensionRuntime {
     board: Arc<std::sync::RwLock<HashMap<String, PluginRuntimeStatus>>>,
     events: Arc<std::sync::OnceLock<Arc<InMemoryEventBus>>>,
     native: Arc<std::sync::OnceLock<super::extension_services::NativeService>>,
+    settings: Arc<std::sync::OnceLock<Arc<magi_settings_store::SettingsStore>>>,
 }
 
 /// 把监管状态映射为界面可见的运行状态。`blocking` 是在宿主不可用期间正被 fail-closed 的
@@ -133,7 +134,13 @@ impl ExtensionRuntime {
             board: Arc::default(),
             events: Arc::default(),
             native: Arc::default(),
+            settings: Arc::default(),
         }
+    }
+
+    /// 绑定主对话模型目录所在的设置事实源（插件贡献的数据源写入其运行期 section）。
+    pub(super) fn bind_settings(&self, settings: &Arc<magi_settings_store::SettingsStore>) {
+        let _ = self.settings.set(Arc::clone(settings));
     }
 
     pub(super) fn bind_native(
@@ -428,6 +435,7 @@ impl ExtensionRuntime {
             digest: digest.clone(),
             native: Arc::clone(&self.native),
             blobs: Arc::default(),
+            settings: Arc::clone(&self.settings),
         }));
         let supervisor = supervise(
             self.group.clone(),
@@ -965,6 +973,76 @@ export default async function activate(api) {
             .await
             .unwrap();
         assert_eq!(freed.verdict, Verdict::Proceed(call("rm -rf x")));
+    }
+
+    fn model_source_package() -> PluginPackage {
+        let manifest: PluginManifest = serde_json::from_value(json!({
+            "sdkVersion": 2, "id": "acme.guard", "version": "1.0.0", "name": "Proxy", "description": "",
+            "extension": {"hooks": []},
+            "permissions": [
+                {"kind": "extension", "targets": ["full-trust"]},
+                {"kind": "modelSources", "targets": ["proxy"]}
+            ],
+            "dataSchemaVersion": 1,
+            "settingsSchema": {"type": "object", "additionalProperties": false},
+            "contributions": {"modelSources": [{"id": "proxy", "title": "Proxy", "description": ""}]}
+        }))
+        .unwrap();
+        let entry = r#"
+export default async function activate(api) {
+  await api.modelSource.set('proxy', {
+    baseUrl: 'http://127.0.0.1:9/v1', apiKey: 'k', apiProtocol: 'openai_chat', models: [{ id: 'm1' }],
+  });
+}
+"#;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes) in [
+            ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
+            ("extension/index.mjs", entry.as_bytes().to_vec()),
+        ] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn plugin_model_sources_follow_the_supervised_instance_lifecycle() {
+        let fixture = fixture(Some(test_node()));
+        let settings = Arc::new(magi_settings_store::SettingsStore::new());
+        fixture.runtime.bind_settings(&settings);
+        activate(&fixture, &model_source_package());
+        fixture.runtime.reconcile().await;
+        fixture
+            .runtime
+            .running
+            .lock()
+            .await
+            .get("acme.guard")
+            .and_then(|entry| entry.supervisor.as_ref())
+            .expect("已启动监管")
+            .wait_for(|state| matches!(state, SupervisorState::Running { .. }))
+            .await;
+        let identities = |settings: &magi_settings_store::SettingsStore| {
+            magi_conversation_runtime::main_model_sources::sources(settings)
+                .unwrap()
+                .into_iter()
+                .map(|source| source.identity)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(identities(&settings), ["plugin/acme.guard/proxy"]);
+
+        // 用户停用插件：宿主回收后，数据源随之撤销。
+        fixture
+            .manager
+            .lock()
+            .unwrap()
+            .deactivate("acme.guard")
+            .unwrap();
+        fixture.runtime.reconcile().await;
+        assert!(identities(&settings).is_empty());
     }
 
     #[tokio::test]

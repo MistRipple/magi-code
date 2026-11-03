@@ -53,7 +53,7 @@
 
 <style>
   .settings-detail-page { width: 100%; min-width: 0; box-sizing: border-box; color: var(--foreground); }
-  .detail-back-row { flex-shrink: 0; padding: 16px 0; }
+  .detail-back-row { flex-shrink: 0; padding: 0 0 16px; }
   .detail-header { flex-shrink: 0; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 20px; }
   .detail-header h3 { margin: 0; font-size: var(--text-lg); }
   .detail-body { min-width: 0; }

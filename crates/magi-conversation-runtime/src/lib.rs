@@ -32,6 +32,7 @@ pub use history_projection::{
 };
 pub mod human_wait;
 mod mailbox;
+pub mod main_model_sources;
 pub mod model_config;
 pub mod model_context_window;
 pub mod model_error;

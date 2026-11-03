@@ -240,18 +240,18 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
     </header>
 
       <!-- Tab 内容区域 -->
-      <div class="settings-tab-content scroll-content" onscroll={() => { store.closeAllModelLists(); }}>
+      <div class="settings-tab-content" onscroll={() => { store.closeAllModelLists(); }}>
       {#if store.activeTab === 'appearance'}
         <SettingsAppearanceTab />
       {:else if store.activeTab === 'project'}
         <SettingsProjectTab />
       {:else if store.activeTab === 'stats'}
         <!-- 统计 Tab -->
-        <SettingsStatsTab totalInputTokens={store.totalInputTokens} totalOutputTokens={store.totalOutputTokens} totalTokens={store.totalTokens} isRefreshing={store.isRefreshing} refreshConnections={store.refreshConnections} showResetConfirmDialog={store.showResetConfirmDialog} modelStatuses={store.modelStatuses} bindingUsageStats={store.executionStats} modelUsageStats={store.executionModelStats} statsDisplayKeys={store.statsDisplayKeys} getWorkerStats={store.getWorkerStats} getStatsRoleModelStatus={store.getStatsRoleModelStatus} getStatusClass={store.getStatusClass} getWorkerDisplayName={store.getWorkerDisplayName} statusTexts={store.statusTexts}
+        <SettingsStatsTab totalInputTokens={store.totalInputTokens} totalOutputTokens={store.totalOutputTokens} totalTokens={store.totalTokens} isRefreshing={store.isRefreshing} refreshConnections={store.refreshConnections} showResetConfirmDialog={store.showResetConfirmDialog} modelStatuses={store.modelStatuses} bindingUsageStats={store.executionStats} modelUsageStats={store.executionModelStats} mainModelSources={store.orchConfig.sources ?? []} statsDisplayKeys={store.statsDisplayKeys} getWorkerStats={store.getWorkerStats} getStatsRoleModelStatus={store.getStatsRoleModelStatus} getStatusClass={store.getStatusClass} getWorkerDisplayName={store.getWorkerDisplayName} statusTexts={store.statusTexts}
         />
       {:else if store.activeTab === 'model'}
         <!-- 模型配置 Tab -->
-        <SettingsModelTab bind:modelConfigTab={store.modelConfigTab} bind:orchConfig={store.orchConfig} bind:compConfig={store.compConfig} bind:visionConfig={store.visionConfig} visionBuiltinTextModelRules={store.visionBuiltinTextModelRules} bind:imageConfig={store.imageConfig} bind:workerConfigs={store.workerConfigs} modelConfigBaselines={store.modelConfigBaselines} workerModelTabs={store.workerModelTabs} modelStatuses={store.modelStatuses} saveStatus={store.saveStatus} testStatus={store.testStatus} fetchingModels={store.fetchingModels} bind:keyVisible={store.keyVisible} modelListOpen={store.modelListOpen} modelListPosition={store.modelListPosition} modelLists={store.modelLists} modelDisplayNames={store.modelDisplayNames} roleTemplates={store.roleTemplates} registryAgents={store.registryAgents} getBaseUrlPlaceholder={store.getBaseUrlPlaceholder} openModelList={store.openModelList} closeModelList={store.closeModelList} fetchModelList={store.fetchModelList} selectModel={store.selectModel} saveModelConfig={store.saveModelConfig} testModelConnection={store.testModelConnection} getStatusClass={store.getStatusClass} getStatusText={store.getStatusText} getWorkerDisplayName={store.getWorkerDisplayName}
+        <SettingsModelTab bind:modelConfigTab={store.modelConfigTab} bind:orchConfig={store.orchConfig} bind:compConfig={store.compConfig} bind:visionConfig={store.visionConfig} visionBuiltinTextModelRules={store.visionBuiltinTextModelRules} bind:imageConfig={store.imageConfig} bind:workerConfigs={store.workerConfigs} modelConfigBaselines={store.modelConfigBaselines} workerModelTabs={store.workerModelTabs} modelStatuses={store.modelStatuses} saveStatus={store.saveStatus} testStatus={store.testStatus} fetchingModels={store.fetchingModels} bind:keyVisible={store.keyVisible} modelListOpen={store.modelListOpen} modelListPosition={store.modelListPosition} modelLists={store.modelLists} modelDisplayNames={store.modelDisplayNames} roleTemplates={store.roleTemplates} registryAgents={store.registryAgents} getBaseUrlPlaceholder={store.getBaseUrlPlaceholder} onMainModelSourcesSaved={store.acceptMainModelSources} openModelList={store.openModelList} closeModelList={store.closeModelList} fetchModelList={store.fetchModelList} selectModel={store.selectModel} saveModelConfig={store.saveModelConfig} testModelConnection={store.testModelConnection} getStatusClass={store.getStatusClass} getStatusText={store.getStatusText} getWorkerDisplayName={store.getWorkerDisplayName}
           {getAgentColor} deleteEngine={store.deleteEngine} openAddEngineDialog={store.openAddEngineDialog} renameEngineDisplay={store.renameEngineDisplay}
         />
       {:else if store.activeTab === 'agents'}
@@ -709,11 +709,13 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
         </div></div></div>
       {:else}
         {#each pluginSettingsTabs.filter((item) => item.tabId === store.activeTab) as tab (tab.tabId)}
-          {#if tab.kind === 'view'}
-            <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} />
-          {:else}
-            <PluginSettingsForm pluginId={tab.id} manifest={tab.manifest} />
-          {/if}
+          <div class="settings-frame">
+            {#if tab.kind === 'view'}
+              <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} />
+            {:else}
+              <PluginSettingsForm pluginId={tab.id} manifest={tab.manifest} />
+            {/if}
+          </div>
         {/each}
       {/if}
     </div>
@@ -1398,23 +1400,6 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
       line-height: 1.35;
     }
 
-    .scroll-content {
-      padding: 20px max(28px, calc((100% - 960px) / 2));
-      overflow: hidden;
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      gap: 0; /* 间隔由各分类组件内部控制 */
-      min-width: 0;
-      min-height: 0;
-    }
-
-    /* 共享页面框架自己管理留白，外壳不再叠加第二层 padding。 */
-    .scroll-content:has(> :global(.apple-manager > .apple-scroller-proxy)),
-    .scroll-content:has(> :global(.settings-frame)) {
-      padding: 0;
-    }
-
   @keyframes settingsPageIn {
     from { opacity: 0; }
     to { opacity: 1; }
@@ -1488,10 +1473,6 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
       padding: 14px 16px;
     }
 
-    .scroll-content {
-      padding: 16px;
-      padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px));
-    }
   }
 
   @media (max-width: 480px) {
@@ -1506,6 +1487,7 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
       gap: 2px;
     }
     .header-description {
+      min-block-size: 2lh;
       display: -webkit-box;
       overflow: hidden;
       -webkit-box-orient: vertical;

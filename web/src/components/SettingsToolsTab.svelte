@@ -725,7 +725,6 @@
 
 <div class="apple-manager tools-manager">
   <div class="apple-scroller-proxy">
-      <div class="tools-stack">
         <!-- 内置工具 -->
         <div class="settings-section tools-section builtin-section">
           <div class="settings-section-header">
@@ -1197,7 +1196,6 @@
             {/if}
           </div>
         </div>
-      </div>
     </div>
 </div>
 

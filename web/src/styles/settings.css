@@ -9,6 +9,7 @@
     container-type: inline-size;
     container-name: settings-content;
     flex: 1;
+    min-width: 0;
     min-height: 0;
     overflow: hidden;
     padding: 0;
@@ -69,12 +70,23 @@
     flex: 1;
     display: flex;
     flex-direction: column;
+    min-width: 0;
+    min-height: 0;
     overflow-y: auto;
     box-sizing: border-box;
-    padding: 4px max(32px, calc((100% - 880px) / 2)) 56px;
+    padding: 20px max(32px, calc((100% - 880px) / 2)) 56px;
     scrollbar-width: none;
   }
-  .apple-scroller-proxy::-webkit-scrollbar { width: 0; }
+  .apple-scroller-proxy::-webkit-scrollbar,
+  .settings-frame::-webkit-scrollbar { width: 0; }
+
+  /* 页首留白只由框架提供；首个分区不再叠加自己的分区间距。 */
+  :is(.apple-scroller-proxy, .settings-frame) > .settings-section:first-child {
+    padding-block-start: 0;
+  }
+  :is(.apple-scroller-proxy, .settings-frame) > :first-child {
+    margin-block-start: 0;
+  }
   
   /* Quiet shared surfaces; colour layers come from the selected theme. */
   .apple-glass-panel,
@@ -178,6 +190,7 @@
     flex-shrink: 0;
   }
   .settings-section-title {
+    margin: 0;
     font-size: 14px;
     font-weight: var(--font-semibold);
     line-height: 1.4;
@@ -316,6 +329,56 @@
 
 
   /* Model Tab 独有公共样式（不在 scoped 中的）*/
+
+  /* 主模型数据源与专用模型共用表单框架，不再叠加页面留白或嵌套表单卡片。 */
+  .llm-config-form {
+    container: model-config / inline-size;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+  .llm-config-field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .model-config-grid { align-items: start; }
+  .llm-config-lead {
+    margin: var(--space-2) 0 0;
+    font-size: var(--text-xs);
+    line-height: 1.5;
+    color: var(--foreground-muted);
+  }
+  .model-form-actions {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    padding: var(--space-3) 0;
+    border-top: var(--magi-hairline) solid var(--border-subtle);
+  }
+  .model-form-action-desc {
+    min-width: 0;
+    flex: 1;
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    overflow-wrap: anywhere;
+  }
+  @container model-config (min-width: 640px) {
+    .model-config-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      column-gap: var(--space-4);
+    }
+  }
+  @container model-config (max-width: 480px) {
+    .model-form-actions { align-items: stretch; flex-direction: column; }
+    .model-form-actions .settings-section-actions { width: 100%; }
+    .model-form-actions .btn { flex: 1 1 auto; justify-content: center; }
+    .model-form-action-desc:empty { display: none; }
+  }
 
   .llm-config-field-row { display: grid; grid-template-columns: 1fr auto; gap: var(--space-3); }
   .llm-config-field-row.has-thinking { grid-template-columns: 1fr auto 72px; }

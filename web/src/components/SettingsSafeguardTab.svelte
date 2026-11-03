@@ -66,6 +66,23 @@
 
 <div class="apple-manager">
 <div class="apple-scroller-proxy">
+  <div class="settings-section">
+    <div class="settings-section-header">
+      <div class="settings-section-title">{i18n.t('settings.safeguard.title')}</div>
+      {#if view === 'rules' && safeguardStatusText}
+        <div class="rules-save-status" class:error={safeguardSaveStatus === 'error'}>
+          {#if safeguardSaveStatus === 'saving'}
+            <Icon name="refresh" size={13} />
+          {:else if safeguardSaveStatus === 'saved'}
+            <Icon name="check" size={13} />
+          {:else}
+            <Icon name="close" size={13} />
+          {/if}
+          <span>{safeguardStatusText}</span>
+        </div>
+      {/if}
+    </div>
+    <div class="settings-section-desc">{i18n.t('settings.safeguard.desc')}</div>
   <div class="settings-subtabs" role="tablist" aria-label={i18n.t('settings.zone.safeguard')}>
     <button type="button" role="tab" class="settings-subtab" class:active={view === 'rules'} aria-selected={view === 'rules'} data-testid="safeguard-tab-rules" onclick={() => { view = 'rules'; }}>
       {i18n.t('settings.safeguard.tab.rules')}
@@ -77,23 +94,6 @@
   </div>
 
   {#if view === 'rules'}
-    <div class="settings-section">
-      <div class="settings-section-header">
-        <div class="settings-section-title">{i18n.t('settings.safeguard.title')}</div>
-        {#if safeguardStatusText}
-          <div class="rules-save-status" class:error={safeguardSaveStatus === 'error'}>
-            {#if safeguardSaveStatus === 'saving'}
-              <Icon name="refresh" size={13} />
-            {:else if safeguardSaveStatus === 'saved'}
-              <Icon name="check" size={13} />
-            {:else}
-              <Icon name="close" size={13} />
-            {/if}
-            <span>{safeguardStatusText}</span>
-          </div>
-        {/if}
-      </div>
-      <div class="settings-section-desc">{i18n.t('settings.safeguard.desc')}</div>
       <div class="safeguard-policy-note">{i18n.t('settings.safeguard.policyNote')}</div>
 
       <div class="safeguard-categories">
@@ -152,12 +152,10 @@
           {/if}
         {/each}
       </div>
-    </div>
   {:else}
-    <div class="settings-section">
       <SafeguardAuditPanel persistenceHealthy={safeguardAuditPersistenceHealthy} onCountChange={setSafeguardAuditCount} />
-    </div>
   {/if}
+  </div>
 </div>
 </div>
 

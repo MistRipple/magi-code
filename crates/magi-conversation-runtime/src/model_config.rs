@@ -154,6 +154,7 @@ impl ModelApiProtocol {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormalizedModelConfig {
+    source_id: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
     model: Option<String>,
@@ -192,6 +193,7 @@ impl NormalizedModelConfig {
             None => ModelApiProtocol::OpenAiResponses,
         };
         Ok(Self {
+            source_id: string_field(value, "sourceId"),
             reasoning_capabilities: BTreeMap::new(),
             base_url: string_field(value, "baseUrl"),
             api_key: string_field(value, "apiKey"),
@@ -229,7 +231,7 @@ impl NormalizedModelConfig {
     pub fn reasoning_catalog_key(&self) -> String {
         let input = serde_json::json!([
             self.base_url.as_deref().unwrap_or("").trim_end_matches('/'),
-            self.provider(),
+            self.api_protocol.provider(),
             format!("{:?}", self.api_protocol),
             self.api_key
         ]);
@@ -259,11 +261,17 @@ impl NormalizedModelConfig {
     }
 
     /// 从显式协议派生的 provider 标签，用于 usage authority 分组与展示。
-    pub fn provider(&self) -> &'static str {
-        self.api_protocol.provider()
+    pub fn provider(&self) -> &str {
+        self.source_id
+            .as_deref()
+            .unwrap_or(self.api_protocol.provider())
     }
 
-    pub fn provider_key(&self) -> &'static str {
+    pub fn source_id(&self) -> Option<&str> {
+        self.source_id.as_deref()
+    }
+
+    pub fn provider_key(&self) -> &str {
         self.provider()
     }
 
@@ -277,6 +285,10 @@ impl NormalizedModelConfig {
         self.api_key
             .as_deref()
             .ok_or_else(|| "模型配置缺少 apiKey".to_string())
+    }
+
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
     }
 
     pub fn require_model(&self) -> Result<&str, String> {
@@ -323,6 +335,7 @@ impl NormalizedModelConfig {
             ));
         }
         Ok(magi_core::AgentModelSelection {
+            source_id: self.source_id.clone(),
             engine_id,
             binding_revision,
             connection_key: self.reasoning_catalog_key(),
@@ -681,11 +694,25 @@ pub(crate) fn frozen_agent_model_config(
     store: &magi_settings_store::SettingsStore,
     selection: &magi_core::AgentModelSelection,
 ) -> Result<NormalizedModelConfig, String> {
+    if selection.engine_id.is_none()
+        && selection
+            .source_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("plugin/"))
+    {
+        return Err("插件模型数据源只能用于主对话；子代理不能继承插件模型".into());
+    }
     let raw = match selection.engine_id.as_deref() {
         Some(id) => {
             engine_llm_config(store, id).ok_or_else(|| "子代理原模型引擎已移除".to_string())?
         }
-        None => store.get_section("orchestrator"),
+        None => crate::main_model_sources::effective_config(
+            store,
+            &serde_json::json!({
+                "sourceId": selection.source_id, "model": selection.model,
+                "reasoningEffort": selection.effective_effort,
+            }),
+        )?,
     };
     NormalizedModelConfig::from_settings_value(&raw)?.apply_agent_selection(selection)
 }
@@ -710,57 +737,68 @@ pub(crate) fn agent_target_model_config(
             selection.binding_revision,
         ));
     }
-    Ok((
-        resolve_orchestrator_model_config(store, Some(session))?,
-        None,
-        0,
-    ))
+    let inherited = resolve_orchestrator_model_config(store, Some(session))?;
+    if inherited
+        .source_id()
+        .is_some_and(|id| id.starts_with("plugin/"))
+    {
+        return Err("插件模型数据源只能用于主对话；请为子代理配置独立模型引擎".into());
+    }
+    Ok((inherited, None, 0))
+}
+
+/// 主对话当前的数据源选择：用户默认选择叠加会话覆盖，再补上目录第一项作为缺省。
+pub fn orchestrator_selection(
+    settings_store: &magi_settings_store::SettingsStore,
+    session_id: Option<&SessionId>,
+) -> serde_json::Value {
+    let mut selection =
+        settings_store.get_section(magi_settings_store::ORCHESTRATOR_SESSION_DEFAULTS_SECTION);
+    if let Some(session_id) = session_id {
+        merge_orchestrator_session_override(
+            &mut selection,
+            &settings_store.get_session_section(session_id, "orchestrator"),
+        );
+    }
+    crate::main_model_sources::with_first_model_default(settings_store, &selection)
 }
 
 pub fn resolve_orchestrator_model_config(
     settings_store: &magi_settings_store::SettingsStore,
     session_id: Option<&SessionId>,
 ) -> Result<NormalizedModelConfig, String> {
-    let defaults =
-        settings_store.get_section(magi_settings_store::ORCHESTRATOR_SESSION_DEFAULTS_SECTION);
-    let session_override = session_id
-        .map(|session_id| settings_store.get_session_section(session_id, "orchestrator"))
-        .unwrap_or(serde_json::Value::Null);
-    if let Some(engine_id) = orchestrator_engine_id(settings_store, session_id) {
-        let entry = engine_entry(settings_store, &engine_id)
-            .ok_or_else(|| format!("会话绑定的模型引擎不存在：{engine_id}"))?;
-        let mut config = entry
-            .get("llm")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        if config.as_object().is_none_or(|object| object.is_empty()) {
-            return Err(format!("模型引擎 {engine_id} 缺少 llm 配置"));
-        }
-        merge_orchestrator_session_override(&mut config, &defaults);
-        merge_orchestrator_session_override(&mut config, &session_override);
-        ensure_orchestrator_reasoning_effort(&mut config);
-        return NormalizedModelConfig::from_settings_with_catalog(settings_store, &config)
-            .map_err(|error| format!("引擎 {engine_id} 的模型配置无效：{error}"));
-    }
-    let mut config = settings_store.get_section("orchestrator");
-    merge_orchestrator_session_override(&mut config, &defaults);
-    merge_orchestrator_session_override(&mut config, &session_override);
-    ensure_orchestrator_reasoning_effort(&mut config);
+    let selection = orchestrator_selection(settings_store, session_id);
+    let config = crate::main_model_sources::effective_config(settings_store, &selection)?;
     NormalizedModelConfig::from_settings_with_catalog(settings_store, &config)
-        .map_err(|error| format!("orchestrator 模型配置无效：{error}"))
 }
 
-/// 会话级主模型覆盖的引擎绑定（A22），只在会话级 section 生效。
-///
-/// 引擎绑定不是跨会话默认值：`ORCHESTRATOR_SESSION_DEFAULTS_SECTION` 不允许携带
-/// `engineId`（settings-store 的归一化会剥离它），这里也只读会话级 override。
-pub fn orchestrator_engine_id(
+/// 扩展的 `credential.ref` / `model.invoke` 只能使用角色绑定的独立引擎，或继承用户配置的主对话数据源；
+/// 插件贡献的主对话数据源（`plugin/`）只服务于主对话，不对扩展调用开放。
+pub fn ensure_extension_model_source(
     settings_store: &magi_settings_store::SettingsStore,
-    session_id: Option<&SessionId>,
-) -> Option<String> {
-    let session_id = session_id?;
-    let section = settings_store.get_session_section(session_id, "orchestrator");
-    string_field(&section, "engineId")
+    role_id: Option<&str>,
+    session_id: &SessionId,
+) -> Result<(), String> {
+    if let Some(role_id) = role_id
+        && configured_role_engine_model_config(settings_store, role_id)?.is_some()
+    {
+        return Ok(());
+    }
+    let selected_source = orchestrator_selection(settings_store, Some(session_id))
+        .get("sourceId")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty());
+    if !crate::main_model_sources::is_configured(settings_store) && !selected_source {
+        return Ok(());
+    }
+    let config = resolve_orchestrator_model_config(settings_store, Some(session_id))?;
+    if config
+        .source_id()
+        .is_some_and(|id| id.starts_with("plugin/"))
+    {
+        return Err("插件模型数据源只能用于主对话，扩展调用不能使用".into());
+    }
+    Ok(())
 }
 
 /// 角色绑定的引擎 id（角色不存在或未绑定引擎时返回 `None`）。
@@ -823,15 +861,15 @@ pub fn merge_orchestrator_session_override(
             serde_json::Value::String(model.trim().to_string()),
         );
     }
-    if let Some(engine_id) = override_map.get("engineId")
+    if let Some(engine_id) = override_map.get("sourceId")
         && let Some(engine_id) = engine_id.as_str()
     {
         let engine_id = engine_id.trim();
         if engine_id.is_empty() {
-            base_map.remove("engineId");
+            base_map.remove("sourceId");
         } else {
             base_map.insert(
-                "engineId".to_string(),
+                "sourceId".to_string(),
                 serde_json::Value::String(engine_id.to_string()),
             );
         }
@@ -944,29 +982,29 @@ mod tests {
     }
 
     #[test]
-    fn session_engine_binding_to_a_missing_engine_fails_instead_of_falling_back() {
+    fn session_selection_of_a_removed_source_fails_instead_of_falling_back() {
         let store = magi_settings_store::SettingsStore::new();
-        let session_id = SessionId::new("session-missing-engine");
+        let session_id = SessionId::new("session-missing-source");
         store
             .set_section(
                 "orchestrator",
-                json!({
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiKey": "sk-orch",
-                    "apiProtocol": "openai_chat",
-                }),
+                crate::main_model_sources::test_sources(
+                    "https://api.example.com/v1",
+                    "sk-orch",
+                    &["m1"],
+                ),
             )
             .expect("写入 orchestrator");
         store
             .set_session_section(
                 &session_id,
                 "orchestrator",
-                json!({ "engineId": "engine-does-not-exist" }),
+                json!({ "sourceId": "custom/removed", "model": "m1" }),
             )
             .expect("写入会话级覆盖");
         let error = resolve_orchestrator_model_config(&store, Some(&session_id))
-            .expect_err("绑定不存在的引擎必须失败");
-        assert!(error.contains("不存在"), "{error}");
+            .expect_err("引用已移除的数据源必须失败");
+        assert!(error.contains("已移除"), "{error}");
     }
 
     #[test]

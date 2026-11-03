@@ -8,6 +8,7 @@
     AgentExecutionModelStatsItem,
     AgentExecutionStatsItem,
   } from '../web/agent-api';
+  import type { MainModelSource } from '../shared/main-model-sources';
 
   let {
     totalInputTokens,
@@ -19,6 +20,7 @@
     modelStatuses,
     bindingUsageStats,
     modelUsageStats,
+    mainModelSources,
     getWorkerStats,
     getStatsRoleModelStatus,
     getStatusClass,
@@ -35,6 +37,7 @@
     modelStatuses: ModelStatusMap;
     bindingUsageStats: AgentExecutionStatsItem[];
     modelUsageStats: AgentExecutionModelStatsItem[];
+    mainModelSources: MainModelSource[];
     getWorkerStats: (worker: string) => any;
     getStatsRoleModelStatus: (roleKey: string) => ModelStatus | undefined;
     getStatusClass: (status: string) => string;
@@ -69,6 +72,14 @@
 
   function formatList(items: string[]): string {
     return new Intl.ListFormat(i18n.locale, { style: 'short', type: 'conjunction' }).format(items);
+  }
+
+  function modelSourceName(provider: string): string | null {
+    if (provider.startsWith('custom/')) {
+      const sourceId = provider.slice('custom/'.length);
+      return mainModelSources.find((source) => source.id === sourceId)?.name ?? sourceId;
+    }
+    return provider.startsWith('plugin/') ? provider.slice('plugin/'.length) : null;
   }
 
   function workerModelLabel(worker: string): string {
@@ -198,6 +209,7 @@
 
   interface ModelBucket {
     resolvedModel: string;
+    provider: string;
     identityKeys: string[];
     totalIn: number;
     totalOut: number;
@@ -210,11 +222,16 @@
     for (const model of [...modelUsageStats].sort((left, right) => (
       right.totals.totalTokens - left.totals.totalTokens
       || left.resolvedModel.localeCompare(right.resolvedModel)
+      || left.provider.localeCompare(right.provider)
     ))) {
       const resolvedModel = model.resolvedModel.trim() || model.declaredModelSpec.trim() || i18n.t('settings.stats.unknownModel');
-      const key = resolvedModel.toLocaleLowerCase();
+      const provider = model.provider.startsWith('custom/') || model.provider.startsWith('plugin/')
+        ? model.provider
+        : '';
+      const key = `${provider}\u001f${resolvedModel.toLocaleLowerCase()}`;
       const bucket: ModelBucket = buckets.get(key) || {
         resolvedModel,
+        provider,
         identityKeys: [],
         totalIn: 0,
         totalOut: 0,
@@ -248,14 +265,16 @@
         const sourceLabels: string[] = Array.from(new Set<string>(
           sourceBindings.map((binding: AgentExecutionStatsItem) => workerLabel(bindingRoleKey(binding))),
         ));
+        const usageLabel = sourceLabels.length > 0
+          ? i18n.t('settings.stats.modelUsedBy', { roles: formatList(sourceLabels) })
+          : i18n.t('settings.stats.recordedUsage');
+        const sourceName = modelSourceName(bucket.provider);
         return {
           key,
           rowKind: 'engine',
           resolvedModel: bucket.resolvedModel,
           label: bucket.resolvedModel,
-          subLabel: sourceLabels.length > 0
-            ? i18n.t('settings.stats.modelUsedBy', { roles: formatList(sourceLabels) })
-            : i18n.t('settings.stats.recordedUsage'),
+          subLabel: sourceName ? `${sourceName} · ${usageLabel}` : usageLabel,
           avatarSeed: key,
           totalIn: bucket.totalIn,
           totalOut: bucket.totalOut,
@@ -491,7 +510,7 @@
 </script>
 
 <div class="stats-tab-inner scroll-proxy">
-  <div class="stats-scroll-panel">
+  <div class="stats-scroll-panel settings-frame">
     <!-- Insight Strip · 3 个洞察单元 + 全局动作 -->
     <div class="insight-strip">
       <div class="insight-cell">
@@ -791,17 +810,8 @@
 
   .scroll-proxy { min-height: 0; }
   .stats-scroll-panel {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    padding: 4px max(32px, calc((100% - 880px) / 2)) 56px;
-    box-sizing: border-box;
-    display: flex;
-    flex-direction: column;
     gap: 12px;
-    scrollbar-width: none;
   }
-  .stats-scroll-panel::-webkit-scrollbar { width: 0; }
 
   /* ---------- Overview Actions ---------- */
   .ghost-action {
@@ -835,6 +845,7 @@
 
   /* ---------- Insight Strip ---------- */
   .insight-strip {
+    flex-shrink: 0;
     display: grid;
     grid-template-columns: minmax(220px, 1.35fr) minmax(140px, 0.8fr) minmax(250px, 1.15fr);
     gap: 0;
@@ -1348,7 +1359,6 @@
   }
 
   @container stats-tab (max-width: 520px) {
-    .stats-scroll-panel { padding-inline: 16px; }
     .col-head { display: none; }
     .stats-row {
       grid-template-columns: 22px repeat(3, minmax(0, 1fr));

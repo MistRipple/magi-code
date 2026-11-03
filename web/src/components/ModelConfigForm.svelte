@@ -1,5 +1,6 @@
 <script lang="ts">
   import SelectField from './SelectField.svelte';
+  import ModelConnectionFields from './ModelConnectionFields.svelte';
   import { resolveAgentModelReasoning } from '../web/agent-api';
   import type { ModelReasoningCapability } from '../shared/rust-backend-types';
   import { i18n } from '../stores/i18n.svelte';
@@ -84,7 +85,6 @@
     }).catch(() => { if (!cancelled) reasoningStatus = 'failed'; });
     return () => { cancelled = true; };
   });
-  const keyVisibleKey = $derived(formType);
   // 同一时刻只渲染一个表单，但 statusKey 仍按引擎区分，避免切换引擎时 label 指向旧控件。
   const fieldId = (name: string) => `model-config-${statusKey}-${name}`;
 
@@ -314,16 +314,6 @@
     return i18n.t('settings.model.fetchModelList');
   }
 
-  function protocolEndpointPath(protocol: string): string {
-    if (protocol === 'openai_responses') return '/v1/responses';
-    if (protocol === 'anthropic_messages') return '/v1/messages';
-    return '/v1/chat/completions';
-  }
-
-  function protocolEndpointLabel(): string {
-    return protocolEndpointPath(config.apiProtocol);
-  }
-
   function visionContextWindowInK(): number {
     const tokens = Number(config?.contextWindowTokens);
     return Number.isFinite(tokens) && tokens > 0 ? tokens / 1000 : 128;
@@ -368,59 +358,7 @@
     <p class="llm-config-lead">{description}</p>
   {/if}
 
-  <section class="settings-card" aria-label={i18n.t('settings.model.card.connection')}>
-    <div class="settings-card-head">
-      <h4 class="settings-section-title">{i18n.t('settings.model.card.connection')}</h4>
-    </div>
-    <div class="settings-card-body model-config-grid">
-      <div class="llm-config-field connection-address">
-        <label class="form-label" for={fieldId('base-url')}>{i18n.t('settings.model.field.baseUrl')}</label>
-        <input
-          id={fieldId('base-url')}
-          type="text"
-          class="form-input"
-          bind:value={config.baseUrl}
-          placeholder={getBaseUrlPlaceholder()}
-        />
-      </div>
-
-      {#if showProtocolField}
-        <div class="llm-config-field">
-          <label class="form-label" for={fieldId('protocol')}>{i18n.t('settings.model.field.apiProtocol')}</label>
-          <SelectField id={fieldId('protocol')} bind:value={config.apiProtocol}
-            label={i18n.t('settings.model.field.apiProtocol')}
-            options={[{ value: 'openai_responses', label: i18n.t('settings.model.protocol.openaiResponses') }, { value: 'openai_chat', label: i18n.t('settings.model.protocol.openaiChat') }, { value: 'anthropic_messages', label: i18n.t('settings.model.protocol.anthropicMessages') }]} />
-          <div class="protocol-endpoint" aria-live="polite">
-            <span>{i18n.t('settings.model.protocol.endpoint')}</span>
-            <code>POST {protocolEndpointLabel()}</code>
-          </div>
-        </div>
-      {/if}
-
-      <div class="llm-config-field">
-        <label class="form-label" for={fieldId('api-key')}>{i18n.t('settings.model.field.apiKey')}</label>
-        <div class="api-key-wrapper">
-          <input
-            id={fieldId('api-key')}
-            type={keyVisible[keyVisibleKey] ? 'text' : 'password'}
-            class="form-input"
-            bind:value={config.apiKey}
-            placeholder={config.apiProtocol === 'anthropic_messages' ? 'sk-ant-...' : 'sk-...'}
-            autocomplete="off"
-          />
-          <button
-            type="button"
-            class="api-key-toggle"
-            onclick={() => (keyVisible[keyVisibleKey] = !keyVisible[keyVisibleKey])}
-            aria-label={keyVisible[keyVisibleKey] ? i18n.t('input.hideKey') : i18n.t('input.showKey')}
-            title={keyVisible[keyVisibleKey] ? i18n.t('input.hideKey') : i18n.t('input.showKey')}
-          >
-            <Icon name={keyVisible[keyVisibleKey] ? 'eye-slash' : 'eye'} size={14} />
-          </button>
-        </div>
-      </div>
-    </div>
-  </section>
+  <ModelConnectionFields bind:config {statusKey} bind:keyVisible {getBaseUrlPlaceholder} showProtocol={showProtocolField} />
 
   {#if showModelField || showAdvancedOptions || formType === 'vision'}
     <section class="settings-card" aria-label={i18n.t('settings.model.card.model')}>
@@ -647,7 +585,7 @@
     </section>
   {/if}
 
-  <div class="apple-dashboard-bar model-form-actions">
+  <div class="model-form-actions">
     <span class="model-form-action-desc" role="status">
       {#if isDirty}
         {i18n.t('settings.model.unsavedChanges')}
@@ -699,53 +637,12 @@
 </div>
 
 <style>
-  .llm-config-form {
-    container: model-config / inline-size;
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-3);
-  }
-
-  .llm-config-field {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-  }
-
-  .model-config-grid {
-    align-items: start;
-  }
-
-  .connection-address,
   .model-reasoning-notes {
     grid-column: 1 / -1;
   }
 
   .model-reasoning-notes :global(.settings-hint:first-child) {
     margin-top: 0;
-  }
-
-  @container model-config (min-width: 640px) {
-    .model-config-grid {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      column-gap: var(--space-4);
-    }
-  }
-
-  .llm-config-form,
-  .llm-config-field {
-    min-width: 0;
-  }
-
-  .llm-config-form :global(.settings-section-title) {
-    margin: 0;
-  }
-
-  .llm-config-lead {
-    margin: var(--space-2) 0 0;
-    font-size: var(--text-xs);
-    line-height: 1.5;
-    color: var(--foreground-muted);
   }
 
   .llm-config-hint {
@@ -946,54 +843,6 @@
     }
   }
 
-  .protocol-endpoint {
-    display: inline-flex;
-    align-items: baseline;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-    min-width: 0;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-  }
-
-  .protocol-endpoint code {
-    color: var(--foreground);
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    overflow-wrap: anywhere;
-  }
-
-  .api-key-wrapper {
-    position: relative;
-  }
-  .api-key-wrapper .form-input {
-    padding-right: 32px;
-  }
-  .api-key-toggle {
-    position: absolute;
-    right: 4px;
-    top: 50%;
-    transform: translateY(-50%);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    padding: 0;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: all var(--transition-fast);
-    opacity: 0.6;
-  }
-  .api-key-toggle:hover {
-    background: var(--secondary);
-    color: var(--foreground);
-    opacity: 1;
-  }
-
   .model-combobox {
     display: flex;
     align-items: center;
@@ -1046,41 +895,9 @@
     background: var(--primary-muted, rgba(var(--primary-rgb, 100, 149, 237), 0.1));
   }
 
-  .model-form-actions {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: var(--space-3);
-    padding: var(--space-3) 0;
-    border-top: var(--magi-hairline) solid var(--border-subtle);
-  }
-
-  .model-form-action-desc {
-    min-width: 0;
-    flex: 1;
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    overflow-wrap: anywhere;
-  }
-
   .vision-custom-rules__header,
   .vision-builtin-rules summary {
     flex-wrap: wrap;
   }
 
-  @container settings-model (max-width: 480px) {
-    .model-form-actions {
-      align-items: stretch;
-      flex-direction: column;
-    }
-    .model-form-actions :global(.settings-section-actions) {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      width: 100%;
-    }
-    .model-form-actions :global(.btn) {
-      width: 100%;
-      justify-content: center;
-    }
-  }
 </style>

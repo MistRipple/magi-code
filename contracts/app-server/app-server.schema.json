@@ -2252,7 +2252,8 @@
         "models",
         "browser",
         "extension",
-        "contextRewrite"
+        "contextRewrite",
+        "modelSources"
       ]
     },
     "PluginPermission": {
@@ -2499,6 +2500,14 @@
           "items": {
             "$ref": "#/$defs/PluginBrowserSurfaceContribution"
           },
+          "x-rust-default": true
+        },
+        "modelSources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginNamedContribution"
+          },
+          "maxItems": 8,
           "x-rust-default": true
         }
       }

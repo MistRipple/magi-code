@@ -25,6 +25,8 @@
 所有设置分类共用 `src/styles/settings.css` 的同一套结构，新增或修改设置页时只用这些共享类，不要在分类内另起一套标题、卡片、行或按钮：
 
 - 页面框架：分类根元素使用 `.apple-scroller-proxy`（或 `.settings-frame`），内容列居中、最宽 880px，不要在分类里再写自己的左右留白。
+- 页首间距由共享框架统一提供 20px；外壳不加第二层内边距，首个分区与工具栏不另加顶部留白。统计、代理、插件设置及二级详情页也复用同一框架，不能根据组件嵌套结构决定外层间距。
+- 模型配置共用 `.llm-config-form` 的内容宽度、说明、字段网格与底部操作栏，连接字段复用 `ModelConnectionFields`。主模型的数据源管理只增加来源列表与模型目录，不另套滚动框架或在连接卡片外再套表单卡片。
 - 分区：`.settings-section` + `.settings-section-header`（`.settings-section-title` 14px 加粗，其下 `.settings-section-desc` 12px 灰色；操作放在 `.settings-section-actions`）。分区之间只有一条细分隔线；每个分区最多一个主按钮。
 - 内容：卡片用 `.settings-card`，列表用 `.settings-rows` / `.settings-row`（`.settings-row-copy` 内放 `.settings-row-title` 与 `.settings-row-desc`），标签用 `.settings-chip`，状态点用 `.settings-dot`，提示用 `.settings-notice`，空状态用 `.settings-empty`（一行说明，不用大图标）。
 - 控件：按钮用全局 `.btn`（设置页一律 `.btn--sm`，主操作 `.btn--primary`，其余 `.btn--secondary`，破坏性 `.btn--error`），输入框用 `.form-input`，开关用 `Toggle`。

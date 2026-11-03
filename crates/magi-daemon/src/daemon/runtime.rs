@@ -651,13 +651,10 @@ struct OpenAiCompatEnvConfig {
 }
 
 fn orchestrator_settings_is_configured(value: &serde_json::Value) -> bool {
-    let field_is_present = |key: &str| {
-        value
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|text| !text.trim().is_empty())
-    };
-    field_is_present("baseUrl") && field_is_present("model")
+    value
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|sources| !sources.is_empty())
 }
 
 #[cfg(test)]
@@ -1193,6 +1190,7 @@ impl DaemonRuntime {
             .map_err(|error| DaemonError::internal(format!("恢复代理角色删除事务失败: {error}")))?;
         canonicalize_model_settings(&settings_store)
             .map_err(|error| DaemonError::internal(format!("清理模型设置失败: {error}")))?;
+        self.plugins.bind_settings(&settings_store);
         let appearance_library = Arc::new(
             magi_appearance::AppearanceLibrary::open(self.state_root.join("appearance"))
                 .map_err(|error| DaemonError::internal(format!("加载外观主题失败: {error}")))?,
@@ -2311,14 +2309,14 @@ impl DaemonRuntime {
         let Some(config) = Self::openai_compat_env_config(bridge_env) else {
             return Ok(());
         };
-        let mut section = serde_json::json!({
-            "baseUrl": config.base_url,
-            "apiProtocol": "openai_chat"
-        });
-        if let Some(api_key) = config.api_key {
-            section["apiKey"] = serde_json::Value::String(api_key);
-        }
-        settings_store.set_section("orchestrator", section)
+        let section = serde_json::json!({"revision":0,"sources":[{
+            "id":"environment", "name":"Environment", "baseUrl":config.base_url,
+            "apiKey":config.api_key.unwrap_or_default(), "apiProtocol":"openai_chat",
+            "models":[{"id":config.model}],
+        }]});
+        settings_store.set_section("orchestrator", section)?;
+        settings_store.set_section(magi_settings_store::ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
+            serde_json::json!({"sourceId":"custom/environment","model":config.model,"reasoningEffort":null}))
     }
 
     fn openai_compat_env_config(bridge_env: &[(&str, &str)]) -> Option<OpenAiCompatEnvConfig> {
@@ -5576,14 +5574,14 @@ done
         )
         .await;
 
+        let source = &bootstrap["orchestratorConfig"]["sources"][0];
+        assert_eq!(source["id"], json!("environment"));
+        assert_eq!(source["baseUrl"], json!("http://127.0.0.1:8317/v1"));
+        assert_eq!(source["apiKey"], json!("test-key"));
+        assert_eq!(source["models"], json!([{"id": "gpt-test"}]));
         assert_eq!(
-            bootstrap["orchestratorConfig"]["baseUrl"],
-            json!("http://127.0.0.1:8317/v1")
-        );
-        assert_eq!(bootstrap["orchestratorConfig"]["apiKey"], json!("test-key"));
-        assert!(
-            bootstrap["orchestratorConfig"].get("model").is_none(),
-            "全局主模型设置只暴露连接配置，具体模型归会话级选择"
+            bootstrap["orchestratorSessionDefaults"],
+            json!({"sourceId": "custom/environment", "model": "gpt-test", "reasoningEffort": null})
         );
         assert!(
             state
@@ -5591,7 +5589,7 @@ done
                 .get_section("orchestrator")
                 .get("model")
                 .is_none(),
-            "环境变量模型只用于直连桥兜底，不得写入全局设置"
+            "环境变量种子写入数据源目录，具体模型选择归会话默认值"
         );
     }
 

@@ -1095,11 +1095,19 @@ fn run_session_turn_execution_inner(
         )
     })?;
     let recovery_history = canonical_session_turn_history(session_store, &request);
-    let selected_model = settings_store
-        .and_then(|store| resolve_orchestrator_model_config(store, Some(&request.session_id)).ok())
+    let selected_model_config = settings_store
+        .and_then(|store| resolve_orchestrator_model_config(store, Some(&request.session_id)).ok());
+    let selected_model = selected_model_config
+        .as_ref()
         .and_then(|config| config.to_usage_llm_config())
         .map(|config| config.model)
         .unwrap_or_default();
+    let selected_main_source_id = selected_model_config
+        .as_ref()
+        .and_then(|config| config.source_id().map(str::to_string));
+    let configured_main_context_window = selected_model_config
+        .as_ref()
+        .and_then(|config| config.context_window_tokens());
 
     let current_turn_contains_images = !request.images.is_empty();
     let vision_execution_config = resolve_vision_execution_config(
@@ -1127,13 +1135,27 @@ fn run_session_turn_execution_inner(
     } else {
         session_turn_model_usage_binding(false)
     };
-    let mut effective_context_window = resolve_model_context_window_with_override(
-        settings_store.map(Arc::as_ref),
-        &resolved_context_model,
-        vision_execution_config
-            .as_ref()
-            .and_then(|config| config.context_window_tokens()),
-    );
+    let context_settings = settings_store.map(Arc::as_ref);
+    let configured_context_window = vision_execution_config
+        .as_ref()
+        .and_then(|config| config.context_window_tokens())
+        .or(configured_main_context_window);
+    let mut effective_context_window = if vision_execution_config.is_none()
+        && let Some(source_id) = selected_main_source_id.as_deref()
+    {
+        crate::model_context_window::resolve_main_source_model_context_window(
+            context_settings,
+            source_id,
+            &resolved_context_model,
+            configured_context_window,
+        )
+    } else {
+        resolve_model_context_window_with_override(
+            context_settings,
+            &resolved_context_model,
+            configured_context_window,
+        )
+    };
     // 扩展 `prompt.contribute`（start 阶段）：本 Turn 只征询一次，稳定片段随后冻结进前缀；
     // 压缩重建与后续请求都复用这一份，不会因再次征询而改变前缀。
     let stable_contributions: Vec<ChatMessage> = extension_hooks
@@ -3805,17 +3827,17 @@ mod tests {
         settings
             .set_section(
                 "orchestrator",
-                serde_json::json!({
-                    "baseUrl": "https://main.example.com/v1",
-                    "apiKey": "main-key",
-                    "apiProtocol": "openai_chat"
-                }),
+                crate::main_model_sources::test_sources(
+                    "https://main.example.com/v1",
+                    "main-key",
+                    &["deepseek-v4-flash"],
+                ),
             )
-            .expect("主模型连接配置必须可写入");
+            .expect("主模型数据源必须可写入");
         settings
             .set_section(
                 magi_settings_store::ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
-                serde_json::json!({"model": "deepseek-v4-flash", "reasoningEffort": "medium"}),
+                serde_json::json!({"sourceId": "custom/test", "model": "deepseek-v4-flash", "reasoningEffort": "medium"}),
             )
             .expect("主模型默认配置必须可写入");
         settings

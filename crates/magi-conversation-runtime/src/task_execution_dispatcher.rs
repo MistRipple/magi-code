@@ -616,16 +616,22 @@ fn build_client_from_section(
 
 /// 构造业务主对话（orchestrator）的 client。
 ///
-/// 主对话采用「全局连接 base + 会话级模型覆盖」两层模型：
-/// - 全局 `orchestrator` 段是权威连接 base，只承载 baseUrl / apiKey / apiProtocol；
-/// - 会话级 `orchestrator` 覆盖段只携带 `model` 与 `reasoningEffort` 两个字段，
-///   在解析时叠加到全局 base 之上，使各会话能独立切换主模型与思考强度而互不污染。
-///
-/// 当 `session_id` 缺失或会话级覆盖为空时，不构造主对话 client，避免隐藏默认模型。
+/// 主对话由数据源目录（`orchestrator.sources`）+ 会话的 `sourceId`/`model` 选择解析；
+/// 目录里没有任何数据源即“未配置”，返回 `None` 由宿主注入的默认客户端承接（开发/测试/嵌入场景）；
+/// 已配置但选择无效是错误，不静默回退。
 fn build_orchestrator_client(
     settings_store: &Arc<SettingsStore>,
     session_id: Option<&SessionId>,
 ) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
+    // 用户没有配置任何数据源、会话也没有选择过来源时才视为“未配置”；
+    // 一旦选择了来源（含插件来源），就必须按目录解析，来源不可用即报错，不回退到默认客户端。
+    let selected_source = crate::model_config::orchestrator_selection(settings_store, session_id)
+        .get("sourceId")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.is_empty());
+    if !crate::main_model_sources::is_configured(settings_store) && !selected_source {
+        return Ok(None);
+    }
     let normalized = resolve_orchestrator_model_config(settings_store, session_id)?;
     Ok(normalized
         .to_http_model_client()
@@ -2871,6 +2877,30 @@ impl LlmTaskDispatcher {
         Ok(resolved)
     }
 
+    /// 扩展调用的模型必须与 `resolve_model_client_for_task` 选中的角色一致，并拒绝插件主对话数据源。
+    pub(crate) fn ensure_extension_model_source(
+        &self,
+        task: Option<&magi_core::Task>,
+        execution_role_id: Option<&str>,
+        session_id: &SessionId,
+    ) -> Result<(), String> {
+        let Some(store) = self.settings_store.as_ref() else {
+            return Ok(());
+        };
+        if task
+            .and_then(|task| task.executor_binding.as_ref())
+            .and_then(|binding| binding.model_selection.as_ref())
+            .is_some()
+        {
+            return Ok(());
+        }
+        let role_id = execution_role_id
+            .map(str::trim)
+            .filter(|role| !role.is_empty())
+            .or_else(|| task.and_then(|task| task_role_id(Some(task))));
+        crate::model_config::ensure_extension_model_source(store, role_id, session_id)
+    }
+
     fn resolve_model_client_for_task(
         &self,
         settings_store: Option<&Arc<SettingsStore>>,
@@ -4198,16 +4228,17 @@ mod tests {
             )
             .expect("写入 engines");
         store
-            .set_session_section(
-                &session_id,
-                "orchestrator",
-                serde_json::json!({ "engineId": "sonnet-4-5" }),
+            .set_section(
+                "agents",
+                serde_json::json!([{"templateId": "reviewer", "engineId": "sonnet-4-5"}]),
             )
-            .expect("写入会话级覆盖");
+            .expect("写入角色绑定");
         let resolved = resolve_target_for_role(
             Some(&store),
             None,
-            RoleTarget::Orchestrator,
+            RoleTarget::Agent {
+                role_id: "reviewer",
+            },
             Some(&session_id),
         )
         .expect("HTTP 引擎绑定应当可用");
@@ -7336,11 +7367,11 @@ mod tests {
         store
             .set_section(
                 "orchestrator",
-                serde_json::json!({
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiKey": "sk-orch",
-                    "apiProtocol": "openai_chat",
-                }),
+                crate::main_model_sources::test_sources(
+                    "https://api.example.com/v1",
+                    "sk-orch",
+                    &["session-model"],
+                ),
             )
             .unwrap();
         let session_id = SessionId::new("session-default-reasoning-effort");
@@ -7348,7 +7379,7 @@ mod tests {
             .set_session_section(
                 &session_id,
                 "orchestrator",
-                serde_json::json!({ "model": "session-model" }),
+                serde_json::json!({ "sourceId": "custom/test", "model": "session-model" }),
             )
             .unwrap();
 
@@ -7370,17 +7401,18 @@ mod tests {
         store
             .set_section(
                 "orchestrator",
-                serde_json::json!({
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiKey": "sk-orch",
-                    "apiProtocol": "openai_chat",
-                }),
+                crate::main_model_sources::test_sources(
+                    "https://api.example.com/v1",
+                    "sk-orch",
+                    &["model-last-used"],
+                ),
             )
             .unwrap();
         store
             .set_section(
                 ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
                 serde_json::json!({
+                    "sourceId": "custom/test",
                     "model": "model-last-used",
                     "reasoningEffort": "high"
                 }),
@@ -7411,11 +7443,11 @@ mod tests {
         store
             .set_section(
                 "orchestrator",
-                serde_json::json!({
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiKey": "sk-orch",
-                    "apiProtocol": "openai_chat",
-                }),
+                crate::main_model_sources::test_sources(
+                    "https://api.example.com/v1",
+                    "sk-orch",
+                    &["session-only-model"],
+                ),
             )
             .unwrap();
         let session_id = SessionId::new("session-model-scope");
@@ -7424,6 +7456,7 @@ mod tests {
                 &session_id,
                 "orchestrator",
                 serde_json::json!({
+                    "sourceId": "custom/test",
                     "model": "session-only-model",
                     "reasoningEffort": "xhigh",
                 }),
@@ -7443,12 +7476,17 @@ mod tests {
             "会话级覆盖存在时必须返回业务模型 client"
         );
 
-        // 不带 session_id 时不能使用全局旧模型字段构造。
+        // 不带 session_id 时只能使用用户默认选择；没有任何数据源则交给宿主默认客户端。
         let global = resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator, None)
-            .expect("orchestrator 段解析不应失败");
+            .expect("已配置数据源时按目录默认选择解析");
+        assert!(global.is_some(), "没有会话覆盖时继承目录第一项");
+        let empty = Arc::new(SettingsStore::new());
+        let unconfigured =
+            resolve_target_for_role(Some(&empty), None, RoleTarget::Orchestrator, None)
+                .expect("未配置数据源不是错误");
         assert!(
-            global.is_none(),
-            "全局 orchestrator base 不得返回隐藏默认模型 client"
+            unconfigured.is_none(),
+            "未配置数据源不得生成隐藏默认模型 client"
         );
     }
 
@@ -7569,15 +7607,21 @@ mod tests {
         use magi_core::ReasoningEffort::{High, Low, Max, Ultra};
         let store = Arc::new(SettingsStore::new());
         let session = SessionId::new("reasoning-selection");
-        let connection = serde_json::json!({"baseUrl":"https://example.test/v1", "apiKey":"private-key", "apiProtocol":"openai_chat"});
         store
-            .set_section("orchestrator", connection.clone())
+            .set_section(
+                "orchestrator",
+                crate::main_model_sources::test_sources(
+                    "https://example.test/v1",
+                    "private-key",
+                    &["gpt-5.6-sol"],
+                ),
+            )
             .unwrap();
         store
             .set_session_section(
                 &session,
                 "orchestrator",
-                serde_json::json!({"model":"gpt-5.6-sol", "reasoningEffort":"high"}),
+                serde_json::json!({"sourceId":"custom/test", "model":"gpt-5.6-sol", "reasoningEffort":"high"}),
             )
             .unwrap();
         let parent = task_with_role("coordinator", TaskTier::ExecutionChain);
@@ -7599,7 +7643,7 @@ mod tests {
                 .freeze_agent_selection(None, 0, Some(Ultra))
                 .is_err()
         );
-        let mut bound = connection.clone();
+        let mut bound = serde_json::json!({"baseUrl":"https://example.test/v1", "apiKey":"private-key", "apiProtocol":"openai_chat"});
         bound["model"] = serde_json::json!("o3-mini");
         bound["reasoningEffort"] = serde_json::json!("low");
         store
@@ -7725,6 +7769,93 @@ mod tests {
         );
     }
 
+    /// 插件贡献的主对话数据源：主对话可用；子代理、扩展调用、辅助模型都不会使用它；
+    /// 来源消失后不静默回退到宿主默认客户端。
+    #[test]
+    fn plugin_model_source_serves_only_the_main_conversation() {
+        use crate::main_model_sources::set_plugin_source;
+        use magi_settings_store::SettingsStore;
+
+        let store = Arc::new(SettingsStore::new());
+        let session = SessionId::new("session-plugin-source");
+        set_plugin_source(
+            &store,
+            "acme.proxy",
+            "gateway",
+            "Gateway",
+            &serde_json::json!({
+                "baseUrl": "https://plugin.example.test/v1", "apiKey": "k",
+                "apiProtocol": "openai_chat", "models": [{"id": "p1"}],
+            }),
+        )
+        .unwrap();
+        store
+            .set_session_section(
+                &session,
+                "orchestrator",
+                serde_json::json!({"sourceId": "plugin/acme.proxy/gateway", "model": "p1"}),
+            )
+            .unwrap();
+
+        // 主对话：即使用户没有配置任何自有数据源，选择了插件来源也按目录解析。
+        let main =
+            resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator, Some(&session))
+                .expect("插件来源应可解析");
+        assert!(main.is_some());
+
+        // 子代理：未绑定独立引擎时不得继承插件来源。
+        let parent = task_with_role("coordinator", TaskTier::ExecutionChain);
+        let error =
+            crate::model_config::agent_target_model_config(&store, &parent, "executor", &session)
+                .expect_err("子代理不得继承插件来源");
+        assert!(error.contains("只能用于主对话"), "{error}");
+
+        // 扩展 model.invoke / credential.ref：默认连接或未绑定引擎的角色同样拒绝。
+        for role in [None, Some("executor")] {
+            let error = crate::model_config::ensure_extension_model_source(&store, role, &session)
+                .expect_err("扩展调用不得使用插件来源");
+            assert!(error.contains("只能用于主对话"), "{error}");
+        }
+        // 角色绑定了独立引擎时，扩展调用走该引擎，与插件来源无关。
+        store
+            .set_section(
+                "engines",
+                serde_json::json!([{"id": "bound", "llm": {
+                    "baseUrl": "https://engine.example.test/v1", "apiKey": "k",
+                    "model": "m", "apiProtocol": "openai_chat",
+                }}]),
+            )
+            .unwrap();
+        store
+            .set_section(
+                "agents",
+                serde_json::json!([{"templateId": "executor", "engineId": "bound"}]),
+            )
+            .unwrap();
+        crate::model_config::ensure_extension_model_source(&store, Some("executor"), &session)
+            .expect("独立引擎不受插件来源影响");
+
+        // 辅助模型只读自己的设置段，不会落到主对话的插件来源。
+        let auxiliary =
+            resolve_target_for_role(Some(&store), None, RoleTarget::Auxiliary, Some(&session))
+                .expect("辅助模型未配置不是错误");
+        assert!(auxiliary.is_none());
+
+        // 插件撤销后：主对话报来源不可用，而不是回退到默认客户端。
+        crate::main_model_sources::clear_plugin_sources(&store, "acme.proxy");
+        let default_client: Arc<dyn ModelBridgeClient> = Arc::new(FailingAuxiliaryClient);
+        let error = match resolve_target_for_role(
+            Some(&store),
+            Some(default_client),
+            RoleTarget::Orchestrator,
+            Some(&session),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("来源撤销后不得回退到默认客户端"),
+        };
+        assert!(error.contains("插件数据源当前不可用"), "{error}");
+    }
+
     #[test]
     fn resolve_target_for_role_reads_execution_snapshot_not_live_settings() {
         use magi_settings_store::SettingsStore;
@@ -7733,11 +7864,11 @@ mod tests {
         live_store
             .set_section(
                 "orchestrator",
-                serde_json::json!({
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiKey": "sk-old",
-                    "apiProtocol": "openai_chat",
-                }),
+                crate::main_model_sources::test_sources(
+                    "https://api.example.com/v1",
+                    "sk-old",
+                    &["model-snapshot"],
+                ),
             )
             .unwrap();
         let session_id = SessionId::new("session-snapshot-model");
@@ -7746,6 +7877,7 @@ mod tests {
                 &session_id,
                 "orchestrator",
                 serde_json::json!({
+                    "sourceId": "custom/test",
                     "model": "model-snapshot",
                 }),
             )

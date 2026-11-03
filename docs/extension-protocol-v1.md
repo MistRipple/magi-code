@@ -102,6 +102,7 @@ daemon 响应形状：
 | `notify.user` | `api.notify.user({message,title?})` | 原生通知事实、持久化与事件；正文最多 4096 字节、标题 256 字节 |
 | `ask.user` | `api.ask.user({questions})` | 原生问题校验、持久交互和等待；扩展不能代答审批 |
 | `blob.put/get` | `api.blob.put(value,contentType?)`／`get(ref)` | 第 8 节有界 JSON 传递 |
+| `modelSource.set/clear` | `api.modelSource.set(sourceId,{baseUrl,apiKey,apiProtocol,models})`／`clear(sourceId)` | 清单声明且获 `modelSources:[sourceId]` 授权；`set` 整体替换，校验与用户数据源一致；只追加到主对话模型目录（`plugin/<pluginId>/<sourceId>`），仅存运行期内存，宿主实例退出时撤销 |
 | `host.ready` | 宿主自动通知 | `activate(api)` 成功后发送 |
 | `host.log` | `api.log(message)` | 最多 4096 字符的诊断通知，不写 canonical 日志 |
 

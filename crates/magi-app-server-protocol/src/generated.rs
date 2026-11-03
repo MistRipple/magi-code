@@ -1497,6 +1497,8 @@ pub enum PluginPermissionKind {
     Extension,
     #[serde(rename = "contextRewrite")]
     ContextRewrite,
+    #[serde(rename = "modelSources")]
+    ModelSources,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1608,6 +1610,9 @@ pub struct PluginContributions {
     #[serde(default)]
     #[serde(rename = "browserSurfaces")]
     pub browser_surfaces: Vec<PluginBrowserSurfaceContribution>,
+    #[serde(default)]
+    #[serde(rename = "modelSources")]
+    pub model_sources: Vec<PluginNamedContribution>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

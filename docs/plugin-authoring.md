@@ -15,6 +15,7 @@
 | 为模型提供新的工具 | Node 扩展：工具 | 第 8 节 |
 | 为用户提供 `/` 斜杠命令 | Node 扩展：命令 | 第 9 节 |
 | 调用模型、读会话、通知或提问用户、派发子任务 | Node 扩展：宿主服务 | 第 10 节 |
+| 把第三方反代等模型接进主对话的模型列表 | Node 扩展：模型数据源 | 第 10 节 |
 | 按计划定时执行命令 | daemon 调度 + Node 命令 | 第 11 节 |
 
 纯声明式的包不启动任何后台进程；只要用到钩子、工具、命令或宿主服务，就必须声明 `extension`，并让用户授予“完全信任”（第 4 节）。
@@ -104,7 +105,7 @@ ui/…                       视图页面与静态资源，按需
 | `name` / `description` | 展示名称与说明 |
 | `permissions` | 权限声明，见第 4 节 |
 | `extension` | `{ "hooks": [...] }`，声明后包必须含 `extension/index.mjs`；反之不得带该文件 |
-| `contributions` | `skills`、`resources`、`views`、`browserSurfaces`、`tools`、`commands` |
+| `contributions` | `skills`、`resources`、`views`、`browserSurfaces`、`tools`、`commands`、`modelSources` |
 | `settingsSchema` | JSON Schema（必须是有界的 object schema，禁止外部引用） |
 | `dataSchemaVersion` | 数据格式版本，正整数 |
 
@@ -112,8 +113,8 @@ ui/…                       视图页面与静态资源，按需
 
 - 清单不接受未知字段。
 - 所有贡献的 ID（技能、资源、视图、工具、命令……）共用一个命名空间，不能重名；ID 以小写字母开头，只含小写字母、数字、连字符，最长 64。
-- 声明了 `extension` 的包必须至少有一个钩子、工具或命令。
-- 工具和命令只有声明了 `extension` 才能出现。
+- 声明了 `extension` 的包必须至少有一个钩子、工具、命令或模型数据源。
+- 工具、命令和模型数据源只有声明了 `extension` 才能出现。
 
 ## 4. 权限与信任
 
@@ -124,6 +125,7 @@ ui/…                       视图页面与静态资源，按需
 | `tools` | 工具 ID | 让对应工具对模型可见 |
 | `models` | `"default"` 或角色 ID | 允许 `model.invoke` / `credential.ref` 使用默认连接或指定角色的模型 |
 | `contextRewrite` | `["history"]` | 允许改写已装配历史的钩子（第 7 节） |
+| `modelSources` | 数据源贡献 ID | 允许向主对话的模型列表提交对应数据源；用户选用后，主对话内容会发送到你提供的地址（第 10 节） |
 | `browser` | surface ID | 浏览器 surface，见第 5 节 |
 
 `permissions` 里列出的每一项，用户都必须在授权时逐项确认；缺少任何一项都不能激活。
@@ -420,6 +422,29 @@ const reply = await api.model.invoke({ prompt: '用一句话总结……', maxOu
 - 调用经 Magi 的模型服务，计入用量账本并归属当前会话；直接用 Node 自己的网络请求不在这个账本里。
 - `api.credential.ref({ roleId? })` 返回模型绑定引用（`model-default` 或 `model-role:<roleId>`），**不返回密钥**；它只能交给 `model.invoke` 的 `credentialRef` 使用。
 
+### 提供主对话模型数据源
+
+```json
+"permissions": [{ "kind": "modelSources", "targets": ["gateway"] }],
+"contributions": { "modelSources": [{ "id": "gateway", "title": "我的反代", "description": "" }] }
+```
+
+```js
+await api.modelSource.set('gateway', {
+  baseUrl: 'http://127.0.0.1:8317/v1',   // OpenAI 兼容或 Anthropic 兼容端点
+  apiKey: 'runtime-secret',
+  apiProtocol: 'openai_chat',            // openai_responses | openai_chat | anthropic_messages
+  models: [{ id: 'my-model', displayName: '我的模型' }],
+});
+await api.modelSource.clear('gateway');
+```
+
+- 数据源 ID 必须先在清单 `contributions.modelSources` 声明，并有同名 `modelSources` 权限；展示名取清单里的 `title`。最多 8 个。
+- `set` 是整体替换：新的 `models` 取代旧的。校验与用户自己配置的数据源相同（地址有效、模型 ID 非空且唯一）。
+- **只影响主对话，只追加**：数据源以“插件”分组出现在主对话的模型选择器里，身份是 `plugin/<pluginId>/<id>`。它不覆盖用户配置的数据源，不会成为默认选择，子代理、`model.invoke`、辅助、识图和生图模型都不会使用它。
+- **只存在于本次运行**：连接信息只在 daemon 内存中，不写盘。插件停用、卸载、崩溃或宿主退出时自动撤销；重启后的实例在 `activate` 里再次提交。已选用该数据源的会话在它不可用期间会明确报错，不会改用其他模型；恢复后可继续使用。
+- 用户在设置页只读查看插件提供的数据源。授权时会提示：选用后主对话内容（对话历史、工具结果等）会发送到你提供的地址。
+
 ### 读取会话
 
 ```js
@@ -549,4 +574,4 @@ node scripts/pack-plugin.mjs <插件目录> <输出.zip>
 - 工作流、会话引擎：由 Magi 原生提供，插件不能替换。
 - 数据格式迁移：没有转换通道，见第 13 节。
 - 运行时安装依赖、包内原生模块或二进制、按通配注册远程工具目录。
-- 让扩展指定或替换模型、写 canonical 日志、批准审批。
+- 让扩展指定或替换模型、写 canonical 日志、批准审批。模型数据源只能追加到主对话目录，不能替换用户的数据源或其他角色的模型。

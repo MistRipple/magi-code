@@ -2,6 +2,8 @@
 
 推理能力由 daemon 解析；Web 只消费 `supportedEfforts`、`defaultEffort`、`transport` 和 `source`。运行时、连接测试、用量身份与模型选择器使用同一解析结果。
 
+主对话模型使用分组数据源目录。会话持久化 `sourceId` 与 `model`，模型 ID 仅在来源分组内唯一；`custom/<sourceId>` 是用户自定义 API，持久化在设置的 `orchestrator` 段；`plugin/<pluginId>/<contributionId>` 是插件经 `api.modelSource` 在本次运行中提交的来源，只存在于设置存储的运行期 section（不写盘，随执行快照冻结，变化推进配置代际），插件停用、卸载、崩溃或宿主退出时撤销。目录、选择校验、连接解析和投影对两类来源走同一条路径（`main_model_sources`），UI 只读取目录投影（含 `kind` 与 `pluginId`），不直连插件、不读取插件密钥。插件来源只追加在用户来源之后，不会成为隐式默认，也不改变“是否已配置”。插件来源只在主对话模型列表出现，辅助推理、图片理解/生成、扩展调用的 `model.invoke` 和子代理均不得沿“继承主模型”路径调用插件来源；子代理应使用其自身模型引擎。数据源移除或插件停用后，已有会话保留原 `sourceId`，明确报来源不可用，不自动切到其他分组。
+
 能力优先级为服务商模型目录显式声明、已知模型内置能力。未知模型返回空档位和 `source: unknown`，请求不携带强度参数。`/models` 通常只返回模型名称，不能据此声称所有服务商都支持自动发现档位；布尔 `reasoning: true` 也不能推导具体档位。
 
 服务商目录支持 `reasoningCapabilities` 对象或模型条目上的 `supportedEfforts` / `supportedReasoningEfforts` / `supported_reasoning_efforts` 数组及对应默认值。同时支持 Codex 目录的 `models[].slug`、`supported_reasoning_levels[].effort` 和 `default_reasoning_level`。数组元素可以是字符串或包含 `reasoningEffort` / `reasoning_effort` / `effort` 的对象。无效声明不作为能力事实。普通模型列表缺少显式能力时，daemon 在同一 `/models` 地址附带自身 `client_version` 请求补充元数据；可选查询失败仍保留普通列表。精确模型 id 优先，代理别名只按同一服务明确提供的相同 `display_name` 关联能力；重名且能力冲突时拒绝关联，不解码别名，不修改实际请求的模型 id。缓存未覆盖的模型在读取档位时自动加载目录；UI 不让旧“未知”投影压过新读取结果。能力缓存以基础地址、协议和凭据摘要分区，保存于 daemon 设置；刷新目录替换该连接的目录声明，不跨连接或账号复用。不提供用户侧兼容性规则编辑；启动时清理历史 `modelReasoningOverrides`，写入入口拒绝废弃字段。

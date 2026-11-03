@@ -97,8 +97,8 @@ assert.match(
 );
 assert.match(
   inputAreaSource,
-  /applyOrchestratorSessionDefaults\([\s\S]*?payload\.orchestratorSessionDefaults[\s\S]*?\);/,
-  '主线模型目录返回后必须立即应用后端权威的新会话默认配置',
+  /getAgentMainModelCatalog\(\)[\s\S]*?if \(!String\(defaults\.sourceId \?\? ''\)\.trim\(\)\) \{[\s\S]*?applyOrchestratorSessionDefaults\(\{ sourceId: firstGroup\.sourceId, model: firstModel\.id, reasoningEffort: null \}\)/,
+  '主线模型目录返回后，没有默认选择时必须立即以目录第一项作为新会话默认配置',
 );
 assert.match(
   inputAreaSource,

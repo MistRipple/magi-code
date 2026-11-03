@@ -62,7 +62,7 @@ for (const create of ['createInteractiveConfig', 'createAuxiliaryConfig', 'creat
   assert.equal(helpers[create]().apiProtocol, 'openai_responses', `${create} defaults to Responses`);
 }
 for (const protocol of ['openai_responses', 'openai_chat', 'anthropic_messages']) {
-  for (const hydrate of ['normalizeOrchestratorFormConfig', 'normalizeAuxiliaryFormConfig', 'normalizeVisionFormConfig', 'normalizeWorkerFormConfig']) {
+  for (const hydrate of ['normalizeAuxiliaryFormConfig', 'normalizeVisionFormConfig', 'normalizeWorkerFormConfig']) {
     assert.equal(helpers[hydrate]({ apiProtocol: protocol }).apiProtocol, protocol, 'loading existing config preserves its explicit protocol');
   }
 }
@@ -73,9 +73,20 @@ const payload = helpers.buildBaseModelConfigPayload({
 assert.deepEqual(payload, {
   baseUrl: 'https://gateway.example.com/v1', apiKey: 'test-key', model: 'test-model', apiProtocol: 'openai_responses',
 });
-assert.deepEqual(helpers.buildOrchestratorConnectionConfigPayload(payload), {
-  baseUrl: payload.baseUrl, apiKey: payload.apiKey, apiProtocol: payload.apiProtocol,
-}, 'main model connection payload contains only connection fields');
+// 主对话配置是数据源目录：每个来源自带连接与协议，保存带乐观并发修订号，不含单连接字段。
+for (const protocol of ['openai_responses', 'openai_chat', 'anthropic_messages']) {
+  const hydrated = helpers.normalizeOrchestratorFormConfig({
+    revision: 3,
+    sources: [{ id: 'one', name: 'One', baseUrl: 'https://one.example/v1', apiKey: 'k', apiProtocol: protocol, models: [{ id: 'm', displayName: 'M' }] }],
+  });
+  assert.equal(hydrated.sources[0].apiProtocol, protocol, 'loading existing source preserves its explicit protocol');
+  assert.equal(hydrated.revision, 3);
+  assert.deepEqual(helpers.buildOrchestratorConnectionConfigPayload(hydrated), {
+    revision: 3, expectedRevision: 3,
+    sources: [{ id: 'one', name: 'One', baseUrl: 'https://one.example/v1', apiKey: 'k', apiProtocol: protocol, models: [{ id: 'm', displayName: 'M' }] }],
+  }, 'main model payload contains only the source catalog and its revision');
+}
+assert.deepEqual(helpers.normalizeOrchestratorFormConfig(undefined).sources, [], '未配置时数据源目录为空');
 
 for (const hydrate of ['normalizeAuxiliaryFormConfig', 'normalizeVisionFormConfig']) {
   for (const effort of [null, 'none', 'minimal', 'high', 'max', 'ultra']) {
@@ -266,8 +277,8 @@ assert.match(
 );
 assert.match(
   settingsStatsTabSource,
-  /const key = resolvedModel\.toLocaleLowerCase\(\)/,
-  '产品模型视角必须只按模型名称聚合',
+  /const key = `\$\{provider\}\\u001f\$\{resolvedModel\.toLocaleLowerCase\(\)\}`/,
+  '产品模型视角必须按数据源身份与模型名称聚合，不同数据源的同名模型不得合并',
 );
 assert.match(
   settingsStatsTabSource,

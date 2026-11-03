@@ -199,11 +199,13 @@ fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
         if manifest.permissions.iter().any(|permission| {
             matches!(
                 permission.kind,
-                PluginPermissionKind::Extension | PluginPermissionKind::ContextRewrite
+                PluginPermissionKind::Extension
+                    | PluginPermissionKind::ContextRewrite
+                    | PluginPermissionKind::ModelSources
             )
         }) {
             return Err(invalid(
-                "extension / contextRewrite 权限只能由声明了 extension 的包使用",
+                "extension / contextRewrite / modelSources 权限只能由声明了 extension 的包使用",
             ));
         }
         return Ok(());
@@ -211,9 +213,10 @@ fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
     if extension.hooks.is_empty()
         && manifest.contributions.tools.is_empty()
         && manifest.contributions.commands.is_empty()
+        && manifest.contributions.model_sources.is_empty()
     {
         return Err(invalid(
-            "声明 extension 的包必须至少声明一个钩子、工具或命令",
+            "声明 extension 的包必须至少声明一个钩子、工具、命令或模型数据源",
         ));
     }
     // 改写已装配历史会让缓存前缀失效并改变模型看到的上下文，必须由用户单独授权。
@@ -402,6 +405,24 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
             return Err(invalid(
                 "浏览器 surface 必须声明对应 Browser surface 的 browser 权限",
             ));
+        }
+    }
+    // 模型数据源由 Node 扩展在运行时提交，只出现在主对话目录；每项必须有同名 `modelSources` 授权，
+    // 因为主对话内容会发送到插件提供的端点。
+    if !c.model_sources.is_empty() && manifest.extension.is_none() {
+        return Err(invalid("声明模型数据源贡献的包必须同时声明 extension"));
+    }
+    for source in &c.model_sources {
+        check(&source.id, &source.title, &source.description)?;
+        let authorized = manifest.permissions.iter().any(|permission| {
+            permission.kind == PluginPermissionKind::ModelSources
+                && permission.targets.iter().any(|target| target == &source.id)
+        });
+        if !authorized {
+            return Err(invalid(format!(
+                "模型数据源 `{}` 必须有包含它的 modelSources 权限声明",
+                source.id
+            )));
         }
     }
     for item in &c.resources {

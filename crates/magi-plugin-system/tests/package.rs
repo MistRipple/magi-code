@@ -436,3 +436,47 @@ fn extension_tools_need_a_tools_permission_and_an_extension() {
     m["contributions"]["tools"][0]["inputSchema"] = json!({"type":"string"});
     assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
 }
+
+fn model_source_manifest() -> Value {
+    let mut m = extension_manifest();
+    m["extension"]["hooks"] = json!([]);
+    m["permissions"] = json!([
+        {"kind":"extension","targets":["full-trust"]},
+        {"kind":"modelSources","targets":["proxy"]}
+    ]);
+    m["contributions"] = json!({"modelSources":[{"id":"proxy","title":"Proxy","description":""}]});
+    m
+}
+
+#[test]
+fn model_sources_need_their_own_authorization_and_an_extension() {
+    // 只提供模型数据源的扩展没有钩子、工具或命令也成立。
+    let ok = PluginPackage::from_archive(&extension_archive(&model_source_manifest(), ENTRY));
+    assert!(ok.is_ok(), "{:?}", ok.err());
+    // 缺少覆盖该数据源的 modelSources 权限（models 权限不能替代：它是插件使用 Magi 的模型）。
+    let mut m = model_source_manifest();
+    m["permissions"] = json!([
+        {"kind":"extension","targets":["full-trust"]},
+        {"kind":"models","targets":["default"]}
+    ]);
+    assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
+    // 没有 extension 的包既不能声明数据源，也不能声明这项权限。
+    let mut m = model_source_manifest();
+    m.as_object_mut().unwrap().remove("extension");
+    m["permissions"] = json!([{"kind":"modelSources","targets":["proxy"]}]);
+    assert!(PluginPackage::from_archive(&extension_archive(&m, &[])).is_err());
+    // 数据源 ID 与其他贡献共用命名空间，且有数量上限。
+    let mut m = model_source_manifest();
+    m["contributions"]["modelSources"] = json!([
+        {"id":"proxy","title":"A","description":""},
+        {"id":"proxy","title":"B","description":""}
+    ]);
+    assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
+    let mut m = model_source_manifest();
+    m["contributions"]["modelSources"] = json!(
+        (0..9)
+            .map(|i| json!({"id":format!("s{i}"),"title":"T","description":""}))
+            .collect::<Vec<_>>()
+    );
+    assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
+}

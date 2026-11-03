@@ -9,6 +9,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
   import ModelConfigForm from './ModelConfigForm.svelte';
+  import MainModelSourcesEditor from './MainModelSourcesEditor.svelte';
 
   let {
     modelConfigTab = $bindable(),
@@ -44,7 +45,8 @@
     getAgentColor,
     deleteEngine,
     openAddEngineDialog,
-    renameEngineDisplay
+    renameEngineDisplay,
+    onMainModelSourcesSaved,
   }: {
     modelConfigTab: string;
     orchConfig: any;
@@ -80,6 +82,7 @@
     deleteEngine: (engineId: string) => void;
     openAddEngineDialog: () => void;
     renameEngineDisplay: (engineId: string, newName: string) => void;
+    onMainModelSourcesSaved: (config: import('../shared/main-model-sources').MainModelSourcesConfig) => void;
   } = $props();
 
   // 角色 displayName 解析（带 i18n fallback）
@@ -423,30 +426,7 @@
 
       <div class="tab-content-area">
         {#if modelConfigTab === 'orch'}
-          <ModelConfigForm
-            formType="orch"
-            statusKey="orch"
-            bind:config={orchConfig}
-            baselineConfig={modelConfigBaselines.orch}
-            bind:keyVisible
-            showModelField={false}
-            showAdvancedOptions={false}
-            description={i18n.t('settings.model.orchestratorDesc')}
-            {saveStatus}
-            {testStatus}
-            {fetchingModels}
-            {modelListOpen}
-            {modelListPosition}
-            {modelLists}
-            {modelDisplayNames}
-            {getBaseUrlPlaceholder}
-            {openModelList}
-            {closeModelList}
-            {fetchModelList}
-            {selectModel}
-            {saveModelConfig}
-            {testModelConnection}
-          />
+          <MainModelSourcesEditor bind:config={orchConfig} {getBaseUrlPlaceholder} onSaved={onMainModelSourcesSaved} />
         {:else if modelConfigTab === 'comp'}
           <ModelConfigForm
             formType="comp"

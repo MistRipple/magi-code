@@ -71,6 +71,8 @@ impl ReasoningCapability {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentModelSelection {
+    #[serde(default)]
+    pub source_id: Option<String>,
     pub engine_id: Option<String>,
     pub binding_revision: u32,
     pub connection_key: String,

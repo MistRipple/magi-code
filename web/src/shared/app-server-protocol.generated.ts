@@ -667,7 +667,7 @@ export type ServerNotification = JsonRpcServerNotification;
 
 export type ServerResponse = JsonRpcServerResponse;
 
-export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite";
+export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite" | "modelSources";
 
 export interface PluginPermission {
   kind: PluginPermissionKind;
@@ -725,6 +725,7 @@ export interface PluginContributions {
   views?: Array<PluginViewContribution>;
   resources?: Array<PluginNamedContribution>;
   browserSurfaces?: Array<PluginBrowserSurfaceContribution>;
+  modelSources?: Array<PluginNamedContribution>;
 }
 
 export type PluginHookMode = "observe" | "advise" | "guard";

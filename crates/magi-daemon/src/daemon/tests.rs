@@ -3380,9 +3380,15 @@ async fn orchestrator_settings_save_stays_global_when_session_scope_is_supplied(
         app,
         "/api/settings/orchestrator/save",
         json!({
-            "baseUrl": "https://api.example.com/v1",
-            "apiKey": "sk-real-test",
-            "apiProtocol": "openai_chat",
+            "expectedRevision": 0,
+            "sources": [{
+                "id": "real",
+                "name": "Real",
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-real-test",
+                "apiProtocol": "openai_chat",
+                "models": [{"id": "gpt-real"}]
+            }],
             "sessionId": "session-scoped-should-not-save",
             "workspaceId": "test-workspace-001"
         }),
@@ -3402,9 +3408,10 @@ async fn orchestrator_settings_save_stays_global_when_session_scope_is_supplied(
         .get("orchestrator")
         .expect("orchestrator section should persist");
     assert_eq!(
-        orchestrator["baseUrl"], "https://api.example.com/v1",
-        "global orchestrator settings should keep connection credentials"
+        orchestrator["sources"][0]["baseUrl"], "https://api.example.com/v1",
+        "global orchestrator settings should keep source connection credentials"
     );
+    assert_eq!(orchestrator["revision"], 1);
     assert!(
         orchestrator.get("model").is_none(),
         "main model selection is session-owned and must not persist in global settings"

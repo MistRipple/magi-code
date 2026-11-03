@@ -30,16 +30,16 @@ fn orchestrator_session_override_request(config: &Value) -> Result<Value, ApiErr
     {
         override_config.insert("model".to_string(), Value::String(model.to_string()));
     }
-    if config.contains_key("engineId") {
-        match config.get("engineId") {
+    if config.contains_key("sourceId") {
+        match config.get("sourceId") {
             Some(Value::String(value)) => {
                 override_config.insert(
-                    "engineId".to_string(),
+                    "sourceId".to_string(),
                     Value::String(value.trim().to_string()),
                 );
             }
             Some(_) => {
-                return Err(ApiError::InvalidInput("engineId 必须是字符串".to_string()));
+                return Err(ApiError::InvalidInput("sourceId 必须是字符串".to_string()));
             }
             None => {}
         }
@@ -102,7 +102,10 @@ pub(crate) fn orchestrator_session_defaults(state: &ApiState) -> Value {
         .get_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION);
     let mut defaults = orchestrator_session_override_request(&stored).unwrap_or_else(|_| json!({}));
     ensure_session_reasoning_effort(&mut defaults);
-    defaults
+    magi_conversation_runtime::main_model_sources::with_first_model_default(
+        &state.settings_store,
+        &defaults,
+    )
 }
 
 pub(crate) fn resolved_orchestrator_session_config(
@@ -115,34 +118,6 @@ pub(crate) fn resolved_orchestrator_session_config(
         .get_session_section(session_id, "orchestrator");
     merge_orchestrator_session_override(&mut config, &session_override);
     config
-}
-
-pub(crate) fn ensure_orchestrator_session_defaults_from_models(
-    state: &ApiState,
-    models: &[String],
-) -> Result<Value, ApiError> {
-    let first_model = models.first().cloned();
-    state
-        .settings_store
-        .update_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION, |stored| {
-            let mut defaults =
-                orchestrator_session_override_request(stored).unwrap_or_else(|_| json!({}));
-            ensure_session_reasoning_effort(&mut defaults);
-            let fields = defaults
-                .as_object_mut()
-                .expect("orchestrator session defaults should be object");
-            let has_model = fields
-                .get("model")
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty());
-            if !has_model && let Some(model) = first_model.as_ref() {
-                fields.insert("model".to_string(), Value::String(model.clone()));
-                fields.insert("reasoningEffort".into(), Value::Null);
-            }
-            *stored = defaults;
-        })
-        .map_err(settings_persistence_error)?;
-    Ok(orchestrator_session_defaults(state))
 }
 
 pub(crate) fn save_orchestrator_session_override_for_session(
@@ -161,9 +136,7 @@ pub(crate) fn save_orchestrator_session_override_for_session(
     }
     let override_fields = &override_fields;
 
-    let mut next_config = state
-        .settings_store
-        .get_session_section(session_id, "orchestrator");
+    let mut next_config = resolved_orchestrator_session_config(state, session_id);
 
     if !next_config.is_object() {
         next_config = json!({});
@@ -179,22 +152,19 @@ pub(crate) fn save_orchestrator_session_override_for_session(
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok());
     ensure_session_reasoning_effort(&mut next_config);
-    let mut effective = state.settings_store.get_section("orchestrator");
-    merge_orchestrator_session_override(&mut effective, &next_config);
-    if !next_config
-        .get("engineId")
-        .and_then(Value::as_str)
-        .is_some_and(|value| !value.is_empty())
-        && let Ok(resolved) =
-            NormalizedModelConfig::from_settings_with_catalog(&state.settings_store, &effective)
-        && let Ok(model) = resolved.require_model()
-    {
-        let capability = resolved.reasoning_capability(model);
-        if capability.source != "unknown" {
-            // null is the user's choice to follow the model default, not a concrete effort.
-            next_config["reasoningEffort"] =
-                json!(requested.filter(|value| capability.supported_efforts.contains(value)));
-        }
+    let effective = magi_conversation_runtime::main_model_sources::effective_config(
+        &state.settings_store,
+        &next_config,
+    )
+    .map_err(ApiError::InvalidInput)?;
+    let resolved =
+        NormalizedModelConfig::from_settings_with_catalog(&state.settings_store, &effective)
+            .map_err(ApiError::InvalidInput)?;
+    let capability =
+        resolved.reasoning_capability(resolved.require_model().map_err(ApiError::InvalidInput)?);
+    if capability.source != "unknown" {
+        next_config["reasoningEffort"] =
+            json!(requested.filter(|value| capability.supported_efforts.contains(value)));
     }
 
     let mut next_defaults = orchestrator_session_defaults(state);
@@ -247,7 +217,7 @@ pub(crate) fn require_orchestrator_session_model(
     config
         .require_model()
         .map(|_| ())
-        .map_err(|_| ApiError::InvalidInput("主线模型尚未选择，请刷新模型列表后重试".to_string()))
+        .map_err(ApiError::InvalidInput)
 }
 
 pub(crate) fn initial_session_orchestrator_config(

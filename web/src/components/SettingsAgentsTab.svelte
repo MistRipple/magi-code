@@ -472,7 +472,7 @@
 </script>
 
 <div class="settings-tab-inner scroll-proxy">
-  <div class="agents-scroll-panel settings-scroll-panel" bind:this={agentsScrollPanel}>
+  <div class="settings-frame" bind:this={agentsScrollPanel}>
     {#if !editorOpen}
       <div class="agents-toolbar">
         <div>
@@ -736,31 +736,19 @@
   .settings-tab-inner {
     container-type: inline-size;
     container-name: agents-tab;
-    /* 覆盖 settings.css 默认值：本 tab 自己用 .settings-scroll-panel 承担滚动 */
+    /* 本 Tab 的共享 settings-frame 承担滚动。 */
     height: 100%;
     width: 100%;
     overflow: hidden;
   }
 
   .scroll-proxy { min-height: 0; }
-  .settings-scroll-panel {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    padding: 4px max(32px, calc((100% - 880px) / 2)) 56px;
-    box-sizing: border-box;
-    scrollbar-width: none;
-    display: flex;
-    flex-direction: column;
-  }
-  .settings-scroll-panel::-webkit-scrollbar { width: 0; }
-
   .agents-toolbar {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 16px;
-    padding: 14px 0 12px;
+    padding: 0 0 12px;
     margin-bottom: 2px;
   }
   .toolbar-title { font-size: 14px; font-weight: calc(var(--font-semibold) + 50); color: var(--ind-foreground); }

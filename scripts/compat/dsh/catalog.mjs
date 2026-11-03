@@ -12,7 +12,7 @@ export const DSH_RULES = [
   rule('calls', /^ctx\.(effect|fiber|on|once|collect|dispose|scope)(\.|$)/, 'runtime', 'shim', '扩展关闭时执行清理', 'Cordis 生命周期子集'),
   rule('calls', /^ctx\.(inject|get|plugin|provide|root|parent)(\.|$)/, 'runtime', 'shim', '服务查找，仅限已登记服务', '未登记的服务会使对应功能丢失'),
   rule('calls', /^ctx\.settings(\.|$)/, 'settings', 'shim', 'api.settings + settingsSchema', '配置 schema 构建期转成 JSON Schema'),
-  rule('calls', /^ctx\.llm\.(registerAdapter|registerConfigurableProviders|registerModelDiscovery)$/, 'llm', 'planned', '插件向主对话追加模型数据源', '依赖 Magi 的插件模型数据源（仅主对话、只追加）'),
+  rule('calls', /^ctx\.llm\.(registerAdapter|registerConfigurableProviders|registerModelDiscovery)$/, 'llm', 'planned', '插件向主对话追加模型数据源', '目标 Magi `api.modelSource`（仅主对话、只追加）已交付；翻译器尚未生成对应的提交代码'),
   rule('calls', /^ctx\.llm(\.|$)/, 'llm', 'planned', '插件向主对话追加模型数据源', '其他 llm 服务需逐项评审'),
   rule('calls', /^ctx\.(tools)(\.|$)/, 'tools', 'planned', '模型工具（contributions.tools）', '工具必须在构建期静态声明'),
   rule('calls', /^ctx\.(commands)(\.|$)/, 'commands', 'planned', '用户命令（contributions.commands）', '命令必须在构建期静态声明'),

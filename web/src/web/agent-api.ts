@@ -2,6 +2,7 @@ import { getDefaultAgentBaseUrl } from '../shared/agent-shared-config';
 import { getTransport } from '../shared/transport';
 import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
 import type { RoleTemplate } from '../shared/types/role-templates';
+import type { MainModelCatalog, MainModelSourcesConfig } from '../shared/main-model-sources';
 import type { SessionTurnCommand } from '../shared/app-server-protocol.generated';
 import type {
   SettingsBootstrapPayload,
@@ -360,6 +361,7 @@ function normalizeSettingsBootstrapPayload(
     orchestratorSessionDefaults: normalizeSettingsSectionConfig(payload.orchestratorSessionDefaults),
     orchestratorSessionConfig: normalizeSettingsSectionConfig(payload.orchestratorSessionConfig),
     effectiveOrchestratorConfig: normalizeSettingsSectionConfig(payload.effectiveOrchestratorConfig),
+    orchestratorModelError: typeof payload.orchestratorModelError === 'string' ? payload.orchestratorModelError : undefined,
     auxiliaryConfig: normalizeSettingsSectionConfig(payload.auxiliaryConfig),
     visionConfig: normalizeSettingsSectionConfig(payload.visionConfig),
     visionBuiltinTextModelRules: normalizeVisionBuiltinTextModelRules(payload.visionBuiltinTextModelRules),
@@ -3156,6 +3158,22 @@ export async function saveAgentOrchestratorConfig(config: Record<string, unknown
   return await postGlobalJson<Record<string, unknown>>('/api/settings/orchestrator/save', config, 'save orchestrator config');
 }
 
+export async function getAgentMainModelCatalog(): Promise<MainModelCatalog> {
+  const response = await getTransport().request(agentUrl('/api/settings/models/catalog'), { cache: 'no-store' });
+  return await parseAgentJson<MainModelCatalog>(response, 'load main model catalog');
+}
+
+export async function saveAgentMainModelSources(
+  config: MainModelSourcesConfig,
+): Promise<MainModelSourcesConfig> {
+  const response = await saveAgentOrchestratorConfig({
+    revision: config.revision,
+    expectedRevision: config.revision,
+    sources: config.sources,
+  });
+  return response.config as MainModelSourcesConfig;
+}
+
 export async function saveAgentOrchestratorSessionConfig(
   config: Record<string, unknown>,
   bindingOverride?: AgentBindingOverride,
@@ -3175,10 +3193,11 @@ export async function saveAgentOrchestratorSessionConfig(
 export async function saveAgentModelContextWindow(
   model: string,
   contextWindowTokens: number,
+  sourceId?: string,
 ): Promise<Record<string, unknown>> {
   return await postGlobalJson<Record<string, unknown>>(
     '/api/settings/model-context-window/save',
-    { model, contextWindowTokens },
+    { model, contextWindowTokens, ...(sourceId?.trim() ? { sourceId: sourceId.trim() } : {}) },
     'save model context window',
   );
 }

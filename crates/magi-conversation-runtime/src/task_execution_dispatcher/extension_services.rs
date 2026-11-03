@@ -187,6 +187,11 @@ impl LlmTaskDispatcher {
             let input: CredentialInput = parse(params)?;
             // 与随后的 model.invoke 使用同一个原生解析入口。主模型由会话
             // 选择，不能在这里只检查不包含 model 的全局连接设置。
+            self.ensure_extension_model_source(
+                owner.task.as_ref(),
+                input.role_id.as_deref(),
+                &owner.session,
+            )?;
             self.resolve_model_client_for_task(
                 self.settings_store.as_ref(),
                 owner.task.as_ref(),
@@ -226,6 +231,11 @@ impl LlmTaskDispatcher {
                     return Err("roleId 与凭据引用不一致".into());
                 }
                 let role = input.role_id.or(ref_role);
+                self.ensure_extension_model_source(
+                    owner.task.as_ref(),
+                    role.as_deref(),
+                    &owner.session,
+                )?;
                 let client = self.resolve_model_client_for_task(
                     self.settings_store.as_ref(),
                     owner.task.as_ref(),

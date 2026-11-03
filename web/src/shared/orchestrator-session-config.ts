@@ -58,8 +58,11 @@ export function copyOrchestratorSessionConfig(
   effectiveConfig: Record<string, unknown> | null | undefined,
 ): Record<string, unknown> {
   const model = resolveOrchestratorModel(sessionConfig, effectiveConfig);
+  const sourceId = [sessionConfig?.sourceId, effectiveConfig?.sourceId]
+    .find((value) => typeof value === 'string' && value.trim()) as string | undefined;
   const reasoningEffort = resolveOrchestratorReasoningEffort(sessionConfig, effectiveConfig);
   return {
+    ...(sourceId ? { sourceId } : {}),
     ...(model ? { model } : {}),
     reasoningEffort,
   };

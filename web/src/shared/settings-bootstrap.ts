@@ -72,6 +72,7 @@ export interface SettingsBootstrapPayload {
   orchestratorSessionDefaults?: Record<string, unknown>;
   orchestratorSessionConfig?: Record<string, unknown>;
   effectiveOrchestratorConfig?: Record<string, unknown>;
+  orchestratorModelError?: string;
   auxiliaryConfig: Record<string, unknown>;
   visionConfig: Record<string, unknown>;
   visionBuiltinTextModelRules: VisionBuiltinTextModelRule[];

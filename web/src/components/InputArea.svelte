@@ -21,7 +21,7 @@
   import { activeAgentRun } from '../stores/active-agent-run.svelte';
   import {
     enhanceAgentPrompt,
-    fetchAgentModelList,
+    getAgentMainModelCatalog,
     getAgentSettingsBootstrap,
     isReferenceableBrowserAnnotation,
     saveAgentModelContextWindow,
@@ -73,7 +73,7 @@
   } from '../shared/session-navigation.svelte';
   import ImageAttachmentTray from './ImageAttachmentTray.svelte';
   import { materializeSession } from '../web/agent-api';
-  import { canFetchModelList } from '../shared/model-governance';
+  import { mainModelContextWindowKey, type MainModelCatalogGroup } from '../shared/main-model-sources';
   import {
     resolveOrchestratorModel,
     resolveOrchestratorReasoningEffort,
@@ -283,12 +283,15 @@
   let pickerLoading = $state(false);
   let pickerSavingModel = $state<string | null>(null);
   let pickerSavingReasoning = $state<ReasoningEffort | 'default' | null>(null);
-  let pickerModels = $state<string[]>([]);
-  let pickerModelDisplayNames = $state<Record<string, string>>({});
+  let pickerModelGroups = $state<MainModelCatalogGroup[]>([]);
   let modelSearch = $state('');
   let workspaceSearch = $state('');
-  const filteredPickerModels = $derived(pickerModels.filter(model =>
-    `${pickerModelDisplayNames[model] ?? ''} ${model}`.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())));
+  const filteredPickerModelGroups = $derived(pickerModelGroups.map((group) => ({
+    ...group,
+    models: group.models.filter((model) =>
+      `${group.name} ${model.displayName} ${model.id}`.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())),
+  })).filter((group) => group.models.length > 0));
+  const pickerModelCount = $derived(pickerModelGroups.reduce((count, group) => count + group.models.length, 0));
   let pickerError = $state<string | null>(null);
   let pickerLoadedOnce = false;
   let pickerModelsConfigKey = '';
@@ -397,12 +400,22 @@
   let accessProfilePickerOpen = $state(false);
   let selectedAccessProfile = $state<AccessProfile>('restricted');
   const currentPickerModel = $derived.by(() => readOrchestratorModel());
-  const mainModelReady = $derived.by(() => currentPickerModel.trim().length > 0);
 
-  const currentPickerEngineId = $derived.by(() => readOrchestratorEngineId());
- const currentPickerLabel = $derived(pickerModelDisplayNames[currentPickerModel] || currentPickerModel);
+  const currentPickerSourceId = $derived.by(() => readOrchestratorSourceId());
+  const mainModelReady = $derived.by(() => currentPickerModel.trim().length > 0 && currentPickerSourceId.trim().length > 0);
+  const currentPickerGroup = $derived(pickerModelGroups.find((group) => group.sourceId === currentPickerSourceId));
+  const currentPickerEntry = $derived(currentPickerGroup?.models.find((entry) => entry.id === currentPickerModel));
+  const currentPickerLabel = $derived([
+    currentPickerEntry?.displayName || currentPickerModel,
+    currentPickerGroup?.name,
+  ].filter(Boolean).join(' · '));
+  const currentPickerSourceError = $derived(
+    typeof messagesState.settingsBootstrapSnapshot?.orchestratorModelError === 'string'
+      && messagesState.settingsBootstrapSnapshot.orchestratorModelError.length > 0,
+  );
+  const currentPickerCapabilityKey = $derived(`${currentPickerSourceId}\u001f${currentPickerModel}`);
   const projectedReasoningCapability = $derived(
-    pickerCapabilities[currentPickerModel]
+    pickerCapabilities[currentPickerCapabilityKey]
       ?? (getEffectiveOrchestratorConfigSnapshot()?.model === currentPickerModel ? messagesState.settingsBootstrapSnapshot?.orchestratorReasoningCapability : null)
       ?? null,
   );
@@ -410,7 +423,7 @@
   $effect(() => {
     const projected = projectedReasoningCapability;
     const model = currentPickerModel;
-    const config = getOrchestratorConfigSnapshot();
+    const config = currentPickerSourceId ? { sourceId: currentPickerSourceId } : null;
 
     void reasoningRetry;
     fallbackReasoningCapability = null;
@@ -446,7 +459,11 @@
     if (!model) return null;
     const snapshot = messagesState.settingsBootstrapSnapshot;
     if (!settingsBootstrapMatchesCurrentWorkspace(snapshot)) return null;
-    const value = snapshot?.modelContextWindows?.[model];
+    const sourceKey = currentPickerSourceId
+      ? mainModelContextWindowKey(currentPickerSourceId, model)
+      : '';
+    const value = (sourceKey ? snapshot?.modelContextWindows?.[sourceKey] : undefined)
+      ?? snapshot?.modelContextWindows?.[model];
     return typeof value === 'number' && Number.isFinite(value) && value > 0
       ? Math.floor(value)
       : null;
@@ -494,7 +511,7 @@
     `${folder.name || ''} ${folder.path}`.toLocaleLowerCase().includes(sourceFolderSearch.trim().toLocaleLowerCase())));
   const selectedSourceFolder = $derived(composerWorkspace?.sourceFolders?.find((folder) => folder.sourceFolderId === selectedSourceFolderId));
   const filteredWorkspaces = $derived(workspaceOptions.filter(workspace => `${workspace.name} ${workspace.rootPath}`.toLocaleLowerCase().includes(workspaceSearch.trim().toLocaleLowerCase())));
-  $effect(() => { if (!pickerOpen || pickerModels.length <= 10) modelSearch = ''; });
+  $effect(() => { if (!pickerOpen || pickerModelCount <= 10) modelSearch = ''; });
   $effect(() => { if (!workspacePickerOpen || workspaceOptions.length <= 10) workspaceSearch = ''; });
   $effect(() => { if (!sourceFolderPickerOpen || (composerWorkspace?.sourceFolders?.length || 0) <= 10) sourceFolderSearch = ''; });
   const agentRunState = $derived(getAgentRunState(currentSessionId, currentWorkspaceId));
@@ -1929,8 +1946,7 @@
     const orchestratorConfig = getOrchestratorConfigSnapshot();
     const configKey = orchestratorModelListConfigKey(orchestratorConfig);
     if (!configKey) {
-      pickerModels = [];
-      pickerModelDisplayNames = {};
+      pickerModelGroups = [];
       pickerCapabilities = {};
       pickerModelsConfigKey = '';
       pickerLoadedOnce = false;
@@ -1938,8 +1954,7 @@
       return;
     }
     if (pickerModelsConfigKey && pickerModelsConfigKey !== configKey) {
-      pickerModels = [];
-      pickerModelDisplayNames = {};
+      pickerModelGroups = [];
       pickerCapabilities = {};
       pickerModelsConfigKey = '';
       pickerLoadedOnce = false;
@@ -2403,7 +2418,7 @@
 
   function resolveTurnOrchestratorSessionConfigPayload(): Record<string, unknown> | null {
     const model = readOrchestratorModel();
-    if (!model) {
+    if (!model || !readOrchestratorSourceId()) {
       pickerOpen = true;
       pickerView = 'models';
       if (!pickerLoadedOnce && !pickerLoading) {
@@ -2426,14 +2441,11 @@
     );
   }
 
-  /**
-   * 会话级引擎绑定。空串代表「继承 provider 连接」，不是错误值：
-   * settings 侧的空串等价于显式解绑（`canonicalize_session_orchestrator_section`）。
-   */
-  function readOrchestratorEngineId(): string {
-    const config = getCurrentOrchestratorSessionConfigSnapshot();
-    const value = config.engineId;
-    return typeof value === 'string' ? value.trim() : '';
+  function readOrchestratorSourceId(): string {
+    const selected = getCurrentOrchestratorSessionConfigSnapshot().sourceId;
+    if (typeof selected === 'string' && selected.trim()) return selected.trim();
+    const effective = getEffectiveOrchestratorConfigSnapshot()?.sourceId;
+    return typeof effective === 'string' ? effective.trim() : '';
   }
 
   function readOrchestratorReasoningEffort(): ReasoningEffort | null {
@@ -2454,11 +2466,9 @@
   }
 
   function orchestratorModelListConfigKey(config: Record<string, unknown> | null): string {
-    if (!config || !canFetchModelList(config)) return '';
-    const baseUrl = typeof config.baseUrl === 'string' ? config.baseUrl.trim() : '';
-    const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : '';
-    const apiProtocol = typeof config.apiProtocol === 'string' ? config.apiProtocol.trim() : '';
-    return JSON.stringify({ baseUrl, apiKey, apiProtocol });
+    const sources = config?.sources;
+    if (!config || !Array.isArray(sources) || sources.length === 0) return '';
+    return JSON.stringify({ revision: Number(config.revision) || 0, sources });
   }
 
   function applyDraftOrchestratorSessionPatch(patch: Record<string, unknown>) {
@@ -2509,7 +2519,8 @@
     messagesState.settingsBootstrapSnapshot = {
       ...snapshot,
       orchestratorReasoningCapability: capability,
-      ...(!sessionConfig.engineId ? { orchestratorSessionDefaults: { ...sessionConfig } } : {}),
+      orchestratorModelError: undefined,
+      orchestratorSessionDefaults: { ...sessionConfig },
       orchestratorSessionConfig: { ...sessionConfig },
       effectiveOrchestratorConfig: { ...effectiveConfig },
     } as AgentSettingsBootstrapSnapshot;
@@ -2565,26 +2576,35 @@
       return;
     }
     const loadPromise = (async () => {
-      const orchestratorConfig = getOrchestratorConfigSnapshot() ?? {};
+      const orchestratorConfig = getOrchestratorConfigSnapshot();
       const configKey = orchestratorModelListConfigKey(orchestratorConfig);
-      if (pickerLoadedOnce && pickerModelsConfigKey === configKey && pickerModels.length > 0) {
+      if (pickerLoadedOnce && pickerModelsConfigKey === configKey && pickerModelCount > 0) {
         return;
       }
       pickerLoading = true;
       pickerError = null;
       try {
-        const payload = await fetchAgentModelList(
-          orchestratorConfig as Record<string, unknown>,
-          'orch',
-          currentWorkspaceId,
-        );
+        if (!orchestratorConfig) throw new Error(i18n.t('input.modelListLoadFailed'));
+        const payload = await getAgentMainModelCatalog();
         if (orchestratorModelListConfigKey(getOrchestratorConfigSnapshot()) !== configKey) return;
-        pickerModels = Array.isArray(payload.models) ? payload.models : [];
-        pickerModelDisplayNames = payload.modelDisplayNames ?? {};
-        pickerCapabilities = payload.modelCapabilities ?? {};
-        applyOrchestratorSessionDefaults(
-          objectRecord(payload.orchestratorSessionDefaults),
-        );
+        pickerModelGroups = Array.isArray(payload.groups) ? payload.groups : [];
+        pickerCapabilities = Object.fromEntries(pickerModelGroups.flatMap((group) => group.models.map((model) => [
+          `${group.sourceId}\u001f${model.id}`, model.reasoningCapability,
+        ])));
+        const defaults = objectRecord(messagesState.settingsBootstrapSnapshot?.orchestratorSessionDefaults);
+        if (!String(defaults.sourceId ?? '').trim()) {
+          const firstGroup = pickerModelGroups.find((group) => group.models.length > 0);
+          const firstModel = firstGroup?.models[0];
+          if (firstGroup && firstModel) applyOrchestratorSessionDefaults({ sourceId: firstGroup.sourceId, model: firstModel.id, reasoningEffort: null });
+        }
+        const selectedSourceId = readOrchestratorSourceId();
+        const selectedModel = readOrchestratorModel();
+        const selectedModelIsAvailable = pickerModelGroups.some((group) =>
+          group.sourceId === selectedSourceId && group.models.some((model) => model.id === selectedModel));
+        const snapshot = messagesState.settingsBootstrapSnapshot;
+        if (selectedModelIsAvailable && snapshot && settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
+          messagesState.settingsBootstrapSnapshot = { ...snapshot, orchestratorModelError: undefined };
+        }
         pickerModelsConfigKey = configKey;
         pickerLoadedOnce = true;
       } catch (error) {
@@ -2615,11 +2635,11 @@
     pickerLoadedOnce = false;
     await loadPickerModels();
   }
-  async function selectPickerModel(model: string) {
+  async function selectPickerModel(model: string, sourceId: string) {
     if (pickerSavingModel || pickerSavingReasoning) return;
     const normalizedModel = model.trim();
     if (!normalizedModel) return;
-    if (normalizedModel === currentPickerModel && !currentPickerEngineId) {
+    if (normalizedModel === currentPickerModel && sourceId === currentPickerSourceId) {
       pickerView = 'effort';
       return;
     }
@@ -2629,7 +2649,7 @@
     const binding: AgentBindingOverride = workspaceId || workspacePath
       ? { scope: 'workspace', workspaceId, workspacePath, sessionId }
       : { scope: 'personal', sessionId };
-    const targetCapability = pickerCapabilities[normalizedModel];
+    const targetCapability = pickerCapabilities[`${sourceId}\u001f${normalizedModel}`];
     const oldEffort = readOrchestratorReasoningEffort();
     const reasoningEffort = targetCapability?.supportedEfforts.includes(oldEffort!)
       ? oldEffort : null;
@@ -2638,19 +2658,19 @@
       messagesState.draftOrchestratorSessionConfig = withOrchestratorReasoningEffort(
         messagesState.draftOrchestratorSessionConfig,
         reasoningEffort,
-        { model: normalizedModel, engineId: '' },
+        { sourceId, model: normalizedModel },
       );
       pickerError = null;
       pickerView = 'effort';
       reasoningAdjusted = adjusted;
       return;
     }
-    pickerSavingModel = normalizedModel;
+    pickerSavingModel = `${sourceId}\u001f${normalizedModel}`;
     pickerError = null;
     const nextSessionConfig = withOrchestratorReasoningEffort(
       getOrchestratorSessionConfigSnapshot(),
       reasoningEffort,
-      { model: normalizedModel, engineId: '' },
+      { sourceId, model: normalizedModel },
     );
     try {
       const saved = await saveAgentOrchestratorSessionConfig(nextSessionConfig, binding);
@@ -2756,7 +2776,7 @@
     if (!model) {
       throw new Error(i18n.t('input.contextRing.modelRequired'));
     }
-    const saved = await saveAgentModelContextWindow(model, contextWindowTokens);
+    const saved = await saveAgentModelContextWindow(model, contextWindowTokens, currentPickerSourceId);
     const snapshot = messagesState.settingsBootstrapSnapshot;
     if (snapshot && settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
       messagesState.settingsBootstrapSnapshot = {
@@ -3494,6 +3514,7 @@ async function refreshPickerSettingsSnapshot() {
                         <button type="button" class="btn btn--sm btn--secondary" aria-pressed={currentPickerReasoningEffort === reasoningOptions[0]} disabled={pickerSavingReasoning !== null || pickerSavingModel !== null} onclick={() => void selectPickerReasoningEffort(reasoningOptions[0])}>{reasoningEffortLabel(reasoningOptions[0])}</button>
                       </div>
                     {/if}
+                    {#if currentPickerSourceError}<p class="ia-picker-status-error" role="alert">{i18n.t('input.mainModelSourceUnavailable')}</p>{/if}
                     {#if !currentReasoningCapability && reasoningReadStatus === 'loading'}<p class="ia-reasoning-hint" role="status">{i18n.t('settings.model.reasoning.loading')}</p>
                     {:else if !currentReasoningCapability && reasoningReadStatus === 'failed'}<p class="ia-reasoning-hint" role="alert">{i18n.t('settings.model.reasoning.failed')}</p><button type="button" class="btn btn--sm btn--secondary" onclick={() => reasoningRetry++}>{i18n.t('input.mainModelPicker.retry')}</button>
                     {:else if !reasoningOptions.length}<p class="ia-reasoning-hint">{i18n.t(currentReasoningCapability?.source === 'unknown' ? 'input.mainModelPicker.reasoning.unknown' : 'input.mainModelPicker.reasoning.unsupported')}</p>
@@ -3517,7 +3538,8 @@ async function refreshPickerSettingsSnapshot() {
                     <Icon name="refresh" size={13} class={pickerLoading ? 'spinning' : ''} />
                   </button>
                 </div>
-                {#if pickerModels.length > 10}
+                {#if currentPickerSourceError}<p class="ia-picker-status-error" role="alert">{i18n.t('input.mainModelSourceUnavailable')}</p>{/if}
+                {#if pickerModelCount > 10}
                   <input type="search" class="form-input" bind:value={modelSearch} placeholder={i18n.t('selection.search')} aria-label={i18n.t('selection.searchFor', { label: i18n.t('input.mainModelPicker.header') })} />
                 {/if}
                 {#if pickerLoading}
@@ -3531,31 +3553,36 @@ async function refreshPickerSettingsSnapshot() {
                       onclick={() => { pickerError = null; loadPickerModels(); }}
                     >{i18n.t('input.mainModelPicker.retry')}</button>
                   </div>
-                {:else if pickerModels.length === 0}
+                {:else if pickerModelCount === 0}
                   <div class="ia-picker-status">{i18n.t('input.mainModelPicker.empty')}</div>
                 {:else}
-                  {#if filteredPickerModels.length === 0}
+                  {#if filteredPickerModelGroups.length === 0}
                     <div class="ia-picker-status" role="status">{i18n.t('selection.empty')}</div>
                   {/if}
                   <div class="ia-picker-list" role="listbox" aria-label={i18n.t('input.mainModelPicker.header')}>
-                    {#each filteredPickerModels as model (model)}
-                      <button
-                        type="button"
-                        class="ia-picker-item ia-picker-row"
-                        class:selected={!currentPickerEngineId && currentPickerModel === model}
-                        role="option" aria-selected={!currentPickerEngineId && currentPickerModel === model}
-                        title={model}
-                        data-model-id={model}
-                        onclick={() => void selectPickerModel(model)}
-                        disabled={pickerSavingModel !== null || pickerSavingReasoning !== null}
-                      >
-                        <span class="ia-picker-item-label">{pickerModelDisplayNames[model] || model}</span>
-                        {#if pickerSavingModel === model}
-                          <Icon name="loader" size={12} class="spinning" />
-                        {:else if !currentPickerEngineId && currentPickerModel === model}
-                          <span class="ia-picker-check"><Icon name="check" size={13} /></span>
-                        {/if}
-                      </button>
+                    {#each filteredPickerModelGroups as group (group.sourceId)}
+                      <div class="ia-picker-group-heading">{group.name}{#if group.kind === 'plugin'}<span class="ia-picker-group-origin">{i18n.t('input.mainModelPicker.pluginSource')}</span>{/if}</div>
+                      {#each group.models as model (`${group.sourceId}:${model.id}`)}
+                        {@const selected = currentPickerSourceId === group.sourceId && currentPickerModel === model.id}
+                        {@const selectionKey = `${group.sourceId}\u001f${model.id}`}
+                        <button
+                          type="button"
+                          class="ia-picker-item ia-picker-row"
+                          class:selected
+                          role="option" aria-selected={selected}
+                          title={`${group.name} · ${model.id}`}
+                          data-model-id={model.id}
+                          onclick={() => void selectPickerModel(model.id, group.sourceId)}
+                          disabled={pickerSavingModel !== null || pickerSavingReasoning !== null}
+                        >
+                          <span class="ia-picker-item-label">{model.displayName || model.id}</span>
+                          {#if pickerSavingModel === selectionKey}
+                            <Icon name="loader" size={12} class="spinning" />
+                          {:else if selected}
+                            <span class="ia-picker-check"><Icon name="check" size={13} /></span>
+                          {/if}
+                        </button>
+                      {/each}
                     {/each}
                   </div>
 
@@ -4497,6 +4524,24 @@ async function refreshPickerSettingsSnapshot() {
     font-size: 12px;
     font-weight: var(--font-medium, 500);
     word-break: break-all;
+  }
+  .ia-picker-group-heading {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    padding: 7px 10px 4px;
+    color: var(--foreground-muted);
+    background: var(--background);
+    font-size: var(--text-xs);
+    font-weight: var(--font-semibold, 600);
+    overflow-wrap: anywhere;
+  }
+  .ia-picker-group-origin {
+    margin-inline-start: 6px;
+    padding: 0 5px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 4px);
+    font-weight: var(--font-normal, 400);
   }
   .ia-picker-row .ia-picker-item-label {
     overflow: hidden;

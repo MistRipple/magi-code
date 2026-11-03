@@ -1100,6 +1100,18 @@ pub(crate) fn resolved_provider_for_usage_binding(
         .map(|config| config.provider)
 }
 
+pub(crate) fn resolved_main_source_id_for_usage_binding(
+    settings_store: Option<&Arc<SettingsStore>>,
+    binding: &ModelUsageBinding,
+    session_id: &SessionId,
+) -> Option<String> {
+    if !binding.tracks_active_context() {
+        return None;
+    }
+    let provider = resolved_provider_for_usage_binding(settings_store, binding, session_id)?;
+    (provider.starts_with("custom/") || provider.starts_with("plugin/")).then_some(provider)
+}
+
 fn usage_tokens_from_payload(usage: Option<&serde_json::Value>) -> Option<UsageTokenInput> {
     let usage = usage?;
     let input_tokens = usage_u64_field(
@@ -1199,15 +1211,21 @@ mod tests {
         use super::*;
         let settings = Arc::new(SettingsStore::new());
         let session = SessionId::new("safe-usage-binding");
-        settings.set_section("orchestrator", serde_json::json!({
-            "baseUrl":"https://url-user:url-password@example.test/v1?api_key=url-token#fragment",
-            "apiProtocol":"openai_chat", "apiKey":"private-key",
-        })).unwrap();
+        settings
+            .set_section(
+                "orchestrator",
+                crate::main_model_sources::test_sources(
+                    "https://url-user:url-password@example.test/v1?api_key=url-token#fragment",
+                    "private-key",
+                    &["original-model", "later-model"],
+                ),
+            )
+            .unwrap();
         settings
             .set_session_section(
                 &session,
                 "orchestrator",
-                serde_json::json!({"model":"original-model"}),
+                serde_json::json!({"sourceId":"custom/test","model":"original-model"}),
             )
             .unwrap();
         let frozen = model_step_usage_context(
@@ -1233,7 +1251,7 @@ mod tests {
             .set_session_section(
                 &session,
                 "orchestrator",
-                serde_json::json!({"model":"later-model"}),
+                serde_json::json!({"sourceId":"custom/test","model":"later-model"}),
             )
             .unwrap();
         assert_eq!(frozen.model_config.model, "original-model");
@@ -1613,11 +1631,11 @@ mod tests {
         settings_store
             .set_section(
                 "orchestrator",
-                json!({
-                    "baseUrl": "https://example.test",
-                    "apiProtocol": "openai_chat",
-                    "apiKey": "secret-success-call-key"
-                }),
+                crate::main_model_sources::test_sources(
+                    "https://example.test",
+                    "secret-success-call-key",
+                    &["gpt-5.6-sol"],
+                ),
             )
             .unwrap();
         settings_store
@@ -1625,6 +1643,7 @@ mod tests {
                 &session_id,
                 "orchestrator",
                 json!({
+                    "sourceId": "custom/test",
                     "model": "gpt-5.6-sol",
                     "reasoningEffort": "high"
                 }),
@@ -1698,18 +1717,18 @@ mod tests {
         settings_store
             .set_section(
                 "orchestrator",
-                json!({
-                    "baseUrl": "https://example.test",
-                    "apiProtocol": "openai_chat",
-                    "apiKey": "secret"
-                }),
+                crate::main_model_sources::test_sources(
+                    "https://example.test",
+                    "secret",
+                    &["gpt-fixed-window"],
+                ),
             )
             .unwrap();
         settings_store
             .set_session_section(
                 &session_id,
                 "orchestrator",
-                json!({"model": "gpt-fixed-window"}),
+                json!({"sourceId": "custom/test", "model": "gpt-fixed-window"}),
             )
             .unwrap();
         let binding = session_turn_model_usage_binding(true);
@@ -1885,18 +1904,18 @@ mod tests {
         settings_store
             .set_section(
                 "orchestrator",
-                json!({
-                    "baseUrl": "https://orchestrator.example.test/v1",
-                    "apiProtocol": "openai_chat",
-                    "apiKey": "secret-orchestrator-key"
-                }),
+                crate::main_model_sources::test_sources(
+                    "https://orchestrator.example.test/v1",
+                    "secret-orchestrator-key",
+                    &["orchestrator-inherited-model"],
+                ),
             )
             .unwrap();
         settings_store
             .set_session_section(
                 &session_id,
                 "orchestrator",
-                json!({"model": "orchestrator-inherited-model"}),
+                json!({"sourceId": "custom/test", "model": "orchestrator-inherited-model"}),
             )
             .unwrap();
         let binding = auxiliary_model_usage_binding(UsagePhase::Integration);
@@ -2060,18 +2079,18 @@ mod tests {
         settings_store
             .set_section(
                 "orchestrator",
-                json!({
-                    "baseUrl": "https://example.test",
-                    "apiProtocol": "openai_chat",
-                    "apiKey": "secret-failed-call-key"
-                }),
+                crate::main_model_sources::test_sources(
+                    "https://example.test",
+                    "secret-failed-call-key",
+                    &["model-failed-call"],
+                ),
             )
             .unwrap();
         settings_store
             .set_session_section(
                 &session_id,
                 "orchestrator",
-                json!({"model": "model-failed-call"}),
+                json!({"sourceId": "custom/test", "model": "model-failed-call"}),
             )
             .unwrap();
         let binding = session_turn_model_usage_binding(true);
@@ -2133,10 +2152,11 @@ mod tests {
         settings_store
             .set_section(
                 "orchestrator",
-                json!({
-                    "baseUrl": "https://example.test",
-                    "apiProtocol": "openai_chat"
-                }),
+                crate::main_model_sources::test_sources(
+                    "https://example.test",
+                    "",
+                    &["gpt-session-test"],
+                ),
             )
             .unwrap();
         settings_store
@@ -2144,6 +2164,7 @@ mod tests {
                 &session_id,
                 "orchestrator",
                 json!({
+                    "sourceId": "custom/test",
                     "model": "gpt-session-test"
                 }),
             )

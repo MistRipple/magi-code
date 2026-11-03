@@ -121,6 +121,8 @@ export interface BaseModelFormConfig {
 
 export interface InteractiveModelFormConfig extends BaseModelFormConfig {
   reasoningEffort: ReasoningEffort | null;
+  sources?: import('../shared/main-model-sources').MainModelSource[];
+  revision?: number;
 }
 
 export interface WorkerModelFormConfig extends InteractiveModelFormConfig {}
@@ -482,11 +484,14 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   /** 全局 orchestrator 只保存连接配置；主模型与推理强度归会话所有。 */
   function buildOrchestratorConnectionConfigPayload(
     config: InteractiveModelFormConfig,
-  ): Omit<BaseModelConfigPayload, "model"> {
+  ): Record<string, unknown> {
     return {
-      baseUrl: config.baseUrl,
-      apiProtocol: config.apiProtocol,
-      apiKey: config.apiKey,
+      revision: config.revision ?? 0,
+      expectedRevision: config.revision ?? 0,
+      sources: (config.sources ?? []).map((source) => ({
+        ...source,
+        models: source.models.map((model) => ({ ...model })),
+      })),
     };
   }
 
@@ -516,6 +521,9 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   function cloneModelFormConfig<T extends BaseModelFormConfig>(config: T): T {
     return {
       ...config,
+      ...('sources' in config && Array.isArray(config.sources)
+        ? { sources: (config.sources as import('../shared/main-model-sources').MainModelSource[]).map((source) => ({ ...source, models: source.models.map((model) => ({ ...model })) })) }
+        : {}),
       ...(Array.isArray(config.textModelRules)
         ? { textModelRules: config.textModelRules.map((rule) => ({ ...rule })) }
         : {}),
@@ -563,11 +571,22 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
 
   function normalizeOrchestratorFormConfig(config: any): InteractiveModelFormConfig {
     return createInteractiveConfig({
-      baseUrl: config?.baseUrl || "",
-      apiProtocol: normalizeModelApiProtocol(config?.apiProtocol),
-      apiKey: config?.apiKey || "",
+      baseUrl: "",
+      apiProtocol: "openai_responses",
+      apiKey: "",
       model: "",
       reasoningEffort: "medium",
+      revision: Number.isSafeInteger(config?.revision) ? config.revision : 0,
+      sources: Array.isArray(config?.sources) ? config.sources.map((source: any) => ({
+        id: String(source?.id ?? ''),
+        name: String(source?.name ?? ''),
+        baseUrl: String(source?.baseUrl ?? ''),
+        apiKey: String(source?.apiKey ?? ''),
+        apiProtocol: normalizeModelApiProtocol(source?.apiProtocol),
+        models: Array.isArray(source?.models) ? source.models.map((model: any) => ({
+          id: String(model?.id ?? ''), displayName: String(model?.displayName ?? ''),
+        })) : [],
+      })) : [],
     });
   }
 
@@ -1075,12 +1094,13 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   }
 
   function hasUsableConnectionConfig(
-    config: Partial<BaseModelFormConfig> | undefined,
+    config: Partial<InteractiveModelFormConfig> | undefined,
   ): boolean {
     if (!config) {
       return false;
     }
-    return Boolean(config.baseUrl?.trim() && config.apiKey?.trim());
+    return Array.isArray(config.sources) && config.sources.some((source) =>
+      Boolean(source.name.trim() && source.baseUrl.trim() && source.models.length > 0));
   }
 
   function inferModelErrorStatus(error: unknown): {
@@ -1306,6 +1326,11 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
         key: statusKey,
         value: { status: "not_configured", model },
       };
+    }
+
+    // 主对话数据源逐项由用户维护模型目录；设置页打开时不对所有来源发起隐式探测。
+    if (target === "orch") {
+      return { key: statusKey, value: { status: "configured" } };
     }
 
     try {
@@ -3397,6 +3422,18 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     if (!preserveDraft) orchConfig = persisted;
   }
 
+  function acceptMainModelSources(saved: import('../shared/main-model-sources').MainModelSourcesConfig): void {
+    const persisted = normalizeOrchestratorFormConfig(saved);
+    orchConfig = cloneModelFormConfig(persisted);
+    setModelConfigBaseline('orch', persisted);
+    updateModelConfigSnapshot('orch', 'orch', persisted);
+    normalizeModelStatuses({
+      ...modelStatuses,
+      orchestrator: { status: hasUsableConnectionConfig(persisted) ? 'configured' : 'not_configured' },
+    });
+    notifySettingsSuccess(i18n.t('settings.toast.modelConfigSaved'));
+  }
+
   function applyAuxiliaryConfig(config: any): void {
     if (!config) {
       return;
@@ -4341,6 +4378,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       return skillsByRepo;
     },
     getBaseUrlPlaceholder,
+    acceptMainModelSources,
     openModelList,
     closeAllModelLists,
     closeModelList,

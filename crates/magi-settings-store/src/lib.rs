@@ -24,6 +24,9 @@ const PUBLIC_RESPONSE_ALIAS_SECTIONS: &[&str] = &[
 #[derive(Debug)]
 pub struct SettingsStore {
     sections: RwLock<HashMap<String, Value>>,
+    /// 运行期事实（例如插件在本次运行中贡献的模型数据源）：只在内存，不写盘，不进入设置响应；
+    /// 随执行快照一起冻结，变化同样推进代际。
+    runtime_sections: RwLock<HashMap<String, Value>>,
     /// 持久化文件路径，为 None 时仅内存模式。
     persistence_path: Option<PathBuf>,
     /// 配置事实源代际。执行期缓存只允许绑定这个代际，设置变化后自然失效。
@@ -41,6 +44,7 @@ impl Clone for SettingsStore {
         let sections = self.sections.read().unwrap().clone();
         Self {
             sections: RwLock::new(sections),
+            runtime_sections: RwLock::new(self.runtime_sections.read().unwrap().clone()),
             persistence_path: self.persistence_path.clone(),
             revision: Arc::new(AtomicU64::new(self.revision())),
         }
@@ -51,6 +55,7 @@ impl SettingsStore {
     pub fn new() -> Self {
         Self {
             sections: RwLock::new(HashMap::new()),
+            runtime_sections: RwLock::default(),
             persistence_path: None,
             revision: Arc::new(AtomicU64::new(0)),
         }
@@ -60,6 +65,7 @@ impl SettingsStore {
     pub fn with_persistence_path(path: PathBuf) -> Self {
         Self {
             sections: RwLock::new(HashMap::new()),
+            runtime_sections: RwLock::default(),
             persistence_path: Some(path),
             revision: Arc::new(AtomicU64::new(0)),
         }
@@ -73,6 +79,7 @@ impl SettingsStore {
         let sections = self.sections.read().unwrap().clone();
         Self {
             sections: RwLock::new(sections),
+            runtime_sections: RwLock::new(self.runtime_sections.read().unwrap().clone()),
             persistence_path: None,
             revision: Arc::new(AtomicU64::new(self.revision())),
         }
@@ -161,6 +168,32 @@ impl SettingsStore {
         self.mutate(|sections| {
             sections.insert(key.to_string(), value);
         })
+    }
+
+    /// 读取运行期 section；不存在时为 `Null`。
+    pub fn get_runtime_section(&self, section: &str) -> Value {
+        self.runtime_sections
+            .read()
+            .unwrap()
+            .get(section)
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// 在写锁内读改写运行期 section，并推进配置代际；不持久化。
+    pub fn update_runtime_section<R>(
+        &self,
+        section: &str,
+        update: impl FnOnce(&mut Value) -> R,
+    ) -> R {
+        let mut sections = self.runtime_sections.write().unwrap();
+        let value = sections.entry(section.to_string()).or_insert(Value::Null);
+        let result = update(value);
+        if value.is_null() {
+            sections.remove(section);
+        }
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        result
     }
 
     pub fn get_section(&self, section: &str) -> Value {
@@ -366,21 +399,18 @@ fn is_public_response_alias_section(section: &str) -> bool {
 }
 
 fn canonicalize_settings_section_value(section: &str, value: &mut Value) {
-    if section == ORCHESTRATOR_SESSION_DEFAULTS_SECTION {
-        canonicalize_session_orchestrator_section(value, false);
-    } else if is_session_section_key(section) && section.ends_with(":orchestrator") {
-        canonicalize_session_orchestrator_section(value, true);
+    if section == ORCHESTRATOR_SESSION_DEFAULTS_SECTION
+        || (is_session_section_key(section) && section.ends_with(":orchestrator"))
+    {
+        canonicalize_session_orchestrator_section(value);
     }
 }
 
-fn canonicalize_session_orchestrator_section(value: &mut Value, allow_engine_binding: bool) {
+fn canonicalize_session_orchestrator_section(value: &mut Value) {
     let Some(object) = value.as_object_mut() else {
         return;
     };
-    object.retain(|key, _| {
-        matches!(key.as_str(), "model" | "reasoningEffort")
-            || (allow_engine_binding && key == "engineId")
-    });
+    object.retain(|key, _| matches!(key.as_str(), "sourceId" | "model" | "reasoningEffort"));
 }
 
 fn session_section_key(session_id: &SessionId, section: &str) -> String {
@@ -617,12 +647,16 @@ mod tests {
                     "reasoningEffort": "xhigh",
                     "previousModel": "legacy-main",
                     "modelSwitchPending": true,
-                    "provider": "openai"
+                    "provider": "openai",
+                    "engineId": "obsolete",
+                    "sourceId": "custom/one"
                 }),
             )
             .unwrap();
 
         let section = store.get_session_section(&session_id, "orchestrator");
+        assert_eq!(section["sourceId"], json!("custom/one"));
+        assert!(section.get("engineId").is_none());
         assert_eq!(section["model"], json!("session-main"));
         assert_eq!(section["reasoningEffort"], json!("xhigh"));
         assert!(section.get("baseUrl").is_none());
@@ -633,12 +667,34 @@ mod tests {
     }
 
     #[test]
+    fn runtime_sections_are_memory_only_and_frozen_by_execution_snapshots() {
+        let dir =
+            std::env::temp_dir().join(format!("magi-runtime-sections-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let store = SettingsStore::with_persistence_path(path.clone());
+        let before = store.revision();
+        store.update_runtime_section("volatile", |value| *value = json!({"key": 1}));
+        assert!(store.revision() > before, "运行期变化必须使执行缓存失效");
+        assert_eq!(store.get_runtime_section("volatile"), json!({"key": 1}));
+        assert!(store.snapshot().is_empty() && store.public_snapshot().is_empty());
+        store.set_section("persisted", json!(true)).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("volatile"), "运行期 section 不得写盘");
+        let frozen = store.execution_snapshot();
+        store.update_runtime_section("volatile", |value| *value = Value::Null);
+        assert_eq!(frozen.get_runtime_section("volatile"), json!({"key": 1}));
+        assert_eq!(store.get_runtime_section("volatile"), Value::Null);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn orchestrator_session_defaults_keep_only_session_owned_fields() {
         let store = SettingsStore::new();
         store
             .set_section(
                 ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
                 json!({
+                    "sourceId": "custom/one",
                     "model": "model-default",
                     "reasoningEffort": "high",
                     "apiKey": "must-not-persist",
@@ -650,6 +706,7 @@ mod tests {
         assert_eq!(
             store.get_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION),
             json!({
+                "sourceId": "custom/one",
                 "model": "model-default",
                 "reasoningEffort": "high"
             })

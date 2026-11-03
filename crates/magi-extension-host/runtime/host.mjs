@@ -252,6 +252,11 @@ const api = Object.freeze({
   ask: Object.freeze({ user: (input = {}) => request('ask.user', input) }),
   session: Object.freeze({ snapshot: (input = {}) => request('session.snapshot', input) }),
   credential: Object.freeze({ ref: (input = {}) => request('credential.ref', input) }),
+  /** 向主对话的模型目录提交（整体替换）清单声明过且获 `modelSources` 授权的数据源；宿主退出时自动撤销。 */
+  modelSource: Object.freeze({
+    set: (sourceId, input = {}) => request('modelSource.set', { sourceId, ...input }),
+    clear: (sourceId) => request('modelSource.clear', { sourceId }),
+  }),
   blob: Object.freeze({
     put: (value, contentType) => request('blob.put', { value, contentType }),
     get: (ref) => request('blob.get', { ref }),

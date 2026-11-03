@@ -25,6 +25,8 @@ pub(super) struct PluginHostService {
     pub digest: String,
     pub native: Arc<OnceLock<NativeService>>,
     pub blobs: Arc<Mutex<HashMap<String, Blob>>>,
+    /// 主对话模型目录所在的设置事实源；插件贡献的数据源写入其运行期 section。
+    pub settings: Arc<OnceLock<Arc<magi_settings_store::SettingsStore>>>,
 }
 
 pub(super) struct Blob {
@@ -38,6 +40,31 @@ pub(super) struct Blob {
 impl PluginHostService {
     fn service_admitted(&self, plugin: &str, method: &str, params: &Value) -> Result<(), RpcError> {
         self.admitted(plugin)?;
+        if matches!(method, "modelSource.set" | "modelSource.clear") {
+            // 主对话内容会发往插件提供的端点，所以数据源必须逐项授权。
+            let target = params
+                .get("sourceId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError::new(ErrorKind::InvalidParams, "sourceId 必须是字符串"))?;
+            let manager = self
+                .manager
+                .lock()
+                .map_err(|_| RpcError::new(ErrorKind::Internal, "插件管理器不可用"))?;
+            if !manager
+                .permission_allowed(
+                    plugin,
+                    magi_plugin_system::PluginPermissionKind::ModelSources,
+                    target,
+                )
+                .map_err(|error| RpcError::new(ErrorKind::PermissionDenied, error.to_string()))?
+            {
+                return Err(RpcError::new(
+                    ErrorKind::PermissionDenied,
+                    format!("缺少 modelSources:[{target}] 授权"),
+                ));
+            }
+            return Ok(());
+        }
         if !matches!(method, "model.invoke" | "credential.ref") {
             return Ok(());
         }
@@ -100,6 +127,14 @@ impl PluginHostService {
 }
 
 impl HostService for PluginHostService {
+    fn instance_detached(&self, plugin_id: &str) {
+        if let Some(settings) = self.settings.get() {
+            magi_conversation_runtime::main_model_sources::clear_plugin_sources(
+                settings, plugin_id,
+            );
+        }
+    }
+
     fn request_scoped(
         &self,
         plugin_id: String,
@@ -175,6 +210,7 @@ impl HostService for PluginHostService {
         let events = Arc::clone(&self.events);
         let digest = self.digest.clone();
         let blobs = Arc::clone(&self.blobs);
+        let settings = self.settings.get().cloned();
         if let Err(error) = self.service_admitted(&plugin_id, &method, &params) {
             return Box::pin(async { Err(error) });
         }
@@ -341,6 +377,44 @@ impl HostService for PluginHostService {
                     )
                     .map(|r| serde_json::json!({"version": r.version, "value": r.value}))
                 }
+                "modelSource.set" | "modelSource.clear" => {
+                    let settings = settings
+                        .ok_or_else(|| RpcError::new(ErrorKind::Internal, "设置服务未装配"))?;
+                    let mut input = params;
+                    let source_id = input
+                        .as_object_mut()
+                        .and_then(|object| object.remove("sourceId"))
+                        .and_then(|value| value.as_str().map(str::to_string))
+                        .ok_or_else(|| {
+                            RpcError::new(ErrorKind::InvalidParams, "sourceId 必须是字符串")
+                        })?;
+                    let title = manager_guard
+                        .package(&plugin_id)
+                        .map_err(map_error)?
+                        .manifest()
+                        .contributions
+                        .model_sources
+                        .iter()
+                        .find(|source| source.id == source_id)
+                        .map(|source| source.title.clone())
+                        .ok_or_else(|| {
+                            RpcError::new(
+                                ErrorKind::InvalidParams,
+                                format!("模型数据源 {source_id} 未在清单中声明"),
+                            )
+                        })?;
+                    if method == "modelSource.clear" {
+                        magi_conversation_runtime::main_model_sources::clear_plugin_source(
+                            &settings, &plugin_id, &source_id,
+                        );
+                    } else {
+                        magi_conversation_runtime::main_model_sources::set_plugin_source(
+                            &settings, &plugin_id, &source_id, &title, &input,
+                        )
+                        .map_err(|message| RpcError::new(ErrorKind::InvalidParams, message))?;
+                    }
+                    return Ok(json!({}));
+                }
                 "settings.read" => manager_guard
                     .read_settings(&plugin_id)
                     .map(|r| serde_json::json!({"version": r.version, "value": r.value})),
@@ -392,10 +466,11 @@ mod tests {
             "extension": {"hooks": []}, "dataSchemaVersion": 1,
             "permissions": [
                 {"kind": "extension", "targets": ["full-trust"]},
-                {"kind": "storage", "targets": ["notes", "__settings"]}
+                {"kind": "storage", "targets": ["notes", "__settings"]},
+                {"kind": "modelSources", "targets": ["proxy"]}
             ],
             "settingsSchema": {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "additionalProperties": false},
-            "contributions": {"resources": [{"id": "notes", "title": "Notes", "description": ""}], "commands": [{"id": "status", "title": "Status", "description": ""}]}
+            "contributions": {"resources": [{"id": "notes", "title": "Notes", "description": ""}], "commands": [{"id": "status", "title": "Status", "description": ""}], "modelSources": [{"id": "proxy", "title": "Acme Proxy", "description": ""}]}
         });
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         zip.start_file("manifest.json", zip::write::SimpleFileOptions::default())
@@ -414,6 +489,10 @@ mod tests {
             await api.resource.write('notes', snapshot.version, {text: 'from node'});
             const settings = await api.settings.read();
             await api.settings.write(settings.version, {enabled: true});
+            await api.modelSource.set('proxy', {
+              baseUrl: 'http://127.0.0.1:9/v1', apiKey: 'plugin-secret', apiProtocol: 'openai_chat',
+              models: [{id: 'proxy-model', displayName: 'Proxy Model'}],
+            });
         }"#,
         )
         .unwrap();
@@ -445,6 +524,9 @@ mod tests {
             digest: package.digest().into(),
             native: Arc::default(),
             blobs: Arc::default(),
+            settings: Arc::new(std::sync::OnceLock::from(Arc::new(
+                magi_settings_store::SettingsStore::new(),
+            ))),
         });
         (dir, service)
     }
@@ -662,6 +744,108 @@ mod tests {
         assert_eq!(
             manager.read_settings("acme.services").unwrap().value,
             json!({"enabled": true})
+        );
+        // 真实 Node 激活期间提交的数据源进入主对话目录，并带上清单里的标题。
+        let settings = service.settings.get().unwrap();
+        let catalog = magi_conversation_runtime::main_model_sources::catalog(settings).unwrap();
+        let group = &catalog["groups"][0];
+        assert_eq!(group["sourceId"], "plugin/acme.services/proxy");
+        assert_eq!(group["kind"], "plugin");
+        assert_eq!(group["name"], "Acme Proxy");
+        assert_eq!(group["models"][0]["displayName"], "Proxy Model");
+        assert!(!catalog.to_string().contains("plugin-secret"));
+    }
+
+    fn source_input() -> serde_json::Value {
+        json!({
+            "sourceId": "proxy", "baseUrl": "https://proxy.example/v1", "apiKey": "k",
+            "apiProtocol": "openai_chat", "models": [{"id": "m1"}]
+        })
+    }
+
+    #[tokio::test]
+    async fn model_sources_are_declared_authorized_validated_and_revoked_with_the_instance() {
+        use magi_conversation_runtime::main_model_sources as sources;
+        let (_dir, service) = fixture();
+        let settings = Arc::clone(service.settings.get().unwrap());
+        call(&service, "modelSource.set", source_input())
+            .await
+            .unwrap();
+        let resolved = sources::effective_config(
+            &settings,
+            &json!({"sourceId": "plugin/acme.services/proxy", "model": "m1"}),
+        )
+        .unwrap();
+        assert_eq!(resolved["baseUrl"], "https://proxy.example/v1");
+
+        // 未在清单声明、无授权、地址无效，都在写入口被拒绝，目录不变。
+        let mut undeclared = source_input();
+        undeclared["sourceId"] = json!("other");
+        assert_eq!(
+            call(&service, "modelSource.set", undeclared)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        let mut bad = source_input();
+        bad["baseUrl"] = json!("not a url");
+        assert_eq!(
+            call(&service, "modelSource.set", bad)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidParams
+        );
+        let mut extra = source_input();
+        extra["unexpected"] = json!(1);
+        assert_eq!(
+            call(&service, "modelSource.set", extra)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidParams
+        );
+        assert_eq!(sources::sources(&settings).unwrap().len(), 1);
+
+        // 整体替换：新的模型列表取代旧的，旧模型不再可选。
+        let mut replaced = source_input();
+        replaced["models"] = json!([{"id": "m2"}]);
+        call(&service, "modelSource.set", replaced).await.unwrap();
+        assert!(
+            sources::effective_config(
+                &settings,
+                &json!({"sourceId": "plugin/acme.services/proxy", "model": "m1"}),
+            )
+            .is_err()
+        );
+
+        // 实例退出即撤销；已选用它的会话得到“不可用”，不会回退。
+        service.instance_detached("acme.services");
+        let error = sources::effective_config(
+            &settings,
+            &json!({"sourceId": "plugin/acme.services/proxy", "model": "m2"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("插件数据源当前不可用"), "{error}");
+        assert!(sources::sources(&settings).unwrap().is_empty());
+
+        // 撤权后写入口关闭。
+        call(&service, "modelSource.set", source_input())
+            .await
+            .unwrap();
+        service
+            .manager
+            .lock()
+            .unwrap()
+            .authorize("acme.services", vec![])
+            .unwrap();
+        assert_eq!(
+            call(&service, "modelSource.clear", json!({"sourceId": "proxy"}))
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
         );
     }
 }
