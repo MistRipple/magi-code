@@ -259,6 +259,13 @@
 
 ## 6. 阶段 E：翻译器与兼容来源
 
+### 6.0 当前进度与工厂结构（2026-11-03）
+
+【现状·已运行验证】翻译器从“静态兼容分析”起步，入口 `scripts/compat/`：`core/registry.mjs` 是翻译器工厂注册表（`register(kind, factory)`、`create(kind)`、`detect(dir)`；识别不出或并列时明确失败，不猜），每种上游生态只在 `index.mjs` 注册一个工厂；`core/scan.mjs` 用语法树扫描导入、`ctx.*` 调用链与 `inject` 服务，不执行上游代码；`core/report.mjs` 规定每项能力必须落在 mapped／shim／bundled／planned／dropped／unknown 之一，必需能力里出现 planned／dropped／unknown 即阻塞翻译；`dsh/` 是首个翻译器，`dsh/catalog.mjs` 是 DSH→Magi 对照表。运行：`node scripts/compat/cli.mjs inspect <插件目录> --require llm`，测试：`npm run test:compat`。pi 翻译器之后只需新增 `pi/` 并注册工厂；DSH 与 pi 共用的 pi-ai 适配层放在共享层，不在两边各写一份。
+
+【现状·已运行验证】对 dsh-connect-workbuddy 5.18.0（95 个源文件、约 5.7 万行）的分析结论：模型提供者注册（`ctx.llm.registerAdapter`／`registerConfigurableProviders`／`registerModelDiscovery`，依赖 pi-ai 适配层）是核心，对应 Magi **尚未交付**的“插件向主对话追加模型数据源”（planned）；浏览器端 React 界面、HTTP 路由、会话投影、槽位与多语言共 18 项 dropped；工具、命令、`systemPrompt` 可映射但需构建期静态声明（planned）；日志、生命周期、服务查找、设置由兼容层 shim。**尚未实现**：兼容层运行时（Cordis 子集）、构建打包、产物与兼容报告随包、Magi 侧插件模型数据源。
+
+
 > **状态：推迟（2026-11-02 决定）。** 本节及路线表的 P3（pi）、P4（DSH）是后期工作，当前不实现；先让本地插件系统稳定可用。以下是启动时的设计输入，不是已排期的交付。
 
 ### 6.1 适配层加构建期打包
