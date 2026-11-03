@@ -667,13 +667,10 @@ export type ServerNotification = JsonRpcServerNotification;
 
 export type ServerResponse = JsonRpcServerResponse;
 
-export type PluginScopeKind = "application";
-
 export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite";
 
 export interface PluginPermission {
   kind: PluginPermissionKind;
-  scope: PluginScopeKind;
   targets: Array<string>;
 }
 
@@ -709,7 +706,6 @@ export interface PluginBrowserSurfaceContribution {
   id: string;
   title: string;
   description: string;
-  scope: PluginScopeKind;
   persistence: PluginSurfacePersistence;
   keepMounted: boolean;
   closeAction: PluginSurfaceCloseAction;
@@ -758,12 +754,7 @@ export interface PluginManifest {
 
 export type JsonRpcMessage = JsonRpcRequest | JsonRpcNotification | JsonRpcResponse;
 
-export interface PluginScopeRequest {
-  scope: string;
-}
-
 export interface PluginAuthorizeRequest {
-  scope: string;
   grants: Array<PluginPermission>;
 }
 
@@ -787,11 +778,6 @@ export interface PluginCandidatePreview {
   dataReset: boolean;
 }
 
-export interface PluginScopeGrant {
-  scope: string;
-  permissions: Array<PluginPermission>;
-}
-
 export type PluginSourceKind = "center" | "address" | "local" | "builtin";
 
 export interface PluginSourceProjection {
@@ -802,11 +788,11 @@ export interface PluginSourceProjection {
 export interface PluginInstalled {
   manifest: PluginManifest;
   digest: string;
-  enabledScopes: Array<string>;
-  activeScopes: Array<string>;
-  grants: Array<PluginScopeGrant>;
+  grants: Array<PluginPermission>;
   source: PluginSourceProjection;
   runtime?: PluginRuntimeStatus;
+  enabled: boolean;
+  active: boolean;
 }
 
 export type PluginRuntimeState = "starting" | "running" | "restarting" | "failed" | "stopped";
@@ -1453,4 +1439,41 @@ export interface ModelResponseTiming {
   firstContentMs: number;
   contentDurationMs: number;
   textOutputTokens?: number;
+}
+
+export interface PluginActivationRequest {
+}
+
+export interface PluginJobBudget {
+  maxModelCalls: number;
+  maxOutputTokens: number;
+  timeoutMs: number;
+}
+
+export interface PluginJobContext {
+  jobId: string;
+  scheduleId: string;
+  budget: PluginJobBudget;
+}
+
+export interface PluginJobRequest {
+  commandId: string;
+  sessionId: string;
+  text: string;
+  runAt: number;
+  intervalMs: number | null;
+  budget: PluginJobBudget;
+}
+
+export interface PluginJobSchedule {
+  id: string;
+  pluginId: string;
+  digest: string;
+  request: PluginJobRequest;
+  enabled: boolean;
+  nextRunAt: number;
+  runNumber: number;
+  pendingRequestId: string | null;
+  lastTurnId: string | null;
+  lastOutcome: string | null;
 }

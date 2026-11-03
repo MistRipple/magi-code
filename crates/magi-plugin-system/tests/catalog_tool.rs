@@ -33,7 +33,7 @@ fn catalog_signed_by_the_publish_tool_is_accepted_by_the_daemon_verifier() {
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(
         source.join("manifest.json"),
-        r#"{"sdkVersion":2,"id":"example.notes","version":"1.0.0","name":"示例","description":"","permissions":[{"kind":"storage","scope":"application","targets":["notes"]}],"dataSchemaVersion":1,"settingsSchema":{"type":"object","additionalProperties":false},"contributions":{"resources":[{"id":"notes","title":"笔记","description":""}]}}"#,
+        r#"{"sdkVersion":2,"id":"example.notes","version":"1.0.0","name":"示例","description":"","permissions":[{"kind":"storage","targets":["notes"]}],"dataSchemaVersion":1,"settingsSchema":{"type":"object","additionalProperties":false},"contributions":{"resources":[{"id":"notes","title":"笔记","description":""}]}}"#,
     )
     .unwrap();
     let archive = path("notes.zip");

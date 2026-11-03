@@ -2,6 +2,8 @@
 //!
 //! Owns the production task dispatch implementation for session turns and conversation loops.
 
+mod extension_services;
+
 use crate::{
     ConversationRegistry, SKILL_APPLY_TOOL_NAME, active_skill_tool_execution_policy,
     build_skill_custom_tool_definitions,
@@ -7777,6 +7779,138 @@ mod tests {
         assert!(
             live_client.is_none(),
             "实时 settings 已删除 orchestrator，不应影响既有执行快照"
+        );
+    }
+    fn extension_services_fixture() -> (LlmTaskDispatcher, SessionId, serde_json::Value) {
+        let dispatcher = dispatcher_with_default_tool_surface()
+            .with_session_state_persist_callback(Arc::new(|_| Ok(())));
+        let session = SessionId::new("extension-service-session");
+        dispatcher
+            .session_store
+            .create_session(session.clone(), "扩展服务")
+            .unwrap();
+        dispatcher
+            .session_store
+            .ensure_session_mission(&session, UtcMillis(1), || {
+                MissionId::new("extension-service-mission")
+            });
+        dispatcher
+            .session_store
+            .accept_current_turn_with_timeline_entry(
+                session.clone(),
+                magi_session_store::TimelineEntryInput::new(
+                    "extension-test",
+                    TimelineEntryKind::UserMessage,
+                    "work",
+                    UtcMillis(1),
+                ),
+                magi_session_store::ActiveExecutionTurn {
+                    turn_id: "extension-service-turn".into(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis(1),
+                    completed_at: None,
+                    status: "running".into(),
+                    user_message: Some("work".into()),
+                    items: vec![],
+                },
+            )
+            .unwrap();
+        let context = serde_json::json!({"owner":{"sessionId":session,"turnId":"extension-service-turn"},"invocationId":"signed-by-daemon"});
+        (dispatcher, session, context)
+    }
+
+    #[test]
+    fn extension_snapshot_is_bounded_and_actions_require_a_live_owner() {
+        let (dispatcher, session, context) = extension_services_fixture();
+        let snapshot = dispatcher
+            .extension_service(
+                "acme.test",
+                "session.snapshot",
+                serde_json::json!({"sessionId":session}),
+                Arc::default(),
+            )
+            .unwrap();
+        assert_eq!(snapshot["turns"].as_array().unwrap().len(), 1);
+        assert!(
+            dispatcher
+                .extension_service(
+                    "acme.test",
+                    "notify.user",
+                    serde_json::json!({"message":"hello"}),
+                    Arc::default()
+                )
+                .is_err()
+        );
+        let notification = dispatcher
+            .extension_service(
+                "acme.test",
+                "notify.user",
+                serde_json::json!({"_context":context,"message":"hello"}),
+                Arc::default(),
+            )
+            .unwrap();
+        let records = dispatcher.session_store.notifications_for_context(
+            &magi_session_store::NotificationContext::personal(Some(session)),
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(notification["notificationId"], records[0].notification_id);
+    }
+
+    #[test]
+    fn extension_questions_use_canonical_interactions_and_only_user_answers_complete_them() {
+        let (dispatcher, session, context) = extension_services_fixture();
+        let worker = dispatcher.clone();
+        let thread = std::thread::spawn(move || {
+            worker.extension_service("acme.test", "ask.user", serde_json::json!({"_context":context,"questions":[{"header":"方式","question":"选择方式","options":[{"label":"A"},{"label":"B"}]}]}), Arc::default())
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let question = loop {
+            if let Some(question) = dispatcher
+                .conversation_registry
+                .user_questions()
+                .pending_for_session(&session)
+                .into_iter()
+                .next()
+            {
+                break question;
+            }
+            if thread.is_finished() {
+                panic!("提问在登记前失败：{:?}", thread.join().unwrap());
+            }
+            assert!(std::time::Instant::now() < deadline, "提问登记超时");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(
+            dispatcher
+                .session_store
+                .pending_user_questions(&session)
+                .unwrap()
+                .len(),
+            1
+        );
+        dispatcher
+            .conversation_registry
+            .user_questions()
+            .resolve(
+                &session,
+                &question.question_id,
+                crate::UserQuestionResponse::Answered {
+                    answers: vec![crate::UserQuestionAnswer {
+                        selected: vec!["A".into()],
+                        other: None,
+                    }],
+                },
+            )
+            .unwrap();
+        let result = thread.join().unwrap().unwrap();
+        assert_eq!(result["response"]["kind"], "answered");
+        assert_eq!(
+            dispatcher
+                .session_store
+                .pending_user_questions(&session)
+                .unwrap()
+                .len(),
+            0
         );
     }
 }

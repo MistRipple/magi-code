@@ -285,9 +285,9 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 钩子接线：`cargo test -p magi-extension-host`（目录与已接线模式）、`cargo test -p magi-conversation-runtime --lib extension_hooks`（子代理 guard、改写重新校验）、`model_step_notifies_observers_after_commit_without_prompt_content`（模型观察）、`cargo test -p magi-daemon --lib extension_bridge`（真实 Node 扩展经 input/subagent.spawn guard 与领域事件转发的完整链路）、`cargo test -p magi-api --lib blocked_input_is_rejected`（被阻止的输入不留任何会话或 Turn 事实）。
 
-随包 Node：`node apps/desktop/scripts/node-runtime.mjs stage <目录>` 下载固定版本、校验归档摘要并在清空环境下执行校验；打包时 afterPack 对最终制品再做同样的执行校验（清单必须含该文件与版本）。以 `MAGI_EXTENSION_NODE` 指向该 Node 运行 `cargo test -p magi-extension-host --test host` 与 `cargo test -p magi-daemon --lib extension` 已在 macOS 通过；其余钩子未接线；macOS 以外平台未运行。
+随包 Node：`node apps/desktop/scripts/node-runtime.mjs stage <目录>` 下载固定版本、校验归档摘要并在清空环境下执行校验；打包时 afterPack 对最终制品再做同样的执行校验（清单必须含该文件与版本）。以 `MAGI_EXTENSION_NODE` 指向该 Node 运行 `cargo test -p magi-extension-host --test host` 与 `cargo test -p magi-daemon --lib extension` 已在 macOS 通过；`input` 的 advise、`model.request` 的 advise 和 `subagent.spawn` 的 advise 仍按协议明确拒绝；macOS 以外平台未运行。
 
-[插件系统设计](plugin-system-requirements-design.md)第 12 节定义了完整的验收面，除上述入口外目前没有对应的脚本或测试命令，不能把下列条目当作已有入口；协议层验收清单见[扩展协议 v1](extension-protocol-v1.md#13-一致性验收协议层)。`test:electron-plugins` 原有的 SDK 1 插件段（工具/命令、升级排空与数据转换、插件中心安装）已随 QuickJS 删除，现仅保留工作区导航与 MCP 验收；受信 Node 扩展在发行包中的真实验收尚未接入。
+[插件系统设计](plugin-system-requirements-design.md)第 12 节定义了完整的验收面。设置 `MAGI_PLUGIN_TEST_APP=<Magi.app 路径>` 可让它改为启动发行包内的 daemon，只使用随包 Node。`npm run test:local-plugins` 会启动独立状态目录的真实 daemon、构建并安装临时 Node 插件，覆盖预览、授权、input guard、资源/设置、模型/凭据/快照/blob/通知、直接文件/网络/进程、用户提问、无 Task 服务拒绝、作业调度、停用、升级数据重置和卸载；它不接管已有 daemon。`npm run test:local-plugins-ui` 在同一纵向流程中再启动真实 Electron Chromium，覆盖设置页创建计划、目标会话／预算／回执展示和 390px 深色视口无横向溢出；它仍不是正式安装包验收。`test:electron-plugins` 仍只验收工作区导航与内置 MCP；Windows 运行验收按当前平台条件后置。协议层验收清单见[扩展协议 v1](extension-protocol-v1.md#13-一致性验收协议层)。
 
 实现该能力时必须新增并在本文登记的验证面：
 
@@ -295,9 +295,9 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 - 钩子模式：guard 在异常、超时、熔断、宿主缺失时阻止受影响动作，advise 失败保留原生行为并提示，模式变更触发重新授权；
 - 提案与裁决：工具入参被改写后在账本、路径与并发规划、权限和审批之前生效，用户批准的是最终内容，`deny` 不被翻转；
 - 取消与故障：任务取消传播到扩展调用，迟到响应按实例代次拒绝，宿主崩溃只影响该插件；
-- 迁移与恢复：迁移只经暂存区提交，提交前失败不改变旧版本与数据，备份完整性校验，显式恢复不触碰外部状态；
+- 升级与恢复：dataSchemaVersion 变化时预览明确 dataReset；只清空当前插件数据，提交失败保留恢复日志且关闭准入，不恢复迁移 VM；
 - 缓存：`extension_rewrite` 归因、拒绝路径与重启重建一致（见[缓存架构](prompt-cache-lineage-architecture.md)）；
-- 翻译：pi 固定版本的一致性报告，不支持的 API 在构建期失败，报告分母为固定样本与必需断言。
+- 翻译（后期，不属于当前验收）：pi／DSH 固定版本的一致性报告，不支持的 API 在构建期失败，报告分母为固定样本与必需断言。
 
 ### Executor 能力与历史恢复
 

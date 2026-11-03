@@ -12,45 +12,18 @@ fn resource_updates_are_versioned_and_conflicts_are_explicit() {
     let dir = tempdir().unwrap();
     let mut store = PluginResourceStore::open(dir.path().join("resources.json")).unwrap();
     let first = store
-        .write(
-            "acme.dashboard",
-            "application",
-            "board",
-            0,
-            json!({"items":[]}),
-        )
+        .write("acme.dashboard", "board", 0, json!({"items":[]}))
         .unwrap();
     assert_eq!(first.version, 1);
     let error = store
-        .write(
-            "acme.dashboard",
-            "application",
-            "board",
-            0,
-            json!({"items":[1]}),
-        )
+        .write("acme.dashboard", "board", 0, json!({"items":[1]}))
         .unwrap_err();
     assert!(error.to_string().contains("expected=0"));
     let second = store
-        .write(
-            "acme.dashboard",
-            "application",
-            "board",
-            1,
-            json!({"items":[1]}),
-        )
+        .write("acme.dashboard", "board", 1, json!({"items":[1]}))
         .unwrap();
-    assert_eq!(
-        store
-            .read("acme.dashboard", "application", "board")
-            .unwrap(),
-        second
-    );
-    assert!(
-        store
-            .read("acme.dashboard", "application", "other")
-            .is_none()
-    );
+    assert_eq!(store.read("acme.dashboard", "board").unwrap(), second);
+    assert!(store.read("acme.dashboard", "other").is_none());
 }
 
 #[test]
@@ -103,19 +76,17 @@ fn failed_persistence_does_not_advance_the_in_memory_resource_version() {
     let mut store = PluginResourceStore::open(directory.join("resources.json")).unwrap();
     std::fs::remove_dir_all(&directory).unwrap();
     let error = store
-        .write("acme.dashboard", "application", "board", 0, json!({"n": 1}))
+        .write("acme.dashboard", "board", 0, json!({"n": 1}))
         .unwrap_err();
     assert!(error.to_string().contains("资源存储失败"), "{error}");
     assert!(
-        store
-            .read("acme.dashboard", "application", "board")
-            .is_none(),
+        store.read("acme.dashboard", "board").is_none(),
         "落盘失败的写入不能留在内存快照里"
     );
 
     std::fs::create_dir_all(&directory).unwrap();
     let recovered = store
-        .write("acme.dashboard", "application", "board", 0, json!({"n": 2}))
+        .write("acme.dashboard", "board", 0, json!({"n": 2}))
         .unwrap();
     assert_eq!(recovered.version, 1, "失败写入不得消耗版本号");
 }
@@ -126,7 +97,7 @@ fn dashboard_package() -> PluginPackage {
         "id": "acme.dashboard",
         "version": "1.0.0",
         "name": "Dashboard",
-        "description": "", "permissions": [{"kind":"storage","scope":"application","targets":["board"]}],
+        "description": "", "permissions": [{"kind":"storage","targets":["board"]}],
         "dataSchemaVersion": 1,
         "settingsSchema": {"type":"object","additionalProperties":false},
         "contributions": {"resources":[{"id":"board","title":"Board","description":""}]}
@@ -143,10 +114,8 @@ fn dashboard_package() -> PluginPackage {
 }
 
 #[test]
-fn manager_resource_access_is_declared_authorized_and_scoped_in_one_place() {
-    use magi_plugin_system::{
-        PluginError, PluginPermission, PluginPermissionKind, PluginScopeKind,
-    };
+fn manager_resource_access_is_declared_authorized_in_one_place() {
+    use magi_plugin_system::{PluginError, PluginPermission, PluginPermissionKind};
 
     let dir = tempdir().unwrap();
     let mut manager = PluginManager::open(dir.path()).unwrap();
@@ -158,55 +127,44 @@ fn manager_resource_access_is_declared_authorized_and_scoped_in_one_place() {
             },
         )
         .unwrap();
-    let scope = "application";
     // 未激活：隐藏入口之外，直接调用也被拒绝。
     assert!(matches!(
-        manager.read_resource("acme.dashboard", scope, "board"),
+        manager.read_resource("acme.dashboard", "board"),
         Err(PluginError::NotAuthorized(_))
     ));
-    manager.enable("acme.dashboard", scope).unwrap();
+    manager.enable("acme.dashboard").unwrap();
     manager
         .authorize(
             "acme.dashboard",
-            scope,
             vec![PluginPermission {
                 kind: PluginPermissionKind::Storage,
-                scope: PluginScopeKind::Application,
+
                 targets: vec!["board".into()],
             }],
         )
         .unwrap();
-    manager.activate("acme.dashboard", scope).unwrap();
+    manager.activate("acme.dashboard").unwrap();
 
     assert!(matches!(
-        manager.read_resource("acme.dashboard", scope, "forged"),
+        manager.read_resource("acme.dashboard", "forged"),
         Err(PluginError::NotFound(_))
     ));
     // 尚未写入的资源读到版本 0，调用方据此完成首次提交。
-    let empty = manager
-        .read_resource("acme.dashboard", scope, "board")
-        .unwrap();
+    let empty = manager.read_resource("acme.dashboard", "board").unwrap();
     assert_eq!((empty.version, empty.value), (0, serde_json::Value::Null));
     let first = manager
-        .write_resource(
-            "acme.dashboard",
-            scope,
-            "board",
-            empty.version,
-            json!({"n": 1}),
-        )
+        .write_resource("acme.dashboard", "board", empty.version, json!({"n": 1}))
         .unwrap();
     assert_eq!(first.version, 1);
     assert!(
         manager
-            .write_resource("acme.dashboard", scope, "board", 0, json!({"n": 2}))
+            .write_resource("acme.dashboard", "board", 0, json!({"n": 2}))
             .is_err(),
         "过期版本必须明确冲突"
     );
-    // 插件全局生效：工作区作用域键不是合法的资源作用域。
-    assert!(
-        manager
-            .read_resource("acme.dashboard", "workspace:two", "board")
-            .is_err()
+    // 插件全局只有一份资源，不随调用发生在哪个工作区而复制。
+    assert_eq!(
+        manager.read_resource("acme.dashboard", "board").unwrap(),
+        first
     );
 }

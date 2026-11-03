@@ -1469,6 +1469,7 @@ pub struct ApiState {
     pub tunnel_manager: crate::tunnel::TunnelManager,
     /// 插件安装、授权和生命周期的唯一 daemon 领域服务。
     pub plugin_manager: Arc<Mutex<magi_plugin_system::PluginManager>>,
+    pub(crate) plugin_jobs: Arc<crate::plugin_jobs::PluginJobs>,
     /// 升级时执行插件数据格式转换的 Worker 执行者；未装配时需要转换的升级被拒绝。
     pub(crate) mcp_service: Arc<crate::mcp_runtime::McpServiceRuntime>,
     pub snapshot_manager: Arc<SnapshotManager>,
@@ -2045,6 +2046,13 @@ pub trait ExtensionStatusSource: Send + Sync {
         &self,
         plugin_id: &str,
     ) -> Option<magi_app_server_protocol::generated::PluginRuntimeStatus>;
+    /// 生命周期切换前关闭宿主准入并等待进程树退出；guard 登记保持到提交后的收敛。
+    fn quiesce(
+        &self,
+        _plugin_id: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        Box::pin(async { Err("扩展宿主未提供生命周期停止端口".into()) })
+    }
 }
 
 impl ApiState {
@@ -2233,6 +2241,12 @@ impl ApiState {
                 .expect("in-memory ApiState plugin manager should initialize"),
             )),
             mcp_service: Arc::new(crate::mcp_runtime::McpServiceRuntime::in_memory()),
+            plugin_jobs: Arc::new(crate::plugin_jobs::PluginJobs::open(
+                std::env::temp_dir().join(format!(
+                    "magi-jobs-{}.json",
+                    magi_core::EventId::unique("test")
+                )),
+            )),
             snapshot_manager: Arc::new(SnapshotManager::new()),
             conversation_registry,
             turn_coordinator,
@@ -3689,6 +3703,9 @@ impl ApiState {
             .map(load_browser_authority)
             .transpose();
         if let Some(state_root) = persistence.state_root() {
+            self.plugin_jobs = Arc::new(crate::plugin_jobs::PluginJobs::open(
+                state_root.join("plugin-jobs.json"),
+            ));
             self.mcp_service = Arc::new(crate::mcp_runtime::McpServiceRuntime::load(
                 state_root.join("mcp-server.json"),
             ));
@@ -3738,27 +3755,14 @@ impl ApiState {
         self
     }
 
-    /// 按已保存的配置恢复 MCP 服务监听（daemon 启动时调用）。MCP 服务是原生功能，
-    /// 只由自己的开关控制，不依赖任何插件状态。
-    ///
-    /// 旧版本把它显示为内置插件：若退役的旧记录在退役前并未激活，则旧语义下服务本就不会运行，
-    /// 这里先把持久开关关闭，不让升级悄悄开启一个对外监听。
+    pub fn start_plugin_jobs(&self) {
+        self.plugin_jobs.start(self.clone());
+    }
+
+    /// 按原生 MCP 自己持久化的开关恢复监听，不读取或依赖插件安装/激活状态。
     pub fn start_mcp_service_if_enabled(&self) {
         let state = self.clone();
-        let was_inactive = self
-            .plugin_manager
-            .lock()
-            .map(|manager| {
-                manager
-                    .retired_builtins()
-                    .iter()
-                    .any(|retired| retired.id == "magi.mcp-server" && !retired.was_active)
-            })
-            .unwrap_or(false);
         tokio::spawn(async move {
-            if was_inactive {
-                state.mcp_service.disable_persisted().await;
-            }
             state.mcp_service.start_if_enabled(&state).await;
             state.mcp_service.external_turns.start_maintenance(&state);
         });
@@ -5612,11 +5616,7 @@ impl ApiState {
                 let manifests = manager
                     .lock()
                     .ok()
-                    .and_then(|manager| {
-                        manager
-                            .manifests_for_scope(magi_plugin_system::APPLICATION_SCOPE)
-                            .ok()
-                    })
+                    .and_then(|manager| manager.manifests().ok())
                     .unwrap_or_default();
                 manifests
                     .into_iter()

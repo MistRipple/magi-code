@@ -1,12 +1,16 @@
 //! 与真实 Node 进程的端到端验收：握手、注册、钩子裁决、超时取消、崩溃与观察投递。
 
 use magi_extension_host::{
+    HostService,
     bus::{BusPolicy, ExtensionBus, HookContext, TraceOutcome, Verdict},
     instance::{LaunchConfig, LaunchError, launch},
+    peer::BoxFuture,
+    protocol::{ErrorKind, RpcError},
     protocol::{HookMode, HookRegistration},
     supervisor::{RestartPolicy, SupervisorState, supervise},
 };
 use magi_process::ManagedProcessGroup;
+use serde_json::Value;
 use serde_json::json;
 use std::{
     path::{Path, PathBuf},
@@ -80,6 +84,63 @@ async fn up(env: &Env, bus: &ExtensionBus) -> Arc<magi_extension_host::instance:
 
 fn ctx() -> HookContext {
     HookContext::new("inv_1")
+}
+
+struct MockService {
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl HostService for MockService {
+    fn request_with_identity(
+        &self,
+        plugin_id: String,
+        method: String,
+        params: Value,
+    ) -> BoxFuture<Result<Value, RpcError>> {
+        let calls = Arc::clone(&self.calls);
+        Box::pin(async move {
+            calls.lock().unwrap().push(format!("{plugin_id}:{method}"));
+            match method.as_str() {
+                "resource.read" => Ok(json!({"version": 0, "value": null})),
+                "resource.write" => Ok(
+                    json!({"version": params["expectedVersion"].as_u64().unwrap_or(0) + 1, "value": params["value"]}),
+                ),
+                "settings.read" => Ok(json!({"version": 2, "value": {"enabled": true}})),
+                _ => Err(RpcError::new(ErrorKind::MethodNotFound, method)),
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn node_extension_can_call_declared_daemon_resource_and_settings_services() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("index.mjs");
+    std::fs::write(
+        &entry,
+        r#"
+export default async function activate(api) {
+  const resource = await api.resource.read('notes');
+  await api.resource.write('notes', resource.version, { text: 'ok' });
+  const settings = await api.settings.read();
+  if (settings.value.enabled !== true || api.configRevision !== 2) throw new Error('bad settings');
+}
+"#,
+    )
+    .unwrap();
+    let mut config = LaunchConfig::new(node(), runtime(), entry, dir.path().join("sock"));
+    config.plugin_id = "acme.services".into();
+    config.version = "1.0.0".into();
+    config.digest = "sha256:services".into();
+    config.service = Some(Arc::new(MockService {
+        calls: Arc::default(),
+    }));
+    config.config = json!({"enabled": false});
+    config.config_revision = 2;
+    let instance = launch(&ManagedProcessGroup::new(), config, 1)
+        .await
+        .unwrap();
+    instance.stop().await;
 }
 
 #[tokio::test]
@@ -435,7 +496,12 @@ async fn tools_are_invoked_through_the_real_host_and_failures_stay_tool_results(
         .await
         .unwrap();
     assert_eq!(ok["output"]["echoed"], json!({"a": 1}));
-    assert_eq!(ok["output"]["invocation"], "inv-1");
+    assert!(
+        ok["output"]["invocation"]
+            .as_str()
+            .unwrap()
+            .starts_with("acme.guard:1:")
+    );
     let failed = instance
         .invoke_tool(
             "boom",
@@ -553,4 +619,134 @@ async fn registering_an_unapproved_tool_fails_activation() {
     bus.register_plugin("acme.guard", &[]).unwrap();
     let error = launch(&env.group, env.config.clone(), 1).await.err();
     assert!(error.is_some(), "未获批的工具注册必须使激活失败");
+}
+
+#[tokio::test]
+async fn concurrent_calls_with_the_same_caller_identity_cancel_independently() {
+    use magi_extension_host::protocol::ErrorKind;
+    let mut env = env("tools", Vec::new());
+    env.config.tools = vec!["echo".into(), "slow".into(), "boom".into()];
+    env.config.commands = vec!["hello".into(), "bad".into(), "slow-cmd".into()];
+    let bus = ExtensionBus::new(BusPolicy::default());
+    let instance = up(&env, &bus).await;
+    let mut calls = Vec::new();
+    let mut cancellations = Vec::new();
+    for _ in 0..2 {
+        let (cancel, waiting) = tokio::sync::oneshot::channel::<()>();
+        cancellations.push(cancel);
+        let instance = Arc::clone(&instance);
+        calls.push(tokio::spawn(async move {
+            instance
+                .invoke_tool(
+                    "slow",
+                    json!({}),
+                    json!({"invocationId":"same-caller"}),
+                    Duration::from_secs(5),
+                    async {
+                        let _ = waiting.await;
+                    },
+                )
+                .await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    cancellations.remove(0).send(()).unwrap();
+    assert_eq!(
+        calls.remove(0).await.unwrap().unwrap_err().kind(),
+        ErrorKind::Cancelled
+    );
+    assert!(!calls[0].is_finished(), "取消第一个调用不得结束第二个调用");
+    cancellations.remove(0).send(()).unwrap();
+    assert_eq!(
+        calls.remove(0).await.unwrap().unwrap_err().kind(),
+        ErrorKind::Cancelled
+    );
+    instance.stop().await;
+}
+
+#[tokio::test]
+async fn supervisor_reclaims_a_live_host_whose_event_loop_is_stuck() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("spin.mjs");
+    std::fs::write(&entry, "export default async function(api) { await api.on('tool.call', () => { while (true) {} }); }").unwrap();
+    let mut config = LaunchConfig::new(node(), runtime(), entry, dir.path().join("sock"));
+    config.plugin_id = "acme.stuck".into();
+    config.hooks = vec![hook("tool.call", HookMode::Guard, Some(50))];
+    let bus = Arc::new(ExtensionBus::default());
+    bus.register_plugin("acme.stuck", &config.hooks).unwrap();
+    let group = ManagedProcessGroup::new();
+    let supervisor = supervise(
+        group,
+        Arc::clone(&bus),
+        config,
+        RestartPolicy {
+            max_crashes: 0,
+            ..RestartPolicy::default()
+        },
+    );
+    supervisor
+        .wait_for(|state| matches!(state, SupervisorState::Running { .. }))
+        .await;
+    let outcome = bus.invoke("tool.call", &ctx(), json!({})).await.unwrap();
+    assert!(matches!(outcome.verdict, Verdict::Blocked { .. }));
+    let state = tokio::time::timeout(
+        Duration::from_secs(15),
+        supervisor.wait_for(|state| matches!(state, SupervisorState::Failed(_))),
+    )
+    .await
+    .expect("卡死宿主必须在有限时间内回收");
+    assert!(matches!(state, SupervisorState::Failed(_)));
+    assert!(bus.instance("acme.stuck").is_none());
+    supervisor.stop().await;
+}
+
+#[tokio::test]
+async fn job_runs_use_signed_owners_and_enforce_model_budgets() {
+    struct ModelService {
+        calls: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+    impl HostService for ModelService {
+        fn request_with_identity(
+            &self,
+            _: String,
+            method: String,
+            params: Value,
+        ) -> BoxFuture<Result<Value, RpcError>> {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                assert_eq!(method, "model.invoke");
+                calls.lock().unwrap().push(params);
+                Ok(json!({"content":"ok"}))
+            })
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("index.mjs");
+    std::fs::write(&entry,r#"export default async api => {
+        await api.command('run', async (_,ctx) => {
+            if(ctx.job.jobId !== 'signed-job') throw Error('missing job');
+            const first=await api.model.invoke({prompt:'hello'});
+            const denied=await Promise.allSettled([api.model.invoke({prompt:'two'}),api.model.invoke({prompt:'three'})]);
+            if(denied.some(v=>v.status!=='rejected' || v.reason.kind!=='PermissionDenied')) throw Error('budget bypass');
+            return first.content;
+        });
+    }"#).unwrap();
+    let calls = Arc::new(std::sync::Mutex::new(vec![]));
+    let mut config = LaunchConfig::new(node(), runtime(), entry, dir.path().join("sock"));
+    config.plugin_id = "acme.jobs".into();
+    config.commands = vec!["run".into()];
+    config.service = Some(Arc::new(ModelService {
+        calls: calls.clone(),
+    }));
+    let group = ManagedProcessGroup::new();
+    let host = launch(&group, config, 1).await.unwrap();
+    let response=host.invoke_command("run",json!({"text":""}),json!({"owner":{"sessionId":"signed-session","turnId":"signed-turn"},"job":{"jobId":"signed-job","scheduleId":"plan","budget":{"maxModelCalls":1,"maxOutputTokens":123,"timeoutMs":5000}}}),Duration::from_secs(5),std::future::pending()).await.unwrap();
+    assert_eq!(response["content"], "ok");
+    {
+        let received = calls.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["maxOutputTokens"], 123);
+        assert_eq!(received[0]["_context"]["owner"]["turnId"], "signed-turn");
+    }
+    host.stop().await;
 }

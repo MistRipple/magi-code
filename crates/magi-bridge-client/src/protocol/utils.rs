@@ -412,20 +412,35 @@ mod tests {
 
     #[test]
     fn openai_and_deepseek_cache_usage_share_streaming_and_non_streaming_semantics() {
-        use crate::protocol::streaming::{parse_stream_event, SseEvent};
         use crate::protocol::adapter::ProviderFamily;
+        use crate::protocol::streaming::{SseEvent, parse_stream_event};
         for (metadata, expected) in [
-            (serde_json::json!({"prompt_cache_hit_tokens":60,"prompt_cache_miss_tokens":40}), Some(60)),
-            (serde_json::json!({"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":100}), Some(0)),
-            (serde_json::json!({"prompt_tokens_details":{"cached_tokens":30},"prompt_cache_hit_tokens":60}), Some(30)),
+            (
+                serde_json::json!({"prompt_cache_hit_tokens":60,"prompt_cache_miss_tokens":40}),
+                Some(60),
+            ),
+            (
+                serde_json::json!({"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":100}),
+                Some(0),
+            ),
+            (
+                serde_json::json!({"prompt_tokens_details":{"cached_tokens":30},"prompt_cache_hit_tokens":60}),
+                Some(30),
+            ),
             (serde_json::json!({}), None),
         ] {
             let mut usage = metadata;
             usage["prompt_tokens"] = serde_json::json!(100);
             usage["completion_tokens"] = serde_json::json!(10);
             let direct = parse_openai_usage(&usage);
-            let event = SseEvent { event_type: None, data: serde_json::json!({"choices":[],"usage":usage}).to_string() };
-            let streamed = parse_stream_event(ProviderFamily::OpenAiChat, &event).into_iter().find_map(|chunk| chunk.usage).unwrap();
+            let event = SseEvent {
+                event_type: None,
+                data: serde_json::json!({"choices":[],"usage":usage}).to_string(),
+            };
+            let streamed = parse_stream_event(ProviderFamily::OpenAiChat, &event)
+                .into_iter()
+                .find_map(|chunk| chunk.usage)
+                .unwrap();
             for parsed in [direct, streamed] {
                 assert_eq!(parsed.input_tokens, 100);
                 assert_eq!(parsed.output_tokens, 10);

@@ -11,9 +11,6 @@ import type {
   PluginManifest,
 } from '../shared/app-server-protocol.generated';
 
-/** 插件全局生效：daemon 只有这一个作用域键，启用、授权和资源都归在它名下。 */
-export const APPLICATION_PLUGIN_SCOPE = 'application';
-
 export type PluginManifestProjection = PluginManifest;
 
 export type InstalledPluginProjection = PluginInstalled;
@@ -86,7 +83,7 @@ export async function previewPluginCandidate(candidate: PluginCandidate): Promis
   return await response.json() as PluginCandidatePreview;
 }
 
-/** 确认后安装或升级：只接受与预览摘要一致的包。升级由 daemon 先排空全部作用域再切换，新包须重新授权后激活。 */
+/** 确认后安装或升级：只接受与预览摘要一致的包。升级由 daemon 先排空插件再切换，新包须重新授权后激活。 */
 export async function applyPluginCandidate(candidate: PluginCandidate, preview: PluginCandidatePreview): Promise<void> {
   const upgrade = preview.operation === 'upgrade';
   const response = await pluginRequest(upgrade ? '/api/plugins/upgrade' : '/api/plugins/install', {
@@ -138,7 +135,7 @@ export async function authorizeAndActivatePlugin(pluginId: string, manifest: Plu
     const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/${action}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ scope: APPLICATION_PLUGIN_SCOPE, ...body }),
+      body: JSON.stringify(body),
     });
     if (!response.ok) throw await pluginFailure(failure, response);
   };
@@ -152,7 +149,7 @@ async function changePluginActivation(pluginId: string, action: 'deactivate' | '
   const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/${action}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ scope: APPLICATION_PLUGIN_SCOPE }),
+    body: JSON.stringify({}),
   });
   if (!response.ok) throw await pluginFailure(action === 'deactivate' ? i18n.t('plugins.error.deactivate') : i18n.t('plugins.error.disable'), response);
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
@@ -172,17 +169,17 @@ export async function uninstallPlugin(pluginId: string): Promise<void> {
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
 }
 
-export async function loadActivePluginManifests(scope = APPLICATION_PLUGIN_SCOPE): Promise<PluginManifestProjection[]> {
+export async function loadActivePluginManifests(): Promise<PluginManifestProjection[]> {
   const response = await getTransport().request(
-    agentUrl(`/api/plugins/manifests?scope=${encodeURIComponent(scope)}`),
+    agentUrl(`/api/plugins/manifests`),
   );
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.manifest'), response);
   const payload = await response.json() as unknown;
   return Array.isArray(payload) ? payload as PluginManifestProjection[] : [];
 }
 
-export async function loadActivePluginCommands(scope = APPLICATION_PLUGIN_SCOPE): Promise<PluginCommandProjection[]> {
-  const response = await pluginRequest(`/api/plugins/commands?scope=${encodeURIComponent(scope)}`);
+export async function loadActivePluginCommands(): Promise<PluginCommandProjection[]> {
+  const response = await pluginRequest(`/api/plugins/commands`);
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.commands'), response);
   const payload = await response.json() as unknown;
   return Array.isArray(payload) ? payload as PluginCommandProjection[] : [];
@@ -191,14 +188,13 @@ export async function loadActivePluginCommands(scope = APPLICATION_PLUGIN_SCOPE)
 export function subscribePluginResource(
   pluginId: string,
   resourceId: string,
-  scope: string,
   onUpdate: (resource: { version: number; value: unknown }) => void,
   onError?: (error: unknown) => void,
 ): () => void {
   let closed = false;
   const connection = getTransport().connectEventStream(
     agentUrl(
-      `/api/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceId)}/events?scope=${encodeURIComponent(scope)}`,
+      `/api/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceId)}/events`,
     ),
     {
       onOpen() {},
@@ -212,7 +208,7 @@ export function subscribePluginResource(
             return;
           }
           if (event.reset === true) {
-            void readPluginResource(pluginId, resourceId, scope)
+            void readPluginResource(pluginId, resourceId)
               .then((resource) => {
                 if (closed) return;
                 const snapshot = resource as { version?: unknown; value?: unknown };
@@ -244,10 +240,9 @@ export function subscribePluginResource(
 export async function readPluginResource(
   pluginId: string,
   resourceId: string,
-  scope: string,
 ): Promise<unknown> {
   const response = await pluginRequest(
-    `/api/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceId)}?scope=${encodeURIComponent(scope)}`,
+    `/api/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceId)}`,
   );
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.readResource'), response);
   return await response.json();
@@ -256,12 +251,11 @@ export async function readPluginResource(
 export async function writePluginResource(
   pluginId: string,
   resourceId: string,
-  scope: string,
   expectedVersion: number,
   value: unknown,
 ): Promise<unknown> {
   const response = await pluginRequest(
-    `/api/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceId)}?scope=${encodeURIComponent(scope)}`,
+    `/api/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceId)}`,
     {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
@@ -272,9 +266,9 @@ export async function writePluginResource(
   return await response.json();
 }
 
-export async function readPluginSettings(pluginId: string, scope: string): Promise<unknown> {
+export async function readPluginSettings(pluginId: string): Promise<unknown> {
   const response = await pluginRequest(
-    `/api/plugins/${encodeURIComponent(pluginId)}/settings?scope=${encodeURIComponent(scope)}`,
+    `/api/plugins/${encodeURIComponent(pluginId)}/settings`,
   );
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.readSettings'), response);
   return await response.json();
@@ -282,12 +276,11 @@ export async function readPluginSettings(pluginId: string, scope: string): Promi
 
 export async function writePluginSettings(
   pluginId: string,
-  scope: string,
   expectedVersion: number,
   value: unknown,
 ): Promise<unknown> {
   const response = await pluginRequest(
-    `/api/plugins/${encodeURIComponent(pluginId)}/settings?scope=${encodeURIComponent(scope)}`,
+    `/api/plugins/${encodeURIComponent(pluginId)}/settings`,
     {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
@@ -296,4 +289,18 @@ export async function writePluginSettings(
   );
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.writeSettings'), response);
   return await response.json();
+}
+
+export async function listPluginJobs(pluginId: string): Promise<import('../shared/app-server-protocol.generated').PluginJobSchedule[]> {
+  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/jobs`);
+  if (!response.ok) throw await pluginFailure(i18n.t('settings.plugins.jobs.load'), response);
+  return response.json();
+}
+export async function createPluginJob(pluginId: string, request: import('../shared/app-server-protocol.generated').PluginJobRequest): Promise<void> {
+  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/jobs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request) });
+  if (!response.ok) throw await pluginFailure(i18n.t('settings.plugins.jobs.create'), response);
+}
+export async function cancelPluginJob(pluginId: string, jobId: string): Promise<void> {
+  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+  if (!response.ok) throw await pluginFailure(i18n.t('settings.plugins.jobs.cancel'), response);
 }

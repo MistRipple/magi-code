@@ -270,7 +270,7 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
         return Err(invalid("插件清单违反版本、字段或大小合同"));
     }
     if manifest.sdk_version != 2 || manifest.data_schema_version < 1 {
-        return Err(invalid("仅支持 SDK 1，数据格式版本必须为正整数"));
+        return Err(invalid("仅支持 SDK 2，数据格式版本必须为正整数"));
     }
     if manifest.id.len() > 96
         || manifest.id.split('.').count() < 2
@@ -390,23 +390,24 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
         if surface.background_inference && !surface.keep_mounted {
             return Err(invalid("后台推理要求浏览器 surface 保持挂载"));
         }
-        // 挂载、权限与释放由 BrowserAuthority 执行；贡献必须同时申请同作用域的 browser 权限。
+        // 挂载、权限与释放由 BrowserAuthority 执行；贡献必须同时申请对应 surface 的 browser 权限。
         let authorized = manifest.permissions.iter().any(|permission| {
             permission.kind == PluginPermissionKind::Browser
-                && permission.scope == surface.scope
                 && permission
                     .targets
                     .iter()
                     .any(|target| target == &surface.id)
         });
         if !authorized {
-            return Err(invalid("浏览器 surface 必须声明对应作用域的 browser 权限"));
+            return Err(invalid(
+                "浏览器 surface 必须声明对应 Browser surface 的 browser 权限",
+            ));
         }
     }
     for item in &c.resources {
         check(&item.id, &item.title, &item.description)?;
     }
-    // 只开关宿主能力的第一方插件（如 MCP 服务）没有贡献，但必须声明它所需的权限。
+    // 只有声明钩子的扩展可不提供 UI/工具贡献；Magi MCP 服务属于内置功能，不经过此入口。
     if ids.len() > 128 || (ids.is_empty() && manifest.permissions.is_empty()) {
         return Err(invalid(
             "插件需要至少一项贡献或权限声明，且贡献不超过 128 项",

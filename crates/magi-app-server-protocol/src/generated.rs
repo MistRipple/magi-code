@@ -1484,13 +1484,6 @@ pub type ServerResponse = JsonRpcServerResponse;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum PluginScopeKind {
-    #[serde(rename = "application")]
-    Application,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum PluginPermissionKind {
     #[serde(rename = "storage")]
     Storage,
@@ -1510,7 +1503,6 @@ pub enum PluginPermissionKind {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginPermission {
     pub kind: PluginPermissionKind,
-    pub scope: PluginScopeKind,
     pub targets: Vec<String>,
 }
 
@@ -1583,7 +1575,6 @@ pub struct PluginBrowserSurfaceContribution {
     pub id: String,
     pub title: String,
     pub description: String,
-    pub scope: PluginScopeKind,
     pub persistence: PluginSurfacePersistence,
     #[serde(rename = "keepMounted")]
     pub keep_mounted: bool,
@@ -1677,14 +1668,7 @@ pub enum JsonRpcMessage {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginScopeRequest {
-    pub scope: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginAuthorizeRequest {
-    pub scope: String,
     pub grants: Vec<PluginPermission>,
 }
 
@@ -1740,13 +1724,6 @@ pub struct PluginCandidatePreview {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginScopeGrant {
-    pub scope: String,
-    pub permissions: Vec<PluginPermission>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PluginSourceKind {
     #[serde(rename = "center")]
@@ -1771,15 +1748,13 @@ pub struct PluginSourceProjection {
 pub struct PluginInstalled {
     pub manifest: PluginManifest,
     pub digest: String,
-    #[serde(rename = "enabledScopes")]
-    pub enabled_scopes: Vec<String>,
-    #[serde(rename = "activeScopes")]
-    pub active_scopes: Vec<String>,
-    pub grants: Vec<PluginScopeGrant>,
+    pub grants: Vec<PluginPermission>,
     pub source: PluginSourceProjection,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<PluginRuntimeStatus>,
+    pub enabled: bool,
+    pub active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3295,4 +3270,69 @@ pub struct ModelResponseTiming {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "textOutputTokens")]
     pub text_output_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginActivationRequest {}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginJobBudget {
+    #[serde(rename = "maxModelCalls")]
+    pub max_model_calls: u16,
+    #[serde(rename = "maxOutputTokens")]
+    pub max_output_tokens: u16,
+    #[serde(rename = "timeoutMs")]
+    pub timeout_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginJobContext {
+    #[serde(rename = "jobId")]
+    pub job_id: String,
+    #[serde(rename = "scheduleId")]
+    pub schedule_id: String,
+    pub budget: PluginJobBudget,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginJobRequest {
+    #[serde(rename = "commandId")]
+    pub command_id: String,
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub text: String,
+    #[serde(rename = "runAt")]
+    pub run_at: i64,
+    #[serde(default)]
+    #[serde(rename = "intervalMs")]
+    pub interval_ms: Option<i64>,
+    pub budget: PluginJobBudget,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginJobSchedule {
+    pub id: String,
+    #[serde(rename = "pluginId")]
+    pub plugin_id: String,
+    pub digest: String,
+    pub request: PluginJobRequest,
+    pub enabled: bool,
+    #[serde(rename = "nextRunAt")]
+    pub next_run_at: i64,
+    #[serde(rename = "runNumber")]
+    pub run_number: i64,
+    #[serde(default)]
+    #[serde(rename = "pendingRequestId")]
+    pub pending_request_id: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "lastTurnId")]
+    pub last_turn_id: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "lastOutcome")]
+    pub last_outcome: Option<String>,
 }

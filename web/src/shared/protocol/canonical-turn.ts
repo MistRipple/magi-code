@@ -20,7 +20,7 @@ export type CanonicalTurnEventKind = 'turn_started' | 'turn_item_upsert' | 'turn
 
 /** canonical ModelStep 的展示投影；不保存请求正文或建立另一份消费状态。 */
 export type CanonicalModelStep = Pick<ModelStep,
-  'stepId' | 'status' | 'purpose' | 'inputRequestIds' | 'startedAt' | 'settledAt'>;
+  'stepId' | 'status' | 'purpose' | 'inputRequestIds' | 'startedAt' | 'settledAt' | 'promptFrame'>;
 
 export interface CanonicalTurnVisibility {
   renderable: boolean;
@@ -150,6 +150,9 @@ function normalizeCanonicalModelStep(value: unknown, path: string): CanonicalMod
     inputRequestIds: [...record.inputRequestIds] as string[],
     startedAt,
     settledAt: settledAt ?? null,
+    ...(record.promptFrame && typeof record.promptFrame === 'object'
+      ? { promptFrame: record.promptFrame as ModelStep['promptFrame'] }
+      : {}),
   };
 }
 

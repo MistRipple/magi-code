@@ -1,6 +1,6 @@
 use magi_plugin_system::{
     PluginError, PluginManager, PluginPackage, PluginPermission, PluginPermissionKind,
-    PluginResourceStore, PluginScopeKind, PluginSource,
+    PluginResourceStore, PluginSource,
 };
 use serde_json::{Value, json};
 use std::{
@@ -12,7 +12,7 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 
 fn manifest(with_permission: bool) -> Value {
     json!({
-        "sdkVersion":2,"id":"acme.lifecycle","version":"1.0.0","name":"Lifecycle","description":"", "permissions": if with_permission { json!([{"kind":"storage","scope":"application","targets":["cache"]}]) } else { json!([]) },
+        "sdkVersion":2,"id":"acme.lifecycle","version":"1.0.0","name":"Lifecycle","description":"", "permissions": if with_permission { json!([{"kind":"storage","targets":["cache"]}]) } else { json!([]) },
         "dataSchemaVersion":1,"settingsSchema":{"type":"object","additionalProperties":false},
         "contributions":{"resources":[{"id":"open","title":"Open","description":""}]}
     })
@@ -46,26 +46,25 @@ fn install_enable_authorize_activate_and_reopen_use_one_immutable_package() {
             },
         )
         .unwrap();
-    assert!(manager.activate("acme.lifecycle", "application").is_err());
-    manager.enable("acme.lifecycle", "application").unwrap();
-    assert!(manager.activate("acme.lifecycle", "application").is_err());
+    assert!(manager.activate("acme.lifecycle").is_err());
+    manager.enable("acme.lifecycle").unwrap();
+    assert!(manager.activate("acme.lifecycle").is_err());
     manager
         .authorize(
             "acme.lifecycle",
-            "application",
             vec![magi_plugin_system::PluginPermission {
                 kind: magi_plugin_system::PluginPermissionKind::Storage,
-                scope: magi_plugin_system::PluginScopeKind::Application,
+
                 targets: vec!["cache".into()],
             }],
         )
         .unwrap();
-    let active = manager.activate("acme.lifecycle", "application").unwrap();
+    let active = manager.activate("acme.lifecycle").unwrap();
     assert_eq!(active.digest, package.digest());
-    assert_eq!(manager.active("application").len(), 1);
-    assert!(manager.disable("acme.lifecycle", "application").is_err());
-    manager.deactivate("acme.lifecycle", "application").unwrap();
-    manager.disable("acme.lifecycle", "application").unwrap();
+    assert_eq!(manager.active().len(), 1);
+    assert!(manager.disable("acme.lifecycle").is_err());
+    manager.deactivate("acme.lifecycle").unwrap();
+    manager.disable("acme.lifecycle").unwrap();
     let reopened = PluginManager::open(root.path()).unwrap();
     assert_eq!(
         reopened.package("acme.lifecycle").unwrap().digest(),
@@ -75,7 +74,7 @@ fn install_enable_authorize_activate_and_reopen_use_one_immutable_package() {
 }
 
 #[test]
-fn lifecycle_rejects_out_of_manifest_grants_and_uninstall_with_enabled_scope() {
+fn lifecycle_rejects_out_of_manifest_grants_and_uninstall_while_enabled() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();
     manager
@@ -88,17 +87,13 @@ fn lifecycle_rejects_out_of_manifest_grants_and_uninstall_with_enabled_scope() {
         .unwrap();
     let grant = magi_plugin_system::PluginPermission {
         kind: magi_plugin_system::PluginPermissionKind::Storage,
-        scope: magi_plugin_system::PluginScopeKind::Application,
+
         targets: vec!["undeclared-resource".into()],
     };
-    assert!(
-        manager
-            .authorize("acme.lifecycle", "application", vec![grant])
-            .is_err()
-    );
-    manager.enable("acme.lifecycle", "application").unwrap();
+    assert!(manager.authorize("acme.lifecycle", vec![grant]).is_err());
+    manager.enable("acme.lifecycle").unwrap();
     assert!(manager.uninstall("acme.lifecycle").is_err());
-    manager.disable("acme.lifecycle", "application").unwrap();
+    manager.disable("acme.lifecycle").unwrap();
     manager.uninstall("acme.lifecycle").unwrap();
     assert!(manager.package("acme.lifecycle").is_err());
 }
@@ -128,7 +123,7 @@ fn version_two() -> PluginPackage {
 fn grant() -> PluginPermission {
     PluginPermission {
         kind: PluginPermissionKind::Storage,
-        scope: PluginScopeKind::Application,
+
         targets: vec!["cache".into()],
     }
 }
@@ -146,34 +141,26 @@ fn upgrade_drains_the_plugin_then_keeps_enablement_but_not_activation_or_grants(
             },
         )
         .unwrap();
-    manager.enable("acme.lifecycle", "application").unwrap();
-    manager
-        .authorize("acme.lifecycle", "application", vec![grant()])
-        .unwrap();
-    manager.activate("acme.lifecycle", "application").unwrap();
+    manager.enable("acme.lifecycle").unwrap();
+    manager.authorize("acme.lifecycle", vec![grant()]).unwrap();
+    manager.activate("acme.lifecycle").unwrap();
     let manager = Arc::new(Mutex::new(manager));
     let second = version_two();
 
-    // 停用排空不能充当整插件升级的准入关闭证明。
-    let single =
-        PluginManager::begin_deactivation(Arc::clone(&manager), "acme.lifecycle", "application")
-            .unwrap();
-    assert!(
-        manager
-            .lock()
-            .unwrap()
-            .upgrade(
-                &second,
-                PluginSource::Local {
-                    name: "second.zip".into()
-                },
-                &single
-            )
-            .is_err()
-    );
+    // 停用和升级都关闭整插件准入，可共享同一个排空凭据。
+    let single = PluginManager::begin_deactivation(Arc::clone(&manager), "acme.lifecycle").unwrap();
+    manager
+        .lock()
+        .unwrap()
+        .upgrade(
+            &second,
+            PluginSource::Local {
+                name: "second.zip".into(),
+            },
+            &single,
+        )
+        .unwrap();
     drop(single);
-
-    upgrade_with_drain(&manager, &second, "second.zip").unwrap();
     let manager = manager.lock().unwrap();
     assert_eq!(manager.state().plugins.len(), 1);
     assert_eq!(
@@ -185,14 +172,10 @@ fn upgrade_drains_the_plugin_then_keeps_enablement_but_not_activation_or_grants(
         "1.1.0"
     );
     let installed = &manager.state().plugins["acme.lifecycle"];
-    assert_eq!(installed.enabled_scopes.len(), 1, "启用意愿跨升级保留");
-    assert!(installed.active_scopes.is_empty(), "新包必须重新激活");
+    assert!(installed.enabled, "启用意愿跨升级保留");
+    assert!(!installed.active, "新包必须重新激活");
     assert!(installed.grants.is_empty(), "授权绑定摘要，不跨版本继承");
-    assert!(
-        !manager
-            .is_active_for_scope("acme.lifecycle", "application")
-            .unwrap()
-    );
+    assert!(!manager.is_active("acme.lifecycle").unwrap());
 }
 
 #[test]
@@ -218,16 +201,14 @@ fn data_schema_change_clears_stored_data_and_is_announced_by_the_preview() {
     let next = package_from_manifest(changed);
 
     // 有持久数据时升级成功，但该插件的数据被清空；预览阶段已标记 data_reset。
-    manager.enable("acme.lifecycle", "application").unwrap();
+    manager.enable("acme.lifecycle").unwrap();
+    manager.authorize("acme.lifecycle", vec![grant()]).unwrap();
+    manager.activate("acme.lifecycle").unwrap();
     manager
-        .authorize("acme.lifecycle", "application", vec![grant()])
+        .write_resource("acme.lifecycle", "cache", 0, json!({"k": 1}))
         .unwrap();
-    manager.activate("acme.lifecycle", "application").unwrap();
-    manager
-        .write_resource("acme.lifecycle", "application", "cache", 0, json!({"k": 1}))
-        .unwrap();
-    manager.deactivate("acme.lifecycle", "application").unwrap();
-    manager.disable("acme.lifecycle", "application").unwrap();
+    manager.deactivate("acme.lifecycle").unwrap();
+    manager.disable("acme.lifecycle").unwrap();
     let manager = Arc::new(Mutex::new(manager));
     assert!(
         manager
@@ -286,24 +267,20 @@ fn upgrade_drain_blocks_activation_until_it_is_released() {
             },
         )
         .unwrap();
-    manager.enable("acme.lifecycle", "application").unwrap();
+    manager.enable("acme.lifecycle").unwrap();
     let manager = Arc::new(Mutex::new(manager));
     let drain = PluginManager::begin_upgrade_drain(Arc::clone(&manager), "acme.lifecycle").unwrap();
     {
         let mut guard = manager.lock().unwrap();
-        assert!(guard.activate("acme.lifecycle", "application").is_err());
-        assert!(guard.enable("acme.lifecycle", "application").is_err());
+        assert!(guard.activate("acme.lifecycle").is_err());
+        assert!(guard.enable("acme.lifecycle").is_err());
     }
     assert!(
         PluginManager::begin_upgrade_drain(Arc::clone(&manager), "acme.lifecycle").is_err(),
         "同一插件不能同时存在两个排空操作"
     );
     drop(drain);
-    manager
-        .lock()
-        .unwrap()
-        .enable("acme.lifecycle", "application")
-        .unwrap();
+    manager.lock().unwrap().enable("acme.lifecycle").unwrap();
 }
 
 #[test]
@@ -394,26 +371,16 @@ fn active_manifests_follow_the_global_activation_state() {
             },
         )
         .unwrap();
-    assert!(
-        manager
-            .manifests_for_scope("application")
-            .unwrap()
-            .is_empty()
-    );
-    manager.enable("acme.lifecycle", "application").unwrap();
-    manager.activate("acme.lifecycle", "application").unwrap();
-    assert_eq!(manager.manifests_for_scope("application").unwrap().len(), 1);
-    manager.deactivate("acme.lifecycle", "application").unwrap();
-    assert!(
-        manager
-            .manifests_for_scope("application")
-            .unwrap()
-            .is_empty()
-    );
+    assert!(manager.manifests().unwrap().is_empty());
+    manager.enable("acme.lifecycle").unwrap();
+    manager.activate("acme.lifecycle").unwrap();
+    assert_eq!(manager.manifests().unwrap().len(), 1);
+    manager.deactivate("acme.lifecycle").unwrap();
+    assert!(manager.manifests().unwrap().is_empty());
 }
 
 #[test]
-fn plugins_are_global_and_reject_workspace_scope_keys() {
+fn plugins_are_global_and_use_one_application_state() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();
     manager
@@ -424,13 +391,9 @@ fn plugins_are_global_and_reject_workspace_scope_keys() {
             },
         )
         .unwrap();
-    assert!(manager.enable("acme.lifecycle", "workspace:one").is_err());
-    assert!(manager.manifests_for_scope("workspace:one").is_err());
-    assert!(
-        manager
-            .is_active_for_scope("acme.lifecycle", "workspace:one")
-            .is_err()
-    );
+    manager.enable("acme.lifecycle").unwrap();
+    assert!(manager.manifests().unwrap().is_empty());
+    assert!(!manager.is_active("acme.lifecycle").unwrap());
 }
 
 #[test]
@@ -446,24 +409,22 @@ fn resource_permission_is_required_for_each_declared_resource() {
             },
         )
         .unwrap();
-    manager.enable("acme.lifecycle", "application").unwrap();
+    manager.enable("acme.lifecycle").unwrap();
     manager
         .authorize(
             "acme.lifecycle",
-            "application",
             vec![magi_plugin_system::PluginPermission {
                 kind: magi_plugin_system::PluginPermissionKind::Storage,
-                scope: magi_plugin_system::PluginScopeKind::Application,
+
                 targets: vec!["cache".into()],
             }],
         )
         .unwrap();
-    manager.activate("acme.lifecycle", "application").unwrap();
+    manager.activate("acme.lifecycle").unwrap();
     assert!(
         manager
             .permission_allowed(
                 "acme.lifecycle",
-                "application",
                 magi_plugin_system::PluginPermissionKind::Storage,
                 "cache",
             )
@@ -473,7 +434,6 @@ fn resource_permission_is_required_for_each_declared_resource() {
         !manager
             .permission_allowed(
                 "acme.lifecycle",
-                "application",
                 magi_plugin_system::PluginPermissionKind::Storage,
                 "other",
             )
@@ -487,8 +447,8 @@ fn activation_requires_every_declared_permission_to_be_granted() {
     let mut manager = PluginManager::open(root.path()).unwrap();
     let package = package_from_manifest(json!({
         "sdkVersion":2,"id":"acme.shared","version":"1.0.0","name":"Shared","description":"", "permissions":[
-            {"kind":"storage","scope":"application","targets":["session"]},
-            {"kind":"storage","scope":"application","targets":["cache"]}
+            {"kind":"storage","targets":["session"]},
+            {"kind":"storage","targets":["cache"]}
         ],
         "dataSchemaVersion":1,"settingsSchema":{"type":"object","additionalProperties":false},
         "contributions":{"resources":[{"id":"open","title":"Open","description":""}]}
@@ -501,29 +461,25 @@ fn activation_requires_every_declared_permission_to_be_granted() {
             },
         )
         .unwrap();
-    manager.enable("acme.shared", "application").unwrap();
+    manager.enable("acme.shared").unwrap();
     let workspace_grant = PluginPermission {
         kind: PluginPermissionKind::Storage,
-        scope: PluginScopeKind::Application,
+
         targets: vec!["cache".into()],
     };
     let application_grant = PluginPermission {
         kind: PluginPermissionKind::Storage,
-        scope: PluginScopeKind::Application,
+
         targets: vec!["session".into()],
     };
     manager
-        .authorize("acme.shared", "application", vec![workspace_grant.clone()])
+        .authorize("acme.shared", vec![workspace_grant.clone()])
         .unwrap();
-    assert!(manager.activate("acme.shared", "application").is_err());
+    assert!(manager.activate("acme.shared").is_err());
     manager
-        .authorize(
-            "acme.shared",
-            "application",
-            vec![workspace_grant, application_grant],
-        )
+        .authorize("acme.shared", vec![workspace_grant, application_grant])
         .unwrap();
-    manager.activate("acme.shared", "application").unwrap();
+    manager.activate("acme.shared").unwrap();
 }
 
 fn package_from_manifest(manifest: Value) -> PluginPackage {
@@ -550,24 +506,18 @@ fn draining_closes_independent_editing_admission() {
             },
         )
         .unwrap();
-    manager.enable("acme.lifecycle", "application").unwrap();
-    manager.activate("acme.lifecycle", "application").unwrap();
+    manager.enable("acme.lifecycle").unwrap();
+    manager.activate("acme.lifecycle").unwrap();
     let manager = Arc::new(Mutex::new(manager));
     let guard = manager.lock().unwrap();
-    assert!(
-        guard
-            .ensure_editing_admitted("acme.lifecycle", "application")
-            .is_ok()
-    );
+    assert!(guard.ensure_editing_admitted("acme.lifecycle").is_ok());
     drop(guard);
-    let drain =
-        PluginManager::begin_deactivation(Arc::clone(&manager), "acme.lifecycle", "application")
-            .unwrap();
+    let drain = PluginManager::begin_deactivation(Arc::clone(&manager), "acme.lifecycle").unwrap();
     assert!(
         manager
             .lock()
             .unwrap()
-            .ensure_editing_admitted("acme.lifecycle", "application")
+            .ensure_editing_admitted("acme.lifecycle")
             .is_err()
     );
     drop(drain);
@@ -576,11 +526,10 @@ fn draining_closes_independent_editing_admission() {
 #[test]
 fn activation_rejects_browser_surface_policies_the_host_cannot_mount() {
     let mut manifest = json!({
-        "sdkVersion":2,"id":"acme.surface","version":"1.0.0","name":"Surface","description":"", "permissions":[{"kind":"browser","scope":"application","targets":["login"]}],
+        "sdkVersion":2,"id":"acme.surface","version":"1.0.0","name":"Surface","description":"", "permissions":[{"kind":"browser","targets":["login"]}],
         "dataSchemaVersion":1,"settingsSchema":{"type":"object","additionalProperties":false},
         "contributions":{"browserSurfaces":[{
-            "id":"login","title":"Login","description":"","scope":"application",
-            "persistence":"persistent","keepMounted":true,"closeAction":"hide","backgroundInference":true
+            "id":"login","title":"Login","description":"","persistence":"persistent","keepMounted":true,"closeAction":"hide","backgroundInference":true
         }]}
     });
     let root = tempdir().unwrap();
@@ -593,19 +542,18 @@ fn activation_rejects_browser_surface_policies_the_host_cannot_mount() {
             },
         )
         .unwrap();
-    manager.enable("acme.surface", "application").unwrap();
+    manager.enable("acme.surface").unwrap();
     manager
         .authorize(
             "acme.surface",
-            "application",
             vec![PluginPermission {
                 kind: PluginPermissionKind::Browser,
-                scope: PluginScopeKind::Application,
+
                 targets: vec!["login".into()],
             }],
         )
         .unwrap();
-    manager.activate("acme.surface", "application").unwrap();
+    manager.activate("acme.surface").unwrap();
 
     manifest["version"] = json!("1.1.0");
     manifest["contributions"]["browserSurfaces"][0]["closeAction"] = json!("destroy");
@@ -619,19 +567,18 @@ fn activation_rejects_browser_surface_policies_the_host_cannot_mount() {
             },
         )
         .unwrap();
-    manager.enable("acme.surface", "application").unwrap();
+    manager.enable("acme.surface").unwrap();
     manager
         .authorize(
             "acme.surface",
-            "application",
             vec![PluginPermission {
                 kind: PluginPermissionKind::Browser,
-                scope: PluginScopeKind::Application,
+
                 targets: vec!["login".into()],
             }],
         )
         .unwrap();
-    let error = manager.activate("acme.surface", "application").unwrap_err();
+    let error = manager.activate("acme.surface").unwrap_err();
     assert!(error.to_string().contains("宿主尚不支持"), "{error}");
 }
 
@@ -664,7 +611,7 @@ fn preview_of_an_upgrade_reports_permission_diff_and_blocked_data_migration() {
 
     let mut widened = manifest(false);
     widened["version"] = json!("1.2.0");
-    widened["permissions"] = json!([{"kind":"storage","scope":"application","targets":["cache"]}]);
+    widened["permissions"] = json!([{"kind":"storage","targets":["cache"]}]);
     let widened = package_from_manifest(widened);
     let preview = manager.preview(&widened, &local("v2.zip")).unwrap();
     assert_eq!(
@@ -678,7 +625,7 @@ fn preview_of_an_upgrade_reports_permission_diff_and_blocked_data_migration() {
 
     // 目标范围变化被视为新增加移除，而不是静默沿用；目标顺序不影响判断。
     let mut base = manifest(true);
-    base["permissions"] = json!([{"kind":"storage","scope":"application","targets":["b","a"]}]);
+    base["permissions"] = json!([{"kind":"storage","targets":["b","a"]}]);
     let root2 = tempdir().unwrap();
     let mut second = PluginManager::open(root2.path()).unwrap();
     second
@@ -686,16 +633,14 @@ fn preview_of_an_upgrade_reports_permission_diff_and_blocked_data_migration() {
         .unwrap();
     let mut reordered = manifest(true);
     reordered["version"] = json!("1.0.1");
-    reordered["permissions"] =
-        json!([{"kind":"storage","scope":"application","targets":["a","b"]}]);
+    reordered["permissions"] = json!([{"kind":"storage","targets":["a","b"]}]);
     let preview = second
         .preview(&package_from_manifest(reordered), &local("v2.zip"))
         .unwrap();
     assert!(preview.added_permissions.is_empty() && preview.removed_permissions.is_empty());
     let mut expanded = manifest(true);
     expanded["version"] = json!("1.0.2");
-    expanded["permissions"] =
-        json!([{"kind":"storage","scope":"application","targets":["a","b","c"]}]);
+    expanded["permissions"] = json!([{"kind":"storage","targets":["a","b","c"]}]);
     let preview = second
         .preview(&package_from_manifest(expanded), &local("v3.zip"))
         .unwrap();
@@ -723,13 +668,11 @@ fn preview_of_an_upgrade_reports_permission_diff_and_blocked_data_migration() {
     let preview = third.preview(&schema, &local("v2.zip")).unwrap();
     assert_eq!(preview.data_schema_from, Some(1));
     assert!(!preview.data_reset);
-    third.enable("acme.lifecycle", "application").unwrap();
+    third.enable("acme.lifecycle").unwrap();
+    third.authorize("acme.lifecycle", vec![grant()]).unwrap();
+    third.activate("acme.lifecycle").unwrap();
     third
-        .authorize("acme.lifecycle", "application", vec![grant()])
-        .unwrap();
-    third.activate("acme.lifecycle", "application").unwrap();
-    third
-        .write_resource("acme.lifecycle", "application", "cache", 0, json!({"k": 1}))
+        .write_resource("acme.lifecycle", "cache", 0, json!({"k": 1}))
         .unwrap();
     assert!(third.preview(&schema, &local("v2.zip")).unwrap().data_reset);
 }
@@ -766,15 +709,11 @@ fn missing_package_is_isolated_on_startup_without_losing_other_plugins_or_resour
             )
             .unwrap();
     }
-    manager.enable("acme.lifecycle", "application").unwrap();
+    manager.enable("acme.lifecycle").unwrap();
     manager
-        .authorize(
-            "acme.lifecycle",
-            "application",
-            package.manifest().permissions.clone(),
-        )
+        .authorize("acme.lifecycle", package.manifest().permissions.clone())
         .unwrap();
-    manager.activate("acme.lifecycle", "application").unwrap();
+    manager.activate("acme.lifecycle").unwrap();
     let missing_path = manager.state().plugins["acme.lifecycle"]
         .package_path
         .clone();
@@ -784,13 +723,7 @@ fn missing_package_is_isolated_on_startup_without_losing_other_plugins_or_resour
     drop(manager);
     let mut resources = PluginResourceStore::open(root.path().join("resources.json")).unwrap();
     let retained = resources
-        .write(
-            "acme.lifecycle",
-            "application",
-            "cache",
-            0,
-            json!({"saved":true}),
-        )
+        .write("acme.lifecycle", "cache", 0, json!({"saved":true}))
         .unwrap();
     let resource_bytes = std::fs::read(root.path().join("resources.json")).unwrap();
 
@@ -827,10 +760,7 @@ fn missing_package_is_isolated_on_startup_without_losing_other_plugins_or_resour
         ),
         Err(PluginError::Conflict(_))
     ));
-    assert_eq!(
-        resources.read("acme.lifecycle", "application", "cache"),
-        Some(retained)
-    );
+    assert_eq!(resources.read("acme.lifecycle", "cache"), Some(retained));
     recovered
         .install(
             &package,
@@ -840,8 +770,8 @@ fn missing_package_is_isolated_on_startup_without_losing_other_plugins_or_resour
         )
         .unwrap();
     let reinstalled = &recovered.state().plugins["acme.lifecycle"];
-    assert!(reinstalled.enabled_scopes.is_empty());
-    assert!(reinstalled.active_scopes.is_empty());
+    assert!(!reinstalled.enabled);
+    assert!(!reinstalled.active);
     assert!(reinstalled.grants.is_empty());
     drop(recovered);
     assert_eq!(
@@ -918,8 +848,8 @@ fn retired_builtin_is_removed_on_reopen_without_erasing_resources() {
     let mut manager = PluginManager::open(root.path()).unwrap();
     let package = package(false);
     manager.install(&package, local("retired.zip")).unwrap();
-    manager.enable("acme.lifecycle", "application").unwrap();
-    manager.activate("acme.lifecycle", "application").unwrap();
+    manager.enable("acme.lifecycle").unwrap();
+    manager.activate("acme.lifecycle").unwrap();
     let state_path = root.path().join("state.json");
     // 模拟旧宿主曾经发布的内置包；新宿主目录不再声明该身份。
     let mut state = serde_json::to_value(manager.state()).unwrap();
@@ -928,13 +858,7 @@ fn retired_builtin_is_removed_on_reopen_without_erasing_resources() {
     std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
     let mut resources = PluginResourceStore::open(root.path().join("resources.json")).unwrap();
     resources
-        .write(
-            "acme.lifecycle",
-            "application",
-            "cache",
-            0,
-            json!({"saved":true}),
-        )
+        .write("acme.lifecycle", "cache", 0, json!({"saved":true}))
         .unwrap();
     let retained = std::fs::read(root.path().join("resources.json")).unwrap();
     let reopened = PluginManager::open(root.path()).unwrap();

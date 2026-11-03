@@ -14,10 +14,42 @@ pub fn new_endpoint(dir: &Path, tag: &str) -> std::io::Result<PathBuf> {
     let name = format!("{tag}-{suffix}");
     #[cfg(unix)]
     {
-        std::fs::create_dir_all(dir)?;
+        // macOS 的 sockaddr_un 路径上限约 104 字节；状态根可由用户指定为很深的
+        // 路径，直接把它拼进 socket 名会导致宿主永远在端点错误中重启。长路径
+        // 改用系统临时目录，并用状态目录摘要保持实例目录隔离，目录权限仍为 0700。
+        let candidate = dir.join(format!("{name}.sock"));
+        let (endpoint_dir, endpoint_name) = if candidate.as_os_str().len() >= 90 {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(dir.to_string_lossy().as_bytes());
+            let short: String = digest
+                .iter()
+                .take(10)
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            // macOS 的用户 TMPDIR 自身可能长达 70 字节；使用该平台标准的
+            // 短临时根，socket 仍受私有目录权限与一次性令牌保护。
+            let temporary_root = if cfg!(target_os = "macos") {
+                PathBuf::from("/tmp")
+            } else {
+                std::env::temp_dir()
+            };
+            (
+                temporary_root.join(format!("magi-ext-{short}")),
+                format!("{name}.sock"),
+            )
+        } else {
+            (dir.to_path_buf(), format!("{name}.sock"))
+        };
+        std::fs::create_dir_all(&endpoint_dir)?;
+        if !std::fs::symlink_metadata(&endpoint_dir)?
+            .file_type()
+            .is_dir()
+        {
+            return Err(std::io::Error::other("扩展端点目录不能是符号链接"));
+        }
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        Ok(dir.join(format!("{name}.sock")))
+        std::fs::set_permissions(&endpoint_dir, std::fs::Permissions::from_mode(0o700))?;
+        Ok(endpoint_dir.join(endpoint_name))
     }
     #[cfg(windows)]
     {
@@ -96,3 +128,24 @@ mod imp {
 }
 
 pub use imp::{Listener, Stream, bind};
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn long_state_roots_use_a_short_private_socket_path() {
+        let root = tempfile::tempdir().unwrap();
+        let long = root.path().join("x".repeat(120));
+        let endpoint = new_endpoint(&long, "g1").unwrap();
+        assert!(endpoint.as_os_str().len() < 104);
+        let listener = bind(&endpoint).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&endpoint).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(listener);
+        assert!(!endpoint.exists());
+        std::fs::remove_dir(endpoint.parent().unwrap()).unwrap();
+    }
+}

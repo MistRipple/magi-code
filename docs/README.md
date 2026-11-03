@@ -5,7 +5,7 @@
 ## 项目定位
 
 - Magi 只提供 Electron 桌面 GUI 与 Web 工作台，不提供 Magi CLI 或独立移动端应用；手机和平板通过同一 Web 工作台的响应式布局访问。
-- 外部 Agent Executor 当前只预留通用扩展接口，不提供具体执行器、设置入口或试点交付；现有原生模型继续维护。插件后台已由受信 Node 扩展宿主取代，QuickJS 与 SDK 1 已删除（[插件系统设计](plugin-system-requirements-design.md)）；插件提供的工具、命令、工作流与会话引擎尚未在 Node 上重建。
+- 外部 Agent Executor 当前只预留通用扩展接口，不提供具体执行器、设置入口或试点交付；现有原生模型继续维护。插件后台已由受信 Node 扩展宿主取代，QuickJS 与 SDK 1 已删除（[插件系统设计](plugin-system-requirements-design.md)）；Node 插件已提供工具、命令、钩子以及资源/设置服务，工作流与会话引擎不属于当前插件合同。
 - Rust 后端已完成重构与协议冻结，当前处于正式运行阶段
 - 前端基于现有 `magi` 产品方案迁移完成，持续完善产品体验
 - 后端重构历史文档已归档清理，当前以代码和真实运行链路为唯一事实源
@@ -25,7 +25,7 @@
 - `magi-daemon` 是唯一业务内核。桌面端通过受控 sidecar 启动它，Magi UI 与内置浏览器共用同一 Chromium Desktop Host；浏览器自动化通过私有 Desktop Control 协议接管当前 Browser WebContents。
 - 主窗口关闭后默认隐藏到系统托盘，daemon 继续运行；只有托盘中的“退出 Magi”或操作系统显式退出动作会触发优雅关闭。
 - `magi-daemon-app` 承载开发、无头部署及桌面包中的 daemon sidecar 入口；业务实现复用 `magi-daemon`，不复制 Electron 宿主逻辑。
-- 扩展宿主（目标，尚未实现）：每个启用的可执行插件由 daemon 直接托管一个独立 Node 进程；Node 随产品携带固定版本、不依赖用户 PATH，Desktop 与无头入口使用同一合同，不经 Electron utilityProcess。插件以用户权限运行，业务提案经 daemon 内唯一的 ExtensionBus 裁决，设计见[插件系统设计](plugin-system-requirements-design.md)。已实现的交付：发行包把固定版本 Node（版本与各平台归档摘要固定在 `apps/desktop/node-runtime.json`）放在 `daemon/node/`，daemon 只在自身同级 `node/` 目录查找，不读用户 PATH；开发时可用 `node apps/desktop/scripts/node-runtime.mjs stage <目录>` 准备同一份 Node，并设置 `MAGI_EXTENSION_NODE` 指向它。
+- 扩展宿主：每个激活的可执行插件由 daemon 直接托管一个独立 Node 进程；Node 随产品携带固定版本、不依赖用户 PATH，Desktop 与无头入口使用同一合同，不经 Electron utilityProcess。插件以用户权限运行，业务提案经 daemon 内唯一的 ExtensionBus 裁决，资源/设置服务复用插件管理器的授权和版本事实，设计见[插件系统设计](plugin-system-requirements-design.md)。发行包把固定版本 Node（版本与各平台归档摘要固定在 `apps/desktop/node-runtime.json`）放在 `daemon/node/`，daemon 只在自身同级 `node/` 目录查找，不读用户 PATH；开发时可用 `node apps/desktop/scripts/node-runtime.mjs stage <目录>` 准备同一份 Node，并设置 `MAGI_EXTENSION_NODE` 指向它。
 - 正式 Desktop 通过专属 stdin 管道托管 daemon（`MAGI_DAEMON_OWNER_PIPE=1`）：退出先关闭管道，daemon 收到 EOF 后沿原关闭入口结算 Turn、工具和持久化，宿主等待退出，超时才强制终止。开发/无头入口不设置此标记，stdin EOF 不影响其生命周期；系统信号仍走原关闭入口。
 
 开发模式仍使用 daemon 托管入口：
@@ -108,7 +108,7 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 - [Prompt Lineage 与缓存根架构](./prompt-cache-lineage-architecture.md)：把提示词 IR、分支 lineage、cache epoch、Provider Cache Contract 和 logical/transport usage 统一为 daemon 一级事实。
 - [知识图谱设计与维护](./knowledge-graph-design.md)：图谱事实源、候选审阅、检索预算、索引维护与定向验证。
 - [用户自定义子代理角色](./custom-worker-role-design.md)：角色定义、持久化、注册表热更新、导入导出与调度合同。
-- [Magi 插件系统：需求与架构设计](./plugin-system-requirements-design.md)：受信 Node 扩展宿主、ExtensionBus 与钩子目录、包与授权、生命周期与升级、pi/DSH 兼容来源（翻译器已推迟到本地插件系统稳定之后），以及已删除的 QuickJS 实现的审计缺陷；[扩展协议 v1](./extension-protocol-v1.md)是受信宿主的线协议规范（已实现，13 个钩子均已接线）；[插件作者指南](./plugin-authoring.md)描述 SDK 2。
+- [Magi 插件系统：需求与架构设计](./plugin-system-requirements-design.md)：受信 Node 扩展宿主、ExtensionBus 与钩子目录、包与授权、生命周期与升级、pi/DSH 兼容来源（翻译器已推迟到本地插件系统稳定之后），以及已删除的 QuickJS 实现的审计缺陷；[扩展协议 v1](./extension-protocol-v1.md)是受信宿主的线协议规范（15 个钩子名称均有已接线模式，未接线模式在安装时拒绝）；[插件作者指南](./plugin-authoring.md)描述 SDK 2。
 
 - [Turn、事件事实与对话执行架构](./conversation-response-core-architecture-redesign.md)：统一接纳、任务调度、终态、恢复和权限边界。
 - [持久日志的追加写入与压缩](./durable-log-compaction-design.md)：用量账本分段、canonical 事件检查点和崩溃恢复。

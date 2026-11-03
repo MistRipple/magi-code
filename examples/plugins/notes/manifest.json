@@ -1,0 +1,62 @@
+{
+  "sdkVersion": 2,
+  "id": "example.notes",
+  "version": "1.0.0",
+  "name": "示例笔记",
+  "description": "演示资源、设置和受信 Node 工具。",
+  "permissions": [
+    {
+      "kind": "storage",
+      "targets": [
+        "notes",
+        "__settings"
+      ]
+    },
+    {
+      "kind": "extension",
+      "targets": [
+        "full-trust"
+      ]
+    },
+    {
+      "kind": "tools",
+      "targets": [
+        "note-count"
+      ]
+    }
+  ],
+  "dataSchemaVersion": 1,
+  "settingsSchema": {
+    "type": "object",
+    "properties": {
+      "prefix": {
+        "type": "string"
+      }
+    },
+    "additionalProperties": false
+  },
+  "extension": {
+    "hooks": []
+  },
+  "contributions": {
+    "resources": [
+      {
+        "id": "notes",
+        "title": "笔记",
+        "description": "示例笔记数据"
+      }
+    ],
+    "tools": [
+      {
+        "id": "note-count",
+        "title": "笔记数量",
+        "description": "返回示例笔记数量",
+        "readOnly": true,
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      }
+    ]
+  }
+}

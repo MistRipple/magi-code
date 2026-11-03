@@ -39,15 +39,13 @@ use center::{center, center_install, guide, write_center_config};
 use download::download_bytes;
 
 type InstallRequest = magi_app_server_protocol::PluginInstallRequest;
-type ScopeRequest = magi_app_server_protocol::PluginScopeRequest;
+type ActivationRequest = magi_app_server_protocol::PluginActivationRequest;
 type AuthorizeRequest = magi_app_server_protocol::PluginAuthorizeRequest;
 type ResourceWriteRequest = magi_app_server_protocol::PluginResourceWriteRequest;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ScopeQuery {
-    scope: String,
-}
+struct PluginQuery {}
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -60,6 +58,8 @@ pub fn routes() -> Router<ApiState> {
         .route("/plugins/center/install", post(center_install))
         .route("/plugins/guide", get(guide))
         .route("/plugins/commands", get(commands))
+        .route("/plugins/{id}/jobs", get(list_jobs).post(create_job))
+        .route("/plugins/{id}/jobs/{job}/cancel", post(cancel_job))
         .route("/plugins/manifests", get(manifests))
         .route(
             "/plugins/{id}/resources/{resource}/events",
@@ -97,24 +97,22 @@ async fn list(
 
 async fn manifests(
     State(state): State<ApiState>,
-    Query(query): Query<ScopeQuery>,
+    Query(_query): Query<PluginQuery>,
 ) -> Result<Json<Vec<magi_app_server_protocol::PluginManifest>>, ApiError> {
     let manager = locked(&state, "读取插件清单")?;
-    let manifests = manager
-        .manifests_for_scope(&query.scope)
-        .map_err(plugin_error)?;
+    let manifests = manager.manifests().map_err(plugin_error)?;
     Ok(Json(manifests))
 }
 
 async fn resource_events(
     State(state): State<ApiState>,
     Path((id, resource)): Path<(String, String)>,
-    Query(query): Query<ScopeQuery>,
+    Query(_query): Query<PluginQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let (initial_resource, receiver) = {
         let manager = locked(&state, "订阅插件资源")?;
         let initial_resource = manager
-            .read_resource(&id, &query.scope, &resource)
+            .read_resource(&id, &resource)
             .map_err(plugin_error)?;
         // The manager lock serializes this snapshot with every resource writer. The
         // event-bus cut is then registered before the lock is released, so a writer
@@ -123,22 +121,19 @@ async fn resource_events(
         (initial_resource, receiver)
     };
     let initial = stream::once(future::ready(Ok::<Event, Infallible>(
-        resource_sse_snapshot(&id, &query.scope, &resource, initial_resource),
+        resource_sse_snapshot(&id, &resource, initial_resource),
     )));
     // 订阅随插件停用、撤权或升级失效：不能让已被撤销的视图继续收到资源变更。
     let revoked = resource_subscription_revoked(
         std::sync::Arc::clone(&state.plugin_manager),
         id.clone(),
-        query.scope.clone(),
         resource.clone(),
     );
     let live = BroadcastStream::new(receiver)
         .filter_map(move |event| {
             future::ready(match event {
-                Ok(envelope) => {
-                    plugin_resource_event_matches(&envelope, &id, &query.scope, &resource)
-                        .then(|| Ok::<Event, Infallible>(resource_sse_event(envelope)))
-                }
+                Ok(envelope) => plugin_resource_event_matches(&envelope, &id, &resource)
+                    .then(|| Ok::<Event, Infallible>(resource_sse_event(envelope))),
                 Err(_) => Some(Ok::<Event, Infallible>(resource_sse_reset())),
             })
         })
@@ -154,14 +149,13 @@ async fn resource_events(
 async fn resource_subscription_revoked(
     manager: std::sync::Arc<std::sync::Mutex<PluginManager>>,
     id: String,
-    scope: String,
     resource: String,
 ) {
     loop {
         tokio::time::sleep(RESOURCE_SUBSCRIPTION_RECHECK).await;
         let allowed = manager
             .lock()
-            .map(|manager| manager.resource_access_allowed(&id, &scope, &resource))
+            .map(|manager| manager.resource_access_allowed(&id, &resource))
             .unwrap_or(false);
         if !allowed {
             return;
@@ -172,13 +166,10 @@ async fn resource_subscription_revoked(
 async fn resource(
     State(state): State<ApiState>,
     Path((id, path)): Path<(String, String)>,
-    Query(query): Query<ScopeQuery>,
+    Query(_query): Query<PluginQuery>,
 ) -> Result<Response, ApiError> {
     let manager = locked(&state, "读取插件视图")?;
-    if !manager
-        .is_active_for_scope(&id, &query.scope)
-        .map_err(plugin_error)?
-    {
+    if !manager.is_active(&id).map_err(plugin_error)? {
         return Err(ApiError::Forbidden("插件未激活".into()));
     }
     let resource_path = format!("ui/{path}");
@@ -219,10 +210,10 @@ async fn resource(
 async fn read_resource(
     State(state): State<ApiState>,
     Path((id, resource)): Path<(String, String)>,
-    Query(query): Query<ScopeQuery>,
+    Query(_query): Query<PluginQuery>,
 ) -> Result<Json<magi_plugin_system::PluginResource>, ApiError> {
     locked(&state, "读取插件资源")?
-        .read_resource(&id, &query.scope, &resource)
+        .read_resource(&id, &resource)
         .map(Json)
         .map_err(plugin_error)
 }
@@ -230,18 +221,15 @@ async fn read_resource(
 async fn write_resource(
     State(state): State<ApiState>,
     Path((id, resource)): Path<(String, String)>,
-    Query(query): Query<ScopeQuery>,
+    Query(_query): Query<PluginQuery>,
     Json(request): Json<ResourceWriteRequest>,
 ) -> Result<Json<magi_plugin_system::PluginResource>, ApiError> {
     let mut manager = locked(&state, "写入插件资源")?;
-    manager
-        .ensure_editing_admitted(&id, &query.scope)
-        .map_err(plugin_error)?;
+    manager.ensure_editing_admitted(&id).map_err(plugin_error)?;
     write_plugin_resource_with_event(
         &mut manager,
         &state.event_bus,
         &id,
-        &query.scope,
         &resource,
         request.expected_version,
         request.value,
@@ -255,13 +243,12 @@ pub fn write_plugin_resource_with_event(
     manager: &mut PluginManager,
     event_bus: &InMemoryEventBus,
     id: &str,
-    scope: &str,
     resource_id: &str,
     expected_version: u64,
     value: Value,
 ) -> Result<magi_plugin_system::PluginResource, magi_plugin_system::PluginError> {
-    let resource = manager.write_resource(id, scope, resource_id, expected_version, value)?;
-    publish_plugin_resource_event(event_bus, id, scope, resource_id, &resource);
+    let resource = manager.write_resource(id, resource_id, expected_version, value)?;
+    publish_plugin_resource_event(event_bus, id, resource_id, &resource);
     Ok(resource)
 }
 
@@ -269,31 +256,28 @@ pub fn write_plugin_settings_with_event(
     manager: &mut PluginManager,
     event_bus: &InMemoryEventBus,
     id: &str,
-    scope: &str,
     expected_version: u64,
     value: Value,
 ) -> Result<magi_plugin_system::PluginResource, magi_plugin_system::PluginError> {
-    let resource = manager.write_settings(id, scope, expected_version, value)?;
-    publish_plugin_resource_event(event_bus, id, scope, "__settings", &resource);
+    let resource = manager.write_settings(id, expected_version, value)?;
+    publish_plugin_resource_event(event_bus, id, "__settings", &resource);
     Ok(resource)
 }
 
 fn publish_plugin_resource_event(
     event_bus: &InMemoryEventBus,
     id: &str,
-    scope: &str,
     resource_id: &str,
     resource: &magi_plugin_system::PluginResource,
 ) {
     let event = EventEnvelope::projection(
         EventId::new(format!(
-            "plugin-resource-{id}-{scope}-{resource_id}-{}",
+            "plugin-resource-{id}-{resource_id}-{}",
             resource.version
         )),
         "plugin.resource.updated",
         serde_json::json!({
             "pluginId": id,
-            "scope": scope,
             "resourceId": resource_id,
             "version": resource.version,
             "value": resource.value,
@@ -306,10 +290,10 @@ fn publish_plugin_resource_event(
 async fn read_settings(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    Query(query): Query<ScopeQuery>,
+    Query(_query): Query<PluginQuery>,
 ) -> Result<Json<magi_plugin_system::PluginResource>, ApiError> {
     locked(&state, "读取插件设置")?
-        .read_settings(&id, &query.scope)
+        .read_settings(&id)
         .map(Json)
         .map_err(plugin_error)
 }
@@ -317,18 +301,15 @@ async fn read_settings(
 async fn write_settings(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    Query(query): Query<ScopeQuery>,
+    Query(_query): Query<PluginQuery>,
     Json(request): Json<ResourceWriteRequest>,
 ) -> Result<Json<magi_plugin_system::PluginResource>, ApiError> {
     let mut manager = locked(&state, "写入插件设置")?;
-    manager
-        .ensure_editing_admitted(&id, &query.scope)
-        .map_err(plugin_error)?;
+    manager.ensure_editing_admitted(&id).map_err(plugin_error)?;
     write_plugin_settings_with_event(
         &mut manager,
         &state.event_bus,
         &id,
-        &query.scope,
         request.expected_version,
         request.value,
     )
@@ -475,7 +456,7 @@ async fn install_or_upgrade(
     }
 }
 
-/// 升级的唯一入口：关闭该插件全部作用域的准入，再原子切换到新包。任一步失败都保持旧版本与旧激活状态不变。
+/// 升级的唯一入口：关闭该插件全局准入，再原子切换到新包。任一步失败都保持旧版本与旧激活状态不变。
 async fn upgrade_installed_plugin(
     state: &ApiState,
     package: &PluginPackage,
@@ -486,11 +467,14 @@ async fn upgrade_installed_plugin(
         &package.manifest().id,
     )
     .map_err(plugin_error)?;
+    quiesce_extension(state, &package.manifest().id).await?;
     {
         let mut manager = locked(state, "升级插件")?;
-        manager
-            .upgrade(package, source, &drain)
-            .map_err(plugin_error)?;
+        if let Err(error) = manager.upgrade(package, source, &drain) {
+            drop(manager);
+            publish_plugin_registry_changed(state);
+            return Err(plugin_error(error));
+        }
         drain.commit(&mut manager);
     }
     publish_plugin_registry_changed(state);
@@ -500,12 +484,10 @@ async fn upgrade_installed_plugin(
 /// 已激活插件声明的用户命令。身份固定为 `plugin/{插件}/{贡献}`，供输入框斜杠菜单使用。
 async fn commands(
     State(state): State<ApiState>,
-    Query(query): Query<ScopeQuery>,
+    Query(_query): Query<PluginQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     let manager = locked(&state, "读取插件命令")?;
-    let entries = manager
-        .command_contributions_for_scope(&query.scope)
-        .map_err(plugin_error)?;
+    let entries = manager.command_contributions().map_err(plugin_error)?;
     Ok(Json(
         entries
             .into_iter()
@@ -528,47 +510,60 @@ async fn authorize(
     Path(id): Path<String>,
     Json(request): Json<AuthorizeRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    let mut manager = locked(&state, "授权插件")?;
-    manager
-        .authorize(&id, &request.scope, request.grants)
+    let active = locked(&state, "读取插件授权")?
+        .is_active(&id)
         .map_err(plugin_error)?;
+    let drain = if active {
+        let drain =
+            PluginManager::begin_deactivation(std::sync::Arc::clone(&state.plugin_manager), &id)
+                .map_err(plugin_error)?;
+        quiesce_extension(&state, &id).await?;
+        Some(drain)
+    } else {
+        None
+    };
+    let mut manager = locked(&state, "授权插件")?;
+    if let Err(error) = manager.authorize(&id, request.grants) {
+        drop(manager);
+        publish_plugin_registry_changed(&state);
+        return Err(plugin_error(error));
+    }
+    if let Some(drain) = drain {
+        drain.commit(&mut manager);
+    }
     publish_plugin_registry_changed(&state);
     snapshot(&state, &manager)
 }
 async fn enable(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    Json(request): Json<ScopeRequest>,
+    Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    mutate_scope(&state, |m| m.enable(&id, &request.scope), "启用插件")
+    mutate_plugin(&state, |m| m.enable(&id), "启用插件")
 }
 async fn activate(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    Json(request): Json<ScopeRequest>,
+    Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    mutate_scope(
-        &state,
-        |m| m.activate(&id, &request.scope).map(|_| ()),
-        "激活插件",
-    )
+    mutate_plugin(&state, |m| m.activate(&id).map(|_| ()), "激活插件")
 }
 async fn deactivate(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    Json(request): Json<ScopeRequest>,
+    Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    let drain = PluginManager::begin_deactivation(
-        std::sync::Arc::clone(&state.plugin_manager),
-        &id,
-        &request.scope,
-    )
-    .map_err(plugin_error)?;
+    let drain =
+        PluginManager::begin_deactivation(std::sync::Arc::clone(&state.plugin_manager), &id)
+            .map_err(plugin_error)?;
+    quiesce_extension(&state, &id).await?;
     {
         let mut manager = locked(&state, "停用插件")?;
-        manager
-            .deactivate(&id, &request.scope)
-            .map_err(plugin_error)?;
+        if let Err(error) = manager.deactivate(&id) {
+            drop(manager);
+            publish_plugin_registry_changed(&state);
+            return Err(plugin_error(error));
+        }
         drain.commit(&mut manager);
     }
     publish_plugin_registry_changed(&state);
@@ -577,12 +572,28 @@ async fn deactivate(
         snapshot(&state, &manager)
     }
 }
+
+async fn quiesce_extension(state: &ApiState, id: &str) -> Result<(), ApiError> {
+    let executable = locked(state, "读取扩展宿主")?
+        .package(id)
+        .map_err(plugin_error)?
+        .manifest()
+        .extension
+        .is_some();
+    if executable && let Some(source) = &state.extension_status {
+        source
+            .quiesce(id.to_string())
+            .await
+            .map_err(|reason| ApiError::Conflict(format!("扩展停止失败：{reason}")))?;
+    }
+    Ok(())
+}
 async fn disable(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    Json(request): Json<ScopeRequest>,
+    Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    mutate_scope(&state, |m| m.disable(&id, &request.scope), "禁用插件")
+    mutate_plugin(&state, |m| m.disable(&id), "禁用插件")
 }
 async fn uninstall(
     State(state): State<ApiState>,
@@ -603,7 +614,7 @@ fn publish_plugin_registry_changed(state: &ApiState) {
     ));
 }
 
-fn mutate_scope<F>(
+fn mutate_plugin<F>(
     state: &ApiState,
     mut operation: F,
     action: &str,
@@ -660,25 +671,21 @@ fn plugin_error(error: magi_plugin_system::PluginError) -> ApiError {
 fn plugin_resource_event_matches(
     event: &EventEnvelope,
     plugin_id: &str,
-    scope: &str,
     resource_id: &str,
 ) -> bool {
     event.event_type == "plugin.resource.updated"
         && event.payload.get("pluginId").and_then(Value::as_str) == Some(plugin_id)
-        && event.payload.get("scope").and_then(Value::as_str) == Some(scope)
         && event.payload.get("resourceId").and_then(Value::as_str) == Some(resource_id)
 }
 
 fn resource_sse_snapshot(
     plugin_id: &str,
-    scope: &str,
     resource_id: &str,
     resource: magi_plugin_system::PluginResource,
 ) -> Event {
     Event::default()
         .json_data(serde_json::json!({
             "pluginId": plugin_id,
-            "scope": scope,
             "resourceId": resource_id,
             "version": resource.version,
             "value": resource.value,
@@ -731,6 +738,26 @@ fn validated_remote_url(value: &str) -> Result<String, ApiError> {
     Ok(url.to_string())
 }
 
+async fn list_jobs(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<magi_app_server_protocol::generated::PluginJobSchedule>>, ApiError> {
+    state.plugin_jobs.list(&id).map(Json)
+}
+async fn create_job(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(request): Json<magi_app_server_protocol::generated::PluginJobRequest>,
+) -> Result<Json<magi_app_server_protocol::generated::PluginJobSchedule>, ApiError> {
+    state.plugin_jobs.create(&state, &id, request).map(Json)
+}
+async fn cancel_job(
+    State(state): State<ApiState>,
+    Path((id, job)): Path<(String, String)>,
+) -> Result<Json<magi_app_server_protocol::generated::PluginJobSchedule>, ApiError> {
+    state.plugin_jobs.cancel(&state, &id, &job).await.map(Json)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,8 +765,7 @@ mod tests {
     use futures_util::StreamExt;
     use magi_governance::GovernanceService;
     use magi_plugin_system::{
-        PluginManager, PluginPackage, PluginPermission, PluginPermissionKind, PluginScopeKind,
-        PluginSource,
+        PluginManager, PluginPackage, PluginPermission, PluginPermissionKind, PluginSource,
     };
     use magi_session_store::SessionStore;
     use magi_workspace::WorkspaceStore;
@@ -761,7 +787,6 @@ mod tests {
             "description": "",
             "permissions": [{
                 "kind": "storage",
-                "scope":"application",
                 "targets": ["dashboard"]
             }],
             "dataSchemaVersion": 1,
@@ -941,19 +966,18 @@ mod tests {
                 },
             )
             .unwrap();
-        manager.enable("acme.resources", "application").unwrap();
+        manager.enable("acme.resources").unwrap();
         manager
             .authorize(
                 "acme.resources",
-                "application",
                 vec![PluginPermission {
                     kind: PluginPermissionKind::Storage,
-                    scope: PluginScopeKind::Application,
+
                     targets: vec!["dashboard".into()],
                 }],
             )
             .unwrap();
-        manager.activate("acme.resources", "application").unwrap();
+        manager.activate("acme.resources").unwrap();
         let manager = Arc::new(std::sync::Mutex::new(manager));
         let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(32));
         let api_state = ApiState::new(
@@ -1004,11 +1028,9 @@ mod tests {
                 },
             )
             .unwrap();
-        manager.enable("acme.viewer", "application").unwrap();
-        manager
-            .authorize("acme.viewer", "application", Vec::new())
-            .unwrap();
-        manager.activate("acme.viewer", "application").unwrap();
+        manager.enable("acme.viewer").unwrap();
+        manager.authorize("acme.viewer", Vec::new()).unwrap();
+        manager.activate("acme.viewer").unwrap();
         let state = ApiState::new(
             "magi-test",
             Arc::new(magi_event_bus::InMemoryEventBus::new(32)),
@@ -1021,7 +1043,7 @@ mod tests {
             .with_state(state)
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/plugins/acme.viewer/ui/index.html?scope=application")
+                    .uri("/plugins/acme.viewer/ui/index.html")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1047,7 +1069,7 @@ mod tests {
             .clone()
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/plugins/acme.resources/resources/dashboard/events?scope=application")
+                    .uri("/plugins/acme.resources/resources/dashboard/events")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1060,7 +1082,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("PUT")
-                    .uri("/plugins/acme.resources/resources/dashboard?scope=application")
+                    .uri("/plugins/acme.resources/resources/dashboard")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"expectedVersion":0,"value":{"count":1}}"#))
                     .unwrap(),
@@ -1102,7 +1124,7 @@ mod tests {
         let mut stream = router
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/plugins/acme.resources/resources/dashboard/events?scope=application")
+                    .uri("/plugins/acme.resources/resources/dashboard/events")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1121,7 +1143,7 @@ mod tests {
             .plugin_manager
             .lock()
             .unwrap()
-            .deactivate("acme.resources", "application")
+            .deactivate("acme.resources")
             .unwrap();
         let closed = timeout(Duration::from_secs(3), stream.next())
             .await
@@ -1184,8 +1206,8 @@ mod tests {
         let list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let plugin = &list["plugins"][0];
         assert_eq!(plugin["manifest"]["version"], "1.1.0");
-        assert_eq!(plugin["enabledScopes"], serde_json::json!(["application"]));
-        assert_eq!(plugin["activeScopes"], serde_json::json!([]));
+        assert_eq!(plugin["enabled"], true);
+        assert_eq!(plugin["active"], false);
         assert_eq!(plugin["grants"], serde_json::json!([]));
         assert_eq!(plugin["source"]["kind"], "local");
         drop(root);
@@ -1351,14 +1373,18 @@ mod tests {
 
         // 发布服务被入侵：包内容被替换，但目录签名仍绑定原摘要，安装必须失败且不落盘。
         *center.package.lock().unwrap() = self::archive("1.0.1");
-        let (status, _) = call(
+        let (status, rejection) = call(
             &state,
             "POST",
             "/plugins/center/install",
             Some(serde_json::json!({"id": "acme.resources", "expectedSha256": digest})),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        // 替换内容要么超出目录声明的大小（下载阶段 400），要么与签名摘要不符（403）；都不得安装。
+        assert!(
+            matches!(status, StatusCode::FORBIDDEN | StatusCode::BAD_REQUEST),
+            "{status} {rejection}"
+        );
         assert!(
             state
                 .plugin_manager
@@ -1415,7 +1441,7 @@ mod tests {
             &state,
             "POST",
             "/plugins/acme.resources/deactivate",
-            Some(serde_json::json!({"scope": "application"})),
+            Some(serde_json::json!({})),
         )
         .await;
         assert_eq!(

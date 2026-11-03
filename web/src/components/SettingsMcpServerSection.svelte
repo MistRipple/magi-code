@@ -1,7 +1,7 @@
 <script lang="ts">
   import SelectField from './SelectField.svelte';
   /**
-   * 「设置 → MCP 服务」分类（MCP 服务插件激活后出现）。
+   * 「设置 → MCP 服务」内置分类，始终可见；只由 MCP 自身开关控制。
    *
    * 只展示 daemon 的事实：服务是否运行、令牌列表、待确认调用与审计记录都来自
    * `/api/mcp-server/*`。令牌原文由 daemon 在本机保存，需要时通过“查看配置”重新取回；

@@ -139,7 +139,7 @@ assert.match(
 assert.match(shell, /<ExternalApprovalTray \/>/);
 assert.match(shell, /mergeExternalSessionsIntoSidebar/);
 assert.doesNotMatch(shell, /<ExternalSessionsSection/);
-// MCP 服务是独立的设置分类（插件激活后才出现），不再嵌在工具页里。
+// MCP 服务是始终可见的原生设置分类，不依赖插件激活。
 assert.match(settingsPanel, /<SettingsMcpServerSection \/>/);
 assert.doesNotMatch(toolsTab, /SettingsMcpServerSection/);
 

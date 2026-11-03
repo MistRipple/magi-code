@@ -14,6 +14,7 @@ pub struct PluginCommandInvocation {
     pub turn_id: String,
     pub workspace_id: Option<String>,
     pub input: String,
+    pub job: Option<magi_app_server_protocol::generated::PluginJobContext>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

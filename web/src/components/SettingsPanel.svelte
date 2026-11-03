@@ -22,7 +22,7 @@ import { i18n } from '../stores/i18n.svelte';
 import WebFolderPicker from '../web/WebFolderPicker.svelte';
 import { getAgentColor } from '../lib/agent-colors';
 import { SETTINGS_TABS } from '../lib/settings-tabs';
-import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
+import { pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
 
   import { useSettingsStore } from '../stores/settings-store.svelte';
   import { shellUi } from '../stores/shell-ui.svelte';
@@ -50,8 +50,8 @@ import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } fro
     void untrack(() => store.reloadRoleTemplates());
   });
 
-  const pluginManifests = $derived(pluginProjection(APPLICATION_PLUGIN_SCOPE).manifests);
-  const pluginManifestsLoaded = $derived(pluginProjection(APPLICATION_PLUGIN_SCOPE).loaded);
+  const pluginManifests = $derived(pluginProjection().manifests);
+  const pluginManifestsLoaded = $derived(pluginProjection().loaded);
   const pluginSettingsViews = $derived.by(() => pluginManifests.flatMap((manifest) =>
     (manifest.contributions.views ?? [])
       .filter((view) => view.placements.includes('settings'))
@@ -85,7 +85,7 @@ import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } fro
     })));
   const pluginSettingsTabs = $derived([...pluginSettingsViews, ...pluginSettingsForms]);
   $effect(() => {
-    trackPluginProjection(APPLICATION_PLUGIN_SCOPE);
+    trackPluginProjection();
   });
   const activeTabDefinition = $derived(
     SETTINGS_TABS.find((tab) => tab.id === store.activeTab)
@@ -203,19 +203,21 @@ import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } fro
           <Icon name={tab.icon} size={15} />
           <span>{i18n.t(tab.titleKey)}</span>
         </button>
-      {/each}
-      {#each pluginSettingsTabs as tab (tab.tabId)}
-        <button
-          type="button"
-          class="settings-nav-item"
-          class:active={store.activeTab === tab.tabId}
-          aria-current={store.activeTab === tab.tabId ? 'page' : undefined}
-          data-testid={`settings-nav-${tab.tabId}`}
-          onclick={() => store.activeTab = tab.tabId}
-        >
-          <Icon name="settings" size={15} />
-          <span>{tab.label}</span>
-        </button>
+      {#if tab.id === 'plugins'}
+        {#each pluginSettingsTabs as pluginTab (pluginTab.tabId)}
+          <button
+            type="button"
+            class="settings-nav-item"
+            class:active={store.activeTab === pluginTab.tabId}
+            aria-current={store.activeTab === pluginTab.tabId ? 'page' : undefined}
+            data-testid={`settings-nav-${pluginTab.tabId}`}
+            onclick={() => store.activeTab = pluginTab.tabId}
+          >
+            <Icon name="settings" size={15} />
+            <span>{pluginTab.label}</span>
+          </button>
+        {/each}
+      {/if}
       {/each}
     </nav>
     {#if store.userInfo && store.clientKind === 'vscode'}
@@ -708,9 +710,9 @@ import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } fro
       {:else}
         {#each pluginSettingsTabs.filter((item) => item.tabId === store.activeTab) as tab (tab.tabId)}
           {#if tab.kind === 'view'}
-            <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} scope={APPLICATION_PLUGIN_SCOPE} />
+            <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} />
           {:else}
-            <PluginSettingsForm pluginId={tab.id} manifest={tab.manifest} scope={APPLICATION_PLUGIN_SCOPE} />
+            <PluginSettingsForm pluginId={tab.id} manifest={tab.manifest} />
           {/if}
         {/each}
       {/if}

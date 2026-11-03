@@ -238,7 +238,8 @@ impl UsageTotals {
     pub fn add(&self, other: &UsageTotals) -> UsageTotals {
         UsageTotals {
             performance: self.performance.add(&other.performance),
-            token_observed_call_count: self.token_observed_call_count + other.token_observed_call_count,
+            token_observed_call_count: self.token_observed_call_count
+                + other.token_observed_call_count,
             llm_call_count: self.llm_call_count + other.llm_call_count,
             assignment_count: self.assignment_count + other.assignment_count,
             turn_count: self.turn_count + other.turn_count,
@@ -246,7 +247,8 @@ impl UsageTotals {
             raw_output_tokens: self.raw_output_tokens + other.raw_output_tokens,
             cache_read_tokens: self.cache_read_tokens + other.cache_read_tokens,
             cache_write_tokens: self.cache_write_tokens + other.cache_write_tokens,
-            cache_write_observed_call_count: self.cache_write_observed_call_count + other.cache_write_observed_call_count,
+            cache_write_observed_call_count: self.cache_write_observed_call_count
+                + other.cache_write_observed_call_count,
             cache_observed_call_count: self.cache_observed_call_count
                 + other.cache_observed_call_count,
             cache_hit_call_count: self.cache_hit_call_count + other.cache_hit_call_count,

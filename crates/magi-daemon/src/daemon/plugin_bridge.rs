@@ -1,12 +1,12 @@
 //! daemon 对插件系统的装配。
 //!
-//! `magi-plugin-system` 拥有安装、授权、作用域与资源的事实；本模块只持有插件管理器、
+//! `magi-plugin-system` 拥有安装、授权与资源的事实；本模块只持有插件管理器、
 //! 扩展总线与受信 Node 扩展运行时，并把它们接到 daemon 的执行链路上。这里不保存任何插件
 //! 状态，也不另建权限判定。
 
 use super::config::DaemonError;
 use magi_event_bus::InMemoryEventBus;
-use magi_plugin_system::{APPLICATION_SCOPE, PluginError, PluginManager};
+use magi_plugin_system::{PluginError, PluginManager};
 use magi_process::ManagedProcessGroup;
 use magi_tool_runtime::{
     PluginToolCatalogEntry, PluginToolCatalogProvider, PluginToolExecutor, ToolExecutionContext,
@@ -15,8 +15,13 @@ use serde_json::json;
 use std::time::Duration;
 use std::{
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
+
+static NEXT_PLUGIN_INVOCATION: AtomicU64 = AtomicU64::new(1);
 
 /// 插件管理器与受信扩展运行时的 daemon 侧持有者。
 #[derive(Clone)]
@@ -58,6 +63,13 @@ impl PluginServices {
         self.extensions.start(events);
     }
 
+    pub(super) fn bind_native(
+        &self,
+        dispatcher: &Arc<magi_conversation_runtime::task_execution_dispatcher::LlmTaskDispatcher>,
+    ) {
+        self.extensions.bind_native(dispatcher);
+    }
+
     /// 扩展宿主运行状态的只读来源，供插件列表投影合并。
     pub(super) fn extension_status(&self) -> Arc<dyn magi_api::ExtensionStatusSource> {
         Arc::new(self.extensions.clone())
@@ -75,7 +87,7 @@ impl PluginServices {
                 return Vec::new();
             };
             manager
-                .tool_contributions_for_scope(APPLICATION_SCOPE)
+                .tool_contributions()
                 .unwrap_or_default()
                 .into_iter()
                 .map(|(manifest, tool)| PluginToolCatalogEntry {
@@ -162,14 +174,14 @@ impl magi_conversation_runtime::plugin_command::PluginCommandExecutor for NodeCo
                 .lock()
                 .map_err(|_| "插件管理器不可用".to_string())?;
             let available = manager
-                .command_contributions_for_scope(APPLICATION_SCOPE)
+                .command_contributions()
                 .map_err(|error| error.to_string())?
                 .into_iter()
                 .any(|(manifest, command)| {
                     manifest.id == selected.plugin_id && command.id == selected.contribution_id
                 });
             if !available {
-                return Err("插件命令未在当前作用域激活".into());
+                return Err("插件命令未在当前全局状态激活".into());
             }
             manager
                 .package(&selected.plugin_id)
@@ -185,7 +197,8 @@ impl magi_conversation_runtime::plugin_command::PluginCommandExecutor for NodeCo
             return Err("扩展宿主不是当前授权的版本".into());
         }
         let ctx = json!({
-            "invocationId": format!("cmd_{}_{}", invocation.turn_id, selected.contribution_id),
+            "job": invocation.job,
+            "invocationId": format!("cmd_{}", NEXT_PLUGIN_INVOCATION.fetch_add(1, Ordering::Relaxed)),
             "owner": {"sessionId": invocation.session_id, "turnId": invocation.turn_id},
             "binding": {"workspaceId": invocation.workspace_id},
         });
@@ -194,13 +207,18 @@ impl magi_conversation_runtime::plugin_command::PluginCommandExecutor for NodeCo
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         };
+        let timeout = invocation
+            .job
+            .as_ref()
+            .map(|job| Duration::from_millis(job.budget.timeout_ms as u64))
+            .unwrap_or(COMMAND_TIMEOUT);
         let value = self
             .handle
             .block_on(instance.invoke_command(
                 &selected.contribution_id,
                 json!({"text": invocation.input}),
                 ctx,
-                COMMAND_TIMEOUT,
+                timeout,
                 wait_cancelled,
             ))
             .map_err(|error| error.to_string())?;
@@ -255,9 +273,8 @@ pub(super) fn execute_tool(
     let prepared = match manager
         .lock()
         .map_err(|_| PluginError::Conflict("插件管理器不可用".into()))
-        .and_then(|manager| {
-            manager.prepare_tool_call(APPLICATION_SCOPE, model_tool_name, arguments)
-        }) {
+        .and_then(|manager| manager.prepare_tool_call(model_tool_name, arguments))
+    {
         Ok(prepared) => prepared,
         Err(error) => {
             let status = match error {
@@ -277,13 +294,8 @@ pub(super) fn execute_tool(
         return failure(Failed, "plugin_host_stale", "扩展宿主不是当前授权的版本");
     }
     let invocation_id = format!(
-        "tool_{}_{}",
-        prepared.plugin_id,
-        context
-            .task_id
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default()
+        "tool_{}",
+        NEXT_PLUGIN_INVOCATION.fetch_add(1, Ordering::Relaxed)
     );
     let ctx = json!({
         "invocationId": format!("{invocation_id}.{}", model_tool_name),
@@ -335,6 +347,21 @@ pub(super) fn execute_tool(
             // 只读工具取消后没有副作用；可能写入的工具无法确认是否已生效，不得自动重试。
             let status = if read_only { Cancelled } else { Indeterminate };
             failure(status, "tool_cancelled", "调用已取消")
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                magi_extension_host::protocol::ErrorKind::DeadlineExceeded
+                    | magi_extension_host::protocol::ErrorKind::HostGone
+                    | magi_extension_host::protocol::ErrorKind::ProtocolError
+                    | magi_extension_host::protocol::ErrorKind::Internal
+            ) =>
+        {
+            failure(
+                if read_only { Failed } else { Indeterminate },
+                "plugin_execution_unconfirmed",
+                &error.to_string(),
+            )
         }
         Err(error) => failure(
             Failed,

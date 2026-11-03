@@ -1,14 +1,13 @@
 /**
  * 已激活插件贡献的前端投影。
  *
- * daemon 的激活注册表是插件可用性的唯一事实；这里只按作用域缓存它的读取结果，
+ * daemon 的激活注册表是插件可用性的唯一事实；这里只缓存它的读取结果，
  * 让设置页、右侧面板、输入区等入口看到同一份清单，并在注册表变化后一起刷新。
  * 入口出现与面板打开分别管理：投影只决定“有哪些入口”，不打开任何页面。
  */
 
 import { untrack } from 'svelte';
 import {
-  APPLICATION_PLUGIN_SCOPE,
   loadActivePluginCommands,
   loadActivePluginManifests,
   PLUGIN_REGISTRY_CHANGED_EVENT,
@@ -17,59 +16,43 @@ import {
 } from '../web/plugin-api';
 import { RUNTIME_CONNECTION_EVENT, type AgentConnectionEventDetail } from '../web/agent-api';
 
-export { APPLICATION_PLUGIN_SCOPE };
 
-interface PluginScopeProjection {
+interface PluginProjection {
   manifests: PluginManifestProjection[];
   commands: PluginCommandProjection[];
   /** 当前修订读取成功；加载中或失败时不能据旧清单判断插件“不存在”。 */
   loaded: boolean;
 }
 
-const EMPTY_PROJECTION: PluginScopeProjection = {
+const EMPTY_PROJECTION: PluginProjection = {
   manifests: [],
   commands: [],
   loaded: false,
 };
 
-const projections = $state<Record<string, PluginScopeProjection>>({});
-/** 每次注册表变化加一；读取它的 effect 会随之重新读取 daemon 投影。 */
+const projection = $state<PluginProjection>({ ...EMPTY_PROJECTION });
 const registry = $state({ revision: 0 });
-/** 每个作用域最近一次发起读取时的注册表修订；同一修订只读取一次，多个入口共享结果。 */
-const requestedRevision = new Map<string, number>();
-const inflight = new Map<string, Promise<void>>();
+let requestedRevision: number | undefined;
+let inflight: Promise<void> | undefined;
 
 /** 主内容区插件页面的顶层 Tab 标识；顶部标签栏与主页入口共用，保证二者指向同一页面。 */
 export function pluginMainPageId(pluginId: string, viewId: string): string {
   return `plugin:${pluginId}:${viewId}`;
 }
 
-export function pluginProjection(scope: string): PluginScopeProjection {
-  return projections[scope] ?? EMPTY_PROJECTION;
-}
+export function pluginProjection(): PluginProjection { return projection; }
 
-/** 在 `$effect` 中调用：作用域或注册表修订变化时重新读取该作用域的投影。 */
-export function trackPluginProjection(scope: string): void {
+/** 全应用只有一份 daemon 插件投影。 */
+export function trackPluginProjection(): void {
   const revision = registry.revision;
-  if (requestedRevision.get(scope) === revision) return;
-  requestedRevision.set(scope, revision);
-  // 保留已有入口，但在新修订确认前不以旧清单的缺项判断插件不存在。
-  untrack(() => {
-    projections[scope] = { ...(projections[scope] ?? EMPTY_PROJECTION), loaded: false };
-  });
-  const isCurrent = () => registry.revision === revision && requestedRevision.get(scope) === revision;
-  const loading = Promise.all([
-    loadActivePluginManifests(scope),
-    loadActivePluginCommands(scope),
-  ]).then(([manifests, commands]) => {
-    if (!isCurrent()) return;
-    projections[scope] = { manifests, commands, loaded: true };
-  }).catch(() => {
-    if (!isCurrent()) return;
-    // 网络失败不是撤权事实：保留最近一次成功投影，也不能将首次失败标成已加载。
-    requestedRevision.delete(scope);
-  });
-  inflight.set(scope, loading);
+  if (requestedRevision === revision) return;
+  requestedRevision = revision;
+  untrack(() => { projection.loaded = false; });
+  const isCurrent = () => registry.revision === revision && requestedRevision === revision;
+  inflight = Promise.all([loadActivePluginManifests(), loadActivePluginCommands()])
+    .then(([manifests, commands]) => {
+      if (isCurrent()) Object.assign(projection, { manifests, commands, loaded: true });
+    }).catch(() => { if (isCurrent()) requestedRevision = undefined; });
 }
 
 /** 当前注册表修订；读取它的 effect 会在注册表变化（含窗口重新获得焦点）后重新执行。 */
@@ -77,17 +60,17 @@ export function pluginRegistryRevision(): number {
   return registry.revision;
 }
 
-/** 取得已加载的作用域投影：尚未加载时发起读取并等待，用于不在 effect 里的一次性判断。 */
-export async function loadedPluginProjection(scope: string): Promise<PluginScopeProjection> {
+/** 取得已加载的全局投影：尚未加载时发起读取并等待，用于不在 effect 里的一次性判断。 */
+export async function loadedPluginProjection(): Promise<PluginProjection> {
   let loading: Promise<void> | undefined;
   let revision: number;
   do {
     revision = registry.revision;
-    trackPluginProjection(scope);
-    loading = inflight.get(scope);
+    trackPluginProjection();
+    loading = inflight;
     await loading;
-  } while (revision !== registry.revision || loading !== inflight.get(scope));
-  return pluginProjection(scope);
+  } while (revision !== registry.revision || loading !== inflight);
+  return pluginProjection();
 }
 
 function notifyPluginRegistryChanged(): void {

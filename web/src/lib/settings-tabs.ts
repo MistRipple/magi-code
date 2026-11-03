@@ -20,17 +20,17 @@ export interface SettingsTabDefinition {
   descKey: string;
 }
 
-/** 设置分类的唯一清单：导航与页头标题都从这里生成，顺序即导航顺序。 */
+/** 设置分类的唯一清单：核心配置 → 能力与扩展 → 使用偏好 → 系统管理与项目信息。 */
 export const SETTINGS_TABS: readonly SettingsTabDefinition[] = [
   { id: 'model', icon: 'model', titleKey: 'settings.zone.quickStart', descKey: 'settings.zone.quickStartDesc' },
+  { id: 'agents', icon: 'bot', titleKey: 'settings.zone.roles', descKey: 'settings.zone.rolesDesc' },
   { id: 'tools', icon: 'tools', titleKey: 'settings.zone.capabilities', descKey: 'settings.zone.capabilitiesDesc' },
   { id: 'browser', icon: 'globe', titleKey: 'settings.zone.browser', descKey: 'settings.zone.browserDesc' },
-  { id: 'agents', icon: 'bot', titleKey: 'settings.zone.roles', descKey: 'settings.zone.rolesDesc' },
+  { id: 'mcpServer', icon: 'plug', titleKey: 'settings.zone.mcpServer', descKey: 'settings.zone.mcpServerDesc' },
+  { id: 'plugins', icon: 'settings', titleKey: 'settings.zone.plugins', descKey: 'settings.zone.pluginsDesc' },
   { id: 'rules', icon: 'settings', titleKey: 'settings.zone.preferences', descKey: 'settings.zone.preferencesDesc' },
+  { id: 'appearance', icon: 'sparkles', titleKey: 'settings.zone.appearance', descKey: 'settings.zone.appearanceDesc' },
   { id: 'safeguard', icon: 'shield', titleKey: 'settings.zone.safeguard', descKey: 'settings.zone.safeguardDesc' },
   { id: 'stats', icon: 'stats', titleKey: 'settings.zone.usage', descKey: 'settings.zone.usageDesc' },
-  { id: 'appearance', icon: 'sparkles', titleKey: 'settings.zone.appearance', descKey: 'settings.zone.appearanceDesc' },
   { id: 'project', icon: 'git-branch', titleKey: 'settings.zone.project', descKey: 'settings.zone.projectDesc' },
-  { id: 'plugins', icon: 'settings', titleKey: 'settings.zone.plugins', descKey: 'settings.zone.pluginsDesc' },
-  { id: 'mcpServer', icon: 'plug', titleKey: 'settings.zone.mcpServer', descKey: 'settings.zone.mcpServerDesc' },
 ];

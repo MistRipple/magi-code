@@ -1,9 +1,10 @@
-//! daemon 插件领域：包、授权、作用域与生命周期。
+//! daemon 插件领域：包、授权与生命周期。
 //!
 //! 插件的可执行部分只有受信 Node 扩展，由 `magi-extension-host` 承载；这里只拥有包校验、
 //! 授权、启用/激活/升级状态与插件资源存储。SDK 1（QuickJS 后台）已移除，其包在校验阶段被拒绝。
 
 pub mod catalog;
+pub mod jobs;
 mod lifecycle;
 mod package;
 pub mod resource;
@@ -16,14 +17,9 @@ pub use lifecycle::{
     ActivePlugin, InstalledPlugin, PluginDrainGuard, PluginManager, PluginManagerState,
     PluginSource, PreparedToolCall, RetiredBuiltin,
 };
-pub use magi_app_server_protocol::{
-    PluginManifest, PluginPermission, PluginPermissionKind, PluginScopeKind,
-};
+pub use magi_app_server_protocol::{PluginManifest, PluginPermission, PluginPermissionKind};
 pub use package::{MAX_PACKAGE_BYTES, PluginPackage, validate_manifest};
 pub use resource::{PluginResource, PluginResourceStore, ResourceError};
-
-/// 插件全局生效：启用、授权、激活和资源都只有这一个作用域键，与调用发生在哪个工作区无关。
-pub const APPLICATION_SCOPE: &str = "application";
 
 /// `plugin/{插件}/{贡献}` 形式的贡献身份：技能、视图等贡献共用。
 #[derive(Clone, Debug, PartialEq, Eq)]

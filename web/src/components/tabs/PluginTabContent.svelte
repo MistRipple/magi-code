@@ -13,22 +13,22 @@
     pluginId: string;
     entry: string;
     label: string;
-    scope: string;
     /** 同一页面可能同时存在主视图和主页卡片，卡片用不同的测试标识避免混淆。 */
     frameTestId?: string;
   }
 
-  let { pluginId, entry, label, scope, frameTestId = 'plugin-view' }: Props = $props();
+  let { pluginId, entry, label, frameTestId = 'plugin-view' }: Props = $props();
   let iframe = $state<HTMLIFrameElement | null>(null);
-  const instanceId = crypto.randomUUID();
+  let instanceId = crypto.randomUUID();
   /** 与 daemon 资源快照上限一致：更大的写入在到达消息桥之前就拒绝。 */
   const MAX_WRITE_BYTES = 4 * 1024 * 1024;
   const resourceUrl = $derived(
-    agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/ui/${entry.replace(/^ui\//, '').split('/').map(encodeURIComponent).join('/')}?scope=${encodeURIComponent(scope)}`),
+    agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/ui/${entry.replace(/^ui\//, '').split('/').map(encodeURIComponent).join('/')}`),
   );
   const resourceOrigin = $derived(new URL(resourceUrl, window.location.href).origin);
 
-  function send(message: Record<string, unknown>): void {
+  function send(message: Record<string, unknown>, expectedInstance = instanceId): void {
+    if (expectedInstance !== instanceId) return;
     iframe?.contentWindow?.postMessage({
       channel: 'magi-plugin-v1',
       instanceId,
@@ -48,6 +48,7 @@
   }
 
   function handleResourceSubscriptionRequest(requestId: string, resourceId: string): void {
+    const expectedInstance = instanceId;
     if (activeResourceSubscriptions.has(resourceId)) {
       send({ type: 'response', requestId, ok: true });
       return;
@@ -55,12 +56,12 @@
     const unsubscribe = subscribePluginResource(
       pluginId,
       resourceId,
-      scope,
       (resource) => {
-        send({ type: 'event', resourceId, resource });
+        send({ type: 'event', resourceId, resource }, expectedInstance);
       },
       () => {
         // 订阅失败或被 daemon 结束（停用、撤权、升级）：释放句柄，视图可在恢复后重新订阅。
+        if (expectedInstance !== instanceId) return;
         activeResourceSubscriptions.get(resourceId)?.();
         activeResourceSubscriptions.delete(resourceId);
         send({ type: 'event', resourceId, error: 'subscription_failed' });
@@ -75,6 +76,7 @@
       || event.source !== iframe?.contentWindow || !event.data || event.data.channel !== 'magi-plugin-v1'
       || event.data.instanceId !== instanceId || event.data.type !== 'request') return;
     const requestId = typeof event.data.requestId === 'string' ? event.data.requestId : '';
+    const expectedInstance = instanceId;
     const operation = event.data.operation;
     if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write'].includes(operation)) return;
     try {
@@ -90,26 +92,24 @@
         return;
       }
       const result = operation === 'resource.read'
-        ? await readPluginResource(pluginId, resourceId, scope)
+        ? await readPluginResource(pluginId, resourceId)
         : operation === 'resource.write'
           ? await writePluginResource(
             pluginId,
             resourceId,
-            scope,
-            typeof event.data.expectedVersion === 'number' ? event.data.expectedVersion : -1,
+                  typeof event.data.expectedVersion === 'number' ? event.data.expectedVersion : -1,
             event.data.value,
           )
           : operation === 'settings.read'
-            ? await readPluginSettings(pluginId, scope)
+            ? await readPluginSettings(pluginId)
             : await writePluginSettings(
               pluginId,
-              scope,
-              typeof event.data.expectedVersion === 'number' ? event.data.expectedVersion : -1,
+                      typeof event.data.expectedVersion === 'number' ? event.data.expectedVersion : -1,
               event.data.value,
             );
-      send({ type: 'response', requestId, ok: true, result });
+      send({ type: 'response', requestId, ok: true, result }, expectedInstance);
     } catch (error) {
-      send({ type: 'response', requestId, ok: false, error: error instanceof Error ? error.message : String(error) });
+      send({ type: 'response', requestId, ok: false, error: error instanceof Error ? error.message : String(error) }, expectedInstance);
     }
   }
 
@@ -129,7 +129,11 @@
   src={resourceUrl}
   title={label}
   bind:this={iframe}
-  onload={() => send({ type: 'init', pluginId, scope })}
+  onload={() => {
+    releaseResourceSubscriptions();
+    instanceId = crypto.randomUUID();
+    send({ type: 'init', pluginId });
+  }}
   sandbox="allow-scripts"
   referrerpolicy="no-referrer"
 ></iframe>

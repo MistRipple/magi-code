@@ -424,6 +424,25 @@ pub fn invoke_auxiliary_model_with_usage(
     }
 }
 
+/// 扩展模型调用沿同一角色绑定记录用量，不允许扩展自报模型身份。
+pub(crate) fn extension_model_usage_binding(
+    settings: Option<&Arc<SettingsStore>>,
+    role: &str,
+) -> Result<ModelUsageBinding, String> {
+    let mut binding = session_turn_model_usage_binding(false);
+    binding.template_id = role.to_owned();
+    if let Some(config) = settings
+        .map(|s| configured_role_engine_model_config(s, role))
+        .transpose()?
+        .flatten()
+    {
+        binding.engine_id = config.engine_id;
+        binding.binding_revision = config.binding_revision;
+        binding.model_config = config.config.to_usage_llm_config();
+    }
+    Ok(binding)
+}
+
 pub fn session_turn_model_usage_binding(use_tools: bool) -> ModelUsageBinding {
     ModelUsageBinding {
         model_config: None,
@@ -855,10 +874,9 @@ fn publish_model_usage_record_internal(
             let mut attempt = input.clone();
             attempt.call_identity.call_id = attempt_id.clone();
             attempt.call_identity.parent_call_id = Some(input.call_identity.call_id.clone());
-            attempt.call_identity.transport =
-                transport
-                    .as_ref()
-                    .map(magi_usage_authority::UsageTransportIdentity::from_receipt);
+            attempt.call_identity.transport = transport
+                .as_ref()
+                .map(magi_usage_authority::UsageTransportIdentity::from_receipt);
             attempt.event_id = Some(format!(
                 "model-usage:{usage_scope_key}:{session_id}:{attempt_id}"
             ));
@@ -1118,7 +1136,8 @@ fn usage_tokens_from_payload(usage: Option<&serde_json::Value>) -> Option<UsageT
             "/promptTokensDetails/cachedTokens",
             "/inputTokensDetails/cachedTokens",
         ],
-    ).or_else(|| usage_u64_field(usage, &["prompt_cache_hit_tokens", "promptCacheHitTokens"]));
+    )
+    .or_else(|| usage_u64_field(usage, &["prompt_cache_hit_tokens", "promptCacheHitTokens"]));
     let explicit_cache_read_tokens = usage_u64_field(
         usage,
         &[

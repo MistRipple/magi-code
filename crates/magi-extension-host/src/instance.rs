@@ -13,7 +13,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -21,7 +24,7 @@ use tokio::{
     sync::{Notify, watch},
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LaunchConfig {
     /// 产品随包的固定版本 Node 可执行文件。
     pub node: PathBuf,
@@ -42,6 +45,9 @@ pub struct LaunchConfig {
     /// 清单声明的用户命令 ID。
     pub commands: Vec<String>,
     pub config: Value,
+    pub config_revision: u64,
+    /// Node 扩展反向调用 daemon 的公开服务。未配置时，服务方法明确返回未找到。
+    pub service: Option<Arc<dyn crate::HostService>>,
     pub connect_timeout: Duration,
     pub handshake_timeout: Duration,
     pub ready_timeout: Duration,
@@ -68,6 +74,8 @@ impl LaunchConfig {
             tools: Vec::new(),
             commands: Vec::new(),
             config: Value::Null,
+            config_revision: 0,
+            service: None,
             connect_timeout: Duration::from_secs(15),
             handshake_timeout: Duration::from_secs(5),
             ready_timeout: Duration::from_secs(10),
@@ -101,6 +109,31 @@ pub struct ApprovedHook {
     pub deadline: Duration,
 }
 
+/// 由 daemon 签发的调用租约；连接与父调用结束即失效，不相信插件自报的 owner。
+#[derive(Clone)]
+struct InvocationLease {
+    context: Value,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    model_calls: Arc<std::sync::atomic::AtomicU32>,
+}
+
+struct InvocationGuard {
+    id: String,
+    leases: Arc<Mutex<HashMap<String, InvocationLease>>>,
+}
+impl Drop for InvocationGuard {
+    fn drop(&mut self) {
+        if let Some(lease) = self
+            .leases
+            .lock()
+            .expect("invocation leases")
+            .remove(&self.id)
+        {
+            lease.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 pub struct HostInstance {
     pub plugin_id: String,
     pub version: String,
@@ -112,6 +145,8 @@ pub struct HostInstance {
     bound: Arc<Mutex<HashSet<String>>>,
     bound_tools: Arc<Mutex<HashSet<String>>>,
     bound_commands: Arc<Mutex<HashSet<String>>>,
+    next_invocation: AtomicU64,
+    invocations: Arc<Mutex<HashMap<String, InvocationLease>>>,
     stop: Arc<Notify>,
     exited: watch::Receiver<bool>,
 }
@@ -182,7 +217,11 @@ impl HostInstance {
             ));
         }
         self.invoke_bound(
-            "command.invoke",
+            if ctx.get("job").is_some_and(|v| !v.is_null()) {
+                "job.run"
+            } else {
+                "command.invoke"
+            },
             "command",
             command,
             input,
@@ -204,14 +243,39 @@ impl HostInstance {
         timeout: Duration,
         cancelled: impl std::future::Future<Output = ()>,
     ) -> Result<Value, RpcError> {
-        let invocation_id = ctx
+        let base_invocation_id = ctx
             .get("invocationId")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let invocation_id = format!(
+            "{}:{}:{}",
+            self.plugin_id,
+            self.generation,
+            self.next_invocation.fetch_add(1, Ordering::Relaxed)
+        );
         let mut ctx = ctx;
+        ctx["invocationId"] = json!(invocation_id);
+        ctx["callerInvocationId"] = json!(base_invocation_id);
         ctx["generation"] = json!(self.generation);
         ctx["deadlineMs"] = json!(timeout.as_millis() as u64);
+        let lease = InvocationLease {
+            context: ctx.clone(),
+            cancelled: Arc::default(),
+            model_calls: Arc::default(),
+        };
+        // 保留一份与 invocation 表相同的取消句柄。外层 Turn/Task 取消或 daemon
+        // deadline 到达时，必须先标记这份句柄，再通知 Node；否则 Node 在收到
+        // host.cancel 前发出的反向服务请求仍可能被 daemon 接纳。
+        let lease_cancelled = Arc::clone(&lease.cancelled);
+        self.invocations
+            .lock()
+            .expect("invocation leases")
+            .insert(invocation_id.clone(), lease);
+        let _lease = InvocationGuard {
+            id: invocation_id.clone(),
+            leases: Arc::clone(&self.invocations),
+        };
         let request = self.peer.request(
             method,
             json!({key: name, "ctx": ctx, "input": input}),
@@ -220,6 +284,7 @@ impl HostInstance {
         let result = tokio::select! {
             result = request => result,
             _ = cancelled => {
+                lease_cancelled.store(true, Ordering::Release);
                 let _ = self.peer.notify(
                     "host.cancel",
                     json!({"invocationId": invocation_id, "reason": "cancelled"}),
@@ -228,6 +293,7 @@ impl HostInstance {
             }
         };
         if matches!(&result, Err(e) if e.kind() == ErrorKind::DeadlineExceeded) {
+            lease_cancelled.store(true, Ordering::Release);
             let _ = self.peer.notify(
                 "host.cancel",
                 json!({"invocationId": invocation_id, "reason": "deadline"}),
@@ -273,6 +339,21 @@ impl HostInstance {
         .await;
         self.peer.close();
     }
+
+    /// daemon 独立计时的健康探测；同步死循环无法响应时由监管回收整棵进程树。
+    pub async fn ping(&self) -> Result<(), RpcError> {
+        self.peer
+            .request("host.ping", json!({}), Duration::from_secs(2))
+            .await
+            .map(|_| ())
+    }
+
+    pub fn update_config(&self, revision: u64, values: Value) -> Result<(), RpcError> {
+        self.peer.notify(
+            "config.changed",
+            json!({"revision": revision, "values": values}),
+        )
+    }
 }
 
 struct HostHandler {
@@ -284,6 +365,8 @@ struct HostHandler {
     approved_commands: HashSet<String>,
     bound_commands: Arc<Mutex<HashSet<String>>>,
     ready: watch::Sender<bool>,
+    service: Option<Arc<dyn crate::HostService>>,
+    invocations: Arc<Mutex<HashMap<String, InvocationLease>>>,
 }
 
 impl Incoming for HostHandler {
@@ -343,7 +426,100 @@ impl Incoming for HostHandler {
                     ))
                 }
             }
-            _ => Err(RpcError::new(ErrorKind::MethodNotFound, method)),
+            _ => {
+                let Some(service) = &self.service else {
+                    return Box::pin(async move {
+                        Err(RpcError::new(ErrorKind::MethodNotFound, method))
+                    });
+                };
+                let service = Arc::clone(service);
+                let plugin_id = self.plugin_id.clone();
+                let mut params = params;
+                let Some(object) = params.as_object_mut() else {
+                    return Box::pin(async {
+                        Err(RpcError::new(
+                            ErrorKind::InvalidParams,
+                            "服务参数必须是对象",
+                        ))
+                    });
+                };
+                // 下划线字段仅由宿主连接注入，扩展不能伪造。
+                if object.keys().any(|key| key.starts_with('_')) {
+                    return Box::pin(async {
+                        Err(RpcError::new(ErrorKind::InvalidParams, "不允许内部字段"))
+                    });
+                }
+                let invocation = object.remove("invocationId");
+                let lease = invocation.as_ref().and_then(Value::as_str).and_then(|id| {
+                    self.invocations
+                        .lock()
+                        .expect("invocation leases")
+                        .get(id)
+                        .cloned()
+                });
+                if invocation.is_some() && lease.is_none() {
+                    return Box::pin(async {
+                        Err(RpcError::new(ErrorKind::Cancelled, "父调用租约已失效"))
+                    });
+                }
+                if let Some(lease) = lease {
+                    if method == "model.invoke"
+                        && let Some(budget) = lease.context.pointer("/job/budget")
+                    {
+                        let max_calls = budget
+                            .get("maxModelCalls")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as u32;
+                        let max_output = budget
+                            .get("maxOutputTokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let requested = object
+                            .get("maxOutputTokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(max_output);
+                        if requested == 0
+                            || requested > max_output
+                            || lease
+                                .model_calls
+                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |calls| {
+                                    (calls < max_calls).then_some(calls + 1)
+                                })
+                                .is_err()
+                        {
+                            return Box::pin(async {
+                                Err(RpcError::new(
+                                    ErrorKind::PermissionDenied,
+                                    "作业模型预算已耗尽或请求超过授权上限",
+                                ))
+                            });
+                        }
+                        object.insert("maxOutputTokens".into(), json!(requested));
+                    }
+                    object.insert("_context".into(), lease.context);
+                    return service.request_scoped(plugin_id, method, params, lease.cancelled);
+                }
+                if matches!(
+                    method.as_str(),
+                    "model.invoke"
+                        | "task.spawn"
+                        | "ask.user"
+                        | "notify.user"
+                        | "tool.call"
+                        | "session.snapshot"
+                        | "credential.ref"
+                        | "blob.put"
+                        | "blob.get"
+                ) {
+                    return Box::pin(async {
+                        Err(RpcError::new(
+                            ErrorKind::ReentryDenied,
+                            "服务需要仍在运行的工具或命令调用；钩子内不允许启动业务动作",
+                        ))
+                    });
+                }
+                return service.request_with_identity(plugin_id, method, params);
+            }
         };
         Box::pin(async move { result })
     }
@@ -379,9 +555,20 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 
 pub async fn launch(
     group: &ManagedProcessGroup,
-    config: LaunchConfig,
+    mut config: LaunchConfig,
     generation: u64,
 ) -> Result<Arc<HostInstance>, LaunchError> {
+    if let Some(service) = &config.service
+        && let Some(snapshot) = service
+            .configuration(config.plugin_id.clone())
+            .await
+            .map_err(|error| LaunchError::Handshake(error.to_string()))?
+    {
+        config.config = snapshot["value"].clone();
+        config.config_revision = snapshot["version"]
+            .as_u64()
+            .ok_or_else(|| LaunchError::Handshake("设置快照缺少版本".into()))?;
+    }
     let mut approved = HashMap::new();
     for hook in &config.hooks {
         let deadline = hook.validate().map_err(LaunchError::InvalidHook)?;
@@ -440,6 +627,16 @@ pub async fn launch(
 
     let (exited_tx, exited_rx) = watch::channel(false);
     let stop = Arc::new(Notify::new());
+    // `launch` 被调用方取消时也必须回收已启动的进程，不能只依赖成功返回后的 supervisor。
+    struct LaunchGuard(Option<Arc<Notify>>);
+    impl Drop for LaunchGuard {
+        fn drop(&mut self) {
+            if let Some(stop) = &self.0 {
+                stop.notify_one();
+            }
+        }
+    }
+    let mut launch_guard = LaunchGuard(Some(Arc::clone(&stop)));
     let exit_signal = Arc::clone(&stop);
     // 进程所有权交给监视任务：自行退出或收到停止请求时回收整棵进程树。
     tokio::spawn(async move {
@@ -499,6 +696,7 @@ pub async fn launch(
     let bound_tools: Arc<Mutex<HashSet<String>>> = Arc::default();
     let bound_commands: Arc<Mutex<HashSet<String>>> = Arc::default();
     let (ready_tx, mut ready_rx) = watch::channel(false);
+    let invocations = Arc::default();
     let handler = Arc::new(HostHandler {
         plugin_id: config.plugin_id.clone(),
         approved: approved.clone(),
@@ -508,6 +706,8 @@ pub async fn launch(
         approved_commands: config.commands.iter().cloned().collect(),
         bound_commands: Arc::clone(&bound_commands),
         ready: ready_tx,
+        service: config.service.clone(),
+        invocations: Arc::clone(&invocations),
     });
     let peer = Peer::spawn(stream, handler, config.limits);
 
@@ -524,6 +724,7 @@ pub async fn launch(
         return Err(LaunchError::NotReady(tail_text(&stderr_tail)));
     }
 
+    launch_guard.0 = None;
     Ok(Arc::new(HostInstance {
         plugin_id: config.plugin_id,
         version: config.version,
@@ -534,6 +735,8 @@ pub async fn launch(
         bound,
         bound_tools,
         bound_commands,
+        next_invocation: AtomicU64::new(1),
+        invocations,
         stop,
         exited: exited_rx,
     }))
@@ -590,7 +793,7 @@ where
                 },
                 "grants": config.grants,
                 "registrations": {"hooks": registrations, "tools": config.tools, "commands": config.commands},
-                "config": {"revision": 1, "values": config.config},
+                "config": {"revision": config.config_revision, "values": config.config},
                 "features": features,
             });
             write_frame(stream, &response_ok(&id, result), limit)

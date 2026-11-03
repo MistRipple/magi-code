@@ -7,6 +7,8 @@
 // 插件以用户权限运行，本运行时不提供也不声称任何 OS 沙箱。
 
 import net from 'node:net';
+import { AsyncLocalStorage } from 'node:async_hooks';
+const invocationContext = new AsyncLocalStorage();
 import { pathToFileURL } from 'node:url';
 
 const MAX_FRAME = 4 * 1024 * 1024;
@@ -30,6 +32,7 @@ let nextId = 1;
 const pending = new Map();
 let generation = null;
 let configValues = null;
+let configRevision = 0;
 const handlers = new Map(); // hook name -> handler
 const toolHandlers = new Map(); // tool id -> handler
 const commandHandlers = new Map(); // command id -> handler
@@ -48,10 +51,19 @@ function rpcError(kind, message) {
 }
 
 function request(method, params) {
+  const context = invocationContext.getStore();
+  if (context?.signal.aborted) return Promise.reject(Object.assign(new Error('调用已取消'), { kind: 'Cancelled' }));
+  if (context) params = { ...params, invocationId: context.invocationId };
   const id = `h${nextId++}`;
   return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject });
-    send({ id, method, params });
+    if (pending.size >= 256) return reject(Object.assign(new Error('挂起请求过多'), { kind: 'Backpressure' }));
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(Object.assign(new Error(`${method} 超时`), { kind: 'DeadlineExceeded' }));
+    }, 120_000);
+    pending.set(id, { resolve, reject, timer });
+    try { send({ id, method, params }); }
+    catch (error) { clearTimeout(timer); pending.delete(id); reject(error); }
   });
 }
 
@@ -70,10 +82,13 @@ async function handleRequest(id, method, params) {
       }
       const handler = handlers.get(params.hook);
       if (!handler) return send({ id, result: { decision: 'continue' } });
+      if (typeof ctx.invocationId !== 'string' || !ctx.invocationId || inflight.has(ctx.invocationId)) {
+        return send({ id, error: rpcError('InvalidParams', '调用身份缺失或重复') });
+      }
       const controller = new AbortController();
       inflight.set(ctx.invocationId, controller);
       try {
-        const result = await handler(params.input, { ...ctx, signal: controller.signal });
+        const result = await invocationContext.run({ ...ctx, signal: controller.signal }, () => handler(params.input, { ...ctx, signal: controller.signal }));
         return send({ id, result: normalizeDecision(result) });
       } finally {
         inflight.delete(ctx.invocationId);
@@ -86,10 +101,13 @@ async function handleRequest(id, method, params) {
       }
       const handler = toolHandlers.get(params.tool);
       if (!handler) return send({ id, error: rpcError('MethodNotFound', `工具 ${params.tool} 未绑定`) });
+      if (typeof ctx.invocationId !== 'string' || !ctx.invocationId || inflight.has(ctx.invocationId)) {
+        return send({ id, error: rpcError('InvalidParams', '调用身份缺失或重复') });
+      }
       const controller = new AbortController();
       inflight.set(ctx.invocationId, controller);
       try {
-        const output = await handler(params.input, { ...ctx, signal: controller.signal });
+        const output = await invocationContext.run({ ...ctx, signal: controller.signal }, () => handler(params.input, { ...ctx, signal: controller.signal }));
         return send({ id, result: { output: output === undefined ? null : output } });
       } catch (error) {
         // 工具自身抛出的错误是模型可见的工具失败，不是协议错误。
@@ -98,17 +116,20 @@ async function handleRequest(id, method, params) {
         inflight.delete(ctx.invocationId);
       }
     }
-    if (method === 'command.invoke') {
+    if (method === 'command.invoke' || method === 'job.run') {
       const ctx = params?.ctx ?? {};
       if (generation !== null && ctx.generation !== generation) {
         return send({ id, error: rpcError('StaleGeneration', '实例代次不符') });
       }
       const handler = commandHandlers.get(params.command);
       if (!handler) return send({ id, error: rpcError('MethodNotFound', `命令 ${params.command} 未绑定`) });
+      if (typeof ctx.invocationId !== 'string' || !ctx.invocationId || inflight.has(ctx.invocationId)) {
+        return send({ id, error: rpcError('InvalidParams', '调用身份缺失或重复') });
+      }
       const controller = new AbortController();
       inflight.set(ctx.invocationId, controller);
       try {
-        const output = await handler(params.input, { ...ctx, signal: controller.signal });
+        const output = await invocationContext.run({ ...ctx, signal: controller.signal }, () => handler(params.input, { ...ctx, signal: controller.signal }));
         const content = typeof output === 'string' ? output : output?.content;
         if (typeof content !== 'string' || !content.trim()) {
           return send({ id, result: { isError: true, content: '命令必须返回非空文本，或 { content: string }' } });
@@ -135,7 +156,12 @@ function normalizeDecision(result) {
 }
 
 function handleNotification(method, params) {
-  if (method === 'host.cancel') {
+  if (method === 'config.changed') {
+    if (Number.isSafeInteger(params?.revision) && params.revision > configRevision) {
+      configValues = deepFreeze(params.values ?? null);
+      configRevision = params.revision;
+    }
+  } else if (method === 'host.cancel') {
     inflight.get(params?.invocationId)?.abort();
   } else if (method === 'hook.notify') {
     const handler = handlers.get(params?.hook);
@@ -152,7 +178,8 @@ function onFrame(value) {
   const waiter = pending.get(value.id);
   if (!waiter) return;
   pending.delete(value.id);
-  if (value.error) waiter.reject(Object.assign(new Error(value.error.message), { rpc: value.error }));
+  clearTimeout(waiter.timer);
+  if (value.error) waiter.reject(Object.assign(new Error(value.error.message), { rpc: value.error, kind: value.error.data?.kind }));
   else waiter.resolve(value.result);
 }
 
@@ -170,9 +197,36 @@ socket.on('data', (chunk) => {
 socket.on('close', () => process.exit(0));
 socket.on('error', (error) => fail(`连接失败: ${error.message}`));
 
+function deepFreeze(value) {
+  if (value && typeof value === 'object') {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
 const api = Object.freeze({
   /** 握手时 daemon 下发的配置快照（只读）。 */
   get config() { return configValues; },
+  get configRevision() { return configRevision; },
+  resource: Object.freeze({
+    read: (id) => request('resource.read', { resourceId: id }),
+    write: (id, expectedVersion, value) => request('resource.write', { resourceId: id, expectedVersion, value }),
+  }),
+  settings: Object.freeze({
+    async read() {
+      const snapshot = await request('settings.read', {});
+      configValues = deepFreeze(snapshot.value);
+      configRevision = snapshot.version;
+      return snapshot;
+    },
+    async write(expectedVersion, value) {
+      const snapshot = await request('settings.write', { expectedVersion, value });
+      configValues = deepFreeze(snapshot.value);
+      configRevision = snapshot.version;
+      return snapshot;
+    },
+  }),
   /** 绑定钩子处理器；钩子必须已在清单中声明并被 daemon 批准。 */
   async on(hook, handler) {
     if (typeof handler !== 'function') throw new TypeError('handler 必须是函数');
@@ -191,6 +245,17 @@ const api = Object.freeze({
     await request('register.command', { name: id });
     commandHandlers.set(id, handler);
   },
+  model: Object.freeze({ invoke: (input = {}) => request('model.invoke', input) }),
+  tools: Object.freeze({ call: (tool, input = {}) => request('tool.call', { tool, input }) }),
+  task: Object.freeze({ spawn: (input = {}) => request('task.spawn', input) }),
+  notify: Object.freeze({ user: (input = {}) => request('notify.user', input) }),
+  ask: Object.freeze({ user: (input = {}) => request('ask.user', input) }),
+  session: Object.freeze({ snapshot: (input = {}) => request('session.snapshot', input) }),
+  credential: Object.freeze({ ref: (input = {}) => request('credential.ref', input) }),
+  blob: Object.freeze({
+    put: (value, contentType) => request('blob.put', { value, contentType }),
+    get: (ref) => request('blob.get', { ref }),
+  }),
   log(message) {
     send({ method: 'host.log', params: { message: String(message).slice(0, 4096) } });
   },
@@ -206,7 +271,8 @@ socket.on('connect', async () => {
       features: FEATURES,
     });
     generation = hello.instance.generation;
-    configValues = Object.freeze(hello.config?.values ?? null);
+    configValues = deepFreeze(hello.config?.values ?? null);
+    configRevision = hello.config?.revision ?? 0;
     const module = await import(pathToFileURL(entry).href);
     if (typeof module.default !== 'function') throw new Error('入口必须默认导出 activate(api)');
     await module.default(api);

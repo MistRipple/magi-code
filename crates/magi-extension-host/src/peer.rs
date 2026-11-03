@@ -252,8 +252,18 @@ impl Inner {
                 }
                 let inner = Arc::clone(self);
                 let handler = Arc::clone(handler);
+                let mut closed = self.closed.subscribe();
                 tokio::spawn(async move {
-                    let reply = match handler.request(method, params).await {
+                    let result = tokio::select! {
+                        biased;
+                        _ = async { while !*closed.borrow_and_update() { if closed.changed().await.is_err() { break; } } } => {
+                            inner.incoming_inflight.fetch_sub(1, Ordering::SeqCst);
+                            return;
+                        }
+                        result = tokio::time::timeout(Duration::from_secs(120), handler.request(method, params)) =>
+                            result.unwrap_or_else(|_| Err(RpcError::new(ErrorKind::DeadlineExceeded, "宿主服务超时"))),
+                    };
+                    let reply = match result {
                         Ok(result) => response_ok(&id, result),
                         Err(error) => response_err(&id, &error),
                     };

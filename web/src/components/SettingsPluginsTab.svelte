@@ -159,7 +159,7 @@
   function permissionText(permission: PluginPermission): string {
     if (permission.kind === 'extension') return i18n.t('settings.plugins.permission.extensionFullTrust');
     if (permission.kind === 'contextRewrite') return i18n.t('settings.plugins.permission.contextRewrite');
-    return `${permission.kind}: ${permission.scope}${permission.targets.length ? `, ${permission.targets.join(', ')}` : ''}`;
+    return `${permission.kind}${permission.targets.length ? `: ${permission.targets.join(', ')}` : ''}`;
   }
 
   const hasCatalog = $derived(Boolean(center && center.entries.length > 0));

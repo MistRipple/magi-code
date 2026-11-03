@@ -32,16 +32,15 @@
   import { synchronizeBrowserAuthority } from './web/browser-authority-coordinator';
   import { syncSessionIsolations } from './stores/session-isolation-store.svelte';
   import { syncWorkspaceWaits } from './stores/workspace-wait-store.svelte';
-  import { APPLICATION_PLUGIN_SCOPE, pluginMainPageId, pluginProjection, trackPluginProjection } from './stores/plugin-registry.svelte';
+  import { pluginMainPageId, pluginProjection, trackPluginProjection } from './stores/plugin-registry.svelte';
 
   // 插件在主内容区声明的完整页面。入口只来自 daemon 的激活投影；插件停用后入口消失，
   // 正在查看该页面时当前 Tab 自动回到对话。
-  const pluginScope = APPLICATION_PLUGIN_SCOPE;
   $effect(() => {
-    trackPluginProjection(pluginScope);
+    trackPluginProjection();
   });
   const mainPluginPages = $derived(
-    pluginProjection(pluginScope).manifests.flatMap((manifest) => (
+    pluginProjection().manifests.flatMap((manifest) => (
       (manifest.contributions.views ?? [])
         .filter((view) => view.placements.includes('main'))
         .map((view) => ({
@@ -420,7 +419,7 @@
     </div>
     {#each mainPluginPages.filter((page) => page.id === currentTopTab) as page (page.id)}
       <div class="top-tab-pane active">
-        <PluginTabContent pluginId={page.pluginId} entry={page.entry} label={page.label} scope={pluginScope} />
+        <PluginTabContent pluginId={page.pluginId} entry={page.entry} label={page.label} />
       </div>
     {/each}
   </div>

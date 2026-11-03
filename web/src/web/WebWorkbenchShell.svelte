@@ -24,8 +24,7 @@
     refreshExternalSessions,
   } from '../stores/external-sessions.svelte';
   import { externalApprovals } from '../stores/external-approvals.svelte';
-  import { pluginRegistryRevision } from '../stores/plugin-registry.svelte';
-  import SidebarFooter from '../components/SidebarFooter.svelte';
+    import SidebarFooter from '../components/SidebarFooter.svelte';
   import Modal from '../components/Modal.svelte';
   import SelectField from '../components/SelectField.svelte';
   import { runActionWithFeedback } from '../lib/action-feedback';
@@ -432,9 +431,8 @@ import {
     });
   });
 
-  // 外部客户端会话（Magi MCP）：首次、以及插件注册表变化（激活、停用、窗口重新获得焦点）后读取；调用过程由事件驱动。
+  // 外部客户端会话（Magi MCP 内置功能）：首次和工作区变化后读取；调用过程由事件驱动。
   $effect(() => {
-    void pluginRegistryRevision();
     void workspaces;
     void refreshExternalSessions();
   });

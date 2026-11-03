@@ -30,7 +30,7 @@
   import { getAgentSessionMessages } from '../web/agent-api';
   import { normalizeCanonicalTurnStrict } from '../shared/protocol/canonical-turn';
   import { setCanonicalTimelineError } from '../stores/turn-store.svelte';
-  import { APPLICATION_PLUGIN_SCOPE, pluginMainPageId, pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
+  import { pluginMainPageId, pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
   import { postBridgeMessage } from '../shared/bridges/bridge-runtime';
   import {
     MessageScrollCoordinator,
@@ -578,13 +578,12 @@
   const emptyTitle = $derived(emptyState?.title || i18n.t('messageList.empty.title'));
   const emptyHint = $derived(emptyState?.hint || i18n.t('messageList.empty.hint'));
   // 主页入口只来自 daemon 的激活投影；它只是进入主内容区页面的触发器，不会自动打开任何页面。
-  const homePluginScope = APPLICATION_PLUGIN_SCOPE;
   $effect(() => {
-    trackPluginProjection(homePluginScope);
+    trackPluginProjection();
   });
   const homeEntries = $derived(
     displayContext === 'thread' && !emptyState
-      ? pluginProjection(homePluginScope).manifests.flatMap((manifest) => (
+      ? pluginProjection().manifests.flatMap((manifest) => (
         (manifest.contributions.views ?? [])
           .filter((view) => view.placements.includes('home') && view.placements.includes('main'))
           .map((view) => ({
@@ -597,7 +596,7 @@
   // 主页卡片是插件显式声明的嵌入视图（homeCard）；与入口一样只来自 daemon 的激活投影。
   const homeCards = $derived(
     displayContext === 'thread' && !emptyState
-      ? pluginProjection(homePluginScope).manifests.flatMap((manifest) => (
+      ? pluginProjection().manifests.flatMap((manifest) => (
         (manifest.contributions.views ?? [])
           .filter((view) => view.placements.includes('homeCard'))
           .map((view) => ({
@@ -1789,7 +1788,7 @@
                   {/if}
                 </header>
                 <div class="plugin-home-card-body">
-                  <PluginTabContent pluginId={card.pluginId} entry={card.entry} label={card.title} scope={homePluginScope} frameTestId="plugin-card-view" />
+                  <PluginTabContent pluginId={card.pluginId} entry={card.entry} label={card.title} frameTestId="plugin-card-view" />
                 </div>
               </section>
             {/each}

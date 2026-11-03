@@ -1,8 +1,10 @@
 # Magi 插件作者指南
 
-> **状态说明（2026-11-02）：** 本指南描述 SDK 2。SDK 1（QuickJS 后台，`backend` / `plugin.mjs`）已移除：安装这类包会被明确拒绝，不提供兼容执行或自动转换。SDK 2 目前提供三类内容：声明式贡献（技能、视图、资源、浏览器 surface）、受信 Node 扩展（对会话、Turn、模型与工具事件挂钩子）和扩展提供的模型工具。用户命令也由 Node 扩展提供。工作流和会话引擎不提供；数据格式迁移也没有，改变 `dataSchemaVersion` 且已有数据时升级会清空该插件的数据。
+> **状态说明（2026-11-03）：** 本指南描述 SDK 2。SDK 1（QuickJS 后台，`backend` / `plugin.mjs`）已移除：安装这类包会被明确拒绝，不提供兼容执行或自动转换。SDK 2 目前提供三类内容：声明式贡献（技能、视图、资源、浏览器 surface）、受信 Node 扩展（对会话、Turn、模型与工具事件挂钩子）和扩展提供的模型工具。用户命令和持久插件作业也由 Node 扩展提供。工作流和会话引擎不提供；数据格式迁移也没有，改变 `dataSchemaVersion` 且已有数据时升级会清空该插件的数据。
 
 这是一份可以单独保存、复制给其他开发者或交给 AI 使用的 Magi 插件开发手册。你需要了解基本 JavaScript 和 JSON；增加页面时需要基本 HTML。
+
+当前 SDK 2 的 Node API 已接通资源/设置、受信钩子、模型调用、通知、会话快照、凭据引用与有界 blob；`ask.user` 复用原生用户问题等待。`model.invoke` 与 `credential.ref` 还必须声明并获批 `models` 权限（目标为 `default` 或明确的角色 ID）。`task.spawn` 与 `tool.call` 复用原生 Task/工具管线；`job.run` 由 daemon 的持久计划触发，计划执行失败或结果不确定时不会自动重跑；没有活动归属、权限或审批时会拒绝，插件不能伪造这些字段。后台包当前使用单个 `extension/index.mjs` 入口，依赖应在作者构建阶段打包进该入口；不支持裸相对导入或运行时从 npm 安装依赖。
 
 ## 1. 先确认你的功能适合哪种形态
 
@@ -14,6 +16,7 @@
 | 观察或拦截会话事件：工具调用前后、用户输入、子代理派发、模型请求与响应、用量 | Node 扩展 | `extension.hooks`，需要“完全信任”授权 |
 | 为模型提供新的工具 | Node 扩展 | `contributions.tools` 声明、`api.tool` 实现，第 5 节 |
 | 为用户提供斜杠命令 | Node 扩展 | `contributions.commands` 声明、`api.command` 实现，第 6 节 |
+| 持久插件作业 | daemon 调度 + Node 扩展 | 计划状态由 daemon 持久化，复用 `api.command` 处理器；失败不会静默重试 |
 | 工作流、会话引擎 | 不提供 | 已随 QuickJS 移除，不会重建 |
 
 插件的安装、授权、启用和数据都对所有工作区共用一份。
@@ -28,14 +31,14 @@
   "id": "acme.audit",
   "version": "1.0.0",
   "name": "审计",
-  "description": "记录每次工具调用",
+  "description": "检查每次工具调用",
   "permissions": [
-    { "kind": "extension", "scope": "application", "targets": ["full-trust"] }
+    { "kind": "extension", "targets": ["full-trust"] }
   ],
   "dataSchemaVersion": 1,
   "settingsSchema": { "type": "object", "additionalProperties": false },
   "extension": {
-    "hooks": [{ "name": "tool.call", "mode": "observe" }]
+    "hooks": [{ "name": "tool.call", "mode": "guard" }]
   },
   "contributions": {}
 }
@@ -72,6 +75,21 @@ export default async function activate(api) {
 }
 ```
 
+### 4.1 资源与设置服务
+
+受信扩展可通过 daemon 的同一资源事实源读写已声明资源；写入必须携带读取到的版本，冲突会被拒绝。设置使用清单中的 `settingsSchema` 校验，也采用同样的版本提交语义。入口启动时收到真实设置快照，设置在界面修改后会通过 `config.changed` 更新 `api.config` 和 `api.configRevision`：
+
+```js
+export default async function activate(api) {
+  const current = await api.resource.read('notes');
+  await api.resource.write('notes', current.version, { text: 'hello' });
+  const settings = await api.settings.read();
+  await api.settings.write(settings.version, { enabled: true });
+}
+```
+
+这些服务只覆盖插件声明并获 `storage` 授权的全局插件资源范围。它们不提供会话、任务或 canonical 日志写入；服务未声明的能力会明确拒绝。
+
 要点：
 
 - `guard` 钩子失败或超时时关闭（拒绝该操作）；`advise` 与 `observe` 失败只影响自己，宿主继续。
@@ -89,8 +107,8 @@ export default async function activate(api) {
 
 ```json
 "permissions": [
-  { "kind": "extension", "scope": "application", "targets": ["full-trust"] },
-  { "kind": "tools", "scope": "application", "targets": ["word-count"] }
+  { "kind": "extension", "targets": ["full-trust"] },
+  { "kind": "tools", "targets": ["word-count"] }
 ],
 "extension": { "hooks": [] },
 "contributions": { "tools": [{
@@ -129,7 +147,13 @@ export default async function activate(api) {
 - 处理器返回非空字符串或 `{ content }`；抛错或返回空文本会让这一轮失败并显示原因。上限 120 秒，停止该轮时 `ctx.signal` 中止。
 - 命令不能与技能、目标模式、图片或上下文引用同时提交；授权由 `extension` 的完全信任覆盖，不需要额外权限。
 
-## 7. 打包与分发
+## 7. 持久插件作业
+
+插件作业由 daemon 计划状态拥有；Node 只绑定处理器，不自己保存定时器。作业计划通过 `/api/plugins/{pluginId}/jobs` 创建、查询和取消，必须引用当前已激活插件的公开命令、目标会话和预算。`runAt` 使用 Unix 毫秒，`intervalMs` 可选且最小为一分钟。daemon 在产生执行副作用前先持久化 `pendingRequestId`；重启会复用同一身份，不重复启动。
+
+作业执行沿普通 Session Turn 写入 canonical 记录，命令输出和失败可回看。作业停止、插件停用、包摘要变化、目标会话不存在或宿主不可用时，计划不会自动换包、改参数或静默重试。
+
+## 8. 打包与分发
 
 把插件目录打成 ZIP（根目录即包根，不要多套一层文件夹）。仓库提供 `scripts/pack-plugin.mjs`，输出可重现的 ZIP：
 
@@ -139,6 +163,6 @@ node scripts/pack-plugin.mjs <插件目录> <输出.zip>
 
 用户在设置 → 插件中安装本地包，安装前会预览权限与版本差异，并把确认绑定到包摘要。官方插件中心与自建目录使用签名目录（序号、过期时间、吊销列表），详见插件中心说明。
 
-## 8. 升级
+## 9. 升级
 
-升级会保留各作用域的启用意愿，但清空授权与激活，用户须对新包重新授权。`dataSchemaVersion` 变化且已有持久数据时，升级会清空该插件的资源数据与设置：没有数据转换通道，升级前的预览会明确提示。
+升级会保留全局启用意愿，但清空授权与激活，用户须对新包重新授权。`dataSchemaVersion` 变化且已有持久数据时，升级会清空该插件的资源数据与设置：没有数据转换通道，升级前的预览会明确提示。

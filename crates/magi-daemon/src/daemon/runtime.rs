@@ -1760,7 +1760,6 @@ impl DaemonRuntime {
             self.state_root.clone(),
         );
 
-        self.plugins.start_extensions(self.event_bus.clone());
         let extension_hooks_adapter = Arc::new(super::extension_bridge::ExtensionBusHooks::new(
             self.plugins.extension_bus(),
             tokio::runtime::Handle::current(),
@@ -1794,6 +1793,8 @@ impl DaemonRuntime {
                 .with_workspace_execution_preparer(magi_api::workspace_execution_preparer(&state))
                 .with_extension_hooks(extension_bus_hooks),
         );
+        self.plugins.bind_native(&llm_task_dispatcher);
+        self.plugins.start_extensions(self.event_bus.clone());
         let session_turn_dispatcher = llm_task_dispatcher.clone();
         state = state
             .with_input_guard(extension_hooks_adapter)
@@ -1813,6 +1814,7 @@ impl DaemonRuntime {
         .with_checkpoint_persist(task_checkpoint_persist);
         let runner_manager = Arc::new(runner_manager);
         state = state.with_shared_runner_manager(runner_manager.clone());
+        state.start_plugin_jobs();
         // 回调在 mutation guard 外的普通线程等待原 restart 锁；整个投影/释放
         // 过程结束前不能重开该 scope，也不会持有 TaskStore mutation 锁执行 IO。
         task_store.set_status_change_callback_async(true);

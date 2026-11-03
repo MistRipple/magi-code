@@ -15,7 +15,8 @@ use magi_extension_host::{
     protocol::{HookMode, HookRegistration},
     supervisor::{PluginSupervisor, RestartPolicy, SupervisorState, supervise},
 };
-use magi_plugin_system::{APPLICATION_SCOPE, PluginManager, PluginPackage};
+
+use magi_plugin_system::{PluginManager, PluginPackage};
 use magi_process::ManagedProcessGroup;
 use sha2::{Digest, Sha256};
 use std::{
@@ -49,6 +50,7 @@ fn resolve_node(
 struct Running {
     digest: String,
     supervisor: Option<PluginSupervisor>,
+    quiesced: bool,
 }
 
 #[derive(Clone)]
@@ -63,6 +65,7 @@ pub(super) struct ExtensionRuntime {
     /// 各扩展的运行状态（监管状态的只读投影），界面经 API 读取；变化时发布事件。
     board: Arc<std::sync::RwLock<HashMap<String, PluginRuntimeStatus>>>,
     events: Arc<std::sync::OnceLock<Arc<InMemoryEventBus>>>,
+    native: Arc<std::sync::OnceLock<super::extension_services::NativeService>>,
 }
 
 /// 把监管状态映射为界面可见的运行状态。`blocking` 是在宿主不可用期间正被 fail-closed 的
@@ -129,7 +132,34 @@ impl ExtensionRuntime {
             running: Arc::default(),
             board: Arc::default(),
             events: Arc::default(),
+            native: Arc::default(),
         }
+    }
+
+    pub(super) fn bind_native(
+        &self,
+        dispatcher: &Arc<magi_conversation_runtime::task_execution_dispatcher::LlmTaskDispatcher>,
+    ) {
+        let dispatcher = Arc::downgrade(dispatcher);
+        let _ = self
+            .native
+            .set(Arc::new(move |plugin, method, params, cancelled| {
+                dispatcher
+                    .upgrade()
+                    .ok_or_else(|| {
+                        magi_extension_host::protocol::RpcError::new(
+                            magi_extension_host::protocol::ErrorKind::HostGone,
+                            "原生执行器已退出",
+                        )
+                    })?
+                    .extension_service(&plugin, &method, params, cancelled)
+                    .map_err(|e| {
+                        magi_extension_host::protocol::RpcError::new(
+                            magi_extension_host::protocol::ErrorKind::Blocked,
+                            e,
+                        )
+                    })
+            }));
     }
 
     fn set_status(&self, id: &str, status: Option<PluginRuntimeStatus>) {
@@ -156,8 +186,32 @@ impl ExtensionRuntime {
         let mut receiver = events.subscribe();
         tokio::spawn(async move {
             runtime.reconcile().await;
+            // 请求取消或客户端断开也可能释放生命周期准入；周期收敛保证其后恢复，
+            // 不把某个事件是否送达作为启用状态的第二份事实。
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                match receiver.recv().await {
+                let event = tokio::select! {
+                    event = receiver.recv() => event,
+                    _ = tick.tick() => { runtime.reconcile().await; continue; }
+                };
+                match event {
+                    Ok(event)
+                        if event.event_type == "plugin.resource.updated"
+                            && event
+                                .payload
+                                .get("resourceId")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("__settings") =>
+                    {
+                        if let Some(id) = event
+                            .payload
+                            .get("pluginId")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            runtime.sync_config(id);
+                        }
+                    }
                     Ok(event) if event.event_type == "plugin.registry.changed" => {
                         runtime.reconcile().await;
                     }
@@ -165,11 +219,37 @@ impl ExtensionRuntime {
                     // 落后丢事件后无法知道漏了什么，直接再收敛一次。
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         runtime.reconcile().await;
+                        let ids = runtime
+                            .board
+                            .read()
+                            .expect("status board poisoned")
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for id in ids {
+                            runtime.sync_config(&id);
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
         });
+    }
+
+    fn sync_config(&self, id: &str) {
+        let Some(instance) = self.bus.instance(id) else {
+            return;
+        };
+        let Ok(manager) = self.manager.lock() else {
+            return;
+        };
+        if manager
+            .package(id)
+            .is_ok_and(|package| package.digest() == instance.digest)
+            && let Ok(resource) = manager.read_settings(id)
+        {
+            let _ = instance.update_config(resource.version, resource.value);
+        }
     }
 
     #[cfg(test)]
@@ -198,9 +278,15 @@ impl ExtensionRuntime {
         let stale: Vec<String> = running
             .iter()
             .filter(|(id, entry)| {
-                desired
-                    .get(*id)
-                    .is_none_or(|package| package.digest() != entry.digest)
+                !self
+                    .manager
+                    .lock()
+                    .expect("plugin manager poisoned")
+                    .is_draining(id)
+                    && (entry.quiesced
+                        || desired
+                            .get(*id)
+                            .is_none_or(|package| package.digest() != entry.digest))
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -215,7 +301,13 @@ impl ExtensionRuntime {
         }
 
         for (id, package) in desired {
-            if running.contains_key(&id) {
+            if running.contains_key(&id)
+                || self
+                    .manager
+                    .lock()
+                    .expect("plugin manager poisoned")
+                    .is_draining(&id)
+            {
                 continue;
             }
             let entry = self.start_plugin(&id, &package);
@@ -231,7 +323,7 @@ impl ExtensionRuntime {
             .state()
             .plugins
             .values()
-            .filter(|plugin| plugin.active_scopes.contains(APPLICATION_SCOPE))
+            .filter(|plugin| plugin.active)
             .filter_map(|plugin| manager.package(&plugin.id).ok())
             .filter(|package| package.manifest().extension.is_some())
             .map(|package| (package.manifest().id.clone(), package))
@@ -257,6 +349,7 @@ impl ExtensionRuntime {
             Running {
                 digest: digest.clone(),
                 supervisor: None,
+                quiesced: false,
             }
         };
         let Some(extension) = package.manifest().extension.as_ref() else {
@@ -320,7 +413,22 @@ impl ExtensionRuntime {
             .map(|command| command.id.clone())
             .collect();
         config.grants = vec!["extension:full-trust".into()];
-        config.config = serde_json::json!({});
+        let (config_value, config_revision) = self
+            .manager
+            .lock()
+            .ok()
+            .and_then(|manager| manager.read_settings(id).ok())
+            .map(|resource| (resource.value, resource.version))
+            .unwrap_or((serde_json::Value::Null, 0));
+        config.config = config_value;
+        config.config_revision = config_revision;
+        config.service = Some(Arc::new(super::extension_services::PluginHostService {
+            manager: Arc::clone(&self.manager),
+            events: Arc::clone(&self.events),
+            digest: digest.clone(),
+            native: Arc::clone(&self.native),
+            blobs: Arc::default(),
+        }));
         let supervisor = supervise(
             self.group.clone(),
             Arc::clone(&self.bus),
@@ -357,6 +465,7 @@ impl ExtensionRuntime {
         Running {
             digest,
             supervisor: Some(supervisor),
+            quiesced: false,
         }
     }
 
@@ -390,6 +499,28 @@ impl ExtensionRuntime {
 impl magi_api::ExtensionStatusSource for ExtensionRuntime {
     fn status(&self, plugin_id: &str) -> Option<PluginRuntimeStatus> {
         self.board.read().ok()?.get(plugin_id).cloned()
+    }
+
+    fn quiesce(
+        &self,
+        plugin_id: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        let runtime = self.clone();
+        Box::pin(async move {
+            // 回收任务独立于 HTTP future：客户端中断不能在旧宿主仍活着时释放互斥。
+            tokio::spawn(async move {
+                let mut running = runtime.running.lock().await;
+                if let Some(entry) = running.get_mut(&plugin_id) {
+                    entry.quiesced = true;
+                    if let Some(supervisor) = entry.supervisor.take() {
+                        supervisor.stop().await;
+                    }
+                }
+                runtime.bus.detach(&plugin_id);
+            })
+            .await
+            .map_err(|error| format!("扩展回收任务失败：{error}"))
+        })
     }
 }
 
@@ -469,7 +600,7 @@ export default async function activate(api) {
         let manifest: PluginManifest = serde_json::from_value(json!({
             "sdkVersion": 2, "id": "acme.guard", "version": "1.0.0", "name": "Guard", "description": "",
             "extension": {"hooks": [{"name": "tool.call", "mode": "guard", "deadlineMs": 3000}]},
-            "permissions": [{"kind": "extension", "scope": "application", "targets": ["full-trust"]}],
+            "permissions": [{"kind": "extension", "targets": ["full-trust"]}],
             "dataSchemaVersion": 1,
             "settingsSchema": {"type": "object", "additionalProperties": false},
             "contributions": {}
@@ -526,15 +657,11 @@ export default async function activate(api) {
                 },
             )
             .unwrap();
-        manager.enable("acme.guard", "application").unwrap();
+        manager.enable("acme.guard").unwrap();
         manager
-            .authorize(
-                "acme.guard",
-                "application",
-                package.manifest().permissions.clone(),
-            )
+            .authorize("acme.guard", package.manifest().permissions.clone())
             .unwrap();
-        manager.activate("acme.guard", "application").unwrap();
+        manager.activate("acme.guard").unwrap();
     }
 
     fn call(command: &str) -> serde_json::Value {
@@ -567,8 +694,8 @@ export default async function activate(api) {
             "sdkVersion": 2, "id": "acme.guard", "version": "1.0.0", "name": "Tools", "description": "",
             "extension": {"hooks": []},
             "permissions": [
-                {"kind": "extension", "scope": "application", "targets": ["full-trust"]},
-                {"kind": "tools", "scope": "application", "targets": ["echo", "boom", "slow", "slow-write"]}
+                {"kind": "extension", "targets": ["full-trust"]},
+                {"kind": "tools", "targets": ["echo", "boom", "slow", "slow-write"]}
             ],
             "dataSchemaVersion": 1,
             "settingsSchema": {"type": "object", "additionalProperties": false},
@@ -619,22 +746,12 @@ export default async function activate(api) {
                     },
                 )
                 .unwrap();
-            manager.enable("acme.guard", "application").unwrap();
+            manager.enable("acme.guard").unwrap();
             manager
-                .authorize(
-                    "acme.guard",
-                    "application",
-                    package.manifest().permissions.clone(),
-                )
+                .authorize("acme.guard", package.manifest().permissions.clone())
                 .unwrap();
-            manager.activate("acme.guard", "application").unwrap();
-            assert_eq!(
-                manager
-                    .command_contributions_for_scope("application")
-                    .unwrap()
-                    .len(),
-                3
-            );
+            manager.activate("acme.guard").unwrap();
+            assert_eq!(manager.command_contributions().unwrap().len(), 3);
         }
         fixture.runtime.reconcile().await;
         fixture
@@ -657,6 +774,7 @@ export default async function activate(api) {
             tokio::task::spawn_blocking(move || {
                 executor.invoke(
                     PluginCommandInvocation {
+                        job: None,
                         command_id: format!("plugin/acme.guard/{command}"),
                         session_id: "s".into(),
                         turn_id: "t".into(),
@@ -712,29 +830,14 @@ export default async function activate(api) {
                     },
                 )
                 .unwrap();
-            manager.enable("acme.guard", "application").unwrap();
+            manager.enable("acme.guard").unwrap();
             // 未授权时目录为空，也无法执行。
-            assert!(
-                manager
-                    .tool_contributions_for_scope("application")
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(manager.tool_contributions().unwrap().is_empty());
             manager
-                .authorize(
-                    "acme.guard",
-                    "application",
-                    package.manifest().permissions.clone(),
-                )
+                .authorize("acme.guard", package.manifest().permissions.clone())
                 .unwrap();
-            manager.activate("acme.guard", "application").unwrap();
-            assert_eq!(
-                manager
-                    .tool_contributions_for_scope("application")
-                    .unwrap()
-                    .len(),
-                4
-            );
+            manager.activate("acme.guard").unwrap();
+            assert_eq!(manager.tool_contributions().unwrap().len(), 4);
         }
         fixture.runtime.reconcile().await;
         fixture
@@ -852,7 +955,7 @@ export default async function activate(api) {
             .manager
             .lock()
             .unwrap()
-            .deactivate("acme.guard", "application")
+            .deactivate("acme.guard")
             .unwrap();
         fixture.runtime.reconcile().await;
         assert!(!fixture.runtime.is_running("acme.guard").await);
@@ -895,7 +998,7 @@ export default async function activate(api) {
             .manager
             .lock()
             .unwrap()
-            .deactivate("acme.guard", "application")
+            .deactivate("acme.guard")
             .unwrap();
         events.publish(EventEnvelope::domain(
             magi_core::EventId::unique("plugin-registry-changed"),
@@ -1002,7 +1105,7 @@ export default async function activate(api) {
             .manager
             .lock()
             .unwrap()
-            .deactivate("acme.guard", "application")
+            .deactivate("acme.guard")
             .unwrap();
         fixture.runtime.reconcile().await;
         assert!(fixture.runtime.status("acme.guard").is_none());

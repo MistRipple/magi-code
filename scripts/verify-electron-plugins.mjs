@@ -393,11 +393,11 @@ try {
   const sessionsList = JSON.parse((await api(page, "/api/mcp-server/sessions")).body).sessions;
   const externalSession = sessionsList.find((entry) => entry.tokenId === issued.token.tokenId);
   check("daemon 为外部客户端建立了外部会话，归属令牌绑定的工作区", externalSession?.workspaceId === workspaceId && externalSession.sessionId.startsWith("external-tool-"), JSON.stringify(sessionsList).slice(0, 200));
-  await page.evaluate(`window.dispatchEvent(new Event('focus'))`);
-  const sessionItem = '[data-testid="external-session-item"]';
+  // 外部会话由 daemon 的 mcp.activity 事件驱动出现在侧栏，不依赖窗口焦点或插件注册表刷新。
+  const sessionItem = `.session-item[data-session-id="${externalSession.sessionId}"]`;
   await page.evaluate(`(() => { const header = document.querySelector('[data-workspace-id="${workspaceId}"]'); if (header && header.getAttribute('aria-expanded') !== 'true') header.click(); })()`);
-  await waitFor(() => exists(page, sessionItem), "工作区下出现外部客户端会话", 30_000);
-  check("外部会话进入工作区的统一会话列表", await exists(page, `.session-item[data-session-id="${externalSession.sessionId}"]`));
+  await waitFor(() => exists(page, sessionItem), "工作区下出现该令牌的外部客户端会话", 30_000);
+  check("外部会话进入工作区的统一会话列表", await exists(page, sessionItem));
   check("外部会话按最近活动时间排在普通会话中", await page.evaluate(`(() => {
     const item = document.querySelector('[data-testid="external-session-item"]');
     const list = item?.closest('.session-list');

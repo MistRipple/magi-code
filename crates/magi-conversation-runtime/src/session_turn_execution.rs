@@ -1030,6 +1030,16 @@ fn run_session_turn_execution_inner(
             turn_id: request.turn_id.clone(),
             workspace_id: request.workspace_id.as_ref().map(ToString::to_string),
             input: arguments.unwrap_or_else(|| prompt.clone()),
+            job: session_store
+                .canonical_turn_for_session_turn_id(&request.session_id, &request.turn_id)
+                .and_then(|turn| {
+                    turn.items
+                        .iter()
+                        .find_map(|item| item.metadata.get("pluginJob").cloned())
+                })
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| SessionTurnExecutionError::runtime_invalid_state())?,
         };
         let worker_cancellation = std::sync::Arc::clone(&cancellation);
         let worker = std::thread::spawn(move || executor.invoke(invocation, &worker_cancellation));

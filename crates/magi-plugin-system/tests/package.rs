@@ -110,7 +110,7 @@ fn views_cannot_reference_unpacked_missing_or_external_resources() {
 #[test]
 fn application_permissions_are_accepted_and_schema_cannot_fetch() {
     let mut m = manifest();
-    m["permissions"] = json!([{"kind":"browser","scope":"application","targets":[]}]);
+    m["permissions"] = json!([{"kind":"browser","targets":[]}]);
     assert!(PluginPackage::from_archive(&archive(&m, &[])).is_ok());
     m["settingsSchema"] =
         json!({"type":"object","properties":{"key":{"$ref":"file:///etc/passwd"}}});
@@ -165,10 +165,9 @@ fn home_cards_are_declared_views_with_a_per_plugin_limit() {
 
 fn surface_manifest(mutate: impl FnOnce(&mut Value)) -> Value {
     let mut value = manifest();
-    value["permissions"] = json!([{"kind":"browser","scope":"application","targets":["login"]}]);
+    value["permissions"] = json!([{"kind":"browser","targets":["login"]}]);
     value["contributions"]["browserSurfaces"] = json!([{
-        "id":"login","title":"Login","description":"","scope":"application",
-        "persistence":"persistent","keepMounted":true,"closeAction":"hide","backgroundInference":true
+        "id":"login","title":"Login","description":"","persistence":"persistent","keepMounted":true,"closeAction":"hide","backgroundInference":true
     }]);
     mutate(&mut value);
     value
@@ -180,7 +179,7 @@ fn browser_surface_contributions_are_declarations_backed_by_browser_permission()
     let package = PluginPackage::from_archive(&archive(&valid, &[])).unwrap();
     assert_eq!(package.manifest().contributions.browser_surfaces.len(), 1);
 
-    // 没有同作用域、同目标的 browser 权限：声明不能代替授权。
+    // 没有同目标的 browser 权限：声明不能代替授权。
     let unauthorized = surface_manifest(|value| value["permissions"] = json!([]));
     assert!(PluginPackage::from_archive(&archive(&unauthorized, &[])).is_err());
     let wrong_target = surface_manifest(|value| {
@@ -239,8 +238,7 @@ fn a_plugin_without_contributions_must_still_declare_the_permissions_it_switches
     empty["contributions"] = json!({});
     assert!(PluginPackage::from_archive(&archive(&empty, &[])).is_err());
 
-    empty["permissions"] =
-        json!([{"kind":"storage","scope":"application","targets":["__settings"]}]);
+    empty["permissions"] = json!([{"kind":"storage","targets":["__settings"]}]);
     assert!(PluginPackage::from_archive(&archive(&empty, &[])).is_ok());
 }
 
@@ -249,7 +247,7 @@ fn permissions_without_an_enforcement_point_are_rejected() {
     // 文件与网络权限没有任何强制点：受信后台直接以用户权限运行，清单不能声明装饰性 OS 权限。
     for kind in ["filesRead", "filesWrite", "network"] {
         let mut value = manifest();
-        value["permissions"] = json!([{"kind": kind, "scope":"application", "targets": ["x"]}]);
+        value["permissions"] = json!([{"kind": kind, "targets": ["x"]}]);
         assert!(
             PluginPackage::from_archive(&archive(&value, &[])).is_err(),
             "{kind}"
@@ -278,7 +276,7 @@ fn extension_manifest() -> Value {
     json!({
         "sdkVersion":2,"id":"acme.guard","version":"1.0.0","name":"Guard","description":"",
         "extension":{"hooks":[{"name":"tool.call","mode":"guard","deadlineMs":3000}]},
-        "permissions":[{"kind":"extension","scope":"application","targets":["full-trust"]}],
+        "permissions":[{"kind":"extension","targets":["full-trust"]}],
         "dataSchemaVersion":1,
         "settingsSchema":{"type":"object","additionalProperties":false},
         "contributions":{}
@@ -366,8 +364,7 @@ fn node_extension_packages_reject_every_ambiguous_or_unsupported_shape() {
     );
     // 声明 extension 权限的包若没有 extension 声明同样无效。
     let mut qjs = manifest();
-    qjs["permissions"] =
-        json!([{"kind":"extension","scope":"application","targets":["full-trust"]}]);
+    qjs["permissions"] = json!([{"kind":"extension","targets":["full-trust"]}]);
     assert!(PluginPackage::from_archive(&archive(&qjs, &[])).is_err());
     // 同时携带两种入口文件。
     assert!(
@@ -379,8 +376,8 @@ fn node_extension_packages_reject_every_ambiguous_or_unsupported_shape() {
 #[test]
 fn history_rewrite_hooks_require_the_separate_context_rewrite_authorization() {
     let rewrite_hook = json!([{"name":"context.assemble","mode":"advise"}]);
-    let trust = json!({"kind":"extension","scope":"application","targets":["full-trust"]});
-    let rewrite = json!({"kind":"contextRewrite","scope":"application","targets":["history"]});
+    let trust = json!({"kind":"extension","targets":["full-trust"]});
+    let rewrite = json!({"kind":"contextRewrite","targets":["history"]});
     let build = |hooks: &Value, permissions: Vec<&Value>| {
         let mut value = extension_manifest();
         value["extension"]["hooks"] = hooks.clone();
@@ -400,7 +397,7 @@ fn history_rewrite_hooks_require_the_separate_context_rewrite_authorization() {
         .is_err(),
         "没有改写钩子就不能申请 contextRewrite"
     );
-    let wrong_target = json!({"kind":"contextRewrite","scope":"application","targets":["all"]});
+    let wrong_target = json!({"kind":"contextRewrite","targets":["all"]});
     assert!(build(&rewrite_hook, vec![&trust, &wrong_target]).is_err());
     let mut qjs = manifest();
     qjs["permissions"] = json!([rewrite]);
@@ -411,8 +408,8 @@ fn tool_manifest() -> Value {
     let mut m = extension_manifest();
     m["extension"]["hooks"] = json!([]);
     m["permissions"] = json!([
-        {"kind":"extension","scope":"application","targets":["full-trust"]},
-        {"kind":"tools","scope":"application","targets":["echo"]}
+        {"kind":"extension","targets":["full-trust"]},
+        {"kind":"tools","targets":["echo"]}
     ]);
     m["contributions"] = json!({"tools":[{
         "id":"echo","title":"Echo","description":"","readOnly":true,
@@ -427,12 +424,12 @@ fn extension_tools_need_a_tools_permission_and_an_extension() {
     assert!(ok.is_ok(), "{:?}", ok.err());
     // 缺少覆盖该工具的 tools 权限。
     let mut m = tool_manifest();
-    m["permissions"] = json!([{"kind":"extension","scope":"application","targets":["full-trust"]}]);
+    m["permissions"] = json!([{"kind":"extension","targets":["full-trust"]}]);
     assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
     // 没有 extension 的包不能声明工具。
     let mut m = tool_manifest();
     m.as_object_mut().unwrap().remove("extension");
-    m["permissions"] = json!([{"kind":"tools","scope":"application","targets":["echo"]}]);
+    m["permissions"] = json!([{"kind":"tools","targets":["echo"]}]);
     assert!(PluginPackage::from_archive(&extension_archive(&m, &[])).is_err());
     // 工具参数 schema 必须是有界的 object schema。
     let mut m = tool_manifest();

@@ -2244,12 +2244,6 @@
     "ServerResponse": {
       "$ref": "#/$defs/JsonRpcServerResponse"
     },
-    "PluginScopeKind": {
-      "type": "string",
-      "enum": [
-        "application"
-      ]
-    },
     "PluginPermissionKind": {
       "type": "string",
       "enum": [
@@ -2266,15 +2260,11 @@
       "additionalProperties": false,
       "required": [
         "kind",
-        "scope",
         "targets"
       ],
       "properties": {
         "kind": {
           "$ref": "#/$defs/PluginPermissionKind"
-        },
-        "scope": {
-          "$ref": "#/$defs/PluginScopeKind"
         },
         "targets": {
           "type": "array",
@@ -2408,7 +2398,6 @@
         "id",
         "title",
         "description",
-        "scope",
         "persistence",
         "keepMounted",
         "closeAction",
@@ -2426,9 +2415,6 @@
         "description": {
           "type": "string",
           "maxLength": 4096
-        },
-        "scope": {
-          "$ref": "#/$defs/PluginScopeKind"
         },
         "persistence": {
           "$ref": "#/$defs/PluginSurfacePersistence"
@@ -2641,31 +2627,13 @@
         }
       ]
     },
-    "PluginScopeRequest": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "scope"
-      ],
-      "properties": {
-        "scope": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 160
-        }
-      }
-    },
     "PluginAuthorizeRequest": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "scope",
         "grants"
       ],
       "properties": {
-        "scope": {
-          "type": "string"
-        },
         "grants": {
           "type": "array",
           "items": {
@@ -2750,25 +2718,6 @@
         }
       }
     },
-    "PluginScopeGrant": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "scope",
-        "permissions"
-      ],
-      "properties": {
-        "scope": {
-          "type": "string"
-        },
-        "permissions": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PluginPermission"
-          }
-        }
-      }
-    },
     "PluginSourceKind": {
       "type": "string",
       "enum": [
@@ -2800,8 +2749,8 @@
       "required": [
         "manifest",
         "digest",
-        "enabledScopes",
-        "activeScopes",
+        "enabled",
+        "active",
         "grants",
         "source"
       ],
@@ -2812,22 +2761,10 @@
         "digest": {
           "type": "string"
         },
-        "enabledScopes": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "activeScopes": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
         "grants": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/PluginScopeGrant"
+            "$ref": "#/$defs/PluginPermission"
           }
         },
         "source": {
@@ -2835,6 +2772,12 @@
         },
         "runtime": {
           "$ref": "#/$defs/PluginRuntimeStatus"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "active": {
+          "type": "boolean"
         }
       }
     },
@@ -5785,6 +5728,163 @@
           "type": "integer",
           "minimum": 0,
           "x-rust-type": "u64"
+        }
+      }
+    },
+    "PluginActivationRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {}
+    },
+    "PluginJobBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxModelCalls",
+        "maxOutputTokens",
+        "timeoutMs"
+      ],
+      "properties": {
+        "maxModelCalls": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "maxOutputTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32768
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 120000
+        }
+      }
+    },
+    "PluginJobContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "jobId",
+        "scheduleId",
+        "budget"
+      ],
+      "properties": {
+        "jobId": {
+          "type": "string"
+        },
+        "scheduleId": {
+          "type": "string"
+        },
+        "budget": {
+          "$ref": "#/$defs/PluginJobBudget"
+        }
+      }
+    },
+    "PluginJobRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "commandId",
+        "sessionId",
+        "text",
+        "runAt",
+        "intervalMs",
+        "budget"
+      ],
+      "properties": {
+        "commandId": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 65536
+        },
+        "runAt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "intervalMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 60000,
+          "maximum": 31536000000,
+          "x-rust-default": true
+        },
+        "budget": {
+          "$ref": "#/$defs/PluginJobBudget"
+        }
+      }
+    },
+    "PluginJobSchedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "pluginId",
+        "digest",
+        "request",
+        "enabled",
+        "nextRunAt",
+        "runNumber",
+        "pendingRequestId",
+        "lastTurnId",
+        "lastOutcome"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "pluginId": {
+          "type": "string"
+        },
+        "digest": {
+          "type": "string"
+        },
+        "request": {
+          "$ref": "#/$defs/PluginJobRequest"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "nextRunAt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "runNumber": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "pendingRequestId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-rust-default": true
+        },
+        "lastTurnId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-rust-default": true
+        },
+        "lastOutcome": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-rust-default": true
         }
       }
     }

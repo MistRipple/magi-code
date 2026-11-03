@@ -191,7 +191,8 @@ fn has_reported_token_counts(usage: &Value) -> bool {
 fn observed_response_usage(family: ProviderFamily, body: &str) -> Option<ModelTransportUsage> {
     // 缺少 usage 不是零用量；只有提供方明确返回时才规范化并记录。
     let raw: Value = serde_json::from_str(body).ok()?;
-    raw.get("usage").filter(|usage| has_reported_token_counts(usage))?;
+    raw.get("usage")
+        .filter(|usage| has_reported_token_counts(usage))?;
     let response = match family {
         ProviderFamily::OpenAiChat => OpenAiChatCompletionsAdapter.parse_response(200, body),
         ProviderFamily::OpenAiResponses => OpenAiResponsesAdapter.parse_response(200, body),
@@ -1382,19 +1383,22 @@ fn apply_provider_stream_event(
     let mut llm_chunks = parse_stream_event(provider_family, event);
     let has_usage = timing.observe(
         event,
-        llm_chunks.iter().any(|chunk| {
-            chunk.content.as_ref().is_some_and(|text| !text.is_empty())
-        }),
+        llm_chunks
+            .iter()
+            .any(|chunk| chunk.content.as_ref().is_some_and(|text| !text.is_empty())),
         received_at,
     );
-    if !has_usage { llm_chunks.retain(|chunk| chunk.usage.is_none()); }
+    if !has_usage {
+        llm_chunks.retain(|chunk| chunk.usage.is_none());
+    }
     accumulator.apply_all(&llm_chunks);
     // Responses 兼容网关可能先发 usage snapshot，再在 response.completed
     // 给出最终结算。最终事件是该 attempt 的权威 usage，不能继续用 max 合并，
     // 否则隐藏推理/中间统计会把 ledger 与 completed response 的 output tokens
     // 分叉。
     if (provider_family == ProviderFamily::OpenAiChat
-        || (provider_family == ProviderFamily::OpenAiResponses && is_responses_terminal_event(event)))
+        || (provider_family == ProviderFamily::OpenAiResponses
+            && is_responses_terminal_event(event)))
         && let Some(usage) = llm_chunks
             .iter()
             .rev()
@@ -1965,12 +1969,23 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
             message: "provider response invalid: empty stream response".to_string(),
         });
     }
-    if let Some(timing) = body_timing.finish(provider_family, adapted.usage.output_tokens,
-        adapted.thinking.as_ref().is_some_and(|text| !text.is_empty()), !adapted.tool_calls.is_empty()) {
-        let _ = tx.send(StreamMessage::Observation(ModelTransportEvent::ResponseTiming(timing)));
+    if let Some(timing) = body_timing.finish(
+        provider_family,
+        adapted.usage.output_tokens,
+        adapted
+            .thinking
+            .as_ref()
+            .is_some_and(|text| !text.is_empty()),
+        !adapted.tool_calls.is_empty(),
+    ) {
+        let _ = tx.send(StreamMessage::Observation(
+            ModelTransportEvent::ResponseTiming(timing),
+        ));
     }
     let mut response: ModelResponse = adapted.into();
-    if !body_timing.usage_observed { response.usage = None; }
+    if !body_timing.usage_observed {
+        response.usage = None;
+    }
     Ok(response)
 }
 
@@ -5394,9 +5409,15 @@ mod tests {
         let usage: crate::llm_types::LlmUsage =
             serde_json::from_value(response.usage.expect("response usage")).unwrap();
         assert_eq!(usage.output_tokens, 103);
-        let timing = recorder.borrow().attempts[0].response_timing.clone().expect("body stream timing must reach the persisted receipt");
+        let timing = recorder.borrow().attempts[0]
+            .response_timing
+            .clone()
+            .expect("body stream timing must reach the persisted receipt");
         assert_eq!(timing.text_output_tokens, Some(23));
-        assert_eq!(timing.content_duration_ms, 0, "a single body chunk has no measurable generation interval");
+        assert_eq!(
+            timing.content_duration_ms, 0,
+            "a single body chunk has no measurable generation interval"
+        );
         assert_eq!(
             recorder.borrow().attempts[0]
                 .usage

@@ -74,8 +74,16 @@ impl TurnService {
         &self,
         request: SessionTurnRequestDto,
     ) -> Result<SessionTurnResponseDto, ApiError> {
-        submit_session_turn_internal(self.state.clone(), request).await
+        submit_session_turn_internal(self.state.clone(), request, None).await
     }
+}
+
+pub(crate) async fn submit_plugin_job(
+    state: ApiState,
+    request: SessionTurnRequestDto,
+    job: magi_app_server_protocol::generated::PluginJobContext,
+) -> Result<SessionTurnResponseDto, ApiError> {
+    submit_session_turn_internal(state, request, Some(job)).await
 }
 
 /// TurnService 的唯一业务实现。
@@ -84,6 +92,7 @@ impl TurnService {
 async fn submit_session_turn_internal(
     state: ApiState,
     mut request: SessionTurnRequestDto,
+    job: Option<magi_app_server_protocol::generated::PluginJobContext>,
 ) -> Result<SessionTurnResponseDto, ApiError> {
     request.skill_name = request
         .skill_name
@@ -316,6 +325,19 @@ async fn submit_session_turn_internal(
             "编辑上一条消息必须开始新的对话轮次".to_string(),
         ));
     }
+    if job.is_some() {
+        let session = request
+            .requested_session_id()
+            .ok_or_else(|| ApiError::InvalidInput("作业需要明确会话".into()))?;
+        if state.queued_regular_session_turn_count(&session) > 0
+            || state
+                .session_store
+                .ensure_current_turn_acceptance_available(&session)
+                .is_err()
+        {
+            return Err(ApiError::Conflict("会话繁忙，作业等待下一次调度".into()));
+        }
+    }
     if matches!(
         decision.route,
         SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute
@@ -400,6 +422,7 @@ async fn submit_session_turn_internal(
                 workspace_id,
                 accepted_at,
                 request_fingerprint,
+                job,
             )
             .await
         }
@@ -1246,7 +1269,7 @@ pub(crate) fn validate_plugin_command_selection(
         .lock()
         .map_err(|_| ApiError::internal_assembly("校验插件命令失败", "插件锁已损坏"))?;
     let available = manager
-        .command_contributions_for_scope(magi_plugin_system::APPLICATION_SCOPE)
+        .command_contributions()
         .map_err(|error| ApiError::internal_assembly("读取插件命令失败", error.to_string()))?
         .into_iter()
         .any(|(manifest, command)| {
@@ -1480,6 +1503,7 @@ async fn submit_conversation_session_turn(
     workspace_id: Option<WorkspaceId>,
     accepted_at: UtcMillis,
     request_fingerprint: String,
+    job: Option<magi_app_server_protocol::generated::PluginJobContext>,
 ) -> Result<SessionTurnResponseDto, ApiError> {
     let previous_current_session_id = state.session_store.current_session_id();
     let (session_id, created_session, workspace_id) = crate::scope_binding::resolve_turn_session(
@@ -1584,6 +1608,12 @@ async fn submit_conversation_session_turn(
         metadata.insert(
             magi_session_store::SESSION_COMMAND_METADATA_KEY.to_string(),
             serde_json::to_value(command).expect("session command must serialize"),
+        );
+    }
+    if let Some(job) = job {
+        metadata.insert(
+            "pluginJob".into(),
+            serde_json::to_value(job).expect("job serializes"),
         );
     }
     if let Some(plugin_command_id) = request.plugin_command_id.as_ref() {
@@ -3198,6 +3228,7 @@ pub(crate) async fn drain_next_queued_regular_session_turn(
                             scope.workspace_id(),
                             admission_at,
                             request_fingerprint,
+                            None,
                         )
                         .await
                         .map(|_| ()),
@@ -4498,7 +4529,7 @@ mod tests {
         let manifest = serde_json::json!({
             "sdkVersion": 2, "id": "acme.cmd", "version": "1.0.0", "name": "Cmd", "description": "",
             "extension": {"hooks": []},
-            "permissions": [{"kind": "extension", "scope": "application", "targets": ["full-trust"]}],
+            "permissions": [{"kind": "extension", "targets": ["full-trust"]}],
             "dataSchemaVersion": 1,
             "settingsSchema": {"type": "object", "additionalProperties": false},
             "contributions": {"commands": [{"id": "hello", "title": "Hello", "description": ""}]}
@@ -4532,15 +4563,11 @@ mod tests {
             )
             .unwrap();
         if active {
-            manager.enable("acme.cmd", "application").unwrap();
+            manager.enable("acme.cmd").unwrap();
             manager
-                .authorize(
-                    "acme.cmd",
-                    "application",
-                    package.manifest().permissions.clone(),
-                )
+                .authorize("acme.cmd", package.manifest().permissions.clone())
                 .unwrap();
-            manager.activate("acme.cmd", "application").unwrap();
+            manager.activate("acme.cmd").unwrap();
         }
         let state = crate::ApiState::new(
             "magi-test",

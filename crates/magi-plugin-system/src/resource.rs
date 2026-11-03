@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
-const STATE_VERSION: u16 = 2;
+const STATE_VERSION: u16 = 3;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,27 +44,23 @@ impl PluginResourceStore {
         }
         Ok(Self { path, state })
     }
-    pub fn read(&self, plugin_id: &str, scope: &str, resource_id: &str) -> Option<PluginResource> {
-        self.state
-            .values
-            .get(&key(plugin_id, scope, resource_id))
-            .cloned()
+    pub fn read(&self, plugin_id: &str, resource_id: &str) -> Option<PluginResource> {
+        self.state.values.get(&key(plugin_id, resource_id)).cloned()
     }
-    /// 该插件在任何作用域是否已有持久数据（含设置）。
+    /// 该插件是否已有持久数据（含设置）。
     pub fn has_data(&self, plugin_id: &str) -> bool {
         let prefix = format!("{plugin_id}\u{1f}");
         self.state.values.keys().any(|key| key.starts_with(&prefix))
     }
-    /// 该插件的全部持久条目（含设置），按（作用域、资源 ID）排序，供升级转换读取。
-    pub fn entries(&self, plugin_id: &str) -> Vec<(String, String, PluginResource)> {
+    /// 该插件的全部持久条目（含设置），按资源 ID 排序，供升级事务读取。
+    pub fn entries(&self, plugin_id: &str) -> Vec<(String, PluginResource)> {
         let prefix = format!("{plugin_id}\u{1f}");
         self.state
             .values
             .iter()
             .filter_map(|(key, resource)| {
                 let rest = key.strip_prefix(&prefix)?;
-                let (scope, resource_id) = rest.split_once('\u{1f}')?;
-                Some((scope.to_owned(), resource_id.to_owned(), resource.clone()))
+                Some((rest.to_owned(), resource.clone()))
             })
             .collect()
     }
@@ -74,15 +70,15 @@ impl PluginResourceStore {
     pub fn replace_plugin(
         &mut self,
         plugin_id: &str,
-        entries: &[(String, String, PluginResource)],
+        entries: &[(String, PluginResource)],
     ) -> Result<(), ResourceError> {
         let prefix = format!("{plugin_id}\u{1f}");
         let previous = self.state.values.clone();
         self.state.values.retain(|key, _| !key.starts_with(&prefix));
-        for (scope, resource_id, resource) in entries {
+        for (resource_id, resource) in entries {
             self.state
                 .values
-                .insert(key(plugin_id, scope, resource_id), resource.clone());
+                .insert(key(plugin_id, resource_id), resource.clone());
         }
         if let Err(error) = self.persist() {
             self.state.values = previous;
@@ -94,7 +90,6 @@ impl PluginResourceStore {
     pub fn write(
         &mut self,
         plugin_id: &str,
-        scope: &str,
         resource_id: &str,
         expected_version: u64,
         value: Value,
@@ -102,7 +97,7 @@ impl PluginResourceStore {
         if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > 4 * 1024 * 1024) {
             return Err(ResourceError::Invalid("资源快照超限".into()));
         }
-        let key = key(plugin_id, scope, resource_id);
+        let key = key(plugin_id, resource_id);
         let current = self
             .state
             .values
@@ -148,6 +143,6 @@ pub enum ResourceError {
     Storage(String),
 }
 
-fn key(plugin_id: &str, scope: &str, resource_id: &str) -> String {
-    format!("{plugin_id}\u{1f}{scope}\u{1f}{resource_id}")
+fn key(plugin_id: &str, resource_id: &str) -> String {
+    format!("{plugin_id}\u{1f}{resource_id}")
 }

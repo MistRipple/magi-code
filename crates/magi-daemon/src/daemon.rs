@@ -4,6 +4,7 @@ mod config;
 mod events;
 mod extension_bridge;
 mod extension_runtime;
+mod extension_services;
 mod maintenance;
 mod persistence;
 mod plugin_bridge;

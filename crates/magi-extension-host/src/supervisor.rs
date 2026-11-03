@@ -158,8 +158,9 @@ pub fn supervise(
                     state_tx.send_replace(SupervisorState::Running { generation });
                     let stopped = wait_or_stop(&instance, &stop_signal).await;
                     bus.detach(&config.plugin_id);
+                    // 连接失效不等于进程已退出；心跳失败和协议断连也必须回收整棵进程树。
+                    instance.stop().await;
                     if stopped {
-                        instance.stop().await;
                         state_tx.send_replace(SupervisorState::Stopped);
                         return;
                     }
@@ -203,9 +204,20 @@ pub fn supervise(
 
 /// 返回 true 表示收到停止请求；false 表示实例自行退出。
 async fn wait_or_stop(instance: &Arc<HostInstance>, stop: &Notify) -> bool {
-    tokio::select! {
-        _ = instance.wait_exit() => false,
-        _ = stop.notified() => true,
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = instance.wait_exit() => return false,
+            _ = stop.notified() => return true,
+            _ = heartbeat.tick() => {
+                let healthy = tokio::select! {
+                    result = instance.ping() => result.is_ok(),
+                    _ = stop.notified() => return true,
+                };
+                if !healthy { return false; }
+            }
+        }
     }
 }
 

@@ -8,7 +8,7 @@
 
 ## 1. 摘要
 
-Magi 不内置 Laya/Jev 模型，也不把它实现成插件。用户配置一个 HTTP 地址后，daemon 可选地调用外部决策服务。未配置时，Magi 完全沿现有模型、工具、权限和任务链路运行；配置后也不默认把所有决策交给 Laya，而是按决策类型逐项启用。
+Magi 不内置 Laya/Jev 模型，也不把它实现成插件。用户最多配置一个 HTTP 决策服务；该服务可以是 Laya，也可以是 Jev，二者是同一接入位的互斥实现。未配置时，Magi 完全沿现有模型、工具、权限和任务链路运行；配置后也不默认把所有决策交给 Laya 或 Jev，而是按决策类型逐项启用。
 
 接入目标是**降低 LLM 路由成本**，不是增加一个事后审查模型。Laya/Jev 应在昂贵的主模型调用之前完成有限集合中的类型化选择：是否需要主模型、选择哪个模型等级、开放哪些工具、浏览器下一步动作是什么、是否需要检索或是否值得开放子代理。只有能跳过一次 LLM 调用、改用更便宜的模型、缩小工具/上下文输入时，才计入效率收益。
 
@@ -34,7 +34,7 @@ Magi 仍然拥有全部业务事实和安全边界：Session、Turn、Task、模
             └─ gated ───────────────► 高置信度时采用，否则回退
             │
             ▼
-     HTTP Laya/Jev Provider
+  HTTP Laya 或 Jev Provider（全局唯一实例）
             │
             ▼
    类型化结果 + 置信度 + abstain
@@ -56,6 +56,21 @@ Laya Guard 展示了另一类接口：在工具执行前判断 `allow`、`ask` �
 公开评测也给出了必须纳入设计的限制：Laya 对选项顺序、相似候选和高基数候选较敏感，零样本模型路由不稳定；如果先筛选再调用 LLM，实际端到端节省可能显著低于只看路由器命中率得到的估计。[Fast Models, Slow Evidence](https://arxiv.org/abs/2610.02267)
 
 因此本方案不把 Laya/Jev 视为通用“意图分类器”，而把它视为**按 Magi 决策头验证、校准，并按需微调的外部 System-1 Provider**。
+
+### 2.1 公开浏览器结果对 Magi 的实际启示
+
+Laya 仓库的浏览器微调报告比通用宣传更适合拿来做工程假设：在约 45 个候选元素、每步三个问题的 held-out 数据上，元素 top-1 约为 0.63–0.66，单步延迟约 17–50 ms；16 个真实任务的三次运行通过率为 50%–62%。同一报告也明确记录了类型后联想、需要先滚动的分页和 Google Flights 等任务连续失败。[浏览器微调报告](https://github.com/NandhaKishorM/laya/blob/main/docs/finetune_browser_agent.md)
+
+这对 Magi 有两个直接结论：
+
+1. **延迟差可能足以支持控制片段。** 如果本地 HTTP 服务保持类似几十毫秒级延迟，而原始主模型轮次是秒级，连续动作段的 wall time 和 ModelStep 数有机会同时下降；但必须把交接、回退和最终核对算进去。
+2. **通用模型不能直接宣称可用。** 报告中的收益来自特定浏览器输入格式和专门微调，不是零样本 Laya 的一般能力；Magi 的候选节点、快照裁剪、可信值引用和页面状态必须按自己的轨迹重新训练/校准。报告还显示“候选放在 option 列表、页面正文留在短状态”比单纯增加数据更关键，这与 Magi 的候选表设计方向一致，但仍需在 Magi 数据上复现。
+
+Laya 自己的工具路由说明也给出了与 Magi 直接相关的边界：工具超过约 20 个时建议分层路由；状态窗口很短，约 320 或 768 token；零样本工具准确率在真实工具上未知，必须用真实 agent step 标注；概率在采用前需要温度校准。[Laya 的路由限制与集成说明](https://github.com/NandhaKishorM/laya#limitations-of-decision-model-routing-for-agents)
+
+Magi 已经在外部工具路径上采用了部分相同的确定性分层：基础工具先按策略、Skill、访问档位和宿主能力生成，MCP/插件工具默认延迟到 `tool_catalog` 成功后再加载。对这类路径再增加一个 Laya “选工具”请求，只有在能减少错误的 `tool_catalog`/模型轮次或显著缩短输入时才有增量价值；单纯把现有分层重新分类没有价值。
+
+因此公开结果只能支持“浏览器控制片段值得做 P0”，不能支持“直接在线 gated”。它不能替工具面、知识检索或子代理 head 提供同等强度的收益证据。
 
 上述外部资料是撰写本方案时的引用，未在 Magi 仓库内复现；其中的指标不能作为 Magi 的预期收益。尤其“端到端节省可能显著低于路由器命中率”一条，要求本方案以端到端调用数、token 和缓存命中率为准（§10）。
 
@@ -102,6 +117,42 @@ Session/Turn 接纳等已经由 daemon 规则完成的路径不消耗 LLM 路由
 2. **模型归用户与角色绑定。** 主对话模型由用户在会话中选择，角色可显式绑定引擎，`agent_spawn` 不接受调用级模型覆盖。Decision 结果不能静默替换用户选择的模型或绑定。
 3. **数据外发最小化。** Magi 是本地优先的个人产品。决策请求包含用户目标、页面标题和候选文本，即使只做 `shadow` 也是真实的数据外发，必须有独立的用户同意和字段范围说明（§5.3、§11.2）。
 
+### 3.6 先回答“替代了哪一次模型调用”
+
+在 Magi 当前的执行循环中，一轮通常会构造 `ModelInvocationRequest`，再由 `StepModelClient` 创建并发送一个 canonical ModelStep；模型返回工具调用后，工具执行、结果写回和下一轮模型请求继续循环。这个事实决定了 Laya 接入的价值边界：
+
+- Laya 只有在**阻止一次原本会创建的 `StepModelClient` 请求**时，才算减少主模型调用；
+- 在同一个模型请求已经选好工具之后再发一次 Laya HTTP，只是增加一个辅助请求，不能把它记成“省掉了一次 LLM”；
+- 一次模型响应可以批量返回多个工具调用，不能把每个工具调用都折算为一个可省的模型请求；
+- 如果 Laya 只是把建议追加到下一轮 prompt，主模型仍然会被调用，收益最多是输入缩短或错误率下降，不能宣称减少调用。
+
+因此，接入价值按下列顺序判断，而不是按“分类准确率”判断：
+
+```text
+可替代的原 ModelStep
+  × 原路径占比
+  × Laya 在 Magi 候选格式上的可靠采用率
+  − Decision HTTP、交接、回退、重试和恢复开销
+  − 缓存失效与额外输入成本
+```
+
+这个式子只是 P0 的筛选模型，不是线上计费公式。任何 head 在 P0 中都必须把分子落到真实的 ModelStep/transport 记录，不能从 prompt 中猜测“其中有一部分是在做路由”。
+
+### 3.7 按 Magi 当前代码的价值排序
+
+下面是工程优先级假设，数字不是已测结果；它们用于决定先测什么，不能替代 §16 的回放和对照。
+
+| 方向 | 当前 Magi 是否已有确定性实现 | Laya 能否直接省掉主模型请求 | 实际价值假设 | 当前建议 |
+| --- | --- | --- | --- | --- |
+| 浏览器有界控制片段 | 没有；当前由对话循环逐轮请求模型，再调用浏览器工具 | **可以**，但必须由主模型先交出有界子目标 | 在同一页面连续点击、填写和翻页时，替代“观察快照→选下一动作”的中间 ModelStep；这是唯一具备明确省调用路径的首选 head | 先做离线回放，再做隔离站点的受控 gated 实验 |
+| 大工具面/候选工具族 | 工具面已由策略、Skill、权限和缓存约束生成 | 通常不可以；同一模型响应中仍由主模型选工具 | 可能减少工具定义 token，或在下一轮减少错误工具重试；动态删表会损失缓存 | 只测 Turn/会话边界的稳定缩小；默认不改工具表 |
+| 知识/记忆需求 | `ContextRuntime` 已有意图词规则、受治理查询、类型过滤和选择缓存 | 不可以；现有路径没有独立“是否检索”的 LLM 请求 | Laya 可能提高长尾相关性，但会增加 HTTP；只有能减少注入 token 或后续纠错轮次才有价值 | 先与现有规则做增量对照，未证明节省输入就不接入 |
+| 模型档位/推理强度 | 模型由用户或角色绑定，当前没有自动选档产品 | 不可以；最多改变后续模型成本 | 只有新建用户认可的档位产品后，才可能用更便宜模型完成简单 Turn | 暂不做在线 head |
+| 子代理委派 | 主模型决定，daemon 做完整预检和注册 | **当前不可以**；advisory 不消除当前主模型请求 | 只有后续 child Task、模型轮次或整合成本下降才有净收益，且容易被交接开销抵消 | 只保留对照实验，不作为首个落地点 |
+| 语义无进展 | 工具账本已处理幂等、重复失败和未知副作用 | 通常不可以；Laya 仍需触发下一次判断 | 可能减少重复的后续模型轮次，但规则已覆盖的部分没有增量价值 | 先审计规则漏项，默认不调用 Laya |
+
+按这个排序，Laya 对 Magi 的真实定位不是“全局智能路由层”，而是一个只在**高频、闭集、可回执、能跳过 ModelStep**的局部控制器。其余方向只有在实验显示增量收益后才值得投入。
+
 ## 4. 目标与非目标
 
 ### 4.1 目标
@@ -127,16 +178,18 @@ Session/Turn 接纳等已经由 daemon 规则完成的路径不消耗 LLM 路由
 
 ### 5.1 Provider 类型
 
-首期只有一种传输类型：`http`。地址可以指向远程服务或本机服务，Magi 不区分模型是否本地运行。
+首期只有一种传输类型：`http`，且全局至多保存一份 Provider 配置。地址可以指向远程服务或本机服务，Magi 不区分模型是否本地运行。Laya 和 Jev 都是该接入位的外部实现；协议字段不一致时，由各自的 HTTP adapter 转换到 Magi 的内部 `DecisionRequest` / `DecisionResponse`，业务 runtime 不直接依赖供应商字段。
 
 ```text
 DecisionRouter
     └── HttpDecisionProvider
-          ├── Laya/Jev-compatible /v1/systemone
-          └── 可选 provider-specific guard endpoint
+          └── Laya adapter 或 Jev adapter（按 protocol 二选一）
+                └── 唯一已配置的 HTTP 决策服务
 ```
 
 Magi 内部使用自己的 `DecisionRequest` / `DecisionResponse`，由 HTTP 适配层转换到外部协议。这样不会让 Magi 的业务代码依赖某个供应商的 JSON 字段，也可以在未来接入其他 HTTP 决策服务。
+
+Laya 和 Jev 不同时配置、不做双 Provider 投票、不做跨 Provider failover。当前配置的 Provider 超时、失联或结果不可采用时，直接回到 Magi 原路径。
 
 ### 5.2 行为模式
 
@@ -158,6 +211,37 @@ Magi 内部使用自己的 `DecisionRequest` / `DecisionResponse`，由 HTTP 适
 - 不允许通过 Provider URL 访问 Magi daemon 的管理端口、内部 API 或 Electron 控制端口。
 - 远程地址的 `shadow` 默认关闭：只有用户在设置中明确同意，并看到将发送的字段范围后才发送；loopback 地址不需要额外同意，但同样受 §11.2 的脱敏约束。`shadow` 不产生用户可见收益，不能以“收集数据”为由默认外发。
 - Provider 请求使用独立的连接超时、读取超时和总预算；不能继承主模型的长超时。
+
+### 5.4 Provider 兼容与能力准入
+
+本方案要支持的是 **Laya、Jev 这一类 HTTP 决策服务**。Laya 与 Jev 都是首批适配目标；业务 head 使用统一的内部合同，后续同类服务通过适配器扩展。当前仍是方案，源码尚未实现任何在线 Decision Provider，不能把这里的支持目标描述成已经可用。
+
+- HTTP 地址、协议适配和模型能力分别配置、分别验证；同为 `/v1/systemone` 不保证鉴权、字段、版本、错误响应或分数语义完全相同。协议标识指向 Magi 的适配器，不由品牌名或 URL 自动猜测；实际兼容性按服务版本的请求/响应样本验证。
+- 文章使用的是 OpenRouter 的 `POST /api/alpha/decisions`，请求包含 `model`、`state`、`questions`，并非 `/v1/systemone` 或聊天接口；[OpenRouter 官方示例](https://openrouter.ai/blog/tutorials/how-to-use-jev/)也说明了这一点。因此单配置需能选择相应 HTTP adapter，并显式指定托管模型 ID；不能只靠替换 baseUrl 假定兼容。
+- 对当前配置的 Provider 记录支持的问题类型、一次多问题能力、上下文与候选上限、版本身份和可用的概率字段；能力来自服务说明、显式配置及连接测试，不假设存在统一的能力发现接口。不支持某个 head 的必要能力时，禁用该 head 并回到原路径，不静默丢字段或截断候选。
+- 置信度、概率分布、校准参数和采用阈值绑定到具体 Provider、有效模型/服务版本及 head。不能把 Laya 的阈值复制给 Jev，也不能把一个 Provider 的 `confidence` 直接当作另一个 Provider 的正确率。
+- Laya 的公开浏览器微调结果只支持对该 Laya 版本的实验假设，不能用来准入 Jev。Jev 也有使用动态 operation/target 候选、仅在需要生成输入文本时调用小 LLM 的公开浏览器示例，但该示例不是 Magi 的实测。[Jev Ultrafast](https://github.com/browser-use/jev-ultrafast)。两者均须在同一组 Magi 任务、候选和执行合同上独立评估；协议兼容不代表所有 head 都适用。
+- `shadow` 仍是单个已配置 Provider 的观测模式：与 Magi 原路径对照，不参与真实决策，不表示另行配置一个旁观模型。比较 Laya 和 Jev 时分别运行离线评估，不在一次在线执行中同时调用两者。
+
+### 5.5 借鉴 Jev harness：按生命周期接入三类判断
+
+参考这篇 [Pi SDK + Jev harness 实践](https://wujiaming88.github.io/2026/09/23/pi-sdk-jev-harness.html)及其 [DAIR.AI 原文](https://academy.dair.ai/resources/jev-decisions-in-a-pi-sdk-harness)，可以按模型请求前、工具执行前和交付检查三个边界设计 Router、Gate、Verifier。它提供的是结构参考，文中的示例阈值和运行结果不能直接作为 Magi 的准入证据。下面是结合 Magi 源码提出的采用方式，不是这三类能力已经实现的声明。
+
+| harness 位置 | Magi 对应边界 | 能解决什么 | 是否直接减少主 LLM 请求 | Magi 的采用边界 |
+| --- | --- | --- | --- | --- |
+| Router | 新 Turn/新 lineage 的 `StepModelClient` 冻结前 | 在用户允许的模型档位中选更便宜或更强的模型 | 不能保证减少次数，主要是降低单次成本；当前模型档位产品尚不存在 | 只在会话首轮或 lineage 本来要切换时运行一次，不能每轮切换模型 |
+| Gate | 经 schema 校验的最终工具参数、原审批和副作用执行之前 | 提供动作与可信目标是否一致等语义风险信号 | 当前没有独立 LLM Gate 可直接省掉，新增检查属于质量/安全开销 | 不改权限结论；若采用信号，由原生策略决定是否补查或进入原交互入口，不能由外部 `allow` 覆盖拒绝 |
+| Verifier | 已有候选答复和真实证据、Task/Turn 尚未结算的边界 | 提供漏答、证据与论断不一致的有限语义信号 | 只有替代已有昂贵复核调用，或对照确认减少后续返工时才有净收益 | 先满足 completion evidence、required tool chain 等硬合同；语义信号不提交终态、不证明事实为真 |
+
+Magi 可以复用的结构是：Provider 返回类型化信号，由可测试的 `DecisionPolicy` 结合原生事实决定是否采用；同一观测点的问题合并请求；故障回退、版本和实际用量分别记录。不能把路径是否越界、工具是否执行成功等已有精确答案再交给概率模型。直接把多个未校准分数取最大值也不构成联合风险概率。
+
+现有接线也有边界：`extension_hooks.rs` 的工具钩子在账本、权限和审批前接受提案，改写后重新校验；多个改写者存在时，新增语义检查必须看最终参数，之后参数变化使判断失效。`model_step.rs` 的 `model.request` / `model.response` 当前是事实提交后的 observe 通知，不能据此阻止调用、切换模型或重开 Turn。本文仍采用原生 runtime 接入，不因借鉴 hooks 就改成插件实现。
+
+故障回退不能照搬示例：Router 失败沿用户已选模型，不擅自换强模型；可选 Gate 失败回到原生权限和审批，原本需审批的动作仍需审批，不把服务失联扩大成所有工具不可用；Verifier 不可用或不自信时不增加通过标记，保留原完成合同，也不无限补查。同一 Decision HTTP 不自动重试，恢复沿原循环的既有限制。
+
+Verifier 值得增加一个离线研究项：给出可信任务条款、候选答复和带 itemId/状态的有界真实证据，分别问“哪项要求可能遗漏”“当前证据是否足以判断”“是否需要定向复核”，不问笼统的“任务完成了吗”。证据不足、正文截断或低置信度表示无法判断；不把它当作通过或失败。疑点由宿主绑定回原条款/证据，必要时交给原主线作定向补查，不自动创建 reviewer 子代理。若进入采用实验，补查须共用原 completion recovery 上限、不能重放已成功副作用；当前答复可能已经流式展示，需沿原消息追加纠正事实，不能宣称实现了交付前隐藏审核。
+
+本研究项不新增默认在线 head。P0 先核对是否真的存在可替代的额外复核或返工，计入误报造成的补查、漏报、额外 HTTP 和证据准备；现有硬检查已经解决的样本没有增量收益。浏览器片段仍是直接省 ModelStep 的候选，Router 主要省单次模型费用，Gate/Verifier 则分别证明自身的质量收益和净成本，不能把三者合并宣称提速。
 
 ## 6. 内部决策合同
 
@@ -254,7 +338,7 @@ Provider 返回的 `value` 只能引用对应问题的 `criteria` 中已有的�
 
 ### 6.3 批量和单次多问题
 
-同一执行点需要多个问题时必须合并成一次 HTTP 请求，例如同时判断：
+同一执行点、同一 Provider 需要多个问题时，必须在该 Provider 支持的能力和上限内合并成一次 HTTP 请求；必要的多问题能力缺失时回到原路径，不为适配而逐问题串行追加请求。例如同时判断：
 
 - 是否需要 Browser；
 - 浏览器动作类型；
@@ -341,9 +425,9 @@ needs_user_input
 
 子目标最少固定：来源 Task/Turn/工具调用、目标 Tab、允许的操作与页面范围、可信输入值引用、遇到何种状态必须返回、一次控制片段的动作上限和总期限。上限用于限制这一段自动化授权与故障影响，不新增全任务 token/成本预算。片段可能跨越 Provider 的缓存保留时间，控制交回主模型时前缀可能已冷；这是 §10.3 冷热缓存对照要覆盖的实际成本，片段长度的取舍应参考该结果，而不只看动作数。新增用户指令、子目标变化、人工交互或 Task/Turn 结束都使当前片段停止。
 
-#### 7.3.2 Laya 只选择，宿主构造完整工具参数
+#### 7.3.2 Decision Provider 只选择，宿主构造完整工具参数
 
-Laya 不生成任意输入文本、URL、脚本或路径。`type` 的文本来自子目标中已有的可信值引用；`select` 的值来自当前可用选项集合；参数不完整、操作与节点不兼容或需要理解新页面正文时，返回主模型补充。§6 中的多问题答案必须作为一个动作整体校验，不能把独立高分的 operation 和 target 强行拼接。
+Decision Provider 不生成任意输入文本、URL、脚本或路径。`type` 的文本来自子目标中已有的可信值引用；`select` 的值来自当前可用选项集合；参数不完整、操作与节点不兼容或需要理解新页面正文时，返回主模型补充。§6 中的多问题答案必须作为一个动作整体校验，不能把独立高分的 operation 和 target 强行拼接。
 
 宿主持有本次候选到真实 `element_ref` 的映射，并绑定 `tab_id`、Surface、`navigationRevision`、`snapshotRevision` 和当前执行租约。绑定与引用不是 Provider 可覆盖的字段；每次快照均使旧节点引用失效。Provider 返回后以及实际派发前，分别重查执行范围和页面代次，迟到结果只记录为过期，不能落到新页面或新租约。
 
@@ -383,7 +467,7 @@ context_isolation
 independent_review
 ```
 
-当用户明确要求真实代理时，Laya 不能否决；当用户未明确要求时，Laya 只能以 advisory 提示（写入易变尾部）影响主模型是否派发；不通过增删 `agent_spawn` 工具定义实现，避免改变工具表而使缓存前缀失效（§3.5）。实际 `delegation.reason`、角色、上下文包、Task 注册和生命周期仍由原有入口负责。
+当用户明确要求真实代理时，Decision Provider 不能否决；当用户未明确要求时，Decision Provider 只能以 advisory 提示（写入易变尾部）影响主模型是否派发；不通过增删 `agent_spawn` 工具定义实现，避免改变工具表而使缓存前缀失效（§3.5）。实际 `delegation.reason`、角色、上下文包、Task 注册和生命周期仍由原有入口负责。
 
 该 head 定位为对照实验，不因为记录易取就优先上线。`delegation.reason` 是模型自述，任务终态、产物和重复工作拒绝可用于构造弱标签；整合成本可能需要补采，是否值得委派仍需复核或对照实验（§11.1）。离线评估可与[子代理唤起设计](subagent-delegation-design.md)中的固定回放合并。
 
@@ -441,7 +525,7 @@ magi-bridge-client
     ProviderVersionIdentity
   decision_http
     HttpDecisionProvider
-    Laya/Jev protocol adapter
+    Laya protocol adapter / Jev protocol adapter / OpenRouter Decisions adapter
     timeout / cancellation / response validation / health
 
 依赖方向：daemon / API → conversation-runtime → bridge-client
@@ -468,37 +552,38 @@ magi-bridge-client
 ### 8.3 生命周期
 
 ```text
-读取设置
-  → 验证 URL、协议和凭据引用
+读取 Provider 与 head 设置
+  → 验证唯一 Provider 的 URL、协议、凭据引用和版本身份
   → 可选健康检查
-  → 新 Turn 固定决策配置快照
+  → 新 Turn 固定 Provider 和各 head 策略的配置快照
   → 每个决策头生成候选
-  → HTTP 请求
+  → 向唯一已配置 Provider 发 HTTP 请求
   → 校验响应
   → 置信度/abstain/策略门槛判断
   → 采用或回退
   → 写入 DecisionTrace
 ```
 
-新接纳运行冻结 Provider 配置 revision、head/策略和模型/服务版本身份；已有 Task 的排队、重试和恢复沿原快照，新 activation 再按接纳合同解析。撤权、关闭外发或取消是即时安全边界，旧快照不能继续授权新请求；结束控制片段后回到本任务已冻结的主模型。Provider 消失或版本变化也按该任务策略收口，不静默换服务或模型。
+新接纳运行冻结 Provider 配置 revision、head/策略和模型/服务版本身份；已有 Task 的排队、重试和恢复沿原快照，新 activation 再按接纳合同解析。撤权、关闭外发或取消是即时安全边界，旧快照不能继续授权新请求；结束控制片段后回到本任务已冻结的主模型。Provider 消失或版本变化时按该任务策略回退，不静默换服务或模型。
 
 ## 9. 配置设计
 
-建议新增全局 `decisionProvider` 设置，具体字段以最终 App Server schema 为准：
+建议新增全局 `decisionProvider` 设置，至多保存一份服务配置，具体字段以最终 App Server schema 为准：
 
 ```json
 {
   "enabled": true,
   "transport": "http",
   "baseUrl": "http://127.0.0.1:8765",
-  "protocol": "systemone",
-  "credentialRef": "secret:decision-provider/laya",
+  "protocol": "laya_systemone",
+  "model": null,
+  "credentialRef": null,
+  "expectedServiceVersion": null,
   "defaultMode": "off",
   "allowRemoteShadow": false,
   "connectTimeoutMs": 100,
   "requestTimeoutMs": 100,
   "totalBudgetMs": 150,
-  "expectedServiceVersion": null,
   "healthCheck": false,
   "heads": {
     "magi.route.v1": {"enabled": false, "mode": "off", "policyRef": null},
@@ -516,10 +601,14 @@ magi-bridge-client
 - 示例中所有 head 默认 `off`：head 只有在通过 §10.4 对应准入后才逐项打开；`allowRemoteShadow=false` 时，远程地址不发送 `shadow` 请求，仅 loopback 可用；
 - `baseUrl` 必须是 HTTP(S) origin，禁止嵌入凭据、路径穿越和非 HTTP scheme；
 - 远程地址默认 HTTPS；loopback 地址允许 HTTP；
-- 每个 head 独立开关和模式；
+- 全局只有一份地址、协议、凭据引用和版本身份，没有 Provider 列表或各 head 的 Provider 选择；未配置时所有 head 均不调用；
+- `protocol` 使用拟定的 `laya_systemone`、`jev_systemone` 或 `openrouter_decisions` 标识选择适配器。切换时替换同一份地址、协议、模型 ID 和凭据，不增加第二个实例；这些标识是方案设计，不代表服务已完成兼容验收；
+- `model` 是当前决策服务使用的模型 ID，不是 Magi 主 LLM 的配置；OpenRouter adapter 要求显式指定，如文章中的 `typesafe/jev-1.13`，不使用浮动 latest 别名。直连本机固定模型服务可省略，但 gated 仍须验证实际版本身份。`baseUrl` 保持 origin 形式，例如 `https://openrouter.ai`，路径由 adapter 固定为 `/api/alpha/decisions`；
+- 每个 head 独立开关和模式，均使用唯一已配置的 Provider；head 关闭或为 `off` 时不调用；
+- 同一个 Provider 服务多个 head 时，每个 head 仍须有自己的评估、校准和准入版本，不能因为 Laya 或 Jev 在一个 head 通过就自动授权其他 head；
 - `totalBudgetMs` 是单次 Decision 的总期限，连接与读取超时都受它约束（§13）；示例数值仅作示意；
-- `expectedServiceVersion` 固定准入评估所针对的模型/服务版本，gated 要求它非空且与实际响应一致，浮动别名不通过（§6.2）；
-- 采用阈值和 margin（§12）通过 head 的 `policyRef` 引用随评估发布的策略版本，不在设置里手填裸数字；具体字段以最终 schema 为准；
+- Provider 的 `expectedServiceVersion` 固定准入评估所针对的模型/服务版本，gated 要求它非空且与实际响应一致，浮动别名不通过（§6.2）；
+- 采用阈值和 margin（§12）通过 head 的 `policyRef` 引用随评估发布的策略版本，并核对 Provider、有效模型/服务版本及 head；更换服务或协议使旧策略准入失效，不能沿用原阈值；具体字段以最终 schema 为准；
 - 不保存明文密钥；
 - 不把 Provider 连接失败伪装为“模型没有做出决定”；
 - UI 显示 `disabled`、`configured`、`healthy`、`degraded`、`unavailable`，不只显示一个布尔开关。
@@ -573,6 +662,25 @@ net_cost_saved = baseline_total_cost - experiment_total_cost
 对照至少区分：A 为当前规则与主模型，B 为只增加相同确定性预筛选，C 为预筛选加 Decision。C 需要相对 B 有增量收益，不能把规则本身的优化归给 Laya/Jev。shadow 只能测试响应质量、覆盖率和额外延迟，不改变行为，不能单独证明省调用或提高成功率；这些结论需离线端到端回放或获准的真实采用实验。
 
 对照固定任务、权限、主/子模型及推理强度、候选构造、可复现的站点/文件状态，并报告冷热缓存、重试和失败样本。合格 margin 和样本量按 head 在实验前声明；P0 可以给出“说不准”，不能在结果出来后挑样本或改阈值来宣称通过。
+
+### 10.5 让“有价值”变成可执行的门槛
+
+为了避免把一次命中率报告误读成产品收益，首轮实验应在开始前写下以下门槛；具体数值可以按 Magi 的基线调整，但不能在看到结果后再调整：
+
+- **浏览器控制片段**：只纳入原轨迹中至少有两个连续“快照后选动作” ModelStep、候选集可重建、动作可逆且页面目标未变化的片段。报告每片段原 ModelStep 数、控制片段中的 Decision 次数、交接 ModelStep 数和净减少数；`net_llm_calls_saved` 必须仍为正，任务成功率相对当前路径不得低于预先声明的非劣 margin，未知副作用和人工接管不能增加。
+- **工具面或模型档位**：必须分别报告工具定义 token、缓存读写 token、实际模型费用和错误重做次数。若只减少了候选描述，却没有降低总输入或后续调用，就判定为无收益；若换模型造成缓存重建，缓存损失必须计入同一对照。
+- **知识/记忆**：以当前 `ContextRuntime` 的规则、受治理查询和选择缓存为 B 对照，Laya 只能在 C 相对 B 额外减少注入 token、纠错轮次或失败率时保留。相对“完全没有检索”的收益不能归给 Laya。
+- **子代理和进展建议**：固定主/子模型与工具面，比较后续 child Task 数、子代理 ModelStep 数、整合轮次和总 wall time；建议被采纳本身不是收益，轨迹不变就关闭该 head。
+
+浏览器首轮可以用一个简单的片段账本核算：
+
+```text
+原路径：handoff_model_steps + action_selection_model_steps
+实验路径：handoff_model_steps + return_check_model_steps + decision_http_calls
+净节省：原路径 ModelStep 数 − 实验路径 ModelStep 数
+```
+
+其中 `decision_http_calls` 只进入延迟和费用账本，不冒充 ModelStep；如果实验路径为了建立子目标多发了一次模型请求，也必须加回 `handoff_model_steps`。这个账本能直接回答“Laya 是否真的减少了 Magi 让 LLM 做的工作”。
 
 ### 10.4 在线启用准入条件
 
@@ -690,6 +798,7 @@ request_id
 session_id / task_id / turn_id / step_id
 head_id / head_version
 provider_origin_hash
+adapter_id / adapter_version
 model_id / provider_version / model_digest（可选）
 provider_config_revision / schema_version / evaluation_version / calibration_version
 candidate_ids_hash
@@ -730,13 +839,13 @@ Trace 不能单独证明工具成功、Task 完成、用户授权或 Browser 副
 - 按 §7.8 为每个 head 标明当前请求、拟消除请求/输入、仍需 LLM 的工作及新增开销；浏览器按整次模型请求区分纯动作选择与混合页面理解，保留原批量工具路径作为基线；
 - 按 §11.1 关联 Browser/Agent 事实并建立弱标签和复核集；委派样本与原固定回放合并，缺失候选或反事实结果明确列为缺口；
 - 先审计现有工具账本规则；未覆盖的停滞仅做离线规则对照，不为了 P0 改生产行为；
-- 以单独的离线回放脚本调用用户已有的本机 HTTP 决策服务，Magi 不带模型、不启动推理进程、不接在线链路；报告 held-out、校准与选项顺序稳定性；
+- 以单独的离线回放脚本分别调用用户已有的 Laya、Jev 或其他本机 HTTP 决策服务，Magi 不带模型、不启动推理进程、不接在线链路；报告各 Provider 的 held-out、校准与选项顺序稳定性；
 - 对比 A 当前路径、B 规则预筛选、C 规则加 Decision，区分可估算上限与已验证收益；
 - 退出条件：至少一个 head 有可省的具体工作、预期相对规则的净收益及可补齐的执行/恢复合同；否则止步。子代理数据易得不构成其首发理由。
 
 ### P1：协议与 `shadow`（仅对通过 P0 的 head）
 
-- 按 §8.1 在 `magi-bridge-client` 增加独立 Decision 合同、trait 和 HTTP 实现，在 `magi-conversation-runtime` 增加策略/领域装配，保持单向依赖；
+- 按 §8.1 在 `magi-bridge-client` 增加独立 Decision 合同、trait 和 HTTP 实现，以及 Laya/Jev 各自的 adapter；在 `magi-conversation-runtime` 增加策略/领域装配，保持单向依赖；
 - 全局配置、凭据引用、连接测试；
 - 只支持 `shadow`；远程地址默认关闭，需用户同意（§5.3）；
 - DecisionTrace、脱敏、候选 hash；未配置时零请求；
@@ -768,6 +877,9 @@ Trace 不能单独证明工具成功、Task 完成、用户授权或 Browser 副
 ### 17.1 协议与配置
 
 - 未配置时零 HTTP 请求；
+- 只允许单个决策服务配置，可选择 Laya 或 Jev；所有 head 共用该服务，不支持同时配置两者；
+- 同一决策点只向唯一 Provider 发一次请求；`shadow` 仅观测该服务，不额外配置或调用其他决策模型；
+- Laya/Jev 的协议 adapter、能力声明、版本身份和校准策略分别验证；切换服务使旧准入失效，当前服务失败时回到 Magi 原路径；
 - 配置错误不会改变普通 Magi 路径；
 - 明文凭据不出现在 settings、日志、事件和请求指纹；
 - 本地 HTTP 与远程 HTTPS 都能完成连接测试；
@@ -783,7 +895,7 @@ Trace 不能单独证明工具成功、Task 完成、用户授权或 Browser 副
 ### 17.3 浏览器
 
 - 过期 `navigationRevision`、lease、fence 和候选引用全部拒绝；
-- Laya 不能执行未在候选列表中的节点；
+- Decision Provider 不能执行未在候选列表中的节点；
 - 用户接管、导航、取消和 Guest 崩溃时不会重放旧动作；
 - gated 浏览器模型的真实任务成功率没有明显低于当前基线，并且 LLM 步数有可感知的下降；
 - 有界片段在原循环的模型发送前分支，真实执行轨迹证明确有 LLM 请求被跳过；不在已选好动作的工具处理器中事后追加 HTTP 冒充收益；
@@ -794,8 +906,8 @@ Trace 不能单独证明工具成功、Task 完成、用户授权或 Browser 副
 ### 17.4 子代理
 
 - 用户明确要求代理时不能被 Laya 否决；
-- Laya 建议不能绕过 `agent_spawn` Schema、角色、Skill、工作区、重复工作和生命周期预检；
-- Laya 失败不产生虚构的 child Task；
+- Decision Provider 建议不能绕过 `agent_spawn` Schema、角色、Skill、工作区、重复工作和生命周期预检；
+- Decision Provider 失败不产生虚构的 child Task；
 - 子代理建议不自动创建 Task、不隐藏 `agent_spawn`；只有相同主/子模型条件下对照显示无效子任务及总成本下降，才保留 advisory；
 - 评测区分弱标签与复核标签，不能以 `delegation.reason`、子任务成功或去重拒绝作为委派价值的直接真值。
 
@@ -828,7 +940,15 @@ npm --prefix web run check
 
 ## 18. 结论
 
-Magi 接入 Laya/Jev 的价值成立的前提，是它能够替代或缩小真实的 LLM 路由工作。最有潜力的路径不是 Session 基础分类，也不是把 Laya 当作普通工具，而是：
+基于当前代码和调用链，Magi 没有足够理由把 Laya/Jev 做成全局路由层。Session/Turn、Skill/权限工具面、知识意图和重复执行已经有确定性事实源；把这些路径再过一遍 HTTP 决策服务，大多只会增加延迟、外发数据和故障面。
+
+接入仍可能有实际价值，但价值集中在一个很窄的条件：**浏览器任务中存在可预测、连续、低风险的动作选择，并且这些动作目前各自触发一次主模型 ModelStep。** 在这个条件下，配置的 Laya 或 Jev 可以作为有界控制片段的 System-1，替代中间动作选择，保留主模型的目标理解、异常处理和最终核对。它应先以离线回放和隔离站点实验验证，不能因为浏览器模型的分类准确率高就直接上线。
+
+次一级的可能价值是 Turn/会话边界的模型档位或工具面选择，但这依赖尚未存在的产品能力，并且要证明缓存损失小于输入或费用节省。知识路由、子代理 advisory 和语义进展建议目前都不能直接减少一次主模型请求，只能在有端到端对照收益时作为后续实验。
+
+因此本方案的落地结论是：先验证浏览器控制片段是否能产生正的净 ModelStep 节省；若 Magi 的真实轨迹中没有足够长的连续浏览器片段，或者交接、回退和失败恢复抵消了节省，则该 head 不进入在线采用。Laya、Jev 和后续同类 Provider 使用同一验收口径、分别评估；某一个服务表现不足不代表其他服务同样不足。止步于离线结论是有效结果。
+
+在满足上述条件时，最有潜力的路径是：
 
 1. 有界浏览器片段替代纯动作选择的中间模型请求，保留主模型的理解、交接和核对；
 2. 获准的稳定边界模型等级和工具面路由，实际降低模型费用或定义 token；

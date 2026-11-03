@@ -33,7 +33,6 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     openHtmlFileInRightPaneBrowser,
   } from './right-pane-browser';
   import {
-    APPLICATION_PLUGIN_SCOPE,
     pluginProjection,
     trackPluginProjection,
   } from '../stores/plugin-registry.svelte';
@@ -145,7 +144,7 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
   /** 「新增 → 浏览器」在途：只驱动按钮的 loading 表现。 */
   let creatingBrowserPane = $state(false);
   let browserCapabilities = $state<BrowserCapabilitiesSnapshot | null>(null);
-  const pluginManifests = $derived(pluginProjection(APPLICATION_PLUGIN_SCOPE).manifests);
+  const pluginManifests = $derived(pluginProjection().manifests);
   const canCreateBrowserPane = $derived(Boolean(
     desktopSurface
       && window.magiDesktop
@@ -165,13 +164,13 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
   }
 
   $effect(() => {
-    trackPluginProjection(APPLICATION_PLUGIN_SCOPE);
+    trackPluginProjection();
   });
 
   // 插件被停用、撤权或升级后，已打开的插件视图随注册表一起关闭，
   // 不能留下指向已失效包的页面（入口出现与面板打开分别管理，关闭同样由投影决定）。
   $effect(() => {
-    const projection = pluginProjection(APPLICATION_PLUGIN_SCOPE);
+    const projection = pluginProjection();
     if (!projection.loaded) return;
     for (const tab of openTabs) {
       if (tab.kind !== 'plugin') continue;
@@ -1263,7 +1262,6 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
         pluginId={pluginPayload.pluginId}
         entry={pluginPayload.entry}
         label={activeTab.label}
-        scope={APPLICATION_PLUGIN_SCOPE}
       />
     {:else if previewLoading}
       <div class="right-pane-state">{i18n.t('web.filePreviewLoading')}</div>

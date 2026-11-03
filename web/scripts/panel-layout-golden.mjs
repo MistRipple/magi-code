@@ -536,8 +536,8 @@ assert.match(
 );
 assert.match(
   settingsTabsSource,
-  /SETTINGS_TABS[\s\S]*'model'[\s\S]*'tools'[\s\S]*'browser'[\s\S]*'agents'[\s\S]*'rules'[\s\S]*'stats'[\s\S]*'appearance'[\s\S]*'project'/,
-  '设置分类清单必须覆盖全部八个分类',
+  /SETTINGS_TABS[\s\S]*'model'[\s\S]*'agents'[\s\S]*'tools'[\s\S]*'browser'[\s\S]*'mcpServer'[\s\S]*'plugins'[\s\S]*'rules'[\s\S]*'appearance'[\s\S]*'safeguard'[\s\S]*'stats'[\s\S]*'project'/,
+  '设置分类按核心配置、能力扩展、使用偏好、系统管理与项目信息排序',
 );
 assert.match(
   workbenchShellSource,

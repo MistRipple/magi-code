@@ -480,6 +480,9 @@ fn migrate_snapshot_storage(from: &Path, to: &Path) -> SnapshotResult<()> {
         file.write_all(&serde_json::to_vec(&manifest)?)
             .and_then(|_| file.sync_all())
             .map_err(|error| SnapshotError::io(&manifest_path, error))?;
+        // Close the manifest before publishing its containing directory. Windows may reject
+        // the directory rename while a file inside the staging tree remains open.
+        drop(file);
         #[cfg(unix)]
         std::fs::File::open(&staging)
             .and_then(|directory| directory.sync_all())
@@ -515,14 +518,19 @@ fn publish_migration_directory(
 ) -> SnapshotResult<()> {
     match std::fs::rename(staging, to) {
         Ok(()) => Ok(()),
-        Err(_) if to.is_dir() && validate_existing_migration(to, manifest).is_ok() => {
-            // Another initializer may publish the same snapshot root first. Windows reports
-            // ERROR_ACCESS_DENIED when the destination directory already exists.
+        Err(_rename_error) if migration_was_published(to, manifest) => {
+            // Another initializer published the same root first. Keep its verified storage
+            // and remove this initializer's private staging copy.
             std::fs::remove_dir_all(staging).map_err(|error| SnapshotError::io(staging, error))?;
             Ok(())
         }
         Err(rename_error) => Err(SnapshotError::io(to, rename_error)),
     }
+}
+
+fn migration_was_published(to: &Path, manifest: &serde_json::Value) -> bool {
+    std::fs::symlink_metadata(to).is_ok_and(|metadata| metadata.file_type().is_dir())
+        && validate_existing_migration(to, manifest).is_ok()
 }
 
 fn copy_snapshot_directory(from: &Path, to: &Path) -> SnapshotResult<()> {
@@ -623,6 +631,41 @@ mod tests {
             )
             .unwrap(),
             manifest
+        );
+    }
+
+    #[test]
+    fn concurrent_initializers_publish_one_complete_migration() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("legacy");
+        let target = root.path().join("managed/snapshots");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("baseline.json"), vec![b'x'; 16 * 1024]).unwrap();
+
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| migrate_snapshot_storage(&source, &target));
+            let second = scope.spawn(|| migrate_snapshot_storage(&source, &target));
+            first.join().unwrap().unwrap();
+            second.join().unwrap().unwrap();
+        });
+
+        let manifest_path = target.join(STORAGE_MIGRATION_MANIFEST);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["version"], 1);
+        assert_eq!(
+            std::fs::read(target.join("baseline.json")).unwrap(),
+            vec![b'x'; 16 * 1024]
+        );
+        assert!(
+            std::fs::read_dir(root.path().join("managed"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".snapshot-migration-")),
+            "losing initialization must clean its staging directory"
         );
     }
 

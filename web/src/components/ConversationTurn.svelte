@@ -117,6 +117,16 @@
     presentationItems.filter((entry) => entry.role === 'final').map((entry) => entry.item),
   );
   const stepItems = $derived(assistantItems.filter((item) => readExecutionSteps(item.message.metadata?.executionSteps)));
+  const extensionRewriteCount = $derived(
+    (canonicalTurn?.modelSteps || []).reduce((total, step) => {
+      const rewrites = step.promptFrame?.historyProjection?.extensionRewrites;
+      return total + (Array.isArray(rewrites) ? rewrites.length : 0);
+    }, 0),
+  );
+  const extensionRewriteSources = $derived([...new Set(
+    (canonicalTurn?.modelSteps ?? []).flatMap(step =>
+      step.promptFrame?.historyProjection?.extensionRewrites?.map(rewrite => rewrite.pluginId) ?? []),
+  )].sort().join(', '));
   const streamEntries = $derived(buildConversationStreamEntries(presentationItems.filter((entry) => !readExecutionSteps(entry.item.message.metadata?.executionSteps))));
 
   const hasProcess = $derived(
@@ -240,6 +250,12 @@
   {/if}
 
   <div class="turn-stream" id={`turn-process-${turnId}`}>
+    {#if extensionRewriteCount > 0}
+      <div class="turn-extension-notice" role="status" data-testid="turn-extension-rewrite-notice">
+        <Icon name="info" size={13} />
+        <span>{i18n.t('conversationTurn.extensionRewriteNotice', { count: extensionRewriteCount, sources: extensionRewriteSources })}</span>
+      </div>
+    {/if}
     {#each stepItems as item (item.key)}
       <MessageItem message={item.message} {readOnly} {displayContext} filePreviewScope={filePreviewScopeForItem(item)} hideResponseDuration />
     {/each}
@@ -382,6 +398,16 @@
 
   .turn-earlier-steps-error {
     color: var(--error);
+  }
+
+  .turn-extension-notice {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    margin-block: var(--space-2);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    overflow-wrap: anywhere;
   }
 
   .turn-stream {

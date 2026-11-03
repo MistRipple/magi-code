@@ -38,7 +38,7 @@ export function storeGroup(item: StoreItem): StoreGroup {
 
 function statusOf(installed: PluginInstalled | null): StoreStatus {
   if (!installed) return 'available';
-  return installed.activeScopes.length > 0 ? 'active' : 'installed';
+  return installed.active ? 'active' : 'installed';
 }
 
 export function buildStoreItems(

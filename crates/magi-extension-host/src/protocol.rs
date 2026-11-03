@@ -45,6 +45,7 @@ pub enum ErrorKind {
     StaleGeneration,
     MethodNotFound,
     InvalidParams,
+    Conflict,
     RegistrationDenied,
     PermissionDenied,
     Blocked,

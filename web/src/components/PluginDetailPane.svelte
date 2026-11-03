@@ -1,14 +1,14 @@
 <script lang="ts">
   /**
-   * 插件详情面板（商店右侧）：来源、版本、权限、各作用域的启用状态与全部生命周期操作。
+   * 插件详情面板（商店右侧）：来源、版本、权限、全局启用状态与全部生命周期操作。
    * 左侧列表只放概要；所有“改变状态”的操作都在这里，由父组件执行并刷新 daemon 事实。
    */
   import { i18n } from '../stores/i18n.svelte';
   import type { InstalledPluginProjection } from '../web/plugin-api';
   import type { PluginManifest, PluginPermission, PluginRuntimeStatus } from '../shared/app-server-protocol.generated';
   import { pluginSettingsTab, type StoreItem } from '../lib/plugin-store';
-  import { APPLICATION_PLUGIN_SCOPE } from '../stores/plugin-registry.svelte';
   import Icon from './Icon.svelte';
+  import PluginJobs from './PluginJobs.svelte';
 
   interface Props {
     item: StoreItem;
@@ -33,14 +33,14 @@
 
   const plugin = $derived(item.installed);
   const manifest = $derived<PluginManifest | null>(plugin?.manifest ?? null);
-  const settingsTab = $derived(plugin && plugin.activeScopes.length > 0 ? pluginSettingsTab(plugin.manifest) : null);
+  const settingsTab = $derived(plugin && plugin.active ? pluginSettingsTab(plugin.manifest) : null);
   const activation = $derived(plugin ? activationRow(plugin) : null);
-  const removable = $derived(Boolean(plugin) && plugin!.activeScopes.length === 0 && plugin!.enabledScopes.length === 0);
+  const removable = $derived(Boolean(plugin) && !plugin!.active && !plugin!.enabled);
 
   function permissionText(permission: PluginPermission): string {
     if (permission.kind === 'extension') return i18n.t('settings.plugins.permission.extensionFullTrust');
     if (permission.kind === 'contextRewrite') return i18n.t('settings.plugins.permission.contextRewrite');
-    return `${permission.kind}: ${permission.scope}${permission.targets.length ? `, ${permission.targets.join(', ')}` : ''}`;
+    return `${permission.kind}${permission.targets.length ? `: ${permission.targets.join(', ')}` : ''}`;
   }
 
   function sourceLabel(installed: InstalledPluginProjection): string {
@@ -49,8 +49,8 @@
 
   /** 插件全局生效，只有一个启用状态。 */
   function activationRow(installed: InstalledPluginProjection): ActivationRow {
-    if (installed.activeScopes.includes(APPLICATION_PLUGIN_SCOPE)) return { state: 'active' };
-    if (installed.enabledScopes.includes(APPLICATION_PLUGIN_SCOPE)) return { state: 'enabled' };
+    if (installed.active) return { state: 'active' };
+    if (installed.enabled) return { state: 'enabled' };
     return { state: 'off' };
   }
 
@@ -66,7 +66,7 @@
   }
 
   function stateText(row: ActivationRow): string {
-    return i18n.t(`settings.plugins.scopeState.${row.state}`);
+    return i18n.t(`settings.plugins.activationState.${row.state}`);
   }
 </script>
 
@@ -170,12 +170,12 @@
 
   {#if plugin && activation}
     <section class="pane-section">
-      <h4>{i18n.t('settings.plugins.scopes')}</h4>
-      <div class="pane-scopes">
-        <div class="pane-scope" data-testid="plugin-scope-row" data-scope={APPLICATION_PLUGIN_SCOPE} data-state={activation.state}>
+      <h4>{i18n.t('settings.plugins.activation')}</h4>
+      <div class="pane-activation">
+        <div class="pane-activation-row" data-testid="plugin-activation-row" data-state={activation.state}>
           <span class="settings-dot" class:settings-dot--ok={activation.state === 'active'} class:settings-dot--warn={activation.state === 'enabled'} aria-hidden="true"></span>
           <div class="settings-row-copy">
-            <span class="settings-row-title">{i18n.t('settings.plugins.scope.application')}</span>
+            <span class="settings-row-title">{i18n.t('settings.plugins.globalActivation')}</span>
             <span class="settings-row-desc">{stateText(activation)}</span>
           </div>
           <div class="settings-row-actions">
@@ -192,6 +192,9 @@
       </div>
     </section>
   {/if}
+  {#if plugin && manifest && (manifest.contributions.commands?.length ?? 0) > 0}
+    {#key manifest.id}<PluginJobs {manifest} active={plugin.active} />{/key}
+  {/if}
 </article>
 
 <style>
@@ -205,11 +208,11 @@
   .pane-facts > div { display: grid; grid-template-columns: fit-content(30%) minmax(0, 1fr); gap: var(--space-3); align-items: baseline; }
   .pane-facts dt { overflow-wrap: anywhere; color: var(--foreground-muted); font-size: var(--text-xs); }
   .pane-facts dd { margin: 0; font-size: var(--text-xs); color: var(--foreground); overflow-wrap: anywhere; display: flex; gap: 8px; flex-wrap: wrap; }
-  .pane-facts dd > *, .pane-scopes .settings-row-copy { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
-  .pane-scope { flex-wrap: wrap; }
+  .pane-facts dd > *, .pane-activation .settings-row-copy { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+  .pane-activation-row { flex-wrap: wrap; }
   .pane-warn dd { color: var(--warning); }
   .pane-section h4 { margin: 0 0 var(--space-2); font-size: var(--text-sm); font-weight: var(--font-bold); color: var(--foreground); }
-  .pane-scopes { border: var(--magi-hairline) solid var(--border); border-radius: 10px; padding: 0 12px; }
-  .pane-scope { display: flex; align-items: center; gap: var(--space-3); min-height: 46px; padding: var(--space-2) 0; }
+  .pane-activation { border: var(--magi-hairline) solid var(--border); border-radius: 10px; padding: 0 12px; }
+  .pane-activation-row { display: flex; align-items: center; gap: var(--space-3); min-height: 46px; padding: var(--space-2) 0; }
   .pane-disabled { opacity: 0.45; pointer-events: none; }
 </style>

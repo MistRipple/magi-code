@@ -89,7 +89,7 @@
     type ComposerPluginCommandOption,
     type ComposerSkillOption,
   } from '../lib/composer-actions';
-  import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
+  import { pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
   import {
     composerAttachmentTotal,
     MAX_COMPOSER_IMAGE_BYTES,
@@ -686,18 +686,17 @@
   }));
 
   // 命令入口只来自 daemon 的激活投影，并随插件注册表变化一起刷新。
-  const pluginScope = APPLICATION_PLUGIN_SCOPE;
   $effect(() => {
-    trackPluginProjection(pluginScope);
+    trackPluginProjection();
   });
   const availablePluginCommands = $derived<ComposerPluginCommandOption[]>(
-    pluginProjection(pluginScope).commands
+    pluginProjection().commands
       .filter((entry) => entry.id.startsWith('plugin/'))
       .map((entry) => ({ pluginCommandId: entry.id, name: entry.title, description: entry.description })),
   );
   // 已选命令失效（插件停用）时撤销选择，避免提交已不可用的身份。
   $effect(() => {
-    if (!pluginProjection(pluginScope).loaded) return;
+    if (!pluginProjection().loaded) return;
     if (selectedPluginCommand && !availablePluginCommands.some((command) => command.pluginCommandId === selectedPluginCommand?.pluginCommandId)) {
       selectedPluginCommand = null;
     }

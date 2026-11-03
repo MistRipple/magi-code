@@ -12,7 +12,6 @@
   interface Props {
     pluginId: string;
     manifest: PluginManifest;
-    scope: string;
   }
 
   interface SchemaProperty {
@@ -24,7 +23,7 @@
     enumValues: string[];
   }
 
-  let { pluginId, manifest, scope }: Props = $props();
+  let { pluginId, manifest }: Props = $props();
   let value = $state<Record<string, unknown>>({});
   let version = $state(0);
   let loading = $state(true);
@@ -32,7 +31,7 @@
   let error = $state('');
   let status = $state('');
   let baseline = '';
-  const draftKey = $derived(`plugin-settings:${pluginId}:${scope}`);
+  const draftKey = $derived(`plugin-settings:${pluginId}`);
   $effect(() => { if (!loading && baseline) saveViewDraft(draftKey, baseline, value, 'memory'); });
 
   const properties = $derived.by<SchemaProperty[]>(() => {
@@ -116,7 +115,7 @@
     loading = true;
     error = '';
     try {
-      const resource = await readPluginSettings(pluginId, scope) as { version?: unknown; value?: unknown };
+      const resource = await readPluginSettings(pluginId) as { version?: unknown; value?: unknown };
       version = typeof resource.version === 'number' ? resource.version : 0;
       value = resource.value && typeof resource.value === 'object' && !Array.isArray(resource.value)
         ? { ...initialValue(), ...(resource.value as Record<string, unknown>) }
@@ -136,7 +135,7 @@
     error = '';
     status = '';
     try {
-      const resource = await writePluginSettings(pluginId, scope, version, value) as { version?: unknown; value?: unknown };
+      const resource = await writePluginSettings(pluginId, version, value) as { version?: unknown; value?: unknown };
       version = typeof resource.version === 'number' ? resource.version : version + 1;
       baseline = JSON.stringify({ version, value });
       clearViewDraft(draftKey);
