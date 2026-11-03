@@ -64,11 +64,11 @@ assert.match(client, /themes\/import[\s\S]*?themes\/\$\{encodeURIComponent\(them
 assert.match(client, /document\.body\.append\(anchor\)[\s\S]*?setTimeout\([\s\S]*?revokeObjectURL/, '主题导出必须等待浏览器接管下载后再释放 Blob URL');
 assert.match(settingsPanel, /SettingsAppearanceTab[\s\S]*?activeTab === 'appearance'/, '外观必须是设置中的一级导航');
 assert.ok(
-  settingsTabs.indexOf("id: 'stats'")
+  settingsTabs.indexOf("id: 'rules'")
     < settingsTabs.indexOf("id: 'appearance'")
     && settingsTabs.indexOf("id: 'appearance'")
-      < settingsTabs.indexOf("id: 'project'"),
-  '外观导航必须位于统计之后、项目之前，DOM 与键盘焦点顺序保持一致',
+      < settingsTabs.indexOf("id: 'safeguard'"),
+  '外观导航与使用偏好同组，必须位于偏好之后、安全防护之前，DOM 与键盘焦点顺序保持一致',
 );
 assert.match(settingsAppearance, /createAppearanceTheme[\s\S]*?updateAppearanceTheme[\s\S]*?deleteAppearanceTheme/, '自定义与导入主题必须具备完整生命周期');
 assert.match(settingsAppearance, /visibleThemes[\s\S]*?record\.pack\.id !== 'builtin\.system'[\s\S]*?settings-row[\s\S]*?<Toggle/, '跟随系统必须作为独立策略控制，不得占用普通主题卡片');
