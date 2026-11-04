@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod http;
 pub mod local_socket;
+pub mod oauth;
 pub mod path_guard;
 pub mod profile;
 pub mod protocol;

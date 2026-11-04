@@ -3,7 +3,7 @@
   "id": "example.notes",
   "version": "1.0.0",
   "name": "示例笔记",
-  "description": "演示资源、设置和受信 Node 工具。",
+  "description": "演示资源、自带设置页和受信 Node 工具。",
   "permissions": [
     {
       "kind": "storage",
@@ -39,6 +39,16 @@
     "hooks": []
   },
   "contributions": {
+    "views": [
+      {
+        "id": "settings",
+        "title": "设置",
+        "entry": "ui/settings.html",
+        "placements": [
+          "settings"
+        ]
+      }
+    ],
     "resources": [
       {
         "id": "notes",

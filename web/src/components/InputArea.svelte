@@ -405,10 +405,7 @@
   const mainModelReady = $derived.by(() => currentPickerModel.trim().length > 0 && currentPickerSourceId.trim().length > 0);
   const currentPickerGroup = $derived(pickerModelGroups.find((group) => group.sourceId === currentPickerSourceId));
   const currentPickerEntry = $derived(currentPickerGroup?.models.find((entry) => entry.id === currentPickerModel));
-  const currentPickerLabel = $derived([
-    currentPickerEntry?.displayName || currentPickerModel,
-    currentPickerGroup?.name,
-  ].filter(Boolean).join(' · '));
+  const currentPickerLabel = $derived(currentPickerEntry?.displayName || currentPickerModel);
   const currentPickerSourceError = $derived(
     typeof messagesState.settingsBootstrapSnapshot?.orchestratorModelError === 'string'
       && messagesState.settingsBootstrapSnapshot.orchestratorModelError.length > 0,

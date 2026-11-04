@@ -6,6 +6,8 @@
   } from '../types/message';
   import MessageItem from './MessageItem.svelte';
   import ConversationTurn from './ConversationTurn.svelte';
+  import ExecutionSteps from './ExecutionSteps.svelte';
+  import { selectPinnedExecutionSteps } from '../lib/execution-steps';
   import TurnRuntimeIndicator from './TurnRuntimeIndicator.svelte';
   import TurnRuntimeSummary from './TurnRuntimeSummary.svelte';
   import TurnNavigationRail from './TurnNavigationRail.svelte';
@@ -41,6 +43,7 @@
     canScrollableElementConsumeWheel,
     deriveMessageScrollDirection,
     isMainMessageWheelInput,
+    shouldFollowMessageScrollInput,
   } from '../lib/message-scroll-input';
   import {
     buildTurnNavigationItems,
@@ -50,6 +53,7 @@
   import { uiClockState, retainUiClock } from '../stores/ui-clock.svelte';
   import { isLatestMainlineTurn } from '../lib/composer-policy';
   import { turnStoreState } from '../stores/turn-store.svelte';
+  import { isSessionProvenanceMessage } from '../lib/conversation-presentation';
 
   // Props - Svelte 5 语法
   interface Props {
@@ -154,6 +158,7 @@
     if (displayContext !== 'thread') return [];
     const navigationMessages: TurnNavigationMessage[] = [];
     for (const item of safeRenderItems) {
+      if (isSessionProvenanceMessage(item.message)) continue;
       const metadata = item.message.metadata || {};
       const turnId = typeof metadata.turnId === 'string' ? metadata.turnId.trim() : '';
       const turnSeq = typeof metadata.turnSeq === 'number' && Number.isFinite(metadata.turnSeq)
@@ -477,12 +482,29 @@
     const runtimeIndex = activeRenderItems.findIndex((item) => item.key === runtimeItem.key);
     return runtimeIndex >= 0 ? runtimeIndex + 1 : activeRenderItems.length;
   });
+  // 执行中的步骤卡片不随内容流滚走：当前运行轮次里仍有进行中 / 待执行 / 受阻步骤时，
+  // 它从时间线与摘要轮次中移出，置底悬浮在消息区下方；全部终结或轮次结束后回到原位。
+  // 两种显示模式读取同一份快照，只有悬浮条的初始展开状态不同。
+  const pinnedExecutionSteps = $derived.by(() => {
+    if (!shouldRunTimer) return null;
+    const runtimeTurnId = currentRuntimeRenderItem
+      ? messageMetadataString(currentRuntimeRenderItem.message, 'turnId')
+      : '';
+    return selectPinnedExecutionSteps(activeRenderItems, runtimeTurnId);
+  });
   const timelineRenderEntries = $derived.by(() => {
+    const pinnedKey = pinnedExecutionSteps?.item.key ?? '';
     const entries: TimelineRenderEntry[] = activeRenderItems.map((item) => ({
       kind: 'message',
       key: item.key,
       item,
     }));
+    // 只过滤展示，不移除参与运行态和轮次身份计算的原始记录；新旧历史、
+    // 原始与摘要模式共用此入口，空开场也不会留下空白消息或重复阶段。
+    const visibleEntries = () => entries.filter((entry) => (
+      entry.kind !== 'message'
+        || (entry.key !== pinnedKey && !isSessionProvenanceMessage(entry.item.message))
+    ));
     if (!shouldRunTimer || !runtimeIndicatorKey) {
       if (shouldShowRuntimeSummary) {
         entries.push({
@@ -490,13 +512,14 @@
           key: `runtime-summary:${taskId || ''}:${normalizedRuntimeCompletedAt}:${normalizedRuntimeDurationMs}`,
         });
       }
-      return entries;
+      return visibleEntries();
     }
+    // 运行指示器按完整时间线的下标插入，之后再移出置底的步骤卡片，避免下标错位。
     entries.splice(runtimeIndicatorInsertionIndex, 0, {
       kind: 'runtime',
       key: runtimeIndicatorKey,
     });
-    return entries;
+    return visibleEntries();
   });
   const conversationRenderEntries = $derived.by(() => {
     const entries: ConversationRenderEntry[] = [];
@@ -1492,7 +1515,7 @@
     return promise;
   }
 
-  function cancelScrollRecoveryForUserIntent(): void {
+  function cancelScrollRecoveryForUserIntent(followBottom = false): void {
     scrollRecoveryEpoch += 1;
     layoutStabilizer.clear();
     activationRestoreNonce += 1;
@@ -1503,8 +1526,9 @@
       contentResizeFrame = 0;
     }
     cancelScheduledScrollStateSync();
-    // 在原生滚动生效前撤销跟随，避免同一帧的新 token 抢先写回底部。
-    updatePanelScrollState(panelKey, { autoScrollEnabled: false }, { persist: false });
+    // 向上阅读时先撤销跟随，避免同一帧的新内容抢回底部；向下输入已在
+    // 底部时直接恢复跟随，因为无溢出或到底后不会再产生原生 scroll 事件。
+    updatePanelScrollState(panelKey, { autoScrollEnabled: followBottom }, { persist: false });
   }
 
   function canNestedScrollerConsumeWheel(target: EventTarget | null, deltaY: number): boolean {
@@ -1528,7 +1552,10 @@
     })) return;
     // 只有主列表会实际消费这次滚轮输入时，才取消它的程序滚动恢复。
     if (event.target instanceof Element && !node.contains(event.target)) return;
-    cancelScrollRecoveryForUserIntent();
+    cancelScrollRecoveryForUserIntent(shouldFollowMessageScrollInput(
+      event.deltaY > 0 ? 'down' : 'up',
+      node,
+    ));
     if (event.deltaY < 0) {
       // 滚动条已经在顶端时浏览器不会再派发 scroll，但这仍是明确的历史阅读意图。
       if (shouldAutoScroll) {
@@ -1552,7 +1579,10 @@
       || event.key === 'End'
       || (event.key === ' ' && !event.shiftKey);
     if (scrollingUp || scrollingDown) {
-      cancelScrollRecoveryForUserIntent();
+      cancelScrollRecoveryForUserIntent(Boolean(containerRef && shouldFollowMessageScrollInput(
+        scrollingDown ? 'down' : 'up',
+        containerRef,
+      )));
     }
   }
 
@@ -1887,12 +1917,25 @@
     {/if}
   </div>
 
-  <!-- 滚动按钮：绝对定位在消息列表右下角 -->
-  {#if showScrollBtn}
-    <button class="scroll-to-bottom floating-overlay-control" onclick={scrollToBottom} title={i18n.t('messageList.scrollToBottom')} aria-label={i18n.t('messageList.scrollToBottom')}>
-      <Icon name="chevron-down" size={16} />
-    </button>
-  {/if}
+  <!-- 列表下方的置底区：执行步骤悬浮条在其中，滚动按钮始终浮在它的上沿 -->
+  <div class="message-list-footer">
+    {#if showScrollBtn}
+      <button class="scroll-to-bottom floating-overlay-control" onclick={scrollToBottom} title={i18n.t('messageList.scrollToBottom')} aria-label={i18n.t('messageList.scrollToBottom')}>
+        <Icon name="chevron-down" size={16} />
+      </button>
+    {/if}
+    {#if pinnedExecutionSteps}
+      <div class="execution-steps-dock" data-testid="execution-steps-dock">
+        <ExecutionSteps
+          pinned
+          startExpanded={conversationDisplayMode === 'original'}
+          snapshot={pinnedExecutionSteps.snapshot}
+          sessionId={filePreviewScopeForItem(pinnedExecutionSteps.item).sessionId || messageMetadataString(pinnedExecutionSteps.item.message, 'sessionId')}
+          filePreviewScope={filePreviewScopeForItem(pinnedExecutionSteps.item)}
+        />
+      </div>
+    {/if}
+  </div>
 </div>
 
 <style>
@@ -2221,10 +2264,24 @@
 
   .empty-history-load { margin-top: var(--space-4); }
 
-  /* 滚动按钮 - 绝对定位在消息列表右下角 */
+  .message-list-footer {
+    position: relative;
+    flex: 0 0 auto;
+  }
+
+  /* 与消息阅读列同宽对齐；scrollbar-gutter 与滚动区一致，经典滚动条下不错位。 */
+  .execution-steps-dock {
+    --message-column-gutter: max(var(--space-4), calc((100cqw - 1040px) / 2));
+    padding-block: var(--space-2) var(--space-3);
+    padding-inline: var(--message-column-gutter);
+    overflow-y: hidden;
+    scrollbar-gutter: stable;
+  }
+
+  /* 滚动按钮 - 浮在列表下沿（有置底条时在其上方） */
   .scroll-to-bottom {
     position: absolute;
-    bottom: 20px;
+    bottom: calc(100% + 20px);
     right: 20px;
     display: flex;
     align-items: center;

@@ -19,9 +19,9 @@ use magi_core::{AccessProfile, EventId, ExecutionResultStatus, SessionId, UtcMil
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_mcp_server::server::BoxFuture;
 use magi_mcp_server::{
-    ApprovalMode, AttributionTarget, AuditEvent, AuditOutcome, AuditSink, DynamicTool,
-    InvocationOutcome, PathAccess, PathRequest, Profile, TokenStore, ToolBackend, ToolClass,
-    ToolInvocation, ToolSchema, ToolSchemaProvider, WorkspaceResolver,
+    AttributionTarget, AuditEvent, AuditOutcome, AuditSink, DynamicTool, InvocationOutcome,
+    PathAccess, PathRequest, Profile, TokenStore, ToolBackend, ToolClass, ToolInvocation,
+    ToolSchema, ToolSchemaProvider, WorkspaceResolver,
 };
 use magi_tool_runtime::{BuiltinToolName, tool_path_access_requests};
 use serde_json::Value;
@@ -152,6 +152,16 @@ impl WorkspaceResolver for RegistryWorkspaces {
         principal: &magi_mcp_server::ClientPrincipal,
         target: &AttributionTarget,
     ) -> Result<Option<magi_core::ProjectDirectoryExecutionMap>, String> {
+        if principal.attribution == magi_mcp_server::AttributionMode::Conversation {
+            let current = self.state.mcp_service.conversations.bind(
+                &self.state,
+                principal,
+                principal.session_id.as_deref().ok_or("缺少聊天上下文")?,
+            )?;
+            if current != *principal {
+                return Err("会话目录绑定已变化".into());
+            }
+        }
         if principal.workspace_id.is_empty() {
             return Err("外部令牌缺少项目授权".into());
         }
@@ -170,7 +180,11 @@ impl WorkspaceResolver for RegistryWorkspaces {
         .map_err(|error| error.message().to_string())?
         .ok_or("项目缺少目录授权")?;
         let session_id = match target {
-            AttributionTarget::ExternalSession { token_id } => external_session_id(token_id),
+            AttributionTarget::ExternalSession { token_id } => principal
+                .session_id
+                .as_deref()
+                .map(SessionId::new)
+                .unwrap_or_else(|| external_session_id(token_id)),
         };
         self.state
             .workspace_registry
@@ -209,6 +223,7 @@ impl AuditSink for EventBusAudit {
             .mcp_service
             .audit()
             .record(crate::mcp_runtime::AuditEntry {
+                session_id: event.session_id.clone(),
                 token_id: event.token_id.clone(),
                 client_name: event.client_name.clone(),
                 workspace_id: event.workspace_id.clone(),
@@ -233,6 +248,7 @@ impl AuditSink for EventBusAudit {
                 "mcp.tool.call",
                 serde_json::json!({
                     "token_id": event.token_id,
+                    "session_id": event.session_id,
                     "client_name": event.client_name,
                     "workspace_id": event.workspace_id,
                     "tool": event.tool,
@@ -318,7 +334,7 @@ fn gateway_dynamic_tools(registry: &magi_tool_runtime::ToolRegistry) -> Vec<Dyna
         tools.push(DynamicTool {
             public_name: format!("mcp.{}", tool.model_tool_name),
             internal_name: tool.model_tool_name.clone(),
-            // 下游工具的副作用 Magi 看不见：只有它自己声明只读才自动放行，其余永远逐次确认。
+            // 下游工具的副作用 Magi 看不见：非只读调用只有完全访问模式自动放行。
             class: if tool.read_only {
                 ToolClass::Read
             } else {
@@ -401,7 +417,7 @@ impl ApiToolBackend {
                 let listing = tokio::task::spawn_blocking(move || {
                     snapshot
                         .reconcile()
-                        .and_then(|()| snapshot.pending_changes())
+                        .and_then(|()| snapshot.pending_tool_changes())
                 })
                 .await;
                 let changes = match listing {
@@ -477,6 +493,14 @@ impl ApiToolBackend {
     }
 
     fn resolve_session(&self, invocation: &ToolInvocation) -> Result<SessionId, String> {
+        if let Some(id) = &invocation.principal.session_id {
+            return self
+                .state
+                .mcp_service
+                .conversations
+                .bind(&self.state, &invocation.principal, id)
+                .map(|_| SessionId::new(id));
+        }
         match &invocation.attribution {
             AttributionTarget::ExternalSession { token_id } => ensure_external_session(
                 &self.state,
@@ -559,12 +583,18 @@ pub(crate) fn ensure_external_session(
 /// 进入工具之前就被拒绝的外部调用（权限档、路径范围、参数上限）：作为一条已拒绝的工具项
 /// 写进外部会话，结果文本是拒绝原因。写入失败只记日志，不影响拒绝本身。
 fn record_denied_external_call(state: &ApiState, event: &AuditEvent, reason: &str) {
-    let session_id = match ensure_external_session(
-        state,
-        &event.token_id,
-        &event.client_name,
-        &event.workspace_id,
-    ) {
+    let session_id = match event
+        .session_id
+        .as_deref()
+        .map(|id| Ok(SessionId::new(id)))
+        .unwrap_or_else(|| {
+            ensure_external_session(
+                state,
+                &event.token_id,
+                &event.client_name,
+                &event.workspace_id,
+            )
+        }) {
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(%error, "无法为被拒绝的外部调用建立外部会话");
@@ -637,6 +667,27 @@ pub(crate) fn approval_owners(state: &ApiState) -> Vec<ApprovalOwner> {
             token_prefix: record.prefix,
             workspace_id: record.workspace_id,
         })
+        .chain(
+            state
+                .mcp_service
+                .conversations
+                .records()
+                .into_iter()
+                .filter_map(|session| {
+                    let token = state
+                        .mcp_service
+                        .list_tokens()
+                        .into_iter()
+                        .find(|token| token.token_id == session.token_id)?;
+                    Some(ApprovalOwner {
+                        session_id: SessionId::new(session.session_id),
+                        token_id: token.token_id,
+                        client_name: token.client_name,
+                        token_prefix: token.prefix,
+                        workspace_id: session.directories?.workspace_id.to_string(),
+                    })
+                }),
+        )
         .collect::<Vec<_>>()
 }
 
@@ -657,6 +708,7 @@ fn liveness(
         .map(|record| record.hash.clone());
     let attribution = invocation.attribution.clone();
     let principal = invocation.principal.clone();
+    let class = invocation.class;
     let directories = invocation.project_directory_map.clone();
     let cancellation = invocation.cancellation.clone();
     move || {
@@ -672,6 +724,8 @@ fn liveness(
                         record.token_id == token_id
                             && record.is_active(UtcMillis::now().0)
                             && Some(&record.hash) == token_hash.as_ref()
+                            && (principal.approval_mode.requires_approval(class)
+                                || !record.approval_mode.requires_approval(class))
                     })
                 }
             }
@@ -741,6 +795,54 @@ fn cancelled_outcome() -> InvocationOutcome {
 }
 
 impl ToolBackend for ApiToolBackend {
+    fn start_session(
+        &self,
+        principal: &magi_mcp_server::ClientPrincipal,
+        arguments: &Value,
+    ) -> InvocationOutcome {
+        let Some(conversation) = arguments.get("conversation_id").and_then(Value::as_str) else {
+            return error_outcome("缺少 conversation_id");
+        };
+        let title = arguments.get("title").and_then(Value::as_str).unwrap_or("");
+        if !self.tokens.records().iter().any(|record| {
+            record.token_id == principal.token_id && record.is_active(UtcMillis::now().0)
+        }) {
+            return error_outcome("客户端授权已失效");
+        }
+        let record =
+            match self
+                .state
+                .mcp_service
+                .conversations
+                .start(principal, conversation, title)
+            {
+                Ok(record) => record,
+                Err(error) => return error_outcome(error),
+            };
+        crate::external_turns::publish_changed(&self.state, &SessionId::new(&record.session_id));
+        if record.denied {
+            return error_outcome("用户已拒绝此会话的目录授权");
+        }
+        if record.directories.is_some() {
+            return match self.bind_session(principal, &record.session_id) {
+                Ok(bound) => InvocationOutcome { is_error: false, text: serde_json::json!({"status":"ready","magi_session_id":record.session_id,"directories":bound.project_directories,"message":"目录已选定。本聊天后续工具调用复用此 magi_session_id，无需再次选择目录。"}).to_string() },
+                Err(error) => error_outcome(error),
+            };
+        }
+        InvocationOutcome { is_error: false, text: serde_json::json!({"status":"awaiting_directory","magi_session_id":record.session_id,"message":"请用户在本机 Magi 的目录选择提示中选择本会话的执行目录。选择后使用相同 conversation_id 再调用本工具确认；不要创建新会话，不要连续轮询。"}).to_string() }
+    }
+
+    fn bind_session(
+        &self,
+        principal: &magi_mcp_server::ClientPrincipal,
+        session_id: &str,
+    ) -> Result<magi_mcp_server::ClientPrincipal, String> {
+        self.state
+            .mcp_service
+            .conversations
+            .bind(&self.state, principal, session_id)
+    }
+
     fn schemas(&self) -> &dyn ToolSchemaProvider {
         static SCHEMAS: BuiltinSchemas = BuiltinSchemas;
         &SCHEMAS
@@ -768,6 +870,8 @@ impl ToolBackend for ApiToolBackend {
                 })
                 .collect();
         }
+        let structured_git = BuiltinToolName::from_name(internal_name)
+            .is_some_and(|tool| tool.requires_repository());
         tool_path_access_requests(
             internal_name,
             &arguments.to_string(),
@@ -779,6 +883,9 @@ impl ToolBackend for ApiToolBackend {
             raw: request.absolute_path.to_string_lossy().into_owned(),
             access: match request.kind {
                 magi_permissions::PathAccessKind::Read => PathAccess::Read,
+                // 仅结构化 Git 工具可以经 GitService 修改元数据；通用 PathGuard
+                // 只负责校验工作树、gitdir/commondir 的范围与符号链接。
+                magi_permissions::PathAccessKind::Write if structured_git => PathAccess::Read,
                 magi_permissions::PathAccessKind::Write => PathAccess::Write,
             },
         })
@@ -1044,10 +1151,12 @@ fn approve_blocking(
     workspace_id: Option<&WorkspaceId>,
     root: &Path,
 ) -> Result<(), String> {
-    match invocation.principal.approval_mode {
-        ApprovalMode::Always => return Ok(()),
-
-        ApprovalMode::Ask => {}
+    if !invocation
+        .principal
+        .approval_mode
+        .requires_approval(invocation.class)
+    {
+        return Ok(());
     }
     let is_alive = liveness(state, tokens, invocation);
     let approval = await_external_tool_approval(
@@ -1068,6 +1177,19 @@ fn approve_blocking(
         &is_alive,
     );
     approval.map_err(|(payload, _)| payload)
+}
+
+struct ExternalGitExecution {
+    state: ApiState,
+    session_id: SessionId,
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl Drop for ExternalGitExecution {
+    fn drop(&mut self) {
+        self.state
+            .release_session_git_execution_lease(&self.session_id);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1109,24 +1231,67 @@ fn run_blocking(
         )
     };
 
-    let approval_mode = invocation.principal.approval_mode;
     if invocation.cancellation.is_cancelled() {
         return cancelled_outcome();
     }
-    // MCP 的开放权限代表用户已授予完整工具调用；传入 granted 让既有执行链跳过重复审批，
-    // 但路径越界等硬性策略仍由执行层拒绝。
-    let mut granted = approval_mode == ApprovalMode::Always;
+    // 令牌按本次工具类别预授权；路径越界等硬性策略仍由执行层拒绝。
+    let mut granted = !invocation
+        .principal
+        .approval_mode
+        .requires_approval(invocation.class);
     if invocation.requires_approval {
-        match approval_mode {
-            ApprovalMode::Always => {}
-            ApprovalMode::Ask => {
-                if let Err((payload, _)) = approve(call_id) {
-                    return error_outcome(payload);
-                }
-            }
+        if let Err((payload, _)) = approve(call_id) {
+            return error_outcome(payload);
         }
         granted = true;
     }
+    if !is_alive() {
+        return cancelled_outcome();
+    }
+    // Consent must settle before acquiring a repository lease. The guard lives in
+    // this blocking execution, so disconnecting the HTTP request cannot release a
+    // lease while the actual Git process is still running.
+    let _git_execution = if BuiltinToolName::from_name(&invocation.internal_name)
+        .is_some_and(|tool| tool.requires_repository() && tool.is_write_operation())
+        && let Some(workspace_id) = workspace_id
+    {
+        let target = invocation
+            .arguments
+            .get("repositoryPath")
+            .and_then(Value::as_str)
+            .map(|path| {
+                magi_core::HostPath::resolve_native_input(path, Some(root), None)
+                    .map(magi_core::HostPath::into_path_buf)
+            })
+            .transpose();
+        let target = match target {
+            Ok(path) => path.unwrap_or_else(|| root.to_path_buf()),
+            Err(error) => return error_outcome(error.to_string()),
+        };
+        let handle = tokio::runtime::Handle::current();
+        let prepared = handle.block_on(async {
+            tokio::select! {
+                prepared = async {
+                    let lock = state.lock_session_turn(session_id).await;
+                    let guard = ExternalGitExecution { state: state.clone(), session_id: session_id.clone(), _lock: lock };
+                    state.ensure_session_code_context_for_root(session_id, workspace_id, &target).await?;
+                    Ok::<_, crate::errors::ApiError>(guard)
+                } => prepared,
+                _ = async {
+                    loop {
+                        if !is_alive() { break; }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                } => Err(crate::errors::ApiError::Conflict("Git 调用已取消或授权已失效".into())),
+            }
+        });
+        match prepared {
+            Ok(guard) => Some(guard),
+            Err(error) => return error_outcome(format!("无法准备 Git 执行: {}", error.message())),
+        }
+    } else {
+        None
+    };
     if !is_alive() {
         return cancelled_outcome();
     }
@@ -1436,6 +1601,342 @@ mod tests {
         } else {
             serde_json::from_slice(&bytes).unwrap()
         }
+    }
+
+    fn conversation_fixture() -> Fixture {
+        let mut f = fixture_with_approval(ApprovalMode::Always, Duration::from_secs(5));
+        let issued = f
+            .tokens
+            .issue(
+                IssueTokenRequest {
+                    client_name: "Web Agent".into(),
+                    workspace_id: String::new(),
+                    project_directories: None,
+                    attribution: AttributionMode::Conversation,
+                    approval_mode: ApprovalMode::Always,
+                    ttl_ms: None,
+                    network: false,
+                },
+                UtcMillis::now().0,
+            )
+            .unwrap();
+        f.secret = issued.secret;
+        f.token_id = issued.record.token_id;
+        f
+    }
+
+    async fn start_chat(f: &Fixture, conversation_id: &str) -> Value {
+        let result = rpc(f, "tools/call", call("magi.session.start", serde_json::json!({"conversation_id":conversation_id,"title":format!("Chat {conversation_id}")}))).await;
+        assert!(!is_error(&result), "{result}");
+        serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    fn approve_chat(f: &Fixture, id: &str, workspace: &str) {
+        let binding = f
+            .state
+            .workspace_registry
+            .capture_directory_binding(&WorkspaceId::new(workspace), None, None)
+            .unwrap();
+        f.state
+            .mcp_service
+            .conversations
+            .decide(&f.state, id, Some(binding))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn conversations_select_once_reconnect_and_share_a_directory_without_sharing_history() {
+        let f = conversation_fixture();
+        let a = start_chat(&f, "chat-a").await;
+        assert_eq!(a["status"], "awaiting_directory");
+        let a_id = a["magi_session_id"].as_str().unwrap();
+        assert_eq!(start_chat(&f, "chat-a").await["magi_session_id"], a_id);
+        let denied = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.fs.write",
+                serde_json::json!({"magi_session_id":a_id,"path":"a.txt","content":"too early"}),
+            ),
+        )
+        .await;
+        assert!(is_error(&denied));
+        assert!(!f.root.join("a.txt").exists());
+        approve_chat(&f, a_id, "ws-mcp");
+        let b = start_chat(&f, "chat-b").await;
+        let b_id = b["magi_session_id"].as_str().unwrap();
+        assert_ne!(a_id, b_id);
+        approve_chat(&f, b_id, "ws-mcp");
+        for (id, file, content) in [(a_id, "a.txt", "from-a"), (b_id, "b.txt", "from-b")] {
+            for _ in 0..2 {
+                let result = rpc(
+                    &f,
+                    "tools/call",
+                    call(
+                        "magi.fs.write",
+                        serde_json::json!({"magi_session_id":id,"path":file,"content":content}),
+                    ),
+                )
+                .await;
+                assert!(!is_error(&result), "{result}");
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("a.txt")).unwrap(),
+            "from-a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("b.txt")).unwrap(),
+            "from-b"
+        );
+        for (id, own, other) in [(a_id, "a.txt", "b.txt"), (b_id, "b.txt", "a.txt")] {
+            let history = serde_json::to_string(
+                &f.state
+                    .session_store
+                    .canonical_turns_for_session(&SessionId::new(id)),
+            )
+            .unwrap();
+            assert!(history.contains(own), "{history}");
+            assert!(!history.contains(other), "{history}");
+            assert_eq!(
+                f.state
+                    .session_store
+                    .session(&SessionId::new(id))
+                    .unwrap()
+                    .workspace_id
+                    .as_deref(),
+                Some("ws-mcp")
+            );
+        }
+        // Re-initialize a transport: the explicit conversation ID keeps the same binding.
+        let initialized = rpc(&f, "initialize", serde_json::json!({})).await;
+        assert!(initialized.get("error").is_none());
+        assert_eq!(start_chat(&f, "chat-a").await["status"], "ready");
+        assert!(
+            f.state
+                .mcp_service
+                .conversations
+                .records()
+                .iter()
+                .all(|r| r.directories.is_some())
+        );
+        assert!(
+            f.state
+                .session_store
+                .session(&external_session_id(&f.token_id))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn conversations_with_different_directories_do_not_follow_the_active_project() {
+        let f = conversation_fixture();
+        let other = tempfile::tempdir().unwrap();
+        f.state
+            .workspace_registry
+            .register(
+                WorkspaceId::new("ws-other"),
+                AbsolutePath::new(other.path().canonicalize().unwrap().display().to_string()),
+            )
+            .unwrap();
+        let a = start_chat(&f, "first-project").await;
+        let b = start_chat(&f, "second-project").await;
+        let a_id = a["magi_session_id"].as_str().unwrap();
+        let b_id = b["magi_session_id"].as_str().unwrap();
+        approve_chat(&f, a_id, "ws-mcp");
+        approve_chat(&f, b_id, "ws-other");
+        for (id, content) in [(b_id, "B"), (a_id, "A"), (b_id, "B"), (a_id, "A")] {
+            let result = rpc(
+                &f,
+                "tools/call",
+                call(
+                    "magi.fs.write",
+                    serde_json::json!({"magi_session_id":id,"path":"same.txt","content":content}),
+                ),
+            )
+            .await;
+            assert!(!is_error(&result), "{result}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("same.txt")).unwrap(),
+            "A"
+        );
+        assert_eq!(
+            std::fs::read_to_string(other.path().join("same.txt")).unwrap(),
+            "B"
+        );
+        let outside = rpc(&f,"tools/call",call("magi.fs.write",serde_json::json!({"magi_session_id":a_id,"path":other.path().join("escape.txt"),"content":"no"}))).await;
+        assert!(is_error(&outside));
+        assert!(!other.path().join("escape.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn conversation_identity_is_required_and_scoped_to_the_client() {
+        let f = conversation_fixture();
+        let missing = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.fs.write",
+                serde_json::json!({"path":"escape.txt","content":"no"}),
+            ),
+        )
+        .await;
+        assert!(is_error(&missing));
+        let chat = start_chat(&f, "same-id").await;
+        let id = chat["magi_session_id"].as_str().unwrap();
+        approve_chat(&f, id, "ws-mcp");
+        let another = f
+            .tokens
+            .issue(
+                IssueTokenRequest {
+                    client_name: "Another Web Agent".into(),
+                    workspace_id: String::new(),
+                    project_directories: None,
+                    attribution: AttributionMode::Conversation,
+                    approval_mode: ApprovalMode::Always,
+                    ttl_ms: None,
+                    network: false,
+                },
+                UtcMillis::now().0,
+            )
+            .unwrap();
+        let principal = magi_mcp_server::ClientPrincipal::from(&another.record);
+        assert!(
+            f.state
+                .mcp_service
+                .conversations
+                .bind(&f.state, &principal, id)
+                .is_err()
+        );
+        let other = f
+            .state
+            .mcp_service
+            .conversations
+            .start(&principal, "same-id", "")
+            .unwrap();
+        assert_ne!(other.session_id, id);
+        assert!(other.directories.is_none());
+        assert!(!f.root.join("escape.txt").exists());
+        f.tokens.revoke(&f.token_id, UtcMillis::now().0);
+        let response = http_message(&f,serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":call("magi.fs.write",serde_json::json!({"magi_session_id":id,"path":"escape.txt","content":"no"}))}),None).await;
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn conversations_sharing_a_client_and_directory_keep_tool_approvals_separate() {
+        let f = Arc::new(conversation_fixture());
+        f.tokens
+            .update(
+                &f.token_id,
+                magi_mcp_server::TokenPatch {
+                    approval_mode: Some(ApprovalMode::Ask),
+                    ..Default::default()
+                },
+                UtcMillis::now().0,
+            )
+            .unwrap();
+        let a = start_chat(&f, "approval-A").await;
+        let b = start_chat(&f, "approval-B").await;
+        let a_id = a["magi_session_id"].as_str().unwrap().to_string();
+        let b_id = b["magi_session_id"].as_str().unwrap().to_string();
+        approve_chat(&f, &a_id, "ws-mcp");
+        approve_chat(&f, &b_id, "ws-mcp");
+        let run = |session_id: String, file: &'static str| {
+            let f = f.clone();
+            tokio::spawn(async move {
+                let response = http_message(&f,serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":call("magi.fs.write",serde_json::json!({"magi_session_id":session_id,"path":file,"content":"approved"}))}),None).await;
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            })
+        };
+        let a_call = run(a_id.clone(), "allowed-a.txt");
+        let b_call = run(b_id.clone(), "denied-b.txt");
+        let registry = f.state.conversation_registry.tool_approvals();
+        let a_session = SessionId::new(a_id);
+        let b_session = SessionId::new(b_id);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while registry.pending_for_session(&a_session).is_empty()
+                || registry.pending_for_session(&b_session).is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let a_pending = registry.pending_for_session(&a_session).remove(0);
+        registry
+            .resolve(
+                &a_session,
+                &a_pending.approval_id,
+                magi_conversation_runtime::ToolApprovalDecision::AllowOnce,
+            )
+            .unwrap();
+        assert_eq!(registry.pending_for_session(&b_session).len(), 1);
+        let b_pending = registry.pending_for_session(&b_session).remove(0);
+        assert_ne!(a_pending.approval_id, b_pending.approval_id);
+        registry
+            .resolve(
+                &b_session,
+                &b_pending.approval_id,
+                magi_conversation_runtime::ToolApprovalDecision::Deny,
+            )
+            .unwrap();
+        assert!(!is_error(&a_call.await.unwrap()));
+        assert!(is_error(&b_call.await.unwrap()));
+        assert!(f.root.join("allowed-a.txt").exists());
+        assert!(!f.root.join("denied-b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn conversation_directory_grants_are_immutable_and_restore_after_restart() {
+        let f = conversation_fixture();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("mcp-conversations.json");
+        let store = crate::mcp_sessions::McpConversations::load(path.clone());
+        let record = f
+            .tokens
+            .records()
+            .into_iter()
+            .find(|record| record.token_id == f.token_id)
+            .unwrap();
+        let principal = magi_mcp_server::ClientPrincipal::from(&record);
+        let chat = store
+            .start(&principal, "persistent-chat", "Persistent")
+            .unwrap();
+        let binding = f
+            .state
+            .workspace_registry
+            .capture_directory_binding(&WorkspaceId::new("ws-mcp"), None, None)
+            .unwrap();
+        store
+            .decide(&f.state, &chat.session_id, Some(binding.clone()))
+            .unwrap();
+        assert!(store.decide(&f.state, &chat.session_id, None).is_err());
+        let pending = store.start(&principal, "not-yet-selected", "").unwrap();
+        let restored = crate::mcp_sessions::McpConversations::load(path);
+        assert_eq!(
+            restored
+                .start(&principal, "persistent-chat", "")
+                .unwrap()
+                .session_id,
+            chat.session_id
+        );
+        assert_eq!(
+            restored
+                .bind(&f.state, &principal, &chat.session_id)
+                .unwrap()
+                .project_directories,
+            Some(binding)
+        );
+        assert!(
+            !restored
+                .records()
+                .iter()
+                .any(|record| record.session_id == pending.session_id)
+        );
     }
 
     fn call(name: &str, arguments: Value) -> Value {
@@ -2293,7 +2794,57 @@ mod tests {
             status.to_string().contains(r#"\"untracked\":1"#),
             "{status}"
         );
-        // 变更类 git 操作不在目录里。
+        // 兼容的 dirty 改动沿 GitService 的既有语义保留；MCP 不得被通用
+        // `.git` 写保护误拒绝，也不能改变 GitService 的工作树保护语义。
+        let dirty_branch = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.git.branch_create",
+                serde_json::json!({"branch":"mcp-test"}),
+            ),
+        )
+        .await;
+        assert!(!is_error(&dirty_branch), "{dirty_branch}");
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("dirty.txt")).unwrap(),
+            "x"
+        );
+        std::fs::remove_file(f.root.join("dirty.txt")).unwrap();
+        for (name, arguments) in [
+            (
+                "magi.git.branch_switch",
+                serde_json::json!({"branch":"main"}),
+            ),
+            (
+                "magi.git.branch_delete",
+                serde_json::json!({"branch":"mcp-test"}),
+            ),
+        ] {
+            let result = rpc(&f, "tools/call", call(name, arguments)).await;
+            assert!(!is_error(&result), "{name}: {result}");
+        }
+        let raw = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.fs.write",
+                serde_json::json!({"path":".git/config","content":"must not replace"}),
+            ),
+        )
+        .await;
+        assert!(is_error(&raw), "原始元数据写入仍须拒绝: {raw}");
+        let escaped = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.git.branch_create",
+                serde_json::json!({"branch":"escape","repositoryPath":"../outside"}),
+            ),
+        )
+        .await;
+        assert!(is_error(&escaped), "结构化 Git 不能越界: {escaped}");
+        // 未配置远端仍须报错，完全访问不伪造 Git 操作成功。
         let push = rpc(
             &f,
             "tools/call",
@@ -2462,6 +3013,69 @@ mod tests {
         .await;
         assert!(!is_error(&ok), "{ok}");
         assert!(ok.to_string().contains("still-open"));
+    }
+
+    #[tokio::test]
+    async fn read_write_mode_runs_normal_io_but_prompts_for_commands_and_opaque_effects() {
+        let f = fixture_with_approval(ApprovalMode::ReadWrite, Duration::from_millis(150));
+        let written = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.fs.write",
+                serde_json::json!({
+                    "path": "rw.txt", "content": "allowed"
+                }),
+            ),
+        )
+        .await;
+        assert!(!is_error(&written), "{written}");
+        let read = rpc(
+            &f,
+            "tools/call",
+            call("magi.fs.read", serde_json::json!({"path": "rw.txt"})),
+        )
+        .await;
+        assert!(!is_error(&read), "{read}");
+        assert!(read.to_string().contains("allowed"));
+        assert!(
+            f.state
+                .conversation_registry
+                .tool_approvals()
+                .pending_for_session(&external_session_id(&f.token_id))
+                .is_empty()
+        );
+
+        for (name, arguments) in [
+            ("magi.fs.remove", serde_json::json!({"path": "rw.txt"})),
+            (
+                "magi.shell.exec",
+                serde_json::json!({"command": "touch command-must-not-run"}),
+            ),
+            ("mcp.mcp__docs__publish", serde_json::json!({})),
+        ] {
+            let result = rpc(&f, "tools/call", call(name, arguments)).await;
+            assert!(is_error(&result), "未确认必须拒绝: {name}: {result}");
+            assert!(
+                result.to_string().contains("tool_approval_timeout"),
+                "必须进入审批并超时: {result}"
+            );
+        }
+        assert!(f.root.join("rw.txt").exists());
+        assert!(!f.root.join("command-must-not-run").exists());
+        assert_eq!(f.mcp_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let outside = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.fs.write",
+                serde_json::json!({
+                    "path": "../escape.txt", "content": "deny"
+                }),
+            ),
+        )
+        .await;
+        assert!(is_error(&outside), "{outside}");
     }
 
     #[tokio::test]

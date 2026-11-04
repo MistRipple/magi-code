@@ -17,7 +17,9 @@ export function mergeExternalSessionsIntoSidebar(
     .map((session): Session => ({
       id: session.sessionId,
       workspaceId: session.workspaceId ?? undefined,
-      name: session.clientName,
+      // 外部聊天的标题是用户在 Agent 中看到并理解的任务名；客户端名称
+      // 仅在悬浮提示中展示，避免把“ChatGPT Web · Edge · …”塞进主标题。
+      name: session.title?.trim() || session.clientName.trim(),
       createdAt: session.lastActivityAtMs,
       updatedAt: session.lastActivityAtMs,
       messageCount: 0,

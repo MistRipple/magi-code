@@ -1248,7 +1248,8 @@ impl BuiltinToolName {
                 "当 AgentContextPackage 和 context_search/context_read 都不足以完成任务时，向父任务发送明确的上下文请求。父任务可通过 agent_send 回复；不要用它替代已有引用读取。"
             }
             Self::UpdateExecutionSteps => {
-                "更新当前 Task/Turn 的实时执行步骤，不创建 Goal 或会话计划。复杂多阶段任务在实际执行前先提交 2–12 个简短步骤，首次 expectedRevision=0，后续沿用返回的 revision 和 stepId。简单问答、单步操作不用。先把步骤设为 running 再动手，完成时提交本轮同 Task 成功工具或助手 itemId 作为 evidenceRefs；失败/阻塞/取消须填写 reason。并行步骤用 taskIds 绑定直接子任务；dependsOn 必须先完成。保留所有旧步骤及已结束事实；失败重试、拆分或范围变化时取消未开始的旧步骤并追加新 stepId。不要将一次工具调用失败当作整个阶段失败；可先恢复。最终答复前收口全部步骤，不得虚报完成。"
+                "更新当前 Task/Turn 的实时执行步骤，不创建 Goal 或会话计划；已有会话计划时，计划表达顶层阶段，步骤只表达本轮正在做的细分，不要把计划项原样复制成步骤。仅用于需要多阶段修改/验证/委派、且用户需要看到进度的任务；问答、只读分析、少量工具即可完成的操作不要使用，拿不准就不用。\n\
+                每次提交完整步骤列表并沿用 stepId，3–6 个简短步骤，标题用用户的语言。先把步骤设为 running 再动手（可与其第一个工具调用放在同一轮），成功执行后设为 completed。没有版本号或证据参数——完成由服务端按该步骤运行期间成功的工具调用确认，没有成功执行就不能完成。失败、阻塞、取消须填写 reason；已结束步骤不可改写，重试、拆分或范围变化时取消未开始的旧步骤并追加新 stepId。并行步骤用 taskIds 绑定直接子任务；dependsOn 可选，只能指向前序步骤。单次工具失败不等于阶段失败，可先恢复。最终答复时仍未收口的步骤由系统结算，无需额外调用。"
             }
             Self::UpdatePlan => {
                 "更新当前会话的用户可见计划。计划只表达顶层执行阶段；真实主线、代理和工具执行由执行链负责。首次创建时 planId 和每个 itemId 必须显式传 null，并使用 expectedRevision=0；后续更新必须沿用工具返回的 planId、revision、itemId 和 language。存在未完成 Goal 时，expectedGoalId 和 expectedGoalControlRevision 必须使用本轮 get_goal 或 create_goal 返回的 goalId 与 controlRevision；没有 Goal 时两者都显式传 null。\n\n\

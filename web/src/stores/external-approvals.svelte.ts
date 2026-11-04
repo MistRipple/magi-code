@@ -6,6 +6,9 @@ import {
   RUNTIME_CONNECTION_EVENT,
   type AgentConnectionEventDetail,
   listMcpServerApprovals,
+  listMcpDirectoryRequests,
+  resolveMcpDirectoryRequest,
+  type McpDirectoryRequest,
   resolveMcpServerApproval,
   type McpServerApproval,
 } from '../web/agent-api';
@@ -16,6 +19,7 @@ const POLL_WHILE_PENDING_MS = 3000;
 
 export const externalApprovals = $state({
   approvals: [] as McpServerApproval[],
+  directories: [] as McpDirectoryRequest[],
   busy: false,
   /** 倒计时用的当前时间（毫秒）。 */
   now: Date.now(),
@@ -51,7 +55,7 @@ function notifyNewApprovals(approvals: McpServerApproval[]): void {
     notification.onclick = () => {
       window.focus();
       notification.close();
-      const session = externalSessions.sessions.find((item) => item.tokenId === approval.tokenId);
+      const session = externalSessions.sessions.find((item) => item.sessionId === approval.sessionId);
       if (session) window.dispatchEvent(new CustomEvent(OPEN_EXTERNAL_SESSION_EVENT, { detail: { session } }));
     };
   }
@@ -65,16 +69,18 @@ export async function refreshExternalApprovals(): Promise<void> {
   }
   const revision = ++syncRevision;
   try {
-    const approvals = await listMcpServerApprovals();
+    const [approvals, directories] = await Promise.all([listMcpServerApprovals(), listMcpDirectoryRequests()]);
     if (revision !== syncRevision) return;
     notifyNewApprovals(approvals);
     externalApprovals.approvals = approvals;
+    externalApprovals.directories = directories;
     retryPending = false;
   } catch (error) {
     if (revision !== syncRevision) return;
     if (error instanceof AgentApiError && [401, 403, 404, 501].includes(error.status)) {
       disabled = true;
       externalApprovals.approvals = [];
+      externalApprovals.directories = [];
       retryPending = false;
       loadedOnce = true;
     } else {
@@ -109,6 +115,20 @@ export async function resolveExternalApproval(
   }
 }
 
+export async function selectExternalDirectory(sessionId: string, directory: { workspaceId: string; sourceFolderId: string } | null): Promise<void> {
+  if (externalApprovals.busy) return;
+  ++syncRevision;
+  externalApprovals.busy = true;
+  try {
+    await resolveMcpDirectoryRequest(sessionId, directory);
+  } catch (error) {
+    reportFailure(error);
+  } finally {
+    externalApprovals.busy = false;
+    await refreshExternalApprovals();
+  }
+}
+
 /** 开始跟踪待确认：收到事件时拉取；只有存在待确认项时才低频轮询。返回停止函数。 */
 export function trackExternalApprovals(): () => void {
   disabled = false;
@@ -124,7 +144,7 @@ export function trackExternalApprovals(): () => void {
   window.addEventListener(RUNTIME_CONNECTION_EVENT, onConnected);
   const clock = window.setInterval(() => { externalApprovals.now = Date.now(); }, 1000);
   const poll = window.setInterval(() => {
-    if (externalApprovals.approvals.length > 0 || retryPending) void refreshExternalApprovals();
+    if (externalApprovals.approvals.length > 0 || externalApprovals.directories.length > 0 || retryPending) void refreshExternalApprovals();
   }, POLL_WHILE_PENDING_MS);
   return () => {
     window.removeEventListener(MCP_APPROVALS_CHANGED_EVENT, onChanged);

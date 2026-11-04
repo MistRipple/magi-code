@@ -19,20 +19,13 @@
 
   const segmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
   const words = (value: string) => Array.from(segmenter.segment(value), (part) => part.segment);
-  let burstStarted = 0;
-  let burstIndex = 0;
 
   // Animate only newly mounted words. Never queue a delay based on total reply length.
   function inkArrival(node: HTMLSpanElement) {
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
-    const now = performance.now();
-    if (now - burstStarted > 30) {
-      burstStarted = now;
-      burstIndex = 0;
-    }
     const animation = node.animate(
-      [{ opacity: 0.35, filter: 'blur(6px)' }, { opacity: 1, filter: 'blur(0)' }],
-      { duration: 90, delay: Math.min(burstIndex++, 7) * 30, easing: 'cubic-bezier(.215,.61,.355,1)', fill: 'backwards' },
+      [{ opacity: 0.7 }, { opacity: 1 }],
+      { duration: 90, easing: 'cubic-bezier(.215,.61,.355,1)' },
     );
     return { destroy: () => animation.cancel() };
   }

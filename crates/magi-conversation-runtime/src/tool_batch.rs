@@ -269,12 +269,58 @@ pub(crate) fn execute_task_tool_call_batch(
             }).to_string(),ExecutionResultStatus::Rejected)).collect();
         }
     }
-    if tool_calls.len() > 1
-        && tool_calls
+    // 步骤更新要先于同批次的实际工具生效：后者按“当前 running 步骤”绑定归属。
+    // 模型习惯把“进入下一步”和该步的第一个工具放在同一轮，这里拆成先后两段执行，不拒绝整批。
+    let is_steps_call = |call: &ChatToolCall| call.function.name == "update_execution_steps";
+    if tool_calls.iter().any(is_steps_call) && tool_calls.iter().any(|call| !is_steps_call(call)) {
+        let (steps_calls, other_calls): (Vec<_>, Vec<_>) = tool_calls
             .iter()
-            .any(|call| call.function.name == "update_execution_steps")
-    {
-        return tool_calls.iter().map(|call|(serde_json::json!({"tool":call.function.name,"status":"rejected","error_code":"execution_steps_separate_batch","execution_started":false,"error":"请单独提交 update_execution_steps；步骤更新成功后再调用实际工具。"}).to_string(),ExecutionResultStatus::Rejected)).collect();
+            .cloned()
+            .enumerate()
+            .partition(|(_, call)| is_steps_call(call));
+        let mut run = |group: &[(usize, ChatToolCall)]| {
+            let calls = group
+                .iter()
+                .map(|(_, call)| call.clone())
+                .collect::<Vec<_>>();
+            execute_task_tool_call_batch(
+                event_bus,
+                tool_registry,
+                agent_role_registry,
+                skill_runtime,
+                skill_dispatch_runtime,
+                skill_name,
+                task_store,
+                session_store,
+                execution_registry,
+                conversation_registry,
+                safety_gate,
+                plan_store,
+                project_memory,
+                task,
+                session_id,
+                workspace_id,
+                workspace_root_path,
+                worker_id,
+                browser_capability_snapshot.clone(),
+                &calls,
+                tool_execution_ledger,
+                on_progress,
+                workspace_resources.clone(),
+                execution_group_id.clone(),
+                execution_allowed,
+            )
+        };
+        let mut merged: Vec<Option<(String, ExecutionResultStatus)>> = vec![None; tool_calls.len()];
+        for group in [&steps_calls, &other_calls] {
+            for ((index, _), result) in group.iter().zip(run(group)) {
+                merged[*index] = Some(result);
+            }
+        }
+        return merged
+            .into_iter()
+            .map(|result| result.expect("每个工具调用都有结果"))
+            .collect();
     }
     tool_execution_ledger.rebind_project_directories(
         workspace_resources
@@ -3387,7 +3433,7 @@ fn execute_execution_steps(
         let input: execution_steps_protocol::UpdateExecutionStepsParams =
             serde_json::from_str(&call.function.arguments).map_err(|e| e.to_string())?;
         for step in &input.steps {
-            for child_id in &step.task_ids {
+            for child_id in step.task_ids.iter().flatten() {
                 let child = task_store
                     .get_task(&TaskId::new(child_id))
                     .ok_or("关联子任务不存在")?;
@@ -3420,13 +3466,9 @@ fn execute_execution_steps(
                     .ok()
                     .flatten()
             });
-            let code = if error.contains("revision_conflict") {
-                "execution_steps_revision_conflict"
-            } else {
-                "execution_steps_invalid_update"
-            };
+            let code = "execution_steps_invalid_update";
             let failure=magi_core::ToolFailure::coded("update_execution_steps",code,error)
-                .instruction("读取 current_steps 的 revision 与稳定 stepId 修正后重试。只能根据实际成功证据完成步骤；取消、失败和阻塞要填写原因。")
+                .instruction("按 current_steps 里的稳定 stepId 修正后重试，每次提交完整步骤列表。只能在步骤 running 期间有成功执行后完成步骤；取消、失败和阻塞要填写原因。")
                 .with("current_steps",serde_json::to_value(current).expect("steps serializable"));
             (failure.into_payload(), ExecutionResultStatus::Failed)
         }
@@ -8763,6 +8805,97 @@ mod tests {
                 && payload["status"] == "running"
                 && payload["stdout"] == "first"
         }));
+    }
+
+    #[test]
+    fn execution_steps_update_shares_a_batch_with_real_tools_in_original_order() {
+        let event_bus = InMemoryEventBus::new(16);
+        let task_store = TaskStore::new();
+        let session_store = SessionStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let conversation_registry = ConversationRegistry::new();
+        let plan_store = crate::test_plan_store("test-plan");
+        let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(magi_governance::GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_default_builtins();
+        let dir = tempdir().expect("temp dir");
+        let mut task = test_task("task-steps-batch", "task-steps-batch", None);
+        task.policy_snapshot = Some(default_agent_spawn_policy());
+        task.policy_snapshot
+            .as_mut()
+            .expect("policy")
+            .access_profile = magi_core::AccessProfile::FullAccess;
+        let session_id = SessionId::new("session-steps-batch");
+        let workspace_id = Some(WorkspaceId::new("workspace-steps-batch"));
+        let call = |id: &str, name: &str, arguments: serde_json::Value| ChatToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        };
+        // 模型把“进入下一步”放在实际工具之前或之后都应当可用，结果顺序与调用顺序一致。
+        let calls = [
+            call(
+                "call-shell",
+                BuiltinToolName::ShellExec.as_str(),
+                serde_json::json!({"command": "printf ok", "access_mode": "read_only", "timeout_ms": 5_000}),
+            ),
+            call(
+                "call-steps",
+                "update_execution_steps",
+                serde_json::json!({"steps": [
+                    {"stepId": "a", "title": "第一步", "status": "running"},
+                    {"stepId": "b", "title": "第二步", "status": "pending"}
+                ]}),
+            ),
+        ];
+        let result = execute_task_tool_call_batch(
+            &event_bus,
+            Some(&tool_registry),
+            &agent_role_registry,
+            None,
+            None,
+            None,
+            &task_store,
+            &session_store,
+            &execution_registry,
+            &conversation_registry,
+            None,
+            &plan_store,
+            None,
+            &task,
+            &session_id,
+            &workspace_id,
+            Some(&dir.path().to_path_buf()),
+            None,
+            None,
+            &calls,
+            &mut ToolExecutionLedger::default(),
+            None,
+            None,
+            None,
+            &|| true,
+        );
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0].1,
+            ExecutionResultStatus::Succeeded,
+            "{:?}",
+            result[0]
+        );
+        // 测试里没有可写入的 Turn，步骤更新本身失败；关键是它没有拖垮同批次的实际工具，
+        // 也不再因“混合批次”被整体拒绝。
+        assert!(
+            !result[1].0.contains("execution_steps_separate_batch"),
+            "{:?}",
+            result[1]
+        );
+        assert!(result[1].0.contains("update_execution_steps"));
     }
 
     #[test]

@@ -484,7 +484,7 @@
   .diff-line-number {
     display: block;
     padding: 0 10px 0 6px;
-    color: color-mix(in srgb, var(--foreground-muted) 72%, transparent);
+    color: var(--foreground-muted);
     text-align: right;
     font-variant-numeric: tabular-nums;
     user-select: none;

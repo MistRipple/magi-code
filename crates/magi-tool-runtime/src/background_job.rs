@@ -35,7 +35,9 @@ pub struct BackgroundJob {
     pub job_id: String,
     pub session_id: SessionId,
     pub workspace_id: Option<WorkspaceId>,
-    pub task_id: TaskId,
+    /// 原生执行绑定 Task；外部工具会话直接绑定 canonical Turn / item，不伪造 Task。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
     pub turn_id: String,
     pub item_id: String,
     pub tool_call_id: String,
@@ -55,7 +57,7 @@ impl BackgroundJob {
         context.session_id.as_ref() == Some(&self.session_id)
             && context.workspace_id == self.workspace_id
             && (context.caller_scope == ToolCallerScope::SessionMainline
-                || context.task_id.as_ref() == Some(&self.task_id))
+                || self.task_id.as_ref().is_some_and(|task| context.task_id.as_ref() == Some(task)))
     }
 
     pub fn validate_snapshot(&self) -> Result<(), String> {
@@ -68,7 +70,7 @@ impl BackgroundJob {
             || self.item_id.trim().is_empty()
             || self.tool_call_id.trim().is_empty()
             || self.session_id.as_str().trim().is_empty()
-            || self.task_id.as_str().trim().is_empty()
+            || self.task_id.as_ref().is_some_and(|task| task.as_str().trim().is_empty())
             || self.revision == 0
             || !self.stdout_path.is_absolute()
             || !self.stderr_path.is_absolute()

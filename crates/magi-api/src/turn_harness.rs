@@ -4845,7 +4845,7 @@ done
                         registry.cancel_active_executions(
                             &magi_tool_runtime::ToolExecutionContextQuery {
                                 session_id: Some(job.session_id),
-                                task_id: Some(job.task_id),
+                                task_id: job.task_id,
                                 ..Default::default()
                             },
                         );
@@ -4944,7 +4944,7 @@ done
                             self.settlement_visible.store(
                                 tools.has_active_executions(&ToolExecutionContextQuery {
                                     session_id: Some(job.session_id),
-                                    task_id: Some(job.task_id),
+                                    task_id: job.task_id,
                                     ..Default::default()
                                 }),
                                 Ordering::SeqCst,
@@ -4981,7 +4981,7 @@ done
         let context = ToolExecutionContext {
             session_id: Some(session.clone()),
             workspace_id: Some(workspace.clone()),
-            task_id: Some(job.task_id.clone()),
+            task_id: job.task_id.clone(),
             working_directory: Some(root.clone()),
             ..Default::default()
         };
@@ -5002,7 +5002,7 @@ done
         let first = kill();
         let query = ToolExecutionContextQuery {
             session_id: Some(session.clone()),
-            task_id: Some(job.task_id.clone()),
+            task_id: job.task_id.clone(),
             ..Default::default()
         };
         // 同一取消入口还须结束等待者；写盘仍失败时，物理进程退出不能抹掉结算屏障。

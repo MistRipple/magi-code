@@ -613,6 +613,41 @@ async fn tool_hook_attribution_is_recorded() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn tool_changes_exclude_foreign_paths_but_preserve_own_overwrite_conflicts() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("shared.txt"), "baseline").unwrap();
+    let mgr = SnapshotManager::new();
+    let a = mgr.start_session("tool-changes-a".into(), root.clone()).await.unwrap();
+    let b = mgr.start_session("tool-changes-b".into(), root.clone()).await.unwrap();
+    let ctx = ToolHookCtx {
+        tool_call_id: "a-write".into(), worker_id: None, execution_group_id: None,
+        declared_paths: vec![root.join("shared.txt"), root.join("a.txt")],
+    };
+    a.before_tool(&ctx);
+    fs::write(root.join("shared.txt"), "A edit").unwrap();
+    fs::write(root.join("a.txt"), "A new file").unwrap();
+    a.after_tool(&ctx);
+    b.reconcile().unwrap();
+    assert!(b.pending_tool_changes().unwrap().is_empty());
+    assert_eq!(a.pending_tool_changes().unwrap().len(), 2);
+    // 其他来源覆盖本会话已修改的文件：冲突仍显示，禁止回退。
+    fs::write(root.join("shared.txt"), "B overwrites A, a longer value").unwrap();
+    a.reconcile().unwrap();
+    let own = a.pending_tool_changes().unwrap();
+    assert_eq!(own.len(), 2);
+    assert!(!own.iter().find(|change| change.path == "shared.txt").unwrap().revertible);
+    assert!(!a.paths_modified_outside_tools(&["shared.txt".into()]).unwrap().is_empty());
+    // 批准之后再发生的外部变化不能沿用已结束的工具归属。
+    a.approve(&["shared.txt".into(), "a.txt".into()]).unwrap();
+    fs::write(root.join("shared.txt"), "new external edit after approval").unwrap();
+    fs::write(root.join("a.txt"), "external edit of approved file").unwrap();
+    a.reconcile().unwrap();
+    assert_eq!(a.pending_changes().unwrap().len(), 2);
+    assert!(a.pending_tool_changes().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn revert_execution_group_restores_state_before_that_group_only() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();

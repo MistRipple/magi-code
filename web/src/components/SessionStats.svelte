@@ -170,9 +170,9 @@
   .metric { min-inline-size: 0; }
   .metric-label { display: flex; align-items: baseline; gap: 5px; color: var(--foreground-muted); font-size: 12px; line-height: 1.4; }
   .metric-label :global(svg) { flex: none; align-self: center; }
-  small { font-size: 10px; }
+  small { font-size: var(--text-xs); }
   .metric-value { display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px; margin-block: 5px 2px; font-size: 24px; line-height: 1.3; font-weight: var(--font-medium); overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
-  .metric-value > span { font-size: 11px; color: var(--foreground-muted); font-weight: var(--font-normal); }
+  .metric-value > span { font-size: var(--text-xs); color: var(--foreground-muted); font-weight: var(--font-normal); }
   .metric-value--placeholder { color: var(--foreground-muted); font-size: 21px; line-height: 1.45; font-weight: var(--font-normal); }
   .metric-value--status { font-size: 15px; line-height: 1.5; font-weight: var(--font-normal); letter-spacing: .01em; }
   .metric-caption, .detail-note { color: var(--foreground-muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
@@ -189,10 +189,10 @@
   dl > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
   dt { min-inline-size: 0; color: var(--foreground-muted); overflow-wrap: anywhere; }
   dd { margin: 0; text-align: end; overflow-wrap: anywhere; direction: ltr; unicode-bidi: isolate; }
-  .observation-footer { display: flex; align-items: baseline; gap: 5px; padding-block-start: 10px; color: var(--foreground-muted); font-size: 11px; }
+  .observation-footer { display: flex; align-items: baseline; gap: 5px; padding-block-start: 10px; color: var(--foreground-muted); font-size: var(--text-xs); }
   .observation-footer :global(svg) { flex: none; }
   .stats-empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 24px 8px; color: var(--foreground-muted); text-align: center; }
-  .stats-empty--compact { flex-direction: row; justify-content: center; padding: 12px 0 0; border-block-start: var(--magi-hairline) solid var(--border); font-size: 11px; }
+  .stats-empty--compact { flex-direction: row; justify-content: center; padding: 12px 0 0; border-block-start: var(--magi-hairline) solid var(--border); font-size: var(--text-xs); }
   .stats-error { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: var(--error); }
   @container magi-composer (max-width: 800px) { .stats-summary { display: none; } }
   @media (hover: none), (pointer: coarse) {

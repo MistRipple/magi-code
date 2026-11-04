@@ -1356,9 +1356,8 @@ export interface ExecutionStepInput {
   stepId: string;
   title: string;
   status: ExecutionStepStatus;
-  dependsOn: Array<string>;
-  evidenceRefs: Array<string>;
-  taskIds: Array<string>;
+  dependsOn?: Array<string>;
+  taskIds?: Array<string>;
   reason?: string;
   planItemId?: string;
 }
@@ -1377,7 +1376,6 @@ export interface ExecutionStep {
 }
 
 export interface UpdateExecutionStepsParams {
-  expectedRevision: number;
   steps: Array<ExecutionStepInput>;
   explanation?: string;
 }

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import ts from 'typescript';
+import { parse } from 'svelte/compiler';
 
 const repositoryRoot = path.resolve(new URL('../..', import.meta.url).pathname);
 const read = (relative) => fs.readFileSync(path.join(repositoryRoot, relative), 'utf8');
@@ -52,16 +54,16 @@ assert.match(section, /token\.hasSecret/);
 assert.match(section, /data-mcp-token-no-secret/);
 assert.match(section, /rotateMcpServerToken\(token\.tokenId\)/);
 assert.match(section, /confirmMessage\(i18n\.t\('mcpServer\.token\.rotateConfirm'/);
-// 所有客户端使用完整工具目录，只选择逐次询问或开放权限。
+// 所有客户端使用完整工具目录，选择每次询问、允许读写或完全访问。
 assert.doesNotMatch(section, /McpServerProfile|data-mcp-profile|data-mcp-edit-profile|confirmHighRisk|editConfirmHighRisk/);
 assert.doesNotMatch(agentApi, /McpServerProfile|confirmHighRisk/);
 assert.doesNotMatch(section, /updateMcpServerToken\([^)]*workspaceId/);
 assert.match(section, /viewingSecret = null/, '收起后原文必须丢弃');
 
-// ── MCP 权限只有每次询问与开放权限两种 ───────────────────────────────────────
+// ── MCP 权限分为每次询问、允许读写和完全访问三档 ───────────────────────────────────────
 assert.match(section, /data-mcp-approval-mode/);
 assert.match(section, /data-mcp-edit-approval-mode/);
-assert.match(section, /const APPROVAL_MODES:[^\n]*= \['ask', 'always'\]/);
+assert.match(section, /const APPROVAL_MODES:[^\n]*= \['ask', 'read_write', 'always'\]/);
 assert.doesNotMatch(section, /profile !== 'read_only'/);
 assert.match(section, /let approvalMode = \$state<McpServerApprovalMode>\('ask'\)/);
 
@@ -98,7 +100,7 @@ assert.match(toolsTabSource, /\{#if skill\.builtin\}[\s\S]*?data-skill-builtin[\
 assert.equal((settingsStore.match(/builtin: skill\.builtin === true/g) ?? []).length, 2, '两处构造技能列表都要带 builtin');
 
 // ── 面板按用途分组；调用记录分页并可清理，数据来自 daemon ─────────────────────
-for (const id of ['connect', 'clients', 'remote', 'activity']) assert.match(section, new RegExp(`'${id}'`));
+for (const id of ['clients', 'remote', 'activity']) assert.match(section, new RegExp(`'${id}'`));
 assert.match(section, /<SettingsMcpServerAudit /);
 assert.match(section, /tab === 'activity'/);
 assert.match(section, /data-mcp-create-open/, '新建令牌表单默认收起');
@@ -109,14 +111,11 @@ assert.match(audit, /confirmMessage\(message/, '清理前必须确认');
 assert.match(agentApi, /clear mcp server audit/);
 assert.match(agentApi, /if \(options\.offset\) query\.set\('offset'/);
 
-// ── 令牌来源要说清楚：配置卡片选客户端自动填入，没有令牌时直接引导去创建 ──────────
-assert.match(section, /data-mcp-token-origin/);
-assert.match(section, /data-mcp-connect-token/);
-assert.match(section, /data-mcp-go-clients="1"[\s\S]*?tab = 'clients'; showCreate = true/);
-assert.match(section, /data-mcp-placeholder-note/);
-assert.match(zhCN['mcpServer.snippets.hint'], /“客户端”分组/);
+// ── 连接配置归属对应客户端；网络入口可直接进入新建客户端流程 ──────────────────
+assert.match(section, /data-mcp-token-view=\{token\.tokenId\}/);
+assert.match(section, /data-mcp-token-detail=\{token\.tokenId\}/);
+assert.match(section, /data-mcp-go-clients-network="1"[\s\S]*?openCreateToken\(true\)/);
 assert.match(zhCN['mcpServer.network.needToken'], /“客户端”分组/);
-assert.match(zhCN['mcpServer.snippets.placeholderNote'], /MAGI_MCP_TOKEN/);
 
 // ── 直接对公网开放（监听公网 IP / 0.0.0.0）：必须确认明文风险，只引用 daemon 的状态 ──
 assert.ok(agentApi.includes('/api/mcp-server/direct'));
@@ -145,7 +144,7 @@ assert.doesNotMatch(toolsTab, /SettingsMcpServerSection/);
 
 // ── 托盘：没有待确认项时不产生周期请求；无管理权限时自行停用 ─────────────────
 // 托盘与外部会话里的调用卡片共用同一个存储和同一组操作按钮：批准与拒绝只有一个入口。
-assert.match(approvalStore, /if \(externalApprovals\.approvals\.length > 0 \|\| retryPending\) void refreshExternalApprovals\(\)/);
+assert.match(approvalStore, /if \(externalApprovals\.approvals\.length > 0 \|\| externalApprovals\.directories\.length > 0 \|\| retryPending\) void refreshExternalApprovals\(\)/);
 assert.match(approvalStore, /disabled = true;/);
 assert.match(approvalActions, /'allow_once'/);
 assert.doesNotMatch(approvalActions, /allow_for_turn/);
@@ -166,11 +165,11 @@ assert.doesNotMatch(section, /resolveMcpServerApproval|data-mcp-server-approvals
 // ── i18n：用到的键中英文都存在，且两边键集合一致 ─────────────────────────────
 const usedKeys = new Set();
 for (const action of ['token.view_secret', 'token.update', 'token.rotate']) usedKeys.add(`mcpServer.audit.action.${action}`);
-for (const id of ['connect', 'clients', 'remote', 'activity']) usedKeys.add(`mcpServer.tab.${id}`);
+for (const id of ['clients', 'remote', 'activity']) usedKeys.add(`mcpServer.tab.${id}`);
 for (const source of [section, tray, audit, approvalActions, approvalStore, read('web/src/components/ExternalSessionBar.svelte')]) {
   for (const match of source.matchAll(/i18n\.t\(\s*['`](mcpServer\.[^'`$]+)['`]/g)) usedKeys.add(match[1]);
 }
-for (const mode of ['ask', 'always']) {
+for (const mode of ['ask', 'read_write', 'always']) {
   usedKeys.add(`mcpServer.token.approvalMode.${mode}`);
   usedKeys.add(`mcpServer.token.approvalModeShort.${mode}`);
 }
@@ -193,5 +192,58 @@ for (const key of usedKeys) {
 }
 const mcpKeys = (dict) => Object.keys(dict).filter((key) => key.startsWith('mcpServer.')).sort();
 assert.deepEqual(mcpKeys(zhCN), mcpKeys(enUS), '中英文 mcpServer.* 键必须一一对应');
+
+// 执行实际加载函数，覆盖折叠状态和迟到响应，避免 OAuth 浏览时自动读取手动令牌。
+const instance = parse(section).instance;
+const script = section.slice(instance.content.start, instance.content.end);
+const ast = ts.createSourceFile('SettingsMcpServerSection.ts', script, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+const functions = ['loadQuickAdd', 'openNamedEditor', 'closeNamedEditor'].map(name => {
+  const node = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
+  assert.ok(node, `missing production function ${name}`);
+  return node.getText(ast);
+}).join('\n');
+const makeLoader = new Function('getMcpServerConfigSnippets', ts.transpileModule(`
+  let tab = 'remote', showManualConfig = false, remoteReady = true;
+  const token = { tokenId: 'client-1', hasSecret: true };
+  let quickAddToken = token, quickAddTokenId = token.tokenId, quickAddSnippets = null;
+  let quickAddRequest = 0;
+  let status = { running: true, network: { namedHostname: 'mcp.example.com' } };
+  let namedHostname = '', namedToken = '', showNamedEditor = false;
+  ${functions}
+  return {
+    manual: loadQuickAdd,
+    setOpen: value => { showManualConfig = value; }, setTab: value => { tab = value; },
+    snapshot: () => ({ quickAddSnippets, namedHostname, namedToken, showNamedEditor }),
+    openEditor: openNamedEditor, closeEditor: closeNamedEditor,
+    typeToken: value => { namedToken = value; },
+  };
+`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText);
+let requests = [];
+const loader = makeLoader(tokenId => new Promise(resolve => { requests.push({ tokenId, resolve }); }));
+await loader.manual();
+assert.equal(requests.length, 0, '网络页未展开手动配置，不得请求令牌片段');
+loader.setOpen(true);
+const pending = loader.manual();
+assert.equal(requests.length, 1);
+loader.setOpen(false);
+await loader.manual();
+requests[0].resolve({ secretFilled: true });
+await pending;
+assert.equal(loader.snapshot().quickAddSnippets, null, '收起后迟到的令牌片段必须丢弃');
+loader.setOpen(true);
+const remotePending = loader.manual();
+assert.equal(requests.length, 2, '展开手动连接配置后正常加载');
+requests[1].resolve({ secretFilled: true });
+await remotePending;
+assert.equal(loader.snapshot().quickAddSnippets.secretFilled, true);
+loader.setTab('clients');
+await loader.manual();
+assert.equal(loader.snapshot().quickAddSnippets, null, '离开网络分组应丢弃手动令牌片段');
+loader.openEditor();
+assert.equal(loader.snapshot().namedHostname, 'mcp.example.com', '修改时预填已配置域名');
+loader.typeToken('test-only-secret');
+loader.closeEditor();
+assert.equal(loader.snapshot().namedToken, '', '取消编辑必须清空隧道令牌');
+assert.equal(loader.snapshot().showNamedEditor, false);
 
 console.log('mcp-server golden ok');

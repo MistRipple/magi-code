@@ -1,6 +1,6 @@
 //! 客户端令牌：生成、哈希存储、校验与吊销。
 //!
-//! 令牌绑定一个工作区、授权方式与归属模式；工具目录对所有令牌统一完整开放。原文只在创建时返回一次；这里只保存哈希、
+//! 令牌标识客户端、授权方式与归属模式；conversation 模式逐聊天在本机授权目录，external 模式固定项目。工具目录对所有令牌统一完整开放。原文只在创建时返回一次；这里只保存哈希、
 //! 前缀与元数据。原文不进日志、不进诊断、不进 canonical。
 
 use std::sync::Mutex;
@@ -23,6 +23,8 @@ pub enum AttributionMode {
     /// 归到该令牌自己的外部工具会话（默认）。
     #[default]
     External,
+    /// 客户端身份与外部聊天分离；每个聊天首次使用时由本机选择目录。
+    Conversation,
 }
 
 /// 持久化的令牌元数据。**不含原文。**
@@ -193,12 +195,19 @@ impl TokenStore {
         if request.client_name.trim().is_empty() {
             return Err(TokenError::EmptyClientName);
         }
-        if request.workspace_id.trim().is_empty() {
+        if request.attribution == AttributionMode::External
+            && request.workspace_id.trim().is_empty()
+        {
             return Err(TokenError::EmptyWorkspace);
         }
         if let Some(binding) = &request.project_directories
             && (binding.workspace_id.as_str() != request.workspace_id.trim()
                 || binding.validate().is_err())
+        {
+            return Err(TokenError::InvalidDirectoryBinding);
+        }
+        if request.attribution == AttributionMode::Conversation
+            && (!request.workspace_id.is_empty() || request.project_directories.is_some())
         {
             return Err(TokenError::InvalidDirectoryBinding);
         }
@@ -386,6 +395,28 @@ mod tests {
             ttl_ms: None,
             network: false,
         }
+    }
+
+    #[test]
+    fn conversation_identity_does_not_implicitly_grant_a_workspace() {
+        let store = TokenStore::new();
+        let mut input = request();
+        input.attribution = AttributionMode::Conversation;
+        assert!(store.issue(input, 1).is_err());
+        let mut input = request();
+        input.attribution = AttributionMode::Conversation;
+        input.workspace_id.clear();
+        let issued = store.issue(input, 1).unwrap();
+        assert_eq!(
+            store.authenticate(&issued.secret, 2).unwrap().attribution,
+            AttributionMode::Conversation
+        );
+        let json = serde_json::to_value(&issued.record).unwrap();
+        assert_eq!(json["workspaceId"], "");
+        assert!(json["projectDirectories"].is_null());
+        let mut legacy = request();
+        legacy.workspace_id.clear();
+        assert!(store.issue(legacy, 1).is_err());
     }
 
     #[test]

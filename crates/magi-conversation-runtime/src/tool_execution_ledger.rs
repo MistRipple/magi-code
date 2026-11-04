@@ -1196,7 +1196,7 @@ mod tests {
                 job_id: "job-recovery".into(),
                 session_id: item.session_id.clone(),
                 workspace_id: None,
-                task_id: task.task_id.clone(),
+                task_id: Some(task.task_id.clone()),
                 turn_id: item.turn_id.clone(),
                 item_id: item.item_id.clone(),
                 tool_call_id: item.tool.as_ref().unwrap().call_id.clone(),

@@ -29,7 +29,7 @@
     --ind-foreground: var(--foreground);
     --ind-foreground-secondary: color-mix(in srgb, var(--foreground) 72%, var(--foreground-muted) 28%);
     --ind-foreground-muted: var(--foreground-muted);
-    --ind-foreground-soft: color-mix(in srgb, var(--foreground-muted) 65%, transparent);
+    --ind-foreground-soft: var(--foreground-muted);
     --ind-radius-card: 12px;
     --ind-shadow-sm: 0 1px 2px color-mix(in srgb, var(--foreground) 4%, transparent),
       0 6px 18px color-mix(in srgb, var(--foreground) 5%, transparent);
@@ -51,7 +51,7 @@
     min-height: 0;
     overflow-y: auto;
     overflow-x: hidden;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+    font-family: var(--font-family);
   }
   .settings-tab-inner::-webkit-scrollbar { width: 0; }
   .settings-tab-inner { scrollbar-width: none; }
@@ -448,7 +448,7 @@
   .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: var(--space-8); color: var(--foreground-muted); text-align: center; width: 100%; flex: 1; margin: auto; box-sizing: border-box; }
   .apple-grid > .empty-state { grid-column: 1 / -1; margin: 0; }
   .empty-state p { margin: var(--space-2) 0 0 0; }
-  .empty-state-hint { font-size: var(--text-sm); opacity: 0.7; }
+  .empty-state-hint { font-size: var(--text-sm); }
   .empty-state-sm { padding: var(--space-6); text-align: center; color: var(--foreground-muted); font-size: var(--text-sm); width: 100%; box-sizing: border-box; }
 
   /* 加载状态 */

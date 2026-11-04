@@ -1,5 +1,6 @@
 <script lang="ts">
   import SelectField from './SelectField.svelte';
+  import Icon from './Icon.svelte';
   /**
    * 「设置 → MCP 服务」内置分类，始终可见；只由 MCP 自身开关控制。
    *
@@ -17,6 +18,10 @@
     createMcpServerToken,
     getMcpServerConfigSnippets,
     getMcpServerStatus,
+    resolveAgentBaseUrl,
+    listMcpOAuthRequests,
+    resolveMcpOAuthRequest,
+    type McpOAuthRequest,
     getMcpServerTokenSecret,
     revokeAllMcpServerTokens,
     revokeMcpServerToken,
@@ -37,16 +42,17 @@
   import SettingsMcpServerAudit from './SettingsMcpServerAudit.svelte';
 
   // 新建 MCP 令牌始终开放完整工具目录；权限只决定是否在调用前询问。
-  const APPROVAL_MODES: readonly McpServerApprovalMode[] = ['ask', 'always'];
+  const APPROVAL_MODES: readonly McpServerApprovalMode[] = ['ask', 'read_write', 'always'];
 
   let status = $state<McpServerStatus | null>(null);
-  let snippets = $state<McpServerConfigSnippets | null>(null);
+  let oauthRequests = $state<McpOAuthRequest[]>([]);
+  let oauthClients = $state<Record<string, string>>({});
   /** 调用记录组件的刷新信号（审批处理后递增）。 */
   let auditVersion = $state(0);
 
-  type McpTab = 'connect' | 'clients' | 'remote' | 'activity';
+  type McpTab = 'clients' | 'remote' | 'activity';
   /** 当前分组。只是界面状态，不持久化。 */
-  let tab = $state<McpTab>('connect');
+  let tab = $state<McpTab>('clients');
   let showCreate = $state(false);
   /** 已吊销 / 已过期的令牌默认折叠。 */
   let showInactive = $state(false);
@@ -56,6 +62,7 @@
 
   let clientName = $state('');
   let workspaceId = $state('');
+  let bindingMode = $state<'conversation' | 'external'>('conversation');
   let approvalMode = $state<McpServerApprovalMode>('ask');
   let ttlDays = $state(90);
   let allowNetwork = $state(false);
@@ -74,15 +81,14 @@
   let namedHostname = $state('');
   let namedToken = $state('');
   let namedCheck = $state<McpServerNamedTunnelCheck | null>(null);
-
-  /** “连接”分组里配置所用的客户端令牌；空表示保留 <MAGI_MCP_TOKEN> 占位符。 */
-  let connectTokenId = $state('');
-  /** 用户主动选过“保留占位符”后，不再自动替他选客户端。 */
-  let connectTokenTouched = $state(false);
+  let showNamedEditor = $state(false);
+  let showManualConfig = $state(false);
+  const serviceAddress = resolveAgentBaseUrl();
 
   /** 隧道就绪后的“添加到远程客户端”：选一个公网令牌，得到带令牌的现成配置。 */
   let quickAddTokenId = $state('');
   let quickAddSnippets = $state<McpServerConfigSnippets | null>(null);
+  let quickAddRequest = 0;
 
   /** 展开“查看配置”的令牌：原文与带原文的配置都来自 daemon，收起即丢弃。 */
   let viewingTokenId = $state('');
@@ -139,10 +145,8 @@
     (status?.tokens ?? []).filter((token) => showInactive || token.active),
   );
   /** 能直接填进配置的令牌：有效且保存了原文。 */
-  const connectTokens = $derived((status?.tokens ?? []).filter((token) => token.state === 'active'));
-  const connectToken = $derived(connectTokens.find((token) => token.tokenId === connectTokenId));
   const STATUS_POLL_MS = 3000;
-  const TABS: readonly McpTab[] = ['connect', 'clients', 'remote', 'activity'];
+  const TABS: readonly McpTab[] = ['clients', 'remote', 'activity'];
   const activeTokenCount = $derived((status?.tokens ?? []).filter((token) => token.active).length);
   function tabBadge(id: McpTab): string {
     if (id === 'clients') return activeTokenCount > 0 ? String(activeTokenCount) : '';
@@ -160,8 +164,8 @@
   const canCreate = $derived(
     !busy
       && clientName.trim() !== ''
-      && Boolean(selectedWorkspace?.primarySourceFolderId)
-      && Boolean(selectedWorkspace?.sourceFolders?.length),
+      && (bindingMode === 'conversation' || (Boolean(selectedWorkspace?.primarySourceFolderId)
+        && Boolean(selectedWorkspace?.sourceFolders?.length))),
   );
 
   function messageOf(error: unknown): string {
@@ -172,7 +176,9 @@
     if (refreshing) return;
     refreshing = true;
     try {
-      status = await getMcpServerStatus();
+      const [nextStatus, requests] = await Promise.all([getMcpServerStatus(), listMcpOAuthRequests()]);
+      status = nextStatus;
+      oauthRequests = requests;
       loadError = '';
       if (tab === 'activity') auditVersion += 1;
     } catch (error) {
@@ -193,6 +199,13 @@
     }
   }
 
+  function resolveOAuth(requestId: string, tokenId: string | null): Promise<void> {
+    return act(async () => {
+      await resolveMcpOAuthRequest(requestId, tokenId);
+      await refresh();
+    });
+  }
+
   const RETENTION_CHOICES = [7, 30, 90, 0] as const;
 
   function saveExternal(patch: { saveContent?: boolean; retentionDays?: number }): Promise<void> {
@@ -200,6 +213,29 @@
     return act(async () => {
       status = await setMcpExternalRetention({ ...current, ...patch });
     });
+  }
+
+  function resetCreateTokenDraft(): void {
+    clientName = '';
+    bindingMode = 'conversation';
+    approvalMode = 'ask';
+    ttlDays = 90;
+    allowNetwork = false;
+  }
+
+  function openCreateToken(allowNetworkAccess = false): void {
+    resetCreateTokenDraft();
+    workspaceId = workspaces.find((workspace) => workspace.isActive)?.workspaceId
+      ?? workspaces[0]?.workspaceId
+      ?? '';
+    allowNetwork = allowNetworkAccess;
+    showCreate = true;
+    tab = 'clients';
+  }
+
+  function closeCreateToken(): void {
+    showCreate = false;
+    resetCreateTokenDraft();
   }
 
   function toggleEnabled(enabled: boolean): Promise<void> {
@@ -211,13 +247,14 @@
 
   function createToken(): Promise<void> {
     const workspace = selectedWorkspace;
-    if (!canCreate || !workspace?.primarySourceFolderId || !workspace.sourceFolders?.length) return Promise.resolve();
-    const sourceFolderIds = workspace.sourceFolders.map((folder) => folder.sourceFolderId);
-    const sourceFolderId = workspace.primarySourceFolderId;
+    if (!canCreate) return Promise.resolve();
+    const sourceFolderIds = bindingMode === 'external' ? workspace?.sourceFolders?.map((folder) => folder.sourceFolderId) : undefined;
+    const sourceFolderId = bindingMode === 'external' ? workspace?.primarySourceFolderId : undefined;
     return act(async () => {
       const created = await createMcpServerToken({
         clientName: clientName.trim(),
-        workspaceId: workspace.workspaceId,
+        workspaceId: bindingMode === 'external' ? (workspace?.workspaceId ?? '') : '',
+        attribution: bindingMode,
         sourceFolderIds,
         sourceFolderId,
         approvalMode,
@@ -225,10 +262,7 @@
         allowNetwork: allowNetwork ? true : undefined,
       });
       freshSecret = created.secret;
-      showCreate = false;
-      clientName = '';
-      approvalMode = 'ask';
-      allowNetwork = false;
+      closeCreateToken();
       await refresh();
     });
   }
@@ -236,11 +270,22 @@
   function saveNamedTunnel(): Promise<void> {
     return act(async () => {
       status = await saveMcpServerNamedTunnel(namedHostname.trim(), namedToken.trim());
-      namedToken = '';
-      namedHostname = '';
       namedCheck = null;
+      closeNamedEditor();
       await refresh();
     });
+  }
+
+  function openNamedEditor(): void {
+    namedHostname = status?.network.namedHostname ?? '';
+    namedToken = '';
+    showNamedEditor = true;
+  }
+
+  function closeNamedEditor(): void {
+    namedHostname = '';
+    namedToken = '';
+    showNamedEditor = false;
   }
 
   async function clearNamedTunnel(): Promise<void> {
@@ -248,6 +293,7 @@
     return act(async () => {
       status = await clearMcpServerNamedTunnel();
       namedCheck = null;
+      closeNamedEditor();
       await refresh();
     });
   }
@@ -264,28 +310,14 @@
     return servers[source.serverName]?.headers?.Authorization ?? '';
   }
 
-  async function loadConnectSnippets(): Promise<void> {
-    snippets = null;
-    if (!status?.running) {
-      return;
-    }
-    const selectedTokenId = connectTokenId;
-    const token = connectTokens.find((entry) => entry.tokenId === connectTokenId);
-    try {
-      const loaded = await getMcpServerConfigSnippets(token?.hasSecret ? token.tokenId : undefined);
-      if (connectTokenId === selectedTokenId && status?.running) snippets = loaded;
-    } catch {
-      /* 重新选择客户端或配置入口变化时再试 */
-    }
-  }
-
   async function loadQuickAdd(): Promise<void> {
+    const request = ++quickAddRequest;
     quickAddSnippets = null;
     const token = quickAddToken;
-    if (!remoteReady || !token || !token.hasSecret) return;
+    if (tab !== 'remote' || !showManualConfig || !remoteReady || !token || !token.hasSecret) return;
     try {
       const loaded = await getMcpServerConfigSnippets(token.tokenId);
-      if (quickAddTokenId === token.tokenId && remoteReady) quickAddSnippets = loaded;
+      if (request === quickAddRequest && tab === 'remote' && showManualConfig && quickAddTokenId === token.tokenId && remoteReady) quickAddSnippets = loaded;
     } catch {
       /* 重新选择令牌或配置入口变化时再试 */
     }
@@ -361,20 +393,19 @@
 
   function toggleView(token: McpServerToken): Promise<void> {
     if (viewingTokenId === token.tokenId) {
-      viewingTokenId = '';
-      viewingSecret = null;
-      viewingSnippets = null;
+      toggleViewOff();
       return Promise.resolve();
     }
+    cancelEdit();
     viewingTokenId = token.tokenId;
     return act(() => loadView(token));
   }
 
   function startEdit(token: McpServerToken): void {
+    toggleViewOff();
     editingTokenId = token.tokenId;
     editName = token.clientName;
-    // Legacy `deny` tokens enter the current two-choice model as `ask` when saved.
-    editApprovalMode = token.approvalMode === 'always' ? 'always' : 'ask';
+    editApprovalMode = APPROVAL_MODES.includes(token.approvalMode) ? token.approvalMode : 'ask';
     editNetwork = token.network;
     editTtl = '';
   }
@@ -454,6 +485,10 @@
     return workspaces.find((workspace) => workspace.workspaceId === id)?.name ?? id;
   }
 
+  function tokenScopeLabel(token: McpServerToken): string {
+    return token.attribution === 'conversation' ? i18n.t('mcpServer.conversation.modeConversation') : workspaceName(token.workspaceId);
+  }
+
   function formatTime(ms: number): string {
     return new Date(ms).toLocaleString(i18n.locale);
   }
@@ -474,29 +509,10 @@
     }
   });
 
-  // 默认选一个能直接填进配置的客户端（没有原文的令牌无法填入）。
-  $effect(() => {
-    if (connectTokenId && !connectTokens.some((token) => token.tokenId === connectTokenId)) {
-      connectTokenId = '';
-    }
-    if (!connectTokenId) {
-      const first = connectTokens.find((token) => token.hasSecret);
-      if (first && !connectTokenTouched) connectTokenId = first.tokenId;
-    }
-  });
-
   const configVersion = $derived(JSON.stringify([
-    status?.running, status?.url, status?.stdioEndpoint,
     status?.network.mcpUrl, status?.direct.mcpUrl, status?.direct.listening,
     status?.tokens.map((token) => [token.tokenId, token.prefix, token.clientName, token.state, token.hasSecret]),
   ]));
-
-  // 状态轮询不重复读取令牌原文，只有配置入口或所选客户端变化时重新取配置。
-  $effect(() => {
-    void configVersion;
-    void connectTokenId;
-    untrack(() => { void loadConnectSnippets(); });
-  });
 
   // 选中的公网令牌失效（吊销、过期）或不存在时，回到一个可用的。
   $effect(() => {
@@ -510,7 +526,17 @@
   $effect(() => {
     void configVersion;
     void quickAddTokenId;
+    void showManualConfig;
+    void tab;
     untrack(() => { void loadQuickAdd(); });
+  });
+
+  $effect(() => {
+    if (!remoteReady) showManualConfig = false;
+    if (tab !== 'remote') {
+      showManualConfig = false;
+      untrack(closeNamedEditor);
+    }
   });
 
   $effect(() => {
@@ -530,6 +556,9 @@
 </script>
 
 {#snippet workspaceBinding(id: string, token: McpServerToken | null = null, showHint = true)}
+  {#if token?.attribution === 'conversation'}
+    <p class="meta">{i18n.t('mcpServer.conversation.scopeHint')}</p>
+  {:else}
   {@const workspace = workspaces.find((entry) => entry.workspaceId === id)}
   {@const folderIds = token ? token.sourceFolderIds : (workspace?.sourceFolders ?? []).map((folder) => folder.sourceFolderId)}
   {@const defaultId = token ? token.defaultSourceFolderId : workspace?.primarySourceFolderId}
@@ -550,6 +579,7 @@
     {/each}
   </div>
   {#if showHint}<p class="meta">{i18n.t('mcpServer.token.workspaceFixedHint')}</p>{/if}
+  {/if}
 {/snippet}
 
 <section class="mcp-server-section" data-mcp-server="1">
@@ -581,41 +611,35 @@
     {/each}
   </div>
 
-  {#if tab === 'connect'}
-  <div class="settings-card mcp-card" data-mcp-server-status="1">
-    <label class="switch-line">
-      <input
-        type="checkbox"
-        role="switch"
-        class="control-switch"
-        data-mcp-server-enabled="1"
-        checked={status?.enabled ?? false}
-        disabled={busy || status === null}
-        onchange={(event) => void toggleEnabled((event.currentTarget as HTMLInputElement).checked)}
-      />
-      <span>{i18n.t('mcpServer.enable')}</span>
-      <span class="settings-chip settings-chip--ok" class:badge--off={!status?.running}>
-        {status == null ? i18n.t('common.notProvided') : status.running ? i18n.t('mcpServer.status.running') : i18n.t('mcpServer.status.stopped')}
-      </span>
-    </label>
-    <p class="meta">{i18n.t('mcpServer.enableHint')}</p>
-      <p class="meta"><code>{i18n.t('mcpServer.status.url', { url: status?.url || '—' })}</code></p>
-      <p class="meta"><code>{i18n.t('mcpServer.status.stdio', { endpoint: status?.stdioEndpoint || '—' })}</code></p>
-      <p class="meta">{i18n.t('mcpServer.status.port', { port: status?.port ?? '—' })}</p>
-      <p class="meta" data-mcp-connections="1">{i18n.t('mcpServer.status.connections', { http: status?.httpSessions ?? '—', local: status?.localConnections ?? '—' })}</p>
-      <p class="meta">{i18n.t('mcpServer.status.connectionsHint')}</p>
-  </div>
-
-  {/if}
+  {#each oauthRequests as request (request.requestId)}
+    {@const selectedClient = remoteTokens.find(token => token.tokenId === oauthClients[request.requestId])}
+    <div class="settings-card mcp-card" data-mcp-oauth-request={request.requestId}>
+      <h4>{i18n.t('mcpServer.oauth.title')}</h4>
+      <p class="meta">{i18n.t('mcpServer.oauth.client', { name: request.clientName })}</p>
+      <p class="meta">{i18n.t('mcpServer.oauth.callback', { url: request.redirectUri })}</p>
+      <p class="meta">{i18n.t('mcpServer.oauth.resource', { url: request.resource })}</p>
+      <p class="meta">{i18n.t('mcpServer.oauth.hint')}</p>
+      <SelectField bind:value={oauthClients[request.requestId]} label={i18n.t('mcpServer.oauth.connection')}
+        options={[{ value: '', label: i18n.t('mcpServer.oauth.placeholder') }, ...remoteTokens.map(token => ({ value: token.tokenId, label: `${token.clientName} · ${i18n.t(`mcpServer.token.approvalModeShort.${token.approvalMode}`)}` }))]} />
+      {#if selectedClient}
+        <p class="meta">{i18n.t(`mcpServer.token.approvalMode.${selectedClient.approvalMode}`)}</p>
+        <p class="meta">{selectedClient.attribution === 'conversation' ? i18n.t('mcpServer.conversation.scopeHint') : i18n.t('mcpServer.token.boundWorkspace', { workspace: workspaces.find(workspace => workspace.workspaceId === selectedClient.workspaceId)?.name ?? selectedClient.workspaceId })}</p>
+      {/if}
+      <div class="action-row">
+        <button type="button" class="btn btn--sm btn--primary" disabled={busy || !selectedClient} onclick={() => void resolveOAuth(request.requestId, selectedClient?.tokenId ?? null)}>{i18n.t('mcpServer.oauth.allow')}</button>
+        <button type="button" class="btn btn--sm btn--secondary" disabled={busy} onclick={() => void resolveOAuth(request.requestId, null)}>{i18n.t('mcpServer.oauth.deny')}</button>
+      </div>
+    </div>
+  {/each}
 
   {#if tab === 'remote'}
   <div class="settings-card mcp-card" data-mcp-server-network="1">
     <h4>{i18n.t('mcpServer.network.section')}</h4>
     <p class="meta">{i18n.t('mcpServer.network.desc')}</p>
-    <p class="meta" data-mcp-network-mode={status?.network.mode ?? 'quick'}>
-      {namedMode
-        ? i18n.t('mcpServer.named.modeNamed', { hostname: status?.network.namedHostname ?? '' })
-        : i18n.t('mcpServer.network.addressChanges')}
+    <p class="meta" data-mcp-network-mode={status?.network.mode ?? ''}>
+      {i18n.t('mcpServer.network.mode')}: {status == null ? '—' : namedMode
+        ? i18n.t('mcpServer.named.modeNamed', { hostname: status.network.namedHostname ?? '' })
+        : i18n.t('mcpServer.network.modeQuick')}
     </p>
     <label class="switch-line">
       <input
@@ -629,25 +653,28 @@
       />
       <span>{i18n.t('mcpServer.network.enable')}</span>
       <span class="settings-chip settings-chip--ok" class:badge--off={networkTunnelStatus !== 'running'}>
-        {i18n.t(`mcpServer.network.status.${networkTunnelStatus}`)}
+        {status == null ? i18n.t('common.notProvided') : i18n.t(`mcpServer.network.status.${networkTunnelStatus}`)}
       </span>
     </label>
     {#if status && !status.network.enabled && !hasNetworkToken}
       <p class="meta">{i18n.t('mcpServer.network.needToken')}</p>
       <div class="action-row">
-        <button type="button" class="btn btn--sm btn--primary" data-mcp-go-clients-network="1" onclick={() => { tab = 'clients'; showCreate = true; allowNetwork = true; }}>
-          {i18n.t('mcpServer.snippets.goCreate')}
+        <button type="button" class="btn btn--sm btn--primary" data-mcp-go-clients-network="1" onclick={() => openCreateToken(true)}>
+          {i18n.t('mcpServer.network.manageClients')}
         </button>
       </div>
     {/if}
-    {#if status?.network.mcpUrl}
       <div class="snippet-head">
         <span class="meta">{i18n.t('mcpServer.network.url')}</span>
+        {#if status?.network.mcpUrl}
         <button class="btn btn--sm btn--secondary" type="button" onclick={() => void copy('network-url', status?.network.mcpUrl ?? '')}>
           {copiedKey === 'network-url' ? i18n.t('mcpServer.token.copied') : i18n.t('mcpServer.token.copy')}
         </button>
+        {/if}
       </div>
-      <code class="secret" data-mcp-network-url="1">{status.network.mcpUrl}</code>
+      <code class="secret" data-mcp-network-url="1">{status?.network.mcpUrl ?? '—'}</code>
+    {#if status?.network.enabled && !namedMode}
+      <p class="meta">{i18n.t('mcpServer.network.addressChanges')}</p>
     {/if}
     {#if status?.network.error}
       <p class="status-message error" role="alert">
@@ -656,16 +683,69 @@
           : status.network.error}
       </p>
     {/if}
-    <p class="meta">{i18n.t('mcpServer.network.autoStop')}</p>
+    <details class="network-disclosure">
+      <summary>{i18n.t('mcpServer.network.lifecycle')}</summary>
+      <p class="meta">{i18n.t('mcpServer.network.autoStop')}</p>
+    </details>
+
+    <div class="named-tunnel" data-mcp-named-tunnel="1">
+      <h4>{i18n.t('mcpServer.named.section')}</h4>
+      <p class="meta">{i18n.t('mcpServer.named.hostname')}: <code>{status == null ? '—' : status.network.namedHostname ?? i18n.t('mcpServer.named.notConfigured')}</code></p>
+      {#if namedMode}
+        <p class="meta">{i18n.t('mcpServer.named.tokenHidden')}</p>
+        {#if namedCheck}
+          <p class="status-message" class:error={!namedCheck.ok} role="status" data-mcp-named-check={namedCheck.code}>
+            {i18n.t(`mcpServer.named.verifyResult.${namedCheck.code}`, { port: String(status?.port ?? ''), status: String(namedCheck.httpStatus ?? '') })}
+          </p>
+        {/if}
+      {/if}
+      <div class="action-row">
+        {#if namedMode}
+          <button class="btn btn--sm btn--secondary" type="button" data-mcp-named-verify="1" disabled={busy} onclick={() => void checkNamedTunnel()}>{i18n.t('mcpServer.named.verify')}</button>
+        {/if}
+        <button type="button" class="btn btn--sm btn--secondary" data-mcp-named-editor-toggle="1" aria-expanded={showNamedEditor} aria-controls="mcp-named-editor" disabled={busy || status === null} onclick={() => showNamedEditor ? closeNamedEditor() : openNamedEditor()}>
+          {showNamedEditor ? i18n.t('mcpServer.token.cancel') : namedMode ? i18n.t('mcpServer.named.edit') : i18n.t('mcpServer.named.configure')}
+        </button>
+      </div>
+      {#if showNamedEditor}
+      <div id="mcp-named-editor">
+      <p class="meta">{i18n.t('mcpServer.named.desc')}</p>
+      <p class="meta" data-mcp-named-assist="1">{i18n.t('mcpServer.named.assist')}</p>
+      <form class="create-form edit-form" onsubmit={(event) => { event.preventDefault(); void saveNamedTunnel(); }}>
+        <label class="field">
+          <span>{i18n.t('mcpServer.named.hostname')}</span>
+          <input class="form-input" bind:value={namedHostname} placeholder="mcp.example.com" autocomplete="off" data-mcp-named-hostname="1" />
+        </label>
+        <label class="field">
+          <span>{i18n.t('mcpServer.named.token')}</span>
+          <input class="form-input" type="password" bind:value={namedToken} placeholder={i18n.t('mcpServer.named.tokenPlaceholder')} autocomplete="off" data-mcp-named-token="1" />
+        </label>
+        <p class="meta">{i18n.t('mcpServer.named.portHint', { port: String(status?.port ?? '') })}</p>
+        <div class="action-row">
+          <button type="submit" class="btn btn--sm btn--primary" disabled={!canSaveNamed}>
+            {namedMode ? i18n.t('mcpServer.named.replace') : i18n.t('mcpServer.named.save')}
+          </button>
+          {#if namedMode}
+            <button type="button" class="btn btn--sm btn--error" disabled={busy} onclick={() => void clearNamedTunnel()}>{i18n.t('mcpServer.named.clear')}</button>
+          {/if}
+        </div>
+      </form>
+      </div>
+      {/if}
+    </div>
+  </div>
 
     {#if remoteReady}
-      <div class="quick-add" data-mcp-quick-add="1">
+      <div class="settings-card mcp-card" data-mcp-quick-add="1">
         <h4>{i18n.t('mcpServer.quickAdd.section')}</h4>
+        <p class="meta" data-mcp-oauth-hint="1">{i18n.t(remoteMcpUrl?.startsWith('https://') ? 'mcpServer.oauth.setup' : 'mcpServer.oauth.httpsRequired')}</p>
+        <details class="network-disclosure" data-mcp-manual-config="1" ontoggle={(event) => { showManualConfig = event.currentTarget.open; }}>
+        <summary>{i18n.t('mcpServer.quickAdd.manual')}</summary>
         <p class="meta">{i18n.t('mcpServer.quickAdd.desc')}</p>
         {#if remoteTokens.length === 0}
           <p class="meta">{i18n.t('mcpServer.network.needToken')}</p>
           <div class="action-row">
-            <button type="button" class="btn btn--sm btn--primary" onclick={() => { tab = 'clients'; showCreate = true; allowNetwork = true; }}>
+            <button type="button" class="btn btn--sm btn--primary" onclick={() => openCreateToken(true)}>
               {i18n.t('mcpServer.snippets.goCreate')}
             </button>
           </div>
@@ -673,7 +753,7 @@
           <div class="field">
             <span>{i18n.t('mcpServer.quickAdd.token')}</span>
             <SelectField bind:value={quickAddTokenId} data-mcp-quick-add-token="1" label={i18n.t('mcpServer.quickAdd.token')}
-              options={remoteTokens.map(token => ({ value: token.tokenId, label: `${token.clientName}: ${workspaceName(token.workspaceId)}: ${token.prefix}…` }))} />
+              options={remoteTokens.map(token => ({ value: token.tokenId, label: `${token.clientName}: ${tokenScopeLabel(token)}: ${token.prefix}…` }))} />
           </div>
           {#if quickAddToken}{@render workspaceBinding(quickAddToken.workspaceId, quickAddToken)}{/if}
           {#if quickAddToken && !quickAddToken.hasSecret}
@@ -714,54 +794,21 @@
                 <pre>{entry.text}</pre>
               </div>
             {/each}
-            <p class="meta">{!tunnelReady ? i18n.t('mcpServer.direct.plainHint') : status?.network.mode === 'named' ? i18n.t('mcpServer.quickAdd.fixedHint') : i18n.t('mcpServer.network.addressChanges')}</p>
+            {#if !tunnelReady}<p class="meta">{i18n.t('mcpServer.direct.plainHint')}</p>{/if}
           {/if}
         {/if}
+        </details>
       </div>
+    {:else}
+      <div class="settings-notice" data-mcp-oauth-hint="1">{i18n.t('mcpServer.oauth.prepare')}</div>
     {/if}
 
-    <div class="named-tunnel" data-mcp-named-tunnel="1">
-      <h4>{i18n.t('mcpServer.named.section')}</h4>
-      <p class="meta">{i18n.t('mcpServer.named.desc')}</p>
-      <p class="meta" data-mcp-named-assist="1">{i18n.t('mcpServer.named.assist')}</p>
-      {#if namedMode}
-        <p class="meta"><span class="settings-chip settings-chip--ok">{i18n.t('mcpServer.named.configured', { hostname: status?.network.namedHostname ?? '' })}</span></p>
-        <p class="meta">{i18n.t('mcpServer.named.tokenHidden')} {i18n.t('mcpServer.named.autoRestore')}</p>
-        <div class="action-row">
-          <button class="btn btn--sm btn--secondary" type="button" data-mcp-named-verify="1" disabled={busy} onclick={() => void checkNamedTunnel()}>
-            {i18n.t('mcpServer.named.verify')}
-          </button>
-          <button type="button" class="btn btn--sm btn--error" disabled={busy} onclick={() => void clearNamedTunnel()}>
-            {i18n.t('mcpServer.named.clear')}
-          </button>
-        </div>
-        {#if namedCheck}
-          <p class="status-message" class:error={!namedCheck.ok} role="status" data-mcp-named-check={namedCheck.code}>
-            {i18n.t(`mcpServer.named.verifyResult.${namedCheck.code}`, { port: String(status?.port ?? ''), status: String(namedCheck.httpStatus ?? '') })}
-          </p>
-        {/if}
-      {/if}
-      <form class="create-form edit-form" onsubmit={(event) => { event.preventDefault(); void saveNamedTunnel(); }}>
-        <label class="field">
-          <span>{i18n.t('mcpServer.named.hostname')}</span>
-          <input class="form-input" bind:value={namedHostname} placeholder="mcp.example.com" autocomplete="off" data-mcp-named-hostname="1" />
-        </label>
-        <label class="field">
-          <span>{i18n.t('mcpServer.named.token')}</span>
-          <input class="form-input" type="password" bind:value={namedToken} placeholder={i18n.t('mcpServer.named.tokenPlaceholder')} autocomplete="off" data-mcp-named-token="1" />
-        </label>
-        <p class="meta">{i18n.t('mcpServer.named.portHint', { port: String(status?.port ?? '') })}</p>
-        <div class="action-row">
-          <button type="submit" class="btn btn--sm btn--primary" disabled={!canSaveNamed}>
-            {namedMode ? i18n.t('mcpServer.named.replace') : i18n.t('mcpServer.named.save')}
-          </button>
-        </div>
-      </form>
-    </div>
-  </div>
 
   <div class="settings-card mcp-card" data-mcp-server-direct="1">
     <h4>{i18n.t('mcpServer.direct.section')}</h4>
+    <p class="meta">{i18n.t('mcpServer.direct.state')}: {status == null ? '—' : status.direct.listening ? i18n.t('mcpServer.direct.listening') : i18n.t('mcpServer.direct.notListening')}</p>
+    <details class="network-disclosure" open={Boolean(status?.direct.enabled || status?.direct.error)}>
+    <summary>{i18n.t('mcpServer.direct.configure')}</summary>
     <p class="meta">{i18n.t('mcpServer.direct.desc')}</p>
     <p class="meta risk-note" data-mcp-direct-risk="1">{i18n.t('mcpServer.direct.risk')}</p>
     {#if status?.direct.error}
@@ -815,22 +862,68 @@
         </button>
       </div>
     </form>
+    </details>
   </div>
 
   {/if}
 
   {#if tab === 'clients'}
+  <div class="settings-card mcp-card" data-mcp-server-status="1">
+    <div class="clients-header">
+      <div class="settings-row-copy">
+        <h4>{i18n.t('mcpServer.status.title')}</h4>
+        <span class="meta">{status == null ? i18n.t('common.notProvided') : status.running ? i18n.t('mcpServer.status.running') : i18n.t('mcpServer.status.stopped')}</span>
+      </div>
+      <label class="switch-line">
+        <input
+          type="checkbox"
+          role="switch"
+          class="control-switch"
+          data-mcp-server-enabled="1"
+          checked={status?.enabled ?? false}
+          disabled={busy || status === null}
+          onchange={(event) => void toggleEnabled((event.currentTarget as HTMLInputElement).checked)}
+        />
+        <span>{i18n.t('mcpServer.enable')}</span>
+      </label>
+    </div>
+    <p class="meta">{i18n.t('mcpServer.enableHint')}</p>
+    <details class="network-disclosure" data-mcp-local-endpoints="1">
+      <summary>{i18n.t('mcpServer.status.localConfig')}</summary>
+      <p class="meta"><code>{i18n.t('mcpServer.status.url', { url: status?.url || '—' })}</code></p>
+      <p class="meta"><code>{i18n.t('mcpServer.status.stdio', { endpoint: status?.stdioEndpoint || '—' })}</code></p>
+      <p class="meta">{i18n.t('mcpServer.status.port', { port: status?.port ?? '—' })}</p>
+      <p class="meta" data-mcp-connections="1">{i18n.t('mcpServer.status.connections', { http: status?.httpSessions ?? '—', local: status?.localConnections ?? '—' })}</p>
+      <p class="meta">{i18n.t('mcpServer.status.connectionsHint')}</p>
+    </details>
+  </div>
+
+  <div class="settings-rows" data-mcp-instance="1">
+    <div class="settings-row">
+      <div class="settings-row-copy">
+        <span class="settings-row-title">{i18n.t('mcpServer.instance.title')}</span>
+        <code class="meta">{serviceAddress}</code>
+        <span class="settings-row-desc">{i18n.t('mcpServer.instance.hint')}</span>
+      </div>
+    </div>
+    <div class="settings-row">
+      <div class="settings-row-copy">
+        <span class="settings-row-title">{i18n.t('mcpServer.instance.stateRoot')}</span>
+        <code class="meta">{status?.stateRoot ?? '—'}</code>
+      </div>
+    </div>
+  </div>
+
   <div class="settings-card mcp-card" data-mcp-server-tokens="1">
     <div class="clients-header">
       <h4>{i18n.t('mcpServer.token.section')}</h4>
       {#if !showCreate}
-        <button type="button" class="btn btn--sm btn--primary" data-mcp-create-open="1" onclick={() => { showCreate = true; }}>
+        <button type="button" class="btn btn--sm btn--primary" data-mcp-create-open="1" onclick={() => openCreateToken()}>
           {i18n.t('mcpServer.token.new')}
         </button>
       {/if}
     </div>
-    <p class="meta">{i18n.t('mcpServer.token.sharedSessionHint')}</p>
-    <p class="meta">{i18n.t('mcpServer.token.workspaceFixedHint')}</p>
+    <p class="meta">{i18n.t('mcpServer.clients.helper')}</p>
 
     {#if freshSecret}
       <div class="secret-card" data-mcp-fresh-secret="1" role="status">
@@ -862,7 +955,11 @@
               {#if !token.workspaceAvailable}
                 <p class="meta">{i18n.t('mcpServer.token.workspaceRestoreHint')}</p>
               {/if}
-              {@render workspaceBinding(token.workspaceId, token, false)}
+              {#if token.attribution === 'conversation'}
+                <p class="meta">{i18n.t('mcpServer.conversation.tokenHint')}</p>
+              {:else}
+                {@render workspaceBinding(token.workspaceId, token, false)}
+              {/if}
               <span class="meta ui-meta">
                 <span>{token.expiresAtMs === null ? i18n.t('mcpServer.token.neverExpires') : i18n.t('mcpServer.token.expiresAt', { time: formatTime(token.expiresAtMs) })}</span>
                 <span>{token.lastUsedAtMs === null ? i18n.t('mcpServer.token.neverUsed') : i18n.t('mcpServer.token.lastUsed', { time: formatTime(token.lastUsedAtMs) })}</span>
@@ -870,24 +967,23 @@
             </div>
             {#if token.state !== 'revoked'}
               <div class="action-row token-actions">
-                <button class="btn btn--sm btn--secondary" type="button" data-mcp-token-view={token.tokenId} disabled={busy || token.state !== 'active'} onclick={() => void toggleView(token)}>
-                  {viewingTokenId === token.tokenId ? i18n.t('mcpServer.token.hide') : i18n.t('mcpServer.token.view')}
+                <button class="btn btn--sm btn--secondary" type="button" data-mcp-token-view={token.tokenId} aria-expanded={viewingTokenId === token.tokenId} aria-controls={`mcp-token-config-${token.tokenId}`} disabled={busy || token.state !== 'active'} onclick={() => void toggleView(token)}>
+                  {i18n.t('mcpServer.token.connectionConfig')}
+                  <Icon name={viewingTokenId === token.tokenId ? 'chevron-up' : 'chevron-down'} size={16} />
                 </button>
-                <button class="btn btn--sm btn--secondary" type="button" data-mcp-token-edit={token.tokenId} disabled={busy || token.attribution !== 'external'} onclick={() => startEdit(token)}>
-                  {i18n.t('mcpServer.token.edit')}
-                </button>
-                <button class="btn btn--sm btn--secondary" type="button" disabled={busy || token.attribution !== 'external' || token.state !== 'active'} onclick={() => void rotate(token)}>
-                  {i18n.t('mcpServer.token.rotate')}
-                </button>
-                <button type="button" class="btn btn--sm btn--error" disabled={busy} onclick={() => void revoke(token)}>
-                  {i18n.t('mcpServer.token.revoke')}
-                </button>
+                <button class="btn btn--sm btn--secondary" type="button" data-mcp-token-edit={token.tokenId} aria-expanded={editingTokenId === token.tokenId} aria-controls={`mcp-token-edit-${token.tokenId}`} disabled={busy} onclick={() => startEdit(token)}>{i18n.t('mcpServer.token.edit')}</button>
+                <button class="btn btn--sm btn--secondary" type="button" disabled={busy || token.state !== 'active'} onclick={() => void rotate(token)}>{i18n.t('mcpServer.token.rotate')}</button>
+                <button type="button" class="btn btn--sm btn--error" disabled={busy} onclick={() => void revoke(token)}>{i18n.t('mcpServer.token.revoke')}</button>
               </div>
             {/if}
           </li>
           {#if viewingTokenId === token.tokenId}
-            <li class="detail" data-mcp-token-detail={token.tokenId}>
-              {@render workspaceBinding(token.workspaceId, token, false)}
+            <li class="detail" id={`mcp-token-config-${token.tokenId}`} data-mcp-token-detail={token.tokenId}>
+              {#if token.attribution === 'conversation'}
+                <p class="meta">{i18n.t('mcpServer.conversation.tokenHint')}</p>
+              {:else}
+                {@render workspaceBinding(token.workspaceId, token, false)}
+              {/if}
               {#if viewingSecret}
                 <div class="snippet-head">
                   <span class="settings-row-title">{i18n.t('mcpServer.token.secret')}</span>
@@ -918,13 +1014,13 @@
             </li>
           {/if}
           {#if editingTokenId === token.tokenId}
-            <li class="detail" data-mcp-token-edit-form={token.tokenId}>
+            <li class="detail" id={`mcp-token-edit-${token.tokenId}`} data-mcp-token-edit-form={token.tokenId}>
               <form class="create-form edit-form" onsubmit={(event) => { event.preventDefault(); void saveEdit(); }}>
                 <label class="field">
                   <span>{i18n.t('mcpServer.token.clientName')}</span>
                   <input class="form-input" bind:value={editName} maxlength="60" data-mcp-edit-name="1" />
                 </label>
-                <p class="meta">{i18n.t('mcpServer.token.editWorkspaceFixed', { workspace: workspaceName(token.workspaceId) })}</p>
+                <p class="meta">{token.attribution === 'conversation' ? i18n.t('mcpServer.conversation.scopeHint') : i18n.t('mcpServer.token.editWorkspaceFixed', { workspace: workspaceName(token.workspaceId) })}</p>
                 <div class="field">
                   <span>{i18n.t('mcpServer.token.approvalMode')}</span>
                   <SelectField bind:value={editApprovalMode} data-mcp-edit-approval-mode="1" label={i18n.t('mcpServer.token.approvalMode')}
@@ -979,82 +1075,43 @@
           maxlength="60"
         />
       </label>
-      <div class="field">
-        <span>{i18n.t('mcpServer.token.workspace')}</span>
-        <SelectField bind:value={workspaceId} data-mcp-workspace="1" disabled={workspaces.length === 0}
-          label={i18n.t('mcpServer.token.workspace')}
-          options={workspaces.length ? workspaces.map(workspace => ({ value: workspace.workspaceId, label: workspace.name })) : [{ value: '', label: i18n.t('mcpServer.token.workspaceEmpty') }]} />
-      </div>
-      {#if workspaceId}{@render workspaceBinding(workspaceId)}{/if}
-      <div class="field">
-        <span>{i18n.t('mcpServer.token.approvalMode')}</span>
-        <SelectField bind:value={approvalMode} data-mcp-approval-mode="1" label={i18n.t('mcpServer.token.approvalMode')}
-                    options={APPROVAL_MODES.map(option => ({ value: option, label: i18n.t(`mcpServer.token.approvalMode.${option}`) }))} />
-      </div>
-      <label class="field">
-        <span>{i18n.t('mcpServer.token.ttl')}</span>
-        <input class="form-input" type="number" min="0" max="3650" step="1" bind:value={ttlDays} data-mcp-ttl="1" />
-      </label>
-      <label class="switch-line" data-mcp-allow-network="1">
-        <input type="checkbox" role="switch" class="control-switch" bind:checked={allowNetwork} />
-        <span>{i18n.t('mcpServer.token.allowNetwork')}</span>
-      </label>
+              <div class="field">
+                <span>{i18n.t('mcpServer.token.approvalMode')}</span>
+                <SelectField bind:value={approvalMode} data-mcp-approval-mode="1" label={i18n.t('mcpServer.token.approvalMode')}
+                  options={APPROVAL_MODES.map(option => ({ value: option, label: i18n.t(`mcpServer.token.approvalMode.${option}`) }))} />
+              </div>
+              <p class="meta">{i18n.t('mcpServer.token.approvalModeHint')}</p>
+              <label class="switch-line" data-mcp-allow-network="1">
+                <input type="checkbox" role="switch" class="control-switch" bind:checked={allowNetwork} />
+                <span>{i18n.t('mcpServer.token.allowNetwork')}</span>
+              </label>
+              <details class="network-disclosure" data-mcp-client-advanced="1">
+                <summary>{i18n.t('mcpServer.token.advancedSummary')}</summary>
+                <div class="field">
+                  <SelectField bind:value={bindingMode} label={i18n.t('mcpServer.conversation.mode')}
+                    options={[{value: 'conversation', label: i18n.t('mcpServer.conversation.modeConversation')}, {value: 'external', label: i18n.t('mcpServer.conversation.modeFixed')}]} />
+                </div>
+                {#if bindingMode === 'external'}
+                  <div class="field">
+                    <span>{i18n.t('mcpServer.token.workspace')}</span>
+                    <SelectField bind:value={workspaceId} data-mcp-workspace="1" disabled={workspaces.length === 0}
+                      label={i18n.t('mcpServer.token.workspace')}
+                      options={workspaces.length ? workspaces.map(workspace => ({ value: workspace.workspaceId, label: workspace.name })) : [{ value: '', label: i18n.t('mcpServer.token.workspaceEmpty') }]} />
+                  </div>
+                  {#if workspaceId}{@render workspaceBinding(workspaceId)}{/if}
+                {/if}
+                <label class="field">
+                  <span>{i18n.t('mcpServer.token.ttl')}</span>
+                  <input class="form-input" type="number" min="0" max="3650" step="1" bind:value={ttlDays} data-mcp-ttl="1" />
+                </label>
+              </details>
       <div class="action-row">
         <button type="submit" class="btn btn--sm btn--primary" data-mcp-create="1" disabled={!canCreate}>
           {i18n.t('mcpServer.token.create')}
         </button>
-        <button class="btn btn--sm btn--secondary" type="button" onclick={() => { showCreate = false; }}>{i18n.t('mcpServer.token.cancel')}</button>
+        <button class="btn btn--sm btn--secondary" type="button" onclick={closeCreateToken}>{i18n.t('mcpServer.token.cancel')}</button>
       </div>
     </form>
-    {/if}
-  </div>
-
-  {/if}
-
-  {#if tab === 'connect'}
-  <div class="settings-card mcp-card" data-mcp-server-snippets="1">
-    <h4>{i18n.t('mcpServer.snippets.section')}</h4>
-    <p class="meta" data-mcp-token-origin="1">{i18n.t('mcpServer.snippets.hint')}</p>
-    <p class="meta">{i18n.t('mcpServer.token.sharedSessionHint')}</p>
-    {#if connectTokens.length === 0}
-      <p class="meta" data-mcp-no-tokens="1">{i18n.t('mcpServer.snippets.noTokens')}</p>
-      <div class="action-row">
-        <button type="button" class="btn btn--sm btn--primary" data-mcp-go-clients="1" onclick={() => { tab = 'clients'; showCreate = true; }}>
-          {i18n.t('mcpServer.snippets.goCreate')}
-        </button>
-      </div>
-    {:else}
-      <div class="field">
-        <span>{i18n.t('mcpServer.snippets.useToken')}</span>
-        <SelectField bind:value={connectTokenId} data-mcp-connect-token="1" onchange={(next) => { connectTokenId = next; connectTokenTouched = true; }}
-          label={i18n.t('mcpServer.snippets.useToken')}
-          options={[{ value: '', label: i18n.t('mcpServer.snippets.placeholderOption') }, ...connectTokens.map(token => ({ value: token.tokenId, label: `${token.clientName}: ${workspaceName(token.workspaceId)}: ${token.prefix}…${token.hasSecret ? '' : ` (${i18n.t('mcpServer.snippets.noSecretOption')})`}`, disabled: !token.hasSecret }))]} />
-      </div>
-      {#if connectToken}{@render workspaceBinding(connectToken.workspaceId, connectToken)}{/if}
-      {#if connectTokens.some((token) => !token.hasSecret)}
-        <p class="meta">{i18n.t('mcpServer.snippets.noSecretHint')}</p>
-      {/if}
-    {/if}
-    {#if !snippets}
-      <p class="meta">{i18n.t('mcpServer.snippets.needStart')}</p>
-    {:else}
-      {#if !snippets.secretFilled}
-        <p class="meta" data-mcp-placeholder-note="1">{i18n.t('mcpServer.snippets.placeholderNote')}</p>
-      {:else}
-        <p class="meta">{i18n.t('mcpServer.snippets.perClientHint', { name: snippets.serverName })}</p>
-      {/if}
-      {#each snippetEntries(snippets) as entry (entry.key)}
-        <div class="snippet">
-          <div class="snippet-head">
-            <span class="settings-row-title">{entry.label}</span>
-            <button class="btn btn--sm btn--secondary" type="button" onclick={() => void copy(entry.key, entry.text)}>
-              {copiedKey === entry.key ? i18n.t('mcpServer.token.copied') : i18n.t('mcpServer.token.copy')}
-            </button>
-          </div>
-          <pre>{entry.text}</pre>
-        </div>
-      {/each}
-      <p class="meta">{i18n.t('mcpServer.snippets.stdioNote')}</p>
     {/if}
   </div>
 
@@ -1180,7 +1237,7 @@
 
   .token-row {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) max-content;
+    grid-template-columns: minmax(0, 1fr);
     align-items: start;
     gap: var(--space-3);
   }
@@ -1191,6 +1248,8 @@
   }
 
   .token-actions {
+    align-items: center;
+    justify-self: end;
     justify-content: flex-end;
   }
 
@@ -1208,14 +1267,6 @@
     opacity: 0.55;
   }
 
-  .quick-add {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    padding-top: 10px;
-    border-top: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.14));
-  }
-
   .form-field-row {
     display: grid;
     grid-template-columns: minmax(0, max-content) minmax(0, 1fr) auto;
@@ -1225,7 +1276,21 @@
 
   .risk-note {
     color: var(--danger, #c53f4f);
-    opacity: 0.9;
+  }
+
+  .network-disclosure { min-inline-size: 0; }
+  .network-disclosure > summary {
+    cursor: pointer;
+    min-block-size: 32px;
+    align-content: center;
+    font-size: var(--text-xs);
+    overflow-wrap: anywhere;
+  }
+  .network-disclosure > :not(summary), #mcp-named-editor > * + * { margin-block-start: var(--space-3); }
+  .network-disclosure > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  @media (pointer: coarse) {
+    .network-disclosure > summary { min-block-size: 44px; }
   }
 
   .field textarea {
@@ -1322,11 +1387,6 @@
 
   .status-message.error {
     color: var(--danger, #c53f4f);
-  }
-
-  @container mcp-server (max-width: 720px) {
-    .token-row { grid-template-columns: minmax(0, 1fr); }
-    .token-actions { justify-self: end; }
   }
 
   @container mcp-server (max-width: 420px) {

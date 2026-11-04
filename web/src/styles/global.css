@@ -345,11 +345,6 @@ body.vscode-light,
 body.vscode-dark,
 body.theme-dark,
 :root.theme-dark {
-  /* Optical compensation for white-on-charcoal glow. */
-  --font-normal: 360;
-  --font-medium: 460;
-  --font-semibold: 560;
-  --font-bold: 660;
   --scrollbar-thumb: rgba(255, 255, 255, 0.15);
   --scrollbar-thumb-hover: rgba(255, 255, 255, 0.25);
 }
@@ -375,8 +370,6 @@ body {
   font-variant-numeric: tabular-nums;
   color: var(--foreground);
   background: var(--magi-canvas);
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
   /* 移动端触摸优化：消除 300ms 点击延迟 + 去除点击高亮闪烁 */
   -webkit-tap-highlight-color: transparent;
   /* 覆盖 VSCode 默认的不可选中文本样式 */
@@ -702,7 +695,8 @@ textarea:focus {
 
 input::placeholder,
 textarea::placeholder {
-  color: color-mix(in srgb, var(--foreground-muted) 88%, transparent);
+  color: var(--foreground-muted);
+  opacity: 1;
 }
 
 /* 代码样式 */

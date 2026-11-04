@@ -33,6 +33,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub struct ClientPrincipal {
     pub token_id: String,
     pub token_prefix: String,
+    /// 宿主解析的会话上下文，不能从传输连接或活动项目推断。
+    pub session_id: Option<String>,
     pub client_name: String,
     pub workspace_id: String,
     pub project_directories: Option<magi_core::ProjectDirectoryBinding>,
@@ -46,6 +48,7 @@ impl From<&TokenRecord> for ClientPrincipal {
         Self {
             token_id: record.token_id.clone(),
             token_prefix: record.prefix.clone(),
+            session_id: None,
             client_name: record.client_name.clone(),
             workspace_id: record.workspace_id.clone(),
             project_directories: record.project_directories.clone(),
@@ -80,9 +83,11 @@ impl AttributionResolver for ExternalOnlyAttribution {
         principal: &ClientPrincipal,
     ) -> Result<AttributionTarget, AttributionRefusal> {
         match principal.attribution {
-            AttributionMode::External => Ok(AttributionTarget::ExternalSession {
-                token_id: principal.token_id.clone(),
-            }),
+            AttributionMode::External | AttributionMode::Conversation => {
+                Ok(AttributionTarget::ExternalSession {
+                    token_id: principal.token_id.clone(),
+                })
+            }
         }
     }
 }
@@ -139,6 +144,24 @@ pub struct InvocationOutcome {
 
 /// 后端：真正的工具执行与审批，由宿主实现（工具运行时、审批注册表、变更账本）。
 pub trait ToolBackend: Send + Sync {
+    /// 会话初始化不读取项目文件；返回本机目录选择状态或已经批准的绑定。
+    fn start_session(&self, _principal: &ClientPrincipal, _arguments: &Value) -> InvocationOutcome {
+        InvocationOutcome {
+            text: "宿主不支持独立会话".into(),
+            is_error: true,
+        }
+    }
+
+    /// 在任何项目目录或工具能力解析之前，验证会话归属并冻结本次调用上下文。
+    fn bind_session(
+        &self,
+        principal: &ClientPrincipal,
+        _session_id: &str,
+    ) -> Result<ClientPrincipal, String> {
+        let _ = principal;
+        Err("宿主不支持独立会话".into())
+    }
+
     fn schemas(&self) -> &dyn ToolSchemaProvider;
 
     /// 该工具的参数里有哪些路径访问；由宿主用现有的路径声明能力给出（相对路径按工作区根解析）。
@@ -171,6 +194,7 @@ pub enum AuditOutcome {
 /// 审计事件：不含令牌原文，不含文件正文，只含路径 / 工具的摘要。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditEvent {
+    pub session_id: Option<String>,
     pub token_id: String,
     pub client_name: String,
     pub workspace_id: String,
@@ -364,13 +388,16 @@ impl McpServer {
     /// 连接器配置指纹只跟随工具定义与权限档，不随活动会话切换变化。
     pub fn catalog_definition_for(&self, principal: &ClientPrincipal) -> Vec<ToolDescriptor> {
         let dynamic = self.backend.dynamic_tools();
-        build_catalog(principal.profile, self.backend.schemas(), &dynamic)
+        session_catalog(
+            principal,
+            build_catalog(principal.profile, self.backend.schemas(), &dynamic),
+        )
     }
 
     /// 当前调用方可见的工具目录；调用准入重复验证相同能力边界。
     pub fn catalog_for(&self, principal: &ClientPrincipal) -> Vec<ToolDescriptor> {
         let dynamic = self.backend.dynamic_tools();
-        build_catalog(principal.profile, self.backend.schemas(), &dynamic)
+        let catalog = build_catalog(principal.profile, self.backend.schemas(), &dynamic)
             .into_iter()
             .filter(|tool| {
                 let internal = mapping_for_public_name(&tool.name)
@@ -383,7 +410,8 @@ impl McpServer {
                     });
                 internal.is_some_and(|name| self.backend.tool_available(principal, name))
             })
-            .collect()
+            .collect();
+        session_catalog(principal, catalog)
     }
 
     /// 处理一条已通过认证的 JSON-RPC 请求。通知返回 `None`。
@@ -452,7 +480,9 @@ impl McpServer {
         let id = request.response_id();
         match request.method.as_str() {
             "initialize" => {
-                let instructions = if principal.attribution == AttributionMode::External {
+                let instructions = if principal.attribution == AttributionMode::Conversation {
+                    Some("This connection identifies an MCP client, not a chat or a working directory. At the FIRST use in EACH NEW conversation call magi.session.start with a unique conversation_id (use the client's stable chat ID when available, otherwise generate a fresh UUID once for that chat). The local Magi user selects the execution directory once. Reuse the SAME conversation_id when checking pending selection or reconnecting; do not create another directory request for each tool call. Once ready, pass the returned magi_session_id on EVERY ordinary tool call in that conversation. Never reuse a session ID from a different conversation. A transport MCP session ID is not a chat ID. Do not infer local paths from a cloud working directory.".to_string())
+                } else if principal.attribution == AttributionMode::External {
                     let target = AttributionTarget::ExternalSession {
                         token_id: principal.token_id.clone(),
                     };
@@ -535,10 +565,49 @@ impl McpServer {
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return Err("缺少工具名 name".to_string());
         };
-        let arguments = match params.get("arguments") {
+        let mut arguments = match params.get("arguments") {
             None | Some(Value::Null) => json!({}),
             Some(value @ Value::Object(_)) => value.clone(),
             Some(_) => return Err("arguments 必须是对象".to_string()),
+        };
+
+        if serde_json::to_vec(&arguments).map_or(0, |bytes| bytes.len()) > MAX_ARGUMENT_BYTES {
+            return Ok(tool_failure("工具参数过大"));
+        }
+        let bound;
+        let principal = if principal.attribution == AttributionMode::Conversation {
+            if name == "magi.session.start" {
+                let _in_flight = match registration {
+                    Ok(guard) => guard,
+                    Err(message) => return Ok(tool_failure(message)),
+                };
+                let outcome = self.backend.start_session(principal, &arguments);
+                return Ok(if outcome.is_error {
+                    tool_failure(outcome.text)
+                } else {
+                    tool_success(outcome.text)
+                });
+            }
+            let Some(id) = arguments
+                .get("magi_session_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            else {
+                return Ok(tool_failure(
+                    "缺少 magi_session_id；本聊天首次使用时先调用 magi.session.start，并在本机 Magi 选择执行目录。",
+                ));
+            };
+            bound = match self.backend.bind_session(principal, id) {
+                Ok(principal) => principal,
+                Err(error) => return Ok(tool_failure(error)),
+            };
+            arguments
+                .as_object_mut()
+                .expect("object arguments")
+                .remove("magi_session_id");
+            &bound
+        } else {
+            principal
         };
 
         // 目录里没有的工具（含该权限档不可见的）统一按“不存在”处理，不泄露其存在。
@@ -567,6 +636,7 @@ impl McpServer {
         };
         let deny = |reason: String, paths: Vec<String>, requires_approval: bool| -> Value {
             self.audit.record(AuditEvent {
+                session_id: principal.session_id.clone(),
                 token_id: principal.token_id.clone(),
                 client_name: principal.client_name.clone(),
                 workspace_id: principal.workspace_id.clone(),
@@ -672,9 +742,7 @@ impl McpServer {
             }
         };
 
-        let requires_approval = match principal.attribution {
-            AttributionMode::External => principal.approval_mode == ApprovalMode::Ask,
-        };
+        let requires_approval = principal.approval_mode.requires_approval(mapping.class);
         let invocation = ToolInvocation {
             principal: principal.clone(),
             public_name: mapping.public_name.clone(),
@@ -690,6 +758,7 @@ impl McpServer {
         let backend = self.backend.clone();
         let audit = self.audit.clone();
         let event = AuditEvent {
+            session_id: principal.session_id.clone(),
             token_id: principal.token_id.clone(),
             client_name: principal.client_name.clone(),
             workspace_id: principal.workspace_id.clone(),
@@ -724,6 +793,34 @@ impl McpServer {
             tool_success(text)
         })
     }
+}
+
+/// 所有支持 MCP 的 Agent 使用同一会话协议，不依赖特定厂商或传输连接。
+fn session_catalog(
+    principal: &ClientPrincipal,
+    mut catalog: Vec<ToolDescriptor>,
+) -> Vec<ToolDescriptor> {
+    if principal.attribution != AttributionMode::Conversation {
+        return catalog;
+    }
+    for tool in &mut catalog {
+        let schema = &mut tool.input_schema;
+        schema["properties"]["magi_session_id"] = json!({"type":"string", "minLength":1, "description":"本聊天由 magi.session.start 返回的已批准会话 ID；后续调用复用，不得借用其他聊天的 ID"});
+        if !schema["required"].is_array() {
+            schema["required"] = json!([]);
+        }
+        schema["required"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("magi_session_id"));
+    }
+    catalog.insert(0, ToolDescriptor {
+        name: "magi.session.start".into(),
+        description: "每个新聊天首次使用 Magi 时调用一次，让本机用户选择执行目录。相同 conversation_id 幂等复用；等待中用同一 ID 查询，不要反复新建。返回 ready 后，所有普通工具调用携带 magi_session_id。".into(),
+        input_schema: json!({"type":"object","properties":{"conversation_id":{"type":"string","minLength":1,"maxLength":256},"title":{"type":"string","maxLength":160,"description":"本聊天的简短自然语言标题，只概括用户的任务，例如‘修复登录问题’。尽量提供；会话已按项目归组，不要附加项目名、工作区名、文件夹名或路径，不要重复客户端名称，不要使用会话 ID、UUID 或令牌充当标题。"}},"required":["conversation_id"],"additionalProperties":false}),
+        class: ToolClass::Write,
+    });
+    catalog
 }
 
 /// 超出上限时在字符边界截断并明确提示，不做静默截断。
@@ -825,6 +922,7 @@ mod tests {
 
     fn principal(profile: Profile) -> ClientPrincipal {
         ClientPrincipal {
+            session_id: None,
             project_directories: None,
             token_id: "tok-1".to_string(),
             token_prefix: "magi_mcp_abcdef".to_string(),
@@ -882,6 +980,53 @@ mod tests {
 
     fn is_error(response: &Value) -> bool {
         response["result"]["isError"] == json!(true)
+    }
+
+    #[tokio::test]
+    async fn conversation_protocol_never_falls_back_to_a_workspace_or_transport_session() {
+        let h = harness();
+        let mut p = principal(Profile::Exec);
+        p.attribution = AttributionMode::Conversation;
+        p.workspace_id.clear();
+        let initialized = h
+            .server
+            .handle(&p, request("initialize", Some(json!(1)), json!({})), 1)
+            .await
+            .unwrap();
+        assert!(
+            initialized["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("FIRST use in EACH NEW conversation")
+        );
+        let catalog = h.server.catalog_for(&p);
+        assert_eq!(catalog[0].name, "magi.session.start");
+        assert!(catalog.iter().skip(1).all(|tool| {
+            tool.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("magi_session_id"))
+        }));
+        let response = h
+            .server
+            .handle(&p, call("magi.fs.read", json!({"path":"a.txt"})), 2)
+            .await
+            .unwrap();
+        assert!(is_error(&response));
+        let forged = h
+            .server
+            .handle(
+                &p,
+                call(
+                    "magi.fs.read",
+                    json!({"path":"a.txt","magi_session_id":"another-chat"}),
+                ),
+                3,
+            )
+            .await
+            .unwrap();
+        assert!(is_error(&forged));
+        assert!(h.backend.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -25,6 +25,11 @@ const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/mcp-server/status", get(get_status))
+        .route("/mcp-server/oauth/requests", get(list_oauth_requests))
+        .route(
+            "/mcp-server/oauth/requests/{request_id}",
+            post(resolve_oauth_request),
+        )
         .route("/mcp-server/enabled", post(set_enabled))
         .route("/mcp-server/network", post(set_network))
         .route("/mcp-server/direct", put(set_direct_access))
@@ -44,6 +49,14 @@ pub fn routes() -> Router<ApiState> {
         .route("/mcp-server/config-snippets", get(config_snippets))
         .route("/mcp-server/audit", get(list_audit).delete(clear_audit))
         .route("/mcp-server/sessions", get(list_sessions))
+        .route(
+            "/mcp-server/directory-requests",
+            get(list_directory_requests),
+        )
+        .route(
+            "/mcp-server/directory-requests/{session_id}",
+            post(resolve_directory_request),
+        )
         .route("/mcp-server/external", put(set_external_retention))
         .route("/mcp-server/approvals", get(list_approvals))
         .route("/mcp-server/approvals/resolve", post(resolve_approval))
@@ -102,12 +115,13 @@ struct TokenDto {
 
 impl TokenDto {
     fn from_record(state: &ApiState, record: &TokenRecord, now_ms: u64) -> Self {
-        let workspace_available = record.project_directories.as_ref().is_some_and(|binding| {
-            state
-                .workspace_registry
-                .validate_directory_binding(binding)
-                .is_ok()
-        });
+        let workspace_available = record.attribution == AttributionMode::Conversation
+            || record.project_directories.as_ref().is_some_and(|binding| {
+                state
+                    .workspace_registry
+                    .validate_directory_binding(binding)
+                    .is_ok()
+            });
         Self {
             token_id: record.token_id.clone(),
             prefix: record.prefix.clone(),
@@ -353,10 +367,22 @@ async fn verify_named_tunnel(
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
+        .user_agent(concat!("Magi-MCP/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| ApiError::internal_assembly("连通性检查", error))?;
-    match client.get(format!("https://{hostname}/mcp")).send().await {
+    // MCP 入口只接受 POST/DELETE；GET 会在认证之前返回 405，不能用于检查认证链路。
+    match client
+        .post(format!("https://{hostname}/mcp"))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        }))
+        .send()
+        .await
+    {
         Ok(response) => {
             let code = response.status().as_u16();
             match code {
@@ -376,7 +402,10 @@ async fn verify_named_tunnel(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateTokenRequest {
     client_name: String,
+    #[serde(default)]
     workspace_id: String,
+    #[serde(default)]
+    attribution: AttributionMode,
     #[serde(default)]
     source_folder_ids: Option<Vec<String>>,
     #[serde(default)]
@@ -414,33 +443,50 @@ async fn create_token(
     Json(request): Json<CreateTokenRequest>,
 ) -> Result<Json<CreateTokenResponse>, ApiError> {
     require_local(&headers)?;
-    if state
-        .workspace_root_path(&Some(WorkspaceId::new(request.workspace_id.trim())))
-        .is_none()
+    if request.attribution == AttributionMode::External
+        && state
+            .workspace_root_path(&Some(WorkspaceId::new(request.workspace_id.trim())))
+            .is_none()
     {
         return Err(ApiError::InvalidInput("工作区不存在".to_string()));
     }
     let ttl_ms = ttl_days_to_ms(request.ttl_days.unwrap_or(DEFAULT_TOKEN_TTL_DAYS));
-    let project_directories = state
-        .workspace_registry
-        .capture_directory_binding(
-            &WorkspaceId::new(request.workspace_id.trim()),
-            request.source_folder_id.as_deref(),
-            request.source_folder_ids.as_deref(),
+    let project_directories = if request.attribution == AttributionMode::Conversation {
+        if !request.workspace_id.is_empty()
+            || request.source_folder_id.is_some()
+            || request.source_folder_ids.is_some()
+        {
+            return Err(ApiError::InvalidInput(
+                "逐会话选择目录的客户端不能预先绑定项目".into(),
+            ));
+        }
+        None
+    } else {
+        Some(
+            state
+                .workspace_registry
+                .capture_directory_binding(
+                    &WorkspaceId::new(request.workspace_id.trim()),
+                    request.source_folder_id.as_deref(),
+                    request.source_folder_ids.as_deref(),
+                )
+                .map_err(|error| ApiError::InvalidInput(error.to_string()))?,
         )
-        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
-    state
-        .workspace_registry
-        .validate_directory_binding(&project_directories)
-        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+    };
+    if let Some(binding) = &project_directories {
+        state
+            .workspace_registry
+            .validate_directory_binding(binding)
+            .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+    }
     let issued = state
         .mcp_service
         .issue_token(IssueTokenRequest {
-            project_directories: Some(project_directories),
+            project_directories,
             client_name: request.client_name,
             workspace_id: request.workspace_id,
             approval_mode: request.approval_mode,
-            attribution: AttributionMode::External,
+            attribution: request.attribution,
             ttl_ms,
             network: request.allow_network,
         })
@@ -549,6 +595,7 @@ fn audit_management(state: &ApiState, record: &TokenRecord, action: &str, detail
         .mcp_service
         .audit()
         .record(crate::mcp_runtime::AuditEntry {
+            session_id: None,
             token_id: record.token_id.clone(),
             client_name: record.client_name.clone(),
             workspace_id: record.workspace_id.clone(),
@@ -787,6 +834,7 @@ fn build_snippets(
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExternalApprovalDto {
+    session_id: String,
     approval_id: String,
     token_id: String,
     client_name: String,
@@ -818,6 +866,7 @@ fn pending_external_approvals(state: &ApiState) -> Vec<ExternalApprovalDto> {
                 continue;
             }
             approvals.push(ExternalApprovalDto {
+                session_id: owner.session_id.to_string(),
                 approval_id: pending.approval_id,
                 token_id: owner.token_id.clone(),
                 client_name: owner.client_name.clone(),
@@ -979,11 +1028,100 @@ async fn clear_audit(
     Ok(Json(ClearAuditResponse { removed }))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectoryRequestDto {
+    session_id: String,
+    client_name: String,
+    conversation_id: String,
+    title: String,
+    requested_at_ms: u64,
+}
+
+async fn list_directory_requests(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<DirectoryRequestDto>>, ApiError> {
+    require_local(&headers)?;
+    let tokens = state.mcp_service.list_tokens();
+    Ok(Json(
+        state
+            .mcp_service
+            .conversations
+            .pending(&state)
+            .into_iter()
+            .filter_map(|record| {
+                let token = tokens
+                    .iter()
+                    .find(|token| token.token_id == record.token_id)?;
+                Some(DirectoryRequestDto {
+                    session_id: record.session_id,
+                    client_name: token.client_name.clone(),
+                    conversation_id: record.conversation_id,
+                    title: record.title,
+                    requested_at_ms: record.requested_at_ms,
+                })
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DirectoryDecision {
+    /// None 表示拒绝。授权必须由可信本机界面提供明确项目和目录。
+    workspace_id: Option<String>,
+    source_folder_id: Option<String>,
+}
+
+async fn resolve_directory_request(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(request): Json<DirectoryDecision>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_local(&headers)?;
+    let _pending = state
+        .mcp_service
+        .conversations
+        .pending(&state)
+        .into_iter()
+        .find(|record| record.session_id == session_id)
+        .ok_or_else(|| ApiError::not_found("目录选择请求不存在或已处理", &session_id))?;
+    let directories = if let Some(workspace) = &request.workspace_id {
+        let source = request
+            .source_folder_id
+            .as_ref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| ApiError::InvalidInput("请选择本会话的执行目录".into()))?;
+        Some(
+            state
+                .workspace_registry
+                .capture_directory_binding(
+                    &WorkspaceId::new(workspace),
+                    Some(source),
+                    Some(std::slice::from_ref(source)),
+                )
+                .map_err(|error| ApiError::InvalidInput(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    state
+        .mcp_service
+        .conversations
+        .decide(&state, &session_id, directories)
+        .map_err(ApiError::InvalidInput)?;
+    crate::external_turns::publish_changed(&state, &magi_core::SessionId::new(session_id));
+    Ok(Json(serde_json::json!({"ok":true})))
+}
+
 /// 外部客户端（一个令牌）的外部会话。会话本身是普通会话，调用过程在它的 canonical 时间线里；
 /// 这里只给侧栏提供入口所需的概要。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExternalSessionDto {
+    title: Option<String>,
     token_id: String,
     session_id: String,
     client_name: String,
@@ -1007,17 +1145,25 @@ async fn list_sessions(
 ) -> Result<Json<SessionsResponse>, ApiError> {
     require_local(&headers)?;
     let tokens = state.mcp_service.list_tokens();
+    let conversations = state.mcp_service.conversations.records();
     let mut sessions = state
         .session_store
         .sessions()
         .into_iter()
         .filter(|session| session.kind == magi_session_store::SessionKind::ExternalTool)
         .filter_map(|session| {
-            let token_id = session
-                .session_id
-                .as_str()
-                .strip_prefix(crate::mcp_service::EXTERNAL_SESSION_ID_PREFIX)?
-                .to_string();
+            let conversation = conversations
+                .iter()
+                .find(|record| record.session_id == session.session_id.as_str());
+            let token_id = conversation
+                .map(|record| record.token_id.clone())
+                .or_else(|| {
+                    session
+                        .session_id
+                        .as_str()
+                        .strip_prefix(crate::mcp_service::EXTERNAL_SESSION_ID_PREFIX)
+                        .map(str::to_string)
+                })?;
             let client_name = tokens
                 .iter()
                 .find(|record| record.token_id == token_id)
@@ -1030,6 +1176,15 @@ async fn list_sessions(
                         .to_string()
                 });
             Some(ExternalSessionDto {
+                // 早期未命名聊天把 conversation_id 写成标题；展示投影不再
+                // 泄露技术标识，保留后来用户重命名的标题，不修改历史记录。
+                title: conversation
+                    .filter(|record| {
+                        !session.title.trim().is_empty()
+                            && !(record.title.is_empty()
+                                && session.title == record.conversation_id)
+                    })
+                    .map(|_| session.title.clone()),
                 token_id,
                 running: state
                     .mcp_service
@@ -1075,6 +1230,75 @@ async fn set_external_retention(
         .map_err(runtime_error)?;
     state.mcp_service.external_turns.purge_expired(&state).await;
     Ok(Json(status_response(&state).await))
+}
+
+async fn list_oauth_requests(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<magi_mcp_server::oauth::PendingConsent>>, ApiError> {
+    require_local(&headers)?;
+    Ok(Json(state.mcp_service.oauth.pending(now_ms())))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OAuthConsentRequest {
+    token_id: Option<String>,
+}
+
+async fn resolve_oauth_request(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+    Json(request): Json<OAuthConsentRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_local(&headers)?;
+    let token = request
+        .token_id
+        .map(|id| {
+            state
+                .mcp_service
+                .list_tokens()
+                .into_iter()
+                .find(|token| token.token_id == id && token.is_active(now_ms()) && token.network)
+                .ok_or_else(|| ApiError::InvalidInput("请选择有效的公网客户端".into()))
+        })
+        .transpose()?;
+    state
+        .mcp_service
+        .oauth
+        .resolve(&request_id, token.as_ref(), now_ms())
+        .map_err(ApiError::InvalidInput)?;
+    state
+        .mcp_service
+        .audit()
+        .record(crate::mcp_runtime::AuditEntry {
+            session_id: None,
+            token_id: token
+                .as_ref()
+                .map(|t| t.token_id.clone())
+                .unwrap_or_default(),
+            client_name: token
+                .as_ref()
+                .map(|t| t.client_name.clone())
+                .unwrap_or_default(),
+            workspace_id: token
+                .as_ref()
+                .map(|t| t.workspace_id.clone())
+                .unwrap_or_default(),
+            tool: "oauth.consent".into(),
+            requires_approval: true,
+            paths: vec![],
+            outcome: if token.is_some() {
+                "succeeded"
+            } else {
+                "denied"
+            }
+            .into(),
+            detail: None,
+            at_ms: now_ms(),
+        });
+    Ok(Json(serde_json::json!({"ok":true})))
 }
 
 #[cfg(test)]
@@ -1131,6 +1355,165 @@ mod tests {
             .await
             .unwrap();
         (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn conversation_client_directory_selection_is_local_once_and_per_chat() {
+        let (state, _dir) = state_with_workspace();
+        let (status, created) = call(&state,"POST","/mcp-server/tokens",serde_json::json!({"clientName":"Any Web Agent","attribution":"conversation","allowNetwork":true}),false).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["token"]["state"], "active");
+        assert_eq!(created["token"]["workspaceId"], "");
+        let record = state.mcp_service.list_tokens().remove(0);
+        let principal = magi_mcp_server::ClientPrincipal::from(&record);
+        let a = state
+            .mcp_service
+            .conversations
+            .start(&principal, "A", "Chat A")
+            .unwrap();
+        let b = state
+            .mcp_service
+            .conversations
+            .start(&principal, "B", "Chat B")
+            .unwrap();
+        let path = format!("/mcp-server/directory-requests/{}", a.session_id);
+        let source = state
+            .workspace_registry
+            .project(&WorkspaceId::new("ws-1"))
+            .unwrap()
+            .primary_source_folder_id;
+        let choice = serde_json::json!({"workspaceId":"ws-1","sourceFolderId":source});
+        assert_eq!(
+            call(
+                &state,
+                "GET",
+                "/mcp-server/directory-requests",
+                serde_json::Value::Null,
+                true
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(&state, "POST", &path, choice.clone(), true).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(
+            state
+                .mcp_service
+                .conversations
+                .bind(&state, &principal, &a.session_id)
+                .is_err()
+        );
+        assert_eq!(
+            call(&state, "POST", &path, choice.clone(), false).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(&state, "POST", &path, choice.clone(), false).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(state.mcp_service.conversations.pending(&state).len(), 1);
+        let path_b = format!("/mcp-server/directory-requests/{}", b.session_id);
+        assert_eq!(
+            call(&state, "POST", &path_b, choice, false).await.0,
+            StatusCode::OK
+        );
+        let (status, listed) = call(
+            &state,
+            "GET",
+            "/mcp-server/sessions",
+            serde_json::Value::Null,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let sessions = listed["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(
+            sessions
+                .iter()
+                .all(|entry| entry["tokenId"] == record.token_id && entry["workspaceId"] == "ws-1")
+        );
+        assert_ne!(sessions[0]["sessionId"], sessions[1]["sessionId"]);
+        assert_ne!(sessions[0]["title"], sessions[1]["title"]);
+    }
+
+    #[tokio::test]
+    async fn conversation_titles_hide_identifier_fallbacks_and_preserve_renames() {
+        let (state, _dir) = state_with_workspace();
+        let (_, created) = call(
+            &state,
+            "POST",
+            "/mcp-server/tokens",
+            serde_json::json!({
+                "clientName": "Web Agent", "attribution": "conversation"
+            }),
+            false,
+        )
+        .await;
+        assert!(created["token"]["tokenId"].is_string(), "{created}");
+        let principal = magi_mcp_server::ClientPrincipal::from(&state.mcp_service.list_tokens()[0]);
+        let conversation = state
+            .mcp_service
+            .conversations
+            .start(&principal, "chat-identifier-not-a-title", "")
+            .unwrap();
+        let source = state
+            .workspace_registry
+            .project(&WorkspaceId::new("ws-1"))
+            .unwrap()
+            .primary_source_folder_id;
+        let (status, _) = call(
+            &state,
+            "POST",
+            &format!("/mcp-server/directory-requests/{}", conversation.session_id),
+            serde_json::json!({"workspaceId": "ws-1", "sourceFolderId": source}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let id = magi_core::SessionId::new(&conversation.session_id);
+        assert_eq!(state.session_store.session(&id).unwrap().title, "");
+        let (_, listed) = call(
+            &state,
+            "GET",
+            "/mcp-server/sessions",
+            serde_json::Value::Null,
+            false,
+        )
+        .await;
+        assert!(listed["sessions"][0]["title"].is_null());
+
+        // 已有会话的旧版自动 ID 标题也隐藏，但用户后续改名必须保留。
+        state
+            .session_store
+            .rename_session(&id, &conversation.conversation_id)
+            .unwrap();
+        let (_, listed) = call(
+            &state,
+            "GET",
+            "/mcp-server/sessions",
+            serde_json::Value::Null,
+            false,
+        )
+        .await;
+        assert!(listed["sessions"][0]["title"].is_null());
+        state
+            .session_store
+            .rename_session(&id, "修复登录问题")
+            .unwrap();
+        let (_, listed) = call(
+            &state,
+            "GET",
+            "/mcp-server/sessions",
+            serde_json::Value::Null,
+            false,
+        )
+        .await;
+        assert_eq!(listed["sessions"][0]["title"], "修复登录问题");
+        assert_eq!(listed["sessions"][0]["clientName"], "Web Agent");
     }
 
     #[tokio::test]
@@ -1309,6 +1692,17 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{created}");
         assert_eq!(created["token"]["approvalMode"], "always");
         let token_id = created["token"]["tokenId"].as_str().unwrap();
+
+        let (status, updated) = call(
+            &state,
+            "PATCH",
+            &format!("/mcp-server/tokens/{token_id}"),
+            serde_json::json!({"approvalMode": "read_write"}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["tokens"][0]["approvalMode"], "read_write");
 
         let (status, updated) = call(
             &state,
@@ -1822,6 +2216,8 @@ mod tests {
         let (state, _dir) = state_with_workspace();
         for (method, path) in [
             ("GET", "/mcp-server/status"),
+            ("GET", "/mcp-server/oauth/requests"),
+            ("POST", "/mcp-server/oauth/requests/not-a-request"),
             ("POST", "/mcp-server/enabled"),
             ("POST", "/mcp-server/tokens"),
             ("POST", "/mcp-server/tokens/revoke-all"),
@@ -1953,6 +2349,7 @@ mod tests {
     async fn audit_lists_recent_calls_newest_first_and_filters_by_token() {
         let (state, _dir) = state_with_workspace();
         let entry = |token: &str, at_ms: u64| crate::mcp_runtime::AuditEntry {
+            session_id: None,
             token_id: token.to_string(),
             client_name: "cursor".to_string(),
             workspace_id: "ws-1".to_string(),

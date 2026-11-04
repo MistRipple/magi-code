@@ -27,6 +27,13 @@ await withGoldenViteServer(async (server) => {
     ['normal-new', 'external-tool-token-external', 'normal-old'],
     '外部会话应按最近活动时间插入普通会话列表，而不是固定在底部',
   );
+  const parallelChats = mergeExternalSessionsIntoSidebar([], ['A', 'B'].map((title, index) => ({
+    tokenId: 'shared-client', sessionId: `external-tool-chat-${title}`, title,
+    clientName: 'Web Agent', workspaceId: 'workspace-1', lastActivityAtMs: index, running: 0,
+  })), 'workspace-1');
+  assert.equal(parallelChats.length, 2, '同一客户端和目录中的多个聊天不能合并');
+  assert.deepEqual(parallelChats.map(chat => chat.name), ['B', 'A'], '外部聊天标题作为主名称，客户端来源不再挤占标题');
+
 });
 
 console.log('session sidebar golden checks passed');

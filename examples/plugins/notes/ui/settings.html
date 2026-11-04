@@ -1,0 +1,53 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 16px; }
+  label { display: block; margin-bottom: 4px; font-weight: 600; }
+  input { width: 100%; max-width: 360px; box-sizing: border-box; padding: 6px 8px; }
+  button { margin-top: 12px; padding: 6px 14px; }
+  #status { margin-left: 8px; opacity: .7; }
+</style>
+<label for="prefix">笔记前缀</label>
+<input id="prefix" autocomplete="off">
+<div><button id="save">保存</button><span id="status" role="status"></span></div>
+<script>
+  // 设置页由插件自己提供；宿主只托管沙箱和消息桥（settings.read / settings.write）。
+  const CHANNEL = 'magi-plugin-v1';
+  const input = document.getElementById('prefix');
+  const status = document.getElementById('status');
+  let instanceId = null, version = 0, next = 0;
+  const pending = new Map();
+
+  function request(operation, fields) {
+    return new Promise((resolve, reject) => {
+      const requestId = 'r' + (++next);
+      pending.set(requestId, { resolve, reject });
+      parent.postMessage({ channel: CHANNEL, instanceId, type: 'request', requestId, operation, ...fields }, '*');
+    });
+  }
+  function show(settings) {
+    version = settings.version;
+    input.value = settings.value?.prefix ?? '';
+  }
+  window.addEventListener('message', async (event) => {
+    const m = event.data;
+    if (!m || m.channel !== CHANNEL) return;
+    if (m.type === 'init') {
+      instanceId = m.instanceId;
+      show(await request('settings.read', {}));
+    } else if (m.type === 'response') {
+      const waiter = pending.get(m.requestId);
+      pending.delete(m.requestId);
+      if (waiter) m.ok ? waiter.resolve(m.result) : waiter.reject(new Error(m.error));
+    }
+  });
+  document.getElementById('save').onclick = async () => {
+    try {
+      show(await request('settings.write', { expectedVersion: version, value: { prefix: input.value } }));
+      status.textContent = '已保存';
+    } catch (error) {
+      status.textContent = String(error.message || error);
+    }
+  };
+</script>

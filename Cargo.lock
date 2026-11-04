@@ -1795,6 +1795,7 @@ name = "magi-mcp-server"
 version = "3.0.62"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "getrandom 0.4.3",
  "magi-core",
  "serde",
@@ -1805,6 +1806,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "url",
 ]
 
 [[package]]

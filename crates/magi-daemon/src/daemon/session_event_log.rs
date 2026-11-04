@@ -1394,7 +1394,7 @@ mod tests {
             job_id: "job-events-1".into(),
             session_id: session.clone(),
             workspace_id: None,
-            task_id: magi_core::TaskId::new("job-task"),
+            task_id: Some(magi_core::TaskId::new("job-task")),
             turn_id: running.turn_id.clone(),
             item_id: tool_item.item_id.clone(),
             tool_call_id: "job-call".into(),

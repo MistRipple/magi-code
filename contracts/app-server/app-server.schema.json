@@ -5347,15 +5347,6 @@
           "uniqueItems": true,
           "maxItems": 64
         },
-        "evidenceRefs": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1
-          },
-          "uniqueItems": true,
-          "maxItems": 64
-        },
         "taskIds": {
           "type": "array",
           "items": {
@@ -5377,10 +5368,7 @@
       "required": [
         "stepId",
         "title",
-        "status",
-        "dependsOn",
-        "evidenceRefs",
-        "taskIds"
+        "status"
       ]
     },
     "ExecutionStep": {
@@ -5458,11 +5446,6 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "expectedRevision": {
-          "type": "integer",
-          "minimum": 0,
-          "x-rust-type": "u64"
-        },
         "steps": {
           "type": "array",
           "minItems": 2,
@@ -5477,7 +5460,6 @@
         }
       },
       "required": [
-        "expectedRevision",
         "steps"
       ]
     },

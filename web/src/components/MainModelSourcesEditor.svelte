@@ -3,8 +3,8 @@
   import Icon from './Icon.svelte';
   import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { fetchAgentModelList, getAgentMainModelCatalog, saveAgentMainModelSources } from '../web/agent-api';
-  import type { MainModelCatalogEntry, MainModelCatalogGroup, MainModelSource, MainModelSourcesConfig } from '../shared/main-model-sources';
+  import { fetchAgentModelList, saveAgentMainModelSources } from '../web/agent-api';
+  import type { MainModelCatalogEntry, MainModelSource, MainModelSourcesConfig } from '../shared/main-model-sources';
 
   type MainEditorConfig = Record<string, unknown> & {
     sources?: MainModelSource[];
@@ -29,23 +29,6 @@
   let modelIdDraft = $state('');
   let modelNameDraft = $state('');
   let keyVisible = $state<Record<string, boolean>>({});
-
-  // 插件在运行期提供的数据源：只读展示，来自主对话目录的同一份投影。
-  let pluginGroups = $state<MainModelCatalogGroup[]>([]);
-  async function loadPluginGroups(): Promise<void> {
-    try {
-      const catalog = await getAgentMainModelCatalog();
-      pluginGroups = catalog.groups.filter((group) => group.kind === 'plugin');
-    } catch {
-      pluginGroups = [];
-    }
-  }
-  $effect(() => {
-    void loadPluginGroups();
-    const refresh = () => void loadPluginGroups();
-    window.addEventListener('focus', refresh);
-    return () => window.removeEventListener('focus', refresh);
-  });
 
   const sources = $derived(Array.isArray(config.sources) ? config.sources as MainModelSource[] : []);
   const dirty = $derived(draft !== null && JSON.stringify(draft) !== baseline);
@@ -208,31 +191,6 @@
       {/if}
       {#if !draft && sources.length > 0}
         <p class="settings-hint source-select-hint">{i18n.t('settings.model.sources.selectHint')}</p>
-      {/if}
-    </div>
-  </section>
-
-  <section class="settings-card" aria-labelledby="plugin-model-sources-title">
-    <div class="settings-card-head">
-      <div class="settings-card-title">
-        <h4 class="settings-section-title" id="plugin-model-sources-title">{i18n.t('settings.model.sources.pluginTitle')}</h4>
-        <div class="settings-section-desc">{i18n.t('settings.model.sources.pluginDesc')}</div>
-      </div>
-    </div>
-    <div class="settings-card-body">
-      {#if pluginGroups.length > 0}
-        <div class="source-list" role="list" aria-label={i18n.t('settings.model.sources.pluginTitle')}>
-          {#each pluginGroups as group (group.sourceId)}
-            <div class="settings-row" role="listitem">
-              <span class="settings-row-copy">
-                <span class="settings-row-title">{group.name}</span>
-                <span class="settings-row-desc">{i18n.t('settings.model.sources.pluginBy', { plugin: group.pluginId ?? '', count: group.models.length })}</span>
-              </span>
-            </div>
-          {/each}
-        </div>
-      {:else}
-        <div class="settings-empty">{i18n.t('settings.model.sources.pluginEmpty')}</div>
       {/if}
     </div>
   </section>

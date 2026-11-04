@@ -743,6 +743,43 @@ impl SnapshotSession {
         Ok(out)
     }
 
+    /// 外部客户端只看本会话工具在当前基线之后产生的改动。后来被其他来源覆盖的
+    /// 本会话路径仍保留（不可回退），纯外部改动不混入。归属从既有 ChangeLog 派生，
+    /// 不另存一份路径所有权；批准推进基线后，旧工具事件不再授予当前改动归属。
+    pub fn pending_tool_changes(&self) -> SnapshotResult<Vec<PendingChange>> {
+        let mut changes = self.pending_changes()?;
+        let baseline = self.baseline.read().expect("baseline poisoned");
+        let mut settled = std::collections::HashSet::new();
+        let mut owned = std::collections::HashSet::new();
+        for event in self.events.read_all()?.into_iter().rev() {
+            let Some(path) = event.after.as_ref().or(event.before.as_ref()).map(|meta| &meta.path) else {
+                continue;
+            };
+            if settled.contains(path) {
+                continue;
+            }
+            let base = baseline.entries.get(path);
+            let matches_baseline = |meta: Option<&FileMeta>| match (base, meta) {
+                (None, None) => true,
+                (Some(base), Some(meta)) => meta_unchanged(base, meta),
+                _ => false,
+            };
+            if matches_baseline(event.after.as_ref()) {
+                settled.insert(path.clone());
+                continue;
+            }
+            if event.source == SourceKind::Tool {
+                owned.insert(path.clone());
+            }
+            if matches_baseline(event.before.as_ref()) {
+                settled.insert(path.clone());
+            }
+        }
+        changes.retain(|change| owned.contains(&change.path)
+            || change.old_path.as_ref().is_some_and(|path| owned.contains(path)));
+        Ok(changes)
+    }
+
     fn cached_unified_diff(&self, path: &str, old: &str, new: &str) -> String {
         if let Some(hit) = self
             .diff_cache

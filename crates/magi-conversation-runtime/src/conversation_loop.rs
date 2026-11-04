@@ -687,7 +687,12 @@ fn refresh_current_agent_mode(
             .iter()
             .any(|tool| tool.function.name == "update_execution_steps")
         {
-            prompt.push_str("\n\n当前任务提供 update_execution_steps：多阶段任务在第一次实际工具执行前，先提交 2–12 个简短执行步骤，首次 expectedRevision=0。它属于当前 Task/Turn，不创建 Goal 或会话计划。简单问答、单步操作不用。先 running 再执行；用本轮同 Task 的真实成功 itemId/toolCallId 作为 evidenceRefs 后标记完成。失败/阻塞/取消须说明 reason；重试或拆分保留旧步骤并追加新 stepId。步骤工具不能代替实际工作。最终答复前收口所有步骤。");
+            prompt.push_str(
+                "\n\n# 执行步骤（update_execution_steps）\n\
+                 默认不用。只有确认任务需要多阶段的实际修改、构建验证或委派子任务，且用户需要看到进度时，才在第一次执行这些操作前提交 3–6 个步骤；此前的只读探索不算步骤，探索之后再决定是否需要。\n\
+                 不用：问答、解释、只读的查看/分析/总结（如“了解项目”“解释这段代码”）、单步或几次工具调用就能完成的操作、探索性检索。拿不准就不用。\n\
+                 用法：每次提交完整步骤列表并沿用 stepId；标题用用户的语言，每条一个简短动作。把正在做的步骤设为 running（可与它的第一个工具调用放在同一轮），成功执行后设为 completed；失败、阻塞、取消须写 reason。完成由服务端按该步骤运行期间成功的工具调用确认，没有版本号和证据参数。步骤不能代替实际工作，也不要在正文里复述步骤列表。最终答复时仍未收口的步骤由系统结算，无需为此额外调用。",
+            );
         }
         let position = messages
             .iter()
@@ -897,23 +902,6 @@ fn run_conversation_loop_inner(
             && session_store
                 .active_plan_for_execution_owner(session_id, task_id.as_str())
                 .is_some()
-    };
-    let execution_steps_unfinished = || -> Result<bool, String> {
-        let Some(turn_id) = expected_turn_id.as_deref() else {
-            return Ok(false);
-        };
-        let steps = session_store
-            .execution_steps_for_task(session_id, turn_id, task_id)
-            .map_err(|error| error.to_string())?;
-        Ok(steps.is_some_and(|steps| {
-            steps.steps.iter().any(|s| {
-                matches!(
-                    s.status,
-                    magi_session_store::execution_steps::ExecutionStepStatus::Pending
-                        | magi_session_store::execution_steps::ExecutionStepStatus::Running
-                )
-            })
-        }))
     };
     let current_access_profile = task
         .policy_snapshot
@@ -2854,8 +2842,6 @@ fn run_conversation_loop_inner(
                 agent_coordination_recovery_prompt(task, task_store, &tool_call_records)
             {
                 Some(recovery_prompt)
-            } else if execution_steps_unfinished().unwrap_or(true) {
-                Some("执行步骤尚未收口。请继续实际工作并调用 update_execution_steps 更新当前 revision；完成必须引用真实成功工具的 itemId/toolCallId。确实受阻或不再执行的步骤应填写 blocked/canceled 和 reason，不得虚报完成。".into())
             } else if owns_active_plan() {
                 plan_store.render_execution_follow_up_prompt()
             } else {
@@ -3694,16 +3680,8 @@ fn run_conversation_loop_inner(
         return (TaskOutcome::Failed { error }, context_summary);
     }
 
-    if execution_steps_unfinished().unwrap_or(true) {
-        let error = task_failure_with_error_item(
-            turn_writeback_context,
-            "执行步骤在完成纠正后仍未收口，任务已停止；未执行步骤不会标记完成。",
-            last_stream_item_id.as_deref(),
-            None,
-            None,
-        );
-        return (TaskOutcome::Failed { error }, context_summary);
-    }
+    // 步骤只是进度展示：纠正后仍未收口时不判任务失败，Turn 终态结算会把未完成步骤标为未确认，
+    // 不会伪造完成。
     let output_refs = vec![build_output_content(
         tool_call_records,
         final_content.clone(),

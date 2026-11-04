@@ -1136,12 +1136,8 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
   {#if activeTab && activeTab.kind === 'code'}
     <div class="right-pane-subbar">
       <div class="right-pane-path" title={activeDisplayFilePath}><FileName name={displayPath} /></div>
-      {#if activeFilePreviewQuery && !activeCodePayload?.imageDataUrl}
-        <a class="right-pane-document-icon-action" href={agentUrl('/api/files/download', activeFilePreviewQuery)}
-          download title={i18n.t('web.fileDownload')} aria-label={i18n.t('web.fileDownload')}>{i18n.t('web.fileDownload')}</a>
-      {/if}
-      {#if documentFile && !hasDiff && !previewLoading && !previewError && !wordFile && !binaryFile && !largeTextFile && !symlinkFile && !specialFile && (htmlFile || hasContent)}
-        <div class="right-pane-document-actions">
+      <div class="right-pane-document-actions">
+        {#if documentFile && !hasDiff && !previewLoading && !previewError && !wordFile && !binaryFile && !largeTextFile && !symlinkFile && !specialFile && (htmlFile || hasContent)}
           {#if markdownFile}
             <div class="right-pane-document-modes" role="tablist" aria-label={i18n.t('web.filePreviewTitle')}>
               <button
@@ -1164,15 +1160,19 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
           {:else if htmlFile && canCreateBrowserPane}
             <button
               type="button"
-              class="right-pane-document-icon-action"
+              class="btn-icon btn-icon--md"
               onclick={() => void openHtmlInMagiBrowser()}
               disabled={openingHtmlInBrowser}
               title={i18n.t('web.filePreviewOpenBrowser')}
               aria-label={i18n.t('web.filePreviewOpenBrowser')}
-            ><Icon name="globe" size={13} /></button>
+            ><Icon name="globe" size={16} /></button>
           {/if}
-        </div>
-      {/if}
+        {/if}
+        {#if activeFilePreviewQuery && !activeCodePayload?.imageDataUrl}
+          <a class="btn-icon btn-icon--md" href={agentUrl('/api/files/download', activeFilePreviewQuery)}
+            download title={i18n.t('web.fileDownload')} aria-label={i18n.t('web.fileDownload')}><Icon name="download" size={16} /></a>
+        {/if}
+      </div>
     </div>
   {/if}
 
@@ -1707,24 +1707,12 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     color: var(--foreground);
   }
 
-  .right-pane-document-icon-action {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 26px;
-    height: 26px;
-    padding: 0;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: background var(--transition-fast), color var(--transition-fast);
-  }
-
-  .right-pane-document-icon-action:hover {
-    background: color-mix(in srgb, var(--surface-selected) 72%, transparent);
-    color: var(--foreground);
+  @media (hover: none), (pointer: coarse) {
+    .right-pane-document-actions { gap: var(--space-2); }
+    .right-pane-document-actions :global(.btn-icon) {
+      min-inline-size: 44px;
+      min-block-size: 44px;
+    }
   }
 
   /* ============ Body ============ */

@@ -4,7 +4,7 @@
   import type { CanonicalTurnItem } from '../shared/protocol/canonical-turn';
   import type { FilePreviewScope } from '../lib/file-reference';
   import type { IconName } from '../lib/icons';
-  import { executionStepEvidence } from '../lib/execution-steps';
+  import { currentExecutionStep, executionStepEvidence } from '../lib/execution-steps';
   import { turnStoreState } from '../stores/turn-store.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { getAgentMessageItem } from '../web/agent-api';
@@ -16,12 +16,17 @@
   import MarkdownContent from './MarkdownContent.svelte';
   import { openAgentTab } from '../stores/right-pane.svelte';
 
-  interface Props { snapshot: ExecutionSteps; sessionId: string; filePreviewScope?: FilePreviewScope; }
-  let { snapshot, sessionId, filePreviewScope }: Props = $props();
+  /** pinned：执行期间置底悬浮在消息区下方；startExpanded 决定悬浮条首次是否展开（详细模式展开，摘要模式收成一行）。 */
+  interface Props { snapshot: ExecutionSteps; sessionId: string; filePreviewScope?: FilePreviewScope; pinned?: boolean; startExpanded?: boolean; }
+  let { snapshot, sessionId, filePreviewScope, pinned = false, startExpanded = false }: Props = $props();
   const turn = $derived(turnStoreState.reducer.turns.find((turn) => turn.turnId === snapshot.turnId && turn.sessionId === sessionId));
   const completed = $derived(snapshot.steps.filter((step) => step.status === 'completed').length);
   const live = $derived(snapshot.steps.some((step) => step.status === 'running' || step.status === 'pending'));
-  let expanded = $state(untrack(() => snapshot.steps.some((step) => step.status === 'running' || step.status === 'pending' || step.status === 'blocked')));
+  const attention = $derived(snapshot.steps.some((step) => step.status === 'blocked' || step.status === 'failed'));
+  const currentStep = $derived(currentExecutionStep(snapshot));
+  let expanded = $state(untrack(() => pinned
+    ? startExpanded || snapshot.steps.some((step) => step.status === 'blocked' || step.status === 'failed')
+    : snapshot.steps.some((step) => step.status === 'running' || step.status === 'pending' || step.status === 'blocked')));
   let manual = false;
   let wasLive = $state(untrack(() => live));
   let selected = $state<Record<string, boolean>>({});
@@ -29,6 +34,8 @@
   let loading = $state('');
   let error = $state('');
   $effect(() => { if (!manual && wasLive && !live) expanded = false; wasLive = live; });
+  // 置底期间出现受阻或失败的步骤需要用户处理，自动展开；用户手动选择后不再覆盖。
+  $effect(() => { if (pinned && !manual && attention) expanded = true; });
   const contentId = $props.id();
   const overallStatus = $derived(snapshot.steps.some((step) => step.status === 'failed') ? 'error' : snapshot.steps.some((step) => step.status === 'blocked') ? 'pending' : live ? 'running' : snapshot.steps.some((step) => step.status === 'canceled') ? 'cancelled' : 'success');
   const label = (status: ExecutionStepStatus) => i18n.t(`executionSteps.status.${status}`);
@@ -58,11 +65,13 @@
   }
 </script>
 
-<section class="message-card execution-steps" data-testid="execution-steps" aria-label={i18n.t('executionSteps.title')}>
+<section class="message-card execution-steps" class:pinned data-testid={pinned ? 'execution-steps-pinned' : 'execution-steps'} aria-label={i18n.t('executionSteps.title')}>
   <button class="execution-steps-header" type="button" aria-expanded={expanded} aria-controls={contentId} onclick={() => { manual = true; expanded = !expanded; }}>
     <span class="execution-steps-title"><Icon name="list" size={14} /> {i18n.t('executionSteps.title')}</span>
+    {#if pinned && !expanded && currentStep}<span class="execution-steps-current">{currentStep.title}</span>{/if}
     <ToolCardMeta status={overallStatus} label={i18n.t(`terminalSession.status.${overallStatus}`)} {expanded}><span class="execution-steps-count">{completed} / {snapshot.steps.length}</span></ToolCardMeta>
   </button>
+  {#if pinned && currentStep}<span class="sr-only" role="status" aria-live="polite">{i18n.t('executionSteps.current', { title: currentStep.title })}</span>{/if}
   <Disclosure {expanded}>
     <ol id={contentId}>
       {#each snapshot.steps as step (step.stepId)}
@@ -91,6 +100,9 @@
 </section>
 <style>
   .execution-steps { margin: 8px 0 12px; padding: 0; }
+  .execution-steps.pinned { margin: 0; }
+  .execution-steps.pinned ol { max-height: min(40vh, 320px); overflow-y: auto; margin-top: 0; padding-top: 6px; }
+  .execution-steps-current { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground-muted); font-size: 12px; }
   .execution-steps-header { border:0; background:none; width:100%; padding:9px var(--tool-card-padding); min-height:42px; display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--foreground-muted); font-size:12px; cursor:pointer; text-align:left; }
   .execution-steps-title { display:flex; gap:6px; align-items:center; color:var(--foreground); font-weight:var(--font-semibold); }
   .execution-steps-count { display:flex; align-items:center; gap:8px; font-variant-numeric:tabular-nums; }

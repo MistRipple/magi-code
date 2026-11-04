@@ -16,6 +16,11 @@ const PRESENTATION_ROLES = new Set<ConversationPresentationRole>([
   'final',
 ]);
 
+/** 会话级来源已有固定展示；canonical 活动段的来源记录不再重复作为聊天正文。 */
+export function isSessionProvenanceMessage(message: Message): boolean {
+  return message.metadata?.noticeKind === 'external_client';
+}
+
 const ARTIFACT_TOOL_NAMES = new Set([
   'diagram_render',
   'image_generate',

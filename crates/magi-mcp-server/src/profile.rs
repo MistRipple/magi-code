@@ -23,8 +23,20 @@ pub enum ApprovalMode {
     /// 默认每次 MCP 工具调用都在 Magi 中询问。
     #[default]
     Ask,
+    /// 自动允许普通读写；命令、破坏性及无法判断副作用的操作仍需确认。
+    ReadWrite,
     /// 自动允许所有 MCP 工具调用。
     Always,
+}
+
+impl ApprovalMode {
+    pub fn requires_approval(self, class: ToolClass) -> bool {
+        match self {
+            Self::Ask => true,
+            Self::ReadWrite => matches!(class, ToolClass::Destructive | ToolClass::Exec),
+            Self::Always => false,
+        }
+    }
 }
 
 /// 工具的风险类别。
@@ -34,9 +46,9 @@ pub enum ToolClass {
     Read,
     /// 创建 / 修改。
     Write,
-    /// 删除、覆盖式操作、对外推送等：永远逐次确认。
+    /// 删除、覆盖式操作、对外推送或无法判断副作用的操作。
     Destructive,
-    /// 执行命令：永远逐次确认。
+    /// 执行命令。
     Exec,
 }
 

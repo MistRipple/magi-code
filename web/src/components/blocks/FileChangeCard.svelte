@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
   import type { ConversationPresentationRole } from '../../lib/conversation-presentation';
   import FileName from '../FileName.svelte';
   import Disclosure from '../Disclosure.svelte';
@@ -21,11 +20,11 @@
     filePreviewScope?: FilePreviewScope;
   }
 
-  let { block, filePreviewScope = undefined, presentationRole = 'process' }: Props = $props();
+  let { block, filePreviewScope = undefined }: Props = $props();
   const change = $derived(block.fileChange);
 
-  // Artifact cards stay visible in both modes; later updates never replace a manual choice.
-  let collapsed = $state(untrack(() => presentationRole !== 'artifact'));
+  // 文件变更保留可见摘要，diff 默认折叠；后续更新不覆盖用户的手动选择。
+  let collapsed = $state(true);
   const contentId = $props.id();
 
   function toggle() {

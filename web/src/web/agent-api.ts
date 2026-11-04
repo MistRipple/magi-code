@@ -3854,7 +3854,7 @@ export async function revertAgentExecutionGroupChanges(
 
 // ── Magi MCP 服务（对外暴露 Magi 工具的标准 MCP 入口）─────────────────────────
 
-export type McpServerApprovalMode = 'ask' | 'always';
+export type McpServerApprovalMode = 'ask' | 'read_write' | 'always';
 
 export interface McpServerToken {
   tokenId: string;
@@ -3865,7 +3865,7 @@ export interface McpServerToken {
   defaultSourceFolderId: string | null;
   workspaceAvailable: boolean;
   approvalMode: McpServerApprovalMode;
-  attribution: 'external';
+  attribution: 'external' | 'conversation';
   /** 是否允许经公网隧道使用。 */
   network: boolean;
   createdAtMs: number;
@@ -3921,8 +3921,27 @@ export interface McpServerStatus {
   tokens: McpServerToken[];
 }
 
+export interface McpDirectoryRequest {
+  sessionId: string;
+  clientName: string;
+  conversationId: string;
+  title: string;
+  requestedAtMs: number;
+}
+
+export function listMcpDirectoryRequests(): Promise<McpDirectoryRequest[]> {
+  return mcpServerJson('/api/mcp-server/directory-requests', 'list MCP directory requests');
+}
+
+export async function resolveMcpDirectoryRequest(sessionId: string, directory: { workspaceId: string; sourceFolderId: string } | null): Promise<void> {
+  await mcpServerJson(`/api/mcp-server/directory-requests/${encodeURIComponent(sessionId)}`, 'select MCP conversation directory', {
+    method: 'POST', body: directory ?? { workspaceId: null, sourceFolderId: null },
+  });
+}
+
 export interface McpServerCreateTokenRequest {
   clientName: string;
+  attribution?: 'external' | 'conversation';
   workspaceId: string;
   sourceFolderIds?: string[];
   sourceFolderId?: string;
@@ -3964,6 +3983,7 @@ export interface McpServerConfigSnippets {
 
 export interface McpServerApproval {
   approvalId: string;
+  sessionId: string;
   tokenId: string;
   clientName: string;
   tokenPrefix: string;
@@ -3977,6 +3997,7 @@ export interface McpServerApproval {
 }
 
 export interface McpServerAuditEntry {
+  sessionId: string | null;
   tokenId: string;
   clientName: string;
   workspaceId: string;
@@ -4004,6 +4025,24 @@ async function mcpServerJson<T>(
 
 export function getMcpServerStatus(): Promise<McpServerStatus> {
   return mcpServerJson('/api/mcp-server/status', 'load mcp server status');
+}
+
+export interface McpOAuthRequest {
+  requestId: string;
+  clientName: string;
+  redirectUri: string;
+  resource: string;
+  expiresAtMs: number;
+}
+
+export function listMcpOAuthRequests(): Promise<McpOAuthRequest[]> {
+  return mcpServerJson('/api/mcp-server/oauth/requests', 'list MCP OAuth requests');
+}
+
+export function resolveMcpOAuthRequest(requestId: string, tokenId: string | null): Promise<{ ok: boolean }> {
+  return mcpServerJson(`/api/mcp-server/oauth/requests/${encodeURIComponent(requestId)}`, 'resolve MCP OAuth request', {
+    method: 'POST', body: { tokenId },
+  });
 }
 
 export function setMcpServerEnabled(enabled: boolean): Promise<McpServerStatus> {
@@ -4175,6 +4214,7 @@ export function listMcpServerAudit(
 
 /** 外部 MCP 客户端（一个令牌）的外部会话概要；会话本身是普通会话，调用过程在它的时间线里。 */
 export interface McpExternalSession {
+  title?: string | null;
   tokenId: string;
   sessionId: string;
   clientName: string;

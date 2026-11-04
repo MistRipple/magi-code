@@ -3061,12 +3061,14 @@ pub struct ExecutionStepInput {
     pub step_id: String,
     pub title: String,
     pub status: ExecutionStepStatus,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "dependsOn")]
-    pub depends_on: Vec<String>,
-    #[serde(rename = "evidenceRefs")]
-    pub evidence_refs: Vec<String>,
+    pub depends_on: Option<Vec<String>>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "taskIds")]
-    pub task_ids: Vec<String>,
+    pub task_ids: Option<Vec<String>>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -3109,8 +3111,6 @@ pub struct ExecutionStep {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateExecutionStepsParams {
-    #[serde(rename = "expectedRevision")]
-    pub expected_revision: u64,
     pub steps: Vec<ExecutionStepInput>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]

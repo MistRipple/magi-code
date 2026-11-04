@@ -6,6 +6,24 @@ await withGoldenViteServer(async (server) => {
   const disclosure = await server.ssrLoadModule('/src/lib/conversation-disclosure.ts');
   const translate = (key) => key;
 
+  // 执行步骤置底：只选当前运行轮次里最新且仍有活动步骤的快照。
+  const stepsLib = await server.ssrLoadModule('/src/lib/execution-steps.ts');
+  const snap = (turnId, statuses) => ({
+    executionId: `exec-${turnId}`, turnId, taskId: 't', revision: 1, createdAt: 1, updatedAt: 1,
+    steps: statuses.map((status, i) => ({ stepId: `s${i}`, title: `步骤${i}`, status, dependsOn: [], evidenceRefs: [], taskIds: [] })),
+  });
+  const stepItem = (key, snapshot) => ({ key, message: { metadata: { executionSteps: snapshot } } });
+  const plain = { key: 'plain', message: { metadata: {} } };
+  const live = stepItem('live', snap('turn-2', ['completed', 'running', 'pending']));
+  assert.equal(stepsLib.selectPinnedExecutionSteps([plain, live, plain], 'turn-2')?.item.key, 'live');
+  assert.equal(stepsLib.selectPinnedExecutionSteps([live], '')?.item.key, 'live', '无法确定运行轮次时仍按活动步骤置底');
+  assert.equal(stepsLib.selectPinnedExecutionSteps([live], 'turn-3'), null, '其他轮次的计划不置底');
+  const done = stepItem('done', snap('turn-2', ['completed', 'completed']));
+  assert.equal(stepsLib.selectPinnedExecutionSteps([live, done], 'turn-2'), null, '最新快照已终结时不回选旧计划');
+  assert.equal(stepsLib.selectPinnedExecutionSteps([stepItem('blocked', snap('turn-2', ['completed', 'blocked']))], 'turn-2')?.item.key, 'blocked');
+  assert.equal(stepsLib.selectPinnedExecutionSteps([stepItem('failed', snap('turn-2', ['completed', 'failed']))], 'turn-2'), null, '失败且无活动步骤时回到原位');
+  assert.equal(stepsLib.currentExecutionStep(snap('t', ['completed', 'pending', 'running']))?.stepId, 's2');
+
   const message = (overrides) => ({
     id: 'm',
     role: 'assistant',
@@ -89,6 +107,45 @@ await withGoldenViteServer(async (server) => {
       blocks: [{ id: `${key}-b`, type: 'tool_call', toolCall: { id: key, name, arguments: args, status } }],
     }),
   });
+  // MCP 来源只在会话底部展示，逐轮开场不进入正文、摘要阶段或轮次导航。
+  // 对比实际 MessageList 渲染，确保过滤来源后工具、错误与待处理交互保持原样。
+  {
+    const { render } = await server.ssrLoadModule('svelte/server');
+    const { default: MessageList } = await server.ssrLoadModule('/src/components/MessageList.svelte');
+    const { messagesState } = await server.ssrLoadModule('/src/stores/messages.svelte.ts');
+    const previousSettings = messagesState.settingsBootstrapSnapshot;
+    const opener = { key: 'external-opener', message: message({
+      id: 'external-opener', content: '来自 Web Agent 验收 的外部调用', source: 'system',
+      metadata: { noticeKind: 'external_client', clientName: 'Web Agent 验收', turnId: 'external-turn-1' },
+    }) };
+    const failed = toolItem('external-failed', 'file_read', { path: 'missing.ts' }, 'error');
+    Object.assign(failed.message, { id: failed.key, source: 'orchestrator' });
+    failed.message.metadata.turnId = 'external-turn-1';
+    failed.message.blocks[0].toolCall.error = '验收文件不存在';
+    const approval = { key: 'external-approval', message: message({
+      id: 'external-approval', source: 'system', type: 'system-notice', content: '等待目录授权',
+      metadata: { noticeKind: 'directory_approval', conversationPresentationRole: 'attention', turnId: 'external-turn-1' },
+    }) };
+    const output = { key: 'external-final', message: message({
+      id: 'external-final', source: 'orchestrator', content: '请先确认目录。',
+      metadata: { assistantOutputKind: 'final', turnId: 'external-turn-1' },
+    }) };
+    const items = [failed, approval, output];
+    const listHtml = (renderItems) => render(MessageList, { props: { renderItems } }).body;
+    try {
+      for (const mode of ['original', 'summary']) {
+        messagesState.settingsBootstrapSnapshot = { runtimeSettings: { conversationDisplayMode: mode } };
+        const withoutOpener = listHtml(items);
+        const withOpener = listHtml([opener, ...items]);
+        assert.equal(withOpener, withoutOpener, `${mode} 来源开场不产生消息、空白或阶段，真实内容保持原样`);
+        assert.doesNotMatch(withOpener, /Web Agent 验收/u);
+        assert.match(withOpener, /等待目录授权/u, `${mode} 待处理提示仍可见`);
+        assert.match(withOpener, /请先确认目录/u, `${mode} 最终说明仍可见`);
+      }
+    } finally {
+      messagesState.settingsBootstrapSnapshot = previousSettings;
+    }
+  }
   assert.equal(disclosure.resolveConversationToolGroupStatus([toolItem('a', 'web_fetch', {}, 'running')]), 'running');
   assert.equal(disclosure.resolveConversationToolGroupStatus([toolItem('a', 'web_fetch', {}, 'success'), toolItem('b', 'web_fetch', {}, 'error')]), 'error');
   assert.equal(disclosure.resolveConversationToolGroupStatus([toolItem('a', 'web_fetch', {}, 'unconfirmed')]), 'unconfirmed');

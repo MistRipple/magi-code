@@ -988,7 +988,7 @@ fn shell_exec_command_path_accesses(
         return Vec::new();
     }
 
-    let mut paths = shell_redirection_write_paths(&tokens, workspace_root_path);
+    let mut paths = shell_redirection_path_accesses(&tokens, workspace_root_path);
     for segment in shell_command_segments(&tokens) {
         paths.extend(shell_segment_path_accesses(
             segment,
@@ -1126,6 +1126,11 @@ fn shell_command_tokens(command: &str, dialect: ShellDialect) -> Vec<ShellToken>
             continue;
         }
         if let Some(active_quote) = quote {
+            if active_quote == '"' && ch == '$' && chars.peek() == Some(&'(') {
+                word.push(ch);
+                consume_shell_substitution(&mut chars, &mut word);
+                continue;
+            }
             if ch == active_quote {
                 quote = None;
             } else {
@@ -1135,6 +1140,24 @@ fn shell_command_tokens(command: &str, dialect: ShellDialect) -> Vec<ShellToken>
         }
         if matches!(ch, '\'' | '"') {
             quote = Some(ch);
+            continue;
+        }
+        // 展开表达式由 shell 求值；保持为同一个词，不能把其中的空格/分号拆成
+        // 顶层命令并把 `-d)` 等片段误报为缺失的可执行文件。
+        if ch == '$' && chars.peek() == Some(&'(') {
+            word.push(ch);
+            consume_shell_substitution(&mut chars, &mut word);
+            continue;
+        }
+        if dialect == ShellDialect::Posix && matches!(ch, '(' | ')') {
+            if (ch == '(' && !word.is_empty() && chars.peek() == Some(&')'))
+                || (ch == ')' && word.ends_with('('))
+            {
+                word.push(ch); // 保留 name() 函数声明。
+            } else {
+                push_shell_word(&mut tokens, &mut word);
+                tokens.push(ShellToken::Operator(ch.to_string()));
+            }
             continue;
         }
         if ch == '\n' {
@@ -1183,13 +1206,46 @@ fn shell_command_tokens(command: &str, dialect: ShellDialect) -> Vec<ShellToken>
     tokens
 }
 
+fn consume_shell_substitution(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    word: &mut String,
+) {
+    // 调用时 '(' 尚未消耗。只跟踪配对/引用，不执行展开，也不推测展开结果。
+    chars.next();
+    word.push('(');
+    let mut depth = 1usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in chars.by_ref() {
+        word.push(ch);
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            }
+        } else if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+}
+
 fn push_shell_word(tokens: &mut Vec<ShellToken>, word: &mut String) {
     if !word.is_empty() {
         tokens.push(ShellToken::Word(std::mem::take(word)));
     }
 }
 
-fn shell_redirection_write_paths(
+fn shell_redirection_path_accesses(
     tokens: &[ShellToken],
     workspace_root_path: Option<&Path>,
 ) -> Vec<ToolPathAccessRequest> {
@@ -1198,15 +1254,20 @@ fn shell_redirection_write_paths(
         let ShellToken::Operator(operator) = token else {
             continue;
         };
-        if !matches!(operator.as_str(), ">" | ">>" | ">|" | "&>" | "&>>") {
+        if !matches!(operator.as_str(), ">" | ">>" | ">|" | "&>" | "&>>" | "<") {
             continue;
         }
         let Some(ShellToken::Word(target)) = tokens.get(index + 1) else {
             continue;
         };
-        if target == "/dev/null"
+        let kind = if operator == "<" {
+            magi_permissions::PathAccessKind::Read
+        } else {
+            magi_permissions::PathAccessKind::Write
+        };
+        if (kind == magi_permissions::PathAccessKind::Write && (target == "/dev/null"
             || target.eq_ignore_ascii_case("NUL")
-            || target.eq_ignore_ascii_case("$null")
+            || target.eq_ignore_ascii_case("$null")))
             || target.starts_with('&')
             || target == "-"
         {
@@ -1215,7 +1276,7 @@ fn shell_redirection_write_paths(
         push_shell_path(
             &mut paths,
             target,
-            magi_permissions::PathAccessKind::Write,
+            kind,
             workspace_root_path,
         );
     }
@@ -1244,13 +1305,34 @@ fn shell_command_segments(tokens: &[ShellToken]) -> Vec<&[ShellToken]> {
 }
 
 fn shell_segment_words(segment: &[ShellToken]) -> Vec<&str> {
-    segment
-        .iter()
-        .filter_map(|token| match token {
-            ShellToken::Word(word) => Some(word.as_str()),
-            ShellToken::Operator(_) => None,
-        })
-        .collect()
+    let mut words = Vec::new();
+    let mut index = 0;
+    while index < segment.len() {
+        match &segment[index] {
+            ShellToken::Operator(operator)
+                if matches!(operator.as_str(), ">" | ">>" | ">|" | "<" | "<<" | "&>" | "&>>") =>
+            {
+                // 重定向目标由专门的路径扫描处理，不是命令参数。否则 /dev/null
+                // 会在安全输出目标检查后再次被当作普通工作区文件，或污染 cp/mv 的目标。
+                index += 1;
+                if matches!(segment.get(index), Some(ShellToken::Operator(op)) if op == "&") {
+                    index += 1; // 2>&1 / <&0 的文件描述符复制。
+                }
+                index += usize::from(index < segment.len());
+                continue;
+            }
+            ShellToken::Word(word) => {
+                let is_fd = word.bytes().all(|ch| ch.is_ascii_digit())
+                    && matches!(segment.get(index + 1), Some(ShellToken::Operator(op)) if matches!(op.as_str(), ">" | ">>" | ">|" | "<"));
+                if !is_fd {
+                    words.push(word.as_str());
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    words
 }
 
 fn shell_declared_function<'a>(words: &'a [&str]) -> Option<&'a str> {
@@ -1393,13 +1475,7 @@ fn shell_segment_path_accesses(
     workspace_root_path: Option<&Path>,
     shell_kind: magi_permissions::PathAccessKind,
 ) -> Vec<ToolPathAccessRequest> {
-    let words = segment
-        .iter()
-        .filter_map(|token| match token {
-            ShellToken::Word(word) => Some(word.as_str()),
-            ShellToken::Operator(_) => None,
-        })
-        .collect::<Vec<_>>();
+    let words = shell_segment_words(segment);
     let Some(command_index) = shell_command_word_index(&words) else {
         return Vec::new();
     };
@@ -1661,6 +1737,42 @@ fn normalize_path_for_lock(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod shell_path_parser_tests {
     use super::{shell_command_required_executables, shell_word_looks_like_path};
+
+    #[test]
+    fn shell_dependency_scan_keeps_substitutions_and_subshells_out_of_program_names() {
+        for command in [
+            "D=$(mktemp -d); node --version",
+            "D=$(printf '%s' \"a b\"); (node --version; printf ok) > result.txt 2>&1",
+            "(node --version)",
+            "echo \"cwd: $(pwd)\"; node --version",
+        ] {
+            assert_eq!(shell_command_required_executables(command, "/bin/zsh"), vec!["node"], "{command}");
+        }
+        assert!(shell_command_required_executables("run() { node --version; }; run", "/bin/zsh").is_empty());
+    }
+
+    #[test]
+    fn shell_redirection_paths_are_not_reinterpreted_as_command_operands() {
+        use magi_permissions::PathAccessKind::{Read, Write};
+        use std::path::Path;
+        let root = Path::new("/workspace");
+        let paths = |command: &str| super::tool_path_access_requests(
+            "shell_exec", &serde_json::json!({"command":command, "access_mode":"read_only"}).to_string(),
+            Some(root), magi_core::AccessProfile::Restricted,
+        );
+        for command in ["printf ok > /dev/null", "node --version 2>/dev/null", "printf ok 2>&1"] {
+            assert!(paths(command).iter().all(|request| request.absolute_path == root), "{command}");
+        }
+        // 普通路径和输入重定向仍检查权限；不能全局豁免 /dev/null 或工作区外文件。
+        for command in ["cat /dev/null", "cat < /dev/null"] {
+            assert!(paths(command).iter().any(|request| request.absolute_path == Path::new("/dev/null") && request.kind == Read));
+        }
+        assert!(paths("printf ok > /outside/file").iter().any(|request| request.absolute_path == Path::new("/outside/file") && request.kind == Write));
+        let copy = paths("cp src.txt dst.txt > log.txt");
+        assert!(copy.iter().any(|request| request.absolute_path == root.join("src.txt") && request.kind == Read));
+        assert!(copy.iter().any(|request| request.absolute_path == root.join("dst.txt") && request.kind == Write));
+        assert!(copy.iter().any(|request| request.absolute_path == root.join("log.txt") && request.kind == Write));
+    }
 
     #[test]
     fn shell_dependency_scan_handles_comments_pipelines_and_command_probes() {

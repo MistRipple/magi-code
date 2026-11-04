@@ -241,6 +241,15 @@ impl ExternalTurns {
             .filter(|session_id| {
                 token_id.is_none_or(|token_id| {
                     *session_id == crate::mcp_service::external_session_id(token_id)
+                        || state
+                            .mcp_service
+                            .conversations
+                            .records()
+                            .iter()
+                            .any(|record| {
+                                record.token_id == token_id
+                                    && record.session_id == session_id.as_str()
+                            })
                 })
             })
             .collect::<Vec<_>>();
@@ -294,7 +303,7 @@ impl ExternalTurns {
 
 /// 通知界面某个外部会话有变化（有新调用、调用结束）：侧栏据此刷新入口。
 /// 事件对所有事件流可见（不管当前打开的是哪个工作区）；调用本身的内容走会话的 canonical 事件。
-fn publish_changed(state: &ApiState, session_id: &SessionId) {
+pub(crate) fn publish_changed(state: &ApiState, session_id: &SessionId) {
     let workspace_id = state
         .session_store
         .session(session_id)

@@ -64,7 +64,8 @@ impl SessionStore {
                 .iter()
                 .find(|session| session.session_id == job.session_id)
                 .is_none_or(|session| {
-                    session.workspace_id.as_deref()
+                    (job.task_id.is_none() && session.kind != crate::SessionKind::ExternalTool)
+                        || session.workspace_id.as_deref()
                         != job
                             .workspace_id
                             .as_ref()
@@ -88,7 +89,7 @@ impl SessionStore {
                 .worker
                 .as_ref()
                 .and_then(|worker| worker.task_id.as_ref())
-                != Some(&job.task_id)
+                != job.task_id.as_ref()
                 || item.tool.as_ref().is_none_or(|tool| {
                     tool.call_id != job.tool_call_id || tool.name != "shell_exec"
                 })
@@ -222,12 +223,19 @@ impl BackgroundJobJournal for SessionJobJournal {
             .session_id
             .as_ref()
             .ok_or("持久 Job 需要 Session 身份")?;
-        let task = context.task_id.as_ref().ok_or("持久 Job 需要 Task 身份")?;
+        let task = context.task_id.as_ref();
         if !self.output_root.is_absolute() {
             return Err("Job 输出根目录必须为绝对路径".into());
         }
         let job = {
             let state = self.store.state.read().expect("session state lock");
+            let owner = state.sessions.iter().find(|owner| &owner.session_id == session)
+                .ok_or("Job 所属 Session 不存在")?;
+            if task.is_none() && (owner.kind != crate::SessionKind::ExternalTool
+                || context.caller_scope != magi_tool_runtime::ToolCallerScope::SessionMainline)
+            {
+                return Err("原生执行的持久 Job 需要 Task 身份".into());
+            }
             let (turn, item) = state
                 .canonical_turns
                 .iter()
@@ -241,7 +249,7 @@ impl BackgroundJobJournal for SessionJobJournal {
                             item.worker
                                 .as_ref()
                                 .and_then(|worker| worker.task_id.as_ref())
-                                == Some(task)
+                                == task
                                 && item.tool.as_ref().is_some_and(|tool| {
                                     tool.call_id == tool_call_id && tool.name == "shell_exec"
                                 })
@@ -258,7 +266,7 @@ impl BackgroundJobJournal for SessionJobJournal {
                 job_id: id,
                 session_id: session.clone(),
                 workspace_id: context.workspace_id.clone(),
-                task_id: task.clone(),
+                task_id: task.cloned(),
                 turn_id: turn.turn_id.clone(),
                 item_id: item.item_id.clone(),
                 tool_call_id: tool_call_id.into(),

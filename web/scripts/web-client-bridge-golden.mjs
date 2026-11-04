@@ -97,6 +97,7 @@ let workspaceSessionIsRunning = false;
 let workspaceSessionsPayloadOverride = null;
 let pendingChangesRequestCount = 0;
 let pendingChangesPayloadOverride = null;
+let pendingChangesResponseGate = null;
 let queuedTurnPayloads = [];
 let interruptRequestCount = 0;
 let interruptResponseGate = null;
@@ -595,7 +596,7 @@ function installFetchStub() {
       const sessionId = parsed.searchParams.get('sessionId') || SESSION_ID;
       const workspaceId = parsed.searchParams.get('workspaceId') || WORKSPACE_ID;
       const workspacePath = parsed.searchParams.get('workspacePath') || WORKSPACE_PATH;
-      return jsonResponse({
+      const response = jsonResponse({
         generatedAt: Date.now() + pendingChangesRequestCount,
         sessionId,
         workspaceId,
@@ -606,6 +607,8 @@ function installFetchStub() {
           pendingCount: pendingChangesPayloadOverride?.length || 0,
         },
       });
+      if (pendingChangesResponseGate) await pendingChangesResponseGate.promise;
+      return response;
     }
     if (
       parsed.pathname === '/api/changes/approve'
@@ -2552,6 +2555,44 @@ await withGoldenViteServer(async (server) => {
   pendingChangesPayloadOverride = null;
 
   const editsBeforeLiveRefresh = structuredClone(messagesStore.messagesState.edits);
+  const mcpStream = FakeEventSource.instances.at(-1);
+  let mcpEventId = 0;
+  const settleMcpCall = (sessionId = SESSION_ID, workspaceId = WORKSPACE_ID, outcome = 'succeeded') => {
+    mcpStream.onmessage?.({ data: JSON.stringify({
+      event_id: `mcp-settled-${++mcpEventId}`, event_type: 'mcp.tool.call', category: 'domain',
+      occurred_at: Date.now(), sequence: 0, workspace_id: workspaceId,
+      payload: { session_id: sessionId, workspace_id: workspaceId, tool: 'magi.changes.revert', outcome },
+    }) });
+  };
+  const mcpRequestsBefore = pendingChangesRequestCount;
+  const mcpBootstrapBefore = bootstrapRequestCount;
+  const staleMcpChanges = deferred();
+  pendingChangesPayloadOverride = editsBeforeLiveRefresh;
+  pendingChangesResponseGate = staleMcpChanges;
+  settleMcpCall();
+  await waitFor(() => pendingChangesRequestCount === mcpRequestsBefore + 1,
+    'settled MCP call must refresh changes without opening the changes tab');
+  pendingChangesPayloadOverride = [];
+  settleMcpCall();
+  settleMcpCall();
+  pendingChangesResponseGate = null;
+  staleMcpChanges.resolve();
+  await waitFor(() => pendingChangesRequestCount === mcpRequestsBefore + 2
+    && messagesStore.messagesState.edits.length === 0,
+  'MCP mutations during an in-flight query must trigger one trailing refresh of the latest facts');
+  assert.equal(bootstrapRequestCount, mcpBootstrapBefore,
+    'MCP change refresh must not reload the whole session');
+  settleMcpCall('other-mcp-chat');
+  settleMcpCall(SESSION_ID, 'other-workspace');
+  settleMcpCall(SESSION_ID, WORKSPACE_ID, 'denied');
+  await Promise.resolve();
+  assert.equal(pendingChangesRequestCount, mcpRequestsBefore + 2,
+    'foreign sessions, foreign workspaces and pre-execution refusals must not refresh active changes');
+  pendingChangesPayloadOverride = editsBeforeLiveRefresh;
+  settleMcpCall();
+  await waitFor(() => messagesStore.messagesState.edits.length === 2,
+    'later MCP mutations must refresh after the previous invalidation has settled');
+  pendingChangesPayloadOverride = null;
   const currentChangesVersion = messagesStore.messagesState.appState?.pendingChangesStateVersion ?? 0;
   const foreignRefreshApplied = messagesStore.applyPendingChangesProjection({
     generatedAt: currentChangesVersion + 1,

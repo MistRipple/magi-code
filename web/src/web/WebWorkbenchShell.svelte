@@ -1188,7 +1188,7 @@ import {
   }
 
   function externalAwaitingCountForSession(session: McpExternalSession): number {
-    return externalApprovals.approvals.filter((approval) => approval.tokenId === session.tokenId).length;
+    return externalApprovals.approvals.filter((approval) => approval.sessionId === session.sessionId).length;
   }
 
   function currentSessionDirectoryEpoch(): string | null {
@@ -2068,6 +2068,15 @@ import {
     projectEditError = '';
   }
 
+  function projectFolderDisplayName(folder: { name: string; displayPath: string }): string {
+    return folder.name || folder.displayPath.split(/[\\/]/).filter(Boolean).at(-1) || '';
+  }
+
+  // 只有一个源文件夹时，项目名称可留空并沿用该文件夹名；多个文件夹必须显式命名。
+  const projectEffectiveName = $derived(
+    projectEditName.trim() || (projectEditFolders.length === 1 ? projectFolderDisplayName(projectEditFolders[0]) : ''),
+  );
+
   function closeProjectEditor(): void {
     if (workspaceActionPending) return;
     projectEditorOpen = false;
@@ -2096,15 +2105,15 @@ import {
   }
 
   async function saveProjectEditor(): Promise<void> {
-    if (!projectEditorOpen || workspaceActionPending || !projectEditFolders.length || !projectEditPrimary || !projectEditName.trim()) return;
+    if (!projectEditorOpen || workspaceActionPending || !projectEditFolders.length || !projectEditPrimary || !projectEffectiveName) return;
     workspaceActionPending = true;
     projectEditError = '';
     try {
       const members = projectEditFolders.map(({ sourceFolderId, path, name }) => ({ sourceFolderId, path, name }));
       const editing = projectEditWorkspace;
       const updated = editing
-        ? await updateAgentProject(editing, projectEditName, members, projectEditPrimary)
-        : await createAgentProject(projectEditName.trim(), members, projectEditPrimary);
+        ? await updateAgentProject(editing, projectEffectiveName, members, projectEditPrimary)
+        : await createAgentProject(projectEffectiveName, members, projectEditPrimary);
       workspaces = editing
         ? workspaces.map((workspace) => workspace.workspaceId === updated.workspaceId ? updated : workspace)
         : [...workspaces.filter((workspace) => workspace.workspaceId !== updated.workspaceId), updated];
@@ -3350,13 +3359,14 @@ import {
                                   data-token-id={externalSession.tokenId}
                                   data-session-id={externalSession.sessionId}
                                   data-session-updated-at={externalSession.lastActivityAtMs}
-                                  title={externalSession.clientName}
+                                  title={session.name === externalSession.clientName ? session.name : `${session.name} · ${externalSession.clientName}`}
+                                  aria-label={session.name === externalSession.clientName ? session.name : `${session.name} · ${externalSession.clientName}`}
                                   onclick={() => openExternalSessionIn(workspace, externalSession.sessionId)}
                                 >
                                   <span class="external-dot" class:running={externalSession.running > 0 && awaiting === 0} class:awaiting={awaiting > 0} aria-hidden="true">
                                     <Icon name="plug" size={12} />
                                   </span>
-                                  <span class="session-name">{externalSession.clientName}</span>
+                                  <span class="session-name">{session.name}</span>
                                   <span class="session-meta external-session-meta">
                                     {#if awaiting > 0}
                                       {i18n.t('externalSession.awaitingShort', { count: awaiting })}
@@ -3849,7 +3859,7 @@ import {
     <label class="workspace-dialog-field">
       <span class="project-name-control">
         <span class="project-name-icon"><Icon name="grid" size={18} /></span>
-        <input class="form-input" bind:value={projectEditName} aria-label={i18n.t('web.projectNameLabel')} placeholder={i18n.t('web.projectNameLabel')} required disabled={workspaceActionPending} />
+        <input class="form-input" bind:value={projectEditName} aria-label={i18n.t('web.projectNameLabel')} placeholder={projectEditFolders.length === 1 ? projectFolderDisplayName(projectEditFolders[0]) : i18n.t('web.projectNameLabel')} required={projectEditFolders.length !== 1} disabled={workspaceActionPending} />
       </span>
     </label>
     <div class="workspace-dialog-field">
@@ -3863,7 +3873,7 @@ import {
             <div class="workspace-source-folder-row">
               <span class="project-source-icon"><Icon name="folder" size={20} /></span>
               <div class="workspace-source-folder-copy">
-                <bdi class="workspace-source-folder-name">{folder.name || folder.displayPath.split(/[\\/]/).filter(Boolean).at(-1)}</bdi>
+                <bdi class="workspace-source-folder-name">{projectFolderDisplayName(folder)}</bdi>
                 <span class="workspace-source-folder-path" dir="ltr">{folder.displayPath}</span>
               </div>
               <button class="btn-icon btn-icon--sm btn-icon--danger" type="button"
@@ -3886,7 +3896,7 @@ import {
       <SelectField bind:value={projectEditPrimary} label={i18n.t('input.primarySourceFolder')}
         disabled={workspaceActionPending}
         options={[{ value: '', label: i18n.t('web.selectPrimarySourceFolder'), disabled: true }, ...projectEditFolders.map(folder => ({
-          value: folder.sourceFolderId, label: `${folder.name || folder.displayPath.split(/[\\/]/).filter(Boolean).at(-1)} · ${folder.displayPath}`,
+          value: folder.sourceFolderId, label: `${projectFolderDisplayName(folder)} · ${folder.displayPath}`,
         }))]} />
     </div>
     {#if !projectEditPrimary}<p class="settings-hint" role="status">{i18n.t('web.selectPrimarySourceFolder')}</p>{/if}
@@ -3901,7 +3911,7 @@ import {
   {/if}
   <button class="btn btn--secondary" type="button" onclick={closeProjectEditor} disabled={workspaceActionPending}>{i18n.t('web.folderPickerCancel')}</button>
   <button class="btn btn--primary" type="submit" form={projectEditorFormId}
-    disabled={workspaceActionPending || !projectEditPrimary || !projectEditFolders.length || !projectEditName.trim()}>
+    disabled={workspaceActionPending || !projectEditPrimary || !projectEditFolders.length || !projectEffectiveName}>
     {workspaceActionPending ? i18n.t('common.loading') : i18n.t(projectEditWorkspace ? 'web.saveWorkspaceChanges' : 'web.createProjectTitle')}
   </button>
 {/snippet}

@@ -207,6 +207,8 @@ const AUDIT_MAX_ENTRIES: usize = 2000;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AuditEntry {
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub token_id: String,
     pub client_name: String,
     pub workspace_id: String,
@@ -384,7 +386,9 @@ pub(crate) struct McpServiceRuntime {
     public_hosts: Arc<RwLock<Vec<String>>>,
     network_generation: Arc<AtomicU64>,
     path: Option<PathBuf>,
+    pub(crate) conversations: crate::mcp_sessions::McpConversations,
     tokens: Arc<TokenStore>,
+    pub(crate) oauth: Arc<magi_mcp_server::oauth::OAuthStore>,
     /// 令牌原文（token_id → 原文），与校验用的哈希分开存放在 `mcp-token-secrets.json`（0600），
     /// 只服务于「重新查看 / 复制」，不参与校验，也不进审计、日志和备份导出。
     secrets: Mutex<std::collections::HashMap<String, String>>,
@@ -412,7 +416,9 @@ impl McpServiceRuntime {
             public_hosts: Arc::new(RwLock::new(Vec::new())),
             network_generation: Arc::new(AtomicU64::new(0)),
             path: None,
+            conversations: Default::default(),
             tokens: Arc::new(TokenStore::new()),
+            oauth: Arc::new(Default::default()),
             secrets: Mutex::new(Default::default()),
             control: AsyncMutex::new(Control::default()),
             persist_lock: Mutex::new(()),
@@ -456,6 +462,9 @@ impl McpServiceRuntime {
         let direct = persisted.direct.clone();
         Self {
             audit,
+            oauth: Arc::new(magi_mcp_server::oauth::OAuthStore::load(
+                path.with_file_name("mcp-oauth.json"),
+            )),
             external_turns: ExternalTurns::new(),
             retention: Mutex::new(persisted.external),
             tunnel: QuickTunnelProvider::shared(),
@@ -466,6 +475,9 @@ impl McpServiceRuntime {
             tunnel_hosts: Arc::new(RwLock::new(Vec::new())),
             public_hosts: Arc::new(RwLock::new(Vec::new())),
             network_generation: Arc::new(AtomicU64::new(0)),
+            conversations: crate::mcp_sessions::McpConversations::load(
+                path.with_file_name("mcp-conversations.json"),
+            ),
             path: Some(path),
             tokens,
             secrets: Mutex::new(secrets),
@@ -795,6 +807,7 @@ impl McpServiceRuntime {
         let mut http_state =
             HttpState::new(server.clone(), self.tokens.clone(), HttpConfig::default());
         http_state.tunnel_hosts = self.tunnel_hosts.clone();
+        http_state.oauth = self.oauth.clone();
         http_state.public_hosts = self.public_hosts.clone();
         *self.public_hosts.write().expect("public hosts poisoned") = if direct.enabled {
             direct.public_hosts.clone()
@@ -1376,9 +1389,7 @@ impl McpServiceRuntime {
     }
 }
 
-/// 这次编辑有没有收紧该令牌的权限（关闭公网、缩短有效期）。收紧时挂起的审批按旧权限发起，
-/// 不能继续等；单纯放宽或改名不需要作废。授权方式不参与：开放模式从不产生审批，
-/// 询问模式下已挂起的审批仍可由用户处理。
+/// 收紧权限时，按旧权限发起的挂起审批作废；单纯放宽或改名不影响。
 fn narrows_access(before: &TokenRecord, after: &TokenRecord) -> bool {
     let network_narrowed = before.network && !after.network;
     let expiry_narrowed = match (before.expires_at_ms, after.expires_at_ms) {
@@ -1386,10 +1397,34 @@ fn narrows_access(before: &TokenRecord, after: &TokenRecord) -> bool {
         (Some(old), Some(new)) => new < old,
         _ => false,
     };
-    network_narrowed || expiry_narrowed
+    let approval_narrowed = [
+        magi_mcp_server::ToolClass::Read,
+        magi_mcp_server::ToolClass::Write,
+        magi_mcp_server::ToolClass::Destructive,
+        magi_mcp_server::ToolClass::Exec,
+    ]
+    .into_iter()
+    .any(|class| {
+        !before.approval_mode.requires_approval(class)
+            && after.approval_mode.requires_approval(class)
+    });
+    network_narrowed || expiry_narrowed || approval_narrowed
 }
 
 fn cancel_pending(state: &ApiState, token_id: &str) {
+    for conversation in state
+        .mcp_service
+        .conversations
+        .records()
+        .into_iter()
+        .filter(|record| record.token_id == token_id)
+    {
+        magi_conversation_runtime::external_approval::cancel_external_approvals(
+            state.conversation_registry.tool_approvals(),
+            &magi_core::SessionId::new(conversation.session_id),
+            token_id,
+        );
+    }
     cancel_external_approvals(
         state.conversation_registry.tool_approvals(),
         &external_session_id(token_id),
@@ -1411,7 +1446,7 @@ fn read_named_tunnel(path: &std::path::Path) -> Option<NamedTunnel> {
 }
 
 /// 用户私有权限的原子写：先写同目录临时文件再改名。
-fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1637,7 +1672,13 @@ mod tests {
         let state = state();
 
         let first = McpServiceRuntime::load(path.clone());
-        let issued = first.issue_token(request()).await.unwrap();
+        let issued = first
+            .issue_token(IssueTokenRequest {
+                approval_mode: ApprovalMode::ReadWrite,
+                ..request()
+            })
+            .await
+            .unwrap();
         let status = first.set_enabled(&state, true).await.unwrap();
         let port = status.port.unwrap();
         assert_eq!(port, expected_port);
@@ -1655,6 +1696,10 @@ mod tests {
 
         // 并行测试里其它用例可能恰好拿走了刚释放的端口；短暂重试，避免把端口竞态当成失败。
         let second = McpServiceRuntime::load(path);
+        assert_eq!(
+            second.list_tokens()[0].approval_mode,
+            ApprovalMode::ReadWrite
+        );
         for _ in 0..20 {
             second.start_if_enabled(&state).await;
             if second.status().await.running {
@@ -2007,6 +2052,12 @@ mod tests {
         let mut widened = before.clone();
         widened.approval_mode = ApprovalMode::Always;
         assert!(!narrows_access(&before, &widened), "放宽授权不取消挂起审批");
+        let mut read_write = before.clone();
+        read_write.approval_mode = ApprovalMode::ReadWrite;
+        assert!(!narrows_access(&before, &read_write));
+        assert!(!narrows_access(&read_write, &widened));
+        assert!(narrows_access(&widened, &read_write));
+        assert!(narrows_access(&read_write, &before));
         let mut offline = before.clone();
         offline.network = false;
         assert!(narrows_access(&before, &offline));
@@ -2179,6 +2230,7 @@ mod tests {
         let path = dir.path().join("mcp-audit.jsonl");
         let log = McpAuditLog::load(path.clone());
         let entry = |token: &str, at_ms: u64| AuditEntry {
+            session_id: None,
             token_id: token.to_string(),
             client_name: token.to_string(),
             workspace_id: "ws".to_string(),

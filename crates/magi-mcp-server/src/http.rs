@@ -73,6 +73,7 @@ struct HttpSession {
 pub struct HttpState {
     pub server: Arc<McpServer>,
     pub tokens: Arc<TokenStore>,
+    pub oauth: Arc<crate::oauth::OAuthStore>,
     pub config: HttpConfig,
     pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     /// 公网隧道的主机名（网络模式运行期间由宿主写入，停止时清空）。
@@ -110,6 +111,7 @@ impl HttpState {
         Self {
             server,
             tokens,
+            oauth: Arc::new(crate::oauth::OAuthStore::default()),
             config,
             clock: Arc::new(system_now_ms),
             tunnel_hosts: Arc::new(RwLock::new(Vec::new())),
@@ -152,6 +154,7 @@ pub fn router(state: HttpState) -> Router {
                 .delete(handle_post)
                 .fallback(method_not_allowed),
         )
+        .merge(crate::oauth::routes(state.clone()))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state)
 }
@@ -179,7 +182,7 @@ fn host_name(header_value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn unauthorized() -> Response {
+fn unauthorized(issuer: Option<&str>) -> Response {
     let mut response = (
         StatusCode::UNAUTHORIZED,
         Json(json!({ "error": "unauthorized" })),
@@ -187,7 +190,9 @@ fn unauthorized() -> Response {
         .into_response();
     response.headers_mut().insert(
         header::WWW_AUTHENTICATE,
-        HeaderValue::from_static("Bearer realm=\"magi-mcp\""),
+        issuer
+            .and_then(|issuer| HeaderValue::from_str(&format!("Bearer realm=\"magi-mcp\", resource_metadata=\"{issuer}/.well-known/oauth-protected-resource/mcp\", scope=\"magi\"")).ok())
+            .unwrap_or_else(|| HeaderValue::from_static("Bearer realm=\"magi-mcp\"")),
     );
     response
 }
@@ -223,7 +228,7 @@ fn host_in(list: &RwLock<Vec<String>>, host: Option<&str>) -> bool {
 }
 
 /// 同机进程（隧道、反向代理）转交请求时带的真实来源；取不到就退化为统一的 `unknown`。
-fn forwarded_source(headers: &HeaderMap) -> String {
+pub(crate) fn forwarded_source(headers: &HeaderMap) -> String {
     ["cf-connecting-ip", "x-forwarded-for"]
         .iter()
         .find_map(|name| {
@@ -293,9 +298,24 @@ async fn handle_post(
     {
         return too_many_requests();
     }
+    let oauth_issuer = crate::oauth::issuer(&state, peer, &headers);
     let record = match bearer_secret(&headers)
         .ok_or(())
-        .and_then(|secret| state.tokens.authenticate(secret, now_ms).map_err(|_| ()))
+        .and_then(|secret| {
+            state
+                .tokens
+                .authenticate(secret, now_ms)
+                .ok()
+                .or_else(|| {
+                    state.oauth.authenticate(
+                        secret,
+                        oauth_issuer.as_deref()?,
+                        &state.tokens,
+                        now_ms,
+                    )
+                })
+                .ok_or(())
+        })
         // 只在本机使用的令牌经隧道到达时，与“令牌不存在”不可区分。
         .and_then(|record| {
             if via_tunnel && !record.network {
@@ -309,7 +329,7 @@ async fn handle_post(
             if let Some(source) = &source {
                 state.limiter.record_auth_failure(source, now_ms);
             }
-            return unauthorized();
+            return unauthorized(oauth_issuer.as_deref());
         }
     };
     if let Some(source) = &source {
@@ -810,6 +830,235 @@ mod tests {
         );
         initialize(&f).await;
         assert_eq!(f.state.sessions.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn oauth_http_discovery_consent_exchange_and_resource_authentication() {
+        let f = fixture(HttpConfig::default());
+        let token_id = f.tokens.records()[0].token_id.clone();
+        f.tokens
+            .update(
+                &token_id,
+                crate::token::TokenPatch {
+                    network: Some(true),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        *f.state.tunnel_hosts.write().unwrap() = vec!["mcp.example.com".into()];
+        let request = |method: &str, path: &str, content_type: &str, body: String| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::HOST, "mcp.example.com")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let unauthenticated = f
+            .router
+            .clone()
+            .oneshot(request("POST", "/mcp", "application/json", LIST.into()))
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            unauthenticated.headers()[header::WWW_AUTHENTICATE]
+                .to_str()
+                .unwrap()
+                .contains("https://mcp.example.com/.well-known/oauth-protected-resource/mcp")
+        );
+        let metadata = f
+            .router
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/.well-known/oauth-protected-resource/mcp",
+                "application/json",
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(metadata.status(), StatusCode::OK);
+        assert_eq!(
+            json_of(metadata).await["resource"],
+            "https://mcp.example.com/mcp"
+        );
+        let metadata = json_of(
+            f.router
+                .clone()
+                .oneshot(request(
+                    "GET",
+                    "/.well-known/oauth-authorization-server",
+                    "application/json",
+                    String::new(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            metadata["code_challenge_methods_supported"],
+            json!(["S256"])
+        );
+        let callback = "https://chatgpt.com/connector_platform_oauth_redirect";
+        let registered = f
+            .router
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/oauth/register",
+                "application/json",
+                json!({"redirect_uris":[callback],"token_endpoint_auth_method":"none"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(registered.status(), StatusCode::CREATED);
+        let registered = json_of(registered).await;
+        let verifier = "0123456789012345678901234567890123456789012345678901234567890123";
+        use base64::Engine;
+        use sha2::Digest;
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(verifier.as_bytes()));
+        let mut auth_url = url::Url::parse("https://mcp.example.com/oauth/authorize").unwrap();
+        auth_url.query_pairs_mut().extend_pairs([
+            ("response_type", "code"),
+            ("client_id", registered["client_id"].as_str().unwrap()),
+            ("redirect_uri", callback),
+            ("resource", "https://mcp.example.com/mcp"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("state", "test-state"),
+        ]);
+        let started = f
+            .router
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("{}?{}", auth_url.path(), auth_url.query().unwrap()),
+                "application/json",
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::SEE_OTHER);
+        let continuation =
+            url::Url::parse(started.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+        let pending = f.state.oauth.pending(10);
+        assert_eq!(pending.len(), 1);
+        let parent = f.tokens.records()[0].clone();
+        f.state
+            .oauth
+            .resolve(&pending[0].request_id, Some(&parent), 10)
+            .unwrap();
+        let approved = f
+            .router
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("{}?{}", continuation.path(), continuation.query().unwrap()),
+                "application/json",
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        let redirect =
+            url::Url::parse(approved.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+        let code = redirect
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .unwrap()
+            .1
+            .into_owned();
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        form.extend_pairs([
+            ("grant_type", "authorization_code"),
+            ("client_id", registered["client_id"].as_str().unwrap()),
+            ("code", &code),
+            ("code_verifier", verifier),
+            ("redirect_uri", callback),
+            ("resource", "https://mcp.example.com/mcp"),
+        ]);
+        let token_response = f
+            .router
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/oauth/token",
+                "application/x-www-form-urlencoded",
+                form.finish(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(token_response.status(), StatusCode::OK);
+        assert_eq!(token_response.headers()[header::CACHE_CONTROL], "no-store");
+        let token_response = json_of(token_response).await;
+        let mut mcp = request("POST", "/mcp", "application/json", LIST.into());
+        mcp.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!(
+                "Bearer {}",
+                token_response["access_token"].as_str().unwrap()
+            )
+            .parse()
+            .unwrap(),
+        );
+        assert_eq!(
+            f.router.clone().oneshot(mcp).await.unwrap().status(),
+            StatusCode::OK
+        );
+        // Host and Origin checks must run before parsing a DCR body.
+        let mut invalid = request(
+            "POST",
+            "/oauth/register",
+            "application/json",
+            "not json".into(),
+        );
+        invalid
+            .headers_mut()
+            .insert(header::HOST, "evil.example.com".parse().unwrap());
+        assert_eq!(
+            f.router.clone().oneshot(invalid).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut cross_site = request(
+            "POST",
+            "/oauth/token",
+            "application/x-www-form-urlencoded",
+            String::new(),
+        );
+        cross_site
+            .headers_mut()
+            .insert(header::ORIGIN, "https://evil.example.com".parse().unwrap());
+        assert_eq!(
+            f.router.clone().oneshot(cross_site).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut forged_peer = request(
+            "GET",
+            "/.well-known/oauth-authorization-server",
+            "application/json",
+            String::new(),
+        );
+        forged_peer
+            .extensions_mut()
+            .insert(ConnectInfo("192.0.2.1:443".parse::<SocketAddr>().unwrap()));
+        assert_eq!(
+            f.router
+                .clone()
+                .oneshot(forged_peer)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        // Localhost cannot impersonate the TLS issuer, even with an OAuth access token.
+        let local = post_request(token_response["access_token"].as_str(), "localhost", LIST);
+        assert_eq!(
+            f.router.oneshot(local).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

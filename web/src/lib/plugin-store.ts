@@ -104,12 +104,10 @@ export function paginate<T>(items: T[], page: number, pageSize: number): { rows:
 }
 
 /**
- * 插件在设置里的专属分类（用于从插件中心一键跳转）：取声明的设置视图或自动生成的设置表单。
- * 没有设置时返回 null。
+ * 插件在设置里的专属分类（用于从插件中心一键跳转）：只取插件自己声明的 settings 视图。
+ * 没有该视图时返回 null；宿主不为插件生成设置表单。
  */
 export function pluginSettingsTab(manifest: PluginManifest): string | null {
   const view = (manifest.contributions.views ?? []).find((entry) => entry.placements.includes('settings'));
-  if (view) return `plugin:${manifest.id}:${view.id}`;
-  const schema = manifest.settingsSchema as { properties?: Record<string, unknown> } | undefined;
-  return schema?.properties && Object.keys(schema.properties).length > 0 ? `plugin:${manifest.id}:settings` : null;
+  return view ? `plugin:${manifest.id}:${view.id}` : null;
 }

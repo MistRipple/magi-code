@@ -9,7 +9,7 @@
 | 你想做什么 | 形态 | 在哪一节 |
 | --- | --- | --- |
 | 给模型增加一段方法说明（Skill） | 声明式 | 第 5 节 |
-| 增加设置表单、主页面、右侧面板 | 声明式 | 第 5 节 |
+| 增加设置页、主页面、右侧面板（界面都由你的页面提供） | 声明式 | 第 5 节 |
 | 让页面和扩展共享一份带版本的数据 | 声明式 + `storage` 权限 | 第 5、10 节 |
 | 观察或拦截会话事件：输入、工具调用、子代理派发、模型请求与响应、用量 | Node 扩展：钩子 | 第 7 节 |
 | 为模型提供新的工具 | Node 扩展：工具 | 第 8 节 |
@@ -106,7 +106,7 @@ ui/…                       视图页面与静态资源，按需
 | `permissions` | 权限声明，见第 4 节 |
 | `extension` | `{ "hooks": [...] }`，声明后包必须含 `extension/index.mjs`；反之不得带该文件 |
 | `contributions` | `skills`、`resources`、`views`、`browserSurfaces`、`tools`、`commands`、`modelSources` |
-| `settingsSchema` | JSON Schema（必须是有界的 object schema，禁止外部引用） |
+| `settingsSchema` | 设置的 JSON Schema，用于校验设置值（必须是有界的 object schema，禁止外部引用）；它不生成界面 |
 | `dataSchemaVersion` | 数据格式版本，正整数 |
 
 规则：
@@ -150,7 +150,7 @@ ui/…                       视图页面与静态资源，按需
 - **资源**：带版本的 JSON 数据，写入必须携带读到的版本（乐观并发）。页面和扩展读写同一份；读写需要对应 `storage` 权限，目标是资源 ID。
 - **视图**：`entry` 必须是包内 `ui/` 下的 HTML 文件。`placements` 可选：`settings`（在设置里为该插件增加一个分类页）、`main`（主内容区页面）、`home`（主页上的入口，必须同时声明 `main`）、`homeCard`（主页上嵌入的卡片，每个插件最多 2 张）、`rightPane`（右侧面板）。
 - **视图隔离**：页面运行在 `sandbox="allow-scripts"` 的隔离 iframe 中，不能联网、不能访问宿主页面、凭据或 Electron，只能通过下面的消息桥读写资源和设置。
-- **设置表单**：由 `settingsSchema` 生成，字段顺序按你书写的顺序展示。设置读写需要 `storage` 权限，目标 `"__settings"`。
+- **设置界面**：Magi 不为插件生成设置表单，所有界面都由插件自己的页面提供。需要用户配置时，声明一个 `placements` 含 `settings` 的视图，页面通过消息桥的 `settings.read` / `settings.write` 读写；值按 `settingsSchema` 校验。设置读写需要 `storage` 权限，目标 `"__settings"`。完整示例见 `examples/plugins/notes/ui/settings.html`。
 - **浏览器 surface**：`browserSurfaces` 条目需要同名的 `browser` 权限；`backgroundInference` 为真时必须 `keepMounted`。
 
 ### 视图消息桥
@@ -443,7 +443,7 @@ await api.modelSource.clear('gateway');
 - `set` 是整体替换：新的 `models` 取代旧的。校验与用户自己配置的数据源相同（地址有效、模型 ID 非空且唯一）。
 - **只影响主对话，只追加**：数据源以“插件”分组出现在主对话的模型选择器里，身份是 `plugin/<pluginId>/<id>`。它不覆盖用户配置的数据源，不会成为默认选择，子代理、`model.invoke`、辅助、识图和生图模型都不会使用它。
 - **只存在于本次运行**：连接信息只在 daemon 内存中，不写盘。插件停用、卸载、崩溃或宿主退出时自动撤销；重启后的实例在 `activate` 里再次提交。已选用该数据源的会话在它不可用期间会明确报错，不会改用其他模型；恢复后可继续使用。
-- 用户在设置页只读查看插件提供的数据源。授权时会提示：选用后主对话内容（对话历史、工具结果等）会发送到你提供的地址。
+- Magi 设置页不为插件另设数据源列表：用户在对话输入区的模型选择器里看到“插件”分组，插件的启停与授权在插件管理里。授权时会提示：选用后主对话内容（对话历史、工具结果等）会发送到你提供的地址。
 
 ### 读取会话
 

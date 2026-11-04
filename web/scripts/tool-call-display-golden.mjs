@@ -267,7 +267,35 @@ await withGoldenViteServer(async (server) => {
   const failureCard = await server.ssrLoadModule('/src/components/ModelFailureCard.svelte');
   const toolCall = await server.ssrLoadModule('/src/components/ToolCall.svelte');
   const messageItem = await server.ssrLoadModule('/src/components/MessageItem.svelte');
+  const { default: ConversationTurn } = await server.ssrLoadModule('/src/components/ConversationTurn.svelte');
   const { default: ToolCallRenderer } = await server.ssrLoadModule('/src/components/ToolCallRenderer.svelte');
+  for (const sessionId of ['local-session', 'external-tool-chat-regression']) {
+    for (const changeType of ['create', 'modify', 'delete']) {
+      const filePreviewScope = { sessionId, workspaceId: 'workspace-a' };
+      const message = {
+        id: `${sessionId}-${changeType}`, role: 'assistant', source: 'orchestrator',
+        type: 'tool_call', content: '', timestamp: 1, isComplete: true,
+        metadata: { canonical: true, turnId: 'file-turn', conversationPresentationRole: 'artifact' },
+        blocks: [{ id: `file-${changeType}`, type: 'file_change', content: '', fileChange: {
+          filePath: 'src/collapse-regression.ts', changeType, additions: 2, deletions: 1,
+          diff: '@@ -1 +1,2 @@\n-const oldValue = 1;\n+const newValue = 2;\n+export { newValue };',
+        } }],
+      };
+      const modes = {
+        original: render(messageItem.default, { props: { message, filePreviewScope } }).body,
+        summary: render(ConversationTurn, { props: {
+          turnId: 'file-turn', items: [{ key: message.id, message }],
+          runtimeActive: false, filePreviewScopeForItem: () => filePreviewScope,
+        } }).body,
+      };
+      for (const [mode, markup] of Object.entries(modes)) {
+        assert.match(markup, /aria-expanded="false"/, `${sessionId} ${changeType} ${mode} 文件变更默认折叠`);
+        assert.match(markup, /collapse-regression/, '折叠后仍显示文件入口');
+        assert.match(markup, /stats-badge/, '折叠后仍显示增删行数');
+        assert.doesNotMatch(markup, /class="tool-content|const newValue/, '默认不渲染或暴露完整 diff');
+      }
+    }
+  }
   const truncatedBlock = (name) => ({
     id: `truncated-${name}`, type: 'tool_call', content: '',
     toolCall: {

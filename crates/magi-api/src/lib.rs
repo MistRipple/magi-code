@@ -23,6 +23,7 @@ pub mod mcp_config;
 mod mcp_direct;
 mod mcp_runtime;
 mod mcp_service;
+mod mcp_sessions;
 mod mcp_tunnel;
 mod model_config;
 mod performance;

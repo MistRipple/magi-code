@@ -6,6 +6,18 @@ export interface VerticalScrollMetrics {
   clientHeight: number;
 }
 
+/** 向下阅读已到达底部时，输入本身就足以恢复跟随，不能等待可能不会发生的 scroll 事件。 */
+export function shouldFollowMessageScrollInput(
+  direction: MessageScrollDirection,
+  metrics: VerticalScrollMetrics,
+): boolean {
+  return direction === 'down'
+    && Number.isFinite(metrics.scrollTop)
+    && Number.isFinite(metrics.scrollHeight)
+    && Number.isFinite(metrics.clientHeight)
+    && metrics.scrollHeight - metrics.scrollTop - metrics.clientHeight <= 40;
+}
+
 export function deriveMessageScrollDirection(
   nextScrollTop: number,
   previousScrollTop: number,

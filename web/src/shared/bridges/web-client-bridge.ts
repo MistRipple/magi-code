@@ -186,7 +186,7 @@ import type {
   OrchestratorRuntimeSnapshot,
   QueuedMessage,
 } from '../../types/message';
-import { refreshPendingChangesProjection } from '../../lib/pending-changes-refresh';
+import { invalidatePendingChangesProjection, refreshPendingChangesProjection } from '../../lib/pending-changes-refresh';
 import { syncToolApprovals } from '../../stores/tool-approval-store.svelte';
 import { syncUserQuestions } from '../../stores/user-question-store.svelte';
 import { syncSessionIsolations } from '../../stores/session-isolation-store.svelte';
@@ -1980,6 +1980,27 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     window.dispatchEvent(new Event(MCP_APPROVALS_CHANGED_EVENT));
     if (rustEventSessionId(event) === currentSessionId.trim()) {
       refreshCurrentSessionToolApprovals(eventType);
+    }
+    return;
+  }
+
+  // MCP 审计事件在工具结算后产生，变更、回退都重新读取同一份服务端投影。
+  // 不把其他聊天的调用或执行前拒绝当成当前会话的变更。
+  if (eventType === 'mcp.tool.call') {
+    if (event.payload?.outcome !== 'denied'
+      && currentSessionId
+      && rustEventSessionId(event) === currentSessionId.trim()
+      && currentSessionScope === 'workspace'
+      && currentWorkspaceId
+      && rustEventWorkspaceId(event) === currentWorkspaceId) {
+      void invalidatePendingChangesProjection({
+        scope: 'workspace',
+        sessionId: currentSessionId,
+        workspaceId: currentWorkspaceId,
+        workspacePath: currentWorkspacePath,
+      }).catch((error) => {
+        console.warn('[web-client-bridge] 外部工具结算后刷新变更列表失败:', error);
+      });
     }
     return;
   }

@@ -805,7 +805,7 @@
     width: 100%;
     min-height: 0;
     overflow: hidden;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+    font-family: var(--font-family);
   }
 
   .scroll-proxy { min-height: 0; }

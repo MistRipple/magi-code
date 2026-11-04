@@ -141,8 +141,20 @@ pub(super) fn settle_active_current_turn_items(
     items: &mut [ActiveExecutionTurnItem],
     terminal_status: &str,
 ) {
+    // 终态结算前先固定依据：条目状态随后会被改写为终态。只有正常完成才用依据确认步骤完成。
+    let proof = if terminal_item_status_for_turn_status(terminal_status) == Some("completed") {
+        crate::execution_steps::collect_step_proof(
+            items,
+            |status| terminal_item_status_for_turn_status(status) == Some("completed"),
+            current_turn_item_status_is_active,
+        )
+    } else {
+        Vec::new()
+    };
+    let terminal_for_steps =
+        terminal_item_status_for_turn_status(terminal_status).unwrap_or(terminal_status);
     for item in items {
-        crate::execution_steps::settle_steps(item, terminal_status);
+        crate::execution_steps::settle_steps(item, terminal_for_steps, &proof);
         if current_turn_item_status_is_active(&item.status) {
             item.status = terminal_status.to_string();
         }

@@ -12,7 +12,6 @@ import SettingsAppearanceTab from './SettingsAppearanceTab.svelte';
 import SettingsPluginsTab from './SettingsPluginsTab.svelte';
 import SettingsMcpServerSection from './SettingsMcpServerSection.svelte';
 import PluginTabContent from './tabs/PluginTabContent.svelte';
-import PluginSettingsForm from './PluginSettingsForm.svelte';
 import { tick, untrack } from 'svelte';
 import Icon from './Icon.svelte';
 import Modal from './Modal.svelte';
@@ -56,7 +55,6 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
     (manifest.contributions.views ?? [])
       .filter((view) => view.placements.includes('settings'))
       .map((view) => ({
-        kind: 'view' as const,
         tabId: `plugin:${manifest.id}:${view.id}` as `plugin:${string}`,
         id: manifest.id,
         manifest,
@@ -65,25 +63,8 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
         title: view.title,
         description: manifest.description,
       }))));
-  const pluginSettingsForms = $derived.by(() => pluginManifests
-    .filter((manifest) => !(manifest.contributions.views ?? []).some((view) => view.placements.includes('settings')))
-    .filter((manifest) => {
-      const schema = manifest.settingsSchema;
-      return Boolean(schema && typeof schema === 'object' && !Array.isArray(schema)
-        && schema.properties && typeof schema.properties === 'object'
-        && Object.keys(schema.properties).length > 0);
-    })
-    .map((manifest) => ({
-      kind: 'form' as const,
-      tabId: `plugin:${manifest.id}:settings` as `plugin:${string}`,
-      id: manifest.id,
-      manifest,
-      entry: '',
-      label: `${manifest.name}: ${i18n.t('settings.plugins.settings.title')}`,
-      title: i18n.t('settings.plugins.settings.title'),
-      description: manifest.description,
-    })));
-  const pluginSettingsTabs = $derived([...pluginSettingsViews, ...pluginSettingsForms]);
+  // 插件的设置界面只有一种来源：插件自己声明的 settings 视图，宿主不生成表单。
+  const pluginSettingsTabs = $derived(pluginSettingsViews);
   $effect(() => {
     trackPluginProjection();
   });
@@ -710,11 +691,7 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
       {:else}
         {#each pluginSettingsTabs.filter((item) => item.tabId === store.activeTab) as tab (tab.tabId)}
           <div class="settings-frame">
-            {#if tab.kind === 'view'}
-              <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} />
-            {:else}
-              <PluginSettingsForm pluginId={tab.id} manifest={tab.manifest} />
-            {/if}
+            <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} />
           </div>
         {/each}
       {/if}

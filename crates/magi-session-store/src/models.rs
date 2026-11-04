@@ -538,7 +538,7 @@ impl CanonicalTurnItem {
                     .worker
                     .as_ref()
                     .and_then(|worker| worker.task_id.as_ref())
-                    != Some(&job.task_id)
+                    != job.task_id.as_ref()
                 || self.tool.as_ref().is_none_or(|tool| {
                     tool.name != "shell_exec" || tool.call_id != job.tool_call_id
                 })

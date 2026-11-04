@@ -61,11 +61,11 @@
 
   /** 选中的客户端有外部会话时，可以直接去看它的调用过程。 */
   const hasSession = $derived(
-    filterTokenId !== '' && externalSessions.sessions.some((session) => session.tokenId === filterTokenId),
+    filterTokenId !== '' && externalSessions.sessions.filter((session) => session.tokenId === filterTokenId).length === 1,
   );
 
-  function viewSession(): void {
-    const session = externalSessions.sessions.find((item) => item.tokenId === filterTokenId);
+  function viewSession(sessionId?: string): void {
+    const session = externalSessions.sessions.find((item) => sessionId ? item.sessionId === sessionId : item.tokenId === filterTokenId);
     if (!session) return;
     closeSettings();
     openExternalSession(session);
@@ -139,7 +139,7 @@
     </div>
     <div class="action-row">
       {#if hasSession}
-        <button class="btn btn--sm btn--secondary" type="button" data-mcp-audit-view-session="1" onclick={viewSession}>{i18n.t('mcpServer.audit.viewSession')}</button>
+        <button class="btn btn--sm btn--secondary" type="button" data-mcp-audit-view-session="1" onclick={() => viewSession()}>{i18n.t('mcpServer.audit.viewSession')}</button>
       {/if}
       <button class="btn btn--sm btn--secondary" type="button" disabled={busy} onclick={() => void load()}>{i18n.t('mcpServer.audit.refresh')}</button>
       <button type="button" class="btn btn--sm btn--error" data-mcp-audit-clear="1" disabled={busy || total === 0} onclick={() => void clearRecords()}>
@@ -163,6 +163,12 @@
             </span>
             <span class="meta ui-meta">
               <span>{entry.clientName}</span><span>{formatTime(entry.atMs)}</span>
+              {#if entry.sessionId}
+                {@const session = externalSessions.sessions.find(item => item.sessionId === entry.sessionId)}
+                {#if session}
+                  <button class="btn btn--sm btn--secondary" type="button" onclick={() => viewSession(session.sessionId)}>{session.title || i18n.t('mcpServer.audit.viewSession')}</button>
+                {/if}
+              {/if}
               {#if entry.paths.length > 0}<span>{entry.paths.slice(0, 3).join(', ')}</span>{/if}
               {#if entry.detail}<span>{entry.detail}</span>{/if}
             </span>

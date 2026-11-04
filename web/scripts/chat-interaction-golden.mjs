@@ -9,7 +9,7 @@ const component = await readFile(new URL('../src/components/MessageList.svelte',
 const instance = parse(component).instance;
 const script = component.slice(instance.content.start, instance.content.end);
 const ast = ts.createSourceFile('MessageList.ts', script, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-const handlers = ['handleScroll', 'updateBottomDistance', 'cancelScrollRecoveryForUserIntent', 'compensateLayoutAfterUpdate'].map(name => {
+const handlers = ['handleScroll', 'updateBottomDistance', 'cancelScrollRecoveryForUserIntent', 'compensateLayoutAfterUpdate', 'handleWheelIntent', 'handleKeydownIntent'].map(name => {
   const declaration = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
   assert.ok(declaration, `missing production handler ${name}`);
   return declaration.getText(ast);
@@ -17,12 +17,12 @@ const handlers = ['handleScroll', 'updateBottomDistance', 'cancelScrollRecoveryF
 
 await withGoldenViteServer(async server => {
   const { MessageScrollCoordinator, MessageLayoutStabilizer } = await server.ssrLoadModule('/src/lib/message-scroll-coordinator.ts');
-  const { deriveMessageScrollDirection } = await server.ssrLoadModule('/src/lib/message-scroll-input.ts');
+  const { deriveMessageScrollDirection, isMainMessageWheelInput, shouldFollowMessageScrollInput } = await server.ssrLoadModule('/src/lib/message-scroll-input.ts');
   const { splitFileName } = await server.ssrLoadModule('/src/lib/file-name.ts');
   const { beginPanelResize } = await server.ssrLoadModule('/src/lib/panel-resize.ts');
   const { imeEnterGuard } = await server.ssrLoadModule('/src/lib/ime-enter-guard.ts');
   const { previewSplitAt, equalPreviewSplitWidth } = await server.ssrLoadModule('/src/web/panel-layout.ts');
-  const makeScroll = new Function('MessageScrollCoordinator', 'MessageLayoutStabilizer', 'deriveMessageScrollDirection', ts.transpileModule(`
+  const makeScroll = new Function('MessageScrollCoordinator', 'MessageLayoutStabilizer', 'deriveMessageScrollDirection', 'isMainMessageWheelInput', 'shouldFollowMessageScrollInput', ts.transpileModule(`
     let shouldAutoScroll = true, distanceToBottom = 0;
     let lastObservedScrollTop = 500, scrollInteractionEpoch = 0, scrollRecoveryEpoch = 0;
     let activationRestoreNonce = 0, autoScrollScheduleNonce = 0, contentResizeFrame = 0;
@@ -31,6 +31,8 @@ await withGoldenViteServer(async server => {
     const containerRef = { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 };
     const scrollCoordinator = new MessageScrollCoordinator();
     const layoutStabilizer = new MessageLayoutStabilizer();
+    const Element = class {};
+    function canNestedScrollerConsumeWheel() { return false; }
     function currentScrollScopeKey() { return 'session'; }
     function currentHistoryLoadScopeKey() { return 'history'; }
     function updatePanelScrollState(_key, input) { shouldAutoScroll = input.autoScrollEnabled; }
@@ -46,13 +48,33 @@ await withGoldenViteServer(async server => {
     return {
       metrics: containerRef,
       intent: cancelScrollRecoveryForUserIntent,
+      wheel: (deltaY) => handleWheelIntent({ deltaY, ctrlKey: false, metaKey: false, target: null }, containerRef),
+      key: (key) => handleKeydownIntent({ key, target: null, defaultPrevented: false }),
       scroll: (top) => { containerRef.scrollTop = top; handleScroll({ target: containerRef }); },
       grow: (px) => { containerRef.scrollHeight += px; compensateLayoutAfterUpdate(0, 'history', scrollInteractionEpoch, scrollRecoveryEpoch); },
       programmatic: (top, intent) => { scrollCoordinator.begin(top, scrollInteractionEpoch, 'session', intent); },
       snapshot: () => ({ follow: shouldAutoScroll, distance: distanceToBottom, top: containerRef.scrollTop }),
     };
   `, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText);
-  const harness = () => makeScroll(MessageScrollCoordinator, MessageLayoutStabilizer, deriveMessageScrollDirection);
+  const harness = () => makeScroll(MessageScrollCoordinator, MessageLayoutStabilizer, deriveMessageScrollDirection, isMainMessageWheelInput, shouldFollowMessageScrollInput);
+  const bottom = harness();
+  bottom.wheel(50);
+  bottom.grow(300);
+  assert.equal(bottom.snapshot().top, 800, '在底部继续向下滚轮后，新 MCP 工具卡片仍必须自动跟随');
+  bottom.wheel(-50);
+  bottom.grow(200);
+  assert.equal(bottom.snapshot().top, 800, '向上输入即使尚未产生 scroll 事件，也不能被新消息抢回底部');
+  const shortList = harness();
+  shortList.metrics.scrollTop = 0;
+  shortList.metrics.scrollHeight = shortList.metrics.clientHeight;
+  shortList.wheel(50);
+  shortList.grow(700);
+  assert.equal(shortList.snapshot().top, 700, '短列表从无溢出变成溢出时必须继续跟随');
+  const keyboard = harness();
+  keyboard.intent();
+  keyboard.key('End');
+  keyboard.grow(300);
+  assert.equal(keyboard.snapshot().top, 800, '底部 End 输入恢复跟随，不依赖额外 scroll 事件');
   const h = harness();
   h.intent();
   assert.equal(h.snapshot().follow, false, 'manual input suspends following before native scroll arrives');

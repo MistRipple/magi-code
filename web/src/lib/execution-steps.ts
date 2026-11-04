@@ -32,3 +32,32 @@ export function executionStepEvidence(snapshot: ExecutionSteps, stepId: string, 
     && !item.metadata?.executionSteps
     && (item.metadata?.executionStepId === stepId || step.evidenceRefs.includes(item.itemId) || step.evidenceRefs.includes(item.tool?.callId || '')));
 }
+
+/** 仍需要用户关注的快照：有步骤在执行、待执行或受阻；全部终结后不再置底悬浮。 */
+export function isExecutionStepsActive(snapshot: ExecutionSteps): boolean {
+  return snapshot.steps.some((step) => step.status === 'running' || step.status === 'pending' || step.status === 'blocked');
+}
+/** 置底条显示的当前步骤：优先执行中，其次受阻/失败，最后第一个待执行。 */
+export function currentExecutionStep(snapshot: ExecutionSteps) {
+  return snapshot.steps.find((step) => step.status === 'running')
+    ?? snapshot.steps.find((step) => step.status === 'blocked' || step.status === 'failed')
+    ?? snapshot.steps.find((step) => step.status === 'pending')
+    ?? null;
+}
+
+/**
+ * 选出需要置底悬浮的步骤快照：只看时间线里最新的一份，且必须属于当前运行轮次并仍有活动步骤。
+ * 最新一份已全部终结时不回头选更早的快照，否则旧计划会重新浮起。
+ */
+export function selectPinnedExecutionSteps<T extends { message: { metadata?: Record<string, unknown> } }>(
+  items: readonly T[],
+  runtimeTurnId: string,
+): { item: T; snapshot: ExecutionSteps } | null {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const snapshot = readExecutionSteps(items[index].message.metadata?.executionSteps);
+    if (!snapshot) continue;
+    if (runtimeTurnId && snapshot.turnId !== runtimeTurnId) return null;
+    return isExecutionStepsActive(snapshot) ? { item: items[index], snapshot } : null;
+  }
+  return null;
+}
