@@ -1,6 +1,6 @@
 # Magi 插件系统：架构、当前合同与交付边界
 
-【现状】更新：2026-11-03。以本工作区源码和本轮运行证据为准；方案目标不得作为已交付证明。本文完整替换旧 QuickJS 方案。作者可依赖的接口见[作者指南](plugin-authoring.md)，字节协议见[扩展协议](extension-protocol-v1.md)。
+【现状】更新：2026-11-05。以本工作区源码和本轮运行证据为准；方案目标不得作为已交付证明。本文完整替换旧 QuickJS 方案。作者可依赖的接口见[作者指南](plugin-authoring.md)，字节协议见[扩展协议](extension-protocol-v1.md)。
 
 ## 1. 结论、约定与需求
 
@@ -12,7 +12,7 @@
 - 【目标】插件能直接使用文件、网络、进程；daemon 服务负责 Magi 业务所有权，不是 OS 沙箱。
 - 【目标】扩展只能阻止或提出改写；最终权限、审批、日志和结果由 daemon 决定。
 - 【目标】子代理保留自定义角色与模型绑定；不允许扩展静默替换模型。
-- 【目标】pi／DSH 翻译器及兼容来源开关推迟到本地系统稳定之后；当前不提供占位功能。
+- 【目标】pi／DSH 翻译器及兼容来源开关推迟到本地系统稳定之后；当前不提供占位功能。【现状·已运行验证】仓库内仅有离线静态兼容分析（`scripts/compat/`，`npm run test:compat` 5 项通过），它不执行上游代码，没有运行时、构建打包、来源开关或兼容声明，见 6.0。
 - 【现状】Windows demo、Windows 实机与正式安装包验收后置；本机开发验收不等于这些平台已通过。
 - 【目标】工作流／会话引擎替换、数据转换 VM、SDK 1 兼容均不恢复。
 
@@ -46,7 +46,7 @@
 | 目标 | R3 | 扩展可直接使用文件、网络、进程，以及观察、阻止和受控改写 agent 行为 |
 | 目标 | R4 | MCP、Browser、Subagent 等原生功能继续内置；只有公开 API 可独立实现的功能才作为插件 |
 | 目标 | R5 | 本地 ZIP、地址与插件中心走统一预览、摘要确认、安装和授权 |
-| 目标 | R6 | 支持工具、命令、Skill、设置、视图、资源及 browser surface 声明 |
+| 目标 | R6 | 支持工具、命令、Skill、设置、视图、资源、browser surface 及主对话模型数据源声明 |
 | 目标 | R7 | UI 与扩展共享 daemon 资源／设置事实；CAS 冲突明确，不覆盖新值 |
 | 目标 | R8 | 工作流与会话内核保持原生；通过公开钩子和命令扩展业务 |
 | 目标 | R9 | 启用、就绪、停用、撤权、升级、崩溃、取消均有可观察状态 |
@@ -65,7 +65,7 @@
 | 状态／依据 | 项目 | 当前合同与证据 |
 | --- | --- | --- |
 | 现状·已运行验证 | 包 | SDK 2，固定单入口 `extension/index.mjs`；SDK 1、backend、未知字段与未接线模式拒绝；[package.rs:192](../crates/magi-plugin-system/src/package.rs#L192) |
-| 现状·读码推断 | 贡献全集 | skills、tools、commands、views、resources、browserSurfaces；views 可为 settings、home、main、rightPane、homeCard；[生成清单类型:1600](../crates/magi-app-server-protocol/src/generated.rs#L1600) |
+| 现状·读码推断 | 贡献全集 | skills、tools、commands、views、resources、browserSurfaces、modelSources（须同时声明 extension）；views 可为 settings、home、main、rightPane、homeCard；[生成清单类型:1600](../crates/magi-app-server-protocol/src/generated.rs#L1600) |
 | 现状·已运行验证 | 资源与设置 | `resource.read/write`、`settings.read/write`，统一 CAS、schema 校验与事件发布；[lifecycle.rs:266](../crates/magi-plugin-system/src/lifecycle.rs#L266) |
 | 现状·已运行验证 | 业务服务 | `model.invoke`、`task.spawn`、`tools.call`、`notify.user`、`ask.user`、`session.snapshot`、`credential.ref`、`blob.put/get`；wire 工具服务名为 `tool.call`；[host.mjs:248](../crates/magi-extension-host/runtime/host.mjs#L248)、[原生服务:138](../crates/magi-conversation-runtime/src/task_execution_dispatcher/extension_services.rs#L138) |
 | 现状·已运行验证 | 注册与诊断 | `api.on`、`api.tool`、`api.command`、`api.log`，只绑定获批贡献；只读 `api.config/configRevision`；[host.mjs:208](../crates/magi-extension-host/runtime/host.mjs#L208) |
@@ -84,6 +84,7 @@
 | 现状·读码推断 | browser | 清单关联和支持的 surface 策略准入；不代表所有物理 guest 路径已实体验收；[package.rs:389](../crates/magi-plugin-system/src/package.rs#L389) |
 | 现状·已运行验证 | extension | 可执行包必须声明 `full-trust` 且获批后才激活；不限制直接 OS 调用；[package.rs:192](../crates/magi-plugin-system/src/package.rs#L192) |
 | 现状·已运行验证 | contextRewrite | context／compaction 钩子与 `history` 授权关联；未经授权的改写拒绝；[extension_hooks.rs:136](../crates/magi-conversation-runtime/src/extension_hooks.rs#L136) |
+| 现状·已运行验证 | modelSources | `modelSource.set/clear` 按数据源 ID 逐项检查授权；清单要求每个数据源有同名权限且包必须声明 extension；连接信息只在 daemon 内存，宿主退出即撤销；[服务:43](../crates/magi-daemon/src/daemon/extension_services.rs#L43)、[清单校验:410](../crates/magi-plugin-system/src/package.rs#L410) |
 | 现状·已运行验证 | 已删除权限 | filesRead、filesWrite、network 不再作为装饰性权限；旧 scope 参数与未知清单字段明确拒绝；[包回归](../crates/magi-plugin-system/tests/package.rs) |
 
 ### 2.3 视图隔离
@@ -237,6 +238,8 @@
 
 【现状·已运行验证】model.invoke 经原生 StepModelClient 和用量账本；credential.ref 只返回模型绑定引用，不返回 secret。session.snapshot 仅当前签发会话，最多 10 Turn、每 Turn 20 条文本投影并截断；notify/ask 复用通知与交互事实。task.spawn/tool.call 只在具有原生 Task／租约、策略和工具权限时执行，普通命令没有 Task 会明确拒绝，不伪造任务。[服务:138](../crates/magi-conversation-runtime/src/task_execution_dispatcher/extension_services.rs#L138)。
 
+【现状·已运行验证】`modelSource.set/clear` 向主对话模型目录整体替换或撤销已授权的数据源，只追加、不作默认选择，不被子代理、`model.invoke`、辅助、识图和生图使用；已选用而不可用的会话明确报错，不改用其他模型。选用后主对话内容会发往插件提供的地址，授权预览必须明示。daemon 单测覆盖未声明、非法输入与替换撤销，真实 daemon 端到端用例未单列。[服务:380](../crates/magi-daemon/src/daemon/extension_services.rs#L380)、[作者指南](plugin-authoring.md#提供主对话模型数据源)。
+
 【现状·读码推断】blob 为 JSON 传递：单项 2 MiB、宿主最多 64 项／16 MiB、300 秒过期、归插件所有；不是持久存储或任意文件读取接口。[blob 服务](../crates/magi-daemon/src/daemon/extension_services.rs#L232)。
 
 ### 5.8 超时、失败与取消
@@ -255,13 +258,13 @@
 
 【现状·读码推断】ZIP 路径、大小写冲突、原生载荷、文件类型和 schema 在安装前校验；16 MiB 压缩／32 MiB 展开／512 条目，后台入口上限以包校验代码为准。作者必须构建期打包依赖；产品不安装 npm 依赖，不运行 install 脚本。[package.rs:10](../crates/magi-plugin-system/src/package.rs#L10)。
 
-【目标】信任告知必须说明：可读写文件和凭据、联网、派生进程；Magi 无法限制所有直接副作用。Magi 的 models/storage/tools 授权只控制公开业务服务，不保证恶意完全受信代码遵守它。
+【目标】信任告知必须说明：可读写文件和凭据、联网、派生进程；Magi 无法限制所有直接副作用。Magi 的 models/storage/tools 授权只控制公开业务服务，不保证恶意完全受信代码遵守它。modelSources 授权还须告知：用户选用该数据源后，对话历史与工具结果会发送到插件提供的地址。
 
 ## 6. 阶段 E：翻译器与兼容来源
 
 ### 6.0 当前进度与工厂结构（2026-11-03）
 
-【现状·已运行验证】翻译器从“静态兼容分析”起步，入口 `scripts/compat/`：`core/registry.mjs` 是翻译器工厂注册表（`register(kind, factory)`、`create(kind)`、`detect(dir)`；识别不出或并列时明确失败，不猜），每种上游生态只在 `index.mjs` 注册一个工厂；`core/scan.mjs` 用语法树扫描导入、`ctx.*` 调用链与 `inject` 服务，不执行上游代码；`core/report.mjs` 规定每项能力必须落在 mapped／shim／bundled／planned／dropped／unknown 之一，必需能力里出现 planned／dropped／unknown 即阻塞翻译；`dsh/` 是首个翻译器，`dsh/catalog.mjs` 是 DSH→Magi 对照表。运行：`node scripts/compat/cli.mjs inspect <插件目录> --require llm`，测试：`npm run test:compat`。pi 翻译器之后只需新增 `pi/` 并注册工厂；DSH 与 pi 共用的 pi-ai 适配层放在共享层，不在两边各写一份。
+【现状·已运行验证】翻译器从“静态兼容分析”起步，入口 `scripts/compat/`：`core/registry.mjs` 是翻译器工厂注册表（`register(kind, factory)`、`create(kind)`、`detect(dir)`；识别不出或并列时明确失败，不猜），每种上游生态只在 `index.mjs` 注册一个工厂；`core/scan.mjs` 用语法树扫描导入、`ctx.*` 调用链与 `inject` 服务，不执行上游代码；`core/report.mjs` 规定每项能力必须落在 mapped／shim／bundled／planned／dropped／unknown 之一，必需能力里出现 planned／dropped／unknown 即阻塞翻译；`dsh/` 是首个翻译器，`dsh/catalog.mjs` 是 DSH→Magi 对照表。运行：`node scripts/compat/cli.mjs inspect <插件目录> --require llm`，测试：`npm run test:compat`（2026-11-05 复跑 5 项通过）。pi 翻译器之后只需新增 `pi/` 并注册工厂；DSH 与 pi 共用的 pi-ai 适配层放在共享层，不在两边各写一份。
 
 【现状·已运行验证】对 dsh-connect-workbuddy 5.18.0（95 个源文件、约 5.7 万行）的分析结论：模型提供者注册（`ctx.llm.registerAdapter`／`registerConfigurableProviders`／`registerModelDiscovery`，依赖 pi-ai 适配层）是核心，对应 Magi 已交付的“插件向主对话追加模型数据源”（`modelSources` 权限与 `api.modelSource`；翻译器侧生成提交代码仍为 planned）；浏览器端 React 界面、HTTP 路由、会话投影、槽位与多语言共 18 项 dropped；工具、命令、`systemPrompt` 可映射但需构建期静态声明（planned）；日志、生命周期、服务查找、设置由兼容层 shim。**尚未实现**：兼容层运行时（Cordis 子集）、构建打包、产物与兼容报告随包。
 
@@ -334,6 +337,8 @@
 
 【现状·读码推断】插件页面沿工作台共享布局和 i18n；设置提供安装预览、授权、运行状态、停用、升级和计划管理。计划显示目标会话、模型调用次数、单次输出和期限，结果取 daemon 回执；关闭视图不结束任务。[PluginDetailPane](../web/src/components/PluginDetailPane.svelte)、[PluginJobs](../web/src/components/PluginJobs.svelte)。
 
+【现状·读码推断】设置分类以 `SETTINGS_TABS` 为唯一清单，顺序为：模型、角色、能力、浏览器、MCP 服务、插件、偏好、外观、安全防护、统计、项目。MCP 服务是独立的系统设置分类，不属于插件，其监听、令牌和审批不经插件宿主；插件分类只管理扩展包。[settings-tabs.ts:24](../web/src/lib/settings-tabs.ts#L24)。
+
 【现状·已运行验证】UI、HTTP、后台共用资源 CAS 与写事件；SSE 原子获取快照和订阅边界，溢出 reset 后重读，撤权结束订阅。设置变化通过 config.changed 更新宿主快照；不建立前端业务持久化权威。[plugins.rs:107](../crates/magi-api/src/routes/plugins.rs#L107)、[extension_runtime:239](../crates/magi-daemon/src/daemon/extension_runtime.rs#L239)。
 
 ## 9. 安装、升级与生命周期
@@ -375,7 +380,7 @@
 | 目标（推迟） | P3 pi 翻译器 | 本地系统稳定后另启；固定版本／API 子集／一致性报告，再开放来源开关 |
 | 目标（推迟） | P4 DSH 翻译器 | P3 适配基础后推进；完整依赖审计和必需语义报告，不嵌入第二内核 |
 
-【目标】当前不创建 pi／DSH 来源开关、空适配器或兼容声明。原生 MCP 不列为插件。发布签名、公钥托管与官方目录内容须由发布者决定，不把本地开发密钥当官方信任根。
+【现状】`scripts/compat/` 只是离线静态分析，不属于 P3／P4 交付，也不是翻译器运行时。【目标】当前不创建 pi／DSH 来源开关、空适配器或兼容声明。原生 MCP 不列为插件。发布签名、公钥托管与官方目录内容须由发布者决定，不把本地开发密钥当官方信任根。
 
 ## 12. 验收与证据边界
 
@@ -387,6 +392,7 @@
 | 现状·已运行验证 | `npm run test:local-plugins-ui` | 在同一纵向流程追加真实 Electron Chromium：设置页创建计划、展示目标会话／预算／daemon 回执，桌面与 390px 深色视口无横向溢出；21 项总检查通过 |
 | 现状·已运行验证 | `MAGI_PLUGIN_TEST_APP=<Magi.app> npm run test:local-plugins` | 2026-11-03：对 `npm run package --workspace @magi/desktop -- --dir` 生成的 macOS arm64 目录包，直接启动包内 daemon，只使用随包 Node（不设 `MAGI_EXTENSION_NODE`、不读 PATH），同一 20 项纵向流程全部通过；未签名、未生成 dmg，未在干净机器上安装 |
 | 现状·已运行验证 | `npm run test:electron-plugins` | 同一目录包经 CDP 驱动真实打包 Electron：工作区导航与 MCP 服务 88 项通过（该脚本不含扩展内容；扩展的界面验收见 `test:local-plugins-ui`）。同一脚本某次运行曾在“桌面设置展示 daemon 的连接统计”处等待超时，重跑通过，按时序不稳定记录，未定位根因 |
+| 现状·已运行验证 | `npm run test:compat` | 2026-11-05：静态兼容分析 5 项通过（生态识别、能力状态、必需能力判定、命令行退出码）；只证明分析工具行为，不证明任何上游包可运行 |
 | 现状·已运行验证 | `cargo test -p magi-extension-host --all-targets` | 15 个单元＋17 个真实 Node 集成通过，含模型预算、独立取消、异常、guard、卡死回收与长路径端点 |
 | 现状·已运行验证 | `cargo test -p magi-plugin-system --all-targets` | 包／生命周期／资源／计划持久化及签名目录定向套件通过 |
 | 现状·已运行验证 | API／daemon 定向回归 | Turn 接纳前取消计划收口、models 未授权拒绝、命令清单准入通过 |

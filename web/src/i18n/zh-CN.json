@@ -3211,7 +3211,7 @@
   "mcpServer.network.mode": "地址类型",
   "mcpServer.network.modeQuick": "临时地址（未配置固定域名）",
   "mcpServer.network.manageClients": "配置客户端权限",
-  "mcpServer.network.lifecycle": "关闭与重启规则",
+  "mcpServer.network.lifecycle": "关闭与重启规则：",
   "mcpServer.quickAdd.manual": "手动令牌连接（Bearer / JSON / 命令）",
   "mcpServer.named.notConfigured": "未配置",
   "mcpServer.named.configure": "配置固定地址",

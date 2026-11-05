@@ -3211,7 +3211,7 @@
   "mcpServer.network.mode": "Address type",
   "mcpServer.network.modeQuick": "Temporary address (no fixed domain configured)",
   "mcpServer.network.manageClients": "Configure client access",
-  "mcpServer.network.lifecycle": "Shutdown and restart behavior",
+  "mcpServer.network.lifecycle": "Shutdown and restart behavior:",
   "mcpServer.quickAdd.manual": "Manual token connection (Bearer / JSON / command)",
   "mcpServer.named.notConfigured": "Not configured",
   "mcpServer.named.configure": "Configure a fixed address",

@@ -683,10 +683,10 @@
           : status.network.error}
       </p>
     {/if}
-    <details class="network-disclosure">
-      <summary>{i18n.t('mcpServer.network.lifecycle')}</summary>
-      <p class="meta">{i18n.t('mcpServer.network.autoStop')}</p>
-    </details>
+    <p class="meta">
+      <strong>{i18n.t('mcpServer.network.lifecycle')}</strong>{' '}
+      {i18n.t('mcpServer.network.autoStop')}
+    </p>
 
     <div class="named-tunnel" data-mcp-named-tunnel="1">
       <h4>{i18n.t('mcpServer.named.section')}</h4>
