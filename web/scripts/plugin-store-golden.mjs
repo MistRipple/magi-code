@@ -56,5 +56,22 @@ await withGoldenViteServer(async (server) => {
     );
     assert.equal(items.length, 2);
   }
+  // 搜索跨状态分组按匹配度：精确包名优先，其次作用域短名、前缀、描述与 registry 相关结果。
+  {
+    const names = ['unrelated-z', 'dsh-rea-agents', '@scope/dsh-rea', 'dsh-rea', 'unrelated-a'];
+    const items = buildStoreItems([{
+      ...installed('local-active'), active: true,
+      manifest: { ...installed('local-active').manifest, description: 'dsh-rea related' },
+    }], [], names.map((name) => upstream({ package: name, name })), text);
+    assert.deepEqual(filterStoreItems(items, 'all', 'dsh-rea').map((i) => i.name),
+      ['dsh-rea', '@scope/dsh-rea', 'dsh-rea-agents', 'local-active', 'unrelated-z', 'unrelated-a']);
+    assert.equal(filterStoreItems(items, 'available', 'DSH-REA')[0].name, 'dsh-rea');
+    assert.equal(filterStoreItems(items, 'installed', 'dsh-rea')[0].id, 'local-active');
+  }
+  // 刚安装后的条目尚未拿到上游刷新结果，也能用来源包名搜索并保持选择。
+  {
+    const items = buildStoreItems([installed('custom-title', { kind: 'upstream', location: 'dsh:dsh-rea@1.2.0' })], [], [], text);
+    assert.equal(filterStoreItems(items, 'all', 'dsh-rea').length, 1);
+  }
   console.log('plugin-store golden passed');
 });

@@ -76,11 +76,12 @@ function candidateBody(candidate: PluginCandidate, expectedDigest?: string): str
 }
 
 /** 准备阶段：daemon 校验候选包并给出与已安装版本的权限差异，不写入任何状态。 */
-export async function previewPluginCandidate(candidate: PluginCandidate): Promise<PluginCandidatePreview> {
+export async function previewPluginCandidate(candidate: PluginCandidate, signal?: AbortSignal): Promise<PluginCandidatePreview> {
   const response = await pluginRequest('/api/plugins/preview', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: candidateBody(candidate),
+    signal,
   });
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.preview'), response);
   return await response.json() as PluginCandidatePreview;
@@ -133,8 +134,8 @@ export async function installFromPluginCenter(entry: PluginCenterEntry): Promise
 }
 
 /** 在上游生态（DSH、pi）的官方 npm 发布中搜索；空查询列出该生态的常见包。 */
-export async function searchUpstreamPlugins(query: string): Promise<PluginUpstreamProjection> {
-  const response = await pluginRequest(`/api/plugins/upstream?q=${encodeURIComponent(query)}`);
+export async function searchUpstreamPlugins(query: string, signal?: AbortSignal): Promise<PluginUpstreamProjection> {
+  const response = await pluginRequest(`/api/plugins/upstream?q=${encodeURIComponent(query)}`, { signal });
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.upstream'), response);
   return await response.json() as PluginUpstreamProjection;
 }
@@ -149,11 +150,12 @@ function upstreamBody(entry: Pick<PluginUpstreamEntry, 'ecosystem' | 'package' |
 }
 
 /** 准备阶段：daemon 取包、核对完整性并翻译，返回翻译结果与权限差异，不写入任何状态。 */
-export async function previewUpstreamPlugin(entry: PluginUpstreamEntry): Promise<PluginUpstreamPreview> {
+export async function previewUpstreamPlugin(entry: PluginUpstreamEntry, signal?: AbortSignal): Promise<PluginUpstreamPreview> {
   const response = await pluginRequest('/api/plugins/upstream/preview', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: upstreamBody(entry),
+    signal,
   });
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.upstreamPreview'), response);
   return await response.json() as PluginUpstreamPreview;

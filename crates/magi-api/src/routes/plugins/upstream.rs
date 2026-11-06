@@ -17,6 +17,8 @@ use magi_app_server_protocol::generated::{
 use magi_plugin_system::npm;
 use std::path::Path as FsPath;
 
+pub(super) mod icons;
+
 /// registry 的开发与验收覆盖入口；默认使用 npm 官方 registry。
 pub(super) const NPM_REGISTRY_ENV: &str = "MAGI_NPM_REGISTRY";
 const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
@@ -194,11 +196,7 @@ pub(super) async fn search(
             ecosystem,
         });
     }
-    entries.sort_by(|a, b| {
-        b.official
-            .cmp(&a.official)
-            .then_with(|| a.package.cmp(&b.package))
-    });
+    // 保留 registry 的相关度顺序；发布者身份与名称不能覆盖用户的搜索匹配度。
     Ok(Json(PluginUpstreamProjection {
         registry,
         entries,

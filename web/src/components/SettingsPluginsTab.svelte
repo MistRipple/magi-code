@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy, tick, untrack } from 'svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import {
@@ -31,6 +32,9 @@
   let list = $state<PluginList | null>(null);
   let address = $state('');
   let busy = $state(false);
+  let busyLabel = $state('');
+  let previewController = $state<AbortController | null>(null);
+  let detailPane: HTMLElement;
   let message = $state('');
   let center = $state<PluginCenterProjection | null>(null);
   let centerUrl = $state('');
@@ -41,6 +45,7 @@
   let centerDraftBaseline = $state('');
   let listRequestSeq = 0;
   let centerRequestSeq = 0;
+  let centerFailure = $state('');
   let guideOpen = $state(false);
   /** 已通过准备阶段、等待用户确认的候选包；确认前不写入任何安装状态。 */
   type Staged =
@@ -49,6 +54,8 @@
   let staged = $state<Staged | null>(null);
   let upstream = $state<PluginUpstreamProjection | null>(null);
   let upstreamSeq = 0;
+  let upstreamLoading = $state(false);
+  let searchRetry = $state(0);
   const plugins = $derived(list?.plugins ?? []);
 
   async function refresh(): Promise<void> {
@@ -56,7 +63,7 @@
     const installed = await listInstalledPlugins();
     if (requestSeq !== listRequestSeq) return;
     list = installed;
-    await refreshCenter();
+    void refreshCenter();
   }
 
   async function refreshCenter(): Promise<void> {
@@ -65,6 +72,7 @@
       const next = await fetchPluginCenter();
       if (requestSeq !== centerRequestSeq) return;
       center = next;
+      centerFailure = '';
       // 只在首次读取和保存后同步输入框，避免用户正在输入时被周期刷新覆盖。
       if (!centerSynced) {
         centerSynced = true;
@@ -79,19 +87,20 @@
     } catch (error) {
       if (requestSeq !== centerRequestSeq) return;
       // 插件中心不可用不应阻止管理已安装插件。
-      message = describe(error);
+      centerFailure = describe(error);
     }
   }
 
   /** 搜索上游生态的官方 npm 发布。失败只影响上游条目，不影响已安装与插件中心。 */
-  async function refreshUpstream(text: string): Promise<void> {
-    const requestSeq = ++upstreamSeq;
+  async function refreshUpstream(text: string, requestSeq: number, signal: AbortSignal): Promise<void> {
     try {
-      const next = await searchUpstreamPlugins(text);
+      const next = await searchUpstreamPlugins(text, signal);
       if (requestSeq === upstreamSeq) upstream = next;
     } catch (error) {
-      if (requestSeq !== upstreamSeq) return;
+      if (signal.aborted || requestSeq !== upstreamSeq) return;
       upstream = { registry: upstream?.registry ?? '', entries: [], error: describe(error) };
+    } finally {
+      if (requestSeq === upstreamSeq) upstreamLoading = false;
     }
   }
 
@@ -120,8 +129,17 @@
   });
 
   /** 执行一次改变状态的操作并刷新 daemon 事实；成功由界面状态本身体现，只有失败才提示。 */
-  async function run(operation: () => Promise<void>): Promise<void> {
+  async function revealFeedback(): Promise<void> {
+    await tick();
+    if (!detailPane) return;
+    detailPane.scrollTop = 0;
+    detailPane.scrollIntoView({ block: 'nearest' });
+  }
+
+  async function run(operation: () => Promise<void>, label = i18n.t('common.loading')): Promise<void> {
+    if (busy) return;
     busy = true;
+    busyLabel = label;
     message = '';
     try {
       await operation();
@@ -129,6 +147,7 @@
     } catch (error) {
       message = describe(error);
       await refresh().catch(() => undefined);
+      await revealFeedback();
     } finally {
       busy = false;
     }
@@ -141,34 +160,45 @@
     return file ? await file.arrayBuffer() : null;
   }
 
-  async function stageUpstream(entry: PluginUpstreamEntry): Promise<void> {
+  function cancelPreview(): void {
+    if (previewController) {
+      previewController.abort();
+      previewController = null;
+      busy = false;
+    }
+    staged = null;
+  }
+
+  async function prepareCandidate(load: (signal: AbortSignal) => Promise<Staged>): Promise<void> {
+    if (busy) return;
+    const controller = new AbortController();
+    previewController = controller;
     busy = true;
+    busyLabel = i18n.t('settings.plugins.candidate.preparing');
     message = '';
     staged = null;
     try {
-      const preview = await previewUpstreamPlugin(entry);
-      if (preview.candidate.operation === 'unchanged') message = i18n.t('settings.plugins.candidate.unchanged');
-      else staged = { kind: 'upstream', entry, preview };
+      const next = await load(controller.signal);
+      if (controller.signal.aborted) return;
+      const preview = next.kind === 'upstream' ? next.preview.candidate : next.preview;
+      if (preview.operation === 'unchanged') message = i18n.t('settings.plugins.candidate.unchanged');
+      else staged = next;
+      await revealFeedback();
     } catch (error) {
+      if (controller.signal.aborted) return;
       message = describe(error);
+      await revealFeedback();
     } finally {
-      busy = false;
+      if (previewController === controller) { previewController = null; busy = false; }
     }
   }
 
+  async function stageUpstream(entry: PluginUpstreamEntry): Promise<void> {
+    await prepareCandidate(async (signal) => ({ kind: 'upstream', entry, preview: await previewUpstreamPlugin(entry, signal) }));
+  }
+
   async function stage(candidate: PluginCandidate): Promise<void> {
-    busy = true;
-    message = '';
-    staged = null;
-    try {
-      const preview = await previewPluginCandidate(candidate);
-      if (preview.operation === 'unchanged') message = i18n.t('settings.plugins.candidate.unchanged');
-      else staged = { kind: 'file', candidate, preview };
-    } catch (error) {
-      message = describe(error);
-    } finally {
-      busy = false;
-    }
+    await prepareCandidate(async (signal) => ({ kind: 'file', candidate, preview: await previewPluginCandidate(candidate, signal) }));
   }
 
   async function stageFile(event: Event): Promise<void> {
@@ -190,7 +220,11 @@
       else await applyPluginCandidate(pending.candidate, pending.preview);
       staged = null;
       address = '';
-    });
+      const preview = pending.kind === 'upstream' ? pending.preview.candidate : pending.preview;
+      selectedId = preview.manifest.id;
+      filter = 'all';
+      page = 1;
+    }, i18n.t('settings.plugins.candidate.installing'));
   }
 
   function permissionText(permission: PluginPermission): string {
@@ -222,7 +256,7 @@
   /** 默认选中当前页第一项；所选插件不在当前页（翻页、过滤后）时回到第一项。 */
   const selected = $derived<StoreItem | null>(view.rows.find((entry) => entry.id === selectedId) ?? view.rows[0] ?? null);
   const groups = $derived(
-    GROUPS.map((group) => ({
+    query.trim() ? (view.rows.length ? [{ group: 'results', total: filtered.length, rows: view.rows }] : []) : GROUPS.map((group) => ({
       group,
       total: filtered.filter((entry) => storeGroup(entry) === group).length,
       rows: view.rows.filter((entry) => storeGroup(entry) === group),
@@ -261,9 +295,25 @@
   $effect(() => {
     const text = query.trim();
     void pluginRegistryRevision();
-    const timer = setTimeout(() => void refreshUpstream(text), text ? 350 : 0);
-    return () => clearTimeout(timer);
+    void searchRetry;
+    const requestSeq = ++upstreamSeq;
+    const controller = new AbortController();
+    untrack(() => { upstream = null; upstreamLoading = true; });
+    const timer = setTimeout(() => void refreshUpstream(text, requestSeq, controller.signal), text ? 350 : 0);
+    return () => { clearTimeout(timer); controller.abort(); };
   });
+
+  function selectItem(item: StoreItem): void {
+    cancelPreview();
+    message = '';
+    selectedId = item.id;
+    if (detailPane) detailPane.scrollTop = 0;
+  }
+
+  function changeQuery(): void { cancelPreview(); message = ''; selectedId = null; }
+  onDestroy(() => { previewController?.abort(); });
+
+  function changePage(next: number): void { cancelPreview(); message = ''; selectedId = null; page = next; }
 
   $effect(() => {
     if (centerSynced && centerDraftBaseline) saveViewDraft('plugin-sources', centerDraftBaseline, { centerUrl, centerKeyId, centerPublicKey, address }, 'memory');
@@ -287,8 +337,128 @@
 <div hidden={sourcesOpen || guideOpen}>
 <div class="apple-manager">
 <div class="apple-scroller-proxy">
+  <div class="settings-section store-section">
+    <div class="settings-section-header">
+      <div>
+        <div class="settings-section-title">{i18n.t('settings.plugins.store.title')}</div>
+        <div class="settings-section-desc">{i18n.t('settings.plugins.store.desc')}</div>
+      </div>
+      <div class="settings-section-actions">
+        <button class="btn btn--sm btn--secondary" data-testid="plugin-guide-toggle" onclick={() => { guideOpen = true; }}>
+          <Icon name="file-text" size={13} />
+          <span>{i18n.t('settings.plugins.guide.toggle')}</span>
+        </button>
+        <button class="btn btn--sm btn--secondary" data-testid="plugin-sources-open" onclick={() => { sourcesOpen = true; }}>
+          <Icon name="plus" size={13} />
+          <span>{i18n.t('settings.plugins.store.sources')}</span>
+        </button>
+      </div>
+    </div>
+
+    {#if upstream?.error}
+      <div class="settings-notice settings-notice--warn store-center-error" data-testid="plugin-upstream-error" role="status">
+        <Icon name="alert-triangle" size={14} />
+        <span>{i18n.t('settings.plugins.upstream.searchFailed', { reason: upstream.error })}</span>
+        <button class="btn btn--sm btn--secondary" onclick={() => { searchRetry += 1; }}>{i18n.t('settings.plugins.center.retry')}</button>
+      </div>
+    {/if}
+    {#if center?.error || centerFailure}
+      <div class="settings-notice settings-notice--warn store-center-error" data-testid="plugin-center-error" role="status">
+        <Icon name="alert-triangle" size={14} />
+        <span>{i18n.t('settings.plugins.center.loadFailed', { reason: center?.error || centerFailure })}</span>
+        <button class="plugin-link" onclick={() => void refreshCenter()}>{i18n.t('settings.plugins.center.retry')}</button>
+      </div>
+    {/if}
+
+    {#if !query.trim()}
+      <div class="settings-row-desc" data-testid="plugin-upstream-hint">{i18n.t('settings.plugins.upstream.searchHint')}</div>
+    {/if}
+
+    <div class="store-toolbar">
+      <div class="store-search">
+        <input class="form-input" data-testid="plugin-search" type="search" bind:value={query} oninput={changeQuery} disabled={busy && !previewController} placeholder={i18n.t('settings.plugins.store.search')} aria-label={i18n.t('settings.plugins.store.search')} aria-controls="plugin-search-results" />
+        {#if upstreamLoading}
+          <span class="store-search-status" data-testid="plugin-search-loading" role="status"><Icon name="loader" class="spinning" size={16} /><span>{i18n.t('settings.plugins.store.searching')}</span></span>
+        {/if}
+      </div>
+      <div class="settings-subtabs store-filters" role="tablist">
+        {#each [['all', 'filter.all'], ['installed', 'filter.installed'], ['available', 'filter.available'], ['updatable', 'filter.updatable']] as [id, key] (id)}
+          {#if id !== 'updatable' || counts.updatable > 0}
+            <button type="button" role="tab" class="settings-subtab" class:active={filter === id} aria-selected={filter === id} data-testid={`plugin-filter-${id}`} disabled={busy && !previewController} onclick={() => { changeQuery(); filter = id as StoreFilter; }}>
+              {i18n.t(`settings.plugins.store.${key}`)} <span class="store-count">{counts[id as StoreFilter]}</span>
+            </button>
+          {/if}
+        {/each}
+      </div>
+    </div>
+
+    <div class="store" data-testid="plugin-store">
+      <aside class="store-list">
+        <div class="store-scroll" data-testid="plugin-list" id="plugin-search-results" aria-busy={upstreamLoading}>
+          {#each groups as entry (entry.group)}
+            <div class="store-group" data-group={entry.group}>
+              <span>{entry.group === 'results' ? i18n.t('settings.plugins.store.results') : i18n.t(`settings.plugins.store.group.${entry.group}`)}</span>
+              <span class="store-count">{entry.total}</span>
+            </div>
+            {#each entry.rows as item (item.id)}
+              <button
+                type="button"
+                class="store-item"
+                class:selected={selected?.id === item.id}
+                aria-current={selected?.id === item.id ? 'true' : undefined}
+                data-testid="plugin-row"
+                data-plugin-id={item.id}
+                data-status={item.status}
+                data-group={entry.group}
+                onclick={() => selectItem(item)}
+                disabled={busy && !previewController}
+              >
+                <span class="settings-icon-tile" aria-hidden="true"><PluginIcon pluginId={item.id} icon={item.installed?.manifest.icon} upstream={item.installed ? null : item.upstream} revision={item.installed?.digest ?? ''} size={18} /></span>
+                <span class="store-item-copy">
+                  <span class="store-item-name">{item.name}</span>
+                  <span class="store-item-desc">{item.description}</span>
+                </span>
+                <span class="store-item-state" data-state={item.updatable ? 'updatable' : item.status}>
+                  {#if item.installed?.runtime && (item.installed.runtime.state === 'failed' || item.installed.runtime.state === 'restarting')}
+                    <span
+                      class="store-item-alert"
+                      role="img"
+                      aria-label={i18n.t(`settings.plugins.runtime.state.${item.installed.runtime.state}`)}
+                      title={i18n.t(`settings.plugins.runtime.state.${item.installed.runtime.state}`)}
+                    ><Icon name="warning" size={14} /></span>
+                  {:else if item.updatable}
+                    <Icon name="download" size={14} />
+                  {:else if item.installed}
+                    <Icon name="check-circle" size={14} />
+                  {:else}
+                    <Icon name="plus" size={14} />
+                  {/if}
+                  <span class="store-item-version">v{item.version}</span>
+                </span>
+              </button>
+            {/each}
+          {:else}
+            <div class="settings-empty">
+              <span>{upstreamLoading ? i18n.t('settings.plugins.store.searching') : items.length === 0 ? i18n.t('settings.plugins.empty') : i18n.t('settings.plugins.store.noMatch')}</span>
+            </div>
+          {/each}
+        </div>
+
+        {#if view.pages > 1}
+          <div class="store-pager" data-testid="plugin-pager">
+            <span class="settings-row-desc">{i18n.t('settings.plugins.store.pageSummary', { from: (view.page - 1) * PAGE_SIZE + 1, to: Math.min(view.page * PAGE_SIZE, filtered.length), total: filtered.length })}</span>
+            <div class="store-pager-actions">
+              <button class="btn btn--sm btn--secondary" data-testid="plugin-page-prev" onclick={() => changePage(view.page - 1)} disabled={view.page <= 1 || (busy && !previewController)}>{i18n.t('settings.plugins.store.prev')}</button>
+              <span class="settings-row-desc">{view.page} / {view.pages}</span>
+              <button class="btn btn--sm btn--secondary" data-testid="plugin-page-next" onclick={() => changePage(view.page + 1)} disabled={view.page >= view.pages || (busy && !previewController)}>{i18n.t('settings.plugins.store.next')}</button>
+            </div>
+          </div>
+        {/if}
+      </aside>
+
+      <section class="store-detail" data-testid="plugin-detail" bind:this={detailPane} aria-busy={busy}>
   {#if message}
-    <div class="settings-notice plugins-status" data-testid="plugin-message" role="status"><Icon name="info" size={14} /><span>{message}</span></div>
+    <div class="settings-notice settings-notice--warn plugins-status" data-testid="plugin-message" role="status"><Icon name="info" size={14} /><span class="plugin-message-text">{message}</span></div>
   {/if}
 
   {#if staged}
@@ -385,131 +555,23 @@
         <div class="settings-card-foot">
           <button class="btn btn--sm btn--secondary" data-action="cancel-candidate" onclick={() => { staged = null; }} disabled={busy}>{i18n.t('settings.plugins.candidate.cancel')}</button>
           <button class="btn btn--sm btn--primary" data-action="confirm-candidate" onclick={() => void confirmStaged()} disabled={busy}>
-            {preview.operation === 'upgrade' ? i18n.t('settings.plugins.candidate.confirmUpgrade') : i18n.t('settings.plugins.candidate.confirmInstall')}
+            {#if busy}<Icon name="loader" class="spinning" size={14} /> {busyLabel}
+            {:else}{preview.operation === 'upgrade' ? i18n.t('settings.plugins.candidate.confirmUpgrade') : i18n.t('settings.plugins.candidate.confirmInstall')}{/if}
           </button>
         </div>
       </div>
     </div>
   {/if}
 
-  <div class="settings-section store-section">
-    <div class="settings-section-header">
-      <div>
-        <div class="settings-section-title">{i18n.t('settings.plugins.store.title')}</div>
-        <div class="settings-section-desc">{i18n.t('settings.plugins.store.desc')}</div>
-      </div>
-      <div class="settings-section-actions">
-        <button class="btn btn--sm btn--secondary" data-testid="plugin-guide-toggle" onclick={() => { guideOpen = true; }}>
-          <Icon name="file-text" size={13} />
-          <span>{i18n.t('settings.plugins.guide.toggle')}</span>
-        </button>
-        <button class="btn btn--sm btn--secondary" data-testid="plugin-sources-open" onclick={() => { sourcesOpen = true; }}>
-          <Icon name="plus" size={13} />
-          <span>{i18n.t('settings.plugins.store.sources')}</span>
-        </button>
-      </div>
-    </div>
-
-    {#if upstream?.error}
-      <div class="settings-notice settings-notice--warn store-center-error" data-testid="plugin-upstream-error" role="status">
-        <Icon name="alert-triangle" size={14} />
-        <span>{i18n.t('settings.plugins.upstream.searchFailed', { reason: upstream.error })}</span>
-      </div>
-    {/if}
-    {#if center?.error}
-      <div class="settings-notice settings-notice--warn store-center-error" data-testid="plugin-center-error" role="status">
-        <Icon name="alert-triangle" size={14} />
-        <span>{i18n.t('settings.plugins.center.loadFailed', { reason: center.error })}</span>
-        <button class="plugin-link" onclick={() => void refreshCenter()}>{i18n.t('settings.plugins.center.retry')}</button>
-      </div>
-    {/if}
-
-    {#if !query.trim()}
-      <div class="settings-row-desc" data-testid="plugin-upstream-hint">{i18n.t('settings.plugins.upstream.searchHint')}</div>
-    {/if}
-
-    <div class="store-toolbar">
-      <input class="form-input store-search" data-testid="plugin-search" type="search" bind:value={query} placeholder={i18n.t('settings.plugins.store.search')} />
-      <div class="settings-subtabs store-filters" role="tablist">
-        {#each [['all', 'filter.all'], ['installed', 'filter.installed'], ['available', 'filter.available'], ['updatable', 'filter.updatable']] as [id, key] (id)}
-          {#if id !== 'updatable' || counts.updatable > 0}
-            <button type="button" role="tab" class="settings-subtab" class:active={filter === id} aria-selected={filter === id} data-testid={`plugin-filter-${id}`} onclick={() => { filter = id as StoreFilter; }}>
-              {i18n.t(`settings.plugins.store.${key}`)} <span class="store-count">{counts[id as StoreFilter]}</span>
-            </button>
-          {/if}
-        {/each}
-      </div>
-    </div>
-
-    <div class="store" data-testid="plugin-store">
-      <aside class="store-list">
-        <div class="store-scroll" data-testid="plugin-list">
-          {#each groups as entry (entry.group)}
-            <div class="store-group" data-group={entry.group}>
-              <span>{i18n.t(`settings.plugins.store.group.${entry.group}`)}</span>
-              <span class="store-count">{entry.total}</span>
-            </div>
-            {#each entry.rows as item (item.id)}
-              <button
-                type="button"
-                class="store-item"
-                class:selected={selected?.id === item.id}
-                aria-current={selected?.id === item.id ? 'true' : undefined}
-                data-testid="plugin-row"
-                data-plugin-id={item.id}
-                data-status={item.status}
-                data-group={entry.group}
-                onclick={() => { selectedId = item.id; }}
-              >
-                <span class="settings-icon-tile" aria-hidden="true"><PluginIcon pluginId={item.id} icon={item.installed?.manifest.icon} revision={item.installed?.digest ?? ''} size={18} /></span>
-                <span class="store-item-copy">
-                  <span class="store-item-name">{item.name}</span>
-                  <span class="store-item-desc">{item.description}</span>
-                </span>
-                <span class="store-item-state" data-state={entry.group === 'updatable' ? 'updatable' : item.status}>
-                  {#if item.installed?.runtime && (item.installed.runtime.state === 'failed' || item.installed.runtime.state === 'restarting')}
-                    <span
-                      class="store-item-alert"
-                      role="img"
-                      aria-label={i18n.t(`settings.plugins.runtime.state.${item.installed.runtime.state}`)}
-                      title={i18n.t(`settings.plugins.runtime.state.${item.installed.runtime.state}`)}
-                    ><Icon name="warning" size={14} /></span>
-                  {:else if entry.group === 'updatable'}
-                    <Icon name="download" size={14} />
-                  {:else if item.installed}
-                    <Icon name="check-circle" size={14} />
-                  {:else}
-                    <Icon name="plus" size={14} />
-                  {/if}
-                  <span class="store-item-version">v{item.version}</span>
-                </span>
-              </button>
-            {/each}
-          {:else}
-            <div class="settings-empty">
-              <span>{items.length === 0 ? i18n.t('settings.plugins.empty') : i18n.t('settings.plugins.store.noMatch')}</span>
-            </div>
-          {/each}
-        </div>
-
-        {#if view.pages > 1}
-          <div class="store-pager" data-testid="plugin-pager">
-            <span class="settings-row-desc">{i18n.t('settings.plugins.store.pageSummary', { from: (view.page - 1) * PAGE_SIZE + 1, to: Math.min(view.page * PAGE_SIZE, filtered.length), total: filtered.length })}</span>
-            <div class="store-pager-actions">
-              <button class="btn btn--sm btn--secondary" data-testid="plugin-page-prev" onclick={() => { page = view.page - 1; }} disabled={view.page <= 1}>{i18n.t('settings.plugins.store.prev')}</button>
-              <span class="settings-row-desc">{view.page} / {view.pages}</span>
-              <button class="btn btn--sm btn--secondary" data-testid="plugin-page-next" onclick={() => { page = view.page + 1; }} disabled={view.page >= view.pages}>{i18n.t('settings.plugins.store.next')}</button>
-            </div>
-          </div>
-        {/if}
-      </aside>
-
-      <section class="store-detail" data-testid="plugin-detail">
+        {#if !staged}
         {#if selected}
           {#key selected.id}
             <PluginDetailPane
               item={selected}
               {busy}
+              {busyLabel}
+              previewing={previewController !== null}
+              onCancelPreview={cancelPreview}
               onInstall={() => void installItem(selected)}
               onUpdateFromCenter={() => void updateFromCenter(selected)}
               onUpgradeFile={(event) => void stageFile(event)}
@@ -522,6 +584,7 @@
           {/key}
         {:else}
           <div class="settings-empty"><span>{i18n.t('settings.plugins.detail.empty')}</span></div>
+        {/if}
         {/if}
       </section>
     </div>
@@ -597,7 +660,9 @@
 <style>
   .store-section { display: flex; flex: 1 0 auto; flex-direction: column; min-height: 0; }
   .store-toolbar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; margin: var(--space-3) 0 var(--space-2); }
-  .store-search { width: 240px; max-width: 100%; }
+  .store-search { display: flex; align-items: center; gap: var(--space-2); min-width: 0; flex: 1 1 260px; }
+  .store-search input { min-width: 0; flex: 1; }
+  .store-search-status { display: inline-flex; align-items: center; gap: var(--space-1); color: var(--foreground-muted); font-size: var(--text-xs); }
   .store-filters { margin-bottom: 0; border-bottom: 0; }
   .store-center-error { margin-top: var(--space-3); }
   .store-count { margin-left: 2px; color: var(--foreground-muted); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
@@ -610,6 +675,7 @@
   .store-group[data-group='updatable'] { color: var(--primary); }
   .store-item { display: flex; align-items: center; gap: var(--space-2); width: 100%; padding: 8px; border: 0; border-radius: 8px; background: transparent; color: inherit; text-align: left; cursor: pointer; }
   .store-item:hover { background: var(--surface-hover); }
+  .store-item:disabled { cursor: wait; opacity: .65; }
   .store-item.selected { background: var(--primary-muted); }
   .store-item:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
   .store-item-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
@@ -633,7 +699,9 @@
   .plugin-link { justify-self: start; align-self: flex-start; padding: 0; border: 0; background: transparent; color: var(--foreground-muted); font-size: var(--text-xs); cursor: pointer; }
   .plugin-link:hover { color: var(--primary); }
   .plugin-disabled { opacity: 0.45; pointer-events: none; }
-  .plugins-status { margin-top: var(--space-3); }
+  .plugins-status { margin: var(--space-3); }
+  .plugin-message-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .store-detail > .settings-section { padding: var(--space-3); margin: 0; }
   .sources-header { display: flex; align-items: center; justify-content: space-between; width: 100%; }
   .sources-header h3 { margin: 0; }
   .sources-body { display: grid; gap: var(--space-5); }

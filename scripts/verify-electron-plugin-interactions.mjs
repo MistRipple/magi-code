@@ -1,0 +1,106 @@
+// 打包版真实 Electron：在线搜索、原包图标、翻译失败、确认安装与窄屏。
+// CDP 只在取消／乱序／搜索失败用例中暂停或失败 HTTP 请求，不替代插件安装事实。
+import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { connectAppPage, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
+
+const root = dirname(dirname(fileURLToPath(import.meta.url)));
+const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-interaction-test/mac-arm64/Magi.app');
+const port = 38939, cdpPort = 9309, origin = `http://127.0.0.1:${port}`;
+const work = await mkdtemp(join(tmpdir(), 'magi-plugin-interactions-'));
+const output = join(root, 'target/plugin-acceptance/interactions');
+await mkdir(output, { recursive: true });
+const report = createReporter(), errors = [];
+let app, page, ui, previews = 0;
+const row = (pkg) => `[data-testid=plugin-row][data-plugin-id="upstream:dsh:${pkg}"]`;
+const visible = (selector) => page.evaluate(`(()=>{const r=document.querySelector(${JSON.stringify(selector)})?.getBoundingClientRect();return !!r && r.top>=0 && r.top<innerHeight && r.left>=0 && r.right<=innerWidth;})()`);
+const first = () => page.evaluate('document.querySelector("[data-testid=plugin-row]")?.getAttribute("data-plugin-id")');
+const query = (text) => page.evaluate(`(()=>{const input=document.querySelector('[data-testid=plugin-search]'); input.value=${JSON.stringify(text)};input.dispatchEvent(new Event('input',{bubbles:true}));return true;})()`);
+const search = async (text) => {
+  await query(text);
+  await waitFor(() => ui.exists('[data-testid=plugin-search-loading]'), '搜索加载反馈');
+  await waitFor(async () => !await ui.exists('[data-testid=plugin-search-loading]'), '搜索完成', 60_000);
+};
+const screenshot = (name) => ui.screenshot().then((data) => writeFile(join(output, `${name}.png`), Buffer.from(data, 'base64')));
+async function intercept(pattern) {
+  let request;
+  const off = page.on('Fetch.requestPaused', (event) => { request = event; });
+  await page.call('Fetch.enable', { patterns: [{ urlPattern: pattern, requestStage: 'Request' }] });
+  return { request: () => waitFor(() => request, '被暂停的请求'), stop: async () => { await page.call('Fetch.disable'); off(); } };
+}
+try {
+  report.check('隔离验收端口空闲', !await fetch(origin + '/health').then(() => true, () => false));
+  app = launchApp({ executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort, env: { MAGI_STATE_ROOT: join(work, 'state'), MAGI_DESKTOP_DAEMON_PORT: String(port), MAGI_OPEN_BROWSER: '0' } });
+  page = await waitFor(() => connectAppPage(cdpPort, port, errors), 'Magi 主窗口', 60_000); ui = pageTools(page);
+  await page.call('Network.enable');
+  page.on('Network.requestWillBeSent', ({ request }) => { if (request.url.endsWith('/api/plugins/upstream/preview')) previews++; });
+  await waitFor(() => ui.exists('[data-testid=sidebar-settings]'), '工作台'); await ui.click('[data-testid=sidebar-settings]');
+  await waitFor(async () => { if (!await ui.exists('[data-testid=settings-nav-plugins]')) return false; await ui.click('[data-testid=settings-nav-plugins]'); return ui.exists('[data-testid=plugin-search]'); }, '插件设置');
+  await query('dsh-rea');
+  await waitFor(() => ui.exists('[data-testid=plugin-search-loading]'), '搜索加载反馈');
+  report.check('搜索期间有真实加载动画和可读状态', await page.evaluate('getComputedStyle(document.querySelector("[data-testid=plugin-search-loading] svg")).animationName !== "none"'));
+  await waitFor(async () => !await ui.exists('[data-testid=plugin-search-loading]') && await ui.exists(row('dsh-rea')), '在线搜索 dsh-rea', 60_000);
+  report.check('精确匹配 dsh-rea 排在搜索结果首位', await first() === 'upstream:dsh:dsh-rea');
+  await ui.click(row('dsh-rea'));
+  const before = previews;
+  await page.evaluate('const button=document.querySelector("[data-testid=plugin-detail-install]");button.click();button.click();true');
+  await waitFor(() => ui.exists('[data-testid=plugin-operation-progress]'), '安装检查反馈');
+  report.check('重复点击只发起一次预览，按钮显示当前检查状态', previews === before + 1 && await page.evaluate('document.querySelector("[data-testid=plugin-detail-install]").disabled'));
+  await waitFor(() => ui.exists('[data-testid=plugin-message]'), '真实兼容失败提示', 180_000);
+  report.check('dsh-rea 的真实翻译失败在当前详情可见', await visible('[data-testid=plugin-message]')
+    && /dsh-mcp-client|dsh-typert-protocol|未登记|尚未实现/.test(await ui.text('[data-testid=plugin-message]'))
+    && await page.evaluate('document.querySelector("[data-testid=plugin-detail]").contains(document.querySelector("[data-testid=plugin-message]"))'));
+  await screenshot('dsh-rea-error');
+  await search('dsh-connect-workbuddy'); await ui.click(row('dsh-connect-workbuddy'));
+  await waitFor(() => page.evaluate(`Boolean(document.querySelector(${JSON.stringify(row('dsh-connect-workbuddy') + ' img')})?.naturalWidth)`), '未安装原包图标', 60_000);
+  report.check('未安装插件的列表与详情显示原包真实图标', await page.evaluate('document.querySelector(".pane-icon img")?.naturalWidth > 0'));
+  const paused = await intercept(`${origin}/api/plugins/upstream/preview`);
+  await ui.click('[data-testid=plugin-detail-install]'); const pending = await paused.request();
+  await waitFor(() => ui.exists('[data-testid=plugin-cancel-preview]'), '取消预览按钮'); await ui.click('[data-testid=plugin-cancel-preview]');
+  await waitFor(() => page.evaluate('!document.querySelector("[data-testid=plugin-detail-install]").disabled'), '取消后恢复可操作');
+  await page.call('Fetch.continueRequest', { requestId: pending.requestId }).catch(() => {}); await paused.stop();
+  report.check('取消慢预览后恢复操作且不出现迟到候选', !await ui.exists('[data-testid=plugin-candidate]'));
+  await ui.click('[data-testid=plugin-detail-install]');
+  await waitFor(() => ui.exists('[data-testid=plugin-candidate]'), '在线下载与翻译预览', 180_000);
+  report.check('确认预览出现在当前详情并自动进入可见区域', await visible('[data-testid=plugin-candidate]')
+    && await page.evaluate('document.querySelector("[data-testid=plugin-detail]").contains(document.querySelector("[data-testid=plugin-candidate]"))'));
+  await screenshot('preview');
+  await ui.click('[data-action=confirm-candidate]');
+  await waitFor(() => page.evaluate('document.querySelector("[data-action=confirm-candidate]")?.disabled'), '安装中的确认按钮');
+  report.check('确认安装期间显示进度并阻止重复提交', /安装|Installing/.test(await ui.text('[data-action=confirm-candidate]')));
+  const plugin = await waitFor(async () => (await (await fetch(origin + '/api/plugins')).json()).plugins.find((p) => p.source.location.startsWith('dsh:dsh-connect-workbuddy@')), '实际安装完成', 120_000);
+  await waitFor(() => ui.exists(`[data-testid=plugin-card][data-plugin-id="${plugin.manifest.id}"]`), '安装后保持选中');
+  await waitFor(() => page.evaluate('!document.querySelector("[data-action=activate]")?.disabled'), '后续操作恢复');
+  report.check('安装后保持当前插件详情且可继续授权激活', true);
+  const failure = await intercept(`${origin}/api/plugins/upstream?*`);
+  await query('dsh-rea'); const failed = await failure.request();
+  await page.call('Fetch.fulfillRequest', { requestId: failed.requestId, responseCode: 503, responseHeaders: [{ name: 'content-type', value: 'application/json' }], body: Buffer.from(JSON.stringify({ message: 'INTERACTION_SEARCH_FAILURE' })).toString('base64') });
+  await failure.stop();
+  await waitFor(() => ui.exists('[data-testid=plugin-upstream-error]'), '搜索错误反馈');
+  report.check('搜索失败停止加载并提供原位重试', !await ui.exists('[data-testid=plugin-search-loading]') && (await ui.text('[data-testid=plugin-upstream-error]')).includes('INTERACTION_SEARCH_FAILURE'));
+  await ui.click('[data-testid=plugin-upstream-error] button');
+  await waitFor(async () => !await ui.exists('[data-testid=plugin-search-loading]') && await ui.exists(row('dsh-rea')), '重试恢复', 60_000);
+  const stale = await intercept(`${origin}/api/plugins/upstream?q=dsh-rea`);
+  await query('dsh-rea '); const old = await stale.request();
+  await search('dsh-connect-workbuddy');
+  await page.call('Fetch.continueRequest', { requestId: old.requestId }).catch(() => {}); await stale.stop();
+  report.check('连续改词后旧请求不能覆盖新搜索结果', await first() === plugin.manifest.id);
+  await page.call('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: false });
+  await page.call('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: 'light' }] });
+  await search('dsh-rea'); await ui.click(row('dsh-rea')); await ui.click('[data-testid=plugin-detail-install]');
+  await waitFor(() => ui.exists('[data-testid=plugin-message]'), '窄屏失败反馈', 180_000);
+  report.check('390px 窄屏无横向溢出，失败原因自动可见', await page.evaluate('document.documentElement.scrollWidth <= innerWidth') && await visible('[data-testid=plugin-message]'));
+  await screenshot('error-390');
+  report.check('交互全程无未捕获脚本异常', !errors.some((e) => /Uncaught|TypeError|ReferenceError/.test(e)), errors.join('\n'));
+  console.log(report.summary());
+} catch (error) {
+  console.error(error); process.exitCode = 1;
+  if (ui) await screenshot('failure').catch(() => {});
+} finally {
+  await writeFile(join(output, 'results.json'), JSON.stringify(report.results, null, 2));
+  if (app) { await writeFile(join(output, 'electron.log'), app.log.join('')); await app.stop(); }
+  page?.close(); await rm(work, { recursive: true, force: true });
+}

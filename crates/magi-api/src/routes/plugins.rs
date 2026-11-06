@@ -58,6 +58,7 @@ pub fn routes() -> Router<ApiState> {
         )
         .route("/plugins/center/install", post(center_install))
         .route("/plugins/upstream", get(upstream::search))
+        .route("/plugins/upstream/icon", get(upstream::icons::icon))
         .route("/plugins/upstream/preview", post(upstream::preview))
         .route("/plugins/upstream/install", post(upstream::install))
         .route("/plugins/guide", get(guide))
@@ -222,7 +223,11 @@ async fn icon(State(state): State<ApiState>, Path(id): Path<String>) -> Result<R
     let (content_type, bytes) = package
         .icon()
         .ok_or_else(|| ApiError::NotFound("插件没有声明图标".into()))?;
-    let mut response = Response::new(bytes.to_vec().into());
+    Ok(icon_response(content_type, bytes.to_vec()))
+}
+
+fn icon_response(content_type: &'static str, bytes: Vec<u8>) -> Response {
+    let mut response = Response::new(bytes.into());
     *response.status_mut() = StatusCode::OK;
     response
         .headers_mut()
@@ -240,7 +245,7 @@ async fn icon(State(state): State<ApiState>, Path(id): Path<String>) -> Result<R
         "cache-control",
         HeaderValue::from_static("private, max-age=300"),
     );
-    Ok(response)
+    response
 }
 
 /// 视图经消息桥调用本插件宿主里注册的后端路由。API 只转交，授权与准入由执行端口判定。

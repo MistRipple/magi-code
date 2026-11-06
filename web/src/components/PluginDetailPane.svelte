@@ -13,6 +13,9 @@
   interface Props {
     item: StoreItem;
     busy: boolean;
+    busyLabel?: string;
+    previewing?: boolean;
+    onCancelPreview?: () => void;
     onInstall: () => void;
     onUpdateFromCenter: () => void;
     onUpgradeFile: (event: Event) => void;
@@ -23,7 +26,7 @@
     onOpenSettings: (tab: string) => void;
   }
   let {
-    item, busy, onInstall, onUpdateFromCenter, onUpgradeFile,
+    item, busy, busyLabel = '', previewing = false, onCancelPreview, onInstall, onUpdateFromCenter, onUpgradeFile,
     onUninstall, onActivate, onDeactivate, onDisable, onOpenSettings,
   }: Props = $props();
 
@@ -74,7 +77,7 @@
 <article class="pane" data-testid="plugin-card" data-plugin-id={item.id}>
   <header class="pane-head">
     <div class="pane-title">
-      <span class="pane-icon" aria-hidden="true"><PluginIcon pluginId={item.id} icon={item.installed?.manifest.icon} revision={item.installed?.digest ?? ''} size={28} /></span>
+      <span class="pane-icon" aria-hidden="true"><PluginIcon pluginId={item.id} icon={item.installed?.manifest.icon} upstream={item.installed ? null : item.upstream} revision={item.installed?.digest ?? ''} size={28} /></span>
       <h3>{item.name}</h3>
       <span class="settings-chip">v{item.version}</span>
       {#if item.status === 'active'}<span class="settings-chip settings-chip--ok">{i18n.t('settings.plugins.status.active')}</span>
@@ -129,14 +132,16 @@
       >{i18n.t('settings.plugins.uninstall')}</button>
     {:else}
       <button class="btn btn--lg btn--primary" data-testid="plugin-detail-install" onclick={onInstall} disabled={busy || (item.upstream !== null && !item.upstream.installable)} title={item.upstream?.blockedReason ?? undefined}>
-        <Icon name="download" size={13} />
-        <span>{i18n.t('settings.plugins.installAddress')}</span>
+        <Icon name={busy ? 'loader' : 'download'} class={busy ? 'spinning' : ''} size={13} />
+        <span>{busy ? busyLabel || i18n.t('common.loading') : i18n.t('settings.plugins.installAddress')}</span>
       </button>
     {/if}
   </div>
 
   {#if busy}
-    <div class="settings-hint" role="status"><Icon name="loader" size={13} class="spinning" /> {i18n.t('common.loading')}</div>
+    <div class="settings-hint" data-testid="plugin-operation-progress" role="status"><Icon name="loader" size={13} class="spinning" /> {busyLabel || i18n.t('common.loading')}
+      {#if previewing}<button class="btn btn--sm btn--secondary" data-testid="plugin-cancel-preview" onclick={onCancelPreview}>{i18n.t('common.cancel')}</button>{/if}
+    </div>
   {/if}
 
   <dl class="pane-facts">

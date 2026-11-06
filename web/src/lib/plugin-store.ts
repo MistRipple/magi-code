@@ -25,6 +25,8 @@ export interface StoreItem {
   status: StoreStatus;
   /** 插件中心有比已安装版本更新的版本。 */
   updatable: boolean;
+  /** registry 返回的相关度顺序；只用于当前搜索投影。 */
+  searchOrder?: number;
 }
 
 type Text = (manifest: PluginManifest, field: 'name' | 'description') => string;
@@ -91,12 +93,13 @@ export function buildStoreItems(
     const at = installed.source.location.lastIndexOf('@');
     if (at > 0) installedByUpstream.set(installed.source.location.slice(0, at), installed.manifest.id);
   }
-  for (const entry of upstream) {
+  for (const [searchOrder, entry] of upstream.entries()) {
     // 已安装的上游包并入对应的已安装条目，其余用 生态+包名 作为临时身份（安装翻译后才有 Magi 插件 ID）。
     const installedId = entry.installedPluginId ?? installedByUpstream.get(`${entry.ecosystem}:${entry.package}`);
     const existing = installedId ? items.get(installedId) : undefined;
     if (existing) {
       existing.upstream = entry;
+      existing.searchOrder = searchOrder;
       existing.updatable = existing.updatable || entry.state === 'updatable';
       continue;
     }
@@ -109,6 +112,7 @@ export function buildStoreItems(
       installed: null,
       catalog: null,
       upstream: entry,
+      searchOrder,
       status: 'available',
       updatable: false,
     });
@@ -122,7 +126,7 @@ export function buildStoreItems(
 
 export function filterStoreItems(items: StoreItem[], filter: StoreFilter, query: string): StoreItem[] {
   const needle = query.trim().toLowerCase();
-  return items.filter((item) => {
+  const matches = items.filter((item) => {
     if (filter === 'installed' && !item.installed) return false;
     if (filter === 'available' && item.installed) return false;
     if (filter === 'updatable' && !item.updatable) return false;
@@ -131,8 +135,21 @@ export function filterStoreItems(items: StoreItem[], filter: StoreFilter, query:
     return !needle
       || item.name.toLowerCase().includes(needle)
       || item.id.toLowerCase().includes(needle)
+      || item.installed?.source.location.toLowerCase().includes(needle)
       || item.description.toLowerCase().includes(needle);
   });
+  if (!needle) return matches;
+  const rank = (item: StoreItem): number => {
+    const names = [item.name, item.upstream?.package ?? item.id].map((name) => name.toLowerCase());
+    if (names.some((name) => name === needle)) return 0;
+    if (names.some((name) => name.split('/').at(-1) === needle)) return 1;
+    if (names.some((name) => name.startsWith(needle) || name.split('/').at(-1)?.startsWith(needle))) return 2;
+    if (names.some((name) => name.includes(needle))) return 3;
+    if (item.description.toLowerCase().includes(needle)) return 4;
+    return 5;
+  };
+  return matches.sort((a, b) => rank(a) - rank(b)
+    || (a.searchOrder ?? Number.MAX_SAFE_INTEGER) - (b.searchOrder ?? Number.MAX_SAFE_INTEGER));
 }
 
 export function paginate<T>(items: T[], page: number, pageSize: number): { rows: T[]; pages: number; page: number } {
