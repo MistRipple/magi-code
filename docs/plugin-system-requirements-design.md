@@ -467,7 +467,28 @@
 
 【现状·静态核对】本机已有 `dsh-connect-workbuddy@5.18.1` 原包按当前安装期必需类别重新检查，仍有三项阻塞：`ctx.sessionProjections`、`sessionProjections` 注入及 `session/event`。未放宽检查或跳过这些功能；需继续核对只读投影、条件注入和事件消费者的精确合同，并沿 daemon 事实接线。不能把本节回归通过解释为 WorkBuddy 已完成改造后验收。
 
-【未运行】本次未重新下载或登录 WorkBuddy、未打包新版 Electron、未进行原生设置页交互或 Windows 验收；pi 运行器、上游完整契约分母、依赖安装覆盖及旧安装记录器清理仍在 T1／T2／T4／T6 范围。运行验证使用当前工作树依赖锁及 macOS arm64 Node 26.13.0，不代表其他上游版本或平台通过。
+【未运行·截至本节记录】未重新下载或登录 WorkBuddy、未打包新版 Electron、未进行原生设置页交互或 Windows 验收；后续主分支打包与界面验证见 11.3。pi 运行器、上游完整契约分母、依赖安装覆盖及旧安装记录器清理仍在 T1／T2／T4／T6 范围。运行验证使用当前工作树依赖锁及 macOS arm64 Node 26.13.0，不代表其他上游版本或平台通过。
+
+### 11.3 主分支合并与目录包验收（2026-11-06）
+
+【现状·已运行验证】`codex/dsh-translator` 的正式代码已通过 `f459634a` 合入 `main`；另一个 `project-multi-root` 工作树的提交也已包含在主分支。工作树剩余未跟踪文件为历史截图／探测脚本和本地依赖链接，保留原处。合并后的真机验证补充三组修复：
+
+- `1685effa`：补全随包兼容层依赖与资源校验，修复设置默认值和原生服务回归，加入真实 Magi Main 验收入口。
+- `9cd4363b`：停用先取消在途租约；即使插件在收到 abort 后返回成功，宿主也拒绝迟到成功回执。此前真实验收中错误完成的 Turn 现在按失败／取消有限结算。
+- `8d42a7df`：设置页初始化失败沿现有状态区展示原因，读取成功前禁用保存。验收从只监听主 Renderer 扩展到插件 iframe 与 Electron 控制台日志，覆盖加载撞上生命周期排空的未捕获异常。
+
+【现状·已运行验证】最终目录包为 `target/electron-dist/mac-arm64/Magi.app`，构建身份 `8d42a7df`、`gitDirty=false`，Magi 3.0.62／Electron 45.0.0／Chromium 156.0.8078.48／随包 Node 26.13.0。使用本机已安装的同版本 Electron 重新组装目录包，`after-pack` 对资源摘要、兼容层依赖和随包 Node 的自检通过；包内 daemon 与本次 release 构建的 SHA-256 相同。
+
+| 已验证入口 | 结果与范围 |
+| --- | --- |
+| `MAGI_PLUGIN_TEST_APP="$PWD/target/electron-dist/mac-arm64/Magi.app" MAGI_PLUGIN_TEST_PORT=38936 npm run test:local-plugins-ui` | 26 项通过：包内 daemon／Node、公开 API、真实 Electron 工作台，覆盖在途停用、重新激活、升级清空授权与旧格式数据、卸载、模型来源撤销后明确失败且不回退；本地 HTTP 模型替身，无用户凭据 |
+| `npm run test:electron-plugin-runtime` | 最终包 16 项通过：真实 Magi Main 托管 sidecar、Cordis 晚注册、设置默认值与保存／重载、DSH 模型流式回复、停用与重启、390px 深色视口，以及 iframe／主 Renderer 无运行时异常。通过 CDP 暂停设置读取并注入 409，断言加载及失败时禁止保存、显示错误、配置版本不变，重新加载后恢复；旧包在新增断言上失败，修复包通过 |
+| `cargo test --release -p magi-extension-host --test host` | 23 项真实 Node 宿主回归通过，包含收到取消后仍返回成功的处理器；`cargo check --release -p magi-daemon` 通过 |
+| `npm run test:compat` | 设置初始化修复后 30 项通过；验收脚本语法及 `git diff --check` 通过 |
+
+【现状·证据】Electron 结果与截图保存在 `target/plugin-acceptance/runtime/` 的 `results.json`、`settings-desktop.png`、`conversation.png`、`inactive-390.png`、`electron.log` 和 `workbuddy-result.json`。设置读取失败用例为主动故障注入；其他生命周期与配置流程通过真实 daemon 执行。390px 为桌面 Electron 视口模拟，不是手机实机。
+
+【现状·仍未完成】真实 npm `dsh-connect-workbuddy@5.18.1` 原包在最终包的预览入口仍返回 HTTP 400，原因是 `ctx.sessionProjections`、`sessionProjections` 注入及 `session/event` 未支持；这是拒绝路径通过，不能解释为 WorkBuddy 登录态或模型调用通过。本轮未进行 Windows、干净 macOS 安装、真实付费模型与全仓测试；pi 运行器和 T1–T6 的其余范围仍未完成。
 
 ## 12. 验收与证据边界
 
