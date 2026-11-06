@@ -66,6 +66,7 @@ impl PluginManager {
             .plugins
             .get(id)
             .ok_or_else(|| conflict("插件未安装，不能升级"))?;
+        ensure_same_source(&current.source, &source)?;
         if current.digest == package.digest() {
             return Ok(());
         }
@@ -146,6 +147,7 @@ impl PluginManager {
             });
         };
         let installed = self.package(&manifest.id)?;
+        ensure_same_source(&current.source, source)?;
         let previous = &installed.manifest().permissions;
         let unchanged = current.digest == package.digest();
         let from_version = installed.manifest().data_schema_version;
@@ -166,6 +168,15 @@ impl PluginManager {
             data_schema_from: schema_changed.then_some(installed.manifest().data_schema_version),
             data_reset,
         })
+    }
+}
+
+/// 上游来源身份不可由同名 Magi ID 冒用，版本是同一来源的可变部分。
+fn ensure_same_source(current: &PluginSource, candidate: &PluginSource) -> Result<(), PluginError> {
+    match (current, candidate) {
+        (PluginSource::Upstream { ecosystem: a, package: b, .. }, PluginSource::Upstream { ecosystem: c, package: d, .. }) if a == c && b == d => Ok(()),
+        (PluginSource::Upstream { .. }, _) | (_, PluginSource::Upstream { .. }) => Err(conflict("插件 ID 已属于另一来源，不能作为升级替换")),
+        _ => Ok(()),
     }
 }
 

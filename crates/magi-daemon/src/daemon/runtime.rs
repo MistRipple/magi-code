@@ -1643,6 +1643,8 @@ impl DaemonRuntime {
         .with_tunnel_port(self.local_port)
         .with_plugin_manager(self.plugins.manager())
         .with_extension_status(self.plugins.extension_status())
+        .with_plugin_route_executor(self.plugins.route_executor())
+        .with_optional_plugin_toolchain(self.plugins.toolchain())
         .with_runtime_persistence(runtime_persistence)
         .with_workspace_history_restore({
             let repository = self.state_repository.clone();

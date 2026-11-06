@@ -38,8 +38,25 @@ pub(super) struct Blob {
 }
 
 impl PluginHostService {
+    fn catalog_changed(&self) {
+        if let Some(events) = self.events.get() {
+            events.publish(magi_event_bus::EventEnvelope::domain(
+                magi_core::EventId::unique("plugin-runtime-catalog"),
+                "plugin.registry.changed",
+                json!({}),
+            ));
+        }
+    }
+
     fn service_admitted(&self, plugin: &str, method: &str, params: &Value) -> Result<(), RpcError> {
         self.admitted(plugin)?;
+        if let Some(lease) = params.get("_instance").and_then(Value::as_str) {
+            self.manager
+                .lock()
+                .map_err(|_| RpcError::new(ErrorKind::Internal, "插件管理器不可用"))?
+                .check_runtime(plugin, lease)
+                .map_err(|error| RpcError::new(ErrorKind::StaleGeneration, error.to_string()))?;
+        }
         if matches!(method, "modelSource.set" | "modelSource.clear") {
             // 主对话内容会发往插件提供的端点，所以数据源必须逐项授权。
             let target = params
@@ -127,11 +144,37 @@ impl PluginHostService {
 }
 
 impl HostService for PluginHostService {
-    fn instance_detached(&self, plugin_id: &str) {
-        if let Some(settings) = self.settings.get() {
-            magi_conversation_runtime::main_model_sources::clear_plugin_sources(
-                settings, plugin_id,
-            );
+    fn instance_started(&self, plugin_id: &str, lease: &str) -> Result<(), RpcError> {
+        self.manager
+            .lock()
+            .map_err(|_| RpcError::new(ErrorKind::Internal, "插件管理器不可用"))?
+            .begin_runtime(plugin_id, &self.digest, lease)
+            .map_err(|error| RpcError::new(ErrorKind::PermissionDenied, error.to_string()))
+    }
+    fn instance_ready(&self, plugin_id: &str, lease: &str) -> Result<(), RpcError> {
+        self.manager
+            .lock()
+            .map_err(|_| RpcError::new(ErrorKind::Internal, "插件管理器不可用"))?
+            .ready_runtime(plugin_id, lease)
+            .map_err(|error| RpcError::new(ErrorKind::StaleGeneration, error.to_string()))?;
+        self.catalog_changed();
+        Ok(())
+    }
+    fn instance_ended(&self, plugin_id: &str, lease: &str) {
+        let removed = self.manager.lock().is_ok_and(|mut manager| {
+            if !manager.end_runtime(plugin_id, lease) {
+                return false;
+            }
+            // 与实例准入、目录写入持同一把锁，避免删除旧租约后误清理刚启动的新来源。
+            if let Some(settings) = self.settings.get() {
+                magi_conversation_runtime::main_model_sources::clear_plugin_sources(
+                    settings, plugin_id,
+                );
+            }
+            true
+        });
+        if removed {
+            self.catalog_changed();
         }
     }
 
@@ -236,7 +279,12 @@ impl HostService for PluginHostService {
                 native(plugin_id, method, params, Arc::default())
             });
         }
+        let lease = params
+            .get("_instance")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         if let Some(object) = params.as_object_mut() {
+            object.remove("_instance");
             object.remove("_context");
         }
         Box::pin(async move {
@@ -272,7 +320,89 @@ impl HostService for PluginHostService {
             manager_guard
                 .ensure_editing_admitted(&plugin_id)
                 .map_err(map_error)?;
+            if let Some(lease) = &lease {
+                manager_guard
+                    .check_runtime(&plugin_id, lease)
+                    .map_err(map_error)?;
+            }
             let result = match method.as_str() {
+                "catalog.replace" => {
+                    #[derive(serde::Deserialize)]
+                    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                    struct Replace {
+                        expected_revision: u64,
+                        catalog: magi_app_server_protocol::generated::PluginRuntimeCatalog,
+                    }
+                    let input: Replace = serde_json::from_value(params).map_err(|error| {
+                        RpcError::new(ErrorKind::InvalidParams, error.to_string())
+                    })?;
+                    let lease = lease.as_deref().ok_or_else(|| {
+                        RpcError::new(ErrorKind::StaleGeneration, "目录写入需要实例租约")
+                    })?;
+                    let previous = manager_guard
+                        .runtime_manifest(&plugin_id, true)
+                        .map_err(map_error)?
+                        .contributions
+                        .model_sources;
+                    let revision = manager_guard
+                        .replace_runtime_catalog(
+                            &plugin_id,
+                            lease,
+                            input.expected_revision,
+                            input.catalog,
+                        )
+                        .map_err(map_error)?;
+                    let current = manager_guard
+                        .runtime_manifest(&plugin_id, true)
+                        .map_err(map_error)?
+                        .contributions
+                        .model_sources;
+                    if let Some(settings) = &settings {
+                        for source in previous {
+                            if !current.iter().any(|item| item.id == source.id) {
+                                magi_conversation_runtime::main_model_sources::clear_plugin_source(
+                                    settings, &plugin_id, &source.id,
+                                );
+                            }
+                        }
+                    }
+                    if let Some(events) = events.get() {
+                        events.publish(magi_event_bus::EventEnvelope::domain(
+                            magi_core::EventId::unique("plugin-runtime-catalog"),
+                            "plugin.registry.changed",
+                            json!({}),
+                        ));
+                    }
+                    return Ok(json!({"revision": revision}));
+                }
+                "registration.check" => {
+                    let lease = lease.as_deref().ok_or_else(|| {
+                        RpcError::new(ErrorKind::StaleGeneration, "绑定需要实例租约")
+                    })?;
+                    let kind = params
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let name = params
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !manager_guard
+                        .runtime_registration_allowed(&plugin_id, lease, kind, name)
+                        .map_err(map_error)?
+                    {
+                        return Err(RpcError::new(
+                            ErrorKind::RegistrationDenied,
+                            "贡献未在当前运行目录登记或未授权",
+                        ));
+                    }
+                    return Ok(json!({}));
+                }
+                "settings.describe" => {
+                    return Ok(
+                        json!({"schema": manager_guard.runtime_manifest(&plugin_id, true).map_err(map_error)?.settings_schema}),
+                    );
+                }
                 "blob.put" => {
                     #[derive(serde::Deserialize)]
                     #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -389,9 +519,8 @@ impl HostService for PluginHostService {
                             RpcError::new(ErrorKind::InvalidParams, "sourceId 必须是字符串")
                         })?;
                     let title = manager_guard
-                        .package(&plugin_id)
+                        .runtime_manifest(&plugin_id, true)
                         .map_err(map_error)?
-                        .manifest()
                         .contributions
                         .model_sources
                         .iter()
@@ -732,7 +861,6 @@ mod tests {
         config.service = Some(service.clone());
         let group = magi_process::ManagedProcessGroup::new();
         let instance = launch(&group, config, 1).await.unwrap();
-        instance.stop().await;
         let manager = service.manager.lock().unwrap();
         assert_eq!(
             manager
@@ -745,6 +873,7 @@ mod tests {
             manager.read_settings("acme.services").unwrap().value,
             json!({"enabled": true})
         );
+        drop(manager);
         // 真实 Node 激活期间提交的数据源进入主对话目录，并带上清单里的标题。
         let settings = service.settings.get().unwrap();
         let catalog = magi_conversation_runtime::main_model_sources::catalog(settings).unwrap();
@@ -754,6 +883,12 @@ mod tests {
         assert_eq!(group["name"], "Acme Proxy");
         assert_eq!(group["models"][0]["displayName"], "Proxy Model");
         assert!(!catalog.to_string().contains("plugin-secret"));
+        instance.stop().await;
+        assert!(
+            magi_conversation_runtime::main_model_sources::sources(settings)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn source_input() -> serde_json::Value {
@@ -764,9 +899,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_instance_requests_and_cleanup_cannot_change_new_model_sources() {
+        use magi_conversation_runtime::main_model_sources as sources;
+        let (_dir, service) = fixture();
+        let settings = service.settings.get().unwrap();
+        service.instance_started("acme.services", "old").unwrap();
+        let mut input = source_input();
+        input["_instance"] = json!("old");
+        // 准入后尚未执行的写入也必须在真正提交时重新核对租约。
+        let delayed =
+            service.request_with_identity("acme.services".into(), "modelSource.set".into(), input);
+        service.instance_started("acme.services", "new").unwrap();
+        let mut input = source_input();
+        input["_instance"] = json!("new");
+        input["models"] = json!([{"id": "new-model"}]);
+        call(&service, "modelSource.set", input).await.unwrap();
+        assert!(delayed.await.is_err());
+        service.instance_ended("acme.services", "old");
+        assert!(
+            sources::effective_config(
+                settings,
+                &json!({
+                    "sourceId": "plugin/acme.services/proxy", "model": "new-model"
+                })
+            )
+            .is_ok()
+        );
+        service
+            .manager
+            .lock()
+            .unwrap()
+            .authorize("acme.services", vec![])
+            .unwrap();
+        service.instance_ended("acme.services", "new");
+        assert!(sources::sources(settings).unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn model_sources_are_declared_authorized_validated_and_revoked_with_the_instance() {
         use magi_conversation_runtime::main_model_sources as sources;
         let (_dir, service) = fixture();
+        service.instance_started("acme.services", "first").unwrap();
         let settings = Arc::clone(service.settings.get().unwrap());
         call(&service, "modelSource.set", source_input())
             .await
@@ -821,7 +994,7 @@ mod tests {
         );
 
         // 实例退出即撤销；已选用它的会话得到“不可用”，不会回退。
-        service.instance_detached("acme.services");
+        service.instance_ended("acme.services", "first");
         let error = sources::effective_config(
             &settings,
             &json!({"sourceId": "plugin/acme.services/proxy", "model": "m2"}),
@@ -831,6 +1004,7 @@ mod tests {
         assert!(sources::sources(&settings).unwrap().is_empty());
 
         // 撤权后写入口关闭。
+        service.instance_started("acme.services", "second").unwrap();
         call(&service, "modelSource.set", source_input())
             .await
             .unwrap();

@@ -33,6 +33,7 @@ const RESOURCE_SUBSCRIPTION_RECHECK: Duration = Duration::from_millis(500);
 
 mod center;
 mod download;
+mod upstream;
 #[cfg(test)]
 use center::{OFFICIAL_PLUGIN_CENTER_URL, is_official_center, read_center_config};
 use center::{center, center_install, guide, write_center_config};
@@ -56,6 +57,9 @@ pub fn routes() -> Router<ApiState> {
             axum::routing::put(write_center_config),
         )
         .route("/plugins/center/install", post(center_install))
+        .route("/plugins/upstream", get(upstream::search))
+        .route("/plugins/upstream/preview", post(upstream::preview))
+        .route("/plugins/upstream/install", post(upstream::install))
         .route("/plugins/guide", get(guide))
         .route("/plugins/commands", get(commands))
         .route("/plugins/{id}/jobs", get(list_jobs).post(create_job))
@@ -66,6 +70,9 @@ pub fn routes() -> Router<ApiState> {
             get(resource_events),
         )
         .route("/plugins/{id}/ui/{*path}", get(resource))
+        .route("/plugins/{id}/icon", get(icon))
+        .route("/plugins/{id}/routes", post(call_route))
+        .route("/plugins/{id}/settings/schema", get(settings_schema))
         .route(
             "/plugins/{id}/resources/{resource}",
             get(read_resource).put(write_resource),
@@ -207,6 +214,49 @@ async fn resource(
     Ok(response)
 }
 
+/// 已安装插件的图标。与视图资源不同，列表要展示所有已安装插件，所以不要求插件已激活；
+/// 只返回清单声明且通过包校验的那一个位图，其他包内文件不经此接口出去。
+async fn icon(State(state): State<ApiState>, Path(id): Path<String>) -> Result<Response, ApiError> {
+    let manager = locked(&state, "读取插件图标")?;
+    let package = manager.package(&id).map_err(plugin_error)?;
+    let (content_type, bytes) = package
+        .icon()
+        .ok_or_else(|| ApiError::NotFound("插件没有声明图标".into()))?;
+    let mut response = Response::new(bytes.to_vec().into());
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    // 位图只作图片展示；沙箱 CSP 让它即使被当文档打开也不能执行任何内容。
+    response.headers_mut().insert(
+        "content-security-policy",
+        HeaderValue::from_static("sandbox; default-src 'none'; img-src 'self'"),
+    );
+    response.headers_mut().insert(
+        "cache-control",
+        HeaderValue::from_static("private, max-age=300"),
+    );
+    Ok(response)
+}
+
+/// 视图经消息桥调用本插件宿主里注册的后端路由。API 只转交，授权与准入由执行端口判定。
+async fn call_route(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(_query): Query<PluginQuery>,
+    Json(request): Json<magi_app_server_protocol::generated::PluginRouteCallRequest>,
+) -> Result<Json<magi_app_server_protocol::generated::PluginRouteCallResult>, ApiError> {
+    let executor = state
+        .plugin_route_executor
+        .clone()
+        .ok_or_else(|| ApiError::Conflict("扩展宿主未运行".into()))?;
+    executor.call(id, request).await.map(Json)
+}
+
 async fn read_resource(
     State(state): State<ApiState>,
     Path((id, resource)): Path<(String, String)>,
@@ -298,13 +348,35 @@ async fn read_settings(
         .map_err(plugin_error)
 }
 
+async fn settings_schema(State(state): State<ApiState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    let manager = locked(&state, "读取插件设置 schema")?;
+    manager.read_settings(&id).map_err(plugin_error)?;
+    Ok(Json(serde_json::json!({"schema": manager.runtime_manifest(&id, true).map_err(plugin_error)?.settings_schema})))
+}
+
 async fn write_settings(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Query(_query): Query<PluginQuery>,
     Json(request): Json<ResourceWriteRequest>,
 ) -> Result<Json<magi_plugin_system::PluginResource>, ApiError> {
+    let digest = {
+        let manager = locked(&state, "校验插件设置")?;
+        manager.ensure_editing_admitted(&id).map_err(plugin_error)?;
+        manager.validate_settings(&id, &request.value).map_err(plugin_error)?;
+        let package = manager.package(&id).map_err(plugin_error)?;
+        package.manifest().extension.as_ref()
+            .is_some_and(|extension| extension.runtime_contributions.contains(&magi_app_server_protocol::generated::PluginRuntimeContributionKind::Settings))
+            .then(|| package.digest().to_string())
+    };
+    if digest.is_some() {
+        state.extension_status.as_ref().ok_or_else(|| ApiError::Conflict("扩展宿主未就绪".into()))?
+            .validate_settings(id.clone(), request.value.clone()).await.map_err(ApiError::InvalidInput)?;
+    }
     let mut manager = locked(&state, "写入插件设置")?;
+    if digest.as_deref().is_some_and(|digest| manager.package(&id).map_or(true, |package| package.digest() != digest)) {
+        return Err(ApiError::Conflict("设置校验后插件版本已变化".into()));
+    }
     manager.ensure_editing_admitted(&id).map_err(plugin_error)?;
     write_plugin_settings_with_event(
         &mut manager,
@@ -337,6 +409,11 @@ async fn load_package(
         (None, PluginSource::Builtin { .. }) => {
             return Err(ApiError::InvalidInput(
                 "内置插件必须通过内置安装入口".into(),
+            ));
+        }
+        (None, PluginSource::Upstream { .. }) => {
+            return Err(ApiError::InvalidInput(
+                "上游生态来源必须通过上游插件入口安装".into(),
             ));
         }
     };

@@ -1098,6 +1098,7 @@ fn run_conversation_loop_inner(
     let current_turn_contains_images = !images.is_empty();
     let vision_execution_config = match resolve_vision_execution_config(
         settings_store.or(live_settings_store).map(Arc::as_ref),
+        selected_main_source_id.as_deref(),
         &selected_context_model,
         current_turn_contains_images,
     ) {

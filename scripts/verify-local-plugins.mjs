@@ -59,8 +59,12 @@ async function settled(session, turn) {
 }
 async function pack(version, dataSchemaVersion) {
   const directory = join(work, version); await mkdir(join(directory, 'extension'), {recursive:true});
-  const manifest = {sdkVersion:2, id:'test.local', version, name:'本地验收插件', description:'公开接口纵向验收', permissions:[{kind:'extension',targets:['full-trust']},{kind:'storage',targets:['notes','__settings']},{kind:'models',targets:['default']}], extension:{hooks:[{name:'input',mode:'guard'}]}, dataSchemaVersion, settingsSchema:{type:'object',properties:{label:{type:'string'}},additionalProperties:false}, contributions:{resources:[{id:'notes',title:'笔记',description:''}],commands:['probe','status','wait','ask','taskless'].map(id=>({id,title:id,description:''}))}};
+  const manifest = {sdkVersion:2, id:'test.local', version, name:'本地验收插件', description:'公开接口纵向验收', icon:'ui/icon.png', permissions:[{kind:'extension',targets:['full-trust']},{kind:'storage',targets:['notes','__settings']},{kind:'models',targets:['default']}], extension:{hooks:[{name:'input',mode:'guard'}]}, dataSchemaVersion, settingsSchema:{type:'object',properties:{label:{type:'string'}},additionalProperties:false}, contributions:{resources:[{id:'notes',title:'笔记',description:''}],views:[{id:'page',title:'设置',entry:'ui/page.html',placements:['settings']}],commands:['probe','status','wait','ask','taskless'].map(id=>({id,title:id,description:''}))}};
   await writeFile(join(directory,'manifest.json'),JSON.stringify(manifest));
+  await mkdir(join(directory,'ui'),{recursive:true});
+  // 1x1 PNG：只为验证图标在列表、详情和设置导航中显示。
+  await writeFile(join(directory,'ui/icon.png'),Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==','base64'));
+  await writeFile(join(directory,'ui/page.html'),'<!doctype html><meta charset="utf-8"><p>local plugin page</p>');
   await writeFile(join(directory,'extension/index.mjs'), `
 import {execFile} from 'node:child_process'; import {promisify} from 'node:util';
 import {mkdtemp,writeFile,readFile,rm} from 'node:fs/promises'; import {tmpdir} from 'node:os'; import {join} from 'node:path';

@@ -89,7 +89,7 @@
     type ComposerPluginCommandOption,
     type ComposerSkillOption,
   } from '../lib/composer-actions';
-  import { pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
+  import { pluginProjection, pluginRegistryRevision, trackPluginProjection } from '../stores/plugin-registry.svelte';
   import {
     composerAttachmentTotal,
     MAX_COMPOSER_IMAGE_BYTES,
@@ -295,6 +295,9 @@
   let pickerError = $state<string | null>(null);
   let pickerLoadedOnce = false;
   let pickerModelsConfigKey = '';
+  // 已拉取列表对应的插件注册表修订。插件激活/停用/升级会增删其数据源，用户数据源配置不变；
+  // 此时保留当前列表、后台重拉，避免窗口重新获得焦点（也会递增修订）时列表闪空。
+  let pickerPluginRevision = -1;
   let pickerLoadPromise: Promise<void> | null = null;
 
   let settingsBootstrapRefreshKey = '';
@@ -1957,6 +1960,8 @@
       pickerLoadedOnce = false;
       pickerError = null;
     }
+    const pluginRevision = pluginRegistryRevision();
+    if (pickerLoadedOnce && pickerPluginRevision !== pluginRevision) pickerLoadedOnce = false;
     if (!pickerLoadedOnce && !pickerLoading) {
       void loadPickerModels();
     }
@@ -2462,9 +2467,13 @@
       : {};
   }
 
+  // 主对话目录由 daemon 合并“用户数据源”和“插件在本次运行中贡献的数据源”。
+  // key 只描述用户数据源：它变了，已拉取的列表属于旧配置，必须清空重拉。
+  // 没有用户数据源不等于没有可选模型（插件可以单独提供），所以空数组同样发起请求；
+  // 只有设置快照尚未就绪（config 为空）时才不请求。插件侧变化见 pickerPluginRevision。
   function orchestratorModelListConfigKey(config: Record<string, unknown> | null): string {
-    const sources = config?.sources;
-    if (!config || !Array.isArray(sources) || sources.length === 0) return '';
+    if (!config) return '';
+    const sources = Array.isArray(config.sources) ? config.sources : [];
     return JSON.stringify({ revision: Number(config.revision) || 0, sources });
   }
 
@@ -2578,6 +2587,7 @@
       if (pickerLoadedOnce && pickerModelsConfigKey === configKey && pickerModelCount > 0) {
         return;
       }
+      const pluginRevisionAtLoad = pluginRegistryRevision();
       pickerLoading = true;
       pickerError = null;
       try {
@@ -2603,10 +2613,12 @@
           messagesState.settingsBootstrapSnapshot = { ...snapshot, orchestratorModelError: undefined };
         }
         pickerModelsConfigKey = configKey;
+        pickerPluginRevision = pluginRevisionAtLoad;
         pickerLoadedOnce = true;
       } catch (error) {
         if (orchestratorModelListConfigKey(getOrchestratorConfigSnapshot()) !== configKey) return;
         pickerModelsConfigKey = configKey;
+        pickerPluginRevision = pluginRevisionAtLoad;
         pickerLoadedOnce = true;
         console.warn('[InputArea] 拉取主线模型列表失败:', error);
         pickerError = i18n.t('input.modelListLoadFailed');

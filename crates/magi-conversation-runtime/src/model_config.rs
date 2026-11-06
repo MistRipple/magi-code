@@ -224,6 +224,23 @@ impl NormalizedModelConfig {
                 && (config.api_protocol == ModelApiProtocol::AnthropicMessages)
                     != (cap.transport == magi_bridge_client::reasoning::ReasoningTransport::Openai)
         });
+        // 数据源条目自己声明的能力是事实，覆盖缓存里按同一地址探测到的结果。
+        if let (Some(declared), Some(model)) = (
+            value.get(crate::main_model_sources::DECLARED_REASONING_FIELD),
+            config.model.clone(),
+        ) {
+            let mut declared: ReasoningCapability = serde_json::from_value(declared.clone())
+                .map_err(|error| format!("来源声明的推理能力无效：{error}"))?;
+            declared.validate()?;
+            let openai_transport =
+                declared.transport == magi_bridge_client::reasoning::ReasoningTransport::Openai;
+            if (config.api_protocol == ModelApiProtocol::AnthropicMessages) == openai_transport {
+                return Err(format!(
+                    "来源声明的推理传输方式与 apiProtocol 不一致（模型 {model}）"
+                ));
+            }
+            capabilities.insert(model, declared);
+        }
         config.reasoning_capabilities = capabilities;
         Ok(config)
     }
@@ -555,12 +572,24 @@ pub fn model_matches_text_model_rule(
 
 pub fn resolve_vision_execution_config(
     settings_store: Option<&magi_settings_store::SettingsStore>,
+    selected_source_id: Option<&str>,
     selected_model: &str,
     current_turn_contains_images: bool,
 ) -> Result<Option<NormalizedModelConfig>, String> {
-    if !current_turn_contains_images
-        || !model_matches_text_model_rule(settings_store, selected_model)
-    {
+    if !current_turn_contains_images {
+        return Ok(None);
+    }
+    // 数据源条目明确声明了输入模态时以声明为准；未声明才回到文本模型规则。
+    let declared_accepts_images = settings_store
+        .zip(selected_source_id)
+        .and_then(|(store, source_id)| {
+            crate::main_model_sources::declared_image_input(store, source_id, selected_model)
+        });
+    let text_only = match declared_accepts_images {
+        Some(accepts_images) => !accepts_images,
+        None => model_matches_text_model_rule(settings_store, selected_model),
+    };
+    if !text_only {
         return Ok(None);
     }
     let store = settings_store.ok_or_else(|| {
@@ -1326,18 +1355,18 @@ mod tests {
             .unwrap();
 
         assert!(
-            resolve_vision_execution_config(Some(&store), "deepseek-chat", false)
+            resolve_vision_execution_config(Some(&store), None, "deepseek-chat", false)
                 .unwrap()
                 .is_none(),
             "纯文本请求不得切换识图模型"
         );
         assert!(
-            resolve_vision_execution_config(Some(&store), "gpt-4.1", true)
+            resolve_vision_execution_config(Some(&store), None, "gpt-4.1", true)
                 .unwrap()
                 .is_none(),
             "未命中文本模型规则时不得切换识图模型"
         );
-        let resolved = resolve_vision_execution_config(Some(&store), "GLM-4.5-Air", true)
+        let resolved = resolve_vision_execution_config(Some(&store), None, "GLM-4.5-Air", true)
             .unwrap()
             .expect("图片请求命中文本模型规则时必须切换识图模型");
         assert_eq!(resolved.require_model().unwrap(), "vision-model");

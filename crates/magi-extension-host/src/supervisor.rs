@@ -160,9 +160,6 @@ pub fn supervise(
                     bus.detach(&config.plugin_id);
                     // 连接失效不等于进程已退出；心跳失败和协议断连也必须回收整棵进程树。
                     instance.stop().await;
-                    if let Some(service) = &config.service {
-                        service.instance_detached(&config.plugin_id);
-                    }
                     if stopped {
                         state_tx.send_replace(SupervisorState::Stopped);
                         return;

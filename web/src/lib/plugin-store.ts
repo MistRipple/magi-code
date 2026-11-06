@@ -6,6 +6,7 @@ import type {
   PluginCenterEntry,
   PluginInstalled,
   PluginManifest,
+  PluginUpstreamEntry,
 } from '../shared/app-server-protocol.generated';
 
 export type StoreStatus = 'active' | 'installed' | 'available';
@@ -19,6 +20,8 @@ export interface StoreItem {
   version: string;
   installed: PluginInstalled | null;
   catalog: PluginCenterEntry | null;
+  /** 上游生态（DSH、pi）的 npm 发布包；安装时由 daemon 翻译。 */
+  upstream: PluginUpstreamEntry | null;
   status: StoreStatus;
   /** 插件中心有比已安装版本更新的版本。 */
   updatable: boolean;
@@ -44,6 +47,7 @@ function statusOf(installed: PluginInstalled | null): StoreStatus {
 export function buildStoreItems(
   installedPlugins: PluginInstalled[],
   catalog: PluginCenterEntry[],
+  upstream: PluginUpstreamEntry[],
   text: Text,
 ): StoreItem[] {
   const items = new Map<string, StoreItem>();
@@ -55,6 +59,7 @@ export function buildStoreItems(
       version: installed.manifest.version,
       installed,
       catalog: null,
+      upstream: null,
       status: statusOf(installed),
       updatable: false,
     });
@@ -73,6 +78,37 @@ export function buildStoreItems(
       version: entry.version,
       installed: null,
       catalog: entry,
+      upstream: null,
+      status: 'available',
+      updatable: false,
+    });
+  }
+  // 已安装插件的来源就是 `生态:包名@版本`，据此归并，不依赖上游搜索结果是否已刷新：
+  // 刚安装完时搜索结果还是旧的，若只看 installedPluginId 会短暂出现重复条目。
+  const installedByUpstream = new Map<string, string>();
+  for (const installed of installedPlugins) {
+    if (installed.source.kind !== 'upstream') continue;
+    const at = installed.source.location.lastIndexOf('@');
+    if (at > 0) installedByUpstream.set(installed.source.location.slice(0, at), installed.manifest.id);
+  }
+  for (const entry of upstream) {
+    // 已安装的上游包并入对应的已安装条目，其余用 生态+包名 作为临时身份（安装翻译后才有 Magi 插件 ID）。
+    const installedId = entry.installedPluginId ?? installedByUpstream.get(`${entry.ecosystem}:${entry.package}`);
+    const existing = installedId ? items.get(installedId) : undefined;
+    if (existing) {
+      existing.upstream = entry;
+      existing.updatable = existing.updatable || entry.state === 'updatable';
+      continue;
+    }
+    const id = `upstream:${entry.ecosystem}:${entry.package}`;
+    items.set(id, {
+      id,
+      name: entry.name,
+      description: entry.description,
+      version: entry.version,
+      installed: null,
+      catalog: null,
+      upstream: entry,
       status: 'available',
       updatable: false,
     });
@@ -90,6 +126,8 @@ export function filterStoreItems(items: StoreItem[], filter: StoreFilter, query:
     if (filter === 'installed' && !item.installed) return false;
     if (filter === 'available' && item.installed) return false;
     if (filter === 'updatable' && !item.updatable) return false;
+    // 上游条目的匹配由 registry 搜索完成（它按关键词与相关度匹配，不一定包含查询原文）。
+    if (item.upstream && !item.installed) return true;
     return !needle
       || item.name.toLowerCase().includes(needle)
       || item.id.toLowerCase().includes(needle)

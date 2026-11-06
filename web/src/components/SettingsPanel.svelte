@@ -12,6 +12,8 @@ import SettingsAppearanceTab from './SettingsAppearanceTab.svelte';
 import SettingsPluginsTab from './SettingsPluginsTab.svelte';
 import SettingsMcpServerSection from './SettingsMcpServerSection.svelte';
 import PluginTabContent from './tabs/PluginTabContent.svelte';
+import PluginPageHeader from './PluginPageHeader.svelte';
+import PluginIcon from './PluginIcon.svelte';
 import { tick, untrack } from 'svelte';
 import Icon from './Icon.svelte';
 import Modal from './Modal.svelte';
@@ -49,19 +51,21 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
     void untrack(() => store.reloadRoleTemplates());
   });
 
-  const pluginManifests = $derived(pluginProjection().manifests);
   const pluginManifestsLoaded = $derived(pluginProjection().loaded);
-  const pluginSettingsViews = $derived.by(() => pluginManifests.flatMap((manifest) =>
-    (manifest.contributions.views ?? [])
+  // 设置导航按“已安装”列出插件页：停用后页面仍在，只剩顶部栏和停用提示，用户可在顶部重新开启；卸载后才消失。
+  const pluginSettingsViews = $derived.by(() => pluginProjection().installed.flatMap((installed) =>
+    (installed.manifest.contributions.views ?? [])
       .filter((view) => view.placements.includes('settings'))
       .map((view) => ({
-        tabId: `plugin:${manifest.id}:${view.id}` as `plugin:${string}`,
-        id: manifest.id,
-        manifest,
+        tabId: `plugin:${installed.manifest.id}:${view.id}` as `plugin:${string}`,
+        id: installed.manifest.id,
+        manifest: installed.manifest,
+        active: installed.active,
+        digest: installed.digest,
         entry: view.entry,
-        label: `${manifest.name}: ${view.title}`,
-        title: view.title,
-        description: manifest.description,
+        // 插件设置页直接以插件名称呈现：导航项与页头一致，不再拼接视图标题。
+        label: installed.manifest.name,
+        title: installed.manifest.name,
       }))));
   // 插件的设置界面只有一种来源：插件自己声明的 settings 视图，宿主不生成表单。
   const pluginSettingsTabs = $derived(pluginSettingsViews);
@@ -73,11 +77,14 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
       ?? pluginSettingsTabs.find((item) => item.tabId === store.activeTab)
       ?? SETTINGS_TABS[0],
   );
+  /** 当前打开的是插件设置页时的插件项：页头据此显示图标并放置启停与卸载。 */
+  const activePluginTab = $derived(pluginSettingsTabs.find((item) => item.tabId === store.activeTab) ?? null);
   const activeTabTitle = $derived(
     'titleKey' in activeTabDefinition ? i18n.t(activeTabDefinition.titleKey) : activeTabDefinition.title,
   );
+  // 插件视图页由插件自己的界面说明用途，宿主不再附加 manifest 描述。
   const activeTabDescription = $derived(
-    'descKey' in activeTabDefinition ? i18n.t(activeTabDefinition.descKey) : activeTabDefinition.description,
+    'descKey' in activeTabDefinition ? i18n.t(activeTabDefinition.descKey) : '',
   );
 
   $effect(() => {
@@ -194,7 +201,7 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
             data-testid={`settings-nav-${pluginTab.tabId}`}
             onclick={() => store.activeTab = pluginTab.tabId}
           >
-            <Icon name="settings" size={15} />
+            <PluginIcon pluginId={pluginTab.id} icon={pluginTab.manifest.icon} size={15} />
             <span>{pluginTab.label}</span>
           </button>
         {/each}
@@ -214,10 +221,18 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
     <header class="main-header">
       <div class="header-breadcrumbs">
         <div class="header-title-group">
+          {#if activePluginTab}
+            <span class="header-plugin-icon" aria-hidden="true"><PluginIcon pluginId={activePluginTab.id} icon={activePluginTab.manifest.icon} revision={activePluginTab.digest} size={22} /></span>
+          {/if}
           <h2>{activeTabTitle}</h2>
-          <span class="header-description">{activeTabDescription}</span>
+          {#if activeTabDescription}
+            <span class="header-description">{activeTabDescription}</span>
+          {/if}
         </div>
       </div>
+      {#if activePluginTab}
+        <PluginPageHeader manifest={activePluginTab.manifest} />
+      {/if}
     </header>
 
       <!-- Tab 内容区域 -->
@@ -691,7 +706,11 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
       {:else}
         {#each pluginSettingsTabs.filter((item) => item.tabId === store.activeTab) as tab (tab.tabId)}
           <div class="settings-frame">
-            <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} />
+            {#if tab.active}
+              <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} placement="settings" />
+            {:else}
+              <p class="settings-hint" role="status" data-testid="plugin-page-inactive">{i18n.t('settings.plugins.pageHeader.inactive')}</p>
+            {/if}
           </div>
         {/each}
       {/if}
@@ -1360,6 +1379,21 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
     .header-breadcrumbs {
       min-width: 0;
       flex: 1;
+    }
+
+    .header-title-group:has(.header-plugin-icon) {
+      align-items: center;
+    }
+
+    .header-plugin-icon {
+      display: grid;
+      place-items: center;
+      width: 30px;
+      height: 30px;
+      flex: 0 0 auto;
+      border-radius: 8px;
+      color: var(--primary);
+      background: var(--primary-muted);
     }
 
     .header-title-group {

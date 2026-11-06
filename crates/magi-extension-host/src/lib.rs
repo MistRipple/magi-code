@@ -22,6 +22,14 @@ use serde_json::Value;
 /// daemon 暴露给受信扩展的业务服务端口。实现必须在 Magi 原生事实源上执行准入，
 /// 不得让 Node 直接写 canonical 日志或复制会话/任务状态。
 pub trait HostService: Send + Sync + 'static {
+    /// 代次租约由 daemon 签发，覆盖初始化、运行和失败回收；不能由扩展自报。
+    fn instance_started(&self, _plugin_id: &str, _lease: &str) -> Result<(), RpcError> {
+        Ok(())
+    }
+    fn instance_ready(&self, _plugin_id: &str, _lease: &str) -> Result<(), RpcError> {
+        Ok(())
+    }
+    fn instance_ended(&self, _plugin_id: &str, _lease: &str) {}
     /// 每次宿主启动（含崩溃后重启）从原生设置事实读取配置。
     fn configuration(&self, _plugin_id: String) -> BoxFuture<Result<Option<Value>, RpcError>> {
         Box::pin(async { Ok(None) })
@@ -41,9 +49,6 @@ pub trait HostService: Send + Sync + 'static {
         method: String,
         params: Value,
     ) -> BoxFuture<Result<Value, RpcError>>;
-    /// 宿主实例已退出（崩溃、停止或被替换），进程树已回收。实现应撤销该插件在本次运行中
-    /// 登记的运行期事实（例如贡献的模型数据源）；下一个实例重新激活时自行提交。
-    fn instance_detached(&self, _plugin_id: &str) {}
 }
 
 /// Node 侧宿主运行时（`runtime/host.mjs`）。daemon 在状态目录里按内容摘要落盘后交给 Node 执行。

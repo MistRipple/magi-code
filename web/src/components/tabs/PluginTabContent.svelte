@@ -1,7 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { agentUrl } from '../../web/agent-api';
+  import { i18n } from '../../stores/i18n.svelte';
+  import { subscribeAppearanceRuntime } from '../../appearance/runtime';
+  import { openExternalUrl } from '../../lib/external-link';
   import {
+    callPluginRoute,
+    describePluginSettings,
     readPluginResource,
     readPluginSettings,
     subscribePluginResource,
@@ -15,9 +20,18 @@
     label: string;
     /** 同一页面可能同时存在主视图和主页卡片，卡片用不同的测试标识避免混淆。 */
     frameTestId?: string;
+    /**
+     * 视图所处的位置。`settings` 嵌入设置页的整页滚动：高度由页面经 `view.resize` 上报，
+     * 底色取设置页主区域的实际底色；其他位置由宿主给定固定尺寸，页面自己滚动。
+     */
+    placement?: 'settings' | 'page';
   }
 
-  let { pluginId, entry, label, frameTestId = 'plugin-view' }: Props = $props();
+  let { pluginId, entry, label, frameTestId = 'plugin-view', placement = 'page' }: Props = $props();
+  /** 页面上报的内容高度（CSS 像素）；只在 settings 位置生效，重新加载后清空。 */
+  let reportedHeight = $state<number | null>(null);
+  /** 与页面可上报的合理上限一致，防止异常值撑爆设置页。 */
+  const MAX_VIEW_HEIGHT = 20_000;
   let iframe = $state<HTMLIFrameElement | null>(null);
   let instanceId = crypto.randomUUID();
   /** 与 daemon 资源快照上限一致：更大的写入在到达消息桥之前就拒绝。 */
@@ -26,6 +40,61 @@
     agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/ui/${entry.replace(/^ui\//, '').split('/').map(encodeURIComponent).join('/')}`),
   );
   const resourceOrigin = $derived(new URL(resourceUrl, window.location.href).origin);
+
+  /**
+   * 下发给插件页面的主题令牌：取宿主根元素当前生效的计算值，不依赖具体主题包。
+   * 插件页面在自己的文档里把它们写成 CSS 变量，因此明暗切换和自定义主题都自然生效。
+   */
+  const THEME_TOKENS = [
+    '--background', '--foreground', '--foreground-muted', '--border', '--border-subtle',
+    '--surface-1', '--surface-2', '--surface-3', '--surface-hover', '--surface-active', '--surface-selected',
+    '--primary', '--primary-hover', '--primary-foreground', '--primary-muted',
+    '--secondary', '--secondary-hover',
+    '--success', '--success-muted', '--warning', '--warning-muted', '--error', '--error-muted', '--info', '--info-muted',
+    '--code-bg', '--dropdown-bg', '--overlay',
+    '--text-xs', '--text-sm', '--text-base', '--text-md', '--text-lg', '--text-xl',
+    '--space-1', '--space-2', '--space-3', '--space-4', '--space-5', '--space-6', '--space-8',
+    '--radius-md', '--radius-lg', '--font-semibold',
+    // 设置页的次级文字色：介于正文色与弱化色之间，交互控件（按钮、下拉）的文字用它才清晰。
+    '--ind-foreground-secondary',
+    // 主按钮的底色与文字色是一对实心反色；叠层色（--surface-*）是半透明的，不能当文字色用。
+    '--btn-primary-bg', '--btn-primary-fg', '--btn-primary-hover-bg', '--magi-canvas',
+    '--vscode-font-family', '--vscode-editor-font-family',
+  ];
+
+  function hostSurfaceColor(): string | null {
+    for (let node: Element | null = iframe?.parentElement ?? null; node; node = node.parentElement) {
+      const color = getComputedStyle(node).backgroundColor;
+      if (color && color !== 'transparent' && !/^rgba\(.*,\s*0\)$/.test(color)) return color;
+    }
+    return null;
+  }
+
+  function readTheme(): { mode: 'light' | 'dark'; tokens: Record<string, string> } {
+    const root = document.documentElement;
+    const computed = getComputedStyle(root);
+    const tokens: Record<string, string> = {};
+    for (const name of THEME_TOKENS) {
+      const value = computed.getPropertyValue(name).trim();
+      if (value) tokens[name] = value;
+    }
+    // 设置页里页面应与周围同底色：背景令牌取容器链上第一个不透明的实际底色。
+    if (placement === 'settings') {
+      const surface = hostSurfaceColor();
+      if (surface) tokens['--background'] = surface;
+      // 设置页内的卡片圆角，与原生设置分类一致。
+      const settingsScope = getComputedStyle(iframe?.closest('.settings-tab-content') ?? root);
+      const radius = settingsScope.getPropertyValue('--ind-radius-card').trim();
+      if (radius) tokens['--ind-radius-card'] = radius;
+      const secondary = settingsScope.getPropertyValue('--ind-foreground-secondary').trim();
+      if (secondary) tokens['--ind-foreground-secondary'] = secondary;
+    }
+    return { mode: root.classList.contains('theme-light') ? 'light' : 'dark', tokens };
+  }
+
+  function sendHostContext(): void {
+    send({ type: 'context', placement, locale: i18n.locale, theme: readTheme() });
+  }
 
   function send(message: Record<string, unknown>, expectedInstance = instanceId): void {
     if (expectedInstance !== instanceId) return;
@@ -78,7 +147,7 @@
     const requestId = typeof event.data.requestId === 'string' ? event.data.requestId : '';
     const expectedInstance = instanceId;
     const operation = event.data.operation;
-    if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write'].includes(operation)) return;
+    if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write', 'settings.describe', 'route.call', 'host.openExternal', 'clipboard.write', 'view.resize'].includes(operation)) return;
     try {
       const resourceId = typeof event.data.resourceId === 'string' ? event.data.resourceId : '';
       if (operation.startsWith('resource.') && (!resourceId || resourceId.length > 256)) {
@@ -91,6 +160,44 @@
         handleResourceSubscriptionRequest(requestId, resourceId);
         return;
       }
+      if (operation === 'route.call') {
+        // 路径形态由 daemon 的协议校验把关；这里只限制体积，避免页面把大块内容塞进消息桥。
+        if (JSON.stringify(event.data.body ?? null).length > MAX_WRITE_BYTES) {
+          throw new Error('插件写入内容超过大小上限');
+        }
+        const routed = await callPluginRoute(pluginId, {
+          method: event.data.method,
+          path: event.data.path,
+          ...(typeof event.data.query === 'string' ? { query: event.data.query } : {}),
+          ...(event.data.body === undefined ? {} : { body: event.data.body }),
+        });
+        send({ type: 'response', requestId, ok: true, result: routed }, expectedInstance);
+        return;
+      }
+      if (operation === 'view.resize') {
+        // 页面报告自己的内容高度；只有嵌入设置页整页滚动的位置采用，其余位置确认收到但不改变尺寸。
+        const height = event.data.height;
+        if (typeof height !== 'number' || !Number.isFinite(height) || height < 0 || height > MAX_VIEW_HEIGHT) {
+          throw new Error('视图高度无效');
+        }
+        if (placement === 'settings') reportedHeight = Math.ceil(height);
+        send({ type: 'response', requestId, ok: true, result: null }, expectedInstance);
+        return;
+      }
+      if (operation === 'host.openExternal') {
+        // 沙箱页面不能自己开窗口；链接交给宿主按产品规则打开（桌面端走系统浏览器，仅 http/https/mailto）。
+        if (typeof event.data.url !== 'string') throw new Error('链接无效');
+        await openExternalUrl(event.data.url);
+        send({ type: 'response', requestId, ok: true, result: null }, expectedInstance);
+        return;
+      }
+      if (operation === 'clipboard.write') {
+        // 沙箱页面没有剪贴板权限；复制由用户点击触发，经桥写入，文本大小受限。
+        if (typeof event.data.text !== 'string' || event.data.text.length > 65_536) throw new Error('剪贴板内容无效');
+        await navigator.clipboard.writeText(event.data.text);
+        send({ type: 'response', requestId, ok: true, result: null }, expectedInstance);
+        return;
+      }
       const result = operation === 'resource.read'
         ? await readPluginResource(pluginId, resourceId)
         : operation === 'resource.write'
@@ -100,6 +207,8 @@
                   typeof event.data.expectedVersion === 'number' ? event.data.expectedVersion : -1,
             event.data.value,
           )
+          : operation === 'settings.describe'
+            ? await describePluginSettings(pluginId)
           : operation === 'settings.read'
             ? await readPluginSettings(pluginId)
             : await writePluginSettings(
@@ -115,15 +224,30 @@
 
   onMount(() => {
     window.addEventListener('message', handleMessage);
+    // 主题或语言变化时重新下发；订阅在挂载时立即回调一次，页面尚未初始化时 send 会被忽略，init 后再补一次。
+    const unsubscribeAppearance = subscribeAppearanceRuntime(() => {
+      // 变量应用到根元素之后再读取。
+      queueMicrotask(sendHostContext);
+    });
     return () => {
       window.removeEventListener('message', handleMessage);
+      unsubscribeAppearance();
       releaseResourceSubscriptions();
     };
+  });
+
+  $effect(() => {
+    // 语言切换：读取响应式的 locale 即建立依赖。
+    void i18n.locale;
+    sendHostContext();
   });
 </script>
 
 <iframe
   class="plugin-view"
+  class:plugin-view--settings={placement === 'settings'}
+  class:plugin-view--sized={placement === 'settings' && reportedHeight !== null}
+  style:height={placement === 'settings' && reportedHeight !== null ? `${reportedHeight}px` : undefined}
   data-testid={frameTestId}
   data-plugin-id={pluginId}
   src={resourceUrl}
@@ -132,7 +256,8 @@
   onload={() => {
     releaseResourceSubscriptions();
     instanceId = crypto.randomUUID();
-    send({ type: 'init', pluginId });
+    reportedHeight = null;
+    send({ type: 'init', pluginId, placement, locale: i18n.locale, theme: readTheme() });
   }}
   sandbox="allow-scripts"
   referrerpolicy="no-referrer"
@@ -147,5 +272,14 @@
     flex: 1;
     border: 0;
     background: var(--surface-1);
+  }
+  /* 设置页：与其他分类同一圆角，背景透明，高度随页面内容，整页由设置容器滚动。 */
+  .plugin-view--settings {
+    border-radius: var(--ind-radius-card, 12px);
+    background: transparent;
+  }
+  .plugin-view--sized {
+    flex: none;
+    min-height: 0;
   }
 </style>

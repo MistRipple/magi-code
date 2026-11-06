@@ -9,6 +9,9 @@ import type {
   PluginInstalled,
   PluginList,
   PluginManifest,
+  PluginUpstreamEntry,
+  PluginUpstreamPreview,
+  PluginUpstreamProjection,
 } from '../shared/app-server-protocol.generated';
 
 export type PluginManifestProjection = PluginManifest;
@@ -126,6 +129,44 @@ export async function installFromPluginCenter(entry: PluginCenterEntry): Promise
     body: JSON.stringify({ id: entry.id, version: entry.version, expectedSha256: entry.sha256 }),
   });
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.installCenter'), response);
+  window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
+}
+
+/** 在上游生态（DSH、pi）的官方 npm 发布中搜索；空查询列出该生态的常见包。 */
+export async function searchUpstreamPlugins(query: string): Promise<PluginUpstreamProjection> {
+  const response = await pluginRequest(`/api/plugins/upstream?q=${encodeURIComponent(query)}`);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.upstream'), response);
+  return await response.json() as PluginUpstreamProjection;
+}
+
+function upstreamBody(entry: Pick<PluginUpstreamEntry, 'ecosystem' | 'package' | 'version'>, expectedDigest?: string): string {
+  return JSON.stringify({
+    ecosystem: entry.ecosystem,
+    package: entry.package,
+    version: entry.version,
+    ...(expectedDigest ? { expectedDigest } : {}),
+  });
+}
+
+/** 准备阶段：daemon 取包、核对完整性并翻译，返回翻译结果与权限差异，不写入任何状态。 */
+export async function previewUpstreamPlugin(entry: PluginUpstreamEntry): Promise<PluginUpstreamPreview> {
+  const response = await pluginRequest('/api/plugins/upstream/preview', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: upstreamBody(entry),
+  });
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.upstreamPreview'), response);
+  return await response.json() as PluginUpstreamPreview;
+}
+
+/** 确认后安装：daemon 重新翻译并只接受与预览摘要一致的结果。 */
+export async function installUpstreamPlugin(preview: PluginUpstreamPreview, ecosystem: PluginUpstreamEntry['ecosystem']): Promise<void> {
+  const response = await pluginRequest('/api/plugins/upstream/install', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: upstreamBody({ ecosystem, package: preview.package, version: preview.version }, preview.candidate.digest),
+  });
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.upstreamInstall'), response);
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
 }
 
@@ -266,6 +307,12 @@ export async function writePluginResource(
   return await response.json();
 }
 
+export async function describePluginSettings(pluginId: string): Promise<unknown> {
+  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/settings/schema`);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.readSettings'), response);
+  return await response.json();
+}
+
 export async function readPluginSettings(pluginId: string): Promise<unknown> {
   const response = await pluginRequest(
     `/api/plugins/${encodeURIComponent(pluginId)}/settings`,
@@ -291,16 +338,16 @@ export async function writePluginSettings(
   return await response.json();
 }
 
-export async function listPluginJobs(pluginId: string): Promise<import('../shared/app-server-protocol.generated').PluginJobSchedule[]> {
-  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/jobs`);
-  if (!response.ok) throw await pluginFailure(i18n.t('settings.plugins.jobs.load'), response);
-  return response.json();
-}
-export async function createPluginJob(pluginId: string, request: import('../shared/app-server-protocol.generated').PluginJobRequest): Promise<void> {
-  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/jobs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request) });
-  if (!response.ok) throw await pluginFailure(i18n.t('settings.plugins.jobs.create'), response);
-}
-export async function cancelPluginJob(pluginId: string, jobId: string): Promise<void> {
-  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
-  if (!response.ok) throw await pluginFailure(i18n.t('settings.plugins.jobs.cancel'), response);
+/** 视图后端路由：请求经 daemon 转交给该插件的扩展宿主。返回路由处理器给出的状态码与内容。 */
+export async function callPluginRoute(
+  pluginId: string,
+  request: import('../shared/app-server-protocol.generated').PluginRouteCallRequest,
+): Promise<import('../shared/app-server-protocol.generated').PluginRouteCallResult> {
+  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/routes`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(request),
+  });
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.callRoute'), response);
+  return await response.json();
 }

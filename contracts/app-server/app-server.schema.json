@@ -2326,13 +2326,21 @@
         },
         "description": {
           "type": "string",
-          "maxLength": 4096
+          "maxLength": 32768
         },
         "inputSchema": {
           "type": "object"
         },
         "readOnly": {
           "type": "boolean"
+        },
+        "timeoutMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1000,
+          "maximum": 600000
         }
       }
     },
@@ -2560,6 +2568,18 @@
             "$ref": "#/$defs/PluginHookDeclaration"
           },
           "maxItems": 32
+        },
+        "compat": {
+          "$ref": "#/$defs/PluginCompat"
+        },
+        "runtimeContributions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginRuntimeContributionKind"
+          },
+          "maxItems": 4,
+          "uniqueItems": true,
+          "x-rust-default": true
         }
       }
     },
@@ -2600,6 +2620,12 @@
         "description": {
           "type": "string",
           "maxLength": 4096
+        },
+        "icon": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^ui/[A-Za-z0-9._/-]+\\.(png|jpg|jpeg|webp)$",
+          "description": "包内 ui/ 下的位图图标（png/jpg/webp，不含 SVG）；宿主只把它当图片展示，不执行。"
         },
         "extension": {
           "$ref": "#/$defs/PluginExtension"
@@ -2733,7 +2759,8 @@
         "center",
         "address",
         "local",
-        "builtin"
+        "builtin",
+        "upstream"
       ]
     },
     "PluginSourceProjection": {
@@ -3042,6 +3069,59 @@
           "x-rust-type": "u64"
         },
         "value": {}
+      }
+    },
+    "PluginRouteMethod": {
+      "type": "string",
+      "enum": [
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE"
+      ]
+    },
+    "PluginRouteCallRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "path"
+      ],
+      "properties": {
+        "method": {
+          "$ref": "#/$defs/PluginRouteMethod"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^/[\\x21-\\x7e]*$"
+        },
+        "query": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "body": {}
+      }
+    },
+    "PluginRouteCallResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599
+        },
+        "contentType": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "body": {}
       }
     },
     "SessionTurnGuideStatus": {
@@ -5875,6 +5955,326 @@
             "string",
             "null"
           ],
+          "x-rust-default": true
+        }
+      }
+    },
+    "PluginCompatKind": {
+      "type": "string",
+      "enum": [
+        "dsh",
+        "pi"
+      ],
+      "description": "翻译来源生态。由 Magi 翻译器写入；宿主据此展示来源与选择兼容层，不据此做任何授权判断。"
+    },
+    "PluginCompat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/PluginCompatKind"
+        }
+      }
+    },
+    "PluginUpstreamEntryState": {
+      "type": "string",
+      "enum": [
+        "available",
+        "updatable",
+        "installed"
+      ]
+    },
+    "PluginUpstreamEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ecosystem",
+        "package",
+        "version",
+        "name",
+        "description",
+        "publisher",
+        "official",
+        "state",
+        "installable"
+      ],
+      "properties": {
+        "ecosystem": {
+          "$ref": "#/$defs/PluginEcosystem"
+        },
+        "package": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 214
+        },
+        "version": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "publisher": {
+          "type": "string",
+          "description": "npm 发布者；仅作展示，不构成 Magi 的审核结论。"
+        },
+        "official": {
+          "type": "boolean",
+          "description": "包属于上游官方 npm 作用域。这是发布者身份，不代表该包适配 Magi 或经过 Magi 审核。"
+        },
+        "state": {
+          "$ref": "#/$defs/PluginUpstreamEntryState"
+        },
+        "installedPluginId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-rust-default": true
+        },
+        "installedVersion": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-rust-default": true
+        },
+        "installable": {
+          "type": "boolean",
+          "description": "本机是否具备该生态的翻译器；否则条目只可浏览。"
+        },
+        "blockedReason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-rust-default": true
+        }
+      }
+    },
+    "PluginUpstreamProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "registry",
+        "entries"
+      ],
+      "properties": {
+        "registry": {
+          "type": "string",
+          "description": "本次搜索使用的 npm registry 地址。"
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginUpstreamEntry"
+          }
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-rust-default": true
+        }
+      }
+    },
+    "PluginUpstreamRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ecosystem",
+        "package"
+      ],
+      "properties": {
+        "ecosystem": {
+          "$ref": "#/$defs/PluginEcosystem"
+        },
+        "package": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 214
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64,
+          "x-rust-default": true
+        },
+        "expectedDigest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-rust-default": true,
+          "description": "预览得到的翻译包摘要；安装只接受摘要完全一致的翻译结果。"
+        }
+      }
+    },
+    "PluginTranslationNote": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "status",
+        "note"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        }
+      }
+    },
+    "PluginTranslationSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tools",
+        "commands",
+        "modelSources",
+        "unmountedSlots",
+        "degraded",
+        "omittedFiles"
+      ],
+      "properties": {
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "modelSources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "unmountedSlots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "上游界面注册、但 Magi 没有对应位置因而不渲染的槽位。"
+        },
+        "degraded": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginTranslationNote"
+          }
+        },
+        "omittedFiles": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "PluginUpstreamPreview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate",
+        "package",
+        "version",
+        "integrity",
+        "publisher",
+        "official",
+        "translation"
+      ],
+      "properties": {
+        "candidate": {
+          "$ref": "#/$defs/PluginCandidatePreview"
+        },
+        "package": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "integrity": {
+          "type": "string"
+        },
+        "publisher": {
+          "type": "string"
+        },
+        "official": {
+          "type": "boolean"
+        },
+        "translation": {
+          "$ref": "#/$defs/PluginTranslationSummary"
+        }
+      }
+    },
+    "PluginEcosystem": {
+      "type": "string",
+      "enum": [
+        "dsh",
+        "pi"
+      ],
+      "description": "上游插件生态。"
+    },
+    "PluginRuntimeContributionKind": {
+      "type": "string",
+      "enum": [
+        "tools",
+        "commands",
+        "modelSources",
+        "settings"
+      ]
+    },
+    "PluginRuntimeCatalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "x-rust-derive-default": true,
+      "properties": {
+        "tools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginToolContribution"
+          },
+          "maxItems": 128,
+          "x-rust-default": true
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginNamedContribution"
+          },
+          "maxItems": 128,
+          "x-rust-default": true
+        },
+        "modelSources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginNamedContribution"
+          },
+          "maxItems": 8,
+          "x-rust-default": true
+        },
+        "settingsSchema": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
           "x-rust-default": true
         }
       }

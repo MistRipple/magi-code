@@ -9,12 +9,16 @@
     fetchPluginCenter,
     installFromPluginCenter,
     listInstalledPlugins,
+    installUpstreamPlugin,
     previewPluginCandidate,
+    previewUpstreamPlugin,
     savePluginCenterConfig,
+    searchUpstreamPlugins,
     uninstallPlugin,
     type PluginCandidate,
   } from '../web/plugin-api';
   import PluginDetailPane from './PluginDetailPane.svelte';
+  import PluginIcon from './PluginIcon.svelte';
   import PluginGuidePage from './PluginGuidePage.svelte';
   import Icon from './Icon.svelte';
   import SettingsDetailPage from './SettingsDetailPage.svelte';
@@ -22,7 +26,7 @@
   import { openSettings } from '../stores/shell-ui.svelte';
   import { buildStoreItems, filterStoreItems, paginate, storeGroup, type StoreFilter, type StoreGroup, type StoreItem } from '../lib/plugin-store';
   import { pluginRegistryRevision } from '../stores/plugin-registry.svelte';
-  import type { PluginCandidatePreview, PluginCenterProjection, PluginList, PluginManifest, PluginPermission } from '../shared/app-server-protocol.generated';
+  import type { PluginCandidatePreview, PluginCenterProjection, PluginList, PluginManifest, PluginPermission, PluginUpstreamEntry, PluginUpstreamPreview, PluginUpstreamProjection } from '../shared/app-server-protocol.generated';
 
   let list = $state<PluginList | null>(null);
   let address = $state('');
@@ -39,7 +43,12 @@
   let centerRequestSeq = 0;
   let guideOpen = $state(false);
   /** 已通过准备阶段、等待用户确认的候选包；确认前不写入任何安装状态。 */
-  let staged = $state<{ candidate: PluginCandidate; preview: PluginCandidatePreview } | null>(null);
+  type Staged =
+    | { kind: 'file'; candidate: PluginCandidate; preview: PluginCandidatePreview }
+    | { kind: 'upstream'; entry: PluginUpstreamEntry; preview: PluginUpstreamPreview };
+  let staged = $state<Staged | null>(null);
+  let upstream = $state<PluginUpstreamProjection | null>(null);
+  let upstreamSeq = 0;
   const plugins = $derived(list?.plugins ?? []);
 
   async function refresh(): Promise<void> {
@@ -71,6 +80,18 @@
       if (requestSeq !== centerRequestSeq) return;
       // 插件中心不可用不应阻止管理已安装插件。
       message = describe(error);
+    }
+  }
+
+  /** 搜索上游生态的官方 npm 发布。失败只影响上游条目，不影响已安装与插件中心。 */
+  async function refreshUpstream(text: string): Promise<void> {
+    const requestSeq = ++upstreamSeq;
+    try {
+      const next = await searchUpstreamPlugins(text);
+      if (requestSeq === upstreamSeq) upstream = next;
+    } catch (error) {
+      if (requestSeq !== upstreamSeq) return;
+      upstream = { registry: upstream?.registry ?? '', entries: [], error: describe(error) };
     }
   }
 
@@ -120,6 +141,21 @@
     return file ? await file.arrayBuffer() : null;
   }
 
+  async function stageUpstream(entry: PluginUpstreamEntry): Promise<void> {
+    busy = true;
+    message = '';
+    staged = null;
+    try {
+      const preview = await previewUpstreamPlugin(entry);
+      if (preview.candidate.operation === 'unchanged') message = i18n.t('settings.plugins.candidate.unchanged');
+      else staged = { kind: 'upstream', entry, preview };
+    } catch (error) {
+      message = describe(error);
+    } finally {
+      busy = false;
+    }
+  }
+
   async function stage(candidate: PluginCandidate): Promise<void> {
     busy = true;
     message = '';
@@ -127,7 +163,7 @@
     try {
       const preview = await previewPluginCandidate(candidate);
       if (preview.operation === 'unchanged') message = i18n.t('settings.plugins.candidate.unchanged');
-      else staged = { candidate, preview };
+      else staged = { kind: 'file', candidate, preview };
     } catch (error) {
       message = describe(error);
     } finally {
@@ -150,7 +186,8 @@
     const pending = staged;
     if (!pending) return;
     await run(async () => {
-      await applyPluginCandidate(pending.candidate, pending.preview);
+      if (pending.kind === 'upstream') await installUpstreamPlugin(pending.preview, pending.entry.ecosystem);
+      else await applyPluginCandidate(pending.candidate, pending.preview);
       staged = null;
       address = '';
     });
@@ -179,7 +216,7 @@
   let selectedId = $state<string | null>(null);
   let sourcesOpen = $state(false);
 
-  const items = $derived(buildStoreItems(plugins, center?.entries ?? [], manifestText));
+  const items = $derived(buildStoreItems(plugins, center?.entries ?? [], upstream?.entries ?? [], manifestText));
   const filtered = $derived(filterStoreItems(items, filter, query));
   const view = $derived(paginate(filtered, page, PAGE_SIZE));
   /** 默认选中当前页第一项；所选插件不在当前页（翻页、过滤后）时回到第一项。 */
@@ -211,12 +248,22 @@
 
   async function installItem(item: StoreItem): Promise<void> {
     if (item.catalog) await run(() => installFromPluginCenter(item.catalog!));
+    else if (item.upstream) await stageUpstream(item.upstream);
   }
 
+  /** 升级：插件中心条目直接安装；上游条目先翻译预览，由用户确认后安装。 */
   async function updateFromCenter(item: StoreItem): Promise<void> {
-    if (!item.catalog) return;
-    await run(() => installFromPluginCenter(item.catalog!));
+    if (item.catalog && item.catalog.state === 'updatable') await run(() => installFromPluginCenter(item.catalog!));
+    else if (item.upstream) await stageUpstream(item.upstream);
   }
+
+  // 搜索词变化后稍作等待再请求 registry；注册表变化（安装、卸载）后立即刷新，使安装状态保持准确。
+  $effect(() => {
+    const text = query.trim();
+    void pluginRegistryRevision();
+    const timer = setTimeout(() => void refreshUpstream(text), text ? 350 : 0);
+    return () => clearTimeout(timer);
+  });
 
   $effect(() => {
     if (centerSynced && centerDraftBaseline) saveViewDraft('plugin-sources', centerDraftBaseline, { centerUrl, centerKeyId, centerPublicKey, address }, 'memory');
@@ -245,8 +292,9 @@
   {/if}
 
   {#if staged}
-    {@const preview = staged.preview}
-    <div class="settings-section" data-testid="plugin-candidate" data-operation={preview.operation}>
+    {@const preview = staged.kind === 'upstream' ? staged.preview.candidate : staged.preview}
+    {@const translated = staged.kind === 'upstream' ? staged.preview : null}
+    <div class="settings-section" data-testid="plugin-candidate" data-operation={preview.operation} data-origin={staged.kind}>
       <div class="settings-card settings-card--accent">
         <div class="settings-card-head">
           <div class="settings-icon-tile" aria-hidden="true"><Icon name="download" size={15} /></div>
@@ -291,6 +339,32 @@
                 : i18n.t('settings.plugins.candidate.dataChanged', { from: preview.dataSchemaFrom, to: preview.manifest.dataSchemaVersion })}
             </div>
           {/if}
+          {#if translated}
+            <div class="plugin-perm" data-testid="candidate-translation">
+              <span class="settings-row-title">{i18n.t('settings.plugins.upstream.translation')}</span>
+              <div class="settings-row-desc">
+                {i18n.t('settings.plugins.upstream.publisher')}：{translated.publisher || i18n.t('common.notProvided')}
+                · {translated.official ? i18n.t('settings.plugins.upstream.official') : i18n.t('settings.plugins.upstream.thirdParty')}
+              </div>
+              <div class="settings-row-desc">{i18n.t('settings.plugins.upstream.notice')}</div>
+              {#each [['tools', translated.translation.tools], ['commands', translated.translation.commands], ['modelSources', translated.translation.modelSources], ['unmounted', translated.translation.unmountedSlots]] as [key, values] (key)}
+                <div class="settings-row-desc">
+                  <span class="settings-row-title">{i18n.t(`settings.plugins.upstream.${key}`)}</span>
+                  {(values as string[]).length ? (values as string[]).join('、') : i18n.t('settings.plugins.upstream.none')}
+                </div>
+              {/each}
+              {#if translated.translation.degraded.length > 0}
+                <div class="settings-row-desc">
+                  <span class="settings-row-title">{i18n.t('settings.plugins.upstream.degraded')}</span>
+                  {translated.translation.degraded.map((entry) => `${entry.name}（${entry.status}）`).join('、')}
+                </div>
+              {/if}
+              {#if translated.translation.omittedFiles > 0}
+                <div class="settings-row-desc">{i18n.t('settings.plugins.upstream.omitted', { count: translated.translation.omittedFiles })}</div>
+              {/if}
+              <div class="settings-row-desc">{i18n.t('settings.plugins.upstream.integrity')} <span class="settings-mono" title={translated.integrity}>{translated.integrity.slice(0, 24)}</span></div>
+            </div>
+          {/if}
           <div class="settings-row-desc">
             {preview.operation === 'upgrade' ? i18n.t('settings.plugins.candidate.upgradeHint') : i18n.t('settings.plugins.candidate.installHint')}
             <span class="settings-mono" title={preview.digest}>{i18n.t('settings.plugins.digest', { digest: preview.digest.slice(0, 12) })}</span>
@@ -324,12 +398,22 @@
       </div>
     </div>
 
+    {#if upstream?.error}
+      <div class="settings-notice settings-notice--warn store-center-error" data-testid="plugin-upstream-error" role="status">
+        <Icon name="alert-triangle" size={14} />
+        <span>{i18n.t('settings.plugins.upstream.searchFailed', { reason: upstream.error })}</span>
+      </div>
+    {/if}
     {#if center?.error}
       <div class="settings-notice settings-notice--warn store-center-error" data-testid="plugin-center-error" role="status">
         <Icon name="alert-triangle" size={14} />
         <span>{i18n.t('settings.plugins.center.loadFailed', { reason: center.error })}</span>
         <button class="plugin-link" onclick={() => void refreshCenter()}>{i18n.t('settings.plugins.center.retry')}</button>
       </div>
+    {/if}
+
+    {#if !query.trim()}
+      <div class="settings-row-desc" data-testid="plugin-upstream-hint">{i18n.t('settings.plugins.upstream.searchHint')}</div>
     {/if}
 
     <div class="store-toolbar">
@@ -365,7 +449,7 @@
                 data-group={entry.group}
                 onclick={() => { selectedId = item.id; }}
               >
-                <span class="settings-icon-tile" aria-hidden="true"><Icon name="plug" size={15} /></span>
+                <span class="settings-icon-tile" aria-hidden="true"><PluginIcon pluginId={item.id} icon={item.installed?.manifest.icon} revision={item.installed?.digest ?? ''} size={18} /></span>
                 <span class="store-item-copy">
                   <span class="store-item-name">{item.name}</span>
                   <span class="store-item-desc">{item.description}</span>
