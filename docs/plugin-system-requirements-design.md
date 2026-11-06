@@ -511,6 +511,22 @@
 
 【现状·兼容边界】`session/event` 自动续发仍由上游捕获不支持错误后关闭；`sessionProjections` 当前工作目录读取分支因服务缺席而不挂载。这是上游明确支持的可选降级，不代表这两项能力已经实现。本轮未验证真实生图／视频、`codebuddy_ask`／`/codebuddy`、国际版登录态、Windows、干净系统安装和全部 DSH／pi 插件兼容性。
 
+### 11.5 插件列表交互与在线升级验收（2026-11-06）
+
+【现状·已修复】原界面缺少搜索与翻译期间的反馈，失败消息位于列表上方，安装操作随详情滚动；搜索又被状态分组与名称排序覆盖，上游包在安装前没有真实图标。`7076b0a2`、`1b406ede` 沿现有 daemon 安装入口和共享设置组件完成三项修复：搜索增加加载、失败重试和过期结果隔离，精确包名优先；上游图标从原包声明读取，翻译进度、取消、错误和确认留在当前详情；安装、确认及在线更新固定在详情底部，长说明和权限在上方滚动。上游升级继续从原 npm 来源下载、翻译、预览并确认，详情不混放文件升级入口。
+
+【现状·已运行验证】在 macOS arm64 的真实 Magi.app 目录包中执行 `npm run test:electron-plugin-interactions`，21 项通过。包内构建标识为 `1b406ede`，随包 Electron 45／daemon／Node；使用独立状态根，不激活本轮安装的插件或调用模型。在线安装与升级均使用真实 npm 原包；取消、乱序和搜索失败用例通过 CDP 暂停或失败请求，未替代安装事实。
+
+| 验收范围 | 结果 |
+| --- | --- |
+| 搜索与列表 | `dsh-rea` 精确匹配第一，搜索动效、失败重试、连续改词的过期响应隔离通过；未安装 WorkBuddy 的列表与详情真实图标加载成功 |
+| 安装反馈 | 重复点击只发起一次预览；取消恢复操作；确认期间禁止重复提交；安装后保留当前插件详情 |
+| 固定操作 | 桌面与 390×844 窄视口下，安装、确认安装、在线更新按钮在长内容滚动时保持可见；浅色错误页无横向溢出，深色预览与更新操作可见 |
+| 在线升级 | 先从 npm 安装 `dsh-connect-workbuddy@5.20.0` 并读取 daemon 确认旧版，再经界面预览和确认更新至 `5.20.2`；版本显示正确，无文件升级入口 |
+| Web 定向检查 | `npm --prefix web run check` 0 错误 0 警告；`test:plugin-store`、`test:i18n` 与 `git diff --check` 通过 |
+
+【现状·证据与限制】结果在 `target/plugin-acceptance/interactions/results.json`；截图包括 `dsh-rea-error.png`、`preview.png`、`update-preview.png`、`install-390.png`、`preview-390.png`、`update-390.png`、`error-390.png`。`dsh-rea@1.2.0` 仍因必需的 `@deepseek-ai/dsh-mcp-client`、`@deepseek-ai/dsh-typert-protocol`、`ctx.reflect.provide` 未支持而被拒绝，本轮通过的是明确反馈路径，不是该插件安装成功。390px 是桌面 Electron 视口模拟；未验证 Android／iOS 真机、触摸、200% 缩放、RTL 或全部插件兼容性。此前 WorkBuddy 真实模型调用证据见 11.4。
+
 ## 12. 验收与证据边界
 
 ### 12.1 已运行验证

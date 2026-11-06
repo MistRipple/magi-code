@@ -39,6 +39,19 @@ async function intercept(pattern) {
 async function fixedAction(button, scroller) {
   return page.evaluate(`(()=>{const button=document.querySelector(${JSON.stringify(button)}),scroll=document.querySelector(${JSON.stringify(scroller)});const stress=document.createElement('div');stress.style.height='2000px';scroll.append(stress);const before=button.getBoundingClientRect();scroll.scrollTop=scroll.scrollHeight;const after=button.getBoundingClientRect();stress.remove();scroll.scrollTop=0;return Math.abs(after.bottom-before.bottom)<1 && after.bottom<=innerHeight && after.top>=0;})()`);
 }
+async function narrowAction(button, scroller, name) {
+  await page.call('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: false });
+  try {
+    await page.evaluate('document.querySelector("[data-testid=plugin-detail]").scrollIntoView({block:"nearest"}); true');
+    const fixed = await fixedAction(button, scroller);
+    const fits = await page.evaluate('document.documentElement.scrollWidth <= innerWidth');
+    await screenshot(name);
+    return fixed && fits;
+  } finally {
+    await page.call('Emulation.clearDeviceMetricsOverride');
+    await page.evaluate('document.querySelector("[data-testid=plugin-detail]").scrollIntoView({block:"nearest"}); true');
+  }
+}
 try {
   report.check('隔离验收端口空闲', !await fetch(origin + '/health').then(() => true, () => false));
   app = launchApp({ executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort, env: { MAGI_STATE_ROOT: join(work, 'state'), MAGI_DESKTOP_DAEMON_PORT: String(port), MAGI_OPEN_BROWSER: '0' } });
@@ -55,6 +68,7 @@ try {
   report.check('精确匹配 dsh-rea 排在搜索结果首位', await first() === 'upstream:dsh:dsh-rea');
   await ui.click(row('dsh-rea'));
   report.check('安装按钮固定在详情底部，滚动说明不改变位置', await fixedAction('[data-testid=plugin-detail-install]', '[data-testid=plugin-detail-scroll]'));
+  report.check('390px 窄屏安装按钮固定可见', await narrowAction('[data-testid=plugin-detail-install]', '[data-testid=plugin-detail-scroll]', 'install-390'));
   const before = previews;
   await page.evaluate('const button=document.querySelector("[data-testid=plugin-detail-install]");button.click();button.click();true');
   await waitFor(() => ui.exists('[data-testid=plugin-operation-progress]'), '安装检查反馈');
@@ -79,6 +93,7 @@ try {
     && await page.evaluate('document.querySelector("[data-testid=plugin-detail]").contains(document.querySelector("[data-testid=plugin-candidate]"))'));
   report.check('长权限预览滚动时确认安装按钮仍固定可见', await fixedAction('[data-action=confirm-candidate]', '[data-testid=plugin-candidate-scroll]'));
   await screenshot('preview');
+  report.check('390px 窄屏确认安装按钮固定可见', await narrowAction('[data-action=confirm-candidate]', '[data-testid=plugin-candidate-scroll]', 'preview-390'));
   await ui.click('[data-action=confirm-candidate]');
   await waitFor(() => page.evaluate('document.querySelector("[data-action=confirm-candidate]")?.disabled'), '安装中的确认按钮');
   report.check('确认安装期间显示进度并阻止重复提交', /安装|Installing/.test(await ui.text('[data-action=confirm-candidate]')));
@@ -89,7 +104,7 @@ try {
     return error && await page.evaluate('!document.querySelector("[data-action=confirm-candidate]")?.disabled') && { error };
   }, '实际安装完成', 190_000);
   let installed = await installResult();
-  if (installed.error && /network|TLS|socket|timeout/i.test(installed.error)) {
+  if (installed.error && /network|TLS|socket|timeout|error sending request/i.test(installed.error)) {
     report.check('网络失败保留确认预览与可重试按钮', await ui.exists('[data-testid=plugin-candidate]'));
     await ui.click('[data-action=confirm-candidate]'); installed = await installResult();
   }
@@ -99,19 +114,22 @@ try {
   report.check('安装后保持当前插件详情且可继续授权激活', true);
   // 为在线升级准备真实 npm 旧版；不激活、不调用模型，只在本次隔离实例安装。
   await api(`/api/plugins/${plugin.manifest.id}/uninstall`, {});
-  const older = { ecosystem: 'dsh', package: 'dsh-connect-workbuddy', version: '5.20.1' };
+  const older = { ecosystem: 'dsh', package: 'dsh-connect-workbuddy', version: '5.20.0' };
   const oldPreview = await api('/api/plugins/upstream/preview', older);
   await api('/api/plugins/upstream/install', { ...older, expectedDigest: oldPreview.candidate.digest });
+  assert.equal((await api('/api/plugins')).plugins.find((p) => p.manifest.id === plugin.manifest.id)?.manifest.version, older.version);
   await page.evaluate('window.dispatchEvent(new Event("focus")); true');
   await waitFor(() => ui.exists('[data-testid=plugin-detail-update]'), '在线更新入口', 90_000);
   report.check('在线更新显示正确目标版本且没有文件升级入口', await fixedAction('[data-testid=plugin-detail-update]', '[data-testid=plugin-detail-scroll]')
     && !await page.evaluate('Boolean(document.querySelector("[data-testid=plugin-card] input[type=file]"))')
     && !(await ui.text('[data-testid=plugin-card]')).includes('vundefined'));
+  report.check('390px 窄屏在线更新按钮固定可见', await narrowAction('[data-testid=plugin-detail-update]', '[data-testid=plugin-detail-scroll]', 'update-390'));
   await ui.click('[data-testid=plugin-detail-update]');
   await waitFor(() => ui.exists('[data-testid=plugin-candidate][data-operation=upgrade]'), '在线升级预览', 190_000);
+  await screenshot('update-preview');
   await ui.click('[data-action=confirm-candidate]');
   await waitFor(async () => (await api('/api/plugins')).plugins.find((p) => p.manifest.id === plugin.manifest.id)?.manifest.version === plugin.manifest.version, '在线升级完成', 190_000);
-  report.check('真实 npm 旧版通过在线预览与确认更新到当前版本', true);
+  report.check('真实 npm 旧版通过在线预览与确认更新到当前版本', true, `${older.version} → ${plugin.manifest.version}`);
   await waitFor(async () => !await ui.exists('[data-testid=plugin-search-loading]'), '安装后的搜索刷新', 60_000);
   const failure = await intercept(`${origin}/api/plugins/upstream?*`);
   await query('dsh-rea'); const failed = await failure.request();
