@@ -60,12 +60,16 @@ export async function afterPack(context) {
   if (unpackedNodeModule) {
     throw new Error(`Desktop Main 必须是单一 bundle，不得携带运行时 node_modules: ${unpackedNodeModule}`);
   }
-  const forbidden = packagedPaths.find((path) =>
-    /(^|\/)(tauri|cef|playwright|native-browser|browser-runtime)(\/|\.|-|$)/i.test(path)
-    || /chromium embedded framework/i.test(path)
-  );
+  const forbidden = packagedPaths.find(isRetiredRuntimePath);
   if (forbidden) throw new Error(`发行包包含废弃 Browser/Desktop 实现: ${forbidden}`);
   process.stdout.write(`Electron 解包自检通过: ${context.appOutDir}\n`);
+}
+
+export function isRetiredRuntimePath(path) {
+  // 品牌图片不是运行时实现；仍检查完整父路径，不能藏在 tauri/ 等目录中。
+  const candidate = path.replace(/[^/]+\.(svg|png|jpe?g|webp|gif|avif|bmp|ico)$/i, "");
+  return /(^|\/)(tauri|cef|playwright|native-browser|browser-runtime)(\/|\.|-|$)/i.test(candidate)
+    || /chromium embedded framework/i.test(candidate);
 }
 
 function verifyAsarComponent(asarPath, path, expected) {

@@ -7,6 +7,8 @@ export class RuntimeCatalog {
     this.queue = Promise.resolve();
     this.failure = null;
     this.live = false;
+    this.changes = [];
+    this.scheduled = null;
   }
   enqueue(operation) {
     const work = this.queue.then(() => {
@@ -25,30 +27,45 @@ export class RuntimeCatalog {
   }
   async drain() {
     let current;
-    do { current = this.queue; await current; } while (current !== this.queue);
+    do { await this.scheduled; current = this.queue; await current; } while (this.scheduled || current !== this.queue);
     if (this.failure) throw this.failure;
   }
   register(kind, definition, bind) {
-    let disposeBinding;
-    const registration = this.enqueue(async () => {
-      if (this.catalog[kind].some((item) => item.id === definition.id)) throw new Error(`运行目录重复注册 ${definition.id}`);
-      this.catalog[kind].push(definition);
-      await this.publish();
-      disposeBinding = await bind();
-    });
-    // 上游同步注册 API 返回 effect disposer，异步 RPC 的失败进入同一生命周期。
-    registration.catch(() => {});
-    let disposed = false;
+    const entry = { kind, definition, bind, disposed: false, release: undefined };
+    this.changes.push({ add: true, entry });
+    this.schedule();
     return () => {
-      if (disposed) return;
-      disposed = true;
-      const removal = this.enqueue(async () => {
-        await disposeBinding?.();
-        this.catalog[kind] = this.catalog[kind].filter((item) => item !== definition);
-        await this.publish();
-      });
-      removal.catch(() => {});
-      return removal;
+      if (entry.disposed) return;
+      entry.disposed = true;
+      this.changes.push({ add: false, entry });
+      return this.schedule();
     };
+  }
+  schedule() {
+    if (this.scheduled) return this.scheduled;
+    // 同一批发现/回收一次提交完整目录，避免 N 个工具造成 N 次全目录复制与 RPC。
+    const work = Promise.resolve().then(() => {
+      this.scheduled = null;
+      const changes = this.changes.splice(0);
+      return this.enqueue(async () => {
+        const additions = [];
+        for (const { add, entry } of changes) {
+          const { kind, definition } = entry;
+          if (!add) {
+            await entry.release?.();
+            this.catalog[kind] = this.catalog[kind].filter((item) => item !== definition);
+          } else if (!entry.disposed) {
+            if (this.catalog[kind].some((item) => item.id === definition.id)) throw new Error(`运行目录重复注册 ${definition.id}`);
+            this.catalog[kind].push(definition);
+            additions.push(entry);
+          }
+        }
+        await this.publish();
+        for (const entry of additions) if (!entry.disposed) entry.release = await entry.bind();
+      });
+    });
+    this.scheduled = work;
+    work.catch(() => {});
+    return work;
   }
 }

@@ -20,6 +20,7 @@ tempfile = "3"
 semver = "1"
 urlencoding = "2"
 magi-core = { path = "../magi-core" }
+magi-media = { path = "../magi-media" }
 magi-app-server-protocol = { path = "../magi-app-server-protocol" }
 magi-browser-authority = { path = "../magi-browser-authority" }
 magi-appearance = { path = "../magi-appearance" }

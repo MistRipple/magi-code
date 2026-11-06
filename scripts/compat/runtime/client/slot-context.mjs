@@ -34,7 +34,7 @@ export const SLOT_SURFACE = { 'settings.section': 'settings' };
  *   scope    settingsScope 的实现（getSnapshot / subscribe / set）
  *   onChange 槽位注册或释放后的回调
  */
-export function createSlotContext({ scope, onChange = () => {} }) {
+export function createSlotContext({ scope, connection, onChange = () => {} }) {
   const registered = [];
   const catalogs = new Map();
   const effects = [];
@@ -49,6 +49,8 @@ export function createSlotContext({ scope, onChange = () => {} }) {
   };
 
   const ctx = {
+    configForms,
+    connection,
     slots: {
       inject(_name, factory) { return factory(); },
       register(descriptor, component) {
@@ -72,7 +74,7 @@ export function createSlotContext({ scope, onChange = () => {} }) {
       },
     },
     effect(fn) { effects.push(fn()); },
-    get(name) { return name === 'configForms' ? configForms : undefined; },
+    get(name) { return name === 'configForms' ? configForms : name === 'connection' ? connection : undefined; },
   };
 
   return {

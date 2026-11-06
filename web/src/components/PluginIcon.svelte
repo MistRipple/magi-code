@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * 插件图标：清单声明了位图就用它，没有声明或加载失败时退回通用插件图标。
+   * 插件图标：使用清单声明的图片（包括 SVG），没有声明或加载失败时退回通用插件图标。
    * 图标只作为图片展示，来源是 daemon 的 `/api/plugins/{id}/icon`，与插件是否激活无关。
    */
   import { agentUrl } from '../web/agent-api';

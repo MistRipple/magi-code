@@ -116,7 +116,7 @@ daemon 响应形状：
 
 清单声明、用户授权和包摘要决定能力上界。静态贡献直接来自清单；动态贡献需要清单的 `extension.runtimeContributions` 显式列出 `tools`、`commands`、`modelSources` 或 `settings`。只有声明对应动态贡献种类时，`tools`／`modelSources` 权限才允许 `"*"` 目标；它不授予模型调用、存储或其他能力。钩子仍完全静态，不能降低 guard 模式。插件工具名由 Magi 生成，作者不依赖模型侧编码后的名称。
 
-`catalog.replace` 接收 `{tools?,commands?,modelSources?,settingsSchema?}`；省略的数组按空数组处理，设置 schema 省略或为 null 时使用安装清单。revision 从每个新实例的 0 开始，成功提交递增，版本冲突或任何校验失败都不改变旧目录。整个目录最多 512 KiB，合并静态贡献后仍受清单数量、共享 ID 和 schema 约束。先提交目录，再调用 `api.tool`／`api.command` 绑定；撤销时先释放处理器，再提交新目录。移除模型来源声明也会清除该来源已发布的端点和模型。
+`catalog.replace` 接收 `{tools?,commands?,modelSources?,settingsSchema?}`；省略的数组按空数组处理，设置 schema 省略或为 null 时使用安装清单。revision 从每个新实例的 0 开始，成功提交递增，版本冲突或任何校验失败都不改变旧目录。动态目录最多 2 MiB（为 4 MiB RPC 帧保留余量），最多 1024 个工具、128 个命令、8 个模型来源；动态工具的单个输入 schema 最多 256 KiB，安装清单与设置 schema 仍为 32 KiB；安装清单仍限 128 项贡献，合并后继续校验共享 ID、各项 schema 与授权上界。先提交目录，再调用 `api.tool`／`api.command` 绑定；撤销时先释放处理器，再提交新目录。同批注册/回收合并为一次目录提交，避免逐工具复制全目录。移除模型来源声明也会清除该来源已发布的端点和模型。
 
 初始化阶段的动态目录仅供本实例校验与绑定，`host.ready` 后才进入对外贡献投影。动态目录不写入安装包或持久设置，重启后重新提交。daemon 为每个实例签发独立租约：旧实例不能修改新目录、标记新实例就绪或清理新来源。停用或撤权一经提交，旧租约永久失效；重新授权并激活也不能恢复它。
 

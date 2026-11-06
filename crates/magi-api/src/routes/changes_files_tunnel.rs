@@ -851,21 +851,7 @@ async fn get_file_content(
 
 /// 按文件扩展名推断图片 MIME 类型；非图片返回 None（用于白名单拦截）。
 fn image_mime_for_path(path: &Path) -> Option<&'static str> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())?;
-    match ext.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "avif" => Some("image/avif"),
-        "bmp" => Some("image/bmp"),
-        "ico" => Some("image/x-icon"),
-        "svg" => Some("image/svg+xml"),
-        _ => None,
-    }
+    magi_media::image_content_type(path)
 }
 
 /// 返回图片文件原始字节流（带 Content-Type），供前端 `<img src>` 直接预览。
@@ -900,7 +886,7 @@ async fn get_file_raw(
     let bytes = std::fs::read(&absolute_path)
         .map_err(|e| file_access_error("读取文件内容失败", &absolute_path, e))?;
 
-    Ok(([(header::CONTENT_TYPE, mime)], bytes).into_response())
+    Ok(crate::image_response::image_response(mime, bytes))
 }
 
 /// 下载与文本/图片预览复用同一所有权及 canonical 路径边界。
@@ -4255,5 +4241,40 @@ mod tests {
             .await
             .expect("body should read");
         assert_eq!(&body[..], b"not-a-real-png");
+    }
+
+    #[tokio::test]
+    async fn svg_preview_preserves_vectors_and_isolates_direct_navigation() {
+        let root = unique_temp_dir("magi-raw-svg");
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><style>rect{fill:blue}</style><rect width="32" height="32"/></svg>"##;
+        fs::write(root.join("drawing.SVG"), svg).unwrap();
+        let state = build_state_with_workspace_root(&root, "workspace-svg");
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/files/raw?workspaceId=workspace-svg&filePath=drawing.SVG")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/svg+xml");
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_SECURITY_POLICY],
+            magi_media::IMAGE_CONTENT_SECURITY_POLICY
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            svg
+        );
     }
 }

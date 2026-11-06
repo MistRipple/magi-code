@@ -15,6 +15,8 @@ import * as ReactDOM from 'react-dom';
 import * as ReactDOMClient from 'react-dom/client';
 import * as JsxRuntime from 'react/jsx-runtime';
 import { createSlotContext, slotDisposition, MOUNT_PRIORITY, SLOT_SURFACE } from './slot-context.mjs';
+import { createSettingsScope } from './settings-scope.mjs';
+import { bindSlotProps } from './slot-bindings.mjs';
 
 const CHANNEL = 'magi-plugin-v1';
 
@@ -25,9 +27,8 @@ const CHANNEL = 'magi-plugin-v1';
  */
 export function startDshClient(options) {
   const modules = { react: React, 'react-dom': ReactDOM, 'react/jsx-runtime': JsxRuntime };
+  globalThis.__MAGI_DSH_MODULES__ = modules;
   let locale = 'zh-CN';
-  let settingsState = { version: 0, value: {} };
-  const settingsListeners = new Set();
   let nextRequest = 0;
   let instanceId = null;
   let placement = 'page';
@@ -62,30 +63,31 @@ export function startDshClient(options) {
 
   // —— 沙箱里被禁的窗口、剪贴板、下载：经桥交给宿主 ——
   window.open = (url) => { if (url) void request({ operation: 'host.openExternal', url: String(url) }).catch(() => {}); return null; };
+  // 沙箱 iframe 禁止弹出窗口；把上游原生外链交给宿主，保留 href、target、rel
+  // 和页面代码本身。文档内锚点仍由浏览器原样处理。
+  document.addEventListener('click', (event) => {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const anchor = event.target instanceof Element ? event.target.closest('a[href]') : null;
+    if (!anchor) return;
+    const url = new URL(anchor.getAttribute('href') ?? '', document.baseURI);
+    if (!['http:', 'https:', 'mailto:'].includes(url.protocol)) return;
+    event.preventDefault();
+    void request({ operation: 'host.openExternal', url: url.toString() }).catch(() => {});
+  }, true);
   try {
     Object.defineProperty(navigator, 'clipboard', { value: { writeText: (text) => request({ operation: 'clipboard.write', text: String(text) }) }, configurable: true });
   } catch { /* 浏览器不允许覆盖时保持原样，复制按钮会得到明确的权限错误 */ }
 
   // —— settingsScope：上游界面读写配置的接口，背后是 Magi 的 settings.read / settings.write ——
-  const scope = {
-    getSnapshot: () => ({ value: settingsState.value }),
-    subscribe(listener) { settingsListeners.add(listener); return () => settingsListeners.delete(listener); },
-    async set(field, next) {
-      const merged = { ...settingsState.value, [field]: next };
-      const written = await request({ operation: 'settings.write', expectedVersion: settingsState.version, value: merged });
-      settingsState = { version: written.version, value: written.value ?? merged };
-      for (const listener of [...settingsListeners]) listener();
-      return true;
-    },
-  };
-  const refreshSettings = async () => {
-    const read = await request({ operation: 'settings.read' });
-    settingsState = { version: read.version, value: read.value ?? {} };
-    for (const listener of [...settingsListeners]) listener();
-  };
+  const { scope, refresh: refreshSettings } = createSettingsScope(request);
+  const connection = { rpc: { async call(path, endpoint, input) {
+    if (path !== '/api' || !input || Object.keys(input).some((key) => key !== 'args')) throw new Error('插件 Remote 仅支持 /api 的 JSON unary 调用');
+    const result = await request({ operation: 'route.call', method: 'POST', path: '/__magi_compat/remote', body: { endpoint, args: input.args } });
+    return result.body;
+  } } };
 
   // —— ctx：与构建期记录共用同一份实现 ——
-  const slotContext = createSlotContext({ scope, onChange: () => render() });
+  const slotContext = createSlotContext({ scope, connection, onChange: () => render() });
   const { ctx } = slotContext;
 
   // —— 主题：Magi 令牌映射到上游的 --dsw-* 变量 ——
@@ -102,6 +104,7 @@ export function startDshClient(options) {
       '--dsw-alias-bg-base': t['--background'], '--dsw-alias-bg-layer-1': t['--background'],
       '--dsw-alias-bg-layer-2': t['--surface-2'], '--dsw-alias-bg-layer-3': t['--surface-3'], '--dsw-alias-bg-l1': t['--surface-1'],
       '--dsw-alias-brand-primary': t['--primary'], '--dsw-alias-interactive-bg-hover': t['--surface-hover'],
+      '--dsw-alias-link': t['--primary'],
       '--dsw-alias-state-success-primary': t['--success'], '--dsw-alias-state-warn-primary': t['--warning'],
       '--dsw-alias-state-error-primary': t['--error'], '--dsw-alias-label-error': t['--error'],
       '--dsw-alias-label-success': t['--success'], '--dsw-alias-label-warning': t['--warning'], '--dsw-alias-label-caution': t['--warning'],
@@ -176,27 +179,40 @@ export function startDshClient(options) {
       root.render(React.createElement('div', { style: { padding: 16 } }, '该插件没有提供设置界面。'));
       return;
     }
-    const injected = card.descriptor.inject?.() ?? {};
+    const injected = bindSlotProps(card.descriptor, card.descriptor.inject?.() ?? {}, ctx.locale);
     root.render(React.createElement(card.component, { ...injected, settingsScope: scope, surface: SLOT_SURFACE[card.descriptor.name] ?? 'page', view: 'page' }));
   };
 
   /** 上游界面是一个调用 `__ModuleLoader__.load` 的脚本文件；以 <script src> 加载，页面 CSP 不允许 eval。 */
-  const loadUpstream = (src) => new Promise((resolve, reject) => {
-    window.__ModuleLoader__ = {
-      load({ factory }) {
-        const exports = factory((name) => {
-          if (!(name in modules)) throw new Error(`上游界面需要未提供的模块：${name}`);
-          return modules[name];
-        });
-        exports.apply(ctx);
-      },
-    };
+  const loadScript = (src) => new Promise((resolve, reject) => {
     const script = document.createElement('script');
     script.src = src;
     script.onload = () => resolve();
     script.onerror = () => reject(new Error(`加载 ${src} 失败`));
     document.head.appendChild(script);
   });
+  const loadUpstream = async (src) => {
+    for (const file of options.libraryScripts ?? []) await loadScript(file);
+    let initialized;
+    window.__ModuleLoader__ = {
+      load({ factory }) {
+        try {
+          const exports = factory((name) => {
+            if (!Object.hasOwn(modules, name)) throw new Error(`上游界面需要未提供的模块：${name}`);
+            return modules[name];
+          });
+          // script.onload 只说明文件加载成功；上游 apply 的异步失败也必须进入错误界面。
+          initialized = Promise.resolve(exports.apply(ctx)).then(() => ({}), (error) => ({ error }));
+        } catch (error) {
+          initialized = Promise.resolve({ error });
+        }
+      },
+    };
+    await loadScript(src);
+    if (!initialized) throw new Error('上游界面未通过 ModuleLoader 初始化');
+    const result = await initialized;
+    if (result.error) throw result.error;
+  };
 
   window.addEventListener('message', async (event) => {
     const m = event.data;

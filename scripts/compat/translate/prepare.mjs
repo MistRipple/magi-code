@@ -9,6 +9,7 @@ import { findClientFile } from './client-assets.mjs';
 import { resolveUpstreamIcon } from './icon.mjs';
 import { installDependencies } from './dependencies.mjs';
 import { renderSettingsPage } from './settings-page.mjs';
+import { copyBrowserAssets } from './browser-assets.mjs';
 
 const COMPAT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const TRANSLATOR_VERSION = 2;
@@ -31,6 +32,7 @@ function copyTree(source, target) {
       if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) throw new Error(`上游含链接或特殊文件：${relative(source, full)}`);
       if (entry.isDirectory()) { visit(full); continue; }
       const name = relative(source, full).split(sep).join('/');
+      if (/\.(node|wasm)$/i.test(name)) throw new Error(`上游原包或依赖包含未支持的原生模块：${name}`);
       const size = statSync(full).size; total += size;
       if (size > 4 * 1024 * 1024 || total > 32 * 1024 * 1024 || files.length >= 4096) throw new Error('上游原包及依赖超过有界安装限制');
       const dest = join(target, 'extension/upstream', name);
@@ -52,7 +54,7 @@ export async function prepareDsh(options) {
   const main = entryOf(pkg), root = resolve(options.upstreamDir), entry = resolve(root, main);
   if (!entry.startsWith(root + sep) || !existsSync(entry) || !/\.(?:mjs|cjs|js)$/.test(main)) throw new Error('上游入口无效或尚未构建');
   const inspection = await translator.inspect(root, { required: ['llm', 'tools', 'commands', 'settings', 'runtime', 'hooks', 'session', 'services', 'prompt', 'native'] });
-  if (inspection.verdict.blocked.length) throw new Error(`上游使用了尚未实现的必需契约：\n${inspection.verdict.blocked.map((item) => `${item.name}: ${item.note}`).join('\n')}`);
+  if (inspection.verdict.blocked.length) throw new Error(`Magi 兼容检查未通过：\n${inspection.verdict.blocked.map((item) => `${item.name}（${item.status === 'unknown' ? '尚未完成兼容核对' : '宿主能力尚未接入'}）: ${item.note}`).join('\n')}`);
   const dependencies = await installDependencies(root, options.sharedRoot);
   const manifest = {
     sdkVersion: 2, id: packageId('dsh', pkg.name), version: pkg.version,
@@ -74,14 +76,15 @@ export async function prepareDsh(options) {
   if (client) {
     if (!/^window\.__ModuleLoader__\.load\(/.test(readFileSync(client.file, 'utf8'))) throw new Error('不支持的 DSH 客户端模块格式');
     copyFileSync(join(COMPAT_DIR, 'dist/dsh-client-host.js'), join(options.outDir, 'ui/host.js'));
+    const assets = copyBrowserAssets(client.file, COMPAT_DIR, join(options.outDir, 'ui'));
     copyFileSync(client.file, join(options.outDir, 'ui/client.js'));
-    writeFileSync(join(options.outDir, 'ui/dsh-config.js'), 'globalThis.__MAGI_DSH_CLIENT__ = { runtimeVersion: 2, clientScript: "client.js" };\n');
-    writeFileSync(join(options.outDir, 'ui/settings.html'), '<!doctype html>\n<meta charset="utf-8"><meta name="color-scheme" content="light dark">\n<div id="root"></div><script src="dsh-config.js"></script><script src="host.js"></script>\n');
+    writeFileSync(join(options.outDir, 'ui/dsh-config.js'), `globalThis.__MAGI_DSH_CLIENT__ = ${JSON.stringify({ runtimeVersion: 2, clientScript: 'client.js', libraryScripts: assets.scripts })};\n`);
+    writeFileSync(join(options.outDir, 'ui/settings.html'), `<!doctype html>\n<meta charset="utf-8"><meta name="color-scheme" content="light dark">${assets.styles.map((file) => `<link rel="stylesheet" href="${file}">`).join('')}\n<div id="root"></div><script src="dsh-config.js"></script><script src="host.js"></script>\n`);
   } else {
     writeFileSync(join(options.outDir, 'ui/settings.html'), renderSettingsPage({ schema: manifest.settingsSchema, title: manifest.name, runtimeSchema: true }));
   }
-  const icon = resolveUpstreamIcon({ upstreamDir: root, pkg });
-  if (icon) { copyFileSync(join(root, icon.from), join(options.outDir, icon.to)); manifest.icon = icon.to; }
+  const icon = await resolveUpstreamIcon({ upstreamDir: root, pkg });
+  if (icon) { writeFileSync(join(options.outDir, icon.to), icon.bytes); manifest.icon = icon.to; }
   writeFileSync(join(options.outDir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
   const report = {
     kind: 'dsh', translatorVersion: TRANSLATOR_VERSION, runtimeId,

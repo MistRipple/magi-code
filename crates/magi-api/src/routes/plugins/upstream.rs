@@ -460,11 +460,17 @@ async fn translate(
             .map_err(|error| ApiError::internal_assembly("解包上游插件失败", error))?
             .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
     }
-    let extracted: Value = serde_json::from_slice(&std::fs::read(upstream_dir.join("package.json"))
-        .map_err(|error| ApiError::InvalidInput(error.to_string()))?)
-        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
-    if extracted["name"].as_str() != Some(document.name.as_str()) || extracted["version"].as_str() != Some(document.version.as_str()) {
-        return Err(ApiError::InvalidInput("发布包的名称或版本与 registry 元数据不一致".into()));
+    let extracted: Value = serde_json::from_slice(
+        &std::fs::read(upstream_dir.join("package.json"))
+            .map_err(|error| ApiError::InvalidInput(error.to_string()))?,
+    )
+    .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+    if extracted["name"].as_str() != Some(document.name.as_str())
+        || extracted["version"].as_str() != Some(document.version.as_str())
+    {
+        return Err(ApiError::InvalidInput(
+            "发布包的名称或版本与 registry 元数据不一致".into(),
+        ));
     }
     let out_dir = work.path().join("package");
     let archive_path = work.path().join("package.zip");

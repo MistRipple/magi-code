@@ -429,7 +429,8 @@ fn tool_descriptions_allow_long_guidance_but_stay_bounded() {
     // 其他贡献的说明上限不变。
     let mut m = tool_manifest();
     m["contributions"]["tools"][0]["description"] = json!("");
-    m["contributions"]["commands"] = json!([{"id":"go","title":"Go","description":"x".repeat(4097)}]);
+    m["contributions"]["commands"] =
+        json!([{"id":"go","title":"Go","description":"x".repeat(4097)}]);
     assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
 }
 
@@ -512,7 +513,8 @@ fn model_sources_need_their_own_authorization_and_an_extension() {
 #[test]
 fn bundled_extension_entry_has_its_own_larger_limit() {
     fn compressed_archive(manifest: &Value, entry: &[u8], other: &[u8]) -> Vec<u8> {
-        let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         for (name, bytes) in [
             ("manifest.json", serde_json::to_vec(manifest).unwrap()),
@@ -536,34 +538,68 @@ fn bundled_extension_entry_has_its_own_larger_limit() {
     assert!(PluginPackage::from_archive(&compressed_archive(&manifest, &too_big, b"x")).is_err());
     // 放宽只属于入口文件：同样大小的其他文件仍受 4 MiB 限制。
     let other = vec![b'/'; 5 * 1024 * 1024];
-    assert!(PluginPackage::from_archive(&compressed_archive(&manifest, b"export default async () => {}", &other)).is_err());
+    assert!(
+        PluginPackage::from_archive(&compressed_archive(
+            &manifest,
+            b"export default async () => {}",
+            &other
+        ))
+        .is_err()
+    );
 }
 
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
 
 #[test]
-fn icons_must_be_real_bitmaps_inside_ui_and_are_served_with_their_content_type() {
+fn icons_preserve_svg_and_common_image_formats_inside_ui() {
     let mut m = manifest();
     m["icon"] = json!("ui/icon.png");
     let package = PluginPackage::from_archive(&archive(&m, &[("ui/icon.png", PNG)])).unwrap();
     let (content_type, bytes) = package.icon().expect("声明的图标可读");
     assert_eq!(content_type, "image/png");
     assert_eq!(bytes, PNG);
+    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36"><defs><linearGradient id="g"><stop stop-color="red"/></linearGradient></defs><rect width="36" height="36" fill="url(#g)"/></svg>"##;
+    m["icon"] = json!("ui/icon.svg");
+    let vector = PluginPackage::from_archive(&archive(&m, &[("ui/icon.svg", svg)])).unwrap();
+    assert_eq!(vector.icon(), Some(("image/svg+xml", svg.as_slice())));
 
     // 没有声明图标的包没有图标。
     let plain = PluginPackage::from_archive(&archive(&manifest(), &[])).unwrap();
     assert!(plain.icon().is_none());
 
-    // 声明了却不在包内、内容与类型不符、体积超限、路径越出 ui/、或是 SVG，都明确拒绝。
+    // SVG 图片可用；主动内容、外部引用、类型不符和越界仍拒绝。
     let mut oversized = PNG.to_vec();
     oversized.resize(256 * 1024 + 1, 0);
     for (declared, name, bytes) in [
         ("ui/icon.png", "ui/other.png", PNG.to_vec()),
-        ("ui/icon.png", "ui/icon.png", b"<script>alert(1)</script>".to_vec()),
+        (
+            "ui/icon.png",
+            "ui/icon.png",
+            b"<script>alert(1)</script>".to_vec(),
+        ),
         ("ui/icon.jpg", "ui/icon.jpg", PNG.to_vec()),
         ("ui/icon.png", "ui/icon.png", oversized),
         ("icon.png", "icon.png", PNG.to_vec()),
-        ("ui/icon.svg", "ui/icon.svg", b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec()),
+        (
+            "ui/icon.svg",
+            "ui/icon.svg",
+            b"<svg><script>alert(1)</script></svg>".to_vec(),
+        ),
+        (
+            "ui/icon.svg",
+            "ui/icon.svg",
+            b"<svg onload='alert(1)'/>".to_vec(),
+        ),
+        (
+            "ui/icon.svg",
+            "ui/icon.svg",
+            b"<svg><image href='https://example.test/a.png'/></svg>".to_vec(),
+        ),
+        (
+            "ui/icon.svg",
+            "ui/icon.svg",
+            b"<!DOCTYPE svg><svg/>".to_vec(),
+        ),
     ] {
         let mut m = manifest();
         m["icon"] = json!(declared);

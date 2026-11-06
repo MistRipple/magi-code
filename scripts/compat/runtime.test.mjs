@@ -8,13 +8,17 @@ import { activateDsh } from './runtime/dsh-host.mjs';
 import { runtimeId } from './core/identity.mjs';
 import { startOpenAiBridge } from './runtime/openai-bridge.mjs';
 import { requestAttachments, saveRequestImage, withRequestImages } from './runtime/attachments.mjs';
+import * as McpClient from '@deepseek-ai/dsh-mcp-client';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 // 只替代 daemon RPC；插件加载、依赖、effect、工具管线及模型目录运行真实上游代码。
 function host(value = {}) {
   let revision = 0;
   let snapshot = { version: 0, value };
   let listener, validate;
-  const state = { catalog: {}, tools: new Map(), commands: new Map(), models: new Map(), failures: [], logs: [] };
+  const state = { catalog: {}, tools: new Map(), commands: new Map(), routes: new Map(), models: new Map(), failures: [], logs: [] };
   const bind = (kind) => async (id, handler) => {
     assert.ok(state.catalog[kind].some((item) => item.id === id));
     state[kind].set(id, handler);
@@ -27,6 +31,7 @@ function host(value = {}) {
       return { revision: ++revision };
     } },
     tool: bind('tools'), command: bind('commands'),
+    async route(path, handler) { state.routes.set(path, handler); return () => state.routes.delete(path); },
     modelSource: {
       async set(id, source) { state.models.set(id, source); },
       async clear(id) { state.models.delete(id); },
@@ -63,6 +68,43 @@ async function until(predicate) {
   for (let n = 0; n < 200; n++) { if (predicate()) return; await delay(10); }
   assert.fail('运行状态未在 2 秒内收敛');
 }
+
+test('真实 DSH MCP 客户端发现、调用、工具目录变化、取消与停用回收子进程', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'magi-mcp-contract-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const file = join(directory, 'server.mjs');
+  await writeFile(file, `import {createInterface} from 'node:readline';
+let names=['echo'];
+const send=value=>process.stdout.write(JSON.stringify(value)+'\\n');
+createInterface({input:process.stdin}).on('line',line=>{
+ const m=JSON.parse(line);if(!Object.hasOwn(m,'id'))return;
+ let result;
+ if(m.method==='initialize')result={protocolVersion:'2025-11-25',serverInfo:{name:'contract',version:'1'},capabilities:{tools:{listChanged:true}}};
+ else if(m.method==='tools/list')result={tools:names.map(name=>({name,description:'contract tool',inputSchema:{type:'object',properties:{replace:{type:'boolean'}}}}))};
+ else if(m.method==='tools/call'){
+  result={content:[{type:'text',text:JSON.stringify({pid:process.pid,name:m.params.name})}]};
+  if(m.params.arguments?.replace){names=['replacement'];send({jsonrpc:'2.0',method:'notifications/tools/list_changed'});}
+ }else result={};
+ send({jsonrpc:'2.0',id:m.id,result});
+});`);
+  const h = host();
+  const running = await activateDsh(h.api, {
+    async apply(ctx) { const fiber = ctx.plugin(McpClient, { transport: 'stdio', serverName: 'contract', command: process.execPath, args: [file], failOnStartupError: true }); await fiber.await(); },
+  }, options);
+  t.after(() => running.dispose());
+  const oldId = runtimeId('tool', 'mcp__contract__echo');
+  assert.ok(h.state.tools.has(oldId));
+  const response = await h.state.tools.get(oldId)({ replace: true }, execution());
+  const receipt = JSON.parse(response.content[0].text);
+  assert.equal(receipt.name, 'echo');
+  const nextId = runtimeId('tool', 'mcp__contract__replacement');
+  await until(() => !h.state.tools.has(oldId) && h.state.tools.has(nextId));
+  await assert.rejects(h.state.tools.get(nextId)({}, { invocationId: 'cancelled', signal: AbortSignal.abort(new Error('cancelled')) }), /cancel|abort/i);
+  await running.dispose();
+  assert.equal(h.state.tools.size, 0);
+  await until(() => { try { process.kill(receipt.pid, 0); return false; } catch { return true; } });
+  assert.deepEqual(h.state.failures, []);
+});
 
 test('DSH 初始化失败、必需依赖缺失和未支持事件均不能就绪，并回收已有工具', async () => {
   for (const plugin of [

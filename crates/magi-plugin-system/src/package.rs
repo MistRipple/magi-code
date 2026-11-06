@@ -105,7 +105,7 @@ impl PluginPackage {
         if let Some(icon) = manifest.icon.as_deref() {
             let bytes = files
                 .get(icon)
-                .ok_or_else(|| invalid("图标必须引用包内 ui/ 下的位图文件"))?;
+                .ok_or_else(|| invalid("图标必须引用包内 ui/ 下的图片文件"))?;
             validate_icon(icon, bytes)?;
         }
         Ok(Self {
@@ -116,7 +116,7 @@ impl PluginPackage {
         })
     }
 
-    /// 清单声明的图标：(内容类型, 字节)。只有通过 [`validate_icon`] 的位图才会出现在这里。
+    /// 清单声明的图标：(内容类型, 字节)。SVG 保留矢量原文，与位图共用图片入口。
     pub fn icon(&self) -> Option<(&'static str, &[u8])> {
         let path = self.manifest.icon.as_deref()?;
         let bytes = self.files.get(path)?;
@@ -291,6 +291,19 @@ fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
 }
 
 pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
+    validate_manifest_with_limits(manifest, 128, 32 * 1024)
+}
+
+pub(crate) fn validate_runtime_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
+    // 安装清单仍限 128 项；运行目录另受各类数量与 2 MiB 总预算约束。
+    validate_manifest_with_limits(manifest, 128 + 1024 + 128 + 8, 256 * 1024)
+}
+
+fn validate_manifest_with_limits(
+    manifest: &PluginManifest,
+    max_contributions: usize,
+    max_tool_schema_bytes: usize,
+) -> Result<(), PluginError> {
     static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
     let validator = VALIDATOR.get_or_init(|| {
         let mut schema: serde_json::Value = serde_json::from_str(include_str!(
@@ -342,14 +355,20 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
     }
     // 通配授权只覆盖显式声明的运行期贡献种类，不扩展模型调用或存储权限。
     for permission in &manifest.permissions {
-        if !permission.targets.iter().any(|target| target == "*") { continue; }
+        if !permission.targets.iter().any(|target| target == "*") {
+            continue;
+        }
         use magi_app_server_protocol::generated::PluginRuntimeContributionKind as Kind;
         let kind = match permission.kind {
             PluginPermissionKind::Tools => Kind::Tools,
             PluginPermissionKind::ModelSources => Kind::ModelSources,
             _ => return Err(invalid("该权限不支持通配目标")),
         };
-        if !manifest.extension.as_ref().is_some_and(|extension| extension.runtime_contributions.contains(&kind)) {
+        if !manifest
+            .extension
+            .as_ref()
+            .is_some_and(|extension| extension.runtime_contributions.contains(&kind))
+        {
             return Err(invalid("通配授权必须对应显式运行期贡献种类"));
         }
     }
@@ -389,7 +408,7 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
                 tool.id
             )));
         }
-        validate_object_schema(&tool.input_schema)?;
+        validate_object_schema(&tool.input_schema, max_tool_schema_bytes)?;
         if let Some(timeout) = tool.timeout_ms
             && !(1_000..=600_000).contains(&timeout)
         {
@@ -397,7 +416,10 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
         }
         let permitted = manifest.permissions.iter().any(|permission| {
             permission.kind == PluginPermissionKind::Tools
-                && permission.targets.iter().any(|target| target == &tool.id || target == "*")
+                && permission
+                    .targets
+                    .iter()
+                    .any(|target| target == &tool.id || target == "*")
         });
         if !permitted {
             return Err(invalid(format!(
@@ -472,7 +494,10 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
         check(&source.id, &source.title, &source.description)?;
         let authorized = manifest.permissions.iter().any(|permission| {
             permission.kind == PluginPermissionKind::ModelSources
-                && permission.targets.iter().any(|target| target == &source.id || target == "*")
+                && permission
+                    .targets
+                    .iter()
+                    .any(|target| target == &source.id || target == "*")
         });
         if !authorized {
             return Err(invalid(format!(
@@ -485,19 +510,19 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
         check(&item.id, &item.title, &item.description)?;
     }
     // 只有声明钩子的扩展可不提供 UI/工具贡献；Magi MCP 服务属于内置功能，不经过此入口。
-    if ids.len() > 128 || (ids.is_empty() && manifest.permissions.is_empty()) {
-        return Err(invalid(
-            "插件需要至少一项贡献或权限声明，且贡献不超过 128 项",
-        ));
+    if ids.len() > max_contributions || (ids.is_empty() && manifest.permissions.is_empty()) {
+        return Err(invalid(format!(
+            "插件需要至少一项贡献或权限声明，且贡献不超过 {max_contributions} 项"
+        )));
     }
-    validate_object_schema(&manifest.settings_schema)?;
+    validate_object_schema(&manifest.settings_schema, 32 * 1024)?;
     Ok(())
 }
 
-fn validate_object_schema(schema: &serde_json::Value) -> Result<(), PluginError> {
+fn validate_object_schema(schema: &serde_json::Value, max_bytes: usize) -> Result<(), PluginError> {
     if !schema.is_object()
         || schema.get("type").and_then(|x| x.as_str()) != Some("object")
-        || serde_json::to_vec(schema).map_or(true, |v| v.len() > 32 * 1024)
+        || serde_json::to_vec(schema).map_or(true, |v| v.len() > max_bytes)
     {
         return Err(invalid("配置或工具输入必须声明有界的 object schema"));
     }
@@ -542,9 +567,10 @@ fn valid_path(path: &str) -> bool {
             !segment.is_empty()
                 && !matches!(segment, "." | "..")
                 && !segment.ends_with('.')
-                && segment
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'@' | b'+' | b'~'))
+                && segment.bytes().all(|c| {
+                    c.is_ascii_alphanumeric()
+                        || matches!(c, b'-' | b'_' | b'.' | b'@' | b'+' | b'~')
+                })
                 && !matches!(
                     segment
                         .split('.')
@@ -593,13 +619,17 @@ fn validate_file(name: &str, bytes: &[u8]) -> Result<(), PluginError> {
     if name == "plugin.mjs" {
         return Err(invalid(REMOVED_SDK_MESSAGE));
     }
-    let extension = name.rsplit('.').next().unwrap_or("");
-    let text = matches!(extension, "html" | "css" | "js" | "mjs" | "cjs" | "json" | "svg");
+    let extension = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let extension = extension.as_str();
+    let text = matches!(
+        extension,
+        "html" | "css" | "js" | "mjs" | "cjs" | "json" | "svg"
+    );
     // 扩展代码树：入口 extension/index.mjs 及其依赖的 JS／JSON 文件。仍是纯文本源码，
     // 原生程序、字节码与 WASM 由下面的文件头检查拒绝。
     let upstream_asset = name.starts_with("extension/upstream/");
-    let extension_code = name.starts_with("extension/")
-        && matches!(extension, "js" | "mjs" | "cjs" | "json");
+    let extension_code =
+        name.starts_with("extension/") && matches!(extension, "js" | "mjs" | "cjs" | "json");
     if name != "manifest.json"
         && name != "extension/index.mjs"
         && !extension_code
@@ -618,6 +648,9 @@ fn validate_file(name: &str, bytes: &[u8]) -> Result<(), PluginError> {
                     | "jpeg"
                     | "webp"
                     | "gif"
+                    | "avif"
+                    | "bmp"
+                    | "ico"
                     | "woff"
                     | "woff2"
             ))
@@ -642,30 +675,15 @@ fn validate_file(name: &str, bytes: &[u8]) -> Result<(), PluginError> {
 /// 图标体积上限。图标只用于列表和标题展示，不需要大图。
 pub const MAX_ICON_BYTES: usize = 256 * 1024;
 
-fn icon_content_type(path: &str) -> Option<&'static str> {
-    match path.rsplit('.').next()? {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "webp" => Some("image/webp"),
-        _ => None,
-    }
+pub fn icon_content_type(path: &str) -> Option<&'static str> {
+    magi_media::image_content_type(path)
 }
 
-/// 图标必须是真实位图：扩展名只是声明，文件头必须与之相符，SVG 因可含脚本而不放行。
-fn validate_icon(path: &str, bytes: &[u8]) -> Result<(), PluginError> {
+/// 图标只增加自身的体积约束，图片格式和内容准入与其他 GUI 图片共用。
+pub fn validate_icon(path: &str, bytes: &[u8]) -> Result<(), PluginError> {
     if bytes.len() > MAX_ICON_BYTES {
         return Err(invalid("图标超过 256 KiB 上限"));
     }
-    let matches_header = match icon_content_type(path) {
-        Some("image/png") => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        Some("image/jpeg") => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-        Some("image/webp") => {
-            bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP"
-        }
-        _ => false,
-    };
-    if !matches_header {
-        return Err(invalid("图标文件内容与其类型不符，只接受 png、jpg、webp 位图"));
-    }
+    magi_media::validate_image(path, bytes).map_err(invalid)?;
     Ok(())
 }

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "apps/daemon",
   "crates/magi-core",
+  "crates/magi-media",
   "crates/magi-app-server-protocol",
   "crates/magi-browser-authority",
   "crates/magi-mcp-server",

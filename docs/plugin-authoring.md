@@ -4,7 +4,7 @@
 
 > **适用范围：** 本指南描述当前的插件 SDK（清单 `sdkVersion` 为 `2`）。能力边界见第 16 节。Windows 上的运行与安装包尚未验收，下文的行为以 macOS 上的验证为准。
 >
-> **已有的 DSH 插件：** 为 DeepSeek Harness 发布到 npm 的插件不需要按本指南改写。设置 → 插件可搜索上游包，Magi 在安装期检查和封装原包，安装前展示兼容结果与权限。尚未实现的必需契约会阻止安装；没有对应位置的界面槽位会如实披露。运行时兼容层仍在改造，不能据搜索结果推断该包已完成验收。pi 生态的搜索结果目前只可浏览。
+> **已有的 DSH 插件：** 为 DeepSeek Harness 发布到 npm 的插件不需要按本指南改写。设置 → 插件可搜索上游包，Magi 在安装期检查和封装原包，安装前展示兼容结果与权限。尚未实现的必需契约会阻止安装；没有对应位置的界面槽位会如实披露。页面代码、语言包、样式、图片、链接和页面交互由上游原包直接运行，翻译器只适配宿主能力与业务运行时接口。pi 生态的搜索结果目前只可浏览。
 
 ## 1. 先确认你的功能适合哪种形态
 
@@ -93,7 +93,7 @@ ui/…                       视图页面与静态资源，按需
 
 - `manifest.json`；
 - `extension/index.mjs`；
-- `ui/` 下扩展名为 `html`、`css`、`js`、`mjs`、`json`、`svg`、`png`、`jpg`、`jpeg`、`webp`、`gif`、`woff`、`woff2` 的文件。
+- `ui/` 下扩展名为 `html`、`css`、`js`、`mjs`、`json`、`svg`、`png`、`jpg`、`jpeg`、`webp`、`gif`、`avif`、`bmp`、`ico`、`woff`、`woff2` 的文件。
 
 文本文件必须是 UTF-8。限制：整包不超过 16 MiB，展开后不超过 32 MiB，最多 512 个文件，单文件不超过 4 MiB；不得有符号链接、可执行文件、原生程序或 WASM、路径穿越。
 
@@ -151,9 +151,10 @@ ui/…                       视图页面与静态资源，按需
 - **技能**：`instruction` 是给模型的方法说明（不超过 64 KiB），用户通过 `/` 选用。
 - **资源**：带版本的 JSON 数据，写入必须携带读到的版本（乐观并发）。页面和扩展读写同一份；读写需要对应 `storage` 权限，目标是资源 ID。
 - **视图**：`entry` 必须是包内 `ui/` 下的 HTML 文件。`placements` 可选：`settings`（在设置里为该插件增加一个分类页）、`main`（主内容区页面）、`home`（主页上的入口，必须同时声明 `main`）、`homeCard`（主页上嵌入的卡片，每个插件最多 2 张）、`rightPane`（右侧面板）。
-- **图标**：清单可选字段 `icon`，指向包内 `ui/` 下的位图（png、jpg 或 webp，不超过 256 KiB，不接受 SVG）。设置的插件列表、详情和设置导航都显示它；没有声明或加载失败时显示通用插件图标。
+- **图标**：清单可选字段 `icon`，指向包内 `ui/` 下的图片（PNG、JPEG、GIF、WebP、AVIF、BMP、ICO 或 SVG，不超过 256 KiB）。设置的插件列表、详情和设置导航都显示它；没有声明或加载失败时显示通用插件图标。SVG 保留矢量格式，仅通过图片元素显示；脚本、事件和外部引用不属于图片合同，直接导航也受沙箱 CSP 隔离。
 - **视图隔离**：页面运行在 `sandbox="allow-scripts"` 的隔离 iframe 中，不能联网、不能访问宿主页面、凭据或 Electron，只能通过下面的消息桥读写资源和设置。
 - **设置界面**：Magi 不为插件生成设置表单，所有界面都由插件自己的页面提供。需要用户配置时，声明一个 `placements` 含 `settings` 的视图，页面通过消息桥的 `settings.read` / `settings.write` 读写；值按 `settingsSchema` 校验。设置读写需要 `storage` 权限，目标 `"__settings"`。完整示例见 `examples/plugins/notes/ui/settings.html`。
+- **上游页面**：DSH 翻译包沿用上游的页面入口和组件运行库。页面中的外部 HTTP(S)/mailto 链接保留原始地址、目标和可访问名称，并由宿主外部链接入口打开；图片和 SVG 继续由页面按图片元素显示，SVG 不注入可信 DOM。
 - **浏览器 surface**：`browserSurfaces` 条目需要同名的 `browser` 权限；`backgroundInference` 为真时必须 `keepMounted`。
 
 ### 视图消息桥

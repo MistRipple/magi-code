@@ -29,16 +29,18 @@ export const DSH_RULES = [
   // —— 上下文与生命周期（兼容层运行真实的 Cordis，这些调用由上游代码自身完成）——
   rule('calls', /^ctx\.(logger)(\.|$)/, { fixed: 'shim', group: 'runtime', target: 'api.log', note: '日志降级为诊断日志（最多 4096 字符，不写 canonical 日志）', source: COOKBOOK }),
   rule('calls', /^ctx\.(effect|fiber|on|once|collect|dispose|scope|inject|get|plugin|provide|root|parent)(\.|$)/, { fixed: 'shim', group: 'runtime', target: '真实 Cordis 运行时（兼容层内）', note: '注册与回收沿用上游 Cordis 语义', source: src('docs/cordis-api/context.md') }),
+  rule('calls', /^ctx\.(emit|parallel|serial|bail|waterfall|accessor|mixin|extend|isolate|intercept|set)$/, { fixed: 'shim', group: 'runtime', target: '真实 Cordis 运行时（兼容层内）', source: src('docs/cordis-primer.md') }),
+  rule('calls', /^ctx\.reflect\.(get|set|provide|accessor|mixin)$/, { fixed: 'shim', group: 'runtime', target: '真实 Cordis ReflectService', source: src('vendor/cordis/packages/core/src/reflect.ts') }),
   rule('calls', /^ctx\.settings(\.|$)/, { capability: 'settings.schema', fidelity: 'full', note: '配置 schema 构建期转成 JSON Schema；Volatile 字段随设置推送更新', source: SETTINGS }),
 
   // —— 工具、命令、模型 ——
   // `ctx.inject(['tools'], (c) => c.tools)`：取得服务本身；真正的注册调用另有 `.register` 条目。
   rule('calls', /^ctx\.tools$/, { capability: 'tool.register', fidelity: 'full', note: '取得 tools 服务；注册动作见 ctx.tools.register', source: TOOL }),
-  rule('calls', /^ctx\.tools\.register$/, { capability: 'tool.register', fidelity: 'full', note: '构建期执行 apply 记录静态声明；运行期才出现的工具被明确拒绝', source: TOOL }),
+  rule('calls', /^ctx\.tools\.(register|get|executable|definitions|schemas)$/, { capability: 'tool.register', fidelity: 'full', note: '插件自己的动态工具目录，经 daemon 准入、版本化发布与回收', source: TOOL }),
   rule('calls', /^ctx\.tools\.(guard)$/, { capability: 'hook.tool.call', fidelity: 'partial', note: 'guard 是单调终局拒绝：映射为 tool.call guard 的阻止；DSH 同步 guard 返回值只有 reason', source: PIPELINE, needs: '无；阻止语义一致' }),
-  rule('calls', /^ctx\.tools\.(restrict|resolve|executable|definitions|schemas|get)$/, { capability: 'tool.register', fidelity: 'none', note: '按 Agent 作用域裁剪/检视可见工具；Magi 的工具面由原生权限与角色绑定决定，扩展不能改变', source: src('packages/core/tools/README.md', '“Restrict tools per agent”'), needs: '工具可见性钩子（改变不变量，不建议）' }),
+  rule('calls', /^ctx\.tools\.(restrict|resolve)$/, { capability: 'tool.register', fidelity: 'none', note: '按 Agent 作用域裁剪可见工具；Magi 的工具面由原生权限与角色绑定决定，扩展不能改变', source: src('packages/core/tools/README.md', '“Restrict tools per agent”'), needs: '工具可见性钩子（改变不变量，不建议）' }),
   rule('calls', /^ctx\.commands$/, { capability: 'command.register', fidelity: 'full', note: '取得 commands 服务；注册动作见 ctx.commands.register', source: COOKBOOK }),
-  rule('calls', /^ctx\.commands\.register$/, { capability: 'command.register', fidelity: 'full', note: '构建期静态声明', source: COOKBOOK }),
+  rule('calls', /^ctx\.commands\.register$/, { capability: 'command.register', fidelity: 'full', note: '运行期注册，沿 daemon 目录准入、版本化发布与回收', source: COOKBOOK }),
   rule('calls', /^ctx\.llm\.(registerAdapter|registerConfigurableProviders|registerModelDiscovery)$/, { capability: 'modelSource.publish', fidelity: 'full', note: '适配器经仅本机的 OpenAI 兼容端点接入；协议义务（usage 先于 finish、取消、replayState）由真实 dsh-llm 运行时保持', source: ADAPTER }),
   rule('calls', /^ctx\.llm(\.|$)/, { capability: 'modelSource.publish', fidelity: 'partial', note: '其余 llm 服务（stream/prepareCall 等）不对扩展开放，调用会被拒绝', source: ADAPTER }),
 
@@ -95,7 +97,12 @@ export const DSH_RULES = [
   rule('imports', /^@deepseek-ai\/dsh-llm-pi-ai$/, { capability: 'modelSource.publish', fidelity: 'full', note: '真实 dsh-llm-pi-ai 随包打入；与 pi 翻译器共用 pi-ai 适配层', source: ADAPTER }),
   rule('imports', /^@deepseek-ai\/dsh-llm$/, { capability: 'modelSource.publish', fidelity: 'full', note: '真实 dsh-llm 随包打入', source: ADAPTER }),
   rule('imports', /^@deepseek-ai\/dsh-tools$/, { capability: 'tool.register', fidelity: 'full', note: 'defineTool 等类型与校验随包打入', source: TOOL }),
+  rule('imports', /^@deepseek-ai\/dsh-commands$/, { capability: 'command.register', fidelity: 'full', source: COOKBOOK }),
+  rule('imports', /^@deepseek-ai\/dsh-host-webserver$/, { capability: 'ui.route', fidelity: 'full', source: src('packages/host/webserver/README.md') }),
+  rule('imports', /^@deepseek-ai\/dsh-mcp-client$/, { fixed: 'bundled', group: 'runtime', target: '上游 MCP 客户端 + Magi 动态工具目录', note: '原版客户端负责连接、工具发现及回收；调用经过 Magi 的工具权限与执行入口。MCP 资源与提示服务仅在宿主提供时挂载', source: src('packages/mcp/mcp-client/README.md') }),
+  rule('imports', /^@deepseek-ai\/dsh-typert-protocol$/, { fixed: 'bundled', group: 'runtime', target: '上游 Typert 声明 + 插件私有 Remote 路由', note: '承载本插件声明的 JSON unary 方法；流、Host 对象查找与原生会话上下文不伪造，调用时明确拒绝', source: src('docs/api-gateway.md') }),
   rule('imports', /^@deepseek-ai\/dsh-(atomic-write|home-paths)$/, { fixed: 'bundled', group: 'runtime', target: '文件与目录工具，随包打入' }),
+  rule('imports', /^@deepseek-ai\/dsh-util-(workspace-path|code-language)$/, { fixed: 'bundled', group: 'runtime', target: '上游纯函数工具库，随包携带' }),
   rule('imports', /^@deepseek-ai\/dsh-settings$/, { capability: 'settings.schema', fidelity: 'full', source: SETTINGS }),
   rule('imports', /^@deepseek-ai\/dsh-attachment$/, { capability: 'service.snapshot', fidelity: 'none', group: 'session', note: '附件由 Magi 原生拥有', source: src('packages/attachment/attachment/README.md') }),
   rule('imports', /^@deepseek-ai\/schemastery$/, { fixed: 'bundled', group: 'settings', target: '纯 JS，构建期打包' }),

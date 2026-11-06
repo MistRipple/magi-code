@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { connectAppPage, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-interaction-test/mac-arm64/Magi.app');
+const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
 const port = 38939, cdpPort = 9309, origin = `http://127.0.0.1:${port}`;
 const work = await mkdtemp(join(tmpdir(), 'magi-plugin-interactions-'));
 const output = join(root, 'target/plugin-acceptance/interactions');
@@ -69,13 +69,17 @@ try {
   await ui.click(row('dsh-rea'));
   report.check('安装按钮固定在详情底部，滚动说明不改变位置', await fixedAction('[data-testid=plugin-detail-install]', '[data-testid=plugin-detail-scroll]'));
   report.check('390px 窄屏安装按钮固定可见', await narrowAction('[data-testid=plugin-detail-install]', '[data-testid=plugin-detail-scroll]', 'install-390'));
+  const rejectedPreview = await intercept(`${origin}/api/plugins/upstream/preview`);
   const before = previews;
   await page.evaluate('const button=document.querySelector("[data-testid=plugin-detail-install]");button.click();button.click();true');
   await waitFor(() => ui.exists('[data-testid=plugin-operation-progress]'), '安装检查反馈');
   report.check('重复点击只发起一次预览，按钮显示当前检查状态', previews === before + 1 && await page.evaluate('document.querySelector("[data-testid=plugin-detail-install]").disabled'));
-  await waitFor(() => ui.exists('[data-testid=plugin-message]'), '真实兼容失败提示', 180_000);
-  report.check('dsh-rea 的真实翻译失败在当前详情可见', await visible('[data-testid=plugin-message]')
-    && /dsh-mcp-client|dsh-typert-protocol|未登记|尚未实现/.test(await ui.text('[data-testid=plugin-message]'))
+  const rejected = await rejectedPreview.request();
+  await page.call('Fetch.fulfillRequest', { requestId: rejected.requestId, responseCode: 400, responseHeaders: [{ name: 'content-type', value: 'application/json' }], body: Buffer.from(JSON.stringify({ message: 'COMPATIBILITY_CHECK_REJECTED' })).toString('base64') });
+  await rejectedPreview.stop();
+  await waitFor(() => ui.exists('[data-testid=plugin-message]'), '兼容检查失败提示', 30_000);
+  report.check('注入的兼容检查失败在当前详情可见', await visible('[data-testid=plugin-message]')
+    && /COMPATIBILITY_CHECK_REJECTED/.test(await ui.text('[data-testid=plugin-message]'))
     && await page.evaluate('document.querySelector("[data-testid=plugin-detail]").contains(document.querySelector("[data-testid=plugin-message]"))'));
   await screenshot('dsh-rea-error');
   await search('dsh-connect-workbuddy'); await ui.click(row('dsh-connect-workbuddy'));
@@ -147,7 +151,12 @@ try {
   report.check('连续改词后旧请求不能覆盖新搜索结果', await first() === plugin.manifest.id);
   await page.call('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: false });
   await page.call('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: 'light' }] });
-  await search('dsh-rea'); await ui.click(row('dsh-rea')); await ui.click('[data-testid=plugin-detail-install]');
+  await search('dsh-rea'); await ui.click(row('dsh-rea'));
+  const narrowFailure = await intercept(`${origin}/api/plugins/upstream/preview`);
+  await ui.click('[data-testid=plugin-detail-install]');
+  const narrowRequest = await narrowFailure.request();
+  await page.call('Fetch.fulfillRequest', { requestId: narrowRequest.requestId, responseCode: 400, responseHeaders: [{ name: 'content-type', value: 'application/json' }], body: Buffer.from(JSON.stringify({ message: 'COMPATIBILITY_CHECK_REJECTED' })).toString('base64') });
+  await narrowFailure.stop();
   await waitFor(() => ui.exists('[data-testid=plugin-message]'), '窄屏失败反馈', 180_000);
   report.check('390px 窄屏无横向溢出，失败原因自动可见', await page.evaluate('document.documentElement.scrollWidth <= innerWidth') && await visible('[data-testid=plugin-message]'));
   await screenshot('error-390');

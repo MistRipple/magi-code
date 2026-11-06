@@ -1,6 +1,6 @@
 # Magi 插件系统：架构、当前合同与交付边界
 
-【现状】更新：2026-11-05。以本工作区源码和本轮运行证据为准；方案目标不得作为已交付证明。本文完整替换旧 QuickJS 方案。作者可依赖的接口见[作者指南](plugin-authoring.md)，字节协议见[扩展协议](extension-protocol-v1.md)。
+【现状】更新：2026-11-07。以本工作区源码和本轮运行证据为准；方案目标不得作为已交付证明。本文完整替换旧 QuickJS 方案。作者可依赖的接口见[作者指南](plugin-authoring.md)，字节协议见[扩展协议](extension-protocol-v1.md)。
 
 ## 1. 结论、约定与需求
 
@@ -12,7 +12,7 @@
 - 【目标】插件能直接使用文件、网络、进程；daemon 服务负责 Magi 业务所有权，不是 OS 沙箱。
 - 【目标】扩展只能阻止或提出改写；最终权限、审批、日志和结果由 daemon 决定。
 - 【目标】子代理保留自定义角色与模型绑定；不允许扩展静默替换模型。
-- 【现状】已接入 DSH 上游原包安装与运行时兼容层，正在按 11.1、11.2 补齐契约和验收；尚未支持的必需契约会阻止安装。pi 运行器尚未提供，只能浏览其搜索结果，安装被明确拒绝。
+- 【现状】已接入 DSH 上游原包安装与运行时兼容层；WorkBuddy 与 dsh-rea 已完成 macOS 目录包在线安装、原生页面和运行期验收，尚未支持的必需契约仍会阻止安装。pi 运行器尚未提供，只能浏览其搜索结果，安装被明确拒绝。
 - 【现状】Windows demo、Windows 实机与正式安装包验收后置；本机开发验收不等于这些平台已通过。
 - 【目标】工作流／会话引擎替换、数据转换 VM、SDK 1 兼容均不恢复。
 
@@ -35,7 +35,7 @@
 | 目标 | ExtensionBus | 钩子分发与提案裁决入口，不是第二个业务事件日志 |
 | 目标 | canonical 事实 | 原有 Session／Turn／Task／审批／用量存储提交的唯一业务事实 |
 | 目标 | 插件作业 | daemon 计划触发的命令 Turn，携带计划、执行身份和预算 |
-| 现状 | 翻译包 | 安装期由翻译器从上游 npm 包生成的标准 Magi 包：上游文件逐字节保留，兼容层与共享依赖随产品发行；不带第二个 agent 内核 |
+| 现状 | 翻译包 | 安装期由翻译器从上游 npm 包生成的标准 Magi 包：上游业务文件逐字节保留，页面代码、语言包、样式、图片与链接原样运行；兼容层只翻译宿主能力与业务运行时接口，不带第二个 agent 内核 |
 
 ### 1.3 连续编号需求与非目标
 
@@ -89,7 +89,7 @@
 
 ### 2.3 视图隔离
 
-【现状·读码推断】iframe 仅 `allow-scripts`；响应 CSP 也包含 `sandbox allow-scripts`、`connect-src 'none'`、`frame-ancestors 'self'` 与 nosniff。桥检查 contentWindow、origin、通道和 instanceId；导航重新签发 instanceId，释放旧订阅，丢弃迟到回复。[plugins.rs:166](../crates/magi-api/src/routes/plugins.rs#L166)、[PluginTabContent.svelte:23](../web/src/components/tabs/PluginTabContent.svelte#L23)。实际可调用操作只有资源 read/write/subscribe、设置 read/write；不开放任意 daemon API。
+【现状·读码推断】iframe 仅 `allow-scripts`；响应 CSP 也包含 `sandbox allow-scripts`、`connect-src 'none'`、`frame-ancestors 'self'` 与 nosniff。桥检查 contentWindow、origin、通道和 instanceId；导航重新签发 instanceId，释放旧订阅，丢弃迟到回复。页面原有的 HTTP(S)/mailto 外链由兼容宿主捕获后交给 Magi 外部链接入口，保留 href、target、rel 和上游链接样式；文档内锚点仍由页面处理。[plugins.rs:166](../crates/magi-api/src/routes/plugins.rs#L166)、[PluginTabContent.svelte:23](../web/src/components/tabs/PluginTabContent.svelte#L23)。实际桥操作包括资源 read/write/subscribe、设置 read/write、受限 route.call、外链、剪贴板和高度上报；不开放任意 daemon API。
 
 ### 2.4 缺陷清单与处理顺序
 
@@ -378,9 +378,9 @@
 | 关闭 | 关闭开关即停用：设置页保留，只剩顶部栏与停用提示，不加载插件界面；重新启用在“插件”列表详情里完成 | 同上 |
 | 版面 | 内容列宽度、左右留白、与页头的间距、圆角、整页滚动全部沿用设置共享框架（`settings.css` 的 `settings-frame`）；插件界面以透明背景嵌入，高度由页面经 `view.resize` 上报，页面自身不产生滚动条也不自带外层留白 | [PluginTabContent](../web/src/components/tabs/PluginTabContent.svelte)、[settings.css](../web/src/styles/settings.css) |
 | 令牌 | 字号、字体、间距、圆角、文字层级与主按钮前后景取宿主下发的令牌，不写死数值；交互控件用次级文字色，实心控件用主按钮前景色 | 同上 |
-| 图标 | 清单 `icon` 指向包内 `ui/` 下的 png／jpg／webp，不放行 SVG，不超过 256 KiB，文件头必须与类型相符；读取走 `GET /api/plugins/{id}/icon`，与插件是否激活无关，仅返回声明的那一个文件 | [package.rs](../crates/magi-plugin-system/src/package.rs)、[plugins.rs](../crates/magi-api/src/routes/plugins.rs) |
+| 图标 | 清单 `icon` 指向包内 `ui/` 下的 PNG、JPEG、GIF、WebP、AVIF、BMP、ICO 或 SVG，不超过 256 KiB，文件内容必须与类型相符；SVG 只作为图片显示并经过 XML 内容准入；读取走 `GET /api/plugins/{id}/icon`，与插件是否激活无关，仅返回声明的那一个文件 | [package.rs](../crates/magi-plugin-system/src/package.rs)、[plugins.rs](../crates/magi-api/src/routes/plugins.rs)、[magi-media](../crates/magi-media/src/lib.rs) |
 
-【现状·已运行验证】2026-11-06：`node scripts/verify-local-plugins.mjs --ui`（隔离 daemon，真实 Electron 窗口）26 项通过，其中界面部分断言：导航、列表、详情头的图标均为已加载位图；页头同一行含图标、名称与已启用开关且内容列不重复操作栏；页头与内容列左边距同原生分类一致；关闭后保留页面与停用提示且不渲染 iframe；在列表中重新授权激活后页面恢复；390px 视口无横向溢出。包校验的反例（缺文件、伪造内容、SVG、超限、越出 ui/）由 `cargo test -p magi-plugin-system --test package` 覆盖。
+【现状·已运行验证】2026-11-06：`node scripts/verify-local-plugins.mjs --ui`（隔离 daemon，真实 Electron 窗口）26 项通过，其中界面部分断言：导航、列表、详情头的图片均为已加载；页头同一行含图标、名称与已启用开关且内容列不重复操作栏；页头与内容列左边距同原生分类一致；关闭后保留页面与停用提示且不渲染 iframe；在列表中重新授权激活后页面恢复；390px 视口无横向溢出。包校验的反例（缺文件、伪造内容、SVG 主动内容、超限、越出 ui/）由 `cargo test -p magi-plugin-system --test package` 覆盖。
 
 【现状·读码推断】设置界面不再提供插件计划管理；daemon 的作业接口（`/plugins/{id}/jobs`）与调度保留，只是没有界面入口。
 
@@ -525,7 +525,18 @@
 | 在线升级 | 先从 npm 安装 `dsh-connect-workbuddy@5.20.0` 并读取 daemon 确认旧版，再经界面预览和确认更新至 `5.20.2`；版本显示正确，无文件升级入口 |
 | Web 定向检查 | `npm --prefix web run check` 0 错误 0 警告；`test:plugin-store`、`test:i18n` 与 `git diff --check` 通过 |
 
-【现状·证据与限制】结果在 `target/plugin-acceptance/interactions/results.json`；截图包括 `dsh-rea-error.png`、`preview.png`、`update-preview.png`、`install-390.png`、`preview-390.png`、`update-390.png`、`error-390.png`。`dsh-rea@1.2.0` 仍因必需的 `@deepseek-ai/dsh-mcp-client`、`@deepseek-ai/dsh-typert-protocol`、`ctx.reflect.provide` 未支持而被拒绝，本轮通过的是明确反馈路径，不是该插件安装成功。390px 是桌面 Electron 视口模拟；未验证 Android／iOS 真机、触摸、200% 缩放、RTL 或全部插件兼容性。此前 WorkBuddy 真实模型调用证据见 11.4。
+【现状·证据与限制】结果在 `target/plugin-acceptance/interactions/results.json`；截图包括 `dsh-rea-error.png`、`preview.png`、`update-preview.png`、`install-390.png`、`preview-390.png`、`update-390.png`、`error-390.png`。该脚本保留 dsh-rea 的失败反馈路径，在线兼容成功与真实运行见 11.6。390px 是桌面 Electron 视口模拟；未验证 Android／iOS 真机、触摸、200% 缩放、RTL 或全部插件兼容性。此前 WorkBuddy 真实模型调用证据见 11.4。
+
+### 11.6 DSH 原生页面与 dsh-rea 在线验收（2026-11-07）
+
+【现状·已运行验证】`node scripts/verify-electron-dsh-rea.mjs` 使用真实 macOS arm64 目录包、独立状态根、npm 在线原包 `dsh-rea@1.2.0` 和 `rea-agents@6.5.0`，共 16 项通过：
+
+- 安装前搜索精确匹配第一，npm 原包声明的 SVG 图标在列表和详情可显示；在线预览、确认安装和安装后图标接口均保留原始 SVG 字节，并带 `image/svg+xml`、`nosniff` 与 sandbox CSP。
+- 原包业务页面、React 组件、样式、语言包、示例提示、复制按钮、Ghidra 外链和设置表单均由上游页面直接渲染。Ghidra 链接保留原始 href、`target="_blank"` 和链接色；外链点击经宿主外部链接入口打开。
+- `rea-agents@6.5.0` 的真实 MCP 握手返回 207 个工具；动态目录超过安装清单的 128 项静态贡献上限后仍能在运行目录进入 daemon，目录总量与单工具 schema 受独立 2 MiB／256 KiB 边界保护。
+- Remote 状态页显示真实 REA 版本和工具数量；修改 300000 毫秒超时为 310000 后经 CAS 保存，触发上游 Volatile 配置重载；停用清空动态工具，重新激活恢复工具并保留配置；原窗口和 iframe 无未捕获异常，390px 无横向溢出。
+
+证据保存在 `target/plugin-acceptance/dsh-rea/results.json`、`evidence.json`、`online-svg.png`、`settings.png` 和 `settings-390.png`。本轮仍未覆盖 Android/iOS 真机触摸、Windows、Ghidra 实际安装与原生二进制分析，以及全部 DSH 包。
 
 ## 12. 验收与证据边界
 

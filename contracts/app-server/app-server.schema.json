@@ -2624,8 +2624,8 @@
         "icon": {
           "type": "string",
           "maxLength": 128,
-          "pattern": "^ui/[A-Za-z0-9._/-]+\\.(png|jpg|jpeg|webp)$",
-          "description": "包内 ui/ 下的位图图标（png/jpg/webp，不含 SVG）；宿主只把它当图片展示，不执行。"
+          "pattern": "^ui/[A-Za-z0-9._/-]+\\.(png|jpg|jpeg|webp|gif|avif|bmp|ico|svg)$",
+          "description": "包内 ui/ 下的图片图标（png/jpg/jpeg/gif/webp/avif/bmp/ico/svg）；SVG 保留矢量格式，宿主只作为图片展示，不执行脚本。"
         },
         "extension": {
           "$ref": "#/$defs/PluginExtension"
@@ -6250,7 +6250,7 @@
           "items": {
             "$ref": "#/$defs/PluginToolContribution"
           },
-          "maxItems": 128,
+          "maxItems": 1024,
           "x-rust-default": true
         },
         "commands": {

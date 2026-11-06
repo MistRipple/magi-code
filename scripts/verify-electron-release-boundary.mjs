@@ -1,6 +1,13 @@
 import { access, readFile, readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import assert from "node:assert/strict";
+import { isRetiredRuntimePath } from "../apps/desktop/scripts/after-pack.mjs";
+
+assert.equal(isRetiredRuntimePath("daemon/compat/node_modules/simple-icons/icons/tauri.svg"), false);
+for (const path of ["tauri/runtime.js", "daemon/tauri/icons/logo.svg", "cef.dll", "playwright/index.js", "Chromium Embedded Framework.framework/main"]) {
+  assert.equal(isRetiredRuntimePath(path), true, path);
+}
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const forbiddenPaths = [

@@ -186,15 +186,21 @@ async fn resource(
         .files()
         .get(&resource_path)
         .ok_or_else(|| ApiError::NotFound("插件视图资源不存在".into()))?;
-    let content_type = match resource_path.rsplit('.').next().unwrap_or_default() {
+    if let Some(mime) = magi_media::image_content_type(&resource_path) {
+        return Ok(crate::image_response::image_response(mime, bytes.clone()));
+    }
+    let extension = resource_path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let content_type = match extension.as_str() {
         "html" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "json" => "application/json; charset=utf-8",
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
         _ => "application/octet-stream",
     };
     let mut response = Response::new(bytes.clone().into());
@@ -216,7 +222,7 @@ async fn resource(
 }
 
 /// 已安装插件的图标。与视图资源不同，列表要展示所有已安装插件，所以不要求插件已激活；
-/// 只返回清单声明且通过包校验的那一个位图，其他包内文件不经此接口出去。
+/// 只返回清单声明且通过包校验的那一个图片，其他包内文件不经此接口出去。
 async fn icon(State(state): State<ApiState>, Path(id): Path<String>) -> Result<Response, ApiError> {
     let manager = locked(&state, "读取插件图标")?;
     let package = manager.package(&id).map_err(plugin_error)?;
@@ -227,20 +233,7 @@ async fn icon(State(state): State<ApiState>, Path(id): Path<String>) -> Result<R
 }
 
 fn icon_response(content_type: &'static str, bytes: Vec<u8>) -> Response {
-    let mut response = Response::new(bytes.into());
-    *response.status_mut() = StatusCode::OK;
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-    response.headers_mut().insert(
-        "x-content-type-options",
-        HeaderValue::from_static("nosniff"),
-    );
-    // 位图只作图片展示；沙箱 CSP 让它即使被当文档打开也不能执行任何内容。
-    response.headers_mut().insert(
-        "content-security-policy",
-        HeaderValue::from_static("sandbox; default-src 'none'; img-src 'self'"),
-    );
+    let mut response = crate::image_response::image_response(content_type, bytes);
     response.headers_mut().insert(
         "cache-control",
         HeaderValue::from_static("private, max-age=300"),
@@ -353,10 +346,15 @@ async fn read_settings(
         .map_err(plugin_error)
 }
 
-async fn settings_schema(State(state): State<ApiState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+async fn settings_schema(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
     let manager = locked(&state, "读取插件设置 schema")?;
     manager.read_settings(&id).map_err(plugin_error)?;
-    Ok(Json(serde_json::json!({"schema": manager.runtime_manifest(&id, true).map_err(plugin_error)?.settings_schema})))
+    Ok(Json(
+        serde_json::json!({"schema": manager.runtime_manifest(&id, true).map_err(plugin_error)?.settings_schema}),
+    ))
 }
 
 async fn write_settings(
@@ -368,18 +366,36 @@ async fn write_settings(
     let digest = {
         let manager = locked(&state, "校验插件设置")?;
         manager.ensure_editing_admitted(&id).map_err(plugin_error)?;
-        manager.validate_settings(&id, &request.value).map_err(plugin_error)?;
+        manager
+            .validate_settings(&id, &request.value)
+            .map_err(plugin_error)?;
         let package = manager.package(&id).map_err(plugin_error)?;
-        package.manifest().extension.as_ref()
-            .is_some_and(|extension| extension.runtime_contributions.contains(&magi_app_server_protocol::generated::PluginRuntimeContributionKind::Settings))
+        package
+            .manifest()
+            .extension
+            .as_ref()
+            .is_some_and(|extension| {
+                extension.runtime_contributions.contains(
+                    &magi_app_server_protocol::generated::PluginRuntimeContributionKind::Settings,
+                )
+            })
             .then(|| package.digest().to_string())
     };
     if digest.is_some() {
-        state.extension_status.as_ref().ok_or_else(|| ApiError::Conflict("扩展宿主未就绪".into()))?
-            .validate_settings(id.clone(), request.value.clone()).await.map_err(ApiError::InvalidInput)?;
+        state
+            .extension_status
+            .as_ref()
+            .ok_or_else(|| ApiError::Conflict("扩展宿主未就绪".into()))?
+            .validate_settings(id.clone(), request.value.clone())
+            .await
+            .map_err(ApiError::InvalidInput)?;
     }
     let mut manager = locked(&state, "写入插件设置")?;
-    if digest.as_deref().is_some_and(|digest| manager.package(&id).map_or(true, |package| package.digest() != digest)) {
+    if digest.as_deref().is_some_and(|digest| {
+        manager
+            .package(&id)
+            .map_or(true, |package| package.digest() != digest)
+    }) {
         return Err(ApiError::Conflict("设置校验后插件版本已变化".into()));
     }
     manager.ensure_editing_admitted(&id).map_err(plugin_error)?;

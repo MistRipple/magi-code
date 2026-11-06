@@ -330,7 +330,7 @@ export function scanSources(root, options = {}) {
     const isDshContext = (node, at) => flow === DSH_FLOW && ts.isIdentifier(node) && labelOf(node.text, at) === 'ctx';
     const visit = (node) => {
       if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
-        const typeOnly = Boolean(node.importClause?.isTypeOnly) || !node.importClause;
+        const typeOnly = Boolean(node.importClause?.isTypeOnly);
         const module = node.moduleSpecifier.text;
         bump(imports, `${typeOnly ? 'type:' : ''}${module}`, rel);
         const named = node.importClause?.namedBindings;

@@ -15,6 +15,7 @@ mod external_turns;
 pub mod git_tool_runtime;
 mod goal_service;
 mod host_paths;
+mod image_response;
 mod input_service;
 mod interaction_service;
 mod isolation;

@@ -56,6 +56,76 @@ fn catalog() -> PluginRuntimeCatalog {
 }
 
 #[test]
+fn large_runtime_tool_catalogs_keep_byte_budget_and_count_limits() {
+    let (_dir, mut manager, package) = fixture();
+    manager
+        .begin_runtime(ID, package.digest(), "large")
+        .unwrap();
+    let mut large = catalog();
+    let template = large.tools[0].clone();
+    large.tools = (0..300)
+        .map(|n| {
+            let mut tool = template.clone();
+            tool.id = format!("tool-{n}");
+            tool
+        })
+        .collect();
+    manager
+        .replace_runtime_catalog(ID, "large", 0, large.clone())
+        .unwrap();
+    let mut over_count = large.clone();
+    over_count.tools = (0..1025)
+        .map(|n| {
+            let mut tool = template.clone();
+            tool.id = format!("tool-{n}");
+            tool
+        })
+        .collect();
+    assert!(
+        manager
+            .replace_runtime_catalog(ID, "large", 1, over_count)
+            .is_err()
+    );
+    for tool in &mut large.tools {
+        tool.description = "x".repeat(8 * 1024);
+    }
+    assert!(
+        manager
+            .replace_runtime_catalog(ID, "large", 1, large)
+            .is_err()
+    );
+}
+
+#[test]
+fn runtime_input_schemas_have_their_own_budget_and_keep_reference_validation() {
+    let (_dir, mut manager, package) = fixture();
+    manager
+        .begin_runtime(ID, package.digest(), "schemas")
+        .unwrap();
+    let mut value = catalog();
+    value.tools[0].input_schema["description"] = json!("s".repeat(160 * 1024));
+    manager
+        .replace_runtime_catalog(ID, "schemas", 0, value.clone())
+        .unwrap();
+    value.tools[0].input_schema["description"] = json!("s".repeat(256 * 1024));
+    assert!(
+        manager
+            .replace_runtime_catalog(ID, "schemas", 1, value.clone())
+            .is_err()
+    );
+    value.tools[0].input_schema = json!({"type":"object", "$ref":"https://example.test/schema"});
+    assert!(
+        manager
+            .replace_runtime_catalog(ID, "schemas", 1, value)
+            .is_err()
+    );
+    // 拒绝后 revision 不变，仍能以原版本提交有效快照。
+    manager
+        .replace_runtime_catalog(ID, "schemas", 1, catalog())
+        .unwrap();
+}
+
+#[test]
 fn catalog_is_hidden_until_ready_and_never_persisted_as_an_installation_fact() {
     let (dir, mut manager, package) = fixture();
     manager

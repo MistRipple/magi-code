@@ -69,6 +69,7 @@ test('DSH peer 沿上游准入策略计入预发布版本；越界版本、直�
   const shared = join(root, 'shared');
   const check = async (name, version, range, field = 'peerDependencies') => {
     const target = join(shared, 'node_modules', name); mkdirSync(target, { recursive: true });
+    writeFileSync(join(shared, 'package.json'), JSON.stringify({ dependencies: { [name]: version } }));
     writeFileSync(join(target, 'package.json'), JSON.stringify({ name, version }));
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'peer-fixture', version: '1.0.0', [field]: { [name]: range } }));
     return installDependencies(root, shared);
@@ -404,23 +405,30 @@ test('界面槽位：ctx 的实现只含上游入口用到的成员；未知服�
   assert.equal(t('missing'), 'missing');
 });
 
-test('图标：上游声明的位图被带进清单与包；没有图标不产生；SVG、越界、伪造、超限明确失败', async () => {
-  const { mkdtempSync, writeFileSync, mkdirSync } = await import('node:fs');
+test('翻译保留 PNG/SVG 原始图片字节；越界、伪造和超限拒绝，内容准入由 Magi 包统一校验', async (t) => {
+  const { mkdtempSync, writeFileSync, mkdirSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const { resolveUpstreamIcon } = await import('./translate/icon.mjs');
-  const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(32)]);
+  const sharp = (await import('sharp')).default;
+  const png = await sharp({ create: { width: 8, height: 8, channels: 4, background: '#2478ac' } }).png().toBuffer();
   const make = (declared, file, bytes) => {
     const dir = mkdtempSync(join(tmpdir(), 'magi-icon-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
     mkdirSync(join(dir, 'up/icons'), { recursive: true });
     if (file && bytes) writeFileSync(join(dir, 'up', file), bytes);
     return { upstreamDir: join(dir, 'up'), pkg: { name: 'x', ...(declared === undefined ? {} : { icon: declared }) } };
   };
-  assert.deepEqual(resolveUpstreamIcon(make('icons/a.png', 'icons/a.png', png)), { from: 'icons/a.png', to: 'ui/icon.png' });
-  assert.equal(resolveUpstreamIcon(make(undefined)), null, '没有声明就没有图标');
-  assert.throws(() => resolveUpstreamIcon(make('icons/a.svg', 'icons/a.svg', Buffer.from('<svg/>'))), /不受支持/);
-  assert.throws(() => resolveUpstreamIcon(make('icons/a.png', 'icons/a.png', Buffer.from('<script>'))), /内容与其扩展名不符/);
-  assert.throws(() => resolveUpstreamIcon(make('icons/a.png', 'icons/a.png', Buffer.alloc(300 * 1024, 1))), /超过 256 KiB/);
-  assert.throws(() => resolveUpstreamIcon(make('../../etc/hosts')), /指向包外/);
-  assert.throws(() => resolveUpstreamIcon(make('icons/missing.png')), /文件不存在/);
+  const icon = await resolveUpstreamIcon(make('icons/a.png', 'icons/a.png', png));
+  assert.equal(icon.to, 'ui/icon.png');
+  assert.equal((await sharp(icon.bytes).metadata()).width, 8);
+  assert.equal(await resolveUpstreamIcon(make(undefined)), null);
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" fill="red"/></svg>';
+  const vector = await resolveUpstreamIcon(make('icons/a.svg', 'icons/a.svg', Buffer.from(svg)));
+  assert.equal(vector.to, 'ui/icon.svg');
+  assert.equal(vector.bytes.toString(), svg);
+  await assert.rejects(resolveUpstreamIcon(make('icons/a.png', 'icons/a.png', Buffer.from('<script>'))), /内容与其扩展名不符/);
+  await assert.rejects(resolveUpstreamIcon(make('icons/a.png', 'icons/a.png', Buffer.alloc(300 * 1024, 1))), /超过 256 KiB/);
+  await assert.rejects(resolveUpstreamIcon(make('../../etc/hosts')), /指向包外/);
+  await assert.rejects(resolveUpstreamIcon(make('icons/missing.png')), /文件不存在/);
 });

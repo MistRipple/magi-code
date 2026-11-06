@@ -2046,7 +2046,11 @@ fn browser_authority_api_error(error: BrowserAuthorityError) -> ApiError {
 /// 受信扩展宿主运行状态的只读来源（daemon 的 ExtensionRuntime 实现它）。
 /// 状态属于宿主监管，插件管理器与 API 都不持有第二份。
 pub trait ExtensionStatusSource: Send + Sync {
-    fn validate_settings(&self, _plugin_id: String, _value: serde_json::Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+    fn validate_settings(
+        &self,
+        _plugin_id: String,
+        _value: serde_json::Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
         Box::pin(async { Err("扩展宿主未提供设置校验端口".into()) })
     }
     fn status(

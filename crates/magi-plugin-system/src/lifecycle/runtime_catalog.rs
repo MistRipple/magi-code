@@ -4,6 +4,9 @@ use magi_app_server_protocol::generated::{
     PluginRuntimeCatalog, PluginRuntimeContributionKind as Kind,
 };
 
+// 动态发现目录可能包含数百个工具；独立于安装清单预算，并为 4 MiB RPC 帧留出余量。
+const MAX_RUNTIME_CATALOG_BYTES: usize = 2 * 1024 * 1024;
+
 pub(super) struct RuntimeCatalog {
     lease: String,
     digest: String,
@@ -99,8 +102,18 @@ impl PluginManager {
         if runtime.revision != expected {
             return Err(conflict("运行目录版本冲突"));
         }
-        if serde_json::to_vec(&catalog).map_or(true, |bytes| bytes.len() > 512 * 1024) {
-            return Err(invalid("运行目录超过 512 KiB"));
+        if serde_json::to_vec(&catalog)
+            .map_or(true, |bytes| bytes.len() > MAX_RUNTIME_CATALOG_BYTES)
+        {
+            return Err(invalid("运行目录超过 2 MiB"));
+        }
+        if catalog.tools.len() > 1024
+            || catalog.commands.len() > 128
+            || catalog.model_sources.len() > 8
+        {
+            return Err(invalid(
+                "运行目录数量超过工具 1024 / 命令 128 / 模型来源 8 的上限",
+            ));
         }
         let package = self.package(id)?;
         let allowed = &package
@@ -120,7 +133,7 @@ impl PluginManager {
             }
         }
         let manifest = merge(package.manifest(), &catalog);
-        crate::validate_manifest(&manifest)?;
+        crate::package::validate_runtime_manifest(&manifest)?;
         let revision = expected
             .checked_add(1)
             .ok_or_else(|| conflict("运行目录版本耗尽"))?;

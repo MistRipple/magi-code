@@ -1,8 +1,9 @@
 //! 未安装上游包的图标：只读取已核对完整性的原包，不安装依赖或执行插件。
 use super::*;
-use std::{collections::VecDeque, io::Cursor, path::Component, sync::LazyLock};
+use std::{collections::VecDeque, path::Component, sync::LazyLock};
 
-type IconCache = VecDeque<(String, Option<Vec<u8>>)>;
+type Icon = (&'static str, Vec<u8>);
+type IconCache = VecDeque<(String, Option<Icon>)>;
 static CACHE: LazyLock<tokio::sync::Mutex<IconCache>> =
     LazyLock::new(|| tokio::sync::Mutex::new(VecDeque::new()));
 static DOWNLOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
@@ -40,7 +41,7 @@ pub(in crate::routes::plugins) async fn icon(
     Ok(response(bytes))
 }
 
-async fn cached(key: &str) -> Option<Option<Vec<u8>>> {
+async fn cached(key: &str) -> Option<Option<Icon>> {
     CACHE
         .lock()
         .await
@@ -49,16 +50,17 @@ async fn cached(key: &str) -> Option<Option<Vec<u8>>> {
         .map(|(_, bytes)| bytes.clone())
 }
 
-fn response(bytes: Option<Vec<u8>>) -> Response {
+fn response(bytes: Option<Icon>) -> Response {
     let empty = bytes.is_none();
-    let mut response = super::super::icon_response("image/png", bytes.unwrap_or_default());
+    let (mime, bytes) = bytes.unwrap_or(("image/png", Vec::new()));
+    let mut response = super::super::icon_response(mime, bytes);
     if empty {
         *response.status_mut() = StatusCode::NO_CONTENT;
     }
     response
 }
 
-async fn load(registry: &str, package: &str, version: &str) -> Result<Option<Vec<u8>>, ApiError> {
+async fn load(registry: &str, package: &str, version: &str) -> Result<Option<Icon>, ApiError> {
     let url = format!("{registry}/{}/{version}", package_path(package));
     let bytes = download_bytes(&url, MAX_REGISTRY_DOCUMENT_BYTES, "上游插件图标元数据").await?;
     let raw: Value = serde_json::from_slice(&bytes)
@@ -112,7 +114,7 @@ async fn load(registry: &str, package: &str, version: &str) -> Result<Option<Vec
         }
         let bytes =
             std::fs::read(icon).map_err(|error| ApiError::InvalidInput(error.to_string()))?;
-        normalize(&bytes).map(Some)
+        normalize(&path, bytes).map(Some)
     })
     .await
     .map_err(|error| ApiError::internal_assembly("读取图标失败", error))?
@@ -130,49 +132,29 @@ fn validate_path(path: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn normalize(bytes: &[u8]) -> Result<Vec<u8>, ApiError> {
-    let format =
-        image::guess_format(bytes).map_err(|_| ApiError::InvalidInput("图标不是位图".into()))?;
-    if !matches!(
-        format,
-        image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP
-    ) {
-        return Err(ApiError::InvalidInput("只支持 PNG、JPEG、WebP 图标".into()));
-    }
-    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(2048);
-    limits.max_image_height = Some(2048);
-    limits.max_alloc = Some(16 * 1024 * 1024);
-    reader.limits(limits);
-    let image = reader
-        .decode()
-        .map_err(|_| ApiError::InvalidInput("图标位图无效或尺寸超限".into()))?;
-    let mut output = Cursor::new(Vec::new());
-    image
-        .thumbnail(128, 128)
-        .write_to(&mut output, image::ImageFormat::Png)
-        .map_err(|error| ApiError::internal_assembly("生成图标失败", error))?;
-    Ok(output.into_inner())
+fn normalize(path: &str, bytes: Vec<u8>) -> Result<Icon, ApiError> {
+    magi_plugin_system::validate_icon(path, &bytes)
+        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+    let mime = magi_plugin_system::icon_content_type(path)
+        .ok_or_else(|| ApiError::InvalidInput("图标类型无效".into()))?;
+    Ok((mime, bytes))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn only_bounded_bitmap_paths_and_decodable_images_are_accepted() {
+    fn online_icons_keep_the_original_format_and_share_package_validation() {
         for path in ["../x.png", "/x.png", "ui/../../x.png", "C:\\x.png", ""] {
             assert!(validate_path(path).is_err());
         }
         assert!(validate_path("./icons/logo.png").is_ok());
-        assert!(normalize(b"<svg onload='alert(1)'></svg>").is_err());
-        assert!(normalize(b"\x89PNG\r\n\x1a\ntruncated").is_err());
-        let mut source = Cursor::new(Vec::new());
-        image::DynamicImage::new_rgb8(256, 128)
-            .write_to(&mut source, image::ImageFormat::Png)
-            .unwrap();
-        let output = normalize(source.get_ref()).unwrap();
-        let image = image::load_from_memory(&output).unwrap();
-        assert_eq!((image.width(), image.height()), (128, 64));
+        assert!(normalize("icon.svg", b"<svg onload='alert(1)'></svg>".to_vec()).is_err());
+        assert!(normalize("icon.png", b"not png".to_vec()).is_err());
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><path d="M0 0L32 32"/></svg>"##.to_vec();
+        assert_eq!(
+            normalize("icon.svg", svg.clone()).unwrap(),
+            ("image/svg+xml", svg)
+        );
     }
 }

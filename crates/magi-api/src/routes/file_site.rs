@@ -229,14 +229,6 @@ fn site_mime_for_path(path: &Path) -> Option<&'static str> {
         "json" => Some("application/json; charset=utf-8"),
         "webmanifest" => Some("application/manifest+json; charset=utf-8"),
         "txt" => Some("text/plain; charset=utf-8"),
-        "svg" => Some("image/svg+xml"),
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "avif" => Some("image/avif"),
-        "bmp" => Some("image/bmp"),
-        "ico" => Some("image/x-icon"),
         "woff" => Some("font/woff"),
         "woff2" => Some("font/woff2"),
         "ttf" => Some("font/ttf"),
@@ -247,7 +239,7 @@ fn site_mime_for_path(path: &Path) -> Option<&'static str> {
         "ogg" => Some("audio/ogg"),
         "mp4" => Some("video/mp4"),
         "webm" => Some("video/webm"),
-        _ => None,
+        _ => magi_media::image_content_type(path),
     }
 }
 

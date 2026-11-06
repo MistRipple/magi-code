@@ -9,6 +9,7 @@ import { RuntimeCatalog } from './catalog.mjs';
 import { runRoute } from './routes.mjs';
 import { startOpenAiBridge } from './openai-bridge.mjs';
 import { requestAttachments, saveRequestImage, withRequestImages } from './attachments.mjs';
+import { mountRemote } from './remote.mjs';
 
 const clone = (value) => structuredClone(value ?? {});
 const freeze = (value) => {
@@ -305,6 +306,7 @@ export async function activateDsh(api, module, options) {
   };
   api.onDispose(dispose);
   try {
+    await mountRemote(api, ctx);
     const settings = await api.settings.read();
     rawConfig = clone(settings.value); version = settings.version;
     fiber = ctx.plugin(upstream, clone(rawConfig));

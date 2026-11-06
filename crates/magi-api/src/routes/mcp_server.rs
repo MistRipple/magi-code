@@ -1181,8 +1181,7 @@ async fn list_sessions(
                 title: conversation
                     .filter(|record| {
                         !session.title.trim().is_empty()
-                            && !(record.title.is_empty()
-                                && session.title == record.conversation_id)
+                            && !(record.title.is_empty() && session.title == record.conversation_id)
                     })
                     .map(|_| session.title.clone()),
                 token_id,
