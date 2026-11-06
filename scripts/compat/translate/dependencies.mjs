@@ -20,7 +20,10 @@ export async function installDependencies(root, sharedRoot, registry = process.e
         const manifest = join(sharedRoot, 'node_modules', ...name.split('/'), 'package.json');
         if (!existsSync(manifest)) throw new Error(`缺少宿主依赖 ${name}`);
         const installed = JSON.parse(readFileSync(manifest, 'utf8'));
-        if (!semver.satisfies(installed.version, range)) throw new Error(`宿主依赖 ${name}@${installed.version} 不满足 ${range}`);
+        // DSH app-boot 0.2.2-rc.1 的 plugin-compatibility 明确让预发布版本参与 DSH peer 范围。
+        // 这不是 npm 普通依赖的默认规则；仅 DSH peer 使用上游策略，直接依赖与其他生态仍严格校验。
+        const dshPeer = name.startsWith('@deepseek-ai/dsh-') && !Object.hasOwn(pkg.dependencies ?? {}, name);
+        if (!semver.satisfies(installed.version, range, { includePrerelease: dshPeer })) throw new Error(`宿主依赖 ${name}@${installed.version} 不满足 ${range}`);
         records.push({ name, version: installed.version, host: true });
         continue;
       }

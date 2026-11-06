@@ -190,9 +190,12 @@ try {
   await ui.click('[data-action="activate"]');
   await waitFor(async () => (await installed()).runtime?.state === 'running', '重新激活');
   reporter.check('重新激活恢复持久配置并建立新运行目录', (await api(`/api/plugins/${pluginId}/settings`)).value.value.label === 'changed');
-  const upstream = await api('/api/plugins/upstream/preview', { ecosystem: 'dsh', package: 'dsh-connect-workbuddy', version: '5.18.1' });
-  reporter.check('真实 npm WorkBuddy 原包的未支持必需契约被明确拒绝', upstream.status >= 400 && /sessionProjections|session\/event/.test(JSON.stringify(upstream.value)), JSON.stringify(upstream.value));
-  await writeFile(join(output, 'workbuddy-result.json'), JSON.stringify(upstream, null, 2));
+  const unsupported = join(work, 'unsupported');
+  await mkdir(unsupported);
+  await writeFile(join(unsupported, 'package.json'), JSON.stringify({ name: 'unsupported-dsh', version: '1.0.0', type: 'module', main: 'index.js', dsh: { bundle: {} } }));
+  await writeFile(join(unsupported, 'index.js'), 'export function apply(ctx) { ctx.on("session/event", () => {}); }');
+  await assert.rejects(run(node, [join(compat, 'cli.mjs'), 'prepare', 'dsh', unsupported, '--out', join(work, 'unsupported-out'), '--integrity', 'local-acceptance'], { timeout: 30_000 }), /session\/event/);
+  reporter.check('未捕获的必需宿主事件仍被明确拒绝', true);
   const rendererLogErrors = app.log.join('').split('\n').filter((line) => /Uncaught|可信 Renderer 控制台错误/.test(line));
   reporter.check('主 Renderer 与插件 iframe 没有运行时异常', errors.length === 0 && rendererLogErrors.length === 0,
     [...errors, ...rendererLogErrors].join('\n'));

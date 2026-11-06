@@ -22,7 +22,9 @@ export function buildReport({ translator, upstream, root, scanOptions, classify,
     for (const [name, usage] of Object.entries(scan[kind] ?? {})) {
       const rule = classify(kind, name);
       entries.push({
-        kind, name, category: rule.category, status: rule.status, target: rule.target, note: rule.note,
+        kind, name, category: rule.category, status: rule.status, target: rule.target,
+        optional: usage.optional === true,
+        note: usage.optional ? `${rule.note}；上游可选路径：依赖缺席时不执行注入回调，或同步注册失败由上游捕获` : rule.note,
         source: rule.source, needs: rule.needs, capability: rule.capability, count: usage.count, files: usage.files,
       });
     }

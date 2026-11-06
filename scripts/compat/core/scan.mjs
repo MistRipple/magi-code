@@ -5,6 +5,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, extname, join, relative, resolve } from 'node:path';
 import ts from 'typescript';
+import { conditionalService, guardedRegistration } from './optional.mjs';
 
 const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs', '.jsx']);
 const SKIP_DIRECTORIES = new Set(['node_modules', '.git', 'lib', 'dist', 'tests', 'test', '__tests__']);
@@ -72,9 +73,10 @@ export function reachableFiles(entries) {
   return [...seen].sort();
 }
 
-function bump(map, key, file) {
-  const entry = map.get(key) ?? { count: 0, files: new Set() };
+function bump(map, key, file, optional = false) {
+  const entry = map.get(key) ?? { count: 0, optionalCount: 0, files: new Set() };
   entry.count += 1;
+  if (optional) entry.optionalCount += 1;
   entry.files.add(file);
   map.set(key, entry);
 }
@@ -325,6 +327,7 @@ export function scanSources(root, options = {}) {
       for (let n = at.parent; n; n = n.parent) { const label = scopes.get(n)?.get(name); if (label) return label; }
       return undefined;
     };
+    const isDshContext = (node, at) => flow === DSH_FLOW && ts.isIdentifier(node) && labelOf(node.text, at) === 'ctx';
     const visit = (node) => {
       if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
         const typeOnly = Boolean(node.importClause?.isTypeOnly) || !node.importClause;
@@ -341,20 +344,24 @@ export function scanSources(root, options = {}) {
       } else if (ts.isPropertyAccessExpression(node) && !ts.isPropertyAccessExpression(node.parent)) {
         const chain = chainOf(node);
         const label = chain && chain.length > 1 ? labelOf(chain[0], node) : undefined;
-        if (label) bump(calls, [flow.keyOf(label), ...chain.slice(1, depth)].join('.'), rel);
+        if (label) bump(calls, [flow.keyOf(label), ...chain.slice(1, depth)].join('.'), rel,
+          flow === DSH_FLOW && conditionalService(node, chain[1], isDshContext));
       }
       // 事件监听：`ctx.on('tools/pre-execute', …)` / `pi.on('tool_call', …)`。事件名不是字面量记为 <dynamic>。
       if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && ['on', 'once'].includes(node.expression.name.text)) {
         const owner = chainOf(node.expression.expression);
         if (owner && owner.length === 1 && labelOf(owner[0], node) === flow.eventLabel) {
           const first = node.arguments[0];
-          bump(events, first && ts.isStringLiteralLike(first) ? first.text : '<dynamic>', rel);
+          bump(events, first && ts.isStringLiteralLike(first) ? first.text : '<dynamic>', rel,
+            flow === DSH_FLOW && guardedRegistration(node, source));
         }
       }
       // `ctx.inject(['a', 'b'], …)` 与 `export const inject = [...]`
       if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'inject') {
         const first = node.arguments[0];
-        if (first && ts.isArrayLiteralExpression(first)) for (const element of first.elements) if (ts.isStringLiteralLike(element)) bump(injects, element.text, rel);
+        if (first && ts.isArrayLiteralExpression(first)) for (const element of first.elements) if (ts.isStringLiteralLike(element)) {
+          bump(injects, element.text, rel, isDshContext(node.expression.expression, node));
+        }
       }
       if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === 'inject' && node.initializer && ts.isArrayLiteralExpression(node.initializer)) {
         for (const element of node.initializer.elements) if (ts.isStringLiteralLike(element)) bump(injects, element.text, rel);
@@ -363,6 +370,6 @@ export function scanSources(root, options = {}) {
     };
     visit(source);
   }
-  const plain = (map) => Object.fromEntries([...map].sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => [key, { count: value.count, files: [...value.files].sort() }]));
+  const plain = (map) => Object.fromEntries([...map].sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => [key, { count: value.count, optional: value.optionalCount === value.count, files: [...value.files].sort() }]));
   return { fileCount: files.length, lineCount: lines, files: files.map((file) => relative(root, file)), imports: plain(imports), symbols: plain(symbols), calls: plain(calls), injects: plain(injects), events: plain(events), unresolvedContextFlows: unresolved };
 }

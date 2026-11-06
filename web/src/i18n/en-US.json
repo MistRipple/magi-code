@@ -908,6 +908,7 @@
   "settings.plugins.upstream.omitted": "{count} files not included (docs, screenshots, type declarations)",
   "settings.plugins.upstream.integrity": "Integrity",
   "settings.plugins.upstream.none": "None",
+  "settings.plugins.upstream.runtimePending": "Registered dynamically after activation; not loaded yet",
   "plugins.error.upstream": "Failed to search upstream plugins",
   "plugins.error.upstreamPreview": "Failed to translate the upstream plugin",
   "plugins.error.upstreamInstall": "Failed to install the upstream plugin",

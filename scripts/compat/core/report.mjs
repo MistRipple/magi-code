@@ -18,6 +18,7 @@ export const STATUSES = ['mapped', 'shim', 'bundled', 'planned', 'partial', 'dro
  * @property {string} target 对应的 Magi 能力或处理方式
  * @property {string} note
  * @property {number} count
+ * @property {boolean} [optional] 已证明是条件注入或有同步失败处理的注册；不改变能力状态
  * @property {string[]} files
  *
  * @typedef {object} CompatReport
@@ -35,12 +36,12 @@ export function summarize(entries) {
   return summary;
 }
 
-/** 必需能力：命中这些类别的条目只要不是 mapped/shim/bundled，就视为阻塞翻译。 */
+/** 必需能力：条件分支缺席沿上游语义降级；未知能力即使位于可选分支也仍阻塞。 */
 export function verdictFor(entries, required) {
   // partial 不算满足：只能覆盖一部分语义的能力，不能被当作“可完整翻译”。
   const satisfied = new Set(['mapped', 'shim', 'bundled']);
   const blocked = entries.filter((entry) => entry.status === 'unknown'
-    || (required.includes(entry.category) && !satisfied.has(entry.status)));
+    || (required.includes(entry.category) && !entry.optional && !satisfied.has(entry.status)));
   return { required, blocked };
 }
 

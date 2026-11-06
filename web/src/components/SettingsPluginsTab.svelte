@@ -350,13 +350,25 @@
               {#each [['tools', translated.translation.tools], ['commands', translated.translation.commands], ['modelSources', translated.translation.modelSources], ['unmounted', translated.translation.unmountedSlots]] as [key, values] (key)}
                 <div class="settings-row-desc">
                   <span class="settings-row-title">{i18n.t(`settings.plugins.upstream.${key}`)}</span>
-                  {(values as string[]).length ? (values as string[]).join('、') : i18n.t('settings.plugins.upstream.none')}
+                  {(values as string[]).length ? (values as string[]).join('、')
+                    : preview.manifest.extension?.runtimeContributions?.some((kind) => kind === key)
+                      ? i18n.t('settings.plugins.upstream.runtimePending')
+                      : i18n.t('settings.plugins.upstream.none')}
                 </div>
               {/each}
               {#if translated.translation.degraded.length > 0}
                 <div class="settings-row-desc">
                   <span class="settings-row-title">{i18n.t('settings.plugins.upstream.degraded')}</span>
-                  {translated.translation.degraded.map((entry) => `${entry.name}（${entry.status}）`).join('、')}
+                  <div class="settings-rows">
+                    {#each translated.translation.degraded as entry (`${entry.name}:${entry.status}`)}
+                      <div class="settings-row">
+                        <div class="settings-row-copy">
+                          <span class="settings-row-title">{entry.name}（{entry.status}）</span>
+                          <span class="settings-row-desc">{entry.note}</span>
+                        </div>
+                      </div>
+                    {/each}
+                  </div>
                 </div>
               {/if}
               {#if translated.translation.omittedFiles > 0}

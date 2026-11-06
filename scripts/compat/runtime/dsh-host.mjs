@@ -21,6 +21,15 @@ export async function activateDsh(api, module, options) {
   if (options?.runtimeVersion !== 2) throw new Error('DSH 兼容包版本不受支持，请从上游来源重新安装');
   const upstream = module.default ?? module;
   const ctx = new Context();
+  // Cordis inject 是“服务出现时挂载”的条件 fiber；不能把可选分支的 PENDING 当成整包失败。
+  const conditionalFibers = new Set();
+  const inject = ctx.inject;
+  ctx.inject = function (...args) {
+    const child = inject.apply(this, args);
+    // Cordis 返回带调用方上下文的代理；用上游唯一 uid 与 registry 中的真实 fiber 对齐。
+    conditionalFibers.add(child.uid);
+    return child;
+  };
   const catalog = new RuntimeCatalog(api);
   const tools = new Map();
   const guards = new Set();
@@ -303,7 +312,10 @@ export async function activateDsh(api, module, options) {
     // Cordis 可把缺依赖的插件留在 PENDING；Magi 不能把它报告为 running。
     for (const runtime of ctx.registry.values()) for (const child of runtime.fibers) {
       await child.await();
-      if (child.state === 0) throw new Error(`DSH 插件 ${runtime.name ?? '(匿名)'} 缺少必需服务：${Object.keys(child.inject).join(', ')}`);
+      if (child.state === 0) {
+        if (!conditionalFibers.has(child.uid)) throw new Error(`DSH 插件 ${runtime.name ?? '(匿名)'} 缺少必需服务：${Object.keys(child.inject).join(', ')}`);
+        diagnostic(`DSH 可选注入未挂载，宿主缺少服务：${Object.keys(child.inject).join(', ')}`);
+      }
     }
     await catalog.drain();
     await refreshModels();

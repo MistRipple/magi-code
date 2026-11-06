@@ -10,6 +10,76 @@ const fixture = fileURLToPath(new URL('./fixtures/mini-dsh', import.meta.url));
 const cli = fileURLToPath(new URL('./cli.mjs', import.meta.url));
 const find = (report, name) => report.entries.find((entry) => entry.name === name);
 
+async function inspectOptional(t, code) {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'magi-optional-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'optional-dsh', version: '1.0.0', main: 'index.js' }));
+  writeFileSync(join(dir, 'index.js'), code);
+  return createRegistry().create('dsh').inspect(dir, { required: ['session', 'hooks', 'tools'] });
+}
+
+test('DSH 可选服务保留缺失报告；必需依赖、未知服务和分支里的其他未支持服务仍阻塞', async (t) => {
+  const optional = "export function apply(ctx) { ctx.inject(['sessionProjections'], c => c.sessionProjections.stateOf()); }";
+  const report = await inspectOptional(t, optional);
+  assert.equal(report.verdict.blocked.length, 0);
+  assert.equal(find(report, 'sessionProjections').status, 'dropped');
+  assert.equal(find(report, 'sessionProjections').optional, true);
+  for (const code of [
+    "export const inject = ['sessionProjections'];\n" + optional,
+    "export function apply(ctx) { ctx.inject(['unknownService'], c => c.unknownService.read()); }",
+    "export function apply(ctx) { ctx.inject(['tools'], c => c.compaction.run()); }",
+  ]) assert.ok((await inspectOptional(t, code)).verdict.blocked.length > 0);
+});
+
+test('DSH 同步事件注册失败有明确 catch 时允许上游降级；无保护、异步与重抛仍阻塞', async (t) => {
+  const report = await inspectOptional(t, "export function apply(ctx) { try { ctx.on('session/event', () => {}); } catch (error) { ctx.logger.warn(error); } }");
+  assert.equal(report.verdict.blocked.length, 0);
+  assert.equal(find(report, 'session/event').status, 'partial');
+  for (const code of [
+    "export function apply(ctx) { ctx.on('session/event', () => {}); }",
+    "export function apply(ctx) { try { ctx.on('session/event', () => {}); } catch (error) { throw error; } }",
+    "export function apply(ctx) { try { (() => ctx.on('session/event', () => {}))(); } catch {} }",
+    "export function apply(ctx) { try { ctx.on('session/event', () => {}); } catch {} ctx.on('session/event', () => {}); }",
+  ]) assert.ok((await inspectOptional(t, code)).verdict.blocked.length > 0);
+});
+
+test('DSH 交给普通函数的注册回调必须在所有可追踪调用点捕获，不把逃逸回调当可选', async (t) => {
+  const mount = "export function apply(ctx) { mount({ subscribe: () => ctx.on('session/event', () => {}) }); }";
+  const good = mount + "function mount(api) { read(api); try { api.subscribe(); } catch { return; } } function read(api) { return api.label; }";
+  assert.equal((await inspectOptional(t, good)).verdict.blocked.length, 0);
+  for (const helper of [
+    'function mount(api) { api.subscribe(); }',
+    'function mount(api) { try { api.subscribe(); } catch {} return api.subscribe; }',
+    'function mount(api) { unknown(api); try { api.subscribe(); } catch {} }',
+    'function mount(api) { nested(api); } function nested(api) { api.subscribe(); }',
+  ]) assert.ok((await inspectOptional(t, mount + helper)).verdict.blocked.length > 0);
+  assert.ok((await inspectOptional(t, good.replace('subscribe: ()', 'subscribe: async ()'))).verdict.blocked.length > 0);
+});
+
+test('DSH peer 沿上游准入策略计入预发布版本；越界版本、直接依赖和普通 peer 不放宽', async (t) => {
+  const { installDependencies } = await import('./translate/dependencies.mjs');
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const root = mkdtempSync(join(tmpdir(), 'magi-peer-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const shared = join(root, 'shared');
+  const check = async (name, version, range, field = 'peerDependencies') => {
+    const target = join(shared, 'node_modules', name); mkdirSync(target, { recursive: true });
+    writeFileSync(join(target, 'package.json'), JSON.stringify({ name, version }));
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'peer-fixture', version: '1.0.0', [field]: { [name]: range } }));
+    return installDependencies(root, shared);
+  };
+  const range = '>=0.1.7-rc.1 <0.3.0-0';
+  assert.equal((await check('@deepseek-ai/dsh-llm', '0.2.2-rc.1', range))[0].version, '0.2.2-rc.1');
+  await assert.rejects(check('@deepseek-ai/dsh-llm', '0.3.0-rc.1', range), /不满足/);
+  await assert.rejects(check('@deepseek-ai/dsh-llm', '0.2.2-rc.1', range, 'dependencies'), /不满足/);
+  await assert.rejects(check('@deepseek-ai/cordis', '4.2.0-rc.1', '^4.0.0'), /不满足/);
+});
+
 test('工厂按名称创建，重复注册、未知名称与非法名称都明确失败', () => {
   const registry = createRegistry();
   assert.deepEqual(registry.kinds(), ['dsh', 'pi']);

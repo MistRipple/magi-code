@@ -14,7 +14,7 @@ function host(value = {}) {
   let revision = 0;
   let snapshot = { version: 0, value };
   let listener, validate;
-  const state = { catalog: {}, tools: new Map(), commands: new Map(), models: new Map(), failures: [] };
+  const state = { catalog: {}, tools: new Map(), commands: new Map(), models: new Map(), failures: [], logs: [] };
   const bind = (kind) => async (id, handler) => {
     assert.ok(state.catalog[kind].some((item) => item.id === id));
     state[kind].set(id, handler);
@@ -41,7 +41,7 @@ function host(value = {}) {
       onValidate(handler) { validate = handler; },
     },
     onConfig(handler) { listener = handler; return () => { listener = undefined; }; },
-    onDispose() {}, log() {}, fail(error) { state.failures.push(error); },
+    onDispose() {}, log(message) { state.logs.push(message); }, fail(error) { state.failures.push(error); },
   };
   return {
     api, state,
@@ -68,12 +68,31 @@ test('DSH 初始化失败、必需依赖缺失和未支持事件均不能就绪�
   for (const plugin of [
     { inject: ['tools'], apply(ctx) { ctx.tools.register(tool('early')); throw new Error('startup failed'); } },
     { inject: ['absent'], apply() { assert.fail('缺依赖不能执行'); } },
+    { apply(ctx) { ctx.plugin({ inject: ['absent'], apply() { assert.fail('子插件必需依赖不能绕过'); } }); } },
     { apply(ctx) { ctx.on('session/event', () => {}); } },
   ]) {
     const h = host();
     await assert.rejects(activateDsh(h.api, plugin, options), /startup failed|缺少必需服务|尚未实现/);
     assert.equal(h.state.tools.size, 0);
   }
+});
+
+test('DSH 条件注入缺服务保留 pending，注册失败交由上游捕获；可用能力正常执行', async (t) => {
+  const h = host();
+  let missingRan = false, caught = false;
+  const running = await activateDsh(h.api, { apply(ctx) {
+    ctx.inject(['sessionProjections'], () => { missingRan = true; });
+    ctx.inject(['tools'], (c) => c.tools.register(tool('available')));
+    try { ctx.on('session/event', () => assert.fail('不得伪造宿主事件')); }
+    catch { caught = true; }
+  } }, options);
+  t.after(() => running.dispose());
+  assert.equal(missingRan, false);
+  assert.equal(caught, true);
+  assert.ok(h.state.logs.some((line) => line.includes('可选注入') && line.includes('sessionProjections')));
+  const result = await h.state.tools.get(runtimeId('tool', 'available'))({}, execution());
+  assert.equal(result.content[0].text, 'ok');
+  assert.deepEqual(h.state.failures, []);
 });
 
 test('DSH 就绪后的注册、撤销、同名重绑沿 effect 生效，卸载清空目录', async (t) => {

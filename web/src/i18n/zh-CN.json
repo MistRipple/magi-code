@@ -908,6 +908,7 @@
   "settings.plugins.upstream.omitted": "未随包的文件 {count} 个（文档、截图、类型声明）",
   "settings.plugins.upstream.integrity": "完整性",
   "settings.plugins.upstream.none": "无",
+  "settings.plugins.upstream.runtimePending": "激活后动态注册，当前尚未加载",
   "plugins.error.upstream": "搜索上游插件失败",
   "plugins.error.upstreamPreview": "翻译上游插件失败",
   "plugins.error.upstreamInstall": "安装上游插件失败",
