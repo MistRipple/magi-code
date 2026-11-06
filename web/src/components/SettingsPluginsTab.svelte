@@ -132,7 +132,7 @@
   async function revealFeedback(): Promise<void> {
     await tick();
     if (!detailPane) return;
-    detailPane.scrollTop = 0;
+    for (const content of detailPane.querySelectorAll('.pane-scroll, .candidate-scroll')) content.scrollTop = 0;
     detailPane.scrollIntoView({ block: 'nearest' });
   }
 
@@ -307,7 +307,7 @@
     cancelPreview();
     message = '';
     selectedId = item.id;
-    if (detailPane) detailPane.scrollTop = 0;
+    void revealFeedback();
   }
 
   function changeQuery(): void { cancelPreview(); message = ''; selectedId = null; }
@@ -464,8 +464,9 @@
   {#if staged}
     {@const preview = staged.kind === 'upstream' ? staged.preview.candidate : staged.preview}
     {@const translated = staged.kind === 'upstream' ? staged.preview : null}
-    <div class="settings-section" data-testid="plugin-candidate" data-operation={preview.operation} data-origin={staged.kind}>
-      <div class="settings-card settings-card--accent">
+    <div class="settings-section plugin-candidate" data-testid="plugin-candidate" data-operation={preview.operation} data-origin={staged.kind}>
+      <div class="settings-card plugin-candidate-card">
+        <div class="candidate-scroll" data-testid="plugin-candidate-scroll">
         <div class="settings-card-head">
           <div class="settings-icon-tile" aria-hidden="true"><Icon name="download" size={15} /></div>
           <div class="settings-card-title">
@@ -552,7 +553,8 @@
             <span class="settings-mono" title={preview.digest}>{i18n.t('settings.plugins.digest', { digest: preview.digest.slice(0, 12) })}</span>
           </div>
         </div>
-        <div class="settings-card-foot">
+        </div>
+        <div class="settings-card-foot" data-testid="plugin-candidate-actions">
           <button class="btn btn--sm btn--secondary" data-action="cancel-candidate" onclick={() => { staged = null; }} disabled={busy}>{i18n.t('settings.plugins.candidate.cancel')}</button>
           <button class="btn btn--sm btn--primary" data-action="confirm-candidate" onclick={() => void confirmStaged()} disabled={busy}>
             {#if busy}<Icon name="loader" class="spinning" size={14} /> {busyLabel}
@@ -574,7 +576,6 @@
               onCancelPreview={cancelPreview}
               onInstall={() => void installItem(selected)}
               onUpdateFromCenter={() => void updateFromCenter(selected)}
-              onUpgradeFile={(event) => void stageFile(event)}
               onUninstall={() => void uninstallItem(selected)}
               onActivate={() => void run(() => authorizeAndActivatePlugin(selected.id, selected.installed!.manifest))}
               onDeactivate={() => void run(() => deactivatePlugin(selected.id))}
@@ -690,18 +691,22 @@
   .store-item-version { font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
   .store-pager { display: grid; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-top: var(--magi-hairline) solid var(--border); }
   .store-pager-actions { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
-  .store-detail { min-width: 0; min-height: 0; overflow-y: auto; }
+  .store-detail { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
   @container settings-content (max-width: 720px) {
     .store { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto; flex: 1 0 auto; }
     .store-list { border-right: 0; border-bottom: var(--magi-hairline) solid var(--border); max-height: 40dvh; min-height: 180px; }
+    .store-detail { height: 65dvh; min-height: 360px; }
   }
   .plugin-perm { display: grid; gap: var(--space-2); }
   .plugin-link { justify-self: start; align-self: flex-start; padding: 0; border: 0; background: transparent; color: var(--foreground-muted); font-size: var(--text-xs); cursor: pointer; }
   .plugin-link:hover { color: var(--primary); }
   .plugin-disabled { opacity: 0.45; pointer-events: none; }
-  .plugins-status { margin: var(--space-3); }
+  .plugins-status { margin: var(--space-3); flex: 0 1 auto; max-height: 35%; overflow-y: auto; }
   .plugin-message-text { white-space: pre-wrap; overflow-wrap: anywhere; }
-  .store-detail > .settings-section { padding: var(--space-3); margin: 0; }
+  .plugin-candidate { display: flex; flex: 1; min-height: 0; margin: 0; }
+  .plugin-candidate-card { display: flex; flex-direction: column; flex: 1; min-height: 0; border: 0; border-radius: 0; }
+  .candidate-scroll { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+  .plugin-candidate-card > .settings-card-foot { flex: 0 0 auto; }
   .sources-header { display: flex; align-items: center; justify-content: space-between; width: 100%; }
   .sources-header h3 { margin: 0; }
   .sources-body { display: grid; gap: var(--space-5); }

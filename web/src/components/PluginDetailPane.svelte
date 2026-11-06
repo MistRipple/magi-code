@@ -18,7 +18,6 @@
     onCancelPreview?: () => void;
     onInstall: () => void;
     onUpdateFromCenter: () => void;
-    onUpgradeFile: (event: Event) => void;
     onUninstall: () => void;
     onActivate: () => void;
     onDeactivate: () => void;
@@ -26,7 +25,7 @@
     onOpenSettings: (tab: string) => void;
   }
   let {
-    item, busy, busyLabel = '', previewing = false, onCancelPreview, onInstall, onUpdateFromCenter, onUpgradeFile,
+    item, busy, busyLabel = '', previewing = false, onCancelPreview, onInstall, onUpdateFromCenter,
     onUninstall, onActivate, onDeactivate, onDisable, onOpenSettings,
   }: Props = $props();
 
@@ -75,6 +74,7 @@
 </script>
 
 <article class="pane" data-testid="plugin-card" data-plugin-id={item.id}>
+  <div class="pane-scroll" data-testid="plugin-detail-scroll">
   <header class="pane-head">
     <div class="pane-title">
       <span class="pane-icon" aria-hidden="true"><PluginIcon pluginId={item.id} icon={item.installed?.manifest.icon} upstream={item.installed ? null : item.upstream} revision={item.installed?.digest ?? ''} size={28} /></span>
@@ -106,41 +106,9 @@
     {/if}
   {/if}
 
-  <div class="pane-actions">
-    {#if plugin}
-      {#if item.updatable && (item.catalog || item.upstream)}
-        <button class="btn btn--lg btn--primary" data-testid="plugin-detail-update" onclick={onUpdateFromCenter} disabled={busy}>
-          <Icon name="download" size={13} />
-          <span>{i18n.t('settings.plugins.center.update', { from: plugin.manifest.version })}</span>
-        </button>
-      {/if}
-      {#if settingsTab}
-        <button class="btn btn--sm {item.updatable ? 'btn--secondary' : 'btn--primary'}" data-testid="plugin-open-settings" onclick={() => onOpenSettings(settingsTab)}>
-          <Icon name="settings" size={13} />
-          <span>{i18n.t('settings.plugins.openSettings')}</span>
-        </button>
-      {/if}
-      <label class="btn btn--sm btn--secondary" class:pane-disabled={busy}>
-        {i18n.t('settings.plugins.upgradeFromFile')}
-        <input type="file" accept=".zip,application/zip" hidden onchange={onUpgradeFile} disabled={busy} />
-      </label>
-      <button
-        class="btn btn--sm btn--secondary"
-        onclick={onUninstall}
-        disabled={busy || !removable}
-        title={removable ? undefined : i18n.t('settings.plugins.uninstallBlocked')}
-      >{i18n.t('settings.plugins.uninstall')}</button>
-    {:else}
-      <button class="btn btn--lg btn--primary" data-testid="plugin-detail-install" onclick={onInstall} disabled={busy || (item.upstream !== null && !item.upstream.installable)} title={item.upstream?.blockedReason ?? undefined}>
-        <Icon name={busy ? 'loader' : 'download'} class={busy ? 'spinning' : ''} size={13} />
-        <span>{busy ? busyLabel || i18n.t('common.loading') : i18n.t('settings.plugins.installAddress')}</span>
-      </button>
-    {/if}
-  </div>
 
   {#if busy}
     <div class="settings-hint" data-testid="plugin-operation-progress" role="status"><Icon name="loader" size={13} class="spinning" /> {busyLabel || i18n.t('common.loading')}
-      {#if previewing}<button class="btn btn--sm btn--secondary" data-testid="plugin-cancel-preview" onclick={onCancelPreview}>{i18n.t('common.cancel')}</button>{/if}
     </div>
   {/if}
 
@@ -155,7 +123,7 @@
         </dd>
       </div>
     {/if}
-    <div><dt>{i18n.t('settings.plugins.detail.version')}</dt><dd>v{item.version}{#if item.updatable} → v{item.catalog?.version}{/if}</dd></div>
+    <div><dt>{i18n.t('settings.plugins.detail.version')}</dt><dd>v{item.version}{#if item.updatable} → v{item.catalog?.version ?? item.upstream?.version}{/if}</dd></div>
       <div data-testid="plugin-source" class:pane-warn={plugin?.source.kind === 'address' || plugin?.source.kind === 'local'}>
         <dt>{i18n.t('settings.plugins.detail.source')}</dt>
         <dd>{#if plugin}{sourceLabel(plugin)} <span class="settings-mono" title={plugin.source.location}>{plugin.source.location}</span>{:else}{i18n.t(item.catalog ? 'settings.plugins.source.center' : item.upstream ? 'settings.plugins.source.upstream' : 'common.notProvided')}{/if}</dd>
@@ -215,17 +183,48 @@
       </div>
     </section>
   {/if}
+  </div>
+  <div class="settings-card-foot pane-actions" data-testid="plugin-detail-actions">
+    {#if previewing}<button class="btn btn--sm btn--secondary" data-testid="plugin-cancel-preview" onclick={onCancelPreview}>{i18n.t('common.cancel')}</button>{/if}
+    {#if plugin}
+      {#if item.updatable && (item.catalog || item.upstream)}
+        <button class="btn btn--lg btn--primary" data-testid="plugin-detail-update" onclick={onUpdateFromCenter} disabled={busy}>
+          <Icon name="download" size={13} />
+          <span>{i18n.t('settings.plugins.center.update', { from: plugin.manifest.version })}</span>
+        </button>
+      {/if}
+      {#if settingsTab}
+        <button class="btn btn--sm {item.updatable ? 'btn--secondary' : 'btn--primary'}" data-testid="plugin-open-settings" onclick={() => onOpenSettings(settingsTab)}>
+          <Icon name="settings" size={13} />
+          <span>{i18n.t('settings.plugins.openSettings')}</span>
+        </button>
+      {/if}
+      <button
+        class="btn btn--sm btn--secondary"
+        onclick={onUninstall}
+        disabled={busy || !removable}
+        title={removable ? undefined : i18n.t('settings.plugins.uninstallBlocked')}
+      >{i18n.t('settings.plugins.uninstall')}</button>
+    {:else}
+      <button class="btn btn--lg btn--primary" data-testid="plugin-detail-install" onclick={onInstall} disabled={busy || (item.upstream !== null && !item.upstream.installable)} title={item.upstream?.blockedReason ?? undefined}>
+        <Icon name={busy ? 'loader' : 'download'} class={busy ? 'spinning' : ''} size={13} />
+        <span>{busy ? busyLabel || i18n.t('common.loading') : i18n.t('settings.plugins.installAddress')}</span>
+      </button>
+    {/if}
+  </div>
+
 </article>
 
 <style>
-  .pane { display: grid; align-content: start; gap: var(--space-4); padding: var(--space-5); min-width: 0; user-select: text; }
+  .pane { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; user-select: text; }
+  .pane-scroll { display: grid; align-content: start; gap: var(--space-4); padding: var(--space-5); flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
   .pane-title { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
   .pane-title h3 { overflow-wrap: anywhere; min-width: 0; margin: 0; font-size: 20px; font-weight: calc(var(--font-semibold) + 50); color: var(--foreground); }
   .pane-icon { display: grid; place-items: center; width: 36px; height: 36px; flex: 0 0 auto; border-radius: 10px; color: var(--primary); background: var(--primary-muted); }
   .pane-upstream { margin-top: var(--space-2); }
   .pane-id { margin-top: 6px; color: var(--foreground-muted); overflow-wrap: anywhere; }
   .pane-desc { margin: 0; color: var(--foreground); font-size: var(--text-sm); line-height: 1.6; }
-  .pane-actions { display: flex; gap: var(--space-2); flex-wrap: wrap; }
+  .pane-actions { display: flex; flex: 0 0 auto; justify-content: flex-end; gap: var(--space-2); flex-wrap: wrap; padding: var(--space-3) var(--space-5); border-top: var(--magi-hairline) solid var(--border); }
   .pane-facts { margin: 0; display: grid; gap: 8px; }
   .pane-facts > div { display: grid; grid-template-columns: fit-content(30%) minmax(0, 1fr); gap: var(--space-3); align-items: baseline; }
   .pane-facts dt { overflow-wrap: anywhere; color: var(--foreground-muted); font-size: var(--text-xs); }
@@ -236,5 +235,4 @@
   .pane-section h4 { margin: 0 0 var(--space-2); font-size: var(--text-sm); font-weight: var(--font-bold); color: var(--foreground); }
   .pane-activation { border: var(--magi-hairline) solid var(--border); border-radius: 10px; padding: 0 12px; }
   .pane-activation-row { display: flex; align-items: center; gap: var(--space-3); min-height: 46px; padding: var(--space-2) 0; }
-  .pane-disabled { opacity: 0.45; pointer-events: none; }
 </style>

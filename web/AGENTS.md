@@ -31,6 +31,7 @@
 - 内容：卡片用 `.settings-card`，列表用 `.settings-rows` / `.settings-row`（`.settings-row-copy` 内放 `.settings-row-title` 与 `.settings-row-desc`），标签用 `.settings-chip`，状态点用 `.settings-dot`，提示用 `.settings-notice`，空状态用 `.settings-empty`（一行说明，不用大图标）。
 - 控件：按钮用全局 `.btn`（设置页一律 `.btn--sm`，主操作 `.btn--primary`，其余 `.btn--secondary`，破坏性 `.btn--error`），输入框用 `.form-input`，开关用 `Toggle`。
 - 主从布局（插件页）：整体是一块带边框面板，左侧按状态分组、可独立滚动的列表，右侧在同一页面展示所选项的详情与全部操作，默认选中第一项，不用弹窗；安装/更新这类首要动作用 `.btn--lg`，让「未安装」「有更新」一眼可辨。
+- 插件的安装、确认安装和在线更新操作固定在详情面板底部，说明、权限和预览内容在其上方滚动；进度与失败原因就地可见。上游和插件中心的升级沿原在线来源，不在详情混放“从文件升级”入口。搜索有加载和重试反馈，精确包名优先于状态分组与名称排序；有声明图标的上游包在安装前也展示真实位图。
 - 分类内的二级标签用 `.settings-subtabs` / `.settings-subtab`（下划线样式），不使用胶囊分段控件。
 - 内容面板不填充背景色、不加阴影、不用渐变，只用 1px `var(--border)` 边框与 10px 圆角；背景色只留给控件（输入框、分段控件、选中项）。
 
