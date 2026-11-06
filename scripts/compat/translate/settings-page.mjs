@@ -37,13 +37,14 @@ export function renderSettingsPage({ schema, title, hidden = [], runtimeSchema =
   .error { color: #c0392b; }
 </style>
 <div id="form"></div>
-<div><button id="save">保存</button><span id="status" role="status"></span></div>
+<div><button id="save" disabled>保存</button><span id="status" role="status"></span></div>
 <script>
   const CHANNEL = 'magi-plugin-v1';
   let { fields } = ${data};
   const runtimeSchema = ${JSON.stringify(runtimeSchema)};
   const form = document.getElementById('form');
   const status = document.getElementById('status');
+  const save = document.getElementById('save');
   let instanceId = null, version = 0, next = 0, current = {};
   const pending = new Map();
   const controls = new Map();
@@ -106,31 +107,41 @@ export function renderSettingsPage({ schema, title, hidden = [], runtimeSchema =
     }
     return next;
   }
+  function showError(error) {
+    status.className = 'error';
+    status.textContent = String(error.message || error);
+  }
   window.addEventListener('message', async (event) => {
     const m = event.data;
     if (!m || m.channel !== CHANNEL) return;
     if (m.type === 'init') {
       instanceId = m.instanceId;
-      if (runtimeSchema) {
-        const { schema } = await request('settings.describe', {});
-        fields = Object.entries(schema.properties ?? {}).map(([key, node]) => ({key, kind: node.enum ? 'enum' : node.type === 'object' || node.type === 'array' || node.anyOf ? 'json' : node.type, description: node.description ?? '', options: node.enum ?? [], required: (schema.required ?? []).includes(key), defaultValue: node.default}));
+      save.disabled = true;
+      try {
+        if (runtimeSchema) {
+          const { schema } = await request('settings.describe', {});
+          fields = Object.entries(schema.properties ?? {}).map(([key, node]) => ({key, kind: node.enum ? 'enum' : node.type === 'object' || node.type === 'array' || node.anyOf ? 'json' : node.type, description: node.description ?? '', options: node.enum ?? [], required: (schema.required ?? []).includes(key), defaultValue: node.default}));
+        }
+        build();
+        show(await request('settings.read', {}));
+        save.disabled = false;
+      } catch (error) {
+        showError(error);
       }
-      build();
-      show(await request('settings.read', {}));
     } else if (m.type === 'response') {
       const waiter = pending.get(m.requestId);
       pending.delete(m.requestId);
       if (waiter) m.ok ? waiter.resolve(m.result) : waiter.reject(new Error(m.error));
     }
   });
-  document.getElementById('save').onclick = async () => {
+  save.onclick = async () => {
+    if (save.disabled) return;
     status.className = '';
     try {
       show(await request('settings.write', { expectedVersion: version, value: collect() }));
       status.textContent = '已保存';
     } catch (error) {
-      status.className = 'error';
-      status.textContent = String(error.message || error);
+      showError(error);
     }
   };
 </script>

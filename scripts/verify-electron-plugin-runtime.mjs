@@ -125,11 +125,26 @@ try {
   reporter.check('通过界面授权后运行真实 Cordis 插件', true);
   await waitFor(async () => (await installed()).manifest.contributions.tools.length === 1, '就绪后的晚注册工具');
   reporter.check('晚于初始化窗口的工具进入 daemon 动态目录', true);
+  // 复现设置读取撞上生命周期排空；真实 iframe 应展示错误，不能留下未捕获拒绝或允许盲写。
+  let settingsRead;
+  const stopIntercept = page.on('Fetch.requestPaused', (event) => { settingsRead = event.requestId; });
+  await page.call('Fetch.enable', { patterns: [{ urlPattern: `${origin}/api/plugins/${pluginId}/settings`, requestStage: 'Request' }] });
   await settingsTab(`plugin:${pluginId}:settings`);
   await waitFor(() => ui.exists('.settings-frame iframe'), '插件设置视图');
   const frameUrl = await page.evaluate('document.querySelector(".settings-frame iframe").src');
   frame = await waitFor(() => connectTarget(cdpPort, (target) => target.type === 'iframe' && target.url === frameUrl, '插件隔离视图', errors), '插件隔离视图');
   const evaluateFrame = (expression) => frame.evaluate(expression);
+  await waitFor(() => settingsRead, '设置读取请求');
+  reporter.check('设置读取完成前禁止保存', await evaluateFrame('document.getElementById("save").disabled'));
+  await page.call('Fetch.fulfillRequest', { requestId: settingsRead, responseCode: 409,
+    responseHeaders: [{ name: 'content-type', value: 'application/json' }],
+    body: Buffer.from(JSON.stringify({ error_code: 'CONFLICT', message: 'RUNTIME_SETTINGS_DRAINING' })).toString('base64') });
+  await waitFor(() => evaluateFrame('document.getElementById("status").textContent.includes("RUNTIME_SETTINGS_DRAINING")'), '设置读取错误反馈');
+  reporter.check('设置读取失败显示原因且禁止覆盖配置', await evaluateFrame('document.getElementById("save").disabled')
+    && (await api(`/api/plugins/${pluginId}/settings`)).value.version === 0 && errors.length === 0, errors.join('\n'));
+  await page.call('Fetch.disable'); stopIntercept();
+  await page.evaluate('document.querySelector(".settings-frame iframe").src += ""; true');
+  await waitFor(() => evaluateFrame('Boolean(document.getElementById("save")) && !document.getElementById("save").disabled'), '重新加载设置恢复');
   await waitFor(() => evaluateFrame('Boolean(document.getElementById("f-label"))'), '动态 schema 设置字段');
   reporter.check('首次打开设置页展示与插件执行一致的 schema 默认值',
     await evaluateFrame('document.getElementById("f-label").value === "initial" && document.getElementById("f-enabled").checked'));
@@ -178,7 +193,9 @@ try {
   const upstream = await api('/api/plugins/upstream/preview', { ecosystem: 'dsh', package: 'dsh-connect-workbuddy', version: '5.18.1' });
   reporter.check('真实 npm WorkBuddy 原包的未支持必需契约被明确拒绝', upstream.status >= 400 && /sessionProjections|session\/event/.test(JSON.stringify(upstream.value)), JSON.stringify(upstream.value));
   await writeFile(join(output, 'workbuddy-result.json'), JSON.stringify(upstream, null, 2));
-  reporter.check('主 Renderer 没有运行时异常', errors.length === 0, errors.join('\n'));
+  const rendererLogErrors = app.log.join('').split('\n').filter((line) => /Uncaught|可信 Renderer 控制台错误/.test(line));
+  reporter.check('主 Renderer 与插件 iframe 没有运行时异常', errors.length === 0 && rendererLogErrors.length === 0,
+    [...errors, ...rendererLogErrors].join('\n'));
   console.log(reporter.summary());
 } catch (error) {
   if (ui) await snapshot('failure').catch(() => {});
