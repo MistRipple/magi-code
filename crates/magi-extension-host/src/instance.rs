@@ -15,7 +15,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -147,7 +147,9 @@ struct ServiceLease {
 }
 impl Drop for ServiceLease {
     fn drop(&mut self) {
-        if let Some(service) = &self.service { service.instance_ended(&self.plugin_id, &self.lease); }
+        if let Some(service) = &self.service {
+            service.instance_ended(&self.plugin_id, &self.lease);
+        }
     }
 }
 
@@ -166,6 +168,7 @@ pub struct HostInstance {
     bound_routes: Arc<Mutex<HashSet<String>>>,
     next_invocation: AtomicU64,
     invocations: Arc<Mutex<HashMap<String, InvocationLease>>>,
+    stopping: AtomicBool,
     stop: Arc<Notify>,
     exited: watch::Receiver<bool>,
 }
@@ -201,7 +204,10 @@ impl HostInstance {
     /// 解析视图请求路径命中的已绑定路由：先精确匹配，再取最长前缀匹配。
     /// 返回绑定键（`exact:/path` 或 `prefix:/path`），即宿主注册时使用的名字。
     pub fn resolve_route(&self, path: &str) -> Option<String> {
-        let bound = self.bound_routes.lock().expect("bound routes lock poisoned");
+        let bound = self
+            .bound_routes
+            .lock()
+            .expect("bound routes lock poisoned");
         let exact = format!("exact:{path}");
         if bound.contains(&exact) {
             return Some(exact);
@@ -230,8 +236,16 @@ impl HostInstance {
                 format!("后端路由 {path} 未被宿主绑定"),
             ));
         };
-        self.invoke_bound("route.invoke", "route", &route, input, ctx, timeout, cancelled)
-            .await
+        self.invoke_bound(
+            "route.invoke",
+            "route",
+            &route,
+            input,
+            ctx,
+            timeout,
+            cancelled,
+        )
+        .await
     }
 
     /// 向宿主发起一次工具调用。超时时通知宿主取消并返回 `DeadlineExceeded`。
@@ -323,10 +337,13 @@ impl HostInstance {
         // deadline 到达时，必须先标记这份句柄，再通知 Node；否则 Node 在收到
         // host.cancel 前发出的反向服务请求仍可能被 daemon 接纳。
         let lease_cancelled = Arc::clone(&lease.cancelled);
-        self.invocations
-            .lock()
-            .expect("invocation leases")
-            .insert(invocation_id.clone(), lease);
+        {
+            let mut invocations = self.invocations.lock().expect("invocation leases");
+            if self.stopping.load(Ordering::Acquire) {
+                return Err(RpcError::new(ErrorKind::HostGone, "扩展宿主正在停止"));
+            }
+            invocations.insert(invocation_id.clone(), lease);
+        }
         let _lease = InvocationGuard {
             id: invocation_id.clone(),
             leases: Arc::clone(&self.invocations),
@@ -347,6 +364,13 @@ impl HostInstance {
                 return Err(RpcError::new(ErrorKind::Cancelled, "调用已取消"));
             }
         };
+        // 停用先撤销在途租约。扩展即使在收到 abort 后返回正常文本，也不能把取消改成成功。
+        if lease_cancelled.load(Ordering::Acquire) {
+            return Err(RpcError::new(
+                ErrorKind::Cancelled,
+                "扩展宿主停止，调用已取消",
+            ));
+        }
         if matches!(&result, Err(e) if e.kind() == ErrorKind::DeadlineExceeded) {
             lease_cancelled.store(true, Ordering::Release);
             let _ = self.peer.notify(
@@ -358,7 +382,7 @@ impl HostInstance {
     }
 
     pub fn is_alive(&self) -> bool {
-        !*self.exited.borrow() && !self.peer.is_closed()
+        !self.stopping.load(Ordering::Acquire) && !*self.exited.borrow() && !self.peer.is_closed()
     }
 
     /// 连接关闭或进程退出时返回。
@@ -376,6 +400,10 @@ impl HostInstance {
 
     /// 请求有限排空后终止整个受管进程树。
     pub async fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        for lease in self.invocations.lock().expect("invocation leases").values() {
+            lease.cancelled.store(true, Ordering::Release);
+        }
         if let Some(service) = &self.service_lease.service {
             service.instance_ended(&self.plugin_id, &self.service_lease.lease);
         }
@@ -407,7 +435,14 @@ impl HostInstance {
     }
 
     pub async fn validate_settings(&self, value: Value) -> Result<(), RpcError> {
-        self.peer.request("settings.validate", json!({"generation": self.generation, "value": value}), Duration::from_secs(5)).await.map(|_| ())
+        self.peer
+            .request(
+                "settings.validate",
+                json!({"generation": self.generation, "value": value}),
+                Duration::from_secs(5),
+            )
+            .await
+            .map(|_| ())
     }
 
     pub fn update_config(&self, revision: u64, values: Value) -> Result<(), RpcError> {
@@ -437,16 +472,30 @@ impl Incoming for HostHandler {
     fn request(&self, method: String, params: Value) -> BoxFuture<Result<Value, RpcError>> {
         // 动态绑定与静态绑定共用入口，元数据只从 daemon 的当前实例目录读取。
         if matches!(method.as_str(), "register.tool" | "register.command") {
-            let name = params.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
             let is_tool = method == "register.tool";
-            let declared = if is_tool { self.approved_tools.contains(&name) } else { self.approved_commands.contains(&name) };
+            let declared = if is_tool {
+                self.approved_tools.contains(&name)
+            } else {
+                self.approved_commands.contains(&name)
+            };
             if !declared {
                 let service = self.service.clone();
                 let plugin = self.plugin_id.clone();
                 let lease = self.lease.clone();
-                let bound = if is_tool { self.bound_tools.clone() } else { self.bound_commands.clone() };
+                let bound = if is_tool {
+                    self.bound_tools.clone()
+                } else {
+                    self.bound_commands.clone()
+                };
                 return Box::pin(async move {
-                    let service = service.ok_or_else(|| RpcError::new(ErrorKind::RegistrationDenied, "未声明的贡献"))?;
+                    let service = service.ok_or_else(|| {
+                        RpcError::new(ErrorKind::RegistrationDenied, "未声明的贡献")
+                    })?;
                     service.request_with_identity(plugin, "registration.check".into(), json!({
                         "_instance": lease, "kind": if is_tool { "tool" } else { "command" }, "name": name,
                     })).await?;
@@ -520,7 +569,10 @@ impl Incoming for HostHandler {
                         "后端路由名必须形如 exact:/路径 或 prefix:/路径（不含查询，最长 256 字节）",
                     ))
                 } else {
-                    let mut bound = self.bound_routes.lock().expect("bound routes lock poisoned");
+                    let mut bound = self
+                        .bound_routes
+                        .lock()
+                        .expect("bound routes lock poisoned");
                     if !bound.contains(name) && bound.len() >= MAX_BOUND_ROUTES {
                         Err(RpcError::new(
                             ErrorKind::RegistrationDenied,
@@ -711,10 +763,13 @@ pub async fn launch(
             .ok_or_else(|| LaunchError::Handshake("设置快照缺少版本".into()))?;
     }
     let service_lease = ServiceLease {
-        plugin_id: config.plugin_id.clone(), lease: random_hex(16).map_err(LaunchError::Endpoint)?, service: config.service.clone(),
+        plugin_id: config.plugin_id.clone(),
+        lease: random_hex(16).map_err(LaunchError::Endpoint)?,
+        service: config.service.clone(),
     };
     if let Some(service) = &config.service {
-        service.instance_started(&config.plugin_id, &service_lease.lease)
+        service
+            .instance_started(&config.plugin_id, &service_lease.lease)
             .map_err(|error| LaunchError::Handshake(error.to_string()))?;
     }
     let mut approved = HashMap::new();
@@ -883,7 +938,8 @@ pub async fn launch(
 
     if let Some(service) = &config.service {
         if let Err(error) = service.instance_ready(&config.plugin_id, &service_lease.lease) {
-            abort(&stop); peer.close();
+            abort(&stop);
+            peer.close();
             return Err(LaunchError::NotReady(error.to_string()));
         }
     }
@@ -902,6 +958,7 @@ pub async fn launch(
         bound_routes,
         next_invocation: AtomicU64::new(1),
         invocations,
+        stopping: AtomicBool::new(false),
         stop,
         exited: exited_rx,
     }))

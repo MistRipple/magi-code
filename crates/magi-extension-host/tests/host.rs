@@ -205,6 +205,65 @@ async fn guard_blocks_rewrites_and_continues_through_a_real_node_host() {
 }
 
 #[tokio::test]
+async fn stopping_a_host_cancels_even_a_handler_that_returns_success_after_abort() {
+    let mut env = env("tools", vec![]);
+    env.config.plugin_entry = env._dir.path().join("stop-race.mjs");
+    env.config.commands = vec!["wait".into()];
+    std::fs::write(
+        &env.config.plugin_entry,
+        r#"
+import { writeFile } from 'node:fs/promises';
+export default async api => {
+  await api.command('wait', async (_, ctx) => {
+    const aborted = new Promise(resolve => ctx.signal.addEventListener('abort', resolve, {once: true}));
+    await writeFile(api.config.marker, 'started');
+    await aborted;
+    return 'late success';
+  });
+};
+"#,
+    )
+    .unwrap();
+    let instance = launch(&env.group, env.config, 1).await.unwrap();
+    let running = Arc::clone(&instance);
+    let call = tokio::spawn(async move {
+        running
+            .invoke_command(
+                "wait",
+                json!({}),
+                json!({}),
+                Duration::from_secs(10),
+                std::future::pending(),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !env.marker.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    instance.stop().await;
+    assert_eq!(
+        call.await.unwrap().unwrap_err().kind(),
+        ErrorKind::Cancelled
+    );
+    assert!(!instance.is_alive());
+    let refused = instance
+        .invoke_command(
+            "wait",
+            json!({}),
+            json!({}),
+            Duration::from_secs(1),
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::HostGone);
+}
+
+#[tokio::test]
 async fn guard_timeout_cancels_the_extension_and_blocks() {
     let env = env("guard", vec![hook("tool.call", HookMode::Guard, Some(400))]);
     let bus = ExtensionBus::new(BusPolicy::default());
@@ -869,18 +928,35 @@ async fn view_routes_bind_exact_and_prefix_dispatch_and_release_at_runtime() {
     assert_eq!(prefixed["status"], 201);
     assert_eq!(prefixed["contentType"], "application/x-ndjson");
     assert_eq!(prefixed["body"], "/items/42\n");
-    assert_eq!(call("/items/special", "r-3").await.unwrap()["body"], "exact-wins");
+    assert_eq!(
+        call("/items/special", "r-3").await.unwrap()["body"],
+        "exact-wins"
+    );
     // 处理器抛错是视图可见的 500，不是协议错误。
     let boom = call("/boom", "r-4").await.unwrap();
     assert_eq!(boom["status"], 500);
-    assert!(boom["body"]["error"].as_str().unwrap().contains("处理器失败"));
+    assert!(
+        boom["body"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("处理器失败")
+    );
     // 未绑定的路径明确拒绝，不落到别的处理器。
-    assert_eq!(call("/nothing", "r-5").await.unwrap_err().kind(), ErrorKind::MethodNotFound);
+    assert_eq!(
+        call("/nothing", "r-5").await.unwrap_err().kind(),
+        ErrorKind::MethodNotFound
+    );
     // 运行期释放：释放后不可再调用。
     assert_eq!(call("/gone", "r-6").await.unwrap()["body"], "here");
     assert_eq!(call("/drop", "r-7").await.unwrap()["body"], "dropped");
-    assert!(instance.resolve_route("/gone").is_none(), "释放后路由不再命中");
-    assert_eq!(call("/gone", "r-8").await.unwrap_err().kind(), ErrorKind::MethodNotFound);
+    assert!(
+        instance.resolve_route("/gone").is_none(),
+        "释放后路由不再命中"
+    );
+    assert_eq!(
+        call("/gone", "r-8").await.unwrap_err().kind(),
+        ErrorKind::MethodNotFound
+    );
 }
 
 #[tokio::test]
@@ -911,7 +987,10 @@ async fn view_route_calls_are_cancelled_with_their_http_request() {
     cancel.send(()).unwrap();
     let error = pending.await.unwrap().unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Cancelled);
-    assert!(started.elapsed() < Duration::from_secs(5), "取消不得等到处理器的 30 秒");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "取消不得等到处理器的 30 秒"
+    );
 }
 
 #[tokio::test]
