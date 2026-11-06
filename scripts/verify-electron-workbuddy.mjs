@@ -68,7 +68,7 @@ try {
   const row = `[data-testid=plugin-row][data-plugin-id="${pluginId}"]`;
   await waitFor(() => ui.exists(row), '已安装列表项');
   await ui.click(row);
-  await waitFor(() => ui.exists('[data-action=activate]'), '授权激活');
+  await waitFor(() => page.evaluate('Boolean(document.querySelector("[data-action=activate]")) && !document.querySelector("[data-action=activate]").disabled'), '授权激活');
   await ui.click('[data-action=activate]');
   const activated = await waitFor(async () => {
     const item = await installed();
@@ -81,8 +81,8 @@ try {
     return catalog.some((g) => g.models.length) && catalog;
   }, 'WorkBuddy 模型目录', 90_000);
   const selected = groups.flatMap((g) => g.models.map((m) => ({ sourceId: g.sourceId, ...m })))
-    .find((m) => m.id === (process.env.MAGI_WORKBUDDY_MODEL || 'hy4'));
-  assert.ok(selected, 'WorkBuddy 国内版 hy4 模型必须真实出现在目录；不自动改用其他模型');
+    .find((m) => m.id === (process.env.MAGI_WORKBUDDY_MODEL || 'hy3'));
+  assert.ok(selected, '所选 WorkBuddy 模型必须真实出现在目录；不自动改用其他模型');
   report.check('真实 WorkBuddy 模型数据源进入主对话目录', Boolean(selected));
   await tab(`plugin:${pluginId}:settings`);
   await waitFor(() => ui.exists('.settings-frame iframe'), '原包设置界面');
@@ -98,7 +98,9 @@ try {
     const turns = (await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).canonicalTurns;
     return turns?.find((t) => t.turnId === turn.turnId && ['completed', 'failed', 'cancelled', 'blocked'].includes(t.status));
   }, '真实 WorkBuddy 模型回复', 180_000);
-  report.check('真实 WorkBuddy 登录态与 hy4 完成模型调用', finished.status === 'completed' && JSON.stringify(finished).includes('MAGI_WORKBUDDY_LIVE_OK'), JSON.stringify(finished));
+  const assistantText = finished.items.filter((item) => item.kind === 'assistant_text').map((item) => item.content ?? '').join('\n').trim();
+  report.check(`真实 WorkBuddy 登录态与 ${selected.id} 完成模型调用`, finished.status === 'completed' && assistantText === 'MAGI_WORKBUDDY_LIVE_OK',
+    JSON.stringify({ turnId: finished.turnId, status: finished.status, model: selected.id, assistantText }));
   frame.close(); frame = null;
   await page.call('Page.navigate', { url: `${origin}/web.html?scope=personal&sessionId=${encodeURIComponent(session)}` });
   await waitFor(() => page.evaluate('document.body.innerText.includes("MAGI_WORKBUDDY_LIVE_OK")'), '真实回复展示');
@@ -108,7 +110,7 @@ try {
   await ui.click('[data-action=deactivate]');
   await waitFor(async () => !(await installed()).active, '停用原包');
   report.check('停用回收真实 WorkBuddy 模型数据源', !(await api('/api/settings/models/catalog')).groups.some((g) => g.pluginId === pluginId));
-  await waitFor(() => ui.exists('[data-action=activate]'), '再次激活'); await ui.click('[data-action=activate]');
+  await waitFor(() => page.evaluate('Boolean(document.querySelector("[data-action=activate]")) && !document.querySelector("[data-action=activate]").disabled'), '再次激活'); await ui.click('[data-action=activate]');
   await waitFor(async () => (await installed()).runtime?.state === 'running', '重新激活', 90_000);
   report.check('重新激活真实原包成功', true);
   report.check('主窗口与上游设置无未捕获异常', errors.length === 0 && !/Uncaught|可信 Renderer 控制台错误/.test(app.log.join('')), errors.join('\n'));

@@ -488,7 +488,28 @@
 
 【现状·证据】Electron 结果与截图保存在 `target/plugin-acceptance/runtime/` 的 `results.json`、`settings-desktop.png`、`conversation.png`、`inactive-390.png`、`electron.log` 和 `workbuddy-result.json`。设置读取失败用例为主动故障注入；其他生命周期与配置流程通过真实 daemon 执行。390px 为桌面 Electron 视口模拟，不是手机实机。
 
-【现状·仍未完成】真实 npm `dsh-connect-workbuddy@5.18.1` 原包在最终包的预览入口仍返回 HTTP 400，原因是 `ctx.sessionProjections`、`sessionProjections` 注入及 `session/event` 未支持；这是拒绝路径通过，不能解释为 WorkBuddy 登录态或模型调用通过。本轮未进行 Windows、干净 macOS 安装、真实付费模型与全仓测试；pi 运行器和 T1–T6 的其余范围仍未完成。
+【现状·截至本节记录】真实 npm `dsh-connect-workbuddy@5.18.1` 原包在当时目录包的预览入口返回 HTTP 400，原因是 `ctx.sessionProjections`、`sessionProjections` 注入及 `session/event` 未支持；当时只有拒绝路径通过，不能解释为 WorkBuddy 登录态或模型调用通过。后续原包在线安装与真实模型调用见 11.4。本轮未进行 Windows、干净 macOS 安装、真实付费模型与全仓测试；pi 运行器和 T1–T6 的其余范围仍未完成。
+
+### 11.4 首款原包在线翻译验收：WorkBuddy 5.20.2（2026-11-06）
+
+【现状·已运行验证】首款验收必须是从 npm 在线安装的 `dsh-connect-workbuddy` 原包，不能用夹具或拒绝路径替代。`24e7a37a` 对齐两项通用上游合同，未修改 WorkBuddy 原代码，也未按包名添加兼容分支：
+
+- Cordis `ctx.inject` 是条件挂载，不等于导出的必需 `inject`。静态分析只在全部使用点均有同一服务的条件注入保护，或同步注册失败有可追踪的 catch 时标注可选；`partial`／`dropped` 状态仍保留并在预览展示原因。未知能力、必需依赖、未捕获注册失败和不能证明的回调逃逸仍拒绝。运行期保留 Cordis 条件 fiber 的 pending 状态，缺少必需服务仍使激活失败。
+- 官方 `@deepseek-ai/dsh-app-boot@0.2.2-rc.1` 的 `lib/index.js` 中 `plugin-compatibility` 明确用 `semver.satisfies(..., { includePrerelease: true })` 检查 DSH peer 范围。兼容层对齐该规则；直接依赖和非 DSH peer 仍用普通语义版本校验，超出上游范围的版本仍拒绝。无需更改已固定的 DSH 依赖版本。
+
+【现状·已运行验证】安装预览沿已有设置组件显示降级原因；清单声明的动态工具／命令／模型目录在激活前显示“激活后动态注册，当前尚未加载”，不再误写成“无”。
+
+| 入口 | 结果与证据范围 |
+| --- | --- |
+| `npm run test:electron-workbuddy` | 11 项通过。macOS arm64 真实目录包 Main／daemon／随包 Node，界面搜索 npm → 原包下载与完整性预览 → 确认安装 `5.20.2` → 授权激活 → 上游设置卡片渲染 → 主对话模型目录 → 使用本机已有 WorkBuddy 国内版登录态调用 `hy3` → 停用回收来源 → 重新激活；主窗口和插件 iframe 无未捕获异常 |
+| 真实回复与 canonical Turn | `turn-session-action-1793974719003` 为 `completed`；绑定来源为该插件的 `workbuddy`，模型为 `hy3`，模型步骤记录 20,957 Token。单独检查 `assistant_text` 精确等于 `MAGI_WORKBUDDY_LIVE_OK`，不以用户消息中的同名文本充当回复证据 |
+| `npm run test:compat` | 35 项通过；新增条件依赖、捕获／重抛、回调逃逸、真实 Cordis 可选 fiber、DSH peer 预发布准入与越界拒绝回归 |
+| `npm run test:electron-plugin-runtime` | 同一产品代码 16 项通过；必需事件拒绝改用不捕获错误的独立夹具，不再把 WorkBuddy 拒绝当作正向验收 |
+| Web 定向验证 | `npm --prefix web run check` 0 错误 0 警告；`test:i18n`、`test:plugin-store`、构建与 `git diff --check` 通过 |
+
+【现状·证据与状态】真实安装和会话使用独立 Magi／DSH 状态目录，原包自行读取本机已有桌面登录态；没有修改用户原有 Magi 会话。`target/plugin-acceptance/workbuddy/` 保存 `installed.json`（版本、来源、会话与状态目录）、`results.json`、`install-preview.png`、`settings.png`、`conversation.png` 和 `electron.log`。凭据不写入验收结果文件。该脚本会发出真实模型请求，仅显式运行，不并入默认测试套件。
+
+【现状·兼容边界】`session/event` 自动续发仍由上游捕获不支持错误后关闭；`sessionProjections` 当前工作目录读取分支因服务缺席而不挂载。这是上游明确支持的可选降级，不代表这两项能力已经实现。本轮未验证真实生图／视频、`codebuddy_ask`／`/codebuddy`、国际版登录态、Windows、干净系统安装和全部 DSH／pi 插件兼容性。
 
 ## 12. 验收与证据边界
 
