@@ -34,6 +34,17 @@ extraResources:
     filter:
       - node
       - node.exe
+  - from: dist/compat
+    to: daemon/compat
+    filter:
+      - "**/*"
+      - "!node_modules/**"
+  # electron-builder 的 extraResources 会丢弃名为 node_modules 的目录，所以依赖单独以其内容为源再放回原名
+  # （与上面 Lighthouse 运行时同一做法）。
+  - from: dist/compat/node_modules
+    to: daemon/compat/node_modules
+    filter:
+      - "**/*"
   - from: ../../browser-automation-worker/dist/index.cjs
     to: browser-automation-worker/index.cjs
   - from: dist/lighthouse-runtime/node_modules

@@ -83,9 +83,11 @@ impl PluginServices {
         Arc::clone(&self.extension_bus)
     }
 
-    /// 模型可见的插件工具目录：与执行共用 `PluginManager` 的授权判定。
+    /// 模型可见的插件工具目录：与执行共用 `PluginManager` 的授权判定，
+    /// 并且只列出当前宿主实例已绑定处理器的工具（作者可在运行期按配置上下架工具）。
     pub(super) fn tool_catalog_provider(&self) -> PluginToolCatalogProvider {
         let manager = Arc::clone(&self.manager);
+        let bus = Arc::clone(&self.extension_bus);
         Arc::new(move || {
             let Ok(manager) = manager.lock() else {
                 return Vec::new();
@@ -94,6 +96,10 @@ impl PluginServices {
                 .tool_contributions()
                 .unwrap_or_default()
                 .into_iter()
+                .filter(|(manifest, tool)| {
+                    bus.instance(&manifest.id)
+                        .is_some_and(|instance| instance.is_tool_bound(&tool.id))
+                })
                 .map(|(manifest, tool)| PluginToolCatalogEntry {
                     model_tool_name: magi_plugin_system::model_tool_name(&manifest.id, &tool.id),
                     plugin_id: manifest.id,
@@ -135,6 +141,18 @@ impl PluginServices {
             bus: Arc::clone(&self.extension_bus),
             handle,
         })
+    }
+
+    /// 插件视图后端路由的执行端口：API 的 `/plugins/{id}/routes` 经此转交给扩展宿主。
+    pub(super) fn route_executor(&self) -> Arc<dyn magi_api::PluginRouteExecutor> {
+        Arc::new(NodeRouteExecutor {
+            manager: Arc::clone(&self.manager),
+            bus: Arc::clone(&self.extension_bus),
+        })
+    }
+
+    pub(super) fn toolchain(&self) -> Option<magi_api::PluginToolchain> {
+        self.extensions.toolchain()
     }
 
     pub(super) fn manager(&self) -> Arc<Mutex<PluginManager>> {
@@ -241,6 +259,136 @@ impl magi_conversation_runtime::plugin_command::PluginCommandExecutor for NodeCo
     }
 }
 
+/// 单次视图后端路由调用的上限。路由里有账号测试、导入导出这类耗时操作，期限比工具宽，
+/// 但仍有界；HTTP 请求被丢弃时宿主侧调用随即取消。
+const ROUTE_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 视图后端路由的执行者。授权判定与工具、命令同源：插件必须在当前全局状态激活，
+/// 宿主摘要必须是当前授权的包；路由本身只服务该插件自己的视图。
+pub(super) struct NodeRouteExecutor {
+    manager: Arc<Mutex<PluginManager>>,
+    bus: Arc<magi_extension_host::bus::ExtensionBus>,
+}
+
+impl NodeRouteExecutor {
+    #[cfg(test)]
+    pub(super) fn for_test(
+        manager: Arc<Mutex<PluginManager>>,
+        bus: Arc<magi_extension_host::bus::ExtensionBus>,
+    ) -> Self {
+        Self { manager, bus }
+    }
+}
+
+/// 外层 HTTP 请求被丢弃（视图关闭、连接断开）时通知宿主取消。
+struct CancelOnDrop(Arc<tokio::sync::Notify>);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+impl magi_api::PluginRouteExecutor for NodeRouteExecutor {
+    fn call(
+        &self,
+        plugin_id: String,
+        request: magi_app_server_protocol::generated::PluginRouteCallRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        magi_app_server_protocol::generated::PluginRouteCallResult,
+                        magi_api::ApiError,
+                    >,
+                > + Send,
+        >,
+    > {
+        use magi_api::ApiError;
+        use magi_extension_host::protocol::ErrorKind;
+        let manager = Arc::clone(&self.manager);
+        let bus = Arc::clone(&self.bus);
+        Box::pin(async move {
+            let digest = {
+                let manager = manager.lock().map_err(|_| {
+                    ApiError::internal_assembly("插件路由调用失败", "插件管理器不可用")
+                })?;
+                if !manager
+                    .is_active(&plugin_id)
+                    .map_err(|error| ApiError::Conflict(error.to_string()))?
+                {
+                    return Err(ApiError::Conflict("插件未激活".into()));
+                }
+                let package = manager
+                    .package(&plugin_id)
+                    .map_err(|error| ApiError::NotFound(error.to_string()))?;
+                // 后端路由只为插件自己的视图存在；没有视图的插件不开放这个入口。
+                if package.manifest().contributions.views.is_empty() {
+                    return Err(ApiError::Forbidden("插件未声明视图，不开放后端路由".into()));
+                }
+                package.digest().to_owned()
+            };
+            let instance = bus
+                .instance(&plugin_id)
+                .ok_or_else(|| ApiError::Conflict("扩展宿主未运行".into()))?;
+            if instance.digest != digest {
+                return Err(ApiError::Conflict("扩展宿主不是当前授权的版本".into()));
+            }
+            let ctx = json!({
+                "invocationId": format!("route_{}", NEXT_PLUGIN_INVOCATION.fetch_add(1, Ordering::Relaxed)),
+                "owner": {},
+                "binding": {},
+            });
+            let method = serde_json::to_value(&request.method)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let input = json!({
+                "method": method,
+                "path": request.path,
+                "query": request.query.unwrap_or_default(),
+                "body": request.body,
+            });
+            // 在独立任务里等待宿主：外层请求被丢弃时由 CancelOnDrop 触发取消，
+            // 而不是让宿主侧的处理器白白跑到期限。
+            let cancel = Arc::new(tokio::sync::Notify::new());
+            let _guard = CancelOnDrop(Arc::clone(&cancel));
+            let path = request.path;
+            let task = tokio::spawn(async move {
+                instance
+                    .invoke_route(&path, input, ctx, ROUTE_CALL_TIMEOUT, async move {
+                        cancel.notified().await
+                    })
+                    .await
+            });
+            let value = task
+                .await
+                .map_err(|error| ApiError::internal_assembly("插件路由调用失败", error))?
+                .map_err(|error| match error.kind() {
+                    ErrorKind::MethodNotFound => ApiError::NotFound(error.message),
+                    ErrorKind::Cancelled => ApiError::Conflict("路由调用已取消".into()),
+                    ErrorKind::DeadlineExceeded => ApiError::Conflict("路由处理超时".into()),
+                    _ => ApiError::internal_assembly("插件路由调用失败", error.message),
+                })?;
+            let status = value
+                .get("status")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|status| u16::try_from(status).ok())
+                .filter(|status| (100..=599).contains(status))
+                .ok_or_else(|| {
+                    ApiError::internal_assembly("插件路由调用失败", "宿主返回的状态码无效")
+                })?;
+            Ok(magi_app_server_protocol::generated::PluginRouteCallResult {
+                status,
+                content_type: value
+                    .get("contentType")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                body: value.get("body").filter(|body| !body.is_null()).cloned(),
+            })
+        })
+    }
+}
+
 /// 单次插件命令的上限；命令可能比工具更久，但仍受期限与停止取消约束。
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -320,11 +468,18 @@ pub(super) fn execute_tool(
         }
     };
     let read_only = prepared.tool.read_only;
+    // 作者在清单里声明的期限（最长 10 分钟）优先；未声明沿用默认的 60 秒。
+    let timeout = prepared
+        .tool
+        .timeout_ms
+        .and_then(|ms| u64::try_from(ms).ok())
+        .map(Duration::from_millis)
+        .unwrap_or(TOOL_CALL_TIMEOUT);
     let result = handle.block_on(instance.invoke_tool(
         &prepared.tool.id,
         prepared.input,
         ctx,
-        TOOL_CALL_TIMEOUT,
+        timeout,
         wait_cancelled,
     ));
     match result {

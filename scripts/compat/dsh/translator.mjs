@@ -1,8 +1,8 @@
 // DSH → Magi 翻译器。当前阶段：识别与静态兼容分析；构建与产物生成在后续阶段加入。
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { scanSources } from '../core/scan.mjs';
-import { summarize, verdictFor } from '../core/report.mjs';
+import { DSH_FLOW } from '../core/scan.mjs';
+import { buildReport } from '../core/inspect.mjs';
 import { classify } from './catalog.mjs';
 
 function readPackage(dir) {
@@ -47,26 +47,19 @@ export function createDshTranslator(options = {}) {
     async inspect(dir, inspectOptions = {}) {
       const pkg = readPackage(dir);
       const required = inspectOptions.required ?? options.required ?? ['llm'];
-      const scan = scanSources(dir, { directories: inspectOptions.directories ?? ['src'] });
-      const entries = [];
-      for (const kind of ['imports', 'calls', 'injects']) {
-        for (const [name, usage] of Object.entries(scan[kind])) {
-          const rule = classify(kind, name);
-          entries.push({ kind, name, category: rule.category, status: rule.status, target: rule.target, note: rule.note, count: usage.count, files: usage.files });
-        }
-      }
-      const native = findNative(dir);
-      for (const file of native) {
-        entries.push({ kind: 'native', name: file, category: 'native', status: 'dropped', target: '无', note: 'Magi 扩展不支持包内原生模块或 WASM', count: 1, files: [file] });
-      }
-      return {
-        translator: 'dsh',
-        upstream: { name: pkg.name, version: pkg.version },
-        scanned: { files: scan.fileCount, lines: scan.lineCount },
-        entries,
-        summary: summarize(entries),
-        verdict: verdictFor(entries, required),
-      };
+      // 已发布的 npm 产物没有 src/：默认从 package.json 的 main 出发沿相对导入扫描；显式给出 directories 时按源码目录扫描。
+      const mainFile = join(dir, pkg.main ?? 'index.js');
+      const scanOptions = inspectOptions.directories || !existsSync(mainFile)
+        ? { directories: inspectOptions.directories ?? ['src'], flow: DSH_FLOW }
+        : { entry: mainFile, flow: DSH_FLOW };
+      const native = findNative(dir).map((file) => ({
+        kind: 'native', name: file, category: 'native', status: 'dropped', target: '无',
+        note: 'Magi 扩展不支持包内原生模块或 WASM', count: 1, files: [file],
+      }));
+      return buildReport({
+        translator: 'dsh', upstream: { name: pkg.name, version: pkg.version }, root: dir,
+        scanOptions, classify, required, extraEntries: native,
+      });
     },
   };
 }

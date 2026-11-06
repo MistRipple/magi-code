@@ -3,6 +3,8 @@
 这是一份可以单独保存、复制给其他开发者或交给 AI 使用的 Magi 插件开发手册。你需要了解基本 JavaScript 和 JSON；做界面页面时需要基本 HTML。
 
 > **适用范围：** 本指南描述当前的插件 SDK（清单 `sdkVersion` 为 `2`）。能力边界见第 16 节。Windows 上的运行与安装包尚未验收，下文的行为以 macOS 上的验证为准。
+>
+> **已有的 DSH 插件：** 为 DeepSeek Harness 发布到 npm 的插件不需要按本指南改写。设置 → 插件可搜索上游包，Magi 在安装期检查和封装原包，安装前展示兼容结果与权限。尚未实现的必需契约会阻止安装；没有对应位置的界面槽位会如实披露。运行时兼容层仍在改造，不能据搜索结果推断该包已完成验收。pi 生态的搜索结果目前只可浏览。
 
 ## 1. 先确认你的功能适合哪种形态
 
@@ -104,7 +106,7 @@ ui/…                       视图页面与静态资源，按需
 | `version` | 语义化版本 |
 | `name` / `description` | 展示名称与说明 |
 | `permissions` | 权限声明，见第 4 节 |
-| `extension` | `{ "hooks": [...] }`，声明后包必须含 `extension/index.mjs`；反之不得带该文件 |
+| `extension` | `{ "hooks": [...], "runtimeContributions": [...] }`，动态贡献种类可省略；声明后包必须含 `extension/index.mjs`；反之不得带该文件 |
 | `contributions` | `skills`、`resources`、`views`、`browserSurfaces`、`tools`、`commands`、`modelSources` |
 | `settingsSchema` | 设置的 JSON Schema，用于校验设置值（必须是有界的 object schema，禁止外部引用）；它不生成界面 |
 | `dataSchemaVersion` | 数据格式版本，正整数 |
@@ -113,7 +115,7 @@ ui/…                       视图页面与静态资源，按需
 
 - 清单不接受未知字段。
 - 所有贡献的 ID（技能、资源、视图、工具、命令……）共用一个命名空间，不能重名；ID 以小写字母开头，只含小写字母、数字、连字符，最长 64。
-- 声明了 `extension` 的包必须至少有一个钩子、工具、命令或模型数据源。
+- 声明了 `extension` 的包必须至少有一个钩子、工具、命令、模型数据源或运行期贡献种类。
 - 工具、命令和模型数据源只有声明了 `extension` 才能出现。
 
 ## 4. 权限与信任
@@ -149,6 +151,7 @@ ui/…                       视图页面与静态资源，按需
 - **技能**：`instruction` 是给模型的方法说明（不超过 64 KiB），用户通过 `/` 选用。
 - **资源**：带版本的 JSON 数据，写入必须携带读到的版本（乐观并发）。页面和扩展读写同一份；读写需要对应 `storage` 权限，目标是资源 ID。
 - **视图**：`entry` 必须是包内 `ui/` 下的 HTML 文件。`placements` 可选：`settings`（在设置里为该插件增加一个分类页）、`main`（主内容区页面）、`home`（主页上的入口，必须同时声明 `main`）、`homeCard`（主页上嵌入的卡片，每个插件最多 2 张）、`rightPane`（右侧面板）。
+- **图标**：清单可选字段 `icon`，指向包内 `ui/` 下的位图（png、jpg 或 webp，不超过 256 KiB，不接受 SVG）。设置的插件列表、详情和设置导航都显示它；没有声明或加载失败时显示通用插件图标。
 - **视图隔离**：页面运行在 `sandbox="allow-scripts"` 的隔离 iframe 中，不能联网、不能访问宿主页面、凭据或 Electron，只能通过下面的消息桥读写资源和设置。
 - **设置界面**：Magi 不为插件生成设置表单，所有界面都由插件自己的页面提供。需要用户配置时，声明一个 `placements` 含 `settings` 的视图，页面通过消息桥的 `settings.read` / `settings.write` 读写；值按 `settingsSchema` 校验。设置读写需要 `storage` 权限，目标 `"__settings"`。完整示例见 `examples/plugins/notes/ui/settings.html`。
 - **浏览器 surface**：`browserSurfaces` 条目需要同名的 `browser` 权限；`backgroundInference` 为真时必须 `keepMounted`。
@@ -157,7 +160,7 @@ ui/…                       视图页面与静态资源，按需
 
 页面通过 `postMessage` 与宿主通信，通道名固定为 `magi-plugin-v1`：
 
-1. 页面加载后，宿主先发来 `{ channel, type: 'init', instanceId, pluginId }`。**记下 `instanceId`**，之后每个请求都要带上。
+1. 页面加载后，宿主先发来 `{ channel, type: 'init', instanceId, pluginId, placement, locale, theme }`；`placement` 为 `settings`（嵌入设置页：内容列宽度、左右留白、与页头的间距、圆角和滚动都由宿主的设置框架决定，页面背景透明、不应自带外层留白，高度由页面经 `view.resize` 上报）或 `page`（其他位置，宿主给定固定尺寸，页面自行滚动）。字号、字体、间距和圆角使用 `theme.tokens` 下发的宿主令牌，不要写死数值。**记下 `instanceId`**，之后每个请求都要带上。
 2. 页面发请求：`parent.postMessage({ channel, instanceId, type: 'request', requestId, operation, ...字段 }, '*')`。
 3. 宿主回复 `{ type: 'response', requestId, ok, result | error }`。
 
@@ -167,6 +170,7 @@ ui/…                       视图页面与静态资源，按需
 | `resource.write` | `resourceId`、`expectedVersion`、`value` | 新的 `{ version, value }`；版本过期时 `ok: false` |
 | `resource.subscribe` | `resourceId` | 无；之后资源每次变化宿主推送 `{ type: 'event', resourceId, resource }`，订阅失败（停用、撤权、升级）推送 `{ type: 'event', resourceId, error }` |
 | `settings.read` / `settings.write` | `expectedVersion`、`value`（写） | `{ version, value }` |
+| `view.resize` | `height`（CSS 像素，0 到 20000） | 无；仅对 `settings` 位置的视图生效：宿主把 iframe 高度设为该值，由设置页整体滚动，页面自身不应再出现滚动条 |
 
 单次写入不超过 4 MiB。一个最小的页面（`ui/index.html`）：
 
@@ -230,9 +234,12 @@ export default async function activate(api) {
 | `api.on(hook, handler)` | 绑定钩子（第 7 节） |
 | `api.tool(id, handler)` | 绑定模型工具（第 8 节） |
 | `api.command(id, handler)` | 绑定用户命令，也是作业的执行入口（第 9、11 节） |
+| `api.catalog.replace(expectedRevision, catalog)` | 提交已声明种类的动态贡献目录，返回新的 `{revision}` |
 | `api.resource.read(id)` / `write(id, expectedVersion, value)` | 读写本插件资源 |
 | `api.settings.read()` / `write(expectedVersion, value)` | 读写本插件设置 |
 | `api.config` / `api.configRevision` | 设置快照与版本；设置在界面修改后自动更新 |
+| `api.onConfig(listener)` / `api.onDispose(disposer)` | 接收配置通知／释放运行资源；返回取消监听函数 |
+| `api.settings.describe()` / `api.settings.onValidate(handler)` | 读取有效 schema／注册一个额外设置校验器 |
 | `api.model.invoke(input)` | 调用模型 |
 | `api.credential.ref({ roleId? })` | 取得模型绑定引用 |
 | `api.session.snapshot(input)` | 读取会话的有界快照 |
@@ -258,6 +265,14 @@ export default async function activate(api) {
 | `ctx.job` | 仅作业触发的命令有：`jobId`、`scheduleId`、`budget` |
 
 `owner`、`binding`、`job` 由 daemon 注入，扩展不能伪造。
+
+### 运行期贡献与回收
+
+工具、命令和模型目录在启动后才确定时，在 `extension.runtimeContributions` 中声明对应种类（`tools`、`commands`、`modelSources`；动态设置 schema 使用 `settings`）。声明 `tools`／`modelSources` 动态贡献的包可申请对应的 `["*"]` 权限，用户仍须明确授权。
+
+`api.catalog.replace(0, { tools: [...], commands: [...], modelSources: [...], settingsSchema: {...} })` 提交首次完整快照。保存返回的 revision，每次修改串行提交；省略的动态数组会被清空。daemon 合并静态声明并验证，失败保留原目录。工具／命令需要在目录获准后再绑定处理器；`await api.tool(...)` 和 `await api.command(...)` 返回释放函数，撤销贡献时先释放，再提交移除后的目录。动态 ID 与静态贡献共用命名空间，不能重复。
+
+动态目录只在内存中生效，每次启动重新建立，不能替代 `api.resource`／`api.settings` 持久化。初始化抛错、崩溃或停用会回收本实例贡献；旧实例的迟到注册不能影响新实例。用 `api.onDispose` 或入口返回的 `dispose` 关闭定时器、连接和文件监听；回收动作应幂等，并且在 daemon 已拒绝新请求时仍能释放本地资源。完整大小与租约合同见[扩展协议第 5 节](extension-protocol-v1.md#5-注册)。
 
 ## 7. 钩子
 
@@ -357,7 +372,7 @@ export default async function activate(api) {
 - 参数先按 `inputSchema` 校验（必须是有界的 object schema），不合法的调用不会到达你的代码。
 - 返回任意 JSON 作为工具输出；**抛出的错误会作为工具失败返回给模型**，不是协议错误。
 - `readOnly` 决定审批：只读工具在“只读”模式下可用；非只读工具在“逐次询问”下需要用户批准，在“只读”下被拒绝。
-- 单次调用上限 60 秒；超时或用户停止所属 Turn/任务时 `ctx.signal` 中止。停止时如果工具不是 `readOnly`，Magi 无法确认写入是否已生效，结果记为“未确定”，**不会自动重试**。
+- 单次调用默认上限 60 秒；可在清单里用 `timeoutMs`（1000–600000）为长任务声明更长期限。超时或用户停止所属 Turn/任务时 `ctx.signal` 中止。停止时如果工具不是 `readOnly`，Magi 无法确认写入是否已生效，结果记为“未确定”，**不会自动重试**。
 - 停用、撤权或宿主不可用时，工具从目录中消失或调用失败。
 
 ## 9. 用户命令

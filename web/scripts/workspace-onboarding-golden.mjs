@@ -186,8 +186,18 @@ assert.match(
 );
 assert.match(
   inputAreaSource,
-  /function orchestratorModelListConfigKey[\s\S]*?if \(!config \|\| !Array\.isArray\(sources\) \|\| sources\.length === 0\) return '';/,
-  '主模型列表自动加载只在数据源目录非空时发起请求，未配置数据源时不能发起请求',
+  /function orchestratorModelListConfigKey[\s\S]*?if \(!config\) return '';[\s\S]*?Array\.isArray\(config\.sources\) \? config\.sources : \[\]/,
+  '主模型列表只在设置快照未就绪时不请求；用户数据源为空时仍要请求，因为插件可以单独提供数据源',
+);
+assert.doesNotMatch(
+  inputAreaSource,
+  /function orchestratorModelListConfigKey[\s\S]{0,300}sources\.length === 0\) return ''/,
+  '用户数据源为空不能让 key 为空：加载成功后刷新设置快照会触发 effect，空 key 会把刚拉到的插件模型清空',
+);
+assert.match(
+  inputAreaSource,
+  /pickerPluginRevision !== pluginRevision\) pickerLoadedOnce = false;/,
+  '插件注册表变化（激活、停用、升级）后必须重新拉取主模型目录',
 );
 assert.match(
   shellSource,

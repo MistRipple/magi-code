@@ -58,3 +58,7 @@ launchctl
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# 兼容运行时：共享依赖与预构建产物（发行时由构建流程生成）
+/scripts/compat/node_modules/
+/scripts/compat/dist/

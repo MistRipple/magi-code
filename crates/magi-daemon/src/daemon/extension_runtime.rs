@@ -37,6 +37,25 @@ fn bundled_node(executable: &Path) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// 兼容运行时目录的开发覆盖入口；发行版不设置：daemon 使用与自身可执行文件同级的 `compat/`。
+pub(super) const EXTENSION_COMPAT_ENV: &str = "MAGI_EXTENSION_COMPAT";
+
+/// 兼容运行时（翻译包的共享依赖、兼容层与准备脚本）相对 daemon 可执行文件的位置：`<daemon 目录>/compat/`。
+fn bundled_compat(executable: &Path) -> Option<PathBuf> {
+    let path = executable.parent()?.join("compat");
+    path.join("cli.mjs").is_file().then_some(path)
+}
+
+pub(super) fn resolve_compat(
+    configured: Option<std::ffi::OsString>,
+    executable: Option<PathBuf>,
+) -> Option<PathBuf> {
+    configured
+        .map(PathBuf::from)
+        .filter(|path| path.join("cli.mjs").is_file())
+        .or_else(|| executable.as_deref().and_then(bundled_compat))
+}
+
 fn resolve_node(
     configured: Option<std::ffi::OsString>,
     executable: Option<PathBuf>,
@@ -60,6 +79,7 @@ pub(super) struct ExtensionRuntime {
     group: ManagedProcessGroup,
     root: PathBuf,
     node: Option<PathBuf>,
+    compat: Option<PathBuf>,
     policy: RestartPolicy,
     running: Arc<tokio::sync::Mutex<HashMap<String, Running>>>,
     /// 各扩展的运行状态（监管状态的只读投影），界面经 API 读取；变化时发布事件。
@@ -129,6 +149,10 @@ impl ExtensionRuntime {
             group,
             root: state_root.join("extensions"),
             node,
+            compat: resolve_compat(
+                std::env::var_os(EXTENSION_COMPAT_ENV),
+                std::env::current_exe().ok(),
+            ),
             policy: RestartPolicy::default(),
             running: Arc::default(),
             board: Arc::default(),
@@ -136,6 +160,14 @@ impl ExtensionRuntime {
             native: Arc::default(),
             settings: Arc::default(),
         }
+    }
+
+    /// 翻译上游插件的工具链：随包 Node 与兼容运行时都具备时才有。
+    pub(super) fn toolchain(&self) -> Option<magi_api::PluginToolchain> {
+        Some(magi_api::PluginToolchain {
+            node: self.node.clone()?,
+            compat: self.compat.clone()?,
+        })
     }
 
     /// 绑定主对话模型目录所在的设置事实源（插件贡献的数据源写入其运行期 section）。
@@ -400,6 +432,20 @@ impl ExtensionRuntime {
             Err(error) => return failed(format!("落盘扩展文件失败: {error}")),
         };
         let mut config = LaunchConfig::new(node, host_script, entry, self.root.join("sock"));
+        if extension.compat.is_some() {
+            // 翻译包的上游代码依赖共享运行时；找不到就明确失败，不让上游自己去解析用户机器上的包。
+            let Some(compat) = self.compat.clone() else {
+                return failed(format!(
+                    "未找到兼容运行时（应位于 daemon 同级的 compat/ 目录；开发时可设置 {EXTENSION_COMPAT_ENV}）"
+                ));
+            };
+            config.compat_root = Some(compat);
+            let home = self.root.join("data").join(id);
+            if let Err(error) = std::fs::create_dir_all(&home) {
+                return failed(format!("创建插件私有数据目录失败: {error}"));
+            }
+            config.compat_home = Some(home);
+        }
         config.plugin_id = id.to_string();
         config.version = package.manifest().version.clone();
         config.digest = digest.clone();
@@ -477,7 +523,7 @@ impl ExtensionRuntime {
         }
     }
 
-    /// 把宿主运行时与扩展入口按内容摘要落盘（已存在则复用）。
+    /// 把宿主运行时与扩展代码树按包摘要落盘（目录已存在则复用）。返回宿主脚本与入口路径。
     fn materialize(
         &self,
         id: &str,
@@ -489,22 +535,42 @@ impl ExtensionRuntime {
             .join("host")
             .join(format!("host-{}.mjs", &host_digest[..16]));
         write_if_absent(&host_script, HOST_RUNTIME_SOURCE.as_bytes())?;
-        let entry = self
-            .root
-            .join("packages")
-            .join(id)
-            .join(package.digest())
-            .join("extension")
-            .join("index.mjs");
-        let source = package
-            .extension_entry()
-            .ok_or_else(|| std::io::Error::other("包没有 extension/index.mjs"))?;
-        write_if_absent(&entry, source)?;
-        Ok((host_script, entry))
+        let package_root = self.root.join("packages").join(id).join(package.digest());
+        let mut found_entry = false;
+        for (name, bytes) in package.extension_files() {
+            // 包校验已保证路径只含安全分量；这里再次按分量拼接，不信任字符串。
+            let mut destination = package_root.clone();
+            for part in name.split('/') {
+                destination.push(part);
+            }
+            write_if_absent(&destination, bytes)?;
+            found_entry |= name == "extension/index.mjs";
+        }
+        if !found_entry {
+            return Err(std::io::Error::other("包没有 extension/index.mjs"));
+        }
+        Ok((
+            host_script,
+            package_root.join("extension").join("index.mjs"),
+        ))
     }
 }
 
 impl magi_api::ExtensionStatusSource for ExtensionRuntime {
+    fn validate_settings(
+        &self,
+        plugin_id: String,
+        value: serde_json::Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        let instance = self.bus.instance(&plugin_id);
+        Box::pin(async move {
+            let instance = instance.ok_or("扩展宿主未就绪，无法校验设置")?;
+            instance
+                .validate_settings(value)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
     fn status(&self, plugin_id: &str) -> Option<PluginRuntimeStatus> {
         self.board.read().ok()?.get(plugin_id).cloned()
     }
@@ -734,6 +800,153 @@ export default async function activate(api) {
             writer.write_all(&bytes).unwrap();
         }
         PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap()
+    }
+
+    const ROUTE_ENTRY: &str = r#"
+export default async function activate(api) {
+  await api.command('noop', async () => 'ok');
+  await api.route('/status', async (input) => ({ body: { echoed: input.query } }));
+  await api.route('/hang', async (_input, ctx) => {
+    await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve, { once: true }));
+    return { body: 'aborted' };
+  });
+}
+"#;
+
+    fn route_package(id: &str, with_view: bool) -> PluginPackage {
+        let views = if with_view {
+            json!([{"id": "page", "title": "Page", "entry": "ui/index.html", "placements": ["settings"]}])
+        } else {
+            json!([])
+        };
+        // 包必须至少有一项贡献；无视图的包以一个命令满足，路由准入仍由「有无视图」决定。
+        let commands = json!([{"id": "noop", "title": "Noop", "description": "占位命令"}]);
+        let manifest: PluginManifest = serde_json::from_value(json!({
+            "sdkVersion": 2, "id": id, "version": "1.0.0", "name": "Routes", "description": "",
+            "extension": {"hooks": []},
+            "permissions": [{"kind": "extension", "targets": ["full-trust"]}],
+            "dataSchemaVersion": 1,
+            "settingsSchema": {"type": "object", "additionalProperties": false},
+            "contributions": {"views": views, "commands": commands}
+        }))
+        .unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let mut files = vec![
+            ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
+            ("extension/index.mjs", ROUTE_ENTRY.as_bytes().to_vec()),
+        ];
+        if with_view {
+            files.push(("ui/index.html", b"<!doctype html><title>x</title>".to_vec()));
+        }
+        for (name, bytes) in files {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn view_routes_follow_plugin_admission_and_are_cancelled_with_the_request() {
+        use magi_api::PluginRouteExecutor;
+        use magi_app_server_protocol::generated::{PluginRouteCallRequest, PluginRouteMethod};
+        let fixture = fixture(Some(test_node()));
+        let with_view = route_package("acme.guard", true);
+        let without_view = route_package("acme.bare", false);
+        {
+            let mut manager = fixture.manager.lock().unwrap();
+            for (package, name) in [(&with_view, "a.zip"), (&without_view, "b.zip")] {
+                let id = package.manifest().id.clone();
+                manager
+                    .install(package, PluginSource::Local { name: name.into() })
+                    .unwrap();
+                manager.enable(&id).unwrap();
+                manager
+                    .authorize(&id, package.manifest().permissions.clone())
+                    .unwrap();
+                manager.activate(&id).unwrap();
+            }
+        }
+        fixture.runtime.reconcile().await;
+        for id in ["acme.guard", "acme.bare"] {
+            fixture
+                .runtime
+                .running
+                .lock()
+                .await
+                .get(id)
+                .and_then(|entry| entry.supervisor.as_ref())
+                .expect("已启动监管")
+                .wait_for(|state| matches!(state, SupervisorState::Running { .. }))
+                .await;
+        }
+        let executor = super::super::plugin_bridge::NodeRouteExecutor::for_test(
+            Arc::clone(&fixture.manager),
+            Arc::clone(&fixture.bus),
+        );
+        let request = |path: &str, query: &str| PluginRouteCallRequest {
+            method: PluginRouteMethod::GET,
+            path: path.into(),
+            query: Some(query.into()),
+            body: None,
+        };
+        // 有视图的插件：请求经 daemon 到达宿主里的处理器。
+        let ok = executor
+            .call("acme.guard".into(), request("/status", "a=1"))
+            .await
+            .unwrap();
+        assert_eq!(ok.status, 200);
+        assert_eq!(ok.body.unwrap()["echoed"], "a=1");
+        // 没有视图的插件不开放后端路由，即使宿主里绑定了处理器。
+        let refused = executor
+            .call("acme.bare".into(), request("/status", ""))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, magi_api::ApiError::Forbidden(_)),
+            "{refused:?}"
+        );
+        // 未绑定的路径：明确 NotFound。
+        let missing = executor
+            .call("acme.guard".into(), request("/nothing", ""))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(missing, magi_api::ApiError::NotFound(_)),
+            "{missing:?}"
+        );
+        // HTTP 请求被丢弃：宿主侧的处理器收到取消，而不是跑到期限。
+        let hung = executor.call("acme.guard".into(), request("/hang", ""));
+        let started = std::time::Instant::now();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(400), hung)
+                .await
+                .is_err(),
+            "处理器在等待取消，调用不应自行结束"
+        );
+        // 取消后宿主立即可以服务下一次调用（旧调用没有占住处理器）。
+        let after = executor
+            .call("acme.guard".into(), request("/status", "b=2"))
+            .await
+            .unwrap();
+        assert_eq!(after.body.unwrap()["echoed"], "b=2");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // 插件停用后：不再接受路由调用。
+        fixture
+            .manager
+            .lock()
+            .unwrap()
+            .deactivate("acme.guard")
+            .unwrap();
+        let stopped = executor
+            .call("acme.guard".into(), request("/status", ""))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(stopped, magi_api::ApiError::Conflict(_)),
+            "{stopped:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1043,6 +1256,158 @@ export default async function activate(api) {
             .unwrap();
         fixture.runtime.reconcile().await;
         assert!(identities(&settings).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dynamic_catalog_changes_reach_the_real_tool_entry_and_stop_with_the_host() {
+        use super::super::plugin_bridge::execute_tool;
+        use magi_core::ExecutionResultStatus::{Rejected, Succeeded};
+        let fixture = fixture(Some(test_node()));
+        let settings = Arc::new(magi_settings_store::SettingsStore::new());
+        fixture.runtime.bind_settings(&settings);
+        let manifest = json!({
+            "sdkVersion": 2, "id": "acme.guard", "version": "1.0.0", "name": "Dynamic", "description": "",
+            "extension": {"hooks": [], "runtimeContributions": ["tools", "modelSources"]},
+            "permissions": [{"kind": "extension", "targets": ["full-trust"]}, {"kind": "tools", "targets": ["*"]}, {"kind": "modelSources", "targets": ["*"]}],
+            "dataSchemaVersion": 1, "settingsSchema": {"type": "object"},
+            "contributions": {"commands": [{"id": "configure", "title": "Configure", "description": ""}]}
+        });
+        let entry = br#"
+export default async function activate(api) {
+  let revision = 0, release;
+  await api.command('configure', async ({ enabled }) => {
+    await release?.();
+    const tools = enabled ? [{ id: 'late', title: 'Late', description: '', readOnly: true,
+      inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } }] : [];
+    const modelSources = enabled ? [{ id: 'proxy', title: 'Proxy', description: '' }] : [];
+    ({ revision } = await api.catalog.replace(revision, { tools, modelSources }));
+    release = enabled ? await api.tool('late', async ({ text }) => ({ echoed: text })) : undefined;
+    if (enabled) await api.modelSource.set('proxy', {
+      baseUrl: 'http://127.0.0.1:9/v1', apiKey: 'k', apiProtocol: 'openai_chat', models: [{ id: 'm1' }],
+    });
+    return 'updated';
+  });
+}
+"#;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes) in [
+            ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
+            ("extension/index.mjs", entry.to_vec()),
+        ] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        let package = PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap();
+        activate(&fixture, &package);
+        fixture.runtime.reconcile().await;
+        fixture
+            .runtime
+            .running
+            .lock()
+            .await
+            .get("acme.guard")
+            .and_then(|entry| entry.supervisor.as_ref())
+            .unwrap()
+            .wait_for(|state| {
+                matches!(
+                    state,
+                    SupervisorState::Running { .. } | SupervisorState::Failed(_)
+                )
+            })
+            .await;
+        let instance = fixture.bus.instance("acme.guard").expect("真实宿主已就绪");
+        assert!(
+            fixture
+                .manager
+                .lock()
+                .unwrap()
+                .tool_contributions()
+                .unwrap()
+                .is_empty()
+        );
+        let configure = |enabled| {
+            instance.invoke_command(
+                "configure",
+                json!({"enabled": enabled}),
+                json!({}),
+                std::time::Duration::from_secs(3),
+                std::future::pending(),
+            )
+        };
+        configure(true).await.unwrap();
+        assert_eq!(
+            fixture
+                .manager
+                .lock()
+                .unwrap()
+                .tool_contributions()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            magi_conversation_runtime::main_model_sources::sources(&settings)
+                .unwrap()
+                .len(),
+            1
+        );
+        let run = |input: &'static str| {
+            let manager = Arc::clone(&fixture.manager);
+            let bus = Arc::clone(&fixture.bus);
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                execute_tool(
+                    &manager,
+                    &bus,
+                    &handle,
+                    &magi_plugin_system::model_tool_name("acme.guard", "late"),
+                    input,
+                    &magi_tool_runtime::ToolExecutionContext::default(),
+                    &std::sync::atomic::AtomicBool::new(false),
+                )
+            })
+        };
+        let (output, status) = run(r#"{"text":"live"}"#).await.unwrap();
+        assert_eq!(status, Succeeded, "{output}");
+        assert!(output.contains("live"));
+        assert_eq!(run(r#"{"text":1}"#).await.unwrap().1, Rejected);
+        configure(false).await.unwrap();
+        assert!(
+            fixture
+                .manager
+                .lock()
+                .unwrap()
+                .tool_contributions()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            magi_conversation_runtime::main_model_sources::sources(&settings)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(run(r#"{"text":"removed"}"#).await.unwrap().1, Rejected);
+        configure(true).await.unwrap();
+        assert_eq!(run(r#"{"text":"rebound"}"#).await.unwrap().1, Succeeded);
+        fixture
+            .manager
+            .lock()
+            .unwrap()
+            .deactivate("acme.guard")
+            .unwrap();
+        fixture.runtime.reconcile().await;
+        assert!(
+            fixture
+                .manager
+                .lock()
+                .unwrap()
+                .tool_contributions()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!instance.is_alive());
     }
 
     #[tokio::test]

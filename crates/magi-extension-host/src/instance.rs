@@ -32,6 +32,10 @@ pub struct LaunchConfig {
     pub runtime_entry: PathBuf,
     /// 插件入口（包内 `extension/index.mjs`）。
     pub plugin_entry: PathBuf,
+    /// 翻译包的兼容运行时目录（随产品发行，含共享依赖）。仅翻译包设置。
+    pub compat_root: Option<PathBuf>,
+    /// 翻译包的私有数据目录（上游 DSH_HOME 指向这里）。仅翻译包设置。
+    pub compat_home: Option<PathBuf>,
     /// 套接字目录（Unix）；Windows 忽略。
     pub endpoint_dir: PathBuf,
     pub plugin_id: String,
@@ -65,6 +69,8 @@ impl LaunchConfig {
             node,
             runtime_entry,
             plugin_entry,
+            compat_root: None,
+            compat_home: None,
             endpoint_dir,
             plugin_id: String::new(),
             version: String::new(),
@@ -134,7 +140,19 @@ impl Drop for InvocationGuard {
     }
 }
 
+struct ServiceLease {
+    plugin_id: String,
+    lease: String,
+    service: Option<Arc<dyn crate::HostService>>,
+}
+impl Drop for ServiceLease {
+    fn drop(&mut self) {
+        if let Some(service) = &self.service { service.instance_ended(&self.plugin_id, &self.lease); }
+    }
+}
+
 pub struct HostInstance {
+    service_lease: ServiceLease,
     pub plugin_id: String,
     pub version: String,
     /// 插件包摘要；提示贡献的片段身份包含它。
@@ -145,6 +163,7 @@ pub struct HostInstance {
     bound: Arc<Mutex<HashSet<String>>>,
     bound_tools: Arc<Mutex<HashSet<String>>>,
     bound_commands: Arc<Mutex<HashSet<String>>>,
+    bound_routes: Arc<Mutex<HashSet<String>>>,
     next_invocation: AtomicU64,
     invocations: Arc<Mutex<HashMap<String, InvocationLease>>>,
     stop: Arc<Notify>,
@@ -177,6 +196,42 @@ impl HostInstance {
             .lock()
             .expect("bound commands lock poisoned")
             .contains(command)
+    }
+
+    /// 解析视图请求路径命中的已绑定路由：先精确匹配，再取最长前缀匹配。
+    /// 返回绑定键（`exact:/path` 或 `prefix:/path`），即宿主注册时使用的名字。
+    pub fn resolve_route(&self, path: &str) -> Option<String> {
+        let bound = self.bound_routes.lock().expect("bound routes lock poisoned");
+        let exact = format!("exact:{path}");
+        if bound.contains(&exact) {
+            return Some(exact);
+        }
+        bound
+            .iter()
+            .filter_map(|key| key.strip_prefix("prefix:").map(|prefix| (key, prefix)))
+            .filter(|(_, prefix)| path.starts_with(prefix))
+            .max_by_key(|(_, prefix)| prefix.len())
+            .map(|(key, _)| key.clone())
+    }
+
+    /// 向宿主发起一次视图后端调用；取消与期限语义同 [`HostInstance::invoke_tool`]。
+    /// `path` 是视图请求的实际路径，宿主按绑定键分发，`input` 里带回实际路径。
+    pub async fn invoke_route(
+        &self,
+        path: &str,
+        input: Value,
+        ctx: Value,
+        timeout: Duration,
+        cancelled: impl std::future::Future<Output = ()>,
+    ) -> Result<Value, RpcError> {
+        let Some(route) = self.resolve_route(path) else {
+            return Err(RpcError::new(
+                ErrorKind::MethodNotFound,
+                format!("后端路由 {path} 未被宿主绑定"),
+            ));
+        };
+        self.invoke_bound("route.invoke", "route", &route, input, ctx, timeout, cancelled)
+            .await
     }
 
     /// 向宿主发起一次工具调用。超时时通知宿主取消并返回 `DeadlineExceeded`。
@@ -321,6 +376,9 @@ impl HostInstance {
 
     /// 请求有限排空后终止整个受管进程树。
     pub async fn stop(&self) {
+        if let Some(service) = &self.service_lease.service {
+            service.instance_ended(&self.plugin_id, &self.service_lease.lease);
+        }
         let _ = tokio::time::timeout(
             Duration::from_secs(2),
             self.peer
@@ -348,6 +406,10 @@ impl HostInstance {
             .map(|_| ())
     }
 
+    pub async fn validate_settings(&self, value: Value) -> Result<(), RpcError> {
+        self.peer.request("settings.validate", json!({"generation": self.generation, "value": value}), Duration::from_secs(5)).await.map(|_| ())
+    }
+
     pub fn update_config(&self, revision: u64, values: Value) -> Result<(), RpcError> {
         self.peer.notify(
             "config.changed",
@@ -358,12 +420,14 @@ impl HostInstance {
 
 struct HostHandler {
     plugin_id: String,
+    lease: String,
     approved: HashMap<String, ApprovedHook>,
     bound: Arc<Mutex<HashSet<String>>>,
     approved_tools: HashSet<String>,
     bound_tools: Arc<Mutex<HashSet<String>>>,
     approved_commands: HashSet<String>,
     bound_commands: Arc<Mutex<HashSet<String>>>,
+    bound_routes: Arc<Mutex<HashSet<String>>>,
     ready: watch::Sender<bool>,
     service: Option<Arc<dyn crate::HostService>>,
     invocations: Arc<Mutex<HashMap<String, InvocationLease>>>,
@@ -371,6 +435,26 @@ struct HostHandler {
 
 impl Incoming for HostHandler {
     fn request(&self, method: String, params: Value) -> BoxFuture<Result<Value, RpcError>> {
+        // 动态绑定与静态绑定共用入口，元数据只从 daemon 的当前实例目录读取。
+        if matches!(method.as_str(), "register.tool" | "register.command") {
+            let name = params.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let is_tool = method == "register.tool";
+            let declared = if is_tool { self.approved_tools.contains(&name) } else { self.approved_commands.contains(&name) };
+            if !declared {
+                let service = self.service.clone();
+                let plugin = self.plugin_id.clone();
+                let lease = self.lease.clone();
+                let bound = if is_tool { self.bound_tools.clone() } else { self.bound_commands.clone() };
+                return Box::pin(async move {
+                    let service = service.ok_or_else(|| RpcError::new(ErrorKind::RegistrationDenied, "未声明的贡献"))?;
+                    service.request_with_identity(plugin, "registration.check".into(), json!({
+                        "_instance": lease, "kind": if is_tool { "tool" } else { "command" }, "name": name,
+                    })).await?;
+                    bound.lock().expect("bound lock").insert(name);
+                    Ok(json!({}))
+                });
+            }
+        }
         let result = match method.as_str() {
             "register.hook" => {
                 let name = params
@@ -406,6 +490,46 @@ impl Incoming for HostHandler {
                         ErrorKind::RegistrationDenied,
                         format!("工具 {name} 未在清单中声明或未获授权"),
                     ))
+                }
+            }
+            // 处理器释放：工具与命令可在运行期按配置上下架（例如作者把某个工具放在开关后面）。
+            // 释放只缩小已绑定集合，不能扩大获批集合；未绑定的名字视为幂等成功。
+            "unregister.tool" | "unregister.command" | "unregister.route" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let bound = match method.as_str() {
+                    "unregister.tool" => &self.bound_tools,
+                    "unregister.route" => &self.bound_routes,
+                    _ => &self.bound_commands,
+                };
+                bound.lock().expect("bound lock poisoned").remove(name);
+                Ok(json!({}))
+            }
+            // 视图后端路由：路径由扩展在运行期自报（不在清单里声明），只服务本插件自己的视图。
+            // 数量与路径形态受限，避免一个宿主无界占用绑定表。
+            "register.route" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !valid_route_key(name) {
+                    Err(RpcError::new(
+                        ErrorKind::InvalidParams,
+                        "后端路由名必须形如 exact:/路径 或 prefix:/路径（不含查询，最长 256 字节）",
+                    ))
+                } else {
+                    let mut bound = self.bound_routes.lock().expect("bound routes lock poisoned");
+                    if !bound.contains(name) && bound.len() >= MAX_BOUND_ROUTES {
+                        Err(RpcError::new(
+                            ErrorKind::RegistrationDenied,
+                            format!("后端路由数量超过上限 {MAX_BOUND_ROUTES}"),
+                        ))
+                    } else {
+                        bound.insert(name.to_string());
+                        Ok(json!({}))
+                    }
                 }
             }
             "register.command" => {
@@ -449,6 +573,7 @@ impl Incoming for HostHandler {
                         Err(RpcError::new(ErrorKind::InvalidParams, "不允许内部字段"))
                     });
                 }
+                object.insert("_instance".into(), json!(self.lease));
                 let invocation = object.remove("invocationId");
                 let lease = invocation.as_ref().and_then(Value::as_str).and_then(|id| {
                     self.invocations
@@ -538,6 +663,22 @@ impl Incoming for HostHandler {
     }
 }
 
+/// 同一宿主可绑定的后端路由上限。
+const MAX_BOUND_ROUTES: usize = 128;
+
+fn valid_route_key(key: &str) -> bool {
+    let Some(path) = key
+        .strip_prefix("exact:")
+        .or_else(|| key.strip_prefix("prefix:"))
+    else {
+        return false;
+    };
+    path.starts_with('/')
+        && path.len() <= 256
+        && !path.contains(['?', '#'])
+        && path.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
 fn random_hex(bytes: usize) -> std::io::Result<String> {
     let mut buffer = vec![0u8; bytes];
     getrandom::fill(&mut buffer).map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -569,6 +710,13 @@ pub async fn launch(
             .as_u64()
             .ok_or_else(|| LaunchError::Handshake("设置快照缺少版本".into()))?;
     }
+    let service_lease = ServiceLease {
+        plugin_id: config.plugin_id.clone(), lease: random_hex(16).map_err(LaunchError::Endpoint)?, service: config.service.clone(),
+    };
+    if let Some(service) = &config.service {
+        service.instance_started(&config.plugin_id, &service_lease.lease)
+            .map_err(|error| LaunchError::Handshake(error.to_string()))?;
+    }
     let mut approved = HashMap::new();
     for hook in &config.hooks {
         let deadline = hook.validate().map_err(LaunchError::InvalidHook)?;
@@ -597,6 +745,12 @@ pub async fn launch(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(root) = &config.compat_root {
+        command.env("MAGI_EXT_COMPAT_ROOT", root);
+    }
+    if let Some(home) = &config.compat_home {
+        command.env("MAGI_EXT_COMPAT_HOME", home);
+    }
     let mut child = group
         .spawn_tokio(&mut command)
         .map_err(LaunchError::Spawn)?;
@@ -695,16 +849,19 @@ pub async fn launch(
     let bound: Arc<Mutex<HashSet<String>>> = Arc::default();
     let bound_tools: Arc<Mutex<HashSet<String>>> = Arc::default();
     let bound_commands: Arc<Mutex<HashSet<String>>> = Arc::default();
+    let bound_routes: Arc<Mutex<HashSet<String>>> = Arc::default();
     let (ready_tx, mut ready_rx) = watch::channel(false);
     let invocations = Arc::default();
     let handler = Arc::new(HostHandler {
         plugin_id: config.plugin_id.clone(),
+        lease: service_lease.lease.clone(),
         approved: approved.clone(),
         bound: Arc::clone(&bound),
         approved_tools: config.tools.iter().cloned().collect(),
         bound_tools: Arc::clone(&bound_tools),
         approved_commands: config.commands.iter().cloned().collect(),
         bound_commands: Arc::clone(&bound_commands),
+        bound_routes: Arc::clone(&bound_routes),
         ready: ready_tx,
         service: config.service.clone(),
         invocations: Arc::clone(&invocations),
@@ -724,8 +881,15 @@ pub async fn launch(
         return Err(LaunchError::NotReady(tail_text(&stderr_tail)));
     }
 
+    if let Some(service) = &config.service {
+        if let Err(error) = service.instance_ready(&config.plugin_id, &service_lease.lease) {
+            abort(&stop); peer.close();
+            return Err(LaunchError::NotReady(error.to_string()));
+        }
+    }
     launch_guard.0 = None;
     Ok(Arc::new(HostInstance {
+        service_lease,
         plugin_id: config.plugin_id,
         version: config.version,
         digest: config.digest,
@@ -735,6 +899,7 @@ pub async fn launch(
         bound,
         bound_tools,
         bound_commands,
+        bound_routes,
         next_invocation: AtomicU64::new(1),
         invocations,
         stop,

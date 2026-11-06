@@ -419,6 +419,21 @@ fn tool_manifest() -> Value {
 }
 
 #[test]
+fn tool_descriptions_allow_long_guidance_but_stay_bounded() {
+    let mut m = tool_manifest();
+    m["contributions"]["tools"][0]["description"] = json!("工".repeat(10_000));
+    let ok = PluginPackage::from_archive(&extension_archive(&m, ENTRY));
+    assert!(ok.is_ok(), "{:?}", ok.err());
+    m["contributions"]["tools"][0]["description"] = json!("x".repeat(32 * 1024 + 1));
+    assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
+    // 其他贡献的说明上限不变。
+    let mut m = tool_manifest();
+    m["contributions"]["tools"][0]["description"] = json!("");
+    m["contributions"]["commands"] = json!([{"id":"go","title":"Go","description":"x".repeat(4097)}]);
+    assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
+}
+
+#[test]
 fn extension_tools_need_a_tools_permission_and_an_extension() {
     let ok = PluginPackage::from_archive(&extension_archive(&tool_manifest(), ENTRY));
     assert!(ok.is_ok(), "{:?}", ok.err());
@@ -435,6 +450,19 @@ fn extension_tools_need_a_tools_permission_and_an_extension() {
     let mut m = tool_manifest();
     m["contributions"]["tools"][0]["inputSchema"] = json!({"type":"string"});
     assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
+}
+
+#[test]
+fn tool_timeout_is_bounded_and_optional() {
+    let mut m = tool_manifest();
+    m["contributions"]["tools"][0]["timeoutMs"] = json!(570_000);
+    assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_ok());
+    for bad in [json!(999), json!(600_001), json!(0), json!(-5)] {
+        m["contributions"]["tools"][0]["timeoutMs"] = bad;
+        assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
+    }
+    m["contributions"]["tools"][0]["timeoutMs"] = Value::Null;
+    assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_ok());
 }
 
 fn model_source_manifest() -> Value {
@@ -479,4 +507,69 @@ fn model_sources_need_their_own_authorization_and_an_extension() {
             .collect::<Vec<_>>()
     );
     assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
+}
+
+#[test]
+fn bundled_extension_entry_has_its_own_larger_limit() {
+    fn compressed_archive(manifest: &Value, entry: &[u8], other: &[u8]) -> Vec<u8> {
+        let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in [
+            ("manifest.json", serde_json::to_vec(manifest).unwrap()),
+            ("ui/index.html", b"<!doctype html><p>dashboard</p>".to_vec()),
+            ("extension/index.mjs", entry.to_vec()),
+            ("ui/extra.js", other.to_vec()),
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+    let mut padded = b"export default async () => {};\n".to_vec();
+    let manifest = extension_manifest();
+    // 5 MiB 的打包入口超过普通文件上限，但属于合法的构建期打包产物。
+    padded.extend(std::iter::repeat_n(b'/', 5 * 1024 * 1024));
+    assert!(PluginPackage::from_archive(&compressed_archive(&manifest, &padded, b"x")).is_ok());
+    // 入口自己的上限是 16 MiB。
+    let mut too_big = b"export default async () => {};\n".to_vec();
+    too_big.extend(std::iter::repeat_n(b'/', 16 * 1024 * 1024));
+    assert!(PluginPackage::from_archive(&compressed_archive(&manifest, &too_big, b"x")).is_err());
+    // 放宽只属于入口文件：同样大小的其他文件仍受 4 MiB 限制。
+    let other = vec![b'/'; 5 * 1024 * 1024];
+    assert!(PluginPackage::from_archive(&compressed_archive(&manifest, b"export default async () => {}", &other)).is_err());
+}
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+
+#[test]
+fn icons_must_be_real_bitmaps_inside_ui_and_are_served_with_their_content_type() {
+    let mut m = manifest();
+    m["icon"] = json!("ui/icon.png");
+    let package = PluginPackage::from_archive(&archive(&m, &[("ui/icon.png", PNG)])).unwrap();
+    let (content_type, bytes) = package.icon().expect("声明的图标可读");
+    assert_eq!(content_type, "image/png");
+    assert_eq!(bytes, PNG);
+
+    // 没有声明图标的包没有图标。
+    let plain = PluginPackage::from_archive(&archive(&manifest(), &[])).unwrap();
+    assert!(plain.icon().is_none());
+
+    // 声明了却不在包内、内容与类型不符、体积超限、路径越出 ui/、或是 SVG，都明确拒绝。
+    let mut oversized = PNG.to_vec();
+    oversized.resize(256 * 1024 + 1, 0);
+    for (declared, name, bytes) in [
+        ("ui/icon.png", "ui/other.png", PNG.to_vec()),
+        ("ui/icon.png", "ui/icon.png", b"<script>alert(1)</script>".to_vec()),
+        ("ui/icon.jpg", "ui/icon.jpg", PNG.to_vec()),
+        ("ui/icon.png", "ui/icon.png", oversized),
+        ("icon.png", "icon.png", PNG.to_vec()),
+        ("ui/icon.svg", "ui/icon.svg", b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec()),
+    ] {
+        let mut m = manifest();
+        m["icon"] = json!(declared);
+        assert!(
+            PluginPackage::from_archive(&archive(&m, &[(name, bytes.as_slice())])).is_err(),
+            "{declared} 应被拒绝"
+        );
+    }
 }

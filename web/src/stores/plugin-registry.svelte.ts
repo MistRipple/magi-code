@@ -7,7 +7,9 @@
  */
 
 import { untrack } from 'svelte';
+import type { PluginInstalled } from '../shared/app-server-protocol.generated';
 import {
+  listInstalledPlugins,
   loadActivePluginCommands,
   loadActivePluginManifests,
   PLUGIN_REGISTRY_CHANGED_EVENT,
@@ -19,6 +21,8 @@ import { RUNTIME_CONNECTION_EVENT, type AgentConnectionEventDetail } from '../we
 
 interface PluginProjection {
   manifests: PluginManifestProjection[];
+  /** 已安装插件（含未激活）：设置导航据此保留停用后的插件页，让用户能在页面顶部重新开启。 */
+  installed: PluginInstalled[];
   commands: PluginCommandProjection[];
   /** 当前修订读取成功；加载中或失败时不能据旧清单判断插件“不存在”。 */
   loaded: boolean;
@@ -26,6 +30,7 @@ interface PluginProjection {
 
 const EMPTY_PROJECTION: PluginProjection = {
   manifests: [],
+  installed: [],
   commands: [],
   loaded: false,
 };
@@ -49,9 +54,9 @@ export function trackPluginProjection(): void {
   requestedRevision = revision;
   untrack(() => { projection.loaded = false; });
   const isCurrent = () => registry.revision === revision && requestedRevision === revision;
-  inflight = Promise.all([loadActivePluginManifests(), loadActivePluginCommands()])
-    .then(([manifests, commands]) => {
-      if (isCurrent()) Object.assign(projection, { manifests, commands, loaded: true });
+  inflight = Promise.all([loadActivePluginManifests(), loadActivePluginCommands(), listInstalledPlugins()])
+    .then(([manifests, commands, list]) => {
+      if (isCurrent()) Object.assign(projection, { manifests, commands, installed: list.plugins, loaded: true });
     }).catch(() => { if (isCurrent()) requestedRevision = undefined; });
 }
 

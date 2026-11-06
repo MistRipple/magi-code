@@ -6,6 +6,7 @@
 pub mod catalog;
 pub mod jobs;
 mod lifecycle;
+pub mod npm;
 mod package;
 pub mod resource;
 
@@ -18,7 +19,7 @@ pub use lifecycle::{
     PluginSource, PreparedToolCall, RetiredBuiltin,
 };
 pub use magi_app_server_protocol::{PluginManifest, PluginPermission, PluginPermissionKind};
-pub use package::{MAX_PACKAGE_BYTES, PluginPackage, validate_manifest};
+pub use package::{MAX_EXTENSION_ENTRY_BYTES, MAX_PACKAGE_BYTES, PluginPackage, validate_manifest};
 pub use resource::{PluginResource, PluginResourceStore, ResourceError};
 
 /// `plugin/{插件}/{贡献}` 形式的贡献身份：技能、视图等贡献共用。

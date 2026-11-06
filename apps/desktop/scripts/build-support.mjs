@@ -25,6 +25,7 @@ export const desktopDist = join(desktopRoot, "dist");
 export const workerDist = join(repositoryRoot, "browser-automation-worker", "dist");
 export const lighthouseRuntimeDist = join(desktopDist, "lighthouse-runtime");
 export const nodeRuntimeDist = join(desktopDist, "node-runtime");
+export const compatRuntimeDist = join(desktopDist, "compat");
 export const webDist = join(repositoryRoot, "web", "dist");
 
 const runtimePackages = ["electron", "electron-updater", "ws", "devtools-protocol", "lighthouse"];
@@ -155,6 +156,7 @@ export async function prepareReleaseMetadata() {
   }
   await appendFileHash(files, join(nodeRuntimeDist, nodeRuntimeFileName), `daemon/node/${nodeRuntimeFileName}`);
   await appendFileHash(files, join(workerDist, "index.cjs"), "browser-automation-worker/index.cjs");
+  await appendTreeHashes(files, compatRuntimeDist, "daemon/compat");
   await appendTreeHashes(files, lighthouseRuntimeDist, "browser-automation-worker");
   await appendTreeHashes(files, webDist, "web/dist");
   await appendTreeHashes(files, join(resources, "licenses"), "licenses");
@@ -242,6 +244,8 @@ export async function assertReleaseInputs() {
     assertFile(join(desktopDist, "resources", "browser-capability-manifest.json"), "能力清单"),
     assertBridgeBinaries(bridgeBinariesRoot("release"), "Rust release bridge"),
     assertFile(join(nodeRuntimeDist, nodeRuntimeFileName), "随包 Node"),
+    assertFile(join(compatRuntimeDist, "cli.mjs"), "上游插件翻译运行时"),
+    assertFile(join(compatRuntimeDist, "dist", "dsh-client-host.js"), "上游插件页面运行时"),
   ]);
   await runNodeRuntimePreflight(nodeRuntimeDist);
   await runBridgePreflight(bridgeBinariesRoot("release"), "Rust release bridge");
@@ -250,6 +254,36 @@ export async function assertReleaseInputs() {
 /** 准备扩展宿主使用的固定版本 Node（归档摘要固定在 node-runtime.json）。 */
 export async function stageExtensionNode() {
   return stageNodeRuntime(nodeRuntimeDist);
+}
+
+/**
+ * 准备上游生态插件的翻译运行时（`scripts/compat`）：翻译器源码、预构建的页面运行时，
+ * 以及按锁文件精确安装的生产依赖。依赖只来自锁文件固定的 registry 摘要；不运行任何安装脚本，
+ * 不安装可选的原生依赖。
+ */
+export async function stageCompatRuntime() {
+  const source = join(repositoryRoot, "scripts", "compat");
+  await rm(compatRuntimeDist, { recursive: true, force: true });
+  await mkdir(compatRuntimeDist, { recursive: true });
+  const entries = ["cli.mjs", "index.mjs", "core", "dsh", "pi", "runtime", "translate", "package.json", "package-lock.json"];
+  for (const entry of entries) {
+    await cp(join(source, entry), join(compatRuntimeDist, entry), { recursive: true, dereference: false });
+  }
+  const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+  await execFileAsync(
+    npmCommand,
+    ["ci", "--omit=dev", "--include=optional", "--ignore-scripts", "--no-audit", "--no-fund"],
+    { cwd: compatRuntimeDist, maxBuffer: 16 * 1024 * 1024, shell: process.platform === "win32" },
+  );
+  // npm 的内部缓存文件不属于发行物，且以点开头的 node_modules 元数据会被打包器按依赖清单特殊处理。
+  await rm(join(compatRuntimeDist, "node_modules", ".package-lock.json"), { force: true });
+  await rm(join(compatRuntimeDist, "node_modules", ".bin"), { recursive: true, force: true });
+  // 页面运行时由 esbuild 预构建（需要开发依赖），在源目录构建后复制，不在用户机器上构建。
+  await execFileAsync(npmCommand, ["run", "build:client"], { cwd: source, maxBuffer: 16 * 1024 * 1024, shell: process.platform === "win32" });
+  await mkdir(join(compatRuntimeDist, "dist"), { recursive: true });
+  await cp(join(source, "dist", "dsh-client-host.js"), join(compatRuntimeDist, "dist", "dsh-client-host.js"));
+  const { access: probe } = await import("node:fs/promises");
+  await probe(join(compatRuntimeDist, "node_modules", "@deepseek-ai", "cordis", "package.json"));
 }
 
 /** Node 许可证与来源声明随发行物一起交付。 */

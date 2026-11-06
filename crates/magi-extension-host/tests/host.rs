@@ -750,3 +750,173 @@ async fn job_runs_use_signed_owners_and_enforce_model_budgets() {
     }
     host.stop().await;
 }
+
+#[tokio::test]
+async fn tools_can_be_unbound_and_rebound_at_runtime_without_widening_approval() {
+    let mut env = env("toggle", Vec::new());
+    env.config.tools = vec!["gated".into()];
+    env.config.commands = vec!["toggle".into(), "swap".into()];
+    let bus = ExtensionBus::new(BusPolicy::default());
+    bus.register_plugin("acme.guard", &[]).unwrap();
+    let instance = up(&env, &bus).await;
+    assert!(instance.is_tool_bound("gated"));
+    let toggle = |id: &'static str| {
+        let instance = Arc::clone(&instance);
+        async move {
+            instance
+                .invoke_command(
+                    "toggle",
+                    json!({"text": ""}),
+                    json!({"invocationId": id}),
+                    Duration::from_secs(5),
+                    std::future::pending(),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(toggle("t-1").await["content"], "off");
+    assert!(!instance.is_tool_bound("gated"), "释放后工具不可调用");
+    let refused = instance
+        .invoke_tool(
+            "gated",
+            json!({}),
+            json!({"invocationId": "c-1"}),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::MethodNotFound);
+    assert_eq!(toggle("t-2").await["content"], "on");
+    assert!(instance.is_tool_bound("gated"), "旧释放函数不得收回新绑定");
+    let again = instance
+        .invoke_tool(
+            "gated",
+            json!({}),
+            json!({"invocationId": "c-2"}),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again["output"], "on-again");
+}
+
+#[tokio::test]
+async fn rebinding_in_the_same_tick_keeps_the_new_binding() {
+    let mut env = env("toggle", Vec::new());
+    env.config.tools = vec!["gated".into()];
+    env.config.commands = vec!["toggle".into(), "swap".into()];
+    let bus = ExtensionBus::new(BusPolicy::default());
+    bus.register_plugin("acme.guard", &[]).unwrap();
+    let instance = up(&env, &bus).await;
+    assert!(instance.is_tool_bound("gated"));
+    let swapped = instance
+        .invoke_command(
+            "swap",
+            json!({"text": ""}),
+            json!({"invocationId": "s-1"}),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(swapped["content"], "swapped");
+    assert!(
+        instance.is_tool_bound("gated"),
+        "新注册先于旧释放发出时，旧释放不得收回新绑定"
+    );
+    let answer = instance
+        .invoke_tool(
+            "gated",
+            json!({}),
+            json!({"invocationId": "c-3"}),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer["output"], "swapped");
+}
+
+#[tokio::test]
+async fn view_routes_bind_exact_and_prefix_dispatch_and_release_at_runtime() {
+    let env = env("routes", Vec::new());
+    let bus = ExtensionBus::new(BusPolicy::default());
+    bus.register_plugin("acme.guard", &[]).unwrap();
+    let instance = up(&env, &bus).await;
+    let call = |path: &'static str, id: &'static str| {
+        let instance = Arc::clone(&instance);
+        async move {
+            instance
+                .invoke_route(
+                    path,
+                    json!({"method": "GET", "path": path, "query": "a=1", "body": null}),
+                    json!({"invocationId": id}),
+                    Duration::from_secs(5),
+                    std::future::pending(),
+                )
+                .await
+        }
+    };
+    // 精确匹配：处理器收到请求描述，状态码缺省为 200。
+    let status = call("/status", "r-1").await.unwrap();
+    assert_eq!(status["status"], 200);
+    assert_eq!(status["body"]["seen"]["query"], "a=1");
+    // 前缀匹配取最长前缀；精确绑定优先于前缀。
+    let prefixed = call("/items/42", "r-2").await.unwrap();
+    assert_eq!(prefixed["status"], 201);
+    assert_eq!(prefixed["contentType"], "application/x-ndjson");
+    assert_eq!(prefixed["body"], "/items/42\n");
+    assert_eq!(call("/items/special", "r-3").await.unwrap()["body"], "exact-wins");
+    // 处理器抛错是视图可见的 500，不是协议错误。
+    let boom = call("/boom", "r-4").await.unwrap();
+    assert_eq!(boom["status"], 500);
+    assert!(boom["body"]["error"].as_str().unwrap().contains("处理器失败"));
+    // 未绑定的路径明确拒绝，不落到别的处理器。
+    assert_eq!(call("/nothing", "r-5").await.unwrap_err().kind(), ErrorKind::MethodNotFound);
+    // 运行期释放：释放后不可再调用。
+    assert_eq!(call("/gone", "r-6").await.unwrap()["body"], "here");
+    assert_eq!(call("/drop", "r-7").await.unwrap()["body"], "dropped");
+    assert!(instance.resolve_route("/gone").is_none(), "释放后路由不再命中");
+    assert_eq!(call("/gone", "r-8").await.unwrap_err().kind(), ErrorKind::MethodNotFound);
+}
+
+#[tokio::test]
+async fn view_route_calls_are_cancelled_with_their_http_request() {
+    let env = env("routes", Vec::new());
+    let bus = ExtensionBus::new(BusPolicy::default());
+    bus.register_plugin("acme.guard", &[]).unwrap();
+    let instance = up(&env, &bus).await;
+    let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let started = std::time::Instant::now();
+    let pending = {
+        let instance = Arc::clone(&instance);
+        tokio::spawn(async move {
+            instance
+                .invoke_route(
+                    "/slow",
+                    json!({"method": "GET", "path": "/slow", "query": "", "body": null}),
+                    json!({"invocationId": "slow-1"}),
+                    Duration::from_secs(20),
+                    async move {
+                        let _ = cancelled.await;
+                    },
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cancel.send(()).unwrap();
+    let error = pending.await.unwrap().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert!(started.elapsed() < Duration::from_secs(5), "取消不得等到处理器的 30 秒");
+}
+
+#[tokio::test]
+async fn malformed_or_excessive_route_registrations_are_refused() {
+    let env = env("routes-bad", Vec::new());
+    let error = launch(&env.group, env.config.clone(), 1).await;
+    assert!(error.is_err(), "非法路由名必须让激活失败");
+}

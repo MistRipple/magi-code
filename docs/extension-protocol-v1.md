@@ -1,10 +1,10 @@
 # Magi 扩展协议 v1
 
-更新：2026-11-03。本文描述当前受信 Node 宿主的公开合同；架构、所有权及后期路线见[插件系统设计](plugin-system-requirements-design.md)第 5.5～5.10 节。必须／不得为硬约束，应为默认行为，可为允许选项。实现依据为 [`protocol.rs`](../crates/magi-extension-host/src/protocol.rs)、[`instance.rs`](../crates/magi-extension-host/src/instance.rs)、[`host.mjs`](../crates/magi-extension-host/runtime/host.mjs)；未交付的旧方案不构成 API。
+更新：2026-11-06。本文描述当前受信 Node 宿主的公开合同；架构、所有权及后期路线见[插件系统设计](plugin-system-requirements-design.md)第 5.5～5.10 节。必须／不得为硬约束，应为默认行为，可为允许选项。实现依据为 [`protocol.rs`](../crates/magi-extension-host/src/protocol.rs)、[`instance.rs`](../crates/magi-extension-host/src/instance.rs)、[`host.mjs`](../crates/magi-extension-host/runtime/host.mjs)；未交付的旧方案不构成 API。
 
 ## 0. 状态与适用范围
 
-【现状】SDK 2、传输协议 1.0、扩展 API 1.0。daemon 独立托管每插件一个 Node 进程；支持钩子、模型工具、用户命令、持久计划及反向服务。SDK 1／QuickJS、迁移 VM、工作流与会话引擎替换不提供。pi／DSH 翻译器后置；MCP 完整内置于 Magi，不经插件注册。
+【现状】SDK 2、传输协议 1.0、扩展 API 1.0。daemon 独立托管每插件一个 Node 进程；支持钩子、模型工具、用户命令、持久计划及反向服务。SDK 1／QuickJS、迁移 VM、工作流与会话引擎替换不提供。DSH 运行时兼容层正在按设计文档第 11.1 节改造，pi 运行器后置；MCP 完整内置于 Magi，不经插件注册。
 
 【现状】下表列出的 15 个钩子名称均有实际接线。`input`／`subagent.spawn` 仅允许 guard，`model.request` 仅允许 observe；清单声明未接线模式时安装拒绝。不能把目录中未来可能支持的模式当作已交付合同。
 
@@ -81,6 +81,7 @@ daemon 响应形状：
 | `command.invoke` | request | 用户命令；返回 `{content}` 或 `{isError:true,content}` |
 | `job.run` | request | 原生计划触发，复用已绑定命令；有真实 Turn、作业身份和预算 |
 | `config.changed` | notification | `{revision,values}`，只接纳更高版本并更新只读配置快照 |
+| `settings.validate` | request | `{generation,value}`，调用扩展注册的设置校验器；实例代次不符或未注册校验器时明确失败 |
 | `host.cancel` | notification | `{invocationId,reason}`，中止对应 `ctx.signal` |
 | `host.ping` | request | 心跳，daemon 等待最多 2 秒 |
 | `host.shutdown` | request | 有限停止；随后由 daemon 回收受管进程树 |
@@ -90,10 +91,13 @@ daemon 响应形状：
 | 方法 | Node API | 当前合同 |
 | --- | --- | --- |
 | `register.hook` | `api.on(name,handler)` | 只能绑定清单获批钩子 |
-| `register.tool` | `api.tool(id,handler)` | 只能绑定清单且获 tools 授权的工具 |
-| `register.command` | `api.command(id,handler)` | 只能绑定清单公开命令 |
+| `register.tool` | `api.tool(id,handler)` | 只能绑定清单或当前实例运行目录中声明且获 tools 授权的工具 |
+| `register.command` | `api.command(id,handler)` | 只能绑定清单或当前实例运行目录中的公开命令 |
+| `catalog.replace` | `api.catalog.replace(expectedRevision,catalog)` | 整体替换当前实例的动态目录，返回 `{revision}`；校验清单授权上界、唯一 ID、schema、大小及实例租约，见第 5 节 |
+| `unregister.tool/command` | `api.tool`/`api.command` 返回的释放函数 | 收回本实例的处理器绑定；只缩小已绑定集合，未绑定的名字幂等成功。未绑定的工具对模型不可见，调用返回 `MethodNotFound` |
 | `resource.read/write` | `api.resource.read(id)`／`write(id,expectedVersion,value)` | 当前插件全局资源，逐次 storage 授权与 CAS |
 | `settings.read/write` | `api.settings.read()`／`write(expectedVersion,value)` | `__settings` 授权、schema 校验、CAS 与事件同步 |
+| `settings.describe` | `api.settings.describe()` | 返回 `{schema}`，包含当前实例已接纳的运行期设置 schema |
 | `model.invoke` | `api.model.invoke(input)` | `{prompt,roleId?,credentialRef?,maxOutputTokens?}`，models 授权、原生模型解析和账本 |
 | `credential.ref` | `api.credential.ref({roleId?})` | 返回模型绑定引用，不返回 secret；只由 model.invoke 消费 |
 | `session.snapshot` | `api.session.snapshot(input)` | 仅签发会话；`sessionId?`、`afterTurnSeq?`、`limit?`；最多 10 Turn，每 Turn 最多 20 条截断文本 |
@@ -110,9 +114,15 @@ daemon 响应形状：
 
 ## 5. 注册
 
-清单声明、用户授权和包摘要先决定获批集合，宿主只能绑定该集合内的处理器。运行时不能扩大集合或降低 guard 模式。插件工具名由 Magi 生成，作者不依赖模型侧编码后的名称。
+清单声明、用户授权和包摘要决定能力上界。静态贡献直接来自清单；动态贡献需要清单的 `extension.runtimeContributions` 显式列出 `tools`、`commands`、`modelSources` 或 `settings`。只有声明对应动态贡献种类时，`tools`／`modelSources` 权限才允许 `"*"` 目标；它不授予模型调用、存储或其他能力。钩子仍完全静态，不能降低 guard 模式。插件工具名由 Magi 生成，作者不依赖模型侧编码后的名称。
+
+`catalog.replace` 接收 `{tools?,commands?,modelSources?,settingsSchema?}`；省略的数组按空数组处理，设置 schema 省略或为 null 时使用安装清单。revision 从每个新实例的 0 开始，成功提交递增，版本冲突或任何校验失败都不改变旧目录。整个目录最多 512 KiB，合并静态贡献后仍受清单数量、共享 ID 和 schema 约束。先提交目录，再调用 `api.tool`／`api.command` 绑定；撤销时先释放处理器，再提交新目录。移除模型来源声明也会清除该来源已发布的端点和模型。
+
+初始化阶段的动态目录仅供本实例校验与绑定，`host.ready` 后才进入对外贡献投影。动态目录不写入安装包或持久设置，重启后重新提交。daemon 为每个实例签发独立租约：旧实例不能修改新目录、标记新实例就绪或清理新来源。停用或撤权一经提交，旧租约永久失效；重新授权并激活也不能恢复它。
 
 同一插件只激活一个包摘要。停用、撤权、升级先关闭准入并停止旧宿主；注册随实例释放。没有独立的持久动态注册表，也没有通配远程目录注册。
+
+`api.onConfig(listener)` 按通知顺序交付 `{version,value}`，`api.onDispose(disposer)` 注册回收动作；两者返回取消监听函数。入口也可返回一个 disposer 或 `{dispose}`。`api.settings.onValidate(handler)` 只能注册一个校验器；它补充 daemon 的 JSON Schema 校验。`api.fail(error)` 报告无法继续的运行失败，由原宿主监管回收并按既有策略处理。
 
 ## 6. 钩子合同
 

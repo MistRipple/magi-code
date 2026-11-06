@@ -5,6 +5,7 @@ import {
   buildWebAssets,
   cleanDesktopOutputs,
   prepareReleaseMetadata,
+  stageCompatRuntime,
   stageExtensionNode,
   stageLighthouseRuntime,
 } from "./build-support.mjs";
@@ -19,6 +20,7 @@ export async function buildDesktopRelease() {
   ]);
   await stageLighthouseRuntime();
   await stageExtensionNode();
+  await stageCompatRuntime();
   const manifest = await prepareReleaseMetadata();
   await assertReleaseInputs();
   process.stdout.write(

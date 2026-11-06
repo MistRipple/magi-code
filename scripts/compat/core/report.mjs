@@ -2,16 +2,17 @@
 //
 //   shim      兼容层自己提供实现（纯 JS 适配），不依赖 Magi 新能力
 //   mapped    已有对应的 Magi 公开能力，可直接翻译
-//   planned   Magi 还没有对应能力；翻译前必须先交付它
+//   planned   映射已设计、Magi 有对应落点，但翻译器尚未实现；实现前翻译被阻塞
+//   partial   只能覆盖上游语义的一部分（范围缩小或字段子集）；与 dropped 同等对待，必须显式接受
 //   dropped   Magi 不提供；翻译后该功能丢失，必须如实告知用户
 //   bundled   纯 JS 依赖，构建期打进单入口
 //   unknown   没有登记的能力；必须人工评审后归类
 
-export const STATUSES = ['mapped', 'shim', 'bundled', 'planned', 'dropped', 'unknown'];
+export const STATUSES = ['mapped', 'shim', 'bundled', 'planned', 'partial', 'dropped', 'unknown'];
 
 /**
  * @typedef {object} ReportEntry
- * @property {string} kind imports | calls | injects | native
+ * @property {string} kind imports | calls | injects | events | native
  * @property {string} name
  * @property {string} status
  * @property {string} target 对应的 Magi 能力或处理方式
@@ -36,6 +37,7 @@ export function summarize(entries) {
 
 /** 必需能力：命中这些类别的条目只要不是 mapped/shim/bundled，就视为阻塞翻译。 */
 export function verdictFor(entries, required) {
+  // partial 不算满足：只能覆盖一部分语义的能力，不能被当作“可完整翻译”。
   const satisfied = new Set(['mapped', 'shim', 'bundled']);
   const blocked = entries.filter((entry) => entry.status === 'unknown'
     || (required.includes(entry.category) && !satisfied.has(entry.status)));
@@ -50,7 +52,7 @@ export function renderText(report) {
     '',
   ];
   const internal = report.entries.filter((entry) => entry.category === 'internal');
-  for (const status of ['unknown', 'planned', 'dropped', 'shim', 'mapped', 'bundled']) {
+  for (const status of ['unknown', 'planned', 'partial', 'dropped', 'shim', 'mapped', 'bundled']) {
     const group = report.entries.filter((entry) => entry.status === status && entry.category !== 'internal');
     if (group.length === 0) continue;
     lines.push(`## ${status}（${group.length}）`);

@@ -12,7 +12,7 @@
 - 【目标】插件能直接使用文件、网络、进程；daemon 服务负责 Magi 业务所有权，不是 OS 沙箱。
 - 【目标】扩展只能阻止或提出改写；最终权限、审批、日志和结果由 daemon 决定。
 - 【目标】子代理保留自定义角色与模型绑定；不允许扩展静默替换模型。
-- 【目标】pi／DSH 翻译器及兼容来源开关推迟到本地系统稳定之后；当前不提供占位功能。
+- 【现状】DSH 翻译器已随产品提供，用户直接安装上游发布的 npm 包，由 Magi 在安装期翻译（6.0）；pi 翻译器尚未提供，只能浏览其搜索结果，安装被明确拒绝。
 - 【现状】Windows demo、Windows 实机与正式安装包验收后置；本机开发验收不等于这些平台已通过。
 - 【目标】工作流／会话引擎替换、数据转换 VM、SDK 1 兼容均不恢复。
 
@@ -35,7 +35,7 @@
 | 目标 | ExtensionBus | 钩子分发与提案裁决入口，不是第二个业务事件日志 |
 | 目标 | canonical 事实 | 原有 Session／Turn／Task／审批／用量存储提交的唯一业务事实 |
 | 目标 | 插件作业 | daemon 计划触发的命令 Turn，携带计划、执行身份和预算 |
-| 目标 | 翻译包 | 固定上游版本、适配层和已构建依赖组成的 Magi 包；不带第二个 agent 内核 |
+| 现状 | 翻译包 | 安装期由翻译器从上游 npm 包生成的标准 Magi 包：上游文件逐字节保留，兼容层与共享依赖随产品发行；不带第二个 agent 内核 |
 
 ### 1.3 连续编号需求与非目标
 
@@ -56,7 +56,7 @@
 | 目标 | R13 | 版本、能力范围、拒绝项与验证报告可核对 |
 | 目标 | R14 | 作者只使用公开接口开发、打包、诊断和分发，不需要修改 Magi |
 
-【目标】非目标：替换或 Rust 复刻 DSH 内核；任意上游原包直接兼容；扩展写 canonical 事件或批准审批；任意原生二进制／Node 原生模块；安装时运行 npm／git 构建或第三方脚本；恢复 QuickJS、工作流引擎和数据转换通道。
+【目标】非目标：替换或 Rust 复刻 DSH 内核；任意上游原包直接兼容；扩展写 canonical 事件或批准审批；任意原生二进制／Node 原生模块；安装时运行 npm／git 的安装脚本或第三方构建脚本（翻译器只在受限子进程里执行一次上游入口以记录注册，不运行 postinstall）；恢复 QuickJS、工作流引擎和数据转换通道。
 
 ## 2. 阶段 A：现状审计与缺陷收敛
 
@@ -106,7 +106,7 @@
 | 现状·已运行验证 | G8 | P2 | 长状态路径超过 Unix socket 上限已修，短端点与 0600 回归通过；[transport.rs:10](../crates/magi-extension-host/src/transport.rs#L10) |
 | 现状·已运行验证 | G9 | P2 | 作业取消发生于 Turn 接纳前会遗留 pending；现显式结算，并有回归；[plugin_jobs.rs:151](../crates/magi-api/src/plugin_jobs.rs#L151) |
 | 现状·已运行验证 | G10 | P1 | 默认凭据引用错误读取全局模型字段；现复用会话／角色模型解析，真实 HTTP 模型调用通过；[原生服务:184](../crates/magi-conversation-runtime/src/task_execution_dispatcher/extension_services.rs#L184) |
-| 现状·静态核对 | G11 | P2 | 历史改写提示和计划管理 UI 已接入，展示 daemon 事实、来源、目标会话与预算；[ConversationTurn:120](../web/src/components/ConversationTurn.svelte#L120)、[PluginJobs](../web/src/components/PluginJobs.svelte)；真实布局验收范围见第 12 节 |
+| 现状·已运行验证 | G11 | P2 | 历史改写提示已接入；设置界面不再提供计划管理表单（原计划 UI 已移除，daemon 的作业接口与调度保持不变）；[ConversationTurn:120](../web/src/components/ConversationTurn.svelte#L120)；界面验收见第 12 节 |
 | 待定 | G12 | P2 | 官方签名公钥及发布资产由发布者提供；当前空目录不得显示为验签通过；[center.rs](../crates/magi-api/src/routes/plugins/center.rs) |
 
 ## 3. 阶段 B：上游对标与自有体系判断
@@ -257,24 +257,56 @@
 
 【目标】信任告知必须说明：可读写文件和凭据、联网、派生进程；Magi 无法限制所有直接副作用。Magi 的 models/storage/tools 授权只控制公开业务服务，不保证恶意完全受信代码遵守它。
 
-## 6. 阶段 E：翻译器与兼容来源
+## 6. 阶段 E：翻译器与上游来源
 
-### 6.0 当前进度与工厂结构（2026-11-03）
+【目标】2026-11-06 合同修订：翻译器是随 Magi 发行的**运行时生态兼容层**。用户安装与升级上游原包；原代码在受信 Node 中执行，服务调用、动态注册、事件、配置与客户端宿主接口在运行时适配到 Magi 的公开合同。不维护插件改写版，不以安装时执行一次 `apply` 或配置排列组合证明贡献完整性。以下早期安装期记录与单插件成功记录只能证明当时的样例路径；不得作为完整兼容声明。改造计划与退出条件见 11.1。
 
-【现状·已运行验证】翻译器从“静态兼容分析”起步，入口 `scripts/compat/`：`core/registry.mjs` 是翻译器工厂注册表（`register(kind, factory)`、`create(kind)`、`detect(dir)`；识别不出或并列时明确失败，不猜），每种上游生态只在 `index.mjs` 注册一个工厂；`core/scan.mjs` 用语法树扫描导入、`ctx.*` 调用链与 `inject` 服务，不执行上游代码；`core/report.mjs` 规定每项能力必须落在 mapped／shim／bundled／planned／dropped／unknown 之一，必需能力里出现 planned／dropped／unknown 即阻塞翻译；`dsh/` 是首个翻译器，`dsh/catalog.mjs` 是 DSH→Magi 对照表。运行：`node scripts/compat/cli.mjs inspect <插件目录> --require llm`，测试：`npm run test:compat`。pi 翻译器之后只需新增 `pi/` 并注册工厂；DSH 与 pi 共用的 pi-ai 适配层放在共享层，不在两边各写一份。
+### 6.0 DSH 翻译器的设计合同（2026-11-05）
 
-【现状·已运行验证】对 dsh-connect-workbuddy 5.18.0（95 个源文件、约 5.7 万行）的分析结论：模型提供者注册（`ctx.llm.registerAdapter`／`registerConfigurableProviders`／`registerModelDiscovery`，依赖 pi-ai 适配层）是核心，对应 Magi 已交付的“插件向主对话追加模型数据源”（`modelSources` 权限与 `api.modelSource`；翻译器侧生成提交代码仍为 planned）；浏览器端 React 界面、HTTP 路由、会话投影、槽位与多语言共 18 项 dropped；工具、命令、`systemPrompt` 可映射但需构建期静态声明（planned）；日志、生命周期、服务查找、设置由兼容层 shim。**尚未实现**：兼容层运行时（Cordis 子集）、构建打包、产物与兼容报告随包。
+【现状·已运行验证】用户安装的是上游官方发布的 npm 包本身，不是 Magi 维护的另一份翻译副本。安装在 daemon 内分四步：向 npm registry 取包元数据并下载 tarball；核对 `dist.integrity`（sha512）并安全解包（拒绝路径穿越、符号链接、特殊文件，数量与体积有界，不运行任何脚本）；调用随产品发行的翻译器（随包 Node 加 `compat/cli.mjs prepare`）生成标准 Magi 包；把该包交给与其他来源完全相同的预览、授权和生命周期。翻译是确定的：同一上游版本与同一兼容运行时得到同一摘要，所以预览确认的摘要在安装时重新翻译后核对，服务端不缓存产物，也不维护第二份目录。接口为 `GET /api/plugins/upstream?q=`、`POST /api/plugins/upstream/preview`、`POST /api/plugins/upstream/install`，来源标记为 `upstream`（`生态:包名@精确版本`）。
 
+【目标】`dsh-connect-workbuddy` 只是第一个验收样本，翻译器内不得出现针对它的分支或补丁；样本之外必须有独立夹具覆盖同一机制。
 
-> **状态：推迟（2026-11-02 决定）。** 本节及路线表的 P3（pi）、P4（DSH）是后期工作，当前不实现；先让本地插件系统稳定可用。以下是启动时的设计输入，不是已排期的交付。
+【现状·已运行验证】翻译器按工厂注册（`scripts/compat/core/registry.mjs`）。共享层负责产物扫描、能力报告、清单生成、可复现打包；生态层（`dsh/`、`pi/`）只提供识别、能力对照表和兼容层。上游的 `./client` 界面脚本原样放入 `ui/`，由随产品预构建的页面运行时提供宿主服务；上游没有界面才由设置 schema 生成通用页。
 
-### 6.1 适配层加构建期打包
+【现状·已运行验证】DSH 兼容层在 Magi 扩展宿主内运行**真实的 Cordis 与 `@deepseek-ai/dsh-llm` 运行时**，不自写 Cordis 子集；共享依赖由 `scripts/compat/package-lock.json` 按精确版本固定，发行时用 `npm ci --omit=dev --omit=optional --ignore-scripts` 安装进 `daemon/compat/`。兼容层只补宿主服务（`tools`、`commands`、`settings`、`webServer`、`attachments`），其余行为沿用上游代码，避免仿写与上游漂移。
 
-【目标】提供 @magi/compat-pi、@magi/compat-dsh 与离线发布构建工具；重定向宿主导入到适配层，将上游扩展、固定依赖、许可证与适配层一起构建为 Magi 包。适配层只用公开 API；依赖的 Cordis 框架可以随适配层打包，但不得顺带挂载 DSH 会话/loop/审批/持久化服务成为第二个内核。
+| 状态 | DSH 服务或 API | 映射 | 约束 |
+| --- | --- | --- | --- |
+| 目标 | `llm.registerAdapter` / `registerConfigurableProviders` / `registerModelDiscovery` | 经 `api.modelSource.set` 提交主对话数据源 | 适配器的真实上游不必是标准协议：兼容层在宿主内起仅本机监听、带随机 Bearer 的 OpenAI 兼容端点，适配器 `stream()` 输出的 DSH 块在端点转成 OpenAI 流，`apiKey` 为该 Bearer。数据源条目携带上下文窗口、输入模态、推理档位（见 5.7） |
+| 现状 | `tools.register` | 清单 `contributions.tools` + `api.tool` | 工具必须在翻译期静态声明：翻译器在受限子进程里**实际执行**一次 `apply` 并记录注册的工具名、描述与参数 schema，写入清单；运行期按名字绑定。运行期才出现、翻译期未记录的工具明确拒绝 |
+| 目标 | `commands.register` | 清单 `contributions.commands` + `api.command` | 同上 |
+| 目标 | `settings`、`ctx.settings` | `settingsSchema` 与 `api.settings` | Schemastery 在翻译期导出为 JSON Schema；上游有界面时原样挂载，否则由翻译器生成通用设置页并打入 `ui/`，都只用公开视图桥 |
+| 目标 | `webServer.register` | 视图桥操作 | 浏览器端界面调用的 HTTP 路由改为经视图桥的受限操作转发给宿主内的同一处理器；不开放任意 daemon API |
+| 目标 | 浏览器端 React 界面（`lib/client.js`） | 重新打包为 `ui/` 页面 | 依赖 DSH 客户端槽位的部分明确报告，由兼容层提供最小槽位容器 |
+| 目标 | `attachments`、`tokenMeter`、`compaction`、`agents`、`sessionProjections`（`ctx.get`） | 无 | 无对应公开接口：运行期访问明确抛出“宿主服务不可用”，不返回空值；报告列为 dropped |
+| 目标 | 包内原生载荷与 `child_process` 加载宿主机器上的程序 | 原生载荷拒绝；运行外部程序属作者代码 | 不随包分发二进制；外部程序是否存在由用户机器决定，报告如实标注 |
 
-【目标】构建工具生成逐项 API 清单、依赖图、上游和适配层精确版本、源码及产物摘要、平台要求和兼容报告。发现不支持或无法识别的动态导入/API 直接失败，不生成“成功但少功能”的包。静态分析不能证明任意 JS 的全部运行分支：运行时仍严格拒绝未知 API；不得以静态构建成功冒充兼容证明。未执行到的分支在报告标为未覆盖。
+【现状·已运行验证】翻译期执行 `apply` 发生在 Node 权限模型的子进程里：默认拒绝网络、子进程、Worker 与原生插件，文件系统只放行翻译运行时与上游目录，环境变量不继承（凭据不进入被记录的上游代码），60 秒超时。Node 官方文档说明权限模型是防误操作的护栏而不是对抗性沙箱，所以这一步不能被表述为"上游代码被隔离"；运行期的上游代码与其他 Magi 扩展一样以用户权限运行（完全信任），安装预览已按完全信任披露。翻译失败的条件：必需能力里有 `planned`、`dropped`、`unknown`；翻译期记录到的注册与静态扫描不一致；产物超出包限制；上游界面声明了槽位却没有任何 Magi 会渲染的槽位。翻译在 daemon 内串行执行，单次上限 180 秒。
 
-【目标】构建在作者或 Magi 维护的隔离构建环境进行；本机安装只接收产物，不运行 npm/git 构建脚本。Magi 不提供本机一键翻译任意上游源码：翻译只发生在作者或 Magi 维护的构建环境，作者用发布工具生成并分发自己的翻译包。
+【现状·已运行验证】已有静态分析：`core/registry.mjs` 工厂注册表（识别不出或并列明确失败）、`core/scan.mjs` 语法树扫描、`core/report.mjs` 状态报告（mapped／shim／bundled／planned／dropped／unknown）、`dsh/` 对照表；`node scripts/compat/cli.mjs inspect <目录> --require llm`，`npm run test:compat`。
+
+【现状·已运行验证】对 `dsh-connect-workbuddy@5.18.1` npm 产物（早期实测，版本已由上段 5.18.2 取代）（`lib/index.js` 约 66.7 万字符，已构建、未压缩）的实测：16 条 `webServer` 路由、3 个工具（`workbuddy_draw_image`、`workbuddy_draw_video`、`codebuddy_ask`，后两个受配置开关控制）、1 个命令（`codebuddy`）、2 个适配器、1 个目录、1 个模型发现；esbuild 打包（含 `next` 线的 dsh 依赖和 pi-ai 1.5.0）单文件 5.7 MB（压缩前），其中 pi-ai 及其各厂商 SDK 约 4.4 MB。
+
+【现状·已运行验证】2026-11-05 真机验收（macOS，真实 WorkBuddy 登录态，未使用 mock）：早期的离线构建方案（`cli.mjs build`，已由安装期翻译取代并移除）取得上游（核对 npm integrity）、在隔离子进程记录注册、打成 `magi.dsh-connect-workbuddy`（3 个工具、1 个命令、2 个模型数据源、16 条路由明确放弃，入口 2.8 MB 压缩后）。依赖目录按上游对等范围精确固定：cordis 4.1.0、schemastery 3.19.0、dsh-* 0.2.2-rc.1、pi-ai 1.5.0、react 18；`next` 线的 cordis 4.0.6-alpha.2 与 dsh-llm 0.2.2-rc.1 的对等要求（`~4.1.0`）冲突，不能混用。该包经公开 API 预览、安装、授权、启用、激活后运行态为 `running`、崩溃 0 次；WorkBuddy 国内版 16 个模型进入主对话数据源目录；会话选用 `hy3` 完成真实对话（输入 20875／输出 25 Token）；`workbuddy_draw_image` 经 Magi 工具审批（`allow_once`）后真实出图并扣 5.71 积分。未验证：`workbuddy_draw_video`、`codebuddy_ask`、国际版账号、设置页在 Electron 内的渲染、Windows。
+
+【现状·已运行验证】真机暴露的两个问题已修：(1) 包校验把所有贡献说明限在 4096 字节，而真实工具 `workbuddy_draw_image` 的使用指引为 16843 字节，翻译器原先静默截断到 4000 字符，会让模型拿不到完整约束；现把工具说明上限提到 32 KiB（schema、包校验、生成类型同步），其余贡献仍为 4096，翻译器超限时明确失败而不截断。(2) 记录期必须用「开关全开」的配置变体才能发现受开关控制的工具，只用默认配置会得到 0 个工具而「成功」；现由翻译器自动追加该变体（见 6.1）。
+
+【现状·已运行验证】2026-11-05 在本地打包的 Magi.app（`npm run desktop:package -- --dir`，随包 daemon 与 Node，独立状态目录）内复验，仅国内版：`codebuddy_ask` 经审批后调用 WorkBuddy 随包 CLI，返回 `ok=true`、reply `pong`（21088 输入／38 输出 Token）；`workbuddy_draw_video`（`kling-video-v3`、5 秒、720P）真实出片，扣 128.57 积分，文件为 H.264／AAC、1280×720、约 5 秒；工具调用在清单未声明 `timeoutMs` 时按 60 秒默认期限，本次视频任务跑完仍成功，期限对更长任务是否足够未验证。
+
+【现状·已运行验证】复验暴露并已修一处宿主缺陷：上游框架重新挂载工具时先注册新处理器、再释放旧处理器，二者不互相等待；daemon 侧绑定集合以名字为键、没有代次，旧释放会把同名新绑定一并收回，表现为改任意一项设置后 `codebuddy_ask` 从工具目录消失。现在由宿主运行时（`host.mjs`）在发出释放前检查同名新注册是否在途，在途则不通知 daemon；新增集成测试 `rebinding_in_the_same_tick_keeps_the_new_binding`。
+
+【现状·已运行验证·未解决】`/codebuddy` 命令在 Magi 中不可用：上游命令处理器读取 `invocation.agent` 的会话工作目录，而 Magi 的命令上下文只含会话与工作区标识，不含工作区路径；翻译器对 `agent` 明确抛出“不可用”。`codebuddy_ask` 工具不受影响（可传 `working_dir` 或 `allow_unattended`）。若要支持，需要插件系统先决定是否向扩展调用上下文公开会话的工作区目录（待定，见 13.2）；不得为此伪造 DSH Agent 对象。
+
+【现状·已运行验证】WorkBuddy 随包 CLI 只含 `codebuddy-lite-wb` 一个产物，直接以 `-p` 启动会因缺少 `dist/codebuddy` 而 `MODULE_NOT_FOUND`；需要环境变量 `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1`，或安装完整的 `@tencent-ai/codebuddy-code` 后用 `cliBridge.binary` 指向它。这是使用者机器上的环境事实，翻译器不得为其写入特例。
+
+### 6.1 兼容层与翻译运行时
+
+【现状·已运行验证】兼容层只用公开 API；依赖的 Cordis 框架随翻译运行时发行，但不得顺带挂载 DSH 会话／loop／审批／持久化服务成为第二个内核。发行目录 `daemon/compat/` 由 `apps/desktop/scripts/build-support.mjs` 的 `stageCompatRuntime` 生成，进入发行清单的逐文件哈希，`after-pack` 校验其存在；daemon 只在自身同级 `compat/` 查找，开发时用 `MAGI_EXTENSION_COMPAT` 覆盖。翻译与扩展宿主使用同一份 Node 解析结果；缺少随包 Node 或兼容运行时时，上游条目只可浏览，界面显示原因。
+
+【目标】翻译报告应逐项列出 API 清单、依赖图、上游精确版本、平台要求与降级项。现状报告含上游版本与 integrity、工具／命令／数据源、路由、界面槽位处置、静态分析降级项与被省略的文件；依赖图与平台要求尚未输出。发现不支持或无法识别的动态导入／API 直接失败，不生成"成功但少功能"的包。静态分析不能证明任意 JS 的全部运行分支：运行时仍严格拒绝未知 API；未执行到的分支应标为未覆盖。
+
+【现状】受开关控制的工具在记录期可见，靠翻译器自动追加"所有开关打开"的配置变体，不再需要作者提供；是否所有开关型配置都能被这样发现仍属待定。
 
 ### 6.2 翻译范围
 
@@ -300,19 +332,20 @@
 
 【现状†·文档摘要】上表依据为第 3 节固定版本文档，不是已经实现的适配器。pi 的 input/Turn/工具次序与不重验入参，见[扩展文档](https://github.com/earendil-works/pi/blob/c9f4c7b9fcd0f3e6b5bbc35c7c9b6cda35580eb8/packages/coding-agent/docs/extensions.md)；DSH 对象、事件及生成协议见[Agent](https://github.com/deepseek-ai/deepseek-harness/blob/ce7073d51254c26cd63b22a60835b8f948deb447/packages/core/agent/README.md)、[Session](https://github.com/deepseek-ai/deepseek-harness/blob/ce7073d51254c26cd63b22a60835b8f948deb447/docs/subsystems/session.md)、[Gateway](https://github.com/deepseek-ai/deepseek-harness/blob/ce7073d51254c26cd63b22a60835b8f948deb447/docs/api-gateway.md)。
 
-### 6.3 兼容来源开关
+### 6.3 上游来源的发现与安装
+
+【现状·已运行验证】设置 → 插件 的搜索框同时检索三处：Magi 插件中心目录、DSH 生态（npm 关键词 `dsh-plugin`）、pi 生态（npm 关键词 `pi-package`）。上游检索需要关键词，空查询不拉取 npm 全量，只对已安装的上游包检查最新版本以提示升级。不设"兼容来源"开关：搜索即发现，没有第二个入口。
 
 | 状态 | 动作 | 规定行为 |
 | --- | --- | --- |
-| 目标 | 显示入口 | 设置 → 插件 → 兼容来源；“pi 兼容来源”“DSH 兼容来源”各一开关，默认关闭，复用现有设置控件与 [UX/UI 规范](ux-ui-guidelines.md) |
-| 目标 | 打开 | 只启用该来源的目录浏览，不安装、不启动 Node、不执行远端代码；不能把开关当批量授权 |
-| 目标 | 默认目录 | Magi 维护的已翻译产物目录，条目带固定上游版本、兼容报告与摘要，经统一插件中心分发；界面准确标“来自 pi/DSH（翻译）” |
-| 目标 | 上游发现 | pi 官方 gallery/npm 与 DSH 官方包/topic 只能提供候选线索，不能等同 Magi 已验证目录；未翻译条目不显示为可直接运行 |
-| 目标 | 逐个安装 | 预览产物与报告 → 完全信任确认（有受信后台时）→ 安装 → 用户启用；预览凭据绑定实际产物和来源 |
-| 目标 | 关闭 | 隐藏目录/入口，已装包按普通插件继续管理；可显式选择同时停用，默认不联动删除、不撤销用户数据 |
-| 目标 | DSH 状态 | “DSH 兼容来源”开关在首个通过全部必需断言的 DSH 包产出兼容报告之前不出现在界面；达标后与 pi 项同等呈现，不设“实验”中间态。DSH 已有版本准入但仍声明破坏性变更，故以固定版本与报告为准 |
+| 现状·已运行验证 | 条目标注 | 每个上游条目显示生态（DSH／pi）、npm 发布者，以及发布者是否属于上游官方作用域（`@deepseek-ai/`、`@earendil-works/`）。官方作用域只说明谁发布，不代表适配 Magi 或经 Magi 审核，界面如实写出 |
+| 现状·已运行验证 | 逐个安装 | 点击安装先预览：取包、核对 integrity、翻译，展示权限差异（完全信任）、翻译结果（工具／命令／数据源／不显示的界面位置／降级项／未随包文件）与 integrity；用户确认后才安装。安装只接受预览摘要，缺失或不一致明确拒绝（409） |
+| 现状·已运行验证 | 升级 | registry 的语义版本更新于已装版本时标"可更新"；升级沿同一预览与确认，走排空升级，授权不继承 |
+| 现状·已运行验证 | pi 条目 | 可搜索、可浏览；翻译器未提供前，预览与安装明确拒绝并显示原因，不伪装成功 |
+| 现状 | 卸载 | 已装上游包按普通插件管理，沿用现有卸载流程 |
+| 目标 | 信任信号 | 现状没有按包的审核或签名；若要把某些包标为"已验证"，需要 Magi 发布者提供可验证的名单与签名，不得用 npm 评分、下载量或关键词当作信任依据 |
 
-【目标】三条具体交互修正：开关只负责发现；安装页显示该包真实差异与信任；关闭来源和停用插件分开提交。共享设置、表单、状态及右栏组件承载这些交互，不增加自制审批界面。最强反方：相比“一开即用”步骤多；但目录内容可变且插件全权限，批量自动执行无法表达逐包知情信任。
+【现状·已运行验证】真实 npm registry 上对 `dsh-connect-workbuddy` 的全链路（2026-11-06，隔离 daemon 加发行目录中的翻译运行时）：搜索得到 40 条 DSH 结果并标注发布者；预览约 7.6 秒；无摘要与错误摘要的安装分别被拒绝；非法包名与 pi 安装被拒绝；安装后来源为 `upstream`，激活后宿主 `running`、崩溃 0 次，工具、命令、两个模型数据源与图标齐全；先装 5.18.2 再升级到 5.19.1，状态依次为"可更新"、升级成功、新版本运行。未验证：Windows、干净机器上的发行包安装、pi 生态。打包时曾发现 electron-builder 会丢弃 `extraResources` 里名为 `node_modules` 的目录，已改为与 Lighthouse 运行时相同的单独复制写法，并由 `after-pack` 校验。
 
 【现状†·文档摘要】不能沿用“pi、DSH 都没有官方目录”的旧结论：pi 的[包文档](https://github.com/earendil-works/pi/blob/c9f4c7b9fcd0f3e6b5bbc35c7c9b6cda35580eb8/packages/coding-agent/docs/packages.md)链接 [pi.dev/packages](https://pi.dev/packages)，DSH [插件管理器](https://github.com/deepseek-ai/deepseek-harness/blob/ce7073d51254c26cd63b22a60835b8f948deb447/packages/boot/plugin-manager/README.md)描述官方按需包。所读资料没有证明第三方全集经过签名审查并保证安全；此项应写“未核实”，不能推导为绝对不存在。
 
@@ -332,7 +365,21 @@
 
 ## 8. 界面与数据同步
 
-【现状·读码推断】插件页面沿工作台共享布局和 i18n；设置提供安装预览、授权、运行状态、停用、升级和计划管理。计划显示目标会话、模型调用次数、单次输出和期限，结果取 daemon 回执；关闭视图不结束任务。[PluginDetailPane](../web/src/components/PluginDetailPane.svelte)、[PluginJobs](../web/src/components/PluginJobs.svelte)。
+【现状·已运行验证】插件在设置里的形态已定稿，后续不再调整版面；变更须先改本节并经用户确认。
+
+| 范围 | 规定 | 依据 |
+| --- | --- | --- |
+| 导航 | 设置左侧导航按“已安装”列出声明了 `settings` 视图的插件，项名为插件名称，图标为清单 `icon`，缺省或加载失败时退回通用插件图标；卸载后消失 | [SettingsPanel](../web/src/components/SettingsPanel.svelte) |
+| 页头 | 页头只显示插件名称，不显示描述，不拼接视图标题；原生分类的页头与描述保持不变 | 同上 |
+| 顶部栏 | 位于内容列顶部：图标、名称、版本、启用开关、卸载；状态只读全局投影，操作沿现有授权／激活／停用／卸载接口，卸载沿用确认对话框 | [PluginPageHeader](../web/src/components/PluginPageHeader.svelte) |
+| 关闭 | 关闭开关即停用：设置页保留，只剩顶部栏与停用提示，不加载插件界面；重新启用在“插件”列表详情里完成 | 同上 |
+| 版面 | 内容列宽度、左右留白、与页头的间距、圆角、整页滚动全部沿用设置共享框架（`settings.css` 的 `settings-frame`）；插件界面以透明背景嵌入，高度由页面经 `view.resize` 上报，页面自身不产生滚动条也不自带外层留白 | [PluginTabContent](../web/src/components/tabs/PluginTabContent.svelte)、[settings.css](../web/src/styles/settings.css) |
+| 令牌 | 字号、字体、间距、圆角、文字层级与主按钮前后景取宿主下发的令牌，不写死数值；交互控件用次级文字色，实心控件用主按钮前景色 | 同上 |
+| 图标 | 清单 `icon` 指向包内 `ui/` 下的 png／jpg／webp，不放行 SVG，不超过 256 KiB，文件头必须与类型相符；读取走 `GET /api/plugins/{id}/icon`，与插件是否激活无关，仅返回声明的那一个文件 | [package.rs](../crates/magi-plugin-system/src/package.rs)、[plugins.rs](../crates/magi-api/src/routes/plugins.rs) |
+
+【现状·已运行验证】2026-11-06：`node scripts/verify-local-plugins.mjs --ui`（隔离 daemon，真实 Electron 窗口）26 项通过，其中界面部分断言：导航、列表、详情头的图标均为已加载位图；页头同一行含图标、名称与已启用开关且内容列不重复操作栏；页头与内容列左边距同原生分类一致；关闭后保留页面与停用提示且不渲染 iframe；在列表中重新授权激活后页面恢复；390px 视口无横向溢出。包校验的反例（缺文件、伪造内容、SVG、超限、越出 ui/）由 `cargo test -p magi-plugin-system --test package` 覆盖。
+
+【现状·读码推断】设置界面不再提供插件计划管理；daemon 的作业接口（`/plugins/{id}/jobs`）与调度保留，只是没有界面入口。
 
 【现状·已运行验证】UI、HTTP、后台共用资源 CAS 与写事件；SSE 原子获取快照和订阅边界，溢出 reset 后重读，撤权结束订阅。设置变化通过 config.changed 更新宿主快照；不建立前端业务持久化权威。[plugins.rs:107](../crates/magi-api/src/routes/plugins.rs#L107)、[extension_runtime:239](../crates/magi-daemon/src/daemon/extension_runtime.rs#L239)。
 
@@ -372,10 +419,50 @@
 | 现状·已运行验证 | P1 Node 宿主 | 独立进程、钩子／工具／命令、取消、熔断、崩溃和卡死回收；真实 Node 集成验证 |
 | 现状·已运行验证 | P2 原生服务与调度 | 反向服务、模型归属、用量／预算、原生计划、停用升级闭环；真实 daemon 20 项验证 |
 | 目标 | 平台交付验收 | Windows demo、实机与正式安装包独立验收；不以本机开发结果代替 |
-| 目标（推迟） | P3 pi 翻译器 | 本地系统稳定后另启；固定版本／API 子集／一致性报告，再开放来源开关 |
-| 目标（推迟） | P4 DSH 翻译器 | P3 适配基础后推进；完整依赖审计和必需语义报告，不嵌入第二内核 |
+| 现状·已运行验证 | P4 DSH 翻译器 | 安装期动态翻译、多来源搜索、预览确认、升级；真实 npm registry 全链路与发行目录中的翻译运行时验证；不嵌入第二内核 |
+| 目标 | P3 pi 翻译器 | 在同一工厂注册表与来源/预览/安装链路上新增 pi 生态；翻译器提供前 pi 条目只可浏览，安装明确拒绝 |
 
-【目标】当前不创建 pi／DSH 来源开关、空适配器或兼容声明。原生 MCP 不列为插件。发布签名、公钥托管与官方目录内容须由发布者决定，不把本地开发密钥当官方信任根。
+【现状】不创建 pi 空适配器或兼容声明；pi 条目可浏览、不可安装。原生 MCP 不列为插件。发布签名、公钥托管与官方目录内容须由发布者决定，不把本地开发密钥当官方信任根。
+
+### 11.1 运行时兼容层改造计划（2026-11-06）
+
+【目标】优先级固定为 Magi 稳定性、插件系统正确性、生态兼容完整性。DSH 先交付；pi 的规范用于共同协议和工厂边界设计，pi 运行器随后接入。保留现有插件设置页的共享布局、原生 UI、图标与顶部操作、整页滚动、停用后导航和设置页同时消失的交互。MCP 保持 Magi 内置功能。Windows 实机与安装包验收等待可用环境，不能据 macOS 结果宣告完成。
+
+| 状态 | 步骤 | 模块与交付 | 退出条件 |
+| --- | --- | --- | --- |
+| 目标 | T1 上游合同 | 固定 DSH 与 pi 提交；核对官方开发文档、类型、加载器、生命周期与服务实现；逐项记录原样复用、适配、内核所有权冲突、未实现及验证范围 | 事件顺序、返回值、异步、取消、回收与版本约束有明确证据；不以 API 同名证明兼容 |
+| 目标 | T2 原包安装 | `scripts/compat` 工厂、`magi-api/plugins/upstream`、`magi-plugin-system`：稳定且无碰撞的来源身份、依赖/版本校验、不可变上游文件和摘要 | 预览与安装身份一致；不同 npm 名不得互相升级；安装不执行上游业务初始化；不生成维护分叉 |
+| 目标 | T3 公共运行协议 | schema、`magi-extension-host`、`magi-plugin-system`、daemon：动态工具/命令/模型目录、配置 schema、实例租约、注册回收 | 晚注册与条件注册正常生效；最终参数沿原生 schema/权限/审批校验；旧实例不得修改新目录；失败与退出清理全部贡献 |
+| 目标 | T4 DSH 宿主 | 真实 Cordis 生命周期、effect、配置更新、工具与命令、模型流/附件、事件合同及客户端宿主 | 初始化错误不就绪；缺依赖不假成功；事件不漏执行；多模态声明与执行一致；未支持的必需契约明确拒绝 |
+| 目标 | T5 契约回归 | 固定夹具与上游行为对照，Node/Cordis 实测、Rust 注册准入与生命周期测试 | 覆盖初始化失败、异步/动态注册、同名重绑、撤权、崩溃、取消、配置更新、图片、来源碰撞与不支持 API；静态分析测试不能代替运行验证 |
+| 目标 | T6 产品验收与清理 | macOS 发行包与真实 WorkBuddy 国内版登录态；更新本文件与公开作者/协议合同，移除已替代的记录器与特例 | 原包搜索、预览、安装、启动、配置、模型选择、实际调用、停用、重新启用及升级闭环；报告实测范围与未覆盖项 |
+
+【目标】动态声明是宿主向 daemon 提交的提案：daemon 校验授权范围、大小、schema、唯一身份和实例代次后维护唯一运行目录；包身份与用户授权仍来自不可变安装事实。适配器不得自行批准工具、写 canonical 日志、替换会话引擎或另建任务存储。
+
+【目标】安装预览说明可动态贡献的能力种类与完全信任风险，不能把尚未启动的零工具目录表述为插件没有工具。运行期发现目录变化，通过既有事件投影刷新工具、命令与模型；不按定时等待完成来推断初始化成功。
+
+【现状·已运行验证】改造前基线：18 项翻译器测试通过，但最小夹具仍复现初始化抛错后成功打包、2 秒异步注册被 1.5 秒记录窗口漏掉、拦截钩子未接线仍打包、npm 名归一化碰撞，以及图片请求 HTTP 400。三份缺陷包通过 Rust 安装包校验；因此早期 P4 成功记录不等于 T1–T6 已完成。
+
+### 11.2 运行时生命周期续推记录（2026-11-06）
+
+【现状·已运行验证】在 `codex/dsh-translator` 工作树继续 T3／T4／T5，修复以下问题：
+
+- 模型发现尚未结束时，适配器已撤销或变化：刷新以代次排除旧结果并补跑期间收到的变化事件，初始化阶段也不漏事件。卸载使未完成的发现失效；daemon 拒绝回写时，本地 HTTP 端口仍被关闭。
+- 普通配置按版本串行重载；Volatile 更新保持实例、保留最新原始配置供后续重启，并按上游 loader 的 fiber 范围通知监听者。
+- 停用／撤权后重新激活不能使旧实例租约复活；旧实例的迟到写入与回收不能覆盖或清空新模型来源。清理与新实例准入使用同一 manager 锁；移除动态来源声明同步移除其已发布端点。
+- 删除没有实例租约的旧 `instance_detached` 回调，回收统一走 `instance_ended(pluginId, lease)`。持久资源与设置保留，运行期目录和模型来源回收。
+
+| 已验证入口 | 结果与范围 |
+| --- | --- |
+| `npm run test:compat` | 30 项：原 18 项静态／路由／界面槽位测试，加 12 项真实 Cordis 生命周期、工具管线与本机 HTTP 图片桥回归。daemon RPC 在 Cordis 测试中使用有版本的测试替身；图片到达本机模型替身，未调用 WorkBuddy 模型 |
+| `cargo test -p magi-plugin-system --test runtime_catalog --test lifecycle` | 4 项新运行目录测试＋20 项生命周期回归：初始化隐藏、原子 CAS、声明边界、重复／超量／非法 schema、旧实例与撤权失效、重启不持久化动态目录 |
+| `cargo test -p magi-daemon --lib daemon::extension` | 26 项：含真实 Node 运行后新增／撤销／重绑工具，沿原生工具入口重验入参，动态模型来源撤销，停用和过期实例回收 |
+| `cargo test -p magi-extension-host --test host` | 22 项真实 Node 宿主回归：绑定、同名重绑、路由、取消、崩溃、超时与进程回收 |
+| `npm run protocol:check` | schema 生成物一致；协议与作者指南补充动态目录、租约及回收合同 |
+
+【现状·静态核对】本机已有 `dsh-connect-workbuddy@5.18.1` 原包按当前安装期必需类别重新检查，仍有三项阻塞：`ctx.sessionProjections`、`sessionProjections` 注入及 `session/event`。未放宽检查或跳过这些功能；需继续核对只读投影、条件注入和事件消费者的精确合同，并沿 daemon 事实接线。不能把本节回归通过解释为 WorkBuddy 已完成改造后验收。
+
+【未运行】本次未重新下载或登录 WorkBuddy、未打包新版 Electron、未进行原生设置页交互或 Windows 验收；pi 运行器、上游完整契约分母、依赖安装覆盖及旧安装记录器清理仍在 T1／T2／T4／T6 范围。运行验证使用当前工作树依赖锁及 macOS arm64 Node 26.13.0，不代表其他上游版本或平台通过。
 
 ## 12. 验收与证据边界
 
@@ -391,6 +478,19 @@
 | 现状·已运行验证 | `cargo test -p magi-plugin-system --all-targets` | 包／生命周期／资源／计划持久化及签名目录定向套件通过 |
 | 现状·已运行验证 | API／daemon 定向回归 | Turn 接纳前取消计划收口、models 未授权拒绝、命令清单准入通过 |
 | 现状·已运行验证 | Rust／Web／Desktop 基础检查 | 相关 crate check；宿主／插件系统／daemon 库 Clippy（含传递依赖）零警告；Web 0 错误 0 警告；Desktop check、protocol:check、i18n／桥接定向检查、格式和 diff 检查通过 |
+
+### 12.1.1 上游来源验证
+
+| 状态 | 入口 | 证据 |
+| --- | --- | --- |
+| 现状·已运行验证 | `npm run test:compat` | 翻译器单元与夹具 18 项通过（工厂识别、静态分析、槽位策略含 `settings.section`、图标、路由取消等） |
+| 现状·已运行验证 | `cargo test -p magi-api --lib routes::plugins` | 21 项通过，含包名校验、升级状态判定、翻译摘要解析 |
+| 现状·已运行验证 | 真实 npm 全链路（开发构建） | 见 6.3：搜索、预览、拒绝路径、安装、激活运行、旧版升级到新版；使用 `target/debug/magi-daemon-app` 与 `apps/desktop/dist/compat`，Node 取开发机的 Node 26 |
+| 现状·已运行验证 | 打包版 Magi.app 的 daemon | `npm run desktop:package -- --dir` 生成的 macOS arm64 目录包，直接启动包内 daemon，只使用随包 Node 与包内 `daemon/compat/`（不设 `MAGI_EXTENSION_*`），同一条链路 18 项全部通过；包内 `compat/` 文件数与源目录一致（13547） |
+| 现状·已运行验证 | 打包版真实 Electron 界面 | `scripts/lib/plugin-upstream-acceptance.cjs`：设置 → 插件搜索关键词，核对 DSH 标注与发布者提示，预览展示权限与翻译结果，确认安装后列表以 Magi 插件 ID 出现、来源显示为"上游生态"、图标已加载、无重复的临时条目，共 12 项通过；截图在 `target/plugin-acceptance/upstream-*.png` |
+| 现状·已运行验证 | `npm --prefix web run test:plugin-store` | 上游条目的归并：临时身份、按已装来源归并（含作用域包名）、不同生态同名不互相归并 |
+| 现状·已运行验证 | 上游 5.19.1 | 上游把配置页换成新槽位 `settings.section`；翻译器原先正确拒绝了"没有可渲染槽位"的包，补入该槽位策略后翻译通过。翻译产物逐字节可复现（三次摘要相同） |
+| 现状 | 未覆盖 | 打包后的 Magi.app 内的安装、Windows、pi 生态、第三方发布者包的覆盖面（仅验证了一个真实包） |
 
 ### 12.2 未运行与不得推导的结论
 
@@ -413,7 +513,7 @@
 | 目标 | D7 | 不做转换 VM；格式变化显式 dataReset；反方是丢失插件数据，必须在预览提示 |
 | 目标 | D8 | 不自动回退旧代码或外部副作用；反方是恢复需显式操作，优先事实一致性 |
 | 目标 | D9 | 作业由 daemon 调度并绑定 canonical Turn；反方是 Node 直接外调无法完整核算，必须披露 |
-| 目标 | D10 | 兼容目录只收已构建产物，签名与来源分开；反方是维护负担，后期与翻译器一起评审 |
+| 现状 | D10 | 不维护第二份翻译产物目录：用户安装上游官方 npm 包，翻译在本机安装期完成并以摘要核对；反方是每次预览都要下载并翻译（约数秒），信任信号（谁发布、是否审核）与摘要核对分开表达，不借 npm 元数据暗示审核 |
 | 目标 | D11 | 不恢复工作流／会话引擎插件；反方是扩展面较窄，关键钩子与工具服务承载业务扩展 |
 | 目标 | D12 | 全权限扩展不提供强制 OS 只读保证；要求此保证的环境不得组合启用，不能把工具过滤称作隔离 |
 | 目标 | D13 | 低信任内容仅声明式包；反方是轻量后台也需完全信任，避免第二执行器 |
@@ -424,7 +524,8 @@
 | --- | --- | --- |
 | 待定 | 官方目录签名密钥、轮换和发布责任人 | 由发布者提供受控公钥；当前不伪造可信官方内容 |
 | 待定 | Windows／正式安装包验收环境 | 后置到具备真实环境；能力合同保留，不把缺环境误报为通过 |
-| 待定 | 未来翻译器样本和必需语义分母 | 固定上游提交和真实样本；本地系统稳定后再决定，不先承诺生态兼容比例 |
+| 待定 | 翻译器的必需语义分母与一致性测试集 | 现状只有 `dsh-connect-workbuddy` 一个真实样本和一个夹具；扩大到更多真实包后再定分母，不先承诺生态兼容比例 |
+| 待定 | 扩展调用上下文是否公开会话工作区目录 | 推荐只公开已授权的当前工作区路径（只读、随调用签发）；DSH 的 `/codebuddy` 等命令依赖它，现状只能在 `codebuddy_ask` 里显式传 `working_dir`。反方：路径属于会话事实，扩展拿到后可据此直接读写磁盘，但完全信任扩展本来就能读写磁盘，所以不新增权限面 |
 
 ### 13.3 与现有架构的一致性
 

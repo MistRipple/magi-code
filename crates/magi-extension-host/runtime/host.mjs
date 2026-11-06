@@ -9,6 +9,7 @@
 import net from 'node:net';
 import { AsyncLocalStorage } from 'node:async_hooks';
 const invocationContext = new AsyncLocalStorage();
+import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const MAX_FRAME = 4 * 1024 * 1024;
@@ -18,6 +19,13 @@ const FEATURES = ['hook.guard'];
 const endpoint = process.env.MAGI_EXT_ENDPOINT;
 const token = process.env.MAGI_EXT_TOKEN;
 const entry = process.env.MAGI_EXT_ENTRY;
+// 翻译包（DSH 等）：兼容运行时目录。上游代码的裸导入与 `@magi/compat-dsh` 都解析到它。
+const compatRoot = process.env.MAGI_EXT_COMPAT_ROOT;
+delete process.env.MAGI_EXT_COMPAT_ROOT;
+// 翻译包的私有数据目录：DSH 插件把状态写在 DSH_HOME 下，指向 Magi 管理的插件目录，
+// 不触碰用户真实的 ~/.dsh（那是 DSH 自己的数据）。HOME 保持不变，上游读取其他应用数据仍用真实家目录。
+if (process.env.MAGI_EXT_COMPAT_HOME) process.env.DSH_HOME = process.env.MAGI_EXT_COMPAT_HOME;
+delete process.env.MAGI_EXT_COMPAT_HOME;
 delete process.env.MAGI_EXT_TOKEN; // 令牌一次性使用，不留给插件代码读取
 
 function fail(message) {
@@ -33,10 +41,24 @@ const pending = new Map();
 let generation = null;
 let configValues = null;
 let configRevision = 0;
+let identity = null;
 const handlers = new Map(); // hook name -> handler
 const toolHandlers = new Map(); // tool id -> handler
 const commandHandlers = new Map(); // command id -> handler
+const routeHandlers = new Map(); // 视图后端路径 -> handler
 const inflight = new Map(); // invocationId -> AbortController
+const disposers = new Set();
+const configListeners = new Set();
+let configQueue = Promise.resolve();
+let shuttingDown = false;
+let validateSettings = null;
+async function disposeExtension() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  for (const controller of inflight.values()) controller.abort();
+  for (const dispose of [...disposers].reverse()) await dispose();
+  disposers.clear();
+}
 
 function send(message) {
   const body = Buffer.from(JSON.stringify({ jsonrpc: '2.0', ...message }));
@@ -69,8 +91,15 @@ function request(method, params) {
 
 async function handleRequest(id, method, params) {
   try {
+    if (method === 'settings.validate') {
+      if (!validateSettings) throw new Error('扩展未提供设置校验器');
+      if (params.generation !== generation) throw new Error('设置校验实例已失效');
+      await validateSettings(params.value);
+      return send({ id, result: {} });
+    }
     if (method === 'host.ping') return send({ id, result: {} });
     if (method === 'host.shutdown') {
+      await disposeExtension();
       send({ id, result: {} });
       setImmediate(() => process.exit(0));
       return;
@@ -112,6 +141,30 @@ async function handleRequest(id, method, params) {
       } catch (error) {
         // 工具自身抛出的错误是模型可见的工具失败，不是协议错误。
         return send({ id, result: { isError: true, output: String(error?.message ?? error).slice(0, 4096) } });
+      } finally {
+        inflight.delete(ctx.invocationId);
+      }
+    }
+    if (method === 'route.invoke') {
+      const ctx = params?.ctx ?? {};
+      if (generation !== null && ctx.generation !== generation) {
+        return send({ id, error: rpcError('StaleGeneration', '实例代次不符') });
+      }
+      const handler = routeHandlers.get(params.route);
+      if (!handler) return send({ id, error: rpcError('MethodNotFound', `后端路由 ${params.route} 未绑定`) });
+      if (typeof ctx.invocationId !== 'string' || !ctx.invocationId || inflight.has(ctx.invocationId)) {
+        return send({ id, error: rpcError('InvalidParams', '调用身份缺失或重复') });
+      }
+      const controller = new AbortController();
+      inflight.set(ctx.invocationId, controller);
+      try {
+        const output = await invocationContext.run({ ...ctx, signal: controller.signal }, () => handler(params.input, { ...ctx, signal: controller.signal }));
+        const status = Number.isInteger(output?.status) && output.status >= 100 && output.status <= 599 ? output.status : 200;
+        const contentType = typeof output?.contentType === 'string' ? output.contentType.slice(0, 128) : undefined;
+        return send({ id, result: { status, ...(contentType ? { contentType } : {}), body: output?.body === undefined ? null : output.body } });
+      } catch (error) {
+        // 路由自身抛出的错误是视图可见的 500，不是协议错误。
+        return send({ id, result: { status: 500, body: { error: String(error?.message ?? error).slice(0, 4096) } } });
       } finally {
         inflight.delete(ctx.invocationId);
       }
@@ -160,6 +213,10 @@ function handleNotification(method, params) {
     if (Number.isSafeInteger(params?.revision) && params.revision > configRevision) {
       configValues = deepFreeze(params.values ?? null);
       configRevision = params.revision;
+      const snapshot = { version: configRevision, value: configValues };
+      configQueue = configQueue.then(async () => {
+        for (const listener of [...configListeners]) await listener(snapshot);
+      }).catch((error) => fail(`配置更新失败: ${error?.message ?? error}`));
     }
   } else if (method === 'host.cancel') {
     inflight.get(params?.invocationId)?.abort();
@@ -197,6 +254,36 @@ socket.on('data', (chunk) => {
 socket.on('close', () => process.exit(0));
 socket.on('error', (error) => fail(`连接失败: ${error.message}`));
 
+/**
+ * 处理器释放。daemon 侧的绑定集合以名字为键，没有代次，所以“旧释放”和“同名新注册”的先后必须在宿主这一侧排好：
+ * - 本地表里已是别的处理器（新注册已落地）：不通知 daemon，否则旧释放会把新绑定一起收回；
+ * - 新注册的请求已发出、尚未落地：登记为占位，等它落地后再决定；占位存在时同样不通知 daemon。
+ * 上游框架重新挂载时常常先注册新的、再释放旧的，二者不会互相等待。
+ */
+const registering = new Map();
+function release(method, table, id, handler) {
+  let released = false;
+  return async () => {
+    if (released || table.get(id) !== handler) return;
+    released = true;
+    table.delete(id);
+    if ((registering.get(`${method}:${id}`) ?? 0) > 0) return; // 同名新注册已在途：绑定归它
+    await request(method, { name: id });
+  };
+}
+async function register(method, releaseMethod, table, id, handler) {
+  const key = `${releaseMethod}:${id}`;
+  registering.set(key, (registering.get(key) ?? 0) + 1);
+  try {
+    await request(method, { name: id });
+    table.set(id, handler);
+  } finally {
+    const left = (registering.get(key) ?? 1) - 1;
+    if (left <= 0) registering.delete(key); else registering.set(key, left);
+  }
+  return release(releaseMethod, table, id, handler);
+}
+
 function deepFreeze(value) {
   if (value && typeof value === 'object') {
     for (const child of Object.values(value)) deepFreeze(child);
@@ -206,14 +293,34 @@ function deepFreeze(value) {
 }
 
 const api = Object.freeze({
+  get identity() { return identity; },
+  fail(error) { fail(`扩展运行失败: ${error?.message ?? error}`); },
   /** 握手时 daemon 下发的配置快照（只读）。 */
   get config() { return configValues; },
   get configRevision() { return configRevision; },
+  onDispose(dispose) {
+    if (typeof dispose !== 'function') throw new TypeError('dispose 必须是函数');
+    disposers.add(dispose);
+    return () => disposers.delete(dispose);
+  },
+  onConfig(listener) {
+    if (typeof listener !== 'function') throw new TypeError('listener 必须是函数');
+    configListeners.add(listener);
+    return () => configListeners.delete(listener);
+  },
+  catalog: Object.freeze({
+    replace: (expectedRevision, catalog) => request('catalog.replace', { expectedRevision, catalog }),
+  }),
   resource: Object.freeze({
     read: (id) => request('resource.read', { resourceId: id }),
     write: (id, expectedVersion, value) => request('resource.write', { resourceId: id, expectedVersion, value }),
   }),
   settings: Object.freeze({
+    describe: () => request('settings.describe', {}),
+    onValidate(handler) {
+      if (typeof handler !== 'function' || validateSettings) throw new TypeError('设置校验器必须且只能注册一个');
+      validateSettings = handler;
+    },
     async read() {
       const snapshot = await request('settings.read', {});
       configValues = deepFreeze(snapshot.value);
@@ -221,6 +328,7 @@ const api = Object.freeze({
       return snapshot;
     },
     async write(expectedVersion, value) {
+      if (validateSettings) await validateSettings(value);
       const snapshot = await request('settings.write', { expectedVersion, value });
       configValues = deepFreeze(snapshot.value);
       configRevision = snapshot.version;
@@ -233,17 +341,26 @@ const api = Object.freeze({
     await request('register.hook', { name: hook });
     handlers.set(hook, handler);
   },
-  /** 绑定工具处理器；工具必须已在清单中声明并获得 `tools` 授权。 */
+  /** 绑定工具处理器；工具必须已在清单中声明并获得 `tools` 授权。返回释放函数。 */
   async tool(id, handler) {
     if (typeof handler !== 'function') throw new TypeError('handler 必须是函数');
-    await request('register.tool', { name: id });
-    toolHandlers.set(id, handler);
+    return register('register.tool', 'unregister.tool', toolHandlers, id, handler);
   },
-  /** 绑定用户命令处理器；命令必须已在清单中声明。返回字符串或 `{ content }`。 */
+  /** 绑定用户命令处理器；命令必须已在清单中声明。返回字符串或 `{ content }`。返回释放函数。 */
   async command(id, handler) {
     if (typeof handler !== 'function') throw new TypeError('handler 必须是函数');
-    await request('register.command', { name: id });
-    commandHandlers.set(id, handler);
+    return register('register.command', 'unregister.command', commandHandlers, id, handler);
+  },
+  /**
+   * 绑定视图后端路由：本插件自己的视图经桥的 `route.call` 调用。路径以 / 开头且不含查询；
+   * `match` 为 `exact`（默认）或 `prefix`（最长前缀优先）。
+   * 处理器收到 `{ method, path, query, body }`，返回 `{ status?, body }`；抛错即 500。返回释放函数。
+   */
+  async route(path, handler, options = {}) {
+    if (typeof handler !== 'function') throw new TypeError('handler 必须是函数');
+    const match = options.match ?? 'exact';
+    if (match !== 'exact' && match !== 'prefix') throw new TypeError('match 必须是 exact 或 prefix');
+    return register('register.route', 'unregister.route', routeHandlers, `${match}:${path}`, handler);
   },
   model: Object.freeze({ invoke: (input = {}) => request('model.invoke', input) }),
   tools: Object.freeze({ call: (tool, input = {}) => request('tool.call', { tool, input }) }),
@@ -276,13 +393,21 @@ socket.on('connect', async () => {
       features: FEATURES,
     });
     generation = hello.instance.generation;
+    identity = deepFreeze(hello.instance);
     configValues = deepFreeze(hello.config?.values ?? null);
     configRevision = hello.config?.revision ?? 0;
+    if (compatRoot) {
+      const { installSharedResolution } = await import(pathToFileURL(join(compatRoot, 'runtime/shared-resolution.mjs')).href);
+      installSharedResolution(compatRoot, { '@magi/compat-dsh': join(compatRoot, 'runtime/dsh-host.mjs') });
+    }
     const module = await import(pathToFileURL(entry).href);
     if (typeof module.default !== 'function') throw new Error('入口必须默认导出 activate(api)');
-    await module.default(api);
+    const activated = await module.default(api);
+    if (typeof activated === 'function') disposers.add(activated);
+    else if (typeof activated?.dispose === 'function') disposers.add(() => activated.dispose());
     send({ method: 'host.ready', params: { generation } });
   } catch (error) {
+    try { await disposeExtension(); } catch {}
     fail(`激活失败: ${error?.message ?? error}`);
   }
 });

@@ -10,8 +10,12 @@ use std::{
 pub const MAX_PACKAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: usize = 32 * 1024 * 1024;
 const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_FILES: usize = 512;
+/// Node 扩展入口是构建期打包的单文件，容纳作者依赖，上限单独放宽；仍受解压总量约束。
+pub const MAX_EXTENSION_ENTRY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FILES: usize = 4096;
 const MAX_HOME_CARDS_PER_PLUGIN: usize = 2;
+/// 工具说明是模型可见的使用指引，真实工具常需要数 KiB 的约束与示例；其余贡献的说明仍限 4096 字节。
+pub const MAX_TOOL_DESCRIPTION_BYTES: usize = 32 * 1024;
 
 /// 已校验的不可变包。安装与执行读取同一份内容，避免校验后再次读取外部源文件。
 #[derive(Clone, Debug)]
@@ -55,17 +59,18 @@ impl PluginPackage {
             if file.is_dir() {
                 continue;
             }
-            if file.size() > MAX_FILE_BYTES as u64 {
+            let limit = file_limit(&name);
+            if file.size() > limit as u64 {
                 return Err(invalid("发布包文件大小超限"));
             }
             let mut content = Vec::new();
             file.by_ref()
-                .take(MAX_FILE_BYTES as u64 + 1)
+                .take(limit as u64 + 1)
                 .read_to_end(&mut content)?;
             total = total
                 .checked_add(content.len())
                 .ok_or_else(|| invalid("发布包大小超限"))?;
-            if content.len() > MAX_FILE_BYTES || total > MAX_UNPACKED_BYTES {
+            if content.len() > limit || total > MAX_UNPACKED_BYTES {
                 return Err(invalid("发布包展开大小超限"));
             }
             validate_file(&name, &content)?;
@@ -85,6 +90,9 @@ impl PluginPackage {
                 "extension 声明与 extension/index.mjs 必须同时存在或同时缺失",
             ));
         }
+        if manifest.extension.is_none() && files.keys().any(|name| name.starts_with("extension/")) {
+            return Err(invalid("未声明 extension 的包不得携带 extension/ 目录"));
+        }
         for view in &manifest.contributions.views {
             if !valid_path(&view.entry)
                 || !view.entry.starts_with("ui/")
@@ -94,6 +102,12 @@ impl PluginPackage {
                 return Err(invalid("视图入口必须引用包内 ui/ 下的 HTML 文件"));
             }
         }
+        if let Some(icon) = manifest.icon.as_deref() {
+            let bytes = files
+                .get(icon)
+                .ok_or_else(|| invalid("图标必须引用包内 ui/ 下的位图文件"))?;
+            validate_icon(icon, bytes)?;
+        }
         Ok(Self {
             manifest,
             digest: magi_core::hex_lower(Sha256::digest(bytes)),
@@ -102,6 +116,12 @@ impl PluginPackage {
         })
     }
 
+    /// 清单声明的图标：(内容类型, 字节)。只有通过 [`validate_icon`] 的位图才会出现在这里。
+    pub fn icon(&self) -> Option<(&'static str, &[u8])> {
+        let path = self.manifest.icon.as_deref()?;
+        let bytes = self.files.get(path)?;
+        Some((icon_content_type(path)?, bytes.as_slice()))
+    }
     pub fn manifest(&self) -> &PluginManifest {
         &self.manifest
     }
@@ -113,6 +133,15 @@ impl PluginPackage {
     }
     pub(crate) fn archive_bytes(&self) -> &[u8] {
         &self.archive
+    }
+    /// 扩展代码树：`extension/` 下的全部文件（含入口），路径相对包根。仅声明了 `extension` 的包有。
+    pub fn extension_files(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.manifest.extension.iter().flat_map(|_| {
+            self.files
+                .iter()
+                .filter(|(name, _)| name.starts_with("extension/"))
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        })
     }
     /// Node 扩展入口源码（`extension/index.mjs`）。仅声明了 `extension` 的包有。
     pub fn extension_entry(&self) -> Option<&[u8]> {
@@ -210,13 +239,16 @@ fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
         }
         return Ok(());
     };
-    if extension.hooks.is_empty()
+    if extension.runtime_contributions.is_empty()
+        && extension.hooks.is_empty()
         && manifest.contributions.tools.is_empty()
         && manifest.contributions.commands.is_empty()
         && manifest.contributions.model_sources.is_empty()
+        // 视图的后端路由由扩展宿主服务；只有界面和后端、没有其他贡献的包同样合法。
+        && manifest.contributions.views.is_empty()
     {
         return Err(invalid(
-            "声明 extension 的包必须至少声明一个钩子、工具、命令或模型数据源",
+            "声明 extension 的包必须至少声明一个钩子、工具、命令、模型数据源或视图",
         ));
     }
     // 改写已装配历史会让缓存前缀失效并改变模型看到的上下文，必须由用户单独授权。
@@ -308,6 +340,19 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
             return Err(invalid("权限声明重复"));
         }
     }
+    // 通配授权只覆盖显式声明的运行期贡献种类，不扩展模型调用或存储权限。
+    for permission in &manifest.permissions {
+        if !permission.targets.iter().any(|target| target == "*") { continue; }
+        use magi_app_server_protocol::generated::PluginRuntimeContributionKind as Kind;
+        let kind = match permission.kind {
+            PluginPermissionKind::Tools => Kind::Tools,
+            PluginPermissionKind::ModelSources => Kind::ModelSources,
+            _ => return Err(invalid("该权限不支持通配目标")),
+        };
+        if !manifest.extension.as_ref().is_some_and(|extension| extension.runtime_contributions.contains(&kind)) {
+            return Err(invalid("通配授权必须对应显式运行期贡献种类"));
+        }
+    }
     let c = &manifest.contributions;
     let mut ids = HashSet::new();
     let mut check = |id: &str, title: &str, description: &str| -> Result<(), PluginError> {
@@ -337,11 +382,22 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
         return Err(invalid("声明工具贡献的包必须同时声明 extension"));
     }
     for tool in &c.tools {
-        check(&tool.id, &tool.title, &tool.description)?;
+        check(&tool.id, &tool.title, "")?;
+        if tool.description.len() > MAX_TOOL_DESCRIPTION_BYTES {
+            return Err(invalid(format!(
+                "工具 `{}` 的说明超过 {MAX_TOOL_DESCRIPTION_BYTES} 字节",
+                tool.id
+            )));
+        }
         validate_object_schema(&tool.input_schema)?;
+        if let Some(timeout) = tool.timeout_ms
+            && !(1_000..=600_000).contains(&timeout)
+        {
+            return Err(invalid("工具 timeoutMs 必须在 1000 到 600000 毫秒之间"));
+        }
         let permitted = manifest.permissions.iter().any(|permission| {
             permission.kind == PluginPermissionKind::Tools
-                && permission.targets.iter().any(|target| target == &tool.id)
+                && permission.targets.iter().any(|target| target == &tool.id || target == "*")
         });
         if !permitted {
             return Err(invalid(format!(
@@ -416,7 +472,7 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
         check(&source.id, &source.title, &source.description)?;
         let authorized = manifest.permissions.iter().any(|permission| {
             permission.kind == PluginPermissionKind::ModelSources
-                && permission.targets.iter().any(|target| target == &source.id)
+                && permission.targets.iter().any(|target| target == &source.id || target == "*")
         });
         if !authorized {
             return Err(invalid(format!(
@@ -488,7 +544,7 @@ fn valid_path(path: &str) -> bool {
                 && !segment.ends_with('.')
                 && segment
                     .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'@' | b'+' | b'~'))
                 && !matches!(
                     segment
                         .split('.')
@@ -525,14 +581,29 @@ fn valid_path(path: &str) -> bool {
 const REMOVED_SDK_MESSAGE: &str =
     "该插件使用已移除的 SDK 1（QuickJS 后台）；请改用声明 extension 的 SDK 2（Node 扩展）重新打包";
 
+fn file_limit(name: &str) -> usize {
+    if name == "extension/index.mjs" {
+        MAX_EXTENSION_ENTRY_BYTES
+    } else {
+        MAX_FILE_BYTES
+    }
+}
+
 fn validate_file(name: &str, bytes: &[u8]) -> Result<(), PluginError> {
     if name == "plugin.mjs" {
         return Err(invalid(REMOVED_SDK_MESSAGE));
     }
     let extension = name.rsplit('.').next().unwrap_or("");
-    let text = matches!(extension, "html" | "css" | "js" | "mjs" | "json" | "svg");
+    let text = matches!(extension, "html" | "css" | "js" | "mjs" | "cjs" | "json" | "svg");
+    // 扩展代码树：入口 extension/index.mjs 及其依赖的 JS／JSON 文件。仍是纯文本源码，
+    // 原生程序、字节码与 WASM 由下面的文件头检查拒绝。
+    let upstream_asset = name.starts_with("extension/upstream/");
+    let extension_code = name.starts_with("extension/")
+        && matches!(extension, "js" | "mjs" | "cjs" | "json");
     if name != "manifest.json"
         && name != "extension/index.mjs"
+        && !extension_code
+        && !upstream_asset
         && (!name.starts_with("ui/")
             || !matches!(
                 extension,
@@ -564,6 +635,37 @@ fn validate_file(name: &str, bytes: &[u8]) -> Result<(), PluginError> {
     }
     if text && std::str::from_utf8(bytes).is_err() {
         return Err(invalid("插件文本资源必须使用 UTF-8"));
+    }
+    Ok(())
+}
+
+/// 图标体积上限。图标只用于列表和标题展示，不需要大图。
+pub const MAX_ICON_BYTES: usize = 256 * 1024;
+
+fn icon_content_type(path: &str) -> Option<&'static str> {
+    match path.rsplit('.').next()? {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// 图标必须是真实位图：扩展名只是声明，文件头必须与之相符，SVG 因可含脚本而不放行。
+fn validate_icon(path: &str, bytes: &[u8]) -> Result<(), PluginError> {
+    if bytes.len() > MAX_ICON_BYTES {
+        return Err(invalid("图标超过 256 KiB 上限"));
+    }
+    let matches_header = match icon_content_type(path) {
+        Some("image/png") => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        Some("image/jpeg") => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        Some("image/webp") => {
+            bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP"
+        }
+        _ => false,
+    };
+    if !matches_header {
+        return Err(invalid("图标文件内容与其类型不符，只接受 png、jpg、webp 位图"));
     }
     Ok(())
 }

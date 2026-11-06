@@ -1464,6 +1464,10 @@ pub struct ApiState {
     pub skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
     /// 受信扩展宿主的运行状态来源；None 表示没有扩展宿主（例如纯 API 测试）。
     pub(crate) extension_status: Option<Arc<dyn ExtensionStatusSource>>,
+    /// 插件视图后端路由的执行端口；None 表示没有可执行扩展。
+    pub(crate) plugin_route_executor: Option<Arc<dyn PluginRouteExecutor>>,
+    /// 上游生态插件的翻译工具链（随包 Node 与兼容运行时）；None 表示本机不能翻译上游插件。
+    pub(crate) plugin_toolchain: Option<PluginToolchain>,
     /// 扩展 `input` 钩子端口；None 表示没有可执行扩展。
     pub(crate) input_guard: Option<Arc<dyn magi_conversation_runtime::extension_hooks::InputGuard>>,
     pub tunnel_manager: crate::tunnel::TunnelManager,
@@ -2042,6 +2046,9 @@ fn browser_authority_api_error(error: BrowserAuthorityError) -> ApiError {
 /// 受信扩展宿主运行状态的只读来源（daemon 的 ExtensionRuntime 实现它）。
 /// 状态属于宿主监管，插件管理器与 API 都不持有第二份。
 pub trait ExtensionStatusSource: Send + Sync {
+    fn validate_settings(&self, _plugin_id: String, _value: serde_json::Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        Box::pin(async { Err("扩展宿主未提供设置校验端口".into()) })
+    }
     fn status(
         &self,
         plugin_id: &str,
@@ -2053,6 +2060,34 @@ pub trait ExtensionStatusSource: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
         Box::pin(async { Err("扩展宿主未提供生命周期停止端口".into()) })
     }
+}
+
+/// 翻译上游生态插件所需的本机工具链：随包 Node 与兼容运行时目录（含 `cli.mjs`）。
+/// 与扩展宿主使用同一份解析结果，API 只据此启动翻译进程，不自行寻找 Node。
+#[derive(Clone, Debug)]
+pub struct PluginToolchain {
+    pub node: std::path::PathBuf,
+    pub compat: std::path::PathBuf,
+}
+
+/// 插件视图后端路由的执行端口（daemon 的 PluginServices 实现）。
+/// 路由处理器运行在受信扩展宿主里；API 只转交请求，不持有插件状态，也不解释路由语义。
+pub trait PluginRouteExecutor: Send + Sync {
+    /// 把视图请求交给该插件的宿主。调用方（HTTP 请求）被丢弃时，实现应取消宿主侧的调用。
+    fn call(
+        &self,
+        plugin_id: String,
+        request: magi_app_server_protocol::generated::PluginRouteCallRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        magi_app_server_protocol::generated::PluginRouteCallResult,
+                        ApiError,
+                    >,
+                > + Send,
+        >,
+    >;
 }
 
 impl ApiState {
@@ -2230,6 +2265,8 @@ impl ApiState {
             skill_runtime: None,
             skill_dispatch_runtime: None,
             extension_status: None,
+            plugin_route_executor: None,
+            plugin_toolchain: None,
             input_guard: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
             plugin_manager: Arc::new(Mutex::new(
@@ -5649,6 +5686,25 @@ impl ApiState {
 
     pub fn with_extension_status(mut self, source: Arc<dyn ExtensionStatusSource>) -> Self {
         self.extension_status = Some(source);
+        self
+    }
+
+    pub fn with_plugin_toolchain(mut self, toolchain: PluginToolchain) -> Self {
+        self.plugin_toolchain = Some(toolchain);
+        self
+    }
+
+    pub fn with_optional_plugin_toolchain(mut self, toolchain: Option<PluginToolchain>) -> Self {
+        self.plugin_toolchain = toolchain;
+        self
+    }
+
+    pub(crate) fn managed_process_group(&self) -> &ManagedProcessGroup {
+        &self.managed_process_group
+    }
+
+    pub fn with_plugin_route_executor(mut self, executor: Arc<dyn PluginRouteExecutor>) -> Self {
+        self.plugin_route_executor = Some(executor);
         self
     }
 

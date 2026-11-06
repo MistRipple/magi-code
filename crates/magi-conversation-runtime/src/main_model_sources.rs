@@ -3,6 +3,8 @@
 //! `plugin/<pluginId>/<contributionId>` 是插件在本次运行中贡献的数据源，只存在于运行期 section，
 //! 不写盘，插件停用、卸载或宿主退出时撤销。插件来源只追加到主对话目录，不参与其他角色。
 use crate::model_config::NormalizedModelConfig;
+use crate::model_context_window::{MAX_MODEL_CONTEXT_WINDOW, MIN_MODEL_CONTEXT_WINDOW};
+use magi_core::model_reasoning::ReasoningCapability;
 use magi_settings_store::SettingsStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -14,6 +16,22 @@ pub struct MainModelEntry {
     pub id: String,
     #[serde(default)]
     pub display_name: String,
+    /// 来源声明的上下文窗口（Token）。缺省表示来源未声明，由用户设置或内置规则解析，不按模型名猜测。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<u64>,
+    /// 来源声明的输入模态。缺省表示未声明（保持按文本规则判定）；显式列表则以它为准。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<ModelInputModality>>,
+    /// 来源声明的推理能力。缺省表示未声明。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningCapability>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelInputModality {
+    Text,
+    Image,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,6 +62,9 @@ pub struct MainModelSourcesConfig {
     pub revision: u64,
     pub sources: Vec<MainModelSource>,
 }
+
+/// `effective_config` 输出里携带来源声明的推理能力的内部字段名，只在执行链内部使用。
+pub const DECLARED_REASONING_FIELD: &str = "declaredReasoning";
 
 /// 插件贡献来源所在的运行期 section。结构：`{ "<pluginId>": { "<contributionId>": MainModelSource } }`。
 pub const PLUGIN_SOURCES_SECTION: &str = "pluginModelSources";
@@ -86,6 +107,26 @@ fn normalize_source(source: &mut MainModelSource) -> Result<(), String> {
     for model in &mut source.models {
         model.id = model.id.trim().to_string();
         model.display_name = model.display_name.trim().to_string();
+        if let Some(window) = model.context_window_tokens
+            && !(MIN_MODEL_CONTEXT_WINDOW..=MAX_MODEL_CONTEXT_WINDOW).contains(&window)
+        {
+            return Err(format!(
+                "模型 {} 的上下文窗口必须在 {MIN_MODEL_CONTEXT_WINDOW} 到 {MAX_MODEL_CONTEXT_WINDOW} 之间",
+                model.id
+            ));
+        }
+        if let Some(modalities) = &mut model.input_modalities {
+            modalities.sort_by_key(|m| *m as u8);
+            modalities.dedup();
+            if !modalities.contains(&ModelInputModality::Text) {
+                return Err(format!("模型 {} 的输入模态必须包含 text", model.id));
+            }
+        }
+        if let Some(reasoning) = &mut model.reasoning {
+            reasoning
+                .validate()
+                .map_err(|error| format!("模型 {} 的推理能力无效：{error}", model.id))?;
+        }
         if model.id.is_empty()
             || model.id.len() > 512
             || model.display_name.len() > 512
@@ -290,6 +331,22 @@ pub fn with_first_model_default(store: &SettingsStore, selection: &Value) -> Val
     resolved
 }
 
+/// 选中来源声明的输入模态：`Some(true/false)` 表示来源明确声明了是否接受图片，`None` 表示未声明。
+pub fn declared_image_input(store: &SettingsStore, source_id: &str, model: &str) -> Option<bool> {
+    let entry = sources(store).ok()?.into_iter().find_map(|candidate| {
+        (candidate.identity == source_id).then(|| {
+            candidate
+                .source
+                .models
+                .into_iter()
+                .find(|entry| entry.id == model)
+        })
+    })??;
+    entry
+        .input_modalities
+        .map(|modalities| modalities.contains(&ModelInputModality::Image))
+}
+
 pub fn effective_config(store: &SettingsStore, selection: &Value) -> Result<Value, String> {
     let identity = selection
         .get("sourceId")
@@ -317,17 +374,28 @@ pub fn effective_config(store: &SettingsStore, selection: &Value) -> Result<Valu
     if !source.models.iter().any(|entry| entry.id == model) {
         return Err("会话使用的模型已从数据源目录移除，请重新选择模型".into());
     }
+    let entry = source
+        .models
+        .iter()
+        .find(|entry| entry.id == model)
+        .ok_or("会话使用的模型已从数据源目录移除，请重新选择模型")?;
     let mut config = source.connection();
     config["sourceId"] = json!(identity);
     config["model"] = json!(model);
+    // 用户在设置里明确指定的窗口优先；其次是来源声明的窗口；都没有才回到内置规则。
     if let Some(context_window) =
         crate::model_context_window::configured_main_source_model_context_window(
             Some(store),
             identity,
             model,
         )
+        .or(entry.context_window_tokens)
     {
         config["contextWindowTokens"] = json!(context_window);
+    }
+    // 来源声明的推理能力随选择一并交给归一化：声明优先于缓存的目录探测结果。
+    if let Some(reasoning) = &entry.reasoning {
+        config[DECLARED_REASONING_FIELD] = json!(reasoning);
     }
     config["reasoningEffort"] = selection
         .get("reasoningEffort")
@@ -353,11 +421,21 @@ pub fn catalog(store: &SettingsStore) -> Result<Value, String> {
                 .models
                 .iter()
                 .map(|model| {
-                    json!({
+                    let mut projected = json!({
                         "id": model.id,
                         "displayName": if model.display_name.is_empty() { &model.id } else { &model.display_name },
-                        "reasoningCapability": config.reasoning_capability(&model.id),
-                    })
+                        "reasoningCapability": model
+                            .reasoning
+                            .clone()
+                            .unwrap_or_else(|| config.reasoning_capability(&model.id)),
+                    });
+                    if let Some(window) = model.context_window_tokens {
+                        projected["contextWindowTokens"] = json!(window);
+                    }
+                    if let Some(modalities) = &model.input_modalities {
+                        projected["inputModalities"] = json!(modalities);
+                    }
+                    projected
                 })
                 .collect::<Vec<_>>();
             let mut group = json!({
@@ -507,6 +585,88 @@ mod tests {
         assert!(effective_config(&frozen, &selected).is_ok());
         let error = effective_config(&store, &selected).unwrap_err();
         assert!(error.contains("插件数据源当前不可用"), "{error}");
+    }
+    fn declared_input(models: Value) -> Value {
+        json!({
+            "baseUrl": "https://plugin.example.test/v1", "apiKey": "plugin-secret",
+            "apiProtocol": "openai_chat", "models": models,
+        })
+    }
+    #[test]
+    fn declared_capabilities_flow_into_resolution_and_projection() {
+        let store = SettingsStore::new();
+        set_plugin_source(
+            &store,
+            "acme.proxy",
+            "gateway",
+            "Gateway",
+            &declared_input(json!([
+                {
+                    "id": "vision-1", "contextWindowTokens": 200_000,
+                    "inputModalities": ["image", "text"],
+                    "reasoning": {"supportedEfforts": ["low", "high"], "defaultEffort": "low", "transport": "openai", "source": "plugin"}
+                },
+                {"id": "plain"}
+            ])),
+        )
+        .unwrap();
+        let identity = "plugin/acme.proxy/gateway";
+        let selected = json!({"sourceId": identity, "model": "vision-1"});
+        let resolved = effective_config(&store, &selected).unwrap();
+        assert_eq!(resolved["contextWindowTokens"], 200_000);
+        let config = NormalizedModelConfig::from_settings_with_catalog(&store, &resolved).unwrap();
+        let capability = config.reasoning_capability("vision-1");
+        assert_eq!(capability.supported_efforts.len(), 2);
+        assert_eq!(capability.source, "plugin");
+        // 用户在设置里明确指定的窗口优先于来源声明。
+        crate::model_context_window::set_main_source_model_context_window(
+            &store, identity, "vision-1", 300_000,
+        )
+        .unwrap();
+        assert_eq!(
+            effective_config(&store, &selected).unwrap()["contextWindowTokens"],
+            300_000
+        );
+        // 声明了模态的条目以声明为准；未声明的条目返回 None，交还文本模型规则。
+        assert_eq!(declared_image_input(&store, identity, "vision-1"), Some(true));
+        assert_eq!(declared_image_input(&store, identity, "plain"), None);
+        let projection = catalog(&store).unwrap();
+        let models = &projection["groups"][0]["models"];
+        assert_eq!(models[0]["contextWindowTokens"], 200_000);
+        assert_eq!(models[0]["inputModalities"], json!(["text", "image"]));
+        assert!(models[1].get("contextWindowTokens").is_none());
+        assert_eq!(
+            effective_config(
+                &store,
+                &json!({"sourceId": identity, "model": "plain"})
+            )
+            .unwrap()
+            .get("contextWindowTokens"),
+            None,
+            "未声明窗口不得被编造"
+        );
+    }
+    #[test]
+    fn declared_capabilities_are_rejected_when_invalid() {
+        let store = SettingsStore::new();
+        let attempt = |model: Value| {
+            set_plugin_source(&store, "acme.proxy", "gateway", "Gateway", &declared_input(json!([model])))
+        };
+        assert!(attempt(json!({"id": "m", "contextWindowTokens": 1000})).is_err());
+        assert!(attempt(json!({"id": "m", "inputModalities": ["image"]})).is_err());
+        assert!(attempt(json!({"id": "m", "unknownField": 1})).is_err());
+        assert!(
+            attempt(json!({"id": "m", "reasoning": {"supportedEfforts": ["low"], "defaultEffort": "high", "transport": "openai"}})).is_err()
+        );
+        // 传输方式与协议不一致必须在解析时报错，而不是静默忽略。
+        attempt(json!({"id": "m", "reasoning": {"supportedEfforts": ["low"], "defaultEffort": "low", "transport": "anthropic_effort"}}))
+            .unwrap();
+        let resolved = effective_config(
+            &store,
+            &json!({"sourceId": "plugin/acme.proxy/gateway", "model": "m"}),
+        )
+        .unwrap();
+        assert!(NormalizedModelConfig::from_settings_with_catalog(&store, &resolved).is_err());
     }
     #[test]
     fn plugin_sources_are_validated_replaced_and_revoked_per_plugin() {

@@ -8,7 +8,7 @@
   import type { PluginManifest, PluginPermission, PluginRuntimeStatus } from '../shared/app-server-protocol.generated';
   import { pluginSettingsTab, type StoreItem } from '../lib/plugin-store';
   import Icon from './Icon.svelte';
-  import PluginJobs from './PluginJobs.svelte';
+  import PluginIcon from './PluginIcon.svelte';
 
   interface Props {
     item: StoreItem;
@@ -74,6 +74,7 @@
 <article class="pane" data-testid="plugin-card" data-plugin-id={item.id}>
   <header class="pane-head">
     <div class="pane-title">
+      <span class="pane-icon" aria-hidden="true"><PluginIcon pluginId={item.id} icon={item.installed?.manifest.icon} revision={item.installed?.digest ?? ''} size={28} /></span>
       <h3>{item.name}</h3>
       <span class="settings-chip">v{item.version}</span>
       {#if item.status === 'active'}<span class="settings-chip settings-chip--ok">{i18n.t('settings.plugins.status.active')}</span>
@@ -81,14 +82,30 @@
       {:else}<span class="settings-chip">{i18n.t('settings.plugins.status.notInstalled')}</span>{/if}
       {#if item.updatable}<span class="settings-chip settings-chip--accent">{i18n.t('settings.plugins.status.updatable')}</span>{/if}
     </div>
-    <div class="pane-id settings-mono">{item.id}</div>
+    <div class="pane-id settings-mono">{item.upstream && !plugin ? item.upstream.package : item.id}</div>
+    {#if item.upstream}
+      <div class="settings-chips pane-upstream" data-testid="plugin-upstream-badges">
+        <span class="settings-chip">{i18n.t(`settings.plugins.upstream.ecosystem.${item.upstream.ecosystem}`)}</span>
+        <span class="settings-chip" class:settings-chip--ok={item.upstream.official}>
+          {item.upstream.official ? i18n.t('settings.plugins.upstream.official') : i18n.t('settings.plugins.upstream.thirdParty')}
+        </span>
+        {#if item.upstream.publisher}<span class="settings-chip">{i18n.t('settings.plugins.upstream.publisher')}：{item.upstream.publisher}</span>{/if}
+      </div>
+    {/if}
   </header>
 
   <p class="pane-desc">{item.description || item.id}</p>
 
+  {#if item.upstream && !plugin}
+    <p class="settings-notice settings-notice--warn" data-testid="plugin-upstream-notice" role="note"><Icon name="info" size={13} /><span>{i18n.t('settings.plugins.upstream.notice')}</span></p>
+    {#if item.upstream.blockedReason}
+      <p class="settings-notice settings-notice--warn" data-testid="plugin-upstream-blocked" role="status"><Icon name="warning" size={13} /><span>{item.upstream.blockedReason}</span></p>
+    {/if}
+  {/if}
+
   <div class="pane-actions">
     {#if plugin}
-      {#if item.updatable && item.catalog}
+      {#if item.updatable && (item.catalog || item.upstream)}
         <button class="btn btn--lg btn--primary" data-testid="plugin-detail-update" onclick={onUpdateFromCenter} disabled={busy}>
           <Icon name="download" size={13} />
           <span>{i18n.t('settings.plugins.center.update', { from: plugin.manifest.version })}</span>
@@ -111,7 +128,7 @@
         title={removable ? undefined : i18n.t('settings.plugins.uninstallBlocked')}
       >{i18n.t('settings.plugins.uninstall')}</button>
     {:else}
-      <button class="btn btn--lg btn--primary" data-testid="plugin-detail-install" onclick={onInstall} disabled={busy}>
+      <button class="btn btn--lg btn--primary" data-testid="plugin-detail-install" onclick={onInstall} disabled={busy || (item.upstream !== null && !item.upstream.installable)} title={item.upstream?.blockedReason ?? undefined}>
         <Icon name="download" size={13} />
         <span>{i18n.t('settings.plugins.installAddress')}</span>
       </button>
@@ -136,7 +153,7 @@
     <div><dt>{i18n.t('settings.plugins.detail.version')}</dt><dd>v{item.version}{#if item.updatable} → v{item.catalog?.version}{/if}</dd></div>
       <div data-testid="plugin-source" class:pane-warn={plugin?.source.kind === 'address' || plugin?.source.kind === 'local'}>
         <dt>{i18n.t('settings.plugins.detail.source')}</dt>
-        <dd>{#if plugin}{sourceLabel(plugin)} <span class="settings-mono" title={plugin.source.location}>{plugin.source.location}</span>{:else}{i18n.t(item.catalog ? 'settings.plugins.source.center' : 'common.notProvided')}{/if}</dd>
+        <dd>{#if plugin}{sourceLabel(plugin)} <span class="settings-mono" title={plugin.source.location}>{plugin.source.location}</span>{:else}{i18n.t(item.catalog ? 'settings.plugins.source.center' : item.upstream ? 'settings.plugins.source.upstream' : 'common.notProvided')}{/if}</dd>
       </div>
       <div><dt>{i18n.t('settings.plugins.detail.digest')}</dt><dd class="settings-mono" title={plugin?.digest}>{plugin?.digest.slice(0, 16) || i18n.t('common.notProvided')}</dd></div>
       <div><dt>{i18n.t('settings.plugins.detail.size')}</dt><dd>{!plugin && item.catalog ? `${Math.round(item.catalog.size / 1024)} KB` : i18n.t('common.notProvided')}</dd></div>
@@ -193,15 +210,14 @@
       </div>
     </section>
   {/if}
-  {#if plugin && manifest && (manifest.contributions.commands?.length ?? 0) > 0}
-    {#key manifest.id}<PluginJobs {manifest} active={plugin.active} />{/key}
-  {/if}
 </article>
 
 <style>
   .pane { display: grid; align-content: start; gap: var(--space-4); padding: var(--space-5); min-width: 0; user-select: text; }
   .pane-title { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
   .pane-title h3 { overflow-wrap: anywhere; min-width: 0; margin: 0; font-size: 20px; font-weight: calc(var(--font-semibold) + 50); color: var(--foreground); }
+  .pane-icon { display: grid; place-items: center; width: 36px; height: 36px; flex: 0 0 auto; border-radius: 10px; color: var(--primary); background: var(--primary-muted); }
+  .pane-upstream { margin-top: var(--space-2); }
   .pane-id { margin-top: 6px; color: var(--foreground-muted); overflow-wrap: anywhere; }
   .pane-desc { margin: 0; color: var(--foreground); font-size: var(--text-sm); line-height: 1.6; }
   .pane-actions { display: flex; gap: var(--space-2); flex-wrap: wrap; }

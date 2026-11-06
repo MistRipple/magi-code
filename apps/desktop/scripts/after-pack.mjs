@@ -45,6 +45,10 @@ export async function afterPack(context) {
       || !manifest.files.some((file) => file.path === `daemon/node/${nodeRuntimeFileName}`)) {
     throw new Error("发行资源清单缺少随包 Node");
   }
+  if (!manifest.files.some((file) => file.path === "daemon/compat/cli.mjs")
+      || !manifest.files.some((file) => file.path.startsWith("daemon/compat/node_modules/@deepseek-ai/cordis/"))) {
+    throw new Error("发行资源清单缺少上游插件翻译运行时");
+  }
   // 校验最终制品里的 Node 能在清空环境下真实执行，且与固定版本一致。
   await runNodeRuntimePreflight(join(resources, "daemon", "node"));
 

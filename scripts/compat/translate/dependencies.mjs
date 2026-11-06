@@ -1,0 +1,42 @@
+// 原包依赖安装：由随产品发行的 pacote 解包 npm 发布物，绝不运行 lifecycle 脚本。
+import { readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import semver from 'semver';
+import pacote from 'pacote';
+
+const NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
+const shared = (name) => name === '@deepseek-ai/cordis' || name.startsWith('@deepseek-ai/dsh-') || name === '@earendil-works/pi-ai' || ['react', 'react-dom'].includes(name);
+export const isHostDependency = shared;
+
+export async function installDependencies(root, sharedRoot, registry = process.env.MAGI_NPM_REGISTRY ?? 'https://registry.npmjs.org') {
+  const records = [];
+  const work = async (directory, ancestors = new Map(), depth = 0) => {
+    if (depth > 16 || records.length > 128) throw new Error('插件依赖图超过 16 层或 128 个包');
+    const pkg = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8'));
+    if (pkg.engines?.node && !semver.satisfies(process.versions.node, pkg.engines.node)) throw new Error(`${pkg.name} 要求 Node ${pkg.engines.node}`);
+    for (const [name, range] of Object.entries({ ...pkg.peerDependencies, ...pkg.dependencies })) {
+      if (!NAME.test(name) || !semver.validRange(range)) throw new Error(`依赖 ${name}@${range} 不是可验证的 npm 语义版本范围`);
+      if (shared(name)) {
+        const manifest = join(sharedRoot, 'node_modules', ...name.split('/'), 'package.json');
+        if (!existsSync(manifest)) throw new Error(`缺少宿主依赖 ${name}`);
+        const installed = JSON.parse(readFileSync(manifest, 'utf8'));
+        if (!semver.satisfies(installed.version, range)) throw new Error(`宿主依赖 ${name}@${installed.version} 不满足 ${range}`);
+        records.push({ name, version: installed.version, host: true });
+        continue;
+      }
+      if (ancestors.has(name) && semver.satisfies(ancestors.get(name), range)) continue;
+      // 可选依赖在当前平台确实不适用时才跳过；不以下载失败当作不可用。
+      const manifest = await pacote.manifest(`${name}@${range}`, { registry, fullMetadata: true });
+      if (!manifest.dist?.integrity?.startsWith('sha512-')) throw new Error(`依赖 ${name} 缺少 sha512 完整性摘要`);
+      const destination = join(directory, 'node_modules', ...name.split('/'));
+      mkdirSync(destination, { recursive: true });
+      await pacote.extract(manifest.dist.tarball, destination, { registry, integrity: manifest.dist.integrity, ignoreScripts: true });
+      const saved = JSON.parse(readFileSync(join(destination, 'package.json'), 'utf8'));
+      if (saved.name !== name || saved.version !== manifest.version) throw new Error(`依赖 ${name} 的包身份与 registry 不符`);
+      records.push({ name, version: saved.version, integrity: manifest.dist.integrity, host: false });
+      await work(destination, new Map([...ancestors, [name, saved.version]]), depth + 1);
+    }
+  };
+  await work(root);
+  return records;
+}

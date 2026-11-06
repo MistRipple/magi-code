@@ -15,6 +15,7 @@ use std::{
 };
 
 mod drain;
+mod runtime_catalog;
 mod upgrade;
 
 pub use drain::PluginDrainGuard;
@@ -30,10 +31,24 @@ const BUILTIN_PLUGIN_IDS: &[&str] = &[];
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PluginSource {
-    Center { url: String },
-    Address { url: String },
-    Local { name: String },
-    Builtin { name: String },
+    Center {
+        url: String,
+    },
+    Address {
+        url: String,
+    },
+    Local {
+        name: String,
+    },
+    Builtin {
+        name: String,
+    },
+    /// 上游生态（DSH、pi）的 npm 发布包，经翻译器在本机安装期翻译。版本是安装时固定的精确版本。
+    Upstream {
+        ecosystem: String,
+        package: String,
+        version: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -86,6 +101,7 @@ pub struct ActivePlugin {
 /// daemon 插件服务的唯一写入口。来源解析和下载在外层完成，进入此处的始终是已校验包。
 pub struct PluginManager {
     root: PathBuf,
+    runtime_catalogs: BTreeMap<String, runtime_catalog::RuntimeCatalog>,
     state: PluginManagerState,
     resources: PluginResourceStore,
     /// 已校验包的内存副本，按插件 ID 缓存并以摘要核对；包文件不可变，
@@ -109,15 +125,20 @@ pub struct RetiredBuiltin {
 impl PluginSource {
     fn projection(&self) -> PluginSourceProjection {
         let (kind, location) = match self {
-            Self::Center { url } => (PluginSourceKind::Center, url),
-            Self::Address { url } => (PluginSourceKind::Address, url),
-            Self::Local { name } => (PluginSourceKind::Local, name),
-            Self::Builtin { name } => (PluginSourceKind::Builtin, name),
+            Self::Center { url } => (PluginSourceKind::Center, url.clone()),
+            Self::Address { url } => (PluginSourceKind::Address, url.clone()),
+            Self::Local { name } => (PluginSourceKind::Local, name.clone()),
+            Self::Builtin { name } => (PluginSourceKind::Builtin, name.clone()),
+            Self::Upstream {
+                ecosystem,
+                package,
+                version,
+            } => (
+                PluginSourceKind::Upstream,
+                format!("{ecosystem}:{package}@{version}"),
+            ),
         };
-        PluginSourceProjection {
-            kind,
-            location: location.clone(),
-        }
+        PluginSourceProjection { kind, location }
     }
 }
 
@@ -155,6 +176,7 @@ impl PluginManager {
             PluginResourceStore::open(root.join("resources.json")).map_err(PluginError::Storage)?;
         let mut manager = Self {
             root,
+            runtime_catalogs: BTreeMap::new(),
             state,
             resources,
             packages: Mutex::new(BTreeMap::new()),
@@ -232,8 +254,8 @@ impl PluginManager {
     }
 
     pub fn validate_settings(&self, id: &str, value: &Value) -> Result<(), PluginError> {
-        let package = self.package(id)?;
-        let validator = jsonschema::validator_for(&package.manifest().settings_schema)
+        let manifest = self.runtime_manifest(id, true)?;
+        let validator = jsonschema::validator_for(&manifest.settings_schema)
             .map_err(|error| invalid(format!("插件设置 schema 无效：{error}")))?;
         if validator.is_valid(value) {
             Ok(())
@@ -255,7 +277,16 @@ impl PluginManager {
             .get(id)
             .ok_or_else(|| PluginError::Conflict("插件未安装".into()))?;
         Ok(package.manifest().permissions.iter().any(|permission| {
-            if permission.kind != kind || !permission.targets.iter().any(|item| item == target) {
+            if permission.kind != kind
+                || !permission.targets.iter().any(|item| {
+                    item == target
+                        || (item == "*"
+                            && matches!(
+                                kind,
+                                PluginPermissionKind::Tools | PluginPermissionKind::ModelSources
+                            ))
+                })
+            {
                 return false;
             }
             permission_granted(permission, &installed.grants)
@@ -591,8 +622,8 @@ impl PluginManager {
         Ok(self
             .active_packages()?
             .iter()
-            .map(|package| package.manifest().clone())
-            .collect())
+            .map(|package| self.effective_manifest(&package.manifest().id))
+            .collect::<Result<_, _>>()?)
     }
 
     /// 模型可见且可执行的工具目录：只含已获 `tools` 授权的贡献。目录与执行
@@ -608,7 +639,7 @@ impl PluginManager {
     > {
         let mut tools = Vec::new();
         for package in self.active_packages()? {
-            let manifest = package.manifest();
+            let manifest = self.effective_manifest(&package.manifest().id)?;
             for tool in &manifest.contributions.tools {
                 if self.permission_allowed(&manifest.id, PluginPermissionKind::Tools, &tool.id)? {
                     tools.push((manifest.clone(), tool.clone()));
@@ -628,18 +659,14 @@ impl PluginManager {
         )>,
         PluginError,
     > {
-        Ok(self
-            .active_packages()?
-            .iter()
-            .flat_map(|package| {
-                let manifest = package.manifest();
-                manifest
-                    .contributions
-                    .commands
-                    .iter()
-                    .map(move |command| (manifest.clone(), command.clone()))
-            })
-            .collect())
+        let mut commands = Vec::new();
+        for package in self.active_packages()? {
+            let manifest = self.effective_manifest(&package.manifest().id)?;
+            for command in &manifest.contributions.commands {
+                commands.push((manifest.clone(), command.clone()));
+            }
+        }
+        Ok(commands)
     }
 
     /// 解析并校验一次模型发起的工具调用：工具必须在当前激活目录内，参数必须是
@@ -687,7 +714,7 @@ impl PluginManager {
                 .values()
                 .map(|installed| {
                     Ok(PluginInstalledProjection {
-                        manifest: self.package(&installed.id)?.manifest().clone(),
+                        manifest: self.effective_manifest(&installed.id)?,
                         digest: installed.digest.clone(),
                         enabled: installed.enabled,
                         active: installed.active,
@@ -733,6 +760,7 @@ impl PluginManager {
             .map_err(|error| PluginError::CorruptState(error.to_string()))?;
         write_atomic(&self.root.join(STATE_FILE), bytes)?;
         self.state = next;
+        self.invalidate_inactive_runtimes();
         Ok(())
     }
 }

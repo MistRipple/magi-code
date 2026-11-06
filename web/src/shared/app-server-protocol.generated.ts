@@ -687,6 +687,7 @@ export interface PluginToolContribution {
   description: string;
   inputSchema: Record<string, unknown>;
   readOnly: boolean;
+  timeoutMs?: number | null;
 }
 
 export type PluginViewPlacement = "settings" | "home" | "main" | "rightPane" | "homeCard";
@@ -738,6 +739,8 @@ export interface PluginHookDeclaration {
 
 export interface PluginExtension {
   hooks: Array<PluginHookDeclaration>;
+  compat?: PluginCompat;
+  runtimeContributions?: Array<PluginRuntimeContributionKind>;
 }
 
 export interface PluginManifest {
@@ -746,6 +749,7 @@ export interface PluginManifest {
   version: string;
   name: string;
   description: string;
+  icon?: string;
   extension?: PluginExtension;
   permissions: Array<PluginPermission>;
   contributions: PluginContributions;
@@ -779,7 +783,7 @@ export interface PluginCandidatePreview {
   dataReset: boolean;
 }
 
-export type PluginSourceKind = "center" | "address" | "local" | "builtin";
+export type PluginSourceKind = "center" | "address" | "local" | "builtin" | "upstream";
 
 export interface PluginSourceProjection {
   kind: PluginSourceKind;
@@ -854,6 +858,21 @@ export interface PluginResource {
 export interface PluginResourceWriteRequest {
   expectedVersion: number;
   value: unknown;
+}
+
+export type PluginRouteMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+export interface PluginRouteCallRequest {
+  method: PluginRouteMethod;
+  path: string;
+  query?: string;
+  body?: unknown;
+}
+
+export interface PluginRouteCallResult {
+  status: number;
+  contentType?: string;
+  body?: unknown;
 }
 
 export type SessionTurnGuideStatus = "ready" | "no_active_turn" | "input_closed" | "unsupported_input" | "unsupported_executor";
@@ -1475,4 +1494,76 @@ export interface PluginJobSchedule {
   pendingRequestId: string | null;
   lastTurnId: string | null;
   lastOutcome: string | null;
+}
+
+export type PluginCompatKind = "dsh" | "pi";
+
+export interface PluginCompat {
+  kind: PluginCompatKind;
+}
+
+export type PluginUpstreamEntryState = "available" | "updatable" | "installed";
+
+export interface PluginUpstreamEntry {
+  ecosystem: PluginEcosystem;
+  package: string;
+  version: string;
+  name: string;
+  description: string;
+  publisher: string;
+  official: boolean;
+  state: PluginUpstreamEntryState;
+  installedPluginId?: string | null;
+  installedVersion?: string | null;
+  installable: boolean;
+  blockedReason?: string | null;
+}
+
+export interface PluginUpstreamProjection {
+  registry: string;
+  entries: Array<PluginUpstreamEntry>;
+  error?: string | null;
+}
+
+export interface PluginUpstreamRequest {
+  ecosystem: PluginEcosystem;
+  package: string;
+  version?: string | null;
+  expectedDigest?: string | null;
+}
+
+export interface PluginTranslationNote {
+  name: string;
+  status: string;
+  note: string;
+}
+
+export interface PluginTranslationSummary {
+  tools: Array<string>;
+  commands: Array<string>;
+  modelSources: Array<string>;
+  unmountedSlots: Array<string>;
+  degraded: Array<PluginTranslationNote>;
+  omittedFiles: number;
+}
+
+export interface PluginUpstreamPreview {
+  candidate: PluginCandidatePreview;
+  package: string;
+  version: string;
+  integrity: string;
+  publisher: string;
+  official: boolean;
+  translation: PluginTranslationSummary;
+}
+
+export type PluginEcosystem = "dsh" | "pi";
+
+export type PluginRuntimeContributionKind = "tools" | "commands" | "modelSources" | "settings";
+
+export interface PluginRuntimeCatalog {
+  tools?: Array<PluginToolContribution>;
+  commands?: Array<PluginNamedContribution>;
+  modelSources?: Array<PluginNamedContribution>;
+  settingsSchema?: Record<string, unknown> | null;
 }

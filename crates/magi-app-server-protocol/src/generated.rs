@@ -1527,6 +1527,10 @@ pub struct PluginToolContribution {
     pub input_schema: Value,
     #[serde(rename = "readOnly")]
     pub read_only: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "timeoutMs")]
+    pub timeout_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1641,6 +1645,12 @@ pub struct PluginHookDeclaration {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginExtension {
     pub hooks: Vec<PluginHookDeclaration>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compat: Option<PluginCompat>,
+    #[serde(default)]
+    #[serde(rename = "runtimeContributions")]
+    pub runtime_contributions: Vec<PluginRuntimeContributionKind>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1652,6 +1662,9 @@ pub struct PluginManifest {
     pub version: String,
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<PluginExtension>,
@@ -1739,6 +1752,8 @@ pub enum PluginSourceKind {
     Local,
     #[serde(rename = "builtin")]
     Builtin,
+    #[serde(rename = "upstream")]
+    Upstream,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1875,6 +1890,47 @@ pub struct PluginResourceWriteRequest {
     #[serde(rename = "expectedVersion")]
     pub expected_version: u64,
     pub value: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginRouteMethod {
+    #[serde(rename = "GET")]
+    GET,
+    #[serde(rename = "POST")]
+    POST,
+    #[serde(rename = "PUT")]
+    PUT,
+    #[serde(rename = "PATCH")]
+    PATCH,
+    #[serde(rename = "DELETE")]
+    DELETE,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginRouteCallRequest {
+    pub method: PluginRouteMethod,
+    pub path: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginRouteCallResult {
+    pub status: u16,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "contentType")]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3340,4 +3396,152 @@ pub struct PluginJobSchedule {
     #[serde(default)]
     #[serde(rename = "lastOutcome")]
     pub last_outcome: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginCompatKind {
+    #[serde(rename = "dsh")]
+    Dsh,
+    #[serde(rename = "pi")]
+    Pi,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginCompat {
+    pub kind: PluginCompatKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginUpstreamEntryState {
+    #[serde(rename = "available")]
+    Available,
+    #[serde(rename = "updatable")]
+    Updatable,
+    #[serde(rename = "installed")]
+    Installed,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginUpstreamEntry {
+    pub ecosystem: PluginEcosystem,
+    pub package: String,
+    pub version: String,
+    pub name: String,
+    pub description: String,
+    pub publisher: String,
+    pub official: bool,
+    pub state: PluginUpstreamEntryState,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "installedPluginId")]
+    pub installed_plugin_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "installedVersion")]
+    pub installed_version: Option<String>,
+    pub installable: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "blockedReason")]
+    pub blocked_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginUpstreamProjection {
+    pub registry: String,
+    pub entries: Vec<PluginUpstreamEntry>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginUpstreamRequest {
+    pub ecosystem: PluginEcosystem,
+    pub package: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expectedDigest")]
+    pub expected_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginTranslationNote {
+    pub name: String,
+    pub status: String,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginTranslationSummary {
+    pub tools: Vec<String>,
+    pub commands: Vec<String>,
+    #[serde(rename = "modelSources")]
+    pub model_sources: Vec<String>,
+    #[serde(rename = "unmountedSlots")]
+    pub unmounted_slots: Vec<String>,
+    pub degraded: Vec<PluginTranslationNote>,
+    #[serde(rename = "omittedFiles")]
+    pub omitted_files: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginUpstreamPreview {
+    pub candidate: PluginCandidatePreview,
+    pub package: String,
+    pub version: String,
+    pub integrity: String,
+    pub publisher: String,
+    pub official: bool,
+    pub translation: PluginTranslationSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginEcosystem {
+    #[serde(rename = "dsh")]
+    Dsh,
+    #[serde(rename = "pi")]
+    Pi,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginRuntimeContributionKind {
+    #[serde(rename = "tools")]
+    Tools,
+    #[serde(rename = "commands")]
+    Commands,
+    #[serde(rename = "modelSources")]
+    ModelSources,
+    #[serde(rename = "settings")]
+    Settings,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginRuntimeCatalog {
+    #[serde(default)]
+    pub tools: Vec<PluginToolContribution>,
+    #[serde(default)]
+    pub commands: Vec<PluginNamedContribution>,
+    #[serde(default)]
+    #[serde(rename = "modelSources")]
+    pub model_sources: Vec<PluginNamedContribution>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "settingsSchema")]
+    pub settings_schema: Option<Value>,
 }

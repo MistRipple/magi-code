@@ -13,5 +13,6 @@ export function apply(ctx: Context) {
   ctx.llm.registerAdapter(['mini'], new PiAiAdapter({}))
   ctx.inject(['tools'], (toolsCtx) => { toolsCtx.tools.register({}) })
   ctx.webServer.register('/x', () => {})
+  ctx.webServer.registerFallback(() => {})
   void readFile; void helper; void mystery
 }
