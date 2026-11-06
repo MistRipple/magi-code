@@ -33,6 +33,7 @@
     "plugin-center:build": "node scripts/build-plugin-center.mjs",
     "plugin-center:check": "node scripts/build-plugin-center.mjs --check",
     "test:electron-plugins": "node scripts/verify-electron-plugins.mjs",
+    "test:electron-plugin-runtime": "node scripts/verify-electron-plugin-runtime.mjs",
     "test:compat": "node --test scripts/compat/test.mjs scripts/compat/runtime.test.mjs",
     "test:local-plugins": "node scripts/verify-local-plugins.mjs",
     "test:local-plugins-ui": "node scripts/verify-local-plugins.mjs --ui",

@@ -259,7 +259,7 @@ export async function stageExtensionNode() {
 /**
  * 准备上游生态插件的翻译运行时（`scripts/compat`）：翻译器源码、预构建的页面运行时，
  * 以及按锁文件精确安装的生产依赖。依赖只来自锁文件固定的 registry 摘要；不运行任何安装脚本，
- * 不安装可选的原生依赖。
+ * 包含当前平台的可选依赖（图片转换使用 sharp 的预编译模块）。
  */
 export async function stageCompatRuntime() {
   const source = join(repositoryRoot, "scripts", "compat");
@@ -278,10 +278,14 @@ export async function stageCompatRuntime() {
   // npm 的内部缓存文件不属于发行物，且以点开头的 node_modules 元数据会被打包器按依赖清单特殊处理。
   await rm(join(compatRuntimeDist, "node_modules", ".package-lock.json"), { force: true });
   await rm(join(compatRuntimeDist, "node_modules", ".bin"), { recursive: true, force: true });
-  // 页面运行时由 esbuild 预构建（需要开发依赖），在源目录构建后复制，不在用户机器上构建。
-  await execFileAsync(npmCommand, ["run", "build:client"], { cwd: source, maxBuffer: 16 * 1024 * 1024, shell: process.platform === "win32" });
-  await mkdir(join(compatRuntimeDist, "dist"), { recursive: true });
-  await cp(join(source, "dist", "dsh-client-host.js"), join(compatRuntimeDist, "dist", "dsh-client-host.js"));
+  // electron-builder 不复制 .gitkeep；在生成资源摘要前移除空目录占位，保持逐文件校验完整。
+  for (const path of await walkFiles(compatRuntimeDist)) {
+    if (basename(path) === ".gitkeep") await rm(path);
+  }
+  // esbuild 来自根 workspace；页面依赖只读取刚安装的发行暂存目录。
+  await execFileAsync(process.execPath, [join(source, "tools", "build-client-shim.mjs"), compatRuntimeDist], {
+    cwd: repositoryRoot, maxBuffer: 16 * 1024 * 1024,
+  });
   const { access: probe } = await import("node:fs/promises");
   await probe(join(compatRuntimeDist, "node_modules", "@deepseek-ai", "cordis", "package.json"));
 }

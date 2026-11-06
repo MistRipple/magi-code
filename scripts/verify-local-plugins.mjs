@@ -117,7 +117,7 @@ async function verifyUi(session) {
   await mkdir(output, {recursive:true});
   const result = await run(executable, ['--headless', '--disable-gpu', '--use-mock-keychain', join(root, 'scripts/lib/plugin-ui-acceptance.cjs')], {cwd:root, timeout:90000, maxBuffer:1024*1024, env:{...process.env, MAGI_PLUGIN_UI_URL:`${origin}/web.html?scope=personal&sessionId=${encodeURIComponent(session)}`,MAGI_PLUGIN_UI_SESSION:session,MAGI_PLUGIN_UI_OUTPUT:output,MAGI_PLUGIN_UI_USER_DATA:join(work,'electron')}});
   console.log(result.stdout.trim());
-  check('真实工作台创建计划并展示会话／预算／daemon 回执，390px 无横向溢出', true);
+  check('真实工作台展示插件图标、设置页与启停恢复，390px 无横向溢出', true);
 }
 try {
   check('验收不接管已有 daemon', !await fetch(`${origin}/health`).then(()=>true,()=>false));

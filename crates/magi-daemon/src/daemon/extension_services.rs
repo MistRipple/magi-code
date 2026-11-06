@@ -197,6 +197,7 @@ impl HostService for PluginHostService {
         ) {
             return self.request_with_identity(plugin_id, method, params);
         }
+        let params = native_params(params);
         let native = self.native.get().cloned();
         Box::pin(async move {
             let native =
@@ -272,6 +273,7 @@ impl HostService for PluginHostService {
                     });
                 }
             }
+            let params = native_params(params);
             let native = self.native.get().cloned();
             return Box::pin(async move {
                 let native = native
@@ -582,6 +584,14 @@ impl HostService for PluginHostService {
     }
 }
 
+// 实例租约由本层校验；原生业务 DTO 只接收业务字段和独立的调用归属。
+fn native_params(mut params: Value) -> Value {
+    if let Some(object) = params.as_object_mut() {
+        object.remove("_instance");
+    }
+    params
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,6 +798,60 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(missing_owner.kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn native_services_receive_owner_context_without_transport_instance_metadata() {
+        let (_dir, service) = fixture();
+        service.instance_started("acme.services", "active").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received = Arc::clone(&calls);
+        assert!(
+            service
+                .native
+                .set(Arc::new(move |_, _, params, _| {
+                    assert!(params.get("_instance").is_none());
+                    assert_eq!(
+                        params.pointer("/_context/owner/sessionId"),
+                        Some(&json!("signed"))
+                    );
+                    received.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({}))
+                }))
+                .is_ok()
+        );
+        let params = json!({"_instance": "active", "_context": {"owner": {"sessionId": "signed"}}});
+        for method in [
+            "session.snapshot",
+            "notify.user",
+            "ask.user",
+            "task.spawn",
+            "tool.call",
+        ] {
+            service
+                .request_scoped(
+                    "acme.services".into(),
+                    method.into(),
+                    params.clone(),
+                    Arc::default(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        service.instance_ended("acme.services", "active");
+        assert!(
+            service
+                .request_scoped(
+                    "acme.services".into(),
+                    "notify.user".into(),
+                    params,
+                    Arc::default()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]

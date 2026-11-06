@@ -1,10 +1,11 @@
 // 预先构建 DSH 页面运行时（React + 垫片）为 dist/dsh-client-host.js。随 Magi 发行，不在用户机器上构建。
 import { build } from 'esbuild';
 import { mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const compat = join(dirname(fileURLToPath(import.meta.url)), '..');
+// 发行构建直接使用暂存目录已按锁文件安装的依赖，不要求源码目录另做 npm install。
+const compat = process.argv[2] ? resolve(process.argv[2]) : join(dirname(fileURLToPath(import.meta.url)), '..');
 mkdirSync(join(compat, 'dist'), { recursive: true });
 await build({
   entryPoints: [join(compat, 'runtime/client/entry.mjs')], outfile: join(compat, 'dist/dsh-client-host.js'),

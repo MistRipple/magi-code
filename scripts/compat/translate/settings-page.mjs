@@ -18,6 +18,7 @@ export function renderSettingsPage({ schema, title, hidden = [], runtimeSchema =
       description: node.description ?? '',
       options: node.enum ?? [],
       required: (schema.required ?? []).includes(key),
+      defaultValue: node.default,
     }));
   const data = JSON.stringify({ fields }).replace(/</g, '\\u003c');
   return `<!doctype html>
@@ -85,7 +86,7 @@ export function renderSettingsPage({ schema, title, hidden = [], runtimeSchema =
     version = settings.version;
     current = settings.value ?? {};
     for (const { field, control } of controls.values()) {
-      const value = current[field.key];
+      const value = current[field.key] === undefined ? field.defaultValue : current[field.key];
       if (field.kind === 'boolean') control.checked = value === true;
       else if (field.kind === 'enum') control.value = JSON.stringify(value ?? field.options[0]);
       else if (field.kind === 'json') control.value = value === undefined ? '' : JSON.stringify(value, null, 2);
@@ -112,7 +113,7 @@ export function renderSettingsPage({ schema, title, hidden = [], runtimeSchema =
       instanceId = m.instanceId;
       if (runtimeSchema) {
         const { schema } = await request('settings.describe', {});
-        fields = Object.entries(schema.properties ?? {}).map(([key, node]) => ({key, kind: node.enum ? 'enum' : node.type === 'object' || node.type === 'array' || node.anyOf ? 'json' : node.type, description: node.description ?? '', options: node.enum ?? [], required: (schema.required ?? []).includes(key)}));
+        fields = Object.entries(schema.properties ?? {}).map(([key, node]) => ({key, kind: node.enum ? 'enum' : node.type === 'object' || node.type === 'array' || node.anyOf ? 'json' : node.type, description: node.description ?? '', options: node.enum ?? [], required: (schema.required ?? []).includes(key), defaultValue: node.default}));
       }
       build();
       show(await request('settings.read', {}));
