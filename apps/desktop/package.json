@@ -17,13 +17,13 @@
     "bridge:preflight": "node scripts/bridge-preflight.mjs"
   },
   "devDependencies": {
-    "@electron-internal/extract-zip": "1.0.6",
+    "@electron-internal/extract-zip": "1.0.8",
     "@electron/asar": "4.3.1",
     "@electron/get": "5.1.0",
     "@magi/desktop-browser-contracts": "0.0.0",
     "@types/node": "24.19.2",
     "@types/ws": "8.18.2",
-    "electron": "45.0.0",
+    "electron": "45.1.0",
     "electron-builder": "26.18.0",
     "electron-updater": "6.8.11",
     "esbuild": "0.28.2",
