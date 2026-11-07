@@ -1,9 +1,7 @@
 // DSH 插件管理沿 daemon 的安装、摘要确认和生命周期入口。新包授权需要
 // 管理插件单独获得 authorize 委托；失败不能把已下载当成已运行。
 import semver from 'semver';
-import pacote from 'pacote';
 import { profileCompatibility, updateProfileExemption } from './profile.mjs';
-import { checkDshCompatibility } from '../core/dsh-compatibility.mjs';
 
 const NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
 const failure = (error, extra = {}) => ({ application: 'failed', ...extra,
@@ -40,7 +38,7 @@ export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTR
         const name = spec.slice(0, separator), version = spec.slice(separator + 1);
         return [{ name, version, enabled, active, installed: true, source: version,
           availability: 'profile', removable: true, official: name.startsWith('@deepseek-ai/'),
-          ...(!api.plugins.install ? { readOnlyReason: '在线安装、升级和启停请使用 Magi 的插件管理入口' } : {}),
+          ...(!api.plugins.installBundle ? { readOnlyReason: '在线安装、升级和启停请使用 Magi 的插件管理入口' } : {}),
           meta: { title: manifest.name, description: manifest.description } }];
       });
     },
@@ -54,54 +52,18 @@ export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTR
       return { target, runtimeVersion, enabled, exemptions, application: 'applied' };
     },
   };
-  if (api.plugins.preview && api.plugins.install) {
+  if (api.plugins.installBundle) {
     manager.installBundle = async (spec, options = {}) => {
-      let installed, preview;
       try {
         if (options.enabled !== undefined && typeof options.enabled !== 'boolean') throw new Error('enabled 必须是布尔值');
         if (options.approvedBuilds?.length) throw new Error('Magi 不执行安装脚本，不接受构建授权');
         if (options.registry && options.registry.replace(/\/+$/, '') !== registry.replace(/\/+$/, '')) throw new Error('安装源与 Magi 当前 registry 不一致，请先在 Magi 中配置安装源');
-        const request = parseBundleSpec(spec);
-        if ((request.version && !semver.valid(request.version)) || api.plugins.compatibility) {
-          const manifest = await pacote.manifest(`${request.package}@${request.version ?? 'latest'}`, { registry, ignoreScripts: true });
-          if (manifest.name !== request.package || !semver.valid(manifest.version)) throw new Error('registry 返回的插件身份无效');
-          request.version = manifest.version;
-          // 与翻译器共用上游版本规则，为原生页面保留可处理的精确诊断。
-          // 此处只预检；真正安装仍由 daemon 在翻译和提交时重新准入。
-          if (api.plugins.compatibility) {
-            const policy = await api.plugins.compatibility();
-            checkDshCompatibility(manifest, policy, policy);
-          }
-        }
-        preview = await api.plugins.preview(request);
-        const list = await api.plugins.install({ ...request, version: preview.version, expectedDigest: preview.candidate.digest });
-        installed = list.plugins.find(({ source }) => source.location === `dsh:${request.package}@${preview.version}`);
-        if (!installed) throw new Error('安装结果缺少插件记录');
-        if (options.enabled === false && (installed.enabled || installed.active)) {
-          await api.plugins.setEnabled(installed.manifest.id, false, installed.digest);
-        }
-        if (options.enabled !== false) {
-          if (api.plugins.authorize && !installed.active) {
-            await api.plugins.authorize(installed.manifest.id, installed.digest, installed.manifest.permissions);
-          }
-          const updated = await api.plugins.setEnabled(installed.manifest.id, true, installed.digest);
-          installed = updated.plugins.find((plugin) => plugin.manifest.id === installed.manifest.id);
-          if (!installed?.active) throw new Error('插件尚未激活');
-        }
-        return { bundle: request.package, application: 'applied', version: preview.version,
-          changed: ['install', 'upgrade'].includes(preview.candidate.operation) };
-      } catch (error) {
-        if (installed) {
-          const authorization = error.kind === 'PermissionDenied';
-          return failure(Object.assign(new Error(`已安装 ${installed.manifest.name}，后续操作未完成：${error.message}${authorization ? '；请在 Magi 插件管理中确认权限后激活' : ''}`), { code: authorization ? 'authorization-required' : 'activation-failed' }), {
-            bundle: parseBundleSpec(spec).package, installed: true, stage: 'enable', version: preview.version,
-            changed: ['install', 'upgrade'].includes(preview.candidate.operation),
-          });
-        }
-        return failure(error, { stage: 'install' });
-      }
+        return await api.plugins.installBundle({ ...parseBundleSpec(spec), requestId: options.requestId ?? crypto.randomUUID(),
+          ...(options.enabled === undefined ? {} : { enabled: options.enabled }) });
+      } catch (error) { return failure(error, { stage: 'install' }); }
     };
   }
+  if (api.plugins.cancelInstall) manager.cancelInstall = (requestId) => api.plugins.cancelInstall(requestId);
   if (api.plugins.setEnabled) manager.setBundleEnabled = async (name, enabled) => {
     try {
       if (typeof enabled !== 'boolean') throw new Error('enabled 必须是布尔值');

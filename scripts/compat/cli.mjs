@@ -9,6 +9,25 @@ const [command, directory, ...flags] = process.argv.slice(2);
 const optionOf = (list, name) => { const i = list.indexOf(`--${name}`); return i === -1 ? undefined : list[i + 1]; };
 const flag = (name) => optionOf(flags, name);
 
+if (command === 'resolve') {
+  try {
+    const [{ default: pacote }, { default: semver }, { dshEnvironment, checkDshCompatibility }, { dirname }, { fileURLToPath }] = await Promise.all([
+      import('pacote'), import('semver'), import('./core/dsh-compatibility.mjs'), import('node:path'), import('node:url'),
+    ]);
+    const spec = flags[0] ?? 'latest';
+    if (!/^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/.test(directory ?? '')
+      || (!semver.validRange(spec) && !/^[a-z][a-z0-9._-]*$/i.test(spec))) throw new Error('npm 插件来源或版本范围无效');
+    const document = await pacote.manifest(`${directory}@${spec}`, { registry: process.env.MAGI_NPM_REGISTRY ?? 'https://registry.npmjs.org', fullMetadata: true, preferOnline: true, ignoreScripts: true, fetchRetries: 2, fetchTimeout: 30_000 });
+    if (document.name !== directory || !semver.valid(document.version)) throw new Error('registry 返回的插件身份无效');
+    const policy = process.env.MAGI_DSH_COMPATIBILITY_POLICY ? JSON.parse(process.env.MAGI_DSH_COMPATIBILITY_POLICY) : undefined;
+    checkDshCompatibility(document, dshEnvironment(dirname(fileURLToPath(import.meta.url))), policy);
+    process.stdout.write(JSON.stringify({ document }));
+  } catch (error) {
+    process.stdout.write(JSON.stringify({ error: { code: error.code ?? 'resolve-failed', message: error.message, diagnostic: error.message,
+      ...(error.incompatible ? { incompatible: error.incompatible } : {}) } }));
+  }
+  process.exit(0);
+}
 if (command === 'prepare') {
   const kind = directory;
   const [upstreamDir, ...args] = flags;

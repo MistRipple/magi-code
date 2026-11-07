@@ -5,6 +5,8 @@ import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createServer } from 'node:http';
+import { Readable } from 'node:stream';
 import { packPlugin } from './compat/core/pack.mjs';
 import { connectAppPage, connectTarget, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
 
@@ -16,6 +18,24 @@ const output = join(root, 'target/plugin-acceptance/dsh-management');
 const work = await mkdtemp(join(tmpdir(), 'magi-dsh-management-'));
 const report = createReporter(), errors = [];
 let app, page, frame, ui;
+// 转发真实 npm 元数据，仅暂停指定安装任务的解析请求来确定性验证取消。
+// 原包、integrity、页面及业务均不替换；不影响用户正在运行的实例。
+let holdResolution = false;
+const held = new Set();
+const registryProxy = createServer(async (request, response) => {
+  if (holdResolution && request.headers['pacote-pkg-id'] === `registry:${targetPackage}`) {
+    held.add(response);
+    response.on('close', () => held.delete(response));
+    return;
+  }
+  try {
+    const upstream = await fetch(`https://registry.npmjs.org${request.url}`, {
+      headers: { accept: request.headers.accept ?? 'application/json' }, signal: AbortSignal.timeout(120_000),
+    });
+    response.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
+    Readable.fromWeb(upstream.body).on('error', () => response.destroy()).pipe(response);
+  } catch (error) { response.writeHead(502); response.end(String(error)); }
+});
 await mkdir(output, { recursive: true });
 async function api(path, body) {
   const response = await fetch(origin + path, { method: body === undefined ? 'GET' : 'POST', headers: { origin, 'content-type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(300_000) });
@@ -39,9 +59,21 @@ async function installUpstream(name, version) {
   return list.plugins.find((plugin) => plugin.source.location === `dsh:${name}@${version}`);
 }
 async function callRoute(id, path, body) {
-  return api(`/api/plugins/${id}/routes`, { method: 'POST', path, body });
+  return api(`/api/plugins/${id}/routes`, { method: body === undefined ? 'GET' : 'POST', path, ...(body === undefined ? {} : { body }) });
 }
 async function screenshot(name) { await writeFile(join(output, name + '.png'), Buffer.from(await ui.screenshot(), 'base64')); }
+async function openSettings(plugin) {
+  frame?.close();
+  await waitFor(() => ui.exists('[data-testid=sidebar-settings]'), '设置入口');
+  await ui.click('[data-testid=sidebar-settings]');
+  const view = plugin.manifest.contributions.views.find((v) => v.placements.includes('settings'));
+  const nav = `[data-testid=${JSON.stringify(`settings-nav-plugin:${plugin.manifest.id}:${view.id}`)}]`;
+  await waitFor(() => ui.exists(nav), '原生页面入口'); await ui.click(nav);
+  const selector = `iframe[data-plugin-id=${JSON.stringify(plugin.manifest.id)}]`;
+  await waitFor(() => ui.exists(selector), '原包页面');
+  const frameUrl = await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).src`);
+  frame = await waitFor(() => connectTarget(cdpPort, (t) => (t.type === 'iframe' || t.type === 'page') && t.url === frameUrl, '原生页面', errors), '原包 iframe');
+}
 async function installFixture() {
   const dir = join(work, 'fixture'); await mkdir(join(dir, 'extension'), { recursive: true });
   const manifest = { sdkVersion: 2, id: 'magi.management-test', name: 'Management acceptance', version: '1.0.0', description: '', dataSchemaVersion: 1, extension: { hooks: [] },
@@ -72,8 +104,10 @@ async function installFixture() {
   };
 }
 try {
+  await new Promise((resolve) => registryProxy.listen(0, '127.0.0.1', resolve));
+  const registry = `http://127.0.0.1:${registryProxy.address().port}`;
   assert.ok(!await fetch(origin + '/health').then(() => true, () => false), '验收端口已占用');
-  app = launchApp({ executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort, env: { MAGI_STATE_ROOT: join(work, 'state'), DSH_HOME: join(work, 'dsh'), MAGI_DESKTOP_DAEMON_PORT: String(port), MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '' } });
+  app = launchApp({ executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort, env: { MAGI_STATE_ROOT: join(work, 'state'), DSH_HOME: join(work, 'dsh'), MAGI_NPM_REGISTRY: registry, MAGI_DESKTOP_DAEMON_PORT: String(port), MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '' } });
   await waitFor(() => api('/health'), 'daemon', 60_000);
   page = await waitFor(() => connectAppPage(cdpPort, port, errors), 'Electron'); ui = pageTools(page);
   const share = await installUpstream('dsh-plugin-share', '0.2.5');
@@ -88,14 +122,7 @@ try {
   const parsed = await shareCall('parse', { code: exported.code });
   const qr = await shareCall('qr', { code: exported.code });
   report.check('原包业务生成组合码、解析并生成二维码', parsed.preview[0].action === 'install' && qr.modules.length > 0, JSON.stringify({parsed,qr}));
-  await waitFor(() => ui.exists('[data-testid=sidebar-settings]'), '设置入口'); await ui.click('[data-testid=sidebar-settings]');
-  const view = share.manifest.contributions.views.find((v) => v.placements.includes('settings'));
-  const nav = `[data-testid=${JSON.stringify(`settings-nav-plugin:${share.manifest.id}:${view.id}`)}]`;
-  await waitFor(() => ui.exists(nav), 'Share 原生页面入口'); await ui.click(nav);
-  const selector = `iframe[data-plugin-id=${JSON.stringify(share.manifest.id)}]`;
-  await waitFor(() => ui.exists(selector), 'Share 页面');
-  const frameUrl = await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).src`);
-  frame = await waitFor(() => connectTarget(cdpPort, (t) => (t.type === 'iframe' || t.type === 'page') && t.url === frameUrl, 'Share 原生页面', errors), '原包 iframe');
+  await openSettings(share);
   await waitFor(() => frame.evaluate('Boolean(document.querySelector("textarea.dps-code"))'), '原包组合码输入');
   await frame.evaluate(`(() => {const el=document.querySelector('textarea.dps-code');Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(el,${JSON.stringify(exported.code)});el.dispatchEvent(new Event('input',{bubbles:true}));return true;})()`);
   async function clickText(text) {
@@ -144,6 +171,41 @@ try {
   const refused = await callRoute(share.manifest.id, '/api/plugin-share/import', { code: newerCode.code, confirm: true, requestId: 'upstream-refusal' });
   report.check('原包主动要求手动升级时保留其回执与当前运行版本', refused.status === 409 && refused.body.error === 'manual-update-required' && (await target()).manifest.version === '0.0.7' && (await target()).active);
   await manage('remove', { pluginId: (await target()).manifest.id });
+  const upgrader = await installUpstream('dsh-plugin-upgrader', '1.8.0'); await authorize(upgrader);
+  const original = await installUpstream(targetPackage, '0.0.7'); await authorize(original);
+  const beforeCancel = await target();
+  await openSettings(upgrader);
+  await page.evaluate(`(() => { globalThis.__installationTrace=[]; window.addEventListener('message', event => {const m=event.data;if(m?.channel==='magi-plugin-v1' && m.operation==='route.call') {globalThis.__installationTrace.push(m);if(globalThis.__installationTrace.length>100)globalThis.__installationTrace.shift();}}); })()`);
+  await frame.evaluate(`(() => { globalThis.__installationTrace=[]; window.addEventListener('message', event => {const m=event.data;if(m?.channel==='magi-plugin-v1') {globalThis.__installationTrace.push(m);if(globalThis.__installationTrace.length>100)globalThis.__installationTrace.shift();}}); })()`);
+  const upgradeButton = `(() => [...document.querySelectorAll('.dsh-pu-row')].find(el => el.innerText.includes(${JSON.stringify(targetPackage)}))?.querySelector('.dsh-pu-row-actions button.is-primary'))()`;
+  await waitFor(() => frame.evaluate(`Boolean(${upgradeButton})`), 'Upgrader 原包目标升级按钮', 120_000);
+  holdResolution = true;
+  await frame.evaluate(`${upgradeButton}.click()`);
+  await waitFor(() => held.size > 0, 'daemon 在线安装版本解析请求', 30_000);
+  const running = await callRoute(upgrader.manifest.id, '/api/plugin-upgrader/overview');
+  const jobId = running.body.active.id;
+  await waitFor(() => frame.evaluate(`(() => {const button=[...document.querySelectorAll('.dsh-pu-job button')].find(el => /^(取消|Cancel)$/.test(el.innerText.trim()) && !el.disabled);if (!button) return false;button.click();return true;})()`), '原包取消按钮');
+  await waitFor(() => held.size === 0, '取消回收解析子进程连接');
+  const cancellation = await waitFor(async () => {
+    const result = await api(`/api/plugins/${upgrader.manifest.id}/routes`, { method: 'GET', path: '/api/plugin-upgrader/job', query: `id=${jobId}` });
+    return result.body.status === 'cancelled' ? result.body : false;
+  }, '原包取消结算');
+  const afterCancel = await target();
+  report.check('原包升级及取消按钮真正停止当前 daemon 安装，保留旧版本、授权和运行实例',
+    cancellation.results[0]?.application === 'cancelled'
+      && afterCancel.digest === beforeCancel.digest && afterCancel.runtime.state === 'running'
+      && JSON.stringify(afterCancel.grants) === JSON.stringify(beforeCancel.grants)
+      && afterCancel.runtime.generation === beforeCancel.runtime.generation, JSON.stringify({ cancellation, beforeCancel, afterCancel }));
+  holdResolution = false;
+  await waitFor(() => frame.evaluate(`Boolean(${upgradeButton} && !${upgradeButton}.disabled)`), '取消后恢复升级按钮');
+  await screenshot('upgrader-cancelled');
+  await frame.evaluate(`${upgradeButton}.click()`);
+  await waitFor(async () => { const plugin = await target(); return plugin.manifest.version === '0.0.8' && plugin.runtime?.state === 'running'; }, '原包显式重试在线升级并运行', 240_000);
+  await waitFor(() => frame.evaluate(`!${upgradeButton} && ![...document.querySelectorAll('.dsh-pu-job button')].some(el => /^(取消|Cancel|正在取消…|Cancelling…)$/.test(el.innerText.trim()))`), '原包页面完成回执与新版列表');
+  report.check('取消后从原包按钮显式重试，在线安装新版并恢复运行', (await target()).active);
+  report.check('其他插件安装状态变化保留当前页面消息桥身份和完成回执',
+    await frame.evaluate(`new Set(globalThis.__installationTrace.map(m => m.instanceId)).size === 1`));
+  await screenshot('upgrader-retried');
   report.check('Electron 与原包页面无未捕获异常', errors.length === 0, errors.join('\n'));
   console.log(report.summary());
 } catch (error) {
@@ -151,7 +213,10 @@ try {
   console.error(error); process.exitCode = 1;
   if (ui) await screenshot('failure').catch(() => {});
 } finally {
+  await writeFile(join(output, 'route-trace.json'), JSON.stringify({ parent: await page?.evaluate('globalThis.__installationTrace').catch(() => null), frame: await frame?.evaluate('globalThis.__installationTrace').catch(() => null) }, null, 2));
   await writeFile(join(output, 'results.json'), JSON.stringify({ checks: report.results, errors, stateRoot: join(work, 'state'), scope: 'Share 原包安装/启停功能 + 管理服务机制；不代表生态全集兼容率' }, null, 2));
   frame?.close(); page?.close();
   if (app) { await writeFile(join(output, 'electron.log'), app.log.join('')); await app.stop(); }
+  registryProxy.closeAllConnections();
+  await new Promise((resolve) => registryProxy.close(resolve));
 }

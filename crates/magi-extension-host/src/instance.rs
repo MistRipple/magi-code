@@ -632,6 +632,8 @@ impl Incoming for HostHandler {
                             method.as_str(),
                             "plugins.preview"
                                 | "plugins.install"
+                                | "plugins.installBundle"
+                                | "plugins.cancelInstall"
                                 | "plugins.authorize"
                                 | "plugins.setEnabled"
                                 | "plugins.remove"
@@ -707,6 +709,8 @@ impl Incoming for HostHandler {
                         | "notify.user"
                         | "tool.call"
                         | "plugins.install"
+                        | "plugins.installBundle"
+                        | "plugins.cancelInstall"
                         | "plugins.setEnabled"
                         | "plugins.remove"
                         | "plugins.authorize"
@@ -1102,6 +1106,7 @@ fn check_hello(
         "hook.guard",
         "plugin.management",
         "plugin.management.background",
+        "plugin.installations",
         "session.directory",
         "images.store",
     ];

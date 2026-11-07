@@ -3,10 +3,13 @@
 use super::*;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
+mod installation;
+
 #[derive(Clone)]
 pub struct PluginOperations {
     manager: Arc<Mutex<PluginManager>>,
     events: Arc<InMemoryEventBus>,
+    installations: Arc<crate::plugin_installations::PluginInstallations>,
     extension_status: Option<Weak<dyn crate::ExtensionStatusSource>>,
     pub(super) plugin_toolchain: Option<crate::PluginToolchain>,
     pub(super) processes: magi_process::ManagedProcessGroup,
@@ -756,6 +759,7 @@ impl PluginOperations {
         Self {
             manager: Arc::clone(&state.plugin_manager),
             events: Arc::clone(&state.event_bus),
+            installations: Arc::clone(&state.plugin_installations),
             extension_status: state.extension_status.as_ref().map(Arc::downgrade),
             plugin_toolchain: state.plugin_toolchain.clone(),
             processes: state.managed_process_group().clone(),
@@ -988,7 +992,13 @@ impl PluginOperations {
             "compatibility"
         } else if method == "plugins.compatibility" {
             ""
-        } else if matches!(method, "plugins.preview" | "plugins.install") {
+        } else if matches!(
+            method,
+            "plugins.preview"
+                | "plugins.install"
+                | "plugins.installBundle"
+                | "plugins.cancelInstall"
+        ) {
             "install"
         } else if method == "plugins.authorize" {
             "authorize"
@@ -1027,6 +1037,21 @@ impl PluginOperations {
                 self.changed();
                 serde_json::to_value(result)
                     .map_err(|error| ApiError::internal_assembly("编码兼容策略失败", error))
+            }
+            "plugins.installBundle" => {
+                let input = serde_json::from_value(params)
+                    .map_err(|e| ApiError::InvalidInput(format!("安装参数无效：{e}")))?;
+                let owner = installation::owner(caller, digest, lease, background)?;
+                serde_json::to_value(self.install_bundle(owner, input).await?)
+                    .map_err(|e| ApiError::internal_assembly("编码安装结果失败", e))
+            }
+            "plugins.cancelInstall" => {
+                let input: magi_app_server_protocol::generated::PluginBundleInstallCancelRequest =
+                    serde_json::from_value(params)
+                        .map_err(|e| ApiError::InvalidInput(format!("取消参数无效：{e}")))?;
+                let owner = installation::owner(caller, digest, lease, background)?;
+                serde_json::to_value(self.installations.cancel(&owner, &input.request_id).await?)
+                    .map_err(|e| ApiError::internal_assembly("编码安装取消结果失败", e))
             }
             "plugins.preview" => {
                 let request = serde_json::from_value(params)
@@ -1087,64 +1112,53 @@ impl PluginOperations {
                 if method == "plugins.setEnabled" && input.enabled.is_none() {
                     return Err(ApiError::InvalidInput("启停操作需要 enabled".into()));
                 }
-                if method == "plugins.remove" || input.enabled == Some(false) {
-                    let active = self
-                        .locked("读取插件激活状态")?
-                        .is_active(&input.plugin_id)
-                        .map_err(plugin_error)?;
-                    if active {
-                        self.lifecycle(
-                            "deactivate",
-                            &input.plugin_id,
-                            Some((caller, digest, lease, background)),
-                            input.expected_digest.as_deref(),
-                        )
-                        .await?;
-                    }
-                    // 停止后发起方可能已撤权；后续写入仍核对同一身份。
-                    Self::check_caller(
-                        &*self.locked("检查插件管理授权")?,
-                        Some((caller, digest, lease, background)),
-                        target,
-                    )?;
-                    self.lifecycle(
-                        "disable",
-                        &input.plugin_id,
-                        Some((caller, digest, lease, background)),
-                        input.expected_digest.as_deref(),
-                    )
-                    .await?;
-                    if method == "plugins.remove" {
-                        self.lifecycle(
-                            "uninstall",
-                            &input.plugin_id,
-                            Some((caller, digest, lease, background)),
-                            input.expected_digest.as_deref(),
-                        )
-                        .await?;
-                    }
-                } else {
-                    self.lifecycle(
-                        "enable",
-                        &input.plugin_id,
-                        Some((caller, digest, lease, background)),
-                        input.expected_digest.as_deref(),
-                    )
-                    .await?;
-                    self.lifecycle(
-                        "activate",
-                        &input.plugin_id,
-                        Some((caller, digest, lease, background)),
-                        input.expected_digest.as_deref(),
-                    )
-                    .await?;
-                    self.wait_running(&input.plugin_id, Some((caller, digest, lease, background)))
-                        .await?;
-                }
+                self.manage_target(
+                    &input.plugin_id,
+                    input.enabled.unwrap_or(false),
+                    method == "plugins.remove",
+                    Some((caller, digest, lease, background)),
+                    input.expected_digest.as_deref(),
+                )
+                .await?;
                 self.projection()
             }
             _ => Err(ApiError::InvalidInput("未知插件管理操作".into())),
         }
+    }
+
+    async fn manage_target(
+        &self,
+        id: &str,
+        enabled: bool,
+        remove: bool,
+        caller: Option<OperationCaller<'_>>,
+        expected_digest: Option<&str>,
+    ) -> Result<(), ApiError> {
+        if remove || !enabled {
+            let active = self
+                .locked("读取插件激活状态")?
+                .is_active(id)
+                .map_err(plugin_error)?;
+            if active {
+                self.lifecycle("deactivate", id, caller, expected_digest)
+                    .await?;
+            }
+            // 停止后发起方可能已撤权；后续写入仍核对同一身份。
+            Self::check_caller(&*self.locked("检查插件管理授权")?, caller, "lifecycle")?;
+            self.lifecycle("disable", id, caller, expected_digest)
+                .await?;
+            if remove {
+                self.lifecycle("uninstall", id, caller, expected_digest)
+                    .await?;
+            }
+        } else {
+            self.lifecycle("enable", id, caller, expected_digest)
+                .await?;
+            self.lifecycle("activate", id, caller, expected_digest)
+                .await?;
+            self.wait_running(id, caller).await?;
+        }
+        Ok(())
     }
 
     /// SDK 版本取自真实随包 dsh-tools；指纹与译包 runtimeId 使用同一锁文件。

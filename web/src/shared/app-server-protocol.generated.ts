@@ -1683,3 +1683,40 @@ export interface PluginImageAttachmentReleaseResult {
 export interface PluginClientContribution {
   entry: string;
 }
+
+export interface PluginBundleInstallRequest {
+  ecosystem: PluginEcosystem;
+  package: string;
+  requestId: string;
+  version?: string | null;
+  enabled?: boolean | null;
+}
+
+export interface PluginBundleInstallCancelRequest {
+  requestId: string;
+}
+
+export interface PluginBundleInstallCancellation {
+  status: PluginBundleInstallCancelStatus;
+}
+
+export interface PluginBundleInstallError {
+  code: string;
+  message: string;
+  diagnostic: string;
+  incompatible?: Array<Record<string, unknown>> | null;
+}
+
+export interface PluginBundleInstallResult {
+  application: PluginBundleInstallApplication;
+  bundle?: string | null;
+  version?: string | null;
+  changed?: boolean | null;
+  installed?: boolean | null;
+  stage?: string | null;
+  error?: PluginBundleInstallError | null;
+}
+
+export type PluginBundleInstallApplication = "applied" | "failed" | "cancelled";
+
+export type PluginBundleInstallCancelStatus = "cancelled" | "too-late" | "not-running";

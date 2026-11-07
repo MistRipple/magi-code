@@ -127,6 +127,7 @@
   const activeStreams = new Map<string, string>();
   let documentDigest = '';
   let documentEntry = '';
+  let navigationIdentity = '';
   let composerSubscribed = false;
   let composerBridge = makeComposerBridge();
   function makeComposerBridge() {
@@ -364,8 +365,11 @@
   });
 
   $effect.pre(() => {
-    // 同一组件被用于另一插件/页面时，导航开始前就使旧文档身份失效。
-    void pluginId; void entry; void resourceDigest;
+    // 注册表投影刷新也会重新下发 props；只有文档身份真正变化才撤销消息桥。
+    // 否则更新其他插件会改变 nonce，而当前 iframe 没有导航，之后的请求全部失配。
+    const identity = JSON.stringify([pluginId, entry, resourceDigest]);
+    if (identity === navigationIdentity) return;
+    navigationIdentity = identity;
     releaseResourceSubscriptions();
     releaseRoutes();
     documentDigest = '';

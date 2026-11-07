@@ -1474,6 +1474,7 @@ pub struct ApiState {
     /// 插件安装、授权和生命周期的唯一 daemon 领域服务。
     pub plugin_manager: Arc<Mutex<magi_plugin_system::PluginManager>>,
     pub(crate) plugin_jobs: Arc<crate::plugin_jobs::PluginJobs>,
+    pub(crate) plugin_installations: Arc<crate::plugin_installations::PluginInstallations>,
     /// 升级时执行插件数据格式转换的 Worker 执行者；未装配时需要转换的升级被拒绝。
     pub(crate) mcp_service: Arc<crate::mcp_runtime::McpServiceRuntime>,
     pub snapshot_manager: Arc<SnapshotManager>,
@@ -2271,6 +2272,7 @@ impl ApiState {
             extension_status: None,
             plugin_route_executor: None,
             plugin_toolchain: None,
+            plugin_installations: Arc::default(),
             input_guard: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
             plugin_manager: Arc::new(Mutex::new(

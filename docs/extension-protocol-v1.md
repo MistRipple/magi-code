@@ -105,6 +105,7 @@ daemon 响应形状：
 | `plugins.list` | `api.plugins.list()` | 读取 daemon 的既有 `PluginList` 目录投影，每次校验当前插件包、激活状态及实例租约；不包含配置、资源或凭据 |
 | `plugins.compatibility`／`plugins.setVersionExemption` | `api.plugins.compatibility()`／`setVersionExemption(input)` | 需协商 `plugin.management`。读取要求活动宿主租约；写入另需 `pluginManagement:["compatibility"]`，使用 `PluginDshVersionExemptionRequest` 的精确 target、当前 runtimeVersion／runtimeId、revision CAS 和显式风险确认。安装／升级提交前重验，撤销后旧译包不能继续提交 |
 | `plugins.preview/install` | `api.plugins.preview(input)`／`install(input)` | 需协商 `plugin.management` 与 `pluginManagement:["install"]` 授权；复用 `PluginUpstreamRequest`、预览与安装入口，返回既有预览／目录 DTO；仅支持已接入的上游生态。安装必须指定精确版本与预览摘要，不替用户授权新版本 |
+| `plugins.installBundle/cancelInstall` | `api.plugins.installBundle(input)`／`cancelInstall(requestId)` | 另协商 `plugin.installations`，使用 `PluginBundleInstall*` DTO；由 daemon 完成在线版本解析、准备、安装／升级及请求的启停，返回实际应用结果。两者均需 install 授权，后台调用另需 background；启停及代授新版本分别核对 lifecycle、authorize 委托 |
 | `plugins.setEnabled/remove` | `api.plugins.setEnabled(pluginId,enabled)`／`remove(pluginId)` | 需协商 `plugin.management` 与 `pluginManagement:["lifecycle"]`；复用 HTTP 的生命周期、排空与停止端口。拒绝当前发起插件的自身停止、删除或升级；启用后等待真实宿主运行状态，启动失败不返回成功 |
 | `tool.call` | `api.tools.call(tool,input)` | 只接受公开原生工具；需要真实 Task、租约、策略、schema、权限、审批与账本 |
 | `task.spawn` | `api.task.spawn(input)` | 原生 agent_spawn 合同；保留角色、自定义模型绑定、目录与策略，不接受伪造归属 |
@@ -132,6 +133,10 @@ sessionRead 的各自授权。未声明客户端贡献的普通视图仍按页�
 图片元数据复用 daemon 现有插件资源事实和升级数据重置事务，内容寻址文件只保存载荷。先原子写载荷，再提交元数据；未提交载荷不可由 API 读取，重启及下次保存时回收。释放先提交元数据删除，没有其他插件引用时才删除共享载荷。已发送图片沿原生 canonical 消息保存自己的字节，不引用这份插件私有存储。`images.store` 明确允许已授权插件在后台事件回调中使用当前实例，不携带已结束的 invocationId；这不放宽 blob、模型、工具、会话或通知服务的原调用租约。
 
 管理 API 的后台模式另协商 `plugin.management.background`：SDK 的 `api.plugins.background` 以显式 `background:true` 传输元字段发送管理写请求，不携带已结束的 invocationId。HostHandler 仅接受插件管理方法、拒绝同时携带 invocationId，移除该元字段并注入当前 `_instance`／`_background` 后交给 daemon。daemon 在初次准入和异步提交锁内均检查 background 及具体动作授权；停用、撤权和旧实例失效仍拒绝。只读目录和兼容策略可沿当前实例重新读取；普通管理 API、模型、工具、会话和钩子原有调用租约边界不变。
+
+在线安装任务由 daemon 持有，安装及授权事实仍只写入 PluginManager。requestId 为 1–128 个字母、数字或 `-_.:`，绑定发起插件、摘要、宿主实例、前后台模式及完整输入；同身份同输入只执行一次，不同输入拒绝复用。活动任务和短期回执合计至多 256 个，每个 owner 至多 16 个，完成回执按时间／容量清退，不跨 daemon 重启恢复。重复等待中的一个连接断开不会取消其他等待者；最后一个等待者断开或宿主退出，只取消尚在准备的任务。
+
+准备阶段在线解析 npm 精确版本、标签或范围并保留原包身份与 integrity，最多 840 秒；取消返回 `cancelled` 前停止该准备流程及受控翻译子进程，不能提交候选版本。进入应用阶段后返回 `too-late`，daemon 继续结算实际结果；已结算或非本实例任务返回 `not-running`。`application:applied` 只有在请求的安装及启停完成后返回；安装已提交但启用失败返回 `failed`、`installed:true`、`stage:enable`，缺少独立授权时带 `authorization-required`，调用方应引导用户处理权限，不能再次伪装为安装未发生。安装任务不会在自己的调用内升级发起插件自身，也不会执行 npm 安装脚本。
 
 插件私有页面的路由请求可携带可选 `headers`（`PluginRouteCallRequest`）。只转交页面自己提供的应用头，不转交 Magi HTTP 请求的 Cookie、凭据和 Origin；Host、Origin、Cookie、代理与传输控制头禁止覆盖。DSH 原生页面的 localStorage/sessionStorage 由 iframe 消息桥按插件 ID 隔离代理，仅保存浏览器 profile 内的界面缓存；插件业务配置仍走 daemon 设置 CAS。右栏导航仅能打开当前激活插件清单声明的右栏视图。
 

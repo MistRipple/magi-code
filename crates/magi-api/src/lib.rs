@@ -28,6 +28,7 @@ mod mcp_sessions;
 mod mcp_tunnel;
 mod model_config;
 mod performance;
+mod plugin_installations;
 mod plugin_jobs;
 mod public_canonical;
 mod request_guard;

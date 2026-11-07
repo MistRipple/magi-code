@@ -192,6 +192,9 @@ impl HostService for PluginHostService {
         Ok(())
     }
     fn instance_ended(&self, plugin_id: &str, lease: &str) {
+        if let Some(operations) = self.operations.get() {
+            operations.installation_instance_ended(plugin_id, lease);
+        }
         let removed = self.manager.lock().is_ok_and(|mut manager| {
             if !manager.end_runtime(plugin_id, lease) {
                 return false;
@@ -229,6 +232,8 @@ impl HostService for PluginHostService {
             method.as_str(),
             "plugins.preview"
                 | "plugins.install"
+                | "plugins.installBundle"
+                | "plugins.cancelInstall"
                 | "plugins.setEnabled"
                 | "plugins.remove"
                 | "plugins.authorize"
@@ -320,6 +325,8 @@ impl HostService for PluginHostService {
             method.as_str(),
             "plugins.preview"
                 | "plugins.install"
+                | "plugins.installBundle"
+                | "plugins.cancelInstall"
                 | "plugins.setEnabled"
                 | "plugins.remove"
                 | "plugins.authorize"

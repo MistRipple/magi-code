@@ -6777,6 +6777,177 @@
           "description": "激活期间常驻的隔离客户端入口；必须为已声明视图入口，视图共用该客户端。"
         }
       }
+    },
+    "PluginBundleInstallRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ecosystem",
+        "package",
+        "requestId"
+      ],
+      "properties": {
+        "ecosystem": {
+          "$ref": "#/$defs/PluginEcosystem"
+        },
+        "package": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 214
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128,
+          "description": "npm 精确版本、标签或语义版本范围，由安装任务解析为精确版本。",
+          "x-rust-default": true
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "x-rust-default": true
+        }
+      }
+    },
+    "PluginBundleInstallCancelRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requestId"
+      ],
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "PluginBundleInstallCancellation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/PluginBundleInstallCancelStatus"
+        }
+      }
+    },
+    "PluginBundleInstallError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "diagnostic"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "diagnostic": {
+          "type": "string"
+        },
+        "incompatible": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "x-rust-default": true
+        }
+      }
+    },
+    "PluginBundleInstallResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "application"
+      ],
+      "properties": {
+        "application": {
+          "$ref": "#/$defs/PluginBundleInstallApplication"
+        },
+        "bundle": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-rust-default": true
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-rust-default": true
+        },
+        "changed": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "x-rust-default": true
+        },
+        "installed": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "x-rust-default": true
+        },
+        "stage": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-rust-default": true
+        },
+        "error": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/PluginBundleInstallError"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-rust-default": true
+        }
+      }
+    },
+    "PluginBundleInstallApplication": {
+      "type": "string",
+      "enum": [
+        "applied",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "PluginBundleInstallCancelStatus": {
+      "type": "string",
+      "enum": [
+        "cancelled",
+        "too-late",
+        "not-running"
+      ]
     }
   }
 }

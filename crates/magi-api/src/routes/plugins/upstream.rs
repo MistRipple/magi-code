@@ -34,7 +34,7 @@ static TRANSLATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()
 /// 发布在这些作用域下的包属于上游官方发布者。这只说明“谁发布的”，不说明包适配 Magi 或经过 Magi 审核。
 const OFFICIAL_SCOPES: &[&str] = &["@deepseek-ai/", "@earendil-works/"];
 
-fn registry() -> Result<String, ApiError> {
+pub(super) fn registry() -> Result<String, ApiError> {
     let value = std::env::var(NPM_REGISTRY_ENV).unwrap_or_else(|_| DEFAULT_NPM_REGISTRY.into());
     Ok(validated_remote_url(value.trim())?
         .trim_end_matches('/')
@@ -309,9 +309,9 @@ pub(super) fn upstream_state(installed: Option<&str>, available: &str) -> Plugin
 }
 
 #[derive(Deserialize)]
-struct VersionDocument {
-    name: String,
-    version: String,
+pub(super) struct VersionDocument {
+    pub(super) name: String,
+    pub(super) version: String,
     #[serde(default)]
     description: String,
     dist: Dist,
@@ -331,9 +331,9 @@ struct NpmUser {
 }
 
 /// 一次翻译的结果：已校验的 Magi 包，加上给用户看的翻译摘要。
-struct Translated {
-    package: PluginPackage,
-    document: VersionDocument,
+pub(super) struct Translated {
+    pub(super) package: PluginPackage,
+    pub(super) document: VersionDocument,
     summary: PluginTranslationSummary,
 }
 
@@ -445,14 +445,15 @@ async fn translate(
     state: &PluginOperations,
     request: &PluginUpstreamRequest,
 ) -> Result<Translated, ApiError> {
-    tokio::time::timeout(PREPARATION_TIMEOUT, prepare(state, request))
+    tokio::time::timeout(PREPARATION_TIMEOUT, prepare(state, request, None))
         .await
         .map_err(|_| ApiError::InvalidInput("插件安装准备超时，尚未提交版本；请稍后重试".into()))?
 }
 
-async fn prepare(
+pub(super) async fn prepare(
     state: &PluginOperations,
     request: &PluginUpstreamRequest,
+    document: Option<VersionDocument>,
 ) -> Result<Translated, ApiError> {
     if let Some(reason) = blocked_reason(state, &request.ecosystem) {
         return Err(ApiError::InvalidInput(reason));
@@ -470,12 +471,16 @@ async fn prepare(
             version.to_string()
         }
     };
-    let registry = registry()?;
-    let document_url = format!("{registry}/{}/{version}", package_path(&request.package));
-    let bytes =
-        download_bytes(&document_url, MAX_REGISTRY_DOCUMENT_BYTES, "上游插件元数据").await?;
-    let document: VersionDocument = serde_json::from_slice(&bytes)
-        .map_err(|_| ApiError::InvalidInput("registry 元数据格式无效".into()))?;
+    let document = if let Some(document) = document {
+        document
+    } else {
+        let registry = registry()?;
+        let document_url = format!("{registry}/{}/{version}", package_path(&request.package));
+        let bytes =
+            download_bytes(&document_url, MAX_REGISTRY_DOCUMENT_BYTES, "上游插件元数据").await?;
+        serde_json::from_slice::<VersionDocument>(&bytes)
+            .map_err(|_| ApiError::InvalidInput("registry 元数据格式无效".into()))?
+    };
     if document.name != request.package {
         return Err(ApiError::InvalidInput(
             "registry 返回的包名与请求不一致".into(),
@@ -488,18 +493,20 @@ async fn prepare(
     let tarball = artifacts::tarball(&document.dist.tarball, &integrity, "上游插件包").await?;
 
     let _serial = TRANSLATE_LOCK.lock().await;
-    let work = tempfile::tempdir()
-        .map_err(|error| ApiError::internal_assembly("创建翻译工作目录失败", error))?;
-    let upstream_dir = work.path().join("upstream");
-    std::fs::create_dir(&upstream_dir)
-        .map_err(|error| ApiError::internal_assembly("创建翻译工作目录失败", error))?;
-    {
-        let target = upstream_dir.clone();
-        tokio::task::spawn_blocking(move || npm::unpack_tarball(&tarball, &target))
-            .await
-            .map_err(|error| ApiError::internal_assembly("解包上游插件失败", error))?
+    // 解包任务拥有临时目录；取消等待时目录跟随阻塞任务完成清理，
+    // 不会在外层 TempDir 已释放后继续写入一个无人拥有的路径。
+    let (work, upstream_dir) = tokio::task::spawn_blocking(move || {
+        let work = tempfile::tempdir()
+            .map_err(|error| ApiError::internal_assembly("创建翻译工作目录失败", error))?;
+        let target = work.path().join("upstream");
+        std::fs::create_dir(&target)
+            .map_err(|error| ApiError::internal_assembly("创建翻译工作目录失败", error))?;
+        npm::unpack_tarball(&tarball, &target)
             .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
-    }
+        Ok::<_, ApiError>((work, target))
+    })
+    .await
+    .map_err(|error| ApiError::internal_assembly("解包上游插件失败", error))??;
     let extracted: Value = serde_json::from_slice(
         &std::fs::read(upstream_dir.join("package.json"))
             .map_err(|error| ApiError::InvalidInput(error.to_string()))?,
@@ -544,19 +551,30 @@ async fn run_translator(
     archive: &FsPath,
     integrity: &str,
 ) -> Result<String, ApiError> {
+    let args = vec![
+        "prepare".to_string(),
+        ecosystem_name(ecosystem).to_string(),
+        upstream_dir.to_string_lossy().into_owned(),
+        "--out".into(),
+        out_dir.to_string_lossy().into_owned(),
+        "--integrity".into(),
+        integrity.to_string(),
+        "--archive".into(),
+        archive.to_string_lossy().into_owned(),
+    ];
+    run_toolchain(state, toolchain, &args).await
+}
+
+pub(super) async fn run_toolchain(
+    state: &PluginOperations,
+    toolchain: &crate::state::PluginToolchain,
+    args: &[String],
+) -> Result<String, ApiError> {
     use tokio::io::AsyncReadExt;
     let mut command = magi_process::tokio_command(&toolchain.node);
     command
         .arg(toolchain.compat.join("cli.mjs"))
-        .arg("prepare")
-        .arg(ecosystem_name(ecosystem))
-        .arg(upstream_dir)
-        .arg("--out")
-        .arg(out_dir)
-        .arg("--integrity")
-        .arg(integrity)
-        .arg("--archive")
-        .arg(archive)
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

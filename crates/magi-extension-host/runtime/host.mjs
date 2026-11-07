@@ -16,11 +16,12 @@ import { createHash } from 'node:crypto';
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const PROTOCOL = { major: 1, minor: 0 };
-const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'session.directory', 'images.store'];
+const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'plugin.installations', 'session.directory', 'images.store'];
 let negotiatedFeatures = new Set();
 const pluginRequest = (method, input, background = false) => {
   if (!negotiatedFeatures.has('plugin.management')) throw new Error('daemon 未协商 plugin.management');
   if (background && !negotiatedFeatures.has('plugin.management.background')) throw new Error('daemon 未协商 plugin.management.background');
+  if (['plugins.installBundle', 'plugins.cancelInstall'].includes(method) && !negotiatedFeatures.has('plugin.installations')) throw new Error('daemon 未协商 plugin.installations');
   return request(method, background ? { ...input, background: true } : input, background);
 };
 const imageRequest = (method, input) => {
@@ -97,7 +98,7 @@ function request(method, params, independent = false) {
     const timer = setTimeout(() => {
       pending.delete(id);
       reject(Object.assign(new Error(`${method} 超时`), { kind: 'DeadlineExceeded' }));
-    }, method === 'plugins.preview' || method === 'plugins.install' ? 1_000_000 : 120_000);
+    }, ['plugins.preview', 'plugins.install', 'plugins.installBundle', 'plugins.cancelInstall'].includes(method) ? 1_000_000 : 120_000);
     pending.set(id, { resolve, reject, timer });
     try { send({ id, method, params }); }
     catch (error) { clearTimeout(timer); pending.delete(id); reject(error); }
@@ -311,6 +312,8 @@ const pluginApi = (background = false) => Object.freeze({
   list: (input = {}) => request('plugins.list', input, background),
   preview: (input) => pluginRequest('plugins.preview', input, background),
   install: (input) => pluginRequest('plugins.install', input, background),
+  installBundle: (input) => pluginRequest('plugins.installBundle', input, background),
+  cancelInstall: (requestId) => pluginRequest('plugins.cancelInstall', { requestId }, background),
   compatibility: () => request('plugins.compatibility', {}, background),
   setVersionExemption: (input) => pluginRequest('plugins.setVersionExemption', input, background),
   setEnabled: (pluginId, enabled, expectedDigest) => pluginRequest('plugins.setEnabled', { pluginId, enabled, ...(expectedDigest === undefined ? {} : { expectedDigest }) }, background),
