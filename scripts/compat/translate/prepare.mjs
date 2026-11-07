@@ -100,7 +100,9 @@ export async function prepareDsh(options) {
       { kind: 'tools', targets: ['*'] }, { kind: 'modelSources', targets: ['*'] },
     ],
     settingsSchema: { type: 'object', additionalProperties: true },
-    contributions: { tools: toolContributions, commands: commandContributions, views: [{ id: 'settings', title: '设置', entry: 'ui/settings.html', placements: ['settings'] }] },
+    // 工具/命令由真实 Cordis 启动后通过 runtime catalog 发布；若同时写入静态
+    // 清单，daemon 合并运行目录时会把同一个贡献 ID 计数两次。
+    contributions: { tools: [], commands: [], views: [{ id: 'settings', title: '设置', entry: 'ui/settings.html', placements: ['settings'] }] },
   };
   mkdirSync(options.outDir, { recursive: true });
   const kept = copyTree(root, options.outDir);
@@ -131,7 +133,7 @@ export async function prepareDsh(options) {
   } else {
     writeFileSync(join(options.outDir, 'ui/settings.html'), renderSettingsPage({ schema: manifest.settingsSchema, title: manifest.name, runtimeSchema: true }));
   }
-  const slotViews = clientAnalysis?.mounted?.filter((slot) => !['settings.section', 'plugins.bundle.config', 'settings.plugins.tab'].includes(slot.name)).map((slot) => {
+  const slotViews = clientAnalysis?.mounted?.filter((slot) => !['settings.section', 'plugins.bundle.config', 'settings.plugins.tab', 'plugins.tab'].includes(slot.name)).map((slot) => {
     const slug = slot.name.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase();
     const placement = slot.name === 'main' ? ['main', 'rightPane'] : ['rightPane'];
     return { id: `slot-${slug}`.slice(0, 64), title: slot.name, entry: `ui/view-${slug}.html`, placements: placement };
