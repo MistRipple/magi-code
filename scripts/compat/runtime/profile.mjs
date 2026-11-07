@@ -39,7 +39,7 @@ function bundle(plugin) {
   return { name: spec.slice(0, index), version: spec.slice(index + 1), plugin };
 }
 async function refresh(scope) {
-  const list = await host.api.plugins.list();
+  const list = await host.api.plugins.list({ includeUpstreamManifest: true });
   scope.compatibility = host.api.plugins.compatibility ? await host.api.plugins.compatibility() : null;
   scope.bundles = list.plugins.map(bundle).filter(Boolean);
   scope.original = new Map(scope.bundles.map((item) => [item.name, { ...item, digest: item.plugin.digest }]));
@@ -56,8 +56,23 @@ async function refresh(scope) {
   if (scope.compatibility) scope.files.set('compatibility.json', JSON.stringify(scope.compatibility.exemptions));
   for (const { name, version, plugin } of scope.bundles) {
     const path = `node_modules/${name}`;
-    scope.files.set(`${path}/package.json`, JSON.stringify({ name, version, description: plugin.manifest.description, dsh: { bundle: { patch: './cordis.patch.yml' } } }));
-    scope.files.set(`${path}/cordis.patch.yml`, dump([{ insert: [{ id: plugin.manifest.id, name }] }]));
+    // 缺失的原包元数据保持缺失，不能从 Magi 的名称/描述拼一份假清单，
+    // 否则 engines、peers、仓库和 dsh 声明都会在健康/升级报告里丢失。
+    const metadata = plugin.upstreamManifest;
+    if (metadata) {
+      if (metadata.name !== name || metadata.version !== version) throw new Error('daemon 上游原包元数据身份无效');
+      scope.files.set(`${path}/package.json`, JSON.stringify(metadata));
+    }
+    const declared = metadata?.dsh?.bundle?.patch ?? './cordis.patch.yml';
+    const patches = Array.isArray(declared) ? declared : [declared];
+    if (patches.length > 32 || patches.some((patch) => typeof patch !== 'string')) throw new Error('上游 bundle patch 声明无效');
+    for (const [index, patch] of [...new Set(patches)].entries()) {
+      const key = relative(path, resolve(path, patch)).split(/[\\/]/).join('/');
+      if (key === '..' || key.startsWith('../') || !key || key === 'package.json') throw new Error('上游 bundle patch 路径越界或无效');
+      // Magi 的安装/启停单位是整个译包，由一个 daemon 监管的根实例承载。
+      // 多层 bundle 声明仍只投影一次这个真实根行，不制造重复运行实例。
+      scope.files.set(`${path}/${key}`, dump(index === 0 ? [{ insert: [{ id: plugin.manifest.id, name }] }] : []));
+    }
   }
 }
 

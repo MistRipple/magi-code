@@ -2,7 +2,7 @@
 // 不因包名带 dsh 前缀就重定向，也不重写共享包自身的嵌套依赖版本。
 //
 // 只做解析，不改写模块内容；找不到时沿用 Node 默认的 ERR_MODULE_NOT_FOUND，错误里带原始说明符。
-import { isBuiltin, registerHooks } from 'node:module';
+import { createRequire, isBuiltin, registerHooks } from 'node:module';
 import { existsSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -18,6 +18,7 @@ const isBare = (specifier) => !/^(\.{0,2}\/|file:|node:|data:|https?:)/.test(spe
 export function installSharedResolution(sharedRoot, aliases = {}) {
   const provided = hostDependencies(sharedRoot);
   const anchor = pathToFileURL(join(sharedRoot, '__shared__.mjs')).href;
+  const sharedRequire = createRequire(anchor);
   const sharedPrefix = pathToFileURL(`${join(sharedRoot, 'node_modules')}/`).href;
   const targets = new Map(Object.entries(aliases).map(([name, file]) => [name, pathToFileURL(file).href]));
   const upstreamRoot = aliases['@magi/compat-upstream-root'] ? pathToFileURL(realpathSync(aliases['@magi/compat-upstream-root']) + '/').href : undefined;
@@ -38,7 +39,7 @@ export function installSharedResolution(sharedRoot, aliases = {}) {
       // ESM 和 CJS 共用，并加载同一个无顶层 await 的 profile 模块实例。
       if (fromUpstream && facades.has(specifier)) return nextResolve(fileURLToPath(facades.get(specifier)), context);
       // 共享目录里的包按 Node 默认规则解析自己的依赖（可能有嵌套版本）；只有来自上游代码的裸导入才重定向。
-      const fromShared = typeof context.parentURL === 'string' && context.parentURL.startsWith(sharedPrefix);
+      const fromShared = context.parentURL === anchor || (typeof context.parentURL === 'string' && context.parentURL.startsWith(sharedPrefix));
       // An upstream package may declare a newer Cordis peer than the version
       // bundled by Magi. The translator installs that peer under the package
       // tree and marks it isolated; prefer it over the shared redirect so the
@@ -50,7 +51,14 @@ export function installSharedResolution(sharedRoot, aliases = {}) {
           directory = dirname(directory);
         }
       }
-      return isBare(specifier) && provided.has(packageName(specifier)) && !fromShared ? nextResolve(specifier, { ...context, parentURL: anchor }) : nextResolve(specifier, context);
+      if (isBare(specifier) && provided.has(packageName(specifier)) && !fromShared) {
+        // CJS 的 require.resolve 仍按原 require 的搜索路径解析，仅改 parentURL
+        // 不会生效。先沿同一发行清单解析真实文件，保留 exports/require 条件，
+        // 再以绝对路径交还 Node；没有副本或虚假的 package.json。
+        if (context.conditions?.includes('require')) return nextResolve(sharedRequire.resolve(specifier), context);
+        return nextResolve(specifier, { ...context, parentURL: anchor });
+      }
+      return nextResolve(specifier, context);
     },
   });
 }

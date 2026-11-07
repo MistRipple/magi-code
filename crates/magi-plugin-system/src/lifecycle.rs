@@ -14,8 +14,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-mod drain;
 mod compatibility;
+mod drain;
 mod runtime_catalog;
 mod upgrade;
 
@@ -708,6 +708,13 @@ impl PluginManager {
     }
 
     pub fn projection(&self) -> Result<PluginList, PluginError> {
+        self.projection_with_upstream_metadata(false)
+    }
+
+    pub fn projection_with_upstream_metadata(
+        &self,
+        include_upstream: bool,
+    ) -> Result<PluginList, PluginError> {
         Ok(PluginList {
             plugins: self
                 .state
@@ -721,12 +728,41 @@ impl PluginManager {
                         active: installed.active,
                         grants: installed.grants.clone(),
                         source: installed.source.projection(),
+                        upstream_manifest: if include_upstream {
+                            self.upstream_manifest(installed)?
+                        } else {
+                            None
+                        },
                         // 扩展宿主的运行状态属于 daemon 的 ExtensionRuntime，由 API 层合并，管理器不持有它。
                         runtime: None,
                     })
                 })
                 .collect::<Result<_, PluginError>>()?,
         })
+    }
+
+    // 原包元数据只从当前不可变安装包取得；不读插件可写目录或 registry 最新版。
+    fn upstream_manifest(&self, installed: &InstalledPlugin) -> Result<Option<Value>, PluginError> {
+        let PluginSource::Upstream {
+            package: name,
+            version,
+            ..
+        } = &installed.source
+        else {
+            return Ok(None);
+        };
+        let package = self.package(&installed.id)?;
+        let Some(bytes) = package.files().get("extension/upstream/package.json") else {
+            return Ok(None);
+        };
+        let manifest: Value = serde_json::from_slice(bytes)
+            .map_err(|error| PluginError::CorruptState(format!("上游原包元数据无效：{error}")))?;
+        if !manifest.is_object() || manifest["name"] != *name || manifest["version"] != *version {
+            return Err(PluginError::CorruptState(
+                "上游原包元数据与已安装来源不一致".into(),
+            ));
+        }
+        Ok(Some(manifest))
     }
 
     pub fn uninstall(&mut self, id: &str) -> Result<(), PluginError> {

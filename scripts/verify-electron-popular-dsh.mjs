@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -157,7 +157,11 @@ try {
           assert.ok(status.review.packages.some((entry) => entry.name === pkg && entry.version === version));
           assert.ok(status.liveReview?.entries.some((entry) => entry.name === pkg && entry.state === 'active'));
           assert.equal(status.issues.some((issue) => ['profiles-missing', 'profile-missing', 'profile-bundles-empty'].includes(issue.id)), false);
-          item.functionalChecks = { fileInspection: true, reliabilityReport: true, liveActivation: true, repairs: 'unverified' };
+          const runtimeVersion = JSON.parse(await readFile(join(appRoot, 'Contents/Resources/daemon/compat/node_modules/@deepseek-ai/dsh-app-boot/package.json'), 'utf8')).version;
+          assert.equal(status.runtimeVersion, runtimeVersion, '不能把已携带的 DSH SDK 版本显示为未知');
+          assert.equal(status.review.currentVersion, runtimeVersion);
+          assert.equal(status.review.packages.find((entry) => entry.name === pkg)?.declaration.state, 'compatible', '原包 engines/peer 声明必须到达实际兼容报告');
+          item.functionalChecks = { fileInspection: true, reliabilityReport: true, liveActivation: true, runtimeIdentity: true, declaredCompatibility: true, repairs: 'unverified' };
         }
         if (pkg === 'dsh-plugin-share' && item.smoke?.ok) {
           const call = async (action, body) => {
@@ -171,6 +175,31 @@ try {
           const qr = await call('qr', { code: exported.code });
           assert.ok(parsed.preview.length && qr.modules.length);
           item.functionalChecks = { export: true, parse: true, qr: true, import: 'unverified' };
+        }
+        if (pkg === 'dsh-plugin-upgrader' && process.env.MAGI_DSH_FUNCTIONAL_UPGRADE === '1') {
+          let targetId;
+          try {
+            const request = { ecosystem: 'dsh', package: 'dsh-plugin-release-probe', version: '0.0.7' };
+            const targetPreview = await post('/api/plugins/upstream/preview', request);
+            const targetList = await post('/api/plugins/upstream/install', { ...request, expectedDigest: targetPreview.candidate.digest });
+            const target = targetList.plugins.find((p) => p.source.location === 'dsh:dsh-plugin-release-probe@0.0.7');
+            targetId = target.manifest.id;
+            await post(`/api/plugins/${targetId}/enable`, {});
+            await post(`/api/plugins/${targetId}/authorize`, { grants: target.manifest.permissions });
+            await post(`/api/plugins/${targetId}/activate`, {});
+            const submitted = await post(`/api/plugins/${item.id}/routes`, { method: 'POST', path: '/api/plugin-upgrader/job', body: { steps: [{ name: request.package, version: '0.0.8', action: 'upgrade', enabled: true }] } });
+            assert.equal(submitted.status, 202, JSON.stringify(submitted));
+            const job = await waitFor(async () => {
+              const current = await post(`/api/plugins/${item.id}/routes`, { method: 'GET', path: '/api/plugin-upgrader/job', query: `id=${submitted.body.id}` });
+              return current.body.status === 'finished' ? current.body : false;
+            }, 'Upgrader 原包后台升级完成', 240_000);
+            item.functionalUpgrade = job;
+            assert.equal(job.failed, 0, JSON.stringify(job));
+            const after = (await api('/api/plugins')).value.plugins.find((p) => p.manifest.id === targetId);
+            assert.equal(after.manifest.version, '0.0.8');
+            assert.equal(after.runtime.state, 'running');
+            item.functionalChecks = { onlineUpgrade: true, rollback: 'unverified' };
+          } finally { if (targetId) await removePlugin(targetId); }
         }
       }
       await removePlugin(item.id);

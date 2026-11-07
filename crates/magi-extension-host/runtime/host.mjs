@@ -375,7 +375,7 @@ const api = Object.freeze({
   session: Object.freeze({ snapshot: (input = {}) => request('session.snapshot', input) }),
   /** 读取 daemon 的插件目录；不包含插件配置、私有资源或凭据。 */
   plugins: Object.freeze({
-    list: () => request('plugins.list', {}),
+    list: (input = {}) => request('plugins.list', input),
     preview: (input) => pluginRequest('plugins.preview', input),
     install: (input) => pluginRequest('plugins.install', input),
     compatibility: () => pluginRequest('plugins.compatibility', {}),

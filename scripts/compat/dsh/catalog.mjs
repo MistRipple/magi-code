@@ -118,6 +118,8 @@ export const DSH_RULES = [
   rule('imports', /^@deepseek-ai\/dsh-llm$/, { capability: 'modelSource.publish', fidelity: 'full', note: '真实 dsh-llm 随包打入', source: ADAPTER }),
   rule('imports', /^@deepseek-ai\/dsh-tools$/, { capability: 'tool.register', fidelity: 'full', note: 'defineTool 等类型与校验随包打入', source: TOOL }),
   rule('imports', /^@deepseek-ai\/dsh-commands$/, { capability: 'command.register', fidelity: 'full', source: COOKBOOK }),
+  rule('imports', /^@deepseek-ai\/dsh-app-boot\/package\.json$/, { fixed: 'bundled', group: 'runtime', target: '真实随包 DSH SDK 元数据', source: COOKBOOK }),
+  rule('imports', /^@deepseek-ai\/dsh-app-boot$/, { capability: 'service.snapshot', fidelity: 'partial', group: 'runtime', note: '可定位真实随包版本；启动 DSH Loader/另一套内核不属于 Magi 兼容合同，直接导入业务入口仍未接入', source: COOKBOOK }),
   rule('imports', /^@deepseek-ai\/dsh-host-webserver$/, { capability: 'ui.route', fidelity: 'full', source: src('packages/host/webserver/README.md') }),
   rule('imports', /^@deepseek-ai\/dsh-mcp-client$/, { fixed: 'bundled', group: 'runtime', target: '上游 MCP 客户端 + Magi 动态工具目录', note: '原版客户端负责连接、工具发现及回收；调用经过 Magi 的工具权限与执行入口。MCP 资源与提示服务仅在宿主提供时挂载', source: src('packages/mcp/mcp-client/README.md') }),
   rule('imports', /^@deepseek-ai\/dsh-typert-protocol$/, { fixed: 'bundled', group: 'runtime', target: '上游 Typert 声明 + 插件私有 Remote 路由', note: '承载本插件声明的 JSON unary 方法；流、Host 对象查找与原生会话上下文不伪造，调用时明确拒绝', source: src('docs/api-gateway.md') }),

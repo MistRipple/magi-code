@@ -34,6 +34,99 @@ fn package(with_permission: bool) -> PluginPackage {
 }
 
 #[test]
+fn upstream_metadata_is_read_from_the_installed_archive_only_on_request() {
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    let mut value = manifest(false);
+    value["extension"] = json!({"hooks":[]});
+    value["permissions"] = json!([{"kind":"extension","targets":["full-trust"]}]);
+    value["contributions"] =
+        json!({"commands":[{"id":"status","title":"Status","description":""}]});
+    let original = json!({"name":"@scope/upstream","version":"1.0.0","engines":{"dsh":"^0.2"},"peerDependencies":{"@deepseek-ai/cordis":"~4.1.0"},"repository":{"url":"https://example.test/repo"},"dsh":{"bundle":{"patch":"./original.yml"}}});
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    for (path, bytes) in [
+        ("manifest.json", serde_json::to_vec(&value).unwrap()),
+        ("extension/index.mjs", b"export default () => {};".to_vec()),
+        (
+            "extension/upstream/package.json",
+            serde_json::to_vec(&original).unwrap(),
+        ),
+    ] {
+        writer
+            .start_file(path, SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+    }
+    let package = PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap();
+    manager
+        .install(
+            &package,
+            PluginSource::Upstream {
+                ecosystem: "dsh".into(),
+                package: "@scope/upstream".into(),
+                version: "1.0.0".into(),
+            },
+        )
+        .unwrap();
+    assert!(
+        manager.projection().unwrap().plugins[0]
+            .upstream_manifest
+            .is_none()
+    );
+    assert_eq!(
+        manager
+            .projection_with_upstream_metadata(true)
+            .unwrap()
+            .plugins[0]
+            .upstream_manifest
+            .as_ref(),
+        Some(&original)
+    );
+    drop(manager);
+    let manager = PluginManager::open(root.path()).unwrap();
+    assert_eq!(
+        manager
+            .projection_with_upstream_metadata(true)
+            .unwrap()
+            .plugins[0]
+            .upstream_manifest
+            .as_ref(),
+        Some(&original)
+    );
+    let local = tempdir().unwrap();
+    let mut local_manager = PluginManager::open(local.path()).unwrap();
+    local_manager
+        .install(
+            &package,
+            PluginSource::Local {
+                name: "local.zip".into(),
+            },
+        )
+        .unwrap();
+    assert!(
+        local_manager
+            .projection_with_upstream_metadata(true)
+            .unwrap()
+            .plugins[0]
+            .upstream_manifest
+            .is_none()
+    );
+    let mismatch = tempdir().unwrap();
+    let mut mismatched = PluginManager::open(mismatch.path()).unwrap();
+    mismatched
+        .install(
+            &package,
+            PluginSource::Upstream {
+                ecosystem: "dsh".into(),
+                package: "different".into(),
+                version: "1.0.0".into(),
+            },
+        )
+        .unwrap();
+    assert!(mismatched.projection_with_upstream_metadata(true).is_err());
+}
+
+#[test]
 fn install_enable_authorize_activate_and_reopen_use_one_immutable_package() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();

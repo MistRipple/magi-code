@@ -16,7 +16,7 @@ test('profile 同步读取真实调用快照，启停提案经 daemon 与摘要�
   let enabled = true, digest = 'current';
   const calls = [];
   const off = configureProfile({ plugins: {
-    async list() { return { plugins: [{ manifest: { id: 'dsh.example', description: 'real' }, digest, source: { kind: 'upstream', location: 'dsh:@scope/example@1.2.3' }, enabled, active: enabled, runtime: { state: enabled ? 'running' : 'stopped' } }] }; },
+    async list() { return { plugins: [{ manifest: { id: 'dsh.example', description: 'real' }, upstreamManifest: { name: '@scope/example', version: '1.2.3' }, digest, source: { kind: 'upstream', location: 'dsh:@scope/example@1.2.3' }, enabled, active: enabled, runtime: { state: enabled ? 'running' : 'stopped' } }] }; },
     async setEnabled(id, value, expected) { assert.equal(id, 'dsh.example'); assert.equal(expected, digest); calls.push(value); enabled = value; },
   } }, { home });
   t.after(off);
@@ -78,6 +78,33 @@ test('Node 导入外观仅覆盖上游的 profile 访问，其他物理文件仍
     assert.deepEqual(JSON.parse(cjs.read()).dependencies, {});
     assert.ok((await cjs.scan()).includes('package.json'));
   });
+});
+
+test('profile 包清单保留不可变原包全部元数据，缺失元数据不伪造，身份不匹配明确失败', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'magi-profile-metadata-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  let upstreamManifest = { name: '@scope/example', version: '1.2.3', engines: { dsh: '^0.2' },
+    peerDependencies: { '@deepseek-ai/cordis': '~4.1.0' }, repository: { url: 'https://example.test/source' },
+    dsh: { bundle: { patch: 'config/loader.yml' }, client: { inject: ['slots'] } }, custom: { retained: true } };
+  const off = configureProfile({ plugins: { async list(input) {
+    assert.deepEqual(input, { includeUpstreamManifest: true });
+    return { plugins: [{ manifest: { id: 'dsh.example' }, upstreamManifest, source: { kind: 'upstream', location: 'dsh:@scope/example@1.2.3' } }] };
+  } } }, { home });
+  t.after(off);
+  const manifestPath = join(profilePath(), 'node_modules/@scope/example/package.json');
+  await withProfile(async () => {
+    assert.deepEqual(JSON.parse(fs.readFileSync(manifestPath, 'utf8')), upstreamManifest);
+    assert.equal(load(fs.readFileSync(join(profilePath(), 'node_modules/@scope/example/config/loader.yml'), 'utf8'))[0].insert[0].id, 'dsh.example');
+  });
+  upstreamManifest.dsh.bundle.patch = ['a.yml', 'b.yml'];
+  await withProfile(async () => {
+    assert.equal(load(fs.readFileSync(join(profilePath(), 'node_modules/@scope/example/a.yml'), 'utf8'))[0].insert[0].id, 'dsh.example');
+    assert.deepEqual(load(fs.readFileSync(join(profilePath(), 'node_modules/@scope/example/b.yml'), 'utf8')), []);
+  });
+  upstreamManifest = undefined;
+  await withProfile(async () => { assert.equal(fs.existsSync(manifestPath), false); });
+  upstreamManifest = { name: 'other', version: '1.2.3' };
+  await assert.rejects(withProfile(async () => {}), /元数据身份/);
 });
 
 test('通用原子写入后缀只在调用内存在，取消不提交启停提案', async (t) => {

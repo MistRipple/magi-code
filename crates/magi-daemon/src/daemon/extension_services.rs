@@ -390,15 +390,15 @@ impl HostService for PluginHostService {
             }
             let result = match method.as_str() {
                 "plugins.list" => {
-                    if params.as_object().is_none_or(|object| !object.is_empty()) {
-                        return Err(RpcError::new(
-                            ErrorKind::InvalidParams,
-                            "plugins.list 不接受参数",
-                        ));
-                    }
+                    let request: magi_app_server_protocol::generated::PluginListRequest =
+                        serde_json::from_value(params).map_err(|error| {
+                            RpcError::new(ErrorKind::InvalidParams, error.to_string())
+                        })?;
                     // 复用既有目录 DTO，配置和资源不在此投影中；每次读取当前 manager，
                     // 不在 Node 端建立安装状态缓存或另一份插件清单。
-                    let mut list = manager_guard.projection().map_err(map_error)?;
+                    let mut list = manager_guard
+                        .projection_with_upstream_metadata(request.include_upstream_manifest)
+                        .map_err(map_error)?;
                     if let Some(operations) = &operations {
                         operations.decorate_runtime(&mut list);
                     }

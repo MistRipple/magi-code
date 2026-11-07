@@ -1777,6 +1777,10 @@ pub struct PluginInstalled {
     pub runtime: Option<PluginRuntimeStatus>,
     pub enabled: bool,
     pub active: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "upstreamManifest")]
+    pub upstream_manifest: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3575,4 +3579,12 @@ pub struct PluginDshVersionExemptionRequest {
     pub enabled: bool,
     #[serde(rename = "acceptRisk")]
     pub accept_risk: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginListRequest {
+    #[serde(default)]
+    #[serde(rename = "includeUpstreamManifest")]
+    pub include_upstream_manifest: bool,
 }

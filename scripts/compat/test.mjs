@@ -41,6 +41,20 @@ test('ctx.get 服务读取沿上下文辅助函数记录，供管理权限声明
   assert.equal(report.verdict.blocked.length, 0, '读取可缺席服务不会被变成必需依赖');
 });
 
+test('DSH 原包的 createRequire.resolve 与 ESM 共享同一真实运行库解析', async (t) => {
+  const { installSharedResolution } = await import('./runtime/shared-resolution.mjs');
+  const { createRequire } = await import('node:module');
+  const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const root = await mkdtemp(join(tmpdir(), 'magi-runtime-metadata-')); t.after(() => rm(root, { recursive: true, force: true }));
+  const shared = new URL('./', import.meta.url).pathname;
+  await writeFile(join(root, 'entry.mjs'), "import {createRequire} from 'node:module'; export default () => createRequire(import.meta.url).resolve('@deepseek-ai/dsh-app-boot');");
+  const hooks = installSharedResolution(shared, { '@magi/compat-upstream-root': root + '/' }); t.after(() => hooks.deregister());
+  const resolved = (await import(join(root, 'entry.mjs'))).default();
+  assert.equal(resolved, createRequire(new URL('./package.json', import.meta.url)).resolve('@deepseek-ai/dsh-app-boot'));
+});
+
 test('DSH 同步事件注册失败有明确 catch 时允许上游降级；无保护、异步与重抛仍阻塞', async (t) => {
   const report = await inspectOptional(t, "export function apply(ctx) { try { ctx.on('session/event', () => {}); } catch (error) { ctx.logger.warn(error); } }");
   assert.equal(report.verdict.blocked.length, 0);

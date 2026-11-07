@@ -634,6 +634,8 @@ Windows、手机触摸、完整生态分母及 95% 目标均未验收。后续�
 
 `ctx.get('pluginManager')` 这类可选服务读取也纳入翻译扫描，使用管理服务的原包会声明对应授权；`ctx.baseUrl` 改为调用期 profile 的 `file:` 身份，健康扫描不会再把 HTTP 地址误判为 DSH 安装目录。版本不兼容回执保留精确包、版本、运行时和声明范围，供原生面板展示；豁免不能跳过能力门禁、完整性校验或权限授权。
 
+插件目录支持按请求在同一个 daemon 快照中附带不可变原包 `package.json`；DSH profile 投影保留 engines、peer、repository、bundle patch 数组和自定义字段，元数据缺失时保持缺失，不从 Magi 清单猜造。CJS `createRequire().resolve()` 与 ESM 导入共用随包依赖解析，因此 Health 的运行时身份和兼容声明可到达真实报告；`dsh-app-boot` 只提供版本元数据 shim，不提供 Loader 业务 API。
+
 【现状·已运行验证】`npm run test:electron-dsh-compatibility` 在真实 macOS arm64 目录包、Electron Main、sidecar、随包 Node 和未修改的 `dsh-plugin-ops-bundle@0.20.8` 原生页面中 12/12 通过：缺少兼容委托不能激活；失败安装自动撤回豁免；Ops 通过真实路由在线安装并激活 `dsh-plugin-release-probe@0.0.8`；健康扫描读取真实 `magi` profile；重启后豁免恢复；原包撤销、卸载和页面运行无异常；没有落盘第二份 profile。兼容回归 64 项、插件系统兼容单测 2 项、管理 API 单测 5 项通过。证据位于 `target/plugin-acceptance/dsh-compatibility/`。
 
 本轮只覆盖 Ops 的扫描、豁免、在线安装和卸载路径；完整生态分母、Windows、Appshot 会话投递、Upgrader 回滚、平台原生辅助进程和 95%／100% 目标仍未完成，不能由通过数推导生态兼容率。

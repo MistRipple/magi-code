@@ -798,6 +798,7 @@ export interface PluginInstalled {
   runtime?: PluginRuntimeStatus;
   enabled: boolean;
   active: boolean;
+  upstreamManifest?: Record<string, unknown>;
 }
 
 export type PluginRuntimeState = "starting" | "running" | "restarting" | "failed" | "stopped";
@@ -1583,4 +1584,8 @@ export interface PluginDshVersionExemptionRequest {
   expectedRevision: number;
   enabled: boolean;
   acceptRisk: boolean;
+}
+
+export interface PluginListRequest {
+  includeUpstreamManifest?: boolean;
 }

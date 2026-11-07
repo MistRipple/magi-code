@@ -2815,6 +2815,11 @@
         },
         "active": {
           "type": "boolean"
+        },
+        "upstreamManifest": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "已安装且通过来源身份校验的 npm 原包 package.json，只读；缺失表示没有原包元数据，不从 Magi 清单猜测。"
         }
       }
     },
@@ -6360,6 +6365,17 @@
         },
         "acceptRisk": {
           "type": "boolean"
+        }
+      }
+    },
+    "PluginListRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "includeUpstreamManifest": {
+          "type": "boolean",
+          "x-rust-default": true,
+          "description": "只读兼容诊断需要原包元数据时显式请求；与插件目录在同一 manager 快照中读取。"
         }
       }
     }
