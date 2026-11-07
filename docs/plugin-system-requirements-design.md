@@ -538,6 +538,24 @@
 
 证据保存在 `target/plugin-acceptance/dsh-rea/results.json`、`evidence.json`、`online-svg.png`、`settings.png` 和 `settings-390.png`。本轮仍未覆盖 Android/iOS 真机触摸、Windows、Ghidra 实际安装与原生二进制分析，以及全部 DSH 包。
 
+### 11.7 热门社区 DSH 插件兼容审计（2026-11-07）
+
+【现状·已运行验证】`npm run test:electron-popular-dsh` 在真实 macOS arm64 目录包、独立状态根和 npm 在线来源上审计 9 个近期社区包。脚本对每个包执行精确版本预览、翻译、确认安装、授权、激活和运行状态检查；成功包在结束时停用并卸载，避免污染用户状态。
+
+| 包 | 版本 | 结果 | 原因或证据 |
+| --- | --- | --- | --- |
+| `dsh-plugin-health` | 3.0.5 | 阻止安装 | 宿主 `@deepseek-ai/cordis@4.1.0` 不满足包声明的 `~4.0.5-alpha.2` |
+| `dsh-plugin-ops-bundle` | 0.20.8 | 阻止安装 | 使用未登记的 `ctx.baseUrl` |
+| `dsh-plugin-upgrader` | 1.8.0 | 阻止安装 | 事件名动态生成，静态分析无法证明语义 |
+| `dsh-plugin-debugging` | 0.7.2 | 阻止安装 | 使用未登记的 `ctx.events`，并发生上下文逃逸 |
+| `dsh-plugin-appshot` | 0.4.2 | 阻止安装 | 依赖附件、会话等由 Magi 内核独有的能力 |
+| `dsh-plugin-share` | 0.2.5 | 阻止安装 | 使用未登记的 `ctx.connection` 与 `ctx.pluginManager` |
+| `dsh-plugin-mgr` | 0.2.12 | 阻止安装 | 使用未登记的 `loader` 服务 |
+| `dsh-plugin-release-probe` | 0.0.8 | **通过** | 在线翻译、安装、授权、激活成功，运行状态 `running`，设置视图贡献正常 |
+| `@99galaxy/dsh-plugin-market` | 1.2.2 | 阻止安装 | 上游客户端模块格式不符合当前原样页面加载合同 |
+
+这组结果说明兼容门禁正在拦截真实生态中的版本、宿主服务、动态事件、上下文逃逸和客户端格式差异；`dsh-plugin-release-probe` 提供了除 WorkBuddy、dsh-rea 外的第三个真实安装运行样本。审计结果保存在 `target/plugin-acceptance/popular-dsh/results.json`。
+
 ## 12. 验收与证据边界
 
 ### 12.1 已运行验证
