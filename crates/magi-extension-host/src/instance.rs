@@ -683,6 +683,9 @@ impl Incoming for HostHandler {
                         | "ask.user"
                         | "notify.user"
                         | "tool.call"
+                        | "plugins.install"
+                        | "plugins.setEnabled"
+                        | "plugins.remove"
                         | "session.snapshot"
                         | "credential.ref"
                         | "blob.put"
@@ -1070,7 +1073,7 @@ fn check_hello(
                 .collect()
         })
         .unwrap_or_default();
-    let supported = ["hook.guard"];
+    let supported = ["hook.guard", "plugin.management"];
     let features: Vec<String> = supported
         .iter()
         .filter(|f| offered.contains(**f))

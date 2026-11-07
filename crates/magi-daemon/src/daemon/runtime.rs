@@ -1794,6 +1794,7 @@ impl DaemonRuntime {
                 .with_extension_hooks(extension_bus_hooks),
         );
         self.plugins.bind_native(&llm_task_dispatcher);
+        self.plugins.bind_operations(&state);
         self.plugins.start_extensions(self.event_bus.clone());
         let session_turn_dispatcher = llm_task_dispatcher.clone();
         state = state

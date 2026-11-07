@@ -53,7 +53,7 @@ fn ecosystem_name(ecosystem: &PluginEcosystem) -> &'static str {
 }
 
 /// 本机能否安装该生态的包。返回不能的原因，界面原样展示。
-fn blocked_reason(state: &ApiState, ecosystem: &PluginEcosystem) -> Option<String> {
+fn blocked_reason(state: &PluginOperations, ecosystem: &PluginEcosystem) -> Option<String> {
     if !matches!(ecosystem, PluginEcosystem::Dsh) {
         return Some("pi 翻译器尚未提供，当前只能浏览".into());
     }
@@ -140,7 +140,7 @@ pub(super) async fn search(
         }
         match search_ecosystem(&registry, &ecosystem, query.q.trim()).await {
             Ok(found) => {
-                let reason = blocked_reason(&state, &ecosystem);
+                let reason = blocked_reason(&PluginOperations::from_state(&state), &ecosystem);
                 for package in found {
                     entries.push(entry_from_search(package, &ecosystem, &reason, &installed));
                 }
@@ -174,7 +174,7 @@ pub(super) async fn search(
         let Ok(document) = serde_json::from_slice::<VersionDocument>(&bytes) else {
             continue;
         };
-        let reason = blocked_reason(&state, &ecosystem);
+        let reason = blocked_reason(&PluginOperations::from_state(&state), &ecosystem);
         entries.push(PluginUpstreamEntry {
             official: OFFICIAL_SCOPES
                 .iter()
@@ -338,15 +338,24 @@ pub(super) async fn preview(
     State(state): State<ApiState>,
     Json(request): Json<PluginUpstreamRequest>,
 ) -> Result<Json<PluginUpstreamPreview>, ApiError> {
-    let translated = translate(&state, &request).await?;
+    preview_candidate(&PluginOperations::from_state(&state), &request)
+        .await
+        .map(Json)
+}
+
+pub(super) async fn preview_candidate(
+    operations: &PluginOperations,
+    request: &PluginUpstreamRequest,
+) -> Result<PluginUpstreamPreview, ApiError> {
+    let translated = translate(operations, &request).await?;
     let source = upstream_source(&request.ecosystem, &translated.document);
     let candidate = {
-        let manager = locked(&state, "预览上游插件")?;
+        let manager = operations.locked("预览上游插件")?;
         manager
             .preview(&translated.package, &source)
             .map_err(plugin_error)?
     };
-    Ok(Json(PluginUpstreamPreview {
+    Ok(PluginUpstreamPreview {
         candidate,
         official: OFFICIAL_SCOPES
             .iter()
@@ -366,13 +375,22 @@ pub(super) async fn preview(
         package: translated.document.name,
         version: translated.document.version,
         translation: translated.summary,
-    }))
+    })
 }
 
 pub(super) async fn install(
     State(state): State<ApiState>,
     Json(request): Json<PluginUpstreamRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
+    install_candidate(&PluginOperations::from_state(&state), &request, None).await?;
+    snapshot(&state, &*locked(&state, "读取插件安装结果")?)
+}
+
+pub(super) async fn install_candidate(
+    operations: &PluginOperations,
+    request: &PluginUpstreamRequest,
+    caller: Option<(&str, &str, Option<&str>)>,
+) -> Result<(), ApiError> {
     let expected = request
         .expected_digest
         .as_deref()
@@ -387,7 +405,7 @@ pub(super) async fn install(
             "安装必须指定预览时的精确版本".into(),
         ));
     }
-    let translated = translate(&state, &request).await?;
+    let translated = translate(operations, &request).await?;
     // 预览确认的是具体摘要：上游内容或兼容运行时在确认后变化时必须拒绝。
     if translated.package.digest() != expected {
         return Err(ApiError::Conflict(
@@ -395,8 +413,18 @@ pub(super) async fn install(
         ));
     }
     let source = upstream_source(&request.ecosystem, &translated.document);
-    install_or_upgrade(&state, &translated.package, source).await?;
-    snapshot(&state, &*locked(&state, "读取插件安装结果")?)
+    if let Some((id, digest, lease)) = caller {
+        operations.admitted(id, digest, lease, "install")?;
+        if translated.package.manifest().id == id {
+            return Err(ApiError::Conflict(
+                "插件不能在自己的调用中升级自身，请使用 Magi 在线升级入口".into(),
+            ));
+        }
+    }
+    operations
+        .install_or_upgrade(&translated.package, source, caller)
+        .await?;
+    Ok(())
 }
 
 fn upstream_source(ecosystem: &PluginEcosystem, document: &VersionDocument) -> PluginSource {
@@ -408,7 +436,7 @@ fn upstream_source(ecosystem: &PluginEcosystem, document: &VersionDocument) -> P
 }
 
 async fn translate(
-    state: &ApiState,
+    state: &PluginOperations,
     request: &PluginUpstreamRequest,
 ) -> Result<Translated, ApiError> {
     if let Some(reason) = blocked_reason(state, &request.ecosystem) {
@@ -496,7 +524,7 @@ async fn translate(
 }
 
 async fn run_translator(
-    state: &ApiState,
+    state: &PluginOperations,
     toolchain: &crate::state::PluginToolchain,
     ecosystem: &PluginEcosystem,
     upstream_dir: &FsPath,
@@ -521,9 +549,8 @@ async fn run_translator(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let mut child =
-        magi_process::spawn_managed_tokio_in_group(state.managed_process_group(), &mut command)
-            .map_err(|error| ApiError::internal_assembly("启动翻译器失败", error))?;
+    let mut child = magi_process::spawn_managed_tokio_in_group(&state.processes, &mut command)
+        .map_err(|error| ApiError::internal_assembly("启动翻译器失败", error))?;
     let mut out = child.take_stdout();
     let mut err = child.take_stderr();
     let collect = async {

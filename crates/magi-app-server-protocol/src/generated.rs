@@ -1499,6 +1499,8 @@ pub enum PluginPermissionKind {
     ContextRewrite,
     #[serde(rename = "modelSources")]
     ModelSources,
+    #[serde(rename = "pluginManagement")]
+    PluginManagement,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

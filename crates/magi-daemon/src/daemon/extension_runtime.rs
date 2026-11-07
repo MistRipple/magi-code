@@ -86,6 +86,7 @@ pub(super) struct ExtensionRuntime {
     board: Arc<std::sync::RwLock<HashMap<String, PluginRuntimeStatus>>>,
     events: Arc<std::sync::OnceLock<Arc<InMemoryEventBus>>>,
     native: Arc<std::sync::OnceLock<super::extension_services::NativeService>>,
+    operations: Arc<std::sync::OnceLock<magi_api::PluginOperations>>,
     settings: Arc<std::sync::OnceLock<Arc<magi_settings_store::SettingsStore>>>,
 }
 
@@ -158,6 +159,7 @@ impl ExtensionRuntime {
             board: Arc::default(),
             events: Arc::default(),
             native: Arc::default(),
+            operations: Arc::default(),
             settings: Arc::default(),
         }
     }
@@ -173,6 +175,10 @@ impl ExtensionRuntime {
     /// 绑定主对话模型目录所在的设置事实源（插件贡献的数据源写入其运行期 section）。
     pub(super) fn bind_settings(&self, settings: &Arc<magi_settings_store::SettingsStore>) {
         let _ = self.settings.set(Arc::clone(settings));
+    }
+
+    pub(super) fn bind_operations(&self, operations: magi_api::PluginOperations) {
+        let _ = self.operations.set(operations);
     }
 
     pub(super) fn bind_native(
@@ -480,6 +486,7 @@ impl ExtensionRuntime {
             events: Arc::clone(&self.events),
             digest: digest.clone(),
             native: Arc::clone(&self.native),
+            operations: Arc::clone(&self.operations),
             blobs: Arc::default(),
             settings: Arc::clone(&self.settings),
         }));

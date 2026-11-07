@@ -66,6 +66,15 @@ impl PluginManager {
         Ok(())
     }
 
+    /// 当前安装版本的活动实例是否已就绪；不能用监管板的迟到 Running
+    /// 推导新版本已经启动，旧实例在停用／升级后永久失效。
+    pub fn runtime_ready(&self, id: &str) -> Result<bool, PluginError> {
+        let Some(runtime) = self.runtime_catalogs.get(id) else {
+            return Ok(false);
+        };
+        Ok(runtime.ready && !runtime.revoked && self.check_runtime(id, &runtime.lease).is_ok())
+    }
+
     /// 老实例清理不能删除同插件新实例的目录。
     pub fn end_runtime(&mut self, id: &str, lease: &str) -> bool {
         if self

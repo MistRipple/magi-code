@@ -872,6 +872,7 @@
   "settings.plugins.deactivate": "Deactivate",
   "settings.plugins.disable": "Disable",
   "settings.plugins.permission.extensionFullTrust": "Full trust: runs with your user privileges and can read files and credentials, use the network and start processes. Magi cannot restrict it",
+  "settings.plugins.permission.pluginManagement": "Manage plugins: may install, upgrade, enable, disable and remove other plugins; you still approve permissions for new versions",
   "settings.plugins.permission.contextRewrite": "Rewrite context: may replace the conversation history sent to the model (invalidating the prompt cache) and supply custom compaction summaries; the recorded conversation is unchanged",
   "settings.plugins.permission.modelSources": "Provide main-conversation models ({sources}): these sources appear in the main conversation's model list; once selected, conversation content (history, tool results, etc.) is sent to the address the plugin provides",
   "settings.plugins.runtime.label": "Extension host",

@@ -296,12 +296,14 @@ fn deactivation_and_revocation_permanently_invalidate_the_previous_lease() {
             .replace_runtime_catalog(ID, "old", 0, catalog())
             .unwrap();
         manager.ready_runtime(ID, "old").unwrap();
+        assert!(manager.runtime_ready(ID).unwrap());
         if revoke {
             manager.authorize(ID, vec![]).unwrap();
         } else {
             manager.deactivate(ID).unwrap();
         }
         assert!(manager.check_runtime(ID, "old").is_err());
+        assert!(!manager.runtime_ready(ID).unwrap());
         manager
             .authorize(ID, package.manifest().permissions.clone())
             .unwrap();
@@ -315,7 +317,11 @@ fn deactivation_and_revocation_permanently_invalidate_the_previous_lease() {
                 .is_empty()
         );
         assert!(manager.check_runtime(ID, "old").is_err());
+        assert!(!manager.runtime_ready(ID).unwrap());
         manager.begin_runtime(ID, package.digest(), "new").unwrap();
         manager.check_runtime(ID, "new").unwrap();
+        assert!(!manager.runtime_ready(ID).unwrap());
+        manager.ready_runtime(ID, "new").unwrap();
+        assert!(manager.runtime_ready(ID).unwrap());
     }
 }

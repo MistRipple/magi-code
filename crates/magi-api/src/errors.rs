@@ -149,7 +149,7 @@ impl ApiError {
         }
     }
 
-    pub(crate) fn message(&self) -> &str {
+    pub fn message(&self) -> &str {
         match self {
             ApiError::InvalidInput(message) => message,
             ApiError::InvalidRequestBody(message) => message,

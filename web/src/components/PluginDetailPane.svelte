@@ -41,6 +41,7 @@
 
   function permissionText(permission: PluginPermission): string {
     if (permission.kind === 'extension') return i18n.t('settings.plugins.permission.extensionFullTrust');
+    if (permission.kind === 'pluginManagement') return i18n.t('settings.plugins.permission.pluginManagement');
     if (permission.kind === 'contextRewrite') return i18n.t('settings.plugins.permission.contextRewrite');
     if (permission.kind === 'modelSources') return i18n.t('settings.plugins.permission.modelSources', { sources: permission.targets.join(', ') });
     return `${permission.kind}${permission.targets.length ? `: ${permission.targets.join(', ')}` : ''}`;
@@ -149,7 +150,7 @@
     {#if manifest}
       <div class="settings-chips">
         {#each manifest.permissions as permission}
-          <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources'}>{permissionText(permission)}</span>
+          <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement'}>{permissionText(permission)}</span>
         {:else}
           <span class="settings-row-desc">{i18n.t('settings.plugins.noPermissions')}</span>
         {/each}

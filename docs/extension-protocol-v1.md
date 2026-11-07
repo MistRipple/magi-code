@@ -101,7 +101,9 @@ daemon 响应形状：
 | `model.invoke` | `api.model.invoke(input)` | `{prompt,roleId?,credentialRef?,maxOutputTokens?}`，models 授权、原生模型解析和账本 |
 | `credential.ref` | `api.credential.ref({roleId?})` | 返回模型绑定引用，不返回 secret；只由 model.invoke 消费 |
 | `session.snapshot` | `api.session.snapshot(input)` | 仅签发会话；`sessionId?`、`afterTurnSeq?`、`limit?`；最多 10 Turn，每 Turn 最多 20 条截断文本 |
-| `plugins.list` | `api.plugins.list()` | 读取 daemon 的既有 `PluginList` 目录投影，每次校验当前插件包、激活状态及实例租约；不包含配置、资源或凭据，不提供安装或生命周期写入 |
+| `plugins.list` | `api.plugins.list()` | 读取 daemon 的既有 `PluginList` 目录投影，每次校验当前插件包、激活状态及实例租约；不包含配置、资源或凭据 |
+| `plugins.preview/install` | `api.plugins.preview(input)`／`install(input)` | 需协商 `plugin.management` 与 `pluginManagement:["install"]` 授权；复用 `PluginUpstreamRequest`、预览与安装入口，返回既有预览／目录 DTO；仅支持已接入的上游生态。安装必须指定精确版本与预览摘要，不替用户授权新版本 |
+| `plugins.setEnabled/remove` | `api.plugins.setEnabled(pluginId,enabled)`／`remove(pluginId)` | 需协商 `plugin.management` 与 `pluginManagement:["lifecycle"]`；复用 HTTP 的生命周期、排空与停止端口。拒绝当前发起插件的自身停止、删除或升级；启用后等待真实宿主运行状态，启动失败不返回成功 |
 | `tool.call` | `api.tools.call(tool,input)` | 只接受公开原生工具；需要真实 Task、租约、策略、schema、权限、审批与账本 |
 | `task.spawn` | `api.task.spawn(input)` | 原生 agent_spawn 合同；保留角色、自定义模型绑定、目录与策略，不接受伪造归属 |
 | `notify.user` | `api.notify.user({message,title?})` | 原生通知事实、持久化与事件；正文最多 4096 字节、标题 256 字节 |
@@ -152,6 +154,8 @@ daemon 响应形状：
 ## 7. 租约与重入
 
 resource／settings 可在 activate 期间调用；其他业务服务必须拥有仍活动的工具／命令租约。当前钩子和 observe 回调内不得启动模型、工具、任务、通知或提问，返回 `ReentryDenied`；不存在隐式重入或后台无归属动作。
+
+插件管理预览可在活动宿主内读取；安装、启停与移除需要活动调用租约（包括已准入的插件视图路由）。下载／翻译及排空可能异步等待，提交前在 manager 锁内重新核对发起插件摘要、宿主租约、激活与授权，取消沿原调用结束；不在钩子内发起这些写操作。安装不会继承目标旧版本授权，也不执行上游安装脚本。失败可能已完成安装或停止等先前步骤，不宣称整组操作具有自动回滚或幂等性。
 
 工具服务只开放原生工具，拒绝扩展自调用／跨扩展工具递归。Task／审批／canonical 日志不向 Node 暴露可写对象。资源使用 CAS；作业使用持久幂等身份；不得宣称所有反向服务都有通用 requestId 去重或外部副作用回滚。
 

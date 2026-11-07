@@ -86,6 +86,56 @@ test('未接入的 loader 和 sessions 不再以空服务满足必需依赖', as
   t.after(() => running.dispose());
   for (const dependency of ['loader', 'sessions']) await assert.rejects(activateDsh(host().api, { inject: [dependency], apply() { assert.fail('必需服务缺失不能启动'); } }, options), /缺少必需服务/);
 });
+
+test('DSH 管理写操作使用预览精确版本和摘要，不伪造新包授权，启停和移除映射真实 ID', async () => {
+  const { createPluginManager, parseBundleSpec } = await import('./runtime/plugin-manager.mjs');
+  const installed = { manifest: { id: 'translated.scoped', name: 'Scoped' }, source: { kind: 'upstream', location: 'dsh:@scope/sample@1.2.3' }, enabled: false, active: false };
+  const calls = [];
+  const plugins = {
+    async list() { return { plugins: [installed] }; },
+    async preview(input) { calls.push(['preview', input]); return { version: '1.2.3', candidate: { digest: 'confirmed' } }; },
+    async install(input) { calls.push(['install', input]); return { plugins: [installed] }; },
+    async setEnabled(id, enabled) { calls.push(['enabled', id, enabled]); if (enabled) throw Object.assign(new Error('缺少新版授权'), { kind: 'PermissionDenied' }); return { plugins: [installed] }; },
+    async remove(id) { calls.push(['remove', id]); },
+  };
+  const manager = createPluginManager({ plugins });
+  assert.deepEqual(parseBundleSpec('@scope/sample@latest'), { ecosystem: 'dsh', package: '@scope/sample' });
+  assert.equal(parseBundleSpec('sample@^1').version, '^1');
+  assert.equal(parseBundleSpec('sample@next').version, 'next');
+  for (const bad of ['../sample', 'https://example.org/sample', 'sample@1.0.0;touch x', '@scope/sample@']) assert.throws(() => parseBundleSpec(bad));
+  const result = await manager.installBundle('@scope/sample', { enabled: false });
+  assert.equal(result.application, 'applied');
+  assert.deepEqual(calls[1], ['install', { ecosystem: 'dsh', package: '@scope/sample', version: '1.2.3', expectedDigest: 'confirmed' }]);
+  const unapproved = await manager.installBundle('@scope/sample');
+  assert.equal(unapproved.application, 'failed');
+  assert.equal(unapproved.installed, true); assert.equal(unapproved.error.code, 'authorization-required');
+  assert.equal((await manager.setBundleEnabled('@scope/sample', false)).application, 'applied');
+  assert.deepEqual(calls.at(-1), ['enabled', 'translated.scoped', false]);
+  assert.equal((await manager.removeBundle('@scope/sample')).application, 'applied');
+  assert.deepEqual(calls.at(-1), ['remove', 'translated.scoped']);
+  assert.equal((await manager.installBundle('../sample')).application, 'failed');
+});
+
+test('DSH npm 标签和版本范围从 registry 解析为精确版本后才进入 daemon 预览，拒绝静默切换安装源', async (t) => {
+  const { createServer } = await import('node:http');
+  const { createPluginManager } = await import('./runtime/plugin-manager.mjs');
+  const server = createServer((_req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ name: 'fixture-range', 'dist-tags': { latest: '1.2.0', next: '2.0.0' }, versions: Object.fromEntries(['1.0.0', '1.2.0', '2.0.0'].map((version) => [version, { name: 'fixture-range', version, dist: { tarball: 'https://example.test/unused.tgz' } }])) }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const versions = [];
+  const manager = createPluginManager({ plugins: {
+    async preview(input) { versions.push(input.version); return { version: input.version, candidate: { digest: 'confirmed' } }; },
+    async install(input) { return { plugins: [{ manifest: { id: 'translated.range', name: 'Range' }, source: { location: `dsh:fixture-range@${input.version}` }, active: false, enabled: false }] }; },
+  } }, `http://127.0.0.1:${server.address().port}`);
+  assert.equal((await manager.installBundle('fixture-range@^1', { enabled: false })).application, 'applied');
+  assert.equal((await manager.installBundle('fixture-range@next', { enabled: false })).application, 'applied');
+  assert.deepEqual(versions, ['1.2.0', '2.0.0']);
+  assert.equal((await manager.installBundle('fixture-range', { registry: 'https://different.test' })).application, 'failed');
+  assert.equal(versions.length, 2, '安装源不一致不能发送预览或写入');
+});
 const execution = () => ({ invocationId: 'test-call', signal: new AbortController().signal });
 const tool = (name, execute = async () => 'ok') => ({
   name, description: name, parameters: { type: 'object' }, execute,

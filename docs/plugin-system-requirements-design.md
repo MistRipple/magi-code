@@ -591,6 +591,27 @@
 
 Windows、手机触摸、完整生态分母及 95% 目标均未验收。后续须补齐 daemon 原生会话投影、插件管理写操作、profile/loader 语义与业务级回归，不能靠添加空服务或跳过失败提高比例。
 
+### 11.9 插件管理写操作与原包业务验收（2026-11-07）
+
+【目标】继续以生态安装和核心业务完整兼容为验收口径，95% 为此前最低目标，100% 为用户期望目标；当前均未达到。不能把新增管理服务机制或单个原包的部分核心路径通过换算成生态兼容率。
+
+【现状】新增 `PluginOperations`，HTTP、插件中心、上游安装与受信 Node 管理调用使用同一组安装、升级、生命周期和排空实现。服务只捕获原 manager、事件、随包工具链与进程组，监管端口使用弱引用，避免捕获完整 ApiState 造成引用环；不生成 DSH profile，也不让 Node 维护安装事实。
+
+- 新增 `plugin.management` 功能协商、`pluginManagement` 权限及 `install`／`lifecycle` 两个目标。插件详情和安装预览沿共享权限组件展示中英文告知。译包实际使用 pluginManager 时声明该授权；只读目录仍不包含配置或凭据。
+- DSH 的 `installBundle`、`setBundleEnabled`、`removeBundle` 映射到原服务。npm 精确版本、标签与范围解析后，最终仍经 daemon 校验 npm 包、完整性、精确版本和翻译摘要。Git／本地来源和构建脚本不伪装支持。
+- 新装或升级不会代替用户确认目标包权限；未授权激活明确失败，并保留“已安装、后续未完成”的信息。管理调用不能在自身请求内升级、停止或删除发起插件，避免回执前销毁自己；这类操作仍可沿 Magi 原生在线入口完成。
+- 发起插件摘要、激活、权限与实例租约在异步等待后的提交锁内复核；管理写操作要求活动调用租约，钩子不能隐式启动管理动作。已停用目标不重复执行停用，卸载先停止运行宿主再移除事实。启用操作以实际宿主状态确认运行，启动失败不算成功。
+
+【现状·已运行验证】`test:electron-dsh-management` 从新构建的 macOS arm64 目录包启动真实 Electron、sidecar 和随包 Node：11 项通过。在线安装未经修改的 `dsh-plugin-share@0.2.5`，原生页面生成／解析组合码、二维码、点击安装 `dsh-plugin-release-probe@0.0.7`（保持禁用）、导入停用／启用状态并确认目标宿主恢复；共享管理服务机制夹具再验证错误摘要拒绝、真实 npm 原包从 `0.0.7` 在线升级至 `0.0.8`、清空旧版授权、未授权激活拒绝、运行中卸载和自身删除拒绝。后半部分是机制夹具，不称为 Upgrader 原包业务验收。390px 截图确认原页面与宿主设置页可显示。
+
+证据：`target/plugin-acceptance/dsh-management/{results.json,electron.log,share-installed.png,share-390.png}`。前两次验收脚本分别因测试输入缺少 npm 类型和机制夹具缺少视图声明失败，修正夹具后完整重跑通过，未绕过产品准入。
+
+【现状·定向回归】兼容层 53 项通过（含标签／版本范围从本机 registry 解析后固定精确版本、拒绝静默切换安装源）；API 插件路由与管理服务 25 项通过；daemon 服务 9 项通过；扩展宿主 15 项单元与 23 项真实 Node 集成通过；运行目录租约回归 6 项通过。Web 类型检查 0 错误 0 警告，i18n、protocol:check 和差异空白检查通过。未运行全仓测试。
+
+【现状·社区复测仍未达标】同一目录包重跑 9 个固定样本，7 个安装、启动和页面显示通过，5 个只读后端探测通过；脚本仍以退出码 1 报告不达标，完整核心业务／升级均未由该批量脚本验收。Share 的新增业务证据来自单独脚本，不能把它或管理机制夹具拼成 7/9 完整业务通过。Health 仍报告 profile 缺席，Ops 仍缺 `listVersionExemptions`，Upgrader 真实返回 `managed:false`／`not a profile-managed package`。证据为 `target/plugin-acceptance/popular-dsh/{results.json,coverage.json,electron.log}`。
+
+【剩余】DSH 原生 profile 文件、loader 行、健康扫描、版本豁免、Agent／会话及平台原生辅助进程等语义仍须沿对应 Magi 服务继续适配。Upgrader 原包还检查 DSH profile 的托管身份并直接修改其 manifest，新增通用在线管理 RPC 不代表该原包已完成升级业务；Mgr／Appshot 的必需服务仍缺席。Share 已验证 npm 原包安装与启停，Git 导入、完整扫码和升级业务未验收。Windows、手机触摸、生态全集分母及 95%／100% 均未验收。
+
 ## 12. 验收与证据边界
 
 ### 12.1 已运行验证

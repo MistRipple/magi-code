@@ -67,6 +67,11 @@ impl PluginServices {
         self.extensions.bind_settings(settings);
     }
 
+    pub(super) fn bind_operations(&self, state: &magi_api::ApiState) {
+        self.extensions
+            .bind_operations(magi_api::PluginOperations::from_state(state));
+    }
+
     pub(super) fn bind_native(
         &self,
         dispatcher: &Arc<magi_conversation_runtime::task_execution_dispatcher::LlmTaskDispatcher>,

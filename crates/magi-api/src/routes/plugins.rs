@@ -33,6 +33,8 @@ const RESOURCE_SUBSCRIPTION_RECHECK: Duration = Duration::from_millis(500);
 
 mod center;
 mod download;
+mod operations;
+pub use operations::PluginOperations;
 mod upstream;
 #[cfg(test)]
 use center::{OFFICIAL_PLUGIN_CENTER_URL, is_official_center, read_center_config};
@@ -539,19 +541,9 @@ async fn install_or_upgrade(
     package: &PluginPackage,
     source: PluginSource,
 ) -> Result<(), ApiError> {
-    let installed = locked(state, "读取已安装插件")?
-        .state()
-        .plugins
-        .contains_key(&package.manifest().id);
-    if installed {
-        upgrade_installed_plugin(state, package, source).await
-    } else {
-        locked(state, "安装插件")?
-            .install(package, source)
-            .map_err(plugin_error)?;
-        publish_plugin_registry_changed(state);
-        Ok(())
-    }
+    PluginOperations::from_state(state)
+        .install_or_upgrade(package, source, None)
+        .await
 }
 
 /// 升级的唯一入口：关闭该插件全局准入，再原子切换到新包。任一步失败都保持旧版本与旧激活状态不变。
@@ -560,23 +552,9 @@ async fn upgrade_installed_plugin(
     package: &PluginPackage,
     source: PluginSource,
 ) -> Result<(), ApiError> {
-    let drain = PluginManager::begin_upgrade_drain(
-        std::sync::Arc::clone(&state.plugin_manager),
-        &package.manifest().id,
-    )
-    .map_err(plugin_error)?;
-    quiesce_extension(state, &package.manifest().id).await?;
-    {
-        let mut manager = locked(state, "升级插件")?;
-        if let Err(error) = manager.upgrade(package, source, &drain) {
-            drop(manager);
-            publish_plugin_registry_changed(state);
-            return Err(plugin_error(error));
-        }
-        drain.commit(&mut manager);
-    }
-    publish_plugin_registry_changed(state);
-    Ok(())
+    PluginOperations::from_state(state)
+        .upgrade(package, source, None)
+        .await
 }
 
 /// 已激活插件声明的用户命令。身份固定为 `plugin/{插件}/{贡献}`，供输入框斜杠菜单使用。
@@ -637,70 +615,53 @@ async fn enable(
     Path(id): Path<String>,
     Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    mutate_plugin(&state, |m| m.enable(&id), "启用插件")
+    PluginOperations::from_state(&state)
+        .lifecycle("enable", &id, None)
+        .await?;
+    snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
 async fn activate(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    mutate_plugin(&state, |m| m.activate(&id).map(|_| ()), "激活插件")
+    PluginOperations::from_state(&state)
+        .lifecycle("activate", &id, None)
+        .await?;
+    snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
 async fn deactivate(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    let drain =
-        PluginManager::begin_deactivation(std::sync::Arc::clone(&state.plugin_manager), &id)
-            .map_err(plugin_error)?;
-    quiesce_extension(&state, &id).await?;
-    {
-        let mut manager = locked(&state, "停用插件")?;
-        if let Err(error) = manager.deactivate(&id) {
-            drop(manager);
-            publish_plugin_registry_changed(&state);
-            return Err(plugin_error(error));
-        }
-        drain.commit(&mut manager);
-    }
-    publish_plugin_registry_changed(&state);
-    {
-        let manager = locked(&state, "读取停用后的插件状态")?;
-        snapshot(&state, &manager)
-    }
+    PluginOperations::from_state(&state)
+        .lifecycle("deactivate", &id, None)
+        .await?;
+    snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
 
 async fn quiesce_extension(state: &ApiState, id: &str) -> Result<(), ApiError> {
-    let executable = locked(state, "读取扩展宿主")?
-        .package(id)
-        .map_err(plugin_error)?
-        .manifest()
-        .extension
-        .is_some();
-    if executable && let Some(source) = &state.extension_status {
-        source
-            .quiesce(id.to_string())
-            .await
-            .map_err(|reason| ApiError::Conflict(format!("扩展停止失败：{reason}")))?;
-    }
-    Ok(())
+    PluginOperations::from_state(state).quiesce(id).await
 }
 async fn disable(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    mutate_plugin(&state, |m| m.disable(&id), "禁用插件")
+    PluginOperations::from_state(&state)
+        .lifecycle("disable", &id, None)
+        .await?;
+    snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
 async fn uninstall(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    let mut manager = locked(&state, "卸载插件")?;
-    manager.uninstall(&id).map_err(plugin_error)?;
-    publish_plugin_registry_changed(&state);
-    snapshot(&state, &manager)
+    PluginOperations::from_state(&state)
+        .lifecycle("uninstall", &id, None)
+        .await?;
+    snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
 
 // 只发布注册表失效事实；所有客户端经原清单入口读取，不复制激活或权限状态。
@@ -712,19 +673,6 @@ fn publish_plugin_registry_changed(state: &ApiState) {
     ));
 }
 
-fn mutate_plugin<F>(
-    state: &ApiState,
-    mut operation: F,
-    action: &str,
-) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError>
-where
-    F: FnMut(&mut magi_plugin_system::PluginManager) -> Result<(), magi_plugin_system::PluginError>,
-{
-    let mut manager = locked(state, action)?;
-    operation(&mut manager).map_err(plugin_error)?;
-    publish_plugin_registry_changed(state);
-    snapshot(state, &manager)
-}
 fn locked<'a>(
     state: &'a ApiState,
     action: &str,
@@ -913,7 +861,7 @@ mod tests {
         assert!(parse_source("address:not-a-url").is_err());
     }
 
-    fn bare_state(root: &std::path::Path) -> ApiState {
+    pub(super) fn bare_state(root: &std::path::Path) -> ApiState {
         let manager = PluginManager::open(root).unwrap();
         ApiState::new(
             "magi-test",

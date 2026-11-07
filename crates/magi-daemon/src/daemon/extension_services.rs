@@ -24,6 +24,7 @@ pub(super) struct PluginHostService {
     pub events: Arc<OnceLock<Arc<InMemoryEventBus>>>,
     pub digest: String,
     pub native: Arc<OnceLock<NativeService>>,
+    pub operations: Arc<OnceLock<magi_api::PluginOperations>>,
     pub blobs: Arc<Mutex<HashMap<String, Blob>>>,
     /// 主对话模型目录所在的设置事实源；插件贡献的数据源写入其运行期 section。
     pub settings: Arc<OnceLock<Arc<magi_settings_store::SettingsStore>>>,
@@ -191,6 +192,22 @@ impl HostService for PluginHostService {
         if cancelled.load(Ordering::Acquire) {
             return Box::pin(async { Err(RpcError::new(ErrorKind::Cancelled, "调用已取消")) });
         }
+        if matches!(
+            method.as_str(),
+            "plugins.preview" | "plugins.install" | "plugins.setEnabled" | "plugins.remove"
+        ) {
+            let operation = self.request_with_identity(plugin_id, method, params);
+            return Box::pin(async move {
+                tokio::select! {
+                    result = operation => result,
+                    _ = async {
+                        while !cancelled.load(Ordering::Acquire) {
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
+                    } => Err(RpcError::new(ErrorKind::Cancelled, "插件管理调用已取消")),
+                }
+            });
+        }
         if !matches!(
             method.as_str(),
             "model.invoke" | "task.spawn" | "ask.user" | "notify.user" | "tool.call"
@@ -257,6 +274,37 @@ impl HostService for PluginHostService {
         let settings = self.settings.get().cloned();
         if let Err(error) = self.service_admitted(&plugin_id, &method, &params) {
             return Box::pin(async { Err(error) });
+        }
+        if matches!(
+            method.as_str(),
+            "plugins.preview" | "plugins.install" | "plugins.setEnabled" | "plugins.remove"
+        ) {
+            let operations = self.operations.get().cloned();
+            let digest = self.digest.clone();
+            let lease = params
+                .get("_instance")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(object) = params.as_object_mut() {
+                object.remove("_instance");
+                object.remove("_context");
+            }
+            return Box::pin(async move {
+                let operations = operations
+                    .ok_or_else(|| RpcError::new(ErrorKind::HostGone, "插件管理服务未就绪"))?;
+                operations
+                    .call(&plugin_id, &digest, lease.as_deref(), &method, params)
+                    .await
+                    .map_err(|error| {
+                        let kind = match &error {
+                            magi_api::ApiError::Forbidden(_) => ErrorKind::PermissionDenied,
+                            magi_api::ApiError::Conflict(_) => ErrorKind::Conflict,
+                            magi_api::ApiError::InvalidInput(_) => ErrorKind::InvalidParams,
+                            _ => ErrorKind::Blocked,
+                        };
+                        RpcError::new(kind, error.message())
+                    })
+            });
         }
         if matches!(method.as_str(), "session.snapshot" | "credential.ref") {
             if method == "session.snapshot" {
@@ -674,6 +722,7 @@ mod tests {
             events,
             digest: package.digest().into(),
             native: Arc::default(),
+            operations: Arc::default(),
             blobs: Arc::default(),
             settings: Arc::new(std::sync::OnceLock::from(Arc::new(
                 magi_settings_store::SettingsStore::new(),

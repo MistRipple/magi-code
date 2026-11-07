@@ -234,10 +234,11 @@ fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
                 PluginPermissionKind::Extension
                     | PluginPermissionKind::ContextRewrite
                     | PluginPermissionKind::ModelSources
+                    | PluginPermissionKind::PluginManagement
             )
         }) {
             return Err(invalid(
-                "extension / contextRewrite / modelSources 权限只能由声明了 extension 的包使用",
+                "extension / contextRewrite / modelSources / pluginManagement 权限只能由声明了 extension 的包使用",
             ));
         }
         return Ok(());

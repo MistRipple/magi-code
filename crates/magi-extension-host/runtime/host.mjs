@@ -14,7 +14,12 @@ import { pathToFileURL } from 'node:url';
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const PROTOCOL = { major: 1, minor: 0 };
-const FEATURES = ['hook.guard'];
+const FEATURES = ['hook.guard', 'plugin.management'];
+let negotiatedFeatures = new Set();
+const pluginRequest = (method, input) => {
+  if (!negotiatedFeatures.has('plugin.management')) throw new Error('daemon 未协商 plugin.management');
+  return request(method, input);
+};
 
 const endpoint = process.env.MAGI_EXT_ENDPOINT;
 const token = process.env.MAGI_EXT_TOKEN;
@@ -82,7 +87,7 @@ function request(method, params) {
     const timer = setTimeout(() => {
       pending.delete(id);
       reject(Object.assign(new Error(`${method} 超时`), { kind: 'DeadlineExceeded' }));
-    }, 120_000);
+    }, method === 'plugins.preview' || method === 'plugins.install' ? 300_000 : 120_000);
     pending.set(id, { resolve, reject, timer });
     try { send({ id, method, params }); }
     catch (error) { clearTimeout(timer); pending.delete(id); reject(error); }
@@ -369,7 +374,13 @@ const api = Object.freeze({
   ask: Object.freeze({ user: (input = {}) => request('ask.user', input) }),
   session: Object.freeze({ snapshot: (input = {}) => request('session.snapshot', input) }),
   /** 读取 daemon 的插件目录；不包含插件配置、私有资源或凭据。 */
-  plugins: Object.freeze({ list: () => request('plugins.list', {}) }),
+  plugins: Object.freeze({
+    list: () => request('plugins.list', {}),
+    preview: (input) => pluginRequest('plugins.preview', input),
+    install: (input) => pluginRequest('plugins.install', input),
+    setEnabled: (pluginId, enabled) => pluginRequest('plugins.setEnabled', { pluginId, enabled }),
+    remove: (pluginId) => pluginRequest('plugins.remove', { pluginId }),
+  }),
   credential: Object.freeze({ ref: (input = {}) => request('credential.ref', input) }),
   /** 向主对话的模型目录提交（整体替换）清单声明过且获 `modelSources` 授权的数据源；宿主退出时自动撤销。 */
   modelSource: Object.freeze({
@@ -394,6 +405,7 @@ socket.on('connect', async () => {
       runtime: { node: process.versions.node, platform: process.platform, arch: process.arch },
       features: FEATURES,
     });
+    negotiatedFeatures = new Set(hello.features ?? []);
     generation = hello.instance.generation;
     identity = deepFreeze(hello.instance);
     configValues = deepFreeze(hello.config?.values ?? null);

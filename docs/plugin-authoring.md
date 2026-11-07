@@ -129,6 +129,7 @@ ui/…                       视图页面与静态资源，按需
 | `contextRewrite` | `["history"]` | 允许改写已装配历史的钩子（第 7 节） |
 | `modelSources` | 数据源贡献 ID | 允许向主对话的模型列表提交对应数据源；用户选用后，主对话内容会发送到你提供的地址（第 10 节） |
 | `browser` | surface ID | 浏览器 surface，见第 5 节 |
+| `pluginManagement` | `install`／`lifecycle` | 在线预览与安装上游包／启停和卸载其他插件；新版本权限仍由用户确认，不允许管理插件替其他包授予权限 |
 
 `permissions` 里列出的每一项，用户都必须在授权时逐项确认；缺少任何一项都不能激活。
 
@@ -244,6 +245,9 @@ export default async function activate(api) {
 | `api.model.invoke(input)` | 调用模型 |
 | `api.credential.ref({ roleId? })` | 取得模型绑定引用 |
 | `api.session.snapshot(input)` | 读取会话的有界快照 |
+| `api.plugins.list()` | 读取 daemon 当前插件目录，不含配置或凭据 |
+| `api.plugins.preview(input)`／`install(input)` | 上游包预览与在线安装；复用精确版本和摘要确认合同，需 `pluginManagement:["install"]` |
+| `api.plugins.setEnabled(pluginId,enabled)`／`remove(pluginId)` | 启停或卸载其他插件；需 `pluginManagement:["lifecycle"]`，启用不会代授目标插件权限 |
 | `api.tools.call(tool, input)` | 调用公开的原生工具 |
 | `api.task.spawn(input)` | 派发子任务 |
 | `api.notify.user({ message, title? })` | 向用户发通知 |
