@@ -37,6 +37,16 @@ export function startDshClient(options) {
   let nextRequest = 0;
   let instanceId = null;
   let placement = 'page';
+  let selectedSlot = options;
+  let initialized = false;
+  const selectView = (m) => {
+    placement = ['settings', 'background'].includes(m.placement) ? m.placement : 'page';
+    if (options.clientViews?.length && m.viewId) {
+      const view = options.clientViews.find(view => view.id === m.viewId);
+      if (!view) throw new Error('插件视图未声明');
+      selectedSlot = { slotName: view.name, slotKey: view.key };
+    }
+  };
   const pending = new Map();
 
   // —— 视图桥 ——
@@ -193,8 +203,9 @@ export function startDshClient(options) {
   const container = document.getElementById('root');
   const root = ReactDOMClient.createRoot(container);
   const render = () => {
-    const cards = slotContext.live().filter((entry) => options.slotName
-      ? entry.descriptor.name === options.slotName && (options.slotKey === undefined || String(entry.descriptor.key ?? entry.descriptor.id ?? '') === options.slotKey)
+    if (placement === 'background') { root.render(null); return; }
+    const cards = slotContext.live().filter((entry) => selectedSlot.slotName
+      ? entry.descriptor.name === selectedSlot.slotName && (selectedSlot.slotKey === undefined || String(entry.descriptor.key ?? entry.descriptor.id ?? '') === selectedSlot.slotKey)
       : slotDisposition(entry.descriptor.name) === 'mounted');
     // 同一张卡片可能以多个槽位注册（DSH 的不同入口与行布局）；Magi 只有一种页面，按优先级取一份。
     const rank = (entry) => { const index = MOUNT_PRIORITY.indexOf(entry.descriptor.name); return index === -1 ? MOUNT_PRIORITY.length : index; };
@@ -244,7 +255,9 @@ export function startDshClient(options) {
     if (m.type !== 'init' && m.instanceId !== instanceId) return;
     if (m.type === 'init') {
       instanceId = m.instanceId;
-      placement = m.placement === 'settings' ? 'settings' : 'page';
+      if (initialized) return;
+      initialized = true;
+      selectView(m);
       lastReported = -1;
       locale = m.locale ?? locale;
       slotContext.setLocale(locale);
@@ -267,7 +280,7 @@ export function startDshClient(options) {
         root.render(React.createElement('div', { style: { padding: 16, color: 'crimson' } }, `界面加载失败：${error?.message ?? error}`));
       }
     } else if (m.type === 'context') {
-      if (m.placement) { placement = m.placement === 'settings' ? 'settings' : 'page'; }
+      if (m.placement) { selectView(m); applyPlacement(); render(); }
       if (m.locale && m.locale !== locale) { locale = m.locale; slotContext.setLocale(locale); render(); }
       if (m.theme) applyTheme(m.theme);
     } else if (m.type === 'composer') {

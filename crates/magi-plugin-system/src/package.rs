@@ -353,7 +353,31 @@ fn validate_manifest_with_limits(
         return Err(invalid("插件版本、名称或说明无效"));
     }
     validate_extension(manifest)?;
+    if let Some(client) = &manifest.contributions.client {
+        if !manifest
+            .contributions
+            .views
+            .iter()
+            .any(|view| view.entry == client.entry)
+            || !manifest.permissions.iter().any(|permission| {
+                permission.kind == PluginPermissionKind::Client
+                    && permission.targets.as_slice() == ["persistent"]
+            })
+        {
+            return Err(invalid(
+                "常驻客户端须引用声明视图入口并申请 client:[persistent] 权限",
+            ));
+        }
+    }
     for permission in &manifest.permissions {
+        if permission.kind == PluginPermissionKind::Client
+            && (permission.targets.as_slice() != ["persistent"]
+                || manifest.contributions.client.is_none())
+        {
+            return Err(invalid(
+                "client 权限必须为 persistent，且插件须声明常驻客户端",
+            ));
+        }
         if permission.kind == PluginPermissionKind::Attachments
             && permission.targets.as_slice() != ["images"]
         {

@@ -1262,6 +1262,7 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
         pluginId={pluginPayload.pluginId}
         entry={pluginPayload.entry}
         label={activeTab.label}
+        active={visible}
       />
     {:else if previewLoading}
       <div class="right-pane-state">{i18n.t('web.filePreviewLoading')}</div>

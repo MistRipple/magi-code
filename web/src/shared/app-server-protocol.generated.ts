@@ -667,7 +667,7 @@ export type ServerNotification = JsonRpcServerNotification;
 
 export type ServerResponse = JsonRpcServerResponse;
 
-export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite" | "modelSources" | "pluginManagement" | "composer" | "sessionRead" | "attachments";
+export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite" | "modelSources" | "pluginManagement" | "composer" | "sessionRead" | "attachments" | "client";
 
 export interface PluginPermission {
   kind: PluginPermissionKind;
@@ -727,6 +727,7 @@ export interface PluginContributions {
   resources?: Array<PluginNamedContribution>;
   browserSurfaces?: Array<PluginBrowserSurfaceContribution>;
   modelSources?: Array<PluginNamedContribution>;
+  client?: PluginClientContribution;
 }
 
 export type PluginHookMode = "observe" | "advise" | "guard";
@@ -1677,4 +1678,8 @@ export interface PluginImageAttachmentAbortResult {
 
 export interface PluginImageAttachmentReleaseResult {
   released: boolean;
+}
+
+export interface PluginClientContribution {
+  entry: string;
 }

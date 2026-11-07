@@ -631,3 +631,21 @@ fn icons_preserve_svg_and_common_image_formats_inside_ui() {
         );
     }
 }
+
+#[test]
+fn persistent_clients_require_an_explicit_grant_and_a_declared_view_entry() {
+    let mut m = manifest();
+    m["contributions"]["client"] = json!({"entry":"ui/index.html"});
+    assert!(PluginPackage::from_archive(&archive(&m, &[])).is_err());
+    m["permissions"] = json!([{"kind":"client","targets":["persistent"]}]);
+    assert!(PluginPackage::from_archive(&archive(&m, &[])).is_ok());
+    m["contributions"]["client"]["entry"] = json!("ui/other.html");
+    assert!(
+        PluginPackage::from_archive(&archive(&m, &[("ui/other.html", b"<p>other</p>")])).is_err()
+    );
+    m["contributions"].as_object_mut().unwrap().remove("client");
+    assert!(PluginPackage::from_archive(&archive(&m, &[])).is_err());
+    m["contributions"]["client"] = json!({"entry":"ui/index.html"});
+    m["permissions"] = json!([{"kind":"client","targets":["*"]}]);
+    assert!(PluginPackage::from_archive(&archive(&m, &[])).is_err());
+}

@@ -24,6 +24,12 @@ Bridge 可以拥有不同传输实现，但不得重新定义同形状的 wire D
 与激活状态决定。`magi-plugin-system` 使用生成类型并对包资源与作用域补充语义校验；不得
 在插件 SDK、HTTP 适配器或 UI 手写另一份清单结构。
 
+`PluginContributions.client` 与 `client:["persistent"]` 为常驻客户端的增量合同。
+入口必须引用已声明视图；启动仍须满足 daemon 的激活与全部授权事实。旧包不声明该
+贡献，继续按页面生命周期挂载。新增权限须在升级预览中展示并重新授权，不自动授予。
+常驻客户端只在当前工作台窗口存活，视图切换复用同一隔离文档；不改变 daemon 的
+Session、Turn 或草稿事实，也不允许未授权的后台会话写入。
+
 `attachments:["images"]` 与 `PluginImageAttachment*` 是独立授权的私有图片存储增量合同。
 通过 Extension Protocol 的 `images.store` 协商使用，不新增 App Server 方法。旧插件
 无此权限，不能使用实例级后台图片存储；普通 blob 与会话调用的租约保持不变。图片

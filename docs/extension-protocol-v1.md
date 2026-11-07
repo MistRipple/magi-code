@@ -117,6 +117,14 @@ daemon 响应形状：
 | `host.ready` | 宿主自动通知 | `activate(api)` 成功后发送 |
 | `host.log` | `api.log(message)` | 最多 4096 字符的诊断通知，不写 canonical 日志 |
 
+需要在关闭页面后保持事件订阅的隔离客户端，可声明 `contributions.client.entry` 并申请
+`client:["persistent"]`。入口必须属于同一清单的 views；daemon 激活投影决定其挂载和销毁，
+Renderer 不自行延长插件激活。每个工作台窗口为该插件持有一个客户端文档，设置和右栏
+切换通过保留文档的物理挂载与视图上下文切换完成，不重新运行上游 apply。无可见入口时
+停放在不参与布局、焦点或辅助技术导航的容器中，业务订阅继续；停用、撤权和包摘要变更
+销毁旧文档、关闭事件连接并废弃迟到回执。该合同不会代替 composer、attachments 或
+sessionRead 的各自授权。未声明客户端贡献的普通视图仍按页面生命周期运行。
+
 原生 DSH 页面如需把图片交给当前 Magi 输入框，必须在翻译清单中声明 `composer:["images"]`；页面通过 `ctx.magiComposer` 的异步 `addImages(files)`、`removeImage(id)`、`focus()` 和 `notify(level,message)` 使用宿主。`addImages` 只有在浏览器真实解码、插件摘要/页面身份/权限复核以及 InputArea 接纳后才返回 `accepted:true`；同一批次任一图片失败不会部分挂载。会话切换、页面卸载、停用、撤权或包升级会使旧请求失效。PNG、JPEG、GIF、WebP、AVIF、BMP、ICO 和 SVG 均保留原始草稿字节；发送到不支持原格式的模型时，模型桥只在传输边界生成有界 PNG/JPEG 派生图，canonical 消息仍保留原始图片。
 
 持久图片使用 schema 中的 `PluginImageAttachment*` DTO。单图最多 10 MiB，分块最多 786432 字节，每个实例最多两个未提交上传、共 20 MiB，60 秒无活动回收；实例失效立即丢弃暂存，不能用旧上传身份跨实例提交。相同偏移与字节的分块重传、同一完整上传的提交重试幂等。每插件持久图片最多 1024 个引用、逻辑总量 256 MiB；作者应以 release 回收不再使用的引用。相同内容可共享载荷文件，但引用和授权仍按插件隔离。存储保留 PNG、JPEG、GIF、WebP、AVIF、BMP、ICO 与安全 SVG 原始字节，拒绝类型伪造；不承诺已完成浏览器或模型解码，解码仍由相应消费入口负责。

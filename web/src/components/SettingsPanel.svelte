@@ -707,7 +707,7 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
         {#each pluginSettingsTabs.filter((item) => item.tabId === store.activeTab) as tab (tab.tabId)}
           <div class="settings-frame">
             {#if tab.active}
-              <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} placement="settings" />
+              <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} placement="settings" {active} />
             {:else}
               <p class="settings-hint" role="status" data-testid="plugin-page-inactive">{i18n.t('settings.plugins.pageHeader.inactive')}</p>
             {/if}

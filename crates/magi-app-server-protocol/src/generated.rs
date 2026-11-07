@@ -1507,6 +1507,8 @@ pub enum PluginPermissionKind {
     SessionRead,
     #[serde(rename = "attachments")]
     Attachments,
+    #[serde(rename = "client")]
+    Client,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1625,6 +1627,9 @@ pub struct PluginContributions {
     #[serde(default)]
     #[serde(rename = "modelSources")]
     pub model_sources: Vec<PluginNamedContribution>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client: Option<PluginClientContribution>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3742,4 +3747,10 @@ pub struct PluginImageAttachmentAbortResult {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginImageAttachmentReleaseResult {
     pub released: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginClientContribution {
+    pub entry: String,
 }

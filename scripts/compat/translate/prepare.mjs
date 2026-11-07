@@ -149,10 +149,15 @@ export async function prepareDsh(options) {
     writeFileSync(join(options.outDir, 'ui/client.js'), business.code);
     const views = clientViews(clientAnalysis.mounted, manifest.name);
     manifest.contributions.views = views.map(({ slot, ...view }) => view);
+    if (business.operations.length) {
+      manifest.contributions.client = { entry: views[0].entry };
+      manifest.permissions.push({ kind: 'client', targets: ['persistent'] });
+    }
+    const clientViewCatalog = views.map(view => ({ id: view.id, name: view.slot.name, key: view.slot.key }));
     const panelViews = views.filter((view) => view.placements.includes('rightPane')).map((view) => ({ key: view.slot.key, viewId: view.id }));
     for (const { slot, id, entry } of views) {
       const configFile = `dsh-config-${id}.js`;
-      writeFileSync(join(options.outDir, 'ui', configFile), `globalThis.__MAGI_DSH_CLIENT__ = ${JSON.stringify({ runtimeVersion: 2, clientScript: 'client.js', libraryScripts: assets.scripts, slotName: slot.name, slotKey: slot.key, panelViews, business: { operations: business.operations } })};\n`);
+      writeFileSync(join(options.outDir, 'ui', configFile), `globalThis.__MAGI_DSH_CLIENT__ = ${JSON.stringify({ runtimeVersion: 2, clientScript: 'client.js', libraryScripts: assets.scripts, slotName: slot.name, slotKey: slot.key, clientViews: clientViewCatalog, panelViews, business: { operations: business.operations } })};\n`);
       writeFileSync(join(options.outDir, entry), `<!doctype html>\n<meta charset="utf-8"><meta name="color-scheme" content="light dark">${assets.styles.map((name) => `<link rel="stylesheet" href="${name}">`).join('')}\n<div id="root"></div><script src="${configFile}"></script><script src="host.js"></script>\n`);
     }
   } else {

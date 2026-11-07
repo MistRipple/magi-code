@@ -228,6 +228,7 @@
   }
 
   function permissionText(permission: PluginPermission): string {
+    if (permission.kind === 'client') return i18n.t('settings.plugins.permission.client');
     if (permission.kind === 'attachments') return i18n.t('settings.plugins.permission.attachments');
     if (permission.kind === 'sessionRead') return i18n.t('settings.plugins.permission.sessionRead');
     if (permission.kind === 'composer') return i18n.t('settings.plugins.permission.composer');
@@ -495,7 +496,7 @@
             <span class="settings-row-title">{i18n.t('settings.plugins.candidate.added')}</span>
             <div class="settings-chips">
               {#each preview.addedPermissions as permission}
-                <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement' || permission.kind === 'composer' || permission.kind === 'sessionRead'}>{permissionText(permission)}</span>
+                <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement' || permission.kind === 'composer' || permission.kind === 'sessionRead' || permission.kind === 'client' || permission.kind === 'attachments'}>{permissionText(permission)}</span>
               {:else}
                 <span class="settings-row-desc">{i18n.t('settings.plugins.candidate.noneAdded')}</span>
               {/each}
@@ -506,7 +507,7 @@
               <span class="settings-row-title">{i18n.t('settings.plugins.candidate.removed')}</span>
               <div class="settings-chips">
                 {#each preview.removedPermissions as permission}
-                  <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement' || permission.kind === 'composer' || permission.kind === 'sessionRead'}>{permissionText(permission)}</span>
+                  <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement' || permission.kind === 'composer' || permission.kind === 'sessionRead' || permission.kind === 'client' || permission.kind === 'attachments'}>{permissionText(permission)}</span>
                 {/each}
               </div>
             </div>

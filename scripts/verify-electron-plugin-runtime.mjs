@@ -162,6 +162,7 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   function attach(c,scope,ids) { const input=c.conversation.input.for(scope); return input.addAttachments(ids); }
   return { async apply(ctx) {
     await Promise.resolve();
+    window.__clientInstance = String(Math.random());
     window.__composer = ctx.magiComposer;
     window.__dshAdd=async(file)=>{
       const sessionId=ctx.sessions.list.getSnapshot().ids[0],scope=ctx.sessions.scope(sessionId);
@@ -220,6 +221,7 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   const first = plugin.manifest.contributions.views.find((view) => view.title === 'first');
   const entry = `.launcher-tool[data-plugin-id="${id}"][data-contribution-id="${first.id}"]`;
   await waitFor(() => ui.exists(entry), '第一个原生面板'); await ui.click(entry);
+  let clientInstance;
   for (const key of ['first', 'second']) {
     frame?.close();
     const selector = `iframe[data-plugin-id="${id}"]`;
@@ -229,6 +231,9 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
     await waitFor(() => frame.evaluate(`document.getElementById('identity')?.textContent===${JSON.stringify(key)}`), '正确的页面身份');
     await waitFor(() => frame.evaluate(`document.getElementById('pulse')?.textContent==='1'`), 'SSE 事件通过真实 daemon 与 iframe 到达上游组件');
     reporter.check(`右栏 ${key} 持续接收 SSE，切换后只有一个活跃上游连接`, true);
+    const currentInstance = await frame.evaluate('window.__clientInstance');
+    if (key === 'first') clientInstance = currentInstance;
+    else reporter.check('切换原生右栏页签保留同一客户端文档且不重复初始化业务', currentInstance === clientInstance);
     if (key === 'first') {
       const imageData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=';
       const dshReceipt = await frame.evaluate(`(async()=>{

@@ -2257,7 +2257,8 @@
         "pluginManagement",
         "composer",
         "sessionRead",
-        "attachments"
+        "attachments",
+        "client"
       ]
     },
     "PluginPermission": {
@@ -2521,6 +2522,9 @@
           },
           "maxItems": 8,
           "x-rust-default": true
+        },
+        "client": {
+          "$ref": "#/$defs/PluginClientContribution"
         }
       }
     },
@@ -6757,6 +6761,20 @@
       "properties": {
         "released": {
           "type": "boolean"
+        }
+      }
+    },
+    "PluginClientContribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entry"
+      ],
+      "properties": {
+        "entry": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "激活期间常驻的隔离客户端入口；必须为已声明视图入口，视图共用该客户端。"
         }
       }
     }

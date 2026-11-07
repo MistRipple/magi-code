@@ -3,6 +3,8 @@
   import Header from './components/Header.svelte';
   import TopTabs from './components/TopTabs.svelte';
   import PluginTabContent from './components/tabs/PluginTabContent.svelte';
+  import { shellUi } from './stores/shell-ui.svelte';
+  import PluginClientHost from './components/PluginClientHost.svelte';
   import ThreadPanel from './components/ThreadPanel.svelte';
   import IsolationExitDialog from './components/IsolationExitDialog.svelte';
   import IsolationMergeDialog from './components/IsolationMergeDialog.svelte';
@@ -419,10 +421,14 @@
     </div>
     {#each mainPluginPages.filter((page) => page.id === currentTopTab) as page (page.id)}
       <div class="top-tab-pane active">
-        <PluginTabContent pluginId={page.pluginId} entry={page.entry} label={page.label} />
+        <PluginTabContent pluginId={page.pluginId} entry={page.entry} label={page.label} active={!shellUi.settingsOpen} />
       </div>
     {/each}
   </div>
+
+  {#each pluginProjection().manifests.filter(manifest => manifest.contributions.client) as manifest (manifest.id + ':' + (pluginProjection().installed.find(item => item.manifest.id === manifest.id)?.digest ?? ''))}
+    <PluginClientHost pluginId={manifest.id} entry={manifest.contributions.client!.entry} label={manifest.name} />
+  {/each}
 
   <IsolationMergeDialog />
   <IsolationExitDialog />
