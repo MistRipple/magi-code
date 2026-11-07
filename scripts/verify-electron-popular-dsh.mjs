@@ -41,7 +41,7 @@ const probes = {
   '@99galaxy/dsh-plugin-market': '/dsh-plugin-market/list',
 };
 async function api(path, body) {
-  const response = await fetch(origin + path, { method: body === undefined ? 'GET' : 'POST', headers: { origin, 'content-type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(240_000) });
+  const response = await fetch(origin + path, { method: body === undefined ? 'GET' : 'POST', headers: { origin, 'content-type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(1_020_000) });
   const text = await response.text();
   let value; try { value = JSON.parse(text); } catch { value = text; }
   return { status: response.status, value };
@@ -50,15 +50,6 @@ async function post(path, body) {
   const result = await api(path, body);
   if (result.status !== 200) throw new Error(`${path}: HTTP ${result.status} ${JSON.stringify(result.value)}`);
   return result.value;
-}
-async function previewPackage(packageName, version) {
-  let last;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    last = await api('/api/plugins/upstream/preview', { ecosystem: 'dsh', package: packageName, version });
-    if (last.status === 200 || !/error sending request|timeout|reset|temporarily unavailable/i.test(JSON.stringify(last.value))) return last;
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
-  }
-  return last;
 }
 async function removePlugin(id) {
   await post(`/api/plugins/${encodeURIComponent(id)}/deactivate`, {});
@@ -122,7 +113,7 @@ try {
     const item = { package: pkg, version, preview: 'pending', core: 'unverified', upgrade: 'unverified' };
     console.log(`CHECK ${pkg}@${version}`);
     try {
-      const previewResult = await previewPackage(pkg, version);
+      const previewResult = await api('/api/plugins/upstream/preview', { ecosystem: 'dsh', package: pkg, version });
       if (previewResult.status !== 200) {
         item.preview = 'blocked'; throw new Error(previewResult.value?.message || previewResult.value?.error || JSON.stringify(previewResult.value));
       }

@@ -27,7 +27,6 @@ use std::convert::Infallible;
 use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
 
-const PLUGIN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// 资源订阅检查插件是否仍激活并持有授权的间隔；失效后立即关闭订阅。
 const RESOURCE_SUBSCRIPTION_RECHECK: Duration = Duration::from_millis(500);
 
@@ -1395,6 +1394,59 @@ mod tests {
         assert_eq!(plugin["grants"], serde_json::json!([]));
         assert_eq!(plugin["source"]["kind"], "local");
         drop(root);
+    }
+
+    #[tokio::test]
+    async fn exhausted_download_preserves_active_version_and_allows_explicit_upgrade_retry() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let (state, _root) = active_resource_state().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/package.zip", listener.local_addr().unwrap());
+        let unavailable = Arc::new(AtomicBool::new(true));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (fault, count) = (unavailable.clone(), requests.clone());
+        let app = axum::Router::new().route(
+            "/package.zip",
+            get(move || {
+                let (fault, count) = (fault.clone(), count.clone());
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if fault.load(Ordering::SeqCst) {
+                        (StatusCode::SERVICE_UNAVAILABLE, Vec::new())
+                    } else {
+                        (StatusCode::OK, archive("1.1.0"))
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let before =
+            serde_json::to_value(state.plugin_manager.lock().unwrap().projection().unwrap())
+                .unwrap();
+        let request = serde_json::json!({
+            "source": format!("address:{url}"),
+            "expectedDigest": PluginPackage::from_archive(&archive("1.1.0")).unwrap().digest(),
+        });
+        let (status, failure) = post_json(&state, "/plugins/upgrade", request.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(failure["message"].as_str().unwrap().contains("已尝试 3 次"));
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            serde_json::to_value(state.plugin_manager.lock().unwrap().projection().unwrap())
+                .unwrap(),
+            before
+        );
+        assert!(state.plugin_manager.lock().unwrap().state().plugins["acme.resources"].active);
+
+        // 网络恢复后由用户显式重试，同一确认摘要进入原有升级提交点。
+        unavailable.store(false, Ordering::SeqCst);
+        let (status, upgraded) = post_json(&state, "/plugins/upgrade", request).await;
+        assert_eq!(status, StatusCode::OK, "{upgraded}");
+        assert_eq!(requests.load(Ordering::SeqCst), 4);
+        assert_eq!(upgraded["plugins"][0]["manifest"]["version"], "1.1.0");
+        assert_eq!(upgraded["plugins"][0]["active"], false);
+        assert_eq!(upgraded["plugins"][0]["grants"], serde_json::json!([]));
+        server.abort();
     }
 
     #[tokio::test]

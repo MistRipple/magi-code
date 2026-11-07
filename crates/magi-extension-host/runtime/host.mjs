@@ -92,10 +92,12 @@ function request(method, params, independent = false) {
   const id = `h${nextId++}`;
   return new Promise((resolve, reject) => {
     if (pending.size >= 256) return reject(Object.assign(new Error('挂起请求过多'), { kind: 'Backpressure' }));
+    // 上游准备由 daemon 在 840 秒内结束；管理写入还要等待排空。
+    // 等待预算大于准备预算，不能先向插件报告超时再迟到提交版本。
     const timer = setTimeout(() => {
       pending.delete(id);
       reject(Object.assign(new Error(`${method} 超时`), { kind: 'DeadlineExceeded' }));
-    }, method === 'plugins.preview' || method === 'plugins.install' ? 300_000 : 120_000);
+    }, method === 'plugins.preview' || method === 'plugins.install' ? 1_000_000 : 120_000);
     pending.set(id, { resolve, reject, timer });
     try { send({ id, method, params }); }
     catch (error) { clearTimeout(timer); pending.delete(id); reject(error); }

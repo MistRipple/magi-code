@@ -17,6 +17,7 @@ use magi_app_server_protocol::generated::{
 use magi_plugin_system::npm;
 use std::path::Path as FsPath;
 
+mod artifacts;
 pub(super) mod icons;
 
 /// registry 的开发与验收覆盖入口；默认使用 npm 官方 registry。
@@ -25,6 +26,8 @@ const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
 const MAX_REGISTRY_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 const SEARCH_PAGE_SIZE: usize = 20;
 const TRANSLATE_TIMEOUT: Duration = Duration::from_secs(180);
+// 覆盖元数据、原包、翻译排队与执行，必须在宿主管理 RPC 的等待预算内结束。
+const PREPARATION_TIMEOUT: Duration = Duration::from_secs(840);
 /// 同一时间只翻译一个包：翻译会在子进程里执行上游代码，并发只会放大资源占用。
 static TRANSLATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -442,6 +445,15 @@ async fn translate(
     state: &PluginOperations,
     request: &PluginUpstreamRequest,
 ) -> Result<Translated, ApiError> {
+    tokio::time::timeout(PREPARATION_TIMEOUT, prepare(state, request))
+        .await
+        .map_err(|_| ApiError::InvalidInput("插件安装准备超时，尚未提交版本；请稍后重试".into()))?
+}
+
+async fn prepare(
+    state: &PluginOperations,
+    request: &PluginUpstreamRequest,
+) -> Result<Translated, ApiError> {
     if let Some(reason) = blocked_reason(state, &request.ecosystem) {
         return Err(ApiError::InvalidInput(reason));
     }
@@ -473,10 +485,7 @@ async fn translate(
         document.dist.integrity.clone().ok_or_else(|| {
             ApiError::InvalidInput("该版本没有 sha512 完整性摘要，拒绝安装".into())
         })?;
-    let tarball =
-        download_bytes(&document.dist.tarball, npm::MAX_TARBALL_BYTES, "上游插件包").await?;
-    npm::verify_integrity(&tarball, &integrity)
-        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+    let tarball = artifacts::tarball(&document.dist.tarball, &integrity, "上游插件包").await?;
 
     let _serial = TRANSLATE_LOCK.lock().await;
     let work = tempfile::tempdir()

@@ -28,7 +28,7 @@ async function stop() {
   await app.stop(); logs.push(...app.log); app = null;
 }
 async function api(path, body) {
-  const response = await fetch(origin + path, { method: body === undefined ? 'GET' : 'POST', headers: { origin, 'content-type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(240_000) });
+  const response = await fetch(origin + path, { method: body === undefined ? 'GET' : 'POST', headers: { origin, 'content-type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(1_020_000) });
   const value = await response.json();
   assert.equal(response.status, 200, `${path}: ${JSON.stringify(value)}`);
   return value;

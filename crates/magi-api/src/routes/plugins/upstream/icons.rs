@@ -79,14 +79,8 @@ async fn load(registry: &str, package: &str, version: &str) -> Result<Option<Ico
         .dist
         .integrity
         .ok_or_else(|| ApiError::InvalidInput("图标包缺少完整性摘要".into()))?;
-    let tarball = download_bytes(
-        &document.dist.tarball,
-        npm::MAX_TARBALL_BYTES,
-        "上游插件图标包",
-    )
-    .await?;
-    npm::verify_integrity(&tarball, &integrity)
-        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+    let tarball =
+        super::artifacts::tarball(&document.dist.tarball, &integrity, "上游插件图标包").await?;
     let expected_name = document.name;
     let expected_version = document.version;
     tokio::task::spawn_blocking(move || {
