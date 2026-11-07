@@ -164,20 +164,21 @@ test('后端会话目录分页错误、撤权与处置不会回落旧快照或�
   await assert.rejects(request,/已失效/);
 });
 
-test('附件读取沿 daemon blob 身份和过期事实，不保留绕过授权的本地图片副本', async (t) => {
+test('附件读取沿 daemon 持久身份，不保留绕过授权的本地图片副本', async (t) => {
   const h = host();
   const values = new Map();
   let gets = 0, attachments;
-  h.api.blob = {
-    async put(value, contentType) {
-      assert.equal(contentType, 'image/png');
-      values.set('daemon-image', structuredClone(value));
-      return {ref:'daemon-image'};
+  h.api.images = {
+    async save(input) {
+      assert.equal(input.mediaType, 'image/png');
+      const ref={attachmentId:'daemon-image',mediaType:input.mediaType,name:input.name,bytes:input.data.length};
+      values.set('daemon-image', {ref,data:Buffer.from(input.data)});
+      return ref;
     },
-    async get(id) {
+    async read(id) {
       gets++;
-      if (!values.has(id)) throw new Error('blob 已过期或撤权');
-      return {value:structuredClone(values.get(id))};
+      if (!values.has(id)) throw new Error('附件不存在或已撤权');
+      return {ref:{...values.get(id).ref},data:Buffer.from(values.get(id).data)};
     },
   };
   const running = await activateDsh(h.api, {inject:['attachments'],apply(ctx){ attachments=ctx.attachments; }}, options);
@@ -191,14 +192,14 @@ test('附件读取沿 daemon blob 身份和过期事实，不保留绕过授权�
   assert.equal(read.ref.name,'capture.png');
   assert.equal(gets,1);
   values.clear();
-  await assert.rejects(attachments.readImage(ref),/过期或撤权/);
+  await assert.rejects(attachments.readImage(ref),/不存在或已撤权/);
   const controller=new AbortController(); controller.abort(new Error('cancelled'));
   await assert.rejects(attachments.readImage(ref,controller.signal),/cancelled/);
   assert.equal(gets,2,'已取消的请求不读取 daemon');
-  h.api.blob.put=async()=>({});
+  h.api.images.save=async()=>({});
   await assert.rejects(attachments.saveImage({data:Buffer.from('x'),mediaType:'image/png'}),/未返回已保存附件身份/);
-  delete h.api.blob;
-  await assert.rejects(attachments.saveImage({data:Buffer.from('x'),mediaType:'image/png'}),/未提供附件 blob 服务/);
+  delete h.api.images;
+  await assert.rejects(attachments.saveImage({data:Buffer.from('x'),mediaType:'image/png'}),/未提供持久图片附件服务/);
 });
 
 test('DSH 插件目录读取 daemon 当前事实，保留作用域包名、版本和停用状态，不伪造空列表或写入口', async () => {

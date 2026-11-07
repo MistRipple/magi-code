@@ -111,11 +111,17 @@ daemon 响应形状：
 | `notify.user` | `api.notify.user({message,title?})` | 原生通知事实、持久化与事件；正文最多 4096 字节、标题 256 字节 |
 | `ask.user` | `api.ask.user({questions})` | 原生问题校验、持久交互和等待；扩展不能代答审批 |
 | `blob.put/get` | `api.blob.put(value,contentType?)`／`get(ref)` | 第 8 节有界 JSON 传递 |
+| `images.begin/append/commit/abort` | `api.images.save({data,mediaType,name?})` | 协商 `images.store`，独立 `attachments:["images"]` 授权；以当前宿主实例上传，SDK 分块后由 daemon 校验并持久化。不是会话写入，也不发送消息 |
+| `images.describe/read/release` | `api.images.read(attachmentId)`／`release(attachmentId)` | 仅当前插件自己的持久图片；读取分块并核对完整 SHA-256，释放幂等；每次复核包摘要、激活、权限和宿主实例 |
 | `modelSource.set/clear` | `api.modelSource.set(sourceId,{baseUrl,apiKey,apiProtocol,models})`／`clear(sourceId)` | 清单声明且获 `modelSources:[sourceId]` 授权；`set` 整体替换，校验与用户数据源一致；只追加到主对话模型目录（`plugin/<pluginId>/<sourceId>`），仅存运行期内存，宿主实例退出时撤销 |
 | `host.ready` | 宿主自动通知 | `activate(api)` 成功后发送 |
 | `host.log` | `api.log(message)` | 最多 4096 字符的诊断通知，不写 canonical 日志 |
 
 原生 DSH 页面如需把图片交给当前 Magi 输入框，必须在翻译清单中声明 `composer:["images"]`；页面通过 `ctx.magiComposer` 的异步 `addImages(files)`、`removeImage(id)`、`focus()` 和 `notify(level,message)` 使用宿主。`addImages` 只有在浏览器真实解码、插件摘要/页面身份/权限复核以及 InputArea 接纳后才返回 `accepted:true`；同一批次任一图片失败不会部分挂载。会话切换、页面卸载、停用、撤权或包升级会使旧请求失效。PNG、JPEG、GIF、WebP、AVIF、BMP、ICO 和 SVG 均保留原始草稿字节；发送到不支持原格式的模型时，模型桥只在传输边界生成有界 PNG/JPEG 派生图，canonical 消息仍保留原始图片。
+
+持久图片使用 schema 中的 `PluginImageAttachment*` DTO。单图最多 10 MiB，分块最多 786432 字节，每个实例最多两个未提交上传、共 20 MiB，60 秒无活动回收；实例失效立即丢弃暂存，不能用旧上传身份跨实例提交。相同偏移与字节的分块重传、同一完整上传的提交重试幂等。每插件持久图片最多 1024 个引用、逻辑总量 256 MiB；作者应以 release 回收不再使用的引用。相同内容可共享载荷文件，但引用和授权仍按插件隔离。存储保留 PNG、JPEG、GIF、WebP、AVIF、BMP、ICO 与安全 SVG 原始字节，拒绝类型伪造；不承诺已完成浏览器或模型解码，解码仍由相应消费入口负责。
+
+图片元数据复用 daemon 现有插件资源事实和升级数据重置事务，内容寻址文件只保存载荷。先原子写载荷，再提交元数据；未提交载荷不可由 API 读取，重启及下次保存时回收。释放先提交元数据删除，没有其他插件引用时才删除共享载荷。已发送图片沿原生 canonical 消息保存自己的字节，不引用这份插件私有存储。`images.store` 明确允许已授权插件在后台事件回调中使用当前实例，不携带已结束的 invocationId；这不放宽 blob、模型、工具、会话或通知服务的原调用租约。
 
 管理 API 的后台模式另协商 `plugin.management.background`：SDK 的 `api.plugins.background` 以显式 `background:true` 传输元字段发送管理写请求，不携带已结束的 invocationId。HostHandler 仅接受插件管理方法、拒绝同时携带 invocationId，移除该元字段并注入当前 `_instance`／`_background` 后交给 daemon。daemon 在初次准入和异步提交锁内均检查 background 及具体动作授权；停用、撤权和旧实例失效仍拒绝。只读目录和兼容策略可沿当前实例重新读取；普通管理 API、模型、工具、会话和钩子原有调用租约边界不变。
 

@@ -1505,6 +1505,8 @@ pub enum PluginPermissionKind {
     Composer,
     #[serde(rename = "sessionRead")]
     SessionRead,
+    #[serde(rename = "attachments")]
+    Attachments,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3658,4 +3660,86 @@ pub struct PluginSessionDirectory {
     pub has_more: bool,
     #[serde(rename = "nextAfterSessionId")]
     pub next_after_session_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginImageAttachment {
+    #[serde(rename = "attachmentId")]
+    pub attachment_id: String,
+    #[serde(rename = "mediaType")]
+    pub media_type: String,
+    pub name: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginImageAttachmentBegin {
+    #[serde(rename = "mediaType")]
+    pub media_type: String,
+    pub name: String,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginImageAttachmentUpload {
+    #[serde(rename = "uploadId")]
+    pub upload_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginImageAttachmentAppend {
+    #[serde(rename = "uploadId")]
+    pub upload_id: String,
+    pub offset: u64,
+    #[serde(rename = "dataBase64")]
+    pub data_base64: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginImageAttachmentRef {
+    #[serde(rename = "attachmentId")]
+    pub attachment_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginImageAttachmentRead {
+    #[serde(rename = "attachmentId")]
+    pub attachment_id: String,
+    pub offset: u64,
+    pub length: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginImageAttachmentChunk {
+    pub offset: u64,
+    #[serde(rename = "totalBytes")]
+    pub total_bytes: u64,
+    #[serde(rename = "dataBase64")]
+    pub data_base64: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginImageAttachmentAppendResult {
+    pub offset: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginImageAttachmentAbortResult {
+    pub removed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginImageAttachmentReleaseResult {
+    pub released: bool,
 }

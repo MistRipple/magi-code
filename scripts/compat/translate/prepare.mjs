@@ -127,6 +127,9 @@ export async function prepareDsh(options) {
     manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', 'authorize', 'compatibility', 'background'] });
   }
   if (readSessionDirectory) manifest.permissions.push({ kind: 'sessionRead', targets: ['directory'] });
+  if (inspection.entries.some(entry => entry.name === 'attachments' || /^ctx\.attachments(?:\.|$)/.test(entry.name)) || Object.hasOwn(inspection.serviceReads, 'attachments')) {
+    manifest.permissions.push({ kind: 'attachments', targets: ['images'] });
+  }
   if (recorded.settingsNamespaces.length) {
     manifest.permissions.find(permission => permission.kind === 'storage').targets.push(REGISTERED_SETTINGS_RESOURCE);
     manifest.contributions.resources = [{ id: REGISTERED_SETTINGS_RESOURCE, title: 'DSH 设置', description: '由 daemon 持久化的插件命名空间设置' }];

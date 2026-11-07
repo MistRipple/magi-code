@@ -248,10 +248,11 @@ fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
                     | PluginPermissionKind::ModelSources
                     | PluginPermissionKind::PluginManagement
                     | PluginPermissionKind::SessionRead
+                    | PluginPermissionKind::Attachments
             )
         }) {
             return Err(invalid(
-                "extension / contextRewrite / modelSources / pluginManagement / sessionRead 权限只能由声明了 extension 的包使用",
+                "extension / contextRewrite / modelSources / pluginManagement / sessionRead / attachments 权限只能由声明了 extension 的包使用",
             ));
         }
         return Ok(());
@@ -353,6 +354,11 @@ fn validate_manifest_with_limits(
     }
     validate_extension(manifest)?;
     for permission in &manifest.permissions {
+        if permission.kind == PluginPermissionKind::Attachments
+            && permission.targets.as_slice() != ["images"]
+        {
+            return Err(invalid("attachments 权限当前只允许 images"));
+        }
         if permission.kind == PluginPermissionKind::SessionRead
             && permission.targets.as_slice() != ["directory"]
         {

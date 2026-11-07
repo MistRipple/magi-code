@@ -488,6 +488,7 @@ impl ExtensionRuntime {
             native: Arc::clone(&self.native),
             operations: Arc::clone(&self.operations),
             blobs: Arc::default(),
+            images: Arc::default(),
             settings: Arc::clone(&self.settings),
         }));
         let supervisor = supervise(

@@ -1103,6 +1103,7 @@ fn check_hello(
         "plugin.management",
         "plugin.management.background",
         "session.directory",
+        "images.store",
     ];
     let features: Vec<String> = supported
         .iter()

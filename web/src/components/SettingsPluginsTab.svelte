@@ -228,6 +228,7 @@
   }
 
   function permissionText(permission: PluginPermission): string {
+    if (permission.kind === 'attachments') return i18n.t('settings.plugins.permission.attachments');
     if (permission.kind === 'sessionRead') return i18n.t('settings.plugins.permission.sessionRead');
     if (permission.kind === 'composer') return i18n.t('settings.plugins.permission.composer');
     if (permission.kind === 'extension') return i18n.t('settings.plugins.permission.extensionFullTrust');

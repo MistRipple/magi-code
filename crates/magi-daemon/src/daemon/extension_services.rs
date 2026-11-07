@@ -26,6 +26,7 @@ pub(super) struct PluginHostService {
     pub native: Arc<OnceLock<NativeService>>,
     pub operations: Arc<OnceLock<magi_api::PluginOperations>>,
     pub blobs: Arc<Mutex<HashMap<String, Blob>>>,
+    pub images: Arc<Mutex<super::extension_images::ImageUploads>>,
     /// 主对话模型目录所在的设置事实源；插件贡献的数据源写入其运行期 section。
     pub settings: Arc<OnceLock<Arc<magi_settings_store::SettingsStore>>>,
 }
@@ -203,6 +204,9 @@ impl HostService for PluginHostService {
             }
             true
         });
+        if let Ok(mut images) = self.images.lock() {
+            images.discard_instance(lease);
+        }
         if removed {
             self.catalog_changed();
         }
@@ -306,6 +310,7 @@ impl HostService for PluginHostService {
         let events = Arc::clone(&self.events);
         let digest = self.digest.clone();
         let blobs = Arc::clone(&self.blobs);
+        let images = Arc::clone(&self.images);
         let settings = self.settings.get().cloned();
         let operations = self.operations.get().cloned();
         if let Err(error) = self.service_admitted(&plugin_id, &method, &params) {
@@ -427,6 +432,15 @@ impl HostService for PluginHostService {
                 manager_guard
                     .check_runtime(&plugin_id, lease)
                     .map_err(map_error)?;
+            }
+            if method.starts_with("images.") {
+                let lease = lease.as_deref().ok_or_else(|| {
+                    RpcError::new(ErrorKind::StaleGeneration, "图片附件服务需要活动宿主租约")
+                })?;
+                return images
+                    .lock()
+                    .map_err(|_| RpcError::new(ErrorKind::Internal, "图片上传服务不可用"))?
+                    .call(&mut manager_guard, &plugin_id, lease, &method, params);
             }
             let result = match method.as_str() {
                 "plugins.list" => {
@@ -724,7 +738,8 @@ mod tests {
                 {"kind": "extension", "targets": ["full-trust"]},
                 {"kind": "storage", "targets": ["notes", "__settings"]},
                 {"kind": "modelSources", "targets": ["proxy"]},
-                {"kind": "sessionRead", "targets": ["directory"]}
+                {"kind": "sessionRead", "targets": ["directory"]},
+                {"kind": "attachments", "targets": ["images"]}
             ],
             "settingsSchema": {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "additionalProperties": false},
             "contributions": {"resources": [{"id": "notes", "title": "Notes", "description": ""}], "commands": [{"id": "status", "title": "Status", "description": ""}], "modelSources": [{"id": "proxy", "title": "Acme Proxy", "description": ""}]}
@@ -782,6 +797,7 @@ mod tests {
             native: Arc::default(),
             operations: Arc::default(),
             blobs: Arc::default(),
+            images: Arc::default(),
             settings: Arc::new(std::sync::OnceLock::from(Arc::new(
                 magi_settings_store::SettingsStore::new(),
             ))),
@@ -797,6 +813,169 @@ mod tests {
         service
             .request_with_identity("acme.services".into(), method.into(), params)
             .await
+    }
+
+    #[tokio::test]
+    async fn instance_image_uploads_are_chunked_persistent_and_rejected_after_revocation() {
+        use base64::Engine as _;
+        let (dir, service) = fixture();
+        service
+            .instance_started("acme.services", "images-one")
+            .unwrap();
+        let call_image = |method: &'static str, mut input: Value| {
+            input
+                .as_object_mut()
+                .unwrap()
+                .insert("_instance".into(), json!("images-one"));
+            call(&service, method, input)
+        };
+        let bytes = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='1' height='1'><!--{}--></svg>",
+            "x".repeat(3 * 1024 * 1024)
+        )
+        .into_bytes();
+        assert!(
+            call(
+                &service,
+                "images.begin",
+                json!({"bytes":1,"mediaType":"image/png","name":"capture.png"})
+            )
+            .await
+            .is_err(),
+            "不能无实例上传"
+        );
+        let begin = call_image(
+            "images.begin",
+            json!({"bytes":bytes.len(),"mediaType":"image/svg+xml","name":"capture.svg"}),
+        )
+        .await
+        .unwrap();
+        let id = begin["uploadId"].as_str().unwrap();
+        let second = call_image(
+            "images.begin",
+            json!({"bytes":1,"mediaType":"image/png","name":"second.png"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            call_image(
+                "images.begin",
+                json!({"bytes":1,"mediaType":"image/png","name":"third.png"})
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+            ErrorKind::Backpressure
+        );
+        call_image("images.abort", second).await.unwrap();
+        assert!(
+            call_image(
+                "images.append",
+                json!({"uploadId":id,"offset":1,"dataBase64":"YWJj"})
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            call_image(
+                "images.begin",
+                json!({"bytes":1,"mediaType":"image/png","name":"bad.png","extra":true})
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            call_image("images.commit", begin.clone()).await.is_err(),
+            "未完成不能提交"
+        );
+        for (index, chunk) in bytes.chunks(786432).enumerate() {
+            let input = json!({"uploadId":id,"offset":index*786432,"dataBase64":base64::engine::general_purpose::STANDARD.encode(chunk)});
+            call_image("images.append", input.clone()).await.unwrap();
+            call_image("images.append", input).await.unwrap(); // 相同分块重传是幂等的。
+        }
+        let record = call_image("images.commit", begin.clone()).await.unwrap();
+        assert_eq!(
+            call_image("images.commit", begin.clone()).await.unwrap(),
+            record,
+            "同一上传提交重试不能复制附件"
+        );
+        let ref_input = json!({"attachmentId":record["attachmentId"]});
+        assert_eq!(
+            call_image("images.describe", ref_input.clone())
+                .await
+                .unwrap()["bytes"],
+            bytes.len()
+        );
+        assert!(
+            call_image(
+                "images.read",
+                json!({"attachmentId":record["attachmentId"],"offset":0,"length":786433})
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            call_image(
+                "images.append",
+                json!({"uploadId":id,"offset":0,"dataBase64":"YWJj"})
+            )
+            .await
+            .is_err(),
+            "已提交上传不能改写"
+        );
+        service.instance_ended("acme.services", "images-one");
+        assert!(
+            call_image("images.describe", ref_input.clone())
+                .await
+                .is_err()
+        );
+        service
+            .instance_started("acme.services", "images-two")
+            .unwrap();
+        let describe = call(
+            &service,
+            "images.describe",
+            json!({"_instance":"images-two","attachmentId":record["attachmentId"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(describe, record);
+        assert!(
+            call(
+                &service,
+                "images.commit",
+                json!({"_instance":"images-two","uploadId":id})
+            )
+            .await
+            .is_err(),
+            "重启不恢复旧上传"
+        );
+        let manager = magi_plugin_system::PluginManager::open(dir.path().join("plugins")).unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                manager
+                    .image_attachment("acme.services", record["attachmentId"].as_str().unwrap())
+                    .unwrap()
+            )
+            .unwrap(),
+            record
+        );
+        drop(manager);
+        service
+            .manager
+            .lock()
+            .unwrap()
+            .deactivate("acme.services")
+            .unwrap();
+        assert!(
+            call(
+                &service,
+                "images.describe",
+                json!({"_instance":"images-two","attachmentId":record["attachmentId"]})
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1179,6 +1358,123 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn real_node_background_images_outlive_parent_calls_and_restart_but_respect_instance_revocation()
+     {
+        use magi_extension_host::instance::{LaunchConfig, launch};
+        let (dir, service) = fixture();
+        let runtime = dir.path().join("images-host.mjs");
+        let entry = dir.path().join("images-entry.mjs");
+        std::fs::write(&runtime, magi_extension_host::HOST_RUNTIME_SOURCE).unwrap();
+        std::fs::write(&entry,r#"
+        export default async api => {
+          let background=null;
+          await api.command('status',async input => {
+            if(input.mode==='poll') return JSON.stringify(background);
+            if(input.mode==='save') {
+              setTimeout(async()=>{
+                try {
+                  const data=Buffer.from(`<svg xmlns='http://www.w3.org/2000/svg' width='1' height='1'><!--${'x'.repeat(3*1024*1024)}--></svg>`);
+                  const ref=await api.images.save({data,mediaType:'image/svg+xml',name:'background.svg'});
+                  const read=await api.images.read(ref.attachmentId);
+                  if(!read.data.equals(data)) throw Error('bytes differ');
+                  background={ref};
+                } catch(error) {
+                  background={error:String(error)};
+                }
+              },100);
+              return 'queued';
+            }
+            try { const image=await api.images.read(input.id); return JSON.stringify({ref:image.ref,bytes:image.data.length}); }
+            catch(error) { return 'DENIED:'+error; }
+          });
+        }"#).unwrap();
+        let node = std::env::var_os("MAGI_EXTENSION_NODE")
+            .map(std::path::PathBuf::from)
+            .or_else(|| magi_process::resolve_executable("node"))
+            .expect("Node required");
+        let config_for = || {
+            let mut config = LaunchConfig::new(
+                node.clone(),
+                runtime.clone(),
+                entry.clone(),
+                dir.path().join("images-sock"),
+            );
+            config.plugin_id = "acme.services".into();
+            config.commands = vec!["status".into()];
+            config.digest = package().digest().into();
+            config.service = Some(service.clone());
+            config
+        };
+        let group = magi_process::ManagedProcessGroup::new();
+        let instance = launch(&group, config_for(), 1).await.unwrap();
+        instance
+            .invoke_command(
+                "status",
+                json!({"mode":"save"}),
+                json!({}),
+                std::time::Duration::from_secs(5),
+                std::future::pending(),
+            )
+            .await
+            .unwrap();
+        let stored = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let response = instance
+                    .invoke_command(
+                        "status",
+                        json!({"mode":"poll"}),
+                        json!({}),
+                        std::time::Duration::from_secs(5),
+                        std::future::pending(),
+                    )
+                    .await
+                    .unwrap();
+                let value: Value =
+                    serde_json::from_str(response["content"].as_str().unwrap()).unwrap();
+                if value.get("ref").is_some() || value.get("error").is_some() {
+                    break value;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(stored.get("error").is_none(), "{stored}");
+        let id = stored["ref"]["attachmentId"].as_str().unwrap();
+        instance.stop().await;
+        let instance = launch(&group, config_for(), 2).await.unwrap();
+        let result = instance
+            .invoke_command(
+                "status",
+                json!({"id":id}),
+                json!({}),
+                std::time::Duration::from_secs(5),
+                std::future::pending(),
+            )
+            .await
+            .unwrap();
+        assert!(result.to_string().contains("background.svg"), "{result}");
+        service
+            .manager
+            .lock()
+            .unwrap()
+            .deactivate("acme.services")
+            .unwrap();
+        let denied = instance
+            .invoke_command(
+                "status",
+                json!({"id":id}),
+                json!({}),
+                std::time::Duration::from_secs(5),
+                std::future::pending(),
+            )
+            .await
+            .unwrap();
+        assert!(denied.to_string().contains("DENIED"), "{denied}");
+        instance.stop().await;
     }
 
     fn source_input() -> serde_json::Value {

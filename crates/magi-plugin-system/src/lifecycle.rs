@@ -15,6 +15,7 @@ use std::{
 };
 
 mod compatibility;
+mod image_attachments;
 mod drain;
 mod runtime_catalog;
 mod upgrade;
@@ -186,6 +187,7 @@ impl PluginManager {
             retired_builtins: Vec::new(),
         };
         manager.recover_data_reset()?;
+        manager.collect_image_attachment_files()?;
         // 内置包目录是宿主支持能力的唯一入口；停发的内置包不能在重启后恢复激活。
         // 先备份安装事实，再移除注册表记录。资源数据保留，不把退役包当作外部插件加载。
         let retired_records: Vec<_> = manager

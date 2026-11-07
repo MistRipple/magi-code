@@ -24,6 +24,11 @@ Bridge 可以拥有不同传输实现，但不得重新定义同形状的 wire D
 与激活状态决定。`magi-plugin-system` 使用生成类型并对包资源与作用域补充语义校验；不得
 在插件 SDK、HTTP 适配器或 UI 手写另一份清单结构。
 
+`attachments:["images"]` 与 `PluginImageAttachment*` 是独立授权的私有图片存储增量合同。
+通过 Extension Protocol 的 `images.store` 协商使用，不新增 App Server 方法。旧插件
+无此权限，不能使用实例级后台图片存储；普通 blob 与会话调用的租约保持不变。图片
+暂存按实例失效，已提交图片由原资源元数据与载荷文件共同恢复，升级数据重置沿原事务处理。
+
 `sessionRead:["directory"]` 与 `PluginSessionDirectoryRequest/Entry/Directory` 是独立授权的只读增量合同。
 通过 Extension Protocol 的协商特性 `session.directory` 使用，不新增 App Server 方法。
 旧插件无此权限，不能读取跨会话目录；已授权插件每次读取当前 daemon 用户会话元数据，

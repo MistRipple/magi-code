@@ -2256,7 +2256,8 @@
         "modelSources",
         "pluginManagement",
         "composer",
-        "sessionRead"
+        "sessionRead",
+        "attachments"
       ]
     },
     "PluginPermission": {
@@ -6541,6 +6542,221 @@
             "null"
           ],
           "maxLength": 256
+        }
+      }
+    },
+    "PluginImageAttachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attachmentId",
+        "mediaType",
+        "name",
+        "bytes",
+        "sha256"
+      ],
+      "properties": {
+        "attachmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "mediaType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10485760,
+          "x-rust-type": "u64"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "PluginImageAttachmentBegin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mediaType",
+        "name",
+        "bytes"
+      ],
+      "properties": {
+        "mediaType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10485760,
+          "x-rust-type": "u64"
+        }
+      }
+    },
+    "PluginImageAttachmentUpload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uploadId"
+      ],
+      "properties": {
+        "uploadId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "PluginImageAttachmentAppend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uploadId",
+        "offset",
+        "dataBase64"
+      ],
+      "properties": {
+        "uploadId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10485760,
+          "x-rust-type": "u64"
+        },
+        "dataBase64": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1048576
+        }
+      }
+    },
+    "PluginImageAttachmentRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attachmentId"
+      ],
+      "properties": {
+        "attachmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "PluginImageAttachmentRead": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attachmentId",
+        "offset",
+        "length"
+      ],
+      "properties": {
+        "attachmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10485760,
+          "x-rust-type": "u64"
+        },
+        "length": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 786432,
+          "x-rust-type": "u64"
+        }
+      }
+    },
+    "PluginImageAttachmentChunk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "offset",
+        "totalBytes",
+        "dataBase64"
+      ],
+      "properties": {
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10485760,
+          "x-rust-type": "u64"
+        },
+        "totalBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10485760,
+          "x-rust-type": "u64"
+        },
+        "dataBase64": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 1048576
+        }
+      }
+    },
+    "PluginImageAttachmentAppendResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "offset"
+      ],
+      "properties": {
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10485760,
+          "x-rust-type": "u64"
+        }
+      }
+    },
+    "PluginImageAttachmentAbortResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "removed"
+      ],
+      "properties": {
+        "removed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "PluginImageAttachmentReleaseResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "released"
+      ],
+      "properties": {
+        "released": {
+          "type": "boolean"
         }
       }
     }

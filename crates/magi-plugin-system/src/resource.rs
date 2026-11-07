@@ -65,6 +65,30 @@ impl PluginResourceStore {
             .collect()
     }
 
+    pub(crate) fn reserved_entries(&self, resource_prefix: &str) -> Vec<PluginResource> {
+        self.state
+            .values
+            .iter()
+            .filter_map(|(key, value)| {
+                key.split_once('\u{1f}')
+                    .filter(|(_, id)| id.starts_with(resource_prefix))
+                    .map(|_| value.clone())
+            })
+            .collect()
+    }
+
+    pub(crate) fn remove(&mut self, plugin: &str, resource: &str) -> Result<bool, ResourceError> {
+        let key = key(plugin, resource);
+        let Some(previous) = self.state.values.remove(&key) else {
+            return Ok(false);
+        };
+        if let Err(error) = self.persist() {
+            self.state.values.insert(key, previous);
+            return Err(error);
+        }
+        Ok(true)
+    }
+
     /// 用转换后的完整条目整体替换该插件的持久数据，只落盘一次。幂等：
     /// 以相同条目重复调用结果不变，崩溃恢复可以安全重放。
     pub fn replace_plugin(

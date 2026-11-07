@@ -71,6 +71,19 @@ export const name = 'magi-runtime-acceptance';
 export const inject = ['commands', 'tools', 'llm', 'attachments', 'webServer', 'sessions'];
 export const Config = Schema.object({ label: Schema.string().default('initial'), enabled: Schema.boolean().default(true) });
 export function apply(ctx, config) {
+  let backgroundImage={pending:true};
+  ctx.effect(()=>{
+    const timer=setTimeout(async()=>{
+      try {
+        const data=Buffer.from("<svg xmlns='http://www.w3.org/2000/svg' width='1' height='1'><!--"+'x'.repeat(3*1024*1024)+"--></svg>");
+        const ref=await ctx.attachments.saveImage({data,mediaType:'image/svg+xml',name:'background.svg'});
+        const saved=await ctx.attachments.readImage(ref);
+        backgroundImage={ref,sameBytes:saved.data.equals(data)};
+      } catch(error) { backgroundImage={error:String(error)}; }
+    },200);
+    return ()=>clearTimeout(timer);
+  });
+  ctx.webServer.register({path:'/background-image',resource:()=>Response.json(backgroundImage)});
   ctx.commands.register({ name: 'report', description: '报告当前配置', handler: async () => ({ kind: 'text', text: 'DSH_REPORT:' + config.label }) });
   ctx.webServer.register({path:'/image-roundtrip',resource:async()=>{
     const data=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=','base64');
@@ -370,6 +383,7 @@ try {
   await waitFor(() => ui.exists(row), '已安装插件');
   await ui.click(row);
   await waitFor(() => ui.exists('[data-action="activate"]'), '授权激活按钮');
+  reporter.check('图片存储独立权限在授权前可见', (await ui.text('[data-testid="plugin-card"]')).includes('图片存储'));
   await ui.click('[data-action="activate"]');
   await waitFor(async () => {
     const plugin = await installed();
@@ -378,9 +392,15 @@ try {
   }, 'DSH 宿主就绪', 30_000);
   reporter.check('通过界面授权后运行真实 Cordis 插件', true);
   const imageRoundtrip = await post(`/api/plugins/${pluginId}/routes`, {method:'GET',path:'/image-roundtrip'});
-  reporter.check('真实 Node 附件经 daemon blob 保存与读取，身份和文件名采用保存事实', imageRoundtrip.status===200
+  reporter.check('真实 Node 附件经 daemon 持久图片服务保存与读取，身份和文件名采用保存事实', imageRoundtrip.status===200
     && imageRoundtrip.body.sameBytes && imageRoundtrip.body.ref.mediaType==='image/png' && imageRoundtrip.body.ref.name==='capture.png'
-    && imageRoundtrip.body.ref.attachmentId.startsWith('blob'), JSON.stringify(imageRoundtrip));
+    && imageRoundtrip.body.ref.attachmentId.startsWith('plugin-image'), JSON.stringify(imageRoundtrip));
+  const backgroundImage=await waitFor(async()=>{
+    const result=await post(`/api/plugins/${pluginId}/routes`,{method:'GET',path:'/background-image'});
+    if(result.body?.error) throw new Error(result.body.error);
+    return result.body?.ref && result.body;
+  },'初始化结束后的后台图片保存');
+  reporter.check('初始化结束后的后台事件经独立实例授权分块保存并读回超过 3 MiB 图片',backgroundImage.sameBytes && backgroundImage.ref.bytes>3*1024*1024);
   await waitFor(async () => (await installed()).manifest.contributions.tools.length === 1, '就绪后的晚注册工具');
   reporter.check('晚于初始化窗口的工具进入 daemon 动态目录', true);
   // 复现设置读取撞上生命周期排空；真实 iframe 应展示错误，不能留下未捕获拒绝或允许盲写。

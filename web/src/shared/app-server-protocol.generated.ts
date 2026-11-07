@@ -667,7 +667,7 @@ export type ServerNotification = JsonRpcServerNotification;
 
 export type ServerResponse = JsonRpcServerResponse;
 
-export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite" | "modelSources" | "pluginManagement" | "composer" | "sessionRead";
+export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite" | "modelSources" | "pluginManagement" | "composer" | "sessionRead" | "attachments";
 
 export interface PluginPermission {
   kind: PluginPermissionKind;
@@ -1625,4 +1625,56 @@ export interface PluginSessionDirectory {
   sessions: Array<PluginSessionDirectoryEntry>;
   hasMore: boolean;
   nextAfterSessionId: string | null;
+}
+
+export interface PluginImageAttachment {
+  attachmentId: string;
+  mediaType: string;
+  name: string;
+  bytes: number;
+  sha256: string;
+}
+
+export interface PluginImageAttachmentBegin {
+  mediaType: string;
+  name: string;
+  bytes: number;
+}
+
+export interface PluginImageAttachmentUpload {
+  uploadId: string;
+}
+
+export interface PluginImageAttachmentAppend {
+  uploadId: string;
+  offset: number;
+  dataBase64: string;
+}
+
+export interface PluginImageAttachmentRef {
+  attachmentId: string;
+}
+
+export interface PluginImageAttachmentRead {
+  attachmentId: string;
+  offset: number;
+  length: number;
+}
+
+export interface PluginImageAttachmentChunk {
+  offset: number;
+  totalBytes: number;
+  dataBase64: string;
+}
+
+export interface PluginImageAttachmentAppendResult {
+  offset: number;
+}
+
+export interface PluginImageAttachmentAbortResult {
+  removed: boolean;
+}
+
+export interface PluginImageAttachmentReleaseResult {
+  released: boolean;
 }

@@ -11,15 +11,21 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 const invocationContext = new AsyncLocalStorage();
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { createHash } from 'node:crypto';
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const PROTOCOL = { major: 1, minor: 0 };
-const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'session.directory'];
+const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'session.directory', 'images.store'];
 let negotiatedFeatures = new Set();
 const pluginRequest = (method, input, background = false) => {
   if (!negotiatedFeatures.has('plugin.management')) throw new Error('daemon 未协商 plugin.management');
   if (background && !negotiatedFeatures.has('plugin.management.background')) throw new Error('daemon 未协商 plugin.management.background');
   return request(method, background ? { ...input, background: true } : input, background);
+};
+const imageRequest = (method, input) => {
+  if (!negotiatedFeatures.has('images.store')) throw new Error('daemon 未协商 images.store');
+  // 私有图片存储拥有独立、显式的实例授权，不继承初始化回调留下的 Turn 租约。
+  return invocationContext.run(undefined, () => request(method, input, true));
 };
 
 const endpoint = process.env.MAGI_EXT_ENDPOINT;
@@ -403,6 +409,37 @@ const api = Object.freeze({
   blob: Object.freeze({
     put: (value, contentType) => request('blob.put', { value, contentType }),
     get: (ref) => request('blob.get', { ref }),
+  }),
+  images: Object.freeze({
+    async save(input) {
+      if (!input || !(input.data instanceof Uint8Array) || !input.data.length || input.data.length > 10 * 1024 * 1024) throw new TypeError('图片必须为不超过 10 MiB 的字节数组');
+      const data = Buffer.from(input.data);
+      const upload = await imageRequest('images.begin', { mediaType: input.mediaType, name: input.name ?? 'image', bytes: data.length });
+      try {
+        for (let offset = 0; offset < data.length; offset += 786432) {
+          const bytes = data.subarray(offset, offset + 786432);
+          const result = await imageRequest('images.append', { uploadId: upload.uploadId, offset, dataBase64: bytes.toString('base64') });
+          if (result.offset !== offset + bytes.length) throw new Error('daemon 图片上传偏移不符');
+        }
+        return await imageRequest('images.commit', upload);
+      } finally { await imageRequest('images.abort', upload).catch(() => {}); }
+    },
+    async read(attachmentId) {
+      const ref = await imageRequest('images.describe', { attachmentId });
+      if (!Number.isSafeInteger(ref.bytes) || ref.bytes < 1 || ref.bytes > 10 * 1024 * 1024 || ref.attachmentId !== attachmentId) throw new Error('daemon 图片附件元数据无效');
+      const chunks = [];
+      for (let offset = 0; offset < ref.bytes;) {
+        const length = Math.min(786432, ref.bytes - offset);
+        const part = await imageRequest('images.read', { attachmentId, offset, length });
+        const bytes = Buffer.from(part.dataBase64, 'base64');
+        if (part.offset !== offset || part.totalBytes !== ref.bytes || bytes.length !== length) throw new Error('daemon 图片附件分块无效');
+        chunks.push(bytes); offset += bytes.length;
+      }
+      const data = Buffer.concat(chunks);
+      if (createHash('sha256').update(data).digest('hex') !== ref.sha256) throw new Error('daemon 图片附件摘要不符');
+      return { ref, data };
+    },
+    release: (attachmentId) => imageRequest('images.release', { attachmentId }),
   }),
   log(message) {
     send({ method: 'host.log', params: { message: String(message).slice(0, 4096) } });
