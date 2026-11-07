@@ -41,7 +41,9 @@ export const DSH_RULES = [
   rule('calls', /^ctx\.(effect|fiber|on|once|collect|dispose|scope|inject|get|plugin|provide|root|parent)(\.|$)/, { fixed: 'shim', group: 'runtime', target: '真实 Cordis 运行时（兼容层内）', note: '注册与回收沿用上游 Cordis 语义', source: src('docs/cordis-api/context.md') }),
   rule('calls', /^ctx\.(emit|parallel|serial|bail|waterfall|accessor|mixin|extend|isolate|intercept|set)$/, { fixed: 'shim', group: 'runtime', target: '真实 Cordis 运行时（兼容层内）', source: src('docs/cordis-primer.md') }),
   rule('calls', /^ctx\.reflect\.(get|set|provide|accessor|mixin)$/, { fixed: 'shim', group: 'runtime', target: '真实 Cordis ReflectService', source: src('vendor/cordis/packages/core/src/reflect.ts') }),
-  rule('calls', /^ctx\.settings(\.|$)/, { capability: 'settings.schema', fidelity: 'full', note: '配置 schema 构建期转成 JSON Schema；Volatile 字段随设置推送更新', source: SETTINGS }),
+  rule('calls', /^ctx\.settings(\.(configure|describe|update|replace|mutate))?$/, { capability: 'settings.schema', fidelity: 'full', note: '现代 Config 沿 daemon 设置 CAS；Volatile 字段随设置推送更新；只允许当前插件命名空间', source: SETTINGS }),
+  rule('calls', /^ctx\.settings\.(register|get)$/, { capability: 'settings.schema', fidelity: 'full', note: '早期 DSH 的独立设置命名空间沿 daemon 私有资源 CAS 保存；安装期记录声明并申请存储授权，与现代 Config 分开', source: SETTINGS }),
+  rule('calls', /^ctx\.settings\./, { capability: 'settings.schema', fidelity: 'partial', note: '该设置方法尚未接入；不能把整个 settings 服务出现视为全部接口可用', source: SETTINGS }),
 
   // —— 工具、命令、模型 ——
   // `ctx.inject(['tools'], (c) => c.tools)`：取得服务本身；真正的注册调用另有 `.register` 条目。

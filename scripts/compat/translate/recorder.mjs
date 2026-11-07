@@ -42,7 +42,7 @@ net.Server.prototype.close = function close(callback) {
 // 记录阶段不发送任何请求：上游对本机端点的健康探测、模型发现等一律明确失败（上游自己处理失败路径）。
 globalThis.fetch = (input) => Promise.reject(new Error(`构建期记录不发送请求：${typeof input === 'string' ? input : (input.url ?? String(input))}`));
 
-const out = { name: upstream.name ?? null, inject: upstream.inject ?? [], tools: [], commands: [], providers: [], routes: [], listeners: [], configSchema: null };
+const out = { name: upstream.name ?? null, inject: upstream.inject ?? [], tools: [], commands: [], providers: [], routes: [], listeners: [], settingsNamespaces: [], configSchema: null };
 const ctx = new Context();
 // 只提供真实服务的命名空间；记录器没有 daemon 会话事实，调用读取即拒绝。
 if (readSessionDirectory === '1') ctx.provide('sessions', createBackendSessions({}).service);
@@ -62,7 +62,19 @@ stub('webServer', (d) => {
   out.routes.push({ kind: d.kind === 'prefix' ? 'prefix' : 'exact', path: d.path });
   return () => {};
 });
-ctx.plugin(class extends Service { constructor(c) { super(c, 'settings'); } configure() { return () => {}; } async update() {} async replace() {} async mutate() {} });
+ctx.plugin(class extends Service {
+  constructor(c) { super(c, 'settings'); }
+  configure() { return () => {}; }
+  register(ns, schema) {
+    if (typeof ns !== 'string' || !ns || ns.length > 128 || ['__proto__', 'prototype', 'constructor'].includes(ns) || typeof schema !== 'function') throw new Error('记录阶段设置注册无效');
+    if (!out.settingsNamespaces.includes(ns)) out.settingsNamespaces.push(ns);
+    return { get: () => schema({}) };
+  }
+  get() { return undefined; }
+  async update() {}
+  async replace() {}
+  async mutate() {}
+});
 ctx.plugin(class extends Service {
   constructor(c) { super(c, 'attachments'); }
   saveImage() { throw new Error('记录阶段没有 daemon 附件存储，不能保存业务图片'); }

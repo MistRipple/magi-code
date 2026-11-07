@@ -15,6 +15,7 @@ import { mountRemote } from './remote.mjs';
 import { createPluginManager } from './plugin-manager.mjs';
 import { configureProfile, withProfile as runProfile, loaderEntries, profilePath } from './profile.mjs';
 import { createBackendSessions } from './backend-sessions.mjs';
+import { createRegisteredSettings } from './registered-settings.mjs';
 
 const clone = (value) => structuredClone(value ?? {});
 const timeoutOf = (value) => value == null ? undefined : Math.min(600_000, Math.max(1_000, Number(value) || 1_000));
@@ -32,10 +33,11 @@ export async function activateDsh(api, module, options) {
   const upstream = module.default ?? module;
   const releaseProfile = configureProfile(api);
   const sessions = options.readSessionDirectory ? createBackendSessions(api) : undefined;
-  const withProfile = (callback, signal) => sessions
-    ? sessions.run(() => runProfile(callback, signal), signal)
-    : runProfile(callback, signal);
   const ctx = new Context();
+  const registeredSettings = createRegisteredSettings(api, options.settingsNamespaces, (ns, value) => ctx.emit('settings/updated', ns, value));
+  const withProfile = (callback, signal) => registeredSettings.run(() => sessions
+    ? sessions.run(() => runProfile(callback, signal), signal)
+    : runProfile(callback, signal));
   // Cordis inject 是“服务出现时挂载”的条件 fiber；不能把可选分支的 PENDING 当成整包失败。
   const conditionalFibers = new Set();
   const inject = ctx.inject;
@@ -207,9 +209,18 @@ export async function activateDsh(api, module, options) {
     constructor(c) { super(c, 'settings'); }
     configure() { return this.ctx.effect(() => () => {}); }
     describe() { return [{ ns: options.plugin, value: clone(rawConfig) }]; }
-    update(ns, patch) { this.check(ns); return writeSettings((value) => ({ ...value, ...patch })); }
-    replace(ns, value) { this.check(ns); return writeSettings(() => value); }
+    register(ns, schema, presentation) { return registeredSettings.register(this.ctx, ns, schema, presentation); }
+    get(ns) { return registeredSettings.get(ns); }
+    update(ns, patch) {
+      if (registeredSettings.has(ns)) return registeredSettings.update(ns, patch);
+      this.check(ns); return writeSettings((value) => ({ ...value, ...clone(patch) }));
+    }
+    replace(ns, value) {
+      if (registeredSettings.has(ns)) return registeredSettings.replace(ns, value);
+      this.check(ns); return writeSettings(() => clone(value));
+    }
     mutate(ns, operations) {
+      if (registeredSettings.has(ns)) return registeredSettings.mutate(ns, operations);
       this.check(ns);
       return writeSettings((value) => {
         for (const op of operations) {
@@ -362,6 +373,7 @@ export async function activateDsh(api, module, options) {
     sourceReleases.clear(); bridges.clear(); published.clear();
     releaseProfile();
     sessions?.dispose();
+    await registeredSettings.dispose();
   };
   api.onDispose(dispose);
   try {

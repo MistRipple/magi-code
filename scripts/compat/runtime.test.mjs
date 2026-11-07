@@ -14,6 +14,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { browserImageFixtures, bmpEncodingFixtures } from '../lib/plugin-image-fixtures.mjs';
 import { createBackendSessions } from './runtime/backend-sessions.mjs';
+import { REGISTERED_SETTINGS_RESOURCE } from './runtime/registered-settings.mjs';
 
 // 只替代 daemon RPC；插件加载、依赖、effect、工具管线及模型目录运行真实上游代码。
 function host(value = {}) {
@@ -62,6 +63,58 @@ function host(value = {}) {
 }
 
 const options = { runtimeVersion: 2, plugin: 'fixture' };
+
+test('DSH 注册设置按命名空间保存到 daemon 资源，未 await 的写入在路由回执前落盘并在重建实例后恢复', async (t) => {
+  let h = host({ configOnly: true });
+  let stored = { version: 0, value: null }, failure, scopes, observed = [];
+  const resource = {
+    async read(id) { assert.equal(id, REGISTERED_SETTINGS_RESOURCE); return structuredClone(stored); },
+    async write(id, expected, value) {
+      assert.equal(id, REGISTERED_SETTINGS_RESOURCE); assert.equal(expected, stored.version);
+      await delay(5); if (failure) throw failure;
+      stored = { version: expected + 1, value: structuredClone(value) }; return structuredClone(stored);
+    },
+  };
+  h.api.resource = resource;
+  const upstream = { inject: ['settings', 'webServer'], apply(ctx) {
+    const schema = value => ({ enabled: value.enabled ?? true, items: value.items ?? ['a', 'b'] });
+    scopes = ['one', 'two'].map(ns => ctx.settings.register(ns, schema, { applies: 'live' }));
+    ctx.on('settings/updated', (ns, value) => observed.push([ns, value]));
+    ctx.webServer.register({ path: '/settings', handler: async (request, response) => {
+      const chunks = []; for await (const chunk of request) chunks.push(chunk);
+      const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      if (input.op === 'get') { response.end(JSON.stringify(scopes.map(scope => scope.get()))); return; }
+      if (input.op === 'mutate') ctx.settings.mutate(input.ns, input.ops);
+      else ctx.settings.update(input.ns, input.patch);
+      response.end(JSON.stringify({ saved: true }));
+    } });
+  } };
+  const settingsOptions = { ...options, settingsNamespaces: ['one', 'two'] };
+  let running = await activateDsh(h.api, upstream, settingsOptions);
+  t.after(() => running.dispose());
+  const invoke = body => h.state.routes.get('/settings')({ method: 'POST', path: '/settings', body }, { signal: new AbortController().signal });
+  await invoke({ ns: 'one', patch: { enabled: false } });
+  assert.equal(stored.value.one.enabled, false);
+  assert.equal(stored.value.two, undefined);
+  assert.equal(observed[0][0], 'one');
+  assert.deepEqual((await h.api.settings.read()).value, { configOnly: true }, '旧版设置不能覆盖现代 Config');
+  await Promise.all([invoke({ ns: 'one', patch: { items: ['c'] } }), invoke({ ns: 'two', patch: { enabled: false } })]);
+  assert.deepEqual(stored.value.one, { enabled: false, items: ['c'] });
+  assert.equal(stored.value.two.enabled, false);
+  await invoke({ ns: 'two', op: 'mutate', ops: [{ op: 'unset', path: ['items', '0'] }] });
+  assert.deepEqual(stored.value.two.items, ['b']);
+  const old = scopes[0]; await running.dispose();
+  assert.throws(() => old.get(), /已失效/);
+  h = host({ configOnly: true }); h.api.resource = resource;
+  running = await activateDsh(h.api, upstream, settingsOptions);
+  assert.deepEqual(scopes.map(scope => scope.get()), [stored.value.one, stored.value.two]);
+  failure = new Error('permission revoked'); const previous = structuredClone(stored);
+  await assert.rejects(invoke({ ns: 'one', patch: { enabled: true } }), /permission revoked/);
+  assert.deepEqual(stored, previous);
+  assert.deepEqual(scopes[0].get(), previous.value.one, '写失败不能发布乐观快照');
+  failure = null;
+  await assert.rejects(invoke({ ns: 'two', op: 'mutate', ops: [{ op: 'set', path: ['__proto__', 'polluted'], value: true }] }), /路径/);
+});
 
 test('后端会话目录消费真实分页，保持 list/get 形状且拒绝跨调用、取消和未知 Session 字段', async () => {
   let version=0, saved, calls=[];

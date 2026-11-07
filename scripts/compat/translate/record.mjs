@@ -29,15 +29,16 @@ export function recordUpstream(options) {
     const on = allSwitchesOn(first.configSchema);
     if (on) variants.push({ overrides: on, recorded: run(on) });
 
-    const merged = { tools: new Map(), commands: new Map(), providers: new Map(), routes: new Map(), listeners: new Set(), configSchema: first.configSchema, name: first.name, inject: first.inject, variants: [] };
+    const merged = { tools: new Map(), commands: new Map(), providers: new Map(), routes: new Map(), listeners: new Set(), settingsNamespaces: new Set(), configSchema: first.configSchema, name: first.name, inject: first.inject, variants: [] };
     for (const { overrides, recorded } of variants) {
       for (const tool of recorded.tools) merged.tools.set(tool.id, tool);
       for (const command of recorded.commands) merged.commands.set(command.id, command);
       for (const provider of recorded.providers) merged.providers.set(provider.id, provider);
       for (const route of recorded.routes) merged.routes.set(`${route.kind}:${route.path}`, route);
       for (const name of recorded.listeners) merged.listeners.add(name);
+      for (const name of recorded.settingsNamespaces) merged.settingsNamespaces.add(name);
       merged.variants.push({ overrides, tools: recorded.tools.map((tool) => tool.id), commands: recorded.commands.map((command) => command.id) });
     }
-    return { ...merged, tools: [...merged.tools.values()], commands: [...merged.commands.values()], providers: [...merged.providers.values()], routes: [...merged.routes.values()], listeners: [...merged.listeners].sort() };
+    return { ...merged, tools: [...merged.tools.values()], commands: [...merged.commands.values()], providers: [...merged.providers.values()], routes: [...merged.routes.values()], listeners: [...merged.listeners].sort(), settingsNamespaces: [...merged.settingsNamespaces].sort() };
   });
 }

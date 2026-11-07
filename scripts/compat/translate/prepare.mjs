@@ -19,6 +19,7 @@ import { classify as classifyDsh } from '../dsh/catalog.mjs';
 import { clientViews } from './client-views.mjs';
 import { dshEnvironment, checkDshCompatibility } from '../core/dsh-compatibility.mjs';
 import { translateClientBusiness } from './client-business.mjs';
+import { REGISTERED_SETTINGS_RESOURCE } from '../runtime/registered-settings.mjs';
 
 const COMPAT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const TRANSLATOR_VERSION = 2;
@@ -124,11 +125,15 @@ export async function prepareDsh(options) {
     manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', 'authorize', 'compatibility', 'background'] });
   }
   if (readSessionDirectory) manifest.permissions.push({ kind: 'sessionRead', targets: ['directory'] });
+  if (recorded.settingsNamespaces.length) {
+    manifest.permissions.find(permission => permission.kind === 'storage').targets.push(REGISTERED_SETTINGS_RESOURCE);
+    manifest.contributions.resources = [{ id: REGISTERED_SETTINGS_RESOURCE, title: 'DSH 设置', description: '由 daemon 持久化的插件命名空间设置' }];
+  }
   mkdirSync(options.outDir, { recursive: true });
   const kept = copyTree(root, options.outDir);
   const compatRuntimeId = sharedRuntimeId();
   const optionalEvents = recorded.listeners.filter((name) => inspection.entries.some((item) => item.kind === 'events' && item.name === name && item.optional));
-  writeFileSync(join(options.outDir, 'extension/index.mjs'), `import { activateDsh } from '@magi/compat-dsh';\nimport * as upstream from ${JSON.stringify(`./upstream/${main}`)};\nexport default api => activateDsh(api, upstream, ${JSON.stringify({ runtimeVersion: TRANSLATOR_VERSION, plugin: pkg.name, runtimeId: compatRuntimeId, optionalEvents, readSessionDirectory })});\n`);
+  writeFileSync(join(options.outDir, 'extension/index.mjs'), `import { activateDsh } from '@magi/compat-dsh';\nimport * as upstream from ${JSON.stringify(`./upstream/${main}`)};\nexport default api => activateDsh(api, upstream, ${JSON.stringify({ runtimeVersion: TRANSLATOR_VERSION, plugin: pkg.name, runtimeId: compatRuntimeId, optionalEvents, readSessionDirectory, settingsNamespaces: recorded.settingsNamespaces })});\n`);
   mkdirSync(join(options.outDir, 'ui'), { recursive: true });
   let clientAnalysis = null;
   if (client) {
@@ -159,7 +164,7 @@ export async function prepareDsh(options) {
     runtimeContributions: manifest.extension.runtimeContributions,
     serviceReads: inspection.serviceReads,
     tools: recorded.tools, commands: recorded.commands, modelSources: recorded.providers,
-    routes: recorded.routes, listeners: recorded.listeners, variants: recorded.variants,
+    routes: recorded.routes, listeners: recorded.listeners, variants: recorded.variants, settingsNamespaces: recorded.settingsNamespaces,
     ui: { mode: client ? 'native' : 'generated', mountedSlots: clientAnalysis?.mounted ?? [], unmountedSlots: clientAnalysis?.unmounted ?? [],
       ...(business?.operations.length ? { business: { operations: business.operations, awaitedCalls: business.awaitedCalls, changedFunctions: business.changedFunctions, originalHash: hash(clientSource), adaptedHash: hash(business.code) } } : {}) },
     static: { summary: report.summary, degraded: report.entries.filter((item) => ['partial', 'dropped'].includes(item.status)) },
