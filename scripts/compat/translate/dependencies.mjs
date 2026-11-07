@@ -31,9 +31,19 @@ export async function installDependencies(root, sharedRoot, registry = process.e
         // DSH app-boot 0.2.2-rc.1 的 plugin-compatibility 明确让预发布版本参与 DSH peer 范围。
         // 这不是 npm 普通依赖的默认规则；仅 DSH peer 使用上游策略，直接依赖与其他生态仍严格校验。
         const dshPeer = name.startsWith('@deepseek-ai/dsh-') && peer;
-        if (!semver.satisfies(installed.version, range, { includePrerelease: dshPeer })) throw new Error(`宿主依赖 ${name}@${installed.version} 不满足 ${range}`);
-        records.push({ name, version: installed.version, host: true });
-        continue;
+        if (semver.satisfies(installed.version, range, { includePrerelease: dshPeer })) {
+          records.push({ name, version: installed.version, host: true });
+          continue;
+        }
+        // Cordis is a peer in the upstream ecosystem, but it is also the
+        // versioned compatibility boundary. A newer plugin must not be
+        // rejected merely because Magi's bundled peer is older: install the
+        // exact compatible Cordis copy inside this translated package. The
+        // runtime resolver leaves this name local to the upstream tree while
+        // Magi's own adapter continues using its bundled Cordis instance.
+        const requested = semver.minVersion(range);
+        const rangePinsDifferentPeer = typeof range === 'string' && range.includes('-');
+        if (name !== '@deepseek-ai/cordis' || !peer || !requested || (!semver.gte(requested, installed.version) && !rangePinsDifferentPeer)) throw new Error(`宿主依赖 ${name}@${installed.version} 不满足 ${range}`);
       }
       if (ancestors.has(name) && semver.satisfies(ancestors.get(name), range)) continue;
       // 可选依赖在当前平台确实不适用时才跳过；不以下载失败当作不可用。
@@ -49,7 +59,7 @@ export async function installDependencies(root, sharedRoot, registry = process.e
       await pacote.extract(manifest.dist.tarball, destination, { registry, integrity: manifest.dist.integrity, ignoreScripts: true });
       const saved = JSON.parse(readFileSync(join(destination, 'package.json'), 'utf8'));
       if (saved.name !== name || saved.version !== manifest.version) throw new Error(`依赖 ${name} 的包身份与 registry 不符`);
-      records.push({ name, version: saved.version, integrity: manifest.dist.integrity, host: false });
+      records.push({ name, version: saved.version, integrity: manifest.dist.integrity, host: false, isolated: name === '@deepseek-ai/cordis' });
       await work(destination, new Map([...ancestors, [name, saved.version]]), depth + 1);
     }
   };

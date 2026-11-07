@@ -59,9 +59,17 @@ const overrides = JSON.parse(readFileSync(overridesPath, 'utf8'));
 const schema = upstream.Config;
 if (schema) out.configSchema = schema.toJSON();
 const config = schema ? schema(overrides) : overrides;
-ctx.plugin({ apply: upstream.apply, inject: upstream.inject, name: upstream.name }, config);
-await new Promise((r) => setTimeout(r, 1500));
+// 启动必须是记录合同的一部分。此前只调用 ctx.plugin 而不等待 fiber，Cordis
+// 会把 apply() 的异常变成后台失败，记录器仍然输出“成功”的空清单，最终导致
+// 一个永远无法激活的翻译包通过安装校验。
+const fiber = ctx.plugin({ apply: upstream.apply, inject: upstream.inject, name: upstream.name }, config);
+await fiber.await();
+// 贡献可以在 apply 返回后由上游异步注册（例如 MCP 发现或延迟工具）。给它一个
+// 有界的稳定窗口；运行期目录仍然支持动态增删，但安装期不能把已观察到的启动
+// 失败隐藏成成功。
+await new Promise((r) => setTimeout(r, Number(process.env.MAGI_RECORD_SETTLE_MS ?? 3000)));
+await fiber.await();
 out.listeners = [...listenerNames].sort();
 // 结果写文件而不是 stdout：上游常用 console.log 打印日志，会混进输出。
 writeFileSync(resultPath, JSON.stringify(out));
-process.exit(0);
+process.exitCode = 0;

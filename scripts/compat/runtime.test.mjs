@@ -373,3 +373,11 @@ test('图片经真实本机 HTTP 模型桥转换，附件引用只在该请求�
     await assert.rejects(requestAttachments.readImage(ref, controller.signal), /abort/i);
   });
 });
+
+test('模型图片桥接受安全 SVG 并拒绝活动内容', async () => {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="8" height="6"><rect width="8" height="6" fill="red"/></svg>`;
+  const dataUrl = `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
+  const ref = await withRequestImages(() => saveRequestImage(dataUrl));
+  assert.equal(ref.mediaType, 'image/png');
+  await assert.rejects(withRequestImages(() => saveRequestImage(`data:image/svg+xml;base64,${Buffer.from('<svg><script>alert(1)</script></svg>').toString('base64')}`)), /活动|外部|根节点/);
+});

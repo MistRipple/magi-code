@@ -12,11 +12,15 @@ import { requestAttachments, saveRequestImage, withRequestImages } from './attac
 import { mountRemote } from './remote.mjs';
 
 const clone = (value) => structuredClone(value ?? {});
+const timeoutOf = (value) => value == null ? undefined : Math.min(600_000, Math.max(1_000, Number(value) || 1_000));
 const freeze = (value) => {
   if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); }
   return value;
 };
 const LOCAL_EVENTS = new Set(['loader/volatile-update', 'llm/adapters-updated', 'llm/models-updated', 'llm/stream', 'tools/change', 'tools/pre-execute', 'tools/execute', 'tools/post-execute', 'tools/result']);
+// DSH 的可选兼容分支会在 Magi 不提供对应事实时仍登记监听器。静态翻译报告
+// 已把这些事件标成 partial/optional；运行期必须保留“无事件可收”的降级，而不是
+// 因为一个可选 UI/会话观察器把整个插件判为失败。
 
 export async function activateDsh(api, module, options) {
   if (options?.runtimeVersion !== 2) throw new Error('DSH 兼容包版本不受支持，请从上游来源重新安装');
@@ -53,7 +57,13 @@ export async function activateDsh(api, module, options) {
   // 不支持的宿主事件不能成为永远不触发的监听。内部事件及插件自有服务事件由 Cordis 自己拥有。
   ctx.on('internal/listener', (name) => {
     if (typeof name !== 'string' || name.startsWith('internal/') || LOCAL_EVENTS.has(name)) return;
-    if (/^(agent|session|turn|system-prompt|fs|approval)\//.test(name)) throw new Error(`尚未实现 DSH 宿主事件 ${name}，拒绝注册`);
+    if (/^(agent|session|turn|system-prompt|fs|approval)\//.test(name)) {
+      if (options?.optionalEvents?.includes(name)) {
+        diagnostic(`DSH 事件 ${name} 在 Magi 中没有对应事实，按可选兼容分支忽略`);
+        return;
+      }
+      throw new Error(`尚未实现 DSH 宿主事件 ${name}，拒绝注册`);
+    }
   });
   ctx.on('internal/status', (child) => {
     if (catalog.live && child.state === 3) void child.await().catch(reportFailure);
@@ -70,7 +80,7 @@ export async function activateDsh(api, module, options) {
       if (tools.has(definition.name)) throw new Error(`工具 ${definition.name} 重复注册`);
       const id = runtimeId('tool', definition.name);
       const contribution = { id, title: definition.name, description: definition.description, inputSchema: definition.parameters, readOnly: definition.readOnly === true };
-      if (definition.timeoutMs !== undefined) contribution.timeoutMs = definition.timeoutMs;
+      if (definition.timeoutMs !== undefined) contribution.timeoutMs = timeoutOf(definition.timeoutMs);
       return this.ctx.effect(() => {
         tools.set(definition.name, definition);
         const release = catalog.register('tools', contribution, () => api.tool(id, async (input, execContext) => {

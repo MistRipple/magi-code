@@ -16,13 +16,21 @@ const map = () => {
 export const withRequestImages = (run) => requests.run(new Map(), run);
 
 export async function saveRequestImage(url) {
-  const match = typeof url === 'string' && /^data:(image\/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]*={0,2})$/.exec(url);
+  const match = typeof url === 'string' && /^data:(image\/(?:png|jpeg|webp|gif|svg\+xml));base64,([A-Za-z0-9+/]*={0,2})$/.exec(url);
   if (!match) throw new Error('模型桥只接受 Magi 已上传的 base64 图片，不代取远程 URL');
   const input = Buffer.from(match[2], 'base64');
   if (input.toString('base64') !== match[2] || !input.length || input.length > MAX_BYTES) throw new Error('图片编码无效或超过 24 MiB');
   if ([...map().values()].reduce((total, entry) => total + entry.ref.bytes, 0) + input.length > 32 * 1024 * 1024) throw new Error('单次模型请求图片超过 32 MiB');
+  if (match[1] === 'image/svg+xml') {
+    const svg = input.toString('utf8');
+    if (!/^\s*(?:<\?xml[^>]*>\s*)?<svg\b/i.test(svg)
+      || /<\s*script\b|\bon[a-z]+\s*=|(?:href|src)\s*=\s*["']\s*(?:https?:|data:(?!image\/|font\/)|javascript:)/i.test(svg)) {
+      throw new Error('SVG 图片包含无效根节点或活动/外部内容');
+    }
+  }
   const meta = await sharp(input, { limitInputPixels: 64_000_000 }).metadata();
-  if (`image/${meta.format}` !== match[1]) throw new Error('图片格式与声明不一致');
+  const detectedType = meta.format === 'svg' ? 'image/svg+xml' : `image/${meta.format}`;
+  if (detectedType !== match[1]) throw new Error('图片格式与声明不一致');
   // 完整解码并规范化，变体始终是 8 位 sRGB，不伪造深度或尺寸。
   const { data, info } = await sharp(input, { limitInputPixels: 64_000_000 }).rotate().toColourspace('srgb').png().toBuffer({ resolveWithObject: true });
   if (data.length > MAX_BYTES) throw new Error('规范化图片超过 24 MiB');

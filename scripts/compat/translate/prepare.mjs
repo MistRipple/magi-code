@@ -1,4 +1,5 @@
-// 上游原包的安装封装。只读元数据与静态合同，不 import 上游、不执行 apply、不猜测贡献目录。
+// 上游原包的安装封装。静态扫描先做准入；随后在受限记录器中启动一次真实
+// Cordis，只记录注册合同，不把上游进程带入 Magi 运行期。
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, join, relative, resolve, sep } from 'node:path';
@@ -10,6 +11,10 @@ import { resolveUpstreamIcon } from './icon.mjs';
 import { installDependencies } from './dependencies.mjs';
 import { renderSettingsPage } from './settings-page.mjs';
 import { copyBrowserAssets } from './browser-assets.mjs';
+import { recordUpstream } from './record.mjs';
+import { runtimeId } from '../core/identity.mjs';
+import { summarize, verdictFor } from '../core/report.mjs';
+import { classify as classifyDsh } from '../dsh/catalog.mjs';
 
 const COMPAT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const TRANSLATOR_VERSION = 2;
@@ -56,6 +61,32 @@ export async function prepareDsh(options) {
   const inspection = await translator.inspect(root, { required: ['llm', 'tools', 'commands', 'settings', 'runtime', 'hooks', 'session', 'services', 'prompt', 'native'] });
   if (inspection.verdict.blocked.length) throw new Error(`Magi 兼容检查未通过：\n${inspection.verdict.blocked.map((item) => `${item.name}（${item.status === 'unknown' ? '尚未完成兼容核对' : '宿主能力尚未接入'}）: ${item.note}`).join('\n')}`);
   const dependencies = await installDependencies(root, options.sharedRoot);
+  // 静态扫描不能证明 apply() 能启动，也看不到延迟注册的工具/事件。安装前在
+  // 受限记录器中启动一次真实 Cordis：失败直接阻塞安装，成功的运行期贡献写入
+  // 清单，避免“空清单但安装成功”的假阳性。
+  const recorded = recordUpstream({ entry, sharedRoot: options.sharedRoot, upstreamDir: root });
+  const runtimeEntries = recorded.listeners.map((name) => {
+    const rule = classifyDsh('events', name);
+    return { kind: 'events', name, category: rule.category, status: rule.status, target: rule.target, note: rule.note, source: rule.source, needs: rule.needs, capability: rule.capability, count: 1, files: [] };
+  });
+  // 对运行期发现的事件复用同一生态规则；这里通过已生成报告的分类结果查找
+  // 静态规则，未知事件保持 unknown，绝不因“记录到了”而自动放行。
+  for (const entry of runtimeEntries) {
+    const known = inspection.entries.find((item) => item.kind === 'events' && item.name === entry.name);
+    if (known) Object.assign(entry, known);
+  }
+  const entries = [...inspection.entries, ...runtimeEntries.filter((item) => !inspection.entries.some((known) => known.kind === item.kind && known.name === item.name))];
+  const reportSummary = summarize(entries);
+  const reportVerdict = verdictFor(entries, inspection.verdict.required);
+  const report = { ...inspection, entries, summary: reportSummary, verdict: reportVerdict };
+  if (reportVerdict.blocked.length) throw new Error(`Magi 运行期兼容检查未通过：\n${reportVerdict.blocked.map((item) => `${item.name}（${item.status}）: ${item.note}`).join('\n')}`);
+  const normalizeTimeout = (value) => value == null ? undefined : Math.min(600_000, Math.max(1_000, Number(value) || 1_000));
+  const toolContributions = recorded.tools.map((tool) => ({
+    id: runtimeId('tool', tool.id), title: tool.id, description: tool.description ?? '',
+    inputSchema: tool.parameters ?? { type: 'object' }, readOnly: tool.readOnly === true,
+    ...(tool.timeoutMs == null ? {} : { timeoutMs: normalizeTimeout(tool.timeoutMs) }),
+  }));
+  const commandContributions = recorded.commands.map((command) => ({ id: runtimeId('cmd', command.id), title: command.id, description: command.description ?? '' }));
   const manifest = {
     sdkVersion: 2, id: packageId('dsh', pkg.name), version: pkg.version,
     name: pkg.displayName ?? pkg.name, description: pkg.description ?? '', dataSchemaVersion: 1,
@@ -65,16 +96,17 @@ export async function prepareDsh(options) {
       { kind: 'tools', targets: ['*'] }, { kind: 'modelSources', targets: ['*'] },
     ],
     settingsSchema: { type: 'object', additionalProperties: true },
-    contributions: { views: [{ id: 'settings', title: '设置', entry: 'ui/settings.html', placements: ['settings'] }] },
+    contributions: { tools: toolContributions, commands: commandContributions, views: [{ id: 'settings', title: '设置', entry: 'ui/settings.html', placements: ['settings'] }] },
   };
   mkdirSync(options.outDir, { recursive: true });
   const kept = copyTree(root, options.outDir);
-  const runtimeId = sharedRuntimeId();
-  writeFileSync(join(options.outDir, 'extension/index.mjs'), `import { activateDsh } from '@magi/compat-dsh';\nimport * as upstream from ${JSON.stringify(`./upstream/${main}`)};\nexport default api => activateDsh(api, upstream, ${JSON.stringify({ runtimeVersion: TRANSLATOR_VERSION, plugin: pkg.name, runtimeId })});\n`);
+  const compatRuntimeId = sharedRuntimeId();
+  const optionalEvents = recorded.listeners.filter((name) => inspection.entries.some((item) => item.kind === 'events' && item.name === name && item.optional));
+  writeFileSync(join(options.outDir, 'extension/index.mjs'), `import { activateDsh } from '@magi/compat-dsh';\nimport * as upstream from ${JSON.stringify(`./upstream/${main}`)};\nexport default api => activateDsh(api, upstream, ${JSON.stringify({ runtimeVersion: TRANSLATOR_VERSION, plugin: pkg.name, runtimeId: compatRuntimeId, optionalEvents })});\n`);
   mkdirSync(join(options.outDir, 'ui'), { recursive: true });
   const client = findClientFile(root, pkg);
   if (client) {
-    if (!/^window\.__ModuleLoader__\.load\(/.test(readFileSync(client.file, 'utf8'))) throw new Error('不支持的 DSH 客户端模块格式');
+    if (!/window\.__ModuleLoader__\.load\(\s*\{\s*id\s*:\s*(['"])[^'"\n]+\1\s*,\s*factory\s*:/.test(readFileSync(client.file, 'utf8'))) throw new Error('不支持的 DSH 客户端模块格式');
     copyFileSync(join(COMPAT_DIR, 'dist/dsh-client-host.js'), join(options.outDir, 'ui/host.js'));
     const assets = copyBrowserAssets(client.file, COMPAT_DIR, join(options.outDir, 'ui'));
     copyFileSync(client.file, join(options.outDir, 'ui/client.js'));
@@ -86,16 +118,17 @@ export async function prepareDsh(options) {
   const icon = await resolveUpstreamIcon({ upstreamDir: root, pkg });
   if (icon) { writeFileSync(join(options.outDir, icon.to), icon.bytes); manifest.icon = icon.to; }
   writeFileSync(join(options.outDir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
-  const report = {
-    kind: 'dsh', translatorVersion: TRANSLATOR_VERSION, runtimeId,
+  const compatReport = {
+    kind: 'dsh', translatorVersion: TRANSLATOR_VERSION, runtimeId: compatRuntimeId,
     upstream: { name: pkg.name, version: pkg.version, integrity: options.source.integrity },
     magi: { id: manifest.id, version: manifest.version }, dependencies,
     runtimeContributions: manifest.extension.runtimeContributions,
-    tools: [], commands: [], modelSources: [], routes: [], listeners: [], variants: [],
+    tools: recorded.tools, commands: recorded.commands, modelSources: recorded.providers,
+    routes: recorded.routes, listeners: recorded.listeners, variants: recorded.variants,
     ui: { mode: client ? 'native' : 'generated', mountedSlots: [], unmountedSlots: [] },
-    static: { summary: inspection.summary, degraded: inspection.entries.filter((item) => ['partial', 'dropped'].includes(item.status)) },
+    static: { summary: report.summary, degraded: report.entries.filter((item) => ['partial', 'dropped'].includes(item.status)) },
     files: { kept: kept.length, omitted: [] },
   };
-  writeFileSync(join(options.outDir, 'extension/compat.json'), JSON.stringify(report, null, 2) + '\n');
-  return { manifest, report };
+  writeFileSync(join(options.outDir, 'extension/compat.json'), JSON.stringify(compatReport, null, 2) + '\n');
+  return { manifest, report: compatReport };
 }
