@@ -16,7 +16,7 @@ import { createHash } from 'node:crypto';
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const PROTOCOL = { major: 1, minor: 0 };
-const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'plugin.installations', 'session.directory', 'images.store'];
+const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'plugin.installations', 'plugin.directory.events', 'session.directory', 'images.store'];
 let negotiatedFeatures = new Set();
 const pluginRequest = (method, input, background = false) => {
   if (!negotiatedFeatures.has('plugin.management')) throw new Error('daemon 未协商 plugin.management');
@@ -63,10 +63,12 @@ const routeHandlers = new Map(); // 视图后端路径 -> handler
 const inflight = new Map(); // invocationId -> AbortController
 const disposers = new Set();
 const configListeners = new Set();
+const pluginDirectoryListeners = new Set();
 let configQueue = Promise.resolve();
 let shuttingDown = false;
 let validateSettings = null;
 async function disposeExtension() {
+  pluginDirectoryListeners.clear();
   if (shuttingDown) return;
   shuttingDown = true;
   for (const controller of inflight.values()) controller.abort();
@@ -225,7 +227,13 @@ function normalizeDecision(result) {
 }
 
 function handleNotification(method, params) {
-  if (method === 'config.changed') {
+  if (method === 'plugins.changed' && negotiatedFeatures.has('plugin.directory.events')) {
+    for (const listener of [...pluginDirectoryListeners]) {
+      Promise.resolve().then(() => {
+        if (pluginDirectoryListeners.has(listener)) return listener();
+      }).catch((error) => api.log(`插件目录订阅失败: ${error?.message ?? error}`));
+    }
+  } else if (method === 'config.changed') {
     if (Number.isSafeInteger(params?.revision) && params.revision > configRevision) {
       configValues = deepFreeze(params.values ?? null);
       configRevision = params.revision;
@@ -310,6 +318,12 @@ function deepFreeze(value) {
 
 const pluginApi = (background = false) => Object.freeze({
   list: (input = {}) => request('plugins.list', input, background),
+  onChanged: (listener) => {
+    if (!negotiatedFeatures.has('plugin.directory.events')) throw new Error('daemon 未协商 plugin.directory.events');
+    if (typeof listener !== 'function') throw new TypeError('listener 必须是函数');
+    pluginDirectoryListeners.add(listener);
+    return () => pluginDirectoryListeners.delete(listener);
+  },
   preview: (input) => pluginRequest('plugins.preview', input, background),
   install: (input) => pluginRequest('plugins.install', input, background),
   installBundle: (input) => pluginRequest('plugins.installBundle', input, background),

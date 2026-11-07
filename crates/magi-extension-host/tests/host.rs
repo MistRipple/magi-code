@@ -146,6 +146,52 @@ export default async function activate(api) {
 }
 
 #[tokio::test]
+async fn plugin_directory_notifications_are_instance_local_and_subscriptions_can_be_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("index.mjs");
+    std::fs::write(
+        &entry,
+        r#"
+export default async api => {
+  let count=0;
+  const off=api.plugins.onChanged(() => { count++; });
+  await api.route('/count', () => ({status:200,body:{count}}));
+  await api.route('/off', () => { off(); return {status:200,body:{count}}; });
+};
+"#,
+    )
+    .unwrap();
+    let config = LaunchConfig::new(node(), runtime(), entry, dir.path().join("sock"));
+    let group = ManagedProcessGroup::new();
+    let instance = launch(&group, config, 1).await.unwrap();
+    let call = |path: &'static str, id: &'static str| {
+        instance.invoke_route(
+            path,
+            json!({"method":"GET","path":path}),
+            json!({"invocationId":id}),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
+    };
+    instance.plugin_directory_changed().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if call("/count", "first").await.unwrap()["body"]["count"] == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    call("/off", "off").await.unwrap();
+    instance.plugin_directory_changed().unwrap();
+    assert_eq!(call("/count", "second").await.unwrap()["body"]["count"], 1);
+    instance.stop().await;
+    assert!(!instance.is_alive());
+}
+
+#[tokio::test]
 async fn background_management_uses_instance_identity_after_http_reply_without_reviving_the_parent()
 {
     struct Management(std::sync::Mutex<Vec<Value>>);

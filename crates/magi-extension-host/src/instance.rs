@@ -451,6 +451,11 @@ impl HostInstance {
             json!({"revision": revision, "values": values}),
         )
     }
+
+    /// 只通知目录已变化；接收方必须沿 plugins.list 重新核对当前实例与安装事实。
+    pub fn plugin_directory_changed(&self) -> Result<(), RpcError> {
+        self.peer.notify("plugins.changed", json!({}))
+    }
 }
 
 struct HostHandler {
@@ -1107,6 +1112,7 @@ fn check_hello(
         "plugin.management",
         "plugin.management.background",
         "plugin.installations",
+        "plugin.directory.events",
         "session.directory",
         "images.store",
     ];

@@ -259,6 +259,10 @@ impl ExtensionRuntime {
                     }
                     Ok(event) if event.event_type == "plugin.registry.changed" => {
                         runtime.reconcile().await;
+                        runtime.notify_plugin_directory_changed();
+                    }
+                    Ok(event) if event.event_type == "plugin.extension.status.changed" => {
+                        runtime.notify_plugin_directory_changed();
                     }
                     Ok(_) => {}
                     // 落后丢事件后无法知道漏了什么，直接再收敛一次。
@@ -274,11 +278,20 @@ impl ExtensionRuntime {
                         for id in ids {
                             runtime.sync_config(&id);
                         }
+                        runtime.notify_plugin_directory_changed();
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
         });
+    }
+
+    fn notify_plugin_directory_changed(&self) {
+        for id in self.desired_packages().keys() {
+            if let Some(instance) = self.bus.instance(id) {
+                let _ = instance.plugin_directory_changed();
+            }
+        }
     }
 
     fn sync_config(&self, id: &str) {

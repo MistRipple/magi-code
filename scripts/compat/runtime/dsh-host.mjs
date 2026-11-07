@@ -17,6 +17,7 @@ import { configureProfile, withProfile as runProfile, loaderEntries, profilePath
 import { createBackendSessions } from './backend-sessions.mjs';
 import { createRegisteredSettings } from './registered-settings.mjs';
 import { installRegistryFetch } from './registry-fetch.mjs';
+import { createPluginDirectory } from './plugin-directory.mjs';
 
 const clone = (value) => structuredClone(value ?? {});
 const timeoutOf = (value) => value == null ? undefined : Math.min(600_000, Math.max(1_000, Number(value) || 1_000));
@@ -65,6 +66,15 @@ export async function activateDsh(api, module, options) {
   let catalogTimer;
   let configUpdates = Promise.resolve();
   const diagnostic = (message) => api.log(String(message));
+  const pluginDirectory = createPluginDirectory(api, diagnostic);
+  // 全局 internal/status 是跨插件的只读观察；真实本地 fiber 仍由 Cordis 派发。
+  // 外部状态只交给观察者，不进入本实例的启动、失败或处置流程。
+  ctx.on('internal/listener', function (name, listener, eventOptions) {
+    if (name !== 'internal/status' || !eventOptions.global) return;
+    const local = this.events.register('ctx.on("internal/status")', name, listener, eventOptions);
+    const external = this.effect(() => pluginDirectory.subscribe(listener));
+    return () => { external(); return local(); };
+  });
   const reportFailure = (error) => { if (!stopped) api.fail(error); };
   const schema = upstream.Config;
   catalog.catalog.settingsSchema = schema?.toJSON ? toJsonSchema(schema.toJSON()).schema : { type: 'object', additionalProperties: true };
@@ -351,6 +361,7 @@ export async function activateDsh(api, module, options) {
   const dispose = async () => {
     if (stopped) return;
     stopped = true; catalog.live = false;
+    pluginDirectory.dispose();
     releaseRegistryFetch();
     routeStreams.dispose();
     clearInterval(catalogTimer);
@@ -393,6 +404,7 @@ export async function activateDsh(api, module, options) {
     }
     await catalog.drain();
     await refreshModels();
+    await pluginDirectory.refresh();
     await catalog.drain();
     api.settings.onValidate(checkConfig);
     api.onConfig(refresh);

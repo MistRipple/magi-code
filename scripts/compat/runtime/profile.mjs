@@ -8,6 +8,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { load, dump } from 'js-yaml';
 import { createPluginManager } from './plugin-manager.mjs';
+import { pluginLifecycle } from './plugin-directory.mjs';
 
 const scopes = new AsyncLocalStorage();
 let host;
@@ -190,7 +191,7 @@ export function loaderEntries() {
   const scope = state();
   return [ { options: { id: 'magi-profile', name: 'cordis:include', group: true, config: { path: join(host.root, 'cordis.yml') } } },
     ...scope.bundles.map(({ name, plugin }) => ({ disabled: !plugin.enabled, options: { id: `magi-profile:${plugin.manifest.id}`, name, disabled: !plugin.enabled },
-      fiber: { state: plugin.runtime?.state === 'running' ? 2 : plugin.runtime?.state === 'failed' ? 3 : 0 } })) ];
+      fiber: pluginLifecycle(plugin) })) ];
 }
 
 async function commit(scope) {

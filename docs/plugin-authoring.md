@@ -252,6 +252,7 @@ export default async function activate(api) {
 | `api.credential.ref({ roleId? })` | 取得模型绑定引用 |
 | `api.session.snapshot(input)` | 读取会话的有界快照 |
 | `api.plugins.list({includeUpstreamManifest?:true})` | 读取 daemon 当前插件目录；显式请求时在同一快照附带已安装原包 package.json，来源及精确版本由 daemon 校验。默认不附带，不含配置或凭据 |
+| `api.plugins.onChanged(listener)` | 协商 `plugin.directory.events` 后监听目录或运行状态失效通知，返回解除订阅函数；先订阅再读取 `plugins.list()`，读取期间收到通知则补读。通知没有目录数据，不替代 daemon 快照；实例退出回收监听器 |
 | `api.plugins.preview(input)`／`install(input)` | 上游包预览与在线安装；复用精确版本和摘要确认合同，需 `pluginManagement:["install"]` |
 | `api.plugins.setEnabled(pluginId,enabled,expectedDigest?)`／`remove(pluginId,expectedDigest?)` | 启停或卸载其他插件；需 `pluginManagement:["lifecycle"]`。传入目标摘要可拒绝过期页面操作；启用本身不会代授目标插件权限 |
 | `api.plugins.authorize(pluginId,expectedDigest,grants)` | 需单独的 `pluginManagement:["authorize"]` 用户委托。仅授予目标当前摘要声明的权限（可包含完全信任），不能改变自身权限；授权和激活沿原生入口执行，异步提交前复核发起方租约与权限 |

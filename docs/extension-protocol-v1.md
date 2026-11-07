@@ -103,6 +103,7 @@ daemon 响应形状：
 | `session.snapshot` | `api.session.snapshot(input)` | 仅签发会话；`sessionId?`、`afterTurnSeq?`、`limit?`；最多 10 Turn，每 Turn 最多 20 条截断文本 |
 | `session.directory` | `api.session.directory(input?)` | 需协商 `session.directory` 及独立 `sessionRead:["directory"]` 授权。按当前实例读取 daemon 用户会话目录，不要求活动 Turn；输入 `PluginSessionDirectoryRequest`，输出 `PluginSessionDirectory`。按 sessionId 升序分页，每页 1–200 条（默认 100），可筛选 workspaceId；仅身份、标题、项目归属与创建/更新时间，不含外部工具会话、消息、文件路径或凭据。末页游标为 null；跨页并非事务快照，调用者需按身份处理期间新增/删除。旧版本、停用、撤权、排空及失效实例拒绝 |
 | `plugins.list` | `api.plugins.list()` | 读取 daemon 的既有 `PluginList` 目录投影，每次校验当前插件包、激活状态及实例租约；不包含配置、资源或凭据 |
+| `plugins.changed`（通知） | `api.plugins.onChanged(listener)` | 协商 `plugin.directory.events`；daemon 在安装目录或运行状态变化时发送无载荷的失效通知，返回值为解除订阅函数；消费者重新调用 plugins.list，不由通知构造安装或运行事实 |
 | `plugins.compatibility`／`plugins.setVersionExemption` | `api.plugins.compatibility()`／`setVersionExemption(input)` | 需协商 `plugin.management`。读取要求活动宿主租约；写入另需 `pluginManagement:["compatibility"]`，使用 `PluginDshVersionExemptionRequest` 的精确 target、当前 runtimeVersion／runtimeId、revision CAS 和显式风险确认。安装／升级提交前重验，撤销后旧译包不能继续提交 |
 | `plugins.preview/install` | `api.plugins.preview(input)`／`install(input)` | 需协商 `plugin.management` 与 `pluginManagement:["install"]` 授权；复用 `PluginUpstreamRequest`、预览与安装入口，返回既有预览／目录 DTO；仅支持已接入的上游生态。安装必须指定精确版本与预览摘要，不替用户授权新版本 |
 | `plugins.installBundle/cancelInstall` | `api.plugins.installBundle(input)`／`cancelInstall(requestId)` | 另协商 `plugin.installations`，使用 `PluginBundleInstall*` DTO；由 daemon 完成在线版本解析、准备、安装／升级及请求的启停，返回实际应用结果。两者均需 install 授权，后台调用另需 background；启停及代授新版本分别核对 lifecycle、authorize 委托 |
@@ -126,6 +127,8 @@ Renderer 不自行延长插件激活。每个工作台窗口为该插件持有�
 销毁旧文档、关闭事件连接并废弃迟到回执。该合同不会代替 composer、attachments 或
 sessionRead 的各自授权。未声明客户端贡献的普通视图仍按页面生命周期运行。
 
+所有插件视图共用 daemon 运行状态门禁：声明后台扩展的包仅在宿主 running 后挂载原包文档，启动及重启期间展示真实等待状态，失败展示 daemon 原因。包摘要、入口或运行代次变化销毁旧文档和消息桥；其他插件的目录变化不重建当前文档。纯声明视图在激活后直接挂载，常驻客户端同样遵守该门禁，不自行延长后台实例的生命周期。
+
 原生 DSH 页面如需把图片交给当前 Magi 输入框，必须在翻译清单中声明 `composer:["images"]`；页面通过 `ctx.magiComposer` 的异步 `addImages(files)`、`removeImage(id)`、`focus()` 和 `notify(level,message)` 使用宿主。`addImages` 只有在浏览器真实解码、插件摘要/页面身份/权限复核以及 InputArea 接纳后才返回 `accepted:true`；同一批次任一图片失败不会部分挂载。会话切换、页面卸载、停用、撤权或包升级会使旧请求失效。PNG、JPEG、GIF、WebP、AVIF、BMP、ICO 和 SVG 均保留原始草稿字节；发送到不支持原格式的模型时，模型桥只在传输边界生成有界 PNG/JPEG 派生图，canonical 消息仍保留原始图片。
 
 持久图片使用 schema 中的 `PluginImageAttachment*` DTO。单图最多 10 MiB，分块最多 786432 字节，每个实例最多两个未提交上传、共 20 MiB，60 秒无活动回收；实例失效立即丢弃暂存，不能用旧上传身份跨实例提交。相同偏移与字节的分块重传、同一完整上传的提交重试幂等。每插件持久图片最多 1024 个引用、逻辑总量 256 MiB；作者应以 release 回收不再使用的引用。相同内容可共享载荷文件，但引用和授权仍按插件隔离。存储保留 PNG、JPEG、GIF、WebP、AVIF、BMP、ICO 与安全 SVG 原始字节，拒绝类型伪造；不承诺已完成浏览器或模型解码，解码仍由相应消费入口负责。
@@ -133,6 +136,8 @@ sessionRead 的各自授权。未声明客户端贡献的普通视图仍按页�
 图片元数据复用 daemon 现有插件资源事实和升级数据重置事务，内容寻址文件只保存载荷。先原子写载荷，再提交元数据；未提交载荷不可由 API 读取，重启及下次保存时回收。释放先提交元数据删除，没有其他插件引用时才删除共享载荷。已发送图片沿原生 canonical 消息保存自己的字节，不引用这份插件私有存储。`images.store` 明确允许已授权插件在后台事件回调中使用当前实例，不携带已结束的 invocationId；这不放宽 blob、模型、工具、会话或通知服务的原调用租约。
 
 管理 API 的后台模式另协商 `plugin.management.background`：SDK 的 `api.plugins.background` 以显式 `background:true` 传输元字段发送管理写请求，不携带已结束的 invocationId。HostHandler 仅接受插件管理方法、拒绝同时携带 invocationId，移除该元字段并注入当前 `_instance`／`_background` 后交给 daemon。daemon 在初次准入和异步提交锁内均检查 background 及具体动作授权；停用、撤权和旧实例失效仍拒绝。只读目录和兼容策略可沿当前实例重新读取；普通管理 API、模型、工具、会话和钩子原有调用租约边界不变。
+
+插件目录订阅只有当前实例内的监听器，不传递其他插件的配置、事件日志或凭据；不提供跨重启游标或逐条迁移重放。消费者先订阅再读取完整目录，并合并读取期间的失效通知后补读；daemon 广播接收落后时再次通知所有活动实例重新读取。解除订阅及宿主退出回收监听器，旧实例的读取仍由 plugins.list 身份准入拒绝。DSH 全局 internal/status 的观察者接收由当前目录生成的只读生命周期投影（entry.options、state、await），本地可执行 fiber 仍归真实 Cordis；外部故障不得触发观察插件自身的失败或处置。观察按包摘要、运行代次、状态与原因去重；恢复及移除使旧故障清除，不维持第二套插件运行状态。
 
 在线安装任务由 daemon 持有，安装及授权事实仍只写入 PluginManager。requestId 为 1–128 个字母、数字或 `-_.:`，绑定发起插件、摘要、宿主实例、前后台模式及完整输入；同身份同输入只执行一次，不同输入拒绝复用。活动任务和短期回执合计至多 256 个，每个 owner 至多 16 个，完成回执按时间／容量清退，不跨 daemon 重启恢复。重复等待中的一个连接断开不会取消其他等待者；最后一个等待者断开或宿主退出，只取消尚在准备的任务。
 

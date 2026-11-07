@@ -8,6 +8,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
+import { createServer } from 'node:http';
 import { browserImageFixtures } from './lib/plugin-image-fixtures.mjs';
 import { packPlugin } from './compat/core/pack.mjs';
 import { connectAppPage, connectTarget, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
@@ -25,7 +26,8 @@ const work = await mkdtemp(join(tmpdir(), 'magi-runtime-live-'));
 const run = promisify(execFile);
 const reporter = createReporter();
 const errors = [];
-let app, page, frame, ui, pluginId;
+let app, page, frame, ui, pluginId, startupGate;
+const heldStarts = new Set();
 await mkdir(output, { recursive: true });
 async function api(path, body, method = body === undefined ? 'GET' : 'POST') {
   const response = await fetch(`${origin}${path}`, {
@@ -149,13 +151,27 @@ export function apply(ctx, config) {
 }
 
 async function verifyNativePanels(session) {
+  // 在真实异步激活期间保持后台未就绪，验证页面不能抢先发起业务请求。
+  let holdStart = false;
+  startupGate = createServer((_request, response) => {
+    if (!holdStart) return response.end('ready');
+    heldStarts.add(response);
+    response.on('close', () => heldStarts.delete(response));
+  });
+  await new Promise(resolve => startupGate.listen(0, '127.0.0.1', resolve));
+  const gateUrl = `http://127.0.0.1:${startupGate.address().port}`;
   const upstream = join(work, 'native-panels');
   await mkdir(upstream);
+  const deps = JSON.parse(await readFile(join(compat, 'package.json'), 'utf8')).dependencies;
   await writeFile(join(upstream, 'package.json'), JSON.stringify({ name: 'magi-native-panels', version: '1.0.0', type: 'module', main: 'index.js',
+    dependencies: { '@deepseek-ai/schemastery': deps['@deepseek-ai/schemastery'] },
     dsh: { bundle: {} }, exports: { '.': './index.js', './client': './client.js' } }));
   await writeFile(join(upstream, 'index.js'), `
+import Schema from '@deepseek-ai/schemastery';
 export const inject = ['webServer'];
-export function apply(ctx) {
+export const Config = Schema.object({ startupUrl: Schema.string().default('') });
+export async function apply(ctx, config) {
+  if (config.startupUrl) await fetch(config.startupUrl);
   const clients=new Set();
   ctx.webServer.register({path:'/panel-events',handler(req,res){
     res.writeHead(200,{'content-type':'text/event-stream'});
@@ -316,12 +332,41 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   reporter.check('390px 右栏原生面板无横向溢出', await page.evaluate('document.documentElement.scrollWidth<=innerWidth') && await frame.evaluate('document.documentElement.scrollWidth<=innerWidth'));
   await snapshot('panel-390');
   await page.call('Emulation.clearDeviceMetricsOverride');
+  const settings = (await api(`/api/plugins/${id}/settings`)).value;
+  await post(`/api/plugins/${id}/settings`, { expectedVersion: settings.version, value: { startupUrl: gateUrl } }, 'PUT');
   await post(`/api/plugins/${id}/deactivate`);
   await waitFor(async () => !await ui.exists(`iframe[data-plugin-id="${id}"]`), '停用回收右栏面板');
   reporter.check('停用后右栏不保留可调用的旧插件 iframe', true);
   const stoppedStream = await api(`/api/plugins/${id}/routes`, { method:'POST', path:'/__magi_compat/streams', body:{action:'open',request:{method:'GET',path:'/panel-events'}} });
   reporter.check('停用后事件连接沿同一 daemon 准入拒绝重连', stoppedStream.status === 409);
   frame?.close(); frame = null;
+  holdStart = true;
+  await post(`/api/plugins/${id}/activate`);
+  const stateSelector = `[data-testid="plugin-view-runtime"][data-plugin-id="${id}"]`;
+  await waitFor(() => heldStarts.size > 0, '后台等待真实异步初始化');
+  await waitFor(() => ui.exists(stateSelector), '共享页面宿主显示启动状态');
+  if (!await visible(stateSelector)) {
+    if (!await visible('.right-pane')) await ui.click('.header-right-pane-btn');
+    await ui.click('.right-pane-add-tab');
+    await waitFor(() => ui.exists(entry), '启动中仍可选择插件面板');
+    await ui.click(entry);
+  }
+  await waitFor(() => visible(stateSelector), '当前插件面板展示启动反馈');
+  reporter.check('后台未就绪时保留真实加载反馈且不挂载原包文档',
+    await page.evaluate(`document.querySelector(${JSON.stringify(stateSelector)}).getAttribute('aria-busy')==='true' && !document.querySelector('iframe[data-plugin-id="${id}"]')`));
+  await snapshot('panel-starting');
+  holdStart = false;
+  for (const response of heldStarts) response.end('ready');
+  await waitFor(() => ui.exists(`iframe[data-plugin-id="${id}"]`), '后台就绪后自动挂载新文档');
+  const url = await page.evaluate(`document.querySelector('iframe[data-plugin-id="${id}"]').src`);
+  frame = await waitFor(() => connectTarget(cdpPort, target => (target.type === 'iframe' || target.type === 'page') && target.url === url, '重启原包文档', errors), '重启原包文档');
+  await waitFor(() => frame.evaluate('Boolean(window.__clientInstance)'), '重新初始化原包客户端');
+  await waitFor(() => frame.evaluate(`document.getElementById('pulse')?.textContent==='1'`), '新文档自动恢复后端事件');
+  reporter.check('后台恢复后自动创建新客户端，旧文档不会继续调用', await frame.evaluate('window.__clientInstance') !== clientInstance);
+  await snapshot('panel-restarted');
+  await post(`/api/plugins/${id}/deactivate`);
+  await waitFor(async () => !await ui.exists(`iframe[data-plugin-id="${id}"]`), '再次停用回收客户端');
+  frame.close(); frame = null;
 }
 
 async function verifySessionDirectory(session) {
@@ -508,6 +553,9 @@ try {
   console.error(error);
   process.exitCode = 1;
 } finally {
+  for (const response of heldStarts) response.end('closed');
+  startupGate?.closeAllConnections();
+  startupGate?.close();
   await writeFile(join(output, 'results.json'), JSON.stringify(reporter.results, null, 2));
   if (app) { await writeFile(join(output, 'electron.log'), app.log.join('')); await app.stop(); }
   frame?.close();

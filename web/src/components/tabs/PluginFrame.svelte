@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import Icon from '../Icon.svelte';
   import { agentUrl } from '../../web/agent-api';
   import { i18n } from '../../stores/i18n.svelte';
   import { subscribeAppearanceRuntime } from '../../appearance/runtime';
@@ -43,7 +44,14 @@
   let destroyed = false;
   /** 与 daemon 资源快照上限一致：更大的写入在到达消息桥之前就拒绝。 */
   const MAX_WRITE_BYTES = 4 * 1024 * 1024;
-  const resourceDigest = $derived(pluginProjection().installed.find((item) => item.manifest.id === pluginId)?.digest ?? '');
+  const installed = $derived(pluginProjection().installed.find((item) => item.manifest.id === pluginId));
+  const runtime = $derived(installed?.runtime);
+  const ready = $derived(Boolean(installed?.active && (!installed.manifest.extension || runtime?.state === 'running')));
+  const waiting = $derived((!installed && !pluginProjection().loaded) || Boolean(installed?.active && (!runtime || runtime.state === 'starting' || runtime.state === 'restarting')));
+  const runtimeState = $derived(installed?.active ? runtime?.state ?? 'starting' : 'notRunning');
+  const resourceDigest = $derived(installed?.digest ?? '');
+  // 监管可能合并中间状态；即使只看到 running → running，新运行代次也必须创建新文档。
+  const documentIdentity = $derived(JSON.stringify([pluginId, entry, resourceDigest, ready, runtime?.generation]));
   const resourceUrl = $derived(
     agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/${resourceDigest ? `ui-v/${resourceDigest}` : 'ui'}/${entry.replace(/^ui\//, '').split('/').map(encodeURIComponent).join('/')}`),
   );
@@ -367,7 +375,7 @@
   $effect.pre(() => {
     // 注册表投影刷新也会重新下发 props；只有文档身份真正变化才撤销消息桥。
     // 否则更新其他插件会改变 nonce，而当前 iframe 没有导航，之后的请求全部失配。
-    const identity = JSON.stringify([pluginId, entry, resourceDigest]);
+    const identity = documentIdentity;
     if (identity === navigationIdentity) return;
     navigationIdentity = identity;
     releaseResourceSubscriptions();
@@ -377,6 +385,8 @@
   });
 </script>
 
+{#if ready}
+{#key documentIdentity}
 <iframe
   class="plugin-view"
   class:plugin-view--settings={placement === 'settings'}
@@ -398,8 +408,17 @@
   sandbox="allow-scripts"
   referrerpolicy="no-referrer"
 ></iframe>
+{/key}
+{:else}
+  <div class="settings-notice plugin-view-status" class:settings-notice--error={runtime?.state === 'failed'} role="status" aria-busy={waiting} data-testid="plugin-view-runtime" data-plugin-id={pluginId}>
+    <Icon name={waiting ? 'loader' : 'warning'} class={waiting ? 'spinning' : ''} size={14} />
+    <span>{waiting && !installed ? i18n.t('common.loading') : i18n.t(`settings.plugins.runtime.state.${runtimeState}`)}{#if installed?.active && runtime?.reason}<br />{runtime.reason}{/if}</span>
+  </div>
+{/if}
 
 <style>
+  .plugin-view-status { min-width: 0; overflow-wrap: anywhere; }
+  .plugin-view-status :global(svg) { flex: none; }
   .plugin-view {
     display: block;
     width: 100%;

@@ -293,6 +293,63 @@ test('DSH 管理安装只转发到 daemon 任务，保留版本来源、requestI
 
 const execution = () => ({ invocationId: 'test-call', signal: new AbortController().signal });
 
+test('全局插件状态观察来自 daemon 当前目录，其他插件失败不终止本实例，恢复及卸载清除故障', async () => {
+  const h = host(), failures = new Map();
+  let notify;
+  const plugin = (state, reason) => ({ manifest: { id: 'dsh.other' }, digest: 'other-digest',
+    source: { kind: 'upstream', location: 'dsh:@scope/other@1.0.0' }, active: true, runtime: { state, reason, generation: 1 } });
+  let plugins = [plugin('failed', '真实启动失败')];
+  h.api.plugins = {
+    async list() { return { plugins: structuredClone(plugins) }; },
+    onChanged(listener) { notify = listener; return () => { notify = undefined; }; },
+  };
+  const running = await activateDsh(h.api, { apply(ctx) {
+    ctx.on('internal/status', fiber => {
+      const name = fiber.entry?.options?.name;
+      if (!name) return;
+      if (fiber.state === 3) fiber.await().catch(error => failures.set(name, error.message));
+      else if ([2, 4].includes(fiber.state)) failures.delete(name);
+    }, { global: true });
+  } }, options);
+  try {
+    assert.equal(failures.get('@scope/other'), '真实启动失败');
+    assert.deepEqual(h.state.failures, [], '外部故障不能进入本实例的失败处理');
+    plugins = [plugin('running')]; await notify();
+    assert.equal(failures.size, 0);
+    plugins = [plugin('failed', '再次失败')]; await notify();
+    assert.equal(failures.get('@scope/other'), '再次失败');
+    plugins = []; await notify();
+    assert.equal(failures.size, 0);
+  } finally { await running.dispose(); }
+  assert.equal(notify, undefined, '处置回收目录订阅');
+});
+
+test('插件目录观察合并变更并补读在途更新，取消订阅与处置拒绝迟到快照', async () => {
+  const { createPluginDirectory } = await import('./runtime/plugin-directory.mjs');
+  let notify, resolveRead, reads = 0;
+  const calls = [], errors = [];
+  const api = { plugins: {
+    list() { reads++; return new Promise(resolve => { resolveRead = resolve; }); },
+    onChanged(listener) { notify = listener; return () => { notify = undefined; }; },
+  } };
+  const directory = createPluginDirectory(api, message => errors.push(message));
+  const plugin = (state) => ({ manifest: { id: 'dsh.other' }, digest: 'digest', source: { kind: 'upstream', location: 'dsh:other@1.0.0' }, active: true, runtime: { state, generation: 1 } });
+  const off = directory.subscribe(value => { calls.push(value.state); });
+  const change = notify();
+  resolveRead({ plugins: [plugin('starting')] });
+  await until(() => reads === 2);
+  resolveRead({ plugins: [plugin('running')] }); await change;
+  assert.deepEqual(calls, [1, 2]);
+  const late = notify(); off();
+  resolveRead({ plugins: [plugin('failed')] }); await late;
+  assert.deepEqual(calls, [1, 2]);
+  directory.subscribe(value => { calls.push(value.state); });
+  directory.dispose();
+  resolveRead({ plugins: [plugin('failed')] });
+  await delay(0);
+  assert.deepEqual(calls, [1, 2]); assert.deepEqual(errors, []);
+});
+
 test('Loader baseUrl 使用 daemon 调用期 profile 身份，不使用伪造 HTTP 地址', async (t) => {
   const { pathToFileURL } = await import('node:url');
   const directory = await mkdtemp(join(tmpdir(), 'magi-profile-identity-'));
