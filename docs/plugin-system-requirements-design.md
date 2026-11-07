@@ -622,7 +622,7 @@ Windows、手机触摸、完整生态分母及 95% 目标均未验收。后续�
 
 【现状·定向回归】兼容层 58 项、API 管理服务 4 项、daemon 扩展服务 9 项通过；Web 检查 0 错误 0 警告。补充 ESM／CommonJS 文件导入、异步目录扫描、临时原子写入、取消和连续安装／升级摘要回归。构建有既有 WebFolderPicker 静态／动态导入警告；未运行全仓测试。
 
-【剩余】Health 基础文件体检与运行状态读取可用，但完整可靠性报告仍返回 null，DSH 运行版本显示未知，不记为全部业务通过。Ops 的文件导入和 CommonJS 准入阻塞已修复，安装、启动与两个原生面板可显示，但健康扫描仍因缺少 `listVersionExemptions` 失败；验收将页面显示的方法缺失判为失败，不用空豁免目录伪造支持。版本豁免的原生持久化／兼容准入、完整包元数据投影、Agent／sessions、Appshot 业务、Upgrader 完整升级／回滚及平台辅助进程仍未完成。95%／100% 生态覆盖均未达到，Windows 与 pi 运行器仍未验收。
+【剩余】Health 基础文件体检、运行状态和可靠性报告已能读取调用期 profile 快照；DSH 运行版本仍显示未知，不记为全部业务通过。Ops 的文件导入和 CommonJS 准入阻塞已修复，安装、启动与两个原生面板可显示，但健康扫描仍因缺少 `listVersionExemptions` 失败；验收将页面显示的方法缺失判为失败，不用空豁免目录伪造支持。版本豁免的原生持久化／兼容准入、完整包元数据投影、Agent／sessions、Appshot 业务、Upgrader 完整升级／回滚及平台辅助进程仍未完成。95%／100% 生态覆盖均未达到，Windows 与 pi 运行器仍未验收。
 
 证据：`target/plugin-acceptance/profile/`、`target/plugin-acceptance/dsh-management/`、`target/plugin-acceptance/popular-dsh/`，构建目录不纳入版本库。
 

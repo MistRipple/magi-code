@@ -116,3 +116,50 @@ test('fs/promises 的目录扫描保留 DSH profile 的异步迭代语义', asyn
     await callbackDir.close();
   });
 });
+
+test('只读 fd 保留快照、定位读取与游标语义，关闭及跨调用后失效', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'magi-profile-fd-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const off = configureProfile({ plugins: { async list() { return { plugins: [] }; } } }, { home });
+  t.after(off);
+  const path = join(profilePath(), 'package.json');
+  let stale;
+  await withProfile(async () => {
+    const expected = fs.readFileSync(path);
+    const fd = fs.openSync(path, 'r');
+    assert.ok(Number.isInteger(fd) && fd >= 0);
+    assert.equal(fs.fstatSync(fd).size, expected.length);
+    assert.equal(fs.fstatSync(fd).isFile(), true);
+    const buffer = Buffer.alloc(expected.length + 1);
+    assert.equal(fs.readSync(fd, buffer, 0, 4, 2), 4);
+    assert.deepEqual(buffer.subarray(0, 4), expected.subarray(2, 6));
+    assert.equal(fs.readSync(fd, buffer, { length: 3 }), 3, '定位读取不推进文件游标');
+    assert.deepEqual(buffer.subarray(0, 3), expected.subarray(0, 3));
+    assert.equal(fs.readSync(fd, buffer, 3, buffer.length - 3, null), expected.length - 3);
+    assert.deepEqual(buffer.subarray(0, expected.length), expected);
+    assert.equal(fs.readSync(fd, buffer, 0, 1, null), 0);
+    assert.equal(fs.readSync(fd, buffer, 0, 1, expected.length + 100), 0);
+    fs.closeSync(fd);
+    assert.throws(() => fs.fstatSync(fd), { code: 'EBADF' });
+    assert.throws(() => fs.openSync(path, 'w'), { code: 'EROFS' });
+    stale = fs.openSync(path, 0);
+    const callbackFd = await new Promise((resolve, reject) => fs.open(path, 'r', (error, fd) => error ? reject(error) : resolve(fd)));
+    const readBuffer = Buffer.alloc(2);
+    const count = await new Promise((resolve, reject) => fs.read(callbackFd, readBuffer, 0, 2, null, (error, count, actualBuffer) => {
+      if (error) return reject(error);
+      assert.equal(actualBuffer, readBuffer); resolve(count);
+    }));
+    assert.equal(count, 2); assert.deepEqual(readBuffer, expected.subarray(0, 2));
+    assert.deepEqual(fs.readFileSync(callbackFd), expected.subarray(2));
+    await new Promise((resolve, reject) => fs.close(callbackFd, (error) => error ? reject(error) : resolve()));
+    const handle = await fs.promises.open(path, 'r');
+    assert.equal((await handle.stat()).size, expected.length);
+    assert.equal((await handle.read(readBuffer, { length: 2 })).bytesRead, 2);
+    assert.equal(await handle.readFile('utf8'), expected.subarray(2).toString('utf8'));
+    await handle.close(); await handle.close();
+    assert.equal(handle.fd, -1);
+    await assert.rejects(handle.stat(), { code: 'EBADF' });
+  });
+  await withProfile(async () => { assert.throws(() => fs.readSync(stale, Buffer.alloc(1)), { code: 'EBADF' }); });
+  assert.equal(nativeFs.existsSync(profilePath()), false);
+});

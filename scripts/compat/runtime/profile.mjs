@@ -11,6 +11,8 @@ import { createPluginManager } from './plugin-manager.mjs';
 
 const scopes = new AsyncLocalStorage();
 let host;
+const DESCRIPTOR_BASE = 0x40000000;
+let nextDescriptor = DESCRIPTOR_BASE;
 const error = (code, message, path) => Object.assign(new Error(message), { code, path });
 // Atomic writers may use their own temporary or backup suffix. These files
 // exist only for this invocation and never become a second installation store.
@@ -79,6 +81,44 @@ export function profileRead(path, encoding) {
   const data = Buffer.from(value);
   const format = typeof encoding === 'string' ? encoding : encoding?.encoding;
   return format ? data.toString(format) : data;
+}
+
+// 保留的高位描述符只指向本次调用快照，不持有 OS 文件句柄。关闭或调用结束后
+// 立即失效；带 position 的读取不推进游标，语义与 Node 只读 fd 一致。
+export const isProfileDescriptor = (fd) => Number.isInteger(fd) && fd >= DESCRIPTOR_BASE;
+function descriptor(fd) {
+  const scope = state(), value = scope.descriptors.get(fd);
+  if (!value) throw error('EBADF', 'profile 文件描述符已关闭或不属于当前调用');
+  return value;
+}
+export function profileOpen(path, flags = 'r') {
+  const location = virtualPath(path); if (!location) return;
+  if (flags !== 'r' && flags !== 0) throw error('EROFS', 'profile 描述符只允许读取快照', path);
+  const data = profileRead(path), stat = profileStat(path), scope = state();
+  if (scope.descriptors.size >= 256) throw error('EMFILE', 'profile 调用内的文件描述符过多');
+  const fd = nextDescriptor++;
+  scope.descriptors.set(fd, { data, stat, position: 0 });
+  return fd;
+}
+export function profileFstat(fd) { return { ...descriptor(fd).stat }; }
+export function profileClose(fd) { descriptor(fd); state().descriptors.delete(fd); }
+export function profileReadRemaining(fd, options) {
+  const file = descriptor(fd), data = Buffer.from(file.data.subarray(file.position));
+  file.position = file.data.length;
+  const encoding = typeof options === 'string' ? options : options?.encoding;
+  return encoding ? data.toString(encoding) : data;
+}
+export function profileReadDescriptor(fd, buffer, offset = 0, length = buffer.byteLength - offset, position = null) {
+  const file = descriptor(fd);
+  if (!ArrayBuffer.isView(buffer)) throw new TypeError('buffer 必须是 Buffer 或 TypedArray');
+  if (!Number.isInteger(offset) || !Number.isInteger(length) || offset < 0 || length < 0 || offset + length > buffer.byteLength) throw new RangeError('读取范围无效');
+  if (position !== null && (!Number.isSafeInteger(position) || position < 0)) throw new RangeError('读取位置无效');
+  const start = position ?? file.position;
+  const count = Math.min(length, Math.max(0, file.data.length - start));
+  const target = Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  if (count) file.data.copy(target, offset, start, start + count);
+  if (position === null) file.position += count;
+  return count;
 }
 export function profileWrite(path, data, encoding) {
   const location = virtualPath(path); if (!location) return false;
@@ -155,9 +195,12 @@ async function commit(scope) {
 }
 export async function withProfile(callback, signal) {
   if (!host || scopes.getStore()) return callback();
-  const scope = { signal, time: Date.now() };
+  const scope = { signal, time: Date.now(), descriptors: new Map() };
   await refresh(scope);
-  return scopes.run(scope, async () => { const result = await callback(); if (!(result?.status >= 400 || result?.body?.ok === false || result?.isError)) await commit(scope); return result; });
+  return scopes.run(scope, async () => {
+    try { const result = await callback(); if (!(result?.status >= 400 || result?.body?.ok === false || result?.isError)) await commit(scope); return result; }
+    finally { scope.descriptors.clear(); }
+  });
 }
 
 // 只接管明确针对当前虚拟 profile 的 dsh plugin 命令。其他进程仍走原生

@@ -150,6 +150,15 @@ try {
           item.smoke = { path, transportStatus: route.status, ...route.value };
           item.smoke.ok = route.status === 200 && route.value.status >= 200 && route.value.status < 300 && route.value.body?.ok !== false && !route.value.body?.error;
         }
+        if (pkg === 'dsh-plugin-health' && item.smoke?.ok) {
+          const status = item.smoke.body;
+          assert.equal(status.profile, 'magi');
+          assert.equal(status.review?.schemaVersion, 1, '原包可靠性报告不能被吞成 null');
+          assert.ok(status.review.packages.some((entry) => entry.name === pkg && entry.version === version));
+          assert.ok(status.liveReview?.entries.some((entry) => entry.name === pkg && entry.state === 'active'));
+          assert.equal(status.issues.some((issue) => ['profiles-missing', 'profile-missing', 'profile-bundles-empty'].includes(issue.id)), false);
+          item.functionalChecks = { fileInspection: true, reliabilityReport: true, liveActivation: true, repairs: 'unverified' };
+        }
         if (pkg === 'dsh-plugin-share' && item.smoke?.ok) {
           const call = async (action, body) => {
             const response = await post(`/api/plugins/${encodeURIComponent(item.id)}/routes`, { method: 'POST', path: `/api/plugin-share/${action}`, body });
