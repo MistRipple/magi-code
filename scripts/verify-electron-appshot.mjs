@@ -89,6 +89,25 @@ try {
     assert.equal(await frame.evaluate(`window.__acceptanceIdentity`), marker);
     return true;
   });
+  await check('重复确认同一原包保持原生进程、常驻客户端和配置', async () => {
+    const processes = await nativeProcesses();
+    assert.equal(processes.length, 1);
+    const before = await running();
+    const same = { ecosystem: 'dsh', package: 'dsh-plugin-appshot', version: '0.4.2' };
+    const repeated = await api('/api/plugins/upstream/preview', same);
+    assert.equal(repeated.candidate.operation, 'unchanged');
+    assert.equal(repeated.candidate.digest, before.digest);
+    const result = await api('/api/plugins/upstream/install', { ...same, expectedDigest: repeated.candidate.digest });
+    const current = result.plugins.find(p => p.manifest.id === id);
+    assert.equal(current.active, true);
+    assert.deepEqual(current.grants, before.grants);
+    assert.equal((await config()).soundEnabled, false);
+    // 客户端此时停放在后台；通过真实配置调用后核对进程和文档身份，
+    // 不等待被隐藏 iframe 正常节流的动画帧。
+    assert.equal(await frame.evaluate('window.__acceptanceIdentity'), marker);
+    assert.deepEqual(await nativeProcesses(), processes);
+    return { unchanged: true, processes };
+  });
   await pageTools(page).click('[data-testid=sidebar-settings]');
   const nav = `[data-testid=${JSON.stringify(`settings-nav-plugin:${id}:settings`)}]`;
   await waitFor(() => pageTools(page).exists(nav), '再次打开设置入口');

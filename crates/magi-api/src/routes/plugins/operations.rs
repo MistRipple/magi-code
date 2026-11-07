@@ -502,6 +502,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unchanged_install_preserves_the_running_instance_and_checks_admission_first() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct RuntimeProbe(Arc<AtomicUsize>);
+        impl crate::ExtensionStatusSource for RuntimeProbe {
+            fn status(
+                &self,
+                _: &str,
+            ) -> Option<magi_app_server_protocol::generated::PluginRuntimeStatus> {
+                None
+            }
+            fn quiesce(
+                &self,
+                _: String,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let stops = Arc::new(AtomicUsize::new(0));
+        let state = super::super::tests::bare_state(root.path())
+            .with_extension_status(Arc::new(RuntimeProbe(stops.clone())));
+        let target = package("acme.target", false);
+        let unprivileged = package("acme.unprivileged", false);
+        install(&state, &target, true);
+        install(&state, &unprivileged, true);
+        let operations = PluginOperations::from_state(&state);
+        let source = PluginSource::Local {
+            name: "acme.target.zip".into(),
+        };
+        let before = state.plugin_manager.lock().unwrap().state().clone();
+        operations
+            .install_or_upgrade(&target, source.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            0,
+            "同一摘要不能停止正在工作的宿主"
+        );
+        assert_eq!(state.plugin_manager.lock().unwrap().state(), &before);
+        state
+            .plugin_manager
+            .lock()
+            .unwrap()
+            .check_runtime("acme.target", "current")
+            .unwrap();
+
+        assert!(
+            operations
+                .install_or_upgrade(
+                    &target,
+                    source.clone(),
+                    Some((
+                        "acme.unprivileged",
+                        unprivileged.digest(),
+                        Some("current"),
+                        false
+                    ))
+                )
+                .await
+                .is_err()
+        );
+        let foreign = PluginSource::Upstream {
+            ecosystem: "pi".into(),
+            package: "foreign".into(),
+            version: "1.0.0".into(),
+        };
+        assert!(
+            operations
+                .install_or_upgrade(&target, foreign, None)
+                .await
+                .is_err()
+        );
+        let drain = PluginManager::begin_upgrade_drain(state.plugin_manager.clone(), "acme.target")
+            .unwrap();
+        assert!(
+            operations
+                .install_or_upgrade(&target, source.clone(), None)
+                .await
+                .is_err()
+        );
+        drop(drain);
+        assert_eq!(stops.load(Ordering::SeqCst), 0, "拒绝的确认也不能打断实例");
+        assert_eq!(state.plugin_manager.lock().unwrap().state(), &before);
+    }
+
+    #[tokio::test]
     async fn management_reports_runtime_failure_instead_of_claiming_activation_applied() {
         use magi_app_server_protocol::generated::{PluginRuntimeState, PluginRuntimeStatus};
         struct FailedRuntime;
@@ -737,7 +826,25 @@ impl PluginOperations {
         source: PluginSource,
         caller: Option<OperationCaller<'_>>,
     ) -> Result<(), ApiError> {
-        self.check_upstream_compatibility(&*self.locked("检查升级兼容策略")?, package, &source)?;
+        {
+            let manager = self.locked("检查插件更新")?;
+            Self::check_caller(&manager, caller, "install")?;
+            manager
+                .ensure_editing_admitted(&package.manifest().id)
+                .map_err(plugin_error)?;
+            self.check_upstream_compatibility(&manager, package, &source)?;
+            // 复用预览的来源及摘要判断，在关闭宿主准入前结束无需变更的确认。
+            // 运行中的工具、后台进程和客户端不应因重复安装同一包而被回收。
+            if matches!(
+                manager
+                    .preview(package, &source)
+                    .map_err(plugin_error)?
+                    .operation,
+                magi_app_server_protocol::generated::PluginCandidateOperation::Unchanged
+            ) {
+                return Ok(());
+            }
+        }
         let drain =
             PluginManager::begin_upgrade_drain(Arc::clone(&self.manager), &package.manifest().id)
                 .map_err(plugin_error)?;

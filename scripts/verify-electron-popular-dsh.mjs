@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -284,8 +284,29 @@ try {
             const stillActive = await currentTarget();
             assert.equal(stillActive.digest, active.digest); assert.equal(stillActive.runtime.state, 'running');
             assert.deepEqual(stillActive.grants, active.grants, '失败预检不应撤销已运行版本的授权');
+            // 让新包落盘在旧宿主已经排空后失败，不能只用不存在版本测试预检。
+            // 仅在本次隔离状态根制造目录冲突，不改上游原包或用户安装。
+            const replacement = await post('/api/plugins/upstream/preview', { ecosystem: 'dsh', package: request.package, version: '0.0.7' });
+            const blockedArchive = join(work, 'state/plugins/versions', targetId, `${replacement.candidate.digest}.zip`);
+            await mkdir(blockedArchive);
+            try {
+              const failedWrite = await run('0.0.7', true);
+              assert.equal(failedWrite.failed, 1, '真实包落盘失败须向上游管理页面报告失败');
+              const recovered = await waitFor(async () => {
+                const current = await currentTarget();
+                return current?.digest === active.digest && current.runtime?.state === 'running' ? current : false;
+              }, '升级写入失败后旧版本恢复运行', 30_000);
+              assert.equal(recovered.manifest.version, '0.0.8');
+              assert.deepEqual(recovered.grants, active.grants);
+              assert.equal(recovered.enabled, true); assert.equal(recovered.active, true);
+              item.failedReplacement = { stage: 'archive-write', job: failedWrite, preservedDigest: recovered.digest };
+            } finally { await rm(blockedArchive, { recursive: true, force: true }); }
+            const retry = await run('0.0.7', true);
+            assert.equal(retry.failed, 0, '清除故障后显式重试应完成版本切换');
+            const retried = await currentTarget();
+            assert.equal(retried.manifest.version, '0.0.7'); assert.equal(retried.runtime.state, 'running');
             item.functionalChecks = { onlineUpgrade: true, versionSwitch: true, disabledState: true, failedUpgradePreservesVersion: true,
-              failedUpgradePreservesActiveRuntime: true, reactivation: true, removalRollback: 'unverified' };
+              failedUpgradePreservesActiveRuntime: true, failedReplacementPreservesRuntime: true, retryAfterWriteFailure: true, reactivation: true, removalRollback: 'unverified' };
           } finally { if (targetId) await removePlugin(targetId); }
         }
       }
