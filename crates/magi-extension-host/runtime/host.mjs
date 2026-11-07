@@ -378,6 +378,8 @@ const api = Object.freeze({
     list: () => request('plugins.list', {}),
     preview: (input) => pluginRequest('plugins.preview', input),
     install: (input) => pluginRequest('plugins.install', input),
+    compatibility: () => pluginRequest('plugins.compatibility', {}),
+    setVersionExemption: (input) => pluginRequest('plugins.setVersionExemption', input),
     setEnabled: (pluginId, enabled, expectedDigest) => pluginRequest('plugins.setEnabled', { pluginId, enabled, ...(expectedDigest === undefined ? {} : { expectedDigest }) }),
     authorize: (pluginId, expectedDigest, grants) => pluginRequest('plugins.authorize', { pluginId, expectedDigest, grants }),
     remove: (pluginId, expectedDigest) => pluginRequest('plugins.remove', { pluginId, ...(expectedDigest === undefined ? {} : { expectedDigest }) }),

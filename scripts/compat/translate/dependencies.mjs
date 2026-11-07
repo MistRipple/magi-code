@@ -9,7 +9,7 @@ const NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
 const platformMatches = (values, value) => !values || (Array.isArray(values)
   && !values.includes(`!${value}`) && (values.includes('any') || !values.some((item) => !item.startsWith('!')) || values.includes(value)));
 
-export async function installDependencies(root, sharedRoot, registry = process.env.MAGI_NPM_REGISTRY ?? 'https://registry.npmjs.org') {
+export async function installDependencies(root, sharedRoot, registry = process.env.MAGI_NPM_REGISTRY ?? 'https://registry.npmjs.org', compatibility) {
   const records = [];
   const shared = hostDependencies(sharedRoot);
   const work = async (directory, ancestors = new Map(), depth = 0) => {
@@ -31,8 +31,8 @@ export async function installDependencies(root, sharedRoot, registry = process.e
         // DSH app-boot 0.2.2-rc.1 的 plugin-compatibility 明确让预发布版本参与 DSH peer 范围。
         // 这不是 npm 普通依赖的默认规则；仅 DSH peer 使用上游策略，直接依赖与其他生态仍严格校验。
         const dshPeer = name.startsWith('@deepseek-ai/dsh-') && peer;
-        if (semver.satisfies(installed.version, range, { includePrerelease: dshPeer })) {
-          records.push({ name, version: installed.version, host: true });
+        if (semver.satisfies(installed.version, range, { includePrerelease: dshPeer }) || (depth === 0 && dshPeer && compatibility?.useRuntimePeers)) {
+          records.push({ name, version: installed.version, host: true, ...(depth === 0 && dshPeer && compatibility?.exempted ? { versionExemption: true } : {}) });
           continue;
         }
         // Cordis is a peer in the upstream ecosystem, but it is also the

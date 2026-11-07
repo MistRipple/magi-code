@@ -15,6 +15,7 @@ use std::{
 };
 
 mod drain;
+mod compatibility;
 mod runtime_catalog;
 mod upgrade;
 

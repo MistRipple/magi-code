@@ -2,10 +2,12 @@
 // 管理插件单独获得 authorize 委托；失败不能把已下载当成已运行。
 import semver from 'semver';
 import pacote from 'pacote';
+import { profileCompatibility, updateProfileExemption } from './profile.mjs';
+import { checkDshCompatibility } from '../core/dsh-compatibility.mjs';
 
 const NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
 const failure = (error, extra = {}) => ({ application: 'failed', ...extra,
-  error: { code: error.code ?? 'magi-operation-failed', message: String(error.message ?? error) } });
+  error: { code: error.code ?? 'magi-operation-failed', message: String(error.message ?? error), ...(error.incompatible ? { incompatible: error.incompatible } : {}) } });
 
 export function parseBundleSpec(spec) {
   if (typeof spec !== 'string' || spec.length > 300) throw new Error('npm 插件来源无效');
@@ -39,6 +41,14 @@ export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTR
       });
     },
     async registries() { return { registry }; },
+    listVersionExemptions() {
+      const { runtimeVersion, exemptions } = profileCompatibility();
+      return { runtimeVersion, exemptions };
+    },
+    async setVersionExemption(target, runtimeVersion, enabled, acceptRisk = false) {
+      const { exemptions } = await updateProfileExemption(target, runtimeVersion, enabled, acceptRisk);
+      return { target, runtimeVersion, enabled, exemptions, application: 'applied' };
+    },
   };
   if (api.plugins.preview && api.plugins.install) {
     manager.installBundle = async (spec, options = {}) => {
@@ -48,10 +58,16 @@ export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTR
         if (options.approvedBuilds?.length) throw new Error('Magi 不执行安装脚本，不接受构建授权');
         if (options.registry && options.registry.replace(/\/+$/, '') !== registry.replace(/\/+$/, '')) throw new Error('安装源与 Magi 当前 registry 不一致，请先在 Magi 中配置安装源');
         const request = parseBundleSpec(spec);
-        if (request.version && !semver.valid(request.version)) {
-          const manifest = await pacote.manifest(`${request.package}@${request.version}`, { registry, ignoreScripts: true });
+        if ((request.version && !semver.valid(request.version)) || api.plugins.compatibility) {
+          const manifest = await pacote.manifest(`${request.package}@${request.version ?? 'latest'}`, { registry, ignoreScripts: true });
           if (manifest.name !== request.package || !semver.valid(manifest.version)) throw new Error('registry 返回的插件身份无效');
           request.version = manifest.version;
+          // 与翻译器共用上游版本规则，为原生页面保留可处理的精确诊断。
+          // 此处只预检；真正安装仍由 daemon 在翻译和提交时重新准入。
+          if (api.plugins.compatibility) {
+            const policy = await api.plugins.compatibility();
+            checkDshCompatibility(manifest, policy, policy);
+          }
         }
         const preview = await api.plugins.preview(request);
         const list = await api.plugins.install({ ...request, version: preview.version, expectedDigest: preview.candidate.digest });

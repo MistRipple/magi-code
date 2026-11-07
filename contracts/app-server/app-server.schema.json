@@ -6287,6 +6287,81 @@
           "x-rust-default": true
         }
       }
+    },
+    "PluginDshCompatibilityProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "runtimeVersion",
+        "runtimeId",
+        "exemptions"
+      ],
+      "properties": {
+        "revision": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "runtimeVersion": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "runtimeId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{24}$"
+        },
+        "exemptions": {
+          "type": "object",
+          "maxProperties": 512,
+          "additionalProperties": {
+            "type": "array",
+            "maxItems": 32,
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            }
+          },
+          "x-rust-type": "std::collections::BTreeMap<String, Vec<String>>"
+        }
+      }
+    },
+    "PluginDshVersionExemptionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target",
+        "runtimeVersion",
+        "expectedRuntimeId",
+        "expectedRevision",
+        "enabled",
+        "acceptRisk"
+      ],
+      "properties": {
+        "target": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "runtimeVersion": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "expectedRuntimeId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{24}$"
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "acceptRisk": {
+          "type": "boolean"
+        }
+      }
     }
   }
 }

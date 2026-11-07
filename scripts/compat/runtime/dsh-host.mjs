@@ -1,5 +1,6 @@
 // DSH 运行期适配器。上游原包执行真实 Cordis；业务与贡献准入由 Magi daemon 裁决。
 import { Context, Service } from '@deepseek-ai/cordis';
+import { pathToFileURL } from 'node:url';
 import { deepEqual, volatileEntries, updateVolatile } from '@deepseek-ai/cosmokit';
 import { LlmRuntime } from '@deepseek-ai/dsh-llm';
 import { ToolExecutionPipeline } from '@deepseek-ai/dsh-tools/pipeline';
@@ -248,7 +249,8 @@ export async function activateDsh(api, module, options) {
     ctx.provide('loader', { entries: loaderEntries });
     ctx.provide('profileContext', Object.freeze({ name: 'magi', dir: profilePath() }));
   }
-  ctx.baseUrl = 'http://127.0.0.1';
+  // Loader 的 baseUrl 是当前 profile 目录，用于上游识别运行身份；不是 HTTP 地址。
+  if (profilePath()) ctx.baseUrl = pathToFileURL(profilePath() + '/').href;
 
   let publishing;
   let modelRevision = 0;

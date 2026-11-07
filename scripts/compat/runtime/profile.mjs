@@ -40,6 +40,7 @@ function bundle(plugin) {
 }
 async function refresh(scope) {
   const list = await host.api.plugins.list();
+  scope.compatibility = host.api.plugins.compatibility ? await host.api.plugins.compatibility() : null;
   scope.bundles = list.plugins.map(bundle).filter(Boolean);
   scope.original = new Map(scope.bundles.map((item) => [item.name, { ...item, digest: item.plugin.digest }]));
   scope.files = new Map(); scope.dirty = new Set();
@@ -52,11 +53,26 @@ async function refresh(scope) {
   scope.files.set('cordis.yml', dump(rows));
   scope.files.set('cordis.patch.yml', dump(rows.map(({ id, disabled }) => ({ id, disabled }))));
   scope.files.set('.npmrc', `registry=${host.registry}\n`);
+  if (scope.compatibility) scope.files.set('compatibility.json', JSON.stringify(scope.compatibility.exemptions));
   for (const { name, version, plugin } of scope.bundles) {
     const path = `node_modules/${name}`;
     scope.files.set(`${path}/package.json`, JSON.stringify({ name, version, description: plugin.manifest.description, dsh: { bundle: { patch: './cordis.patch.yml' } } }));
     scope.files.set(`${path}/cordis.patch.yml`, dump([{ insert: [{ id: plugin.manifest.id, name }] }]));
   }
+}
+
+export function profileCompatibility() {
+  const value = state().compatibility;
+  if (!value) throw error('ENOTSUP', 'daemon 未提供版本兼容策略');
+  return structuredClone(value);
+}
+export async function updateProfileExemption(target, runtimeVersion, enabled, acceptRisk) {
+  const scope = state(), current = profileCompatibility();
+  const value = await host.api.plugins.setVersionExemption({ target, runtimeVersion, enabled, acceptRisk,
+    expectedRuntimeId: current.runtimeId, expectedRevision: current.revision });
+  scope.compatibility = value;
+  scope.files.set('compatibility.json', JSON.stringify(value.exemptions));
+  return structuredClone(value);
 }
 
 function state() {

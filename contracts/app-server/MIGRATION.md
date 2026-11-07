@@ -24,6 +24,10 @@ Bridge 可以拥有不同传输实现，但不得重新定义同形状的 wire D
 与激活状态决定。`magi-plugin-system` 使用生成类型并对包资源与作用域补充语义校验；不得
 在插件 SDK、HTTP 适配器或 UI 手写另一份清单结构。
 
+`PluginDshCompatibilityProjection` 与 `PluginDshVersionExemptionRequest` 是新增的插件兼容策略 DTO，
+复用资源 CAS 持久化。runtimeId 绑定当前随包锁文件，豁免只对精确包版本和当前运行时生效；
+管理写操作需要独立 compatibility 授权和风险确认，不改变已有安装摘要、能力或权限准入。
+
 `PluginRouteCallRequest.headers` 是可选的增量字段，用于插件页面向其私有后端携带应用头。
 旧请求省略时保持原行为；Magi HTTP 身份头不随该字段转交。DSH 路由适配器校验头名、
 值、数量和大小，并拒绝覆盖宿主身份及传输控制头。

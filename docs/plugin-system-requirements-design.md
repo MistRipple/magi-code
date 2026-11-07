@@ -628,6 +628,16 @@ Windows、手机触摸、完整生态分母及 95% 目标均未验收。后续�
 
 证据：`target/plugin-acceptance/profile/`、`target/plugin-acceptance/dsh-management/`、`target/plugin-acceptance/popular-dsh/`，构建目录不纳入版本库。
 
+### 11.11 DSH 版本豁免与 Ops 原包真实复验（2026-11-07）
+
+【现状·已运行验证】兼容豁免现已成为 daemon 的全局资源事实，而不是 DSH profile 文件或管理插件私有状态。安装期通过随包 `dsh-tools` 版本和锁文件摘要得到 `runtimeVersion`／`runtimeId`；管理插件写入要求独立 `pluginManagement:["compatibility"]` 授权、活动宿主租约、revision CAS 和显式风险确认。译包来源、精确版本、运行时身份及兼容报告在安装和升级提交前重新核对；撤销后旧摘要不能继续提交。
+
+`ctx.get('pluginManager')` 这类可选服务读取也纳入翻译扫描，使用管理服务的原包会声明对应授权；`ctx.baseUrl` 改为调用期 profile 的 `file:` 身份，健康扫描不会再把 HTTP 地址误判为 DSH 安装目录。版本不兼容回执保留精确包、版本、运行时和声明范围，供原生面板展示；豁免不能跳过能力门禁、完整性校验或权限授权。
+
+【现状·已运行验证】`npm run test:electron-dsh-compatibility` 在真实 macOS arm64 目录包、Electron Main、sidecar、随包 Node 和未修改的 `dsh-plugin-ops-bundle@0.20.8` 原生页面中 12/12 通过：缺少兼容委托不能激活；失败安装自动撤回豁免；Ops 通过真实路由在线安装并激活 `dsh-plugin-release-probe@0.0.8`；健康扫描读取真实 `magi` profile；重启后豁免恢复；原包撤销、卸载和页面运行无异常；没有落盘第二份 profile。兼容回归 64 项、插件系统兼容单测 2 项、管理 API 单测 5 项通过。证据位于 `target/plugin-acceptance/dsh-compatibility/`。
+
+本轮只覆盖 Ops 的扫描、豁免、在线安装和卸载路径；完整生态分母、Windows、Appshot 会话投递、Upgrader 回滚、平台原生辅助进程和 95%／100% 目标仍未完成，不能由通过数推导生态兼容率。
+
 ## 12. 验收与证据边界
 
 ### 12.1 已运行验证

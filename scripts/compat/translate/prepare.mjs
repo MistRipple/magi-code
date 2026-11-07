@@ -17,6 +17,7 @@ import { runtimeId } from '../core/identity.mjs';
 import { summarize, verdictFor } from '../core/report.mjs';
 import { classify as classifyDsh } from '../dsh/catalog.mjs';
 import { clientViews } from './client-views.mjs';
+import { dshEnvironment, checkDshCompatibility } from '../core/dsh-compatibility.mjs';
 
 const COMPAT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const TRANSLATOR_VERSION = 2;
@@ -61,12 +62,13 @@ export async function prepareDsh(options) {
   const pkg = JSON.parse(readFileSync(join(options.upstreamDir, 'package.json'), 'utf8'));
   const translator = createRegistry().create('dsh');
   if (!(await translator.detect(options.upstreamDir))) throw new Error(`${pkg.name} 不是 DSH 插件`);
+  const compatibility = checkDshCompatibility(pkg, dshEnvironment(options.sharedRoot), options.compatibility);
   if (existsSync(options.outDir) && readdirSync(options.outDir).length) throw new Error('输出目录必须为空');
   const main = entryOf(pkg), root = resolve(options.upstreamDir), entry = resolve(root, main);
   if (!entry.startsWith(root + sep) || !existsSync(entry) || !/\.(?:mjs|cjs|js)$/.test(main)) throw new Error('上游入口无效或尚未构建');
   const inspection = await translator.inspect(root, { required: ['llm', 'tools', 'commands', 'settings', 'runtime', 'hooks', 'session', 'services', 'prompt', 'native'] });
   if (inspection.verdict.blocked.length) throw new Error(`Magi 兼容检查未通过：\n${inspection.verdict.blocked.map((item) => `${item.name}（${item.status === 'unknown' ? '尚未完成兼容核对' : '宿主能力尚未接入'}）: ${item.note}`).join('\n')}`);
-  const dependencies = await installDependencies(root, options.sharedRoot);
+  const dependencies = await installDependencies(root, options.sharedRoot, undefined, compatibility);
   // 静态扫描不能证明 apply() 能启动，也看不到延迟注册的工具/事件。安装前在
   // 受限记录器中启动一次真实 Cordis：失败直接阻塞安装，成功的运行期贡献写入
   // 清单，避免“空清单但安装成功”的假阳性。
@@ -106,8 +108,9 @@ export async function prepareDsh(options) {
     // 清单，daemon 合并运行目录时会把同一个贡献 ID 计数两次。
     contributions: { tools: [], commands: [], views: [{ id: 'settings', title: '设置', entry: 'ui/settings.html', placements: ['settings'] }] },
   };
-  if (inspection.entries.some((entry) => /^(?:ctx\.)?(?:pluginManager|loader)(?:\.|$)/.test(entry.name))) {
-    manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', 'authorize'] });
+  if (inspection.entries.some((entry) => /^(?:ctx\.)?(?:pluginManager|loader)(?:\.|$)/.test(entry.name))
+    || ['pluginManager', 'loader'].some((name) => Object.hasOwn(inspection.serviceReads, name))) {
+    manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', 'authorize', 'compatibility'] });
   }
   mkdirSync(options.outDir, { recursive: true });
   const kept = copyTree(root, options.outDir);
@@ -140,8 +143,10 @@ export async function prepareDsh(options) {
   const compatReport = {
     kind: 'dsh', translatorVersion: TRANSLATOR_VERSION, runtimeId: compatRuntimeId,
     upstream: { name: pkg.name, version: pkg.version, integrity: options.source.integrity },
+    compatibility,
     magi: { id: manifest.id, version: manifest.version }, dependencies,
     runtimeContributions: manifest.extension.runtimeContributions,
+    serviceReads: inspection.serviceReads,
     tools: recorded.tools, commands: recorded.commands, modelSources: recorded.providers,
     routes: recorded.routes, listeners: recorded.listeners, variants: recorded.variants,
     ui: { mode: client ? 'native' : 'generated', mountedSlots: clientAnalysis?.mounted ?? [], unmountedSlots: clientAnalysis?.unmounted ?? [] },

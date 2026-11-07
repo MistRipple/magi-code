@@ -549,6 +549,11 @@ async fn run_translator(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    command.env(
+        "MAGI_DSH_COMPATIBILITY_POLICY",
+        serde_json::to_string(&state.dsh_compatibility()?)
+            .map_err(|error| ApiError::internal_assembly("编码兼容策略失败", error))?,
+    );
     let mut child = magi_process::spawn_managed_tokio_in_group(&state.processes, &mut command)
         .map_err(|error| ApiError::internal_assembly("启动翻译器失败", error))?;
     let mut out = child.take_stdout();

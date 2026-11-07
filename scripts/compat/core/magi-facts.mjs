@@ -58,8 +58,10 @@ export function readHookReentryDenied() {
   const text = read('crates/magi-extension-host/src/instance.rs');
   const at = text.indexOf('ErrorKind::ReentryDenied');
   if (at === -1) throw new Error('instance.rs 中找不到 ReentryDenied 分支');
-  const window = text.slice(Math.max(0, at - 700), at);
-  const list = [...window.matchAll(/"([a-z]+(?:\.[a-z]+)+)"/g)].map((m) => m[1]);
+  const before = text.slice(0, at);
+  const start = before.lastIndexOf('if matches!(');
+  if (start === -1) throw new Error('instance.rs 中找不到 ReentryDenied 方法列表');
+  const list = [...before.slice(start).matchAll(/"([a-zA-Z]+(?:\.[a-zA-Z]+)+)"/g)].map((m) => m[1]);
   if (!list.includes('model.invoke') || !list.includes('ask.user')) throw new Error('ReentryDenied 列表解析异常');
   return new Set(list);
 }

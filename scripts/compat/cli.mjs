@@ -19,6 +19,7 @@ if (command === 'prepare') {
     const result = await prepareDsh({
       upstreamDir: resolve(upstreamDir), outDir: resolve(need('out')), sharedRoot: dirname(fileURLToPath(import.meta.url)),
       source: { integrity: need('integrity') },
+      compatibility: process.env.MAGI_DSH_COMPATIBILITY_POLICY ? JSON.parse(process.env.MAGI_DSH_COMPATIBILITY_POLICY) : undefined,
     });
     const archive = optionOf(args, 'archive');
     if (archive) {

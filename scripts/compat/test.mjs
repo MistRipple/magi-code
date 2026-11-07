@@ -34,6 +34,13 @@ test('DSH 可选服务保留缺失报告；必需依赖、未知服务和分支�
   ]) assert.ok((await inspectOptional(t, code)).verdict.blocked.length > 0);
 });
 
+test('ctx.get 服务读取沿上下文辅助函数记录，供管理权限声明使用；普通同名对象不混入', async (t) => {
+  const report = await inspectOptional(t, "export function apply(ctx) { lookup(ctx); const other = { get() {} }; other.get('unrelated'); } function lookup(c) { c.get('pluginManager'); c.get('loader'); }");
+  assert.deepEqual(Object.keys(report.serviceReads), ['loader', 'pluginManager']);
+  assert.equal(report.serviceReads.pluginManager.count, 1);
+  assert.equal(report.verdict.blocked.length, 0, '读取可缺席服务不会被变成必需依赖');
+});
+
 test('DSH 同步事件注册失败有明确 catch 时允许上游降级；无保护、异步与重抛仍阻塞', async (t) => {
   const report = await inspectOptional(t, "export function apply(ctx) { try { ctx.on('session/event', () => {}); } catch (error) { ctx.logger.warn(error); } }");
   assert.equal(report.verdict.blocked.length, 0);
@@ -79,6 +86,20 @@ test('DSH peer 沿上游准入策略计入预发布版本；越界版本、直�
   await assert.rejects(check('@deepseek-ai/dsh-llm', '0.3.0-rc.1', range), /不满足/);
   await assert.rejects(check('@deepseek-ai/dsh-llm', '0.2.2-rc.1', range, 'dependencies'), /不满足/);
   await assert.rejects(check('@deepseek-ai/cordis', '4.2.0-rc.1', '^4.0.0'), /不满足/);
+});
+
+test('DSH 版本门禁保持 engines 优先与预发布语义；豁免只覆盖精确包版本和运行时', async () => {
+  const { unmetDshRequirements, checkDshCompatibility } = await import('./core/dsh-compatibility.mjs');
+  const environment = { runtimeVersion: '0.2.2-rc.1', runtimeId: '0123456789abcdef01234567' };
+  const pkg = { name: '@scope/plugin', version: '1.0.0', engines: { dsh: '>=0.3' }, peerDependencies: { '@deepseek-ai/dsh-tools': '*' } };
+  assert.deepEqual(unmetDshRequirements(pkg, environment.runtimeVersion), { 'engines.dsh': '>=0.3' });
+  assert.equal(unmetDshRequirements({ ...pkg, engines: { dsh: '>=0.2.1 <0.3' }, peerDependencies: { '@deepseek-ai/dsh-tools': '0.1.0' } }, environment.runtimeVersion), null);
+  assert.equal(unmetDshRequirements({ peerDependencies: { '@deepseek-ai/dsh-tools': 'workspace:^' } }, environment.runtimeVersion), null);
+  assert.throws(() => checkDshCompatibility(pkg, environment), /版本声明不接受/);
+  const policy = { ...environment, revision: 1, exemptions: { '@scope/plugin@1.0.0': [environment.runtimeVersion] } };
+  assert.equal(checkDshCompatibility(pkg, environment, policy).exempted, true);
+  assert.throws(() => checkDshCompatibility({ ...pkg, version: '1.0.1' }, environment, policy), /版本声明不接受/);
+  assert.throws(() => checkDshCompatibility(pkg, { ...environment, runtimeId: 'abcdef0123456789abcdef01' }, policy), /运行时不一致/);
 });
 
 test('工厂按名称创建，重复注册、未知名称与非法名称都明确失败', () => {

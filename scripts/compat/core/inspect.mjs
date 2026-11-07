@@ -42,6 +42,7 @@ export function buildReport({ translator, upstream, root, scanOptions, classify,
   return {
     translator, upstream,
     scanned: { files: scan.fileCount, lines: scan.lineCount, fileList: scan.files },
+    serviceReads: scan.serviceReads,
     entries, summary: summarize(entries), verdict: verdictFor(entries, required),
   };
 }

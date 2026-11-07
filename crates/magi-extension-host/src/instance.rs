@@ -687,6 +687,7 @@ impl Incoming for HostHandler {
                         | "plugins.setEnabled"
                         | "plugins.remove"
                         | "plugins.authorize"
+                        | "plugins.setVersionExemption"
                         | "session.snapshot"
                         | "credential.ref"
                         | "blob.put"

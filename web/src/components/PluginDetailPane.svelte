@@ -41,7 +41,10 @@
 
   function permissionText(permission: PluginPermission): string {
     if (permission.kind === 'extension') return i18n.t('settings.plugins.permission.extensionFullTrust');
-    if (permission.kind === 'pluginManagement') return i18n.t(permission.targets.includes('authorize') ? 'settings.plugins.permission.pluginAuthorization' : 'settings.plugins.permission.pluginManagement');
+    if (permission.kind === 'pluginManagement') return [
+      i18n.t(permission.targets.includes('authorize') ? 'settings.plugins.permission.pluginAuthorization' : 'settings.plugins.permission.pluginManagement'),
+      ...(permission.targets.includes('compatibility') ? [i18n.t('settings.plugins.permission.pluginCompatibility')] : []),
+    ].join('；');
     if (permission.kind === 'contextRewrite') return i18n.t('settings.plugins.permission.contextRewrite');
     if (permission.kind === 'modelSources') return i18n.t('settings.plugins.permission.modelSources', { sources: permission.targets.join(', ') });
     return `${permission.kind}${permission.targets.length ? `: ${permission.targets.join(', ')}` : ''}`;

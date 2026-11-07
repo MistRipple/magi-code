@@ -8,6 +8,7 @@ import { configureProfile, withProfile, profilePath, loaderEntries } from './run
 import fs from './runtime/profile-fs.mjs';
 import { load, dump } from 'js-yaml';
 import { installSharedResolution } from './runtime/shared-resolution.mjs';
+import { createPluginManager } from './runtime/plugin-manager.mjs';
 
 test('profile 同步读取真实调用快照，启停提案经 daemon 与摘要校验提交，无物理副本和失败写入', async (t) => {
   const home = await mkdtemp(join(tmpdir(), 'magi-profile-test-'));
@@ -161,5 +162,37 @@ test('只读 fd 保留快照、定位读取与游标语义，关闭及跨调用�
     await assert.rejects(handle.stat(), { code: 'EBADF' });
   });
   await withProfile(async () => { assert.throws(() => fs.readSync(stale, Buffer.alloc(1)), { code: 'EBADF' }); });
+  assert.equal(nativeFs.existsSync(profilePath()), false);
+});
+
+test('管理器同步读当前 daemon 豁免快照，CAS 回执同步到虚拟文件；新调用读取外部变更', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'magi-profile-policy-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  let policy = { revision: 0, runtimeVersion: '0.2.2-rc.1', runtimeId: '0123456789abcdef01234567', exemptions: {} };
+  const calls = [];
+  const api = { plugins: {
+    async list() { return { plugins: [] }; },
+    async compatibility() { return structuredClone(policy); },
+    async setVersionExemption(input) {
+      calls.push(input);
+      assert.equal(input.expectedRuntimeId, policy.runtimeId);
+      assert.equal(input.expectedRevision, policy.revision);
+      assert.equal(input.acceptRisk, true);
+      policy = { ...policy, revision: policy.revision + 1, exemptions: { [input.target]: [input.runtimeVersion] } };
+      return structuredClone(policy);
+    },
+  } };
+  const off = configureProfile(api, { home }); t.after(off);
+  const manager = createPluginManager(api);
+  assert.throws(() => manager.listVersionExemptions(), /调用快照/);
+  await withProfile(async () => {
+    assert.deepEqual(manager.listVersionExemptions(), { runtimeVersion: policy.runtimeVersion, exemptions: {} });
+    await manager.setVersionExemption('@scope/plugin@1.0.0', policy.runtimeVersion, true, true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(join(profilePath(), 'compatibility.json'), 'utf8')), policy.exemptions);
+    assert.equal(manager.listVersionExemptions().exemptions['@scope/plugin@1.0.0'][0], policy.runtimeVersion);
+  });
+  assert.equal(calls.length, 1);
+  policy = { ...policy, revision: policy.revision + 1, exemptions: {} };
+  await withProfile(async () => { assert.deepEqual(manager.listVersionExemptions().exemptions, {}); });
   assert.equal(nativeFs.existsSync(profilePath()), false);
 });

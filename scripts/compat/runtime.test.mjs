@@ -183,6 +183,50 @@ test('DSH npm 标签和版本范围从 registry 解析为精确版本后才进�
   assert.equal(versions.length, 2, '安装源不一致不能发送预览或写入');
 });
 const execution = () => ({ invocationId: 'test-call', signal: new AbortController().signal });
+
+test('版本不兼容回执保留精确诊断，未豁免不发起预览；豁免后仍走 daemon 安装', async (t) => {
+  const { createServer } = await import('node:http');
+  const { createPluginManager } = await import('./runtime/plugin-manager.mjs');
+  const policy = { runtimeVersion: '0.2.2-rc.1', runtimeId: '0123456789abcdef01234567', exemptions: {} };
+  const server = createServer((_req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ name: 'fixture-incompatible', 'dist-tags': { latest: '1.0.0' }, versions: {
+      '1.0.0': { name: 'fixture-incompatible', version: '1.0.0', engines: { dsh: '^9.0.0' }, dist: { tarball: 'https://example.test/unused.tgz' } },
+    } }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const calls = [];
+  const manager = createPluginManager({ plugins: {
+    async compatibility() { return structuredClone(policy); },
+    async preview(input) { calls.push('preview'); return { version: input.version, candidate: { digest: 'exact' } }; },
+    async install(input) { calls.push('install'); assert.equal(input.expectedDigest, 'exact'); return { plugins: [{ manifest: { id: 'fixture', name: 'Fixture' }, source: { location: `dsh:fixture-incompatible@${input.version}` }, enabled: false }] }; },
+  } }, `http://127.0.0.1:${server.address().port}`);
+  const refused = await manager.installBundle('fixture-incompatible@1.0.0', { enabled: false });
+  assert.equal(refused.application, 'failed');
+  assert.equal(refused.error.code, 'incompatible-version');
+  assert.deepEqual(refused.error.incompatible, [{ name: 'fixture-incompatible', version: '1.0.0', runtimeVersion: policy.runtimeVersion, requirements: { 'engines.dsh': '^9.0.0' } }]);
+  assert.deepEqual(calls, []);
+  policy.exemptions['fixture-incompatible@1.0.0'] = [policy.runtimeVersion];
+  assert.equal((await manager.installBundle('fixture-incompatible@1.0.0', { enabled: false })).application, 'applied');
+  assert.deepEqual(calls, ['preview', 'install']);
+});
+
+test('Loader baseUrl 使用 daemon 调用期 profile 身份，不使用伪造 HTTP 地址', async (t) => {
+  const { pathToFileURL } = await import('node:url');
+  const directory = await mkdtemp(join(tmpdir(), 'magi-profile-identity-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const h = host(); h.api.plugins = { async list() { return { plugins: [] }; } };
+  const original = process.env.DSH_HOME; process.env.DSH_HOME = directory;
+  try {
+    let identity;
+    const running = await activateDsh(h.api, { apply(ctx) { identity = ctx.baseUrl; } }, options);
+    try { assert.equal(identity, pathToFileURL(join(directory, 'profiles/magi') + '/').href); }
+    finally { await running.dispose(); }
+  } finally {
+    if (original === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = original;
+  }
+});
 const tool = (name, execute = async () => 'ok') => ({
   name, description: name, parameters: { type: 'object' }, execute,
   output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },

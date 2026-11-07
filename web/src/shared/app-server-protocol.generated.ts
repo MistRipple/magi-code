@@ -1568,3 +1568,19 @@ export interface PluginRuntimeCatalog {
   modelSources?: Array<PluginNamedContribution>;
   settingsSchema?: Record<string, unknown> | null;
 }
+
+export interface PluginDshCompatibilityProjection {
+  revision: number;
+  runtimeVersion: string;
+  runtimeId: string;
+  exemptions: Record<string, unknown>;
+}
+
+export interface PluginDshVersionExemptionRequest {
+  target: string;
+  runtimeVersion: string;
+  expectedRuntimeId: string;
+  expectedRevision: number;
+  enabled: boolean;
+  acceptRisk: boolean;
+}

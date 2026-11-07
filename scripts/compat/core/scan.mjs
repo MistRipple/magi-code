@@ -315,6 +315,7 @@ export function scanSources(root, options = {}) {
   const symbols = new Map();
   const calls = new Map();
   const injects = new Map();
+  const serviceReads = new Map();
   const events = new Map();
   let lines = 0;
   const { info, unresolved } = analyzeContexts(files, flow);
@@ -357,6 +358,12 @@ export function scanSources(root, options = {}) {
         }
       }
       // `ctx.inject(['a', 'b'], …)` 与 `export const inject = [...]`
+      // get() 本身允许服务缺席；另记读取身份供安装授权声明使用，不把 get()
+      // 误当成必需 inject，也不能漏掉经辅助函数取得的 pluginManager。
+      if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'get'
+        && isDshContext(node.expression.expression, node) && node.arguments[0] && ts.isStringLiteralLike(node.arguments[0])) {
+        bump(serviceReads, node.arguments[0].text, rel);
+      }
       if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'inject') {
         const first = node.arguments[0];
         if (first && ts.isArrayLiteralExpression(first)) for (const element of first.elements) if (ts.isStringLiteralLike(element)) {
@@ -371,5 +378,5 @@ export function scanSources(root, options = {}) {
     visit(source);
   }
   const plain = (map) => Object.fromEntries([...map].sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => [key, { count: value.count, optional: value.optionalCount === value.count, files: [...value.files].sort() }]));
-  return { fileCount: files.length, lineCount: lines, files: files.map((file) => relative(root, file)), imports: plain(imports), symbols: plain(symbols), calls: plain(calls), injects: plain(injects), events: plain(events), unresolvedContextFlows: unresolved };
+  return { fileCount: files.length, lineCount: lines, files: files.map((file) => relative(root, file)), imports: plain(imports), symbols: plain(symbols), calls: plain(calls), injects: plain(injects), serviceReads: plain(serviceReads), events: plain(events), unresolvedContextFlows: unresolved };
 }

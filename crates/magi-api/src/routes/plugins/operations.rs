@@ -79,6 +79,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compatibility_writes_require_independent_grant_risk_confirmation_and_current_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::bare_state(root.path());
+        let caller = package_permissions("acme.compatibility", &["compatibility"]);
+        let readonly = package("acme.manager", true);
+        install(&state, &caller, true);
+        install(&state, &readonly, true);
+        let mut operations = PluginOperations::from_state(&state);
+        let compat = root.path().join("compat");
+        std::fs::create_dir_all(compat.join("node_modules/@deepseek-ai/dsh-tools")).unwrap();
+        std::fs::write(
+            compat.join("node_modules/@deepseek-ai/dsh-tools/package.json"),
+            br#"{"version":"0.2.2-rc.1"}"#,
+        )
+        .unwrap();
+        std::fs::write(compat.join("package-lock.json"), b"{}").unwrap();
+        operations.plugin_toolchain = Some(crate::PluginToolchain {
+            node: root.path().join("node"),
+            compat,
+        });
+        let current = operations
+            .call(
+                "acme.manager",
+                readonly.digest(),
+                Some("current"),
+                "plugins.compatibility",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let mut request = json!({"target":"example@1.2.3","runtimeVersion":current["runtimeVersion"],"expectedRuntimeId":current["runtimeId"],"expectedRevision":current["revision"],"enabled":true,"acceptRisk":false});
+        assert!(
+            operations
+                .call(
+                    "acme.manager",
+                    readonly.digest(),
+                    Some("current"),
+                    "plugins.setVersionExemption",
+                    request.clone()
+                )
+                .await
+                .unwrap_err()
+                .message()
+                .contains("compatibility")
+        );
+        assert!(
+            operations
+                .call(
+                    "acme.compatibility",
+                    caller.digest(),
+                    Some("current"),
+                    "plugins.setVersionExemption",
+                    request.clone()
+                )
+                .await
+                .is_err()
+        );
+        request["acceptRisk"] = json!(true);
+        assert!(
+            operations
+                .call(
+                    "acme.compatibility",
+                    caller.digest(),
+                    Some("old"),
+                    "plugins.setVersionExemption",
+                    request.clone()
+                )
+                .await
+                .is_err()
+        );
+        let updated = operations
+            .call(
+                "acme.compatibility",
+                caller.digest(),
+                Some("current"),
+                "plugins.setVersionExemption",
+                request.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated["exemptions"]["example@1.2.3"][0], "0.2.2-rc.1");
+        assert!(
+            operations
+                .call(
+                    "acme.compatibility",
+                    caller.digest(),
+                    Some("current"),
+                    "plugins.setVersionExemption",
+                    request
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            operations
+                .call(
+                    "acme.manager",
+                    readonly.digest(),
+                    None,
+                    "plugins.compatibility",
+                    json!({})
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn management_uses_real_lifecycle_and_cannot_grant_new_packages() {
         let root = tempfile::tempdir().unwrap();
         let state = super::super::tests::bare_state(root.path());
@@ -481,6 +589,7 @@ impl PluginOperations {
             {
                 let mut manager = self.locked("安装插件")?;
                 Self::check_caller(&manager, caller, "install")?;
+                self.check_upstream_compatibility(&manager, package, &source)?;
                 manager.install(package, source).map_err(plugin_error)?;
             }
             self.changed();
@@ -494,6 +603,7 @@ impl PluginOperations {
         source: PluginSource,
         caller: Option<OperationCaller<'_>>,
     ) -> Result<(), ApiError> {
+        self.check_upstream_compatibility(&*self.locked("检查升级兼容策略")?, package, &source)?;
         let drain =
             PluginManager::begin_upgrade_drain(Arc::clone(&self.manager), &package.manifest().id)
                 .map_err(plugin_error)?;
@@ -501,6 +611,7 @@ impl PluginOperations {
         let result = {
             let mut manager = self.locked("升级插件")?;
             Self::check_caller(&manager, caller, "install")?;
+            self.check_upstream_compatibility(&manager, package, &source)?;
             let result = manager
                 .upgrade(package, source, &drain)
                 .map_err(plugin_error);
@@ -511,6 +622,21 @@ impl PluginOperations {
         };
         self.changed();
         result
+    }
+
+    fn check_upstream_compatibility(
+        &self,
+        manager: &PluginManager,
+        package: &PluginPackage,
+        source: &PluginSource,
+    ) -> Result<(), ApiError> {
+        if matches!(source, PluginSource::Upstream { ecosystem, .. } if ecosystem == "dsh") {
+            let (version, runtime) = self.dsh_runtime()?;
+            manager
+                .ensure_dsh_candidate_compatible(package, source, &version, &runtime)
+                .map_err(plugin_error)?;
+        }
+        Ok(())
     }
 
     /// 写操作只能由获授权的活动宿主调用；代授新版本需要独立 authorize 委托。
@@ -553,6 +679,9 @@ impl PluginOperations {
                 lease.ok_or_else(|| ApiError::Forbidden("插件管理需要活动宿主租约".into()))?,
             )
             .map_err(plugin_error)?;
+        if target.is_empty() {
+            return Ok(());
+        }
         if !manager
             .permission_allowed(
                 caller,
@@ -576,7 +705,11 @@ impl PluginOperations {
         method: &str,
         params: Value,
     ) -> Result<Value, ApiError> {
-        let target = if matches!(method, "plugins.preview" | "plugins.install") {
+        let target = if method == "plugins.setVersionExemption" {
+            "compatibility"
+        } else if method == "plugins.compatibility" {
+            ""
+        } else if matches!(method, "plugins.preview" | "plugins.install") {
             "install"
         } else if method == "plugins.authorize" {
             "authorize"
@@ -585,6 +718,29 @@ impl PluginOperations {
         };
         self.admitted(caller, digest, lease, target)?;
         match method {
+            "plugins.compatibility" => {
+                if params.as_object().is_none_or(|object| !object.is_empty()) {
+                    return Err(ApiError::InvalidInput("兼容策略读取不接受参数".into()));
+                }
+                serde_json::to_value(self.dsh_compatibility()?)
+                    .map_err(|error| ApiError::internal_assembly("编码兼容策略失败", error))
+            }
+            "plugins.setVersionExemption" => {
+                let request: magi_app_server_protocol::generated::PluginDshVersionExemptionRequest =
+                    serde_json::from_value(params)
+                        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+                let (version, runtime) = self.dsh_runtime()?;
+                let result = {
+                    let mut manager = self.locked("提交版本豁免")?;
+                    Self::check_caller(&manager, Some((caller, digest, lease)), "compatibility")?;
+                    manager
+                        .set_dsh_exemption(&version, &runtime, &request)
+                        .map_err(plugin_error)?
+                };
+                self.changed();
+                serde_json::to_value(result)
+                    .map_err(|error| ApiError::internal_assembly("编码兼容策略失败", error))
+            }
             "plugins.preview" => {
                 let request = serde_json::from_value(params)
                     .map_err(|e| ApiError::InvalidInput(format!("预览参数无效：{e}")))?;
@@ -693,6 +849,43 @@ impl PluginOperations {
             }
             _ => Err(ApiError::InvalidInput("未知插件管理操作".into())),
         }
+    }
+
+    /// SDK 版本取自真实随包 dsh-tools；指纹与译包 runtimeId 使用同一锁文件。
+    fn dsh_runtime(&self) -> Result<(String, String), ApiError> {
+        use sha2::{Digest, Sha256};
+        let toolchain = self
+            .plugin_toolchain
+            .as_ref()
+            .ok_or_else(|| ApiError::Conflict("DSH 兼容运行时不可用".into()))?;
+        let manifest: Value = serde_json::from_slice(
+            &std::fs::read(
+                toolchain
+                    .compat
+                    .join("node_modules/@deepseek-ai/dsh-tools/package.json"),
+            )
+            .map_err(|error| ApiError::internal_assembly("读取兼容 SDK 失败", error))?,
+        )
+        .map_err(|error| ApiError::internal_assembly("读取兼容 SDK 失败", error))?;
+        let version = manifest
+            .get("version")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::Conflict("DSH SDK 版本缺失".into()))?
+            .to_owned();
+        let lock = std::fs::read(toolchain.compat.join("package-lock.json"))
+            .map_err(|error| ApiError::internal_assembly("读取兼容运行时摘要失败", error))?;
+        let id = magi_core::hex_lower(Sha256::digest(lock))[..24].to_owned();
+        Ok((version, id))
+    }
+
+    pub(super) fn dsh_compatibility(
+        &self,
+    ) -> Result<magi_app_server_protocol::generated::PluginDshCompatibilityProjection, ApiError>
+    {
+        let (version, runtime) = self.dsh_runtime()?;
+        self.locked("读取兼容策略")?
+            .dsh_compatibility(&version, &runtime)
+            .map_err(plugin_error)
     }
 
     /// HTTP 与受信插件使用同一个生命周期实现。

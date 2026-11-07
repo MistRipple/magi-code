@@ -199,6 +199,8 @@ impl HostService for PluginHostService {
                 | "plugins.setEnabled"
                 | "plugins.remove"
                 | "plugins.authorize"
+                | "plugins.compatibility"
+                | "plugins.setVersionExemption"
         ) {
             let operation = self.request_with_identity(plugin_id, method, params);
             return Box::pin(async move {
@@ -287,6 +289,8 @@ impl HostService for PluginHostService {
                 | "plugins.setEnabled"
                 | "plugins.remove"
                 | "plugins.authorize"
+                | "plugins.compatibility"
+                | "plugins.setVersionExemption"
         ) {
             let operations = self.operations.get().cloned();
             let digest = self.digest.clone();

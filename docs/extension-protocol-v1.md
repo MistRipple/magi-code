@@ -102,6 +102,7 @@ daemon 响应形状：
 | `credential.ref` | `api.credential.ref({roleId?})` | 返回模型绑定引用，不返回 secret；只由 model.invoke 消费 |
 | `session.snapshot` | `api.session.snapshot(input)` | 仅签发会话；`sessionId?`、`afterTurnSeq?`、`limit?`；最多 10 Turn，每 Turn 最多 20 条截断文本 |
 | `plugins.list` | `api.plugins.list()` | 读取 daemon 的既有 `PluginList` 目录投影，每次校验当前插件包、激活状态及实例租约；不包含配置、资源或凭据 |
+| `plugins.compatibility`／`plugins.setVersionExemption` | `api.plugins.compatibility()`／`setVersionExemption(input)` | 需协商 `plugin.management`。读取要求活动宿主租约；写入另需 `pluginManagement:["compatibility"]`，使用 `PluginDshVersionExemptionRequest` 的精确 target、当前 runtimeVersion／runtimeId、revision CAS 和显式风险确认。安装／升级提交前重验，撤销后旧译包不能继续提交 |
 | `plugins.preview/install` | `api.plugins.preview(input)`／`install(input)` | 需协商 `plugin.management` 与 `pluginManagement:["install"]` 授权；复用 `PluginUpstreamRequest`、预览与安装入口，返回既有预览／目录 DTO；仅支持已接入的上游生态。安装必须指定精确版本与预览摘要，不替用户授权新版本 |
 | `plugins.setEnabled/remove` | `api.plugins.setEnabled(pluginId,enabled)`／`remove(pluginId)` | 需协商 `plugin.management` 与 `pluginManagement:["lifecycle"]`；复用 HTTP 的生命周期、排空与停止端口。拒绝当前发起插件的自身停止、删除或升级；启用后等待真实宿主运行状态，启动失败不返回成功 |
 | `tool.call` | `api.tools.call(tool,input)` | 只接受公开原生工具；需要真实 Task、租约、策略、schema、权限、审批与账本 |

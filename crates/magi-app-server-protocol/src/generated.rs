@@ -3550,3 +3550,29 @@ pub struct PluginRuntimeCatalog {
     #[serde(rename = "settingsSchema")]
     pub settings_schema: Option<Value>,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginDshCompatibilityProjection {
+    pub revision: u64,
+    #[serde(rename = "runtimeVersion")]
+    pub runtime_version: String,
+    #[serde(rename = "runtimeId")]
+    pub runtime_id: String,
+    pub exemptions: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginDshVersionExemptionRequest {
+    pub target: String,
+    #[serde(rename = "runtimeVersion")]
+    pub runtime_version: String,
+    #[serde(rename = "expectedRuntimeId")]
+    pub expected_runtime_id: String,
+    #[serde(rename = "expectedRevision")]
+    pub expected_revision: u64,
+    pub enabled: bool,
+    #[serde(rename = "acceptRisk")]
+    pub accept_risk: bool,
+}

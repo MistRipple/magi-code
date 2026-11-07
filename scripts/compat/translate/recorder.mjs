@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { configureProfile, withProfile, loaderEntries, profilePath } from '../runtime/profile.mjs';
 import { installSharedResolution } from '../runtime/shared-resolution.mjs';
+import { dshEnvironment } from '../core/dsh-compatibility.mjs';
 
 const [entry, overridesPath, sharedRoot, resultPath, upstreamDir] = process.argv.slice(2);
 // 上游常把运行状态写进 ~/.dsh；HOME 是记录用的空临时目录，预建它即可，不触碰真实用户目录。
@@ -12,7 +13,10 @@ installSharedResolution(sharedRoot, { '@magi/compat-upstream-root': upstreamDir 
 const { Context, Service } = await import('@deepseek-ai/cordis');
 const { LlmRuntime } = await import('@deepseek-ai/dsh-llm');
 const metadata = JSON.parse(readFileSync(new URL('package.json', pathToFileURL(upstreamDir + '/')), 'utf8'));
-configureProfile({ plugins: { async list() { return { plugins: [{manifest: {id:'recording.plugin', description:metadata.description}, digest:'recording', source:{kind:'upstream', location:`dsh:${metadata.name}@${metadata.version}`}, enabled:true, active:false}] }; } } }, { home: process.env.HOME + '/.dsh' });
+configureProfile({ plugins: {
+  async list() { return { plugins: [{manifest: {id:'recording.plugin', description:metadata.description}, digest:'recording', source:{kind:'upstream', location:`dsh:${metadata.name}@${metadata.version}`}, enabled:true, active:false}] }; },
+  async compatibility() { return { ...dshEnvironment(sharedRoot), revision: 0, exemptions: {} }; },
+} }, { home: process.env.HOME + '/.dsh' });
 const upstream = await withProfile(() => import(pathToFileURL(entry).href));
 
 // 记录进程由 Node 权限模型限制：没有网络、子进程、Worker、原生插件，也不能写临时目录以外的位置。
@@ -41,6 +45,7 @@ const out = { name: upstream.name ?? null, inject: upstream.inject ?? [], tools:
 const ctx = new Context();
 ctx.provide('loader', {entries:loaderEntries});
 ctx.provide('profileContext', Object.freeze({ name: 'magi', dir: profilePath() }));
+ctx.baseUrl = pathToFileURL(profilePath() + '/').href;
 // 记录上游监听的事件名：拦截类事件要在清单里静态声明为 Magi 钩子，运行期才出现的监听会被明确拒绝。
 // 通过 Cordis 自带的 `internal/listener` 事件观察，不改写 ctx.on，也不执行监听器。
 const listenerNames = new Set();
