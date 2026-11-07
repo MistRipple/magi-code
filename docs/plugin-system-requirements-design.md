@@ -311,6 +311,10 @@
 
 【现状】安装封装集中于 `scripts/compat/install/`，仅保留默认启动与槽位观察。工具、命令、模型来源和配置由 `runtime/` 适配器动态发布至 daemon；不穷举开关、不合并静态注册副本。注册设置授权覆盖本插件私有资源，合法命名空间可在真实配置重载后出现，仍逐次由 daemon 校验资源权限和 CAS。
 
+【现状·清理】旧 `translate/` 目录已移除，通用归档工具归 `core/pack.mjs`，运行期 schema 投影归 `runtime/settings-schema.mjs`。已删除无调用的静态贡献 ID／超时转换、开关全开与注册并集合并、安装期 schema 私有字段收集、重复页面格式判断，以及独立 HTML 设置页生成器和桥接。后端条件导出和包元数据读取使用同一入口；无原生页面的包复用同一 `settingsScope`、主题、语言和 iframe 生命周期。发行边界拒绝重新携带旧 `translate/` 资产。原包业务代码与页面仍保留；仅需要跨进程真实回执的业务调用进行适配。
+
+【现状·体积】本次清理后，`scripts/compat` 生产 JavaScript 为 5,306 行，测试 2,076 行，依赖锁文件 6,456 行；生产代码相对清理前主分支净减 107 行（移动文件按移动统计，不算作删除）。新增和保留的回归证据不计作运行链路重复。
+
 ### 6.2 翻译范围
 
 | 状态 | 来源与 API | 范围 | 原因与必要映射 |
@@ -738,6 +742,12 @@ Upgrader 原包追加验证了 0.0.8→0.0.7 切换并保持禁用、请求不�
 【现状·通用客户端】增量 `contributions.client` 配合独立 `client:["persistent"]` 授权，每窗口每个激活插件只加载一个隔离客户端。设置页、主页面和右栏复用该文档，通过视图上下文选择原生组件。`Element.moveBefore` 保留 iframe 与订阅；分支删除前停放到后台，停用/撤权/包摘要变化销毁旧文档。未声明客户端的普通视图仍按原页面生命周期。Web 检查 0 错误 0 警告、兼容 84/84、包客户端准入、i18n、输入端口、右栏和协议一致性通过；最新打包 Electron 运行时 59/59。
 
 【当前目标】图片格式、后台持久附件、常驻客户端和 Appshot 截图投递已形成可复用机制；完整生态分母、在线升级回滚、Windows 和 95%／100% 目标仍需继续验收。
+
+### 11.21 原包链路清理验收（2026-11-07）
+
+【现状·已运行验证】兼容回归 88/88（含默认配置不被改写、条件导出、原生页面字节保留、重复封装摘要、动态设置资源授权）；Desktop check、协议一致性、插件中心和发行边界通过。重新构建 macOS arm64 Electron 45 目录包后，打包运行时 61/61、`dsh-rea` 在线原包 16/16 通过。共享设置页另运行阴影审计，`cut:0`、`hidden:0`；该轮加审计回执为 62/62。证据在 `target/plugin-acceptance/runtime/{results.json,settings-clip.json,settings-desktop.png}` 与 `target/plugin-acceptance/dsh-rea/`。
+
+【证据边界】社区 9 样本首轮安装和运行 7 项，Upgrader、Appshot 分别遇到 registry 请求／大包读取错误；对两个样本定向重试后，Upgrader 安装、启动、原生页面和 overview 通过，Appshot 在该批次仍下载失败。随后独立运行 `test:electron-appshot`，同一在线原包成功安装，原生辅助进程、页面保存、常驻复用、停用／退出回收及重启恢复共 11/11 通过；本轮未启用真实截图触发。下载间歇性失败的根因未定位，不以成功复跑宣称网络稳定性已解决。主样本与定向结果分别保存在 `target/plugin-acceptance/popular-dsh/`、`target/plugin-acceptance/cleanup-retry/`；后者保留原分母 9，不因过滤样本缩小兼容率分母；独立 Appshot 证据在 `target/plugin-acceptance/appshot/`。完整核心业务及升级分母仍未通过，`qualified:false`，不能据此宣称 95%／100% 兼容。Windows、干净系统安装和整个生态未验收。
 
 ## 12. 验收与证据边界
 
