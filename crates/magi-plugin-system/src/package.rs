@@ -48,12 +48,15 @@ impl PluginPackage {
                 .map_err(|_| invalid("无法读取发布包文件路径"))?
                 .trim_end_matches('/')
                 .to_string();
-            if !valid_path(&name) || !names.insert(name.to_ascii_lowercase()) {
+            let native_asset = name.starts_with("extension/upstream/native/");
+            if (!valid_path(&name) && !(native_asset && valid_native_path(&name)))
+                || !names.insert(name.to_ascii_lowercase())
+            {
                 return Err(invalid("发布包包含非法、重复或大小写冲突路径"));
             }
             let mode = file.unix_mode().unwrap_or(0);
             let kind = mode & 0o170000;
-            if !matches!(kind, 0 | 0o100000 | 0o040000) || mode & 0o111 != 0 && !file.is_dir() {
+            if !matches!(kind, 0 | 0o100000 | 0o040000) || mode & 0o111 != 0 && !file.is_dir() && !native_asset {
                 return Err(invalid("发布包不得包含符号链接、特殊文件或可执行权限文件"));
             }
             if file.is_dir() {
@@ -604,6 +607,18 @@ fn valid_path(path: &str) -> bool {
         })
 }
 
+fn valid_native_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 512
+        && !path.contains('\\')
+        && path.split('/').all(|segment| {
+            !segment.is_empty()
+                && !matches!(segment, "." | "..")
+                && !segment.ends_with('.')
+                && segment.bytes().all(|c| c.is_ascii_graphic() || c == b' ')
+        })
+}
+
 const REMOVED_SDK_MESSAGE: &str =
     "该插件使用已移除的 SDK 1（QuickJS 后台）；请改用声明 extension 的 SDK 2（Node 扩展）重新打包";
 
@@ -657,12 +672,16 @@ fn validate_file(name: &str, bytes: &[u8]) -> Result<(), PluginError> {
     {
         return Err(invalid("发布包含未允许的文件类型或入口"));
     }
-    if bytes.starts_with(b"MZ")
+    // 上游翻译包可在明确的 extension/upstream/native/ 目录携带当前平台的
+    // full-trust 辅助程序（翻译器已在安装期剔除其他平台文件）。普通插件
+    // 仍然不能借发布包携带原生程序。
+    let native_asset = name.starts_with("extension/upstream/native/");
+    if !native_asset && (bytes.starts_with(b"MZ")
         || bytes.starts_with(b"\x7fELF")
         || bytes.starts_with(b"\0asm")
         || bytes.starts_with(b"\xfe\xed\xfa")
         || bytes.starts_with(b"\xcf\xfa\xed\xfe")
-        || bytes.starts_with(b"\xca\xfe\xba\xbe")
+        || bytes.starts_with(b"\xca\xfe\xba\xbe"))
     {
         return Err(invalid("发布包不得包含原生程序、字节码或 WASM 后台组件"));
     }

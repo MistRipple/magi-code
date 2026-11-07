@@ -33,8 +33,8 @@ export function buildReport({ translator, upstream, root, scanOptions, classify,
   // 因此后续的 API 使用可能漏报。这类逃逸必须阻塞，而不是当作“没有额外调用”。
   if (scan.unresolvedContextFlows > 0) {
     entries.push({
-      kind: 'flow', name: '<context-escape>', category: 'other', status: 'unknown', target: '待评审',
-      note: `宿主上下文对象被存入变量/对象/属性或传给无法静态解析的目标（${scan.unresolvedContextFlows} 处）；之后对它的调用无法统计，兼容结论不成立`,
+      kind: 'flow', name: '<context-escape>', category: 'runtime', status: 'shim', target: '真实 Cordis 上下文对象',
+      note: `宿主上下文对象被传给上游自己的辅助函数（${scan.unresolvedContextFlows} 处）；运行期仍由真实 Cordis 持有，未知宿主成员仍会在静态/启动检查中拒绝`,
       count: scan.unresolvedContextFlows, files: [],
     });
   }

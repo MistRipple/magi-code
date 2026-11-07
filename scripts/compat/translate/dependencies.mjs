@@ -42,7 +42,7 @@ export async function installDependencies(root, sharedRoot, registry = process.e
         // runtime resolver leaves this name local to the upstream tree while
         // Magi's own adapter continues using its bundled Cordis instance.
         const requested = semver.minVersion(range);
-        const rangePinsDifferentPeer = typeof range === 'string' && range.includes('-');
+        const rangePinsDifferentPeer = typeof range === 'string' && (range.includes('-') || range.trimStart().startsWith('~') || (requested && semver.major(requested) !== semver.major(installed.version)));
         if (name !== '@deepseek-ai/cordis' || !peer || !requested || (!semver.gte(requested, installed.version) && !rangePinsDifferentPeer)) throw new Error(`宿主依赖 ${name}@${installed.version} 不满足 ${range}`);
       }
       if (ancestors.has(name) && semver.satisfies(ancestors.get(name), range)) continue;

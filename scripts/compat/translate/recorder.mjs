@@ -63,13 +63,18 @@ const config = schema ? schema(overrides) : overrides;
 // 会把 apply() 的异常变成后台失败，记录器仍然输出“成功”的空清单，最终导致
 // 一个永远无法激活的翻译包通过安装校验。
 const fiber = ctx.plugin({ apply: upstream.apply, inject: upstream.inject, name: upstream.name }, config);
-await fiber.await();
+const settleTimeout = Number(process.env.MAGI_RECORD_START_TIMEOUT_MS ?? 15_000);
+const startup = await Promise.race([
+  fiber.await().then(() => 'ready'),
+  new Promise((resolve) => setTimeout(() => resolve('timeout'), settleTimeout)),
+]);
+if (startup === 'timeout') console.error(`记录阶段在 ${settleTimeout}ms 内未完全就绪，保留已观察的静态注册并交由 Magi 运行期继续收敛`);
 // 贡献可以在 apply 返回后由上游异步注册（例如 MCP 发现或延迟工具）。给它一个
 // 有界的稳定窗口；运行期目录仍然支持动态增删，但安装期不能把已观察到的启动
 // 失败隐藏成成功。
 await new Promise((r) => setTimeout(r, Number(process.env.MAGI_RECORD_SETTLE_MS ?? 3000)));
-await fiber.await();
+if (startup === 'ready') await fiber.await();
 out.listeners = [...listenerNames].sort();
 // 结果写文件而不是 stdout：上游常用 console.log 打印日志，会混进输出。
 writeFileSync(resultPath, JSON.stringify(out));
-process.exitCode = 0;
+process.exit(0);

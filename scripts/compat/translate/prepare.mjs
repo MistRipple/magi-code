@@ -6,7 +6,7 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRegistry } from '../index.mjs';
 import { packageId } from '../core/identity.mjs';
-import { findClientFile } from './client-assets.mjs';
+import { analyzeNativeClient, findClientFile } from './client-assets.mjs';
 import { resolveUpstreamIcon } from './icon.mjs';
 import { installDependencies } from './dependencies.mjs';
 import { renderSettingsPage } from './settings-page.mjs';
@@ -37,9 +37,13 @@ function copyTree(source, target) {
       if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) throw new Error(`上游含链接或特殊文件：${relative(source, full)}`);
       if (entry.isDirectory()) { visit(full); continue; }
       const name = relative(source, full).split(sep).join('/');
+      if ((name.startsWith('native/windows/') && process.platform !== 'win32')
+        || (name.startsWith('native/macos/') && process.platform !== 'darwin')
+        || (name.startsWith('native/linux/') && process.platform !== 'linux')) continue;
       if (/\.(node|wasm)$/i.test(name)) throw new Error(`上游原包或依赖包含未支持的原生模块：${name}`);
       const size = statSync(full).size; total += size;
-      if (size > 4 * 1024 * 1024 || total > 32 * 1024 * 1024 || files.length >= 4096) throw new Error('上游原包及依赖超过有界安装限制');
+      const limit = name.startsWith('native/') ? 64 * 1024 * 1024 : 4 * 1024 * 1024;
+      if (size > limit || total > 64 * 1024 * 1024 || files.length >= 4096) throw new Error('上游原包及依赖超过有界安装限制');
       const dest = join(target, 'extension/upstream', name);
       mkdirSync(dirname(dest), { recursive: true }); copyFileSync(full, dest); files.push(name);
     }
@@ -105,16 +109,37 @@ export async function prepareDsh(options) {
   writeFileSync(join(options.outDir, 'extension/index.mjs'), `import { activateDsh } from '@magi/compat-dsh';\nimport * as upstream from ${JSON.stringify(`./upstream/${main}`)};\nexport default api => activateDsh(api, upstream, ${JSON.stringify({ runtimeVersion: TRANSLATOR_VERSION, plugin: pkg.name, runtimeId: compatRuntimeId, optionalEvents })});\n`);
   mkdirSync(join(options.outDir, 'ui'), { recursive: true });
   const client = findClientFile(root, pkg);
+  let clientAnalysis = null;
   if (client) {
-    if (!/window\.__ModuleLoader__\.load\(\s*\{\s*id\s*:\s*(['"])[^'"\n]+\1\s*,\s*factory\s*:/.test(readFileSync(client.file, 'utf8'))) throw new Error('不支持的 DSH 客户端模块格式');
+    if (!/window\.__ModuleLoader__\.load\(\s*\{\s*id\s*:\s*(['"])[^'"\n]+\1\s*,\s*factory\s*(?::|\()/.test(readFileSync(client.file, 'utf8'))) throw new Error('不支持的 DSH 客户端模块格式');
+    clientAnalysis = analyzeNativeClient({ upstreamDir: root, pkg, sharedRoot: options.sharedRoot });
     copyFileSync(join(COMPAT_DIR, 'dist/dsh-client-host.js'), join(options.outDir, 'ui/host.js'));
     const assets = copyBrowserAssets(client.file, COMPAT_DIR, join(options.outDir, 'ui'));
     copyFileSync(client.file, join(options.outDir, 'ui/client.js'));
-    writeFileSync(join(options.outDir, 'ui/dsh-config.js'), `globalThis.__MAGI_DSH_CLIENT__ = ${JSON.stringify({ runtimeVersion: 2, clientScript: 'client.js', libraryScripts: assets.scripts })};\n`);
-    writeFileSync(join(options.outDir, 'ui/settings.html'), `<!doctype html>\n<meta charset="utf-8"><meta name="color-scheme" content="light dark">${assets.styles.map((file) => `<link rel="stylesheet" href="${file}">`).join('')}\n<div id="root"></div><script src="dsh-config.js"></script><script src="host.js"></script>\n`);
+    const writeClientPage = (file, slotName) => {
+      const slug = slotName ? slotName.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() : 'all';
+      const configFile = `dsh-config-${slug}.js`;
+      writeFileSync(join(options.outDir, 'ui', configFile), `globalThis.__MAGI_DSH_CLIENT__ = ${JSON.stringify({ runtimeVersion: 2, clientScript: 'client.js', libraryScripts: assets.scripts, ...(slotName ? { slotName } : {}) })};\n`);
+      writeFileSync(join(options.outDir, 'ui', file), `<!doctype html>\n<meta charset="utf-8"><meta name="color-scheme" content="light dark">${assets.styles.map((name) => `<link rel="stylesheet" href="${name}">`).join('')}\n<div id="root"></div><script src="${configFile}"></script><script src="host.js"></script>\n`);
+    };
+    const mounted = clientAnalysis?.mounted ?? [];
+    if (mounted.some((slot) => ['settings.section', 'plugins.bundle.config', 'settings.plugins.tab', 'plugins.tab'].includes(slot.name))) writeClientPage('settings.html', mounted.find((slot) => ['settings.section', 'plugins.bundle.config', 'settings.plugins.tab', 'plugins.tab'].includes(slot.name)).name);
+    for (const slot of mounted.filter((entry) => !['settings.section', 'plugins.bundle.config', 'settings.plugins.tab', 'plugins.tab'].includes(entry.name))) {
+      const slug = slot.name.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase();
+      writeClientPage(`view-${slug}.html`, slot.name);
+    }
   } else {
     writeFileSync(join(options.outDir, 'ui/settings.html'), renderSettingsPage({ schema: manifest.settingsSchema, title: manifest.name, runtimeSchema: true }));
   }
+  const slotViews = clientAnalysis?.mounted?.filter((slot) => !['settings.section', 'plugins.bundle.config', 'settings.plugins.tab'].includes(slot.name)).map((slot) => {
+    const slug = slot.name.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase();
+    const placement = slot.name === 'main' ? ['main', 'rightPane'] : ['rightPane'];
+    return { id: `slot-${slug}`.slice(0, 64), title: slot.name, entry: `ui/view-${slug}.html`, placements: placement };
+  }) ?? [];
+  const settingsView = client && clientAnalysis?.mounted?.some((slot) => ['settings.section', 'plugins.bundle.config', 'settings.plugins.tab', 'plugins.tab'].includes(slot.name))
+    ? [{ id: 'settings', title: '设置', entry: 'ui/settings.html', placements: ['settings'] }]
+    : client ? [] : [{ id: 'settings', title: '设置', entry: 'ui/settings.html', placements: ['settings'] }];
+  manifest.contributions.views = [...settingsView, ...slotViews];
   const icon = await resolveUpstreamIcon({ upstreamDir: root, pkg });
   if (icon) { writeFileSync(join(options.outDir, icon.to), icon.bytes); manifest.icon = icon.to; }
   writeFileSync(join(options.outDir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
@@ -125,7 +150,7 @@ export async function prepareDsh(options) {
     runtimeContributions: manifest.extension.runtimeContributions,
     tools: recorded.tools, commands: recorded.commands, modelSources: recorded.providers,
     routes: recorded.routes, listeners: recorded.listeners, variants: recorded.variants,
-    ui: { mode: client ? 'native' : 'generated', mountedSlots: [], unmountedSlots: [] },
+    ui: { mode: client ? 'native' : 'generated', mountedSlots: clientAnalysis?.mounted ?? [], unmountedSlots: clientAnalysis?.unmounted ?? [] },
     static: { summary: report.summary, degraded: report.entries.filter((item) => ['partial', 'dropped'].includes(item.status)) },
     files: { kept: kept.length, omitted: [] },
   };

@@ -12,13 +12,28 @@ const modules = {
   'react-dom': require('react-dom'),
   'react/jsx-runtime': require('react/jsx-runtime'),
 };
+const moduleStubs = new Map();
+const stubModule = (name) => {
+  if (!moduleStubs.has(name)) moduleStubs.set(name, new Proxy({}, { get: (_target, key) => {
+    if (key === '__esModule') return true;
+    return (..._args) => null;
+  } }));
+  return moduleStubs.get(name);
+};
 const scope = { getSnapshot: () => ({ value: {} }), subscribe: () => () => {}, set: async () => true };
 const slotContext = createSlotContext({ scope });
 let applied = false;
 // 最小的浏览器环境：模块加载时注入 <style> 的写法很常见，给一个无副作用的 document。
-const element = () => ({ dataset: {}, style: {}, appendChild() {}, remove() {}, setAttribute() {}, addEventListener() {} });
+const elements = new Map();
+const element = (tag = 'div') => {
+  const node = { tagName: tag.toUpperCase(), dataset: {}, style: {}, children: [], textContent: '',
+    appendChild(child) { this.children.push(child); if (child?.id) elements.set(child.id, child); return child; },
+    remove() { if (this.id) elements.delete(this.id); }, setAttribute(name, value) { this[name] = String(value); if (name === 'id') elements.set(this.id, this); },
+    addEventListener() {}, removeEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; } };
+  return node;
+};
 const sandbox = {
-  window: undefined, document: { querySelector: () => null, createElement: element, head: element(), body: element(), documentElement: element(), addEventListener() {}, removeEventListener() {} },
+  window: undefined, document: { querySelector: () => null, querySelectorAll: () => [], getElementById: (id) => elements.get(id) ?? null, createElement: element, createTextNode: (text) => ({ textContent: String(text) }), head: element('head'), body: element('body'), documentElement: element('html'), addEventListener() {}, removeEventListener() {} },
   navigator: { language: 'zh-CN' }, console, setTimeout, clearTimeout, setInterval, clearInterval, URL, URLSearchParams, Blob: globalThis.Blob,
   AbortController, TextEncoder, TextDecoder, queueMicrotask, fetch: () => Promise.reject(new Error('记录阶段不发送请求')),
 };
@@ -28,8 +43,9 @@ sandbox.window.removeEventListener = () => {};
 sandbox.window.__ModuleLoader__ = {
   load({ factory }) {
     const exports = factory((name) => {
-      if (!(name in modules)) throw new Error(`上游界面需要未提供的模块：${name}`);
-      return modules[name];
+      if (name in modules) return modules[name];
+      if (name.startsWith('@deepseek-ai/dsh-client-ui-')) return stubModule(name);
+      throw new Error(`上游界面需要未提供的模块：${name}`);
     });
     if (typeof exports.apply !== 'function') throw new Error('上游界面没有导出 apply');
     exports.apply(slotContext.ctx);

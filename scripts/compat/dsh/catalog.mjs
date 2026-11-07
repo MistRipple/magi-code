@@ -28,6 +28,10 @@ export const DSH_IMPLEMENTED = new Set([
 export const DSH_RULES = [
   // —— 上下文与生命周期（兼容层运行真实的 Cordis，这些调用由上游代码自身完成）——
   rule('calls', /^ctx\.(logger)(\.|$)/, { fixed: 'shim', group: 'runtime', target: 'api.log', note: '日志降级为诊断日志（最多 4096 字符，不写 canonical 日志）', source: COOKBOOK }),
+  rule('calls', /^ctx\.(baseUrl)$/, { fixed: 'shim', group: 'runtime', target: 'Magi 本机兼容地址', note: 'DSH profile 地址只用于选择 web/desktop 分支；Magi 路由仍由 daemon 统一拥有', source: COOKBOOK }),
+  rule('calls', /^ctx\.(connection|pluginManager)(\.|$)/, { fixed: 'shim', group: 'runtime', target: 'Magi daemon 已认证路由/插件投影', note: '上游可选的 Host 服务不改变 Magi 权威状态；缺少的管理动作返回明确降级', source: COOKBOOK }),
+  rule('calls', /^ctx\.(loader)(\.|$)/, { fixed: 'shim', group: 'runtime', target: '兼容加载器目录（只读）', note: '只提供当前翻译运行时的有界空/只读目录', source: COOKBOOK }),
+  rule('calls', /^ctx\.events(\.|$)/, { fixed: 'shim', group: 'runtime', target: 'Cordis 事件目录（只读）', note: '只暴露兼容层已登记的事件监听表，不提供任意宿主写入', source: COOKBOOK }),
   rule('calls', /^ctx\.(effect|fiber|on|once|collect|dispose|scope|inject|get|plugin|provide|root|parent)(\.|$)/, { fixed: 'shim', group: 'runtime', target: '真实 Cordis 运行时（兼容层内）', note: '注册与回收沿用上游 Cordis 语义', source: src('docs/cordis-api/context.md') }),
   rule('calls', /^ctx\.(emit|parallel|serial|bail|waterfall|accessor|mixin|extend|isolate|intercept|set)$/, { fixed: 'shim', group: 'runtime', target: '真实 Cordis 运行时（兼容层内）', source: src('docs/cordis-primer.md') }),
   rule('calls', /^ctx\.reflect\.(get|set|provide|accessor|mixin)$/, { fixed: 'shim', group: 'runtime', target: '真实 Cordis ReflectService', source: src('vendor/cordis/packages/core/src/reflect.ts') }),
@@ -48,10 +52,13 @@ export const DSH_RULES = [
   rule('calls', /^ctx\.systemPrompt(\.|$)/, { capability: 'hook.prompt.contribute', fidelity: 'partial', note: 'section() 可映射为带稳定性与预算的参考片段；作用域内遮蔽（shadowing）与顺序控制无对应', source: COOKBOOK, needs: '片段排序/遮蔽（会削弱“不得伪造原生系统段”不变量，不建议）' }),
 
   // —— 会话、消息、附件：Magi 内核独有 ——
-  rule('calls', /^ctx\.(agents|sessions|sessionPersistence|subagents)(\.|$)/, { capability: 'service.spawn', fidelity: 'none', group: 'session', note: '会话/Agent 对象由 Magi 内核独有；扩展只能经钩子与宿主服务提案', source: COOKBOOK, needs: '无；与“Rust daemon 是唯一事实源”冲突' }),
-  rule('calls', /^ctx\.(sessionProjections|attachments|messages|memory|goals|workflowEngine|compaction|approval|sandbox)(\.|$)/, { capability: 'service.snapshot', fidelity: 'none', group: 'session', note: '对应能力由 Magi 原生拥有（审批、压缩、目标、沙箱、附件），没有公开写入接口', source: COOKBOOK }),
+  rule('calls', /^ctx\.(agents|sessionPersistence|subagents)(\.|$)/, { capability: 'service.spawn', fidelity: 'none', group: 'session', note: '会话/Agent 对象由 Magi 内核独有；扩展只能经钩子与宿主服务提案', source: COOKBOOK, needs: '无；与“Rust daemon 是唯一事实源”冲突' }),
+  rule('calls', /^ctx\.sessions(\.|$)/, { fixed: 'shim', group: 'runtime', target: 'Magi 会话只读兼容投影', note: '仅提供有界空/只读形状，不能创建、修改或持久化会话', source: COOKBOOK }),
+  rule('calls', /^ctx\.attachments\.(readImage|saveImage|readImageRequest)$/, { fixed: 'shim', group: 'runtime', target: 'Magi 有界 blob 附件桥', note: '图片以插件私有、短时 blob 保存；不复制会话附件事实', source: COOKBOOK }),
+  rule('calls', /^ctx\.(sessionProjections|messages|memory|goals|workflowEngine|compaction|approval|sandbox)(\.|$)/, { capability: 'service.snapshot', fidelity: 'none', group: 'session', note: '对应能力由 Magi 原生拥有（审批、压缩、目标、沙箱），没有公开写入接口', source: COOKBOOK }),
   rule('calls', /^ctx\.(webServer|server)\.register$/, { capability: 'ui.route', fidelity: 'full', note: 'exact / prefix 路由，handler(req,res) 与 resource(Request) 两种形态；处理器留在宿主内，界面经视图桥调用。响应整段返回，流式响应不逐行推送', source: src('packages/host/webserver/README.md') }),
-  rule('calls', /^ctx\.(webServer|server)\.(registerUpgrade|registerFallback|tapIndex|applyIndexTaps|renderIndex|collectIndexInjections|readResource)$/, { capability: 'ui.view', fidelity: 'none', group: 'ui', note: 'WebSocket 升级、SPA 回退与 index 注入属于 DSH Web 外壳；Magi 的视图是独立页面，没有对应物', source: src('packages/host/webserver/README.md') }),
+  rule('calls', /^ctx\.(webServer|server)\.registerUpgrade$/, { fixed: 'shim', group: 'ui', target: 'Magi 受限视图桥', note: 'WebSocket 分支在已有 HTTP 路由时不会启用；兼容层不开放监听端口', source: src('packages/host/webserver/README.md') }),
+  rule('calls', /^ctx\.(webServer|server)\.(registerFallback|tapIndex|applyIndexTaps|renderIndex|collectIndexInjections|readResource)$/, { capability: 'ui.view', fidelity: 'none', group: 'ui', note: 'SPA 回退与 index 注入属于 DSH Web 外壳；Magi 的视图是独立页面，没有对应物', source: src('packages/host/webserver/README.md') }),
   rule('calls', /^ctx\.(webServer|server)(\.|$)/, { capability: 'ui.route', fidelity: 'partial', group: 'ui', note: 'webServer 的其余成员（地址、端口、协议）在 Magi 里没有意义：宿主不开放监听端口', source: src('packages/host/webserver/README.md') }),
   rule('calls', /^ctx\.(router|http)(\.|$)/, { capability: 'ui.view', fidelity: 'none', group: 'ui', note: '任意 HTTP 暴露不提供', source: src('packages/host/webserver/README.md') }),
   rule('calls', /^ctx\.(slots|locale|configForms)(\.|$)/, { capability: 'ui.native', fidelity: 'partial', group: 'ui', note: '上游自带界面原样挂载：注册在“插件配置”位置（settings.section，或较早的 plugins.bundle.config）的卡片在 Magi 设置页整页渲染；注册在 DSH 外壳其他位置（输入框、会话底栏、侧栏面板、全局提示）的槽位 Magi 没有对应位置，不渲染，构建报告逐项列出', source: SETTINGS }),
@@ -61,6 +68,9 @@ export const DSH_RULES = [
   rule('injects', /^(llm)$/, { capability: 'modelSource.publish', fidelity: 'full', source: ADAPTER }),
   rule('injects', /^(settings)$/, { capability: 'settings.schema', fidelity: 'full', source: SETTINGS }),
   rule('injects', /^(tools)$/, { capability: 'tool.register', fidelity: 'full', source: TOOL }),
+  rule('injects', /^(loader)$/, { fixed: 'shim', group: 'runtime', target: '兼容加载器目录（只读）', note: 'Magi 不暴露 DSH 的热加载器写入口，插件可安全读取空目录并按自身降级', source: COOKBOOK }),
+  rule('injects', /^(connection|pluginManager)$/, { fixed: 'shim', group: 'runtime', target: 'Magi daemon 已认证路由/插件投影', note: '仅提供请求准入与只读空投影；Magi 的安装、授权和生命周期仍由 daemon 拥有', source: COOKBOOK }),
+  rule('injects', /^(attachments|sessions)$/, { fixed: 'shim', group: 'runtime', target: 'Magi 有界只读/附件兼容服务', note: '不复制会话事实；未提供的 DSH 子能力按插件原有降级路径处理', source: COOKBOOK }),
   rule('injects', /^(commands)$/, { capability: 'command.register', fidelity: 'full', source: COOKBOOK }),
   rule('injects', /^(systemPrompt)$/, { capability: 'hook.prompt.contribute', fidelity: 'partial', note: '只能追加带稳定性与预算的参考片段；遮蔽与顺序控制无对应', source: COOKBOOK }),
   rule('injects', /^(webServer|server)$/, { capability: 'ui.route', fidelity: 'full', note: '路由注册由 Magi 的 api.route 承载；见 ctx.webServer.register', source: src('packages/host/webserver/README.md') }),
@@ -71,6 +81,8 @@ export const DSH_RULES = [
 
   // —— 事件 ——
   rule('events', /^loader\/volatile-update$/, { fixed: 'shim', group: 'settings', target: 'config.changed 通知', note: '配置热更新；兼容层已接', source: SETTINGS }),
+  rule('events', /^settings\/updated$/, { fixed: 'shim', group: 'settings', target: 'config.changed 通知', note: '映射为插件设置更新通知', source: SETTINGS }),
+  rule('events', /^plugin-manager\//, { fixed: 'shim', group: 'runtime', target: '插件管理器只读事件镜像', note: '事件只用于面板进度展示；Magi 安装事实仍由 daemon 拥有', source: COOKBOOK }),
   rule('events', /^tools\/pre-execute$/, { capability: 'hook.tool.call', fidelity: 'partial', note: 'deny→block；改参→replace（Magi 重验 schema 与权限）。allow/ask 无对应：扩展不能批准或发起审批，ask 由 Magi 原生审批接管', source: PIPELINE, needs: '无；扩展只能阻止不能批准是不变量' }),
   rule('events', /^tools\/post-execute$/, { capability: 'hook.tool.result', fidelity: 'partial', note: '可替换/阻止模型可见投影；DSH 的“附加上下文”“替换 value”无对应，原始回执不可改', source: TOOL, needs: '无；原始回执不变是不变量' }),
   rule('events', /^tools\/result$/, { capability: 'hook.tool.result', fidelity: 'partial', note: '观察冻结的最终结果；Magi 的 tool.result 在结果交给模型之前触发', source: PIPELINE }),
@@ -85,7 +97,7 @@ export const DSH_RULES = [
   rule('events', /^turn\/end$/, { capability: 'hook.turn.end', fidelity: 'partial', note: '终态事实可观察；在 turn/end 后 followup 驱动下一轮（/loop）无对应', source: COOKBOOK }),
   rule('events', /^llm\/(adapters-updated|models-updated)$/, { fixed: 'shim', group: 'llm', target: '兼容层内部使用', note: '用于重新发布模型数据源', source: ADAPTER }),
   rule('events', /^internal\/(error|warning)$/, { fixed: 'shim', group: 'runtime', target: 'api.log', source: COOKBOOK }),
-  rule('events', /^<dynamic>$/, { fixed: 'unknown', note: '事件名不是字面量，静态分析无法确定' }),
+  rule('events', /^<dynamic>$/, { fixed: 'shim', group: 'runtime', target: '受限事件注册', note: '事件名由上游运行期决定；兼容层只允许其自身服务/已登记 Magi 事件，未支持宿主事件明确降级', source: COOKBOOK }),
   rule('events', /.*/, { fixed: 'unknown', note: '文档未登记的事件' }),
 
   // —— 导入 ——

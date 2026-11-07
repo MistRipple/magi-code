@@ -13,7 +13,7 @@ import { runRestricted, withTempHome } from './sandbox.mjs';
 const SLOT_RECORDER = join(dirname(fileURLToPath(import.meta.url)), 'slot-recorder.mjs');
 // 允许作者在入口前放许可证/说明注释、使用单引号或常规空格；只接受明确的
 // DSH 懒加载调用形状，不执行猜测性的其他浏览器模块格式。
-const LOADER_SIGNATURE = /window\.__ModuleLoader__\.load\(\s*\{\s*id\s*:\s*(['"])[^'"\n]+\1\s*,\s*factory\s*:/s;
+const LOADER_SIGNATURE = /window\.__ModuleLoader__\.load\(\s*\{\s*id\s*:\s*(['"])[^'"\n]+\1\s*,\s*factory\s*(?::|\()/s;
 
 /** 上游 exports["./client"] 解析出的文件；没有声明则返回 null。 */
 export function findClientFile(upstreamDir, pkg) {

@@ -214,9 +214,9 @@ test('拦截类 API：tools/pre-execute 等不再被当作“已可翻译”，p
   assert.equal(find(report, 'tools/pre-execute').status, 'partial');
   assert.equal(find(report, 'tools/execute').status, 'dropped');
   assert.equal(find(report, 'agent/turn-stopping').status, 'dropped');
-  assert.equal(find(report, '<dynamic>').status, 'unknown');
+  assert.equal(find(report, '<dynamic>').status, 'shim');
   const blocked = report.verdict.blocked.map((entry) => entry.name);
-  for (const name of ['tools/pre-execute', 'tools/execute', 'agent/turn-stopping', '<dynamic>']) assert.ok(blocked.includes(name), `${name} 应阻塞`);
+  for (const name of ['tools/pre-execute', 'tools/execute', 'agent/turn-stopping']) assert.ok(blocked.includes(name), `${name} 应阻塞`);
 });
 
 async function piFixture(files, pkg) {
@@ -294,7 +294,7 @@ test('规则表：pi 与 dsh 引用的能力都存在；partial/dropped 的规�
   }
 });
 
-test('上下文逃逸：宿主上下文被存进对象或传给无法解析的目标时，兼容结论不成立（unknown 阻塞）', async () => {
+test('上下文传给上游辅助函数沿真实 Cordis 保留；未知宿主成员仍由规则阻断', async () => {
   const dir = await piFixture({
     'extensions/e.ts': [
       'export default function (pi) {',
@@ -306,8 +306,8 @@ test('上下文逃逸：宿主上下文被存进对象或传给无法解析的�
     ].join('\n'),
   }, {});
   const report = await createRegistry().create('pi').inspect(dir, { required: [] });
-  assert.equal(find(report, '<context-escape>').status, 'unknown');
-  assert.ok(report.verdict.blocked.some((entry) => entry.name === '<context-escape>'));
+  assert.equal(find(report, '<context-escape>').status, 'shim');
+  assert.ok(!report.verdict.blocked.some((entry) => entry.name === '<context-escape>'));
   // 同文件函数 setup(pi) 里的订阅仍被传播识别
   assert.equal(find(report, 'tool_call').status, 'partial');
 });

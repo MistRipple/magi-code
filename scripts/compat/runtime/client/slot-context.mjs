@@ -18,6 +18,16 @@ export const SLOT_POLICY = {
   'plugins.bundle.config': 'mounted',
   // 同一张卡片在 DSH 另一种行布局里的注册；Magi 只有一种页面，取 bundle.config 那份。
   'plugins.row.config': 'alternate',
+  // DSH 的完整页面与右栏页签都可以由 Magi 的视图容器承载。它们仍在
+  // 上游 iframe 中原样运行，只把入口位置映射到 Magi 的 main/rightPane。
+  'main': 'mounted',
+  'sidebar.right.pane.tab': 'mounted',
+  'settings.plugins.tab': 'mounted',
+  'plugins.tab': 'mounted',
+  'sidebar.panellist': 'alternate',
+  'sidebar.right.pane.tab.title': 'alternate',
+  'sidebar.right.tab.guide.entry': 'alternate',
+  'sidebar.footer.action': 'alternate',
 };
 
 export function slotDisposition(name) {
@@ -25,7 +35,7 @@ export function slotDisposition(name) {
 }
 
 /** 多个可渲染槽位同时存在时的取用顺序：新入口优先。 */
-export const MOUNT_PRIORITY = ['settings.section', 'plugins.bundle.config'];
+export const MOUNT_PRIORITY = ['settings.section', 'plugins.bundle.config', 'settings.plugins.tab', 'plugins.tab', 'main', 'sidebar.right.pane.tab'];
 /** 各槽位给上游组件的 surface：`settings.section` 的外壳（标题、关闭）由宿主拥有，组件只渲染内容。 */
 export const SLOT_SURFACE = { 'settings.section': 'settings' };
 
@@ -74,6 +84,20 @@ export function createSlotContext({ scope, connection, onChange = () => {} }) {
       },
     },
     effect(fn) { effects.push(fn()); },
+    // 浏览器端上游常把 slots 作为 layout/configForms 等服务的子服务注入。
+    // 这些服务不是第二套状态源：这里只暴露同一份槽位收集器与设置快照，
+    // 其他 DSH 外壳服务保持缺席，让插件按其原有可选分支降级。
+    inject(names, callback) {
+      const requested = Array.isArray(names) ? names : [names];
+      const services = {
+        slots: ctx.slots,
+        configForms,
+        locale: ctx.locale,
+        layout: { slots: ctx.slots },
+      };
+      if (requested.some((name) => !Object.hasOwn(services, name))) return;
+      return callback({ get(name) { return services[name]; }, slots: ctx.slots, configForms, locale: ctx.locale });
+    },
     get(name) { return name === 'configForms' ? configForms : name === 'connection' ? connection : undefined; },
   };
 

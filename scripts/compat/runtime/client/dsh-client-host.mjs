@@ -24,6 +24,7 @@ const CHANNEL = 'magi-plugin-v1';
  * @param {object} options
  * @param {{ kind: 'exact' | 'prefix', path: string }[]} options.routes 构建期记录的后端路由；界面只能访问这些路径
  * @param {string} [options.clientScript] 上游界面脚本相对路径，默认 client.js
+ * @param {string} [options.slotName] 只渲染这个上游槽位（右栏/主页面入口）
  */
 export function startDshClient(options) {
   const modules = { react: React, 'react-dom': ReactDOM, 'react/jsx-runtime': JsxRuntime };
@@ -171,7 +172,9 @@ export function startDshClient(options) {
   const container = document.getElementById('root');
   const root = ReactDOMClient.createRoot(container);
   const render = () => {
-    const cards = slotContext.live().filter((entry) => slotDisposition(entry.descriptor.name) === 'mounted');
+    const cards = slotContext.live().filter((entry) => options.slotName
+      ? entry.descriptor.name === options.slotName
+      : slotDisposition(entry.descriptor.name) === 'mounted');
     // 同一张卡片可能以多个槽位注册（DSH 的不同入口与行布局）；Magi 只有一种页面，按优先级取一份。
     const rank = (entry) => { const index = MOUNT_PRIORITY.indexOf(entry.descriptor.name); return index === -1 ? MOUNT_PRIORITY.length : index; };
     const card = [...cards].sort((a, b) => rank(a) - rank(b))[0];

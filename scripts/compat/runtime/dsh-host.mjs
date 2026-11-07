@@ -17,7 +17,7 @@ const freeze = (value) => {
   if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); }
   return value;
 };
-const LOCAL_EVENTS = new Set(['loader/volatile-update', 'llm/adapters-updated', 'llm/models-updated', 'llm/stream', 'tools/change', 'tools/pre-execute', 'tools/execute', 'tools/post-execute', 'tools/result']);
+const LOCAL_EVENTS = new Set(['loader/volatile-update', 'settings/updated', 'llm/adapters-updated', 'llm/models-updated', 'llm/stream', 'tools/change', 'tools/pre-execute', 'tools/execute', 'tools/post-execute', 'tools/result']);
 // DSH 的可选兼容分支会在 Magi 不提供对应事实时仍登记监听器。静态翻译报告
 // 已把这些事件标成 partial/optional；运行期必须保留“无事件可收”的降级，而不是
 // 因为一个可选 UI/会话观察器把整个插件判为失败。
@@ -41,6 +41,7 @@ export async function activateDsh(api, module, options) {
   const routes = new Set();
   const bridges = new Map();
   const sourceReleases = new Map();
+  const savedImages = new Map();
   const published = new Map();
   let stopped = false;
   let fiber;
@@ -180,7 +181,7 @@ export async function activateDsh(api, module, options) {
   const refresh = (snapshot) => {
     const operation = configUpdates.then(() => applyConfig(snapshot));
     configUpdates = operation.catch(() => {});
-    return operation;
+    return operation.then((result) => { ctx.emit('settings/updated', options.plugin, clone(snapshot.value)); return result; });
   };
   const writeSettings = async (producer) => {
     const current = await api.settings.read();
@@ -212,12 +213,40 @@ export async function activateDsh(api, module, options) {
   });
   await ctx.plugin(class extends Service {
     constructor(c) { super(c, 'attachments'); }
-    readImage(...args) { return requestAttachments.readImage(...args); }
+    async saveImage(input) {
+      if (!input || !Buffer.isBuffer(input.data) || typeof input.mediaType !== 'string') throw new Error('附件图片输入无效');
+      const ref = { attachmentId: `blob-${Math.random().toString(36).slice(2)}`, mediaType: input.mediaType, bytes: input.data.length };
+      savedImages.set(ref.attachmentId, { ref, data: Buffer.from(input.data) });
+      if (api.blob?.put) {
+        const stored = await api.blob.put({ dataBase64: input.data.toString('base64'), mediaType: input.mediaType }, input.mediaType);
+        if (stored?.ref) ref.attachmentId = stored.ref;
+      }
+      return ref;
+    }
+    async readImage(ref, signal) {
+      const local = savedImages.get(ref?.attachmentId);
+      if (local) return { ref: local.ref, data: Buffer.from(local.data) };
+      const blob = await api.blob?.get?.(ref?.attachmentId);
+      if (!blob?.value?.dataBase64) throw new Error('图片引用不存在或已过期');
+      signal?.throwIfAborted?.();
+      return { ref, data: Buffer.from(blob.value.dataBase64, 'base64') };
+    }
     readImageRequest(...args) { return requestAttachments.readImageRequest(...args); }
     imageHostPath() { return undefined; }
     fileHostPath() { return undefined; }
   });
   await ctx.plugin(LlmRuntime);
+
+  // Several widely used DSH plugins probe optional host services before
+  // deciding whether to show their panel. Keep those probes harmless and
+  // deterministic: the daemon remains the authority, while compatibility
+  // code sees the same empty/read-only shape it would see on a DSH profile
+  // without that subsystem.
+  ctx.provide('connection', { requestRejection: () => undefined });
+  ctx.provide('pluginManager', { list: () => [], entries: () => [] });
+  ctx.provide('loader', { entries: () => [] });
+  ctx.provide('sessions', { list: { getSnapshot: () => ({ sessions: [] }), subscribe: () => () => {} }, scope: () => ({ getSnapshot: () => ({}), subscribe: () => () => {} }) });
+  ctx.baseUrl = 'http://127.0.0.1';
 
   let publishing;
   let modelRevision = 0;
