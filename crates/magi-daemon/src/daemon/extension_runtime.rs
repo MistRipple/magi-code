@@ -551,6 +551,11 @@ impl ExtensionRuntime {
                 destination.push(part);
             }
             write_if_absent(&destination, bytes)?;
+            #[cfg(unix)]
+            if package.extension_file_is_executable(name) {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o755))?;
+            }
             found_entry |= name == "extension/index.mjs";
         }
         if !found_entry {
@@ -726,6 +731,68 @@ export default async function activate(api) {
             bus,
             runtime,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn materialized_native_helper_executes_and_assets_stay_non_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = fixture(None);
+        let manifest = serde_json::to_value(package().manifest()).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes, mode) in [
+            (
+                "manifest.json",
+                serde_json::to_vec(&manifest).unwrap(),
+                0o644,
+            ),
+            (
+                "extension/index.mjs",
+                b"export default () => {};".to_vec(),
+                0o644,
+            ),
+            (
+                "extension/upstream/native/helper",
+                b"#!/bin/sh\nprintf native-helper-ok".to_vec(),
+                0o755,
+            ),
+            (
+                "extension/upstream/native/data",
+                b"plain data".to_vec(),
+                0o644,
+            ),
+        ] {
+            writer
+                .start_file(
+                    name,
+                    zip::write::SimpleFileOptions::default().unix_permissions(mode),
+                )
+                .unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        let package = PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap();
+        let (_, entry) = fixture.runtime.materialize("acme.guard", &package).unwrap();
+        let helper = entry.parent().unwrap().join("upstream/native/helper");
+        let result = std::process::Command::new(&helper).output().unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout, b"native-helper-ok");
+        assert_eq!(
+            std::fs::metadata(entry.parent().unwrap().join("upstream/native/data"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        // 重用已落盘的同摘要目录时也恢复执行权限。
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o644)).unwrap();
+        fixture.runtime.materialize("acme.guard", &package).unwrap();
+        assert!(
+            std::process::Command::new(helper)
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     fn activate(fixture: &Fixture, package: &PluginPackage) {

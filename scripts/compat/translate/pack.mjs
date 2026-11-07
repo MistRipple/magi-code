@@ -48,7 +48,7 @@ export function packPlugin(directory, output) {
     chunks.push(local, nameBytes, packed);
     const entry = Buffer.alloc(46);
     entry.writeUInt32LE(0x02014b50, 0);
-    entry.writeUInt16LE(20, 4);
+    entry.writeUInt16LE((3 << 8) | 20, 4); // Unix 文件属性，不复制原包的特殊权限。
     entry.writeUInt16LE(20, 6);
     entry.writeUInt16LE(0x0800, 8);
     entry.writeUInt16LE(8, 10);
@@ -58,6 +58,8 @@ export function packPlugin(directory, output) {
     entry.writeUInt32LE(packed.length, 20);
     entry.writeUInt32LE(data.length, 24);
     entry.writeUInt16LE(nameBytes.length, 28);
+    const executable = name.startsWith('extension/upstream/native/') && (statSync(join(root, name)).mode & 0o111) !== 0;
+    entry.writeUInt32LE(((executable ? 0o100755 : 0o100644) << 16) >>> 0, 38);
     entry.writeUInt32LE(offset, 42);
     central.push(entry, nameBytes);
     offset += local.length + nameBytes.length + packed.length;

@@ -3,6 +3,8 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { launchApp, connectAppPage, connectTarget, pageTools, waitFor } from './lib/electron-harness.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -12,7 +14,17 @@ const origin = `http://127.0.0.1:${port}`, work = await mkdtemp(join(tmpdir(), '
 const output = join(root, 'target/plugin-acceptance/appshot');
 await mkdir(output, { recursive: true });
 const errors = [], evidence = { package: 'dsh-plugin-appshot@0.4.2', work, checks: [], core: 'unverified' };
+const execFileAsync = promisify(execFile), logs = [];
 let app, page, frame, id, session;
+async function nativeProcesses() {
+  const { stdout } = await execFileAsync('ps', ['-ax', '-o', 'pid=,ppid=,command=']);
+  return stdout.split('\n').filter(line => line.includes(work.replace(/^\/var\//, '/private/var/')) || line.includes(work))
+    .filter(line => line.includes('/Contents/MacOS/appshot-macos')).map(line => line.trim());
+}
+async function stop() {
+  if (!app) return;
+  await app.stop(); logs.push(...app.log); app = null;
+}
 async function api(path, body) {
   const response = await fetch(origin + path, { method: body === undefined ? 'GET' : 'POST', headers: { origin, 'content-type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(240_000) });
   const value = await response.json();
@@ -59,6 +71,7 @@ try {
   const installed = await api('/api/plugins/upstream/install', { ecosystem: 'dsh', package: 'dsh-plugin-appshot', version: '0.4.2', expectedDigest: preview.candidate.digest });
   const plugin = installed.plugins.find(p => p.source?.location === 'dsh:dsh-plugin-appshot@0.4.2'); id = plugin.manifest.id;
   await api(pluginPath() + '/enable', {}); await api(pluginPath() + '/authorize', { grants: plugin.manifest.permissions }); await api(pluginPath() + '/activate', {}); await running();
+  await check('原包原生辅助进程启动', () => waitFor(async () => { const processes = await nativeProcesses(); return processes.length === 1 && processes; }, 'Appshot 原生辅助进程'));
   await openSettings();
   await check('原包页面保存声音开关', async () => {
     await frame.evaluate(`document.querySelector('input[type=checkbox]').click()`);
@@ -69,11 +82,15 @@ try {
   frame.close(); frame = null;
   await page.call('Page.navigate', { url: `${origin}/web.html?scope=personal&sessionId=${encodeURIComponent(session)}` });
   await check('关闭页面后配置仍在', async () => { assert.equal((await config()).soundEnabled, false); return config(); });
-  await api(pluginPath() + '/deactivate', {}); await api(pluginPath() + '/activate', {}); await running();
+  await api(pluginPath() + '/deactivate', {});
+  await check('停用回收原生辅助进程', () => waitFor(async () => !(await nativeProcesses()).length, '原生辅助进程回收'));
+  await api(pluginPath() + '/activate', {}); await running();
   await check('停用再激活恢复配置', async () => { assert.equal((await config()).soundEnabled, false); return config(); });
-  page.close(); page = null; await app.stop(); app = null;
+  page.close(); page = null; await stop();
+  await check('退出应用回收原生辅助进程', () => waitFor(async () => !(await nativeProcesses()).length, '退出回收辅助进程'));
   await start();
   await api(pluginPath() + '/activate', {}); await running();
+  await check('重启后恢复原生辅助进程', () => waitFor(async () => { const processes = await nativeProcesses(); return processes.length === 1 && processes; }, '重启后辅助进程'));
   await check('应用重启恢复配置', async () => { assert.equal((await config()).soundEnabled, false); return config(); });
   await openSettings();
   await check('原包页面恢复持久开关', async () => { assert.equal(await frame.evaluate(`document.querySelector('input[type=checkbox]').checked`), false); return true; });
@@ -82,6 +99,7 @@ try {
 } catch (error) { evidence.error = error.stack; console.error(error); process.exitCode = 1; }
 finally {
   evidence.rendererErrors = errors;
-  frame?.close(); page?.close(); await app?.stop();
+  frame?.close(); page?.close(); await stop();
+  await writeFile(join(output, 'electron.log'), logs.join(''));
   await writeFile(join(output, 'results.json'), JSON.stringify(evidence, null, 2));
 }

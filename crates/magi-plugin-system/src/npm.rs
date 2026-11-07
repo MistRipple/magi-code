@@ -33,7 +33,9 @@ pub fn verify_integrity(tarball: &[u8], integrity: &str) -> Result<(), PluginErr
     }
     let actual = Sha512::digest(tarball);
     if actual.as_slice() != expected.as_slice() {
-        return Err(invalid("上游 tarball 的摘要与 registry 公布的 integrity 不一致"));
+        return Err(invalid(
+            "上游 tarball 的摘要与 registry 公布的 integrity 不一致",
+        ));
     }
     Ok(())
 }
@@ -89,8 +91,19 @@ pub fn unpack_tarball(tarball: &[u8], target: &Path) -> Result<(), PluginError> 
         if bytes.len() as u64 != size {
             return Err(invalid("上游 tarball 文件大小与头部声明不符"));
         }
-        // 不使用 tar 的 unpack：它会保留可执行位等权限，而这里只需要内容。
+        // 不使用 tar 的 unpack：只为已分区的原生辅助文件保留执行意图，
+        // 不恢复 setuid/setgid、任意写入权限或普通 JS 文件的执行位。
         std::fs::write(&destination, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let executable =
+                relative.starts_with("native") && entry.header().mode().unwrap_or(0) & 0o111 != 0;
+            std::fs::set_permissions(
+                &destination,
+                std::fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 }),
+            )?;
+        }
     }
     if !target.join("package.json").is_file() {
         return Err(invalid("上游 tarball 缺少 package/package.json"));
@@ -166,6 +179,41 @@ mod tests {
             std::fs::read(dir.path().join("lib/index.js")).unwrap(),
             b"export {}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_execution_intent_survives_unpack_without_special_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        for (name, mode) in [
+            ("package/package.json", 0o755),
+            ("package/native/linux/helper", 0o6751),
+            ("package/native/linux/data", 0o644),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(2);
+            header.set_mode(mode);
+            header.set_cksum();
+            builder.append_data(&mut header, name, &b"{}"[..]).unwrap();
+        }
+        let tarball = builder.into_inner().unwrap().finish().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        unpack_tarball(&tarball, dir.path()).unwrap();
+        for (name, mode) in [
+            ("package.json", 0o644),
+            ("native/linux/helper", 0o755),
+            ("native/linux/data", 0o644),
+        ] {
+            assert_eq!(
+                std::fs::metadata(dir.path().join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                mode
+            );
+        }
     }
 
     #[test]

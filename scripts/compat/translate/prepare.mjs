@@ -1,7 +1,7 @@
 // 上游原包的安装封装。静态扫描先做准入；随后在受限记录器中启动一次真实
 // Cordis，只记录准入证据。安装后的原包由 daemon 管理的 Node 宿主运行，
 // 动态贡献仍在运行期发布，不把记录器输出当作完整业务验收。
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,11 +46,13 @@ function copyTree(source, target) {
         || (name.startsWith('native/macos/') && process.platform !== 'darwin')
         || (name.startsWith('native/linux/') && process.platform !== 'linux')) continue;
       if (/\.(node|wasm)$/i.test(name)) throw new Error(`上游原包或依赖包含未支持的原生模块：${name}`);
-      const size = statSync(full).size; total += size;
+      const sourceStat = statSync(full), size = sourceStat.size; total += size;
       const limit = name.startsWith('native/') ? 64 * 1024 * 1024 : 4 * 1024 * 1024;
       if (size > limit || total > 64 * 1024 * 1024 || files.length >= 4096) throw new Error('上游原包及依赖超过有界安装限制');
       const dest = join(target, 'extension/upstream', name);
-      mkdirSync(dirname(dest), { recursive: true }); copyFileSync(full, dest); files.push(name);
+      mkdirSync(dirname(dest), { recursive: true }); copyFileSync(full, dest);
+      if (name.startsWith('native/') && (sourceStat.mode & 0o111)) chmodSync(dest, 0o755);
+      files.push(name);
     }
   };
   visit(source); return files;

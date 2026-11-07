@@ -10,6 +10,31 @@ const fixture = fileURLToPath(new URL('./fixtures/mini-dsh', import.meta.url));
 const cli = fileURLToPath(new URL('./cli.mjs', import.meta.url));
 const find = (report, name) => report.entries.find((entry) => entry.name === name);
 
+test('可复现归档只携带原生辅助文件的执行意图，普通源码不会继承执行位', async (t) => {
+  const { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { packPlugin } = await import('./translate/pack.mjs');
+  const root = mkdtempSync(join(tmpdir(), 'magi-pack-modes-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const tree = join(root, 'package'); mkdirSync(join(tree, 'extension/upstream/native/linux'), { recursive: true });
+  writeFileSync(join(tree, 'manifest.json'), JSON.stringify({ id: 'fixture.native', version: '1.0.0' }));
+  for (const [name, mode] of [['extension/index.mjs', 0o755], ['extension/upstream/native/linux/helper', 0o755], ['extension/upstream/native/linux/data', 0o644]]) {
+    writeFileSync(join(tree, name), name); chmodSync(join(tree, name), mode);
+  }
+  const first = join(root, 'first.zip'), second = join(root, 'second.zip');
+  packPlugin(tree, first); packPlugin(tree, second);
+  const bytes = readFileSync(first); assert.deepEqual(bytes, readFileSync(second));
+  const entries = new Map();
+  for (let offset = 0; offset < bytes.length - 46; offset++) if (bytes.readUInt32LE(offset) === 0x02014b50) {
+    const name = bytes.subarray(offset + 46, offset + 46 + bytes.readUInt16LE(offset + 28)).toString();
+    entries.set(name, bytes.readUInt32LE(offset + 38) >>> 16);
+  }
+  assert.equal(entries.get('extension/index.mjs') & 0o7777, 0o644);
+  assert.equal(entries.get('extension/upstream/native/linux/helper') & 0o7777, process.platform === 'win32' ? 0o644 : 0o755);
+  assert.equal(entries.get('extension/upstream/native/linux/data') & 0o7777, 0o644);
+});
+
 async function inspectOptional(t, code) {
   const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');

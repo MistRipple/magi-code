@@ -24,6 +24,7 @@ pub struct PluginPackage {
     digest: String,
     archive: Vec<u8>,
     files: BTreeMap<String, Vec<u8>>,
+    executable_files: HashSet<String>,
 }
 
 impl PluginPackage {
@@ -37,6 +38,7 @@ impl PluginPackage {
             return Err(invalid("发布包文件数量超限"));
         }
         let mut files = BTreeMap::new();
+        let mut executable_files = HashSet::new();
         let mut names = HashSet::new();
         let mut total = 0usize;
         for index in 0..archive.len() {
@@ -63,6 +65,9 @@ impl PluginPackage {
             }
             if file.is_dir() {
                 continue;
+            }
+            if mode & 0o111 != 0 {
+                executable_files.insert(name.clone());
             }
             let limit = file_limit(&name);
             if file.size() > limit as u64 {
@@ -118,6 +123,7 @@ impl PluginPackage {
             digest: magi_core::hex_lower(Sha256::digest(bytes)),
             archive: bytes.to_vec(),
             files,
+            executable_files,
         })
     }
 
@@ -135,6 +141,10 @@ impl PluginPackage {
     }
     pub fn files(&self) -> &BTreeMap<String, Vec<u8>> {
         &self.files
+    }
+    /// 仅准入包中显式携带执行位的原生辅助文件；路径与普通文件类型已在解包时核对。
+    pub fn extension_file_is_executable(&self, name: &str) -> bool {
+        self.executable_files.contains(name)
     }
     pub(crate) fn archive_bytes(&self) -> &[u8] {
         &self.archive
