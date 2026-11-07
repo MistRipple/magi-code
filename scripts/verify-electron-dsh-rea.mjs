@@ -55,10 +55,11 @@ try {
     && svg.includes('<svg') && await page.evaluate('document.querySelector(".pane-icon img")?.naturalWidth > 0'));
   await snapshot('online-svg');
   await ui.click('[data-testid=plugin-detail-install]');
-  await waitFor(async () => {
-    if (await ui.exists('[data-testid=plugin-candidate]')) return true;
-    const error = await ui.text('[data-testid=plugin-message]'); if (error) throw new Error(error);
+  const preview = await waitFor(async () => {
+    if (await ui.exists('[data-testid=plugin-candidate]')) return { ok: true };
+    const error = await ui.text('[data-testid=plugin-message]'); return error && { error };
   }, '真实在线翻译预览', 180_000);
+  assert.ok(preview.ok, preview.error);
   report.check('在线翻译原包成功并展示权限预览', /sha512-/.test(await ui.text('[data-testid=plugin-candidate]')));
   await ui.click('[data-action=confirm-candidate]');
   const plugin = await waitFor(installed, '原包安装完成', 180_000); pluginId = plugin.manifest.id;

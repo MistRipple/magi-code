@@ -3102,6 +3102,14 @@
           "type": "string",
           "maxLength": 2048
         },
+        "headers": {
+          "type": "object",
+          "maxProperties": 64,
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 8192
+          }
+        },
         "body": {}
       }
     },

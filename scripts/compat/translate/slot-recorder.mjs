@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { readFileSync, writeFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { createSlotContext, slotDisposition } from '../runtime/client/slot-context.mjs';
+import { browserLibraries } from '../runtime/client/modules.mjs';
 
 const [clientFile, sharedRoot, resultPath] = process.argv.slice(2);
 const require = createRequire(`${sharedRoot}/__shared__.cjs`);
@@ -12,17 +13,11 @@ const modules = {
   'react-dom': require('react-dom'),
   'react/jsx-runtime': require('react/jsx-runtime'),
 };
-const moduleStubs = new Map();
-const stubModule = (name) => {
-  if (!moduleStubs.has(name)) moduleStubs.set(name, new Proxy({}, { get: (_target, key) => {
-    if (key === '__esModule') return true;
-    return (..._args) => null;
-  } }));
-  return moduleStubs.get(name);
-};
-const scope = { getSnapshot: () => ({ value: {} }), subscribe: () => () => {}, set: async () => true };
+const snapshot = { status: 'ready', value: {}, base: {}, user: {}, writable: false, revision: 0 };
+const scope = { getSnapshot: () => snapshot, subscribe: () => () => {}, set: async () => false };
 const slotContext = createSlotContext({ scope });
 let applied = false;
+let initialized;
 // 最小的浏览器环境：模块加载时注入 <style> 的写法很常见，给一个无副作用的 document。
 const elements = new Map();
 const element = (tag = 'div') => {
@@ -33,28 +28,52 @@ const element = (tag = 'div') => {
   return node;
 };
 const sandbox = {
-  window: undefined, document: { querySelector: () => null, querySelectorAll: () => [], getElementById: (id) => elements.get(id) ?? null, createElement: element, createTextNode: (text) => ({ textContent: String(text) }), head: element('head'), body: element('body'), documentElement: element('html'), addEventListener() {}, removeEventListener() {} },
-  navigator: { language: 'zh-CN' }, console, setTimeout, clearTimeout, setInterval, clearInterval, URL, URLSearchParams, Blob: globalThis.Blob,
+  window: undefined, document: { compatMode: 'CSS1Compat', querySelector: () => null, querySelectorAll: () => [], getElementById: (id) => elements.get(id) ?? null, createElement: element, createTextNode: (text) => ({ textContent: String(text) }), head: element('head'), body: element('body'), documentElement: element('html'), addEventListener() {}, removeEventListener() {} },
+  navigator: { language: 'zh-CN', userAgent: '', platform: process.platform }, console, setTimeout, clearTimeout, setInterval, clearInterval, URL, URLSearchParams, Blob: globalThis.Blob,
   AbortController, TextEncoder, TextDecoder, queueMicrotask, fetch: () => Promise.reject(new Error('记录阶段不发送请求')),
+  __MAGI_DSH_MODULES__: modules,
 };
 sandbox.window = sandbox;
 sandbox.window.addEventListener = () => {};
 sandbox.window.removeEventListener = () => {};
+const context = vm.createContext(sandbox);
+const browserManifest = JSON.parse(readFileSync(`${sharedRoot}/dist/browser-modules.json`, 'utf8'));
+const loadLibrary = (name) => {
+  // 与真实页面共用随包预构建模块。不能用“任何导出都返回 null”的替身：
+  // 上游 apply 中构造 SettingsFormModel 等真实服务时会失败或漏掉注册。
+  for (const library of browserLibraries([name])) {
+    if (Object.hasOwn(modules, library.name)) continue;
+    for (const file of browserManifest[library.name] ?? []) {
+      if (!file.endsWith('.js')) continue;
+      if (!/^[a-z0-9-]+\.js$/.test(file)) throw new Error('浏览器模块路径无效');
+      vm.runInContext(readFileSync(`${sharedRoot}/dist/${file}`, 'utf8'), context, { timeout: 20_000, filename: file });
+    }
+    if (!Object.hasOwn(modules, library.name)) throw new Error(`浏览器模块没有初始化：${library.name}`);
+  }
+  return modules[name];
+};
 sandbox.window.__ModuleLoader__ = {
   load({ factory }) {
     const exports = factory((name) => {
       if (name in modules) return modules[name];
-      if (name.startsWith('@deepseek-ai/dsh-client-ui-')) return stubModule(name);
-      throw new Error(`上游界面需要未提供的模块：${name}`);
+      return loadLibrary(name);
     });
     if (typeof exports.apply !== 'function') throw new Error('上游界面没有导出 apply');
-    exports.apply(slotContext.ctx);
+    initialized = Promise.resolve(exports.apply(slotContext.ctx));
+    initialized.catch(() => {});
     applied = true;
   },
 };
-vm.runInNewContext(readFileSync(clientFile, 'utf8'), sandbox, { timeout: 20_000 });
+vm.runInContext(readFileSync(clientFile, 'utf8'), context, { timeout: 20_000 });
 if (!applied) throw new Error('上游界面没有调用 __ModuleLoader__.load');
-const slots = new Map();
-for (const entry of slotContext.live()) slots.set(entry.descriptor.name, (slots.get(entry.descriptor.name) ?? 0) + 1);
-writeFileSync(resultPath, JSON.stringify([...slots].map(([name, count]) => ({ name, count, disposition: slotDisposition(name) }))));
+await initialized;
+const labelOf = (label) => { const value = typeof label === 'function' ? label() : label; return typeof value === 'string' && value ? value : undefined; };
+const slots = slotContext.live().map(({ descriptor }) => {
+  const { name } = descriptor;
+  const key = String(descriptor.key ?? descriptor.id ?? '');
+  const tab = slotContext.tabTypes().find((item) => item.id === key);
+  const navigation = slotContext.live().find((item) => item.descriptor.name === 'sidebar.panellist' && item.descriptor.id === key);
+  return { name, key, label: labelOf(descriptor.label ?? tab?.title ?? navigation?.descriptor.label), count: 1, disposition: slotDisposition(name) };
+});
+writeFileSync(resultPath, JSON.stringify(slots));
 process.exit(0);

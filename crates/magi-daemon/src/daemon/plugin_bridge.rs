@@ -346,6 +346,7 @@ impl magi_api::PluginRouteExecutor for NodeRouteExecutor {
                 "method": method,
                 "path": request.path,
                 "query": request.query.unwrap_or_default(),
+                "headers": request.headers,
                 "body": request.body,
             });
             // 在独立任务里等待宿主：外层请求被丢弃时由 CancelOnDrop 触发取消，

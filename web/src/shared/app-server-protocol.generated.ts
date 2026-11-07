@@ -866,6 +866,7 @@ export interface PluginRouteCallRequest {
   method: PluginRouteMethod;
   path: string;
   query?: string;
+  headers?: Record<string, unknown>;
   body?: unknown;
 }
 

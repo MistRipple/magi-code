@@ -328,6 +328,18 @@ impl HostService for PluginHostService {
                     .map_err(map_error)?;
             }
             let result = match method.as_str() {
+                "plugins.list" => {
+                    if params.as_object().is_none_or(|object| !object.is_empty()) {
+                        return Err(RpcError::new(
+                            ErrorKind::InvalidParams,
+                            "plugins.list 不接受参数",
+                        ));
+                    }
+                    // 复用既有目录 DTO，配置和资源不在此投影中；每次读取当前 manager，
+                    // 不在 Node 端建立安装状态缓存或另一份插件清单。
+                    return serde_json::to_value(manager_guard.projection().map_err(map_error)?)
+                        .map_err(|error| RpcError::new(ErrorKind::Internal, error.to_string()));
+                }
                 "catalog.replace" => {
                     #[derive(serde::Deserialize)]
                     #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -678,6 +690,27 @@ mod tests {
         service
             .request_with_identity("acme.services".into(), method.into(), params)
             .await
+    }
+
+    #[tokio::test]
+    async fn plugin_directory_reads_current_manager_and_rejects_disabled_instances() {
+        let (_dir, service) = fixture();
+        let listed = call(&service, "plugins.list", json!({})).await.unwrap();
+        assert_eq!(listed["plugins"][0]["manifest"]["id"], "acme.services");
+        assert_eq!(listed["plugins"][0]["active"], true);
+        assert!(listed["plugins"][0].get("settings").is_none());
+        assert!(
+            call(&service, "plugins.list", json!({"unknown": true}))
+                .await
+                .is_err()
+        );
+        service
+            .manager
+            .lock()
+            .unwrap()
+            .deactivate("acme.services")
+            .unwrap();
+        assert!(call(&service, "plugins.list", json!({})).await.is_err());
     }
 
     #[tokio::test]

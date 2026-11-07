@@ -556,6 +556,41 @@
 
 这组结果说明兼容门禁正在拦截真实生态中的版本、宿主服务、动态事件、上下文逃逸和客户端格式差异；`dsh-plugin-release-probe` 提供了除 WorkBuddy、dsh-rea 外的第三个真实安装运行样本。审计结果保存在 `target/plugin-acceptance/popular-dsh/results.json`。
 
+### 11.8 功能验收与右栏原生页面补全（2026-11-07）
+
+【目标】用户要求至少 95% 的 DSH 插件正常在线安装并完成核心功能；提供运行页面的插件须能在 Magi 右栏实际使用，原页面代码保持不变。该比例是后续退出条件，当前未达到，也不能用少量样本的启动成功率代替。固定生态包版本与分母、安装、核心行为、页面、升级分别留证；未知和未测不计成功。
+
+【现状·已运行验证】本轮沿原有兼容层和视图桥补全以下通用合同：
+
+- 原生客户端记录等待异步 `apply`；提供 `sidebarRight`／`sidebarRightTabs` 的界面注册与受控导航。页面身份包含槽位名和上游 key/id，同一槽位的多个页面各有独立清单入口，不再只取第一项。页签名称取上游声明；设置页、完整页面、右栏页签继续由未经修改的上游页面渲染。
+- 记录器加载与真实页面相同的随包预构建浏览器模块，移除“任意导出都返回 null”的 UI 库替身。REA 原包在 `apply` 中构造真实 `SettingsFormModel` 的路径由此恢复；未知模块仍明确失败，不能以空组件完成准入。
+- `PluginRouteCallRequest` 增加可选应用请求头，原生页面自带的鉴权头能到达其 Node／Fetch 处理器；宿主身份、代理和传输头不能覆盖。opaque-origin iframe 的 localStorage／sessionStorage 通过按插件 ID 隔离的界面缓存桥访问，不开放同源权限，不借此存储 daemon 业务事实。
+- `api.plugins.list()` 每次读取 daemon 的真实目录；DSH 的 `listBundles`、`registries` 映射到真实包来源、版本和启用状态，不生成第二份 DSH profile。安装、升级和生命周期写操作尚未映射，目录明确标注只读管理边界。删除空 loader／sessions 服务，必需依赖缺失不再假装启动成功；对应兼容报告改为未完成或部分支持。
+
+【现状·已运行验证】macOS arm64 目录包（真实 Electron Main、sidecar、随包 Node／compat）验证：
+
+| 验证 | 本轮结果与边界 |
+| --- | --- |
+| `npm run test:compat` | 51 项通过，含异步/条件多面板、身份碰撞、页面存储、应用请求头、真实插件目录与必需服务缺失回归 |
+| `npm run test:electron-plugin-runtime` | 22 项通过：原有配置／工具／模型链路，加两个独立右栏原生页面、页面跳转、真实后端动作与请求头、跨页面界面缓存、宿主键隔离、390px、停用回收；这是机制夹具，不计为真实生态包兼容率 |
+| `npm run test:electron-workbuddy` | 在线原包 `dsh-connect-workbuddy@5.20.2` 11 项通过，含原生设置页、本机真实登录态及 `hy3` 模型调用、停用与重激活 |
+| `npm run test:electron-dsh-rea` | 原包 16 项通过，真实 MCP 207 个工具、真实 UI 库构造与原生设置页、Ghidra 外链、CAS 保存／配置重载、390px 和停用／重激活；没有执行 Ghidra 二进制分析 |
+| daemon 定向回归 | 插件目录读取与停用拒绝、路由透传／准入／取消各 1 项通过 |
+| Web／协议 | Web 类型检查 0 错误 0 警告；right-pane、plugin-store golden 和 protocol:check 通过。仅修改的 Rust 文件格式通过；全仓 fmt 检查仍有本轮未修改文件的既有差异 |
+
+【现状·已运行验证·未达标】9 个固定社区样本重新在线安装并打开真实页面后：7 个安装、启动及页面加载通过，5 个安全后端探测通过，无未捕获页面异常；**没有任何一个样本完成“全部核心业务＋升级”的完整验收**，脚本以退出码 1 报告未达到门槛。不能把 7/9 或页面无异常解释为生态兼容率。
+
+- `dsh-plugin-ops-bundle@0.20.8` 的健康页面及右栏沙箱页面均可显示，沙箱状态读取真实成功；健康扫描仍缺少 `listVersionExemptions` 等管理能力，沙箱启动／安装／修复未通过功能验收。
+- `dsh-plugin-share@0.2.5` 已从 daemon 读取真实已安装包，真实导出组合码、解析及二维码生成通过；导入、升级与生命周期写操作仍未完成。
+- `dsh-plugin-upgrader@1.8.0` 已显示 daemon 的真实插件目录，消除了 `listBundles is not a function`；仍只读，不能把列表显示或 HTTP 200 计为升级成功。
+- `dsh-plugin-health@3.0.5` 页面可显示，但其 DSH profile 文件扫描未映射到 Magi；`dsh-plugin-debugging@0.7.2` 的页面及工具登记可用，工具业务未逐项验证；`dsh-plugin-release-probe@0.0.8` 仅完成安装、启动和设置页显示。
+- `@99galaxy/dsh-plugin-market@1.2.2` 的原始完整页面可在右栏打开并读取真实目录；安装与 profile 重载动作未验收。
+- `dsh-plugin-mgr@0.2.12` 的必需 loader、`dsh-plugin-appshot@0.4.2` 的必需 sessions 尚未完整实现，本轮明确阻止安装。此前“running”来自空服务，不能沿用为功能通过证据。Appshot 的浏览器存储加载错误已通过通用桥修复，但其会话投递能力仍待接线。
+
+证据：`target/plugin-acceptance/popular-dsh/{results.json,coverage.json,electron.log}` 及各原生页面截图；右栏机制为 `target/plugin-acceptance/runtime/{results.json,panel-first.png,panel-second.png,panel-390.png}`；WorkBuddy 为 `target/plugin-acceptance/workbuddy/`，REA 为 `target/plugin-acceptance/dsh-rea/`。验收脚本现在区分安装、启动、页面、后端探测、完整业务和升级，未完成项保留 unverified；逐包清理沿停用、禁用、卸载顺序，不吞掉清理失败。证据保存在构建目录，未纳入版本库。
+
+Windows、手机触摸、完整生态分母及 95% 目标均未验收。后续须补齐 daemon 原生会话投影、插件管理写操作、profile/loader 语义与业务级回归，不能靠添加空服务或跳过失败提高比例。
+
 ## 12. 验收与证据边界
 
 ### 12.1 已运行验证

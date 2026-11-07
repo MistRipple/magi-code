@@ -59,6 +59,33 @@ function host(value = {}) {
 }
 
 const options = { runtimeVersion: 2, plugin: 'fixture' };
+
+test('DSH 插件目录读取 daemon 当前事实，保留作用域包名、版本和停用状态，不伪造空列表或写入口', async () => {
+  const { createPluginManager } = await import('./runtime/plugin-manager.mjs');
+  let enabled = true;
+  const manager = createPluginManager({ plugins: { async list() { return { plugins: [
+    { manifest: { name: 'Scoped plugin', description: 'description' }, source: { kind: 'upstream', location: 'dsh:@scope/sample@1.2.3' }, enabled, active: false },
+    { manifest: { name: 'Native' }, source: { kind: 'local', location: 'native.zip' }, enabled: true, active: true },
+  ] }; } } }, 'https://registry.npmjs.org');
+  const first = await manager.listBundles();
+  assert.equal(first.length, 1); assert.equal(first[0].name, '@scope/sample');
+  assert.equal(first[0].removable, true, '原生管理入口可移除；DSH 写操作不会被伪造');
+  assert.equal(first[0].version, '1.2.3'); assert.equal(first[0].enabled, true);
+  enabled = false;
+  assert.equal((await manager.listBundles())[0].enabled, false);
+  assert.equal(manager.installBundle, undefined, '没有实施的写操作不冒充可用能力');
+  assert.deepEqual(await manager.registries(), { registry: 'https://registry.npmjs.org' });
+});
+
+test('未接入的 loader 和 sessions 不再以空服务满足必需依赖', async (t) => {
+  const h = host();
+  const running = await activateDsh(h.api, { apply(ctx) {
+    assert.equal(ctx.get('sessions', false), undefined);
+    assert.equal(ctx.get('loader', false), undefined);
+  } }, options);
+  t.after(() => running.dispose());
+  for (const dependency of ['loader', 'sessions']) await assert.rejects(activateDsh(host().api, { inject: [dependency], apply() { assert.fail('必需服务缺失不能启动'); } }, options), /缺少必需服务/);
+});
 const execution = () => ({ invocationId: 'test-call', signal: new AbortController().signal });
 const tool = (name, execute = async () => 'ok') => ({
   name, description: name, parameters: { type: 'object' }, execute,

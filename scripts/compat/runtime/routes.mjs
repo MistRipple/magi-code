@@ -11,6 +11,21 @@ import { Readable } from 'node:stream';
 export const MAX_ROUTE_BODY_BYTES = 3 * 1024 * 1024;
 const JSON_TYPE = /(^|[/+])json(\s*;|$)/i;
 
+// 只传递插件页面自己提供的应用头；宿主身份与传输头由消息桥拥有。
+// 不转发 Magi HTTP 请求的 Cookie、Bearer 或 Origin。
+export function routeHeaders(input) {
+  const values = input ?? {};
+  if (typeof values !== 'object' || Array.isArray(values) || Object.keys(values).length > 64) throw new Error('插件路由请求头无效');
+  const headers = {};
+  for (const [key, value] of Object.entries(values)) {
+    if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/i.test(key) || typeof value !== 'string' || value.length > 8192 || /[\r\n\0]/.test(value)) throw new Error('插件路由请求头无效');
+    const name = key.toLowerCase();
+    if (/^(host|origin|cookie|connection|content-length|transfer-encoding|upgrade|proxy-.*|sec-.*|x-forwarded-.*|forwarded)$/.test(name)) throw new Error(`插件路由不能覆盖宿主请求头：${name}`);
+    headers[name] = value;
+  }
+  return headers;
+}
+
 /** 把视图请求还原成上游处理器熟悉的 Node 请求对象：回环主机头、本机套接字、可读的请求体流。 */
 export function makeRouteRequest(input, signal) {
   const url = input.query ? `${input.path}?${input.query}` : input.path;
@@ -19,7 +34,8 @@ export function makeRouteRequest(input, signal) {
   const req = Readable.from(payload.length ? [payload] : []);
   req.method = input.method;
   req.url = url;
-  req.headers = { host: '127.0.0.1', ...(hasBody ? { 'content-type': 'application/json', 'content-length': String(payload.length) } : {}) };
+  const headers = routeHeaders(input.headers);
+  req.headers = { ...headers, host: '127.0.0.1', ...(hasBody ? { 'content-type': headers['content-type'] ?? 'application/json', 'content-length': String(payload.length) } : {}) };
   req.socket = { localAddress: '127.0.0.1', remoteAddress: '127.0.0.1' };
   signal.addEventListener('abort', () => req.destroy(), { once: true });
   return req;
@@ -96,7 +112,7 @@ export async function runRoute(definition, input, execContext) {
       return { status: 405, contentType: 'application/json', body: { error: 'method not allowed' } };
     }
     const url = new URL(input.query ? `${input.path}?${input.query}` : input.path, 'http://127.0.0.1');
-    const response = await definition.resource(new Request(url, { method: input.method, signal }));
+    const response = await definition.resource(new Request(url, { method: input.method, headers: routeHeaders(input.headers), signal }));
     const buffer = Buffer.from(await response.arrayBuffer());
     if (buffer.length > MAX_ROUTE_BODY_BYTES) throw new Error(`路由响应超过 ${MAX_ROUTE_BODY_BYTES} 字节上限`);
     return routeResult({ status: response.status, contentType: response.headers.get('content-type') ?? undefined, body: buffer });

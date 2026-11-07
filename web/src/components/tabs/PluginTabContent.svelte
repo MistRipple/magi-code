@@ -4,6 +4,8 @@
   import { i18n } from '../../stores/i18n.svelte';
   import { subscribeAppearanceRuntime } from '../../appearance/runtime';
   import { openExternalUrl } from '../../lib/external-link';
+  import { pluginProjection } from '../../stores/plugin-registry.svelte';
+  import { rightPaneState, openPluginTab } from '../../stores/right-pane.svelte';
   import {
     callPluginRoute,
     describePluginSettings,
@@ -147,8 +149,44 @@
     const requestId = typeof event.data.requestId === 'string' ? event.data.requestId : '';
     const expectedInstance = instanceId;
     const operation = event.data.operation;
-    if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write', 'settings.describe', 'route.call', 'host.openExternal', 'clipboard.write', 'view.resize'].includes(operation)) return;
+    if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write', 'settings.describe', 'route.call', 'host.openExternal', 'clipboard.write', 'view.resize', 'view.open', 'view.storage.read', 'view.storage.write'].includes(operation)) return;
     try {
+      if (operation === 'view.storage.read' || operation === 'view.storage.write') {
+        // 这是界面缓存，归浏览器 profile 所有；业务配置仍只走 daemon 的 settings CAS。
+        const storageKey = `magi:plugin-ui:${pluginId}`;
+        const read = (storage: Storage): Record<string, string> => {
+          const value: unknown = JSON.parse(storage.getItem(storageKey) ?? '{}');
+          if (!value || typeof value !== 'object' || Array.isArray(value) || Object.values(value).some((item) => typeof item !== 'string')) throw new Error('插件界面缓存无效');
+          return value as Record<string, string>;
+        };
+        if (operation === 'view.storage.read') {
+          send({ type: 'response', requestId, ok: true, result: { local: read(localStorage), session: read(sessionStorage) } }, expectedInstance);
+          return;
+        }
+        if (!['local', 'session'].includes(event.data.area)) throw new Error('插件存储区域无效');
+        const storage = event.data.area === 'local' ? localStorage : sessionStorage;
+        const mutation = event.data.mutation;
+        if (!mutation || !['set', 'remove', 'clear'].includes(mutation.kind) || (mutation.kind !== 'clear' && typeof mutation.key !== 'string') || (mutation.kind === 'set' && typeof mutation.value !== 'string')) throw new Error('插件存储操作无效');
+        const values = new Map(Object.entries(read(storage)));
+        if (mutation.kind === 'clear') values.clear();
+        else if (mutation.kind === 'remove') values.delete(mutation.key);
+        else values.set(mutation.key, mutation.value);
+        const encoded = JSON.stringify(Object.fromEntries(values));
+        if (encoded.length > MAX_WRITE_BYTES) throw new Error('插件界面缓存超过大小上限');
+        storage.setItem(storageKey, encoded);
+        send({ type: 'response', requestId, ok: true, result: null }, expectedInstance);
+        return;
+      }
+      if (operation === 'view.open') {
+        const manifest = pluginProjection().manifests.find((item) => item.id === pluginId);
+        const view = manifest?.contributions.views?.find((item) => item.id === event.data.viewId && item.placements.includes('rightPane'));
+        if (!view) throw new Error('插件未提供此右栏视图或已停用');
+        const id = openPluginTab({ pluginId, contributionId: view.id, entry: view.entry, label: view.title,
+          workspaceId: rightPaneState.activeWorkspaceId, sessionId: rightPaneState.activeSessionId });
+        if (!id) throw new Error('当前没有可打开右栏的会话');
+        send({ type: 'response', requestId, ok: true, result: id }, expectedInstance);
+        return;
+      }
       const resourceId = typeof event.data.resourceId === 'string' ? event.data.resourceId : '';
       if (operation.startsWith('resource.') && (!resourceId || resourceId.length > 256)) {
         throw new Error('插件资源标识无效');
@@ -169,6 +207,7 @@
           method: event.data.method,
           path: event.data.path,
           ...(typeof event.data.query === 'string' ? { query: event.data.query } : {}),
+          ...(event.data.headers === undefined ? {} : { headers: event.data.headers }),
           ...(event.data.body === undefined ? {} : { body: event.data.body }),
         });
         send({ type: 'response', requestId, ok: true, result: routed }, expectedInstance);

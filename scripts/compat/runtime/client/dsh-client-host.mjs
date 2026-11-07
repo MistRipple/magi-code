@@ -8,7 +8,7 @@
 //   - `settingsScope` 由 Magi 设置（settings.read / settings.write）支撑；
 //   - 主题令牌映射到上游使用的 `--dsw-*` 变量，语言随 Magi 切换。
 //
-// 不做什么（如实披露，见兼容报告）：DSH 外壳里的其他槽位（输入框右侧、会话底部栏、侧栏面板、全局配额提示等）
+// 不做什么（如实披露，见兼容报告）：DSH 外壳里的其他槽位（输入框右侧、会话底部栏、全局配额提示等）
 // 属于 DSH 的会话界面，Magi 没有对应位置；这些注册被收集后不渲染，并记录在 `unmountedSlots` 里供报告读取。
 import * as React from 'react';
 import * as ReactDOM from 'react-dom';
@@ -17,6 +17,7 @@ import * as JsxRuntime from 'react/jsx-runtime';
 import { createSlotContext, slotDisposition, MOUNT_PRIORITY, SLOT_SURFACE } from './slot-context.mjs';
 import { createSettingsScope } from './settings-scope.mjs';
 import { bindSlotProps } from './slot-bindings.mjs';
+import { createWebStorage } from './web-storage.mjs';
 
 const CHANNEL = 'magi-plugin-v1';
 
@@ -47,16 +48,19 @@ export function startDshClient(options) {
   globalThis.fetch = async (input, init = {}) => {
     const raw = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     const url = new URL(raw, 'http://magi.invalid');
-    if (url.origin !== 'http://magi.invalid') {
+    if (url.origin !== 'http://magi.invalid' && url.origin !== new URL(document.baseURI).origin) {
       throw new TypeError(`插件界面只能访问自己宿主的后端路由：${raw}`);
     }
-    const method = String(init.method ?? 'GET').toUpperCase();
+    const original = input instanceof Request ? input : null;
+    const method = String(init.method ?? original?.method ?? 'GET').toUpperCase();
+    const headers = Object.fromEntries(new Headers(init.headers ?? original?.headers).entries());
     let body;
-    if (init.body !== undefined && init.body !== null) {
-      const text = typeof init.body === 'string' ? init.body : await new Response(init.body).text();
+    const suppliedBody = init.body ?? (original && !['GET', 'HEAD'].includes(method) ? await original.clone().text() : undefined);
+    if (suppliedBody !== undefined && suppliedBody !== null) {
+      const text = typeof suppliedBody === 'string' ? suppliedBody : await new Response(suppliedBody).text();
       try { body = JSON.parse(text); } catch { body = text; }
     }
-    const result = await request({ operation: 'route.call', method, path: url.pathname, query: url.search.replace(/^\?/, ''), body });
+    const result = await request({ operation: 'route.call', method, path: url.pathname, query: url.search.replace(/^\?/, ''), headers, body });
     const contentType = result.contentType ?? (typeof result.body === 'string' ? 'text/plain' : 'application/json');
     const payload = result.body === null || result.body === undefined ? '' : typeof result.body === 'string' ? result.body : JSON.stringify(result.body);
     return new Response([204, 205, 304].includes(result.status) ? null : payload, { status: result.status, headers: { 'content-type': contentType } });
@@ -88,7 +92,11 @@ export function startDshClient(options) {
   } } };
 
   // —— ctx：与构建期记录共用同一份实现 ——
-  const slotContext = createSlotContext({ scope, connection, onChange: () => render() });
+  const slotContext = createSlotContext({ scope, connection, onChange: () => render(), onOpenTab: (key) => {
+    const view = options.panelViews?.find((item) => item.key === key);
+    if (!view) throw new Error(`右栏视图未声明：${key}`);
+    return request({ operation: 'view.open', viewId: view.viewId });
+  } });
   const { ctx } = slotContext;
 
   // —— 主题：Magi 令牌映射到上游的 --dsw-* 变量 ——
@@ -173,7 +181,7 @@ export function startDshClient(options) {
   const root = ReactDOMClient.createRoot(container);
   const render = () => {
     const cards = slotContext.live().filter((entry) => options.slotName
-      ? entry.descriptor.name === options.slotName
+      ? entry.descriptor.name === options.slotName && (options.slotKey === undefined || String(entry.descriptor.key ?? entry.descriptor.id ?? '') === options.slotKey)
       : slotDisposition(entry.descriptor.name) === 'mounted');
     // 同一张卡片可能以多个槽位注册（DSH 的不同入口与行布局）；Magi 只有一种页面，按优先级取一份。
     const rank = (entry) => { const index = MOUNT_PRIORITY.indexOf(entry.descriptor.name); return index === -1 ? MOUNT_PRIORITY.length : index; };
@@ -228,6 +236,15 @@ export function startDshClient(options) {
       slotContext.setLocale(locale);
       if (m.theme) applyTheme(m.theme);
       try {
+        // 同步 Web Storage 外观只保存界面缓存；实际存储由宿主按插件身份隔离。
+        // 必须在上游 apply 之前初始化，typeof sessionStorage 在 opaque origin 上也会抛错。
+        const storage = await request({ operation: 'view.storage.read' });
+        for (const area of ['local', 'session']) Object.defineProperty(window, `${area}Storage`, {
+          configurable: true,
+          value: createWebStorage(storage[area], (mutation) => {
+            void request({ operation: 'view.storage.write', area, mutation }).catch((error) => console.error('Plugin UI storage failed:', error));
+          }),
+        });
         await refreshSettings();
         await loadUpstream(options.clientScript ?? 'client.js');
         render();

@@ -368,6 +368,8 @@ const api = Object.freeze({
   notify: Object.freeze({ user: (input = {}) => request('notify.user', input) }),
   ask: Object.freeze({ user: (input = {}) => request('ask.user', input) }),
   session: Object.freeze({ snapshot: (input = {}) => request('session.snapshot', input) }),
+  /** 读取 daemon 的插件目录；不包含插件配置、私有资源或凭据。 */
+  plugins: Object.freeze({ list: () => request('plugins.list', {}) }),
   credential: Object.freeze({ ref: (input = {}) => request('credential.ref', input) }),
   /** 向主对话的模型目录提交（整体替换）清单声明过且获 `modelSources` 授权的数据源；宿主退出时自动撤销。 */
   modelSource: Object.freeze({

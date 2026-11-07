@@ -405,6 +405,85 @@ test('界面槽位：ctx 的实现只含上游入口用到的成员；未知服�
   assert.equal(t('missing'), 'missing');
 });
 
+test('原生页面保留异步和条件注册的多个右栏页签，页面身份与显示名称不混淆', async (t) => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { analyzeNativeClient } = await import('./translate/client-assets.mjs');
+  const { clientViews } = await import('./translate/client-views.mjs');
+  const directory = mkdtempSync(join(tmpdir(), 'magi-native-panels-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  writeFileSync(join(directory, 'client.js'), `window.__ModuleLoader__.load({ id: 'panels', factory(require) { return { async apply(ctx) {
+    await Promise.resolve();
+    const P=require('@deepseek-ai/dsh-client-ui-primitives');
+    const form=new P.SettingsFormModel(ctx.configForms.get('preferences'),[P.settingsTextField('title')]);
+    if (!form.shell().available) throw new Error('真实表单模型未初始化');
+    ctx.inject(['sidebarRight','sidebarRightTabs'], c => {
+      for (const id of ['one/a', 'one-a']) {
+        c.effect(() => c.sidebarRightTabs.register({ id, kind: id, title: () => 'Panel ' + id }));
+        ctx.slots.register({ name:'sidebar.right.pane.tab', key:id }, () => null);
+      }
+    });
+    ctx.slots.register({name:'settings.section',id:'preferences',label:()=> 'Preferences'}, () => null);
+    ctx.slots.register({name:'settings.section',id:'account',label:()=> 'Account'}, () => null);
+  } }; } });`);
+  const analysis = analyzeNativeClient({ upstreamDir: directory, pkg: { exports: { './client': './client.js' } }, sharedRoot: fileURLToPath(new URL('.', import.meta.url)) });
+  const views = clientViews(analysis.mounted, 'fallback');
+  assert.equal(views.length, 4);
+  assert.equal(views.filter((view) => view.placements.includes('rightPane')).length, 2);
+  assert.equal(views.filter((view) => view.placements.includes('settings')).length, 2);
+  assert.equal(new Set(views.map((view) => view.id)).size, 4, '同一槽位及同形 slug 不会覆盖页面');
+  assert.equal(views[0].title, 'Panel one/a');
+  assert.equal(views[2].id, 'settings');
+  assert.throws(() => clientViews([analysis.mounted[0], analysis.mounted[0]], 'x'), /身份重复/);
+  writeFileSync(join(directory, 'client.js'), `window.__ModuleLoader__.load({id:'failed',factory(require){return {async apply(){await Promise.resolve();throw new Error('async failed')}}}})`);
+  assert.throws(() => analyzeNativeClient({ upstreamDir: directory, pkg: { exports: { './client': './client.js' } }, sharedRoot: fileURLToPath(new URL('.', import.meta.url)) }), /async failed/);
+});
+
+test('右栏导航只打开已注册页签，停用清理注册；语言改变通知上游订阅', async () => {
+  const { createSlotContext } = await import('./runtime/client/slot-context.mjs');
+  const opened = [], locales = [];
+  const context = createSlotContext({ scope: {}, onOpenTab: (id) => opened.push(id) });
+  const off = context.ctx.locale.subscribe(() => locales.push(context.ctx.locale.getSnapshot()));
+  context.setLocale('en'); context.setLocale('en'); off(); context.setLocale('zh');
+  assert.deepEqual(locales, ['en']);
+  context.ctx.inject(['sidebarRight', 'sidebarRightTabs'], c => {
+    c.effect(() => c.sidebarRightTabs.register({ id: 'inspector', kind: 'inspect' }));
+    c.sidebarRight.openTab('inspect');
+  });
+  assert.deepEqual(opened, ['inspector']);
+  assert.throws(() => context.ctx.sidebarRight.openTab('unknown'), /未注册/);
+  context.dispose();
+  assert.throws(() => context.ctx.sidebarRight.openTab('inspect'), /未注册/);
+});
+
+test('隔离页面 Web Storage 外观保留字符串、空值、特殊键、删除与配额语义', async () => {
+  const { createWebStorage } = await import('./runtime/client/web-storage.mjs');
+  const mutations = [];
+  const storage = createWebStorage({ old: 'value' }, (mutation) => mutations.push(mutation));
+  storage.setItem('__proto__', 'ordinary-key'); storage.setItem('zero', 0); storage.setItem('empty', '');
+  assert.equal(storage.getItem('zero'), '0'); assert.equal(storage.getItem('empty'), '');
+  assert.equal(storage.getItem('__proto__'), 'ordinary-key'); assert.equal(storage.getItem('missing'), null);
+  assert.equal(storage.length, 4); assert.equal(storage.key(0), 'old'); assert.equal(storage.key(10), null);
+  storage.removeItem('old'); assert.equal(storage.length, 3);
+  const limited = createWebStorage({}, () => {}, 20);
+  assert.throws(() => limited.setItem('x', 'v'.repeat(30)), { name: 'QuotaExceededError' });
+  assert.equal(limited.length, 0);
+  storage.clear(); assert.equal(storage.length, 0); assert.equal(mutations.at(-1).kind, 'clear');
+});
+
+test('原生页面自定义鉴权头到达 Node/Fetch 处理器，宿主身份和传输头不可伪造', async () => {
+  const { runRoute, routeHeaders } = await import('./runtime/routes.mjs');
+  const signal = new AbortController().signal;
+  const input = { method: 'GET', path: '/authenticated', headers: { 'X-Panel-Key': 'token', Accept: 'application/json' } };
+  const node = await runRoute({ handler(req, res) { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ key: req.headers['x-panel-key'], host: req.headers.host })); } }, input, { signal });
+  assert.deepEqual(node.body, { key: 'token', host: '127.0.0.1' });
+  const fetchStyle = await runRoute({ resource(request) { return new Response(request.headers.get('x-panel-key')); } }, input, { signal });
+  assert.equal(fetchStyle.body, 'token');
+  for (const name of ['Host', 'Origin', 'Cookie', 'Content-Length', 'X-Forwarded-For', 'Sec-Fetch-Site']) assert.throws(() => routeHeaders({ [name]: 'spoof' }), /不能覆盖/);
+  for (const headers of [{ 'bad key': 'x' }, { valid: 'x\r\ny' }, { valid: 1 }, { valid: 'x'.repeat(8193) }]) assert.throws(() => routeHeaders(headers), /无效/);
+});
+
 test('翻译保留 PNG/SVG 原始图片字节；越界、伪造和超限拒绝，内容准入由 Magi 包统一校验', async (t) => {
   const { mkdtempSync, writeFileSync, mkdirSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');

@@ -44,10 +44,12 @@ export const SLOT_SURFACE = { 'settings.section': 'settings' };
  *   scope    settingsScope 的实现（getSnapshot / subscribe / set）
  *   onChange 槽位注册或释放后的回调
  */
-export function createSlotContext({ scope, connection, onChange = () => {} }) {
+export function createSlotContext({ scope, connection, onChange = () => {}, onOpenTab }) {
   const registered = [];
+  const tabTypes = new Map();
   const catalogs = new Map();
   const effects = [];
+  const localeListeners = new Set();
   let locale = 'zh-CN';
 
   const configForms = {
@@ -71,6 +73,8 @@ export function createSlotContext({ scope, connection, onChange = () => {} }) {
       },
     },
     locale: {
+      getSnapshot: () => locale,
+      subscribe(listener) { localeListeners.add(listener); return () => localeListeners.delete(listener); },
       register(namespace, packs) { catalogs.set(namespace, packs); return () => catalogs.delete(namespace); },
       bind(namespace) {
         return (key, vars) => {
@@ -94,18 +98,38 @@ export function createSlotContext({ scope, connection, onChange = () => {} }) {
         configForms,
         locale: ctx.locale,
         layout: { slots: ctx.slots },
+        sidebarRight: ctx.sidebarRight,
+        sidebarRightTabs: ctx.sidebarRightTabs,
+        connection,
       };
-      if (requested.some((name) => !Object.hasOwn(services, name))) return;
-      return callback({ get(name) { return services[name]; }, slots: ctx.slots, configForms, locale: ctx.locale });
+      if (requested.some((name) => services[name] === undefined)) return;
+      return callback({ ...ctx, get(name) { return services[name]; } });
     },
-    get(name) { return name === 'configForms' ? configForms : name === 'connection' ? connection : undefined; },
+    get(name) { return ctx[name]; },
+  };
+  // 页签类型是界面注册资料；仅记录插件自身声明，业务事实与安装状态仍来自 daemon。
+  ctx.sidebarRightTabs = {
+    register(definition) {
+      if (!definition?.id || !definition?.kind || tabTypes.has(definition.kind)) throw new Error('右栏页签类型无效或重复');
+      tabTypes.set(definition.kind, definition);
+      return () => tabTypes.delete(definition.kind);
+    },
+  };
+  ctx.sidebarRight = {
+    openTab(kind) {
+      const type = tabTypes.get(kind);
+      if (!type) throw new Error(`右栏页签未注册：${kind}`);
+      if (!onOpenTab) throw new Error('当前宿主不提供右栏导航');
+      return onOpenTab(type.id);
+    },
   };
 
   return {
     ctx,
-    setLocale(next) { locale = next; },
+    setLocale(next) { if (next !== locale) { locale = next; for (const listener of [...localeListeners]) listener(); } },
+    tabTypes: () => [...tabTypes.values()],
     /** 当前仍然有效的注册。 */
     live() { return registered.filter((entry) => !entry.disposed); },
-    dispose() { for (const cleanup of effects.splice(0)) if (typeof cleanup === 'function') cleanup(); },
+    dispose() { for (const cleanup of effects.splice(0).reverse()) if (typeof cleanup === 'function') cleanup(); tabTypes.clear(); localeListeners.clear(); registered.length = 0; },
   };
 }

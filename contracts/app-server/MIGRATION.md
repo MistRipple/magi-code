@@ -24,6 +24,10 @@ Bridge 可以拥有不同传输实现，但不得重新定义同形状的 wire D
 与激活状态决定。`magi-plugin-system` 使用生成类型并对包资源与作用域补充语义校验；不得
 在插件 SDK、HTTP 适配器或 UI 手写另一份清单结构。
 
+`PluginRouteCallRequest.headers` 是可选的增量字段，用于插件页面向其私有后端携带应用头。
+旧请求省略时保持原行为；Magi HTTP 身份头不随该字段转交。DSH 路由适配器校验头名、
+值、数量和大小，并拒绝覆盖宿主身份及传输控制头。
+
 `ModelAttempt.transport` 是可选的逐次 HTTP 证据，包含实际请求摘要、HTTP 状态、
 已报告的 Token usage 和 transport outcome。旧记录或非 HTTP 执行器缺失时保持
 未知。它不替代 Step/attempt 的逻辑状态；HTTP 已返回不表示模型输出已被接受。

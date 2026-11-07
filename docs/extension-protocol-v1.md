@@ -101,6 +101,7 @@ daemon 响应形状：
 | `model.invoke` | `api.model.invoke(input)` | `{prompt,roleId?,credentialRef?,maxOutputTokens?}`，models 授权、原生模型解析和账本 |
 | `credential.ref` | `api.credential.ref({roleId?})` | 返回模型绑定引用，不返回 secret；只由 model.invoke 消费 |
 | `session.snapshot` | `api.session.snapshot(input)` | 仅签发会话；`sessionId?`、`afterTurnSeq?`、`limit?`；最多 10 Turn，每 Turn 最多 20 条截断文本 |
+| `plugins.list` | `api.plugins.list()` | 读取 daemon 的既有 `PluginList` 目录投影，每次校验当前插件包、激活状态及实例租约；不包含配置、资源或凭据，不提供安装或生命周期写入 |
 | `tool.call` | `api.tools.call(tool,input)` | 只接受公开原生工具；需要真实 Task、租约、策略、schema、权限、审批与账本 |
 | `task.spawn` | `api.task.spawn(input)` | 原生 agent_spawn 合同；保留角色、自定义模型绑定、目录与策略，不接受伪造归属 |
 | `notify.user` | `api.notify.user({message,title?})` | 原生通知事实、持久化与事件；正文最多 4096 字节、标题 256 字节 |
@@ -109,6 +110,8 @@ daemon 响应形状：
 | `modelSource.set/clear` | `api.modelSource.set(sourceId,{baseUrl,apiKey,apiProtocol,models})`／`clear(sourceId)` | 清单声明且获 `modelSources:[sourceId]` 授权；`set` 整体替换，校验与用户数据源一致；只追加到主对话模型目录（`plugin/<pluginId>/<sourceId>`），仅存运行期内存，宿主实例退出时撤销 |
 | `host.ready` | 宿主自动通知 | `activate(api)` 成功后发送 |
 | `host.log` | `api.log(message)` | 最多 4096 字符的诊断通知，不写 canonical 日志 |
+
+插件私有页面的路由请求可携带可选 `headers`（`PluginRouteCallRequest`）。只转交页面自己提供的应用头，不转交 Magi HTTP 请求的 Cookie、凭据和 Origin；Host、Origin、Cookie、代理与传输控制头禁止覆盖。DSH 原生页面的 localStorage/sessionStorage 由 iframe 消息桥按插件 ID 隔离代理，仅保存浏览器 profile 内的界面缓存；插件业务配置仍走 daemon 设置 CAS。右栏导航仅能打开当前激活插件清单声明的右栏视图。
 
 `api.config`／`api.configRevision` 是只读配置快照。SDK 不提供 `register.skill`、`register.mcp`、`register.dispose`、`migration.run` 或任意事实写入接口。MCP 为内置功能，Skill 来自清单声明。未知方法返回 `MethodNotFound`。
 

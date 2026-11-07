@@ -1,5 +1,6 @@
 // 上游原包的安装封装。静态扫描先做准入；随后在受限记录器中启动一次真实
-// Cordis，只记录注册合同，不把上游进程带入 Magi 运行期。
+// Cordis，只记录准入证据。安装后的原包由 daemon 管理的 Node 宿主运行，
+// 动态贡献仍在运行期发布，不把记录器输出当作完整业务验收。
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, join, relative, resolve, sep } from 'node:path';
@@ -15,6 +16,7 @@ import { recordUpstream } from './record.mjs';
 import { runtimeId } from '../core/identity.mjs';
 import { summarize, verdictFor } from '../core/report.mjs';
 import { classify as classifyDsh } from '../dsh/catalog.mjs';
+import { clientViews } from './client-views.mjs';
 
 const COMPAT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const TRANSLATOR_VERSION = 2;
@@ -118,30 +120,17 @@ export async function prepareDsh(options) {
     copyFileSync(join(COMPAT_DIR, 'dist/dsh-client-host.js'), join(options.outDir, 'ui/host.js'));
     const assets = copyBrowserAssets(client.file, COMPAT_DIR, join(options.outDir, 'ui'));
     copyFileSync(client.file, join(options.outDir, 'ui/client.js'));
-    const writeClientPage = (file, slotName) => {
-      const slug = slotName ? slotName.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() : 'all';
-      const configFile = `dsh-config-${slug}.js`;
-      writeFileSync(join(options.outDir, 'ui', configFile), `globalThis.__MAGI_DSH_CLIENT__ = ${JSON.stringify({ runtimeVersion: 2, clientScript: 'client.js', libraryScripts: assets.scripts, ...(slotName ? { slotName } : {}) })};\n`);
-      writeFileSync(join(options.outDir, 'ui', file), `<!doctype html>\n<meta charset="utf-8"><meta name="color-scheme" content="light dark">${assets.styles.map((name) => `<link rel="stylesheet" href="${name}">`).join('')}\n<div id="root"></div><script src="${configFile}"></script><script src="host.js"></script>\n`);
-    };
-    const mounted = clientAnalysis?.mounted ?? [];
-    if (mounted.some((slot) => ['settings.section', 'plugins.bundle.config', 'settings.plugins.tab', 'plugins.tab'].includes(slot.name))) writeClientPage('settings.html', mounted.find((slot) => ['settings.section', 'plugins.bundle.config', 'settings.plugins.tab', 'plugins.tab'].includes(slot.name)).name);
-    for (const slot of mounted.filter((entry) => !['settings.section', 'plugins.bundle.config', 'settings.plugins.tab', 'plugins.tab'].includes(entry.name))) {
-      const slug = slot.name.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase();
-      writeClientPage(`view-${slug}.html`, slot.name);
+    const views = clientViews(clientAnalysis.mounted, manifest.name);
+    manifest.contributions.views = views.map(({ slot, ...view }) => view);
+    const panelViews = views.filter((view) => view.placements.includes('rightPane')).map((view) => ({ key: view.slot.key, viewId: view.id }));
+    for (const { slot, id, entry } of views) {
+      const configFile = `dsh-config-${id}.js`;
+      writeFileSync(join(options.outDir, 'ui', configFile), `globalThis.__MAGI_DSH_CLIENT__ = ${JSON.stringify({ runtimeVersion: 2, clientScript: 'client.js', libraryScripts: assets.scripts, slotName: slot.name, slotKey: slot.key, panelViews })};\n`);
+      writeFileSync(join(options.outDir, entry), `<!doctype html>\n<meta charset="utf-8"><meta name="color-scheme" content="light dark">${assets.styles.map((name) => `<link rel="stylesheet" href="${name}">`).join('')}\n<div id="root"></div><script src="${configFile}"></script><script src="host.js"></script>\n`);
     }
   } else {
     writeFileSync(join(options.outDir, 'ui/settings.html'), renderSettingsPage({ schema: manifest.settingsSchema, title: manifest.name, runtimeSchema: true }));
   }
-  const slotViews = clientAnalysis?.mounted?.filter((slot) => !['settings.section', 'plugins.bundle.config', 'settings.plugins.tab', 'plugins.tab'].includes(slot.name)).map((slot) => {
-    const slug = slot.name.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase();
-    const placement = slot.name === 'main' ? ['main', 'rightPane'] : ['rightPane'];
-    return { id: `slot-${slug}`.slice(0, 64), title: slot.name, entry: `ui/view-${slug}.html`, placements: placement };
-  }) ?? [];
-  const settingsView = client && clientAnalysis?.mounted?.some((slot) => ['settings.section', 'plugins.bundle.config', 'settings.plugins.tab', 'plugins.tab'].includes(slot.name))
-    ? [{ id: 'settings', title: '设置', entry: 'ui/settings.html', placements: ['settings'] }]
-    : client ? [] : [{ id: 'settings', title: '设置', entry: 'ui/settings.html', placements: ['settings'] }];
-  manifest.contributions.views = [...settingsView, ...slotViews];
   const icon = await resolveUpstreamIcon({ upstreamDir: root, pkg });
   if (icon) { writeFileSync(join(options.outDir, icon.to), icon.bytes); manifest.icon = icon.to; }
   writeFileSync(join(options.outDir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');

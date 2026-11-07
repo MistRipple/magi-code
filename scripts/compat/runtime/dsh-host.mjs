@@ -10,6 +10,7 @@ import { runRoute } from './routes.mjs';
 import { startOpenAiBridge } from './openai-bridge.mjs';
 import { requestAttachments, saveRequestImage, withRequestImages } from './attachments.mjs';
 import { mountRemote } from './remote.mjs';
+import { createPluginManager } from './plugin-manager.mjs';
 
 const clone = (value) => structuredClone(value ?? {});
 const timeoutOf = (value) => value == null ? undefined : Math.min(600_000, Math.max(1_000, Number(value) || 1_000));
@@ -237,15 +238,10 @@ export async function activateDsh(api, module, options) {
   });
   await ctx.plugin(LlmRuntime);
 
-  // Several widely used DSH plugins probe optional host services before
-  // deciding whether to show their panel. Keep those probes harmless and
-  // deterministic: the daemon remains the authority, while compatibility
-  // code sees the same empty/read-only shape it would see on a DSH profile
-  // without that subsystem.
+  // 路由在 daemon 已完成插件准入后才到达此连接。插件目录每次读 daemon，
+  // 缺少的 loader/session 服务保持缺席，不能用空目录冒充真实安装/会话事实。
   ctx.provide('connection', { requestRejection: () => undefined });
-  ctx.provide('pluginManager', { list: () => [], entries: () => [] });
-  ctx.provide('loader', { entries: () => [] });
-  ctx.provide('sessions', { list: { getSnapshot: () => ({ sessions: [] }), subscribe: () => () => {} }, scope: () => ({ getSnapshot: () => ({}), subscribe: () => () => {} }) });
+  if (api.plugins?.list) ctx.provide('pluginManager', createPluginManager(api));
   ctx.baseUrl = 'http://127.0.0.1';
 
   let publishing;

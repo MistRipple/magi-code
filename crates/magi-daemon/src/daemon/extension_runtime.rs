@@ -805,7 +805,7 @@ export default async function activate(api) {
     const ROUTE_ENTRY: &str = r#"
 export default async function activate(api) {
   await api.command('noop', async () => 'ok');
-  await api.route('/status', async (input) => ({ body: { echoed: input.query } }));
+  await api.route('/status', async (input) => ({ body: { echoed: input.query, headers: input.headers } }));
   await api.route('/hang', async (_input, ctx) => {
     await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve, { once: true }));
     return { body: 'aborted' };
@@ -889,6 +889,7 @@ export default async function activate(api) {
             method: PluginRouteMethod::GET,
             path: path.into(),
             query: Some(query.into()),
+            headers: Some(json!({"x-panel-key": "panel-key"})),
             body: None,
         };
         // 有视图的插件：请求经 daemon 到达宿主里的处理器。
@@ -897,7 +898,9 @@ export default async function activate(api) {
             .await
             .unwrap();
         assert_eq!(ok.status, 200);
-        assert_eq!(ok.body.unwrap()["echoed"], "a=1");
+        let body = ok.body.unwrap();
+        assert_eq!(body["echoed"], "a=1");
+        assert_eq!(body["headers"]["x-panel-key"], "panel-key");
         // 没有视图的插件不开放后端路由，即使宿主里绑定了处理器。
         let refused = executor
             .call("acme.bare".into(), request("/status", ""))

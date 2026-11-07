@@ -88,13 +88,98 @@ export function apply(ctx, config) {
   }
   ctx.llm.registerAdapter(['runtime-fixture'], new Adapter());
 }
+
 `);
   const archive = join(work, 'plugin.zip');
   const result = await run(node, [join(compat, 'cli.mjs'), 'prepare', 'dsh', upstream, '--out', join(work, 'prepared'), '--integrity', 'local-acceptance', '--archive', archive], { timeout: 120_000, maxBuffer: 1024 * 1024 });
   const prepared = JSON.parse(result.stdout);
+  const manifest = JSON.parse(await readFile(join(work, 'prepared/manifest.json'), 'utf8'));
   pluginId = prepared.id;
-  reporter.check('随包 Node 与兼容层完成原包封装，安装期不冻结动态贡献', prepared.report.runtimeContributions.includes('tools') && prepared.report.tools.length === 0);
+  reporter.check('随包 Node 与兼容层完成原包封装，安装期不冻结动态贡献', prepared.report.runtimeContributions.includes('tools') && manifest.contributions.tools.length === 0);
   return { source: 'local:runtime-acceptance.zip', archiveBase64: (await readFile(archive)).toString('base64') };
+}
+
+async function verifyNativePanels(session) {
+  const upstream = join(work, 'native-panels');
+  await mkdir(upstream);
+  await writeFile(join(upstream, 'package.json'), JSON.stringify({ name: 'magi-native-panels', version: '1.0.0', type: 'module', main: 'index.js',
+    dsh: { bundle: {} }, exports: { '.': './index.js', './client': './client.js' } }));
+  await writeFile(join(upstream, 'index.js'), `
+export const inject = ['webServer'];
+export function apply(ctx) {
+  ctx.webServer.register({ path: '/panel-action', handler: async (req,res) => {
+    let body=''; for await(const chunk of req) body+=chunk;
+    const data=JSON.parse(body || '{}');
+    res.setHeader('content-type','application/json');
+    res.end(JSON.stringify({key:req.headers['x-panel-key'], result:String(data.text).toUpperCase()}));
+  }});
+}`);
+  await writeFile(join(upstream, 'client.js'), `
+window.__ModuleLoader__.load({id:'native-panels',factory(require){
+  const React=require('react'), h=React.createElement;
+  return { async apply(ctx) {
+    await Promise.resolve();
+    ctx.inject(['sidebarRight','sidebarRightTabs'], c => {
+      for(const key of ['first','second']) {
+        c.effect(() => c.sidebarRightTabs.register({id:key,kind:key,title:()=>key}));
+        ctx.slots.register({name:'sidebar.right.pane.tab',key}, () => {
+          const [text,setText]=React.useState(key);
+          return h('main',{},h('h1',{id:'identity'},key),
+            h('button',{id:'action',onClick:async()=>{
+              localStorage.setItem('panel-cache', key); sessionStorage.setItem('panel-session', 'same-client');
+              const response=await fetch('/panel-action',{method:'POST',headers:{'content-type':'application/json','x-panel-key':key},body:JSON.stringify({text:key})});
+              const result=await response.json(); setText(result.key+':'+result.result);
+            }},'Run'),
+            h('output',{id:'receipt'},text),
+            h('button',{id:'next-panel',onClick:()=>c.sidebarRight.openTab(key==='first'?'second':'first')},'Next panel'));
+        });
+      }
+    });
+  }};
+}});`);
+  const archive = join(work, 'native-panels.zip');
+  const result = await run(node, [join(compat, 'cli.mjs'), 'prepare', 'dsh', upstream, '--out', join(work, 'native-prepared'), '--integrity', 'local-acceptance', '--archive', archive], { timeout: 120_000 });
+  const prepared = JSON.parse(result.stdout), id = prepared.id;
+  const payload = { source: 'local:native-panels.zip', archiveBase64: (await readFile(archive)).toString('base64') };
+  const preview = await post('/api/plugins/preview', payload);
+  await post('/api/plugins/install', { ...payload, expectedDigest: preview.digest });
+  await post(`/api/plugins/${id}/enable`);
+  const plugin = (await api('/api/plugins')).value.plugins.find((item) => item.manifest.id === id);
+  await post(`/api/plugins/${id}/authorize`, { grants: plugin.manifest.permissions });
+  await post(`/api/plugins/${id}/activate`);
+  await waitFor(async () => (await api('/api/plugins')).value.plugins.find((item) => item.manifest.id === id)?.runtime?.state === 'running', '原生多面板插件');
+  reporter.check('同一槽位的两个条件注册面板均进入 daemon 视图目录', plugin.manifest.contributions.views.length === 2 && plugin.manifest.contributions.views.every((view) => view.placements.includes('rightPane')));
+  await page.call('Page.navigate', {url:`${origin}/web.html?scope=personal&sessionId=${encodeURIComponent(session)}`});
+  await waitFor(() => ui.exists('.header-right-pane-btn'), '工作台顶栏');
+  await page.evaluate(`localStorage.setItem('magi-ui-private-probe','private'); true`);
+  if (!await visible('.right-pane')) await ui.click('.header-right-pane-btn');
+  await waitFor(() => ui.exists('.right-pane-add-tab'), '右栏入口');
+  await ui.click('.right-pane-add-tab');
+  const first = plugin.manifest.contributions.views.find((view) => view.title === 'first');
+  const entry = `.launcher-tool[data-plugin-id="${id}"][data-contribution-id="${first.id}"]`;
+  await waitFor(() => ui.exists(entry), '第一个原生面板'); await ui.click(entry);
+  for (const key of ['first', 'second']) {
+    frame?.close();
+    const selector = `iframe[data-plugin-id="${id}"]`;
+    await waitFor(() => ui.exists(selector), '右栏 iframe');
+    const url = await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).src`);
+    frame = await waitFor(() => connectTarget(cdpPort, (target) => target.type === 'iframe' && target.url === url, '右栏原生页面', errors), '右栏原生页面');
+    await waitFor(() => frame.evaluate(`document.getElementById('identity')?.textContent===${JSON.stringify(key)}`), '正确的页面身份');
+    if (key === 'second') reporter.check('插件隔离存储跨面板保留界面缓存且不泄露宿主键', await frame.evaluate(`localStorage.getItem('panel-cache')==='first' && sessionStorage.getItem('panel-session')==='same-client' && localStorage.getItem('magi-ui-private-probe')===null`));
+    await frame.evaluate(`document.getElementById('action').click(); true`);
+    await waitFor(() => frame.evaluate(`document.getElementById('receipt')?.textContent===${JSON.stringify(`${key}:${key.toUpperCase()}`)}`), '原生业务回执');
+    reporter.check(`右栏 ${key} 原生页面执行真实后端动作并保留鉴权头`, true);
+    await snapshot(`panel-${key}`);
+    if (key === 'first') await frame.evaluate(`document.getElementById('next-panel').click(); true`);
+  }
+  await page.call('Emulation.setDeviceMetricsOverride', {width:390,height:844,deviceScaleFactor:1,mobile:false});
+  reporter.check('390px 右栏原生面板无横向溢出', await page.evaluate('document.documentElement.scrollWidth<=innerWidth') && await frame.evaluate('document.documentElement.scrollWidth<=innerWidth'));
+  await snapshot('panel-390');
+  await page.call('Emulation.clearDeviceMetricsOverride');
+  await post(`/api/plugins/${id}/deactivate`);
+  await waitFor(async () => !await ui.exists(`iframe[data-plugin-id="${id}"]`), '停用回收右栏面板');
+  reporter.check('停用后右栏不保留可调用的旧插件 iframe', true);
+  frame?.close(); frame = null;
 }
 
 try {
@@ -196,6 +281,7 @@ try {
   await writeFile(join(unsupported, 'index.js'), 'export function apply(ctx) { ctx.on("session/event", () => {}); }');
   await assert.rejects(run(node, [join(compat, 'cli.mjs'), 'prepare', 'dsh', unsupported, '--out', join(work, 'unsupported-out'), '--integrity', 'local-acceptance'], { timeout: 30_000 }), /session\/event/);
   reporter.check('未捕获的必需宿主事件仍被明确拒绝', true);
+  await verifyNativePanels(session);
   const rendererLogErrors = app.log.join('').split('\n').filter((line) => /Uncaught|可信 Renderer 控制台错误/.test(line));
   reporter.check('主 Renderer 与插件 iframe 没有运行时异常', errors.length === 0 && rendererLogErrors.length === 0,
     [...errors, ...rendererLogErrors].join('\n'));
