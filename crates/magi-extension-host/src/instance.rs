@@ -686,6 +686,7 @@ impl Incoming for HostHandler {
                         | "plugins.install"
                         | "plugins.setEnabled"
                         | "plugins.remove"
+                        | "plugins.authorize"
                         | "session.snapshot"
                         | "credential.ref"
                         | "blob.put"

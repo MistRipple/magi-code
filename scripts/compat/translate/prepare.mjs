@@ -106,8 +106,8 @@ export async function prepareDsh(options) {
     // 清单，daemon 合并运行目录时会把同一个贡献 ID 计数两次。
     contributions: { tools: [], commands: [], views: [{ id: 'settings', title: '设置', entry: 'ui/settings.html', placements: ['settings'] }] },
   };
-  if (inspection.entries.some((entry) => /^(?:ctx\.)?pluginManager(?:\.|$)/.test(entry.name))) {
-    manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle'] });
+  if (inspection.entries.some((entry) => /^(?:ctx\.)?(?:pluginManager|loader)(?:\.|$)/.test(entry.name))) {
+    manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', 'authorize'] });
   }
   mkdirSync(options.outDir, { recursive: true });
   const kept = copyTree(root, options.outDir);

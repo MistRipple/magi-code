@@ -247,7 +247,8 @@ export default async function activate(api) {
 | `api.session.snapshot(input)` | 读取会话的有界快照 |
 | `api.plugins.list()` | 读取 daemon 当前插件目录，不含配置或凭据 |
 | `api.plugins.preview(input)`／`install(input)` | 上游包预览与在线安装；复用精确版本和摘要确认合同，需 `pluginManagement:["install"]` |
-| `api.plugins.setEnabled(pluginId,enabled)`／`remove(pluginId)` | 启停或卸载其他插件；需 `pluginManagement:["lifecycle"]`，启用不会代授目标插件权限 |
+| `api.plugins.setEnabled(pluginId,enabled,expectedDigest?)`／`remove(pluginId,expectedDigest?)` | 启停或卸载其他插件；需 `pluginManagement:["lifecycle"]`。传入目标摘要可拒绝过期页面操作；启用本身不会代授目标插件权限 |
+| `api.plugins.authorize(pluginId,expectedDigest,grants)` | 需单独的 `pluginManagement:["authorize"]` 用户委托。仅授予目标当前摘要声明的权限（可包含完全信任），不能改变自身权限；授权和激活沿原生入口执行，异步提交前复核发起方租约与权限 |
 | `api.tools.call(tool, input)` | 调用公开的原生工具 |
 | `api.task.spawn(input)` | 派发子任务 |
 | `api.notify.user({ message, title? })` | 向用户发通知 |

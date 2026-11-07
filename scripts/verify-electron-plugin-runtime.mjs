@@ -163,7 +163,7 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
     const selector = `iframe[data-plugin-id="${id}"]`;
     await waitFor(() => ui.exists(selector), '右栏 iframe');
     const url = await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).src`);
-    frame = await waitFor(() => connectTarget(cdpPort, (target) => target.type === 'iframe' && target.url === url, '右栏原生页面', errors), '右栏原生页面');
+    frame = await waitFor(() => connectTarget(cdpPort, (target) => (target.type === 'iframe' || target.type === 'page') && target.url === url, '右栏原生页面', errors), '右栏原生页面');
     await waitFor(() => frame.evaluate(`document.getElementById('identity')?.textContent===${JSON.stringify(key)}`), '正确的页面身份');
     if (key === 'second') reporter.check('插件隔离存储跨面板保留界面缓存且不泄露宿主键', await frame.evaluate(`localStorage.getItem('panel-cache')==='first' && sessionStorage.getItem('panel-session')==='same-client' && localStorage.getItem('magi-ui-private-probe')===null`));
     await frame.evaluate(`document.getElementById('action').click(); true`);
@@ -217,7 +217,7 @@ try {
   await settingsTab(`plugin:${pluginId}:settings`);
   await waitFor(() => ui.exists('.settings-frame iframe'), '插件设置视图');
   const frameUrl = await page.evaluate('document.querySelector(".settings-frame iframe").src');
-  frame = await waitFor(() => connectTarget(cdpPort, (target) => target.type === 'iframe' && target.url === frameUrl, '插件隔离视图', errors), '插件隔离视图');
+    frame = await waitFor(() => connectTarget(cdpPort, (target) => (target.type === 'iframe' || target.type === 'page') && target.url === frameUrl, '插件隔离视图', errors), '插件隔离视图');
   const evaluateFrame = (expression) => frame.evaluate(expression);
   await waitFor(() => settingsRead, '设置读取请求');
   reporter.check('设置读取完成前禁止保存', await evaluateFrame('document.getElementById("save").disabled'));

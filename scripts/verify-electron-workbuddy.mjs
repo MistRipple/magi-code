@@ -87,7 +87,7 @@ try {
   await tab(`plugin:${pluginId}:settings`);
   await waitFor(() => ui.exists('.settings-frame iframe'), '原包设置界面');
   const frameUrl = await page.evaluate('document.querySelector(".settings-frame iframe").src');
-  frame = await waitFor(() => connectTarget(cdpPort, (t) => t.type === 'iframe' && t.url === frameUrl, 'WorkBuddy 原生设置', errors), 'WorkBuddy 设置 iframe');
+  frame = await waitFor(() => connectTarget(cdpPort, (t) => (t.type === 'iframe' || t.type === 'page') && t.url === frameUrl, 'WorkBuddy 原生设置', errors), 'WorkBuddy 设置 iframe');
   await waitFor(() => frame.evaluate('document.querySelectorAll("button").length > 3 && !document.body.innerText.includes("界面加载失败")'), '原生设置卡片渲染', 60_000);
   report.check('未经修改的上游设置卡片实际渲染', true);
   await screenshot('settings');

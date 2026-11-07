@@ -2,15 +2,18 @@
 // 运行在 `node --permission` 受限模式下（见 record.mjs）：不能写用户目录、不能起子进程、不能联网。
 import { pathToFileURL } from 'node:url';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { configureProfile, withProfile, loaderEntries, profilePath } from '../runtime/profile.mjs';
 import { installSharedResolution } from '../runtime/shared-resolution.mjs';
 
-const [entry, overridesPath, sharedRoot, resultPath] = process.argv.slice(2);
+const [entry, overridesPath, sharedRoot, resultPath, upstreamDir] = process.argv.slice(2);
 // 上游常把运行状态写进 ~/.dsh；HOME 是记录用的空临时目录，预建它即可，不触碰真实用户目录。
 mkdirSync(`${process.env.HOME}/.dsh`, { recursive: true });
-installSharedResolution(sharedRoot);
+installSharedResolution(sharedRoot, { '@magi/compat-upstream-root': upstreamDir + '/' });
 const { Context, Service } = await import('@deepseek-ai/cordis');
 const { LlmRuntime } = await import('@deepseek-ai/dsh-llm');
-const upstream = await import(pathToFileURL(entry).href);
+const metadata = JSON.parse(readFileSync(new URL('package.json', pathToFileURL(upstreamDir + '/')), 'utf8'));
+configureProfile({ plugins: { async list() { return { plugins: [{manifest: {id:'recording.plugin', description:metadata.description}, digest:'recording', source:{kind:'upstream', location:`dsh:${metadata.name}@${metadata.version}`}, enabled:true, active:false}] }; } } }, { home: process.env.HOME + '/.dsh' });
+const upstream = await withProfile(() => import(pathToFileURL(entry).href));
 
 // 记录进程由 Node 权限模型限制：没有网络、子进程、Worker、原生插件，也不能写临时目录以外的位置。
 // 上游 apply 常在本机起监听端点（只为之后接收请求）。记录阶段不接收任何请求，因此把监听替换成
@@ -36,6 +39,8 @@ globalThis.fetch = (input) => Promise.reject(new Error(`构建期记录不发送
 
 const out = { name: upstream.name ?? null, inject: upstream.inject ?? [], tools: [], commands: [], providers: [], routes: [], listeners: [], configSchema: null };
 const ctx = new Context();
+ctx.provide('loader', {entries:loaderEntries});
+ctx.provide('profileContext', Object.freeze({ name: 'magi', dir: profilePath() }));
 // 记录上游监听的事件名：拦截类事件要在清单里静态声明为 Magi 钩子，运行期才出现的监听会被明确拒绝。
 // 通过 Cordis 自带的 `internal/listener` 事件观察，不改写 ctx.on，也不执行监听器。
 const listenerNames = new Set();
@@ -62,12 +67,15 @@ const config = schema ? schema(overrides) : overrides;
 // 启动必须是记录合同的一部分。此前只调用 ctx.plugin 而不等待 fiber，Cordis
 // 会把 apply() 的异常变成后台失败，记录器仍然输出“成功”的空清单，最终导致
 // 一个永远无法激活的翻译包通过安装校验。
-const fiber = ctx.plugin({ apply: upstream.apply, inject: upstream.inject, name: upstream.name }, config);
+let fiber, startup;
 const settleTimeout = Number(process.env.MAGI_RECORD_START_TIMEOUT_MS ?? 15_000);
-const startup = await Promise.race([
+await withProfile(async () => {
+fiber = ctx.plugin({ apply: upstream.apply, inject: upstream.inject, name: upstream.name }, config);
+startup = await Promise.race([
   fiber.await().then(() => 'ready'),
   new Promise((resolve) => setTimeout(() => resolve('timeout'), settleTimeout)),
 ]);
+});
 if (startup === 'timeout') console.error(`记录阶段在 ${settleTimeout}ms 内未完全就绪，保留已观察的静态注册并交由 Magi 运行期继续收敛`);
 // 贡献可以在 apply 返回后由上游异步注册（例如 MCP 发现或延迟工具）。给它一个
 // 有界的稳定窗口；运行期目录仍然支持动态增删，但安装期不能把已观察到的启动

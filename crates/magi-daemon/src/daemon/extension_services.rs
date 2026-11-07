@@ -194,7 +194,11 @@ impl HostService for PluginHostService {
         }
         if matches!(
             method.as_str(),
-            "plugins.preview" | "plugins.install" | "plugins.setEnabled" | "plugins.remove"
+            "plugins.preview"
+                | "plugins.install"
+                | "plugins.setEnabled"
+                | "plugins.remove"
+                | "plugins.authorize"
         ) {
             let operation = self.request_with_identity(plugin_id, method, params);
             return Box::pin(async move {
@@ -272,12 +276,17 @@ impl HostService for PluginHostService {
         let digest = self.digest.clone();
         let blobs = Arc::clone(&self.blobs);
         let settings = self.settings.get().cloned();
+        let operations = self.operations.get().cloned();
         if let Err(error) = self.service_admitted(&plugin_id, &method, &params) {
             return Box::pin(async { Err(error) });
         }
         if matches!(
             method.as_str(),
-            "plugins.preview" | "plugins.install" | "plugins.setEnabled" | "plugins.remove"
+            "plugins.preview"
+                | "plugins.install"
+                | "plugins.setEnabled"
+                | "plugins.remove"
+                | "plugins.authorize"
         ) {
             let operations = self.operations.get().cloned();
             let digest = self.digest.clone();
@@ -385,7 +394,11 @@ impl HostService for PluginHostService {
                     }
                     // 复用既有目录 DTO，配置和资源不在此投影中；每次读取当前 manager，
                     // 不在 Node 端建立安装状态缓存或另一份插件清单。
-                    return serde_json::to_value(manager_guard.projection().map_err(map_error)?)
+                    let mut list = manager_guard.projection().map_err(map_error)?;
+                    if let Some(operations) = &operations {
+                        operations.decorate_runtime(&mut list);
+                    }
+                    return serde_json::to_value(list)
                         .map_err(|error| RpcError::new(ErrorKind::Internal, error.to_string()));
                 }
                 "catalog.replace" => {

@@ -1,5 +1,5 @@
-// DSH 插件管理沿 daemon 的安装、摘要确认和生命周期入口。安装不替用户
-// 授权新包；需要授权时返回明确的失败状态，不能把包已下载当成已运行。
+// DSH 插件管理沿 daemon 的安装、摘要确认和生命周期入口。新包授权需要
+// 管理插件单独获得 authorize 委托；失败不能把已下载当成已运行。
 import semver from 'semver';
 import pacote from 'pacote';
 
@@ -33,7 +33,7 @@ export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTR
         if (separator <= 0) throw new Error(`DSH 包来源无效：${source.location}`);
         const name = spec.slice(0, separator), version = spec.slice(separator + 1);
         return [{ name, version, enabled, active, installed: true, source: version,
-          availability: 'magi', removable: true, official: name.startsWith('@deepseek-ai/'),
+          availability: 'profile', removable: true, official: name.startsWith('@deepseek-ai/'),
           ...(!api.plugins.install ? { readOnlyReason: '在线安装、升级和启停请使用 Magi 的插件管理入口' } : {}),
           meta: { title: manifest.name, description: manifest.description } }];
       });
@@ -58,10 +58,13 @@ export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTR
         installed = list.plugins.find(({ source }) => source.location === `dsh:${request.package}@${preview.version}`);
         if (!installed) throw new Error('安装结果缺少插件记录');
         if (options.enabled === false && (installed.enabled || installed.active)) {
-          await api.plugins.setEnabled(installed.manifest.id, false);
+          await api.plugins.setEnabled(installed.manifest.id, false, installed.digest);
         }
         if (options.enabled !== false) {
-          const updated = await api.plugins.setEnabled(installed.manifest.id, true);
+          if (api.plugins.authorize && !installed.active) {
+            await api.plugins.authorize(installed.manifest.id, installed.digest, installed.manifest.permissions);
+          }
+          const updated = await api.plugins.setEnabled(installed.manifest.id, true, installed.digest);
           installed = updated.plugins.find((plugin) => plugin.manifest.id === installed.manifest.id);
           if (!installed?.active) throw new Error('插件尚未激活');
         }
@@ -79,14 +82,14 @@ export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTR
     try {
       if (typeof enabled !== 'boolean') throw new Error('enabled 必须是布尔值');
       const plugin = await find(name);
-      await api.plugins.setEnabled(plugin.manifest.id, enabled);
+      await api.plugins.setEnabled(plugin.manifest.id, enabled, plugin.digest);
       return { bundle: name, application: 'applied' };
     } catch (error) { return failure(error); }
   };
   if (api.plugins.remove) manager.removeBundle = async (name) => {
     try {
       const plugin = await find(name);
-      await api.plugins.remove(plugin.manifest.id);
+      await api.plugins.remove(plugin.manifest.id, plugin.digest);
       return { bundle: name, application: 'applied' };
     } catch (error) { return failure(error); }
   };

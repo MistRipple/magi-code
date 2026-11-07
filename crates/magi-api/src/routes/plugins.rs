@@ -586,29 +586,10 @@ async fn authorize(
     Path(id): Path<String>,
     Json(request): Json<AuthorizeRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    let active = locked(&state, "读取插件授权")?
-        .is_active(&id)
-        .map_err(plugin_error)?;
-    let drain = if active {
-        let drain =
-            PluginManager::begin_deactivation(std::sync::Arc::clone(&state.plugin_manager), &id)
-                .map_err(plugin_error)?;
-        quiesce_extension(&state, &id).await?;
-        Some(drain)
-    } else {
-        None
-    };
-    let mut manager = locked(&state, "授权插件")?;
-    if let Err(error) = manager.authorize(&id, request.grants) {
-        drop(manager);
-        publish_plugin_registry_changed(&state);
-        return Err(plugin_error(error));
-    }
-    if let Some(drain) = drain {
-        drain.commit(&mut manager);
-    }
-    publish_plugin_registry_changed(&state);
-    snapshot(&state, &manager)
+    PluginOperations::from_state(&state)
+        .authorize(&id, request.grants, None, None)
+        .await?;
+    snapshot(&state, &*locked(&state, "读取授权结果")?)
 }
 async fn enable(
     State(state): State<ApiState>,
@@ -616,7 +597,7 @@ async fn enable(
     Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .lifecycle("enable", &id, None)
+        .lifecycle("enable", &id, None, None)
         .await?;
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
@@ -626,7 +607,7 @@ async fn activate(
     Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .lifecycle("activate", &id, None)
+        .lifecycle("activate", &id, None, None)
         .await?;
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
@@ -636,21 +617,18 @@ async fn deactivate(
     Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .lifecycle("deactivate", &id, None)
+        .lifecycle("deactivate", &id, None, None)
         .await?;
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
 
-async fn quiesce_extension(state: &ApiState, id: &str) -> Result<(), ApiError> {
-    PluginOperations::from_state(state).quiesce(id).await
-}
 async fn disable(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .lifecycle("disable", &id, None)
+        .lifecycle("disable", &id, None, None)
         .await?;
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
@@ -659,7 +637,7 @@ async fn uninstall(
     Path(id): Path<String>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .lifecycle("uninstall", &id, None)
+        .lifecycle("uninstall", &id, None, None)
         .await?;
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
@@ -688,11 +666,7 @@ fn snapshot(
     manager: &magi_plugin_system::PluginManager,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     let mut list = manager.projection().map_err(plugin_error)?;
-    if let Some(source) = state.extension_status.as_ref() {
-        for plugin in &mut list.plugins {
-            plugin.runtime = source.status(&plugin.manifest.id);
-        }
-    }
+    PluginOperations::from_state(state).decorate_runtime(&mut list);
     Ok(Json(list))
 }
 fn plugin_error(error: magi_plugin_system::PluginError) -> ApiError {

@@ -81,7 +81,7 @@ try {
   await settings(`plugin:${pluginId}:settings`);
   await waitFor(() => ui.exists('.settings-frame iframe'), '原包设置 iframe');
   const frameUrl = await page.evaluate('document.querySelector(".settings-frame iframe").src');
-  frame = await waitFor(() => connectTarget(cdpPort, (target) => target.type === 'iframe' && target.url === frameUrl, 'REA 设置', errors), '原包设置上下文');
+  frame = await waitFor(() => connectTarget(cdpPort, (target) => (target.type === 'iframe' || target.type === 'page') && target.url === frameUrl, 'REA 设置', errors), '原包设置上下文');
   await waitFor(() => frame.evaluate('Boolean(document.getElementById("plugin-config-dsh-rea-timeout"))'), '上游原生设置表单', 60_000);
   await waitFor(() => frame.evaluate(`document.body.innerText.includes(${JSON.stringify(remote.value.rea.version)})`), '上游 Remote 状态卡片', 30_000);
   report.check('原生 React 设置表单与状态卡片加载，无未提供模块', !await frame.evaluate('document.body.innerText.includes("界面加载失败")'));

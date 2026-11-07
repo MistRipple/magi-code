@@ -612,6 +612,20 @@ Windows、手机触摸、完整生态分母及 95% 目标均未验收。后续�
 
 【剩余】DSH 原生 profile 文件、loader 行、健康扫描、版本豁免、Agent／会话及平台原生辅助进程等语义仍须沿对应 Magi 服务继续适配。Upgrader 原包还检查 DSH profile 的托管身份并直接修改其 manifest，新增通用在线管理 RPC 不代表该原包已完成升级业务；Mgr／Appshot 的必需服务仍缺席。Share 已验证 npm 原包安装与启停，Git 导入、完整扫码和升级业务未验收。Windows、手机触摸、生态全集分母及 95%／100% 均未验收。
 
+### 11.10 调用期 profile、委托授权与原包复测（2026-11-07）
+
+【现状】DSH 的 `loader.entries()`、`profileContext` 与 profile 文件读取来自同一次 daemon 插件目录快照。`package.json` 的依赖和 bundles、patch 行及每个包的版本均由原安装事实投影，不创建物理 profile、文件监听器或第二份安装注册表。启停修改只形成调用内提案，回执前通过原生生命周期入口提交；失败、取消及摘要变化不能提交草稿。临时原子写入文件只保留在当前调用。上游 ESM 与 CommonJS 共用同一 fs / fs-promises / child-process 外观；profile 外仍使用原生异步文件 API，保留 opendir 的异步迭代和目录关闭语义。
+
+【现状】新增独立 `pluginManagement:["authorize"]` 委托，安装预览及详情明确告知可为其他插件授予其声明的权限，包括完全信任。用户授权管理插件后，管理插件才能为安装回执中的精确摘要申请授权，再沿原生启用／激活入口等待实际运行。自授权限、未声明权限、过期目标摘要、失效发起者租约均拒绝。仅有 install／lifecycle 的插件仍不能代授。HTTP 与宿主目录共同合并监管器状态，Health 不再把已运行目标显示为 pending。
+
+【现状·已运行验证】macOS arm64 目录包（Electron 45.0.0、随包 Node 26.13.0）：`test:electron-dsh-profile` 11 项通过，未经修改的 Mgr 原包在线安装、原生页面、读取真实行、停用／重启、通过 `dsh plugin add` 在线升级 release-probe 0.0.7→0.0.8 并运行，以及真正卸载均通过；profile 未落盘。`test:electron-dsh-management` 13 项通过，新增 Share 原包获独立委托后安装并运行新包的检查。Share 0.2.5 在自己业务代码中明确拒绝升级已有包，返回 manual-update-required；保留该上游行为，升级链路由 Mgr 验收，未修改原包绕过其决策。
+
+【现状·定向回归】兼容层 58 项、API 管理服务 4 项、daemon 扩展服务 9 项通过；Web 检查 0 错误 0 警告。补充 ESM／CommonJS 文件导入、异步目录扫描、临时原子写入、取消和连续安装／升级摘要回归。构建有既有 WebFolderPicker 静态／动态导入警告；未运行全仓测试。
+
+【剩余】Health 基础文件体检与运行状态读取可用，但完整可靠性报告仍返回 null，DSH 运行版本显示未知，不记为全部业务通过。Ops 的文件导入和 CommonJS 准入阻塞已修复，安装、启动与两个原生面板可显示，但健康扫描仍因缺少 `listVersionExemptions` 失败；验收将页面显示的方法缺失判为失败，不用空豁免目录伪造支持。版本豁免的原生持久化／兼容准入、完整包元数据投影、Agent／sessions、Appshot 业务、Upgrader 完整升级／回滚及平台辅助进程仍未完成。95%／100% 生态覆盖均未达到，Windows 与 pi 运行器仍未验收。
+
+证据：`target/plugin-acceptance/profile/`、`target/plugin-acceptance/dsh-management/`、`target/plugin-acceptance/popular-dsh/`，构建目录不纳入版本库。
+
 ## 12. 验收与证据边界
 
 ### 12.1 已运行验证

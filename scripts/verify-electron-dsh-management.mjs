@@ -95,7 +95,7 @@ try {
   const selector = `iframe[data-plugin-id=${JSON.stringify(share.manifest.id)}]`;
   await waitFor(() => ui.exists(selector), 'Share 页面');
   const frameUrl = await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).src`);
-  frame = await waitFor(() => connectTarget(cdpPort, (t) => t.type === 'iframe' && t.url === frameUrl, 'Share 原生页面', errors), '原包 iframe');
+  frame = await waitFor(() => connectTarget(cdpPort, (t) => (t.type === 'iframe' || t.type === 'page') && t.url === frameUrl, 'Share 原生页面', errors), '原包 iframe');
   await waitFor(() => frame.evaluate('Boolean(document.querySelector("textarea.dps-code"))'), '原包组合码输入');
   await frame.evaluate(`(() => {const el=document.querySelector('textarea.dps-code');Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(el,${JSON.stringify(exported.code)});el.dispatchEvent(new Event('input',{bubbles:true}));return true;})()`);
   async function clickText(text) {
@@ -134,6 +134,16 @@ try {
   report.check('管理服务移除运行中的插件，先停止宿主再删除安装事实', removed.ok && !await target());
   const self = await manage('remove', { pluginId: 'magi.management-test' });
   report.check('自身移除明确拒绝，宿主不会在回执前自杀', !self.ok && (await plugins()).some((p) => p.manifest.id === 'magi.management-test' && p.active));
+  const enabledInstall = await shareCall('export', { entries: [{ kind: 'npm', name: targetPackage, version: '0.0.7', enabled: true }] });
+  await shareCall('import', { code: enabledInstall.code, confirm: true, requestId: 'delegated-install' });
+  await waitFor(async () => (await target())?.runtime?.state === 'running', '委托安装后真实运行', 240_000);
+  report.check('Share 原包通过独立授权委托安装并实际运行新包', (await target()).active && (await target()).grants.length > 0);
+  // Share 0.2.5 deliberately refuses upgrading existing bundles before calling
+  // the host. Preserve that upstream business decision; Mgr covers online upgrades.
+  const newerCode = await shareCall('export', { entries: [{ kind: 'npm', name: targetPackage, version: '0.0.8', enabled: true }] });
+  const refused = await callRoute(share.manifest.id, '/api/plugin-share/import', { code: newerCode.code, confirm: true, requestId: 'upstream-refusal' });
+  report.check('原包主动要求手动升级时保留其回执与当前运行版本', refused.status === 409 && refused.body.error === 'manual-update-required' && (await target()).manifest.version === '0.0.7' && (await target()).active);
+  await manage('remove', { pluginId: (await target()).manifest.id });
   report.check('Electron 与原包页面无未捕获异常', errors.length === 0, errors.join('\n'));
   console.log(report.summary());
 } catch (error) {

@@ -3,7 +3,7 @@
 //
 // 只做解析，不改写模块内容；找不到时沿用 Node 默认的 ERR_MODULE_NOT_FOUND，错误里带原始说明符。
 import { isBuiltin, registerHooks } from 'node:module';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { fileURLToPath } from 'node:url';
@@ -20,10 +20,23 @@ export function installSharedResolution(sharedRoot, aliases = {}) {
   const anchor = pathToFileURL(join(sharedRoot, '__shared__.mjs')).href;
   const sharedPrefix = pathToFileURL(`${join(sharedRoot, 'node_modules')}/`).href;
   const targets = new Map(Object.entries(aliases).map(([name, file]) => [name, pathToFileURL(file).href]));
+  const upstreamRoot = aliases['@magi/compat-upstream-root'] ? pathToFileURL(realpathSync(aliases['@magi/compat-upstream-root']) + '/').href : undefined;
+  const facades = new Map([
+    ['node:fs', 'profile-fs.mjs'], ['fs', 'profile-fs.mjs'],
+    ['node:fs/promises', 'profile-promises.mjs'], ['fs/promises', 'profile-promises.mjs'],
+    ['node:child_process', 'profile-process.mjs'], ['child_process', 'profile-process.mjs'],
+  ].map(([name, file]) => [name, new URL(file, import.meta.url).href]));
   return registerHooks({
     resolve(specifier, context, nextResolve) {
       const alias = targets.get(specifier);
       if (alias) return nextResolve(alias, context);
+      // 仅上游代码使用 profile 外观；兼容层自身与共享依赖继续使用原生模块，
+      // 不全局替换 Node 的 fs，不影响 daemon RPC 和 Magi 自己的文件操作。
+      const parent = context.parentURL;
+      const fromUpstream = typeof parent === 'string' && (parent.includes('/extension/upstream/') || (upstreamRoot && parent.startsWith(upstreamRoot)));
+      // require() 的默认解析器不接受 file: URL 作为说明符。绝对路径可由
+      // ESM 和 CJS 共用，并加载同一个无顶层 await 的 profile 模块实例。
+      if (fromUpstream && facades.has(specifier)) return nextResolve(fileURLToPath(facades.get(specifier)), context);
       // 共享目录里的包按 Node 默认规则解析自己的依赖（可能有嵌套版本）；只有来自上游代码的裸导入才重定向。
       const fromShared = typeof context.parentURL === 'string' && context.parentURL.startsWith(sharedPrefix);
       // An upstream package may declare a newer Cordis peer than the version

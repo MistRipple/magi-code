@@ -87,16 +87,16 @@ test('未接入的 loader 和 sessions 不再以空服务满足必需依赖', as
   for (const dependency of ['loader', 'sessions']) await assert.rejects(activateDsh(host().api, { inject: [dependency], apply() { assert.fail('必需服务缺失不能启动'); } }, options), /缺少必需服务/);
 });
 
-test('DSH 管理写操作使用预览精确版本和摘要，不伪造新包授权，启停和移除映射真实 ID', async () => {
+test('DSH 管理写操作使用精确版本与摘要，未获委托不能授权新包，启停和移除映射真实 ID', async () => {
   const { createPluginManager, parseBundleSpec } = await import('./runtime/plugin-manager.mjs');
-  const installed = { manifest: { id: 'translated.scoped', name: 'Scoped' }, source: { kind: 'upstream', location: 'dsh:@scope/sample@1.2.3' }, enabled: false, active: false };
+  const installed = { digest: 'installed-digest', manifest: { id: 'translated.scoped', name: 'Scoped' }, source: { kind: 'upstream', location: 'dsh:@scope/sample@1.2.3' }, enabled: false, active: false };
   const calls = [];
   const plugins = {
     async list() { return { plugins: [installed] }; },
     async preview(input) { calls.push(['preview', input]); return { version: '1.2.3', candidate: { digest: 'confirmed' } }; },
     async install(input) { calls.push(['install', input]); return { plugins: [installed] }; },
-    async setEnabled(id, enabled) { calls.push(['enabled', id, enabled]); if (enabled) throw Object.assign(new Error('缺少新版授权'), { kind: 'PermissionDenied' }); return { plugins: [installed] }; },
-    async remove(id) { calls.push(['remove', id]); },
+    async setEnabled(id, enabled, expectedDigest) { calls.push(['enabled', id, enabled, expectedDigest]); if (enabled) throw Object.assign(new Error('缺少新版授权'), { kind: 'PermissionDenied' }); return { plugins: [installed] }; },
+    async remove(id, expectedDigest) { calls.push(['remove', id, expectedDigest]); },
   };
   const manager = createPluginManager({ plugins });
   assert.deepEqual(parseBundleSpec('@scope/sample@latest'), { ecosystem: 'dsh', package: '@scope/sample' });
@@ -110,10 +110,56 @@ test('DSH 管理写操作使用预览精确版本和摘要，不伪造新包授�
   assert.equal(unapproved.application, 'failed');
   assert.equal(unapproved.installed, true); assert.equal(unapproved.error.code, 'authorization-required');
   assert.equal((await manager.setBundleEnabled('@scope/sample', false)).application, 'applied');
-  assert.deepEqual(calls.at(-1), ['enabled', 'translated.scoped', false]);
+  assert.deepEqual(calls.at(-1), ['enabled', 'translated.scoped', false, 'installed-digest']);
   assert.equal((await manager.removeBundle('@scope/sample')).application, 'applied');
-  assert.deepEqual(calls.at(-1), ['remove', 'translated.scoped']);
+  assert.deepEqual(calls.at(-1), ['remove', 'translated.scoped', 'installed-digest']);
   assert.equal((await manager.installBundle('../sample')).application, 'failed');
+});
+
+test('获委托的管理插件连续安装与升级时只授权安装回执中的摘要，拒绝后不启用，禁用安装不代授', async () => {
+  const { createPluginManager } = await import('./runtime/plugin-manager.mjs');
+  const permissions = [{ kind: 'extension', targets: ['full-trust'] }];
+  const records = new Map(), calls = [];
+  let delegated = true, replaced = false;
+  const manager = createPluginManager({ plugins: {
+    async list() { return { plugins: [...records.values()] }; },
+    async preview(request) { return { version: request.version, candidate: { digest: `digest-${request.version}` } }; },
+    async install(request) {
+      const row = { digest: request.expectedDigest, source: { kind: 'upstream', location: `dsh:${request.package}@${request.version}` },
+        manifest: { id: `translated.${request.package}`, name: request.package, permissions }, active: false, enabled: false };
+      records.set(row.manifest.id, row); return { plugins: [...records.values()] };
+    },
+    async authorize(id, digest, grants) {
+      calls.push(['authorize', id, digest]);
+      if (!delegated) throw Object.assign(new Error('缺少 authorize 委托'), { kind: 'PermissionDenied' });
+      assert.equal(records.get(id).digest, digest); assert.deepEqual(grants, permissions);
+      if (replaced) records.set(id, { ...records.get(id), digest: 'replacement' });
+    },
+    async setEnabled(id, enabled, digest) {
+      calls.push(['enable', id, digest]);
+      assert.equal(enabled, true);
+      if (records.get(id).digest !== digest) throw Object.assign(new Error('目标版本已变化'), { kind: 'Conflict' });
+      records.get(id).active = records.get(id).enabled = true;
+      return { plugins: [...records.values()] };
+    },
+  } });
+  for (const spec of ['first@1.0.0', 'second@1.0.0', 'first@2.0.0']) {
+    assert.equal((await manager.installBundle(spec)).application, 'applied');
+  }
+  assert.deepEqual(calls.filter(([action]) => action === 'authorize').map(([, id, digest]) => [id, digest]), [
+    ['translated.first', 'digest-1.0.0'], ['translated.second', 'digest-1.0.0'], ['translated.first', 'digest-2.0.0'],
+  ]);
+  delegated = false;
+  const denied = await manager.installBundle('denied@1.0.0');
+  assert.equal(denied.error.code, 'authorization-required');
+  assert.equal(records.get('translated.denied').active, false);
+  assert.equal(calls.at(-1)[0], 'authorize', '拒绝委托后不能继续激活');
+  const count = calls.length;
+  assert.equal((await manager.installBundle('disabled@1.0.0', { enabled: false })).application, 'applied');
+  assert.equal(calls.length, count, '禁用安装不能请求授权');
+  delegated = true; replaced = true;
+  assert.equal((await manager.installBundle('racing@1.0.0')).application, 'failed');
+  assert.equal(records.get('translated.racing').active, false, '授权后被替换的包不能被旧请求激活');
 });
 
 test('DSH npm 标签和版本范围从 registry 解析为精确版本后才进入 daemon 预览，拒绝静默切换安装源', async (t) => {

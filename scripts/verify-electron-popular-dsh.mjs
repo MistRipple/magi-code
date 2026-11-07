@@ -81,15 +81,15 @@ async function viewCheck(plugin, view, session) {
   const url = await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).src`);
   let frame;
   try {
-    frame = await waitFor(() => connectTarget(cdpPort, (target) => target.type === 'iframe' && target.url === url, '原包页面', errors), '原包页面');
+    frame = await waitFor(() => connectTarget(cdpPort, (target) => (target.type === 'iframe' || target.type === 'page') && target.url === url, '原包页面', errors), '原包页面');
     await waitFor(async () => (await frame.evaluate('document.body.innerText')).trim().length > 0, '原包内容');
     // 等待一次上游页面初始化；请求结果另由后端 smoke 记录，不能把页面有字视为业务完成。
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const text = await frame.evaluate('document.body.innerText');
-    const error = /界面加载失败|该插件没有提供设置界面|Minified React error/.test(text);
+    const failure = text.match(/界面加载失败|该插件没有提供设置界面|Minified React error|[\w.]+ is not a function|Cannot read properties|ReferenceError:|TypeError:|ERR_MODULE_NOT_FOUND/)?.[0];
     const screenshot = `${plugin.manifest.id}-${view.id}.png`;
     await writeFile(join(output, screenshot), Buffer.from(await ui.screenshot(), 'base64'));
-    return { id: view.id, placement: view.placements.includes('rightPane') ? 'rightPane' : 'settings', ok: !error, text: text.slice(0, 5000), screenshot, declaredViews: views.length };
+    return { id: view.id, placement: view.placements.includes('rightPane') ? 'rightPane' : 'settings', ok: !failure, ...(failure ? { failure } : {}), text: text.slice(0, 5000), screenshot, declaredViews: views.length };
   } finally { frame?.close(); }
 }
 try {

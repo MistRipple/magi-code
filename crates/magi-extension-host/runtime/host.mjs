@@ -378,8 +378,9 @@ const api = Object.freeze({
     list: () => request('plugins.list', {}),
     preview: (input) => pluginRequest('plugins.preview', input),
     install: (input) => pluginRequest('plugins.install', input),
-    setEnabled: (pluginId, enabled) => pluginRequest('plugins.setEnabled', { pluginId, enabled }),
-    remove: (pluginId) => pluginRequest('plugins.remove', { pluginId }),
+    setEnabled: (pluginId, enabled, expectedDigest) => pluginRequest('plugins.setEnabled', { pluginId, enabled, ...(expectedDigest === undefined ? {} : { expectedDigest }) }),
+    authorize: (pluginId, expectedDigest, grants) => pluginRequest('plugins.authorize', { pluginId, expectedDigest, grants }),
+    remove: (pluginId, expectedDigest) => pluginRequest('plugins.remove', { pluginId, ...(expectedDigest === undefined ? {} : { expectedDigest }) }),
   }),
   credential: Object.freeze({ ref: (input = {}) => request('credential.ref', input) }),
   /** 向主对话的模型目录提交（整体替换）清单声明过且获 `modelSources` 授权的数据源；宿主退出时自动撤销。 */

@@ -11,6 +11,7 @@ import { startOpenAiBridge } from './openai-bridge.mjs';
 import { requestAttachments, saveRequestImage, withRequestImages } from './attachments.mjs';
 import { mountRemote } from './remote.mjs';
 import { createPluginManager } from './plugin-manager.mjs';
+import { configureProfile, withProfile, loaderEntries, profilePath } from './profile.mjs';
 
 const clone = (value) => structuredClone(value ?? {});
 const timeoutOf = (value) => value == null ? undefined : Math.min(600_000, Math.max(1_000, Number(value) || 1_000));
@@ -26,6 +27,7 @@ const LOCAL_EVENTS = new Set(['loader/volatile-update', 'settings/updated', 'llm
 export async function activateDsh(api, module, options) {
   if (options?.runtimeVersion !== 2) throw new Error('DSH 兼容包版本不受支持，请从上游来源重新安装');
   const upstream = module.default ?? module;
+  const releaseProfile = configureProfile(api);
   const ctx = new Context();
   // Cordis inject 是“服务出现时挂载”的条件 fiber；不能把可选分支的 PENDING 当成整包失败。
   const conditionalFibers = new Set();
@@ -72,7 +74,7 @@ export async function activateDsh(api, module, options) {
   });
 
   const registration = (owner, kind, definition, handler) => owner.effect(() => catalog.register(kind, definition, () =>
-    kind === 'tools' ? api.tool(definition.id, handler) : api.command(definition.id, handler)));
+    kind === 'tools' ? api.tool(definition.id, (...args) => withProfile(() => handler(...args), args[1]?.signal)) : api.command(definition.id, (...args) => withProfile(() => handler(...args), args[1]?.signal))));
 
   await ctx.plugin(class extends Service {
     constructor(c) { super(c, 'tools'); }
@@ -85,7 +87,7 @@ export async function activateDsh(api, module, options) {
       if (definition.timeoutMs !== undefined) contribution.timeoutMs = timeoutOf(definition.timeoutMs);
       return this.ctx.effect(() => {
         tools.set(definition.name, definition);
-        const release = catalog.register('tools', contribution, () => api.tool(id, async (input, execContext) => {
+        const release = catalog.register('tools', contribution, () => api.tool(id, (input, execContext) => withProfile(async () => {
           const pipeline = new ToolExecutionPipeline(ctx, { get: (name) => tools.get(name) });
           const prepared = await pipeline.prepare({ callId: execContext.invocationId, name: definition.name, arguments: input, signal: execContext.signal });
           const outcome = prepared.kind === 'dispatch' ? await pipeline.dispatch(prepared.exec) : prepared;
@@ -93,7 +95,7 @@ export async function activateDsh(api, module, options) {
           if (result.additionalContexts?.length || result.concludeTurn) throw new Error('此工具要求追加会话上下文或结束 Turn，当前公开合同尚未承载');
           if (result.isError) throw new Error(result.content?.filter((part) => part.type === 'text').map((part) => part.text).join('\n') || 'DSH 工具执行失败');
           return result;
-        }));
+        }, execContext.signal)));
         this.ctx.emit('tools/change');
         return async () => { if (tools.get(definition.name) === definition) tools.delete(definition.name); await release(); this.ctx.emit('tools/change'); };
       });
@@ -138,7 +140,7 @@ export async function activateDsh(api, module, options) {
       return this.ctx.effect(() => {
         routes.add(key);
         let release;
-        catalog.enqueue(async () => { release = await api.route(definition.path, (input, context) => runRoute(definition, input, context), { match: kind }); }).catch(() => {});
+        catalog.enqueue(async () => { release = await api.route(definition.path, (input, context) => withProfile(() => runRoute(definition, input, context), context.signal), { match: kind }); }).catch(() => {});
         return () => { routes.delete(key); return catalog.enqueue(async () => release?.()); };
       });
     }
@@ -180,7 +182,7 @@ export async function activateDsh(api, module, options) {
     await catalog.drain();
   };
   const refresh = (snapshot) => {
-    const operation = configUpdates.then(() => applyConfig(snapshot));
+    const operation = configUpdates.then(() => withProfile(() => applyConfig(snapshot)));
     configUpdates = operation.catch(() => {});
     return operation.then((result) => { ctx.emit('settings/updated', options.plugin, clone(snapshot.value)); return result; });
   };
@@ -242,6 +244,10 @@ export async function activateDsh(api, module, options) {
   // 缺少的 loader/session 服务保持缺席，不能用空目录冒充真实安装/会话事实。
   ctx.provide('connection', { requestRejection: () => undefined });
   if (api.plugins?.list) ctx.provide('pluginManager', createPluginManager(api));
+  if (api.plugins?.list && profilePath()) {
+    ctx.provide('loader', { entries: loaderEntries });
+    ctx.provide('profileContext', Object.freeze({ name: 'magi', dir: profilePath() }));
+  }
   ctx.baseUrl = 'http://127.0.0.1';
 
   let publishing;
@@ -338,14 +344,17 @@ export async function activateDsh(api, module, options) {
     ]);
     for (const result of cleanup) if (result.status === 'rejected') diagnostic(`卸载回收: ${result.reason?.message ?? result.reason}`);
     sourceReleases.clear(); bridges.clear(); published.clear();
+    releaseProfile();
   };
   api.onDispose(dispose);
   try {
     await mountRemote(api, ctx);
     const settings = await api.settings.read();
     rawConfig = clone(settings.value); version = settings.version;
-    fiber = ctx.plugin(upstream, clone(rawConfig));
-    await fiber.await();
+    await withProfile(async () => {
+      fiber = ctx.plugin(upstream, clone(rawConfig));
+      await fiber.await();
+    });
     // Cordis 可把缺依赖的插件留在 PENDING；Magi 不能把它报告为 running。
     for (const runtime of ctx.registry.values()) for (const child of runtime.fibers) {
       await child.await();

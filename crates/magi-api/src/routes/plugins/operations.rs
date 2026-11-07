@@ -21,10 +21,20 @@ mod tests {
     use std::io::{Cursor, Write};
 
     fn package(id: &str, management: bool) -> PluginPackage {
+        package_permissions(
+            id,
+            if management {
+                &["install", "lifecycle"]
+            } else {
+                &[]
+            },
+        )
+    }
+
+    fn package_permissions(id: &str, management: &[&str]) -> PluginPackage {
         let mut permissions = vec![json!({"kind":"extension", "targets":["full-trust"]})];
-        if management {
-            permissions
-                .push(json!({"kind":"pluginManagement", "targets":["install", "lifecycle"]}));
+        if !management.is_empty() {
+            permissions.push(json!({"kind":"pluginManagement", "targets":management}));
         }
         let manifest = json!({
             "sdkVersion":2, "id":id, "version":"1.0.0", "name":id, "description":"", "dataSchemaVersion":1,
@@ -271,6 +281,10 @@ mod tests {
         let target = package("acme.target", false);
         install(&state, &caller, true);
         install(&state, &target, false);
+        let list = PluginOperations::from_state(&state).projection().unwrap();
+        assert!(list["plugins"].as_array().unwrap().iter().any(|plugin| {
+            plugin["runtime"]["state"] == "failed" && plugin["runtime"]["reason"] == "原包启动失败"
+        }));
         state
             .plugin_manager
             .lock()
@@ -288,6 +302,121 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.message().contains("原包启动失败"));
+    }
+
+    #[tokio::test]
+    async fn delegated_authorization_requires_its_own_grant_and_exact_target_version() {
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::bare_state(root.path());
+        let caller = package_permissions("acme.delegate", &["install", "lifecycle", "authorize"]);
+        let readonly = package("acme.manager", true);
+        let target = package("acme.target", false);
+        install(&state, &caller, true);
+        install(&state, &readonly, true);
+        install(&state, &target, false);
+        let operations = PluginOperations::from_state(&state);
+        let input = json!({"pluginId":"acme.target", "expectedDigest":target.digest(), "grants":target.manifest().permissions});
+        assert!(
+            operations
+                .call(
+                    "acme.manager",
+                    readonly.digest(),
+                    Some("current"),
+                    "plugins.authorize",
+                    input.clone()
+                )
+                .await
+                .unwrap_err()
+                .message()
+                .contains("authorize")
+        );
+        let mut stale = input.clone();
+        stale["expectedDigest"] = json!("old");
+        assert!(
+            operations
+                .call(
+                    "acme.delegate",
+                    caller.digest(),
+                    Some("current"),
+                    "plugins.authorize",
+                    stale
+                )
+                .await
+                .unwrap_err()
+                .message()
+                .contains("版本")
+        );
+        let mut undeclared = input.clone();
+        undeclared["grants"] = json!([{"kind":"models", "targets":["default"]}]);
+        assert!(
+            operations
+                .call(
+                    "acme.delegate",
+                    caller.digest(),
+                    Some("current"),
+                    "plugins.authorize",
+                    undeclared
+                )
+                .await
+                .is_err()
+        );
+        operations
+            .call(
+                "acme.delegate",
+                caller.digest(),
+                Some("current"),
+                "plugins.authorize",
+                input,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !state
+                .plugin_manager
+                .lock()
+                .unwrap()
+                .is_active("acme.target")
+                .unwrap()
+        );
+        operations
+            .call(
+                "acme.delegate",
+                caller.digest(),
+                Some("current"),
+                "plugins.setEnabled",
+                json!({"pluginId":"acme.target", "enabled":true, "expectedDigest":target.digest()}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            state
+                .plugin_manager
+                .lock()
+                .unwrap()
+                .is_active("acme.target")
+                .unwrap()
+        );
+        let error = operations
+            .call(
+                "acme.delegate",
+                caller.digest(),
+                Some("current"),
+                "plugins.setEnabled",
+                json!({"pluginId":"acme.target", "enabled":false, "expectedDigest":"old"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("版本"));
+        assert!(
+            state
+                .plugin_manager
+                .lock()
+                .unwrap()
+                .is_active("acme.target")
+                .unwrap(),
+            "过期 profile 提案不能停止新版实例"
+        );
+        assert!(operations.call("acme.delegate", caller.digest(), Some("current"), "plugins.authorize", json!({"pluginId":"acme.delegate", "expectedDigest":caller.digest(), "grants":[]})).await.is_err());
     }
 }
 
@@ -384,7 +513,7 @@ impl PluginOperations {
         result
     }
 
-    /// 写操作只能由获授权的活动宿主调用。安装不代替用户授予新版本权限。
+    /// 写操作只能由获授权的活动宿主调用；代授新版本需要独立 authorize 委托。
     pub(super) fn admitted(
         &self,
         caller: &str,
@@ -449,6 +578,8 @@ impl PluginOperations {
     ) -> Result<Value, ApiError> {
         let target = if matches!(method, "plugins.preview" | "plugins.install") {
             "install"
+        } else if method == "plugins.authorize" {
+            "authorize"
         } else {
             "lifecycle"
         };
@@ -467,12 +598,35 @@ impl PluginOperations {
                 upstream::install_candidate(self, &request, Some((caller, digest, lease))).await?;
                 self.projection()
             }
+            "plugins.authorize" => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct Authorize {
+                    plugin_id: String,
+                    expected_digest: String,
+                    grants: Vec<magi_plugin_system::PluginPermission>,
+                }
+                let input: Authorize = serde_json::from_value(params)
+                    .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+                if input.plugin_id == caller {
+                    return Err(ApiError::Forbidden("管理插件不能自行改变自己的权限".into()));
+                }
+                self.authorize(
+                    &input.plugin_id,
+                    input.grants,
+                    Some((caller, digest, lease)),
+                    Some(&input.expected_digest),
+                )
+                .await?;
+                self.projection()
+            }
             "plugins.setEnabled" | "plugins.remove" => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase", deny_unknown_fields)]
                 struct Input {
                     plugin_id: String,
                     enabled: Option<bool>,
+                    expected_digest: Option<String>,
                 }
                 let input: Input = serde_json::from_value(params)
                     .map_err(|e| ApiError::InvalidInput(format!("管理参数无效：{e}")))?;
@@ -495,26 +649,43 @@ impl PluginOperations {
                             "deactivate",
                             &input.plugin_id,
                             Some((caller, digest, lease)),
+                            input.expected_digest.as_deref(),
                         )
                         .await?;
                     }
                     // 停止后发起方可能已撤权；后续写入仍核对同一身份。
                     self.admitted(caller, digest, lease, target)?;
-                    self.lifecycle("disable", &input.plugin_id, Some((caller, digest, lease)))
-                        .await?;
+                    self.lifecycle(
+                        "disable",
+                        &input.plugin_id,
+                        Some((caller, digest, lease)),
+                        input.expected_digest.as_deref(),
+                    )
+                    .await?;
                     if method == "plugins.remove" {
                         self.lifecycle(
                             "uninstall",
                             &input.plugin_id,
                             Some((caller, digest, lease)),
+                            input.expected_digest.as_deref(),
                         )
                         .await?;
                     }
                 } else {
-                    self.lifecycle("enable", &input.plugin_id, Some((caller, digest, lease)))
-                        .await?;
-                    self.lifecycle("activate", &input.plugin_id, Some((caller, digest, lease)))
-                        .await?;
+                    self.lifecycle(
+                        "enable",
+                        &input.plugin_id,
+                        Some((caller, digest, lease)),
+                        input.expected_digest.as_deref(),
+                    )
+                    .await?;
+                    self.lifecycle(
+                        "activate",
+                        &input.plugin_id,
+                        Some((caller, digest, lease)),
+                        input.expected_digest.as_deref(),
+                    )
+                    .await?;
                     self.wait_running(&input.plugin_id, Some((caller, digest, lease)))
                         .await?;
                 }
@@ -530,13 +701,20 @@ impl PluginOperations {
         action: &str,
         id: &str,
         caller: Option<OperationCaller<'_>>,
+        expected_digest: Option<&str>,
     ) -> Result<(), ApiError> {
+        {
+            let manager = self.locked("检查插件管理准入")?;
+            Self::check_caller(&manager, caller, "lifecycle")?;
+            Self::check_target(&manager, id, expected_digest)?;
+        }
         if action == "deactivate" {
             let drain = PluginManager::begin_deactivation(Arc::clone(&self.manager), id)
                 .map_err(plugin_error)?;
             self.quiesce(id).await?;
             let result = {
                 let mut manager = self.locked("停用插件")?;
+                Self::check_target(&manager, id, expected_digest)?;
                 Self::check_caller(&manager, caller, "lifecycle")?;
                 let result = manager.deactivate(id).map_err(plugin_error);
                 if result.is_ok() {
@@ -549,6 +727,7 @@ impl PluginOperations {
         }
         let result = {
             let mut manager = self.locked("管理插件")?;
+            Self::check_target(&manager, id, expected_digest)?;
             Self::check_caller(&manager, caller, "lifecycle")?;
             match action {
                 "enable" => manager.enable(id),
@@ -563,16 +742,73 @@ impl PluginOperations {
         result
     }
 
-    fn projection(&self) -> Result<Value, ApiError> {
-        let mut list = self
-            .locked("读取插件结果")?
-            .projection()
-            .map_err(plugin_error)?;
+    pub(super) async fn authorize(
+        &self,
+        id: &str,
+        grants: Vec<magi_plugin_system::PluginPermission>,
+        caller: Option<OperationCaller<'_>>,
+        expected: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let active = {
+            let manager = self.locked("读取插件授权")?;
+            Self::check_caller(&manager, caller, "authorize")?;
+            Self::check_target(&manager, id, expected)?;
+            manager.is_active(id).map_err(plugin_error)?
+        };
+        let drain = if active {
+            let drain = PluginManager::begin_deactivation(Arc::clone(&self.manager), id)
+                .map_err(plugin_error)?;
+            self.quiesce(id).await?;
+            Some(drain)
+        } else {
+            None
+        };
+        let result = {
+            let mut manager = self.locked("授权插件")?;
+            Self::check_caller(&manager, caller, "authorize")?;
+            Self::check_target(&manager, id, expected)?;
+            let result = manager.authorize(id, grants).map_err(plugin_error);
+            if result.is_ok() {
+                if let Some(drain) = drain {
+                    drain.commit(&mut manager);
+                }
+            }
+            result
+        };
+        self.changed();
+        result
+    }
+
+    fn check_target(
+        manager: &PluginManager,
+        id: &str,
+        expected_digest: Option<&str>,
+    ) -> Result<(), ApiError> {
+        if let Some(expected) = expected_digest {
+            if manager.package(id).map_err(plugin_error)?.digest() != expected {
+                return Err(ApiError::Conflict(
+                    "目标插件版本已变化，请刷新后重试".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 只合并监管器当前运行事实，HTTP 与宿主目录必须使用相同投影。
+    pub fn decorate_runtime(&self, list: &mut magi_app_server_protocol::PluginList) {
         if let Some(source) = self.extension_status.as_ref().and_then(Weak::upgrade) {
             for plugin in &mut list.plugins {
                 plugin.runtime = source.status(&plugin.manifest.id);
             }
         }
+    }
+
+    fn projection(&self) -> Result<Value, ApiError> {
+        let mut list = self
+            .locked("读取插件结果")?
+            .projection()
+            .map_err(plugin_error)?;
+        self.decorate_runtime(&mut list);
         serde_json::to_value(list).map_err(|e| ApiError::internal_assembly("编码插件目录失败", e))
     }
 
