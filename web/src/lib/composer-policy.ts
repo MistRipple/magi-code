@@ -10,6 +10,16 @@ import type { CanonicalTurn } from '../shared/protocol/canonical-turn';
 export const MAX_COMPOSER_IMAGES = 5;
 export const MAX_COMPOSER_IMAGE_BYTES = 10 * 1024 * 1024;
 
+/** 插件图片草稿与 Magi GUI 图片准入保持相同的浏览器格式。 */
+export const SUPPORTED_COMPOSER_IMAGE_TYPES = [
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif',
+  'image/bmp', 'image/x-icon', 'image/svg+xml',
+] as const;
+export function isSupportedComposerDataUrl(dataUrl: string): boolean {
+  const match = /^data:([^;,]+);base64,/i.exec(dataUrl);
+  return Boolean(match && (SUPPORTED_COMPOSER_IMAGE_TYPES as readonly string[]).includes(match[1].toLowerCase()));
+}
+
 export interface ComposerAttachmentCounts {
   images: number;
   contextReferences: number;

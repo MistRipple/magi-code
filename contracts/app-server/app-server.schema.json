@@ -2254,7 +2254,8 @@
         "extension",
         "contextRewrite",
         "modelSources",
-        "pluginManagement"
+        "pluginManagement",
+        "composer"
       ]
     },
     "PluginPermission": {
@@ -6376,6 +6377,80 @@
           "type": "boolean",
           "x-rust-default": true,
           "description": "只读兼容诊断需要原包元数据时显式请求；与插件目录在同一 manager 快照中读取。"
+        }
+      }
+    },
+    "PluginComposerImageInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dataUrl",
+        "name",
+        "size"
+      ],
+      "properties": {
+        "dataUrl": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 13981060
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10485760
+        }
+      }
+    },
+    "PluginComposerSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "attachmentIds",
+        "writable"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 256
+        },
+        "attachmentIds": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "type": "string",
+            "maxLength": 128
+          }
+        },
+        "writable": {
+          "type": "boolean"
+        }
+      }
+    },
+    "PluginComposerAdmissionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "expectedDigest",
+        "entry"
+      ],
+      "properties": {
+        "expectedDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "entry": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
         }
       }
     }

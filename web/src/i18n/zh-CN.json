@@ -876,6 +876,7 @@
   "settings.plugins.permission.pluginCompatibility": "管理版本豁免：确认风险后，可允许特定版本绕过 DSH 版本要求；不能绕过 Magi 能力与权限检查",
   "settings.plugins.permission.pluginBackground": "后台管理：页面请求完成后仍可继续已授权的插件管理操作；停用或撤权后失效",
   "settings.plugins.permission.pluginManagement": "管理插件：可在线安装、升级、启停及卸载其他插件；新版本权限仍须由你确认",
+  "settings.plugins.permission.composer": "图片草稿：可向当前会话输入框添加图片，移除自己添加的图片及聚焦输入框；不会自动发送",
   "settings.plugins.permission.contextRewrite": "改写上下文：可替换发给模型的对话历史并使提示缓存失效，可自定义压缩摘要；原始对话记录不变",
   "settings.plugins.permission.modelSources": "提供主对话模型（{sources}）：这些数据源会出现在主对话的模型列表；选用后，主对话内容（对话历史、工具结果等）会发送到该插件提供的地址",
   "settings.plugins.runtime.label": "扩展运行",

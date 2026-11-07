@@ -72,6 +72,7 @@
     waitForSessionNavigation,
   } from '../shared/session-navigation.svelte';
   import ImageAttachmentTray from './ImageAttachmentTray.svelte';
+  import { registerPluginComposer, notifyPluginComposerChanged } from '../lib/plugin-composer';
   import { materializeSession } from '../web/agent-api';
   import { mainModelContextWindowKey, type MainModelCatalogGroup } from '../shared/main-model-sources';
   import {
@@ -260,7 +261,7 @@
   // 输入区组件在会话切换时不会销毁。草稿必须按会话隔离，否则新会话会继承
   // 上一个会话尚未发送的图片、标记或文本，表现为内容串会话和“新会话自带附件”。
   const scopedComposerDrafts = new Map<string, ComposerSubmissionDraft>();
-  const IMAGE_FILE_NAME_PATTERN = /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i;
+  const IMAGE_FILE_NAME_PATTERN = /\.(png|jpe?g|gif|webp|avif|bmp|ico|svg|heic|heif)$/i;
   const GENERATED_CLIPBOARD_IMAGE_NAME_PATTERN = /^(clipboard|image|pasted[-_ ]?image)\.[^.]+$/i;
   const CLIPBOARD_IMAGE_TYPE_PRIORITY = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
 
@@ -1787,6 +1788,39 @@
 
   onMount(() => {
     selectedAccessProfile = readStoredAccessProfile();
+    const releasePluginComposer = registerPluginComposer({
+      sessionId: () => currentSessionId?.trim() || '',
+      add(images) {
+        if (sessionInputLocked || sendPreparing || editingQueuedMessage || editingTurn
+          || selectedImages.length + pendingImageReadCount + images.length > MAX_COMPOSER_IMAGES) return null;
+        const added = images.map((image) => ({ ...image, id: generateId() }));
+        dropSessionCommandForAttachment();
+        selectedImages = [...selectedImages, ...added];
+        return added.map((image) => image.id);
+      },
+      has: (id) => selectedImages.some((image) => image.id === id),
+      writable: () => Boolean(currentSessionId?.trim()) && !sessionInputLocked && !sendPreparing && !editingQueuedMessage && !editingTurn
+        && selectedImages.length + pendingImageReadCount < MAX_COMPOSER_IMAGES,
+      beginRead(count) {
+        if (sessionInputLocked || sendPreparing || editingQueuedMessage || editingTurn
+          || selectedImages.length + pendingImageReadCount + count > MAX_COMPOSER_IMAGES) return null;
+        for (let i = 0; i < count; i++) beginImageRead();
+        let finished = false;
+        return () => {
+          if (finished) return;
+          finished = true;
+          for (let i = 0; i < count; i++) finishImageRead();
+        };
+      },
+      remove(id) {
+        if (sessionInputLocked || sendPreparing || editingQueuedMessage || editingTurn) return false;
+        if (!selectedImages.some((image) => image.id === id)) return false;
+        selectedImages = selectedImages.filter((image) => image.id !== id);
+        return true;
+      },
+      focus: () => queueMicrotask(focusEditor),
+      notify: (level, message) => addToast(level, message, undefined, { forceVisible: true }),
+    });
 
     function handleFillComposer(event: Event) {
       const text = (event as CustomEvent<{ text?: string }>).detail?.text;
@@ -1927,6 +1961,7 @@
     window.addEventListener('storage', handleStoredAccessProfileChange);
     document.addEventListener('pointerdown', handlePickerOutsidePointerDown, true);
     return () => {
+      releasePluginComposer();
       setComposerHasUnsavedInput(false);
       window.removeEventListener('magi:fillComposer', handleFillComposer as EventListener);
       window.removeEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
@@ -1940,6 +1975,12 @@
       window.removeEventListener('storage', handleStoredAccessProfileChange);
       document.removeEventListener('pointerdown', handlePickerOutsidePointerDown, true);
     };
+  });
+
+  $effect(() => {
+    void currentSessionId; void selectedImages; void pendingImageReadCount;
+    void sessionInputLocked; void sendPreparing; void editingQueuedMessage; void editingTurn;
+    notifyPluginComposerChanged();
   });
 
   $effect(() => {

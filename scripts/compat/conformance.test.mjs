@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { usesComposerClient } from './translate/client-assets.mjs';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -134,4 +135,9 @@ test('通用设置表单保持稳定快照，多字段保存只提交一次 CAS�
   assert.deepEqual(scope.getSnapshot().value, { title: 'queued', timeout: 45 });
   assert.equal(await scope.unset('timeout'), true);
   assert.deepEqual(scope.getSnapshot().value, { title: 'queued', timeout: 30 });
+});
+test('图片端口权限识别支持压缩变量、属性和解构，不匹配注释与字符串', () => {
+  for (const source of ['function apply(c){ c.magiComposer.addImages([]); }', 'const p=c["magiComposer"];', 'const {magiComposer: images}=c;', 'const {magiComposer}=c;']) assert.equal(usesComposerClient(source), true);
+  assert.equal(usesComposerClient('// ctx.magiComposer\nconst label="ctx.magiComposer";'), false);
+  assert.throws(()=>usesComposerClient('const { =;'), /语法/);
 });

@@ -9,11 +9,27 @@ import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runRestricted, withTempHome } from './sandbox.mjs';
+import ts from 'typescript';
 
 const SLOT_RECORDER = join(dirname(fileURLToPath(import.meta.url)), 'slot-recorder.mjs');
 // 允许作者在入口前放许可证/说明注释、使用单引号或常规空格；只接受明确的
 // DSH 懒加载调用形状，不执行猜测性的其他浏览器模块格式。
 const LOADER_SIGNATURE = /window\.__ModuleLoader__\.load\(\s*\{\s*id\s*:\s*(['"])[^'"\n]+\1\s*,\s*factory\s*(?::|\()/s;
+
+/** 识别浏览器入口的公开图片端口访问；不依赖 ctx 变量名，不把注释/字符串当权限使用。 */
+export function usesComposerClient(source) {
+  const file = ts.createSourceFile('client.js', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  if (file.parseDiagnostics.length) throw new Error('上游客户端脚本语法无效');
+  let used = false;
+  const visit = (node) => {
+    if (ts.isPropertyAccessExpression(node) && node.name.text === 'magiComposer'
+      || ts.isElementAccessExpression(node) && ts.isStringLiteral(node.argumentExpression) && node.argumentExpression.text === 'magiComposer'
+      || ts.isBindingElement(node) && (node.propertyName?.text ?? node.name.text) === 'magiComposer') used = true;
+    if (!used) ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return used;
+}
 
 /** 上游 exports["./client"] 解析出的文件；没有声明则返回 null。 */
 export function findClientFile(upstreamDir, pkg) {

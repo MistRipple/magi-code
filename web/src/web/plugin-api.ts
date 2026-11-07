@@ -355,3 +355,10 @@ export async function callPluginRoute(
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.callRoute'), response);
   return await response.json();
 }
+
+export async function admitPluginComposer(pluginId: string, request: import('../shared/app-server-protocol.generated').PluginComposerAdmissionRequest, signal?: AbortSignal): Promise<void> {
+  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/composer/admit`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request), signal,
+  });
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.callRoute'), response);
+}

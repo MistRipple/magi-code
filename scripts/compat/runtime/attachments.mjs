@@ -2,6 +2,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import sharp from 'sharp';
+import { modelImage } from './browser-image.mjs';
 
 const requests = new AsyncLocalStorage();
 const MAX_BYTES = 24 * 1024 * 1024;
@@ -16,7 +17,7 @@ const map = () => {
 export const withRequestImages = (run) => requests.run(new Map(), run);
 
 export async function saveRequestImage(url) {
-  const match = typeof url === 'string' && /^data:(image\/(?:png|jpeg|webp|gif|svg\+xml));base64,([A-Za-z0-9+/]*={0,2})$/.exec(url);
+  const match = typeof url === 'string' && /^data:(image\/(?:png|jpeg|webp|gif|avif|bmp|x-icon|svg\+xml));base64,([A-Za-z0-9+/]*={0,2})$/.exec(url);
   if (!match) throw new Error('模型桥只接受 Magi 已上传的 base64 图片，不代取远程 URL');
   const input = Buffer.from(match[2], 'base64');
   if (input.toString('base64') !== match[2] || !input.length || input.length > MAX_BYTES) throw new Error('图片编码无效或超过 24 MiB');
@@ -28,11 +29,9 @@ export async function saveRequestImage(url) {
       throw new Error('SVG 图片包含无效根节点或活动/外部内容');
     }
   }
-  const meta = await sharp(input, { limitInputPixels: 64_000_000 }).metadata();
-  const detectedType = meta.format === 'svg' ? 'image/svg+xml' : `image/${meta.format}`;
-  if (detectedType !== match[1]) throw new Error('图片格式与声明不一致');
+  const image = await modelImage(input, match[1]);
   // 完整解码并规范化，变体始终是 8 位 sRGB，不伪造深度或尺寸。
-  const { data, info } = await sharp(input, { limitInputPixels: 64_000_000 }).rotate().toColourspace('srgb').png().toBuffer({ resolveWithObject: true });
+  const { data, info } = await image.rotate().toColourspace('srgb').png().toBuffer({ resolveWithObject: true });
   if (data.length > MAX_BYTES) throw new Error('规范化图片超过 24 MiB');
   const ref = Object.freeze({ attachmentId: digest(data), mediaType: 'image/png', bytes: data.length, width: info.width, height: info.height });
   map().set(ref.attachmentId, { ref, data });

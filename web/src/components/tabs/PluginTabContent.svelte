@@ -15,6 +15,9 @@
     writePluginResource,
     writePluginSettings,
   } from '../../web/plugin-api';
+  import { createPluginComposerBridge } from '../../lib/plugin-composer-bridge';
+  import { subscribePluginComposer } from '../../lib/plugin-composer';
+  import { admitPluginComposer } from '../../web/plugin-api';
 
   interface Props {
     pluginId: string;
@@ -38,8 +41,9 @@
   let instanceId = crypto.randomUUID();
   /** 与 daemon 资源快照上限一致：更大的写入在到达消息桥之前就拒绝。 */
   const MAX_WRITE_BYTES = 4 * 1024 * 1024;
+  const resourceDigest = $derived(pluginProjection().installed.find((item) => item.manifest.id === pluginId)?.digest ?? '');
   const resourceUrl = $derived(
-    agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/ui/${entry.replace(/^ui\//, '').split('/').map(encodeURIComponent).join('/')}`),
+    agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/${resourceDigest ? `ui-v/${resourceDigest}` : 'ui'}/${entry.replace(/^ui\//, '').split('/').map(encodeURIComponent).join('/')}`),
   );
   const resourceOrigin = $derived(new URL(resourceUrl, window.location.href).origin);
 
@@ -114,6 +118,28 @@
   const activeResourceSubscriptions = new Map<string, () => void>();
   const STREAM_ROUTE = '/__magi_compat/streams';
   const activeStreams = new Map<string, string>();
+  let documentDigest = '';
+  let documentEntry = '';
+  let composerSubscribed = false;
+  let composerBridge = makeComposerBridge();
+  function makeComposerBridge() {
+    const expectedInstance = instanceId;
+    return createPluginComposerBridge(async () => {
+      if (!documentDigest) throw new Error('插件页面缺少安装摘要');
+      await admitPluginComposer(pluginId, { expectedDigest: documentDigest, entry: documentEntry });
+    }, () => instanceId === expectedInstance);
+  }
+  function sendComposerSnapshot(): void {
+    if (!composerSubscribed) return;
+    const expectedInstance = instanceId;
+    void composerBridge.call('composer.snapshot', {}).then((snapshot) => {
+      send({ type: 'composer', snapshot }, expectedInstance);
+    }).catch(() => {
+      if (expectedInstance !== instanceId) return;
+      composerSubscribed = false;
+      send({ type: 'composer', snapshot: { sessionId: null, attachmentIds: [], writable: false } }, expectedInstance);
+    });
+  }
   const routeControllers = new Set<AbortController>();
 
   function releaseRoutes(): void {
@@ -125,7 +151,10 @@
     activeStreams.clear();
     // 迟到 open 回执也不属于下一份文档；收到后会走相同 close 入口。
     instanceId = crypto.randomUUID();
+    composerSubscribed = false;
+    composerBridge = makeComposerBridge();
   }
+
 
   function releaseResourceSubscriptions(): void {
     for (const unsubscribe of activeResourceSubscriptions.values()) unsubscribe();
@@ -164,7 +193,7 @@
     const callingPluginId = pluginId;
     const expectedInstance = instanceId;
     const operation = event.data.operation;
-    if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write', 'settings.describe', 'route.call', 'host.openExternal', 'clipboard.write', 'view.resize', 'view.open', 'view.storage.read', 'view.storage.write'].includes(operation)) return;
+    if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write', 'settings.describe', 'route.call', 'host.openExternal', 'clipboard.write', 'view.resize', 'view.open', 'view.storage.read', 'view.storage.write', 'composer.snapshot', 'composer.addImages', 'composer.removeImage', 'composer.notify', 'composer.focus'].includes(operation)) return;
     try {
       if (operation === 'view.storage.read' || operation === 'view.storage.write') {
         // 这是界面缓存，归浏览器 profile 所有；业务配置仍只走 daemon 的 settings CAS。
@@ -200,6 +229,14 @@
           workspaceId: rightPaneState.activeWorkspaceId, sessionId: rightPaneState.activeSessionId });
         if (!id) throw new Error('当前没有可打开右栏的会话');
         send({ type: 'response', requestId, ok: true, result: id }, expectedInstance);
+        return;
+      }
+      if (operation.startsWith('composer.')) {
+        const result = await composerBridge.call(operation, event.data);
+        if (expectedInstance !== instanceId) return;
+        if (operation === 'composer.snapshot') composerSubscribed = true;
+        send({ type: 'response', requestId, ok: true, result }, expectedInstance);
+        sendComposerSnapshot();
         return;
       }
       const resourceId = typeof event.data.resourceId === 'string' ? event.data.resourceId : '';
@@ -297,6 +334,7 @@
 
   onMount(() => {
     window.addEventListener('message', handleMessage);
+    const unsubscribeComposer = subscribePluginComposer(sendComposerSnapshot);
     // 主题或语言变化时重新下发；订阅在挂载时立即回调一次，页面尚未初始化时 send 会被忽略，init 后再补一次。
     const unsubscribeAppearance = subscribeAppearanceRuntime(() => {
       // 变量应用到根元素之后再读取。
@@ -305,6 +343,7 @@
     return () => {
       window.removeEventListener('message', handleMessage);
       unsubscribeAppearance();
+      unsubscribeComposer();
       releaseResourceSubscriptions();
       releaseRoutes();
     };
@@ -318,9 +357,11 @@
 
   $effect.pre(() => {
     // 同一组件被用于另一插件/页面时，导航开始前就使旧文档身份失效。
-    void pluginId; void entry;
+    void pluginId; void entry; void resourceDigest;
     releaseResourceSubscriptions();
     releaseRoutes();
+    documentDigest = '';
+    documentEntry = '';
   });
 </script>
 
@@ -338,6 +379,8 @@
     releaseResourceSubscriptions();
     releaseRoutes();
     reportedHeight = null;
+    documentDigest = resourceDigest;
+    documentEntry = entry;
     send({ type: 'init', pluginId, placement, locale: i18n.locale, theme: readTheme() });
   }}
   sandbox="allow-scripts"

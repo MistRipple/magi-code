@@ -656,6 +656,18 @@ Upgrader 原包追加验证了 0.0.8→0.0.7 切换并保持禁用、请求不�
 
 【剩余】这是通用机制夹具的真实 Electron 验证，不计为 Appshot 原包业务通过。Appshot 的常驻客户端、受控原生辅助进程、会话投影、输入草稿与持久附件投递仍待接入和原包端到端验证；其 `sessions` 必需依赖仍阻止安装。生态分母、95%／100%、Windows 与手机触摸仍未验收。
 
+### 11.13 图片草稿、版本化页面与模型格式边界（2026-11-07）
+
+【现状·实现】新增通用 `composer:["images"]` 用户授权。daemon 根据当前插件包摘要、声明视图和激活授权裁决；Renderer 的现有 InputArea 继续拥有未发送草稿，不创建第二份会话或草稿存储。隔离页面以异步回执添加图片、移除本页面接纳的图片、聚焦及通知；图片批次先预留容量、完整解码，提交前再次检查授权、文档和会话身份。容量不足整批拒绝；损坏图片、切换会话、解码期间撤权或文档失效不能部分挂载。页面资源 URL 带安装摘要，升级不能把旧页面身份绑定到新包，摘要变更即使旧文档尚未卸载也会撤销其请求端口。
+
+【现状·图片】插件图片端口与 GUI 接受 PNG、JPEG、GIF、WebP、AVIF、BMP、ICO 和 SVG；SVG 保留矢量字节，通过图片元素显示。DSH 模型图片桥补齐 AVIF、BMP 与两种 ICO 编码，在模型传输边界产生 PNG/JPEG 派生图；canonical 消息和 GUI 保留原图。BMP 调色板、RLE、位域与保留字节按编码解码，不把保留字节当透明度；尺寸、目录越界、类型伪造、体积与请求私有引用仍受限。该适配属于共享模型桥，没有按某个插件名分支。
+
+【现状·已运行验证】重新构建 macOS arm64 目录包、Electron 45、受控 sidecar 与随包 Node/compat：`test:electron-plugin-runtime` 47/47 通过。9 个真实编码样本经原生插件页面加入 InputArea、真实点击发送、daemon canonical Turn、DSH 适配器实际读取派生图片，回执确认尺寸且 canonical 保留原图；另覆盖批次失败、容量拒绝、移除、SSE、390px、停用和页面异常。独立复跑未经修改的 npm 原包：WorkBuddy 5.20.2 11/11（含本机真实登录态与 hy3 调用），REA 16/16（含真实 MCP 工具目录、原生页面和配置重载）。机制夹具不是 Appshot 原包通过证据。
+
+【现状·定向检查】兼容层 75 项通过（新增格式 HTTP 模型桥、像素颜色/透明度、BMP 编码、端口权限 AST 识别）；Web check 0 错误 0 警告，plugin-composer、composer-policy、plugin-store、right-pane、i18n 与 protocol:check 通过；API 图片草稿授权/摘要/视图/停用拒绝回归通过。证据在 `target/plugin-acceptance/runtime/`（含 `composer-svg.png`）、`workbuddy/` 和 `dsh-rea/`；未运行全仓测试。
+
+【剩余】当前图片端口为明确的异步合同；DSH 的原同步 `conversation.createDrafts`／`input.addAttachments` 尚未映射，不能同步返回 true 冒充宿主挂载。Appshot 的常驻客户端、会话投影、原生辅助进程和持久附件仍未通过原包端到端验收，其必需 sessions 门禁保持拒绝。Windows、生态分母及 95%／100% 目标仍未完成。
+
 ## 12. 验收与证据边界
 
 ### 12.1 已运行验证

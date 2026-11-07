@@ -667,7 +667,7 @@ export type ServerNotification = JsonRpcServerNotification;
 
 export type ServerResponse = JsonRpcServerResponse;
 
-export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite" | "modelSources" | "pluginManagement";
+export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite" | "modelSources" | "pluginManagement" | "composer";
 
 export interface PluginPermission {
   kind: PluginPermissionKind;
@@ -1588,4 +1588,21 @@ export interface PluginDshVersionExemptionRequest {
 
 export interface PluginListRequest {
   includeUpstreamManifest?: boolean;
+}
+
+export interface PluginComposerImageInput {
+  dataUrl: string;
+  name: string;
+  size: number;
+}
+
+export interface PluginComposerSnapshot {
+  sessionId: string | null;
+  attachmentIds: Array<string>;
+  writable: boolean;
+}
+
+export interface PluginComposerAdmissionRequest {
+  expectedDigest: string;
+  entry: string;
 }

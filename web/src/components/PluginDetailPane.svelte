@@ -40,6 +40,7 @@
   const removable = $derived(Boolean(plugin) && !plugin!.active && !plugin!.enabled);
 
   function permissionText(permission: PluginPermission): string {
+    if (permission.kind === 'composer') return i18n.t('settings.plugins.permission.composer');
     if (permission.kind === 'extension') return i18n.t('settings.plugins.permission.extensionFullTrust');
     if (permission.kind === 'pluginManagement') return [
       i18n.t(permission.targets.includes('authorize') ? 'settings.plugins.permission.pluginAuthorization' : 'settings.plugins.permission.pluginManagement'),
@@ -154,7 +155,7 @@
     {#if manifest}
       <div class="settings-chips">
         {#each manifest.permissions as permission}
-          <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement'}>{permissionText(permission)}</span>
+          <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement' || permission.kind === 'composer'}>{permissionText(permission)}</span>
         {:else}
           <span class="settings-row-desc">{i18n.t('settings.plugins.noPermissions')}</span>
         {/each}

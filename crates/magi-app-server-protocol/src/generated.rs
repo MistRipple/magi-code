@@ -1501,6 +1501,8 @@ pub enum PluginPermissionKind {
     ModelSources,
     #[serde(rename = "pluginManagement")]
     PluginManagement,
+    #[serde(rename = "composer")]
+    Composer,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3587,4 +3589,31 @@ pub struct PluginListRequest {
     #[serde(default)]
     #[serde(rename = "includeUpstreamManifest")]
     pub include_upstream_manifest: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginComposerImageInput {
+    #[serde(rename = "dataUrl")]
+    pub data_url: String,
+    pub name: String,
+    pub size: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginComposerSnapshot {
+    #[serde(rename = "sessionId")]
+    pub session_id: Option<String>,
+    #[serde(rename = "attachmentIds")]
+    pub attachment_ids: Vec<String>,
+    pub writable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginComposerAdmissionRequest {
+    #[serde(rename = "expectedDigest")]
+    pub expected_digest: String,
+    pub entry: String,
 }

@@ -12,6 +12,7 @@ import * as McpClient from '@deepseek-ai/dsh-mcp-client';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { browserImageFixtures, bmpEncodingFixtures } from '../lib/plugin-image-fixtures.mjs';
 
 // 只替代 daemon RPC；插件加载、依赖、effect、工具管线及模型目录运行真实上游代码。
 function host(value = {}) {
@@ -547,4 +548,59 @@ test('模型图片桥接受安全 SVG 并拒绝活动内容', async () => {
   const ref = await withRequestImages(() => saveRequestImage(dataUrl));
   assert.equal(ref.mediaType, 'image/png');
   await assert.rejects(withRequestImages(() => saveRequestImage(`data:image/svg+xml;base64,${Buffer.from('<svg><script>alert(1)</script></svg>').toString('base64')}`)), /活动|外部|根节点/);
+});
+
+test('浏览器通用格式通过真实 HTTP 模型桥变成可读位图，伪造和超限图片拒绝', async (t) => {
+  const fixtures = await browserImageFixtures(sharp);
+  let calls = 0;
+  const bridge = await startOpenAiBridge({ provider: 'fixture', saveImage: saveRequestImage, withRequest: withRequestImages,
+    llm: { async *stream(request) {
+      const blocks = request.messages[0].content;
+      assert.equal(blocks.length, fixtures.length);
+      for (let index = 0; index < fixtures.length; index++) {
+        const [, , , width, height] = fixtures[index];
+        const image = await requestAttachments.readImage(blocks[index].attachment, request.signal);
+        const meta = await sharp(image.data).metadata();
+        assert.equal(meta.mediaType, 'image/png'); assert.equal(meta.width, width); assert.equal(meta.height, height);
+        assert.equal(meta.depth, 'uchar');
+        const pixel = await sharp(image.data).flatten({background:'#ffffff'}).raw().toBuffer();
+        assert.ok(pixel[0] > pixel[1] + 80 && pixel[0] > pixel[2] + 80, `${fixtures[index][0]} 保留红色像素，不能把透明度或通道转换错`);
+      }
+      calls++;
+      yield { type: 'text-delta', text: 'all formats received' };
+      yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 2 } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    } },
+  });
+  t.after(() => bridge.close());
+  const response = await fetch(`${bridge.baseUrl}/chat/completions`, { method: 'POST',
+    headers: { authorization: `Bearer ${bridge.apiKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'image', stream: true, messages: [{ role: 'user', content: fixtures.map(([, mime, bytes]) => ({ type: 'image_url', image_url: { url: `data:${mime};base64,${bytes.toString('base64')}` } })) }] }),
+  });
+  assert.equal(response.status, 200, await response.clone().text());
+  assert.match(await response.text(), /all formats received/); assert.equal(calls, 1);
+  await withRequestImages(async () => {
+    const bmp = Buffer.from(fixtures.find(([ext]) => ext === 'bmp')[2]);
+    bmp.writeInt32LE(100_000, 18); bmp.writeInt32LE(100_000, 22);
+    await assert.rejects(saveRequestImage(`data:image/bmp;base64,${bmp.toString('base64')}`), /尺寸/);
+    const ico = Buffer.from(fixtures.find(([ext]) => ext === 'ico')[2]);
+    ico[6] = 100;
+    await assert.rejects(saveRequestImage(`data:image/x-icon;base64,${ico.toString('base64')}`), /尺寸/);
+    await assert.rejects(saveRequestImage(`data:image/x-icon;base64,${fixtures[0][2].toString('base64')}`), /ICO/);
+    await assert.rejects(saveRequestImage(`data:image/avif;base64,${fixtures[0][2].toString('base64')}`), /声明不一致/);
+  });
+});
+
+test('BMP 调色板、位域和 RLE 保留颜色及不透明度，不将保留字节当透明度', async () => {
+  await withRequestImages(async () => {
+    for (const [encoding, input] of bmpEncodingFixtures()) {
+      const ref = await saveRequestImage(`data:image/bmp;base64,${input.toString('base64')}`);
+      const { data } = await requestAttachments.readImage(ref);
+      const pixels = await sharp(data).ensureAlpha().raw().toBuffer();
+      assert.equal(ref.width, 2); assert.equal(ref.height, 1);
+      for (let at = 0; at < pixels.length; at += 4) {
+        assert.ok(pixels[at] > 240 && pixels[at + 1] === 0 && pixels[at + 2] === 0 && pixels[at + 3] === 255, `${encoding}: ${[...pixels]}`);
+      }
+    }
+  });
 });

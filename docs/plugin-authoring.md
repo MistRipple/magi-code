@@ -130,6 +130,7 @@ ui/…                       视图页面与静态资源，按需
 | `modelSources` | 数据源贡献 ID | 允许向主对话的模型列表提交对应数据源；用户选用后，主对话内容会发送到你提供的地址（第 10 节） |
 | `browser` | surface ID | 浏览器 surface，见第 5 节 |
 | `pluginManagement` | `install`／`lifecycle`／`authorize`／`compatibility`／`background` | 在线安装／启停和卸载／独立委托授予目标包声明的权限／修改精确版本豁免／页面请求完成后继续后台管理；各目标分别授权，豁免不能绕过 Magi 能力检查 |
+| `composer` | `["images"]` | 由插件原生页面把用户选择的图片加入当前会话输入框草稿；只能移除本插件页面自己接纳的图片或聚焦输入框，不会自动发送 |
 
 `permissions` 里列出的每一项，用户都必须在授权时逐项确认；缺少任何一项都不能激活。
 
@@ -172,6 +173,10 @@ ui/…                       视图页面与静态资源，按需
 | `resource.write` | `resourceId`、`expectedVersion`、`value` | 新的 `{ version, value }`；版本过期时 `ok: false` |
 | `resource.subscribe` | `resourceId` | 无；之后资源每次变化宿主推送 `{ type: 'event', resourceId, resource }`，订阅失败（停用、撤权、升级）推送 `{ type: 'event', resourceId, error }` |
 | `settings.read` / `settings.write` | `expectedVersion`、`value`（写） | `{ version, value }` |
+| `composer.snapshot` | 无 | `{sessionId,attachmentIds,writable}`；只包含当前文档接纳的图片 ID，之后宿主按状态变化推送 `{type:'composer',snapshot}` |
+| `composer.addImages` | `sessionId`、`images:[{dataUrl,name,size}]` | `{accepted,ids,snapshot}`；等待输入框实际接纳，最多 5 张且每张 10 MiB，容量不足时整批返回 `accepted:false`，坏图或失效身份明确失败 |
+| `composer.removeImage` | `sessionId`、`id` | `{removed,snapshot}`；只允许本页面文档添加的图片 |
+| `composer.focus` / `composer.notify` | `sessionId`；通知另需 `level`、`message` | 无；上述全部操作需要 `composer:["images"]` 授权及当前安装摘要，页面换代后旧 ID 不能操作草稿 |
 | `view.resize` | `height`（CSS 像素，0 到 20000） | 无；仅对 `settings` 位置的视图生效：宿主把 iframe 高度设为该值，由设置页整体滚动，页面自身不应再出现滚动条 |
 
 单次写入不超过 4 MiB。一个最小的页面（`ui/index.html`）：

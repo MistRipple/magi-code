@@ -7,6 +7,8 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { createRequire } from 'node:module';
+import { browserImageFixtures } from './lib/plugin-image-fixtures.mjs';
 import { connectAppPage, connectTarget, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -65,7 +67,7 @@ async function prepare() {
 import Schema from '@deepseek-ai/schemastery';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 export const name = 'magi-runtime-acceptance';
-export const inject = ['commands', 'tools', 'llm'];
+export const inject = ['commands', 'tools', 'llm', 'attachments'];
 export const Config = Schema.object({ label: Schema.string().default('initial'), enabled: Schema.boolean().default(true) });
 export function apply(ctx, config) {
   ctx.commands.register({ name: 'report', description: '报告当前配置', handler: async () => ({ kind: 'text', text: 'DSH_REPORT:' + config.label }) });
@@ -76,9 +78,21 @@ export function apply(ctx, config) {
   });
   class Adapter extends LlmAdapter {
     async listModels(provider) { return [{ provider, id: 'fixture-model', name: 'Runtime Fixture' }]; }
+    async resolveModel(provider, id) { return {provider,id,name:'Runtime Fixture',inputModalities:['text','image']}; }
     async *stream(request) {
       request.signal?.throwIfAborted();
-      const text = 'DSH_MODEL:' + config.label;
+      let text = 'DSH_MODEL:' + config.label;
+      const lastImage = request.messages.flatMap(message=>message.content).filter(block=>block.type==='image').at(-1);
+      const images = lastImage ? [lastImage] : [];
+      if (images.length) {
+        const sizes=[];
+        for(const block of images) {
+          const image=await ctx.attachments.readImageRequest(block.attachment,{width:64,height:64,maxBytes:65536},request.signal);
+          if(image.mediaType!=='image/jpeg' || image.bytes!==image.data.length) throw new Error('invalid model image');
+          sizes.push(image.width+'x'+image.height);
+        }
+        text='DSH_IMAGE:'+sizes.join(',');
+      }
       yield { type: 'block-start', index: 0, blockType: 'text' };
       yield { type: 'text-delta', index: 0, text };
       yield { type: 'block-end', index: 0, block: { type: 'text', text } };
@@ -127,6 +141,7 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   const React=require('react'), h=React.createElement;
   return { async apply(ctx) {
     await Promise.resolve();
+    window.__composer = ctx.magiComposer;
     ctx.inject(['sidebarRight','sidebarRightTabs'], c => {
       for(const key of ['first','second']) {
         c.effect(() => c.sidebarRightTabs.register({id:key,kind:key,title:()=>key}));
@@ -181,6 +196,53 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
     await waitFor(() => frame.evaluate(`document.getElementById('identity')?.textContent===${JSON.stringify(key)}`), '正确的页面身份');
     await waitFor(() => frame.evaluate(`document.getElementById('pulse')?.textContent==='1'`), 'SSE 事件通过真实 daemon 与 iframe 到达上游组件');
     reporter.check(`右栏 ${key} 持续接收 SSE，切换后只有一个活跃上游连接`, true);
+    if (key === 'first') {
+      const imageData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=';
+      const add = (count) => frame.evaluate(`(async()=>{
+        const bytes=Uint8Array.from(atob(${JSON.stringify(imageData)}),c=>c.charCodeAt(0));
+        return await window.__composer.addImages(Array.from({length:${count}},(_,i)=>new File([bytes], 'native-'+i+'.png',{type:'image/png'})));
+      })()`);
+      const receipt = await add(1);
+      reporter.check('原生插件等待真实 InputArea 挂载回执，图片保持未发送草稿', receipt.accepted === true && receipt.ids.length === 1
+        && await page.evaluate(`document.querySelectorAll('.image-tray-thumb').length===1`), JSON.stringify(receipt));
+      const refused = await add(5);
+      reporter.check('超出容量的图片批次拒绝且不部分挂载', refused.accepted === false && refused.ids.length === 0
+        && await page.evaluate(`document.querySelectorAll('.image-tray-thumb').length===1`));
+      const removed = await frame.evaluate(`window.__composer.removeImage(${JSON.stringify(receipt.ids[0])})`);
+      reporter.check('原生插件只移除已接纳的自有图片，输入框真实状态同步', removed.removed === true
+        && await page.evaluate(`document.querySelectorAll('.image-tray-thumb').length===0`));
+      // 各格式必须通过真实 Chromium 解码，不用 PNG 字节冒充其他 MIME。
+      const sharp = createRequire(join(compat, 'package.json'))('sharp');
+      const formats = await browserImageFixtures(sharp);
+      for (const [extension, mime, bytes, width, height] of formats) {
+        const attached = await frame.evaluate(`(async()=>{
+          const bytes=Uint8Array.from(atob(${JSON.stringify(bytes.toString('base64'))}),c=>c.charCodeAt(0));
+          return window.__composer.addImages([new File([bytes],${JSON.stringify('native.' + extension)},{type:${JSON.stringify(mime)}})]);
+        })()`);
+        await waitFor(() => page.evaluate(`document.querySelector('.image-tray-thumb img')?.naturalWidth > 0`), `${extension} 真实缩略图`);
+        reporter.check(`${extension.toUpperCase()} 原始格式经真实 Chromium 解码并挂载草稿`, attached.accepted && attached.ids.length === 1);
+        if (extension === 'svg') await snapshot('composer-svg');
+        const before = (await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).value.canonicalTurns ?? [];
+        const lastSeq = Math.max(0,...before.map(turn=>turn.turnSeq));
+        await waitFor(() => page.evaluate(`!document.querySelector('[data-testid="input-send-button"]')?.disabled`), '图片发送按钮可用');
+        await ui.click('[data-testid="input-send-button"]');
+        const turn = await waitFor(async()=>{
+          const turns=(await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).value.canonicalTurns ?? [];
+          return turns.find(turn=>turn.turnSeq>lastSeq && ['completed','failed','cancelled','blocked'].includes(turn.status));
+        }, `${extension} 图片送达 DSH 模型`,45_000);
+        reporter.check(`${extension.toUpperCase()} 草稿经真实发送和 daemon 到达 DSH 适配器，原图保留在消息中`, turn.status==='completed'
+          && turn.items.some(item=>item.content===`DSH_IMAGE:${width}x${height}`)
+          && turn.items.some(item=>item.metadata?.images?.some(image=>image.dataUrl===`data:${mime};base64,${bytes.toString('base64')}`)), JSON.stringify(turn));
+        await waitFor(() => page.evaluate(`document.querySelectorAll('.image-tray-thumb').length===0`), '发送后草稿清空');
+      }
+      const invalidBatch = await frame.evaluate(`(async()=>{
+        const valid=Uint8Array.from(atob(${JSON.stringify(imageData)}),c=>c.charCodeAt(0));
+        try { await window.__composer.addImages([new File([valid],'valid.png',{type:'image/png'}),new File(['broken'],'broken.png',{type:'image/png'})]); return false; }
+        catch { return true; }
+      })()`);
+      reporter.check('真实解码失败的整批图片被拒绝且不留下部分草稿', invalidBatch
+        && await page.evaluate(`document.querySelectorAll('.image-tray-thumb').length===0`));
+    }
     if (key === 'second') reporter.check('插件隔离存储跨面板保留界面缓存且不泄露宿主键', await frame.evaluate(`localStorage.getItem('panel-cache')==='first' && sessionStorage.getItem('panel-session')==='same-client' && localStorage.getItem('magi-ui-private-probe')===null`));
     await frame.evaluate(`document.getElementById('action').click(); true`);
     await waitFor(() => frame.evaluate(`document.getElementById('receipt')?.textContent===${JSON.stringify(`${key}:${key.toUpperCase()}`)}`), '原生业务回执');

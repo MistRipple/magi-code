@@ -73,8 +73,13 @@ pub fn routes() -> Router<ApiState> {
             get(resource_events),
         )
         .route("/plugins/{id}/ui/{*path}", get(resource))
+        .route(
+            "/plugins/{id}/ui-v/{digest}/{*path}",
+            get(versioned_resource),
+        )
         .route("/plugins/{id}/icon", get(icon))
         .route("/plugins/{id}/routes", post(call_route))
+        .route("/plugins/{id}/composer/admit", post(admit_composer))
         .route("/plugins/{id}/settings/schema", get(settings_schema))
         .route(
             "/plugins/{id}/resources/{resource}",
@@ -178,12 +183,32 @@ async fn resource(
     Path((id, path)): Path<(String, String)>,
     Query(_query): Query<PluginQuery>,
 ) -> Result<Response, ApiError> {
+    resource_response(&state, &id, &path, None)
+}
+
+async fn versioned_resource(
+    State(state): State<ApiState>,
+    Path((id, digest, path)): Path<(String, String, String)>,
+    Query(_query): Query<PluginQuery>,
+) -> Result<Response, ApiError> {
+    resource_response(&state, &id, &path, Some(&digest))
+}
+
+fn resource_response(
+    state: &ApiState,
+    id: &str,
+    path: &str,
+    digest: Option<&str>,
+) -> Result<Response, ApiError> {
     let manager = locked(&state, "读取插件视图")?;
     if !manager.is_active(&id).map_err(plugin_error)? {
         return Err(ApiError::Forbidden("插件未激活".into()));
     }
     let resource_path = format!("ui/{path}");
     let package = manager.package(&id).map_err(plugin_error)?;
+    if digest.is_some_and(|expected| expected != package.digest()) {
+        return Err(ApiError::Conflict("插件页面版本已失效".into()));
+    }
     let bytes = package
         .files()
         .get(&resource_path)
@@ -255,6 +280,42 @@ async fn call_route(
         .clone()
         .ok_or_else(|| ApiError::Conflict("扩展宿主未运行".into()))?;
     executor.call(id, request).await.map(Json)
+}
+
+/// 输入草稿仍由当前 Renderer 的 InputArea 拥有；daemon 裁决调用插件的版本与授权。
+async fn admit_composer(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(request): Json<magi_app_server_protocol::generated::PluginComposerAdmissionRequest>,
+) -> Result<StatusCode, ApiError> {
+    let manager = locked(&state, "校验插件图片草稿授权")?;
+    if !manager.is_active(&id).map_err(plugin_error)?
+        || !manager
+            .permission_allowed(
+                &id,
+                magi_plugin_system::PluginPermissionKind::Composer,
+                "images",
+            )
+            .map_err(plugin_error)?
+    {
+        return Err(ApiError::Forbidden(
+            "插件未激活或缺少 composer:[images] 授权".into(),
+        ));
+    }
+    let package = manager.package(&id).map_err(plugin_error)?;
+    if package.digest() != request.expected_digest {
+        return Err(ApiError::Conflict("插件页面属于旧版安装包".into()));
+    }
+    if !package
+        .manifest()
+        .contributions
+        .views
+        .iter()
+        .any(|view| view.entry == request.entry)
+    {
+        return Err(ApiError::Forbidden("插件页面未在当前清单声明".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn read_resource(
@@ -1079,6 +1140,109 @@ mod tests {
         assert!(csp.starts_with("sandbox allow-scripts;"), "{csp}");
         assert!(csp.contains("connect-src 'none'"), "{csp}");
         drop(root);
+    }
+
+    #[tokio::test]
+    async fn composer_admission_binds_current_digest_view_and_grant() {
+        let root = tempfile::tempdir().unwrap();
+        let state = bare_state(root.path());
+        let manifest = serde_json::json!({
+            "sdkVersion":2,"id":"acme.composer","version":"1.0.0","name":"Composer","description":"",
+            "dataSchemaVersion":1,"settingsSchema":{"type":"object"},
+            "permissions":[{"kind":"composer","targets":["images"]}],
+            "contributions":{"views":[{"id":"page","title":"Page","entry":"ui/index.html","placements":["rightPane"]}]}
+        });
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in [
+            ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
+            ("ui/index.html", b"<!doctype html><title>x</title>".to_vec()),
+        ] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        let package = PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap();
+        {
+            let mut manager = state.plugin_manager.lock().unwrap();
+            manager
+                .install(
+                    &package,
+                    PluginSource::Local {
+                        name: "composer.zip".into(),
+                    },
+                )
+                .unwrap();
+            manager.enable("acme.composer").unwrap();
+        }
+        let request =
+            serde_json::json!({"expectedDigest":package.digest(),"entry":"ui/index.html"});
+        let endpoint = "/plugins/acme.composer/composer/admit";
+        assert_eq!(
+            post_json(&state, endpoint, request.clone()).await.0,
+            StatusCode::FORBIDDEN
+        );
+        {
+            let mut manager = state.plugin_manager.lock().unwrap();
+            manager
+                .authorize("acme.composer", package.manifest().permissions.clone())
+                .unwrap();
+            manager.activate("acme.composer").unwrap();
+        }
+        assert_eq!(
+            post_json(&state, endpoint, request.clone()).await.0,
+            StatusCode::NO_CONTENT
+        );
+        let mut stale = request.clone();
+        stale["expectedDigest"] = serde_json::json!("0".repeat(64));
+        assert_eq!(
+            post_json(&state, endpoint, stale).await.0,
+            StatusCode::CONFLICT
+        );
+        let mut wrong = request.clone();
+        wrong["entry"] = serde_json::json!("ui/other.html");
+        assert_eq!(
+            post_json(&state, endpoint, wrong).await.0,
+            StatusCode::FORBIDDEN
+        );
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/plugins/acme.composer/ui-v/{}/index.html",
+                        package.digest()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/plugins/acme.composer/ui-v/{}/index.html",
+                        "0".repeat(64)
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        state
+            .plugin_manager
+            .lock()
+            .unwrap()
+            .deactivate("acme.composer")
+            .unwrap();
+        assert_eq!(
+            post_json(&state, endpoint, request).await.0,
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]

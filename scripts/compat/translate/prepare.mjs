@@ -7,7 +7,7 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRegistry } from '../index.mjs';
 import { packageId } from '../core/identity.mjs';
-import { analyzeNativeClient, findClientFile } from './client-assets.mjs';
+import { analyzeNativeClient, findClientFile, usesComposerClient } from './client-assets.mjs';
 import { resolveUpstreamIcon } from './icon.mjs';
 import { installDependencies } from './dependencies.mjs';
 import { renderSettingsPage } from './settings-page.mjs';
@@ -108,6 +108,10 @@ export async function prepareDsh(options) {
     // 清单，daemon 合并运行目录时会把同一个贡献 ID 计数两次。
     contributions: { tools: [], commands: [], views: [{ id: 'settings', title: '设置', entry: 'ui/settings.html', placements: ['settings'] }] },
   };
+  const client = findClientFile(root, pkg);
+  if (client && usesComposerClient(readFileSync(client.file, 'utf8'))) {
+    manifest.permissions.push({ kind: 'composer', targets: ['images'] });
+  }
   if (inspection.entries.some((entry) => /^(?:ctx\.)?(?:pluginManager|loader)(?:\.|$)/.test(entry.name))
     || ['pluginManager', 'loader'].some((name) => Object.hasOwn(inspection.serviceReads, name))) {
     manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', 'authorize', 'compatibility', 'background'] });
@@ -118,7 +122,6 @@ export async function prepareDsh(options) {
   const optionalEvents = recorded.listeners.filter((name) => inspection.entries.some((item) => item.kind === 'events' && item.name === name && item.optional));
   writeFileSync(join(options.outDir, 'extension/index.mjs'), `import { activateDsh } from '@magi/compat-dsh';\nimport * as upstream from ${JSON.stringify(`./upstream/${main}`)};\nexport default api => activateDsh(api, upstream, ${JSON.stringify({ runtimeVersion: TRANSLATOR_VERSION, plugin: pkg.name, runtimeId: compatRuntimeId, optionalEvents })});\n`);
   mkdirSync(join(options.outDir, 'ui'), { recursive: true });
-  const client = findClientFile(root, pkg);
   let clientAnalysis = null;
   if (client) {
     if (!/window\.__ModuleLoader__\.load\(\s*\{\s*id\s*:\s*(['"])[^'"\n]+\1\s*,\s*factory\s*(?::|\()/.test(readFileSync(client.file, 'utf8'))) throw new Error('不支持的 DSH 客户端模块格式');

@@ -19,6 +19,7 @@ import { createSettingsScope } from './settings-scope.mjs';
 import { bindSlotProps } from './slot-bindings.mjs';
 import { createWebStorage } from './web-storage.mjs';
 import { createEventSource } from './event-source.mjs';
+import { createComposerClient } from './composer.mjs';
 
 const CHANNEL = 'magi-plugin-v1';
 
@@ -49,8 +50,9 @@ export function startDshClient(options) {
     post({ requestId, ...message });
   });
   const eventSources = createEventSource(request, document.baseURI);
+  const composer = createComposerClient(request);
   globalThis.EventSource = eventSources.EventSource;
-  window.addEventListener('pagehide', () => { eventSources.dispose(); slotContext.dispose(); }, { once: true });
+  window.addEventListener('pagehide', () => { eventSources.dispose(); composer.dispose(); slotContext.dispose(); }, { once: true });
 
   // —— 路由：上游界面用 fetch('/plugins/<name>/…') 访问自己的后端，这里转交给宿主里的同一处理器 ——
   globalThis.fetch = async (input, init = {}) => {
@@ -106,6 +108,7 @@ export function startDshClient(options) {
     return request({ operation: 'view.open', viewId: view.viewId });
   } });
   const { ctx } = slotContext;
+  ctx.magiComposer = composer.api;
 
   // —— 主题：Magi 令牌映射到上游的 --dsw-* 变量 ——
   const applyTheme = (theme) => {
@@ -264,6 +267,8 @@ export function startDshClient(options) {
       if (m.placement) { placement = m.placement === 'settings' ? 'settings' : 'page'; }
       if (m.locale && m.locale !== locale) { locale = m.locale; slotContext.setLocale(locale); render(); }
       if (m.theme) applyTheme(m.theme);
+    } else if (m.type === 'composer') {
+      composer.update(m.snapshot);
     } else if (m.type === 'response') {
       const waiter = pending.get(m.requestId);
       pending.delete(m.requestId);

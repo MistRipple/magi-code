@@ -56,7 +56,9 @@ impl PluginPackage {
             }
             let mode = file.unix_mode().unwrap_or(0);
             let kind = mode & 0o170000;
-            if !matches!(kind, 0 | 0o100000 | 0o040000) || mode & 0o111 != 0 && !file.is_dir() && !native_asset {
+            if !matches!(kind, 0 | 0o100000 | 0o040000)
+                || mode & 0o111 != 0 && !file.is_dir() && !native_asset
+            {
                 return Err(invalid("发布包不得包含符号链接、特殊文件或可执行权限文件"));
             }
             if file.is_dir() {
@@ -339,6 +341,14 @@ fn validate_manifest_with_limits(
         return Err(invalid("插件版本、名称或说明无效"));
     }
     validate_extension(manifest)?;
+    for permission in &manifest.permissions {
+        if permission.kind == PluginPermissionKind::Composer
+            && (permission.targets.as_slice() != ["images"]
+                || manifest.contributions.views.is_empty())
+        {
+            return Err(invalid("composer 权限必须为 images，且插件须声明视图"));
+        }
+    }
     let mut permissions = HashSet::new();
     if manifest.permissions.len() > 64 {
         return Err(invalid("权限声明超限"));
@@ -677,12 +687,13 @@ fn validate_file(name: &str, bytes: &[u8]) -> Result<(), PluginError> {
     // full-trust 辅助程序（翻译器已在安装期剔除其他平台文件）。普通插件
     // 仍然不能借发布包携带原生程序。
     let native_asset = name.starts_with("extension/upstream/native/");
-    if !native_asset && (bytes.starts_with(b"MZ")
-        || bytes.starts_with(b"\x7fELF")
-        || bytes.starts_with(b"\0asm")
-        || bytes.starts_with(b"\xfe\xed\xfa")
-        || bytes.starts_with(b"\xcf\xfa\xed\xfe")
-        || bytes.starts_with(b"\xca\xfe\xba\xbe"))
+    if !native_asset
+        && (bytes.starts_with(b"MZ")
+            || bytes.starts_with(b"\x7fELF")
+            || bytes.starts_with(b"\0asm")
+            || bytes.starts_with(b"\xfe\xed\xfa")
+            || bytes.starts_with(b"\xcf\xfa\xed\xfe")
+            || bytes.starts_with(b"\xca\xfe\xba\xbe"))
     {
         return Err(invalid("发布包不得包含原生程序、字节码或 WASM 后台组件"));
     }
