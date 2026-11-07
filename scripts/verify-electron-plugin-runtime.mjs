@@ -107,11 +107,19 @@ async function verifyNativePanels(session) {
   await writeFile(join(upstream, 'index.js'), `
 export const inject = ['webServer'];
 export function apply(ctx) {
+  const clients=new Set();
+  ctx.webServer.register({path:'/panel-events',handler(req,res){
+    res.writeHead(200,{'content-type':'text/event-stream'});
+    res.write(': connected\\n\\n'); clients.add(res);
+    const timer=setInterval(()=>res.write('event: pulse\\ndata: '+JSON.stringify({live:clients.size})+'\\n\\n'),150);
+    req.on('close',()=>{clearInterval(timer);clients.delete(res);});
+    res.on('close',()=>{clearInterval(timer);clients.delete(res);});
+  }});
   ctx.webServer.register({ path: '/panel-action', handler: async (req,res) => {
     let body=''; for await(const chunk of req) body+=chunk;
     const data=JSON.parse(body || '{}');
     res.setHeader('content-type','application/json');
-    res.end(JSON.stringify({key:req.headers['x-panel-key'], result:String(data.text).toUpperCase()}));
+    res.end(JSON.stringify({key:req.headers['x-panel-key'], result:String(data.text).toUpperCase(),live:clients.size}));
   }});
 }`);
   await writeFile(join(upstream, 'client.js'), `
@@ -124,13 +132,19 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
         c.effect(() => c.sidebarRightTabs.register({id:key,kind:key,title:()=>key}));
         ctx.slots.register({name:'sidebar.right.pane.tab',key}, () => {
           const [text,setText]=React.useState(key);
+          const [pulse,setPulse]=React.useState('waiting');
+          React.useEffect(()=>{
+            const source=new EventSource('/panel-events');
+            source.addEventListener('pulse',event=>setPulse(JSON.parse(event.data).live));
+            return ()=>source.close();
+          },[]);
           return h('main',{},h('h1',{id:'identity'},key),
             h('button',{id:'action',onClick:async()=>{
               localStorage.setItem('panel-cache', key); sessionStorage.setItem('panel-session', 'same-client');
               const response=await fetch('/panel-action',{method:'POST',headers:{'content-type':'application/json','x-panel-key':key},body:JSON.stringify({text:key})});
               const result=await response.json(); setText(result.key+':'+result.result);
             }},'Run'),
-            h('output',{id:'receipt'},text),
+            h('output',{id:'receipt'},text),h('output',{id:'pulse'},pulse),
             h('button',{id:'next-panel',onClick:()=>c.sidebarRight.openTab(key==='first'?'second':'first')},'Next panel'));
         });
       }
@@ -165,6 +179,8 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
     const url = await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).src`);
     frame = await waitFor(() => connectTarget(cdpPort, (target) => (target.type === 'iframe' || target.type === 'page') && target.url === url, '右栏原生页面', errors), '右栏原生页面');
     await waitFor(() => frame.evaluate(`document.getElementById('identity')?.textContent===${JSON.stringify(key)}`), '正确的页面身份');
+    await waitFor(() => frame.evaluate(`document.getElementById('pulse')?.textContent==='1'`), 'SSE 事件通过真实 daemon 与 iframe 到达上游组件');
+    reporter.check(`右栏 ${key} 持续接收 SSE，切换后只有一个活跃上游连接`, true);
     if (key === 'second') reporter.check('插件隔离存储跨面板保留界面缓存且不泄露宿主键', await frame.evaluate(`localStorage.getItem('panel-cache')==='first' && sessionStorage.getItem('panel-session')==='same-client' && localStorage.getItem('magi-ui-private-probe')===null`));
     await frame.evaluate(`document.getElementById('action').click(); true`);
     await waitFor(() => frame.evaluate(`document.getElementById('receipt')?.textContent===${JSON.stringify(`${key}:${key.toUpperCase()}`)}`), '原生业务回执');
@@ -179,6 +195,8 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   await post(`/api/plugins/${id}/deactivate`);
   await waitFor(async () => !await ui.exists(`iframe[data-plugin-id="${id}"]`), '停用回收右栏面板');
   reporter.check('停用后右栏不保留可调用的旧插件 iframe', true);
+  const stoppedStream = await api(`/api/plugins/${id}/routes`, { method:'POST', path:'/__magi_compat/streams', body:{action:'open',request:{method:'GET',path:'/panel-events'}} });
+  reporter.check('停用后事件连接沿同一 daemon 准入拒绝重连', stoppedStream.status === 409);
   frame?.close(); frame = null;
 }
 

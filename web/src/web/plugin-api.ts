@@ -344,11 +344,13 @@ export async function writePluginSettings(
 export async function callPluginRoute(
   pluginId: string,
   request: import('../shared/app-server-protocol.generated').PluginRouteCallRequest,
+  signal?: AbortSignal,
 ): Promise<import('../shared/app-server-protocol.generated').PluginRouteCallResult> {
   const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/routes`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(request),
+    signal,
   });
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.callRoute'), response);
   return await response.json();

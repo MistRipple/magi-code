@@ -646,6 +646,16 @@ Upgrader 原包追加验证了 0.0.8→0.0.7 切换并保持禁用、请求不�
 
 本轮只覆盖 Ops 的扫描、豁免、在线安装和卸载路径；完整生态分母、Windows、Appshot 会话投递、Upgrader 回滚、平台原生辅助进程和 95%／100% 目标仍未完成，不能由通过数推导生态兼容率。
 
+### 11.12 原生页面 SSE 与文档生命周期（2026-11-07）
+
+【现状·根因】Appshot 原包的 macOS 投递通过 `EventSource` 接收 `appshot/ready`；此前路由只在 `res.end()` 后返回整段正文，持续连接既无法收到事件，也不会在页面切换时主动回收。其客户端同时依赖 `sessions.list`／`scope`、conversation 的草稿附件和输入接口，且须在设置页关闭后继续运行；因此仅放开 sessions 依赖不能完成截图业务。本轮未放宽该依赖门禁。
+
+【现状·实现】三项改造沿现有入口实施：①Node/Fetch 路由共用有界 SSE 传输队列，以序号确认和分批读取保留未确认数据；②原始页面的 EventSource 经原视图桥访问同一插件路由，支持命名事件、多行 data、ID、UTF-8／CRLF 跨块、重连和 204 终止；③Renderer 按当前文档身份记录连接，换页／关闭取消在途请求、关闭连接并拒绝迟到回执，宿主停用和路由卸载回收原请求。不新增监听端口、会话持久化或插件专用业务分支。具体限制见[扩展协议](extension-protocol-v1.md)。
+
+【现状·已运行验证】重新构建的 macOS arm64 目录包（Electron 45、sidecar、随包 Node/compat）运行 `test:electron-plugin-runtime`：25/25 通过，新增两个独立原生右栏页面持续接收真实 SSE、切换只保留一个上游连接、停用后重连拒绝；原配置、动态工具、模型桥、390px 和页面无异常检查仍通过。`test:compat` 72 项通过，其中 6 项覆盖 SSE 的 Node/Fetch 读取、队列和批次边界、取消、过期、头超时、204、Unicode 和事件解析。Web check 0 错误 0 警告，差异空白检查通过。证据位于 `target/plugin-acceptance/runtime/{results.json,electron.log,panel-first.png,panel-second.png,panel-390.png}`。
+
+【剩余】这是通用机制夹具的真实 Electron 验证，不计为 Appshot 原包业务通过。Appshot 的常驻客户端、受控原生辅助进程、会话投影、输入草稿与持久附件投递仍待接入和原包端到端验证；其 `sessions` 必需依赖仍阻止安装。生态分母、95%／100%、Windows 与手机触摸仍未验收。
+
 ## 12. 验收与证据边界
 
 ### 12.1 已运行验证

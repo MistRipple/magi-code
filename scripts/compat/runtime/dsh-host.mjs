@@ -8,6 +8,7 @@ import { runtimeId } from '../core/identity.mjs';
 import { toJsonSchema } from '../translate/schema.mjs';
 import { RuntimeCatalog } from './catalog.mjs';
 import { runRoute } from './routes.mjs';
+import { createRouteStreams, STREAM_ROUTE } from './route-streams.mjs';
 import { startOpenAiBridge } from './openai-bridge.mjs';
 import { requestAttachments, saveRequestImage, withRequestImages } from './attachments.mjs';
 import { mountRemote } from './remote.mjs';
@@ -42,7 +43,9 @@ export async function activateDsh(api, module, options) {
   const catalog = new RuntimeCatalog(api);
   const tools = new Map();
   const guards = new Set();
-  const routes = new Set();
+  const routes = new Map();
+  const routeStreams = createRouteStreams((path) => routes.get(`exact:${path}`)
+    ?? [...routes].filter(([key]) => key.startsWith('prefix:') && path.startsWith(key.slice(7))).sort(([a], [b]) => b.length - a.length)[0]?.[1]);
   const bridges = new Map();
   const sourceReleases = new Map();
   const savedImages = new Map();
@@ -139,13 +142,16 @@ export async function activateDsh(api, module, options) {
       const key = `${kind}:${definition.path}`;
       if (routes.has(key)) throw new Error(`路由重复：${definition.path}`);
       return this.ctx.effect(() => {
-        routes.add(key);
+        if (definition.path === STREAM_ROUTE) throw new Error('插件路由使用了兼容层保留路径');
+        routes.set(key, definition);
         let release;
         catalog.enqueue(async () => { release = await api.route(definition.path, (input, context) => withProfile(() => runRoute(definition, input, context), context.signal), { match: kind }); }).catch(() => {});
-        return () => { routes.delete(key); return catalog.enqueue(async () => release?.()); };
+        return () => { routes.delete(key); routeStreams.closePath(definition.path); return catalog.enqueue(async () => release?.()); };
       });
     }
   });
+
+  const releaseStreamRoute = await api.route(STREAM_ROUTE, (input, context) => withProfile(async () => ({ body: await routeStreams.call(input.body, context) }), context.signal));
 
   const checkConfig = (raw) => {
     if (fiber) return fiber.resolveConfig(clone(raw));
@@ -331,6 +337,7 @@ export async function activateDsh(api, module, options) {
   const dispose = async () => {
     if (stopped) return;
     stopped = true; catalog.live = false;
+    routeStreams.dispose();
     clearInterval(catalogTimer);
     modelLookups.abort(new Error('扩展已卸载'));
     await publishing?.catch(() => {});
@@ -338,6 +345,7 @@ export async function activateDsh(api, module, options) {
     // 停用时 daemon 可能已经关闭写入准入；一个 RPC 失败不能阻止本地端口和 effect 回收。
     const cleanup = await Promise.allSettled([
       ctx.fiber.dispose(),
+      releaseStreamRoute?.(),
       ...[...sourceReleases].map(async ([provider, release]) => {
         try { await api.modelSource.clear(runtimeId('model', provider)); }
         finally { await release(); }

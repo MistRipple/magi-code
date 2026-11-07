@@ -18,6 +18,7 @@ import { createSlotContext, slotDisposition, MOUNT_PRIORITY, SLOT_SURFACE } from
 import { createSettingsScope } from './settings-scope.mjs';
 import { bindSlotProps } from './slot-bindings.mjs';
 import { createWebStorage } from './web-storage.mjs';
+import { createEventSource } from './event-source.mjs';
 
 const CHANNEL = 'magi-plugin-v1';
 
@@ -38,11 +39,18 @@ export function startDshClient(options) {
 
   // —— 视图桥 ——
   const post = (message) => parent.postMessage({ channel: CHANNEL, instanceId, type: 'request', ...message }, '*');
-  const request = (message) => new Promise((resolve, reject) => {
+  const request = (message, signal) => new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
     const requestId = `r${++nextRequest}`;
-    pending.set(requestId, { resolve, reject });
+    const abort = () => { pending.delete(requestId); reject(signal.reason); };
+    const cleanup = () => signal?.removeEventListener('abort', abort);
+    pending.set(requestId, { resolve: (value) => { cleanup(); resolve(value); }, reject: (error) => { cleanup(); reject(error); } });
+    signal?.addEventListener('abort', abort, { once: true });
     post({ requestId, ...message });
   });
+  const eventSources = createEventSource(request, document.baseURI);
+  globalThis.EventSource = eventSources.EventSource;
+  window.addEventListener('pagehide', () => { eventSources.dispose(); slotContext.dispose(); }, { once: true });
 
   // —— 路由：上游界面用 fetch('/plugins/<name>/…') 访问自己的后端，这里转交给宿主里的同一处理器 ——
   globalThis.fetch = async (input, init = {}) => {
@@ -227,7 +235,8 @@ export function startDshClient(options) {
 
   window.addEventListener('message', async (event) => {
     const m = event.data;
-    if (!m || m.channel !== CHANNEL) return;
+    if (event.source !== parent || !m || m.channel !== CHANNEL) return;
+    if (m.type !== 'init' && m.instanceId !== instanceId) return;
     if (m.type === 'init') {
       instanceId = m.instanceId;
       placement = m.placement === 'settings' ? 'settings' : 'page';

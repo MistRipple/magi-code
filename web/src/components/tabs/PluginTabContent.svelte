@@ -112,6 +112,20 @@
   }
 
   const activeResourceSubscriptions = new Map<string, () => void>();
+  const STREAM_ROUTE = '/__magi_compat/streams';
+  const activeStreams = new Map<string, string>();
+  const routeControllers = new Set<AbortController>();
+
+  function releaseRoutes(): void {
+    for (const controller of routeControllers) controller.abort();
+    routeControllers.clear();
+    for (const [id, owner] of activeStreams) {
+      void callPluginRoute(owner, { method: 'POST', path: STREAM_ROUTE, body: { action: 'close', id } }).catch(() => {});
+    }
+    activeStreams.clear();
+    // 迟到 open 回执也不属于下一份文档；收到后会走相同 close 入口。
+    instanceId = crypto.randomUUID();
+  }
 
   function releaseResourceSubscriptions(): void {
     for (const unsubscribe of activeResourceSubscriptions.values()) unsubscribe();
@@ -147,6 +161,7 @@
       || event.source !== iframe?.contentWindow || !event.data || event.data.channel !== 'magi-plugin-v1'
       || event.data.instanceId !== instanceId || event.data.type !== 'request') return;
     const requestId = typeof event.data.requestId === 'string' ? event.data.requestId : '';
+    const callingPluginId = pluginId;
     const expectedInstance = instanceId;
     const operation = event.data.operation;
     if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write', 'settings.describe', 'route.call', 'host.openExternal', 'clipboard.write', 'view.resize', 'view.open', 'view.storage.read', 'view.storage.write'].includes(operation)) return;
@@ -203,13 +218,32 @@
         if (JSON.stringify(event.data.body ?? null).length > MAX_WRITE_BYTES) {
           throw new Error('插件写入内容超过大小上限');
         }
-        const routed = await callPluginRoute(pluginId, {
+        const stream = event.data.path === STREAM_ROUTE ? event.data.body : undefined;
+        if (event.data.path === STREAM_ROUTE) {
+          if (!stream || !['open', 'read', 'close'].includes(stream.action) || event.data.method !== 'POST') throw new Error('插件事件请求无效');
+          if (stream.action !== 'open' && !activeStreams.has(stream.id)) throw new Error('事件连接不属于当前视图');
+          if (stream.action === 'open' && activeStreams.size >= 8) throw new Error('插件事件连接超过上限');
+        }
+        const controller = new AbortController();
+        routeControllers.add(controller);
+        let routed;
+        try { routed = await callPluginRoute(callingPluginId, {
           method: event.data.method,
           path: event.data.path,
           ...(typeof event.data.query === 'string' ? { query: event.data.query } : {}),
           ...(event.data.headers === undefined ? {} : { headers: event.data.headers }),
           ...(event.data.body === undefined ? {} : { body: event.data.body }),
-        });
+        }, controller.signal); }
+        finally { routeControllers.delete(controller); }
+        if (stream?.action === 'open' && routed.status === 200 && typeof (routed.body as { id?: unknown })?.id === 'string') {
+          const id = (routed.body as { id: string }).id;
+          if (expectedInstance !== instanceId) {
+            void callPluginRoute(callingPluginId, { method: 'POST', path: STREAM_ROUTE, body: { action: 'close', id } }).catch(() => {});
+            return;
+          }
+          activeStreams.set(id, callingPluginId);
+        }
+        if (stream?.action === 'close') activeStreams.delete(stream.id);
         send({ type: 'response', requestId, ok: true, result: routed }, expectedInstance);
         return;
       }
@@ -272,6 +306,7 @@
       window.removeEventListener('message', handleMessage);
       unsubscribeAppearance();
       releaseResourceSubscriptions();
+      releaseRoutes();
     };
   });
 
@@ -279,6 +314,13 @@
     // 语言切换：读取响应式的 locale 即建立依赖。
     void i18n.locale;
     sendHostContext();
+  });
+
+  $effect.pre(() => {
+    // 同一组件被用于另一插件/页面时，导航开始前就使旧文档身份失效。
+    void pluginId; void entry;
+    releaseResourceSubscriptions();
+    releaseRoutes();
   });
 </script>
 
@@ -294,7 +336,7 @@
   bind:this={iframe}
   onload={() => {
     releaseResourceSubscriptions();
-    instanceId = crypto.randomUUID();
+    releaseRoutes();
     reportedHeight = null;
     send({ type: 'init', pluginId, placement, locale: i18n.locale, theme: readTheme() });
   }}

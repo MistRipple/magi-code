@@ -27,11 +27,11 @@ export function routeHeaders(input) {
 }
 
 /** 把视图请求还原成上游处理器熟悉的 Node 请求对象：回环主机头、本机套接字、可读的请求体流。 */
-export function makeRouteRequest(input, signal) {
+export function makeRouteRequest(input, signal, options = {}) {
   const url = input.query ? `${input.path}?${input.query}` : input.path;
   const hasBody = input.body !== null && input.body !== undefined && input.method !== 'GET';
   const payload = hasBody ? Buffer.from(typeof input.body === 'string' ? input.body : JSON.stringify(input.body)) : Buffer.alloc(0);
-  const req = Readable.from(payload.length ? [payload] : []);
+  const req = Readable.from(payload.length ? [payload] : [], options);
   req.method = input.method;
   req.url = url;
   const headers = routeHeaders(input.headers);
@@ -42,15 +42,17 @@ export function makeRouteRequest(input, signal) {
 }
 
 /** 收集上游处理器写出的响应；`end` 之后通过 onEnd 交出状态码、内容类型和整段正文。 */
-export function makeRouteResponse(onEnd) {
+export function makeRouteResponse(onEnd, streaming) {
   const emitter = new EventEmitter();
   const chunks = [];
   const headers = {};
   let size = 0;
   let ended = false;
   let overflow = false;
+  const publishHeaders = () => streaming?.headers({ status: res.statusCode, contentType: headers['content-type'] });
   const push = (chunk) => {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    if (streaming) { streaming.chunk(buffer); return; }
     size += buffer.length;
     if (size > MAX_ROUTE_BODY_BYTES) {
       // 超限不截断：丢弃已收集的内容，结束时以明确的失败交出。处理器仍可继续写，但不再占用内存。
@@ -66,13 +68,16 @@ export function makeRouteResponse(onEnd) {
       res.statusCode = code;
       for (const [key, value] of Object.entries(extra ?? {})) headers[key.toLowerCase()] = String(value);
       res.headersSent = true;
+      publishHeaders();
       return res;
     },
     setHeader(key, value) { headers[key.toLowerCase()] = String(value); },
     getHeader(key) { return headers[key.toLowerCase()]; },
-    write(chunk) { if (ended) return false; res.headersSent = true; push(chunk); return true; },
+    flushHeaders() { res.headersSent = true; publishHeaders(); },
+    write(chunk) { if (ended) return false; res.headersSent = true; publishHeaders(); push(chunk); return true; },
     end(chunk) {
       if (ended) return res;
+      publishHeaders();
       if (chunk !== undefined && chunk !== null) push(chunk);
       ended = true;
       res.writable = false;

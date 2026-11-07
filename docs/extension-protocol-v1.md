@@ -118,6 +118,8 @@ daemon 响应形状：
 
 插件私有页面的路由请求可携带可选 `headers`（`PluginRouteCallRequest`）。只转交页面自己提供的应用头，不转交 Magi HTTP 请求的 Cookie、凭据和 Origin；Host、Origin、Cookie、代理与传输控制头禁止覆盖。DSH 原生页面的 localStorage/sessionStorage 由 iframe 消息桥按插件 ID 隔离代理，仅保存浏览器 profile 内的界面缓存；插件业务配置仍走 daemon 设置 CAS。右栏导航仅能打开当前激活插件清单声明的右栏视图。
 
+DSH 页面里的 `EventSource` 通过相同路由调用承载 SSE。兼容层保留 `/__magi_compat/streams` 控制路由，打开、读取和关闭均经过上述 daemon 准入，不增加监听端口或会话写入口。连接只可调用本插件已登记的 GET 路由；Node 与 Fetch 响应均须为 `200 text/event-stream`，`204` 表示结束且不重连。每插件至多 8 条连接，每条至多保留 2 MiB／8192 个未确认块；按单调序号确认和分批返回，重复读取不丢未确认数据。读取等待至多 15 秒，45 秒无读取自动关闭。Renderer 按文档 nonce 记录连接归属，导航/卸载会取消在途路由并关闭已登记连接，旧文档回执不能更新新页面；上游路由撤销和宿主停用也关闭对应原请求。SSE 的命名事件、多行数据、跨块 UTF-8/CRLF、事件 ID 与重连由页面适配器承载；普通 fetch 仍返回完整响应，WebSocket 未由此实现。
+
 `api.config`／`api.configRevision` 是只读配置快照。SDK 不提供 `register.skill`、`register.mcp`、`register.dispose`、`migration.run` 或任意事实写入接口。MCP 为内置功能，Skill 来自清单声明。未知方法返回 `MethodNotFound`。
 
 ## 5. 注册
