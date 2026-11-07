@@ -61,6 +61,43 @@ function host(value = {}) {
 
 const options = { runtimeVersion: 2, plugin: 'fixture' };
 
+test('附件读取沿 daemon blob 身份和过期事实，不保留绕过授权的本地图片副本', async (t) => {
+  const h = host();
+  const values = new Map();
+  let gets = 0, attachments;
+  h.api.blob = {
+    async put(value, contentType) {
+      assert.equal(contentType, 'image/png');
+      values.set('daemon-image', structuredClone(value));
+      return {ref:'daemon-image'};
+    },
+    async get(id) {
+      gets++;
+      if (!values.has(id)) throw new Error('blob 已过期或撤权');
+      return {value:structuredClone(values.get(id))};
+    },
+  };
+  const running = await activateDsh(h.api, {inject:['attachments'],apply(ctx){ attachments=ctx.attachments; }}, options);
+  t.after(()=>running.dispose());
+  const bytes=Buffer.from('image payload'), ref=await attachments.saveImage({data:bytes,mediaType:'image/png',name:'capture.png'});
+  assert.deepEqual(ref,{attachmentId:'daemon-image',mediaType:'image/png',bytes:bytes.length,name:'capture.png'});
+  bytes.fill(0);
+  const read=await attachments.readImage({...ref,mediaType:'image/jpeg',name:'forged.jpg'});
+  assert.equal(read.data.toString(),'image payload');
+  assert.equal(read.ref.mediaType,'image/png');
+  assert.equal(read.ref.name,'capture.png');
+  assert.equal(gets,1);
+  values.clear();
+  await assert.rejects(attachments.readImage(ref),/过期或撤权/);
+  const controller=new AbortController(); controller.abort(new Error('cancelled'));
+  await assert.rejects(attachments.readImage(ref,controller.signal),/cancelled/);
+  assert.equal(gets,2,'已取消的请求不读取 daemon');
+  h.api.blob.put=async()=>({});
+  await assert.rejects(attachments.saveImage({data:Buffer.from('x'),mediaType:'image/png'}),/未返回已保存附件身份/);
+  delete h.api.blob;
+  await assert.rejects(attachments.saveImage({data:Buffer.from('x'),mediaType:'image/png'}),/未提供附件 blob 服务/);
+});
+
 test('DSH 插件目录读取 daemon 当前事实，保留作用域包名、版本和停用状态，不伪造空列表或写入口', async () => {
   const { createPluginManager } = await import('./runtime/plugin-manager.mjs');
   let enabled = true;

@@ -48,7 +48,6 @@ export async function activateDsh(api, module, options) {
     ?? [...routes].filter(([key]) => key.startsWith('prefix:') && path.startsWith(key.slice(7))).sort(([a], [b]) => b.length - a.length)[0]?.[1]);
   const bridges = new Map();
   const sourceReleases = new Map();
-  const savedImages = new Map();
   const published = new Map();
   let stopped = false;
   let fiber;
@@ -225,21 +224,22 @@ export async function activateDsh(api, module, options) {
     constructor(c) { super(c, 'attachments'); }
     async saveImage(input) {
       if (!input || !Buffer.isBuffer(input.data) || typeof input.mediaType !== 'string') throw new Error('附件图片输入无效');
-      const ref = { attachmentId: `blob-${Math.random().toString(36).slice(2)}`, mediaType: input.mediaType, bytes: input.data.length };
-      savedImages.set(ref.attachmentId, { ref, data: Buffer.from(input.data) });
-      if (api.blob?.put) {
-        const stored = await api.blob.put({ dataBase64: input.data.toString('base64'), mediaType: input.mediaType }, input.mediaType);
-        if (stored?.ref) ref.attachmentId = stored.ref;
-      }
-      return ref;
+      if (!api.blob?.put) throw new Error('daemon 未提供附件 blob 服务');
+      const stored = await api.blob.put({ dataBase64: input.data.toString('base64'), mediaType: input.mediaType,
+        ...(input.name === undefined ? {} : { name: input.name }) }, input.mediaType);
+      if (!stored?.ref) throw new Error('daemon 未返回已保存附件身份');
+      return { attachmentId: stored.ref, mediaType: input.mediaType, bytes: input.data.length,
+        ...(input.name === undefined ? {} : { name: input.name }) };
     }
     async readImage(ref, signal) {
-      const local = savedImages.get(ref?.attachmentId);
-      if (local) return { ref: local.ref, data: Buffer.from(local.data) };
+      signal?.throwIfAborted?.();
       const blob = await api.blob?.get?.(ref?.attachmentId);
       if (!blob?.value?.dataBase64) throw new Error('图片引用不存在或已过期');
       signal?.throwIfAborted?.();
-      return { ref, data: Buffer.from(blob.value.dataBase64, 'base64') };
+      const value = blob.value;
+      const data = Buffer.from(value.dataBase64, 'base64');
+      return { ref: { attachmentId: ref.attachmentId, mediaType: value.mediaType, bytes: data.length,
+        ...(value.name === undefined ? {} : { name: value.name }) }, data };
     }
     readImageRequest(...args) { return requestAttachments.readImageRequest(...args); }
     imageHostPath() { return undefined; }

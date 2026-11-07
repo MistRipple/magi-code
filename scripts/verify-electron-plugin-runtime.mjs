@@ -68,10 +68,16 @@ async function prepare() {
 import Schema from '@deepseek-ai/schemastery';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 export const name = 'magi-runtime-acceptance';
-export const inject = ['commands', 'tools', 'llm', 'attachments'];
+export const inject = ['commands', 'tools', 'llm', 'attachments', 'webServer'];
 export const Config = Schema.object({ label: Schema.string().default('initial'), enabled: Schema.boolean().default(true) });
 export function apply(ctx, config) {
   ctx.commands.register({ name: 'report', description: '报告当前配置', handler: async () => ({ kind: 'text', text: 'DSH_REPORT:' + config.label }) });
+  ctx.webServer.register({path:'/image-roundtrip',resource:async()=>{
+    const data=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=','base64');
+    const ref=await ctx.attachments.saveImage({data,mediaType:'image/png',name:'capture.png'});
+    const saved=await ctx.attachments.readImage({...ref,mediaType:'image/jpeg',name:'forged.jpg'});
+    return Response.json({sameBytes:saved.data.equals(data),ref:saved.ref});
+  }});
   if (config.enabled) ctx.effect(() => {
     const timer = setTimeout(() => ctx.tools.register({ name: 'late-read', description: '读取验收配置', parameters: { type: 'object' }, readOnly: true,
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }, execute: async () => config.label }), 1700);
@@ -371,6 +377,10 @@ try {
     return plugin?.runtime?.state === 'running';
   }, 'DSH 宿主就绪', 30_000);
   reporter.check('通过界面授权后运行真实 Cordis 插件', true);
+  const imageRoundtrip = await post(`/api/plugins/${pluginId}/routes`, {method:'GET',path:'/image-roundtrip'});
+  reporter.check('真实 Node 附件经 daemon blob 保存与读取，身份和文件名采用保存事实', imageRoundtrip.status===200
+    && imageRoundtrip.body.sameBytes && imageRoundtrip.body.ref.mediaType==='image/png' && imageRoundtrip.body.ref.name==='capture.png'
+    && imageRoundtrip.body.ref.attachmentId.startsWith('blob'), JSON.stringify(imageRoundtrip));
   await waitFor(async () => (await installed()).manifest.contributions.tools.length === 1, '就绪后的晚注册工具');
   reporter.check('晚于初始化窗口的工具进入 daemon 动态目录', true);
   // 复现设置读取撞上生命周期排空；真实 iframe 应展示错误，不能留下未捕获拒绝或允许盲写。
