@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
 import { browserImageFixtures } from './lib/plugin-image-fixtures.mjs';
-import { packPlugin } from './compat/translate/pack.mjs';
+import { packPlugin } from './compat/core/pack.mjs';
 import { connectAppPage, connectTarget, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -61,16 +61,28 @@ async function prepare() {
   await writeFile(join(upstream, 'package.json'), JSON.stringify({
     name: 'magi-runtime-acceptance', displayName: '运行时兼容验收', version: '1.0.0', type: 'module', main: 'index.js',
     dsh: { bundle: { patch: './cordis.patch.yml' } },
-    peerDependencies: { '@deepseek-ai/cordis': deps['@deepseek-ai/cordis'], '@deepseek-ai/dsh-llm': deps['@deepseek-ai/dsh-llm'] },
+    peerDependencies: { '@deepseek-ai/cordis': '4.0.5-alpha.2', '@deepseek-ai/dsh-llm': deps['@deepseek-ai/dsh-llm'] },
     dependencies: { '@deepseek-ai/schemastery': deps['@deepseek-ai/schemastery'] },
   }));
   await writeFile(join(upstream, 'index.js'), `
 import Schema from '@deepseek-ai/schemastery';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { Service } from '@deepseek-ai/cordis';
+import cordis from '@deepseek-ai/cordis/package.json' with { type: 'json' };
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
 export const name = 'magi-runtime-acceptance';
 export const inject = ['commands', 'tools', 'llm', 'attachments', 'webServer', 'sessions'];
 export const Config = Schema.object({ label: Schema.string().default('initial'), enabled: Schema.boolean().default(true) });
 export function apply(ctx, config) {
+  let peerService;
+  ctx.plugin(class extends Service {
+    constructor(c) { super(c, 'peerAcceptance'); this.version = cordis.version; peerService = this; }
+  });
+  ctx.webServer.register({path:'/cordis-peer',resource:()=>Response.json({
+    esm:cordis.version, cjs:require('@deepseek-ai/cordis/package.json').version,
+    service:peerService.version,
+  })});
   let backgroundImage={pending:true};
   ctx.effect(()=>{
     const timer=setTimeout(async()=>{
@@ -130,6 +142,9 @@ export function apply(ctx, config) {
   const manifest = JSON.parse(await readFile(join(work, 'prepared/manifest.json'), 'utf8'));
   pluginId = prepared.id;
   reporter.check('随包 Node 与兼容层完成原包封装，安装期不冻结动态贡献', prepared.report.runtimeContributions.includes('tools') && manifest.contributions.tools.length === 0);
+  reporter.check('不替换 Magi 运行库，从 npm 在线安装满足声明的独立 Cordis peer 并保留完整性',
+    prepared.report.dependencies.some(dependency => dependency.name === '@deepseek-ai/cordis'
+      && dependency.isolated && dependency.host === false && dependency.version === '4.0.5-alpha.2' && dependency.integrity.startsWith('sha512-')));
   return { source: 'local:runtime-acceptance.zip', archiveBase64: (await readFile(archive)).toString('base64') };
 }
 
@@ -396,6 +411,9 @@ try {
     return plugin?.runtime?.state === 'running';
   }, 'DSH 宿主就绪', 30_000);
   reporter.check('通过界面授权后运行真实 Cordis 插件', true);
+  const peer = await post(`/api/plugins/${pluginId}/routes`, { method: 'GET', path: '/cordis-peer' });
+  reporter.check('实际宿主的 Cordis ESM、CJS 子路径与 Service 均使用同一隔离版本',
+    peer.status === 200 && peer.body.esm === '4.0.5-alpha.2' && peer.body.cjs === peer.body.esm && peer.body.service === peer.body.esm, JSON.stringify(peer));
   const imageRoundtrip = await post(`/api/plugins/${pluginId}/routes`, {method:'GET',path:'/image-roundtrip'});
   reporter.check('真实 Node 附件经 daemon 持久图片服务保存与读取，身份和文件名采用保存事实', imageRoundtrip.status===200
     && imageRoundtrip.body.sameBytes && imageRoundtrip.body.ref.mediaType==='image/png' && imageRoundtrip.body.ref.name==='capture.png'
@@ -433,7 +451,7 @@ try {
     await evaluateFrame('document.getElementById("f-label").value === "initial" && document.getElementById("f-enabled").checked'));
   await evaluateFrame('document.getElementById("f-label").value="changed"; document.getElementById("f-enabled").checked=true; document.getElementById("save").click(); true');
   await waitFor(async () => (await api(`/api/plugins/${pluginId}/settings`)).value.value?.label === 'changed', '界面配置保存');
-  reporter.check('生成设置页经原视图桥保存动态 schema 配置', true);
+  reporter.check('共享页面宿主经同一 settingsScope 保存动态 schema 配置', true);
   await snapshot('settings-desktop');
   frame.close(); frame = null;
   const plugin = await installed();

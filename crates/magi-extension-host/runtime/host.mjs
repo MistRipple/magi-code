@@ -9,7 +9,8 @@
 import net from 'node:net';
 import { AsyncLocalStorage } from 'node:async_hooks';
 const invocationContext = new AsyncLocalStorage();
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 
@@ -462,7 +463,10 @@ socket.on('connect', async () => {
     configRevision = hello.config?.revision ?? 0;
     if (compatRoot) {
       const { installSharedResolution } = await import(pathToFileURL(join(compatRoot, 'runtime/shared-resolution.mjs')).href);
-      installSharedResolution(compatRoot, { '@magi/compat-dsh': join(compatRoot, 'runtime/dsh-host.mjs') });
+      installSharedResolution(compatRoot, {
+        '@magi/compat-dsh': join(compatRoot, 'runtime/dsh-host.mjs'),
+        ...(existsSync(join(dirname(entry), 'upstream')) ? { '@magi/compat-upstream-root': join(dirname(entry), 'upstream') } : {}),
+      });
     }
     const module = await import(pathToFileURL(entry).href);
     if (typeof module.default !== 'function') throw new Error('入口必须默认导出 activate(api)');

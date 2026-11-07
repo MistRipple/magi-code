@@ -4,19 +4,14 @@
 // 检查结果只用于回答“这个 pi 扩展里有多少能被承载、多少不能、为什么”，并阻塞构建。
 // 入口发现依据 pi 的包约定（docs/packages.md 行 40–100，2026-11-05 读取）：
 //   package.json 的 `pi.extensions`（数组，路径相对包根；支持 glob 与排除）→ 否则约定目录 `extensions/`。
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { buildReport } from '../core/inspect.mjs';
 import { PI_FLOW } from '../core/scan.mjs';
 import { classify } from './catalog.mjs';
+import { readPackage } from '../core/package.mjs';
 
 const EXT = /\.(ts|tsx|js|mjs|cjs)$/;
-
-function readPackage(dir) {
-  const path = join(dir, 'package.json');
-  if (!existsSync(path)) throw new Error(`缺少 package.json: ${dir}`);
-  return JSON.parse(readFileSync(path, 'utf8'));
-}
 
 /** 极简 glob：只支持 `*`、`**` 与字面量，且拒绝 `!` 排除、`{}` 与 `?`——遇到就明确失败，而不是错配。 */
 function globToRegExp(pattern) {

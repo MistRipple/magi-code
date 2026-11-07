@@ -7,7 +7,7 @@ import { installSharedResolution } from '../runtime/shared-resolution.mjs';
 import { dshEnvironment } from '../core/dsh-compatibility.mjs';
 import { createBackendSessions } from '../runtime/backend-sessions.mjs';
 
-const [entry, overridesPath, sharedRoot, resultPath, upstreamDir, readSessionDirectory] = process.argv.slice(2);
+const [entry, sharedRoot, resultPath, upstreamDir, readSessionDirectory] = process.argv.slice(2);
 // 上游常把运行状态写进 ~/.dsh；HOME 是记录用的空临时目录，预建它即可，不触碰真实用户目录。
 mkdirSync(`${process.env.HOME}/.dsh`, { recursive: true });
 installSharedResolution(sharedRoot, { '@magi/compat-upstream-root': upstreamDir + '/' });
@@ -42,14 +42,14 @@ net.Server.prototype.close = function close(callback) {
 // 记录阶段不发送任何请求：上游对本机端点的健康探测、模型发现等一律明确失败（上游自己处理失败路径）。
 globalThis.fetch = (input) => Promise.reject(new Error(`构建期记录不发送请求：${typeof input === 'string' ? input : (input.url ?? String(input))}`));
 
-const out = { name: upstream.name ?? null, inject: upstream.inject ?? [], tools: [], commands: [], providers: [], routes: [], listeners: [], settingsNamespaces: [], configSchema: null };
+const out = { tools: [], commands: [], providers: [], routes: [], listeners: [], settingsNamespaces: [] };
 const ctx = new Context();
 // 只提供真实服务的命名空间；记录器没有 daemon 会话事实，调用读取即拒绝。
 if (readSessionDirectory === '1') ctx.provide('sessions', createBackendSessions({}).service);
 ctx.provide('loader', {entries:loaderEntries});
 ctx.provide('profileContext', Object.freeze({ name: 'magi', dir: profilePath() }));
 ctx.baseUrl = pathToFileURL(profilePath() + '/').href;
-// 记录上游监听的事件名：拦截类事件要在清单里静态声明为 Magi 钩子，运行期才出现的监听会被明确拒绝。
+// 记录默认启动观察到的事件名，供兼容报告核对；不据此生成 Magi 钩子。
 // 通过 Cordis 自带的 `internal/listener` 事件观察，不改写 ctx.on，也不执行监听器。
 const listenerNames = new Set();
 ctx.on('internal/listener', (name) => { if (typeof name === 'string' && !name.startsWith('internal/')) listenerNames.add(name); });
@@ -86,10 +86,7 @@ const llm = ctx.llm;
 const originalAdapter = llm.registerAdapter.bind(llm);
 llm.registerAdapter = (providers, adapter) => { for (const id of providers) out.providers.push({ id }); return originalAdapter(providers, adapter); };
 
-const overrides = JSON.parse(readFileSync(overridesPath, 'utf8'));
-const schema = upstream.Config;
-if (schema) out.configSchema = schema.toJSON();
-const config = schema ? schema(overrides) : overrides;
+const config = upstream.Config ? upstream.Config({}) : {};
 // 启动必须是记录合同的一部分。此前只调用 ctx.plugin 而不等待 fiber，Cordis
 // 会把 apply() 的异常变成后台失败，记录器仍然输出“成功”的空清单，最终导致
 // 一个永远无法激活的翻译包通过安装校验。

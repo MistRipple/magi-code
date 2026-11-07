@@ -270,18 +270,18 @@
 
 【目标】`dsh-connect-workbuddy` 只是第一个验收样本，翻译器内不得出现针对它的分支或补丁；样本之外必须有独立夹具覆盖同一机制。
 
-【现状·已运行验证】翻译器按工厂注册（`scripts/compat/core/registry.mjs`）。共享层负责产物扫描、能力报告、清单生成、可复现打包；生态层（`dsh/`、`pi/`）只提供识别、能力对照表和兼容层。上游的 `./client` 界面脚本原样放入 `ui/`，由随产品预构建的页面运行时提供宿主服务；上游没有界面才由设置 schema 生成通用页。
+【现状·已运行验证】翻译器按工厂注册（`scripts/compat/core/registry.mjs`）。共享层负责产物扫描、能力报告、清单生成、可复现打包；生态层（`dsh/`、`pi/`）只提供识别、能力对照表和兼容层。上游的 `./client` 界面脚本原样放入 `ui/`，由随产品预构建的页面运行时提供宿主服务；上游没有界面时，仍由同一页面宿主加载通用设置组件；不再生成独立 HTML 表单或另一份视图桥。
 
 【现状·已运行验证】DSH 兼容层在 Magi 扩展宿主内运行**真实的 Cordis 与 `@deepseek-ai/dsh-llm` 运行时**，不自写 Cordis 子集；共享依赖由 `scripts/compat/package-lock.json` 按精确版本固定，发行时用 `npm ci --omit=dev --include=optional --ignore-scripts` 安装进 `daemon/compat/`。兼容层只补宿主服务（`tools`、`commands`、`settings`、`webServer`、`attachments`），其余行为沿用上游代码，避免仿写与上游漂移。
 
 | 状态 | DSH 服务或 API | 映射 | 约束 |
 | --- | --- | --- | --- |
 | 目标 | `llm.registerAdapter` / `registerConfigurableProviders` / `registerModelDiscovery` | 经 `api.modelSource.set` 提交主对话数据源 | 适配器的真实上游不必是标准协议：兼容层在宿主内起仅本机监听、带随机 Bearer 的 OpenAI 兼容端点，适配器 `stream()` 输出的 DSH 块在端点转成 OpenAI 流，`apiKey` 为该 Bearer。数据源条目携带上下文窗口、输入模态、推理档位（见 5.7） |
-| 现状 | `tools.register` | 清单 `contributions.tools` + `api.tool` | 工具必须在翻译期静态声明：翻译器在受限子进程里**实际执行**一次 `apply` 并记录注册的工具名、描述与参数 schema，写入清单；运行期按名字绑定。运行期才出现、翻译期未记录的工具明确拒绝 |
-| 目标 | `commands.register` | 清单 `contributions.commands` + `api.command` | 同上 |
-| 目标 | `settings`、`ctx.settings` | `settingsSchema` 与 `api.settings` | Schemastery 在翻译期导出为 JSON Schema；上游有界面时原样挂载，否则由翻译器生成通用设置页并打入 `ui/`，都只用公开视图桥 |
+| 现状 | `tools.register` | daemon runtime catalog + `api.tool` | 原包按实际配置注册工具，目录和处理器绑定同一宿主租约；安装期观察只供预览，不生成静态工具清单 |
+| 现状 | `commands.register` | daemon runtime catalog + `api.command` | 同上 |
+| 目标 | `settings`、`ctx.settings` | `settingsSchema` 与 `api.settings` | Schemastery 在运行期提供 JSON Schema 投影，校验仍调用原包 schema；原生页面与无页面包的设置组件共用 settingsScope 和公开视图桥 |
 | 目标 | `webServer.register` | 视图桥操作 | 浏览器端界面调用的 HTTP 路由改为经视图桥的受限操作转发给宿主内的同一处理器；不开放任意 daemon API |
-| 目标 | 浏览器端 React 界面（`lib/client.js`） | 重新打包为 `ui/` 页面 | 依赖 DSH 客户端槽位的部分明确报告，由兼容层提供最小槽位容器 |
+| 目标 | 浏览器端 React 界面（`lib/client.js`） | 原包页面与静态资源直接加载 | 依赖 DSH 客户端槽位的部分明确报告，由兼容层提供最小槽位容器 |
 | 目标 | `attachments`、`tokenMeter`、`compaction`、`agents`、`sessionProjections`（`ctx.get`） | 无 | 无对应公开接口：运行期访问明确抛出“宿主服务不可用”，不返回空值；报告列为 dropped |
 | 目标 | 包内原生载荷与 `child_process` 加载宿主机器上的程序 | 原生载荷拒绝；运行外部程序属作者代码 | 不随包分发二进制；外部程序是否存在由用户机器决定，报告如实标注 |
 
@@ -293,7 +293,7 @@
 
 【现状·已运行验证】2026-11-05 真机验收（macOS，真实 WorkBuddy 登录态，未使用 mock）：早期的离线构建方案（`cli.mjs build`，已由安装期翻译取代并移除）取得上游（核对 npm integrity）、在隔离子进程记录注册、打成 `magi.dsh-connect-workbuddy`（3 个工具、1 个命令、2 个模型数据源、16 条路由明确放弃，入口 2.8 MB 压缩后）。依赖目录按上游对等范围精确固定：cordis 4.1.0、schemastery 3.19.0、dsh-* 0.2.2-rc.1、pi-ai 1.5.0、react 18；`next` 线的 cordis 4.0.6-alpha.2 与 dsh-llm 0.2.2-rc.1 的对等要求（`~4.1.0`）冲突，不能混用。该包经公开 API 预览、安装、授权、启用、激活后运行态为 `running`、崩溃 0 次；WorkBuddy 国内版 16 个模型进入主对话数据源目录；会话选用 `hy3` 完成真实对话（输入 20875／输出 25 Token）；`workbuddy_draw_image` 经 Magi 工具审批（`allow_once`）后真实出图并扣 5.71 积分。未验证：`workbuddy_draw_video`、`codebuddy_ask`、国际版账号、设置页在 Electron 内的渲染、Windows。
 
-【现状·已运行验证】真机暴露的两个问题已修：(1) 包校验把所有贡献说明限在 4096 字节，而真实工具 `workbuddy_draw_image` 的使用指引为 16843 字节，翻译器原先静默截断到 4000 字符，会让模型拿不到完整约束；现把工具说明上限提到 32 KiB（schema、包校验、生成类型同步），其余贡献仍为 4096，翻译器超限时明确失败而不截断。(2) 记录期必须用「开关全开」的配置变体才能发现受开关控制的工具，只用默认配置会得到 0 个工具而「成功」；现由翻译器自动追加该变体（见 6.1）。
+【现状·已运行验证】真机暴露的两个问题已修：(1) 包校验把所有贡献说明限在 4096 字节，而真实工具 `workbuddy_draw_image` 的使用指引为 16843 字节，翻译器原先静默截断到 4000 字符，会让模型拿不到完整约束；现把工具说明上限提到 32 KiB（schema、包校验、生成类型同步），其余贡献仍为 4096，翻译器超限时明确失败而不截断。(2) 早期静态清单曾通过「开关全开」变体探测工具。这条旧路径已移除：安装期只检查默认启动，工具由原包在运行期随配置动态发布。
 
 【现状·已运行验证】2026-11-05 在本地打包的 Magi.app（`npm run desktop:package -- --dir`，随包 daemon 与 Node，独立状态目录）内复验，仅国内版：`codebuddy_ask` 经审批后调用 WorkBuddy 随包 CLI，返回 `ok=true`、reply `pong`（21088 输入／38 输出 Token）；`workbuddy_draw_video`（`kling-video-v3`、5 秒、720P）真实出片，扣 128.57 积分，文件为 H.264／AAC、1280×720、约 5 秒；工具调用在清单未声明 `timeoutMs` 时按 60 秒默认期限，本次视频任务跑完仍成功，期限对更长任务是否足够未验证。
 
@@ -309,7 +309,7 @@
 
 【目标】翻译报告应逐项列出 API 清单、依赖图、上游精确版本、平台要求与降级项。现状报告含上游版本与 integrity、工具／命令／数据源、路由、界面槽位处置、静态分析降级项与被省略的文件；依赖图与平台要求尚未输出。发现不支持或无法识别的动态导入／API 直接失败，不生成"成功但少功能"的包。静态分析不能证明任意 JS 的全部运行分支：运行时仍严格拒绝未知 API；未执行到的分支应标为未覆盖。
 
-【现状】受开关控制的工具在记录期可见，靠翻译器自动追加"所有开关打开"的配置变体，不再需要作者提供；是否所有开关型配置都能被这样发现仍属待定。
+【现状】安装封装集中于 `scripts/compat/install/`，仅保留默认启动与槽位观察。工具、命令、模型来源和配置由 `runtime/` 适配器动态发布至 daemon；不穷举开关、不合并静态注册副本。注册设置授权覆盖本插件私有资源，合法命名空间可在真实配置重载后出现，仍逐次由 daemon 校验资源权限和 CAS。
 
 ### 6.2 翻译范围
 
@@ -704,7 +704,7 @@ Upgrader 原包追加验证了 0.0.8→0.0.7 切换并保持禁用、请求不�
 
 【现状·根因】Appshot 0.4.2 使用早期 DSH 的 `settings.register("appshot", schema)`／`get()` 合同，不能把它别名到现代插件 Config。此前注册失败被原包捕获，页面 POST 只更新插件进程中的临时配置；实际复现了页面保存后停用再激活恢复默认值。
 
-【现状·实现】受限记录器收集注册命名空间，译包声明一个插件私有资源并申请对应 storage 授权。运行期每次调用先读取 daemon 的确认快照，各命名空间独立解析 schema，更新经原资源 CAS 写入，现代 Config 不混入这些值。写入串行保留不同命名空间的并发修改；未声明命名空间拒绝，fiber 卸载回收 schema 和旧 scope。旧原包未等待 `settings.update()` 时，兼容层仍在本次调用回执前等待真实写入并传播失败，不提交乐观成功。设置方法分类改为逐项准入，未实现方法不再随整个 settings 服务放行。
+【现状·实现】安装期识别设置服务使用并申请一个插件私有资源的 storage 授权；命名空间由原包运行期注册，不再受安装期观察清单限制。运行期每次调用先读取 daemon 的确认快照，各命名空间独立解析 schema，更新经原资源 CAS 写入，现代 Config 不混入这些值。写入串行保留不同命名空间的并发修改；未声明命名空间拒绝，fiber 卸载回收 schema 和旧 scope。旧原包未等待 `settings.update()` 时，兼容层仍在本次调用回执前等待真实写入并传播失败，不提交乐观成功。设置方法分类改为逐项准入，未实现方法不再随整个 settings 服务放行。
 
 【现状·已运行验证】兼容回归 83/83，通过不同命名空间隔离、串行并发写入、数组 unset、旧 scope 失效、重建宿主恢复、撤权失败不发布乐观快照与非法路径拒绝。重新构建 macOS arm64 Electron 45 目录包，`test:electron-appshot` 从 npm 在线安装未经修改的 Appshot 0.4.2，并真实点击原生页面声音开关：保存、关闭设置页、停用再激活、退出应用后重新启动及原生页面恢复共 5 项通过，未捕获页面异常为 0。证据在 `target/plugin-acceptance/appshot/{results.json,settings-restored.png}`。目录包构建通过，保留既有 WebFolderPicker 静态／动态导入警告；未运行全仓检查。
 

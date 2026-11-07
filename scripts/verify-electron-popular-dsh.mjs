@@ -9,7 +9,7 @@ const root = dirname(fileURLToPath(import.meta.url)).replace(/\/scripts$/, '');
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
 const port = Number(process.env.MAGI_POPULAR_DSH_PORT || 38942), cdpPort = Number(process.env.MAGI_POPULAR_DSH_CDP_PORT || 9312), origin = `http://127.0.0.1:${port}`;
 const work = await mkdtemp(join(tmpdir(), 'magi-popular-dsh-'));
-const output = join(root, 'target/plugin-acceptance/popular-dsh');
+const output = process.env.MAGI_DSH_ACCEPTANCE_OUTPUT || join(root, 'target/plugin-acceptance/popular-dsh');
 await mkdir(output, { recursive: true });
 const candidates = [
   ['dsh-plugin-health', '3.0.5'],
@@ -22,6 +22,12 @@ const candidates = [
   ['dsh-plugin-release-probe', '0.0.8'],
   ['@99galaxy/dsh-plugin-market', '1.2.2'],
 ];
+const expectedPackages = candidates.length;
+const selected = process.env.MAGI_DSH_ACCEPTANCE_PACKAGES?.split(',').filter(Boolean);
+if (selected) {
+  for (const name of selected) assert.ok(candidates.some(([pkg]) => pkg === name), `未知验收样本：${name}`);
+  candidates.splice(0, candidates.length, ...candidates.filter(([name]) => selected.includes(name)));
+}
 const results = [];
 const errors = [];
 let app, page, ui;
@@ -59,6 +65,19 @@ async function removePlugin(id) {
   await post(`/api/plugins/${encodeURIComponent(id)}/disable`, {});
   await post(`/api/plugins/${encodeURIComponent(id)}/uninstall`, {});
 }
+async function installTarget(version = '0.0.7') {
+  const request = { ecosystem: 'dsh', package: 'dsh-plugin-release-probe', version };
+  const preview = await post('/api/plugins/upstream/preview', request);
+  const list = await post('/api/plugins/upstream/install', { ...request, expectedDigest: preview.candidate.digest });
+  const plugin = list.plugins.find((entry) => entry.source.location === `dsh:${request.package}@${version}`);
+  assert.ok(plugin, 'daemon 必须确认目标安装身份');
+  await post(`/api/plugins/${plugin.manifest.id}/enable`, {});
+  await post(`/api/plugins/${plugin.manifest.id}/authorize`, { grants: plugin.manifest.permissions });
+  await post(`/api/plugins/${plugin.manifest.id}/activate`, {});
+  await waitFor(async () => (await currentTarget())?.runtime?.state === 'running', '业务验收目标运行', 120_000);
+  return plugin;
+}
+const currentTarget = async () => (await api('/api/plugins')).value.plugins.find((entry) => entry.source.location.startsWith('dsh:dsh-plugin-release-probe@'));
 async function viewCheck(plugin, view, session) {
   const views = plugin.manifest.contributions.views;
   const selector = `iframe[data-plugin-id=${JSON.stringify(plugin.manifest.id)}]`;
@@ -174,19 +193,70 @@ try {
           const parsed = await call('parse', { code: exported.code });
           const qr = await call('qr', { code: exported.code });
           assert.ok(parsed.preview.length && qr.modules.length);
-          item.functionalChecks = { export: true, parse: true, qr: true, import: 'unverified' };
+          let targetId;
+          try {
+            const code = (await call('export', { entries: [{ kind: 'npm', name: 'dsh-plugin-release-probe', version: '0.0.7', enabled: true }] })).code;
+            const targetQr = await call('qr', { code });
+            const scale = 5, quiet = 4, size = (targetQr.size + quiet * 2) * scale;
+            const gray = Buffer.alloc(size * size, 255);
+            for (let y = 0; y < targetQr.size; y++) for (let x = 0; x < targetQr.size; x++) {
+              if (targetQr.modules[y][x] !== '1') continue;
+              for (let dy = 0; dy < scale; dy++) gray.fill(0, ((y + quiet) * scale + dy) * size + (x + quiet) * scale,
+                ((y + quiet) * scale + dy) * size + (x + quiet + 1) * scale);
+            }
+            const scanned = await call('scan', { width: size, height: size, gray: gray.toString('base64') });
+            assert.equal(scanned.code, code, '原包必须从二维码图片识别回分享码');
+            await call('import', { code, confirm: true, requestId: 'sample-share-install' });
+            const target = await currentTarget(); assert.ok(target); targetId = target.manifest.id;
+            assert.equal(target.manifest.version, '0.0.7'); assert.equal(target.runtime.state, 'running');
+            const disabledCode = (await call('export', { entries: [{ kind: 'npm', name: 'dsh-plugin-release-probe', version: '0.0.7', enabled: false }] })).code;
+            await call('import', { code: disabledCode, confirm: true, requestId: 'sample-share-disable' });
+            assert.equal((await currentTarget()).enabled, false); assert.equal((await currentTarget()).active, false);
+            await call('import', { code, confirm: true, requestId: 'sample-share-enable' });
+            assert.equal((await currentTarget()).runtime.state, 'running');
+            const newer = (await call('export', { entries: [{ kind: 'npm', name: 'dsh-plugin-release-probe', version: '0.0.8', enabled: true }] })).code;
+            const blocked = await post(`/api/plugins/${item.id}/routes`, { method: 'POST', path: '/api/plugin-share/import', body: { code: newer, confirm: true, requestId: 'sample-share-upgrade' } });
+            assert.equal(blocked.status, 409); assert.equal(blocked.body.error, 'manual-update-required');
+            assert.equal((await currentTarget()).digest, target.digest, '上游拒绝更新不应修改当前目标');
+            item.functionalChecks = { export: true, parse: true, qr: true, scan: true, import: true, disable: true, enable: true,
+              upstreamManualUpdate: true, githubImport: 'unverified', queueRecovery: 'unverified' };
+          } finally {
+            const target = await currentTarget();
+            if (target) await removePlugin(targetId || target.manifest.id);
+          }
+        }
+        if (pkg === 'dsh-plugin-mgr' && item.smoke?.ok) {
+          const target = await installTarget();
+          const call = async (action, body) => {
+            const result = await post(`/api/plugins/${item.id}/routes`, { method: body === undefined ? 'GET' : 'POST', path: `/api/plugin-manager/${action}`, ...(body === undefined ? {} : { body }) });
+            assert.equal(result.status, 200, JSON.stringify(result)); assert.equal(result.body.ok, true, JSON.stringify(result)); return result.body;
+          };
+          try {
+            item.daemonPluginsBeforeManagerRoute = (await api('/api/plugins')).value.plugins
+              .filter((entry) => entry.source?.kind === 'upstream').map((entry) => entry.source.location);
+            const row = (await call('list')).plugins.find((entry) => entry.name === 'dsh-plugin-release-probe');
+            assert.equal(row.version, '0.0.7'); assert.equal(row.disabled, false); assert.ok(row.rows.includes(target.manifest.id));
+            await call('toggle', { name: row.name, disable: true });
+            assert.equal((await currentTarget()).enabled, false); assert.equal((await currentTarget()).active, false);
+            await call('toggle', { name: row.name, disable: false });
+            assert.equal((await currentTarget()).runtime.state, 'running');
+            const update = (await call('updates')).updates;
+            item.updateCheck = update;
+            assert.equal(update?.[row.name]?.latest, '0.0.8', '原包须从 registry 检查到目标新版');
+            await call('update', { name: row.name });
+            const after = await currentTarget();
+            assert.equal(after.manifest.version, '0.0.8'); assert.equal(after.runtime.state, 'running');
+            await call('uninstall', { name: row.name }); assert.equal(await currentTarget(), undefined);
+            item.functionalChecks = { list: true, disable: true, enable: true, checkUpdates: true, onlineUpgrade: true, uninstall: true, runtimeFailureDisplay: 'unverified' };
+            item.upgrade = 'passed';
+          } finally { const target = await currentTarget(); if (target) await removePlugin(target.manifest.id); }
         }
         if (pkg === 'dsh-plugin-upgrader' && process.env.MAGI_DSH_FUNCTIONAL_UPGRADE === '1') {
           let targetId;
           try {
-            const request = { ecosystem: 'dsh', package: 'dsh-plugin-release-probe', version: '0.0.7' };
-            const targetPreview = await post('/api/plugins/upstream/preview', request);
-            const targetList = await post('/api/plugins/upstream/install', { ...request, expectedDigest: targetPreview.candidate.digest });
-            const target = targetList.plugins.find((p) => p.source.location === 'dsh:dsh-plugin-release-probe@0.0.7');
+            const request = { package: 'dsh-plugin-release-probe' };
+            const target = await installTarget();
             targetId = target.manifest.id;
-            await post(`/api/plugins/${targetId}/enable`, {});
-            await post(`/api/plugins/${targetId}/authorize`, { grants: target.manifest.permissions });
-            await post(`/api/plugins/${targetId}/activate`, {});
             const submitted = await post(`/api/plugins/${item.id}/routes`, { method: 'POST', path: '/api/plugin-upgrader/job', body: { steps: [{ name: request.package, version: '0.0.8', action: 'upgrade', enabled: true }] } });
             assert.equal(submitted.status, 202, JSON.stringify(submitted));
             const job = await waitFor(async () => {
@@ -218,9 +288,26 @@ try {
             assert.equal(restored.failed, 0, JSON.stringify(restored));
             const active = (await api('/api/plugins')).value.plugins.find((p) => p.manifest.id === targetId);
             assert.equal(active.manifest.version, '0.0.8'); assert.equal(active.runtime.state, 'running');
-            item.functionalChecks = { onlineUpgrade: true, versionSwitch: true, disabledState: true, failedUpgradePreservesVersion: true, reactivation: true, removalRollback: 'unverified' };
+            const rejectedActive = await run('9999.0.0', true);
+            assert.equal(rejectedActive.failed, 1);
+            const stillActive = await currentTarget();
+            assert.equal(stillActive.digest, active.digest); assert.equal(stillActive.runtime.state, 'running');
+            assert.deepEqual(stillActive.grants, active.grants, '失败预检不应撤销已运行版本的授权');
+            item.functionalChecks = { onlineUpgrade: true, versionSwitch: true, disabledState: true, failedUpgradePreservesVersion: true,
+              failedUpgradePreservesActiveRuntime: true, reactivation: true, removalRollback: 'unverified' };
           } finally { if (targetId) await removePlugin(targetId); }
         }
+      }
+      // 覆盖率只记录已完成的业务断言：页面有内容、启动成功或 HTTP 200
+      // 不能代替核心业务。插件没有明确的功能检查时保持 unverified，避免把
+      // 兼容机制样本误算进生态分母。
+      if (item.functionalChecks) {
+        const checks = Object.values(item.functionalChecks);
+        item.core = checks.every((value) => value === true) ? 'passed'
+          : checks.some((value) => value === false) ? 'failed' : 'unverified';
+      }
+      if (item.functionalUpgrade) {
+        item.upgrade = item.functionalUpgrade.failed === 0 ? 'passed' : 'failed';
       }
       await removePlugin(item.id);
       item.cleaned = true;
@@ -236,6 +323,7 @@ try {
 } finally {
   await writeFile(join(output, 'results.json'), JSON.stringify(results, null, 2));
   const summary = { scope: '固定的社区样本，不代表 DSH 生态全集', packages: results.length,
+    expectedPackages, completeSample: results.length === expectedPackages,
     installed: results.filter((item) => item.installed).length, started: results.filter((item) => item.runtime === 'running').length,
     uiPassed: results.filter((item) => item.views?.length && item.views.every((view) => view.ok)).length,
     smokePassed: results.filter((item) => item.smoke?.ok).length,
@@ -243,7 +331,7 @@ try {
     upgradeVerified: results.filter((item) => item.upgrade === 'passed').length,
     thresholdPercent: 95, qualified: false, rendererErrors: errors };
   // 尚未执行完整业务及升级的样本不算成功。启动、页面有内容、HTTP 200 都不能替代功能验收。
-  summary.qualified = summary.packages > 0 && [summary.installed, summary.started, summary.coreVerified, summary.upgradeVerified].every((count) => count / summary.packages >= 0.95)
+  summary.qualified = summary.completeSample && [summary.installed, summary.started, summary.coreVerified, summary.upgradeVerified].every((count) => count / summary.packages >= 0.95)
     && results.every((item) => !item.views?.some((view) => !view.ok)) && errors.length === 0;
   await writeFile(join(output, 'coverage.json'), JSON.stringify(summary, null, 2));
   if (!summary.qualified || errors.length) process.exitCode = 1;

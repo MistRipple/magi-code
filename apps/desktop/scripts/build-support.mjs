@@ -265,7 +265,7 @@ export async function stageCompatRuntime() {
   const source = join(repositoryRoot, "scripts", "compat");
   await rm(compatRuntimeDist, { recursive: true, force: true });
   await mkdir(compatRuntimeDist, { recursive: true });
-  const entries = ["cli.mjs", "index.mjs", "core", "dsh", "pi", "runtime", "translate", "package.json", "package-lock.json"];
+  const entries = ["cli.mjs", "index.mjs", "core", "dsh", "pi", "runtime", "install", "package.json", "package-lock.json"];
   for (const entry of entries) {
     await cp(join(source, entry), join(compatRuntimeDist, entry), { recursive: true, dereference: false });
   }

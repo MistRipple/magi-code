@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { browserImageFixtures, bmpEncodingFixtures } from '../lib/plugin-image-fixtures.mjs';
 import { createBackendSessions } from './runtime/backend-sessions.mjs';
 import { REGISTERED_SETTINGS_RESOURCE } from './runtime/registered-settings.mjs';
+import { createRegisteredSettings } from './runtime/registered-settings.mjs';
 
 // 只替代 daemon RPC；插件加载、依赖、effect、工具管线及模型目录运行真实上游代码。
 function host(value = {}) {
@@ -63,6 +64,31 @@ function host(value = {}) {
 }
 
 const options = { runtimeVersion: 2, plugin: 'fixture' };
+
+test('设置命名空间可在配置重载后动态出现，资源授权与 CAS 仍由 daemon 裁决', async () => {
+  let snapshot = { version: 0, value: null }, fail = false;
+  const settings = createRegisteredSettings({ resource: {
+    async read(id) { assert.equal(id, REGISTERED_SETTINGS_RESOURCE); return structuredClone(snapshot); },
+    async write(id, version, value) {
+      assert.equal(id, REGISTERED_SETTINGS_RESOURCE); assert.equal(version, snapshot.version);
+      if (fail) throw new Error('permission revoked');
+      return snapshot = { version: version + 1, value: structuredClone(value) };
+    },
+  } }, true);
+  const cleanup = [], ctx = { effect: callback => cleanup.push(callback()) };
+  await settings.run(async () => {
+    const late = settings.register(ctx, 'runtime-selected', Schema.object({ enabled: Schema.boolean().default(true) }));
+    await settings.update('runtime-selected', { enabled: false }); assert.equal(late.get().enabled, false);
+    fail = true;
+  });
+  await assert.rejects(settings.run(() => settings.update('runtime-selected', { enabled: true })), /permission revoked/);
+  assert.equal(settings.get('runtime-selected').enabled, false);
+  for (const release of cleanup) release();
+  assert.equal(settings.get('runtime-selected'), undefined);
+  await settings.dispose();
+  const denied = createRegisteredSettings({}, false);
+  assert.throws(() => denied.register(ctx, 'unapproved', Schema.object({})), /未声明/);
+});
 
 test('DSH 注册设置按命名空间保存到 daemon 资源，未 await 的写入在路由回执前落盘并在重建实例后恢复', async (t) => {
   let h = host({ configOnly: true });
@@ -238,9 +264,10 @@ test('DSH 管理写操作使用精确版本与摘要，未获委托不能授权�
   const { createPluginManager, parseBundleSpec } = await import('./runtime/plugin-manager.mjs');
   const installed = { digest: 'installed-digest', manifest: { id: 'translated.scoped', name: 'Scoped' }, source: { kind: 'upstream', location: 'dsh:@scope/sample@1.2.3' }, enabled: false, active: false };
   const calls = [];
+  let operation = 'upgrade';
   const plugins = {
     async list() { return { plugins: [installed] }; },
-    async preview(input) { calls.push(['preview', input]); return { version: '1.2.3', candidate: { digest: 'confirmed' } }; },
+    async preview(input) { calls.push(['preview', input]); return { version: '1.2.3', candidate: { digest: 'confirmed', operation } }; },
     async install(input) { calls.push(['install', input]); return { plugins: [installed] }; },
     async setEnabled(id, enabled, expectedDigest) { calls.push(['enabled', id, enabled, expectedDigest]); if (enabled) throw Object.assign(new Error('缺少新版授权'), { kind: 'PermissionDenied' }); return { plugins: [installed] }; },
     async remove(id, expectedDigest) { calls.push(['remove', id, expectedDigest]); },
@@ -252,15 +279,22 @@ test('DSH 管理写操作使用精确版本与摘要，未获委托不能授权�
   for (const bad of ['../sample', 'https://example.org/sample', 'sample@1.0.0;touch x', '@scope/sample@']) assert.throws(() => parseBundleSpec(bad));
   const result = await manager.installBundle('@scope/sample', { enabled: false });
   assert.equal(result.application, 'applied');
+  assert.equal(result.changed, true);
   assert.deepEqual(calls[1], ['install', { ecosystem: 'dsh', package: '@scope/sample', version: '1.2.3', expectedDigest: 'confirmed' }]);
   const unapproved = await manager.installBundle('@scope/sample');
   assert.equal(unapproved.application, 'failed');
   assert.equal(unapproved.installed, true); assert.equal(unapproved.error.code, 'authorization-required');
+  assert.equal(unapproved.stage, 'enable'); assert.equal(unapproved.changed, true); assert.equal(unapproved.version, '1.2.3');
+  assert.match(unapproved.error.diagnostic, /缺少新版授权/);
+  operation = 'unchanged';
+  assert.equal((await manager.installBundle('@scope/sample', { enabled: false })).changed, false, '未变更的摘要不能报告升级已改包');
   assert.equal((await manager.setBundleEnabled('@scope/sample', false)).application, 'applied');
   assert.deepEqual(calls.at(-1), ['enabled', 'translated.scoped', false, 'installed-digest']);
   assert.equal((await manager.removeBundle('@scope/sample')).application, 'applied');
   assert.deepEqual(calls.at(-1), ['remove', 'translated.scoped', 'installed-digest']);
-  assert.equal((await manager.installBundle('../sample')).application, 'failed');
+  const refused = await manager.installBundle('../sample');
+  assert.equal(refused.application, 'failed'); assert.equal(refused.stage, 'install');
+  assert.equal(refused.installed, undefined);
 });
 
 test('获委托的管理插件连续安装与升级时只授权安装回执中的摘要，拒绝后不启用，禁用安装不代授', async () => {
@@ -270,7 +304,7 @@ test('获委托的管理插件连续安装与升级时只授权安装回执中�
   let delegated = true, replaced = false;
   const manager = createPluginManager({ plugins: {
     async list() { return { plugins: [...records.values()] }; },
-    async preview(request) { return { version: request.version, candidate: { digest: `digest-${request.version}` } }; },
+    async preview(request) { return { version: request.version, candidate: { digest: `digest-${request.version}`, operation: records.has(`translated.${request.package}`) ? 'upgrade' : 'install' } }; },
     async install(request) {
       const row = { digest: request.expectedDigest, source: { kind: 'upstream', location: `dsh:${request.package}@${request.version}` },
         manifest: { id: `translated.${request.package}`, name: request.package, permissions }, active: false, enabled: false };

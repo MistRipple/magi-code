@@ -132,6 +132,7 @@ export const DSH_RULES = [
   rule('imports', /^@deepseek-ai\/dsh-settings$/, { capability: 'settings.schema', fidelity: 'full', source: SETTINGS }),
   rule('imports', /^@deepseek-ai\/dsh-attachment$/, { capability: 'service.snapshot', fidelity: 'none', group: 'session', note: '附件由 Magi 原生拥有', source: src('packages/attachment/attachment/README.md') }),
   rule('imports', /^@deepseek-ai\/schemastery$/, { fixed: 'bundled', group: 'settings', target: '纯 JS，构建期打包' }),
+  rule('imports', /^@deepseek-ai\/cordis\/package\.json$/, { fixed: 'bundled', group: 'runtime', target: '当前原包实际使用的 Cordis peer 元数据', note: '与主入口共用同一依赖解析，不从宿主猜造版本', source: src('vendor/cordis/package.json') }),
   rule('imports', /^@deepseek-ai\/cordis$/, { fixed: 'shim', group: 'runtime', target: '真实 Cordis，随包打入' }),
   rule('imports', /^(type:)?@earendil-works\/pi-ai(\/|$)/, { capability: 'modelSource.publish', fidelity: 'full', note: 'pi-ai 随包打入（与 pi 翻译器共用）' }),
   rule('imports', /^(type:)?@deepseek-ai\//, { fixed: 'unknown', note: '文档未登记的 DSH 包' }),

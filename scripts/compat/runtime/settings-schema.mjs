@@ -10,12 +10,10 @@ export class SchemaTranslationError extends Error {}
 
 /**
  * @param {{ uid: number, refs: Record<string, any> }} serialized
- * @returns {{ schema: object, secrets: string[][], volatile: string[][] }}
+ * @returns {{ schema: object }}
  */
 export function toJsonSchema(serialized) {
   const refs = serialized.refs;
-  const secrets = [];
-  const volatile = [];
   const seen = new Set();
   const fail = (path, message) => { throw new SchemaTranslationError(`${path.join('.') || '(根)'}：${message}`); };
 
@@ -26,9 +24,7 @@ export function toJsonSchema(serialized) {
     if (!SUPPORTED.has(node.type)) fail(path, `不支持的 Schemastery 类型 ${node.type}`);
     const meta = node.meta ?? {};
     for (const key of Object.keys(meta)) if (!KNOWN_META.has(key)) fail(path, `不认识的元数据 ${key}`);
-    if (meta.role === 'secret') secrets.push(path);
-    else if (meta.role !== undefined) fail(path, `不支持的 role：${meta.role}`);
-    if (meta.volatile) volatile.push(path);
+    if (meta.role !== undefined && meta.role !== 'secret') fail(path, `不支持的 role：${meta.role}`);
     seen.add(id);
     let out;
     switch (node.type) {
@@ -86,5 +82,5 @@ export function toJsonSchema(serialized) {
 
   const schema = convert(serialized.uid, []);
   if (schema.type !== 'object') fail([], '配置 schema 的根必须是 object');
-  return { schema, secrets, volatile };
+  return { schema };
 }

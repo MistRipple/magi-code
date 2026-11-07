@@ -14,7 +14,7 @@ test('可复现归档只携带原生辅助文件的执行意图，普通源码�
   const { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
-  const { packPlugin } = await import('./translate/pack.mjs');
+  const { packPlugin } = await import('./core/pack.mjs');
   const root = mkdtempSync(join(tmpdir(), 'magi-pack-modes-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const tree = join(root, 'package'); mkdirSync(join(tree, 'extension/upstream/native/linux'), { recursive: true });
@@ -114,7 +114,7 @@ test('DSH 交给普通函数的注册回调必须在所有可追踪调用点捕�
 });
 
 test('DSH peer 沿上游准入策略计入预发布版本；越界版本、直接依赖和普通 peer 不放宽', async (t) => {
-  const { installDependencies } = await import('./translate/dependencies.mjs');
+  const { installDependencies } = await import('./install/dependencies.mjs');
   const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -132,7 +132,7 @@ test('DSH peer 沿上游准入策略计入预发布版本；越界版本、直�
   assert.equal((await check('@deepseek-ai/dsh-llm', '0.2.2-rc.1', range))[0].version, '0.2.2-rc.1');
   await assert.rejects(check('@deepseek-ai/dsh-llm', '0.3.0-rc.1', range), /不满足/);
   await assert.rejects(check('@deepseek-ai/dsh-llm', '0.2.2-rc.1', range, 'dependencies'), /不满足/);
-  await assert.rejects(check('@deepseek-ai/cordis', '4.2.0-rc.1', '^4.0.0'), /不满足/);
+  await assert.rejects(check('react', '19.0.0', '^18.0.0'), /不满足/);
 });
 
 test('DSH 版本门禁保持 engines 优先与预发布语义；豁免只覆盖精确包版本和运行时', async () => {
@@ -477,8 +477,8 @@ test('原生页面保留异步和条件注册的多个右栏页签，页面身�
   const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
-  const { analyzeNativeClient } = await import('./translate/client-assets.mjs');
-  const { clientViews } = await import('./translate/client-views.mjs');
+  const { analyzeNativeClient } = await import('./install/client-assets.mjs');
+  const { clientViews } = await import('./install/client-views.mjs');
   const directory = mkdtempSync(join(tmpdir(), 'magi-native-panels-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   writeFileSync(join(directory, 'client.js'), `window.__ModuleLoader__.load({ id: 'panels', factory(require) { return { async apply(ctx) {
@@ -556,7 +556,7 @@ test('翻译保留 PNG/SVG 原始图片字节；越界、伪造和超限拒绝�
   const { mkdtempSync, writeFileSync, mkdirSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
-  const { resolveUpstreamIcon } = await import('./translate/icon.mjs');
+  const { resolveUpstreamIcon } = await import('./install/icon.mjs');
   const sharp = (await import('sharp')).default;
   const png = await sharp({ create: { width: 8, height: 8, channels: 4, background: '#2478ac' } }).png().toBuffer();
   const make = (declared, file, bytes) => {

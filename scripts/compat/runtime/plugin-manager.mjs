@@ -7,7 +7,8 @@ import { checkDshCompatibility } from '../core/dsh-compatibility.mjs';
 
 const NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
 const failure = (error, extra = {}) => ({ application: 'failed', ...extra,
-  error: { code: error.code ?? 'magi-operation-failed', message: String(error.message ?? error), ...(error.incompatible ? { incompatible: error.incompatible } : {}) } });
+  error: { code: error.code ?? 'magi-operation-failed', message: String(error.message ?? error), diagnostic: String(error.message ?? error),
+    ...(error.incompatible ? { incompatible: error.incompatible } : {}) } });
 
 export function parseBundleSpec(spec) {
   if (typeof spec !== 'string' || spec.length > 300) throw new Error('npm 插件来源无效');
@@ -55,7 +56,7 @@ export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTR
   };
   if (api.plugins.preview && api.plugins.install) {
     manager.installBundle = async (spec, options = {}) => {
-      let installed;
+      let installed, preview;
       try {
         if (options.enabled !== undefined && typeof options.enabled !== 'boolean') throw new Error('enabled 必须是布尔值');
         if (options.approvedBuilds?.length) throw new Error('Magi 不执行安装脚本，不接受构建授权');
@@ -72,7 +73,7 @@ export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTR
             checkDshCompatibility(manifest, policy, policy);
           }
         }
-        const preview = await api.plugins.preview(request);
+        preview = await api.plugins.preview(request);
         const list = await api.plugins.install({ ...request, version: preview.version, expectedDigest: preview.candidate.digest });
         installed = list.plugins.find(({ source }) => source.location === `dsh:${request.package}@${preview.version}`);
         if (!installed) throw new Error('安装结果缺少插件记录');
@@ -87,13 +88,17 @@ export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTR
           installed = updated.plugins.find((plugin) => plugin.manifest.id === installed.manifest.id);
           if (!installed?.active) throw new Error('插件尚未激活');
         }
-        return { bundle: request.package, application: 'applied', version: preview.version };
+        return { bundle: request.package, application: 'applied', version: preview.version,
+          changed: ['install', 'upgrade'].includes(preview.candidate.operation) };
       } catch (error) {
         if (installed) {
           const authorization = error.kind === 'PermissionDenied';
-          return failure(Object.assign(new Error(`已安装 ${installed.manifest.name}，后续操作未完成：${error.message}${authorization ? '；请在 Magi 插件管理中确认权限后激活' : ''}`), { code: authorization ? 'authorization-required' : 'activation-failed' }), { bundle: parseBundleSpec(spec).package, installed: true });
+          return failure(Object.assign(new Error(`已安装 ${installed.manifest.name}，后续操作未完成：${error.message}${authorization ? '；请在 Magi 插件管理中确认权限后激活' : ''}`), { code: authorization ? 'authorization-required' : 'activation-failed' }), {
+            bundle: parseBundleSpec(spec).package, installed: true, stage: 'enable', version: preview.version,
+            changed: ['install', 'upgrade'].includes(preview.candidate.operation),
+          });
         }
-        return failure(error);
+        return failure(error, { stage: 'install' });
       }
     };
   }

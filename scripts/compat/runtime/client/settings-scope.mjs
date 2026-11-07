@@ -34,6 +34,7 @@ export function createSettingsScope(request) {
     const current = ++seq;
     const [read, { schema }] = await Promise.all([request({ operation: 'settings.read' }), request({ operation: 'settings.describe' })]);
     if (current === seq && (state.revision === undefined || read.version >= state.revision)) publish(read, schema);
+    return schema;
   };
   const applyMutation = async (ops, expectedRevision = state.revision) => {
     if (state.status !== 'ready' || !Array.isArray(ops) || ops.length > 128) return false;

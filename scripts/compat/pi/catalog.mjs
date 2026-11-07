@@ -14,7 +14,6 @@ import { classifyWith, rule } from '../core/rules.mjs';
 
 const RAW = 'https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/coding-agent/docs/extensions.md';
 const at = (range) => `${RAW} 行 ${range}`;
-const EVENTS = at('307–1163');
 const API = at('1567–1975');
 const PROVIDER = at('1974–2140');
 const TOOL = at('2180–2360');

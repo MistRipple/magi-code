@@ -1,15 +1,10 @@
-// DSH → Magi 翻译器。当前阶段：识别与静态兼容分析；构建与产物生成在后续阶段加入。
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+// DSH 兼容准入分析。这里只读原包，不改写业务、页面或生成静态贡献。
+import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DSH_FLOW } from '../core/scan.mjs';
 import { buildReport } from '../core/inspect.mjs';
 import { classify } from './catalog.mjs';
-
-function readPackage(dir) {
-  const path = join(dir, 'package.json');
-  if (!existsSync(path)) throw new Error(`缺少 package.json: ${dir}`);
-  return JSON.parse(readFileSync(path, 'utf8'));
-}
+import { backendEntry, readPackage } from '../core/package.mjs';
 
 /** 原生模块：`.node`/`.wasm` 文件，或随包 `native/` 目录里有构建产物。 */
 function findNative(dir) {
@@ -48,7 +43,7 @@ export function createDshTranslator(options = {}) {
       const pkg = readPackage(dir);
       const required = inspectOptions.required ?? options.required ?? ['llm'];
       // 已发布的 npm 产物没有 src/：默认从 package.json 的 main 出发沿相对导入扫描；显式给出 directories 时按源码目录扫描。
-      const mainFile = join(dir, pkg.main ?? 'index.js');
+      const mainFile = join(dir, backendEntry(pkg));
       const scanOptions = inspectOptions.directories || !existsSync(mainFile)
         ? { directories: inspectOptions.directories ?? ['src'], flow: DSH_FLOW }
         : { entry: mainFile, flow: DSH_FLOW };

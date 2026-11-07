@@ -15,7 +15,7 @@ if (command === 'prepare') {
   const need = (name) => optionOf(args, name) ?? (console.error(`缺少 --${name}`), process.exit(2));
   if (kind !== 'dsh' || !upstreamDir) { console.error('用法: prepare dsh <上游目录> --out <包目录> --integrity <sha512-…>'); process.exit(2); }
   try {
-    const [{ prepareDsh }, { resolve, dirname }, { fileURLToPath }] = await Promise.all([import('./translate/prepare.mjs'), import('node:path'), import('node:url')]);
+    const [{ prepareDsh }, { resolve, dirname }, { fileURLToPath }] = await Promise.all([import('./install/prepare.mjs'), import('node:path'), import('node:url')]);
     const result = await prepareDsh({
       upstreamDir: resolve(upstreamDir), outDir: resolve(need('out')), sharedRoot: dirname(fileURLToPath(import.meta.url)),
       source: { integrity: need('integrity') },
@@ -24,7 +24,7 @@ if (command === 'prepare') {
     const archive = optionOf(args, 'archive');
     if (archive) {
       // 同一份打包实现（可复现 ZIP）：预览与安装各翻译一次，得到的摘要必须一致。
-      const { packPlugin } = await import('./translate/pack.mjs');
+      const { packPlugin } = await import('./core/pack.mjs');
       packPlugin(resolve(need('out')), resolve(archive));
     }
     process.stdout.write(JSON.stringify({ id: result.manifest.id, version: result.manifest.version, report: result.report }));

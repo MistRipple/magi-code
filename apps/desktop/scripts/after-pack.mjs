@@ -46,6 +46,7 @@ export async function afterPack(context) {
     throw new Error("发行资源清单缺少随包 Node");
   }
   if (!manifest.files.some((file) => file.path === "daemon/compat/cli.mjs")
+      || !manifest.files.some((file) => file.path === "daemon/compat/install/prepare.mjs")
       || !manifest.files.some((file) => file.path.startsWith("daemon/compat/node_modules/@deepseek-ai/cordis/"))) {
     throw new Error("发行资源清单缺少上游插件翻译运行时");
   }
@@ -69,6 +70,7 @@ export function isRetiredRuntimePath(path) {
   // 品牌图片不是运行时实现；仍检查完整父路径，不能藏在 tauri/ 等目录中。
   const candidate = path.replace(/[^/]+\.(svg|png|jpe?g|webp|gif|avif|bmp|ico)$/i, "");
   return /(^|\/)(tauri|cef|playwright|native-browser|browser-runtime)(\/|\.|-|$)/i.test(candidate)
+    || /^daemon\/compat\/translate\//.test(candidate)
     || /chromium embedded framework/i.test(candidate);
 }
 

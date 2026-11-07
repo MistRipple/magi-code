@@ -5,7 +5,7 @@ import { deepEqual, volatileEntries, updateVolatile } from '@deepseek-ai/cosmoki
 import { LlmRuntime } from '@deepseek-ai/dsh-llm';
 import { ToolExecutionPipeline } from '@deepseek-ai/dsh-tools/pipeline';
 import { runtimeId } from '../core/identity.mjs';
-import { toJsonSchema } from '../translate/schema.mjs';
+import { toJsonSchema } from './settings-schema.mjs';
 import { RuntimeCatalog } from './catalog.mjs';
 import { runRoute } from './routes.mjs';
 import { createRouteStreams, STREAM_ROUTE } from './route-streams.mjs';
@@ -16,6 +16,7 @@ import { createPluginManager } from './plugin-manager.mjs';
 import { configureProfile, withProfile as runProfile, loaderEntries, profilePath } from './profile.mjs';
 import { createBackendSessions } from './backend-sessions.mjs';
 import { createRegisteredSettings } from './registered-settings.mjs';
+import { installRegistryFetch } from './registry-fetch.mjs';
 
 const clone = (value) => structuredClone(value ?? {});
 const timeoutOf = (value) => value == null ? undefined : Math.min(600_000, Math.max(1_000, Number(value) || 1_000));
@@ -31,6 +32,7 @@ const LOCAL_EVENTS = new Set(['loader/volatile-update', 'settings/updated', 'llm
 export async function activateDsh(api, module, options) {
   if (options?.runtimeVersion !== 2) throw new Error('DSH 兼容包版本不受支持，请从上游来源重新安装');
   const upstream = module.default ?? module;
+  let releaseRegistryFetch = () => {};
   const releaseProfile = configureProfile(api);
   const sessions = options.readSessionDirectory ? createBackendSessions(api) : undefined;
   const ctx = new Context();
@@ -349,6 +351,7 @@ export async function activateDsh(api, module, options) {
   const dispose = async () => {
     if (stopped) return;
     stopped = true; catalog.live = false;
+    releaseRegistryFetch();
     routeStreams.dispose();
     clearInterval(catalogTimer);
     modelLookups.abort(new Error('扩展已卸载'));
@@ -372,6 +375,7 @@ export async function activateDsh(api, module, options) {
   };
   api.onDispose(dispose);
   try {
+    releaseRegistryFetch = installRegistryFetch();
     await mountRemote(api, ctx);
     const settings = await api.settings.read();
     rawConfig = clone(settings.value); version = settings.version;

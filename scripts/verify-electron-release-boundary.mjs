@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { isRetiredRuntimePath } from "../apps/desktop/scripts/after-pack.mjs";
 
 assert.equal(isRetiredRuntimePath("daemon/compat/node_modules/simple-icons/icons/tauri.svg"), false);
-for (const path of ["tauri/runtime.js", "daemon/tauri/icons/logo.svg", "cef.dll", "playwright/index.js", "Chromium Embedded Framework.framework/main"]) {
+for (const path of ["tauri/runtime.js", "daemon/tauri/icons/logo.svg", "cef.dll", "playwright/index.js", "Chromium Embedded Framework.framework/main", "daemon/compat/translate/settings-page.mjs"]) {
   assert.equal(isRetiredRuntimePath(path), true, path);
 }
 

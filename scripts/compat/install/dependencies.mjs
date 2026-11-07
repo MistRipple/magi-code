@@ -35,15 +35,10 @@ export async function installDependencies(root, sharedRoot, registry = process.e
           records.push({ name, version: installed.version, host: true, ...(depth === 0 && dshPeer && compatibility?.exempted ? { versionExemption: true } : {}) });
           continue;
         }
-        // Cordis is a peer in the upstream ecosystem, but it is also the
-        // versioned compatibility boundary. A newer plugin must not be
-        // rejected merely because Magi's bundled peer is older: install the
-        // exact compatible Cordis copy inside this translated package. The
-        // runtime resolver leaves this name local to the upstream tree while
-        // Magi's own adapter continues using its bundled Cordis instance.
-        const requested = semver.minVersion(range);
-        const rangePinsDifferentPeer = typeof range === 'string' && (range.includes('-') || range.trimStart().startsWith('~') || (requested && semver.major(requested) !== semver.major(installed.version)));
-        if (name !== '@deepseek-ai/cordis' || !peer || !requested || (!semver.gte(requested, installed.version) && !rangePinsDifferentPeer)) throw new Error(`宿主依赖 ${name}@${installed.version} 不满足 ${range}`);
+        // Cordis peer 可以随译包从 registry 安装满足完整范围的精确版本；
+        // minVersion 不是 registry 实际版本，不能据此猜测是否可以隔离。
+        // Magi 自己的上下文仍使用随包实例，原包注册还须通过真实启动检查。
+        if (name !== '@deepseek-ai/cordis' || !peer) throw new Error(`宿主依赖 ${name}@${installed.version} 不满足 ${range}`);
       }
       if (ancestors.has(name) && semver.satisfies(ancestors.get(name), range)) continue;
       // 可选依赖在当前平台确实不适用时才跳过；不以下载失败当作不可用。

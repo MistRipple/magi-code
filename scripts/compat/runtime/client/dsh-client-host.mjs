@@ -21,12 +21,12 @@ import { createWebStorage } from './web-storage.mjs';
 import { createEventSource } from './event-source.mjs';
 import { createComposerClient } from './composer.mjs';
 import { createSessionComposerServices } from './session-composer.mjs';
+import { SettingsForm } from './settings-form.mjs';
 
 const CHANNEL = 'magi-plugin-v1';
 
 /**
  * @param {object} options
- * @param {{ kind: 'exact' | 'prefix', path: string }[]} options.routes 构建期记录的后端路由；界面只能访问这些路径
  * @param {string} [options.clientScript] 上游界面脚本相对路径，默认 client.js
  * @param {string} [options.slotName] 只渲染这个上游槽位（右栏/主页面入口）
  */
@@ -39,6 +39,7 @@ export function startDshClient(options) {
   let placement = 'page';
   let selectedSlot = options;
   let initialized = false;
+  let settingsSchema, settingsError;
   const selectView = (m) => {
     placement = ['settings', 'background'].includes(m.placement) ? m.placement : 'page';
     if (options.clientViews?.length && m.viewId) {
@@ -204,6 +205,10 @@ export function startDshClient(options) {
   const root = ReactDOMClient.createRoot(container);
   const render = () => {
     if (placement === 'background') { root.render(null); return; }
+    if (options.settingsForm) {
+      root.render(React.createElement(SettingsForm, { scope, schema: settingsSchema, locale, error: settingsError }));
+      return;
+    }
     const cards = slotContext.live().filter((entry) => selectedSlot.slotName
       ? entry.descriptor.name === selectedSlot.slotName && (selectedSlot.slotKey === undefined || String(entry.descriptor.key ?? entry.descriptor.id ?? '') === selectedSlot.slotKey)
       : slotDisposition(entry.descriptor.name) === 'mounted');
@@ -262,6 +267,7 @@ export function startDshClient(options) {
       locale = m.locale ?? locale;
       slotContext.setLocale(locale);
       if (m.theme) applyTheme(m.theme);
+      if (options.settingsForm) render();
       try {
         // 同步 Web Storage 外观只保存界面缓存；实际存储由宿主按插件身份隔离。
         // 必须在上游 apply 之前初始化，typeof sessionStorage 在 opaque origin 上也会抛错。
@@ -272,12 +278,13 @@ export function startDshClient(options) {
             void request({ operation: 'view.storage.write', area, mutation }).catch((error) => console.error('Plugin UI storage failed:', error));
           }),
         });
-        await refreshSettings();
+        settingsSchema = await refreshSettings();
         if (sessionComposer) await composer.api.refresh();
-        await loadUpstream(options.clientScript ?? 'client.js');
+        if (!options.settingsForm) await loadUpstream(options.clientScript ?? 'client.js');
         render();
       } catch (error) {
-        root.render(React.createElement('div', { style: { padding: 16, color: 'crimson' } }, `界面加载失败：${error?.message ?? error}`));
+        if (options.settingsForm) { settingsError = String(error?.message ?? error); render(); }
+        else root.render(React.createElement('div', { style: { padding: 16, color: 'crimson' } }, `界面加载失败：${error?.message ?? error}`));
       }
     } else if (m.type === 'context') {
       if (m.placement) { selectView(m); applyPlacement(); render(); }

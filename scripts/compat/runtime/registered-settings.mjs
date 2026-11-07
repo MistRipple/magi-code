@@ -7,7 +7,8 @@ export const validSettingsNamespace = ns => typeof ns === 'string' && ns.length 
 // 旧版 DSH 的命名空间表单独立于现代 Config。所有值沿 daemon 的插件
 // 资源与 CAS 持久化；本对象只持有已确认的快照和 fiber 生命周期内的 schema。
 export function createRegisteredSettings(api, namespaces = [], emit = () => {}) {
-  const allowed = new Set(namespaces), entries = new Map(), calls = new AsyncLocalStorage();
+  const enabled = namespaces === true || Array.isArray(namespaces) && namespaces.length > 0;
+  const entries = new Map(), calls = new AsyncLocalStorage();
   let snapshot = { version: 0, value: null }, queue = Promise.resolve(), closed = false;
   const alive = () => { if (closed) throw new Error('设置服务已失效'); };
   const read = async () => {
@@ -50,10 +51,11 @@ export function createRegisteredSettings(api, namespaces = [], emit = () => {}) 
     has: ns => entries.has(ns),
     register(ctx, ns, schema, options = {}) {
       alive();
-      if (!validSettingsNamespace(ns) || !allowed.has(ns)) throw new Error(`设置命名空间未在安装期声明：${ns}`);
+      if (!validSettingsNamespace(ns) || !enabled) throw new Error(`插件未声明注册设置资源或命名空间无效：${ns}`);
       if (typeof schema !== 'function') throw new Error(`设置 ${ns} 缺少同步 schema`);
       if (options.applies !== undefined && options.applies !== 'live') throw new Error(`设置 ${ns} 暂不支持 ${options.applies} 应用范围`);
       if (entries.has(ns)) throw new Error(`设置命名空间 ${ns} 已注册`);
+      if (entries.size >= 128) throw new Error('设置命名空间超过 128 项');
       const entry = { ns, schema };
       entries.set(ns, entry);
       try { get(entry); } catch (error) { entries.delete(ns); throw error; }
@@ -85,7 +87,7 @@ export function createRegisteredSettings(api, namespaces = [], emit = () => {}) 
     async run(callback) {
       alive();
       if (calls.getStore()) return callback();
-      if (allowed.size) await read();
+      if (enabled) await read();
       const call = { writes: [] };
       return calls.run(call, async () => {
         let result, failure;

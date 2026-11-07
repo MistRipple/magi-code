@@ -16,7 +16,7 @@
 /** @type {Record<string, Capability>} */
 export const CAPABILITIES = {
   // —— 静态贡献（清单声明 + 运行期绑定处理器）——
-  'tool.register': { group: 'tools', magi: '清单 contributions.tools + api.tool', rpc: 'register.tool', invariants: ['工具必须在构建期静态声明', '最终入参由 Magi 按 inputSchema 校验'] },
+  'tool.register': { group: 'tools', magi: 'daemon runtime catalog + api.tool', rpc: 'register.tool', invariants: ['动态目录与处理器绑定同一宿主租约', '最终入参由 Magi 按 inputSchema 校验'] },
   'command.register': { group: 'commands', magi: '清单 contributions.commands + api.command', rpc: 'register.command' },
   'settings.schema': { group: 'settings', magi: '清单 settingsSchema + api.settings', rpc: 'settings.read' },
   'modelSource.publish': { group: 'llm', magi: 'api.modelSource（仅主对话、只追加、仅存运行期）', rpc: 'modelSource.set' },

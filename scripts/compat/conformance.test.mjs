@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { usesComposerClient } from './translate/client-assets.mjs';
-import { translateClientBusiness } from './translate/client-business.mjs';
+import { usesComposerClient } from './install/client-assets.mjs';
+import { translateClientBusiness } from './install/client-business.mjs';
 import { createSessionComposerServices } from './runtime/client/session-composer.mjs';
 import { createComposerClient } from './runtime/client/composer.mjs';
 import vm from 'node:vm';
@@ -12,10 +12,16 @@ import { Context } from '@deepseek-ai/cordis';
 import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import { classify } from './dsh/catalog.mjs';
 import { hostDependencies } from './core/host-dependencies.mjs';
-import { installDependencies } from './translate/dependencies.mjs';
+import { installDependencies } from './install/dependencies.mjs';
 import { installSharedResolution } from './runtime/shared-resolution.mjs';
 import { invokeRemote } from './runtime/remote.mjs';
 import { createSettingsScope } from './runtime/client/settings-scope.mjs';
+import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
+import { create as createTar } from 'tar';
+import { installRegistryFetch } from './runtime/registry-fetch.mjs';
+import { prepareDsh } from './install/prepare.mjs';
+import { backendEntry } from './core/package.mjs';
 
 const temporary = async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'magi-compat-contract-'));
@@ -23,6 +29,74 @@ const temporary = async (t) => {
   return root;
 };
 const json = (file, value) => writeFile(file, JSON.stringify(value));
+
+test('原包封装只观察默认启动，扫描与运行共用条件导出，原生页面字节保留且归档可复现', async (t) => {
+  const root = await temporary(t), upstream = join(root, 'upstream'); await mkdir(upstream);
+  const sharedRoot = new URL('.', import.meta.url).pathname;
+  await json(join(upstream, 'package.json'), { name: 'dsh-cleanup-contract', version: '1.0.0', type: 'module',
+    main: 'unused.js', exports: { '.': { node: { import: './index.js' }, default: './unused.js' }, './client': './client.js' },
+    peerDependencies: { '@deepseek-ai/cordis': '4.1.0' } });
+  await writeFile(join(upstream, 'index.js'), `
+    export const Config = value => ({ enabled: false, ...value });
+    Config.toJSON = () => ({ uid: 1, refs: { 1: { type: 'object', dict: { enabled: 2 } }, 2: { type: 'boolean', meta: { default: false } } } });
+    export function apply(ctx, config) {
+      if (config.enabled) throw new Error('安装期不能改写作者默认配置');
+      ctx.inject(['settings'], c => { if (config.enabled) c.settings.register('late', value => value ?? {}); });
+    }
+  `);
+  const client = `/* preserve page */ window.__ModuleLoader__.load({ id: 'contract', factory: require => ({ apply(ctx) { ctx.slots.register({ name: 'settings.section', id: 'contract' }, () => null); } }) });`;
+  await writeFile(join(upstream, 'client.js'), client);
+  const prepared = [];
+  for (const name of ['first', 'second']) {
+    const outDir = join(root, name);
+    const result = await prepareDsh({ upstreamDir: upstream, outDir, sharedRoot, source: { integrity: 'contract' } });
+    assert.deepEqual(result.manifest.contributions.tools, []);
+    assert.deepEqual(result.manifest.contributions.commands, []);
+    assert.ok(result.manifest.permissions.some(permission => permission.kind === 'storage' && permission.targets.includes('dsh-registered-settings')));
+    assert.equal(await readFile(join(outDir, 'ui/client.js'), 'utf8'), client);
+    assert.equal(result.report.variants, undefined);
+    assert.match(await readFile(join(outDir, 'extension/index.mjs'), 'utf8'), /settingsNamespaces":true/);
+    const { packPlugin } = await import('./core/pack.mjs');
+    const archive = join(root, `${name}.zip`); packPlugin(outDir, archive); prepared.push(await readFile(archive));
+  }
+  assert.deepEqual(prepared[0], prepared[1]);
+  assert.equal(backendEntry({ exports: { default: './first.js', node: './second.js' } }), 'first.js');
+  for (const exports of ['../outside.js', { '.': { browser: './browser.js' } }]) assert.throws(() => backendEntry({ exports }), /入口/);
+});
+
+test('npm 版本元数据遇到 406 只重新协商 JSON，保留取消与请求选项，其他服务和写入原样执行', async () => {
+  const calls = [], registry = 'https://registry.example.test/npm/';
+  const target = { async fetch(input, options) {
+    const request = new Request(input, options); calls.push({ input, options, request });
+    return new Response('metadata', { status: request.headers.get('accept') === 'application/json' ? 200 : 406 });
+  } };
+  const original = target.fetch, release = installRegistryFetch({ registry, target });
+  const dispatcher = {}, controller = new AbortController();
+  const options = { headers: { accept: 'application/vnd.npm.install-v1+json', authorization: 'test-token' }, signal: controller.signal, dispatcher };
+  const result = await target.fetch(`${registry}dsh-example/latest`, options);
+  assert.equal(result.status, 200); assert.equal(calls.length, 2);
+  assert.equal(calls[0].options, options); assert.equal(calls[1].options.dispatcher, dispatcher);
+  assert.equal(calls[1].request.headers.get('authorization'), 'test-token');
+  assert.equal(calls[1].request.headers.get('accept'), 'application/json');
+  for (const url of [`${registry}%40scope%2fplugin/1.0.0`, `${registry}@scope/plugin/next`]) {
+    calls.length = 0; assert.equal((await target.fetch(new Request(url, options))).status, 200); assert.equal(calls.length, 2);
+  }
+  for (const [url, init] of [
+    ['https://other.example.test/npm/plugin/latest', options], ['https://registry.example.test/other/plugin/latest', options],
+    [`${registry}plugin/-/file.tgz`, options], [`${registry}plugin/latest`, { ...options, method: 'POST', body: 'write' }],
+    [`${registry}plugin/latest`, { headers: { accept: 'text/plain' } }],
+  ]) {
+    calls.length = 0; assert.equal((await target.fetch(url, init)).status, 406); assert.equal(calls.length, 1);
+    assert.equal(calls[0].input, url); assert.equal(calls[0].options, init);
+  }
+  controller.abort(); assert.equal(calls.length, 1);
+  release(); assert.equal(target.fetch, original);
+  let count = 0;
+  const aborted = { async fetch() { count++; controller.abort(); return new Response('', { status: 406 }); } };
+  const restore = installRegistryFetch({ registry, target: aborted });
+  await assert.rejects(aborted.fetch(`${registry}plugin/latest`, options), { name: 'AbortError' });
+  assert.equal(count, 1, '取消后不能补发元数据请求'); restore();
+});
 
 test('发行运行库的导入分类和安装/执行解析共用实际清单，不把未携带的 dsh 包当成宿主包', async () => {
   const root = new URL('.', import.meta.url).pathname;
@@ -37,6 +111,8 @@ test('真实 Cordis 方法与报告对齐；不存在的 Reflect 方法仍拒绝
     assert.equal(classify('calls', `ctx.reflect.${method}`).status, 'shim');
   }
   assert.equal(classify('calls', 'ctx.reflect.notARealMethod').status, 'unknown');
+  assert.equal(classify('imports', '@deepseek-ai/cordis/package.json').status, 'bundled');
+  assert.equal(classify('imports', '@deepseek-ai/cordis/unknown-api').status, 'unknown');
 });
 
 test('普通 DSH 依赖沿原包解析，共享 Cordis 仍保持单实例', async (t) => {
@@ -52,6 +128,58 @@ test('普通 DSH 依赖沿原包解析，共享 Cordis 仍保持单实例', asyn
   const hooks = installSharedResolution(shared);
   try { assert.deepEqual((await import(join(upstream, 'entry.mjs'))).default, ['shared', 'local']); }
   finally { hooks.deregister(); }
+});
+
+test('Cordis peer 在线隔离安装，主入口、子路径和 CJS 元数据使用同一版本，宿主不被污染', async (t) => {
+  const root = await temporary(t), shared = join(root, 'shared'), upstream = join(root, 'upstream');
+  const name = '@deepseek-ai/cordis';
+  // 发布物来自独立本地 registry，校验和及安装流程与 npm 一致。
+  // 宿主预发布版不满足 ^4.0.0，但 registry 的稳定版满足，不能按 minVersion 猜测而拒绝。
+  const source = join(root, 'source'); await mkdir(source);
+  await json(join(source, 'package.json'), { name, version: '4.1.1', type: 'module', exports: {
+    '.': { import: './index.js', require: './index.cjs' }, './package.json': './package.json', './feature': './feature.js',
+  } });
+  await writeFile(join(source, 'index.js'), "export default 'local';");
+  await writeFile(join(source, 'index.cjs'), "module.exports = 'local-cjs';");
+  await writeFile(join(source, 'feature.js'), "export default 'local-feature';");
+  const archive = join(root, 'cordis.tgz');
+  await createTar({ cwd: source, gzip: true, file: archive, prefix: 'package' }, ['package.json', 'index.js', 'index.cjs', 'feature.js']);
+  const tarball = await readFile(archive);
+  const integrity = `sha512-${createHash('sha512').update(tarball).digest('base64')}`;
+  let registry;
+  const server = createServer((request, response) => {
+    if (request.url === '/cordis.tgz') { response.end(tarball); return; }
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({ name, 'dist-tags': { latest: '4.1.1' }, versions: {
+      '4.1.1': { name, version: '4.1.1', dist: { tarball: `${registry}/cordis.tgz`, integrity } },
+    } }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  registry = `http://127.0.0.1:${server.address().port}`;
+  const host = join(shared, 'node_modules', name); await mkdir(host, { recursive: true });
+  await json(join(shared, 'package.json'), { dependencies: { [name]: '4.2.0-rc.1' } });
+  await json(join(host, 'package.json'), { name, version: '4.2.0-rc.1', type: 'module', exports: { '.': './index.js', './package.json': './package.json', './feature': './feature.js' } });
+  await writeFile(join(host, 'index.js'), "export default 'host';");
+  await writeFile(join(host, 'feature.js'), "export default 'host-feature';");
+  await mkdir(upstream);
+  await json(join(upstream, 'package.json'), { name: 'peer-plugin', version: '1.0.0', peerDependencies: { [name]: '^4.0.0' } });
+  const installed = await installDependencies(upstream, shared, registry);
+  assert.deepEqual(installed, [{ name, version: '4.1.1', integrity, host: false, isolated: true }]);
+  await writeFile(join(upstream, 'entry.mjs'), `import core from '${name}'; import feature from '${name}/feature'; import metadata from '${name}/package.json' with { type: 'json' }; import {createRequire} from 'node:module'; const require=createRequire(import.meta.url); export default [core, feature, metadata.version, require('${name}'), require('${name}/package.json').version];`);
+  await writeFile(join(shared, 'entry.mjs'), `import core from '${name}'; import feature from '${name}/feature'; export default [core, feature];`);
+  // 上游目录之外的同名 node_modules 不能改变共享运行库的身份。
+  const ambient = join(root, 'node_modules', name); await mkdir(ambient, { recursive: true });
+  await json(join(ambient, 'package.json'), { name, version: '9.0.0', type: 'module', main: 'index.js' });
+  await writeFile(join(ambient, 'index.js'), "export default 'ambient';");
+  const adapter = join(root, 'adapter'); await mkdir(adapter);
+  await writeFile(join(adapter, 'entry.mjs'), `import core from '${name}'; export default core;`);
+  const hooks = installSharedResolution(shared, { '@magi/compat-upstream-root': upstream });
+  try {
+    assert.deepEqual((await import(join(upstream, 'entry.mjs'))).default, ['local', 'local-feature', '4.1.1', 'local-cjs', '4.1.1']);
+    assert.deepEqual((await import(join(shared, 'entry.mjs'))).default, ['host', 'host-feature']);
+    assert.equal((await import(join(adapter, 'entry.mjs'))).default, 'host', '原包之外的适配器不使用物理祖先中的同名依赖');
+  } finally { hooks.deregister(); }
 });
 
 test('可选 peer 缺席不会下载或冒充宿主已提供；必需的缺失宿主包仍明确失败', async (t) => {
