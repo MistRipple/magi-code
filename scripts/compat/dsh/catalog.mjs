@@ -59,7 +59,8 @@ export const DSH_RULES = [
 
   // —— 会话、消息、附件：Magi 内核独有 ——
   rule('calls', /^ctx\.(agents|sessionPersistence|subagents)(\.|$)/, { capability: 'service.spawn', fidelity: 'none', group: 'session', note: '会话/Agent 对象由 Magi 内核独有；扩展只能经钩子与宿主服务提案', source: COOKBOOK, needs: '无；与“Rust daemon 是唯一事实源”冲突' }),
-  rule('calls', /^ctx\.sessions(\.|$)/, { capability: 'service.snapshot', fidelity: 'full', group: 'session', note: '会话投影需要沿 daemon 的原生快照和授权接入，尚未实现；不提供空会话替身', source: COOKBOOK }),
+  rule('calls', /^ctx\.sessions$/, { fixed: 'shim', group: 'session', target: 'daemon 调用期的后端会话服务', note: '服务可注入；不提供客户端快照接口，不复制 DSH SessionStore', source: COOKBOOK }),
+  rule('calls', /^ctx\.sessions\./, { capability: 'service.sessionDirectory', fidelity: 'partial', group: 'session', note: '仅有调用期 list()/get() 身份投影；完整 Session 对象和写入尚未接入，必需调用仍阻塞', source: COOKBOOK }),
   rule('calls', /^ctx\.attachments\.(readImage|saveImage|readImageRequest)$/, { fixed: 'shim', group: 'runtime', target: 'Magi 有界 blob 附件桥', note: '图片以插件私有、短时 blob 保存；不复制会话附件事实', source: COOKBOOK }),
   rule('calls', /^ctx\.(sessionProjections|messages|memory|goals|workflowEngine|compaction|approval|sandbox)(\.|$)/, { capability: 'service.snapshot', fidelity: 'none', group: 'session', note: '对应能力由 Magi 原生拥有（审批、压缩、目标、沙箱），没有公开写入接口', source: COOKBOOK }),
   rule('calls', /^ctx\.(webServer|server)\.register$/, { capability: 'ui.route', fidelity: 'full', note: 'exact / prefix 路由，Node 与 Fetch 处理器；普通 fetch 整段返回，EventSource 经有界事件桥持续推送 SSE；不开放额外端口', source: src('packages/host/webserver/README.md') }),
@@ -78,7 +79,7 @@ export const DSH_RULES = [
   rule('injects', /^profileContext$/, { fixed: 'shim', group: 'runtime', target: '调用期 profile 的只读身份', source: COOKBOOK }),
   rule('injects', /^(connection|pluginManager)$/, { fixed: 'shim', group: 'runtime', target: 'Magi daemon 已认证路由/插件管理服务', note: '目录读取实时投影；安装、启停与卸载需独立授权，并保留 Magi 的版本授权与排空边界', source: COOKBOOK }),
   rule('injects', /^(attachments)$/, { fixed: 'shim', group: 'runtime', target: 'Magi 有界附件兼容服务', note: '图片复用 blob 桥，不复制会话事实', source: COOKBOOK }),
-  rule('injects', /^(sessions)$/, { capability: 'service.snapshot', fidelity: 'full', group: 'session', note: '会话投影尚未接入；必需依赖拒绝，条件注入保持缺席', source: COOKBOOK }),
+  rule('injects', /^(sessions)$/, { fixed: 'shim', group: 'session', target: 'daemon 调用期的后端会话服务', note: '命名空间可用；具体 Session 方法仍逐项检查，不把服务出现视为完整支持', source: COOKBOOK }),
   rule('injects', /^(commands)$/, { capability: 'command.register', fidelity: 'full', source: COOKBOOK }),
   rule('injects', /^(systemPrompt)$/, { capability: 'hook.prompt.contribute', fidelity: 'partial', note: '只能追加带稳定性与预算的参考片段；遮蔽与顺序控制无对应', source: COOKBOOK }),
   rule('injects', /^(webServer|server)$/, { capability: 'ui.route', fidelity: 'full', note: '路由注册由 Magi 的 api.route 承载；见 ctx.webServer.register', source: src('packages/host/webserver/README.md') }),

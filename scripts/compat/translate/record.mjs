@@ -21,7 +21,7 @@ export function recordUpstream(options) {
       const overridesPath = join(home, 'overrides.json');
       writeFileSync(overridesPath, JSON.stringify(overrides));
       const resultPath = join(home, 'result.json');
-      runRestricted({ script: RECORDER, args: [entry, overridesPath, sharedRoot, resultPath, upstreamDir], readable: [sharedRoot, upstreamDir], home, label: '受限记录' });
+      runRestricted({ script: RECORDER, args: [entry, overridesPath, sharedRoot, resultPath, upstreamDir, options.readSessionDirectory ? '1' : '0'], readable: [sharedRoot, upstreamDir], home, label: '受限记录' });
       return JSON.parse(readFileSync(resultPath, 'utf8'));
     };
     const first = run({});

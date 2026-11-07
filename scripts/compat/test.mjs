@@ -41,6 +41,14 @@ test('ctx.get 服务读取沿上下文辅助函数记录，供管理权限声明
   assert.equal(report.verdict.blocked.length, 0, '读取可缺席服务不会被变成必需依赖');
 });
 
+test('后端 sessions 命名空间准入不代表完整 Session 对象或写入方法已翻译', async(t)=>{
+  assert.equal((await inspectOptional(t,"export const inject=['sessions']; export function apply(ctx) {}" )).verdict.blocked.length,0);
+  for(const code of ["ctx.sessions.list()","ctx.sessions.get('s').header","ctx.sessions.create('s')","ctx.sessions.fork('s')"]){
+    const report=await inspectOptional(t,`export const inject=['sessions']; export function apply(ctx) { ${code}; }`);
+    assert.ok(report.verdict.blocked.length>0,code);
+  }
+});
+
 test('DSH 原包的 createRequire.resolve 与 ESM 共享同一真实运行库解析', async (t) => {
   const { installSharedResolution } = await import('./runtime/shared-resolution.mjs');
   const { createRequire } = await import('node:module');

@@ -70,10 +70,14 @@ export async function prepareDsh(options) {
   const inspection = await translator.inspect(root, { required: ['llm', 'tools', 'commands', 'settings', 'runtime', 'hooks', 'session', 'services', 'prompt', 'native'] });
   if (inspection.verdict.blocked.length) throw new Error(`Magi 兼容检查未通过：\n${inspection.verdict.blocked.map((item) => `${item.name}（${item.status === 'unknown' ? '尚未完成兼容核对' : '宿主能力尚未接入'}）: ${item.note}`).join('\n')}`);
   const dependencies = await installDependencies(root, options.sharedRoot, undefined, compatibility);
+  // 条件注入的未实现 Session 方法继续保持服务缺席，不能因新增命名空间
+  // 让原有可选降级分支突然运行。只有必需命名空间读取申请目录授权。
+  const readSessionDirectory = inspection.entries.some((entry) => !entry.optional
+    && (entry.kind === 'injects' && entry.name === 'sessions' || entry.kind === 'calls' && entry.name === 'ctx.sessions'));
   // 静态扫描不能证明 apply() 能启动，也看不到延迟注册的工具/事件。安装前在
   // 受限记录器中启动一次真实 Cordis：失败直接阻塞安装，成功的运行期贡献写入
   // 清单，避免“空清单但安装成功”的假阳性。
-  const recorded = recordUpstream({ entry, sharedRoot: options.sharedRoot, upstreamDir: root });
+  const recorded = recordUpstream({ entry, sharedRoot: options.sharedRoot, upstreamDir: root, readSessionDirectory });
   const runtimeEntries = recorded.listeners.map((name) => {
     const rule = classifyDsh('events', name);
     return { kind: 'events', name, category: rule.category, status: rule.status, target: rule.target, note: rule.note, source: rule.source, needs: rule.needs, capability: rule.capability, count: 1, files: [] };
@@ -119,11 +123,12 @@ export async function prepareDsh(options) {
     || ['pluginManager', 'loader'].some((name) => Object.hasOwn(inspection.serviceReads, name))) {
     manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', 'authorize', 'compatibility', 'background'] });
   }
+  if (readSessionDirectory) manifest.permissions.push({ kind: 'sessionRead', targets: ['directory'] });
   mkdirSync(options.outDir, { recursive: true });
   const kept = copyTree(root, options.outDir);
   const compatRuntimeId = sharedRuntimeId();
   const optionalEvents = recorded.listeners.filter((name) => inspection.entries.some((item) => item.kind === 'events' && item.name === name && item.optional));
-  writeFileSync(join(options.outDir, 'extension/index.mjs'), `import { activateDsh } from '@magi/compat-dsh';\nimport * as upstream from ${JSON.stringify(`./upstream/${main}`)};\nexport default api => activateDsh(api, upstream, ${JSON.stringify({ runtimeVersion: TRANSLATOR_VERSION, plugin: pkg.name, runtimeId: compatRuntimeId, optionalEvents })});\n`);
+  writeFileSync(join(options.outDir, 'extension/index.mjs'), `import { activateDsh } from '@magi/compat-dsh';\nimport * as upstream from ${JSON.stringify(`./upstream/${main}`)};\nexport default api => activateDsh(api, upstream, ${JSON.stringify({ runtimeVersion: TRANSLATOR_VERSION, plugin: pkg.name, runtimeId: compatRuntimeId, optionalEvents, readSessionDirectory })});\n`);
   mkdirSync(join(options.outDir, 'ui'), { recursive: true });
   let clientAnalysis = null;
   if (client) {

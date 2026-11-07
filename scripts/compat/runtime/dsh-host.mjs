@@ -13,7 +13,8 @@ import { startOpenAiBridge } from './openai-bridge.mjs';
 import { requestAttachments, saveRequestImage, withRequestImages } from './attachments.mjs';
 import { mountRemote } from './remote.mjs';
 import { createPluginManager } from './plugin-manager.mjs';
-import { configureProfile, withProfile, loaderEntries, profilePath } from './profile.mjs';
+import { configureProfile, withProfile as runProfile, loaderEntries, profilePath } from './profile.mjs';
+import { createBackendSessions } from './backend-sessions.mjs';
 
 const clone = (value) => structuredClone(value ?? {});
 const timeoutOf = (value) => value == null ? undefined : Math.min(600_000, Math.max(1_000, Number(value) || 1_000));
@@ -30,6 +31,10 @@ export async function activateDsh(api, module, options) {
   if (options?.runtimeVersion !== 2) throw new Error('DSH 兼容包版本不受支持，请从上游来源重新安装');
   const upstream = module.default ?? module;
   const releaseProfile = configureProfile(api);
+  const sessions = options.readSessionDirectory ? createBackendSessions(api) : undefined;
+  const withProfile = (callback, signal) => sessions
+    ? sessions.run(() => runProfile(callback, signal), signal)
+    : runProfile(callback, signal);
   const ctx = new Context();
   // Cordis inject 是“服务出现时挂载”的条件 fiber；不能把可选分支的 PENDING 当成整包失败。
   const conditionalFibers = new Set();
@@ -248,8 +253,9 @@ export async function activateDsh(api, module, options) {
   await ctx.plugin(LlmRuntime);
 
   // 路由在 daemon 已完成插件准入后才到达此连接。插件目录每次读 daemon，
-  // 缺少的 loader/session 服务保持缺席，不能用空目录冒充真实安装/会话事实。
+  // 会话服务仅在安装包请求独立目录授权时出现；可选未支持分支继续缺席。
   ctx.provide('connection', { requestRejection: () => undefined });
+  if (sessions) ctx.provide('sessions', sessions.service);
   if (api.plugins?.list) ctx.provide('pluginManager', createPluginManager(api));
   if (api.plugins?.list && profilePath()) {
     ctx.provide('loader', { entries: loaderEntries });
@@ -355,6 +361,7 @@ export async function activateDsh(api, module, options) {
     for (const result of cleanup) if (result.status === 'rejected') diagnostic(`卸载回收: ${result.reason?.message ?? result.reason}`);
     sourceReleases.clear(); bridges.clear(); published.clear();
     releaseProfile();
+    sessions?.dispose();
   };
   api.onDispose(dispose);
   try {

@@ -13,6 +13,7 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { browserImageFixtures, bmpEncodingFixtures } from '../lib/plugin-image-fixtures.mjs';
+import { createBackendSessions } from './runtime/backend-sessions.mjs';
 
 // 只替代 daemon RPC；插件加载、依赖、effect、工具管线及模型目录运行真实上游代码。
 function host(value = {}) {
@@ -37,6 +38,7 @@ function host(value = {}) {
       async set(id, source) { state.models.set(id, source); },
       async clear(id) { state.models.delete(id); },
     },
+    session: { async directory() { return { sessions: [{ sessionId: 'fixture-session', workspaceId: null, title: 'Fixture', createdAt: 1, updatedAt: 2 }], hasMore: false, nextAfterSessionId: null }; } },
     settings: {
       async read() { return structuredClone(snapshot); },
       async write(expected, value) {
@@ -60,6 +62,54 @@ function host(value = {}) {
 }
 
 const options = { runtimeVersion: 2, plugin: 'fixture' };
+
+test('后端会话目录消费真实分页，保持 list/get 形状且拒绝跨调用、取消和未知 Session 字段', async () => {
+  let version=0, saved, calls=[];
+  const backend=createBackendSessions({session:{async directory(input){
+    calls.push(input);
+    return input.afterSessionId ? {sessions:[{sessionId:'b',createdAt:1}],hasMore:false,nextAfterSessionId:null}
+      : {sessions:[{sessionId:`a${version}`,createdAt:2}],hasMore:true,nextAfterSessionId:`a${version}`};
+  }}});
+  assert.equal(typeof backend.service.list,'function');
+  assert.equal(backend.service.scope,undefined);
+  assert.throws(()=>backend.service.list(),/当前 daemon 调用/);
+  await backend.run(()=>{
+    assert.deepEqual(backend.service.list().map(session=>session.id),['b','a0']);
+    saved=backend.service.get('a0');
+    assert.throws(()=>saved.header,/尚未映射/);
+    assert.equal(backend.service.get('unknown'),undefined);
+  });
+  assert.throws(()=>saved.id,/当前 daemon 调用/);
+  version++;
+  await backend.run(()=>{
+    assert.equal(backend.service.get('a0'),undefined);
+    assert.equal(backend.service.get('a1').id,'a1');
+    assert.throws(()=>saved.id,/不属于当前调用/);
+  });
+  assert.equal(calls.length,4);
+  const controller=new AbortController();controller.abort(new Error('cancelled'));
+  await assert.rejects(backend.run(()=>assert.fail(),controller.signal),/cancelled/);
+  assert.equal(calls.length,4);
+  backend.dispose();
+  await assert.rejects(backend.run(()=>assert.fail()),/已失效/);
+});
+
+test('后端会话目录分页错误、撤权与处置不会回落旧快照或继续执行业务',async()=>{
+  for(const directory of [
+    async()=>({sessions:[{sessionId:'same',createdAt:1}],hasMore:true,nextAfterSessionId:'same'}),
+    async()=>({sessions:[],hasMore:true,nextAfterSessionId:null}),
+    async()=>{throw new Error('permission revoked');},
+  ]){
+    const backend=createBackendSessions({session:{directory}});
+    await assert.rejects(backend.run(()=>assert.fail('目录未成功不得执行业务')),/身份重复|游标|revoked/);
+    assert.throws(()=>backend.service.list(),/当前 daemon 调用/);
+  }
+  let finish;
+  const backend=createBackendSessions({session:{directory:()=>new Promise(resolve=>{finish=resolve;})}});
+  const request=backend.run(()=>assert.fail('处置期间不能使用迟到目录'));
+  backend.dispose();finish({sessions:[],hasMore:false,nextAfterSessionId:null});
+  await assert.rejects(request,/已失效/);
+});
 
 test('附件读取沿 daemon blob 身份和过期事实，不保留绕过授权的本地图片副本', async (t) => {
   const h = host();
@@ -123,6 +173,11 @@ test('未接入的 loader 和 sessions 不再以空服务满足必需依赖', as
   } }, options);
   t.after(() => running.dispose());
   for (const dependency of ['loader', 'sessions']) await assert.rejects(activateDsh(host().api, { inject: [dependency], apply() { assert.fail('必需服务缺失不能启动'); } }, options), /缺少必需服务/);
+  let sessions, ids;
+  const projected = await activateDsh(host().api, { inject: ['sessions'], apply(ctx) { sessions = ctx.sessions; ids = sessions.list().map(session=>session.id); } }, { ...options, readSessionDirectory: true });
+  t.after(() => projected.dispose());
+  assert.deepEqual(ids, ['fixture-session']);
+  assert.throws(()=>sessions.list(), /当前 daemon 调用/);
 });
 
 test('DSH 管理写操作使用精确版本与摘要，未获委托不能授权新包，启停和移除映射真实 ID', async () => {

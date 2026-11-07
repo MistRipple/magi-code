@@ -68,7 +68,7 @@ async function prepare() {
 import Schema from '@deepseek-ai/schemastery';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 export const name = 'magi-runtime-acceptance';
-export const inject = ['commands', 'tools', 'llm', 'attachments', 'webServer'];
+export const inject = ['commands', 'tools', 'llm', 'attachments', 'webServer', 'sessions'];
 export const Config = Schema.object({ label: Schema.string().default('initial'), enabled: Schema.boolean().default(true) });
 export function apply(ctx, config) {
   ctx.commands.register({ name: 'report', description: '报告当前配置', handler: async () => ({ kind: 'text', text: 'DSH_REPORT:' + config.label }) });

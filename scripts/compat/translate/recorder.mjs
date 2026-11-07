@@ -5,8 +5,9 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { configureProfile, withProfile, loaderEntries, profilePath } from '../runtime/profile.mjs';
 import { installSharedResolution } from '../runtime/shared-resolution.mjs';
 import { dshEnvironment } from '../core/dsh-compatibility.mjs';
+import { createBackendSessions } from '../runtime/backend-sessions.mjs';
 
-const [entry, overridesPath, sharedRoot, resultPath, upstreamDir] = process.argv.slice(2);
+const [entry, overridesPath, sharedRoot, resultPath, upstreamDir, readSessionDirectory] = process.argv.slice(2);
 // 上游常把运行状态写进 ~/.dsh；HOME 是记录用的空临时目录，预建它即可，不触碰真实用户目录。
 mkdirSync(`${process.env.HOME}/.dsh`, { recursive: true });
 installSharedResolution(sharedRoot, { '@magi/compat-upstream-root': upstreamDir + '/' });
@@ -43,6 +44,8 @@ globalThis.fetch = (input) => Promise.reject(new Error(`构建期记录不发送
 
 const out = { name: upstream.name ?? null, inject: upstream.inject ?? [], tools: [], commands: [], providers: [], routes: [], listeners: [], configSchema: null };
 const ctx = new Context();
+// 只提供真实服务的命名空间；记录器没有 daemon 会话事实，调用读取即拒绝。
+if (readSessionDirectory === '1') ctx.provide('sessions', createBackendSessions({}).service);
 ctx.provide('loader', {entries:loaderEntries});
 ctx.provide('profileContext', Object.freeze({ name: 'magi', dir: profilePath() }));
 ctx.baseUrl = pathToFileURL(profilePath() + '/').href;
@@ -60,6 +63,12 @@ stub('webServer', (d) => {
   return () => {};
 });
 ctx.plugin(class extends Service { constructor(c) { super(c, 'settings'); } configure() { return () => {}; } async update() {} async replace() {} async mutate() {} });
+ctx.plugin(class extends Service {
+  constructor(c) { super(c, 'attachments'); }
+  saveImage() { throw new Error('记录阶段没有 daemon 附件存储，不能保存业务图片'); }
+  readImage() { throw new Error('记录阶段没有 daemon 附件存储，不能读取业务图片'); }
+  readImageRequest() { throw new Error('记录阶段没有模型图片请求'); }
+});
 await new Promise((r) => setTimeout(r, 0));
 const llm = ctx.llm;
 const originalAdapter = llm.registerAdapter.bind(llm);
