@@ -18,6 +18,7 @@ import { summarize, verdictFor } from '../core/report.mjs';
 import { classify as classifyDsh } from '../dsh/catalog.mjs';
 import { clientViews } from './client-views.mjs';
 import { dshEnvironment, checkDshCompatibility } from '../core/dsh-compatibility.mjs';
+import { translateClientBusiness } from './client-business.mjs';
 
 const COMPAT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const TRANSLATOR_VERSION = 2;
@@ -109,7 +110,9 @@ export async function prepareDsh(options) {
     contributions: { tools: [], commands: [], views: [{ id: 'settings', title: '设置', entry: 'ui/settings.html', placements: ['settings'] }] },
   };
   const client = findClientFile(root, pkg);
-  if (client && usesComposerClient(readFileSync(client.file, 'utf8'))) {
+  const clientSource = client ? readFileSync(client.file, 'utf8') : null;
+  const business = clientSource ? translateClientBusiness(clientSource) : null;
+  if (client && (business.operations.length || usesComposerClient(clientSource))) {
     manifest.permissions.push({ kind: 'composer', targets: ['images'] });
   }
   if (inspection.entries.some((entry) => /^(?:ctx\.)?(?:pluginManager|loader)(?:\.|$)/.test(entry.name))
@@ -128,13 +131,13 @@ export async function prepareDsh(options) {
     clientAnalysis = analyzeNativeClient({ upstreamDir: root, pkg, sharedRoot: options.sharedRoot });
     copyFileSync(join(COMPAT_DIR, 'dist/dsh-client-host.js'), join(options.outDir, 'ui/host.js'));
     const assets = copyBrowserAssets(client.file, COMPAT_DIR, join(options.outDir, 'ui'));
-    copyFileSync(client.file, join(options.outDir, 'ui/client.js'));
+    writeFileSync(join(options.outDir, 'ui/client.js'), business.code);
     const views = clientViews(clientAnalysis.mounted, manifest.name);
     manifest.contributions.views = views.map(({ slot, ...view }) => view);
     const panelViews = views.filter((view) => view.placements.includes('rightPane')).map((view) => ({ key: view.slot.key, viewId: view.id }));
     for (const { slot, id, entry } of views) {
       const configFile = `dsh-config-${id}.js`;
-      writeFileSync(join(options.outDir, 'ui', configFile), `globalThis.__MAGI_DSH_CLIENT__ = ${JSON.stringify({ runtimeVersion: 2, clientScript: 'client.js', libraryScripts: assets.scripts, slotName: slot.name, slotKey: slot.key, panelViews })};\n`);
+      writeFileSync(join(options.outDir, 'ui', configFile), `globalThis.__MAGI_DSH_CLIENT__ = ${JSON.stringify({ runtimeVersion: 2, clientScript: 'client.js', libraryScripts: assets.scripts, slotName: slot.name, slotKey: slot.key, panelViews, business: { operations: business.operations } })};\n`);
       writeFileSync(join(options.outDir, entry), `<!doctype html>\n<meta charset="utf-8"><meta name="color-scheme" content="light dark">${assets.styles.map((name) => `<link rel="stylesheet" href="${name}">`).join('')}\n<div id="root"></div><script src="${configFile}"></script><script src="host.js"></script>\n`);
     }
   } else {
@@ -152,7 +155,8 @@ export async function prepareDsh(options) {
     serviceReads: inspection.serviceReads,
     tools: recorded.tools, commands: recorded.commands, modelSources: recorded.providers,
     routes: recorded.routes, listeners: recorded.listeners, variants: recorded.variants,
-    ui: { mode: client ? 'native' : 'generated', mountedSlots: clientAnalysis?.mounted ?? [], unmountedSlots: clientAnalysis?.unmounted ?? [] },
+    ui: { mode: client ? 'native' : 'generated', mountedSlots: clientAnalysis?.mounted ?? [], unmountedSlots: clientAnalysis?.unmounted ?? [],
+      ...(business?.operations.length ? { business: { operations: business.operations, awaitedCalls: business.awaitedCalls, changedFunctions: business.changedFunctions, originalHash: hash(clientSource), adaptedHash: hash(business.code) } } : {}) },
     static: { summary: report.summary, degraded: report.entries.filter((item) => ['partial', 'dropped'].includes(item.status)) },
     files: { kept: kept.length, omitted: [] },
   };

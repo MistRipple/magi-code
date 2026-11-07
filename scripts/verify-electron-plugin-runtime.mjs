@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
 import { browserImageFixtures } from './lib/plugin-image-fixtures.mjs';
+import { packPlugin } from './compat/translate/pack.mjs';
 import { connectAppPage, connectTarget, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -139,9 +140,22 @@ export function apply(ctx) {
   await writeFile(join(upstream, 'client.js'), `
 window.__ModuleLoader__.load({id:'native-panels',factory(require){
   const React=require('react'), h=React.createElement;
+  function attach(c,scope,ids) { const input=c.conversation.input.for(scope); return input.addAttachments(ids); }
   return { async apply(ctx) {
     await Promise.resolve();
     window.__composer = ctx.magiComposer;
+    window.__dshAdd=async(file)=>{
+      const sessionId=ctx.sessions.list.getSnapshot().ids[0],scope=ctx.sessions.scope(sessionId);
+      const [draft]=ctx.conversation.createDrafts(sessionId,[file]);
+      const accepted=attach(ctx,scope,[draft.id]);
+      return {accepted,id:draft.id,ids:ctx.conversation.input.for(scope).snapshot.attachmentIds};
+    };
+    window.__dshRemove=async(id)=>{
+      const sessionId=ctx.sessions.list.getSnapshot().ids[0],scope=ctx.sessions.scope(sessionId);
+      const removed=ctx.conversation.input.for(scope).removeAttachment(id);
+      ctx.conversation.releaseDraftAttachment(id);
+      return {removed,ids:ctx.conversation.input.for(scope).snapshot.attachmentIds};
+    };
     ctx.inject(['sidebarRight','sidebarRightTabs'], c => {
       for(const key of ['first','second']) {
         c.effect(() => c.sidebarRightTabs.register({id:key,kind:key,title:()=>key}));
@@ -198,6 +212,15 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
     reporter.check(`右栏 ${key} 持续接收 SSE，切换后只有一个活跃上游连接`, true);
     if (key === 'first') {
       const imageData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=';
+      const dshReceipt = await frame.evaluate(`(async()=>{
+        const bytes=Uint8Array.from(atob(${JSON.stringify(imageData)}),c=>c.charCodeAt(0));
+        return window.__dshAdd(new File([bytes],'dsh-original.png',{type:'image/png'}));
+      })()`);
+      reporter.check('DSH 原同步业务经通用调用链转换后等待真实 InputArea 回执', dshReceipt.accepted===true && dshReceipt.ids.includes(dshReceipt.id)
+        && await page.evaluate(`document.querySelectorAll('.image-tray-thumb').length===1`),JSON.stringify(dshReceipt));
+      const dshRemoved=await frame.evaluate(`window.__dshRemove(${JSON.stringify(dshReceipt.id)})`);
+      reporter.check('DSH 原移除调用等待宿主回执后释放文档草稿身份', dshRemoved.removed===true && !dshRemoved.ids.includes(dshReceipt.id)
+        && await page.evaluate(`document.querySelectorAll('.image-tray-thumb').length===0`));
       const add = (count) => frame.evaluate(`(async()=>{
         const bytes=Uint8Array.from(atob(${JSON.stringify(imageData)}),c=>c.charCodeAt(0));
         return await window.__composer.addImages(Array.from({length:${count}},(_,i)=>new File([bytes], 'native-'+i+'.png',{type:'image/png'})));
@@ -262,6 +285,66 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   frame?.close(); frame = null;
 }
 
+async function verifySessionDirectory(session) {
+  const install = async (allowed) => {
+    const id = `acceptance.directory-${allowed ? 'allowed' : 'denied'}`;
+    const folder = join(work, id);
+    await mkdir(join(folder, 'extension'), { recursive: true });
+    const manifest = { sdkVersion: 2, id, version: '1.0.0', name: id, description: '', dataSchemaVersion: 1,
+      extension: { hooks: [] }, settingsSchema: {type:'object'}, permissions: [{ kind: 'extension', targets: ['full-trust'] },
+        ...(allowed ? [{ kind: 'sessionRead', targets: ['directory'] }] : [])],
+      contributions: { commands: [{ id: 'status', title: 'Status', description: '' }], views: [{ id: 'settings', title: 'Settings', entry: 'ui/settings.html', placements: ['settings'] }] },
+    };
+    await mkdir(join(folder, 'ui'));
+    await writeFile(join(folder, 'ui/settings.html'), '<!doctype html><meta charset="utf-8"><p>Directory acceptance</p>');
+    await writeFile(join(folder, 'manifest.json'), JSON.stringify(manifest));
+    await writeFile(join(folder, 'extension/index.mjs'), `export default async api => {
+      await api.command('status', async()=>({content:'ready'}));
+      await api.route('/directory',async input=>{
+        try { return {body:await api.session.directory(input.body ?? {})}; }
+        catch(error){return {status:403,body:{kind:error.kind,message:error.message}};}
+      });
+      // 就绪前也必须允许当前宿主实例经独立授权读取，不依赖活动 Turn。
+      ${allowed ? 'await api.session.directory({limit:1});' : ''}
+    };`);
+    const archive = join(work, `${id}.zip`); packPlugin(folder, archive);
+    const payload = { source: `local:${id}.zip`, archiveBase64: (await readFile(archive)).toString('base64') };
+    const preview = await post('/api/plugins/preview', payload);
+    await post('/api/plugins/install', { ...payload, expectedDigest: preview.digest });
+    await post(`/api/plugins/${id}/enable`);
+    await post(`/api/plugins/${id}/authorize`, { grants: manifest.permissions });
+    await post(`/api/plugins/${id}/activate`);
+    await waitFor(async () => (await api('/api/plugins')).value.plugins.find(p=>p.manifest.id===id)?.runtime?.state==='running', id);
+    return id;
+  };
+  const allowed = await install(true), denied = await install(false);
+  const read = (id, body = {}) => post(`/api/plugins/${id}/routes`, { method: 'POST', path: '/directory', body });
+  const first = (await read(allowed, {limit:1})).body;
+  reporter.check('随包 Node 的协商会话目录读取 daemon 当前身份和最小元数据', first.sessions.length===1
+    && first.sessions.every(entry=>Object.keys(entry).sort().join(',')==='createdAt,sessionId,title,updatedAt,workspaceId'));
+  const secondSession = (await post('/api/session/materialize', {scope:'personal'})).sessionId;
+  await post('/api/session/rename', {sessionId:session,name:'Directory live metadata'});
+  const all = (await read(allowed)).body;
+  reporter.check('会话创建和改名直接投影当前 daemon，无第二份会话目录', all.sessions.some(entry=>entry.sessionId===secondSession)
+    && all.sessions.find(entry=>entry.sessionId===session)?.title==='Directory live metadata');
+  const paged = (await read(allowed, {limit:1})).body;
+  const rest = (await read(allowed, {afterSessionId:paged.nextAfterSessionId})).body;
+  reporter.check('真实宿主分页游标稳定且末页无游标', paged.hasMore && rest.sessions.length>0
+    && !rest.sessions.some(entry=>entry.sessionId===paged.sessions[0].sessionId) && !rest.hasMore && rest.nextAfterSessionId===null);
+  const missingGrant = await read(denied);
+  reporter.check('完全信任插件缺少会话目录独立授权时仍被 daemon 拒绝', missingGrant.status===403 && missingGrant.body.kind==='PermissionDenied');
+  const invalid = await read(allowed, {limit:201});
+  reporter.check('会话目录超限请求明确失败', invalid.status===403 && invalid.body.message.includes('InvalidParams'));
+  await post(`/api/plugins/${allowed}/authorize`, {grants:[{kind:'extension',targets:['full-trust']}]});
+  const revoked = await api(`/api/plugins/${allowed}/routes`, {method:'POST',path:'/directory',body:{}});
+  reporter.check('撤销会话目录授权后旧插件路由不可继续读取', revoked.status===409 || revoked.status===403);
+  for (const id of [allowed, denied]) {
+    const item = (await api('/api/plugins')).value.plugins.find((plugin) => plugin.manifest.id === id);
+    if (item?.active) await post(`/api/plugins/${id}/deactivate`);
+    if (item?.enabled) await post(`/api/plugins/${id}/disable`);
+  }
+}
+
 try {
   reporter.check('验收端口未被已有实例使用',
     !await fetch(`${origin}/health`).then(() => true, () => false)
@@ -320,6 +403,7 @@ try {
   frame.close(); frame = null;
   const plugin = await installed();
   const session = (await post('/api/session/materialize', { scope: 'personal' })).sessionId;
+  await verifySessionDirectory(session);
   const command = plugin.manifest.contributions.commands[0].id;
   const source = plugin.manifest.contributions.modelSources[0].id;
   const waitTurn = (id) => waitFor(async () => {

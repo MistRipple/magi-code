@@ -46,6 +46,7 @@ export const CAPABILITIES = {
   'service.notify': { group: 'services', magi: 'api.notify.user', rpc: 'notify.user' },
   'service.ask': { group: 'services', magi: 'api.ask.user（扩展不能代答审批）', rpc: 'ask.user' },
   'service.snapshot': { group: 'services', magi: 'api.session.snapshot（只读、有界）', rpc: 'session.snapshot' },
+  'service.sessionDirectory': { group: 'services', magi: 'api.session.directory（需独立授权，只读用户会话元数据，每页最多 200 条）', rpc: 'session.directory' },
   'service.spawn': { group: 'services', magi: 'api.task.spawn（保留角色与模型绑定）', rpc: 'task.spawn' },
   'service.blob': { group: 'services', magi: 'api.blob.put/get（有界 JSON）', rpc: 'blob.put' },
   'service.tools': { group: 'services', magi: 'api.tools.call（只调公开原生工具，需活动 Task）', rpc: 'tool.call' },

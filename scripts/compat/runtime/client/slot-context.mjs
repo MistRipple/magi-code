@@ -44,7 +44,7 @@ export const SLOT_SURFACE = { 'settings.section': 'settings' };
  *   scope    settingsScope 的实现（getSnapshot / subscribe / set）
  *   onChange 槽位注册或释放后的回调
  */
-export function createSlotContext({ scope, connection, onChange = () => {}, onOpenTab }) {
+export function createSlotContext({ scope, connection, composer, onChange = () => {}, onOpenTab }) {
   const registered = [];
   const tabTypes = new Map();
   const catalogs = new Map();
@@ -101,12 +101,17 @@ export function createSlotContext({ scope, connection, onChange = () => {}, onOp
         sidebarRight: ctx.sidebarRight,
         sidebarRightTabs: ctx.sidebarRightTabs,
         connection,
+        ...(composer ? { sessions: composer.sessions, conversation: composer.conversation } : {}),
       };
       if (requested.some((name) => services[name] === undefined)) return;
-      return callback({ ...ctx, get(name) { return services[name]; } });
+      return callback({ ...ctx, ...services, get(name) { return services[name]; } });
     },
     get(name) { return ctx[name]; },
   };
+  if (composer) {
+    ctx.sessions = composer.sessions;
+    ctx.conversation = composer.conversation;
+  }
   // 页签类型是界面注册资料；仅记录插件自身声明，业务事实与安装状态仍来自 daemon。
   ctx.sidebarRightTabs = {
     register(definition) {

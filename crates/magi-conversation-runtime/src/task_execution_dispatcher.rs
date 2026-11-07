@@ -7989,6 +7989,65 @@ mod tests {
     }
 
     #[test]
+    fn extension_session_directory_projects_current_metadata_with_bounded_stable_pages() {
+        use serde_json::{Value, json};
+        let (dispatcher, _, _) = extension_services_fixture();
+        for (id, title, workspace) in [
+            ("a", "First", Some("w".into())),
+            ("b", "Second", None),
+            ("c", "Third", Some("w".into())),
+        ] {
+            dispatcher
+                .session_store
+                .create_session_for_workspace(SessionId::new(id), title, workspace)
+                .unwrap();
+        }
+        dispatcher
+            .session_store
+            .create_external_tool_session(SessionId::new("external"), "Private", "w".into())
+            .unwrap();
+        let directory = |params| {
+            dispatcher.extension_service("acme.test", "session.directory", params, Arc::default())
+        };
+        let first = directory(json!({"limit":1})).unwrap();
+        assert_eq!(first["sessions"][0]["sessionId"], "a");
+        assert_eq!(first["nextAfterSessionId"], "a");
+        assert_eq!(first["hasMore"], true);
+        assert_eq!(
+            first["sessions"][0].as_object().unwrap().len(),
+            5,
+            "只有标题、身份、归属与时间，不含消息或运行配置"
+        );
+        let second = directory(json!({"afterSessionId":"a","limit":1})).unwrap();
+        assert_eq!(second["sessions"][0]["sessionId"], "b");
+        assert_eq!(second["sessions"][0]["workspaceId"], Value::Null);
+        dispatcher
+            .session_store
+            .rename_session(&SessionId::new("c"), "Changed")
+            .unwrap();
+        let filtered = directory(json!({"workspaceId":"w","afterSessionId":"a"})).unwrap();
+        assert_eq!(filtered["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(filtered["sessions"][0]["title"], "Changed");
+        assert_eq!(filtered["hasMore"], false);
+        assert_eq!(filtered["nextAfterSessionId"], Value::Null);
+        for params in [
+            json!({"limit":0}),
+            json!({"limit":201}),
+            json!({"workspaceId":" "}),
+            json!({"afterSessionId":""}),
+            json!({"messages":true}),
+        ] {
+            assert!(directory(params).is_err());
+        }
+        assert!(
+            directory(json!({"workspaceId":"absent"})).unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn extension_questions_use_canonical_interactions_and_only_user_answers_complete_them() {
         let (dispatcher, session, context) = extension_services_fixture();
         let worker = dispatcher.clone();

@@ -286,6 +286,28 @@ fn extension_manifest() -> Value {
 const ENTRY: &[(&str, &[u8])] = &[("extension/index.mjs", b"export default async () => {}")];
 
 #[test]
+fn session_directory_permission_requires_an_extension_and_an_exact_read_scope() {
+    let mut manifest = extension_manifest();
+    manifest["permissions"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"kind":"sessionRead","targets":["directory"]}));
+    assert!(PluginPackage::from_archive(&extension_archive(&manifest, ENTRY)).is_ok());
+    for targets in [
+        json!([]),
+        json!(["*"]),
+        json!(["messages"]),
+        json!(["directory", "write"]),
+    ] {
+        manifest["permissions"][1]["targets"] = targets;
+        assert!(PluginPackage::from_archive(&extension_archive(&manifest, ENTRY)).is_err());
+    }
+    let mut without_extension = self::manifest();
+    without_extension["permissions"] = json!([{"kind":"sessionRead","targets":["directory"]}]);
+    assert!(PluginPackage::from_archive(&archive(&without_extension, &[])).is_err());
+}
+
+#[test]
 fn node_extension_packages_carry_hooks_trust_and_a_single_bundled_entry() {
     let package =
         PluginPackage::from_archive(&extension_archive(&extension_manifest(), ENTRY)).unwrap();

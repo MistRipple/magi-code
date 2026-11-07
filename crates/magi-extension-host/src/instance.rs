@@ -1102,6 +1102,7 @@ fn check_hello(
         "hook.guard",
         "plugin.management",
         "plugin.management.background",
+        "session.directory",
     ];
     let features: Vec<String> = supported
         .iter()

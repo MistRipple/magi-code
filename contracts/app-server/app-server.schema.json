@@ -2255,7 +2255,8 @@
         "contextRewrite",
         "modelSources",
         "pluginManagement",
-        "composer"
+        "composer",
+        "sessionRead"
       ]
     },
     "PluginPermission": {
@@ -6450,6 +6451,95 @@
         "entry": {
           "type": "string",
           "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "PluginSessionDirectoryRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workspaceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "afterSessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "x-rust-type": "usize"
+        }
+      }
+    },
+    "PluginSessionDirectoryEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "workspaceId",
+        "title",
+        "createdAt",
+        "updatedAt"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 256
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "createdAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "updatedAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        }
+      }
+    },
+    "PluginSessionDirectory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessions",
+        "hasMore",
+        "nextAfterSessionId"
+      ],
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "$ref": "#/$defs/PluginSessionDirectoryEntry"
+          }
+        },
+        "hasMore": {
+          "type": "boolean"
+        },
+        "nextAfterSessionId": {
+          "type": [
+            "string",
+            "null"
+          ],
           "maxLength": 256
         }
       }

@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { usesComposerClient } from './translate/client-assets.mjs';
+import { translateClientBusiness } from './translate/client-business.mjs';
+import { createSessionComposerServices } from './runtime/client/session-composer.mjs';
+import { createComposerClient } from './runtime/client/composer.mjs';
+import vm from 'node:vm';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -140,4 +144,79 @@ test('图片端口权限识别支持压缩变量、属性和解构，不匹配�
   for (const source of ['function apply(c){ c.magiComposer.addImages([]); }', 'const p=c["magiComposer"];', 'const {magiComposer: images}=c;', 'const {magiComposer}=c;']) assert.equal(usesComposerClient(source), true);
   assert.equal(usesComposerClient('// ctx.magiComposer\nconst label="ctx.magiComposer";'), false);
   assert.throws(()=>usesComposerClient('const { =;'), /语法/);
+});
+
+test('DSH 会话图片业务调用只在静态可证明路径上转换为异步真实回执', async () => {
+  const source = 'function apply(ctx){ const input=ctx.conversation.input.for(ctx.sessions.scope("s")); const {addAttachments}=input; return addAttachments(["draft"]); }';
+  const transformed = translateClientBusiness(source);
+  assert.equal(transformed.operations.includes('addAttachments'), true);
+  assert.match(transformed.code, /addAttachmentsAsync/);
+  assert.match(transformed.code, /await/);
+  assert.doesNotThrow(() => new vm.Script(transformed.code));
+  assert.throws(() => translateClientBusiness('function apply(ctx){ const x=ctx.conversation.input.for(scope); return x[method](ids); }'), /动态|逃逸|未支持/);
+
+  const snapshots = [{ sessionId: 's', attachmentIds: [], writable: true }];
+  const requests = [];
+  const composer = createComposerClient(async (message) => {
+    requests.push(message);
+    if (message.operation === 'composer.snapshot') return snapshots[0];
+    if (message.operation === 'composer.addImages') return { accepted: true, ids: ['attachment-1'], snapshot: { sessionId: 's', attachmentIds: ['attachment-1'], writable: true } };
+    return { removed: true, snapshot: { sessionId: 's', attachmentIds: [], writable: true } };
+  });
+  composer.update(snapshots[0]);
+  const facade = createSessionComposerServices(composer.api);
+  const [draft] = facade.conversation.createDrafts('s', [new File(['x'], 'x.png', { type: 'image/png' })]);
+  const scope = facade.sessions.scope('s');
+  assert.equal(await facade.conversation.input.for(scope).addAttachmentsAsync([draft.id]), true);
+  assert.deepEqual(facade.conversation.input.for(scope).snapshot.attachmentIds, [draft.id]);
+  facade.dispose(); composer.dispose();
+  assert.ok(requests.some((request) => request.operation === 'composer.addImages'));
+});
+
+test('业务转换后的同步布尔分支等待宿主，失败回执不会变成 truthy Promise', async () => {
+  const original = 'function apply(c){ const input=c.conversation.input.for(scope); function add(){return input.addAttachments(["draft"])} return add() ? "mounted" : "busy"; }';
+  const transformed = translateClientBusiness(original);
+  let acknowledge;
+  const context = vm.createContext({ scope: {}, ctx: { conversation: { input: { for: () => ({ addAttachmentsAsync: () => new Promise((resolve) => { acknowledge = resolve; }) }) } } } });
+  new vm.Script(`${transformed.code}; globalThis.pending=apply(ctx);`).runInContext(context);
+  let settled = false;
+  const pending = context.pending.then((value) => { settled = true; return value; });
+  await Promise.resolve(); assert.equal(settled, false);
+  acknowledge(false); assert.equal(await pending, 'busy');
+  assert.throws(() => translateClientBusiness('function apply(ctx){const input=ctx.conversation.input.for(scope);function Render(){return input.addAttachments(ids)} React.createElement(Render)}'), /逃逸|渲染/);
+  assert.throws(() => translateClientBusiness('function apply(ctx){const input=ctx.conversation.input.for(scope); save({input}); }'), /逃逸/);
+  assert.throws(() => translateClientBusiness('function apply(ctx){const input=ctx.conversation.input.for(scope); return ()=>external(input); }'), /逃逸/);
+  assert.equal(translateClientBusiness('function apply(ordinary){return ordinary.other.addAttachments(ids)}').awaitedCalls, 0);
+  const markup = 'const style=".view { color: red }"; function View(){return h("a",{href:"https://example.test"},"下载 Ghidra")}; function apply(ctx){ const input=ctx.conversation.input.for(scope); return input.addAttachments(ids)}';
+  assert.ok(translateClientBusiness(markup).code.startsWith(markup.slice(0,markup.indexOf('function apply'))));
+});
+
+test('DSH 草稿端口拒绝同步真值、跨会话/伪造身份，并在宿主发送或移除后回收引用', async () => {
+  let active = { sessionId: 'first', attachmentIds: [], writable: true }, listener, accepted = false;
+  const composer = {
+    getSnapshot: () => active,
+    subscribe(fn) { listener = fn; return () => { listener = undefined; }; },
+    async addImages(_files, sessionId) { assert.equal(sessionId, 'first'); return { accepted, ids: accepted ? ['host-id'] : [], snapshot: active }; },
+    async removeImage(id, sessionId) { assert.equal(id, 'host-id'); assert.equal(sessionId, 'first'); active = {...active,attachmentIds:[]}; listener(); return { removed: true, snapshot: active }; },
+    async focus() {}, async notify() {},
+  };
+  const facade = createSessionComposerServices(composer);
+  const scope = facade.sessions.scope('first'), input = facade.conversation.input.for(scope);
+  assert.strictEqual(facade.sessions.list.getSnapshot(),facade.sessions.list.getSnapshot());
+  assert.throws(()=>input.addAttachments([]),/同步/);
+  assert.throws(()=>facade.conversation.input.for({}),/不属于/);
+  const [draft] = facade.conversation.createDrafts('first',[new File(['x'],'x.png',{type:'image/png'})]);
+  assert.equal(await input.addAttachmentsAsync([draft.id]),false);
+  assert.deepEqual(input.snapshot.attachmentIds,[]);
+  accepted=true; active={...active,attachmentIds:['host-id']};
+  assert.equal(await input.addAttachmentsAsync([draft.id]),true);
+  active={...active,sessionId:'second',attachmentIds:[]}; listener();
+  assert.throws(()=>input.snapshot,/不属于/);
+  active={...active,sessionId:'first',attachmentIds:['host-id']}; listener();
+  assert.equal(await input.removeAttachmentAsync(draft.id),true);
+  assert.deepEqual(input.snapshot.attachmentIds,[]);
+  assert.equal(facade.conversation.resolveDraftAttachments([draft.id]).length,1,'移除挂载不等于释放未发送 File 草稿');
+  facade.conversation.releaseDraftAttachment(draft.id);
+  assert.deepEqual(facade.conversation.resolveDraftAttachments([draft.id]),[]);
+  facade.dispose(); assert.throws(()=>input.snapshot,/失效|不属于/);
 });

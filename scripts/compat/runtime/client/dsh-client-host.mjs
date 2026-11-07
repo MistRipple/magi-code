@@ -20,6 +20,7 @@ import { bindSlotProps } from './slot-bindings.mjs';
 import { createWebStorage } from './web-storage.mjs';
 import { createEventSource } from './event-source.mjs';
 import { createComposerClient } from './composer.mjs';
+import { createSessionComposerServices } from './session-composer.mjs';
 
 const CHANNEL = 'magi-plugin-v1';
 
@@ -51,8 +52,9 @@ export function startDshClient(options) {
   });
   const eventSources = createEventSource(request, document.baseURI);
   const composer = createComposerClient(request);
+  const sessionComposer = options.business?.operations?.length ? createSessionComposerServices(composer.api) : undefined;
   globalThis.EventSource = eventSources.EventSource;
-  window.addEventListener('pagehide', () => { eventSources.dispose(); composer.dispose(); slotContext.dispose(); }, { once: true });
+  window.addEventListener('pagehide', () => { eventSources.dispose(); composer.dispose(); sessionComposer?.dispose(); slotContext.dispose(); }, { once: true });
 
   // —— 路由：上游界面用 fetch('/plugins/<name>/…') 访问自己的后端，这里转交给宿主里的同一处理器 ——
   globalThis.fetch = async (input, init = {}) => {
@@ -102,7 +104,7 @@ export function startDshClient(options) {
   } } };
 
   // —— ctx：与构建期记录共用同一份实现 ——
-  const slotContext = createSlotContext({ scope, connection, onChange: () => render(), onOpenTab: (key) => {
+  const slotContext = createSlotContext({ scope, connection, composer: sessionComposer, onChange: () => render(), onOpenTab: (key) => {
     const view = options.panelViews?.find((item) => item.key === key);
     if (!view) throw new Error(`右栏视图未声明：${key}`);
     return request({ operation: 'view.open', viewId: view.viewId });
@@ -258,6 +260,7 @@ export function startDshClient(options) {
           }),
         });
         await refreshSettings();
+        if (sessionComposer) await composer.api.refresh();
         await loadUpstream(options.clientScript ?? 'client.js');
         render();
       } catch (error) {

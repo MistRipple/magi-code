@@ -24,6 +24,11 @@ Bridge 可以拥有不同传输实现，但不得重新定义同形状的 wire D
 与激活状态决定。`magi-plugin-system` 使用生成类型并对包资源与作用域补充语义校验；不得
 在插件 SDK、HTTP 适配器或 UI 手写另一份清单结构。
 
+`sessionRead:["directory"]` 与 `PluginSessionDirectoryRequest/Entry/Directory` 是独立授权的只读增量合同。
+通过 Extension Protocol 的协商特性 `session.directory` 使用，不新增 App Server 方法。
+旧插件无此权限，不能读取跨会话目录；已授权插件每次读取当前 daemon 用户会话元数据，
+最多 200 条并以稳定 sessionId 分页，不包含消息、执行配置、外部工具会话、文件路径或凭据。
+
 `PluginDshCompatibilityProjection` 与 `PluginDshVersionExemptionRequest` 是新增的插件兼容策略 DTO，
 复用资源 CAS 持久化。runtimeId 绑定当前随包锁文件，豁免只对精确包版本和当前运行时生效；
 管理写操作需要独立 compatibility 授权和风险确认，不改变已有安装摘要、能力或权限准入。

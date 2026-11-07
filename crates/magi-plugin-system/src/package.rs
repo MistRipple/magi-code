@@ -237,10 +237,11 @@ fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
                     | PluginPermissionKind::ContextRewrite
                     | PluginPermissionKind::ModelSources
                     | PluginPermissionKind::PluginManagement
+                    | PluginPermissionKind::SessionRead
             )
         }) {
             return Err(invalid(
-                "extension / contextRewrite / modelSources / pluginManagement 权限只能由声明了 extension 的包使用",
+                "extension / contextRewrite / modelSources / pluginManagement / sessionRead 权限只能由声明了 extension 的包使用",
             ));
         }
         return Ok(());
@@ -342,6 +343,11 @@ fn validate_manifest_with_limits(
     }
     validate_extension(manifest)?;
     for permission in &manifest.permissions {
+        if permission.kind == PluginPermissionKind::SessionRead
+            && permission.targets.as_slice() != ["directory"]
+        {
+            return Err(invalid("sessionRead 权限当前只允许 directory"));
+        }
         if permission.kind == PluginPermissionKind::Composer
             && (permission.targets.as_slice() != ["images"]
                 || manifest.contributions.views.is_empty())

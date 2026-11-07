@@ -1503,6 +1503,8 @@ pub enum PluginPermissionKind {
     PluginManagement,
     #[serde(rename = "composer")]
     Composer,
+    #[serde(rename = "sessionRead")]
+    SessionRead,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3616,4 +3618,44 @@ pub struct PluginComposerAdmissionRequest {
     #[serde(rename = "expectedDigest")]
     pub expected_digest: String,
     pub entry: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginSessionDirectoryRequest {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "afterSessionId")]
+    pub after_session_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginSessionDirectoryEntry {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    pub title: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: u64,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginSessionDirectory {
+    pub sessions: Vec<PluginSessionDirectoryEntry>,
+    #[serde(rename = "hasMore")]
+    pub has_more: bool,
+    #[serde(rename = "nextAfterSessionId")]
+    pub next_after_session_id: Option<String>,
 }

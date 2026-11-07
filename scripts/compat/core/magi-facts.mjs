@@ -47,6 +47,11 @@ export function readHostMethods() {
   // 服务分发：只取 match 分支（"a" | "b" =>），避免把测试里的字符串当成方法。
   const services = read('crates/magi-daemon/src/daemon/extension_services.rs');
   for (const arm of services.matchAll(/^\s*((?:"[a-zA-Z]+(?:\.[a-zA-Z]+)+"\s*\|?\s*)+)=>/gm)) collect(arm[1]);
+  // 原生服务还通过 if/matches! 分发；只读取实现段，排除后面的测试字符串。
+  const implementation = services.split('#[cfg(test)]')[0];
+  for (const branch of implementation.matchAll(/if\s+(?:matches!\(\s*method\.as_str\(\),([\s\S]*?)\)|method\s*==\s*("[a-zA-Z]+(?:\.[a-zA-Z]+)+"))\s*\{/g)) {
+    collect(branch[1] ?? branch[2]);
+  }
   // 需要活动调用租约的业务服务：instance.rs 里 `matches!(method, "model.invoke" | …)` 的列表
   //（钩子内同样以 ReentryDenied 拒绝，见 readHookReentryDenied）。
   for (const method of readHookReentryDenied()) methods.add(method);

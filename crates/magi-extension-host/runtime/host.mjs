@@ -14,7 +14,7 @@ import { pathToFileURL } from 'node:url';
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const PROTOCOL = { major: 1, minor: 0 };
-const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background'];
+const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'session.directory'];
 let negotiatedFeatures = new Set();
 const pluginRequest = (method, input, background = false) => {
   if (!negotiatedFeatures.has('plugin.management')) throw new Error('daemon 未协商 plugin.management');
@@ -385,7 +385,13 @@ const api = Object.freeze({
   task: Object.freeze({ spawn: (input = {}) => request('task.spawn', input) }),
   notify: Object.freeze({ user: (input = {}) => request('notify.user', input) }),
   ask: Object.freeze({ user: (input = {}) => request('ask.user', input) }),
-  session: Object.freeze({ snapshot: (input = {}) => request('session.snapshot', input) }),
+  session: Object.freeze({
+    snapshot: (input = {}) => request('session.snapshot', input),
+    directory(input = {}) {
+      if (!negotiatedFeatures.has('session.directory')) throw new Error('daemon 未协商 session.directory');
+      return request('session.directory', input);
+    },
+  }),
   /** 读取 daemon 的插件目录；不包含插件配置、私有资源或凭据。 */
   plugins: pluginApi(),
   credential: Object.freeze({ ref: (input = {}) => request('credential.ref', input) }),

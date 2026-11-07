@@ -101,6 +101,7 @@ daemon 响应形状：
 | `model.invoke` | `api.model.invoke(input)` | `{prompt,roleId?,credentialRef?,maxOutputTokens?}`，models 授权、原生模型解析和账本 |
 | `credential.ref` | `api.credential.ref({roleId?})` | 返回模型绑定引用，不返回 secret；只由 model.invoke 消费 |
 | `session.snapshot` | `api.session.snapshot(input)` | 仅签发会话；`sessionId?`、`afterTurnSeq?`、`limit?`；最多 10 Turn，每 Turn 最多 20 条截断文本 |
+| `session.directory` | `api.session.directory(input?)` | 需协商 `session.directory` 及独立 `sessionRead:["directory"]` 授权。按当前实例读取 daemon 用户会话目录，不要求活动 Turn；输入 `PluginSessionDirectoryRequest`，输出 `PluginSessionDirectory`。按 sessionId 升序分页，每页 1–200 条（默认 100），可筛选 workspaceId；仅身份、标题、项目归属与创建/更新时间，不含外部工具会话、消息、文件路径或凭据。末页游标为 null；跨页并非事务快照，调用者需按身份处理期间新增/删除。旧版本、停用、撤权、排空及失效实例拒绝 |
 | `plugins.list` | `api.plugins.list()` | 读取 daemon 的既有 `PluginList` 目录投影，每次校验当前插件包、激活状态及实例租约；不包含配置、资源或凭据 |
 | `plugins.compatibility`／`plugins.setVersionExemption` | `api.plugins.compatibility()`／`setVersionExemption(input)` | 需协商 `plugin.management`。读取要求活动宿主租约；写入另需 `pluginManagement:["compatibility"]`，使用 `PluginDshVersionExemptionRequest` 的精确 target、当前 runtimeVersion／runtimeId、revision CAS 和显式风险确认。安装／升级提交前重验，撤销后旧译包不能继续提交 |
 | `plugins.preview/install` | `api.plugins.preview(input)`／`install(input)` | 需协商 `plugin.management` 与 `pluginManagement:["install"]` 授权；复用 `PluginUpstreamRequest`、预览与安装入口，返回既有预览／目录 DTO；仅支持已接入的上游生态。安装必须指定精确版本与预览摘要，不替用户授权新版本 |

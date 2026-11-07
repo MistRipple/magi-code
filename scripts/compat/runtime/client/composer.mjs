@@ -9,8 +9,8 @@ export function createComposerClient(request) {
     return current;
   };
   const refresh = async () => update(await request({ operation: 'composer.snapshot' }));
-  const call = async (operation, payload) => {
-    const sessionId = current.sessionId ?? (await refresh()).sessionId;
+  const call = async (operation, payload, expectedSessionId) => {
+    const sessionId = expectedSessionId ?? current.sessionId ?? (await refresh()).sessionId;
     if (!sessionId) throw new Error('当前没有活动会话');
     const result = await request({ operation, sessionId, ...payload });
     if (result?.snapshot) update(result.snapshot);
@@ -22,11 +22,11 @@ export function createComposerClient(request) {
       getSnapshot: () => current,
       subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
       refresh,
-      async addImages(files) {
+      async addImages(files, expectedSessionId) {
         if (!Array.isArray(files) || !files.length || files.length > 5 || files.some((file) => !file || typeof file.arrayBuffer !== 'function' || file.size > 10 * 1024 * 1024)) throw new Error('图片草稿无效或超过大小上限');
         // 捕获读取前的会话身份；读取期间切换会话不能静默投递到新会话。
         const target = await refresh();
-        if (!target.sessionId) return { accepted: false, ids: [], snapshot: target };
+        if (!target.sessionId || expectedSessionId && expectedSessionId !== target.sessionId) return { accepted: false, ids: [], snapshot: target };
         const images = [];
         for (const file of files) {
           const bytes = new Uint8Array(await file.arrayBuffer());
@@ -38,9 +38,9 @@ export function createComposerClient(request) {
         update(result.snapshot);
         return result;
       },
-      removeImage: (id) => call('composer.removeImage', { id }),
-      focus: () => call('composer.focus', {}),
-      notify: (level, message) => call('composer.notify', { level, message }),
+      removeImage: (id, sessionId) => call('composer.removeImage', { id }, sessionId),
+      focus: (sessionId) => call('composer.focus', {}, sessionId),
+      notify: (level, message, sessionId) => call('composer.notify', { level, message }, sessionId),
     }),
     dispose() { listeners.clear(); },
   };

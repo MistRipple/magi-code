@@ -667,7 +667,7 @@ export type ServerNotification = JsonRpcServerNotification;
 
 export type ServerResponse = JsonRpcServerResponse;
 
-export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite" | "modelSources" | "pluginManagement" | "composer";
+export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite" | "modelSources" | "pluginManagement" | "composer" | "sessionRead";
 
 export interface PluginPermission {
   kind: PluginPermissionKind;
@@ -1605,4 +1605,24 @@ export interface PluginComposerSnapshot {
 export interface PluginComposerAdmissionRequest {
   expectedDigest: string;
   entry: string;
+}
+
+export interface PluginSessionDirectoryRequest {
+  workspaceId?: string;
+  afterSessionId?: string;
+  limit?: number;
+}
+
+export interface PluginSessionDirectoryEntry {
+  sessionId: string;
+  workspaceId: string | null;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PluginSessionDirectory {
+  sessions: Array<PluginSessionDirectoryEntry>;
+  hasMore: boolean;
+  nextAfterSessionId: string | null;
 }

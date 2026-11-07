@@ -131,6 +131,7 @@ ui/…                       视图页面与静态资源，按需
 | `browser` | surface ID | 浏览器 surface，见第 5 节 |
 | `pluginManagement` | `install`／`lifecycle`／`authorize`／`compatibility`／`background` | 在线安装／启停和卸载／独立委托授予目标包声明的权限／修改精确版本豁免／页面请求完成后继续后台管理；各目标分别授权，豁免不能绕过 Magi 能力检查 |
 | `composer` | `["images"]` | 由插件原生页面把用户选择的图片加入当前会话输入框草稿；只能移除本插件页面自己接纳的图片或聚焦输入框，不会自动发送 |
+| `sessionRead` | `["directory"]` | 读取全部用户会话的标题、身份、项目归属与创建/更新时间；不含消息、路径或凭据，不授予任何会话写入能力 |
 
 `permissions` 里列出的每一项，用户都必须在授权时逐项确认；缺少任何一项都不能激活。
 
@@ -257,6 +258,7 @@ export default async function activate(api) {
 | `api.plugins.compatibility()` | 读取当前随包 DSH SDK 版本、锁文件 runtimeId、revision 与精确版本豁免；仍需活动宿主租约 |
 | `api.plugins.setVersionExemption(input)` | 需独立 `pluginManagement:["compatibility"]`。输入使用 `PluginDshVersionExemptionRequest`：精确 target、当前 runtimeVersion／runtimeId、revision、enabled、acceptRisk；写入需要风险确认，安装与升级提交前再次核对 |
 | `api.plugins.background` | 与 plugins 相同的管理方法，显式使用宿主实例身份，适用于 HTTP 202 后继续执行的管理任务；写操作另需 `pluginManagement:["background"]`，且仍需 install／lifecycle／authorize／compatibility 各动作授权。停用、撤权、升级或实例替换后失效，提交前重验；不延长原会话调用，也不能调用模型、工具或会话服务 |
+| `api.session.directory(input?)` | 需 `sessionRead:["directory"]` 和协商特性 `session.directory`；直接读 daemon 当前用户会话元数据，支持 `workspaceId`、`afterSessionId`、`limit`（默认 100，上限 200）。按稳定 sessionId 升序分页，返回 `{sessions,hasMore,nextAfterSessionId}`；不创建 DSH Session 或复制 Magi 消息，不能据此写入会话 |
 | `api.tools.call(tool, input)` | 调用公开的原生工具 |
 | `api.task.spawn(input)` | 派发子任务 |
 | `api.notify.user({ message, title? })` | 向用户发通知 |

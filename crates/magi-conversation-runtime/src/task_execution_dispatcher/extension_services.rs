@@ -150,6 +150,61 @@ impl LlmTaskDispatcher {
         if cancelled.load(Ordering::Acquire) {
             return Err("Cancelled: 调用已取消".into());
         }
+        if method == "session.directory" {
+            use magi_app_server_protocol::generated::{
+                PluginSessionDirectory, PluginSessionDirectoryEntry, PluginSessionDirectoryRequest,
+            };
+            let input: PluginSessionDirectoryRequest = parse(params)?;
+            let limit = input.limit.unwrap_or(100);
+            if !(1..=200).contains(&limit)
+                || [
+                    input.workspace_id.as_deref(),
+                    input.after_session_id.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|value| value.trim().is_empty() || value.len() > 256)
+            {
+                return Err("InvalidParams: 会话目录筛选或分页参数无效".into());
+            }
+            // 元数据直接读取原生 SessionStore，不加载消息、任务、路径或配置；
+            // 与用户目录一样排除外部工具会话，按稳定身份分页避免改名改变游标。
+            let mut records = match input.workspace_id.as_deref() {
+                Some(workspace) => self.session_store.sessions_for_workspace(workspace),
+                None => self.session_store.sessions(),
+            };
+            records.retain(|record| {
+                record.kind.is_user()
+                    && input
+                        .after_session_id
+                        .as_deref()
+                        .is_none_or(|after| record.session_id.as_str() > after)
+            });
+            records.sort_by(|a, b| a.session_id.as_str().cmp(b.session_id.as_str()));
+            let has_more = records.len() > limit;
+            let sessions: Vec<_> = records
+                .into_iter()
+                .take(limit)
+                .map(|record| PluginSessionDirectoryEntry {
+                    session_id: record.session_id.to_string(),
+                    workspace_id: record.workspace_id,
+                    title: record.title,
+                    created_at: record.created_at.0,
+                    updated_at: record.updated_at.0,
+                })
+                .collect();
+            let next_after_session_id = if has_more {
+                sessions.last().map(|entry| entry.session_id.clone())
+            } else {
+                None
+            };
+            return serde_json::to_value(PluginSessionDirectory {
+                sessions,
+                has_more,
+                next_after_session_id,
+            })
+            .map_err(|error| error.to_string());
+        }
         if method == "session.snapshot" {
             let input: SnapshotInput = parse(params)?;
             let session = input

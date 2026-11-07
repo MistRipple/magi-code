@@ -668,6 +668,18 @@ Upgrader 原包追加验证了 0.0.8→0.0.7 切换并保持禁用、请求不�
 
 【剩余】当前图片端口为明确的异步合同；DSH 的原同步 `conversation.createDrafts`／`input.addAttachments` 尚未映射，不能同步返回 true 冒充宿主挂载。Appshot 的常驻客户端、会话投影、原生辅助进程和持久附件仍未通过原包端到端验收，其必需 sessions 门禁保持拒绝。Windows、生态分母及 95%／100% 目标仍未完成。
 
+### 11.14 同步附件业务转换与独立授权的会话目录（2026-11-07）
+
+【现状·业务转换】客户端翻译器沿 AST 和符号数据流识别 `conversation.input.for(scope)` 的 addAttachments、removeAttachment、focus 与 notify，跨可证明的本地调用链插入等待并调用异步端口。原包组件、样式与其余源字节保留；同步真假分支等待 InputArea 的真实回执，失败保持 false。同步渲染、未知回调、构造器、访问器、动态成员与无法证明的端口逃逸拒绝安装，不把 Promise 当作成功。
+
+【现状·会话目录】新增协商特性 `session.directory` 与独立 `sessionRead:["directory"]` 授权。扩展 SDK 的 `api.session.directory` 直接读取 daemon 原 SessionStore，只投影用户会话身份、标题、项目归属和创建/更新时间，不含消息、路径、凭据或外部工具会话。每页最多 200 条，稳定身份游标分页；每次读取校验当前包摘要、激活状态、排空状态与实例租约。权限预览和详情沿既有共享权限标签展示中英文读取范围。该原生元数据端口尚未冒充 DSH 后端的完整 SessionStore，`sessions` 必需依赖门禁保持拒绝。
+
+【现状·已运行验证】重新构建 macOS arm64 目录包、Electron 45、受控 sidecar 和随包 Node/compat，`test:electron-plugin-runtime` 55/55 通过。覆盖 DSH 原同步附件添加/移除等待真实回执、9 种编码样本的真实输入和模型发送、SSE、面板切换、390px、撤权与停用；新增真实扩展宿主读取会话目录、创建与改名即时投影、分页、完全信任但无独立授权时拒绝、超限与撤权拒绝。证据为 `target/plugin-acceptance/runtime/results.json` 与同目录截图、日志。
+
+【现状·定向检查】兼容层 78/78、扩展宿主真实 Node 集成 24/24，以及会话目录元数据/分页、daemon 身份授权、包权限范围三项定向 Rust 回归通过；`cargo check -p magi-daemon`、Web check（0 错误 0 警告）、i18n 与协议生成一致性检查通过。未运行全仓测试。
+
+【剩余】上述通过数是机制与定向回归，不是生态兼容率。Appshot 原包的常驻客户端、完整后端 sessions 适配、原生辅助进程和持久附件投递仍须端到端验证；本轮未重复 WorkBuddy/REA 原包业务验收。Windows、生态全集分母及 95%／100% 目标仍未完成。
+
 ## 12. 验收与证据边界
 
 ### 12.1 已运行验证

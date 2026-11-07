@@ -58,6 +58,35 @@ impl PluginHostService {
                 .check_runtime(plugin, lease)
                 .map_err(|error| RpcError::new(ErrorKind::StaleGeneration, error.to_string()))?;
         }
+        if method == "session.directory" {
+            let manager = self
+                .manager
+                .lock()
+                .map_err(|_| RpcError::new(ErrorKind::Internal, "插件管理器不可用"))?;
+            let lease = params
+                .get("_instance")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RpcError::new(ErrorKind::StaleGeneration, "会话目录读取需要活动宿主租约")
+                })?;
+            manager
+                .check_runtime(plugin, lease)
+                .map_err(|error| RpcError::new(ErrorKind::StaleGeneration, error.to_string()))?;
+            if !manager
+                .permission_allowed(
+                    plugin,
+                    magi_plugin_system::PluginPermissionKind::SessionRead,
+                    "directory",
+                )
+                .map_err(|error| RpcError::new(ErrorKind::PermissionDenied, error.to_string()))?
+            {
+                return Err(RpcError::new(
+                    ErrorKind::PermissionDenied,
+                    "缺少 sessionRead:[directory] 授权",
+                ));
+            }
+            return Ok(());
+        }
         if matches!(method, "modelSource.set" | "modelSource.clear") {
             // 主对话内容会发往插件提供的端点，所以数据源必须逐项授权。
             let target = params
@@ -327,7 +356,10 @@ impl HostService for PluginHostService {
                 })
             });
         }
-        if matches!(method.as_str(), "session.snapshot" | "credential.ref") {
+        if matches!(
+            method.as_str(),
+            "session.snapshot" | "session.directory" | "credential.ref"
+        ) {
             if method == "session.snapshot" {
                 let owner = params
                     .pointer("/_context/owner/sessionId")
@@ -691,7 +723,8 @@ mod tests {
             "permissions": [
                 {"kind": "extension", "targets": ["full-trust"]},
                 {"kind": "storage", "targets": ["notes", "__settings"]},
-                {"kind": "modelSources", "targets": ["proxy"]}
+                {"kind": "modelSources", "targets": ["proxy"]},
+                {"kind": "sessionRead", "targets": ["directory"]}
             ],
             "settingsSchema": {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "additionalProperties": false},
             "contributions": {"resources": [{"id": "notes", "title": "Notes", "description": ""}], "commands": [{"id": "status", "title": "Status", "description": ""}], "modelSources": [{"id": "proxy", "title": "Acme Proxy", "description": ""}]}
@@ -905,6 +938,92 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(missing_owner.kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn session_directory_requires_current_instance_digest_and_explicit_grant() {
+        let (_dir, service) = fixture();
+        assert!(
+            service
+                .native
+                .set(Arc::new(|_, method, params, _| {
+                    assert_eq!(method, "session.directory");
+                    assert!(params.get("_instance").is_none());
+                    Ok(json!({"sessions":[],"hasMore":false,"nextAfterSessionId":null}))
+                }))
+                .is_ok()
+        );
+        assert_eq!(
+            call(&service, "session.directory", json!({}))
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::StaleGeneration
+        );
+        service
+            .instance_started("acme.services", "current")
+            .unwrap();
+        assert_eq!(
+            call(&service, "session.directory", json!({"_instance":"old"}))
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::StaleGeneration
+        );
+        assert_eq!(
+            call(
+                &service,
+                "session.directory",
+                json!({"_instance":"current"})
+            )
+            .await
+            .unwrap()["hasMore"],
+            false
+        );
+        {
+            let mut manager = service.manager.lock().unwrap();
+            let grants = manager
+                .package("acme.services")
+                .unwrap()
+                .manifest()
+                .permissions
+                .iter()
+                .filter(|permission| {
+                    permission.kind != magi_plugin_system::PluginPermissionKind::SessionRead
+                })
+                .cloned()
+                .collect();
+            manager.authorize("acme.services", grants).unwrap();
+        }
+        assert_eq!(
+            call(
+                &service,
+                "session.directory",
+                json!({"_instance":"current"})
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+            ErrorKind::PermissionDenied
+        );
+        {
+            let mut manager = service.manager.lock().unwrap();
+            manager
+                .authorize("acme.services", package().manifest().permissions.clone())
+                .unwrap();
+            manager.activate("acme.services").unwrap();
+        }
+        let stale = PluginHostService {
+            digest: "old-digest".into(),
+            ..Arc::try_unwrap(service).ok().unwrap()
+        };
+        assert_eq!(
+            call(&stale, "session.directory", json!({"_instance":"current"}))
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::StaleGeneration
+        );
     }
 
     #[tokio::test]
