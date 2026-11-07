@@ -620,7 +620,9 @@ Windows、手机触摸、完整生态分母及 95% 目标均未验收。后续�
 
 【现状·已运行验证】macOS arm64 目录包（Electron 45.0.0、随包 Node 26.13.0）：`test:electron-dsh-profile` 11 项通过，未经修改的 Mgr 原包在线安装、原生页面、读取真实行、停用／重启、通过 `dsh plugin add` 在线升级 release-probe 0.0.7→0.0.8 并运行，以及真正卸载均通过；profile 未落盘。`test:electron-dsh-management` 13 项通过，新增 Share 原包获独立委托后安装并运行新包的检查。Share 0.2.5 在自己业务代码中明确拒绝升级已有包，返回 manual-update-required；保留该上游行为，升级链路由 Mgr 验收，未修改原包绕过其决策。
 
-【现状·定向回归】兼容层 58 项、API 管理服务 4 项、daemon 扩展服务 9 项通过；Web 检查 0 错误 0 警告。补充 ESM／CommonJS 文件导入、异步目录扫描、临时原子写入、取消和连续安装／升级摘要回归。构建有既有 WebFolderPicker 静态／动态导入警告；未运行全仓测试。
+【现状·定向回归】兼容层 59 项、API 管理服务 4 项、daemon 扩展服务 9 项通过；Web 检查 0 错误 0 警告。补充 ESM／CommonJS 文件导入、异步目录扫描、临时原子写入、取消和连续安装／升级摘要回归。构建有既有 WebFolderPicker 静态／动态导入警告；未运行全仓测试。
+
+【现状·追加验证】只读文件描述符支持同步、回调与 FileHandle 读取，句柄绑定调用快照并在关闭或调用结束后失效，不创建 OS 文件。Health 原包在真实目录包中的文件检查、可靠性报告（schemaVersion 1 与真实包版本）及 live activation 断言通过。社区批量验收继续以非零退出码报告未达标，Ops 的缺失方法已被记录为 settings 视图失败。
 
 【剩余】Health 基础文件体检、运行状态和可靠性报告已能读取调用期 profile 快照；DSH 运行版本仍显示未知，不记为全部业务通过。Ops 的文件导入和 CommonJS 准入阻塞已修复，安装、启动与两个原生面板可显示，但健康扫描仍因缺少 `listVersionExemptions` 失败；验收将页面显示的方法缺失判为失败，不用空豁免目录伪造支持。版本豁免的原生持久化／兼容准入、完整包元数据投影、Agent／sessions、Appshot 业务、Upgrader 完整升级／回滚及平台辅助进程仍未完成。95%／100% 生态覆盖均未达到，Windows 与 pi 运行器仍未验收。
 
