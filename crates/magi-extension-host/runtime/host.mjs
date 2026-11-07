@@ -14,11 +14,12 @@ import { pathToFileURL } from 'node:url';
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const PROTOCOL = { major: 1, minor: 0 };
-const FEATURES = ['hook.guard', 'plugin.management'];
+const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background'];
 let negotiatedFeatures = new Set();
-const pluginRequest = (method, input) => {
+const pluginRequest = (method, input, background = false) => {
   if (!negotiatedFeatures.has('plugin.management')) throw new Error('daemon 未协商 plugin.management');
-  return request(method, input);
+  if (background && !negotiatedFeatures.has('plugin.management.background')) throw new Error('daemon 未协商 plugin.management.background');
+  return request(method, background ? { ...input, background: true } : input, background);
 };
 
 const endpoint = process.env.MAGI_EXT_ENDPOINT;
@@ -77,10 +78,10 @@ function rpcError(kind, message) {
   return { code: -32000, message, data: { kind, retryable: false, detail: null } };
 }
 
-function request(method, params) {
+function request(method, params, independent = false) {
   const context = invocationContext.getStore();
   if (context?.signal.aborted) return Promise.reject(Object.assign(new Error('调用已取消'), { kind: 'Cancelled' }));
-  if (context) params = { ...params, invocationId: context.invocationId };
+  if (!independent && context) params = { ...params, invocationId: context.invocationId };
   const id = `h${nextId++}`;
   return new Promise((resolve, reject) => {
     if (pending.size >= 256) return reject(Object.assign(new Error('挂起请求过多'), { kind: 'Backpressure' }));
@@ -297,6 +298,18 @@ function deepFreeze(value) {
   return value;
 }
 
+const pluginApi = (background = false) => Object.freeze({
+  list: (input = {}) => request('plugins.list', input, background),
+  preview: (input) => pluginRequest('plugins.preview', input, background),
+  install: (input) => pluginRequest('plugins.install', input, background),
+  compatibility: () => request('plugins.compatibility', {}, background),
+  setVersionExemption: (input) => pluginRequest('plugins.setVersionExemption', input, background),
+  setEnabled: (pluginId, enabled, expectedDigest) => pluginRequest('plugins.setEnabled', { pluginId, enabled, ...(expectedDigest === undefined ? {} : { expectedDigest }) }, background),
+  authorize: (pluginId, expectedDigest, grants) => pluginRequest('plugins.authorize', { pluginId, expectedDigest, grants }, background),
+  remove: (pluginId, expectedDigest) => pluginRequest('plugins.remove', { pluginId, ...(expectedDigest === undefined ? {} : { expectedDigest }) }, background),
+  ...(!background ? { background: pluginApi(true) } : {}),
+});
+
 const api = Object.freeze({
   get identity() { return identity; },
   fail(error) { fail(`扩展运行失败: ${error?.message ?? error}`); },
@@ -374,16 +387,7 @@ const api = Object.freeze({
   ask: Object.freeze({ user: (input = {}) => request('ask.user', input) }),
   session: Object.freeze({ snapshot: (input = {}) => request('session.snapshot', input) }),
   /** 读取 daemon 的插件目录；不包含插件配置、私有资源或凭据。 */
-  plugins: Object.freeze({
-    list: (input = {}) => request('plugins.list', input),
-    preview: (input) => pluginRequest('plugins.preview', input),
-    install: (input) => pluginRequest('plugins.install', input),
-    compatibility: () => pluginRequest('plugins.compatibility', {}),
-    setVersionExemption: (input) => pluginRequest('plugins.setVersionExemption', input),
-    setEnabled: (pluginId, enabled, expectedDigest) => pluginRequest('plugins.setEnabled', { pluginId, enabled, ...(expectedDigest === undefined ? {} : { expectedDigest }) }),
-    authorize: (pluginId, expectedDigest, grants) => pluginRequest('plugins.authorize', { pluginId, expectedDigest, grants }),
-    remove: (pluginId, expectedDigest) => pluginRequest('plugins.remove', { pluginId, ...(expectedDigest === undefined ? {} : { expectedDigest }) }),
-  }),
+  plugins: pluginApi(),
   credential: Object.freeze({ ref: (input = {}) => request('credential.ref', input) }),
   /** 向主对话的模型目录提交（整体替换）清单声明过且获 `modelSources` 授权的数据源；宿主退出时自动撤销。 */
   modelSource: Object.freeze({

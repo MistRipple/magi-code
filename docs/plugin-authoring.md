@@ -129,7 +129,7 @@ ui/…                       视图页面与静态资源，按需
 | `contextRewrite` | `["history"]` | 允许改写已装配历史的钩子（第 7 节） |
 | `modelSources` | 数据源贡献 ID | 允许向主对话的模型列表提交对应数据源；用户选用后，主对话内容会发送到你提供的地址（第 10 节） |
 | `browser` | surface ID | 浏览器 surface，见第 5 节 |
-| `pluginManagement` | `install`／`lifecycle`／`authorize`／`compatibility` | 在线安装／启停和卸载／独立委托授予目标包声明的权限／修改当前 DSH 运行时的精确版本豁免；豁免必须确认风险，不能绕过 Magi 能力检查 |
+| `pluginManagement` | `install`／`lifecycle`／`authorize`／`compatibility`／`background` | 在线安装／启停和卸载／独立委托授予目标包声明的权限／修改精确版本豁免／页面请求完成后继续后台管理；各目标分别授权，豁免不能绕过 Magi 能力检查 |
 
 `permissions` 里列出的每一项，用户都必须在授权时逐项确认；缺少任何一项都不能激活。
 
@@ -245,12 +245,13 @@ export default async function activate(api) {
 | `api.model.invoke(input)` | 调用模型 |
 | `api.credential.ref({ roleId? })` | 取得模型绑定引用 |
 | `api.session.snapshot(input)` | 读取会话的有界快照 |
-| `api.plugins.list()` | 读取 daemon 当前插件目录，不含配置或凭据 |
+| `api.plugins.list({includeUpstreamManifest?:true})` | 读取 daemon 当前插件目录；显式请求时在同一快照附带已安装原包 package.json，来源及精确版本由 daemon 校验。默认不附带，不含配置或凭据 |
 | `api.plugins.preview(input)`／`install(input)` | 上游包预览与在线安装；复用精确版本和摘要确认合同，需 `pluginManagement:["install"]` |
 | `api.plugins.setEnabled(pluginId,enabled,expectedDigest?)`／`remove(pluginId,expectedDigest?)` | 启停或卸载其他插件；需 `pluginManagement:["lifecycle"]`。传入目标摘要可拒绝过期页面操作；启用本身不会代授目标插件权限 |
 | `api.plugins.authorize(pluginId,expectedDigest,grants)` | 需单独的 `pluginManagement:["authorize"]` 用户委托。仅授予目标当前摘要声明的权限（可包含完全信任），不能改变自身权限；授权和激活沿原生入口执行，异步提交前复核发起方租约与权限 |
 | `api.plugins.compatibility()` | 读取当前随包 DSH SDK 版本、锁文件 runtimeId、revision 与精确版本豁免；仍需活动宿主租约 |
 | `api.plugins.setVersionExemption(input)` | 需独立 `pluginManagement:["compatibility"]`。输入使用 `PluginDshVersionExemptionRequest`：精确 target、当前 runtimeVersion／runtimeId、revision、enabled、acceptRisk；写入需要风险确认，安装与升级提交前再次核对 |
+| `api.plugins.background` | 与 plugins 相同的管理方法，显式使用宿主实例身份，适用于 HTTP 202 后继续执行的管理任务；写操作另需 `pluginManagement:["background"]`，且仍需 install／lifecycle／authorize／compatibility 各动作授权。停用、撤权、升级或实例替换后失效，提交前重验；不延长原会话调用，也不能调用模型、工具或会话服务 |
 | `api.tools.call(tool, input)` | 调用公开的原生工具 |
 | `api.task.spawn(input)` | 派发子任务 |
 | `api.notify.user({ message, title? })` | 向用户发通知 |

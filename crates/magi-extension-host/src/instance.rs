@@ -626,6 +626,29 @@ impl Incoming for HostHandler {
                     });
                 }
                 object.insert("_instance".into(), json!(self.lease));
+                if let Some(background) = object.remove("background") {
+                    if background != true
+                        || !matches!(
+                            method.as_str(),
+                            "plugins.preview"
+                                | "plugins.install"
+                                | "plugins.authorize"
+                                | "plugins.setEnabled"
+                                | "plugins.remove"
+                                | "plugins.setVersionExemption"
+                        )
+                        || object.contains_key("invocationId")
+                    {
+                        return Box::pin(async {
+                            Err(RpcError::new(
+                                ErrorKind::InvalidParams,
+                                "后台管理标记只适用于独立插件管理调用",
+                            ))
+                        });
+                    }
+                    object.insert("_background".into(), json!(true));
+                    return service.request_with_identity(plugin_id, method, params);
+                }
                 let invocation = object.remove("invocationId");
                 let lease = invocation.as_ref().and_then(Value::as_str).and_then(|id| {
                     self.invocations
@@ -1075,7 +1098,11 @@ fn check_hello(
                 .collect()
         })
         .unwrap_or_default();
-    let supported = ["hook.guard", "plugin.management"];
+    let supported = [
+        "hook.guard",
+        "plugin.management",
+        "plugin.management.background",
+    ];
     let features: Vec<String> = supported
         .iter()
         .filter(|f| offered.contains(**f))

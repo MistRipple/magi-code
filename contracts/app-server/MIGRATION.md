@@ -28,6 +28,10 @@ Bridge 可以拥有不同传输实现，但不得重新定义同形状的 wire D
 复用资源 CAS 持久化。runtimeId 绑定当前随包锁文件，豁免只对精确包版本和当前运行时生效；
 管理写操作需要独立 compatibility 授权和风险确认，不改变已有安装摘要、能力或权限准入。
 
+`PluginListRequest.includeUpstreamManifest` 与 `PluginInstalled.upstreamManifest` 是只读增量字段：
+旧请求默认省略原包元数据；显式请求时仅返回 daemon 当前不可变安装归档内通过包名/版本校验的
+package.json，不包含插件可写配置或凭据。旧包缺失该文件时保持未知，不从 Magi 清单补造。
+
 `PluginRouteCallRequest.headers` 是可选的增量字段，用于插件页面向其私有后端携带应用头。
 旧请求省略时保持原行为；Magi HTTP 身份头不随该字段转交。DSH 路由适配器校验头名、
 值、数量和大小，并拒绝覆盖宿主身份及传输控制头。

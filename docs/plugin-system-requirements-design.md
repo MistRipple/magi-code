@@ -634,7 +634,13 @@ Windows、手机触摸、完整生态分母及 95% 目标均未验收。后续�
 
 `ctx.get('pluginManager')` 这类可选服务读取也纳入翻译扫描，使用管理服务的原包会声明对应授权；`ctx.baseUrl` 改为调用期 profile 的 `file:` 身份，健康扫描不会再把 HTTP 地址误判为 DSH 安装目录。版本不兼容回执保留精确包、版本、运行时和声明范围，供原生面板展示；豁免不能跳过能力门禁、完整性校验或权限授权。
 
-插件目录支持按请求在同一个 daemon 快照中附带不可变原包 `package.json`；DSH profile 投影保留 engines、peer、repository、bundle patch 数组和自定义字段，元数据缺失时保持缺失，不从 Magi 清单猜造。CJS `createRequire().resolve()` 与 ESM 导入共用随包依赖解析，因此 Health 的运行时身份和兼容声明可到达真实报告；`dsh-app-boot` 只提供版本元数据 shim，不提供 Loader 业务 API。
+插件目录支持按请求在同一个 daemon 快照中附带不可变原包 `package.json`；DSH profile 投影保留 engines、peer、repository、bundle patch 数组和自定义字段，元数据缺失时保持缺失，不从 Magi 清单猜造。bundle patch 文件投影为 daemon 监管的译包根行，不是上游 Loader 的第二份注册表。CJS `createRequire().resolve()` 与 ESM 导入共用真实随包依赖解析，没有元数据替身；直接导入 DSH Loader 业务 API 仍不计为已支持。
+
+【追加实测】Health 3.0.5 在同一 macOS 目录包中返回 `runtimeVersion=0.2.2-rc.1`，可靠性报告 `currentVersion` 一致，原包声明判定为 `compatible`，文件体检无 findings。Upgrader 1.8.0 的真实后台升级任务现在通过独立实例管理委托完成 `release-probe` 0.0.7→0.0.8，并确认新版宿主 `running`；父 HTTP 202 请求结束不会撤销后台任务。回滚故障注入仍未单独验收。
+
+后台管理采用显式 `api.plugins.background`，另需用户授予 `pluginManagement:["background"]`；普通插件管理、会话和模型调用继续受原调用租约约束。只复用同一 `PluginOperations`，实例、摘要、background 委托及具体动作权限在初次准入和异步提交时重验。真实 Node 回归确认：HTTP 回执后普通管理请求返回 Cancelled，显式后台调用使用当前实例；管理 API 7 项回归包含目标排空期间撤权，旧调用不能提交卸载。
+
+Upgrader 原包追加验证了 0.0.8→0.0.7 切换并保持禁用、请求不存在版本明确失败且旧摘要和禁用状态不变、再在线升级为 0.0.8 并激活。Ops 在相同新包上再次 12/12 通过。兼容层 66 项通过；Web 检查及 i18n／plugin-store 检查通过。批量脚本仍以退出码 1 表示未达到完整生态门槛：这些通过的管理路径不等于完整生态分母、所有业务及全部回滚阶段已覆盖。全仓 fmt 仍有本轮未改文件的既有差异；仅修改文件按 rustfmt 校验。
 
 【现状·已运行验证】`npm run test:electron-dsh-compatibility` 在真实 macOS arm64 目录包、Electron Main、sidecar、随包 Node 和未修改的 `dsh-plugin-ops-bundle@0.20.8` 原生页面中 12/12 通过：缺少兼容委托不能激活；失败安装自动撤回豁免；Ops 通过真实路由在线安装并激活 `dsh-plugin-release-probe@0.0.8`；健康扫描读取真实 `magi` profile；重启后豁免恢复；原包撤销、卸载和页面运行无异常；没有落盘第二份 profile。兼容回归 64 项、插件系统兼容单测 2 项、管理 API 单测 5 项通过。证据位于 `target/plugin-acceptance/dsh-compatibility/`。
 

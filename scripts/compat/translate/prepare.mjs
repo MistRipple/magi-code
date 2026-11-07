@@ -110,7 +110,7 @@ export async function prepareDsh(options) {
   };
   if (inspection.entries.some((entry) => /^(?:ctx\.)?(?:pluginManager|loader)(?:\.|$)/.test(entry.name))
     || ['pluginManager', 'loader'].some((name) => Object.hasOwn(inspection.serviceReads, name))) {
-    manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', 'authorize', 'compatibility'] });
+    manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', 'authorize', 'compatibility', 'background'] });
   }
   mkdirSync(options.outDir, { recursive: true });
   const kept = copyTree(root, options.outDir);

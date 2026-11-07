@@ -21,6 +21,7 @@ export const profilePath = () => host?.root;
 export function configureProfile(api, { home = process.env.DSH_HOME, registry = process.env.MAGI_NPM_REGISTRY ?? 'https://registry.npmjs.org' } = {}) {
   if (!home || !api.plugins?.list) return () => {};
   if (host) throw new Error('DSH profile 已绑定宿主');
+  if (api.plugins.background) api = { ...api, plugins: api.plugins.background };
   host = { api, registry, root: resolve(home, 'profiles', 'magi'), parent: resolve(home, 'profiles') };
   const old = { dir: process.env.DSH_PROFILE_DIR, name: process.env.DSH_PROFILE };
   process.env.DSH_PROFILE_DIR = host.root; process.env.DSH_PROFILE = 'magi';

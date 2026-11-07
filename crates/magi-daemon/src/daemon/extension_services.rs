@@ -294,6 +294,7 @@ impl HostService for PluginHostService {
         ) {
             let operations = self.operations.get().cloned();
             let digest = self.digest.clone();
+            let background = params.get("_background") == Some(&Value::Bool(true));
             let lease = params
                 .get("_instance")
                 .and_then(Value::as_str)
@@ -301,22 +302,29 @@ impl HostService for PluginHostService {
             if let Some(object) = params.as_object_mut() {
                 object.remove("_instance");
                 object.remove("_context");
+                object.remove("_background");
             }
             return Box::pin(async move {
                 let operations = operations
                     .ok_or_else(|| RpcError::new(ErrorKind::HostGone, "插件管理服务未就绪"))?;
-                operations
-                    .call(&plugin_id, &digest, lease.as_deref(), &method, params)
-                    .await
-                    .map_err(|error| {
-                        let kind = match &error {
-                            magi_api::ApiError::Forbidden(_) => ErrorKind::PermissionDenied,
-                            magi_api::ApiError::Conflict(_) => ErrorKind::Conflict,
-                            magi_api::ApiError::InvalidInput(_) => ErrorKind::InvalidParams,
-                            _ => ErrorKind::Blocked,
-                        };
-                        RpcError::new(kind, error.message())
-                    })
+                (if background {
+                    operations
+                        .call_background(&plugin_id, &digest, lease.as_deref(), &method, params)
+                        .await
+                } else {
+                    operations
+                        .call(&plugin_id, &digest, lease.as_deref(), &method, params)
+                        .await
+                })
+                .map_err(|error| {
+                    let kind = match &error {
+                        magi_api::ApiError::Forbidden(_) => ErrorKind::PermissionDenied,
+                        magi_api::ApiError::Conflict(_) => ErrorKind::Conflict,
+                        magi_api::ApiError::InvalidInput(_) => ErrorKind::InvalidParams,
+                        _ => ErrorKind::Blocked,
+                    };
+                    RpcError::new(kind, error.message())
+                })
             });
         }
         if matches!(method.as_str(), "session.snapshot" | "credential.ref") {

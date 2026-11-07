@@ -232,6 +232,7 @@
     if (permission.kind === 'pluginManagement') return [
       i18n.t(permission.targets.includes('authorize') ? 'settings.plugins.permission.pluginAuthorization' : 'settings.plugins.permission.pluginManagement'),
       ...(permission.targets.includes('compatibility') ? [i18n.t('settings.plugins.permission.pluginCompatibility')] : []),
+      ...(permission.targets.includes('background') ? [i18n.t('settings.plugins.permission.pluginBackground')] : []),
     ].join('；');
     if (permission.kind === 'contextRewrite') return i18n.t('settings.plugins.permission.contextRewrite');
     if (permission.kind === 'modelSources') return i18n.t('settings.plugins.permission.modelSources', { sources: permission.targets.join(', ') });

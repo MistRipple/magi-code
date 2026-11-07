@@ -114,6 +114,8 @@ daemon 响应形状：
 | `host.ready` | 宿主自动通知 | `activate(api)` 成功后发送 |
 | `host.log` | `api.log(message)` | 最多 4096 字符的诊断通知，不写 canonical 日志 |
 
+管理 API 的后台模式另协商 `plugin.management.background`：SDK 的 `api.plugins.background` 以显式 `background:true` 传输元字段发送管理写请求，不携带已结束的 invocationId。HostHandler 仅接受插件管理方法、拒绝同时携带 invocationId，移除该元字段并注入当前 `_instance`／`_background` 后交给 daemon。daemon 在初次准入和异步提交锁内均检查 background 及具体动作授权；停用、撤权和旧实例失效仍拒绝。只读目录和兼容策略可沿当前实例重新读取；普通管理 API、模型、工具、会话和钩子原有调用租约边界不变。
+
 插件私有页面的路由请求可携带可选 `headers`（`PluginRouteCallRequest`）。只转交页面自己提供的应用头，不转交 Magi HTTP 请求的 Cookie、凭据和 Origin；Host、Origin、Cookie、代理与传输控制头禁止覆盖。DSH 原生页面的 localStorage/sessionStorage 由 iframe 消息桥按插件 ID 隔离代理，仅保存浏览器 profile 内的界面缓存；插件业务配置仍走 daemon 设置 CAS。右栏导航仅能打开当前激活插件清单声明的右栏视图。
 
 `api.config`／`api.configRevision` 是只读配置快照。SDK 不提供 `register.skill`、`register.mcp`、`register.dispose`、`migration.run` 或任意事实写入接口。MCP 为内置功能，Skill 来自清单声明。未知方法返回 `MethodNotFound`。

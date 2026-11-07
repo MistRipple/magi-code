@@ -125,6 +125,8 @@ export default async function activate(api) {
   const settings = await api.settings.read();
   if (settings.value.enabled !== true || api.configRevision !== 2) throw new Error('bad settings');
 }
+
+
 "#,
     )
     .unwrap();
@@ -140,6 +142,77 @@ export default async function activate(api) {
     let instance = launch(&ManagedProcessGroup::new(), config, 1)
         .await
         .unwrap();
+    instance.stop().await;
+}
+
+#[tokio::test]
+async fn background_management_uses_instance_identity_after_http_reply_without_reviving_the_parent()
+{
+    struct Management(std::sync::Mutex<Vec<Value>>);
+    impl HostService for Management {
+        fn request_with_identity(
+            &self,
+            _: String,
+            method: String,
+            params: Value,
+        ) -> BoxFuture<Result<Value, RpcError>> {
+            if method == "plugins.setEnabled" {
+                self.0.lock().unwrap().push(params);
+                return Box::pin(async { Ok(json!({"applied":true})) });
+            }
+            Box::pin(async move { Err(RpcError::new(ErrorKind::MethodNotFound, method)) })
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("index.mjs");
+    std::fs::write(&entry, r#"
+export default async api => {
+  const result = {};
+  await api.route('/start', () => {
+    setTimeout(async () => {
+      try { await api.plugins.setEnabled('target', true); result.foreground='unexpected'; } catch(error) { result.foreground=error.kind; }
+      try { result.background=await api.plugins.background.setEnabled('target', true); } catch(error) { result.background=error.message; }
+    }, 50);
+    return {status:202,body:{accepted:true}};
+  });
+  await api.route('/status', () => ({status:200,body:result}));
+};
+"#).unwrap();
+    let service = Arc::new(Management(std::sync::Mutex::new(Vec::new())));
+    let mut config = LaunchConfig::new(node(), runtime(), entry, dir.path().join("sock"));
+    config.plugin_id = "acme.management".into();
+    config.version = "1.0.0".into();
+    config.digest = "sha256:management".into();
+    config.service = Some(service.clone());
+    let instance = launch(&ManagedProcessGroup::new(), config, 1)
+        .await
+        .unwrap();
+    let call = |path: &'static str, id: String| {
+        instance.invoke_route(
+            path,
+            json!({"method":"GET","path":path}),
+            json!({"invocationId":id}),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
+    };
+    assert_eq!(call("/start", "start".into()).await.unwrap()["status"], 202);
+    let mut status = Value::Null;
+    for n in 0..40 {
+        status = call("/status", format!("status-{n}")).await.unwrap();
+        if status["body"].get("background").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(status["body"]["foreground"], "Cancelled");
+    assert_eq!(status["body"]["background"]["applied"], true);
+    let calls = service.0.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["_background"], true);
+    assert!(calls[0]["_instance"].is_string());
+    assert!(calls[0].get("_context").is_none());
+    drop(calls);
     instance.stop().await;
 }
 

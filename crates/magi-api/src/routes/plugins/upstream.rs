@@ -389,7 +389,7 @@ pub(super) async fn install(
 pub(super) async fn install_candidate(
     operations: &PluginOperations,
     request: &PluginUpstreamRequest,
-    caller: Option<(&str, &str, Option<&str>)>,
+    caller: Option<super::operations::OperationCaller<'_>>,
 ) -> Result<(), ApiError> {
     let expected = request
         .expected_digest
@@ -413,7 +413,10 @@ pub(super) async fn install_candidate(
         ));
     }
     let source = upstream_source(&request.ecosystem, &translated.document);
-    if let Some((id, digest, lease)) = caller {
+    if let Some((id, digest, lease, background)) = caller {
+        if background {
+            operations.admitted(id, digest, lease, "background")?;
+        }
         operations.admitted(id, digest, lease, "install")?;
         if translated.package.manifest().id == id {
             return Err(ApiError::Conflict(

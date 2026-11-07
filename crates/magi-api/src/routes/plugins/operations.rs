@@ -12,7 +12,7 @@ pub struct PluginOperations {
     pub(super) processes: magi_process::ManagedProcessGroup,
 }
 
-pub(super) type OperationCaller<'a> = (&'a str, &'a str, Option<&'a str>);
+pub(super) type OperationCaller<'a> = (&'a str, &'a str, Option<&'a str>, bool);
 
 #[cfg(test)]
 mod tests {
@@ -296,6 +296,140 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn background_management_requires_its_own_grant_and_current_instance() {
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::bare_state(root.path());
+        let caller = package_permissions("acme.background", &["lifecycle", "background"]);
+        let ordinary = package("acme.foreground", true);
+        let target = package("acme.target", false);
+        install(&state, &caller, true);
+        install(&state, &ordinary, true);
+        install(&state, &target, false);
+        let operations = PluginOperations::from_state(&state);
+        let input = json!({"pluginId":"acme.target"});
+        assert!(
+            operations
+                .call_background(
+                    "acme.foreground",
+                    ordinary.digest(),
+                    Some("current"),
+                    "plugins.remove",
+                    input.clone()
+                )
+                .await
+                .unwrap_err()
+                .message()
+                .contains("background")
+        );
+        assert!(
+            operations
+                .call_background(
+                    "acme.background",
+                    caller.digest(),
+                    Some("old"),
+                    "plugins.remove",
+                    input.clone()
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .plugin_manager
+                .lock()
+                .unwrap()
+                .package("acme.target")
+                .is_ok()
+        );
+        operations
+            .call_background(
+                "acme.background",
+                caller.digest(),
+                Some("current"),
+                "plugins.remove",
+                input,
+            )
+            .await
+            .unwrap();
+        assert!(
+            state
+                .plugin_manager
+                .lock()
+                .unwrap()
+                .package("acme.target")
+                .is_err()
+        );
+        state
+            .plugin_manager
+            .lock()
+            .unwrap()
+            .deactivate("acme.background")
+            .unwrap();
+        assert!(
+            operations
+                .call_background(
+                    "acme.background",
+                    caller.digest(),
+                    Some("current"),
+                    "plugins.preview",
+                    json!({})
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn background_caller_revoked_during_target_drain_cannot_commit_removal() {
+        struct RevokeDuringDrain(Arc<Mutex<PluginManager>>);
+        impl crate::ExtensionStatusSource for RevokeDuringDrain {
+            fn status(
+                &self,
+                _: &str,
+            ) -> Option<magi_app_server_protocol::generated::PluginRuntimeStatus> {
+                None
+            }
+            fn quiesce(
+                &self,
+                _: String,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+            {
+                let manager = self.0.clone();
+                Box::pin(async move {
+                    manager
+                        .lock()
+                        .unwrap()
+                        .deactivate("acme.background")
+                        .unwrap();
+                    Ok(())
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::bare_state(root.path());
+        let caller = package_permissions("acme.background", &["lifecycle", "background"]);
+        let target = package("acme.target", false);
+        install(&state, &caller, true);
+        install(&state, &target, true);
+        let manager = state.plugin_manager.clone();
+        let state = state.with_extension_status(Arc::new(RevokeDuringDrain(manager.clone())));
+        let operations = PluginOperations::from_state(&state);
+        assert!(
+            operations
+                .call_background(
+                    "acme.background",
+                    caller.digest(),
+                    Some("current"),
+                    "plugins.remove",
+                    json!({"pluginId":"acme.target"})
+                )
+                .await
+                .is_err()
+        );
+        assert!(manager.lock().unwrap().package("acme.target").is_ok());
     }
 
     #[tokio::test]
@@ -649,7 +783,7 @@ impl PluginOperations {
     ) -> Result<(), ApiError> {
         Self::check_caller(
             &*self.locked("检查插件管理授权")?,
-            Some((caller, digest, lease)),
+            Some((caller, digest, lease, false)),
             target,
         )
     }
@@ -659,7 +793,7 @@ impl PluginOperations {
         identity: Option<OperationCaller<'_>>,
         target: &str,
     ) -> Result<(), ApiError> {
-        let Some((caller, digest, lease)) = identity else {
+        let Some((caller, digest, lease, background)) = identity else {
             return Ok(());
         };
 
@@ -679,6 +813,19 @@ impl PluginOperations {
                 lease.ok_or_else(|| ApiError::Forbidden("插件管理需要活动宿主租约".into()))?,
             )
             .map_err(plugin_error)?;
+        if background
+            && !manager
+                .permission_allowed(
+                    caller,
+                    magi_plugin_system::PluginPermissionKind::PluginManagement,
+                    "background",
+                )
+                .map_err(plugin_error)?
+        {
+            return Err(ApiError::Forbidden(
+                "缺少 pluginManagement:[background] 后台管理授权".into(),
+            ));
+        }
         if target.is_empty() {
             return Ok(());
         }
@@ -705,6 +852,31 @@ impl PluginOperations {
         method: &str,
         params: Value,
     ) -> Result<Value, ApiError> {
+        self.call_with_scope(caller, digest, lease, method, params, false)
+            .await
+    }
+
+    pub async fn call_background(
+        &self,
+        caller: &str,
+        digest: &str,
+        lease: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, ApiError> {
+        self.call_with_scope(caller, digest, lease, method, params, true)
+            .await
+    }
+
+    async fn call_with_scope(
+        &self,
+        caller: &str,
+        digest: &str,
+        lease: Option<&str>,
+        method: &str,
+        params: Value,
+        background: bool,
+    ) -> Result<Value, ApiError> {
         let target = if method == "plugins.setVersionExemption" {
             "compatibility"
         } else if method == "plugins.compatibility" {
@@ -716,7 +888,11 @@ impl PluginOperations {
         } else {
             "lifecycle"
         };
-        self.admitted(caller, digest, lease, target)?;
+        Self::check_caller(
+            &*self.locked("检查插件管理授权")?,
+            Some((caller, digest, lease, background)),
+            target,
+        )?;
         match method {
             "plugins.compatibility" => {
                 if params.as_object().is_none_or(|object| !object.is_empty()) {
@@ -732,7 +908,11 @@ impl PluginOperations {
                 let (version, runtime) = self.dsh_runtime()?;
                 let result = {
                     let mut manager = self.locked("提交版本豁免")?;
-                    Self::check_caller(&manager, Some((caller, digest, lease)), "compatibility")?;
+                    Self::check_caller(
+                        &manager,
+                        Some((caller, digest, lease, background)),
+                        "compatibility",
+                    )?;
                     manager
                         .set_dsh_exemption(&version, &runtime, &request)
                         .map_err(plugin_error)?
@@ -751,7 +931,12 @@ impl PluginOperations {
                 let request = serde_json::from_value(params)
                     .map_err(|e| ApiError::InvalidInput(format!("安装参数无效：{e}")))?;
                 // 下载/翻译可能耗时；提交前再次核对发起宿主的版本、租约和授权。
-                upstream::install_candidate(self, &request, Some((caller, digest, lease))).await?;
+                upstream::install_candidate(
+                    self,
+                    &request,
+                    Some((caller, digest, lease, background)),
+                )
+                .await?;
                 self.projection()
             }
             "plugins.authorize" => {
@@ -770,7 +955,7 @@ impl PluginOperations {
                 self.authorize(
                     &input.plugin_id,
                     input.grants,
-                    Some((caller, digest, lease)),
+                    Some((caller, digest, lease, background)),
                     Some(&input.expected_digest),
                 )
                 .await?;
@@ -804,17 +989,21 @@ impl PluginOperations {
                         self.lifecycle(
                             "deactivate",
                             &input.plugin_id,
-                            Some((caller, digest, lease)),
+                            Some((caller, digest, lease, background)),
                             input.expected_digest.as_deref(),
                         )
                         .await?;
                     }
                     // 停止后发起方可能已撤权；后续写入仍核对同一身份。
-                    self.admitted(caller, digest, lease, target)?;
+                    Self::check_caller(
+                        &*self.locked("检查插件管理授权")?,
+                        Some((caller, digest, lease, background)),
+                        target,
+                    )?;
                     self.lifecycle(
                         "disable",
                         &input.plugin_id,
-                        Some((caller, digest, lease)),
+                        Some((caller, digest, lease, background)),
                         input.expected_digest.as_deref(),
                     )
                     .await?;
@@ -822,7 +1011,7 @@ impl PluginOperations {
                         self.lifecycle(
                             "uninstall",
                             &input.plugin_id,
-                            Some((caller, digest, lease)),
+                            Some((caller, digest, lease, background)),
                             input.expected_digest.as_deref(),
                         )
                         .await?;
@@ -831,18 +1020,18 @@ impl PluginOperations {
                     self.lifecycle(
                         "enable",
                         &input.plugin_id,
-                        Some((caller, digest, lease)),
+                        Some((caller, digest, lease, background)),
                         input.expected_digest.as_deref(),
                     )
                     .await?;
                     self.lifecycle(
                         "activate",
                         &input.plugin_id,
-                        Some((caller, digest, lease)),
+                        Some((caller, digest, lease, background)),
                         input.expected_digest.as_deref(),
                     )
                     .await?;
-                    self.wait_running(&input.plugin_id, Some((caller, digest, lease)))
+                    self.wait_running(&input.plugin_id, Some((caller, digest, lease, background)))
                         .await?;
                 }
                 self.projection()

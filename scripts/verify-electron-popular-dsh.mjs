@@ -198,7 +198,27 @@ try {
             const after = (await api('/api/plugins')).value.plugins.find((p) => p.manifest.id === targetId);
             assert.equal(after.manifest.version, '0.0.8');
             assert.equal(after.runtime.state, 'running');
-            item.functionalChecks = { onlineUpgrade: true, rollback: 'unverified' };
+            const run = async (version, enabled) => {
+              const started = await post(`/api/plugins/${item.id}/routes`, { method: 'POST', path: '/api/plugin-upgrader/job', body: { steps: [{ name: request.package, version, action: 'switch', enabled }] } });
+              assert.equal(started.status, 202, JSON.stringify(started));
+              return waitFor(async () => {
+                const current = await post(`/api/plugins/${item.id}/routes`, { method: 'GET', path: '/api/plugin-upgrader/job', query: `id=${started.body.id}` });
+                return current.body.status === 'finished' ? current.body : false;
+              }, `Upgrader 切换 ${version}`, 240_000);
+            };
+            const switched = await run('0.0.7', false);
+            assert.equal(switched.failed, 0, JSON.stringify(switched));
+            const disabled = (await api('/api/plugins')).value.plugins.find((p) => p.manifest.id === targetId);
+            assert.equal(disabled.manifest.version, '0.0.7'); assert.equal(disabled.enabled, false); assert.equal(disabled.active, false);
+            const rejected = await run('9999.0.0', false);
+            assert.equal(rejected.failed, 1, '不存在的版本必须明确失败');
+            const preserved = (await api('/api/plugins')).value.plugins.find((p) => p.manifest.id === targetId);
+            assert.equal(preserved.digest, disabled.digest); assert.equal(preserved.enabled, false);
+            const restored = await run('0.0.8', true);
+            assert.equal(restored.failed, 0, JSON.stringify(restored));
+            const active = (await api('/api/plugins')).value.plugins.find((p) => p.manifest.id === targetId);
+            assert.equal(active.manifest.version, '0.0.8'); assert.equal(active.runtime.state, 'running');
+            item.functionalChecks = { onlineUpgrade: true, versionSwitch: true, disabledState: true, failedUpgradePreservesVersion: true, reactivation: true, removalRollback: 'unverified' };
           } finally { if (targetId) await removePlugin(targetId); }
         }
       }

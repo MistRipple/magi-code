@@ -19,6 +19,9 @@ export function parseBundleSpec(spec) {
 }
 
 export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTRY ?? 'https://registry.npmjs.org') {
+  // 原生 DSH 管理面板允许在 HTTP 202 后继续工作；使用显式实例级管理
+  // API，由 daemon 的独立 background 委托控制，不借用已结束的请求租约。
+  if (api.plugins.background) api = { ...api, plugins: api.plugins.background };
   const find = async (name) => {
     if (!NAME.test(name)) throw new Error('npm 包名无效');
     const { plugins } = await api.plugins.list();
