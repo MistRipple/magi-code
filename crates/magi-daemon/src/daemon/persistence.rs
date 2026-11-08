@@ -147,7 +147,7 @@ fn trim_resident_event_projections(
     }
 }
 
-const STATE_LAYOUT_VERSION: u32 = 20;
+const STATE_LAYOUT_VERSION: u32 = 21;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1260,7 +1260,7 @@ impl StateRepository {
         let layout_path = self.state_layout_marker_path();
         if layout_path.exists() {
             let marker: StateLayoutMarker = self.read_json_strict(&layout_path)?;
-            if matches!(marker.version, 2..=19) {
+            if matches!(marker.version, 2..=20) {
                 // 升级写屏障，防止旧 daemon 重写新 Agent activation 与 Goal/Step。
                 let backup = self
                     .state_root
@@ -5151,7 +5151,7 @@ mod tests {
 
     #[test]
     fn prior_state_layouts_upgrade_write_barrier_once() {
-        for version in 2..=19 {
+        for version in 2..=20 {
             let state_root = unique_temp_dir("magi-state-layout-upgrade");
             let repository = StateRepository::new(state_root.clone());
             fs::write(

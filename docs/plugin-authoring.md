@@ -628,3 +628,9 @@ node scripts/pack-plugin.mjs <插件目录> <输出.zip>
 工具或命令可用 `await api.session.message({messageId, text, sourceKind, delivery})` 把结果交给本次调用所属的主会话。清单必须显式请求 `sessionWrite` 的 `context` 或 `wake` 目标；context 不主动请求模型，steer/followup 可产生模型用量，需 wake。不能指定其他会话、在后台回调或子任务中调用；计划作业禁止唤醒。
 
 使用稳定的 messageId 和独立来源（例如 `analysis-result`），不要声称来源是 user、system 或 assistant。等待回执后再报告交付状态：pending 表示待处理，attached 表示已绑定轮次，consumed 表示已进入模型请求；都不表示模型答复成功。取消和未知结果不能自动生成新身份重发。正文、插件身份与名称由 daemon 保存，用户可查看和取消待处理消息。完整限额、身份冲突和生命周期规则见[扩展协议](extension-protocol-v1.md#会话消息交付)。
+
+## 在线安装的请求恢复
+
+管理插件调用 `api.plugins.installBundle({ecosystem:'dsh', package, version, requestId, enabled})` 时，requestId 应标识一次用户操作并在重连／应用重启后保持稳定。同插件、同包摘要、同输入的重发领取原回执；新宿主代次不会使同一操作重新执行。不能修改原 requestId 的输入，也不能用随机新身份自动重试未知结果。
+
+`installation-interrupted` 表示应用退出前任务未完成结算。`installed:true` 仅证明候选摘要已经安装，不能视作授权或运行成功；提示用户到 Magi 插件管理检查状态，确认后再用新 requestId 显式重试。恢复不自动下载、安装或代授权。原回执最多保留 256 项、至少保留至请求创建后七天；容量不足时明确失败。完整提交边界、取消及损坏日志处理见[扩展协议](extension-protocol-v1.md)。

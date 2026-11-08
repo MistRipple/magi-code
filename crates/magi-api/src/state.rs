@@ -2152,6 +2152,17 @@ impl ApiState {
         workspace_registry: Arc<WorkspaceStore>,
         governance: Arc<GovernanceService>,
     ) -> Self {
+        let plugin_manager =
+            magi_plugin_system::PluginManager::open(std::env::temp_dir().join(format!(
+                "magi-api-plugin-state-{}-{}",
+                std::process::id(),
+                UtcMillis::now().0
+            )))
+            .expect("ApiState plugin manager should initialize");
+        let plugin_installations = Arc::new(
+            crate::plugin_installations::PluginInstallations::open(&plugin_manager),
+        );
+        let plugin_manager = Arc::new(Mutex::new(plugin_manager));
         let browser_authority = Arc::new(Mutex::new(BrowserAuthority::new()));
         let browser_write_lock = Arc::new(Mutex::new(()));
         let browser_host_client = Arc::new(RwLock::new(None));
@@ -2289,17 +2300,10 @@ impl ApiState {
             extension_status: None,
             plugin_route_executor: None,
             plugin_toolchain: None,
-            plugin_installations: Arc::default(),
+            plugin_installations,
             input_guard: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
-            plugin_manager: Arc::new(Mutex::new(
-                magi_plugin_system::PluginManager::open(std::env::temp_dir().join(format!(
-                    "magi-api-plugin-state-{}-{}",
-                    std::process::id(),
-                    UtcMillis::now().0
-                )))
-                .expect("in-memory ApiState plugin manager should initialize"),
-            )),
+            plugin_manager,
             mcp_service: Arc::new(crate::mcp_runtime::McpServiceRuntime::in_memory()),
             plugin_jobs: Arc::new(crate::plugin_jobs::PluginJobs::open(
                 std::env::temp_dir().join(format!(
@@ -2623,6 +2627,10 @@ impl ApiState {
         mut self,
         manager: Arc<Mutex<magi_plugin_system::PluginManager>>,
     ) -> Self {
+        self.plugin_installations =
+            Arc::new(crate::plugin_installations::PluginInstallations::open(
+                &manager.lock().expect("plugin manager assembly"),
+            ));
         self.plugin_manager = manager;
         // Builder 的装配顺序不能让实时 Skill provider 永久捕获临时 manager。
         if let Some(runtime) = self.skill_runtime.clone() {

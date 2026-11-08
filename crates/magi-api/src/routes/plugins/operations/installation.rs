@@ -1,5 +1,5 @@
 use super::*;
-use crate::plugin_installations::{InstallOwner, InstallationWaiter};
+use crate::plugin_installations::{InstallCandidate, InstallOwner, InstallationWaiter};
 use magi_app_server_protocol::generated::{
     PluginBundleInstallApplication as Application, PluginBundleInstallError as InstallError,
     PluginBundleInstallRequest, PluginBundleInstallResult as InstallResult, PluginEcosystem,
@@ -121,9 +121,21 @@ impl PluginOperations {
                         return;
                     }
                 };
-                if !job.begin_apply() {
-                    job.finish(cancelled(&input.package));
-                    return;
+                let candidate = job.begin_apply(InstallCandidate {
+                    plugin_id: translated.package.manifest().id.clone(),
+                    digest: translated.package.digest().into(),
+                    version: translated.package.manifest().version.clone(),
+                });
+                match candidate {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        job.finish(cancelled(&input.package));
+                        return;
+                    }
+                    Err(error) => {
+                        job.finish(failure(error, false, &input.package, None, None));
+                        return;
+                    }
                 }
                 // 提交开始后取消只返回 too-late；即便等待方退出，daemon 仍结算此任务。
                 let result = operations
@@ -133,7 +145,7 @@ impl PluginOperations {
             });
         }
         let _waiter = InstallationWaiter::new(job.clone());
-        Ok(job.wait().await)
+        job.wait().await
     }
 
     async fn prepare_bundle(

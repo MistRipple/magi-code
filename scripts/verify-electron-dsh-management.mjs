@@ -14,7 +14,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
 const port = Number(process.env.MAGI_DSH_MANAGEMENT_PORT || 38944), cdpPort = Number(process.env.MAGI_DSH_MANAGEMENT_CDP_PORT || 9314);
 const origin = `http://127.0.0.1:${port}`;
-const output = join(root, 'target/plugin-acceptance/dsh-management');
+const output = process.env.MAGI_DSH_MANAGEMENT_OUTPUT || join(root, 'target/plugin-acceptance/dsh-management');
 const work = await mkdtemp(join(tmpdir(), 'magi-dsh-management-'));
 const report = createReporter(), errors = [];
 let app, page, frame, ui;

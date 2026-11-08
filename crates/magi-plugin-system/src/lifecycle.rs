@@ -15,8 +15,8 @@ use std::{
 };
 
 mod compatibility;
-mod image_attachments;
 mod drain;
+mod image_attachments;
 mod runtime_catalog;
 mod upgrade;
 
@@ -250,6 +250,11 @@ impl PluginManager {
         }
         cleanup_unreferenced_packages(&manager.root, &manager.state)?;
         Ok(manager)
+    }
+
+    /// daemon 的安装回执与原安装事实共用状态根，独立日志不拥有插件版本。
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn state(&self) -> &PluginManagerState {
