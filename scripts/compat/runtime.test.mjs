@@ -345,6 +345,10 @@ test('DSH 管理安装只转发到 daemon 任务，保留版本来源、requestI
   } });
   assert.equal(parseBundleSpec('sample@^1').version, '^1');
   assert.equal(parseBundleSpec('sample@next').version, 'next');
+  assert.equal(parseBundleSpec('sample@>=1 <2').version, '>=1 <2');
+  for (const spec of ['github:Owner/Repo#feature/desktop', 'git+https://github.com/Owner/Repo.git#feature/desktop', 'Owner/Repo#feature/desktop']) {
+    assert.deepEqual(parseBundleSpec(spec), { ecosystem: 'dsh', github: { repository: 'owner/repo', reference: 'feature/desktop' } });
+  }
   for (const bad of ['../sample', 'https://example.org/sample', 'sample@1.0.0;touch x', '@scope/sample@']) assert.throws(() => parseBundleSpec(bad));
   assert.deepEqual(await manager.installBundle('@scope/sample@^1', { requestId: 'upgrader-1', enabled: false }), result);
   assert.deepEqual(calls[0], { ecosystem: 'dsh', package: '@scope/sample', version: '^1', enabled: false, requestId: 'upgrader-1' });

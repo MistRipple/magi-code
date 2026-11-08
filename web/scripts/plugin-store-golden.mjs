@@ -51,6 +51,16 @@ await withGoldenViteServer(async (server) => {
   // 不同生态的同名包互不归并。
   {
     const items = buildStoreItems(
+      [installed('dsh.dsh-x', { kind: 'upstream', location: 'dsh:dsh-x@1.0.0', github: { repository: 'owner/repo', commit: 'a'.repeat(40) } })], [],
+      [upstream({ state: 'updatable' })], text,
+    );
+    assert.equal(items.length, 1);
+    assert.equal(items[0].upstream, null, 'npm 搜索结果不替换已安装 GitHub 原包的来源');
+    assert.equal(items[0].updatable, false, 'npm 版本不能当作仓库更新');
+  }
+  // 不同生态的同名包互不归并。
+  {
+    const items = buildStoreItems(
       [installed('dsh.dsh-x', { kind: 'upstream', location: 'dsh:dsh-x@1.0.0' })], [],
       [upstream({ ecosystem: 'pi' })], text,
     );

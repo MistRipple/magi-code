@@ -11,6 +11,7 @@ import type {
   PluginManifest,
   PluginUpstreamEntry,
   PluginUpstreamPreview,
+  PluginUpstreamRequest,
   PluginUpstreamProjection,
 } from '../shared/app-server-protocol.generated';
 
@@ -140,17 +141,18 @@ export async function searchUpstreamPlugins(query: string, signal?: AbortSignal)
   return await response.json() as PluginUpstreamProjection;
 }
 
-function upstreamBody(entry: Pick<PluginUpstreamEntry, 'ecosystem' | 'package' | 'version'>, expectedDigest?: string): string {
+function upstreamBody(entry: PluginUpstreamRequest, expectedDigest?: string): string {
   return JSON.stringify({
     ecosystem: entry.ecosystem,
     package: entry.package,
     version: entry.version,
+    github: entry.github,
     ...(expectedDigest ? { expectedDigest } : {}),
   });
 }
 
 /** 准备阶段：daemon 取包、核对完整性并翻译，返回翻译结果与权限差异，不写入任何状态。 */
-export async function previewUpstreamPlugin(entry: PluginUpstreamEntry, signal?: AbortSignal): Promise<PluginUpstreamPreview> {
+export async function previewUpstreamPlugin(entry: PluginUpstreamRequest, signal?: AbortSignal): Promise<PluginUpstreamPreview> {
   const response = await pluginRequest('/api/plugins/upstream/preview', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -166,7 +168,7 @@ export async function installUpstreamPlugin(preview: PluginUpstreamPreview, ecos
   const response = await pluginRequest('/api/plugins/upstream/install', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: upstreamBody({ ecosystem, package: preview.package, version: preview.version }, preview.candidate.digest),
+    body: upstreamBody({ ecosystem, package: preview.package, version: preview.version, github: preview.github }, preview.candidate.digest),
   });
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.upstreamInstall'), response);
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));

@@ -9,6 +9,7 @@ import { PassThrough } from 'node:stream';
 import { load, dump } from 'js-yaml';
 import { createPluginManager } from './plugin-manager.mjs';
 import { pluginLifecycle } from './plugin-directory.mjs';
+import { dshBundle as bundle } from './plugin-source.mjs';
 import { createProfileProcesses } from './profile-process-host.mjs';
 
 const scopes = new AsyncLocalStorage();
@@ -36,13 +37,6 @@ export function configureProfile(api, { home = process.env.DSH_HOME, registry = 
   };
 }
 
-function bundle(plugin) {
-  const { source } = plugin;
-  if (source.kind !== 'upstream' || !source.location.startsWith('dsh:')) return;
-  const spec = source.location.slice(4), index = spec.lastIndexOf('@');
-  if (index <= 0) throw new Error('daemon 上游插件身份无效');
-  return { name: spec.slice(0, index), version: spec.slice(index + 1), plugin };
-}
 async function refresh(scope) {
   const list = await host.api.plugins.list({ includeUpstreamManifest: true });
   const compatibility = host.api.plugins.compatibility ? await host.api.plugins.compatibility() : null;
@@ -58,7 +52,7 @@ export function applyProfileSnapshot(scope, { list, compatibility }) {
   scope.files.set('package.json', JSON.stringify({
     name: 'magi-dsh-profile', private: true,
     dsh: { profile: { bundles: scope.bundles.map(({ name }) => name) } },
-    dependencies: Object.fromEntries(scope.bundles.map(({ name, version }) => [name, version])),
+    dependencies: Object.fromEntries(scope.bundles.map(({ name, source }) => [name, source])),
   }));
   scope.files.set('cordis.yml', dump(rows));
   scope.files.set('cordis.patch.yml', dump(rows.map(({ id, disabled }) => ({ id, disabled }))));
@@ -252,7 +246,7 @@ async function commit(scope) {
   }
   if (scope.dirty.has('package.json')) {
     const proposed = JSON.parse(scope.files.get('package.json'));
-    const expected = Object.fromEntries(scope.bundles.map(({ name, version }) => [name, version]));
+    const expected = Object.fromEntries(scope.bundles.map(({ name, source }) => [name, source]));
     // 删除依赖后再安装的上游事务可在调用内执行；最终清单必须与真正安装
     // 结果一致。不能让单纯写 package.json 成为绕开原包完整性验证的安装入口。
     if (JSON.stringify(Object.entries(proposed.dependencies ?? {}).sort()) !== JSON.stringify(Object.entries(expected).sort())) throw error('EINVAL', 'profile 清单提案与 daemon 安装事实不一致；安装或移除必须经过插件管理入口');

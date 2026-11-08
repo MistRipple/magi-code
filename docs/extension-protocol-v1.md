@@ -145,7 +145,7 @@ sessionRead 的各自授权。未声明客户端贡献的普通视图仍按页�
 
 DSH 的 `hmr.runExclusive(callback)` 串行运行当前实例的 profile 应用操作，禁止嵌套；回调异常不阻塞后续显式操作。`reconcileProfile(requiredIds?)` 必须在该事务内调用：先沿原提交入口结算当前调用的清单／启停提案，再由 `plugins.reconcile` 核对运行目录并刷新 profile 投影。必需 Loader 条目未运行时失败；已启用但未激活的条目返回可执行的授权／运行状态提示。不可变安装归档的版本替换仍归原安装事务，因此没有物理 profile、文件监听或另一份模块缓存；该服务不提供上游 `watchConfig` 或任意模块替换。调用结束、取消和实例处置后，遗留队列及快照访问拒绝。页面刷新继续运行原包代码与共享视图桥。
 
-DSH `profileContext.packageManager` 提供插件实例拥有的内部 Node 命令入口。原包通过当前 Node 的 `spawn(node,[script,...])` 启动 JS／MJS／CJS 辅助脚本时，脚本继续运行原字节，profile 文件读取仍来自 daemon 快照。同步调用该包管理入口只阻塞辅助进程：独立传输进程等待父扩展经 `plugins.installBundle` 取得实际结果，再刷新同一调用的 profile 投影。只接受当前 profile 的 `add`、npm 版本／范围／标签以及工作区、忽略脚本、强制获取选项；不会启动 pnpm、执行构建脚本或把 Git 来源伪装成 npm。其他 Node 进程调用形态和非 Node 原生程序保留原有路径。
+DSH `profileContext.packageManager` 提供插件实例拥有的内部 Node 命令入口。原包通过当前 Node 的 `spawn(node,[script,...])` 启动 JS／MJS／CJS 辅助脚本时，脚本继续运行原字节，profile 文件读取仍来自 daemon 快照。同步调用该包管理入口只阻塞辅助进程：独立传输进程等待父扩展经 `plugins.installBundle` 取得实际结果，再刷新同一调用的 profile 投影。只接受当前 profile 的 `add`、npm 版本／范围／标签、公开 GitHub 仓库引用以及工作区、忽略脚本、强制获取选项；不会启动 pnpm 或执行构建脚本。GitHub 引用在同一 daemon 安装任务中固定为提交，原包、来源、版本与回执沿原生命周期保存。其他 Node 进程调用形态和非 Node 原生程序保留原有路径。
 
 辅助进程仅取得父实例私有管道的独立随机委托，不继承 daemon 扩展 RPC 凭据。每实例最多 16 个直接辅助进程、32 个连接，请求和回执各限 4 MiB；读写仍经当前父实例的 SDK 和 daemon 授权入口，派生辅助进程继续沿父委托转交。成功退出前，变动过的清单／启停提案按当前摘要复核并经既有 profile 提交入口结算；失败退出丢弃提案，不写物理 profile。调用取消、子进程退出和实例处置撤销该委托，并取消其准备中的安装；已进入提交的安装仍按原任务合同结算。包管理能力的使用单独进入安装授权预览，单纯读取 profile 名称或目录不因此增加安装／代授权委托。
 

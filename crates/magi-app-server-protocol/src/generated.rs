@@ -1776,6 +1776,9 @@ pub enum PluginSourceKind {
 pub struct PluginSourceProjection {
     pub kind: PluginSourceKind,
     pub location: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github: Option<PluginGithubSource>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3490,7 +3493,9 @@ pub struct PluginUpstreamProjection {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginUpstreamRequest {
     pub ecosystem: PluginEcosystem,
-    pub package: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -3498,6 +3503,9 @@ pub struct PluginUpstreamRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "expectedDigest")]
     pub expected_digest: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github: Option<PluginGithubSource>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3532,6 +3540,9 @@ pub struct PluginUpstreamPreview {
     pub publisher: String,
     pub official: bool,
     pub translation: PluginTranslationSummary,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github: Option<PluginGithubSource>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3769,7 +3780,9 @@ pub struct PluginClientContribution {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginBundleInstallRequest {
     pub ecosystem: PluginEcosystem,
-    pub package: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
     #[serde(rename = "requestId")]
     pub request_id: String,
     #[serde(default)]
@@ -3778,6 +3791,9 @@ pub struct PluginBundleInstallRequest {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github: Option<PluginGithubSource>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3920,4 +3936,16 @@ pub enum PluginSessionMessageState {
     Consumed,
     #[serde(rename = "cancelled")]
     Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginGithubSource {
+    pub repository: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
 }

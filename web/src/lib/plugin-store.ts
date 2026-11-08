@@ -98,6 +98,8 @@ export function buildStoreItems(
     const installedId = entry.installedPluginId ?? installedByUpstream.get(`${entry.ecosystem}:${entry.package}`);
     const existing = installedId ? items.get(installedId) : undefined;
     if (existing) {
+      // 搜索可以命中同名仓库原包，但 npm 元数据不能改绑其在线更新来源。
+      if (existing.installed?.source.github) { existing.searchOrder = searchOrder; continue; }
       existing.upstream = entry;
       existing.searchOrder = searchOrder;
       existing.updatable = existing.updatable || entry.state === 'updatable';

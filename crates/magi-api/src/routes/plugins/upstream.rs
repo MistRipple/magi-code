@@ -1,8 +1,8 @@
 //! 上游生态插件（DSH、pi）：搜索、预览与安装。
 //!
-//! 用户安装的是上游官方发布的 npm 包本身。这里只做三件事：向 npm registry 取包并核对
-//! `dist.integrity`；调用随包的安装封装器（`compat/cli.mjs prepare`）保留原包并声明宿主权限；
-//! 把封装结果交给与其他来源相同的预览、授权和生命周期。安装期不运行 npm/git 安装或构建脚本，
+//! 用户安装上游发布的 npm 原包或公开 GitHub 仓库的固定提交。来源获取分别核对 registry
+//! integrity 与 GitHub 提交；公共解包和翻译入口保留原包并声明宿主权限，再沿相同的预览、
+//! 授权与生命周期提交。安装期不运行 npm/git 安装或构建脚本，
 //! 上游代码只在翻译器的受限子进程里被执行一次以记录它声明了什么。
 //!
 //! 翻译是确定的：同一上游版本和同一兼容运行时得到同一摘要，所以预览确认的摘要可以在安装时
@@ -18,6 +18,7 @@ use magi_plugin_system::npm;
 use std::path::Path as FsPath;
 
 mod artifacts;
+pub(super) mod github;
 pub(super) mod icons;
 
 /// registry 的开发与验收覆盖入口；默认使用 npm 官方 registry。
@@ -88,6 +89,23 @@ pub(super) fn validate_package_name(name: &str) -> Result<(), ApiError> {
     } else {
         Err(ApiError::InvalidInput("npm 包名无效".into()))
     }
+}
+
+pub(super) fn validate_source(
+    package: Option<&str>,
+    github: Option<&magi_app_server_protocol::generated::PluginGithubSource>,
+) -> Result<(), ApiError> {
+    if let Some(name) = package {
+        validate_package_name(name)?;
+    }
+    if let Some(source) = github {
+        github::validate(source)?;
+    } else if package.is_none() {
+        return Err(ApiError::InvalidInput(
+            "请选择 npm 包或 GitHub 仓库来源".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn package_path(name: &str) -> String {
@@ -251,6 +269,7 @@ fn installed_upstream(
                 ecosystem,
                 package,
                 version,
+                github: None,
             } => Some((
                 (ecosystem.clone(), package.clone()),
                 (plugin.id.clone(), version.clone()),
@@ -333,8 +352,10 @@ struct NpmUser {
 /// 一次翻译的结果：已校验的 Magi 包，加上给用户看的翻译摘要。
 pub(super) struct Translated {
     pub(super) package: PluginPackage,
-    pub(super) document: VersionDocument,
+    integrity: String,
+    publisher: String,
     summary: PluginTranslationSummary,
+    pub(super) source: PluginSource,
 }
 
 pub(super) async fn preview(
@@ -351,32 +372,35 @@ pub(super) async fn preview_candidate(
     request: &PluginUpstreamRequest,
 ) -> Result<PluginUpstreamPreview, ApiError> {
     let translated = translate(operations, &request).await?;
-    let source = upstream_source(&request.ecosystem, &translated.document);
+    let source = translated.source.clone();
     let candidate = {
         let manager = operations.locked("预览上游插件")?;
         manager
             .preview(&translated.package, &source)
             .map_err(plugin_error)?
     };
+    let PluginSource::Upstream {
+        package,
+        version,
+        github,
+        ..
+    } = translated.source
+    else {
+        return Err(ApiError::InternalAssemblyError(
+            "翻译结果缺少上游来源".into(),
+        ));
+    };
     Ok(PluginUpstreamPreview {
         candidate,
-        official: OFFICIAL_SCOPES
-            .iter()
-            .any(|scope| translated.document.name.starts_with(scope)),
-        publisher: translated
-            .document
-            .npm_user
-            .as_ref()
-            .map(|user| user.name.clone())
-            .unwrap_or_default(),
-        integrity: translated
-            .document
-            .dist
-            .integrity
-            .clone()
-            .unwrap_or_default(),
-        package: translated.document.name,
-        version: translated.document.version,
+        official: github.is_none()
+            && OFFICIAL_SCOPES
+                .iter()
+                .any(|scope| package.starts_with(scope)),
+        github,
+        publisher: translated.publisher,
+        integrity: translated.integrity,
+        package,
+        version,
         translation: translated.summary,
     })
 }
@@ -399,13 +423,23 @@ pub(super) async fn install_candidate(
         .as_deref()
         .filter(|digest| !digest.trim().is_empty())
         .ok_or_else(|| ApiError::InvalidInput("安装前必须先预览并携带预览摘要".into()))?;
-    if request
-        .version
-        .as_deref()
-        .is_none_or(|version| version.trim().is_empty())
+    if request.github.is_none()
+        && request
+            .version
+            .as_deref()
+            .is_none_or(|version| version.trim().is_empty())
     {
         return Err(ApiError::InvalidInput(
             "安装必须指定预览时的精确版本".into(),
+        ));
+    }
+    if request
+        .github
+        .as_ref()
+        .is_some_and(|source| source.commit.is_none())
+    {
+        return Err(ApiError::InvalidInput(
+            "GitHub 安装必须指定预览固定的提交".into(),
         ));
     }
     let translated = translate(operations, &request).await?;
@@ -415,7 +449,7 @@ pub(super) async fn install_candidate(
             "翻译结果与预览时不一致，请重新预览后再确认".into(),
         ));
     }
-    let source = upstream_source(&request.ecosystem, &translated.document);
+    let source = translated.source.clone();
     if let Some((id, digest, lease, background)) = caller {
         if background {
             operations.admitted(id, digest, lease, "background")?;
@@ -431,14 +465,6 @@ pub(super) async fn install_candidate(
         .install_or_upgrade(&translated.package, source, caller)
         .await?;
     Ok(())
-}
-
-fn upstream_source(ecosystem: &PluginEcosystem, document: &VersionDocument) -> PluginSource {
-    PluginSource::Upstream {
-        ecosystem: ecosystem_name(ecosystem).into(),
-        package: document.name.clone(),
-        version: document.version.clone(),
-    }
 }
 
 async fn translate(
@@ -462,35 +488,45 @@ pub(super) async fn prepare(
         .plugin_toolchain
         .clone()
         .ok_or_else(|| ApiError::InvalidInput("本机不能翻译上游插件".into()))?;
-    validate_package_name(&request.package)?;
-    let version = match request.version.as_deref().map(str::trim) {
-        None | Some("") => "latest".to_string(),
-        Some(version) => {
-            semver::Version::parse(version)
-                .map_err(|_| ApiError::InvalidInput("版本必须是精确的语义版本".into()))?;
-            version.to_string()
-        }
-    };
-    let document = if let Some(document) = document {
-        document
+    validate_source(request.package.as_deref(), request.github.as_ref())?;
+    let (tarball, integrity, github, document) = if let Some(source) = &request.github {
+        let (bytes, integrity, pinned) = github::acquire(source).await?;
+        (std::sync::Arc::new(bytes), integrity, Some(pinned), None)
     } else {
-        let registry = registry()?;
-        let document_url = format!("{registry}/{}/{version}", package_path(&request.package));
-        let bytes =
-            download_bytes(&document_url, MAX_REGISTRY_DOCUMENT_BYTES, "上游插件元数据").await?;
-        serde_json::from_slice::<VersionDocument>(&bytes)
-            .map_err(|_| ApiError::InvalidInput("registry 元数据格式无效".into()))?
-    };
-    if document.name != request.package {
-        return Err(ApiError::InvalidInput(
-            "registry 返回的包名与请求不一致".into(),
-        ));
-    }
-    let integrity =
-        document.dist.integrity.clone().ok_or_else(|| {
+        let name = request.package.as_deref().unwrap();
+        let version = match request.version.as_deref() {
+            None => "latest",
+            Some(version) => {
+                semver::Version::parse(version)
+                    .map_err(|_| ApiError::InvalidInput("版本必须是精确的语义版本".into()))?;
+                version
+            }
+        };
+        let document = if let Some(document) = document {
+            document
+        } else {
+            let registry = registry()?;
+            let bytes = download_bytes(
+                &format!("{registry}/{}/{version}", package_path(name)),
+                MAX_REGISTRY_DOCUMENT_BYTES,
+                "上游插件元数据",
+            )
+            .await?;
+            serde_json::from_slice::<VersionDocument>(&bytes)
+                .map_err(|_| ApiError::InvalidInput("registry 元数据格式无效".into()))?
+        };
+        if document.name != name || version != "latest" && document.version != version {
+            return Err(ApiError::InvalidInput(
+                "registry 返回的包名或版本与请求不一致".into(),
+            ));
+        }
+        let integrity = document.dist.integrity.clone().ok_or_else(|| {
             ApiError::InvalidInput("该版本没有 sha512 完整性摘要，拒绝安装".into())
         })?;
-    let tarball = artifacts::tarball(&document.dist.tarball, &integrity, "上游插件包").await?;
+        let bytes = artifacts::tarball(&document.dist.tarball, &integrity, "上游插件包").await?;
+        (bytes, integrity, None, Some(document))
+    };
+    let repository_archive = github.is_some();
 
     let _serial = TRANSLATE_LOCK.lock().await;
     // 解包任务拥有临时目录；取消等待时目录跟随阻塞任务完成清理，
@@ -501,8 +537,12 @@ pub(super) async fn prepare(
         let target = work.path().join("upstream");
         std::fs::create_dir(&target)
             .map_err(|error| ApiError::internal_assembly("创建翻译工作目录失败", error))?;
-        npm::unpack_tarball(&tarball, &target)
-            .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+        (if repository_archive {
+            npm::unpack_repository_tarball(&tarball, &target)
+        } else {
+            npm::unpack_tarball(&tarball, &target)
+        })
+        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
         Ok::<_, ApiError>((work, target))
     })
     .await
@@ -512,13 +552,38 @@ pub(super) async fn prepare(
             .map_err(|error| ApiError::InvalidInput(error.to_string()))?,
     )
     .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
-    if extracted["name"].as_str() != Some(document.name.as_str())
-        || extracted["version"].as_str() != Some(document.version.as_str())
+    let name = extracted["name"].as_str().unwrap_or_default();
+    let version = extracted["version"].as_str().unwrap_or_default();
+    validate_package_name(name)?;
+    semver::Version::parse(version)
+        .map_err(|_| ApiError::InvalidInput("上游原包缺少精确语义版本".into()))?;
+    if document
+        .as_ref()
+        .is_some_and(|d| d.name != name || d.version != version)
+        || request
+            .package
+            .as_deref()
+            .is_some_and(|expected| expected != name)
+        || repository_archive
+            && request
+                .version
+                .as_deref()
+                .is_some_and(|expected| expected != version)
     {
         return Err(ApiError::InvalidInput(
-            "发布包的名称或版本与 registry 元数据不一致".into(),
+            "原包名称或版本与来源声明不一致".into(),
         ));
     }
+    let source = PluginSource::Upstream {
+        ecosystem: ecosystem_name(&request.ecosystem).into(),
+        package: name.into(),
+        version: version.into(),
+        github: github.clone(),
+    };
+    let publisher = document
+        .and_then(|document| document.npm_user)
+        .map(|user| user.name)
+        .unwrap_or_default();
     let out_dir = work.path().join("package");
     let archive_path = work.path().join("package.zip");
     let stdout = run_translator(
@@ -529,6 +594,7 @@ pub(super) async fn prepare(
         &out_dir,
         &archive_path,
         &integrity,
+        github.as_ref(),
     )
     .await?;
     let archive = std::fs::read(&archive_path)
@@ -538,7 +604,9 @@ pub(super) async fn prepare(
     Ok(Translated {
         summary: summarize(&stdout),
         package,
-        document,
+        source,
+        integrity,
+        publisher,
     })
 }
 
@@ -550,8 +618,9 @@ async fn run_translator(
     out_dir: &FsPath,
     archive: &FsPath,
     integrity: &str,
+    github: Option<&magi_app_server_protocol::generated::PluginGithubSource>,
 ) -> Result<String, ApiError> {
-    let args = vec![
+    let mut args = vec![
         "prepare".to_string(),
         ecosystem_name(ecosystem).to_string(),
         upstream_dir.to_string_lossy().into_owned(),
@@ -562,6 +631,13 @@ async fn run_translator(
         "--archive".into(),
         archive.to_string_lossy().into_owned(),
     ];
+    if let Some(source) = github {
+        args.extend([
+            "--github".into(),
+            serde_json::to_string(source)
+                .map_err(|e| ApiError::internal_assembly("编码 GitHub 来源失败", e))?,
+        ]);
+    }
     run_toolchain(state, toolchain, &args).await
 }
 

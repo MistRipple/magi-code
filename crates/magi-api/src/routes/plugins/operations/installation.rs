@@ -70,6 +70,16 @@ fn cancelled(bundle: &str) -> InstallResult {
     }
 }
 
+fn bundle_label(input: &PluginBundleInstallRequest) -> String {
+    input.package.clone().unwrap_or_else(|| {
+        input
+            .github
+            .as_ref()
+            .map(|s| format!("github:{}", s.repository))
+            .unwrap_or_default()
+    })
+}
+
 impl PluginOperations {
     pub fn installation_instance_ended(&self, plugin: &str, lease: &str) {
         self.installations.instance_ended(plugin, lease);
@@ -85,11 +95,13 @@ impl PluginOperations {
             Some(owner.caller()),
             "install",
         )?;
-        upstream::validate_package_name(&input.package)?;
+        upstream::validate_source(input.package.as_deref(), input.github.as_ref())?;
         if !matches!(input.ecosystem, PluginEcosystem::Dsh) {
             return Err(ApiError::InvalidInput("该生态尚未提供在线安装".into()));
         }
-        upstream::registry()?;
+        if input.github.is_none() {
+            upstream::registry()?;
+        }
         if input
             .version
             .as_ref()
@@ -99,6 +111,7 @@ impl PluginOperations {
                 "npm 版本或范围必须为 1–128 个字符".into(),
             ));
         }
+        let bundle = bundle_label(&input);
         let fingerprint =
             serde_json::to_string(&input).map_err(|e| ApiError::InvalidInput(e.to_string()))?;
         let (job, fresh) =
@@ -110,9 +123,9 @@ impl PluginOperations {
             tokio::spawn(async move {
                 let prepared = tokio::select! {
                     biased;
-                    _ = job.cancelled() => { job.finish(cancelled(&input.package)); return; }
+                    _ = job.cancelled() => { job.finish(cancelled(&bundle)); return; }
                     result = tokio::time::timeout(Duration::from_secs(840), operations.prepare_bundle(&input)) => result
-                        .unwrap_or_else(|_| Err(failure(ApiError::InvalidInput("安装准备超时，尚未提交版本".into()), false, &input.package, None, None))),
+                        .unwrap_or_else(|_| Err(failure(ApiError::InvalidInput("安装准备超时，尚未提交版本".into()), false, &bundle, None, None))),
                 };
                 let translated = match prepared {
                     Ok(value) => value,
@@ -129,17 +142,17 @@ impl PluginOperations {
                 match candidate {
                     Ok(true) => {}
                     Ok(false) => {
-                        job.finish(cancelled(&input.package));
+                        job.finish(cancelled(&bundle));
                         return;
                     }
                     Err(error) => {
-                        job.finish(failure(error, false, &input.package, None, None));
+                        job.finish(failure(error, false, &bundle, None, None));
                         return;
                     }
                 }
                 // 提交开始后取消只返回 too-late；即便等待方退出，daemon 仍结算此任务。
                 let result = operations
-                    .apply_bundle(&owner, &input, translated.package)
+                    .apply_bundle(&owner, &input, translated.package, translated.source)
                     .await;
                 job.finish(result);
             });
@@ -152,6 +165,19 @@ impl PluginOperations {
         &self,
         input: &PluginBundleInstallRequest,
     ) -> Result<upstream::Translated, InstallResult> {
+        let bundle = bundle_label(input);
+        if input.github.is_some() {
+            let request = PluginUpstreamRequest {
+                ecosystem: input.ecosystem.clone(),
+                package: input.package.clone(),
+                version: input.version.clone(),
+                expected_digest: None,
+                github: input.github.clone(),
+            };
+            return upstream::prepare(self, &request, None)
+                .await
+                .map_err(|e| failure(e, false, &bundle, None, None));
+        }
         let work = async {
             let toolchain = self
                 .plugin_toolchain
@@ -162,7 +188,7 @@ impl PluginOperations {
                 toolchain,
                 &[
                     "resolve".into(),
-                    input.package.clone(),
+                    input.package.clone().unwrap(),
                     input.version.clone().unwrap_or_else(|| "latest".into()),
                 ],
             )
@@ -172,18 +198,18 @@ impl PluginOperations {
             Ok::<_, ApiError>(resolved)
         }
         .await
-        .map_err(|e| failure(e, false, &input.package, None, None))?;
+        .map_err(|e| failure(e, false, &bundle, None, None))?;
         if let Some(error) = work.get("error") {
             let error: InstallError = serde_json::from_value(error.clone()).map_err(|e| {
                 failure(
                     ApiError::InvalidInput(e.to_string()),
                     false,
-                    &input.package,
+                    &bundle,
                     None,
                     None,
                 )
             })?;
-            let mut result = cancelled(&input.package);
+            let mut result = cancelled(&bundle);
             result.application = Application::Failed;
             result.error = Some(error);
             return Err(result);
@@ -193,7 +219,7 @@ impl PluginOperations {
                 failure(
                     ApiError::internal_assembly("读取 npm 元数据失败", e),
                     false,
-                    &input.package,
+                    &bundle,
                     None,
                     None,
                 )
@@ -203,10 +229,11 @@ impl PluginOperations {
             package: input.package.clone(),
             version: Some(document.version.clone()),
             expected_digest: None,
+            github: None,
         };
         upstream::prepare(self, &request, Some(document))
             .await
-            .map_err(|e| failure(e, false, &input.package, None, None))
+            .map_err(|e| failure(e, false, &bundle, None, None))
     }
 
     async fn apply_bundle(
@@ -214,14 +241,22 @@ impl PluginOperations {
         owner: &InstallOwner,
         input: &PluginBundleInstallRequest,
         package: PluginPackage,
+        source: PluginSource,
     ) -> InstallResult {
+        let bundle = match &source {
+            PluginSource::Upstream { package, .. } => package.clone(),
+            _ => {
+                return failure(
+                    ApiError::InvalidInput("安装来源不是上游原包".into()),
+                    false,
+                    &bundle_label(input),
+                    None,
+                    None,
+                );
+            }
+        };
         let id = package.manifest().id.clone();
         let version = package.manifest().version.clone();
-        let source = PluginSource::Upstream {
-            ecosystem: "dsh".into(),
-            package: input.package.clone(),
-            version: version.clone(),
-        };
         let apply = async {
             if id == owner.plugin {
                 return Err(ApiError::Conflict(
@@ -242,7 +277,7 @@ impl PluginOperations {
         .await;
         let changed = match apply {
             Ok(changed) => changed,
-            Err(e) => return failure(e, false, &input.package, Some(version), None),
+            Err(e) => return failure(e, false, &bundle, Some(version), None),
         };
         let enable = async {
             let enabled = input.enabled.unwrap_or(true);
@@ -288,14 +323,14 @@ impl PluginOperations {
         match enable {
             Ok(()) => InstallResult {
                 application: Application::Applied,
-                bundle: Some(input.package.clone()),
+                bundle: Some(bundle),
                 version: Some(version),
                 changed: Some(changed),
                 installed: Some(true),
                 stage: None,
                 error: None,
             },
-            Err(e) => failure(e, true, &input.package, Some(version), Some(changed)),
+            Err(e) => failure(e, true, &bundle, Some(version), Some(changed)),
         }
     }
 }
@@ -378,9 +413,18 @@ mod tests {
         PluginBundleInstallRequest {
             request_id: "job".into(),
             ecosystem: PluginEcosystem::Dsh,
-            package: "sample".into(),
+            package: Some("sample".into()),
+            github: None,
             version: Some("1.0.0".into()),
             enabled: Some(enabled),
+        }
+    }
+    fn npm_source() -> PluginSource {
+        PluginSource::Upstream {
+            ecosystem: "dsh".into(),
+            package: "sample".into(),
+            version: "1.0.0".into(),
+            github: None,
         }
     }
     fn target() -> PluginPackage {
@@ -395,7 +439,9 @@ mod tests {
      {
         let (state, _root, who) = fixture(&["install", "lifecycle"]);
         let operations = PluginOperations::from_state(&state);
-        let result = operations.apply_bundle(&who, &input(true), target()).await;
+        let result = operations
+            .apply_bundle(&who, &input(true), target(), npm_source())
+            .await;
         assert_eq!(result.application, Application::Failed);
         assert_eq!(result.installed, Some(true), "{result:?}");
         assert_eq!(result.error.unwrap().code, "authorization-required");
@@ -409,12 +455,14 @@ mod tests {
      {
         let (state, _root, who) = fixture(&["install", "lifecycle", "authorize"]);
         let operations = PluginOperations::from_state(&state);
-        let result = operations.apply_bundle(&who, &input(true), target()).await;
+        let result = operations
+            .apply_bundle(&who, &input(true), target(), npm_source())
+            .await;
         assert_eq!(result.application, Application::Applied, "{result:?}");
         assert!(state.plugin_manager.lock().unwrap().state().plugins["dsh.sample"].active);
         let (state, _root2, who) = fixture(&["install"]);
         let result = PluginOperations::from_state(&state)
-            .apply_bundle(&who, &input(false), target())
+            .apply_bundle(&who, &input(false), target(), npm_source())
             .await;
         assert_eq!(result.application, Application::Applied);
         let manager = state.plugin_manager.lock().unwrap();
@@ -444,7 +492,9 @@ mod tests {
                 .begin_runtime(&who.plugin, &who.digest, "replacement")
                 .unwrap();
         }
-        let result = operations.apply_bundle(&who, &input(false), target()).await;
+        let result = operations
+            .apply_bundle(&who, &input(false), target(), npm_source())
+            .await;
         assert_eq!(result.application, Application::Failed);
         assert_ne!(result.installed, Some(true));
         assert!(

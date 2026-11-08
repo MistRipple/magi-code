@@ -93,3 +93,10 @@ false，只有解析到实际 Token 数字段时才变为 true；缺失或空 us
 沿同一目录的就绪、CAS、实例租约和撤销规则，不新增 HTTP 目录或本地设置写入。
 
 `sessionWrite:["context"|"wake"]`、`PluginSessionMessage*` 和队列的可选 `pluginMessage` 是会话业务结果的增量合同，协商特性为 `session.messages`，不新增 App Server 提交方法。旧插件未声明此授权不能调用；DSH 重新安装或在线更新时展示新增权限并重新授权。插件消息复用 SessionInput 与 canonical 事务，UI 不能把它解释为用户输入；旧数据无该元数据时保留原语义。状态布局推进到 20，阻止不认识不唤醒上下文的旧 daemon 消费新版队列。
+
+`PluginGithubSource` 与安装请求、预览、来源投影的 `github` 为 GitHub 原包来源增量合同。
+省略 `github` 时 `package` 仍为必需的 npm 包名；指定仓库时 `package` 可选，提供即核对
+原包名称。`reference` 保留用户选择的分支／标签，`commit` 是解析后固定的提交。确认安装
+必须携带预览提交和摘要，不能重新解析浮动分支。来源和提交保存在同一 `PluginSource::Upstream`
+安装事实内；不同仓库和 npm 同名包不能互相冒用升级。管理插件仍使用同一安装任务、授权
+和中断回执，不新增包管理执行器、安装状态文件或 App Server 方法。

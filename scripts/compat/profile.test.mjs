@@ -13,6 +13,23 @@ import { profileSpawn } from './runtime/profile.mjs';
 import { once } from 'node:events';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
+test('GitHub 原包目录与 profile 共用 daemon 来源，导出保留分支，版本仍来自不可变原包', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'magi-github-profile-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const plugin = { manifest: { id: 'dsh.github', name: 'Original', description: '' }, digest: 'current', enabled: true, active: true,
+    source: { kind: 'upstream', location: 'dsh:@scope/github@1.2.0', github: { repository: 'owner/repo', reference: 'main', commit: 'a'.repeat(40) } },
+    upstreamManifest: { name: '@scope/github', version: '1.2.0', engines: { dsh: '^0.2' } } };
+  const api = { plugins: { list: async () => ({ plugins: [plugin] }) } };
+  const off = configureProfile(api, { home }); t.after(off);
+  await withProfile(async () => {
+    assert.equal(JSON.parse(fs.readFileSync(join(profilePath(), 'package.json'), 'utf8')).dependencies['@scope/github'], 'github:owner/repo#main');
+    assert.equal(JSON.parse(fs.readFileSync(join(profilePath(), 'node_modules/@scope/github/package.json'), 'utf8')).version, '1.2.0');
+    const [bundle] = await createPluginManager(api).listBundles();
+    assert.equal(bundle.source, 'github:owner/repo#main'); assert.equal(bundle.version, '1.2.0');
+    assert.equal(loaderEntries()[1].options.name, '@scope/github');
+  });
+});
+
 test('profile 重载串行提交真实启停意图、等待 daemon 收敛；失败、嵌套、取消与过期调用不冒充成功', async t => {
   const home = await mkdtemp(join(tmpdir(), 'magi-profile-reconcile-'));
   t.after(() => rm(home, { recursive: true, force: true }));

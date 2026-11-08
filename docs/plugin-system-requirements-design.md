@@ -289,6 +289,10 @@
 
 【现状·已运行验证】用户安装的是上游官方发布的 npm 包本身，不是 Magi 维护的另一份翻译副本。安装在 daemon 内分四步：向 npm registry 取包元数据并下载 tarball；核对 `dist.integrity`（sha512）并安全解包（拒绝路径穿越、符号链接、特殊文件，数量与体积有界，不运行任何脚本）；调用随产品发行的翻译器（随包 Node 加 `compat/cli.mjs prepare`）生成标准 Magi 包；把该包交给与其他来源完全相同的预览、授权和生命周期。翻译是确定的：同一上游版本与同一兼容运行时得到同一摘要，所以预览确认的摘要在安装时重新翻译后核对，服务端不缓存产物，也不维护第二份目录。接口为 `GET /api/plugins/upstream?q=`、`POST /api/plugins/upstream/preview`、`POST /api/plugins/upstream/install`，来源标记为 `upstream`（`生态:包名@精确版本`）。
 
+【现状·实现】来源获取已扩展到公开 GitHub 仓库。`github:owner/repository#reference` 与 GitHub HTTPS 地址先解析为固定提交，再经公共有界下载、归档解包和同一翻译入口准备；标准 PAX 提交元数据不生成文件，符号链接与特殊文件仍拒绝。原包名称和语义版本来自仓库的 `package.json`，不伪造 npm 发布元数据。确认安装同时绑定固定提交、原始引用及翻译摘要；仓库必须已携带可运行的 JavaScript 入口，不执行仓库构建、安装脚本或 Git hooks。
+
+【现状·实现】仓库、引用和提交增量保存在 daemon 原 `PluginSource::Upstream` 内，没有第二份安装目录。DSH 管理器、profile 快照及状态观察共用一个来源投影，保留真实包名／版本和 GitHub 来源。原生插件详情提供沿原引用的在线检查，搜索到的 npm 同名包不能改绑更新来源；同一仓库的提交替换仍走原排空、摘要授权和恢复事务。窄屏插件列表与详情共用剩余高度，分别滚动，预览确认和生命周期操作固定在详情底部。当前来源范围为公开 GitHub，其他 Git 服务、私有仓库、子模块与需构建的源码仓库未验收。
+
 【目标】`dsh-connect-workbuddy` 只是第一个验收样本，翻译器内不得出现针对它的分支或补丁；样本之外必须有独立夹具覆盖同一机制。
 
 【现状·已运行验证】翻译器按工厂注册（`scripts/compat/core/registry.mjs`）。共享层负责产物扫描、能力报告、清单生成、可复现打包；生态层（`dsh/`、`pi/`）只提供识别、能力对照表和兼容层。上游的 `./client` 界面脚本原样放入 `ui/`，由随产品预构建的页面运行时提供宿主服务；上游没有界面时，仍由同一页面宿主加载通用设置组件；不再生成独立 HTML 表单或另一份视图桥。
@@ -464,7 +468,7 @@
 
 - 完整业务覆盖率仍未达到可证明的 95%／100%。逐插件补齐成功结果、取消、配置持久化、在线更新、失败恢复与停用／重启验收；安装、进程 running、页面有内容和路由 smoke 各自只证明对应阶段。
 - Mgr 0.2.12 原页面点击更新不能显示确认框：宿主漏掉间接取用的公共组件库已修正；`profile-sdk-final/ui-modules.json` 确认官方 Modal 为函数、Button 为 React forwardRef 对象，原包仍按 `typeof Button === "function"` 判断而跳过确认。后台更新路由通过不能作为此页面流程通过；保留原页面与官方组件，不增加按包名改写或组件伪装。初始失败证据在 `target/plugin-acceptance/profile-product-before/` 与 `profile-product-confirm/`，补齐 SDK 后的失败在 `profile-sdk-final/`；本轮用最新随包组件重新运行同一 0.2.12 原包，仍复现，见 `profile-product-current/ui-modules.json`。这项仍须解决，不能计为完整支持。
-- Market／Share 的 Git 来源、上游主动移除式替换及安装提交各阶段的崩溃恢复仍未完成。安装任务现持久保存请求、提交边界和回执，重启不自动重放，候选摘要由 PluginManager 核对；验收证据见第 12 节。尚不能据部分断进程验证宣称覆盖所有掉电阶段或外部副作用 exactly-once。
+- Market／Share 的 GitHub 路径已接入并按第 12 节逐项验收；其他 Git 来源、上游主动移除式替换及安装提交各阶段的崩溃恢复仍未完成。安装任务现持久保存请求、提交边界和回执，重启不自动重放，候选摘要由 PluginManager 核对；验收证据见第 12 节。尚不能据部分断进程验证宣称覆盖所有掉电阶段或外部副作用 exactly-once。
 - Debugging 的诊断／重启业务、Health 的完整修复流程，以及未列为实测通过的其他原包分支仍待验证。技能可用不等于插件全部诊断业务可用。
 - 会话消息已接通当前主会话的工具／命令文本交付；跨会话与后台消息尚无产品入口。session/event、sessionProjections、完整 Agent 对象、provider 技能与作用域等仍按实际能力门槛处理，不能返回假对象或空结果冒充完成。
 - Windows、干净系统正式安装包、Android／iOS 真机触摸、屏幕录制权限引导和长期负载仍需各自验收。390px Electron 视口模拟不代表手机真机通过。
@@ -476,10 +480,13 @@
 
 | 最近核对范围 | 入口 | 结果与边界 |
 | --- | --- | --- |
-| 既有翻译运行时回归，不计本轮复跑 | `npm run test:compat` | 102/102；新增同步消息真实回执、失败不提交、来源校验、失效引用、工具与命令共享消息端口；其他原有契约保持通过。不能据测试数量推导生态支持率 |
-| 本轮安装恢复专项 | `test:electron-plugin-install-recovery` | 新构建的 macOS arm64 目录发行包、状态布局 21，**10/10**；`target/plugin-acceptance/install-recovery-final/`。实际 SIGKILL 验证解析中、版本已提交但 Node 未就绪、完成回执三个断点；同请求不重新下载、不替换版本，显式新请求收敛，恢复后的原包业务命令实际返回。私有 registry 仅提供测试原包，不计入社区样本覆盖率；尚未覆盖所有掉电、磁盘与替换阶段 |
-| 本轮真实原包管理回归 | `test:electron-dsh-management` | 新构建目录包中的 Share 0.2.5、Upgrader 1.8.0 和 Release Probe 在线原包，**16/16**；`target/plugin-acceptance/install-journal-community/`。原页面导入、安装与启停、委托授权、在线升级、取消／重试、摘要拒绝、卸载和运行实例保留通过；不代表 Git 来源或全部社区业务完成 |
-| 本轮安装恢复 Rust 回归 | `magi-api`、`magi-daemon` | 安装任务 10 项、管理操作 12 项、状态布局写屏障 1 项通过；包含请求内容冲突、跨插件身份、撤权／实例结束、取消清理、写盘失败与损坏日志保留。daemon check、协议生成一致、Electron 单一发行边界和目录包解包自检通过 |
+| 本轮翻译运行时回归 | `npm run test:compat` | 103/103；包括 GitHub 来源解析、目录与 profile 来源一致；新增同步消息真实回执、失败不提交、来源校验、失效引用、工具与命令共享消息端口；其他原有契约保持通过。不能据测试数量推导生态支持率 |
+| 本轮 npm／GitHub 原包管理 | `test:electron-dsh-management` | 新构建 macOS arm64 目录包 **30/30**；`target/plugin-acceptance/github-product-final/`。Share 0.2.5 原页面实际导入 GitHub Health 3.0.5，保留来源并在线升至 3.0.6；固定提交预览、摘要授权、版本失败保留运行实例、重启和卸载通过。Market 1.2.2 原包 Node 辅助进程实际从 GitHub 安装、HTTPS Git 更新与失败保留通过；Market Git 的整页按钮未覆盖。原 npm Share／Upgrader／Release Probe 管理流程同批通过。390px 确认固定可达、无横向溢出，桌面审计 `cut=0`；不代表 Health 全部修复业务、其他 Git 服务或手机真机 |
+| 本轮目录包中断恢复 | `test:electron-plugin-install-recovery` | 新构建 macOS arm64 目录包 **10/10**；`target/plugin-acceptance/github-install-recovery-final/`。同原解析、提交后等待、完成回执三个断进程位置，npm 机制夹具实际业务恢复；不据此宣称所有 Git 下载与掉电阶段均已验证 |
+| 本轮来源、安装与界面检查 | Rust、Web、协议、发行边界 | 插件 API 专项 48 项、安装恢复 11 项；插件领域与生命周期专项 42 项、归档专项 7 项（范围重叠，不相加）；Web check、i18n、插件列表与布局回归、协议一致、Electron 单一发行边界及目录包解包自检通过。布局旧断言误禁插件页只读 `shellUi.settingsOpen`，已收敛为禁止 App 拥有或写入设置层 |
+| 既有安装恢复专项，不计本轮复跑 | `test:electron-plugin-install-recovery` | 新构建的 macOS arm64 目录发行包、状态布局 21，**10/10**；`target/plugin-acceptance/install-recovery-final/`。实际 SIGKILL 验证解析中、版本已提交但 Node 未就绪、完成回执三个断点；同请求不重新下载、不替换版本，显式新请求收敛，恢复后的原包业务命令实际返回。私有 registry 仅提供测试原包，不计入社区样本覆盖率；尚未覆盖所有掉电、磁盘与替换阶段 |
+| 既有真实原包管理回归，不计本轮复跑 | `test:electron-dsh-management` | 新构建目录包中的 Share 0.2.5、Upgrader 1.8.0 和 Release Probe 在线原包，**16/16**；`target/plugin-acceptance/install-journal-community/`。原页面导入、安装与启停、委托授权、在线升级、取消／重试、摘要拒绝、卸载和运行实例保留通过；不代表 Git 来源或全部社区业务完成 |
+| 既有安装恢复 Rust 回归，不计本轮复跑 | `magi-api`、`magi-daemon` | 安装任务 10 项、管理操作 12 项、状态布局写屏障 1 项通过；包含请求内容冲突、跨插件身份、撤权／实例结束、取消清理、写盘失败与损坏日志保留。daemon check、协议生成一致、Electron 单一发行边界和目录包解包自检通过 |
 | 既有会话消息 Rust 回归，不计本轮复跑 | `magi-api`、`magi-conversation-runtime`、`magi-plugin-system`、`magi-daemon` | 原生队列与消费相关 20 项、dispatch 原有 20 项、新增上下文原子领取与来源重建 1 项、独立消息权限 1 项、状态布局写屏障 1 项通过；daemon check 和修改 Rust 文件格式检查通过 |
 | 既有 Web 与会话消息检查，不计本轮复跑 | Web、协议、目录发行包 | Web check 0 错误 0 警告；协议生成一致；canonical 历史投影和 composer 定向检查通过。macOS 目录包重新构建与解包自检通过；没有 Desktop Main 代码变更，未复跑其独立测试 |
 | 既有 Rust 业务专项，不计本轮复跑 | 运行目录、技能与宿主 | 运行目录 7、`skill_apply` 7、技能加载 7、SkillRuntime 20、消息名称接纳 1、宿主单元 15、真实 Node 集成 25 项通过 |
@@ -492,7 +499,7 @@
 | 既有专项，不计本轮复跑 | `test:electron-appshot` | 0.4.2 原包、13 项，真实 macOS 原生截图、后台附件、草稿挂载及重启恢复；`target/plugin-acceptance/appshot/`，不代表其他平台或所有时序分支 |
 | 既有本地纵向套件，不计本轮复跑 | `test:local-plugins`、`test:local-plugins-ui` | 真实 daemon／Node 的安装、授权、服务、调度、回收与界面流程；设置页现已移除计划表单，旧表单截图不是当前 UI 合同 |
 
-验收器仅在发送按钮真实存在且启用时操作；进程重启前释放旧文档，重新启动后等待外观和工作台初始化，不把 CDP 提前导航造成的网络中止混入业务结果。原包组件、错误断言和成功门槛保持实际行为，没有过滤运行异常或添加整轮自动重试。当前目录包独立完整通过 107/107，不拼接中间通过项。消息验收早期工具端口装配遗漏及夹具错误保留于 `session-messages-*` 各失败目录；当前通过证据仅为 `session-messages-product-final/`。执行上下文验收早期参数、协议方法与夹具模型触发错误，以及目录失效应由异步 canonical 终态判定的修正记录保留于 `execution-product/`、`execution-product-final/`、`execution-product-verified/`、`execution-context-final/`、`execution-product-complete/`；此前页面失败仍保留于各自证据目录。
+验收器仅在发送按钮真实存在且启用时操作；进程重启前释放旧文档，重新启动后等待外观和工作台初始化，不把 CDP 提前导航造成的网络中止混入业务结果。原包组件、错误断言和成功门槛保持实际行为，没有过滤运行异常或添加整轮自动重试。GitHub 管理早期 Share 夹具缺来源类型、PAX 元数据拒绝和窄屏确认不可达分别保留于 `github-product-initial/`、`github-product-source/` 和 `github-product-archive/`；当前整套通过证据为 `github-product-final/`。会话消息专项的既有目录包独立完整通过 107/107，不拼接中间通过项；本轮 GitHub 管理与中断恢复按上表独立记录。消息验收早期工具端口装配遗漏及夹具错误保留于 `session-messages-*` 各失败目录；当前通过证据仅为 `session-messages-product-final/`。执行上下文验收早期参数、协议方法与夹具模型触发错误，以及目录失效应由异步 canonical 终态判定的修正记录保留于 `execution-product/`、`execution-product-final/`、`execution-product-verified/`、`execution-context-final/`、`execution-product-complete/`；此前页面失败仍保留于各自证据目录。
 
 ### 12.2 未运行与不得推导的结论
 

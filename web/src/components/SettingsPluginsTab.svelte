@@ -27,7 +27,7 @@
   import { openSettings } from '../stores/shell-ui.svelte';
   import { buildStoreItems, filterStoreItems, paginate, storeGroup, type StoreFilter, type StoreGroup, type StoreItem } from '../lib/plugin-store';
   import { pluginRegistryRevision } from '../stores/plugin-registry.svelte';
-  import type { PluginCandidatePreview, PluginCenterProjection, PluginList, PluginManifest, PluginPermission, PluginUpstreamEntry, PluginUpstreamPreview, PluginUpstreamProjection } from '../shared/app-server-protocol.generated';
+  import type { PluginCandidatePreview, PluginEcosystem, PluginUpstreamRequest, PluginCenterProjection, PluginList, PluginManifest, PluginPermission, PluginUpstreamPreview, PluginUpstreamProjection } from '../shared/app-server-protocol.generated';
 
   let list = $state<PluginList | null>(null);
   let address = $state('');
@@ -50,7 +50,7 @@
   /** 已通过准备阶段、等待用户确认的候选包；确认前不写入任何安装状态。 */
   type Staged =
     | { kind: 'file'; candidate: PluginCandidate; preview: PluginCandidatePreview }
-    | { kind: 'upstream'; entry: PluginUpstreamEntry; preview: PluginUpstreamPreview };
+    | { kind: 'upstream'; ecosystem: PluginEcosystem; preview: PluginUpstreamPreview };
   let staged = $state<Staged | null>(null);
   let upstream = $state<PluginUpstreamProjection | null>(null);
   let upstreamSeq = 0;
@@ -193,8 +193,8 @@
     }
   }
 
-  async function stageUpstream(entry: PluginUpstreamEntry): Promise<void> {
-    await prepareCandidate(async (signal) => ({ kind: 'upstream', entry, preview: await previewUpstreamPlugin(entry, signal) }));
+  async function stageUpstream(entry: PluginUpstreamRequest): Promise<void> {
+    await prepareCandidate(async (signal) => ({ kind: 'upstream', ecosystem: entry.ecosystem, preview: await previewUpstreamPlugin(entry, signal) }));
   }
 
   async function stage(candidate: PluginCandidate): Promise<void> {
@@ -209,14 +209,26 @@
   async function stageAddress(): Promise<void> {
     const source = address.trim();
     if (!source) return;
-    await stage({ source: source.includes(':') ? source : `address:${source}` });
+    if (source.startsWith('github:') || /^(?:git\+)?https:\/\/github\.com\//i.test(source)) {
+      await prepareCandidate(async signal => {
+        let locator = source.slice(7);
+        if (!source.startsWith('github:')) {
+          const url = new URL(source.replace(/^git\+/, ''));
+          if (url.username || url.password || url.search || url.port) throw new Error(i18n.t('settings.plugins.github.invalidAddress'));
+          locator = url.pathname.slice(1) + url.hash;
+        }
+        const [repository, reference, ...extra] = locator.split('#');
+        if (extra.length) throw new Error(i18n.t('settings.plugins.github.invalidAddress'));
+        return { kind: 'upstream', ecosystem: 'dsh', preview: await previewUpstreamPlugin({ ecosystem: 'dsh', github: { repository, ...(reference === undefined ? {} : { reference }) } }, signal) };
+      });
+    } else await stage({ source: source.includes(':') ? source : `address:${source}` });
   }
 
   async function confirmStaged(): Promise<void> {
     const pending = staged;
     if (!pending) return;
     await run(async () => {
-      if (pending.kind === 'upstream') await installUpstreamPlugin(pending.preview, pending.entry.ecosystem);
+      if (pending.kind === 'upstream') await installUpstreamPlugin(pending.preview, pending.ecosystem);
       else await applyPluginCandidate(pending.candidate, pending.preview);
       staged = null;
       address = '';
@@ -297,7 +309,10 @@
 
   /** 升级：插件中心条目直接安装；上游条目先翻译预览，由用户确认后安装。 */
   async function updateFromCenter(item: StoreItem): Promise<void> {
-    if (item.catalog && item.catalog.state === 'updatable') await run(() => installFromPluginCenter(item.catalog!));
+    if (item.installed?.source.github) {
+      const { repository, reference } = item.installed.source.github;
+      await stageUpstream({ ecosystem: 'dsh', github: { repository, reference } });
+    } else if (item.catalog && item.catalog.state === 'updatable') await run(() => installFromPluginCenter(item.catalog!));
     else if (item.upstream) await stageUpstream(item.upstream);
   }
 
@@ -525,9 +540,9 @@
               <span class="settings-row-title">{i18n.t('settings.plugins.upstream.translation')}</span>
               <div class="settings-row-desc">
                 {i18n.t('settings.plugins.upstream.publisher')}：{translated.publisher || i18n.t('common.notProvided')}
-                · {translated.official ? i18n.t('settings.plugins.upstream.official') : i18n.t('settings.plugins.upstream.thirdParty')}
+                {translated.official ? i18n.t('settings.plugins.upstream.official') : i18n.t('settings.plugins.upstream.thirdParty')}
               </div>
-              <div class="settings-row-desc">{i18n.t('settings.plugins.upstream.notice')}</div>
+              <div class="settings-row-desc">{i18n.t(translated.github ? 'settings.plugins.github.notice' : 'settings.plugins.upstream.notice')}</div>
               {#each [['tools', translated.translation.tools], ['commands', translated.translation.commands], ['modelSources', translated.translation.modelSources], ['unmounted', translated.translation.unmountedSlots]] as [key, values] (key)}
                 <div class="settings-row-desc">
                   <span class="settings-row-title">{i18n.t(`settings.plugins.upstream.${key}`)}</span>
@@ -555,6 +570,7 @@
               {#if translated.translation.omittedFiles > 0}
                 <div class="settings-row-desc">{i18n.t('settings.plugins.upstream.omitted', { count: translated.translation.omittedFiles })}</div>
               {/if}
+              {#if translated.github}<div class="settings-row-desc settings-mono" data-testid="plugin-candidate-github" dir="ltr">github:{translated.github.repository}#{translated.github.commit}</div>{/if}
               <div class="settings-row-desc">{i18n.t('settings.plugins.upstream.integrity')} <span class="settings-mono" title={translated.integrity}>{translated.integrity.slice(0, 24)}</span></div>
             </div>
           {/if}
@@ -703,9 +719,9 @@
   .store-pager-actions { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
   .store-detail { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
   @container settings-content (max-width: 720px) {
-    .store { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto; flex: 1 0 auto; }
-    .store-list { border-right: 0; border-bottom: var(--magi-hairline) solid var(--border); max-height: 40dvh; min-height: 180px; }
-    .store-detail { height: 65dvh; min-height: 360px; }
+    .store-section { flex: 1 1 0; }
+    .store { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(88px, .4fr) minmax(0, 1fr); }
+    .store-list { border-right: 0; border-bottom: var(--magi-hairline) solid var(--border); }
   }
   .plugin-perm { display: grid; gap: var(--space-2); }
   .plugin-link { justify-self: start; align-self: flex-start; padding: 0; border: 0; background: transparent; color: var(--foreground-muted); font-size: var(--text-xs); cursor: pointer; }

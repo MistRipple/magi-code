@@ -2785,6 +2785,9 @@
         },
         "location": {
           "type": "string"
+        },
+        "github": {
+          "$ref": "#/$defs/PluginGithubSource"
         }
       }
     },
@@ -6121,8 +6124,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "ecosystem",
-        "package"
+        "ecosystem"
       ],
       "properties": {
         "ecosystem": {
@@ -6131,7 +6133,8 @@
         "package": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 214
+          "maxLength": 214,
+          "description": "npm 包名；GitHub 来源可省略，提供时核对原包名称。"
         },
         "version": {
           "type": [
@@ -6148,8 +6151,24 @@
           ],
           "x-rust-default": true,
           "description": "预览得到的翻译包摘要；安装只接受摘要完全一致的翻译结果。"
+        },
+        "github": {
+          "$ref": "#/$defs/PluginGithubSource",
+          "description": "GitHub 仓库来源；package 可选并用于核对原包名称。确认安装须携带预览固定的 commit。"
         }
-      }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "package"
+          ]
+        },
+        {
+          "required": [
+            "github"
+          ]
+        }
+      ]
     },
     "PluginTranslationNote": {
       "type": "object",
@@ -6253,6 +6272,9 @@
         },
         "translation": {
           "$ref": "#/$defs/PluginTranslationSummary"
+        },
+        "github": {
+          "$ref": "#/$defs/PluginGithubSource"
         }
       }
     },
@@ -6804,7 +6826,6 @@
       "additionalProperties": false,
       "required": [
         "ecosystem",
-        "package",
         "requestId"
       ],
       "properties": {
@@ -6814,7 +6835,8 @@
         "package": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 214
+          "maxLength": 214,
+          "description": "npm 包名；GitHub 来源可省略，提供时核对原包名称。"
         },
         "requestId": {
           "type": "string",
@@ -6836,8 +6858,24 @@
             "null"
           ],
           "x-rust-default": true
+        },
+        "github": {
+          "$ref": "#/$defs/PluginGithubSource",
+          "description": "GitHub 仓库来源；package 可选并用于核对原包名称。确认安装须携带预览固定的 commit。"
         }
-      }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "package"
+          ]
+        },
+        {
+          "required": [
+            "github"
+          ]
+        }
+      ]
     },
     "PluginBundleInstallCancelRequest": {
       "type": "object",
@@ -7099,6 +7137,39 @@
         "consumed",
         "cancelled"
       ]
+    },
+    "PluginGithubSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository"
+      ],
+      "description": "GitHub 原包来源；reference 为分支、标签或提交，commit 为 daemon 解析后固定的 40 位提交。",
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 201,
+          "description": "owner/repository，不包含 URL、凭据或路径。"
+        },
+        "reference": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128,
+          "x-rust-default": true
+        },
+        "commit": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 40,
+          "maxLength": 40,
+          "x-rust-default": true
+        }
+      }
     }
   }
 }

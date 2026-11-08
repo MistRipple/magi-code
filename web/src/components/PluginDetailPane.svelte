@@ -136,7 +136,7 @@
     <div><dt>{i18n.t('settings.plugins.detail.version')}</dt><dd>v{item.version}{#if item.updatable} → v{item.catalog?.version ?? item.upstream?.version}{/if}</dd></div>
       <div data-testid="plugin-source" class:pane-warn={plugin?.source.kind === 'address' || plugin?.source.kind === 'local'}>
         <dt>{i18n.t('settings.plugins.detail.source')}</dt>
-        <dd>{#if plugin}{sourceLabel(plugin)} <span class="settings-mono" title={plugin.source.location}>{plugin.source.location}</span>{:else}{i18n.t(item.catalog ? 'settings.plugins.source.center' : item.upstream ? 'settings.plugins.source.upstream' : 'common.notProvided')}{/if}</dd>
+        <dd>{#if plugin}{@const location = plugin.source.github ? `github:${plugin.source.github.repository}#${plugin.source.github.commit}` : plugin.source.location}{sourceLabel(plugin)} <span class="settings-mono" title={location} dir="ltr">{location}</span>{:else}{i18n.t(item.catalog ? 'settings.plugins.source.center' : item.upstream ? 'settings.plugins.source.upstream' : 'common.notProvided')}{/if}</dd>
       </div>
       <div><dt>{i18n.t('settings.plugins.detail.digest')}</dt><dd class="settings-mono" title={plugin?.digest}>{plugin?.digest.slice(0, 16) || i18n.t('common.notProvided')}</dd></div>
       <div><dt>{i18n.t('settings.plugins.detail.size')}</dt><dd>{!plugin && item.catalog ? `${Math.round(item.catalog.size / 1024)} KB` : i18n.t('common.notProvided')}</dd></div>
@@ -197,10 +197,10 @@
   <div class="settings-card-foot pane-actions" data-testid="plugin-detail-actions">
     {#if previewing}<button class="btn btn--sm btn--secondary" data-testid="plugin-cancel-preview" onclick={onCancelPreview}>{i18n.t('common.cancel')}</button>{/if}
     {#if plugin}
-      {#if item.updatable && (item.catalog || item.upstream)}
+      {#if plugin.source.github || item.updatable && (item.catalog || item.upstream)}
         <button class="btn btn--lg btn--primary" data-testid="plugin-detail-update" onclick={onUpdateFromCenter} disabled={busy}>
           <Icon name="download" size={13} />
-          <span>{i18n.t('settings.plugins.center.update', { from: plugin.manifest.version })}</span>
+          <span>{plugin.source.github ? i18n.t('settings.plugins.github.checkUpdate') : i18n.t('settings.plugins.center.update', { from: plugin.manifest.version })}</span>
         </button>
       {/if}
       {#if settingsTab}

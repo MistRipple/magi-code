@@ -634,3 +634,9 @@ node scripts/pack-plugin.mjs <插件目录> <输出.zip>
 管理插件调用 `api.plugins.installBundle({ecosystem:'dsh', package, version, requestId, enabled})` 时，requestId 应标识一次用户操作并在重连／应用重启后保持稳定。同插件、同包摘要、同输入的重发领取原回执；新宿主代次不会使同一操作重新执行。不能修改原 requestId 的输入，也不能用随机新身份自动重试未知结果。
 
 `installation-interrupted` 表示应用退出前任务未完成结算。`installed:true` 仅证明候选摘要已经安装，不能视作授权或运行成功；提示用户到 Magi 插件管理检查状态，确认后再用新 requestId 显式重试。恢复不自动下载、安装或代授权。原回执最多保留 256 项、至少保留至请求创建后七天；容量不足时明确失败。完整提交边界、取消及损坏日志处理见[扩展协议](extension-protocol-v1.md)。
+
+GitHub 来源插件经相同的在线安装、授权和生命周期管理：支持 `github:owner/repository#reference`
+及公开 GitHub HTTPS 仓库地址，安装准备将引用固定到提交。Magi 原生确认流程须携带预览提交与
+包摘要，管理插件的 `installBundle` 仍由同一 daemon 安装任务执行。仓库必须包含可直接运行的
+JavaScript 发布入口；安装不运行仓库构建、npm lifecycle 或 Git hooks。原包名称与语义版本
+仍来自 `package.json`，来源目录同时保留仓库、原始引用和固定提交；仅同一仓库可以在线更新。

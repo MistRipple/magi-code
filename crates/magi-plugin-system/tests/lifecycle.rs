@@ -65,6 +65,7 @@ fn upstream_metadata_is_read_from_the_installed_archive_only_on_request() {
                 ecosystem: "dsh".into(),
                 package: "@scope/upstream".into(),
                 version: "1.0.0".into(),
+                github: None,
             },
         )
         .unwrap();
@@ -120,10 +121,68 @@ fn upstream_metadata_is_read_from_the_installed_archive_only_on_request() {
                 ecosystem: "dsh".into(),
                 package: "different".into(),
                 version: "1.0.0".into(),
+                github: None,
             },
         )
         .unwrap();
     assert!(mismatched.projection_with_upstream_metadata(true).is_err());
+}
+
+#[test]
+fn repository_upgrades_keep_source_identity_and_commit_in_the_same_installation_fact() {
+    use magi_app_server_protocol::generated::PluginGithubSource;
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    let package = package(false);
+    let source = |repository: &str, commit: char| PluginSource::Upstream {
+        ecosystem: "dsh".into(),
+        package: "example".into(),
+        version: "1.0.0".into(),
+        github: Some(PluginGithubSource {
+            repository: repository.into(),
+            reference: Some("main".into()),
+            commit: Some(commit.to_string().repeat(40)),
+        }),
+    };
+    manager
+        .install(&package, source("owner/repo", 'a'))
+        .unwrap();
+    assert!(
+        manager
+            .preview(&package, &source("attacker/repo", 'a'))
+            .is_err()
+    );
+    assert!(
+        manager
+            .preview(
+                &package,
+                &PluginSource::Upstream {
+                    ecosystem: "dsh".into(),
+                    package: "example".into(),
+                    version: "1.0.0".into(),
+                    github: None
+                }
+            )
+            .is_err()
+    );
+    assert!(
+        manager
+            .preview(&package, &source("owner/repo", 'b'))
+            .is_ok()
+    );
+    drop(manager);
+    let manager = PluginManager::open(root.path()).unwrap();
+    let projection = manager.projection().unwrap();
+    assert_eq!(
+        projection.plugins[0]
+            .source
+            .github
+            .as_ref()
+            .unwrap()
+            .commit
+            .as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
 }
 
 #[test]

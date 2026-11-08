@@ -865,7 +865,7 @@
   "settings.plugins.openSettings": "打开设置",
   "settings.plugins.upgradeFromFile": "从文件升级",
   "settings.plugins.chooseZip": "选择 ZIP…",
-  "settings.plugins.addressPlaceholder": "远程插件包地址（HTTP(S)），本地 ZIP 请使用下方选择文件",
+  "settings.plugins.addressPlaceholder": "远程 ZIP 地址或 github:owner/repository#分支",
   "settings.plugins.installAddress": "安装",
   "settings.plugins.empty": "尚未安装插件。",
   "settings.plugins.activate": "授权并激活",
@@ -3250,5 +3250,8 @@
   "settings.plugins.permission.sessionWrite.wake": "会话消息：向当前调用所属会话发送文本并可启动模型回复，产生模型用量",
   "messageItem.pluginMessage": "来自插件 {name}",
   "input.queue.pluginContext": "{name}，等待下一次请求",
-  "input.queue.pluginMessage": "来自 {name}"
+  "input.queue.pluginMessage": "来自 {name}",
+  "settings.plugins.github.invalidAddress": "请输入有效的 GitHub 仓库地址",
+  "settings.plugins.github.checkUpdate": "检查在线更新",
+  "settings.plugins.github.notice": "从 GitHub 固定提交安装原包。插件以你的系统权限运行，安装前请核对来源和权限。"
 }

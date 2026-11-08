@@ -725,6 +725,7 @@ mod tests {
             ecosystem: "pi".into(),
             package: "foreign".into(),
             version: "1.0.0".into(),
+            github: None,
         };
         assert!(
             operations

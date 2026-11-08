@@ -33,6 +33,7 @@ impl PluginManager {
             ecosystem,
             package: name,
             version,
+            github,
         } = source
         else {
             return Ok(());
@@ -52,6 +53,8 @@ impl PluginManager {
             || report["upstream"]["version"] != *version
             || proof["runtimeVersion"] != runtime_version
             || proof["runtimeId"] != runtime_id
+            || report["upstream"]["github"]
+                != serde_json::to_value(github).map_err(|_| invalid("GitHub 来源证据无效"))?
         {
             return Err(PluginError::Conflict(
                 "DSH 译包的兼容运行时或来源已变化，请重新预览".into(),
@@ -251,6 +254,7 @@ mod tests {
             ecosystem: "dsh".into(),
             package: "example".into(),
             version: "1.2.3".into(),
+            github: None,
         };
         manager
             .ensure_dsh_candidate_compatible(&package, &source, "0.2.2-rc.1", RUNTIME)
@@ -269,6 +273,7 @@ mod tests {
             ecosystem: "dsh".into(),
             package: "another".into(),
             version: "1.2.3".into(),
+            github: None,
         };
         assert!(
             manager

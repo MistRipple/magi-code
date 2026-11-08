@@ -42,6 +42,15 @@ pub fn verify_integrity(tarball: &[u8], integrity: &str) -> Result<(), PluginErr
 
 /// 解包 npm tarball 到 `target`（必须是已存在的空目录）。tarball 内容在 `package/` 前缀下。
 pub fn unpack_tarball(tarball: &[u8], target: &Path) -> Result<(), PluginError> {
+    unpack(tarball, target, Some("package".into()))
+}
+
+/// 仓库归档与 npm 使用同一解包边界；仓库根名由首条文件确定，全包只能有一个根。
+pub fn unpack_repository_tarball(tarball: &[u8], target: &Path) -> Result<(), PluginError> {
+    unpack(tarball, target, None)
+}
+
+fn unpack(tarball: &[u8], target: &Path, mut root: Option<String>) -> Result<(), PluginError> {
     if tarball.is_empty() || tarball.len() > MAX_TARBALL_BYTES {
         return Err(invalid("上游 tarball 大小超限"));
     }
@@ -58,6 +67,17 @@ pub fn unpack_tarball(tarball: &[u8], target: &Path) -> Result<(), PluginError> 
             return Err(invalid("上游 tarball 条目过多"));
         }
         let kind = entry.header().entry_type();
+        // GitHub/git archive 带有全局 PAX comment（提交身份），它只是归档元数据，
+        // 不生成文件，也不改变已校验的路径。tar crate 已处理本地 PAX 路径，
+        // 实际文件仍逐项经过下方同一准入与配额；不把链接或设备当作元数据跳过。
+        if kind.is_pax_global_extensions() {
+            let size = entry.header().size().unwrap_or(u64::MAX);
+            total = total.saturating_add(size);
+            if size > 64 * 1024 || total > MAX_UNPACKED_BYTES {
+                return Err(invalid("上游归档元数据超限"));
+            }
+            continue;
+        }
         if kind.is_dir() {
             continue;
         }
@@ -77,7 +97,13 @@ pub fn unpack_tarball(tarball: &[u8], target: &Path) -> Result<(), PluginError> 
             .path()
             .map_err(|_| invalid("上游 tarball 含无效路径"))?
             .into_owned();
-        let relative = package_relative(&raw)?;
+        if root.is_none() {
+            root = raw.components().next().and_then(|part| match part {
+                Component::Normal(name) => name.to_str().map(str::to_owned),
+                _ => None,
+            });
+        }
+        let relative = archive_relative(&raw, root.as_deref().unwrap_or_default())?;
         let destination = target.join(&relative);
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent)?;
@@ -111,12 +137,12 @@ pub fn unpack_tarball(tarball: &[u8], target: &Path) -> Result<(), PluginError> 
     Ok(())
 }
 
-/// 去掉 npm 的 `package/` 前缀并拒绝任何穿越：路径必须由普通分量组成。
-fn package_relative(raw: &Path) -> Result<PathBuf, PluginError> {
+/// 去掉归档的单一根前缀并拒绝任何穿越：路径必须由普通分量组成。
+fn archive_relative(raw: &Path, root: &str) -> Result<PathBuf, PluginError> {
     let mut components = raw.components();
     match components.next() {
-        Some(Component::Normal(first)) if first == "package" => {}
-        _ => return Err(invalid("上游 tarball 内容必须位于 package/ 下")),
+        Some(Component::Normal(first)) if first == root => {}
+        _ => return Err(invalid("上游归档内容必须位于同一个根目录下")),
     }
     let mut relative = PathBuf::new();
     for component in components {
@@ -179,6 +205,65 @@ mod tests {
             std::fs::read(dir.path().join("lib/index.js")).unwrap(),
             b"export {}"
         );
+    }
+
+    #[test]
+    fn repository_archives_share_bounds_and_refuse_multiple_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = build(&[
+            ("repo-commit/package.json", b"{}"),
+            ("repo-commit/src/index.js", b"export {}"),
+        ]);
+        unpack_repository_tarball(&archive, dir.path()).unwrap();
+        assert!(dir.path().join("src/index.js").is_file());
+        let other = tempfile::tempdir().unwrap();
+        let archive = build(&[
+            ("first/package.json", b"{}"),
+            ("second/overwrite.js", b"{}"),
+        ]);
+        assert!(unpack_repository_tarball(&archive, other.path()).is_err());
+        assert!(!other.path().join("overwrite.js").exists());
+        assert!(unpack_tarball(&archive, other.path()).is_err());
+    }
+
+    #[test]
+    fn git_pax_commit_metadata_does_not_become_a_file_or_hide_special_entries() {
+        let build_git = |link: bool| {
+            let mut archive = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+            let comment = b"52 comment=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::XGlobalHeader);
+            header.set_size(comment.len() as u64);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "pax_global_header", &comment[..])
+                .unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(2);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "repo-sha/package.json", &b"{}"[..])
+                .unwrap();
+            if link {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_link_name("../../outside").unwrap();
+                header.set_cksum();
+                archive
+                    .append_data(&mut header, "repo-sha/link", std::io::empty())
+                    .unwrap();
+            }
+            archive.into_inner().unwrap().finish().unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        unpack_repository_tarball(&build_git(false), dir.path()).unwrap();
+        assert!(dir.path().join("package.json").is_file());
+        assert!(!dir.path().join("pax_global_header").exists());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(unpack_repository_tarball(&build_git(true), dir.path()).is_err());
+        assert!(!dir.path().join("link").exists());
     }
 
     #[test]

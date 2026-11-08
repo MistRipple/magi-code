@@ -865,7 +865,7 @@
   "settings.plugins.openSettings": "Open settings",
   "settings.plugins.upgradeFromFile": "Upgrade from file",
   "settings.plugins.chooseZip": "Choose ZIP…",
-  "settings.plugins.addressPlaceholder": "Remote package address (HTTP(S)); use Choose ZIP below for a local ZIP",
+  "settings.plugins.addressPlaceholder": "Remote ZIP URL or github:owner/repository#branch",
   "settings.plugins.installAddress": "Install",
   "settings.plugins.empty": "No plugins installed.",
   "settings.plugins.activate": "Authorize and activate",
@@ -3250,5 +3250,8 @@
   "settings.plugins.permission.sessionWrite.wake": "Session messages: send text to the current conversation and start model replies, incurring model usage",
   "messageItem.pluginMessage": "From plugin {name}",
   "input.queue.pluginContext": "{name}, awaiting the next request",
-  "input.queue.pluginMessage": "From {name}"
+  "input.queue.pluginMessage": "From {name}",
+  "settings.plugins.github.invalidAddress": "Enter a valid GitHub repository address",
+  "settings.plugins.github.checkUpdate": "Check for updates",
+  "settings.plugins.github.notice": "Install the original package from a pinned GitHub commit. Plugins run with your system permissions. Review the source and permissions before installing."
 }

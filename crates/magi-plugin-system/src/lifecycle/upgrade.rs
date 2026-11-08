@@ -174,8 +174,28 @@ impl PluginManager {
 /// 上游来源身份不可由同名 Magi ID 冒用，版本是同一来源的可变部分。
 fn ensure_same_source(current: &PluginSource, candidate: &PluginSource) -> Result<(), PluginError> {
     match (current, candidate) {
-        (PluginSource::Upstream { ecosystem: a, package: b, .. }, PluginSource::Upstream { ecosystem: c, package: d, .. }) if a == c && b == d => Ok(()),
-        (PluginSource::Upstream { .. }, _) | (_, PluginSource::Upstream { .. }) => Err(conflict("插件 ID 已属于另一来源，不能作为升级替换")),
+        (
+            PluginSource::Upstream {
+                ecosystem: a,
+                package: b,
+                github: first,
+                ..
+            },
+            PluginSource::Upstream {
+                ecosystem: c,
+                package: d,
+                github: second,
+                ..
+            },
+        ) if a == c
+            && b == d
+            && first.as_ref().map(|s| &s.repository) == second.as_ref().map(|s| &s.repository) =>
+        {
+            Ok(())
+        }
+        (PluginSource::Upstream { .. }, _) | (_, PluginSource::Upstream { .. }) => {
+            Err(conflict("插件 ID 已属于另一来源，不能作为升级替换"))
+        }
         _ => Ok(()),
     }
 }

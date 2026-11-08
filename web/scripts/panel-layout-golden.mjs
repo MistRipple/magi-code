@@ -551,8 +551,8 @@ assert.match(
 );
 assert.doesNotMatch(
   appSource,
-  /SettingsPanel|settingsOpen/,
-  'App 不再持有设置层',
+  /SettingsPanel|(?:let|const)\s+settingsOpen\b|shellUi\.settingsOpen\s*=(?!=)/,
+  'App 不持有或写入设置层；插件页面可以读取外壳状态以暂停隐藏页面',
 );
 assert.match(
   globalStyleSource,

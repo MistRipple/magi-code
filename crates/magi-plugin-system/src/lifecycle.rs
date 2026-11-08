@@ -50,6 +50,8 @@ pub enum PluginSource {
         ecosystem: String,
         package: String,
         version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        github: Option<magi_app_server_protocol::generated::PluginGithubSource>,
     },
 }
 
@@ -135,12 +137,21 @@ impl PluginSource {
                 ecosystem,
                 package,
                 version,
+                ..
             } => (
                 PluginSourceKind::Upstream,
                 format!("{ecosystem}:{package}@{version}"),
             ),
         };
-        PluginSourceProjection { kind, location }
+        let github = match self {
+            Self::Upstream { github, .. } => github.clone(),
+            _ => None,
+        };
+        PluginSourceProjection {
+            kind,
+            location,
+            github,
+        }
     }
 }
 

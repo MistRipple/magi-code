@@ -13,7 +13,14 @@ const MAX_ICON_BYTES: u64 = 256 * 1024;
 pub(in crate::routes::plugins) async fn icon(
     Query(request): Query<PluginUpstreamRequest>,
 ) -> Result<Response, ApiError> {
-    validate_package_name(&request.package)?;
+    if request.github.is_some() {
+        return Err(ApiError::InvalidInput("GitHub 图标沿已预览原包提供".into()));
+    }
+    let name = request
+        .package
+        .as_deref()
+        .ok_or_else(|| ApiError::InvalidInput("图标请求缺少包名".into()))?;
+    validate_package_name(name)?;
     let version = request
         .version
         .as_deref()
@@ -21,7 +28,7 @@ pub(in crate::routes::plugins) async fn icon(
     semver::Version::parse(version)
         .map_err(|_| ApiError::InvalidInput("图标请求需要精确版本".into()))?;
     let registry = registry()?;
-    let key = format!("{registry}\0{}\0{version}", request.package);
+    let key = format!("{registry}\0{}\0{version}", name);
     if let Some(bytes) = cached(&key).await {
         return Ok(response(bytes));
     }
@@ -32,7 +39,7 @@ pub(in crate::routes::plugins) async fn icon(
     if let Some(bytes) = cached(&key).await {
         return Ok(response(bytes));
     }
-    let bytes = load(&registry, &request.package, version).await?;
+    let bytes = load(&registry, name, version).await?;
     let mut cache = CACHE.lock().await;
     if cache.len() >= MAX_ICONS {
         cache.pop_front();

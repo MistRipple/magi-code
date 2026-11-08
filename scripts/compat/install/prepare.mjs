@@ -159,7 +159,7 @@ export async function prepareDsh(options) {
   writeFileSync(join(options.outDir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
   const compatReport = {
     kind: 'dsh', translatorVersion: TRANSLATOR_VERSION, runtimeId: compatRuntimeId,
-    upstream: { name: pkg.name, version: pkg.version, integrity: options.source.integrity },
+    upstream: { name: pkg.name, version: pkg.version, integrity: options.source.integrity, ...(options.source.github ? { github: options.source.github } : {}) },
     compatibility,
     magi: { id: manifest.id, version: manifest.version }, dependencies,
     runtimeContributions: manifest.extension.runtimeContributions,

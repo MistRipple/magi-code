@@ -172,6 +172,7 @@ async fn download_attempt(
     let mut response = loop {
         let addresses = resolve_allowed(&current).await?;
         let mut builder = reqwest::Client::builder()
+            .user_agent("Magi-Plugin-Installer")
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none());

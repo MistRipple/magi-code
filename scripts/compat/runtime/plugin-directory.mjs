@@ -1,3 +1,4 @@
+import { dshBundle } from './plugin-source.mjs';
 // 原生目录变更只负责唤醒；版本、启停和故障始终重新读取 daemon。
 // 这里保留上一份已投递的观察投影，以产生状态迁移，不拥有可执行 Cordis fiber。
 export function pluginLifecycle(plugin) {
@@ -13,12 +14,11 @@ export function createPluginDirectory(api, diagnostic) {
   const listeners = new Set();
   let records = new Map(), closed = false, pending = false, refreshing, unsubscribe, epoch = 0;
   const project = (plugin) => {
-    if (plugin.source.kind !== 'upstream' || !plugin.source.location.startsWith('dsh:')) return;
-    const spec = plugin.source.location.slice(4), separator = spec.lastIndexOf('@');
-    if (separator <= 0) throw new Error('daemon 上游插件身份无效');
+    const bundle = dshBundle(plugin);
+    if (!bundle) return;
     const lifecycle = pluginLifecycle(plugin);
     const value = Object.freeze({
-      entry: Object.freeze({ options: Object.freeze({ id: plugin.manifest.id, name: spec.slice(0, separator) }) }),
+      entry: Object.freeze({ options: Object.freeze({ id: plugin.manifest.id, name: bundle.name }) }),
       ...lifecycle,
     });
     return { id: plugin.manifest.id, value, signature: JSON.stringify([plugin.digest, plugin.runtime?.generation, lifecycle.state, plugin.runtime?.reason]) };

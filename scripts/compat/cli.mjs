@@ -37,7 +37,7 @@ if (command === 'prepare') {
     const [{ prepareDsh }, { resolve, dirname }, { fileURLToPath }] = await Promise.all([import('./install/prepare.mjs'), import('node:path'), import('node:url')]);
     const result = await prepareDsh({
       upstreamDir: resolve(upstreamDir), outDir: resolve(need('out')), sharedRoot: dirname(fileURLToPath(import.meta.url)),
-      source: { integrity: need('integrity') },
+      source: { integrity: need('integrity'), ...(optionOf(args, 'github') ? { github: JSON.parse(optionOf(args, 'github')) } : {}) },
       compatibility: process.env.MAGI_DSH_COMPATIBILITY_POLICY ? JSON.parse(process.env.MAGI_DSH_COMPATIBILITY_POLICY) : undefined,
     });
     const archive = optionOf(args, 'archive');

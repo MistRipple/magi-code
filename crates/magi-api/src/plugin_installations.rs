@@ -149,13 +149,14 @@ impl PluginInstallations {
                 if record.phase == Phase::Finished {
                     continue;
                 }
-                let installed = record.candidate.as_ref().is_some_and(|candidate| {
+                let committed = record.candidate.as_ref().and_then(|candidate| {
                     manager
                         .state()
                         .plugins
                         .get(&candidate.plugin_id)
-                        .is_some_and(|plugin| plugin.digest == candidate.digest)
+                        .filter(|plugin| plugin.digest == candidate.digest)
                 });
+                let installed = committed.is_some();
                 let message = if installed {
                     "应用退出时安装任务尚未结算；候选版本已安装，请在插件管理检查授权与运行状态。再次安装须显式发起新请求。"
                 } else {
@@ -163,9 +164,24 @@ impl PluginInstallations {
                 };
                 record.result = Some(PluginBundleInstallResult {
                     application: Application::Failed,
-                    bundle: serde_json::from_str::<serde_json::Value>(&record.fingerprint)
-                        .ok()
-                        .and_then(|v| v["package"].as_str().map(str::to_owned)),
+                    bundle: committed
+                        .and_then(|plugin| match &plugin.source {
+                            magi_plugin_system::PluginSource::Upstream { package, .. } => {
+                                Some(package.clone())
+                            }
+                            _ => None,
+                        })
+                        .or_else(|| {
+                            serde_json::from_str::<serde_json::Value>(&record.fingerprint)
+                                .ok()
+                                .and_then(|v| {
+                                    v["package"].as_str().map(str::to_owned).or_else(|| {
+                                        v["github"]["repository"]
+                                            .as_str()
+                                            .map(|repo| format!("github:{repo}"))
+                                    })
+                                })
+                        }),
                     version: record.candidate.as_ref().map(|c| c.version.clone()),
                     changed: None,
                     installed: installed.then_some(true),
@@ -493,6 +509,27 @@ mod tests {
                 .unwrap()
                 .1
         );
+    }
+
+    #[tokio::test]
+    async fn github_preparation_restart_preserves_source_without_resolving_a_moved_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let fingerprint = serde_json::json!({"ecosystem":"dsh","github":{"repository":"owner/repo","reference":"main"},"requestId":"github"}).to_string();
+        let first = store(root.path());
+        first
+            .start(owner("old"), "github", fingerprint.clone())
+            .unwrap();
+        drop(first);
+        let recovered = store(root.path());
+        let (receipt, fresh) = recovered
+            .start(owner("new"), "github", fingerprint)
+            .unwrap();
+        assert!(!fresh);
+        let result = receipt.wait().await.unwrap();
+        assert_eq!(result.bundle.as_deref(), Some("github:owner/repo"));
+        assert_eq!(result.application, Application::Failed);
+        assert_eq!(result.error.unwrap().code, "installation-interrupted");
+        assert_eq!(result.installed, None);
     }
 
     #[tokio::test]

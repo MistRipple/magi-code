@@ -789,6 +789,7 @@ export type PluginSourceKind = "center" | "address" | "local" | "builtin" | "ups
 export interface PluginSourceProjection {
   kind: PluginSourceKind;
   location: string;
+  github?: PluginGithubSource;
 }
 
 export interface PluginInstalled {
@@ -1531,9 +1532,10 @@ export interface PluginUpstreamProjection {
 
 export interface PluginUpstreamRequest {
   ecosystem: PluginEcosystem;
-  package: string;
+  package?: string;
   version?: string | null;
   expectedDigest?: string | null;
+  github?: PluginGithubSource;
 }
 
 export interface PluginTranslationNote {
@@ -1559,6 +1561,7 @@ export interface PluginUpstreamPreview {
   publisher: string;
   official: boolean;
   translation: PluginTranslationSummary;
+  github?: PluginGithubSource;
 }
 
 export type PluginEcosystem = "dsh" | "pi";
@@ -1688,10 +1691,11 @@ export interface PluginClientContribution {
 
 export interface PluginBundleInstallRequest {
   ecosystem: PluginEcosystem;
-  package: string;
+  package?: string;
   requestId: string;
   version?: string | null;
   enabled?: boolean | null;
+  github?: PluginGithubSource;
 }
 
 export interface PluginBundleInstallCancelRequest {
@@ -1754,3 +1758,9 @@ export interface PluginSessionMessageReceipt {
 }
 
 export type PluginSessionMessageState = "pending" | "attached" | "consumed" | "cancelled";
+
+export interface PluginGithubSource {
+  repository: string;
+  reference?: string | null;
+  commit?: string | null;
+}
