@@ -1,5 +1,12 @@
 # App Server 协议生成约定
 
+`PluginRemoveRequest.changeId`、`PluginBundleInstallRequest.changeId` 及
+`PluginManagementChangeRequest/Receipt` 是协商特性 `plugin.changes` 的增量合同，不新增
+App Server method。changeId 绑定管理调用者包摘要与实例，移除、后续安装和结算共用同一
+恢复边界。PluginManager 的持久状态可选 `removals` 保存原安装记录与归档引用；缺省为空，
+只拥有未结算移除的恢复事实。原包版本提交与移除该恢复引用是一次状态提交；重启仅恢复
+尚未提交候选的原安装，原归档无需重新下载。原生升级的数据重置日志与授权规则继续适用。
+
 `PluginInstalled.disabledBy` 为 daemon 持久化的停用来源（插件 ID、名称与原因），不是
 客户端自报的运行状态。管理者在 `PluginSetEnabledRequest` 中可提交停用原因；来源身份由
 daemon 根据已授权调用者补充，排空后与 enabled/active 一次提交。启用、用户显式停用及

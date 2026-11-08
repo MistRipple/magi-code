@@ -1703,6 +1703,7 @@ export interface PluginBundleInstallRequest {
   version?: string | null;
   enabled?: boolean | null;
   github?: PluginGithubSource;
+  changeId?: string;
 }
 
 export interface PluginBundleInstallCancelRequest {
@@ -1798,4 +1799,19 @@ export interface PluginSetEnabledRequest {
   expectedDigest?: string;
   expectedState?: PluginLifecycleState;
   reason?: string;
+}
+
+export interface PluginRemoveRequest {
+  pluginId: string;
+  expectedDigest?: string;
+  changeId?: string;
+}
+
+export interface PluginManagementChangeRequest {
+  changeId: string;
+  commit: boolean;
+}
+
+export interface PluginManagementChangeReceipt {
+  restored: Array<string>;
 }

@@ -18,10 +18,12 @@ use std::{
 mod compatibility;
 mod drain;
 mod image_attachments;
+mod removal;
 mod runtime_catalog;
 mod upgrade;
 
 pub use drain::PluginDrainGuard;
+pub use removal::PluginChangeScope;
 
 const STATE_FILE: &str = "state.json";
 const STATE_VERSION: u16 = 2;
@@ -76,6 +78,8 @@ pub struct InstalledPlugin {
 pub struct PluginManagerState {
     pub schema_version: u16,
     pub plugins: BTreeMap<String, InstalledPlugin>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    removals: BTreeMap<String, removal::PendingRemoval>,
 }
 
 impl Default for PluginManagerState {
@@ -83,6 +87,7 @@ impl Default for PluginManagerState {
         Self {
             schema_version: STATE_VERSION,
             plugins: BTreeMap::new(),
+            removals: BTreeMap::new(),
         }
     }
 }
@@ -201,6 +206,7 @@ impl PluginManager {
             retired_builtins: Vec::new(),
         };
         manager.recover_data_reset()?;
+        manager.recover_pending_removals()?;
         manager.collect_image_attachment_files()?;
         // 内置包目录是宿主支持能力的唯一入口；停发的内置包不能在重启后恢复激活。
         // 先备份安装事实，再移除注册表记录。资源数据保留，不把退役包当作外部插件加载。
@@ -446,6 +452,9 @@ impl PluginManager {
     ) -> Result<(), PluginError> {
         let manifest = package.manifest();
         ensure_builtin_source(manifest.id.as_str(), &source)?;
+        if self.state.removals.contains_key(&manifest.id) {
+            return Err(conflict("目标正在管理调用的移除恢复边界内"));
+        }
         if let Some(existing) = self.state.plugins.get(&manifest.id) {
             if existing.digest == package.digest() {
                 return Ok(());
@@ -948,6 +957,7 @@ fn cleanup_unreferenced_packages(
     let referenced = state
         .plugins
         .values()
+        .chain(state.removals.values().map(|removal| &removal.installed))
         .map(|plugin| Path::new(&plugin.package_path))
         .collect::<BTreeSet<_>>();
     let entries = match fs::read_dir(&versions) {

@@ -26,6 +26,7 @@ test('管理服务直接安装、启停和移除后的 profile 读取反映本�
       return {application:'applied',bundle:'target',installed:true,version:'2.0.0',changed:true};},
     async setEnabled(id,enabled,digest){assert.equal(id,'dsh.target');assert.equal(digest,plugins[0].digest);plugins[0].enabled=enabled;plugins[0].active=enabled;},
     async remove(id,digest){assert.equal(id,'dsh.target');assert.equal(digest,plugins[0].digest);plugins=[];},
+    async finishChange(input){assert.equal(input.commit,true);assert.ok(input.changeId);return {restored:[]};},
   }};
   const release=configureProfile(api,{home});t.after(release);
   const manager=createPluginManager(api);
@@ -94,6 +95,34 @@ test('管理修改先结算有效配置提案，串行读取新版本；取消�
       '业务报错后仍重读 daemon，不将已变更状态藏在旧快照里');
   });
   assert.equal(installations,3);
+});
+
+test('同调用移除和安装携带同一恢复身份，失败与取消在关闭快照前结算；成功卸载明确提交', async t => {
+  const home=await mkdtemp(join(tmpdir(),'magi-profile-change-'));t.after(()=>rm(home,{recursive:true,force:true}));
+  const original={manifest:{id:'dsh.target'},digest:'old',enabled:true,active:true,source:{kind:'upstream',location:'dsh:target@1.0.0'}};
+  let plugins=[original],pending,changeId;const receipts=[];
+  const api={plugins:{
+    list:async()=>({plugins}),
+    async remove(id,digest,options){assert.equal(id,original.manifest.id);assert.equal(digest,original.digest);pending=plugins;plugins=[];changeId=options.changeId;assert.ok(changeId);},
+    async installBundle(input){assert.equal(input.changeId,changeId);return {application:'failed',error:{message:'下载失败'}};},
+    async finishChange(input){assert.equal(input.changeId,changeId);receipts.push(input.commit);if(!input.commit)plugins=pending;pending=undefined;return {restored:input.commit?[]:['dsh.target']};},
+  }};
+  const off=configureProfile(api,{home});t.after(off);const manager=createPluginManager(api);
+  const result=await withProfile(async()=>{
+    assert.equal((await manager.removeBundle('target')).application,'applied');
+    assert.deepEqual(loaderEntries(),[],'移除时不伪装目标仍已安装');
+    assert.equal((await manager.installBundle('target@2.0.0')).application,'failed');
+    return {status:500,body:{ok:false,error:'下载失败'}};
+  });
+  assert.equal(result.status,500);assert.deepEqual(plugins,[original]);
+  assert.match(result.body.error,/下载失败[\s\S]*原安装已恢复/);
+  const controller=new AbortController();
+  await assert.rejects(withProfile(async()=>{await manager.removeBundle('target');controller.abort(new Error('用户取消'));},controller.signal),/用户取消/);
+  assert.deepEqual(plugins,[original]);
+  await assert.rejects(withProfile(async()=>{await manager.removeBundle('target');throw new Error('原包错误');}),/原包错误/);
+  assert.deepEqual(plugins,[original]);
+  await withProfile(()=>manager.removeBundle('target'));
+  assert.deepEqual(plugins,[]);assert.deepEqual(receipts,[false,false,false,true]);
 });
 
 test('显式后台管理在请求结束后读取独立新快照，前台旧调用与被替换实例不能继续修改', async t => {
@@ -552,6 +581,7 @@ test('DSH 移除命令等待读取目标时终止，不删除插件或取消同�
   const off=configureProfile({plugins:{
     async list(){if(hold){began();await gate;}return {plugins:[{manifest:{id:'dsh.target'},digest:'one',enabled:true,source:{kind:'upstream',location:'dsh:target@1.0.0'}}]};},
     async remove(){removals++;},
+    async finishChange(input){assert.equal(input.commit,true);return {restored:[]};},
   }},{home});t.after(off);t.after(releaseRead);
   await withProfile(async()=>{
     hold=true;

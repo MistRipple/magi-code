@@ -16,13 +16,14 @@ import { createHash } from 'node:crypto';
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const PROTOCOL = { major: 1, minor: 0 };
-const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'plugin.installations', 'plugin.directory.events', 'plugin.reconciliation', 'plugin.skills', 'session.directory', 'session.messages', 'images.store', 'tool.outcome'];
+const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'plugin.installations', 'plugin.directory.events', 'plugin.reconciliation', 'plugin.changes', 'plugin.skills', 'session.directory', 'session.messages', 'images.store', 'tool.outcome'];
 let negotiatedFeatures = new Set();
 const pluginRequest = (method, input, background = false) => {
   if (!negotiatedFeatures.has('plugin.management')) throw new Error('daemon 未协商 plugin.management');
   if (background && !negotiatedFeatures.has('plugin.management.background')) throw new Error('daemon 未协商 plugin.management.background');
   if (method === 'plugins.reconcile' && !negotiatedFeatures.has('plugin.reconciliation')) throw new Error('daemon 未协商 plugin.reconciliation');
   if (['plugins.installBundle', 'plugins.cancelInstall'].includes(method) && !negotiatedFeatures.has('plugin.installations')) throw new Error('daemon 未协商 plugin.installations');
+  if ((method === 'plugins.finishChange' || input?.changeId) && !negotiatedFeatures.has('plugin.changes')) throw new Error('daemon 未协商 plugin.changes');
   return request(method, background ? { ...input, background: true } : input, background);
 };
 const imageRequest = (method, input) => {
@@ -351,7 +352,9 @@ const pluginApi = (background = false) => Object.freeze({
     ...(options.reason === undefined ? {} : { reason: options.reason }),
   }, background),
   authorize: (pluginId, expectedDigest, grants) => pluginRequest('plugins.authorize', { pluginId, expectedDigest, grants }, background),
-  remove: (pluginId, expectedDigest) => pluginRequest('plugins.remove', { pluginId, ...(expectedDigest === undefined ? {} : { expectedDigest }) }, background),
+  remove: (pluginId, expectedDigest, options = {}) => pluginRequest('plugins.remove', { pluginId, ...(expectedDigest === undefined ? {} : { expectedDigest }),
+    ...(options.changeId === undefined ? {} : { changeId: options.changeId }) }, background),
+  finishChange: (input) => pluginRequest('plugins.finishChange', input, background),
   ...(!background ? { background: pluginApi(true) } : {}),
 });
 

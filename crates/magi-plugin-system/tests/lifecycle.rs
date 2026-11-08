@@ -33,6 +33,220 @@ fn package(with_permission: bool) -> PluginPackage {
     PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap()
 }
 
+fn removal_scope() -> magi_plugin_system::PluginChangeScope {
+    magi_plugin_system::PluginChangeScope {
+        plugin: "acme.manager".into(),
+        digest: "manager-digest".into(),
+        instance: "current".into(),
+        change_id: "update-1".into(),
+    }
+}
+
+fn recoverable_remove(manager: &Arc<Mutex<PluginManager>>) {
+    let drain = PluginManager::begin_upgrade_drain(Arc::clone(manager), "acme.lifecycle").unwrap();
+    let mut guard = manager.lock().unwrap();
+    guard
+        .remove_for_change("acme.lifecycle", removal_scope(), &drain)
+        .unwrap();
+    drain.commit(&mut guard);
+}
+
+#[test]
+fn management_removal_failure_and_restart_restore_original_identity_and_data_without_download() {
+    let root = tempdir().unwrap();
+    let mut value = manifest(true);
+    value["contributions"]["resources"] = json!([{"id":"cache","title":"Cache","description":""}]);
+    let old = package_from_manifest(value);
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    manager
+        .install(
+            &old,
+            PluginSource::Local {
+                name: "old.zip".into(),
+            },
+        )
+        .unwrap();
+    manager.enable("acme.lifecycle").unwrap();
+    manager.authorize("acme.lifecycle", vec![grant()]).unwrap();
+    manager.activate("acme.lifecycle").unwrap();
+    manager
+        .write_resource("acme.lifecycle", "cache", 0, json!({"preserve":true}))
+        .unwrap();
+    let original = manager.state().plugins["acme.lifecycle"].clone();
+    let resources = std::fs::read(root.path().join("resources.json")).unwrap();
+    let manager = Arc::new(Mutex::new(manager));
+    recoverable_remove(&manager);
+    {
+        let mut guard = manager.lock().unwrap();
+        assert!(guard.projection().unwrap().plugins.is_empty());
+        assert!(root.path().join(&original.package_path).is_file());
+        assert!(
+            guard.install(&old, original.source.clone()).is_err(),
+            "other installs cannot occupy the recovery target"
+        );
+        let mut wrong = removal_scope();
+        wrong.instance = "replacement".into();
+        assert!(
+            guard
+                .removed_for_change("acme.lifecycle", Some(&wrong))
+                .is_err()
+        );
+        assert!(guard.finish_change(&wrong, false).unwrap().is_empty());
+        let archive = root.path().join(&original.package_path);
+        let bytes = std::fs::read(&archive).unwrap();
+        std::fs::write(&archive, b"corrupt-retained-archive").unwrap();
+        assert!(
+            guard.finish_change(&removal_scope(), false).is_err(),
+            "recovery must verify the retained archive before restoring old authorization"
+        );
+        std::fs::write(&archive, bytes).unwrap();
+        guard.finish_change(&removal_scope(), false).unwrap();
+        assert_eq!(guard.state().plugins["acme.lifecycle"], original);
+        assert_eq!(
+            guard.package("acme.lifecycle").unwrap().digest(),
+            old.digest()
+        );
+    }
+    recoverable_remove(&manager);
+    drop(manager);
+    let mut reopened = PluginManager::open(root.path()).unwrap();
+    assert_eq!(reopened.state().plugins["acme.lifecycle"], original);
+    assert_eq!(
+        std::fs::read(root.path().join("resources.json")).unwrap(),
+        resources
+    );
+    assert!(
+        reopened
+            .finish_change(&removal_scope(), true)
+            .unwrap()
+            .is_empty(),
+        "restart already settled only the uncommitted removal"
+    );
+    let manager = Arc::new(Mutex::new(reopened));
+    let drain = PluginManager::begin_upgrade_drain(Arc::clone(&manager), "acme.lifecycle").unwrap();
+    let disabled = {
+        let mut guard = manager.lock().unwrap();
+        guard
+            .disable_drained(
+                "acme.lifecycle",
+                Some(magi_app_server_protocol::generated::PluginDisableInfo {
+                    plugin_id: "acme.manager".into(),
+                    name: "Manager".into(),
+                    reason: "diagnostic quarantine".into(),
+                }),
+                &drain,
+            )
+            .unwrap();
+        drain.commit(&mut guard);
+        guard.state().plugins["acme.lifecycle"].clone()
+    };
+    recoverable_remove(&manager);
+    manager
+        .lock()
+        .unwrap()
+        .recover_instance_removals("acme.manager", "current")
+        .unwrap();
+    assert_eq!(
+        manager.lock().unwrap().state().plugins["acme.lifecycle"],
+        disabled,
+        "recovery preserves explicit disable intent and its origin"
+    );
+    recoverable_remove(&manager);
+    manager
+        .lock()
+        .unwrap()
+        .finish_change(&removal_scope(), true)
+        .unwrap();
+    assert!(
+        !root.path().join(&original.package_path).exists(),
+        "confirmed uninstall releases the original archive"
+    );
+    drop(manager);
+    assert!(
+        PluginManager::open(root.path())
+            .unwrap()
+            .state()
+            .plugins
+            .is_empty()
+    );
+}
+
+#[test]
+fn management_replacement_uses_upgrade_data_and_authorization_boundary_and_never_rolls_back_committed_version()
+ {
+    let root = tempdir().unwrap();
+    let mut value = manifest(true);
+    value["contributions"]["resources"] = json!([{"id":"cache","title":"Cache","description":""}]);
+    let old = package_from_manifest(value.clone());
+    value["version"] = json!("2.0.0");
+    value["dataSchemaVersion"] = json!(2);
+    let new = package_from_manifest(value);
+    let source = PluginSource::Upstream {
+        ecosystem: "dsh".into(),
+        package: "target".into(),
+        version: "1.0.0".into(),
+        github: None,
+    };
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    manager.install(&old, source.clone()).unwrap();
+    manager.enable("acme.lifecycle").unwrap();
+    manager.authorize("acme.lifecycle", vec![grant()]).unwrap();
+    manager.activate("acme.lifecycle").unwrap();
+    manager
+        .write_resource("acme.lifecycle", "cache", 0, json!({"old":true}))
+        .unwrap();
+    let manager = Arc::new(Mutex::new(manager));
+    recoverable_remove(&manager);
+    {
+        let mut guard = manager.lock().unwrap();
+        assert!(
+            guard
+                .replace_removed(
+                    &new,
+                    PluginSource::Local {
+                        name: "forged.zip".into()
+                    },
+                    &removal_scope()
+                )
+                .is_err()
+        );
+        assert!(
+            guard
+                .removed_for_change("acme.lifecycle", Some(&removal_scope()))
+                .unwrap()
+        );
+        let source = PluginSource::Upstream {
+            ecosystem: "dsh".into(),
+            package: "target".into(),
+            version: "2.0.0".into(),
+            github: None,
+        };
+        guard
+            .replace_removed(&new, source, &removal_scope())
+            .unwrap();
+        let current = &guard.state().plugins["acme.lifecycle"];
+        assert_eq!(current.digest, new.digest());
+        assert!(current.enabled);
+        assert!(!current.active);
+        assert!(current.grants.is_empty());
+        assert!(!guard.has_resource_data("acme.lifecycle"));
+        assert!(
+            guard
+                .finish_change(&removal_scope(), false)
+                .unwrap()
+                .is_empty(),
+            "a committed replacement cannot be rolled back as an uncommitted removal"
+        );
+    }
+    drop(manager);
+    let reopened = PluginManager::open(root.path()).unwrap();
+    assert_eq!(
+        reopened.state().plugins["acme.lifecycle"].digest,
+        new.digest()
+    );
+    assert!(!reopened.has_resource_data("acme.lifecycle"));
+}
+
 #[test]
 fn upstream_metadata_is_read_from_the_installed_archive_only_on_request() {
     let root = tempdir().unwrap();

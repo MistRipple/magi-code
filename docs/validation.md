@@ -293,7 +293,7 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 `npm run test:electron-plugin-runtime` 可设置 `MAGI_DSH_EXTERNAL_CLI=<真实 dsh 可执行文件路径>`，让在线安装的 Debugging 原包经真实模型工具调用和原生审批检查另一套独立 DSH 目录：外部 CLI 导出配置、执行 schema 检查及判断变更生效方式，Magi 安装状态保持不变。该可选分支需要本机已有的真实 DSH CLI，不提供替身命令；未设置时不计入对应业务证据。
 
-`npm run test:electron-dsh-profile` 在线安装 Mgr 0.2.12，先通过其真实路由验证 `dsh add/remove` 的在线替换与卸载，再经 Magi 原生预览、取消、确认及重新授权更新到固定 0.2.13；随后使用新版原页面完成目标插件启停、故障恢复、在线更新与真实回执、更新／卸载取消、390px 确认、应用重启和卸载。`MAGI_DSH_PROFILE_OUTPUT` 指定证据目录，端口使用 `MAGI_PROFILE_PORT`／`MAGI_PROFILE_CDP_PORT`。旧版路由通过不代表其 Button 页面缺陷已修复；该入口未验证先移除式更新在中途失败时的整体恢复，不能作为全部管理操作具备原子性的证明。`test:compat` 另以延迟目录读取验证命令终止后零安装／移除，以及同请求的显式重试。
+`npm run test:electron-dsh-profile` 在线安装 Mgr 0.2.12，先通过其真实路由验证 `dsh add/remove` 的在线替换与卸载，再经 Magi 原生预览、取消、确认及重新授权更新到固定 0.2.13；随后使用新版原页面完成目标插件启停、故障恢复、在线更新与真实回执、更新／卸载取消、390px 确认、应用重启和卸载。`MAGI_DSH_PROFILE_OUTPUT` 指定证据目录，端口使用 `MAGI_PROFILE_PORT`／`MAGI_PROFILE_CDP_PORT`。旧版路由通过不代表其 Button 页面缺陷已修复；该入口还通过只影响本次候选解析的 registry 代理，使 Mgr 原页面的先移除式更新失败，核对恢复旧摘要、授权和真实运行，并显示恢复说明；在旧版已移除且候选未提交时终止本次应用的 daemon，核对真实翻译进程退出、重启恢复原安装、不重放准备以及原页面显式重试。只验证列出的中断位置，不作为全部掉电阶段或外部副作用可回滚的证明。`test:compat` 另以延迟目录读取验证命令终止后零安装／移除，以及同请求的显式重试。
 
 `test:electron-dsh-management` 另验证 Share 原页面保存 SVG／PNG 二维码、取消下载后重新保存，并将落盘 PNG 交回原包识别；`test:electron-dsh-health` 验证原页面导出的 JSON 包含真实安装身份。下载观测器只连接脚本自有 Main inspector，核对进程身份后为该 App session 设置本次文件保存位置或取消下载，读取 Electron 的实际终态与落盘字节；不替换原包导出代码、不使用默认 CDP context 的状态冒充 App session 下载成功。脚本的 inspector 端口为各自 CDP 端口加一，需保持空闲；产品运行不启用 inspector。
 

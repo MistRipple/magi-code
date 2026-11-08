@@ -83,6 +83,14 @@ fn bundle_label(input: &PluginBundleInstallRequest) -> String {
 impl PluginOperations {
     pub fn installation_instance_ended(&self, plugin: &str, lease: &str) {
         self.installations.instance_ended(plugin, lease);
+        match self.locked("恢复失效实例的未结算移除") {
+            Ok(mut manager) => match manager.recover_instance_removals(plugin, lease) {
+                Ok(ids) if !ids.is_empty() => self.changed(),
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "插件移除恢复尚未完成，记录保留"),
+            },
+            Err(error) => tracing::error!(error = error.message(), "插件移除恢复管理器不可用"),
+        }
     }
 
     pub(super) async fn install_bundle(
@@ -95,6 +103,9 @@ impl PluginOperations {
             Some(owner.caller()),
             "install",
         )?;
+        if let Some(change_id) = &input.change_id {
+            Self::change_scope(owner.caller(), change_id.clone())?;
+        }
         upstream::validate_source(input.package.as_deref(), input.github.as_ref())?;
         if !matches!(input.ecosystem, PluginEcosystem::Dsh) {
             return Err(ApiError::InvalidInput("该生态尚未提供在线安装".into()));
@@ -263,14 +274,29 @@ impl PluginOperations {
                     "插件不能在自己的调用中替换自身，请使用 Magi 在线升级入口".into(),
                 ));
             }
-            let changed = !matches!(
-                self.locked("预览在线安装")?
-                    .preview(&package, &source)
+            let scope = input
+                .change_id
+                .as_ref()
+                .map(|id| Self::change_scope(owner.caller(), id.clone()))
+                .transpose()?;
+            let changed = {
+                let manager = self.locked("预览在线安装")?;
+                if manager
+                    .removed_for_change(&id, scope.as_ref())
                     .map_err(plugin_error)?
-                    .operation,
-                magi_app_server_protocol::generated::PluginCandidateOperation::Unchanged
-            );
-            self.install_or_upgrade(&package, source, Some(owner.caller()))
+                {
+                    true
+                } else {
+                    !matches!(
+                        manager
+                            .preview(&package, &source)
+                            .map_err(plugin_error)?
+                            .operation,
+                        magi_app_server_protocol::generated::PluginCandidateOperation::Unchanged
+                    )
+                }
+            };
+            self.install_or_upgrade_change(&package, source, Some(owner.caller()), scope.as_ref())
                 .await?;
             Ok::<_, ApiError>(changed)
         }
@@ -420,6 +446,7 @@ mod tests {
             github: None,
             version: Some("1.0.0".into()),
             enabled: Some(enabled),
+            change_id: None,
         }
     }
     fn npm_source() -> PluginSource {

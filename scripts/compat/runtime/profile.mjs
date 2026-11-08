@@ -24,6 +24,12 @@ const error = (code, message, path) => Object.assign(new Error(message), { code,
 // exist only for this invocation and never become a second installation store.
 const temporaryProposal = (key) => /^(?:package\.json|cordis\.patch\.yml)[.~-][^/]{1,160}$/.test(key);
 export const profilePath = () => host?.root;
+export function profileChangeId(create = false) {
+  if (!host) return;
+  const scope = state();
+  if (create) scope.changeId ??= crypto.randomUUID();
+  return scope.changeId;
+}
 export function configureProfile(api, { home = process.env.DSH_HOME, registry = process.env.MAGI_NPM_REGISTRY ?? 'https://registry.npmjs.org' } = {}) {
   if (!home || !api.plugins?.list) return () => {};
   if (host) throw new Error('DSH profile 已绑定宿主');
@@ -394,7 +400,26 @@ export async function withProfile(callback, signal) {
   const scope = { owner: host, signal, time: Date.now(), descriptors: new Map() };
   await refresh(scope);
   return scopes.run(scope, async () => {
-    try { const result = await callback(); if (!(result?.status >= 400 || result?.body?.ok === false || result?.isError)) await commit(scope); return result; }
+    let result, failure;
+    const failed = () => failure || result?.status >= 400 || result?.body?.ok === false || result?.isError || result?.application === 'failed' || result?.application === 'cancelled';
+    try {
+      try { result = await callback(); if (!failed()) await commit(scope); } catch (cause) { failure = cause; }
+      if (scope.changeId) {
+        await scope.mutations;
+        try {
+          const receipt = await scope.owner.api.plugins.finishChange({ changeId: scope.changeId, commit: !failed() });
+          if (receipt.restored.length) {
+            const notice = '未提交的更新已结束，原安装已恢复；可检查当前状态后重试。';
+            if (failure) failure = Object.assign(new Error(`${failure.message}\n${notice}`, { cause: failure }), { code: failure.code });
+            else if (typeof result?.body?.error === 'string') result.body.error += `\n${notice}`;
+            else if (result?.error) result.error = { ...result.error, message: `${result.error.message}\n${notice}`, diagnostic: `${result.error.diagnostic ?? result.error.message}\n${notice}` };
+          }
+        }
+        catch (cause) { throw new Error(`管理移除的结算尚未确认，请检查 Magi 插件状态，不要重复已提交的业务：${cause.message}`, { cause: failure ?? cause }); }
+      }
+      if (failure) throw failure;
+      return result;
+    }
     finally { scope.closed = true; scope.descriptors.clear(); }
   });
 }

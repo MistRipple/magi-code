@@ -10,6 +10,20 @@ const fixture = fileURLToPath(new URL('./fixtures/mini-dsh', import.meta.url));
 const cli = fileURLToPath(new URL('./cli.mjs', import.meta.url));
 const find = (report, name) => report.entries.find((entry) => entry.name === name);
 
+test('daemon 的独占管道关闭后正在联网的翻译工具链退出，不保留孤儿重试', {timeout:10000}, async t => {
+  const {spawn}=await import('node:child_process');const {createServer}=await import('node:http');const {once}=await import('node:events');
+  let began;const started=new Promise(resolve=>{began=resolve;});
+  const server=createServer((request,response)=>{began();});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  t.after(()=>{server.closeAllConnections();server.close();});
+  const child=spawn(process.execPath,[cli,'resolve','magi-ownership-probe','1.0.0'],{
+    env:{...process.env,MAGI_TRANSLATOR_OWNER_PIPE:'1',MAGI_NPM_REGISTRY:`http://127.0.0.1:${server.address().port}`},stdio:['pipe','pipe','pipe'],
+  });
+  t.after(()=>child.kill());child.stdout.resume();child.stderr.resume();
+  const exited=once(child,'exit');await Promise.race([started,exited.then(()=>assert.fail('工具链在联网前意外退出'))]);
+  child.stdin.end();assert.equal((await exited)[0],1);
+});
+
 test('运行组件身份可复现，同时覆盖业务转换源码与实际页面产物', async t => {
   const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');

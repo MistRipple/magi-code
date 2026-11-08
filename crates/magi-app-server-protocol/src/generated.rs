@@ -3825,6 +3825,10 @@ pub struct PluginBundleInstallRequest {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github: Option<PluginGithubSource>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "changeId")]
+    pub change_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -4045,4 +4049,33 @@ pub struct PluginSetEnabledRequest {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginRemoveRequest {
+    #[serde(rename = "pluginId")]
+    pub plugin_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expectedDigest")]
+    pub expected_digest: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "changeId")]
+    pub change_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginManagementChangeRequest {
+    #[serde(rename = "changeId")]
+    pub change_id: String,
+    pub commit: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginManagementChangeReceipt {
+    pub restored: Vec<String>,
 }

@@ -1,15 +1,38 @@
 // 真实 npm 原包管理 profile：列表、启停、在线升级、卸载均由原包业务驱动。
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, writeFile, access, rename, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, readFile, access, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createServer } from 'node:http';
+import { Readable } from 'node:stream';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { launchApp, connectAppPage, connectTarget, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
 const port = Number(process.env.MAGI_PROFILE_PORT || 38946), cdpPort = Number(process.env.MAGI_PROFILE_CDP_PORT || 9316), origin = `http://127.0.0.1:${port}`;
 const work = await mkdtemp(join(tmpdir(), 'magi-profile-live-')), output = process.env.MAGI_DSH_PROFILE_OUTPUT || join(root, 'target/plugin-acceptance/profile');
 const report = createReporter(), errors = []; let app, page, frame, ui;
+let failResolution = false, holdResolution = false, rejectedResolutions = 0, targetResolutions = 0;
+const held = new Set();
+// 只使本次 daemon 的候选解析失败；原包、组件和 npm 原字节不替换。
+const registryProxy = createServer(async (request,response)=>{
+  if(request.headers['pacote-pkg-id']==='registry:dsh-plugin-release-probe') {
+    targetResolutions++;
+    if(holdResolution) {held.add(response);response.on('close',()=>held.delete(response));return;}
+  }
+  if(failResolution&&request.headers['pacote-pkg-id']==='registry:dsh-plugin-release-probe') {
+    rejectedResolutions++;response.writeHead(404,{'content-type':'application/json'});response.end('{"error":"acceptance-resolution-failure"}');return;
+  }
+  try {
+    const result=await fetch(`https://registry.npmjs.org${request.url}`,{headers:{accept:request.headers.accept??'application/json'},signal:AbortSignal.timeout(120_000)});
+    response.writeHead(result.status,{'content-type':result.headers.get('content-type')??'application/json'});
+    Readable.fromWeb(result.body).on('error',()=>response.destroy()).pipe(response);
+  } catch(error) {response.writeHead(502);response.end(String(error));}
+});
+await new Promise(resolve=>registryProxy.listen(0,'127.0.0.1',resolve));
+const registry=`http://127.0.0.1:${registryProxy.address().port}`;
 await mkdir(output, { recursive: true });
 async function api(path, body) {
   const response = await fetch(origin + path, { method: body === undefined ? 'GET' : 'POST', headers: { origin, 'content-type':'application/json' }, ...(body === undefined ? {} : {body:JSON.stringify(body)}), signal:AbortSignal.timeout(300_000) });
@@ -17,7 +40,7 @@ async function api(path, body) {
 }
 const plugins = async () => (await api('/api/plugins')).plugins;
 async function start() {
-  app=launchApp({executable:join(appRoot,'Contents/MacOS/Magi'),cwd:root,cdpPort,env:{MAGI_STATE_ROOT:join(work,'state'),MAGI_DESKTOP_DAEMON_PORT:String(port),MAGI_EXTENSION_NODE:'',MAGI_EXTENSION_COMPAT:'',MAGI_OPEN_BROWSER:'0'}});
+  app=launchApp({executable:join(appRoot,'Contents/MacOS/Magi'),cwd:root,cdpPort,env:{MAGI_STATE_ROOT:join(work,'state'),MAGI_DESKTOP_DAEMON_PORT:String(port),MAGI_NPM_REGISTRY:registry,MAGI_EXTENSION_NODE:'',MAGI_EXTENSION_COMPAT:'',MAGI_OPEN_BROWSER:'0'}});
   await waitFor(()=>api('/health'),'daemon',60_000);
   page=await waitFor(()=>connectAppPage(cdpPort,port,errors),'Electron');ui=pageTools(page);
   await waitFor(()=>ui.exists('[data-testid=sidebar-settings]'),'工作台初始化');
@@ -167,6 +190,52 @@ try {
   await waitFor(()=>frame.evaluate(`!document.querySelector('[role=dialog]')`),'取消原包更新');
   report.check('取消原包更新确认保留目标版本与运行',(await current()).digest===target.digest&&(await current()).runtime.state==='running');
   await frame.evaluate(`[...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe').querySelector('.dshpm-btn-update').click();`);
+  await waitFor(()=>frame.evaluate(`Boolean(document.querySelector('[role=dialog]'))`),'故障验收更新确认');
+  const beforeFailure=await current();failResolution=true;
+  await frame.evaluate(`[...document.querySelectorAll('[role=dialog] button')].find(button=>/^(更新|Update)$/.test(button.innerText.trim())).click();`);
+  const failedFeedback=await waitFor(()=>frame.evaluate(`document.querySelector('.dshpm-toast-err')?.innerText.includes('原安装已恢复')&&document.querySelector('.dshpm-toast-err').innerText`),'原页面说明更新失败且恢复原安装',180_000);
+  failResolution=false;
+  const recovered=await waitFor(async()=>{const p=await current();return p?.runtime?.state==='running'&&p;},'恢复原版本真实运行',120_000);
+  report.check('先移除后解析失败恢复原摘要、授权及启停意愿，原页面说明恢复结果',
+    rejectedResolutions>0&&recovered.digest===beforeFailure.digest&&recovered.enabled===beforeFailure.enabled&&recovered.active===beforeFailure.active
+      &&JSON.stringify(recovered.grants)===JSON.stringify(beforeFailure.grants),JSON.stringify({failedFeedback,rejectedResolutions}));
+  await frame.evaluate(`Promise.all(document.querySelector('.dshpm-toast-err').getAnimations().map(animation=>animation.finished.catch(()=>{})))`);
+  await writeFile(join(output,'manager-update-failed-restored.png'),Buffer.from(await ui.screenshot(),'base64'));
+  holdResolution=true;
+  const interrupted=api(`/api/plugins/${manager.manifest.id}/routes`,{method:'POST',path:'/api/plugin-manager/update',body:{name:'dsh-plugin-release-probe'}})
+    .then(value=>({value}),error=>({error:String(error)}));
+  await waitFor(()=>held.size>0,'旧版已移除后的候选解析等待',30_000);
+  const checkpoint=JSON.parse(await readFile(join(work,'state/plugins/state.json'),'utf8'));
+  report.check('移除后的原安装与归档引用持久保存在 daemon 唯一安装状态',
+    !checkpoint.plugins[targetId]&&checkpoint.removals[targetId]?.installed.digest===beforeFailure.digest);
+  await writeFile(join(output,'state-before-interruption.json'),JSON.stringify(checkpoint,null,2));
+  const {stdout}=await promisify(execFile)('ps',['-axo','pid=,ppid=,command=']);
+  const processes=stdout.split('\n').map(line=>line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/)).filter(Boolean);
+  const daemon=processes.find(([,pid,parent,command])=>Number(parent)===app.child.pid&&command.includes('/daemon/magi-daemon'));
+  assert.ok(daemon,'仅终止本次验收应用的受控 daemon');
+  const resolver=processes.find(([,pid,parent,command])=>Number(parent)===Number(daemon[1])&&command.includes('/compat/cli.mjs resolve dsh-plugin-release-probe'));
+  assert.ok(resolver,'核对本次 daemon 正在运行的真实翻译进程');
+  frame.close();frame=undefined;await page.call('Page.navigate',{url:'about:blank'});page.close();page=undefined;
+  process.kill(Number(daemon[1]),'SIGKILL');
+  await waitFor(()=>fetch(origin+'/health').then(()=>false,()=>true),'中断 daemon 已停止监听');
+  await waitFor(()=>{try{process.kill(Number(resolver[1]),0);return false;}catch(error){if(error.code==='ESRCH')return true;throw error;}},'daemon 崩溃后所有者管道结束真实翻译进程',30_000);
+  report.check('daemon 断进程后联网中的翻译工具链退出，旧解析连接不再重试',true);
+  await stop('electron-interrupted.log');await interrupted;
+  holdResolution=false;for(const response of held)response.destroy();
+  const resolutionsBeforeRestart=targetResolutions;
+  await start();
+  const restored=await waitFor(async()=>{const p=await current();return p?.runtime?.state==='running'&&p;},'断进程后原安装自动恢复运行',120_000);
+  report.check('候选提交前 daemon 断进程后恢复原版本及授权，不重新下载或重放安装',
+    restored.digest===beforeFailure.digest&&restored.enabled===beforeFailure.enabled&&restored.active===beforeFailure.active
+      &&JSON.stringify(restored.grants)===JSON.stringify(beforeFailure.grants)&&targetResolutions===resolutionsBeforeRestart,
+    JSON.stringify({restored,beforeFailure,targetResolutions,resolutionsBeforeRestart}));
+  await ui.click('[data-testid=sidebar-settings]');await waitFor(()=>ui.exists(nav),'断进程恢复后原包入口');await ui.click(nav);
+  const recoveredUrl=await waitFor(()=>page.evaluate(`document.querySelector(${JSON.stringify(selector)})?.src`),'断进程恢复后原包页面');
+  frame=await waitFor(()=>connectTarget(cdpPort,t=>['iframe','page'].includes(t.type)&&t.url===recoveredUrl,'恢复 Mgr 页面',errors),'断进程后原包文档');
+  await waitFor(()=>frame.evaluate(`Boolean([...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe'))`),'断进程后原包真实目录');
+  await frame.evaluate(`(() => {const card=[...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe');if(!card.classList.contains('is-open'))card.querySelector('.dshpm-row').click();})()`);
+  await waitFor(()=>frame.evaluate(`Boolean([...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe')?.querySelector('.dshpm-btn-update'))`),'断进程后原包更新入口恢复',120_000);
+  await frame.evaluate(`[...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe').querySelector('.dshpm-btn-update').click();`);
   await waitFor(()=>frame.evaluate(`Boolean(document.querySelector('[role=dialog]'))`),'重新打开更新确认');
   await frame.evaluate(`[...document.querySelectorAll('[role=dialog] button')].find(button=>/^(更新|Update)$/.test(button.innerText.trim())).click();`);
   await waitFor(async()=>(await current()).manifest.version==='0.0.8','原包确认按钮完成在线更新',180_000);
@@ -217,4 +286,4 @@ try {
   }
   if(ui)await writeFile(join(output,'failure.png'),Buffer.from(await ui.screenshot(),'base64')).catch(()=>{});
 }
-finally {await writeFile(join(output,'results.json'),JSON.stringify({checks:report.results,errors,stateRoot:join(work,'state')},null,2));frame?.close();page?.close();if(app){await writeFile(join(output,'electron.log'),app.log.join(''));await app.stop();}}
+finally {await writeFile(join(output,'results.json'),JSON.stringify({checks:report.results,errors,stateRoot:join(work,'state')},null,2));frame?.close();page?.close();if(app){await writeFile(join(output,'electron.log'),app.log.join(''));await app.stop();}registryProxy.closeAllConnections();await new Promise(resolve=>registryProxy.close(resolve));}

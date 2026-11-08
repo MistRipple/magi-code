@@ -310,6 +310,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn management_change_restores_only_its_own_removed_installation_and_rejects_stale_writers()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::bare_state(root.path());
+        let caller = package_permissions("acme.manager", &["install", "lifecycle", "background"]);
+        let readonly = package_permissions("acme.observer", &["background"]);
+        let target = package("acme.target", false);
+        install(&state, &caller, true);
+        install(&state, &readonly, true);
+        install(&state, &target, true);
+        let original = state.plugin_manager.lock().unwrap().state().plugins["acme.target"].clone();
+        let operations = PluginOperations::from_state(&state);
+        let request = json!({"pluginId":"acme.target","expectedDigest":target.digest(),"changeId":"request-1"});
+        for (id, digest, lease) in [
+            ("acme.observer", readonly.digest(), "current"),
+            ("acme.manager", caller.digest(), "expired"),
+        ] {
+            assert!(
+                operations
+                    .call_background(id, digest, Some(lease), "plugins.remove", request.clone())
+                    .await
+                    .is_err()
+            );
+        }
+        operations
+            .call_background(
+                "acme.manager",
+                caller.digest(),
+                Some("current"),
+                "plugins.remove",
+                request.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !state
+                .plugin_manager
+                .lock()
+                .unwrap()
+                .state()
+                .plugins
+                .contains_key("acme.target")
+        );
+        assert!(
+            operations
+                .install_or_upgrade(&target, original.source.clone(), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            operations
+                .call_background(
+                    "acme.manager",
+                    caller.digest(),
+                    Some("expired"),
+                    "plugins.finishChange",
+                    json!({"changeId":"request-1","commit":true})
+                )
+                .await
+                .is_err()
+        );
+        operations
+            .call_background(
+                "acme.manager",
+                caller.digest(),
+                Some("current"),
+                "plugins.finishChange",
+                json!({"changeId":"request-1","commit":false}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            state.plugin_manager.lock().unwrap().state().plugins["acme.target"],
+            original
+        );
+        operations
+            .call_background(
+                "acme.manager",
+                caller.digest(),
+                Some("current"),
+                "plugins.remove",
+                request,
+            )
+            .await
+            .unwrap();
+        operations.installation_instance_ended("acme.manager", "current");
+        assert_eq!(
+            state.plugin_manager.lock().unwrap().state().plugins["acme.target"],
+            original,
+            "instance end restores pending removals without downloading or changing authorization"
+        );
+    }
+
+    #[tokio::test]
     async fn background_management_requires_its_own_grant_and_current_instance() {
         let root = tempfile::tempdir().unwrap();
         let state = super::super::tests::bare_state(root.path());
@@ -1033,6 +1127,23 @@ impl PluginOperations {
         ));
     }
 
+    fn change_scope(
+        caller: OperationCaller<'_>,
+        change_id: String,
+    ) -> Result<magi_plugin_system::PluginChangeScope, ApiError> {
+        let scope = magi_plugin_system::PluginChangeScope {
+            plugin: caller.0.into(),
+            digest: caller.1.into(),
+            instance: caller
+                .2
+                .ok_or_else(|| ApiError::Forbidden("管理恢复需要活动宿主实例".into()))?
+                .into(),
+            change_id,
+        };
+        scope.validate().map_err(plugin_error)?;
+        Ok(scope)
+    }
+
     pub(super) async fn quiesce(&self, id: &str) -> Result<(), ApiError> {
         let executable = self
             .locked("读取扩展宿主")?
@@ -1058,6 +1169,33 @@ impl PluginOperations {
         source: PluginSource,
         caller: Option<OperationCaller<'_>>,
     ) -> Result<(), ApiError> {
+        self.install_or_upgrade_change(package, source, caller, None)
+            .await
+    }
+
+    async fn install_or_upgrade_change(
+        &self,
+        package: &PluginPackage,
+        source: PluginSource,
+        caller: Option<OperationCaller<'_>>,
+        scope: Option<&magi_plugin_system::PluginChangeScope>,
+    ) -> Result<(), ApiError> {
+        {
+            let mut manager = self.locked("检查待恢复移除")?;
+            if manager
+                .removed_for_change(&package.manifest().id, scope)
+                .map_err(plugin_error)?
+            {
+                Self::check_caller(&manager, caller, "install")?;
+                self.check_upstream_compatibility(&manager, package, &source)?;
+                manager
+                    .replace_removed(package, source, scope.unwrap())
+                    .map_err(plugin_error)?;
+                drop(manager);
+                self.changed();
+                return Ok(());
+            }
+        }
         let installed = self
             .locked("读取已安装插件")?
             .state()
@@ -1306,6 +1444,35 @@ impl PluginOperations {
                 serde_json::to_value(self.installations.cancel(&owner, &input.request_id).await?)
                     .map_err(|e| ApiError::internal_assembly("编码安装取消结果失败", e))
             }
+            "plugins.finishChange" => {
+                let input: magi_app_server_protocol::generated::PluginManagementChangeRequest =
+                    serde_json::from_value(params).map_err(|e| {
+                        ApiError::InvalidInput(format!("管理恢复结算参数无效：{e}"))
+                    })?;
+                let identity = Some((caller, digest, lease, background));
+                let scope = Self::change_scope(identity.unwrap(), input.change_id)?;
+                let restored = {
+                    let mut manager = self.locked("结算管理移除恢复")?;
+                    Self::check_caller(&manager, identity, "lifecycle")?;
+                    manager
+                        .finish_change(&scope, input.commit)
+                        .map_err(plugin_error)?
+                };
+                self.changed();
+                for id in &restored {
+                    if self
+                        .locked("读取恢复激活意愿")?
+                        .is_active(id)
+                        .map_err(plugin_error)?
+                    {
+                        self.wait_running(id, identity).await?;
+                    }
+                }
+                serde_json::to_value(
+                    magi_app_server_protocol::generated::PluginManagementChangeReceipt { restored },
+                )
+                .map_err(|error| ApiError::internal_assembly("编码管理恢复回执失败", error))
+            }
             "plugins.preview" => {
                 let request = serde_json::from_value(params)
                     .map_err(|e| ApiError::InvalidInput(format!("预览参数无效：{e}")))?;
@@ -1418,15 +1585,17 @@ impl PluginOperations {
             "plugins.setEnabled" | "plugins.remove" => {
                 use magi_app_server_protocol::generated::PluginSetEnabledRequest;
                 let remove = method == "plugins.remove";
+                let mut change_scope = None;
                 let input = if remove {
-                    #[derive(Deserialize)]
-                    #[serde(rename_all = "camelCase", deny_unknown_fields)]
-                    struct Remove {
-                        plugin_id: String,
-                        expected_digest: Option<String>,
+                    let target: magi_app_server_protocol::generated::PluginRemoveRequest =
+                        serde_json::from_value(params)
+                            .map_err(|e| ApiError::InvalidInput(format!("移除参数无效：{e}")))?;
+                    if let Some(change_id) = target.change_id {
+                        change_scope = Some(Self::change_scope(
+                            (caller, digest, lease, background),
+                            change_id,
+                        )?);
                     }
-                    let target: Remove = serde_json::from_value(params)
-                        .map_err(|e| ApiError::InvalidInput(format!("移除参数无效：{e}")))?;
                     PluginSetEnabledRequest {
                         plugin_id: target.plugin_id,
                         expected_digest: target.expected_digest,
@@ -1454,6 +1623,43 @@ impl PluginOperations {
                             "停用原因仅可用于停用操作，须为 1–4096 字节".into(),
                         ));
                     }
+                }
+                if let Some(scope) = change_scope {
+                    let identity = Some((caller, digest, lease, background));
+                    {
+                        let manager = self.locked("检查可恢复移除")?;
+                        Self::check_caller(&manager, identity, "lifecycle")?;
+                        Self::check_target(
+                            &manager,
+                            &input.plugin_id,
+                            input.expected_digest.as_deref(),
+                        )?;
+                    }
+                    let drain = PluginManager::begin_upgrade_drain(
+                        Arc::clone(&self.manager),
+                        &input.plugin_id,
+                    )
+                    .map_err(plugin_error)?;
+                    self.quiesce(&input.plugin_id).await?;
+                    let result = {
+                        let mut manager = self.locked("提交可恢复移除")?;
+                        Self::check_caller(&manager, identity, "lifecycle")?;
+                        Self::check_target(
+                            &manager,
+                            &input.plugin_id,
+                            input.expected_digest.as_deref(),
+                        )?;
+                        let result = manager
+                            .remove_for_change(&input.plugin_id, scope, &drain)
+                            .map_err(plugin_error);
+                        if result.is_ok() {
+                            drain.commit(&mut manager);
+                        }
+                        result
+                    };
+                    self.changed();
+                    result?;
+                    return self.projection();
                 }
                 self.manage_target(
                     &input.plugin_id,

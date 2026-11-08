@@ -114,6 +114,7 @@ daemon 响应形状：
 | `plugins.installBundle/cancelInstall` | `api.plugins.installBundle(input)`／`cancelInstall(requestId)` | 另协商 `plugin.installations`，使用 `PluginBundleInstall*` DTO；由 daemon 完成在线版本解析、准备、安装／升级及请求的启停，返回实际应用结果。两者均需 install 授权，后台调用另需 background；启停及代授新版本分别核对 lifecycle、authorize 委托 |
 | `plugins.reconcile` | `api.plugins.reconcile({pluginIds})` | 协商 `plugin.reconciliation`，需 `pluginManagement:["lifecycle"]`，后台另需 background。输入 `PluginReconcileRequest`（至多 512 个唯一已安装 ID），沿 daemon 原监管器收敛已提交的激活意图并等待所选活动扩展真实就绪；所有目标共用 110 秒预算。返回既有目录 DTO；停用项保持停用，未变化实例保持代次，缺少监管器、启动失败、排空、版本／激活变化、过期租约和撤权明确失败。不授予权限、不重新安装、不清空故障或强制重启 |
 | `plugins.setEnabled/remove` | `api.plugins.setEnabled(pluginId,enabled,expectedDigest?,options?)`／`remove(pluginId,expectedDigest?)` | 需协商 `plugin.management` 与 `pluginManagement:["lifecycle"]`；复用 HTTP 的生命周期、排空与停止端口。启停输入为 `PluginSetEnabledRequest`；options 可带 `reason`（仅停用，1–4096 字节）及 `expectedState`，后者须与 expectedDigest 一起提交。daemon 注入停用者身份，与 enabled/active 原子保存；启用及显式停用会清除旧来源。排空前后比较相同摘要及启停来源，过期恢复拒绝。拒绝当前发起插件的自身停止、删除或升级；启用后等待真实宿主运行状态，启动失败不返回成功 |
+| `plugins.finishChange` | `api.plugins.finishChange({changeId,commit})` | 协商 `plugin.changes`，需 lifecycle，后台另需 background。`remove` 第三个参数和 `installBundle` 输入可携带同一 changeId；使用 `PluginRemoveRequest`、`PluginManagementChangeRequest/Receipt`。移除原安装由 daemon 暂存恢复引用；失败结算恢复尚未提交候选的原安装并等待原活动扩展运行，回执 `restored` 列出本次真实恢复的 ID。成功结算确认独立卸载；已提交候选不会回退。身份绑定当前调用者包摘要和实例，不能结算其他实例的操作 |
 | `tool.call` | `api.tools.call(tool,input)` | 只接受公开原生工具；需要真实 Task、租约、策略、schema、权限、审批与账本 |
 | `task.spawn` | `api.task.spawn(input)` | 原生 agent_spawn 合同；保留角色、自定义模型绑定、目录与策略，不接受伪造归属 |
 | `notify.user` | `api.notify.user({message,title?})` | 原生通知事实、持久化与事件；正文最多 4096 字节、标题 256 字节 |
@@ -152,6 +153,8 @@ DSH `profileContext.packageManager` 提供插件实例拥有的内部 Node 命�
 辅助进程仅取得父实例私有管道的独立随机委托，不继承 daemon 扩展 RPC 凭据。每实例最多 16 个直接辅助进程、32 个连接，请求和回执各限 4 MiB；读写仍经当前父实例的 SDK 和 daemon 授权入口，派生辅助进程继续沿父委托转交。成功退出前，变动过的清单／启停提案按当前摘要复核并经既有 profile 提交入口结算；失败退出丢弃提案，不写物理 profile。调用取消、子进程退出和实例处置撤销该委托，并取消其准备中的安装；已进入提交的安装仍按原任务合同结算。包管理能力的使用单独进入安装授权预览，单纯读取 profile 名称或目录不因此增加安装／代授权委托。
 
 当前 profile 的 `dsh plugin add/remove` 命令同样进入公共管理边界。单条命令终止会阻止排队中或目录读取后的新业务调用；已发起的安装按其 requestId 取消，进入提交后的真实回执仍沿安装任务合同结算。命令终止不取消父请求、其他命令或父请求已有的配置提案，同一请求可以显式重试；不将命令自身的取消信号序列化到 daemon DTO。
+
+原包管理服务在一次调用快照内首次移除时生成 changeId，随后安装复用同一身份；调用成功结算独立卸载，失败、异常或取消则要求 daemon 恢复尚未提交候选的移除。原安装记录（含来源、摘要、授权、启停来源和意愿）转为 PluginManager 同一状态中的待结算记录，归档不复制、不删除；当前目录如实不包含已移除目标，其他调用不能占用它。候选提交复用原版本切换及数据重置日志，原恢复引用随同一次提交移除，不绕过数据版本或新摘要授权。实例结束或 daemon 重启恢复未结算原安装，不重新下载、授权、执行安装或回放插件业务；之后由原监管器按原激活意愿启动。调用失败的页面错误附带已恢复说明；结算或运行未确认时明确要求检查当前状态，不声称业务已成功，也不自动重试。
 
 在线安装任务由 daemon 持有，安装及授权事实仍只写入 PluginManager。`plugins/installations.json` 仅保存原始请求身份、候选摘要、提交阶段和回执，不是第二份安装目录。requestId 为 1–128 个字母、数字或 `-_.:`，绑定发起插件、包摘要和完整输入；同身份同输入只执行一次，不同输入拒绝复用。身份不依赖宿主实例代次，重启后仍可沿相同 requestId 读取原回执；每次读取仍须当前实例的 install 授权，后台调用另需 background。取消及实例结束只作用于原发起实例，旧实例不能操纵新任务。
 

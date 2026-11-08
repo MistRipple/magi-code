@@ -31,6 +31,12 @@ impl PluginManager {
             .state
             .plugins
             .get(&journal.plugin_id)
+            .or_else(|| {
+                self.state
+                    .removals
+                    .get(&journal.plugin_id)
+                    .map(|value| &value.installed)
+            })
             .ok_or_else(|| PluginError::CorruptState("升级数据重置缺少安装事实".into()))?
             .digest;
         if digest == &journal.from_digest {
@@ -73,8 +79,51 @@ impl PluginManager {
         if drain.plugin_id() != id || !self.is_draining(id) {
             return Err(conflict("升级必须先关闭该插件的准入"));
         }
-        // 没有数据转换通道：数据格式版本变化时，旧格式数据在切换后清空（预览阶段已告知）。
-        let reset_data = self.package(id)?.manifest().data_schema_version
+        self.upgrade_from(package, source, current.clone())
+    }
+
+    /// 原宿主已在移除时排空；候选仍使用同一版本提交及数据重置实现。
+    pub fn replace_removed(
+        &mut self,
+        package: &PluginPackage,
+        source: PluginSource,
+        scope: &PluginChangeScope,
+    ) -> Result<(), PluginError> {
+        self.recover_data_reset()?;
+        let id = package.manifest().id.as_str();
+        self.removed_for_change(id, Some(scope))?;
+        let previous = self
+            .state
+            .removals
+            .get(id)
+            .ok_or_else(|| conflict("目标没有待恢复移除"))?
+            .installed
+            .clone();
+        ensure_same_source(&previous.source, &source)?;
+        if previous.digest == package.digest() {
+            let mut next = self.state.clone();
+            next.removals.remove(id);
+            next.plugins.insert(id.into(), previous);
+            return self.commit(next);
+        }
+        self.upgrade_from(package, source, previous)
+    }
+
+    fn upgrade_from(
+        &mut self,
+        package: &PluginPackage,
+        source: PluginSource,
+        current: InstalledPlugin,
+    ) -> Result<(), PluginError> {
+        let id = package.manifest().id.as_str();
+        let old = PluginPackage::from_archive(&fs::read(self.root.join(&current.package_path))?)?;
+        if old.digest() != current.digest || old.manifest().id != id {
+            return Err(PluginError::CorruptState(
+                "移除恢复原包身份或摘要无效".into(),
+            ));
+        }
+        // 没有数据转换通道：数据格式版本变化时沿原提交恢复日志处理。
+        let reset_data = old.manifest().data_schema_version
             != package.manifest().data_schema_version
             && self.resources.has_data(id);
         let previous_entries = reset_data.then(|| self.resources.entries(id));
@@ -92,6 +141,7 @@ impl PluginManager {
             disabled_by: None,
         };
         let mut next = self.state.clone();
+        next.removals.remove(id);
         next.plugins.insert(id.to_owned(), replacement);
         if reset_data {
             // 恢复日志先于数据变更；安装摘要是恢复时的唯一裁决依据。

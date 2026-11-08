@@ -6,6 +6,14 @@ import { renderText } from './core/report.mjs';
 import { createRegistry } from './index.mjs';
 import { registryOptions } from './core/registry-options.mjs';
 
+// daemon 独占的管道关闭即结束工具链；崩溃时也不能留下联网重试的孤儿进程。
+if (process.env.MAGI_TRANSLATOR_OWNER_PIPE === '1') {
+  process.stdin.on('end', () => process.exit(1));
+  process.stdin.on('error', () => process.exit(1));
+  process.stdin.resume();
+  process.stdin.unref?.();
+}
+
 const [command, directory, ...flags] = process.argv.slice(2);
 const optionOf = (list, name) => { const i = list.indexOf(`--${name}`); return i === -1 ? undefined : list[i + 1]; };
 const flag = (name) => optionOf(flags, name);

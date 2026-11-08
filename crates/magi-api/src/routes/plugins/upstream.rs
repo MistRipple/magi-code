@@ -665,10 +665,11 @@ pub(super) async fn run_toolchain(
     command
         .arg(toolchain.compat.join("cli.mjs"))
         .args(args)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    command.env("MAGI_TRANSLATOR_OWNER_PIPE", "1");
     command.env(
         "MAGI_DSH_COMPATIBILITY_POLICY",
         serde_json::to_string(&state.dsh_compatibility()?)
@@ -676,6 +677,7 @@ pub(super) async fn run_toolchain(
     );
     let mut child = magi_process::spawn_managed_tokio_in_group(&state.processes, &mut command)
         .map_err(|error| ApiError::internal_assembly("启动翻译器失败", error))?;
+    let owner = child.take_stdin();
     let mut out = child.take_stdout();
     let mut err = child.take_stderr();
     let collect = async {
@@ -702,6 +704,7 @@ pub(super) async fn run_toolchain(
             return Err(ApiError::InvalidInput("翻译上游插件超时".into()));
         }
     };
+    drop(owner);
     let status = status.map_err(|error| ApiError::internal_assembly("等待翻译器失败", error))?;
     if !status.success() {
         let message = String::from_utf8_lossy(&stderr);

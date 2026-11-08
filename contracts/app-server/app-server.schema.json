@@ -6896,6 +6896,12 @@
         "github": {
           "$ref": "#/$defs/PluginGithubSource",
           "description": "GitHub 仓库来源；package 可选并用于核对原包名称。确认安装须携带预览固定的 commit。"
+        },
+        "changeId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "当前管理调用的恢复边界身份；绑定调用者包摘要和实例。"
         }
       },
       "anyOf": [
@@ -7297,6 +7303,65 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 4096
+        }
+      }
+    },
+    "PluginRemoveRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pluginId"
+      ],
+      "properties": {
+        "pluginId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedDigest": {
+          "type": "string"
+        },
+        "changeId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "当前管理调用的恢复边界身份；绑定调用者包摘要和实例。"
+        }
+      }
+    },
+    "PluginManagementChangeRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "changeId",
+        "commit"
+      ],
+      "properties": {
+        "changeId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "当前管理调用的恢复边界身份；绑定调用者包摘要和实例。"
+        },
+        "commit": {
+          "type": "boolean",
+          "description": "成功调用确认移除；失败调用恢复尚未被新版本提交的原安装。"
+        }
+      }
+    },
+    "PluginManagementChangeReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "restored"
+      ],
+      "properties": {
+        "restored": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "string"
+          },
+          "description": "本次结算已恢复原安装的插件 ID；候选已提交的目标不会列入。"
         }
       }
     }

@@ -16,7 +16,7 @@ pub use catalog::{
 };
 pub use lifecycle::{
     ActivePlugin, InstalledPlugin, PluginDrainGuard, PluginManager, PluginManagerState,
-    PluginSource, PreparedToolCall, RetiredBuiltin,
+    PluginSource, PreparedToolCall, RetiredBuiltin, PluginChangeScope,
 };
 pub use magi_app_server_protocol::{PluginManifest, PluginPermission, PluginPermissionKind};
 pub use package::{MAX_EXTENSION_ENTRY_BYTES, MAX_PACKAGE_BYTES, PluginPackage, validate_manifest, icon_content_type, validate_icon};

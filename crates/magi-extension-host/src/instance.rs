@@ -643,6 +643,7 @@ impl Incoming for HostHandler {
                                 | "plugins.authorize"
                                 | "plugins.setEnabled"
                                 | "plugins.remove"
+                                | "plugins.finishChange"
                                 | "plugins.setVersionExemption"
                         )
                         || object.contains_key("invocationId")
@@ -720,6 +721,7 @@ impl Incoming for HostHandler {
                         | "plugins.reconcile"
                         | "plugins.setEnabled"
                         | "plugins.remove"
+                        | "plugins.finishChange"
                         | "plugins.authorize"
                         | "plugins.setVersionExemption"
                         | "session.message"
@@ -1117,6 +1119,7 @@ fn check_hello(
         "plugin.installations",
         "plugin.directory.events",
         "plugin.reconciliation",
+        "plugin.changes",
         "plugin.skills",
         "session.directory",
         "session.messages",

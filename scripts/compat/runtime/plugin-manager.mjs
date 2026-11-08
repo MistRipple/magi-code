@@ -2,7 +2,7 @@
 // 管理插件单独获得 authorize 委托；失败不能把已下载当成已运行。
 import { NPM_NAME as NAME, parseBundleSpec, dshBundle } from './plugin-source.mjs';
 export { parseBundleSpec } from './plugin-source.mjs';
-import { profileCompatibility, updateProfileExemption, createProfileMutation } from './profile.mjs';
+import { profileCompatibility, updateProfileExemption, createProfileMutation, profileChangeId } from './profile.mjs';
 
 const failure = (error, extra = {}) => ({ ...error.receipt, application: 'failed', ...extra,
   error: { code: error.code ?? 'magi-operation-failed', message: String(error.message ?? error), diagnostic: String(error.message ?? error),
@@ -53,7 +53,8 @@ export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTR
         if (options.registry && options.registry.replace(/\/+$/, '') !== registry.replace(/\/+$/, '')) throw new Error('安装源与 Magi 当前 registry 不一致，请先在 Magi 中配置安装源');
         const input = { ...parseBundleSpec(spec), requestId: options.requestId ?? crypto.randomUUID(),
           ...(options.enabled === undefined ? {} : { enabled: options.enabled }) };
-        return await mutateProfile(() => api.plugins.installBundle(input));
+        return await mutateProfile(() => api.plugins.installBundle({ ...input,
+          ...(profileChangeId() ? { changeId: profileChangeId() } : {}) }));
       } catch (error) { return failure(error, { stage: error.receipt?.installed ? 'reconcile' : 'install' }); }
     };
   }
@@ -74,7 +75,8 @@ export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTR
       if (!NAME.test(name)) throw new Error('npm 包名无效');
       return await mutateProfile(async () => {
         const plugin = await find(name);
-        await api.plugins.remove(plugin.manifest.id, plugin.digest);
+        const changeId = profileChangeId(true);
+        await api.plugins.remove(plugin.manifest.id, plugin.digest, changeId ? { changeId } : {});
         return { bundle: name, application: 'applied' };
       });
     } catch (error) { return failure(error); }
