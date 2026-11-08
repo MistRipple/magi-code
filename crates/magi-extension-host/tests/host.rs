@@ -1076,6 +1076,23 @@ async fn view_routes_bind_exact_and_prefix_dispatch_and_release_at_runtime() {
         call("/gone", "r-8").await.unwrap_err().kind(),
         ErrorKind::MethodNotFound
     );
+    let bytes = call("/bytes", "r-bytes").await.unwrap();
+    assert_eq!(bytes["bodyBase64"], "AP+A");
+    assert!(bytes.get("body").is_none());
+    assert_eq!(bytes["headers"]["x-original"], "bytes");
+    for (path, id) in [
+        ("/conflicting-body", "r-conflict"),
+        ("/too-big", "r-too-big"),
+    ] {
+        let failed = call(path, id).await.unwrap();
+        assert_eq!(failed["status"], 500);
+        assert!(!failed["body"]["error"].as_str().unwrap().is_empty());
+    }
+    assert_eq!(
+        call("/status", "r-after-errors").await.unwrap()["status"],
+        200,
+        "非法/超限路由响应不能击穿帧限制并终止宿主"
+    );
 }
 
 #[tokio::test]

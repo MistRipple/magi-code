@@ -61,6 +61,13 @@ package.json，不包含插件可写配置或凭据。旧包缺失该文件时�
 旧请求省略时保持原行为；Magi HTTP 身份头不随该字段转交。DSH 路由适配器校验头名、
 值、数量和大小，并拒绝覆盖宿主身份及传输控制头。
 
+`PluginRouteCallRequest/Result.bodyBase64` 为原始正文的字节表示，与非空 `body` 互斥；
+`PluginRouteCallResult.headers` 提供应用响应头，`PluginRouteMethod` 增加 HEAD／OPTIONS。
+所有载荷共用原路由执行、实例授权和取消入口。解码后字节最多 2 MiB，JSON 消息最多
+3 MiB 加 64 KiB；daemon 在分发前校验，Node／页面读取流时也有界并响应取消。响应不携带
+Set-Cookie、宿主身份或传输控制头。未使用字节表示的原生 SDK 调用继续使用结构化 body，
+不是另一个执行器或文件存储。图片附件的分块服务和权限保持独立。
+
 `ModelAttempt.transport` 是可选的逐次 HTTP 证据，包含实际请求摘要、HTTP 状态、
 已报告的 Token usage 和 transport outcome。旧记录或非 HTTP 执行器缺失时保持
 未知。它不替代 Step/attempt 的逻辑状态；HTTP 已返回不表示模型输出已被接受。

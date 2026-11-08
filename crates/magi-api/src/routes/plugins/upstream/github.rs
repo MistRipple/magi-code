@@ -57,26 +57,41 @@ pub(super) async fn acquire(
         .repository
         .trim_end_matches(".git")
         .to_ascii_lowercase();
-    // 显式 commit 不重新解释浮动分支；预览确认后分支移动也不能改变安装内容。
-    let commit = if let Some(commit) = &source.commit {
-        commit.to_ascii_lowercase()
-    } else {
-        let reference = urlencoding::encode(source.reference.as_deref().unwrap_or("HEAD"));
-        let url = format!("https://api.github.com/repos/{repository}/commits/{reference}");
-        let bytes = download_bytes(&url, MAX_REGISTRY_DOCUMENT_BYTES, "GitHub 提交").await?;
-        let document: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| ApiError::InvalidInput("GitHub 提交响应无效".into()))?;
-        let commit = document["sha"].as_str().unwrap_or_default();
-        let pinned = PluginGithubSource {
-            repository: repository.clone(),
-            reference: source.reference.clone(),
-            commit: Some(commit.into()),
-        };
-        validate(&pinned)?;
-        commit.to_ascii_lowercase()
-    };
-    let url = format!("https://codeload.github.com/{repository}/tar.gz/{commit}");
-    let bytes = download_bytes(&url, npm::MAX_TARBALL_BYTES, "GitHub 原包").await?;
+    // 从同一份 Git 归档读取实际提交并绑定预览摘要。确认提交后只取该 SHA，
+    // 不再次解释浮动引用；不维护 REST 解析或 rate-limit 后的第二条来源路径。
+    let revision = source
+        .commit
+        .as_deref()
+        .or(source.reference.as_deref())
+        .unwrap_or("HEAD");
+    let revision = urlencoding::encode(revision);
+    let url = format!("https://codeload.github.com/{repository}/tar.gz/{revision}");
+    let mut bytes = download_bytes(&url, npm::MAX_TARBALL_BYTES, "GitHub 原包").await?;
+    let commit = npm::repository_commit(&bytes)
+        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+    if source
+        .commit
+        .as_ref()
+        .is_some_and(|expected| !expected.eq_ignore_ascii_case(&commit))
+    {
+        return Err(ApiError::InvalidInput(
+            "GitHub 归档提交与预览确认身份不一致".into(),
+        ));
+    }
+    if !revision.eq_ignore_ascii_case(&commit) {
+        // GitHub 按请求引用生成归档根名，tag 与 SHA 的 tar 字节并不相同。
+        // 安装准备始终取 SHA 归档，保证预览和确认使用同一完整性与摘要。
+        let url = format!("https://codeload.github.com/{repository}/tar.gz/{commit}");
+        bytes = download_bytes(&url, npm::MAX_TARBALL_BYTES, "GitHub 固定提交原包").await?;
+        if npm::repository_commit(&bytes)
+            .map_err(|error| ApiError::InvalidInput(error.to_string()))?
+            != commit
+        {
+            return Err(ApiError::InvalidInput(
+                "GitHub 固定归档的提交身份不一致".into(),
+            ));
+        }
+    }
     let integrity = format!(
         "sha512-{}",
         base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&bytes))

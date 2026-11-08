@@ -50,6 +50,44 @@ pub fn unpack_repository_tarball(tarball: &[u8], target: &Path) -> Result<(), Pl
     unpack(tarball, target, None)
 }
 
+/// Git archive 在首个全局 PAX header 中记录实际提交。身份来自这份已下载的归档，
+/// 调用方据此取固定 SHA 的归档，不依赖第二种引用解析服务或公共 REST 查询配额。
+pub fn repository_commit(tarball: &[u8]) -> Result<String, PluginError> {
+    if tarball.is_empty() || tarball.len() > MAX_TARBALL_BYTES {
+        return Err(invalid("上游 tarball 大小超限"));
+    }
+    let mut archive = tar::Archive::new(GzDecoder::new(tarball));
+    let mut entries = archive
+        .entries()
+        .map_err(|_| invalid("仓库归档不是有效的 gzip tar"))?;
+    let mut entry = entries
+        .next()
+        .ok_or_else(|| invalid("仓库归档为空"))?
+        .map_err(|_| invalid("仓库归档元数据无法读取"))?;
+    if !entry.header().entry_type().is_pax_global_extensions()
+        || entry.header().size().unwrap_or(u64::MAX) > 64 * 1024
+    {
+        return Err(invalid("仓库归档缺少有界的 Git 提交元数据"));
+    }
+    let metadata = entry
+        .pax_extensions()
+        .map_err(|_| invalid("仓库归档 PAX 元数据无效"))?
+        .ok_or_else(|| invalid("仓库归档缺少 Git 提交元数据"))?;
+    let mut commit = None;
+    for item in metadata {
+        let item = item.map_err(|_| invalid("仓库归档 PAX 记录无效"))?;
+        if item.key_bytes() != b"comment" {
+            continue;
+        }
+        let value = item.value().map_err(|_| invalid("仓库归档提交身份无效"))?;
+        if commit.is_some() || value.len() != 40 || !value.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(invalid("仓库归档提交身份缺失、重复或无效"));
+        }
+        commit = Some(value.to_ascii_lowercase());
+    }
+    commit.ok_or_else(|| invalid("仓库归档缺少 Git 提交身份"))
+}
+
 fn unpack(tarball: &[u8], target: &Path, mut root: Option<String>) -> Result<(), PluginError> {
     if tarball.is_empty() || tarball.len() > MAX_TARBALL_BYTES {
         return Err(invalid("上游 tarball 大小超限"));
@@ -258,12 +296,59 @@ mod tests {
             archive.into_inner().unwrap().finish().unwrap()
         };
         let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            repository_commit(&build_git(false)).unwrap(),
+            "a".repeat(40)
+        );
         unpack_repository_tarball(&build_git(false), dir.path()).unwrap();
         assert!(dir.path().join("package.json").is_file());
         assert!(!dir.path().join("pax_global_header").exists());
         let dir = tempfile::tempdir().unwrap();
         assert!(unpack_repository_tarball(&build_git(true), dir.path()).is_err());
         assert!(!dir.path().join("link").exists());
+    }
+
+    #[test]
+    fn repository_identity_rejects_missing_invalid_duplicate_and_unbounded_metadata() {
+        let with_metadata = |records: &[(&str, &str)]| {
+            let mut payload = Vec::new();
+            for (key, value) in records {
+                let content = format!("{key}={value}\n");
+                let mut length = content.len() + 2;
+                loop {
+                    let actual = content.len() + length.to_string().len() + 1;
+                    if actual == length {
+                        break;
+                    }
+                    length = actual;
+                }
+                payload.extend_from_slice(format!("{length} {content}").as_bytes());
+            }
+            let mut archive = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::XGlobalHeader);
+            header.set_size(payload.len() as u64);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "pax_global_header", &payload[..])
+                .unwrap();
+            archive.into_inner().unwrap().finish().unwrap()
+        };
+        let sha = "Ab".repeat(20);
+        assert_eq!(
+            repository_commit(&with_metadata(&[("comment", &sha)])).unwrap(),
+            sha.to_ascii_lowercase()
+        );
+        for records in [
+            vec![("other", "value")],
+            vec![("comment", "not-a-sha")],
+            vec![("comment", sha.as_str()), ("comment", sha.as_str())],
+        ] {
+            assert!(repository_commit(&with_metadata(&records)).is_err());
+        }
+        assert!(repository_commit(&with_metadata(&[("comment", &"a".repeat(65536))])).is_err());
+        assert!(repository_commit(&build(&[("package/package.json", b"{}")])).is_err());
+        assert!(repository_commit(b"invalid archive").is_err());
     }
 
     #[test]

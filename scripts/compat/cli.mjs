@@ -4,6 +4,7 @@
 //   node scripts/compat/cli.mjs prepare dsh <上游目录> --out <包目录> --integrity <sha512-…> [--archive <zip>]   （daemon 在安装期调用）
 import { renderText } from './core/report.mjs';
 import { createRegistry } from './index.mjs';
+import { registryOptions } from './core/registry-options.mjs';
 
 const [command, directory, ...flags] = process.argv.slice(2);
 const optionOf = (list, name) => { const i = list.indexOf(`--${name}`); return i === -1 ? undefined : list[i + 1]; };
@@ -17,7 +18,7 @@ if (command === 'resolve') {
     const spec = flags[0] ?? 'latest';
     if (!/^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/.test(directory ?? '')
       || (!semver.validRange(spec) && !/^[a-z][a-z0-9._-]*$/i.test(spec))) throw new Error('npm 插件来源或版本范围无效');
-    const document = await pacote.manifest(`${directory}@${spec}`, { registry: process.env.MAGI_NPM_REGISTRY ?? 'https://registry.npmjs.org', fullMetadata: true, preferOnline: true, ignoreScripts: true, fetchRetries: 2, fetchTimeout: 30_000 });
+    const document = await pacote.manifest(`${directory}@${spec}`, registryOptions(process.env.MAGI_NPM_REGISTRY ?? 'https://registry.npmjs.org'));
     if (document.name !== directory || !semver.valid(document.version)) throw new Error('registry 返回的插件身份无效');
     const policy = process.env.MAGI_DSH_COMPATIBILITY_POLICY ? JSON.parse(process.env.MAGI_DSH_COMPATIBILITY_POLICY) : undefined;
     checkDshCompatibility(document, dshEnvironment(dirname(fileURLToPath(import.meta.url))), policy);

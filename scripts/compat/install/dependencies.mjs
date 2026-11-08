@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import semver from 'semver';
 import pacote from 'pacote';
 import { hostDependencies } from '../core/host-dependencies.mjs';
+import { registryOptions } from '../core/registry-options.mjs';
 
 const NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
 const platformMatches = (values, value) => !values || (Array.isArray(values)
@@ -42,7 +43,7 @@ export async function installDependencies(root, sharedRoot, registry = process.e
       }
       if (ancestors.has(name) && semver.satisfies(ancestors.get(name), range)) continue;
       // 可选依赖在当前平台确实不适用时才跳过；不以下载失败当作不可用。
-      const manifest = await pacote.manifest(`${name}@${range}`, { registry, fullMetadata: true });
+      const manifest = await pacote.manifest(`${name}@${range}`, registryOptions(registry));
       if (!platformMatches(manifest.os, process.platform) || !platformMatches(manifest.cpu, process.arch)) {
         if (!Object.hasOwn(pkg.optionalDependencies ?? {}, name)) throw new Error(`依赖 ${name}@${manifest.version} 不支持当前平台 ${process.platform}/${process.arch}`);
         records.push({ name, version: manifest.version, optional: true, skipped: 'platform' });
@@ -51,7 +52,7 @@ export async function installDependencies(root, sharedRoot, registry = process.e
       if (!manifest.dist?.integrity?.startsWith('sha512-')) throw new Error(`依赖 ${name} 缺少 sha512 完整性摘要`);
       const destination = join(directory, 'node_modules', ...name.split('/'));
       mkdirSync(destination, { recursive: true });
-      await pacote.extract(manifest.dist.tarball, destination, { registry, integrity: manifest.dist.integrity, ignoreScripts: true });
+      await pacote.extract(manifest.dist.tarball, destination, { ...registryOptions(registry), integrity: manifest.dist.integrity });
       const saved = JSON.parse(readFileSync(join(destination, 'package.json'), 'utf8'));
       if (saved.name !== name || saved.version !== manifest.version) throw new Error(`依赖 ${name} 的包身份与 registry 不符`);
       records.push({ name, version: saved.version, integrity: manifest.dist.integrity, host: false, isolated: name === '@deepseek-ai/cordis' });

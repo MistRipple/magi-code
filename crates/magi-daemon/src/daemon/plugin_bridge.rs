@@ -328,6 +328,16 @@ impl magi_api::PluginRouteExecutor for NodeRouteExecutor {
         let manager = Arc::clone(&self.manager);
         let bus = Arc::clone(&self.bus);
         Box::pin(async move {
+            validate_route_body(request.body.as_ref(), request.body_base64.as_deref())
+                .map_err(ApiError::InvalidInput)?;
+            if matches!(
+                request.method,
+                magi_app_server_protocol::generated::PluginRouteMethod::GET
+                    | magi_app_server_protocol::generated::PluginRouteMethod::HEAD
+            ) && (request.body.is_some() || request.body_base64.is_some())
+            {
+                return Err(ApiError::InvalidInput("GET/HEAD 请求不能携带正文".into()));
+            }
             let digest = {
                 let manager = manager.lock().map_err(|_| {
                     ApiError::internal_assembly("插件路由调用失败", "插件管理器不可用")
@@ -358,17 +368,17 @@ impl magi_api::PluginRouteExecutor for NodeRouteExecutor {
                 "owner": {},
                 "binding": {},
             });
-            let method = serde_json::to_value(&request.method)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_owned))
-                .unwrap_or_default();
-            let input = json!({
-                "method": method,
-                "path": request.path,
-                "query": request.query.unwrap_or_default(),
-                "headers": request.headers,
-                "body": request.body,
-            });
+            let input = serde_json::to_value(&request)
+                .map_err(|error| ApiError::internal_assembly("插件路由调用失败", error))?;
+            if serde_json::to_vec(&input)
+                .map_err(|error| ApiError::internal_assembly("插件路由调用失败", error))?
+                .len()
+                > 3 * 1024 * 1024 + 64 * 1024
+            {
+                return Err(ApiError::InvalidInput(
+                    "插件路由请求超过消息大小上限".into(),
+                ));
+            }
             // 在独立任务里等待宿主：外层请求被丢弃时由 CancelOnDrop 触发取消，
             // 而不是让宿主侧的处理器白白跑到期限。
             let cancel = Arc::new(tokio::sync::Notify::new());
@@ -398,16 +408,88 @@ impl magi_api::PluginRouteExecutor for NodeRouteExecutor {
                 .ok_or_else(|| {
                     ApiError::internal_assembly("插件路由调用失败", "宿主返回的状态码无效")
                 })?;
+            let result: magi_app_server_protocol::generated::PluginRouteCallResult =
+                serde_json::from_value(value)
+                    .map_err(|error| ApiError::internal_assembly("插件路由响应无效", error))?;
+            validate_route_body(result.body.as_ref(), result.body_base64.as_deref())
+                .map_err(|error| ApiError::internal_assembly("插件路由响应无效", error))?;
             Ok(magi_app_server_protocol::generated::PluginRouteCallResult {
                 status,
-                content_type: value
-                    .get("contentType")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-                body: value.get("body").filter(|body| !body.is_null()).cloned(),
+                headers: route_response_headers(result.headers)
+                    .map_err(|error| ApiError::internal_assembly("插件路由响应头无效", error))?,
+                ..result
             })
         })
     }
+}
+
+fn validate_route_body(
+    body: Option<&serde_json::Value>,
+    bytes: Option<&str>,
+) -> Result<(), String> {
+    use base64::Engine;
+    if let Some(bytes) = bytes {
+        if body.is_some_and(|body| !body.is_null()) {
+            return Err("插件路由不能同时携带 JSON 与字节载荷".into());
+        }
+        let base64 = base64::engine::general_purpose::STANDARD;
+        const MAX_BYTES: usize = 2 * 1024 * 1024;
+        if bytes.len() > MAX_BYTES.div_ceil(3) * 4 {
+            return Err("插件路由二进制载荷超过 2 MiB".into());
+        }
+        let decoded = base64
+            .decode(bytes)
+            .map_err(|_| "插件路由 base64 载荷无效")?;
+        if decoded.len() > MAX_BYTES || base64.encode(&decoded) != bytes {
+            return Err("插件路由 base64 载荷无效或超过大小上限".into());
+        }
+    }
+    Ok(())
+}
+
+fn route_response_headers(
+    headers: Option<serde_json::Value>,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(headers) = headers else {
+        return Ok(None);
+    };
+    let Some(headers) = headers.as_object() else {
+        return Err("响应头必须为对象".into());
+    };
+    if headers.len() > 64 {
+        return Err("响应头数量超过上限".into());
+    }
+    let mut result = serde_json::Map::new();
+    for (name, value) in headers {
+        let name =
+            axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| "响应头名称无效")?;
+        let value = value.as_str().ok_or("响应头值必须为字符串")?;
+        if value.len() > 8192 || axum::http::HeaderValue::from_str(value).is_err() {
+            return Err("响应头值无效".into());
+        }
+        let key = name.as_str();
+        // 字节已由桥解码，不能再携带 HTTP 压缩/长度；插件 Cookie 不进入 Magi 的可信 origin。
+        if matches!(
+            key,
+            "set-cookie"
+                | "host"
+                | "origin"
+                | "cookie"
+                | "connection"
+                | "content-length"
+                | "content-encoding"
+                | "transfer-encoding"
+                | "upgrade"
+                | "forwarded"
+        ) || key.starts_with("proxy-")
+            || key.starts_with("sec-")
+            || key.starts_with("x-forwarded-")
+        {
+            continue;
+        }
+        result.insert(key.into(), value.into());
+    }
+    Ok(Some(result.into()))
 }
 
 /// 单次插件命令的上限；命令可能比工具更久，但仍受期限与停止取消约束。
@@ -468,6 +550,32 @@ mod tests {
     use magi_core::{
         HostPath, ProjectDirectoryExecutionMap, ProjectDirectoryExecutionRoot, WorkspaceId,
     };
+
+    #[test]
+    fn route_payload_validates_binary_before_dispatch_and_preserves_only_application_headers() {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD.encode([0, 255, 128, 13, 10]);
+        assert!(validate_route_body(None, Some(&bytes)).is_ok());
+        assert!(validate_route_body(Some(&json!({})), Some(&bytes)).is_err());
+        for value in ["?", "Zg=", "Zh==", "Zg==\n"] {
+            assert!(validate_route_body(None, Some(value)).is_err(), "{value:?}");
+        }
+        let too_large =
+            base64::engine::general_purpose::STANDARD.encode(vec![0; 2 * 1024 * 1024 + 1]);
+        assert!(validate_route_body(None, Some(&too_large)).is_err());
+        let headers = route_response_headers(Some(json!({
+            "Content-Disposition": "attachment; filename=report.zip", "ETag": "original",
+            "Set-Cookie": "must-not-reach-magi=1", "Content-Length": "999", "Connection": "close"
+        })))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            headers,
+            json!({"content-disposition":"attachment; filename=report.zip", "etag":"original"})
+        );
+        assert!(route_response_headers(Some(json!({"valid":"invalid\r\nvalue"}))).is_err());
+        assert!(route_response_headers(Some(json!({"valid":42}))).is_err());
+    }
 
     #[test]
     fn execution_projection_preserves_selected_copy_and_rejects_missing_or_forged_roots() {

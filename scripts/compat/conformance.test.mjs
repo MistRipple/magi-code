@@ -25,6 +25,8 @@ import { backendEntry } from './core/package.mjs';
 import { createViewTransport } from './runtime/client/view-transport.mjs';
 import { createRouteFetch } from './runtime/client/route-fetch.mjs';
 import { getEventListeners } from 'node:events';
+import { runRoute } from './runtime/routes.mjs';
+import { decodeRouteBytes, encodeRouteBytes, readRouteBytes, MAX_ROUTE_BINARY_BYTES } from './runtime/route-payload.mjs';
 
 const temporary = async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'magi-compat-contract-'));
@@ -74,7 +76,7 @@ test('页面 fetch 使用真实 Request 输入、相对路径和信号优先级�
   const input = new Request('https://magi.example/run?q=1', { method: 'POST', headers: { 'x-plugin-key': 'test' }, body: '{"value":2}', signal: old.signal });
   const response = await fetchRoute(input, { signal: active.signal });
   assert.equal(response.status, 202); assert.deepEqual(await response.json(), { accepted: true });
-  assert.deepEqual(calls[0], { operation: 'route.call', method: 'POST', path: '/run', query: 'q=1', headers: { 'content-type': 'text/plain;charset=UTF-8', 'x-plugin-key': 'test' }, body: { value: 2 } });
+  assert.deepEqual(calls[0], { operation: 'route.call', method: 'POST', path: '/run', query: 'q=1', headers: { 'content-type': 'text/plain;charset=UTF-8', 'x-plugin-key': 'test' }, bodyBase64: Buffer.from('{"value":2}').toString('base64') });
   await fetchRoute('action'); assert.equal(calls[1].path, '/ui-v/digest/ui/action');
   const head = await fetchRoute('/status', { method: 'HEAD' });
   assert.equal(head.body, null); assert.equal(await head.text(), '');
@@ -99,6 +101,80 @@ test('fetch 的两种 signal 输入沿同一个传输取消，后续请求正常
   transport.receive({ requestId: sent.at(-1).requestId, ok: true, result: { status: 200, body: 'actual' } });
   assert.equal(await (await current).text(), 'actual');
   transport.dispose();
+});
+
+test('原包 fetch 二进制上传、multipart、图片与下载共用路由载荷，保留字节、类型和应用响应头', async () => {
+  const bytes = Uint8Array.from([0, 255, 128, 13, 10, 0, 195, 40]);
+  const seen = [];
+  const definition = { async handler(req, res) {
+    const parts = []; for await (const part of req) parts.push(part);
+    const body = Buffer.concat(parts);
+    seen.push({ bytes: body, headers: req.headers });
+    res.writeHead(201, { 'content-type': 'image/png', 'content-disposition': 'attachment; filename="result.png"',
+      'x-plugin-result': 'actual', 'set-cookie': 'must-not-reach-magi=1', 'content-length': String(body.length) });
+    res.write(new Uint8Array(body.subarray(0, 3))); res.end(body.subarray(3));
+  } };
+  const fetchRoute = createRouteFetch((input, signal) => runRoute(definition, input, { signal }), 'https://magi.example/ui/index.html');
+  const response = await fetchRoute('/upload', { method: 'POST', body: new Blob([bytes], { type: 'application/octet-stream' }) });
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), bytes);
+  assert.deepEqual(seen[0].bytes, Buffer.from(bytes));
+  assert.equal(seen[0].headers['content-length'], String(bytes.length));
+  assert.equal(response.status, 201);
+  assert.equal(response.headers.get('content-type'), 'image/png');
+  assert.equal(response.headers.get('content-disposition'), 'attachment; filename="result.png"');
+  assert.equal(response.headers.get('x-plugin-result'), 'actual');
+  // 这里只验证上游处理器与 Fetch；不借单元驱动冒充 daemon 的响应头裁决。
+
+  const form = new FormData(); form.append('description', '中文'); form.append('image', new File([bytes], 'sample.bin'));
+  const request = new Request('https://magi.example/upload', { method: 'POST', body: form });
+  const expected = Buffer.from(await request.clone().arrayBuffer());
+  await fetchRoute(request);
+  assert.deepEqual(seen[1].bytes, expected, 'multipart 分隔符和文件字节不能经过文本/JSON 重写');
+  assert.equal(seen[1].headers['content-type'], request.headers.get('content-type'));
+
+  const fromResource = createRouteFetch((input, signal) => runRoute({ resource: () => new Response(bytes, {
+    headers: { 'content-type': 'application/zip', 'x-package-version': '1.0' },
+  }) }, input, { signal }), 'https://magi.example/');
+  const resource = await fromResource('/archive');
+  assert.deepEqual(new Uint8Array(await resource.arrayBuffer()), bytes);
+  assert.equal(resource.headers.get('x-package-version'), '1.0');
+  const head = await fromResource('/archive', { method: 'HEAD' });
+  assert.equal(head.body, null); assert.equal(head.headers.get('content-type'), 'application/zip');
+});
+
+test('路由字节载荷在业务前拒绝伪造、冲突和超限，流读取取消即时释放且不留下监听', async () => {
+  const signal = new AbortController().signal;
+  let invoked = 0;
+  const definition = { handler(_req, res) { invoked++; res.end('ok'); } };
+  for (const bodyBase64 of ['?', 'Zg=', 'Zh==', 'Zg==\n', 'A'.repeat(Math.ceil(MAX_ROUTE_BINARY_BYTES / 3) * 4 + 4)]) {
+    await assert.rejects(runRoute(definition, { method: 'POST', path: '/', bodyBase64 }, { signal }), /base64|载荷/);
+  }
+  await assert.rejects(runRoute(definition, { method: 'POST', path: '/', bodyBase64: '', body: {} }, { signal }), /同时/);
+  await assert.rejects(runRoute(definition, { method: 'HEAD', path: '/', bodyBase64: '' }, { signal }), /不能携带正文/);
+  assert.equal(invoked, 0);
+  const max = new Uint8Array(MAX_ROUTE_BINARY_BYTES).fill(255);
+  assert.deepEqual(decodeRouteBytes(encodeRouteBytes(max)), max);
+  let sent = 0;
+  const client = createRouteFetch(async () => { sent++; return { status: 200 }; }, 'https://magi.example/');
+  await assert.rejects(client('/', { method: 'POST', body: new Uint8Array(MAX_ROUTE_BINARY_BYTES + 1) }), /大小上限/);
+  assert.equal(sent, 0);
+  const controller = new AbortController();
+  let closed = 0;
+  const stream = new ReadableStream({ cancel() { closed++; } });
+  const reading = readRouteBytes(stream, controller.signal);
+  controller.abort();
+  await assert.rejects(reading, { name: 'AbortError' });
+  assert.equal(closed, 1); assert.equal(stream.locked, false);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  const deferred = new AbortController();
+  let release, released = 0;
+  const pending = runRoute({ resource: () => new Promise(resolve => { release = resolve; }) }, { method: 'GET', path: '/delayed' }, { signal: deferred.signal });
+  await Promise.resolve(); deferred.abort();
+  await assert.rejects(pending, error => error.kind === 'Cancelled');
+  release(new Response(new ReadableStream({ cancel() { released++; } })));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(released, 1, '取消后的迟到资源响应释放自己的流，不交给失效页面');
+  assert.equal(getEventListeners(deferred.signal, 'abort').length, 0);
 });
 
 test('原包封装只观察默认启动，扫描与运行共用条件导出，原生页面字节保留且归档可复现', async (t) => {
@@ -229,9 +305,16 @@ test('Cordis peer 在线隔离安装，主入口、子路径和 CJS 元数据使
   await createTar({ cwd: source, gzip: true, file: archive, prefix: 'package' }, ['package.json', 'index.js', 'index.cjs', 'feature.js']);
   const tarball = await readFile(archive);
   const integrity = `sha512-${createHash('sha512').update(tarball).digest('base64')}`;
-  let registry;
+  let registry, metadataRequests = 0, archiveRequests = 0, rejectManifest = false;
   const server = createServer((request, response) => {
-    if (request.url === '/cordis.tgz') { response.end(tarball); return; }
+    if (request.url === '/cordis.tgz') {
+      archiveRequests++;
+      if (archiveRequests === 1) { response.writeHead(503); response.end('temporary download failure'); return; }
+      response.end(tarball); return;
+    }
+    metadataRequests++;
+    if (rejectManifest) { response.writeHead(404); response.end('not found'); return; }
+    if (metadataRequests === 1) { request.socket.destroy(); return; }
     response.setHeader('content-type', 'application/json');
     response.end(JSON.stringify({ name, 'dist-tags': { latest: '4.1.1' }, versions: {
       '4.1.1': { name, version: '4.1.1', dist: { tarball: `${registry}/cordis.tgz`, integrity } },
@@ -248,6 +331,12 @@ test('Cordis peer 在线隔离安装，主入口、子路径和 CJS 元数据使
   await mkdir(upstream);
   await json(join(upstream, 'package.json'), { name: 'peer-plugin', version: '1.0.0', peerDependencies: { [name]: '^4.0.0' } });
   const installed = await installDependencies(upstream, shared, registry);
+  assert.equal(metadataRequests, 2, '元数据连接断开由同一网络层恢复一次');
+  assert.equal(archiveRequests, 2, '依赖归档 503 由同一网络层恢复一次，不重跑安装');
+  rejectManifest = true;
+  await assert.rejects(installDependencies(upstream, shared, registry), error => error.code === 'E404');
+  assert.equal(metadataRequests, 3, '缺失版本属于明确失败，不进入网络重试');
+  assert.equal(archiveRequests, 2, '失败读取不能重做已验证的归档安装');
   assert.deepEqual(installed, [{ name, version: '4.1.1', integrity, host: false, isolated: true }]);
   await writeFile(join(upstream, 'entry.mjs'), `import core from '${name}'; import feature from '${name}/feature'; import metadata from '${name}/package.json' with { type: 'json' }; import {createRequire} from 'node:module'; const require=createRequire(import.meta.url); export default [core, feature, metadata.version, require('${name}'), require('${name}/package.json').version];`);
   await writeFile(join(shared, 'entry.mjs'), `import core from '${name}'; import feature from '${name}/feature'; export default [core, feature];`);

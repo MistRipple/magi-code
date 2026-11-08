@@ -271,7 +271,7 @@
       }
       if (operation === 'route.call') {
         // 路径形态由 daemon 的协议校验把关；这里只限制体积，避免页面把大块内容塞进消息桥。
-        if (JSON.stringify(event.data.body ?? null).length > MAX_WRITE_BYTES) {
+        if (new TextEncoder().encode(JSON.stringify(event.data)).length > 3 * 1024 * 1024 + 64 * 1024) {
           throw new Error('插件写入内容超过大小上限');
         }
         const stream = event.data.path === STREAM_ROUTE ? event.data.body : undefined;
@@ -290,6 +290,7 @@
           ...(typeof event.data.query === 'string' ? { query: event.data.query } : {}),
           ...(event.data.headers === undefined ? {} : { headers: event.data.headers }),
           ...(event.data.body === undefined ? {} : { body: event.data.body }),
+          ...(event.data.bodyBase64 === undefined ? {} : { bodyBase64: event.data.bodyBase64 }),
         }, controller.signal); }
         finally { if (routeControllers.get(requestId) === controller) routeControllers.delete(requestId); }
         if (stream?.action === 'open' && routed.status === 200 && typeof (routed.body as { id?: unknown })?.id === 'string') {

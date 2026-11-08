@@ -864,7 +864,7 @@ export interface PluginResourceWriteRequest {
   value: unknown;
 }
 
-export type PluginRouteMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+export type PluginRouteMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS";
 
 export interface PluginRouteCallRequest {
   method: PluginRouteMethod;
@@ -872,12 +872,15 @@ export interface PluginRouteCallRequest {
   query?: string;
   headers?: Record<string, unknown>;
   body?: unknown;
+  bodyBase64?: string;
 }
 
 export interface PluginRouteCallResult {
   status: number;
   contentType?: string;
   body?: unknown;
+  bodyBase64?: string;
+  headers?: Record<string, unknown>;
 }
 
 export type SessionTurnGuideStatus = "ready" | "no_active_turn" | "input_closed" | "unsupported_input" | "unsupported_executor";

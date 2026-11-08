@@ -3099,7 +3099,9 @@
         "POST",
         "PUT",
         "PATCH",
-        "DELETE"
+        "DELETE",
+        "HEAD",
+        "OPTIONS"
       ]
     },
     "PluginRouteCallRequest": {
@@ -3131,7 +3133,12 @@
             "maxLength": 8192
           }
         },
-        "body": {}
+        "body": {},
+        "bodyBase64": {
+          "type": "string",
+          "maxLength": 2796204,
+          "description": "原始 HTTP 正文的标准 base64；与非空 body 互斥，解码后最多 2 MiB。"
+        }
       }
     },
     "PluginRouteCallResult": {
@@ -3150,7 +3157,20 @@
           "type": "string",
           "maxLength": 128
         },
-        "body": {}
+        "body": {},
+        "bodyBase64": {
+          "type": "string",
+          "maxLength": 2796204,
+          "description": "原始 HTTP 正文的标准 base64；与非空 body 互斥，解码后最多 2 MiB。"
+        },
+        "headers": {
+          "type": "object",
+          "maxProperties": 64,
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 8192
+          }
+        }
       }
     },
     "SessionTurnGuideStatus": {

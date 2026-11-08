@@ -289,7 +289,7 @@
 
 【现状·已运行验证】用户安装的是上游官方发布的 npm 包本身，不是 Magi 维护的另一份翻译副本。安装在 daemon 内分四步：向 npm registry 取包元数据并下载 tarball；核对 `dist.integrity`（sha512）并安全解包（拒绝路径穿越、符号链接、特殊文件，数量与体积有界，不运行任何脚本）；调用随产品发行的翻译器（随包 Node 加 `compat/cli.mjs prepare`）生成标准 Magi 包；把该包交给与其他来源完全相同的预览、授权和生命周期。翻译是确定的：同一上游版本与同一兼容运行时得到同一摘要，所以预览确认的摘要在安装时重新翻译后核对，服务端不缓存产物，也不维护第二份目录。接口为 `GET /api/plugins/upstream?q=`、`POST /api/plugins/upstream/preview`、`POST /api/plugins/upstream/install`，来源标记为 `upstream`（`生态:包名@精确版本`）。
 
-【现状·实现】来源获取已扩展到公开 GitHub 仓库。`github:owner/repository#reference` 与 GitHub HTTPS 地址先解析为固定提交，再经公共有界下载、归档解包和同一翻译入口准备；标准 PAX 提交元数据不生成文件，符号链接与特殊文件仍拒绝。原包名称和语义版本来自仓库的 `package.json`，不伪造 npm 发布元数据。确认安装同时绑定固定提交、原始引用及翻译摘要；仓库必须已携带可运行的 JavaScript 入口，不执行仓库构建、安装脚本或 Git hooks。
+【现状·实现】来源获取已扩展到公开 GitHub 仓库。`github:owner/repository#reference` 与 GitHub HTTPS 地址经官方 codeload 归档的首个有界 PAX Git 元数据解析实际提交，再取固定 SHA 归档，沿公共有界下载、归档解包和同一翻译入口准备。删除单独的匿名 REST 提交查询，避免其配额成为公开原包安装的前置依赖。引用归档与 SHA 归档根名可能不同，安装准备只使用固定 SHA 的字节；确认安装同时绑定固定提交、原始引用及翻译摘要。提交缺失、重复、无效或与确认不一致均拒绝；PAX 元数据不生成文件，符号链接与特殊文件仍拒绝。原包名称和语义版本来自仓库的 `package.json`，不伪造 npm 发布元数据。仓库必须已携带可运行的 JavaScript 入口，不执行构建、安装脚本或 Git hooks。
 
 【现状·实现】仓库、引用和提交增量保存在 daemon 原 `PluginSource::Upstream` 内，没有第二份安装目录。DSH 管理器、profile 快照及状态观察共用一个来源投影，保留真实包名／版本和 GitHub 来源。原生插件详情提供沿原引用的在线检查，搜索到的 npm 同名包不能改绑更新来源；同一仓库的提交替换仍走原排空、摘要授权和恢复事务。窄屏插件列表与详情共用剩余高度，分别滚动，预览确认和生命周期操作固定在详情底部。当前来源范围为公开 GitHub，其他 Git 服务、私有仓库、子模块与需构建的源码仓库未验收。
 
@@ -314,6 +314,8 @@
 【现状·已运行验证】翻译期执行 `apply` 发生在 Node 权限模型的子进程里：默认拒绝网络、子进程、Worker 与原生插件，文件系统只放行翻译运行时与上游目录，环境变量不继承（凭据不进入被记录的上游代码），60 秒超时。Node 官方文档说明权限模型是防误操作的护栏而不是对抗性沙箱，所以这一步不能被表述为"上游代码被隔离"；运行期的上游代码与其他 Magi 扩展一样以用户权限运行（完全信任），安装预览已按完全信任披露。翻译失败的条件：必需能力里有 `planned`、`dropped`、`unknown`；翻译期记录到的注册与静态扫描不一致；产物超出包限制；上游界面声明了槽位却没有任何 Magi 会渲染的槽位。翻译在 daemon 内串行执行，单次上限 180 秒。
 
 【现状·已运行验证】已有静态分析：`core/registry.mjs` 工厂注册表（识别不出或并列明确失败）、`core/scan.mjs` 语法树扫描、`core/report.mjs` 状态报告（mapped／shim／bundled／planned／dropped／unknown）、`dsh/` 对照表；`node scripts/compat/cli.mjs inspect <目录> --require llm`，`npm run test:compat`。
+
+【现状·实现】npm 版本解析与原包依赖的元数据／归档共用 `core/registry-options.mjs`；只有 pacote HTTP 层执行至多两次读取重试，单次请求 30 秒、退避 250–1000ms，仍受 daemon 原安装阶段总预算及取消约束。TLS 断连、503 等暂态读取由同一层恢复；不重新执行翻译、安装提交或激活。独立 registry 回归实际制造连接断开和归档 503，校验各两次请求后完整性与运行库隔离仍成立。
 
 【现状】工具说明最多 32 KiB，其他贡献说明最多 4096 字节；超限明确失败，不截断原包指引。默认启动只作为安装准入观察，不通过开关变体推导静态目录。原包验收入口与当前业务范围集中维护于第 11、12 节；旧离线构建方案及其记录由 Git 历史追溯。
 
@@ -458,6 +460,7 @@
 | 在会话目录执行业务 | 命令与工具共用 daemon 的实际执行上下文；命令先完成原生资源准备，再调用原包。DSH 仅将本次会话身份与执行根投影为业务读取所需的 `agent.id`、`agent.session.id/header.cwd`；不创建上游内核对象、历史或写入路径，其他成员明确拒绝。投影在调用结束／取消后失效，并发调用相互隔离 | 定向运行时回归覆盖并发、配置替换、取消及跨调用拒绝；Rust 覆盖隔离路径、源目录不可回落及真实 Node 命令上下文。桌面与真实原包业务的本轮结果见第 12 节 |
 | 持续接收页面业务 | 共享 EventSource 保留命名事件、UTF-8／CRLF、重连和取消；`contributions.client` 另需 persistent 授权，每窗口每个激活插件一个隔离文档，视图切换复用 | `test:electron-plugin-runtime`；多右栏页签、SSE、页面关闭／重开及停用回收 |
 | 取消页面请求 | 原页面 fetch 的 `init.signal` 与 `Request.signal` 沿同一视图桥取消对应后台路由；并发请求保持独立，文档回收结束等待，迟到回执和响应写入不再生效。取消不撤销已提交业务 | 定向合同覆盖 Request 输入、取消、正常完成、监听释放及 HEAD；真实目录包验证两种取消和其他并发调用的实际结果，完整复跑结果见第 12 节 |
+| 页面上传与业务文件返回 | Blob、File、FormData 和 Request 正文沿原视图桥传原字节，Node／Fetch 路由共用载荷合同；图片、归档与应用响应头进入同一 Fetch Response。daemon 在业务前校验字节编码及容量，读流响应取消；不新增文件执行器或安装副本 | 机制回归覆盖二进制、multipart、原 PNG、下载文件名、2 MiB 边界、响应头、伪造／冲突及取消；目录发行包结果按本轮证据单列，不计为社区插件核心业务通过 |
 | 截图与附件 | 后台图片存储有独立实例授权、分块传输和持久元数据；输入端口等待真实草稿回执，原同步业务调用仅在可证明的 AST 路径上改为等待；图片发送仍由用户决定 | `test:electron-appshot`：0.4.2 原包真实 macOS 截图、关闭设置页后投递、重启后载荷恢复；证据 `target/plugin-acceptance/appshot/`。曾有解码／挂载超时，复跑通过，长期时序稳定性仍待定位 |
 | 读取会话目录 | 独立 `sessionRead:["directory"]` 权限，只读 daemon 用户会话元数据与稳定分页；不包含消息、凭据或完整可写 Session，不按上游对象形状伪造事实 | `test:electron-plugin-runtime`、`test:electron-appshot` |
 | 发现与调用技能 | 全局文本注册进入已有运行目录，输入框 `/` 与模型 `skill_apply` 共用该事实；原文调用、配置替换、停用撤销和应用重启归原生生命周期；消息保存接纳时名称 | `test:compat`、`test:electron-plugin-runtime`，Debugging 0.7.2 原包技能；其他调用策略、资源根、provider 和 agent 作用域仍未接入 |
@@ -473,6 +476,7 @@
 - Mgr 0.2.12 原页面点击更新仍不能显示确认框：原包按 `typeof Button === "function"` 判断组件，官方 Button 实为 React forwardRef 对象。公共组件库及原包页面均已完整加载；最新目录包专项 **12/13**，失败与类型证据在 `target/plugin-acceptance/diagnostics-profile-current/`。后台更新路由通过不能作为页面流程通过，不增加按包名改写或组件伪装。
 - Market／Share 的 GitHub 路径已接入并按第 12 节逐项验收；其他 Git 来源、上游主动移除式替换及安装提交各阶段的崩溃恢复仍未完成。安装任务现持久保存请求、提交边界和回执，重启不自动重放，候选摘要由 PluginManager 核对；验收证据见第 12 节。尚不能据部分断进程验证宣称覆盖所有掉电阶段或外部副作用 exactly-once。
 - Debugging 的 `dsh_diagnose_plugin_load` 已完成真实工具审批、安装文件核对及运行／停用／故障／恢复验收；其余诊断工具及宿主重启、Health 的完整修复流程，以及未列为实测通过的其他原包分支仍待验证，不能据单项通过认定整个插件完成。
+- 页面运行库目前封装在安装归档内。应用中的共享后端更新，不代表既有安装的页面运行库也已更新；仍需完成运行库版本检查、同版原包在线重新准备、摘要确认及页面实例更新的产品流程，不能要求用户手工替换文件，也不能用上游版本未变化推导无需更新。
 - 会话消息已接通当前主会话的工具／命令文本交付；跨会话与后台消息尚无产品入口。session/event、sessionProjections、完整 Agent 对象、provider 技能与作用域等仍按实际能力门槛处理，不能返回假对象或空结果冒充完成。
 - Windows、干净系统正式安装包、Android／iOS 真机触摸、屏幕录制权限引导和长期负载仍需各自验收。390px Electron 视口模拟不代表手机真机通过。
 - pi 尚无运行器；只允许浏览搜索结果，不创建空适配器或兼容声明。官方签名、公钥托管及目录内容由发布者提供，不把本地开发密钥当官方信任根。
@@ -483,11 +487,11 @@
 
 | 最近核对范围 | 入口 | 结果与边界 |
 | --- | --- | --- |
-| 本轮归档、诊断与页面完整回归 | `test:electron-plugin-runtime` | 最终源码新构建 macOS arm64 目录包 **119/119**；`target/plugin-acceptance/diagnostics-product-complete/`。Debugging 0.7.2 原包经真实模型工具链与原生审批，安装入口可读，运行／停用／真实物化失败／恢复均与 daemon 一致，错误原因完整保留。8 种深浅色与壁纸材质、原页面、右栏、390px、图片、取消、消息、技能及应用重启同批通过。初始诊断及验收器失败均保留于 `diagnostics-*` 各自目录，中间通过项不拼接计入；其余 Debugging 工具与宿主重启未验收 |
-| 本轮原包管理回归 | `test:electron-dsh-management` | 同一最终目录包 **29/29**；`target/plugin-acceptance/diagnostics-management-final/`。Share、Upgrader、Market 原包的 npm／GitHub 获取、安装、更新、授权、取消、重试、失败保留、重启及卸载沿原入口通过；没有启用可选阴影审计。本轮 Mgr 专项另为 **12/13**，在原页面更新确认处失败，`diagnostics-profile-current/` 保留官方 Modal／forwardRef Button 的实际类型；不把管理服务通过作为该页面通过 |
+| 本轮页面载荷、诊断与运行时完整回归 | `test:electron-plugin-runtime` | 最终源码新构建 macOS arm64 目录包 **125/125**；`target/plugin-acceptance/route-source-product-final/`。同批验证真实隔离页面 2 MiB 原字节往返、multipart 文件及边界、PNG／SVG Blob 图片解码、应用响应头、HEAD／OPTIONS 和非法／冲突／超限载荷在业务前拒绝。Debugging 0.7.2 原包仍经真实模型工具链、原生审批完成运行／停用／故障／恢复诊断；8 种外观、原页面、右栏、390px、取消、消息、技能及应用重启通过。新增字节流程为机制样本，不计入社区核心业务覆盖率；其余 Debugging 工具与宿主重启未验收 |
+| 本轮原包管理回归 | `test:electron-dsh-management` | 同一目录包独立完整复跑 **29/29**；`target/plugin-acceptance/route-source-management-final/`。Share、Upgrader、Market 原包的 npm／GitHub 获取、安装、更新、授权、取消、重试、失败保留、重启及卸载沿原入口通过；没有启用可选阴影审计。早期 npm 依赖 502、TLS 断连及匿名 GitHub REST 配额耗尽分别保留于 `route-media-management/`、`route-media-product-final/` 与 `route-media-management-verified/`；统一 npm 读取恢复并移除 REST 提交查询后，最终源码独立完整复跑通过，没有过滤错误或拼接通过项。Mgr 的此前专项仍为 **12/13**，本轮未复跑，不把管理服务通过作为该页面通过 |
 | 本轮 Market 目录应用 | `test:electron-popular-dsh`，仅选择 Market | `target/plugin-acceptance/diagnostics-market-final/`：Market 1.2.2 安装、运行、页面、原 Node 辅助进程安装及更新、版本失败保留、目录重载、未变化实例保留、停用意图和原页面重载后继续搜索均通过。完整分母仍为 9，实际只选 1，`coreVerified=0`、`qualified=false`，脚本按完整门槛退出 1；不计为 95% 通过 |
 | 此前主题批次的真实 WorkBuddy 回归 | `test:electron-workbuddy` | 主题改造目录包，在线 5.20.32 原包 **11/11**；`target/plugin-acceptance/theme-contract-workbuddy/`。原页面、实际 hy3 模型回复、停用撤销和重新激活通过，未启用可选 CLI 专项；本轮归档改造后未复跑，不拼接成当前批次通过项 |
-| 本轮静态与共享检查 | `test:compat`、Rust、Web、协议、发行边界 | 翻译运行时 **104/104**、插件生命周期 **22/22**；daemon check、协议生成一致、Web check 0 错误 0 警告、Electron 单一发行边界及目录包解包自检通过。主题改造阶段的共享外观与布局回归单列；未运行全仓测试、Windows 或手机真机 |
+| 本轮静态与共享检查 | `test:compat`、Rust、Web、协议、发行边界 | 翻译运行时 **106/106**；Rust 字节载荷／响应头、真实 Node 路由、daemon 授权取消及图片 CSP 四个定向回归、归档 8 项及 GitHub 来源校验通过；daemon check、协议生成一致、Web check 0 错误 0 警告、Electron 单一发行边界与目录包解包自检通过。未复跑插件生命周期全套、全仓测试、Windows 或手机真机 |
 | 本轮翻译运行时回归 | `npm run test:compat` | 103/103；包括 GitHub 来源解析、目录与 profile 来源一致；新增同步消息真实回执、失败不提交、来源校验、失效引用、工具与命令共享消息端口；其他原有契约保持通过。不能据测试数量推导生态支持率 |
 | 本轮 npm／GitHub 原包管理 | `test:electron-dsh-management` | 新构建 macOS arm64 目录包 **30/30**；`target/plugin-acceptance/github-product-final/`。Share 0.2.5 原页面实际导入 GitHub Health 3.0.5，保留来源并在线升至 3.0.6；固定提交预览、摘要授权、版本失败保留运行实例、重启和卸载通过。Market 1.2.2 原包 Node 辅助进程实际从 GitHub 安装、HTTPS Git 更新与失败保留通过；Market Git 的整页按钮未覆盖。原 npm Share／Upgrader／Release Probe 管理流程同批通过。390px 确认固定可达、无横向溢出，桌面审计 `cut=0`；不代表 Health 全部修复业务、其他 Git 服务或手机真机 |
 | 本轮目录包中断恢复 | `test:electron-plugin-install-recovery` | 新构建 macOS arm64 目录包 **10/10**；`target/plugin-acceptance/github-install-recovery-final/`。同原解析、提交后等待、完成回执三个断进程位置，npm 机制夹具实际业务恢复；不据此宣称所有 Git 下载与掉电阶段均已验证 |

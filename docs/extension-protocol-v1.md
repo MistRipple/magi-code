@@ -159,6 +159,10 @@ DSH `profileContext.packageManager` 提供插件实例拥有的内部 Node 命�
 
 插件私有页面的路由请求可携带可选 `headers`（`PluginRouteCallRequest`）。只转交页面自己提供的应用头，不转交 Magi HTTP 请求的 Cookie、凭据和 Origin；Host、Origin、Cookie、代理与传输控制头禁止覆盖。DSH 原生页面的 localStorage/sessionStorage 由 iframe 消息桥按插件 ID 隔离代理，仅保存浏览器 profile 内的界面缓存；插件业务配置仍走 daemon 设置 CAS。右栏导航仅能打开当前激活插件清单声明的右栏视图。
 
+路由载荷只有一个实际正文：`body` 承载 JSON 值或文本，`bodyBase64` 承载原始 HTTP 字节，两者不能同时包含非空值。字节载荷使用标准、有 padding 的 base64，解码后最多 2 MiB；请求与响应的 JSON 消息最多 3 MiB 加 64 KiB 元数据，保留 4 MiB 宿主帧的封装空间。限制在执行业务前核对，非法编码、冲突或超限明确失败；不截断载荷，也不重放业务。独立图片附件的分块合同不受此路由限制影响。
+
+`api.route()` 返回值可提供 `headers` 和 `bodyBase64`。应用响应头（例如 Content-Disposition、ETag、业务回执头）经 daemon 校验后进入本插件的 Fetch Response；Set-Cookie、宿主身份、代理和传输控制头不进入 Magi origin。DSH 的 Node／Fetch 处理器仍运行原代码：页面 Blob、File、FormData 和 Request 正文按字节上传，保留原 multipart 边界；PNG、ZIP 等响应按字节返回，文本／JSON 仍提供结构化结果。HEAD／OPTIONS 进入同一路由准入；HEAD 和 204／205／304 在页面没有响应正文。页面关闭、取消、停用及旧实例失效继续沿原调用租约回收，无第二条文件服务。
+
 视图消息桥支持按文档 `instanceId` 和在途 `requestId` 取消 `route.call`（`type:cancel`，不新增业务写入口）。Renderer 关闭对应 HTTP 等待，daemon 沿原调用租约通知 Node 取消；Node 请求/响应释放后拒绝迟到写入。原页面的 fetch 以真实 Request 处理输入、相对路径及 signal 优先级；普通 fetch 仍是有界完整响应，HEAD 无正文。取消只能终止等待与可取消执行，不能撤销已提交副作用，不自动重放。资源和设置写入不采用该取消消息；页面销毁后所有等待结束且旧回执不再生效。
 
 DSH 页面里的 `EventSource` 通过相同路由调用承载 SSE。兼容层保留 `/__magi_compat/streams` 控制路由，打开、读取和关闭均经过上述 daemon 准入，不增加监听端口或会话写入口。连接只可调用本插件已登记的 GET 路由；Node 与 Fetch 响应均须为 `200 text/event-stream`，`204` 表示结束且不重连。每插件至多 8 条连接，每条至多保留 2 MiB／8192 个未确认块；按单调序号确认和分批返回，重复读取不丢未确认数据。读取等待至多 15 秒，45 秒无读取自动关闭。Renderer 按文档 nonce 记录连接归属，导航/卸载会取消在途路由并关闭已登记连接，旧文档回执不能更新新页面；上游路由撤销和宿主停用也关闭对应原请求。SSE 的命名事件、多行数据、跨块 UTF-8/CRLF、事件 ID 与重连由页面适配器承载；普通 fetch 仍返回完整响应，WebSocket 未由此实现。

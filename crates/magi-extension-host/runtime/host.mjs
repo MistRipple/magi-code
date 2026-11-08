@@ -179,8 +179,15 @@ async function handleRequest(id, method, params) {
       try {
         const output = await invocationContext.run({ ...ctx, signal: controller.signal }, () => handler(params.input, { ...ctx, signal: controller.signal }));
         const status = Number.isInteger(output?.status) && output.status >= 100 && output.status <= 599 ? output.status : 200;
-        const contentType = typeof output?.contentType === 'string' ? output.contentType.slice(0, 128) : undefined;
-        return send({ id, result: { status, ...(contentType ? { contentType } : {}), body: output?.body === undefined ? null : output.body } });
+        const contentType = output?.contentType;
+        if (contentType !== undefined && (typeof contentType !== 'string' || contentType.length > 128 || /[\r\n\0]/.test(contentType))) throw new TypeError('路由内容类型无效');
+        if (output?.bodyBase64 !== undefined && output?.body != null) throw new TypeError('路由不能同时返回 JSON 与字节载荷');
+        const result = { status, ...(contentType ? { contentType } : {}),
+          ...(output?.headers === undefined ? {} : { headers: output.headers }),
+          ...(output?.bodyBase64 === undefined ? { body: output?.body ?? null } : { bodyBase64: output.bodyBase64 }),
+        };
+        if (Buffer.byteLength(JSON.stringify(result)) > 3 * 1024 * 1024 + 64 * 1024) throw new RangeError('路由响应超过消息大小上限');
+        return send({ id, result });
       } catch (error) {
         // 路由自身抛出的错误是视图可见的 500，不是协议错误。
         return send({ id, result: { status: 500, body: { error: String(error?.message ?? error).slice(0, 4096) } } });

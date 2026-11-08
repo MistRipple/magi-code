@@ -1931,6 +1931,10 @@ pub enum PluginRouteMethod {
     PATCH,
     #[serde(rename = "DELETE")]
     DELETE,
+    #[serde(rename = "HEAD")]
+    HEAD,
+    #[serde(rename = "OPTIONS")]
+    OPTIONS,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1947,6 +1951,10 @@ pub struct PluginRouteCallRequest {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<Value>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "bodyBase64")]
+    pub body_base64: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1960,6 +1968,13 @@ pub struct PluginRouteCallResult {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<Value>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "bodyBase64")]
+    pub body_base64: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

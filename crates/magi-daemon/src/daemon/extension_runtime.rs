@@ -990,6 +990,7 @@ export default async function activate(api) {
             query: Some(query.into()),
             headers: Some(json!({"x-panel-key": "panel-key"})),
             body: None,
+            body_base64: None,
         };
         // 有视图的插件：请求经 daemon 到达宿主里的处理器。
         let ok = executor

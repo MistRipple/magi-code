@@ -400,6 +400,23 @@ export async function apply(ctx, config) {
     res.setHeader('content-type','application/json');
     res.end(JSON.stringify({key:req.headers['x-panel-key'], result:String(data.text).toUpperCase(),live:clients.size}));
   }});
+  ctx.webServer.register({path:'/binary-echo',handler:async(req,res)=>{
+    const chunks=[];for await(const chunk of req)chunks.push(chunk);
+    const bytes=Buffer.concat(chunks);
+    res.writeHead(201,{'content-type':req.headers['content-type']??'application/octet-stream',
+      'content-disposition':'attachment; filename="original.bin"','x-original-bytes':String(bytes.length),
+      'set-cookie':'must-not-enter-magi=1','content-length':String(bytes.length)});
+    res.write(bytes.subarray(0,7));res.end(bytes.subarray(7));
+  }});
+  ctx.webServer.register({path:'/binary-image',resource:()=>new Response(
+    Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=','base64'),
+    {headers:{'content-type':'image/png','x-image-source':'original-route'}})});
+  ctx.webServer.register({path:'/vector-image',resource:()=>new Response(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="9"><rect width="12" height="9" fill="red"/></svg>',
+    {headers:{'content-type':'image/svg+xml'}})});
+  ctx.webServer.register({path:'/http-method',handler(req,res){
+    res.writeHead(204,{'allow':'GET, HEAD, OPTIONS','x-original-method':req.method});res.end();
+  }});
   const calls = new Map();
   ctx.webServer.register({path:'/slow-action',handler(req,res){
     const name=req.headers['x-call-id'];
@@ -586,6 +603,56 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
       await post(`/api/plugins/${id}/routes`,{method:'POST',path:'/complete-call',body:'remaining'});
       await waitFor(()=>frame.evaluate(`window.__calls.remaining.state==='completed:remaining'`),'未取消请求正常完成');
       reporter.check('并发请求取消后其他业务仍收到真实结果',true);
+      const binary=await frame.evaluate(`(async()=>{
+        const bytes=Uint8Array.from({length:2*1024*1024},(_,i)=>i%256);
+        const response=await fetch('/binary-echo',{method:'POST',body:new Blob([bytes],{type:'application/octet-stream'})});
+        const restored=new Uint8Array(await response.arrayBuffer());
+        const form=new FormData();form.append('title','中文');form.append('file',new File([bytes.subarray(0,512)],'original.bin'));
+        const request=new Request(new URL('/binary-echo',document.baseURI),{method:'POST',body:form});
+        const expected=new Uint8Array(await request.clone().arrayBuffer());
+        const multipart=await fetch(request),actual=new Uint8Array(await multipart.arrayBuffer());
+        return {status:response.status,bytes:restored.length,same:restored.length===bytes.length&&restored.every((v,i)=>v===bytes[i]),
+          type:response.headers.get('content-type'),filename:response.headers.get('content-disposition'),reported:response.headers.get('x-original-bytes'),
+          cookie:response.headers.get('set-cookie'),length:response.headers.get('content-length'),
+          multipart:actual.length===expected.length&&actual.every((v,i)=>v===expected[i]),
+          boundary:multipart.headers.get('content-type')===request.headers.get('content-type')};
+      })()`);
+      reporter.check('真实原包页面以 Blob 上传 2 MiB 原字节并沿同一路由取回，下载名及类型保留',
+        binary.status===201&&binary.bytes===2*1024*1024&&binary.same&&binary.type==='application/octet-stream'
+          &&binary.reported===String(binary.bytes)&&binary.filename==='attachment; filename="original.bin"',JSON.stringify(binary));
+      reporter.check('真实 Chromium 的 FormData 文件和边界完整通过，Cookie 与传输长度不进入可信页面',
+        binary.multipart&&binary.boundary&&binary.cookie===null&&binary.length===null,JSON.stringify(binary));
+      const media=await frame.evaluate(`(async()=>{
+        const response=await fetch('/binary-image'),blob=await response.blob(),url=URL.createObjectURL(blob);
+        const image=new Image();image.src=url;document.body.append(image);
+        try {await image.decode();return {type:blob.type,bytes:blob.size,width:image.naturalWidth,height:image.naturalHeight,source:response.headers.get('x-image-source')};}
+        finally{image.remove();URL.revokeObjectURL(url);}
+      })()`);
+      reporter.check('Fetch 风格原包路由返回的 PNG 保持原字节并由真实 Chromium 解码展示',
+        media.type==='image/png'&&media.bytes===68&&media.width===1&&media.height===1&&media.source==='original-route',JSON.stringify(media));
+      const vector=await frame.evaluate(`(async()=>{
+        const response=await fetch('/vector-image'),blob=await response.blob(),url=URL.createObjectURL(blob);
+        const image=new Image();image.src=url;document.body.append(image);
+        try {await image.decode();return {type:blob.type,width:image.naturalWidth,height:image.naturalHeight};}
+        finally{image.remove();URL.revokeObjectURL(url);}
+      })()`);
+      reporter.check('原生页面从业务路由取得 SVG 并通过自己的 Blob URL 展示，无需改写为 PNG',
+        vector.type==='image/svg+xml'&&vector.width===12&&vector.height===9,JSON.stringify(vector));
+      const methods=await frame.evaluate(`Promise.all(['HEAD','OPTIONS'].map(async method=>{
+        const response=await fetch('/http-method',{method});return {method,status:response.status,body:await response.text(),seen:response.headers.get('x-original-method'),allow:response.headers.get('allow')};
+      }))`);
+      reporter.check('HEAD 与 OPTIONS 通过正式协议到达真实处理器，204 响应无伪造正文',
+        methods.every(result=>result.status===204&&result.body===''&&result.seen===result.method&&result.allow==='GET, HEAD, OPTIONS'),JSON.stringify(methods));
+      const rejected=[];
+      for(const payload of [{bodyBase64:'?'},{bodyBase64:'AA==',body:{}},
+        {bodyBase64:Buffer.alloc(2*1024*1024+1).toString('base64')}]) {
+        const result=await api(`/api/plugins/${id}/routes`,{method:'POST',path:'/binary-echo',...payload});
+        rejected.push({status:result.status,message:result.value.message});
+      }
+      reporter.check('非法、冲突及超限字节在 daemon 进入原包业务前被拒绝，运行实例保持可用',
+        rejected.every(result=>result.status===400&&result.message)
+          &&(await api('/api/plugins')).value.plugins.find(plugin=>plugin.manifest.id===id).runtime?.state==='running',JSON.stringify(rejected));
+      await writeFile(join(output,'route-media.json'),JSON.stringify({binary,media,vector,methods,rejected},null,2));
       const imageData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=';
       const dshReceipt = await frame.evaluate(`(async()=>{
         const bytes=Uint8Array.from(atob(${JSON.stringify(imageData)}),c=>c.charCodeAt(0));

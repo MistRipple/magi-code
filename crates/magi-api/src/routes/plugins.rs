@@ -31,6 +31,8 @@ use tokio_stream::wrappers::BroadcastStream;
 const RESOURCE_SUBSCRIPTION_RECHECK: Duration = Duration::from_millis(500);
 /// JSON 上传承载合法归档的 base64（每三字节占四字符），另留有界元数据空间。
 const MAX_INSTALL_REQUEST_BYTES: usize = MAX_PACKAGE_BYTES.div_ceil(3) * 4 + 64 * 1024;
+/// 路由 JSON 可承载最多 2 MiB 的 base64 字节及有界头部；其他 HTTP 接口保持原上限。
+const MAX_ROUTE_REQUEST_BYTES: usize = 3 * 1024 * 1024 + 64 * 1024;
 
 mod center;
 mod download;
@@ -79,7 +81,10 @@ pub fn routes() -> Router<ApiState> {
             get(versioned_resource),
         )
         .route("/plugins/{id}/icon", get(icon))
-        .route("/plugins/{id}/routes", post(call_route))
+        .route(
+            "/plugins/{id}/routes",
+            post(call_route).layer(DefaultBodyLimit::max(MAX_ROUTE_REQUEST_BYTES)),
+        )
         .route("/plugins/{id}/composer/admit", post(admit_composer))
         .route("/plugins/{id}/settings/schema", get(settings_schema))
         .route(
@@ -248,7 +253,7 @@ fn resource_response(
     response.headers_mut().insert(
         "content-security-policy",
         HeaderValue::from_static(
-            "sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; object-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'; connect-src 'none'",
+            "sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; object-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'; connect-src 'none'",
         ),
     );
     response.headers_mut().insert(
@@ -1197,6 +1202,8 @@ mod tests {
             .unwrap();
         assert!(csp.starts_with("sandbox allow-scripts;"), "{csp}");
         assert!(csp.contains("connect-src 'none'"), "{csp}");
+        assert!(csp.contains("img-src 'self' data: blob:"), "{csp}");
+        assert!(csp.contains("object-src 'none'"), "{csp}");
         drop(root);
     }
 
