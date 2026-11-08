@@ -19,6 +19,7 @@ import { dshEnvironment, checkDshCompatibility } from '../core/dsh-compatibility
 import { translateClientBusiness } from './client-business.mjs';
 import { REGISTERED_SETTINGS_RESOURCE } from '../runtime/registered-settings.mjs';
 import { backendEntry, readPackage } from '../core/package.mjs';
+import { translationRuntimeId } from '../core/translation-runtime.mjs';
 
 const COMPAT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const TRANSLATOR_VERSION = 2;
@@ -55,6 +56,7 @@ function clientDocument(configFile, styles = []) {
 }
 
 export async function prepareDsh(options) {
+  const preparedRuntimeId = translationRuntimeId(options.sharedRoot);
   const pkg = readPackage(options.upstreamDir);
   const translator = createRegistry().create('dsh');
   if (!(await translator.detect(options.upstreamDir))) throw new Error(`${pkg.name} 不是 DSH 插件`);
@@ -158,7 +160,7 @@ export async function prepareDsh(options) {
   if (icon) { writeFileSync(join(options.outDir, icon.to), icon.bytes); manifest.icon = icon.to; }
   writeFileSync(join(options.outDir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
   const compatReport = {
-    kind: 'dsh', translatorVersion: TRANSLATOR_VERSION, runtimeId: compatRuntimeId,
+    kind: 'dsh', translatorVersion: TRANSLATOR_VERSION, runtimeId: compatRuntimeId, translationRuntimeId: preparedRuntimeId,
     upstream: { name: pkg.name, version: pkg.version, integrity: options.source.integrity, ...(options.source.github ? { github: options.source.github } : {}) },
     compatibility,
     magi: { id: manifest.id, version: manifest.version }, dependencies,

@@ -25,7 +25,7 @@
   import SettingsDetailPage from './SettingsDetailPage.svelte';
   import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
   import { openSettings } from '../stores/shell-ui.svelte';
-  import { buildStoreItems, filterStoreItems, paginate, storeGroup, type StoreFilter, type StoreGroup, type StoreItem } from '../lib/plugin-store';
+  import { buildStoreItems, filterStoreItems, installedUpstreamRequest, paginate, storeGroup, type StoreFilter, type StoreGroup, type StoreItem } from '../lib/plugin-store';
   import { pluginRegistryRevision } from '../stores/plugin-registry.svelte';
   import type { PluginCandidatePreview, PluginEcosystem, PluginUpstreamRequest, PluginCenterProjection, PluginList, PluginManifest, PluginPermission, PluginUpstreamPreview, PluginUpstreamProjection } from '../shared/app-server-protocol.generated';
 
@@ -309,7 +309,10 @@
 
   /** 升级：插件中心条目直接安装；上游条目先翻译预览，由用户确认后安装。 */
   async function updateFromCenter(item: StoreItem): Promise<void> {
-    if (item.installed?.source.github) {
+    if (item.installed?.translationRuntime?.state === 'updateAvailable' && item.upstream?.state !== 'updatable') {
+      const request = installedUpstreamRequest(item.installed);
+      if (request) await stageUpstream(request);
+    } else if (item.installed?.source.github) {
       const { repository, reference } = item.installed.source.github;
       await stageUpstream({ ecosystem: 'dsh', github: { repository, reference } });
     } else if (item.catalog && item.catalog.state === 'updatable') await run(() => installFromPluginCenter(item.catalog!));
@@ -489,6 +492,7 @@
   {#if staged}
     {@const preview = staged.kind === 'upstream' ? staged.preview.candidate : staged.preview}
     {@const translated = staged.kind === 'upstream' ? staged.preview : null}
+    {@const componentsOnly = translated?.translationRuntime?.state === 'updateAvailable' && preview.installedVersion === preview.manifest.version}
     <div class="settings-section plugin-candidate" data-testid="plugin-candidate" data-operation={preview.operation} data-origin={staged.kind}>
       <div class="settings-card plugin-candidate-card">
         <div class="candidate-scroll" data-testid="plugin-candidate-scroll">
@@ -498,11 +502,11 @@
             <div class="settings-card-title-line">
               <span class="settings-card-name">{manifestText(preview.manifest, 'name')}</span>
               <span class="settings-chip">
-                {preview.installedVersion
+                {preview.installedVersion && preview.installedVersion !== preview.manifest.version
                   ? i18n.t('settings.plugins.candidate.versionChange', { from: preview.installedVersion, to: preview.manifest.version })
                   : `v${preview.manifest.version}`}
               </span>
-              <span class="settings-chip settings-chip--accent">{preview.operation === 'upgrade' ? i18n.t('settings.plugins.upgrade') : i18n.t('settings.plugins.installAddress')}</span>
+              <span class="settings-chip settings-chip--accent">{componentsOnly ? i18n.t('settings.plugins.translationRuntime.update') : preview.operation === 'upgrade' ? i18n.t('settings.plugins.upgrade') : i18n.t('settings.plugins.installAddress')}</span>
             </div>
             <span class="settings-row-desc">{manifestText(preview.manifest, 'description') || preview.manifest.id}</span>
           </div>
@@ -574,8 +578,8 @@
               <div class="settings-row-desc">{i18n.t('settings.plugins.upstream.integrity')} <span class="settings-mono" title={translated.integrity}>{translated.integrity.slice(0, 24)}</span></div>
             </div>
           {/if}
-          <div class="settings-row-desc">
-            {preview.operation === 'upgrade' ? i18n.t('settings.plugins.candidate.upgradeHint') : i18n.t('settings.plugins.candidate.installHint')}
+          <div class="settings-row-desc" data-testid={componentsOnly ? 'candidate-runtime-update' : undefined}>
+            {componentsOnly ? i18n.t('settings.plugins.translationRuntime.confirm') : preview.operation === 'upgrade' ? i18n.t('settings.plugins.candidate.upgradeHint') : i18n.t('settings.plugins.candidate.installHint')}
             <span class="settings-mono" title={preview.digest}>{i18n.t('settings.plugins.digest', { digest: preview.digest.slice(0, 12) })}</span>
           </div>
         </div>

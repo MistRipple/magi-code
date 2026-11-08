@@ -7,6 +7,7 @@ import type {
   PluginInstalled,
   PluginManifest,
   PluginUpstreamEntry,
+  PluginUpstreamRequest,
 } from '../shared/app-server-protocol.generated';
 
 export type StoreStatus = 'active' | 'installed' | 'available';
@@ -23,7 +24,7 @@ export interface StoreItem {
   /** 上游生态（DSH、pi）的 npm 发布包；安装时由 daemon 翻译。 */
   upstream: PluginUpstreamEntry | null;
   status: StoreStatus;
-  /** 插件中心有比已安装版本更新的版本。 */
+  /** daemon 检测到运行组件更新，或在线来源有新版本。 */
   updatable: boolean;
   /** registry 返回的相关度顺序；只用于当前搜索投影。 */
   searchOrder?: number;
@@ -63,14 +64,14 @@ export function buildStoreItems(
       catalog: null,
       upstream: null,
       status: statusOf(installed),
-      updatable: false,
+      updatable: installed.translationRuntime?.state === 'updateAvailable' && installed.source.kind === 'upstream',
     });
   }
   for (const entry of catalog) {
     const existing = items.get(entry.id);
     if (existing) {
       existing.catalog = entry;
-      existing.updatable = entry.state === 'updatable';
+      existing.updatable ||= entry.state === 'updatable';
       continue;
     }
     items.set(entry.id, {
@@ -90,8 +91,8 @@ export function buildStoreItems(
   const installedByUpstream = new Map<string, string>();
   for (const installed of installedPlugins) {
     if (installed.source.kind !== 'upstream') continue;
-    const at = installed.source.location.lastIndexOf('@');
-    if (at > 0) installedByUpstream.set(installed.source.location.slice(0, at), installed.manifest.id);
+    const source = installedUpstreamRequest(installed);
+    if (source) installedByUpstream.set(`${source.ecosystem}:${source.package}`, installed.manifest.id);
   }
   for (const [searchOrder, entry] of upstream.entries()) {
     // 已安装的上游包并入对应的已安装条目，其余用 生态+包名 作为临时身份（安装翻译后才有 Magi 插件 ID）。
@@ -124,6 +125,20 @@ export function buildStoreItems(
       || STATUS_ORDER[left.status] - STATUS_ORDER[right.status]
       || left.name.localeCompare(right.name),
   );
+}
+
+/** 组件更新固定当前原包，沿原来源在线重新准备；GitHub 不被同名 npm 包替换。 */
+export function installedUpstreamRequest(installed: PluginInstalled): PluginUpstreamRequest | null {
+  if (installed.source.kind !== 'upstream') return null;
+  const location = installed.source.location;
+  const colon = location.indexOf(':'), at = location.lastIndexOf('@');
+  const ecosystem = location.slice(0, colon);
+  if (colon < 1 || at <= colon + 1 || !['dsh', 'pi'].includes(ecosystem)) return null;
+  return {
+    ecosystem: ecosystem as PluginUpstreamRequest['ecosystem'],
+    package: location.slice(colon + 1, at), version: location.slice(at + 1),
+    ...(installed.source.github ? { github: installed.source.github } : {}),
+  };
 }
 
 export function filterStoreItems(items: StoreItem[], filter: StoreFilter, query: string): StoreItem[] {

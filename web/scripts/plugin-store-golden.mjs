@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { withGoldenViteServer } from './golden-vite.mjs';
 
 await withGoldenViteServer(async (server) => {
-  const { buildStoreItems, filterStoreItems } = await server.ssrLoadModule('/src/lib/plugin-store.ts');
+  const { buildStoreItems, filterStoreItems, installedUpstreamRequest } = await server.ssrLoadModule('/src/lib/plugin-store.ts');
   const text = (manifest, field) => manifest[field];
   const installed = (id, source) => ({
     manifest: { id, version: '1.0.0', name: id, description: '', permissions: [], contributions: {} },
@@ -82,6 +82,22 @@ await withGoldenViteServer(async (server) => {
   {
     const items = buildStoreItems([installed('custom-title', { kind: 'upstream', location: 'dsh:dsh-rea@1.2.0' })], [], [], text);
     assert.equal(filterStoreItems(items, 'all', 'dsh-rea').length, 1);
+  }
+  // 运行组件更新不依赖 registry 搜索成功，也不把同版原包伪装成新版本。
+  {
+    const original = {
+      ...installed('dsh.scope.pkg', { kind: 'upstream', location: 'dsh:@scope/pkg@1.0.0' }),
+      translationRuntime: { state: 'updateAvailable', currentId: 'a'.repeat(64) },
+    };
+    const items = buildStoreItems([original], [], [], text);
+    assert.equal(filterStoreItems(items, 'updatable', '').length, 1);
+    assert.equal(items[0].version, '1.0.0');
+    assert.deepEqual(installedUpstreamRequest(original), { ecosystem: 'dsh', package: '@scope/pkg', version: '1.0.0' });
+    const github = { repository: 'owner/repo', reference: 'main', commit: 'b'.repeat(40) };
+    assert.deepEqual(installedUpstreamRequest({ ...original, source: { ...original.source, github } }).github, github);
+    const current = { ...original, translationRuntime: { state: 'current' } };
+    assert.equal(filterStoreItems(buildStoreItems([current], [], [], text), 'updatable', '').length, 0);
+    assert.equal(installedUpstreamRequest(installed('local')), null);
   }
   console.log('plugin-store golden passed');
 });

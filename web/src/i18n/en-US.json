@@ -3253,5 +3253,11 @@
   "input.queue.pluginMessage": "From {name}",
   "settings.plugins.github.invalidAddress": "Enter a valid GitHub repository address",
   "settings.plugins.github.checkUpdate": "Check for updates",
-  "settings.plugins.github.notice": "Install the original package from a pinned GitHub commit. Plugins run with your system permissions. Review the source and permissions before installing."
+  "settings.plugins.github.notice": "Install the original package from a pinned GitHub commit. Plugins run with your system permissions. Review the source and permissions before installing.",
+  "settings.plugins.translationRuntime.label": "Runtime components",
+  "settings.plugins.translationRuntime.current": "Up to date",
+  "settings.plugins.translationRuntime.updateAvailable": "Update available",
+  "settings.plugins.translationRuntime.unavailable": "Update unavailable",
+  "settings.plugins.translationRuntime.update": "Update runtime components",
+  "settings.plugins.translationRuntime.confirm": "The package version stays the same while its runtime components are updated. Authorize and enable the plugin again after updating."
 }

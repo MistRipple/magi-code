@@ -3253,5 +3253,11 @@
   "input.queue.pluginMessage": "来自 {name}",
   "settings.plugins.github.invalidAddress": "请输入有效的 GitHub 仓库地址",
   "settings.plugins.github.checkUpdate": "检查在线更新",
-  "settings.plugins.github.notice": "从 GitHub 固定提交安装原包。插件以你的系统权限运行，安装前请核对来源和权限。"
+  "settings.plugins.github.notice": "从 GitHub 固定提交安装原包。插件以你的系统权限运行，安装前请核对来源和权限。",
+  "settings.plugins.translationRuntime.label": "运行组件",
+  "settings.plugins.translationRuntime.current": "已是最新",
+  "settings.plugins.translationRuntime.updateAvailable": "有更新",
+  "settings.plugins.translationRuntime.unavailable": "暂不可更新",
+  "settings.plugins.translationRuntime.update": "更新运行组件",
+  "settings.plugins.translationRuntime.confirm": "原包版本不变，将更新运行组件。更新后需重新授权并启用。"
 }

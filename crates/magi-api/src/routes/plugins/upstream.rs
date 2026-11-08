@@ -61,8 +61,8 @@ fn blocked_reason(state: &PluginOperations, ecosystem: &PluginEcosystem) -> Opti
     if !matches!(ecosystem, PluginEcosystem::Dsh) {
         return Some("pi 翻译器尚未提供，当前只能浏览".into());
     }
-    if state.plugin_toolchain.is_none() {
-        return Some("本机缺少随包 Node 或兼容运行时，不能翻译上游插件".into());
+    if let Err(reason) = state.translation_runtime_id() {
+        return Some(reason);
     }
     None
 }
@@ -373,11 +373,24 @@ pub(super) async fn preview_candidate(
 ) -> Result<PluginUpstreamPreview, ApiError> {
     let translated = translate(operations, &request).await?;
     let source = translated.source.clone();
-    let candidate = {
+    let (candidate, translation_runtime) = {
         let manager = operations.locked("预览上游插件")?;
-        manager
+        let candidate = manager
             .preview(&translated.package, &source)
-            .map_err(plugin_error)?
+            .map_err(plugin_error)?;
+        let installed = manager.state().plugins.get(&candidate.manifest.id);
+        let translation_runtime = if installed.is_some() {
+            let package = manager
+                .package(&candidate.manifest.id)
+                .map_err(plugin_error)?;
+            operations.translation_runtime_status(
+                &package,
+                operations.translation_runtime_id().as_deref(),
+            )
+        } else {
+            None
+        };
+        (candidate, translation_runtime)
     };
     let PluginSource::Upstream {
         package,
@@ -401,6 +414,7 @@ pub(super) async fn preview_candidate(
         integrity: translated.integrity,
         package,
         version,
+        translation_runtime,
         translation: translated.summary,
     })
 }

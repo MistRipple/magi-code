@@ -1801,6 +1801,10 @@ pub struct PluginInstalled {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "upstreamArchivePath")]
     pub upstream_archive_path: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "translationRuntime")]
+    pub translation_runtime: Option<PluginTranslationRuntimeStatus>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3562,6 +3566,10 @@ pub struct PluginUpstreamPreview {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github: Option<PluginGithubSource>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "translationRuntime")]
+    pub translation_runtime: Option<PluginTranslationRuntimeStatus>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3967,4 +3975,32 @@ pub struct PluginGithubSource {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginTranslationRuntimeState {
+    #[serde(rename = "current")]
+    Current,
+    #[serde(rename = "updateAvailable")]
+    UpdateAvailable,
+    #[serde(rename = "unavailable")]
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginTranslationRuntimeStatus {
+    pub state: PluginTranslationRuntimeState,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "installedId")]
+    pub installed_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "currentId")]
+    pub current_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }

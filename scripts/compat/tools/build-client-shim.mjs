@@ -1,14 +1,16 @@
 // 预先构建 DSH 页面运行时（React + 垫片）为 dist/dsh-client-host.js。随 Magi 发行，不在用户机器上构建。
 import { build } from 'esbuild';
-import { mkdirSync, existsSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, existsSync, statSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import { BROWSER_LIBRARIES, SHARED_BROWSER_MODULES } from '../runtime/client/modules.mjs';
+import { writeTranslationRuntime } from '../core/translation-runtime.mjs';
 
 // 发行构建直接使用暂存目录已按锁文件安装的依赖，不要求源码目录另做 npm install。
 const compat = process.argv[2] ? resolve(process.argv[2]) : join(dirname(fileURLToPath(import.meta.url)), '..');
 const output = join(compat, 'dist');
+rmSync(output, { recursive: true, force: true });
 mkdirSync(output, { recursive: true });
 const require = createRequire(join(compat, 'package.json'));
 const configuration = {
@@ -41,4 +43,5 @@ for (const library of BROWSER_LIBRARIES) {
   for (const file of files) if (statSync(join(output, file)).size > 4 * 1024 * 1024) throw new Error(`浏览器模块 ${file} 超过插件单文件上限，必须拆分运行库`);
 }
 writeFileSync(join(output, 'browser-modules.json'), JSON.stringify(manifest, null, 2));
+writeTranslationRuntime(compat);
 console.log('DSH 浏览器宿主与分模块运行库已构建');

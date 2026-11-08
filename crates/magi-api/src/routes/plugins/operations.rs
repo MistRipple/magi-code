@@ -4,6 +4,7 @@ use super::*;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 mod installation;
+mod translation;
 
 #[derive(Clone)]
 pub struct PluginOperations {
@@ -1519,21 +1520,33 @@ impl PluginOperations {
         Ok(())
     }
 
-    /// 只合并监管器当前运行事实，HTTP 与宿主目录必须使用相同投影。
-    pub fn decorate_runtime(&self, list: &mut magi_app_server_protocol::PluginList) {
+    /// HTTP 与宿主目录共用安装归档、当前运行组件和监管器的只读投影。
+    pub fn decorate_runtime(
+        &self,
+        manager: &PluginManager,
+        list: &mut magi_app_server_protocol::PluginList,
+    ) -> Result<(), ApiError> {
+        let current = self.translation_runtime_id();
+        for plugin in &mut list.plugins {
+            if plugin.source.kind == magi_app_server_protocol::generated::PluginSourceKind::Upstream
+            {
+                let package = manager.package(&plugin.manifest.id).map_err(plugin_error)?;
+                plugin.translation_runtime =
+                    self.translation_runtime_status(&package, current.as_deref());
+            }
+        }
         if let Some(source) = self.extension_status.as_ref().and_then(Weak::upgrade) {
             for plugin in &mut list.plugins {
                 plugin.runtime = source.status(&plugin.manifest.id);
             }
         }
+        Ok(())
     }
 
     fn projection(&self) -> Result<Value, ApiError> {
-        let mut list = self
-            .locked("读取插件结果")?
-            .projection()
-            .map_err(plugin_error)?;
-        self.decorate_runtime(&mut list);
+        let manager = self.locked("读取插件结果")?;
+        let mut list = manager.projection().map_err(plugin_error)?;
+        self.decorate_runtime(&manager, &mut list)?;
         serde_json::to_value(list).map_err(|e| ApiError::internal_assembly("编码插件目录失败", e))
     }
 

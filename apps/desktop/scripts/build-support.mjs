@@ -246,6 +246,7 @@ export async function assertReleaseInputs() {
     assertFile(join(nodeRuntimeDist, nodeRuntimeFileName), "随包 Node"),
     assertFile(join(compatRuntimeDist, "cli.mjs"), "上游插件翻译运行时"),
     assertFile(join(compatRuntimeDist, "dist", "dsh-client-host.js"), "上游插件页面运行时"),
+    assertFile(join(compatRuntimeDist, "dist", "translation-runtime.json"), "插件运行组件版本"),
   ]);
   await runNodeRuntimePreflight(nodeRuntimeDist);
   await runBridgePreflight(bridgeBinariesRoot("release"), "Rust release bridge");

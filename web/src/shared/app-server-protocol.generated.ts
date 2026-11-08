@@ -802,6 +802,7 @@ export interface PluginInstalled {
   active: boolean;
   upstreamManifest?: Record<string, unknown>;
   upstreamArchivePath?: string;
+  translationRuntime?: PluginTranslationRuntimeStatus;
 }
 
 export type PluginRuntimeState = "starting" | "running" | "restarting" | "failed" | "stopped";
@@ -1566,6 +1567,7 @@ export interface PluginUpstreamPreview {
   official: boolean;
   translation: PluginTranslationSummary;
   github?: PluginGithubSource;
+  translationRuntime?: PluginTranslationRuntimeStatus;
 }
 
 export type PluginEcosystem = "dsh" | "pi";
@@ -1767,4 +1769,13 @@ export interface PluginGithubSource {
   repository: string;
   reference?: string | null;
   commit?: string | null;
+}
+
+export type PluginTranslationRuntimeState = "current" | "updateAvailable" | "unavailable";
+
+export interface PluginTranslationRuntimeStatus {
+  state: PluginTranslationRuntimeState;
+  installedId?: string;
+  currentId?: string;
+  reason?: string;
 }

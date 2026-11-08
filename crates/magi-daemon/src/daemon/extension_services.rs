@@ -468,7 +468,9 @@ impl HostService for PluginHostService {
                         .projection_with_upstream_metadata(request.include_upstream_manifest)
                         .map_err(map_error)?;
                     if let Some(operations) = &operations {
-                        operations.decorate_runtime(&mut list);
+                        operations
+                            .decorate_runtime(&manager_guard, &mut list)
+                            .map_err(|error| RpcError::new(ErrorKind::Internal, error.message()))?;
                     }
                     return serde_json::to_value(list)
                         .map_err(|error| RpcError::new(ErrorKind::Internal, error.to_string()));

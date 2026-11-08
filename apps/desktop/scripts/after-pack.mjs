@@ -47,6 +47,7 @@ export async function afterPack(context) {
   }
   if (!manifest.files.some((file) => file.path === "daemon/compat/cli.mjs")
       || !manifest.files.some((file) => file.path === "daemon/compat/install/prepare.mjs")
+      || !manifest.files.some((file) => file.path === "daemon/compat/dist/translation-runtime.json")
       || !manifest.files.some((file) => file.path.startsWith("daemon/compat/node_modules/@deepseek-ai/cordis/"))) {
     throw new Error("发行资源清单缺少上游插件翻译运行时");
   }

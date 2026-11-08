@@ -10,6 +10,29 @@ const fixture = fileURLToPath(new URL('./fixtures/mini-dsh', import.meta.url));
 const cli = fileURLToPath(new URL('./cli.mjs', import.meta.url));
 const find = (report, name) => report.entries.find((entry) => entry.name === name);
 
+test('运行组件身份可复现，同时覆盖业务转换源码与实际页面产物', async t => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { writeTranslationRuntime, translationRuntimeId } = await import('./core/translation-runtime.mjs');
+  const root = mkdtempSync(join(tmpdir(), 'magi-translation-identity-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  for (const name of ['cli.mjs', 'index.mjs', 'package.json', 'package-lock.json']) writeFileSync(join(root, name), name);
+  for (const directory of ['core', 'dsh', 'pi', 'runtime', 'install', 'dist']) mkdirSync(join(root, directory));
+  writeFileSync(join(root, 'runtime/host.mjs'), 'first');
+  writeFileSync(join(root, 'dist/host.js'), 'page');
+  const original = writeTranslationRuntime(root);
+  assert.equal(translationRuntimeId(root), original.id);
+  assert.deepEqual(writeTranslationRuntime(root), original, '生成的身份本身不参与下一次身份计算');
+  writeFileSync(join(root, 'runtime/host.mjs'), 'second');
+  assert.notEqual(writeTranslationRuntime(root).id, original.id);
+  writeFileSync(join(root, 'runtime/host.mjs'), 'first');
+  writeFileSync(join(root, 'dist/host.js'), 'updated page');
+  assert.notEqual(writeTranslationRuntime(root).id, original.id);
+  writeFileSync(join(root, 'dist/translation-runtime.json'), '{}');
+  assert.throws(() => translationRuntimeId(root), /身份无效/);
+});
+
 test('可复现归档只携带原生辅助文件的执行意图，普通源码不会继承执行位', async (t) => {
   const { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');

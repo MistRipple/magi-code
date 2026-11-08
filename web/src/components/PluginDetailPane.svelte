@@ -6,7 +6,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import type { InstalledPluginProjection } from '../web/plugin-api';
   import type { PluginManifest, PluginPermission, PluginRuntimeStatus } from '../shared/app-server-protocol.generated';
-  import { pluginSettingsTab, type StoreItem } from '../lib/plugin-store';
+  import { installedUpstreamRequest, pluginSettingsTab, type StoreItem } from '../lib/plugin-store';
   import Icon from './Icon.svelte';
   import PluginIcon from './PluginIcon.svelte';
 
@@ -38,6 +38,9 @@
   const settingsTab = $derived(plugin && plugin.active ? pluginSettingsTab(plugin.manifest) : null);
   const activation = $derived(plugin ? activationRow(plugin) : null);
   const removable = $derived(Boolean(plugin) && !plugin!.active && !plugin!.enabled);
+  const translationRuntime = $derived(plugin?.translationRuntime);
+  const runtimeUpdate = $derived(translationRuntime?.state === 'updateAvailable' && item.upstream?.state !== 'updatable');
+  const versionUpdate = $derived(item.catalog?.state === 'updatable' ? item.catalog.version : item.upstream?.state === 'updatable' ? item.upstream.version : null);
 
   function permissionText(permission: PluginPermission): string {
     if (permission.kind === 'client') return i18n.t('settings.plugins.permission.client');
@@ -133,7 +136,13 @@
         </dd>
       </div>
     {/if}
-    <div><dt>{i18n.t('settings.plugins.detail.version')}</dt><dd>v{item.version}{#if item.updatable} → v{item.catalog?.version ?? item.upstream?.version}{/if}</dd></div>
+    <div><dt>{i18n.t('settings.plugins.detail.version')}</dt><dd>v{item.version}{#if versionUpdate} → v{versionUpdate}{/if}</dd></div>
+    {#if translationRuntime}
+      <div data-testid="plugin-translation-runtime" data-state={translationRuntime.state}>
+        <dt>{i18n.t('settings.plugins.translationRuntime.label')}</dt>
+        <dd>{i18n.t(`settings.plugins.translationRuntime.${translationRuntime.state}`)}</dd>
+      </div>
+    {/if}
       <div data-testid="plugin-source" class:pane-warn={plugin?.source.kind === 'address' || plugin?.source.kind === 'local'}>
         <dt>{i18n.t('settings.plugins.detail.source')}</dt>
         <dd>{#if plugin}{@const location = plugin.source.github ? `github:${plugin.source.github.repository}#${plugin.source.github.commit}` : plugin.source.location}{sourceLabel(plugin)} <span class="settings-mono" title={location} dir="ltr">{location}</span>{:else}{i18n.t(item.catalog ? 'settings.plugins.source.center' : item.upstream ? 'settings.plugins.source.upstream' : 'common.notProvided')}{/if}</dd>
@@ -141,6 +150,10 @@
       <div><dt>{i18n.t('settings.plugins.detail.digest')}</dt><dd class="settings-mono" title={plugin?.digest}>{plugin?.digest.slice(0, 16) || i18n.t('common.notProvided')}</dd></div>
       <div><dt>{i18n.t('settings.plugins.detail.size')}</dt><dd>{!plugin && item.catalog ? `${Math.round(item.catalog.size / 1024)} KB` : i18n.t('common.notProvided')}</dd></div>
   </dl>
+
+  {#if translationRuntime?.reason}
+    <p class="settings-notice settings-notice--warn" role="status">{translationRuntime.reason}</p>
+  {/if}
 
   {#if runtime?.reason}
     <p class="settings-notice settings-notice--{runtimeProblem ? 'error' : 'warn'}" role="status" data-testid="plugin-runtime-reason">
@@ -197,10 +210,10 @@
   <div class="settings-card-foot pane-actions" data-testid="plugin-detail-actions">
     {#if previewing}<button class="btn btn--sm btn--secondary" data-testid="plugin-cancel-preview" onclick={onCancelPreview}>{i18n.t('common.cancel')}</button>{/if}
     {#if plugin}
-      {#if plugin.source.github || item.updatable && (item.catalog || item.upstream)}
+      {#if runtimeUpdate && installedUpstreamRequest(plugin) || plugin.source.github || item.updatable && (item.catalog || item.upstream)}
         <button class="btn btn--lg btn--primary" data-testid="plugin-detail-update" onclick={onUpdateFromCenter} disabled={busy}>
-          <Icon name="download" size={13} />
-          <span>{plugin.source.github ? i18n.t('settings.plugins.github.checkUpdate') : i18n.t('settings.plugins.center.update', { from: plugin.manifest.version })}</span>
+          <Icon name={busy ? 'loader' : 'download'} class={busy ? 'spinning' : ''} size={13} />
+          <span>{busy ? busyLabel || i18n.t('common.loading') : runtimeUpdate ? i18n.t('settings.plugins.translationRuntime.update') : plugin.source.github ? i18n.t('settings.plugins.github.checkUpdate') : i18n.t('settings.plugins.center.update', { from: plugin.manifest.version })}</span>
         </button>
       {/if}
       {#if settingsTab}

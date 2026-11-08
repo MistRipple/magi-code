@@ -1,5 +1,12 @@
 # App Server 协议生成约定
 
+`PluginInstalled.translationRuntime` 是上游安装归档与当前随产品发行的运行组件的只读比较。
+`current` 表示完整组件身份相同，`updateAvailable` 包含缺少组件身份的既有归档，
+`unavailable` 表示当前组件不能读取并携带恢复原因；不从上游版本号推断该状态。
+身份覆盖业务转换源码、锁文件及实际页面产物，由发行构建生成，不新增持久化目录。
+`PluginUpstreamPreview.translationRuntime` 在更新预览中返回同一比较，安装继续使用原
+`PluginUpstreamRequest`、精确来源、候选摘要和生命周期入口；同版但摘要变化仍是升级。
+
 `app-server.schema.json` 是 App Server 控制协议的唯一 wire schema 来源。运行
 `npm run protocol:generate` 会生成：
 

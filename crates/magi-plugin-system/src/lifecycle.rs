@@ -762,6 +762,7 @@ impl PluginManager {
                         source: installed.source.projection(),
                         upstream_manifest,
                         upstream_archive_path,
+                        translation_runtime: None,
                         // 扩展宿主的运行状态属于 daemon 的 ExtensionRuntime，由 API 层合并，管理器不持有它。
                         runtime: None,
                     })

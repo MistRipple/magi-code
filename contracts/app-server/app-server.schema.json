@@ -2835,6 +2835,9 @@
         "upstreamArchivePath": {
           "type": "string",
           "description": "显式读取上游安装元数据时提供的当前不可变安装归档绝对路径；受信 Node 宿主按 digest 校验并只读原包文件，不代表已物化或正在运行。"
+        },
+        "translationRuntime": {
+          "$ref": "#/$defs/PluginTranslationRuntimeStatus"
         }
       }
     },
@@ -6299,6 +6302,9 @@
         },
         "github": {
           "$ref": "#/$defs/PluginGithubSource"
+        },
+        "translationRuntime": {
+          "$ref": "#/$defs/PluginTranslationRuntimeStatus"
         }
       }
     },
@@ -7192,6 +7198,37 @@
           "minLength": 40,
           "maxLength": 40,
           "x-rust-default": true
+        }
+      }
+    },
+    "PluginTranslationRuntimeState": {
+      "type": "string",
+      "enum": [
+        "current",
+        "updateAvailable",
+        "unavailable"
+      ]
+    },
+    "PluginTranslationRuntimeStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/PluginTranslationRuntimeState"
+        },
+        "installedId": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "currentId": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "reason": {
+          "type": "string"
         }
       }
     }

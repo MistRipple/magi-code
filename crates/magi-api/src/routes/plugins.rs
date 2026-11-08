@@ -742,7 +742,7 @@ fn snapshot(
     manager: &magi_plugin_system::PluginManager,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     let mut list = manager.projection().map_err(plugin_error)?;
-    PluginOperations::from_state(state).decorate_runtime(&mut list);
+    PluginOperations::from_state(state).decorate_runtime(manager, &mut list)?;
     Ok(Json(list))
 }
 fn plugin_error(error: magi_plugin_system::PluginError) -> ApiError {

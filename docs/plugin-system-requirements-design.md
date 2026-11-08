@@ -449,6 +449,7 @@
 | 用户任务 | 当前实现与所有权 | 验证入口与范围 |
 | --- | --- | --- |
 | 搜索、安装与在线更新 | npm 原包的获取、完整性、依赖解析与安装准备进入唯一 `PluginOperations`；动态贡献不冻结在安装期；独立 Cordis peer 按完整版本范围在线解析，不替换 Magi 自己的运行库 | `test:compat`、`test:electron-plugin-runtime`；原包搜索、排序、图标和固定操作区见 `test:electron-plugin-interactions` |
+| 更新已装插件的运行组件 | 发行构建为转换源码、锁文件和实际页面产物生成统一内容身份；daemon 与已安装归档比较，在原包版本未变化时也提供固定在线更新入口。当前原包及 GitHub 提交沿原来源重新准备、预览摘要并提交，保留设置及启用意愿；新摘要须用户重新授权激活，不继承旧授权，不增加独立组件安装目录 | `test:electron-plugin-components`：旧目录包在线安装 Health 3.0.5 后，由新目录包接续同一安装状态；本轮结果见第 12 节 |
 | 通过第三方管理页面安装 | `plugins.installBundle/cancelInstall` 把解析、准备、提交与请求的启停纳入同一个 daemon 任务；取消只影响自身未提交的准备，进入提交后明确返回 too-late；去重绑定 owner、摘要、实例和完整输入 | `test:electron-dsh-management`；Share／Upgrader 原包、取消与显式重试，证据 `target/plugin-acceptance/dsh-management/` |
 | 重复安装与失败恢复 | 同摘要不排空正在运行的实例；真实版本替换先排空再提交，失败保留旧摘要、授权和启用状态，并恢复旧宿主；不能把已安装但启用失败表述为运行成功 | Upgrader 原包的在线替换、版本不存在与候选 ZIP 写入失败，证据 `target/plugin-acceptance/upgrade-recovery/`、`installations-upgrader/` |
 | 管理目录与原包辅助进程 | 原包主宿主和 Node 辅助脚本读取同一 daemon profile 调用快照；清单及启停写入沿唯一提交入口，包管理意图委托原安装任务；没有物理 pnpm 安装树和第二套持久 profile | `test:compat` 的真实 Node 委托回归；Market 原页面在线安装 Mgr、实际后端 running 和页面终态，证据 `target/plugin-acceptance/market-helper-business/` |
@@ -476,7 +477,7 @@
 - Mgr 0.2.12 原页面点击更新仍不能显示确认框：原包按 `typeof Button === "function"` 判断组件，官方 Button 实为 React forwardRef 对象。公共组件库及原包页面均已完整加载；最新目录包专项 **12/13**，失败与类型证据在 `target/plugin-acceptance/diagnostics-profile-current/`。后台更新路由通过不能作为页面流程通过，不增加按包名改写或组件伪装。
 - Market／Share 的 GitHub 路径已接入并按第 12 节逐项验收；其他 Git 来源、上游主动移除式替换及安装提交各阶段的崩溃恢复仍未完成。安装任务现持久保存请求、提交边界和回执，重启不自动重放，候选摘要由 PluginManager 核对；验收证据见第 12 节。尚不能据部分断进程验证宣称覆盖所有掉电阶段或外部副作用 exactly-once。
 - Debugging 的 `dsh_diagnose_plugin_load` 已完成真实工具审批、安装文件核对及运行／停用／故障／恢复验收；其余诊断工具及宿主重启、Health 的完整修复流程，以及未列为实测通过的其他原包分支仍待验证，不能据单项通过认定整个插件完成。
-- 页面运行库目前封装在安装归档内。应用中的共享后端更新，不代表既有安装的页面运行库也已更新；仍需完成运行库版本检查、同版原包在线重新准备、摘要确认及页面实例更新的产品流程，不能要求用户手工替换文件，也不能用上游版本未变化推导无需更新。
+- 页面运行库封装在安装归档内，已通过运行组件内容身份及同版原包在线更新接通既有安装的更新。运行组件依然由 Magi 发行更新，原包隔离 peer 由在线依赖解析获取；没有独立运行组件发布源。私有／已撤回来源、所有平台及跨多次 Magi 发布的升级组合仍待验收。
 - 会话消息已接通当前主会话的工具／命令文本交付；跨会话与后台消息尚无产品入口。session/event、sessionProjections、完整 Agent 对象、provider 技能与作用域等仍按实际能力门槛处理，不能返回假对象或空结果冒充完成。
 - Windows、干净系统正式安装包、Android／iOS 真机触摸、屏幕录制权限引导和长期负载仍需各自验收。390px Electron 视口模拟不代表手机真机通过。
 - pi 尚无运行器；只允许浏览搜索结果，不创建空适配器或兼容声明。官方签名、公钥托管及目录内容由发布者提供，不把本地开发密钥当官方信任根。
@@ -484,6 +485,10 @@
 ## 12. 验收与证据边界
 
 ### 12.1 验证入口与证据
+
+本轮运行组件升级以两版 macOS arm64 目录发行包验收：先用旧包在线安装并运行 Health 3.0.5，保存独立状态；再用新包接续旧安装。`npm run test:electron-plugin-components -- --seed` 在旧目录包上准备样本，替换目录包后运行 `npm run test:electron-plugin-components`。可用 `MAGI_PLUGIN_COMPONENTS_OUTPUT` 指定证据目录，并用 `MAGI_PLUGIN_CLIP_AUDIT_SOURCE` 指向桌面技能的审计函数。当前证据为 `target/plugin-acceptance/components/`，**17/17**：版本发现、390px 固定操作区、加载与取消、检查失败保留实例、同版预览、摘要切换与重新授权、新摘要原生页面、真实 Health 状态路由、设置保留及重启恢复；默认、悬停与预览的阴影审计均为 `cut: 0`，无页面异常。早期验收使用了错误的设置请求字段，后又错误地等待新摘要自动激活；这两次失败保留在证据子目录，后者促使修正文案与验收，以原授权合同为准。它们不能被拼入通过计数，本轮 Health 状态路由通过也不代表完整修复流程已验收。
+
+本轮相关检查：翻译器 107 项、插件 API 49 项通过；daemon check、Web check（0 错误、0 警告）、插件列表、中文／英文字典、协议一致、Desktop check、发行边界及目录包解包自检通过。新目录包的 `test:electron-plugin-interactions` **21/21**，证据 `target/plugin-acceptance/interactions/`：真实 WorkBuddy 在线安装和原包版本更新、REA 精确搜索、真实图标、请求乱序、加载／取消／失败反馈及固定操作区。组件身份仅在构建期生成，安装准备和 daemon 读取同一事实；发行预检与解包验收强制要求携带该身份文件。原包业务、安装、授权及持久化仍沿原链路。
 
 | 最近核对范围 | 入口 | 结果与边界 |
 | --- | --- | --- |
