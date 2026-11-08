@@ -803,6 +803,7 @@ export interface PluginInstalled {
   upstreamManifest?: Record<string, unknown>;
   upstreamArchivePath?: string;
   translationRuntime?: PluginTranslationRuntimeStatus;
+  disabledBy?: PluginDisableInfo;
 }
 
 export type PluginRuntimeState = "starting" | "running" | "restarting" | "failed" | "stopped";
@@ -1777,5 +1778,24 @@ export interface PluginTranslationRuntimeStatus {
   state: PluginTranslationRuntimeState;
   installedId?: string;
   currentId?: string;
+  reason?: string;
+}
+
+export interface PluginDisableInfo {
+  pluginId: string;
+  name: string;
+  reason: string;
+}
+
+export interface PluginLifecycleState {
+  enabled: boolean;
+  disabledBy?: PluginDisableInfo;
+}
+
+export interface PluginSetEnabledRequest {
+  pluginId: string;
+  enabled: boolean;
+  expectedDigest?: string;
+  expectedState?: PluginLifecycleState;
   reason?: string;
 }

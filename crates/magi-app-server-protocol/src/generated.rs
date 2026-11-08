@@ -1805,6 +1805,10 @@ pub struct PluginInstalled {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "translationRuntime")]
     pub translation_runtime: Option<PluginTranslationRuntimeStatus>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "disabledBy")]
+    pub disabled_by: Option<PluginDisableInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -4000,6 +4004,44 @@ pub struct PluginTranslationRuntimeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "currentId")]
     pub current_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginDisableInfo {
+    #[serde(rename = "pluginId")]
+    pub plugin_id: String,
+    pub name: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginLifecycleState {
+    pub enabled: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "disabledBy")]
+    pub disabled_by: Option<PluginDisableInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginSetEnabledRequest {
+    #[serde(rename = "pluginId")]
+    pub plugin_id: String,
+    pub enabled: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expectedDigest")]
+    pub expected_digest: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expectedState")]
+    pub expected_state: Option<PluginLifecycleState>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,

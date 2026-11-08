@@ -3259,5 +3259,6 @@
   "settings.plugins.translationRuntime.updateAvailable": "Update available",
   "settings.plugins.translationRuntime.unavailable": "Update unavailable",
   "settings.plugins.translationRuntime.update": "Update runtime components",
-  "settings.plugins.translationRuntime.confirm": "The package version stays the same while its runtime components are updated. Authorize and enable the plugin again after updating."
+  "settings.plugins.translationRuntime.confirm": "The package version stays the same while its runtime components are updated. Authorize and enable the plugin again after updating.",
+  "settings.plugins.disabledBy": "Disabled by {name}: {reason}"
 }

@@ -673,7 +673,7 @@ async fn enable(
     Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .lifecycle("enable", &id, None, None)
+        .lifecycle("enable", &id, None, Default::default())
         .await?;
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
@@ -683,7 +683,7 @@ async fn activate(
     Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .lifecycle("activate", &id, None, None)
+        .lifecycle("activate", &id, None, Default::default())
         .await?;
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
@@ -693,7 +693,7 @@ async fn deactivate(
     Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .lifecycle("deactivate", &id, None, None)
+        .lifecycle("deactivate", &id, None, Default::default())
         .await?;
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
@@ -704,7 +704,7 @@ async fn disable(
     Json(_request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .lifecycle("disable", &id, None, None)
+        .lifecycle("disable", &id, None, Default::default())
         .await?;
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
@@ -713,7 +713,7 @@ async fn uninstall(
     Path(id): Path<String>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .lifecycle("uninstall", &id, None, None)
+        .lifecycle("uninstall", &id, None, Default::default())
         .await?;
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }

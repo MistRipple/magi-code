@@ -89,6 +89,7 @@ impl PluginManager {
             enabled,
             grants: Vec::new(),
             active: false,
+            disabled_by: None,
         };
         let mut next = self.state.clone();
         next.plugins.insert(id.to_owned(), replacement);

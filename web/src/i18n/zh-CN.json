@@ -3259,5 +3259,6 @@
   "settings.plugins.translationRuntime.updateAvailable": "有更新",
   "settings.plugins.translationRuntime.unavailable": "暂不可更新",
   "settings.plugins.translationRuntime.update": "更新运行组件",
-  "settings.plugins.translationRuntime.confirm": "原包版本不变，将更新运行组件。更新后需重新授权并启用。"
+  "settings.plugins.translationRuntime.confirm": "原包版本不变，将更新运行组件。更新后需重新授权并启用。",
+  "settings.plugins.disabledBy": "由 {name} 停用：{reason}"
 }

@@ -318,6 +318,7 @@ export function scanSources(root, options = {}) {
   const serviceReads = new Map();
   const serviceMembers = new Map();
   const events = new Map();
+  const profileMutations = [];
   let lines = 0;
   const { info, unresolved } = analyzeContexts(files, flow);
   for (const file of files) {
@@ -325,6 +326,31 @@ export function scanSources(root, options = {}) {
     lines += text.split('\n').length;
     const rel = relative(root, file);
     const { source, scopes } = info.get(file);
+    // 仅将明确构造 profile patch 路径且调用 fs 写入的模块作为生命周期准入证据；
+    // 普通业务文件写入（截图、缓存等）不因此获得插件管理授权。
+    const fsWriters = new Set(), fsNamespaces = new Set();
+    const writeMethod = /^(?:writeFile|rename|unlink|rm|copyFile)(?:Sync)?$/;
+    for (const statement of source.statements) if (ts.isImportDeclaration(statement)
+      && /^(?:node:)?fs(?:\/promises)?$/.test(statement.moduleSpecifier?.text ?? '')) {
+      const named = statement.importClause?.namedBindings;
+      if (statement.importClause?.name) fsNamespaces.add(statement.importClause.name.text);
+      if (named && ts.isNamespaceImport(named)) fsNamespaces.add(named.name.text);
+      if (named && ts.isNamedImports(named)) for (const binding of named.elements) {
+        if (writeMethod.test((binding.propertyName ?? binding.name).text)) fsWriters.add(binding.name.text);
+      }
+    }
+    let writesProfile = false, profilePatch = false;
+    const inspectProfile = node => {
+      if (ts.isCallExpression(node)) {
+        const callee = node.expression;
+        if (ts.isIdentifier(callee) && fsWriters.has(callee.text)
+          || ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression) && fsNamespaces.has(callee.expression.text) && writeMethod.test(callee.name.text)) writesProfile = true;
+        if (node.arguments.some(arg => ts.isStringLiteralLike(arg) && arg.text === 'cordis.patch.yml')) profilePatch = true;
+      }
+      ts.forEachChild(node, inspectProfile);
+    };
+    inspectProfile(source);
+    if (writesProfile && profilePatch) profileMutations.push(rel);
     const labelOf = (name, at) => {
       for (let n = at.parent; n; n = n.parent) { const label = scopes.get(n)?.get(name); if (label) return label; }
       return undefined;
@@ -403,5 +429,5 @@ export function scanSources(root, options = {}) {
     visit(source);
   }
   const plain = (map) => Object.fromEntries([...map].sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => [key, { count: value.count, optional: value.optionalCount === value.count, files: [...value.files].sort() }]));
-  return { fileCount: files.length, lineCount: lines, files: files.map((file) => relative(root, file)), imports: plain(imports), symbols: plain(symbols), calls: plain(calls), injects: plain(injects), serviceReads: plain(serviceReads), serviceMembers: plain(serviceMembers), events: plain(events), unresolvedContextFlows: unresolved };
+  return { fileCount: files.length, lineCount: lines, files: files.map((file) => relative(root, file)), imports: plain(imports), symbols: plain(symbols), calls: plain(calls), injects: plain(injects), serviceReads: plain(serviceReads), serviceMembers: plain(serviceMembers), profileMutations, events: plain(events), unresolvedContextFlows: unresolved };
 }

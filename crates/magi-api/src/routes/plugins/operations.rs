@@ -18,6 +18,13 @@ pub struct PluginOperations {
 
 pub(super) type OperationCaller<'a> = (&'a str, &'a str, Option<&'a str>, bool);
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct LifecycleChange<'a> {
+    expected_digest: Option<&'a str>,
+    expected_state: Option<&'a magi_app_server_protocol::generated::PluginLifecycleState>,
+    reason: Option<&'a str>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,6 +755,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disable_source_survives_reload_and_stale_restore_cannot_override_user_intent() {
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::bare_state(root.path());
+        let caller = package("acme.manager", true);
+        let target = package("acme.target", false);
+        install(&state, &caller, true);
+        install(&state, &target, true);
+        let operations = PluginOperations::from_state(&state);
+        let input = json!({"pluginId":"acme.target","enabled":false,"expectedDigest":target.digest(),
+            "expectedState":{"enabled":true},"reason":"paused for diagnosis"});
+        let result = operations
+            .call(
+                "acme.manager",
+                caller.digest(),
+                Some("current"),
+                "plugins.setEnabled",
+                input.clone(),
+            )
+            .await
+            .unwrap();
+        let disabled = result["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["manifest"]["id"] == "acme.target")
+            .unwrap();
+        assert_eq!(disabled["enabled"], false);
+        assert_eq!(disabled["active"], false);
+        assert_eq!(
+            disabled["disabledBy"],
+            json!({"pluginId":"acme.manager","name":"acme.manager","reason":"paused for diagnosis"})
+        );
+        let reopened = PluginManager::open(state.plugin_manager.lock().unwrap().root()).unwrap();
+        assert_eq!(
+            reopened.state().plugins["acme.target"]
+                .disabled_by
+                .as_ref()
+                .unwrap()
+                .reason,
+            "paused for diagnosis"
+        );
+        let restore = json!({"pluginId":"acme.target","enabled":true,"expectedDigest":target.digest(),
+            "expectedState":{"enabled":false,"disabledBy":disabled["disabledBy"]}});
+        operations
+            .call(
+                "acme.manager",
+                caller.digest(),
+                Some("current"),
+                "plugins.setEnabled",
+                restore.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            state.plugin_manager.lock().unwrap().state().plugins["acme.target"]
+                .disabled_by
+                .is_none()
+        );
+        operations
+            .call(
+                "acme.manager",
+                caller.digest(),
+                Some("current"),
+                "plugins.setEnabled",
+                input,
+            )
+            .await
+            .unwrap();
+        operations
+            .lifecycle("disable", "acme.target", None, Default::default())
+            .await
+            .unwrap();
+        assert!(
+            operations
+                .call(
+                    "acme.manager",
+                    caller.digest(),
+                    Some("current"),
+                    "plugins.setEnabled",
+                    restore
+                )
+                .await
+                .unwrap_err()
+                .message()
+                .contains("来源已变化")
+        );
+        let manager = state.plugin_manager.lock().unwrap();
+        assert!(!manager.state().plugins["acme.target"].enabled);
+        assert!(manager.state().plugins["acme.target"].disabled_by.is_none());
+    }
+
+    #[tokio::test]
     async fn management_reports_runtime_failure_instead_of_claiming_activation_applied() {
         use magi_app_server_protocol::generated::{PluginRuntimeState, PluginRuntimeStatus};
         struct FailedRuntime;
@@ -1317,30 +1416,55 @@ impl PluginOperations {
                 self.projection()
             }
             "plugins.setEnabled" | "plugins.remove" => {
-                #[derive(Deserialize)]
-                #[serde(rename_all = "camelCase", deny_unknown_fields)]
-                struct Input {
-                    plugin_id: String,
-                    enabled: Option<bool>,
-                    expected_digest: Option<String>,
-                }
-                let input: Input = serde_json::from_value(params)
-                    .map_err(|e| ApiError::InvalidInput(format!("管理参数无效：{e}")))?;
+                use magi_app_server_protocol::generated::PluginSetEnabledRequest;
+                let remove = method == "plugins.remove";
+                let input = if remove {
+                    #[derive(Deserialize)]
+                    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                    struct Remove {
+                        plugin_id: String,
+                        expected_digest: Option<String>,
+                    }
+                    let target: Remove = serde_json::from_value(params)
+                        .map_err(|e| ApiError::InvalidInput(format!("移除参数无效：{e}")))?;
+                    PluginSetEnabledRequest {
+                        plugin_id: target.plugin_id,
+                        expected_digest: target.expected_digest,
+                        enabled: false,
+                        expected_state: None,
+                        reason: None,
+                    }
+                } else {
+                    serde_json::from_value::<PluginSetEnabledRequest>(params)
+                        .map_err(|e| ApiError::InvalidInput(format!("启停参数无效：{e}")))?
+                };
                 if input.plugin_id == caller {
                     return Err(ApiError::Conflict(
                         "插件不能在自己的调用中停止、移除或重启自身，请使用 Magi 插件管理入口"
                             .into(),
                     ));
                 }
-                if method == "plugins.setEnabled" && input.enabled.is_none() {
-                    return Err(ApiError::InvalidInput("启停操作需要 enabled".into()));
+                if let Some(reason) = &input.reason {
+                    if method != "plugins.setEnabled"
+                        || input.enabled
+                        || reason.trim().is_empty()
+                        || reason.len() > 4096
+                    {
+                        return Err(ApiError::InvalidInput(
+                            "停用原因仅可用于停用操作，须为 1–4096 字节".into(),
+                        ));
+                    }
                 }
                 self.manage_target(
                     &input.plugin_id,
-                    input.enabled.unwrap_or(false),
-                    method == "plugins.remove",
+                    input.enabled,
+                    remove,
                     Some((caller, digest, lease, background)),
-                    input.expected_digest.as_deref(),
+                    LifecycleChange {
+                        expected_digest: input.expected_digest.as_deref(),
+                        expected_state: input.expected_state.as_ref(),
+                        reason: input.reason.as_deref(),
+                    },
                 )
                 .await?;
                 self.projection()
@@ -1355,30 +1479,34 @@ impl PluginOperations {
         enabled: bool,
         remove: bool,
         caller: Option<OperationCaller<'_>>,
-        expected_digest: Option<&str>,
+        change: LifecycleChange<'_>,
     ) -> Result<(), ApiError> {
         if remove || !enabled {
-            let active = self
-                .locked("读取插件激活状态")?
-                .is_active(id)
-                .map_err(plugin_error)?;
-            if active {
-                self.lifecycle("deactivate", id, caller, expected_digest)
-                    .await?;
-            }
-            // 停止后发起方可能已撤权；后续写入仍核对同一身份。
-            Self::check_caller(&*self.locked("检查插件管理授权")?, caller, "lifecycle")?;
-            self.lifecycle("disable", id, caller, expected_digest)
-                .await?;
+            self.lifecycle("disable", id, caller, change).await?;
             if remove {
-                self.lifecycle("uninstall", id, caller, expected_digest)
-                    .await?;
+                self.lifecycle(
+                    "uninstall",
+                    id,
+                    caller,
+                    LifecycleChange {
+                        expected_digest: change.expected_digest,
+                        ..Default::default()
+                    },
+                )
+                .await?;
             }
         } else {
-            self.lifecycle("enable", id, caller, expected_digest)
-                .await?;
-            self.lifecycle("activate", id, caller, expected_digest)
-                .await?;
+            self.lifecycle("enable", id, caller, change).await?;
+            self.lifecycle(
+                "activate",
+                id,
+                caller,
+                LifecycleChange {
+                    expected_digest: change.expected_digest,
+                    ..Default::default()
+                },
+            )
+            .await?;
             self.wait_running(id, caller).await?;
         }
         Ok(())
@@ -1427,22 +1555,46 @@ impl PluginOperations {
         action: &str,
         id: &str,
         caller: Option<OperationCaller<'_>>,
-        expected_digest: Option<&str>,
+        change: LifecycleChange<'_>,
     ) -> Result<(), ApiError> {
         {
             let manager = self.locked("检查插件管理准入")?;
             Self::check_caller(&manager, caller, "lifecycle")?;
-            Self::check_target(&manager, id, expected_digest)?;
+            Self::check_lifecycle_target(&manager, id, change)?;
         }
-        if action == "deactivate" {
-            let drain = PluginManager::begin_deactivation(Arc::clone(&self.manager), id)
-                .map_err(plugin_error)?;
+        if action == "deactivate" || action == "disable" {
+            let drain = if action == "disable" {
+                PluginManager::begin_upgrade_drain(Arc::clone(&self.manager), id)
+            } else {
+                PluginManager::begin_deactivation(Arc::clone(&self.manager), id)
+            }
+            .map_err(plugin_error)?;
             self.quiesce(id).await?;
             let result = {
                 let mut manager = self.locked("停用插件")?;
-                Self::check_target(&manager, id, expected_digest)?;
+                Self::check_lifecycle_target(&manager, id, change)?;
                 Self::check_caller(&manager, caller, "lifecycle")?;
-                let result = manager.deactivate(id).map_err(plugin_error);
+                let origin = if let (Some(reason), Some((owner, _, _, _))) = (change.reason, caller)
+                {
+                    Some(magi_app_server_protocol::generated::PluginDisableInfo {
+                        plugin_id: owner.into(),
+                        name: manager
+                            .package(owner)
+                            .map_err(plugin_error)?
+                            .manifest()
+                            .name
+                            .clone(),
+                        reason: reason.into(),
+                    })
+                } else {
+                    None
+                };
+                let result = if action == "disable" {
+                    manager.disable_drained(id, origin, &drain)
+                } else {
+                    manager.deactivate(id)
+                }
+                .map_err(plugin_error);
                 if result.is_ok() {
                     drain.commit(&mut manager);
                 }
@@ -1453,12 +1605,11 @@ impl PluginOperations {
         }
         let result = {
             let mut manager = self.locked("管理插件")?;
-            Self::check_target(&manager, id, expected_digest)?;
+            Self::check_lifecycle_target(&manager, id, change)?;
             Self::check_caller(&manager, caller, "lifecycle")?;
             match action {
                 "enable" => manager.enable(id),
                 "activate" => manager.activate(id).map(|_| ()),
-                "disable" => manager.disable(id),
                 "uninstall" => manager.uninstall(id),
                 _ => return Err(ApiError::InvalidInput("未知生命周期操作".into())),
             }
@@ -1514,6 +1665,34 @@ impl PluginOperations {
             if manager.package(id).map_err(plugin_error)?.digest() != expected {
                 return Err(ApiError::Conflict(
                     "目标插件版本已变化，请刷新后重试".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_lifecycle_target(
+        manager: &PluginManager,
+        id: &str,
+        change: LifecycleChange<'_>,
+    ) -> Result<(), ApiError> {
+        Self::check_target(manager, id, change.expected_digest)?;
+        if let Some(expected) = change.expected_state {
+            if change.expected_digest.is_none() {
+                return Err(ApiError::InvalidInput(
+                    "启停状态确认必须绑定插件摘要".into(),
+                ));
+            }
+            let installed = manager
+                .state()
+                .plugins
+                .get(id)
+                .ok_or_else(|| ApiError::Conflict("目标插件未安装".into()))?;
+            if installed.enabled != expected.enabled
+                || installed.disabled_by != expected.disabled_by
+            {
+                return Err(ApiError::Conflict(
+                    "插件启停状态或停用来源已变化，请刷新后重试".into(),
                 ));
             }
         }

@@ -335,6 +335,8 @@
 
 【现状·实现】次级文字色统一由 Magi 全局 `--foreground-secondary` 定义，设置页和原包页面消费同一令牌，不在翻译器重算。DSH 可用于反色文字的层级色映射到不透明画布；可读正文及页签文字沿共享次级色。已删除 WorkBuddy 专属按钮／页签 CSS 选择器，公共宿主不依据插件类名修正页面。主题来源仍是 Magi 外观服务，原包样式和组件保持原样。
 
+【现状·实现】profile 中的安装清单、配置、node_modules 原包读取及其临时备份继续使用 daemon 调用快照。除此之外的报告、导出和缓存是当前插件的私有业务文件，使用其 `extensions/data/<id>` 下的真实 Node 路径；根目录读取将这些真实文件与只读安装投影合并，不生成物理 package.json、cordis 配置或 node_modules 安装副本。原包返回的报告路径可实际读取，文件副作用遵循普通受信 Node 的语义；它们不变成安装、授权或启停的第二份事实源。静态准入只对同模块明确构造 profile patch 路径并调用文件写入的代码申请 lifecycle/background 委托，普通截图或缓存写入不因此获得管理授权。
+
 ### 6.2 翻译范围
 
 | 状态 | 来源与 API | 范围 | 原因与必要映射 |
@@ -455,6 +457,7 @@
 | 管理目录与原包辅助进程 | 原包主宿主和 Node 辅助脚本读取同一 daemon profile 调用快照；清单及启停写入沿唯一提交入口，包管理意图委托原安装任务；没有物理 pnpm 安装树和第二套持久 profile | `test:compat` 的真实 Node 委托回归；Market 原页面在线安装 Mgr、实际后端 running 和页面终态，证据 `target/plugin-acceptance/market-helper-business/` |
 | 应用插件目录 | `hmr.runExclusive` 只串行当前实例操作，拒绝嵌套；`reconcileProfile` 提交本次启停意图后等待 daemon 原监管器就绪，不改写授权，不启动停用项，不重启未变化实例 | Market 原页面重载并在新文档继续搜索，证据 `target/plugin-acceptance/market-reload-business/`；不提供文件监听或 Node 模块缓存替换 |
 | 查看健康与运行状态 | 目录订阅只发失效通知，消费者重读 daemon；原包元数据来自不可变归档，生命周期和失败原因来自真实监管状态；观察其他插件失败不处置观察者自身 | Health／Mgr 原包及 `test:electron-dsh-profile`；证据 `target/plugin-acceptance/profile-reload-final/` |
+| 按诊断停用并恢复插件 | daemon 将停用来源与原因保存在原安装记录，排空后原子提交启停状态；恢复核对原包摘要及当前停用来源，用户显式停用、启用和版本替换会清除来源。上游 profile 的说明仅投影该事实，备份／复制仍属于调用提案，不保留可写安装树；报告和修复隔离文件保存在插件私有目录，真实文件与投影使用相同的系统路径身份 | `test:compat`、插件 API 的来源持久化和过期恢复回归；`test:electron-dsh-health` 的原页面修复、停用与重启恢复 |
 | 读取已安装原包文件 | 显式安装元数据读取携带 daemon 当前归档路径与摘要；profile 在当前调用内懒读取并核对原包字节，目录、只读句柄和文件时间复用同一快照。未激活包也可读取安装产物，不借用运行目录，不物化第二份安装树；摘要不一致明确拒绝。目录只投影真实插件及原生 ID，已删除虚构的 `cordis:include` 根和 ID 前缀；同步错误读取与异步状态观察共用同一监管原因 | `test:compat` 的真实归档、二进制、只读与摘要冲突回归；Debugging 原包业务验收结果单列 |
 | 管理版本豁免 | daemon 资源 CAS 保存精确包版本与 runtimeId，独立 compatibility 授权及风险确认；豁免不跳过能力、摘要或权限准入，撤销后旧确认不可继续提交 | `test:electron-dsh-compatibility`，Ops 原包扫描、豁免、在线安装、卸载和重启恢复；证据 `target/plugin-acceptance/dsh-compatibility/` |
 | 使用原包页面 | 设置、主页面和右栏共用隔离页面宿主；后台就绪后挂载，摘要或代次变化释放旧文档与桥，其他插件变化保留当前文档；页面、资源、SVG 和外链保持上游表达 | `test:electron-dsh-rea`、`test:electron-plugin-runtime`；REA 原页面 Ghidra 链接、设置 CAS、207 个 MCP 工具和 390px 视口 |
@@ -476,7 +479,7 @@
 - 完整业务覆盖率仍未达到可证明的 95%／100%。逐插件补齐成功结果、取消、配置持久化、在线更新、失败恢复与停用／重启验收；安装、进程 running、页面有内容和路由 smoke 各自只证明对应阶段。
 - Mgr 0.2.12 原页面点击更新仍不能显示确认框：原包按 `typeof Button === "function"` 判断组件，官方 Button 实为 React forwardRef 对象。公共组件库及原包页面均已完整加载；最新目录包专项 **12/13**，失败与类型证据在 `target/plugin-acceptance/diagnostics-profile-current/`。后台更新路由通过不能作为页面流程通过，不增加按包名改写或组件伪装。
 - Market／Share 的 GitHub 路径已接入并按第 12 节逐项验收；其他 Git 来源、上游主动移除式替换及安装提交各阶段的崩溃恢复仍未完成。安装任务现持久保存请求、提交边界和回执，重启不自动重放，候选摘要由 PluginManager 核对；验收证据见第 12 节。尚不能据部分断进程验证宣称覆盖所有掉电阶段或外部副作用 exactly-once。
-- Debugging 的 `dsh_diagnose_plugin_load` 已完成真实工具审批、安装文件核对及运行／停用／故障／恢复验收；其余诊断工具及宿主重启、Health 的完整修复流程，以及未列为实测通过的其他原包分支仍待验证，不能据单项通过认定整个插件完成。
+- Debugging 的 `dsh_diagnose_plugin_load` 已完成真实工具审批、安装文件核对及运行／停用／故障／恢复验收；Health 已验证原页面临时文件修复、取消、隔离日志及停用／重启恢复。其余诊断工具、宿主重启、其他修复类型及未列为实测通过的原包分支仍待验证，不能据单项通过认定整个插件完成。
 - 页面运行库封装在安装归档内，已通过运行组件内容身份及同版原包在线更新接通既有安装的更新。运行组件依然由 Magi 发行更新，原包隔离 peer 由在线依赖解析获取；没有独立运行组件发布源。私有／已撤回来源、所有平台及跨多次 Magi 发布的升级组合仍待验收。
 - 会话消息已接通当前主会话的工具／命令文本交付；跨会话与后台消息尚无产品入口。session/event、sessionProjections、完整 Agent 对象、provider 技能与作用域等仍按实际能力门槛处理，不能返回假对象或空结果冒充完成。
 - Windows、干净系统正式安装包、Android／iOS 真机触摸、屏幕录制权限引导和长期负载仍需各自验收。390px Electron 视口模拟不代表手机真机通过。
@@ -486,37 +489,27 @@
 
 ### 12.1 验证入口与证据
 
-本轮运行组件升级以两版 macOS arm64 目录发行包验收：先用旧包在线安装并运行 Health 3.0.5，保存独立状态；再用新包接续旧安装。`npm run test:electron-plugin-components -- --seed` 在旧目录包上准备样本，替换目录包后运行 `npm run test:electron-plugin-components`。可用 `MAGI_PLUGIN_COMPONENTS_OUTPUT` 指定证据目录，并用 `MAGI_PLUGIN_CLIP_AUDIT_SOURCE` 指向桌面技能的审计函数。当前证据为 `target/plugin-acceptance/components/`，**17/17**：版本发现、390px 固定操作区、加载与取消、检查失败保留实例、同版预览、摘要切换与重新授权、新摘要原生页面、真实 Health 状态路由、设置保留及重启恢复；默认、悬停与预览的阴影审计均为 `cut: 0`，无页面异常。早期验收使用了错误的设置请求字段，后又错误地等待新摘要自动激活；这两次失败保留在证据子目录，后者促使修正文案与验收，以原授权合同为准。它们不能被拼入通过计数，本轮 Health 状态路由通过也不代表完整修复流程已验收。
+本节每个功能只保留最近一次独立完整运行的证据。此前批次不代表本轮已复跑，不将不同批次的分项合并为一次通过，也不从检查数量推导生态支持率。逐次排错过程及被替代的验收记录由 Git 历史和原证据目录追溯。
 
-本轮相关检查：翻译器 107 项、插件 API 49 项通过；daemon check、Web check（0 错误、0 警告）、插件列表、中文／英文字典、协议一致、Desktop check、发行边界及目录包解包自检通过。新目录包的 `test:electron-plugin-interactions` **21/21**，证据 `target/plugin-acceptance/interactions/`：真实 WorkBuddy 在线安装和原包版本更新、REA 精确搜索、真实图标、请求乱序、加载／取消／失败反馈及固定操作区。组件身份仅在构建期生成，安装准备和 daemon 读取同一事实；发行预检与解包验收强制要求携带该身份文件。原包业务、安装、授权及持久化仍沿原链路。
+目录包验收通过 `MAGI_PLUGIN_TEST_APP` 选择发行物，使用独立状态根和随包 daemon／Node。`MAGI_PLUGIN_CLIP_AUDIT_SOURCE` 可指定桌面技能的原始审计函数；各脚本的输出目录变量见源码与[验证入口](validation.md)。
 
-| 最近核对范围 | 入口 | 结果与边界 |
+| 验证范围 | 入口 | 最近证据与边界 |
 | --- | --- | --- |
-| 本轮页面载荷、诊断与运行时完整回归 | `test:electron-plugin-runtime` | 最终源码新构建 macOS arm64 目录包 **125/125**；`target/plugin-acceptance/route-source-product-final/`。同批验证真实隔离页面 2 MiB 原字节往返、multipart 文件及边界、PNG／SVG Blob 图片解码、应用响应头、HEAD／OPTIONS 和非法／冲突／超限载荷在业务前拒绝。Debugging 0.7.2 原包仍经真实模型工具链、原生审批完成运行／停用／故障／恢复诊断；8 种外观、原页面、右栏、390px、取消、消息、技能及应用重启通过。新增字节流程为机制样本，不计入社区核心业务覆盖率；其余 Debugging 工具与宿主重启未验收 |
-| 本轮原包管理回归 | `test:electron-dsh-management` | 同一目录包独立完整复跑 **29/29**；`target/plugin-acceptance/route-source-management-final/`。Share、Upgrader、Market 原包的 npm／GitHub 获取、安装、更新、授权、取消、重试、失败保留、重启及卸载沿原入口通过；没有启用可选阴影审计。早期 npm 依赖 502、TLS 断连及匿名 GitHub REST 配额耗尽分别保留于 `route-media-management/`、`route-media-product-final/` 与 `route-media-management-verified/`；统一 npm 读取恢复并移除 REST 提交查询后，最终源码独立完整复跑通过，没有过滤错误或拼接通过项。Mgr 的此前专项仍为 **12/13**，本轮未复跑，不把管理服务通过作为该页面通过 |
-| 本轮 Market 目录应用 | `test:electron-popular-dsh`，仅选择 Market | `target/plugin-acceptance/diagnostics-market-final/`：Market 1.2.2 安装、运行、页面、原 Node 辅助进程安装及更新、版本失败保留、目录重载、未变化实例保留、停用意图和原页面重载后继续搜索均通过。完整分母仍为 9，实际只选 1，`coreVerified=0`、`qualified=false`，脚本按完整门槛退出 1；不计为 95% 通过 |
-| 此前主题批次的真实 WorkBuddy 回归 | `test:electron-workbuddy` | 主题改造目录包，在线 5.20.32 原包 **11/11**；`target/plugin-acceptance/theme-contract-workbuddy/`。原页面、实际 hy3 模型回复、停用撤销和重新激活通过，未启用可选 CLI 专项；本轮归档改造后未复跑，不拼接成当前批次通过项 |
-| 本轮静态与共享检查 | `test:compat`、Rust、Web、协议、发行边界 | 翻译运行时 **106/106**；Rust 字节载荷／响应头、真实 Node 路由、daemon 授权取消及图片 CSP 四个定向回归、归档 8 项及 GitHub 来源校验通过；daemon check、协议生成一致、Web check 0 错误 0 警告、Electron 单一发行边界与目录包解包自检通过。未复跑插件生命周期全套、全仓测试、Windows 或手机真机 |
-| 本轮翻译运行时回归 | `npm run test:compat` | 103/103；包括 GitHub 来源解析、目录与 profile 来源一致；新增同步消息真实回执、失败不提交、来源校验、失效引用、工具与命令共享消息端口；其他原有契约保持通过。不能据测试数量推导生态支持率 |
-| 本轮 npm／GitHub 原包管理 | `test:electron-dsh-management` | 新构建 macOS arm64 目录包 **30/30**；`target/plugin-acceptance/github-product-final/`。Share 0.2.5 原页面实际导入 GitHub Health 3.0.5，保留来源并在线升至 3.0.6；固定提交预览、摘要授权、版本失败保留运行实例、重启和卸载通过。Market 1.2.2 原包 Node 辅助进程实际从 GitHub 安装、HTTPS Git 更新与失败保留通过；Market Git 的整页按钮未覆盖。原 npm Share／Upgrader／Release Probe 管理流程同批通过。390px 确认固定可达、无横向溢出，桌面审计 `cut=0`；不代表 Health 全部修复业务、其他 Git 服务或手机真机 |
-| 本轮目录包中断恢复 | `test:electron-plugin-install-recovery` | 新构建 macOS arm64 目录包 **10/10**；`target/plugin-acceptance/github-install-recovery-final/`。同原解析、提交后等待、完成回执三个断进程位置，npm 机制夹具实际业务恢复；不据此宣称所有 Git 下载与掉电阶段均已验证 |
-| 本轮来源、安装与界面检查 | Rust、Web、协议、发行边界 | 插件 API 专项 48 项、安装恢复 11 项；插件领域与生命周期专项 42 项、归档专项 7 项（范围重叠，不相加）；Web check、i18n、插件列表与布局回归、协议一致、Electron 单一发行边界及目录包解包自检通过。布局旧断言误禁插件页只读 `shellUi.settingsOpen`，已收敛为禁止 App 拥有或写入设置层 |
-| 既有安装恢复专项，不计本轮复跑 | `test:electron-plugin-install-recovery` | 新构建的 macOS arm64 目录发行包、状态布局 21，**10/10**；`target/plugin-acceptance/install-recovery-final/`。实际 SIGKILL 验证解析中、版本已提交但 Node 未就绪、完成回执三个断点；同请求不重新下载、不替换版本，显式新请求收敛，恢复后的原包业务命令实际返回。私有 registry 仅提供测试原包，不计入社区样本覆盖率；尚未覆盖所有掉电、磁盘与替换阶段 |
-| 既有真实原包管理回归，不计本轮复跑 | `test:electron-dsh-management` | 新构建目录包中的 Share 0.2.5、Upgrader 1.8.0 和 Release Probe 在线原包，**16/16**；`target/plugin-acceptance/install-journal-community/`。原页面导入、安装与启停、委托授权、在线升级、取消／重试、摘要拒绝、卸载和运行实例保留通过；不代表 Git 来源或全部社区业务完成 |
-| 既有安装恢复 Rust 回归，不计本轮复跑 | `magi-api`、`magi-daemon` | 安装任务 10 项、管理操作 12 项、状态布局写屏障 1 项通过；包含请求内容冲突、跨插件身份、撤权／实例结束、取消清理、写盘失败与损坏日志保留。daemon check、协议生成一致、Electron 单一发行边界和目录包解包自检通过 |
-| 既有会话消息 Rust 回归，不计本轮复跑 | `magi-api`、`magi-conversation-runtime`、`magi-plugin-system`、`magi-daemon` | 原生队列与消费相关 20 项、dispatch 原有 20 项、新增上下文原子领取与来源重建 1 项、独立消息权限 1 项、状态布局写屏障 1 项通过；daemon check 和修改 Rust 文件格式检查通过 |
-| 既有 Web 与会话消息检查，不计本轮复跑 | Web、协议、目录发行包 | Web check 0 错误 0 警告；协议生成一致；canonical 历史投影和 composer 定向检查通过。macOS 目录包重新构建与解包自检通过；没有 Desktop Main 代码变更，未复跑其独立测试 |
-| 既有 Rust 业务专项，不计本轮复跑 | 运行目录、技能与宿主 | 运行目录 7、`skill_apply` 7、技能加载 7、SkillRuntime 20、消息名称接纳 1、宿主单元 15、真实 Node 集成 25 项通过 |
-| 既有会话消息目录包，不计本轮复跑 | `test:electron-plugin-runtime` | macOS arm64 Electron 45、随包 daemon／Node，**107/107**；`target/plugin-acceptance/session-messages-product-final/results.json`。在原命令、技能、图片、SVG、原页面、右栏和生命周期回归上新增消息上下文与唤醒、原子领取／Step 消费、重复身份、取消／失败、重启恢复、来源完整展示、390px 布局及计划预算拒绝；不代表手机真机或全部生态完成 |
-| 既有社区目录包批次，不计本轮复跑 | `test:electron-popular-dsh` | 固定 9 个社区原包：在线安装 9/9、启动 9/9、原生页面 9/9、路由 smoke 7/7、页面异常 0；在线更新验证 2 条、coreVerified 仍为 0、qualified 为 false，按完整门槛退出 1。结果在 `target/plugin-acceptance/skills-community-final/`，未完成项保留 unverified，不以安装率推导生态支持率 |
-| 既有 WorkBuddy 真实外部服务，不计本轮复跑 | `MAGI_WORKBUDDY_CLI_BINARY=<CLI绝对路径> MAGI_WORKBUDDY_CLI_MODEL=hy3 MAGI_WORKBUDDY_CLI_INJECT_RESULT=1 npm run test:electron-workbuddy` | 5.20.32 在线原包、CodeBuddy CLI 2.181.0，**15/15**；`target/plugin-acceptance/session-messages-workbuddy-final/`。实际 CLI 只授权读取验收文件，保留 dontAsk；原包自动回注保存 codebuddy-bridge 来源，主模型完成真实回复。此前非 Git 夹具使主模型 git_status 拒绝，整轮失败保留于 `session-messages-workbuddy/`，后续使用真实 Git 项目独立整套通过；未降低成功门槛或过滤运行日志 |
-| 既有页面 SDK 专项，不计本轮复跑 | `test:electron-dsh-rea` | 1.2.0 原包与 rea-agents 6.5.0、16/16：SVG、原页面 Ghidra 链接、真实 207 工具、CAS、停用与恢复；`target/plugin-acceptance/product-ui-rea/`。此包早于最后的外观事件分类修正，未验证 Ghidra 实际安装或二进制分析 |
-| 既有未解决失败，不计通过 | `test:electron-dsh-profile` | 原包搜索、布局恢复、启停和运行错误恢复通过，更新确认仍超时；`target/plugin-acceptance/profile-sdk-final/ui-modules.json` 确认组件库已加载。见第 11.2 节的原包组件判断问题 |
-| 既有专项，不计本轮复跑 | `test:electron-dsh-management`、`test:electron-dsh-compatibility` | 第 11 节所列原包管理、版本豁免、真实运行状态与失败恢复证据；不能合并不同批次成为全部业务通过 |
-| 既有专项，不计本轮复跑 | `test:electron-appshot` | 0.4.2 原包、13 项，真实 macOS 原生截图、后台附件、草稿挂载及重启恢复；`target/plugin-acceptance/appshot/`，不代表其他平台或所有时序分支 |
-| 既有本地纵向套件，不计本轮复跑 | `test:local-plugins`、`test:local-plugins-ui` | 真实 daemon／Node 的安装、授权、服务、调度、回收与界面流程；设置页现已移除计划表单，旧表单截图不是当前 UI 合同 |
+| 本轮 Health 原包业务与停用来源 | `test:electron-dsh-health` | 新构建 macOS arm64 目录包、Electron 45、随包 Node；Health 3.0.5 与 Release Probe 0.0.8 在线原包 **21/21**，`target/plugin-acceptance/health-product-release/`。诊断、无效确认拒绝、停用来源原生详情展示、重启保留停用意愿、恢复运行、交接文件、原页面修复预览／取消／再次确认、真实临时文件隔离及原字节日志通过；390px 停用原因完整换行可见；详情默认／悬停、修复预览及完成态均 `cut=0`，页面异常 0。只覆盖列出的修复类型 |
+| 本轮在线管理公共链路 | `test:electron-dsh-management` | 同一新目录包独立完整复跑 **30/30**，`target/plugin-acceptance/health-lifecycle-management/`。Share、Upgrader、Market 原包完成 npm／GitHub 获取、安装、在线更新、授权、取消／重试、失败保留、重启及卸载；390px 确认固定可达且无横向溢出，阴影审计 `cut=0`。管理服务通过不代表 Mgr 原页面已通过 |
+| 本轮公共检查 | `test:compat`、Rust、Web、协议与目录包 | 翻译运行时 **110/110**；插件 API 50 项、插件领域各测试目标 83 项、真实 Node 后台管理身份 1 项通过。符号链接回归覆盖同步／回调／Promise 路径；Web check 0 错误 0 警告、插件列表和 i18n 回归、协议一致及目录包解包自检通过。修改的 Rust 文件格式检查通过，全仓格式检查有任务外既有差异，未改动这些文件 |
+| 此前运行组件在线更新，未在本轮复跑 | `test:electron-plugin-components` | 两版 macOS arm64 目录包接续同一状态根，**17/17**；`target/plugin-acceptance/components/`。旧包在线安装 Health 3.0.5，随后新包完成组件身份发现、390px 固定操作、加载／取消／失败保留、同版预览与摘要切换、重新授权、原页面、设置保留及重启恢复；默认、悬停、预览均 `cut=0`。运行组件随 Magi 发行，不是独立组件发布源 |
+| 此前发现与安装交互，未在本轮复跑 | `test:electron-plugin-interactions` | **21/21**；`target/plugin-acceptance/interactions/`。WorkBuddy 在线安装与原包版本更新、REA 精确搜索、真实图标、请求乱序、加载／取消／失败反馈及固定操作区 |
+| 此前页面与业务运行时，未在本轮复跑 | `test:electron-plugin-runtime` | macOS arm64 目录包 **125/125**；`target/plugin-acceptance/route-source-product-final/`。真实隔离页面 2 MiB 字节、multipart 文件、PNG／SVG Blob、响应头、HEAD／OPTIONS、非法／超限拒绝、8 种外观、右栏、390px、取消、消息、技能及重启。Debugging 0.7.2 原包经真实工具审批完成运行／停用／故障／恢复诊断；其他诊断工具和宿主重启未验收。机制夹具不计入社区核心业务覆盖率 |
+| 此前安装中断恢复，未在本轮复跑 | `test:electron-plugin-install-recovery` | 新目录包 **10/10**；`target/plugin-acceptance/github-install-recovery-final/`。解析中、版本已提交但 Node 未就绪、终态回执三个断进程位置；同请求不重新下载或替换版本，显式新请求收敛，恢复后真实业务命令返回。私有 registry 仅提供机制原包，未覆盖所有掉电、磁盘和替换阶段 |
+| 此前 WorkBuddy 外部服务，未在本轮复跑 | `MAGI_WORKBUDDY_CLI_BINARY=<CLI绝对路径> MAGI_WORKBUDDY_CLI_MODEL=hy3 MAGI_WORKBUDDY_CLI_INJECT_RESULT=1 npm run test:electron-workbuddy` | WorkBuddy 5.20.32 在线原包、CodeBuddy CLI 2.181.0，**15/15**；`target/plugin-acceptance/session-messages-workbuddy-final/`。原页面、CLI 读取验收文件、自动回注 codebuddy-bridge 来源及主模型真实回复；未覆盖国际版、视频或外部程序安装管理 |
+| 此前 REA 页面与工具，未在本轮复跑 | `test:electron-dsh-rea` | REA 1.2.0、rea-agents 6.5.0，**16/16**；`target/plugin-acceptance/product-ui-rea/`。SVG、原页面 Ghidra 链接、207 个真实工具、CAS、停用和恢复；早于最后的外观事件分类修正，未验证 Ghidra 实际安装或二进制分析 |
+| 此前 Appshot，未在本轮复跑 | `test:electron-appshot` | Appshot 0.4.2，**13/13**；`target/plugin-acceptance/appshot/`。真实 macOS 原生截图、关闭设置页后投递、后台附件和草稿挂载及重启后载荷恢复；不代表其他平台或全部时序分支 |
+| 此前目录应用与版本豁免，未在本轮复跑 | `test:electron-popular-dsh`、`test:electron-dsh-compatibility` | Market 1.2.2 原页面安装／更新、失败保留、目录重载、未变化实例和停用意图、重载后继续搜索，见 `target/plugin-acceptance/diagnostics-market-final/`；该批只选 1 个，完整分母仍为 9，未计为完整业务通过。Ops 原包扫描、豁免、在线安装、卸载及重启恢复见 `target/plugin-acceptance/dsh-compatibility/` |
+| 此前社区批次，未在本轮复跑 | `test:electron-popular-dsh` | 固定 9 个社区原包在线安装 9/9、启动 9/9、原生页面 9/9、路由 smoke 7/7、页面异常 0；在线更新验证 2 条，`coreVerified=0`、`qualified=false`，完整门槛退出 1。证据 `target/plugin-acceptance/skills-community-final/`；未完成业务保持 unverified，不能将安装率作为生态支持率 |
+| 尚未解决的 Mgr 页面流程 | `test:electron-dsh-profile` | Mgr 0.2.12 专项 **12/13**；`target/plugin-acceptance/diagnostics-profile-current/`。搜索、布局恢复、启停、运行错误恢复通过；原包将 forwardRef Button 对象误判为不可用，点击更新后确认框缺失。组件库已完整加载，不改写原包或伪装组件以计为通过 |
 
-验收器仅在发送按钮真实存在且启用时操作；进程重启前释放旧文档，重新启动后等待外观和工作台初始化，不把 CDP 提前导航造成的网络中止混入业务结果。原包组件、错误断言和成功门槛保持实际行为，没有过滤运行异常或添加整轮自动重试。GitHub 管理早期 Share 夹具缺来源类型、PAX 元数据拒绝和窄屏确认不可达分别保留于 `github-product-initial/`、`github-product-source/` 和 `github-product-archive/`；当前整套通过证据为 `github-product-final/`。会话消息专项的既有目录包独立完整通过 107/107，不拼接中间通过项；本轮 GitHub 管理与中断恢复按上表独立记录。消息验收早期工具端口装配遗漏及夹具错误保留于 `session-messages-*` 各失败目录；当前通过证据仅为 `session-messages-product-final/`。执行上下文验收早期参数、协议方法与夹具模型触发错误，以及目录失效应由异步 canonical 终态判定的修正记录保留于 `execution-product/`、`execution-product-final/`、`execution-product-verified/`、`execution-context-final/`、`execution-product-complete/`；此前页面失败仍保留于各自证据目录。
+验收保持原包组件、异常与成功门槛，不过滤运行错误或整轮自动重试。进程重启前释放旧文档，重新启动后等待工作台初始化。以上证据不替代第 11.2 节剩余产品工作。
 
 ### 12.2 未运行与不得推导的结论
 

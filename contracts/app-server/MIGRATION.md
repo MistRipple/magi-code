@@ -1,5 +1,13 @@
 # App Server 协议生成约定
 
+`PluginInstalled.disabledBy` 为 daemon 持久化的停用来源（插件 ID、名称与原因），不是
+客户端自报的运行状态。管理者在 `PluginSetEnabledRequest` 中可提交停用原因；来源身份由
+daemon 根据已授权调用者补充，排空后与 enabled/active 一次提交。启用、用户显式停用及
+包版本替换会清除该来源。可选 `expectedState` 使用 `PluginLifecycleState`，与
+`expectedDigest` 共同核对启停意愿及停用来源，写入前、排空后都须一致；防止旧诊断页
+恢复已被用户或其他管理操作接管的停用。原安装状态的增量 `disabled_by` 缺省为 None，
+无需另建日志或第二份 profile 状态。
+
 `PluginInstalled.translationRuntime` 是上游安装归档与当前随产品发行的运行组件的只读比较。
 `current` 表示完整组件身份相同，`updateAvailable` 包含缺少组件身份的既有归档，
 `unavailable` 表示当前组件不能读取并携带恢复原因；不从上游版本号推断该状态。

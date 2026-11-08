@@ -69,6 +69,15 @@ async function inspectOptional(t, code) {
   return createRegistry().create('dsh').inspect(dir, { required: ['session', 'hooks', 'tools'] });
 }
 
+test('profile 启停文件写入有独立准入证据，普通文件写入不申请插件管理权限', async t => {
+  const report = await inspectOptional(t, "import {writeFileSync as save} from 'node:fs'; import {join} from 'node:path'; export function apply(ctx) {} export function disable(dir){save(join(dir,'cordis.patch.yml'),'[]')}");
+  assert.equal(report.profileMutations.length, 1);
+  const ordinary = await inspectOptional(t, "import fs from 'node:fs'; export function apply(ctx) {fs.writeFileSync('capture.png','bytes')}");
+  assert.deepEqual(ordinary.profileMutations, []);
+  const read = await inspectOptional(t, "import {readFileSync} from 'node:fs'; export function apply(ctx) {readFileSync('cordis.patch.yml')}");
+  assert.deepEqual(read.profileMutations, []);
+});
+
 test('DSH 可选服务保留缺失报告；必需依赖、未知服务和分支里的其他未支持服务仍阻塞', async (t) => {
   const optional = "export function apply(ctx) { ctx.inject(['sessionProjections'], c => c.sessionProjections.stateOf()); }";
   const report = await inspectOptional(t, optional);

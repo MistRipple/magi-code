@@ -11,7 +11,7 @@ import { createPluginManager } from './plugin-manager.mjs';
 import { pluginLifecycle } from './plugin-directory.mjs';
 import { dshBundle as bundle } from './plugin-source.mjs';
 import { createProfileProcesses } from './profile-process-host.mjs';
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, statSync, readdirSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { unzipSync } from 'fflate';
 
@@ -28,7 +28,9 @@ export function configureProfile(api, { home = process.env.DSH_HOME, registry = 
   if (!home || !api.plugins?.list) return () => {};
   if (host) throw new Error('DSH profile 已绑定宿主');
   if (api.plugins.background) api = { ...api, plugins: api.plugins.background };
-  host = { api, registry, root: resolve(home, 'profiles', 'magi'), parent: resolve(home, 'profiles') };
+  const canonicalHome = realpathSync(home);
+  host = { api, registry, root: resolve(home, 'profiles', 'magi'), parent: resolve(home, 'profiles'),
+    canonicalRoot: resolve(canonicalHome, 'profiles', 'magi'), canonicalParent: resolve(canonicalHome, 'profiles') };
   host.processes = createProfileProcesses(api, { home, registry });
   const old = { dir: process.env.DSH_PROFILE_DIR, name: process.env.DSH_PROFILE };
   process.env.DSH_PROFILE_DIR = host.root; process.env.DSH_PROFILE = 'magi';
@@ -59,7 +61,9 @@ export function applyProfileSnapshot(scope, { list, compatibility }) {
     dependencies: Object.fromEntries(scope.bundles.map(({ name, source }) => [name, source])),
   }));
   scope.files.set('cordis.yml', dump(rows));
-  scope.files.set('cordis.patch.yml', dump(rows.map(({ id, disabled }) => ({ id, disabled }))));
+  scope.files.set('cordis.patch.yml', dump(rows.map((row, index) => ({ ...row,
+    ...(scope.bundles[index].plugin.disabledBy ? { comment: scope.bundles[index].plugin.disabledBy.reason } : {}),
+  }))));
   scope.files.set('.npmrc', `registry=${host.registry}\n`);
   if (scope.compatibility) scope.files.set('compatibility.json', JSON.stringify(scope.compatibility.exemptions));
   for (const { name, version, plugin } of scope.bundles) {
@@ -130,10 +134,24 @@ function state() {
 export function virtualPath(input) {
   if (!host || (typeof input !== 'string' && !Buffer.isBuffer(input) && !(input instanceof URL))) return;
   const path = resolve(input instanceof URL ? fileURLToPath(input) : String(input));
-  if (path === host.parent) return { path, key: '..' };
-  const key = relative(host.root, path).split(/[\\/]/).join('/');
-  if (key === '..' || key.startsWith('../') || resolve(host.root, key) !== path) return;
-  return { path, key };
+  if (path === host.parent || path === host.canonicalParent) return { path: host.parent, key: '..' };
+  let key;
+  for (const root of [host.root, host.canonicalRoot]) {
+    const candidate = relative(root, path).split(/[\\/]/).join('/');
+    if (candidate !== '..' && !candidate.startsWith('../') && resolve(root, candidate) === path) { key = candidate; break; }
+  }
+  if (key === undefined) return;
+  // 安装元数据和启停配置仍完全来自 daemon。其余路径是当前插件的私有
+  // 业务文件（报告、导出、缓存），沿真实 Node 文件系统保存和返回实际路径。
+  // 不把这些文件当安装事实，也不生成 package.json 或 node_modules 副本。
+  const top = key.split('/')[0];
+  if (key && !['node_modules', 'package.json', 'cordis.yml', 'cordis.patch.yml', '.npmrc', 'compatibility.json'].includes(top) && !temporaryProposal(top)) return;
+  return { path: resolve(host.root, key), key };
+}
+export function profileRealpath(path) {
+  const location = virtualPath(path); if (!location) return;
+  profileStat(path);
+  return location.key === '..' ? host.canonicalParent : resolve(host.canonicalRoot, location.key);
 }
 function directory(scope, key) { return key === '..' || key === '' || [...scope.files.keys()].some((path) => path.startsWith(`${key}/`)); }
 export function profileRead(path, encoding) {
@@ -215,8 +233,18 @@ export function profileList(path, options) {
   const location = virtualPath(path); if (!location) return;
   const scope = state(); readArtifact(scope, location.key);
   if (!directory(scope, location.key)) throw error('ENOENT', `profile 目录不存在：${path}`, path);
-  const names = location.key === '..' ? ['magi'] : [...new Set([...scope.files.keys()].filter((key) => !location.key || key.startsWith(location.key + '/')).map((key) => key.slice(location.key ? location.key.length + 1 : 0).split('/')[0]))].sort();
-  return names.map((name) => options?.withFileTypes ? { name, parentPath: location.path, path: location.path, ...profileStat(join(location.path, name)) } : options?.encoding === 'buffer' ? Buffer.from(name) : name);
+  const names = location.key === '..' ? ['magi'] : [...new Set([...scope.files.keys()].filter((key) => !location.key || key.startsWith(location.key + '/')).map((key) => key.slice(location.key ? location.key.length + 1 : 0).split('/')[0]))];
+  if (location.key === '') {
+    try { for (const name of readdirSync(host.root)) if (!virtualPath(join(host.root, name)) && !names.includes(name)) names.push(name); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  return names.sort().map(name => {
+    if (!options?.withFileTypes) return options?.encoding === 'buffer' ? Buffer.from(name) : name;
+    const stat = profileStat(join(location.path, name)) ?? statSync(join(location.path, name));
+    return { name, parentPath: location.path, path: location.path,
+      ...Object.fromEntries(['isFile', 'isDirectory', 'isSymbolicLink', 'isBlockDevice', 'isCharacterDevice', 'isFIFO', 'isSocket'].map(method => [method, () => stat[method]()])),
+    };
+  });
 }
 export function loaderEntries() {
   const scope = state();
@@ -285,14 +313,26 @@ async function commit(scope) {
   const byId = new Map(scope.bundles.map((item) => [item.plugin.manifest.id, item]));
   const pending = new Map();
   for (const row of rows) {
-    if (!row || Object.keys(row).some((key) => !['id', 'disabled'].includes(key)) || typeof row.disabled !== 'boolean' || !byId.has(row.id)) throw error('EINVAL', 'loader 提案只能修改当前已安装插件的 disabled 状态');
-    pending.set(row.id, row.disabled);
+    if (!row || Object.keys(row).some((key) => !['id', 'name', 'disabled', 'comment'].includes(key)) || typeof row.disabled !== 'boolean'
+      || row.comment !== undefined && (typeof row.comment !== 'string' || Buffer.byteLength(row.comment) > 4096)
+      || row.name !== undefined && typeof row.name !== 'string') throw error('EINVAL', 'loader 提案只能修改当前已安装插件的 disabled 状态及停用原因');
+    const matches = row.id === undefined ? scope.bundles.filter(item => item.name === row.name) : [byId.get(row.id)].filter(Boolean);
+    if (matches.length !== 1 || row.name !== undefined && row.name !== matches[0].name) throw error('EINVAL', 'loader 提案必须指向唯一的当前已安装插件');
+    pending.set(matches[0].plugin.manifest.id, { disabled: row.disabled, reason: row.comment });
   }
-  for (const [id, disabled] of pending) {
+  // 删除有来源的停用项表示撤销该停用。daemon 在提交时再次比较来源和摘要，
+  // 用户已手动停用或其他管理器接管后，旧页面不能将它重新启用。
+  for (const [id, item] of byId) if (item.plugin.disabledBy && !pending.has(id)) {
+    pending.set(id, { disabled: false });
+  }
+  for (const [id, { disabled, reason }] of pending) {
     const current = byId.get(id);
     if (current.plugin.enabled !== !disabled) {
       scope.signal?.throwIfAborted();
-      await host.api.plugins.setEnabled(id, !disabled, current.plugin.digest);
+      await host.api.plugins.setEnabled(id, !disabled, current.plugin.digest, {
+        expectedState: { enabled: current.plugin.enabled, ...(current.plugin.disabledBy ? { disabledBy: current.plugin.disabledBy } : {}) },
+        ...(disabled && reason?.trim() ? { reason } : {}),
+      });
     }
   }
 }

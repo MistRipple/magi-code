@@ -15,6 +15,83 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { zipSync, strToU8 } from 'fflate';
 
+test('profile 配置复制沿同一调用提案，来源说明从 daemon 重读，删除停用项可恢复且旧来源不能覆盖新操作', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'magi-profile-reason-')); t.after(() => rm(home, { recursive: true, force: true }));
+  const plugin = { manifest: { id: 'dsh.target' }, digest: 'one', enabled: true, active: true,
+    source: { kind: 'upstream', location: 'dsh:target@1.0.0' } };
+  const writes = [];
+  const release = configureProfile({ plugins: {
+    list: async () => ({ plugins: [structuredClone(plugin)] }),
+    setEnabled: async (id, enabled, digest, options) => {
+      assert.equal(id, plugin.manifest.id); assert.equal(digest, plugin.digest);
+      assert.deepEqual(options.expectedState, { enabled: plugin.enabled, ...(plugin.disabledBy ? { disabledBy: plugin.disabledBy } : {}) });
+      writes.push({ enabled, options }); plugin.enabled = enabled; plugin.active = enabled;
+      if (!enabled && options.reason) plugin.disabledBy = { pluginId: 'manager', name: 'Manager', reason: options.reason };
+      else delete plugin.disabledBy;
+    },
+  } }, { home }); t.after(release);
+  const patch = join(profilePath(), 'cordis.patch.yml'), backup = patch + '.backup';
+  await withProfile(async () => {
+    const original = fs.readFileSync(patch);
+    fs.copyFileSync(patch, backup, fs.constants.COPYFILE_EXCL);
+    assert.deepEqual(fs.readFileSync(backup), original);
+    assert.throws(() => fs.copyFileSync(patch, backup, fs.constants.COPYFILE_EXCL), { code: 'EEXIST' });
+    assert.throws(() => fs.copyFileSync(patch, backup, fs.constants.COPYFILE_FICLONE_FORCE), { code: 'ENOTSUP' });
+    const exported = join(home, 'exported-config.yml');
+    fs.copyFileSync(patch, exported);
+    assert.deepEqual(nativeFs.readFileSync(exported), original, '导出使用 daemon 已确认的快照原字节');
+    fs.copyFileSync(exported, backup);
+    assert.deepEqual(fs.readFileSync(backup), original, '真实备份可读入同一提案');
+    assert.throws(() => fs.copyFileSync(exported, join(profilePath(), 'node_modules/target/entry.js')), { code: 'EROFS' });
+    const rows = load(original.toString());
+    rows.push({ id: 'dsh.target', name: 'target', disabled: true, comment: 'operator paused for diagnosis' });
+    fs.writeFileSync(patch, dump(rows));
+    assert.equal(plugin.enabled, true);
+  });
+  assert.equal(plugin.enabled, false); assert.equal(writes[0].options.reason, 'operator paused for diagnosis');
+  await withProfile(async () => {
+    const rows = load(fs.readFileSync(patch, 'utf8'));
+    assert.equal(rows[0].comment, plugin.disabledBy.reason);
+    fs.writeFileSync(patch, dump(rows.filter(row => !row.comment)));
+  });
+  assert.equal(plugin.enabled, true); assert.equal(plugin.disabledBy, undefined);
+  assert.equal(writes[1].enabled, true);
+  await withProfile(async () => {
+    assert.equal(fs.existsSync(backup), false, '备份只存在于调用中，不形成第二份 profile');
+    await fs.promises.copyFile(patch, backup);
+    assert.deepEqual(await fs.promises.readFile(backup), fs.readFileSync(patch));
+  });
+  assert.equal(nativeFs.existsSync(patch), false);
+});
+
+test('私有业务文件与安装投影经过符号链接时保持相同路径身份，且不生成安装副本', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'magi-profile-reports-')); t.after(() => rm(home, { recursive: true, force: true }));
+  const alias = join(home, 'home-link');
+  nativeFs.symlinkSync(home, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const release = configureProfile({ plugins: { list: async () => ({ plugins: [] }) } }, { home: alias }); t.after(release);
+  const root = profilePath(), directory = join(root, 'diagnostics'), report = join(directory, 'brief.txt');
+  await withProfile(async () => {
+    fs.mkdirSync(directory, { recursive: true }); fs.writeFileSync(report, 'real report');
+    assert.equal(fs.realpathSync(directory), nativeFs.realpathSync(directory));
+    assert.equal(fs.readFileSync(report, 'utf8'), 'real report');
+    const entries = fs.readdirSync(root, { withFileTypes: true });
+    assert.ok(entries.find(e => e.name === 'diagnostics').isDirectory());
+    assert.ok(entries.find(e => e.name === 'package.json').isFile());
+    const canonical = fs.realpathSync(root);
+    assert.equal(canonical, nativeFs.realpathSync(root), '虚拟根与真实业务文件采用同一个系统路径身份');
+    assert.equal(fs.readFileSync(join(canonical, 'package.json'), 'utf8'), fs.readFileSync(join(root, 'package.json'), 'utf8'));
+    assert.deepEqual(fs.realpathSync(root, { encoding: 'buffer' }), Buffer.from(canonical));
+    assert.equal(fs.realpathSync.native(root), canonical);
+    assert.equal(await fs.promises.realpath(root), canonical);
+    assert.equal(await new Promise((resolve, reject) => fs.realpath(root, (error, path) => error ? reject(error) : resolve(path))), canonical);
+    assert.deepEqual(fs.readdirSync(canonical), fs.readdirSync(root));
+  });
+  assert.equal(nativeFs.readFileSync(report, 'utf8'), 'real report');
+  assert.equal(nativeFs.existsSync(join(root, 'package.json')), false);
+  assert.equal(nativeFs.existsSync(join(root, 'cordis.patch.yml')), false);
+  await withProfile(async () => assert.equal(fs.readFileSync(report, 'utf8'), 'real report'));
+});
+
 test('profile 从 daemon 当前不可变归档读取真实原包文件，保留字节与时间且不物化第二份安装目录', async t => {
   const home=await mkdtemp(join(tmpdir(),'magi-profile-artifacts-'));
   t.after(()=>rm(home,{recursive:true,force:true}));

@@ -2838,6 +2838,10 @@
         },
         "translationRuntime": {
           "$ref": "#/$defs/PluginTranslationRuntimeStatus"
+        },
+        "disabledBy": {
+          "$ref": "#/$defs/PluginDisableInfo",
+          "description": "通过管理授权停用插件的来源与说明；启用、用户显式停用或包版本替换时清除。只由 daemon 写入。"
         }
       }
     },
@@ -7229,6 +7233,70 @@
         },
         "reason": {
           "type": "string"
+        }
+      }
+    },
+    "PluginDisableInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pluginId",
+        "name",
+        "reason"
+      ],
+      "properties": {
+        "pluginId": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      }
+    },
+    "PluginLifecycleState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "disabledBy": {
+          "$ref": "#/$defs/PluginDisableInfo"
+        }
+      }
+    },
+    "PluginSetEnabledRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pluginId",
+        "enabled"
+      ],
+      "properties": {
+        "pluginId": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "expectedDigest": {
+          "type": "string"
+        },
+        "expectedState": {
+          "$ref": "#/$defs/PluginLifecycleState"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
         }
       }
     }

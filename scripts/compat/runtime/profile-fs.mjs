@@ -1,7 +1,7 @@
 // 仅上游模块的 node:fs 导入经过此外观。profile 之外仍执行原生文件操作。
 import fs from 'node:fs';
 import { Readable } from 'node:stream';
-import { virtualPath, profileRead, profileWrite, profileRemove, profileRename, profileStat, profileList, isProfileDescriptor, profileOpen, profileFstat, profileReadDescriptor, profileReadRemaining, profileClose } from './profile.mjs';
+import { virtualPath, profileRealpath, profileRead, profileWrite, profileRemove, profileRename, profileStat, profileList, isProfileDescriptor, profileOpen, profileFstat, profileReadDescriptor, profileReadRemaining, profileClose } from './profile.mjs';
 export * from 'node:fs';
 const denied = () => { throw Object.assign(new Error('此文件操作不能直接修改 daemon 的 profile 投影'), { code: 'EROFS' }); };
 export const readFileSync = (path, ...args) => isProfileDescriptor(path) ? profileReadRemaining(path, ...args) : virtualPath(path) ? profileRead(path, ...args) : fs.readFileSync(path, ...args);
@@ -13,8 +13,21 @@ export const readdirSync = (path, ...args) => virtualPath(path) ? profileList(pa
 export const rmSync = (path, ...args) => profileRemove(path) || fs.rmSync(path, ...args);
 export const unlinkSync = (path) => profileRemove(path) || fs.unlinkSync(path);
 export const renameSync = (from, to) => profileRename(from, to) || fs.renameSync(from, to);
+export const copyFileSync = (from, to, mode = 0) => {
+  if (!virtualPath(from) && !virtualPath(to)) return fs.copyFileSync(from, to, mode);
+  if (mode & ~(fs.constants.COPYFILE_EXCL | fs.constants.COPYFILE_FICLONE | fs.constants.COPYFILE_FICLONE_FORCE)) throw new RangeError('copyFile mode 无效');
+  if (mode & fs.constants.COPYFILE_FICLONE_FORCE) throw Object.assign(new Error('profile 快照不支持强制 reflink 复制'), { code: 'ENOTSUP' });
+  if (mode & fs.constants.COPYFILE_EXCL && existsSync(to)) throw Object.assign(new Error('复制目标已存在'), { code: 'EEXIST' });
+  // 复制不同于原子移动：导出快照或从真实备份形成提案，都经过相同读写准入。
+  // 不可变原包目标仍由 profileWrite 拒绝；不会向物理安装树写入。
+  writeFileSync(to, readFileSync(from), { flag: mode & fs.constants.COPYFILE_EXCL ? 'wx' : 'w' });
+};
 export const mkdirSync = (path, ...args) => virtualPath(path) ? (profileStat(path).isDirectory() ? undefined : denied()) : fs.mkdirSync(path, ...args);
-export const realpathSync = (path, ...args) => virtualPath(path) ? (profileStat(path), virtualPath(path).path) : fs.realpathSync(path, ...args);
+export const realpathSync = (path, ...args) => {
+  if (!virtualPath(path)) return fs.realpathSync(path, ...args);
+  const result = profileRealpath(path);
+  return (typeof args[0] === 'string' ? args[0] : args[0]?.encoding) === 'buffer' ? Buffer.from(result) : result;
+};
 realpathSync.native = (path, ...args) => virtualPath(path) ? realpathSync(path, ...args) : fs.realpathSync.native(path, ...args);
 export const accessSync = (path, mode = 0) => virtualPath(path) ? (mode & fs.constants.W_OK ? denied() : profileStat(path), undefined) : fs.accessSync(path, mode);
 export const openSync = (path, ...args) => virtualPath(path) ? profileOpen(path, ...args) : fs.openSync(path, ...args);
@@ -55,7 +68,7 @@ function virtualDir(path, options) {
 }
 export const opendirSync = (path, options) => virtualPath(path) ? virtualDir(path, options) : fs.opendirSync(path, options);
 const callback = (name, fn) => (path, ...args) => {
-  if (!virtualPath(path) && !isProfileDescriptor(path) && !(name === 'rename' && virtualPath(args[0]))) return fs[name](path, ...args);
+  if (!virtualPath(path) && !isProfileDescriptor(path) && !(['rename', 'copyFile'].includes(name) && virtualPath(args[0]))) return fs[name](path, ...args);
   const done = args.pop();
   if (typeof done !== 'function') throw new TypeError('缺少回调');
   queueMicrotask(() => { let value; try { value = fn(path, ...args); } catch (error) { done(error); return; } done(null, value); });
@@ -69,6 +82,7 @@ export const mkdir = callback('mkdir', mkdirSync);
 export const unlink = callback('unlink', unlinkSync);
 export const rm = callback('rm', rmSync);
 export const rename = callback('rename', renameSync);
+export const copyFile = callback('copyFile', copyFileSync);
 export const access = callback('access', accessSync);
 export const realpath = callback('realpath', realpathSync);
 realpath.native = callback('realpath', realpathSync.native);
@@ -81,13 +95,14 @@ export const read = (fd, buffer, ...args) => {
   if (typeof done !== 'function') throw new TypeError('缺少回调');
   queueMicrotask(() => { let bytes; try { bytes = readSync(fd, buffer, ...args); } catch (error) { done(error); return; } done(null, bytes, buffer); });
 };
-const promise = (name, fn) => async (path, ...args) => virtualPath(path) || (name === 'rename' && virtualPath(args[0])) ? fn(path, ...args) : fs.promises[name](path, ...args);
+const promise = (name, fn) => async (path, ...args) => virtualPath(path) || (['rename', 'copyFile'].includes(name) && virtualPath(args[0])) ? fn(path, ...args) : fs.promises[name](path, ...args);
 export const promises = {
   ...fs.promises,
   readFile: promise('readFile', readFileSync), writeFile: promise('writeFile', writeFileSync),
   readdir: promise('readdir', readdirSync), stat: promise('stat', statSync), lstat: promise('lstat', lstatSync),
   mkdir: promise('mkdir', mkdirSync), rm: promise('rm', rmSync), unlink: promise('unlink', unlinkSync),
   rename: promise('rename', renameSync), access: promise('access', accessSync), realpath: promise('realpath', realpathSync),
+  copyFile: promise('copyFile', copyFileSync),
   opendir: async (path, options) => virtualPath(path) ? virtualDir(path, options) : fs.promises.opendir(path, options),
   open: async (path, ...args) => {
     if (!virtualPath(path)) return fs.promises.open(path, ...args);
@@ -105,4 +120,4 @@ export const promises = {
   },
 };
 export const opendir = callback('opendir', opendirSync);
-export default { ...fs, readFileSync, writeFileSync, existsSync, statSync, lstatSync, readdirSync, rmSync, unlinkSync, renameSync, mkdirSync, realpathSync, accessSync, openSync, fstatSync, closeSync, readSync, opendirSync, watch, createReadStream, readFile, writeFile, readdir, stat, lstat, mkdir, unlink, rm, rename, access, realpath, open, fstat, close, read, opendir, promises };
+export default { ...fs, readFileSync, writeFileSync, existsSync, statSync, lstatSync, readdirSync, rmSync, unlinkSync, renameSync, copyFileSync, mkdirSync, realpathSync, accessSync, openSync, fstatSync, closeSync, readSync, opendirSync, watch, createReadStream, readFile, writeFile, readdir, stat, lstat, mkdir, unlink, rm, rename, copyFile, access, realpath, open, fstat, close, read, opendir, promises };

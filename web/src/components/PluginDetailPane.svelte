@@ -155,6 +155,12 @@
     <p class="settings-notice settings-notice--warn" role="status">{translationRuntime.reason}</p>
   {/if}
 
+  {#if plugin?.disabledBy}
+    <p class="settings-notice settings-notice--warn" role="status" data-testid="plugin-disabled-by">
+      <Icon name="info" size={13} /><span>{i18n.t('settings.plugins.disabledBy', { name: plugin.disabledBy.name, reason: plugin.disabledBy.reason })}</span>
+    </p>
+  {/if}
+
   {#if runtime?.reason}
     <p class="settings-notice settings-notice--{runtimeProblem ? 'error' : 'warn'}" role="status" data-testid="plugin-runtime-reason">
       <Icon name="warning" size={13} /><span>{runtime.reason}</span>

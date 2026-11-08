@@ -1,7 +1,8 @@
 use crate::{PluginError, PluginPackage, PluginResource, PluginResourceStore, invalid};
 use magi_app_server_protocol::generated::{
-    PluginCandidateOperation, PluginCandidatePreview, PluginInstalled as PluginInstalledProjection,
-    PluginList, PluginSourceKind, PluginSourceProjection,
+    PluginCandidateOperation, PluginCandidatePreview, PluginDisableInfo,
+    PluginInstalled as PluginInstalledProjection, PluginList, PluginSourceKind,
+    PluginSourceProjection,
 };
 use magi_app_server_protocol::{PluginManifest, PluginPermission, PluginPermissionKind};
 use magi_core::{UtcMillis, fs_atomic::write_atomic};
@@ -66,6 +67,8 @@ pub struct InstalledPlugin {
     pub enabled: bool,
     pub grants: Vec<PluginPermission>,
     pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_by: Option<PluginDisableInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -479,6 +482,7 @@ impl PluginManager {
                 enabled: false,
                 grants: Vec::new(),
                 active: false,
+                disabled_by: None,
             },
         );
         if let Err(error) = self.commit(next) {
@@ -530,7 +534,9 @@ impl PluginManager {
         self.package(id)?;
         self.ensure_not_draining(id)?;
         let mut next = self.state.clone();
-        next.plugins.get_mut(id).expect("package checked").enabled = true;
+        let installed = next.plugins.get_mut(id).expect("package checked");
+        installed.enabled = true;
+        installed.disabled_by = None;
         self.commit(next)
     }
 
@@ -580,15 +586,47 @@ impl PluginManager {
     pub fn disable(&mut self, id: &str) -> Result<(), PluginError> {
         self.package(id)?;
         self.ensure_not_draining(id)?;
+        if self.state.plugins[id].active {
+            return Err(conflict("插件仍处于激活状态"));
+        }
+        self.commit_disabled(id, None)
+    }
+
+    /// 停用在排空后一次提交运行状态和来源，不能在两次写入之间重新启动目标。
+    pub fn disable_drained(
+        &mut self,
+        id: &str,
+        origin: Option<PluginDisableInfo>,
+        drain: &PluginDrainGuard,
+    ) -> Result<(), PluginError> {
+        if drain.plugin_id() != id || !self.is_draining(id) {
+            return Err(conflict("停用必须持有目标插件的排空标记"));
+        }
+        self.package(id)?;
+        self.commit_disabled(id, origin)
+    }
+
+    fn commit_disabled(
+        &mut self,
+        id: &str,
+        origin: Option<PluginDisableInfo>,
+    ) -> Result<(), PluginError> {
         let mut next = self.state.clone();
         let installed = next
             .plugins
             .get_mut(id)
             .ok_or_else(|| conflict("插件未安装"))?;
-        if installed.active {
-            return Err(conflict("插件仍处于激活状态"));
+        if let Some(info) = &origin {
+            if info.reason.trim().is_empty() || info.reason.len() > 4096 {
+                return Err(PluginError::InvalidInput("停用原因须为 1–4096 字节".into()));
+            }
+            if !installed.enabled && installed.disabled_by.as_ref() != Some(info) {
+                return Err(conflict("插件已被其他操作停用，请刷新后重试"));
+            }
         }
         installed.enabled = false;
+        installed.active = false;
+        installed.disabled_by = origin;
         self.commit(next)
     }
 
@@ -763,6 +801,7 @@ impl PluginManager {
                         upstream_manifest,
                         upstream_archive_path,
                         translation_runtime: None,
+                        disabled_by: installed.disabled_by.clone(),
                         // 扩展宿主的运行状态属于 daemon 的 ExtensionRuntime，由 API 层合并，管理器不持有它。
                         runtime: None,
                     })

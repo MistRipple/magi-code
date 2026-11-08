@@ -289,6 +289,8 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 [插件系统设计](plugin-system-requirements-design.md)第 12 节定义了完整的验收面。设置 `MAGI_PLUGIN_TEST_APP=<Magi.app 路径>` 可让它改为启动发行包内的 daemon，只使用随包 Node。`npm run test:local-plugins` 会启动独立状态目录的真实 daemon、构建并安装临时 Node 插件，覆盖预览、授权、input guard、资源/设置、模型/凭据/快照/blob/通知、直接文件/网络/进程、用户提问、无 Task 服务拒绝、作业调度、停用、升级数据重置和卸载，以及插件贡献主对话模型数据源（`modelSources` 授权预览、目录追加、主对话请求真实发往插件端点、撤销后会话明确失败且不回退）；它不接管已有 daemon。`npm run test:local-plugins-ui` 在同一纵向流程中再启动真实 Electron Chromium，覆盖设置页创建计划、目标会话／预算／回执展示和 390px 深色视口无横向溢出；它仍不是正式安装包验收。`test:electron-plugins` 仍只验收工作区导航与内置 MCP；Windows 运行验收按当前平台条件后置。协议层验收清单见[扩展协议 v1](extension-protocol-v1.md#13-一致性验收协议层)。
 
+`npm run test:electron-dsh-health` 使用 macOS 目录发行包、随包 Node 和独立状态根，在线安装固定版本 Health 与 Release Probe 原包，验证诊断、修复预览／取消／确认、真实文件隔离和恢复日志、停用来源展示、跨应用重启恢复与诊断交接。`MAGI_DSH_HEALTH_OUTPUT` 指定证据目录，`MAGI_DSH_HEALTH_PORT`／`MAGI_DSH_HEALTH_CDP_PORT` 调整验收端口；`MAGI_PLUGIN_CLIP_AUDIT_SOURCE` 可提供桌面技能的原始阴影审计函数。该脚本只验证列出的业务，不作为全部修复类型或生态覆盖率的证明。
+
 实现该能力时必须新增并在本文登记的验证面：
 
 - 两平台（macOS、Windows）无开发工具的干净安装版：安装、启用、诊断、取消、停用、升级，以及随包 Node 版本与宿主版本匹配；

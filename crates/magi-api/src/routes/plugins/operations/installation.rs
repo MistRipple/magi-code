@@ -315,7 +315,10 @@ impl PluginOperations {
                 enabled,
                 false,
                 Some(owner.caller()),
-                Some(package.digest()),
+                LifecycleChange {
+                    expected_digest: Some(package.digest()),
+                    ..Default::default()
+                },
             )
             .await
         }

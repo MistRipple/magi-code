@@ -112,9 +112,10 @@ export async function prepareDsh(options) {
     || inspection.entries.some(entry => entry.name === 'ctx.profileContext.packageManager');
   const profileReload = inspection.entries.some(entry => /^ctx\.hmr(?:\.|$)/.test(entry.name) || entry.kind === 'injects' && entry.name === 'hmr')
     || Object.hasOwn(inspection.serviceReads, 'hmr');
+  const profileWrites = inspection.profileMutations.length > 0;
   if (management || packageManagement) {
     manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', 'authorize', ...(management ? ['compatibility'] : []), 'background'] });
-  } else if (profileReload) {
+  } else if (profileReload || profileWrites) {
     manifest.permissions.push({ kind: 'pluginManagement', targets: ['lifecycle', 'background'] });
   }
   if (readSessionDirectory) manifest.permissions.push({ kind: 'sessionRead', targets: ['directory'] });
@@ -166,6 +167,7 @@ export async function prepareDsh(options) {
     magi: { id: manifest.id, version: manifest.version }, dependencies,
     runtimeContributions: manifest.extension.runtimeContributions,
     serviceReads: inspection.serviceReads,
+    profileMutations: inspection.profileMutations,
     tools: recorded.tools, commands: recorded.commands, modelSources: recorded.providers,
     routes: recorded.routes, listeners: recorded.listeners, settingsNamespaces: recorded.settingsNamespaces,
     ui: { mode: client ? 'native' : 'schema', mountedSlots: clientAnalysis?.mounted ?? [], unmountedSlots: clientAnalysis?.unmounted ?? [],
