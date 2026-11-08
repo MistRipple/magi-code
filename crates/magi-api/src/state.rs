@@ -185,6 +185,8 @@ fn snapshot_baseline_patch(
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct QueuedRegularSessionTurn {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_message: Option<magi_app_server_protocol::generated::PluginSessionMessageOrigin>,
     pub request: SessionTurnRequestDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_directories: Option<magi_core::ProjectDirectoryBinding>,
@@ -208,6 +210,15 @@ pub(crate) struct QueuedRegularSessionTurn {
     pub queue_id: String,
     #[serde(default)]
     pub retry_count: u8,
+}
+
+impl QueuedRegularSessionTurn {
+    fn requires_execution(&self) -> bool {
+        !self.plugin_message.as_ref().is_some_and(|origin| {
+            origin.delivery
+                == magi_app_server_protocol::generated::PluginSessionMessageDelivery::Context
+        })
+    }
 }
 
 /// 为一个用户发起的 session turn 生成并规范化唯一请求身份。
@@ -5309,7 +5320,7 @@ impl ApiState {
     ) -> Option<QueuedRegularSessionTurn> {
         self.queued_regular_session_turns(session_id)
             .into_iter()
-            .next()
+            .find(QueuedRegularSessionTurn::requires_execution)
     }
 
     pub(crate) fn queued_regular_session_turns(
@@ -5412,7 +5423,10 @@ impl ApiState {
     }
 
     pub(crate) fn queued_regular_session_turn_count(&self, session_id: &SessionId) -> usize {
-        self.queued_regular_session_turns(session_id).len()
+        self.queued_regular_session_turns(session_id)
+            .iter()
+            .filter(|turn| turn.requires_execution())
+            .count()
     }
     pub(crate) fn queued_regular_session_ids(&self) -> Vec<SessionId> {
         self.session_store.pending_input_session_ids()
@@ -6350,6 +6364,7 @@ mod tests {
         accepted_at: u64,
     ) -> QueuedRegularSessionTurn {
         QueuedRegularSessionTurn {
+            plugin_message: None,
             project_directories: None,
             request: SessionTurnRequestDto {
                 plugin_command_id: None,

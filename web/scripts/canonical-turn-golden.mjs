@@ -25,8 +25,26 @@ await withGoldenViteServer(async (server) => {
   assertRestartBootstrapRebasesCanonicalWatermark(dataHandlers, messagesStore, turnStore);
   assertSteeringConsumptionReceipts(reducer, projection, canonicalProtocol);
   assertFrozenSourceFolderProjection(reducer, projection);
+  assertPluginMessageProvenanceAndReceipt(reducer, projection);
   console.log('canonical turn golden replay passed');
 }, { configFile: 'vite.web.config.ts' });
+
+function assertPluginMessageProvenanceAndReceipt(reducer, projection) {
+  const c=baseCase('plugin-message','plugin-session','plugin-turn',100);
+  const origin={pluginId:'acme.result',pluginName:'Original name',messageId:'stable',sourceKind:'result',sourceTurnId:'source-turn',sourceTaskId:'source-task',delivery:'context'};
+  const input=user(c,1,'Original business result');
+  input.metadata={requestId:'plugin-input',pluginMessage:origin};
+  const initial=turn(c,'completed',[input],{modelSteps:[{stepId:'plugin-step',status:'response_received',purpose:'execution',inputRequestIds:['plugin-input'],startedAt:110,settledAt:120}]});
+  for(const source of [initial,JSON.parse(JSON.stringify(initial))]) {
+    const state=reducer.replaceCanonicalTurns(c.sessionId,[source]);
+    const message=projection.buildCanonicalTimelineProjection(state).artifacts[0].message;
+    assert.equal(message.content,'Original business result');
+    assert.notEqual(message.source,'user');
+    assert.notEqual(message.type,'user_input');
+    assert.deepEqual(message.metadata.pluginMessage,origin);
+    assert.equal(message.metadata.inputDelivery,'used','插件消息沿原 Step 日志展示消费回执');
+  }
+}
 
 function assertFrozenSourceFolderProjection(reducer, projection) {
   const c = baseCase('frozen-source', 'session-source', 'turn-source', 100);

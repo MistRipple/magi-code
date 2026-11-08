@@ -7,6 +7,9 @@ await withGoldenViteServer(async (server) => {
   assert.equal(policy.queuedMessageEditable({ interruptTurnId: 'old-turn' }), false,
     '停止并改做的原输入不能编辑成普通投递');
 
+  assert.equal(policy.queuedMessageEditable({pluginMessage:{pluginId:'acme.result'}}),false,
+    '插件消息只能取消，不能编辑成用户输入');
+
   // 会话命令：草稿会话没有可压缩内容；带附件时 daemon 会拒绝。
   assert.equal(
     policy.sessionCommandDisabledReason({ sessionCommandsAvailable: true, attachmentTotal: 0 }),

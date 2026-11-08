@@ -114,6 +114,20 @@ export function apply(ctx, config) {
   });
   ctx.webServer.register({path:'/background-image',resource:()=>Response.json(backgroundImage)});
   ctx.commands.register({ name: 'report', description: '报告当前配置', handler: async () => ({ kind: 'text', text: 'DSH_REPORT:' + config.label }) });
+  ctx.commands.register({name:'message',description:'向当前会话交付业务结果',handler:async invocation=>{
+    const input=JSON.parse(invocation.rawInput);
+    const message={id:input.id,role:'user',content:[{type:'text',text:input.text}],source:{kind:'runtime-result'}};
+    const agent=invocation.agent;
+    const method={context:'inject',steer:'steer',followup:'followup'}[input.delivery];
+    agent[method](message);
+    agent[method](message);
+    if(input.fail) return {kind:'error',text:'MESSAGE_BUSINESS_FAILED'};
+    if(input.wait) {
+      await writeFile(join(agent.session.header.cwd,'message-waiting'),input.id);
+      await new Promise(resolve=>invocation.signal.addEventListener('abort',resolve,{once:true}));
+    }
+    return {kind:'success',text:'MESSAGE_COMMAND_DONE:'+input.id};
+  }});
   ctx.commands.register({ name: 'directory', description: '在本次会话的实际执行目录读取与写入', handler: async invocation => {
     const cwd = invocation.agent.session.header.cwd;
     const id = invocation.agent.id;
@@ -136,8 +150,13 @@ export function apply(ctx, config) {
   }});
   if (config.enabled) ctx.effect(() => {
     const timer = setTimeout(() => ctx.tools.register({ name: 'late-read', description: '读取验收配置', parameters: { type: 'object' }, readOnly: true,
-      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }, execute: async (args,exec) => args.directory
-        ? 'TOOL_DIRECTORY:'+JSON.stringify({id:exec.agent.id,cwd:exec.agent.session.header.cwd,marker:await readFile(join(exec.agent.session.header.cwd,'context-check.txt'),'utf8')}) : config.label }), 1700);
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }, execute: async (args,exec) => {
+        if(args.message) {
+          exec.agent.inject({id:'tool-result-message',role:'user',content:[{type:'text',text:'MESSAGE_TOOL_RESULT'}],source:{kind:'runtime-result'}});
+          return 'TOOL_MESSAGE_DONE';
+        }
+        return args.directory ? 'TOOL_DIRECTORY:'+JSON.stringify({id:exec.agent.id,cwd:exec.agent.session.header.cwd,marker:await readFile(join(exec.agent.session.header.cwd,'context-check.txt'),'utf8')}) : config.label;
+      } }), 1700);
     return () => clearTimeout(timer);
   });
   class Adapter extends LlmAdapter {
@@ -152,9 +171,10 @@ export function apply(ctx, config) {
       const lastTool = request.messages.findLast(message=>message.role==='tool');
       const directoryCheck = lastUser?.content.some(block=>block.type==='text' && block.text.includes('DIRECTORY_TOOL_CHECK'));
       const directoryResult = lastTool && JSON.stringify(lastTool.content).includes('TOOL_DIRECTORY:');
-      if (directoryCheck && !directoryResult) {
+      const messageCheck=lastUser?.content.some(block=>block.type==='text' && block.text.includes('MESSAGE_TOOL_CHECK'));
+      if ((directoryCheck && !directoryResult) || (messageCheck && !(JSON.stringify(lastTool?.content)??'').includes('TOOL_MESSAGE_DONE'))) {
         const tool = request.tools.find(tool=>tool.description==='读取验收配置');
-        const block = {type:'tool-call',id:'directory-tool-call',name:tool.name,arguments:JSON.stringify({directory:true})};
+        const block = {type:'tool-call',id:'directory-tool-call',name:tool.name,arguments:JSON.stringify(messageCheck?{message:true}:{directory:true})};
         yield {type:'block-start',index:0,blockType:'tool-call'};
         yield {type:'tool-call-delta',index:0,id:block.id,name:block.name,argumentsDelta:block.arguments};
         yield {type:'block-end',index:0,block};
@@ -634,6 +654,97 @@ async function verifySessionDirectory(session) {
   }
 }
 
+async function verifySessionMessages() {
+  const session=(await post('/api/session/materialize',{scope:'personal'})).sessionId;
+  const source=(await installed()).manifest.contributions.modelSources[0].id;
+  await post('/api/settings/orchestrator/session/save',{scope:'personal',sessionId:session,config:{sourceId:`plugin/${pluginId}/${source}`,model:'fixture-model',reasoningEffort:null}});
+  const command=(await installed()).manifest.contributions.commands.find(command=>command.title==='message').id;
+  const turns=async()=>(await api(`/api/messages?scope=personal&sessionId=${session}`)).value.canonicalTurns??[];
+  const queue=async()=>(await api(`/api/session/queue?sessionId=${session}`)).value.queuedTurns;
+  const waitTurn=id=>waitFor(async()=>(await turns()).find(turn=>turn.turnId===id&&['completed','failed','cancelled','blocked'].includes(turn.status)),'消息命令终态',45000).catch(async error=>{await writeFile(join(output,'message-failure-turns.json'),JSON.stringify(await turns(),null,2));throw error;});
+  let serial=0;
+  const invoke=async(input,wait=true)=>{
+    const turn=await post('/api/session/turn',{scope:'personal',sessionId:session,text:JSON.stringify(input),pluginCommandId:`plugin/${pluginId}/${command}`,requestId:`message-command-${++serial}`,userMessageId:`message-command-user-${serial}`});
+    return wait ? waitTurn(turn.turnId) : turn;
+  };
+  const context={id:'context-result',delivery:'context',text:'MESSAGE_CONTEXT_RESULT'};
+  const commandTurn=await invoke(context);
+  assert.equal(commandTurn.status,'completed',JSON.stringify(commandTurn));
+  const pending=(await queue()).find(input=>input.pluginMessage?.messageId===context.id);
+  reporter.check('原包同步 inject 等待 daemon 入库，重复身份只留一条且不请求模型',Boolean(pending)
+    && (await queue()).length===1 && (await turns()).length===1 && !commandTurn.modelSteps?.length,JSON.stringify({pending,turn:commandTurn}));
+  const failed=await invoke({id:'business-failed',delivery:'context',text:'MUST_NOT_DELIVER',fail:true});
+  reporter.check('失败的原包业务不提交临时消息',failed.status==='failed' && !(await queue()).some(input=>input.pluginMessage?.messageId==='business-failed'));
+  const cancelled=await invoke({id:'cancelled-message',delivery:'context',text:'MUST_NOT_DELIVER',wait:true},false);
+  await waitFor(()=>readFile(join(work,'state/personal-sessions',session,'message-waiting'),'utf8').then(value=>value==='cancelled-message',()=>false),'消息业务等待取消');
+  await post('/api/session/interrupt',{sessionId:session});
+  await waitTurn(cancelled.turnId);
+  reporter.check('停止调用回收临时消息，不将迟到结果入库或唤醒模型',!(await queue()).some(input=>input.pluginMessage?.messageId==='cancelled-message'));
+  const edit=await api('/api/session/queue/update',{sessionId:session,queueId:pending.queueId,expectedRevision:pending.revision,request:{scope:'personal',sessionId:session,text:'forged'}});
+  reporter.check('插件消息不能借用户编辑入口改写来源',edit.status===409,JSON.stringify(edit));
+  await page.call('Page.navigate',{url:`${origin}/web.html?scope=personal&sessionId=${session}`});
+  await waitFor(()=>page.evaluate('Boolean(document.querySelector(".ia-queue-item"))'),'持久消息队列');
+  reporter.check('队列展示插件来源与等待模型状态，并保留取消操作',await page.evaluate(`(()=>{const row=document.querySelector('.ia-queue-item');return row.innerText.includes('等待下一次请求')&&!row.querySelector('.ia-queue-guide')&&!row.querySelector('[aria-label="编辑消息"]')&&Boolean(row.querySelector('[aria-label="删除消息"]'));})()`));
+  await snapshot('message-context-pending');
+  await page.call('Page.navigate',{url:'about:blank'});page.close();
+  await app.stop();
+  await waitFor(async()=>!await fetch(origin+'/health').then(()=>true,()=>false),'消息持久化后退出');
+  app=startApp();
+  page=await waitFor(()=>connectAppPage(cdpPort,daemonPort,errors),'消息持久化后重新启动',60000);ui=pageTools(page);
+  await waitFor(async()=>(await installed())?.runtime?.state==='running','恢复插件宿主',120000);
+  reporter.check('应用重启恢复相同待处理消息且不会自行请求模型',(await queue()).some(input=>input.queueId===pending.queueId&&input.revision===pending.revision)
+    && (await turns()).length===3);
+  const user=await post('/api/session/turn',{scope:'personal',sessionId:session,text:'READ_MESSAGE_CONTEXT',requestId:'message-context-consumer',userMessageId:'message-context-consumer-user'});
+  const consumed=await waitTurn(user.turnId);
+  const received=JSON.parse((await post(`/api/plugins/${pluginId}/routes`,{method:'GET',path:'/skill-request'})).body.request);
+  const modelText=JSON.stringify(received.messages);
+  reporter.check('下一次模型请求原子领取上下文，原文、来源和 Input 消费均可追踪',consumed.status==='completed'
+    && consumed.items.some(item=>item.metadata?.pluginMessage?.messageId===context.id&&item.content===context.text)
+    && consumed.modelSteps.some(step=>step.inputRequestIds?.includes(pending.requestId))
+    && modelText.includes(context.text)&&modelText.includes('Plugin-provided message')&&(await queue()).length===0,JSON.stringify({turn:consumed,request:received}));
+  for(const delivery of ['steer','followup']) {
+    const id='wake-'+delivery;
+    const result=await invoke({id,delivery,text:'MESSAGE_WAKE_'+delivery});
+    const reply=await waitFor(async()=>(await turns()).find(turn=>turn.items.some(item=>item.metadata?.pluginMessage?.messageId===id)&&['completed','failed'].includes(turn.status)),'插件结果唤醒模型',45000);
+    reporter.check(`${delivery} 沿原生持久队列启动真实模型 Task`,result.status==='completed'&&reply.status==='completed'&&reply.modelSteps?.length>0
+      && reply.items.find(item=>item.metadata?.pluginMessage?.messageId===id).metadata.pluginMessage.sourceTurnId===result.turnId,JSON.stringify(reply));
+  }
+  const tool=await post('/api/session/turn',{scope:'personal',sessionId:session,text:'MESSAGE_TOOL_CHECK',requestId:'message-tool-check',userMessageId:'message-tool-check-user'});
+  const toolTurn=await waitTurn(tool.turnId);
+  reporter.check('运行中的原包工具将上下文交给同一 Turn 下一模型步骤，不另启轮次',toolTurn.status==='completed'
+    && toolTurn.items.some(item=>item.metadata?.pluginMessage?.messageId==='tool-result-message')&&toolTurn.modelSteps.length>=2,JSON.stringify(toolTurn));
+  const request=JSON.parse((await post(`/api/plugins/${pluginId}/routes`,{method:'GET',path:'/skill-request'})).body.request);
+  reporter.check('工具回注与历史重建均保留插件来源，已消费上下文不重复交付',request.messages.filter(message=>message.content.some(block=>block.type==='text'&&block.text.startsWith('[Plugin-provided message;')&&block.text.endsWith(context.text))).length===1
+    && JSON.stringify(request.messages).includes('MESSAGE_TOOL_RESULT')&&JSON.stringify(request.messages).includes('Plugin-provided message'),JSON.stringify(request.messages));
+  const scheduled=await post(`/api/plugins/${pluginId}/jobs`,{commandId:command,sessionId:session,
+    text:JSON.stringify({id:'job-wake-denied',delivery:'steer',text:'MUST_NOT_START_MODEL'}),runAt:Date.now(),intervalMs:null,
+    budget:{maxModelCalls:0,maxOutputTokens:64,timeoutMs:5000}});
+  const outcome=await waitFor(async()=>{
+    const job=(await api(`/api/plugins/${pluginId}/jobs`)).value.find(job=>job.id===scheduled.id);
+    return job?.lastOutcome&&job;
+  },'计划作业的会话唤醒预算门禁');
+  reporter.check('计划作业不能借会话消息绕过签发的模型预算',outcome.lastOutcome==='failed'
+    && !(await turns()).some(turn=>turn.items.some(item=>item.metadata?.pluginMessage?.messageId==='job-wake-denied'))
+    && !(await queue()).some(input=>input.pluginMessage?.messageId==='job-wake-denied'),JSON.stringify(outcome));
+  await page.call('Page.navigate',{url:`${origin}/web.html?scope=personal&sessionId=${session}`});
+  await waitFor(()=>page.evaluate('Boolean(document.querySelector("[data-source=plugin]"))'),'插件消息正文与来源展示');
+  reporter.check('插件消息原文完整显示并明确来源，不冒充用户气泡',await page.evaluate(`document.querySelectorAll('[data-source=plugin]').length>=4&&[...document.querySelectorAll('[data-source=plugin]')].every(node=>node.querySelector('.plugin-message-source')&&!node.classList.contains('user'))`));
+  reporter.check('插件消息消费状态来自真实模型 Step，正文不会仅显示为接纳成功',await page.evaluate(`document.querySelectorAll('[data-source=plugin] [data-input-delivery=used]').length>=4`));
+  await snapshot('message-provenance');
+  await page.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:false});
+  reporter.check('390px 插件消息正文、来源与消费回执无横向溢出',await page.evaluate('document.documentElement.scrollWidth<=innerWidth'));
+  await snapshot('message-provenance-390');
+  await page.call('Emulation.clearDeviceMetricsOverride');
+  const cancellable=await invoke({id:'user-cancelled-context',delivery:'context',text:'CANCEL_FROM_QUEUE'});
+  assert.equal(cancellable.status,'completed');
+  await waitFor(()=>ui.exists('.ia-queue-item [aria-label="删除消息"]'),'待处理插件上下文取消按钮');
+  await ui.click('.ia-queue-item [aria-label="删除消息"]');
+  await waitFor(async()=>(await queue()).length===0,'用户取消已入库的插件消息');
+  reporter.check('用户沿原生队列取消已入库上下文，不发起模型或创建伪造用户消息',!(await turns()).some(turn=>turn.items.some(item=>item.metadata?.pluginMessage?.messageId==='user-cancelled-context')));
+
+  await writeFile(join(output,'session-messages.json'),JSON.stringify({session,turns:await turns(),request},null,2));
+}
+
 async function verifyCommandExecution(session) {
   const command = (await installed()).manifest.contributions.commands.find(command => command.title === 'directory').id;
   let serial = 0;
@@ -777,6 +888,7 @@ try {
   const cmdTurn = await waitTurn(cmd.turnId);
   reporter.check('配置重载后的命令沿 canonical Turn 返回新值', cmdTurn.status === 'completed' && JSON.stringify(cmdTurn).includes('DSH_REPORT:changed'), JSON.stringify(cmdTurn));
   await verifyCommandExecution(session);
+  await verifySessionMessages();
   await post('/api/settings/orchestrator/session/save', { scope: 'personal', sessionId: session, config: { sourceId: `plugin/${pluginId}/${source}`, model: 'fixture-model', reasoningEffort: null } });
   const toolTurn = await post('/api/session/turn',{scope:'personal',sessionId:session,text:'DIRECTORY_TOOL_CHECK',requestId:'directory-tool',userMessageId:'directory-tool-user'});
   const toolResult = await waitTurn(toolTurn.turnId);

@@ -31,3 +31,9 @@ pub trait PluginCommandExecutor: Send + Sync {
         cancelled: &AtomicBool,
     ) -> Result<PluginCommandResult, String>;
 }
+
+/// daemon 的原生消息接纳端口。实现复用 SessionInput/canonical 写入口；
+/// 装配时不得捕获已持有本执行器的 ApiState，避免生命周期引用环。
+pub type PluginSessionMessageAdmitter = dyn Fn(&str, serde_json::Value, std::sync::Arc<AtomicBool>) -> Result<serde_json::Value, String>
+    + Send
+    + Sync;

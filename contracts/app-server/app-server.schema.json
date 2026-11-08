@@ -2258,7 +2258,8 @@
         "composer",
         "sessionRead",
         "attachments",
-        "client"
+        "client",
+        "sessionWrite"
       ]
     },
     "PluginPermission": {
@@ -5166,6 +5167,17 @@
             "string",
             "null"
           ]
+        },
+        "pluginMessage": {
+          "x-rust-default": true,
+          "oneOf": [
+            {
+              "$ref": "#/$defs/PluginSessionMessageOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -6977,6 +6989,116 @@
           "description": "显式选择需要核对的已安装插件；仅收敛已有激活意图，不启用停用项、不重启未变化实例。"
         }
       }
+    },
+    "PluginSessionMessageDelivery": {
+      "type": "string",
+      "enum": [
+        "context",
+        "steer",
+        "followup"
+      ]
+    },
+    "PluginSessionMessageRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "messageId",
+        "text",
+        "sourceKind",
+        "delivery"
+      ],
+      "properties": {
+        "messageId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200000
+        },
+        "sourceKind": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "delivery": {
+          "$ref": "#/$defs/PluginSessionMessageDelivery"
+        }
+      }
+    },
+    "PluginSessionMessageOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pluginId",
+        "pluginName",
+        "messageId",
+        "sourceKind",
+        "sourceTurnId",
+        "sourceTaskId",
+        "delivery"
+      ],
+      "properties": {
+        "pluginId": {
+          "type": "string"
+        },
+        "pluginName": {
+          "type": "string"
+        },
+        "messageId": {
+          "type": "string"
+        },
+        "sourceKind": {
+          "type": "string"
+        },
+        "sourceTurnId": {
+          "type": "string"
+        },
+        "sourceTaskId": {
+          "type": "string"
+        },
+        "delivery": {
+          "$ref": "#/$defs/PluginSessionMessageDelivery"
+        }
+      }
+    },
+    "PluginSessionMessageReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inputId",
+        "requestId",
+        "state",
+        "turnId"
+      ],
+      "properties": {
+        "inputId": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/PluginSessionMessageState"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "PluginSessionMessageState": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "attached",
+        "consumed",
+        "cancelled"
+      ]
     }
   }
 }

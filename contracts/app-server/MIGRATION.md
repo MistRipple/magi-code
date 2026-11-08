@@ -91,3 +91,5 @@ false，只有解析到实际 Token 数字段时才变为 true；缺失或空 us
 `PluginRuntimeCatalog.skills` 与 `PluginRuntimeContributionKind.skills` 是运行期技能的增量合同，
 经 Extension Protocol 的 `plugin.skills` 协商提交。技能仍复用 `PluginSkillContribution`，
 沿同一目录的就绪、CAS、实例租约和撤销规则，不新增 HTTP 目录或本地设置写入。
+
+`sessionWrite:["context"|"wake"]`、`PluginSessionMessage*` 和队列的可选 `pluginMessage` 是会话业务结果的增量合同，协商特性为 `session.messages`，不新增 App Server 提交方法。旧插件未声明此授权不能调用；DSH 重新安装或在线更新时展示新增权限并重新授权。插件消息复用 SessionInput 与 canonical 事务，UI 不能把它解释为用户输入；旧数据无该元数据时保留原语义。状态布局推进到 20，阻止不认识不唤醒上下文的旧 daemon 消费新版队列。

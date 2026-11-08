@@ -3245,5 +3245,10 @@
   "mcpServer.token.advancedSummary": "高级设置 · 默认有效期 90 天",
   "mcpServer.token.approvalModeHint": "权限会应用到此客户端的所有聊天。新接入建议先使用“每次询问”。",
   "mcpServer.clients.helper": "每个应用单独创建客户端。它的令牌可供多个聊天使用；每个聊天首次调用时各自选择执行目录。",
-  "mcpServer.conversation.tokenHint": "每个聊天首次调用时在本机选择执行目录；之后此聊天会继续使用该目录。"
+  "mcpServer.conversation.tokenHint": "每个聊天首次调用时在本机选择执行目录；之后此聊天会继续使用该目录。",
+  "settings.plugins.permission.sessionWrite.context": "会话上下文：向当前调用所属会话提供模型可读取的文本，不主动启动模型",
+  "settings.plugins.permission.sessionWrite.wake": "会话消息：向当前调用所属会话发送文本并可启动模型回复，产生模型用量",
+  "messageItem.pluginMessage": "来自插件 {name}",
+  "input.queue.pluginContext": "{name}，等待下一次请求",
+  "input.queue.pluginMessage": "来自 {name}"
 }

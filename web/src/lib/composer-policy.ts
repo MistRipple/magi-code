@@ -101,6 +101,7 @@ export function formatImageSize(bytes: number): string {
 }
 
 export interface QueuedMessageShape {
+  pluginMessage?: unknown;
   interruptTurnId?: string | null;
   images?: unknown[];
   contextReferences?: unknown[];
@@ -128,7 +129,7 @@ export function summarizeQueuedMessage(queued: QueuedMessageShape): QueuedAttach
  * 无法还原为编辑对象；替代输入也不能编辑以免改变已接纳的停止意图。
  */
 export function queuedMessageEditable(queued: QueuedMessageShape): boolean {
-  return !queued.interruptTurnId && (queued.browserAnnotationRefs?.length ?? 0) === 0;
+  return !queued.pluginMessage && !queued.interruptTurnId && (queued.browserAnnotationRefs?.length ?? 0) === 0;
 }
 
 /** 编辑入口只能属于当前主线最新轮次；隐藏的 Continue 控制轮次也必须参与比较。 */

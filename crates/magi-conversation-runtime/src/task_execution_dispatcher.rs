@@ -287,6 +287,8 @@ pub struct LlmTaskDispatcher {
     skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
     extension_hooks: Option<Arc<dyn crate::extension_hooks::ExtensionHooks>>,
     plugin_command_executor: Option<Arc<dyn crate::plugin_command::PluginCommandExecutor>>,
+    plugin_session_message_admitter:
+        Option<Arc<crate::plugin_command::PluginSessionMessageAdmitter>>,
     snapshot_manager: Option<Arc<magi_snapshot::SnapshotManager>>,
     workspace_execution_preparer: Option<Arc<WorkspaceExecutionPreparer>>,
     /// 主线和子代理共用的运行时输入与交互投递入口，不持有独立 Turn 状态。
@@ -928,6 +930,7 @@ impl LlmTaskDispatcher {
             skill_runtime: None,
             skill_dispatch_runtime: None,
             plugin_command_executor: None,
+            plugin_session_message_admitter: None,
             extension_hooks: None,
             snapshot_manager: None,
             workspace_execution_preparer: None,
@@ -1060,7 +1063,15 @@ impl LlmTaskDispatcher {
         self
     }
 
-    /// 注入扩展钩子端口（`tool.call` / `tool.result`）。
+    /// 接纳插件业务结果，复用 API 的原生 Input 提交端口。
+    pub fn with_plugin_session_message_admitter(
+        mut self,
+        admitter: Arc<crate::plugin_command::PluginSessionMessageAdmitter>,
+    ) -> Self {
+        self.plugin_session_message_admitter = Some(admitter);
+        self
+    }
+
     pub fn with_plugin_command_executor(
         mut self,
         executor: Arc<dyn crate::plugin_command::PluginCommandExecutor>,

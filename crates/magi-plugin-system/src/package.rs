@@ -248,6 +248,7 @@ fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
                     | PluginPermissionKind::ModelSources
                     | PluginPermissionKind::PluginManagement
                     | PluginPermissionKind::SessionRead
+                    | PluginPermissionKind::SessionWrite
                     | PluginPermissionKind::Attachments
             )
         }) {
@@ -387,6 +388,15 @@ fn validate_manifest_with_limits(
             && permission.targets.as_slice() != ["directory"]
         {
             return Err(invalid("sessionRead 权限当前只允许 directory"));
+        }
+        if permission.kind == PluginPermissionKind::SessionWrite
+            && (permission.targets.is_empty()
+                || permission
+                    .targets
+                    .iter()
+                    .any(|target| !matches!(target.as_str(), "context" | "wake")))
+        {
+            return Err(invalid("sessionWrite 权限只允许 context 与 wake"));
         }
         if permission.kind == PluginPermissionKind::Composer
             && (permission.targets.as_slice() != ["images"]

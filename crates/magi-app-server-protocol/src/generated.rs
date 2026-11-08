@@ -1509,6 +1509,8 @@ pub enum PluginPermissionKind {
     Attachments,
     #[serde(rename = "client")]
     Client,
+    #[serde(rename = "sessionWrite")]
+    SessionWrite,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2991,6 +2993,10 @@ pub struct QueuedSessionTurn {
     pub interrupt_turn_id: Option<String>,
     #[serde(rename = "interruptionError")]
     pub interruption_error: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "pluginMessage")]
+    pub plugin_message: Option<PluginSessionMessageOrigin>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3849,4 +3855,69 @@ pub enum PluginBundleInstallCancelStatus {
 pub struct PluginReconcileRequest {
     #[serde(rename = "pluginIds")]
     pub plugin_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginSessionMessageDelivery {
+    #[serde(rename = "context")]
+    Context,
+    #[serde(rename = "steer")]
+    Steer,
+    #[serde(rename = "followup")]
+    Followup,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginSessionMessageRequest {
+    #[serde(rename = "messageId")]
+    pub message_id: String,
+    pub text: String,
+    #[serde(rename = "sourceKind")]
+    pub source_kind: String,
+    pub delivery: PluginSessionMessageDelivery,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginSessionMessageOrigin {
+    #[serde(rename = "pluginId")]
+    pub plugin_id: String,
+    #[serde(rename = "pluginName")]
+    pub plugin_name: String,
+    #[serde(rename = "messageId")]
+    pub message_id: String,
+    #[serde(rename = "sourceKind")]
+    pub source_kind: String,
+    #[serde(rename = "sourceTurnId")]
+    pub source_turn_id: String,
+    #[serde(rename = "sourceTaskId")]
+    pub source_task_id: String,
+    pub delivery: PluginSessionMessageDelivery,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginSessionMessageReceipt {
+    #[serde(rename = "inputId")]
+    pub input_id: String,
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    pub state: PluginSessionMessageState,
+    #[serde(rename = "turnId")]
+    pub turn_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginSessionMessageState {
+    #[serde(rename = "pending")]
+    Pending,
+    #[serde(rename = "attached")]
+    Attached,
+    #[serde(rename = "consumed")]
+    Consumed,
+    #[serde(rename = "cancelled")]
+    Cancelled,
 }

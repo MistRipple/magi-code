@@ -667,7 +667,7 @@ export type ServerNotification = JsonRpcServerNotification;
 
 export type ServerResponse = JsonRpcServerResponse;
 
-export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite" | "modelSources" | "pluginManagement" | "composer" | "sessionRead" | "attachments" | "client";
+export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite" | "modelSources" | "pluginManagement" | "composer" | "sessionRead" | "attachments" | "client" | "sessionWrite";
 
 export interface PluginPermission {
   kind: PluginPermissionKind;
@@ -1315,6 +1315,7 @@ export interface QueuedSessionTurn {
   retryCount: number;
   interruptTurnId: string | null;
   interruptionError: string | null;
+  pluginMessage?: PluginSessionMessageOrigin | null;
 }
 
 export interface SessionQueueSnapshot {
@@ -1725,3 +1726,31 @@ export type PluginBundleInstallCancelStatus = "cancelled" | "too-late" | "not-ru
 export interface PluginReconcileRequest {
   pluginIds: Array<string>;
 }
+
+export type PluginSessionMessageDelivery = "context" | "steer" | "followup";
+
+export interface PluginSessionMessageRequest {
+  messageId: string;
+  text: string;
+  sourceKind: string;
+  delivery: PluginSessionMessageDelivery;
+}
+
+export interface PluginSessionMessageOrigin {
+  pluginId: string;
+  pluginName: string;
+  messageId: string;
+  sourceKind: string;
+  sourceTurnId: string;
+  sourceTaskId: string;
+  delivery: PluginSessionMessageDelivery;
+}
+
+export interface PluginSessionMessageReceipt {
+  inputId: string;
+  requestId: string;
+  state: PluginSessionMessageState;
+  turnId: string | null;
+}
+
+export type PluginSessionMessageState = "pending" | "attached" | "consumed" | "cancelled";

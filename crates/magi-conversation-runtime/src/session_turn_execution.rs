@@ -348,7 +348,7 @@ fn canonical_session_turn_history(
                             if !is_orchestrator_item && !is_root_final_item {
                                 return None;
                             }
-                            let content = item.content?.trim().to_string();
+                            let content = item.model_input_content()?.trim().to_string();
                             if content.is_empty() {
                                 return None;
                             }

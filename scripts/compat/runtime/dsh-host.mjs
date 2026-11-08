@@ -118,7 +118,7 @@ export async function activateDsh(api, module, options) {
           if (result.additionalContexts?.length || result.concludeTurn) throw new Error('此工具要求追加会话上下文或结束 Turn，当前公开合同尚未承载');
           if (result.isError) throw new Error(result.content?.filter((part) => part.type === 'text').map((part) => part.text).join('\n') || 'DSH 工具执行失败');
           return result;
-        }, execContext.signal))));
+        }, execContext.signal), api)));
         this.ctx.emit('tools/change');
         return async () => { if (tools.get(definition.name) === definition) tools.delete(definition.name); await release(); this.ctx.emit('tools/change'); };
       });
@@ -150,7 +150,7 @@ export async function activateDsh(api, module, options) {
         return { content: result.text };
       };
       return this.ctx.effect(() => catalog.register('commands', { id, title: definition.name, description: definition.description ?? '' }, () =>
-        api.command(id, (input, context) => withInvocation(context, () => withProfile(() => handler(input, context), context.signal)))));
+        api.command(id, (input, context) => withInvocation(context, () => withProfile(() => handler(input, context), context.signal), api))));
     }
   });
 

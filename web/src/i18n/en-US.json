@@ -3245,5 +3245,10 @@
   "mcpServer.token.advancedSummary": "Advanced settings · 90-day default expiry",
   "mcpServer.token.approvalModeHint": "This permission applies to every chat using this client. “Ask every time” is a safe starting point.",
   "mcpServer.clients.helper": "Create a separate client for each app. Its token can serve multiple chats; each chat chooses its own working directory the first time it calls a tool.",
-  "mcpServer.conversation.tokenHint": "Choose a working directory on this computer the first time each chat calls a tool. That chat reuses it afterward."
+  "mcpServer.conversation.tokenHint": "Choose a working directory on this computer the first time each chat calls a tool. That chat reuses it afterward.",
+  "settings.plugins.permission.sessionWrite.context": "Session context: provide text to the current conversation without starting a model request",
+  "settings.plugins.permission.sessionWrite.wake": "Session messages: send text to the current conversation and start model replies, incurring model usage",
+  "messageItem.pluginMessage": "From plugin {name}",
+  "input.queue.pluginContext": "{name}, awaiting the next request",
+  "input.queue.pluginMessage": "From {name}"
 }

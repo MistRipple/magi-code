@@ -173,6 +173,7 @@ function resolveSidechainTaskId(item: CanonicalTurnItem): string | undefined {
 }
 
 function resolveMessageSource(item: CanonicalTurnItem): Message['source'] {
+  if (item.kind === 'user_message' && item.metadata?.pluginMessage) return 'orchestrator';
   if (item.kind === 'user_message') {
     return 'user';
   }
@@ -330,6 +331,7 @@ function buildMessageBlocks(
 }
 
 function resolveMessageRole(item: CanonicalTurnItem): Message['role'] {
+  if (item.kind === 'user_message' && item.metadata?.pluginMessage) return 'system';
   if (item.kind === 'user_message') {
     return 'user';
   }
@@ -340,6 +342,7 @@ function resolveMessageRole(item: CanonicalTurnItem): Message['role'] {
 }
 
 function resolveMessageType(item: CanonicalTurnItem): Message['type'] {
+  if (item.kind === 'user_message' && item.metadata?.pluginMessage) return 'system-notice';
   if (item.kind === 'user_message') {
     return 'user_input';
   }
@@ -757,7 +760,7 @@ function buildMessage(
 }
 
 function steeringInputDelivery(turn: CanonicalTurn, item: CanonicalTurnItem): InputDeliveryStatus | undefined {
-  if (item.kind !== 'user_message' || item.metadata?.route !== 'steer') return undefined;
+  if (item.kind !== 'user_message' || (item.metadata?.route !== 'steer' && !item.metadata?.pluginMessage)) return undefined;
   const requestId = item.metadata?.requestId;
   if (typeof requestId !== 'string' || !requestId) return undefined;
   const steps = (turn.modelSteps || []).filter((step) => (

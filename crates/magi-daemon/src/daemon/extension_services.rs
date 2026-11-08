@@ -255,7 +255,12 @@ impl HostService for PluginHostService {
         }
         if !matches!(
             method.as_str(),
-            "model.invoke" | "task.spawn" | "ask.user" | "notify.user" | "tool.call"
+            "model.invoke"
+                | "task.spawn"
+                | "ask.user"
+                | "notify.user"
+                | "tool.call"
+                | "session.message"
         ) {
             return self.request_with_identity(plugin_id, method, params);
         }

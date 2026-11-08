@@ -1,3 +1,4 @@
+import type { PluginSessionMessageOrigin } from '../shared/app-server-protocol.generated';
 import type { ContextUsageBreakdown } from '../lib/context-usage-breakdown';
 /**
  * 消息类型定义
@@ -593,6 +594,7 @@ export interface Message {
   /** 用户在真实 Chromium 中选中的 DOM 节点，只读地随本轮提交。 */
   browserNodeSelections?: MessageBrowserNodeSelection[];
   metadata?: {
+    pluginMessage?: PluginSessionMessageOrigin;
     inputDelivery?: InputDeliveryStatus;
     model?: string;
     tokens?: number;
@@ -763,6 +765,7 @@ export interface QueuedMessageBrowserAnnotationReference {
 export type QueuedMessageBrowserNodeSelection = MessageBrowserNodeSelection;
 
 export interface QueuedMessage {
+  pluginMessage?: PluginSessionMessageOrigin | null;
   sourceFolderId?: string;
   interruptTurnId?: string | null;
   interruptionError?: string | null;

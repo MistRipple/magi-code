@@ -1106,24 +1106,61 @@ fn run_conversation_loop_inner(
         }
         persisted_thread_history = session_store.thread_message_history(thread_id);
     }
-    let current_user_message = (!resumed_task).then(|| ChatMessage {
-        input_request_id: (!is_sidechain)
-            .then_some(expected_turn_id.as_deref())
-            .flatten()
-            .and_then(|turn_id| {
-                crate::model_step::root_input_request_id(session_store, session_id, turn_id)
-            }),
-        context_origin: Default::default(),
-        role: "user".to_string(),
-        content: Some(prompt.clone()),
-        images: session_turn_image_sources(&images),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-        provider_context: Vec::new(),
-    });
+    let mut current_user_messages: Vec<_> = (!resumed_task)
+        .then(|| ChatMessage {
+            input_request_id: (!is_sidechain)
+                .then_some(expected_turn_id.as_deref())
+                .flatten()
+                .and_then(|turn_id| {
+                    crate::model_step::root_input_request_id(session_store, session_id, turn_id)
+                }),
+            context_origin: Default::default(),
+            role: "user".to_string(),
+            content: Some(prompt.clone()),
+            images: session_turn_image_sources(&images),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            provider_context: Vec::new(),
+        })
+        .into_iter()
+        .collect();
+    if !resumed_task
+        && !is_sidechain
+        && let Some(turn) = expected_turn_id.as_deref().and_then(|turn_id| {
+            session_store.canonical_turn_for_session_turn_id(session_id, turn_id)
+        })
+    {
+        for item in turn.items.iter().filter(|item| {
+            item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage
+                && item.metadata.contains_key("pluginMessage")
+        }) {
+            let request_id = item
+                .metadata
+                .get("requestId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if let Some(root) = current_user_messages
+                .iter_mut()
+                .find(|message| message.input_request_id == request_id)
+            {
+                root.content = item.model_input_content();
+            } else {
+                current_user_messages.push(ChatMessage {
+                    input_request_id: request_id,
+                    content: item.model_input_content(),
+                    context_origin: Default::default(),
+                    role: "user".into(),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                });
+            }
+        }
+    }
     let mut additional_context = estimate_context_usage_breakdown(&messages, tools.as_deref());
     additional_context.merge(&estimate_context_usage_breakdown(
-        current_user_message.as_slice(),
+        &current_user_messages,
         None,
     ));
     additional_context.merge(&estimate_context_usage_breakdown(
@@ -1376,7 +1413,7 @@ fn run_conversation_loop_inner(
     // [CACHE: DYNAMIC] Runtime tail · 本轮 user 输入。
     // 新 task 首次启动才追加该输入；恢复 runner 必须复用 thread 中已持久化的原始
     // 用户消息（包括图片），不能把同一任务再次作为一轮全新输入发送给模型。
-    if let Some(current_user_message) = current_user_message {
+    for current_user_message in current_user_messages {
         let mut persisted_user_message = chat_message_to_thread_chat_message(&current_user_message);
         messages.push(current_user_message);
         // 原图由 canonical turn 负责审计与 UI 展示。thread 历史只保留文本语义，

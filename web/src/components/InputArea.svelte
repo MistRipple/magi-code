@@ -2935,6 +2935,9 @@ async function refreshPickerSettingsSnapshot() {
           <div class="ia-queue-item dock-row">
             <span class="ia-queue-index" aria-hidden="true"></span>
             <div class="ia-queue-content" title={queued.content}>
+              {#if queued.pluginMessage}
+                <span class="ia-queue-badge">{i18n.t(queued.pluginMessage.delivery === 'context' ? 'input.queue.pluginContext' : 'input.queue.pluginMessage', { name: queued.pluginMessage.pluginName })}</span>
+              {/if}
               {#if queued.interruptTurnId}
                 <span class="ia-queue-badge">{i18n.t('input.followUp.replacing')}</span>
               {/if}
@@ -2959,7 +2962,7 @@ async function refreshPickerSettingsSnapshot() {
                   onclick={() => vscode.postMessage({ type: 'retryQueuedMessage', queuedMessageId: queued.id, expectedRevision: queued.revision })}
                 >{i18n.t('input.followUp.retry')}</button>
               {/if}
-              {#if !queued.interruptTurnId}
+              {#if !queued.interruptTurnId && !queued.pluginMessage}
               <button
                 type="button"
                 class="ia-queue-action ia-queue-guide btn btn--secondary btn--sm"

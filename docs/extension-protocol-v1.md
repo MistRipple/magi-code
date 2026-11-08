@@ -103,6 +103,7 @@ daemon 响应形状：
 | `model.invoke` | `api.model.invoke(input)` | `{prompt,roleId?,credentialRef?,maxOutputTokens?}`，models 授权、原生模型解析和账本 |
 | `credential.ref` | `api.credential.ref({roleId?})` | 返回模型绑定引用，不返回 secret；只由 model.invoke 消费 |
 | `session.snapshot` | `api.session.snapshot(input)` | 仅签发会话；`sessionId?`、`afterTurnSeq?`、`limit?`；最多 10 Turn，每 Turn 最多 20 条截断文本 |
+| `session.message` | `api.session.message(input)` | 协商 `session.messages`，输入与回执为 `PluginSessionMessageRequest/Receipt`。需要独立 `sessionWrite:["context"]` 或 `["wake"]` 授权，仅写当前有效调用所属的主会话；daemon 注入的真实 Task、Turn 与执行租约必须一致。子任务拒绝；计划作业只能提供 context，不能借 wake 绕过模型预算。正文保存插件来源和稳定身份，不能冒充用户／系统或指定其他会话；不提供后台入口 |
 | `session.directory` | `api.session.directory(input?)` | 需协商 `session.directory` 及独立 `sessionRead:["directory"]` 授权。按当前实例读取 daemon 用户会话目录，不要求活动 Turn；输入 `PluginSessionDirectoryRequest`，输出 `PluginSessionDirectory`。按 sessionId 升序分页，每页 1–200 条（默认 100），可筛选 workspaceId；仅身份、标题、项目归属与创建/更新时间，不含外部工具会话、消息、文件路径或凭据。末页游标为 null；跨页并非事务快照，调用者需按身份处理期间新增/删除。旧版本、停用、撤权、排空及失效实例拒绝 |
 | `plugins.list` | `api.plugins.list()` | 读取 daemon 的既有 `PluginList` 目录投影，每次校验当前插件包、激活状态及实例租约；不包含配置、资源或凭据 |
 | `plugins.changed`（通知） | `api.plugins.onChanged(listener)` | 协商 `plugin.directory.events`；daemon 在安装目录或运行状态变化时发送无载荷的失效通知，返回值为解除订阅函数；消费者重新调用 plugins.list，不由通知构造安装或运行事实 |
@@ -159,6 +160,14 @@ DSH `profileContext.packageManager` 提供插件实例拥有的内部 Node 命�
 DSH 页面里的 `EventSource` 通过相同路由调用承载 SSE。兼容层保留 `/__magi_compat/streams` 控制路由，打开、读取和关闭均经过上述 daemon 准入，不增加监听端口或会话写入口。连接只可调用本插件已登记的 GET 路由；Node 与 Fetch 响应均须为 `200 text/event-stream`，`204` 表示结束且不重连。每插件至多 8 条连接，每条至多保留 2 MiB／8192 个未确认块；按单调序号确认和分批返回，重复读取不丢未确认数据。读取等待至多 15 秒，45 秒无读取自动关闭。Renderer 按文档 nonce 记录连接归属，导航/卸载会取消在途路由并关闭已登记连接，旧文档回执不能更新新页面；上游路由撤销和宿主停用也关闭对应原请求。SSE 的命名事件、多行数据、跨块 UTF-8/CRLF、事件 ID 与重连由页面适配器承载；普通 fetch 仍返回完整响应，WebSocket 未由此实现。
 
 `api.config`／`api.configRevision` 是只读配置快照。SDK 不提供 `register.skill`、`register.mcp`、`register.dispose`、`migration.run` 或任意事实写入接口。MCP 为内置功能，Skill 来自静态清单或声明后提交的运行期贡献。未知方法返回 `MethodNotFound`。
+
+### 会话消息交付
+
+`context` 不独立启动模型：当前模型 Task 尚可接收输入时沿原生引导边界提交，否则保留在 SessionInput 待处理列表，由下一次模型 Task 接纳事务领取。插件命令不会领取这些上下文。`steer` 优先补充当前模型 Task，不能引导时进入原队列；`followup` 始终排队启动下一次模型 Task。命令本身没有模型循环，steer 在命令结算后沿原调度入口唤醒模型。所有模型调用、取消与用量仍归原生 Task/Turn。
+
+消息限非空文本 200000 UTF-8 字节、消息身份及来源各 128 字节；来源不得为 user/system/assistant 或包含控制字符。每插件在同一会话最多 32 条未领取消息。身份按插件、会话及 messageId 生成；相同身份的原始内容、来源或调用归属改变时拒绝。回执的 pending/attached/consumed/cancelled 来自同一 SessionInput，表示接纳、绑定、消费或取消，不代表模型已经成功答复。原始正文与接纳时插件名称写 canonical；模型输入和重建历史使用同一来源表达。
+
+待处理消息沿原 Input 日志恢复，重启不自动执行 context；用户可取消，不能编辑原插件消息或把它改投递为用户输入。UI 完整展示已交付正文及来源。已接纳消息是会话事实，停用插件不撤销已提交内容；它仍可由用户取消。DSH 的同步 inject/steer/followup 在本次业务成功返回后统一等待真实 daemon 回执，失败、取消及失效调用不提交临时消息；不为这些方法另建 Agent、Session 或消息存储。
 
 ## 5. 注册
 

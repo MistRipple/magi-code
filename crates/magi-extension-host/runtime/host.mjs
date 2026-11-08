@@ -16,7 +16,7 @@ import { createHash } from 'node:crypto';
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const PROTOCOL = { major: 1, minor: 0 };
-const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'plugin.installations', 'plugin.directory.events', 'plugin.reconciliation', 'plugin.skills', 'session.directory', 'images.store'];
+const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'plugin.installations', 'plugin.directory.events', 'plugin.reconciliation', 'plugin.skills', 'session.directory', 'session.messages', 'images.store'];
 let negotiatedFeatures = new Set();
 const pluginRequest = (method, input, background = false) => {
   if (!negotiatedFeatures.has('plugin.management')) throw new Error('daemon 未协商 plugin.management');
@@ -418,6 +418,10 @@ const api = Object.freeze({
   ask: Object.freeze({ user: (input = {}) => request('ask.user', input) }),
   session: Object.freeze({
     snapshot: (input = {}) => request('session.snapshot', input),
+    message(input) {
+      if (!negotiatedFeatures.has('session.messages')) throw new Error('daemon 未协商 session.messages');
+      return request('session.message', input);
+    },
     directory(input = {}) {
       if (!negotiatedFeatures.has('session.directory')) throw new Error('daemon 未协商 session.directory');
       return request('session.directory', input);

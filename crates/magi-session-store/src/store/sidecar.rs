@@ -2697,7 +2697,7 @@ impl SessionStore {
                                     .and_then(Value::as_str)
                                     .map(str::to_string),
                                 role: "user".to_string(),
-                                content: item.content.clone(),
+                                content: item.model_input_content(),
                                 images: Vec::new(),
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,

@@ -1209,6 +1209,7 @@ fn materialize_execution(
         writebacks: if request
             .user_message_metadata
             .contains_key("pluginCommandId")
+            || request.user_message_metadata.contains_key("pluginMessage")
         {
             ExecutionWritebackPlans::default()
         } else {
@@ -1279,8 +1280,60 @@ pub fn prepare_pending_dispatch_submission(
     request: &DispatchSubmissionRequest,
 ) -> Result<PendingDispatchSubmission, DispatchSubmissionRunError> {
     let prepared = validate_dispatch_request(runtime, request, true)?;
-    let (active_execution_chain, user_message_item_id) =
+    let (mut active_execution_chain, user_message_item_id) =
         build_active_execution_chain(&prepared, request)?;
+    // 不唤醒的插件上下文只在下一次真实模型 Task 接纳时领取。用户输入与这些
+    // 消息在同一 canonical 事务建立 Input 绑定；失败不领取，重启不重放。
+    if !request
+        .user_message_metadata
+        .contains_key("pluginCommandId")
+    {
+        let turn = active_execution_chain
+            .current_turn
+            .as_mut()
+            .expect("prepared Turn");
+        for input in runtime.session_store.inbox_snapshot(&request.session_id).0 {
+            let Some(origin) = input.payload.get("plugin_message").filter(|origin| {
+                origin.get("delivery").and_then(|v| v.as_str()) == Some("context")
+            }) else {
+                continue;
+            };
+            let origin: magi_app_server_protocol::generated::PluginSessionMessageOrigin =
+                serde_json::from_value(origin.clone()).map_err(|error| {
+                    DispatchSubmissionRunError::InvalidInput(format!("插件消息来源损坏：{error}"))
+                })?;
+            let text = input
+                .payload
+                .pointer("/request/text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    DispatchSubmissionRunError::InvalidInput("插件消息缺少正文".into())
+                })?;
+            let mut item = crate::session_writeback::session_turn_item(
+                "user_message",
+                "completed",
+                None,
+                Some(text.into()),
+                Some(input.user_message_id.clone()),
+                prepared.orchestrator_thread_id.clone(),
+            );
+            item.item_seq = turn.items.len() + 1;
+            item.request_id = Some(input.request_id.clone());
+            item.user_message_id = Some(input.user_message_id);
+            item.task_id = Some(prepared.action_task_id.clone());
+            item.metadata.extend(std::collections::HashMap::from([
+                (
+                    "pluginMessage".into(),
+                    serde_json::to_value(origin).unwrap(),
+                ),
+                (
+                    "requestFingerprint".into(),
+                    serde_json::Value::String(input.request_fingerprint),
+                ),
+            ]));
+            turn.items.push(item);
+        }
+    }
     runtime
         .task_store
         .insert_task_without_checkpoint(prepared.task.clone())
@@ -1882,6 +1935,134 @@ mod tests {
             images: Vec::new(),
             execution_settings_snapshot: None,
         }
+    }
+
+    #[test]
+    fn plugin_context_is_claimed_only_by_model_admission_and_rebuilt_with_provenance() {
+        use magi_session_store::{SessionInput, SessionInputState};
+        let session = SessionId::new("plugin-context-admission");
+        let session_store = SessionStore::default();
+        session_store
+            .create_session(session.clone(), "plugin context")
+            .unwrap();
+        let origin = serde_json::json!({"pluginId":"acme.result","pluginName":"Result",
+            "messageId":"stable","sourceKind":"result","sourceTurnId":"previous",
+            "sourceTaskId":"previous-task","delivery":"context"});
+        session_store.commit_input(SessionInput {
+            input_id:"context-input".into(),session_id:session.clone(),request_id:"context-request".into(),
+            user_message_id:"context-user".into(),request_fingerprint:"context-fingerprint".into(),
+            accepted_at:UtcMillis(1),revision:1,state:SessionInputState::Pending,attached_turn_id:None,
+            consumption:None,interruption:None,
+            payload:serde_json::json!({"plugin_message":origin,"request":{"text":"ORIGINAL_RESULT"}}),
+        },None).unwrap();
+        let task_store = TaskStore::default();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(8);
+        let roles = AgentRoleRegistry::load_default();
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &roles,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: None,
+        };
+        let mut request = rollback_test_request(session.clone(), UtcMillis(3000), "coordinator");
+        request.workspace_id = None;
+        request.user_message_metadata.insert(
+            "pluginCommandId".into(),
+            serde_json::json!("plugin/acme.result/run"),
+        );
+        let command = prepare_pending_dispatch_submission(&runtime, &request).unwrap();
+        assert_eq!(
+            command
+                .active_execution_chain
+                .current_turn
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        task_store.remove_task(&command.task.task_id).unwrap();
+        assert_eq!(
+            session_store
+                .input_for_request("context-request")
+                .unwrap()
+                .state,
+            SessionInputState::Pending
+        );
+        request.user_message_metadata.clear();
+        let pending = prepare_pending_dispatch_submission(&runtime, &request).unwrap();
+        assert_eq!(
+            pending
+                .active_execution_chain
+                .current_turn
+                .as_ref()
+                .unwrap()
+                .items
+                .len(),
+            2
+        );
+        assert_eq!(
+            session_store
+                .input_for_request("context-request")
+                .unwrap()
+                .state,
+            SessionInputState::Pending,
+            "执行准备不能提前领取 Input"
+        );
+        let graph = DispatchSubmissionGraph::new(
+            pending.task.task_id.clone(),
+            pending.task.task_id,
+            Some(pending.active_execution_chain),
+        );
+        let accepted = accept_dispatch_submission(
+            &session_store,
+            &task_store,
+            &execution_registry,
+            request.clone(),
+            graph,
+        )
+        .unwrap();
+        let input = session_store.input_for_request("context-request").unwrap();
+        assert_eq!(input.state, SessionInputState::Attached);
+        assert_eq!(
+            input.attached_turn_id.as_deref(),
+            Some(accepted.turn_id.as_str())
+        );
+        let turn = session_store
+            .canonical_turn_for_session_turn_id(&session, &accepted.turn_id)
+            .unwrap();
+        let item = turn
+            .items
+            .iter()
+            .find(|item| item.metadata.contains_key("pluginMessage"))
+            .unwrap();
+        assert_eq!(item.content.as_deref(), Some("ORIGINAL_RESULT"));
+        assert_eq!(item.metadata["pluginMessage"], origin);
+        materialize_dispatch_submission(&runtime, &request, &accepted.turn_id).unwrap();
+        let thread = session_store
+            .orchestrator_thread_for_session(&session)
+            .unwrap()
+            .thread_id;
+        session_store
+            .rebuild_thread_message_projection(&thread, UtcMillis(3100))
+            .unwrap();
+        let projected = session_store.thread_message_history(&thread);
+        let message = projected
+            .iter()
+            .find(|message| message.input_request_id.as_deref() == Some("context-request"))
+            .unwrap();
+        assert_eq!(message.content, item.model_input_content());
+        assert!(
+            message
+                .content
+                .as_ref()
+                .unwrap()
+                .contains("Plugin-provided message")
+        );
     }
 
     #[test]

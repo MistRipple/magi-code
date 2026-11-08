@@ -446,6 +446,7 @@ async fn submit_session_turn_internal(
                 decision,
                 request_fingerprint,
                 job,
+                None,
             )
             .await
         }
@@ -598,6 +599,7 @@ fn enqueue_session_turn_response(
     let queued_request_id = Some(request_id);
     let queued_user_message_id = Some(user_message_item_id.clone());
     let queue_position = state.enqueue_regular_session_turn(QueuedRegularSessionTurn {
+        plugin_message: None,
         project_directories: request.project_directories.clone(),
         request,
         request_fingerprint: Some(request_fingerprint),
@@ -664,6 +666,7 @@ async fn submit_steer_current_turn(
         scope,
         accepted_at,
         request_fingerprint,
+        None,
     )
     .await
 }
@@ -792,6 +795,7 @@ pub(crate) async fn submit_steer_current_turn_after_turn_commit(
     scope: &SessionScope,
     accepted_at: UtcMillis,
     creation_request_fingerprint: &str,
+    plugin_message: Option<&magi_app_server_protocol::generated::PluginSessionMessageOrigin>,
 ) -> Result<SessionTurnResponseDto, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
     require_session_record_in_scope(state, &session_id, scope)?;
@@ -895,6 +899,12 @@ pub(crate) async fn submit_steer_current_turn_after_turn_commit(
                         serde_json::Value::String(request_id.clone().expect("steer request id")),
                     ),
                 ]);
+                if let Some(origin) = plugin_message {
+                    metadata.insert(
+                        "pluginMessage".into(),
+                        serde_json::to_value(origin).expect("origin serializes"),
+                    );
+                }
                 metadata.extend(
                     magi_conversation_runtime::session_images::session_turn_images_metadata(
                         &images,
@@ -907,7 +917,13 @@ pub(crate) async fn submit_steer_current_turn_after_turn_commit(
         });
     user_message_item.item_seq = 0;
     let signal = UserSignal {
-        text: Some(message),
+        text: Some(match plugin_message {
+            Some(origin) => magi_session_store::plugin_message_model_content(
+                &message,
+                &serde_json::to_value(origin).expect("origin serializes"),
+            ),
+            None => message,
+        }),
         images: magi_conversation_runtime::session_images::session_turn_image_sources(&images),
         request_id: request_id.clone(),
         user_message_id: user_message_id.clone(),
@@ -2400,6 +2416,7 @@ async fn submit_mainline_session_turn(
     decision: SessionTurnIntentDecision,
     creation_request_fingerprint: String,
     job: Option<magi_app_server_protocol::generated::PluginJobContext>,
+    plugin_message: Option<magi_app_server_protocol::generated::PluginSessionMessageOrigin>,
 ) -> Result<SessionTurnResponseDto, ApiError> {
     let trace = PerformanceTrace::new(request.request_id().as_deref(), accepted_at);
     let requested_session_label = request
@@ -2468,6 +2485,12 @@ async fn submit_mainline_session_turn(
                         "route".to_string(),
                         serde_json::Value::String(session_turn_route_name(route).to_string()),
                     )]);
+                    if let Some(origin) = plugin_message {
+                        metadata.insert(
+                            "pluginMessage".into(),
+                            serde_json::to_value(origin).expect("origin serializes"),
+                        );
+                    }
                     if let Some(id) = request.plugin_command_id.as_ref() {
                         metadata.insert("pluginCommandId".into(), Value::String(id.clone()));
                     }
@@ -3201,6 +3224,7 @@ pub(crate) async fn drain_next_queued_regular_session_turn(
     } else {
         queued.accepted_at
     };
+    let plugin_message = queued.plugin_message;
     let mut queued_request = queued.request;
 
     queued_request.project_directories = queued.project_directories;
@@ -3259,6 +3283,7 @@ pub(crate) async fn drain_next_queued_regular_session_turn(
                             decision,
                             creation_request_fingerprint,
                             None,
+                            plugin_message,
                         )
                         .await
                         .map(|_| ()),

@@ -722,6 +722,7 @@ impl Incoming for HostHandler {
                         | "plugins.remove"
                         | "plugins.authorize"
                         | "plugins.setVersionExemption"
+                        | "session.message"
                         | "session.snapshot"
                         | "credential.ref"
                         | "blob.put"
@@ -1118,6 +1119,7 @@ fn check_hello(
         "plugin.reconciliation",
         "plugin.skills",
         "session.directory",
+        "session.messages",
         "images.store",
     ];
     let features: Vec<String> = supported

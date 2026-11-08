@@ -1769,6 +1769,9 @@ impl DaemonRuntime {
         > = extension_hooks_adapter.clone();
         let llm_task_dispatcher = Arc::new(
             llm_task_dispatcher
+                .with_plugin_session_message_admitter(magi_api::plugin_session_message_admitter(
+                    &state,
+                ))
                 .with_plugin_command_executor(
                     self.plugins
                         .command_executor(tokio::runtime::Handle::current()),

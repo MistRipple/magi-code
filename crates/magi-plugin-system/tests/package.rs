@@ -286,6 +286,33 @@ fn extension_manifest() -> Value {
 const ENTRY: &[(&str, &[u8])] = &[("extension/index.mjs", b"export default async () => {}")];
 
 #[test]
+fn session_messages_require_explicit_scopes_and_a_trusted_extension() {
+    for targets in [
+        json!(["context"]),
+        json!(["wake"]),
+        json!(["context", "wake"]),
+    ] {
+        let mut value = extension_manifest();
+        value["permissions"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"kind":"sessionWrite","targets":targets}));
+        assert!(PluginPackage::from_archive(&extension_archive(&value, ENTRY)).is_ok());
+    }
+    for targets in [json!([]), json!(["*"]), json!(["other-session"])] {
+        let mut value = extension_manifest();
+        value["permissions"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"kind":"sessionWrite","targets":targets}));
+        assert!(PluginPackage::from_archive(&extension_archive(&value, ENTRY)).is_err());
+    }
+    let mut page = manifest();
+    page["permissions"] = json!([{"kind":"sessionWrite","targets":["context"]}]);
+    assert!(PluginPackage::from_archive(&archive(&page, &[])).is_err());
+}
+
+#[test]
 fn session_directory_permission_requires_an_extension_and_an_exact_read_scope() {
     let mut manifest = extension_manifest();
     manifest["permissions"]

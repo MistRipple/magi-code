@@ -142,6 +142,12 @@ impl LlmTaskDispatcher {
         mut params: Value,
         cancelled: Arc<AtomicBool>,
     ) -> Result<Value, String> {
+        if method == "session.message" {
+            return self
+                .plugin_session_message_admitter
+                .as_ref()
+                .ok_or("会话消息服务未装配")?(plugin, params, cancelled);
+        }
         let context = params
             .as_object_mut()
             .ok_or("服务参数必须是对象")?

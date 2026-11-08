@@ -42,6 +42,7 @@ pub(crate) fn session_turn_queue_response(
                 .and_then(|input| input.interruption.as_ref())
                 .and_then(|interruption| interruption.error.clone());
             QueuedSessionTurnDto {
+                plugin_message: queued.plugin_message.clone(),
                 plugin_command_id: queued.request.plugin_command_id.clone(),
                 revision: inputs
                     .iter()
@@ -195,6 +196,11 @@ pub(crate) async fn update_session_turn_queue_item(
     let mut queued: crate::state::QueuedRegularSessionTurn =
         serde_json::from_value(input.payload.clone())
             .map_err(|error| ApiError::internal_assembly("读取排队输入", error))?;
+    if queued.plugin_message.is_some() {
+        return Err(ApiError::Conflict(
+            "插件消息保留原始来源，不能编辑；可以取消后自行发送".into(),
+        ));
+    }
     let replacement: crate::dto::SessionTurnRequestDto = serde_json::from_value(
         serde_json::to_value(request.request).expect("wire request serializes"),
     )
@@ -450,6 +456,11 @@ pub(crate) async fn guide_session_turn_queue_item(
         .ok_or_else(|| ApiError::not_found("排队消息不存在", queue_id))?;
 
     {
+        if queued.plugin_message.is_some() {
+            return Err(ApiError::Conflict(
+                "插件消息保留原始投递方式；可以取消后自行发送".into(),
+            ));
+        }
         if !session_turn_request_is_steerable_input(&queued.request) {
             return Err(ApiError::InvalidInput(
                 "补充当前任务仅支持文字与图片，其他输入请留在下一轮发送".to_string(),
@@ -474,6 +485,7 @@ pub(crate) async fn guide_session_turn_queue_item(
             &scope,
             crate::turn_service::monotonic_accepted_at(),
             &creation_fingerprint,
+            queued.plugin_message.as_ref(),
         )
         .await?;
     }

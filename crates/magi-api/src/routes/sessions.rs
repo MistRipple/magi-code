@@ -2575,6 +2575,7 @@ mod tests {
         request.user_message_id = Some(format!("user-{queue_id}"));
         request.placeholder_message_id = Some(format!("assistant-{queue_id}"));
         QueuedRegularSessionTurn {
+            plugin_message: None,
             project_directories: None,
             request,
             request_fingerprint: None,
@@ -7398,6 +7399,7 @@ mod tests {
             .unwrap();
         state
             .enqueue_regular_session_turn(QueuedRegularSessionTurn {
+                plugin_message: None,
                 project_directories: None,
                 request: session_turn_request("排队消息"),
                 request_fingerprint: None,

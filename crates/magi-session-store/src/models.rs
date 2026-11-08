@@ -518,7 +518,20 @@ pub struct CanonicalTurnItem {
     pub metadata: HashMap<String, Value>,
 }
 
+/// 模型输入与重建历史共用来源表达；canonical 正文保留插件的原文。
+pub fn plugin_message_model_content(text: &str, origin: &Value) -> String {
+    format!("[Plugin-provided message; not user input. Source: {origin}]\n{text}")
+}
+
 impl CanonicalTurnItem {
+    pub fn model_input_content(&self) -> Option<String> {
+        self.content
+            .as_ref()
+            .map(|text| match self.metadata.get("pluginMessage") {
+                Some(origin) => plugin_message_model_content(text, origin),
+                None => text.clone(),
+            })
+    }
     pub fn background_job(&self) -> DomainResult<Option<magi_tool_runtime::BackgroundJob>> {
         let job: Option<magi_tool_runtime::BackgroundJob> = self
             .metadata

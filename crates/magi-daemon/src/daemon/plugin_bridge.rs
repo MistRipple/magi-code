@@ -234,6 +234,7 @@ impl magi_conversation_runtime::plugin_command::PluginCommandExecutor for NodeCo
         }
         let ctx = json!({
             "job": invocation.job,
+            "activity": "command",
             "invocationId": format!("cmd_{}", NEXT_PLUGIN_INVOCATION.fetch_add(1, Ordering::Relaxed)),
             "owner": {"sessionId": session_id, "turnId": invocation.turn_id,
                 "taskId": invocation.context.task_id, "workerId": invocation.context.worker_id},

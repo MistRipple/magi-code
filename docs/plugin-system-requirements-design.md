@@ -454,7 +454,8 @@
 | 截图与附件 | 后台图片存储有独立实例授权、分块传输和持久元数据；输入端口等待真实草稿回执，原同步业务调用仅在可证明的 AST 路径上改为等待；图片发送仍由用户决定 | `test:electron-appshot`：0.4.2 原包真实 macOS 截图、关闭设置页后投递、重启后载荷恢复；证据 `target/plugin-acceptance/appshot/`。曾有解码／挂载超时，复跑通过，长期时序稳定性仍待定位 |
 | 读取会话目录 | 独立 `sessionRead:["directory"]` 权限，只读 daemon 用户会话元数据与稳定分页；不包含消息、凭据或完整可写 Session，不按上游对象形状伪造事实 | `test:electron-plugin-runtime`、`test:electron-appshot` |
 | 发现与调用技能 | 全局文本注册进入已有运行目录，输入框 `/` 与模型 `skill_apply` 共用该事实；原文调用、配置替换、停用撤销和应用重启归原生生命周期；消息保存接纳时名称 | `test:compat`、`test:electron-plugin-runtime`，Debugging 0.7.2 原包技能；其他调用策略、资源根、provider 和 agent 作用域仍未接入 |
-| 使用 WorkBuddy 模型与本机 CLI | 原包适配器通过本机带随机 Bearer 的桥进入原生模型目录；流、用量和取消沿真实上游运行时与 Magi 账本。`/codebuddy` 从本次执行上下文读取目录并调用实际 CLI，用户可选择仅返回结果 | `test:electron-workbuddy`：5.20.32 原包、国内版现有登录态、真实 hy3 回复及停用／重新激活；CodeBuddy 2.181.0 实际读取指定项目文件，保持 dontAsk 且只授权该文件 Read，13/13。证据 `target/plugin-acceptance/workbuddy/`；CLI 安装在独立临时目录，不代表 Magi 已提供外部程序安装管理；未覆盖国际版、视频与自动回注 |
+| 将业务结果交给当前会话 | 独立 context／wake 授权，统一 SessionInput、canonical、原生引导及队列；context 不主动启动模型，steer/followup 可唤醒。来源、身份与模型消费回执可审计，子任务及计划预算不能旁路 | 公开合同见[扩展协议](extension-protocol-v1.md#会话消息交付)；`session-messages-product-final/` 与真实 WorkBuddy 自动回注均通过 |
+| 使用 WorkBuddy 模型与本机 CLI | 原包模型、CLI 及结果回注均沿 daemon 原生服务；CLI 在本次 Task 的真实目录执行，原包可选择仅返回结果或回注后唤醒主模型。来源、模型请求和用量可追踪 | `test:electron-workbuddy`：5.20.32 在线原包、CodeBuddy 2.181.0、国内现有登录态与 hy3，15/15；实际读取文件、自动回注、主模型答复及原页面。证据 `target/plugin-acceptance/session-messages-workbuddy-final/`；未覆盖国际版、视频或外部程序安装管理 |
 
 上述为分项证据，不能把不同批次的通过项拼成一次全部通过。固定社区样本为 Health 3.0.5、Ops 0.20.8、Upgrader 1.8.0、Debugging 0.7.2、Appshot 0.4.2、Share 0.2.5、Mgr 0.2.12、Release Probe 0.0.8 与 Market 1.2.2；WorkBuddy 与 REA 单列。筛选样本不能缩小完整门槛的分母，未验证业务保持 `unverified`。
 
@@ -463,8 +464,8 @@
 - 完整业务覆盖率仍未达到可证明的 95%／100%。逐插件补齐成功结果、取消、配置持久化、在线更新、失败恢复与停用／重启验收；安装、进程 running、页面有内容和路由 smoke 各自只证明对应阶段。
 - Mgr 0.2.12 原页面点击更新不能显示确认框：宿主漏掉间接取用的公共组件库已修正；`profile-sdk-final/ui-modules.json` 确认官方 Modal 为函数、Button 为 React forwardRef 对象，原包仍按 `typeof Button === "function"` 判断而跳过确认。后台更新路由通过不能作为此页面流程通过；保留原页面与官方组件，不增加按包名改写或组件伪装。初始失败证据在 `target/plugin-acceptance/profile-product-before/` 与 `profile-product-confirm/`，补齐 SDK 后的失败在 `profile-sdk-final/`。这项仍须解决，不能计为完整支持。
 - Market／Share 的 Git 来源、上游主动移除式替换及安装提交各阶段的崩溃恢复仍未完成。安装任务回执只在当前 daemon 进程内短期保留，不能宣称崩溃后重放或跨重启 exactly-once。
-- `/codebuddy` 的工作目录现沿本次原生 Task 执行资源传递；命令结果自动回注仍缺正式会话消息服务，不能伪造 `Agent.inject/steer` 或宣称完整 Agent 支持。Debugging 的诊断／重启业务、Health 的完整修复流程，以及未列为实测通过的其他原包分支仍待验证。技能可用不等于插件全部诊断业务可用。
-- 会话消息、session/event、sessionProjections、完整 Agent 对象、provider 技能与作用域等仍按实际能力门槛处理。原生能力暂未暴露属于产品待开发项，不能直接定为永久不支持；不得返回假对象或空结果冒充完成。
+- Debugging 的诊断／重启业务、Health 的完整修复流程，以及未列为实测通过的其他原包分支仍待验证。技能可用不等于插件全部诊断业务可用。
+- 会话消息已接通当前主会话的工具／命令文本交付；跨会话与后台消息尚无产品入口。session/event、sessionProjections、完整 Agent 对象、provider 技能与作用域等仍按实际能力门槛处理，不能返回假对象或空结果冒充完成。
 - Windows、干净系统正式安装包、Android／iOS 真机触摸、屏幕录制权限引导和长期负载仍需各自验收。390px Electron 视口模拟不代表手机真机通过。
 - pi 尚无运行器；只允许浏览搜索结果，不创建空适配器或兼容声明。官方签名、公钥托管及目录内容由发布者提供，不把本地开发密钥当官方信任根。
 
@@ -474,20 +475,20 @@
 
 | 最近核对范围 | 入口 | 结果与边界 |
 | --- | --- | --- |
-| 既有兼容回归，不计本轮复跑 | `npm run test:compat` | 100 项通过，新增命令／工具的执行投影、并发隔离、配置替换、取消与失效引用；保留真实 Cordis effect、动态技能、依赖解析、辅助进程委托、公共页面 SDK、请求取消与媒体合同；只证明各测试覆盖的行为 |
-| 本轮 Rust 定向回归 | `magi-api`、`magi-conversation-runtime`、`magi-session-store`、`magi-daemon` | 命令准入与空参数任务目标、失败命令的执行链恢复限制、停止／失败／重启中断后的会话恢复限制、真实 Node 命令与开始前／运行中取消各 1 项通过；daemon check、修改文件格式检查、macOS 目录包构建与解包自检通过 |
-| 既有基础检查，不计本轮复跑 | Web、Desktop、发行边界 | 上一轮 Web check 0 错误 0 警告、Desktop check 通过。本轮重新完成 macOS 目录包构建、解包自检与修改 Rust 文件格式检查；没有 schema 变更，不把既有协议检查算作本轮复跑 |
+| 本轮翻译运行时回归 | `npm run test:compat` | 102/102；新增同步消息真实回执、失败不提交、来源校验、失效引用、工具与命令共享消息端口；其他原有契约保持通过。不能据测试数量推导生态支持率 |
+| 本轮 Rust 定向回归 | `magi-api`、`magi-conversation-runtime`、`magi-plugin-system`、`magi-daemon` | 原生队列与消费相关 20 项、dispatch 原有 20 项、新增上下文原子领取与来源重建 1 项、独立消息权限 1 项、状态布局写屏障 1 项通过；daemon check 和修改 Rust 文件格式检查通过 |
+| 本轮基础检查 | Web、协议、目录发行包 | Web check 0 错误 0 警告；协议生成一致；canonical 历史投影和 composer 定向检查通过。macOS 目录包重新构建与解包自检通过；没有 Desktop Main 代码变更，未复跑其独立测试 |
 | 既有 Rust 业务专项，不计本轮复跑 | 运行目录、技能与宿主 | 运行目录 7、`skill_apply` 7、技能加载 7、SkillRuntime 20、消息名称接纳 1、宿主单元 15、真实 Node 集成 25 项通过 |
-| 当前目录包 | `test:electron-plugin-runtime` | macOS arm64 Electron 45、随包 daemon／Node，**91/91**；`target/plugin-acceptance/task-command-final/results.json`。个人／多目录原包命令实际读写、真实 root Task 接纳／canonical 归属／TaskStore 完成、无主模型步骤、取消传递、禁止通用 Continue 重放、显式重试、源目录失效拒绝均通过；保留技能、图片、原页面 SDK／SVG、主题、请求取消、停用与重启回归。早期空参数任务目标失败保留于 `task-command-initial/`，修正后整套独立通过；不拼接上一轮 87/87 或阴影审计批次，也不代表手机真机或全部页面完成 |
+| 当前目录包 | `test:electron-plugin-runtime` | macOS arm64 Electron 45、随包 daemon／Node，**107/107**；`target/plugin-acceptance/session-messages-product-final/results.json`。在原命令、技能、图片、SVG、原页面、右栏和生命周期回归上新增消息上下文与唤醒、原子领取／Step 消费、重复身份、取消／失败、重启恢复、来源完整展示、390px 布局及计划预算拒绝；不代表手机真机或全部生态完成 |
 | 既有社区目录包批次，不计本轮复跑 | `test:electron-popular-dsh` | 固定 9 个社区原包：在线安装 9/9、启动 9/9、原生页面 9/9、路由 smoke 7/7、页面异常 0；在线更新验证 2 条、coreVerified 仍为 0、qualified 为 false，按完整门槛退出 1。结果在 `target/plugin-acceptance/skills-community-final/`，未完成项保留 unverified，不以安装率推导生态支持率 |
-| 本轮真实原包与外部服务 | `MAGI_WORKBUDDY_CLI_BINARY=<CLI绝对路径> MAGI_WORKBUDDY_CLI_MODEL=hy3 npm run test:electron-workbuddy` | 5.20.32 在线原包、CodeBuddy CLI 2.181.0，**14/14**；真实 WorkBuddy hy3 模型回复及 CLI 指定文件读回，新增命令 Task 接纳／完成结算核对。`target/plugin-acceptance/task-command-workbuddy-hy3/results.json`、`codebuddy-command.json`；injectResult=false，不能推导自动回注完成。本轮未指定 CLI 模型的首次调用超过显式配置的 90 秒预算，canonical Turn 与 Task 均为 failed，失败日志及截图保留在 `task-command-workbuddy/`，状态根记录于 `target/plugin-task-command-workbuddy.log`；后续只通过原包正式模型设置选择 hy3，未放宽权限、延长预算或改写原包。更早的文件 Read 授权失败继续保留，不合并不同批次计数 |
+| 本轮真实原包与外部服务 | `MAGI_WORKBUDDY_CLI_BINARY=<CLI绝对路径> MAGI_WORKBUDDY_CLI_MODEL=hy3 MAGI_WORKBUDDY_CLI_INJECT_RESULT=1 npm run test:electron-workbuddy` | 5.20.32 在线原包、CodeBuddy CLI 2.181.0，**15/15**；`target/plugin-acceptance/session-messages-workbuddy-final/`。实际 CLI 只授权读取验收文件，保留 dontAsk；原包自动回注保存 codebuddy-bridge 来源，主模型完成真实回复。此前非 Git 夹具使主模型 git_status 拒绝，整轮失败保留于 `session-messages-workbuddy/`，后续使用真实 Git 项目独立整套通过；未降低成功门槛或过滤运行日志 |
 | 既有页面 SDK 专项，不计本轮复跑 | `test:electron-dsh-rea` | 1.2.0 原包与 rea-agents 6.5.0、16/16：SVG、原页面 Ghidra 链接、真实 207 工具、CAS、停用与恢复；`target/plugin-acceptance/product-ui-rea/`。此包早于最后的外观事件分类修正，未验证 Ghidra 实际安装或二进制分析 |
 | 既有未解决失败，不计通过 | `test:electron-dsh-profile` | 原包搜索、布局恢复、启停和运行错误恢复通过，更新确认仍超时；`target/plugin-acceptance/profile-sdk-final/ui-modules.json` 确认组件库已加载。见第 11.2 节的原包组件判断问题 |
 | 既有专项，不计本轮复跑 | `test:electron-dsh-management`、`test:electron-dsh-compatibility` | 第 11 节所列原包管理、版本豁免、真实运行状态与失败恢复证据；不能合并不同批次成为全部业务通过 |
 | 既有专项，不计本轮复跑 | `test:electron-appshot` | 0.4.2 原包、13 项，真实 macOS 原生截图、后台附件、草稿挂载及重启恢复；`target/plugin-acceptance/appshot/`，不代表其他平台或所有时序分支 |
 | 既有本地纵向套件，不计本轮复跑 | `test:local-plugins`、`test:local-plugins-ui` | 真实 daemon／Node 的安装、授权、服务、调度、回收与界面流程；设置页现已移除计划表单，旧表单截图不是当前 UI 合同 |
 
-验收器仅在发送按钮真实存在且启用时操作；进程重启前释放旧文档，重新启动后等待外观和工作台初始化，不把 CDP 提前导航造成的网络中止混入业务结果。原包组件、错误断言和成功门槛保持实际行为，没有过滤运行异常或添加整轮自动重试。当前目录包独立完整通过 91/91，不拼接中间通过项。执行上下文验收早期参数、协议方法与夹具模型触发错误，以及目录失效应由异步 canonical 终态判定的修正记录保留于 `execution-product/`、`execution-product-final/`、`execution-product-verified/`、`execution-context-final/`、`execution-product-complete/`；此前页面失败仍保留于各自证据目录。
+验收器仅在发送按钮真实存在且启用时操作；进程重启前释放旧文档，重新启动后等待外观和工作台初始化，不把 CDP 提前导航造成的网络中止混入业务结果。原包组件、错误断言和成功门槛保持实际行为，没有过滤运行异常或添加整轮自动重试。当前目录包独立完整通过 107/107，不拼接中间通过项。消息验收早期工具端口装配遗漏及夹具错误保留于 `session-messages-*` 各失败目录；当前通过证据仅为 `session-messages-product-final/`。执行上下文验收早期参数、协议方法与夹具模型触发错误，以及目录失效应由异步 canonical 终态判定的修正记录保留于 `execution-product/`、`execution-product-final/`、`execution-product-verified/`、`execution-context-final/`、`execution-product-complete/`；此前页面失败仍保留于各自证据目录。
 
 ### 12.2 未运行与不得推导的结论
 

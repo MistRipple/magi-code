@@ -4095,6 +4095,7 @@ function bridgeRuntimeIsBusy(): boolean {
 function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
   return {
     id: turn.queueId,
+    pluginMessage: turn.pluginMessage,
     revision: turn.revision,
     requestId: turn.requestId?.trim() || turn.queueId,
     content: turn.content,

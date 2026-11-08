@@ -89,6 +89,7 @@ export async function prepareDsh(options) {
     name: pkg.displayName ?? pkg.name, description: pkg.description ?? '', dataSchemaVersion: 1,
     extension: { hooks: [], compat: { kind: 'dsh' }, runtimeContributions: ['tools', 'commands', 'modelSources', 'settings', 'skills'] },
     permissions: [
+      { kind: 'sessionWrite', targets: ['context', 'wake'] },
       { kind: 'extension', targets: ['full-trust'] }, { kind: 'storage', targets: ['__settings'] },
       { kind: 'tools', targets: ['*'] }, { kind: 'modelSources', targets: ['*'] },
     ],

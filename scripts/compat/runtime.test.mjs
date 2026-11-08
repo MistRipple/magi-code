@@ -71,7 +71,7 @@ test('命令与工具读取同一 daemon 调用的会话身份和执行目录，
   const running = await activateDsh(h.api, { inject: ['commands', 'tools'], apply(ctx, config) {
     const read = async (agent, signal) => {
       const session = agent.session, header = session.header;
-      assert.throws(() => agent.inject({}), /尚未接入/);
+      assert.throws(() => agent.inject({}), /插件消息必须/);
       assert.throws(() => session.append('message', {}), /尚未接入/);
       assert.throws(() => { header.cwd = '/forged'; }, TypeError);
       if (crossCall) assert.throws(() => crossCall.id, /失效|不属于/);
@@ -813,4 +813,58 @@ test('BMP 调色板、位域和 RLE 保留颜色及不透明度，不将保留�
       }
     }
   });
+});
+
+
+test('插件消息同步业务等待真实 daemon 回执，区分上下文与唤醒且不泄漏过期投影', async () => {
+  const {withInvocation,invocationAgent}=await import('./runtime/invocation.mjs');
+  const calls=[];let done,agent;
+  const api={session:{message:async input=>{calls.push(input);await new Promise(resolve=>{done=resolve});return {inputId:'input',state:'pending'}}}};
+  const context={...execution(),activity:'command',owner:{sessionId:'s'},execution:{workingDirectory:'/execution',sourceFolders:[],accessProfile:'restricted'}};
+  const message={id:'m1',role:'user',content:[{type:'text',text:'RESULT'}],source:{kind:'example-result'}};
+  let finished=false;
+  const work=withInvocation(context,async()=>{
+    agent=invocationAgent();assert.equal(agent.status,'idle');
+    agent.steer(message);agent.steer(message);
+    return 'original';
+  },api).then(value=>{finished=true;return value});
+  await until(()=>calls.length===1);assert.equal(finished,false);
+  assert.deepEqual(calls,[{messageId:'m1',text:'RESULT',sourceKind:'example-result',delivery:'steer'}]);
+  done();assert.equal(await work,'original');
+  assert.throws(()=>agent.inject(message),/失效/);
+  await assert.rejects(withInvocation(context,()=>{invocationAgent().inject({...message,source:{kind:'user'}})},api),/独立来源/);
+  await assert.rejects(withInvocation(context,()=>{invocationAgent().inject(message);throw new Error('business failed')},api),/business failed/);
+  assert.equal(calls.length,1,'失败业务不能提交临时消息');
+  const rejected={session:{message:async()=>{throw new Error('permission denied')}}};
+  await assert.rejects(withInvocation(context,()=>{invocationAgent().inject(message)},rejected),/permission denied/);
+  const delivered=[];
+  await withInvocation({...context,activity:'tool'},()=>{const a=invocationAgent();assert.equal(a.status,'running');a.inject(message);a.followup({...message,id:'m2'});},
+    {session:{message:async input=>{delivered.push(input.delivery);return {inputId:'i',state:'attached'}}}});
+  assert.deepEqual(delivered,['context','followup']);
+});
+
+
+test('原包工具与命令共用已装配的消息端口，状态与真实 daemon 交付方式一致', async t => {
+  const h=host(), messages=[];
+  h.api.session.message=async input=>{messages.push(input);return {inputId:'accepted',state:'pending'}};
+  const body={id:'command-message',role:'user',content:[{type:'text',text:'ORIGINAL'}],source:{kind:'result'}};
+  const running=await activateDsh(h.api,{inject:['commands','tools'],apply(ctx){
+    ctx.commands.register({name:'deliver',handler:invocation=>{
+      assert.equal(invocation.agent.status,'idle');
+      invocation.agent.steer(body);
+      return {kind:'success',text:'COMMAND'};
+    }});
+    ctx.tools.register(tool('deliver',(_args,exec)=>{
+      assert.equal(exec.agent.status,'running');
+      exec.agent.inject({...body,id:'tool-message'});
+      return 'TOOL';
+    }));
+  }},options);
+  t.after(()=>running.dispose());
+  const context={...execution(),owner:{sessionId:'session'},execution:{workingDirectory:'/execution'}};
+  await h.state.commands.get(runtimeId('cmd','deliver'))({}, {...context,activity:'command'});
+  await h.state.tools.get(runtimeId('tool','deliver'))({},context);
+  assert.deepEqual(messages.map(({messageId,delivery})=>({messageId,delivery})),[
+    {messageId:'command-message',delivery:'steer'},{messageId:'tool-message',delivery:'context'},
+  ]);
 });

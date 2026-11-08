@@ -28,7 +28,7 @@ pub use models::{
     SessionSidecarFlushReason, SessionStoreState, ThreadChatImageSource, ThreadChatMessage,
     ThreadChatToolCall, ThreadChatToolFunction, ThreadContextCheckpoint, ThreadFileFactVersion,
     ThreadModelProviderContext, ThreadVisibility, TimelineEntry, TimelineEntryKind,
-    active_execution_turn_request_id, timeline_entry_visible_text,
+    active_execution_turn_request_id, plugin_message_model_content, timeline_entry_visible_text,
 };
 pub use store::{
     CanonicalItemCommitNotice, CanonicalTurnMutation, ModelStepCommitNotice,

@@ -481,6 +481,7 @@ function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
       sessionId: typeof item.sessionId === 'string'
         ? item.sessionId.trim()
         : undefined,
+      pluginMessage: item.pluginMessage,
       content: item.content,
       text: typeof item.text === 'string' ? item.text : null,
       createdAt: item.createdAt,

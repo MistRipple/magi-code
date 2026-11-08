@@ -415,9 +415,24 @@
 
 </script>
 
+{#snippet deliveryReceipt()}
+  {#if inputDelivery}
+    <span class="input-delivery" data-input-delivery={inputDelivery}
+      title={i18n.t(`messageItem.inputDelivery.${inputDelivery}.detail`)}>
+      {i18n.t(`messageItem.inputDelivery.${inputDelivery}`)}
+    </span>
+  {/if}
+{/snippet}
+
 <!-- 系统通知消息：居中显示（必须有实际文本内容才渲染） -->
 {#if executionSteps}
   <div class="execution-steps-message" data-message-id={message.id}><ExecutionSteps snapshot={executionSteps} sessionId={(filePreviewScope?.sessionId || (typeof message.metadata?.sessionId === 'string' ? message.metadata.sessionId : ''))} {filePreviewScope} /></div>
+{:else if message.metadata?.pluginMessage}
+  <div class="message-item plugin-message" data-message-id={message.id} data-turn-id={messageTurnId || undefined} data-source="plugin">
+    <div class="plugin-message-source">{i18n.t('messageItem.pluginMessage', { name: message.metadata.pluginMessage.pluginName })}</div>
+    <MarkdownContent content={message.content} {filePreviewScope} />
+    {@render deliveryReceipt()}
+  </div>
 {:else if isNotice && noticeText && noticeText.trim()}
   <div
     class="system-notice {noticeType}"
@@ -531,12 +546,7 @@
         </div>
       </div>
     {/if}
-    {#if inputDelivery}
-      <span class="input-delivery" data-input-delivery={inputDelivery}
-        title={i18n.t(`messageItem.inputDelivery.${inputDelivery}.detail`)}>
-        {i18n.t(`messageItem.inputDelivery.${inputDelivery}`)}
-      </span>
-    {/if}
+    {@render deliveryReceipt()}
     <div class="user-time">
       <span class="user-timestamp">{formatTraceableTime(message.timestamp)}</span>
       <div class="user-actions">
@@ -650,6 +660,12 @@
 {/if}
 
 <style>
+  .plugin-message-source {
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    margin-block-end: var(--space-2);
+  }
+
   /* ===== 系统通知样式（与HTML版本一致，简洁无背景） ===== */
   .system-notice {
     position: relative;

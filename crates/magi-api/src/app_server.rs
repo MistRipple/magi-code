@@ -2694,6 +2694,7 @@ mod tests {
         let queue_id = "queue-app-server-replay".to_string();
         state
             .enqueue_regular_session_turn(crate::state::QueuedRegularSessionTurn {
+                plugin_message: None,
                 project_directories: None,
                 request,
                 request_fingerprint: Some(request_fingerprint),

@@ -114,7 +114,7 @@ pub(crate) fn freeze_parent_history(
                     {
                         continue;
                     }
-                    ("user_message", item.content.clone())
+                    ("user_message", item.model_input_content())
                 }
                 CanonicalTurnItemKind::AssistantText => ("assistant_text", item.content.clone()),
                 CanonicalTurnItemKind::ToolCall => {
