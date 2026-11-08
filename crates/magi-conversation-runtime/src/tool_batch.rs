@@ -8205,6 +8205,7 @@ mod tests {
             .and_then(|executor| executor.project_directories.as_ref())
             .map(
                 |binding| crate::workspace_execution::WorkspaceExecutionResources {
+                    personal_root: None,
                     directories: Some(
                         magi_core::ProjectDirectoryExecutionMap::from_binding(binding, |_| {
                             Ok(std::fs::canonicalize(&execution_root).unwrap())
@@ -9270,6 +9271,7 @@ mod tests {
                 .unwrap(),
         ];
         let resources = crate::workspace_execution::WorkspaceExecutionResources {
+            personal_root: None,
             directories: Some(map),
             snapshots: snapshots.clone(),
         };

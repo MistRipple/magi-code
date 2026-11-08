@@ -165,7 +165,16 @@ pub fn workspace_execution_preparer(
                 return Err("隔离目录准备期间 Turn 已关闭或变化".to_string());
             }
             let Some(binding) = binding.as_ref() else {
-                return Ok(Default::default());
+                let root = if execution {
+                    std::fs::canonicalize(state.personal_session_execution_root(session_id)
+                        .map_err(|error| error.message().to_string())?)
+                        .map_err(|error| format!("个人会话执行目录不可用: {error}"))?
+                } else {
+                    state.personal_session_execution_root_path(session_id)
+                };
+                return Ok(magi_conversation_runtime::workspace_execution::WorkspaceExecutionResources {
+                    personal_root: Some(root), ..Default::default()
+                });
             };
             let directories =
                 magi_core::ProjectDirectoryExecutionMap::from_binding(binding, |grant| {
@@ -183,6 +192,7 @@ pub fn workspace_execution_preparer(
             if !execution {
                 return Ok(magi_conversation_runtime::workspace_execution::WorkspaceExecutionResources {
                     directories: Some(directories), snapshots: Vec::new(),
+                    personal_root: None,
                 });
             }
             let mut repositories = Vec::new();
@@ -253,6 +263,7 @@ pub fn workspace_execution_preparer(
                 Ok(
                     magi_conversation_runtime::workspace_execution::WorkspaceExecutionResources {
                         directories: Some(directories),
+                        personal_root: None,
                         snapshots,
                     },
                 )

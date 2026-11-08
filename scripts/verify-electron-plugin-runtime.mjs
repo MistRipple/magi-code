@@ -2,7 +2,7 @@
 // 独立状态根；DSH 夹具不读用户凭据，模型回执由夹具适配器本地生成。
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile, rm, realpath, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -82,6 +82,8 @@ import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import { Service } from '@deepseek-ai/cordis';
 import cordis from '@deepseek-ai/cordis/package.json' with { type: 'json' };
 import { createRequire } from 'node:module';
+import { readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 const require = createRequire(import.meta.url);
 export const name = 'magi-runtime-acceptance';
 export const inject = ['commands', 'tools', 'llm', 'attachments', 'webServer', 'sessions', 'skills'];
@@ -112,6 +114,20 @@ export function apply(ctx, config) {
   });
   ctx.webServer.register({path:'/background-image',resource:()=>Response.json(backgroundImage)});
   ctx.commands.register({ name: 'report', description: '报告当前配置', handler: async () => ({ kind: 'text', text: 'DSH_REPORT:' + config.label }) });
+  ctx.commands.register({ name: 'directory', description: '在本次会话的实际执行目录读取与写入', handler: async invocation => {
+    const cwd = invocation.agent.session.header.cwd;
+    const id = invocation.agent.id;
+    if (invocation.rawInput === 'wait') {
+      await writeFile(join(cwd, 'command-waiting'), id);
+      await new Promise(resolve => invocation.signal.addEventListener('abort', resolve, {once:true}));
+      await writeFile(join(cwd, 'command-cancelled'), id);
+      return {kind:'error',text:'COMMAND_CANCELLED'};
+    }
+    const marker = await readFile(join(cwd, 'context-check.txt'), 'utf8');
+    const result = {id,cwd,marker,label:config.label};
+    await writeFile(join(cwd, 'command-result.json'), JSON.stringify(result));
+    return {kind:'success',text:'COMMAND_DIRECTORY:'+JSON.stringify(result)};
+  } });
   ctx.webServer.register({path:'/image-roundtrip',resource:async()=>{
     const data=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=','base64');
     const ref=await ctx.attachments.saveImage({data,mediaType:'image/png',name:'capture.png'});
@@ -120,7 +136,8 @@ export function apply(ctx, config) {
   }});
   if (config.enabled) ctx.effect(() => {
     const timer = setTimeout(() => ctx.tools.register({ name: 'late-read', description: '读取验收配置', parameters: { type: 'object' }, readOnly: true,
-      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }, execute: async () => config.label }), 1700);
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }, execute: async (args,exec) => args.directory
+        ? 'TOOL_DIRECTORY:'+JSON.stringify({id:exec.agent.id,cwd:exec.agent.session.header.cwd,marker:await readFile(join(exec.agent.session.header.cwd,'context-check.txt'),'utf8')}) : config.label }), 1700);
     return () => clearTimeout(timer);
   });
   class Adapter extends LlmAdapter {
@@ -130,6 +147,22 @@ export function apply(ctx, config) {
       request.signal?.throwIfAborted();
       skillRequest = JSON.stringify(request);
       let text = 'DSH_MODEL:' + config.label;
+      const lastUser = request.messages.findLast(message=>message.role==='user'
+        && message.content.some(block=>block.type==='text' && !block.text.startsWith('<magi-context-fragment ')));
+      const lastTool = request.messages.findLast(message=>message.role==='tool');
+      const directoryCheck = lastUser?.content.some(block=>block.type==='text' && block.text.includes('DIRECTORY_TOOL_CHECK'));
+      const directoryResult = lastTool && JSON.stringify(lastTool.content).includes('TOOL_DIRECTORY:');
+      if (directoryCheck && !directoryResult) {
+        const tool = request.tools.find(tool=>tool.description==='读取验收配置');
+        const block = {type:'tool-call',id:'directory-tool-call',name:tool.name,arguments:JSON.stringify({directory:true})};
+        yield {type:'block-start',index:0,blockType:'tool-call'};
+        yield {type:'tool-call-delta',index:0,id:block.id,name:block.name,argumentsDelta:block.arguments};
+        yield {type:'block-end',index:0,block};
+        yield {type:'usage',usage:{inputTokens:1,outputTokens:1,totalTokens:2}};
+        yield {type:'finish',reason:{kind:'tool-calls'}};
+        return;
+      }
+      if (directoryCheck && directoryResult) text=JSON.stringify(lastTool.content);
       const lastImage = request.messages.flatMap(message=>message.content).filter(block=>block.type==='image').at(-1);
       const images = lastImage ? [lastImage] : [];
       if (images.length) {
@@ -601,6 +634,52 @@ async function verifySessionDirectory(session) {
   }
 }
 
+async function verifyCommandExecution(session) {
+  const command = (await installed()).manifest.contributions.commands.find(command => command.title === 'directory').id;
+  let serial = 0;
+  const invoke = async (scope, text = '') => {
+    const turn = await post('/api/session/turn', {...scope, text, pluginCommandId:`plugin/${pluginId}/${command}`,
+      requestId:`directory-${++serial}`,userMessageId:`directory-user-${serial}`});
+    const result = await waitFor(async () => (await api(`/api/messages?scope=${scope.scope}&sessionId=${encodeURIComponent(scope.sessionId)}${scope.workspaceId ? '&workspaceId='+encodeURIComponent(scope.workspaceId) : ''}`)).value.canonicalTurns
+      ?.find(item => item.turnId === turn.turnId && ['completed','failed','cancelled','blocked'].includes(item.status)), '执行目录命令的 canonical 终态');
+    assert.equal(result.status, 'completed', JSON.stringify(result));
+    return result;
+  };
+  const personal = join(work, 'state/personal-sessions', session);
+  await mkdir(personal, {recursive:true}); await writeFile(join(personal,'context-check.txt'),'PERSONAL');
+  await invoke({scope:'personal',sessionId:session});
+  const saved = JSON.parse(await readFile(join(personal,'command-result.json'),'utf8'));
+  reporter.check('原包命令在 daemon 自有个人目录完成实际读写，不使用宿主进程目录', saved.id===session
+    && saved.cwd===await realpath(personal) && saved.marker==='PERSONAL' && saved.label==='changed');
+  const paths = [join(work,'first-source'),join(work,'second-source')];
+  for (const [index,path] of paths.entries()) { await mkdir(path); await writeFile(join(path,'context-check.txt'),`SOURCE_${index}`); }
+  const {workspace} = await post('/api/workspaces/create',{name:'Command context',sourceFolders:paths.map((path,index)=>({path,sourceFolderId:`draft-${index}`})),primarySourceFolderId:'draft-0'});
+  const projectSession = (await post('/api/session/materialize',{scope:'workspace',workspaceId:workspace.workspaceId})).sessionId;
+  const scope = {scope:'workspace',workspaceId:workspace.workspaceId,sessionId:projectSession,sourceFolderId:workspace.sourceFolders[1].sourceFolderId};
+  await invoke(scope);
+  const project = JSON.parse(await readFile(join(paths[1],'command-result.json'),'utf8'));
+  reporter.check('多目录项目命令使用接纳时选定的源目录和会话身份，结果写入对应目录', project.cwd===await realpath(paths[1])
+    && project.id===projectSession && project.marker==='SOURCE_1' && !await readFile(join(paths[0],'command-result.json')).then(()=>true,()=>false));
+  const waiting = await post('/api/session/turn',{scope:'personal',sessionId:session,text:'wait',pluginCommandId:`plugin/${pluginId}/${command}`,requestId:'directory-cancel',userMessageId:'directory-cancel-user'});
+  await waitFor(()=>readFile(join(personal,'command-waiting'),'utf8').then(value=>value===session,()=>false),'命令已进入真实业务');
+  await post('/api/session/interrupt',{sessionId:session});
+  await waitFor(()=>readFile(join(personal,'command-cancelled'),'utf8').then(value=>value===session,()=>false),'停止传递给原包业务信号');
+  const stopped = await waitFor(async () => (await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).value.canonicalTurns
+    ?.find(item=>item.turnId===waiting.turnId && item.status==='cancelled'),'取消的 canonical 终态');
+  reporter.check('停止命令取消真实业务调用，迟到返回不能覆盖已取消的 Turn', stopped.status==='cancelled');
+  await invoke({scope:'personal',sessionId:session});
+  reporter.check('取消后显式再次执行使用新调用并恢复真实文件结果', JSON.parse(await readFile(join(personal,'command-result.json'),'utf8')).id===session);
+  await rename(paths[1], paths[1]+'-removed');
+  const rejected = await api('/api/session/turn',{...scope,text:'',pluginCommandId:`plugin/${pluginId}/${command}`,requestId:'directory-missing',userMessageId:'directory-missing-user'});
+  const missing = rejected.status===200 ? await waitFor(async () => (await api(`/api/messages?scope=workspace&workspaceId=${scope.workspaceId}&sessionId=${projectSession}`)).value.canonicalTurns
+    ?.find(item=>item.turnId===rejected.value.turnId && ['failed','completed','cancelled','blocked'].includes(item.status)), '执行准备拒绝失效目录') : null;
+  reporter.check('项目源目录失效在业务开始前拒绝，不回落主要目录或个人目录', (missing ? missing.status==='failed'
+    && JSON.stringify(missing).includes('执行目录准备失败') : [400,409].includes(rejected.status))
+    && !await readFile(join(paths[0],'command-result.json')).then(()=>true,()=>false), JSON.stringify({httpStatus:rejected.status,turnStatus:missing?.status}));
+  await writeFile(join(output,'execution-context.json'), JSON.stringify({personal:saved,project,cancelledTurn:waiting.turnId,
+    missingDirectory:{httpStatus:rejected.status,turnId:missing?.turnId,status:missing?.status}},null,2));
+}
+
 try {
   reporter.check('验收端口未被已有实例使用',
     !await fetch(`${origin}/health`).then(() => true, () => false)
@@ -672,7 +751,7 @@ try {
   const plugin = await installed();
   const session = (await post('/api/session/materialize', { scope: 'personal' })).sessionId;
   await verifySessionDirectory(session);
-  const command = plugin.manifest.contributions.commands[0].id;
+  const command = plugin.manifest.contributions.commands.find(command=>command.title==='report').id;
   const source = plugin.manifest.contributions.modelSources[0].id;
   const waitTurn = (id) => waitFor(async () => {
     const turns = (await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).value.canonicalTurns;
@@ -681,7 +760,14 @@ try {
   const cmd = await post('/api/session/turn', { scope: 'personal', sessionId: session, pluginCommandId: `plugin/${pluginId}/${command}`, text: '', requestId: 'runtime-command', userMessageId: 'runtime-command-user' });
   const cmdTurn = await waitTurn(cmd.turnId);
   reporter.check('配置重载后的命令沿 canonical Turn 返回新值', cmdTurn.status === 'completed' && JSON.stringify(cmdTurn).includes('DSH_REPORT:changed'), JSON.stringify(cmdTurn));
+  await verifyCommandExecution(session);
   await post('/api/settings/orchestrator/session/save', { scope: 'personal', sessionId: session, config: { sourceId: `plugin/${pluginId}/${source}`, model: 'fixture-model', reasoningEffort: null } });
+  const toolTurn = await post('/api/session/turn',{scope:'personal',sessionId:session,text:'DIRECTORY_TOOL_CHECK',requestId:'directory-tool',userMessageId:'directory-tool-user'});
+  const toolResult = await waitTurn(toolTurn.turnId);
+  const toolRequest = (await post(`/api/plugins/${pluginId}/routes`,{method:'GET',path:'/skill-request'})).body;
+  await writeFile(join(output,'tool-execution-request.json'),JSON.stringify(toolRequest,null,2));
+  reporter.check('模型调用的原包工具读取同一真实会话目录和文件，并沿原生账本结算', toolResult.status==='completed'
+    && JSON.stringify(toolResult).includes('TOOL_DIRECTORY:') && JSON.stringify(toolResult).includes('PERSONAL'), JSON.stringify(toolResult));
   const skillEntries = (await activeSkills());
   const runtimeSkill = skillEntries.find(skill => skill.pluginId === pluginId && skill.title === 'runtime-inspection');
   reporter.check('配置替换后的技能进入 daemon 统一目录且正文保持当前配置', runtimeSkill

@@ -283,9 +283,10 @@ export default async function activate(api) {
 | `ctx.invocationId` | 本次调用的身份 |
 | `ctx.owner` | daemon 填入的归属：`sessionId`，以及 `taskId` / `turnId` / `workerId`（视调用类型而定） |
 | `ctx.binding` | 例如 `workspaceId` |
+| `ctx.execution` | 工具与命令的实际执行上下文：`workingDirectory`、`sourceFolders:[{sourceFolderId,workingDirectory}]`、`accessProfile`。目录来自 daemon 已准备的执行资源；项目只列本次获授的实际执行根，隔离前的源路径不会进入此投影；个人会话使用自有目录，sourceFolders 为空。无目录的调用为 null，不猜宿主 cwd |
 | `ctx.job` | 仅作业触发的命令有：`jobId`、`scheduleId`、`budget` |
 
-`owner`、`binding`、`job` 由 daemon 注入，扩展不能伪造。
+`owner`、`binding`、`execution`、`job` 由 daemon 注入，扩展不能伪造。命令在调用插件前沿原生执行资源入口完成目录验证、隔离与 Git／账本准备；目录缺失或授权失效会拒绝执行，修复后由用户重新发起。目录上下文用于定位本次业务，不是 OS 沙箱；完全信任插件的直接 OS 行为仍以当前用户权限运行。
 
 ### 运行期贡献与回收
 

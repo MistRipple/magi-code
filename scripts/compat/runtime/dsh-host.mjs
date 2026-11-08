@@ -20,6 +20,7 @@ import { createRegisteredSettings } from './registered-settings.mjs';
 import { installRegistryFetch } from './registry-fetch.mjs';
 import { createPluginDirectory } from './plugin-directory.mjs';
 import { profilePackageManager } from './profile-process-host.mjs';
+import { withInvocation, invocationAgent } from './invocation.mjs';
 
 const clone = (value) => structuredClone(value ?? {});
 const timeoutOf = (value) => value == null ? undefined : Math.min(600_000, Math.max(1_000, Number(value) || 1_000));
@@ -97,9 +98,6 @@ export async function activateDsh(api, module, options) {
     if (catalog.live && child.state === 3) void child.await().catch(reportFailure);
   });
 
-  const registration = (owner, kind, definition, handler) => owner.effect(() => catalog.register(kind, definition, () =>
-    kind === 'tools' ? api.tool(definition.id, (...args) => withProfile(() => handler(...args), args[1]?.signal)) : api.command(definition.id, (...args) => withProfile(() => handler(...args), args[1]?.signal))));
-
   await ctx.plugin(class extends Service {
     constructor(c) { super(c, 'tools'); }
     register(definition, registrationOptions = {}) {
@@ -111,15 +109,16 @@ export async function activateDsh(api, module, options) {
       if (definition.timeoutMs !== undefined) contribution.timeoutMs = timeoutOf(definition.timeoutMs);
       return this.ctx.effect(() => {
         tools.set(definition.name, definition);
-        const release = catalog.register('tools', contribution, () => api.tool(id, (input, execContext) => withProfile(async () => {
+        const release = catalog.register('tools', contribution, () => api.tool(id, (input, execContext) => withInvocation(execContext, () => withProfile(async () => {
           const pipeline = new ToolExecutionPipeline(ctx, { get: (name) => tools.get(name) });
-          const prepared = await pipeline.prepare({ callId: execContext.invocationId, name: definition.name, arguments: input, signal: execContext.signal });
+          const agent = invocationAgent();
+          const prepared = await pipeline.prepare({ callId: execContext.invocationId, name: definition.name, arguments: input, signal: execContext.signal, ...(agent ? { agent } : {}) });
           const outcome = prepared.kind === 'dispatch' ? await pipeline.dispatch(prepared.exec) : prepared;
           const result = await pipeline.complete(prepared.exec, outcome);
           if (result.additionalContexts?.length || result.concludeTurn) throw new Error('此工具要求追加会话上下文或结束 Turn，当前公开合同尚未承载');
           if (result.isError) throw new Error(result.content?.filter((part) => part.type === 'text').map((part) => part.text).join('\n') || 'DSH 工具执行失败');
           return result;
-        }, execContext.signal)));
+        }, execContext.signal))));
         this.ctx.emit('tools/change');
         return async () => { if (tools.get(definition.name) === definition) tools.delete(definition.name); await release(); this.ctx.emit('tools/change'); };
       });
@@ -142,14 +141,16 @@ export async function activateDsh(api, module, options) {
     constructor(c) { super(c, 'commands'); }
     register(definition) {
       const id = runtimeId('cmd', definition.name);
-      return registration(this.ctx, 'commands', { id, title: definition.name, description: definition.description ?? '' }, async (input, execContext) => {
+      const handler = async (input, execContext) => {
         const result = await definition.handler({ commandId: execContext.invocationId, rawInput: typeof input?.text === 'string' ? input.text : '', attachments: [], signal: execContext.signal,
-          get agent() { throw new Error('该命令依赖 DSH Agent；会话操作尚未映射到 Magi 公开接口'); },
+          get agent() { return invocationAgent(); },
         });
         if (result?.kind === 'error') throw new Error(result.text);
         if (typeof result?.text !== 'string') throw new Error('DSH 命令必须返回带 text 的结果');
         return { content: result.text };
-      });
+      };
+      return this.ctx.effect(() => catalog.register('commands', { id, title: definition.name, description: definition.description ?? '' }, () =>
+        api.command(id, (input, context) => withInvocation(context, () => withProfile(() => handler(input, context), context.signal)))));
     }
   });
 

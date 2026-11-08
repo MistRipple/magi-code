@@ -3169,6 +3169,7 @@ impl LlmTaskDispatcher {
             persist_session_state: self.session_state_persist_callback.as_deref(),
             live_settings_store: self.settings_store.clone(),
             plugin_command_executor: self.plugin_command_executor.clone(),
+            workspace_execution_preparer: self.workspace_execution_preparer.as_deref(),
             extension_hooks: self.extension_hooks.as_deref(),
         })
     }

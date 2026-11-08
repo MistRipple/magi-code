@@ -10274,6 +10274,7 @@ mod tests {
             system_prompt: None,
             workspace_root_path: Some(workspace_dir),
             workspace_resources: Some(crate::workspace_execution::WorkspaceExecutionResources {
+                personal_root: None,
                 directories: Some(directories),
                 snapshots: vec![],
             }),

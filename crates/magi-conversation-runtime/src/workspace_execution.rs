@@ -12,6 +12,8 @@ pub enum WorkspacePreparationMode {
 #[derive(Clone, Default)]
 pub struct WorkspaceExecutionResources {
     pub directories: Option<ProjectDirectoryExecutionMap>,
+    /// 个人会话的自有执行根，由同一 daemon 准备入口派生；不属于项目或 Git。
+    pub personal_root: Option<PathBuf>,
     pub snapshots: Vec<Arc<SnapshotSession>>,
 }
 
@@ -33,6 +35,7 @@ impl WorkspaceExecutionResources {
     pub fn from_snapshot(snapshot: Arc<SnapshotSession>) -> Self {
         Self {
             directories: None,
+            personal_root: None,
             snapshots: vec![snapshot],
         }
     }
@@ -44,6 +47,9 @@ impl WorkspaceExecutionResources {
                 .and_then(|root| root.execution_root())
                 .map(Some)
                 .map_err(|error| error.to_string());
+        }
+        if let Some(root) = &self.personal_root {
+            return Ok(Some(root.clone()));
         }
         match self.snapshots.as_slice() {
             [] => Ok(None),

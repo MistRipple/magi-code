@@ -1,7 +1,7 @@
 // 在线安装真实 npm 原包并调用本机 WorkBuddy 登录态；会产生真实模型请求，按需显式运行。
 // 独立 Magi / DSH 状态根，不导出凭据，不修改用户已有 Magi 会话。
 import assert from 'node:assert/strict';
-import { cp, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, writeFile, readFile, realpath } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,10 +18,11 @@ await mkdir(output, { recursive: true });
 await mkdir(join(work, 'dsh'), { mode: 0o700 });
 // 沿用该用户的设备身份；账号仍由未经修改的原包从 WorkBuddy 桌面登录目录发现。
 await cp(join(homedir(), '.dsh/.workbuddy-device.json'), join(work, 'dsh/.workbuddy-device.json')).catch((error) => { if (error.code !== 'ENOENT') throw error; });
-const api = async (path, body) => {
-  const response = await fetch(origin + path, { method: body === undefined ? 'GET' : 'POST', headers: { origin, 'content-type': 'application/json' },
+const api = async (path, body, method = body === undefined ? 'GET' : 'POST') => {
+  const response = await fetch(origin + path, { method, headers: { origin, 'content-type': 'application/json' },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(180_000) });
-  const value = await response.json();
+  const raw = await response.text();
+  const value = raw ? JSON.parse(raw) : null;
   assert.equal(response.status, 200, `${path}: ${JSON.stringify(value)}`);
   return value;
 };
@@ -36,6 +37,37 @@ const tab = async (id) => {
     return page.evaluate(`document.querySelector(${JSON.stringify(selector)})?.getAttribute('aria-current') === 'page'`);
   }, `设置分类 ${id}`);
 };
+async function verifyCliCommand() {
+  const binary = process.env.MAGI_WORKBUDDY_CLI_BINARY;
+  if (!binary) return;
+  const settings = await api(`/api/plugins/${pluginId}/settings`);
+  // 用户可选择的“仅返回命令结果”流程；自动回注另需原生会话消息入口，不能混算通过。
+  await api(`/api/plugins/${pluginId}/settings`, { expectedVersion: settings.version, value: {
+    ...settings.value, cliBridge: { ...settings.value?.cliBridge, enabled: true, binary,
+      permissionMode: 'dontAsk', injectResult: false, timeoutSecs: 90,
+      ...(process.env.MAGI_WORKBUDDY_CLI_MODEL ? {model:process.env.MAGI_WORKBUDDY_CLI_MODEL} : {}),
+    },
+  } }, 'PUT');
+  const command = await waitFor(async () => (await installed())?.manifest.contributions.commands.find(command=>command.title==='codebuddy'), '在线原包的 CodeBuddy 命令');
+  const directory = join(work, 'cli-project'); await mkdir(directory);
+  // CLI 拥有自己的工具权限；这里只授权验收文件的读取。
+  await mkdir(join(directory,'.codebuddy'));
+  await writeFile(join(directory,'.codebuddy/settings.local.json'),JSON.stringify({permissions:{allow:['Read(./verification.txt)'],deny:['Edit','Write','Bash']}}));
+  const marker = 'MAGI_COMMAND_FILE_'+Date.now().toString(36);
+  await writeFile(join(directory, 'verification.txt'), marker);
+  const {workspace} = await api('/api/workspaces/create',{name:'CodeBuddy command acceptance',sourceFolders:[{path:directory}]});
+  const session = (await api('/api/session/materialize',{scope:'workspace',workspaceId:workspace.workspaceId})).sessionId;
+  const turn = await api('/api/session/turn',{scope:'workspace',workspaceId:workspace.workspaceId,sessionId:session,
+    pluginCommandId:`plugin/${pluginId}/${command.id}`,text:'Read verification.txt in the current directory and reply with only its full contents. Do not modify any file.',
+    requestId:'workbuddy-cli-live',userMessageId:'workbuddy-cli-live-user'});
+  const result = await waitFor(async () => (await api(`/api/messages?scope=workspace&workspaceId=${workspace.workspaceId}&sessionId=${session}`)).canonicalTurns
+    ?.find(item=>item.turnId===turn.turnId && ['completed','failed','cancelled','blocked'].includes(item.status)), '真实 CodeBuddy CLI 读项目文件',120_000);
+  const text = result.items.filter(item=>item.kind==='assistant_text').map(item=>item.content??'').join('\n');
+  await writeFile(join(output,'codebuddy-command.json'),JSON.stringify({version:(await installed()).manifest.version,binary,sessionId:session,turnId:turn.turnId,status:result.status,text,injectResult:false},null,2));
+  report.check('原包 /codebuddy 在真实会话目录调用实际 CLI 并读取文件结果', result.status==='completed'
+    && text.includes(marker) && text.includes(await realpath(directory)), JSON.stringify({status:result.status,text}));
+  report.check('CodeBuddy 命令保持只读业务结果与原有文件', await readFile(join(directory,'verification.txt'),'utf8')===marker);
+}
 try {
   report.check('独立验收端口空闲', !await fetch(origin + '/health').then(() => true, () => false)
     && !await fetch(`http://127.0.0.1:${cdpPort}/json/version`).then(() => true, () => false));
@@ -113,6 +145,7 @@ try {
   await waitFor(() => page.evaluate('Boolean(document.querySelector("[data-action=activate]")) && !document.querySelector("[data-action=activate]").disabled'), '再次激活'); await ui.click('[data-action=activate]');
   await waitFor(async () => (await installed()).runtime?.state === 'running', '重新激活', 90_000);
   report.check('重新激活真实原包成功', true);
+  await verifyCliCommand();
   report.check('主窗口与上游设置无未捕获异常', errors.length === 0 && !/Uncaught|可信 Renderer 控制台错误/.test(app.log.join('')), errors.join('\n'));
   await writeFile(join(output, 'installed.json'), JSON.stringify({ pluginId, version: plugin.manifest.version, source: plugin.source, model: selected.id, sessionId: session, turnId: turn.turnId, stateRoot: join(work, 'state') }, null, 2));
   console.log(report.summary());

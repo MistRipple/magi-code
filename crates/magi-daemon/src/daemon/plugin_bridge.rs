@@ -193,6 +193,15 @@ impl magi_conversation_runtime::plugin_command::PluginCommandExecutor for NodeCo
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<magi_conversation_runtime::plugin_command::PluginCommandResult, String> {
         use magi_conversation_runtime::plugin_command::PluginCommandResult;
+        if cancelled.load(Ordering::SeqCst) {
+            return Err("调用已取消，命令未执行".into());
+        }
+        let session_id = invocation
+            .context
+            .session_id
+            .as_ref()
+            .ok_or("插件命令缺少所属会话")?;
+        let execution = execution_context(&invocation.context)?;
         let selected = magi_plugin_system::ContributionRef::parse("命令", &invocation.command_id)?;
         // 与目录同一判定：命令必须来自当前激活的插件。
         let digest = {
@@ -226,8 +235,9 @@ impl magi_conversation_runtime::plugin_command::PluginCommandExecutor for NodeCo
         let ctx = json!({
             "job": invocation.job,
             "invocationId": format!("cmd_{}", NEXT_PLUGIN_INVOCATION.fetch_add(1, Ordering::Relaxed)),
-            "owner": {"sessionId": invocation.session_id, "turnId": invocation.turn_id},
-            "binding": {"workspaceId": invocation.workspace_id},
+            "owner": {"sessionId": session_id, "turnId": invocation.turn_id},
+            "binding": {"workspaceId": invocation.context.workspace_id},
+            "execution": execution,
         });
         let wait_cancelled = async {
             while !cancelled.load(std::sync::atomic::Ordering::SeqCst) {
@@ -239,6 +249,9 @@ impl magi_conversation_runtime::plugin_command::PluginCommandExecutor for NodeCo
             .as_ref()
             .map(|job| Duration::from_millis(job.budget.timeout_ms as u64))
             .unwrap_or(COMMAND_TIMEOUT);
+        if cancelled.load(Ordering::SeqCst) {
+            return Err("调用已取消，命令未执行".into());
+        }
         let value = self
             .handle
             .block_on(instance.invoke_command(
@@ -401,6 +414,117 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// 单次插件工具调用的上限；超时后宿主收到取消信号。
 const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// 工具与命令共用的调用期执行事实。只暴露实际执行根，绝不暴露隔离前的源路径。
+fn execution_context(context: &ToolExecutionContext) -> Result<serde_json::Value, String> {
+    // 复核全部目录是否仍存在且身份未变；保留调用入口已选择的工具目录。
+    context
+        .for_tool_arguments("{}")
+        .map_err(|error| error.to_string())?;
+    let directory = |path: &Path| -> Result<String, String> {
+        if !path.is_absolute()
+            || !path.is_dir()
+            || std::fs::canonicalize(path).map_err(|error| error.to_string())? != path
+        {
+            return Err("本次执行目录不可用或身份已变化".into());
+        }
+        path.to_str()
+            .map(str::to_owned)
+            .ok_or("插件执行目录必须可用 UTF-8 表达".into())
+    };
+    let working_directory = context
+        .working_directory
+        .as_deref()
+        .map(directory)
+        .transpose()?;
+    let mut folders = Vec::new();
+    if let Some(map) = &context.project_directory_map {
+        for root in &map.roots {
+            folders.push(json!({
+                "sourceFolderId": root.source_folder_id,
+                "workingDirectory": directory(&root.execution_root().map_err(|error| error.to_string())?)?,
+            }));
+        }
+        if !folders
+            .iter()
+            .any(|folder| folder["workingDirectory"].as_str() == working_directory.as_deref())
+        {
+            return Err("插件执行目录不属于本次获授的项目目录".into());
+        }
+    } else if context.workspace_id.is_some() {
+        return Err("插件项目调用缺少可信执行目录映射".into());
+    }
+    Ok(json!({
+        "workingDirectory": working_directory,
+        "sourceFolders": folders,
+        "accessProfile": context.access_profile,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magi_core::{
+        HostPath, ProjectDirectoryExecutionMap, ProjectDirectoryExecutionRoot, WorkspaceId,
+    };
+
+    #[test]
+    fn execution_projection_preserves_selected_copy_and_rejects_missing_or_forged_roots() {
+        let work = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(work.path()).unwrap();
+        let directories: Vec<_> = ["source-a", "source-b", "copy-a", "copy-b"]
+            .into_iter()
+            .map(|name| {
+                let path = root.join(name);
+                std::fs::create_dir(&path).unwrap();
+                path
+            })
+            .collect();
+        let path_ref = |path: &Path| {
+            HostPath::from_path(path.to_path_buf())
+                .to_path_ref()
+                .as_str()
+                .to_owned()
+        };
+        let context = ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("project")),
+            working_directory: Some(directories[3].clone()),
+            project_directory_map: Some(ProjectDirectoryExecutionMap {
+                workspace_id: WorkspaceId::new("project"),
+                default_source_folder_id: "a".into(),
+                roots: (0..2)
+                    .map(|i| ProjectDirectoryExecutionRoot {
+                        source_folder_id: ["a", "b"][i].into(),
+                        source_root_ref: path_ref(&directories[i]),
+                        execution_root_ref: path_ref(&directories[i + 2]),
+                    })
+                    .collect(),
+            }),
+            ..Default::default()
+        };
+        let projection = execution_context(&context).unwrap();
+        assert_eq!(
+            projection["workingDirectory"],
+            directories[3].to_str().unwrap()
+        );
+        assert_eq!(
+            projection["sourceFolders"][0]["workingDirectory"],
+            directories[2].to_str().unwrap()
+        );
+        assert!(!projection.to_string().contains("source-a"));
+        assert!(!projection.to_string().contains("source-b"));
+        let mut forged = context.clone();
+        forged.working_directory = Some(directories[1].clone());
+        assert!(execution_context(&forged).unwrap_err().contains("不属于"));
+        forged.project_directory_map = None;
+        assert!(execution_context(&forged).unwrap_err().contains("缺少"));
+        std::fs::remove_dir(&directories[2]).unwrap();
+        assert!(
+            execution_context(&context).is_err(),
+            "副本失效不能回落原目录"
+        );
+    }
+}
+
 pub(super) fn execute_tool(
     manager: &Mutex<PluginManager>,
     bus: &magi_extension_host::bus::ExtensionBus,
@@ -451,6 +575,10 @@ pub(super) fn execute_tool(
     if instance.digest != prepared.digest {
         return failure(Failed, "plugin_host_stale", "扩展宿主不是当前授权的版本");
     }
+    let execution = match execution_context(context) {
+        Ok(execution) => execution,
+        Err(error) => return failure(Rejected, "plugin_execution_context_invalid", &error),
+    };
     let invocation_id = format!(
         "tool_{}",
         NEXT_PLUGIN_INVOCATION.fetch_add(1, Ordering::Relaxed)
@@ -463,6 +591,7 @@ pub(super) fn execute_tool(
             "workerId": context.worker_id.as_ref().map(ToString::to_string),
         },
         "binding": {"workspaceId": context.workspace_id.as_ref().map(ToString::to_string)},
+        "execution": execution,
     });
     // 开始前已取消则不启动调用；运行中由标志轮询转成宿主取消。
     if cancelled.load(std::sync::atomic::Ordering::SeqCst) {

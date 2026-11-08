@@ -65,6 +65,52 @@ function host(value = {}) {
 
 const options = { runtimeVersion: 2, plugin: 'fixture' };
 
+test('命令与工具读取同一 daemon 调用的会话身份和执行目录，并发、配置替换与取消不串用投影', async (t) => {
+  const h = host({ label: 'first' });
+  let retained, crossCall;
+  const running = await activateDsh(h.api, { inject: ['commands', 'tools'], apply(ctx, config) {
+    const read = async (agent, signal) => {
+      const session = agent.session, header = session.header;
+      assert.throws(() => agent.inject({}), /尚未接入/);
+      assert.throws(() => session.append('message', {}), /尚未接入/);
+      assert.throws(() => { header.cwd = '/forged'; }, TypeError);
+      if (crossCall) assert.throws(() => crossCall.id, /失效|不属于/);
+      await delay(5, undefined, { signal });
+      retained = { agent, session, header };
+      return `${config.label}:${agent.id}:${session.id}:${header.cwd}`;
+    };
+    ctx.commands.register({ name: 'directory', handler: async invocation => ({ kind: 'success', text: await read(invocation.agent, invocation.signal) }) });
+    ctx.tools.register(tool('directory', async (_args, exec) => read(exec.agent, exec.signal)));
+  } }, options);
+  t.after(() => running.dispose());
+  const context = (id) => ({ ...execution(), owner: { sessionId: id }, execution: { workingDirectory: `/execution/${id}`, sourceFolders: [], accessProfile: 'restricted' } });
+  const command = (id) => h.state.commands.get(runtimeId('cmd', 'directory'))({}, context(id));
+  const [a, b] = await Promise.all([command('one'), command('two')]);
+  assert.equal(a.content, 'first:one:one:/execution/one');
+  assert.equal(b.content, 'first:two:two:/execution/two');
+  for (const object of Object.values(retained)) assert.throws(() => object.id, /失效/);
+  crossCall = retained.agent;
+  const value = await h.state.tools.get(runtimeId('tool', 'directory'))({}, context('three'));
+  assert.equal(value.content[0].text, 'first:three:three:/execution/three');
+  await h.configure({ label: 'second' });
+  assert.equal((await command('four')).content, 'second:four:four:/execution/four');
+  const controller = new AbortController();
+  const pending = h.state.commands.get(runtimeId('cmd', 'directory'))({}, { ...context('cancelled'), signal: controller.signal });
+  controller.abort();
+  await assert.rejects(pending, /abort/i);
+  await assert.rejects(h.state.commands.get(runtimeId('cmd', 'directory'))({}, { ...context('cancelled-before-start'), signal: controller.signal }), /abort/i);
+  assert.equal((await command('five')).content, 'second:five:five:/execution/five');
+});
+
+test('会话业务缺少 daemon 执行上下文时明确失败，不猜进程 cwd 或创建上游会话', async (t) => {
+  const h = host();
+  const running = await activateDsh(h.api, { inject: ['commands'], apply(ctx) {
+    ctx.commands.register({ name: 'directory', handler: invocation => ({ kind: 'success', text: invocation.agent.session.header.cwd }) });
+  } }, options);
+  t.after(() => running.dispose());
+  await assert.rejects(h.state.commands.get(runtimeId('cmd', 'directory'))({}, { ...execution(), owner: { sessionId: 's' } }), /未提供有效/);
+});
+
 test('技能沿真实 Cordis effect 进入同一动态目录，配置替换与停用撤销旧正文', async () => {
   const h = host();
   const Config = Schema.object({ label: Schema.string().default('first'), enabled: Schema.boolean().default(true) });

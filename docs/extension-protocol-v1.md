@@ -61,6 +61,8 @@ daemon 响应形状：
 
 工具／命令请求形状为 `{tool|command,input,ctx}`，钩子请求为 `{hook,input,ctx}`。`ctx` 包含 daemon 签发的 `invocationId`、`generation`、相对 `deadlineMs` 及可用的 `owner`／`binding`；钩子另带 `hookId`、`parentInvocationId`、`depth`。当前不传绝对 `deadline`，也不保证每个场景拥有同一组 owner 字段。
 
+工具与命令另带 `execution:{workingDirectory,sourceFolders,accessProfile}`：workingDirectory 是本次实际执行根的本机绝对路径字符串，缺失为 null；sourceFolders 是获授项目源目录的 `{sourceFolderId,workingDirectory}` 列表，只传实际执行根，个人会话为空。工具保留本次所选 source_folder_id；命令保留 Turn 接纳的默认源目录。daemon 在调用前核对完整目录映射及物理身份；命令与原生工具共用资源准备入口，不能在副本丢失后回落源目录、个人目录或宿主 cwd。此上下文不向页面路由或普通钩子推断补齐，不授予新的 OS 权限。
+
 - 工具／命令调用使用插件＋代次＋递增序号形成独立身份；相同 caller 身份的并发调用可独立取消。
 - `owner` 描述实际 Session／Turn／Task／worker；命令没有 Task，不能伪造 Task 以调用需要 Task 的原生服务。
 - 作业增加 `ctx.job={jobId,scheduleId,budget}`，仍拥有 canonical Turn。预算由 daemon 签发。

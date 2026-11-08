@@ -448,12 +448,13 @@
 | 查看健康与运行状态 | 目录订阅只发失效通知，消费者重读 daemon；原包元数据来自不可变归档，生命周期和失败原因来自真实监管状态；观察其他插件失败不处置观察者自身 | Health／Mgr 原包及 `test:electron-dsh-profile`；证据 `target/plugin-acceptance/profile-reload-final/` |
 | 管理版本豁免 | daemon 资源 CAS 保存精确包版本与 runtimeId，独立 compatibility 授权及风险确认；豁免不跳过能力、摘要或权限准入，撤销后旧确认不可继续提交 | `test:electron-dsh-compatibility`，Ops 原包扫描、豁免、在线安装、卸载和重启恢复；证据 `target/plugin-acceptance/dsh-compatibility/` |
 | 使用原包页面 | 设置、主页面和右栏共用隔离页面宿主；后台就绪后挂载，摘要或代次变化释放旧文档与桥，其他插件变化保留当前文档；页面、资源、SVG 和外链保持上游表达 | `test:electron-dsh-rea`、`test:electron-plugin-runtime`；REA 原页面 Ghidra 链接、设置 CAS、207 个 MCP 工具和 390px 视口 |
+| 在会话目录执行业务 | 命令与工具共用 daemon 的实际执行上下文；命令先完成原生资源准备，再调用原包。DSH 仅将本次会话身份与执行根投影为业务读取所需的 `agent.id`、`agent.session.id/header.cwd`；不创建上游内核对象、历史或写入路径，其他成员明确拒绝。投影在调用结束／取消后失效，并发调用相互隔离 | 定向运行时回归覆盖并发、配置替换、取消及跨调用拒绝；Rust 覆盖隔离路径、源目录不可回落及真实 Node 命令上下文。桌面与真实原包业务的本轮结果见第 12 节 |
 | 持续接收页面业务 | 共享 EventSource 保留命名事件、UTF-8／CRLF、重连和取消；`contributions.client` 另需 persistent 授权，每窗口每个激活插件一个隔离文档，视图切换复用 | `test:electron-plugin-runtime`；多右栏页签、SSE、页面关闭／重开及停用回收 |
 | 取消页面请求 | 原页面 fetch 的 `init.signal` 与 `Request.signal` 沿同一视图桥取消对应后台路由；并发请求保持独立，文档回收结束等待，迟到回执和响应写入不再生效。取消不撤销已提交业务 | 定向合同覆盖 Request 输入、取消、正常完成、监听释放及 HEAD；真实目录包验证两种取消和其他并发调用的实际结果，完整复跑结果见第 12 节 |
 | 截图与附件 | 后台图片存储有独立实例授权、分块传输和持久元数据；输入端口等待真实草稿回执，原同步业务调用仅在可证明的 AST 路径上改为等待；图片发送仍由用户决定 | `test:electron-appshot`：0.4.2 原包真实 macOS 截图、关闭设置页后投递、重启后载荷恢复；证据 `target/plugin-acceptance/appshot/`。曾有解码／挂载超时，复跑通过，长期时序稳定性仍待定位 |
 | 读取会话目录 | 独立 `sessionRead:["directory"]` 权限，只读 daemon 用户会话元数据与稳定分页；不包含消息、凭据或完整可写 Session，不按上游对象形状伪造事实 | `test:electron-plugin-runtime`、`test:electron-appshot` |
 | 发现与调用技能 | 全局文本注册进入已有运行目录，输入框 `/` 与模型 `skill_apply` 共用该事实；原文调用、配置替换、停用撤销和应用重启归原生生命周期；消息保存接纳时名称 | `test:compat`、`test:electron-plugin-runtime`，Debugging 0.7.2 原包技能；其他调用策略、资源根、provider 和 agent 作用域仍未接入 |
-| 使用 WorkBuddy 模型 | 原包适配器通过本机带随机 Bearer 的桥进入原生模型目录；流、用量和取消沿真实上游运行时与 Magi 账本 | `test:electron-workbuddy`：5.20.2 原包、国内版现有登录态、真实 hy3 回复及停用／重新激活，证据 `target/plugin-acceptance/workbuddy/`；未覆盖国际版、视频及 codebuddy 全流程 |
+| 使用 WorkBuddy 模型与本机 CLI | 原包适配器通过本机带随机 Bearer 的桥进入原生模型目录；流、用量和取消沿真实上游运行时与 Magi 账本。`/codebuddy` 从本次执行上下文读取目录并调用实际 CLI，用户可选择仅返回结果 | `test:electron-workbuddy`：5.20.32 原包、国内版现有登录态、真实 hy3 回复及停用／重新激活；CodeBuddy 2.181.0 实际读取指定项目文件，保持 dontAsk 且只授权该文件 Read，13/13。证据 `target/plugin-acceptance/workbuddy/`；CLI 安装在独立临时目录，不代表 Magi 已提供外部程序安装管理；未覆盖国际版、视频与自动回注 |
 
 上述为分项证据，不能把不同批次的通过项拼成一次全部通过。固定社区样本为 Health 3.0.5、Ops 0.20.8、Upgrader 1.8.0、Debugging 0.7.2、Appshot 0.4.2、Share 0.2.5、Mgr 0.2.12、Release Probe 0.0.8 与 Market 1.2.2；WorkBuddy 与 REA 单列。筛选样本不能缩小完整门槛的分母，未验证业务保持 `unverified`。
 
@@ -462,7 +463,7 @@
 - 完整业务覆盖率仍未达到可证明的 95%／100%。逐插件补齐成功结果、取消、配置持久化、在线更新、失败恢复与停用／重启验收；安装、进程 running、页面有内容和路由 smoke 各自只证明对应阶段。
 - Mgr 0.2.12 原页面点击更新不能显示确认框：宿主漏掉间接取用的公共组件库已修正；`profile-sdk-final/ui-modules.json` 确认官方 Modal 为函数、Button 为 React forwardRef 对象，原包仍按 `typeof Button === "function"` 判断而跳过确认。后台更新路由通过不能作为此页面流程通过；保留原页面与官方组件，不增加按包名改写或组件伪装。初始失败证据在 `target/plugin-acceptance/profile-product-before/` 与 `profile-product-confirm/`，补齐 SDK 后的失败在 `profile-sdk-final/`。这项仍须解决，不能计为完整支持。
 - Market／Share 的 Git 来源、上游主动移除式替换及安装提交各阶段的崩溃恢复仍未完成。安装任务回执只在当前 daemon 进程内短期保留，不能宣称崩溃后重放或跨重启 exactly-once。
-- `/codebuddy` 所需的已授权工作目录上下文、Debugging 的诊断／重启业务、Health 的完整修复流程，以及未列为实测通过的其他原包分支仍待验证。技能可用不等于插件全部诊断业务可用。
+- `/codebuddy` 的工作目录现沿本次原生执行资源传递；命令结果自动回注仍缺正式会话消息服务，不能伪造 `Agent.inject/steer` 或宣称完整 Agent 支持。Debugging 的诊断／重启业务、Health 的完整修复流程，以及未列为实测通过的其他原包分支仍待验证。技能可用不等于插件全部诊断业务可用。
 - 会话消息、session/event、sessionProjections、完整 Agent 对象、provider 技能与作用域等仍按实际能力门槛处理。原生能力暂未暴露属于产品待开发项，不能直接定为永久不支持；不得返回假对象或空结果冒充完成。
 - Windows、干净系统正式安装包、Android／iOS 真机触摸、屏幕录制权限引导和长期负载仍需各自验收。390px Electron 视口模拟不代表手机真机通过。
 - pi 尚无运行器；只允许浏览搜索结果，不创建空适配器或兼容声明。官方签名、公钥托管及目录内容由发布者提供，不把本地开发密钥当官方信任根。
@@ -473,24 +474,24 @@
 
 | 最近核对范围 | 入口 | 结果与边界 |
 | --- | --- | --- |
-| 当前代码 | `npm run test:compat` | 98 项通过，含真实 Cordis effect、动态技能、配置替换、依赖解析、辅助进程委托、公共页面 SDK、请求取消与媒体合同；只证明各测试覆盖的行为 |
-| 本轮 Rust 定向回归 | `magi-api` | 大包预览／安装／升级及超限拒绝 1 项、SSE／App Server 外观事件投递 2 项通过；`cargo check -p magi-api` 通过 |
-| 本轮基础检查 | Web、Desktop、发行边界 | Web check 0 错误 0 警告，Desktop check、macOS 目录包构建及解包自检通过；修改 Rust 文件格式通过。没有本轮协议 schema 变更，不把既有协议检查算作本轮复跑 |
+| 当前代码 | `npm run test:compat` | 100 项通过，新增命令／工具的执行投影、并发隔离、配置替换、取消与失效引用；保留真实 Cordis effect、动态技能、依赖解析、辅助进程委托、公共页面 SDK、请求取消与媒体合同；只证明各测试覆盖的行为 |
+| 本轮 Rust 定向回归 | `magi-daemon`、`magi-api` | 隔离执行根投影、真实 Node 命令与开始前／运行中取消、真实 Node 工具授权与执行、冻结项目目录接纳／重载／主要目录变化各 1 项通过；daemon check 和 macOS 目录包构建通过。大包与外观事件的上一轮专项不计本轮复跑 |
+| 既有基础检查，不计本轮复跑 | Web、Desktop、发行边界 | 上一轮 Web check 0 错误 0 警告、Desktop check 通过。本轮重新完成 macOS 目录包构建、解包自检与修改 Rust 文件格式检查；没有 schema 变更，不把既有协议检查算作本轮复跑 |
 | 既有 Rust 业务专项，不计本轮复跑 | 运行目录、技能与宿主 | 运行目录 7、`skill_apply` 7、技能加载 7、SkillRuntime 20、消息名称接纳 1、宿主单元 15、真实 Node 集成 25 项通过 |
-| 当前目录包 | `test:electron-plugin-runtime` | macOS arm64 Electron 45、随包 daemon／Node，**83/83**；`target/plugin-acceptance/product-ui-final/results.json`。保留原技能、图片与生命周期断言，新增公共 SDK 交互、实际 SVG 图形、主按钮／遮罩、真实主题切换和两种 fetch 取消。桌面与 390px 对话框截图及阴影审计均保留，审计 `cut:0, hidden:0`；不代表手机真机或全部页面完成 |
+| 当前目录包 | `test:electron-plugin-runtime` | macOS arm64 Electron 45、随包 daemon／Node，**87/87**；`target/plugin-acceptance/execution-product-validated/results.json`。本轮新增个人／多目录命令实际文件读写、取消与显式重试、目录失效的 canonical 失败及模型调用插件工具读取真实文件。保留技能、图片、页面 SDK／SVG、主题、fetch 取消与生命周期断言；桌面与 390px 截图保留。上一轮额外注入阴影审计的 83/83 仍见 `product-ui-final/`，本轮未注入该可选审计，不合并数量；不代表手机真机或全部页面完成 |
 | 既有社区目录包批次，不计本轮复跑 | `test:electron-popular-dsh` | 固定 9 个社区原包：在线安装 9/9、启动 9/9、原生页面 9/9、路由 smoke 7/7、页面异常 0；在线更新验证 2 条、coreVerified 仍为 0、qualified 为 false，按完整门槛退出 1。结果在 `target/plugin-acceptance/skills-community-final/`，未完成项保留 unverified，不以安装率推导生态支持率 |
-| 既有专项，不计本轮复跑 | `test:electron-workbuddy` | 5.20.2 原包、11 项、真实国内版 hy3 回复；`target/plugin-acceptance/workbuddy/`。早期离线翻译包的生图／视频记录不作为当前安装链路的验证 |
-| 本轮页面 SDK 专项目录包 | `test:electron-dsh-rea` | 1.2.0 原包与 rea-agents 6.5.0、16/16：SVG、原页面 Ghidra 链接、真实 207 工具、CAS、停用与恢复；`target/plugin-acceptance/product-ui-rea/`。此包早于最后的外观事件分类修正，未验证 Ghidra 实际安装或二进制分析 |
-| 本轮失败，明确不计通过 | `test:electron-dsh-profile` | 原包搜索、布局恢复、启停和运行错误恢复通过，更新确认仍超时；`target/plugin-acceptance/profile-sdk-final/ui-modules.json` 确认组件库已加载。见第 11.2 节的原包组件判断问题 |
+| 本轮真实原包与外部服务 | `MAGI_WORKBUDDY_CLI_BINARY=<CLI绝对路径> npm run test:electron-workbuddy` | 5.20.32 在线原包、CodeBuddy CLI 2.181.0，13/13；真实国内版 hy3 回复与 CLI 指定文件读回。`target/plugin-acceptance/workbuddy/results.json`、`codebuddy-command.json`；命令设置 injectResult=false，不能推导自动回注已实现。不传 CLI 路径仅运行原有模型专项。首次 CLI 缺 Read 授权的失败保留于 `target/plugin-workbuddy-execution-final.log`，沿 CLI 正式权限设置仅授权验收文件后成功 |
+| 既有页面 SDK 专项，不计本轮复跑 | `test:electron-dsh-rea` | 1.2.0 原包与 rea-agents 6.5.0、16/16：SVG、原页面 Ghidra 链接、真实 207 工具、CAS、停用与恢复；`target/plugin-acceptance/product-ui-rea/`。此包早于最后的外观事件分类修正，未验证 Ghidra 实际安装或二进制分析 |
+| 既有未解决失败，不计通过 | `test:electron-dsh-profile` | 原包搜索、布局恢复、启停和运行错误恢复通过，更新确认仍超时；`target/plugin-acceptance/profile-sdk-final/ui-modules.json` 确认组件库已加载。见第 11.2 节的原包组件判断问题 |
 | 既有专项，不计本轮复跑 | `test:electron-dsh-management`、`test:electron-dsh-compatibility` | 第 11 节所列原包管理、版本豁免、真实运行状态与失败恢复证据；不能合并不同批次成为全部业务通过 |
 | 既有专项，不计本轮复跑 | `test:electron-appshot` | 0.4.2 原包、13 项，真实 macOS 原生截图、后台附件、草稿挂载及重启恢复；`target/plugin-acceptance/appshot/`，不代表其他平台或所有时序分支 |
 | 既有本地纵向套件，不计本轮复跑 | `test:local-plugins`、`test:local-plugins-ui` | 真实 daemon／Node 的安装、授权、服务、调度、回收与界面流程；设置页现已移除计划表单，旧表单截图不是当前 UI 合同 |
 
-验收器仅在发送按钮真实存在且启用时操作；进程重启前释放旧文档，重新启动后等待外观和工作台初始化，不把 CDP 提前导航造成的网络中止混入业务结果。原包组件、错误断言和成功门槛保持实际行为，没有过滤运行异常或添加整轮自动重试。先前失败证据保留于 `route-cancellation/`、`route-cancellation-final/`、`page-sdk-final/`、`product-page-final/` 与 `product-ui-verified/`；最终目录包独立完整通过 83/83，不拼接中间通过项。
+验收器仅在发送按钮真实存在且启用时操作；进程重启前释放旧文档，重新启动后等待外观和工作台初始化，不把 CDP 提前导航造成的网络中止混入业务结果。原包组件、错误断言和成功门槛保持实际行为，没有过滤运行异常或添加整轮自动重试。当前目录包独立完整通过 87/87，不拼接中间通过项。执行上下文验收早期参数、协议方法与夹具模型触发错误，以及目录失效应由异步 canonical 终态判定的修正记录保留于 `execution-product/`、`execution-product-final/`、`execution-product-verified/`、`execution-context-final/`、`execution-product-complete/`；此前页面失败仍保留于各自证据目录。
 
 ### 12.2 未运行与不得推导的结论
 
-【现状】没有运行全仓测试、Windows 运行／安装包、干净 macOS 安装包、所有崩溃阶段断电注入、长期负载或本轮真实付费第三方模型。UI 类型／源码检查不等于所有语言、触屏、皮肤和实际布局已验收。不同测试有重叠，不以测试数量推导完成百分比。
+【现状】没有运行全仓测试、Windows 运行／安装包、干净 macOS 安装包、所有崩溃阶段断电注入、长期负载或其他区域／账号的外部模型服务。UI 类型／源码检查不等于所有语言、触屏、皮肤和实际布局已验收。不同测试有重叠，不以测试数量推导完成百分比。
 
 【目标】平台发布前仍须核对无开发工具安装、固定 Node、视图直接导航隔离、旧 frame 迟到回复、全部所需 browser surface 物理挂载、停用／撤权／升级竞态、未知副作用不重放、角色模型不漂移及实际模型账本。未覆盖项必须明确保留，不编造成功记录。
 

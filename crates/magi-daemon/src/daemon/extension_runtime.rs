@@ -844,7 +844,8 @@ export default async function activate(api) {
 export default async function activate(api) {
   await api.tool('echo', async (input) => ({ echoed: input.text }));
   await api.tool('boom', async () => { throw new Error('工具失败'); });
-  await api.command('hello', async (input) => `你好，${input.text || '世界'}`);
+  await api.command('hello', async (input, ctx) => input.text === 'context'
+    ? JSON.stringify({owner:ctx.owner,execution:ctx.execution}) : `你好，${input.text || '世界'}`);
   await api.command('bad', async () => { throw new Error('命令失败'); });
   await api.command('wait', async (_input, ctx) => {
     await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve, { once: true }));
@@ -1098,9 +1099,11 @@ export default async function activate(api) {
                     PluginCommandInvocation {
                         job: None,
                         command_id: format!("plugin/acme.guard/{command}"),
-                        session_id: "s".into(),
                         turn_id: "t".into(),
-                        workspace_id: None,
+                        context: magi_tool_runtime::ToolExecutionContext {
+                            session_id: Some(magi_core::SessionId::new("s")),
+                            ..Default::default()
+                        },
                         input: "Magi".into(),
                     },
                     &flag,
@@ -1112,6 +1115,40 @@ export default async function activate(api) {
             .unwrap()
             .unwrap();
         assert_eq!(ok.content, "你好，Magi");
+        let directory = std::fs::canonicalize(fixture._dir.path()).unwrap();
+        let context_executor = Arc::clone(&executor);
+        let expected_directory = directory.clone();
+        let projected = tokio::task::spawn_blocking(move || {
+            context_executor.invoke(
+                PluginCommandInvocation {
+                    command_id: "plugin/acme.guard/hello".into(),
+                    turn_id: "context-turn".into(),
+                    context: magi_tool_runtime::ToolExecutionContext {
+                        session_id: Some(magi_core::SessionId::new("context-session")),
+                        working_directory: Some(directory),
+                        ..Default::default()
+                    },
+                    input: "context".into(),
+                    job: None,
+                },
+                &AtomicBool::new(false),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let projected: serde_json::Value = serde_json::from_str(&projected.content).unwrap();
+        assert_eq!(projected["owner"]["sessionId"], "context-session");
+        assert_eq!(
+            projected["execution"]["workingDirectory"],
+            expected_directory.to_str().unwrap()
+        );
+        assert_eq!(projected["execution"]["sourceFolders"], json!([]));
+        let before_start = call("hello", Arc::new(AtomicBool::new(true)))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(before_start.contains("命令未执行"), "{before_start}");
         let error = call("bad", Arc::new(AtomicBool::new(false)))
             .await
             .unwrap()

@@ -10,9 +10,9 @@ use std::sync::atomic::AtomicBool;
 #[serde(rename_all = "camelCase")]
 pub struct PluginCommandInvocation {
     pub command_id: String,
-    pub session_id: String,
     pub turn_id: String,
-    pub workspace_id: Option<String>,
+    /// 与原生工具共用的可信执行投影；不由插件或命令文本提供路径。
+    pub context: magi_tool_runtime::ToolExecutionContext,
     pub input: String,
     pub job: Option<magi_app_server_protocol::generated::PluginJobContext>,
 }
