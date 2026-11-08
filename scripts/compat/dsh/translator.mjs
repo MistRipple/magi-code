@@ -6,6 +6,9 @@ import { buildReport } from '../core/inspect.mjs';
 import { classify } from './catalog.mjs';
 import { backendEntry, readPackage } from '../core/package.mjs';
 
+// 独立检查与在线安装使用同一产品准入范围；显式 required 仅用于分项诊断。
+const REQUIRED_CATEGORIES = Object.freeze(['llm', 'tools', 'commands', 'settings', 'runtime', 'hooks', 'session', 'services', 'prompt', 'native']);
+
 /** 原生模块：`.node`/`.wasm` 文件，或随包 `native/` 目录里有构建产物。 */
 function findNative(dir) {
   const found = [];
@@ -41,7 +44,7 @@ export function createDshTranslator(options = {}) {
 
     async inspect(dir, inspectOptions = {}) {
       const pkg = readPackage(dir);
-      const required = inspectOptions.required ?? options.required ?? ['llm'];
+      const required = inspectOptions.required ?? options.required ?? REQUIRED_CATEGORIES;
       // 已发布的 npm 产物没有 src/：默认从 package.json 的 main 出发沿相对导入扫描；显式给出 directories 时按源码目录扫描。
       const mainFile = join(dir, backendEntry(pkg));
       const scanOptions = inspectOptions.directories || !existsSync(mainFile)

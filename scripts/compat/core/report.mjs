@@ -63,9 +63,9 @@ export function renderText(report) {
     lines.push('');
   }
   if (internal.length > 0) lines.push(`包内相对导入 ${internal.length} 个模块，构建期打包（不逐项列出）`, '');
-  lines.push(`必需能力：${report.verdict.required.join('、') || '无'}`);
+  lines.push(`静态检查范围：${report.verdict.required.join('、') || '仅未知能力'}`);
   lines.push(report.verdict.blocked.length === 0
-    ? '结论：必需能力均可翻译。'
+    ? '结论：所选范围内的静态检查通过；安装与实际业务仍待验证。'
     : `结论：${report.verdict.blocked.length} 项阻塞翻译：${report.verdict.blocked.map((entry) => entry.name).join('、')}`);
   return lines.join('\n');
 }

@@ -17,6 +17,11 @@ if (process.env.MAGI_TRANSLATOR_OWNER_PIPE === '1') {
 const [command, directory, ...flags] = process.argv.slice(2);
 const optionOf = (list, name) => { const i = list.indexOf(`--${name}`); return i === -1 ? undefined : list[i + 1]; };
 const flag = (name) => optionOf(flags, name);
+// 报告和 registry 文档可超过管道缓冲区；退出前等待完整输出，避免真实大包
+// 的准入证据被截成无效 JSON。daemon 和独立检查沿同一输出合同。
+const writeOutput = value => new Promise((resolve, reject) => {
+  process.stdout.write(value, error => error ? reject(error) : resolve());
+});
 
 if (command === 'resolve') {
   try {
@@ -30,9 +35,9 @@ if (command === 'resolve') {
     if (document.name !== directory || !semver.valid(document.version)) throw new Error('registry 返回的插件身份无效');
     const policy = process.env.MAGI_DSH_COMPATIBILITY_POLICY ? JSON.parse(process.env.MAGI_DSH_COMPATIBILITY_POLICY) : undefined;
     checkDshCompatibility(document, dshEnvironment(dirname(fileURLToPath(import.meta.url))), policy);
-    process.stdout.write(JSON.stringify({ document }));
+    await writeOutput(JSON.stringify({ document }));
   } catch (error) {
-    process.stdout.write(JSON.stringify({ error: { code: error.code ?? 'resolve-failed', message: error.message, diagnostic: error.message,
+    await writeOutput(JSON.stringify({ error: { code: error.code ?? 'resolve-failed', message: error.message, diagnostic: error.message,
       ...(error.incompatible ? { incompatible: error.incompatible } : {}) } }));
   }
   process.exit(0);
@@ -55,7 +60,7 @@ if (command === 'prepare') {
       const { packPlugin } = await import('./core/pack.mjs');
       packPlugin(resolve(need('out')), resolve(archive));
     }
-    process.stdout.write(JSON.stringify({ id: result.manifest.id, version: result.manifest.version, report: result.report }));
+    await writeOutput(JSON.stringify({ id: result.manifest.id, version: result.manifest.version, report: result.report }));
     process.exit(0);
   } catch (error) { console.error(error.message); process.exit(1); }
 }
@@ -69,7 +74,7 @@ const required = flag('require')?.split(',').filter(Boolean);
 try {
   const translator = kind ? registry.create(kind, { required }) : await registry.detect(directory, { required });
   const report = await translator.inspect(directory, { required });
-  console.log(flags.includes('--json') ? JSON.stringify(report, null, 2) : renderText(report));
+  await writeOutput((flags.includes('--json') ? JSON.stringify(report, null, 2) : renderText(report)) + '\n');
   process.exit(report.verdict.blocked.length === 0 ? 0 : 1);
 } catch (error) {
   console.error(error.message);

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { connectAppPage, connectTarget, pageTools, launchApp, waitFor } from './lib/electron-harness.mjs';
 import { createPluginRegistryGate } from './lib/plugin-registry-gate.mjs';
 import { verifyDshUpgrader } from './lib/dsh-upgrader-acceptance.mjs';
+import { verifyDshHealth } from './lib/dsh-health-acceptance.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url)).replace(/\/scripts$/, '');
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
@@ -32,6 +33,7 @@ if (selected) {
 }
 const results = [];
 const errors = [];
+const clipAudit = process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE ? await readFile(process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE, 'utf8') : null;
 let app, page, ui, registryGate;
 const probes = {
   'dsh-plugin-health': '/plugins/dsh-plugin-health/status',
@@ -117,12 +119,17 @@ try {
   assert.ok(!await fetch(origin + '/health').then(() => true, () => false), '验收 daemon 端口被占用');
   assert.ok(!await fetch(`http://127.0.0.1:${cdpPort}/json/version`).then(() => true, () => false), '验收 CDP 端口被占用');
   registryGate = await createPluginRegistryGate();
-  const launchOptions = { executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort, env: { MAGI_STATE_ROOT: join(work, 'state'), DSH_HOME: join(work, 'dsh'), MAGI_DESKTOP_DAEMON_PORT: String(port), MAGI_OPEN_BROWSER: '0', MAGI_NPM_REGISTRY: registryGate.registry, MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '' } };
+  const launchOptions = { executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort, inspectPort: cdpPort + 1, env: { MAGI_STATE_ROOT: join(work, 'state'), DSH_HOME: join(work, 'dsh'), MAGI_DESKTOP_DAEMON_PORT: String(port), MAGI_OPEN_BROWSER: '0', MAGI_NPM_REGISTRY: registryGate.registry, MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '' } };
+  const restart = async label => {
+    page.close(); await writeFile(join(output, `electron-${label}`), app.log.join('')); await app.stop();
+    app = launchApp(launchOptions); await waitFor(async () => (await api('/health')).status === 200, '社区验收重启 daemon', 60_000);
+    page = await waitFor(() => connectAppPage(cdpPort, port, errors), '重启社区工作台'); ui = pageTools(page); return page;
+  };
   app = launchApp(launchOptions);
   await waitFor(async () => (await api('/health')).status === 200, 'Magi daemon', 60_000);
   page = await waitFor(() => connectAppPage(cdpPort, port, errors), 'Magi App Renderer'); ui = pageTools(page);
   const session = (await post('/api/session/materialize', { scope: 'personal' })).sessionId;
-  for (const [pkg, version] of candidates.filter(([name]) => !process.env.MAGI_DSH_PACKAGES || process.env.MAGI_DSH_PACKAGES.split(',').includes(name))) {
+  for (const [pkg, version] of candidates) {
     const item = { package: pkg, version, preview: 'pending', core: 'unverified', upgrade: 'unverified' };
     console.log(`CHECK ${pkg}@${version}`);
     try {
@@ -184,7 +191,19 @@ try {
           assert.equal(status.runtimeVersion, runtimeVersion, '不能把已携带的 DSH SDK 版本显示为未知');
           assert.equal(status.review.currentVersion, runtimeVersion);
           assert.equal(status.review.packages.find((entry) => entry.name === pkg)?.declaration.state, 'compatible', '原包 engines/peer 声明必须到达实际兼容报告');
-          item.functionalChecks = { fileInspection: true, reliabilityReport: true, liveActivation: true, runtimeIdentity: true, declaredCompatibility: true, repairs: 'unverified' };
+          item.businessAttempted = true;
+          const target = await installTarget('0.0.8');
+          try {
+            const business = await verifyDshHealth({ request: post, plugin: running, target, page, cdpPort, errors, output,
+              stateRoot: join(work, 'state'), clipAudit, restart,
+              inspector: () => ({ inspectPort: cdpPort + 1, pid: app.child.pid }),
+              check: (name, ok, detail) => { assert.ok(ok, `${name}: ${JSON.stringify(detail ?? '')}`); console.log(`✓ ${name}`); },
+            });
+            page = business.page; ui = pageTools(page);
+            item.functionalChecks = business.checks;
+            item.upgrade = 'passed';
+            item.updatedVersion = business.plugin.manifest.version;
+          } finally { const target = await currentTarget(); if (target) await removePlugin(target.manifest.id); }
         }
         if (pkg === 'dsh-plugin-debugging') {
           const skill = running.manifest.contributions.skills.find(skill => skill.title === pkg);
@@ -359,11 +378,7 @@ try {
           const business = await verifyDshUpgrader({ request: post, origin, plugin: running, page, cdpPort, errors,
             gate: registryGate, output, stateRoot: join(work, 'state'),
             check: (name, ok, detail) => { assert.ok(ok, `${name}: ${JSON.stringify(detail ?? '')}`); console.log(`✓ ${name}`); },
-            restart: async () => {
-              page.close(); await writeFile(join(output, 'electron-before-upgrader-restart.log'), app.log.join('')); await app.stop();
-              app = launchApp(launchOptions); await waitFor(async () => (await api('/health')).status === 200, 'Upgrader 重启 daemon', 60_000);
-              page = await waitFor(() => connectAppPage(cdpPort, port, errors), '重启 Upgrader 工作台'); ui = pageTools(page); return page;
-            },
+            restart: () => restart('before-upgrader-restart.log'),
           });
           page = business.page; ui = pageTools(page);
           item.functionalChecks = business.checks;
@@ -405,6 +420,7 @@ try {
   summary.qualified = summary.completeSample && [summary.installed, summary.started, summary.coreVerified, summary.upgradeVerified].every((count) => count / summary.packages >= 0.95)
     && results.every((item) => !item.views?.some((view) => !view.ok)) && errors.length === 0;
   await writeFile(join(output, 'coverage.json'), JSON.stringify(summary, null, 2));
+  await writeFile(join(output, 'registry-errors.json'), JSON.stringify(registryGate?.errors ?? [], null, 2));
   if (!summary.qualified || errors.length) process.exitCode = 1;
   console.log(JSON.stringify(summary));
   page?.close();

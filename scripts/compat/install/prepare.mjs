@@ -64,7 +64,7 @@ export async function prepareDsh(options) {
   if (existsSync(options.outDir) && readdirSync(options.outDir).length) throw new Error('输出目录必须为空');
   const main = backendEntry(pkg), root = resolve(options.upstreamDir), entry = resolve(root, main);
   if (!entry.startsWith(root + sep) || !existsSync(entry) || !/\.(?:mjs|cjs|js)$/.test(main)) throw new Error('上游入口无效或尚未构建');
-  const inspection = await translator.inspect(root, { required: ['llm', 'tools', 'commands', 'settings', 'runtime', 'hooks', 'session', 'services', 'prompt', 'native'] });
+  const inspection = await translator.inspect(root);
   if (inspection.verdict.blocked.length) throw new Error(`Magi 兼容检查未通过：\n${inspection.verdict.blocked.map((item) => `${item.name}（${item.status === 'unknown' ? '尚未完成兼容核对' : '宿主能力尚未接入'}）: ${item.note}`).join('\n')}`);
   const dependencies = await installDependencies(root, options.sharedRoot, undefined, compatibility);
   // 条件注入的未实现 Session 方法继续保持服务缺席，不能因新增命名空间

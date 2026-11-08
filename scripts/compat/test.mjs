@@ -10,6 +10,28 @@ const fixture = fileURLToPath(new URL('./fixtures/mini-dsh', import.meta.url));
 const cli = fileURLToPath(new URL('./cli.mjs', import.meta.url));
 const find = (report, name) => report.entries.find((entry) => entry.name === name);
 
+test('真实管道完整输出超过 64 KiB 的准入报告，保留末尾阻塞证据和退出码', { timeout: 10000 }, async t => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { spawn } = await import('node:child_process');
+  const { once } = await import('node:events');
+  const root = mkdtempSync(join(tmpdir(), 'magi-large-inspection-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'large-inspection', version: '1.0.0', main: 'index.js', dsh: { bundle: {} } }));
+  writeFileSync(join(root, 'index.js'), `export function apply(ctx) {${Array.from({length: 500}, (_, index) => `ctx.unknown${index}();`).join('')}ctx.lastUnsupported();}`);
+  const child = spawn(process.execPath, [cli, 'inspect', root, '--json'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  t.after(() => child.kill());
+  const bytes = []; let diagnostic = '';
+  child.stdout.on('data', value => bytes.push(value)); child.stderr.on('data', value => diagnostic += value);
+  const [code] = await once(child, 'close');
+  const output = Buffer.concat(bytes); assert.ok(output.length > 64 * 1024);
+  assert.equal(code, 1, diagnostic);
+  const report = JSON.parse(output.toString());
+  assert.equal(report.verdict.blocked.length, 501);
+  assert.ok(report.verdict.blocked.some(entry => entry.name === 'ctx.lastUnsupported'));
+});
+
 test('daemon 的独占管道关闭后正在联网的翻译工具链退出，不保留孤儿重试', {timeout:10000}, async t => {
   const {spawn}=await import('node:child_process');const {createServer}=await import('node:http');const {once}=await import('node:events');
   let began;const started=new Promise(resolve=>{began=resolve;});
@@ -277,6 +299,28 @@ test('必需能力判定：unknown 永远阻塞；partial 与 dropped 在被要�
   const none = await translator.inspect(fixture, { required: [] });
   assert.deepEqual(names(none), ['@deepseek-ai/dsh-mystery']);
   assert.match(renderText(ui), /阻塞翻译/);
+});
+
+test('默认静态检查与在线安装共用完整业务准入，分项诊断不宣称插件可用', async t => {
+  const { mkdtempSync, writeFileSync, existsSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, dirname } = await import('node:path');
+  const { prepareDsh } = await import('./install/prepare.mjs');
+  const root = mkdtempSync(join(tmpdir(), 'magi-admission-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'admission-test', version: '1.0.0', main: 'index.js', dsh: { bundle: {} } }));
+  writeFileSync(join(root, 'index.js'), 'export function apply(ctx) { ctx.systemPrompt.section({ name: "business", order: 1, text: "Required business instructions" }); }');
+  const run = (...flags) => spawnSync(process.execPath, [cli, 'inspect', root, ...flags], { encoding: 'utf8' });
+  const defaultCheck = run('--json');
+  assert.equal(defaultCheck.status, 1, defaultCheck.stderr);
+  assert.ok(JSON.parse(defaultCheck.stdout).verdict.blocked.some(entry => entry.name === 'ctx.systemPrompt.section'));
+  await assert.rejects(prepareDsh({ upstreamDir: root, outDir: join(root, 'prepared'), sharedRoot: dirname(cli), source: { integrity: 'sha512-test' } }), /ctx\.systemPrompt\.section/);
+  assert.equal(existsSync(join(root, 'prepared')), false, '静态阻塞在依赖获取与生成安装产物之前拒绝');
+  const diagnostic = run('--require', 'llm');
+  assert.equal(diagnostic.status, 0, diagnostic.stderr);
+  assert.match(diagnostic.stdout, /静态检查范围：llm/);
+  assert.match(diagnostic.stdout, /安装与实际业务仍待验证/);
+  assert.doesNotMatch(diagnostic.stdout, /必需能力均可翻译/);
 });
 
 test('命令行：可翻译返回 0 之外的码表示阻塞，输入错误返回 2', () => {
