@@ -580,6 +580,8 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
               h('button',{'data-theme-contrast':'tertiary',style:{background:'var(--magi-canvas)',color:'var(--dsw-alias-label-tertiary)'}},'Details'),
               h('span',{'data-theme-contrast':'layer',style:{background:'var(--dsw-alias-bg-layer-3)',color:'var(--dsw-alias-label-primary)'}},'Layer content'),
               ...['success','warn','error','info'].map(state=>h('div',{'data-theme-contrast':state,style:{background:'var(--dsw-alias-state-'+state+'-bg)',color:'var(--dsw-alias-state-'+state+'-primary)'}},state)),
+              h(sdk.Pill,{active:true,'data-theme-contrast':'sdk-selected',onClick:()=>setText('pill-selected')},'Selected'),
+              h(sdk.DiffBlock,{className:'sdk-contrast-diff',diffs:[{path:'theme.txt',oldText:'removed line',newText:'added line'}],labels:{codeLabel:'Code',wrapLabel:'Wrap',unwrapLabel:'Unwrap',copy:'Copy',copied:'Copied',collapse:'Collapse',collapseAria:'Collapse',expand:n=>'Expand '+n,expandAria:n=>'Expand '+n}}),
               h('div',{'data-sdk-connection':'warning'},h(sdk.ConnectionIndicator,{state:'disconnected',disconnectedLabel:'Reconnect',reconnectActionLabel:'Reconnect',onReconnect:()=>setText('reconnect-requested')})),
               h('div',{'data-sdk-connection':'success'},h(sdk.ConnectionIndicator,{state:'recovered',recoveredLabel:'Recovered'})))):null,
             h('button',{id:'action',onClick:async()=>{
@@ -647,10 +649,12 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
       for(const {id,mode,material} of themeCases) {
         await activatePluginTheme(themeRequest,page,frame,id);
         assert.ok(await frame.evaluate(`(() => {const style=getComputedStyle(document.querySelector('[data-testid=sdk-confirm]'));return style.backgroundColor!=='rgba(0, 0, 0, 0)'&&style.color!==style.backgroundColor;})()`));
-        const contrast=await measurePluginContrast(frame,'[data-theme-contrast], [data-sdk-connection] > *');
+        const contrast=await measurePluginContrast(frame,'[data-theme-contrast], [data-sdk-connection] > *, .sdk-contrast-diff > div:nth-child(2) > div');
         themeResults.push({id,contrast});
-        reporter.check(`${id} 原包反色、层级、四种状态与官方成功／警告组件文字均可读`,
-          contrast.length===9&&contrast.every(item=>item.foreground[3]===255&&item.background[3]===255&&item.ratio>=4.5),JSON.stringify(contrast));
+        reporter.check(`${id} 原包反色、层级、状态及官方选中标签、Diff、连接组件文字均可读`,
+          contrast.length===13&&contrast.every(item=>item.foreground[3]===255&&item.background[3]===255&&item.ratio>=4.5)
+            &&contrast.filter(item=>item.kind==='sdk-selected'||['added line','removed line'].includes(item.text)).length===3
+            &&contrast.filter(item=>item.kind==='sdk-selected'||['added line','removed line'].includes(item.text)).every(item=>item.fill[3]>0),JSON.stringify(contrast));
         if(material==='immersive') await snapshot(`original-ui-${mode}-${material}`);
       }
       await writeFile(join(output,'original-theme-contrast.json'),JSON.stringify(themeResults,null,2));

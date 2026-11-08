@@ -297,6 +297,10 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 `test:electron-dsh-management` 另验证 Share 原页面保存 SVG／PNG 二维码、取消下载后重新保存，并将落盘 PNG 交回原包识别；`test:electron-dsh-health` 验证原页面导出的 JSON 包含真实安装身份。下载观测器只连接脚本自有 Main inspector，核对进程身份后为该 App session 设置本次文件保存位置或取消下载，读取 Electron 的实际终态与落盘字节；不替换原包导出代码、不使用默认 CDP context 的状态冒充 App session 下载成功。脚本的 inspector 端口为各自 CDP 端口加一，需保持空闲；产品运行不启用 inspector。
 
+`test:electron-dsh-management` 与 `MAGI_DSH_FUNCTIONAL_UPGRADE=1 npm run test:electron-popular-dsh` 共用 `scripts/lib/dsh-upgrader-acceptance.mjs` 的 Upgrader 1.8.0 原包业务合同，覆盖配置保存、原页面在线升级、并发拒绝、关页／重开、取消、停用／重新启用、版本切换、失败保留、归档写入失败恢复、显式重试及应用重启；原包可用主按钮还需通过八种外观的默认及真实悬停对比度检查。证据为各自输出目录的 `upgrader-business.json`、`upgrader-button-contrast.json` 与截图；管理专项使用 `MAGI_DSH_MANAGEMENT_OUTPUT`，社区批次使用 `MAGI_DSH_ACCEPTANCE_OUTPUT`。registry gate 只暂停本次独立 daemon 的指定包解析，不替换原包、安装回执或业务结果。社区批次仍固定 9 个样本，只有整个合同通过才计入对应业务覆盖；可用 `MAGI_DSH_ACCEPTANCE_PACKAGES` 选择样本排错，但筛选不会缩小完整门槛的分母，未验证项使脚本退出 1。
+
+`test:compat` 和标准发行构建同时核对随包官方 UI 模块所引用的公共颜色语义是否在 `runtime/client/theme.mjs` 中有映射；未知 alias 使浏览器宿主构建失败。`test:electron-plugin-runtime` 再在真实官方组件中验证选中 Pill、Diff 增删行和连接反馈的颜色及文字对比度，不以源码中有变量名代替真实渲染。
+
 实现该能力时必须新增并在本文登记的验证面：
 
 - 两平台（macOS、Windows）无开发工具的干净安装版：安装、启用、诊断、取消、停用、升级，以及随包 Node 版本与宿主版本匹配；

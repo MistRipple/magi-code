@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectAppPage, connectTarget, pageTools, launchApp, waitFor } from './lib/electron-harness.mjs';
+import { createPluginRegistryGate } from './lib/plugin-registry-gate.mjs';
+import { verifyDshUpgrader } from './lib/dsh-upgrader-acceptance.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url)).replace(/\/scripts$/, '');
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
@@ -30,7 +32,7 @@ if (selected) {
 }
 const results = [];
 const errors = [];
-let app, page, ui;
+let app, page, ui, registryGate;
 const probes = {
   'dsh-plugin-health': '/plugins/dsh-plugin-health/status',
   'dsh-plugin-ops-bundle': '/dsh-ops/api/sandbox/status',
@@ -103,12 +105,20 @@ async function viewCheck(plugin, view, session, interact) {
     const screenshot = `${plugin.manifest.id}-${view.id}.png`;
     await writeFile(join(output, screenshot), Buffer.from(await ui.screenshot(), 'base64'));
     return { id: view.id, placement: view.placements.includes('rightPane') ? 'rightPane' : 'settings', ok: !failure, ...(failure ? { failure } : {}), text: text.slice(0, 5000), screenshot, declaredViews: views.length };
+  } catch (error) {
+    await writeFile(join(output, `${plugin.manifest.id}-${view.id}-failure.png`), Buffer.from(await ui.screenshot(), 'base64'));
+    await writeFile(join(output, `${plugin.manifest.id}-${view.id}-failure.json`), JSON.stringify({ error: error.message,
+      page: await frame?.evaluate(`({text:document.body.innerText,buttons:[...document.querySelectorAll('button')].map(button=>({text:button.innerText,disabled:button.disabled}))})`).catch(() => null),
+    }, null, 2));
+    throw error;
   } finally { frame?.close(); }
 }
 try {
   assert.ok(!await fetch(origin + '/health').then(() => true, () => false), '验收 daemon 端口被占用');
   assert.ok(!await fetch(`http://127.0.0.1:${cdpPort}/json/version`).then(() => true, () => false), '验收 CDP 端口被占用');
-  app = launchApp({ executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort, env: { MAGI_STATE_ROOT: join(work, 'state'), DSH_HOME: join(work, 'dsh'), MAGI_DESKTOP_DAEMON_PORT: String(port), MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '' } });
+  registryGate = await createPluginRegistryGate();
+  const launchOptions = { executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort, env: { MAGI_STATE_ROOT: join(work, 'state'), DSH_HOME: join(work, 'dsh'), MAGI_DESKTOP_DAEMON_PORT: String(port), MAGI_OPEN_BROWSER: '0', MAGI_NPM_REGISTRY: registryGate.registry, MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '' } };
+  app = launchApp(launchOptions);
   await waitFor(async () => (await api('/health')).status === 200, 'Magi daemon', 60_000);
   page = await waitFor(() => connectAppPage(cdpPort, port, errors), 'Magi App Renderer'); ui = pageTools(page);
   const session = (await post('/api/session/materialize', { scope: 'personal' })).sessionId;
@@ -281,7 +291,7 @@ try {
           await viewCheck(running, running.manifest.contributions.views[0], session, async frame => {
             await waitFor(() => frame.evaluate('Boolean(document.querySelector(".dsxpm-input"))'), '市场原包搜索输入框');
             await frame.evaluate(`(() => {const input=document.querySelector('.dsxpm-input');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'dsh-plugin-mgr');input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
-            await frame.evaluate(`[...document.querySelectorAll('button')].find(button=>button.innerText==='搜索').click()`);
+            await waitFor(() => frame.evaluate(`(() => {const button=[...document.querySelectorAll('button')].find(button=>button.innerText==='搜索');if(!button||button.disabled)return false;button.click();return true;})()`), '市场原包搜索操作可用后提交');
             await waitFor(() => frame.evaluate(`Boolean([...document.querySelectorAll('.dsxpm-card')].find(card=>card.querySelector('.dsxpm-name')?.textContent==='dsh-plugin-mgr'))`), '市场原包搜索结果');
             const managerEntry=(await list('q=dsh-plugin-mgr')).items.find(row=>row.name==='dsh-plugin-mgr');
             assert.ok(managerEntry, '原包目录须提供待安装的管理器条目');
@@ -345,72 +355,21 @@ try {
           } finally { const target = await currentTarget(); if (target) await removePlugin(target.manifest.id); }
         }
         if (pkg === 'dsh-plugin-upgrader' && process.env.MAGI_DSH_FUNCTIONAL_UPGRADE === '1') {
-          let targetId;
-          try {
-            const request = { package: 'dsh-plugin-release-probe' };
-            const target = await installTarget();
-            targetId = target.manifest.id;
-            const submitted = await post(`/api/plugins/${item.id}/routes`, { method: 'POST', path: '/api/plugin-upgrader/job', body: { steps: [{ name: request.package, version: '0.0.8', action: 'upgrade', enabled: true }] } });
-            assert.equal(submitted.status, 202, JSON.stringify(submitted));
-            const job = await waitFor(async () => {
-              const current = await post(`/api/plugins/${item.id}/routes`, { method: 'GET', path: '/api/plugin-upgrader/job', query: `id=${submitted.body.id}` });
-              return current.body.status === 'finished' ? current.body : false;
-            }, 'Upgrader 原包后台升级完成', 240_000);
-            item.functionalUpgrade = job;
-            assert.equal(job.failed, 0, JSON.stringify(job));
-            const after = (await api('/api/plugins')).value.plugins.find((p) => p.manifest.id === targetId);
-            assert.equal(after.manifest.version, '0.0.8');
-            assert.equal(after.runtime.state, 'running');
-            const run = async (version, enabled) => {
-              const started = await post(`/api/plugins/${item.id}/routes`, { method: 'POST', path: '/api/plugin-upgrader/job', body: { steps: [{ name: request.package, version, action: 'switch', enabled }] } });
-              assert.equal(started.status, 202, JSON.stringify(started));
-              return waitFor(async () => {
-                const current = await post(`/api/plugins/${item.id}/routes`, { method: 'GET', path: '/api/plugin-upgrader/job', query: `id=${started.body.id}` });
-                return current.body.status === 'finished' ? current.body : false;
-              }, `Upgrader 切换 ${version}`, 240_000);
-            };
-            const switched = await run('0.0.7', false);
-            assert.equal(switched.failed, 0, JSON.stringify(switched));
-            const disabled = (await api('/api/plugins')).value.plugins.find((p) => p.manifest.id === targetId);
-            assert.equal(disabled.manifest.version, '0.0.7'); assert.equal(disabled.enabled, false); assert.equal(disabled.active, false);
-            const rejected = await run('9999.0.0', false);
-            assert.equal(rejected.failed, 1, '不存在的版本必须明确失败');
-            const preserved = (await api('/api/plugins')).value.plugins.find((p) => p.manifest.id === targetId);
-            assert.equal(preserved.digest, disabled.digest); assert.equal(preserved.enabled, false);
-            const restored = await run('0.0.8', true);
-            assert.equal(restored.failed, 0, JSON.stringify(restored));
-            const active = (await api('/api/plugins')).value.plugins.find((p) => p.manifest.id === targetId);
-            assert.equal(active.manifest.version, '0.0.8'); assert.equal(active.runtime.state, 'running');
-            const rejectedActive = await run('9999.0.0', true);
-            assert.equal(rejectedActive.failed, 1);
-            const stillActive = await currentTarget();
-            assert.equal(stillActive.digest, active.digest); assert.equal(stillActive.runtime.state, 'running');
-            assert.deepEqual(stillActive.grants, active.grants, '失败预检不应撤销已运行版本的授权');
-            // 让新包落盘在旧宿主已经排空后失败，不能只用不存在版本测试预检。
-            // 仅在本次隔离状态根制造目录冲突，不改上游原包或用户安装。
-            const replacement = await post('/api/plugins/upstream/preview', { ecosystem: 'dsh', package: request.package, version: '0.0.7' });
-            const blockedArchive = join(work, 'state/plugins/versions', targetId, `${replacement.candidate.digest}.zip`);
-            await mkdir(blockedArchive);
-            try {
-              const failedWrite = await run('0.0.7', true);
-              assert.equal(failedWrite.failed, 1, '真实包落盘失败须向上游管理页面报告失败');
-              const recovered = await waitFor(async () => {
-                const current = await currentTarget();
-                return current?.digest === active.digest && current.runtime?.state === 'running' ? current : false;
-              }, '升级写入失败后旧版本恢复运行', 30_000);
-              assert.equal(recovered.manifest.version, '0.0.8');
-              assert.deepEqual(recovered.grants, active.grants);
-              assert.equal(recovered.enabled, true); assert.equal(recovered.active, true);
-              item.failedReplacement = { stage: 'archive-write', job: failedWrite, preservedDigest: recovered.digest };
-            } finally { await rm(blockedArchive, { recursive: true, force: true }); }
-            const retry = await run('0.0.7', true);
-            assert.equal(retry.failed, 0, '清除故障后显式重试应完成版本切换');
-            const retried = await currentTarget();
-            assert.equal(retried.manifest.version, '0.0.7'); assert.equal(retried.runtime.state, 'running');
-            item.functionalChecks = { onlineUpgrade: true, versionSwitch: true, disabledState: true, failedUpgradePreservesVersion: true,
-              failedUpgradePreservesActiveRuntime: true, failedReplacementPreservesRuntime: true, retryAfterWriteFailure: true, reactivation: true, removalRollback: 'unverified' };
-          } finally { if (targetId) await removePlugin(targetId); }
+          item.businessAttempted = true;
+          const business = await verifyDshUpgrader({ request: post, origin, plugin: running, page, cdpPort, errors,
+            gate: registryGate, output, stateRoot: join(work, 'state'),
+            check: (name, ok, detail) => { assert.ok(ok, `${name}: ${JSON.stringify(detail ?? '')}`); console.log(`✓ ${name}`); },
+            restart: async () => {
+              page.close(); await writeFile(join(output, 'electron-before-upgrader-restart.log'), app.log.join('')); await app.stop();
+              app = launchApp(launchOptions); await waitFor(async () => (await api('/health')).status === 200, 'Upgrader 重启 daemon', 60_000);
+              page = await waitFor(() => connectAppPage(cdpPort, port, errors), '重启 Upgrader 工作台'); ui = pageTools(page); return page;
+            },
+          });
+          page = business.page; ui = pageTools(page);
+          item.functionalChecks = business.checks;
+          item.upgrade = 'passed';
         }
+
       }
       // 覆盖率只记录已完成的业务断言：页面有内容、启动成功或 HTTP 200
       // 不能代替核心业务。插件没有明确的功能检查时保持 unverified，避免把
@@ -420,13 +379,10 @@ try {
         item.core = checks.every((value) => value === true) ? 'passed'
           : checks.some((value) => value === false) ? 'failed' : 'unverified';
       }
-      if (item.functionalUpgrade) {
-        item.upgrade = item.functionalUpgrade.failed === 0 ? 'passed' : 'failed';
-      }
       await removePlugin(item.id);
       item.cleaned = true;
     } catch (error) {
-      if (item.marketInstall) item.core = 'failed';
+      if (item.marketInstall || item.businessAttempted) item.core = 'failed';
       item.runtime = item.runtime || 'error'; item.error = error?.message || String(error);
       if (item.id) await removePlugin(item.id).then(() => { item.cleaned = true; }, (error) => { item.cleanupError = error.message; });
     }
@@ -453,4 +409,5 @@ try {
   console.log(JSON.stringify(summary));
   page?.close();
   if (app) { await writeFile(join(output, 'electron.log'), app.log.join('')); await app.stop(); }
+  await registryGate?.close();
 }

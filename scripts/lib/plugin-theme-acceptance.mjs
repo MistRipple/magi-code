@@ -52,6 +52,6 @@ function measure(selector) {
     context.fillStyle = style.color; context.fillRect(0, 0, 1, 1);
     const renderedForeground = [...context.getImageData(0, 0, 1, 1).data];
     const values = [luminance(renderedForeground), luminance(background)].sort((a, b) => a - b);
-    return { kind: element.dataset.themeContrast ?? element.className, foreground, fill, background, ratio: (values[1] + 0.05) / (values[0] + 0.05) };
+    return { kind: element.dataset.themeContrast ?? element.className, text: element.textContent.trim(), foreground, fill, background, ratio: (values[1] + 0.05) / (values[0] + 0.05) };
   });
 }

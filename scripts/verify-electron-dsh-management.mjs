@@ -5,11 +5,11 @@ import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createServer } from 'node:http';
-import { Readable } from 'node:stream';
 import { packPlugin } from './compat/core/pack.mjs';
 import { connectAppPage, connectTarget, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
 import { capturePluginDownload } from './lib/plugin-download-acceptance.mjs';
+import { createPluginRegistryGate } from './lib/plugin-registry-gate.mjs';
+import { verifyDshUpgrader } from './lib/dsh-upgrader-acceptance.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
@@ -21,24 +21,7 @@ const launchOptions = { executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: r
 const report = createReporter(), errors = [];
 const clipAuditSource = process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE ? await readFile(process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE, 'utf8') : null;
 let app, page, frame, ui;
-// 转发真实 npm 元数据，仅暂停指定安装任务的解析请求来确定性验证取消。
-// 原包、integrity、页面及业务均不替换；不影响用户正在运行的实例。
-let holdResolution = false;
-const held = new Set();
-const registryProxy = createServer(async (request, response) => {
-  if (holdResolution && request.headers['pacote-pkg-id'] === `registry:${targetPackage}`) {
-    held.add(response);
-    response.on('close', () => held.delete(response));
-    return;
-  }
-  try {
-    const upstream = await fetch(`https://registry.npmjs.org${request.url}`, {
-      headers: { accept: request.headers.accept ?? 'application/json' }, signal: AbortSignal.timeout(120_000),
-    });
-    response.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
-    Readable.fromWeb(upstream.body).on('error', () => response.destroy()).pipe(response);
-  } catch (error) { response.writeHead(502); response.end(String(error)); }
-});
+let registryGate;
 await mkdir(output, { recursive: true });
 async function api(path, body) {
   const response = await fetch(origin + path, { method: body === undefined ? 'GET' : 'POST', headers: { origin, 'content-type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(300_000) });
@@ -107,8 +90,8 @@ async function installFixture() {
   };
 }
 try {
-  await new Promise((resolve) => registryProxy.listen(0, '127.0.0.1', resolve));
-  const registry = `http://127.0.0.1:${registryProxy.address().port}`;
+  registryGate = await createPluginRegistryGate();
+  const registry = registryGate.registry;
   assert.ok(!await fetch(origin + '/health').then(() => true, () => false), '验收端口已占用');
   launchOptions.env.MAGI_NPM_REGISTRY = registry;
   app = launchApp(launchOptions);
@@ -284,40 +267,16 @@ try {
   report.check('原包主动要求手动升级时保留其回执与当前运行版本', refused.status === 409 && refused.body.error === 'manual-update-required' && (await target()).manifest.version === '0.0.7' && (await target()).active);
   await manage('remove', { pluginId: (await target()).manifest.id });
   const upgrader = await installUpstream('dsh-plugin-upgrader', '1.8.0'); await authorize(upgrader);
-  const original = await installUpstream(targetPackage, '0.0.7'); await authorize(original);
-  const beforeCancel = await target();
-  await openSettings(upgrader);
-  await page.evaluate(`(() => { globalThis.__installationTrace=[]; window.addEventListener('message', event => {const m=event.data;if(m?.channel==='magi-plugin-v1' && m.operation==='route.call') {globalThis.__installationTrace.push(m);if(globalThis.__installationTrace.length>100)globalThis.__installationTrace.shift();}}); })()`);
-  await frame.evaluate(`(() => { globalThis.__installationTrace=[]; window.addEventListener('message', event => {const m=event.data;if(m?.channel==='magi-plugin-v1') {globalThis.__installationTrace.push(m);if(globalThis.__installationTrace.length>100)globalThis.__installationTrace.shift();}}); })()`);
-  const upgradeButton = `(() => [...document.querySelectorAll('.dsh-pu-row')].find(el => el.innerText.includes(${JSON.stringify(targetPackage)}))?.querySelector('.dsh-pu-row-actions button.is-primary'))()`;
-  await waitFor(() => frame.evaluate(`Boolean(${upgradeButton})`), 'Upgrader 原包目标升级按钮', 120_000);
-  holdResolution = true;
-  await frame.evaluate(`${upgradeButton}.click()`);
-  await waitFor(() => held.size > 0, 'daemon 在线安装版本解析请求', 30_000);
-  const running = await callRoute(upgrader.manifest.id, '/api/plugin-upgrader/overview');
-  const jobId = running.body.active.id;
-  await waitFor(() => frame.evaluate(`(() => {const button=[...document.querySelectorAll('.dsh-pu-job button')].find(el => /^(取消|Cancel)$/.test(el.innerText.trim()) && !el.disabled);if (!button) return false;button.click();return true;})()`), '原包取消按钮');
-  await waitFor(() => held.size === 0, '取消回收解析子进程连接');
-  const cancellation = await waitFor(async () => {
-    const result = await api(`/api/plugins/${upgrader.manifest.id}/routes`, { method: 'GET', path: '/api/plugin-upgrader/job', query: `id=${jobId}` });
-    return result.body.status === 'cancelled' ? result.body : false;
-  }, '原包取消结算');
-  const afterCancel = await target();
-  report.check('原包升级及取消按钮真正停止当前 daemon 安装，保留旧版本、授权和运行实例',
-    cancellation.results[0]?.application === 'cancelled'
-      && afterCancel.digest === beforeCancel.digest && afterCancel.runtime.state === 'running'
-      && JSON.stringify(afterCancel.grants) === JSON.stringify(beforeCancel.grants)
-      && afterCancel.runtime.generation === beforeCancel.runtime.generation, JSON.stringify({ cancellation, beforeCancel, afterCancel }));
-  holdResolution = false;
-  await waitFor(() => frame.evaluate(`Boolean(${upgradeButton} && !${upgradeButton}.disabled)`), '取消后恢复升级按钮');
-  await screenshot('upgrader-cancelled');
-  await frame.evaluate(`${upgradeButton}.click()`);
-  await waitFor(async () => { const plugin = await target(); return plugin.manifest.version === '0.0.8' && plugin.runtime?.state === 'running'; }, '原包显式重试在线升级并运行', 240_000);
-  await waitFor(() => frame.evaluate(`!${upgradeButton} && ![...document.querySelectorAll('.dsh-pu-job button')].some(el => /^(取消|Cancel|正在取消…|Cancelling…)$/.test(el.innerText.trim()))`), '原包页面完成回执与新版列表');
-  report.check('取消后从原包按钮显式重试，在线安装新版并恢复运行', (await target()).active);
-  report.check('其他插件安装状态变化保留当前页面消息桥身份和完成回执',
-    await frame.evaluate(`new Set(globalThis.__installationTrace.map(m => m.instanceId)).size === 1`));
-  await screenshot('upgrader-retried');
+  frame?.close(); frame = undefined;
+  const business = await verifyDshUpgrader({ request: api, origin, plugin: upgrader, page, cdpPort, errors,
+    gate: registryGate, output, stateRoot: join(work, 'state'), check: report.check,
+    restart: async () => {
+      page.close(); await writeFile(join(output, 'electron-before-upgrader-restart.log'), app.log.join('')); await app.stop();
+      app = launchApp(launchOptions); await waitFor(() => api('/health'), 'Upgrader 重启 daemon', 60_000);
+      page = await waitFor(() => connectAppPage(cdpPort, port, errors), '重启 Upgrader 工作台'); ui = pageTools(page); return page;
+    },
+  });
+  page = business.page; ui = pageTools(page);
   report.check('Electron 与原包页面无未捕获异常', errors.length === 0, errors.join('\n'));
   console.log(report.summary());
 } catch (error) {
@@ -325,10 +284,8 @@ try {
   console.error(error); process.exitCode = 1;
   if (ui) await screenshot('failure').catch(() => {});
 } finally {
-  await writeFile(join(output, 'route-trace.json'), JSON.stringify({ parent: await page?.evaluate('globalThis.__installationTrace').catch(() => null), frame: await frame?.evaluate('globalThis.__installationTrace').catch(() => null) }, null, 2));
   await writeFile(join(output, 'results.json'), JSON.stringify({ checks: report.results, errors, stateRoot: join(work, 'state'), scope: 'Share/Upgrader 原包管理，npm/GitHub 在线安装、升级与恢复；不代表生态全集业务覆盖率' }, null, 2));
   frame?.close(); page?.close();
   if (app) { await writeFile(join(output, 'electron.log'), app.log.join('')); await app.stop(); }
-  registryProxy.closeAllConnections();
-  await new Promise((resolve) => registryProxy.close(resolve));
+  await registryGate?.close();
 }
