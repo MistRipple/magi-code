@@ -45,6 +45,7 @@ export function buildReport({ translator, upstream, root, scanOptions, classify,
     serviceReads: scan.serviceReads,
     serviceMembers: scan.serviceMembers,
     profileMutations: scan.profileMutations,
+    profilePackageProcesses: scan.profilePackageProcesses,
     entries, summary: summarize(entries), verdict: verdictFor(entries, required),
   };
 }

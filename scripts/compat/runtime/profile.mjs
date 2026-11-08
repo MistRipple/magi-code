@@ -10,7 +10,7 @@ import { load, dump } from 'js-yaml';
 import { createPluginManager } from './plugin-manager.mjs';
 import { pluginLifecycle } from './plugin-directory.mjs';
 import { dshBundle as bundle } from './plugin-source.mjs';
-import { createProfileProcesses } from './profile-process-host.mjs';
+import { createProfileProcesses, profilePackageCommand } from './profile-process-host.mjs';
 import { readFileSync, statSync, readdirSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { unzipSync } from 'fflate';
@@ -450,7 +450,12 @@ export function commitProcessProposal({ files, expected }) {
 // 访问另一个 DSH 实例；该实例的文件、CLI 和安装事实仍归它自身拥有。
 // 不提供 Magi CLI，也不在 PATH 放置替身程序。
 export function profileSpawn(file, args = [], options) {
+  let packageCommand;
   if (host) {
+    try { packageCommand = profilePackageCommand(file, args, options, [host.root, host.canonicalRoot]); }
+    catch (cause) { packageCommand = { error: cause }; }
+  }
+  if (host && !packageCommand) {
     const environment = options?.env ?? process.env;
     if (environment.DSH_HOME !== undefined) {
       let home;
@@ -459,23 +464,29 @@ export function profileSpawn(file, args = [], options) {
       if (home !== resolve(host.canonicalParent, '..')) return;
     } else if (options?.env != null) return;
   }
-  if (host && scopes.getStore()) {
+  if (host && !packageCommand && scopes.getStore()) {
     const child = host.processes.spawn(file, args, options, state().signal);
     if (child) return child;
   }
-  if (!host || !/^(dsh|dsh\.cmd)$/.test(basename(String(file)))) return;
+  if (!host || !packageCommand && !/^(dsh|dsh\.cmd)$/.test(basename(String(file)))) return;
   const child = new EventEmitter(); child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough(); child.pid = undefined;
   const controller = new AbortController(); child.kill = () => { controller.abort(); return true; };
   queueMicrotask(async () => {
     let code = 1;
     try {
       const scope = state(); scope.signal?.throwIfAborted();
-      const argv = args.map(String);
-      if (argv[0] !== 'plugin') throw new Error('仅翻译 dsh plugin 管理命令');
-      const p = argv.indexOf('--profile');
-      if (p >= 0) { if (argv[p + 1] !== 'magi') throw new Error('不能操作其他 DSH profile'); argv.splice(p, 2); }
-      const [_, verb, spec, ...rest] = argv;
-      if (rest.length || !spec || !['add', 'remove'].includes(verb)) throw new Error('DSH 管理命令参数不受支持');
+      if (packageCommand?.error) throw packageCommand.error;
+      let verb, spec;
+      if (packageCommand) ({ action: verb, spec } = packageCommand);
+      else {
+        const argv = args.map(String);
+        if (argv[0] !== 'plugin') throw new Error('仅翻译 dsh plugin 管理命令');
+        const p = argv.indexOf('--profile');
+        if (p >= 0) { if (argv[p + 1] !== 'magi') throw new Error('不能操作其他 DSH profile'); argv.splice(p, 2); }
+        const [_, action, target, ...rest] = argv;
+        if (rest.length || !target || !['add', 'remove'].includes(action)) throw new Error('DSH 管理命令参数不受支持');
+        verb = action; spec = target;
+      }
       controller.signal.throwIfAborted();
       const manager = createPluginManager(host.api, host.registry, controller.signal);
       const requestId = crypto.randomUUID();

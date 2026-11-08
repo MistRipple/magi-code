@@ -143,6 +143,38 @@ try {
   await waitFor(() => frame.evaluate(`![...document.querySelectorAll('button')].some(b=>['确认修复','Confirm repair'].includes(b.innerText.trim()))`), '原包修复完成反馈');
   await audit('repair-complete');
   await writeFile(join(output, 'repair-complete.png'), Buffer.from(await ui.screenshot(), 'base64'));
+  await waitFor(() => clickText(`!b.disabled && /^(检查更新|Check for updates|Check updates)$/.test(b.innerText.trim())`), 'Health 原页面主动在线检查更新');
+  const update = await waitFor(async () => {
+    const value = await call('/update'); return value.status === 'ok' && value.updateAvailable && value;
+  }, 'Health 原包当前在线版本', 30_000);
+  const beforeUpdate = await current(health.manifest.id);
+  const beforeSettings = await api(`/api/plugins/${health.manifest.id}/settings`);
+  const beforeDocument = await frame.evaluate('window.__healthSelfUpdate=crypto.randomUUID()');
+  await waitFor(() => clickText(`!b.disabled && /^(立即更新|Update now)$/.test(b.innerText.trim())`), 'Health 原页面自更新入口');
+  const afterUpdate = await waitFor(async () => {
+    const plugin = await current(health.manifest.id);
+    return plugin.manifest.version === update.latestVersion && plugin.digest !== beforeUpdate.digest && plugin.runtime?.state === 'running' && plugin;
+  }, 'Health 原页面自更新后实际新版宿主运行', 300_000);
+  frame.close();
+  const updatedUrl = await waitFor(() => page.evaluate(`document.querySelector(${JSON.stringify(selector)})?.src.includes(${JSON.stringify(afterUpdate.digest)})&&document.querySelector(${JSON.stringify(selector)}).src`), 'Health 自更新替换原文档');
+  frame = await waitFor(() => connectTarget(cdpPort, t => ['iframe', 'page'].includes(t.type) && t.url === updatedUrl, 'Health 更新后原页面', errors), 'Health 新版页面');
+  const newStatus = await call('/status', undefined, {}); key = newStatus.key;
+  const journal = await waitFor(async () => {
+    const state = JSON.parse(await readFile(join(work, 'state/plugins/installations.json'), 'utf8'));
+    return Object.values(state.records).find(record => record.plugin === health.manifest.id && record.candidate?.digest === afterUpdate.digest && record.phase === 'finished');
+  }, 'daemon 自更新持久终态');
+  observations.selfUpdate = { before: beforeUpdate, after: afterUpdate, result: journal.result };
+  await audit('self-update-complete');
+  await writeFile(join(output, 'health-self-update.png'), Buffer.from(await ui.screenshot(), 'base64'));
+  report.check('Health 原页面在线自更新由 daemon 完成替换与实际新版运行，旧调用结束不丢提交', journal.result.application === 'applied'
+    && afterUpdate.active && newStatus.update.currentVersion === update.latestVersion, journal.result);
+  report.check('自更新保留原设置和已批权限范围，新文档不复用旧页面状态', JSON.stringify(await api(`/api/plugins/${health.manifest.id}/settings`)) === JSON.stringify(beforeSettings)
+    && afterUpdate.grants.every(permission => beforeUpdate.grants.some(grant => JSON.stringify(grant) === JSON.stringify(permission)))
+    && typeof beforeDocument === 'string' && await frame.evaluate('window.__healthSelfUpdate===undefined'));
+  await stop('before-self-update-restart.log'); await start();
+  await waitFor(async () => (await current(health.manifest.id)).runtime?.state === 'running', '自更新后应用重启恢复新版', 90_000);
+  report.check('应用重启保留自更新最终摘要及配置，不重放旧任务', (await current(health.manifest.id)).digest === afterUpdate.digest
+    && JSON.stringify(await api(`/api/plugins/${health.manifest.id}/settings`)) === JSON.stringify(beforeSettings));
   report.check('本轮没有页面运行异常', errors.length === 0, errors);
 } catch (error) {
   report.results.push({ name: 'Health 业务验收完成', ok: false, detail: String(error.stack || error) }); process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1;

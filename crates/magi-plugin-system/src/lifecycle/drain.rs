@@ -43,7 +43,26 @@ impl PluginManager {
         manager: Arc<Mutex<Self>>,
         id: &str,
     ) -> Result<PluginDrainGuard, PluginError> {
+        Self::begin_drain(manager, id, None)
+    }
+    /// 原实例发起的更新必须在关闭准入的同一锁内核对租约，避免准备完成后
+    /// 恰好重启的旧请求排空并替换已经接管的新宿主。
+    pub fn begin_runtime_upgrade_drain(
+        manager: Arc<Mutex<Self>>,
+        id: &str,
+        lease: &str,
+    ) -> Result<PluginDrainGuard, PluginError> {
+        Self::begin_drain(manager, id, Some(lease))
+    }
+    fn begin_drain(
+        manager: Arc<Mutex<Self>>,
+        id: &str,
+        lease: Option<&str>,
+    ) -> Result<PluginDrainGuard, PluginError> {
         let mut guard = manager.lock().map_err(|_| conflict("插件管理器不可用"))?;
+        if let Some(lease) = lease {
+            guard.check_runtime(id, lease)?;
+        }
         if !guard.state.plugins.contains_key(id) {
             return Err(conflict("插件未安装"));
         }

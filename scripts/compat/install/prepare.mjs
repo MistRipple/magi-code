@@ -113,7 +113,7 @@ export async function prepareDsh(options) {
   const profileReload = inspection.entries.some(entry => /^ctx\.hmr(?:\.|$)/.test(entry.name) || entry.kind === 'injects' && entry.name === 'hmr')
     || Object.hasOwn(inspection.serviceReads, 'hmr');
   const profileWrites = inspection.profileMutations.length > 0;
-  if (management || packageManagement) {
+  if (management || packageManagement || inspection.profilePackageProcesses.length > 0) {
     manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', 'authorize', ...(management ? ['compatibility'] : []), 'background'] });
   } else if (profileReload || profileWrites) {
     manifest.permissions.push({ kind: 'pluginManagement', targets: ['lifecycle', 'background'] });

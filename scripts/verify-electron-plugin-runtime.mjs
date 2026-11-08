@@ -295,7 +295,18 @@ async function verifyOriginalSkill(session, waitTurn) {
   reporter.check('390px 原包技能菜单沿共享输入组件展示且无横向溢出',narrow.left>=0&&narrow.right<=narrow.width&&!narrow.overflow,JSON.stringify(narrow));
   await snapshot('original-skill-mobile');
   await page.call('Emulation.clearDeviceMetricsOverride');
-  await page.evaluate(`[...document.querySelectorAll('.ia-slash-item')].find(item=>item.querySelector('.ia-slash-item-label')?.textContent==='/dsh-plugin-debugging').dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true}))`);
+  // 视口切换或窗口失焦会结束菜单；恢复真实输入焦点后再选择当前菜单，
+  // 不向已经消失的旧 DOM 派发事件。
+  await page.call('Page.bringToFront');
+  await page.evaluate(`document.querySelector('[data-testid=input-textarea][contenteditable=true]').focus({preventScroll:true})`);
+  await page.call('Input.dispatchKeyEvent', { type: 'keyDown', key: 'End', code: 'End' });
+  await page.call('Input.dispatchKeyEvent', { type: 'keyUp', key: 'End', code: 'End' });
+  const skillPosition = await waitFor(() => page.evaluate(`(() => {
+    const item=[...document.querySelectorAll('.ia-slash-item')].find(item=>item.querySelector('.ia-slash-item-label')?.textContent==='/dsh-plugin-debugging');
+    if(!item)return;const r=item.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};
+  })()`), '桌面视口恢复后原包技能菜单可操作');
+  await page.call('Input.dispatchMouseEvent', { type: 'mousePressed', button: 'left', clickCount: 1, ...skillPosition });
+  await page.call('Input.dispatchMouseEvent', { type: 'mouseReleased', button: 'left', clickCount: 1, ...skillPosition });
   await waitFor(()=>ui.exists('.ia-skill-chip'),'原包技能被选择');
   await page.call('Input.insertText',{text:'verify original skill body'});
   const before=(await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).value.canonicalTurns?.length??0;
@@ -448,10 +459,25 @@ async function verifyNativePanels(session) {
   await writeFile(join(upstream, 'index.js'), `
 import Schema from '@deepseek-ai/schemastery';
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
+import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 export const inject = ['webServer'];
 export const Config = Schema.object({ startupUrl: Schema.string().default('') });
 export async function apply(ctx, config) {
   if (config.startupUrl) await fetch(config.startupUrl);
+  ctx.webServer.register({path:'/panel-package-manager',handler:async(req,res)=>{
+    let text='';for await(const chunk of req)text+=chunk;
+    const input=JSON.parse(text), directory=ctx.profileContext.dir;
+    if(!['npm','pnpm'].includes(input.manager))throw new Error('unknown package manager');
+    const child=spawn(input.manager,input.args,{cwd:directory});
+    let stdout='',stderr='';child.stdout.on('data',bytes=>stdout+=bytes);child.stderr.on('data',bytes=>stderr+=bytes);
+    const code=await new Promise(resolve=>child.once('close',resolve));
+    let manifest=null;
+    try{manifest=JSON.parse(readFileSync(join(directory,'node_modules',input.package,'package.json'),'utf8'));}
+    catch(error){if(error.code!=='ENOENT')throw error;}
+    res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({code,stdout,stderr,manifest}));
+  }});
   const clients=new Set();
   ctx.webServer.register({path:'/panel-events',handler(req,res){
     res.writeHead(200,{'content-type':'text/event-stream'});
@@ -607,6 +633,25 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   await post(`/api/plugins/${id}/authorize`, { grants: plugin.manifest.permissions });
   await post(`/api/plugins/${id}/activate`);
   await waitFor(async () => (await api('/api/plugins')).value.plugins.find((item) => item.manifest.id === id)?.runtime?.state === 'running', '原生多面板插件');
+  reporter.check('标准包管理进程声明独立安装与授权委托', plugin.manifest.permissions.some(permission=>permission.kind==='pluginManagement'&&['install','authorize'].every(target=>permission.targets.includes(target))));
+  const packageName='dsh-plugin-release-probe';
+  const managedPackage=async()=> (await api('/api/plugins')).value.plugins.find(item=>item.source.location.startsWith('dsh:'+packageName+'@'));
+  const runManager=async(manager,args)=>{
+    const reply=await post(`/api/plugins/${id}/routes`,{method:'POST',path:'/panel-package-manager',body:{manager,args,package:packageName}});
+    assert.equal(reply.status,200,JSON.stringify(reply));return reply.body;
+  };
+  const installedPackage=await runManager('npm',['install',packageName+'@0.0.7','--ignore-scripts','--no-audit','--no-fund','--no-progress']);
+  reporter.check('原包 npm install 实际在线安装并运行，原文件读取来自同一 daemon 版本',installedPackage.code===0&&installedPackage.manifest.version==='0.0.7'&&(await managedPackage()).runtime.state==='running',installedPackage);
+  const updatedPackage=await runManager('pnpm',['add',packageName+'@0.0.8','--ignore-scripts','--reporter=append-only','--yes']);
+  const beforeFailure=await managedPackage();
+  reporter.check('原包 pnpm add 在线替换版本并刷新当前调用的原文件快照',updatedPackage.code===0&&updatedPackage.manifest.version==='0.0.8'&&beforeFailure.manifest.version==='0.0.8'&&beforeFailure.runtime.state==='running',updatedPackage);
+  const failedPackage=await runManager('npm',['install',packageName+'@9999.0.0','--ignore-scripts']);
+  const afterFailure=await managedPackage();
+  reporter.check('标准包管理失败返回原命令错误，旧摘要、授权及运行代次保持',failedPackage.code!==0&&failedPackage.stderr.length>0&&failedPackage.manifest.version==='0.0.8'&&afterFailure.digest===beforeFailure.digest&&afterFailure.runtime.generation===beforeFailure.runtime.generation&&JSON.stringify(afterFailure.grants)===JSON.stringify(beforeFailure.grants),failedPackage);
+  const removedPackage=await runManager('npm',['uninstall',packageName,'--ignore-scripts']);
+  reporter.check('原包 npm uninstall 经同一排空入口移除目标且不留下投影残留',removedPackage.code===0&&removedPackage.manifest===null&&!await managedPackage(),removedPackage);
+  const managedDirectory=join(work,'state/extensions/data',id,'profiles/magi');
+  reporter.check('标准包管理没有创建第二份物理清单、锁文件或 node_modules',await Promise.all(['package.json','package-lock.json','pnpm-lock.yaml','node_modules'].map(file=>readFile(join(managedDirectory,file)).then(()=>false,error=>{if(error.code==='ENOENT')return true;throw error;}))).then(values=>values.every(Boolean)));
   const completeRemote=async name=>{
     const response=await post(`/api/plugins/${id}/routes`,{method:'POST',path:'/complete-remote',body:name});
     assert.equal(response.status,200,JSON.stringify(response));

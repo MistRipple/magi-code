@@ -470,9 +470,33 @@ pub(super) async fn install_candidate(
         }
         operations.admitted(id, digest, lease, "install")?;
         if translated.package.manifest().id == id {
-            return Err(ApiError::Conflict(
-                "插件不能在自己的调用中升级自身，请使用 Magi 在线升级入口".into(),
-            ));
+            let owner = super::operations::installation_owner(id, digest, lease, background)?;
+            let result = operations
+                .install_bundle_prepared(
+                    owner,
+                    magi_app_server_protocol::generated::PluginBundleInstallRequest {
+                        request_id: magi_core::EventId::unique("self-update").to_string(),
+                        ecosystem: request.ecosystem.clone(),
+                        package: request.package.clone(),
+                        version: request.version.clone(),
+                        github: request.github.clone(),
+                        enabled: Some(true),
+                        change_id: None,
+                    },
+                    Some(translated),
+                )
+                .await?;
+            if result.application
+                != magi_app_server_protocol::generated::PluginBundleInstallApplication::Applied
+            {
+                return Err(ApiError::Conflict(
+                    result
+                        .error
+                        .map(|error| error.message)
+                        .unwrap_or_else(|| "自更新未完成，请核对当前安装状态".into()),
+                ));
+            }
+            return Ok(());
         }
     }
     operations

@@ -6,7 +6,7 @@ use magi_app_server_protocol::generated::{
     PluginUpstreamRequest,
 };
 
-pub(super) fn owner(
+pub(in crate::routes::plugins) fn owner(
     plugin: &str,
     digest: &str,
     lease: Option<&str>,
@@ -98,6 +98,15 @@ impl PluginOperations {
         owner: InstallOwner,
         input: PluginBundleInstallRequest,
     ) -> Result<InstallResult, ApiError> {
+        self.install_bundle_prepared(owner, input, None).await
+    }
+
+    pub(in crate::routes::plugins) async fn install_bundle_prepared(
+        &self,
+        owner: InstallOwner,
+        input: PluginBundleInstallRequest,
+        prepared: Option<upstream::Translated>,
+    ) -> Result<InstallResult, ApiError> {
         Self::check_caller(
             &*self.locked("检查安装任务准入")?,
             Some(owner.caller()),
@@ -132,11 +141,14 @@ impl PluginOperations {
             let operations = self.clone();
             let job = job.clone();
             tokio::spawn(async move {
-                let prepared = tokio::select! {
-                    biased;
-                    _ = job.cancelled() => { job.finish(cancelled(&bundle)); return; }
-                    result = tokio::time::timeout(Duration::from_secs(840), operations.prepare_bundle(&input)) => result
-                        .unwrap_or_else(|_| Err(failure(ApiError::InvalidInput("安装准备超时，尚未提交版本".into()), false, &bundle, None, None))),
+                let prepared = match prepared {
+                    Some(value) => Ok(value),
+                    None => tokio::select! {
+                        biased;
+                        _ = job.cancelled() => { job.finish(cancelled(&bundle)); return; }
+                        result = tokio::time::timeout(Duration::from_secs(840), operations.prepare_bundle(&input)) => result
+                            .unwrap_or_else(|_| Err(failure(ApiError::InvalidInput("安装准备超时，尚未提交版本".into()), false, &bundle, None, None))),
+                    },
                 };
                 let translated = match prepared {
                     Ok(value) => value,
@@ -268,12 +280,10 @@ impl PluginOperations {
         };
         let id = package.manifest().id.clone();
         let version = package.manifest().version.clone();
+        if id == owner.plugin {
+            return self.apply_self_update(owner, input, package, source).await;
+        }
         let apply = async {
-            if id == owner.plugin {
-                return Err(ApiError::Conflict(
-                    "插件不能在自己的调用中替换自身，请使用 Magi 在线升级入口".into(),
-                ));
-            }
             let scope = input
                 .change_id
                 .as_ref()
@@ -362,6 +372,116 @@ impl PluginOperations {
             Err(e) => failure(e, true, &bundle, Some(version), Some(changed)),
         }
     }
+
+    /// 自更新的提交由 daemon 安装任务拥有。排空旧宿主会结束发起 RPC，
+    /// 不能再依赖该宿主接收回执或继续使用旧租约；唯一结果是安装事实、
+    /// 持久任务回执和新宿主运行状态。新授权不得超出提交前的已批范围。
+    async fn apply_self_update(
+        &self,
+        owner: &InstallOwner,
+        input: &PluginBundleInstallRequest,
+        package: PluginPackage,
+        source: PluginSource,
+    ) -> InstallResult {
+        use magi_plugin_system::PluginPermissionKind;
+        let id = &owner.plugin;
+        let version = package.manifest().version.clone();
+        let bundle = bundle_label(input);
+        let updated = async {
+            let previous = {
+                let manager = self.locked("核对自更新授权")?;
+                for target in ["install", "lifecycle", "authorize"] {
+                    Self::check_caller(&manager, Some(owner.caller()), target)?;
+                }
+                if input.enabled == Some(false) || input.change_id.is_some() {
+                    return Err(ApiError::InvalidInput(
+                        "自更新保持原启用意愿，不接受自身移除或停用".into(),
+                    ));
+                }
+                self.check_upstream_compatibility(&manager, &package, &source)?;
+                let candidate = manager.preview(&package, &source).map_err(plugin_error)?;
+                if candidate.data_reset {
+                    return Err(ApiError::Forbidden(
+                        "自更新需要重置插件数据，请在 Magi 在线升级入口确认".into(),
+                    ));
+                }
+                for permission in &package.manifest().permissions {
+                    for target in &permission.targets {
+                        if !manager
+                            .permission_allowed(id, permission.kind.clone(), target)
+                            .map_err(plugin_error)?
+                        {
+                            return Err(ApiError::Forbidden(
+                                "自更新包含尚未授权的能力，请在 Magi 在线升级入口确认新权限".into(),
+                            ));
+                        }
+                    }
+                }
+                if !manager
+                    .permission_allowed(id, PluginPermissionKind::Extension, "full-trust")
+                    .map_err(plugin_error)?
+                {
+                    return Err(ApiError::Forbidden("自更新需要已批准的完全信任授权".into()));
+                }
+                if matches!(
+                    candidate.operation,
+                    magi_app_server_protocol::generated::PluginCandidateOperation::Unchanged
+                ) {
+                    return Ok(false);
+                }
+                manager.state().plugins[id].clone()
+            };
+            let drain =
+                PluginManager::begin_runtime_upgrade_drain(self.manager.clone(), id, &owner.lease)
+                    .map_err(plugin_error)?;
+            self.quiesce(id).await?;
+            let commit = (|| {
+                let mut manager = self.locked("提交自更新")?;
+                // 用户停用／撤权或其他安装若已改变事实，旧请求不能重启它。
+                if manager.state().plugins.get(id) != Some(&previous) {
+                    return Err(ApiError::Conflict(
+                        "自更新期间插件状态已变化，请刷新后重试".into(),
+                    ));
+                }
+                self.check_upstream_compatibility(&manager, &package, &source)?;
+                manager
+                    .upgrade(&package, source, &drain)
+                    .map_err(plugin_error)?;
+                drain.commit(&mut manager);
+                manager
+                    .authorize(id, package.manifest().permissions.clone())
+                    .map_err(plugin_error)?;
+                manager.activate(id).map_err(plugin_error)?;
+                Ok(())
+            })();
+            self.changed();
+            commit?;
+            self.wait_running(id, None, Some(package.digest())).await?;
+            Ok(true)
+        }
+        .await;
+        match updated {
+            Ok(changed) => InstallResult {
+                application: Application::Applied,
+                bundle: Some(bundle),
+                version: Some(version),
+                changed: Some(changed),
+                installed: Some(true),
+                stage: None,
+                error: None,
+            },
+            Err(error) => {
+                let installed = self.locked("核对自更新结果").is_ok_and(|manager| {
+                    manager
+                        .state()
+                        .plugins
+                        .get(id)
+                        .is_some_and(|value| value.digest == package.digest())
+                });
+                failure(error, installed, &bundle, Some(version), None)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -371,7 +491,10 @@ mod tests {
     use std::io::{Cursor, Write};
 
     fn package(id: &str, permissions: Value) -> PluginPackage {
-        let manifest = json!({"sdkVersion":2,"id":id,"version":"1.0.0","name":id,"description":"","dataSchemaVersion":1,
+        versioned_package(id, permissions, "1.0.0")
+    }
+    fn versioned_package(id: &str, permissions: Value, version: &str) -> PluginPackage {
+        let manifest = json!({"sdkVersion":2,"id":id,"version":version,"name":id,"description":"","dataSchemaVersion":1,
             "extension":{"hooks":[]},"permissions":permissions,"settingsSchema":{"type":"object"},
             "contributions":{"commands":[{"id":"status","title":"Status","description":""}]}});
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -536,5 +659,203 @@ mod tests {
                 .plugins
                 .contains_key("dsh.sample")
         );
+    }
+
+    struct SelfUpdateRuntime {
+        manager: Arc<Mutex<PluginManager>>,
+        stops: std::sync::atomic::AtomicUsize,
+        revoke: bool,
+        replacement: Option<PluginPackage>,
+    }
+    impl crate::ExtensionStatusSource for SelfUpdateRuntime {
+        fn quiesce(
+            &self,
+            id: String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        {
+            self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut manager = self.manager.lock().unwrap();
+            manager.end_runtime(&id, "current");
+            if self.revoke {
+                manager.deactivate(&id).unwrap();
+            }
+            Box::pin(async { Ok(()) })
+        }
+        fn status(
+            &self,
+            id: &str,
+        ) -> Option<magi_app_server_protocol::generated::PluginRuntimeStatus> {
+            if let Some(replacement) = &self.replacement {
+                let drain = PluginManager::begin_upgrade_drain(self.manager.clone(), id).unwrap();
+                let mut manager = self.manager.lock().unwrap();
+                manager.upgrade(replacement, self_source(), &drain).unwrap();
+                drain.commit(&mut manager);
+                manager
+                    .authorize(id, replacement.manifest().permissions.clone())
+                    .unwrap();
+                manager.activate(id).unwrap();
+            }
+            let mut manager = self.manager.lock().unwrap();
+            let digest = manager.state().plugins[id].digest.clone();
+            manager.begin_runtime(id, &digest, "new-instance").unwrap();
+            manager.ready_runtime(id, "new-instance").unwrap();
+            Some(magi_app_server_protocol::generated::PluginRuntimeStatus {
+                state: magi_app_server_protocol::generated::PluginRuntimeState::Running,
+                generation: 2,
+                reason: None,
+                crashes: 0,
+                blocking: vec![],
+            })
+        }
+    }
+    fn self_candidate(state: &ApiState, extra: bool) -> PluginPackage {
+        let mut permissions = state
+            .plugin_manager
+            .lock()
+            .unwrap()
+            .package("acme.manager")
+            .unwrap()
+            .manifest()
+            .permissions
+            .clone();
+        if extra {
+            permissions.push(
+                serde_json::from_value(json!({"kind":"sessionRead","targets":["directory"]}))
+                    .unwrap(),
+            );
+        }
+        versioned_package(
+            "acme.manager",
+            serde_json::to_value(permissions).unwrap(),
+            "2.0.0",
+        )
+    }
+    fn self_source() -> PluginSource {
+        PluginSource::Local {
+            name: "manager.zip".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn self_update_survives_old_instance_end_without_expanding_grants_and_rejects_its_old_lease()
+     {
+        let (state, _root, who) = fixture(&["install", "lifecycle", "authorize"]);
+        let runtime = Arc::new(SelfUpdateRuntime {
+            manager: state.plugin_manager.clone(),
+            stops: 0.into(),
+            revoke: false,
+            replacement: None,
+        });
+        let candidate = self_candidate(&state, false);
+        let state = state.with_extension_status(runtime.clone());
+        let operations = PluginOperations::from_state(&state);
+        let result = operations
+            .apply_self_update(&who, &input(true), candidate.clone(), self_source())
+            .await;
+        assert_eq!(result.application, Application::Applied, "{result:?}");
+        assert_eq!(runtime.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let manager = state.plugin_manager.lock().unwrap();
+        let current = &manager.state().plugins[&who.plugin];
+        assert_eq!(current.digest, candidate.digest());
+        assert!(current.active && current.enabled);
+        assert_eq!(current.grants, candidate.manifest().permissions);
+        assert!(PluginOperations::check_caller(&manager, Some(who.caller()), "install").is_err());
+        assert!(manager.runtime_ready(&who.plugin).unwrap());
+    }
+
+    #[tokio::test]
+    async fn self_update_requires_authorize_delegation_and_rejects_new_permissions_before_stopping()
+    {
+        for delegated in [false, true] {
+            let grants = if delegated {
+                vec!["install", "lifecycle", "authorize"]
+            } else {
+                vec!["install", "lifecycle"]
+            };
+            let (state, _root, who) = fixture(&grants);
+            let candidate = self_candidate(&state, delegated);
+            let runtime = Arc::new(SelfUpdateRuntime {
+                manager: state.plugin_manager.clone(),
+                stops: 0.into(),
+                revoke: false,
+                replacement: None,
+            });
+            let state = state.with_extension_status(runtime.clone());
+            let result = PluginOperations::from_state(&state)
+                .apply_self_update(&who, &input(true), candidate, self_source())
+                .await;
+            assert_eq!(result.application, Application::Failed, "{result:?}");
+            assert_eq!(runtime.stops.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(
+                state.plugin_manager.lock().unwrap().state().plugins[&who.plugin].digest,
+                who.digest
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn self_update_rechecks_user_state_after_stop_and_preserves_old_installation_on_archive_failure()
+     {
+        for revoke in [false, true] {
+            let (state, root, who) = fixture(&["install", "lifecycle", "authorize"]);
+            let original =
+                state.plugin_manager.lock().unwrap().state().plugins[&who.plugin].clone();
+            let candidate = self_candidate(&state, false);
+            if !revoke {
+                std::fs::create_dir_all(
+                    root.path()
+                        .join("versions")
+                        .join(&who.plugin)
+                        .join(format!("{}.zip", candidate.digest())),
+                )
+                .unwrap();
+            }
+            let runtime = Arc::new(SelfUpdateRuntime {
+                manager: state.plugin_manager.clone(),
+                stops: 0.into(),
+                revoke,
+                replacement: None,
+            });
+            let state = state.with_extension_status(runtime.clone());
+            let result = PluginOperations::from_state(&state)
+                .apply_self_update(&who, &input(true), candidate, self_source())
+                .await;
+            assert_eq!(result.application, Application::Failed, "{result:?}");
+            let manager = state.plugin_manager.lock().unwrap();
+            let current = &manager.state().plugins[&who.plugin];
+            assert_eq!(current.digest, original.digest);
+            assert_eq!(current.grants, original.grants);
+            assert_eq!(current.active, !revoke);
+            assert!(!manager.is_draining(&who.plugin));
+        }
+    }
+
+    #[tokio::test]
+    async fn self_update_does_not_claim_another_versions_ready_instance_as_its_own_success() {
+        let (state, _root, who) = fixture(&["install", "lifecycle", "authorize"]);
+        let candidate = self_candidate(&state, false);
+        let replacement = versioned_package(
+            &who.plugin,
+            serde_json::to_value(&candidate.manifest().permissions).unwrap(),
+            "3.0.0",
+        );
+        let runtime = Arc::new(SelfUpdateRuntime {
+            manager: state.plugin_manager.clone(),
+            stops: 0.into(),
+            revoke: false,
+            replacement: Some(replacement.clone()),
+        });
+        let state = state.with_extension_status(runtime);
+        let result = PluginOperations::from_state(&state)
+            .apply_self_update(&who, &input(true), candidate, self_source())
+            .await;
+        assert_eq!(result.application, Application::Failed, "{result:?}");
+        assert!(result.error.unwrap().message.contains("版本已变化"));
+        let manager = state.plugin_manager.lock().unwrap();
+        assert_eq!(
+            manager.state().plugins[&who.plugin].digest,
+            replacement.digest()
+        );
+        assert!(manager.runtime_ready(&who.plugin).unwrap());
     }
 }

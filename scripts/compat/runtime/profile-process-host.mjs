@@ -2,9 +2,9 @@
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { randomBytes } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MAX_PROCESS_FRAME } from './profile-process-call.mjs';
 import { createPluginManager } from './plugin-manager.mjs';
@@ -14,15 +14,55 @@ import { withProfile, commitProcessProposal } from './profile.mjs';
 export const packageManagerScript = fileURLToPath(new URL('profile-package-manager.mjs', import.meta.url));
 export const profilePackageManager = () => Object.freeze({ command: process.execPath, args: [packageManagerScript] });
 
-function installSpec(args, profile) {
-  if (!Array.isArray(args) || args[0] !== 'add' || typeof args[1] !== 'string') throw new Error('仅支持当前 profile 的在线 add 请求');
-  let directory;
-  for (let index = 2; index < args.length; index++) {
-    if (args[index] === '--dir' && directory === undefined) directory = args[++index];
-    else if (!['-w', '--ignore-scripts', '--force'].includes(args[index])) throw new Error('包管理参数未提供对应产品能力');
+function directoryIdentity(path) {
+  try { return realpathSync(path); }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    const parent = dirname(path);
+    return parent === path ? path : resolve(directoryIdentity(parent), basename(path));
   }
-  if (typeof directory !== 'string' || resolve(directory) !== profile) throw new Error('不能操作其他 profile');
-  return args[1];
+}
+
+// npm/pnpm 只把当前 profile 的明确包操作转换为 daemon 请求；外部目录
+// 继续由真实程序拥有。不会在投影目录安装依赖、生成锁文件或运行脚本。
+export function profilePackageCommand(file, args, options, roots) {
+  let name = basename(String(file)).replace(/\.cmd$/i, '').toLowerCase();
+  if (file === process.execPath && Array.isArray(args) && /^(?:npm-cli\.js|pnpm\.(?:c?js|mjs))$/.test(basename(args[0] ?? ''))) {
+    name = basename(args[0]).startsWith('npm') ? 'npm' : 'pnpm'; args = args.slice(1);
+  }
+  if (!['npm', 'pnpm'].includes(name) || !Array.isArray(args)) return;
+  const cwd = resolve(options?.cwd instanceof URL ? fileURLToPath(options.cwd) : options?.cwd ?? process.cwd());
+  const identities = new Set(roots.map(root => directoryIdentity(resolve(root))));
+  const inProfile = directory => identities.has(directoryIdentity(directory));
+  let directory = cwd, explicitDirectory = false, invalidDirectory = false, touchesProfile = inProfile(cwd);
+  const remaining = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = String(args[index]);
+    const flag = arg.match(/^(--prefix|--dir|-C)(?:=(.*))?$/);
+    if (!flag) { remaining.push(arg); continue; }
+    const value = flag[2] ?? args[++index];
+    if (explicitDirectory || typeof value !== 'string' || !value || value.startsWith('-')) invalidDirectory = true;
+    if (typeof value === 'string' && value && !value.startsWith('-')) {
+      directory = resolve(cwd, value); touchesProfile ||= inProfile(directory);
+    }
+    explicitDirectory = true;
+  }
+  if (invalidDirectory && touchesProfile) throw new Error('包管理目录参数无效或重复');
+  if (!inProfile(directory)) return;
+  const [verb, spec, ...flags] = remaining;
+  const action = ['add', 'install', 'i'].includes(verb) ? 'add'
+    : ['remove', 'uninstall', 'rm', 'un'].includes(verb) ? 'remove' : null;
+  if (!action || !spec || spec.startsWith('-')) throw new Error('Magi profile 包管理需要明确的单个安装或移除目标');
+  const allowed = new Set(['--ignore-scripts', '--no-audit', '--no-fund', '--no-progress', '--yes', '--force', '-w', '--reporter=append-only']);
+  if (flags.some(flag => !allowed.has(flag))) throw new Error('包管理参数未提供对应产品能力');
+  return { action, spec };
+}
+
+function installSpec(args, profile) {
+  const command = profilePackageCommand('pnpm', args, { cwd: profile }, [profile]);
+  if (!command) throw new Error('不能操作其他 profile');
+  if (command.action !== 'add') throw new Error('仅支持当前 profile 的在线 add 请求');
+  return command.spec;
 }
 
 export function createProfileProcesses(api, { home, registry }) {

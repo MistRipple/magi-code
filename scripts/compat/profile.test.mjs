@@ -15,6 +15,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { zipSync, strToU8 } from 'fflate';
 import { spawn as spawnProfileProcess } from './runtime/profile-process.mjs';
+import { pathToFileURL } from 'node:url';
 
 test('管理服务直接安装、启停和移除后的 profile 读取反映本次 daemon 已提交事实', async t => {
   const home=await mkdtemp(join(tmpdir(),'magi-profile-manager-'));t.after(()=>rm(home,{recursive:true,force:true}));
@@ -545,6 +546,72 @@ test('DSH 管理命令的终止请求取消同一个 daemon 安装任务，不�
     const closed=once(child,'close'), id=await began;
     child.kill();
     assert.equal((await closed)[0],1);assert.equal(cancelled,id);
+  });
+});
+
+test('npm/pnpm 当前 profile 包操作共用 daemon 目录，无物理安装树且外部目录保持独立', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'magi-profile-standard-manager-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  let plugins = [], installations = 0;
+  const off = configureProfile({ plugins: {
+    list: async () => ({ plugins: structuredClone(plugins) }),
+    async installBundle(input) {
+      installations++; assert.equal(input.package, '@scope/target'); assert.equal(input.enabled, true);
+      plugins = [{ manifest: { id: 'dsh.target' }, digest: input.version, enabled: true, active: true,
+        source: { kind: 'upstream', location: `dsh:@scope/target@${input.version}` },
+        upstreamManifest: { name: '@scope/target', version: input.version } }];
+      return { application: 'applied', installed: true, version: input.version };
+    },
+    async remove(id, digest) { assert.equal(id, 'dsh.target'); assert.equal(digest, plugins[0].digest); plugins = []; },
+    async finishChange(input) { assert.equal(input.commit, true); return { restored: [] }; },
+  } }, { home }); t.after(off);
+  const run = async (file, args, options) => {
+    const child = profileSpawn(file, args, options); assert.ok(child);
+    let stderr = ''; child.stdout.resume(); child.stderr.on('data', bytes => stderr += bytes);
+    return { code: (await once(child, 'close'))[0], stderr };
+  };
+  await withProfile(async () => {
+    const directory = profilePath(); nativeFs.mkdirSync(directory, { recursive: true });
+    assert.equal((await run('npm', ['install', '@scope/target@1.0.0', '--ignore-scripts', '--no-audit', '--no-fund', '--no-progress'], { cwd: directory })).code, 0);
+    assert.equal(JSON.parse(fs.readFileSync(join(directory, 'node_modules/@scope/target/package.json'), 'utf8')).version, '1.0.0');
+    assert.equal((await run('pnpm', ['add', '@scope/target@2.0.0', '--ignore-scripts', '--reporter=append-only', '--yes', '--dir', directory], { cwd: home })).code, 0);
+    assert.equal(JSON.parse(fs.readFileSync(join(directory, 'package.json'), 'utf8')).dependencies['@scope/target'], '2.0.0');
+    assert.equal((await run(process.execPath, [join(home, 'npm-cli.js'), 'install', '@scope/target@3.0.0'], { cwd: pathToFileURL(directory) })).code, 0);
+    const alias = join(home, 'profile-alias'); nativeFs.symlinkSync(directory, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    assert.equal((await run('npm', ['install', '@scope/target@4.0.0'], { cwd: alias })).code, 0);
+    assert.equal((await run('npm.cmd', ['uninstall', '@scope/target', '--prefix', directory], { cwd: home })).code, 0);
+    assert.deepEqual(loaderEntries(), []);
+    for (const args of [
+      ['install'], ['install', '@scope/target@1.0.0', '--ignore-scripts=false'],
+      ['install', '@scope/target@1.0.0', '--prefix', home, '--prefix', directory],
+    ]) assert.equal((await run('npm', args, { cwd: directory })).code, 1);
+    assert.equal(installations, 4, '无目标或不支持参数不能创建任何安装');
+    assert.equal(profileSpawn('npm', ['install', 'outside@1.0.0'], { cwd: home }), undefined);
+    assert.equal(profileSpawn('npm', ['install', 'outside@1.0.0', '--prefix', home], { cwd: directory }), undefined);
+    for (const file of ['package.json', 'package-lock.json', 'node_modules']) assert.equal(nativeFs.existsSync(join(directory, file)), false);
+  });
+  const denied = await run('npm', ['install', '@scope/target@4.0.0'], { cwd: profilePath() });
+  assert.equal(denied.code, 1); assert.match(denied.stderr, /当前实例调用快照/);
+});
+
+test('标准包管理命令取消同一 native 安装任务，取消后仍可显式重试', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'magi-profile-npm-cancel-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  let began, finish, cancelled, attempts = 0;
+  const started = new Promise(resolve => { began = resolve; });
+  const off = configureProfile({ plugins: {
+    list: async () => ({ plugins: [] }),
+    installBundle(input) {
+      attempts++; if (attempts > 1) return { application: 'applied' };
+      began(input.requestId); return new Promise(resolve => { finish = resolve; });
+    },
+    async cancelInstall(id) { cancelled = id; finish({ application: 'cancelled' }); return { status: 'cancelled' }; },
+  } }, { home }); t.after(off);
+  await withProfile(async () => {
+    const run = () => { const child = profileSpawn('pnpm', ['add', 'target@1.0.0'], { cwd: profilePath() }); child.stdout.resume(); child.stderr.resume(); return child; };
+    const child = run(), closed = once(child, 'close'), requestId = await started;
+    child.kill(); assert.equal((await closed)[0], 1); assert.equal(cancelled, requestId);
+    assert.equal((await once(run(), 'close'))[0], 0); assert.equal(attempts, 2);
   });
 });
 

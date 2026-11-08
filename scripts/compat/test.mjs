@@ -92,6 +92,17 @@ test('profile 启停文件写入有独立准入证据，普通文件写入不申
   assert.deepEqual(read.profileMutations, []);
 });
 
+test('延迟执行的标准包管理子进程保留安装授权证据，普通进程和同名函数不混入', async t => {
+  const report = await inspectOptional(t, "import {spawn as launch} from 'node:child_process'; export function apply(ctx) {} export function install(dir){const manager='npm';return launch(manager,['install','target@1.0.0'],{cwd:dir})}");
+  assert.deepEqual(report.profilePackageProcesses, ['index.js']);
+  const nodeManager = await inspectOptional(t, "import cp from 'node:child_process'; export function apply(ctx) {} export function install(dir){return cp.spawn(process.execPath,['/tools/npm/bin/npm-cli.js','install','target@1.0.0'],{cwd:dir})}");
+  assert.deepEqual(nodeManager.profilePackageProcesses, ['index.js']);
+  const ordinary = await inspectOptional(t, "import cp from 'node:child_process'; export function apply(ctx) {cp.spawn('capture',['screen.png'])}");
+  assert.deepEqual(ordinary.profilePackageProcesses, []);
+  const unrelated = await inspectOptional(t, "function spawn(name) {return name}; export function apply(ctx) {spawn('npm')}");
+  assert.deepEqual(unrelated.profilePackageProcesses, []);
+});
+
 test('DSH 可选服务保留缺失报告；必需依赖、未知服务和分支里的其他未支持服务仍阻塞', async (t) => {
   const optional = "export function apply(ctx) { ctx.inject(['sessionProjections'], c => c.sessionProjections.stateOf()); }";
   const report = await inspectOptional(t, optional);

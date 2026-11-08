@@ -319,6 +319,7 @@ export function scanSources(root, options = {}) {
   const serviceMembers = new Map();
   const events = new Map();
   const profileMutations = [];
+  const profilePackageProcesses = [];
   let lines = 0;
   const { info, unresolved } = analyzeContexts(files, flow);
   for (const file of files) {
@@ -351,6 +352,32 @@ export function scanSources(root, options = {}) {
     };
     inspectProfile(source);
     if (writesProfile && profilePatch) profileMutations.push(rel);
+    // 包管理可能仅在用户点击页面后启动。明确携带 npm/pnpm 命令并导入
+    // spawn 的模块提前声明安装委托；运行时只接管当前 profile 的包操作，
+    // 普通截图子进程不因此获得插件管理权限。
+    const processSpawners = new Set(), processNamespaces = new Set();
+    for (const statement of source.statements) if (ts.isImportDeclaration(statement)
+      && /^(?:node:)?child_process$/.test(statement.moduleSpecifier?.text ?? '')) {
+      const named = statement.importClause?.namedBindings;
+      if (statement.importClause?.name) processNamespaces.add(statement.importClause.name.text);
+      if (named && ts.isNamespaceImport(named)) processNamespaces.add(named.name.text);
+      if (named && ts.isNamedImports(named)) for (const binding of named.elements) {
+        if ((binding.propertyName ?? binding.name).text === 'spawn') processSpawners.add(binding.name.text);
+      }
+    }
+    let spawnsProcess = false, namesPackageManager = false;
+    const inspectProcess = node => {
+      if (ts.isStringLiteralLike(node)
+        && /(?:^|[/\\])(?:(?:npm|pnpm)(?:\.cmd)?|npm-cli\.js|pnpm\.(?:c?js|mjs))$/i.test(node.text)) namesPackageManager = true;
+      if (ts.isCallExpression(node)) {
+        const callee = node.expression;
+        if (ts.isIdentifier(callee) && processSpawners.has(callee.text)
+          || ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression) && processNamespaces.has(callee.expression.text) && callee.name.text === 'spawn') spawnsProcess = true;
+      }
+      ts.forEachChild(node, inspectProcess);
+    };
+    inspectProcess(source);
+    if (spawnsProcess && namesPackageManager) profilePackageProcesses.push(rel);
     const labelOf = (name, at) => {
       for (let n = at.parent; n; n = n.parent) { const label = scopes.get(n)?.get(name); if (label) return label; }
       return undefined;
@@ -429,5 +456,5 @@ export function scanSources(root, options = {}) {
     visit(source);
   }
   const plain = (map) => Object.fromEntries([...map].sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => [key, { count: value.count, optional: value.optionalCount === value.count, files: [...value.files].sort() }]));
-  return { fileCount: files.length, lineCount: lines, files: files.map((file) => relative(root, file)), imports: plain(imports), symbols: plain(symbols), calls: plain(calls), injects: plain(injects), serviceReads: plain(serviceReads), serviceMembers: plain(serviceMembers), profileMutations, events: plain(events), unresolvedContextFlows: unresolved };
+  return { fileCount: files.length, lineCount: lines, files: files.map((file) => relative(root, file)), imports: plain(imports), symbols: plain(symbols), calls: plain(calls), injects: plain(injects), serviceReads: plain(serviceReads), serviceMembers: plain(serviceMembers), profileMutations, profilePackageProcesses, events: plain(events), unresolvedContextFlows: unresolved };
 }

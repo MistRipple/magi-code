@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 mod installation;
 mod translation;
+pub(super) use installation::owner as installation_owner;
 
 #[derive(Clone)]
 pub struct PluginOperations {
@@ -1465,7 +1466,7 @@ impl PluginOperations {
                         .is_active(id)
                         .map_err(plugin_error)?
                     {
-                        self.wait_running(id, identity).await?;
+                        self.wait_running(id, identity, None).await?;
                     }
                 }
                 serde_json::to_value(
@@ -1556,7 +1557,7 @@ impl PluginOperations {
                         expected
                             .iter()
                             .filter(|(_, _, active)| *active)
-                            .map(|(id, _, _)| self.wait_running(id, identity)),
+                            .map(|(id, digest, _)| self.wait_running(id, identity, Some(digest))),
                     )
                     .await?;
                     Ok::<(), ApiError>(())
@@ -1713,7 +1714,8 @@ impl PluginOperations {
                 },
             )
             .await?;
-            self.wait_running(id, caller).await?;
+            self.wait_running(id, caller, change.expected_digest)
+                .await?;
         }
         Ok(())
     }
@@ -1939,16 +1941,18 @@ impl PluginOperations {
         &self,
         id: &str,
         caller: Option<OperationCaller<'_>>,
+        expected_digest: Option<&str>,
     ) -> Result<(), ApiError> {
         use magi_app_server_protocol::generated::PluginRuntimeState;
-        if self
+        let package = self
             .locked("读取插件入口")?
             .package(id)
-            .map_err(plugin_error)?
-            .manifest()
-            .extension
-            .is_none()
-        {
+            .map_err(plugin_error)?;
+        let expected_digest = expected_digest.unwrap_or(package.digest());
+        if package.digest() != expected_digest {
+            return Err(ApiError::Conflict("等待启动的插件版本已变化".into()));
+        }
+        if package.manifest().extension.is_none() {
             return Ok(());
         }
         let Some(source) = &self.extension_status else {
@@ -1959,31 +1963,31 @@ impl PluginOperations {
             .ok_or_else(|| ApiError::Conflict("扩展监管器已退出".into()))?;
         let wait = async {
             loop {
+                let status = source.status(id);
                 {
                     let manager = self.locked("检查激活结果")?;
                     Self::check_caller(&manager, caller, "lifecycle")?;
+                    if manager.package(id).map_err(plugin_error)?.digest() != expected_digest {
+                        return Err(ApiError::Conflict("等待启动的插件版本已变化".into()));
+                    }
                     if !manager.is_active(id).map_err(plugin_error)? {
                         return Err(ApiError::Conflict("目标插件已被停用或撤权".into()));
                     }
-                }
-                if let Some(status) = source.status(id) {
-                    match status.state {
-                        PluginRuntimeState::Running => {
-                            if self
-                                .locked("核对当前版本实例")?
-                                .runtime_ready(id)
-                                .map_err(plugin_error)?
-                            {
-                                return Ok(());
+                    if let Some(status) = status {
+                        match status.state {
+                            PluginRuntimeState::Running => {
+                                if manager.runtime_ready(id).map_err(plugin_error)? {
+                                    return Ok(());
+                                }
                             }
+                            PluginRuntimeState::Failed => {
+                                return Err(ApiError::Conflict(format!(
+                                    "插件激活失败：{}",
+                                    status.reason.unwrap_or_default()
+                                )));
+                            }
+                            _ => {}
                         }
-                        PluginRuntimeState::Failed => {
-                            return Err(ApiError::Conflict(format!(
-                                "插件激活失败：{}",
-                                status.reason.unwrap_or_default()
-                            )));
-                        }
-                        _ => {}
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;

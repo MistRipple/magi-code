@@ -667,6 +667,53 @@ fn upgrade_drain_blocks_activation_until_it_is_released() {
 }
 
 #[test]
+fn runtime_upgrade_rejects_replaced_lease_before_closing_current_instance_admission() {
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    let package = package(false);
+    let id = package.manifest().id.as_str();
+    manager
+        .install(
+            &package,
+            PluginSource::Local {
+                name: "first.zip".into(),
+            },
+        )
+        .unwrap();
+    manager.enable(id).unwrap();
+    manager.activate(id).unwrap();
+    manager.begin_runtime(id, package.digest(), "old").unwrap();
+    let installed = manager.state().plugins[id].clone();
+    manager.end_runtime(id, "old");
+    manager
+        .begin_runtime(id, package.digest(), "current")
+        .unwrap();
+    let manager = Arc::new(Mutex::new(manager));
+
+    assert!(PluginManager::begin_runtime_upgrade_drain(manager.clone(), id, "old").is_err());
+    {
+        let guard = manager.lock().unwrap();
+        assert_eq!(guard.state().plugins[id], installed);
+        assert!(!guard.is_draining(id));
+        guard.check_runtime(id, "current").unwrap();
+    }
+    let drain = PluginManager::begin_runtime_upgrade_drain(manager.clone(), id, "current").unwrap();
+    assert!(
+        manager
+            .lock()
+            .unwrap()
+            .begin_runtime(id, package.digest(), "late")
+            .is_err()
+    );
+    drop(drain);
+    manager
+        .lock()
+        .unwrap()
+        .check_runtime(id, "current")
+        .unwrap();
+}
+
+#[test]
 fn installed_packages_are_parsed_once_and_replaced_by_digest() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();
