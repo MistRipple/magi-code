@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectAppPage, connectTarget, createReporter, launchApp, pageTools, waitFor } from './lib/electron-harness.mjs';
+import { capturePluginDownload } from './lib/plugin-download-acceptance.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
@@ -42,7 +43,7 @@ async function call(path, body, headers = { 'x-plugin-health-key': key }) {
 async function start() {
   assert.ok(!await fetch(origin + '/health').then(() => true, () => false), '验收端口空闲');
   assert.ok(!await fetch(`http://127.0.0.1:${cdpPort}/json/version`).then(() => true, () => false), '验收 CDP 端口空闲');
-  app = launchApp({ executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort,
+  app = launchApp({ executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort, inspectPort: cdpPort + 1,
     env: { MAGI_STATE_ROOT: join(work, 'state'), MAGI_DESKTOP_DAEMON_PORT: String(port), MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_COMPAT: '', MAGI_EXTENSION_NODE: '' } });
   await waitFor(() => fetch(origin + '/health').then(r => r.ok), 'daemon', 60_000);
   page = await waitFor(() => connectAppPage(cdpPort, port, errors), 'Electron', 60_000); ui = pageTools(page);
@@ -111,6 +112,16 @@ try {
   await writeFile(join(output, 'health.png'), Buffer.from(await ui.screenshot(), 'base64'));
   report.check('原生 Health 页面展示实际诊断与可执行的修复入口', true);
   const clickText = async expression => frame.evaluate(`(()=>{const button=[...document.querySelectorAll('button')].find(b=>${expression});if(!button)return false;button.click();return true;})()`);
+  const selectMode = mode => frame.evaluate(`(()=>{const select=document.querySelector('.dph-mode select');if(!select)throw new Error('原包显示方式入口缺失');select.value=${JSON.stringify(mode)};select.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  await selectMode('advanced');
+  const snapshot = await capturePluginDownload({ inspectPort: cdpPort + 1, pid: app.child.pid }, join(output, 'exports'), async () => {
+    await waitFor(() => clickText(`b.getClientRects().length > 0 && /下载当前检查记录|下载当前配置快照|Download current check record|Download current snapshot/.test(b.innerText)`), '原包下载检查记录入口');
+  });
+  const snapshotData = JSON.parse(snapshot.bytes.toString());
+  report.check('Health 原页面导出真实检查 JSON 文件，包含当前原包身份', snapshot.state === 'completed'
+    && snapshot.suggestedFilename === 'dsh-profile-snapshot.json' && snapshotData.schemaVersion === 1
+    && snapshotData.packages.some(p => p.name === 'dsh-plugin-health' && p.version === health.manifest.version));
+  await selectMode('daily');
   await waitFor(() => clickText(`/清理\\s*1|Clean up\\s*1/i.test(b.innerText)`), '原包非空修复计划入口');
   await waitFor(() => frame.evaluate(`document.body.innerText.includes('确认修复') || document.body.innerText.includes('Confirm repair')`), '原包修复确认');
   report.check('原页面先显示非空修复预览，确认前文件仍存在', await access(residue).then(() => true, () => false));

@@ -14,6 +14,44 @@ import { once } from 'node:events';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { zipSync, strToU8 } from 'fflate';
+import { spawn as spawnProfileProcess } from './runtime/profile-process.mjs';
+
+test('明确指定外部 DSH 实例的 CLI 和 Node 辅助进程保留原环境，不进入 Magi 安装委托', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'magi-profile-ownership-')); t.after(() => rm(home, { recursive: true, force: true }));
+  const external = join(home, 'external'), directory = join(external, 'profiles', 'web');
+  nativeFs.mkdirSync(directory, { recursive: true });
+  nativeFs.writeFileSync(join(directory, 'package.json'), JSON.stringify({ name: 'external-profile', private: true }));
+  let installs = 0;
+  const release = configureProfile({ plugins: {
+    list: async () => ({ plugins: [] }),
+    installBundle() { installs++; throw new Error('外部安装不能进入 Magi'); },
+  } }, { home }); t.after(release);
+  const probe = join(home, 'external-probe.cjs');
+  await writeFile(probe, `const fs=require('node:fs');console.log(JSON.stringify({
+    home:process.env.DSH_HOME,profile:process.env.DSH_PROFILE,dir:process.env.DSH_PROFILE_DIR,
+    delegated:Boolean(process.env.MAGI_PROFILE_PROCESS_TOKEN),
+    manifest:JSON.parse(fs.readFileSync(process.env.DSH_PROFILE_DIR+'/package.json','utf8'))
+  }));`);
+  const env = { ...process.env, DSH_HOME: external, DSH_PROFILE: 'web', DSH_PROFILE_DIR: directory };
+  await withProfile(async () => {
+    assert.equal(profileSpawn('dsh', ['plugin', '--profile', 'web', 'add', 'outside@1.0.0'], { env }), undefined);
+    assert.equal(profileSpawn(process.execPath, [probe], { env }), undefined);
+    assert.equal(profileSpawn('dsh', ['--profile', 'web', '--dump-config'], { env: {} }), undefined);
+    assert.equal(profileSpawn('dsh', ['plugin', 'add', 'outside@1.0.0'], { env: { ...env, DSH_HOME: join(home, 'not-created') } }), undefined);
+    const child = spawnProfileProcess(process.execPath, [probe], { env });
+    let output = '', errors = '';
+    child.stdout.on('data', data => output += data); child.stderr.on('data', data => errors += data);
+    assert.equal((await once(child, 'close'))[0], 0, errors);
+    assert.deepEqual(JSON.parse(output), { home: external, profile: 'web', dir: directory, delegated: false,
+      manifest: { name: 'external-profile', private: true } });
+    const managed = profileSpawn('dsh', ['--profile', 'magi', '--dump-config'], { env: { ...env, DSH_HOME: nativeFs.realpathSync(home) } });
+    assert.ok(managed, '当前目录的真实路径仍由唯一 profile 入口管理');
+    managed.stdout.resume(); managed.stderr.resume();
+    assert.equal((await once(managed, 'close'))[0], 1);
+  });
+  assert.equal(installs, 0);
+  assert.equal(nativeFs.existsSync(join(home, 'profiles')), false);
+});
 
 test('profile 配置复制沿同一调用提案，来源说明从 daemon 重读，删除停用项可恢复且旧来源不能覆盖新操作', async t => {
   const home = await mkdtemp(join(tmpdir(), 'magi-profile-reason-')); t.after(() => rm(home, { recursive: true, force: true }));

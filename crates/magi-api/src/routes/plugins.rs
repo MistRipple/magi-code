@@ -253,7 +253,7 @@ fn resource_response(
     response.headers_mut().insert(
         "content-security-policy",
         HeaderValue::from_static(
-            "sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; object-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'; connect-src 'none'",
+            "sandbox allow-scripts allow-downloads; default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; object-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'; connect-src 'none'",
         ),
     );
     response.headers_mut().insert(
@@ -1200,7 +1200,12 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(csp.starts_with("sandbox allow-scripts;"), "{csp}");
+        assert!(
+            csp.starts_with("sandbox allow-scripts allow-downloads;"),
+            "{csp}"
+        );
+        assert!(!csp.contains("allow-same-origin"), "{csp}");
+        assert!(!csp.contains("allow-popups"), "{csp}");
         assert!(csp.contains("connect-src 'none'"), "{csp}");
         assert!(csp.contains("img-src 'self' data: blob:"), "{csp}");
         assert!(csp.contains("object-src 'none'"), "{csp}");

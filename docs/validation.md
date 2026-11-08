@@ -291,6 +291,10 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 `npm run test:electron-dsh-health` 使用 macOS 目录发行包、随包 Node 和独立状态根，在线安装固定版本 Health 与 Release Probe 原包，验证诊断、修复预览／取消／确认、真实文件隔离和恢复日志、停用来源展示、跨应用重启恢复与诊断交接。`MAGI_DSH_HEALTH_OUTPUT` 指定证据目录，`MAGI_DSH_HEALTH_PORT`／`MAGI_DSH_HEALTH_CDP_PORT` 调整验收端口；`MAGI_PLUGIN_CLIP_AUDIT_SOURCE` 可提供桌面技能的原始阴影审计函数。该脚本只验证列出的业务，不作为全部修复类型或生态覆盖率的证明。
 
+`npm run test:electron-plugin-runtime` 可设置 `MAGI_DSH_EXTERNAL_CLI=<真实 dsh 可执行文件路径>`，让在线安装的 Debugging 原包经真实模型工具调用和原生审批检查另一套独立 DSH 目录：外部 CLI 导出配置、执行 schema 检查及判断变更生效方式，Magi 安装状态保持不变。该可选分支需要本机已有的真实 DSH CLI，不提供替身命令；未设置时不计入对应业务证据。
+
+`test:electron-dsh-management` 另验证 Share 原页面保存 SVG／PNG 二维码、取消下载后重新保存，并将落盘 PNG 交回原包识别；`test:electron-dsh-health` 验证原页面导出的 JSON 包含真实安装身份。下载观测器只连接脚本自有 Main inspector，核对进程身份后为该 App session 设置本次文件保存位置或取消下载，读取 Electron 的实际终态与落盘字节；不替换原包导出代码、不使用默认 CDP context 的状态冒充 App session 下载成功。脚本的 inspector 端口为各自 CDP 端口加一，需保持空闲；产品运行不启用 inspector。
+
 实现该能力时必须新增并在本文登记的验证面：
 
 - 两平台（macOS、Windows）无开发工具的干净安装版：安装、启用、诊断、取消、停用、升级，以及随包 Node 版本与宿主版本匹配；

@@ -368,9 +368,19 @@ export function commitProcessProposal({ files, expected }) {
   }
 }
 
-// 只接管明确针对当前虚拟 profile 的 dsh plugin 命令。其他进程仍走原生
-// Node；这里不提供 Magi CLI，也不在 PATH 放置替身程序。
+// 只有当前 Magi 数据目录的进程才进入 profile 委托。上游业务可以明确
+// 访问另一个 DSH 实例；该实例的文件、CLI 和安装事实仍归它自身拥有。
+// 不提供 Magi CLI，也不在 PATH 放置替身程序。
 export function profileSpawn(file, args = [], options) {
+  if (host) {
+    const environment = options?.env ?? process.env;
+    if (environment.DSH_HOME !== undefined) {
+      let home;
+      try { home = realpathSync(resolve(String(environment.DSH_HOME))); }
+      catch (cause) { if (cause.code === 'ENOENT') return; throw cause; }
+      if (home !== resolve(host.canonicalParent, '..')) return;
+    } else if (options?.env != null) return;
+  }
   if (host && scopes.getStore()) {
     const child = host.processes.spawn(file, args, options, state().signal);
     if (child) return child;

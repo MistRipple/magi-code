@@ -410,7 +410,7 @@
     documentEntry = entry;
     send({ type: 'init', pluginId, placement, viewId: currentViewId(), locale: i18n.locale, theme: readTheme() });
   }}
-  sandbox="allow-scripts"
+  sandbox="allow-scripts allow-downloads"
   referrerpolicy="no-referrer"
 ></iframe>
 {/key}

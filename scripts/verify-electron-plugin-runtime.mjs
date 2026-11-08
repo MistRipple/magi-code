@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, writeFile, rm, realpath, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
@@ -28,6 +28,7 @@ const reporter = createReporter();
 const errors = [];
 const appLogs = [];
 const clipAuditSource = process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE ? await readFile(process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE, 'utf8') : null;
+const externalDshCli = process.env.MAGI_DSH_EXTERNAL_CLI ? await realpath(process.env.MAGI_DSH_EXTERNAL_CLI) : null;
 let app, page, frame, ui, pluginId, startupGate;
 const heldStarts = new Set();
 await mkdir(output, { recursive: true });
@@ -48,6 +49,12 @@ async function post(path, body = {}, method = 'POST') {
 const installed = async () => (await api('/api/plugins')).value.plugins.find((item) => item.manifest.id === pluginId);
 const activeSkills = async () => (await api('/api/plugins/manifests')).value.flatMap(manifest => (manifest.contributions.skills ?? []).map(skill => ({ ...skill, contributionId: skill.id, id: `plugin/${manifest.id}/${skill.id}`, pluginId: manifest.id })));
 const visible = (selector) => page.evaluate(`Boolean(document.querySelector(${JSON.stringify(selector)})?.getClientRects().length)`);
+async function openConversation(session) {
+  const url=`${origin}/web.html?scope=personal&sessionId=${encodeURIComponent(session)}`;
+  if (await page.evaluate('location.href') !== url || await visible('[data-testid=settings-page]')) {
+    await page.call('Page.navigate',{url});
+  }
+}
 async function settingsTab(id) {
   const nav = `[data-testid="settings-nav-${id}"]`;
   if (!await visible('[data-testid="settings-page"]')) await ui.click('[data-testid="sidebar-settings"]');
@@ -60,7 +67,8 @@ async function settingsTab(id) {
 async function snapshot(name) { await writeFile(join(output, `${name}.png`), Buffer.from(await ui.screenshot(), 'base64')); }
 function startApp() {
   const instance = launchApp({ executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort,
-    env: { MAGI_STATE_ROOT: join(work, 'state'), MAGI_DESKTOP_DAEMON_PORT: String(daemonPort), MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '' },
+    env: { MAGI_STATE_ROOT: join(work, 'state'), MAGI_DESKTOP_DAEMON_PORT: String(daemonPort), MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '',
+      ...(externalDshCli ? { PATH: dirname(externalDshCli) + delimiter + process.env.PATH } : {}) },
   });
   appLogs.push(instance.log);
   return instance;
@@ -305,9 +313,9 @@ async function verifyOriginalSkill(session, waitTurn) {
   const resumedRequest = await post(`/api/plugins/${pluginId}/routes`,{method:'GET',path:'/skill-request'});
   reporter.check('应用重启后原包技能恢复相同身份和原文并完成真实模型调用',resumedTurn.status==='completed'
     && resumedRequest.body.request.includes(JSON.stringify(body).slice(1,-1)));
-  const diagnose=async(name,packageName)=>{
+  const originalTool=async(name,description,args)=>{
     const diagnosis=await post('/api/session/turn',{scope:'personal',sessionId:session,
-      text:'ORIGINAL_TOOL_CHECK:'+JSON.stringify({description:'Checks whether a plugin loaded.',args:{package:packageName}}),
+      text:'ORIGINAL_TOOL_CHECK:'+JSON.stringify({description,args}),
       requestId:name,userMessageId:name+'-user'});
     const pending=await waitFor(async()=>{
       const approvals=(await api(`/api/session/tool-approvals?sessionId=${session}`)).value.pendingApprovals;
@@ -316,16 +324,29 @@ async function verifyOriginalSkill(session, waitTurn) {
     const current=(await api(`/api/messages?scope=personal&sessionId=${session}`)).value.canonicalTurns.find(turn=>turn.turnId===diagnosis.turnId);
     const call=current.items.find(item=>item.tool?.callId===pending.toolCallId)?.tool;
     assert.equal(call?.name,pending.toolName);
-    assert.deepEqual(call?.arguments,{package:packageName},'只能批准本次隔离验收指定的诊断参数');
-    await page.call('Page.navigate',{url:`${origin}/web.html?scope=personal&sessionId=${session}`});
+    // 公共 canonical 按既有合同隐藏绝对路径；真实原值另从模型请求及
+    // 原包工具回执核对，不降低为只看 [path] 占位符。
+    const publicArgs={...args,...(args.dshHome?{dshHome:'[path]'}:{})};
+    assert.deepEqual(call?.arguments,publicArgs,'只能批准本次隔离验收指定的诊断参数');
+    await openConversation(session);
     await waitFor(()=>page.evaluate(`(() => {const buttons=[...document.querySelectorAll('.tool-approval .btn--primary')].filter(button=>!button.disabled);if(buttons.length!==1)return false;buttons[0].click();return true;})()`),'用户通过真实原生审批继续诊断');
     const result=await waitTurn(diagnosis.turnId);
     await writeFile(join(output,`${name}.json`),JSON.stringify(result,null,2));
     assert.equal(result.status,'completed',JSON.stringify(result));
     assert.ok(result.items.some(item=>item.kind==='tool_call'&&item.status==='completed')&&result.modelSteps.length>=2,JSON.stringify(result));
+    if(args.dshHome) {
+      const observed=JSON.parse((await post(`/api/plugins/${pluginId}/routes`,{method:'GET',path:'/skill-request'})).body.request);
+      const user=observed.messages.findLast(message=>message.role==='user'&&message.content.some(part=>part.type==='text'&&part.text.startsWith('ORIGINAL_TOOL_CHECK:')));
+      const input=user.content.find(part=>part.type==='text'&&part.text.startsWith('ORIGINAL_TOOL_CHECK:')).text;
+      assert.deepEqual(JSON.parse(input.slice('ORIGINAL_TOOL_CHECK:'.length)).args,args);
+      const tool=observed.messages.slice(observed.messages.indexOf(user)+1).findLast(message=>message.role==='tool');
+      assert.ok(JSON.stringify(tool?.content).includes(args.dshHome),'真实原包结果必须保留本次指定的外部目录');
+      await writeFile(join(output,`${name}-model-request.json`),JSON.stringify(observed,null,2));
+    }
     const receipt=result.items.find(item=>item.kind==='tool_call').tool.result.output;
     return {value:receipt.value,text:receipt.content.filter(part=>part.type==='text').map(part=>part.text).join('\n')};
   };
+  const diagnose=(name,packageName)=>originalTool(name,'Checks whether a plugin loaded.',{package:packageName});
   const diagnosed=await diagnose('original-debugging-active','dsh-plugin-debugging');
   reporter.check('Debugging 原包经真实审批与模型工具调用读取 daemon 当前加载事实',diagnosed.value.ok===true
     &&diagnosed.value.data.key.packages[0].entryState==='present'&&diagnosed.value.data.key.packages[0].phase==='active'
@@ -360,6 +381,24 @@ async function verifyOriginalSkill(session, waitTurn) {
   await waitFor(async()=>(await api('/api/plugins')).value.plugins.find(plugin=>plugin.manifest.id===target.manifest.id)?.runtime?.state==='running','恢复原包入口后重新启用');
   const recovered=await diagnose('original-debugging-recovered','dsh-plugin-release-probe');
   reporter.check('Debugging 原包重新读取恢复后的运行事实，不保留旧故障',recovered.value.ok===true&&recovered.text.includes('active')&&!recovered.text.includes('Observed load failure'),JSON.stringify(recovered));
+  if (externalDshCli) {
+    const externalHome=join(work,'external-dsh'), externalProfile=join(externalHome,'profiles/magi');
+    await mkdir(externalProfile,{recursive:true});
+    await writeFile(join(externalProfile,'package.json'),JSON.stringify({name:'external-diagnostic-profile',private:true,dsh:{profile:{bundles:[]}},dependencies:{}}));
+    await writeFile(join(externalProfile,'cordis.yml'),'[]\n');
+    await writeFile(join(externalProfile,'cordis.patch.yml'),'[]\n');
+    const before=(await api('/api/plugins')).value.plugins.map(plugin=>({id:plugin.manifest.id,digest:plugin.digest,enabled:plugin.enabled,active:plugin.active}));
+    const dumped=await originalTool('original-debugging-external-config','Shows what a profile resolves to.',{dshHome:externalHome});
+    const key=dumped.value.data?.key;
+    reporter.check('Debugging 原包调用真实外部 DSH CLI 导出配置并完成 schema 检查',dumped.value.ok===true
+      &&key?.resolved.dshHome==='[path]'&&key.invocations.length===2&&key.invocations.every(invocation=>invocation.exitCode===0),JSON.stringify(dumped));
+    const effect=await originalTool('original-debugging-external-effect','Classifies what a change needs to take effect:',{change:'config',dshHome:externalHome});
+    reporter.check('外部 DSH 的生效诊断读取其真实空配置，未混入 Magi 的重载能力',effect.value.ok===true
+      &&effect.value.data.key.mode==='restart-required'&&effect.value.data.key.hmr==='absent',JSON.stringify(effect));
+    const after=(await api('/api/plugins')).value.plugins.map(plugin=>({id:plugin.manifest.id,digest:plugin.digest,enabled:plugin.enabled,active:plugin.active}));
+    reporter.check('外部实例诊断保留独立配置文件且不改变 Magi 的安装与运行意愿',JSON.stringify(after)===JSON.stringify(before)
+      &&JSON.parse(await readFile(join(externalProfile,'package.json'),'utf8')).name==='external-diagnostic-profile');
+  }
   await post(targetPath+'/deactivate');await post(targetPath+'/disable');await post(targetPath+'/uninstall');
   await post(path+'/deactivate'); await post(path+'/disable'); await post(path+'/uninstall');
 }
@@ -1071,7 +1110,7 @@ try {
   const chat = await post('/api/session/turn', { scope: 'personal', sessionId: session, text: 'runtime model check', requestId: 'runtime-model', userMessageId: 'runtime-model-user' });
   const modelTurn = await waitTurn(chat.turnId);
   reporter.check('主对话通过插件模型桥与真实 DSH 适配器完成流式回复', modelTurn.status === 'completed' && JSON.stringify(modelTurn).includes('DSH_MODEL:changed'), JSON.stringify(modelTurn));
-  await page.call('Page.navigate', { url: `${origin}/web.html?scope=personal&sessionId=${encodeURIComponent(session)}` });
+  await openConversation(session);
   await waitFor(() => page.evaluate('document.body.innerText.includes("DSH_MODEL:changed")'), '回执显示');
   await snapshot('conversation');
   await settingsTab(`plugin:${pluginId}:settings`);

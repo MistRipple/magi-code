@@ -9,6 +9,7 @@ import { createServer } from 'node:http';
 import { Readable } from 'node:stream';
 import { packPlugin } from './compat/core/pack.mjs';
 import { connectAppPage, connectTarget, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
+import { capturePluginDownload } from './lib/plugin-download-acceptance.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
@@ -16,7 +17,7 @@ const port = Number(process.env.MAGI_DSH_MANAGEMENT_PORT || 38944), cdpPort = Nu
 const origin = `http://127.0.0.1:${port}`;
 const output = process.env.MAGI_DSH_MANAGEMENT_OUTPUT || join(root, 'target/plugin-acceptance/dsh-management');
 const work = await mkdtemp(join(tmpdir(), 'magi-dsh-management-'));
-const launchOptions = { executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort, env: { MAGI_STATE_ROOT: join(work, 'state'), DSH_HOME: join(work, 'dsh'), MAGI_NPM_REGISTRY: '', MAGI_DESKTOP_DAEMON_PORT: String(port), MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '' } };
+const launchOptions = { executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort, inspectPort: cdpPort + 1, env: { MAGI_STATE_ROOT: join(work, 'state'), DSH_HOME: join(work, 'dsh'), MAGI_NPM_REGISTRY: '', MAGI_DESKTOP_DAEMON_PORT: String(port), MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '' } };
 const report = createReporter(), errors = [];
 const clipAuditSource = process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE ? await readFile(process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE, 'utf8') : null;
 let app, page, frame, ui;
@@ -129,6 +130,24 @@ try {
   await openSettings(share);
   await waitFor(() => frame.evaluate('Boolean(document.querySelector("textarea.dps-code"))'), 'GitHub 组合码输入');
   await frame.evaluate(`(() => {const el=document.querySelector('textarea.dps-code');Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(el,${JSON.stringify(gitCode.code)});el.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+  await waitFor(() => clickText('展示二维码'), '原包二维码入口');
+  await waitFor(() => frame.evaluate('[...document.querySelectorAll("button")].some(b=>b.innerText.trim()==="保存 SVG")'), '原包二维码生成');
+  const exportDirectory = join(output, 'exports');
+  const svg = await capturePluginDownload({ inspectPort: cdpPort + 1, pid: app.child.pid }, exportDirectory, () => clickText('保存 SVG'));
+  report.check('Share 原页面将实际二维码导出为 SVG 文件', svg.state === 'completed'
+    && svg.suggestedFilename === 'dsh-plugin-share-code.svg' && svg.bytes.toString().includes('<svg') && svg.bytes.toString().includes('<path'));
+  const cancelledExport = await capturePluginDownload({ inspectPort: cdpPort + 1, pid: app.child.pid }, exportDirectory, () => clickText('保存 PNG'), { cancel: true });
+  report.check('取消原包文件保存由浏览器结算，插件页面仍可操作', cancelledExport.state === 'cancelled'
+    && await frame.evaluate('[...document.querySelectorAll("button")].some(b=>b.innerText.trim()==="保存 PNG"&&!b.disabled)'));
+  const png = await capturePluginDownload({ inspectPort: cdpPort + 1, pid: app.child.pid }, exportDirectory, () => clickText('保存 PNG'));
+  const require = (await import('node:module')).createRequire(new URL('./compat/package.json', import.meta.url));
+  const sharp = require('sharp'), image = await sharp(png.bytes).metadata();
+  const decoded = await sharp(png.bytes).removeAlpha().greyscale().raw().toBuffer({ resolveWithObject: true });
+  const scanned = await shareCall('scan', { width: decoded.info.width, height: decoded.info.height, gray: decoded.data.toString('base64') });
+  report.check('取消后可重新导出原包 PNG，位图包含实际二维码', png.state === 'completed'
+    && png.suggestedFilename === 'dsh-plugin-share-code.png' && image.format === 'png' && image.width > 100 && image.width === image.height
+    && scanned.code === gitCode.code);
+  await screenshot('share-qr-exports');
   await waitFor(() => clickText('解析组合码'), '解析 GitHub 组合码');
   await waitFor(() => clickText('全部可处理项加入队列'), 'Share 原页面 GitHub 安装');
   const gitOutcome = await waitFor(async () => {

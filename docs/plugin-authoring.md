@@ -155,7 +155,7 @@ ui/…                       视图页面与静态资源，按需
 - **资源**：带版本的 JSON 数据，写入必须携带读到的版本（乐观并发）。页面和扩展读写同一份；读写需要对应 `storage` 权限，目标是资源 ID。
 - **视图**：`entry` 必须是包内 `ui/` 下的 HTML 文件。`placements` 可选：`settings`（在设置里为该插件增加一个分类页）、`main`（主内容区页面）、`home`（主页上的入口，必须同时声明 `main`）、`homeCard`（主页上嵌入的卡片，每个插件最多 2 张）、`rightPane`（右侧面板）。
 - **图标**：清单可选字段 `icon`，指向包内 `ui/` 下的图片（PNG、JPEG、GIF、WebP、AVIF、BMP、ICO 或 SVG，不超过 256 KiB）。设置的插件列表、详情和设置导航都显示它；没有声明或加载失败时显示通用插件图标。SVG 保留矢量格式，仅通过图片元素显示；脚本、事件和外部引用不属于图片合同，直接导航也受沙箱 CSP 隔离。
-- **视图隔离**：页面运行在 `sandbox="allow-scripts"` 的隔离 iframe 中，不能联网、不能访问宿主页面、凭据或 Electron，只能通过下面的消息桥读写资源和设置。
+- **视图隔离**：页面运行在 `sandbox="allow-scripts allow-downloads"` 的隔离 iframe 中，不能联网、不能访问宿主页面、凭据或 Electron，只能通过下面的消息桥读写资源和设置。页面生成的文件可沿标准 `Blob`／`URL.createObjectURL`／`a.download` 交给浏览器下载；保存位置和取消由浏览器或系统保存交互处理，页面不能指定任意本机写入路径。DSH 原包使用同一能力，不改写导出按钮或文件内容。
 - **设置界面**：Magi 不为插件生成设置表单，所有界面都由插件自己的页面提供。需要用户配置时，声明一个 `placements` 含 `settings` 的视图，页面通过消息桥的 `settings.read` / `settings.write` 读写；值按 `settingsSchema` 校验。设置读写需要 `storage` 权限，目标 `"__settings"`。完整示例见 `examples/plugins/notes/ui/settings.html`。
 - **上游页面**：DSH 翻译包沿用上游的页面入口和组件运行库。页面中的外部 HTTP(S)/mailto 链接保留原始地址、目标和可访问名称，并由宿主外部链接入口打开；图片和 SVG 继续由页面按图片元素显示，SVG 不注入可信 DOM。
 - **浏览器 surface**：`browserSurfaces` 条目需要同名的 `browser` 权限；`backgroundInference` 为真时必须 `keepMounted`。

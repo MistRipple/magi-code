@@ -89,7 +89,7 @@
 
 ### 2.3 视图隔离
 
-【现状·读码推断】iframe 仅 `allow-scripts`；响应 CSP 也包含 `sandbox allow-scripts`、`connect-src 'none'`、`frame-ancestors 'self'` 与 nosniff。桥检查 contentWindow、origin、通道和 instanceId；导航重新签发 instanceId，释放旧订阅，丢弃迟到回复。页面原有的 HTTP(S)/mailto 外链由兼容宿主捕获后交给 Magi 外部链接入口，保留 href、target、rel 和上游链接样式；文档内锚点仍由页面处理。[plugins.rs:166](../crates/magi-api/src/routes/plugins.rs#L166)、[PluginTabContent.svelte:23](../web/src/components/tabs/PluginTabContent.svelte#L23)。实际桥操作包括资源 read/write/subscribe、设置 read/write、受限 route.call、外链、剪贴板和高度上报；不开放任意 daemon API。
+【现状·读码推断】iframe 使用 `allow-scripts allow-downloads`；响应 CSP 同样包含 `sandbox allow-scripts allow-downloads`、`connect-src 'none'`、`frame-ancestors 'self'` 与 nosniff。桥检查 contentWindow、origin、通道和 instanceId；导航重新签发 instanceId，释放旧订阅，丢弃迟到回复。页面原有的 HTTP(S)/mailto 外链由兼容宿主捕获后交给 Magi 外部链接入口，保留 href、target、rel 和上游链接样式；文档内锚点仍由页面处理。原包生成的 Blob 文件沿浏览器标准下载保存，格式与字节由原包拥有，保存位置与取消由浏览器／系统交互处理；不增加文件写入桥或另一套下载状态。[plugins.rs:166](../crates/magi-api/src/routes/plugins.rs#L166)、[PluginTabContent.svelte:23](../web/src/components/tabs/PluginTabContent.svelte#L23)。实际桥操作包括资源 read/write/subscribe、设置 read/write、受限 route.call、外链、剪贴板和高度上报；不开放任意 daemon API。
 
 ### 2.4 缺陷清单与处理顺序
 
@@ -452,9 +452,10 @@
 | --- | --- | --- |
 | 搜索、安装与在线更新 | npm 原包的获取、完整性、依赖解析与安装准备进入唯一 `PluginOperations`；动态贡献不冻结在安装期；独立 Cordis peer 按完整版本范围在线解析，不替换 Magi 自己的运行库 | `test:compat`、`test:electron-plugin-runtime`；原包搜索、排序、图标和固定操作区见 `test:electron-plugin-interactions` |
 | 更新已装插件的运行组件 | 发行构建为转换源码、锁文件和实际页面产物生成统一内容身份；daemon 与已安装归档比较，在原包版本未变化时也提供固定在线更新入口。当前原包及 GitHub 提交沿原来源重新准备、预览摘要并提交，保留设置及启用意愿；新摘要须用户重新授权激活，不继承旧授权，不增加独立组件安装目录 | `test:electron-plugin-components`：旧目录包在线安装 Health 3.0.5 后，由新目录包接续同一安装状态；本轮结果见第 12 节 |
+| 保存插件生成的文件 | 所有插件视图共用浏览器标准下载，iframe 与响应 CSP 同时开放 `allow-downloads`；原包生成 Blob 和文件名，浏览器／系统拥有保存位置和取消。保持原页面、组件及导出字节，不另建文件写入桥或下载状态源 | `test:electron-dsh-management` 的 Share SVG／PNG 保存、取消后重试与二维码识别；`test:electron-dsh-health` 的原页面 JSON 导出，结果见第 12 节 |
 | 通过第三方管理页面安装 | `plugins.installBundle/cancelInstall` 把解析、准备、提交与请求的启停纳入同一个 daemon 任务；取消只影响自身未提交的准备，进入提交后明确返回 too-late；去重绑定 owner、摘要、实例和完整输入 | `test:electron-dsh-management`；Share／Upgrader 原包、取消与显式重试，证据 `target/plugin-acceptance/dsh-management/` |
 | 重复安装与失败恢复 | 同摘要不排空正在运行的实例；真实版本替换先排空再提交，失败保留旧摘要、授权和启用状态，并恢复旧宿主；不能把已安装但启用失败表述为运行成功 | Upgrader 原包的在线替换、版本不存在与候选 ZIP 写入失败，证据 `target/plugin-acceptance/upgrade-recovery/`、`installations-upgrader/` |
-| 管理目录与原包辅助进程 | 原包主宿主和 Node 辅助脚本读取同一 daemon profile 调用快照；清单及启停写入沿唯一提交入口，包管理意图委托原安装任务；没有物理 pnpm 安装树和第二套持久 profile | `test:compat` 的真实 Node 委托回归；Market 原页面在线安装 Mgr、实际后端 running 和页面终态，证据 `target/plugin-acceptance/market-helper-business/` |
+| 管理目录与原包辅助进程 | 当前 Magi 数据目录的原包主宿主与 Node 辅助脚本读取同一 daemon profile 快照；清单、启停及包管理沿唯一提交入口。显式指定其他 `DSH_HOME` 的 CLI／Node 辅助进程保留其环境，不能注入 Magi 委托或把外部安装意图提交到 Magi；真实路径别名仍识别为当前目录。没有物理 pnpm 安装树和第二套持久 profile | `test:compat` 的真实 Node 委托与外部实例回归；Market 原页面在线安装 Mgr、实际后端 running 和页面终态，证据 `target/plugin-acceptance/market-helper-business/` |
 | 应用插件目录 | `hmr.runExclusive` 只串行当前实例操作，拒绝嵌套；`reconcileProfile` 提交本次启停意图后等待 daemon 原监管器就绪，不改写授权，不启动停用项，不重启未变化实例 | Market 原页面重载并在新文档继续搜索，证据 `target/plugin-acceptance/market-reload-business/`；不提供文件监听或 Node 模块缓存替换 |
 | 查看健康与运行状态 | 目录订阅只发失效通知，消费者重读 daemon；原包元数据来自不可变归档，生命周期和失败原因来自真实监管状态；观察其他插件失败不处置观察者自身 | Health／Mgr 原包及 `test:electron-dsh-profile`；证据 `target/plugin-acceptance/profile-reload-final/` |
 | 按诊断停用并恢复插件 | daemon 将停用来源与原因保存在原安装记录，排空后原子提交启停状态；恢复核对原包摘要及当前停用来源，用户显式停用、启用和版本替换会清除来源。上游 profile 的说明仅投影该事实，备份／复制仍属于调用提案，不保留可写安装树；报告和修复隔离文件保存在插件私有目录，真实文件与投影使用相同的系统路径身份 | `test:compat`、插件 API 的来源持久化和过期恢复回归；`test:electron-dsh-health` 的原页面修复、停用与重启恢复 |
@@ -477,9 +478,9 @@
 ### 11.2 剩余产品工作
 
 - 完整业务覆盖率仍未达到可证明的 95%／100%。逐插件补齐成功结果、取消、配置持久化、在线更新、失败恢复与停用／重启验收；安装、进程 running、页面有内容和路由 smoke 各自只证明对应阶段。
-- Mgr 0.2.12 原页面点击更新仍不能显示确认框：原包按 `typeof Button === "function"` 判断组件，官方 Button 实为 React forwardRef 对象。公共组件库及原包页面均已完整加载；最新目录包专项 **12/13**，失败与类型证据在 `target/plugin-acceptance/diagnostics-profile-current/`。后台更新路由通过不能作为页面流程通过，不增加按包名改写或组件伪装。
+- Mgr 0.2.12 原页面点击更新仍不能显示确认框：原包按 `typeof Button === "function"` 判断组件，官方 Button 实为 React forwardRef 对象。当前目录包复现 **12/13**，失败与类型证据在 `target/plugin-acceptance/profile-product-current/`；已核对上游当前源码及发布期官方 UI 0.1.7-rc.2／0.2.0-rc.2，同样存在该类型判断冲突。后台更新路由通过不能作为页面流程通过，不增加按包名改写或组件伪装。
 - Market／Share 的 GitHub 路径已接入并按第 12 节逐项验收；其他 Git 来源、上游主动移除式替换及安装提交各阶段的崩溃恢复仍未完成。安装任务现持久保存请求、提交边界和回执，重启不自动重放，候选摘要由 PluginManager 核对；验收证据见第 12 节。尚不能据部分断进程验证宣称覆盖所有掉电阶段或外部副作用 exactly-once。
-- Debugging 的 `dsh_diagnose_plugin_load` 已完成真实工具审批、安装文件核对及运行／停用／故障／恢复验收；Health 已验证原页面临时文件修复、取消、隔离日志及停用／重启恢复。其余诊断工具、宿主重启、其他修复类型及未列为实测通过的原包分支仍待验证，不能据单项通过认定整个插件完成。
+- Debugging 的 `dsh_diagnose_plugin_load` 已完成真实工具审批、安装文件核对及运行／停用／故障／恢复验收；另以本机 Harness 0.2.2-rc.1 的真实 CLI 验证独立目录的 `dsh_dump_config` 与 `dsh_check_effect_mode`。Health 已验证原页面临时文件修复、取消、隔离日志及停用／重启恢复。其他诊断工具、宿主重启、其他修复类型及未列为实测通过的原包分支仍待验证，不能据单项通过认定整个插件完成。
 - 页面运行库封装在安装归档内，已通过运行组件内容身份及同版原包在线更新接通既有安装的更新。运行组件依然由 Magi 发行更新，原包隔离 peer 由在线依赖解析获取；没有独立运行组件发布源。私有／已撤回来源、所有平台及跨多次 Magi 发布的升级组合仍待验收。
 - 会话消息已接通当前主会话的工具／命令文本交付；跨会话与后台消息尚无产品入口。session/event、sessionProjections、完整 Agent 对象、provider 技能与作用域等仍按实际能力门槛处理，不能返回假对象或空结果冒充完成。
 - Windows、干净系统正式安装包、Android／iOS 真机触摸、屏幕录制权限引导和长期负载仍需各自验收。390px Electron 视口模拟不代表手机真机通过。
@@ -500,16 +501,19 @@
 | 本轮公共检查 | `test:compat`、Rust、Web、协议与目录包 | 翻译运行时 **110/110**；插件 API 50 项、插件领域各测试目标 83 项、真实 Node 后台管理身份 1 项通过。符号链接回归覆盖同步／回调／Promise 路径；Web check 0 错误 0 警告、插件列表和 i18n 回归、协议一致及目录包解包自检通过。修改的 Rust 文件格式检查通过，全仓格式检查有任务外既有差异，未改动这些文件 |
 | 此前运行组件在线更新，未在本轮复跑 | `test:electron-plugin-components` | 两版 macOS arm64 目录包接续同一状态根，**17/17**；`target/plugin-acceptance/components/`。旧包在线安装 Health 3.0.5，随后新包完成组件身份发现、390px 固定操作、加载／取消／失败保留、同版预览与摘要切换、重新授权、原页面、设置保留及重启恢复；默认、悬停、预览均 `cut=0`。运行组件随 Magi 发行，不是独立组件发布源 |
 | 此前发现与安装交互，未在本轮复跑 | `test:electron-plugin-interactions` | **21/21**；`target/plugin-acceptance/interactions/`。WorkBuddy 在线安装与原包版本更新、REA 精确搜索、真实图标、请求乱序、加载／取消／失败反馈及固定操作区 |
-| 此前页面与业务运行时，未在本轮复跑 | `test:electron-plugin-runtime` | macOS arm64 目录包 **125/125**；`target/plugin-acceptance/route-source-product-final/`。真实隔离页面 2 MiB 字节、multipart 文件、PNG／SVG Blob、响应头、HEAD／OPTIONS、非法／超限拒绝、8 种外观、右栏、390px、取消、消息、技能及重启。Debugging 0.7.2 原包经真实工具审批完成运行／停用／故障／恢复诊断；其他诊断工具和宿主重启未验收。机制夹具不计入社区核心业务覆盖率 |
+| 本轮页面、业务与外部实例诊断 | `MAGI_DSH_EXTERNAL_CLI=<真实CLI路径> npm run test:electron-plugin-runtime` | 新构建 macOS arm64 目录包 **128/128**；`target/plugin-acceptance/external-dsh-product-final/`。原 125 项页面、2 MiB 字节、multipart、PNG／SVG、8 种外观、右栏、390px、取消、消息、技能及重启均复跑；新增 Debugging 0.7.2 原包经真实模型工具和原生审批调用本机 Harness 0.2.2-rc.1 CLI，对独立目录导出配置、完成 schema 检查、判断配置生效方式，Magi 安装与运行意愿保持不变。公共 canonical 继续隐藏绝对路径，实际参数及原包回执另由原始模型请求核对。外部 CLI 不替代 Magi 内核，不计为整个 Debugging 插件已完成 |
+| 本轮实例所有权与打包检查 | `test:compat`、目录发行包 | **111/111**；当前目录的真实路径别名继续进入 daemon 委托，显式外部目录／未创建目录／不继承 DSH_HOME 的环境保持原生进程行为，真实 Node 辅助脚本读取外部物理文件而非 Magi 投影。标准打包两次遇到 Electron 校验文件下载 504；最终构建使用已按安装包官方 SHA-256 验证的本机 Electron 45.0.0 缓存归档，原 afterPack／逐文件清单／解包自检通过。未运行全仓测试或 Windows |
+| 本轮原生导出与管理流程 | `test:electron-dsh-management`、`test:electron-dsh-health` | 新构建 macOS arm64 目录包分别 **33/33**、**22/22**；`target/plugin-acceptance/native-exports-management-final/` 与 `native-exports-health-final/`。Share 0.2.5 原页面保存 SVG、取消 PNG 后再次保存，落盘 PNG 经原包识别为同一组合码；Health 3.0.5 原页面导出 JSON，包含真实安装身份与运行库版本。管理流程同时复跑 GitHub／npm 在线安装、升级、来源校验、失败保留、授权、取消、显式重试及应用重启。另实际观察 macOS 保存框并点击取消，回到原页面。默认、悬停、确认与完成状态阴影审计均 `cut=0`。未验证 Windows 或移动设备保存交互 |
+| 本轮导出公共检查与构建 | `test:compat`、Web、插件 API | **111/111**，Web check 0 错误 0 警告；`cargo check -p magi-api`、视图 CSP 沙箱回归及修改文件格式检查通过。标准打包遇到一次 Electron 校验文件下载 504，使用已与官方 SHA-256 对照的缓存归档完成同一发行构建与解包自检。下载试跑最初误把默认 CDP context 当作 App session，已改用核对进程身份的 Main 观测器；早期超时记录不作为下载能力证据。不增加产品下载桥、文件持久化目录或插件专属处理 |
 | 此前安装中断恢复，未在本轮复跑 | `test:electron-plugin-install-recovery` | 新目录包 **10/10**；`target/plugin-acceptance/github-install-recovery-final/`。解析中、版本已提交但 Node 未就绪、终态回执三个断进程位置；同请求不重新下载或替换版本，显式新请求收敛，恢复后真实业务命令返回。私有 registry 仅提供机制原包，未覆盖所有掉电、磁盘和替换阶段 |
 | 此前 WorkBuddy 外部服务，未在本轮复跑 | `MAGI_WORKBUDDY_CLI_BINARY=<CLI绝对路径> MAGI_WORKBUDDY_CLI_MODEL=hy3 MAGI_WORKBUDDY_CLI_INJECT_RESULT=1 npm run test:electron-workbuddy` | WorkBuddy 5.20.32 在线原包、CodeBuddy CLI 2.181.0，**15/15**；`target/plugin-acceptance/session-messages-workbuddy-final/`。原页面、CLI 读取验收文件、自动回注 codebuddy-bridge 来源及主模型真实回复；未覆盖国际版、视频或外部程序安装管理 |
 | 此前 REA 页面与工具，未在本轮复跑 | `test:electron-dsh-rea` | REA 1.2.0、rea-agents 6.5.0，**16/16**；`target/plugin-acceptance/product-ui-rea/`。SVG、原页面 Ghidra 链接、207 个真实工具、CAS、停用和恢复；早于最后的外观事件分类修正，未验证 Ghidra 实际安装或二进制分析 |
 | 此前 Appshot，未在本轮复跑 | `test:electron-appshot` | Appshot 0.4.2，**13/13**；`target/plugin-acceptance/appshot/`。真实 macOS 原生截图、关闭设置页后投递、后台附件和草稿挂载及重启后载荷恢复；不代表其他平台或全部时序分支 |
 | 此前目录应用与版本豁免，未在本轮复跑 | `test:electron-popular-dsh`、`test:electron-dsh-compatibility` | Market 1.2.2 原页面安装／更新、失败保留、目录重载、未变化实例和停用意图、重载后继续搜索，见 `target/plugin-acceptance/diagnostics-market-final/`；该批只选 1 个，完整分母仍为 9，未计为完整业务通过。Ops 原包扫描、豁免、在线安装、卸载及重启恢复见 `target/plugin-acceptance/dsh-compatibility/` |
 | 此前社区批次，未在本轮复跑 | `test:electron-popular-dsh` | 固定 9 个社区原包在线安装 9/9、启动 9/9、原生页面 9/9、路由 smoke 7/7、页面异常 0；在线更新验证 2 条，`coreVerified=0`、`qualified=false`，完整门槛退出 1。证据 `target/plugin-acceptance/skills-community-final/`；未完成业务保持 unverified，不能将安装率作为生态支持率 |
-| 尚未解决的 Mgr 页面流程 | `test:electron-dsh-profile` | Mgr 0.2.12 专项 **12/13**；`target/plugin-acceptance/diagnostics-profile-current/`。搜索、布局恢复、启停、运行错误恢复通过；原包将 forwardRef Button 对象误判为不可用，点击更新后确认框缺失。组件库已完整加载，不改写原包或伪装组件以计为通过 |
+| 本轮复现的 Mgr 页面流程 | `test:electron-dsh-profile` | Mgr 0.2.12 专项 **12/13**；`target/plugin-acceptance/profile-product-current/`。搜索、布局恢复、启停、运行错误恢复通过；原包将 forwardRef Button 对象误判为不可用，点击更新后确认框缺失。组件库已完整加载，不改写原包或伪装组件以计为通过 |
 
-验收保持原包组件、异常与成功门槛，不过滤运行错误或整轮自动重试。进程重启前释放旧文档，重新启动后等待工作台初始化。以上证据不替代第 11.2 节剩余产品工作。
+验收保持原包组件、异常与成功门槛，不过滤运行错误或整轮自动重试。进程重启前释放旧文档，重新启动后等待工作台初始化。外部实例验收第一次错误地将脱敏后的公共路径与原值比较，第二次在已处于目标会话时强制刷新打断队列同步；失败证据保留于 `external-dsh-product/` 与 `external-dsh-product-verified/`，最终修正为同时核对公共投影和实际模型请求、复用当前会话文档后，独立整套通过 128/128。以上证据不替代第 11.2 节剩余产品工作。
 
 ### 12.2 未运行与不得推导的结论
 
