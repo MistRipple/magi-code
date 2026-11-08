@@ -3839,3 +3839,10 @@ pub enum PluginBundleInstallCancelStatus {
     #[serde(rename = "not-running")]
     NotRunning,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginReconcileRequest {
+    #[serde(rename = "pluginIds")]
+    pub plugin_ids: Vec<String>,
+}

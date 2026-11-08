@@ -13,7 +13,7 @@ import { startOpenAiBridge } from './openai-bridge.mjs';
 import { requestAttachments, saveRequestImage, withRequestImages } from './attachments.mjs';
 import { mountRemote } from './remote.mjs';
 import { createPluginManager } from './plugin-manager.mjs';
-import { configureProfile, withProfile as runProfile, loaderEntries, profilePath } from './profile.mjs';
+import { configureProfile, withProfile as runProfile, loaderEntries, profilePath, createProfileReload } from './profile.mjs';
 import { createBackendSessions } from './backend-sessions.mjs';
 import { createRegisteredSettings } from './registered-settings.mjs';
 import { installRegistryFetch } from './registry-fetch.mjs';
@@ -278,6 +278,7 @@ export async function activateDsh(api, module, options) {
   if (api.plugins?.list) ctx.provide('pluginManager', createPluginManager(api));
   if (api.plugins?.list && profilePath()) {
     ctx.provide('loader', { entries: loaderEntries });
+    ctx.provide('hmr', createProfileReload());
     ctx.provide('profileContext', Object.freeze({ name: 'magi', dir: profilePath(), packageManager: profilePackageManager() }));
   }
   // Loader 的 baseUrl 是当前 profile 目录，用于上游识别运行身份；不是 HTTP 地址。

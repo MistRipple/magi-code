@@ -2,7 +2,7 @@
 // 运行在 `node --permission` 受限模式下（见 record.mjs）：不能写用户目录、不能起子进程、不能联网。
 import { pathToFileURL } from 'node:url';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { configureProfile, withProfile, loaderEntries, profilePath } from '../runtime/profile.mjs';
+import { configureProfile, withProfile, loaderEntries, profilePath, createProfileReload } from '../runtime/profile.mjs';
 import { installSharedResolution } from '../runtime/shared-resolution.mjs';
 import { dshEnvironment } from '../core/dsh-compatibility.mjs';
 import { createBackendSessions } from '../runtime/backend-sessions.mjs';
@@ -48,6 +48,7 @@ const ctx = new Context();
 // 只提供真实服务的命名空间；记录器没有 daemon 会话事实，调用读取即拒绝。
 if (readSessionDirectory === '1') ctx.provide('sessions', createBackendSessions({}).service);
 ctx.provide('loader', {entries:loaderEntries});
+ctx.provide('hmr', createProfileReload());
 ctx.provide('profileContext', Object.freeze({ name: 'magi', dir: profilePath(), get packageManager() { out.profilePackageManager = true; return profilePackageManager(); } }));
 ctx.baseUrl = pathToFileURL(profilePath() + '/').href;
 // 记录默认启动观察到的事件名，供兼容报告核对；不据此生成 Magi 钩子。

@@ -639,6 +639,7 @@ impl Incoming for HostHandler {
                                 | "plugins.install"
                                 | "plugins.installBundle"
                                 | "plugins.cancelInstall"
+                                | "plugins.reconcile"
                                 | "plugins.authorize"
                                 | "plugins.setEnabled"
                                 | "plugins.remove"
@@ -716,6 +717,7 @@ impl Incoming for HostHandler {
                         | "plugins.install"
                         | "plugins.installBundle"
                         | "plugins.cancelInstall"
+                        | "plugins.reconcile"
                         | "plugins.setEnabled"
                         | "plugins.remove"
                         | "plugins.authorize"
@@ -1113,6 +1115,7 @@ fn check_hello(
         "plugin.management.background",
         "plugin.installations",
         "plugin.directory.events",
+        "plugin.reconciliation",
         "session.directory",
         "images.store",
     ];

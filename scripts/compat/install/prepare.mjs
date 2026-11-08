@@ -107,8 +107,12 @@ export async function prepareDsh(options) {
     || ['pluginManager', 'loader'].some((name) => Object.hasOwn(inspection.serviceReads, name));
   const packageManagement = Object.hasOwn(inspection.serviceMembers, 'profileContext.packageManager') || recorded.profilePackageManager
     || inspection.entries.some(entry => entry.name === 'ctx.profileContext.packageManager');
+  const profileReload = inspection.entries.some(entry => /^ctx\.hmr(?:\.|$)/.test(entry.name) || entry.kind === 'injects' && entry.name === 'hmr')
+    || Object.hasOwn(inspection.serviceReads, 'hmr');
   if (management || packageManagement) {
     manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', 'authorize', ...(management ? ['compatibility'] : []), 'background'] });
+  } else if (profileReload) {
+    manifest.permissions.push({ kind: 'pluginManagement', targets: ['lifecycle', 'background'] });
   }
   if (readSessionDirectory) manifest.permissions.push({ kind: 'sessionRead', targets: ['directory'] });
   if (inspection.entries.some(entry => entry.name === 'attachments' || /^ctx\.attachments(?:\.|$)/.test(entry.name)) || Object.hasOwn(inspection.serviceReads, 'attachments')) {

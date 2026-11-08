@@ -4,13 +4,75 @@ import nativeFs from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { configureProfile, withProfile, profilePath, loaderEntries } from './runtime/profile.mjs';
+import { configureProfile, withProfile, profilePath, loaderEntries, createProfileReload } from './runtime/profile.mjs';
 import fs from './runtime/profile-fs.mjs';
 import { load, dump } from 'js-yaml';
 import { installSharedResolution } from './runtime/shared-resolution.mjs';
 import { createPluginManager } from './runtime/plugin-manager.mjs';
 import { profileSpawn } from './runtime/profile.mjs';
 import { once } from 'node:events';
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+test('profile 重载串行提交真实启停意图、等待 daemon 收敛；失败、嵌套、取消与过期调用不冒充成功', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'magi-profile-reconcile-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const plugins = [{ manifest: { id: 'dsh.target' }, digest: 'current', enabled: true, active: true,
+    source: { kind: 'upstream', location: 'dsh:target@1.0.0' }, runtime: { state: 'running', generation: 7 } }];
+  let failure, calls = 0;
+  const off = configureProfile({ plugins: {
+    async list() { return { plugins }; },
+    async setEnabled(id, enabled, digest) {
+      assert.equal(id, 'dsh.target'); assert.equal(digest, 'current');
+      plugins[0].enabled = enabled; plugins[0].active = enabled;
+    },
+    async reconcile(input) {
+      calls++;
+      assert.deepEqual(input, { pluginIds: ['dsh.target'] });
+      if (failure) throw new Error(failure);
+      return { plugins };
+    },
+  } }, { home });
+  let released = false; t.after(() => { if (!released) off(); });
+  const reload = createProfileReload();
+  await withProfile(async () => {
+    await assert.rejects(reload.reconcileProfile(), /inside runExclusive/);
+    assert.deepEqual(await reload.runExclusive(() => reload.reconcileProfile(['magi-profile:dsh.target'])), { warnings: [], pending: [] });
+    assert.equal(plugins[0].runtime.generation, 7, '原实例保持，不通过重启模拟重载');
+    await assert.rejects(reload.runExclusive(() => reload.runExclusive(() => {})), /cannot be nested/);
+    fs.writeFileSync(join(profilePath(), 'cordis.patch.yml'), dump([{ id: 'dsh.target', disabled: true }]));
+    await reload.runExclusive(() => reload.reconcileProfile());
+    assert.equal(plugins[0].active, false, '提案先沿原提交入口生效，再核对运行状态');
+    await assert.rejects(reload.runExclusive(() => reload.reconcileProfile(['magi-profile:dsh.target'])), /必需条目未运行/);
+    assert.equal(plugins[0].enabled, false, '重载不能重新启用停用项');
+    plugins[0].enabled = true;
+    const inactive = await reload.runExclusive(() => reload.reconcileProfile());
+    assert.match(inactive.warnings[0], /尚未激活/);
+    assert.equal(plugins[0].active, false, '未激活项只报告真实状态，不代授或自动激活');
+    failure = '真实宿主启动失败';
+    await assert.rejects(reload.runExclusive(() => reload.reconcileProfile()), /真实宿主启动失败/);
+    failure = undefined;
+    const order = [];
+    let release, began;
+    const started = new Promise(resolve => { began = resolve; });
+    const first = reload.runExclusive(async () => { order.push('start'); began(); await new Promise(resolve => { release = resolve; }); order.push('end'); });
+    await started;
+    const second = reload.runExclusive(() => order.push('second'));
+    assert.deepEqual(order, ['start']); release(); await Promise.all([first, second]);
+    assert.deepEqual(order, ['start', 'end', 'second']);
+  });
+  let late;
+  await withProfile(() => { late = AsyncLocalStorage.bind(() => reload.runExclusive(() => reload.reconcileProfile())); });
+  const before = calls;
+  await assert.rejects(late(), /调用快照/);
+  const controller = new AbortController();
+  await assert.rejects(withProfile(async () => {
+    controller.abort(new Error('用户已取消'));
+    await reload.runExclusive(() => reload.reconcileProfile());
+  }, controller.signal), /用户已取消/);
+  off(); released = true;
+  await assert.rejects(reload.runExclusive(() => reload.reconcileProfile()), /实例已失效/);
+  assert.equal(calls, before, '失效和取消不进入 daemon 收敛入口');
+});
 
 test('原包 Node 辅助进程读取真实 profile，内部包管理经同一 daemon 任务提交并在同步退出前结算', async (t) => {
   const home = await mkdtemp(join(tmpdir(), 'magi-profile-child-'));

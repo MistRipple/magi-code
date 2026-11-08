@@ -505,6 +505,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconciliation_uses_the_supervisor_and_preserves_intent_and_instance_identity() {
+        use magi_app_server_protocol::generated::{PluginRuntimeState, PluginRuntimeStatus};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct Runtime {
+            manager: Arc<Mutex<PluginManager>>,
+            calls: AtomicUsize,
+            failed: AtomicBool,
+            revoke: AtomicBool,
+        }
+        impl crate::ExtensionStatusSource for Runtime {
+            fn reconcile(
+                &self,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+            {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut manager = self.manager.lock().unwrap();
+                manager.ready_runtime("acme.target", "current").unwrap();
+                if self.revoke.load(Ordering::SeqCst) {
+                    manager.deactivate("acme.manager").unwrap();
+                }
+                Box::pin(async { Ok(()) })
+            }
+            fn status(&self, _: &str) -> Option<PluginRuntimeStatus> {
+                Some(PluginRuntimeStatus {
+                    state: if self.failed.load(Ordering::SeqCst) {
+                        PluginRuntimeState::Failed
+                    } else {
+                        PluginRuntimeState::Running
+                    },
+                    generation: 7,
+                    reason: Some("real startup failure".into()),
+                    crashes: 0,
+                    blocking: vec![],
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::bare_state(root.path());
+        let runtime = Arc::new(Runtime {
+            manager: state.plugin_manager.clone(),
+            calls: AtomicUsize::new(0),
+            failed: AtomicBool::new(false),
+            revoke: AtomicBool::new(false),
+        });
+        let state = state.with_extension_status(runtime.clone());
+        let caller = package("acme.manager", true);
+        let target = package("acme.target", false);
+        let disabled = package("acme.disabled", false);
+        let unprivileged = package("acme.unprivileged", false);
+        for package in [&caller, &target, &unprivileged] {
+            install(&state, package, true);
+        }
+        install(&state, &disabled, false);
+        let operations = PluginOperations::from_state(&state);
+        let params = json!({"pluginIds":["acme.target", "acme.disabled"]});
+        for (id, digest, lease, input) in [
+            (
+                "acme.unprivileged",
+                unprivileged.digest(),
+                Some("current"),
+                params.clone(),
+            ),
+            ("acme.manager", caller.digest(), Some("old"), params.clone()),
+            ("acme.manager", "old", Some("current"), params.clone()),
+            (
+                "acme.manager",
+                caller.digest(),
+                Some("current"),
+                json!({"pluginIds":["acme.target", "acme.target"]}),
+            ),
+            (
+                "acme.manager",
+                caller.digest(),
+                Some("current"),
+                json!({"pluginIds":["missing"]}),
+            ),
+            (
+                "acme.manager",
+                caller.digest(),
+                Some("current"),
+                json!({"pluginIds":[], "unknown":true}),
+            ),
+        ] {
+            assert!(
+                operations
+                    .call(id, digest, lease, "plugins.reconcile", input)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        let before = state.plugin_manager.lock().unwrap().state().clone();
+        let result = operations
+            .call(
+                "acme.manager",
+                caller.digest(),
+                Some("current"),
+                "plugins.reconcile",
+                params.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.plugin_manager.lock().unwrap().state(), &before);
+        state
+            .plugin_manager
+            .lock()
+            .unwrap()
+            .check_runtime("acme.target", "current")
+            .unwrap();
+        assert_eq!(
+            result["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["manifest"]["id"] == "acme.target")
+                .unwrap()["runtime"]["generation"],
+            7
+        );
+        runtime.failed.store(true, Ordering::SeqCst);
+        assert!(
+            operations
+                .call(
+                    "acme.manager",
+                    caller.digest(),
+                    Some("current"),
+                    "plugins.reconcile",
+                    params.clone()
+                )
+                .await
+                .unwrap_err()
+                .message()
+                .contains("real startup failure")
+        );
+        runtime.failed.store(false, Ordering::SeqCst);
+        runtime.revoke.store(true, Ordering::SeqCst);
+        assert!(
+            operations
+                .call(
+                    "acme.manager",
+                    caller.digest(),
+                    Some("current"),
+                    "plugins.reconcile",
+                    params
+                )
+                .await
+                .is_err(),
+            "收敛期间撤权不能返回成功"
+        );
+    }
+
+    #[tokio::test]
     async fn unchanged_install_preserves_the_running_instance_and_checks_admission_first() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct RuntimeProbe(Arc<AtomicUsize>);
@@ -1091,6 +1243,75 @@ impl PluginOperations {
                     Some(&input.expected_digest),
                 )
                 .await?;
+                self.projection()
+            }
+            "plugins.reconcile" => {
+                let input: magi_app_server_protocol::generated::PluginReconcileRequest =
+                    serde_json::from_value(params)
+                        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
+                let ids = &input.plugin_ids;
+                if ids.len() > 512
+                    || ids.iter().any(|id| id.is_empty() || id.len() > 128)
+                    || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len()
+                {
+                    return Err(ApiError::InvalidInput("收敛插件身份无效或重复".into()));
+                }
+                let identity = Some((caller, digest, lease, background));
+                let expected = {
+                    let manager = self.locked("读取运行目录收敛目标")?;
+                    ids.iter()
+                        .map(|id| {
+                            manager.ensure_editing_admitted(id).map_err(plugin_error)?;
+                            Ok((
+                                id.clone(),
+                                manager
+                                    .package(id)
+                                    .map_err(plugin_error)?
+                                    .digest()
+                                    .to_owned(),
+                                manager.is_active(id).map_err(plugin_error)?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, ApiError>>()?
+                };
+                let source = self
+                    .extension_status
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .ok_or_else(|| ApiError::Conflict("扩展监管器不可用".into()))?;
+                tokio::time::timeout(Duration::from_secs(110), async {
+                    source.reconcile().await.map_err(|reason| {
+                        ApiError::Conflict(format!("运行目录收敛失败：{reason}"))
+                    })?;
+                    // 所有目标共用同一启动预算，复用启用入口的就绪判定和调用者准入。
+                    futures_util::future::try_join_all(
+                        expected
+                            .iter()
+                            .filter(|(_, _, active)| *active)
+                            .map(|(id, _, _)| self.wait_running(id, identity)),
+                    )
+                    .await?;
+                    Ok::<(), ApiError>(())
+                })
+                .await
+                .map_err(|_| {
+                    ApiError::Conflict(
+                        "运行目录收敛尚未确认，请在 Magi 插件管理查看运行状态".into(),
+                    )
+                })??;
+                {
+                    let manager = self.locked("核对运行目录收敛结果")?;
+                    Self::check_caller(&manager, identity, "lifecycle")?;
+                    for (id, digest, active) in &expected {
+                        manager.ensure_editing_admitted(id).map_err(plugin_error)?;
+                        Self::check_target(&manager, id, Some(digest))?;
+                        if manager.is_active(id).map_err(plugin_error)? != *active {
+                            return Err(ApiError::Conflict(
+                                "收敛期间目标激活状态已变化，请刷新后重试".into(),
+                            ));
+                        }
+                    }
+                }
                 self.projection()
             }
             "plugins.setEnabled" | "plugins.remove" => {

@@ -6948,6 +6948,26 @@
         "too-late",
         "not-running"
       ]
+    },
+    "PluginReconcileRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pluginIds"
+      ],
+      "properties": {
+        "pluginIds": {
+          "type": "array",
+          "maxItems": 512,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "description": "显式选择需要核对的已安装插件；仅收敛已有激活意图，不启用停用项、不重启未变化实例。"
+        }
+      }
     }
   }
 }

@@ -52,8 +52,10 @@ async function post(path, body) {
   return result.value;
 }
 async function removePlugin(id) {
-  await post(`/api/plugins/${encodeURIComponent(id)}/deactivate`, {});
-  await post(`/api/plugins/${encodeURIComponent(id)}/disable`, {});
+  const installed = (await api('/api/plugins')).value.plugins.find(plugin => plugin.manifest.id === id);
+  if (!installed) return;
+  if (installed.active) await post(`/api/plugins/${encodeURIComponent(id)}/deactivate`, {});
+  if (installed.enabled) await post(`/api/plugins/${encodeURIComponent(id)}/disable`, {});
   await post(`/api/plugins/${encodeURIComponent(id)}/uninstall`, {});
 }
 async function installTarget(version = '0.0.7') {
@@ -246,6 +248,26 @@ try {
           assert.equal(failed.body.ok, false, '不存在的原包版本必须向原页面报错');
           assert.equal((await currentTarget()).manifest.version, '0.0.8');
           assert.equal((await currentTarget()).runtime.state, 'running');
+          const reload = () => post(`/api/plugins/${item.id}/routes`, { method: 'POST', path: '/dsh-plugin-market/reload',
+            headers: { 'content-type': 'application/json' }, body: {} });
+          const beforeReload = await currentTarget();
+          item.marketReload = await reload();
+          assert.equal(item.marketReload.status, 200, JSON.stringify(item.marketReload));
+          assert.equal(item.marketReload.body.ok, true);
+          assert.deepEqual(item.marketReload.body.warnings, []);
+          assert.deepEqual(item.marketReload.body.pending, []);
+          assert.equal(item.marketReload.body.restartReason, '');
+          const afterReload = await currentTarget();
+          assert.equal(afterReload.runtime.generation, beforeReload.runtime.generation, '未变化插件继续使用原运行实例');
+          assert.equal(afterReload.digest, beforeReload.digest);
+          assert.deepEqual(afterReload.grants, beforeReload.grants);
+          await post(`/api/plugins/${target.manifest.id}/deactivate`, {});
+          await post(`/api/plugins/${target.manifest.id}/disable`, {});
+          const disabled = await reload();
+          assert.equal(disabled.status, 200, JSON.stringify(disabled));
+          assert.equal(disabled.body.ok, true);
+          assert.equal((await currentTarget()).enabled, false, 'profile 重载保留停用意图');
+          assert.equal((await currentTarget()).active, false);
           await removePlugin(target.manifest.id);
           await viewCheck(running, running.manifest.contributions.views[0], session, async frame => {
             await waitFor(() => frame.evaluate('Boolean(document.querySelector(".dsxpm-input"))'), '市场原包搜索输入框');
@@ -261,11 +283,23 @@ try {
             await writeFile(join(output,'market-installed.png'),Buffer.from(await ui.screenshot(),'base64'));
             const updatedList = await list('only=installed&q=dsh-plugin-mgr');
             assert.ok(updatedList.items.some(row=>row.installedAs==='dsh-plugin-mgr'&&row.installedVersion==='0.2.12'));
+            await frame.evaluate(`window.__magiReloadDocument='before-reload';[...document.querySelectorAll('button')].find(button=>button.innerText==='重载 profile').click()`);
+            await waitFor(() => frame.evaluate(`window.__magiReloadDocument===undefined && Boolean(document.querySelector('.dsxpm-input'))`), '原包重载完成并实际刷新文档', 30_000);
+            await frame.evaluate(`(() => {const input=document.querySelector('.dsxpm-input');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'dsh-plugin-mgr');input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+            await frame.evaluate(`[...document.querySelectorAll('button')].find(button=>button.innerText==='搜索').click()`);
+            await waitFor(() => frame.evaluate(`Boolean([...document.querySelectorAll('.dsxpm-card')].find(card=>card.querySelector('.dsxpm-name')?.textContent==='dsh-plugin-mgr')?.querySelector('.dsxpm-installed'))`), '重载后新文档的桥和真实安装列表继续可用');
+            const currentMgr = (await api('/api/plugins')).value.plugins.find(plugin=>plugin.manifest.id===mgr.manifest.id);
+            const currentMarket = (await api('/api/plugins')).value.plugins.find(plugin=>plugin.manifest.id===item.id);
+            assert.equal(currentMgr.runtime.generation, mgr.runtime.generation);
+            assert.equal(currentMarket.runtime.generation, running.runtime.generation);
+            assert.equal(currentMgr.runtime.state, 'running');
+            await writeFile(join(output,'market-reloaded.png'),Buffer.from(await ui.screenshot(),'base64'));
             await removePlugin(mgr.manifest.id);
           });
           item.upgrade = 'passed';
           item.functionalChecks = { onlineInstall: true, daemonOwnership: true, activation: true, onlineUpdate: true, installedInventory: true,
-            originalPageInstall: true, failedInstallPreservesVersion: true, gitSources: 'unverified', profileReload: 'unverified' };
+            originalPageInstall: true, failedInstallPreservesVersion: true, gitSources: 'unverified', profileReload: true,
+            unchangedInstances: true, disabledStateAfterReload: true, originalPageReload: true, bridgeAfterReload: true };
         }
         if (pkg === 'dsh-plugin-mgr' && item.smoke?.ok) {
           const target = await installTarget();

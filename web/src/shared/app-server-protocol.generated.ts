@@ -1720,3 +1720,7 @@ export interface PluginBundleInstallResult {
 export type PluginBundleInstallApplication = "applied" | "failed" | "cancelled";
 
 export type PluginBundleInstallCancelStatus = "cancelled" | "too-late" | "not-running";
+
+export interface PluginReconcileRequest {
+  pluginIds: Array<string>;
+}

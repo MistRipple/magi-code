@@ -107,6 +107,7 @@ daemon 响应形状：
 | `plugins.compatibility`／`plugins.setVersionExemption` | `api.plugins.compatibility()`／`setVersionExemption(input)` | 需协商 `plugin.management`。读取要求活动宿主租约；写入另需 `pluginManagement:["compatibility"]`，使用 `PluginDshVersionExemptionRequest` 的精确 target、当前 runtimeVersion／runtimeId、revision CAS 和显式风险确认。安装／升级提交前重验，撤销后旧译包不能继续提交 |
 | `plugins.preview/install` | `api.plugins.preview(input)`／`install(input)` | 需协商 `plugin.management` 与 `pluginManagement:["install"]` 授权；复用 `PluginUpstreamRequest`、预览与安装入口，返回既有预览／目录 DTO；仅支持已接入的上游生态。安装必须指定精确版本与预览摘要，不替用户授权新版本 |
 | `plugins.installBundle/cancelInstall` | `api.plugins.installBundle(input)`／`cancelInstall(requestId)` | 另协商 `plugin.installations`，使用 `PluginBundleInstall*` DTO；由 daemon 完成在线版本解析、准备、安装／升级及请求的启停，返回实际应用结果。两者均需 install 授权，后台调用另需 background；启停及代授新版本分别核对 lifecycle、authorize 委托 |
+| `plugins.reconcile` | `api.plugins.reconcile({pluginIds})` | 协商 `plugin.reconciliation`，需 `pluginManagement:["lifecycle"]`，后台另需 background。输入 `PluginReconcileRequest`（至多 512 个唯一已安装 ID），沿 daemon 原监管器收敛已提交的激活意图并等待所选活动扩展真实就绪；所有目标共用 110 秒预算。返回既有目录 DTO；停用项保持停用，未变化实例保持代次，缺少监管器、启动失败、排空、版本／激活变化、过期租约和撤权明确失败。不授予权限、不重新安装、不清空故障或强制重启 |
 | `plugins.setEnabled/remove` | `api.plugins.setEnabled(pluginId,enabled)`／`remove(pluginId)` | 需协商 `plugin.management` 与 `pluginManagement:["lifecycle"]`；复用 HTTP 的生命周期、排空与停止端口。拒绝当前发起插件的自身停止、删除或升级；启用后等待真实宿主运行状态，启动失败不返回成功 |
 | `tool.call` | `api.tools.call(tool,input)` | 只接受公开原生工具；需要真实 Task、租约、策略、schema、权限、审批与账本 |
 | `task.spawn` | `api.task.spawn(input)` | 原生 agent_spawn 合同；保留角色、自定义模型绑定、目录与策略，不接受伪造归属 |
@@ -138,6 +139,8 @@ sessionRead 的各自授权。未声明客户端贡献的普通视图仍按页�
 管理 API 的后台模式另协商 `plugin.management.background`：SDK 的 `api.plugins.background` 以显式 `background:true` 传输元字段发送管理写请求，不携带已结束的 invocationId。HostHandler 仅接受插件管理方法、拒绝同时携带 invocationId，移除该元字段并注入当前 `_instance`／`_background` 后交给 daemon。daemon 在初次准入和异步提交锁内均检查 background 及具体动作授权；停用、撤权和旧实例失效仍拒绝。只读目录和兼容策略可沿当前实例重新读取；普通管理 API、模型、工具、会话和钩子原有调用租约边界不变。
 
 插件目录订阅只有当前实例内的监听器，不传递其他插件的配置、事件日志或凭据；不提供跨重启游标或逐条迁移重放。消费者先订阅再读取完整目录，并合并读取期间的失效通知后补读；daemon 广播接收落后时再次通知所有活动实例重新读取。解除订阅及宿主退出回收监听器，旧实例的读取仍由 plugins.list 身份准入拒绝。DSH 全局 internal/status 的观察者接收由当前目录生成的只读生命周期投影（entry.options、state、await），本地可执行 fiber 仍归真实 Cordis；外部故障不得触发观察插件自身的失败或处置。观察按包摘要、运行代次、状态与原因去重；恢复及移除使旧故障清除，不维持第二套插件运行状态。
+
+DSH 的 `hmr.runExclusive(callback)` 串行运行当前实例的 profile 应用操作，禁止嵌套；回调异常不阻塞后续显式操作。`reconcileProfile(requiredIds?)` 必须在该事务内调用：先沿原提交入口结算当前调用的清单／启停提案，再由 `plugins.reconcile` 核对运行目录并刷新 profile 投影。必需 Loader 条目未运行时失败；已启用但未激活的条目返回可执行的授权／运行状态提示。不可变安装归档的版本替换仍归原安装事务，因此没有物理 profile、文件监听或另一份模块缓存；该服务不提供上游 `watchConfig` 或任意模块替换。调用结束、取消和实例处置后，遗留队列及快照访问拒绝。页面刷新继续运行原包代码与共享视图桥。
 
 DSH `profileContext.packageManager` 提供插件实例拥有的内部 Node 命令入口。原包通过当前 Node 的 `spawn(node,[script,...])` 启动 JS／MJS／CJS 辅助脚本时，脚本继续运行原字节，profile 文件读取仍来自 daemon 快照。同步调用该包管理入口只阻塞辅助进程：独立传输进程等待父扩展经 `plugins.installBundle` 取得实际结果，再刷新同一调用的 profile 投影。只接受当前 profile 的 `add`、npm 版本／范围／标签以及工作区、忽略脚本、强制获取选项；不会启动 pnpm、执行构建脚本或把 Git 来源伪装成 npm。其他 Node 进程调用形态和非 Node 原生程序保留原有路径。
 

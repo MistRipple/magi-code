@@ -44,6 +44,10 @@ Session、Turn 或草稿事实，也不允许未授权的后台会话写入。
 复用资源 CAS 持久化。runtimeId 绑定当前随包锁文件，豁免只对精确包版本和当前运行时生效；
 管理写操作需要独立 compatibility 授权和风险确认，不改变已有安装摘要、能力或权限准入。
 
+`PluginReconcileRequest` 为扩展服务的增量输入 DTO，经 `plugin.reconciliation` 协商使用，不新增 App Server 方法。
+显式选择至多 512 个唯一已安装 ID，只核对已提交的激活意图并等待原监管器就绪，返回既有插件目录。
+它不修改启停、授权或安装事实；需要 lifecycle 授权，后台调用另需 background，期间版本／状态变化明确拒绝。
+
 `PluginListRequest.includeUpstreamManifest` 与 `PluginInstalled.upstreamManifest` 是只读增量字段：
 旧请求默认省略原包元数据；显式请求时仅返回 daemon 当前不可变安装归档内通过包名/版本校验的
 package.json，不包含插件可写配置或凭据。旧包缺失该文件时保持未知，不从 Magi 清单补造。

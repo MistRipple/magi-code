@@ -102,7 +102,7 @@ export async function updateProfileExemption(target, runtimeVersion, enabled, ac
 
 function state() {
   const scope = scopes.getStore();
-  if (!scope) throw error('EPERM', 'DSH profile 只能在 daemon 已签发的调用快照内访问');
+  if (!scope || scope.closed) throw error('EPERM', 'DSH profile 只能在 daemon 已签发的调用快照内访问');
   scope.signal?.throwIfAborted();
   return scope;
 }
@@ -202,6 +202,46 @@ export function loaderEntries() {
       fiber: pluginLifecycle(plugin) })) ];
 }
 
+// 原包的“应用当前 profile”操作沿 daemon 唯一监管器完成。安装归档不可变，
+// 版本替换已由安装事务提交；这里不会观察物理目录或重启未变化的模块。
+export function createProfileReload() {
+  const owner = host, transactions = new AsyncLocalStorage();
+  let queue = Promise.resolve();
+  const admitted = () => {
+    if (!owner || host !== owner) throw new Error('profile 重载所属实例已失效');
+    return state();
+  };
+  return Object.freeze({
+    runExclusive(callback) {
+      if (transactions.getStore()?.active) return Promise.reject(new Error('HMR transactions cannot be nested'));
+      const operation = queue.then(async () => {
+        admitted();
+        const transaction = { active: true };
+        try { return await transactions.run(transaction, callback); }
+        finally { transaction.active = false; }
+      });
+      queue = operation.catch(() => {});
+      return operation;
+    },
+    async reconcileProfile(requiredIds = []) {
+      if (!transactions.getStore()?.active) throw new Error('HMR profile reconciliation must run inside runExclusive');
+      const scope = admitted();
+      if (!Array.isArray(requiredIds) || requiredIds.length > 512 || requiredIds.some(id => typeof id !== 'string')) throw new Error('profile 必需条目身份无效');
+      await commit(scope);
+      await refresh(scope);
+      admitted();
+      await owner.api.plugins.reconcile({ pluginIds: scope.bundles.map(({ plugin }) => plugin.manifest.id) });
+      admitted();
+      await refresh(scope);
+      const entries = new Map(loaderEntries().map(entry => [entry.options.id, entry]));
+      for (const id of requiredIds) if (entries.get(id)?.fiber?.state !== 2) throw new Error(`profile 必需条目未运行：${id}`);
+      const warnings = scope.bundles.filter(({ plugin }) => plugin.enabled && !plugin.active)
+        .map(({ name }) => `${name} 尚未激活，请在 Magi 插件管理检查授权与运行状态`);
+      return { warnings, pending: [] };
+    },
+  });
+}
+
 async function commit(scope) {
   scope.signal?.throwIfAborted();
   if (!scope.dirty.size) return;
@@ -240,7 +280,7 @@ export async function withProfile(callback, signal) {
   await refresh(scope);
   return scopes.run(scope, async () => {
     try { const result = await callback(); if (!(result?.status >= 400 || result?.body?.ok === false || result?.isError)) await commit(scope); return result; }
-    finally { scope.descriptors.clear(); }
+    finally { scope.closed = true; scope.descriptors.clear(); }
   });
 }
 

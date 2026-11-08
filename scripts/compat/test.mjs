@@ -75,6 +75,15 @@ test('profileContext 只读身份与包管理委托分开识别，条件取服�
   assert.equal(direct.verdict.blocked.length, 0);
 });
 
+test('profile 重载只声明已提供的公共操作；文件监听和任意模块替换仍不能冒充已支持', async t => {
+  const report = await inspectOptional(t, "export const inject=['hmr']; export function apply(ctx) { ctx.hmr.runExclusive(() => ctx.hmr.reconcileProfile()); }");
+  assert.equal(report.verdict.blocked.length, 0);
+  for (const method of ['watchConfig', 'reloadModule']) {
+    const unsupported = await inspectOptional(t, `export function apply(ctx) { ctx.hmr.${method}(); }`);
+    assert.ok(unsupported.verdict.blocked.length > 0);
+  }
+});
+
 test('后端 sessions 命名空间准入不代表完整 Session 对象或写入方法已翻译', async(t)=>{
   assert.equal((await inspectOptional(t,"export const inject=['sessions']; export function apply(ctx) {}" )).verdict.blocked.length,0);
   for(const code of ["ctx.sessions.list()","ctx.sessions.get('s').header","ctx.sessions.create('s')","ctx.sessions.fork('s')"]){

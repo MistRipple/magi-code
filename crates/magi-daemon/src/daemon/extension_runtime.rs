@@ -583,6 +583,16 @@ impl ExtensionRuntime {
 }
 
 impl magi_api::ExtensionStatusSource for ExtensionRuntime {
+    fn reconcile(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        let runtime = self.clone();
+        Box::pin(async move {
+            runtime.reconcile().await;
+            Ok(())
+        })
+    }
+
     fn validate_settings(
         &self,
         plugin_id: String,
