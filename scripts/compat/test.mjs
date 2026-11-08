@@ -66,6 +66,15 @@ test('ctx.get 服务读取沿上下文辅助函数记录，供管理权限声明
   assert.equal(report.verdict.blocked.length, 0, '读取可缺席服务不会被变成必需依赖');
 });
 
+test('profileContext 只读身份与包管理委托分开识别，条件取服务仍保留成员使用证据', async t => {
+  const read = await inspectOptional(t, "export function apply(ctx) { const profile = ctx.get('profileContext'); console.log(profile.name, profile.dir); }");
+  assert.equal(Object.hasOwn(read.serviceMembers, 'profileContext.packageManager'), false);
+  const manager = await inspectOptional(t, "export function apply(ctx) { const profile = typeof ctx.get==='function' ? ctx.get('profileContext') : null; console.log(profile.packageManager); }");
+  assert.equal(manager.serviceMembers['profileContext.packageManager'].count, 1);
+  const direct = await inspectOptional(t, "export function apply(ctx) { console.log(ctx.profileContext.packageManager.command); }");
+  assert.equal(direct.verdict.blocked.length, 0);
+});
+
 test('后端 sessions 命名空间准入不代表完整 Session 对象或写入方法已翻译', async(t)=>{
   assert.equal((await inspectOptional(t,"export const inject=['sessions']; export function apply(ctx) {}" )).verdict.blocked.length,0);
   for(const code of ["ctx.sessions.list()","ctx.sessions.get('s').header","ctx.sessions.create('s')","ctx.sessions.fork('s')"]){

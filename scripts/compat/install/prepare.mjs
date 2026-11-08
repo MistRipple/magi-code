@@ -103,9 +103,12 @@ export async function prepareDsh(options) {
   if (client && (business.operations.length || usesComposerClient(clientSource))) {
     manifest.permissions.push({ kind: 'composer', targets: ['images'] });
   }
-  if (inspection.entries.some((entry) => /^(?:ctx\.)?(?:pluginManager|loader)(?:\.|$)/.test(entry.name))
-    || ['pluginManager', 'loader'].some((name) => Object.hasOwn(inspection.serviceReads, name))) {
-    manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', 'authorize', 'compatibility', 'background'] });
+  const management = inspection.entries.some((entry) => /^(?:ctx\.)?(?:pluginManager|loader)(?:\.|$)/.test(entry.name))
+    || ['pluginManager', 'loader'].some((name) => Object.hasOwn(inspection.serviceReads, name));
+  const packageManagement = Object.hasOwn(inspection.serviceMembers, 'profileContext.packageManager') || recorded.profilePackageManager
+    || inspection.entries.some(entry => entry.name === 'ctx.profileContext.packageManager');
+  if (management || packageManagement) {
+    manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', 'authorize', ...(management ? ['compatibility'] : []), 'background'] });
   }
   if (readSessionDirectory) manifest.permissions.push({ kind: 'sessionRead', targets: ['directory'] });
   if (inspection.entries.some(entry => entry.name === 'attachments' || /^ctx\.attachments(?:\.|$)/.test(entry.name)) || Object.hasOwn(inspection.serviceReads, 'attachments')) {

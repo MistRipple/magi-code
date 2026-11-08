@@ -9,6 +9,122 @@ import fs from './runtime/profile-fs.mjs';
 import { load, dump } from 'js-yaml';
 import { installSharedResolution } from './runtime/shared-resolution.mjs';
 import { createPluginManager } from './runtime/plugin-manager.mjs';
+import { profileSpawn } from './runtime/profile.mjs';
+import { once } from 'node:events';
+
+test('原包 Node 辅助进程读取真实 profile，内部包管理经同一 daemon 任务提交并在同步退出前结算', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'magi-profile-child-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  let plugins = [], request;
+  const off = configureProfile({ plugins: {
+    list: async () => ({ plugins }),
+    async installBundle(input) {
+      request = input;
+      plugins = [{ manifest: { id: 'dsh.child', description: 'native' }, digest: 'current',
+        upstreamManifest: { name: '@scope/child', version: '2.0.0', dsh: { bundle: {} } },
+        source: { kind: 'upstream', location: 'dsh:@scope/child@2.0.0' }, enabled: true, active: true }];
+      return { application: 'applied', version: '2.0.0' };
+    },
+    async setEnabled(id, enabled, digest) {
+      assert.equal(id, 'dsh.child'); assert.equal(digest, 'current');
+      plugins[0].enabled = enabled; plugins[0].active = enabled;
+    },
+  } }, { home }); t.after(off);
+  const script = join(home, 'helper.cjs');
+  await writeFile(script, `
+const fs=require('node:fs'),cp=require('node:child_process');
+const path=process.env.DSH_PROFILE_DIR+'/package.json';
+const before=JSON.parse(fs.readFileSync(path,'utf8'));
+const output=fs.openSync(${JSON.stringify(join(home, 'install.log'))},'w');
+const r=cp.spawnSync(process.env.DSH_PACKAGE_MANAGER_COMMAND,[...JSON.parse(process.env.DSH_PACKAGE_MANAGER_ARGS),'add','@scope/child@2.0.0','-w','--dir',process.env.DSH_PROFILE_DIR],{stdio:['ignore',output,output]});
+fs.closeSync(output);
+if(r.status!==0)throw new Error('install failed');
+if(!(r.pid>0))throw new Error('missing real process identity');
+const after=JSON.parse(fs.readFileSync(path,'utf8'));
+fs.writeFileSync(path,JSON.stringify(after));
+fs.writeFileSync(process.env.DSH_PROFILE_DIR+'/cordis.patch.yml','- id: dsh.child\\n  disabled: true\\n');
+console.log(JSON.stringify({before:before.dependencies,after:after.dependencies,argv:process.argv.slice(2)}));
+process.exit(0);`);
+  await withProfile(async () => {
+    const child = profileSpawn(process.execPath, [script, 'original-argument']);
+    let out = '', err = ''; child.stdout.on('data', data => out += data); child.stderr.on('data', data => err += data);
+    assert.equal((await once(child, 'close'))[0], 0, err);
+    assert.deepEqual(JSON.parse(out), { before: {}, after: { '@scope/child': '2.0.0' }, argv: ['original-argument'] });
+  });
+  assert.equal(request.package, '@scope/child'); assert.equal(request.version, '2.0.0'); assert.equal(request.enabled, true);
+  assert.ok(request.requestId);
+  assert.equal(plugins[0].enabled, false, '同步退出前真正提交启停提案');
+  assert.match(nativeFs.readFileSync(join(home, 'install.log'), 'utf8'), /daemon.*提交/);
+  assert.equal(nativeFs.existsSync(profilePath()), false, '辅助进程也不物化第二份 profile');
+  const nested = join(home, 'nested.mjs');
+  await writeFile(nested, `import {spawn} from 'node:child_process';const child=spawn(process.execPath,[${JSON.stringify(script)},'original-argument'],{stdio:['ignore','pipe','pipe']});child.stdout.pipe(process.stdout);child.stderr.pipe(process.stderr);child.on('close',code=>process.exitCode=code);`);
+  await withProfile(async () => {
+    const child = profileSpawn(process.execPath, [nested]);
+    let out='', err=''; child.stdout.on('data',data=>out+=data); child.stderr.on('data',data=>err+=data);
+    assert.equal((await once(child, 'close'))[0], 0, err);
+    assert.equal(JSON.parse(out).after['@scope/child'], '2.0.0', '派生辅助进程沿父实例继续委托，不产生独立安装事实');
+  });
+});
+
+test('辅助进程退出或调用取消回收委托并取消自身准备中的安装，其他 profile 参数不进入安装入口', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'magi-profile-child-cancel-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  let resolveInstall, started, cancelled;
+  const began = new Promise(resolve => { started = resolve; });
+  const stopped = new Promise(resolve => { cancelled = resolve; });
+  let calls = 0;
+  const off = configureProfile({ plugins: {
+    list: async () => ({ plugins: [] }),
+    installBundle(input) { calls++; started(input.requestId); return new Promise(resolve => { resolveInstall = resolve; }); },
+    async cancelInstall(id) { cancelled(id); resolveInstall({ application: 'cancelled' }); return { status: 'cancelled' }; },
+  } }, { home }); t.after(off);
+  const script = join(home, 'helper.mjs');
+  await writeFile(script, `import {spawnSync} from 'node:child_process';
+const result=spawnSync(process.env.DSH_PACKAGE_MANAGER_COMMAND,[...JSON.parse(process.env.DSH_PACKAGE_MANAGER_ARGS),'add','test@1.0.0','-w','--dir',process.argv[2]],{encoding:'utf8'});
+console.log(JSON.stringify({status:result.status,stderr:result.stderr}));`);
+  await withProfile(async () => {
+    const denied = profileSpawn(process.execPath, [script, join(home, 'other-profile')]);
+    let output=''; denied.stdout.on('data', data => output += data); denied.stderr.resume();
+    await once(denied, 'close');
+    assert.match(JSON.parse(output).stderr, /其他 profile/); assert.equal(calls, 0);
+  });
+  const failedScript = join(home, 'failed-helper.mjs');
+  await writeFile(failedScript, `import {writeFileSync} from 'node:fs'; writeFileSync(process.env.DSH_PROFILE_DIR+'/package.json','{"dependencies":{"uncommitted":"*"}}'); process.exit(1);`);
+  await withProfile(async () => {
+    const child = profileSpawn(process.execPath, [failedScript]);
+    let errors = ''; child.stderr.on('data', data => errors += data); child.stdout.resume();
+    assert.equal((await once(child, 'close'))[0], 1);
+    assert.equal(errors, '', '失败退出丢弃提案，不尝试提交损坏清单');
+  });
+  const controller = new AbortController();
+  await assert.rejects(withProfile(async () => {
+    const child = profileSpawn(process.execPath, [script, profilePath()]);
+    child.stdout.resume(); child.stderr.resume();
+    const closed = once(child, 'close'), id = await began;
+    controller.abort(new Error('真实调用已取消'));
+    assert.equal(await stopped, id, '取消的是父实例已登记的同一 native 安装任务');
+    await closed;
+  }, controller.signal), /真实调用已取消/);
+});
+
+test('DSH 管理命令的终止请求取消同一个 daemon 安装任务，不留下迟到安装', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'magi-profile-command-cancel-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  let started, finish, cancelled;
+  const began = new Promise(resolve => { started=resolve; });
+  const off=configureProfile({ plugins: {
+    list: async()=>({plugins:[]}),
+    installBundle(input) { started(input.requestId); return new Promise(resolve=>{finish=resolve;}); },
+    async cancelInstall(id) { cancelled=id; finish({application:'cancelled'}); return {status:'cancelled'}; },
+  } }, {home});t.after(off);
+  await withProfile(async()=>{
+    const child=profileSpawn('dsh',['plugin','add','test@1.0.0']);
+    child.stdout.resume(); child.stderr.resume();
+    const closed=once(child,'close'), id=await began;
+    child.kill();
+    assert.equal((await closed)[0],1);assert.equal(cancelled,id);
+  });
+});
 
 test('profile 同步读取真实调用快照，启停提案经 daemon 与摘要校验提交，无物理副本和失败写入', async (t) => {
   const home = await mkdtemp(join(tmpdir(), 'magi-profile-test-'));

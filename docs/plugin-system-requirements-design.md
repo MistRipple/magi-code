@@ -826,6 +826,18 @@ Upgrader 原包追加验证了 0.0.8→0.0.7 切换并保持禁用、请求不�
 
 【定向检查与边界】翻译层 87 项、宿主 15 单元＋25 Node 集成、daemon 生命周期 13 项通过；Web check 0 错误 0 警告，i18n、输入桥、格式及发行边界检查通过。扩展的启动门禁使用机制夹具验证，不能据此扩大上游核心业务分母；完整生态 95%／100%、Windows 和提交各阶段崩溃恢复仍未验收。夹具首次扩展时暴露配置方法／schema／依赖声明错误，修正夹具并完整重跑，没有绕过产品准入。
 
+### 11.26 原包 Node 辅助进程与 daemon 包管理委托（2026-11-08）
+
+【用户任务与实测失败】用户在第三方原生市场页面点击安装后，目标插件应进入 Magi 当前安装目录并实际运行。扩大业务断言复现 `@99galaxy/dsh-plugin-market@1.2.2` 的真实失败：主宿主能显示在线目录，但独立 Node 辅助脚本读不到虚拟 profile，返回 HTTP 500、`market: no profile`。此前列表 HTTP 200／有内容不能证明市场安装功能可用。失败证据保留在 `target/plugin-acceptance/market-helper-before/`。
+
+【公共产品实现】沿原 Node 启动外观为当前实例持有 JS／MJS／CJS 辅助进程委托，原脚本、参数、标准流及文件描述符继续由真实 Node 执行。辅助脚本读取与主宿主相同的 daemon profile 投影；`profileContext.packageManager` 指向内部受实例约束的命令入口，把当前 profile 的在线安装意图转交已有 `plugins.installBundle`，取得实际回执后更新调用快照。没有物理 profile、pnpm 安装树或另一套安装／启停流程；辅助脚本的清单及启停写入也沿原 profile 提交入口，不直接改 PluginManager 文件。
+
+【生命周期与授权】辅助进程持有独立私有委托，不继承 daemon RPC 凭据；只读 profile 身份与包管理成员分别识别，使用包管理能力才进入安装授权预览。CommonJS 与 ESM 共用无顶层 await 的文件／进程外观；同步退出成功前结算提案，失败退出丢弃；跨 profile 和过期摘要拒绝。取消、退出及处置撤销委托、取消其准备中的原生安装任务，已经进入提交的操作仍按 daemon 任务合同结算。派生辅助进程继续沿父实例委托；原 `dsh plugin add` 命令的终止请求也接入相同取消任务入口，不把 EventEmitter 的本地终止标记当实际取消。大小、进程数量和连接边界见[扩展协议](extension-protocol-v1.md)。
+
+【打包原包业务证据】最终 macOS arm64 Electron 45 目录包，从 npm 在线安装 Market 原包后：读取自身已安装版本，安装 release-probe 0.0.7 并实际运行，在线替换到 0.0.8，不存在版本失败后保留 0.0.8 运行；原包右栏页面搜索并点击安装 Mgr 0.2.12，daemon 真实宿主 running，原页面自动展示“安装完成”和“已安装”，列表返回精确版本。证据在 `target/plugin-acceptance/market-helper-business/{results.json,coverage.json,market-installed.png}`。该目录未收录 release-probe，原包按自身规则将其计为版本未知，不伪造目录行；验收最初错误使用完整作用域包名搜索及假定测试包已被收录，后按原包实际搜索／计数规则修正。重复打开右栏的验收也改为读取实际可见状态，不盲目点击切换按钮。
+
+【回归与未完成】翻译层 **91/91**、profile 定向 **10/10**，含真实 Node 辅助进程、嵌套委托、文件描述符回执、同步退出结算、失败退出丢弃、跨 profile 拒绝和取消同一安装任务；发行边界、语法和 diff 检查通过。重建目录包的原生运行时 **63/63**、Mgr 原包 **15/15** 通过，最终包中受影响运行库与源码字节一致。Market 的 Git 来源及 profile/HMR 重载仍未完成，批量报告保留 `core:unverified`、原分母 9、`qualified:false` 并按门槛退出 1；没有将此次 npm 安装链路通过换算成整个市场、生态或 Windows 通过。
+
 ## 12. 验收与证据边界
 
 ### 12.1 已运行验证

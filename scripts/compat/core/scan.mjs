@@ -316,6 +316,7 @@ export function scanSources(root, options = {}) {
   const calls = new Map();
   const injects = new Map();
   const serviceReads = new Map();
+  const serviceMembers = new Map();
   const events = new Map();
   let lines = 0;
   const { info, unresolved } = analyzeContexts(files, flow);
@@ -329,6 +330,26 @@ export function scanSources(root, options = {}) {
       return undefined;
     };
     const isDshContext = (node, at) => flow === DSH_FLOW && ts.isIdentifier(node) && labelOf(node.text, at) === 'ctx';
+    // ctx.get() 的结果属于具体服务，不能因只读取 profile 名称就申请安装委托。
+    const aliases = new Map();
+    const ownerOf = node => { for (let parent = node.parent; parent; parent = parent.parent) if (isFunctionLike(parent)) return parent; return source; };
+    const collectServices = node => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+        const names = new Set();
+        const find = value => {
+          if (ts.isCallExpression(value) && ts.isPropertyAccessExpression(value.expression) && value.expression.name.text === 'get'
+            && isDshContext(value.expression.expression, value) && value.arguments[0] && ts.isStringLiteralLike(value.arguments[0])) names.add(value.arguments[0].text);
+          ts.forEachChild(value, find);
+        };
+        find(node.initializer);
+        if (names.size === 1) {
+          const owner = ownerOf(node), scope = aliases.get(owner) ?? new Map();
+          scope.set(node.name.text, [...names][0]); aliases.set(owner, scope);
+        }
+      }
+      ts.forEachChild(node, collectServices);
+    };
+    collectServices(source);
     const visit = (node) => {
       if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
         const typeOnly = Boolean(node.importClause?.isTypeOnly);
@@ -347,6 +368,10 @@ export function scanSources(root, options = {}) {
         const label = chain && chain.length > 1 ? labelOf(chain[0], node) : undefined;
         if (label) bump(calls, [flow.keyOf(label), ...chain.slice(1, depth)].join('.'), rel,
           flow === DSH_FLOW && conditionalService(node, chain[1], isDshContext));
+        if (chain?.length > 1) for (let parent = node.parent; parent; parent = parent.parent) {
+          const service = aliases.get(parent)?.get(chain[0]);
+          if (service) { bump(serviceMembers, [service, ...chain.slice(1, depth)].join('.'), rel); break; }
+        }
       }
       // 事件监听：`ctx.on('tools/pre-execute', …)` / `pi.on('tool_call', …)`。事件名不是字面量记为 <dynamic>。
       if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && ['on', 'once'].includes(node.expression.name.text)) {
@@ -378,5 +403,5 @@ export function scanSources(root, options = {}) {
     visit(source);
   }
   const plain = (map) => Object.fromEntries([...map].sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => [key, { count: value.count, optional: value.optionalCount === value.count, files: [...value.files].sort() }]));
-  return { fileCount: files.length, lineCount: lines, files: files.map((file) => relative(root, file)), imports: plain(imports), symbols: plain(symbols), calls: plain(calls), injects: plain(injects), serviceReads: plain(serviceReads), events: plain(events), unresolvedContextFlows: unresolved };
+  return { fileCount: files.length, lineCount: lines, files: files.map((file) => relative(root, file)), imports: plain(imports), symbols: plain(symbols), calls: plain(calls), injects: plain(injects), serviceReads: plain(serviceReads), serviceMembers: plain(serviceMembers), events: plain(events), unresolvedContextFlows: unresolved };
 }

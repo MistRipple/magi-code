@@ -18,6 +18,7 @@ import { createBackendSessions } from './backend-sessions.mjs';
 import { createRegisteredSettings } from './registered-settings.mjs';
 import { installRegistryFetch } from './registry-fetch.mjs';
 import { createPluginDirectory } from './plugin-directory.mjs';
+import { profilePackageManager } from './profile-process-host.mjs';
 
 const clone = (value) => structuredClone(value ?? {});
 const timeoutOf = (value) => value == null ? undefined : Math.min(600_000, Math.max(1_000, Number(value) || 1_000));
@@ -277,7 +278,7 @@ export async function activateDsh(api, module, options) {
   if (api.plugins?.list) ctx.provide('pluginManager', createPluginManager(api));
   if (api.plugins?.list && profilePath()) {
     ctx.provide('loader', { entries: loaderEntries });
-    ctx.provide('profileContext', Object.freeze({ name: 'magi', dir: profilePath() }));
+    ctx.provide('profileContext', Object.freeze({ name: 'magi', dir: profilePath(), packageManager: profilePackageManager() }));
   }
   // Loader 的 baseUrl 是当前 profile 目录，用于上游识别运行身份；不是 HTTP 地址。
   if (profilePath()) ctx.baseUrl = pathToFileURL(profilePath() + '/').href;

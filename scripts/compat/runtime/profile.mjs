@@ -9,6 +9,7 @@ import { PassThrough } from 'node:stream';
 import { load, dump } from 'js-yaml';
 import { createPluginManager } from './plugin-manager.mjs';
 import { pluginLifecycle } from './plugin-directory.mjs';
+import { createProfileProcesses } from './profile-process-host.mjs';
 
 const scopes = new AsyncLocalStorage();
 let host;
@@ -24,9 +25,11 @@ export function configureProfile(api, { home = process.env.DSH_HOME, registry = 
   if (host) throw new Error('DSH profile 已绑定宿主');
   if (api.plugins.background) api = { ...api, plugins: api.plugins.background };
   host = { api, registry, root: resolve(home, 'profiles', 'magi'), parent: resolve(home, 'profiles') };
+  host.processes = createProfileProcesses(api, { home, registry });
   const old = { dir: process.env.DSH_PROFILE_DIR, name: process.env.DSH_PROFILE };
   process.env.DSH_PROFILE_DIR = host.root; process.env.DSH_PROFILE = 'magi';
   return () => {
+    host.processes.dispose();
     host = undefined;
     if (old.dir === undefined) delete process.env.DSH_PROFILE_DIR; else process.env.DSH_PROFILE_DIR = old.dir;
     if (old.name === undefined) delete process.env.DSH_PROFILE; else process.env.DSH_PROFILE = old.name;
@@ -42,7 +45,12 @@ function bundle(plugin) {
 }
 async function refresh(scope) {
   const list = await host.api.plugins.list({ includeUpstreamManifest: true });
-  scope.compatibility = host.api.plugins.compatibility ? await host.api.plugins.compatibility() : null;
+  const compatibility = host.api.plugins.compatibility ? await host.api.plugins.compatibility() : null;
+  applyProfileSnapshot(scope, { list, compatibility });
+}
+export function applyProfileSnapshot(scope, { list, compatibility }) {
+  scope ??= state();
+  scope.compatibility = compatibility;
   scope.bundles = list.plugins.map(bundle).filter(Boolean);
   scope.original = new Map(scope.bundles.map((item) => [item.name, { ...item, digest: item.plugin.digest }]));
   scope.files = new Map(); scope.dirty = new Set();
@@ -236,9 +244,35 @@ export async function withProfile(callback, signal) {
   });
 }
 
+// 辅助进程的同步退出也必须先结算提案；终态回执由父实例经同一 commit 入口取得。
+export async function runProfileProcess(callback, finalize) {
+  const scope = { time: Date.now(), descriptors: new Map() };
+  await refresh(scope);
+  return scopes.run(scope, () => {
+    process.once('exit', code => finalize({
+      files: code === 0 ? [...scope.dirty].filter(key => !temporaryProposal(key)).map(key => [key, scope.files.get(key)]) : [],
+      expected: [...scope.original].map(([name, value]) => [name, value.digest]),
+    }));
+    return callback();
+  });
+}
+export function commitProcessProposal({ files, expected }) {
+  const scope = state();
+  if (!Array.isArray(files) || files.length > 256 || !Array.isArray(expected)) throw new Error('辅助进程 profile 提案无效');
+  if (JSON.stringify(expected) !== JSON.stringify([...scope.original].map(([name, value]) => [name, value.digest]))) throw new Error('辅助进程读取后安装目录已变化，请重试');
+  for (const [key, value] of files) {
+    if (!['package.json', 'cordis.patch.yml'].includes(key) || typeof value !== 'string') throw new Error('辅助进程只能提交 profile 清单和启停提案');
+    profileWrite(join(host.root, key), value);
+  }
+}
+
 // 只接管明确针对当前虚拟 profile 的 dsh plugin 命令。其他进程仍走原生
 // Node；这里不提供 Magi CLI，也不在 PATH 放置替身程序。
-export function profileSpawn(file, args = []) {
+export function profileSpawn(file, args = [], options) {
+  if (host && scopes.getStore()) {
+    const child = host.processes.spawn(file, args, options, state().signal);
+    if (child) return child;
+  }
   if (!host || !/^(dsh|dsh\.cmd)$/.test(basename(String(file)))) return;
   const child = new EventEmitter(); child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough(); child.pid = undefined;
   const controller = new AbortController(); child.kill = () => { controller.abort(); return true; };
@@ -254,8 +288,14 @@ export function profileSpawn(file, args = []) {
       if (rest.length || !spec || !['add', 'remove'].includes(verb)) throw new Error('DSH 管理命令参数不受支持');
       controller.signal.throwIfAborted();
       const manager = createPluginManager(host.api, host.registry);
-      const result = verb === 'add' ? await manager.installBundle(spec, { enabled: true }) : await manager.removeBundle(spec);
-      if (result.application === 'failed') throw new Error(result.error?.message ?? '插件管理失败');
+      const requestId = crypto.randomUUID();
+      const cancel = () => { if (verb === 'add') void manager.cancelInstall(requestId).catch(() => {}); };
+      controller.signal.addEventListener('abort', cancel, { once: true });
+      scope.signal?.addEventListener('abort', cancel, { once: true });
+      let result;
+      try { result = verb === 'add' ? await manager.installBundle(spec, { enabled: true, requestId }) : await manager.removeBundle(spec); }
+      finally { controller.signal.removeEventListener('abort', cancel); scope.signal?.removeEventListener('abort', cancel); }
+      if (result.application !== 'applied') throw new Error(result.error?.message ?? `插件管理结果：${result.application}`);
       await refresh(scope);
       child.stdout.end('Magi daemon 已提交插件管理操作\n'); code = 0;
     } catch (cause) { child.stderr.end(String(cause.message ?? cause)); }

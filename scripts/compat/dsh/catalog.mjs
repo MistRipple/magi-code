@@ -37,6 +37,7 @@ export const DSH_RULES = [
   rule('calls', /^ctx\.loader(\.entries)?$/, { fixed: 'shim', group: 'runtime', target: 'daemon 插件目录的调用期 loader 投影', note: '同步读调用快照；profile 启停写入回执前由 daemon 提交，不保存第二份安装事实', source: COOKBOOK }),
   rule('calls', /^ctx\.loader\./, { capability: 'ui.view', fidelity: 'partial', group: 'runtime', note: '尚未接入的 loader 方法明确拒绝', source: COOKBOOK }),
   rule('calls', /^ctx\.profileContext(\.(name|dir))?$/, { fixed: 'shim', group: 'runtime', target: 'daemon 插件目录的调用期 profile 身份', note: '只读身份用于定位同一虚拟 profile，文件读取来自 daemon 快照', source: COOKBOOK }),
+  rule('calls', /^ctx\.profileContext\.packageManager$/, { fixed: 'shim', group: 'runtime', target: '所属实例委托的 daemon 在线包管理', note: '内部 Node 命令只转交当前 profile 的 add 请求；安装、授权、启停与取消仍由 daemon 裁决，不执行 pnpm 或安装脚本', source: COOKBOOK }),
   rule('calls', /^ctx\.events(\.|$)/, { fixed: 'shim', group: 'runtime', target: 'Cordis 事件目录（只读）', note: '只暴露兼容层已登记的事件监听表，不提供任意宿主写入', source: COOKBOOK }),
   rule('calls', /^ctx\.(effect|fiber|on|once|collect|dispose|scope|inject|get|plugin|provide|root|parent)(\.|$)/, { fixed: 'shim', group: 'runtime', target: '真实 Cordis 运行时（兼容层内）', note: '注册与回收沿用上游 Cordis 语义', source: src('docs/cordis-api/context.md') }),
   rule('calls', /^ctx\.(emit|parallel|serial|bail|waterfall|accessor|mixin|extend|isolate|intercept|set)$/, { fixed: 'shim', group: 'runtime', target: '真实 Cordis 运行时（兼容层内）', source: src('docs/cordis-primer.md') }),

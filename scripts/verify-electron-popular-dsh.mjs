@@ -69,13 +69,13 @@ async function installTarget(version = '0.0.7') {
   return plugin;
 }
 const currentTarget = async () => (await api('/api/plugins')).value.plugins.find((entry) => entry.source.location.startsWith('dsh:dsh-plugin-release-probe@'));
-async function viewCheck(plugin, view, session) {
+async function viewCheck(plugin, view, session, interact) {
   const views = plugin.manifest.contributions.views;
   const selector = `iframe[data-plugin-id=${JSON.stringify(plugin.manifest.id)}]`;
   await page.call('Page.navigate', { url: `${origin}/web.html?scope=personal&sessionId=${encodeURIComponent(session)}` });
   await waitFor(() => ui.exists('[data-testid=sidebar-settings]'), '工作台');
   if (view.placements.includes('rightPane')) {
-    await ui.click('.header-right-pane-btn');
+    if (!await page.evaluate('Boolean(document.querySelector(".right-pane")?.getClientRects().length)')) await ui.click('.header-right-pane-btn');
     await waitFor(() => ui.exists('.right-pane-add-tab'), '右栏');
     await ui.click('.right-pane-add-tab');
     const tool = `.launcher-tool[data-plugin-id=${JSON.stringify(plugin.manifest.id)}][data-contribution-id=${JSON.stringify(view.id)}]`;
@@ -93,6 +93,7 @@ async function viewCheck(plugin, view, session) {
   try {
     frame = await waitFor(() => connectTarget(cdpPort, (target) => (target.type === 'iframe' || target.type === 'page') && target.url === url, '原包页面', errors), '原包页面');
     await waitFor(async () => (await frame.evaluate('document.body.innerText')).trim().length > 0, '原包内容');
+    if (interact) await interact(frame);
     // 等待一次上游页面初始化；请求结果另由后端 smoke 记录，不能把页面有字视为业务完成。
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const text = await frame.evaluate('document.body.innerText');
@@ -216,6 +217,56 @@ try {
             if (target) await removePlugin(targetId || target.manifest.id);
           }
         }
+        if (pkg === '@99galaxy/dsh-plugin-market' && item.smoke?.ok) {
+          const list = async (query) => {
+            const result = await post(`/api/plugins/${item.id}/routes`, { method: 'GET', path: '/dsh-plugin-market/list', query });
+            assert.equal(result.status, 200, JSON.stringify(result)); assert.equal(result.body.ok, true);
+            return result.body.payload;
+          };
+          const self = await list('only=installed&limit=5000');
+          item.marketInventory = self;
+          assert.ok(self.items.some(row => row.installedAs === pkg && row.installedVersion === version), `市场自己的已安装版本来自 daemon 目录：${JSON.stringify(self)}`);
+          const install = await post(`/api/plugins/${item.id}/routes`, { method: 'POST', path: '/dsh-plugin-market/install',
+            headers: { 'content-type': 'application/json' }, body: { install: 'dsh plugin add dsh-plugin-release-probe@0.0.7' } });
+          item.marketInstall = install;
+          assert.equal(install.status, 200, JSON.stringify(install));
+          const target = await currentTarget();
+          assert.equal(target?.manifest.version, '0.0.7', '市场安装必须写入 daemon 的真实安装目录');
+          assert.equal(target?.runtime?.state, 'running', '市场安装须完成已授权启用');
+          const inventory = await list('q=dsh-plugin-release-probe&only=installed');
+          assert.equal(inventory.unknownTotal, self.unknownTotal + 1, '原目录未收录的已装包按上游语义显示为版本未知');
+          const update = await post(`/api/plugins/${item.id}/routes`, { method: 'POST', path: '/dsh-plugin-market/install',
+            headers: { 'content-type': 'application/json' }, body: { install: 'dsh plugin add dsh-plugin-release-probe@0.0.8' } });
+          item.marketUpdate = update;
+          assert.equal(update.status, 200, JSON.stringify(update));
+          assert.equal((await currentTarget()).manifest.version, '0.0.8');
+          assert.equal((await currentTarget()).runtime.state, 'running');
+          const failed = await post(`/api/plugins/${item.id}/routes`, { method: 'POST', path: '/dsh-plugin-market/install',
+            headers: { 'content-type': 'application/json' }, body: { install: 'dsh plugin add dsh-plugin-release-probe@9999.0.0' } });
+          assert.equal(failed.body.ok, false, '不存在的原包版本必须向原页面报错');
+          assert.equal((await currentTarget()).manifest.version, '0.0.8');
+          assert.equal((await currentTarget()).runtime.state, 'running');
+          await removePlugin(target.manifest.id);
+          await viewCheck(running, running.manifest.contributions.views[0], session, async frame => {
+            await waitFor(() => frame.evaluate('Boolean(document.querySelector(".dsxpm-input"))'), '市场原包搜索输入框');
+            await frame.evaluate(`(() => {const input=document.querySelector('.dsxpm-input');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'dsh-plugin-mgr');input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+            await frame.evaluate(`[...document.querySelectorAll('button')].find(button=>button.innerText==='搜索').click()`);
+            await waitFor(() => frame.evaluate(`Boolean([...document.querySelectorAll('.dsxpm-card')].find(card=>card.querySelector('.dsxpm-name')?.textContent==='dsh-plugin-mgr'))`), '市场原包搜索结果');
+            await frame.evaluate(`[...document.querySelectorAll('.dsxpm-card')].find(card=>card.querySelector('.dsxpm-name')?.textContent==='dsh-plugin-mgr').querySelector('button').click()`);
+            const mgr = await waitFor(async () => {
+              const installed = (await api('/api/plugins')).value.plugins.find(plugin=>plugin.source.location==='dsh:dsh-plugin-mgr@0.2.12');
+              return installed?.runtime?.state==='running' ? installed : false;
+            }, '原包按钮在线安装 Mgr 并运行', 180_000);
+            await waitFor(() => frame.evaluate(`Boolean([...document.querySelectorAll('.dsxpm-card')].find(card=>card.querySelector('.dsxpm-name')?.textContent==='dsh-plugin-mgr')?.querySelector('.dsxpm-installed'))`), '市场原包页面显示已安装结果');
+            await writeFile(join(output,'market-installed.png'),Buffer.from(await ui.screenshot(),'base64'));
+            const updatedList = await list('only=installed&q=dsh-plugin-mgr');
+            assert.ok(updatedList.items.some(row=>row.installedAs==='dsh-plugin-mgr'&&row.installedVersion==='0.2.12'));
+            await removePlugin(mgr.manifest.id);
+          });
+          item.upgrade = 'passed';
+          item.functionalChecks = { onlineInstall: true, daemonOwnership: true, activation: true, onlineUpdate: true, installedInventory: true,
+            originalPageInstall: true, failedInstallPreservesVersion: true, gitSources: 'unverified', profileReload: 'unverified' };
+        }
         if (pkg === 'dsh-plugin-mgr' && item.smoke?.ok) {
           const target = await installTarget();
           const call = async (action, body) => {
@@ -324,6 +375,7 @@ try {
       await removePlugin(item.id);
       item.cleaned = true;
     } catch (error) {
+      if (item.marketInstall) item.core = 'failed';
       item.runtime = item.runtime || 'error'; item.error = error?.message || String(error);
       if (item.id) await removePlugin(item.id).then(() => { item.cleaned = true; }, (error) => { item.cleanupError = error.message; });
     }

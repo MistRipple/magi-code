@@ -43,6 +43,7 @@ export function buildReport({ translator, upstream, root, scanOptions, classify,
     translator, upstream,
     scanned: { files: scan.fileCount, lines: scan.lineCount, fileList: scan.files },
     serviceReads: scan.serviceReads,
+    serviceMembers: scan.serviceMembers,
     entries, summary: summarize(entries), verdict: verdictFor(entries, required),
   };
 }
