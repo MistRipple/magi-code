@@ -464,7 +464,7 @@
 | 使用原包页面 | 设置、主页面和右栏共用隔离页面宿主；后台就绪后挂载，摘要或代次变化释放旧文档与桥，其他插件变化保留当前文档；页面、资源、SVG 和外链保持上游表达 | `test:electron-dsh-rea`、`test:electron-plugin-runtime`；REA 原页面 Ghidra 链接、设置 CAS、207 个 MCP 工具和 390px 视口 |
 | 在会话目录执行业务 | 命令与工具共用 daemon 的实际执行上下文；命令先完成原生资源准备，再调用原包。DSH 仅将本次会话身份与执行根投影为业务读取所需的 `agent.id`、`agent.session.id/header.cwd`；不创建上游内核对象、历史或写入路径，其他成员明确拒绝。投影在调用结束／取消后失效，并发调用相互隔离 | 定向运行时回归覆盖并发、配置替换、取消及跨调用拒绝；Rust 覆盖隔离路径、源目录不可回落及真实 Node 命令上下文。桌面与真实原包业务的本轮结果见第 12 节 |
 | 持续接收页面业务 | 共享 EventSource 保留命名事件、UTF-8／CRLF、重连和取消；`contributions.client` 另需 persistent 授权，每窗口每个激活插件一个隔离文档，视图切换复用 | `test:electron-plugin-runtime`；多右栏页签、SSE、页面关闭／重开及停用回收 |
-| 取消页面请求 | 原页面 fetch 的 `init.signal` 与 `Request.signal` 沿同一视图桥取消对应后台路由；并发请求保持独立，文档回收结束等待，迟到回执和响应写入不再生效。取消不撤销已提交业务 | 定向合同覆盖 Request 输入、取消、正常完成、监听释放及 HEAD；真实目录包验证两种取消和其他并发调用的实际结果，完整复跑结果见第 12 节 |
+| 执行与取消页面请求 | 普通 HTTP、SSE 控制与插件私有 Typert JSON unary 路由共用调用入口，按独立授权读取 daemon 的会话与安装目录快照，回执前结算注册设置写入。原页面 fetch 的 `init.signal`／`Request.signal` 及 Remote 第四参数沿同一视图桥取消各自后台调用；文档回收结束等待，迟到回执不能覆盖取消，不撤销已提交业务 | 定向合同覆盖 Remote 的当前快照、未 await 的 CAS 写入、失败回执、预先取消及监听释放；真实目录包验证并发取消、显式重试和页面关闭／重开，完整复跑结果见第 12 节。Remote 流、Host 对象查找与原生会话上下文仍未提供 |
 | 页面上传与业务文件返回 | Blob、File、FormData 和 Request 正文沿原视图桥传原字节，Node／Fetch 路由共用载荷合同；图片、归档与应用响应头进入同一 Fetch Response。daemon 在业务前校验字节编码及容量，读流响应取消；不新增文件执行器或安装副本 | 机制回归覆盖二进制、multipart、原 PNG、下载文件名、2 MiB 边界、响应头、伪造／冲突及取消；目录发行包结果按本轮证据单列，不计为社区插件核心业务通过 |
 | 截图与附件 | 后台图片存储有独立实例授权、分块传输和持久元数据；输入端口等待真实草稿回执，原同步业务调用仅在可证明的 AST 路径上改为等待；图片发送仍由用户决定 | `test:electron-appshot`：0.4.2 原包真实 macOS 截图、关闭设置页后投递、重启后载荷恢复；证据 `target/plugin-acceptance/appshot/`。曾有解码／挂载超时，复跑通过，长期时序稳定性仍待定位 |
 | 读取会话目录 | 独立 `sessionRead:["directory"]` 权限，只读 daemon 用户会话元数据与稳定分页；不包含消息、凭据或完整可写 Session，不按上游对象形状伪造事实 | `test:electron-plugin-runtime`、`test:electron-appshot` |
@@ -497,8 +497,9 @@
 
 | 验证范围 | 入口 | 最近证据与边界 |
 | --- | --- | --- |
-| 本轮工具结果、页面与原包业务 | `npm run test:electron-plugin-runtime` | 新构建 macOS arm64 目录包、Electron 45、随包 Node，独立完整运行 **134/134**；`target/plugin-acceptance/tool-outcomes-product-workbench/`。工具成功／失败保留结构化结果及补充上下文，成功工具直接交付最终原文且无额外模型 Step，后续模型仍取得结束本轮前的上下文；取消、业务只执行一次、正式退出及重启后原文与来源恢复均通过。Debugging 0.7.2 在线原包的技能、原生审批和真实加载／停用／失败／恢复诊断，以及原页面、字节载荷、PNG／SVG、右栏和 390px 回归通过；Renderer 与 iframe 异常 0。本轮未启用外部 DSH CLI，不能由此认定整个 Debugging 插件已完成 |
-| 本轮工具结果公共检查 | `test:compat`、Rust、Web、协议、目录包 | **112/112**；真实 Node 宿主 **25/25**、任务循环 **66/66**、完成结果／恢复定向 **3/3**（与任务循环有重叠），`cargo check -p magi-daemon`、协议一致、修改文件格式及目录包解包自检通过。Web check 0 错误 0 警告，工具错误与展示回归通过；展示回归仍输出任务外 FileChangeCard／FileSpan 的既有 SSR 嵌套按钮警告。前端删除失败工具重展示时重复写控制台告警的副作用，失败详情仍由原 canonical 展示 |
+| 本轮页面业务、取消与恢复 | `npm run test:electron-plugin-runtime` | 新构建 macOS arm64 目录包、Electron 45、随包 Node，独立完整运行 **138/138**；`target/plugin-acceptance/remote-product-complete/`。原包页面 Remote 第四参数取消到达真实方法，预先取消不执行业务、迟到返回不覆盖取消，并发业务与显式重试完成；关闭全部面板后已授权持续文档继续取得结果，重开复用同一文档，停用与恢复释放并重建实例。整套工具成功／失败、完成原文、上下文、重启、Debugging 0.7.2 在线原包诊断、字节载荷、PNG／SVG、8 种外观、右栏与 390px 回归通过，Renderer 与 iframe 异常 0。未启用外部 DSH CLI 或阴影审计，不代表整个 Debugging 插件完成 |
+| 本轮路由公共检查与构建 | `test:compat`、目录包 | **114/114**，含真实 Cordis Remote 调用期的会话／安装目录快照、未 await 的注册设置 CAS、撤权失败及取消回归；JS 语法、差异格式和标准目录包构建／解包自检通过。未修改 Rust、Web 组件或协议，未重复对应全套检查 |
+| 此前工具结果公共检查，未在本轮复跑 | Rust、Web、协议 | 真实 Node 宿主 **25/25**、任务循环 **66/66**、完成结果／恢复定向 **3/3**（与任务循环有重叠），`cargo check -p magi-daemon`、协议一致、修改文件格式通过。Web check 0 错误 0 警告，工具错误与展示回归通过；展示回归仍输出任务外 FileChangeCard／FileSpan 的既有 SSR 嵌套按钮警告。前端删除失败工具重展示时重复写控制台告警的副作用，失败详情仍由原 canonical 展示 |
 | 本轮 Health 原包业务与停用来源 | `test:electron-dsh-health` | 新构建 macOS arm64 目录包、Electron 45、随包 Node；Health 3.0.5 与 Release Probe 0.0.8 在线原包 **21/21**，`target/plugin-acceptance/health-product-release/`。诊断、无效确认拒绝、停用来源原生详情展示、重启保留停用意愿、恢复运行、交接文件、原页面修复预览／取消／再次确认、真实临时文件隔离及原字节日志通过；390px 停用原因完整换行可见；详情默认／悬停、修复预览及完成态均 `cut=0`，页面异常 0。只覆盖列出的修复类型 |
 | 本轮在线管理公共链路 | `test:electron-dsh-management` | 同一新目录包独立完整复跑 **30/30**，`target/plugin-acceptance/health-lifecycle-management/`。Share、Upgrader、Market 原包完成 npm／GitHub 获取、安装、在线更新、授权、取消／重试、失败保留、重启及卸载；390px 确认固定可达且无横向溢出，阴影审计 `cut=0`。管理服务通过不代表 Mgr 原页面已通过 |
 | 此前公共检查，未全部复跑 | `test:compat`、Rust、Web、协议与目录包 | 翻译运行时 **110/110**；插件 API 50 项、插件领域各测试目标 83 项、真实 Node 后台管理身份 1 项通过。符号链接回归覆盖同步／回调／Promise 路径；Web check 0 错误 0 警告、插件列表和 i18n 回归、协议一致及目录包解包自检通过。修改的 Rust 文件格式检查通过，全仓格式检查有任务外既有差异，未改动这些文件 |
@@ -517,6 +518,8 @@
 | 本轮复现的 Mgr 页面流程 | `test:electron-dsh-profile` | Mgr 0.2.12 专项 **12/13**；`target/plugin-acceptance/profile-product-current/`。搜索、布局恢复、启停、运行错误恢复通过；原包将 forwardRef Button 对象误判为不可用，点击更新后确认框缺失。组件库已完整加载，不改写原包或伪装组件以计为通过 |
 
 验收保持原包组件、异常与成功门槛，不过滤运行错误或整轮自动重试。进程重启前释放旧文档，重新启动后等待工作台初始化。外部实例验收第一次错误地将脱敏后的公共路径与原值比较，第二次在已处于目标会话时强制刷新打断队列同步；失败证据保留于 `external-dsh-product/` 与 `external-dsh-product-verified/`，最终修正为同时核对公共投影和实际模型请求、复用当前会话文档后，独立整套通过 128/128。以上证据不替代第 11.2 节剩余产品工作。
+
+本轮 Remote 首轮验收辅助路由误用只支持 GET／HEAD 的 `resource`；后续两轮依次误把持续文档当作关闭页签即销毁、遗漏最后一个页签关闭后的右栏重开操作；另一次在线准备遇到 npm 官方源空闲超时。失败目录 `remote-product-current/`、`remote-product-final/`、`remote-product-verified/`、`remote-product-accepted/` 保留，不合并为通过；修正辅助路由、生命周期预期和真实交互后，`remote-product-complete/` 为单次独立完整通过。验收脚本现对超时／异常追加明确失败项，不能仅按中断前的断言推导整套通过。
 
 ### 12.2 未运行与不得推导的结论
 

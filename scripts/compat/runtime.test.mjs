@@ -16,6 +16,9 @@ import { browserImageFixtures, bmpEncodingFixtures } from '../lib/plugin-image-f
 import { createBackendSessions } from './runtime/backend-sessions.mjs';
 import { REGISTERED_SETTINGS_RESOURCE } from './runtime/registered-settings.mjs';
 import { createRegisteredSettings } from './runtime/registered-settings.mjs';
+import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
+import { REMOTE_ROUTE } from './runtime/remote.mjs';
+import { readFileSync as readProfileFile } from './runtime/profile-fs.mjs';
 
 // 只替代 daemon RPC；插件加载、依赖、effect、工具管线及模型目录运行真实上游代码。
 function host(value = {}) {
@@ -214,6 +217,63 @@ test('DSH 注册设置按命名空间保存到 daemon 资源，未 await 的写�
   assert.deepEqual(scopes[0].get(), previous.value.one, '写失败不能发布乐观快照');
   failure = null;
   await assert.rejects(invoke({ ns: 'two', op: 'mutate', ops: [{ op: 'set', path: ['__proto__', 'polluted'], value: true }] }), /路径/);
+});
+
+test('Remote 与普通路由共用 daemon 调用快照、设置提交与取消边界，不丢失未 await 的写入', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'magi-remote-scope-'));
+  const previousHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  let running, snapshot = { version: 0, value: null }, failure, currentSession = 'first', retained;
+  t.after(async () => {
+    await running?.dispose();
+    if (previousHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = previousHome;
+    await rm(home, { recursive: true, force: true });
+  });
+  const h = host();
+  h.api.plugins = { async list() { return { plugins: [] }; } };
+  h.api.session.directory = async () => ({ sessions: [{ sessionId: currentSession, createdAt: 1 }], hasMore: false });
+  h.api.resource = {
+    async read() { return structuredClone(snapshot); },
+    async write(_id, version, value) {
+      await delay(5);
+      if (failure) throw failure;
+      assert.equal(version, snapshot.version);
+      return snapshot = { version: version + 1, value: structuredClone(value) };
+    },
+  };
+  class Preferences extends TypertRemoteService {
+    static inject = ['sessions', 'settings', 'profileContext'];
+    constructor(ctx) { super(ctx, 'preferences', { namespace: 'preferences' }); }
+    read() {
+      retained = this.ctx.sessions.get(currentSession);
+      return { session: retained.id, enabled: this.ctx.settings.get('preferences').enabled,
+        profile: JSON.parse(readProfileFile(join(this.ctx.profileContext.dir, 'package.json'), 'utf8')).name };
+    }
+    save(enabled) { this.ctx.settings.update('preferences', { enabled }); return { saved: true }; }
+  }
+  for (const method of ['read', 'save']) Remote(method)(undefined, {
+    name: method, private: false, static: false, addInitializer(fn) { fn.call(Object.create(Preferences.prototype)); },
+  });
+  running = await activateDsh(h.api, { inject: ['settings'], async apply(ctx) {
+    ctx.settings.register('preferences', value => ({ enabled: value.enabled ?? true }));
+    await ctx.plugin(Preferences);
+  } }, { ...options, readSessionDirectory: true, settingsNamespaces: ['preferences'] });
+  const call = (method, args = {}, signal = new AbortController().signal) => h.state.routes.get(REMOTE_ROUTE)({
+    method: 'POST', body: { endpoint: 'preferences/' + method, args },
+  }, { signal });
+  assert.deepEqual((await call('read')).body, { ok: true, value: { session: 'first', enabled: true, profile: 'magi-dsh-profile' } });
+  assert.throws(() => retained.id, /调用/);
+  assert.deepEqual((await call('save', { enabled: false })).body, { ok: true, value: { saved: true } });
+  assert.equal(snapshot.value.preferences.enabled, false, 'Remote 回执须等待未 await 的 CAS 写入');
+  currentSession = 'second';
+  assert.equal((await call('read')).body.value.session, 'second', '每次 Remote 都读取 daemon 当前目录');
+  failure = new Error('permission revoked');
+  await assert.rejects(call('save', { enabled: true }), /permission revoked/);
+  assert.equal(snapshot.value.preferences.enabled, false, '写入失败不能返回成功或污染已确认设置');
+  failure = undefined;
+  await assert.rejects(call('save', { enabled: true }, AbortSignal.abort()), /abort/i);
+  assert.equal(snapshot.value.preferences.enabled, false, '预先取消不进入业务');
+  assert.deepEqual(h.state.failures, []);
 });
 
 test('后端会话目录消费真实分页，保持 list/get 形状且拒绝跨调用、取消和未知 Session 字段', async () => {

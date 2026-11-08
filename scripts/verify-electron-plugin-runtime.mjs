@@ -446,6 +446,7 @@ async function verifyNativePanels(session) {
     dsh: { bundle: {} }, exports: { '.': './index.js', './client': './client.js' } }));
   await writeFile(join(upstream, 'index.js'), `
 import Schema from '@deepseek-ai/schemastery';
+import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 export const inject = ['webServer'];
 export const Config = Schema.object({ startupUrl: Schema.string().default('') });
 export async function apply(ctx, config) {
@@ -493,6 +494,31 @@ export async function apply(ctx, config) {
     let name='';for await(const chunk of req)name+=chunk;
     const call=calls.get(name);call.state='completed';call.res.end('completed:'+name);res.end('ok');
   }});
+  const remoteCalls = new Map();
+  class PanelWork extends TypertRemoteService {
+    constructor(c) { super(c, 'panelWork', {namespace:'panelWork'}); }
+    async wait(id, signal) {
+      const call={state:'running'};remoteCalls.set(id,call);
+      let timer,abort;
+      try {
+        return await new Promise(resolve=>{
+          call.complete=()=>{call.state='completed';resolve('completed:'+id);};
+          abort=()=>{call.state='cancelled';resolve('late:'+id);};
+          signal.addEventListener('abort',abort,{once:true});
+          timer=setTimeout(call.complete,30000);
+        });
+      } finally {clearTimeout(timer);signal.removeEventListener('abort',abort);}
+    }
+  }
+  Remote('wait')(undefined,{name:'wait',private:false,static:false,
+    addInitializer(fn){fn.call(Object.create(PanelWork.prototype));}});
+  await ctx.plugin(PanelWork);
+  ctx.webServer.register({path:'/remote-state',resource:()=>Response.json(
+    Object.fromEntries([...remoteCalls].map(([id,call])=>[id,call.state])))});
+  ctx.webServer.register({path:'/complete-remote',handler:async(req,res)=>{
+    let id='';for await(const chunk of req)id+=chunk;
+    remoteCalls.get(id).complete();res.end('ok');
+  }});
 }`);
   await writeFile(join(upstream, 'client.js'), `
 window.__ModuleLoader__.load({id:'native-panels',factory(require){
@@ -503,6 +529,14 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
     await Promise.resolve();
     window.__clientInstance = String(Math.random());
     window.__calls={};
+    window.__remoteCalls={};
+    window.__startRemote=(id,alreadyAborted=false)=>{
+      const controller=new AbortController();
+      if(alreadyAborted)controller.abort();
+      const call={controller,state:'waiting'};window.__remoteCalls[id]=call;
+      ctx.connection.rpc.call('/api','panelWork/wait',{args:{id}},controller.signal)
+        .then(reply=>{call.state=reply.ok?reply.value:reply.error.code;},error=>{call.state=error.name;});
+    };
     window.__startCall=(name,asRequest)=>{
       const controller=new AbortController();
       const init={headers:{'x-call-id':name},signal:controller.signal};
@@ -567,6 +601,10 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   await post(`/api/plugins/${id}/authorize`, { grants: plugin.manifest.permissions });
   await post(`/api/plugins/${id}/activate`);
   await waitFor(async () => (await api('/api/plugins')).value.plugins.find((item) => item.manifest.id === id)?.runtime?.state === 'running', '原生多面板插件');
+  const completeRemote=async name=>{
+    const response=await post(`/api/plugins/${id}/routes`,{method:'POST',path:'/complete-remote',body:name});
+    assert.equal(response.status,200,JSON.stringify(response));
+  };
   reporter.check('同一槽位的两个条件注册面板均进入 daemon 视图目录', plugin.manifest.contributions.views.length === 2 && plugin.manifest.contributions.views.every((view) => view.placements.includes('rightPane')));
   await openConversation(session);
   await waitFor(() => ui.exists('.header-right-pane-btn'), '工作台顶栏');
@@ -667,6 +705,21 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
       await post(`/api/plugins/${id}/routes`,{method:'POST',path:'/complete-call',body:'remaining'});
       await waitFor(()=>frame.evaluate(`window.__calls.remaining.state==='completed:remaining'`),'未取消请求正常完成');
       reporter.check('并发请求取消后其他业务仍收到真实结果',true);
+      const remoteStates=async()=>(await post(`/api/plugins/${id}/routes`,{method:'GET',path:'/remote-state'})).body;
+      await frame.evaluate(`window.__startRemote('cancelled');window.__startRemote('remaining');window.__startRemote('already-aborted',true);true`);
+      await waitFor(async()=>{const states=await remoteStates();return states.cancelled==='running'&&states.remaining==='running';},'原包 Remote 并发业务实际开始');
+      await frame.evaluate(`window.__remoteCalls.cancelled.controller.abort();true`);
+      await waitFor(()=>frame.evaluate(`window.__remoteCalls.cancelled.state==='AbortError'&&window.__remoteCalls['already-aborted'].state==='AbortError'`),'原包 Remote 收到取消');
+      await waitFor(async()=>{const states=await remoteStates();return states.cancelled==='cancelled'&&states.remaining==='running'&&!states['already-aborted'];},'Remote 取消到达真实方法且不执行预先取消业务');
+      reporter.check('原包 Remote 第四参数沿现有路由取消真实业务，不触发预先取消请求或影响并发调用',true);
+      await completeRemote('remaining');
+      await waitFor(()=>frame.evaluate(`window.__remoteCalls.remaining.state==='completed:remaining'`),'并发 Remote 业务完成');
+      await frame.evaluate(`window.__startRemote('retry');true`);
+      await waitFor(async()=>(await remoteStates()).retry==='running','取消后显式重试');
+      await completeRemote('retry');
+      await waitFor(()=>frame.evaluate(`window.__remoteCalls.retry.state==='completed:retry'`),'重试取得真实回执');
+      reporter.check('Remote 取消后的迟到返回不能覆盖取消，其他请求与显式重试均取得实际结果',
+        await frame.evaluate(`window.__remoteCalls.cancelled.state==='AbortError'`));
       const binary=await frame.evaluate(`(async()=>{
         const bytes=Uint8Array.from({length:2*1024*1024},(_,i)=>i%256);
         const response=await fetch('/binary-echo',{method:'POST',body:new Blob([bytes],{type:'application/octet-stream'})});
@@ -783,6 +836,28 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   reporter.check('390px 右栏原生面板无横向溢出', await page.evaluate('document.documentElement.scrollWidth<=innerWidth') && await frame.evaluate('document.documentElement.scrollWidth<=innerWidth'));
   await snapshot('panel-390');
   await page.call('Emulation.clearDeviceMetricsOverride');
+  await frame.evaluate(`window.__startRemote('panel-closed');true`);
+  const remoteStates=async()=>(await post(`/api/plugins/${id}/routes`,{method:'GET',path:'/remote-state'})).body;
+  await waitFor(async()=>(await remoteStates())['panel-closed']==='running','关闭面板前真实 Remote 业务运行');
+  const tabs=await page.evaluate(`Array.from(document.querySelectorAll('.right-pane-tab[data-tab-id]'))
+    .map(tab=>tab.dataset.tabId).filter(id=>id.startsWith(${JSON.stringify('plugin:'+id+':')}))`);
+  assert.equal(tabs.length,2,'关闭本次插件的两个页签');
+  for(const tabId of tabs) await ui.click(`.right-pane-tab[data-tab-id=${JSON.stringify(tabId)}] .right-pane-tab-close`);
+  await waitFor(()=>page.evaluate(`!document.querySelector('iframe[data-plugin-id="${id}"]')?.getClientRects().length`),'关闭全部可见面板并停放已授权持续文档');
+  reporter.check('关闭原包全部面板保留已授权后台文档与在途 Remote，不把隐藏误当停用',
+    (await remoteStates())['panel-closed']==='running'&&await frame.evaluate('window.__clientInstance')===clientInstance);
+  await completeRemote('panel-closed');
+  await waitFor(()=>frame.evaluate(`window.__remoteCalls['panel-closed'].state==='completed:panel-closed'`),'后台 Remote 在面板关闭时完成实际业务');
+  if(!await visible('.right-pane'))await ui.click('.header-right-pane-btn');
+  await waitFor(()=>ui.exists('.right-pane-add-tab'),'关闭最后一个页签后沿顶栏重开右栏');
+  await ui.click('.right-pane-add-tab');await waitFor(()=>ui.exists(entry),'重新打开原包面板入口');await ui.click(entry);
+  await waitFor(()=>page.evaluate(`Boolean(document.querySelector('iframe[data-plugin-id="${id}"]')?.getClientRects().length)`),'重开面板复用持续文档');
+  await frame.evaluate(`window.__startRemote('reopened');true`);
+  await waitFor(async()=>(await remoteStates()).reopened==='running','重开页面重新执行业务');
+  await completeRemote('reopened');
+  await waitFor(()=>frame.evaluate(`window.__remoteCalls.reopened.state==='completed:reopened'`),'重开页面取得新调用真实回执');
+  reporter.check('重开原包面板保留后台 Remote 实际结果，同一文档可发起新请求继续业务',
+    await frame.evaluate(`window.__clientInstance===${JSON.stringify(clientInstance)}&&window.__remoteCalls['panel-closed'].state==='completed:panel-closed'`));
   const settings = (await api(`/api/plugins/${id}/settings`)).value;
   await post(`/api/plugins/${id}/settings`, { expectedVersion: settings.version, value: { startupUrl: gateUrl } }, 'PUT');
   await post(`/api/plugins/${id}/deactivate`);
@@ -1236,6 +1311,7 @@ try {
     [...errors, ...rendererLogErrors].join('\n'));
   console.log(reporter.summary());
 } catch (error) {
+  if(!reporter.results.some(result=>!result.ok))reporter.results.push({name:'目录包运行验收完整完成',ok:false,detail:error.stack??String(error)});
   if (ui) await snapshot('failure').catch(() => {});
   console.error(error);
   process.exitCode = 1;

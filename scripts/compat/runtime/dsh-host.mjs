@@ -44,6 +44,8 @@ export async function activateDsh(api, module, options) {
   const withProfile = (callback, signal) => registeredSettings.run(() => sessions
     ? sessions.run(() => runProfile(callback, signal), signal)
     : runProfile(callback, signal));
+  const registerRoute = (path, handler, options) => api.route(path,
+    (input, context) => withProfile(() => handler(input, context), context.signal), options);
   // Cordis inject 是“服务出现时挂载”的条件 fiber；不能把可选分支的 PENDING 当成整包失败。
   const conditionalFibers = new Set();
   const inject = ctx.inject;
@@ -174,13 +176,13 @@ export async function activateDsh(api, module, options) {
         if (definition.path === STREAM_ROUTE) throw new Error('插件路由使用了兼容层保留路径');
         routes.set(key, definition);
         let release;
-        catalog.enqueue(async () => { release = await api.route(definition.path, (input, context) => withProfile(() => runRoute(definition, input, context), context.signal), { match: kind }); }).catch(() => {});
+        catalog.enqueue(async () => { release = await registerRoute(definition.path, (input, context) => runRoute(definition, input, context), { match: kind }); }).catch(() => {});
         return () => { routes.delete(key); routeStreams.closePath(definition.path); return catalog.enqueue(async () => release?.()); };
       });
     }
   });
 
-  const releaseStreamRoute = await api.route(STREAM_ROUTE, (input, context) => withProfile(async () => ({ body: await routeStreams.call(input.body, context) }), context.signal));
+  const releaseStreamRoute = await registerRoute(STREAM_ROUTE, async (input, context) => ({ body: await routeStreams.call(input.body, context) }));
 
   const checkConfig = (raw) => {
     if (fiber) return fiber.resolveConfig(clone(raw));
@@ -400,7 +402,7 @@ export async function activateDsh(api, module, options) {
   api.onDispose(dispose);
   try {
     releaseRegistryFetch = installRegistryFetch();
-    await mountRemote(api, ctx);
+    await mountRemote({ route: registerRoute }, ctx);
     const settings = await api.settings.read();
     rawConfig = clone(settings.value); version = settings.version;
     await withProfile(async () => {

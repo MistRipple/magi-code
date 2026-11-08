@@ -24,6 +24,7 @@ import { createSessionComposerServices } from './session-composer.mjs';
 import { SettingsForm } from './settings-form.mjs';
 import { createViewTransport } from './view-transport.mjs';
 import { createRouteFetch } from './route-fetch.mjs';
+import { createRemoteConnection } from './connection.mjs';
 
 const CHANNEL = 'magi-plugin-v1';
 
@@ -80,11 +81,7 @@ export function startDshClient(options) {
 
   // —— settingsScope：上游界面读写配置的接口，背后是 Magi 的 settings.read / settings.write ——
   const { scope, refresh: refreshSettings } = createSettingsScope(request);
-  const connection = { rpc: { async call(path, endpoint, input) {
-    if (path !== '/api' || !input || Object.keys(input).some((key) => key !== 'args')) throw new Error('插件 Remote 仅支持 /api 的 JSON unary 调用');
-    const result = await request({ operation: 'route.call', method: 'POST', path: '/__magi_compat/remote', body: { endpoint, args: input.args } });
-    return result.body;
-  } } };
+  const connection = createRemoteConnection(request);
 
   // —— ctx：与构建期记录共用同一份实现 ——
   const slotContext = createSlotContext({ scope, connection, composer: sessionComposer, onChange: () => render(), onOpenTab: (key) => {

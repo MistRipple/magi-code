@@ -24,6 +24,7 @@ import { prepareDsh } from './install/prepare.mjs';
 import { backendEntry } from './core/package.mjs';
 import { createViewTransport } from './runtime/client/view-transport.mjs';
 import { createRouteFetch } from './runtime/client/route-fetch.mjs';
+import { createRemoteConnection } from './runtime/client/connection.mjs';
 import { getEventListeners } from 'node:events';
 import { runRoute } from './runtime/routes.mjs';
 import { decodeRouteBytes, encodeRouteBytes, readRouteBytes, MAX_ROUTE_BINARY_BYTES } from './runtime/route-payload.mjs';
@@ -408,6 +409,38 @@ test('Remote 每次解析活跃服务，卸载后不可复用旧实例', async (
   const { ctx, fiber } = await remoteHost(t);
   await fiber.dispose();
   assert.equal((await invokeRemote(ctx, { endpoint: 'status/echo', args: { request: 1 } })).error.code, 'gateway/method-unavailable');
+});
+
+test('原包 Remote 第四参数取消沿同一视图传输，回收监听且不污染并发请求或显式重试', async () => {
+  const sent = [], transport = createViewTransport(message => sent.push(message));
+  const connection = createRemoteConnection(transport.request);
+  const first = new AbortController(), second = new AbortController();
+  const call = (id, signal) => connection.rpc.call('/api', 'status/echo', { args: { request: id } }, signal);
+  const cancelled = call('cancelled', first.signal), other = call('remaining', second.signal);
+  assert.deepEqual(sent[0].body, { endpoint: 'status/echo', args: { request: 'cancelled' } });
+  const reason = new DOMException('停止原包业务', 'AbortError');
+  first.abort(reason);
+  await assert.rejects(cancelled, error => error === reason);
+  assert.deepEqual(sent[2], { type: 'cancel', requestId: sent[0].requestId });
+  assert.equal(getEventListeners(first.signal, 'abort').length, 0);
+  transport.receive({ requestId: sent[0].requestId, ok: true, result: { body: { ok: true, value: 'late' } } });
+  transport.receive({ requestId: sent[1].requestId, ok: true, result: { body: { ok: true, value: 'remaining' } } });
+  assert.deepEqual(await other, { ok: true, value: 'remaining' });
+  assert.equal(getEventListeners(second.signal, 'abort').length, 0);
+  const count = sent.length;
+  await assert.rejects(call('already-aborted', first.signal), error => error === reason);
+  assert.equal(sent.length, count, '预先取消不能触发后台业务');
+  const retry = call('retry');
+  transport.receive({ requestId: sent.at(-1).requestId, ok: true, result: { body: { ok: false,
+    error: { code: 'plugin/not-ready', message: 'not ready', details: { retry: true } } } } });
+  assert.deepEqual(await retry, { ok: false, error: { code: 'plugin/not-ready', message: 'not ready', details: { retry: true } } });
+  const closing = call('closing', second.signal);
+  transport.dispose();
+  await assert.rejects(closing, { name: 'AbortError' });
+  assert.equal(getEventListeners(second.signal, 'abort').length, 0);
+  await assert.rejects(call('closed'), { name: 'AbortError' });
+  await assert.rejects(connection.rpc.call('/arbitrary', 'status/echo', { args: {} }), /仅支持/);
+  await assert.rejects(connection.rpc.call('/api', 'status/echo', { args: {}, signal: {} }), /仅支持/);
 });
 
 test('通用设置表单保持稳定快照，多字段保存只提交一次 CAS，冲突后保留 daemon 新值', async () => {
