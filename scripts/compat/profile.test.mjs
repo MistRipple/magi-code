@@ -519,6 +519,55 @@ test('DSH 管理命令的终止请求取消同一个 daemon 安装任务，不�
   });
 });
 
+test('DSH 管理命令在目录读取期间终止，迟到读取不能继续安装且同调用可显式重试', {timeout:10000}, async t => {
+  const home=await mkdtemp(join(tmpdir(),'magi-profile-command-admission-'));t.after(()=>rm(home,{recursive:true,force:true}));
+  let hold=false,installations=0,enabled=true,proposals=0,began,releaseRead;
+  const waiting=new Promise(resolve=>{began=resolve;}),gate=new Promise(resolve=>{releaseRead=resolve;});
+  const off=configureProfile({plugins:{
+    async list(){if(hold){began();await gate;}return {plugins:[{manifest:{id:'dsh.keeper'},digest:'one',enabled,source:{kind:'upstream',location:'dsh:keeper@1.0.0'}}]};},
+    async installBundle(){installations++;return {application:'applied'};},
+    async setEnabled(id,value){assert.equal(id,'dsh.keeper');enabled=value;proposals++;},
+    async cancelInstall(){return {status:'not-running'};},
+  }},{home});t.after(off);t.after(releaseRead);
+  await withProfile(async()=>{
+    fs.writeFileSync(join(profilePath(),'cordis.patch.yml'),dump([{id:'dsh.keeper',name:'keeper',disabled:true}]));hold=true;
+    const child=profileSpawn('dsh',['plugin','add','target@1.0.0']);
+    child.stdout.resume();child.stderr.resume();
+    const closed=once(child,'close');await waiting;
+    child.kill();hold=false;releaseRead();
+    assert.equal((await closed)[0],1);
+    assert.equal(installations,0,'准备中的命令被终止，不能在收到目录后迟到开始安装');
+    assert.equal(proposals,1);assert.equal(loaderEntries()[0].disabled,true,'父请求已有的配置提案仍正常结算');
+    const retry=profileSpawn('dsh',['plugin','add','target@1.0.0']);
+    retry.stdout.resume();retry.stderr.resume();
+    assert.equal((await once(retry,'close'))[0],0);
+    assert.equal(installations,1,'取消单条命令不污染调用快照或后续显式重试');
+  });
+});
+
+test('DSH 移除命令等待读取目标时终止，不删除插件或取消同请求其他操作', {timeout:10000}, async t => {
+  const home=await mkdtemp(join(tmpdir(),'magi-profile-remove-admission-'));t.after(()=>rm(home,{recursive:true,force:true}));
+  let hold=false,removals=0,began,releaseRead;
+  const waiting=new Promise(resolve=>{began=resolve;}),gate=new Promise(resolve=>{releaseRead=resolve;});
+  const off=configureProfile({plugins:{
+    async list(){if(hold){began();await gate;}return {plugins:[{manifest:{id:'dsh.target'},digest:'one',enabled:true,source:{kind:'upstream',location:'dsh:target@1.0.0'}}]};},
+    async remove(){removals++;},
+  }},{home});t.after(off);t.after(releaseRead);
+  await withProfile(async()=>{
+    hold=true;
+    const child=profileSpawn('dsh',['plugin','remove','target']);
+    child.stdout.resume();child.stderr.resume();
+    const closed=once(child,'close');await waiting;
+    child.kill();hold=false;releaseRead();
+    assert.equal((await closed)[0],1);
+    assert.equal(removals,0,'终止后收到的目标快照不能继续触发删除');
+    const retry=profileSpawn('dsh',['plugin','remove','target']);
+    retry.stdout.resume();retry.stderr.resume();
+    assert.equal((await once(retry,'close'))[0],0);
+    assert.equal(removals,1);
+  });
+});
+
 test('profile 同步读取真实调用快照，启停提案经 daemon 与摘要校验提交，无物理副本和失败写入', async (t) => {
   const home = await mkdtemp(join(tmpdir(), 'magi-profile-test-'));
   t.after(() => rm(home, { recursive: true, force: true }));

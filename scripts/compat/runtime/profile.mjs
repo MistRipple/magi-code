@@ -342,17 +342,19 @@ async function commit(scope) {
 
 // 管理服务与辅助进程在同一调用中先结算已有配置提案，再执行真实修改并重读
 // daemon。上游随后读取 profile/loader 时须看到刚完成的安装，不能保留旧版本。
-export function createProfileMutation(background = false) {
+export function createProfileMutation(background = false, signal) {
   const owner = host;
   return callback => {
-    if (!owner) return callback();
+    // 命令自己的取消只约束其业务，不取消同一请求中其他命令或配置提案。
+    const apply = () => { signal?.throwIfAborted(); return callback(); };
+    if (!owner) return apply();
     if (host !== owner) return Promise.reject(new Error('profile 修改所属实例已失效'));
     const scope = scopes.getStore();
-    if (scope && !scope.closed && !scope.signal?.aborted) return mutateProfile(callback, background);
+    if (scope && !scope.closed && !scope.signal?.aborted) return mutateProfile(apply, background);
     if (!background) return Promise.reject(new Error('profile 修改缺少活动调用快照'));
     // HTTP 202 后的工作只使用显式后台管理端口；重新读取实例事实，
     // 不继承已经关闭的请求快照、取消信号或待提交提案。
-    return scopes.run(undefined, () => withProfile(() => mutateProfile(callback)));
+    return scopes.run(undefined, () => withProfile(() => mutateProfile(apply)));
   };
 }
 
@@ -450,7 +452,7 @@ export function profileSpawn(file, args = [], options) {
       const [_, verb, spec, ...rest] = argv;
       if (rest.length || !spec || !['add', 'remove'].includes(verb)) throw new Error('DSH 管理命令参数不受支持');
       controller.signal.throwIfAborted();
-      const manager = createPluginManager(host.api, host.registry);
+      const manager = createPluginManager(host.api, host.registry, controller.signal);
       const requestId = crypto.randomUUID();
       const cancel = () => { if (verb === 'add') void manager.cancelInstall(requestId).catch(() => {}); };
       controller.signal.addEventListener('abort', cancel, { once: true });

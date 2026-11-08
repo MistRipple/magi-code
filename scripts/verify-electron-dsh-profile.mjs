@@ -40,6 +40,23 @@ try {
   let manager=await install('dsh-plugin-mgr','0.2.12');
   report.check('Mgr 原包在线安装与必需 loader 启动成功',true);
   report.check('管理授权明确声明委托授权能力',manager.manifest.permissions.some(p=>p.kind==='pluginManagement'&&p.targets.includes('authorize')));
+  // 旧发行版经真实管理路由调用 dsh 命令，核对公共命令边界；
+  // 这不将旧版页面的 Button 缺陷计为已修复。
+  const cliTarget=await install('dsh-plugin-release-probe','0.0.7');
+  const cliUpdate=await api(`/api/plugins/${manager.manifest.id}/routes`,{
+    method:'POST',path:'/api/plugin-manager/update',body:{name:'dsh-plugin-release-probe'},
+  });
+  const cliUpdated=await waitFor(async()=>{
+    const plugin=(await plugins()).find(p=>p.manifest.id===cliTarget.manifest.id);
+    return plugin?.manifest.version==='0.0.8'&&plugin.runtime?.state==='running'&&plugin;
+  },'原包 dsh add 在线替换与运行',180_000);
+  report.check('旧版原包业务通过公共 dsh 命令完成在线替换且回执读取实际新版',
+    cliUpdate.status===200&&cliUpdate.body.ok&&cliUpdate.body.updated&&cliUpdate.body.version==='0.0.8'&&cliUpdated.active,JSON.stringify(cliUpdate));
+  const cliRemove=await api(`/api/plugins/${manager.manifest.id}/routes`,{
+    method:'POST',path:'/api/plugin-manager/uninstall',body:{name:'dsh-plugin-release-probe'},
+  });
+  report.check('旧版原包业务通过公共 dsh remove 完成排空与移除',
+    cliRemove.status===200&&cliRemove.body.ok&&!(await plugins()).some(p=>p.manifest.id===cliTarget.manifest.id),JSON.stringify(cliRemove));
   const oldManager=manager;
   await ui.click('[data-testid=sidebar-settings]');
   await waitFor(()=>ui.exists('[data-testid=settings-nav-plugins]'),'原生插件管理入口');await ui.click('[data-testid=settings-nav-plugins]');

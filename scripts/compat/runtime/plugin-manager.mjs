@@ -8,14 +8,15 @@ const failure = (error, extra = {}) => ({ ...error.receipt, application: 'failed
   error: { code: error.code ?? 'magi-operation-failed', message: String(error.message ?? error), diagnostic: String(error.message ?? error),
     ...(error.incompatible ? { incompatible: error.incompatible } : {}) } });
 
-export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTRY ?? 'https://registry.npmjs.org') {
+export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTRY ?? 'https://registry.npmjs.org', signal) {
   // 原生 DSH 管理面板允许在 HTTP 202 后继续工作；使用显式实例级管理
   // API，由 daemon 的独立 background 委托控制，不借用已结束的请求租约。
-  const mutateProfile = createProfileMutation(Boolean(api.plugins.background));
+  const mutateProfile = createProfileMutation(Boolean(api.plugins.background), signal);
   if (api.plugins.background) api = { ...api, plugins: api.plugins.background };
   const find = async (name) => {
     if (!NAME.test(name)) throw new Error('npm 包名无效');
     const { plugins } = await api.plugins.list();
+    signal?.throwIfAborted();
     const found = plugins.filter(plugin => dshBundle(plugin)?.name === name);
     if (found.length !== 1) throw new Error(`未找到唯一的 DSH 插件：${name}`);
     return found[0];
