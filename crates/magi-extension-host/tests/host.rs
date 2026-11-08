@@ -660,13 +660,18 @@ async fn a_host_that_exits_before_connecting_fails_fast_instead_of_waiting_for_t
 #[tokio::test]
 async fn tools_are_invoked_through_the_real_host_and_failures_stay_tool_results() {
     let mut env = env("tools", Vec::new());
-    env.config.tools = vec!["echo".into(), "slow".into(), "boom".into()];
+    env.config.tools = vec![
+        "echo".into(),
+        "slow".into(),
+        "boom".into(),
+        "outcome".into(),
+    ];
     env.config.commands = vec!["hello".into(), "bad".into(), "slow-cmd".into()];
     let bus = ExtensionBus::new(BusPolicy::default());
     bus.register_plugin("acme.guard", &[]).unwrap();
     let instance = up(&env, &bus).await;
     assert!(instance.is_tool_bound("echo"));
-    let ctx = json!({"invocationId": "inv-1"});
+    let ctx = json!({"invocationId": "inv-1", "activity":"tool"});
     let ok = instance
         .invoke_tool(
             "echo",
@@ -696,6 +701,78 @@ async fn tools_are_invoked_through_the_real_host_and_failures_stay_tool_results(
         .unwrap();
     assert_eq!(failed["isError"], true);
     assert!(failed["output"].as_str().unwrap().contains("boom failed"));
+    for input in [
+        json!({"failed": true, "reason":"业务失败"}),
+        json!({"finish":true}),
+        json!({"failed":true,"finish":true}),
+    ] {
+        let result = instance
+            .invoke_tool(
+                "outcome",
+                input.clone(),
+                ctx.clone(),
+                Duration::from_secs(5),
+                std::future::pending(),
+            )
+            .await
+            .unwrap();
+        if input["failed"] == true && input["finish"] == true {
+            assert_eq!(result["isError"], true);
+            assert!(result.get("completion").is_none());
+        } else {
+            assert_eq!(result["output"], input);
+            assert_eq!(result["isError"], input["failed"] == true);
+            assert_eq!(result.get("completion").is_some(), input["finish"] == true);
+        }
+    }
+    let ordinary = instance
+        .invoke_tool(
+            "echo",
+            json!({"isError":true,"completion":"业务字段"}),
+            ctx.clone(),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    assert!(ordinary.get("isError").is_none() && ordinary.get("completion").is_none());
+    let reused = instance
+        .invoke_tool(
+            "outcome",
+            json!({"reuse":true}),
+            ctx.clone(),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reused["isError"], true);
+    assert!(reused.get("completion").is_none());
+    instance
+        .invoke_tool(
+            "outcome",
+            json!({"stash":true,"finish":true}),
+            ctx.clone(),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    let retained = instance
+        .invoke_tool(
+            "outcome",
+            json!({"reuse":true}),
+            ctx.clone(),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        retained["isError"], true,
+        "即使 caller 复用 invocationId，也不能使用上次未返回的结果"
+    );
+    assert!(retained.get("completion").is_none());
     // 超时：宿主收到取消信号，调用返回 DeadlineExceeded。
     let slow = instance
         .invoke_tool(
@@ -807,7 +884,12 @@ async fn registering_an_unapproved_tool_fails_activation() {
 async fn concurrent_calls_with_the_same_caller_identity_cancel_independently() {
     use magi_extension_host::protocol::ErrorKind;
     let mut env = env("tools", Vec::new());
-    env.config.tools = vec!["echo".into(), "slow".into(), "boom".into()];
+    env.config.tools = vec![
+        "echo".into(),
+        "slow".into(),
+        "boom".into(),
+        "outcome".into(),
+    ];
     env.config.commands = vec!["hello".into(), "bad".into(), "slow-cmd".into()];
     let bus = ExtensionBus::new(BusPolicy::default());
     let instance = up(&env, &bus).await;

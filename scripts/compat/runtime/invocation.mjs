@@ -4,18 +4,33 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 // 不创建 DSH Agent/Session，不提供消息、调度或持久化的影子实现。
 const invocations = new AsyncLocalStorage();
 
-export async function withInvocation(context, callback, api) {
+export async function withInvocation(context, callback, api, settlement) {
   const scope = { context, closed: false, messages: [], hasMessageApi:typeof api?.session?.message==='function' };
   context.signal?.throwIfAborted();
   return invocations.run(scope, async () => {
     try {
       const result = await callback();
-      for (const message of scope.messages) {
+      context.signal?.throwIfAborted();
+      let deliveryError;
+      try {
+        for (const message of settlement?.contexts(result) ?? []) {
+          const agent = invocationAgent();
+          if (!agent) throw new Error('工具补充上下文缺少当前会话');
+          agent.inject(message);
+        }
+        for (const message of scope.messages) {
+          context.signal?.throwIfAborted();
+          const receipt = await api.session.message(message);
+          if (!receipt?.inputId || !['pending','attached','consumed'].includes(receipt.state)) throw new Error('daemon 未接纳插件消息');
+        }
+      } catch (error) {
         context.signal?.throwIfAborted();
-        const receipt = await api.session.message(message);
-        if (!receipt?.inputId || !['pending','attached','consumed'].includes(receipt.state)) throw new Error('daemon 未接纳插件消息');
+        // 工具业务已结算：交付失败不能覆盖原结果，也不能据此重放业务。
+        // 命令仍沿其原错误合同；工具工厂保留实际结果并提交显式失败。
+        if (!settlement) throw error;
+        deliveryError = error;
       }
-      return result;
+      return settlement ? settlement.complete(result, deliveryError) : result;
     }
     finally { scope.closed = true; }
   });

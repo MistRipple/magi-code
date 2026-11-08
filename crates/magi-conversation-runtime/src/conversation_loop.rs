@@ -592,6 +592,7 @@ pub(crate) fn complete_task_command(
         None,
         None,
         &[],
+        &[],
     )?;
     Ok(outcome)
 }
@@ -1478,6 +1479,20 @@ fn run_conversation_loop_inner(
         }
     };
     let mut tool_call_records = tool_call_records_from_thread_history(&recovered_tools.history);
+    let mut plugin_completions =
+        match crate::plugin_tool_completion::recover(&recovered_tools.history) {
+            Ok(completions) => completions,
+            Err(error) => {
+                let error = task_failure_with_error_item(
+                    turn_writeback_context,
+                    &error,
+                    streaming_entry_id,
+                    None,
+                    None,
+                );
+                return (TaskOutcome::Failed { error }, context_summary);
+            }
+        };
     let mut tool_execution_ledger = recovered_tools.ledger.with_current_file_facts(
         &current_session_file_facts(session_store, session_id),
         workspace_root_path.as_deref(),
@@ -1618,6 +1633,43 @@ fn run_conversation_loop_inner(
     let mut prepared_execution_task = None;
     let mut retired_workspace_root = None;
     'conversation_round: for round in 0usize.. {
+        // 成功工具可交付最终业务结果；恢复时读取原 canonical 回执，
+        // 不再调用模型或重放工具。退出循环后仍走原任务验收与终态提交。
+        if !plugin_completions.is_empty() {
+            // 正常执行与恢复共用同一裁决：同批任何工具结果未确定时，
+            // 已成功工具的完成意图不能把整个任务结算为成功。
+            plugin_completions = match ToolExecutionLedger::from_canonical_task(
+                session_store,
+                task_store,
+                session_id,
+                task,
+                thread_id,
+                tool_registry,
+            )
+            .and_then(|tools| crate::plugin_tool_completion::recover(&tools.history))
+            {
+                Ok(completions) => completions,
+                Err(error) => {
+                    let error = task_failure_with_error_item(
+                        turn_writeback_context,
+                        &error,
+                        streaming_entry_id.or(last_stream_item_id.as_deref()),
+                        None,
+                        None,
+                    );
+                    return (TaskOutcome::Failed { error }, context_summary);
+                }
+            };
+            final_content = plugin_completions
+                .iter()
+                .map(|completion| completion.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            final_model_round = None;
+            final_model_step_id = None;
+            final_provider_context.clear();
+            break;
+        }
         current_round.set(round);
         if let Some(failure) = emergency_model_round_failure(round) {
             let error = match append_task_error_turn_item(
@@ -3436,6 +3488,12 @@ fn run_conversation_loop_inner(
                 return (TaskOutcome::Failed { error }, context_summary);
             }
             let canonical_tool_name = canonical_tool_call_name(&tool_call.function.name);
+            if tool_status == ExecutionResultStatus::Succeeded
+                && let Some(completion) =
+                    crate::plugin_tool_completion::from_result(&tool_call.function.name, &result)
+            {
+                plugin_completions.push(completion);
+            }
             if canonical_tool_name == "tool_catalog"
                 && matches!(tool_status, ExecutionResultStatus::Succeeded)
                 && !tool_result_execution_was_skipped(&result)
@@ -3717,7 +3775,9 @@ fn run_conversation_loop_inner(
         return (TaskOutcome::Failed { error }, context_summary);
     }
 
-    final_content = normalize_model_visible_content(final_content);
+    if plugin_completions.is_empty() {
+        final_content = normalize_model_visible_content(final_content);
+    }
     if final_content.trim().is_empty() {
         let retry_attempts = empty_response_recovery_attempts
             + stream_interruption_recovery_attempts
@@ -3795,10 +3855,14 @@ fn run_conversation_loop_inner(
             ..turn_writeback_context
         },
         &final_content,
-        last_stream_item_id.as_deref().or(streaming_entry_id),
+        plugin_completions
+            .is_empty()
+            .then(|| last_stream_item_id.as_deref().or(streaming_entry_id))
+            .flatten(),
         streaming_entry_id,
         final_model_round,
         &final_provider_context,
+        &plugin_completions,
     ) {
         let error_text = format!("最终回复写回失败：{writeback_error}");
         let error = task_failure_with_error_item(
@@ -4567,6 +4631,7 @@ fn append_task_final_turn_item(
     timeline_entry_id: Option<&str>,
     model_round: Option<usize>,
     provider_context: &[ModelProviderContext],
+    plugin_completions: &[magi_extension_host::protocol::PluginToolCompletion],
 ) -> Result<(), String> {
     let has_requested_final_item_id = final_item_id.is_some();
     let mut final_item = session_turn_item(
@@ -4579,6 +4644,12 @@ fn append_task_final_turn_item(
     );
     if let Some(model_round) = model_round {
         apply_model_response_round(&mut final_item, model_round);
+    }
+    if !plugin_completions.is_empty() {
+        final_item.metadata.insert(
+            "pluginToolCompletion".into(),
+            serde_json::to_value(plugin_completions).expect("tool completions serialize"),
+        );
     }
     // 最终回复沿用同一模型响应，不能在替换 stream item 时丢失签名、执行证据和 Step。
     apply_step_identity(&mut final_item, context);
@@ -10566,6 +10637,184 @@ mod tests {
     }
 
     #[test]
+    fn plugin_tool_completion_recovers_canonical_result_without_model_or_business_replay() {
+        for case in ["settled", "uncertain-batch", "missing-evidence"] {
+            let store = SessionStore::new();
+            let events = InMemoryEventBus::new(64);
+            let tasks = TaskStore::new();
+            let session = SessionId::new(format!("session-plugin-completion-{case}"));
+            store.create_session(session.clone(), case).unwrap();
+            let mut task = make_task_loop_test_task(&format!("task-plugin-completion-{case}"));
+            task.goal = "交付已执行的插件业务结果".into();
+            if case == "missing-evidence" {
+                task.completion_contract.evidence_requirements.push(
+                    magi_core::TaskEvidenceRequirement::successful_tool_call("diagram_render"),
+                );
+            }
+            tasks.insert_task(task.clone()).unwrap();
+            let worker = WorkerId::new("worker-plugin-completion");
+            let lease = tasks
+                .grant_lease(
+                    &task.task_id,
+                    &task.root_task_id,
+                    &worker,
+                    "executor",
+                    60_000,
+                )
+                .unwrap();
+            let registry = ConversationRegistry::new();
+            ensure_test_current_turn_with_id(
+                &store,
+                &registry,
+                &session,
+                &task,
+                "completion-turn",
+                "交付结果",
+            );
+            let (_, thread) = store
+                .ensure_session_mission(&session, UtcMillis::now(), || task.mission_id.clone());
+            let roles = magi_agent_role::AgentRoleRegistry::load_default();
+            let visibility = task_turn_visibility(&task, false, Some(&worker), &thread, &roles);
+            let writeback_error = Mutex::new(None);
+            let context = TaskTurnWritebackContext {
+                event_bus: &events,
+                session_store: &store,
+                task_store: &tasks,
+                task: &task,
+                session_id: &session,
+                workspace_id: &None,
+                turn_visibility: &visibility,
+                persist_session_state: None,
+                expected_turn_id: Some("completion-turn"),
+                model_step_id: Some("original-tool-step"),
+                writeback_error: &writeback_error,
+            };
+            let call = ChatToolCall {
+                id: "completed-business".into(),
+                kind: "function".into(),
+                function: magi_bridge_client::ChatToolFunction {
+                    name: magi_plugin_system::model_tool_name("acme.words", "finish"),
+                    arguments: "{}".into(),
+                },
+            };
+            append_task_tool_call_started_turn_item(context, &call, &[]).unwrap();
+            upsert_task_tool_call_result_turn_item(context, &call, &serde_json::json!({
+                "tool":call.function.name, "status":"succeeded", "output":{"value":"实际业务结果"},
+                "pluginCompletion":{"pluginId":"acme.words","contributionId":"finish","content":"loopback-model::实际业务已交付\n\n"},
+            }).to_string(), ExecutionResultStatus::Succeeded).unwrap();
+            if case == "uncertain-batch" {
+                let mut unresolved = call.clone();
+                unresolved.id = "unknown-write".into();
+                unresolved.function.name = "file_write".into();
+                append_task_tool_call_started_turn_item(context, &unresolved, &[]).unwrap();
+            }
+            let restored = SessionStore::from_persisted_parts(
+                store.durable_state(),
+                store.execution_sidecar_store_state(),
+            )
+            .unwrap();
+            let client = StaticTaskFinalModelBridgeClient {
+                content: "不应请求模型",
+                invocations: AtomicUsize::new(0),
+                expect_no_tools: false,
+            };
+            let usage = crate::usage_recording::session_turn_model_usage_binding(true);
+            let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+                refresh_tool_definitions: None,
+                client: &client,
+                event_bus: &events,
+                session_store: &restored,
+                settings_store: None,
+                live_settings_store: None,
+                tool_registry: None,
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                task_store: &tasks,
+                execution_registry: &TaskExecutionRegistry::default(),
+                conversation_registry: &registry,
+                agent_role_registry: &roles,
+                safety_gate: None,
+                plan_store: &crate::test_plan_store("plugin-completion"),
+                project_memory: None,
+                task: &task,
+                task_id: &task.task_id,
+                lease_id: &lease.lease_id,
+                session_id: &session,
+                workspace_id: &None,
+                prompt: "恢复实际业务结果".into(),
+                task_context_messages: Vec::new(),
+                images: Vec::new(),
+                tools: None,
+                usage_binding: &usage,
+                streaming_entry_id: None,
+                is_sidechain: false,
+                worker_id: Some(&worker),
+                thread_id: &thread,
+                context_summary: None,
+                system_prompt: None,
+                workspace_root_path: None,
+                workspace_resources: None,
+                prepare_workspace: None,
+                execution_group_id: None,
+                persist_session_state: None,
+                extension_hooks: None,
+            });
+            assert_eq!(
+                client.invocations.load(Ordering::SeqCst),
+                0,
+                "{case}: 恢复不能请求模型"
+            );
+            let turn = restored
+                .canonical_turn_for_session_turn_id(&session, "completion-turn")
+                .unwrap();
+            if case == "settled" {
+                assert!(
+                    matches!(outcome, TaskOutcome::Completed { .. }),
+                    "{outcome:?}"
+                );
+                let final_item = turn
+                    .items
+                    .iter()
+                    .find(|item| {
+                        item.metadata
+                            .get("assistantOutputKind")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("final")
+                    })
+                    .unwrap();
+                assert_eq!(
+                    final_item.content.as_deref(),
+                    Some("loopback-model::实际业务已交付\n\n")
+                );
+                assert_eq!(
+                    final_item.metadata["pluginToolCompletion"][0]["pluginId"],
+                    "acme.words"
+                );
+                assert!(!final_item.metadata.contains_key("modelStepId"));
+            } else {
+                assert!(
+                    matches!(outcome, TaskOutcome::Failed { .. }),
+                    "{case}: {outcome:?}"
+                );
+                assert!(!turn.items.iter().any(|item| {
+                    item.metadata
+                        .get("assistantOutputKind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("final")
+                }));
+            }
+            assert_eq!(
+                restored
+                    .canonical_tool_calls_for_task(&session, &task.task_id, &thread)
+                    .len(),
+                if case == "uncertain-batch" { 2 } else { 1 },
+                "恢复不能重放业务"
+            );
+        }
+    }
+
+    #[test]
     fn provider_call_id_reuse_across_steps_preserves_unknown_attempt_and_completed_evidence() {
         let store = SessionStore::new();
         let events = InMemoryEventBus::new(16);
@@ -10699,6 +10948,7 @@ mod tests {
             Some("timeline-streaming-task-action-final-root-running"),
             Some("timeline-streaming-task-action-final-root-running"),
             None,
+            &[],
             &[],
         )
         .expect("final item should be persisted");

@@ -109,7 +109,6 @@
   let copyRevision = $state(0);
   let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
   onDestroy(() => clearTimeout(copyResetTimer));
-  let lastLoggedErrorSignature = $state('');
   let lastReportedAgentSpawnFailureSignature = $state('');
   let lastAutoExpandedApprovalId = $state('');
 
@@ -822,23 +821,6 @@
     if (value === 'degraded') return i18n.t('toolCall.agentSpawn.degraded');
     return i18n.t(`terminalSession.status.${value}`);
   }
-
-  $effect(() => {
-    if (!hasError) {
-      return;
-    }
-    const signature = `${id || name}:${status}:${errorForDiagnosis}`;
-    if (signature === lastLoggedErrorSignature) {
-      return;
-    }
-    lastLoggedErrorSignature = signature;
-    console.warn('Tool call failed', {
-      toolName: name,
-      toolCallId: id,
-      category: errorDiagnosis?.category || 'runtime',
-      error: errorForDiagnosis,
-    });
-  });
 
   function toggle() {
     if (!canExpand) {

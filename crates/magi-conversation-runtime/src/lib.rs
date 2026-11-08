@@ -26,6 +26,7 @@ pub mod external_tool;
 mod goal_tool_failure;
 mod history_projection;
 pub mod plugin_command;
+mod plugin_tool_completion;
 pub use history_projection::{
     EXTENSION_REWRITE_HOOKS, ExtensionRewriteProposal, ExtensionRewriteRejection,
     apply_extension_rewrites,

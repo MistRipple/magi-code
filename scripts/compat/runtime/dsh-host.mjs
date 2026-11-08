@@ -114,11 +114,19 @@ export async function activateDsh(api, module, options) {
           const agent = invocationAgent();
           const prepared = await pipeline.prepare({ callId: execContext.invocationId, name: definition.name, arguments: input, signal: execContext.signal, ...(agent ? { agent } : {}) });
           const outcome = prepared.kind === 'dispatch' ? await pipeline.dispatch(prepared.exec) : prepared;
-          const result = await pipeline.complete(prepared.exec, outcome);
-          if (result.additionalContexts?.length || result.concludeTurn) throw new Error('此工具要求追加会话上下文或结束 Turn，当前公开合同尚未承载');
-          if (result.isError) throw new Error(result.content?.filter((part) => part.type === 'text').map((part) => part.text).join('\n') || 'DSH 工具执行失败');
-          return result;
-        }, execContext.signal), api)));
+          return pipeline.complete(prepared.exec, outcome);
+        }, execContext.signal), api, {
+          // deferContext 与 Agent.inject 共用 daemon 的当前会话输入入口。
+          // 失败管线的纠正上下文也交付；交付失败不能覆盖已执行的业务结果。
+          contexts: result => result.additionalContexts ?? [],
+          complete: (result, deliveryError) => api.toolResult(deliveryError ? {
+            result, contextDelivery: { status: 'failed', error: String(deliveryError.message ?? deliveryError),
+              recovery: 'Business execution has settled. Retry context delivery explicitly; do not repeat the tool business operation.' },
+          } : result, {
+            isError: result.isError || Boolean(deliveryError),
+            ...(!deliveryError && result.concludesTurn === true ? { completion: result.content.filter(part => part.type === 'text').map(part => part.text).join('\n') || JSON.stringify(result.value) } : {}),
+          }),
+        })));
         this.ctx.emit('tools/change');
         return async () => { if (tools.get(definition.name) === definition) tools.delete(definition.name); await release(); this.ctx.emit('tools/change'); };
       });

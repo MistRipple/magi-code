@@ -22,7 +22,7 @@ function host(value = {}) {
   let revision = 0;
   let snapshot = { version: 0, value };
   let listener, validate;
-  const state = { catalog: {}, tools: new Map(), commands: new Map(), routes: new Map(), models: new Map(), failures: [], logs: [] };
+  const state = { catalog: {}, tools: new Map(), commands: new Map(), routes: new Map(), models: new Map(), failures: [], logs: [], outcomes: [] };
   const bind = (kind) => async (id, handler) => {
     assert.ok(state.catalog[kind].some((item) => item.id === id));
     state[kind].set(id, handler);
@@ -35,6 +35,7 @@ function host(value = {}) {
       return { revision: ++revision };
     } },
     tool: bind('tools'), command: bind('commands'),
+    toolResult(output, options) { state.outcomes.push({ output, options }); return output; },
     async route(path, handler) { state.routes.set(path, handler); return () => state.routes.delete(path); },
     modelSource: {
       async set(id, source) { state.models.set(id, source); },
@@ -619,13 +620,55 @@ test('DSH 工具沿真实管线校验输出、执行 guard，并传递取消', a
   } }, options);
   t.after(() => running.dispose());
   const invoke = (name, context = execution()) => h.state.tools.get(runtimeId('tool', name))({}, context);
-  await assert.rejects(invoke('blocked'), /denied by plugin/);
+  assert.match(JSON.stringify(await invoke('blocked')), /denied by plugin/);
+  assert.equal(h.state.outcomes.at(-1).options.isError, true);
   assert.equal(called, 0);
-  await assert.rejects(invoke('invalid'), /output|schema|string/i);
+  assert.match(JSON.stringify(await invoke('invalid')), /output|schema|string/i);
+  assert.equal(h.state.outcomes.at(-1).options.isError, true);
   const controller = new AbortController();
   const pending = invoke('cancel', { invocationId: 'cancel-call', signal: controller.signal });
   controller.abort();
   await assert.rejects(pending, /abort|cancel/i);
+});
+
+test('工具补充上下文与失败纠正共用原生消息交付，完成内容只来自成功管线', async t => {
+  const h = host(), delivered = [];
+  h.api.session.message = async input => { delivered.push(input); return { inputId: input.messageId, state: 'attached' }; };
+  const contextMessage = id => ({ id, role: 'user', content: [{ type: 'text', text: `CONTEXT:${id}` }], source: { kind: 'tool-context' } });
+  const running = await activateDsh(h.api, { inject: ['tools'], apply(ctx) {
+    for (const name of ['continue', 'finish', 'failed', 'invalid-context']) ctx.tools.register(tool(name, (_args, exec) => {
+      exec.deferContext(name === 'invalid-context' ? { ...contextMessage(name), source: {kind:'user'} } : contextMessage(name));
+      if (name !== 'continue') exec.concludeTurn();
+      if (name === 'failed') throw new Error('business failed with context');
+      return `ACTUAL:${name}`;
+    }));
+  } }, options);
+  t.after(() => running.dispose());
+  const context = { ...execution(), activity: 'tool', owner: { sessionId: 's' }, execution: { workingDirectory: '/execution' } };
+  for (const name of ['continue', 'finish', 'failed']) {
+    const result = await h.state.tools.get(runtimeId('tool', name))({}, context);
+    const outcome = h.state.outcomes.at(-1);
+    assert.equal(result.isError, name === 'failed');
+    assert.equal(outcome.options.isError, name === 'failed');
+    assert.equal(outcome.options.completion, name === 'finish' ? 'ACTUAL:finish' : undefined);
+  }
+  assert.deepEqual(delivered.map(({ messageId, text, sourceKind, delivery }) => ({ messageId, text, sourceKind, delivery })),
+    ['continue', 'finish', 'failed'].map(id => ({ messageId: id, text: `CONTEXT:${id}`, sourceKind: 'tool-context', delivery: 'context' })));
+  const invalid = await h.state.tools.get(runtimeId('tool', 'invalid-context'))({}, context);
+  assert.equal(invalid.result.value, 'ACTUAL:invalid-context');
+  assert.equal(invalid.contextDelivery.status, 'failed');
+  assert.equal(h.state.outcomes.at(-1).options.completion, undefined);
+  assert.equal(h.state.outcomes.at(-1).options.isError, true);
+  h.api.session.message = async () => { throw new Error('context permission denied'); };
+  const undelivered = await h.state.tools.get(runtimeId('tool', 'finish'))({}, context);
+  assert.equal(undelivered.result.value, 'ACTUAL:finish');
+  assert.equal(undelivered.contextDelivery.status, 'failed');
+  assert.match(undelivered.contextDelivery.error, /context permission denied/);
+  assert.equal(h.state.outcomes.at(-1).options.isError, true);
+  assert.equal(h.state.outcomes.at(-1).options.completion, undefined);
+  const aborted = new AbortController(); aborted.abort();
+  await assert.rejects(h.state.tools.get(runtimeId('tool', 'finish'))({}, { ...context, signal: aborted.signal }), /abort/i);
+  assert.equal(delivered.length, 3);
 });
 
 test('DSH 运行期子插件初始化失败被报告，不能保留成功状态', async (t) => {

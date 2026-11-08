@@ -79,7 +79,7 @@ daemon 响应形状：
 | `hook.invoke` | request | guard／advise 裁决，见第 6 节 |
 | `hook.notify` | notification | observe 通知 `{hook,seq,input}` |
 | `hook.gap` | notification | 队列缺口通知；当前 Node SDK 不暴露单独的 gap 回调，不承诺观察事件完整送达 |
-| `tool.invoke` | request | 已绑定工具；返回 `{output}`，处理器抛错返回 `{isError:true,output}` |
+| `tool.invoke` | request | 已绑定工具；返回 `{output,isError?,completion?}`，处理器抛错返回 `{isError:true,output}`；结构化结果与完成意图见下文 |
 | `command.invoke` | request | 用户命令；返回 `{content}` 或 `{isError:true,content}` |
 | `job.run` | request | 原生计划触发，复用已绑定命令；有真实 Turn、作业身份和预算 |
 | `config.changed` | notification | `{revision,values}`，只接纳更高版本并更新只读配置快照 |
@@ -89,6 +89,8 @@ daemon 响应形状：
 | `host.shutdown` | request | 有限停止；随后由 daemon 回收受管进程树 |
 
 ### 4.2 宿主 → daemon
+
+`tool.outcome` feature 协商后，工具处理器可返回 `api.toolResult(output,{isError?,completion?})` 创建的结果。宿主按本次调用 signal 身份解包，拒绝跨调用、重复使用和已失效调用；普通 JSON 对象不根据字段名推断控制。`completion` 只允许成功结果携带非空且最多 1 MiB UTF-8 的最终内容。daemon 严格校验回执，为成功完成意图附加插件／贡献身份，保存在原 canonical 工具结果；未确定的同批调用阻止完成。任务验收、Goal、租约和终态由原生执行链路裁决，恢复使用原回执，不重放工具。DSH 的 additionalContexts 与 Agent.inject 使用同一 session.message 交付；管线失败保留纠正上下文和结构化结果，交付失败单独标明，不能自动重试已经执行的业务。
 
 | 方法 | Node API | 当前合同 |
 | --- | --- | --- |

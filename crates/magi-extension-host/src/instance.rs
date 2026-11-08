@@ -1121,6 +1121,7 @@ fn check_hello(
         "session.directory",
         "session.messages",
         "images.store",
+        "tool.outcome",
     ];
     let features: Vec<String> = supported
         .iter()

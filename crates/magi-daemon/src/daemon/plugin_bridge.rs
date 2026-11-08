@@ -695,6 +695,7 @@ pub(super) fn execute_tool(
     );
     let ctx = json!({
         "invocationId": format!("{invocation_id}.{}", model_tool_name),
+        "activity": "tool",
         "owner": {
             "sessionId": context.session_id.as_ref().map(ToString::to_string),
             "taskId": context.task_id.as_ref().map(ToString::to_string),
@@ -729,22 +730,36 @@ pub(super) fn execute_tool(
     ));
     match result {
         Ok(value) => {
-            let is_error = value.get("isError").and_then(|v| v.as_bool()) == Some(true);
-            let output = value
-                .get("output")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            if is_error {
+            use magi_extension_host::protocol::{PluginToolCompletion, ToolInvocationResult};
+            let result = serde_json::from_value::<ToolInvocationResult>(value)
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.validate().map(|()| result).map_err(str::to_string));
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    return failure(
+                        if read_only { Failed } else { Indeterminate },
+                        "plugin_tool_result_invalid",
+                        &error,
+                    );
+                }
+            };
+            if result.is_error {
                 (
-                    json!({"tool": model_tool_name, "status": "failed", "error_code": "plugin_tool_error", "error": output}).to_string(),
+                    json!({"tool": model_tool_name, "status": "failed", "error_code": "plugin_tool_error", "error": result.output}).to_string(),
                     Failed,
                 )
             } else {
-                (
-                    json!({"tool": model_tool_name, "status": "succeeded", "output": output})
-                        .to_string(),
-                    Succeeded,
-                )
+                let mut payload = json!({"tool": model_tool_name, "status": "succeeded", "output": result.output});
+                if let Some(content) = result.completion {
+                    payload["pluginCompletion"] = serde_json::to_value(PluginToolCompletion {
+                        plugin_id: prepared.plugin_id,
+                        contribution_id: prepared.tool.id,
+                        content,
+                    })
+                    .expect("tool completion serializes");
+                }
+                (payload.to_string(), Succeeded)
             }
         }
         Err(error) if error.kind() == magi_extension_host::protocol::ErrorKind::Cancelled => {

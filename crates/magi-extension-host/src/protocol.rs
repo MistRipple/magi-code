@@ -8,6 +8,36 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 pub const PROTOCOL_MINOR: u32 = 0;
 pub const MAX_REENTRY_DEPTH: u32 = 4;
 
+/// 工具的业务输出与执行结果分离；完成内容只允许成功结果携带。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolInvocationResult {
+    pub output: Value,
+    #[serde(default)]
+    pub is_error: bool,
+    pub completion: Option<String>,
+}
+
+impl ToolInvocationResult {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.completion.as_ref().is_some_and(|content| {
+            self.is_error || content.trim().is_empty() || content.len() > 1_048_576
+        }) {
+            return Err("只有成功工具可以提供非空且有界的完成内容");
+        }
+        Ok(())
+    }
+}
+
+/// daemon 为已验证工具回执附加的完成来源，随 canonical 工具结果持久化。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginToolCompletion {
+    pub plugin_id: String,
+    pub contribution_id: String,
+    pub content: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Version {
     pub major: u32,

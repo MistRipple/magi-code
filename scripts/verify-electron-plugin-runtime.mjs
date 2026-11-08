@@ -50,10 +50,14 @@ const installed = async () => (await api('/api/plugins')).value.plugins.find((it
 const activeSkills = async () => (await api('/api/plugins/manifests')).value.flatMap(manifest => (manifest.contributions.skills ?? []).map(skill => ({ ...skill, contributionId: skill.id, id: `plugin/${manifest.id}/${skill.id}`, pluginId: manifest.id })));
 const visible = (selector) => page.evaluate(`Boolean(document.querySelector(${JSON.stringify(selector)})?.getClientRects().length)`);
 async function openConversation(session) {
-  const url=`${origin}/web.html?scope=personal&sessionId=${encodeURIComponent(session)}`;
-  if (await page.evaluate('location.href') !== url || await visible('[data-testid=settings-page]')) {
-    await page.call('Page.navigate',{url});
+  if (await visible('[data-testid=settings-page]')) {
+    await ui.click('[data-testid=settings-back]');
+    await waitFor(async()=>!await visible('[data-testid=settings-page]'),'返回工作台');
   }
+  const row=`.session-item[data-session-id="${session}"]`;
+  await waitFor(()=>ui.exists(row),'当前会话在原生侧栏可用');
+  if (!await ui.exists(row+'.active')) await ui.click(row);
+  await waitFor(async()=>await ui.exists(row+'.active') && !await visible('[data-testid=settings-page]') && await ui.exists('[data-testid=input-textarea]'),'切换到会话工作台');
 }
 async function settingsTab(id) {
   const nav = `[data-testid="settings-nav-${id}"]`;
@@ -67,11 +71,24 @@ async function settingsTab(id) {
 async function snapshot(name) { await writeFile(join(output, `${name}.png`), Buffer.from(await ui.screenshot(), 'base64')); }
 function startApp() {
   const instance = launchApp({ executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort,
+    inspectPort: cdpPort + 2,
     env: { MAGI_STATE_ROOT: join(work, 'state'), MAGI_DESKTOP_DAEMON_PORT: String(daemonPort), MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '',
       ...(externalDshCli ? { PATH: dirname(externalDshCli) + delimiter + process.env.PATH } : {}) },
   });
   appLogs.push(instance.log);
   return instance;
+}
+
+async function quitApp() {
+  if (!app || app.child.exitCode !== null || app.child.signalCode !== null) return;
+  // 与托盘退出共用 Main 的正式关闭顺序；先核对脚本自有进程。
+  // about:blank 会触发可信文档恢复，SIGTERM 则会绕过窗口先关的退出流程。
+  const main=await connectTarget(cdpPort+2,()=>true,'验收应用 Main inspector');
+  try {
+    assert.equal(await main.evaluate('process.pid'),app.child.pid,'不能退出其他应用实例');
+    await main.evaluate("setImmediate(()=>process.getBuiltinModule('module')._load('electron').app.quit()); true");
+  } finally { main.close(); }
+  await waitFor(()=>app.child.exitCode!==null||app.child.signalCode!==null,'应用正式退出',30000);
 }
 
 async function prepare() {
@@ -98,6 +115,8 @@ export const inject = ['commands', 'tools', 'llm', 'attachments', 'webServer', '
 export const Config = Schema.object({ label: Schema.string().default('initial'), enabled: Schema.boolean().default(true) });
 export function apply(ctx, config) {
   let skillRequest;
+  const toolOutcomes=[];
+  ctx.webServer.register({path:'/tool-outcomes',resource:()=>Response.json(toolOutcomes)});
   ctx.skills.register({name:'runtime-inspection',description:'Inspect the current runtime',content:'RUNTIME_SKILL_BODY:'+config.label,source:'runtime'});
   ctx.webServer.register({path:'/skill-request',resource:()=>Response.json({request:skillRequest})});
   let peerService;
@@ -159,6 +178,14 @@ export function apply(ctx, config) {
   if (config.enabled) ctx.effect(() => {
     const timer = setTimeout(() => ctx.tools.register({ name: 'late-read', description: '读取验收配置', parameters: { type: 'object' }, readOnly: true,
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }, execute: async (args,exec) => {
+        if(args.outcome) {
+          toolOutcomes.push({id:args.id,kind:args.outcome});
+          exec.deferContext({id:'outcome-context-'+args.id,role:'user',content:[{type:'text',text:'DEFERRED_CONTEXT:'+args.id}],source:{kind:'runtime-tool-context'}});
+          if(args.outcome!=='continue') exec.concludeTurn();
+          if(args.outcome==='cancel') await new Promise(resolve=>exec.signal.addEventListener('abort',resolve,{once:true}));
+          if(args.outcome==='failed') throw new Error('ACTUAL_BUSINESS_FAILURE:'+args.id);
+          return 'ACTUAL_BUSINESS_RESULT:'+args.id;
+        }
         if(args.message) {
           exec.agent.inject({id:'tool-result-message',role:'user',content:[{type:'text',text:'MESSAGE_TOOL_RESULT'}],source:{kind:'runtime-result'}});
           return 'TOOL_MESSAGE_DONE';
@@ -182,11 +209,18 @@ export function apply(ctx, config) {
       const messageCheck=lastUser?.content.some(block=>block.type==='text' && block.text.includes('MESSAGE_TOOL_CHECK'));
       const originalInput=lastUser?.content.find(block=>block.type==='text' && block.text.startsWith('ORIGINAL_TOOL_CHECK:'))?.text;
       const originalCall=originalInput?JSON.parse(originalInput.slice('ORIGINAL_TOOL_CHECK:'.length)):null;
-      const originalResult=originalCall?request.messages.slice(request.messages.indexOf(lastUser)+1).findLast(message=>message.role==='tool'):null;
-      if ((directoryCheck && !directoryResult) || (messageCheck && !(JSON.stringify(lastTool?.content)??'').includes('TOOL_MESSAGE_DONE')) || (originalCall && !originalResult)) {
+      const originalResult=originalCall?request.messages.slice(request.messages.indexOf(lastUser)+1).findLast(message=>message.role==='tool'&&message.toolCallId==='acceptance-tool-call'):null;
+      const outcomeUser=request.messages.findLast(message=>message.role==='user'&&message.content.some(block=>block.type==='text'&&block.text.startsWith('TOOL_OUTCOME_CHECK:')));
+      const outcomeInput=outcomeUser?.content.find(block=>block.type==='text'&&block.text.startsWith('TOOL_OUTCOME_CHECK:'))?.text;
+      const outcomeCall=outcomeInput?JSON.parse(outcomeInput.slice('TOOL_OUTCOME_CHECK:'.length)):null;
+      const outcomeResult=outcomeCall?request.messages.slice(request.messages.indexOf(outcomeUser)+1).findLast(message=>message.role==='tool'&&message.toolCallId==='acceptance-tool-call'):null;
+      if ((directoryCheck && !directoryResult) || (messageCheck && !(JSON.stringify(lastTool?.content)??'').includes('TOOL_MESSAGE_DONE')) || (originalCall && !originalResult) || (outcomeCall&&!outcomeResult)) {
         const tool = request.tools.find(tool=>originalCall?tool.description.startsWith(originalCall.description):tool.description==='读取验收配置');
-        if(!tool)throw new Error('Requested acceptance tool is missing from the real model catalog');
-        const block = {type:'tool-call',id:'acceptance-tool-call',name:tool.name,arguments:JSON.stringify(originalCall?originalCall.args:messageCheck?{message:true}:{directory:true})};
+        // 动态工具尚未绑定时，模型沿公开目录发现入口刷新；不把 running
+        // 状态当作未来动态贡献已经就绪，也不在同一固定请求内盲目重试。
+        const selected=tool??request.tools.find(tool=>tool.name.endsWith('tool_catalog'));
+        if(!selected)throw new Error('Requested acceptance tool and discovery entry are missing from the real model catalog');
+        const block = {type:'tool-call',id:tool?'acceptance-tool-call':'catalog-discovery',name:selected.name,arguments:JSON.stringify(tool?(originalCall?originalCall.args:outcomeCall?{outcome:outcomeCall.kind,id:outcomeCall.id}:messageCheck?{message:true}:{directory:true}):{include_external:true,include_schema:true})};
         yield {type:'block-start',index:0,blockType:'tool-call'};
         yield {type:'tool-call-delta',index:0,id:block.id,name:block.name,argumentsDelta:block.arguments};
         yield {type:'block-end',index:0,block};
@@ -245,16 +279,11 @@ async function verifyOriginalSkill(session, waitTurn) {
   const body=running.manifest.contributions.skills.find(entry=>entry.id===skill.contributionId).instruction;
   const published=await readFile(join(work,'state/extensions/packages',original.manifest.id,running.digest,'extension/upstream/skills/dsh-plugin-debugging/SKILL.md'),'utf8');
   reporter.check('在线原包的技能正文逐字进入 daemon 当前贡献目录', body===published.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/,'').trim());
-  let loaded = false;
-  const stopLoad = page.on('Page.loadEventFired',()=>{ loaded = true; });
-  try {
-    await page.call('Page.navigate',{url:`${origin}/web.html?scope=personal&sessionId=${encodeURIComponent(session)}`});
-    await waitFor(async()=>loaded&&await ui.exists('[data-testid=input-textarea]'),'工作台技能入口');
-  } finally { stopLoad(); }
+  await openConversation(session);
   const selectSkill=async()=>{
-    const point = await page.evaluate(`(()=>{const r=document.querySelector('[data-testid=input-textarea]').getBoundingClientRect();return {x:r.x+20,y:r.y+20};})()`);
-    await page.call('Input.dispatchMouseEvent',{type:'mousePressed',...point,button:'left',clickCount:1});
-    await page.call('Input.dispatchMouseEvent',{type:'mouseReleased',...point,button:'left',clickCount:1});
+    await waitFor(()=>ui.exists('[data-testid=input-textarea][contenteditable=true]'),'技能输入可编辑');
+    await page.evaluate(`document.querySelector('[data-testid=input-textarea][contenteditable=true]').focus({preventScroll:true})`);
+    await waitFor(()=>page.evaluate(`document.activeElement===document.querySelector('[data-testid=input-textarea]')`),'输入框取得真实键盘焦点');
     await page.call('Input.insertText',{text:'/dsh-plugin-debugging'});
     await waitFor(()=>page.evaluate(`Boolean([...document.querySelectorAll('.ia-slash-item')].find(item=>item.querySelector('.ia-slash-item-label')?.textContent==='/dsh-plugin-debugging'))`),'原包技能出现在斜杠菜单');
   };
@@ -296,12 +325,8 @@ async function verifyOriginalSkill(session, waitTurn) {
   await waitFor(async()=>(await activeSkills()).some(entry=>entry.id===skill.id),'重新启用恢复同一技能身份');
   const bootstrap=(await api(`/api/settings/bootstrap?scope=personal&sessionId=${encodeURIComponent(session)}`)).value;
   reporter.check('重新激活重新注册技能，不写入本地技能配置',!bootstrap.skillsConfig.instructionSkills.some(entry=>entry.skillId===skill.id||entry.name==='dsh-plugin-debugging'));
-  // 驱动用 SIGTERM 停进程，先卸载文档，遵守正式退出先关窗口再停 daemon 的顺序。
-  // 关闭 CDP socket 本身不会销毁 Renderer，残留轮询会把验收器杀后台误报为产品错误。
-  await page.call('Page.navigate',{url:'about:blank'});
-  await waitFor(()=>page.evaluate('location.href==="about:blank"'),'重启前释放旧 Renderer 文档');
   page.close();
-  await app.stop();
+  await quitApp();
   await waitFor(async()=>!await fetch(`${origin}/health`).then(()=>true,()=>false),'关闭后 daemon 完成退出');
   app = startApp();
   page = await waitFor(()=>connectAppPage(cdpPort,daemonPort,errors),'同一状态根重新启动工作台',60_000);
@@ -543,7 +568,7 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   await post(`/api/plugins/${id}/activate`);
   await waitFor(async () => (await api('/api/plugins')).value.plugins.find((item) => item.manifest.id === id)?.runtime?.state === 'running', '原生多面板插件');
   reporter.check('同一槽位的两个条件注册面板均进入 daemon 视图目录', plugin.manifest.contributions.views.length === 2 && plugin.manifest.contributions.views.every((view) => view.placements.includes('rightPane')));
-  await page.call('Page.navigate', {url:`${origin}/web.html?scope=personal&sessionId=${encodeURIComponent(session)}`});
+  await openConversation(session);
   await waitFor(() => ui.exists('.header-right-pane-btn'), '工作台顶栏');
   await page.evaluate(`localStorage.setItem('magi-ui-private-probe','private'); true`);
   if (!await visible('.right-pane')) await ui.click('.header-right-pane-btn');
@@ -883,15 +908,16 @@ async function verifySessionMessages() {
   reporter.check('停止调用回收临时消息，不将迟到结果入库或唤醒模型',!(await queue()).some(input=>input.pluginMessage?.messageId==='cancelled-message'));
   const edit=await api('/api/session/queue/update',{sessionId:session,queueId:pending.queueId,expectedRevision:pending.revision,request:{scope:'personal',sessionId:session,text:'forged'}});
   reporter.check('插件消息不能借用户编辑入口改写来源',edit.status===409,JSON.stringify(edit));
-  await page.call('Page.navigate',{url:`${origin}/web.html?scope=personal&sessionId=${session}`});
+  await openConversation(session);
   await waitFor(()=>page.evaluate('Boolean(document.querySelector(".ia-queue-item"))'),'持久消息队列');
   reporter.check('队列展示插件来源与等待模型状态，并保留取消操作',await page.evaluate(`(()=>{const row=document.querySelector('.ia-queue-item');return row.innerText.includes('等待下一次请求')&&!row.querySelector('.ia-queue-guide')&&!row.querySelector('[aria-label="编辑消息"]')&&Boolean(row.querySelector('[aria-label="删除消息"]'));})()`));
   await snapshot('message-context-pending');
-  await page.call('Page.navigate',{url:'about:blank'});page.close();
-  await app.stop();
+  page.close();
+  await quitApp();
   await waitFor(async()=>!await fetch(origin+'/health').then(()=>true,()=>false),'消息持久化后退出');
   app=startApp();
   page=await waitFor(()=>connectAppPage(cdpPort,daemonPort,errors),'消息持久化后重新启动',60000);ui=pageTools(page);
+  await waitFor(()=>page.evaluate(`Boolean(document.documentElement.dataset.magiThemeId && document.querySelector('[data-testid=sidebar-settings]'))`),'消息重启后工作台初始化');
   await waitFor(async()=>(await installed())?.runtime?.state==='running','恢复插件宿主',120000);
   reporter.check('应用重启恢复相同待处理消息且不会自行请求模型',(await queue()).some(input=>input.queueId===pending.queueId&&input.revision===pending.revision)
     && (await turns()).length===3);
@@ -927,7 +953,7 @@ async function verifySessionMessages() {
   reporter.check('计划作业不能借会话消息绕过签发的模型预算',outcome.lastOutcome==='failed'
     && !(await turns()).some(turn=>turn.items.some(item=>item.metadata?.pluginMessage?.messageId==='job-wake-denied'))
     && !(await queue()).some(input=>input.pluginMessage?.messageId==='job-wake-denied'),JSON.stringify(outcome));
-  await page.call('Page.navigate',{url:`${origin}/web.html?scope=personal&sessionId=${session}`});
+  await openConversation(session);
   await waitFor(()=>page.evaluate('Boolean(document.querySelector("[data-source=plugin]"))'),'插件消息正文与来源展示');
   reporter.check('插件消息原文完整显示并明确来源，不冒充用户气泡',await page.evaluate(`document.querySelectorAll('[data-source=plugin]').length>=4&&[...document.querySelectorAll('[data-source=plugin]')].every(node=>node.querySelector('.plugin-message-source')&&!node.classList.contains('user'))`));
   reporter.check('插件消息消费状态来自真实模型 Step，正文不会仅显示为接纳成功',await page.evaluate(`document.querySelectorAll('[data-source=plugin] [data-input-delivery=used]').length>=4`));
@@ -944,6 +970,62 @@ async function verifySessionMessages() {
   reporter.check('用户沿原生队列取消已入库上下文，不发起模型或创建伪造用户消息',!(await turns()).some(turn=>turn.items.some(item=>item.metadata?.pluginMessage?.messageId==='user-cancelled-context')));
 
   await writeFile(join(output,'session-messages.json'),JSON.stringify({session,turns:await turns(),request},null,2));
+}
+
+async function verifyToolOutcomes() {
+  const session=(await post('/api/session/materialize',{scope:'personal'})).sessionId;
+  const source=(await installed()).manifest.contributions.modelSources[0].id;
+  await post('/api/settings/orchestrator/session/save',{scope:'personal',sessionId:session,config:{sourceId:`plugin/${pluginId}/${source}`,model:'fixture-model',reasoningEffort:null}});
+  const turns=async()=>(await api(`/api/messages?scope=personal&sessionId=${session}`)).value.canonicalTurns??[];
+  const outcomes=async()=>(await post(`/api/plugins/${pluginId}/routes`,{method:'GET',path:'/tool-outcomes'})).body;
+  const waitTurn=id=>waitFor(async()=>(await turns()).find(turn=>turn.turnId===id&&['completed','failed','cancelled','blocked'].includes(turn.status)),'工具结果结算',45000);
+  const invoke=kind=>post('/api/session/turn',{scope:'personal',sessionId:session,text:'TOOL_OUTCOME_CHECK:'+JSON.stringify({kind,id:kind}),requestId:'tool-outcome-'+kind,userMessageId:'tool-outcome-user-'+kind});
+  for(const kind of ['continue','finish','failed']) {
+    const accepted=await invoke(kind), turn=await waitTurn(accepted.turnId);
+    const tool=turn.items.find(item=>item.kind==='tool_call');
+    const context=turn.items.find(item=>item.metadata?.pluginMessage?.messageId==='outcome-context-'+kind);
+    const final=turn.items.find(item=>item.metadata?.assistantOutputKind==='final');
+    const request=JSON.parse((await post(`/api/plugins/${pluginId}/routes`,{method:'GET',path:'/skill-request'})).body.request);
+    await writeFile(join(output,`tool-outcome-${kind}.json`),JSON.stringify({turn,request},null,2));
+    reporter.check(`${kind} 工具沿真实管线保留结构化业务结果与补充上下文`,turn.status==='completed'
+      && tool?.status===(kind==='failed'?'failed':'completed')
+      && context?.content==='DEFERRED_CONTEXT:'+kind
+      && context.metadata.pluginMessage.sourceKind==='runtime-tool-context',JSON.stringify(turn));
+    if(kind==='finish') {
+      reporter.check('成功工具直接交付最终业务原文，保留完成来源且不请求第二次模型',final?.content==='ACTUAL_BUSINESS_RESULT:finish'
+        && final.metadata.pluginToolCompletion?.[0]?.pluginId===pluginId && !final.metadata.modelStepId
+        && !final.metadata.providerContext && turn.modelSteps.length===1,JSON.stringify(turn));
+    } else {
+      reporter.check(`${kind} 的上下文交给原生下一模型步骤，失败不能请求结束本轮`,turn.modelSteps.length===2
+        && JSON.stringify(request.messages).includes('DEFERRED_CONTEXT:'+kind)
+        && !final?.metadata?.pluginToolCompletion
+        && (kind!=='failed'||JSON.stringify(tool.tool.result.error).includes('ACTUAL_BUSINESS_FAILURE:failed')),JSON.stringify({turn,request}));
+      if(kind==='failed') reporter.check('结束本轮工具留下的补充上下文仍进入后续真实模型请求',JSON.stringify(request.messages).includes('DEFERRED_CONTEXT:finish'),JSON.stringify(request.messages));
+    }
+    assert.equal((await outcomes()).filter(item=>item.id===kind).length,1,'业务只执行一次');
+  }
+  const cancel=await invoke('cancel');
+  await waitFor(async()=>(await outcomes()).some(item=>item.id==='cancel'),'工具进入等待取消的业务');
+  await post('/api/session/interrupt',{sessionId:session});
+  const stopped=await waitTurn(cancel.turnId);
+  reporter.check('取消中止真实工具，临时补充上下文与结束意图均不能迟到提交',stopped.status==='cancelled'
+    && !stopped.items.some(item=>item.metadata?.assistantOutputKind==='final'||item.metadata?.pluginMessage?.messageId==='outcome-context-cancel'),JSON.stringify(stopped));
+  const before=await turns();
+  await writeFile(join(output,'tool-outcomes.json'),JSON.stringify({session,turns:before,executions:await outcomes()},null,2));
+  page.close();
+  await quitApp();
+  await waitFor(async()=>!await fetch(origin+'/health').then(()=>true,()=>false),'工具结算后退出');
+  app=startApp();
+  page=await waitFor(()=>connectAppPage(cdpPort,daemonPort,errors),'工具结算后重新启动',60000);ui=pageTools(page);
+  await waitFor(()=>page.evaluate(`Boolean(document.documentElement.dataset.magiThemeId && document.querySelector('[data-testid=sidebar-settings]'))`),'重启后工作台初始化');
+  await waitFor(async()=>(await installed())?.runtime?.state==='running','恢复结果验收插件',120000);
+  const after=await turns();
+  reporter.check('应用重启保留业务最终原文与来源，不重放工具或另起模型',after.length===before.length
+    && after.some(turn=>turn.items.some(item=>item.metadata?.assistantOutputKind==='final'&&item.content==='ACTUAL_BUSINESS_RESULT:finish'&&item.metadata.pluginToolCompletion?.[0]?.pluginId===pluginId))
+    && (await outcomes()).length===0,JSON.stringify(after));
+  await openConversation(session);
+  await waitFor(()=>page.evaluate('document.body.innerText.includes("ACTUAL_BUSINESS_RESULT:finish")'),'工具原文恢复展示');
+  await snapshot('tool-outcomes-restored');
 }
 
 async function verifyCommandExecution(session) {
@@ -1011,7 +1093,8 @@ async function verifyCommandExecution(session) {
 try {
   reporter.check('验收端口未被已有实例使用',
     !await fetch(`${origin}/health`).then(() => true, () => false)
-    && !await fetch(`http://127.0.0.1:${cdpPort}/json/version`).then(() => true, () => false));
+    && !await fetch(`http://127.0.0.1:${cdpPort}/json/version`).then(() => true, () => false)
+    && !await fetch(`http://127.0.0.1:${cdpPort+2}/json/list`).then(() => true, () => false));
   const archive = await prepare();
   app = startApp();
   page = await waitFor(() => connectAppPage(cdpPort, daemonPort, errors), '真实 Magi Renderer', 60_000);
@@ -1084,12 +1167,20 @@ try {
   const waitTurn = (id) => waitFor(async () => {
     const turns = (await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).value.canonicalTurns;
     return turns?.find((turn) => turn.turnId === id && ['completed', 'failed', 'cancelled', 'blocked'].includes(turn.status));
-  }, `Turn ${id}`, 45_000);
+  }, `Turn ${id}`, 45_000).catch(async error=>{
+    await writeFile(join(output,'turn-timeout.json'),JSON.stringify({
+      turnId:id, messages:await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`),
+      modelRequest:await api(`/api/plugins/${pluginId}/routes`,{method:'GET',path:'/skill-request'}),
+      plugin:await installed(),
+    },null,2));
+    throw error;
+  });
   const cmd = await post('/api/session/turn', { scope: 'personal', sessionId: session, pluginCommandId: `plugin/${pluginId}/${command}`, text: '', requestId: 'runtime-command', userMessageId: 'runtime-command-user' });
   const cmdTurn = await waitTurn(cmd.turnId);
   reporter.check('配置重载后的命令沿 canonical Turn 返回新值', cmdTurn.status === 'completed' && JSON.stringify(cmdTurn).includes('DSH_REPORT:changed'), JSON.stringify(cmdTurn));
   await verifyCommandExecution(session);
   await verifySessionMessages();
+  await verifyToolOutcomes();
   await post('/api/settings/orchestrator/session/save', { scope: 'personal', sessionId: session, config: { sourceId: `plugin/${pluginId}/${source}`, model: 'fixture-model', reasoningEffort: null } });
   const toolTurn = await post('/api/session/turn',{scope:'personal',sessionId:session,text:'DIRECTORY_TOOL_CHECK',requestId:'directory-tool',userMessageId:'directory-tool-user'});
   const toolResult = await waitTurn(toolTurn.turnId);
@@ -1153,7 +1244,10 @@ try {
   startupGate?.closeAllConnections();
   startupGate?.close();
   await writeFile(join(output, 'results.json'), JSON.stringify(reporter.results, null, 2));
-  if (app) { await app.stop(); await writeFile(join(output, 'electron.log'), appLogs.flat().join('')); }
+  if (app) {
+    await quitApp().catch(async error=>{console.error(error);process.exitCode=1;await app.stop();});
+    await writeFile(join(output, 'electron.log'), appLogs.flat().join(''));
+  }
   frame?.close();
   page?.close();
   await rm(work, { recursive: true, force: true });

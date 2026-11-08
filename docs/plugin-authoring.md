@@ -244,6 +244,7 @@ export default async function activate(api) {
 | --- | --- |
 | `api.on(hook, handler)` | 绑定钩子（第 7 节） |
 | `api.tool(id, handler)` | 绑定模型工具（第 8 节） |
+| `api.toolResult(output, {isError?, completion?})` | 当前工具调用创建结构化执行结果；需协商 `tool.outcome`，业务输出与失败／完成意图分离（第 8 节） |
 | `api.command(id, handler)` | 绑定用户命令，也是作业的执行入口（第 9、11 节） |
 | `api.catalog.replace(expectedRevision, catalog)` | 提交已声明种类的动态贡献目录，返回新的 `{revision}` |
 | `api.resource.read(id)` / `write(id, expectedVersion, value)` | 读写本插件资源 |
@@ -393,6 +394,8 @@ export default async function activate(api) {
 - 模型看到的工具名由 Magi 生成（`plugin__…`），不要依赖它。
 - 参数先按 `inputSchema` 校验（必须是有界的 object schema），不合法的调用不会到达你的代码。
 - 返回任意 JSON 作为工具输出；**抛出的错误会作为工具失败返回给模型**，不是协议错误。
+- 需要保留失败业务的结构化结果时返回 `api.toolResult(output, {isError:true})`。只有经此工厂创建且属于当前活动调用的结果才携带执行控制；普通输出里的同名字段始终属于业务数据，结果对象不能跨调用使用。
+- 成功工具可返回 `api.toolResult(output, {completion:'实际业务最终内容'})`，请求直接交付本轮内容。completion 须非空且不超过 1 MiB UTF-8，不可与 isError 同时提供；daemon 仍检查整批已结算、任务证据、必需工具、Goal 和执行租约后沿原生终态入口提交，不能据此绕过任务要求。最终内容保留插件与贡献来源，不冒充模型 Step；恢复读取 canonical 工具回执，不重放业务或再次请求模型。
 - `readOnly` 决定审批：只读工具在“只读”模式下可用；非只读工具在“逐次询问”下需要用户批准，在“只读”下被拒绝。
 - 单次调用默认上限 60 秒；可在清单里用 `timeoutMs`（1000–600000）为长任务声明更长期限。超时或用户停止所属 Turn/任务时 `ctx.signal` 中止。停止时如果工具不是 `readOnly`，Magi 无法确认写入是否已生效，结果记为“未确定”，**不会自动重试**。
 - 停用、撤权或宿主不可用时，工具从目录中消失或调用失败。

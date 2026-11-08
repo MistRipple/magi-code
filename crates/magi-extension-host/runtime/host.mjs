@@ -16,7 +16,7 @@ import { createHash } from 'node:crypto';
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const PROTOCOL = { major: 1, minor: 0 };
-const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'plugin.installations', 'plugin.directory.events', 'plugin.reconciliation', 'plugin.skills', 'session.directory', 'session.messages', 'images.store'];
+const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'plugin.installations', 'plugin.directory.events', 'plugin.reconciliation', 'plugin.skills', 'session.directory', 'session.messages', 'images.store', 'tool.outcome'];
 let negotiatedFeatures = new Set();
 const pluginRequest = (method, input, background = false) => {
   if (!negotiatedFeatures.has('plugin.management')) throw new Error('daemon 未协商 plugin.management');
@@ -59,6 +59,9 @@ let configRevision = 0;
 let identity = null;
 const handlers = new Map(); // hook name -> handler
 const toolHandlers = new Map(); // tool id -> handler
+// 工具输出本身可以包含任意 JSON 字段，不能把业务对象中的 isError 或
+// completion 猜成执行控制。只有本次调用经公开工厂创建的结果才解包。
+const toolResults = new WeakMap();
 const commandHandlers = new Map(); // command id -> handler
 const routeHandlers = new Map(); // 视图后端路径 -> handler
 const inflight = new Map(); // invocationId -> AbortController
@@ -156,7 +159,10 @@ async function handleRequest(id, method, params) {
       inflight.set(ctx.invocationId, controller);
       try {
         const output = await invocationContext.run({ ...ctx, signal: controller.signal }, () => handler(params.input, { ...ctx, signal: controller.signal }));
-        return send({ id, result: { output: output === undefined ? null : output } });
+        const result = output && typeof output === 'object' ? toolResults.get(output) : undefined;
+        if (result && (result.signal !== controller.signal || result.consumed)) throw new Error('工具结果不属于当前调用或已使用');
+        if (result) result.consumed = true;
+        return send({ id, result: result ? result.value : { output: output === undefined ? null : output } });
       } catch (error) {
         // 工具自身抛出的错误是模型可见的工具失败，不是协议错误。
         return send({ id, result: { isError: true, output: String(error?.message ?? error).slice(0, 4096) } });
@@ -405,6 +411,23 @@ const api = Object.freeze({
   async tool(id, handler) {
     if (typeof handler !== 'function') throw new TypeError('handler 必须是函数');
     return register('register.tool', 'unregister.tool', toolHandlers, id, handler);
+  },
+  toolResult(output, options = {}) {
+    if (!negotiatedFeatures.has('tool.outcome')) throw new Error('daemon 未协商 tool.outcome');
+    const context = invocationContext.getStore();
+    if (!context || context.activity !== 'tool' || context.signal.aborted
+      || inflight.get(context.invocationId)?.signal !== context.signal) throw new Error('工具结果需要当前活动的工具调用');
+    if (!options || typeof options !== 'object' || Array.isArray(options)
+      || Object.keys(options).some(key => !['isError', 'completion'].includes(key))
+      || options.isError !== undefined && typeof options.isError !== 'boolean') throw new TypeError('工具结果选项无效');
+    const { isError = false, completion } = options;
+    if (completion !== undefined && (isError || typeof completion !== 'string' || !completion.trim()
+      || Buffer.byteLength(completion) > 1_048_576)) throw new TypeError('只有成功工具可以提供非空且有界的完成内容');
+    const value = Object.freeze({});
+    toolResults.set(value, { signal: context.signal, value: {
+      output: output === undefined ? null : output, isError, ...(completion === undefined ? {} : { completion }),
+    } });
+    return value;
   },
   /** 绑定用户命令处理器；命令必须已在清单中声明。返回字符串或 `{ content }`。返回释放函数。 */
   async command(id, handler) {
