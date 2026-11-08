@@ -12,6 +12,36 @@ import { createPluginManager } from './runtime/plugin-manager.mjs';
 import { profileSpawn } from './runtime/profile.mjs';
 import { once } from 'node:events';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash } from 'node:crypto';
+import { zipSync, strToU8 } from 'fflate';
+
+test('profile 从 daemon 当前不可变归档读取真实原包文件，保留字节与时间且不物化第二份安装目录', async t => {
+  const home=await mkdtemp(join(tmpdir(),'magi-profile-artifacts-'));
+  t.after(()=>rm(home,{recursive:true,force:true}));
+  const original={name:'@scope/artifact',version:'1.0.0',main:'lib/index.js'};
+  const payload=Buffer.from([0,255,3,42]);
+  const archive=zipSync({'extension/upstream/package.json':strToU8(JSON.stringify(original)),
+    'extension/upstream/lib/index.js':payload,'extension/index.mjs':strToU8('not an upstream file')});
+  const archivePath=join(home,'installed.zip');await writeFile(archivePath,archive);
+  const digest=createHash('sha256').update(archive).digest('hex');
+  const plugin={manifest:{id:'dsh.artifact'},digest,enabled:false,active:false,
+    source:{kind:'upstream',location:'dsh:@scope/artifact@1.0.0'},upstreamManifest:original,upstreamArchivePath:archivePath};
+  const off=configureProfile({plugins:{list:async()=>({plugins:[plugin]})}},{home});t.after(off);
+  await withProfile(async()=>{
+    const root=join(profilePath(),'node_modules/@scope/artifact');
+    assert.deepEqual(fs.readFileSync(join(root,'lib/index.js')),payload);
+    assert.equal(fs.statSync(join(root,'lib/index.js')).mtimeMs,nativeFs.statSync(archivePath).mtimeMs);
+    assert.deepEqual(fs.readdirSync(join(root,'lib')),['index.js']);
+    assert.equal(fs.existsSync(join(root,'missing.js')),false);
+    assert.equal(fs.existsSync(join(root,'index.mjs')),false,'不能把翻译宿主入口混为原包文件');
+    assert.throws(()=>fs.writeFileSync(join(root,'lib/index.js'),'change'),{code:'EROFS'});
+    assert.equal(nativeFs.existsSync(join(home,'profiles')),false);
+    const handle=await fs.promises.open(join(root,'lib/index.js'));
+    assert.deepEqual(await handle.readFile(),payload);await handle.close();
+  });
+  await writeFile(archivePath,'modified archive');
+  await assert.rejects(withProfile(()=>fs.readFileSync(join(profilePath(),'node_modules/@scope/artifact/lib/index.js'))),{code:'ECONFLICT'});
+});
 
 test('GitHub 原包目录与 profile 共用 daemon 来源，导出保留分支，版本仍来自不可变原包', async t => {
   const home = await mkdtemp(join(tmpdir(), 'magi-github-profile-'));
@@ -26,7 +56,7 @@ test('GitHub 原包目录与 profile 共用 daemon 来源，导出保留分支�
     assert.equal(JSON.parse(fs.readFileSync(join(profilePath(), 'node_modules/@scope/github/package.json'), 'utf8')).version, '1.2.0');
     const [bundle] = await createPluginManager(api).listBundles();
     assert.equal(bundle.source, 'github:owner/repo#main'); assert.equal(bundle.version, '1.2.0');
-    assert.equal(loaderEntries()[1].options.name, '@scope/github');
+    assert.equal(loaderEntries()[0].options.name, '@scope/github');
   });
 });
 
@@ -53,13 +83,13 @@ test('profile 重载串行提交真实启停意图、等待 daemon 收敛；失�
   const reload = createProfileReload();
   await withProfile(async () => {
     await assert.rejects(reload.reconcileProfile(), /inside runExclusive/);
-    assert.deepEqual(await reload.runExclusive(() => reload.reconcileProfile(['magi-profile:dsh.target'])), { warnings: [], pending: [] });
+    assert.deepEqual(await reload.runExclusive(() => reload.reconcileProfile(['dsh.target'])), { warnings: [], pending: [] });
     assert.equal(plugins[0].runtime.generation, 7, '原实例保持，不通过重启模拟重载');
     await assert.rejects(reload.runExclusive(() => reload.runExclusive(() => {})), /cannot be nested/);
     fs.writeFileSync(join(profilePath(), 'cordis.patch.yml'), dump([{ id: 'dsh.target', disabled: true }]));
     await reload.runExclusive(() => reload.reconcileProfile());
     assert.equal(plugins[0].active, false, '提案先沿原提交入口生效，再核对运行状态');
-    await assert.rejects(reload.runExclusive(() => reload.reconcileProfile(['magi-profile:dsh.target'])), /必需条目未运行/);
+    await assert.rejects(reload.runExclusive(() => reload.reconcileProfile(['dsh.target'])), /必需条目未运行/);
     assert.equal(plugins[0].enabled, false, '重载不能重新启用停用项');
     plugins[0].enabled = true;
     const inactive = await reload.runExclusive(() => reload.reconcileProfile());
@@ -224,12 +254,12 @@ test('profile 同步读取真实调用快照，启停提案经 daemon 与摘要�
     assert.deepEqual(manifest.dsh.profile.bundles, ['@scope/example']);
     assert.equal(JSON.parse(await fs.promises.readFile(join(root, 'node_modules/@scope/example/package.json'), 'utf8')).name, '@scope/example');
     assert.deepEqual(fs.readdirSync(join(root, '..')), ['magi']);
-    const entries = loaderEntries(); assert.equal(entries[1].options.name, '@scope/example'); assert.equal(entries[1].fiber.state, 2);
+    const entries = loaderEntries(); assert.equal(entries.length,1); assert.equal(entries[0].options.name, '@scope/example'); assert.equal(entries[0].fiber.state, 2);
     fs.writeFileSync(join(root, 'cordis.patch.yml'), dump([{ id: 'dsh.example', disabled: true }]));
     assert.equal(enabled, true, '调用结束前没有第二条状态写入路径');
   });
   assert.equal(enabled, false); assert.deepEqual(calls, [false]);
-  await withProfile(async () => { assert.equal(loaderEntries()[1].disabled, true); });
+  await withProfile(async () => { assert.equal(loaderEntries()[0].disabled, true); });
   await assert.rejects(withProfile(async () => {
     fs.writeFileSync(join(root, 'cordis.patch.yml'), dump([{ id: 'dsh.example', disabled: false }]));
     throw new Error('business failed');

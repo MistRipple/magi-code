@@ -83,6 +83,23 @@ fn upstream_metadata_is_read_from_the_installed_archive_only_on_request() {
             .as_ref(),
         Some(&original)
     );
+    let projection = manager.projection_with_upstream_metadata(true).unwrap();
+    let archive_path = projection.plugins[0]
+        .upstream_archive_path
+        .as_ref()
+        .unwrap();
+    assert!(std::path::Path::new(archive_path).is_absolute());
+    assert_eq!(
+        PluginPackage::from_archive(&std::fs::read(archive_path).unwrap())
+            .unwrap()
+            .digest(),
+        projection.plugins[0].digest
+    );
+    assert!(
+        manager.projection().unwrap().plugins[0]
+            .upstream_archive_path
+            .is_none()
+    );
     drop(manager);
     let manager = PluginManager::open(root.path()).unwrap();
     assert_eq!(

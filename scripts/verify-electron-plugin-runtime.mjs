@@ -172,9 +172,13 @@ export function apply(ctx, config) {
       const directoryCheck = lastUser?.content.some(block=>block.type==='text' && block.text.includes('DIRECTORY_TOOL_CHECK'));
       const directoryResult = lastTool && JSON.stringify(lastTool.content).includes('TOOL_DIRECTORY:');
       const messageCheck=lastUser?.content.some(block=>block.type==='text' && block.text.includes('MESSAGE_TOOL_CHECK'));
-      if ((directoryCheck && !directoryResult) || (messageCheck && !(JSON.stringify(lastTool?.content)??'').includes('TOOL_MESSAGE_DONE'))) {
-        const tool = request.tools.find(tool=>tool.description==='读取验收配置');
-        const block = {type:'tool-call',id:'directory-tool-call',name:tool.name,arguments:JSON.stringify(messageCheck?{message:true}:{directory:true})};
+      const originalInput=lastUser?.content.find(block=>block.type==='text' && block.text.startsWith('ORIGINAL_TOOL_CHECK:'))?.text;
+      const originalCall=originalInput?JSON.parse(originalInput.slice('ORIGINAL_TOOL_CHECK:'.length)):null;
+      const originalResult=originalCall?request.messages.slice(request.messages.indexOf(lastUser)+1).findLast(message=>message.role==='tool'):null;
+      if ((directoryCheck && !directoryResult) || (messageCheck && !(JSON.stringify(lastTool?.content)??'').includes('TOOL_MESSAGE_DONE')) || (originalCall && !originalResult)) {
+        const tool = request.tools.find(tool=>originalCall?tool.description.startsWith(originalCall.description):tool.description==='读取验收配置');
+        if(!tool)throw new Error('Requested acceptance tool is missing from the real model catalog');
+        const block = {type:'tool-call',id:'acceptance-tool-call',name:tool.name,arguments:JSON.stringify(originalCall?originalCall.args:messageCheck?{message:true}:{directory:true})};
         yield {type:'block-start',index:0,blockType:'tool-call'};
         yield {type:'tool-call-delta',index:0,id:block.id,name:block.name,argumentsDelta:block.arguments};
         yield {type:'block-end',index:0,block};
@@ -183,6 +187,7 @@ export function apply(ctx, config) {
         return;
       }
       if (directoryCheck && directoryResult) text=JSON.stringify(lastTool.content);
+      if (originalCall && originalResult) text=JSON.stringify(originalResult.content);
       const lastImage = request.messages.flatMap(message=>message.content).filter(block=>block.type==='image').at(-1);
       const images = lastImage ? [lastImage] : [];
       if (images.length) {
@@ -300,6 +305,62 @@ async function verifyOriginalSkill(session, waitTurn) {
   const resumedRequest = await post(`/api/plugins/${pluginId}/routes`,{method:'GET',path:'/skill-request'});
   reporter.check('应用重启后原包技能恢复相同身份和原文并完成真实模型调用',resumedTurn.status==='completed'
     && resumedRequest.body.request.includes(JSON.stringify(body).slice(1,-1)));
+  const diagnose=async(name,packageName)=>{
+    const diagnosis=await post('/api/session/turn',{scope:'personal',sessionId:session,
+      text:'ORIGINAL_TOOL_CHECK:'+JSON.stringify({description:'Checks whether a plugin loaded.',args:{package:packageName}}),
+      requestId:name,userMessageId:name+'-user'});
+    const pending=await waitFor(async()=>{
+      const approvals=(await api(`/api/session/tool-approvals?sessionId=${session}`)).value.pendingApprovals;
+      return approvals.find(approval=>approval.turnId===diagnosis.turnId);
+    },'原包工具沿原生权限入口等待审批');
+    const current=(await api(`/api/messages?scope=personal&sessionId=${session}`)).value.canonicalTurns.find(turn=>turn.turnId===diagnosis.turnId);
+    const call=current.items.find(item=>item.tool?.callId===pending.toolCallId)?.tool;
+    assert.equal(call?.name,pending.toolName);
+    assert.deepEqual(call?.arguments,{package:packageName},'只能批准本次隔离验收指定的诊断参数');
+    await page.call('Page.navigate',{url:`${origin}/web.html?scope=personal&sessionId=${session}`});
+    await waitFor(()=>page.evaluate(`(() => {const buttons=[...document.querySelectorAll('.tool-approval .btn--primary')].filter(button=>!button.disabled);if(buttons.length!==1)return false;buttons[0].click();return true;})()`),'用户通过真实原生审批继续诊断');
+    const result=await waitTurn(diagnosis.turnId);
+    await writeFile(join(output,`${name}.json`),JSON.stringify(result,null,2));
+    assert.equal(result.status,'completed',JSON.stringify(result));
+    assert.ok(result.items.some(item=>item.kind==='tool_call'&&item.status==='completed')&&result.modelSteps.length>=2,JSON.stringify(result));
+    const receipt=result.items.find(item=>item.kind==='tool_call').tool.result.output;
+    return {value:receipt.value,text:receipt.content.filter(part=>part.type==='text').map(part=>part.text).join('\n')};
+  };
+  const diagnosed=await diagnose('original-debugging-active','dsh-plugin-debugging');
+  reporter.check('Debugging 原包经真实审批与模型工具调用读取 daemon 当前加载事实',diagnosed.value.ok===true
+    &&diagnosed.value.data.key.packages[0].entryState==='present'&&diagnosed.value.data.key.packages[0].phase==='active'
+    &&(diagnosed.value.data.key.observation.phaseHistogram.failed??0)===0,JSON.stringify(diagnosed));
+  const targetRequest={ecosystem:'dsh',package:'dsh-plugin-release-probe',version:'0.0.7'};
+  const targetPreview=await post('/api/plugins/upstream/preview',targetRequest);
+  const targetList=await post('/api/plugins/upstream/install',{...targetRequest,expectedDigest:targetPreview.candidate.digest});
+  const target=targetList.plugins.find(plugin=>plugin.source.location==='dsh:dsh-plugin-release-probe@0.0.7');
+  const targetPath=`/api/plugins/${target.manifest.id}`;
+  const disabled=await diagnose('original-debugging-disabled','dsh-plugin-release-probe');
+  reporter.check('Debugging 原包将真实停用状态与启动失败区分展示',disabled.value.ok===true
+    &&disabled.value.data.key.packages[0].entryState==='present'&&disabled.value.data.key.packages[0].phase==='disabled',JSON.stringify(disabled));
+  await post(targetPath+'/enable');await post(targetPath+'/authorize',{grants:target.manifest.permissions});
+  await post(targetPath+'/activate');
+  await waitFor(async()=>(await api('/api/plugins')).value.plugins.find(plugin=>plugin.manifest.id===target.manifest.id)?.runtime?.state==='running','故障注入前原包实际运行');
+  await post(targetPath+'/deactivate');
+  const entry=join(work,'state/extensions/packages',target.manifest.id,target.digest,'extension/index.mjs');
+  const saved=entry+'.acceptance-save';
+  await rename(entry,saved);await mkdir(entry);
+  try {
+    await post(targetPath+'/activate');
+    const failure=await waitFor(async()=>{
+      const plugin=(await api('/api/plugins')).value.plugins.find(plugin=>plugin.manifest.id===target.manifest.id);
+      return plugin?.runtime?.state==='failed'&&plugin;
+    },'验收包入口故障到达真实监管状态',45000);
+    const failed=await diagnose('original-debugging-failed','dsh-plugin-release-probe');
+    reporter.check('Debugging 原包的失败诊断保留 daemon 实际原因，其他插件故障不终止诊断器',failed.value.ok===true
+      &&failed.value.data.key.packages[0].phase==='failed'&&failed.value.data.key.packages[0].error===failure.runtime.reason,JSON.stringify(failed));
+    await post(targetPath+'/deactivate');
+  } finally { await rm(entry,{recursive:true,force:true});await rename(saved,entry); }
+  await post(targetPath+'/activate');
+  await waitFor(async()=>(await api('/api/plugins')).value.plugins.find(plugin=>plugin.manifest.id===target.manifest.id)?.runtime?.state==='running','恢复原包入口后重新启用');
+  const recovered=await diagnose('original-debugging-recovered','dsh-plugin-release-probe');
+  reporter.check('Debugging 原包重新读取恢复后的运行事实，不保留旧故障',recovered.value.ok===true&&recovered.text.includes('active')&&!recovered.text.includes('Observed load failure'),JSON.stringify(recovered));
+  await post(targetPath+'/deactivate');await post(targetPath+'/disable');await post(targetPath+'/uninstall');
   await post(path+'/deactivate'); await post(path+'/disable'); await post(path+'/uninstall');
 }
 

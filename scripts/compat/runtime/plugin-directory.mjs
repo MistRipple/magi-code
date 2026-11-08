@@ -7,7 +7,8 @@ export function pluginLifecycle(plugin) {
     : runtime?.state === 'failed' ? 3 : ['starting', 'restarting'].includes(runtime?.state) ? 1
       : runtime?.state === 'stopped' ? 4 : 0;
   const reason = state === 3 ? runtime.reason ?? '插件启动失败，daemon 未提供原因' : undefined;
-  return Object.freeze({ state, async await() { if (reason !== undefined) throw new Error(reason); } });
+  return Object.freeze({ state, ...(reason === undefined ? {} : { _error: reason }),
+    async await() { if (reason !== undefined) throw new Error(reason); } });
 }
 
 export function createPluginDirectory(api, diagnostic) {

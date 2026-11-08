@@ -11,6 +11,9 @@ import { createPluginManager } from './plugin-manager.mjs';
 import { pluginLifecycle } from './plugin-directory.mjs';
 import { dshBundle as bundle } from './plugin-source.mjs';
 import { createProfileProcesses } from './profile-process-host.mjs';
+import { readFileSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { unzipSync } from 'fflate';
 
 const scopes = new AsyncLocalStorage();
 let host;
@@ -48,6 +51,7 @@ export function applyProfileSnapshot(scope, { list, compatibility }) {
   scope.bundles = list.plugins.map(bundle).filter(Boolean);
   scope.original = new Map(scope.bundles.map((item) => [item.name, { ...item, digest: item.plugin.digest }]));
   scope.files = new Map(); scope.dirty = new Set();
+  scope.archives = new Map();
   const rows = scope.bundles.map(({ name, plugin }) => ({ id: plugin.manifest.id, name, disabled: !plugin.enabled }));
   scope.files.set('package.json', JSON.stringify({
     name: 'magi-dsh-profile', private: true,
@@ -60,6 +64,7 @@ export function applyProfileSnapshot(scope, { list, compatibility }) {
   if (scope.compatibility) scope.files.set('compatibility.json', JSON.stringify(scope.compatibility.exemptions));
   for (const { name, version, plugin } of scope.bundles) {
     const path = `node_modules/${name}`;
+    if (plugin.upstreamArchivePath) scope.archives.set(path, { path: plugin.upstreamArchivePath, digest: plugin.digest });
     // 缺失的原包元数据保持缺失，不能从 Magi 的名称/描述拼一份假清单，
     // 否则 engines、peers、仓库和 dsh 声明都会在健康/升级报告里丢失。
     const metadata = plugin.upstreamManifest;
@@ -77,6 +82,28 @@ export function applyProfileSnapshot(scope, { list, compatibility }) {
       // 多层 bundle 声明仍只投影一次这个真实根行，不制造重复运行实例。
       scope.files.set(`${path}/${key}`, dump(index === 0 ? [{ insert: [{ id: plugin.manifest.id, name }] }] : []));
     }
+  }
+}
+
+// 原包文件从当前安装归档按调用懒读取；不生成 node_modules 副本，不依赖
+// 激活时才物化的运行目录。摘要变化只能由下一份 daemon 快照接纳。
+function readArtifact(scope, key) {
+  for (const [root, archive] of scope.archives) {
+    if (key !== root && !key.startsWith(root + '/')) continue;
+    if (!archive.stat) {
+      const bytes = readFileSync(archive.path);
+      if (createHash('sha256').update(bytes).digest('hex') !== archive.digest) throw error('ECONFLICT', '已安装归档与 daemon 摘要不一致，请重新读取插件目录');
+      const stat = statSync(archive.path);
+      const prefix = 'extension/upstream/';
+      const files = unzipSync(bytes, { filter: file => file.name.startsWith(prefix) });
+      for (const [name, data] of Object.entries(files)) {
+        if (name.endsWith('/')) continue;
+        const path = `${root}/${name.slice(prefix.length)}`;
+        if (!scope.files.has(path)) scope.files.set(path, Buffer.from(data));
+      }
+      archive.stat = stat;
+    }
+    return archive.stat;
   }
 }
 
@@ -111,7 +138,8 @@ export function virtualPath(input) {
 function directory(scope, key) { return key === '..' || key === '' || [...scope.files.keys()].some((path) => path.startsWith(`${key}/`)); }
 export function profileRead(path, encoding) {
   const location = virtualPath(path); if (!location) return;
-  const scope = state(), value = scope.files.get(location.key);
+  const scope = state(); readArtifact(scope, location.key);
+  const value = scope.files.get(location.key);
   if (value === undefined) throw error(directory(scope, location.key) ? 'EISDIR' : 'ENOENT', `profile 文件不存在：${path}`, path);
   const data = Buffer.from(value);
   const format = typeof encoding === 'string' ? encoding : encoding?.encoding;
@@ -177,23 +205,23 @@ export function profileRename(from, to) {
 }
 export function profileStat(path) {
   const location = virtualPath(path); if (!location) return;
-  const scope = state(), file = scope.files.get(location.key), dir = directory(scope, location.key);
+  const scope = state(), artifact = readArtifact(scope, location.key), file = scope.files.get(location.key), dir = directory(scope, location.key);
   if (file === undefined && !dir) throw error('ENOENT', `profile 路径不存在：${path}`, path);
-  return { size: file === undefined ? 0 : Buffer.byteLength(file), mode: dir ? 0o40555 : 0o100444, mtimeMs: scope.time, mtime: new Date(scope.time),
+  const time = artifact?.mtimeMs ?? scope.time;
+  return { size: file === undefined ? 0 : Buffer.byteLength(file), mode: dir ? 0o40555 : 0o100444, mtimeMs: time, mtime: new Date(time),
     isFile: () => !dir, isDirectory: () => dir, isSymbolicLink: () => false, isBlockDevice: () => false, isCharacterDevice: () => false, isFIFO: () => false, isSocket: () => false };
 }
 export function profileList(path, options) {
   const location = virtualPath(path); if (!location) return;
-  const scope = state();
+  const scope = state(); readArtifact(scope, location.key);
   if (!directory(scope, location.key)) throw error('ENOENT', `profile 目录不存在：${path}`, path);
   const names = location.key === '..' ? ['magi'] : [...new Set([...scope.files.keys()].filter((key) => !location.key || key.startsWith(location.key + '/')).map((key) => key.slice(location.key ? location.key.length + 1 : 0).split('/')[0]))].sort();
   return names.map((name) => options?.withFileTypes ? { name, parentPath: location.path, path: location.path, ...profileStat(join(location.path, name)) } : options?.encoding === 'buffer' ? Buffer.from(name) : name);
 }
 export function loaderEntries() {
   const scope = state();
-  return [ { options: { id: 'magi-profile', name: 'cordis:include', group: true, config: { path: join(host.root, 'cordis.yml') } } },
-    ...scope.bundles.map(({ name, plugin }) => ({ disabled: !plugin.enabled, options: { id: `magi-profile:${plugin.manifest.id}`, name, disabled: !plugin.enabled },
-      fiber: pluginLifecycle(plugin) })) ];
+  return scope.bundles.map(({ name, plugin }) => ({ disabled: !plugin.enabled,
+    options: { id: plugin.manifest.id, name, disabled: !plugin.enabled }, fiber: pluginLifecycle(plugin) }));
 }
 
 // 原包的“应用当前 profile”操作沿 daemon 唯一监管器完成。安装归档不可变，

@@ -739,6 +739,20 @@ impl PluginManager {
                 .plugins
                 .values()
                 .map(|installed| {
+                    let upstream_manifest = if include_upstream {
+                        self.upstream_manifest(installed)?
+                    } else {
+                        None
+                    };
+                    let upstream_archive_path = if upstream_manifest.is_some() {
+                        Some(
+                            fs::canonicalize(self.root.join(&installed.package_path))?
+                                .to_string_lossy()
+                                .into_owned(),
+                        )
+                    } else {
+                        None
+                    };
                     Ok(PluginInstalledProjection {
                         manifest: self.effective_manifest(&installed.id)?,
                         digest: installed.digest.clone(),
@@ -746,11 +760,8 @@ impl PluginManager {
                         active: installed.active,
                         grants: installed.grants.clone(),
                         source: installed.source.projection(),
-                        upstream_manifest: if include_upstream {
-                            self.upstream_manifest(installed)?
-                        } else {
-                            None
-                        },
+                        upstream_manifest,
+                        upstream_archive_path,
                         // 扩展宿主的运行状态属于 daemon 的 ExtensionRuntime，由 API 层合并，管理器不持有它。
                         runtime: None,
                     })

@@ -801,6 +801,7 @@ export interface PluginInstalled {
   enabled: boolean;
   active: boolean;
   upstreamManifest?: Record<string, unknown>;
+  upstreamArchivePath?: string;
 }
 
 export type PluginRuntimeState = "starting" | "running" | "restarting" | "failed" | "stopped";

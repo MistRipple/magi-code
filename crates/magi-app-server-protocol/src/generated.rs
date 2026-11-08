@@ -1797,6 +1797,10 @@ pub struct PluginInstalled {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "upstreamManifest")]
     pub upstream_manifest: Option<Value>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "upstreamArchivePath")]
+    pub upstream_archive_path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

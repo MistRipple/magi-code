@@ -384,6 +384,7 @@ test('全局插件状态观察来自 daemon 当前目录，其他插件失败不
     ctx.on('internal/status', fiber => {
       const name = fiber.entry?.options?.name;
       if (!name) return;
+      if (fiber.state === 3) assert.ok(typeof fiber._error === 'string' && fiber._error.length > 0, '同步诊断与异步观察必须保留同一个 daemon 故障原因');
       if (fiber.state === 3) fiber.await().catch(error => failures.set(name, error.message));
       else if ([2, 4].includes(fiber.state)) failures.delete(name);
     }, { global: true });
