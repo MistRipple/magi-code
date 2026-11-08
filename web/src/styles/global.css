@@ -83,6 +83,15 @@
   --error-muted: rgba(239, 68, 68, 0.15);
   --info: #3b82f6;
   --info-muted: rgba(59, 130, 246, 0.15);
+  --success-text: var(--success);
+  --warning-text: var(--warning);
+  --error-text: var(--error);
+  --info-text: var(--info);
+  /* 独立提示与浮层需要完整底色，不能透出背后的正文或壁纸。 */
+  --success-bg: color-mix(in srgb, var(--success-text) 12%, var(--magi-canvas));
+  --warning-bg: color-mix(in srgb, var(--warning-text) 12%, var(--magi-canvas));
+  --error-bg: color-mix(in srgb, var(--error-text) 12%, var(--magi-canvas));
+  --info-bg: color-mix(in srgb, var(--info-text) 12%, var(--magi-canvas));
 
   /* Agent 专用颜色 (预设品牌色 + 动态 agent 颜色池) */
   --color-orchestrator: #8b5cf6;

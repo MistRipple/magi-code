@@ -221,9 +221,9 @@
     line-height: 1.4;
     color: var(--foreground-muted);
   }
-  .settings-hint.warning { color: var(--warning); }
-  .settings-hint.error { color: var(--error); }
-  .settings-hint.success { color: var(--success); }
+  .settings-hint.warning { color: var(--warning-text); }
+  .settings-hint.error { color: var(--error-text); }
+  .settings-hint.success { color: var(--success-text); }
 
   /* ------------------------------------------
      设置页共享：卡片 / 行 / 标签 / 状态点
@@ -310,8 +310,8 @@
   }
   /* 长说明（如完全信任、改写上下文）不能被截成胶囊：允许换行并改用圆角矩形。 */
   .settings-chip--wrap { white-space: normal; border-radius: 10px; padding: 3px var(--space-2); min-width: 0; max-width: 100%; overflow-wrap: anywhere; line-height: 1.5; }
-  .settings-chip--ok { color: var(--success); border-color: color-mix(in srgb, var(--success) 40%, transparent); }
-  .settings-chip--warn { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent); }
+  .settings-chip--ok { color: var(--success-text); border-color: color-mix(in srgb, var(--success) 40%, transparent); }
+  .settings-chip--warn { color: var(--warning-text); border-color: color-mix(in srgb, var(--warning) 45%, transparent); }
   .settings-chip--accent { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 45%, transparent); }
   .settings-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 
@@ -320,9 +320,9 @@
   .settings-dot--warn { background: var(--warning); opacity: 1; }
 
   .settings-notice { display: flex; align-items: flex-start; gap: var(--space-2); font-size: var(--text-xs); line-height: 1.5; color: var(--foreground-muted); }
-  .settings-notice--warn { color: var(--warning); }
-  .settings-notice--error { color: var(--error); }
-  .settings-notice--success { color: var(--success); }
+  .settings-notice--warn { color: var(--warning-text); }
+  .settings-notice--error { color: var(--error-text); }
+  .settings-notice--success { color: var(--success-text); }
 
   /* 统计 Tab 覆盖 */
   .stats-section { padding: var(--space-4); }
@@ -439,7 +439,7 @@
   }
 
   /* Skill 操作按钮 */
-  .skill-actions .btn-icon--danger:hover { background: var(--error-muted); border-color: var(--error); color: var(--error); }
+  .skill-actions .btn-icon--danger:hover { background: var(--error-muted); border-color: var(--error-text); color: var(--error-text); }
   .skill-actions .btn-icon:not(.btn-icon--danger) { background: transparent; border: 0; color: var(--foreground-muted); }
   .skill-actions .btn-icon:not(.btn-icon--danger):hover:not(:disabled) { background: var(--primary-muted); border-color: var(--primary); color: var(--primary); }
   .skill-actions .btn-icon:disabled { opacity: 0.5; cursor: not-allowed; }

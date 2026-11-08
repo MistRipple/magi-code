@@ -276,6 +276,12 @@ function applyRootTheme(
     '--vscode-list-activeSelectionForeground': scheme.foreground,
     '--vscode-inputOption-activeBackground': rgba(accent, 0.18),
   };
+  // 状态色同时用于文字、描边及浅底提示，必须在主题表面及其着色背景上可读。
+  // 在外观唯一入口校准，原生组件和隔离插件页面消费同一结果。
+  for (const [name, seed] of Object.entries({ success: '#10b981', warning: '#f59e0b', error: '#ef4444', info: '#3b82f6' })) {
+    const color = readableStatusColor(parseHex(seed), [background, raised, floating]);
+    variables[`--${name}-text`] = toHex(color);
+  }
   for (const [name, value] of Object.entries(variables)) root.style.setProperty(name, value);
   return {
     // Electron 的原生非客户区没有办法读取 Renderer 的壁纸层；使用主题
@@ -312,6 +318,29 @@ function relativeLuminance(color: [number, number, number]): number {
     return channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
   });
   return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+}
+
+function readableStatusColor(
+  seed: [number, number, number],
+  surfaces: [number, number, number][],
+): [number, number, number] {
+  const contrast = (color: [number, number, number]) => Math.min(...surfaces.flatMap(surface =>
+    // 包含原包提示与悬停叠色，校准时不把透明背景当成黑色。
+    [surface, mix(surface, color, 0.24)].map(background => {
+      const a = relativeLuminance(color), b = relativeLuminance(background);
+      return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+    }),
+  ));
+  if (contrast(seed) >= 4.6) return seed;
+  const black: [number, number, number] = [0, 0, 0], white: [number, number, number] = [255, 255, 255];
+  const target = contrast(black) > contrast(white) ? black : white;
+  let low = 0, high = 1;
+  for (let step = 0; step < 10; step += 1) {
+    const amount = (low + high) / 2;
+    if (contrast(mix(seed, target, amount)) >= 4.6) high = amount;
+    else low = amount;
+  }
+  return mix(seed, target, high);
 }
 
 function handleSystemModeChange(): void {

@@ -9,11 +9,13 @@ import { Readable } from 'node:stream';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { launchApp, connectAppPage, connectTarget, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
+import { createPluginThemeCases, activatePluginTheme, measurePluginContrast } from './lib/plugin-theme-acceptance.mjs';
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
 const port = Number(process.env.MAGI_PROFILE_PORT || 38946), cdpPort = Number(process.env.MAGI_PROFILE_CDP_PORT || 9316), origin = `http://127.0.0.1:${port}`;
 const work = await mkdtemp(join(tmpdir(), 'magi-profile-live-')), output = process.env.MAGI_DSH_PROFILE_OUTPUT || join(root, 'target/plugin-acceptance/profile');
 const report = createReporter(), errors = []; let app, page, frame, ui;
+const clipAuditSource = process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE ? await readFile(process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE, 'utf8') : null;
 let failResolution = false, holdResolution = false, rejectedResolutions = 0, targetResolutions = 0;
 const held = new Set();
 // 只使本次 daemon 的候选解析失败；原包、组件和 npm 原字节不替换。
@@ -126,6 +128,7 @@ try {
   // still the per-plugin resource URL, so accepting both target kinds keeps
   // this physical check tied to the actual iframe and avoids a false failure.
   frame=await waitFor(()=>connectTarget(cdpPort,t=>(t.type==='iframe'||t.type==='page')&&t.url===frameUrl,'Mgr 原生页面',errors),'Mgr iframe');
+  const themes=await createPluginThemeCases(api);
   await waitFor(()=>frame.evaluate('document.body.innerText.includes("dsh-plugin-release-probe")'),'原生列表');
   report.check('未经修改的 Mgr 页面展示真实目标插件',true);
   await frame.evaluate(`document.querySelector('.dshpm-search-icon').click();const input=document.querySelector('.dshpm-search-box input');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'release-probe');input.dispatchEvent(new Event('input',{bubbles:true}));`);
@@ -200,6 +203,28 @@ try {
     rejectedResolutions>0&&recovered.digest===beforeFailure.digest&&recovered.enabled===beforeFailure.enabled&&recovered.active===beforeFailure.active
       &&JSON.stringify(recovered.grants)===JSON.stringify(beforeFailure.grants),JSON.stringify({failedFeedback,rejectedResolutions}));
   await frame.evaluate(`Promise.all(document.querySelector('.dshpm-toast-err').getAnimations().map(animation=>animation.finished.catch(()=>{})))`);
+  const themeResults=[];
+  for(const theme of themes.cases) {
+    await activatePluginTheme(api,page,frame,theme.id);
+    const contrast=await measurePluginContrast(frame,'.dshpm-toast-err');
+    report.check(`${theme.id} 原包真实更新失败与恢复说明使用不透明状态底色且文字可读`,
+      contrast.length===1&&contrast.every(item=>item.fill[3]===255&&item.foreground[3]===255&&item.ratio>=4.5),JSON.stringify(contrast));
+    themeResults.push({id:theme.id,contrast});
+    if(theme.material==='immersive') {
+      await page.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:false});
+      const fits=await frame.evaluate(`(() => {const toast=document.querySelector('.dshpm-toast-err'),box=toast.getBoundingClientRect(),close=toast.querySelector('button').getBoundingClientRect();return box.left>=0&&box.right<=innerWidth&&box.top>=0&&box.bottom<=innerHeight&&close.left>=0&&close.right<=innerWidth&&document.documentElement.scrollWidth<=innerWidth;})()`);
+      report.check(`${theme.id} 390px 长错误说明与关闭操作可达`,fits);
+      await writeFile(join(output,`manager-error-${theme.mode}-390.png`),Buffer.from(await ui.screenshot(),'base64'));
+      if(clipAuditSource) {
+        const audit=await frame.evaluate(`(${clipAuditSource})({viewport:true})`);
+        await writeFile(join(output,`manager-error-${theme.mode}-clip.json`),JSON.stringify(audit,null,2));
+        report.check(`${theme.id} 原包错误浮层阴影无裁切`,audit.cut===0,JSON.stringify(audit));
+      }
+      await page.call('Emulation.clearDeviceMetricsOverride');
+    }
+  }
+  await writeFile(join(output,'manager-error-theme-contrast.json'),JSON.stringify(themeResults,null,2));
+  await activatePluginTheme(api,page,frame,themes.original);
   await writeFile(join(output,'manager-update-failed-restored.png'),Buffer.from(await ui.screenshot(),'base64'));
   holdResolution=true;
   const interrupted=api(`/api/plugins/${manager.manifest.id}/routes`,{method:'POST',path:'/api/plugin-manager/update',body:{name:'dsh-plugin-release-probe'}})
@@ -247,6 +272,12 @@ try {
   const updateFeedback=await waitFor(async()=>{const feedback=await frame.evaluate(`Array.from(document.querySelectorAll('.dshpm-toast')).map(node=>({text:node.innerText,error:node.classList.contains('dshpm-toast-err')}))`);return feedback.length&&feedback;},'原包完成更新并显示业务回执',180_000);
   await writeFile(join(output,'update-feedback.json'),JSON.stringify(updateFeedback,null,2));
   report.check('原包更新回执与实际新版一致，不把已经完成的更新误报为未更新',updateFeedback.some(item=>!item.error&&item.text.includes('0.0.8'))&&!updateFeedback.some(item=>item.error),JSON.stringify(updateFeedback));
+  await frame.evaluate(`Promise.all(document.querySelector('.dshpm-toast-ok').getAnimations().map(animation=>animation.finished.catch(()=>{})))`);
+  await waitFor(()=>frame.evaluate(`getComputedStyle(document.querySelector('.dshpm-toast-ok')).opacity==='1'`),'原包成功反馈入场结束，不在淡入中截取验收截图');
+  const successContrast=await measurePluginContrast(frame,'.dshpm-toast-ok');
+  report.check('原包真实在线更新成功回执使用不透明状态底色且文字可读',
+    successContrast.length>0&&successContrast.every(item=>item.fill[3]===255&&item.ratio>=4.5),JSON.stringify(successContrast));
+  await writeFile(join(output,'manager-update-success.png'),Buffer.from(await ui.screenshot(),'base64'));
   await frame.evaluate(`(() => {const card=[...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe');card.querySelector('.dshpm-btn-danger').click();})()`);
   await waitFor(()=>frame.evaluate(`Boolean(document.querySelector('[role=dialog]'))`),'原包卸载确认');
   report.check('卸载确认包含真实包名和已更新版本',await frame.evaluate(`document.querySelector('[role=dialog]').innerText.includes('dsh-plugin-release-probe') && document.querySelector('[role=dialog]').innerText.includes('0.0.8')`));

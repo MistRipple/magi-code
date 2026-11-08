@@ -67,6 +67,8 @@
     '--primary', '--primary-hover', '--primary-foreground', '--primary-muted',
     '--secondary', '--secondary-hover',
     '--success', '--success-muted', '--warning', '--warning-muted', '--error', '--error-muted', '--info', '--info-muted',
+    '--success-bg', '--warning-bg', '--error-bg', '--info-bg',
+    '--success-text', '--warning-text', '--error-text', '--info-text',
     '--code-bg', '--dropdown-bg', '--overlay',
     '--text-xs', '--text-sm', '--text-base', '--text-md', '--text-lg', '--text-xl',
     '--space-1', '--space-2', '--space-3', '--space-4', '--space-5', '--space-6', '--space-8',

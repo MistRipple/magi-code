@@ -147,7 +147,7 @@ await assert.rejects(
 console.log('appearance golden checks passed');
 
 const runtimeAst = ts.createSourceFile('runtime.ts', runtime, ts.ScriptTarget.Latest, true);
-const projectionFunctions = ['applyRootTheme', 'parseHex', 'mix', 'toHex', 'rgba', 'relativeLuminance'];
+const projectionFunctions = ['applyRootTheme', 'parseHex', 'mix', 'toHex', 'rgba', 'relativeLuminance', 'readableStatusColor'];
 const projectionSource = projectionFunctions.map(name => {
   const declaration = runtimeAst.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
   assert.ok(declaration, `missing theme projection ${name}`);
@@ -198,3 +198,29 @@ for (const material of ['clear', 'translucent', 'immersive']) {
   }
 }
 console.log('appearance surface projection scenarios passed');
+
+const rgb = value => value.match(/[\d.]+/g).slice(0, 3).map(Number);
+const fromHex = value => [1, 3, 5].map(index => Number.parseInt(value.slice(index, index + 2), 16));
+const luminance = color => color.map(value => value / 255).map(value => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4)
+  .reduce((sum, value, index) => sum + value * [0.2126, 0.7152, 0.0722][index], 0);
+for (const scheme of [
+  { background: '#FCFCFB', foreground: '#272725' }, { background: '#0B0B0A', foreground: '#E7E7E4' },
+  { background: '#f4ede3', foreground: '#29342c' }, { background: '#17251f', foreground: '#e1efdf' },
+  { background: '#fff0fc', foreground: '#390c31' }, { background: '#353546', foreground: '#f5eeee' },
+]) {
+  for (const material of ['clear', 'translucent', 'immersive']) {
+    const projection = project('dark', { ...scheme, accent: '#40B090', contrast: 60 }, 'blob:test', material);
+    for (const state of ['success', 'warning', 'error', 'info']) {
+      assert.equal(projection[`--${state}`], undefined, '主题校准文字色不得改写既有实心状态控件的填色');
+      const color = fromHex(projection[`--${state}-text`]);
+      for (const surface of [fromHex(scheme.background), rgb(projection['--magi-surface-main']), rgb(projection['--dropdown-bg'])]) {
+        for (const tint of [0, 0.12, 0.15, 0.24]) {
+          const background = surface.map((channel, index) => Math.round(channel * (1 - tint) + color[index] * tint));
+          const values = [luminance(color), luminance(background)].sort((a, b) => a - b);
+          assert.ok((values[1] + 0.05) / (values[0] + 0.05) >= 4.5, `${state} 在 ${scheme.background}/${material}/${tint} 的文字对比度不足`);
+        }
+      }
+    }
+  }
+}
+console.log('appearance status contrast scenarios passed');
