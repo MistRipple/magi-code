@@ -62,7 +62,7 @@
    * 插件页面在自己的文档里把它们写成 CSS 变量，因此明暗切换和自定义主题都自然生效。
    */
   const THEME_TOKENS = [
-    '--background', '--foreground', '--foreground-muted', '--border', '--border-subtle',
+    '--background', '--foreground', '--foreground-secondary', '--foreground-muted', '--border', '--border-subtle',
     '--surface-1', '--surface-2', '--surface-3', '--surface-hover', '--surface-active', '--surface-selected',
     '--primary', '--primary-hover', '--primary-foreground', '--primary-muted',
     '--secondary', '--secondary-hover',
@@ -73,8 +73,6 @@
     '--radius-xs', '--radius-sm', '--radius-md', '--radius-lg', '--radius-xl', '--radius-2xl', '--font-semibold',
     '--shadow-sm', '--shadow-md', '--shadow-lg', '--duration-normal', '--ease-in-out',
     '--scrollbar-thumb', '--scrollbar-thumb-hover',
-    // 设置页的次级文字色：介于正文色与弱化色之间，交互控件（按钮、下拉）的文字用它才清晰。
-    '--ind-foreground-secondary',
     // 主按钮的底色与文字色是一对实心反色；叠层色（--surface-*）是半透明的，不能当文字色用。
     '--btn-primary-bg', '--btn-primary-fg', '--btn-primary-hover-bg', '--magi-canvas',
     '--vscode-font-family', '--vscode-editor-font-family',
@@ -104,8 +102,6 @@
       const settingsScope = getComputedStyle(iframe?.closest('.settings-tab-content') ?? root);
       const radius = settingsScope.getPropertyValue('--ind-radius-card').trim();
       if (radius) tokens['--ind-radius-card'] = radius;
-      const secondary = settingsScope.getPropertyValue('--ind-foreground-secondary').trim();
-      if (secondary) tokens['--ind-foreground-secondary'] = secondary;
     }
     return { mode: root.classList.contains('theme-light') ? 'light' : 'dark', tokens };
   }

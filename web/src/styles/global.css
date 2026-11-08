@@ -42,6 +42,7 @@
   --foreground: var(--vscode-editor-foreground, var(--vscode-foreground, #e5e7eb));
   --foreground-rgb: 229, 231, 235;
   --foreground-muted: var(--vscode-descriptionForeground, #98a2b3);
+  --foreground-secondary: color-mix(in srgb, var(--foreground) 72%, var(--foreground-muted) 28%);
   --border: var(--vscode-panel-border, var(--vscode-widget-border, #273142));
   --glass-bg: rgba(15, 20, 27, 0.85); /* Dark mode default */
   --magi-canvas: var(--background);

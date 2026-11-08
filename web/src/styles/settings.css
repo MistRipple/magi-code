@@ -27,7 +27,7 @@
     --ind-border-control-strong: color-mix(in srgb, var(--border) 88%, transparent);
     --ind-border-separator: color-mix(in srgb, var(--border-subtle) 82%, transparent);
     --ind-foreground: var(--foreground);
-    --ind-foreground-secondary: color-mix(in srgb, var(--foreground) 72%, var(--foreground-muted) 28%);
+    --ind-foreground-secondary: var(--foreground-secondary);
     --ind-foreground-muted: var(--foreground-muted);
     --ind-foreground-soft: var(--foreground-muted);
     --ind-radius-card: 12px;

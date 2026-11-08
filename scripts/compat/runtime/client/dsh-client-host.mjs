@@ -100,14 +100,20 @@ export function startDshClient(options) {
     const root = document.documentElement;
     for (const [name, value] of Object.entries(theme.tokens ?? {})) root.style.setProperty(name, value);
     const t = theme.tokens ?? {};
+    // DSH 的层级色是完整颜色，也会被原包用作反色文字；Magi 的
+    // surface-* 是用于叠加的透明材质，不能直接充当这些公共语义色。
+    const canvas = t['--magi-canvas'] ?? t['--background'];
+    const secondary = t['--foreground-secondary'];
     const alias = {
-      // 上游三级文字色：primary 标题/正文，secondary 控件与次要正文（按钮、下拉都用它，必须清晰），tertiary/dimmed 说明与弱化。
-      // 宿主的“设置页次级文字色”正是这一级；不可用时退回正文色，而不是更淡的弱化色。
-      '--dsw-alias-label-primary': t['--foreground'], '--dsw-alias-label-secondary': t['--ind-foreground-secondary'] ?? t['--foreground'],
-      '--dsw-alias-label-tertiary': t['--foreground-muted'], '--dsw-alias-label-dimmed': t['--foreground-muted'],
+      // secondary/tertiary 都可能承载可读正文与操作；沿共享设置页的文字层级，
+      // 不把 Magi 的弱化色直接用于原包可点击页签。dimmed 保留弱化语义。
+      '--dsw-alias-label-primary': t['--foreground'], '--dsw-alias-label-secondary': secondary,
+      '--dsw-alias-label-tertiary': secondary, '--dsw-alias-label-dimmed': t['--foreground-muted'],
       '--dsw-alias-border-l1': t['--border-subtle'], '--dsw-alias-border-l2': t['--border'],
       '--dsw-alias-bg-base': t['--background'], '--dsw-alias-bg-layer-1': t['--background'],
-      '--dsw-alias-bg-layer-2': t['--dropdown-bg'], '--dsw-alias-bg-layer-3': t['--surface-3'], '--dsw-alias-bg-l1': t['--surface-1'],
+      '--dsw-alias-bg-layer-2': t['--dropdown-bg'],
+      '--dsw-alias-bg-layer-3': canvas,
+      '--dsw-alias-bg-l1': t['--surface-1'],
       '--dsw-alias-brand-primary': t['--primary'], '--dsw-alias-interactive-bg-hover': t['--surface-hover'],
       '--dsw-alias-link': t['--primary'],
       '--dsw-alias-state-success-primary': t['--success'], '--dsw-alias-state-warn-primary': t['--warning'],
@@ -165,13 +171,6 @@ export function startDshClient(options) {
   // 页面只负责内容：顶层容器去掉自带的视口约束与留白，铺满宿主给的内容列。
   // 选择器带 html[data-placement] 与 #root，优先级高于上游的类选择器，因此不依赖 !important；
   // 取值只用宿主下发的令牌，其他位置（placement=page）不受影响。
-  // 实心按钮的文字色：上游把叠层背景别名（半透明，如 bg-layer-3）当文字色用在“实心主色底”的控件上，
-  // 在宿主主题下几乎不可见。这些位置改用宿主主按钮的前景色（与 Magi 原生主按钮同一对反色）。
-  // 只覆盖已知的、底色为 label-primary 的控件；其他叠层背景的用法保持不变。
-  const SOLID_CONTROLS = ['.dsm-btn-primary', '.dsm-workbuddy-device-seg-on'];
-  // 页签是可点击控件，上游却用最淡的“说明”级文字色（label-tertiary），浅色主题下对比度不足 4.5:1。
-  // 交互控件用次级文字色（与按钮同一级）；选中态与悬停态由上游自己的更具体规则覆盖，不受影响。
-  const TAB_CONTROLS = ['.dsm-workbuddy-tab', '.dsm-workbuddy-panel-tab'];
   const embedStyle = document.createElement('style');
   embedStyle.textContent = [
     'html[data-placement="settings"] #root > * {',
@@ -179,8 +178,6 @@ export function startDshClient(options) {
     '  width: 100%; max-width: none; margin: 0; padding: 0; align-items: stretch;',
     '}',
     'html[data-placement="settings"] #root > * > * { max-width: none; }',
-    `html[data-theme] :is(${SOLID_CONTROLS.join(', ')}) { color: var(--btn-primary-fg, var(--magi-canvas, #fff)); }`,
-    `html[data-theme] :is(${TAB_CONTROLS.join(', ')}):not(.dsm-workbuddy-tab-active):not(.dsm-workbuddy-panel-tab-active):not(:hover) { color: var(--dsw-alias-label-secondary); }`,
   ].join('\n');
   document.head.appendChild(embedStyle);
   const applyPlacement = () => {

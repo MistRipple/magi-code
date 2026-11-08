@@ -398,7 +398,10 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
             h('button',{id:'open-sdk-dialog',onClick:()=>setDialog(true)},'Actions'),
             dialog?h(sdk.Modal,{open:true,title:'SDK actions',closeLabel:'Close',onClose:()=>setDialog(false),footer:h(sdk.Button,{
               'data-testid':'sdk-confirm',variant:'primary',onClick:()=>{setText('sdk-confirmed');setDialog(false);}
-            },'Confirm')},'Original shared components'):null,
+            },'Confirm')},h(React.Fragment,null,'Original shared components',
+              h('button',{'data-theme-contrast':'inverse',style:{background:'var(--dsw-alias-label-primary)',color:'var(--dsw-alias-bg-layer-3)'}},'Continue'),
+              h('button',{'data-theme-contrast':'tertiary',style:{background:'var(--magi-canvas)',color:'var(--dsw-alias-label-tertiary)'}},'Details'),
+              h('span',{'data-theme-contrast':'layer',style:{background:'var(--dsw-alias-bg-layer-3)',color:'var(--dsw-alias-label-primary)'}},'Layer content'))):null,
             h('button',{id:'action',onClick:async()=>{
               localStorage.setItem('panel-cache', key); sessionStorage.setItem('panel-session', 'same-client');
               const response=await fetch('/panel-action',{method:'POST',headers:{'content-type':'application/json','x-panel-key':key},body:JSON.stringify({text:key})});
@@ -455,12 +458,43 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
       })()`));
       await snapshot('shared-sdk-dialog');
       const appearance=(await api('/api/appearance/bootstrap')).value;
-      for(const mode of ['light','dark']) {
+      const themeCases=['light','dark'].map(mode=>({id:`builtin.${mode}`,mode}));
+      const wallpaper=appearance.themes.find(theme=>theme.pack.wallpaper)?.pack.wallpaper;
+      assert.ok(wallpaper,'材质验收必须使用实际壁纸，避免半透明未生效的假阳性');
+      for(const mode of ['light','dark']) for(const material of ['clear','translucent','immersive']) {
+        const id=`acceptance.original-${mode}-${material}`;
+        const scheme=mode==='light'?{accent:'#276749',background:'#f4ede3',foreground:'#29342c',contrast:60}
+          :{accent:'#94bf85',background:'#17251f',foreground:'#e1efdf',contrast:60};
         const current=(await api('/api/appearance/bootstrap')).value;
-        await post('/api/appearance/activate',{themeId:`builtin.${mode}`,expectedRevision:current.revision});
-        await waitFor(()=>frame.evaluate(`document.documentElement.dataset.theme===${JSON.stringify(mode)}`),'原页面接收真实主题变更');
-        assert.ok(await frame.evaluate(`(() => {const style=getComputedStyle(document.querySelector('[data-testid=sdk-confirm]'));return style.backgroundColor!=='rgba(0, 0, 0, 0)'&&style.color!==style.backgroundColor;})()`));
+        await post('/api/appearance/themes',{expectedRevision:current.revision,pack:{schemaVersion:1,id,name:`Original UI ${mode} ${material}`,
+          schemePolicy:mode,schemes:{[mode]:scheme},material,wallpaper}});
+        themeCases.push({id,mode,material});
       }
+      const themeResults=[];
+      for(const {id,mode,material} of themeCases) {
+        const current=(await api('/api/appearance/bootstrap')).value;
+        await post('/api/appearance/activate',{themeId:id,expectedRevision:current.revision});
+        await waitFor(()=>page.evaluate(`document.documentElement.dataset.magiThemeId===${JSON.stringify(id)}`),'Magi 应用当前皮肤与材质');
+        await waitFor(()=>frame.evaluate(`document.documentElement.dataset.theme===${JSON.stringify(mode)}`),'原页面接收真实主题变更');
+        const expectedColors=await page.evaluate(`['--magi-canvas','--background'].map(name=>getComputedStyle(document.documentElement).getPropertyValue(name).trim())`);
+        await waitFor(()=>frame.evaluate(`JSON.stringify(['--magi-canvas','--background'].map(name=>getComputedStyle(document.documentElement).getPropertyValue(name).trim()))===${JSON.stringify(JSON.stringify(expectedColors))}`),'原页面接收本次实际颜色与材质，不能仅按深浅模式推断完成');
+        assert.ok(await frame.evaluate(`(() => {const style=getComputedStyle(document.querySelector('[data-testid=sdk-confirm]'));return style.backgroundColor!=='rgba(0, 0, 0, 0)'&&style.color!==style.backgroundColor;})()`));
+        const contrast=await frame.evaluate(`(() => {
+          const context=document.createElement('canvas').getContext('2d',{willReadFrequently:true});
+          const pixel=color=>{context.clearRect(0,0,1,1);context.fillStyle=color;context.fillRect(0,0,1,1);return [...context.getImageData(0,0,1,1).data];};
+          const luminance=rgb=>rgb.slice(0,3).map(value=>value/255).map(value=>value<=0.04045?value/12.92:((value+0.055)/1.055)**2.4).reduce((sum,value,index)=>sum+value*[0.2126,0.7152,0.0722][index],0);
+          return [...document.querySelectorAll('[data-theme-contrast]')].map(element=>{
+            const style=getComputedStyle(element),foreground=pixel(style.color),background=pixel(style.backgroundColor);
+            const values=[luminance(foreground),luminance(background)].sort((a,b)=>a-b);
+            return {kind:element.dataset.themeContrast,foreground,background,ratio:(values[1]+0.05)/(values[0]+0.05)};
+          });
+        })()`);
+        themeResults.push({id,contrast});
+        reporter.check(`${id} 原包语义色支持反色按钮、次级操作和层级背景，无专属 CSS 覆盖`,
+          contrast.length===3&&contrast.every(item=>item.foreground[3]===255&&item.background[3]===255&&item.ratio>=4.5),JSON.stringify(contrast));
+        if(material==='immersive') await snapshot(`original-ui-${mode}-${material}`);
+      }
+      await writeFile(join(output,'original-theme-contrast.json'),JSON.stringify(themeResults,null,2));
       reporter.check('公共 SDK 在原页面保留文档的同时随 Magi 切换深浅主题，主操作持续可见',await frame.evaluate('window.__clientInstance')===clientInstance);
       const currentAppearance=(await api('/api/appearance/bootstrap')).value;
       await post('/api/appearance/activate',{themeId:appearance.activeThemeId,expectedRevision:currentAppearance.revision});

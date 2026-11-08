@@ -331,6 +331,8 @@
 
 【现状·实现】原生页面固定提供随产品发行的公共浏览器模块目录（含官方 UI primitives 和所需语法模块），不再按直接 `require` 的语法出现与否裁剪 SDK；原包可在用户交互后通过注入函数取用相同模块。每份隔离文档从官方 `ICON_SYMBOLS` 安装原始 SVG 图形，主按钮、遮罩、浮层、圆角与动效沿公共主题令牌映射并随 Magi 主题刷新，页面与官方组件都不改写。归档上传的预览、安装和升级按统一 16 MiB 包上限计算 base64 JSON 请求容量，业务层仍核对实际归档大小与摘要，其他接口不放宽默认请求上限。
 
+【现状·实现】次级文字色统一由 Magi 全局 `--foreground-secondary` 定义，设置页和原包页面消费同一令牌，不在翻译器重算。DSH 可用于反色文字的层级色映射到不透明画布；可读正文及页签文字沿共享次级色。已删除 WorkBuddy 专属按钮／页签 CSS 选择器，公共宿主不依据插件类名修正页面。主题来源仍是 Magi 外观服务，原包样式和组件保持原样。
+
 ### 6.2 翻译范围
 
 | 状态 | 来源与 API | 范围 | 原因与必要映射 |
@@ -480,6 +482,9 @@
 
 | 最近核对范围 | 入口 | 结果与边界 |
 | --- | --- | --- |
+| 本轮公共页面主题与运行回归 | `test:electron-plugin-runtime` | 最终源码新构建 macOS arm64 目录包 **115/115**；`target/plugin-acceptance/theme-contract-final/`。独立原页面用通用 DSH 语义色展示反色按钮、次级操作和层级正文，8 种内置／自定义深浅色与真实壁纸材质组合均无透明文字，最低实测对比度约 7.91:1；右栏、390px、原始图片、取消、消息、技能及重启流程同批通过。旧包的初始失败保留于 `theme-product-before/`，中间版本通过记录不计入本轮结果；不据主题验收增加社区业务覆盖率 |
+| 本轮真实 WorkBuddy 原包回归 | `test:electron-workbuddy` | 同一最终目录包，在线 5.20.32 原包 **11/11**；`target/plugin-acceptance/theme-contract-workbuddy/`。原页面、实际 hy3 模型回复、停用撤销和重新激活通过，未启用可选 CLI 专项；原有 CLI／自动回注证据仍单列，不拼接成当前批次通过项 |
+| 本轮静态与共享外观检查 | `test:compat`、Web、发行边界 | 翻译运行时 **103/103**；Web check 0 错误 0 警告，共享外观与布局回归、Electron 单一发行边界及目录包解包自检通过。未运行全仓测试、Windows 或手机真机 |
 | 本轮翻译运行时回归 | `npm run test:compat` | 103/103；包括 GitHub 来源解析、目录与 profile 来源一致；新增同步消息真实回执、失败不提交、来源校验、失效引用、工具与命令共享消息端口；其他原有契约保持通过。不能据测试数量推导生态支持率 |
 | 本轮 npm／GitHub 原包管理 | `test:electron-dsh-management` | 新构建 macOS arm64 目录包 **30/30**；`target/plugin-acceptance/github-product-final/`。Share 0.2.5 原页面实际导入 GitHub Health 3.0.5，保留来源并在线升至 3.0.6；固定提交预览、摘要授权、版本失败保留运行实例、重启和卸载通过。Market 1.2.2 原包 Node 辅助进程实际从 GitHub 安装、HTTPS Git 更新与失败保留通过；Market Git 的整页按钮未覆盖。原 npm Share／Upgrader／Release Probe 管理流程同批通过。390px 确认固定可达、无横向溢出，桌面审计 `cut=0`；不代表 Health 全部修复业务、其他 Git 服务或手机真机 |
 | 本轮目录包中断恢复 | `test:electron-plugin-install-recovery` | 新构建 macOS arm64 目录包 **10/10**；`target/plugin-acceptance/github-install-recovery-final/`。同原解析、提交后等待、完成回执三个断进程位置，npm 机制夹具实际业务恢复；不据此宣称所有 Git 下载与掉电阶段均已验证 |
