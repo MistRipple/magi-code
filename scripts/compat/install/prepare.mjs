@@ -134,7 +134,7 @@ export async function prepareDsh(options) {
   let clientAnalysis = null;
   if (client) {
     clientAnalysis = analyzeNativeClient({ upstreamDir: root, pkg, sharedRoot: options.sharedRoot });
-    const assets = copyBrowserAssets(client.file, COMPAT_DIR, join(options.outDir, 'ui'));
+    const assets = copyBrowserAssets(COMPAT_DIR, join(options.outDir, 'ui'));
     writeFileSync(join(options.outDir, 'ui/client.js'), business.code);
     const views = clientViews(clientAnalysis.mounted, manifest.name);
     manifest.contributions.views = views.map(({ slot, ...view }) => view);

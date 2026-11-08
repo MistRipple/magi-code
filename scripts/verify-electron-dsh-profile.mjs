@@ -8,7 +8,7 @@ import { launchApp, connectAppPage, connectTarget, pageTools, waitFor, createRep
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
 const port = Number(process.env.MAGI_PROFILE_PORT || 38946), cdpPort = Number(process.env.MAGI_PROFILE_CDP_PORT || 9316), origin = `http://127.0.0.1:${port}`;
-const work = await mkdtemp(join(tmpdir(), 'magi-profile-live-')), output = join(root, 'target/plugin-acceptance/profile');
+const work = await mkdtemp(join(tmpdir(), 'magi-profile-live-')), output = process.env.MAGI_DSH_PROFILE_OUTPUT || join(root, 'target/plugin-acceptance/profile');
 const report = createReporter(), errors = []; let app, page, frame, ui;
 await mkdir(output, { recursive: true });
 async function api(path, body) {
@@ -58,6 +58,14 @@ try {
   frame=await waitFor(()=>connectTarget(cdpPort,t=>(t.type==='iframe'||t.type==='page')&&t.url===frameUrl,'Mgr 原生页面',errors),'Mgr iframe');
   await waitFor(()=>frame.evaluate('document.body.innerText.includes("dsh-plugin-release-probe")'),'原生列表');
   report.check('未经修改的 Mgr 页面展示真实目标插件',true);
+  await frame.evaluate(`document.querySelector('.dshpm-search-icon').click();const input=document.querySelector('.dshpm-search-box input');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'release-probe');input.dispatchEvent(new Event('input',{bubbles:true}));`);
+  await waitFor(()=>frame.evaluate(`document.querySelectorAll('.dshpm-card').length===1 && document.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe'`),'原包搜索过滤到真实目标');
+  report.check('原包搜索按输入过滤真实安装目录',true);
+  await frame.evaluate(`document.querySelector('.dshpm-search-clear').click();document.querySelectorAll('.dshpm-seg-btn')[1].click();`);
+  await waitFor(()=>frame.evaluate(`document.querySelector('.dshpm-root')?.classList.contains('is-cols-2')`),'原包两列布局');
+  await frame.evaluate(`window.__acceptanceDocument=true;location.reload();`);
+  await waitFor(()=>frame.evaluate(`window.__acceptanceDocument===undefined && document.querySelector('.dshpm-root')?.classList.contains('is-cols-2')`),'重开原包页面恢复布局偏好');
+  report.check('原包布局偏好在真实隔离页面重载后恢复',true);
   await writeFile(join(output,'manager.png'),Buffer.from(await ui.screenshot(),'base64'));
   // 只在本次隔离状态根阻止已校验原包的物化，不修改 npm 原包或业务代码。
   await route('toggle',{name:'dsh-plugin-release-probe',disable:true});
@@ -92,16 +100,40 @@ try {
   await waitFor(()=>frame.evaluate('!document.querySelector(".dshpm-state.is-err")'),'恢复后原包正常卡片');
   report.check('修复后沿原包重新启用恢复实际运行，原包页面清除故障',true);
   await writeFile(join(output,'manager-recovered.png'),Buffer.from(await ui.screenshot(),'base64'));
-  const upgraded=await route('update',{name:'dsh-plugin-release-probe'});
+  await waitFor(()=>frame.evaluate(`Boolean([...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe')?.querySelector('.dshpm-btn-update'))`),'原包显示在线更新入口',60_000);
+  await frame.evaluate(`const card=[...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe');card.querySelector('.dshpm-btn-update').click();`);
+  await waitFor(()=>frame.evaluate(`Boolean(document.querySelector('[role=dialog]'))`),'原包更新确认');
+  report.check('原包更新确认显示目标名称和实际新版',await frame.evaluate(`document.querySelector('[role=dialog]').innerText.includes('dsh-plugin-release-probe') && document.querySelector('[role=dialog]').innerText.includes('0.0.8')`));
+  await writeFile(join(output,'manager-update-confirm.png'),Buffer.from(await ui.screenshot(),'base64'));
+  await frame.evaluate(`[...document.querySelectorAll('[role=dialog] button')].find(button=>/^(更新|Update)$/.test(button.innerText.trim())).click();`);
+  await waitFor(async()=>(await current()).manifest.version==='0.0.8','原包确认按钮完成在线更新',180_000);
   const after=await current();
-  report.check('原包 dsh plugin add 调用在线翻译升级，无 PATH CLI 或代码替换',upgraded.updated===true&&upgraded.version==='0.0.8'&&after.manifest.version==='0.0.8');
+  report.check('原包确认按钮在线翻译升级，无 PATH CLI 或代码替换',after.manifest.version==='0.0.8');
   await waitFor(async()=>(await current()).runtime?.state==='running','升级后真实运行',120_000);
   report.check('已获用户授权的管理插件沿原生授权入口激活新版',after.active&&after.grants.length>0);
-  await route('uninstall',{name:'dsh-plugin-release-probe'});
+  await waitFor(()=>frame.evaluate(`Boolean([...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe')?.innerText.includes('0.0.8'))`),'原包页面显示更新结果');
+  await frame.evaluate(`const card=[...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe');card.querySelector('.dshpm-btn-danger').click();`);
+  await waitFor(()=>frame.evaluate(`Boolean(document.querySelector('[role=dialog]'))`),'原包卸载确认');
+  report.check('卸载确认包含真实包名和已更新版本',await frame.evaluate(`document.querySelector('[role=dialog]').innerText.includes('dsh-plugin-release-probe') && document.querySelector('[role=dialog]').innerText.includes('0.0.8')`));
+  await writeFile(join(output,'manager-uninstall-confirm.png'),Buffer.from(await ui.screenshot(),'base64'));
+  await frame.evaluate(`[...document.querySelectorAll('[role=dialog] button')].find(button=>/^(卸载|Uninstall)$/.test(button.innerText.trim())).click();`);
+  await waitFor(async()=>!await current(),'原包确认按钮完成卸载',60_000);
   report.check('原包 dsh plugin remove 调用真正停止并卸载目标',!await current());
   const location=join(work,'state/extensions/data',manager.manifest.id,'profiles/magi');
   report.check('profile 仅为调用投影，未落盘第二份安装注册表',!await access(location).then(()=>true,()=>false));
   report.check('真实 Electron 与原包页面无未捕获异常',errors.length===0,errors.join('\n'));
   console.log(report.summary());
-} catch(error) { report.results.push({name:'profile 原包验收',ok:false,detail:error.stack??String(error)});console.error(error);process.exitCode=1;if(ui)await writeFile(join(output,'failure.png'),Buffer.from(await ui.screenshot(),'base64')).catch(()=>{}); }
+} catch(error) {
+  report.results.push({name:'profile 原包验收',ok:false,detail:error.stack??String(error)});
+  console.error(error);process.exitCode=1;
+  // 记录原包所见的真实运行库，不能把无异常但缺失的确认操作算成通过。
+  if(frame) {
+    const diagnostics=await frame.evaluate(`(() => {
+      const ui=window.__MAGI_DSH_MODULES__?.['@deepseek-ai/dsh-client-ui-primitives'];
+      return {moduleLoaded:Boolean(ui),exports:Object.fromEntries(['Modal','Button'].map(name=>[name,{type:typeof ui?.[name],reactType:String(ui?.[name]?.$$typeof ?? '')}])),dialogVisible:Boolean(document.querySelector('[role=dialog]'))};
+    })()`).catch(()=>null);
+    await writeFile(join(output,'ui-modules.json'),JSON.stringify(diagnostics,null,2));
+  }
+  if(ui)await writeFile(join(output,'failure.png'),Buffer.from(await ui.screenshot(),'base64')).catch(()=>{});
+}
 finally {await writeFile(join(output,'results.json'),JSON.stringify({checks:report.results,errors,stateRoot:join(work,'state')},null,2));frame?.close();page?.close();if(app){await writeFile(join(output,'electron.log'),app.log.join(''));await app.stop();}}

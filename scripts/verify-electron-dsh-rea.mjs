@@ -11,7 +11,7 @@ const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-
 const reaBin = process.env.MAGI_REA_BIN_DIR || join(root, 'target/plugin-acceptance/rea-prerequisite/node_modules/.bin');
 const port = 38940, cdpPort = 9310, origin = `http://127.0.0.1:${port}`;
 const work = await mkdtemp(join(tmpdir(), 'magi-rea-live-'));
-const output = join(root, 'target/plugin-acceptance/dsh-rea');
+const output = process.env.MAGI_REA_OUTPUT || join(root, 'target/plugin-acceptance/dsh-rea');
 const report = createReporter(), errors = [];
 let app, page, frame, ui, pluginId;
 await mkdir(output, { recursive: true });

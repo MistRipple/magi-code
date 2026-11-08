@@ -1,7 +1,7 @@
 use crate::{errors::ApiError, state::ApiState};
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{
         Response,
@@ -29,6 +29,8 @@ use tokio_stream::wrappers::BroadcastStream;
 
 /// 资源订阅检查插件是否仍激活并持有授权的间隔；失效后立即关闭订阅。
 const RESOURCE_SUBSCRIPTION_RECHECK: Duration = Duration::from_millis(500);
+/// JSON 上传承载合法归档的 base64（每三字节占四字符），另留有界元数据空间。
+const MAX_INSTALL_REQUEST_BYTES: usize = MAX_PACKAGE_BYTES.div_ceil(3) * 4 + 64 * 1024;
 
 mod center;
 mod download;
@@ -88,9 +90,18 @@ pub fn routes() -> Router<ApiState> {
             "/plugins/{id}/settings",
             get(read_settings).put(write_settings),
         )
-        .route("/plugins/preview", post(preview))
-        .route("/plugins/install", post(install))
-        .route("/plugins/upgrade", post(upgrade))
+        .route(
+            "/plugins/preview",
+            post(preview).layer(DefaultBodyLimit::max(MAX_INSTALL_REQUEST_BYTES)),
+        )
+        .route(
+            "/plugins/install",
+            post(install).layer(DefaultBodyLimit::max(MAX_INSTALL_REQUEST_BYTES)),
+        )
+        .route(
+            "/plugins/upgrade",
+            post(upgrade).layer(DefaultBodyLimit::max(MAX_INSTALL_REQUEST_BYTES)),
+        )
         .route("/plugins/{id}/enable", post(enable))
         .route("/plugins/{id}/authorize", post(authorize))
         .route("/plugins/{id}/activate", post(activate))
@@ -1033,6 +1044,54 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let (_, again) = post_json(&state, "/plugins/preview", request(None)).await;
         assert_eq!(again["operation"], "unchanged");
+    }
+
+    #[tokio::test]
+    async fn archive_upload_limits_follow_package_contract_for_preview_install_and_upgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let state = bare_state(root.path());
+        for (version, operation) in [("1.0.0", "install"), ("1.1.0", "upgrade")] {
+            let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+            let mut manifest = serde_json::to_value(package().manifest()).unwrap();
+            manifest["version"] = version.into();
+            for (name, bytes) in [
+                ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
+                ("ui/payload.css", vec![b' '; 2 * 1024 * 1024]),
+            ] {
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(&bytes).unwrap();
+            }
+            let archive = writer.finish().unwrap().into_inner();
+            assert!(archive.len() < MAX_PACKAGE_BYTES);
+            let mut request = serde_json::json!({
+                "source": "local:public-sdk.zip",
+                "archiveBase64": base64::engine::general_purpose::STANDARD.encode(archive),
+            });
+            let (status, preview) = post_json(&state, "/plugins/preview", request.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{preview}");
+            assert_eq!(preview["operation"], operation);
+            request["expectedDigest"] = preview["digest"].clone();
+            let (status, result) =
+                post_json(&state, &format!("/plugins/{operation}"), request).await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+        }
+        for uri in ["/plugins/preview", "/plugins/install", "/plugins/upgrade"] {
+            let response = routes()
+                .with_state(state.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(vec![b' '; MAX_INSTALL_REQUEST_BYTES + 1]))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+        }
     }
 
     async fn active_resource_state() -> (ApiState, tempfile::TempDir) {

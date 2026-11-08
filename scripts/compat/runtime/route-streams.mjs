@@ -91,7 +91,7 @@ export function createRouteStreams(find, { maxStreams = 8, maxBytes = 2 * 1024 *
       } else {
         const req = makeRouteRequest(input, controller.signal, { autoDestroy: false });
         const res = makeRouteResponse(end, { headers: publishHeaders, chunk: (bytes) => enqueue(decoder.write(bytes)) });
-        controller.signal.addEventListener('abort', () => { if (res.writable) { res.writable = false; res.emit('close'); } }, { once: true });
+        controller.signal.addEventListener('abort', () => res.destroy(), { once: true });
         await definition.handler(req, res);
       }
     }).catch(fail);

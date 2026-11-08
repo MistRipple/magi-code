@@ -37,7 +37,10 @@ export function makeRouteRequest(input, signal, options = {}) {
   const headers = routeHeaders(input.headers);
   req.headers = { ...headers, host: '127.0.0.1', ...(hasBody ? { 'content-type': headers['content-type'] ?? 'application/json', 'content-length': String(payload.length) } : {}) };
   req.socket = { localAddress: '127.0.0.1', remoteAddress: '127.0.0.1' };
-  signal.addEventListener('abort', () => req.destroy(), { once: true });
+  const abort = () => req.destroy();
+  signal.addEventListener('abort', abort, { once: true });
+  req.once('close', () => signal.removeEventListener('abort', abort));
+  if (signal.aborted) abort();
   return req;
 }
 
@@ -75,6 +78,14 @@ export function makeRouteResponse(onEnd, streaming) {
     getHeader(key) { return headers[key.toLowerCase()]; },
     flushHeaders() { res.headersSent = true; publishHeaders(); },
     write(chunk) { if (ended) return false; res.headersSent = true; publishHeaders(); push(chunk); return true; },
+    destroy() {
+      if (ended) return res;
+      ended = true;
+      res.writable = false;
+      chunks.length = 0;
+      emitter.emit('close');
+      return res;
+    },
     end(chunk) {
       if (ended) return res;
       publishHeaders();
@@ -112,6 +123,7 @@ export function routeResult({ status, contentType, body }) {
  */
 export async function runRoute(definition, input, execContext) {
   const signal = execContext.signal;
+  signal.throwIfAborted();
   if (typeof definition.resource === 'function') {
     if (input.method !== 'GET' && input.method !== 'HEAD') {
       return { status: 405, contentType: 'application/json', body: { error: 'method not allowed' } };
@@ -124,13 +136,18 @@ export async function runRoute(definition, input, execContext) {
   }
   return await new Promise((resolve, reject) => {
     const req = makeRouteRequest(input, signal);
-    const res = makeRouteResponse((done) => resolve(routeResult(done)));
-    signal.addEventListener('abort', () => {
-      res.emit('close');
+    const res = makeRouteResponse((done) => {
+      signal.removeEventListener('abort', abort);
+      req.destroy();
+      resolve(routeResult(done));
+    });
+    const abort = () => {
+      res.destroy();
       reject(Object.assign(new Error('路由调用已取消'), { kind: 'Cancelled' }));
-    }, { once: true });
+    };
+    signal.addEventListener('abort', abort, { once: true });
     Promise.resolve()
-      .then(() => definition.handler(req, res))
+      .then(() => { signal.throwIfAborted(); return definition.handler(req, res); })
       .catch((error) => {
         // 与 DSH 的 webserver 一致：处理器抛错回 400，而不是让宿主进程失败。
         if (!res.headersSent) {

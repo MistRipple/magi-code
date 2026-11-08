@@ -471,6 +471,7 @@ pub(crate) fn event_is_user_global(event: &EventEnvelope) -> bool {
     matches!(
         event.event_type.as_str(),
         "model.context_window.updated"
+            | "appearance.changed"
             | "mcp.activity"
             | "plugin.registry.changed"
             | "workspace.registry.changed"
@@ -701,6 +702,27 @@ mod tests {
             &event,
             Some(&SessionId::new("session-a"))
         ));
+    }
+
+    #[test]
+    fn appearance_changes_reach_every_workspace_and_session_scope() {
+        let state = test_state();
+        let event = EventEnvelope::domain(
+            EventId::new("event-global-appearance"),
+            "appearance.changed",
+            json!({"revision": 2, "activeThemeId": "builtin.light"}),
+        );
+        for scope in [
+            EventStreamScope::Personal,
+            EventStreamScope::Workspace(workspace_id("workspace-a")),
+        ] {
+            assert!(event_matches_scope(
+                &state,
+                &event,
+                &scope,
+                Some(&SessionId::new("session-a"))
+            ));
+        }
     }
 
     #[test]

@@ -95,7 +95,7 @@ ui/…                       视图页面与静态资源，按需
 - `extension/index.mjs`；
 - `ui/` 下扩展名为 `html`、`css`、`js`、`mjs`、`json`、`svg`、`png`、`jpg`、`jpeg`、`webp`、`gif`、`avif`、`bmp`、`ico`、`woff`、`woff2` 的文件。
 
-文本文件必须是 UTF-8。限制：整包不超过 16 MiB，展开后不超过 32 MiB，最多 512 个文件，单文件不超过 4 MiB；不得有符号链接、可执行文件、原生程序或 WASM、路径穿越。
+文本文件必须是 UTF-8。限制：整包不超过 16 MiB，展开后不超过 32 MiB，最多 512 个文件，单文件不超过 4 MiB；不得有符号链接、可执行文件、原生程序或 WASM、路径穿越。预览、安装和升级的 JSON 上传容量按归档的 base64 长度另加 64 KiB 元数据计算；这不增加归档本身的大小上限。
 
 清单字段：
 
@@ -168,12 +168,15 @@ ui/…                       视图页面与静态资源，按需
 2. 页面发请求：`parent.postMessage({ channel, instanceId, type: 'request', requestId, operation, ...字段 }, '*')`。
 3. 宿主回复 `{ type: 'response', requestId, ok, result | error }`。
 
+在途 `route.call` 可发送 `{ channel, instanceId, type: 'cancel', requestId }`，停止对应路由的等待并向后台传播取消。身份校验与原请求相同，只作用于本份文档仍在途的请求；已完成或未知 ID 无操作。取消不是业务回滚，已经提交的设置、安装或外部副作用仍以实际结果为准；写入操作不能据停止等待推断未提交。文档关闭统一回收在途路由，旧回执不能更新新文档。DSH 原页面的 `fetch` 在两种输入形式（`init.signal`、`Request.signal`）下使用此公共通道，取消后以 `AbortError`（或 signal 的自定义 reason）结束，其他并发请求继续运行。
+
 | `operation` | 字段 | `result` |
 | --- | --- | --- |
 | `resource.read` | `resourceId` | `{ version, value }`（从未写过时是 `{ version: 0, value: null }`） |
 | `resource.write` | `resourceId`、`expectedVersion`、`value` | 新的 `{ version, value }`；版本过期时 `ok: false` |
 | `resource.subscribe` | `resourceId` | 无；之后资源每次变化宿主推送 `{ type: 'event', resourceId, resource }`，订阅失败（停用、撤权、升级）推送 `{ type: 'event', resourceId, error }` |
 | `settings.read` / `settings.write` | `expectedVersion`、`value`（写） | `{ version, value }` |
+| `route.call` | `method`、`path`、可选 `query`、`headers`、`body` | `{status,contentType?,body?}`；只可调用本插件声明的后端路由 |
 | `composer.snapshot` | 无 | `{sessionId,attachmentIds,writable}`；只包含当前文档接纳的图片 ID，之后宿主按状态变化推送 `{type:'composer',snapshot}` |
 | `composer.addImages` | `sessionId`、`images:[{dataUrl,name,size}]` | `{accepted,ids,snapshot}`；等待输入框实际接纳，最多 5 张且每张 10 MiB，容量不足时整批返回 `accepted:false`，坏图或失效身份明确失败 |
 | `composer.removeImage` | `sessionId`、`id` | `{removed,snapshot}`；只允许本页面文档添加的图片 |

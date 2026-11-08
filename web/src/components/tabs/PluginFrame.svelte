@@ -70,7 +70,9 @@
     '--code-bg', '--dropdown-bg', '--overlay',
     '--text-xs', '--text-sm', '--text-base', '--text-md', '--text-lg', '--text-xl',
     '--space-1', '--space-2', '--space-3', '--space-4', '--space-5', '--space-6', '--space-8',
-    '--radius-md', '--radius-lg', '--font-semibold',
+    '--radius-xs', '--radius-sm', '--radius-md', '--radius-lg', '--radius-xl', '--radius-2xl', '--font-semibold',
+    '--shadow-sm', '--shadow-md', '--shadow-lg', '--duration-normal', '--ease-in-out',
+    '--scrollbar-thumb', '--scrollbar-thumb-hover',
     // 设置页的次级文字色：介于正文色与弱化色之间，交互控件（按钮、下拉）的文字用它才清晰。
     '--ind-foreground-secondary',
     // 主按钮的底色与文字色是一对实心反色；叠层色（--surface-*）是半透明的，不能当文字色用。
@@ -156,10 +158,10 @@
       send({ type: 'composer', snapshot: { sessionId: null, attachmentIds: [], writable: false } }, expectedInstance);
     });
   }
-  const routeControllers = new Set<AbortController>();
+  const routeControllers = new Map<string, AbortController>();
 
   function releaseRoutes(): void {
-    for (const controller of routeControllers) controller.abort();
+    for (const controller of routeControllers.values()) controller.abort();
     routeControllers.clear();
     for (const [id, owner] of activeStreams) {
       void callPluginRoute(owner, { method: 'POST', path: STREAM_ROUTE, body: { action: 'close', id } }).catch(() => {});
@@ -204,8 +206,13 @@
   async function handleMessage(event: MessageEvent): Promise<void> {
     if (destroyed || (event.origin !== resourceOrigin && event.origin !== 'null')
       || event.source !== iframe?.contentWindow || !event.data || event.data.channel !== 'magi-plugin-v1'
-      || event.data.instanceId !== instanceId || event.data.type !== 'request') return;
+      || event.data.instanceId !== instanceId) return;
     const requestId = typeof event.data.requestId === 'string' ? event.data.requestId : '';
+    if (event.data.type === 'cancel') {
+      routeControllers.get(requestId)?.abort();
+      return;
+    }
+    if (event.data.type !== 'request') return;
     const callingPluginId = pluginId;
     const expectedInstance = instanceId;
     const operation = event.data.operation;
@@ -278,7 +285,8 @@
           if (stream.action === 'open' && activeStreams.size >= 8) throw new Error('插件事件连接超过上限');
         }
         const controller = new AbortController();
-        routeControllers.add(controller);
+        if (routeControllers.has(requestId)) return;
+        routeControllers.set(requestId, controller);
         let routed;
         try { routed = await callPluginRoute(callingPluginId, {
           method: event.data.method,
@@ -287,10 +295,10 @@
           ...(event.data.headers === undefined ? {} : { headers: event.data.headers }),
           ...(event.data.body === undefined ? {} : { body: event.data.body }),
         }, controller.signal); }
-        finally { routeControllers.delete(controller); }
+        finally { if (routeControllers.get(requestId) === controller) routeControllers.delete(requestId); }
         if (stream?.action === 'open' && routed.status === 200 && typeof (routed.body as { id?: unknown })?.id === 'string') {
           const id = (routed.body as { id: string }).id;
-          if (expectedInstance !== instanceId) {
+          if (expectedInstance !== instanceId || controller.signal.aborted) {
             void callPluginRoute(callingPluginId, { method: 'POST', path: STREAM_ROUTE, body: { action: 'close', id } }).catch(() => {});
             return;
           }

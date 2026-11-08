@@ -2400,6 +2400,22 @@ mod tests {
     }
 
     #[test]
+    fn appearance_changes_reach_bound_app_server_subscriptions() {
+        let subscription = EventSubscription {
+            active: true,
+            session_id: Some(SessionId::new("session-1")),
+            workspace_id: Some(WorkspaceId::new("workspace-1")),
+            after_sequence: 0,
+        };
+        let appearance = EventEnvelope::domain(
+            EventId::new("event-global-appearance"),
+            "appearance.changed",
+            json!({"revision": 2, "activeThemeId": "builtin.light"}),
+        );
+        assert!(event_matches(&appearance, &subscription));
+    }
+
+    #[test]
     fn external_activity_and_approvals_reach_other_session_subscriptions() {
         let subscription = EventSubscription {
             active: true,

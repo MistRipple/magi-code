@@ -21,12 +21,13 @@ const compat = join(resources, 'daemon/compat');
 const cdpPort = Number(process.env.MAGI_PLUGIN_RUNTIME_CDP_PORT || 9307);
 const daemonPort = Number(process.env.MAGI_PLUGIN_RUNTIME_PORT || 38937);
 const origin = `http://127.0.0.1:${daemonPort}`;
-const output = join(root, 'target/plugin-acceptance/runtime');
+const output = process.env.MAGI_PLUGIN_RUNTIME_OUTPUT || join(root, 'target/plugin-acceptance/runtime');
 const work = await mkdtemp(join(tmpdir(), 'magi-runtime-live-'));
 const run = promisify(execFile);
 const reporter = createReporter();
 const errors = [];
 const appLogs = [];
+const clipAuditSource = process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE ? await readFile(process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE, 'utf8') : null;
 let app, page, frame, ui, pluginId, startupGate;
 const heldStarts = new Set();
 await mkdir(output, { recursive: true });
@@ -229,12 +230,17 @@ async function verifyOriginalSkill(session, waitTurn) {
   await waitFor(async()=>(await activeSkills()).some(entry=>entry.id===skill.id),'重新启用恢复同一技能身份');
   const bootstrap=(await api(`/api/settings/bootstrap?scope=personal&sessionId=${encodeURIComponent(session)}`)).value;
   reporter.check('重新激活重新注册技能，不写入本地技能配置',!bootstrap.skillsConfig.instructionSkills.some(entry=>entry.skillId===skill.id||entry.name==='dsh-plugin-debugging'));
+  // 驱动用 SIGTERM 停进程，先卸载文档，遵守正式退出先关窗口再停 daemon 的顺序。
+  // 关闭 CDP socket 本身不会销毁 Renderer，残留轮询会把验收器杀后台误报为产品错误。
+  await page.call('Page.navigate',{url:'about:blank'});
+  await waitFor(()=>page.evaluate('location.href==="about:blank"'),'重启前释放旧 Renderer 文档');
   page.close();
   await app.stop();
   await waitFor(async()=>!await fetch(`${origin}/health`).then(()=>true,()=>false),'关闭后 daemon 完成退出');
   app = startApp();
   page = await waitFor(()=>connectAppPage(cdpPort,daemonPort,errors),'同一状态根重新启动工作台',60_000);
   ui = pageTools(page);
+  await waitFor(()=>page.evaluate(`Boolean(document.documentElement.dataset.magiThemeId && document.querySelector('[data-testid=sidebar-settings]'))`),'重启后的原生窗口初始化完成');
   await waitFor(async()=>(await activeSkills()).some(entry=>entry.id===skill.id&&entry.instruction===body&&entry.description===skill.description),'重启后原包重新发布技能',120_000);
   const resumed = await post('/api/session/turn',{scope:'personal',sessionId:session,text:'verify skill after restart',skillName:skill.id,requestId:'original-skill-restart',userMessageId:'original-skill-restart-user'});
   const resumedTurn = await waitTurn(resumed.turnId);
@@ -280,14 +286,35 @@ export async function apply(ctx, config) {
     res.setHeader('content-type','application/json');
     res.end(JSON.stringify({key:req.headers['x-panel-key'], result:String(data.text).toUpperCase(),live:clients.size}));
   }});
+  const calls = new Map();
+  ctx.webServer.register({path:'/slow-action',handler(req,res){
+    const name=req.headers['x-call-id'];
+    const call={state:'running',res};calls.set(name,call);
+    const timer=setTimeout(()=>res.end('deadline'),30000);
+    res.on('close',()=>{clearTimeout(timer);if(call.state==='running')call.state='cancelled';});
+  }});
+  ctx.webServer.register({path:'/call-state',resource:()=>Response.json(Object.fromEntries([...calls].map(([name,call])=>[name,call.state])))});
+  ctx.webServer.register({path:'/complete-call',handler:async(req,res)=>{
+    let name='';for await(const chunk of req)name+=chunk;
+    const call=calls.get(name);call.state='completed';call.res.end('completed:'+name);res.end('ok');
+  }});
 }`);
   await writeFile(join(upstream, 'client.js'), `
 window.__ModuleLoader__.load({id:'native-panels',factory(require){
   const React=require('react'), h=React.createElement;
+  const getModules=()=>require;
   function attach(c,scope,ids) { const input=c.conversation.input.for(scope); return input.addAttachments(ids); }
   return { async apply(ctx) {
     await Promise.resolve();
     window.__clientInstance = String(Math.random());
+    window.__calls={};
+    window.__startCall=(name,asRequest)=>{
+      const controller=new AbortController();
+      const init={headers:{'x-call-id':name},signal:controller.signal};
+      const task=asRequest?fetch(new Request(new URL('/slow-action',document.baseURI),init)):fetch('/slow-action',init);
+      const call={controller,state:'waiting'};window.__calls[name]=call;
+      task.then(response=>response.text()).then(value=>{call.state=value;},error=>{call.state=error.name;});
+    };
     window.__composer = ctx.magiComposer;
     window.__dshAdd=async(file)=>{
       const sessionId=ctx.sessions.list.getSnapshot().ids[0],scope=ctx.sessions.scope(sessionId);
@@ -307,12 +334,18 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
         ctx.slots.register({name:'sidebar.right.pane.tab',key}, () => {
           const [text,setText]=React.useState(key);
           const [pulse,setPulse]=React.useState('waiting');
+          const [dialog,setDialog]=React.useState(false);
+          const sdk=dialog?getModules()('@deepseek-ai/dsh-client-ui-primitives'):null;
           React.useEffect(()=>{
             const source=new EventSource('/panel-events');
             source.addEventListener('pulse',event=>setPulse(JSON.parse(event.data).live));
             return ()=>source.close();
           },[]);
           return h('main',{},h('h1',{id:'identity'},key),
+            h('button',{id:'open-sdk-dialog',onClick:()=>setDialog(true)},'Actions'),
+            dialog?h(sdk.Modal,{open:true,title:'SDK actions',closeLabel:'Close',onClose:()=>setDialog(false),footer:h(sdk.Button,{
+              'data-testid':'sdk-confirm',variant:'primary',onClick:()=>{setText('sdk-confirmed');setDialog(false);}
+            },'Confirm')},'Original shared components'):null,
             h('button',{id:'action',onClick:async()=>{
               localStorage.setItem('panel-cache', key); sessionStorage.setItem('panel-session', 'same-client');
               const response=await fetch('/panel-action',{method:'POST',headers:{'content-type':'application/json','x-panel-key':key},body:JSON.stringify({text:key})});
@@ -360,6 +393,51 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
     if (key === 'first') clientInstance = currentInstance;
     else reporter.check('切换原生右栏页签保留同一客户端文档且不重复初始化业务', currentInstance === clientInstance);
     if (key === 'first') {
+      await frame.evaluate(`document.getElementById('open-sdk-dialog').click();true`);
+      await waitFor(()=>frame.evaluate(`(() => {const dialog=document.querySelector('[role=dialog]');return dialog?.innerText.includes('Original shared components')&&getComputedStyle(dialog).opacity==='1';})()`),'间接取用官方组件库打开原生对话框');
+      reporter.check('公共 SDK 对话框保留实际 SVG 图形、遮罩和主按钮填色',await frame.evaluate(`(() => {
+        const dialog=document.querySelector('[role=dialog]'),button=dialog.querySelector('[data-testid=sdk-confirm]'),icon=dialog.querySelector('button[aria-label=Close] svg');
+        const shape=icon.getBBox(),style=getComputedStyle(button),mask=getComputedStyle(dialog.previousElementSibling,'::after');
+        return shape.width>0&&shape.height>0&&style.backgroundColor!=='rgba(0, 0, 0, 0)'&&style.color!==style.backgroundColor&&mask.backgroundColor!=='rgba(0, 0, 0, 0)';
+      })()`));
+      await snapshot('shared-sdk-dialog');
+      const appearance=(await api('/api/appearance/bootstrap')).value;
+      for(const mode of ['light','dark']) {
+        const current=(await api('/api/appearance/bootstrap')).value;
+        await post('/api/appearance/activate',{themeId:`builtin.${mode}`,expectedRevision:current.revision});
+        await waitFor(()=>frame.evaluate(`document.documentElement.dataset.theme===${JSON.stringify(mode)}`),'原页面接收真实主题变更');
+        assert.ok(await frame.evaluate(`(() => {const style=getComputedStyle(document.querySelector('[data-testid=sdk-confirm]'));return style.backgroundColor!=='rgba(0, 0, 0, 0)'&&style.color!==style.backgroundColor;})()`));
+      }
+      reporter.check('公共 SDK 在原页面保留文档的同时随 Magi 切换深浅主题，主操作持续可见',await frame.evaluate('window.__clientInstance')===clientInstance);
+      const currentAppearance=(await api('/api/appearance/bootstrap')).value;
+      await post('/api/appearance/activate',{themeId:appearance.activeThemeId,expectedRevision:currentAppearance.revision});
+      for (const narrow of [false,true]) {
+        if(narrow)await page.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:false});
+        reporter.check(`${narrow?'390px':'桌面'} 公共 SDK 对话框和操作完整处于当前页面内`,await frame.evaluate(`(() => {
+          const dialog=document.querySelector('[role=dialog]').getBoundingClientRect(),button=document.querySelector('[data-testid=sdk-confirm]').getBoundingClientRect();
+          return dialog.left>=0&&dialog.top>=0&&dialog.right<=innerWidth&&dialog.bottom<=innerHeight&&button.width>0&&button.height>0&&document.documentElement.scrollWidth<=innerWidth;
+        })()`));
+        if(clipAuditSource) {
+          const audit=await frame.evaluate(`(${clipAuditSource})({viewport:true})`);
+          await writeFile(join(output,`shared-sdk-clip-${narrow?'390':'desktop'}.json`),JSON.stringify(audit,null,2));
+          reporter.check(`${narrow?'390px':'桌面'} 公共 SDK 对话框阴影无裁切`,audit.cut===0,JSON.stringify(audit));
+        }
+        if(narrow)await snapshot('shared-sdk-dialog-390');
+      }
+      await page.call('Emulation.clearDeviceMetricsOverride');
+      await frame.evaluate(`document.querySelector('[data-testid=sdk-confirm]').click();true`);
+      await waitFor(()=>frame.evaluate(`!document.querySelector('[role=dialog]')&&document.getElementById('receipt')?.textContent==='sdk-confirmed'`),'官方 Button 回调完成操作并关闭对话框');
+      reporter.check('交互后间接取用公共 SDK 的官方 Modal 与 Button 正常展示并完成回调，无组件改写',true);
+      await frame.evaluate(`window.__startCall('cancel-init',false);window.__startCall('cancel-request',true);window.__startCall('remaining',false);true`);
+      const callStates = async () => (await post(`/api/plugins/${id}/routes`,{method:'GET',path:'/call-state'})).body;
+      await waitFor(async()=>Object.values(await callStates()).filter(value=>value==='running').length===3,'三个真实在途请求');
+      await frame.evaluate(`window.__calls['cancel-init'].controller.abort();window.__calls['cancel-request'].controller.abort();true`);
+      await waitFor(()=>frame.evaluate(`window.__calls['cancel-init'].state==='AbortError'&&window.__calls['cancel-request'].state==='AbortError'`),'原页面收到两种 fetch 的取消');
+      await waitFor(async()=>{const states=await callStates();return states['cancel-init']==='cancelled'&&states['cancel-request']==='cancelled'&&states.remaining==='running';},'daemon 取消指定后台路由且保留其他调用');
+      reporter.check('fetch(init.signal) 与 fetch(Request.signal) 取消到达真实后台，只关闭各自请求',true);
+      await post(`/api/plugins/${id}/routes`,{method:'POST',path:'/complete-call',body:'remaining'});
+      await waitFor(()=>frame.evaluate(`window.__calls.remaining.state==='completed:remaining'`),'未取消请求正常完成');
+      reporter.check('并发请求取消后其他业务仍收到真实结果',true);
       const imageData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=';
       const dshReceipt = await frame.evaluate(`(async()=>{
         const bytes=Uint8Array.from(atob(${JSON.stringify(imageData)}),c=>c.charCodeAt(0));
@@ -396,7 +474,7 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
         if (extension === 'svg') await snapshot('composer-svg');
         const before = (await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).value.canonicalTurns ?? [];
         const lastSeq = Math.max(0,...before.map(turn=>turn.turnSeq));
-        await waitFor(() => page.evaluate(`!document.querySelector('[data-testid="input-send-button"]')?.disabled`), '图片发送按钮可用');
+        await waitFor(() => page.evaluate(`Boolean(document.querySelector('[data-testid="input-send-button"]:enabled'))`), '图片发送按钮可用');
         await ui.click('[data-testid="input-send-button"]');
         const turn = await waitFor(async()=>{
           const turns=(await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).value.canonicalTurns ?? [];

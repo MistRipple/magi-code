@@ -467,6 +467,27 @@ test('路由执行层：调用被取消时立即以 Cancelled 结束，不等处
   await assert.rejects(pending, (error) => error.kind === 'Cancelled');
 });
 
+test('路由执行层：已取消调用不执行业务，取消关闭响应一次并拒绝迟到写入', async () => {
+  const { runRoute } = await import('./runtime/routes.mjs');
+  const { getEventListeners } = await import('node:events');
+  let called = 0;
+  const cancelled = new AbortController(); cancelled.abort();
+  await assert.rejects(runRoute({ handler() { called++; } }, { method: 'GET', path: '/never' }, { signal: cancelled.signal }), { name: 'AbortError' });
+  assert.equal(called, 0);
+  const controller = new AbortController();
+  let response, closed = 0;
+  const pending = runRoute({ handler(_req, res) { response = res; res.on('close', () => closed++); } }, { method: 'GET', path: '/slow' }, { signal: controller.signal });
+  await Promise.resolve(); controller.abort();
+  await assert.rejects(pending, error => error.kind === 'Cancelled');
+  assert.equal(response.writable, false); assert.equal(response.write('late'), false);
+  response.end('late'); response.destroy();
+  assert.equal(closed, 1);
+  const complete = new AbortController();
+  await runRoute({ handler(_req, res) { res.end('ok'); } }, { method: 'GET', path: '/done' }, { signal: complete.signal });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(getEventListeners(complete.signal, 'abort').length, 0, '已完成请求不保留监听');
+});
+
 test('界面槽位：ctx 的实现只含上游入口用到的成员；未知服务缺席，未知槽位按策略分类', async () => {
   const { createSlotContext, slotDisposition } = await import('./runtime/client/slot-context.mjs');
   const scope = { getSnapshot: () => ({ value: {} }), subscribe: () => () => {}, set: async () => true };

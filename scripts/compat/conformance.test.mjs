@@ -22,6 +22,9 @@ import { create as createTar } from 'tar';
 import { installRegistryFetch } from './runtime/registry-fetch.mjs';
 import { prepareDsh } from './install/prepare.mjs';
 import { backendEntry } from './core/package.mjs';
+import { createViewTransport } from './runtime/client/view-transport.mjs';
+import { createRouteFetch } from './runtime/client/route-fetch.mjs';
+import { getEventListeners } from 'node:events';
 
 const temporary = async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'magi-compat-contract-'));
@@ -29,6 +32,74 @@ const temporary = async (t) => {
   return root;
 };
 const json = (file, value) => writeFile(file, JSON.stringify(value));
+
+test('页面取消只结束对应路由，迟到回执不污染后续调用，关闭文档释放等待和信号监听', async () => {
+  const sent = [], transport = createViewTransport(message => sent.push(message));
+  const first = new AbortController(), second = new AbortController();
+  const route = { operation: 'route.call', method: 'GET', path: '/slow' };
+  const cancelled = transport.request(route, first.signal);
+  const other = transport.request(route, second.signal);
+  const reason = new Error('user cancelled');
+  first.abort(reason);
+  await assert.rejects(cancelled, error => error === reason);
+  assert.deepEqual(sent[2], { type: 'cancel', requestId: sent[0].requestId });
+  assert.equal(getEventListeners(first.signal, 'abort').length, 0);
+  transport.receive({ requestId: sent[0].requestId, ok: true, result: 'late' });
+  transport.receive({ requestId: sent[1].requestId, ok: true, result: 'current' });
+  assert.equal(await other, 'current');
+  assert.equal(getEventListeners(second.signal, 'abort').length, 0);
+  const count = sent.length;
+  await assert.rejects(transport.request(route, first.signal), error => error === reason);
+  assert.equal(sent.length, count, '已取消的输入不能发起业务');
+  const closing = transport.request(route, second.signal);
+  transport.dispose(); transport.dispose();
+  await assert.rejects(closing, { name: 'AbortError' });
+  assert.equal(getEventListeners(second.signal, 'abort').length, 0);
+  await assert.rejects(transport.request(route), { name: 'AbortError' });
+  const writes = [], live = createViewTransport(message => writes.push(message));
+  const controller = new AbortController();
+  const writing = live.request({ operation: 'settings.write' }, controller.signal);
+  controller.abort(); await assert.rejects(writing, { name: 'AbortError' });
+  assert.equal(writes.length, 1, '停止等待不伪装为设置提交已取消');
+});
+
+test('页面 fetch 使用真实 Request 输入、相对路径和信号优先级，保留状态与 HEAD 空正文', async () => {
+  const calls = [];
+  const fetchRoute = createRouteFetch(async (message, signal) => {
+    signal.throwIfAborted(); calls.push(message);
+    return { status: 202, contentType: 'application/json', body: { accepted: true } };
+  }, 'https://magi.example/ui-v/digest/ui/index.html');
+  const old = new AbortController(); old.abort();
+  const active = new AbortController();
+  const input = new Request('https://magi.example/run?q=1', { method: 'POST', headers: { 'x-plugin-key': 'test' }, body: '{"value":2}', signal: old.signal });
+  const response = await fetchRoute(input, { signal: active.signal });
+  assert.equal(response.status, 202); assert.deepEqual(await response.json(), { accepted: true });
+  assert.deepEqual(calls[0], { operation: 'route.call', method: 'POST', path: '/run', query: 'q=1', headers: { 'content-type': 'text/plain;charset=UTF-8', 'x-plugin-key': 'test' }, body: { value: 2 } });
+  await fetchRoute('action'); assert.equal(calls[1].path, '/ui-v/digest/ui/action');
+  const head = await fetchRoute('/status', { method: 'HEAD' });
+  assert.equal(head.body, null); assert.equal(await head.text(), '');
+  await assert.rejects(fetchRoute('/never', { signal: old.signal }), { name: 'AbortError' });
+  await assert.rejects(fetchRoute('https://foreign.example/run'), /只能访问/);
+  await assert.rejects(fetchRoute('/never', { method: 'GET', body: 'invalid' }), TypeError);
+  assert.equal(calls.length, 3);
+});
+
+test('fetch 的两种 signal 输入沿同一个传输取消，后续请求正常完成', async () => {
+  const sent = [], transport = createViewTransport(message => sent.push(message));
+  const fetchRoute = createRouteFetch(transport.request, 'https://magi.example/ui/index.html');
+  for (const asRequest of [false, true]) {
+    const controller = new AbortController();
+    const pending = asRequest ? fetchRoute(new Request('https://magi.example/slow', { signal: controller.signal })) : fetchRoute('/slow', { signal: controller.signal });
+    const requestId = sent.at(-1).requestId;
+    controller.abort(); await assert.rejects(pending, { name: 'AbortError' });
+    assert.deepEqual(sent.at(-1), { type: 'cancel', requestId });
+    transport.receive({ requestId, ok: true, result: { status: 200, body: 'late' } });
+  }
+  const current = fetchRoute('/retry');
+  transport.receive({ requestId: sent.at(-1).requestId, ok: true, result: { status: 200, body: 'actual' } });
+  assert.equal(await (await current).text(), 'actual');
+  transport.dispose();
+});
 
 test('原包封装只观察默认启动，扫描与运行共用条件导出，原生页面字节保留且归档可复现', async (t) => {
   const root = await temporary(t), upstream = join(root, 'upstream'); await mkdir(upstream);
@@ -46,7 +117,14 @@ test('原包封装只观察默认启动，扫描与运行共用条件导出，�
       ctx.inject(['settings'], c => { if (config.enabled) c.settings.register('late', value => value ?? {}); });
     }
   `);
-  const client = `/* preserve page */ window.__ModuleLoader__.load({ id: 'contract', factory: require => ({ apply(ctx) { ctx.slots.register({ name: 'settings.section', id: 'contract' }, () => null); } }) });`;
+  const client = `/* preserve page */ window.__ModuleLoader__.load({ id: 'contract', factory: require => {
+    const getModules = () => require;
+    return { apply(ctx) {
+      const sdk = getModules()('@deepseek-ai/dsh-client-ui-primitives');
+      if (typeof sdk.Modal !== 'function' || !sdk.Button) throw new Error('公共页面 SDK 缺失');
+      ctx.slots.register({ name: 'settings.section', id: 'contract' }, () => null);
+    } };
+  } });`;
   await writeFile(join(upstream, 'client.js'), client);
   const prepared = [];
   for (const name of ['first', 'second']) {
@@ -57,6 +135,8 @@ test('原包封装只观察默认启动，扫描与运行共用条件导出，�
     assert.ok(result.manifest.permissions.some(permission => permission.kind === 'storage' && permission.targets.includes('dsh-registered-settings')));
     assert.deepEqual(result.manifest.permissions.find(permission => permission.kind === 'pluginManagement').targets, ['lifecycle', 'background'], '单独重载只声明生命周期授权');
     assert.equal(await readFile(join(outDir, 'ui/client.js'), 'utf8'), client);
+    assert.match(await readFile(join(outDir, `ui/dsh-config-${result.manifest.contributions.views[0].id}.js`), 'utf8'), /ui-primitives\.js/);
+    assert.ok((await readFile(join(outDir, 'ui/ui-primitives.js'))).length > 0);
     assert.equal(result.report.variants, undefined);
     assert.match(await readFile(join(outDir, 'extension/index.mjs'), 'utf8'), /settingsNamespaces":true/);
     const { packPlugin } = await import('./core/pack.mjs');

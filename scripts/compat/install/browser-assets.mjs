@@ -1,21 +1,12 @@
 import { readFileSync, copyFileSync } from 'node:fs';
 import { join } from 'node:path';
-import ts from 'typescript';
-import { browserLibraries } from '../runtime/client/modules.mjs';
+import { BROWSER_LIBRARIES } from '../runtime/client/modules.mjs';
 
-export function copyBrowserAssets(clientFile, sharedRoot, destination) {
-  const source = ts.createSourceFile(clientFile, readFileSync(clientFile, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-  const names = new Set();
-  const visit = (node) => {
-    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'require') {
-      if (!node.arguments[0] || !ts.isStringLiteralLike(node.arguments[0])) throw new Error('浏览器模块导入必须使用可核对的字面量名称');
-      names.add(node.arguments[0].text);
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(source);
+// 公共页面 SDK 是宿主的固定合同。原包可在交互后经注入函数间接取用组件，
+// 不以源码里直接 require 的出现与否裁剪运行库，避免页面加载成功却缺失操作。
+export function copyBrowserAssets(sharedRoot, destination) {
   const manifest = JSON.parse(readFileSync(join(sharedRoot, 'dist/browser-modules.json'), 'utf8'));
-  const files = browserLibraries(names).flatMap((library) => {
+  const files = BROWSER_LIBRARIES.flatMap((library) => {
     if (!manifest[library.name]) throw new Error(`发行包缺少浏览器模块 ${library.name}`);
     return manifest[library.name];
   });

@@ -22,6 +22,8 @@ import { createEventSource } from './event-source.mjs';
 import { createComposerClient } from './composer.mjs';
 import { createSessionComposerServices } from './session-composer.mjs';
 import { SettingsForm } from './settings-form.mjs';
+import { createViewTransport } from './view-transport.mjs';
+import { createRouteFetch } from './route-fetch.mjs';
 
 const CHANNEL = 'magi-plugin-v1';
 
@@ -34,7 +36,6 @@ export function startDshClient(options) {
   const modules = { react: React, 'react-dom': ReactDOM, 'react/jsx-runtime': JsxRuntime };
   globalThis.__MAGI_DSH_MODULES__ = modules;
   let locale = 'zh-CN';
-  let nextRequest = 0;
   let instanceId = null;
   let placement = 'page';
   let selectedSlot = options;
@@ -48,46 +49,17 @@ export function startDshClient(options) {
       selectedSlot = { slotName: view.name, slotKey: view.key };
     }
   };
-  const pending = new Map();
-
   // —— 视图桥 ——
-  const post = (message) => parent.postMessage({ channel: CHANNEL, instanceId, type: 'request', ...message }, '*');
-  const request = (message, signal) => new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(signal.reason);
-    const requestId = `r${++nextRequest}`;
-    const abort = () => { pending.delete(requestId); reject(signal.reason); };
-    const cleanup = () => signal?.removeEventListener('abort', abort);
-    pending.set(requestId, { resolve: (value) => { cleanup(); resolve(value); }, reject: (error) => { cleanup(); reject(error); } });
-    signal?.addEventListener('abort', abort, { once: true });
-    post({ requestId, ...message });
-  });
+  const transport = createViewTransport(message => parent.postMessage({ channel: CHANNEL, instanceId, ...message }, '*'));
+  const request = transport.request;
   const eventSources = createEventSource(request, document.baseURI);
   const composer = createComposerClient(request);
   const sessionComposer = options.business?.operations?.length ? createSessionComposerServices(composer.api) : undefined;
   globalThis.EventSource = eventSources.EventSource;
-  window.addEventListener('pagehide', () => { eventSources.dispose(); composer.dispose(); sessionComposer?.dispose(); slotContext.dispose(); }, { once: true });
+  window.addEventListener('pagehide', () => { eventSources.dispose(); composer.dispose(); sessionComposer?.dispose(); slotContext.dispose(); transport.dispose(); }, { once: true });
 
   // —— 路由：上游界面用 fetch('/plugins/<name>/…') 访问自己的后端，这里转交给宿主里的同一处理器 ——
-  globalThis.fetch = async (input, init = {}) => {
-    const raw = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-    const url = new URL(raw, 'http://magi.invalid');
-    if (url.origin !== 'http://magi.invalid' && url.origin !== new URL(document.baseURI).origin) {
-      throw new TypeError(`插件界面只能访问自己宿主的后端路由：${raw}`);
-    }
-    const original = input instanceof Request ? input : null;
-    const method = String(init.method ?? original?.method ?? 'GET').toUpperCase();
-    const headers = Object.fromEntries(new Headers(init.headers ?? original?.headers).entries());
-    let body;
-    const suppliedBody = init.body ?? (original && !['GET', 'HEAD'].includes(method) ? await original.clone().text() : undefined);
-    if (suppliedBody !== undefined && suppliedBody !== null) {
-      const text = typeof suppliedBody === 'string' ? suppliedBody : await new Response(suppliedBody).text();
-      try { body = JSON.parse(text); } catch { body = text; }
-    }
-    const result = await request({ operation: 'route.call', method, path: url.pathname, query: url.search.replace(/^\?/, ''), headers, body });
-    const contentType = result.contentType ?? (typeof result.body === 'string' ? 'text/plain' : 'application/json');
-    const payload = result.body === null || result.body === undefined ? '' : typeof result.body === 'string' ? result.body : JSON.stringify(result.body);
-    return new Response([204, 205, 304].includes(result.status) ? null : payload, { status: result.status, headers: { 'content-type': contentType } });
-  };
+  globalThis.fetch = createRouteFetch(request, document.baseURI);
 
   // —— 沙箱里被禁的窗口、剪贴板、下载：经桥交给宿主 ——
   window.open = (url) => { if (url) void request({ operation: 'host.openExternal', url: String(url) }).catch(() => {}); return null; };
@@ -135,12 +107,33 @@ export function startDshClient(options) {
       '--dsw-alias-label-tertiary': t['--foreground-muted'], '--dsw-alias-label-dimmed': t['--foreground-muted'],
       '--dsw-alias-border-l1': t['--border-subtle'], '--dsw-alias-border-l2': t['--border'],
       '--dsw-alias-bg-base': t['--background'], '--dsw-alias-bg-layer-1': t['--background'],
-      '--dsw-alias-bg-layer-2': t['--surface-2'], '--dsw-alias-bg-layer-3': t['--surface-3'], '--dsw-alias-bg-l1': t['--surface-1'],
+      '--dsw-alias-bg-layer-2': t['--dropdown-bg'], '--dsw-alias-bg-layer-3': t['--surface-3'], '--dsw-alias-bg-l1': t['--surface-1'],
       '--dsw-alias-brand-primary': t['--primary'], '--dsw-alias-interactive-bg-hover': t['--surface-hover'],
       '--dsw-alias-link': t['--primary'],
       '--dsw-alias-state-success-primary': t['--success'], '--dsw-alias-state-warn-primary': t['--warning'],
       '--dsw-alias-state-error-primary': t['--error'], '--dsw-alias-label-error': t['--error'],
       '--dsw-alias-label-success': t['--success'], '--dsw-alias-label-warning': t['--warning'], '--dsw-alias-label-caution': t['--warning'],
+      '--dsw-alias-label-primary-foreground': t['--btn-primary-fg'] ?? t['--primary-foreground'],
+      '--dsw-alias-button-primary-fill': t['--btn-primary-bg'] ?? t['--primary'],
+      '--dsw-alias-button-primary-hover': t['--btn-primary-hover-bg'] ?? t['--primary-hover'],
+      '--dsw-alias-button-tool-bar-fill': t['--surface-2'], '--dsw-alias-button-tool-bar-hover': t['--surface-hover'],
+      '--dsw-alias-interactive-bg-active': t['--surface-active'], '--dsw-alias-interactive-bg-hover-danger': t['--error-muted'],
+      '--dsw-alias-bg-mask-1': t['--overlay'], '--dsw-alias-bg-skeleton': t['--surface-2'],
+      '--dsw-alias-bg-module-platform': t['--dropdown-bg'], '--dsw-alias-border-l3': t['--border'], '--dsw-alias-border-l4': t['--border'],
+      '--dsw-alias-switch-thumb': t['--primary-foreground'], '--dsw-alias-label-caption': t['--foreground-muted'],
+      '--dsw-alias-tooltip-bg': t['--dropdown-bg'], '--dsw-alias-tooltip-key-bg': t['--surface-2'],
+      '--dsw-alias-toast-bg': t['--dropdown-bg'], '--dsw-alias-toast-label': t['--foreground'],
+      '--dsw-alias-menu-icon': t['--foreground'], '--dsw-alias-menu-group-header-fill': t['--surface-2'],
+      '--dsw-alias-scrollbar-bg-l2': t['--scrollbar-thumb'], '--dsw-alias-scrollbar-hover-l2': t['--scrollbar-thumb-hover'],
+      '--dsw-alias-markdown-code-block': t['--code-bg'], '--dsw-alias-markdown-code-block-banner': t['--surface-2'],
+      '--dsw-radius-xs': t['--radius-xs'], '--dsw-radius-sm': t['--radius-sm'], '--dsw-radius-md': t['--radius-md'],
+      '--dsw-radius-lg': t['--radius-lg'], '--dsw-radius-xl': t['--radius-xl'], '--dsw-radius-panel': t['--radius-2xl'],
+      '--dsw-elevation-soft': t['--shadow-sm'], '--dsw-elevation-panel': t['--shadow-sm'], '--dsw-elevation-prominent': t['--shadow-md'],
+      '--dsw-shadow-lv3': t['--shadow-lg'], '--dsw-menu-surface-fill': t['--dropdown-bg'], '--dsw-hovercard-bg': t['--dropdown-bg'],
+      '--dsw-focus-ring-color': t['--primary'], '--dsw-focus-ring-width': '2px', '--dsw-mask-blur': 'none',
+      '--ds-transition-duration': t['--duration-normal'], '--ds-ease-in-out': t['--ease-in-out'],
+      '--dsw-font-family': t['--vscode-font-family'], '--ds-font-family-code': t['--vscode-editor-font-family'],
+      '--dsw-font-markdown-code-font-family': t['--vscode-editor-font-family'],
     };
     for (const [name, value] of Object.entries(alias)) if (value) root.style.setProperty(name, value);
     root.style.colorScheme = theme.mode === 'light' ? 'light' : 'dark';
@@ -233,6 +226,23 @@ export function startDshClient(options) {
   });
   const loadUpstream = async (src) => {
     for (const file of options.libraryScripts ?? []) await loadScript(file);
+    // 官方组件用 <use href="#dsw-icon-…"> 引用文档 sprite；图形仍取公共 SDK 的原始导出。
+    // 每份隔离文档独立安装一次，不借用宿主 DOM，也不重绘或替换上游组件。
+    const symbols = modules['@deepseek-ai/dsh-client-ui-primitives']?.ICON_SYMBOLS;
+    if (symbols) {
+      const ns = 'http://www.w3.org/2000/svg', sprite = document.createElementNS(ns, 'svg');
+      sprite.setAttribute('aria-hidden', 'true');
+      sprite.style.cssText = 'position:absolute;width:0;height:0;overflow:hidden;pointer-events:none';
+      for (const [id, source] of Object.entries(symbols)) {
+        const svg = new DOMParser().parseFromString(source, 'image/svg+xml').documentElement;
+        const symbol = document.createElementNS(ns, 'symbol');
+        for (const attribute of svg.attributes) if (attribute.name !== 'xmlns') symbol.setAttribute(attribute.name, attribute.value);
+        symbol.id = id;
+        for (const child of svg.childNodes) symbol.appendChild(document.importNode(child, true));
+        sprite.appendChild(symbol);
+      }
+      document.body.prepend(sprite);
+    }
     let initialized;
     window.__ModuleLoader__ = {
       load({ factory }) {
@@ -293,9 +303,7 @@ export function startDshClient(options) {
     } else if (m.type === 'composer') {
       composer.update(m.snapshot);
     } else if (m.type === 'response') {
-      const waiter = pending.get(m.requestId);
-      pending.delete(m.requestId);
-      if (waiter) m.ok ? waiter.resolve(m.result) : waiter.reject(new Error(m.error));
+      transport.receive(m);
     }
   });
 }
