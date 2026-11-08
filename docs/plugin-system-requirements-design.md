@@ -236,7 +236,7 @@
 
 【现状·读码推断】register.hook/tool/command 只能绑定清单获批项。resource/settings 可在 activate 期间访问；其余业务服务需要仍活动的工具／命令调用租约。Node 使用 AsyncLocalStorage 携带 invocationId，daemon 按连接租约注入 owner，不相信插件自报 `_context`。钩子内启动业务动作当前明确拒绝，避免同一阻塞动作重入。[instance.rs:430](../crates/magi-extension-host/src/instance.rs#L430)。
 
-【现状·已运行验证】model.invoke 经原生 StepModelClient 和用量账本；credential.ref 只返回模型绑定引用，不返回 secret。session.snapshot 仅当前签发会话，最多 10 Turn、每 Turn 20 条文本投影并截断；notify/ask 复用通知与交互事实。task.spawn/tool.call 只在具有原生 Task／租约、策略和工具权限时执行，普通命令没有 Task 会明确拒绝，不伪造任务。[服务:138](../crates/magi-conversation-runtime/src/task_execution_dispatcher/extension_services.rs#L138)。
+【现状·已运行验证】model.invoke 经原生 StepModelClient 和用量账本；credential.ref 只返回模型绑定引用，不返回 secret。session.snapshot 仅当前签发会话，最多 10 Turn、每 Turn 20 条文本投影并截断；notify/ask 复用通知与交互事实。task.spawn/tool.call 只在具有原生 Task／租约、策略和工具权限时执行；插件命令从接纳起就是无隐式模型调用的 Task Turn，复用同一原生准入与结算，不伪造任务。[服务:138](../crates/magi-conversation-runtime/src/task_execution_dispatcher/extension_services.rs#L138)。
 
 【现状·已运行验证】`modelSource.set/clear` 向主对话模型目录整体替换或撤销已授权的数据源，只追加、不作默认选择，不被子代理、`model.invoke`、辅助、识图和生图使用；已选用而不可用的会话明确报错，不改用其他模型。选用后主对话内容会发往插件提供的地址，授权预览必须明示。daemon 单测覆盖未声明、非法输入与替换撤销，真实 daemon 端到端用例未单列。[服务:380](../crates/magi-daemon/src/daemon/extension_services.rs#L380)、[作者指南](plugin-authoring.md#提供主对话模型数据源)。
 
@@ -428,7 +428,7 @@
 
 ## 10. 工作流、会话引擎与子代理
 
-【目标】工作流／会话引擎继续原生，不重建旧插件工厂。命令是独立 Conversation Turn，不隐式跑主模型；要调用模型必须显式 model.invoke，带活动归属、models 授权并计入用量。Task 工具或派发走原生 schema／权限／审批／账本，不另建执行入口。
+【目标】工作流／会话引擎继续原生，不重建旧插件工厂。插件命令是独立 Task Turn，纯 Conversation 入口不执行插件业务或准备 Git 资源，不隐式跑主模型；要调用模型必须显式 model.invoke，带活动归属、models 授权并计入用量。命令与模型动作共用 TaskStore、调度、目录准备、取消、完成契约、canonical 结果和资源结算。Task 工具或派发走原生 schema／权限／审批／账本，不另建执行入口。命令停止、失败或重启中断后不提供通用模型 Continue，须核对外部结果后明确重新发起命令；正文参数不触发聊天记忆提取或辅助模型。
 
 【目标】子代理可由用户自定义角色和模型；扩展的 task.spawn 使用原生 agent_spawn 合同，保留角色、目录、策略与绑定解析。显式模型绑定无效时拒绝，不能回落其他模型。最强反方：无法照搬上游任意 model.select；保留产品特色与唯一配置权威优先。
 
@@ -463,7 +463,7 @@
 - 完整业务覆盖率仍未达到可证明的 95%／100%。逐插件补齐成功结果、取消、配置持久化、在线更新、失败恢复与停用／重启验收；安装、进程 running、页面有内容和路由 smoke 各自只证明对应阶段。
 - Mgr 0.2.12 原页面点击更新不能显示确认框：宿主漏掉间接取用的公共组件库已修正；`profile-sdk-final/ui-modules.json` 确认官方 Modal 为函数、Button 为 React forwardRef 对象，原包仍按 `typeof Button === "function"` 判断而跳过确认。后台更新路由通过不能作为此页面流程通过；保留原页面与官方组件，不增加按包名改写或组件伪装。初始失败证据在 `target/plugin-acceptance/profile-product-before/` 与 `profile-product-confirm/`，补齐 SDK 后的失败在 `profile-sdk-final/`。这项仍须解决，不能计为完整支持。
 - Market／Share 的 Git 来源、上游主动移除式替换及安装提交各阶段的崩溃恢复仍未完成。安装任务回执只在当前 daemon 进程内短期保留，不能宣称崩溃后重放或跨重启 exactly-once。
-- `/codebuddy` 的工作目录现沿本次原生执行资源传递；命令结果自动回注仍缺正式会话消息服务，不能伪造 `Agent.inject/steer` 或宣称完整 Agent 支持。Debugging 的诊断／重启业务、Health 的完整修复流程，以及未列为实测通过的其他原包分支仍待验证。技能可用不等于插件全部诊断业务可用。
+- `/codebuddy` 的工作目录现沿本次原生 Task 执行资源传递；命令结果自动回注仍缺正式会话消息服务，不能伪造 `Agent.inject/steer` 或宣称完整 Agent 支持。Debugging 的诊断／重启业务、Health 的完整修复流程，以及未列为实测通过的其他原包分支仍待验证。技能可用不等于插件全部诊断业务可用。
 - 会话消息、session/event、sessionProjections、完整 Agent 对象、provider 技能与作用域等仍按实际能力门槛处理。原生能力暂未暴露属于产品待开发项，不能直接定为永久不支持；不得返回假对象或空结果冒充完成。
 - Windows、干净系统正式安装包、Android／iOS 真机触摸、屏幕录制权限引导和长期负载仍需各自验收。390px Electron 视口模拟不代表手机真机通过。
 - pi 尚无运行器；只允许浏览搜索结果，不创建空适配器或兼容声明。官方签名、公钥托管及目录内容由发布者提供，不把本地开发密钥当官方信任根。
@@ -474,20 +474,20 @@
 
 | 最近核对范围 | 入口 | 结果与边界 |
 | --- | --- | --- |
-| 当前代码 | `npm run test:compat` | 100 项通过，新增命令／工具的执行投影、并发隔离、配置替换、取消与失效引用；保留真实 Cordis effect、动态技能、依赖解析、辅助进程委托、公共页面 SDK、请求取消与媒体合同；只证明各测试覆盖的行为 |
-| 本轮 Rust 定向回归 | `magi-daemon`、`magi-api` | 隔离执行根投影、真实 Node 命令与开始前／运行中取消、真实 Node 工具授权与执行、冻结项目目录接纳／重载／主要目录变化各 1 项通过；daemon check 和 macOS 目录包构建通过。大包与外观事件的上一轮专项不计本轮复跑 |
+| 既有兼容回归，不计本轮复跑 | `npm run test:compat` | 100 项通过，新增命令／工具的执行投影、并发隔离、配置替换、取消与失效引用；保留真实 Cordis effect、动态技能、依赖解析、辅助进程委托、公共页面 SDK、请求取消与媒体合同；只证明各测试覆盖的行为 |
+| 本轮 Rust 定向回归 | `magi-api`、`magi-conversation-runtime`、`magi-session-store`、`magi-daemon` | 命令准入与空参数任务目标、失败命令的执行链恢复限制、停止／失败／重启中断后的会话恢复限制、真实 Node 命令与开始前／运行中取消各 1 项通过；daemon check、修改文件格式检查、macOS 目录包构建与解包自检通过 |
 | 既有基础检查，不计本轮复跑 | Web、Desktop、发行边界 | 上一轮 Web check 0 错误 0 警告、Desktop check 通过。本轮重新完成 macOS 目录包构建、解包自检与修改 Rust 文件格式检查；没有 schema 变更，不把既有协议检查算作本轮复跑 |
 | 既有 Rust 业务专项，不计本轮复跑 | 运行目录、技能与宿主 | 运行目录 7、`skill_apply` 7、技能加载 7、SkillRuntime 20、消息名称接纳 1、宿主单元 15、真实 Node 集成 25 项通过 |
-| 当前目录包 | `test:electron-plugin-runtime` | macOS arm64 Electron 45、随包 daemon／Node，**87/87**；`target/plugin-acceptance/execution-product-validated/results.json`。本轮新增个人／多目录命令实际文件读写、取消与显式重试、目录失效的 canonical 失败及模型调用插件工具读取真实文件。保留技能、图片、页面 SDK／SVG、主题、fetch 取消与生命周期断言；桌面与 390px 截图保留。上一轮额外注入阴影审计的 83/83 仍见 `product-ui-final/`，本轮未注入该可选审计，不合并数量；不代表手机真机或全部页面完成 |
+| 当前目录包 | `test:electron-plugin-runtime` | macOS arm64 Electron 45、随包 daemon／Node，**91/91**；`target/plugin-acceptance/task-command-final/results.json`。个人／多目录原包命令实际读写、真实 root Task 接纳／canonical 归属／TaskStore 完成、无主模型步骤、取消传递、禁止通用 Continue 重放、显式重试、源目录失效拒绝均通过；保留技能、图片、原页面 SDK／SVG、主题、请求取消、停用与重启回归。早期空参数任务目标失败保留于 `task-command-initial/`，修正后整套独立通过；不拼接上一轮 87/87 或阴影审计批次，也不代表手机真机或全部页面完成 |
 | 既有社区目录包批次，不计本轮复跑 | `test:electron-popular-dsh` | 固定 9 个社区原包：在线安装 9/9、启动 9/9、原生页面 9/9、路由 smoke 7/7、页面异常 0；在线更新验证 2 条、coreVerified 仍为 0、qualified 为 false，按完整门槛退出 1。结果在 `target/plugin-acceptance/skills-community-final/`，未完成项保留 unverified，不以安装率推导生态支持率 |
-| 本轮真实原包与外部服务 | `MAGI_WORKBUDDY_CLI_BINARY=<CLI绝对路径> npm run test:electron-workbuddy` | 5.20.32 在线原包、CodeBuddy CLI 2.181.0，13/13；真实国内版 hy3 回复与 CLI 指定文件读回。`target/plugin-acceptance/workbuddy/results.json`、`codebuddy-command.json`；命令设置 injectResult=false，不能推导自动回注已实现。不传 CLI 路径仅运行原有模型专项。首次 CLI 缺 Read 授权的失败保留于 `target/plugin-workbuddy-execution-final.log`，沿 CLI 正式权限设置仅授权验收文件后成功 |
+| 本轮真实原包与外部服务 | `MAGI_WORKBUDDY_CLI_BINARY=<CLI绝对路径> MAGI_WORKBUDDY_CLI_MODEL=hy3 npm run test:electron-workbuddy` | 5.20.32 在线原包、CodeBuddy CLI 2.181.0，**14/14**；真实 WorkBuddy hy3 模型回复及 CLI 指定文件读回，新增命令 Task 接纳／完成结算核对。`target/plugin-acceptance/task-command-workbuddy-hy3/results.json`、`codebuddy-command.json`；injectResult=false，不能推导自动回注完成。本轮未指定 CLI 模型的首次调用超过显式配置的 90 秒预算，canonical Turn 与 Task 均为 failed，失败日志及截图保留在 `task-command-workbuddy/`，状态根记录于 `target/plugin-task-command-workbuddy.log`；后续只通过原包正式模型设置选择 hy3，未放宽权限、延长预算或改写原包。更早的文件 Read 授权失败继续保留，不合并不同批次计数 |
 | 既有页面 SDK 专项，不计本轮复跑 | `test:electron-dsh-rea` | 1.2.0 原包与 rea-agents 6.5.0、16/16：SVG、原页面 Ghidra 链接、真实 207 工具、CAS、停用与恢复；`target/plugin-acceptance/product-ui-rea/`。此包早于最后的外观事件分类修正，未验证 Ghidra 实际安装或二进制分析 |
 | 既有未解决失败，不计通过 | `test:electron-dsh-profile` | 原包搜索、布局恢复、启停和运行错误恢复通过，更新确认仍超时；`target/plugin-acceptance/profile-sdk-final/ui-modules.json` 确认组件库已加载。见第 11.2 节的原包组件判断问题 |
 | 既有专项，不计本轮复跑 | `test:electron-dsh-management`、`test:electron-dsh-compatibility` | 第 11 节所列原包管理、版本豁免、真实运行状态与失败恢复证据；不能合并不同批次成为全部业务通过 |
 | 既有专项，不计本轮复跑 | `test:electron-appshot` | 0.4.2 原包、13 项，真实 macOS 原生截图、后台附件、草稿挂载及重启恢复；`target/plugin-acceptance/appshot/`，不代表其他平台或所有时序分支 |
 | 既有本地纵向套件，不计本轮复跑 | `test:local-plugins`、`test:local-plugins-ui` | 真实 daemon／Node 的安装、授权、服务、调度、回收与界面流程；设置页现已移除计划表单，旧表单截图不是当前 UI 合同 |
 
-验收器仅在发送按钮真实存在且启用时操作；进程重启前释放旧文档，重新启动后等待外观和工作台初始化，不把 CDP 提前导航造成的网络中止混入业务结果。原包组件、错误断言和成功门槛保持实际行为，没有过滤运行异常或添加整轮自动重试。当前目录包独立完整通过 87/87，不拼接中间通过项。执行上下文验收早期参数、协议方法与夹具模型触发错误，以及目录失效应由异步 canonical 终态判定的修正记录保留于 `execution-product/`、`execution-product-final/`、`execution-product-verified/`、`execution-context-final/`、`execution-product-complete/`；此前页面失败仍保留于各自证据目录。
+验收器仅在发送按钮真实存在且启用时操作；进程重启前释放旧文档，重新启动后等待外观和工作台初始化，不把 CDP 提前导航造成的网络中止混入业务结果。原包组件、错误断言和成功门槛保持实际行为，没有过滤运行异常或添加整轮自动重试。当前目录包独立完整通过 91/91，不拼接中间通过项。执行上下文验收早期参数、协议方法与夹具模型触发错误，以及目录失效应由异步 canonical 终态判定的修正记录保留于 `execution-product/`、`execution-product-final/`、`execution-product-verified/`、`execution-context-final/`、`execution-product-complete/`；此前页面失败仍保留于各自证据目录。
 
 ### 12.2 未运行与不得推导的结论
 
@@ -522,7 +522,6 @@
 | 待定 | 官方目录签名密钥、轮换和发布责任人 | 由发布者提供受控公钥；当前不伪造可信官方内容 |
 | 待定 | Windows／正式安装包验收环境 | 后置到具备真实环境；能力合同保留，不把缺环境误报为通过 |
 | 待定 | 翻译器的必需语义分母与一致性测试集 | 固定社区样本为 9 个，WorkBuddy、REA 及机制夹具单列；安装、启动、页面、核心业务与在线升级分别计数，未验证项不计通过，不以样本安装率代替整个生态的业务支持率 |
-| 待定 | 扩展调用上下文是否公开会话工作区目录 | 推荐只公开已授权的当前工作区路径（只读、随调用签发）；DSH 的 `/codebuddy` 等命令依赖它，现状只能在 `codebuddy_ask` 里显式传 `working_dir`。反方：路径属于会话事实，扩展拿到后可据此直接读写磁盘，但完全信任扩展本来就能读写磁盘，所以不新增权限面 |
 
 ### 13.3 与现有架构的一致性
 

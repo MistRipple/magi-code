@@ -11,7 +11,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
 const port = 38938, cdpPort = 9308, origin = `http://127.0.0.1:${port}`;
 const work = await mkdtemp(join(tmpdir(), 'magi-workbuddy-live-'));
-const output = join(root, 'target/plugin-acceptance/workbuddy');
+const output = process.env.MAGI_WORKBUDDY_OUTPUT || join(root, 'target/plugin-acceptance/workbuddy');
 const report = createReporter(), errors = [];
 let app, page, frame, ui, pluginId;
 await mkdir(output, { recursive: true });
@@ -63,7 +63,13 @@ async function verifyCliCommand() {
   const result = await waitFor(async () => (await api(`/api/messages?scope=workspace&workspaceId=${workspace.workspaceId}&sessionId=${session}`)).canonicalTurns
     ?.find(item=>item.turnId===turn.turnId && ['completed','failed','cancelled','blocked'].includes(item.status)), '真实 CodeBuddy CLI 读项目文件',120_000);
   const text = result.items.filter(item=>item.kind==='assistant_text').map(item=>item.content??'').join('\n');
-  await writeFile(join(output,'codebuddy-command.json'),JSON.stringify({version:(await installed()).manifest.version,binary,sessionId:session,turnId:turn.turnId,status:result.status,text,injectResult:false},null,2));
+  const task = turn.rootTaskId && await api(`/api/agent-runs/projection/${turn.rootTaskId}?scope=workspace&workspaceId=${workspace.workspaceId}&sessionId=${session}`);
+  await writeFile(join(output,'codebuddy-command.json'),JSON.stringify({version:(await installed()).manifest.version,binary,
+    model:process.env.MAGI_WORKBUDDY_CLI_MODEL??null,sessionId:session,turnId:turn.turnId,taskId:turn.rootTaskId,
+    taskStatus:task?.root_task.status,status:result.status,text,injectResult:false},null,2));
+  report.check('真实 CodeBuddy 命令由原生 Task 调度并完成结算', Boolean(turn.rootTaskId)
+    && task.root_task.status==='completed' && result.items.find(item=>item.kind==='user_message')?.metadata.executionProfile==='task',
+    JSON.stringify({taskStatus:task?.root_task.status,turnStatus:result.status,text}));
   report.check('原包 /codebuddy 在真实会话目录调用实际 CLI 并读取文件结果', result.status==='completed'
     && text.includes(marker) && text.includes(await realpath(directory)), JSON.stringify({status:result.status,text}));
   report.check('CodeBuddy 命令保持只读业务结果与原有文件', await readFile(join(directory,'verification.txt'),'utf8')===marker);

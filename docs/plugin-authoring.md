@@ -286,7 +286,7 @@ export default async function activate(api) {
 | `ctx.execution` | 工具与命令的实际执行上下文：`workingDirectory`、`sourceFolders:[{sourceFolderId,workingDirectory}]`、`accessProfile`。目录来自 daemon 已准备的执行资源；项目只列本次获授的实际执行根，隔离前的源路径不会进入此投影；个人会话使用自有目录，sourceFolders 为空。无目录的调用为 null，不猜宿主 cwd |
 | `ctx.job` | 仅作业触发的命令有：`jobId`、`scheduleId`、`budget` |
 
-`owner`、`binding`、`execution`、`job` 由 daemon 注入，扩展不能伪造。命令在调用插件前沿原生执行资源入口完成目录验证、隔离与 Git／账本准备；目录缺失或授权失效会拒绝执行，修复后由用户重新发起。目录上下文用于定位本次业务，不是 OS 沙箱；完全信任插件的直接 OS 行为仍以当前用户权限运行。
+`owner`、`binding`、`execution`、`job` 由 daemon 注入，扩展不能伪造。命令从接纳起进入原生 Task，调用插件前沿同一任务资源入口完成目录验证、隔离与 Git／账本准备；目录缺失或授权失效会拒绝执行，修复后由用户重新发起。目录上下文用于定位本次业务，不是 OS 沙箱；完全信任插件的直接 OS 行为仍以当前用户权限运行。
 
 ### 运行期贡献与回收
 
@@ -413,7 +413,7 @@ await api.command('stats', async (input, ctx) => `共 ${input.text.length} 个�
 - 上限 120 秒；用户停止该轮时 `ctx.signal` 中止。
 - 命令不能与技能、目标模式、图片、上下文引用或会话命令（如 `/compact`）同时提交。
 - 授权由 `extension` 的“完全信任”覆盖，命令不需要额外权限。
-- 命令里默认**没有任务**，所以只能用 `model.invoke`、`session.snapshot`、`notify.user`、`ask.user`，不能用 `tools.call` 和 `task.spawn`（第 10 节）。
+- 命令携带真实 Task／worker 归属；`model.invoke`、`tools.call` 和 `task.spawn` 等服务仍须各自授权，并沿原生任务策略、审批和账本执行（第 10 节）。命令不触发聊天记忆提取或辅助模型请求。停止、失败或重启中断后不能用通用“继续”重放；用户核对结果后可重新发起命令。
 
 ## 10. 宿主服务参考
 
@@ -506,7 +506,7 @@ await api.tools.call('file_read', { path: 'README.md' });
 await api.task.spawn({ /* 与原生 agent_spawn 相同 */ });
 ```
 
-- 只能在有活动任务的上下文里用（例如你的工具被模型在任务中调用时）。命令默认没有任务，会被明确拒绝。
+- 只能在有活动任务和当前租约的上下文里用（包括模型调用的工具和用户插件命令），并继续检查本插件授权、任务策略和原生工具权限。
 - `tools.call` 只接受公开的**原生**工具，不能调用自己或其他扩展的工具；原生工具的 schema、权限、审批和账本照常生效。
 - `task.spawn` 沿用原生子代理合同，保留角色、目录与策略，只能指定角色，不能指定模型。
 
@@ -598,7 +598,7 @@ node scripts/pack-plugin.mjs <插件目录> <输出.zip>
 | 工具、命令不出现 | 插件没有“授权并激活”；工具还需要 `tools` 权限已授权 |
 | 清单被拒绝 | 有未知字段；贡献 ID 重名；声明了 `extension` 却没有钩子、工具或命令；缺 `extension: ["full-trust"]` |
 | 钩子里调用 `api.model.invoke` 报 `ReentryDenied` | 这些服务只能在工具、命令、作业处理器里用 |
-| 命令里 `api.tools.call` / `api.task.spawn` 被拒绝 | 命令默认没有任务，只有任务里的工具调用才有 |
+| 命令里 `api.tools.call` / `api.task.spawn` 被拒绝 | 检查当前 Task 租约、插件对应权限和原生任务策略；具有任务归属不代表额外授权 |
 | 写资源报 `Conflict` | 版本过期；重新读取再带最新版本写入 |
 | 读设置、资源报 `PermissionDenied` | 缺 `storage` 权限（设置的目标是 `"__settings"`） |
 | 升级后数据没了 | 改了 `dataSchemaVersion`；这会清空旧数据，见第 13 节 |

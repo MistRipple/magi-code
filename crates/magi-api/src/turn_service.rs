@@ -215,7 +215,7 @@ async fn submit_session_turn_internal(
     }
     // 幂等重放必须先读取已提交事实，再检查当前插件准入：插件可能已停用或被升级，这些状态
     // 不能让客户端无法读取原 accepted 回执。新请求仍在此处经过当前能力校验。
-    validate_plugin_command_selection(&state, &request)?;
+    resolve_plugin_command_selection(&state, &request)?;
     // 扩展 `input` guard：新请求在任何状态被创建之前征询；幂等重放已在上面返回，不会再次调用。
     check_input_guard(&state, &request, "turn").await?;
 
@@ -433,7 +433,6 @@ async fn submit_session_turn_internal(
                 workspace_id,
                 accepted_at,
                 request_fingerprint,
-                job,
             )
             .await
         }
@@ -446,6 +445,7 @@ async fn submit_session_turn_internal(
                 accepted_at,
                 decision,
                 request_fingerprint,
+                job,
             )
             .await
         }
@@ -1263,12 +1263,12 @@ fn validate_session_turn_command(request: &SessionTurnRequestDto) -> Result<(), 
 }
 
 /// 请求里选择的插件命令身份：长度受限，形态固定为 `plugin/{插件}/{贡献}`。
-pub(crate) fn validate_plugin_command_selection(
+pub(crate) fn resolve_plugin_command_selection(
     state: &ApiState,
     request: &SessionTurnRequestDto,
-) -> Result<(), ApiError> {
+) -> Result<Option<magi_app_server_protocol::generated::PluginNamedContribution>, ApiError> {
     let Some(command_id) = request.plugin_command_id.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
     if command_id.len() > 192 {
         return Err(ApiError::InvalidInput("插件命令身份无效".into()));
@@ -1279,18 +1279,17 @@ pub(crate) fn validate_plugin_command_selection(
         .plugin_manager
         .lock()
         .map_err(|_| ApiError::internal_assembly("校验插件命令失败", "插件锁已损坏"))?;
-    let available = manager
+    let command = manager
         .command_contributions()
         .map_err(|error| ApiError::internal_assembly("读取插件命令失败", error.to_string()))?
         .into_iter()
-        .any(|(manifest, command)| {
-            magi_plugin_system::ContributionRef::new(manifest.id, command.id) == selected
-        });
-    if available {
-        Ok(())
-    } else {
-        Err(ApiError::Forbidden("所选插件命令未激活".into()))
-    }
+        .find(|(manifest, command)| {
+            magi_plugin_system::ContributionRef::new(manifest.id.clone(), command.id.clone())
+                == selected
+        })
+        .map(|(_, command)| command)
+        .ok_or_else(|| ApiError::Forbidden("所选插件命令未激活".into()))?;
+    Ok(Some(command))
 }
 
 fn session_turn_command_decision() -> SessionTurnIntentDecision {
@@ -1312,7 +1311,13 @@ pub(crate) fn decide_session_turn(
             "当前会话的恢复正在启动，请等待本轮恢复完成",
         ));
     }
-    if request.command.is_some() || request.plugin_command_id.is_some() {
+    if let Some(command) = resolve_plugin_command_selection(state, request)? {
+        let mut decision = SessionTurnIntentDecision::new(SessionTurnRouteDto::Execute);
+        decision.task_title = Some(format!("/{}", command.title));
+        decision.execution_goal = Some(format!("执行插件命令 /{}", command.title));
+        return Ok(decision);
+    }
+    if request.command.is_some() {
         return Ok(session_turn_command_decision());
     }
 
@@ -1514,8 +1519,12 @@ async fn submit_conversation_session_turn(
     workspace_id: Option<WorkspaceId>,
     accepted_at: UtcMillis,
     request_fingerprint: String,
-    job: Option<magi_app_server_protocol::generated::PluginJobContext>,
 ) -> Result<SessionTurnResponseDto, ApiError> {
+    if request.plugin_command_id.is_some() {
+        return Err(ApiError::InvalidInput(
+            "插件命令必须通过 Task 入口执行，请重新提交命令".into(),
+        ));
+    }
     let previous_current_session_id = state.session_store.current_session_id();
     let (session_id, created_session, workspace_id) = crate::scope_binding::resolve_turn_session(
         &state,
@@ -1622,18 +1631,6 @@ async fn submit_conversation_session_turn(
         metadata.insert(
             magi_session_store::SESSION_COMMAND_METADATA_KEY.to_string(),
             serde_json::to_value(command).expect("session command must serialize"),
-        );
-    }
-    if let Some(job) = job {
-        metadata.insert(
-            "pluginJob".into(),
-            serde_json::to_value(job).expect("job serializes"),
-        );
-    }
-    if let Some(plugin_command_id) = request.plugin_command_id.as_ref() {
-        metadata.insert(
-            "pluginCommandId".to_string(),
-            serde_json::Value::String(plugin_command_id.clone()),
         );
     }
     metadata.extend([
@@ -1798,25 +1795,13 @@ async fn submit_conversation_session_turn(
         request_id: Some(request_id),
         user_message_id: Some(user_message_id.clone()),
         placeholder_message_id: request.placeholder_message_id(),
-        command: request
-            .command
-            .as_ref()
-            .map(|command| match command {
-                magi_app_server_protocol::SessionTurnCommand::Compact => {
-                    SessionTurnCommand::CompactContext {
-                        instructions: request.trimmed_text(),
-                    }
+        command: request.command.as_ref().map(|command| match command {
+            magi_app_server_protocol::SessionTurnCommand::Compact => {
+                SessionTurnCommand::CompactContext {
+                    instructions: request.trimmed_text(),
                 }
-            })
-            .or_else(|| {
-                request
-                    .plugin_command_id
-                    .as_ref()
-                    .map(|command_id| SessionTurnCommand::Plugin {
-                        command_id: command_id.clone(),
-                        arguments: request.trimmed_text(),
-                    })
-            }),
+            }
+        }),
     };
     schedule_conversation_execution(state.clone(), execution_request, attempt, trace);
     if created_session
@@ -2414,6 +2399,7 @@ async fn submit_mainline_session_turn(
     accepted_at: UtcMillis,
     decision: SessionTurnIntentDecision,
     creation_request_fingerprint: String,
+    job: Option<magi_app_server_protocol::generated::PluginJobContext>,
 ) -> Result<SessionTurnResponseDto, ApiError> {
     let trace = PerformanceTrace::new(request.request_id().as_deref(), accepted_at);
     let requested_session_label = request
@@ -2482,6 +2468,15 @@ async fn submit_mainline_session_turn(
                         "route".to_string(),
                         serde_json::Value::String(session_turn_route_name(route).to_string()),
                     )]);
+                    if let Some(id) = request.plugin_command_id.as_ref() {
+                        metadata.insert("pluginCommandId".into(), Value::String(id.clone()));
+                    }
+                    if let Some(job) = job {
+                        metadata.insert(
+                            "pluginJob".into(),
+                            serde_json::to_value(job).expect("job serializes"),
+                        );
+                    }
                     if let Some(title) = selected_skill_title(&state, &request) {
                         metadata.insert("skillTitle".into(), Value::String(title));
                     }
@@ -3245,7 +3240,6 @@ pub(crate) async fn drain_next_queued_regular_session_turn(
                             scope.workspace_id(),
                             admission_at,
                             request_fingerprint,
-                            None,
                         )
                         .await
                         .map(|_| ()),
@@ -3264,6 +3258,7 @@ pub(crate) async fn drain_next_queued_regular_session_turn(
                             admission_at,
                             decision,
                             creation_request_fingerprint,
+                            None,
                         )
                         .await
                         .map(|_| ()),
@@ -4610,21 +4605,32 @@ mod tests {
 
     #[test]
     fn plugin_commands_are_accepted_only_for_active_declared_commands_and_never_mixed() {
-        use super::{validate_plugin_command_selection, validate_session_turn_input};
+        use super::{resolve_plugin_command_selection, validate_session_turn_input};
         let (state, _dir) = command_state(true);
         let request = command_request(serde_json::json!({}));
         validate_session_turn_input(&request).unwrap();
-        validate_plugin_command_selection(&state, &request).unwrap();
+        resolve_plugin_command_selection(&state, &request).unwrap();
+        assert!(matches!(
+            super::decide_session_turn(&state, &request).unwrap().route,
+            super::SessionTurnRouteDto::Execute
+        ));
+        let empty = command_request(serde_json::json!({"text": ""}));
+        let decision = super::decide_session_turn(&state, &empty).unwrap();
+        assert_eq!(decision.task_title.as_deref(), Some("/Hello"));
+        assert_eq!(
+            decision.execution_goal.as_deref(),
+            Some("执行插件命令 /Hello")
+        );
         // 未声明的命令、格式错误的身份。
         for id in ["plugin/acme.cmd/ghost", "plugin/other/hello"] {
             let bad = command_request(serde_json::json!({"pluginCommandId": id}));
             assert!(
-                validate_plugin_command_selection(&state, &bad).is_err(),
+                resolve_plugin_command_selection(&state, &bad).is_err(),
                 "{id}"
             );
         }
         let malformed = command_request(serde_json::json!({"pluginCommandId": "hello"}));
-        assert!(validate_plugin_command_selection(&state, &malformed).is_err());
+        assert!(resolve_plugin_command_selection(&state, &malformed).is_err());
         // 命令不能与技能、目标模式、会话命令或图片同时提交。
         for extra in [
             serde_json::json!({"skillName": "review"}),
@@ -4638,7 +4644,7 @@ mod tests {
         }
         // 未激活的插件不提供命令。
         let (inactive, _dir2) = command_state(false);
-        assert!(validate_plugin_command_selection(&inactive, &request).is_err());
+        assert!(resolve_plugin_command_selection(&inactive, &request).is_err());
     }
 
     struct DenyForbidden;

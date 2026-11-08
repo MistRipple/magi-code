@@ -1125,6 +1125,8 @@ export default async function activate(api) {
                     turn_id: "context-turn".into(),
                     context: magi_tool_runtime::ToolExecutionContext {
                         session_id: Some(magi_core::SessionId::new("context-session")),
+                        task_id: Some(magi_core::TaskId::new("context-task")),
+                        worker_id: Some(magi_core::WorkerId::new("context-worker")),
                         working_directory: Some(directory),
                         ..Default::default()
                     },
@@ -1139,6 +1141,8 @@ export default async function activate(api) {
         .unwrap();
         let projected: serde_json::Value = serde_json::from_str(&projected.content).unwrap();
         assert_eq!(projected["owner"]["sessionId"], "context-session");
+        assert_eq!(projected["owner"]["taskId"], "context-task");
+        assert_eq!(projected["owner"]["workerId"], "context-worker");
         assert_eq!(
             projected["execution"]["workingDirectory"],
             expected_directory.to_str().unwrap()

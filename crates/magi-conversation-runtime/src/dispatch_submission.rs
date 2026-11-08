@@ -1205,15 +1205,21 @@ fn materialize_execution(
         turn_id: prepared.turn_id.clone(),
         workspace_id: request.workspace_id.clone(),
         execution_root: request.execution_root.clone(),
-        writebacks: ExecutionWritebackPlans::from_session_action_input(
-            DispatchMemoryExtractionInput {
+        // 用户命令的正文是业务参数，不触发聊天记忆提取或隐式辅助模型请求。
+        writebacks: if request
+            .user_message_metadata
+            .contains_key("pluginCommandId")
+        {
+            ExecutionWritebackPlans::default()
+        } else {
+            ExecutionWritebackPlans::from_session_action_input(DispatchMemoryExtractionInput {
                 accepted_at: request.accepted_at,
                 session_id: &request.session_id,
                 timeline_entry_id: &request.entry_id,
                 text: request.trimmed_text.as_deref(),
                 skill_name: request.skill_name.as_deref(),
-            },
-        ),
+            })
+        },
         use_tools: request.use_tools,
         skill_name: request.skill_name.clone(),
         images: request.images.clone(),

@@ -43,6 +43,15 @@ pub fn active_execution_branch_is_continue_recoverable(
     chain: &ActiveExecutionChain,
     branch: &ActiveExecutionBranch,
 ) -> bool {
+    // 当前 Turn 是 canonical 的只读投影。插件命令没有模型检查点，不能走通用
+    // Continue 重放副作用；用户须核对结果后重新发起明确的命令。
+    if chain.current_turn.as_ref().is_some_and(|turn| {
+        turn.items.iter().any(|item| {
+            item.kind == "user_message" && item.metadata.contains_key("pluginCommandId")
+        })
+    }) {
+        return false;
+    }
     let Some(task_store) = task_store else {
         return false;
     };
@@ -633,6 +642,65 @@ mod tests {
             store.execution_scope_root(&child.task_id).unwrap(),
             child.task_id
         );
+    }
+
+    #[test]
+    fn plugin_command_failure_requires_explicit_retry_instead_of_model_recovery() {
+        let store = TaskStore::new();
+        let session = SessionId::new("command-recovery");
+        let root = task(
+            "command-root",
+            "command-root",
+            "command-mission",
+            None,
+            TaskStatus::Failed,
+        );
+        store.insert_task(root.clone()).unwrap();
+        let branch = branch(root.task_id.as_str(), "worker", "finish", None);
+        let mut chain = chain(
+            &session,
+            &root.mission_id,
+            &root.task_id,
+            branch.clone(),
+            None,
+        );
+        assert!(active_execution_branch_is_continue_recoverable(
+            Some(&store),
+            &chain,
+            &branch
+        ));
+        let mut item = crate::session_writeback::session_turn_item(
+            "user_message",
+            "completed",
+            None,
+            Some("parameters".into()),
+            None,
+            branch.thread_id.clone(),
+        );
+        item.metadata.insert(
+            "pluginCommandId".into(),
+            serde_json::json!("plugin/acme.cmd/run"),
+        );
+        chain.current_turn = Some(magi_session_store::ActiveExecutionTurn {
+            turn_id: "command-turn".into(),
+            turn_seq: 1,
+            accepted_at: UtcMillis(1),
+            completed_at: Some(UtcMillis(2)),
+            status: "failed".into(),
+            user_message: Some("parameters".into()),
+            items: vec![item],
+        });
+        assert!(!active_execution_branch_is_continue_recoverable(
+            Some(&store),
+            &chain,
+            &branch
+        ));
+        let reloaded = serde_json::from_value(serde_json::to_value(chain).unwrap()).unwrap();
+        assert!(!active_execution_branch_is_continue_recoverable(
+            Some(&store),
+            &reloaded,
+            &branch
+        ));
     }
 
     #[test]

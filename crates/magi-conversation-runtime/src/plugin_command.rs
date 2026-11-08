@@ -1,7 +1,7 @@
 //! 插件用户命令的执行端口。
 //!
-//! 命令仍通过普通 Session Turn 接纳，并在 canonical 终态里写回一条用户可见文本；
-//! 这里只定义 conversation 执行器向 daemon 请求命令执行的边界，不持有插件状态。
+//! 命令通过原生 Task Turn 接纳、调度、取消与结算，不隐式调用主模型；
+//! 这里只定义 Task 执行器向 daemon 请求命令执行的边界，不持有插件状态。
 
 use serde::Serialize;
 use std::sync::atomic::AtomicBool;

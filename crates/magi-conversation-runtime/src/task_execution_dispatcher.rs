@@ -3,6 +3,7 @@
 //! Owns the production task dispatch implementation for session turns and conversation loops.
 
 mod extension_services;
+mod plugin_commands;
 
 use crate::{
     ConversationRegistry, SKILL_APPLY_TOOL_NAME, active_skill_tool_execution_policy,
@@ -45,10 +46,7 @@ use crate::{
         model_usage_binding_for_worker_with_settings,
     },
 };
-use magi_bridge_client::{
-    BridgeClientError, BridgeErrorLayer, ChatToolDefinition, ModelBridgeClient,
-    ModelInvocationRequest, ModelResponse, ModelStreamingDelta,
-};
+use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest};
 use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
     FileSummaryItem, FileSummaryRecord, KnowledgeConsumer, KnowledgeContextRequest,
@@ -80,6 +78,8 @@ use std::{
 
 #[cfg(test)]
 use crate::session_turn_execution::run_session_turn_execution_for_test;
+#[cfg(test)]
+use magi_bridge_client::{BridgeClientError, BridgeErrorLayer, ModelResponse, ModelStreamingDelta};
 
 #[derive(Clone)]
 pub struct ExecutionPipeline {
@@ -233,7 +233,7 @@ struct DispatchPlanExecutionInput<'a> {
     execution_settings_snapshot: Option<Arc<SettingsStore>>,
 }
 
-struct TaskLlmInvocationInput<'a> {
+struct TaskInvocationInput<'a> {
     task: &'a magi_core::Task,
     lease_id: &'a LeaseId,
     session_id: &'a SessionId,
@@ -524,36 +524,6 @@ pub enum RoleTarget<'a> {
     Orchestrator,
     Auxiliary,
     Agent { role_id: &'a str },
-}
-
-/// 插件命令不依赖模型配置，但 conversation 执行合同仍要求携带一个 client。
-/// 这个占位 client 只会在插件命令已经在执行入口短路时传入，任何模型调用都会显式失败。
-struct PluginCommandPlaceholderClient;
-
-impl ModelBridgeClient for PluginCommandPlaceholderClient {
-    fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
-        magi_bridge_client::text_executor_capabilities()
-    }
-
-    fn invoke(&self, _request: ModelInvocationRequest) -> Result<ModelResponse, BridgeClientError> {
-        Err(BridgeClientError::CallFailed {
-            layer: BridgeErrorLayer::Protocol,
-            code: None,
-            message: "插件命令不允许调用模型".into(),
-        })
-    }
-
-    fn invoke_streaming(
-        &self,
-        _request: ModelInvocationRequest,
-        _on_delta: &dyn Fn(&ModelStreamingDelta),
-    ) -> Result<ModelResponse, BridgeClientError> {
-        Err(BridgeClientError::CallFailed {
-            layer: BridgeErrorLayer::Protocol,
-            code: None,
-            message: "插件命令不允许调用模型".into(),
-        })
-    }
 }
 
 pub const ORCHESTRATOR_THREAD_ID: &str = "orchestrator";
@@ -1203,7 +1173,7 @@ impl LlmTaskDispatcher {
             is_sidechain,
         };
         let streaming_entry_id = task_streaming_entry_id(task);
-        let (mut outcome, context_summary) = self.invoke_llm_with_tools(TaskLlmInvocationInput {
+        let invocation = TaskInvocationInput {
             task,
             lease_id,
             session_id: &session_id,
@@ -1220,7 +1190,11 @@ impl LlmTaskDispatcher {
             thread_id: &thread_id,
             system_prompt,
             execution_settings_snapshot: execution_settings_snapshot.clone(),
-        });
+        };
+        let (mut outcome, context_summary) = match self.execute_plugin_task_command(&invocation) {
+            Some(outcome) => (outcome, None),
+            None => self.invoke_llm_with_tools(invocation),
+        };
         // canonical 取消先于 TaskStore 的级联清理提交。Guard 会立即让执行退出，
         // 这份回执必须保留取消语义，不能抢先把仍持有旧租约的 Task 写成 Failed。
         if self
@@ -3033,68 +3007,62 @@ impl LlmTaskDispatcher {
         let execution_settings_snapshot = self.execution_settings_snapshot();
         let execution_settings =
             self.execution_settings_or_live(execution_settings_snapshot.as_ref());
-        let client: Arc<dyn ModelBridgeClient> = if matches!(
-            request.command,
-            Some(crate::session_turn_execution::SessionTurnCommand::Plugin { .. })
+        let client = match self.resolve_model_client_for_task(
+            execution_settings,
+            None,
+            None,
+            Some(&request.session_id),
         ) {
-            Arc::new(PluginCommandPlaceholderClient)
-        } else {
-            match self.resolve_model_client_for_task(
-                execution_settings,
-                None,
-                None,
-                Some(&request.session_id),
-            ) {
-                Ok(client) => client,
-                Err(error) => {
-                    // 解析失败的原文只进日志（用户可见信息仍走下面的公共文案）：
-                    // 没有它「模型服务请求失败」无法定位到底是缺引擎、缺绑定还是缺工厂。
-                    tracing::warn!(
+            Ok(client) => client,
+            Err(error) => {
+                // 解析失败的原文只进日志（用户可见信息仍走下面的公共文案）：
+                // 没有它「模型服务请求失败」无法定位到底是缺引擎、缺绑定还是缺工厂。
+                tracing::warn!(
+                    session_id = %request.session_id,
+                    turn_id = %request.turn_id,
+                    %error,
+                    "会话主模型客户端解析失败"
+                );
+                let owns_active_plan = self
+                    .session_store
+                    .active_plan_for_execution_owner(&request.session_id, &request.turn_id)
+                    .is_some();
+                let stopped_goal = self
+                    .session_store
+                    .active_goal_for_execution_owner(&request.session_id, &request.turn_id)
+                    .map(|goal| {
+                        self.session_store.stop_goal_for_runtime_failure(
+                            &request.session_id,
+                            &goal.goal_id,
+                            None,
+                            &request.turn_id,
+                            "model_configuration_unavailable",
+                        )
+                    })
+                    .transpose();
+                let plan_result = match stopped_goal {
+                    Ok(Some(_)) => Ok(self.session_store.plan(&request.session_id)),
+                    Ok(None) if owns_active_plan => plan_store.pause(),
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(magi_plan::PlanUpdateError::Store(error.to_string())),
+                };
+                match plan_result {
+                    Ok(Some(plan)) => magi_plan::publish_plan_event(
+                        &self.event_bus,
+                        magi_plan::plan_event_type(&plan),
+                        &plan,
+                        request.workspace_id.as_ref(),
+                        None,
+                        None,
+                    ),
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(
                         session_id = %request.session_id,
-                        turn_id = %request.turn_id,
                         %error,
-                        "会话主模型客户端解析失败"
-                    );
-                    let owns_active_plan = self
-                        .session_store
-                        .active_plan_for_execution_owner(&request.session_id, &request.turn_id)
-                        .is_some();
-                    let stopped_goal = self
-                        .session_store
-                        .active_goal_for_execution_owner(&request.session_id, &request.turn_id)
-                        .map(|goal| {
-                            self.session_store.stop_goal_for_runtime_failure(
-                                &request.session_id,
-                                &goal.goal_id,
-                                None,
-                                &request.turn_id,
-                                "model_configuration_unavailable",
-                            )
-                        })
-                        .transpose();
-                    let plan_result = match stopped_goal {
-                        Ok(Some(_)) => Ok(self.session_store.plan(&request.session_id)),
-                        Ok(None) if owns_active_plan => plan_store.pause(),
-                        Ok(None) => Ok(None),
-                        Err(error) => Err(magi_plan::PlanUpdateError::Store(error.to_string())),
-                    };
-                    match plan_result {
-                        Ok(Some(plan)) => magi_plan::publish_plan_event(
-                            &self.event_bus,
-                            magi_plan::plan_event_type(&plan),
-                            &plan,
-                            request.workspace_id.as_ref(),
-                            None,
-                            None,
-                        ),
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!(
-                            session_id = %request.session_id,
-                            %error,
-                            "模型配置解析失败后停止 Goal/Plan 失败"
-                        ),
-                    }
-                    return Err(SessionTurnExecutionError {
+                        "模型配置解析失败后停止 Goal/Plan 失败"
+                    ),
+                }
+                return Err(SessionTurnExecutionError {
                         reason: crate::session_turn_execution::SessionTurnFailureReason::ModelInvocationFailed,
                         diagnostic_code: "model_configuration_unavailable".to_string(),
                         public_message: crate::model_error::PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE
@@ -3103,7 +3071,6 @@ impl LlmTaskDispatcher {
                             crate::model_error::ModelFailureDiagnostic::configuration_unavailable(),
                         )),
                     });
-                }
             }
         };
 
@@ -3168,17 +3135,15 @@ impl LlmTaskDispatcher {
             knowledge_context_prompt,
             persist_session_state: self.session_state_persist_callback.as_deref(),
             live_settings_store: self.settings_store.clone(),
-            plugin_command_executor: self.plugin_command_executor.clone(),
-            workspace_execution_preparer: self.workspace_execution_preparer.as_deref(),
             extension_hooks: self.extension_hooks.as_deref(),
         })
     }
 
     fn invoke_llm_with_tools(
         &self,
-        input: TaskLlmInvocationInput<'_>,
+        input: TaskInvocationInput<'_>,
     ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
-        let TaskLlmInvocationInput {
+        let TaskInvocationInput {
             task,
             lease_id,
             session_id,
@@ -4657,7 +4622,7 @@ mod tests {
         .unwrap();
         let usage = crate::usage_recording::session_turn_model_usage_binding(true);
         let invoke = |use_tools| {
-            dispatcher.invoke_llm_with_tools(TaskLlmInvocationInput {
+            dispatcher.invoke_llm_with_tools(TaskInvocationInput {
                 task: &child,
                 lease_id: &lease.lease_id,
                 session_id: &session,

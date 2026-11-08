@@ -252,7 +252,7 @@ pub(crate) async fn update_session_turn_queue_item(
         .validate_browser_node_selections()
         .map_err(ApiError::InvalidInput)?;
     candidate.parsed_images().map_err(ApiError::InvalidInput)?;
-    crate::turn_service::validate_plugin_command_selection(&state, candidate)?;
+    crate::turn_service::resolve_plugin_command_selection(&state, candidate)?;
     let decision = crate::turn_service::decide_session_turn(&state, candidate)?;
     queued.route = decision.route;
     queued.task_title = decision.task_title;

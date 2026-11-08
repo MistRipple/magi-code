@@ -10368,6 +10368,46 @@ fn seed_mainline_turn(
 }
 
 #[test]
+fn plugin_commands_never_resume_as_model_turns_after_failure_stop_or_reload() {
+    for status in ["failed", "cancelled", "interrupted"] {
+        let store = SessionStore::new();
+        let session = SessionId::new("command-recovery");
+        store
+            .create_session(session.clone(), "Command recovery")
+            .unwrap();
+        seed_mainline_turn(
+            &store,
+            &session,
+            "previous-model-failure",
+            "failed",
+            10,
+            &[],
+        );
+        assert!(store.mainline_resume_candidate(&session).is_some());
+        seed_mainline_turn(
+            &store,
+            &session,
+            "command",
+            status,
+            20,
+            &[
+                ("pluginCommandId", json!("plugin/acme.cmd/run")),
+                ("interruptionSource", json!("user")),
+            ],
+        );
+        assert!(
+            store.mainline_resume_candidate(&session).is_none(),
+            "{status}"
+        );
+        let reloaded = SessionStore::from_state(store.export_state());
+        assert!(
+            reloaded.mainline_resume_candidate(&session).is_none(),
+            "reloaded {status}"
+        );
+    }
+}
+
+#[test]
 fn mainline_resume_candidate_exists_for_failed_and_user_stopped_turns_only() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-resume-candidate");

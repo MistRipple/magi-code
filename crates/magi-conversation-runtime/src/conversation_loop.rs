@@ -550,6 +550,52 @@ fn required_evidence_recovery_prompt(task: &Task, evidence: &[TaskCompletionEvid
     )
 }
 
+pub(crate) struct TaskCommandCompletion<'a> {
+    pub event_bus: &'a InMemoryEventBus,
+    pub session_store: &'a SessionStore,
+    pub task_store: &'a TaskStore,
+    pub task: &'a Task,
+    pub session_id: &'a SessionId,
+    pub workspace_id: &'a Option<WorkspaceId>,
+    pub visibility: &'a TaskTurnVisibility,
+    pub turn_id: &'a str,
+    pub persist: Option<&'a SessionStatePersistCallback>,
+    pub content: &'a str,
+}
+
+/// 无模型命令与模型执行共用完成契约校验和 canonical 最终结果提交。
+pub(crate) fn complete_task_command(
+    input: TaskCommandCompletion<'_>,
+) -> Result<TaskOutcome, String> {
+    let outcome = validated_task_completion(
+        input.task,
+        vec![input.content.to_owned()],
+        input.content.to_owned(),
+        vec![],
+    )?;
+    append_task_final_turn_item(
+        TaskTurnWritebackContext {
+            event_bus: input.event_bus,
+            session_store: input.session_store,
+            task_store: input.task_store,
+            task: input.task,
+            session_id: input.session_id,
+            workspace_id: input.workspace_id,
+            turn_visibility: input.visibility,
+            persist_session_state: input.persist,
+            expected_turn_id: Some(input.turn_id),
+            model_step_id: None,
+            writeback_error: &std::sync::Mutex::new(None),
+        },
+        input.content,
+        None,
+        None,
+        None,
+        &[],
+    )?;
+    Ok(outcome)
+}
+
 fn validated_task_completion(
     task: &Task,
     output_refs: Vec<String>,

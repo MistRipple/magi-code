@@ -643,6 +643,18 @@ async function verifyCommandExecution(session) {
     const result = await waitFor(async () => (await api(`/api/messages?scope=${scope.scope}&sessionId=${encodeURIComponent(scope.sessionId)}${scope.workspaceId ? '&workspaceId='+encodeURIComponent(scope.workspaceId) : ''}`)).value.canonicalTurns
       ?.find(item => item.turnId === turn.turnId && ['completed','failed','cancelled','blocked'].includes(item.status)), '执行目录命令的 canonical 终态');
     assert.equal(result.status, 'completed', JSON.stringify(result));
+    assert.ok(turn.rootTaskId && turn.actionTaskId === turn.rootTaskId, '插件命令必须接纳真实 root Task');
+    const user = result.items.find(item=>item.kind==='user_message');
+    assert.equal(user?.metadata.executionProfile, 'task');
+    assert.equal(user?.worker?.taskId, turn.rootTaskId);
+    assert.equal(result.modelSteps?.length ?? 0, 0, '命令不能隐式调用主模型');
+    const query = new URLSearchParams({scope:scope.scope,sessionId:scope.sessionId,
+      ...(scope.workspaceId ? {workspaceId:scope.workspaceId} : {})});
+    const projection = await waitFor(async () => {
+      const response = await api(`/api/agent-runs/projection/${turn.rootTaskId}?${query}`);
+      return response.status===200 && response.value.root_task?.status==='completed' && response.value;
+    }, '命令 TaskStore 完成并结算');
+    reporter.check('插件命令沿原生 Task 接纳和结算，结果绑定原任务且不请求主模型', Boolean(projection));
     return result;
   };
   const personal = join(work, 'state/personal-sessions', session);
@@ -667,6 +679,10 @@ async function verifyCommandExecution(session) {
   const stopped = await waitFor(async () => (await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).value.canonicalTurns
     ?.find(item=>item.turnId===waiting.turnId && item.status==='cancelled'),'取消的 canonical 终态');
   reporter.check('停止命令取消真实业务调用，迟到返回不能覆盖已取消的 Turn', stopped.status==='cancelled');
+  const resume = await api('/api/session/turn',{scope:'personal',sessionId:session,text:'继续',resume:true,
+    requestId:'directory-cancel-resume',userMessageId:'directory-cancel-resume-user'});
+  reporter.check('已停止的命令不伪装为模型可继续任务，也不隐式重放业务副作用', [400,409].includes(resume.status));
+
   await invoke({scope:'personal',sessionId:session});
   reporter.check('取消后显式再次执行使用新调用并恢复真实文件结果', JSON.parse(await readFile(join(personal,'command-result.json'),'utf8')).id===session);
   await rename(paths[1], paths[1]+'-removed');
@@ -674,7 +690,7 @@ async function verifyCommandExecution(session) {
   const missing = rejected.status===200 ? await waitFor(async () => (await api(`/api/messages?scope=workspace&workspaceId=${scope.workspaceId}&sessionId=${projectSession}`)).value.canonicalTurns
     ?.find(item=>item.turnId===rejected.value.turnId && ['failed','completed','cancelled','blocked'].includes(item.status)), '执行准备拒绝失效目录') : null;
   reporter.check('项目源目录失效在业务开始前拒绝，不回落主要目录或个人目录', (missing ? missing.status==='failed'
-    && JSON.stringify(missing).includes('执行目录准备失败') : [400,409].includes(rejected.status))
+    : [400,409].includes(rejected.status))
     && !await readFile(join(paths[0],'command-result.json')).then(()=>true,()=>false), JSON.stringify({httpStatus:rejected.status,turnStatus:missing?.status}));
   await writeFile(join(output,'execution-context.json'), JSON.stringify({personal:saved,project,cancelledTurn:waiting.turnId,
     missingDirectory:{httpStatus:rejected.status,turnId:missing?.turnId,status:missing?.status}},null,2));

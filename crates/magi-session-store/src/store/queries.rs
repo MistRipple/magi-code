@@ -41,6 +41,10 @@ fn mainline_resume_candidate_in(
         .items
         .iter()
         .find(|item| item.kind == CanonicalTurnItemKind::UserMessage)?;
+    // 命令可能已经提交外部副作用；恢复模型执行不能代替显式重新发起命令。
+    if user_item.metadata.contains_key("pluginCommandId") {
+        return None;
+    }
     // 被新消息取代的取消不是“停止”，只有用户主动停止才可以继续。
     if turn.status == CanonicalTurnStatus::Cancelled
         && user_item

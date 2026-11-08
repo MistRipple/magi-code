@@ -64,7 +64,7 @@ daemon 响应形状：
 工具与命令另带 `execution:{workingDirectory,sourceFolders,accessProfile}`：workingDirectory 是本次实际执行根的本机绝对路径字符串，缺失为 null；sourceFolders 是获授项目源目录的 `{sourceFolderId,workingDirectory}` 列表，只传实际执行根，个人会话为空。工具保留本次所选 source_folder_id；命令保留 Turn 接纳的默认源目录。daemon 在调用前核对完整目录映射及物理身份；命令与原生工具共用资源准备入口，不能在副本丢失后回落源目录、个人目录或宿主 cwd。此上下文不向页面路由或普通钩子推断补齐，不授予新的 OS 权限。
 
 - 工具／命令调用使用插件＋代次＋递增序号形成独立身份；相同 caller 身份的并发调用可独立取消。
-- `owner` 描述实际 Session／Turn／Task／worker；命令没有 Task，不能伪造 Task 以调用需要 Task 的原生服务。
+- `owner` 描述实际 Session／Turn／Task／worker；插件命令由原生 Task 调度并携带实际 Task／worker 身份，停止与结果提交均核对该任务的当前租约。是否能调用其他原生服务仍由其权限及策略独立判断。
 - 作业增加 `ctx.job={jobId,scheduleId,budget}`，仍拥有 canonical Turn。预算由 daemon 签发。
 - Node 以 AsyncLocalStorage 随反向请求携带 `invocationId`；daemon 从当前连接租约补入内部上下文，拒绝扩展自报下划线字段。
 - 结束、取消和超时使租约失效。失效租约拒绝新业务服务；迟到响应不得写入下一轮。
