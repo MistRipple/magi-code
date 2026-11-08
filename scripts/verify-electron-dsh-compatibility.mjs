@@ -11,7 +11,7 @@ const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-
 const port = Number(process.env.MAGI_DSH_COMPATIBILITY_PORT || 38945);
 const cdpPort = Number(process.env.MAGI_DSH_COMPATIBILITY_CDP_PORT || 9315);
 const origin = `http://127.0.0.1:${port}`;
-const output = join(root, 'target/plugin-acceptance/dsh-compatibility');
+const output = process.env.MAGI_DSH_COMPATIBILITY_OUTPUT || join(root, 'target/plugin-acceptance/dsh-compatibility');
 const work = await mkdtemp(join(tmpdir(), 'magi-dsh-compatibility-'));
 const stateRoot = join(work, 'state'), dshHome = join(work, 'dsh');
 const report = createReporter(), errors = [];

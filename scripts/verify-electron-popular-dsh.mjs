@@ -283,15 +283,23 @@ try {
             await frame.evaluate(`(() => {const input=document.querySelector('.dsxpm-input');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'dsh-plugin-mgr');input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
             await frame.evaluate(`[...document.querySelectorAll('button')].find(button=>button.innerText==='搜索').click()`);
             await waitFor(() => frame.evaluate(`Boolean([...document.querySelectorAll('.dsxpm-card')].find(card=>card.querySelector('.dsxpm-name')?.textContent==='dsh-plugin-mgr'))`), '市场原包搜索结果');
+            const managerEntry=(await list('q=dsh-plugin-mgr')).items.find(row=>row.name==='dsh-plugin-mgr');
+            assert.ok(managerEntry, '原包目录须提供待安装的管理器条目');
+            assert.match(managerEntry.install, /\badd dsh-plugin-mgr$/, '此原包入口未锁版本，应沿在线 latest 安装');
+            // 省略版本沿正式预览入口解析 registry latest；不依赖搜索索引
+            // 是否已收录该包，也不把过期的社区目录版本当成本次安装版本。
+            const expectedManager=(await post('/api/plugins/upstream/preview',{ecosystem:'dsh',package:'dsh-plugin-mgr'})).candidate;
+            const expectedManagerVersion=expectedManager.manifest.version;
             await frame.evaluate(`[...document.querySelectorAll('.dsxpm-card')].find(card=>card.querySelector('.dsxpm-name')?.textContent==='dsh-plugin-mgr').querySelector('button').click()`);
             const mgr = await waitFor(async () => {
-              const installed = (await api('/api/plugins')).value.plugins.find(plugin=>plugin.source.location==='dsh:dsh-plugin-mgr@0.2.12');
+              const installed = (await api('/api/plugins')).value.plugins.find(plugin=>plugin.source.location===`dsh:dsh-plugin-mgr@${expectedManagerVersion}`);
               return installed?.runtime?.state==='running' ? installed : false;
             }, '原包按钮在线安装 Mgr 并运行', 180_000);
+            assert.equal(mgr.digest, expectedManager.digest, '原包未锁版本安装须与同一在线预览的内容身份一致');
             await waitFor(() => frame.evaluate(`Boolean([...document.querySelectorAll('.dsxpm-card')].find(card=>card.querySelector('.dsxpm-name')?.textContent==='dsh-plugin-mgr')?.querySelector('.dsxpm-installed'))`), '市场原包页面显示已安装结果');
             await writeFile(join(output,'market-installed.png'),Buffer.from(await ui.screenshot(),'base64'));
             const updatedList = await list('only=installed&q=dsh-plugin-mgr');
-            assert.ok(updatedList.items.some(row=>row.installedAs==='dsh-plugin-mgr'&&row.installedVersion==='0.2.12'));
+            assert.ok(updatedList.items.some(row=>row.installedAs==='dsh-plugin-mgr'&&row.installedVersion===expectedManagerVersion));
             await frame.evaluate(`window.__magiReloadDocument='before-reload';[...document.querySelectorAll('button')].find(button=>button.innerText==='重载 profile').click()`);
             await waitFor(() => frame.evaluate(`window.__magiReloadDocument===undefined && Boolean(document.querySelector('.dsxpm-input'))`), '原包重载完成并实际刷新文档', 30_000);
             await frame.evaluate(`(() => {const input=document.querySelector('.dsxpm-input');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'dsh-plugin-mgr');input.dispatchEvent(new Event('input',{bubbles:true}));})()`);

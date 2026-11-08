@@ -12,7 +12,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
 const port = Number(process.env.MAGI_APPSHOT_PORT || 38944), cdpPort = Number(process.env.MAGI_APPSHOT_CDP_PORT || 9314);
 const origin = `http://127.0.0.1:${port}`, work = await mkdtemp(join(tmpdir(), 'magi-appshot-persistence-'));
-const output = join(root, 'target/plugin-acceptance/appshot');
+const output = process.env.MAGI_APPSHOT_OUTPUT || join(root, 'target/plugin-acceptance/appshot');
 await mkdir(output, { recursive: true });
 const clientLogs = [];
 const errors = [], evidence = { package: 'dsh-plugin-appshot@0.4.2', work, checks: [], core: 'unverified' };

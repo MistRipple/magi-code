@@ -226,6 +226,40 @@ try {
   await writeFile(join(output,'manager-error-theme-contrast.json'),JSON.stringify(themeResults,null,2));
   await activatePluginTheme(api,page,frame,themes.original);
   await writeFile(join(output,'manager-update-failed-restored.png'),Buffer.from(await ui.screenshot(),'base64'));
+  const detailEvidence=[];
+  for(const width of [1280,390]) {
+    await page.call('Emulation.setDeviceMetricsOverride',{width,height:844,deviceScaleFactor:1,mobile:false});
+    await frame.evaluate(`document.querySelector('.dshpm-toast-text').click()`);
+    const detail=await waitFor(()=>frame.evaluate(`(() => {
+      const toast=document.querySelector('.dshpm-toast-err'),text=toast.querySelector('.dshpm-toast-text');
+      const box=toast.getBoundingClientRect(),textBox=text.getBoundingClientRect();
+      if(text.classList.contains('is-clamped')||textBox.bottom>box.bottom||toast.scrollHeight>toast.clientHeight)return false;
+      return {viewport:{width:innerWidth,height:innerHeight},box:box.toJSON(),textBox:textBox.toJSON(),text:text.innerText};
+    })()`),`${width}px 原包展开真实错误后全文处于可见区域`);
+    detailEvidence.push(detail);
+    report.check(`${width}px 原包展开后完整显示真实失败原因与恢复说明`,detail.text.includes('原安装已恢复'));
+    await writeFile(join(output,`manager-error-expanded-${width}.png`),Buffer.from(await ui.screenshot(),'base64'));
+    if(clipAuditSource) {
+      const audit=await frame.evaluate(`(${clipAuditSource})({viewport:true})`);
+      await writeFile(join(output,`manager-error-expanded-${width}-clip.json`),JSON.stringify(audit,null,2));
+      report.check(`${width}px 原包展开错误浮层阴影无裁切`,audit.cut===0,JSON.stringify(audit));
+    }
+    await frame.evaluate(`document.querySelector('.dshpm-toast-text').click()`);
+    report.check(`${width}px 原包全文收起恢复折叠`,await frame.evaluate(`document.querySelector('.dshpm-toast-text').classList.contains('is-clamped')`));
+  }
+  await writeFile(join(output,'manager-error-expanded.json'),JSON.stringify(detailEvidence,null,2));
+  await page.call('Page.bringToFront');
+  const keyboardFocus=await frame.evaluate(`(() => {const button=document.querySelector('.dshpm-toast-close');button.focus();return {focused:document.activeElement===button,documentFocused:document.hasFocus()};})()`);
+  await writeFile(join(output,'manager-error-keyboard-focus.json'),JSON.stringify(keyboardFocus,null,2));
+  assert.ok(keyboardFocus.focused&&keyboardFocus.documentFocused,'真实键盘输入前须确认原包关闭按钮取得物理文档焦点');
+  // Chromium 的 Enter 原生激活依赖字符事件；由主页面向当前聚焦 iframe
+  // 派发完整按键，不能把只有 keyDown 的协议消息当成实际 Enter。
+  await page.call('Input.dispatchKeyEvent',{type:'keyDown',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,text:'\r',unmodifiedText:'\r'});
+  await page.call('Input.dispatchKeyEvent',{type:'keyUp',key:'Enter',code:'Enter',windowsVirtualKeyCode:13});
+  await waitFor(()=>frame.evaluate(`!document.querySelector('.dshpm-toast-err')`),'键盘关闭原包错误提示');
+  report.check('原包关闭按钮接受真实键盘激活，关闭提示不改变已恢复安装',
+    (await current()).digest===beforeFailure.digest&&(await current()).runtime.state==='running');
+  await page.call('Emulation.clearDeviceMetricsOverride');
   holdResolution=true;
   const interrupted=api(`/api/plugins/${manager.manifest.id}/routes`,{method:'POST',path:'/api/plugin-manager/update',body:{name:'dsh-plugin-release-probe'}})
     .then(value=>({value}),error=>({error:String(error)}));

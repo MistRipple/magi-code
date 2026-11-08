@@ -1213,6 +1213,23 @@ try {
   await waitFor(async () => (await api(`/api/plugins/${pluginId}/settings`)).value.value?.label === 'changed', '界面配置保存');
   reporter.check('共享页面宿主经同一 settingsScope 保存动态 schema 配置', true);
   await snapshot('settings-desktop');
+  const viewport = () => page.evaluate(`(() => {
+    const frame=document.querySelector('.settings-frame iframe'),scroller=frame.closest('.settings-frame'),style=getComputedStyle(scroller);
+    return {height:frame.getBoundingClientRect().height,available:scroller.clientHeight-parseFloat(style.paddingTop)-parseFloat(style.paddingBottom),scrollHeight:scroller.scrollHeight,clientHeight:scroller.clientHeight};
+  })()`);
+  await waitFor(async()=>{const size=await viewport();return size.available>0&&size.height>=size.available-1;},'短插件设置页面保留宿主可用视口');
+  reporter.check('短设置正文不会收缩原包视口，vh 与 fixed 浮层仍使用完整可用区域',true);
+  const clientIdentity=await evaluateFrame(`window.__viewportAcceptance=crypto.randomUUID()`);
+  await evaluateFrame(`(() => {const content=document.createElement('div');content.id='viewport-long-content';content.style.height='1600px';document.getElementById('root').appendChild(content);})()`);
+  await waitFor(async()=>{const size=await viewport();return size.height>1600&&size.scrollHeight>size.clientHeight;},'长内容沿原有高度上报扩展设置页滚动');
+  await page.evaluate(`(() => {const scroller=document.querySelector('.settings-frame');scroller.scrollTop=scroller.scrollHeight;})()`);
+  reporter.check('长页面由宿主滚动，隔离文档没有第二条正文滚动链',
+    await page.evaluate(`document.querySelector('.settings-frame').scrollTop>0`)
+    &&await evaluateFrame(`document.documentElement.scrollHeight<=innerHeight+1`));
+  await evaluateFrame(`document.getElementById('viewport-long-content').remove()`);
+  await waitFor(async()=>{const size=await viewport();return Math.abs(size.height-size.available)<=1;},'移除长内容后恢复完整可用视口，不保留旧内容高度');
+  reporter.check('设置页内容增长和收起保留同一文档及已保存表单状态',
+    await evaluateFrame(`window.__viewportAcceptance===${JSON.stringify(clientIdentity)}&&document.getElementById('f-label').value==='changed'`));
   frame.close(); frame = null;
   const plugin = await installed();
   const session = (await post('/api/session/materialize', { scope: 'personal' })).sessionId;

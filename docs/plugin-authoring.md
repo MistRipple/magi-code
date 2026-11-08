@@ -181,7 +181,7 @@ ui/…                       视图页面与静态资源，按需
 | `composer.addImages` | `sessionId`、`images:[{dataUrl,name,size}]` | `{accepted,ids,snapshot}`；等待输入框实际接纳，最多 5 张且每张 10 MiB，容量不足时整批返回 `accepted:false`，坏图或失效身份明确失败 |
 | `composer.removeImage` | `sessionId`、`id` | `{removed,snapshot}`；只允许本页面文档添加的图片 |
 | `composer.focus` / `composer.notify` | `sessionId`；通知另需 `level`、`message` | 无；上述全部操作需要 `composer:["images"]` 授权及当前安装摘要，页面换代后旧 ID 不能操作草稿 |
-| `view.resize` | `height`（CSS 像素，0 到 20000） | 无；仅对 `settings` 位置的视图生效：宿主把 iframe 高度设为该值，由设置页整体滚动，页面自身不应再出现滚动条 |
+| `view.resize` | `height`（CSS 像素，0 到 20000） | 无；仅对 `settings` 位置的视图生效：文档至少填满宿主可用高度，正文更长时按上报高度增长并由设置页整体滚动，页面自身不应再出现正文滚动条；测量正文而非 `innerHeight`，避免窗口缩小时旧视口高度锁住内容 |
 
 单次写入不超过 4 MiB。一个最小的页面（`ui/index.html`）：
 

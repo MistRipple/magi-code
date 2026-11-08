@@ -335,6 +335,8 @@
 
 【现状·实现】次级文字色统一由 Magi 全局 `--foreground-secondary` 定义，设置页和原包页面消费同一令牌，不在翻译器重算。DSH 可用于反色文字的层级色映射到不透明画布；可读正文及页签文字沿共享次级色。已删除 WorkBuddy 专属按钮／页签 CSS 选择器，公共宿主不依据插件类名修正页面。主题来源仍是 Magi 外观服务，原包样式和组件保持原样。成功、警告、错误及信息的 `--*-text` 文字色在同一外观入口按主题表面及着色背景校准，原生设置组件与插件页面接收相同文字色及不透明状态底色；实心状态填色继续使用原有语义，文字校准不改写按钮和徽标的背景；DSH 状态背景、警告标签和官方连接反馈沿公共语义映射，不再使用上游浅色背景兜底。
 
+【现状·实现】插件设置文档的最小视口由宿主可用高度确定，页面上报的正文高度用于扩展超长内容的整页滚动范围。短正文不能把原包的 `fixed` 浮层和 `vh` 限高缩到正文高度；内容增长、收起及窗口缩放保留同一隔离文档与表单状态。该约束实施于公共 `PluginFrame`，不改写原包提示组件或为特定插件覆盖样式。
+
 【现状·实现】profile 中的安装清单、配置、node_modules 原包读取及其临时备份继续使用 daemon 调用快照。除此之外的报告、导出和缓存是当前插件的私有业务文件，使用其 `extensions/data/<id>` 下的真实 Node 路径；根目录读取将这些真实文件与只读安装投影合并，不生成物理 package.json、cordis 配置或 node_modules 安装副本。原包返回的报告路径可实际读取，文件副作用遵循普通受信 Node 的语义；它们不变成安装、授权或启停的第二份事实源。静态准入只对同模块明确构造 profile patch 路径并调用文件写入的代码申请 lifecycle/background 委托，普通截图或缓存写入不因此获得管理授权。
 
 ### 6.2 翻译范围
@@ -481,10 +483,10 @@
 ### 11.2 剩余产品工作
 
 - 完整业务覆盖率仍未达到可证明的 95%／100%。逐插件补齐成功结果、取消、配置持久化、在线更新、失败恢复与停用／重启验收；安装、进程 running、页面有内容和路由 smoke 各自只证明对应阶段。
-- Mgr 0.2.12 原页面的 Button 类型判断缺陷由上游 0.2.13 修正；本轮通过 Magi 原生在线入口完成 0.2.12 → 0.2.13，再完成原页面更新、取消、卸载与应用重启。最新证据 `status-text-profile-final/`，旧版缺陷证据 `profile-product-current/` 保留；未改写旧包或伪装组件，固定社区批次中的 0.2.12 不因此改计为通过。Mgr 0.2.13 的服务分支先移除再安装，现纳入 daemon 的显式 changeId 恢复边界。准备失败或候选提交前崩溃恢复原安装；候选已提交后保留新版本实际状态。异步跨调用的独立卸载／安装不按时间邻近猜成同一事务，需由发起者显式传递恢复身份。
+- Mgr 0.2.12 原页面的 Button 类型判断缺陷由上游 0.2.13 修正；本轮通过 Magi 原生在线入口完成 0.2.12 → 0.2.13，再完成原页面更新、取消、卸载与应用重启。最新证据 `viewport-profile-final/`，旧版缺陷证据 `profile-product-current/` 保留；未改写旧包或伪装组件，固定社区批次中的 0.2.12 不因此改计为通过。Mgr 0.2.13 的服务分支先移除再安装，现纳入 daemon 的显式 changeId 恢复边界。准备失败或候选提交前崩溃恢复原安装；候选已提交后保留新版本实际状态。异步跨调用的独立卸载／安装不按时间邻近猜成同一事务，需由发起者显式传递恢复身份。
 - Market／Share 的 GitHub 路径已接入并按第 12 节逐项验收；其他 Git 来源及安装提交所有阶段的崩溃恢复仍未完成。安装任务现持久保存请求、提交边界和回执，重启不自动重放，候选摘要由 PluginManager 核对；验收证据见第 12 节。尚不能据部分断进程验证宣称覆盖所有掉电阶段或外部副作用 exactly-once。
 - Debugging 的 `dsh_diagnose_plugin_load` 已完成真实工具审批、安装文件核对及运行／停用／故障／恢复验收；另以本机 Harness 0.2.2-rc.1 的真实 CLI 验证独立目录的 `dsh_dump_config` 与 `dsh_check_effect_mode`。Health 已验证原页面临时文件修复、取消、隔离日志及停用／重启恢复。其他诊断工具、宿主重启、其他修复类型及未列为实测通过的原包分支仍待验证，不能据单项通过认定整个插件完成。
-- 原包长错误的全文展开、内部滚动与键盘操作仍需验收；当前 390px 只验证默认折叠提示及关闭操作可达，不能据此判定所有错误详情已完整展示。
+- Mgr 0.2.13 的全文展开入口仍是不可聚焦的点击 `span`；当前关闭按钮的焦点与 Enter、此次失败原因在桌面／390px 的全文展开已实测。其他键盘路径及超过原包自身限高的错误仍需处理，不能据此次说明完整可见宣称所有错误页面均已验收。
 - 页面运行库封装在安装归档内，已通过运行组件内容身份及同版原包在线更新接通既有安装的更新。运行组件依然由 Magi 发行更新，原包隔离 peer 由在线依赖解析获取；没有独立运行组件发布源。私有／已撤回来源、所有平台及跨多次 Magi 发布的升级组合仍待验收。
 - 会话消息已接通当前主会话的工具／命令文本交付，以及 DSH 工具管线的补充上下文与结束本轮；跨会话与后台消息尚无产品入口。session/event、sessionProjections、完整 Agent 对象、provider 技能与作用域等仍按实际能力门槛处理，不能返回假对象或空结果冒充完成。
 - Windows、干净系统正式安装包、Android／iOS 真机触摸、屏幕录制权限引导和长期负载仍需各自验收。390px Electron 视口模拟不代表手机真机通过。
@@ -496,11 +498,11 @@
 
 本节每个功能只保留最近一次独立完整运行的证据。此前批次不代表本轮已复跑，不将不同批次的分项合并为一次通过，也不从检查数量推导生态支持率。逐次排错过程及被替代的验收记录由 Git 历史和原证据目录追溯。
 
-本轮 Web check（0 错误 0 警告）、外观投影与状态文字对比度回归、标准 macOS 目录包构建及解包自检通过；未运行全仓测试。目录包验收通过 `MAGI_PLUGIN_TEST_APP` 选择发行物，使用独立状态根和随包 daemon／Node。`MAGI_PLUGIN_CLIP_AUDIT_SOURCE` 可指定桌面技能的原始审计函数；各脚本的输出目录变量见源码与[验证入口](validation.md)。
+本轮 Web check（0 错误 0 警告）、标准 macOS 目录包构建及解包自检通过；此前外观投影与状态文字对比度回归本轮未单独复跑，真实 Electron 主题回归按下表执行；未运行全仓测试。目录包验收通过 `MAGI_PLUGIN_TEST_APP` 选择发行物，使用独立状态根和随包 daemon／Node。`MAGI_PLUGIN_CLIP_AUDIT_SOURCE` 可指定桌面技能的原始审计函数；各脚本的输出目录变量见源码与[验证入口](validation.md)。
 
 | 验证范围 | 入口 | 最近证据与边界 |
 | --- | --- | --- |
-| 本轮公共主题、页面业务及恢复 | `npm run test:electron-plugin-runtime` | 新构建 macOS arm64 目录包、Electron 45、随包 Node，独立完整运行 **141/141**；`target/plugin-acceptance/status-text-runtime-final/`。8 种外观中原包反色、层级、成功／警告／错误／信息提示与官方 ConnectionIndicator 的文字对比度最低约 **5.67:1**；真实重连回调、390px 对话框与阴影审计通过（`cut=0`、`hidden=0`）。整套 Remote 取消／迟到回复、工具结果、上下文、消息、技能、Debugging 0.7.2 原包诊断、2 MiB 字节、PNG／SVG、右栏、停用及重启回归通过，Renderer 与 iframe 异常 0。未启用外部 DSH CLI，不代表整个 Debugging 插件完成 |
+| 本轮公共主题、页面业务及恢复 | `npm run test:electron-plugin-runtime` | 新构建 macOS arm64 目录包、Electron 45、随包 Node，独立完整运行 **144/144**；`target/plugin-acceptance/viewport-runtime/`。8 种外观中原包反色、层级、成功／警告／错误／信息提示与官方 ConnectionIndicator 的文字对比度最低约 **5.67:1**；真实重连回调、390px 对话框与阴影审计通过（`cut=0`、`hidden=0`）。整套 Remote 取消／迟到回复、工具结果、上下文、消息、技能、Debugging 0.7.2 原包诊断、2 MiB 字节、PNG／SVG、右栏、停用及重启回归通过，Renderer 与 iframe 异常 0。新增短正文、长正文及内容收起回归：短设置页面保留可用视口，长正文沿宿主滚动且没有第二条正文滚动链，收起后同一文档与已保存表单状态保留。未启用外部 DSH CLI，不代表整个 Debugging 插件完成 |
 | 此前目录修改公共检查，本轮未复跑 Rust 与 compat | `test:compat`、目录包 | **123/123**，含管理调用的恢复身份、失败／异常／取消结算、显式卸载提交、daemon 管道关闭后翻译工具链退出及此前目录／调用回归。插件领域生命周期 **24/24**、插件管理 API **15/15**、真实 Node 宿主 **25/25**；恢复保留原摘要、授权、停用来源和资源，拒绝过期实例及被篡改归档，新版提交沿原数据重置和授权规则。`cargo check -p magi-daemon`、协议一致、Web check（0 错误 0 警告）及标准目录包构建／解包自检通过；未运行全仓测试 |
 | 此前工具结果公共检查，未在本轮复跑 | Rust、Web、协议 | 真实 Node 宿主 **25/25**、任务循环 **66/66**、完成结果／恢复定向 **3/3**（与任务循环有重叠），`cargo check -p magi-daemon`、协议一致、修改文件格式通过。Web check 0 错误 0 警告，工具错误与展示回归通过；展示回归仍输出任务外 FileChangeCard／FileSpan 的既有 SSR 嵌套按钮警告。前端删除失败工具重展示时重复写控制台告警的副作用，失败详情仍由原 canonical 展示 |
 | 此前 Health 原包业务与停用来源，未在本轮复跑 | `test:electron-dsh-health` | 新构建 macOS arm64 目录包、Electron 45、随包 Node；Health 3.0.5 与 Release Probe 0.0.8 在线原包 **21/21**，`target/plugin-acceptance/health-product-release/`。诊断、无效确认拒绝、停用来源原生详情展示、重启保留停用意愿、恢复运行、交接文件、原页面修复预览／取消／再次确认、真实临时文件隔离及原字节日志通过；390px 停用原因完整换行可见；详情默认／悬停、修复预览及完成态均 `cut=0`，页面异常 0。只覆盖列出的修复类型 |
@@ -512,12 +514,14 @@
 | 此前安装中断恢复，未在本轮复跑 | `test:electron-plugin-install-recovery` | 与本轮管理验收相同目录包 **10/10**；`target/plugin-acceptance/removal-install-recovery/`。解析中、版本已提交但 Node 未就绪、终态回执三个断进程位置；同请求不重新下载或替换版本，显式新请求收敛，恢复后真实业务命令返回。私有 registry 仅提供机制原包，未覆盖所有掉电、磁盘和替换阶段 |
 | 此前 WorkBuddy 外部服务，未在本轮复跑 | `MAGI_WORKBUDDY_CLI_BINARY=<CLI绝对路径> MAGI_WORKBUDDY_CLI_MODEL=hy3 MAGI_WORKBUDDY_CLI_INJECT_RESULT=1 npm run test:electron-workbuddy` | WorkBuddy 5.20.32 在线原包、CodeBuddy CLI 2.181.0，**15/15**；`target/plugin-acceptance/session-messages-workbuddy-final/`。原页面、CLI 读取验收文件、自动回注 codebuddy-bridge 来源及主模型真实回复；未覆盖国际版、视频或外部程序安装管理 |
 | 此前 REA 页面与工具，未在本轮复跑 | `test:electron-dsh-rea` | REA 1.2.0、rea-agents 6.5.0，**16/16**；`target/plugin-acceptance/product-ui-rea/`。SVG、原页面 Ghidra 链接、207 个真实工具、CAS、停用和恢复；早于最后的外观事件分类修正，未验证 Ghidra 实际安装或二进制分析 |
-| 此前 Appshot，未在本轮复跑 | `test:electron-appshot` | Appshot 0.4.2，**13/13**；`target/plugin-acceptance/appshot/`。真实 macOS 原生截图、关闭设置页后投递、后台附件和草稿挂载及重启后载荷恢复；不代表其他平台或全部时序分支 |
-| 此前目录应用与版本豁免，未在本轮复跑 | `test:electron-popular-dsh`、`test:electron-dsh-compatibility` | Market 1.2.2 原页面安装／更新、失败保留、目录重载、未变化实例和停用意图、重载后继续搜索，见 `target/plugin-acceptance/diagnostics-market-final/`；该批只选 1 个，完整分母仍为 9，未计为完整业务通过。Ops 原包扫描、豁免、在线安装、卸载及重启恢复见 `target/plugin-acceptance/dsh-compatibility/` |
-| 此前社区批次，未在本轮复跑 | `test:electron-popular-dsh` | 固定 9 个社区原包在线安装 9/9、启动 9/9、原生页面 9/9、路由 smoke 7/7、页面异常 0；在线更新验证 2 条，`coreVerified=0`、`qualified=false`，完整门槛退出 1。证据 `target/plugin-acceptance/skills-community-final/`；未完成业务保持 unverified，不能将安装率作为生态支持率 |
-| 本轮 Mgr 在线升级、状态主题及原页面流程 | `test:electron-dsh-profile` | 与本轮公共运行时相同的新 macOS arm64 目录包，独立完整运行 **47/47**；`target/plugin-acceptance/status-text-profile-final/`。Mgr 0.2.12 经原生在线事务升级为 0.2.13，原页面完成查询、配置恢复、启停、Release Probe 0.0.7 → 0.0.8 在线更新、更新／卸载取消、390px 确认、应用重启及最终卸载；页面异常 0。先移除式更新的解析失败恢复原摘要、授权及实际运行，8 种外观下真实错误与恢复说明的文字对比度最低约 **5.77:1**，状态底色全部不透明；深浅沉浸材质的 390px 错误浮层及关闭操作可达，阴影审计 `cut=0`、`hidden=0`。原包成功更新提示在入场动画结束后核对实际回执、颜色与截图。旧版已移除时终止真实 daemon，翻译工具链退出、重启恢复且不重放安装，再由原页面显式重试成功。长错误保持原包的折叠规则；未据该项宣称所有展开内容、所有崩溃提交阶段或固定 9 包的完整业务均已验收 |
+| 本轮 Appshot 原生截图及持久化 | `MAGI_APPSHOT_LIVE_CAPTURE=1 test:electron-appshot` | 与本轮视口修复相同的 macOS arm64 目录包，Appshot 0.4.2 在线原包 **14/14**；`target/plugin-acceptance/viewport-appshot/`。原包配置、原生进程不重复、关闭／重开设置复用客户端、真实 macOS 原生截图经后台事件进入当前输入框、daemon 持久附件原字节核对及应用重启恢复配置／图片均通过。证据 `core=capture-mounted` 仅覆盖截图业务及上述恢复，不替代其他平台、权限引导或完整社区样本门槛 |
+| 本轮 Ops 兼容豁免与在线原包安装 | `test:electron-dsh-compatibility` | 与本轮视口修复相同目录包、Ops 0.20.8 原包 **12/12**；`target/plugin-acceptance/viewport-ops/`。独立 compatibility 授权准入、失败安装撤销刚提交的豁免、daemon 实际豁免登记、真实 Release Probe 在线安装、原页面扫描、撤销豁免、应用重启持久化及卸载通过；不创建第二份物理 profile 或豁免文件，页面异常 0。只覆盖列出的业务，非整个 Ops 工具集通过 |
+| 本轮固定社区整批 | `MAGI_DSH_FUNCTIONAL_UPGRADE=1 test:electron-popular-dsh` | 固定 9 个原包在线安装 **9/9**、启动 **9/9**、原页面 **9/9**、路由 smoke **7/7**、页面异常 **0**；Upgrader、Mgr 与 Market 在线更新 **3 条**，`coreVerified=0`、`qualified=false`，完整门槛仍退出 1。证据 `target/plugin-acceptance/community-viewport-complete/`。Upgrader 包括版本切换、停用状态、不存在版本拒绝、归档落盘失败恢复及显式重试；Market 原页面未锁版安装 Mgr 0.2.13，按同一在线预览的精确版本及摘要核对，重载后继续查询真实安装结果。社区目录标注的旧版本不代表未锁版安装应停留在旧版；未执行项继续 unverified，不合并专项结果伪造整批成功 |
+| 本轮 Mgr 在线升级、状态主题及原页面流程 | `test:electron-dsh-profile` | 与本轮公共运行时相同的新 macOS arm64 目录包，独立完整运行 **54/54**；`target/plugin-acceptance/viewport-profile-final/`。Mgr 0.2.12 经原生在线事务升级为 0.2.13，原页面完成查询、配置恢复、启停、Release Probe 0.0.7 → 0.0.8 在线更新、更新／卸载取消、390px 确认、应用重启及最终卸载；页面异常 0。先移除式更新的解析失败恢复原摘要、授权及实际运行，8 种外观下真实错误与恢复说明的文字对比度最低约 **5.77:1**，状态底色全部不透明；深浅沉浸材质的 390px 错误浮层及关闭操作可达，阴影审计 `cut=0`、`hidden=0`。原包成功更新提示在入场动画结束后核对实际回执、颜色与截图。旧版已移除时终止真实 daemon，翻译工具链退出、重启恢复且不重放安装，再由原页面显式重试成功。新增 1280px 与 390px 原包真实错误全文展开／收起、完整恢复说明与阴影审计；原包关闭按钮取得真实文档焦点后由完整 Enter 按键关闭，恢复版本保持运行。复现前视口被短正文收缩至 240px，扩展后的说明被隐藏；公共最小视口修正后实际视口为 670px／557px，原包组件和样式不改写。证据含 `manager-error-expanded.json` 与焦点记录；不代表不可聚焦的全文展开入口、所有超长错误或所有崩溃提交阶段均已验收 |
 
 验收保持原包组件、异常与成功门槛，不过滤运行错误或整轮自动重试。进程重启前释放旧文档，重新启动后等待工作台初始化；折叠详情需要沿原页面展开后再执行操作。此前失败的脚本和产品记录保留原证据目录，由 Git 历史追溯，不合并不同批次作为一次通过。
+
+本轮视口与验收修正的原始证据保留：`long-error-probe/` 记录短正文视口下全文被裁切；`viewport-profile/` 记录仅发送 keyDown、未核对物理焦点造成的键盘验收失败。`community-current/`、`community-viewport/` 与 `community-viewport-final/` 分别保留 Market 安装旧版假设、把 latest 作为精确版本参数及依赖搜索索引导致的脚本失败；这些未改动原包。最终独立完整批次使用正式预览的省略版本解析语义并核对摘要，仍保留完整业务门槛未通过。
 
 此前恢复试跑的失败证据保留在 `removal-recovery-profile/` 和 `removal-recovery-profile-product/`：前者暴露 daemon 崩溃后旧翻译进程仍可联网重试，后者在恢复成功后未展开原包卡片而等待更新按钮超时。所有者管道回归与真实进程退出检查覆盖前一缺口；后续独立完整运行的结果仅以表中最新证据为准，不代替第 11.2 节剩余产品工作。
 

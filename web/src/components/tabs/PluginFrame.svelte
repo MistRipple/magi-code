@@ -442,6 +442,8 @@
   }
   .plugin-view--sized {
     flex: none;
-    min-height: 0;
+    /* 内容高度决定宿主滚动范围，可用高度托住原包的最小视口。
+       短页面也要保留完整视口，不能让 fixed 浮层和 vh 限高跟着正文缩小。 */
+    min-height: 100%;
   }
 </style>
