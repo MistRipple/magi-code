@@ -2,15 +2,16 @@
 // 管理插件单独获得 authorize 委托；失败不能把已下载当成已运行。
 import { NPM_NAME as NAME, parseBundleSpec, dshBundle } from './plugin-source.mjs';
 export { parseBundleSpec } from './plugin-source.mjs';
-import { profileCompatibility, updateProfileExemption } from './profile.mjs';
+import { profileCompatibility, updateProfileExemption, createProfileMutation } from './profile.mjs';
 
-const failure = (error, extra = {}) => ({ application: 'failed', ...extra,
+const failure = (error, extra = {}) => ({ ...error.receipt, application: 'failed', ...extra,
   error: { code: error.code ?? 'magi-operation-failed', message: String(error.message ?? error), diagnostic: String(error.message ?? error),
     ...(error.incompatible ? { incompatible: error.incompatible } : {}) } });
 
 export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTRY ?? 'https://registry.npmjs.org') {
   // 原生 DSH 管理面板允许在 HTTP 202 后继续工作；使用显式实例级管理
   // API，由 daemon 的独立 background 委托控制，不借用已结束的请求租约。
+  const mutateProfile = createProfileMutation(Boolean(api.plugins.background));
   if (api.plugins.background) api = { ...api, plugins: api.plugins.background };
   const find = async (name) => {
     if (!NAME.test(name)) throw new Error('npm 包名无效');
@@ -49,25 +50,32 @@ export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTR
         if (options.enabled !== undefined && typeof options.enabled !== 'boolean') throw new Error('enabled 必须是布尔值');
         if (options.approvedBuilds?.length) throw new Error('Magi 不执行安装脚本，不接受构建授权');
         if (options.registry && options.registry.replace(/\/+$/, '') !== registry.replace(/\/+$/, '')) throw new Error('安装源与 Magi 当前 registry 不一致，请先在 Magi 中配置安装源');
-        return await api.plugins.installBundle({ ...parseBundleSpec(spec), requestId: options.requestId ?? crypto.randomUUID(),
-          ...(options.enabled === undefined ? {} : { enabled: options.enabled }) });
-      } catch (error) { return failure(error, { stage: 'install' }); }
+        const input = { ...parseBundleSpec(spec), requestId: options.requestId ?? crypto.randomUUID(),
+          ...(options.enabled === undefined ? {} : { enabled: options.enabled }) };
+        return await mutateProfile(() => api.plugins.installBundle(input));
+      } catch (error) { return failure(error, { stage: error.receipt?.installed ? 'reconcile' : 'install' }); }
     };
   }
   if (api.plugins.cancelInstall) manager.cancelInstall = (requestId) => api.plugins.cancelInstall(requestId);
   if (api.plugins.setEnabled) manager.setBundleEnabled = async (name, enabled) => {
     try {
       if (typeof enabled !== 'boolean') throw new Error('enabled 必须是布尔值');
-      const plugin = await find(name);
-      await api.plugins.setEnabled(plugin.manifest.id, enabled, plugin.digest);
-      return { bundle: name, application: 'applied' };
+      if (!NAME.test(name)) throw new Error('npm 包名无效');
+      return await mutateProfile(async () => {
+        const plugin = await find(name);
+        await api.plugins.setEnabled(plugin.manifest.id, enabled, plugin.digest);
+        return { bundle: name, application: 'applied' };
+      });
     } catch (error) { return failure(error); }
   };
   if (api.plugins.remove) manager.removeBundle = async (name) => {
     try {
-      const plugin = await find(name);
-      await api.plugins.remove(plugin.manifest.id, plugin.digest);
-      return { bundle: name, application: 'applied' };
+      if (!NAME.test(name)) throw new Error('npm 包名无效');
+      return await mutateProfile(async () => {
+        const plugin = await find(name);
+        await api.plugins.remove(plugin.manifest.id, plugin.digest);
+        return { bundle: name, application: 'applied' };
+      });
     } catch (error) { return failure(error); }
   };
   return manager;

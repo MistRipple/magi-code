@@ -16,6 +16,175 @@ import { createHash } from 'node:crypto';
 import { zipSync, strToU8 } from 'fflate';
 import { spawn as spawnProfileProcess } from './runtime/profile-process.mjs';
 
+test('管理服务直接安装、启停和移除后的 profile 读取反映本次 daemon 已提交事实', async t => {
+  const home=await mkdtemp(join(tmpdir(),'magi-profile-manager-'));t.after(()=>rm(home,{recursive:true,force:true}));
+  let plugins=[{manifest:{id:'dsh.target',name:'Target'},digest:'old',enabled:true,active:true,runtime:{state:'running'},
+    source:{kind:'upstream',location:'dsh:target@1.0.0'}}];
+  const api={plugins:{
+    list:async()=>({plugins:structuredClone(plugins)}),
+    async installBundle(){plugins[0]={...plugins[0],digest:'new',source:{kind:'upstream',location:'dsh:target@2.0.0'}};
+      return {application:'applied',bundle:'target',installed:true,version:'2.0.0',changed:true};},
+    async setEnabled(id,enabled,digest){assert.equal(id,'dsh.target');assert.equal(digest,plugins[0].digest);plugins[0].enabled=enabled;plugins[0].active=enabled;},
+    async remove(id,digest){assert.equal(id,'dsh.target');assert.equal(digest,plugins[0].digest);plugins=[];},
+  }};
+  const release=configureProfile(api,{home});t.after(release);
+  const manager=createPluginManager(api);
+  await withProfile(async()=>{
+    const manifest=()=>JSON.parse(fs.readFileSync(join(profilePath(),'package.json'),'utf8'));
+    assert.equal(manifest().dependencies.target,'1.0.0');
+    assert.equal((await manager.installBundle('target@2.0.0')).application,'applied');
+    assert.equal(manifest().dependencies.target,'2.0.0','同一次调用不能继续读到更新前版本');
+    assert.equal(loaderEntries()[0].fiber.state,2);
+    await manager.setBundleEnabled('target',false);
+    assert.equal(loaderEntries()[0].disabled,true,'成功启停后 loader 与 daemon 一致');
+    await manager.removeBundle('target');
+    assert.deepEqual(manifest().dependencies,{});
+    assert.deepEqual(loaderEntries(),[],'移除后不保留旧安装条目');
+  });
+});
+
+test('管理修改先结算有效配置提案，串行读取新版本；取消、无效提案和未知回执不重放业务', async t => {
+  const home=await mkdtemp(join(tmpdir(),'magi-profile-mutation-'));t.after(()=>rm(home,{recursive:true,force:true}));
+  let plugin={manifest:{id:'dsh.target'},digest:'old',enabled:true,active:true,source:{kind:'upstream',location:'dsh:target@1.0.0'}};
+  let failRead=false,installations=0;
+  const actions=[];
+  const api={plugins:{
+    list:async()=>{if(failRead)throw new Error('目录读取中断');return {plugins:[structuredClone(plugin)]};},
+    async installBundle(){installations++;plugin={...plugin,digest:'new',source:{kind:'upstream',location:'dsh:target@2.0.0'}};
+      return {application:'applied',bundle:'target',version:'2.0.0',installed:true,changed:true};},
+    async setEnabled(id,enabled,digest){assert.equal(id,'dsh.target');assert.equal(digest,plugin.digest);actions.push([enabled,digest]);plugin.enabled=enabled;},
+  }};
+  const release=configureProfile(api,{home});t.after(release);
+  const manager=createPluginManager(api);
+  await withProfile(async()=>{
+    const patch=join(profilePath(),'cordis.patch.yml');
+    fs.writeFileSync(patch,dump([{id:'dsh.target',name:'target',disabled:true}]));
+    const installed=manager.installBundle('target@2.0.0');
+    const enabled=manager.setBundleEnabled('target',true);
+    await Promise.all([installed,enabled]);
+    assert.deepEqual(actions,[[false,'old'],[true,'new']],'配置提案不能因重读丢失或用旧摘要覆盖新版');
+    assert.equal(loaderEntries()[0].disabled,false);
+  });
+  await assert.rejects(withProfile(async()=>{
+    const file=join(profilePath(),'package.json'),document=JSON.parse(fs.readFileSync(file,'utf8'));
+    document.dependencies.target='unverified';fs.writeFileSync(file,JSON.stringify(document));
+    const result=await manager.installBundle('target@2.0.0');
+    assert.equal(result.application,'failed');
+    assert.equal(installations,1,'无效清单提案在下一次管理副作用前拒绝');
+  }),/清单提案/);
+  const controller=new AbortController();
+  await assert.rejects(withProfile(async()=>{
+    controller.abort(new Error('用户取消'));
+    assert.equal((await manager.installBundle('target@2.0.0')).application,'failed');
+  },controller.signal),/用户取消/);
+  assert.equal(installations,1);
+  await withProfile(async()=>{
+    api.plugins.installBundle=async()=>{installations++;failRead=true;return {application:'applied',bundle:'target',version:'2.0.0',installed:true,changed:false};};
+    const result=await manager.installBundle('target@2.0.0');
+    assert.equal(result.application,'failed');assert.equal(result.installed,true);assert.equal(result.version,'2.0.0');
+    assert.equal(result.changed,false);assert.equal(result.error.code,'profile-refresh-failed');
+    assert.equal(result.stage,'reconcile');
+    assert.match(result.error.message,/不要重复已提交/);assert.equal(installations,2);
+    failRead=false;
+  });
+  api.plugins.installBundle=async()=>{installations++;plugin.source.location='dsh:target@3.0.0';throw new Error('安装响应中断');};
+  await withProfile(async()=>{
+    assert.equal((await manager.installBundle('target@3.0.0')).application,'failed');
+    assert.equal(JSON.parse(fs.readFileSync(join(profilePath(),'package.json'),'utf8')).dependencies.target,'3.0.0',
+      '业务报错后仍重读 daemon，不将已变更状态藏在旧快照里');
+  });
+  assert.equal(installations,3);
+});
+
+test('显式后台管理在请求结束后读取独立新快照，前台旧调用与被替换实例不能继续修改', async t => {
+  const home=await mkdtemp(join(tmpdir(),'magi-profile-background-'));t.after(()=>rm(home,{recursive:true,force:true}));
+  let installed=0,reads=0;
+  const plugins={
+    list:async()=>{reads++;return {plugins:[]};},
+    installBundle:async()=>{installed++;return {application:'applied',bundle:'target',installed:true};},
+  };
+  const off=configureProfile({plugins},{home});
+  let ended=false;t.after(()=>{if(!ended)off();});
+  const foreground=createPluginManager({plugins});
+  const background=createPluginManager({plugins:{...plugins,background:plugins}});
+  const controller=new AbortController();let lateForeground,lateBackground;
+  await withProfile(()=>{
+    lateForeground=AsyncLocalStorage.bind(()=>foreground.installBundle('target@1.0.0'));
+    lateBackground=AsyncLocalStorage.bind(()=>background.installBundle('target@1.0.0'));
+  },controller.signal);
+  controller.abort();
+  assert.equal((await lateForeground()).application,'failed');assert.equal(installed,0);
+  const before=reads;
+  assert.equal((await lateBackground()).application,'applied','后台不借用已取消的前台请求');
+  assert.equal(installed,1);assert.ok(reads>=before+2,'后台开始与结算分别读取 daemon 当前事实');
+  let finish,began;
+  const started=new Promise(resolve=>{began=resolve;});
+  plugins.installBundle=async()=>{installed++;began();await new Promise(resolve=>{finish=resolve;});return {application:'applied',installed:true};};
+  let inFlight;
+  await withProfile(async()=>{inFlight=background.installBundle('target@1.0.0');await started;});
+  finish();assert.equal((await inFlight).application,'applied','前台结束不丢弃已开始后台操作的真实回执');
+  off();ended=true;
+  assert.equal((await lateBackground()).application,'failed');assert.equal(installed,2,'过期实例的后台委托不能继续');
+});
+
+test('Node 辅助进程在管理快照读取期间退出，释放读取后不能迟到发起安装', {timeout:10000}, async t => {
+  const home=await mkdtemp(join(tmpdir(),'magi-profile-process-read-'));t.after(()=>rm(home,{recursive:true,force:true}));
+  let hold=false,installations=0,releaseRead,began;
+  const waiting=new Promise(resolve=>{began=resolve;}),gate=new Promise(resolve=>{releaseRead=resolve;});
+  const off=configureProfile({plugins:{
+    async list(){if(hold){began();await gate;}return {plugins:[]};},
+    async installBundle(){installations++;return {application:'applied'};},
+    async cancelInstall(){return {status:'not-running'};},
+  }},{home});t.after(off);t.after(releaseRead);
+  const entry=join(home,'install.mjs');
+  await writeFile(entry,`import {callProfileProcess} from ${JSON.stringify(new URL('./runtime/profile-process-call.mjs',import.meta.url).href)};
+process.stdout.write('READY\\n');await new Promise(resolve=>process.stdin.once('data',resolve));
+await callProfileProcess('install',['add','target@1.0.0','--dir',${JSON.stringify(join(home,'profiles/magi'))}]);`);
+  await withProfile(async()=>{
+    const child=profileSpawn(process.execPath,[entry],{env:{...process.env,DSH_HOME:home}});
+    t.after(()=>child.kill());
+    let text='';
+    await new Promise(resolve=>child.stdout.on('data',chunk=>{text+=chunk;if(text.includes('READY'))resolve();}));
+    child.stderr.resume();hold=true;child.stdin.write('go');await waiting;
+    const closed=once(child,'close');child.kill();await closed;
+    releaseRead();await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(installations,0,'子进程退出后不得借新快照复活安装请求');
+  });
+});
+
+test('读取管理快照期间替换实例或取消调用，迟到快照不能启动业务或提交配置', async t => {
+  const home=await mkdtemp(join(tmpdir(),'magi-profile-snapshot-owner-'));t.after(()=>rm(home,{recursive:true,force:true}));
+  let releaseRead,began,installations=0;
+  const waiting=new Promise(resolve=>{began=resolve;}),gate=new Promise(resolve=>{releaseRead=resolve;});
+  const plugins={
+    async list(){began();await gate;return {plugins:[]};},
+    async installBundle(){installations++;return {application:'applied'};},
+  };
+  const off=configureProfile({plugins},{home});
+  const pending=createPluginManager({plugins:{...plugins,background:plugins}}).installBundle('target@1.0.0');
+  await waiting;off();
+  const release=configureProfile({plugins:{list:async()=>({plugins:[]})}},{home});
+  releaseRead();
+  const result=await pending;
+  assert.equal(result.application,'failed');assert.match(result.error.message,/当前实例/);
+  assert.equal(installations,0,'旧实例的快照回执不能借新实例身份发起安装');
+  release();
+
+  let reads=0,writes=0;
+  const controller=new AbortController();
+  const close=configureProfile({plugins:{
+    async list(){
+      if(++reads===2)controller.abort(new Error('用户取消配置提交'));
+      return {plugins:[{manifest:{id:'dsh.target'},digest:'one',enabled:true,source:{kind:'upstream',location:'dsh:target@1.0.0'}}]};
+    },
+    async setEnabled(){writes++;},
+  }},{home});t.after(close);
+  await assert.rejects(withProfile(()=>{
+    fs.writeFileSync(join(profilePath(),'cordis.patch.yml'),dump([{id:'dsh.target',name:'target',disabled:true}]));
+  },controller.signal),/用户取消配置提交/);
+  assert.equal(writes,0,'目录读取期间取消后不能继续提交启停提案');
+});
+
 test('明确指定外部 DSH 实例的 CLI 和 Node 辅助进程保留原环境，不进入 Magi 安装委托', async t => {
   const home = await mkdtemp(join(tmpdir(), 'magi-profile-ownership-')); t.after(() => rm(home, { recursive: true, force: true }));
   const external = join(home, 'external'), directory = join(external, 'profiles', 'web');

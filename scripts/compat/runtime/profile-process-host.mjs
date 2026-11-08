@@ -34,6 +34,7 @@ export function createProfileProcesses(api, { home, registry }) {
     compatibility: api.plugins.compatibility ? await api.plugins.compatibility() : null });
   function revoke(owner) {
     if (!owners.delete(owner.token)) return;
+    owner.controller.abort(new Error('辅助进程所属实例已失效'));
     for (const id of owner.installations) void api.plugins.cancelInstall(id).catch(() => {});
     for (const socket of owner.sockets) socket.destroy();
   }
@@ -59,7 +60,7 @@ export function createProfileProcesses(api, { home, registry }) {
     const id = randomBytes(16).toString('hex');
     owner.installations.add(id);
     try {
-      const result = await createPluginManager(api, registry).installBundle(spec, { enabled: true, requestId: id });
+      const result = await withProfile(() => createPluginManager(api, registry).installBundle(spec, { enabled: true, requestId: id }), owner.controller.signal);
       return { result, snapshot: await snapshot() };
     } finally { owner.installations.delete(id); }
   }
@@ -103,7 +104,7 @@ export function createProfileProcesses(api, { home, registry }) {
       if (owners.size >= 16) throw new Error('当前插件的 Node 辅助进程过多');
       signal?.throwIfAborted();
       boundary.runInAsyncScope(listen);
-      const token = randomBytes(32).toString('hex'), owner = { token, installations: new Set(), sockets: new Set() };
+      const token = randomBytes(32).toString('hex'), owner = { token, installations: new Set(), sockets: new Set(), controller: new AbortController() };
       const env = { ...(options.env ?? process.env), MAGI_PROFILE_PROCESS_ENDPOINT: endpoint, MAGI_PROFILE_PROCESS_TOKEN: token,
         MAGI_PROFILE_PROCESS_HOME: home, MAGI_PROFILE_PROCESS_REGISTRY: registry };
       // 委托只持有父扩展的受限端口，不继承 daemon RPC 传输凭据。

@@ -16,6 +16,16 @@ async function api(path, body) {
   const value = await response.json(); assert.equal(response.status,200,`${path}: ${JSON.stringify(value)}`); return value;
 }
 const plugins = async () => (await api('/api/plugins')).plugins;
+async function start() {
+  app=launchApp({executable:join(appRoot,'Contents/MacOS/Magi'),cwd:root,cdpPort,env:{MAGI_STATE_ROOT:join(work,'state'),MAGI_DESKTOP_DAEMON_PORT:String(port),MAGI_EXTENSION_NODE:'',MAGI_EXTENSION_COMPAT:'',MAGI_OPEN_BROWSER:'0'}});
+  await waitFor(()=>api('/health'),'daemon',60_000);
+  page=await waitFor(()=>connectAppPage(cdpPort,port,errors),'Electron');ui=pageTools(page);
+  await waitFor(()=>ui.exists('[data-testid=sidebar-settings]'),'工作台初始化');
+}
+async function stop(logName) {
+  frame?.close();frame=undefined;page?.close();page=undefined;
+  await writeFile(join(output,logName),app.log.join(''));await app.stop();app=undefined;
+}
 async function install(name,version) {
   const request={ecosystem:'dsh',package:name,version}; const preview=await api('/api/plugins/upstream/preview',request);
   const installed=await api('/api/plugins/upstream/install',{...request,expectedDigest:preview.candidate.digest});
@@ -26,11 +36,31 @@ async function install(name,version) {
 }
 try {
   assert.ok(!await fetch(origin+'/health').then(()=>true,()=>false),'验收端口被占用');
-  app=launchApp({executable:join(appRoot,'Contents/MacOS/Magi'),cwd:root,cdpPort,env:{MAGI_STATE_ROOT:join(work,'state'),MAGI_DESKTOP_DAEMON_PORT:String(port),MAGI_EXTENSION_NODE:'',MAGI_EXTENSION_COMPAT:'',MAGI_OPEN_BROWSER:'0'}});
-  await waitFor(()=>api('/health'),'daemon',60_000); page=await waitFor(()=>connectAppPage(cdpPort,port,errors),'Electron'); ui=pageTools(page);
-  const manager=await install('dsh-plugin-mgr','0.2.12');
+  await start();
+  let manager=await install('dsh-plugin-mgr','0.2.12');
   report.check('Mgr 原包在线安装与必需 loader 启动成功',true);
   report.check('管理授权明确声明委托授权能力',manager.manifest.permissions.some(p=>p.kind==='pluginManagement'&&p.targets.includes('authorize')));
+  const oldManager=manager;
+  await ui.click('[data-testid=sidebar-settings]');
+  await waitFor(()=>ui.exists('[data-testid=settings-nav-plugins]'),'原生插件管理入口');await ui.click('[data-testid=settings-nav-plugins]');
+  const nativeRow=`[data-testid=plugin-row][data-plugin-id=${JSON.stringify(manager.manifest.id)}]`;
+  await waitFor(()=>ui.exists(nativeRow),'已安装旧版 Mgr');await ui.click(nativeRow);
+  await waitFor(()=>ui.exists('[data-testid=plugin-detail-update]'),'原生在线更新入口',90_000);
+  await ui.click('[data-testid=plugin-detail-update]');
+  await waitFor(()=>ui.exists('[data-testid=plugin-candidate][data-operation=upgrade]'),'Mgr 在线升级预览',240_000);
+  report.check('原生在线更新预览实际获取 Mgr 0.2.13，不替换本地页面代码',
+    (await ui.text('[data-testid=plugin-candidate]')).includes('0.2.13'));
+  await ui.click('[data-action=cancel-candidate]');
+  const cancelled=(await plugins()).find(p=>p.manifest.id===manager.manifest.id);
+  report.check('取消 Mgr 在线升级保留旧摘要、授权及真实运行',cancelled.digest===oldManager.digest&&cancelled.active&&cancelled.runtime.state==='running');
+  await ui.click('[data-testid=plugin-detail-update]');
+  await waitFor(()=>ui.exists('[data-testid=plugin-candidate][data-operation=upgrade]'),'再次预览在线升级',240_000);
+  await ui.click('[data-action=confirm-candidate]');
+  manager=await waitFor(async()=>{const value=(await plugins()).find(p=>p.manifest.id===oldManager.manifest.id);return value.manifest.version==='0.2.13'&&value;},'在线提交新版 Mgr',240_000);
+  report.check('Mgr 0.2.12 沿原生在线事务更新到 0.2.13，新摘要要求重新授权',
+    manager.digest!==oldManager.digest&&manager.enabled&&!manager.active&&manager.grants.length===0);
+  await waitFor(()=>ui.exists('[data-action=activate]'),'新版原生授权入口');await ui.click('[data-action=activate]');
+  manager=await waitFor(async()=>{const value=(await plugins()).find(p=>p.manifest.id===oldManager.manifest.id);return value.runtime?.state==='running'&&value;},'新版 Mgr 授权后运行',120_000);
   const target=await install('dsh-plugin-release-probe','0.0.7'), targetId=target.manifest.id;
   const current=async()=>(await plugins()).find(p=>p.manifest.id===targetId);
   const route=async(action,body)=>{
@@ -101,10 +131,26 @@ try {
   report.check('修复后沿原包重新启用恢复实际运行，原包页面清除故障',true);
   await writeFile(join(output,'manager-recovered.png'),Buffer.from(await ui.screenshot(),'base64'));
   await waitFor(()=>frame.evaluate(`Boolean([...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe')?.querySelector('.dshpm-btn-update'))`),'原包显示在线更新入口',60_000);
-  await frame.evaluate(`const card=[...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe');card.querySelector('.dshpm-btn-update').click();`);
+  await frame.evaluate(`(() => {const card=[...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe');card.querySelector('.dshpm-btn-update').click();})()`);
   await waitFor(()=>frame.evaluate(`Boolean(document.querySelector('[role=dialog]'))`),'原包更新确认');
   report.check('原包更新确认显示目标名称和实际新版',await frame.evaluate(`document.querySelector('[role=dialog]').innerText.includes('dsh-plugin-release-probe') && document.querySelector('[role=dialog]').innerText.includes('0.0.8')`));
   await writeFile(join(output,'manager-update-confirm.png'),Buffer.from(await ui.screenshot(),'base64'));
+  await page.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:false});
+  const narrowConfirm=await waitFor(()=>frame.evaluate(`(() => {
+    const dialog=document.querySelector('[role=dialog]'),button=[...dialog.querySelectorAll('button')].find(el=>/^(更新|Update)$/.test(el.innerText.trim()));
+    const box=dialog.getBoundingClientRect(),action=button.getBoundingClientRect();
+    return box.width>0&&box.left>=0&&box.right<=innerWidth&&box.top>=0&&box.bottom<=innerHeight
+      &&action.width>0&&action.left>=0&&action.right<=innerWidth&&action.top>=0&&action.bottom<=innerHeight
+      &&document.documentElement.scrollWidth<=innerWidth;
+  })()`),'390px 原包确认框与主要操作完整可达');
+  report.check('390px 原包更新确认完整展示并保留可见主操作',narrowConfirm);
+  await writeFile(join(output,'manager-update-confirm-390.png'),Buffer.from(await ui.screenshot(),'base64'));
+  await page.call('Emulation.clearDeviceMetricsOverride');
+  await frame.evaluate(`[...document.querySelectorAll('[role=dialog] button')].find(button=>/^(取消|Cancel)$/.test(button.innerText.trim())).click();`);
+  await waitFor(()=>frame.evaluate(`!document.querySelector('[role=dialog]')`),'取消原包更新');
+  report.check('取消原包更新确认保留目标版本与运行',(await current()).digest===target.digest&&(await current()).runtime.state==='running');
+  await frame.evaluate(`[...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe').querySelector('.dshpm-btn-update').click();`);
+  await waitFor(()=>frame.evaluate(`Boolean(document.querySelector('[role=dialog]'))`),'重新打开更新确认');
   await frame.evaluate(`[...document.querySelectorAll('[role=dialog] button')].find(button=>/^(更新|Update)$/.test(button.innerText.trim())).click();`);
   await waitFor(async()=>(await current()).manifest.version==='0.0.8','原包确认按钮完成在线更新',180_000);
   const after=await current();
@@ -112,10 +158,28 @@ try {
   await waitFor(async()=>(await current()).runtime?.state==='running','升级后真实运行',120_000);
   report.check('已获用户授权的管理插件沿原生授权入口激活新版',after.active&&after.grants.length>0);
   await waitFor(()=>frame.evaluate(`Boolean([...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe')?.innerText.includes('0.0.8'))`),'原包页面显示更新结果');
-  await frame.evaluate(`const card=[...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe');card.querySelector('.dshpm-btn-danger').click();`);
+  const updateFeedback=await waitFor(async()=>{const feedback=await frame.evaluate(`Array.from(document.querySelectorAll('.dshpm-toast')).map(node=>({text:node.innerText,error:node.classList.contains('dshpm-toast-err')}))`);return feedback.length&&feedback;},'原包完成更新并显示业务回执',180_000);
+  await writeFile(join(output,'update-feedback.json'),JSON.stringify(updateFeedback,null,2));
+  report.check('原包更新回执与实际新版一致，不把已经完成的更新误报为未更新',updateFeedback.some(item=>!item.error&&item.text.includes('0.0.8'))&&!updateFeedback.some(item=>item.error),JSON.stringify(updateFeedback));
+  await frame.evaluate(`(() => {const card=[...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe');card.querySelector('.dshpm-btn-danger').click();})()`);
   await waitFor(()=>frame.evaluate(`Boolean(document.querySelector('[role=dialog]'))`),'原包卸载确认');
   report.check('卸载确认包含真实包名和已更新版本',await frame.evaluate(`document.querySelector('[role=dialog]').innerText.includes('dsh-plugin-release-probe') && document.querySelector('[role=dialog]').innerText.includes('0.0.8')`));
   await writeFile(join(output,'manager-uninstall-confirm.png'),Buffer.from(await ui.screenshot(),'base64'));
+  await frame.evaluate(`[...document.querySelectorAll('[role=dialog] button')].find(button=>/^(取消|Cancel)$/.test(button.innerText.trim())).click();`);
+  await waitFor(()=>frame.evaluate(`!document.querySelector('[role=dialog]')`),'取消原包卸载');
+  report.check('取消原包卸载保留更新后真实版本与运行',(await current()).digest===after.digest&&(await current()).runtime.state==='running');
+  await stop('electron-before-restart.log');await start();
+  const restarted=await waitFor(async()=>{const value=(await plugins()).find(p=>p.manifest.id===manager.manifest.id);return value?.runtime?.state==='running'&&value;},'应用重启恢复新版 Mgr',120_000);
+  report.check('应用重启保留在线更新的 Mgr 与目标插件，不重新替换版本',restarted.digest===manager.digest&&(await current()).digest===after.digest);
+  await ui.click('[data-testid=sidebar-settings]');await waitFor(()=>ui.exists(nav),'重启后原包入口');await ui.click(nav);
+  const restartedUrl=await waitFor(()=>page.evaluate(`document.querySelector(${JSON.stringify(selector)})?.src`),'重启后原包页面');
+  frame=await waitFor(()=>connectTarget(cdpPort,t=>['iframe','page'].includes(t.type)&&t.url===restartedUrl,'重启 Mgr 原页面',errors),'重启后原包文档');
+  await waitFor(()=>frame.evaluate(`document.querySelector('.dshpm-root')?.classList.contains('is-cols-2')&&document.body.innerText.includes('dsh-plugin-release-probe')`),'应用重启恢复原包布局及真实安装列表');
+  await frame.evaluate(`(() => {const card=[...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe');if(!card.classList.contains('is-open'))card.querySelector('.dshpm-row').click();})()`);
+  await waitFor(()=>frame.evaluate(`Boolean([...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe')?.innerText.includes('0.0.8'))`),'展开重启后的原包详情读取实际版本');
+  report.check('应用重启后原包隔离布局偏好与实际更新结果一致',true);
+  await frame.evaluate(`[...document.querySelectorAll('.dshpm-card')].find(el=>el.querySelector('.dshpm-name')?.textContent==='dsh-plugin-release-probe').querySelector('.dshpm-btn-danger').click();`);
+  await waitFor(()=>frame.evaluate(`Boolean(document.querySelector('[role=dialog]'))`),'重启后再次卸载确认');
   await frame.evaluate(`[...document.querySelectorAll('[role=dialog] button')].find(button=>/^(卸载|Uninstall)$/.test(button.innerText.trim())).click();`);
   await waitFor(async()=>!await current(),'原包确认按钮完成卸载',60_000);
   report.check('原包 dsh plugin remove 调用真正停止并卸载目标',!await current());

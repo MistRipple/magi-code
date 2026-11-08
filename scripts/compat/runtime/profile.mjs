@@ -43,12 +43,15 @@ export function configureProfile(api, { home = process.env.DSH_HOME, registry = 
 }
 
 async function refresh(scope) {
-  const list = await host.api.plugins.list({ includeUpstreamManifest: true });
-  const compatibility = host.api.plugins.compatibility ? await host.api.plugins.compatibility() : null;
+  const { api } = state(scope).owner;
+  const list = await api.plugins.list({ includeUpstreamManifest: true });
+  state(scope);
+  const compatibility = api.plugins.compatibility ? await api.plugins.compatibility() : null;
+  state(scope);
   applyProfileSnapshot(scope, { list, compatibility });
 }
 export function applyProfileSnapshot(scope, { list, compatibility }) {
-  scope ??= state();
+  scope = state(scope);
   scope.compatibility = compatibility;
   scope.bundles = list.plugins.map(bundle).filter(Boolean);
   scope.original = new Map(scope.bundles.map((item) => [item.name, { ...item, digest: item.plugin.digest }]));
@@ -125,9 +128,8 @@ export async function updateProfileExemption(target, runtimeVersion, enabled, ac
   return structuredClone(value);
 }
 
-function state() {
-  const scope = scopes.getStore();
-  if (!scope || scope.closed) throw error('EPERM', 'DSH profile 只能在 daemon 已签发的调用快照内访问');
+function state(scope = scopes.getStore()) {
+  if (!scope || scope.closed || !scope.owner || scope.owner !== host) throw error('EPERM', 'DSH profile 只能在 daemon 已签发的当前实例调用快照内访问');
   scope.signal?.throwIfAborted();
   return scope;
 }
@@ -293,9 +295,10 @@ export function createProfileReload() {
 }
 
 async function commit(scope) {
-  scope.signal?.throwIfAborted();
+  const { api } = state(scope).owner;
   if (!scope.dirty.size) return;
-  const latest = await host.api.plugins.list();
+  const latest = await api.plugins.list();
+  state(scope);
   for (const current of latest.plugins) {
     const original = scope.original.get(bundle(current)?.name);
     if (original && current.digest !== original.digest) throw error('ECONFLICT', '插件版本在 profile 提案期间已变化，请刷新后重试');
@@ -328,17 +331,65 @@ async function commit(scope) {
   for (const [id, { disabled, reason }] of pending) {
     const current = byId.get(id);
     if (current.plugin.enabled !== !disabled) {
-      scope.signal?.throwIfAborted();
-      await host.api.plugins.setEnabled(id, !disabled, current.plugin.digest, {
+      state(scope);
+      await api.plugins.setEnabled(id, !disabled, current.plugin.digest, {
         expectedState: { enabled: current.plugin.enabled, ...(current.plugin.disabledBy ? { disabledBy: current.plugin.disabledBy } : {}) },
         ...(disabled && reason?.trim() ? { reason } : {}),
       });
     }
   }
 }
+
+// 管理服务与辅助进程在同一调用中先结算已有配置提案，再执行真实修改并重读
+// daemon。上游随后读取 profile/loader 时须看到刚完成的安装，不能保留旧版本。
+export function createProfileMutation(background = false) {
+  const owner = host;
+  return callback => {
+    if (!owner) return callback();
+    if (host !== owner) return Promise.reject(new Error('profile 修改所属实例已失效'));
+    const scope = scopes.getStore();
+    if (scope && !scope.closed && !scope.signal?.aborted) return mutateProfile(callback, background);
+    if (!background) return Promise.reject(new Error('profile 修改缺少活动调用快照'));
+    // HTTP 202 后的工作只使用显式后台管理端口；重新读取实例事实，
+    // 不继承已经关闭的请求快照、取消信号或待提交提案。
+    return scopes.run(undefined, () => withProfile(() => mutateProfile(callback)));
+  };
+}
+
+function mutateProfile(callback, background = false) {
+  const scope = scopes.getStore(), owner = host;
+  if (!scope) return callback();
+  const operation = (scope.mutations ?? Promise.resolve()).then(async () => {
+    if (!owner || host !== owner) throw new Error('profile 修改所属实例已失效');
+    if (background && (scope.closed || scope.signal?.aborted)) {
+      return scopes.run(undefined, () => withProfile(() => mutateProfile(callback)));
+    }
+    state(); scope.signal?.throwIfAborted();
+    await commit(scope);
+    if (scope.dirty.size) await refresh(scope);
+    scope.signal?.throwIfAborted();
+    let result, failure;
+    try { result = await callback(); } catch (cause) { failure = cause; }
+    if (background && (scope.closed || scope.signal?.aborted)) {
+      if (failure) throw failure;
+      return result;
+    }
+    try {
+      if (host !== owner) throw new Error('profile 修改所属实例已失效');
+      state(); await refresh(scope);
+    } catch (cause) {
+      throw Object.assign(new Error(`插件管理操作已返回，但最新目录尚未确认；请刷新状态，不要重复已提交的业务：${failure?.message ?? cause.message}`, { cause }),
+        { code: 'profile-refresh-failed', receipt: result });
+    }
+    if (failure) throw failure;
+    return result;
+  });
+  scope.mutations = operation.catch(() => {});
+  return operation;
+}
 export async function withProfile(callback, signal) {
   if (!host || scopes.getStore()) return callback();
-  const scope = { signal, time: Date.now(), descriptors: new Map() };
+  const scope = { owner: host, signal, time: Date.now(), descriptors: new Map() };
   await refresh(scope);
   return scopes.run(scope, async () => {
     try { const result = await callback(); if (!(result?.status >= 400 || result?.body?.ok === false || result?.isError)) await commit(scope); return result; }
@@ -348,7 +399,7 @@ export async function withProfile(callback, signal) {
 
 // 辅助进程的同步退出也必须先结算提案；终态回执由父实例经同一 commit 入口取得。
 export async function runProfileProcess(callback, finalize) {
-  const scope = { time: Date.now(), descriptors: new Map() };
+  const scope = { owner: host, time: Date.now(), descriptors: new Map() };
   await refresh(scope);
   return scopes.run(scope, () => {
     process.once('exit', code => finalize({
@@ -408,7 +459,6 @@ export function profileSpawn(file, args = [], options) {
       try { result = verb === 'add' ? await manager.installBundle(spec, { enabled: true, requestId }) : await manager.removeBundle(spec); }
       finally { controller.signal.removeEventListener('abort', cancel); scope.signal?.removeEventListener('abort', cancel); }
       if (result.application !== 'applied') throw new Error(result.error?.message ?? `插件管理结果：${result.application}`);
-      await refresh(scope);
       child.stdout.end('Magi daemon 已提交插件管理操作\n'); code = 0;
     } catch (cause) { child.stderr.end(String(cause.message ?? cause)); }
     finally { child.stdout.end(); child.stderr.end(); child.emit('exit', code, null); child.emit('close', code, null); }
