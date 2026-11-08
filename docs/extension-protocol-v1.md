@@ -4,7 +4,7 @@
 
 ## 0. 状态与适用范围
 
-【现状】SDK 2、传输协议 1.0、扩展 API 1.0。daemon 独立托管每插件一个 Node 进程；支持钩子、模型工具、用户命令、持久计划及反向服务。SDK 1／QuickJS、迁移 VM、工作流与会话引擎替换不提供。DSH 运行时兼容层正在按设计文档第 11.1 节改造，pi 运行器后置；MCP 完整内置于 Magi，不经插件注册。
+【现状】SDK 2、传输协议 1.0、扩展 API 1.0。daemon 独立托管每插件一个 Node 进程；支持钩子、模型工具、用户命令、持久计划及反向服务。SDK 1／QuickJS、迁移 VM、工作流与会话引擎替换不提供。DSH 翻译功能按设计文档第 6.0 节的产品合同开发，当前能力与未完成项见第 11 节；pi 运行器后置；MCP 完整内置于 Magi，不经插件注册。
 
 【现状】下表列出的 15 个钩子名称均有实际接线。`input`／`subagent.spawn` 仅允许 guard，`model.request` 仅允许 observe；清单声明未接线模式时安装拒绝。不能把目录中未来可能支持的模式当作已交付合同。
 
@@ -154,13 +154,15 @@ DSH `profileContext.packageManager` 提供插件实例拥有的内部 Node 命�
 
 DSH 页面里的 `EventSource` 通过相同路由调用承载 SSE。兼容层保留 `/__magi_compat/streams` 控制路由，打开、读取和关闭均经过上述 daemon 准入，不增加监听端口或会话写入口。连接只可调用本插件已登记的 GET 路由；Node 与 Fetch 响应均须为 `200 text/event-stream`，`204` 表示结束且不重连。每插件至多 8 条连接，每条至多保留 2 MiB／8192 个未确认块；按单调序号确认和分批返回，重复读取不丢未确认数据。读取等待至多 15 秒，45 秒无读取自动关闭。Renderer 按文档 nonce 记录连接归属，导航/卸载会取消在途路由并关闭已登记连接，旧文档回执不能更新新页面；上游路由撤销和宿主停用也关闭对应原请求。SSE 的命名事件、多行数据、跨块 UTF-8/CRLF、事件 ID 与重连由页面适配器承载；普通 fetch 仍返回完整响应，WebSocket 未由此实现。
 
-`api.config`／`api.configRevision` 是只读配置快照。SDK 不提供 `register.skill`、`register.mcp`、`register.dispose`、`migration.run` 或任意事实写入接口。MCP 为内置功能，Skill 来自清单声明。未知方法返回 `MethodNotFound`。
+`api.config`／`api.configRevision` 是只读配置快照。SDK 不提供 `register.skill`、`register.mcp`、`register.dispose`、`migration.run` 或任意事实写入接口。MCP 为内置功能，Skill 来自静态清单或声明后提交的运行期贡献。未知方法返回 `MethodNotFound`。
 
 ## 5. 注册
 
-清单声明、用户授权和包摘要决定能力上界。静态贡献直接来自清单；动态贡献需要清单的 `extension.runtimeContributions` 显式列出 `tools`、`commands`、`modelSources` 或 `settings`。只有声明对应动态贡献种类时，`tools`／`modelSources` 权限才允许 `"*"` 目标；它不授予模型调用、存储或其他能力。钩子仍完全静态，不能降低 guard 模式。插件工具名由 Magi 生成，作者不依赖模型侧编码后的名称。
+清单声明、用户授权和包摘要决定能力上界。静态贡献直接来自清单；动态贡献需要清单的 `extension.runtimeContributions` 显式列出 `tools`、`commands`、`modelSources`、`settings` 或 `skills`。只有声明对应动态贡献种类时，`tools`／`modelSources` 权限才允许 `"*"` 目标；它不授予模型调用、存储或其他能力。钩子仍完全静态，不能降低 guard 模式。插件工具名由 Magi 生成，作者不依赖模型侧编码后的名称。
 
-`catalog.replace` 接收 `{tools?,commands?,modelSources?,settingsSchema?}`；省略的数组按空数组处理，设置 schema 省略或为 null 时使用安装清单。revision 从每个新实例的 0 开始，成功提交递增，版本冲突或任何校验失败都不改变旧目录。动态目录最多 2 MiB（为 4 MiB RPC 帧保留余量），最多 1024 个工具、128 个命令、8 个模型来源；动态工具的单个输入 schema 最多 256 KiB，安装清单与设置 schema 仍为 32 KiB；安装清单仍限 128 项贡献，合并后继续校验共享 ID、各项 schema 与授权上界。先提交目录，再调用 `api.tool`／`api.command` 绑定；撤销时先释放处理器，再提交新目录。同批注册/回收合并为一次目录提交，避免逐工具复制全目录。移除模型来源声明也会清除该来源已发布的端点和模型。
+`catalog.replace` 接收 `{tools?,commands?,modelSources?,settingsSchema?,skills?}`；省略的数组按空数组处理，设置 schema 省略或为 null 时使用安装清单。revision 从每个新实例的 0 开始，成功提交递增，版本冲突或任何校验失败都不改变旧目录。动态目录最多 2 MiB（为 4 MiB RPC 帧保留余量），最多 1024 个工具、128 个命令、8 个模型来源、32 个技能；动态工具的单个输入 schema 最多 256 KiB，安装清单与设置 schema 仍为 32 KiB；安装清单仍限 128 项贡献，合并后继续校验共享 ID、各项 schema 与授权上界。先提交目录，再调用 `api.tool`／`api.command` 绑定；撤销时先释放处理器，再提交新目录。同批注册/回收合并为一次目录提交，避免逐工具复制全目录。移除模型来源声明也会清除该来源已发布的端点和模型。
+
+动态技能通过 `plugin.skills` feature 协商，复用 `PluginSkillContribution` 的 ID、标题、说明及原文正文校验；不绑定执行处理器。输入框从已有 `/api/plugins/manifests` 读取技能，模型目录和调用从同一 manager 实时解析；不另设技能 HTTP 目录或写入本地技能设置。配置替换、停用、撤权、升级与实例退出沿同一目录撤销；应用重启后由新实例重新注册。
 
 初始化阶段的动态目录仅供本实例校验与绑定，`host.ready` 后才进入对外贡献投影。动态目录不写入安装包或持久设置，重启后重新提交。daemon 为每个实例签发独立租约：旧实例不能修改新目录、标记新实例就绪或清理新来源。停用或撤权一经提交，旧租约永久失效；重新授权并激活也不能恢复它。
 

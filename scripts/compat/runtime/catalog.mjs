@@ -3,7 +3,7 @@ export class RuntimeCatalog {
   constructor(api) {
     this.api = api;
     this.revision = 0;
-    this.catalog = { tools: [], commands: [], modelSources: [] };
+    this.catalog = { tools: [], commands: [], modelSources: [], skills: [] };
     this.queue = Promise.resolve();
     this.failure = null;
     this.live = false;
@@ -61,7 +61,7 @@ export class RuntimeCatalog {
           }
         }
         await this.publish();
-        for (const entry of additions) if (!entry.disposed) entry.release = await entry.bind();
+        for (const entry of additions) if (!entry.disposed) entry.release = await entry.bind?.();
       });
     });
     this.scheduled = work;

@@ -823,6 +823,7 @@ mod tests {
     fn dynamic_skill_prompt_only_reinjects_runtime_activation() {
         let registry = SkillRegistry::new();
         registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "runtime-review".to_string(),
             title: "运行时审查".to_string(),
             instruction: "检查压缩后的执行约束。".to_string(),

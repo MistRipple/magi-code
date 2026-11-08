@@ -5017,6 +5017,7 @@ mod tests {
                 "spawn_only" => policy.allowed_tools = vec!["agent_spawn".into()],
                 _ => {
                     skills.register(magi_skill_runtime::SkillDefinition {
+                        description: String::new(),
                         skill_id: "incomplete-agent-scope".into(),
                         title: "不完整代理范围".into(),
                         instruction: "派发日志调查".into(),
@@ -6113,6 +6114,7 @@ mod tests {
         }));
         let skill_registry = magi_skill_runtime::SkillRegistry::new();
         let skill = |restricted| magi_skill_runtime::SkillDefinition {
+            description: String::new(),
             skill_id: "workflow".into(),
             title: "Workflow".into(),
             instruction: "Inspect".into(),
@@ -7999,6 +8001,7 @@ mod tests {
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let skills = magi_skill_runtime::SkillRegistry::new();
         let definition = |restricted| magi_skill_runtime::SkillDefinition {
+            description: String::new(),
             skill_id: "approval-skill".into(),
             title: "Approval".into(),
             instruction: "inspect".into(),

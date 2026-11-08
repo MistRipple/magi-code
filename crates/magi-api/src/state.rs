@@ -5673,6 +5673,7 @@ impl ApiState {
                         let plugin_id = manifest.id;
                         manifest.contributions.skills.into_iter().map(move |skill| {
                             magi_skill_runtime::SkillDefinition {
+                                description: skill.description,
                                 skill_id: magi_plugin_system::ContributionRef::new(
                                     &plugin_id, skill.id,
                                 )

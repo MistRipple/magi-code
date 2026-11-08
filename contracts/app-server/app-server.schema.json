@@ -2585,7 +2585,7 @@
           "items": {
             "$ref": "#/$defs/PluginRuntimeContributionKind"
           },
-          "maxItems": 4,
+          "maxItems": 5,
           "uniqueItems": true,
           "x-rust-default": true
         }
@@ -6258,7 +6258,8 @@
         "tools",
         "commands",
         "modelSources",
-        "settings"
+        "settings",
+        "skills"
       ]
     },
     "PluginRuntimeCatalog": {
@@ -6296,6 +6297,14 @@
             "null"
           ],
           "additionalProperties": true,
+          "x-rust-default": true
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginSkillContribution"
+          },
+          "maxItems": 32,
           "x-rust-default": true
         }
       }

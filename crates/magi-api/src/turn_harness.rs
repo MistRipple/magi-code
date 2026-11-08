@@ -15018,6 +15018,7 @@ done
             let sessions = Arc::new(SessionStore::default());
             let skills = magi_skill_runtime::SkillRegistry::new();
             skills.register(magi_skill_runtime::SkillDefinition {
+                description: String::new(),
                 skill_id: "mainline-restricted-skill".into(),
                 title: "限制恢复验收".into(),
                 instruction: "检查现有证据并返回。".into(),
@@ -15234,6 +15235,7 @@ done
         let skill_runtime = skill_case.then(|| {
             let skills = magi_skill_runtime::SkillRegistry::new();
             skills.register(magi_skill_runtime::SkillDefinition {
+                description: String::new(),
                 skill_id: "retained-review-skill".into(),
                 title: "独立代理只读核对".into(),
                 instruction: "只读取 README.md，返回证据。".into(),

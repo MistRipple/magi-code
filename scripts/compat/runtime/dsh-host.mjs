@@ -1,4 +1,5 @@
 // DSH 运行期适配器。上游原包执行真实 Cordis；业务与贡献准入由 Magi daemon 裁决。
+import { installSkills } from './skills.mjs';
 import { Context, Service } from '@deepseek-ai/cordis';
 import { pathToFileURL } from 'node:url';
 import { deepEqual, volatileEntries, updateVolatile } from '@deepseek-ai/cosmokit';
@@ -269,6 +270,7 @@ export async function activateDsh(api, module, options) {
     imageHostPath() { return undefined; }
     fileHostPath() { return undefined; }
   });
+  await installSkills(ctx, skill => catalog.register('skills', skill));
   await ctx.plugin(LlmRuntime);
 
   // 路由在 daemon 已完成插件准入后才到达此连接。插件目录每次读 daemon，

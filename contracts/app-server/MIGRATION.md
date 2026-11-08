@@ -87,3 +87,7 @@ package.json，不包含插件可写配置或凭据。旧包缺失该文件时�
 `ModelTransportRecord.usageObserved` 为可选的 Provider 用量存在性证据。新 HTTP 记录起始为
 false，只有解析到实际 Token 数字段时才变为 true；缺失或空 usage 不得由 adapter 的零默认值
 补造。旧记录缺少此字段且计数全零时保持未知，不能事后当成已确认零用量。
+
+`PluginRuntimeCatalog.skills` 与 `PluginRuntimeContributionKind.skills` 是运行期技能的增量合同，
+经 Extension Protocol 的 `plugin.skills` 协商提交。技能仍复用 `PluginSkillContribution`，
+沿同一目录的就绪、CAS、实例租约和撤销规则，不新增 HTTP 目录或本地设置写入。

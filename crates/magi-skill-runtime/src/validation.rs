@@ -57,6 +57,7 @@ mod tests {
     use super::*;
     fn skill(restrict: bool, allowed: &[&str]) -> SkillDefinition {
         SkillDefinition {
+            description: String::new(),
             skill_id: format!("skill-{restrict}-{}", allowed.join("-")),
             title: "test".into(),
             instruction: String::new(),

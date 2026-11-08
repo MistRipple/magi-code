@@ -336,6 +336,11 @@ fn build_skill_registry_from_config(config: &Map<String, Value>) -> SkillRegistr
                 }
 
                 registry.register(SkillDefinition {
+                    description: skill_val
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                     skill_id: skill_id.to_string(),
                     title: skill_val
                         .get("name")

@@ -43,6 +43,8 @@ pub struct CustomToolBinding {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SkillDefinition {
+    #[serde(default)]
+    pub description: String,
     pub skill_id: String,
     pub title: String,
     pub instruction: String,
@@ -826,6 +828,7 @@ mod tests {
 
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-a".to_string(),
             title: "Skill A".to_string(),
             instruction: "instruction".to_string(),
@@ -875,6 +878,7 @@ mod tests {
 
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-a".to_string(),
             title: "Skill A".to_string(),
             instruction: "instruction".to_string(),
@@ -928,6 +932,7 @@ mod tests {
 
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-policy".to_string(),
             title: "Skill Policy".to_string(),
             instruction: "instruction".to_string(),
@@ -990,6 +995,7 @@ mod tests {
 
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-cwd".to_string(),
             title: "Skill CWD".to_string(),
             instruction: "instruction".to_string(),
@@ -1042,6 +1048,7 @@ mod tests {
 
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-b".to_string(),
             title: "Skill B".to_string(),
             instruction: "instruction".to_string(),
@@ -1101,6 +1108,7 @@ mod tests {
 
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-mcp".to_string(),
             title: "MCP Skill".to_string(),
             instruction: "instruction".to_string(),
@@ -1185,6 +1193,7 @@ mod tests {
 
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-mcp-read-only".to_string(),
             title: "MCP Read Only Skill".to_string(),
             instruction: "instruction".to_string(),
@@ -1263,6 +1272,7 @@ mod tests {
 
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-mcp-full".to_string(),
             title: "MCP Full Skill".to_string(),
             instruction: "instruction".to_string(),
@@ -1333,6 +1343,7 @@ mod tests {
 
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-mcp-effective-read-only".to_string(),
             title: "MCP Effective Read Only Skill".to_string(),
             instruction: "instruction".to_string(),
@@ -1411,6 +1422,7 @@ mod tests {
 
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-c".to_string(),
             title: "Skill C".to_string(),
             instruction: "instruction".to_string(),
@@ -1503,6 +1515,7 @@ mod tests {
         let tool_registry = ToolRegistry::new(governance, event_bus);
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-business-failure".to_string(),
             title: "Business Failure Skill".to_string(),
             instruction: "instruction".to_string(),
@@ -1572,6 +1585,7 @@ mod tests {
 
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-unknown".to_string(),
             title: "Skill Unknown".to_string(),
             instruction: "instruction".to_string(),
@@ -1629,6 +1643,7 @@ mod tests {
         let skill_registry = SkillRegistry::new();
         // Two bindings with the same tool_name but different binding_ids
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-ambig".to_string(),
             title: "Skill Ambig".to_string(),
             instruction: "instruction".to_string(),
@@ -1705,6 +1720,7 @@ mod tests {
 
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-miss".to_string(),
             title: "Skill Missing Binding".to_string(),
             instruction: "instruction".to_string(),
@@ -1772,6 +1788,7 @@ mod tests {
 
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-events".to_string(),
             title: "Events Skill".to_string(),
             instruction: "instruction".to_string(),
@@ -1858,6 +1875,7 @@ mod tests {
 
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-mixed".to_string(),
             title: "Mixed Skill".to_string(),
             instruction: "instruction".to_string(),
@@ -1997,6 +2015,7 @@ mod tests {
 
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "skill-obs".to_string(),
             title: "Obs Skill".to_string(),
             instruction: "instruction".to_string(),

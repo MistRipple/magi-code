@@ -16,7 +16,7 @@ import { createHash } from 'node:crypto';
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const PROTOCOL = { major: 1, minor: 0 };
-const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'plugin.installations', 'plugin.directory.events', 'plugin.reconciliation', 'session.directory', 'images.store'];
+const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'plugin.installations', 'plugin.directory.events', 'plugin.reconciliation', 'plugin.skills', 'session.directory', 'images.store'];
 let negotiatedFeatures = new Set();
 const pluginRequest = (method, input, background = false) => {
   if (!negotiatedFeatures.has('plugin.management')) throw new Error('daemon 未协商 plugin.management');
@@ -355,7 +355,10 @@ const api = Object.freeze({
     return () => configListeners.delete(listener);
   },
   catalog: Object.freeze({
-    replace: (expectedRevision, catalog) => request('catalog.replace', { expectedRevision, catalog }),
+    replace: (expectedRevision, catalog) => {
+      if (catalog.skills?.length && !negotiatedFeatures.has('plugin.skills')) throw new Error('daemon 未协商 plugin.skills');
+      return request('catalog.replace', { expectedRevision, catalog });
+    },
   }),
   resource: Object.freeze({
     read: (id) => request('resource.read', { resourceId: id }),

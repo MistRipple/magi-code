@@ -26,6 +26,7 @@ const work = await mkdtemp(join(tmpdir(), 'magi-runtime-live-'));
 const run = promisify(execFile);
 const reporter = createReporter();
 const errors = [];
+const appLogs = [];
 let app, page, frame, ui, pluginId, startupGate;
 const heldStarts = new Set();
 await mkdir(output, { recursive: true });
@@ -44,6 +45,7 @@ async function post(path, body = {}, method = 'POST') {
   return result.value;
 }
 const installed = async () => (await api('/api/plugins')).value.plugins.find((item) => item.manifest.id === pluginId);
+const activeSkills = async () => (await api('/api/plugins/manifests')).value.flatMap(manifest => (manifest.contributions.skills ?? []).map(skill => ({ ...skill, contributionId: skill.id, id: `plugin/${manifest.id}/${skill.id}`, pluginId: manifest.id })));
 const visible = (selector) => page.evaluate(`Boolean(document.querySelector(${JSON.stringify(selector)})?.getClientRects().length)`);
 async function settingsTab(id) {
   const nav = `[data-testid="settings-nav-${id}"]`;
@@ -55,6 +57,13 @@ async function settingsTab(id) {
   }, `设置分类 ${id}`);
 }
 async function snapshot(name) { await writeFile(join(output, `${name}.png`), Buffer.from(await ui.screenshot(), 'base64')); }
+function startApp() {
+  const instance = launchApp({ executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort,
+    env: { MAGI_STATE_ROOT: join(work, 'state'), MAGI_DESKTOP_DAEMON_PORT: String(daemonPort), MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '' },
+  });
+  appLogs.push(instance.log);
+  return instance;
+}
 
 async function prepare() {
   const upstream = join(work, 'upstream');
@@ -74,9 +83,12 @@ import cordis from '@deepseek-ai/cordis/package.json' with { type: 'json' };
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 export const name = 'magi-runtime-acceptance';
-export const inject = ['commands', 'tools', 'llm', 'attachments', 'webServer', 'sessions'];
+export const inject = ['commands', 'tools', 'llm', 'attachments', 'webServer', 'sessions', 'skills'];
 export const Config = Schema.object({ label: Schema.string().default('initial'), enabled: Schema.boolean().default(true) });
 export function apply(ctx, config) {
+  let skillRequest;
+  ctx.skills.register({name:'runtime-inspection',description:'Inspect the current runtime',content:'RUNTIME_SKILL_BODY:'+config.label,source:'runtime'});
+  ctx.webServer.register({path:'/skill-request',resource:()=>Response.json({request:skillRequest})});
   let peerService;
   ctx.plugin(class extends Service {
     constructor(c) { super(c, 'peerAcceptance'); this.version = cordis.version; peerService = this; }
@@ -115,6 +127,7 @@ export function apply(ctx, config) {
     async resolveModel(provider, id) { return {provider,id,name:'Runtime Fixture',inputModalities:['text','image']}; }
     async *stream(request) {
       request.signal?.throwIfAborted();
+      skillRequest = JSON.stringify(request);
       let text = 'DSH_MODEL:' + config.label;
       const lastImage = request.messages.flatMap(message=>message.content).filter(block=>block.type==='image').at(-1);
       const images = lastImage ? [lastImage] : [];
@@ -148,6 +161,87 @@ export function apply(ctx, config) {
     prepared.report.dependencies.some(dependency => dependency.name === '@deepseek-ai/cordis'
       && dependency.isolated && dependency.host === false && dependency.version === '4.0.5-alpha.2' && dependency.integrity.startsWith('sha512-')));
   return { source: 'local:runtime-acceptance.zip', archiveBase64: (await readFile(archive)).toString('base64') };
+}
+
+async function verifyOriginalSkill(session, waitTurn) {
+  const request = {ecosystem:'dsh',package:'dsh-plugin-debugging',version:'0.7.2'};
+  const preview = await post('/api/plugins/upstream/preview', request);
+  const list = await post('/api/plugins/upstream/install', {...request,expectedDigest:preview.candidate.digest});
+  const original = list.plugins.find(plugin=>plugin.source.location==='dsh:dsh-plugin-debugging@0.7.2');
+  const path = `/api/plugins/${original.manifest.id}`;
+  await post(path+'/enable'); await post(path+'/authorize',{grants:original.manifest.permissions}); await post(path+'/activate');
+  const running = await waitFor(async()=>{
+    const plugin=(await api('/api/plugins')).value.plugins.find(plugin=>plugin.manifest.id===original.manifest.id);
+    return plugin?.runtime?.state==='running' && plugin;
+  },'Debugging 原包技能注册',120_000);
+  const skill=(await activeSkills()).find(skill=>skill.pluginId===original.manifest.id);
+  const body=running.manifest.contributions.skills.find(entry=>entry.id===skill.contributionId).instruction;
+  const published=await readFile(join(work,'state/extensions/packages',original.manifest.id,running.digest,'extension/upstream/skills/dsh-plugin-debugging/SKILL.md'),'utf8');
+  reporter.check('在线原包的技能正文逐字进入 daemon 当前贡献目录', body===published.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/,'').trim());
+  let loaded = false;
+  const stopLoad = page.on('Page.loadEventFired',()=>{ loaded = true; });
+  try {
+    await page.call('Page.navigate',{url:`${origin}/web.html?scope=personal&sessionId=${encodeURIComponent(session)}`});
+    await waitFor(async()=>loaded&&await ui.exists('[data-testid=input-textarea]'),'工作台技能入口');
+  } finally { stopLoad(); }
+  const selectSkill=async()=>{
+    const point = await page.evaluate(`(()=>{const r=document.querySelector('[data-testid=input-textarea]').getBoundingClientRect();return {x:r.x+20,y:r.y+20};})()`);
+    await page.call('Input.dispatchMouseEvent',{type:'mousePressed',...point,button:'left',clickCount:1});
+    await page.call('Input.dispatchMouseEvent',{type:'mouseReleased',...point,button:'left',clickCount:1});
+    await page.call('Input.insertText',{text:'/dsh-plugin-debugging'});
+    await waitFor(()=>page.evaluate(`Boolean([...document.querySelectorAll('.ia-slash-item')].find(item=>item.querySelector('.ia-slash-item-label')?.textContent==='/dsh-plugin-debugging'))`),'原包技能出现在斜杠菜单');
+  };
+  await selectSkill();
+  await snapshot('original-skill-desktop');
+  await page.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:false});
+  const narrow=await page.evaluate(`(()=>{const r=document.querySelector('.ia-slash-popover').getBoundingClientRect();return {left:r.left,right:r.right,width:innerWidth,overflow:document.documentElement.scrollWidth>innerWidth};})()`);
+  reporter.check('390px 原包技能菜单沿共享输入组件展示且无横向溢出',narrow.left>=0&&narrow.right<=narrow.width&&!narrow.overflow,JSON.stringify(narrow));
+  await snapshot('original-skill-mobile');
+  await page.call('Emulation.clearDeviceMetricsOverride');
+  await page.evaluate(`[...document.querySelectorAll('.ia-slash-item')].find(item=>item.querySelector('.ia-slash-item-label')?.textContent==='/dsh-plugin-debugging').dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true}))`);
+  await waitFor(()=>ui.exists('.ia-skill-chip'),'原包技能被选择');
+  await page.call('Input.insertText',{text:'verify original skill body'});
+  const before=(await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).value.canonicalTurns?.length??0;
+  await waitFor(()=>page.evaluate(`Boolean(document.querySelector('[data-testid=input-send-button]')) && !document.querySelector('[data-testid=input-send-button]').disabled`),'技能发送就绪');
+  await ui.click('[data-testid=input-send-button]');
+  const accepted=await waitFor(async()=>{
+    const turns=(await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).value.canonicalTurns;
+    return turns?.length>before&&turns.at(-1);
+  },'原包技能经输入框提交');
+  const completed=await waitTurn(accepted.turnId);
+  const received=await post(`/api/plugins/${pluginId}/routes`,{method:'GET',path:'/skill-request'});
+  reporter.check('原包技能沿真实输入框、canonical Turn 与模型请求完成调用',completed.status==='completed'
+    && received.body.request.includes(JSON.stringify(body).slice(1,-1)),JSON.stringify(completed).slice(0,300));
+  reporter.check('canonical 用户消息保存技能身份与接纳时名称',completed.items.some(item=>item.metadata?.skillName===skill.id&&item.metadata?.skillTitle===skill.title));
+  await waitFor(()=>page.evaluate(`Array.from(document.querySelectorAll('.user-command-text')).some(node=>node.textContent==='/dsh-plugin-debugging')`),'消息显示原包技能名称');
+  await snapshot('original-skill-conversation');
+  await selectSkill();
+  await page.evaluate(`[...document.querySelectorAll('.ia-slash-item')].find(item=>item.querySelector('.ia-slash-item-label')?.textContent==='/dsh-plugin-debugging').dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true}))`);
+  await post(path+'/deactivate');
+  await waitFor(async()=>!(await activeSkills()).some(entry=>entry.id===skill.id)&&!await ui.exists('.ia-skill-chip'),'停用撤销技能目录和草稿选择');
+  reporter.check('停用从同一事实源撤销技能入口和已选技能',true);
+  reporter.check('插件停用后历史消息仍显示接纳时技能名称',await page.evaluate(`Array.from(document.querySelectorAll('.user-command-text')).some(node=>node.textContent==='/dsh-plugin-debugging')`));
+  const stale=await api('/api/session/turn',{scope:'personal',sessionId:session,text:'stale skill',skillName:skill.id,requestId:'stale-plugin-skill',userMessageId:'stale-plugin-skill-user'});
+  const staleResult=stale.status===200 ? await waitTurn(stale.value.turnId) : stale.value;
+  reporter.check('停用后的旧技能身份不能继续执行',JSON.stringify(staleResult).includes('skill_unavailable')
+    && (stale.status>=400 || ['failed','blocked'].includes(staleResult.status)),JSON.stringify(staleResult).slice(0,500));
+  await post(path+'/activate');
+  await waitFor(async()=>(await activeSkills()).some(entry=>entry.id===skill.id),'重新启用恢复同一技能身份');
+  const bootstrap=(await api(`/api/settings/bootstrap?scope=personal&sessionId=${encodeURIComponent(session)}`)).value;
+  reporter.check('重新激活重新注册技能，不写入本地技能配置',!bootstrap.skillsConfig.instructionSkills.some(entry=>entry.skillId===skill.id||entry.name==='dsh-plugin-debugging'));
+  page.close();
+  await app.stop();
+  await waitFor(async()=>!await fetch(`${origin}/health`).then(()=>true,()=>false),'关闭后 daemon 完成退出');
+  app = startApp();
+  page = await waitFor(()=>connectAppPage(cdpPort,daemonPort,errors),'同一状态根重新启动工作台',60_000);
+  ui = pageTools(page);
+  await waitFor(async()=>(await activeSkills()).some(entry=>entry.id===skill.id&&entry.instruction===body&&entry.description===skill.description),'重启后原包重新发布技能',120_000);
+  const resumed = await post('/api/session/turn',{scope:'personal',sessionId:session,text:'verify skill after restart',skillName:skill.id,requestId:'original-skill-restart',userMessageId:'original-skill-restart-user'});
+  const resumedTurn = await waitTurn(resumed.turnId);
+  const resumedRequest = await post(`/api/plugins/${pluginId}/routes`,{method:'GET',path:'/skill-request'});
+  reporter.check('应用重启后原包技能恢复相同身份和原文并完成真实模型调用',resumedTurn.status==='completed'
+    && resumedRequest.body.request.includes(JSON.stringify(body).slice(1,-1)));
+  await post(path+'/deactivate'); await post(path+'/disable'); await post(path+'/uninstall');
 }
 
 async function verifyNativePanels(session) {
@@ -434,9 +528,7 @@ try {
     !await fetch(`${origin}/health`).then(() => true, () => false)
     && !await fetch(`http://127.0.0.1:${cdpPort}/json/version`).then(() => true, () => false));
   const archive = await prepare();
-  app = launchApp({ executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort,
-    env: { MAGI_STATE_ROOT: join(work, 'state'), MAGI_DESKTOP_DAEMON_PORT: String(daemonPort), MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '' },
-  });
+  app = startApp();
   page = await waitFor(() => connectAppPage(cdpPort, daemonPort, errors), '真实 Magi Renderer', 60_000);
   ui = pageTools(page);
   await waitFor(() => ui.exists('[data-testid="sidebar-settings"]'), '工作台');
@@ -512,6 +604,16 @@ try {
   const cmdTurn = await waitTurn(cmd.turnId);
   reporter.check('配置重载后的命令沿 canonical Turn 返回新值', cmdTurn.status === 'completed' && JSON.stringify(cmdTurn).includes('DSH_REPORT:changed'), JSON.stringify(cmdTurn));
   await post('/api/settings/orchestrator/session/save', { scope: 'personal', sessionId: session, config: { sourceId: `plugin/${pluginId}/${source}`, model: 'fixture-model', reasoningEffort: null } });
+  const skillEntries = (await activeSkills());
+  const runtimeSkill = skillEntries.find(skill => skill.pluginId === pluginId && skill.title === 'runtime-inspection');
+  reporter.check('配置替换后的技能进入 daemon 统一目录且正文保持当前配置', runtimeSkill
+    && plugin.manifest.contributions.skills[0].instruction === 'RUNTIME_SKILL_BODY:changed');
+  const skillTurn = await post('/api/session/turn', { scope: 'personal', sessionId: session, text: 'inspect runtime', skillName: runtimeSkill.id, requestId: 'runtime-skill', userMessageId: 'runtime-skill-user' });
+  const skillResult = await waitTurn(skillTurn.turnId);
+  const skillRequest = await post(`/api/plugins/${pluginId}/routes`, {method:'GET',path:'/skill-request'});
+  reporter.check('技能沿 canonical Turn 和真实模型请求注入当前原文', skillResult.status === 'completed'
+    && skillRequest.body.request.includes('RUNTIME_SKILL_BODY:changed') && !skillRequest.body.request.includes('RUNTIME_SKILL_BODY:initial'));
+  await verifyOriginalSkill(session, waitTurn);
   const chat = await post('/api/session/turn', { scope: 'personal', sessionId: session, text: 'runtime model check', requestId: 'runtime-model', userMessageId: 'runtime-model-user' });
   const modelTurn = await waitTurn(chat.turnId);
   reporter.check('主对话通过插件模型桥与真实 DSH 适配器完成流式回复', modelTurn.status === 'completed' && JSON.stringify(modelTurn).includes('DSH_MODEL:changed'), JSON.stringify(modelTurn));
@@ -522,7 +624,8 @@ try {
   await waitFor(() => ui.exists('[data-testid="plugin-page-header"] input[role=switch]'), '插件启用开关');
   await ui.click('[data-testid="plugin-page-header"] input[role=switch]');
   await waitFor(async () => !(await installed()).active, '停用');
-  reporter.check('界面停用回收动态工具和模型来源', (await installed()).manifest.contributions.tools.length === 0
+  reporter.check('界面停用回收动态工具、技能和模型来源', (await installed()).manifest.contributions.tools.length === 0
+    && !(await activeSkills()).some(skill=>skill.pluginId===pluginId)
     && !(await api('/api/settings/models/catalog')).value.groups.some((group) => group.pluginId === pluginId));
   await waitFor(() => ui.exists('[data-testid="plugin-page-inactive"]'), '停用提示');
   await page.call('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: false });
@@ -544,7 +647,7 @@ try {
   await assert.rejects(run(node, [join(compat, 'cli.mjs'), 'prepare', 'dsh', unsupported, '--out', join(work, 'unsupported-out'), '--integrity', 'local-acceptance'], { timeout: 30_000 }), /session\/event/);
   reporter.check('未捕获的必需宿主事件仍被明确拒绝', true);
   await verifyNativePanels(session);
-  const rendererLogErrors = app.log.join('').split('\n').filter((line) => /Uncaught|可信 Renderer 控制台错误/.test(line));
+  const rendererLogErrors = appLogs.flat().join('').split('\n').filter((line) => /Uncaught|可信 Renderer 控制台错误/.test(line));
   reporter.check('主 Renderer 与插件 iframe 没有运行时异常', errors.length === 0 && rendererLogErrors.length === 0,
     [...errors, ...rendererLogErrors].join('\n'));
   console.log(reporter.summary());
@@ -557,7 +660,7 @@ try {
   startupGate?.closeAllConnections();
   startupGate?.close();
   await writeFile(join(output, 'results.json'), JSON.stringify(reporter.results, null, 2));
-  if (app) { await writeFile(join(output, 'electron.log'), app.log.join('')); await app.stop(); }
+  if (app) { await app.stop(); await writeFile(join(output, 'electron.log'), appLogs.flat().join('')); }
   frame?.close();
   page?.close();
   await rm(work, { recursive: true, force: true });

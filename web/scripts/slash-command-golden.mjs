@@ -115,6 +115,9 @@ await withGoldenViteServer(async (server) => {
 
   assert.equal(userMessageCommand.resolveUserMessageCommandLabel({ goalMode: true, skillName: 'review' }),
     '/goal /review', 'all persisted command identities must remain visible');
+  assert.equal(userMessageCommand.resolveUserMessageCommandLabel({
+    skillName: 'plugin/acme.runtime/skill-inspect-opaque-id', skillTitle: 'Runtime inspection',
+  }), '/Runtime inspection', 'historical skill labels use the accepted title without looking up a mutable plugin');
 
   const firstReference = contextReferences.addComposerContextReference([], {
     kind: 'file',

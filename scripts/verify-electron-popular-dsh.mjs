@@ -176,6 +176,15 @@ try {
           assert.equal(status.review.packages.find((entry) => entry.name === pkg)?.declaration.state, 'compatible', '原包 engines/peer 声明必须到达实际兼容报告');
           item.functionalChecks = { fileInspection: true, reliabilityReport: true, liveActivation: true, runtimeIdentity: true, declaredCompatibility: true, repairs: 'unverified' };
         }
+        if (pkg === 'dsh-plugin-debugging') {
+          const skill = running.manifest.contributions.skills.find(skill => skill.title === pkg);
+          assert.ok(skill, '原包声明的技能必须进入 daemon 当前目录，不能只验证工具和页面');
+          const original = await readFile(join(work, 'state/extensions/packages', item.id, running.digest, 'extension/upstream/skills', pkg, 'SKILL.md'), 'utf8');
+          assert.equal(skill.instruction, original.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim());
+          const catalog = (await api('/api/plugins/manifests')).value;
+          assert.ok(catalog.some(manifest => manifest.id === item.id && manifest.contributions.skills.some(entry => entry.id === skill.id && entry.title === pkg)));
+          item.functionalChecks = { runtimeSkill: true, originalSkillBody: true, skillDiscovery: true, runtimeDiagnostics: 'unverified', restart: 'unverified' };
+        }
         if (pkg === 'dsh-plugin-share' && item.smoke?.ok) {
           const call = async (action, body) => {
             const response = await post(`/api/plugins/${encodeURIComponent(item.id)}/routes`, { method: 'POST', path: `/api/plugin-share/${action}`, body });

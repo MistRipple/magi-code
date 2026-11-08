@@ -6499,6 +6499,7 @@ mod tests {
         let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
             let registry = magi_skill_runtime::SkillRegistry::new();
             registry.register(magi_skill_runtime::SkillDefinition {
+                description: String::new(),
                 skill_id: "code-review".to_string(),
                 title: "代码审查".to_string(),
                 instruction: "检查稳定性风险。".to_string(),
@@ -6608,6 +6609,7 @@ mod tests {
         let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
             let registry = magi_skill_runtime::SkillRegistry::new();
             registry.register(magi_skill_runtime::SkillDefinition {
+                description: String::new(),
                 skill_id: "direct-skill".to_string(),
                 title: "直接 Skill".to_string(),
                 instruction: "直接注入。".to_string(),
@@ -6717,6 +6719,7 @@ mod tests {
         dispatcher = dispatcher.with_skill_runtime(Arc::new({
             let registry = magi_skill_runtime::SkillRegistry::new();
             registry.register(magi_skill_runtime::SkillDefinition {
+                description: String::new(),
                 skill_id: "prompt-only".to_string(),
                 title: "Prompt Only".to_string(),
                 instruction: "先取证，再回答。".to_string(),
@@ -6761,6 +6764,7 @@ mod tests {
         let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
             let registry = magi_skill_runtime::SkillRegistry::new();
             registry.register(magi_skill_runtime::SkillDefinition {
+                description: String::new(),
                 skill_id: "owner/repo/skills/code-review".to_string(),
                 title: "代码审查".to_string(),
                 instruction: "检查稳定性。".to_string(),
@@ -6814,6 +6818,7 @@ mod tests {
         let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
             let registry = magi_skill_runtime::SkillRegistry::new();
             registry.register(magi_skill_runtime::SkillDefinition {
+                description: String::new(),
                 skill_id: "mixed-skill".to_string(),
                 title: "混合 Skill".to_string(),
                 instruction: "提供只读模型辅助和 MCP 外接工具。".to_string(),
@@ -6906,6 +6911,7 @@ mod tests {
         let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
             let registry = magi_skill_runtime::SkillRegistry::new();
             registry.register(magi_skill_runtime::SkillDefinition {
+                description: String::new(),
                 skill_id: "read-only-skill".to_string(),
                 title: "只读 Skill".to_string(),
                 instruction: "只能读取文件。".to_string(),

@@ -1562,13 +1562,14 @@ export interface PluginUpstreamPreview {
 
 export type PluginEcosystem = "dsh" | "pi";
 
-export type PluginRuntimeContributionKind = "tools" | "commands" | "modelSources" | "settings";
+export type PluginRuntimeContributionKind = "tools" | "commands" | "modelSources" | "settings" | "skills";
 
 export interface PluginRuntimeCatalog {
   tools?: Array<PluginToolContribution>;
   commands?: Array<PluginNamedContribution>;
   modelSources?: Array<PluginNamedContribution>;
   settingsSchema?: Record<string, unknown> | null;
+  skills?: Array<PluginSkillContribution>;
 }
 
 export interface PluginDshCompatibilityProjection {

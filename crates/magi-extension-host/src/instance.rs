@@ -1116,6 +1116,7 @@ fn check_hello(
         "plugin.installations",
         "plugin.directory.events",
         "plugin.reconciliation",
+        "plugin.skills",
         "session.directory",
         "images.store",
     ];

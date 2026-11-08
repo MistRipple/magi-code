@@ -3446,7 +3446,24 @@ mod tests {
 
     #[tokio::test]
     async fn a_skill_picked_for_a_plain_chat_turn_reaches_the_turn_instead_of_being_dropped() {
-        let state = test_state();
+        let registry = magi_skill_runtime::SkillRegistry::new();
+        registry.register(magi_skill_runtime::SkillDefinition {
+            skill_id: "magi-cloudflare-tunnel".into(),
+            title: "配置 Tunnel".into(),
+            description: "配置当前项目的访问入口".into(),
+            instruction: "核对当前配置。".into(),
+            metadata: magi_skill_runtime::SkillMetadata {
+                category: "local".into(),
+                tags: vec![],
+            },
+            restrict_standard_tools: false,
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![],
+            prompt_priority: 50,
+        });
+        let state = test_state().with_skill_runtime(Arc::new(
+            magi_skill_runtime::SkillRuntime::new(registry.clone()),
+        ));
         let (status, body) = post_json(
             state.clone(),
             "/session/turn",
@@ -3477,6 +3494,17 @@ mod tests {
             Some("magi-cloudflare-tunnel"),
             "所选技能必须记在这一轮上并交给执行，而不是被对话路径丢弃"
         );
+        registry.replace([]);
+        let retained = state
+            .session_store
+            .canonical_turn_for_request_id("request-skill-chat")
+            .unwrap();
+        let user = retained
+            .items
+            .iter()
+            .find(|item| item.kind == CanonicalTurnItemKind::UserMessage)
+            .unwrap();
+        assert_eq!(user.metadata["skillTitle"], "配置 Tunnel");
     }
 
     #[tokio::test]

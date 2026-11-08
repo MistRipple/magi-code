@@ -1280,6 +1280,7 @@ mod tests {
         let child = test_task("task-child", root_task_id.as_str(), &mission_id);
         let skills = magi_skill_runtime::SkillRegistry::new();
         let skill = |restricted| magi_skill_runtime::SkillDefinition {
+            description: String::new(),
             skill_id: "code-review".into(),
             title: "Review".into(),
             instruction: "Review".into(),

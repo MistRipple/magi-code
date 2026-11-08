@@ -65,6 +65,33 @@ function host(value = {}) {
 
 const options = { runtimeVersion: 2, plugin: 'fixture' };
 
+test('技能沿真实 Cordis effect 进入同一动态目录，配置替换与停用撤销旧正文', async () => {
+  const h = host();
+  const Config = Schema.object({ label: Schema.string().default('first'), enabled: Schema.boolean().default(true) });
+  const running = await activateDsh(h.api, { Config, inject: ['skills'], apply(ctx, config) {
+    if (config.enabled) ctx.effect(function* () {
+      yield ctx.skills.register({ name: 'inspect-runtime', description: 'Inspect the current runtime', content: `Original body: ${config.label}`, source: 'runtime' });
+      const duplicate = ctx.skills.register({ name: 'inspect-runtime', description: 'Duplicate', content: 'Must not replace the original', source: 'runtime' });
+      duplicate();
+    });
+    assert.throws(() => ctx.skills.register({ name: 'empty', description: 'Empty', content: '' }), /正文/);
+    assert.throws(() => ctx.skills.register({ name: 'policy', description: 'Policy', content: 'body', invocation: { modelInvocable: false, userInvocable: true } }), /调用策略/);
+    assert.throws(() => ctx.skills.register({ name: 'resource', description: 'Resources', content: 'body', resourceBase: { kind: 'directory', path: '/tmp' } }), /resourceBase/);
+  } }, options);
+  try {
+    assert.deepEqual(h.state.catalog.skills, [{ id: runtimeId('skill', 'inspect-runtime'), title: 'inspect-runtime', description: 'Inspect the current runtime', instruction: 'Original body: first' }]);
+    await h.configure({ label: 'second', enabled: true });
+    assert.equal(h.state.catalog.skills.length, 1);
+    assert.equal(h.state.catalog.skills[0].instruction, 'Original body: second');
+    await h.configure({ label: 'second', enabled: false });
+    assert.deepEqual(h.state.catalog.skills, []);
+    await h.configure({ label: 'third', enabled: true });
+    assert.equal(h.state.catalog.skills[0].instruction, 'Original body: third');
+  } finally { await running.dispose(); }
+  assert.deepEqual(h.state.catalog.skills, []);
+  assert.deepEqual(h.state.failures, []);
+});
+
 test('设置命名空间可在配置重载后动态出现，资源授权与 CAS 仍由 daemon 裁决', async () => {
   let snapshot = { version: 0, value: null }, fail = false;
   const settings = createRegisteredSettings({ resource: {

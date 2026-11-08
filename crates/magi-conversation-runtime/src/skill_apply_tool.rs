@@ -24,10 +24,15 @@ pub fn skill_apply_tool_definition(skill_runtime: &SkillRuntime) -> ChatToolDefi
                 .rsplit('/')
                 .next()
                 .unwrap_or(skill.skill_id.as_str());
-            format!(
+            let mut line = format!(
                 "- {short_name} | {} | {} | {}",
                 skill.skill_id, skill.title, skill.metadata.category
-            )
+            );
+            if !skill.description.trim().is_empty() {
+                line.push_str(" | ");
+                line.push_str(&skill.description.replace(['\n', '\r'], " "));
+            }
+            line
         })
         .collect::<Vec<_>>();
     available_lines.sort();
@@ -225,6 +230,7 @@ mod tests {
     fn make_skill_runtime() -> SkillRuntime {
         let registry = SkillRegistry::new();
         registry.register(SkillDefinition {
+            description: "Review correctness and product reliability".into(),
             skill_id: "code-review".to_string(),
             title: "代码审查".to_string(),
             instruction: "从产品稳定性角度检查关键缺陷。".to_string(),
@@ -243,6 +249,12 @@ mod tests {
     #[test]
     fn skill_apply_uses_registered_skill_runtime() {
         let runtime = make_skill_runtime();
+        assert!(
+            skill_apply_tool_definition(&runtime)
+                .function
+                .description
+                .contains("Review correctness and product reliability")
+        );
         let (payload, status) = execute_skill_apply_from_runtime(
             &serde_json::json!({
                 "skill_name": "code-review",
@@ -300,6 +312,7 @@ mod tests {
     fn skill_apply_definition_exposes_registered_ids_short_names_and_titles() {
         let registry = SkillRegistry::new();
         registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "stellarlinkco/myclaude/skills/code-review".to_string(),
             title: "代码审查".to_string(),
             instruction: "检查代码。".to_string(),
@@ -330,6 +343,7 @@ mod tests {
     fn skill_apply_resolves_unique_short_name_to_canonical_skill_id() {
         let registry = SkillRegistry::new();
         registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "stellarlinkco/myclaude/skills/talk-normal".to_string(),
             title: "自然表达".to_string(),
             instruction: "保持简洁自然。".to_string(),
@@ -361,6 +375,7 @@ mod tests {
     fn skill_apply_returns_public_custom_tool_summary_without_binding_details() {
         let registry = SkillRegistry::new();
         registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "ops-skill".to_string(),
             title: "运维 Skill".to_string(),
             instruction: "调用外接工具检查状态。".to_string(),

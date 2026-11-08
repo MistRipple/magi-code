@@ -119,9 +119,10 @@ impl PluginManager {
         if catalog.tools.len() > 1024
             || catalog.commands.len() > 128
             || catalog.model_sources.len() > 8
+            || catalog.skills.len() > 32
         {
             return Err(invalid(
-                "运行目录数量超过工具 1024 / 命令 128 / 模型来源 8 的上限",
+                "运行目录数量超过工具 1024 / 命令 128 / 模型来源 8 / 技能 32 的上限",
             ));
         }
         let package = self.package(id)?;
@@ -136,6 +137,7 @@ impl PluginManager {
             (Kind::Commands, !catalog.commands.is_empty()),
             (Kind::ModelSources, !catalog.model_sources.is_empty()),
             (Kind::Settings, catalog.settings_schema.is_some()),
+            (Kind::Skills, !catalog.skills.is_empty()),
         ] {
             if present && !allowed.contains(&kind) {
                 return Err(invalid(format!("未声明运行期贡献 {kind:?}")));
@@ -200,6 +202,7 @@ impl PluginManager {
 fn merge(base: &PluginManifest, catalog: &PluginRuntimeCatalog) -> PluginManifest {
     let mut manifest = base.clone();
     manifest.contributions.tools.extend(catalog.tools.clone());
+    manifest.contributions.skills.extend(catalog.skills.clone());
     manifest
         .contributions
         .commands

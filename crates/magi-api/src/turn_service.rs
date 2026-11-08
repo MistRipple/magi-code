@@ -61,6 +61,17 @@ pub(crate) fn monotonic_accepted_at() -> UtcMillis {
     UtcMillis(now.max(previous + 1))
 }
 
+/// 接纳时记录展示名称，历史消息不随插件改名、升级或停用重新解释。
+fn selected_skill_title(state: &ApiState, request: &SessionTurnRequestDto) -> Option<String> {
+    let id = request.skill_name.as_deref()?.trim();
+    state
+        .skill_runtime
+        .as_ref()?
+        .registry()
+        .get(id)
+        .map(|skill| skill.title)
+}
+
 #[derive(Clone)]
 pub(crate) struct TurnService {
     state: ApiState,
@@ -1602,6 +1613,9 @@ async fn submit_conversation_session_turn(
             "skillName".to_string(),
             serde_json::Value::String(skill_name.clone()),
         );
+        if let Some(title) = selected_skill_title(&state, &request) {
+            metadata.insert("skillTitle".into(), Value::String(title));
+        }
     }
     if let Some(command) = request.command.as_ref() {
         // 命令轮次的用户 item 只用于展示和审计，历史重建据此排除，不进入模型上下文。
@@ -2468,6 +2482,9 @@ async fn submit_mainline_session_turn(
                         "route".to_string(),
                         serde_json::Value::String(session_turn_route_name(route).to_string()),
                     )]);
+                    if let Some(title) = selected_skill_title(&state, &request) {
+                        metadata.insert("skillTitle".into(), Value::String(title));
+                    }
                     if request.resume {
                         metadata.insert("renderable".to_string(), serde_json::Value::Bool(false));
                     }

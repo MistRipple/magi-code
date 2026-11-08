@@ -8,6 +8,10 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 const ID: &str = "acme.runtime";
 
 fn fixture() -> (TempDir, PluginManager, PluginPackage) {
+    fixture_with(&["tools", "commands", "settings"])
+}
+
+fn fixture_with(kinds: &[&str]) -> (TempDir, PluginManager, PluginPackage) {
     let manifest = json!({
         "sdkVersion": 2, "id": ID, "version": "1.0.0", "name": "Runtime", "description": "",
         "dataSchemaVersion": 1, "settingsSchema": {"type": "object"},
@@ -16,7 +20,7 @@ fn fixture() -> (TempDir, PluginManager, PluginPackage) {
             {"kind": "tools", "targets": ["*"]},
             {"kind": "storage", "targets": ["__settings"]}
         ],
-        "extension": {"hooks": [], "runtimeContributions": ["tools", "commands", "settings"]},
+        "extension": {"hooks": [], "runtimeContributions": kinds},
         "contributions": {}
     });
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
@@ -53,6 +57,92 @@ fn catalog() -> PluginRuntimeCatalog {
         "commands": [{"id": "command", "title": "Command", "description": ""}],
         "settingsSchema": {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "additionalProperties": false}
     })).unwrap()
+}
+
+#[test]
+fn runtime_skills_require_a_declaration_and_share_ready_cas_and_revocation() {
+    let (_dir, mut manager, package) = fixture();
+    manager
+        .begin_runtime(ID, package.digest(), "skills")
+        .unwrap();
+    let value: PluginRuntimeCatalog = serde_json::from_value(json!({
+        "skills":[{"id":"runtime-skill","title":"Runtime skill","description":"Original description","instruction":"Original body"}]
+    })).unwrap();
+    assert!(
+        manager
+            .replace_runtime_catalog(ID, "skills", 0, value.clone())
+            .is_err(),
+        "未声明的动态技能不能进入目录"
+    );
+    let (_dir, mut manager, package) = fixture_with(&["tools", "skills"]);
+    let id = ID;
+    manager
+        .begin_runtime(id, package.digest(), "skills")
+        .unwrap();
+    manager
+        .replace_runtime_catalog(id, "skills", 0, value.clone())
+        .unwrap();
+    assert!(
+        manager
+            .manifests()
+            .unwrap()
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap()
+            .contributions
+            .skills
+            .is_empty()
+    );
+    manager.ready_runtime(id, "skills").unwrap();
+    assert_eq!(
+        manager
+            .manifests()
+            .unwrap()
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap()
+            .contributions
+            .skills[0]
+            .instruction,
+        "Original body"
+    );
+    let mut invalid = value.clone();
+    invalid.skills[0].instruction.clear();
+    assert!(
+        manager
+            .replace_runtime_catalog(id, "skills", 1, invalid)
+            .is_err()
+    );
+    assert_eq!(
+        manager
+            .effective_manifest(id)
+            .unwrap()
+            .contributions
+            .skills
+            .len(),
+        1
+    );
+    manager
+        .replace_runtime_catalog(id, "skills", 1, PluginRuntimeCatalog::default())
+        .unwrap();
+    assert!(
+        manager
+            .effective_manifest(id)
+            .unwrap()
+            .contributions
+            .skills
+            .is_empty()
+    );
+    manager
+        .replace_runtime_catalog(id, "skills", 2, value)
+        .unwrap();
+    manager.deactivate(id).unwrap();
+    assert!(manager.manifests().unwrap().iter().all(|m| m.id != id));
+    assert!(
+        manager
+            .replace_runtime_catalog(id, "skills", 3, PluginRuntimeCatalog::default())
+            .is_err()
+    );
 }
 
 #[test]

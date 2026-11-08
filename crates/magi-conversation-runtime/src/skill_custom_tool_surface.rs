@@ -628,6 +628,7 @@ mod tests {
         let registry = SkillRegistry::new();
         let skill_id = "code/review v1";
         registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: skill_id.to_string(),
             title: "Code Review".to_string(),
             instruction: "审查代码。".to_string(),
@@ -686,6 +687,7 @@ mod tests {
         let registry = SkillRegistry::new();
         let skill_id = "code__review";
         registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: skill_id.to_string(),
             title: "Code Review".to_string(),
             instruction: "审查代码。".to_string(),
@@ -731,6 +733,7 @@ mod tests {
         let registry = SkillRegistry::new();
         let skill_id = "model/skill";
         registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: skill_id.to_string(),
             title: "Model Skill".to_string(),
             instruction: "调用模型桥接工具。".to_string(),
@@ -894,6 +897,7 @@ mod tests {
     fn custom_skill_tool_read_only_mcp_preflight_uses_public_error() {
         let registry = SkillRegistry::new();
         registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "mcp-skill".to_string(),
             title: "MCP Skill".to_string(),
             instruction: "调用外接能力。".to_string(),
@@ -950,6 +954,7 @@ mod tests {
     fn custom_skill_tool_read_only_command_mode_mcp_preflight_uses_public_error() {
         let registry = SkillRegistry::new();
         registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "mcp-skill".to_string(),
             title: "MCP Skill".to_string(),
             instruction: "调用外接能力。".to_string(),
@@ -1009,6 +1014,7 @@ mod tests {
     fn custom_skill_tool_safety_gate_uses_public_error() {
         let registry = SkillRegistry::new();
         registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "mcp-skill".to_string(),
             title: "MCP Skill".to_string(),
             instruction: "调用外接能力。".to_string(),
@@ -1076,6 +1082,7 @@ mod tests {
     fn custom_skill_tool_safety_gate_uses_effective_read_only_profile() {
         let registry = SkillRegistry::new();
         registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "mcp-skill".to_string(),
             title: "MCP Skill".to_string(),
             instruction: "调用外接能力。".to_string(),
@@ -1144,6 +1151,7 @@ mod tests {
     fn custom_skill_tool_model_business_failure_uses_public_error() {
         let registry = SkillRegistry::new();
         registry.register(SkillDefinition {
+            description: String::new(),
             skill_id: "model-skill".to_string(),
             title: "Model Skill".to_string(),
             instruction: "调用外接模型能力。".to_string(),

@@ -158,7 +158,7 @@
     pluginCommand: ComposerPluginCommandOption | null;
   }
 
-  // 输入框可识别的 instruction skill。来源：bootstrap 中的 skillsConfig.instructionSkills，
+  // 输入框的指令技能来自本地技能配置与 daemon 已就绪的插件技能投影，
   // 这一组才是 `/` 唤起的指令型技能，与 customTools（已注册到工具表）的语义不同。
   type SkillOption = ComposerSkillOption;
 
@@ -688,6 +688,11 @@
       const description = typeof obj.description === 'string' ? obj.description : '';
       out.push({ skillId, name, description });
     }
+    for (const manifest of pluginProjection().manifests) {
+      for (const skill of manifest.contributions.skills ?? []) {
+        out.push({ skillId: `plugin/${manifest.id}/${skill.id}`, name: skill.title, description: skill.description });
+      }
+    }
     return out;
   });
 
@@ -715,6 +720,9 @@
   // 已选命令失效（插件停用）时撤销选择，避免提交已不可用的身份。
   $effect(() => {
     if (!pluginProjection().loaded) return;
+    if (selectedSkill?.skillId.startsWith('plugin/') && !availableSkills.some(skill => skill.skillId === selectedSkill?.skillId)) {
+      selectedSkill = null;
+    }
     if (selectedPluginCommand && !availablePluginCommands.some((command) => command.pluginCommandId === selectedPluginCommand?.pluginCommandId)) {
       selectedPluginCommand = null;
     }
@@ -2922,6 +2930,7 @@ async function refreshPickerSettingsSnapshot() {
             sessionCommand: queued.command,
             goalMode: queued.goalMode,
             skillName: queued.skillName,
+            skillTitle: availableSkills.find(skill => skill.skillId === queued.skillName)?.name,
           })}
           <div class="ia-queue-item dock-row">
             <span class="ia-queue-index" aria-hidden="true"></span>

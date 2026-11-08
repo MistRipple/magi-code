@@ -87,7 +87,7 @@ export async function prepareDsh(options) {
   const manifest = {
     sdkVersion: 2, id: packageId('dsh', pkg.name), version: pkg.version,
     name: pkg.displayName ?? pkg.name, description: pkg.description ?? '', dataSchemaVersion: 1,
-    extension: { hooks: [], compat: { kind: 'dsh' }, runtimeContributions: ['tools', 'commands', 'modelSources', 'settings'] },
+    extension: { hooks: [], compat: { kind: 'dsh' }, runtimeContributions: ['tools', 'commands', 'modelSources', 'settings', 'skills'] },
     permissions: [
       { kind: 'extension', targets: ['full-trust'] }, { kind: 'storage', targets: ['__settings'] },
       { kind: 'tools', targets: ['*'] }, { kind: 'modelSources', targets: ['*'] },

@@ -3225,6 +3225,7 @@ done
     fn external_tool_catalog_uses_stable_bridge_labels() {
         let registry = magi_skill_runtime::SkillRegistry::new();
         registry.register(magi_skill_runtime::SkillDefinition {
+            description: String::new(),
             skill_id: "catalog-skill".to_string(),
             title: "Catalog Skill".to_string(),
             instruction: "test".to_string(),

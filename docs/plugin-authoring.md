@@ -286,9 +286,9 @@ export default async function activate(api) {
 
 ### 运行期贡献与回收
 
-工具、命令和模型目录在启动后才确定时，在 `extension.runtimeContributions` 中声明对应种类（`tools`、`commands`、`modelSources`；动态设置 schema 使用 `settings`）。声明 `tools`／`modelSources` 动态贡献的包可申请对应的 `["*"]` 权限，用户仍须明确授权。
+工具、命令、技能和模型目录在启动后才确定时，在 `extension.runtimeContributions` 中声明对应种类（`tools`、`commands`、`modelSources`、`skills`；动态设置 schema 使用 `settings`）。声明 `tools`／`modelSources` 动态贡献的包可申请对应的 `["*"]` 权限，用户仍须明确授权。
 
-`api.catalog.replace(0, { tools: [...], commands: [...], modelSources: [...], settingsSchema: {...} })` 提交首次完整快照。保存返回的 revision，每次修改串行提交；省略的动态数组会被清空。daemon 合并静态声明并验证，失败保留原目录。工具／命令需要在目录获准后再绑定处理器；`await api.tool(...)` 和 `await api.command(...)` 返回释放函数，撤销贡献时先释放，再提交移除后的目录。动态 ID 与静态贡献共用命名空间，不能重复。
+`api.catalog.replace(0, { tools: [...], commands: [...], modelSources: [...], settingsSchema: {...}, skills: [...] })` 提交首次完整快照。保存返回的 revision，每次修改串行提交；省略的动态数组会被清空。daemon 合并静态声明并验证，失败保留原目录。工具／命令需要在目录获准后再绑定处理器；`await api.tool(...)` 和 `await api.command(...)` 返回释放函数，撤销贡献时先释放，再提交移除后的目录。动态 ID 与静态贡献共用命名空间，不能重复。动态技能沿用第 5 节的字段，须协商 `plugin.skills`，无需绑定处理器；后台就绪后同时进入输入框 `/` 菜单及模型的 `skill_apply` 目录。说明用于发现用途，正文在选用时原样读取；停用或撤权会撤销入口和未提交的选择，旧身份不能继续执行。消息保存接纳时的技能名称，历史展示不随停用或升级重新解释。
 
 动态目录只在内存中生效，每次启动重新建立，不能替代 `api.resource`／`api.settings` 持久化。初始化抛错、崩溃或停用会回收本实例贡献；旧实例的迟到注册不能影响新实例。用 `api.onDispose` 或入口返回的 `dispose` 关闭定时器、连接和文件监听；回收动作应幂等，并且在 daemon 已拒绝新请求时仍能释放本地资源。完整大小与租约合同见[扩展协议第 5 节](extension-protocol-v1.md#5-注册)。
 

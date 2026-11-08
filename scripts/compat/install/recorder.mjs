@@ -1,5 +1,6 @@
 // 记录进程：加载上游原入口，用桩服务运行 apply，把注册输出为 JSON。不联网、不执行注册之外的动作。
 // 运行在 `node --permission` 受限模式下（见 record.mjs）：不能写用户目录、不能起子进程、不能联网。
+import { installSkills } from '../runtime/skills.mjs';
 import { pathToFileURL } from 'node:url';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { configureProfile, withProfile, loaderEntries, profilePath, createProfileReload } from '../runtime/profile.mjs';
@@ -55,6 +56,7 @@ ctx.baseUrl = pathToFileURL(profilePath() + '/').href;
 // 通过 Cordis 自带的 `internal/listener` 事件观察，不改写 ctx.on，也不执行监听器。
 const listenerNames = new Set();
 ctx.on('internal/listener', (name) => { if (typeof name === 'string' && !name.startsWith('internal/')) listenerNames.add(name); });
+await installSkills(ctx, () => () => {});
 ctx.plugin(LlmRuntime);
 const stub = (name, register) => ctx.plugin(class extends Service { constructor(c) { super(c, name); } register(definition) { return register(definition); } });
 stub('tools', (d) => { out.tools.push({ id: d.name, description: d.description, parameters: d.parameters, readOnly: d.readOnly === true, timeoutMs: d.timeoutMs ?? null }); return () => {}; });
