@@ -120,13 +120,13 @@ fn application_permissions_are_accepted_and_schema_cannot_fetch() {
 }
 
 #[test]
-fn oversized_manifest_and_backend_are_rejected_before_execution() {
+fn oversized_manifest_and_resources_are_rejected_before_execution() {
     let mut m = manifest();
     m["description"] = json!("x".repeat(4097));
     assert!(PluginPackage::from_archive(&archive(&m, &[])).is_err());
     let payload = vec![b'x'; 4 * 1024 * 1024 + 1];
     assert!(
-        PluginPackage::from_archive(&archive(&manifest(), &[("ui/large.js", &payload)])).is_err()
+        PluginPackage::from_archive(&archive(&manifest(), &[("ui/large.css", &payload)])).is_err()
     );
 }
 
@@ -560,8 +560,8 @@ fn model_sources_need_their_own_authorization_and_an_extension() {
 }
 
 #[test]
-fn bundled_extension_entry_has_its_own_larger_limit() {
-    fn compressed_archive(manifest: &Value, entry: &[u8], other: &[u8]) -> Vec<u8> {
+fn browser_and_node_scripts_share_a_budget_with_bounded_package_resources() {
+    fn compressed_archive(manifest: &Value, entry: &[u8], other: (&str, &[u8])) -> Vec<u8> {
         let options =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
@@ -569,7 +569,7 @@ fn bundled_extension_entry_has_its_own_larger_limit() {
             ("manifest.json", serde_json::to_vec(manifest).unwrap()),
             ("ui/index.html", b"<!doctype html><p>dashboard</p>".to_vec()),
             ("extension/index.mjs", entry.to_vec()),
-            ("ui/extra.js", other.to_vec()),
+            (other.0, other.1.to_vec()),
         ] {
             writer.start_file(name, options).unwrap();
             writer.write_all(&bytes).unwrap();
@@ -578,20 +578,66 @@ fn bundled_extension_entry_has_its_own_larger_limit() {
     }
     let mut padded = b"export default async () => {};\n".to_vec();
     let manifest = extension_manifest();
-    // 5 MiB 的打包入口超过普通文件上限，但属于合法的构建期打包产物。
+    // 所有浏览器与 Node 脚本采用同一合同，不限于一个特殊的扩展入口。
     padded.extend(std::iter::repeat_n(b'/', 5 * 1024 * 1024));
-    assert!(PluginPackage::from_archive(&compressed_archive(&manifest, &padded, b"x")).is_ok());
-    // 入口自己的上限是 16 MiB。
-    let mut too_big = b"export default async () => {};\n".to_vec();
-    too_big.extend(std::iter::repeat_n(b'/', 16 * 1024 * 1024));
-    assert!(PluginPackage::from_archive(&compressed_archive(&manifest, &too_big, b"x")).is_err());
-    // 放宽只属于入口文件：同样大小的其他文件仍受 4 MiB 限制。
+    assert!(
+        PluginPackage::from_archive(&compressed_archive(
+            &manifest,
+            &padded,
+            ("ui/extra.js", b"x")
+        ))
+        .is_ok()
+    );
     let other = vec![b'/'; 5 * 1024 * 1024];
+    for name in [
+        "ui/runtime.js",
+        "ui/module.mjs",
+        "extension/upstream/lib/index.cjs",
+    ] {
+        assert!(
+            PluginPackage::from_archive(&compressed_archive(
+                &manifest,
+                b"export default () => {}",
+                (name, &other)
+            ))
+            .is_ok(),
+            "{name}"
+        );
+    }
+    // 超限脚本在任何位置均被拒绝，错误提供具体资源及实际容量。
+    let mut too_big = b"export default async () => {};\n".to_vec();
+    too_big.extend(std::iter::repeat_n(
+        b'/',
+        magi_plugin_system::MAX_SCRIPT_BYTES,
+    ));
+    for name in ["ui/runtime.js", "extension/upstream/lib/index.mjs"] {
+        let error = PluginPackage::from_archive(&compressed_archive(
+            &manifest,
+            b"export default () => {}",
+            (name, &too_big),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(name) && error.contains("16777216"),
+            "{error}"
+        );
+    }
+    // 资源与展开总量仍有界，脚本容量不扩大 CSS 等其他资源的上限。
     assert!(
         PluginPackage::from_archive(&compressed_archive(
             &manifest,
             b"export default async () => {}",
-            &other
+            ("ui/extra.css", &other)
+        ))
+        .is_err()
+    );
+    let full = vec![b'/'; magi_plugin_system::MAX_SCRIPT_BYTES];
+    assert!(
+        PluginPackage::from_archive(&compressed_archive(
+            &manifest,
+            &full,
+            ("ui/runtime.js", &full)
         ))
         .is_err()
     );

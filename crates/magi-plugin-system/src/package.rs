@@ -10,8 +10,8 @@ use std::{
 pub const MAX_PACKAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: usize = 32 * 1024 * 1024;
 const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
-/// Node 扩展入口是构建期打包的单文件，容纳作者依赖，上限单独放宽；仍受解压总量约束。
-pub const MAX_EXTENSION_ENTRY_BYTES: usize = 16 * 1024 * 1024;
+/// 浏览器与 Node 的构建产物均可包含完整依赖；仍受归档与解压总量约束。
+pub const MAX_SCRIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILES: usize = 4096;
 const MAX_HOME_CARDS_PER_PLUGIN: usize = 2;
 /// 工具说明是模型可见的使用指引，真实工具常需要数 KiB 的约束与示例；其余贡献的说明仍限 4096 字节。
@@ -71,7 +71,10 @@ impl PluginPackage {
             }
             let limit = file_limit(&name);
             if file.size() > limit as u64 {
-                return Err(invalid("发布包文件大小超限"));
+                return Err(invalid(format!(
+                    "发布包文件 {name} 为 {} 字节，超过 {limit} 字节上限",
+                    file.size()
+                )));
             }
             let mut content = Vec::new();
             file.by_ref()
@@ -692,8 +695,11 @@ const REMOVED_SDK_MESSAGE: &str =
     "该插件使用已移除的 SDK 1（QuickJS 后台）；请改用声明 extension 的 SDK 2（Node 扩展）重新打包";
 
 fn file_limit(name: &str) -> usize {
-    if name == "extension/index.mjs" {
-        MAX_EXTENSION_ENTRY_BYTES
+    let extension = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    if (name.starts_with("extension/") || name.starts_with("ui/"))
+        && matches!(extension.as_str(), "js" | "mjs" | "cjs")
+    {
+        MAX_SCRIPT_BYTES
     } else {
         MAX_FILE_BYTES
     }

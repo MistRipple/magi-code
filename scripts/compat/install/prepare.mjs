@@ -38,8 +38,9 @@ function copyTree(source, target) {
         || (name.startsWith('native/linux/') && process.platform !== 'linux')) continue;
       if (/\.(node|wasm)$/i.test(name)) throw new Error(`上游原包或依赖包含未支持的原生模块：${name}`);
       const sourceStat = statSync(full), size = sourceStat.size; total += size;
-      const limit = name.startsWith('native/') ? 64 * 1024 * 1024 : 4 * 1024 * 1024;
-      if (size > limit || total > 64 * 1024 * 1024 || files.length >= 4096) throw new Error('上游原包及依赖超过有界安装限制');
+      // 这里只限制准备进程的临时复制开销；脚本、资源和最终归档的准入
+      // 由 daemon 的 PluginPackage 统一裁决，不维护第二份单文件规则。
+      if (total > 64 * 1024 * 1024 || files.length >= 4096) throw new Error(`上游原包及依赖超过准备预算：${name}（${size} 字节，累计 ${total} 字节）`);
       const dest = join(target, 'extension/upstream', name);
       mkdirSync(dirname(dest), { recursive: true }); copyFileSync(full, dest);
       if (name.startsWith('native/') && (sourceStat.mode & 0o111)) chmodSync(dest, 0o755);

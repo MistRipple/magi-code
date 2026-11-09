@@ -28,6 +28,7 @@ const run = promisify(execFile);
 const reporter = createReporter();
 const errors = [];
 const appLogs = [];
+const bundledScriptPadding = '\n/*' + 'bundled-dependency '.repeat(310_000) + '*/\n';
 const clipAuditSource = process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE ? await readFile(process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE, 'utf8') : null;
 const externalDshCli = process.env.MAGI_DSH_EXTERNAL_CLI ? await realpath(process.env.MAGI_DSH_EXTERNAL_CLI) : null;
 let app, page, frame, ui, pluginId, startupGate;
@@ -253,13 +254,14 @@ export function apply(ctx, config) {
   ctx.llm.registerAdapter(['runtime-fixture'], new Adapter());
 }
 
-`);
+` + bundledScriptPadding);
   const archive = join(work, 'plugin.zip');
   const result = await run(node, [join(compat, 'cli.mjs'), 'prepare', 'dsh', upstream, '--out', join(work, 'prepared'), '--integrity', 'local-acceptance', '--archive', archive], { timeout: 120_000, maxBuffer: 1024 * 1024 });
   const prepared = JSON.parse(result.stdout);
   const manifest = JSON.parse(await readFile(join(work, 'prepared/manifest.json'), 'utf8'));
   pluginId = prepared.id;
-  reporter.check('随包 Node 与兼容层完成原包封装，安装期不冻结动态贡献', prepared.report.runtimeContributions.includes('tools') && manifest.contributions.tools.length === 0);
+  reporter.check('随包 Node 封装并执行超过 5 MiB 的原包脚本，安装期不冻结动态贡献', prepared.report.runtimeContributions.includes('tools') && manifest.contributions.tools.length === 0
+    && (await readFile(join(work, 'prepared/extension/upstream/index.js'))).length > 5 * 1024 * 1024);
   reporter.check('不替换 Magi 运行库，从 npm 在线安装满足声明的独立 Cordis peer 并保留完整性',
     prepared.report.dependencies.some(dependency => dependency.name === '@deepseek-ai/cordis'
       && dependency.isolated && dependency.host === false && dependency.version === '4.0.5-alpha.2' && dependency.integrity.startsWith('sha512-')));
@@ -623,9 +625,15 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
     });
   }};
 }});`);
+  // 原页面可携带已打包的浏览器依赖；用同一原页面脚本验证正式资源入口，
+  // 不用读取源码成功替代 Chromium 实际加载并执行业务。
+  const nativeClient = join(upstream, 'client.js');
+  const browserScript = await readFile(nativeClient, 'utf8') + bundledScriptPadding;
+  await writeFile(nativeClient, browserScript);
   const archive = join(work, 'native-panels.zip');
   const result = await run(node, [join(compat, 'cli.mjs'), 'prepare', 'dsh', upstream, '--out', join(work, 'native-prepared'), '--integrity', 'local-acceptance', '--archive', archive], { timeout: 120_000 });
   const prepared = JSON.parse(result.stdout), id = prepared.id;
+  const preparedBrowserScript = await readFile(join(work, 'native-prepared/ui/client.js'));
   const payload = { source: 'local:native-panels.zip', archiveBase64: (await readFile(archive)).toString('base64') };
   const preview = await post('/api/plugins/preview', payload);
   await post('/api/plugins/install', { ...payload, expectedDigest: preview.digest });
@@ -633,6 +641,12 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   const plugin = (await api('/api/plugins')).value.plugins.find((item) => item.manifest.id === id);
   await post(`/api/plugins/${id}/authorize`, { grants: plugin.manifest.permissions });
   await post(`/api/plugins/${id}/activate`);
+  const browserAsset = await fetch(`${origin}/api/plugins/${id}/ui-v/${preview.digest}/client.js`);
+  const browserAssetBytes = Buffer.from(await browserAsset.arrayBuffer());
+  reporter.check('超过 5 MiB 的页面脚本经统一包校验与资源入口完整交付', browserAsset.status === 200
+    && browserAssetBytes.length > 5 * 1024 * 1024 && browserAssetBytes.equals(preparedBrowserScript)
+    && browserAssetBytes.toString('utf8').endsWith(bundledScriptPadding)
+    && ['addAttachments','removeAttachment'].every(operation=>prepared.report.ui.business.operations.includes(operation)), JSON.stringify({status:browserAsset.status,bytes:browserAssetBytes.length,operations:prepared.report.ui.business.operations}));
   await waitFor(async () => (await api('/api/plugins')).value.plugins.find((item) => item.manifest.id === id)?.runtime?.state === 'running', '原生多面板插件');
   reporter.check('标准包管理进程声明独立安装与授权委托', plugin.manifest.permissions.some(permission=>permission.kind==='pluginManagement'&&['install','authorize'].every(target=>permission.targets.includes(target))));
   const packageName='dsh-plugin-release-probe';

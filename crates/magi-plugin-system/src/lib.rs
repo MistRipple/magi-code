@@ -20,8 +20,8 @@ pub use lifecycle::{
 };
 pub use magi_app_server_protocol::{PluginManifest, PluginPermission, PluginPermissionKind};
 pub use package::{
-    MAX_EXTENSION_ENTRY_BYTES, MAX_PACKAGE_BYTES, PluginPackage, icon_content_type,
-    valid_plugin_id, validate_icon, validate_manifest,
+    MAX_PACKAGE_BYTES, MAX_SCRIPT_BYTES, PluginPackage, icon_content_type, valid_plugin_id,
+    validate_icon, validate_manifest,
 };
 pub use resource::{PluginResource, PluginResourceStore, ResourceError};
 

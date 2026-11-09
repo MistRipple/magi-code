@@ -256,7 +256,7 @@
 
 ### 5.10 包与信任模型
 
-【现状·读码推断】ZIP 路径、大小写冲突、原生载荷、文件类型和 schema 在安装前校验；16 MiB 压缩／32 MiB 展开／512 条目，后台入口上限以包校验代码为准。作者必须构建期打包依赖；产品不安装 npm 依赖，不运行 install 脚本。[package.rs:10](../crates/magi-plugin-system/src/package.rs#L10)。
+【现状·实现】ZIP 路径、大小写冲突、原生载荷、文件类型和 schema 在安装前校验；归档最多 16 MiB、展开最多 32 MiB、4096 个条目。浏览器与 Node 的 JavaScript 模块采用同一 16 MiB 单文件合同，其余资源最多 4 MiB；不再仅为一个后台入口设置较大容量。翻译准备只限制临时复制开销，不维护另一份单文件准入；最终包由 daemon 唯一校验。原生作者在构建期打包依赖，DSH 原包依赖沿在线解析并核对完整性，均不执行 install 脚本。[package.rs:10](../crates/magi-plugin-system/src/package.rs#L10)。
 
 【目标】信任告知必须说明：可读写文件和凭据、联网、派生进程；Magi 无法限制所有直接副作用。Magi 的 models/storage/tools 授权只控制公开业务服务，不保证恶意完全受信代码遵守它。modelSources 授权还须告知：用户选用该数据源后，对话历史与工具结果会发送到插件提供的地址。
 
@@ -514,14 +514,14 @@
 
 本节每个功能只保留最近一次独立完整运行的证据。此前批次不代表本轮已复跑，不将不同批次的分项合并为一次通过，也不从检查数量推导生态支持率。逐次排错过程及被替代的验收记录由 Git 历史和原证据目录追溯。
 
-本轮补齐公共提示贡献、统一插件身份校验并修正钩子调用的租约传递，重新构建 macOS arm64 目录包并完整运行公共运行时验收。翻译回归 **129/129**、宿主 **15 单元＋26 真实 Node 集成**、提示接纳 **8/8**、包校验 **25/25** 及 `cargo check -p magi-daemon` 通过；证据分别为 `target/plugin-acceptance/prompt-compat-final.log`、`prompt-host-lease.log`、`prompt-contribution-native-final.log`、`prompt-package.log`、`prompt-daemon-lease-check.log`。独立 Web check、全仓测试以及此前 Health／社区整批未在本次目录包复跑，不合并为本包的全量证明。目录包验收通过 `MAGI_PLUGIN_TEST_APP` 选择发行物，使用独立状态根和随包 daemon／Node；输出目录和可选审计设置见[验证入口](validation.md)。
+本轮统一浏览器与 Node 脚本容量，清除翻译准备中的重复单文件限制，重新构建 macOS arm64 目录包并完整运行公共运行时验收。翻译回归 **129/129**、包校验 **25/25** 及 `cargo check -p magi-daemon` 通过，证据为 `target/plugin-acceptance/resource-compat.log`、`resource-package-final.log`、`resource-daemon-check.log`；公共运行时 **152/152** 见下表。此前提示与租约改造的宿主 **15 单元＋26 真实 Node 集成**、提示接纳 **8/8** 证据保留，未在本次复跑。独立 Web check、全仓测试以及此前 Health／社区整批未在本次目录包复跑，不合并为本包的全量证明。目录包验收通过 `MAGI_PLUGIN_TEST_APP` 选择发行物，使用独立状态根和随包 daemon／Node；输出目录和可选审计设置见[验证入口](validation.md)。
 
 | 验证范围 | 入口 | 最近证据与边界 |
 | --- | --- | --- |
 | 此前准入收敛与目录包定向验收 | `test:compat`、标准 macOS 目录包、随包 Node 与真实 Electron | **128/128**，`target/plugin-acceptance/product-admission-compat.log`；目录包及解包自检通过，`product-admission-build.log`。当时目录包独立定向验收 **4/4**，`product-admission-release-final/`：随包 Node 完整输出 Cost Meter 的 **75,265 字节**报告；GenUI 在线预览在提示能力尚未接入时拒绝且无安装产物；Release Probe 在线安装、精确摘要、授权、实际运行及原包页面通过，页面异常 0。该 GenUI 拒绝不代表当前状态，机制包不计入真实业务覆盖率 |
 | 此前安装事务与构建检查，本轮未复跑 Rust | `test:compat`、`cargo test -p magi-plugin-system --test lifecycle`、`cargo test -p magi-api --lib routes::plugins::operations`、标准目录包 | **126/126**、**25/25**、**19/19**，`cargo check -p magi-daemon`、修改文件格式与 macOS 目录包解包自检通过；`target/plugin-acceptance/self-update-compat-final.log`、`self-update-lifecycle.log`、`self-update-api-final.log`、`self-update-daemon-final.log`、`self-update-build-final.log`。新增 npm／pnpm 安装、取消与目录边界，原实例结束后的自更新、权限扩张拒绝、撤权、归档失败、相同摘要的租约替换及等待就绪时目标版本被再次替换的回归。公共就绪等待绑定预期摘要，不把另一版本的 running 算成本次成功。未运行全仓测试或 Web check；构建仍输出已有 WebFolderPicker 静态／动态导入混用警告 |
 | 本轮 Health 共同完整业务 | `test:electron-dsh-health` 与社区批次共用 `scripts/lib/dsh-health-acceptance.mjs` | macOS arm64 目录包、随包 Node，专项 **33/33**，`target/plugin-acceptance/health-contract-release/`；社区整批独立执行同一合同通过。覆盖原包诊断、导出、临时文件修复预览／取消／隔离、文件变更后旧计划 409 拒绝、停用来源及重启、页面偏好实际持久化及关闭／重开、原页面 3.0.5 → 3.0.7 在线自更新、应用重启、插件自身停用／重新启用及原回执不重放。新实例控制密钥变化，旧密钥 401 拒绝；不用局部崩溃计数推导全局身份。页面异常 0，专项执行的阴影审计均 `cut=0`；非全部修复类型通过 |
-| 本轮公共提示、包管理、主题、页面业务及恢复 | `npm run test:electron-plugin-runtime` | 最新 macOS arm64 目录包、Electron 45、随包 Node，独立完整运行 **149/149**；`target/plugin-acceptance/prompt-lease-runtime/`，构建及解包自检 `prompt-lease-release-build.log`。**85,347 字符、272,415 字节**的完整业务指引进入真实模型请求，保留插件身份、参考来源及 user 角色，配置替换后不混入旧指引，原文证据 `prompt-model-request.json`。原包 npm 在线安装／卸载、pnpm 0.0.7 → 0.0.8 更新、失败保留、同调用文件快照，以及 8 种外观的 13 项真实颜色、官方组件、重连、390px 对话框均通过。Remote 取消／迟到回复、工具结果、上下文、消息、技能、Debugging 0.7.2 原包诊断、2 MiB 字节、PNG／SVG、右栏、停用、重启及短／长／收起正文视口通过，Renderer 与 iframe 异常 0。未启用外部 DSH CLI 或可选阴影审计，不代表整个 Debugging 插件或社区完整业务通过 |
+| 本轮公共脚本、提示、包管理、主题、页面业务及恢复 | `npm run test:electron-plugin-runtime` | 最新 macOS arm64 目录包、Electron 45、随包 Node，独立完整运行 **152/152**；`target/plugin-acceptance/resource-runtime-final/`，构建及解包自检 `resource-release-build.log`。后台和页面脚本均超过 5 MiB，完成真实封装、安装、运行及重启；页面实际交付 **5,895,527 字节**，与正式安装产物一致且依赖原字节保留。**85,347 字符、272,415 字节**业务指引完整进入真实模型请求，保留插件身份、参考来源及 user 角色，配置替换后不混入旧指引。npm 在线安装／卸载、pnpm 0.0.7 → 0.0.8 更新、失败保留、同调用文件快照，以及 8 种外观的 13 项真实颜色、官方组件、重连、390px 对话框均通过；桌面与 390px 阴影审计均 `cut=0`、`hidden=0`。Remote 取消／迟到回复、工具结果、上下文、消息、技能、Debugging 0.7.2 原包诊断、2 MiB 字节、PNG／SVG、右栏、停用、重启及短／长／收起正文视口通过，Renderer 与 iframe 异常 0。未启用外部 DSH CLI，不代表整个 Debugging 插件或社区完整业务通过 |
 | 此前目录修改 Rust 回归，本轮未复跑 | Rust、协议 | 插件领域生命周期 **24/24**、插件管理 API **15/15**、真实 Node 宿主 **25/25**；恢复保留原摘要、授权、停用来源和资源，拒绝过期实例及被篡改归档，新版提交沿原数据重置和授权规则。此前 `cargo check -p magi-daemon` 与协议一致性检查通过；本轮未复跑这些定向检查 |
 | 此前工具结果公共检查，未在本轮复跑 | Rust、Web、协议 | 真实 Node 宿主 **25/25**、任务循环 **66/66**、完成结果／恢复定向 **3/3**（与任务循环有重叠），`cargo check -p magi-daemon`、协议一致、修改文件格式通过。Web check 0 错误 0 警告，工具错误与展示回归通过；展示回归仍输出任务外 FileChangeCard／FileSpan 的既有 SSR 嵌套按钮警告。前端删除失败工具重展示时重复写控制台告警的副作用，失败详情仍由原 canonical 展示 |
 | 此前在线管理、Upgrader 完整业务及恢复 | `test:electron-dsh-management` | 新 macOS arm64 目录包独立完整运行 **46/46**，`target/plugin-acceptance/sdk-theme-management/`。Share、Upgrader、Market 原包完成 npm／GitHub 安装、更新、授权、失败保留、重启及卸载；Share SVG／PNG 导出、取消后重试与原包扫码核对通过。Upgrader 共同合同覆盖原页面配置、更新、并发拒绝、关闭／重开页面、取消、停用／重新启用、版本切换、归档落盘失败恢复、显式重试与应用重启，不重放旧批次。原包可用主按钮在 8 种外观的默认与真实悬停状态最低约 **7.43:1**；390px GitHub 确认固定可达、无横向溢出且 `cut=0`；页面异常 0。专项通过不替代其他插件完整业务 |
@@ -557,7 +557,7 @@
 | @michengai/dsh-skills-manager 1.3.0 | 技能提供方、沙箱策略、会话投影、Agent 生命周期及工具前置事件尚未完整接入 |
 | dsh-cost-meter 1.9.60 | 凭据、Web／Typert、流式计量、会话／工具与设置／账号事件等仍阻塞；保留完整报告与全部阻塞项 |
 | dsh-free-search 0.9.39 | 本插件片段注册已接通；Web 搜索／抓取提供方、`webStartup`、设置文档事件及其余必需接口仍需补齐 |
-| dsh-genui 0.3.3 | 已接通必需的片段注册，原包后台四档模式与设置提交的独立替身验证见下文；原包安装准备随后被 6,327,444 字节的页面运行资源阻断。当前单文件 4 MiB 限制、原生聊天渲染槽位及交互回传仍需处理，不计为安装或业务通过 |
+| dsh-genui 0.3.3 | 已接通必需的片段注册；公共脚本容量改造后，同一原包的 6,327,444 字节页面运行资源已通过准备复制，随后被未接入的 `conversation.input.left`／`conversation.chat.node` 挂载准入拒绝。原生模块的额外运行资源加载、聊天渲染槽位及交互回传仍需完整接入，不计为安装或业务通过 |
 | dsh-image-gen 0.11.1 | 图片限制／校验、凭据解析及变更事件尚未接入 |
 
 检查 Cost Meter 时发现工具链写 stdout 后立即退出，大报告在 65,536 字节处被截断。`cli.mjs` 的 resolve、prepare 和 inspect 共用等待写入完成的输出入口；真实管道回归生成超过 64 KiB 的报告，核对末尾阻塞项和失败退出码。独立检查与安装共用 DSH 翻译器的默认完整业务准入，移除安装入口的第二份范围列表；显式 `--require` 只作分项诊断，文字结论明确区分静态检查与安装／业务验证。回归核对同一必需提示 API 在默认 CLI 和实际安装准备入口均被拒绝，拒绝发生在依赖获取和产物生成之前；分项诊断成功不宣称插件可用。未放宽能力准入或包限制。
@@ -565,6 +565,10 @@
 此前社区整批因 registry 代理连续 502 而失败的记录保留于 `health-contract-community/`，不计为通过；最新独立完整运行仅以上表 `health-contract-community-verified/` 为准。新包定向验收的首次脚本传入了空 registry 地址，在配置校验阶段失败，记录保留于 `product-admission-release/`；显式使用官方 registry 后完整独立复跑，结果只以上表 `product-admission-release-final/` 为准。
 
 提示贡献改造另使用已核对的 GenUI 0.3.3 原包副本，安装准备保留真实依赖解析与受限启动，失败证据为 `target/plugin-acceptance/prompt-genui-preparation/`。未删改原包页面、降低文件准入或制作替代插件。随后直接运行同一原入口、真实 Cordis 和提示注册表，daemon RPC 使用内存替身，原路由切换 `off`／`mini`／`standard`／`plus` 后分别得到 0／38,475／57,982／73,417 字符，并核对设置句柄实际提交；证据 `prompt-genui-backend/`。它只证明后台接口与原文模式，不能替代目录包安装、页面渲染或交互业务。
+
+公共脚本容量改造后，使用同一来源快照、真实完整性身份与未修改的 GenUI 0.3.3 原包重新准备，6,327,444 字节运行资源的 SHA-256 为 `c73508cf211535572e26edb7ab98ef6286adacd676880e5d76855a24b2fd3f6a`，复制前后字节一致；随后在聊天／输入槽位准入明确拒绝。证据 `target/plugin-acceptance/resource-genui-preparation/source-verified.json`；没有通过补一个空白设置页或伪造挂载结果让安装继续。
+
+容量验收的首次失败保留于 `resource-runtime/`：真实资源已返回 200，但夹具把原业务调用与已插入必要回执等待的正式产物直接比较。后续断言核对交付字节与正式安装产物、未改写的依赖原文和必需的业务转换记录；完整页面动作、在线安装和重启仍全部执行，最终只以 `resource-runtime-final/` 独立批次为准。
 
 提示链路的失败证据保留于 `prompt-runtime/`、`prompt-runtime-final/` 及真实 Node 回归 `prompt-hook-lease-before.log`：前两次目录包运行未能把贡献交付到模型，分别暴露插件／片段身份混用及钩子关联身份被误当业务租约。最终结果只以修正后的独立完整运行 `prompt-lease-runtime/` 为准，没有省略长原文或来源断言。
 

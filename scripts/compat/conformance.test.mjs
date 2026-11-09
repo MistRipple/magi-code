@@ -195,6 +195,8 @@ test('原包封装只观察默认启动，扫描与运行共用条件导出，�
       ctx.inject(['settings'], c => { if (config.enabled) c.settings.register('late', value => value ?? {}); });
     }
   `);
+  const largeChunk = '//' + 'x'.repeat(5 * 1024 * 1024);
+  await writeFile(join(upstream, 'large-chunk.mjs'), largeChunk);
   const client = `/* preserve page */ window.__ModuleLoader__.load({ id: 'contract', factory: require => {
     const getModules = () => require;
     return { apply(ctx) {
@@ -214,6 +216,7 @@ test('原包封装只观察默认启动，扫描与运行共用条件导出，�
     assert.ok(result.manifest.permissions.some(permission => permission.kind === 'storage' && permission.targets.includes('dsh-registered-settings')));
     assert.deepEqual(result.manifest.permissions.find(permission => permission.kind === 'pluginManagement').targets, ['lifecycle', 'background'], '单独重载只声明生命周期授权');
     assert.equal(await readFile(join(outDir, 'ui/client.js'), 'utf8'), client);
+    assert.equal(await readFile(join(outDir, 'extension/upstream/large-chunk.mjs'), 'utf8'), largeChunk);
     assert.match(await readFile(join(outDir, `ui/dsh-config-${result.manifest.contributions.views[0].id}.js`), 'utf8'), /ui-primitives\.js/);
     assert.ok((await readFile(join(outDir, 'ui/ui-primitives.js'))).length > 0);
     assert.equal(result.report.variants, undefined);
