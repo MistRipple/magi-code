@@ -24,6 +24,7 @@ import { prepareDsh } from './install/prepare.mjs';
 import { backendEntry } from './core/package.mjs';
 import { createViewTransport } from './runtime/client/view-transport.mjs';
 import { createRouteFetch } from './runtime/client/route-fetch.mjs';
+import { createResourceUrls } from './runtime/client/resource-urls.mjs';
 import { createRemoteConnection } from './runtime/client/connection.mjs';
 import { getEventListeners } from 'node:events';
 import { runRoute } from './runtime/routes.mjs';
@@ -35,6 +36,23 @@ const temporary = async (t) => {
   return root;
 };
 const json = (file, value) => writeFile(file, JSON.stringify(value));
+
+test('原生资源地址绑定同一实例，保留静态 SDK、查询和模块相对依赖，不把资源 URL 当业务路径', async () => {
+  const base='https://magi.example/api/plugins/acme/ui-v/digest/index.html';
+  const gateway='https://magi.example/api/plugins/acme/assets/digest/instance/';
+  const urls=createResourceUrls(base,gateway,['client.js','sdk.js']);
+  assert.equal(urls.resolve('/runtime/main.mjs?q=完整#module'),gateway+'runtime/main.mjs?q=%E5%AE%8C%E6%95%B4#module');
+  assert.equal(urls.resolve('client.js'),'client.js');
+  assert.equal(urls.resolve('extra.css'),gateway+'extra.css');
+  assert.equal(urls.resolve('https://other.example/code.js'),'https://other.example/code.js');
+  assert.equal(urls.resolve('data:image/svg+xml,test'),'data:image/svg+xml,test');
+  assert.equal(urls.resolve(new URL('./leaf.mjs',gateway+'runtime/main.mjs')),gateway+'runtime/leaf.mjs');
+  const calls=[];
+  const fetchRoute=createRouteFetch(async input=>{calls.push(input);return {status:200,body:'ok'};},base,urls.restore);
+  await fetchRoute(gateway+'runtime/data.json?q=1');
+  assert.equal(calls[0].path,'/runtime/data.json');assert.equal(calls[0].query,'q=1');
+  assert.throws(()=>createResourceUrls(base,'https://other.example/'),/入口无效/);
+});
 
 test('页面取消只结束对应路由，迟到回执不污染后续调用，关闭文档释放等待和信号监听', async () => {
   const sent = [], transport = createViewTransport(message => sent.push(message));

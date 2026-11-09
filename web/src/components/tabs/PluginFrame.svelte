@@ -51,7 +51,7 @@
   const runtimeState = $derived(installed?.active ? runtime?.state ?? 'starting' : 'notRunning');
   const resourceDigest = $derived(installed?.digest ?? '');
   // 监管可能合并中间状态；即使只看到 running → running，新运行代次也必须创建新文档。
-  const documentIdentity = $derived(JSON.stringify([pluginId, entry, resourceDigest, ready, runtime?.generation]));
+  const documentIdentity = $derived(JSON.stringify([pluginId, entry, resourceDigest, ready, runtime?.instanceId]));
   const resourceUrl = $derived(
     agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/${resourceDigest ? `ui-v/${resourceDigest}` : 'ui'}/${entry.replace(/^ui\//, '').split('/').map(encodeURIComponent).join('/')}`),
   );
@@ -134,6 +134,7 @@
   const STREAM_ROUTE = '/__magi_compat/streams';
   const activeStreams = new Map<string, string>();
   let documentDigest = '';
+  let documentRuntimeId: string | undefined;
   let documentEntry = '';
   let navigationIdentity = '';
   let composerSubscribed = false;
@@ -162,7 +163,7 @@
     for (const controller of routeControllers.values()) controller.abort();
     routeControllers.clear();
     for (const [id, owner] of activeStreams) {
-      void callPluginRoute(owner, { method: 'POST', path: STREAM_ROUTE, body: { action: 'close', id } }).catch(() => {});
+      void callPluginRoute(owner, { method: 'POST', path: STREAM_ROUTE, body: { action: 'close', id }, expectedDigest: documentDigest, expectedInstanceId: documentRuntimeId }).catch(() => {});
     }
     activeStreams.clear();
     // 迟到 open 回执也不属于下一份文档；收到后会走相同 close 入口。
@@ -213,6 +214,8 @@
     if (event.data.type !== 'request') return;
     const callingPluginId = pluginId;
     const expectedInstance = instanceId;
+    const callingDigest = documentDigest;
+    const callingRuntimeId = documentRuntimeId;
     const operation = event.data.operation;
     if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write', 'settings.describe', 'route.call', 'host.openExternal', 'clipboard.write', 'view.resize', 'view.open', 'view.storage.read', 'view.storage.write', 'composer.snapshot', 'composer.addImages', 'composer.removeImage', 'composer.notify', 'composer.focus'].includes(operation)) return;
     try {
@@ -289,6 +292,8 @@
         try { routed = await callPluginRoute(callingPluginId, {
           method: event.data.method,
           path: event.data.path,
+          expectedDigest: callingDigest,
+          expectedInstanceId: callingRuntimeId,
           ...(typeof event.data.query === 'string' ? { query: event.data.query } : {}),
           ...(event.data.headers === undefined ? {} : { headers: event.data.headers }),
           ...(event.data.body === undefined ? {} : { body: event.data.body }),
@@ -298,7 +303,7 @@
         if (stream?.action === 'open' && routed.status === 200 && typeof (routed.body as { id?: unknown })?.id === 'string') {
           const id = (routed.body as { id: string }).id;
           if (expectedInstance !== instanceId || controller.signal.aborted) {
-            void callPluginRoute(callingPluginId, { method: 'POST', path: STREAM_ROUTE, body: { action: 'close', id } }).catch(() => {});
+            void callPluginRoute(callingPluginId, { method: 'POST', path: STREAM_ROUTE, body: { action: 'close', id }, expectedDigest: callingDigest, expectedInstanceId: callingRuntimeId }).catch(() => {});
             return;
           }
           activeStreams.set(id, callingPluginId);
@@ -388,6 +393,7 @@
     releaseResourceSubscriptions();
     releaseRoutes();
     documentDigest = '';
+    documentRuntimeId = undefined;
     documentEntry = '';
   });
 </script>
@@ -409,8 +415,10 @@
     releaseRoutes();
     reportedHeight = null;
     documentDigest = resourceDigest;
+    documentRuntimeId = runtime?.instanceId;
     documentEntry = entry;
-    send({ type: 'init', pluginId, placement, viewId: currentViewId(), locale: i18n.locale, theme: readTheme() });
+    send({ type: 'init', pluginId, placement, viewId: currentViewId(), locale: i18n.locale, theme: readTheme(),
+      resourceBase: documentRuntimeId ? agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/assets/${encodeURIComponent(documentDigest)}/${encodeURIComponent(documentRuntimeId)}/`) : undefined });
   }}
   sandbox="allow-scripts allow-downloads"
   referrerpolicy="no-referrer"

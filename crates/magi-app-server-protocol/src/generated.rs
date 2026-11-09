@@ -1837,6 +1837,10 @@ pub struct PluginRuntimeStatus {
     pub generation: u64,
     pub crashes: u64,
     pub blocking: Vec<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "instanceId")]
+    pub instance_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1963,6 +1967,14 @@ pub struct PluginRouteCallRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "bodyBase64")]
     pub body_base64: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expectedDigest")]
+    pub expected_digest: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expectedInstanceId")]
+    pub expected_instance_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

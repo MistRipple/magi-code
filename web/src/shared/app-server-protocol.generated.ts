@@ -814,6 +814,7 @@ export interface PluginRuntimeStatus {
   generation?: number | null;
   crashes: number;
   blocking: Array<string>;
+  instanceId?: string;
 }
 
 export interface PluginList {
@@ -875,6 +876,8 @@ export interface PluginRouteCallRequest {
   headers?: Record<string, unknown>;
   body?: unknown;
   bodyBase64?: string;
+  expectedDigest?: string;
+  expectedInstanceId?: string;
 }
 
 export interface PluginRouteCallResult {

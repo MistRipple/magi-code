@@ -160,6 +160,8 @@ pub struct HostInstance {
     /// 插件包摘要；提示贡献的片段身份包含它。
     pub digest: String,
     pub generation: u64,
+    /// 公开的实例关联身份；与私有服务租约、握手令牌分开，不具有授权能力。
+    pub instance_id: String,
     pub(crate) peer: Peer,
     approved: HashMap<String, ApprovedHook>,
     bound: Arc<Mutex<HashSet<String>>>,
@@ -814,6 +816,7 @@ pub async fn launch(
             .as_u64()
             .ok_or_else(|| LaunchError::Handshake("设置快照缺少版本".into()))?;
     }
+    let instance_id = random_hex(16).map_err(LaunchError::Endpoint)?;
     let service_lease = ServiceLease {
         plugin_id: config.plugin_id.clone(),
         lease: random_hex(16).map_err(LaunchError::Endpoint)?,
@@ -1003,6 +1006,7 @@ pub async fn launch(
         digest: config.digest,
         generation,
         peer,
+        instance_id,
         approved,
         bound,
         bound_tools,

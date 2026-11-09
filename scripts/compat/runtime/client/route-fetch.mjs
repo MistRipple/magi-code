@@ -1,12 +1,12 @@
 // 页面 fetch 只访问本插件路由，沿唯一视图桥执行；浏览器负责 Request 输入校验。
 import { encodeRouteBytes, decodeRouteBytes, readRouteBytes, MAX_ROUTE_RESPONSE_BYTES } from '../route-payload.mjs';
 
-export function createRouteFetch(request, baseUri) {
+export function createRouteFetch(request, baseUri, restoreUrl = url => url) {
   const base = new URL(baseUri);
   return async (input, init) => {
     const original = input instanceof Request ? input : new URL(String(input), base);
     const outgoing = new Request(original, init);
-    const url = new URL(outgoing.url);
+    const url = restoreUrl(new URL(outgoing.url));
     if (url.origin !== base.origin) throw new TypeError(`插件界面只能访问自己宿主的后端路由：${url.href}`);
     outgoing.signal.throwIfAborted();
     let bodyBase64;

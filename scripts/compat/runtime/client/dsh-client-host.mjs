@@ -8,8 +8,8 @@
 //   - `settingsScope` 由 Magi 设置（settings.read / settings.write）支撑；
 //   - 主题令牌映射到上游使用的 `--dsw-*` 变量，语言随 Magi 切换。
 //
-// 不做什么（如实披露，见兼容报告）：DSH 外壳里的其他槽位（输入框右侧、会话底部栏、全局配额提示等）
-// 属于 DSH 的会话界面，Magi 没有对应位置；这些注册被收集后不渲染，并记录在 `unmountedSlots` 里供报告读取。
+// 设置、主页面和右栏沿公共槽位合同挂载；其余槽位仍待产品接入，
+// 当前未挂载的注册记录在 `unmountedSlots`，不能据视图准备成功声称完整业务通过。
 import * as React from 'react';
 import * as ReactDOM from 'react-dom';
 import * as ReactDOMClient from 'react-dom/client';
@@ -26,6 +26,7 @@ import { SettingsForm } from './settings-form.mjs';
 import { createViewTransport } from './view-transport.mjs';
 import { createRouteFetch } from './route-fetch.mjs';
 import { createRemoteConnection } from './connection.mjs';
+import { createResourceUrls, installResourceUrls } from './resource-urls.mjs';
 
 const CHANNEL = 'magi-plugin-v1';
 
@@ -42,6 +43,7 @@ export function startDshClient(options) {
   let placement = 'page';
   let selectedSlot = options;
   let initialized = false;
+  let resourceUrls;
   let settingsSchema, settingsError;
   const selectView = (m) => {
     placement = ['settings', 'background'].includes(m.placement) ? m.placement : 'page';
@@ -61,7 +63,7 @@ export function startDshClient(options) {
   window.addEventListener('pagehide', () => { eventSources.dispose(); composer.dispose(); sessionComposer?.dispose(); slotContext.dispose(); transport.dispose(); }, { once: true });
 
   // —— 路由：上游界面用 fetch('/plugins/<name>/…') 访问自己的后端，这里转交给宿主里的同一处理器 ——
-  globalThis.fetch = createRouteFetch(request, document.baseURI);
+  globalThis.fetch = createRouteFetch(request, document.baseURI, url => resourceUrls?.restore(url) ?? url);
 
   // —— 沙箱里被禁的窗口、剪贴板、下载：经桥交给宿主 ——
   window.open = (url) => { if (url) void request({ operation: 'host.openExternal', url: String(url) }).catch(() => {}); return null; };
@@ -227,6 +229,10 @@ export function startDshClient(options) {
       instanceId = m.instanceId;
       if (initialized) return;
       initialized = true;
+      if (m.resourceBase) {
+        resourceUrls = createResourceUrls(document.baseURI, m.resourceBase, [options.clientScript ?? 'client.js', ...(options.libraryScripts ?? [])]);
+        installResourceUrls(window, resourceUrls);
+      }
       selectView(m);
       lastReported = -1;
       locale = m.locale ?? locale;

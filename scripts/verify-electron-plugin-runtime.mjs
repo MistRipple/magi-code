@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import { browserImageFixtures } from './lib/plugin-image-fixtures.mjs';
 import { packPlugin } from './compat/core/pack.mjs';
 import { connectAppPage, connectTarget, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
@@ -31,6 +32,8 @@ const appLogs = [];
 const bundledScriptPadding = '\n/*' + 'bundled-dependency '.repeat(310_000) + '*/\n';
 const clipAuditSource = process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE ? await readFile(process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE, 'utf8') : null;
 const externalDshCli = process.env.MAGI_DSH_EXTERNAL_CLI ? await realpath(process.env.MAGI_DSH_EXTERNAL_CLI) : null;
+const originalResource = process.env.MAGI_PLUGIN_ORIGINAL_RESOURCE ? await readFile(process.env.MAGI_PLUGIN_ORIGINAL_RESOURCE) : null;
+const originalResourceElement = process.env.MAGI_PLUGIN_RESOURCE_ELEMENT;
 let app, page, frame, ui, pluginId, startupGate;
 const heldStarts = new Set();
 await mkdir(output, { recursive: true });
@@ -459,6 +462,7 @@ async function verifyNativePanels(session) {
   await writeFile(join(upstream, 'package.json'), JSON.stringify({ name: 'magi-native-panels', version: '1.0.0', type: 'module', main: 'index.js',
     dependencies: { '@deepseek-ai/schemastery': deps['@deepseek-ai/schemastery'] },
     dsh: { bundle: {} }, exports: { '.': './index.js', './client': './client.js' } }));
+  if (originalResource) await writeFile(join(upstream,'original-runtime.js'),originalResource);
   await writeFile(join(upstream, 'index.js'), `
 import Schema from '@deepseek-ai/schemastery';
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
@@ -513,6 +517,30 @@ export async function apply(ctx, config) {
   ctx.webServer.register({path:'/oversize-response',handler(req,res){
     res.writeHead(200,{'content-type':'text/plain'});res.end(Buffer.alloc(16*1024*1024+1,97));
   }});
+  const assetCalls={main:0,leaf:0,slow:'idle',slowCalls:0};
+  ctx.webServer.register({path:'/native/main.mjs',handler(req,res){
+    assetCalls.main++;
+    res.writeHead(200,{'content-type':'text/javascript'});
+    res.end('import { marker } from "./leaf.mjs?original=1";\\n'+
+      'const response=await fetch(new URL("./data.json?q=1",import.meta.url));\\n'+
+      'window.__nativeModule={marker,data:await response.json(),url:import.meta.url};\\n/*'+ 'original-module '.repeat(360_000)+'*/');
+  }});
+  ctx.webServer.register({path:'/native/leaf.mjs',handler(req,res){
+    assetCalls.leaf++;res.writeHead(200,{'content-type':'text/javascript'});res.end('export const marker="原始模块🙂";');
+  }});
+  ctx.webServer.register({path:'/native/data.json',resource:req=>Response.json({query:new URL(req.url).search})});
+  ctx.webServer.register({path:'/native/theme.css',resource:()=>new Response(':root{--native-asset-color:rgb(12, 34, 56)}',
+    {headers:{'content-type':'text/css'}})});
+  ctx.webServer.register({path:'/native/icon.svg',resource:()=>new Response(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="13" height="11"><rect width="13" height="11" fill="red"/></svg>',
+    {headers:{'content-type':'image/svg+xml'}})});
+  ctx.webServer.register({path:'/native/count',resource:()=>Response.json(assetCalls)});
+  ctx.webServer.register({path:'/native/slow.mjs',handler(req,res){
+    assetCalls.slow='running';assetCalls.slowCalls++;
+    const timer=setTimeout(()=>res.end('window.__mustNotRun=true;'),30000);
+    res.on('close',()=>{clearTimeout(timer);assetCalls.slow='cancelled';});
+  }});
+  ${originalResource ? `ctx.webServer.register({path:'/native/original.mjs',resource:()=>new Response(readFileSync(new URL('./original-runtime.js',import.meta.url)),{headers:{'content-type':'text/javascript'}})});` : ''}
   ctx.webServer.register({path:'/binary-image',resource:()=>new Response(
     Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=','base64'),
     {headers:{'content-type':'image/png','x-image-source':'original-route'}})});
@@ -691,7 +719,7 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   const first = plugin.manifest.contributions.views.find((view) => view.title === 'first');
   const entry = `.launcher-tool[data-plugin-id="${id}"][data-contribution-id="${first.id}"]`;
   await waitFor(() => ui.exists(entry), '第一个原生面板'); await ui.click(entry);
-  let clientInstance;
+  let clientInstance, oldResourceUrl, oldRuntimeId;
   for (const key of ['first', 'second']) {
     frame?.close();
     const selector = `iframe[data-plugin-id="${id}"]`;
@@ -813,6 +841,51 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
         large.sizes.length===10&&large.sizes.every(size=>size===5*1024*1024),large);
       reporter.check('响应超过 16 MiB 时明确整体拒绝，原实例继续处理图片与后续业务',
         large.overflow.status===502&&/超过.*已丢弃/.test(large.overflow.body.error),large.overflow);
+      const native=await frame.evaluate(`(async()=>{
+        const script=document.createElement('script');script.type='module';script.src='/native/main.mjs';
+        const loaded=new Promise((resolve,reject)=>{script.onload=resolve;script.onerror=()=>reject(new Error('native module failed'));});
+        document.head.appendChild(script);await loaded;
+        const link=document.createElement('link');link.rel='stylesheet';link.setAttribute('href','/native/theme.css');
+        const styled=new Promise((resolve,reject)=>{link.onload=resolve;link.onerror=()=>reject(new Error('native stylesheet failed'));});
+        document.head.appendChild(link);await styled;
+        const image=new Image();image.src='/native/icon.svg';document.body.append(image);await image.decode();
+        const result={...window.__nativeModule,src:script.src,color:getComputedStyle(document.documentElement).getPropertyValue('--native-asset-color').trim(),image:{width:image.naturalWidth,height:image.naturalHeight}};
+        script.remove();link.remove();image.remove();return result;
+      })()`);
+      const assetCount=(await post(`/api/plugins/${id}/routes`,{method:'GET',path:'/native/count'})).body;
+      oldResourceUrl=native.src;
+      oldRuntimeId=(await api('/api/plugins')).value.plugins.find(item=>item.manifest.id===id).runtime.instanceId;
+      reporter.check('原生 module script 完整加载超过 5 MiB 原模块及相对依赖，执行一次并保留 import.meta.url 与查询',
+        native.marker==='原始模块🙂'&&native.data.query==='?q=1'&&native.src===native.url
+          &&assetCount.main===1&&assetCount.leaf===1&&native.url.includes('/assets/'),{native,assetCount});
+      reporter.check('原生 link 与 Image 共用插件资源身份，保留 CSS 字节和 SVG 实际解码',
+        native.color==='rgb(12, 34, 56)'&&native.image.width===13&&native.image.height===11,native);
+      const assetAbort=new AbortController();
+      const pendingAsset=fetch(native.src.replace('/native/main.mjs','/native/slow.mjs'),{signal:assetAbort.signal}).then(()=> 'unexpected-success',error=>error.name);
+      await waitFor(async()=>(await post(`/api/plugins/${id}/routes`,{method:'GET',path:'/native/count'})).body.slow==='running','原生资源 HTTP 请求实际开始');
+      assetAbort.abort();
+      const assetCancelled=await pendingAsset;
+      const afterAssetCancel=await waitFor(async()=>{
+        const state=(await post(`/api/plugins/${id}/routes`,{method:'GET',path:'/native/count'})).body;
+        return state.slow==='cancelled'&&state;
+      },'原生资源断开后取消真实处理器');
+      reporter.check('原生资源 HTTP 取消到达真实原处理器并释放等待，不重放业务',
+        assetCancelled==='AbortError'&&afterAssetCancel.slowCalls===1,{assetCancelled,afterAssetCancel});
+      if(originalResource) {
+        const original=await frame.evaluate(`(async()=>{
+          const script=document.createElement('script');script.type='module';script.src='/native/original.mjs';
+          const loaded=new Promise((resolve,reject)=>{script.onload=resolve;script.onerror=()=>reject(new Error('original resource failed'));});
+          document.head.appendChild(script);await loaded;
+          return {url:script.src,defined:${originalResourceElement ? `Boolean(customElements.get(${JSON.stringify(originalResourceElement)}))` : 'true'}};
+        })()`);
+        reporter.check('未改写的真实原包额外运行模块通过原生 script 执行并完成组件注册',original.defined,original);
+        await writeFile(join(output,'original-native-resource.json'),JSON.stringify({
+          source:process.env.MAGI_PLUGIN_ORIGINAL_RESOURCE,bytes:originalResource.length,
+          sha256:createHash('sha256').update(originalResource).digest('hex'),element:originalResourceElement,...original,
+          scope:'原包额外模块机制验收，不代表该插件已安装或完整业务通过',
+        },null,2));
+      }
+      await writeFile(join(output,'native-resources.json'),JSON.stringify({native,assetCount,oldRuntimeId},null,2));
       const media=await frame.evaluate(`(async()=>{
         const response=await fetch('/binary-image'),blob=await response.blob(),url=URL.createObjectURL(blob);
         const image=new Image();image.src=url;document.body.append(image);
@@ -963,6 +1036,12 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   await waitFor(() => frame.evaluate('Boolean(window.__clientInstance)'), '重新初始化原包客户端');
   await waitFor(() => frame.evaluate(`document.getElementById('pulse')?.textContent==='1'`), '新文档自动恢复后端事件');
   reporter.check('后台恢复后自动创建新客户端，旧文档不会继续调用', await frame.evaluate('window.__clientInstance') !== clientInstance);
+  const restarted=(await api('/api/plugins')).value.plugins.find(item=>item.manifest.id===id);
+  const staleResource=await fetch(oldResourceUrl);
+  const newAssetCount=(await post(`/api/plugins/${id}/routes`,{method:'GET',path:'/native/count'})).body;
+  reporter.check('同版重新启用签发新公开实例身份，旧原生资源 URL 在执行业务前拒绝',
+    restarted.runtime.instanceId!==oldRuntimeId&&staleResource.status===409&&newAssetCount.main===0&&newAssetCount.leaf===0,
+    {oldRuntimeId,current:restarted.runtime.instanceId,status:staleResource.status,newAssetCount});
   await snapshot('panel-restarted');
   await post(`/api/plugins/${id}/deactivate`);
   await waitFor(async () => !await ui.exists(`iframe[data-plugin-id="${id}"]`), '再次停用回收客户端');
@@ -1305,6 +1384,7 @@ try {
     await evaluateFrame('document.getElementById("f-label").value === "initial" && document.getElementById("f-enabled").checked'));
   await evaluateFrame('document.getElementById("f-label").value="changed"; document.getElementById("f-enabled").checked=true; document.getElementById("save").click(); true');
   await waitFor(async () => (await api(`/api/plugins/${pluginId}/settings`)).value.value?.label === 'changed', '界面配置保存');
+  await waitFor(()=>evaluateFrame('document.getElementById("status")?.textContent==="已保存"&&!document.getElementById("save").disabled'),'保存配置的页面真实完成回执');
   reporter.check('共享页面宿主经同一 settingsScope 保存动态 schema 配置', true);
   await snapshot('settings-desktop');
   const viewport = () => page.evaluate(`(() => {
@@ -1315,7 +1395,12 @@ try {
   reporter.check('短设置正文不会收缩原包视口，vh 与 fixed 浮层仍使用完整可用区域',true);
   const clientIdentity=await evaluateFrame(`window.__viewportAcceptance=crypto.randomUUID()`);
   await evaluateFrame(`(() => {const content=document.createElement('div');content.id='viewport-long-content';content.style.height='1600px';document.getElementById('root').appendChild(content);})()`);
-  await waitFor(async()=>{const size=await viewport();return size.height>1600&&size.scrollHeight>size.clientHeight;},'长内容沿原有高度上报扩展设置页滚动');
+  await waitFor(async()=>{const size=await viewport();return size.height>1600&&size.scrollHeight>size.clientHeight;},'长内容沿原有高度上报扩展设置页滚动').catch(async error=>{
+    await writeFile(join(output,'viewport-failure.json'),JSON.stringify({
+      host:await viewport(),frame:await evaluateFrame(`({identity:window.__viewportAcceptance,root:document.getElementById('root').getBoundingClientRect().toJSON(),content:document.getElementById('viewport-long-content')?.getBoundingClientRect().toJSON(),html:document.getElementById('root').innerHTML.slice(-2000),placement:document.documentElement.dataset.placement})`),
+      runtime:(await installed()).runtime,errors,
+    },null,2));throw error;
+  });
   await page.evaluate(`(() => {const scroller=document.querySelector('.settings-frame');scroller.scrollTop=scroller.scrollHeight;})()`);
   reporter.check('长页面由宿主滚动，隔离文档没有第二条正文滚动链',
     await page.evaluate(`document.querySelector('.settings-frame').scrollTop>0`)

@@ -638,6 +638,7 @@ mod tests {
                         PluginRuntimeState::Running
                     },
                     generation: 7,
+                    instance_id: None,
                     reason: Some("real startup failure".into()),
                     crashes: 0,
                     blocking: vec![],
@@ -951,6 +952,7 @@ mod tests {
                     state: PluginRuntimeState::Failed,
                     reason: Some("原包启动失败".into()),
                     generation: 1,
+                    instance_id: None,
                     crashes: 1,
                     blocking: Vec::new(),
                 })

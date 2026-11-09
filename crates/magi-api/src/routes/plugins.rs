@@ -33,7 +33,9 @@ const RESOURCE_SUBSCRIPTION_RECHECK: Duration = Duration::from_millis(500);
 const MAX_INSTALL_REQUEST_BYTES: usize = MAX_PACKAGE_BYTES.div_ceil(3) * 4 + 64 * 1024;
 /// 路由 JSON 可承载最多 2 MiB 的 base64 字节及有界头部；其他 HTTP 接口保持原上限。
 const MAX_ROUTE_REQUEST_BYTES: usize = 3 * 1024 * 1024 + 64 * 1024;
+const VIEW_CONTENT_SECURITY_POLICY: &str = "sandbox allow-scripts allow-downloads; default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; object-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'; connect-src 'none'";
 
+mod assets;
 mod center;
 mod download;
 mod operations;
@@ -81,6 +83,10 @@ pub fn routes() -> Router<ApiState> {
             get(versioned_resource),
         )
         .route("/plugins/{id}/icon", get(icon))
+        .route(
+            "/plugins/{id}/assets/{digest}/{instance}/{*path}",
+            get(assets::resource),
+        )
         .route(
             "/plugins/{id}/routes",
             post(call_route).layer(DefaultBodyLimit::max(MAX_ROUTE_REQUEST_BYTES)),
@@ -252,9 +258,7 @@ fn resource_response(
         .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
     response.headers_mut().insert(
         "content-security-policy",
-        HeaderValue::from_static(
-            "sandbox allow-scripts allow-downloads; default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; object-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'; connect-src 'none'",
-        ),
+        HeaderValue::from_static(VIEW_CONTENT_SECURITY_POLICY),
     );
     response.headers_mut().insert(
         "x-content-type-options",
@@ -1726,6 +1730,7 @@ mod tests {
                     state: PluginRuntimeState::Restarting,
                     reason: Some("宿主进程退出".into()),
                     generation: 0,
+                    instance_id: None,
                     crashes: 2,
                     blocking: vec!["tool.call".into()],
                 })

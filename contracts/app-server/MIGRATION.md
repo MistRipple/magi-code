@@ -1,5 +1,12 @@
 # App Server 协议生成约定
 
+`PluginRuntimeStatus.instanceId` 为 daemon 签发的当前运行实例公开关联身份，与私有服务租约
+分开，不具有授权能力；每次重新启动均变化，缺少宿主时省略。`generation` 仍仅表示一次
+监管周期内的崩溃代次。页面用摘要与 instanceId 绑定文档生命周期；原路由请求增量接受
+`expectedDigest`／`expectedInstanceId`，daemon 在业务开始前核对并拒绝失效调用。
+原生资源 GET／HEAD 入口 `/api/plugins/{id}/assets/{digest}/{instanceId}/{path}` 使用同一
+执行端口和响应容量，不新增存储或业务写入口；匿名 CORS 仅用于该资源响应，无凭据。
+
 `PluginRouteCallResult.bodyBase64` 的响应上限增至解码后 16 MiB，请求仍为 2 MiB。
 公开返回形状与方法不变；扩展宿主以 `route.payload` 协商大响应传输，保持 4 MiB RPC
 单帧上限。短期载荷绑定实例代次、字节数和 SHA-256，按 64 KiB 块读取，成功、失败、

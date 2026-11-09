@@ -702,6 +702,7 @@ mod tests {
             Some(magi_app_server_protocol::generated::PluginRuntimeStatus {
                 state: magi_app_server_protocol::generated::PluginRuntimeState::Running,
                 generation: 2,
+                instance_id: None,
                 reason: None,
                 crashes: 0,
                 blocking: vec![],

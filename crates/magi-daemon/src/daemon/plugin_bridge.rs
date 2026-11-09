@@ -364,6 +364,19 @@ impl magi_api::PluginRouteExecutor for NodeRouteExecutor {
             let instance = bus
                 .instance(&plugin_id)
                 .ok_or_else(|| ApiError::Conflict("扩展宿主未运行".into()))?;
+            if request
+                .expected_digest
+                .as_ref()
+                .is_some_and(|expected| expected != &digest)
+                || request
+                    .expected_instance_id
+                    .as_ref()
+                    .is_some_and(|expected| expected != &instance.instance_id)
+            {
+                return Err(ApiError::Conflict(
+                    "插件路由所属页面版本或实例已失效；未执行业务".into(),
+                ));
+            }
             if instance.digest != digest {
                 return Err(ApiError::Conflict("扩展宿主不是当前授权的版本".into()));
             }

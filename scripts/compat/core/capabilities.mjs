@@ -54,7 +54,7 @@ export const CAPABILITIES = {
   // —— 界面 ——
   'ui.view': { group: 'ui', magi: '清单 views + 视图桥（受限操作）' },
   'ui.route': { group: 'ui', magi: 'api.route + 视图桥 route.call（只服务本插件自己的视图）', rpc: 'register.route', invariants: ['路径只在本插件内有效', '请求经 daemon 转交，宿主不开放监听端口'] },
-  'ui.native': { group: 'ui', magi: '上游自带的浏览器端界面原样挂载在设置视图里（页面壳提供其依赖的宿主服务）' },
+  'ui.native': { group: 'ui', magi: '上游浏览器界面原样挂载于已接入的设置、主页面及右栏视图；其余槽位单列未完成项' },
 };
 
 export const CAPABILITY_IDS = Object.keys(CAPABILITIES);

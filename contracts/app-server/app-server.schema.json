@@ -2893,6 +2893,11 @@
           "items": {
             "type": "string"
           }
+        },
+        "instanceId": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "daemon 签发的当前扩展实例公开身份；重启或重新启用必定变化，不是授权凭据，也不从局部 generation 推导。"
         }
       }
     },
@@ -3145,6 +3150,16 @@
           "type": "string",
           "maxLength": 2796204,
           "description": "原始 HTTP 正文的标准 base64；与非空 body 互斥，解码后最多 2 MiB。"
+        },
+        "expectedDigest": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "视图调用绑定的安装摘要；失效时在执行业务前拒绝。"
+        },
+        "expectedInstanceId": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "视图调用绑定的扩展实例公开身份；不授予权限，失效时拒绝。"
         }
       }
     },

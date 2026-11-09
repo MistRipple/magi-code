@@ -75,7 +75,7 @@ export const DSH_RULES = [
   rule('calls', /^ctx\.(webServer|server)\.(registerFallback|tapIndex|applyIndexTaps|renderIndex|collectIndexInjections|readResource)$/, { capability: 'ui.view', fidelity: 'none', group: 'ui', note: 'SPA 回退与 index 注入属于 DSH Web 外壳；Magi 的视图是独立页面，没有对应物', source: src('packages/host/webserver/README.md') }),
   rule('calls', /^ctx\.(webServer|server)(\.|$)/, { capability: 'ui.route', fidelity: 'partial', group: 'ui', note: 'webServer 的其余成员（地址、端口、协议）在 Magi 里没有意义：宿主不开放监听端口', source: src('packages/host/webserver/README.md') }),
   rule('calls', /^ctx\.(router|http)(\.|$)/, { capability: 'ui.view', fidelity: 'none', group: 'ui', note: '任意 HTTP 暴露不提供', source: src('packages/host/webserver/README.md') }),
-  rule('calls', /^ctx\.(slots|locale|configForms)(\.|$)/, { capability: 'ui.native', fidelity: 'partial', group: 'ui', note: '上游自带界面原样挂载：注册在“插件配置”位置（settings.section，或较早的 plugins.bundle.config）的卡片在 Magi 设置页整页渲染；注册在 DSH 外壳其他位置（输入框、会话底栏、侧栏面板、全局提示）的槽位 Magi 没有对应位置，不渲染，构建报告逐项列出', source: SETTINGS }),
+  rule('calls', /^ctx\.(slots|locale|configForms)(\.|$)/, { capability: 'ui.native', fidelity: 'partial', group: 'ui', note: '设置、主页面及右栏由原包界面展示；输入和聊天等其余槽位仍待接入，构建报告按公共槽位合同逐项列出，不能据存在一个可挂载页面推导其他业务可用', source: SETTINGS }),
   rule('calls', /^ctx\.(\w+)/, { fixed: 'unknown', note: '文档未登记的 ctx 成员' }),
 
   // —— 服务名（inject）——
@@ -93,7 +93,7 @@ export const DSH_RULES = [
   rule('injects', /^systemPrompt$/, { fixed: 'shim', group: 'prompt', target: 'daemon 每轮提示贡献', note: '提供本插件的 section、variable 与 getSectionOrder；其他方法与字段逐项校验，不声称拥有 Magi 系统提示', source: src('packages/core/system-prompt/README.md') }),
   rule('injects', /^(webServer|server)$/, { capability: 'ui.route', fidelity: 'full', note: '路由注册由 Magi 的 api.route 承载；见 ctx.webServer.register', source: src('packages/host/webserver/README.md') }),
   rule('injects', /^(sessionProjections|attachments|agents|sessions|sessionPersistence|subagents|messages|memory|goals|compaction|approval|sandbox)$/, { capability: 'service.snapshot', fidelity: 'none', group: 'session', note: 'Magi 内核独有', source: COOKBOOK }),
-  rule('injects', /^(slots|locale|configForms)$/, { capability: 'ui.native', fidelity: 'partial', group: 'ui', note: '见 ctx.slots：设置位置原生挂载，DSH 外壳其他位置不渲染', source: SETTINGS }),
+  rule('injects', /^(slots|locale|configForms)$/, { capability: 'ui.native', fidelity: 'partial', group: 'ui', note: '见 ctx.slots：设置、主页面及右栏原生挂载，其余槽位按实际接入状态披露', source: SETTINGS }),
   rule('injects', /^(tokenMeter)$/, { capability: 'hook.usage.update', fidelity: 'partial', note: '只能观察已提交用量；DSH 的 tokenMeter 还提供预算/计量服务', source: src('packages/llm/token-meter/README.md', '仅在文件树中确认存在，未读正文') }),
   rule('injects', /.*/, { fixed: 'unknown', note: '文档未登记的服务' }),
 

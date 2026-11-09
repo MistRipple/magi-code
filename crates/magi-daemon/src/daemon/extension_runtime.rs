@@ -130,6 +130,7 @@ fn runtime_status(
         generation,
         crashes,
         blocking,
+        instance_id: None,
     }
 }
 
@@ -526,10 +527,14 @@ impl ExtensionRuntime {
                     SupervisorState::Failed(_) => crashes_seen += 1,
                     _ => {}
                 }
-                runtime.set_status(
-                    &plugin_id,
-                    Some(runtime_status(&state, &guards, crashes_seen)),
-                );
+                let mut status = runtime_status(&state, &guards, crashes_seen);
+                if matches!(state, SupervisorState::Running { .. }) {
+                    status.instance_id = runtime
+                        .bus
+                        .instance(&plugin_id)
+                        .map(|instance| instance.instance_id.clone());
+                }
+                runtime.set_status(&plugin_id, Some(status));
                 if matches!(state, SupervisorState::Stopped | SupervisorState::Failed(_))
                     || changes.changed().await.is_err()
                 {
@@ -991,6 +996,8 @@ export default async function activate(api) {
             headers: Some(json!({"x-panel-key": "panel-key"})),
             body: None,
             body_base64: None,
+            expected_digest: None,
+            expected_instance_id: None,
         };
         // 有视图的插件：请求经 daemon 到达宿主里的处理器。
         let ok = executor
@@ -1001,6 +1008,30 @@ export default async function activate(api) {
         let body = ok.body.unwrap();
         assert_eq!(body["echoed"], "a=1");
         assert_eq!(body["headers"]["x-panel-key"], "panel-key");
+        let instance = fixture.bus.instance("acme.guard").unwrap();
+        let mut bound = request("/status", "bound=1");
+        bound.expected_digest = Some(instance.digest.clone());
+        bound.expected_instance_id = Some(instance.instance_id.clone());
+        assert_eq!(
+            executor
+                .call("acme.guard".into(), bound.clone())
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        for stale in ["digest", "instance"] {
+            let mut invalid = bound.clone();
+            if stale == "digest" {
+                invalid.expected_digest = Some("stale-digest".into());
+            } else {
+                invalid.expected_instance_id = Some("stale-instance".into());
+            }
+            assert!(matches!(
+                executor.call("acme.guard".into(), invalid).await,
+                Err(magi_api::ApiError::Conflict(_))
+            ));
+        }
         // 没有视图的插件不开放后端路由，即使宿主里绑定了处理器。
         let refused = executor
             .call("acme.bare".into(), request("/status", ""))
@@ -1681,6 +1712,17 @@ export default async function activate(api) {
         }
         let running = running.expect("扩展应进入运行状态");
         assert!(running.blocking.is_empty());
+        assert_eq!(
+            running.instance_id.as_deref(),
+            Some(
+                fixture
+                    .bus
+                    .instance("acme.guard")
+                    .unwrap()
+                    .instance_id
+                    .as_str()
+            )
+        );
         let mut saw_event = false;
         while let Ok(event) = feed.try_recv() {
             saw_event |= event.event_type == "plugin.extension.status.changed";
@@ -1695,6 +1737,34 @@ export default async function activate(api) {
             .unwrap();
         fixture.runtime.reconcile().await;
         assert!(fixture.runtime.status("acme.guard").is_none());
+        fixture
+            .manager
+            .lock()
+            .unwrap()
+            .activate("acme.guard")
+            .unwrap();
+        fixture.runtime.reconcile().await;
+        let next = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(status) = fixture.runtime.status("acme.guard")
+                    && status.state == PluginRuntimeState::Running
+                    && status.instance_id.is_some()
+                {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            next.generation, running.generation,
+            "监管局部代次会重复，不能作为文档身份"
+        );
+        assert_ne!(
+            next.instance_id, running.instance_id,
+            "同版重新启用必须签发新实例身份"
+        );
     }
 
     #[tokio::test]
