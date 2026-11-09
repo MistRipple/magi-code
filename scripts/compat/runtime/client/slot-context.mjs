@@ -1,43 +1,37 @@
-// DSH 浏览器端上下文（ctx）的最小实现：只含上游界面入口 `apply(ctx)` 用到的成员。
-// 不依赖 DOM：浏览器里的页面壳和构建期的记录器共用这一份，所以“构建期记录到的槽位”就是“运行期收到的槽位”。
-//
-// 范围（其余成员不存在，调用即 TypeError，而不是静默吞掉）：
-//   ctx.slots.inject / ctx.slots.register   收集槽位注册
-//   ctx.locale.register / ctx.locale.bind   上游自带语言包
-//   ctx.effect                              登记清理
-//   ctx.get('configForms')                  设置读写入口（背后由调用方提供 scope）
-//   ctx.get(其他)                           undefined —— 上游约定“服务缺席即降级”
+// 原包注册、优先级、子槽位声明与卸载只由上游纯 SlotCore 维护。
+// Magi 只声明宿主边界并管理文档 effect；页面位置及业务事实不归注册表。
+import { SlotCore } from '@deepseek-ai/dsh-client-ui-slots';
 
-/** 每个 DSH 槽位在 Magi 里的去向。未登记的槽位一律视为“未挂载”并进入兼容报告。 */
-export const SLOT_POLICY = {
-  // 设置面板里的一节（DSH 上游 5.19 起的配置入口，列表槽位，id 由插件自己拥有）：Magi 的设置视图整页渲染它。
-  'settings.section': 'mounted',
-  // 该节的导航图标：Magi 的导航图标取自包清单声明的 icon，不渲染这份注册。
-  'settings.section.icon': 'alternate',
-  // 插件配置卡片（较早的配置入口）：Magi 的设置视图整页渲染它。
-  'plugins.bundle.config': 'mounted',
-  // 同一张卡片在 DSH 另一种行布局里的注册；Magi 只有一种页面，取 bundle.config 那份。
-  'plugins.row.config': 'alternate',
-  // DSH 的完整页面与右栏页签都可以由 Magi 的视图容器承载。它们仍在
-  // 上游 iframe 中原样运行，只把入口位置映射到 Magi 的 main/rightPane。
-  'main': 'mounted',
-  'sidebar.right.pane.tab': 'mounted',
-  'settings.plugins.tab': 'mounted',
-  'plugins.tab': 'mounted',
-  'sidebar.panellist': 'alternate',
-  'sidebar.right.pane.tab.title': 'alternate',
-  'sidebar.right.tab.guide.entry': 'alternate',
-  'sidebar.footer.action': 'alternate',
+// kind/scope 核对 DSH 0.2.2-rc.1 各 UI 包的公开 SlotMap；位置处置由 Magi
+// 拥有，两者集中在同一合同里。声明不等于挂载，未接入位置仍阻止空白交付。
+// mounted 条目的顺序也是多个页面入口的取用顺序，优先新设置入口。
+const SLOT_CONTRACTS = {
+  'settings.section': { kind: 'list', scope: 'root', disposition: 'mounted', surface: 'settings' },
+  'settings.section.icon': { kind: 'list', scope: 'root', disposition: 'alternate' },
+  'plugins.bundle.config': { kind: 'keyed', scope: 'root', disposition: 'mounted' },
+  'plugins.row.config': { kind: 'keyed', scope: 'root', disposition: 'alternate' },
+  'settings.plugins.tab': { kind: 'list', scope: 'root', disposition: 'mounted' },
+  'plugins.tab': { kind: 'list', scope: 'root', disposition: 'mounted' },
+  'main': { kind: 'keyed', scope: 'root', disposition: 'mounted' },
+  'sidebar.right.pane.tab': { kind: 'keyed', scope: 'session', disposition: 'mounted' },
+  'sidebar.panellist': { kind: 'list', scope: 'root', disposition: 'alternate' },
+  'sidebar.right.pane.tab.title': { kind: 'keyed', scope: 'session', disposition: 'alternate' },
+  'sidebar.right.tab.guide.entry': { kind: 'keyed', scope: 'session', disposition: 'alternate' },
+  'sidebar.footer.action': { kind: 'list', scope: 'root', disposition: 'alternate' },
+  'conversation.input.left': { kind: 'list', scope: 'session', disposition: 'unmounted' },
+  'conversation.input.right': { kind: 'list', scope: 'session', disposition: 'unmounted' },
+  'conversation.chat.node': { kind: 'keyed', scope: 'session', disposition: 'unmounted' },
+  'conversation.session.header.actions': { kind: 'list', scope: 'session', disposition: 'unmounted' },
+  'conversation.chat.turnTail': { kind: 'list', scope: 'session', disposition: 'unmounted' },
+  'conversation.input.dock': { kind: 'list', scope: 'session', disposition: 'unmounted' },
 };
 
 export function slotDisposition(name) {
-  return SLOT_POLICY[name] ?? 'unmounted';
+  return SLOT_CONTRACTS[name]?.disposition ?? 'unmounted';
 }
-
-/** 多个可渲染槽位同时存在时的取用顺序：新入口优先。 */
-export const MOUNT_PRIORITY = ['settings.section', 'plugins.bundle.config', 'settings.plugins.tab', 'plugins.tab', 'main', 'sidebar.right.pane.tab'];
-/** 各槽位给上游组件的 surface：`settings.section` 的外壳（标题、关闭）由宿主拥有，组件只渲染内容。 */
-export const SLOT_SURFACE = { 'settings.section': 'settings' };
+export const MOUNT_PRIORITY = Object.keys(SLOT_CONTRACTS).filter(name => slotDisposition(name) === 'mounted');
+export const SLOT_SURFACE = Object.fromEntries(Object.entries(SLOT_CONTRACTS).filter(([, spec]) => spec.surface).map(([name, spec]) => [name, spec.surface]));
+const HOST_SLOTS = Object.fromEntries(Object.entries(SLOT_CONTRACTS).map(([name, { kind, scope }]) => [name, { kind, scope }]));
 
 /**
  * @param {{ scope: object, onChange?: () => void }} options
@@ -45,10 +39,57 @@ export const SLOT_SURFACE = { 'settings.section': 'settings' };
  *   onChange 槽位注册或释放后的回调
  */
 export function createSlotContext({ scope, connection, composer, onChange = () => {}, onOpenTab }) {
-  const registered = [];
+  const core = new SlotCore();
+  const names = new Set();
+  const releaseRoot = core.register({ name: 'root', children: HOST_SLOTS }, () => null);
   const tabTypes = new Map();
   const catalogs = new Map();
-  const effects = [];
+  const effects = new Set();
+  let disposed = false;
+  let owner;
+  const effect = (factory) => {
+    if (disposed) throw new Error('插件页面已失效');
+    const cleanups = [];
+    const release = () => {
+      if (!effects.delete(release)) return;
+      const errors = [];
+      for (const cleanup of cleanups.splice(0).reverse()) try { cleanup(); } catch (error) { errors.push(error); }
+      if (errors.length) throw new AggregateError(errors, '插件页面清理失败');
+    };
+    effects.add(release);
+    owner?.push(release);
+    const parent = owner; owner = cleanups;
+    try {
+      const result = factory();
+      if (typeof result === 'function') cleanups.push(result);
+      else if (result != null) {
+        if (typeof result[Symbol.iterator] !== 'function') throw new Error('页面 effect 必须返回同步清理函数或其迭代器');
+        for (const cleanup of result) {
+          if (typeof cleanup !== 'function') throw new Error('页面 effect 迭代器必须产出清理函数');
+          cleanups.push(cleanup);
+        }
+      }
+    } catch (error) { try { release(); } catch (cleanupError) { throw new AggregateError([error, cleanupError], '插件页面 effect 初始化失败'); } throw error; } finally { owner = parent; }
+    return release;
+  };
+  const register = (descriptor, component) => effect(() => {
+    // names 只是枚举索引；存活身份及所有条目始终向同一个 core 查询。
+    return core.register(descriptor, component);
+  });
+  const inject = (name, factory) => effect(() => {
+    let active, epoch;
+    const reconcile = () => {
+      const next = core.declarationEpoch(name);
+      if (epoch === next) return;
+      epoch = next;
+      const previous = active; active = undefined; previous?.();
+      if (core.specDynamic(name)) active = effect(factory);
+    };
+    const off = core.subscribeDeclaration(name, reconcile);
+    try { reconcile(); } catch (error) { off(); active?.(); throw error; }
+    return () => { off(); active?.(); };
+  });
+  const offMutation = core.onMutate(name => { names.add(name); if (!disposed) onChange(); });
   const localeListeners = new Set();
   let locale = 'zh-CN';
 
@@ -64,13 +105,13 @@ export function createSlotContext({ scope, connection, composer, onChange = () =
     configForms,
     connection,
     slots: {
-      inject(_name, factory) { return factory(); },
-      register(descriptor, component) {
-        const entry = { descriptor, component, disposed: false };
-        registered.push(entry);
-        onChange();
-        return () => { entry.disposed = true; onChange(); };
-      },
+      register, inject,
+      entries: (name) => core.entries(name),
+      entriesOfSlot: (name) => core.entriesOfSlot(name),
+      subscribe: (name, listener) => effect(() => core.subscribe(name, listener)),
+      getVersion: (name) => core.getVersion(name),
+      spec: (name) => core.specDynamic(name),
+      isLive: (entry) => core.isLive(entry),
     },
     locale: {
       getSnapshot: () => locale,
@@ -87,9 +128,9 @@ export function createSlotContext({ scope, connection, composer, onChange = () =
         };
       },
     },
-    effect(fn) { effects.push(fn()); },
+    effect,
     // 浏览器端上游常把 slots 作为 layout/configForms 等服务的子服务注入。
-    // 这些服务不是第二套状态源：这里只暴露同一份槽位收集器与设置快照，
+    // 这些服务不是第二套状态源：这里只暴露同一份槽位注册表与设置快照，
     // 其他 DSH 外壳服务保持缺席，让插件按其原有可选分支降级。
     inject(names, callback) {
       const requested = Array.isArray(names) ? names : [names];
@@ -134,7 +175,19 @@ export function createSlotContext({ scope, connection, composer, onChange = () =
     setLocale(next) { if (next !== locale) { locale = next; for (const listener of [...localeListeners]) listener(); } },
     tabTypes: () => [...tabTypes.values()],
     /** 当前仍然有效的注册。 */
-    live() { return registered.filter((entry) => !entry.disposed); },
-    dispose() { for (const cleanup of effects.splice(0).reverse()) if (typeof cleanup === 'function') cleanup(); tabTypes.clear(); localeListeners.clear(); registered.length = 0; },
+    live() {
+      return [...names].flatMap(name => core.entriesOfSlot(name).map(entry => ({
+        descriptor: { name, ...entry.options, ...Object.fromEntries(['inject', 'children', 'store', 'locale', 'registrant'].filter(key => entry[key] !== undefined).map(key => [key, entry[key]])) },
+        component: entry.component,
+      })));
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      const errors = [];
+      for (const cleanup of [...effects].reverse()) try { cleanup(); } catch (error) { errors.push(error); }
+      offMutation(); releaseRoot(); tabTypes.clear(); localeListeners.clear(); catalogs.clear();
+      if (errors.length) throw new AggregateError(errors, '插件页面清理失败');
+    },
   };
 }

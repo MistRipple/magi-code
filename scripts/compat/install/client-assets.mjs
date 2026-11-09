@@ -3,7 +3,7 @@
 // 界面不翻译：上游的 React 界面原样交付，页面运行时（随 Magi 预构建的 dist/dsh-client-host.js）只负责
 // 提供它依赖的宿主服务。本文件：
 //   1. 找到上游 ./client 文件，确认它是 DSH 的懒加载 CJS 工厂格式（不是就明确失败，不猜）；
-//   2. 在受限子进程里运行一次 apply，记录注册了哪些槽位，按 SLOT_POLICY 分成“Magi 会渲染”与“不渲染”；
+//   2. 在受限子进程里运行一次 apply，记录注册了哪些槽位，按共享位置合同分类；
 //   3. 上游界面声明了、却没有任何 Magi 会渲染的槽位时失败：交付空白页比没有界面更糟。
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';

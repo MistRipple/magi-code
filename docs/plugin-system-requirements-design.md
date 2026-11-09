@@ -590,6 +590,10 @@
 
 公共脚本容量改造后，使用同一来源快照、真实完整性身份与未修改的 GenUI 0.3.3 原包重新准备，6,327,444 字节运行资源的 SHA-256 为 `c73508cf211535572e26edb7ab98ef6286adacd676880e5d76855a24b2fd3f6a`，复制前后字节一致；随后在聊天／输入槽位准入明确拒绝。证据 `target/plugin-acceptance/resource-genui-preparation/source-verified.json`；没有通过补一个空白设置页或伪造挂载结果让安装继续。
 
+槽位产品接入继续使用同一 GenUI 0.3.3 主流程：删除页面宿主的自建条目数组，复用固定版本 `@deepseek-ai/dsh-client-ui-slots` 纯核心维护真实条目身份、优先级、重复注册检查、子声明及订阅；Magi 只维护边界位置合同和文档 effect。effect 返回可重复调用的清理函数，子声明消失及初始化失败回收对应贡献，文档释放在单个清理报错后仍继续释放其他资源。安装记录器在输出前实际执行相同清理。位置种类与挂载处置合为一份合同，没有放开尚未展示的聊天／输入位置。
+
+本次 macOS arm64 目录包及解包自检通过，证据 `target/plugin-acceptance/slot-core-build.log`；翻译回归 **135/135**，`slot-core-compat.log`；公共运行时独立批次 **167/167**，`slot-core-runtime/`，未启用额外原包资源与外部 CLI 分项，不与此前 170 项拼接。REA 在线原包专项 **16/16**，`slot-core-rea/`，覆盖 SVG、Ghidra 外链、真实 MCP 目录、原生设置保存与重载、390px、停用与重新启用，Renderer／iframe 异常 0。随包 Node 26.13.0 再次在线取得并核验 GenUI 0.3.3 原包 integrity，客户端 SHA-256 为 `8f0500adc436be2113dfcfc73d27b61cd585be52ddec21f603ee2b5cd6d605c5`，未修改；原入口注册、订阅和清理完成，证据 `slot-core-genui/evidence.json`。其聊天／输入实际挂载、真实消息投影及提交回传仍未交付，安装继续拒绝，不计入核心业务通过。下一轮沿此主流程接入，不能将本次公共前置能力认作 GenUI 完成。
+
 容量验收的首次失败保留于 `resource-runtime/`：真实资源已返回 200，但夹具把原业务调用与已插入必要回执等待的正式产物直接比较。后续断言核对交付字节与正式安装产物、未改写的依赖原文和必需的业务转换记录；完整页面动作、在线安装和重启仍全部执行，最终只以 `resource-runtime-final/` 独立批次为准。
 
 右栏修复前的原始社区运行保留于 `composer-text-community/`：安装、启动和原页面均为 9/9，但 Ops／Market 清理时共捕获两次 `activeTab` 已为空仍读取 `payload` 的页面异常。该批未启用 Upgrader 完整业务分支，`coreVerified=1/9`，不能与本轮开启该分支的结果拼接。修复沿公共右栏页签身份完成，原包代码和失败门槛不变；最新独立完整批次仅以上表 `panel-lifecycle-community/` 为准。

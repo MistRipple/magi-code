@@ -75,5 +75,8 @@ const slots = slotContext.live().map(({ descriptor }) => {
   const navigation = slotContext.live().find((item) => item.descriptor.name === 'sidebar.panellist' && item.descriptor.id === key);
   return { name, key, label: labelOf(descriptor.label ?? tab?.title ?? navigation?.descriptor.label), count: 1, disposition: slotDisposition(name) };
 });
+// 与真实文档关闭采用同一清理合同；清理失败也属于原入口未完成，不能交付
+// 一份只记录了注册、却从未验证释放函数可调用的成功报告。
+slotContext.dispose();
 writeFileSync(resultPath, JSON.stringify(slots));
 process.exit(0);

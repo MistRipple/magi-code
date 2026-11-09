@@ -2,7 +2,7 @@
 //
 // 做什么：
 //   - 提供上游界面需要的 `__ModuleLoader__`（react / react-dom / jsx-runtime 由本页提供，与上游同一份）；
-//   - 提供 `ctx.slots` / `ctx.locale` / `ctx.effect` / `ctx.get`，把上游注册的槽位收集起来；
+//   - 提供 `ctx.slots` / `ctx.locale` / `ctx.effect` / `ctx.get`，由上游 SlotCore 管理注册与释放；
 //   - 在 Magi 的 settings 视图里渲染上游注册在“插件配置”位置的卡片（`settings.section` 或较早的 `plugins.bundle.config`），整页形态；
 //   - `fetch('/plugins/<id>/…')` 改走视图桥的 route.call，调用的仍是宿主里的同一处理器；
 //   - `settingsScope` 由 Magi 设置（settings.read / settings.write）支撑；

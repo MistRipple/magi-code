@@ -597,7 +597,7 @@ test('界面槽位：ctx 的实现只含上游入口用到的成员；未知服�
   assert.equal(slots.ctx.get('layout'), undefined, 'DSH 外壳服务缺席');
   assert.equal(slots.ctx.get('configForms').get('x'), scope);
   assert.throws(() => slots.ctx.uiRenderer.mount(), TypeError, '未提供的成员是 TypeError，不静默吞掉');
-  const dispose = slots.ctx.slots.inject('plugins.bundle.config', () => slots.ctx.slots.register({ name: 'plugins.bundle.config' }, () => null));
+  const dispose = slots.ctx.slots.inject('plugins.bundle.config', () => slots.ctx.slots.register({ name: 'plugins.bundle.config', key: 'contract' }, () => null));
   assert.equal(slots.live().length, 1);
   dispose();
   assert.equal(slots.live().length, 0);
@@ -612,6 +612,71 @@ test('界面槽位：ctx 的实现只含上游入口用到的成员；未知服�
   slots.setLocale('en-US');
   assert.equal(t('hi', { name: 'A' }), 'Hi A');
   assert.equal(t('missing'), 'missing');
+});
+
+test('槽位使用上游条目身份与优先级，释放后恢复同一单元的原注册', async () => {
+  const { createSlotContext } = await import('./runtime/client/slot-context.mjs');
+  const context = createSlotContext({ scope: {} });
+  const slots = context.ctx.slots;
+  const original = () => null, replacement = () => null;
+  const releaseOriginal = slots.register({ name: 'conversation.chat.node', key: 'assistant-step' }, original);
+  const entry = slots.entries('conversation.chat.node')[0];
+  const changes = [];
+  const off = slots.subscribe('conversation.chat.node', () => changes.push(slots.entriesOfSlot('conversation.chat.node')[0]));
+  await Promise.resolve(); changes.length = 0;
+  assert.throws(() => slots.register({ name: 'conversation.chat.node', key: 'assistant-step' }, replacement), /already has an entry/);
+  const releaseReplacement = slots.register({ name: 'conversation.chat.node', key: 'assistant-step', priority: -1 }, replacement);
+  const shadow = slots.entries('conversation.chat.node').find(item => item.component === replacement);
+  assert.equal(slots.isLive(entry), true);
+  assert.equal(context.live()[0].component, replacement);
+  await Promise.resolve(); assert.deepEqual(changes, [shadow]);
+  releaseReplacement(); releaseReplacement();
+  await Promise.resolve(); assert.deepEqual(changes, [shadow, entry]);
+  assert.equal(slots.isLive(shadow), false);
+  assert.equal(slots.entries('conversation.chat.node')[0], entry);
+  assert.equal(context.live()[0].component, original);
+  assert.throws(() => slots.register({ name: 'settings.section.icon', key: 'invalid' }, original), /requires options.id/);
+  off(); releaseOriginal(); context.dispose();
+  assert.deepEqual(slots.entries('conversation.chat.node'), []);
+  assert.throws(() => slots.register({ name: 'conversation.chat.node', key: 'assistant-step' }, original), /已失效/);
+});
+
+test('子槽位依声明生命周期注入，旧清理不删除新注册，失败初始化完整回收', async () => {
+  const { createSlotContext } = await import('./runtime/client/slot-context.mjs');
+  const context = createSlotContext({ scope: {} });
+  const { slots } = context.ctx;
+  let setups = 0, cleanups = 0;
+  const off = slots.inject('feature.body', function* () {
+    setups++;
+    yield slots.register({ name: 'feature.body', id: 'body' }, () => null);
+    yield () => cleanups++;
+  });
+  assert.equal(setups, 0);
+  const declare = () => slots.register({ name: 'main', key: 'feature', children: { 'feature.body': { kind: 'list', scope: 'root' } } }, () => null);
+  const first = declare();
+  const old = slots.entries('feature.body')[0];
+  assert.equal(setups, 1); assert.equal(slots.isLive(old), true);
+  first(); assert.equal(cleanups, 1); assert.equal(slots.spec('feature.body'), undefined);
+  const second = declare();
+  const current = slots.entries('feature.body')[0];
+  first(); assert.equal(slots.entries('feature.body')[0], current);
+  assert.equal(setups, 2); assert.equal(slots.isLive(old), false);
+  off(); off(); assert.equal(cleanups, 2); assert.deepEqual(slots.entries('feature.body'), []);
+  second();
+  assert.throws(() => slots.inject('settings.section', () => {
+    slots.register({ name: 'settings.section', id: 'failed' }, () => null);
+    throw new Error('setup failed');
+  }), /setup failed/);
+  assert.deepEqual(slots.entries('settings.section'), [], '初始化失败不会留下半份注册');
+  const cleaned = [];
+  const release = context.ctx.effect(() => () => cleaned.push('explicit'));
+  release(); release();
+  context.ctx.effect(() => () => cleaned.push('remaining'));
+  context.ctx.effect(() => () => { cleaned.push('throwing'); throw new Error('cleanup failed'); });
+  assert.throws(() => context.dispose(), AggregateError);
+  assert.deepEqual(cleaned, ['explicit', 'throwing', 'remaining']);
+  assert.deepEqual(context.live(), []);
+  context.dispose();
 });
 
 test('原生页面保留异步和条件注册的多个右栏页签，页面身份与显示名称不混淆', async (t) => {
