@@ -594,6 +594,8 @@
 
 本次 macOS arm64 目录包及解包自检通过，证据 `target/plugin-acceptance/slot-core-build.log`；翻译回归 **135/135**，`slot-core-compat.log`；公共运行时独立批次 **167/167**，`slot-core-runtime/`，未启用额外原包资源与外部 CLI 分项，不与此前 170 项拼接。REA 在线原包专项 **16/16**，`slot-core-rea/`，覆盖 SVG、Ghidra 外链、真实 MCP 目录、原生设置保存与重载、390px、停用与重新启用，Renderer／iframe 异常 0。随包 Node 26.13.0 再次在线取得并核验 GenUI 0.3.3 原包 integrity，客户端 SHA-256 为 `8f0500adc436be2113dfcfc73d27b61cd585be52ddec21f603ee2b5cd6d605c5`，未修改；原入口注册、订阅和清理完成，证据 `slot-core-genui/evidence.json`。其聊天／输入实际挂载、真实消息投影及提交回传仍未交付，安装继续拒绝，不计入核心业务通过。下一轮沿此主流程接入，不能将本次公共前置能力认作 GenUI 完成。
 
+随后复核延迟子声明失败边界：通知发生在上游核心返回父条目 disposer 之前，失败不能同步抛穿已提交注册。页面宿主沿上游服务合同停止该注入，并在微任务报告原错误，父条目正常取得释放句柄；新增真实子进程回归核对原错误及零遗留条目。最终翻译回归 **136/136**（`slot-core-compat-final.log`），重新构建与解包自检（`slot-core-build-final.log`）、独立目录包公共运行时 **167/167**（`slot-core-runtime-final/`）、REA **16/16**（`slot-core-rea-final/`）均通过；最终随包 Node 在线核验同一 GenUI 原包的注册、清理和安装拒绝证据为 `slot-core-genui-final/evidence.json`。这批结果取代本段前一次构建结果，不拼接数量，GenUI 业务仍未完成。
+
 容量验收的首次失败保留于 `resource-runtime/`：真实资源已返回 200，但夹具把原业务调用与已插入必要回执等待的正式产物直接比较。后续断言核对交付字节与正式安装产物、未改写的依赖原文和必需的业务转换记录；完整页面动作、在线安装和重启仍全部执行，最终只以 `resource-runtime-final/` 独立批次为准。
 
 右栏修复前的原始社区运行保留于 `composer-text-community/`：安装、启动和原页面均为 9/9，但 Ops／Market 清理时共捕获两次 `activeTab` 已为空仍读取 `payload` 的页面异常。该批未启用 Upgrader 完整业务分支，`coreVerified=1/9`，不能与本轮开启该分支的结果拼接。修复沿公共右栏页签身份完成，原包代码和失败门槛不变；最新独立完整批次仅以上表 `panel-lifecycle-community/` 为准。

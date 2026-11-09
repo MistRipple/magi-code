@@ -78,16 +78,25 @@ export function createSlotContext({ scope, connection, composer, onChange = () =
   });
   const inject = (name, factory) => effect(() => {
     let active, epoch;
+    let stopped = false;
     const reconcile = () => {
+      if (stopped) return;
       const next = core.declarationEpoch(name);
       if (epoch === next) return;
       epoch = next;
       const previous = active; active = undefined; previous?.();
       if (core.specDynamic(name)) active = effect(factory);
     };
-    const off = core.subscribeDeclaration(name, reconcile);
+    // 声明通知发生在 core.register 返回 disposer 之前。延迟注入失败不能
+    // 从通知里抛穿注册事务，使已提交父条目失去它的释放句柄；沿上游服务
+    // 的合同停止该注入，下一微任务报告原错误，父注册仍可正常释放。
+    const stop = () => { stopped = true; off(); const previous = active; active = undefined; previous?.(); };
+    const off = core.subscribeDeclaration(name, () => {
+      try { reconcile(); }
+      catch (error) { stop(); queueMicrotask(() => { throw error; }); }
+    });
     try { reconcile(); } catch (error) { off(); active?.(); throw error; }
-    return () => { off(); active?.(); };
+    return stop;
   });
   const offMutation = core.onMutate(name => { names.add(name); if (!disposed) onChange(); });
   const localeListeners = new Set();

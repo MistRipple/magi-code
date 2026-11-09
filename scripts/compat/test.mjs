@@ -679,6 +679,30 @@ test('子槽位依声明生命周期注入，旧清理不删除新注册，失�
   context.dispose();
 });
 
+test('延迟子槽位初始化失败保留父注册释放句柄，按上游合同异步报告原错误', () => {
+  const source = `
+    import assert from 'node:assert/strict';
+    import { createSlotContext } from './scripts/compat/runtime/client/slot-context.mjs';
+    const context = createSlotContext({ scope: {} });
+    const slots = context.ctx.slots;
+    const errors = [];
+    process.on('uncaughtException', error => errors.push(error.message));
+    slots.inject('feature.body', () => {
+      slots.register({ name: 'feature.body', id: 'partial' }, () => null);
+      throw new Error('child setup failed');
+    });
+    const release = slots.register({ name: 'main', key: 'feature', children: { 'feature.body': { kind: 'list', scope: 'root' } } }, () => null);
+    assert.equal(typeof release, 'function');
+    assert.deepEqual(slots.entries('feature.body'), []);
+    release();
+    assert.deepEqual(context.live(), []);
+    context.dispose();
+    setImmediate(() => { assert.deepEqual(errors, ['child setup failed']); });
+  `;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', source], { cwd: fileURLToPath(new URL('../..', import.meta.url)), encoding: 'utf8', timeout: 5000 });
+  assert.equal(result.status, 0, result.stderr);
+});
+
 test('原生页面保留异步和条件注册的多个右栏页签，页面身份与显示名称不混淆', async (t) => {
   const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
