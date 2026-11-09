@@ -517,7 +517,7 @@ export async function apply(ctx, config) {
   ctx.webServer.register({path:'/oversize-response',handler(req,res){
     res.writeHead(200,{'content-type':'text/plain'});res.end(Buffer.alloc(16*1024*1024+1,97));
   }});
-  const assetCalls={main:0,leaf:0,slow:'idle',slowCalls:0};
+  const assetCalls={main:0,leaf:0,slow:'idle',slowCalls:0,retry:0,images:[],palette:0,negotiation:[]};
   ctx.webServer.register({path:'/native/main.mjs',handler(req,res){
     assetCalls.main++;
     res.writeHead(200,{'content-type':'text/javascript'});
@@ -529,11 +529,28 @@ export async function apply(ctx, config) {
     assetCalls.leaf++;res.writeHead(200,{'content-type':'text/javascript'});res.end('export const marker="原始模块🙂";');
   }});
   ctx.webServer.register({path:'/native/data.json',resource:req=>Response.json({query:new URL(req.url).search})});
-  ctx.webServer.register({path:'/native/theme.css',resource:()=>new Response(':root{--native-asset-color:rgb(12, 34, 56)}',
+  ctx.webServer.register({path:'/native/theme.css',resource:()=>new Response('@import "./palette.css?from=sheet";:root{--native-asset-color:rgb(12, 34, 56)}',
     {headers:{'content-type':'text/css'}})});
-  ctx.webServer.register({path:'/native/icon.svg',resource:()=>new Response(
+  ctx.webServer.register({path:'/native/palette.css',resource:req=>{
+    assetCalls.palette++;return new Response(':root{--native-import-color:rgb(65, 43, 21)}',{headers:{'content-type':'text/css'}});
+  }});
+  ctx.webServer.register({path:'/native/icon.svg',resource:req=>{assetCalls.images.push(new URL(req.url).search);return new Response(
     '<svg xmlns="http://www.w3.org/2000/svg" width="13" height="11"><rect width="13" height="11" fill="red"/></svg>',
-    {headers:{'content-type':'image/svg+xml'}})});
+    {headers:{'content-type':'image/svg+xml'}});}});
+  ctx.webServer.register({path:'/native/retry.js',resource:()=>{
+    const call=++assetCalls.retry;
+    return new Response(call===1?'resource temporarily unavailable':'window.__nativeRetry=(window.__nativeRetry||0)+1;',
+      {status:call===1?503:200,headers:{'content-type':'text/javascript'}});
+  }});
+  ctx.webServer.register({path:'/native/negotiated.bin',resource:req=>{
+    assetCalls.negotiation.push(Object.fromEntries(req.headers));
+    const bytes=Uint8Array.from({length:32},(_,index)=>index),etag='"original-resource"';
+    if(req.headers.get('if-none-match')===etag)return new Response(null,{status:304,headers:{etag}});
+    const partial=req.headers.get('range')==='bytes=8-15'&&req.headers.get('if-range')===etag;
+    return new Response(partial?bytes.slice(8,16):bytes,{status:partial?206:200,headers:{
+      'content-type':'application/octet-stream',etag,'accept-ranges':'bytes',...(partial?{'content-range':'bytes 8-15/32'}:{}),
+    }});
+  }});
   ctx.webServer.register({path:'/native/count',resource:()=>Response.json(assetCalls)});
   ctx.webServer.register({path:'/native/slow.mjs',handler(req,res){
     assetCalls.slow='running';assetCalls.slowCalls++;
@@ -841,15 +858,20 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
         large.sizes.length===10&&large.sizes.every(size=>size===5*1024*1024),large);
       reporter.check('响应超过 16 MiB 时明确整体拒绝，原实例继续处理图片与后续业务',
         large.overflow.status===502&&/超过.*已丢弃/.test(large.overflow.body.error),large.overflow);
-      const native=await frame.evaluate(`(async()=>{
-        const script=document.createElement('script');script.type='module';script.src='/native/main.mjs';
+      await frame.evaluate(`(async()=>{
+        const script=document.createElement('script');script.id='native-main-module';script.type='module';script.src='/native/main.mjs';
         const loaded=new Promise((resolve,reject)=>{script.onload=resolve;script.onerror=()=>reject(new Error('native module failed'));});
         document.head.appendChild(script);await loaded;
+      })()`);
+      await waitFor(()=>frame.evaluate('Boolean(window.__nativeModule)'),'原生 ESM 顶层 await 实际业务完成');
+      const native=await frame.evaluate(`(async()=>{
+        const script=document.getElementById('native-main-module');
         const link=document.createElement('link');link.rel='stylesheet';link.setAttribute('href','/native/theme.css');
         const styled=new Promise((resolve,reject)=>{link.onload=resolve;link.onerror=()=>reject(new Error('native stylesheet failed'));});
         document.head.appendChild(link);await styled;
         const image=new Image();image.src='/native/icon.svg';document.body.append(image);await image.decode();
-        const result={...window.__nativeModule,src:script.src,color:getComputedStyle(document.documentElement).getPropertyValue('--native-asset-color').trim(),image:{width:image.naturalWidth,height:image.naturalHeight}};
+        const style=getComputedStyle(document.documentElement);
+        const result={...window.__nativeModule,src:script.src,color:style.getPropertyValue('--native-asset-color').trim(),importColor:style.getPropertyValue('--native-import-color').trim(),image:{width:image.naturalWidth,height:image.naturalHeight}};
         script.remove();link.remove();image.remove();return result;
       })()`);
       const assetCount=(await post(`/api/plugins/${id}/routes`,{method:'GET',path:'/native/count'})).body;
@@ -859,7 +881,68 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
         native.marker==='原始模块🙂'&&native.data.query==='?q=1'&&native.src===native.url
           &&assetCount.main===1&&assetCount.leaf===1&&native.url.includes('/assets/'),{native,assetCount});
       reporter.check('原生 link 与 Image 共用插件资源身份，保留 CSS 字节和 SVG 实际解码',
-        native.color==='rgb(12, 34, 56)'&&native.image.width===13&&native.image.height===11,native);
+        native.color==='rgb(12, 34, 56)'&&native.importColor==='rgb(65, 43, 21)'
+          &&assetCount.palette===1&&native.image.width===13&&native.image.height===11,native);
+      const responsive=await frame.evaluate(`(async()=>{
+        const png='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=';
+        const results=[];
+        for(const useAttribute of [false,true]) {
+          const image=new Image(),value=png+' 0.5x, /native/icon.svg?srcset='+useAttribute+' 1x';
+          if(useAttribute)image.setAttribute('SRCSET',value);else image.srcset=value;
+          document.body.append(image);await image.decode();
+          results.push({src:image.currentSrc,width:image.naturalWidth,srcset:image.srcset});image.remove();
+        }
+        const picture=document.createElement('picture'),source=document.createElement('source'),image=new Image();
+        source.type='image/svg+xml';source.srcset='/native/icon.svg?picture=1 13w';source.sizes='13px';
+        image.src=png;picture.append(source,image);document.body.append(picture);await image.decode();
+        results.push({src:image.currentSrc,width:image.naturalWidth,srcset:source.srcset});picture.remove();
+        const ns='http://www.w3.org/2000/svg';
+        for(const namespaced of [false,true]) {
+          const svg=document.createElementNS(ns,'svg'),image=document.createElementNS(ns,'image');
+          svg.setAttribute('width','13');svg.setAttribute('height','11');
+          image.setAttribute('width','13');image.setAttribute('height','11');
+          const loaded=new Promise((resolve,reject)=>{image.onload=()=>resolve();image.onerror=()=>reject(new Error('SVG image load failed'));});
+          const url='/native/icon.svg?svg='+namespaced;
+          if(namespaced)image.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href',url);else image.setAttribute('href',url);
+          svg.append(image);document.body.append(svg);await loaded;
+          results.push({src:image.href.baseVal,width:image.getBBox().width});svg.remove();
+        }
+        const preload=document.createElement('link');preload.imageSrcset='/native/icon.svg?preload=1 1x';
+        const local=document.createElementNS(ns,'use');local.setAttribute('href','#local-symbol');
+        return {images:results,preload:preload.imageSrcset,local:local.getAttribute('href')};
+      })()`);
+      reporter.check('原页面 img／picture 响应式候选保留 data URL 与描述符，浏览器真实选择并解码 SVG',
+        responsive.images.slice(0,3).every(image=>image.width>0&&image.src.startsWith(native.src.replace('main.mjs','icon.svg')))
+          &&responsive.images.slice(0,2).every(image=>image.srcset.startsWith('data:image/png;base64,')),responsive);
+      reporter.check('SVG image 普通及 xlink 命名空间沿同一资源入口实际加载，保留局部图标与预加载候选',
+        responsive.images.slice(3).every(image=>image.width===13&&image.src.includes('/assets/'))
+          &&responsive.preload.includes('/assets/')&&responsive.local==='#local-symbol',responsive);
+      const negotiation=[];
+      for(const headers of [
+        {range:'bytes=8-15','if-range':'"original-resource"',authorization:'Bearer private-host',cookie:'private-host=1','x-host-private':'private'},
+        {'if-none-match':'"original-resource"'},
+      ]) {
+        const response=await fetch(native.src.replace('main.mjs','negotiated.bin'),{headers});
+        negotiation.push({status:response.status,bytes:[...new Uint8Array(await response.arrayBuffer())],etag:response.headers.get('etag'),range:response.headers.get('content-range')});
+      }
+      const negotiated=(await post(`/api/plugins/${id}/routes`,{method:'GET',path:'/native/count'})).body.negotiation;
+      reporter.check('原生资源范围与条件请求只执行一次，保留 206 原字节及 304 空响应，不向原包泄露宿主凭据',
+        negotiation[0].status===206&&negotiation[0].range==='bytes 8-15/32'&&negotiation[0].bytes.join(',')==='8,9,10,11,12,13,14,15'
+          &&negotiation[1].status===304&&negotiation[1].bytes.length===0&&negotiated.length===2
+          &&negotiated.every(headers=>!['authorization','cookie','x-host-private','origin'].some(name=>name in headers)),{negotiation,negotiated});
+      const recovery=await frame.evaluate(`(async()=>{
+        const attempt=()=>new Promise(resolve=>{
+          const script=document.createElement('script');script.src='/native/retry.js';
+          script.onload=()=>{script.remove();resolve('loaded');};script.onerror=()=>{script.remove();resolve('failed');};
+          document.head.append(script);
+        });
+        const first=await attempt(),afterFailure=window.__nativeRetry??0;
+        const second=await attempt();return {first,afterFailure,second,executed:window.__nativeRetry};
+      })()`);
+      const recoveryCalls=(await post(`/api/plugins/${id}/routes`,{method:'GET',path:'/native/count'})).body.retry;
+      reporter.check('原生脚本加载失败保留 error 事件，页面显式重试成功且不自动重放或重复执行脚本',
+        recovery.first==='failed'&&recovery.afterFailure===0&&recovery.second==='loaded'&&recovery.executed===1&&recoveryCalls===2,recovery);
+      await writeFile(join(output,'native-resource-recovery.json'),JSON.stringify({responsive,negotiation,negotiated,recovery,recoveryCalls},null,2));
       const assetAbort=new AbortController();
       const pendingAsset=fetch(native.src.replace('/native/main.mjs','/native/slow.mjs'),{signal:assetAbort.signal}).then(()=> 'unexpected-success',error=>error.name);
       await waitFor(async()=>(await post(`/api/plugins/${id}/routes`,{method:'GET',path:'/native/count'})).body.slow==='running','原生资源 HTTP 请求实际开始');

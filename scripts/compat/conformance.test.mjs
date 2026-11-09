@@ -24,7 +24,7 @@ import { prepareDsh } from './install/prepare.mjs';
 import { backendEntry } from './core/package.mjs';
 import { createViewTransport } from './runtime/client/view-transport.mjs';
 import { createRouteFetch } from './runtime/client/route-fetch.mjs';
-import { createResourceUrls } from './runtime/client/resource-urls.mjs';
+import { createResourceUrls, resolveSrcset } from './runtime/client/resource-urls.mjs';
 import { createRemoteConnection } from './runtime/client/connection.mjs';
 import { getEventListeners } from 'node:events';
 import { runRoute } from './runtime/routes.mjs';
@@ -46,12 +46,26 @@ test('原生资源地址绑定同一实例，保留静态 SDK、查询和模块�
   assert.equal(urls.resolve('extra.css'),gateway+'extra.css');
   assert.equal(urls.resolve('https://other.example/code.js'),'https://other.example/code.js');
   assert.equal(urls.resolve('data:image/svg+xml,test'),'data:image/svg+xml,test');
+  assert.equal(urls.resolve('http://[invalid'),'http://[invalid');
+  assert.equal(urls.resolve('#local-symbol'),'#local-symbol');
   assert.equal(urls.resolve(new URL('./leaf.mjs',gateway+'runtime/main.mjs')),gateway+'runtime/leaf.mjs');
   const calls=[];
   const fetchRoute=createRouteFetch(async input=>{calls.push(input);return {status:200,body:'ok'};},base,urls.restore);
   await fetchRoute(gateway+'runtime/data.json?q=1');
   assert.equal(calls[0].path,'/runtime/data.json');assert.equal(calls[0].query,'q=1');
   assert.throws(()=>createResourceUrls(base,'https://other.example/'),/入口无效/);
+});
+
+test('响应式图片保留 data URL 的逗号、宽度／密度描述符和无效候选，由浏览器选择', () => {
+  const urls=createResourceUrls('https://magi.example/ui/index.html','https://magi.example/assets/version/instance/');
+  const input='  data:image/svg+xml,%3Csvg%3E 0.5x,\n /icon.svg?q=1 1x, /wide.png 640w,\tdata:image/png;base64,a,b,c, /last.webp, ';
+  assert.equal(resolveSrcset(input, value=>urls.resolve(value)),
+    '  data:image/svg+xml,%3Csvg%3E 0.5x,\n https://magi.example/assets/version/instance/icon.svg?q=1 1x, https://magi.example/assets/version/instance/wide.png 640w,\tdata:image/png;base64,a,b,c, https://magi.example/assets/version/instance/last.webp, ');
+  assert.equal(resolveSrcset(' /a.png bad(1,2), /b.png 2x ',value=>urls.resolve(value)),
+    ' https://magi.example/assets/version/instance/a.png bad(1,2), https://magi.example/assets/version/instance/b.png 2x ');
+  for (const value of ['', ', , ', 'data:image/png;base64,a,b 1x', '#local 1x']) {
+    assert.equal(resolveSrcset(value, input=>urls.resolve(input)),value);
+  }
 });
 
 test('页面取消只结束对应路由，迟到回执不污染后续调用，关闭文档释放等待和信号监听', async () => {

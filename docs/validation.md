@@ -299,6 +299,8 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 公共脚本容量由 `cargo test -p magi-plugin-system --test package` 验证浏览器／Node 模块的 16 MiB 上限、其他资源的 4 MiB 上限及展开总量；`test:compat` 复用原封装合同逐字核对超过 5 MiB 的独立模块。`test:electron-plugin-runtime` 的真实后台与页面脚本都超过 5 MiB，通过实际安装、资源字节、Chromium 页面动作及重启核对完整链路。页面业务调用仍只转换必要的回执等待；交付资源须与正式安装产物逐字一致，不能把业务转换当作字节损坏，也不能只检查接口状态码。
 
+原生资源合同由 `cargo test -p magi-api --lib routes::plugins::assets::tests` 核对 GET／HEAD、资源协商头、凭据隔离及进入业务前的容量拒绝。`test:electron-plugin-runtime` 另从实际目录包验证大 ESM 顶层 await 的业务完成、相对模块与 CSS 导入、img／picture 响应式候选、普通／xlink SVG image、206 原字节、304 空响应、脚本 503 的原生 error 事件及页面显式重试、HTTP 取消和实例换代。`MAGI_PLUGIN_RUNTIME_OUTPUT` 指定独立批次证据；可选 `MAGI_PLUGIN_ORIGINAL_RESOURCE` 和 `MAGI_PLUGIN_RESOURCE_ELEMENT` 让同一公共入口逐字交付一份留存的原包运行模块并核对其自定义元素注册，记录 SHA-256。该机制不代表原包已经安装、聊天槽位可用或完整业务通过。
+
 `npm run test:electron-plugin-runtime` 可设置 `MAGI_DSH_EXTERNAL_CLI=<真实 dsh 可执行文件路径>`，让在线安装的 Debugging 原包经真实模型工具调用和原生审批检查另一套独立 DSH 目录：外部 CLI 导出配置、执行 schema 检查及判断变更生效方式，Magi 安装状态保持不变。该可选分支需要本机已有的真实 DSH CLI，不提供替身命令；未设置时不计入对应业务证据。
 
 `npm run test:electron-dsh-profile` 在线安装 Mgr 0.2.12，先通过其真实路由验证 `dsh add/remove` 的在线替换与卸载，再经 Magi 原生预览、取消、确认及重新授权更新到固定 0.2.13；随后使用新版原页面完成目标插件启停、故障恢复、在线更新与真实回执、更新／卸载取消、390px 确认、应用重启和卸载。`MAGI_DSH_PROFILE_OUTPUT` 指定证据目录，端口使用 `MAGI_PROFILE_PORT`／`MAGI_PROFILE_CDP_PORT`。旧版路由通过不代表其 Button 页面缺陷已修复；该入口还通过只影响本次候选解析的 registry 代理，使 Mgr 原页面的先移除式更新失败，核对恢复旧摘要、授权和真实运行，并显示恢复说明；在旧版已移除且候选未提交时终止本次应用的 daemon，核对真实翻译进程退出、重启恢复原安装、不重放准备以及原页面显式重试。只验证列出的中断位置，不作为全部掉电阶段或外部副作用可回滚的证明。`test:compat` 另以延迟目录读取验证命令终止后零安装／移除，以及同请求的显式重试。

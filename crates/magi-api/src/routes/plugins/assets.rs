@@ -3,7 +3,7 @@ use super::*;
 use axum::{
     body::Body,
     extract::RawQuery,
-    http::{Method, header},
+    http::{HeaderMap, Method, header},
 };
 use magi_app_server_protocol::generated::{PluginRouteCallRequest, PluginRouteMethod};
 
@@ -12,6 +12,7 @@ pub(super) async fn resource(
     Path((id, digest, instance, path)): Path<(String, String, String, String)>,
     RawQuery(query): RawQuery,
     method: Method,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     if path.len() > 4096 || query.as_ref().is_some_and(|value| value.len() > 8192) {
         return Err(ApiError::InvalidInput("插件资源地址超过大小上限".into()));
@@ -31,7 +32,7 @@ pub(super) async fn resource(
                 },
                 path: format!("/{path}"),
                 query,
-                headers: None,
+                headers: resource_request_headers(&headers)?,
                 body: None,
                 body_base64: None,
                 expected_digest: Some(digest),
@@ -114,6 +115,40 @@ pub(super) async fn resource(
     Ok(response)
 }
 
+// 原生加载只传递资源协商信息。Cookie、Bearer、Origin、Host 和其他宿主头
+// 不进入插件；页面显式业务头仍由原有 route.call 提交。
+fn resource_request_headers(headers: &HeaderMap) -> Result<Option<Value>, ApiError> {
+    let mut selected = serde_json::Map::new();
+    let mut size = 0;
+    for name in [
+        "accept",
+        "range",
+        "if-range",
+        "if-none-match",
+        "if-modified-since",
+    ] {
+        let values = headers.get_all(name);
+        if values.iter().next().is_none() {
+            continue;
+        }
+        let value = values
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .map_err(|_| ApiError::InvalidInput("插件资源请求头无效".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
+        size += name.len() + value.len();
+        if value.len() > 8192 || size > 16 * 1024 {
+            return Err(ApiError::InvalidInput("插件资源请求头超过大小上限".into()));
+        }
+        selected.insert(name.into(), Value::String(value));
+    }
+    Ok((!selected.is_empty()).then_some(Value::Object(selected)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +199,15 @@ mod tests {
         for method in [Method::GET, Method::HEAD] {
             let response = app.clone().oneshot(axum::http::Request::builder()
                 .method(method.clone()).uri("/plugins/acme.assets/assets/digest/instance/runtime/main.mjs?q=original")
+                .header("range", "bytes=0-31")
+                .header("if-range", "original")
+                .header("if-none-match", "original")
+                .header("if-modified-since", "Mon, 09 Nov 2026 00:00:00 GMT")
+                .header("accept", "text/javascript")
+                .header("cookie", "host-session=private")
+                .header("authorization", "Bearer host-private")
+                .header("origin", "https://host.example")
+                .header("x-host-private", "private")
                 .body(Body::empty()).unwrap()).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(
@@ -199,7 +243,40 @@ mod tests {
             assert_eq!(call.query.as_deref(), Some("q=original"));
             assert_eq!(call.expected_digest.as_deref(), Some("digest"));
             assert_eq!(call.expected_instance_id.as_deref(), Some("instance"));
-            assert!(call.headers.is_none(), "不转发浏览器凭据或宿主请求头");
+            assert_eq!(
+                call.headers,
+                Some(serde_json::json!({
+                    "range": "bytes=0-31", "if-range": "original", "if-none-match": "original",
+                    "if-modified-since": "Mon, 09 Nov 2026 00:00:00 GMT", "accept": "text/javascript",
+                })),
+                "只传递资源协商信息，不转发凭据或宿主请求头"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_resource_headers_are_rejected_before_plugin_business() {
+        let root = tempfile::tempdir().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let state = super::super::tests::bare_state(root.path())
+            .with_plugin_route_executor(Arc::new(Routes(calls.clone())));
+        let app = super::super::routes().with_state(state);
+        for headers in [
+            vec![("range", "x".repeat(8193))],
+            vec![("accept", "x".repeat(8192)), ("if-range", "x".repeat(8192))],
+        ] {
+            let mut request = axum::http::Request::builder()
+                .uri("/plugins/acme.assets/assets/digest/instance/runtime/main.mjs");
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(calls.lock().unwrap().is_empty());
     }
 }

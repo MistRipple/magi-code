@@ -170,6 +170,8 @@ ui/…                       视图页面与静态资源，按需
 
 在途 `route.call` 可发送 `{ channel, instanceId, type: 'cancel', requestId }`，停止对应路由的等待并向后台传播取消。身份校验与原请求相同，只作用于本份文档仍在途的请求；已完成或未知 ID 无操作。取消不是业务回滚，已经提交的设置、安装或外部副作用仍以实际结果为准；写入操作不能据停止等待推断未提交。文档关闭统一回收在途路由，旧回执不能更新新文档。DSH 原页面的 `fetch` 在两种输入形式（`init.signal`、`Request.signal`）下使用此公共通道，取消后以 `AbortError`（或 signal 的自定义 reason）结束，其他并发请求继续运行。
 
+有运行中扩展的页面还会在 `init` 收到可选 `resourceBase`，用于原生脚本、样式及图片的 GET／HEAD 加载，例如 `script.src = new URL('runtime/main.mjs', resourceBase)`。该地址绑定当前包摘要及后台实例，直接交给浏览器加载，不经 JSON 消息桥复制资源；资源路由仍由同一个已授权扩展执行，响应最多 16 MiB。相对 ESM 导入和外部 CSS 相对导入以该 URL 为基准。原生加载只转交 Accept、Range、If-Range、If-None-Match、If-Modified-Since，不转交宿主凭据；保留原处理器的 206／304 状态。停用、同版重新启用、重启或升级后必须使用新 `init` 的地址，不能把旧地址写入持久配置。加载失败沿原生 error 事件处理，宿主不自动重放；ESM 顶层 await 的异步结果需要单独等待实际业务完成。DSH 页面宿主沿同一入口转换动态脚本、样式、`img`／`picture` 的 srcset 及 SVG image 的普通／xlink URL 属性，保留原包页面、字节及浏览器候选选择。
+
 | `operation` | 字段 | `result` |
 | --- | --- | --- |
 | `resource.read` | `resourceId` | `{ version, value }`（从未写过时是 `{ version: 0, value: null }`） |
