@@ -55,12 +55,32 @@ async function post(path, body) {
   if (result.status !== 200) throw new Error(`${path}: HTTP ${result.status} ${JSON.stringify(result.value)}`);
   return result.value;
 }
-async function removePlugin(id) {
+async function removePlugin(id, { verifyPanel = false } = {}) {
   const installed = (await api('/api/plugins')).value.plugins.find(plugin => plugin.manifest.id === id);
   if (!installed) return;
+  const tabSelector = `.right-pane-tab[data-tab-id^=${JSON.stringify(`plugin:${id}:`)}]`;
+  const frameSelector = `iframe[data-plugin-id=${JSON.stringify(id)}]`;
+  const panelWasOpen = verifyPanel && await ui.exists(tabSelector);
+  const errorsBefore = errors.length;
   if (installed.active) await post(`/api/plugins/${encodeURIComponent(id)}/deactivate`, {});
+  if (panelWasOpen) {
+    await waitFor(async () => !await ui.exists(tabSelector) && !await ui.exists(frameSelector), '停用原包回收右栏页签与隔离文档');
+    if (!await page.evaluate('Boolean(document.querySelector(".right-pane")?.getClientRects().length)')) await ui.click('.header-right-pane-btn');
+    await waitFor(() => ui.exists('.right-pane-add-tab'), '停用原包后右栏仍可操作');
+    await ui.click('.right-pane-add-tab');
+    await waitFor(() => ui.exists('[data-testid=right-pane-launcher]'), '停用原包后重新打开原生启动页');
+    assert.deepEqual(errors.slice(errorsBefore), [], '停用与页签离场不能产生页面异常');
+    await writeFile(join(output, `${id}-panel-deactivated.png`), Buffer.from(await ui.screenshot(), 'base64'));
+  }
   if (installed.enabled) await post(`/api/plugins/${encodeURIComponent(id)}/disable`, {});
   await post(`/api/plugins/${encodeURIComponent(id)}/uninstall`, {});
+  if (panelWasOpen) {
+    assert.equal((await api('/api/plugins')).value.plugins.some(plugin => plugin.manifest.id === id), false);
+    assert.equal(await ui.exists(tabSelector), false);
+    assert.equal(await ui.exists(frameSelector), false);
+    assert.deepEqual(errors.slice(errorsBefore), [], '卸载原包后工作台继续可用且没有迟到页面异常');
+  }
+  return { panelWasOpen, ...(panelWasOpen ? { deactivatedPanelReleased: true, nativeLauncherUsable: true, uninstalledPanelReleased: true } : {}) };
 }
 async function installTarget(version = '0.0.7') {
   const request = { ecosystem: 'dsh', package: 'dsh-plugin-release-probe', version };
@@ -394,7 +414,7 @@ try {
         item.core = checks.every((value) => value === true) ? 'passed'
           : checks.some((value) => value === false) ? 'failed' : 'unverified';
       }
-      await removePlugin(item.id);
+      item.panelLifecycle = await removePlugin(item.id, { verifyPanel: true });
       item.cleaned = true;
     } catch (error) {
       if (item.marketInstall || item.businessAttempted) item.core = 'failed';

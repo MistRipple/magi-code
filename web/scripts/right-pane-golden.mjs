@@ -217,7 +217,7 @@ await withGoldenViteServer(async (server) => {
   );
   assert.match(rightPaneSource, /selectLauncherAgents\(projection\?\.agents/u, '代理列表来自运行投影，不另存状态');
   assert.match(storeSource, /tab\.kind !== 'launcher' && tab\.kind !== 'agents'/u, '新标签页和代理列表不持久化');
-  assert.match(rightPaneSource, /activeTab\.kind === 'agents'\}[\s\S]*<AgentListTabContent \/>/u, '代理列表由右栏渲染');
+  assert.match(rightPaneSource, /\.kind === 'agents'\}[\s\S]*<AgentListTabContent \/>/u, '代理列表由右栏渲染');
   assert.match(storeSource, /tab\.kind === 'launcher' \|\| tab\.kind === 'agents'\) return;/u, '新标签页和代理列表不记录 Desktop 激活意图');
   assert.match(rightPaneSource, /<BrowserTabContent[\s\S]*desktopSurface=\{desktopSurface\}/u);
   assert.match(rightPaneSource, /<AgentTabContent/u);

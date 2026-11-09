@@ -1228,19 +1228,18 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
 
 
 
-    {#if !activeTab}
-      <!-- 正常情况下展开的右栏总有一个新标签页 tab；这里只覆盖 Desktop 等待浏览器快照期间没有 tab 的瞬间，避免闪出空白。 -->
-      {@render launcherPage()}
-    {:else if activeTab.kind === 'agent'}
-      {@const agentPayload = activeTab.payload as AgentTabPayload}
+    <!-- 离场期间保留该页签自己的身份，不能让仍在清理的子组件读取已经清空的 activeTab。 -->
+    {#each activeTab ? [activeTab] : [] as renderedTab (renderedTab.id)}
+    {#if renderedTab.kind === 'agent'}
+      {@const agentPayload = renderedTab.payload as AgentTabPayload}
       <AgentTabContent
         agentRunId={agentPayload.agentRunId}
         workspaceId={agentPayload.workspaceId}
         workspacePath={agentPayload.workspacePath}
         sessionId={agentPayload.sessionId}
       />
-    {:else if activeTab.kind === 'terminal'}
-      {@const terminalPayload = activeTab.payload as TerminalTabPayload}
+    {:else if renderedTab.kind === 'terminal'}
+      {@const terminalPayload = renderedTab.payload as TerminalTabPayload}
       {#key terminalPayload.terminalTabId}
       <TerminalTabContent
         terminalTabId={terminalPayload.terminalTabId}
@@ -1250,18 +1249,18 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
         sessionId={terminalPayload.sessionId}
       />
       {/key}
-    {:else if activeTab.kind === 'browser'}
+    {:else if renderedTab.kind === 'browser'}
       <!-- BrowserTabContent 已在上方的内容槽中渲染；这里不能再进入文件预览分支。 -->
-    {:else if activeTab.kind === 'launcher'}
+    {:else if renderedTab.kind === 'launcher'}
       {@render launcherPage()}
-    {:else if activeTab.kind === 'agents'}
+    {:else if renderedTab.kind === 'agents'}
       <AgentListTabContent />
-    {:else if activeTab.kind === 'plugin'}
-      {@const pluginPayload = activeTab.payload as PluginTabPayload}
+    {:else if renderedTab.kind === 'plugin'}
+      {@const pluginPayload = renderedTab.payload as PluginTabPayload}
       <PluginTabContent
         pluginId={pluginPayload.pluginId}
         entry={pluginPayload.entry}
-        label={activeTab.label}
+        label={renderedTab.label}
         active={visible}
       />
     {:else if previewLoading}
@@ -1385,6 +1384,10 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
         </div>
       {/if}
     {/if}
+    {:else}
+      <!-- 等待 Browser 快照等暂时没有活动页签的状态仍使用原启动页。 -->
+      {@render launcherPage()}
+    {/each}
   </div>
 </aside>
 

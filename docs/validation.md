@@ -311,6 +311,8 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 `test:electron-dsh-management` 与 `MAGI_DSH_FUNCTIONAL_UPGRADE=1 npm run test:electron-popular-dsh` 共用 `scripts/lib/dsh-upgrader-acceptance.mjs` 的 Upgrader 1.8.0 原包业务合同，覆盖配置保存、原页面在线升级、并发拒绝、关页／重开、取消、停用／重新启用、版本切换、失败保留、归档写入失败恢复、显式重试及应用重启；原包可用主按钮还需通过八种外观的默认及真实悬停对比度检查。证据为各自输出目录的 `upgrader-business.json`、`upgrader-button-contrast.json` 与截图；管理专项使用 `MAGI_DSH_MANAGEMENT_OUTPUT`，社区批次使用 `MAGI_DSH_ACCEPTANCE_OUTPUT`。registry gate 只暂停本次独立 daemon 的指定包解析，不替换原包、安装回执或业务结果。社区批次仍固定 9 个样本，只有整个合同通过才计入对应业务覆盖；可用 `MAGI_DSH_ACCEPTANCE_PACKAGES` 选择样本排错，但筛选不会缩小完整门槛的分母，未验证项使脚本退出 1。
 
+社区批次在停用／卸载实际打开右栏的原包时，另核对插件页签及隔离文档释放，重新打开原生启动页并继续操作，保存 `*-panel-deactivated.png` 与每个样本的 `panelLifecycle`。所有页面异常仍进入完整批次的失败门槛；该分项只证明面板生命周期，不将样本的核心业务改计为通过。公共运行时验收继续验证多页签切换保留同一原包文档、关闭／重开、停用、重新启用及应用重启。
+
 `test:compat` 和标准发行构建同时核对随包官方 UI 模块所引用的公共颜色语义是否在 `runtime/client/theme.mjs` 中有映射；未知 alias 使浏览器宿主构建失败。`test:electron-plugin-runtime` 再在真实官方组件中验证选中 Pill、Diff 增删行和连接反馈的颜色及文字对比度，不以源码中有变量名代替真实渲染。
 
 实现该能力时必须新增并在本文登记的验证面：
