@@ -1,20 +1,21 @@
 // JSON 消息中的原始 HTTP 载荷。字节限制在编码前计算，wire 限制为 RPC 帧留出元数据空间。
 export const MAX_ROUTE_BINARY_BYTES = 2 * 1024 * 1024;
 export const MAX_ROUTE_WIRE_BYTES = 3 * 1024 * 1024 + 64 * 1024;
-export const MAX_ROUTE_BASE64_LENGTH = Math.ceil(MAX_ROUTE_BINARY_BYTES / 3) * 4;
+export const MAX_ROUTE_RESPONSE_BYTES = 16 * 1024 * 1024;
+export const MAX_ROUTE_RESPONSE_WIRE_BYTES = 24 * 1024 * 1024;
 
-export function encodeRouteBytes(bytes) {
-  if (bytes.byteLength > MAX_ROUTE_BINARY_BYTES) throw new RangeError('插件路由二进制载荷超过 2 MiB');
+export function encodeRouteBytes(bytes, limit = MAX_ROUTE_BINARY_BYTES) {
+  if (bytes.byteLength > limit) throw new RangeError(`插件路由二进制载荷超过 ${limit} 字节`);
   let text = '';
   for (let offset = 0; offset < bytes.length; offset += 32768) text += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
   return btoa(text);
 }
 
-export function decodeRouteBytes(value) {
-  if (typeof value !== 'string' || value.length > MAX_ROUTE_BASE64_LENGTH || value.length % 4 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) throw new TypeError('插件路由 base64 载荷无效');
+export function decodeRouteBytes(value, limit = MAX_ROUTE_BINARY_BYTES) {
+  if (typeof value !== 'string' || value.length > Math.ceil(limit / 3) * 4 || value.length % 4 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) throw new TypeError('插件路由 base64 载荷无效');
   const text = atob(value);
   const bytes = Uint8Array.from(text, c => c.charCodeAt(0));
-  if (encodeRouteBytes(bytes) !== value) throw new TypeError('插件路由 base64 载荷无效');
+  if (encodeRouteBytes(bytes, limit) !== value) throw new TypeError('插件路由 base64 载荷无效');
   return bytes;
 }
 

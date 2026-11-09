@@ -253,6 +253,49 @@ export default async api => {
 }
 
 #[tokio::test]
+async fn large_route_results_cross_bounded_frames_without_replaying_the_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("index.mjs");
+    std::fs::write(&entry, r#"
+export default async api => {
+  let calls=0;
+  await api.route('/large',input=>{
+    calls++;
+    return {status:201,headers:{'x-call-count':String(calls)},body:'完整🙂'.repeat(700_000)};
+  });
+  await api.route('/binary',()=>({status:200,bodyBase64:Buffer.alloc(5*1024*1024,255).toString('base64')}));
+  await api.route('/count',()=>({body:calls}));
+};
+"#).unwrap();
+    let config = LaunchConfig::new(node(), runtime(), entry, dir.path().join("sock"));
+    let group = ManagedProcessGroup::new();
+    let instance = launch(&group, config, 1).await.unwrap();
+    let call = |path: &'static str| {
+        instance.invoke_route(
+            path,
+            json!({"method":"GET","path":path}),
+            json!({"invocationId":path}),
+            Duration::from_secs(15),
+            std::future::pending(),
+        )
+    };
+    let result = call("/large").await.unwrap();
+    assert_eq!(result["status"], 201);
+    assert_eq!(result["headers"]["x-call-count"], "1");
+    assert_eq!(result["body"], "完整🙂".repeat(700_000));
+    assert_eq!(call("/count").await.unwrap()["body"], 1);
+    let binary = call("/binary").await.unwrap();
+    use base64::Engine;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(binary["bodyBase64"].as_str().unwrap())
+            .unwrap(),
+        vec![255; 5 * 1024 * 1024]
+    );
+    instance.stop().await;
+}
+
+#[tokio::test]
 async fn background_management_uses_instance_identity_after_http_reply_without_reviving_the_parent()
 {
     struct Management(std::sync::Mutex<Vec<Value>>);

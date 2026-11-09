@@ -12,6 +12,7 @@ pub mod frame;
 pub mod instance;
 pub mod peer;
 pub mod protocol;
+mod route_payload;
 pub mod supervisor;
 pub mod transport;
 

@@ -348,13 +348,23 @@ impl HostInstance {
             id: invocation_id.clone(),
             leases: Arc::clone(&self.invocations),
         };
-        let request = self.peer.request(
-            method,
-            json!({key: name, "ctx": ctx, "input": input}),
-            timeout,
-        );
+        let request = async {
+            let value = self
+                .peer
+                .request(
+                    method,
+                    json!({key: name, "ctx": ctx, "input": input}),
+                    timeout,
+                )
+                .await?;
+            if method == "route.invoke" {
+                crate::route_payload::receive(&self.peer, self.generation, value).await
+            } else {
+                Ok(value)
+            }
+        };
         let result = tokio::select! {
-            result = request => result,
+            result = tokio::time::timeout(timeout, request) => result.unwrap_or_else(|_| Err(RpcError::new(ErrorKind::DeadlineExceeded, "扩展调用及响应交付超时"))),
             _ = cancelled => {
                 lease_cancelled.store(true, Ordering::Release);
                 let _ = self.peer.notify(
@@ -1125,6 +1135,7 @@ fn check_hello(
         "session.messages",
         "images.store",
         "tool.outcome",
+        "route.payload",
     ];
     let features: Vec<String> = supported
         .iter()

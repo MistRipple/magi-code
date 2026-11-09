@@ -176,7 +176,7 @@ ui/…                       视图页面与静态资源，按需
 | `resource.write` | `resourceId`、`expectedVersion`、`value` | 新的 `{ version, value }`；版本过期时 `ok: false` |
 | `resource.subscribe` | `resourceId` | 无；之后资源每次变化宿主推送 `{ type: 'event', resourceId, resource }`，订阅失败（停用、撤权、升级）推送 `{ type: 'event', resourceId, error }` |
 | `settings.read` / `settings.write` | `expectedVersion`、`value`（写） | `{ version, value }` |
-| `route.call` | `method`、`path`、可选 `query`、`headers`、`body` 或 `bodyBase64` | `{status,contentType?,headers?,body?,bodyBase64?}`；正文只选 JSON／文本或原字节一种表示。字节最多 2 MiB，支持 HEAD／OPTIONS，响应头由 daemon 裁决；只可调用本插件声明的后端路由 |
+| `route.call` | `method`、`path`、可选 `query`、`headers`、`body` 或 `bodyBase64` | `{status,contentType?,headers?,body?,bodyBase64?}`；正文只选 JSON／文本或原字节一种表示。请求最多 2 MiB，响应最多 16 MiB，另有 24 MiB JSON 编码上限；支持 HEAD／OPTIONS，响应头由 daemon 裁决；只可调用本插件声明的后端路由 |
 | `composer.snapshot` | 无 | `{sessionId,attachmentIds,writable}`；只包含当前文档接纳的图片 ID，之后宿主按状态变化推送 `{type:'composer',snapshot}` |
 | `composer.addImages` | `sessionId`、`images:[{dataUrl,name,size}]` | `{accepted,ids,snapshot}`；等待输入框实际接纳，最多 5 张且每张 10 MiB，容量不足时整批返回 `accepted:false`，坏图或失效身份明确失败 |
 | `composer.removeImage` | `sessionId`、`id` | `{removed,snapshot}`；只允许本页面文档添加的图片 |

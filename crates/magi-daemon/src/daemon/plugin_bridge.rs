@@ -328,8 +328,12 @@ impl magi_api::PluginRouteExecutor for NodeRouteExecutor {
         let manager = Arc::clone(&self.manager);
         let bus = Arc::clone(&self.bus);
         Box::pin(async move {
-            validate_route_body(request.body.as_ref(), request.body_base64.as_deref())
-                .map_err(ApiError::InvalidInput)?;
+            validate_route_body(
+                request.body.as_ref(),
+                request.body_base64.as_deref(),
+                2 * 1024 * 1024,
+            )
+            .map_err(ApiError::InvalidInput)?;
             if matches!(
                 request.method,
                 magi_app_server_protocol::generated::PluginRouteMethod::GET
@@ -384,8 +388,9 @@ impl magi_api::PluginRouteExecutor for NodeRouteExecutor {
             let cancel = Arc::new(tokio::sync::Notify::new());
             let _guard = CancelOnDrop(Arc::clone(&cancel));
             let path = request.path;
+            let calling_instance = Arc::clone(&instance);
             let task = tokio::spawn(async move {
-                instance
+                calling_instance
                     .invoke_route(&path, input, ctx, ROUTE_CALL_TIMEOUT, async move {
                         cancel.notified().await
                     })
@@ -411,8 +416,34 @@ impl magi_api::PluginRouteExecutor for NodeRouteExecutor {
             let result: magi_app_server_protocol::generated::PluginRouteCallResult =
                 serde_json::from_value(value)
                     .map_err(|error| ApiError::internal_assembly("插件路由响应无效", error))?;
-            validate_route_body(result.body.as_ref(), result.body_base64.as_deref())
-                .map_err(|error| ApiError::internal_assembly("插件路由响应无效", error))?;
+            validate_route_body(
+                result.body.as_ref(),
+                result.body_base64.as_deref(),
+                16 * 1024 * 1024,
+            )
+            .map_err(|error| ApiError::internal_assembly("插件路由响应无效", error))?;
+            // 大响应仍属最初的安装及实例；交付期间停用、升级或重启不能把旧字节交给新页面。
+            {
+                let manager = manager.lock().map_err(|_| {
+                    ApiError::internal_assembly("插件路由调用失败", "插件管理器不可用")
+                })?;
+                if !manager
+                    .is_active(&plugin_id)
+                    .map_err(|error| ApiError::Conflict(error.to_string()))?
+                    || manager
+                        .package(&plugin_id)
+                        .map_err(|error| ApiError::Conflict(error.to_string()))?
+                        .digest()
+                        != digest
+                    || bus
+                        .instance(&plugin_id)
+                        .is_none_or(|current| !Arc::ptr_eq(&current, &instance))
+                {
+                    return Err(ApiError::Conflict(
+                        "路由响应所属安装或实例已失效；未重复执行业务".into(),
+                    ));
+                }
+            }
             Ok(magi_app_server_protocol::generated::PluginRouteCallResult {
                 status,
                 headers: route_response_headers(result.headers)
@@ -426,21 +457,32 @@ impl magi_api::PluginRouteExecutor for NodeRouteExecutor {
 fn validate_route_body(
     body: Option<&serde_json::Value>,
     bytes: Option<&str>,
+    max_bytes: usize,
 ) -> Result<(), String> {
     use base64::Engine;
+    if let Some(body) = body {
+        let size = match body {
+            serde_json::Value::String(text) => text.len(),
+            value => serde_json::to_vec(value)
+                .map_err(|_| "路由正文无法编码")?
+                .len(),
+        };
+        if size > max_bytes {
+            return Err("插件路由正文超过大小上限".into());
+        }
+    }
     if let Some(bytes) = bytes {
         if body.is_some_and(|body| !body.is_null()) {
             return Err("插件路由不能同时携带 JSON 与字节载荷".into());
         }
         let base64 = base64::engine::general_purpose::STANDARD;
-        const MAX_BYTES: usize = 2 * 1024 * 1024;
-        if bytes.len() > MAX_BYTES.div_ceil(3) * 4 {
-            return Err("插件路由二进制载荷超过 2 MiB".into());
+        if bytes.len() > max_bytes.div_ceil(3) * 4 {
+            return Err("插件路由二进制载荷超过大小上限".into());
         }
         let decoded = base64
             .decode(bytes)
             .map_err(|_| "插件路由 base64 载荷无效")?;
-        if decoded.len() > MAX_BYTES || base64.encode(&decoded) != bytes {
+        if decoded.len() > max_bytes || base64.encode(&decoded) != bytes {
             return Err("插件路由 base64 载荷无效或超过大小上限".into());
         }
     }
@@ -555,14 +597,21 @@ mod tests {
     fn route_payload_validates_binary_before_dispatch_and_preserves_only_application_headers() {
         use base64::Engine;
         let bytes = base64::engine::general_purpose::STANDARD.encode([0, 255, 128, 13, 10]);
-        assert!(validate_route_body(None, Some(&bytes)).is_ok());
-        assert!(validate_route_body(Some(&json!({})), Some(&bytes)).is_err());
+        assert!(validate_route_body(None, Some(&bytes), 2 * 1024 * 1024).is_ok());
+        assert!(validate_route_body(Some(&json!({})), Some(&bytes), 2 * 1024 * 1024).is_err());
         for value in ["?", "Zg=", "Zh==", "Zg==\n"] {
-            assert!(validate_route_body(None, Some(value)).is_err(), "{value:?}");
+            assert!(
+                validate_route_body(None, Some(value), 2 * 1024 * 1024).is_err(),
+                "{value:?}"
+            );
         }
         let too_large =
             base64::engine::general_purpose::STANDARD.encode(vec![0; 2 * 1024 * 1024 + 1]);
-        assert!(validate_route_body(None, Some(&too_large)).is_err());
+        assert!(validate_route_body(None, Some(&too_large), 2 * 1024 * 1024).is_err());
+        assert!(validate_route_body(None, Some(&too_large), 16 * 1024 * 1024).is_ok());
+        let text = json!("完整🙂".repeat(300_000));
+        assert!(validate_route_body(Some(&text), None, 2 * 1024 * 1024).is_err());
+        assert!(validate_route_body(Some(&text), None, 16 * 1024 * 1024).is_ok());
         let headers = route_response_headers(Some(json!({
             "Content-Disposition": "attachment; filename=report.zip", "ETag": "original",
             "Set-Cookie": "must-not-reach-magi=1", "Content-Length": "999", "Connection": "close"

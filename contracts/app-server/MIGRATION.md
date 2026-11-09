@@ -1,5 +1,11 @@
 # App Server 协议生成约定
 
+`PluginRouteCallResult.bodyBase64` 的响应上限增至解码后 16 MiB，请求仍为 2 MiB。
+公开返回形状与方法不变；扩展宿主以 `route.payload` 协商大响应传输，保持 4 MiB RPC
+单帧上限。短期载荷绑定实例代次、字节数和 SHA-256，按 64 KiB 块读取，成功、失败、
+取消或停用后释放；不会重新执行原业务。整段 JSON 编码最多 24 MiB，每宿主最多
+8 项／48 MiB，闲置 30 秒过期。它不属于持久文件、安装缓存或恢复后的重放事实。
+
 `PluginRemoveRequest.changeId`、`PluginBundleInstallRequest.changeId` 及
 `PluginManagementChangeRequest/Receipt` 是协商特性 `plugin.changes` 的增量合同，不新增
 App Server method。changeId 绑定管理调用者包摘要与实例，移除、后续安装和结算共用同一

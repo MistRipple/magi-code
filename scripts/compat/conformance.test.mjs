@@ -27,7 +27,7 @@ import { createRouteFetch } from './runtime/client/route-fetch.mjs';
 import { createRemoteConnection } from './runtime/client/connection.mjs';
 import { getEventListeners } from 'node:events';
 import { runRoute } from './runtime/routes.mjs';
-import { decodeRouteBytes, encodeRouteBytes, readRouteBytes, MAX_ROUTE_BINARY_BYTES } from './runtime/route-payload.mjs';
+import { decodeRouteBytes, encodeRouteBytes, readRouteBytes, MAX_ROUTE_BINARY_BYTES, MAX_ROUTE_RESPONSE_BYTES } from './runtime/route-payload.mjs';
 
 const temporary = async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'magi-compat-contract-'));
@@ -141,6 +141,24 @@ test('原包 fetch 二进制上传、multipart、图片与下载共用路由载�
   assert.equal(resource.headers.get('x-package-version'), '1.0');
   const head = await fromResource('/archive', { method: 'HEAD' });
   assert.equal(head.body, null); assert.equal(head.headers.get('content-type'), 'application/zip');
+});
+
+test('路由响应交付超过单帧的原始脚本与二进制，处理器只执行一次且超限整体拒绝', async () => {
+  let calls = 0;
+  const script = '//完整脚本🙂\n' + 'module-data '.repeat(500_000);
+  const fetchRoute = createRouteFetch((input, signal) => runRoute({handler(_req,res) {
+    calls++; res.writeHead(200, {'content-type':'text/javascript'}); res.end(script);
+  }}, input, {signal}), 'https://magi.example/');
+  assert.equal(await (await fetchRoute('/runtime.js')).text(), script);
+  assert.equal(calls, 1);
+  const bytes = new Uint8Array(5*1024*1024).fill(255);
+  const binary = createRouteFetch((input, signal) => runRoute({resource:()=>new Response(bytes)}, input, {signal}), 'https://magi.example/');
+  assert.deepEqual(new Uint8Array(await (await binary('/binary')).arrayBuffer()), bytes);
+  const tooLarge = createRouteFetch((input, signal) => runRoute({handler(_req,res) {
+    res.writeHead(200, {'content-type':'text/plain'}); res.end('x'.repeat(MAX_ROUTE_RESPONSE_BYTES+1));
+  }}, input, {signal}), 'https://magi.example/');
+  const failed = await tooLarge('/overflow');
+  assert.equal(failed.status, 502); assert.match(await failed.text(), /超过.*已丢弃/);
 });
 
 test('路由字节载荷在业务前拒绝伪造、冲突和超限，流读取取消即时释放且不留下监听', async () => {

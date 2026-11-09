@@ -513,7 +513,8 @@ test('同名变量不是上下文：LLM 请求里的 context.messages 不会被�
 });
 
 test('路由执行层：Node 风格与 Fetch 风格处理器都按上游语义运行；JSON 还原、状态码保留、抛错回 400、超限明确失败', async () => {
-  const { runRoute, MAX_ROUTE_BODY_BYTES } = await import('./runtime/routes.mjs');
+  const { runRoute } = await import('./runtime/routes.mjs');
+  const { MAX_ROUTE_RESPONSE_BYTES } = await import('./runtime/route-payload.mjs');
   const signal = new AbortController().signal;
   const call = (definition, input = {}) => runRoute(definition, { method: 'GET', path: '/p', ...input }, { signal });
 
@@ -551,13 +552,13 @@ test('路由执行层：Node 风格与 Fetch 风格处理器都按上游语义�
   assert.match(thrown.body.error, /坏了/);
 
   // 响应超限：明确失败，不截断。
-  const oversize = await call({ handler: (_req, res) => { res.writeHead(200); res.write(Buffer.alloc(MAX_ROUTE_BODY_BYTES)); res.end(Buffer.alloc(1)); } });
+  const oversize = await call({ handler: (_req, res) => { res.writeHead(200); res.write(Buffer.alloc(MAX_ROUTE_RESPONSE_BYTES)); res.end(Buffer.alloc(1)); } });
   assert.equal(oversize.status, 502, '超限不得变成 200 空正文');
   assert.match(oversize.body.error, /超过/);
   // 恰好等于上限的响应是合法的。
-  const exact = await call({ handler: (_req, res) => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end(Buffer.alloc(MAX_ROUTE_BODY_BYTES, 97)); } });
+  const exact = await call({ handler: (_req, res) => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end(Buffer.alloc(MAX_ROUTE_RESPONSE_BYTES, 97)); } });
   assert.equal(exact.status, 200);
-  assert.equal(exact.body.length, MAX_ROUTE_BODY_BYTES);
+  assert.equal(exact.body.length, MAX_ROUTE_RESPONSE_BYTES);
 });
 
 test('路由执行层：调用被取消时立即以 Cancelled 结束，不等处理器', async () => {

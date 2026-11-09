@@ -6,7 +6,7 @@ export default async function activate(api) {
   await api.route('/boom', async () => { throw new Error('处理器失败'); });
   await api.route('/bytes', async () => ({ contentType: 'image/png', headers: { 'x-original': 'bytes' }, bodyBase64: 'AP+A' }));
   await api.route('/conflicting-body', async () => ({ body: 'not-bytes', bodyBase64: 'AA==' }));
-  await api.route('/too-big', async () => ({ body: 'x'.repeat(4 * 1024 * 1024) }));
+  await api.route('/too-big', async () => ({ body: 'x'.repeat(24 * 1024 * 1024 + 1) }));
   await api.route('/slow', async (_input, ctx) => new Promise((resolve, reject) => {
     ctx.signal.addEventListener('abort', () => reject(new Error('cancelled')));
     setTimeout(() => resolve({ body: 'late' }), 30_000);

@@ -3167,8 +3167,8 @@
         "body": {},
         "bodyBase64": {
           "type": "string",
-          "maxLength": 2796204,
-          "description": "原始 HTTP 正文的标准 base64；与非空 body 互斥，解码后最多 2 MiB。"
+          "maxLength": 22369624,
+          "description": "原始 HTTP 正文的标准 base64；与非空 body 互斥，解码后最多 16 MiB；大响应由宿主分块传输，不扩大 RPC 单帧上限。"
         },
         "headers": {
           "type": "object",

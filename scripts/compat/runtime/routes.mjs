@@ -7,9 +7,8 @@
 // 响应整体收集后一次返回；流式响应（如 NDJSON）以整段文本返回，进度不会逐行推送（兼容报告里披露）。
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
-import { decodeRouteBytes, encodeRouteBytes, readRouteBytes, MAX_ROUTE_WIRE_BYTES } from './route-payload.mjs';
+import { decodeRouteBytes, encodeRouteBytes, readRouteBytes, MAX_ROUTE_BINARY_BYTES, MAX_ROUTE_RESPONSE_BYTES, MAX_ROUTE_RESPONSE_WIRE_BYTES } from './route-payload.mjs';
 
-export const MAX_ROUTE_BODY_BYTES = 3 * 1024 * 1024;
 const JSON_TYPE = /(^|[/+])json(\s*;|$)/i;
 
 // 只传递插件页面自己提供的应用头；宿主身份与传输头由消息桥拥有。
@@ -35,7 +34,7 @@ export function makeRouteRequest(input, signal, options = {}) {
   if (hasBody && ['GET', 'HEAD'].includes(input.method)) throw new TypeError('GET/HEAD 请求不能携带正文');
   const payload = input.bodyBase64 !== undefined ? Buffer.from(decodeRouteBytes(input.bodyBase64))
     : hasBody ? Buffer.from(typeof input.body === 'string' ? input.body : JSON.stringify(input.body)) : Buffer.alloc(0);
-  if (payload.length > MAX_ROUTE_BODY_BYTES) throw new RangeError('插件路由请求超过大小上限');
+  if (payload.length > MAX_ROUTE_BINARY_BYTES) throw new RangeError('插件路由请求超过大小上限');
   const req = Readable.from(payload.length ? [payload] : [], options);
   req.method = input.method;
   req.url = url;
@@ -65,7 +64,7 @@ export function makeRouteResponse(onEnd, streaming) {
     const buffer = chunk instanceof Uint8Array ? Buffer.from(chunk) : Buffer.from(String(chunk), typeof encoding === 'string' ? encoding : undefined);
     if (streaming) { streaming.chunk(buffer); return; }
     size += buffer.length;
-    if (size > MAX_ROUTE_BODY_BYTES) {
+    if (size > MAX_ROUTE_RESPONSE_BYTES) {
       // 超限不截断：丢弃已收集的内容，结束时以明确的失败交出。处理器仍可继续写，但不再占用内存。
       overflow = true;
       chunks.length = 0;
@@ -101,7 +100,7 @@ export function makeRouteResponse(onEnd, streaming) {
       ended = true;
       res.writable = false;
       if (overflow) {
-        onEnd({ status: 502, contentType: 'application/json', body: Buffer.from(JSON.stringify({ error: `路由响应超过 ${MAX_ROUTE_BODY_BYTES} 字节上限，已丢弃` })) });
+        onEnd({ status: 502, contentType: 'application/json', body: Buffer.from(JSON.stringify({ error: `路由响应超过 ${MAX_ROUTE_RESPONSE_BYTES} 字节上限，已丢弃` })) });
       } else {
         onEnd({ status: res.statusCode, contentType: headers['content-type'], headers, body: Buffer.concat(chunks) });
       }
@@ -120,7 +119,7 @@ export function routeResult({ status, contentType, headers, body }) {
   const metadata = { status, ...(contentType ? { contentType } : {}), ...(headers ? { headers } : {}) };
   // 文本与 JSON 保持公开路由的结构化结果；其他媒体和无效 UTF-8 始终传原字节。
   if ((contentType && !/^(text\/|application\/(?:[\w.+-]*json|[\w.+-]*xml|javascript|x-www-form-urlencoded)(?:;|$)|image\/svg\+xml(?:;|$))/i.test(contentType)
-    || !Buffer.from(text).equals(body)) && body.length) return boundedResult({ ...metadata, bodyBase64: encodeRouteBytes(body) });
+    || !Buffer.from(text).equals(body)) && body.length) return boundedResult({ ...metadata, bodyBase64: encodeRouteBytes(body, MAX_ROUTE_RESPONSE_BYTES) });
   if (contentType && JSON_TYPE.test(contentType) && text !== '') {
     try { value = JSON.parse(text); } catch { value = text; }
   }
@@ -128,7 +127,7 @@ export function routeResult({ status, contentType, headers, body }) {
 }
 
 function boundedResult(result) {
-  if (Buffer.byteLength(JSON.stringify(result)) > MAX_ROUTE_WIRE_BYTES) throw new RangeError('插件路由响应超过消息大小上限');
+  if (Buffer.byteLength(JSON.stringify(result)) > MAX_ROUTE_RESPONSE_WIRE_BYTES) throw new RangeError('插件路由响应超过消息大小上限');
   return result;
 }
 
@@ -161,7 +160,7 @@ export async function runRoute(definition, input, execContext) {
         return response;
       }), cancelled]);
     } finally { signal.removeEventListener('abort', abort); }
-    const buffer = Buffer.from(await readRouteBytes(response.body, signal, MAX_ROUTE_BODY_BYTES));
+    const buffer = Buffer.from(await readRouteBytes(response.body, signal, MAX_ROUTE_RESPONSE_BYTES));
     return routeResult({ status: response.status, contentType: response.headers.get('content-type') ?? undefined, headers: Object.fromEntries(response.headers), body: buffer });
   }
   return await new Promise((resolve, reject) => {

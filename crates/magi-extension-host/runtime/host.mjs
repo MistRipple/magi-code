@@ -12,11 +12,11 @@ const invocationContext = new AsyncLocalStorage();
 import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const PROTOCOL = { major: 1, minor: 0 };
-const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'plugin.installations', 'plugin.directory.events', 'plugin.reconciliation', 'plugin.changes', 'plugin.skills', 'session.directory', 'session.messages', 'images.store', 'tool.outcome'];
+const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'plugin.installations', 'plugin.directory.events', 'plugin.reconciliation', 'plugin.changes', 'plugin.skills', 'session.directory', 'session.messages', 'images.store', 'tool.outcome', 'route.payload'];
 let negotiatedFeatures = new Set();
 const pluginRequest = (method, input, background = false) => {
   if (!negotiatedFeatures.has('plugin.management')) throw new Error('daemon 未协商 plugin.management');
@@ -66,6 +66,29 @@ const toolResults = new WeakMap();
 const commandHandlers = new Map(); // command id -> handler
 const routeHandlers = new Map(); // 视图后端路径 -> handler
 const inflight = new Map(); // invocationId -> AbortController
+// 只保存一次已完成响应的传输字节，不保存业务任务或文件事实。读取不重跑路由。
+const routePayloads = new Map();
+const MAX_ROUTE_RESULT = 24 * 1024 * 1024;
+const MAX_ROUTE_PAYLOAD_POOL = 48 * 1024 * 1024;
+const pruneRoutePayloads = () => {
+  for (const [id, payload] of routePayloads) if (payload.expires <= Date.now()) routePayloads.delete(id);
+};
+const routePayloadTimer = setInterval(pruneRoutePayloads, 1000);
+routePayloadTimer.unref();
+function deliverRouteResult(result, owner) {
+  const bytes = Buffer.from(JSON.stringify(result));
+  if (bytes.length <= 3 * 1024 * 1024 + 64 * 1024) return result;
+  if (!negotiatedFeatures.has('route.payload')) throw new Error('daemon 未协商 route.payload，不能交付大路由响应');
+  if (bytes.length > MAX_ROUTE_RESULT) throw new RangeError('路由响应超过 24 MiB 编码上限');
+  pruneRoutePayloads();
+  if (routePayloads.size >= 8 || [...routePayloads.values()].reduce((total, item) => total + item.bytes.length, bytes.length) > MAX_ROUTE_PAYLOAD_POOL) throw new Error('路由响应传输容量已满，请完成或取消当前读取后重试');
+  const id = randomUUID();
+  routePayloads.set(id, { bytes, owner, expires: Date.now() + 30_000 });
+  return { routePayload: { id, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex'), generation } };
+}
+function releaseRoutePayload(params) {
+  if (params?.generation === generation) routePayloads.delete(params.id);
+}
 const disposers = new Set();
 const configListeners = new Set();
 const pluginDirectoryListeners = new Set();
@@ -76,6 +99,8 @@ async function disposeExtension() {
   pluginDirectoryListeners.clear();
   if (shuttingDown) return;
   shuttingDown = true;
+  clearInterval(routePayloadTimer);
+  routePayloads.clear();
   for (const controller of inflight.values()) controller.abort();
   for (const dispose of [...disposers].reverse()) await dispose();
   disposers.clear();
@@ -116,6 +141,15 @@ function request(method, params, independent = false) {
 
 async function handleRequest(id, method, params) {
   try {
+    if (method === 'route.result.read') {
+      if (params?.generation !== generation) return send({ id, error: rpcError('StaleGeneration', '路由响应实例已失效') });
+      pruneRoutePayloads();
+      const payload = routePayloads.get(params.id);
+      if (!payload) return send({ id, error: rpcError('BlobExpired', '路由响应已释放或过期；读取不会重新执行业务') });
+      if (!Number.isSafeInteger(params.offset) || params.offset < 0 || params.offset >= payload.bytes.length) return send({ id, error: rpcError('InvalidParams', '路由响应读取位置无效') });
+      payload.expires = Date.now() + 30_000;
+      return send({ id, result: { offset: params.offset, data: payload.bytes.subarray(params.offset, params.offset + 64 * 1024).toString('base64') } });
+    }
     if (method === 'settings.validate') {
       if (!validateSettings) throw new Error('扩展未提供设置校验器');
       if (params.generation !== generation) throw new Error('设置校验实例已失效');
@@ -195,8 +229,8 @@ async function handleRequest(id, method, params) {
           ...(output?.headers === undefined ? {} : { headers: output.headers }),
           ...(output?.bodyBase64 === undefined ? { body: output?.body ?? null } : { bodyBase64: output.bodyBase64 }),
         };
-        if (Buffer.byteLength(JSON.stringify(result)) > 3 * 1024 * 1024 + 64 * 1024) throw new RangeError('路由响应超过消息大小上限');
-        return send({ id, result });
+        controller.signal.throwIfAborted();
+        return send({ id, result: deliverRouteResult(result, ctx.invocationId) });
       } catch (error) {
         // 路由自身抛出的错误是视图可见的 500，不是协议错误。
         return send({ id, result: { status: 500, body: { error: String(error?.message ?? error).slice(0, 4096) } } });
@@ -261,6 +295,9 @@ function handleNotification(method, params) {
     }
   } else if (method === 'host.cancel') {
     inflight.get(params?.invocationId)?.abort();
+    for (const [id, payload] of routePayloads) if (payload.owner === params?.invocationId) routePayloads.delete(id);
+  } else if (method === 'route.result.release') {
+    releaseRoutePayload(params);
   } else if (method === 'hook.notify') {
     const handler = handlers.get(params?.hook);
     if (handler) Promise.resolve().then(() => handler(params.input, { ...(params.ctx ?? {}), seq: params.seq })).catch(() => {});

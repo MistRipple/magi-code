@@ -503,6 +503,16 @@ export async function apply(ctx, config) {
       'set-cookie':'must-not-enter-magi=1','content-length':String(bytes.length)});
     res.write(bytes.subarray(0,7));res.end(bytes.subarray(7));
   }});
+  let resourceCalls=0;
+  ctx.webServer.register({path:'/large-script',handler(req,res){
+    res.writeHead(200,{'content-type':'text/javascript','x-resource-call':String(++resourceCalls)});
+    res.end('window.__routeScriptReady=(window.__routeScriptReady||0)+1;\\n/*完整🙂'+ 'route-module '.repeat(450_000)+'*/');
+  }});
+  ctx.webServer.register({path:'/large-binary',resource:()=>new Response(
+    Buffer.alloc(5*1024*1024,255),{headers:{'content-type':'application/octet-stream'}})});
+  ctx.webServer.register({path:'/oversize-response',handler(req,res){
+    res.writeHead(200,{'content-type':'text/plain'});res.end(Buffer.alloc(16*1024*1024+1,97));
+  }});
   ctx.webServer.register({path:'/binary-image',resource:()=>new Response(
     Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=','base64'),
     {headers:{'content-type':'image/png','x-image-source':'original-route'}})});
@@ -783,6 +793,26 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
           &&binary.reported===String(binary.bytes)&&binary.filename==='attachment; filename="original.bin"',JSON.stringify(binary));
       reporter.check('真实 Chromium 的 FormData 文件和边界完整通过，Cookie 与传输长度不进入可信页面',
         binary.multipart&&binary.boundary&&binary.cookie===null&&binary.length===null,JSON.stringify(binary));
+      const large=await frame.evaluate(`(async()=>{
+        const response=await fetch('/large-script'),text=await response.text();
+        const script=document.createElement('script');script.textContent=text;document.body.append(script);script.remove();
+        const overflow=await fetch('/oversize-response');
+        return {status:response.status,call:response.headers.get('x-resource-call'),bytes:new TextEncoder().encode(text).length,
+          complete:text==='window.__routeScriptReady=(window.__routeScriptReady||0)+1;\\n/*完整🙂'+'route-module '.repeat(450_000)+'*/',
+          executed:window.__routeScriptReady,overflow:{status:overflow.status,body:await overflow.json()}};
+      })()`);
+      reporter.check('原页面完整取得超过 5 MiB 的业务脚本并由 Chromium 执行，后端处理器只运行一次',
+        large.status===200&&large.call==='1'&&large.bytes>5*1024*1024&&large.complete&&large.executed===1,large);
+      large.sizes=[];
+      for(let index=0;index<10;index++) large.sizes.push(await frame.evaluate(`(async()=>{
+        const response=await fetch('/large-binary'),bytes=new Uint8Array(await response.arrayBuffer());
+        if(response.status!==200||bytes.length!==5*1024*1024||!bytes.every(byte=>byte===255))throw new Error('large binary corrupted');
+        return bytes.length;
+      })()`));
+      reporter.check('连续 50 MiB 原始二进制完整交付且逐次释放，超过宿主总池容量后仍可继续业务',
+        large.sizes.length===10&&large.sizes.every(size=>size===5*1024*1024),large);
+      reporter.check('响应超过 16 MiB 时明确整体拒绝，原实例继续处理图片与后续业务',
+        large.overflow.status===502&&/超过.*已丢弃/.test(large.overflow.body.error),large.overflow);
       const media=await frame.evaluate(`(async()=>{
         const response=await fetch('/binary-image'),blob=await response.blob(),url=URL.createObjectURL(blob);
         const image=new Image();image.src=url;document.body.append(image);
@@ -813,7 +843,7 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
       reporter.check('非法、冲突及超限字节在 daemon 进入原包业务前被拒绝，运行实例保持可用',
         rejected.every(result=>result.status===400&&result.message)
           &&(await api('/api/plugins')).value.plugins.find(plugin=>plugin.manifest.id===id).runtime?.state==='running',JSON.stringify(rejected));
-      await writeFile(join(output,'route-media.json'),JSON.stringify({binary,media,vector,methods,rejected},null,2));
+      await writeFile(join(output,'route-media.json'),JSON.stringify({binary,large,media,vector,methods,rejected},null,2));
       const imageData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=';
       const dshReceipt = await frame.evaluate(`(async()=>{
         const bytes=Uint8Array.from(atob(${JSON.stringify(imageData)}),c=>c.charCodeAt(0));
