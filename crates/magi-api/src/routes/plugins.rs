@@ -307,19 +307,23 @@ async fn admit_composer(
     Path(id): Path<String>,
     Json(request): Json<magi_app_server_protocol::generated::PluginComposerAdmissionRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let manager = locked(&state, "校验插件图片草稿授权")?;
+    let manager = locked(&state, "校验插件输入授权")?;
+    let target = match request.target {
+        Some(magi_app_server_protocol::generated::PluginComposerTarget::Text) => "text",
+        None | Some(magi_app_server_protocol::generated::PluginComposerTarget::Images) => "images",
+    };
     if !manager.is_active(&id).map_err(plugin_error)?
         || !manager
             .permission_allowed(
                 &id,
                 magi_plugin_system::PluginPermissionKind::Composer,
-                "images",
+                target,
             )
             .map_err(plugin_error)?
     {
-        return Err(ApiError::Forbidden(
-            "插件未激活或缺少 composer:[images] 授权".into(),
-        ));
+        return Err(ApiError::Forbidden(format!(
+            "插件未激活或缺少 composer:[{target}] 授权"
+        )));
     }
     let package = manager.package(&id).map_err(plugin_error)?;
     if package.digest() != request.expected_digest {
@@ -1218,12 +1222,18 @@ mod tests {
 
     #[tokio::test]
     async fn composer_admission_binds_current_digest_view_and_grant() {
+        for target in ["images", "text"] {
+            check_composer_admission(target).await;
+        }
+    }
+
+    async fn check_composer_admission(target: &str) {
         let root = tempfile::tempdir().unwrap();
         let state = bare_state(root.path());
         let manifest = serde_json::json!({
             "sdkVersion":2,"id":"acme.composer","version":"1.0.0","name":"Composer","description":"",
             "dataSchemaVersion":1,"settingsSchema":{"type":"object"},
-            "permissions":[{"kind":"composer","targets":["images"]}],
+            "permissions":[{"kind":"composer","targets":[target]}],
             "contributions":{"views":[{"id":"page","title":"Page","entry":"ui/index.html","placements":["rightPane"]}]}
         });
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
@@ -1249,8 +1259,11 @@ mod tests {
                 .unwrap();
             manager.enable("acme.composer").unwrap();
         }
-        let request =
+        let mut request =
             serde_json::json!({"expectedDigest":package.digest(),"entry":"ui/index.html"});
+        if target == "text" {
+            request["target"] = serde_json::json!(target);
+        }
         let endpoint = "/plugins/acme.composer/composer/admit";
         assert_eq!(
             post_json(&state, endpoint, request.clone()).await.0,
@@ -1266,6 +1279,14 @@ mod tests {
         assert_eq!(
             post_json(&state, endpoint, request.clone()).await.0,
             StatusCode::NO_CONTENT
+        );
+        let mut text_request = request.clone();
+        text_request["target"] =
+            serde_json::json!(if target == "text" { "images" } else { "text" });
+        assert_eq!(
+            post_json(&state, endpoint, text_request).await.0,
+            StatusCode::FORBIDDEN,
+            "图片与文本授权不能互相继承"
         );
         let mut stale = request.clone();
         stale["expectedDigest"] = serde_json::json!("0".repeat(64));

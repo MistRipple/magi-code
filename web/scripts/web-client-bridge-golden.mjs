@@ -1540,6 +1540,7 @@ await withGoldenViteServer(async (server) => {
     type: 'executeTask',
     text: '第一行\n第二行\n\n   ',
     requestId: trailingWhitespaceRequestId,
+    userMessageId: 'stable-plugin-input-item',
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
     sessionId: SESSION_ID,
@@ -1551,6 +1552,8 @@ await withGoldenViteServer(async (server) => {
   const trailingWhitespaceBody = capturedTurnBodies.find(
     (body) => body.requestId === trailingWhitespaceRequestId,
   );
+  assert.equal(trailingWhitespaceBody.userMessageId, 'stable-plugin-input-item',
+    '显式提交用户 item 身份必须沿原生桥保留，显式重试不能重新生成而破坏 daemon 指纹');
   assert.equal(
     trailingWhitespaceBody.text,
     '第一行\n第二行',

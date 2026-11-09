@@ -3689,6 +3689,9 @@ pub struct PluginComposerAdmissionRequest {
     #[serde(rename = "expectedDigest")]
     pub expected_digest: String,
     pub entry: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<PluginComposerTarget>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -4090,4 +4093,40 @@ pub struct PluginManagementChangeRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginManagementChangeReceipt {
     pub restored: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginComposerTarget {
+    #[serde(rename = "images")]
+    Images,
+    #[serde(rename = "text")]
+    Text,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginComposerTextInput {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "submissionId")]
+    pub submission_id: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginComposerTextReceipt {
+    #[serde(rename = "submissionId")]
+    pub submission_id: String,
+    pub status: PluginComposerTextStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginComposerTextStatus {
+    #[serde(rename = "accepted")]
+    Accepted,
+    #[serde(rename = "unknown")]
+    Unknown,
 }

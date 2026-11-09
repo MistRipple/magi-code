@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { usesComposerClient } from './install/client-assets.mjs';
 import { translateClientBusiness } from './install/client-business.mjs';
 import { createSessionComposerServices } from './runtime/client/session-composer.mjs';
 import { createComposerClient } from './runtime/client/composer.mjs';
@@ -529,10 +528,28 @@ test('通用设置表单保持稳定快照，多字段保存只提交一次 CAS�
   assert.equal(await scope.unset('timeout'), true);
   assert.deepEqual(scope.getSnapshot().value, { title: 'queued', timeout: 30 });
 });
-test('图片端口权限识别支持压缩变量、属性和解构，不匹配注释与字符串', () => {
-  for (const source of ['function apply(c){ c.magiComposer.addImages([]); }', 'const p=c["magiComposer"];', 'const {magiComposer: images}=c;', 'const {magiComposer}=c;']) assert.equal(usesComposerClient(source), true);
-  assert.equal(usesComposerClient('// ctx.magiComposer\nconst label="ctx.magiComposer";'), false);
-  assert.throws(()=>usesComposerClient('const { =;'), /语法/);
+test('公共输入权限与业务共用数据流识别，支持压缩变量、属性及解构并区分图片与文本', () => {
+  for (const source of [
+    'function apply(c){ c.magiComposer.addImages([]); }',
+    'function apply(c){const p=c["magiComposer"];p.addImages([])}',
+    'function apply(c){const {magiComposer: images}=c;images.addImages([])}',
+    'function apply(c){const {magiComposer}=c;const {addImages}=magiComposer;addImages([])}',
+  ]) assert.deepEqual(translateClientBusiness(source).composerTargets, ['images']);
+  assert.deepEqual(translateClientBusiness('function apply(c){const {magiComposer}=c;magiComposer.submitText("text",{})}').composerTargets,['text']);
+  assert.deepEqual(translateClientBusiness('// ctx.magiComposer\nconst label="ctx.magiComposer";').composerTargets, []);
+  assert.throws(()=>translateClientBusiness('const { =;'), /语法/);
+});
+
+test('公开文本输入按真实宿主别名声明独立权限，保持原代码并等待原生提交回执', async () => {
+  const source='function apply(ctx){const input=ctx.magiComposer;return input.submitText("follow up",{sessionId:"s",submissionId:"stable"});}';
+  const translated=translateClientBusiness(source);
+  assert.deepEqual(translated.composerTargets,['text']);
+  assert.equal(translated.code,source);
+  assert.deepEqual(translateClientBusiness('function apply(ctx){return ordinary.submitText("other")}').composerTargets,[]);
+  const calls=[];
+  const composer=createComposerClient(async input=>{calls.push(input);return {submissionId:input.submissionId,status:'accepted'};});
+  assert.deepEqual(await composer.api.submitText('follow up',{sessionId:'s',submissionId:'stable'}),{submissionId:'stable',status:'accepted'});
+  assert.deepEqual(calls,[{operation:'composer.submitText',text:'follow up',sessionId:'s',submissionId:'stable'}]);
 });
 
 test('DSH 会话图片业务调用只在静态可证明路径上转换为异步真实回执', async () => {

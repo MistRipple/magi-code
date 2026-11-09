@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, writeFile, rm, realpath, rename } from 'node:
 import { tmpdir } from 'node:os';
 import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
+import { isDeepStrictEqual, promisify } from 'node:util';
 import { createRequire } from 'node:module';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
@@ -673,6 +673,13 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
               const response=await fetch('/panel-action',{method:'POST',headers:{'content-type':'application/json','x-panel-key':key},body:JSON.stringify({text:key})});
               const result=await response.json(); setText(result.key+':'+result.result);
             }},'Run'),
+            h('button',{id:'submit-text',onClick:async()=>{
+              const input=window.__textInput;
+              try {
+                const receipt=await ctx.magiComposer.submitText(input.text,input);
+                (window.__textReceipts??=[]).push(receipt);
+              } catch(error) { (window.__textReceipts??=[]).push({error:error.message}); }
+            }},'Follow up'),
             h('output',{id:'receipt'},text),h('output',{id:'pulse'},pulse),
             h('button',{id:'next-panel',onClick:()=>c.sidebarRight.openTab(key==='first'?'second':'first')},'Next panel'));
         });
@@ -1054,6 +1061,47 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
       })()`);
       reporter.check('真实解码失败的整批图片被拒绝且不留下部分草稿', invalidBatch
         && await page.evaluate(`document.querySelectorAll('.image-tray-thumb').length===0`));
+      const textInput={sessionId:session,submissionId:'plugin-composer-text-acceptance',text:'PLUGIN_TEXT_FOLLOWUP:actual action'};
+      const nativeTextRequest='plugin-composer-'+createHash('sha256').update(JSON.stringify([id,session,textInput.submissionId])).digest('hex');
+      const staleTextRequest='plugin-composer-'+createHash('sha256').update(JSON.stringify([id,'no-longer-active','wrong-session-text'])).digest('hex');
+      const textTurns=async()=>(await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).value.canonicalTurns??[];
+      await frame.evaluate(`window.__textInput=${JSON.stringify(textInput)};window.__textReceipts=[];true`);
+      await page.evaluate(`document.querySelector('[data-testid=input-textarea]').focus()`);
+      await waitFor(()=>page.evaluate(`document.activeElement===document.querySelector('[data-testid=input-textarea]')`),'草稿输入框取得真实文档焦点');
+      await page.call('Input.insertText',{text:'KEEP_USER_DRAFT'});
+      await waitFor(()=>page.evaluate(`document.querySelector('[data-testid=input-textarea]').innerText==='KEEP_USER_DRAFT'`),'真实键盘输入已经进入用户草稿');
+      await frame.evaluate(`document.getElementById('submit-text').click();true`);
+      await waitFor(()=>frame.evaluate('Boolean(window.__textReceipts[0]?.error)'),'插件文本与已有用户草稿冲突明确返回');
+      reporter.check('插件文本提交保护现有输入草稿，不覆盖、不清空且不进入 daemon 新请求',
+        await page.evaluate(`document.querySelector('[data-testid=input-textarea]').innerText==='KEEP_USER_DRAFT'`)
+          &&!(await textTurns()).some(turn=>turn.metadata?.requestId===nativeTextRequest));
+      await page.evaluate(`(() => {const editor=document.querySelector('[data-testid=input-textarea]');editor.focus();document.execCommand('selectAll');document.execCommand('delete');})()`);
+      await frame.evaluate(`window.__textReceipts=[];document.getElementById('submit-text').click();document.getElementById('submit-text').click();true`);
+      await waitFor(()=>frame.evaluate(`window.__textReceipts.length===2&&window.__textReceipts.every(receipt=>receipt.status==='accepted')`),'两次原页面点击取得同一原生接纳回执');
+      const acceptedText=await waitFor(async()=>{
+        const turns=await textTurns();return turns.find(turn=>turn.metadata?.requestId===nativeTextRequest&&turn.status==='completed');
+      },'插件文本经真实主会话完成模型业务').catch(async error=>{
+        await writeFile(join(output,'composer-text-failure.json'),JSON.stringify({textInput,nativeTextRequest,turns:await textTurns(),receipts:await frame.evaluate('window.__textReceipts')},null,2));
+        throw error;
+      });
+      const textModelRequest=JSON.parse((await post(`/api/plugins/${pluginId}/routes`,{method:'GET',path:'/skill-request'})).body.request);
+      await writeFile(join(output,'composer-text-model.json'),JSON.stringify({textInput,acceptedText,textModelRequest,permissions:plugin.manifest.permissions,turns:await textTurns()},null,2));
+      reporter.check('原页面文本操作经独立授权与原生输入进入真实模型，重复在途点击只接纳一轮',
+        plugin.manifest.permissions.some(permission=>permission.kind==='composer'&&permission.targets.includes('text'))
+          &&acceptedText.items.some(item=>item.content===textInput.text)&&acceptedText.modelSteps.length===1
+          &&textModelRequest.messages.some(message=>message.role==='user'&&message.content.some(block=>block.type==='text'&&block.text===textInput.text))
+          &&(await textTurns()).filter(turn=>turn.metadata?.requestId===nativeTextRequest).length===1,acceptedText);
+      await frame.evaluate(`window.__textReceipts=[];document.getElementById('submit-text').click();true`);
+      await waitFor(()=>frame.evaluate(`window.__textReceipts[0]?.status==='accepted'`),'完成后显式同身份重试读取原接纳事实');
+      reporter.check('原页面相同文本及身份的显式重试沿 daemon 判重，不重放模型或新增用户消息',
+        (await textTurns()).filter(turn=>turn.metadata?.requestId===nativeTextRequest).length===1
+          &&(await textTurns()).find(turn=>turn.metadata?.requestId===nativeTextRequest).modelSteps.length===acceptedText.modelSteps.length);
+      await frame.evaluate(`window.__textInput={...window.__textInput,sessionId:'no-longer-active',submissionId:'wrong-session-text'};window.__textReceipts=[];document.getElementById('submit-text').click();true`);
+      await waitFor(()=>frame.evaluate(`Boolean(window.__textReceipts[0]?.error)`),'过期会话文本不能转投当前会话');
+      reporter.check('原页面文本显式绑定原会话，失效身份在提交前拒绝且当前输入仍可继续',
+        !(await textTurns()).some(turn=>turn.metadata?.requestId===staleTextRequest)
+          &&await page.evaluate(`document.querySelector('[data-testid=input-textarea]').innerText.trim()===''`));
+      await writeFile(join(output,'composer-text.json'),JSON.stringify({textInput,acceptedText,textModelRequest,receipts:await frame.evaluate('window.__textReceipts')},null,2));
     }
     if (key === 'second') reporter.check('插件隔离存储跨面板保留界面缓存且不泄露宿主键', await frame.evaluate(`localStorage.getItem('panel-cache')==='first' && sessionStorage.getItem('panel-session')==='same-client' && localStorage.getItem('magi-ui-private-probe')===null`));
     await frame.evaluate(`document.getElementById('action').click(); true`);
@@ -1125,10 +1173,34 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   reporter.check('同版重新启用签发新公开实例身份，旧原生资源 URL 在执行业务前拒绝',
     restarted.runtime.instanceId!==oldRuntimeId&&staleResource.status===409&&newAssetCount.main===0&&newAssetCount.leaf===0,
     {oldRuntimeId,current:restarted.runtime.instanceId,status:staleResource.status,newAssetCount});
+  const originalText={sessionId:session,submissionId:'plugin-composer-text-acceptance',text:'PLUGIN_TEXT_FOLLOWUP:actual action'};
+  const nativeTextId='plugin-composer-'+createHash('sha256').update(JSON.stringify([id,session,originalText.submissionId])).digest('hex');
+  const currentTurns=async()=>(await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).value.canonicalTurns??[];
+  const textBefore=(await currentTurns()).find(turn=>turn.metadata?.requestId===nativeTextId);
+  await frame.evaluate(`window.__textInput=${JSON.stringify(originalText)};window.__textReceipts=[];document.getElementById('submit-text').click();true`);
+  await waitFor(()=>frame.evaluate(`window.__textReceipts[0]?.status==='accepted'`),'新文档按相同操作身份读取原接纳回执');
+  const textAfter=(await currentTurns()).filter(turn=>turn.metadata?.requestId===nativeTextId);
+  reporter.check('同版重新启用后的原页面可显式重试旧文本操作，沿同一 daemon 身份读取且不另起模型',
+    textAfter.length===1&&textAfter[0].turnId===textBefore.turnId&&textAfter[0].modelSteps.length===textBefore.modelSteps.length);
   await snapshot('panel-restarted');
   await post(`/api/plugins/${id}/deactivate`);
   await waitFor(async () => !await ui.exists(`iframe[data-plugin-id="${id}"]`), '再次停用回收客户端');
   frame.close(); frame = null;
+  const persistedTurns=await currentTurns();
+  page.close();await quitApp();
+  await waitFor(async()=>!await fetch(origin+'/health').then(()=>true,()=>false),'文本回执持久化后应用及 daemon 退出');
+  app=startApp();
+  page=await waitFor(()=>connectAppPage(cdpPort,daemonPort,errors),'文本回执持久化后完整应用重新启动',60000);ui=pageTools(page);
+  await waitFor(()=>page.evaluate(`Boolean(document.querySelector('[data-testid=sidebar-settings]'))`),'重启工作台完成初始化');
+  const restoredTurns=await currentTurns();
+  await writeFile(join(output,'composer-text-restored.json'),JSON.stringify({
+    before:textAfter[0],after:restoredTurns.filter(turn=>turn.metadata?.requestId===nativeTextId),
+    persistedTurnIds:persistedTurns.map(turn=>turn.turnId),restoredTurnIds:restoredTurns.map(turn=>turn.turnId),
+  },null,2));
+  reporter.check('完整应用重启保留文本操作的唯一 canonical 接纳与模型结果，不自动重放页面提交',
+    restoredTurns.length===persistedTurns.length
+      &&restoredTurns.filter(turn=>turn.metadata?.requestId===nativeTextId).length===1
+      &&isDeepStrictEqual(restoredTurns.find(turn=>turn.metadata?.requestId===nativeTextId),textAfter[0]));
 }
 
 async function verifySessionDirectory(session) {

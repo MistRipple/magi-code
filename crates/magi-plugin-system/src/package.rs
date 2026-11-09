@@ -399,10 +399,16 @@ fn validate_manifest_with_limits(
             return Err(invalid("sessionWrite 权限只允许 context 与 wake"));
         }
         if permission.kind == PluginPermissionKind::Composer
-            && (permission.targets.as_slice() != ["images"]
+            && (permission.targets.is_empty()
+                || permission
+                    .targets
+                    .iter()
+                    .any(|target| !matches!(target.as_str(), "images" | "text"))
                 || manifest.contributions.views.is_empty())
         {
-            return Err(invalid("composer 权限必须为 images，且插件须声明视图"));
+            return Err(invalid(
+                "composer 权限只允许 images 与 text，且插件须声明视图",
+            ));
         }
     }
     let mut permissions = HashSet::new();

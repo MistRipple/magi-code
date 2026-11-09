@@ -295,6 +295,8 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 `test:electron-plugin-runtime` 的公共提示合同使用原有运行时夹具，注册超过八万字符、JSON 补丁超过 256 KiB 的业务指引，经真实 daemon 每轮贡献及插件模型桥核对最终模型请求、完整原文、来源角色和配置替换。`test:compat` 同时验证提示注册、排序、变量插值、撤销、取消、过期设置句柄与预算失败；Rust 接纳点按 Unicode 字符验证单片段及总预算。夹具不计入社区原包的完整业务覆盖率。
 
+页面文本输入使用同一 `test:electron-plugin-runtime` 夹具，通过原按钮等待真实 daemon 接纳与模型结果，并核对用户草稿保护、在途重复、显式相同身份重试、失效会话拒绝、同版重新启用和完整应用重启后的同身份显式重试。重启前后 canonical 记录按字段深度比较，忽略 JSON 对象字段顺序，保留完整前后快照；不忽略任何业务字段。`npm --prefix web run test:plugin-composer` 验证独立授权、派发前会话／页面／授权失效、在途互斥与真实原生回执观察；超时和失败等待保留 `unknown`，不假定未接纳。`cargo test -p magi-api --lib composer_admission` 及 `cargo test -p magi-plugin-system --test package composer_text` 验证两个授权目标互不继承、旧图片请求及当前摘要／视图边界。机制回归不等于 GenUI 聊天槽位或完整业务完成。
+
 `cargo test -p magi-extension-host` 包含真实 Node 的提示钩子反向读取回归：实例级配置与资源可读，模型、工具、任务和会话快照仍返回 `ReentryDenied`，拒绝请求不进入 daemon 业务服务。钩子关联身份不冒充业务租约；工具／命令的取消与过期租约回归继续由同一宿主测试覆盖。
 
 公共脚本容量由 `cargo test -p magi-plugin-system --test package` 验证浏览器／Node 模块的 16 MiB 上限、其他资源的 4 MiB 上限及展开总量；`test:compat` 复用原封装合同逐字核对超过 5 MiB 的独立模块。`test:electron-plugin-runtime` 的真实后台与页面脚本都超过 5 MiB，通过实际安装、资源字节、Chromium 页面动作及重启核对完整链路。页面业务调用仍只转换必要的回执等待；交付资源须与正式安装产物逐字一致，不能把业务转换当作字节损坏，也不能只检查接口状态码。

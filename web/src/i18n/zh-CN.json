@@ -3260,5 +3260,10 @@
   "settings.plugins.translationRuntime.unavailable": "暂不可更新",
   "settings.plugins.translationRuntime.update": "更新运行组件",
   "settings.plugins.translationRuntime.confirm": "原包版本不变，将更新运行组件。更新后需重新授权并启用。",
-  "settings.plugins.disabledBy": "由 {name} 停用：{reason}"
+  "settings.plugins.disabledBy": "由 {name} 停用：{reason}",
+  "input.pluginTextInvalid": "插件文本或提交身份无效。",
+  "input.pluginTextPending": "已有插件文本正在提交，请等待实际回执。",
+  "input.pluginTextUnavailable": "当前输入框暂不可提交插件文本，请检查会话和待处理交互。",
+  "input.pluginTextDraftConflict": "输入框已有草稿、附件或已选操作，请先处理后再提交插件文本。",
+  "settings.plugins.permission.composerText": "文本输入：可向当前会话提交插件文本并请求模型回复；已有草稿或待处理交互时拒绝，运行中按原生规则排队"
 }

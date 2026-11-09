@@ -1621,6 +1621,7 @@ export interface PluginComposerSnapshot {
 export interface PluginComposerAdmissionRequest {
   expectedDigest: string;
   entry: string;
+  target?: PluginComposerTarget;
 }
 
 export interface PluginSessionDirectoryRequest {
@@ -1818,3 +1819,18 @@ export interface PluginManagementChangeRequest {
 export interface PluginManagementChangeReceipt {
   restored: Array<string>;
 }
+
+export type PluginComposerTarget = "images" | "text";
+
+export interface PluginComposerTextInput {
+  sessionId: string;
+  submissionId: string;
+  text: string;
+}
+
+export interface PluginComposerTextReceipt {
+  submissionId: string;
+  status: PluginComposerTextStatus;
+}
+
+export type PluginComposerTextStatus = "accepted" | "unknown";

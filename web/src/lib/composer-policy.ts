@@ -9,6 +9,7 @@ import type { CanonicalTurn } from '../shared/protocol/canonical-turn';
 
 export const MAX_COMPOSER_IMAGES = 5;
 export const MAX_COMPOSER_IMAGE_BYTES = 10 * 1024 * 1024;
+export const MAX_COMPOSER_TEXT_CHARS = 10000;
 
 /** 插件图片草稿与 Magi GUI 图片准入保持相同的浏览器格式。 */
 export const SUPPORTED_COMPOSER_IMAGE_TYPES = [

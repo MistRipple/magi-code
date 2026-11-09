@@ -72,7 +72,9 @@
     waitForSessionNavigation,
   } from '../shared/session-navigation.svelte';
   import ImageAttachmentTray from './ImageAttachmentTray.svelte';
-  import { registerPluginComposer, notifyPluginComposerChanged } from '../lib/plugin-composer';
+  import { registerPluginComposer, notifyPluginComposerChanged, observeComposerSubmission } from '../lib/plugin-composer';
+  import type { PluginComposerTextInput } from '../shared/app-server-protocol.generated';
+  import { MAX_COMPOSER_TEXT_CHARS } from '../lib/composer-policy';
   import { materializeSession } from '../web/agent-api';
   import { mainModelContextWindowKey, type MainModelCatalogGroup } from '../shared/main-model-sources';
   import {
@@ -630,7 +632,7 @@
   let drawersCount = $state(0);
   const queueDockLevel = $derived(drawersCount + 1);
   const questionDockLevel = $derived(drawersCount + (queuedMessages.length > 0 ? 1 : 0) + 1);
-  const MAX_INPUT_CHARS = 10000;
+  const MAX_INPUT_CHARS = MAX_COMPOSER_TEXT_CHARS;
   let inputTextareaEl = $state<HTMLDivElement | null>(null);
   let isComposing = $state(false);
   // Safari/Chromium 在 compositionend 后偶尔会再补发一次 Enter；这段
@@ -1809,6 +1811,8 @@
       has: (id) => selectedImages.some((image) => image.id === id),
       writable: () => Boolean(currentSessionId?.trim()) && !sessionInputLocked && !sendPreparing && !editingQueuedMessage && !editingTurn
         && selectedImages.length + pendingImageReadCount < MAX_COMPOSER_IMAGES,
+      textWritable: () => Boolean(currentSessionId?.trim()) && !isDraftSession && !sessionInputLocked && !sendPreparing
+        && !isComposing && !isInteractionBlocking && !pendingImageReadCount && composerIsPristineForSubmissionRecovery(),
       beginRead(count) {
         if (sessionInputLocked || sendPreparing || editingQueuedMessage || editingTurn
           || selectedImages.length + pendingImageReadCount + count > MAX_COMPOSER_IMAGES) return null;
@@ -1828,6 +1832,14 @@
       },
       focus: () => queueMicrotask(focusEditor),
       notify: (level, message) => addToast(level, message, undefined, { forceVisible: true }),
+      async submitText(input, admit) {
+        const observation = observeComposerSubmission(input.submissionId);
+        try {
+          const posted = await sendMessage(null, { input, admit });
+          if (posted !== input.submissionId) throw new Error(i18n.t('input.pluginTextUnavailable'));
+          return await observation.result;
+        } finally { observation.dispose(); }
+      },
     });
 
     function handleFillComposer(event: Event) {
@@ -1988,6 +2000,9 @@
   $effect(() => {
     void currentSessionId; void selectedImages; void pendingImageReadCount;
     void sessionInputLocked; void sendPreparing; void editingQueuedMessage; void editingTurn;
+    void inputValue; void selectedContextReferences; void selectedBrowserAnnotations; void selectedBrowserNodeSelections;
+    void selectedGoalMode; void selectedSkill; void selectedSessionCommand; void selectedPluginCommand;
+    void isComposing; void isInteractionBlocking;
     notifyPluginComposerChanged();
   });
 
@@ -2054,12 +2069,18 @@
 
   // 发送消息（支持图片附件）。
   // daemon 持久接纳投递意图；替代输入等待原执行结算后才启动。
-  async function sendMessage(interruptTurnId: string | null = null) {
+  async function sendMessage(interruptTurnId: string | null = null, plugin?: { input: PluginComposerTextInput; admit(): Promise<void> }) {
     if (sendPreparing) return;
     sendPreparing = true;
     try {
       await waitForPendingImageReads();
-      const rawContent = resolveComposerRawContent();
+      if (plugin) {
+        await plugin.admit();
+        if (currentSessionId !== plugin.input.sessionId || isDraftSession || isComposing
+          || sessionInputLocked || isInteractionBlocking || pendingImageReadCount) throw new Error(i18n.t('input.pluginTextUnavailable'));
+        if (!composerIsPristineForSubmissionRecovery()) throw new Error(i18n.t('input.pluginTextDraftConflict'));
+      }
+      const rawContent = plugin ? plugin.input.text : resolveComposerRawContent();
       const normalizedContent = rawContent.trim();
       if (editingQueuedMessage) { await saveQueuedMessage(rawContent); return; }
       // 配置期间普通问题、补充方案和暂停说明都进入主对话；只有面板明确操作才提交控制动作。
@@ -2104,12 +2125,12 @@
         return;
       }
 
-      const requestId = generateId();
+      const requestId = plugin?.input.submissionId ?? generateId();
       const replaceTurnId = editingTurn?.sessionId === messagesState.currentSessionId
         ? editingTurn.turnId
         : null;
       if (interruptTurnId && (replaceTurnId || selectedSessionCommand || selectedPluginCommand)) return;
-      if (!replaceTurnId) {
+      if (!replaceTurnId && !plugin) {
         submittedComposerDrafts.set(requestId, captureComposerSubmissionDraft(rawContent));
       }
       vscode.postMessage({
@@ -2117,6 +2138,7 @@
         sourceFolderId: targetWorkspace ? selectedSourceFolderId || undefined : undefined,
         text: submissionText,
         requestId,
+        ...(plugin ? { userMessageId: `plugin-input-${plugin.input.submissionId}` } : {}),
         workspaceId: targetWorkspace?.workspaceId || '',
         workspacePath: targetWorkspace ? workspaceNavigationPath(targetWorkspace) : '',
         sessionId: isDraftSession ? '' : (messagesState.currentSessionId || ''),
@@ -2136,9 +2158,10 @@
         browserAnnotationRefs: selectedBrowserAnnotations.map((annotation) => annotation.annotationId),
         browserNodeSelections: selectedBrowserNodeSelections.map(cloneBrowserNodeSelection),
       });
-      if (!replaceTurnId) {
+      if (!replaceTurnId && !plugin) {
         clearComposerState();
       }
+      return requestId;
     } finally {
       sendPreparing = false;
     }

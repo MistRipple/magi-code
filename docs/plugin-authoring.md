@@ -183,7 +183,10 @@ ui/…                       视图页面与静态资源，按需
 | `composer.addImages` | `sessionId`、`images:[{dataUrl,name,size}]` | `{accepted,ids,snapshot}`；等待输入框实际接纳，最多 5 张且每张 10 MiB，容量不足时整批返回 `accepted:false`，坏图或失效身份明确失败 |
 | `composer.removeImage` | `sessionId`、`id` | `{removed,snapshot}`；只允许本页面文档添加的图片 |
 | `composer.focus` / `composer.notify` | `sessionId`；通知另需 `level`、`message` | 无；上述全部操作需要 `composer:["images"]` 授权及当前安装摘要，页面换代后旧 ID 不能操作草稿 |
+| `composer.submitText` | `PluginComposerTextInput` 的 `sessionId`、`submissionId`、`text` | `PluginComposerTextReceipt`；需要独立 `composer:["text"]`，正文最多 10000 字符。原生输入框已有草稿、附件、选中操作或待处理交互时拒绝并保留原内容；只提交当前会话。`accepted` 仅表示 daemon 已接纳，运行中仍沿原生队列，不能推断模型完成。失联／超时返回 `unknown`，由原页面保留操作身份并显式以相同输入重试，不自动重放 |
 | `view.resize` | `height`（CSS 像素，0 到 20000） | 无；仅对 `settings` 位置的视图生效：文档至少填满宿主可用高度，正文更长时按上报高度增长并由设置页整体滚动，页面自身不应再出现正文滚动条；测量正文而非 `innerHeight`，避免窗口缩小时旧视口高度锁住内容 |
+
+DSH 原包可通过 `ctx.magiComposer.submitText(text, {sessionId, submissionId})` 使用上述文本端口，必须等待 Promise。`submissionId` 是本插件操作身份，宿主按插件与会话派生隔离的原生 requestId，防止占用用户或其他插件的身份；同一身份更改正文或原生提交参数会由 daemon 拒绝。`refresh('text')` 只读取当前会话及可写投影，不取得用户草稿。图片与文本权限独立，翻译安装准备从同一业务数据流识别具体使用并在预览展示；DSH 聊天槽位及同步 `setDraft/submit` 尚不因此可用。
 
 单次写入不超过 4 MiB。一个最小的页面（`ui/index.html`）：
 

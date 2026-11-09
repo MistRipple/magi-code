@@ -4050,6 +4050,7 @@ export async function autoConnectAgentRunTracking(
 }
 
 interface ExecuteTaskInput {
+  userMessageId?: string;
   sourceFolderId?: string;
   text?: string | null;
   workspaceId?: string;
@@ -4344,7 +4345,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     return false;
   }
   const requestId = trimBridgeString(input.requestId) || generateMessageId();
-  const userMessageId = generateMessageId();
+  const userMessageId = trimBridgeString(input.userMessageId) || generateMessageId();
   const placeholderMessageId = `assistant-placeholder-${requestId}`;
   const requestCreatedAt = Date.now();
   if (
@@ -5693,6 +5694,7 @@ export function createWebClientBridge(): ClientBridge {
               workspacePath: typeof message.workspacePath === 'string' ? message.workspacePath : undefined,
               sessionId: typeof message.sessionId === 'string' ? message.sessionId : undefined,
               requestId: typeof message.requestId === 'string' ? message.requestId : undefined,
+              userMessageId: typeof message.userMessageId === 'string' ? message.userMessageId : undefined,
               skillName: typeof message.skillName === 'string' ? message.skillName : null,
               goalMode: message.goalMode === true,
               command: message.command === 'compact' ? 'compact' : null,

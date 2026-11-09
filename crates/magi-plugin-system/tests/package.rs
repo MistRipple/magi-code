@@ -706,6 +706,31 @@ fn icons_preserve_svg_and_common_image_formats_inside_ui() {
 }
 
 #[test]
+fn composer_text_and_images_are_distinct_explicit_view_permissions() {
+    let mut manifest = self::manifest();
+    for targets in [
+        json!(["text"]),
+        json!(["images"]),
+        json!(["images", "text"]),
+    ] {
+        manifest["permissions"] = json!([{"kind":"composer","targets":targets}]);
+        assert!(PluginPackage::from_archive(&archive(&manifest, &[])).is_ok());
+    }
+    for targets in [
+        json!([]),
+        json!(["*"]),
+        json!(["submit"]),
+        json!(["text", "unknown"]),
+    ] {
+        manifest["permissions"] = json!([{"kind":"composer","targets":targets}]);
+        assert!(PluginPackage::from_archive(&archive(&manifest, &[])).is_err());
+    }
+    manifest["permissions"] = json!([{"kind":"composer","targets":["text"]}]);
+    manifest["contributions"]["views"] = json!([]);
+    assert!(PluginPackage::from_archive(&archive(&manifest, &[])).is_err());
+}
+
+#[test]
 fn persistent_clients_require_an_explicit_grant_and_a_declared_view_entry() {
     let mut m = manifest();
     m["contributions"]["client"] = json!({"entry":"ui/index.html"});

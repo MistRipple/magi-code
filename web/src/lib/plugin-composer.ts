@@ -1,5 +1,6 @@
-import { MAX_COMPOSER_IMAGE_BYTES, isSupportedComposerDataUrl } from './composer-policy';
-import type { PluginComposerImageInput, PluginComposerSnapshot } from '../shared/app-server-protocol.generated';
+import { MAX_COMPOSER_IMAGE_BYTES, MAX_COMPOSER_TEXT_CHARS, isSupportedComposerDataUrl } from './composer-policy';
+import type { PluginComposerImageInput, PluginComposerSnapshot, PluginComposerTarget, PluginComposerTextInput, PluginComposerTextReceipt } from '../shared/app-server-protocol.generated';
+import { i18n } from '../stores/i18n.svelte';
 
 export type PluginComposerImage = PluginComposerImageInput;
 
@@ -8,14 +9,18 @@ export interface PluginComposerPort {
   add(images: PluginComposerImage[]): string[] | null;
   has(id: string): boolean;
   writable(): boolean;
+  textWritable(): boolean;
   beginRead(count: number): (() => void) | null;
   remove(id: string): boolean;
   focus(): void;
   notify(level: 'info' | 'warning' | 'error' | 'success', message: string): void;
+  submitText(input: PluginComposerTextInput, admit: () => Promise<void>): Promise<PluginComposerTextReceipt>;
 }
 
 // 仅持有当前 InputArea 的调用端口，不保存第二份草稿或会话列表。
 let active: PluginComposerPort | undefined;
+interface TextSubmission { port: PluginComposerPort; input: PluginComposerTextInput; result: Promise<PluginComposerTextReceipt> }
+let submittingText: TextSubmission | undefined;
 const listeners = new Set<() => void>();
 export function notifyPluginComposerChanged(): void { for (const listener of listeners) listener(); }
 export function subscribePluginComposer(listener: () => void): () => void { listeners.add(listener); return () => listeners.delete(listener); }
@@ -27,13 +32,54 @@ export function registerPluginComposer(port: PluginComposerPort): () => void {
 }
 
 export function pluginComposerSession(): string | null { return active?.sessionId() || null; }
-export function pluginComposerSnapshot(ids: Iterable<string>): PluginComposerSnapshot {
-  return { sessionId: pluginComposerSession(), attachmentIds: active ? [...ids].filter((id) => active?.has(id)) : [], writable: active?.writable() ?? false };
+export function pluginComposerSnapshot(ids: Iterable<string>, target: PluginComposerTarget = 'images'): PluginComposerSnapshot {
+  return { sessionId: pluginComposerSession(), attachmentIds: active ? [...ids].filter((id) => active?.has(id)) : [], writable: (target === 'text' ? !submittingText && active?.textWritable() : active?.writable()) ?? false };
 }
 
 function bound(sessionId: unknown): PluginComposerPort {
   if (typeof sessionId !== 'string' || !sessionId || !active || active.sessionId() !== sessionId) throw new Error('插件输入请求不属于当前活动会话');
   return active;
+}
+
+// 在途 Promise 只是输入端口的互斥与回执等待；去重、接纳和排队事实仍由 daemon 拥有。
+export function submitPluginComposerText(input: PluginComposerTextInput, admit: () => Promise<void>): Promise<PluginComposerTextReceipt> {
+  const port = bound(input.sessionId);
+  if (typeof input.submissionId !== 'string' || !input.submissionId.trim() || input.submissionId.trim() !== input.submissionId
+    || /[\u0000-\u001f\u007f]/.test(input.submissionId) || input.submissionId.length > 128
+    || typeof input.text !== 'string' || !input.text.trim() || input.text.length > MAX_COMPOSER_TEXT_CHARS) throw new Error(i18n.t('input.pluginTextInvalid'));
+  if (submittingText) {
+    if (submittingText.port === port && submittingText.input.sessionId === input.sessionId
+      && submittingText.input.submissionId === input.submissionId && submittingText.input.text === input.text) return submittingText.result;
+    throw new Error(i18n.t('input.pluginTextPending'));
+  }
+  const captured = { ...input };
+  const authorize = async () => {
+    await admit();
+    if (bound(captured.sessionId) !== port) throw new Error(i18n.t('input.pluginTextUnavailable'));
+  };
+  const pending: TextSubmission = { port, input: captured,
+    result: Promise.resolve().then(() => port.submitText(captured, authorize)).finally(() => {
+      if (submittingText === pending) { submittingText = undefined; notifyPluginComposerChanged(); }
+    }),
+  };
+  submittingText = pending;
+  notifyPluginComposerChanged();
+  return pending.result;
+}
+
+/** 只观察现有原生提交回执；失联或停止等待都不能推断请求未接纳。 */
+export function observeComposerSubmission(submissionId: string, timeoutMs = 30_000) {
+  let finish: (status: PluginComposerTextReceipt['status']) => void;
+  const result = new Promise<PluginComposerTextReceipt>(resolve => {
+    finish = status => { window.removeEventListener('magi:sessionTurnSubmissionSettled', receive); clearTimeout(timer); resolve({ submissionId, status }); };
+  });
+  const receive = (event: Event) => {
+    const detail = (event as CustomEvent<{ requestId?: string; status?: string }>).detail;
+    if (detail?.requestId === submissionId) finish(detail.status === 'accepted' ? 'accepted' : 'unknown');
+  };
+  const timer = setTimeout(() => finish('unknown'), timeoutMs);
+  window.addEventListener('magi:sessionTurnSubmissionSettled', receive);
+  return { result, dispose() { finish('unknown'); } };
 }
 
 async function decodeImage(input: unknown): Promise<PluginComposerImage> {

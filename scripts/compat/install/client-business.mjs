@@ -49,6 +49,8 @@ export function translateClientBusiness(text) {
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const parent = label(node.expression), name = methodName(node);
       if (parent === 'ctx' && name === 'conversation') return 'conversation';
+      if (parent === 'ctx' && name === 'magiComposer') return 'composer';
+      if (parent === 'composer') return `composer-op:${name}`;
       if (parent === 'conversation' && name === 'input') return 'inputs';
       if (parent === 'input' && INPUT_METHODS.has(name)) return `operation:${name}`;
       if (parent === 'input' && name === 'snapshot') return 'snapshot';
@@ -72,6 +74,12 @@ export function translateClientBusiness(text) {
           const name = binding.propertyName?.text ?? binding.name.text;
           if (!ts.isIdentifier(binding.name) || !INPUT_METHODS.has(name) || binding.dotDotDotToken) throw new Error('客户端输入端口解构含未支持操作');
           changed = mark(binding.name, `operation:${name}`) || changed;
+        }
+        else if (ts.isObjectBindingPattern(node.name) && ['ctx','composer'].includes(label(node.initializer))) for (const binding of node.name.elements) {
+          if (!ts.isIdentifier(binding.name) || binding.dotDotDotToken) continue;
+          const name = binding.propertyName?.text ?? binding.name.text;
+          const kind = label(node.initializer) === 'composer' ? `composer-op:${name}` : name === 'magiComposer' ? 'composer' : undefined;
+          changed = mark(binding.name, kind) || changed;
         }
       }
       if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(node.left)) {
@@ -177,5 +185,8 @@ export function translateClientBusiness(text) {
   for (const [at, insertion] of edits.sort((a, b) => b[0] - a[0])) code = code.slice(0, at) + insertion + code.slice(at);
   const syntax = ts.createSourceFile('result.js', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   if (syntax.parseDiagnostics.length) throw new Error('客户端业务异步转换结果语法无效');
-  return { code, operations: [...operations].sort(), changedFunctions: [...asyncFunctions].filter((fn) => !alreadyAsync(fn)).length, awaitedCalls: awaited.size };
+  const composerTargets = [...new Set([...members.map(member=>label(member)),...labels.values()]
+    .filter(kind=>kind?.startsWith('composer-op:')).flatMap(kind=>kind==='composer-op:submitText' ? ['text']
+      : ['addImages','removeImage','focus','notify','refresh','getSnapshot','subscribe'].some(name=>kind===`composer-op:${name}`) ? ['images'] : []))].sort();
+  return { code, operations: [...operations].sort(), composerTargets, changedFunctions: [...asyncFunctions].filter((fn) => !alreadyAsync(fn)).length, awaitedCalls: awaited.size };
 }

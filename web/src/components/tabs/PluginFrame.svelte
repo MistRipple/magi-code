@@ -138,18 +138,19 @@
   let documentEntry = '';
   let navigationIdentity = '';
   let composerSubscribed = false;
+  let composerTarget: 'images' | 'text' = 'images';
   let composerBridge = makeComposerBridge();
   function makeComposerBridge() {
     const expectedInstance = instanceId;
-    return createPluginComposerBridge(async () => {
+    return createPluginComposerBridge(async (target) => {
       if (!documentDigest) throw new Error('插件页面缺少安装摘要');
-      await admitPluginComposer(pluginId, { expectedDigest: documentDigest, entry: documentEntry });
-    }, () => instanceId === expectedInstance);
+      await admitPluginComposer(pluginId, { expectedDigest: documentDigest, entry: documentEntry, target });
+    }, () => instanceId === expectedInstance, pluginId);
   }
   function sendComposerSnapshot(): void {
     if (destroyed || !composerSubscribed) return;
     const expectedInstance = instanceId;
-    void composerBridge.call('composer.snapshot', {}).then((snapshot) => {
+    void composerBridge.call('composer.snapshot', { target: composerTarget }).then((snapshot) => {
       send({ type: 'composer', snapshot }, expectedInstance);
     }).catch(() => {
       if (expectedInstance !== instanceId) return;
@@ -217,7 +218,7 @@
     const callingDigest = documentDigest;
     const callingRuntimeId = documentRuntimeId;
     const operation = event.data.operation;
-    if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write', 'settings.describe', 'route.call', 'host.openExternal', 'clipboard.write', 'view.resize', 'view.open', 'view.storage.read', 'view.storage.write', 'composer.snapshot', 'composer.addImages', 'composer.removeImage', 'composer.notify', 'composer.focus'].includes(operation)) return;
+    if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write', 'settings.describe', 'route.call', 'host.openExternal', 'clipboard.write', 'view.resize', 'view.open', 'view.storage.read', 'view.storage.write', 'composer.snapshot', 'composer.addImages', 'composer.removeImage', 'composer.notify', 'composer.focus', 'composer.submitText'].includes(operation)) return;
     try {
       if (operation === 'view.storage.read' || operation === 'view.storage.write') {
         // 这是界面缓存，归浏览器 profile 所有；业务配置仍只走 daemon 的 settings CAS。
@@ -258,7 +259,10 @@
       if (operation.startsWith('composer.')) {
         const result = await composerBridge.call(operation, event.data);
         if (expectedInstance !== instanceId) return;
-        if (operation === 'composer.snapshot') composerSubscribed = true;
+        if (operation === 'composer.snapshot') {
+          composerSubscribed = true;
+          composerTarget = event.data.target === 'text' ? 'text' : 'images';
+        }
         send({ type: 'response', requestId, ok: true, result }, expectedInstance);
         sendComposerSnapshot();
         return;

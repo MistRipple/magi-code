@@ -47,7 +47,8 @@
     if (permission.kind === 'attachments') return i18n.t('settings.plugins.permission.attachments');
     if (permission.kind === 'sessionWrite') return permission.targets.map(target => i18n.t(target === 'wake' ? 'settings.plugins.permission.sessionWrite.wake' : 'settings.plugins.permission.sessionWrite.context')).join('；');
     if (permission.kind === 'sessionRead') return i18n.t('settings.plugins.permission.sessionRead');
-    if (permission.kind === 'composer') return i18n.t('settings.plugins.permission.composer');
+    if (permission.kind === 'composer') return permission.targets.map(target => i18n.t(target === 'text'
+      ? 'settings.plugins.permission.composerText' : 'settings.plugins.permission.composer')).join('\n');
     if (permission.kind === 'extension') return i18n.t('settings.plugins.permission.extensionFullTrust');
     if (permission.kind === 'pluginManagement') return [
       i18n.t(permission.targets.includes('authorize') ? 'settings.plugins.permission.pluginAuthorization' : 'settings.plugins.permission.pluginManagement'),

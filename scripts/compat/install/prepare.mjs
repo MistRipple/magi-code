@@ -7,7 +7,7 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRegistry } from '../index.mjs';
 import { packageId } from '../core/identity.mjs';
-import { analyzeNativeClient, findClientFile, usesComposerClient } from './client-assets.mjs';
+import { analyzeNativeClient, findClientFile } from './client-assets.mjs';
 import { resolveUpstreamIcon } from './icon.mjs';
 import { installDependencies } from './dependencies.mjs';
 import { copyBrowserAssets } from './browser-assets.mjs';
@@ -104,8 +104,9 @@ export async function prepareDsh(options) {
   const client = findClientFile(root, pkg);
   const clientSource = client ? readFileSync(client.file, 'utf8') : null;
   const business = clientSource ? translateClientBusiness(clientSource) : null;
-  if (client && (business.operations.length || usesComposerClient(clientSource))) {
-    manifest.permissions.push({ kind: 'composer', targets: ['images'] });
+  if (client) {
+    const targets = [...new Set([...(business.operations.length ? ['images'] : []), ...business.composerTargets])];
+    if (targets.length) manifest.permissions.push({ kind: 'composer', targets });
   }
   const management = inspection.entries.some((entry) => /^(?:ctx\.)?(?:pluginManager|loader)(?:\.|$)/.test(entry.name))
     || ['pluginManager', 'loader'].some((name) => Object.hasOwn(inspection.serviceReads, name));

@@ -1,5 +1,12 @@
 # App Server 协议生成约定
 
+`composer:["text"]` 为独立输入授权，不继承或替代 `images`。`PluginComposerAdmissionRequest.target`
+为增量字段，省略时保持原图片准入；文本必须显式选择 `text`。页面文本复用既有输入框与
+TurnService 提交、队列和幂等，不新增 App Server method。`PluginComposerTextInput/Receipt`
+定义会话、稳定操作身份、正文与实际接纳／未知回执；页面关闭或超时不会取消已经提交的业务。
+插件操作身份派生成插件及会话隔离的 requestId，显式重试固定用户 item 身份并沿同一服务判重。
+旧包只授图片时不能发送文本，新增权限必须在更新预览中展示并重新授权。
+
 `PluginRuntimeStatus.instanceId` 为 daemon 签发的当前运行实例公开关联身份，与私有服务租约
 分开，不具有授权能力；每次重新启动均变化，缺少宿主时省略。`generation` 仍仅表示一次
 监管周期内的崩溃代次。页面用摘要与 instanceId 绑定文档生命周期；原路由请求增量接受

@@ -6549,6 +6549,10 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 256
+        },
+        "target": {
+          "$ref": "#/$defs/PluginComposerTarget",
+          "description": "本次输入操作所需授权；省略时仍为 images，text 不能继承图片授权。"
         }
       }
     },
@@ -7379,6 +7383,64 @@
           "description": "本次结算已恢复原安装的插件 ID；候选已提交的目标不会列入。"
         }
       }
+    },
+    "PluginComposerTarget": {
+      "type": "string",
+      "enum": [
+        "images",
+        "text"
+      ]
+    },
+    "PluginComposerTextInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "submissionId",
+        "text"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "submissionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "同一文本提交的稳定身份；结果未知时仅以相同身份和输入显式重试。"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10000
+        }
+      }
+    },
+    "PluginComposerTextReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "submissionId",
+        "status"
+      ],
+      "properties": {
+        "submissionId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/PluginComposerTextStatus",
+          "description": "accepted 只在原生 daemon 接纳回执到达后返回；断开或超时为 unknown，不自动重放。"
+        }
+      }
+    },
+    "PluginComposerTextStatus": {
+      "type": "string",
+      "enum": [
+        "accepted",
+        "unknown"
+      ]
     }
   }
 }
