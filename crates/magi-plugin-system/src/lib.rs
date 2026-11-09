@@ -15,11 +15,14 @@ pub use catalog::{
     TrustedKey,
 };
 pub use lifecycle::{
-    ActivePlugin, InstalledPlugin, PluginDrainGuard, PluginManager, PluginManagerState,
-    PluginSource, PreparedToolCall, RetiredBuiltin, PluginChangeScope,
+    ActivePlugin, InstalledPlugin, PluginChangeScope, PluginDrainGuard, PluginManager,
+    PluginManagerState, PluginSource, PreparedToolCall, RetiredBuiltin,
 };
 pub use magi_app_server_protocol::{PluginManifest, PluginPermission, PluginPermissionKind};
-pub use package::{MAX_EXTENSION_ENTRY_BYTES, MAX_PACKAGE_BYTES, PluginPackage, validate_manifest, icon_content_type, validate_icon};
+pub use package::{
+    MAX_EXTENSION_ENTRY_BYTES, MAX_PACKAGE_BYTES, PluginPackage, icon_content_type,
+    valid_plugin_id, validate_icon, validate_manifest,
+};
 pub use resource::{PluginResource, PluginResourceStore, ResourceError};
 
 /// `plugin/{插件}/{贡献}` 形式的贡献身份：技能、视图等贡献共用。

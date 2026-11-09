@@ -146,6 +146,67 @@ export default async function activate(api) {
 }
 
 #[tokio::test]
+async fn prompt_hooks_read_instance_state_without_acquiring_a_business_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("index.mjs");
+    std::fs::write(
+        &entry,
+        r#"
+export default async api => {
+  await api.on('prompt.contribute', async () => {
+    const settings = await api.settings.read();
+    const resource = await api.resource.read('notes');
+    const denied = [];
+    for (const call of [
+      () => api.model.invoke({prompt:'not allowed'}),
+      () => api.tools.call('not-allowed'),
+      () => api.task.spawn({}),
+      () => api.session.snapshot({}),
+    ]) {
+      try { await call(); denied.push('allowed'); }
+      catch (error) { denied.push(error.kind); }
+    }
+    return {decision:'replace',patch:{fragments:[{
+      id:'state',stability:'volatile',text:JSON.stringify({settings,resource,denied}),
+    }]}};
+  });
+};
+"#,
+    )
+    .unwrap();
+    let calls = Arc::default();
+    let mut config = LaunchConfig::new(node(), runtime(), entry, dir.path().join("sock"));
+    config.plugin_id = "acme.services".into();
+    config.hooks = vec![hook("prompt.contribute", HookMode::Advise, Some(3000))];
+    config.service = Some(Arc::new(MockService {
+        calls: Arc::clone(&calls),
+    }));
+    let bus = ExtensionBus::default();
+    bus.register_plugin(&config.plugin_id, &config.hooks)
+        .unwrap();
+    let group = ManagedProcessGroup::new();
+    let instance = launch(&group, config, 1).await.unwrap();
+    assert!(bus.attach(Arc::clone(&instance)));
+    let outcome = bus
+        .invoke("prompt.contribute", &ctx(), json!({"phase":"round"}))
+        .await
+        .unwrap();
+    instance.stop().await;
+    assert_eq!(outcome.patches.len(), 1, "{outcome:?}");
+    let text = outcome.patches[0].1["fragments"][0]["text"]
+        .as_str()
+        .unwrap();
+    let state: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(state["settings"]["value"]["enabled"], true);
+    assert_eq!(state["resource"]["version"], 0);
+    assert_eq!(state["denied"], json!(vec!["ReentryDenied"; 4]));
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["acme.services:settings.read", "acme.services:resource.read"]
+    );
+}
+
+#[tokio::test]
 async fn plugin_directory_notifications_are_instance_local_and_subscriptions_can_be_released() {
     let dir = tempfile::tempdir().unwrap();
     let entry = dir.path().join("index.mjs");

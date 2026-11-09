@@ -344,7 +344,7 @@ await api.on('tool.call', async (event, ctx) => {
 补充：
 
 - `tool.call` / `tool.result` / `subagent.spawn` 只在有工具的任务管线里触发，纯对话不会执行工具，所以不会触发。
-- `prompt.contribute`：每条片段最多 8K 字符、每阶段合计最多 16K；`start` 阶段只接受 `stable` 并在本轮冻结，`round` 阶段只接受 `volatile`，放在上下文尾部。片段来源由 daemon 标注，不能冒充原生系统段。
+- `prompt.contribute`：每条片段及每阶段合计最多 128K Unicode 字符，实际预算由调用的 `budget` 返回；超出时整体拒绝、不截断。补丁传输上限 1 MiB，JSON 编码后仍须满足该限制。`start` 阶段只接受 `stable` 并在本轮冻结，`round` 阶段只接受 `volatile`，放在上下文尾部。片段来源由 daemon 标注，不能冒充原生系统段；长业务指引仍计入模型上下文与正常压力处理。
 - `context.assemble` / `compaction.before` 会改变模型看到的上下文并使提示词缓存前缀失效，必须同时声明权限 `contextRewrite: ["history"]`，并且清单里有且仅当有这类钩子时才声明它。改写提案要经 daemon 校验，被拒绝或扩展失败时保留原生视图；改写**不持久化**，每个新步骤都会重新征询。
 - 期限：清单里 `deadlineMs` 取 1–30000 毫秒，省略时默认 5 秒；实际生效的上限 guard 为 30 秒、advise 为 15 秒，超出按上限截断。
 - 钩子和 observe 回调里**不能**启动模型、工具、任务、通知或提问（见第 10 节“调用规则”）。
@@ -425,7 +425,7 @@ await api.command('stats', async (input, ctx) => `共 ${input.text.length} 个�
 
 ### 调用规则
 
-- `resource` 与 `settings` 在 `activate` 期间也可以调用。
+- `resource` 与 `settings` 在 `activate` 及钩子内也可以调用；实例级读取仍核对当前授权。钩子身份用于取消和诊断，不授予工具／命令的业务租约。
 - 其余服务（模型、会话快照、通知、提问、工具、子任务）**只能在仍然活动的工具、命令或作业处理器里调用**；在钩子或 observe 回调里调用会立刻失败（`ReentryDenied`）。
 - 处理器被取消、超时或所属 Turn 停止后，仍在途的服务调用会被取消。
 - 失败是带 `kind` 的异常：

@@ -60,7 +60,10 @@ export function createRegisteredSettings(api, namespaces = [], emit = () => {}) 
       entries.set(ns, entry);
       try { get(entry); } catch (error) { entries.delete(ns); throw error; }
       ctx.effect(() => () => { if (entries.get(ns) === entry) entries.delete(ns); });
-      return Object.freeze({ get: () => get(entry) });
+      return Object.freeze({
+        get: () => get(entry),
+        update: patch => { get(entry); return this.update(ns, patch); },
+      });
     },
     get(ns) { return entries.has(ns) ? get(entries.get(ns)) : undefined; },
     update(ns, patch) { return change(ns, value => ({ ...value, ...clone(patch) })); },

@@ -1,5 +1,6 @@
 // DSH 运行期适配器。上游原包执行真实 Cordis；业务与贡献准入由 Magi daemon 裁决。
 import { installSkills } from './skills.mjs';
+import { installPromptContributions } from './prompt.mjs';
 import { Context, Service } from '@deepseek-ai/cordis';
 import { pathToFileURL } from 'node:url';
 import { deepEqual, volatileEntries, updateVolatile } from '@deepseek-ai/cosmokit';
@@ -28,7 +29,7 @@ const freeze = (value) => {
   if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); }
   return value;
 };
-const LOCAL_EVENTS = new Set(['loader/volatile-update', 'settings/updated', 'llm/adapters-updated', 'llm/models-updated', 'llm/stream', 'tools/change', 'tools/pre-execute', 'tools/execute', 'tools/post-execute', 'tools/result']);
+const LOCAL_EVENTS = new Set(['loader/volatile-update', 'settings/updated', 'llm/adapters-updated', 'llm/models-updated', 'llm/stream', 'tools/change', 'tools/pre-execute', 'tools/execute', 'tools/post-execute', 'tools/result', 'system-prompt/change']);
 // DSH 的可选兼容分支会在 Magi 不提供对应事实时仍登记监听器。静态翻译报告
 // 已把这些事件标成 partial/optional；运行期必须保留“无事件可收”的降级，而不是
 // 因为一个可选 UI/会话观察器把整个插件判为失败。
@@ -282,6 +283,10 @@ export async function activateDsh(api, module, options) {
     fileHostPath() { return undefined; }
   });
   await installSkills(ctx, skill => catalog.register('skills', skill));
+  if (options.promptContributions) {
+    const contribute = await installPromptContributions(ctx);
+    await api.on('prompt.contribute', (event, context) => withProfile(() => contribute(event, context), context.signal));
+  }
   await ctx.plugin(LlmRuntime);
 
   // 路由在 daemon 已完成插件准入后才到达此连接。插件目录每次读 daemon，

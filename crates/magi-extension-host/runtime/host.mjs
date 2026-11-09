@@ -96,7 +96,9 @@ function rpcError(kind, message) {
 function request(method, params, independent = false) {
   const context = invocationContext.getStore();
   if (context?.signal.aborted) return Promise.reject(Object.assign(new Error('调用已取消'), { kind: 'Cancelled' }));
-  if (!independent && context) params = { ...params, invocationId: context.invocationId };
+  // 钩子身份只关联取消与诊断，不是工具／命令的业务租约。实例级读取仍经
+  // daemon 授权；业务服务缺少租约时由 HostHandler 明确拒绝重入。
+  if (!independent && context && !context.hookId) params = { ...params, invocationId: context.invocationId };
   const id = `h${nextId++}`;
   return new Promise((resolve, reject) => {
     if (pending.size >= 256) return reject(Object.assign(new Error('挂起请求过多'), { kind: 'Backpressure' }));

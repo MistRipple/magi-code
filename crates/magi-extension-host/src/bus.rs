@@ -536,6 +536,7 @@ impl ExtensionBus {
                     });
                 }
                 Err(error) => {
+                    tracing::warn!(%plugin, hook, kind = ?error.kind(), %error, "扩展钩子调用失败");
                     slot.breaker
                         .lock()
                         .expect("breaker poisoned")

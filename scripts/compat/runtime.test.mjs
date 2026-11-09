@@ -25,7 +25,7 @@ function host(value = {}) {
   let revision = 0;
   let snapshot = { version: 0, value };
   let listener, validate;
-  const state = { catalog: {}, tools: new Map(), commands: new Map(), routes: new Map(), models: new Map(), failures: [], logs: [], outcomes: [] };
+  const state = { catalog: {}, tools: new Map(), commands: new Map(), routes: new Map(), models: new Map(), hooks: new Map(), failures: [], logs: [], outcomes: [] };
   const bind = (kind) => async (id, handler) => {
     assert.ok(state.catalog[kind].some((item) => item.id === id));
     state[kind].set(id, handler);
@@ -38,6 +38,7 @@ function host(value = {}) {
       return { revision: ++revision };
     } },
     tool: bind('tools'), command: bind('commands'),
+    async on(name, handler) { state.hooks.set(name, handler); },
     toolResult(output, options) { state.outcomes.push({ output, options }); return output; },
     async route(path, handler) { state.routes.set(path, handler); return () => state.routes.delete(path); },
     modelSource: {
@@ -68,6 +69,38 @@ function host(value = {}) {
 }
 
 const options = { runtimeVersion: 2, plugin: 'fixture' };
+
+test('提示贡献沿真实注册表保持顺序、插值、运行中切换和 effect 撤销，预算失败不提交部分指引', async t => {
+  const h = host(); let context, release, text = '第一轮';
+  const running = await activateDsh(h.api, { inject: ['systemPrompt'], apply(ctx) {
+    context = ctx;
+    ctx.systemPrompt.variable('value', () => text);
+    ctx.systemPrompt.section({ name: 'last', order: 2, text: '{{value}}' });
+    ctx.systemPrompt.section({ name: 'literal', order: 1, text: '{{literal}}', interpolate: false });
+    release = ctx.systemPrompt.section({ name: 'first', order: 0, text: () => '😀'.repeat(40_000) });
+  } }, { ...options, promptContributions: true });
+  t.after(() => running.dispose());
+  const invoke = (phase = 'round', max = 128 * 1024, signal = new AbortController().signal) =>
+    h.state.hooks.get('prompt.contribute')({ phase, round: 1, budget: { maxFragmentChars: max, maxTotalChars: max } }, { signal });
+  assert.deepEqual(await invoke('start'), { decision: 'continue' });
+  const result = await invoke();
+  assert.equal(result.patch.fragments[0].text, '😀'.repeat(40_000) + '\n\n{{literal}}\n\n第一轮');
+  assert.equal(result.patch.fragments[0].stability, 'volatile');
+  assert.ok(!result.patch.fragments[0].text.includes('powered by DeepSeek Harness'));
+  await assert.rejects(invoke('round', 10), /未截断或提交部分指引/);
+  await release(); text = '下一轮';
+  assert.equal((await invoke()).patch.fragments[0].text, '{{literal}}\n\n下一轮');
+  assert.throws(() => context.systemPrompt.section({ name: 'last', order: 3, text: 'duplicate' }), /already registered/);
+  assert.throws(() => context.systemPrompt.section({ name: 'complete', order: 0, text: 'replace', complete: true }), /完整系统提示/);
+  const invalid = context.systemPrompt.section({ name: 'async', order: 9, text: async () => 'not synchronous' });
+  await assert.rejects(invoke(), /同步返回字符串/); await invalid();
+  const { createScope } = await import('@deepseek-ai/dsh-scope');
+  const scope = createScope(context, {});
+  assert.throws(() => scope.ctx.systemPrompt.section({ name: 'scoped', order: 1, text: 'local' }), /局部指引/);
+  await scope.dispose();
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(invoke('round', 100, controller.signal), { name: 'AbortError' });
+});
 
 test('命令与工具读取同一 daemon 调用的会话身份和执行目录，并发、配置替换与取消不串用投影', async (t) => {
   const h = host({ label: 'first' });
@@ -152,15 +185,17 @@ test('设置命名空间可在配置重载后动态出现，资源授权与 CAS 
       return snapshot = { version: version + 1, value: structuredClone(value) };
     },
   } }, true);
-  const cleanup = [], ctx = { effect: callback => cleanup.push(callback()) };
+  const cleanup = [], ctx = { effect: callback => cleanup.push(callback()) }; let retained;
   await settings.run(async () => {
     const late = settings.register(ctx, 'runtime-selected', Schema.object({ enabled: Schema.boolean().default(true) }));
-    await settings.update('runtime-selected', { enabled: false }); assert.equal(late.get().enabled, false);
+    retained = late;
+    await late.update({ enabled: false }); assert.equal(late.get().enabled, false);
     fail = true;
   });
   await assert.rejects(settings.run(() => settings.update('runtime-selected', { enabled: true })), /permission revoked/);
   assert.equal(settings.get('runtime-selected').enabled, false);
   for (const release of cleanup) release();
+  assert.throws(() => retained.update({ enabled: true }), /注册已失效/);
   assert.equal(settings.get('runtime-selected'), undefined);
   await settings.dispose();
   const denied = createRegisteredSettings({}, false);

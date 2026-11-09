@@ -185,11 +185,12 @@ test('原包封装只观察默认启动，扫描与运行共用条件导出，�
     main: 'unused.js', exports: { '.': { node: { import: './index.js' }, default: './unused.js' }, './client': './client.js' },
     peerDependencies: { '@deepseek-ai/cordis': '4.1.0' } });
   await writeFile(join(upstream, 'index.js'), `
-    export const inject = ['hmr'];
+    export const inject = ['hmr', 'systemPrompt'];
     export const Config = value => ({ enabled: false, ...value });
     Config.toJSON = () => ({ uid: 1, refs: { 1: { type: 'object', dict: { enabled: 2 } }, 2: { type: 'boolean', meta: { default: false } } } });
     export function apply(ctx, config) {
       if (typeof ctx.hmr.reconcileProfile !== 'function') throw new Error('profile 重载服务缺失');
+      ctx.systemPrompt.section({name:'business-guide',order:80,text:'Real business guide'.repeat(2000)});
       if (config.enabled) throw new Error('安装期不能改写作者默认配置');
       ctx.inject(['settings'], c => { if (config.enabled) c.settings.register('late', value => value ?? {}); });
     }
@@ -209,6 +210,7 @@ test('原包封装只观察默认启动，扫描与运行共用条件导出，�
     const result = await prepareDsh({ upstreamDir: upstream, outDir, sharedRoot, source: { integrity: 'contract' } });
     assert.deepEqual(result.manifest.contributions.tools, []);
     assert.deepEqual(result.manifest.contributions.commands, []);
+    assert.deepEqual(result.manifest.extension.hooks, [{ name: 'prompt.contribute', mode: 'advise' }]);
     assert.ok(result.manifest.permissions.some(permission => permission.kind === 'storage' && permission.targets.includes('dsh-registered-settings')));
     assert.deepEqual(result.manifest.permissions.find(permission => permission.kind === 'pluginManagement').targets, ['lifecycle', 'background'], '单独重载只声明生命周期授权');
     assert.equal(await readFile(join(outDir, 'ui/client.js'), 'utf8'), client);
@@ -216,6 +218,7 @@ test('原包封装只观察默认启动，扫描与运行共用条件导出，�
     assert.ok((await readFile(join(outDir, 'ui/ui-primitives.js'))).length > 0);
     assert.equal(result.report.variants, undefined);
     assert.match(await readFile(join(outDir, 'extension/index.mjs'), 'utf8'), /settingsNamespaces":true/);
+    assert.match(await readFile(join(outDir, 'extension/index.mjs'), 'utf8'), /promptContributions":true/);
     const { packPlugin } = await import('./core/pack.mjs');
     const archive = join(root, `${name}.zip`); packPlugin(outDir, archive); prepared.push(await readFile(archive));
   }

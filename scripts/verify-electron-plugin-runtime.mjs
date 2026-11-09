@@ -112,10 +112,11 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 const require = createRequire(import.meta.url);
 export const name = 'magi-runtime-acceptance';
-export const inject = ['commands', 'tools', 'llm', 'attachments', 'webServer', 'sessions', 'skills'];
+export const inject = ['commands', 'tools', 'llm', 'attachments', 'webServer', 'sessions', 'skills', 'systemPrompt'];
 export const Config = Schema.object({ label: Schema.string().default('initial'), enabled: Schema.boolean().default(true) });
 export function apply(ctx, config) {
   let skillRequest;
+  ctx.systemPrompt.section({name:'business-guide',order:80,text:'RUNTIME_PROMPT:'+config.label+'\\n'+'业务指引🙂'.repeat(17_000)+'\\nRUNTIME_PROMPT_END'});
   const toolOutcomes=[];
   ctx.webServer.register({path:'/tool-outcomes',resource:()=>Response.json(toolOutcomes)});
   ctx.skills.register({name:'runtime-inspection',description:'Inspect the current runtime',content:'RUNTIME_SKILL_BODY:'+config.label,source:'runtime'});
@@ -203,7 +204,7 @@ export function apply(ctx, config) {
       skillRequest = JSON.stringify(request);
       let text = 'DSH_MODEL:' + config.label;
       const lastUser = request.messages.findLast(message=>message.role==='user'
-        && message.content.some(block=>block.type==='text' && !block.text.startsWith('<magi-context-fragment ')));
+        && message.content.some(block=>block.type==='text' && !/^<magi-(?:context|extension)-fragment /.test(block.text)));
       const lastTool = request.messages.findLast(message=>message.role==='tool');
       const directoryCheck = lastUser?.content.some(block=>block.type==='text' && block.text.includes('DIRECTORY_TOOL_CHECK'));
       const directoryResult = lastTool && JSON.stringify(lastTool.content).includes('TOOL_DIRECTORY:');
@@ -1322,6 +1323,13 @@ try {
   const chat = await post('/api/session/turn', { scope: 'personal', sessionId: session, text: 'runtime model check', requestId: 'runtime-model', userMessageId: 'runtime-model-user' });
   const modelTurn = await waitTurn(chat.turnId);
   reporter.check('主对话通过插件模型桥与真实 DSH 适配器完成流式回复', modelTurn.status === 'completed' && JSON.stringify(modelTurn).includes('DSH_MODEL:changed'), JSON.stringify(modelTurn));
+  const promptRequest = JSON.parse((await post(`/api/plugins/${pluginId}/routes`, {method:'GET',path:'/skill-request'})).body.request);
+  const prompt = promptRequest.messages.flatMap(message => message.content.map(block => ({role:message.role,...block})))
+    .find(block => block.type==='text' && block.text.startsWith('<magi-extension-fragment ') && block.text.includes('id="dsh-sections"'));
+  await writeFile(join(output,'prompt-model-request.json'),JSON.stringify(promptRequest,null,2));
+  reporter.check('超过八万字符的业务指引完整进入真实模型请求并保留来源，配置替换不复用旧片段', prompt?.role==='user'
+    && prompt.text.includes('trust="reference"') && prompt.text.includes('RUNTIME_PROMPT:changed\n'+'业务指引🙂'.repeat(17_000)+'\nRUNTIME_PROMPT_END')
+    && !prompt.text.includes('RUNTIME_PROMPT:initial'), JSON.stringify({found:Boolean(prompt),role:prompt?.role,bytes:prompt?Buffer.byteLength(prompt.text):0,pluginId,pluginIdLength:pluginId.length}));
   await openConversation(session);
   await waitFor(() => page.evaluate('document.body.innerText.includes("DSH_MODEL:changed")'), '回执显示');
   await snapshot('conversation');

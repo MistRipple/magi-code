@@ -267,7 +267,7 @@ pub const HOOKS: &[HookSpec] = &[
         modes: ADVISE,
         wired: ADVISE,
         replace: true,
-        patch_limit: 256 * KIB,
+        patch_limit: 1024 * KIB,
     },
     HookSpec {
         name: "context.assemble",

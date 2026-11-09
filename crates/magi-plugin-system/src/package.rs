@@ -339,10 +339,7 @@ fn validate_manifest_with_limits(
     if manifest.sdk_version != 2 || manifest.data_schema_version < 1 {
         return Err(invalid("仅支持 SDK 2，数据格式版本必须为正整数"));
     }
-    if manifest.id.len() > 96
-        || manifest.id.split('.').count() < 2
-        || !manifest.id.split('.').all(valid_id)
-    {
+    if !valid_plugin_id(&manifest.id) {
         return Err(invalid("插件 ID 必须包含有效的作者命名空间"));
     }
     if manifest.version.len() > 64
@@ -621,6 +618,11 @@ fn reject_external_references(value: &serde_json::Value) -> Result<(), PluginErr
         _ => {}
     }
     Ok(())
+}
+
+/// 安装与运行期贡献使用同一插件身份合同，不能借贡献 ID 的长度限制裁剪插件身份。
+pub fn valid_plugin_id(id: &str) -> bool {
+    id.len() <= 96 && id.split('.').count() >= 2 && id.split('.').all(valid_id)
 }
 
 fn valid_id(id: &str) -> bool {

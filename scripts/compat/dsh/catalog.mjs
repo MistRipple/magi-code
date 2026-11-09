@@ -60,7 +60,8 @@ export const DSH_RULES = [
   rule('calls', /^ctx\.llm(\.|$)/, { capability: 'modelSource.publish', fidelity: 'partial', note: '其余 llm 服务（stream/prepareCall 等）不对扩展开放，调用会被拒绝', source: ADAPTER }),
 
   // —— 拦截类扩展点 ——
-  rule('calls', /^ctx\.systemPrompt(\.|$)/, { capability: 'hook.prompt.contribute', fidelity: 'partial', note: 'section() 可映射为带稳定性与预算的参考片段；作用域内遮蔽（shadowing）与顺序控制无对应', source: COOKBOOK, needs: '片段排序/遮蔽（会削弱“不得伪造原生系统段”不变量，不建议）' }),
+  rule('calls', /^ctx\.systemPrompt(\.(section|variable|getSectionOrder))?$/, { fixed: 'shim', group: 'prompt', target: 'daemon 每轮提示贡献', note: '真实 DSH 注册表维护本插件片段顺序、变量与 effect；每轮按 daemon 预算提交完整参考资料，不替换原生系统提示。完整提示替换和 Agent 局部作用域明确拒绝', source: src('packages/core/system-prompt/README.md') }),
+  rule('calls', /^ctx\.systemPrompt\./, { capability: 'hook.prompt.contribute', fidelity: 'partial', note: '动态上下文、完整装配和工具目录等其余能力尚未接入；不改写原生提示或运行上下文', source: src('packages/core/system-prompt/README.md') }),
 
   // —— 会话、消息、附件：Magi 内核独有 ——
   rule('calls', /^ctx\.(agents|sessionPersistence|subagents)(\.|$)/, { capability: 'service.spawn', fidelity: 'none', group: 'session', note: '会话/Agent 对象由 Magi 内核独有；扩展只能经钩子与宿主服务提案', source: COOKBOOK, needs: '无；与“Rust daemon 是唯一事实源”冲突' }),
@@ -89,7 +90,7 @@ export const DSH_RULES = [
   rule('injects', /^(attachments)$/, { fixed: 'shim', group: 'runtime', target: 'Magi 持久私有图片服务', note: '保存与读取受独立授权和活动实例限制；模型请求图片仍属于调用期', source: COOKBOOK }),
   rule('injects', /^(sessions)$/, { fixed: 'shim', group: 'session', target: 'daemon 调用期的后端会话服务', note: '命名空间可用；具体 Session 方法仍逐项检查，不把服务出现视为完整支持', source: COOKBOOK }),
   rule('injects', /^(commands)$/, { capability: 'command.register', fidelity: 'full', source: COOKBOOK }),
-  rule('injects', /^(systemPrompt)$/, { capability: 'hook.prompt.contribute', fidelity: 'partial', note: '只能追加带稳定性与预算的参考片段；遮蔽与顺序控制无对应', source: COOKBOOK }),
+  rule('injects', /^systemPrompt$/, { fixed: 'shim', group: 'prompt', target: 'daemon 每轮提示贡献', note: '提供本插件的 section、variable 与 getSectionOrder；其他方法与字段逐项校验，不声称拥有 Magi 系统提示', source: src('packages/core/system-prompt/README.md') }),
   rule('injects', /^(webServer|server)$/, { capability: 'ui.route', fidelity: 'full', note: '路由注册由 Magi 的 api.route 承载；见 ctx.webServer.register', source: src('packages/host/webserver/README.md') }),
   rule('injects', /^(sessionProjections|attachments|agents|sessions|sessionPersistence|subagents|messages|memory|goals|compaction|approval|sandbox)$/, { capability: 'service.snapshot', fidelity: 'none', group: 'session', note: 'Magi 内核独有', source: COOKBOOK }),
   rule('injects', /^(slots|locale|configForms)$/, { capability: 'ui.native', fidelity: 'partial', group: 'ui', note: '见 ctx.slots：设置位置原生挂载，DSH 外壳其他位置不渲染', source: SETTINGS }),
@@ -99,6 +100,7 @@ export const DSH_RULES = [
   // —— 事件 ——
   rule('events', /^loader\/volatile-update$/, { fixed: 'shim', group: 'settings', target: 'config.changed 通知', note: '配置热更新；兼容层已接', source: SETTINGS }),
   rule('events', /^settings\/updated$/, { fixed: 'shim', group: 'settings', target: 'config.changed 通知', note: '映射为插件设置更新通知', source: SETTINGS }),
+  rule('events', /^system-prompt\/change$/, { fixed: 'shim', group: 'prompt', target: '本插件真实 DSH 注册表变化', source: src('packages/core/system-prompt/README.md') }),
   rule('events', /^plugin-manager\//, { fixed: 'shim', group: 'runtime', target: '插件管理器只读事件镜像', note: '事件只用于面板进度展示；Magi 安装事实仍由 daemon 拥有', source: COOKBOOK }),
   rule('events', /^tools\/pre-execute$/, { capability: 'hook.tool.call', fidelity: 'partial', note: 'deny→block；改参→replace（Magi 重验 schema 与权限）。allow/ask 无对应：扩展不能批准或发起审批，ask 由 Magi 原生审批接管', source: PIPELINE, needs: '无；扩展只能阻止不能批准是不变量' }),
   rule('events', /^tools\/post-execute$/, { capability: 'hook.tool.result', fidelity: 'partial', note: '可替换/阻止模型可见投影；DSH 的“附加上下文”“替换 value”无对应，原始回执不可改', source: TOOL, needs: '无；原始回执不变是不变量' }),
@@ -135,6 +137,7 @@ export const DSH_RULES = [
   rule('imports', /^@deepseek-ai\/dsh-(atomic-write|home-paths)$/, { fixed: 'bundled', group: 'runtime', target: '文件与目录工具，随包打入' }),
   rule('imports', /^@deepseek-ai\/dsh-util-(workspace-path|code-language)$/, { fixed: 'bundled', group: 'runtime', target: '上游纯函数工具库，随包携带' }),
   rule('imports', /^@deepseek-ai\/dsh-settings$/, { capability: 'settings.schema', fidelity: 'full', source: SETTINGS }),
+  rule('imports', /^@deepseek-ai\/dsh-system-prompt$/, { fixed: 'bundled', group: 'prompt', target: '真实上游提示注册表与纯渲染函数', note: '注册表只承载本插件贡献；Magi 提示最终由 daemon 接纳', source: src('packages/core/system-prompt/README.md') }),
   rule('imports', /^@deepseek-ai\/dsh-attachment$/, { capability: 'service.snapshot', fidelity: 'none', group: 'session', note: '附件由 Magi 原生拥有', source: src('packages/attachment/attachment/README.md') }),
   rule('imports', /^@deepseek-ai\/schemastery$/, { fixed: 'bundled', group: 'settings', target: '纯 JS，构建期打包' }),
   rule('imports', /^@deepseek-ai\/cordis\/package\.json$/, { fixed: 'bundled', group: 'runtime', target: '当前原包实际使用的 Cordis peer 元数据', note: '与主入口共用同一依赖解析，不从宿主猜造版本', source: src('vendor/cordis/package.json') }),

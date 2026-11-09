@@ -228,8 +228,8 @@ pub struct ContributeView<'a> {
 }
 
 /// 单个片段与单阶段总量的字符上限：超限的片段整体丢弃，不截断（半截指令比没有更糟）。
-pub const MAX_CONTRIBUTION_FRAGMENT_CHARS: usize = 8 * 1024;
-pub const MAX_CONTRIBUTION_TOTAL_CHARS: usize = 16 * 1024;
+pub const MAX_CONTRIBUTION_FRAGMENT_CHARS: usize = 128 * 1024;
+pub const MAX_CONTRIBUTION_TOTAL_CHARS: usize = 128 * 1024;
 
 fn contribution_ident_ok(value: &str) -> bool {
     !value.is_empty()
@@ -256,7 +256,7 @@ pub(crate) fn accept_contributions(
         .into_iter()
         .filter(|item| {
             let ok = item.stability == expected
-                && contribution_ident_ok(&item.plugin_id)
+                && magi_plugin_system::valid_plugin_id(&item.plugin_id)
                 && contribution_ident_ok(&item.fragment_id)
                 && !item.text.trim().is_empty()
                 && item.text.chars().count() <= MAX_CONTRIBUTION_FRAGMENT_CHARS
@@ -1005,7 +1005,51 @@ mod tests {
             ],
             ContributePhase::Start,
         );
-        assert_eq!(budgeted.len(), 2, "16K 预算只容得下两个 8K 片段");
+        assert_eq!(
+            budgeted.len(),
+            1,
+            "单阶段预算不因贡献数量增加，放不下的完整片段被拒绝"
+        );
+
+        let unicode = "🙂".repeat(73_500);
+        let accepted = accept_contributions(
+            vec![contribution("a.plugin", "long-guide", 0, &unicode)],
+            ContributePhase::Start,
+        );
+        assert_eq!(
+            accepted.len(),
+            1,
+            "字符预算不能误用 UTF-8 字节数拒绝完整业务指引"
+        );
+        assert!(accepted[0].content.as_ref().unwrap().contains(&unicode));
+        let plugin_id = format!("a.{}", "b".repeat(94));
+        assert_eq!(plugin_id.len(), 96);
+        assert_eq!(
+            accept_contributions(
+                vec![contribution(
+                    &plugin_id,
+                    "guide",
+                    0,
+                    "完整插件身份的业务指引"
+                )],
+                ContributePhase::Start,
+            )
+            .len(),
+            1,
+            "插件身份沿正式安装合同，不误用片段 ID 的 64 字符限制"
+        );
+        assert!(
+            accept_contributions(
+                vec![contribution(
+                    "a.plugin",
+                    "oversized",
+                    0,
+                    &"x".repeat(MAX_CONTRIBUTION_FRAGMENT_CHARS + 1)
+                )],
+                ContributePhase::Start,
+            )
+            .is_empty()
+        );
     }
 
     #[test]

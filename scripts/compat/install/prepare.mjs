@@ -128,11 +128,14 @@ export async function prepareDsh(options) {
     manifest.permissions.find(permission => permission.kind === 'storage').targets.push(REGISTERED_SETTINGS_RESOURCE);
     manifest.contributions.resources = [{ id: REGISTERED_SETTINGS_RESOURCE, title: 'DSH 设置', description: '由 daemon 持久化的插件命名空间设置' }];
   }
+  const promptContributions = inspection.entries.some(entry => ['systemPrompt', '@deepseek-ai/dsh-system-prompt'].includes(entry.name) || /^ctx\.systemPrompt(?:\.|$)/.test(entry.name))
+    || Object.hasOwn(inspection.serviceReads, 'systemPrompt');
+  if (promptContributions) manifest.extension.hooks.push({ name: 'prompt.contribute', mode: 'advise' });
   mkdirSync(options.outDir, { recursive: true });
   const kept = copyTree(root, options.outDir);
   const compatRuntimeId = compatibility.runtimeId;
   const optionalEvents = inspection.entries.filter(item => item.kind === 'events' && item.optional).map(item => item.name);
-  writeFileSync(join(options.outDir, 'extension/index.mjs'), `import { activateDsh } from '@magi/compat-dsh';\nimport * as upstream from ${JSON.stringify(`./upstream/${main}`)};\nexport default api => activateDsh(api, upstream, ${JSON.stringify({ runtimeVersion: TRANSLATOR_VERSION, plugin: pkg.name, runtimeId: compatRuntimeId, optionalEvents, readSessionDirectory, settingsNamespaces: registeredSettings })});\n`);
+  writeFileSync(join(options.outDir, 'extension/index.mjs'), `import { activateDsh } from '@magi/compat-dsh';\nimport * as upstream from ${JSON.stringify(`./upstream/${main}`)};\nexport default api => activateDsh(api, upstream, ${JSON.stringify({ runtimeVersion: TRANSLATOR_VERSION, plugin: pkg.name, runtimeId: compatRuntimeId, optionalEvents, readSessionDirectory, settingsNamespaces: registeredSettings, promptContributions })});\n`);
   mkdirSync(join(options.outDir, 'ui'), { recursive: true });
   copyFileSync(join(COMPAT_DIR, 'dist/dsh-client-host.js'), join(options.outDir, 'ui/host.js'));
   let clientAnalysis = null;

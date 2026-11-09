@@ -66,7 +66,7 @@ daemon 响应形状：
 - 工具／命令调用使用插件＋代次＋递增序号形成独立身份；相同 caller 身份的并发调用可独立取消。
 - `owner` 描述实际 Session／Turn／Task／worker；插件命令由原生 Task 调度并携带实际 Task／worker 身份，停止与结果提交均核对该任务的当前租约。是否能调用其他原生服务仍由其权限及策略独立判断。
 - 作业增加 `ctx.job={jobId,scheduleId,budget}`，仍拥有 canonical Turn。预算由 daemon 签发。
-- Node 以 AsyncLocalStorage 随反向请求携带 `invocationId`；daemon 从当前连接租约补入内部上下文，拒绝扩展自报下划线字段。
+- Node 以 AsyncLocalStorage 随业务处理器的反向请求携带 `invocationId`；daemon 从当前连接租约补入内部上下文，拒绝扩展自报下划线字段。钩子的 `hookId`／`invocationId` 只关联本次钩子及取消，不是业务租约；实例级资源、设置与已授权目录读取不携带该身份，仍核对当前连接及授权，模型、工具等业务服务继续拒绝重入。
 - 结束、取消和超时使租约失效。失效租约拒绝新业务服务；迟到响应不得写入下一轮。
 - `binding` 是业务归属，不是文件系统访问限制。插件直接 OS 行为仍以用户权限运行。
 
@@ -222,7 +222,7 @@ DSH 页面里的 `EventSource` 通过相同路由调用承载 SSE。兼容层保
 
 实际调用链见设计文档第 5.6 节及 [`extension_bridge.rs`](../crates/magi-daemon/src/daemon/extension_bridge.rs)。工具钩子作用于有工具的 Task 管线，不能据此声称纯 conversation 会执行工具。
 
-提示片段每条最多 8K 字符、每阶段总计 16K 字符；start 仅 stable 并冻结，round 仅 volatile 并放在尾部。来源由 daemon 注入，不能伪造原生系统段。历史投影 patch 最多 64 KiB；模型可见原文逐条截断且总量有界。历史改写与自定义摘要必须有独立 `contextRewrite:["history"]` 授权；原始会话不被替换，改写来源与缓存归因进入 ModelStep，界面显示通知。
+提示片段每条及每阶段总计最多 128K Unicode 字符，实际限额通过 `budget` 返回，超限整条拒绝、不截断；提示补丁 JSON 传输最多 1 MiB。start 仅 stable 并冻结，round 仅 volatile 并放在尾部。来源由 daemon 注入，不能伪造原生系统段；长业务指引仍计入正常模型上下文与压力处理。历史投影 patch 最多 64 KiB；模型可见原文逐条截断且总量有界。历史改写与自定义摘要必须有独立 `contextRewrite:["history"]` 授权；原始会话不被替换，改写来源与缓存归因进入 ModelStep，界面显示通知。
 
 ## 7. 租约与重入
 

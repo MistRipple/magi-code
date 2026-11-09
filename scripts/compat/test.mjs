@@ -309,12 +309,12 @@ test('默认静态检查与在线安装共用完整业务准入，分项诊断�
   const root = mkdtempSync(join(tmpdir(), 'magi-admission-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'admission-test', version: '1.0.0', main: 'index.js', dsh: { bundle: {} } }));
-  writeFileSync(join(root, 'index.js'), 'export function apply(ctx) { ctx.systemPrompt.section({ name: "business", order: 1, text: "Required business instructions" }); }');
+  writeFileSync(join(root, 'index.js'), 'export function apply(ctx) { ctx.systemPrompt.context({ name: "business", order: 1, text: "Required runtime context" }); }');
   const run = (...flags) => spawnSync(process.execPath, [cli, 'inspect', root, ...flags], { encoding: 'utf8' });
   const defaultCheck = run('--json');
   assert.equal(defaultCheck.status, 1, defaultCheck.stderr);
-  assert.ok(JSON.parse(defaultCheck.stdout).verdict.blocked.some(entry => entry.name === 'ctx.systemPrompt.section'));
-  await assert.rejects(prepareDsh({ upstreamDir: root, outDir: join(root, 'prepared'), sharedRoot: dirname(cli), source: { integrity: 'sha512-test' } }), /ctx\.systemPrompt\.section/);
+  assert.ok(JSON.parse(defaultCheck.stdout).verdict.blocked.some(entry => entry.name === 'ctx.systemPrompt.context'));
+  await assert.rejects(prepareDsh({ upstreamDir: root, outDir: join(root, 'prepared'), sharedRoot: dirname(cli), source: { integrity: 'sha512-test' } }), /ctx\.systemPrompt\.context/);
   assert.equal(existsSync(join(root, 'prepared')), false, '静态阻塞在依赖获取与生成安装产物之前拒绝');
   const diagnostic = run('--require', 'llm');
   assert.equal(diagnostic.status, 0, diagnostic.stderr);

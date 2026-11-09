@@ -293,6 +293,10 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 `node scripts/compat/cli.mjs inspect <原包目录> --kind dsh --json` 默认与在线安装采用同一完整业务静态准入；`--require` 仅供分项诊断，不能据成功退出推导原包可安装或实际业务通过。`npm run test:compat` 同时覆盖默认 CLI／安装准备对同一必需能力的拒绝及超过 64 KiB 管道输出的完整性。静态检查不会执行原包，不能代替目录包验收。
 
+`test:electron-plugin-runtime` 的公共提示合同使用原有运行时夹具，注册超过八万字符、JSON 补丁超过 256 KiB 的业务指引，经真实 daemon 每轮贡献及插件模型桥核对最终模型请求、完整原文、来源角色和配置替换。`test:compat` 同时验证提示注册、排序、变量插值、撤销、取消、过期设置句柄与预算失败；Rust 接纳点按 Unicode 字符验证单片段及总预算。夹具不计入社区原包的完整业务覆盖率。
+
+`cargo test -p magi-extension-host` 包含真实 Node 的提示钩子反向读取回归：实例级配置与资源可读，模型、工具、任务和会话快照仍返回 `ReentryDenied`，拒绝请求不进入 daemon 业务服务。钩子关联身份不冒充业务租约；工具／命令的取消与过期租约回归继续由同一宿主测试覆盖。
+
 `npm run test:electron-plugin-runtime` 可设置 `MAGI_DSH_EXTERNAL_CLI=<真实 dsh 可执行文件路径>`，让在线安装的 Debugging 原包经真实模型工具调用和原生审批检查另一套独立 DSH 目录：外部 CLI 导出配置、执行 schema 检查及判断变更生效方式，Magi 安装状态保持不变。该可选分支需要本机已有的真实 DSH CLI，不提供替身命令；未设置时不计入对应业务证据。
 
 `npm run test:electron-dsh-profile` 在线安装 Mgr 0.2.12，先通过其真实路由验证 `dsh add/remove` 的在线替换与卸载，再经 Magi 原生预览、取消、确认及重新授权更新到固定 0.2.13；随后使用新版原页面完成目标插件启停、故障恢复、在线更新与真实回执、更新／卸载取消、390px 确认、应用重启和卸载。`MAGI_DSH_PROFILE_OUTPUT` 指定证据目录，端口使用 `MAGI_PROFILE_PORT`／`MAGI_PROFILE_CDP_PORT`。旧版路由通过不代表其 Button 页面缺陷已修复；该入口还通过只影响本次候选解析的 registry 代理，使 Mgr 原页面的先移除式更新失败，核对恢复旧摘要、授权和真实运行，并显示恢复说明；在旧版已移除且候选未提交时终止本次应用的 daemon，核对真实翻译进程退出、重启恢复原安装、不重放准备以及原页面显式重试。只验证列出的中断位置，不作为全部掉电阶段或外部副作用可回滚的证明。`test:compat` 另以延迟目录读取验证命令终止后零安装／移除，以及同请求的显式重试。
