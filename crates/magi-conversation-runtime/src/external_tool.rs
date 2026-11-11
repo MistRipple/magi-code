@@ -160,6 +160,9 @@ pub fn builtin_exposed_externally(tool: BuiltinToolName) -> bool {
         | T::AgentCancel
         | T::AgentWait
         | T::AgentApply
+        // 角色管理：持久化 Magi 自己的配置，只通过对话内的 Skill 与用户确认使用。
+        | T::AgentRoleGet
+        | T::AgentRoleSave
         // 目标、计划、记忆、上下文：绑定当前会话的运行态。
         | T::GetGoal
         | T::CreateGoal

@@ -34,6 +34,8 @@ const RUNTIME_INTERNAL_TOOLS = new Set<string>([
   'update_plan',
   'update_execution_steps',
   'memory_write',
+  // 读取角色只是对话内的准备动作；保存角色（agent_role_save）才进入时间线。
+  'agent_role_get',
   // 后端 builtin shell 内部能力（模型不可调用，仅在 shell_exec 内部走子进程协议）
   'process_launch',
   'process_read',

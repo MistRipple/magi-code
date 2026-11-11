@@ -2775,6 +2775,25 @@ fn execute_task_tool_call(
                 .unwrap_or_default();
             let policy =
                 active_skill_tool_execution_policy(access_profile, skill_runtime, skill_name);
+            // 持久化配置类工具只有被激活 Skill 明确声明时才能调用，不能靠“没有限制”放行。
+            if BuiltinToolName::from_name(&tool_call.function.name)
+                .is_some_and(|tool| tool.requires_skill_declaration())
+                && !policy
+                    .allowed_tool_names
+                    .as_ref()
+                    .is_some_and(|names| names.iter().any(|name| name == &tool_call.function.name))
+            {
+                let decision = task_policy_decision_payload(
+                    &tool_call.function.name,
+                    ExecutionResultStatus::Rejected,
+                    format!(
+                        "tool_not_in_allowed_scope: 当前没有声明 {} 的 Skill 处于激活状态",
+                        tool_call.function.name
+                    ),
+                    Some(access_profile),
+                );
+                return Some((decision.payload, decision.status));
+            }
             if let Some(rejection) = policy.tool_name_rejection(&tool_call.function.name) {
                 let decision = task_policy_decision_payload(
                     &tool_call.function.name,
@@ -3124,6 +3143,75 @@ fn execute_task_tool_call(
                 execution_allowed,
             )
             .unwrap_or_else(std::convert::identity);
+        }
+        if canonical == BuiltinToolName::AgentRoleGet {
+            return crate::agent_role_tool::execute_agent_role_get(
+                agent_role_registry,
+                &tool_call.function.arguments,
+            );
+        }
+        if canonical == BuiltinToolName::AgentRoleSave {
+            // 角色是持久的全局配置：无论访问模式如何，保存前都必须由用户逐次确认。
+            let proposal = match crate::agent_role_tool::prepare_agent_role_save(
+                agent_role_registry,
+                &tool_call.function.arguments,
+            ) {
+                Ok(crate::agent_role_tool::RoleSavePreparation::Confirm(proposal)) => proposal,
+                Ok(crate::agent_role_tool::RoleSavePreparation::Unchanged(result)) => {
+                    return result;
+                }
+                Err(result) => return result,
+            };
+            let decision = ToolPreflightDecision {
+                payload: serde_json::json!({
+                    "tool": tool_call.function.name,
+                    "status": "needs_approval",
+                    "error": proposal.summary(),
+                })
+                .to_string(),
+                status: ExecutionResultStatus::NeedsApproval,
+            };
+            if let Err(rejected) = run_with_task_execution_wait(
+                task_store,
+                execution_registry,
+                task,
+                &tool_call.function.name,
+                || {
+                    await_task_tool_approval(
+                        event_bus,
+                        conversation_registry,
+                        task_store,
+                        session_store,
+                        task,
+                        session_id,
+                        workspace_id,
+                        workspace_root_path,
+                        project_directory_map.as_ref(),
+                        tool_call,
+                        &decision,
+                        on_progress,
+                        execution_allowed,
+                    )
+                },
+                execution_allowed,
+            )
+            .and_then(std::convert::identity)
+            {
+                return rejected;
+            }
+            let (result, saved_role_id) =
+                crate::agent_role_tool::commit_agent_role_save(agent_role_registry, proposal);
+            if let Some(role_id) = saved_role_id {
+                let _ = event_bus.publish(EventEnvelope::domain(
+                    EventId::unique("event-agent-role-saved"),
+                    "settings.agent_roles.changed",
+                    serde_json::json!({
+                        "role_id": role_id,
+                        "registry_revision": agent_role_registry.registry_revision(),
+                    }),
+                ));
+            }
+            return result;
         }
         if matches!(canonical, magi_tool_runtime::BuiltinToolName::MemoryWrite) {
             return magi_project_memory::execute_memory_write_tool(
@@ -5942,6 +6030,123 @@ mod tests {
         )
         .expect("project memory write should remain blocked in read-only mode");
         assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+    }
+
+    /// 角色工具的执行级保护：没有声明它的 Skill、只读模式、无效参数、未获确认都不能写入角色。
+    #[test]
+    fn role_save_never_writes_without_a_declaring_skill_and_a_user_confirmation() {
+        let dir = tempdir().unwrap();
+        let roles = magi_agent_role::AgentRoleRegistry::builtin()
+            .with_user_role_dir(dir.path().join("roles"));
+        let bus = InMemoryEventBus::new(16);
+        let tasks = TaskStore::new();
+        let sessions = SessionStore::new();
+        let execution = TaskExecutionRegistry::default();
+        let conversations = ConversationRegistry::new();
+        let session = SessionId::new("role-save-guard");
+        sessions
+            .create_session(session.clone(), "role save")
+            .unwrap();
+        let plans = magi_plan::PlanStore::from_store(&sessions, session.clone());
+        let skill_runtime = magi_skill_runtime::SkillRuntime::new({
+            let registry = magi_skill_runtime::SkillRegistry::new();
+            registry.register(magi_skill_runtime::SkillDefinition {
+                description: String::new(),
+                skill_id: "role-skill".to_string(),
+                title: "role".to_string(),
+                instruction: "管理角色。".to_string(),
+                metadata: magi_skill_runtime::SkillMetadata {
+                    category: "agent".to_string(),
+                    tags: vec![],
+                },
+                restrict_standard_tools: true,
+                allowed_tools: vec!["agent_role_get".into(), "agent_role_save".into()],
+                custom_tool_bindings: vec![],
+                prompt_priority: 50,
+            });
+            registry
+        });
+        let valid = serde_json::json!({
+            "role_id": "data-analyst", "display_name": "数据分析师",
+            "description": "分析数据", "system_prompt": "你负责分析数据。",
+            "capabilities": ["general_engineering"],
+        });
+        let invoke =
+            |policy: TaskPolicy, skill: Option<&str>, name: &str, arguments: serde_json::Value| {
+                let mut task = coordinator_task(test_task("role-root", "role-root", None));
+                task.policy_snapshot = Some(policy);
+                execute_task_tool_call(
+                    &bus,
+                    None,
+                    &roles,
+                    Some(&skill_runtime),
+                    None,
+                    skill,
+                    &tasks,
+                    &sessions,
+                    &execution,
+                    &conversations,
+                    None,
+                    &plans,
+                    None,
+                    &task,
+                    &session,
+                    &None,
+                    None,
+                    None,
+                    None,
+                    &ChatToolCall {
+                        id: format!("role-call-{name}"),
+                        kind: "function".into(),
+                        function: ChatToolFunction {
+                            name: name.into(),
+                            arguments: arguments.to_string(),
+                        },
+                    },
+                    None,
+                    &|| true,
+                    None,
+                )
+            };
+
+        // 没有声明它的 Skill：即使完全授权也拒绝。
+        let mut full = default_agent_spawn_policy();
+        full.access_profile = magi_core::AccessProfile::FullAccess;
+        for skill in [None, Some("missing-skill")] {
+            let (payload, status) = invoke(full.clone(), skill, "agent_role_save", valid.clone());
+            assert_eq!(status, ExecutionResultStatus::Rejected, "{payload}");
+        }
+        // 只读模式：写入工具被硬阻断，读取工具仍可用。
+        let (payload, status) = invoke(
+            read_only_agent_spawn_policy(),
+            Some("role-skill"),
+            "agent_role_save",
+            valid.clone(),
+        );
+        assert_eq!(status, ExecutionResultStatus::Rejected, "{payload}");
+        let (payload, status) = invoke(
+            read_only_agent_spawn_policy(),
+            Some("role-skill"),
+            "agent_role_get",
+            serde_json::json!({}),
+        );
+        assert_eq!(status, ExecutionResultStatus::Succeeded, "{payload}");
+        // 参数无效：在请用户确认之前就失败。
+        let (payload, status) = invoke(
+            full.clone(),
+            Some("role-skill"),
+            "agent_role_save",
+            serde_json::json!({"role_id": "executor", "display_name": "x", "system_prompt": "x", "capabilities": ["general_engineering"]}),
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed, "{payload}");
+        assert!(payload.contains("role_conflict"));
+        // 声明了 Skill 且参数有效，但当前没有可确认的对话轮次：不会保存。
+        let (payload, status) = invoke(full, Some("role-skill"), "agent_role_save", valid);
+        assert_eq!(status, ExecutionResultStatus::Cancelled, "{payload}");
+        assert!(
+            roles.get("data-analyst").is_none(),
+            "未获用户确认不能写入角色"
+        );
     }
 
     #[test]
@@ -11432,7 +11637,11 @@ mod tests {
         let task_store = TaskStore::new();
         let registry = ConversationRegistry::new();
         let session_id = SessionId::new("session-context-request-foreign");
-        let parent = coordinator_task(test_task("task-foreign-parent", "task-foreign-parent", None));
+        let parent = coordinator_task(test_task(
+            "task-foreign-parent",
+            "task-foreign-parent",
+            None,
+        ));
         let mut child = test_task(
             "task-foreign-child",
             "task-foreign-parent",

@@ -1858,6 +1858,11 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     window.dispatchEvent(new Event('magi:workspaceRegistryChanged'));
     return;
   }
+  // 对话中保存的自定义角色：重新读取角色与绑定，让可派发角色目录和展示信息立即一致。
+  if (eventType === 'settings.agent_roles.changed') {
+    void dispatchRegistryAgents();
+    return;
+  }
 
   if (eventType === 'session.directory.changed') {
     const workspaceId = rustEventWorkspaceId(event);

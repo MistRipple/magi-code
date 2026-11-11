@@ -3193,6 +3193,8 @@ mod tests {
             "update_execution_steps",
             "memory_write",
             "ask_user_question",
+            "agent_role_get",
+            "agent_role_save",
         ];
         assert_eq!(
             builtin_names, expected_builtin_names,

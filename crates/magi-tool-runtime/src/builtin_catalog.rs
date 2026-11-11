@@ -123,6 +123,11 @@ pub enum BuiltinToolName {
     /// 主线遇到需要用户拍板的分叉时，向用户提出 1–4 个选择题（可多选，界面固定追加“其他”自由输入），
     /// 等用户回答后把答案作为工具结果返回。由 orchestration 层拦截，不进入 ToolRegistry。
     AskUserQuestion,
+    // ── 自定义子代理角色（对话式创建与修改）──
+    /// 读取用户与内置角色的定义、版本号和可选专业能力。只在声明它的 Skill 激活时开放。
+    AgentRoleGet,
+    /// 创建或修改用户自定义角色。保存前必须经用户确认；只在声明它的 Skill 激活时开放。
+    AgentRoleSave,
 }
 
 /// 工具的模型调用范围。目录、schema 过滤与执行入口共用；授权和资源预检另行执行。
@@ -182,7 +187,9 @@ impl BuiltinToolName {
             | Self::AgentCancel
             | Self::AgentWait
             | Self::AgentApply => Scope::DelegatorTaskOnly,
-            Self::MemoryWrite => Scope::CoordinatorTaskOnly,
+            Self::MemoryWrite | Self::AgentRoleGet | Self::AgentRoleSave => {
+                Scope::CoordinatorTaskOnly
+            }
             Self::ContextSearch | Self::ContextRead | Self::ContextRequest => Scope::WorkerTaskOnly,
             Self::GetGoal
             | Self::CreateGoal
@@ -207,7 +214,7 @@ impl BuiltinToolName {
         }
     }
 
-    pub const ALL: [Self; 83] = [
+    pub const ALL: [Self; 85] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -291,6 +298,8 @@ impl BuiltinToolName {
         Self::UpdateExecutionSteps,
         Self::MemoryWrite,
         Self::AskUserQuestion,
+        Self::AgentRoleGet,
+        Self::AgentRoleSave,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -377,6 +386,8 @@ impl BuiltinToolName {
             Self::UpdatePlan => "update_plan",
             Self::UpdateExecutionSteps => "update_execution_steps",
             Self::MemoryWrite => "memory_write",
+            Self::AgentRoleGet => "agent_role_get",
+            Self::AgentRoleSave => "agent_role_save",
             Self::AskUserQuestion => "ask_user_question",
         }
     }
@@ -459,6 +470,7 @@ impl BuiltinToolName {
                 "session_state"
             }
             Self::MemoryWrite => "project_memory",
+            Self::AgentRoleGet | Self::AgentRoleSave => "agent_roles",
         }
     }
 
@@ -546,6 +558,8 @@ impl BuiltinToolName {
             "update_plan" => Some(Self::UpdatePlan),
             "update_execution_steps" => Some(Self::UpdateExecutionSteps),
             "memory_write" => Some(Self::MemoryWrite),
+            "agent_role_get" => Some(Self::AgentRoleGet),
+            "agent_role_save" => Some(Self::AgentRoleSave),
             "ask_user_question" => Some(Self::AskUserQuestion),
             _ => None,
         }
@@ -687,6 +701,7 @@ impl BuiltinToolName {
                 | Self::UpdatePlan
                 | Self::UpdateExecutionSteps
                 | Self::MemoryWrite
+                | Self::AgentRoleSave
                 | Self::BrowserClick
                 | Self::BrowserType
                 | Self::BrowserPress
@@ -741,6 +756,7 @@ impl BuiltinToolName {
             || matches!(
                 self,
                 Self::MemoryWrite
+                    | Self::AgentRoleSave
                     | Self::ProcessLaunch
                     | Self::ProcessWrite
                     | Self::ProcessKill
@@ -817,6 +833,7 @@ impl BuiltinToolName {
             | Self::UpdatePlan
             | Self::UpdateExecutionSteps
             | Self::MemoryWrite
+            | Self::AgentRoleSave
             | Self::AskUserQuestion => RestrictedWriteProfilePolicy::AutoAllowed,
             Self::BrowserClick
             | Self::BrowserType
@@ -875,11 +892,20 @@ impl BuiltinToolName {
                 | Self::UpdatePlan
                 | Self::UpdateExecutionSteps
                 | Self::MemoryWrite
+                | Self::AgentRoleGet
+                | Self::AgentRoleSave
         )
     }
 
+    /// 只在声明了该工具的 Skill 激活时才进入模型工具面；没有 Skill 声明时既不展示也不能调用，
+    /// 避免持久化配置类工具出现在每一轮的默认工具定义里。
+    pub fn requires_skill_declaration(&self) -> bool {
+        matches!(self, Self::AgentRoleGet | Self::AgentRoleSave)
+    }
+
     pub fn is_session_timeline_renderable_tool_call(&self) -> bool {
-        matches!(self, Self::AgentSpawn) || !self.is_runtime_internal_tool_call()
+        matches!(self, Self::AgentSpawn | Self::AgentRoleSave)
+            || !self.is_runtime_internal_tool_call()
     }
 
     pub fn default_risk_level(&self) -> RiskLevel {
@@ -915,6 +941,7 @@ impl BuiltinToolName {
             | Self::UpdatePlan
             | Self::UpdateExecutionSteps
             | Self::MemoryWrite
+            | Self::AgentRoleGet
             | Self::AskUserQuestion
             | Self::BrowserNavigate
             | Self::BrowserSnapshot
@@ -940,6 +967,7 @@ impl BuiltinToolName {
             | Self::GitWorktreeCreate
             | Self::ProcessWrite
             | Self::AgentSpawn
+            | Self::AgentRoleSave
             | Self::BrowserClick
             | Self::BrowserType
             | Self::BrowserPress
@@ -1270,6 +1298,12 @@ impl BuiltinToolName {
             }
             Self::MemoryWrite => {
                 "对当前工作区的 ProjectMemory 条目进行写入或删除。Memory 文件存于 ~/.magi/projects/<slug>/memory/，每次新会话开始时自动加载到系统提示。使用 action: save 进行 upsert（覆盖同 file_stem 的文件），action: delete 删除条目。Memory 类别：user / feedback / project / reference。"
+            }
+            Self::AgentRoleGet => {
+                "读取子代理角色定义。不传 role_id 时列出全部角色（含内置只读角色）与可选的专业能力；传 role_id 返回该角色的完整定义和 role_revision，修改用户角色时把它作为 expected_role_revision。"
+            }
+            Self::AgentRoleSave => {
+                "创建或修改用户自定义子代理角色。保存前运行时会向用户展示变更摘要并等待确认，用户拒绝则不保存。新建时不传 expected_role_revision（id 已存在会被拒绝）；修改时必须传 agent_role_get 返回的 role_revision，版本不符说明角色已被改动，应重新读取后再提议。只能管理用户角色：不能覆盖内置角色、不能启用协调者模式，也不设置模型绑定。角色提示词不授予任何权限，必须自足，可直接作为子代理的系统提示词。"
             }
             Self::AskUserQuestion => {
                 "当继续执行需要用户做决定、而你无法从代码和上下文中可靠判断时，向用户提出选择题，等用户在对话框里选完再继续。用户看到的是带选项的卡片；每道题固定多一个“其他”，让用户自己输入，所以不要自己写“其他”选项。\n\n\
@@ -2132,6 +2166,34 @@ impl BuiltinToolName {
                     }
                 },
                 "required": ["action", "file_stem"]
+            }),
+            Self::AgentRoleGet => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "role_id": { "type": "string", "minLength": 1, "description": "要读取的角色 id；省略则列出全部角色和可选专业能力。" }
+                },
+                "required": []
+            }),
+            Self::AgentRoleSave => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "role_id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$", "description": "角色 id：小写字母、数字和连字符，1-64 个字符，例如 data-analyst。新建时必须不与现有角色重复。" },
+                    "display_name": { "type": "string", "minLength": 1, "maxLength": 80, "description": "显示名称。" },
+                    "description": { "type": "string", "maxLength": 300, "description": "一句话说明何时应派发给这个角色，主线据此选择角色。" },
+                    "system_prompt": { "type": "string", "minLength": 1, "maxLength": 50000, "description": "角色的系统提示词：职责、工作方式、边界和交付要求。" },
+                    "role": { "type": "string", "description": "角色定位的一句话概括，用于界面展示。" },
+                    "focus": { "type": "array", "items": { "type": "string" }, "description": "关注点。" },
+                    "constraints": { "type": "array", "items": { "type": "string" }, "description": "约束；声明 \"read-only\" 表示该角色职责只读。" },
+                    "output_preferences": { "type": "array", "items": { "type": "string" }, "description": "输出偏好。" },
+                    "ownerships": { "type": "array", "items": { "type": "string" }, "description": "负责的领域。" },
+                    "insight_preferences": { "type": "array", "items": { "type": "string", "enum": ["decision", "contract", "risk", "constraint"] }, "description": "需要主动回报的洞察类型。" },
+                    "capabilities": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "该角色可激活的专业能力 id，必须来自 agent_role_get 返回的可选能力。" },
+                    "parallelism_limit": { "type": "integer", "minimum": 1, "description": "该角色同时运行的实例上限；省略表示不额外限制。" },
+                    "color_token": { "type": "string", "description": "界面颜色标记；省略使用默认。" },
+                    "icon": { "type": "string", "description": "界面图标名；省略使用默认。" },
+                    "expected_role_revision": { "type": "integer", "minimum": 1, "description": "修改已有角色时必填，取自 agent_role_get 的 role_revision；新建时不要传。" }
+                },
+                "required": ["role_id", "display_name", "system_prompt", "capabilities"]
             }),
             Self::AskUserQuestion => serde_json::json!({
                 "type": "object",

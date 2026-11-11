@@ -21,7 +21,9 @@ struct Entry {
 static PREVIEWED: LazyLock<Mutex<VecDeque<Entry>>> = LazyLock::new(|| Mutex::new(VecDeque::new()));
 
 fn lock() -> std::sync::MutexGuard<'static, VecDeque<Entry>> {
-    PREVIEWED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    PREVIEWED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub(super) fn remember(translated: &Translated) {
@@ -73,7 +75,11 @@ fn matches_request(source: &PluginSource, request: &PluginUpstreamRequest) -> bo
     }
     match (&request.github, github) {
         (Some(wanted), Some(actual)) => {
-            wanted.repository.trim_end_matches(".git").to_ascii_lowercase() == actual.repository
+            wanted
+                .repository
+                .trim_end_matches(".git")
+                .to_ascii_lowercase()
+                == actual.repository
                 && wanted.commit.as_deref().map(str::to_ascii_lowercase) == actual.commit
         }
         (None, None) => {

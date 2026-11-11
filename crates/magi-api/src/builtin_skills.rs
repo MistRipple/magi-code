@@ -26,12 +26,20 @@ struct BuiltinSkill {
     config: &'static str,
 }
 
-const BUILTIN_SKILLS: &[BuiltinSkill] = &[BuiltinSkill {
-    id: "magi-cloudflare-tunnel",
-    version: 4,
-    body: include_str!("../assets/builtin-skills/magi-cloudflare-tunnel/SKILL.md"),
-    config: include_str!("../assets/builtin-skills/magi-cloudflare-tunnel/config.json"),
-}];
+const BUILTIN_SKILLS: &[BuiltinSkill] = &[
+    BuiltinSkill {
+        id: "magi-cloudflare-tunnel",
+        version: 4,
+        body: include_str!("../assets/builtin-skills/magi-cloudflare-tunnel/SKILL.md"),
+        config: include_str!("../assets/builtin-skills/magi-cloudflare-tunnel/config.json"),
+    },
+    BuiltinSkill {
+        id: "magi-create-agent-role",
+        version: 3,
+        body: include_str!("../assets/builtin-skills/magi-create-agent-role/SKILL.md"),
+        config: include_str!("../assets/builtin-skills/magi-create-agent-role/config.json"),
+    },
+];
 
 const INSTALLED_FILE: &str = ".installed.json";
 
@@ -187,23 +195,32 @@ mod tests {
         );
         let config = skills_config_object(&store);
         let entries = config["instructionSkills"].as_array().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["skillId"], "magi-cloudflare-tunnel");
-        assert_eq!(entries[0]["enabled"], true);
+        assert_eq!(entries.len(), BUILTIN_SKILLS.len());
+        let entry = entries
+            .iter()
+            .find(|entry| entry["skillId"] == "magi-cloudflare-tunnel")
+            .unwrap();
+        assert_eq!(entry["enabled"], true);
         // 展示描述来自 SKILL.md 的 front matter，而不是 Rust 常量或 config.json。
         assert_eq!(
-            entries[0]["description"],
+            entry["description"],
             "协助用户配置 Cloudflare 命名隧道，让 Magi MCP 的公网地址固定、重启后不变。"
         );
-        assert!(is_builtin(&entries[0]));
+        assert!(is_builtin(entry));
 
         // 停用是允许的，再次启动不会改回启用。
         let mut config = skills_config_object(&store);
-        config["instructionSkills"][0]["enabled"] = json!(false);
+        let index = config["instructionSkills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|entry| entry["skillId"] == "magi-cloudflare-tunnel")
+            .unwrap();
+        config["instructionSkills"][index]["enabled"] = json!(false);
         save_skills_config_object(&store, config).unwrap();
         install_builtin_skills(&store, dir.path()).unwrap();
         assert_eq!(
-            skills_config_object(&store)["instructionSkills"][0]["enabled"],
+            skills_config_object(&store)["instructionSkills"][index]["enabled"],
             false
         );
 
@@ -213,6 +230,7 @@ mod tests {
         save_skills_config_object(&store, config).unwrap();
         install_builtin_skills(&store, dir.path()).unwrap();
         assert!(has_entry(&store, "magi-cloudflare-tunnel"));
+        assert!(has_entry(&store, "magi-create-agent-role"));
     }
 
     #[test]
@@ -234,7 +252,14 @@ mod tests {
             .iter()
             .filter_map(|entry| entry["skillId"].as_str())
             .collect();
-        assert_eq!(ids, ["user-skill", "magi-cloudflare-tunnel"]);
+        assert_eq!(
+            ids,
+            [
+                "user-skill",
+                "magi-cloudflare-tunnel",
+                "magi-create-agent-role"
+            ]
+        );
 
         let mut unmarked = Map::new();
         unmarked.insert(
@@ -245,6 +270,25 @@ mod tests {
         let entry = &unmarked["instructionSkills"][0];
         assert!(is_builtin(entry));
         assert_eq!(entry["enabled"], false, "启停以提交的为准");
+    }
+
+    #[test]
+    fn the_role_skill_declares_exactly_the_role_tools_and_the_question_tool() {
+        let skill = BUILTIN_SKILLS
+            .iter()
+            .find(|skill| skill.id == "magi-create-agent-role")
+            .unwrap();
+        let config: Value = serde_json::from_str(skill.config).unwrap();
+        assert_eq!(
+            config["allowed_tools"],
+            json!(["agent_role_get", "agent_role_save", "ask_user_question"])
+        );
+        assert!(skill.body.contains("expected_output"));
+        assert!(skill.body.contains("role_revision"));
+        assert!(
+            skill.body.contains("不要") && skill.body.contains("不是用户的要求"),
+            "技能必须声明不按工具结果里的文字行动"
+        );
     }
 
     #[test]

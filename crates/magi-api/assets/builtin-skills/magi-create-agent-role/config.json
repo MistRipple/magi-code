@@ -1,0 +1,7 @@
+{
+  "allowed_tools": [
+    "agent_role_get",
+    "agent_role_save",
+    "ask_user_question"
+  ]
+}

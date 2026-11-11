@@ -40,6 +40,7 @@ export function resolveToolIcon(toolName: string): IconName {
     'agent_apply': 'git-branch',
     'update_plan': 'list',
     'memory_write': 'database',
+    'agent_role_save': 'bot',
     'ask_user_question': 'question',
   };
 

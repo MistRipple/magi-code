@@ -170,6 +170,8 @@ impl BuiltinTool for NormalizedBuiltinTool {
             | BuiltinToolName::UpdatePlan
             | BuiltinToolName::UpdateExecutionSteps
             | BuiltinToolName::MemoryWrite
+            | BuiltinToolName::AgentRoleGet
+            | BuiltinToolName::AgentRoleSave
             | BuiltinToolName::AskUserQuestion => execute_orchestration_only(self.name),
         }
     }

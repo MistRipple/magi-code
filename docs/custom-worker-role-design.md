@@ -154,6 +154,19 @@ Worker 报告回传主 Agent
 
 创建和编辑表单只暴露当前角色模型已有字段：基本信息、角色专长、约束、输出偏好、信号偏好、核心职责、领域能力和代理引擎。权限和 Worker 执行机制不另造一套编辑模型。
 
+### 6.1 通过对话创建与修改
+
+除设置页外，用户可以用对话创建、修改或复制自定义角色。它不是第二套角色管理，只是同一条保存路径的对话入口：
+
+- **入口**：内置 Skill `magi-create-agent-role`（输入框 `/` 唤起，或由模型按描述应用）。Skill 引导模型先读取现状、问清用途、起草完整定义并在对话中展示，用户同意后才保存。
+- **工具**：`agent_role_get` 读取角色（不带 `role_id` 时同时返回可选专业能力）与 `role_revision`；`agent_role_save` 创建或修改用户角色。两者只对主线协调者开放，并且**只有 Skill 的 `allowed_tools` 明确声明时才进入模型工具面、才允许执行**；没有 Skill 声明时默认工具面和执行入口都不出现它们，因此不改变平时的提示词前缀。
+- **同一写入路径**：保存调用 `AgentRoleRegistry::save_user_role`，与设置页相同；保存前用同一套 `check_user_role` 预检。内置角色保护、字段校验、禁止协调者模式、版本冲突都由注册表裁决，工具不另存状态。
+- **用户确认**：每次保存都要用户确认，与访问模式无关（完全授权也要确认）。确认摘要来自预检结果：新建展示名称、能力、约束；修改只列真正变化的字段。无法保存的角色在确认之前就失败，不会请用户确认；内容与现有版本一致时不触发确认。用户拒绝则不写入。只读访问模式下保存被硬阻断，读取仍可用。
+- **修改语义**：修改必须带 `agent_role_get` 返回的 `role_revision`，版本不符返回冲突并要求重新读取；未提供的可选字段沿用现有值。新建不带版本号，已存在的 id 被拒绝。
+- **边界**：不覆盖或修改内置角色（需要调整时另存为新角色）、不设置模型绑定、不删除角色，这些仍在设置页完成。角色提示词本身不授予权限。运行中的 Worker 使用派发时固定的快照，保存只影响之后的派发。
+- **刷新**：保存成功后发布 `settings.agent_roles.changed`，前端重新读取角色与绑定，可派发角色目录随即一致。
+- **对话里的展示**：保存角色的工具卡片沿用共享的工具卡片与 `policy-card` 键值样式，展示“新建角色／修改角色 · 版本 N”的草稿（名称、说明、专业能力、按需出现的约束等、系统提示词），不展示原始 JSON；保存成功只显示“角色已创建／已更新 · 版本 N／没有变化”，失败沿用通用错误展示。确认说明按行列出变更并使用专业能力的显示名；修改时未提供的字段显示“沿用现有内容”。每次保存单独确认，授权区不提供“本轮允许相同操作”。`agent_role_get` 不进入时间线。
+
 ### 7.1 导出
 
 导出一个可独立阅读的 Markdown 角色文件，包含角色定义和能力引用。默认不包含：
@@ -324,5 +337,6 @@ API、Dispatcher、Runner 与 daemon 角色目录 provider 使用同一个共享
 - `crates/magi-api/src/routes/settings.rs`：角色管理、revision 冲突与删除恢复事务。
 - `crates/magi-conversation-runtime/src/agent_spawn_preflight.rs`、`task_execution_dispatcher.rs`：统一可派发角色与不可变 Worker 快照。
 - Web 代理设置与 `test:settings-store`：创建、编辑、导入冲突、导出、引擎绑定与目录刷新。
+- `crates/magi-conversation-runtime/src/agent_role_tool.rs`、`tool_batch.rs`：对话式创建与修改（检查、摘要、确认后保存）；`crates/magi-api/assets/builtin-skills/magi-create-agent-role/`：内置 Skill；`npm run test:agent-role-conversation` 在真实 daemon 上验证 Skill 声明开放、确认前不写入、拒绝不写入、修改带版本号与内置角色保护。
 
 按改动运行 `cargo test -p magi-agent-role`、受影响的 API/调度测试，以及 Web check 和对应回归。涉及产品行为时从 daemon 主入口验证 §11 的场景；通过记录绑定本次源码与构建，不在本文保留一次性实施进度。

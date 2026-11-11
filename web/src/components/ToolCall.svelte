@@ -23,6 +23,7 @@
   import { agentModelDisplay } from '../lib/agent-model-display';
   import { parseToolIdentity } from '../lib/tool-identity';
   import { parseUserQuestionResult } from '../shared/user-question';
+  import { agentRoleCapabilityLabels, parseAgentRoleDraft, parseAgentRoleSaveResult } from '../shared/agent-role-save';
   import { isUserQuestionPending } from '../stores/user-question-store.svelte';
   import { resolveToolDisplayName } from '../lib/tool-display-name';
   import {
@@ -385,8 +386,15 @@
 
   // 折叠态只计算卡片存在性和标题摘要；完整输入输出、图片和图表在展开后解析。
   const sanitizedInput = $derived(sanitizeToolDisplayPayload(input));
+  // 保存角色：对话流里展示“要保存什么”的草稿与结果，而不是原始 JSON 输入输出。
+  const agentRoleDraft = $derived(name === 'agent_role_save' ? parseAgentRoleDraft(input) : null);
+  const agentRoleResult = $derived(agentRoleDraft ? parseAgentRoleSaveResult(output) : null);
+  const agentRoleCapabilityNames = $derived(
+    agentRoleDraft ? agentRoleCapabilityLabels(messagesState.settingsRegistrySnapshot?.roleTemplates) : new Map<string, string>(),
+  );
   const hasInput = $derived(
     name !== 'ask_user_question'
+      && !agentRoleDraft
       && (hasDisplayContent(sanitizedInput) || hasInternalRedactedDisplayValue(input)),
   );
   const toolApproval = $derived.by(() => (
@@ -399,7 +407,7 @@
     name === 'ask_user_question' ? parseUserQuestionResult(output) : null,
   );
   const outputIsStructuredError = $derived(!toolApproval && !userQuestionSummary && isStructuredToolErrorPayload(output));
-  const hasOutput = $derived(!toolApproval && !userQuestionSummary && !outputIsStructuredError && hasDisplayContent(output));
+  const hasOutput = $derived(!toolApproval && !userQuestionSummary && !agentRoleResult && !outputIsStructuredError && hasDisplayContent(output));
   const structuredErrorText = $derived.by(() => {
     if (!outputIsStructuredError) {
       return '';
@@ -425,7 +433,7 @@
   const visualStatus = $derived<VisualToolStatus>(status);
 
   const hasContent = $derived(
-    hasInput || hasOutput || hasError || Boolean(toolApproval) || Boolean(userQuestionSummary) || Boolean(outputFooter),
+    hasInput || hasOutput || hasError || Boolean(toolApproval) || Boolean(userQuestionSummary) || Boolean(agentRoleDraft) || Boolean(outputFooter),
   );
   // 待授权是用户必须处理的交互，即使它来自文件变更这类紧凑工具，也不能
   // 被紧凑卡片规则吞掉；授权状态会自动展开到卡片内容区。
@@ -1031,6 +1039,61 @@
             </div>
           {/if}
 
+          {#if agentRoleDraft}
+            {@const draft = agentRoleDraft}
+            <div class="tool-section">
+              <div class="section-header">
+                <span class="section-label">
+                  {draft.expectedRevision
+                    ? i18n.t('toolCall.agentRole.updateTitle', { revision: draft.expectedRevision })
+                    : i18n.t('toolCall.agentRole.createTitle')}
+                </span>
+              </div>
+              <div class="policy-card role-draft">
+                <div class="policy-row">
+                  <span class="policy-key">{i18n.t('toolCall.agentRole.field.name')}</span>
+                  <span class="policy-value">{draft.displayName || draft.roleId} <span class="policy-meta">{draft.roleId}</span></span>
+                </div>
+                <div class="policy-row">
+                  <span class="policy-key">{i18n.t('toolCall.agentRole.field.description')}</span>
+                  <!-- 修改时未提供的字段沿用现有内容，不能显示成“被清空”。 -->
+                  <span class="policy-value policy-wrap" class:policy-muted={!draft.description}>{draft.description || (draft.expectedRevision ? i18n.t('toolCall.agentRole.keepCurrent') : '—')}</span>
+                </div>
+                <div class="policy-row">
+                  <span class="policy-key">{i18n.t('toolCall.agentRole.field.capabilities')}</span>
+                  <span class="policy-value">{draft.capabilities.map((id) => agentRoleCapabilityNames.get(id) ?? id).join('、') || '—'}</span>
+                </div>
+                {#each [
+                  ['focus', draft.focus.join('\n')],
+                  ['constraints', draft.constraints.join('\n')],
+                  ['outputPreferences', draft.outputPreferences.join('\n')],
+                  ['ownerships', draft.ownerships.join('\n')],
+                  ['parallelism', draft.parallelismLimit === null ? '' : String(draft.parallelismLimit)],
+                ] as [field, value] (field)}
+                  {#if value}
+                    <div class="policy-row">
+                      <span class="policy-key">{i18n.t(`toolCall.agentRole.field.${field}`)}</span>
+                      <span class="policy-value policy-wrap">{value}</span>
+                    </div>
+                  {/if}
+                {/each}
+                <div class="policy-row policy-column">
+                  <span class="policy-key">{i18n.t('toolCall.agentRole.field.systemPrompt')}</span>
+                  <span class="policy-value policy-wrap role-draft-prompt">{draft.systemPrompt || '—'}</span>
+                </div>
+              </div>
+            </div>
+          {/if}
+
+          {#if agentRoleResult}
+            <div class="tool-section">
+              <div class="role-save-result">
+                <Icon name="check" size={12} />
+                {i18n.t(`toolCall.agentRole.result.${agentRoleResult.mode}`, { revision: agentRoleResult.revision ?? '' })}
+              </div>
+            </div>
+          {/if}
+
           {#if userQuestionSummary}
             <div class="tool-section">
               {#if userQuestionSummary.status === 'awaiting'}
@@ -1303,6 +1366,50 @@
   .policy-wrap {
     white-space: pre-wrap;
     word-break: break-word;
+  }
+
+  /* 草稿里的键统一成一列、值对齐成一列；列表项逐行时续行也对齐在值列。系统提示词独占整行。 */
+  .role-draft {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    align-items: baseline;
+    column-gap: var(--space-3);
+    row-gap: var(--space-2);
+  }
+
+  .role-draft .policy-row {
+    display: contents;
+  }
+
+  .role-draft .policy-row.policy-column {
+    display: flex;
+    grid-column: 1 / -1;
+  }
+
+  .policy-muted {
+    color: var(--foreground-muted);
+  }
+
+  .policy-meta {
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* 长提示词在卡片内滚动，不把对话流撑成一整屏。 */
+  .role-draft-prompt {
+    display: block;
+    max-height: 12lh;
+    overflow-y: auto;
+    width: 100%;
+  }
+
+  .role-save-result {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
   }
 
   .copy-btn {

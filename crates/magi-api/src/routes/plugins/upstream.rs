@@ -476,9 +476,8 @@ pub(super) async fn install_candidate(
     }
     // 预览确认的是具体摘要：安装使用预览时翻译出的这份产物。摘要缺失、已过期、
     // 来自另一次运行或与请求来源不符时拒绝，要求重新预览。
-    let translated = previewed::recall(expected, request).ok_or_else(|| {
-        ApiError::Conflict("预览已失效或与请求不符，请重新预览后再确认".into())
-    })?;
+    let translated = previewed::recall(expected, request)
+        .ok_or_else(|| ApiError::Conflict("预览已失效或与请求不符，请重新预览后再确认".into()))?;
     let source = translated.source.clone();
     if let Some((id, digest, lease, background)) = caller {
         if background {

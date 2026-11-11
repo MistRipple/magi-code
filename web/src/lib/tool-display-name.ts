@@ -63,6 +63,7 @@ const TOOL_DISPLAY_NAME_KEYS: Record<string, string> = {
   agent_apply: 'toolCall.displayName.agentApply',
   update_plan: 'toolCall.displayName.updatePlan',
   memory_write: 'toolCall.displayName.memoryWrite',
+  agent_role_save: 'toolCall.displayName.agentRoleSave',
   ask_user_question: 'toolCall.displayName.askUserQuestion',
 };
 

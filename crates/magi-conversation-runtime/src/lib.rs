@@ -8,6 +8,7 @@
 mod agent_activation;
 mod agent_context_fork;
 mod agent_receipt;
+mod agent_role_tool;
 mod agent_spawn_preflight;
 mod auxiliary_usage;
 mod builtin_tool_schema;

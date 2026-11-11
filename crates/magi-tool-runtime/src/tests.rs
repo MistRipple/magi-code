@@ -7483,6 +7483,8 @@ fn public_builtin_specs_exclude_shell_internal_process_tools() {
             "update_execution_steps",
             "memory_write",
             "ask_user_question",
+            "agent_role_get",
+            "agent_role_save",
         ],
         "public builtin specs must remain the single canonical tool surface"
     );

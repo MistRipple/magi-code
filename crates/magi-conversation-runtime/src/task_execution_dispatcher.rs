@@ -1713,6 +1713,11 @@ impl LlmTaskDispatcher {
                     ) && (workspace_id.is_some() || !tool.requires_workspace_context())
                         && builtin_tool_visible_in_access_profile(tool, tool_surface_access_profile)
                         && registry.browser_tool_available(tool)
+                        // 持久化配置类工具只在声明它的 Skill 激活时进入模型工具面。
+                        && (!tool.requires_skill_declaration()
+                            || active_skill_allowed_tools.is_some_and(|allowed| {
+                                allowed.iter().any(|name| name == tool.as_str())
+                            }))
                 })
             })
             .filter(|definition| {
@@ -6423,6 +6428,9 @@ mod tests {
                     | "knowledge_graph_query"
                     | "code_symbols"
                     | "memory_write"
+                    // 角色管理工具只在声明它们的 Skill 激活时开放，默认工具面里没有。
+                    | "agent_role_get"
+                    | "agent_role_save"
                     | "agent_apply"
                     | "process_launch"
                     | "process_read"
@@ -6893,6 +6901,85 @@ mod tests {
             assert!(prompt.contains("本轮 tools 未提供 agent_spawn"));
             assert!(!prompt.contains("可派发角色"));
         }
+    }
+
+    #[test]
+    fn role_tools_enter_the_tool_surface_only_when_an_active_skill_declares_them() {
+        let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
+            let registry = magi_skill_runtime::SkillRegistry::new();
+            let skill = |id: &str, restrict: bool, tools: Vec<String>| {
+                magi_skill_runtime::SkillDefinition {
+                    description: String::new(),
+                    skill_id: id.to_string(),
+                    title: id.to_string(),
+                    instruction: "管理角色。".to_string(),
+                    metadata: magi_skill_runtime::SkillMetadata {
+                        category: "agent".to_string(),
+                        tags: vec![],
+                    },
+                    restrict_standard_tools: restrict,
+                    allowed_tools: tools,
+                    custom_tool_bindings: vec![],
+                    prompt_priority: 50,
+                }
+            };
+            registry.register(skill(
+                "role-skill",
+                true,
+                vec![
+                    "agent_role_get".to_string(),
+                    "agent_role_save".to_string(),
+                    "ask_user_question".to_string(),
+                ],
+            ));
+            registry.register(skill("plain-skill", false, vec![]));
+            magi_skill_runtime::SkillRuntime::new(registry)
+        }));
+        let names = |task: &Task, skill: Option<&str>, profile: AccessProfile| {
+            dispatcher
+                .build_tool_definitions(
+                    task,
+                    skill,
+                    profile,
+                    Some(&WorkspaceId::new("test-workspace")),
+                )
+                .into_iter()
+                .map(|definition| definition.function.name)
+                .collect::<Vec<_>>()
+        };
+        let coordinator = task_with_role("coordinator", TaskTier::ExecutionChain);
+
+        let declared = names(&coordinator, Some("role-skill"), AccessProfile::Restricted);
+        assert!(declared.iter().any(|name| name == "agent_role_get"));
+        assert!(declared.iter().any(|name| name == "agent_role_save"));
+        // 只读模式隐藏写入工具，读取仍可用。
+        let mut read_only_task = coordinator.clone();
+        read_only_task
+            .policy_snapshot
+            .as_mut()
+            .unwrap()
+            .access_profile = AccessProfile::ReadOnly;
+        let read_only = names(&read_only_task, Some("role-skill"), AccessProfile::ReadOnly);
+        assert!(read_only.iter().any(|name| name == "agent_role_get"));
+        assert!(!read_only.iter().any(|name| name == "agent_role_save"));
+        // 没有 Skill、或 Skill 没有声明时，默认工具面里不出现，不能靠“没有限制”放行。
+        for skill in [None, Some("plain-skill")] {
+            let undeclared = names(&coordinator, skill, AccessProfile::FullAccess);
+            assert!(
+                !undeclared
+                    .iter()
+                    .any(|name| name.starts_with("agent_role_")),
+                "{skill:?} 不应开放角色工具"
+            );
+        }
+        // 子代理即使在声明它的 Skill 下也不能管理角色。
+        let worker = task_with_role("executor", TaskTier::ExecutionChain);
+        let worker_names = names(&worker, Some("role-skill"), AccessProfile::Restricted);
+        assert!(
+            !worker_names
+                .iter()
+                .any(|name| name.starts_with("agent_role_"))
+        );
     }
 
     #[test]

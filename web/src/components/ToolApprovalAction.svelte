@@ -20,6 +20,8 @@
   const isExternalApproval = $derived(
     approval.taskId.startsWith('external:'),
   );
+  // 保存角色是持久的全局配置，每次都由用户单独确认，不提供“本轮允许相同操作”。
+  const offersTurnWideAllow = $derived(!isExternalApproval && approval.toolName !== 'agent_role_save');
   const approvalIsActive = $derived(
     !toolApprovalState.hydrated
       || toolApprovalState.sessionId !== approval.sessionId
@@ -65,7 +67,7 @@
         ? i18n.t('toolCall.approval.processing')
         : i18n.t(isExternalApproval ? 'mcpServer.approvals.allow' : 'toolCall.approval.allowOnce')}
     </button>
-    {#if !isExternalApproval}
+    {#if offersTurnWideAllow}
       <button
         type="button"
         class="btn btn--secondary btn--sm"
@@ -136,6 +138,8 @@
     font-size: var(--text-xs);
     line-height: 1.5;
     overflow-wrap: anywhere;
+    /* 结构化的确认说明按行展示（如保存角色的变更清单）。 */
+    white-space: pre-line;
   }
 
   .tool-approval-actions {

@@ -420,6 +420,11 @@ impl AgentRoleRegistry {
             .collect()
     }
 
+    /// 当前注册表里全部专业能力（含说明），角色可以从中选择自己的能力集合。
+    pub fn capability_summaries(&self) -> Vec<ProfessionalCapabilitySummary> {
+        self.current_snapshot().capabilities.summaries()
+    }
+
     pub fn capability_ids(&self) -> Vec<String> {
         self.current_snapshot().capabilities.ids()
     }
@@ -538,6 +543,17 @@ impl AgentRoleRegistry {
         }))
     }
 
+    /// 按保存时同一套规则检查用户角色，返回将被保存的规范化角色（含新的 `role_revision`），
+    /// 不写入任何文件。供“先预览再确认”的调用方使用；真正保存仍走 [`Self::save_user_role`]。
+    pub fn check_user_role(
+        &self,
+        role: AgentRole,
+        expected_role_revision: Option<u64>,
+    ) -> Result<AgentRole, AgentRoleError> {
+        let snapshot = self.current_snapshot();
+        check_user_role(&snapshot, role, expected_role_revision)
+    }
+
     pub fn save_user_role(
         &self,
         role: AgentRole,
@@ -548,44 +564,7 @@ impl AgentRoleRegistry {
             .lock()
             .expect("角色 registry mutation lock 未被破坏");
         let snapshot = self.current_snapshot();
-        let normalized = normalize_role(role).map_err(AgentRoleError::InvalidDefinition)?;
-        validate_role_for_persistence(&normalized, &snapshot.capabilities)
-            .map_err(AgentRoleError::InvalidDefinition)?;
-        if snapshot.builtin_ids.contains(&normalized.id) {
-            return Err(AgentRoleError::Conflict(format!(
-                "角色 {} 是系统内置角色，不能被覆盖",
-                normalized.id
-            )));
-        }
-        let existing = snapshot.roles.get(&normalized.id);
-        if let Some(existing) = existing {
-            if !snapshot.builtin_ids.contains(&normalized.id) {
-                match expected_role_revision {
-                    Some(expected) if expected != existing.role_revision => {
-                        return Err(AgentRoleError::Conflict(format!(
-                            "角色 {} 已被其他窗口修改，请刷新后重试",
-                            normalized.id
-                        )));
-                    }
-                    None => {
-                        return Err(AgentRoleError::Conflict(format!(
-                            "角色 {} 已存在，请选择编辑、覆盖或另存为",
-                            normalized.id
-                        )));
-                    }
-                    _ => {}
-                }
-            }
-        } else if expected_role_revision.is_some() {
-            return Err(AgentRoleError::Conflict(format!(
-                "角色 {} 不存在，不能按更新方式保存",
-                normalized.id
-            )));
-        }
-        let mut normalized = normalized;
-        normalized.role_revision = existing
-            .map(|role| role.role_revision.saturating_add(1))
-            .unwrap_or(1);
+        let normalized = check_user_role(&snapshot, role, expected_role_revision)?;
         let path = self.user_role_dir.join(format!("{}.md", normalized.id));
         fs::create_dir_all(self.user_role_dir()).map_err(|source| AgentRoleError::Io {
             path: self.user_role_dir.clone().as_ref().clone(),
@@ -1037,6 +1016,53 @@ fn normalize_string_list(values: &mut Vec<String>) {
         *value = value.trim().to_string();
         !value.is_empty() && seen.insert(value.clone())
     });
+}
+
+/// 用户角色保存前的唯一检查：规范化、字段校验、内置角色保护与版本冲突。
+fn check_user_role(
+    snapshot: &RegistrySnapshot,
+    role: AgentRole,
+    expected_role_revision: Option<u64>,
+) -> Result<AgentRole, AgentRoleError> {
+    let normalized = normalize_role(role).map_err(AgentRoleError::InvalidDefinition)?;
+    validate_role_for_persistence(&normalized, &snapshot.capabilities)
+        .map_err(AgentRoleError::InvalidDefinition)?;
+    if snapshot.builtin_ids.contains(&normalized.id) {
+        return Err(AgentRoleError::Conflict(format!(
+            "角色 {} 是系统内置角色，不能被覆盖",
+            normalized.id
+        )));
+    }
+    let existing = snapshot.roles.get(&normalized.id);
+    if let Some(existing) = existing {
+        if !snapshot.builtin_ids.contains(&normalized.id) {
+            match expected_role_revision {
+                Some(expected) if expected != existing.role_revision => {
+                    return Err(AgentRoleError::Conflict(format!(
+                        "角色 {} 已被其他窗口修改，请刷新后重试",
+                        normalized.id
+                    )));
+                }
+                None => {
+                    return Err(AgentRoleError::Conflict(format!(
+                        "角色 {} 已存在，请选择编辑、覆盖或另存为",
+                        normalized.id
+                    )));
+                }
+                _ => {}
+            }
+        }
+    } else if expected_role_revision.is_some() {
+        return Err(AgentRoleError::Conflict(format!(
+            "角色 {} 不存在，不能按更新方式保存",
+            normalized.id
+        )));
+    }
+    let mut normalized = normalized;
+    normalized.role_revision = existing
+        .map(|role| role.role_revision.saturating_add(1))
+        .unwrap_or(1);
+    Ok(normalized)
 }
 
 fn validate_role_for_persistence(
