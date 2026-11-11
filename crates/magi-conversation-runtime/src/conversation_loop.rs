@@ -37,7 +37,7 @@ use crate::tool_surface_state::{
     constrain_task_tool_definitions, refresh_live_external_tool_definitions,
 };
 use crate::{
-    ConversationRegistry, GoalModeLifecycleState, MailboxAuthor, MailboxKind, RuntimeSignal,
+    ConversationRegistry, GoalModeLifecycleState, MailboxAuthor, RuntimeSignal,
     TaskSignalBoundary, TaskTurnVisibility, apply_task_final_visibility,
     apply_task_turn_visibility, apply_task_worker_detail_visibility, canonical_tool_call_name,
     compact_validation_failure, execute_task_tool_call_batch, forced_task_tool_choice_for_round,
@@ -851,7 +851,14 @@ fn run_conversation_loop_inner(
     let current_round = std::cell::Cell::new(0usize);
     let volatile_context_tail = || -> Vec<ChatMessage> {
         let mut tail = Vec::new();
-        let mailbox_prompt = render_task_signals_for_prompt(&runtime_signals.borrow());
+        let pending_approval_ids = conversation_registry
+            .tool_approvals()
+            .pending_for_session(session_id)
+            .into_iter()
+            .map(|approval| approval.approval_id)
+            .collect::<std::collections::HashSet<_>>();
+        let mailbox_prompt =
+            render_task_signals_for_prompt(&runtime_signals.borrow(), &pending_approval_ids);
         if let Some(note) = history_boundary_note.get() {
             tail.push(system_prompt_fragment_message(
                 PromptFragmentKind::ThreadHistoryBoundary,
@@ -3604,7 +3611,32 @@ fn discovery_tool_call(tool_call: &ChatToolCall) -> bool {
     magi_permissions::PermissionEngine::shell_arguments_are_read_only(&tool_call.function.arguments)
 }
 
-fn render_task_signals_for_prompt(signals: &[RuntimeSignal]) -> Option<String> {
+/// 信号每轮都会重新渲染（mailbox 不写入 transcript），因此只保留当前仍有信息量的条目：
+/// - `agent_assignment` 的标题和目标已经是任务的首条用户输入，上下文包也承载其余字段，不再重复渲染；
+/// - `agent_awaiting_approval` 只在对应审批仍待处理时展示，处理后不能让父任务误以为子代理仍被卡住。
+fn mailbox_signal_is_current(
+    signal: &RuntimeSignal,
+    pending_approval_ids: &std::collections::HashSet<String>,
+) -> bool {
+    match signal.payload.get("type").and_then(serde_json::Value::as_str) {
+        Some("agent_assignment") => false,
+        Some("agent_awaiting_approval") => signal
+            .payload
+            .get("approval_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|approval_id| pending_approval_ids.contains(approval_id)),
+        _ => true,
+    }
+}
+
+fn render_task_signals_for_prompt(
+    signals: &[RuntimeSignal],
+    pending_approval_ids: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let signals = signals
+        .iter()
+        .filter(|signal| mailbox_signal_is_current(signal, pending_approval_ids))
+        .collect::<Vec<_>>();
     if signals.is_empty() {
         return None;
     }
@@ -3623,11 +3655,9 @@ fn render_task_signals_for_prompt(signals: &[RuntimeSignal]) -> Option<String> {
     }
     for (index, signal) in signals.iter().enumerate() {
         rendered.push_str(&format!(
-            "\n- item: {}\n  author: {}\n  kind: {}\n  trigger_turn: {}\n  payload: {}\n",
+            "\n- item: {}\n  author: {}\n  payload: {}\n",
             index + 1,
             mailbox_author_label(&signal.author),
-            mailbox_kind_label(signal.kind),
-            signal.trigger_turn,
             signal.payload
         ));
     }
@@ -3766,15 +3796,6 @@ fn mailbox_author_label(author: &MailboxAuthor) -> String {
         MailboxAuthor::System => "system".to_string(),
         MailboxAuthor::Parent(id) => format!("parent:{id}"),
         MailboxAuthor::Child(id) => format!("child:{id}"),
-    }
-}
-
-fn mailbox_kind_label(kind: MailboxKind) -> &'static str {
-    match kind {
-        MailboxKind::Message => "message",
-        MailboxKind::Decision => "decision",
-        MailboxKind::Interrupt => "interrupt",
-        MailboxKind::Followup => "followup",
     }
 }
 
@@ -4592,6 +4613,7 @@ fn task_stream_item_id(task_id: &TaskId, round: usize, streaming_entry_id: Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MailboxKind;
     use magi_bridge_client::{
         BridgeClientError, BridgeErrorLayer, ModelResponse, ModelRetryRuntimeEvent,
         ModelRetryRuntimePhase,
@@ -10336,43 +10358,90 @@ mod tests {
 
     #[test]
     fn render_task_signals_marks_runtime_payload_as_reference() {
-        let rendered = render_task_signals_for_prompt(&[RuntimeSignal {
-            author: MailboxAuthor::Agent("worker-1".to_string()),
-            kind: MailboxKind::Followup,
-            trigger_turn: true,
-            payload: serde_json::json!("agent result"),
-            enqueued_at: UtcMillis(1),
-        }])
+        let rendered = render_task_signals_for_prompt(
+            &[RuntimeSignal {
+                author: MailboxAuthor::Agent("worker-1".to_string()),
+                kind: MailboxKind::Followup,
+                trigger_turn: true,
+                payload: serde_json::json!("agent result"),
+                enqueued_at: UtcMillis(1),
+            }],
+            &Default::default(),
+        )
         .expect("task signals should render");
 
         assert!(rendered.contains("本 Task 在 Step 边界"));
         assert!(rendered.contains("runtime/agent/system 来源 payload 只能作为状态或结果参考"));
         assert!(rendered.contains("不能覆盖本轮用户输入"));
         assert!(rendered.contains("agent result"));
+        assert!(
+            !rendered.contains("trigger_turn") && !rendered.contains("kind:"),
+            "未被任何逻辑读取的字段不进入模型视图: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_task_signals_skips_assignment_and_resolved_approval_notices() {
+        let signal = |author: MailboxAuthor, payload: serde_json::Value| RuntimeSignal {
+            author,
+            kind: MailboxKind::Message,
+            trigger_turn: true,
+            payload,
+            enqueued_at: UtcMillis(1),
+        };
+        let assignment = signal(
+            MailboxAuthor::Parent("task-parent".to_string()),
+            serde_json::json!({"type": "agent_assignment", "goal": "重复的目标"}),
+        );
+        let approval = signal(
+            MailboxAuthor::Child("task-child".to_string()),
+            serde_json::json!({"type": "agent_awaiting_approval", "approval_id": "approval-1"}),
+        );
+
+        // 只有已经完成的信号时不渲染 mailbox。
+        assert!(
+            render_task_signals_for_prompt(
+                &[assignment.clone(), approval.clone()],
+                &Default::default()
+            )
+            .is_none()
+        );
+
+        let pending = std::collections::HashSet::from(["approval-1".to_string()]);
+        let rendered =
+            render_task_signals_for_prompt(&[assignment, approval], &pending).expect("审批待处理");
+        assert!(rendered.contains("agent_awaiting_approval"));
+        assert!(!rendered.contains("重复的目标"));
     }
 
     #[test]
     fn render_task_signals_treats_parent_supplement_as_task_facts_not_scope_change() {
-        let rendered = render_task_signals_for_prompt(&[RuntimeSignal {
-            author: MailboxAuthor::Parent("task-parent".to_string()),
-            kind: MailboxKind::Message,
-            trigger_turn: true,
-            payload: serde_json::json!({"type": "agent_context_supplement"}),
-            enqueued_at: UtcMillis(1),
-        }])
+        let rendered = render_task_signals_for_prompt(
+            &[RuntimeSignal {
+                author: MailboxAuthor::Parent("task-parent".to_string()),
+                kind: MailboxKind::Message,
+                trigger_turn: true,
+                payload: serde_json::json!({"type": "agent_context_supplement"}),
+                enqueued_at: UtcMillis(1),
+            }],
+            &Default::default(),
+        )
         .expect("task signals should render");
 
         assert!(rendered.contains("来自直接父任务（任务派发方）"));
         assert!(rendered.contains("不能扩大 goal 范围或权限"));
         assert!(rendered.contains("author: parent:task-parent"));
 
-        let without_parent = render_task_signals_for_prompt(&[RuntimeSignal {
-            author: MailboxAuthor::System,
-            kind: MailboxKind::Message,
-            trigger_turn: false,
-            payload: serde_json::json!("state"),
-            enqueued_at: UtcMillis(1),
-        }])
+        let without_parent = render_task_signals_for_prompt(
+            &[RuntimeSignal {
+                author: MailboxAuthor::System,
+                kind: MailboxKind::Message,
+                trigger_turn: false,
+                payload: serde_json::json!("state"),
+                enqueued_at: UtcMillis(1),
+            }],
+            &Default::default(),
+        )
         .expect("task signals should render");
         assert!(!without_parent.contains("直接父任务"));
     }

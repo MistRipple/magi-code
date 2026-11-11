@@ -6,6 +6,8 @@
 
 - Magi 的业务内核是 `magi-daemon`。`apps/daemon` 的 `magi-daemon-app` 是开发和无头入口；Electron 正式发行版由 Main 通过受控 sidecar 托管 daemon。
 - UI、Worker 和宿主不复制 daemon 的会话、任务、权限或持久化事实；UI 只消费和展示服务端事实，不反向发明业务协议，也不绕开授权入口。
+- 产品范围：只提供 Electron 桌面 GUI 与 Web 工作台（手机和平板走同一 Web 工作台的响应式布局），没有 Magi CLI 或独立移动端；外部 Agent Executor 只预留通用扩展接口；插件由 daemon 托管的 Node 扩展宿主承载，QuickJS 与 SDK 1 已删除。不要按这些已排除的方向新增实现。
+- 协议字段、DTO 结构、事件信封与宿主桥接命令处于冻结与收敛状态，只做对应协议兼容规则内的增量修改。
 - 工程约束、运行入口和整体架构见 [docs/README.md](docs/README.md)。
 
 ## 通用工作规则
@@ -18,9 +20,9 @@
 
 ## 兼容与兜底
 
-默认不保留双轨实现、影子实现、隐藏回退或仅为旧实现服务的兜底；替换实现时在同一轮清退旧代码、无效分支和冗余配置。
+禁止长期双实现、影子实现、回退逻辑、补丁式兼容分支和仅为旧实现服务的兜底；替换实现时在同一轮清退旧代码、无效分支和冗余配置。
 
-如果认为确实需要为推测性的竞态、故障或旧数据增加兜底，先向用户说明具体失败模式、触发概率和增加的复杂度，得到同意后再做，不要静默扩大范围。已发布的持久化数据与 wire 协议的兼容，按对应 schema 与迁移文档执行，不适用这条默认。
+确需短期过渡实现（例如分步迁移）时，先向用户说明具体失败模式、触发概率、增加的复杂度和清退时点，得到同意后再做，并在同一任务内记录清退条件；不要静默扩大范围，也不要为推测性的竞态或故障预先加兜底。已发布的持久化数据与 wire 协议的兼容，按对应 schema 与迁移文档执行。
 
 ## 功能开发
 
@@ -61,9 +63,18 @@
 | App Server schema/生成物 | `npm run protocol:check` |
 | Browser 工具 schema/catalog/生成物 | `npm run browser-tool-catalog:check` |
 | Browser 工具执行语义 | `npm run test:browser-core`；涉及真实 Electron/Chromium 行为时按局部规则做运行验收 |
+| 插件包、生命周期、扩展宿主 | `cargo test -p magi-plugin-system -p magi-extension-host --all-targets --locked`；官方插件中心改动加 `npm run plugin-center:check`；真实业务验收按[每轮推进与完成门槛](docs/plugin-system-requirements-design.md#每轮推进与完成门槛2026-11-09) |
+| 内置代理提示词、工具定义 | `cargo test -p magi-agent-role`、`cargo test -p magi-conversation-runtime --test prompt_layout_snapshots` 及受影响的提示词断言测试；见下方“提示词与工具定义” |
 | 发布或创建/移动版本 Tag | 严格遵循 [发布流程](docs/release-process.md) |
 
-更多脚本与验证入口见 [docs/validation.md](docs/validation.md)。
+更多脚本与验证入口见 [docs/validation.md](docs/validation.md)。发布预检（`npm run release:preflight`）会执行 `clippy --workspace -D warnings` 和 Rust 全量测试；改动 Rust 后，至少让自己改动的文件不引入新的 clippy 告警。
+
+## 提示词与工具定义
+
+- 角色提示词、能力提示词、运行时注入规则和工具描述分别只有一个事实源：委派规则在 `AGENT_DELEGATION_GUIDANCE` 与 `agent_spawn` 等工具定义，角色文件不重复，也不授予或禁止委派；设计合同见 [子代理唤起设计](docs/subagent-delegation-design.md)。
+- 渲染后的完整前缀会被模型缓存，工具名、描述和 schema 的任何改动都会影响复用，见 [提示词缓存优化](docs/prompt-cache-optimization.md)。改动前确认确有行为收益，不为命中率填充无用文字。
+- 角色提示和能力不授予权限，也不因角色名形成硬只读边界；权限以运行时 TaskPolicy 为准（[自定义 Worker 角色设计](docs/custom-worker-role-design.md)）。
+- 改动提示词措辞时同步更新断言它的测试和上述设计文档，不要只改其中一处。
 
 ## 按改动位置读取局部规则
 
