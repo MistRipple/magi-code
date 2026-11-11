@@ -201,7 +201,7 @@ pub fn workspace_execution_preparer(
                 let execution = directory
                     .execution_root()
                     .map_err(|error| error.to_string())?;
-                if source != execution {
+                if !magi_git::same_path(&source, &execution) {
                     continue;
                 }
                 match state.git_service.observe(&execution).await {
@@ -243,10 +243,11 @@ pub fn workspace_execution_preparer(
                         )
                         .await
                         .map_err(|error| format!("{error:?}"))?;
-                    if context
-                        .as_ref()
-                        .is_some_and(|context| !repositories.contains(&context.git.git_common_dir))
-                    {
+                    if context.as_ref().is_some_and(|context| {
+                        !repositories.iter().any(|repository| {
+                            magi_git::same_path(repository, &context.git.git_common_dir)
+                        })
+                    }) {
                         return Err("准备期间项目仓库身份已变化".into());
                     }
                     snapshots.push(

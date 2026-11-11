@@ -2806,7 +2806,12 @@ fn resolve_git_path(worktree_path: &Path, value: &str) -> PathBuf {
     }
 }
 
-fn same_path(left: &Path, right: &Path) -> bool {
+/// Compare paths by their canonical filesystem identity when available.
+///
+/// This also normalizes platform-specific spellings such as Windows extended
+/// length paths, which can differ between `std::fs::canonicalize` and a host
+/// path decoded from the public path reference.
+pub fn same_path(left: &Path, right: &Path) -> bool {
     canonical_or_original(left) == canonical_or_original(right)
 }
 
