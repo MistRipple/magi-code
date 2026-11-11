@@ -35,9 +35,11 @@
     placement?: 'settings' | 'page' | 'background' | 'composerLeft' | 'chatAssistant';
     viewEntry?: string | null;
     conversation?: PluginConversationViewContext;
+    /** 内嵌入口按页面实际内容收起占位，文档继续保留以接收后续内容。 */
+    onContentVisibility?: (visible: boolean) => void;
   }
 
-  let { pluginId, entry, label, frameTestId = 'plugin-view', placement = 'page', viewEntry = entry, conversation }: Props = $props();
+  let { pluginId, entry, label, frameTestId = 'plugin-view', placement = 'page', viewEntry = entry, conversation, onContentVisibility }: Props = $props();
   const inline = $derived(placement === 'composerLeft' || placement === 'chatAssistant');
   /** 页面上报的内容高度（CSS 像素）；只在 settings 位置生效，重新加载后清空。 */
   let reportedHeight = $state<number | null>(null);
@@ -366,7 +368,7 @@
         return;
       }
       if (operation === 'view.resize') {
-        // 页面报告自己的内容高度；只有嵌入设置页整页滚动的位置采用，其余位置确认收到但不改变尺寸。
+        // 页面报告自己的内容高度；设置页用于整页滚动，内嵌入口据此收起空内容占位。
         const height = event.data.height;
         if (typeof height !== 'number' || !Number.isFinite(height) || height < 0 || height > MAX_VIEW_HEIGHT) {
           throw new Error('视图高度无效');
@@ -382,6 +384,7 @@
         // 保活设置页隐藏时没有可测量视口，零尺寸不得覆盖最后一次有效高度，
         // 否则恢复布局会压缩滚动范围并永久夹断用户的阅读位置。
         if (inline || placement === 'settings' && iframe?.getClientRects().length) reportedHeight = Math.ceil(height);
+        if (inline) onContentVisibility?.(height > 0);
         send({ type: 'response', requestId, ok: true, result: null }, expectedInstance);
         return;
       }
@@ -454,6 +457,8 @@
     const identity = documentIdentity;
     if (identity === navigationIdentity) return;
     navigationIdentity = identity;
+    // 旧文档的空内容不能隐藏新实例的加载或失败状态。
+    onContentVisibility?.(true);
     releaseResourceSubscriptions();
     releaseRoutes();
     documentDigest = '';

@@ -3337,10 +3337,8 @@ async function refreshPickerSettingsSnapshot() {
         </div>
         {#if currentSessionId}
           {#each conversationViews(pluginProjection().manifests, 'composerLeft') as item (item.pluginId + ':' + item.view.id)}
-            <div class="ia-plugin-action">
-              <PluginConversationView pluginId={item.pluginId} entry={item.view.entry} label={item.view.title}
-                placement="composerLeft" context={{ sessionId: currentSessionId }} />
-            </div>
+            <PluginConversationView pluginId={item.pluginId} entry={item.view.entry} label={item.view.title}
+              placement="composerLeft" context={{ sessionId: currentSessionId }} />
           {/each}
         {/if}
         <div class="ia-picker-wrap ia-workspace-wrap">
@@ -3861,7 +3859,6 @@ async function refreshPickerSettingsSnapshot() {
 {/if}
 
 <style>
-  .ia-plugin-action { inline-size: 96px; min-inline-size: 0; flex: 0 1 96px; }
   .ia-context-picker-loading {
     display: flex;
     min-height: 220px;

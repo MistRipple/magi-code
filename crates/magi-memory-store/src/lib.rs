@@ -99,7 +99,8 @@ impl MemoryStore {
         Self::default()
     }
 
-    pub fn append(&self, record: MemoryRecord) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn seed_memory_for_test(&self, record: MemoryRecord) {
         self.entries
             .write()
             .expect("memory store write lock poisoned")

@@ -478,6 +478,44 @@ async fn approve_advances_baseline() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn active_tool_with_declared_paths_does_not_claim_unrelated_changes() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let manager = SnapshotManager::new();
+    let session = manager
+        .start_session("declared-tool-owner".into(), root.clone())
+        .await
+        .unwrap();
+    let context = ToolHookCtx {
+        tool_call_id: "call-declared-owner".into(),
+        worker_id: Some("worker-declared-owner".into()),
+        execution_group_id: Some("group-declared-owner".into()),
+        declared_paths: vec![PathBuf::from("owned.txt")],
+    };
+    session.before_tool(&context);
+    fs::write(root.join("owned.txt"), "owned").unwrap();
+    fs::write(root.join("unrelated.txt"), "unrelated").unwrap();
+    session.reconcile().unwrap();
+    session.after_tool(&context);
+
+    let pending = session.pending_changes().unwrap();
+    let owned = pending
+        .iter()
+        .find(|change| change.path == "owned.txt")
+        .unwrap();
+    assert_eq!(owned.source, SourceKind::Tool);
+    assert_eq!(owned.tool_call_id.as_deref(), Some("call-declared-owner"));
+    let unrelated = pending
+        .iter()
+        .find(|change| change.path == "unrelated.txt")
+        .unwrap();
+    assert_ne!(unrelated.source, SourceKind::Tool);
+    assert!(unrelated.tool_call_id.is_none());
+    assert!(unrelated.worker_id.is_none());
+    assert!(unrelated.execution_group_id.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn revert_restores_baseline_content() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();

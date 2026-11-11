@@ -12,4 +12,5 @@ magi-session-store = { path = "../magi-session-store" }
 tracing.workspace = true
 
 [dev-dependencies]
+magi-memory-store = { path = "../magi-memory-store", features = ["test-support"] }
 magi-session-store = { path = "../magi-session-store", features = ["test-support"] }

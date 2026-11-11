@@ -49,6 +49,24 @@ impl ToolResultSlot for ThreadChatMessage {
 
 pub(crate) use magi_session_store::HistoryProjection as ProjectionReport;
 
+/// 只有成功读取且带完整身份的回执才描述文件内容事实；失败和未执行回执保持原始诊断。
+fn file_read_fact(payload: &serde_json::Value) -> Option<(&str, &str)> {
+    if payload.get("tool")?.as_str()? != "file_read"
+        || payload.get("status")?.as_str()? != "succeeded"
+    {
+        return None;
+    }
+    let path = payload
+        .get("path")?
+        .as_str()
+        .filter(|path| !path.is_empty())?;
+    let hash = payload
+        .get("content_hash")?
+        .as_str()
+        .filter(|hash| !hash.is_empty())?;
+    Some((path, hash))
+}
+
 /// 刚读取的文件结果在创建时就是“当前”事实，直接带上与历史校验相同的 `fact_state` 标注。
 ///
 /// 回合边界重建历史时 [`refresh_file_facts`] 会给未变化的读取结果补上同一标注；
@@ -57,16 +75,7 @@ pub(crate) fn with_current_file_fact(content: String) -> String {
     let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&content) else {
         return content;
     };
-    if payload.get("tool").and_then(serde_json::Value::as_str) != Some("file_read")
-        || payload
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .is_none()
-        || payload
-            .get("content_hash")
-            .and_then(serde_json::Value::as_str)
-            .is_none()
-    {
+    if file_read_fact(&payload).is_none() {
         return content;
     }
     payload["fact_state"] = serde_json::Value::String("current".to_string());
@@ -91,24 +100,11 @@ pub(crate) fn refresh_file_facts(history: &mut [ThreadChatMessage]) -> usize {
         let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(content) else {
             continue;
         };
-        if payload.get("tool").and_then(serde_json::Value::as_str) != Some("file_read") {
+        let Some((path, expected_hash)) = file_read_fact(&payload) else {
             continue;
-        }
-        let path = payload
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let expected_hash = payload
-            .get("content_hash")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let is_current =
-            path.as_deref()
-                .zip(expected_hash.as_deref())
-                .is_some_and(|(path, expected_hash)| {
-                    magi_snapshot::path_content_hash(Path::new(path))
-                        .is_ok_and(|actual_hash| actual_hash == expected_hash)
-                });
+        };
+        let is_current = magi_snapshot::path_content_hash(Path::new(path))
+            .is_ok_and(|actual_hash| actual_hash == expected_hash);
         if is_current {
             payload["fact_state"] = serde_json::Value::String("current".to_string());
             message.content = Some(payload.to_string());
@@ -469,6 +465,39 @@ mod tests {
         let mut history = vec![thread_tool_message(0, fixture.raw_read(0, 100))];
         std::fs::write(fixture.dir.join("file-0.txt"), "changed").unwrap();
         assert_eq!(refresh_file_facts(&mut history), 1);
+    }
+
+    #[test]
+    fn file_fact_refresh_preserves_failures_and_receipts_without_content_identity() {
+        let fixture = Fixture::new("projection-failed-read");
+        let success: serde_json::Value = serde_json::from_str(&fixture.raw_read(0, 10)).unwrap();
+        let receipts = [
+            serde_json::json!({"tool":"file_read", "status":"failed",
+                "error_code":"workspace_execution_root_changed", "execution":"not_started",
+                "instruction":"请使用本任务当前执行目录重新调用。"}),
+            serde_json::json!({"tool":"file_read", "status":"rejected",
+                "error_code":"file_read_permission_denied"}),
+            serde_json::json!({"tool":"file_read", "status":"cancelled"}),
+            serde_json::json!({"tool":"file_read", "status":"succeeded", "path":success["path"]}),
+            serde_json::json!({"tool":"file_read", "status":"succeeded", "content_hash":success["content_hash"]}),
+            serde_json::json!({"tool":"file_read", "path":success["path"], "content_hash":success["content_hash"]}),
+            serde_json::json!({"tool":"file_read", "status":"failed", "path":success["path"],
+                "content_hash":success["content_hash"], "error_code":"file_read_io_failed"}),
+        ];
+        for (index, receipt) in receipts.into_iter().enumerate() {
+            let raw = receipt.to_string();
+            assert_eq!(with_current_file_fact(raw.clone()), raw);
+            let mut history = vec![thread_tool_message(index, raw.clone())];
+            assert_eq!(refresh_file_facts(&mut history), 0);
+            assert_eq!(history[0].content.as_deref(), Some(raw.as_str()));
+        }
+        // 成功读取仍须在文件变化后失效，重复投影不能继续丢弃已有诊断。
+        std::fs::write(fixture.dir.join("file-0.txt"), "changed").unwrap();
+        let mut history = vec![thread_tool_message(0, success.to_string())];
+        assert_eq!(refresh_file_facts(&mut history), 1);
+        let stale = history[0].content.clone();
+        assert_eq!(refresh_file_facts(&mut history), 0);
+        assert_eq!(history[0].content, stale);
     }
 
     fn chat(role: &str, text: &str) -> ChatMessage {

@@ -2131,6 +2131,8 @@ mod tests {
                     serde_json::json!({
                         "include_external": true,
                         "include_mcp_servers": true,
+                        "tool_names": ["mcp__cancel_mcp__write_file"],
+                        "include_schema": true,
                     })
                     .to_string(),
                 ),
@@ -3609,6 +3611,8 @@ done
                     serde_json::json!({
                         "include_external": true,
                         "include_mcp_servers": true,
+                        "tool_names": ["mcp__turn_mcp__write_file"],
+                        "include_schema": true,
                     })
                     .to_string(),
                 ),
@@ -3767,6 +3771,8 @@ done
                     serde_json::json!({
                         "include_external": true,
                         "include_mcp_servers": true,
+                        "tool_names": ["mcp__read_only_mcp__read_file"],
+                        "include_schema": true,
                     })
                     .to_string(),
                 ),
@@ -4002,6 +4008,8 @@ done
                     serde_json::json!({
                         "include_external": true,
                         "include_mcp_servers": true,
+                        "tool_names": ["mcp__turn_http_mcp__write_file"],
+                        "include_schema": true,
                     })
                     .to_string(),
                 ),

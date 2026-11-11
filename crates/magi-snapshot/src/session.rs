@@ -664,7 +664,13 @@ impl SnapshotSession {
         if active.is_empty() {
             return None;
         }
-        if active.len() == 1 {
+        // 已声明路径必须匹配；其他工具结束后只剩一个活动工具也不能认领无关变更。
+        if active.len() == 1
+            && active
+                .values()
+                .next()
+                .is_some_and(|ctx| ctx.declared_paths.is_empty())
+        {
             return active.values().next().cloned();
         }
 

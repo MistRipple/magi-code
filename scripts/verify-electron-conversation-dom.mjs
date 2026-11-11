@@ -433,6 +433,10 @@ function toolCallStream(name, arguments_, id = "electron-dom-tool-call-1") {
       }],
     })}\n\n`,
     `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "tool_calls" }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [], usage: {
+      prompt_tokens: 128,
+      completion_tokens: Math.max(1, Math.ceil(JSON.stringify(arguments_).length / 4)),
+    } })}\n\n`,
     "data: [DONE]\n\n",
   ].join("");
 }
@@ -532,30 +536,16 @@ function latestUserText(messages) {
   return (Array.isArray(messages) ? messages : [])
     .filter((message) => message?.role === "user")
     .map(messageText)
+    // 运行时上下文片段不是用户任务；模型请求的尾部可能包含这类事实说明。
+    .filter((text) => !text.startsWith("<magi-context-fragment"))
     .at(-1) || "";
 }
 
 function latestPromptText(messages) {
   const text = latestUserText(messages);
-  const taskMarker = "--- Task ---";
-  const taskIndex = text.lastIndexOf(taskMarker);
-  if (taskIndex >= 0) {
-    const taskText = text.slice(taskIndex + taskMarker.length).trim();
-    const executionMarker = "执行:";
-    const executionIndex = taskText.indexOf(executionMarker);
-    if (executionIndex >= 0) {
-      return taskText.slice(executionIndex + executionMarker.length).trim().split(/\r?\n/u)[0].trim();
-    }
-    return taskText.split(/\r?\n/u).filter(Boolean).at(-1)?.trim() || taskText;
-  }
-  const markerIndex = text.lastIndexOf("用户原始输入");
-  if (markerIndex >= 0) {
-    return text
-      .slice(markerIndex + "用户原始输入".length)
-      .replace(/^\s*[:：]\s*/u, "")
-      .trim();
-  }
-  return text.trim();
+  const marker = "用户原始输入：";
+  const markerIndex = text.lastIndexOf(marker);
+  return markerIndex >= 0 ? text.slice(markerIndex + marker.length).trim() : text.trim();
 }
 
 function providerResponse(body) {
@@ -586,8 +576,8 @@ function providerResponse(body) {
   }
   const compactionToken = compactionResponseToken(promptText);
   if (promptText.includes("服务边界挂起")) {
-    if (latestPromptText(messages).includes("服务边界排队")) return openAiStream("ELECTRON_BOUNDARY_QUEUE_OK");
-    if (latestPromptText(messages).includes("继续")) return openAiStream("ELECTRON_BOUNDARY_CONTINUE_OK");
+    if (currentPrompt.includes("服务边界排队")) return openAiStream("ELECTRON_BOUNDARY_QUEUE_OK");
+    if (currentPrompt.includes("继续")) return openAiStream("ELECTRON_BOUNDARY_CONTINUE_OK");
     return null;
   }
 
@@ -3810,14 +3800,14 @@ try {
     const card = await page.evaluate(`(() => {
       const root = document.querySelector('.tool-approval');
       if (!root) return null;
-      const primary = root.querySelector('button.approval-button--primary');
+      const primary = root.querySelector('button.btn--primary');
       return { text: root.innerText || '', allowOnce: Boolean(primary && !primary.disabled) };
     })()`);
     return card?.allowOnce ? { ...state, approval: card } : null;
   }, "Git mutation 审批卡片", 45_000);
   check("Git mutation 审批卡片进入真实 DOM", gitMutationApproval.approval.text.length > 0);
   check("Git mutation 审批卡片允许一次可用", gitMutationApproval.approval.allowOnce);
-  await page.evaluate(`document.querySelector('.tool-approval button.approval-button--primary')?.click()`);
+  await page.evaluate(`document.querySelector('.tool-approval button.btn--primary')?.click()`);
   const gitMutationResult = await waitForAssistant(
     page,
     gitMutationResponseText,
@@ -3918,7 +3908,7 @@ try {
       const root = document.querySelector('.tool-approval');
       if (!root) return null;
       const buttons = [...root.querySelectorAll('button')];
-      const primary = root.querySelector('button.approval-button--primary');
+      const primary = root.querySelector('button.btn--primary');
       return {
         text: root.innerText || '',
         allowOnce: Boolean(primary && !primary.disabled),
@@ -3933,7 +3923,7 @@ try {
   check("Restricted 审批卡片包含允许一次操作", approval.approval.allowOncePresent);
   check("Restricted 审批卡片包含按 Turn 允许操作", approval.approval.allowForTurn);
   check("Restricted 审批卡片包含拒绝操作", approval.approval.deny);
-  await page.evaluate(`document.querySelector('.tool-approval button.approval-button--primary')?.click()`);
+  await page.evaluate(`document.querySelector('.tool-approval button.btn--primary')?.click()`);
   const approvalResult = await waitForAssistant(page, approvalResponseText, "审批恢复最终消息");
   check("审批允许后最终消息进入真实 DOM", approvalResult.text.includes(approvalResponseText));
   let approvalFileExists = true;
@@ -3970,7 +3960,7 @@ try {
       const root = document.querySelector('.tool-approval');
       if (!root) return null;
       const buttons = [...root.querySelectorAll('button')];
-      const primary = root.querySelector('button.approval-button--primary');
+      const primary = root.querySelector('button.btn--primary');
       return {
         text: root.innerText || '',
         allowOnce: Boolean(primary && !primary.disabled),

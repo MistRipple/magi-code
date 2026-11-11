@@ -44,13 +44,31 @@ await withGoldenViteServer(async (server) => {
   for (const endpoint of [
     '/api/session/isolations',
     '/api/session/workspace-waits',
-    '/api/session/isolation',
     '/api/session/isolation/enable',
     '/api/session/isolation/discard',
     '/api/session/isolation/merge-plan',
     '/api/session/isolation/merge',
   ]) {
     assert.ok(api.includes(`'${endpoint}'`), `agent-api 缺少 ${endpoint}`);
+  }
+  // 工作台从列表统一加载隔离事实，不依赖单会话请求包装。
+  const agentApi = await server.ssrLoadModule('/src/web/agent-api.ts');
+  const originalFetch = globalThis.fetch;
+  const isolations = [{ sessionId: 'isolated-session', workspaceId: 'workspace-isolation' }];
+  const requests = [];
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: new URL(url), init });
+    return new Response(JSON.stringify({ isolations }), {
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  try {
+    assert.deepEqual((await agentApi.listAgentSessionIsolations()).isolations, isolations);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url.pathname, '/api/session/isolations');
+    assert.equal(requests[0].init.cache, 'no-store');
+  } finally {
+    globalThis.fetch = originalFetch;
   }
   const bridge = await read('../src/shared/bridges/web-client-bridge.ts');
   assert.match(bridge, /session\.isolation\.changed/);

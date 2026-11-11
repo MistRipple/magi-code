@@ -752,7 +752,7 @@ mod tests {
         // --- memory store: 5 records, budget allows 2 ---
         let memory_store = MemoryStore::new();
         for i in 1..=5 {
-            memory_store.append(MemoryRecord {
+            memory_store.seed_memory_for_test(MemoryRecord {
                 memory_id: format!("mem-{i}"),
                 session_id: session_id.clone(),
                 layer: magi_memory_store::MemoryLayer::Recent,
@@ -1012,7 +1012,7 @@ mod tests {
         });
 
         let memory_store = MemoryStore::new();
-        memory_store.append(MemoryRecord {
+        memory_store.seed_memory_for_test(MemoryRecord {
             memory_id: "mem-session-1".to_string(),
             session_id: session_id.clone(),
             layer: magi_memory_store::MemoryLayer::Recent,
@@ -1387,7 +1387,7 @@ mod tests {
         let memory_store = MemoryStore::new();
 
         // 2 Recent, 2 Durable, 1 Shared
-        memory_store.append(MemoryRecord {
+        memory_store.seed_memory_for_test(MemoryRecord {
             memory_id: "mem-recent-1".to_string(),
             session_id: session_id.clone(),
             layer: magi_memory_store::MemoryLayer::Recent,
@@ -1395,7 +1395,7 @@ mod tests {
             provenance: None,
             created_at: UtcMillis(10),
         });
-        memory_store.append(MemoryRecord {
+        memory_store.seed_memory_for_test(MemoryRecord {
             memory_id: "mem-recent-2".to_string(),
             session_id: session_id.clone(),
             layer: magi_memory_store::MemoryLayer::Recent,
@@ -1403,7 +1403,7 @@ mod tests {
             provenance: None,
             created_at: UtcMillis(20),
         });
-        memory_store.append(MemoryRecord {
+        memory_store.seed_memory_for_test(MemoryRecord {
             memory_id: "mem-durable-1".to_string(),
             session_id: session_id.clone(),
             layer: magi_memory_store::MemoryLayer::Durable,
@@ -1411,7 +1411,7 @@ mod tests {
             provenance: None,
             created_at: UtcMillis(30),
         });
-        memory_store.append(MemoryRecord {
+        memory_store.seed_memory_for_test(MemoryRecord {
             memory_id: "mem-durable-2".to_string(),
             session_id: session_id.clone(),
             layer: magi_memory_store::MemoryLayer::Durable,
@@ -1419,7 +1419,7 @@ mod tests {
             provenance: None,
             created_at: UtcMillis(40),
         });
-        memory_store.append(MemoryRecord {
+        memory_store.seed_memory_for_test(MemoryRecord {
             memory_id: "mem-shared-1".to_string(),
             session_id: session_id.clone(),
             layer: magi_memory_store::MemoryLayer::Shared,
@@ -2169,7 +2169,7 @@ mod tests {
             updated_at: UtcMillis(1),
         });
         let memory_store = MemoryStore::new();
-        memory_store.append(MemoryRecord {
+        memory_store.seed_memory_for_test(MemoryRecord {
             memory_id: "mem-1".to_string(),
             session_id: session_id.clone(),
             layer: magi_memory_store::MemoryLayer::Recent,

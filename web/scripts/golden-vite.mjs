@@ -23,7 +23,22 @@ export async function withGoldenViteServer(callback, options = {}) {
     cacheDir,
     root: options.root ?? webRoot,
     configFile: options.configFile ?? false,
-    ...(options.plugins ? { plugins: options.plugins } : {}),
+    plugins: [
+      ...(options.plugins ?? []),
+      {
+        name: 'magi-golden-ssr-only',
+        enforce: 'post',
+        configEnvironment(name, environment) {
+          if (name !== 'client') return;
+          // Golden 只调用 ssrLoadModule；客户端预构建既不参与断言，也不能在关闭后继续写缓存。
+          environment.optimizeDeps = {
+            ...environment.optimizeDeps,
+            noDiscovery: true,
+            include: [],
+          };
+        },
+      },
+    ],
     ...(options.ssr ? { ssr: options.ssr } : {}),
     logLevel: 'silent',
     server: { middlewareMode: true },
@@ -34,8 +49,6 @@ export async function withGoldenViteServer(callback, options = {}) {
   } finally {
     await options.cleanup?.();
     await server.close();
-    // Vite 的依赖优化器可能在 close() 返回后短暂完成临时目录清理；
-    // 使用 Node 的重试参数，避免并发 golden 在 macOS 上因 ENOTEMPTY 抖动失败。
-    await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    await rm(cacheDir, { recursive: true, force: true });
   }
 }

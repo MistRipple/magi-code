@@ -51,7 +51,9 @@ Magi 内部装配层，序列化到 Provider 前会被跳过；`ThreadChatMessag
 以便压缩、重启和恢复沿同一 request 身份核对消费。
 
 压缩边界不能把 `Attached` 输入放入摘要前缀。检查点若覆盖了仍未消费的输入，必须失效并从原始
-transcript 重建；图片输入从 canonical 用户 item 的受控 metadata 恢复。摘要辅助 Step 永远不
+transcript 重建；图片输入从 canonical 用户 item 的受控 metadata 恢复。输入被执行 Step 消费只证明
+首次交付，不代表可以丢弃图片：当前 Turn 仍保留在未压缩历史中的图文输入，在工具续轮、空响应恢复
+及重启恢复时都沿原 item 身份重新装配；其他 Turn 的图片不因此重新加载。摘要辅助 Step 永远不
 领取用户输入。只有请求已经冻结且消息实际带有对应 request 身份时，SessionStore 才能把 Input
 从 `Attached` 变为 `Consumed`。
 

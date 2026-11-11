@@ -218,40 +218,50 @@ fn dispatch_runtime_enforces_declared_executor_response_contract() {
 
 #[test]
 fn tool_concurrency_read_only_safe() {
-    assert!(crate::tool_concurrency::is_concurrency_safe("file_read"));
-    assert!(crate::tool_concurrency::is_concurrency_safe("view_image"));
-    assert!(crate::tool_concurrency::is_concurrency_safe("diff_preview"));
-    assert!(crate::tool_concurrency::is_concurrency_safe("search_text"));
-    assert!(crate::tool_concurrency::is_concurrency_safe(
-        "search_semantic"
-    ));
-    assert!(crate::tool_concurrency::is_concurrency_safe(
-        "knowledge_query"
-    ));
-    assert!(crate::tool_concurrency::is_concurrency_safe(
-        "knowledge_graph_query"
-    ));
-    assert!(crate::tool_concurrency::is_concurrency_safe("code_symbols"));
-    assert!(crate::tool_concurrency::is_concurrency_safe("tool_catalog"));
-    assert!(crate::tool_concurrency::is_concurrency_safe("web_search"));
-    assert!(!crate::tool_concurrency::is_concurrency_safe("file_view"));
-    assert!(!crate::tool_concurrency::is_concurrency_safe(
-        "code_search_regex"
-    ));
-    assert!(!crate::tool_concurrency::is_concurrency_safe(
-        "project_knowledge_query"
-    ));
-    assert!(!crate::tool_concurrency::is_concurrency_safe("shell_exec"));
-    assert!(!crate::tool_concurrency::is_concurrency_safe(
-        "process_launch"
-    ));
-    assert!(crate::tool_concurrency::is_concurrency_safe_call(
-        &crate::tool_concurrency::ToolConcurrencyInput {
-            tool_name: "shell_exec",
-            arguments: Some(&json!({ "command": "printf probe", "access_mode": "read_only" })),
+    use crate::tool_concurrency::{ToolConcurrencyInput, is_concurrency_safe_call};
+    for (names, expected) in [
+        (
+            &[
+                "file_read",
+                "view_image",
+                "diff_preview",
+                "search_text",
+                "search_semantic",
+                "knowledge_query",
+                "knowledge_graph_query",
+                "code_symbols",
+                "tool_catalog",
+                "web_search",
+            ][..],
+            true,
+        ),
+        (
+            &[
+                "file_view",
+                "code_search_regex",
+                "project_knowledge_query",
+                "shell_exec",
+                "process_launch",
+                "file_edit",
+            ][..],
+            false,
+        ),
+    ] {
+        for tool_name in names {
+            assert_eq!(
+                is_concurrency_safe_call(&ToolConcurrencyInput {
+                    tool_name,
+                    arguments: None,
+                }),
+                expected,
+                "{tool_name}"
+            );
         }
-    ));
-    assert!(!crate::tool_concurrency::is_concurrency_safe("file_edit"));
+    }
+    assert!(is_concurrency_safe_call(&ToolConcurrencyInput {
+        tool_name: "shell_exec",
+        arguments: Some(&json!({ "command": "printf probe", "access_mode": "read_only" })),
+    }));
 }
 
 #[test]
@@ -263,7 +273,11 @@ fn tool_concurrency_partition_mixed() {
         "search_semantic",
         "shell_exec",
     ];
-    let batches = crate::tool_concurrency::partition_tool_calls(&tools);
+    let calls = tools.map(|tool_name| crate::tool_concurrency::ToolConcurrencyInput {
+        tool_name,
+        arguments: None,
+    });
+    let batches = crate::tool_concurrency::partition_tool_calls_with_inputs(&calls);
     assert_eq!(batches.len(), 4);
     assert!(matches!(
         batches[0].kind,
@@ -342,7 +356,11 @@ fn tool_concurrency_does_not_trust_read_only_shell_with_write_redirection() {
 #[test]
 fn tool_concurrency_keeps_agent_spawn_serial() {
     let tools = ["agent_spawn", "agent_spawn", "file_read"];
-    let batches = crate::tool_concurrency::partition_tool_calls(&tools);
+    let calls = tools.map(|tool_name| crate::tool_concurrency::ToolConcurrencyInput {
+        tool_name,
+        arguments: None,
+    });
+    let batches = crate::tool_concurrency::partition_tool_calls_with_inputs(&calls);
 
     assert_eq!(batches.len(), 3);
     assert!(matches!(

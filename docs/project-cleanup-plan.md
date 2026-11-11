@@ -1,6 +1,6 @@
 # Magi 全项目整理计划
 
-状态：本轮全仓整理完成。开始日期：2026-11-10；完成日期：2026-11-11。对应用户目标：列出完整计划，以目标模式完成全项目整理。
+状态：主体清理及 2026-11-11 审计发现问题的修复已完成；验证范围见追加记录，不代表全仓所有行为均已验收。开始日期：2026-11-10。对应用户目标：列出完整计划，以目标模式完成全项目整理。
 
 本文件是这次整理的唯一计划和进度入口；长期架构约束仍归各领域设计文档。每个批次完成后更新本文件，不能把计划、历史通过记录或扫描结果当成当前交付证据。
 
@@ -126,6 +126,23 @@
 - 一处文档链接指向已不存在的 target 验收产物，改成明确的历史路径与证据限制，没有伪造或补写历史通过报告。全部当前 Markdown 本地文件链接检查通过。
 - 最终 `cargo check --workspace --all-targets` 通过，**0 警告**。Web check 0 错误/0 警告；Desktop、Worker、Desktop contracts 检查通过；App Server、Browser tool catalog、网络策略、crate 架构图与插件中心一致性检查通过。235 个维护脚本（含未跟踪的新脚本）语法检查通过，`git diff --check` 通过。
 - 已关闭本轮临时 daemon；保留用户既有修改与构建缓存，没有提交、发布、Tag 操作或清空用户状态目录。
+
+### 2026-11-11：提交后审计与修复
+
+- 修复当前 Turn 的图片在输入消费后丢失：每次装配都从 canonical 用户 item 为保留在历史中的当前输入恢复图片，不把消费标记当作附件寿命。覆盖首轮、空响应恢复、工具续轮，以及消费后序列化重启；线程历史不保存第二份图片。
+- 文件事实刷新只处理 `succeeded` 且有非空路径/内容哈希的读取回执；失败、拒绝、取消、未执行及身份不完整的回执保持原错误和恢复指引。子代理切换执行目录时的 `workspace_execution_root_changed` 不再被覆盖。
+- 三类过期测试同步到当前入口：四处 MCP 夹具按精确名称取得 schema；恢复夹具显式绑定 Session 恢复引用；Web 隔离回归验证正式列表请求，不再要求已删除的单会话包装。没有恢复旧执行或恢复链路。
+- 删除只被测试使用的无参数并发包装，测试直接覆盖正式带参数分批入口。MemoryStore 的直接写入种子收进 `test-support`，生产继续使用 `apply_extraction`。
+- 完整回归额外暴露两处既有问题并按根因修复：SSR golden 不需要客户端依赖预构建，现已在测试环境配置入口关闭，删除临时目录清理重试；快照的单活动工具只有在未声明路径时才沿用原全树归属规则，已声明路径必须匹配，防止并行工具结束后认领其他文件。快照新增确定性回归在修复前失败、修复后通过。
+- 验证：API 完整库测试 **1002 通过 / 1 忽略**；BridgeClient **233**、ContextRuntime **21**、MemoryStore **3**、daemon **161** 项通过。首次组合回归的快照归属失败已按上一项修复，最终 Conversation Runtime **734**、Snapshot 库 **26**、Snapshot lifecycle **32** 项通过。完整 Web 测试通过，Web check **0 错误 / 0 警告**；生产 `cargo check -p magi-daemon`、脚本语法及差异检查通过。日志为 `/tmp/magi-fix-*.log`，属于本机临时证据。
+- 原始输入写入 Durable 记忆仍有 ContextRuntime 的正式消费者，不是无调用残留；本次保留既有记忆策略。重新定义哪些内容应进入长期记忆属于产品语义调整，不能随接口剪枝静默删除。未重跑真实 Electron、第三方远程模型/账号业务、全 workspace 测试或全量 Clippy；没有发布或修改用户状态数据。
+
+### 2026-11-11：本地目录包验收
+
+- 当前工作区通过 `CSC_IDENTITY_AUTO_DISCOVERY=false npm run desktop:package -- --dir` 构建 macOS arm64 的 Magi 3.0.62，目录包位于 `target/electron-dist/mac-arm64/Magi.app`（约 970MiB）。Web、Worker、release daemon、Electron 与随包运行时完成组装，解包资源哈希及随包 Node 执行自检通过；`npm run release:guard` 通过。
+- 真实 Electron 对话验收暴露测试夹具残留：读取最后一条 user 消息时误取运行时上下文，工具流未提供用量回执，审批查询仍使用旧按钮类名。夹具按现行上下文封装、流式 usage 和共享按钮类修正，移除旧 Task 文本包装解析；保留全部业务断言，没有修改生产链路或增加兜底。
+- 使用独立临时状态根、独立端口及本地受控 Provider 运行 `test:electron-conversation-dom`，最终 **221 项检查全部通过**、进程退出码 0。覆盖个人/项目对话、排队/停止/继续、工具、Goal 成功与失败、子代理、统计、权限拒绝、Git dirty/drift/conflict、Git 分支创建审批、审批允许/拒绝/取消、daemon 重启及宿主退出结算。验收期间源码与包指纹稳定，无 Desktop IPC 协议拒绝。
+- 本机日志为 `/tmp/magi-local-package.log`、`/tmp/magi-local-package-guard.log`、`/tmp/magi-local-package-dom.log`，结构化结果为 `/tmp/magi-local-package-dom.json`。本轮未生成 DMG/ZIP、未执行正式发布完整预检、跨平台安装和第三方远程模型/账号业务；目录包可用于本地测试，不代表正式发布门禁已完成。
 
 ## 交付范围与保留边界
 

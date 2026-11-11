@@ -7,7 +7,7 @@ fn query_and_history_use_deterministic_tie_breakers() {
     let session_id = SessionId::new("session-1");
     let created_at = UtcMillis(42);
 
-    store.append(MemoryRecord {
+    store.seed_memory_for_test(MemoryRecord {
         memory_id: "memory-b".to_string(),
         session_id: session_id.clone(),
         layer: MemoryLayer::Recent,
@@ -15,7 +15,7 @@ fn query_and_history_use_deterministic_tie_breakers() {
         provenance: None,
         created_at,
     });
-    store.append(MemoryRecord {
+    store.seed_memory_for_test(MemoryRecord {
         memory_id: "memory-a".to_string(),
         session_id: session_id.clone(),
         layer: MemoryLayer::Recent,
@@ -176,7 +176,7 @@ fn verify_extraction_linkage_detects_missing_and_mismatched_records() {
         },
     );
 
-    store.append(MemoryRecord {
+    store.seed_memory_for_test(MemoryRecord {
         memory_id: "memory-wrong-session".to_string(),
         session_id: SessionId::new("session-2"),
         layer: MemoryLayer::Recent,
@@ -187,7 +187,7 @@ fn verify_extraction_linkage_detects_missing_and_mismatched_records() {
         }),
         created_at: UtcMillis(11),
     });
-    store.append(MemoryRecord {
+    store.seed_memory_for_test(MemoryRecord {
         memory_id: "memory-provenance-mismatch".to_string(),
         session_id: session_id.clone(),
         layer: MemoryLayer::Durable,
@@ -195,7 +195,7 @@ fn verify_extraction_linkage_detects_missing_and_mismatched_records() {
         provenance: None,
         created_at: UtcMillis(12),
     });
-    store.append(MemoryRecord {
+    store.seed_memory_for_test(MemoryRecord {
         memory_id: "memory-dangling".to_string(),
         session_id: session_id.clone(),
         layer: MemoryLayer::Shared,

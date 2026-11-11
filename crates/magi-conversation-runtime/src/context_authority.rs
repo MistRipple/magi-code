@@ -514,18 +514,14 @@ impl<'a> ContextAuthority<'a> {
         } else {
             snapshot.model_history()
         };
-        // transcript 不复制原图；未消费输入在本次模型视图中按 canonical 身份恢复图片。
-        if !protected_inputs.is_empty()
-            && let Some(turn) = self.expected_turn_id.and_then(|turn_id| {
-                self.session_store
-                    .canonical_turn_for_session_turn_id(self.session_id, turn_id)
-            })
-        {
+        // transcript 不复制原图；当前 Turn 留在历史中的输入始终从 canonical 恢复图片。
+        // 消费只标记首次进入模型请求，不能让同一任务后续的工具续轮或空响应恢复丢图。
+        if let Some(turn) = self.expected_turn_id.and_then(|turn_id| {
+            self.session_store
+                .canonical_turn_for_session_turn_id(self.session_id, turn_id)
+        }) {
             for message in &mut history {
-                if let Some(id) = message
-                    .input_request_id
-                    .as_ref()
-                    .filter(|id| protected_inputs.contains(*id))
+                if let Some(id) = message.input_request_id.as_ref()
                     && let Some(item) = turn.items.iter().find(|item| {
                         item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage
                             && item
@@ -2199,6 +2195,7 @@ mod tests {
         let hash = magi_snapshot::path_content_hash(&file).unwrap();
         let raw = serde_json::json!({
             "tool": "file_read",
+            "status": "succeeded",
             "path": file.to_string_lossy(),
             "content_hash": hash,
             "content": "hello",
@@ -2236,6 +2233,7 @@ mod tests {
         std::fs::write(&file, &body).unwrap();
         let raw = serde_json::json!({
             "tool": "file_read",
+            "status": "succeeded",
             "path": file.to_string_lossy(),
             "content_hash": magi_snapshot::path_content_hash(&file).unwrap(),
             "content": body,

@@ -840,6 +840,10 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         .workspace_registry
         .mark_recovery_ready(&recovery_handle.recovery_id)
         .expect("recovery should be ready");
+    state
+        .session_store
+        .set_recovery_id(&session_id, None, Some(recovery_handle.recovery_id.clone()))
+        .expect("Session should reference the recovery entry");
 
     let task_store = state.task_store().expect("task store should be configured");
     let root_task_id = TaskId::new("task-root-router-recovery");

@@ -4706,7 +4706,8 @@ mod tests {
     }
     struct RetryEventTaskModelBridgeClient;
     struct RecordingImageTaskModelBridgeClient {
-        image_count: AtomicUsize,
+        responses: Vec<ModelResponse>,
+        requests: Mutex<Vec<ModelInvocationRequest>>,
     }
     struct TaskToolFailureThenFinalModelBridgeClient {
         invoke_count: AtomicUsize,
@@ -5863,6 +5864,24 @@ mod tests {
             magi_session_store::SessionInputState::Consumed
         );
         assert_eq!(consumed.consumption.unwrap().step_id, "image-execution");
+        let restarted = SessionStore::from_persisted_parts(
+            restored.durable_state(),
+            restored.execution_sidecar_store_state(),
+        )
+        .unwrap();
+        let continuation = prepare(&restarted, true);
+        assert!(continuation.terminal.is_none());
+        let input = continuation
+            .messages
+            .iter()
+            .find(|message| message.input_request_id.as_deref() == Some("image-input"))
+            .unwrap();
+        assert_eq!(
+            input.images.len(),
+            1,
+            "已消费输入在当前 Turn 恢复后仍保留图片"
+        );
+        assert_eq!(input.images[0].data, "AA==");
     }
 
     #[test]
@@ -7260,30 +7279,17 @@ mod tests {
             &self,
             request: ModelInvocationRequest,
         ) -> Result<ModelResponse, BridgeClientError> {
-            let image_count = request
-                .messages
-                .as_ref()
-                .and_then(|messages| messages.iter().rev().find(|message| message.role == "user"))
-                .map(|message| message.images.len())
-                .unwrap_or_default();
-            self.image_count.store(image_count, Ordering::SeqCst);
-            Ok(model_response(serde_json::json!({
-                "content": "已看到图片",
-                "finish_reason": "stop"
-            })))
+            let mut requests = self.requests.lock().unwrap();
+            let response = self.responses[requests.len()].clone();
+            requests.push(request);
+            Ok(response)
         }
 
         fn invoke_streaming(
             &self,
             request: ModelInvocationRequest,
-            on_delta: &dyn Fn(&ModelStreamingDelta),
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
         ) -> Result<ModelResponse, BridgeClientError> {
-            on_delta(&ModelStreamingDelta {
-                content: "已看到图片".to_string(),
-                thinking: String::new(),
-                tool_calls: Vec::new(),
-                ..Default::default()
-            });
             self.invoke(request)
         }
     }
@@ -9233,108 +9239,164 @@ mod tests {
 
     #[test]
     fn task_conversation_loop_attaches_current_user_images_to_model_request() {
-        let session_store = SessionStore::new();
-        let event_bus = InMemoryEventBus::new(64);
-        let task_store = TaskStore::new();
-        let task = make_task_loop_test_task("task-current-image-input");
-        task_store.insert_task(task.clone()).expect("任务应插入");
-        let worker_id = WorkerId::new("worker-current-image-input");
-        let lease = task_store
-            .grant_lease(
-                &task.task_id,
-                &task.root_task_id,
-                &worker_id,
-                "executor",
-                60_000,
-            )
-            .expect("lease should be granted");
-        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
-        let client = RecordingImageTaskModelBridgeClient {
-            image_count: AtomicUsize::new(0),
-        };
-        let session_id = SessionId::new("session-current-image-input");
-        let workspace_id = Some(WorkspaceId::new("workspace-current-image-input"));
-        session_store
-            .create_session(session_id.clone(), "task image fixture")
-            .expect("session should be creatable");
-        let now = UtcMillis::now();
-        let (_, orchestrator_thread_id) =
-            session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
-        let thread_id = orchestrator_thread_id.clone();
-        let conversation_registry = ConversationRegistry::new();
-        ensure_test_current_turn(
-            &session_store,
-            &conversation_registry,
-            &session_id,
-            &task,
-            "识别图片",
-        );
+        let final_response = model_response(serde_json::json!({
+            "content":"已看到图片", "finish_reason":"stop"
+        }));
+        for responses in [
+            vec![final_response.clone()],
+            vec![
+                model_response(serde_json::json!({"content":"", "finish_reason":"stop"})),
+                final_response.clone(),
+            ],
+            vec![
+                model_response(serde_json::json!({
+                    "finish_reason":"tool_calls", "tool_calls":[{
+                        "id":"image-catalog", "type":"function",
+                        "function":{"name":"tool_catalog", "arguments":"{}"}
+                    }]
+                })),
+                final_response,
+            ],
+        ] {
+            let session_store = SessionStore::new();
+            let event_bus = InMemoryEventBus::new(64);
+            let task_store = TaskStore::new();
+            let task = make_task_loop_test_task("task-current-image-input");
+            task_store.insert_task(task.clone()).expect("任务应插入");
+            let worker_id = WorkerId::new("worker-current-image-input");
+            let lease = task_store
+                .grant_lease(
+                    &task.task_id,
+                    &task.root_task_id,
+                    &worker_id,
+                    "executor",
+                    60_000,
+                )
+                .expect("lease should be granted");
+            let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+            let expected_requests = responses.len();
+            let client = RecordingImageTaskModelBridgeClient {
+                responses,
+                requests: Mutex::new(Vec::new()),
+            };
+            let mut tool_registry = ToolRegistry::new(
+                Arc::new(GovernanceService::default()),
+                Arc::new(InMemoryEventBus::new(8)),
+            );
+            tool_registry.register_default_builtins();
+            let catalog = magi_tool_runtime::BuiltinToolName::ToolCatalog;
+            let session_id = SessionId::new("session-current-image-input");
+            let workspace_id = Some(WorkspaceId::new("workspace-current-image-input"));
+            session_store
+                .create_session(session_id.clone(), "task image fixture")
+                .expect("session should be creatable");
+            let now = UtcMillis::now();
+            let (_, orchestrator_thread_id) =
+                session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
+            let thread_id = orchestrator_thread_id.clone();
+            let conversation_registry = ConversationRegistry::new();
+            ensure_test_current_turn(
+                &session_store,
+                &conversation_registry,
+                &session_id,
+                &task,
+                "识别图片",
+            );
 
-        let images = vec![
-            SessionTurnImage::from_data_url("smoke.png", "data:image/png;base64,AAA").unwrap(),
-        ];
-        let turn = session_store
-            .runtime_sidecar(&session_id)
-            .unwrap()
-            .current_turn
-            .unwrap();
-        let mut user_item = turn
-            .items
-            .iter()
-            .find(|item| item.kind == "user_message")
-            .unwrap()
-            .clone();
-        user_item
-            .metadata
-            .extend(crate::session_images::session_turn_images_metadata(&images));
-        session_store
-            .upsert_current_turn_item_for_turn(&session_id, Some(&turn.turn_id), user_item)
-            .unwrap();
+            let images = vec![
+                SessionTurnImage::from_data_url("smoke.png", "data:image/png;base64,AAA").unwrap(),
+            ];
+            let turn = session_store
+                .runtime_sidecar(&session_id)
+                .unwrap()
+                .current_turn
+                .unwrap();
+            let mut user_item = turn
+                .items
+                .iter()
+                .find(|item| item.kind == "user_message")
+                .unwrap()
+                .clone();
+            user_item
+                .metadata
+                .extend(crate::session_images::session_turn_images_metadata(&images));
+            session_store
+                .upsert_current_turn_item_for_turn(&session_id, Some(&turn.turn_id), user_item)
+                .unwrap();
 
-        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
-            refresh_tool_definitions: None,
-            client: &client,
-            event_bus: &event_bus,
-            session_store: &session_store,
-            settings_store: None,
-            live_settings_store: None,
-            tool_registry: None,
-            skill_runtime: None,
-            skill_dispatch_runtime: None,
-            skill_name: None,
-            task_store: &task_store,
-            execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &conversation_registry,
-            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            safety_gate: None,
-            plan_store: &crate::test_plan_store("test-plan"),
-            project_memory: None,
-            task: &task,
-            task_id: &task.task_id,
-            lease_id: &lease.lease_id,
-            session_id: &session_id,
-            workspace_id: &workspace_id,
-            prompt: "识别图片".to_string(),
-            task_context_messages: Vec::new(),
-            images,
-            tools: None,
-            usage_binding: &usage_binding,
-            streaming_entry_id: None,
-            is_sidechain: false,
-            worker_id: Some(&worker_id),
-            thread_id: &thread_id,
-            context_summary: None,
-            system_prompt: None,
-            workspace_root_path: None,
-            workspace_resources: None,
-            prepare_workspace: None,
-            execution_group_id: None,
-            persist_session_state: None,
-            extension_hooks: None,
-        });
+            let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+                refresh_tool_definitions: None,
+                client: &client,
+                event_bus: &event_bus,
+                session_store: &session_store,
+                settings_store: None,
+                live_settings_store: None,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                task_store: &task_store,
+                execution_registry: &TaskExecutionRegistry::default(),
+                conversation_registry: &conversation_registry,
+                agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+                safety_gate: None,
+                plan_store: &crate::test_plan_store("test-plan"),
+                project_memory: None,
+                task: &task,
+                task_id: &task.task_id,
+                lease_id: &lease.lease_id,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                prompt: "识别图片".to_string(),
+                task_context_messages: Vec::new(),
+                images,
+                tools: Some(vec![ChatToolDefinition {
+                    kind: "function".into(),
+                    function: magi_bridge_client::ChatToolFunctionDefinition {
+                        name: catalog.as_str().into(),
+                        description: catalog.description().into(),
+                        parameters: catalog.parameters_schema(),
+                    },
+                    origin: magi_bridge_client::ChatToolOrigin::Builtin,
+                }]),
+                usage_binding: &usage_binding,
+                streaming_entry_id: None,
+                is_sidechain: false,
+                worker_id: Some(&worker_id),
+                thread_id: &thread_id,
+                context_summary: None,
+                system_prompt: None,
+                workspace_root_path: None,
+                workspace_resources: None,
+                prepare_workspace: None,
+                execution_group_id: None,
+                persist_session_state: None,
+                extension_hooks: None,
+            });
 
-        assert!(matches!(outcome, TaskOutcome::Completed { .. }));
-        assert_eq!(client.image_count.load(Ordering::SeqCst), 1);
+            assert!(matches!(outcome, TaskOutcome::Completed { .. }));
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), expected_requests);
+            for request in requests.iter() {
+                let images = request
+                    .messages
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|message| &message.images)
+                    .collect::<Vec<_>>();
+                assert_eq!(images.len(), 1, "每次请求都保留当前图文输入");
+                assert_eq!(images[0].data, "AAA");
+            }
+            let snapshot = session_store.thread_context_snapshot(&thread_id).unwrap();
+            assert!(
+                snapshot
+                    .messages()
+                    .iter()
+                    .all(|message| message.images.is_empty()),
+                "图片只从 canonical item 装配，不增加线程历史副本"
+            );
+        }
     }
 
     #[test]

@@ -6,13 +6,6 @@ pub struct ToolConcurrencyInput<'a> {
     pub arguments: Option<&'a serde_json::Value>,
 }
 
-pub fn is_concurrency_safe(tool_name: &str) -> bool {
-    is_concurrency_safe_call(&ToolConcurrencyInput {
-        tool_name,
-        arguments: None,
-    })
-}
-
 pub fn is_concurrency_safe_call(input: &ToolConcurrencyInput<'_>) -> bool {
     if is_shell_like_tool(input.tool_name) {
         return input.arguments.is_some_and(|arguments| {
@@ -52,17 +45,6 @@ pub enum ToolBatchKind {
 pub struct ToolBatch {
     pub kind: ToolBatchKind,
     pub tool_indices: Vec<usize>,
-}
-
-pub fn partition_tool_calls(tool_names: &[&str]) -> Vec<ToolBatch> {
-    let inputs = tool_names
-        .iter()
-        .map(|tool_name| ToolConcurrencyInput {
-            tool_name,
-            arguments: None,
-        })
-        .collect::<Vec<_>>();
-    partition_tool_calls_with_inputs(&inputs)
 }
 
 pub fn partition_tool_calls_with_inputs(tool_calls: &[ToolConcurrencyInput<'_>]) -> Vec<ToolBatch> {
