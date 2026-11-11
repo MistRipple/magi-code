@@ -38,8 +38,9 @@ impl PluginManager {
         else {
             return Ok(());
         };
+        // 每个上游生态必须有自己的准入证据校验；没有校验器的生态不能放行。
         if ecosystem != "dsh" {
-            return Ok(());
+            return Err(invalid(format!("上游生态 {ecosystem} 没有可用的兼容准入校验")));
         }
         let report: Value = serde_json::from_slice(
             package
@@ -295,6 +296,18 @@ mod tests {
             manager.ensure_dsh_candidate_compatible(&package, &source, "0.2.2-rc.1", RUNTIME),
             Err(PluginError::NotAuthorized(_))
         ));
+        let unsupported = PluginSource::Upstream {
+            ecosystem: "pi".into(),
+            package: "example".into(),
+            version: "1.2.3".into(),
+            github: None,
+        };
+        assert!(
+            manager
+                .ensure_dsh_candidate_compatible(&package, &unsupported, "0.2.2-rc.1", RUNTIME)
+                .is_err(),
+            "没有准入校验器的上游生态不能默认放行"
+        );
     }
     #[test]
     fn exemptions_persist_with_cas_and_do_not_follow_package_or_runtime_upgrades() {

@@ -1,4 +1,4 @@
-// 规则表的共同形状与状态判定。生态目录（dsh/、pi/）只写规则，状态由这里统一算出。
+// 规则表的共同形状与状态判定。生态目录（当前只有 dsh/）只写规则，状态由这里统一算出。
 import { requireCapability } from './capabilities.mjs';
 
 /**

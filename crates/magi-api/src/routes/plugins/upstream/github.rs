@@ -57,8 +57,9 @@ pub(super) async fn acquire(
         .repository
         .trim_end_matches(".git")
         .to_ascii_lowercase();
-    // 从同一份 Git 归档读取实际提交并绑定预览摘要。确认提交后只取该 SHA，
-    // 不再次解释浮动引用；不维护 REST 解析或 rate-limit 后的第二条来源路径。
+    // 从同一份 Git 归档读取实际提交：浮动引用解析到哪个提交，由这份归档自己说明，
+    // 完整性摘要也是这份归档的字节。预览确认后安装使用预览产物，不再次下载；
+    // 不维护 REST 解析或 rate-limit 后的第二条来源路径。
     let revision = source
         .commit
         .as_deref()
@@ -66,7 +67,7 @@ pub(super) async fn acquire(
         .unwrap_or("HEAD");
     let revision = urlencoding::encode(revision);
     let url = format!("https://codeload.github.com/{repository}/tar.gz/{revision}");
-    let mut bytes = download_bytes(&url, npm::MAX_TARBALL_BYTES, "GitHub 原包").await?;
+    let bytes = download_bytes(&url, npm::MAX_TARBALL_BYTES, "GitHub 原包").await?;
     let commit = npm::repository_commit(&bytes)
         .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
     if source
@@ -77,20 +78,6 @@ pub(super) async fn acquire(
         return Err(ApiError::InvalidInput(
             "GitHub 归档提交与预览确认身份不一致".into(),
         ));
-    }
-    if !revision.eq_ignore_ascii_case(&commit) {
-        // GitHub 按请求引用生成归档根名，tag 与 SHA 的 tar 字节并不相同。
-        // 安装准备始终取 SHA 归档，保证预览和确认使用同一完整性与摘要。
-        let url = format!("https://codeload.github.com/{repository}/tar.gz/{commit}");
-        bytes = download_bytes(&url, npm::MAX_TARBALL_BYTES, "GitHub 固定提交原包").await?;
-        if npm::repository_commit(&bytes)
-            .map_err(|error| ApiError::InvalidInput(error.to_string()))?
-            != commit
-        {
-            return Err(ApiError::InvalidInput(
-                "GitHub 固定归档的提交身份不一致".into(),
-            ));
-        }
     }
     let integrity = format!(
         "sha512-{}",

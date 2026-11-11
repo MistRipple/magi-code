@@ -1278,13 +1278,19 @@ impl PluginOperations {
         package: &PluginPackage,
         source: &PluginSource,
     ) -> Result<(), ApiError> {
-        if matches!(source, PluginSource::Upstream { ecosystem, .. } if ecosystem == "dsh") {
-            let (version, runtime) = self.dsh_runtime()?;
-            manager
-                .ensure_dsh_candidate_compatible(package, source, &version, &runtime)
-                .map_err(plugin_error)?;
+        match source {
+            PluginSource::Upstream { ecosystem, .. } if ecosystem == "dsh" => {
+                let (version, runtime) = self.dsh_runtime()?;
+                manager
+                    .ensure_dsh_candidate_compatible(package, source, &version, &runtime)
+                    .map_err(plugin_error)
+            }
+            // 没有准入校验器的上游生态不能安装；新增生态必须同时提供自己的校验。
+            PluginSource::Upstream { ecosystem, .. } => Err(ApiError::InvalidInput(format!(
+                "上游生态 {ecosystem} 没有可用的兼容准入校验"
+            ))),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     /// 写操作只能由获授权的活动宿主调用；代授新版本需要独立 authorize 委托。

@@ -5,8 +5,8 @@
 //! 授权与生命周期提交。安装期不运行 npm/git 安装或构建脚本，
 //! 上游代码只在翻译器的受限子进程里被执行一次以记录它声明了什么。
 //!
-//! 翻译是确定的：同一上游版本和同一兼容运行时得到同一摘要，所以预览确认的摘要可以在安装时
-//! 重新翻译后核对，不需要在服务端缓存产物。
+//! 预览翻译出的包就是用户确认的包：安装按确认的摘要取回这份产物，不再重新翻译，
+//! 因为依赖版本和上游启动时序在两次翻译之间可能变化（见 `previewed`）。
 
 use super::*;
 use magi_app_server_protocol::generated::{
@@ -20,6 +20,7 @@ use std::path::Path as FsPath;
 mod artifacts;
 pub(super) mod github;
 pub(super) mod icons;
+mod previewed;
 
 /// registry 的开发与验收覆盖入口；默认使用 npm 官方 registry。
 pub(super) const NPM_REGISTRY_ENV: &str = "MAGI_NPM_REGISTRY";
@@ -42,24 +43,38 @@ pub(super) fn registry() -> Result<String, ApiError> {
         .to_string())
 }
 
-fn ecosystem_keyword(ecosystem: &PluginEcosystem) -> &'static str {
+/// 上游生态在 daemon 侧的唯一描述：协议名、搜索关键词、本机是否有翻译器。
+/// 新增生态必须在这里登记，并同时提供自己的准入证据校验（见设计文档 6.5）。
+struct EcosystemSpec {
+    name: &'static str,
+    search_keyword: &'static str,
+    translator: bool,
+}
+
+fn ecosystem_spec(ecosystem: &PluginEcosystem) -> EcosystemSpec {
     match ecosystem {
-        PluginEcosystem::Dsh => "dsh-plugin",
-        PluginEcosystem::Pi => "pi-package",
+        PluginEcosystem::Dsh => EcosystemSpec {
+            name: "dsh",
+            search_keyword: "dsh-plugin",
+            translator: true,
+        },
+        PluginEcosystem::Pi => EcosystemSpec {
+            name: "pi",
+            search_keyword: "pi-package",
+            translator: false,
+        },
     }
 }
 
-fn ecosystem_name(ecosystem: &PluginEcosystem) -> &'static str {
-    match ecosystem {
-        PluginEcosystem::Dsh => "dsh",
-        PluginEcosystem::Pi => "pi",
-    }
+pub(super) fn ecosystem_name(ecosystem: &PluginEcosystem) -> &'static str {
+    ecosystem_spec(ecosystem).name
 }
 
 /// 本机能否安装该生态的包。返回不能的原因，界面原样展示。
 fn blocked_reason(state: &PluginOperations, ecosystem: &PluginEcosystem) -> Option<String> {
-    if !matches!(ecosystem, PluginEcosystem::Dsh) {
-        return Some("pi 翻译器尚未提供，当前只能浏览".into());
+    let spec = ecosystem_spec(ecosystem);
+    if !spec.translator {
+        return Some(format!("{} 翻译器尚未提供，当前只能浏览", spec.name));
     }
     if let Err(reason) = state.translation_runtime_id() {
         return Some(reason);
@@ -176,10 +191,11 @@ pub(super) async fn search(
     }
     // 已安装的上游包即使不在本次搜索结果里，也要查它的最新版本，否则无法提示升级。
     for ((eco, package), (plugin_id, version)) in &installed {
-        let ecosystem = if eco == "pi" {
-            PluginEcosystem::Pi
-        } else {
-            PluginEcosystem::Dsh
+        let ecosystem = match eco.as_str() {
+            "dsh" => PluginEcosystem::Dsh,
+            "pi" => PluginEcosystem::Pi,
+            // 未知生态不是 DSH，不能借 DSH 的更新检查展示；该记录只可在已安装列表管理。
+            _ => continue,
         };
         if entries
             .iter()
@@ -232,7 +248,7 @@ async fn search_ecosystem(
 ) -> Result<Vec<SearchPackage>, ApiError> {
     let mut url = reqwest::Url::parse(&format!("{registry}/-/v1/search"))
         .map_err(|_| ApiError::InvalidInput("registry 地址无效".into()))?;
-    let mut terms = format!("keywords:{}", ecosystem_keyword(ecosystem));
+    let mut terms = format!("keywords:{}", ecosystem_spec(ecosystem).search_keyword);
     if !text.is_empty() {
         terms.push(' ');
         terms.push_str(text);
@@ -350,6 +366,7 @@ struct NpmUser {
 }
 
 /// 一次翻译的结果：已校验的 Magi 包，加上给用户看的翻译摘要。
+#[derive(Clone)]
 pub(super) struct Translated {
     pub(super) package: PluginPackage,
     integrity: String,
@@ -372,6 +389,7 @@ pub(super) async fn preview_candidate(
     request: &PluginUpstreamRequest,
 ) -> Result<PluginUpstreamPreview, ApiError> {
     let translated = translate(operations, &request).await?;
+    previewed::remember(&translated);
     let source = translated.source.clone();
     let (candidate, translation_runtime) = {
         let manager = operations.locked("预览上游插件")?;
@@ -456,13 +474,11 @@ pub(super) async fn install_candidate(
             "GitHub 安装必须指定预览固定的提交".into(),
         ));
     }
-    let translated = translate(operations, &request).await?;
-    // 预览确认的是具体摘要：上游内容或兼容运行时在确认后变化时必须拒绝。
-    if translated.package.digest() != expected {
-        return Err(ApiError::Conflict(
-            "翻译结果与预览时不一致，请重新预览后再确认".into(),
-        ));
-    }
+    // 预览确认的是具体摘要：安装使用预览时翻译出的这份产物。摘要缺失、已过期、
+    // 来自另一次运行或与请求来源不符时拒绝，要求重新预览。
+    let translated = previewed::recall(expected, request).ok_or_else(|| {
+        ApiError::Conflict("预览已失效或与请求不符，请重新预览后再确认".into())
+    })?;
     let source = translated.source.clone();
     if let Some((id, digest, lease, background)) = caller {
         if background {
@@ -676,12 +692,14 @@ async fn run_translator(
                 .map_err(|e| ApiError::internal_assembly("编码 GitHub 来源失败", e))?,
         ]);
     }
-    run_toolchain(state, toolchain, &args).await
+    run_toolchain(state, toolchain, ecosystem, &args).await
 }
 
+/// 调用翻译器工具链。兼容策略只传给对应生态：DSH 的版本豁免不对其他生态生效。
 pub(super) async fn run_toolchain(
     state: &PluginOperations,
     toolchain: &crate::state::PluginToolchain,
+    ecosystem: &PluginEcosystem,
     args: &[String],
 ) -> Result<String, ApiError> {
     use tokio::io::AsyncReadExt;
@@ -694,11 +712,13 @@ pub(super) async fn run_toolchain(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     command.env("MAGI_TRANSLATOR_OWNER_PIPE", "1");
-    command.env(
-        "MAGI_DSH_COMPATIBILITY_POLICY",
-        serde_json::to_string(&state.dsh_compatibility()?)
-            .map_err(|error| ApiError::internal_assembly("编码兼容策略失败", error))?,
-    );
+    if matches!(ecosystem, PluginEcosystem::Dsh) {
+        command.env(
+            "MAGI_DSH_COMPATIBILITY_POLICY",
+            serde_json::to_string(&state.dsh_compatibility()?)
+                .map_err(|error| ApiError::internal_assembly("编码兼容策略失败", error))?,
+        );
+    }
     let mut child = magi_process::spawn_managed_tokio_in_group(&state.processes, &mut command)
         .map_err(|error| ApiError::internal_assembly("启动翻译器失败", error))?;
     let owner = child.take_stdin();

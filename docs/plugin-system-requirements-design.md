@@ -369,9 +369,9 @@
 
 【现状】上述为开发与验收约束，不作为运行能力已交付的证明。已完成和剩余问题以源码及第 11、12 节的实际证据为准。
 
-【现状·已运行验证】用户安装的是上游官方发布的 npm 包本身，不是 Magi 维护的另一份翻译副本。安装在 daemon 内分四步：向 npm registry 取包元数据并下载 tarball；核对 `dist.integrity`（sha512）并安全解包（拒绝路径穿越、符号链接、特殊文件，数量与体积有界，不运行任何脚本）；调用随产品发行的翻译器（随包 Node 加 `compat/cli.mjs prepare`）生成标准 Magi 包；把该包交给与其他来源完全相同的预览、授权和生命周期。翻译是确定的：同一上游版本与同一兼容运行时得到同一摘要，所以预览确认的摘要在安装时重新翻译后核对，服务端不缓存产物，也不维护第二份目录。接口为 `GET /api/plugins/upstream?q=`、`POST /api/plugins/upstream/preview`、`POST /api/plugins/upstream/install`，来源标记为 `upstream`（`生态:包名@精确版本`）。
+【现状·已运行验证】用户安装的是上游官方发布的 npm 包本身，不是 Magi 维护的另一份翻译副本。安装在 daemon 内分四步：向 npm registry 取包元数据并下载 tarball；核对 `dist.integrity`（sha512）并安全解包（拒绝路径穿越、符号链接、特殊文件，数量与体积有界，不运行任何脚本）；调用随产品发行的翻译器（随包 Node 加 `compat/cli.mjs prepare`）生成标准 Magi 包；把该包交给与其他来源完全相同的预览、授权和生命周期。翻译结果不能假定可重复：原包依赖按语义版本范围在翻译时解析，上游启动登记的观察结果也进入 `compat.json`，依赖发布新版本或上游启动时序变化都会让摘要不同。因此预览翻译出的包由 daemon 在进程内保留（最多 16 项、128 MiB、30 分钟，不落盘），安装按用户确认的摘要取回这份产物，不再重新翻译；摘要不存在、已过期、来自另一次运行或与请求来源不符时返回 409 要求重新预览。准入证据仍在提交安装时重新校验。不维护第二份目录。接口为 `GET /api/plugins/upstream?q=`、`POST /api/plugins/upstream/preview`、`POST /api/plugins/upstream/install`，来源标记为 `upstream`（`生态:包名@精确版本`）。
 
-【现状·实现】来源获取已扩展到公开 GitHub 仓库。`github:owner/repository#reference` 与 GitHub HTTPS 地址经官方 codeload 归档的首个有界 PAX Git 元数据解析实际提交，再取固定 SHA 归档，沿公共有界下载、归档解包和同一翻译入口准备。删除单独的匿名 REST 提交查询，避免其配额成为公开原包安装的前置依赖。引用归档与 SHA 归档根名可能不同，安装准备只使用固定 SHA 的字节；确认安装同时绑定固定提交、原始引用及翻译摘要。提交缺失、重复、无效或与确认不一致均拒绝；PAX 元数据不生成文件，符号链接与特殊文件仍拒绝。原包名称和语义版本来自仓库的 `package.json`，不伪造 npm 发布元数据。仓库必须已携带可运行的 JavaScript 入口，不执行构建、安装脚本或 Git hooks。
+【现状·实现】来源获取已扩展到公开 GitHub 仓库。`github:owner/repository#reference` 与 GitHub HTTPS 地址经官方 codeload 归档的首个 PAX Git 元数据解析实际提交，沿公共有界下载、归档解包和同一翻译入口准备；归档的完整性摘要就是这份已下载字节的摘要，不再为得到 SHA 命名的归档重复下载。删除单独的匿名 REST 提交查询，避免其配额成为公开原包安装的前置依赖。确认安装同时绑定固定提交、原始引用及翻译摘要。提交缺失、重复、无效或与确认不一致均拒绝；PAX 元数据不生成文件，符号链接与特殊文件仍拒绝。原包名称和语义版本来自仓库的 `package.json`，不伪造 npm 发布元数据。仓库必须已携带可运行的 JavaScript 入口，不执行构建、安装脚本或 Git hooks。
 
 【现状·实现】仓库、引用和提交增量保存在 daemon 原 `PluginSource::Upstream` 内，没有第二份安装目录。DSH 管理器、profile 快照及状态观察共用一个来源投影，保留真实包名／版本和 GitHub 来源。原生插件详情提供沿原引用的在线检查，搜索到的 npm 同名包不能改绑更新来源；同一仓库的提交替换仍走原排空、摘要授权和恢复事务。窄屏插件列表与详情共用剩余高度，分别滚动，预览确认和生命周期操作固定在详情底部。当前来源范围为公开 GitHub，其他 Git 服务、私有仓库、子模块与需构建的源码仓库未验收。
 
@@ -475,6 +475,31 @@
 【目标】固定一致性测试集覆盖：阻止/改参、异常和取消、并行工具结果顺序、输入来源、最终空闲、流式更新、资源冲突、重启与私有状态、模型归属、UI 缺失、effect 回收、所有不支持 API 的拒绝。能做上游差分的在同一输入下对照；平台差异分别记录。分母为固定样本与必需语义断言，报告“通过/偏离/不支持/未覆盖”，不能只报一个可翻译比例。
 
 【目标】仅当一个包的全部必需行为在两平台通过，且作者/用户确认可接受的显式差异后，才标该固定版本兼容。若必需行为依赖不支持 API，构建即拒绝；不可为求比例忽略该行为。上游或适配层更新生成新产物和新报告，不静默沿用旧兼容结论。
+
+### 6.5 翻译器合同（2026-11-11）
+
+【目标】本节固定“上游生态翻译器”与 Magi 之间的边界，依据当前 DSH 实现整理。目前只有 DSH 实现；pi 尚未实现，本节不代表 pi 翻译器已设计完成。共享代码仍放在 DSH 翻译器旁，等第二个生态真正落地时再按本合同抽取，不预先造抽象，也不保留双实现。
+
+| 状态 | 合同 | 规定 |
+| --- | --- | --- |
+| 现状 | 翻译器对象 | `{ kind, detect(dir), inspect(dir, options) }`。`detect` 返回大于 0 的识别分数；`inspect` 只读原包，返回含 `entries`、`summary`、`verdict` 的报告，不执行上游代码、不改写原包 |
+| 现状 | 状态词汇 | 条目状态只取 `mapped`、`shim`、`bundled`、`planned`、`partial`、`dropped`、`unknown`。`unknown` 一律阻塞；必需类别中非可选的条目不是 `mapped`、`shim`、`bundled`（即 `planned`、`partial`、`dropped`）也阻塞。阻塞即翻译失败，不生成“成功但少功能”的包 |
+| 现状 | 能力词汇 | 上游 API 只能映射到 `core/capabilities.mjs` 中的 Magi 能力 ID；能力清单由 `npm run test:compat` 对照 `magi-extension-host` 源码核对。保真度 `full`、`partial`、`none` 写在生态规则里，不写在能力表里 |
+| 现状 | 调用入口 | daemon 只调用 `node compat/cli.mjs resolve <生态> <包名> [版本]`（解析 npm 版本并按该生态准入）和 `prepare <生态> <上游目录> --out <包目录> --integrity <sha512> --archive <zip> [--github <json>]`；`inspect` 仅用于开发诊断。每个生态在 `cli.mjs` 的 `ECOSYSTEMS` 表登记 `{ createTranslator, resolve, prepare }`，没有登记的生态拒绝。`prepare` 成功时 stdout 为 `{ id, version, report }` 且退出码为 0，失败时退出码非 0、原因写 stderr；`resolve` 总以退出码 0 返回 `{ document }` 或 `{ error }`。daemon 持有的管道关闭即终止翻译进程 |
+| 现状 | 预览即安装物 | 预览翻译出的包在 daemon 进程内保留（`upstream/previewed.rs`），安装按确认的摘要取回并核对来源，不重新翻译；缺失即要求重新预览，没有第二条翻译路径。打包本身可复现（固定时间戳、路径排序、登记证据按稳定键排序） |
+| 现状 | 产物形状 | 标准 Magi 包：`manifest.json`（`sdkVersion` 2、`id` 由 `packageId(生态, 包名)` 生成、`extension.compat.kind` 标明生态）、原包文件、页面与 `extension/compat.json`。权限只作申请，由用户在 Magi 原生入口授权；工具、命令、模型来源由运行期动态发布，不写成静态清单 |
+| 现状 | `compat.json` | daemon 只读取下列字段。准入校验：`upstream.name`、`upstream.version`、`upstream.github`、`compatibility.runtimeVersion`、`compatibility.runtimeId`、`compatibility.requirements`、`compatibility.exempted`，文件缺失或字段不符即拒绝，不补默认值；运行组件状态：`translationRuntimeId`，缺失时显示为可更新。其余字段（`dependencies`、`static.degraded`、`ui`、`files` 等）只供预览与审计，daemon 不据此做决定 |
+| 目标 | 来源与安装身份 | 来源记录为 `PluginSource::Upstream{ ecosystem, package, version, github? }`。安装只接受仍在保留中的预览摘要，版本、完整性摘要、运行时身份任一变化或预览失效都要求重新预览 |
+| 目标 | 准入证据校验 | 每个生态必须有自己的 daemon 侧证据校验（当前为 `ensure_dsh_candidate_compatible`）。没有校验器的生态一律拒绝安装，不能默认放行；安装和升级两条路径共用同一入口 |
+
+【目标】新增生态（如 pi）的接入清单，缺一项即不得开放安装：
+1. 协议侧：在 `PluginEcosystem` 与 `PluginCompatKind` 增加取值并重新生成类型；
+2. 翻译器：实现上述翻译器对象与 `prepare`，保持打包可复现并输出 `compat.json` 的 daemon 读取字段；
+3. daemon 侧：在 `upstream.rs` 的 `EcosystemSpec` 登记协议名、搜索关键词和翻译器可用性；准入证据校验器与生态专属的兼容策略各有唯一所有者，兼容策略只传给对应生态的翻译进程，不复用 DSH 的策略；
+4. 规则表与能力表：新能力先加入 `capabilities.mjs` 并由测试对照 Magi 源码，不用名称匹配或包名特例；
+5. 验收：按第 6.0 节的固定版本真实业务验收，样本与分母可审计。
+
+【现状】pi 在 daemon 的 `prepare` 入口被明确拒绝，界面显示“pi 翻译器尚未提供，当前只能浏览”；上游记录里出现未知生态时，搜索不再把它当作 DSH 展示更新，安装与升级的准入检查对未知生态拒绝；CLI 的 `resolve`、`prepare`、`inspect` 对未登记生态拒绝，DSH 的兼容策略只传给 DSH 翻译进程。pi 的翻译范围表见 6.2，其中均为目标，尚未实现。
 
 ## 7. 沙箱层处置与冻结约束
 

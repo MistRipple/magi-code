@@ -37,7 +37,7 @@ test('daemon 的独占管道关闭后正在联网的翻译工具链退出，不�
   const server=createServer((request,response)=>{began();});
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   t.after(()=>{server.closeAllConnections();server.close();});
-  const child=spawn(process.execPath,[cli,'resolve','magi-ownership-probe','1.0.0'],{
+  const child=spawn(process.execPath,[cli,'resolve','dsh','magi-ownership-probe','1.0.0'],{
     env:{...process.env,MAGI_TRANSLATOR_OWNER_PIPE:'1',MAGI_NPM_REGISTRY:`http://127.0.0.1:${server.address().port}`},stdio:['pipe','pipe','pipe'],
   });
   t.after(()=>child.kill());child.stdout.resume();child.stderr.resume();
@@ -345,7 +345,14 @@ test('DSH 产品入口识别原包，拒绝其他生态与无关目录', async t
   assert.equal(await translator.detect(unrelated), 0);
   const rejected = spawnSync(process.execPath, [cli, 'inspect', fixture, '--kind', 'pi'], { encoding: 'utf8' });
   assert.equal(rejected.status, 2);
-  assert.match(rejected.stderr, /仅支持 DSH/);
+  assert.match(rejected.stderr, /pi 没有翻译器/);
+  // resolve / prepare 同样按生态分发：没有登记的生态不进入 DSH 的解析与策略。
+  const resolved = spawnSync(process.execPath, [cli, 'resolve', 'pi', 'some-package', '1.0.0'], { encoding: 'utf8' });
+  assert.equal(resolved.status, 0);
+  assert.equal(JSON.parse(resolved.stdout).error.code, 'ecosystem-unsupported');
+  const prepared = spawnSync(process.execPath, [cli, 'prepare', 'pi', fixture, '--out', join(unrelated, 'out'), '--integrity', 'sha512-x'], { encoding: 'utf8' });
+  assert.equal(prepared.status, 2);
+  assert.match(prepared.stderr, /pi 没有翻译器/);
 });
 
 test('静态分析：每个能力都有明确状态，未登记的上游服务为 unknown 而非静默通过', async () => {

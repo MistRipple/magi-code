@@ -221,8 +221,10 @@ impl PluginOperations {
             let output = upstream::run_toolchain(
                 self,
                 toolchain,
+                &input.ecosystem,
                 &[
                     "resolve".into(),
+                    upstream::ecosystem_name(&input.ecosystem).into(),
                     input.package.clone().unwrap(),
                     input.version.clone().unwrap_or_else(|| "latest".into()),
                 ],

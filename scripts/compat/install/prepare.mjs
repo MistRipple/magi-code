@@ -24,6 +24,7 @@ import { translationRuntimeId } from '../core/translation-runtime.mjs';
 const COMPAT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const TRANSLATOR_VERSION = 2;
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
+const stable = (items, key) => [...items].sort((a, b) => String(a[key] ?? a.name ?? '').localeCompare(String(b[key] ?? b.name ?? ''), 'en'));
 function copyTree(source, target) {
   const files = [];
   let total = 0;
@@ -194,8 +195,9 @@ export async function prepareDsh(options) {
     runtimeContributions: manifest.extension.runtimeContributions,
     serviceReads: inspection.serviceReads,
     profileMutations: inspection.profileMutations,
-    tools: recorded.tools, commands: recorded.commands, modelSources: recorded.providers,
-    routes: recorded.routes, listeners: recorded.listeners, settingsNamespaces: recorded.settingsNamespaces,
+    // 注册顺序取决于上游异步初始化的先后；证据按稳定键排序，预览与安装才能得到同一摘要。
+    tools: stable(recorded.tools, 'id'), commands: stable(recorded.commands, 'id'), modelSources: stable(recorded.providers, 'id'),
+    routes: stable(recorded.routes, 'path'), listeners: recorded.listeners, settingsNamespaces: [...recorded.settingsNamespaces].sort(),
     ui: { mode: client ? 'native' : 'schema', mountedSlots: clientAnalysis?.mounted ?? [], unmountedSlots: clientAnalysis?.unmounted ?? [],
       ...(business?.operations.length ? { business: { operations: business.operations, awaitedCalls: business.awaitedCalls, changedFunctions: business.changedFunctions, originalHash: hash(clientSource), adaptedHash: hash(business.code) } } : {}) },
     static: { summary: report.summary, degraded: report.entries.filter((item) => ['partial', 'dropped'].includes(item.status)) },

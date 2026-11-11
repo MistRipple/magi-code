@@ -231,7 +231,7 @@ export async function verifyDshManager({ request: api, origin, plugin, page, cdp
     const processes=stdout.split('\n').map(line=>line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/)).filter(Boolean);
     const daemon=processes.find(([,pid,parent,command])=>Number(parent)===appPid()&&command.includes('/daemon/magi-daemon'));
     assert.ok(daemon,'仅终止本次验收应用的受控 daemon');
-    const resolver=processes.find(([,pid,parent,command])=>Number(parent)===Number(daemon[1])&&command.includes('/compat/cli.mjs resolve dsh-plugin-release-probe'));
+    const resolver=processes.find(([,pid,parent,command])=>Number(parent)===Number(daemon[1])&&command.includes('/compat/cli.mjs resolve dsh dsh-plugin-release-probe'));
     assert.ok(resolver,'核对本次 daemon 正在运行的真实翻译进程');
     frame.close();frame=undefined;await page.call('Page.navigate',{url:'about:blank'});page.close();page=undefined;
     process.kill(Number(daemon[1]),'SIGKILL');

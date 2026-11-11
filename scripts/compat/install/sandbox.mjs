@@ -24,7 +24,9 @@ export function withTempHome(fn) {
 export function runRestricted({ script, args, readable, home, label }) {
   const reads = [...new Set([COMPAT_DIR, realpathSync(process.execPath), home, ...readable])];
   const result = spawnSync(process.execPath, [
-    '--permission', ...reads.map((path) => `--allow-fs-read=${path}`), `--allow-fs-write=${home}`, script, ...args,
+    '--permission', ...reads.map((path) => `--allow-fs-read=${path}`), `--allow-fs-write=${home}`,
+    // 上游代码在预览阶段就会执行：限制堆上限，避免恶意或失控的包在超时前耗尽本机内存。
+    '--max-old-space-size=1024', script, ...args,
   ], {
     encoding: 'utf8', timeout: 60_000, maxBuffer: 32 * 1024 * 1024, cwd: home,
     // 不继承父进程环境：凭据类环境变量不进入被记录的上游代码。
