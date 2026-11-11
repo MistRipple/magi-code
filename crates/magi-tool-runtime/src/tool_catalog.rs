@@ -30,6 +30,34 @@ pub(crate) fn build_tool_catalog_value(
     let include_external = flag("include_external", true);
     let include_mcp_servers = flag("include_mcp_servers", true);
     let include_agent_roles = flag("include_agent_roles", true);
+    let tool_names = request
+        .as_ref()
+        .and_then(|value| value.get("tool_names"))
+        .and_then(serde_json::Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<BTreeSet<_>>()
+        });
+    let query = request
+        .as_ref()
+        .and_then(|value| value["query"].as_str())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    let matches = |name: &str, title: &str, description: &str| {
+        tool_names
+            .as_ref()
+            .map(|names| names.contains(name))
+            .unwrap_or_else(|| {
+                query.split_whitespace().all(|word| {
+                    [name, title, description]
+                        .iter()
+                        .any(|text| text.to_lowercase().contains(word))
+                })
+            })
+    };
 
     let mut tools = Vec::new();
     let mut builtin_categories = BTreeSet::new();
@@ -64,6 +92,9 @@ pub(crate) fn build_tool_catalog_value(
             internal_categories.insert(tool.category());
         }
         if !is_public && !include_internal {
+            continue;
+        }
+        if !matches(tool.as_str(), tool.category(), tool.description()) {
             continue;
         }
 
@@ -149,7 +180,7 @@ pub(crate) fn build_tool_catalog_value(
             "model_available": reason.is_none(),
             "availability": availability,
             "reason_code": reason,
-            "schema_included": include_schema,
+            "schema_included": include_schema && tool_names.as_ref().is_none_or(|names| names.contains(tool.as_str())),
             "access_mode": access_mode_for_tool(tool).as_str(),
             "policy_scope": policy_view.policy_scope,
             "input_sensitive_policy": policy_view.input_sensitive_policy,
@@ -163,7 +194,11 @@ pub(crate) fn build_tool_catalog_value(
             "runtime_status": runtime_status.status,
             "runtime_warnings": runtime_status.warnings,
         });
-        if include_schema {
+        if include_schema
+            && tool_names
+                .as_ref()
+                .is_none_or(|names| names.contains(tool.as_str()))
+        {
             item["parameters_schema"] = schema;
         }
         tools.push(item);
@@ -260,10 +295,15 @@ pub(crate) fn build_tool_catalog_value(
                 context,
                 resources,
                 executor_available,
+                include_schema
+                    && tool_names
+                        .as_ref()
+                        .is_some_and(|names| names.contains(name)),
             )
         };
     let mcp_values = external_mcp_tools
         .iter()
+        .filter(|tool| matches(&tool.model_tool_name, &tool.tool_name, &tool.description))
         .map(|tool| {
             external_tool_value(
                 serde_json::json!(tool),
@@ -275,6 +315,7 @@ pub(crate) fn build_tool_catalog_value(
         .collect::<Vec<_>>();
     let plugin_values = plugin_tools
         .iter()
+        .filter(|tool| matches(&tool.model_tool_name, &tool.title, &tool.description))
         .map(|tool| {
             external_tool_value(
                 serde_json::json!(tool),
@@ -695,6 +736,7 @@ fn external_tool_catalog_value(
     context: &ToolExecutionContext,
     resources: &ToolRuntimeResources,
     executor_available: bool,
+    include_schema: bool,
 ) -> serde_json::Value {
     let access_decision = crate::external_tool_access_decision(read_only, context.access_profile);
     let rejection = resources
@@ -719,8 +761,14 @@ fn external_tool_catalog_value(
     value["model_available"] = serde_json::json!(reason.is_none());
     value["availability"] = serde_json::json!(availability);
     value["reason_code"] = serde_json::json!(reason);
-    // 条目携带原 input_schema，不代表它已进入本轮模型的 tools 定义。
-    value["schema_included"] = serde_json::json!(true);
+    // schema 按精确工具名取得；目录元数据不携带全部外接 schema。
+    if !include_schema {
+        value
+            .as_object_mut()
+            .expect("serialized tool entry")
+            .remove("input_schema");
+    }
+    value["schema_included"] = serde_json::json!(include_schema);
     value
 }
 

@@ -11,10 +11,6 @@ use std::path::{Path, PathBuf};
 
 const SKILLS_CONFIG_SECTION: &str = "skillsConfig";
 
-pub fn read_skill_instruction(dir_path: &Path) -> String {
-    read_available_skill_instruction(dir_path).unwrap_or_default()
-}
-
 pub fn read_available_skill_instruction(dir_path: &Path) -> Option<String> {
     for filename in ["prompt.md", "SKILL.md", "README.md"] {
         let path = dir_path.join(filename);

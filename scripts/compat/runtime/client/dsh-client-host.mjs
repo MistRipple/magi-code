@@ -16,7 +16,7 @@ import * as ReactDOMClient from 'react-dom/client';
 import * as JsxRuntime from 'react/jsx-runtime';
 import { createSlotContext, slotDisposition, MOUNT_PRIORITY, SLOT_SURFACE } from './slot-context.mjs';
 import { createSettingsScope } from './settings-scope.mjs';
-import { dshThemeAliases } from './theme.mjs';
+import { createThemeClient, dshThemeAliases } from './theme.mjs';
 import { bindSlotProps } from './slot-bindings.mjs';
 import { createWebStorage } from './web-storage.mjs';
 import { createEventSource } from './event-source.mjs';
@@ -29,6 +29,16 @@ import { createRemoteConnection } from './connection.mjs';
 import { createResourceUrls, installResourceUrls } from './resource-urls.mjs';
 
 const CHANNEL = 'magi-plugin-v1';
+
+class SlotErrorBoundary extends React.Component {
+  state = { error: null };
+  static getDerivedStateFromError(error) { return { error }; }
+  render() {
+    return this.state.error ? React.createElement('div', { role: 'alert' },
+      React.createElement('div', null, String(this.state.error.message ?? this.state.error)),
+      React.createElement('button', { type: 'button', onClick: () => this.setState({ error: null }) }, this.props.retryLabel)) : this.props.children;
+  }
+}
 
 /**
  * @param {object} options
@@ -44,9 +54,17 @@ export function startDshClient(options) {
   let selectedSlot = options;
   let initialized = false;
   let resourceUrls;
+  let availableWidth;
   let settingsSchema, settingsError;
+  let settingsInsets = { left: 0, right: 0 }, settingsLeft = 0, settingsRight = 0;
   const selectView = (m) => {
-    placement = ['settings', 'background'].includes(m.placement) ? m.placement : 'page';
+    placement = ['settings', 'background', 'composerLeft'].includes(m.placement) ? m.placement : 'page';
+    if (Number.isFinite(m.layoutWidth) && m.layoutWidth > 0) inlineWidth = m.layoutWidth;
+    if (Number.isFinite(m.availableWidth) && m.availableWidth > 0) availableWidth = m.availableWidth;
+    if (m.settingsInsets && (settingsInsets.left !== m.settingsInsets.left || settingsInsets.right !== m.settingsInsets.right)) {
+      settingsInsets = m.settingsInsets;
+      settingsLeft = settingsInsets.left; settingsRight = settingsInsets.right;
+    }
     if (options.clientViews?.length && m.viewId) {
       const view = options.clientViews.find(view => view.id === m.viewId);
       if (!view) throw new Error('插件视图未声明');
@@ -58,9 +76,13 @@ export function startDshClient(options) {
   const request = transport.request;
   const eventSources = createEventSource(request, document.baseURI);
   const composer = createComposerClient(request);
+  let actionError = null;
+  const clearActionError = () => { if (actionError) { actionError = null; render(); } };
+  const themeClient = createThemeClient(request, error => { actionError = String(error?.message ?? error); render(); }, clearActionError);
+  let conversationContext;
   const sessionComposer = options.business?.operations?.length ? createSessionComposerServices(composer.api) : undefined;
   globalThis.EventSource = eventSources.EventSource;
-  window.addEventListener('pagehide', () => { eventSources.dispose(); composer.dispose(); sessionComposer?.dispose(); slotContext.dispose(); transport.dispose(); }, { once: true });
+  window.addEventListener('pagehide', () => { eventSources.dispose(); composer.dispose(); sessionComposer?.dispose(); slotContext.dispose(); themeClient.dispose(); transport.dispose(); }, { once: true });
 
   // —— 路由：上游界面用 fetch('/plugins/<name>/…') 访问自己的后端，这里转交给宿主里的同一处理器 ——
   globalThis.fetch = createRouteFetch(request, document.baseURI, url => resourceUrls?.restore(url) ?? url);
@@ -87,7 +109,7 @@ export function startDshClient(options) {
   const connection = createRemoteConnection(request);
 
   // —— ctx：与构建期记录共用同一份实现 ——
-  const slotContext = createSlotContext({ scope, connection, composer: sessionComposer, onChange: () => render(), onOpenTab: (key) => {
+  const slotContext = createSlotContext({ scope, connection, composer: sessionComposer, theme: themeClient, onChange: () => render(), onOpenTab: (key) => {
     const view = options.panelViews?.find((item) => item.key === key);
     if (!view) throw new Error(`右栏视图未声明：${key}`);
     return request({ operation: 'view.open', viewId: view.viewId });
@@ -104,23 +126,81 @@ export function startDshClient(options) {
     for (const [name, value] of Object.entries(alias)) if (value) root.style.setProperty(name, value);
     root.style.colorScheme = theme.mode === 'light' ? 'light' : 'dark';
     root.dataset.theme = theme.mode;
-    const embedded = placement === 'settings';
+    const embedded = ['settings', 'composerLeft'].includes(placement);
     // 字号与字体取宿主下发的令牌；缺失时才回退到继承，不写死数值。
     const font = t['--vscode-font-family'] ? `${t['--text-base'] ?? 'inherit'}/1.5 ${t['--vscode-font-family']}` : 'inherit';
     document.body.style.cssText = `margin:0;background:${embedded ? 'transparent' : (t['--background'] ?? 'transparent')};color:${t['--foreground'] ?? 'inherit'};font:${font}`;
+    themeClient.update(theme);
     applyPlacement();
   };
 
   // —— 位置：嵌入设置页时由宿主整页滚动，页面按内容高度上报，自己不再出现滚动条 ——
   let lastReported = -1;
+  let inlineTop = 0, inlineLeft = 0, inlineWidth;
+  let popupWidth = 0, popupHeight = 0;
   let reportScheduled = false;
   const reportHeight = () => {
     reportScheduled = false;
-    if (placement !== 'settings' || instanceId === null) return;
-    const height = Math.ceil(document.getElementById('root')?.getBoundingClientRect().height ?? 0);
-    if (height === lastReported) return;
-    lastReported = height;
-    void request({ operation: 'view.resize', height }).catch(() => {});
+    if (!['settings', 'composerLeft'].includes(placement) || instanceId === null) return;
+    const root = document.getElementById('root');
+    const inline = ['composerLeft'].includes(placement);
+    let width = window.innerWidth;
+    if (placement === 'settings') {
+      let left = settingsInsets.left, right = settingsInsets.right, hasPopup = false;
+      // 只为原包内容区内的绝对定位浮层预留原生阴影空间；它的包含块
+      // 随宿主容器留白一起布局。fixed/内部滚动裁切仍由原组件拥有。
+      for (const element of root.querySelectorAll('*')) {
+        const style = getComputedStyle(element);
+        if (style.position !== 'absolute' || !root.contains(element.offsetParent) || !element.getClientRects().length || style.boxShadow === 'none') continue;
+        const rect = element.getBoundingClientRect();
+        if (!rect.width || !rect.height) continue;
+        for (const shadow of style.boxShadow.split(/,(?![^()]*\))/)) {
+          if (shadow.includes('inset')) continue;
+          const [x = 0, , blur = 0, spread = 0] = (shadow.match(/-?\d*\.?\d+px\b/g) ?? []).map(Number.parseFloat);
+          hasPopup = true;
+          left = Math.max(left, settingsLeft + Math.max(0, blur + spread - x - rect.left + 2));
+          right = Math.max(right, settingsRight + Math.max(0, rect.right + blur + spread + x - window.innerWidth + 2));
+        }
+      }
+      settingsLeft = hasPopup ? Math.max(settingsLeft, left) : settingsInsets.left;
+      settingsRight = hasPopup ? Math.max(settingsRight, right) : settingsInsets.right;
+      if (root.style.boxSizing !== 'border-box') root.style.boxSizing = 'border-box';
+      if (root.style.paddingLeft !== `${settingsLeft}px`) root.style.paddingLeft = `${settingsLeft}px`;
+      if (root.style.paddingRight !== `${settingsRight}px`) root.style.paddingRight = `${settingsRight}px`;
+    } else if (!inline) {
+      root.style.paddingLeft = ''; root.style.paddingRight = ''; root.style.boxSizing = '';
+    }
+    if (inline) {
+      if (root.style.paddingRight) root.style.paddingRight = '';
+      inlineWidth ??= window.innerWidth;
+      let top = inlineTop, left = inlineLeft, right = inlineWidth, bottom = 0, hasPopup = false;
+      // 原页面经 portal 放到 body 的 fixed 菜单仍由它自己渲染。只扩展
+      // 隔离视口的物理余量，不改原组件或 CSS；关闭后收回命中区域。
+      for (const element of document.body.querySelectorAll('*')) {
+        if (getComputedStyle(element).position !== 'fixed' || !element.getClientRects().length) continue;
+        const rect = element.getBoundingClientRect();
+        if (!rect.width || !rect.height) continue;
+        hasPopup = true; top = Math.min(top, rect.top); left = Math.min(left, rect.left);
+        right = Math.max(right, rect.right); bottom = Math.max(bottom, rect.bottom);
+      }
+      // 浮层的公共物理余量包括阴影；原页面继续拥有菜单样式与位置。
+      // 菜单打开期间只扩展余量，全部浮层关闭后才收回，避免悬停提示
+      // 出现/消失使原组件在 pointermove 与 pointerdown 之间改变位置。
+      inlineTop = hasPopup ? Math.max(inlineTop, inlineTop - top + 24) : 0;
+      inlineLeft = hasPopup ? Math.max(inlineLeft, inlineLeft - left + 24) : 0;
+      if (root.style.paddingTop !== `${inlineTop}px`) root.style.paddingTop = `${inlineTop}px`;
+      if (root.style.paddingLeft !== `${inlineLeft}px`) root.style.paddingLeft = `${inlineLeft}px`;
+      if (root.style.width !== `${inlineWidth}px`) root.style.width = `${inlineWidth}px`;
+      if (root.style.boxSizing !== 'content-box') root.style.boxSizing = 'content-box';
+      popupWidth = hasPopup ? Math.max(popupWidth, right + 24) : 0;
+      popupHeight = hasPopup ? Math.max(popupHeight, bottom + 24) : 0;
+      width = Math.ceil(Math.min(Math.max(inlineWidth + inlineLeft, popupWidth), (availableWidth ?? right) + inlineLeft));
+    }
+    const height = Math.ceil(Math.max(root?.getBoundingClientRect().height ?? 0, inline ? popupHeight : 0));
+    const identity = JSON.stringify([height, inlineTop, inlineLeft, width]);
+    if (identity === lastReported) return;
+    lastReported = identity;
+    void request({ operation: 'view.resize', height, ...(inline ? { overflowTop: inlineTop, overflowLeft: inlineLeft, width } : {}) }).catch(() => {});
   };
   const scheduleReport = () => {
     if (reportScheduled) return;
@@ -141,7 +221,12 @@ export function startDshClient(options) {
   ].join('\n');
   document.head.appendChild(embedStyle);
   const applyPlacement = () => {
-    const embedded = placement === 'settings';
+    const embedded = ['settings', 'composerLeft'].includes(placement);
+    if (!['composerLeft'].includes(placement)) {
+      const root = document.getElementById('root');
+      if (root.style.width) root.style.width = '';
+      if (root.style.paddingTop) root.style.paddingTop = '';
+    }
     // 滚动归宿主的设置框架：页面本身不产生滚动条，高度随内容上报。
     document.documentElement.style.overflow = embedded ? 'hidden' : '';
     document.body.style.overflow = embedded ? 'hidden' : '';
@@ -149,16 +234,22 @@ export function startDshClient(options) {
     scheduleReport();
   };
   new ResizeObserver(scheduleReport).observe(document.getElementById('root'));
+  window.addEventListener('resize', () => { settingsLeft = settingsInsets.left; settingsRight = settingsInsets.right; scheduleReport(); });
+  document.addEventListener('pointerover', scheduleReport, { passive: true });
+  new MutationObserver(scheduleReport).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['style', 'class', 'open'] });
 
   // —— 渲染：把上游注册在“插件配置”位置的卡片整页渲染出来 ——
   const container = document.getElementById('root');
   const root = ReactDOMClient.createRoot(container);
   const render = () => {
-    if (placement === 'background') { root.render(null); return; }
+    // 停放只隐藏宿主位置，保留已打开原页面的 React 状态；首次后台启动仍不创建页面。
+    if (placement === 'background') return;
     if (options.settingsForm) {
       root.render(React.createElement(SettingsForm, { scope, schema: settingsSchema, locale, error: settingsError }));
       return;
     }
+    const conversation = conversationContext;
+    if (['composerLeft'].includes(placement) && !conversation) { root.render(null); return; }
     const cards = slotContext.live().filter((entry) => selectedSlot.slotName
       ? entry.descriptor.name === selectedSlot.slotName && (selectedSlot.slotKey === undefined || String(entry.descriptor.key ?? entry.descriptor.id ?? '') === selectedSlot.slotKey)
       : slotDisposition(entry.descriptor.name) === 'mounted');
@@ -169,8 +260,11 @@ export function startDshClient(options) {
       root.render(React.createElement('div', { style: { padding: 16 } }, '该插件没有提供设置界面。'));
       return;
     }
-    const injected = bindSlotProps(card.descriptor, card.descriptor.inject?.() ?? {}, ctx.locale);
-    root.render(React.createElement(card.component, { ...injected, settingsScope: scope, surface: SLOT_SURFACE[card.descriptor.name] ?? 'page', view: 'page' }));
+    const injected = bindSlotProps(card.descriptor, card.descriptor.inject?.(conversation?.sessionId) ?? {}, ctx.locale);
+    const element = React.createElement(card.component, { ...injected, ...conversation, settingsScope: scope, surface: SLOT_SURFACE[card.descriptor.name] ?? 'page', view: 'page' });
+    root.render(React.createElement(React.Fragment, null,
+      actionError ? React.createElement('div', { role: 'alert' }, actionError) : null,
+      React.createElement(SlotErrorBoundary, { key: selectedSlot.slotName, retryLabel: locale.startsWith('zh') ? '重试' : 'Retry' }, element)));
   };
 
   /** 上游界面是一个调用 `__ModuleLoader__.load` 的脚本文件；以 <script src> 加载，页面 CSP 不允许 eval。 */
@@ -246,7 +340,10 @@ export function startDshClient(options) {
         for (const area of ['local', 'session']) Object.defineProperty(window, `${area}Storage`, {
           configurable: true,
           value: createWebStorage(storage[area], (mutation) => {
-            void request({ operation: 'view.storage.write', area, mutation }).catch((error) => console.error('Plugin UI storage failed:', error));
+            void request({ operation: 'view.storage.write', area, mutation }).catch((error) => {
+              // 销毁会结束本视图的等待；存活文档的真实存储错误仍须报告。
+              if (!transport.disposed) console.error('Plugin UI storage failed:', error);
+            });
           }),
         });
         settingsSchema = await refreshSettings();
@@ -263,6 +360,10 @@ export function startDshClient(options) {
       if (m.theme) applyTheme(m.theme);
     } else if (m.type === 'composer') {
       composer.update(m.snapshot);
+    } else if (m.type === 'conversation') {
+      // 输入区贡献只接收明确会话身份，不合成 DSH 消息结点或输入动作。
+      conversationContext = m.context ? { sessionId: m.context.sessionId } : undefined;
+      render();
     } else if (m.type === 'response') {
       transport.receive(m);
     }

@@ -124,7 +124,7 @@ npm run release:preflight:full -- --tag "$RELEASE_TAG"
 | 工程检查 | crate 架构文档、Desktop/Worker TypeScript、Web Svelte |
 | JS 测试与构建 | Desktop、Worker、Web 测试，Browser 核心边界，Web/Worker 生产构建 |
 | 发行边界 | Browser 工具目录、网络策略、App Server 生成协议、Browser 合同、Electron 唯一发行边界 |
-| Rust | daemon/bridge debug 构建、真实 loopback preflight、全 workspace Clippy（警告视为错误）、全 workspace 测试 |
+| Rust | daemon debug 构建、正式模型/MCP 客户端回归、全 workspace Clippy（警告视为错误）、全 workspace 测试 |
 | 本机安装包 | 构建 Web、Worker、Rust sidecar、Electron，生成安装包并执行解包结构自检 |
 | 安全审计 | npm audit --omit=dev --workspaces 与 cargo audit |
 

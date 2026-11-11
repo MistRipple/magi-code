@@ -1,9 +1,6 @@
 mod budgeting;
 mod execution_context;
 mod knowledge_context;
-pub mod layered_memory_store;
-pub mod memory_document;
-pub mod shared_context_pool;
 mod source_assembly;
 mod structured_output;
 
@@ -584,7 +581,7 @@ mod tests {
         let project_key = "project-a".to_string();
         let timestamp = UtcMillis(42);
 
-        let session_store = SessionStore::from_state(SessionStoreState {
+        let session_store = SessionStore::from_state_for_test(SessionStoreState {
             current_session_id: Some(session_id.clone()),
             sessions: vec![SessionRecord {
                 session_id: session_id.clone(),
@@ -761,13 +758,12 @@ mod tests {
                 layer: magi_memory_store::MemoryLayer::Recent,
                 content: format!("memory content {i}"),
                 provenance: None,
-                compacted: false,
                 created_at: ts(200 + i),
             });
         }
 
         // --- session store: 3 timeline entries ---
-        let session_store = SessionStore::from_state(SessionStoreState {
+        let session_store = SessionStore::from_state_for_test(SessionStoreState {
             current_session_id: Some(session_id.clone()),
             sessions: vec![SessionRecord {
                 session_id: session_id.clone(),
@@ -1022,11 +1018,10 @@ mod tests {
             layer: magi_memory_store::MemoryLayer::Recent,
             content: "Remember to keep diagnostics stable during rollout.".to_string(),
             provenance: None,
-            compacted: false,
             created_at: timestamp(20),
         });
 
-        let session_store = SessionStore::from_state(SessionStoreState {
+        let session_store = SessionStore::from_state_for_test(SessionStoreState {
             current_session_id: Some(session_id.clone()),
             sessions: vec![SessionRecord {
                 session_id: session_id.clone(),
@@ -1398,7 +1393,6 @@ mod tests {
             layer: magi_memory_store::MemoryLayer::Recent,
             content: "recent memory 1".to_string(),
             provenance: None,
-            compacted: false,
             created_at: UtcMillis(10),
         });
         memory_store.append(MemoryRecord {
@@ -1407,7 +1401,6 @@ mod tests {
             layer: magi_memory_store::MemoryLayer::Recent,
             content: "recent memory 2".to_string(),
             provenance: None,
-            compacted: false,
             created_at: UtcMillis(20),
         });
         memory_store.append(MemoryRecord {
@@ -1416,7 +1409,6 @@ mod tests {
             layer: magi_memory_store::MemoryLayer::Durable,
             content: "durable memory 1".to_string(),
             provenance: None,
-            compacted: false,
             created_at: UtcMillis(30),
         });
         memory_store.append(MemoryRecord {
@@ -1425,7 +1417,6 @@ mod tests {
             layer: magi_memory_store::MemoryLayer::Durable,
             content: "durable memory 2".to_string(),
             provenance: None,
-            compacted: false,
             created_at: UtcMillis(40),
         });
         memory_store.append(MemoryRecord {
@@ -1434,7 +1425,6 @@ mod tests {
             layer: magi_memory_store::MemoryLayer::Shared,
             content: "shared memory 1".to_string(),
             provenance: None,
-            compacted: false,
             created_at: UtcMillis(50),
         });
 
@@ -1580,7 +1570,7 @@ mod tests {
         let ts = |v: u64| UtcMillis(v);
 
         // session timeline: 2 entries, one with content "shared turn"
-        let session_store = SessionStore::from_state(SessionStoreState {
+        let session_store = SessionStore::from_state_for_test(SessionStoreState {
             current_session_id: Some(session_id.clone()),
             sessions: vec![SessionRecord {
                 session_id: session_id.clone(),
@@ -1791,7 +1781,7 @@ mod tests {
         let runtime = ContextRuntime::with_runtime_sources(
             KnowledgeStore::new(),
             MemoryStore::new(),
-            SessionStore::from_state(SessionStoreState {
+            SessionStore::from_state_for_test(SessionStoreState {
                 current_session_id: None,
                 sessions: vec![],
                 timeline: vec![],
@@ -2185,7 +2175,6 @@ mod tests {
             layer: magi_memory_store::MemoryLayer::Recent,
             content: "memory".to_string(),
             provenance: None,
-            compacted: false,
             created_at: UtcMillis(1),
         });
 

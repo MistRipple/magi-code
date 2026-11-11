@@ -8,7 +8,7 @@ use magi_session_store::{ExecutionThread, ExecutionThreadStatus, SessionStore};
 /// 为指定 role 创建本次 task 独占的 Thread，并返回其 thread_id。
 ///
 /// worker 的执行事实必须由当前 task 驱动；旧 thread 只作为历史审计存在，不能被新
-/// task 复用，否则 message_history 会把历史工具调用重新注入模型上下文。
+/// task 复用，否则会把历史工具调用重新注入模型上下文。
 pub fn build_thread_for_role(
     session_id: &SessionId,
     mission_id: &MissionId,
@@ -28,7 +28,6 @@ pub fn build_thread_for_role(
         last_used_at: now,
         observed_context_window_tokens: None,
         handled_task_ids: vec![task_id.clone()],
-        message_history: Vec::new(),
     }
 }
 
@@ -83,15 +82,6 @@ mod tests {
                 last_used_at: UtcMillis(1_000),
                 observed_context_window_tokens: None,
                 handled_task_ids: vec![old_task_id],
-                message_history: vec![magi_session_store::ThreadChatMessage {
-                    input_request_id: None,
-                    role: "user".to_string(),
-                    content: Some("历史任务：写 validation_auto_save_marker.txt".to_string()),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                }],
             })
             .expect("已有 idle thread 测试数据应注册成功");
 
@@ -115,7 +105,11 @@ mod tests {
             .expect("new task thread should be registered");
         assert_eq!(new_thread.handled_task_ids, vec![new_task_id]);
         assert!(
-            new_thread.message_history.is_empty(),
+            store
+                .thread_context_snapshot(&new_thread.thread_id)
+                .unwrap()
+                .messages()
+                .is_empty(),
             "新任务 thread 必须从空历史开始，不能继承旧 task 对话"
         );
     }

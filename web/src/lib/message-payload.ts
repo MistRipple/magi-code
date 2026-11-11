@@ -65,7 +65,6 @@ function parseToolInput(value: unknown): Record<string, unknown> {
 
 function sanitizeSerializableValue(
   value: unknown,
-  options: { preserveUndefined?: boolean } = {},
   seen: WeakSet<object> = new WeakSet<object>(),
 ): unknown {
   if (value === undefined) {
@@ -86,7 +85,7 @@ function sanitizeSerializableValue(
   if (Array.isArray(value)) {
     const result: unknown[] = [];
     for (const item of value) {
-      const sanitized = sanitizeSerializableValue(item, options, seen);
+      const sanitized = sanitizeSerializableValue(item, seen);
       if (sanitized !== undefined) {
         result.push(sanitized);
       }
@@ -104,7 +103,7 @@ function sanitizeSerializableValue(
     if (typeof value.stack === 'string' && value.stack.trim()) {
       normalized.stack = value.stack;
     }
-    const cause = sanitizeSerializableValue((value as Error & { cause?: unknown }).cause, options, seen);
+    const cause = sanitizeSerializableValue((value as Error & { cause?: unknown }).cause, seen);
     if (cause !== undefined) {
       normalized.cause = cause;
     }
@@ -119,11 +118,7 @@ function sanitizeSerializableValue(
   seen.add(value);
   const result: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value)) {
-    if (entry === undefined && options.preserveUndefined) {
-      result[key] = undefined;
-      continue;
-    }
-    const sanitized = sanitizeSerializableValue(entry, options, seen);
+    const sanitized = sanitizeSerializableValue(entry, seen);
     if (sanitized !== undefined) {
       result[key] = sanitized;
     }
@@ -135,12 +130,11 @@ function sanitizeSerializableValue(
 function sanitizeMessageMetadata(
   metadata: unknown,
   errorPrefix: string,
-  options: { preserveUndefined?: boolean } = {},
 ): Message['metadata'] | undefined {
   if (metadata === undefined) {
     return undefined;
   }
-  const sanitized = sanitizeSerializableValue(metadata, options);
+  const sanitized = sanitizeSerializableValue(metadata);
   if (sanitized === undefined) {
     return undefined;
   }
@@ -630,141 +624,4 @@ export function normalizeMessagePayload(message: Message, errorPrefix = '[Messag
 
 export function cloneMessagePayload(message: Message): Message {
   return normalizeMessagePayload(message, '[MessagePayload] 克隆消息');
-}
-
-export function sanitizeMessagePatch(
-  updates: Partial<Message>,
-  errorPrefix = '[MessagePayload] 补丁',
-): Partial<Message> {
-  if (!updates || typeof updates !== 'object') {
-    throw new Error(`${errorPrefix} 无效`);
-  }
-
-  const normalized: Partial<Message> = {};
-
-  if ('id' in updates) {
-    if (updates.id === undefined) {
-      normalized.id = updates.id;
-    } else if (typeof updates.id === 'string' && updates.id.trim()) {
-      normalized.id = updates.id.trim();
-    } else {
-      throw new Error(`${errorPrefix} id 无效`);
-    }
-  }
-
-  if ('role' in updates) {
-    if (updates.role === undefined) {
-      normalized.role = updates.role;
-    } else if (MESSAGE_ROLE_SET.has(updates.role as MessageRole)) {
-      normalized.role = updates.role;
-    } else {
-      throw new Error(`${errorPrefix} role 无效`);
-    }
-  }
-
-  if ('source' in updates) {
-    if (updates.source === undefined) {
-      normalized.source = updates.source;
-    } else if (isValidMessageSource(updates.source as string)) {
-      normalized.source = updates.source;
-    } else {
-      throw new Error(`${errorPrefix} source 无效`);
-    }
-  }
-
-  if ('content' in updates) {
-    if (updates.content === undefined || typeof updates.content === 'string') {
-      normalized.content = updates.content;
-    } else {
-      throw new Error(`${errorPrefix} content 非字符串`);
-    }
-  }
-
-  if ('blocks' in updates) {
-    normalized.blocks = updates.blocks === undefined
-      ? undefined
-      : sanitizeMessageBlocks(updates.blocks, errorPrefix);
-  }
-
-  if ('timestamp' in updates) {
-    if (updates.timestamp === undefined) {
-      normalized.timestamp = updates.timestamp;
-    } else if (typeof updates.timestamp === 'number' && Number.isFinite(updates.timestamp)) {
-      normalized.timestamp = Math.floor(updates.timestamp);
-    } else {
-      throw new Error(`${errorPrefix} timestamp 无效`);
-    }
-  }
-
-  if ('updatedAt' in updates) {
-    if (updates.updatedAt === undefined) {
-      normalized.updatedAt = updates.updatedAt;
-    } else if (typeof updates.updatedAt === 'number' && Number.isFinite(updates.updatedAt)) {
-      normalized.updatedAt = Math.floor(updates.updatedAt);
-    } else {
-      throw new Error(`${errorPrefix} updatedAt 无效`);
-    }
-  }
-
-  if ('isStreaming' in updates) {
-    if (updates.isStreaming === undefined || typeof updates.isStreaming === 'boolean') {
-      normalized.isStreaming = updates.isStreaming;
-    } else {
-      throw new Error(`${errorPrefix} isStreaming 无效`);
-    }
-  }
-
-  if ('isComplete' in updates) {
-    if (updates.isComplete === undefined || typeof updates.isComplete === 'boolean') {
-      normalized.isComplete = updates.isComplete;
-    } else {
-      throw new Error(`${errorPrefix} isComplete 无效`);
-    }
-  }
-
-  if ('type' in updates) {
-    if (updates.type === undefined || MESSAGE_TYPE_SET.has(updates.type as MessageType)) {
-      normalized.type = updates.type;
-    } else {
-      throw new Error(`${errorPrefix} type 无效`);
-    }
-  }
-
-  if ('noticeType' in updates) {
-    if (updates.noticeType === undefined || NOTICE_TYPE_SET.has(updates.noticeType as NoticeType)) {
-      normalized.noticeType = updates.noticeType;
-    } else {
-      throw new Error(`${errorPrefix} noticeType 无效`);
-    }
-  }
-
-  if ('images' in updates) {
-    normalized.images = updates.images === undefined
-      ? undefined
-      : sanitizeMessageImages(updates.images, errorPrefix);
-  }
-
-  if ('contextReferences' in updates) {
-    normalized.contextReferences = updates.contextReferences === undefined
-      ? undefined
-      : sanitizeMessageContextReferences(updates.contextReferences, errorPrefix);
-  }
-  if ('browserAnnotationRefs' in updates) {
-    normalized.browserAnnotationRefs = updates.browserAnnotationRefs === undefined
-      ? undefined
-      : sanitizeMessageBrowserAnnotationRefs(updates.browserAnnotationRefs, errorPrefix);
-  }
-  if ('browserNodeSelections' in updates) {
-    normalized.browserNodeSelections = updates.browserNodeSelections === undefined
-      ? undefined
-      : sanitizeMessageBrowserNodeSelections(updates.browserNodeSelections, errorPrefix);
-  }
-
-  if ('metadata' in updates) {
-    normalized.metadata = sanitizeMessageMetadata(updates.metadata, errorPrefix, {
-      preserveUndefined: true,
-    });
-  }
-
-  return normalized;
 }

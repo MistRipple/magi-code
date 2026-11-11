@@ -483,7 +483,7 @@ mod tests {
     use magi_governance::GovernanceService;
     use magi_session_store::{
         SessionDurableState, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
-        SessionRecord, SessionRuntimeSidecar, SessionStore, TimelineEntryKind,
+        SessionRecord, SessionRuntimeSidecarState, SessionStore, TimelineEntryKind,
     };
     use magi_workspace::WorkspaceStore;
     use std::{fs, sync::Arc, time::Duration};
@@ -914,7 +914,7 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("session should create");
-        state.session_store.bind_execution_ownership(
+        state.session_store.bind_execution_ownership_for_test(
             session_id.clone(),
             ExecutionOwnership {
                 session_id: Some(session_id.clone()),
@@ -1444,14 +1444,14 @@ mod tests {
             thread_registry: Vec::new(),
         };
         let sidecar_state = SessionExecutionSidecarStoreState {
-            runtime_sidecars: vec![SessionRuntimeSidecar {
+            runtime_sidecars: vec![SessionRuntimeSidecarState {
                 session_id: session_id.clone(),
                 ownership: ExecutionOwnership {
                     workspace_id: Some(workspace_b_id.clone()),
                     ..ExecutionOwnership::default()
                 },
                 recovery_id: None,
-                current_turn: None,
+                current_turn_id: None,
                 active_execution_chain: None,
                 status: SessionExecutionSidecarStatus::Bound,
                 updated_at: now,

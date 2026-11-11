@@ -1,10 +1,10 @@
 //! canonical Step 是原生调用的用量事实；实时结算与重启补账使用同一投影。
-use magi_core::{SessionId, WorkspaceId};
+use magi_core::SessionId;
 use magi_event_bus::InMemoryEventBus;
 use magi_session_store::{ModelStep, ModelStepStatus, ModelTransportOutcome, SessionStore};
 use magi_usage_authority::{
     ExecutionBindingIdentity, LlmConfig, UsageCallIdentity, UsageCallRecordInput, UsageCallStatus,
-    UsageTokenInput, UsageTransportIdentity,
+    UsageOwner, UsageTokenInput, UsageTransportIdentity,
 };
 
 pub fn model_step_usage_records(
@@ -28,7 +28,7 @@ pub fn model_step_usage_records(
         .filter_map(|(index, attempt)| {
             Some(transport_usage_record(TransportUsageInput {
                 context,
-                session_id,
+                owner: UsageOwner::session(session_id.to_string()),
                 turn_id: Some(turn_id),
                 logical_call_id: &step.step_id,
                 attempt_id: &attempt.attempt_id,
@@ -43,7 +43,7 @@ pub fn model_step_usage_records(
 
 pub(crate) struct TransportUsageInput<'a> {
     pub context: &'a magi_app_server_protocol::ModelUsageContext,
-    pub session_id: &'a SessionId,
+    pub owner: UsageOwner,
     pub turn_id: Option<&'a str>,
     pub logical_call_id: &'a str,
     pub attempt_id: &'a str,
@@ -55,7 +55,7 @@ pub(crate) struct TransportUsageInput<'a> {
 pub(crate) fn transport_usage_record(input: TransportUsageInput<'_>) -> UsageCallRecordInput {
     let TransportUsageInput {
         context,
-        session_id,
+        owner,
         turn_id,
         logical_call_id,
         attempt_id,
@@ -81,11 +81,14 @@ pub(crate) fn transport_usage_record(input: TransportUsageInput<'_>) -> UsageCal
     };
     UsageCallRecordInput {
         workspace_id: context.workspace_id.clone(),
-        session_id: session_id.to_string(),
+        owner: owner.clone(),
         turn_id: turn_id.map(str::to_string),
         dispatch_wave_id: None,
         assignment_id: context.assignment_id.clone(),
-        event_id: Some(format!("model-usage:{scope}:{session_id}:{attempt_id}")),
+        event_id: Some(format!(
+            "model-usage:{scope}:{}:{attempt_id}",
+            owner.ledger_key()
+        )),
         timestamp: Some(transport.observed_at.unwrap_or(fallback_timestamp)),
         execution_binding: ExecutionBindingIdentity {
             template_id: context.template_id.clone(),
@@ -141,15 +144,7 @@ pub fn publish_model_step_usage(
         .into_iter()
         .filter(|_| step.status != ModelStepStatus::Started)
     {
-        crate::usage_recording::publish_usage_call_input(
-            event_bus,
-            &input
-                .workspace_id
-                .as_ref()
-                .map(|id| WorkspaceId::new(id.clone())),
-            session_id,
-            &input,
-        );
+        crate::usage_recording::publish_usage_call_input(event_bus, &input);
     }
 }
 
@@ -185,7 +180,7 @@ pub fn recover_model_usage_projections(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::{EventId, ThreadId, UtcMillis};
+    use magi_core::{EventId, ThreadId, UtcMillis, WorkspaceId};
     use magi_event_bus::EventEnvelope;
     use magi_session_store::{
         ActiveExecutionTurn, ModelTransportRecord, ModelTransportUsage, TimelineEntryInput,
@@ -272,6 +267,7 @@ mod tests {
                     ModelTransportRecord {
                         usage_observed: None,
                         response_timing: Some(magi_app_server_protocol::ModelResponseTiming {
+                            response_duration_ms: Some(1400),
                             first_content_ms: 250,
                             content_duration_ms: 1000,
                             text_output_tokens: Some(2),
@@ -338,7 +334,7 @@ mod tests {
                     serde_json::to_value(input.call_identity.source).unwrap(),
                     role
                 );
-                assert_eq!(input.session_id, session.as_str());
+                assert_eq!(input.owner.session_id(), Some(session.as_str()));
                 authority.append_call_record(input.clone());
                 authority.append_call_record(input);
             }
@@ -363,6 +359,10 @@ mod tests {
             assert_eq!(totals.performance.text_output_tokens, 2);
             assert_eq!(totals.performance.content_duration_ms, 1000);
             assert_eq!(totals.performance.last_tps, Some(2.0));
+            assert_eq!(totals.performance.response_sample_count, 1);
+            assert_eq!(totals.performance.response_output_tokens, 2);
+            assert_eq!(totals.performance.response_duration_ms, 1400);
+            assert_eq!(totals.performance.last_response_tps, Some(2.0 / 1.4));
             assert_eq!(snapshot.by_execution_binding.len(), 1);
             assert_eq!(
                 snapshot.by_execution_binding[0]
@@ -406,7 +406,7 @@ mod tests {
             assert_eq!(input.model_config.base_url, "https://original.test/v1");
             assert_eq!(input.assignment_id.as_deref(), Some("original-lease"));
             assert_eq!(input.turn_id.as_deref(), Some("usage-turn"));
-            assert_eq!(input.session_id, session.as_str());
+            assert_eq!(input.owner.session_id(), Some(session.as_str()));
             assert_eq!(
                 input.call_identity.parent_call_id.as_deref(),
                 Some("usage-step")
@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn usage_scope_is_frozen_even_if_session_is_later_bound_to_another_workspace() {
         let (store, session) = recorded_call(true, UtcMillis::now().0);
-        store.bind_execution_ownership(
+        store.bind_execution_ownership_for_test(
             session.clone(),
             magi_core::ExecutionOwnership {
                 session_id: Some(session.clone()),

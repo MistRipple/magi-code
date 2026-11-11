@@ -127,7 +127,7 @@
 
 {#if change}
   <div class="message-card tool-call" class:collapsed>
-    <button class="tool-header" onclick={toggle} aria-expanded={!collapsed} aria-controls={contentId}>
+    <div class="tool-header tool-header-with-actions">
       <span class="tool-icon">
         <Icon name={changeIcon} size={14} />
       </span>
@@ -135,29 +135,18 @@
       <span class="tool-title">
         <span class="tool-name">{changeLabel}</span>
         {#if change.changeType === 'rename' && change.oldPath}
-          <span
+          <button
+            type="button"
             class="rename-path"
             title={displayPath}
-            role="button"
-            tabindex="0"
             use:desktopContextMenu={{
               kind: 'file',
               filePath: change.filePath,
               open: () => previewInRightPane(change.filePath),
               fileScope: contextFileScope,
             }}
-            onclick={(event) => {
-              event.stopPropagation();
-              previewInRightPane(change.filePath);
-            }}
-            onkeydown={(event) => {
-              if (event.key === 'Enter' || event.key === ' ') {
-                event.preventDefault();
-                event.stopPropagation();
-                previewInRightPane(change.filePath);
-              }
-            }}
-          ><FileName name={displayPath ?? ""} /></span>
+            onclick={() => previewInRightPane(change.filePath)}
+          ><FileName name={displayPath ?? ""} /></button>
         {:else}
           <FileSpan
             filepath={change.filePath}
@@ -169,7 +158,8 @@
         {/if}
       </span>
 
-      <ToolCardMeta status={change.error ? 'error' : 'success'} label={i18n.t(change.error ? 'terminalSession.status.error' : 'terminalSession.status.success')} expanded={!collapsed}>
+      <button type="button" class="tool-header-disclosure" onclick={toggle} aria-label={`${changeLabel} ${displayPath}`} aria-expanded={!collapsed} aria-controls={contentId}>
+        <ToolCardMeta status={change.error ? 'error' : 'success'} label={i18n.t(change.error ? 'terminalSession.status.error' : 'terminalSession.status.success')} expanded={!collapsed}>
 
       {#if hasStatsBadge && isText}
         <span class="stats-badge">
@@ -187,8 +177,9 @@
         </span>
       {/if}
 
-      </ToolCardMeta>
-    </button>
+        </ToolCardMeta>
+      </button>
+    </div>
 
     <Disclosure expanded={!collapsed}>
       <div class="tool-content" id={contentId}>
@@ -259,6 +250,9 @@
   }
 
   .rename-path {
+    border: 0;
+    padding: 0;
+    background: transparent;
     min-width: 0;
     overflow: hidden;
     color: var(--foreground);

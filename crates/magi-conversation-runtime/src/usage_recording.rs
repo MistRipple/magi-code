@@ -308,8 +308,8 @@ pub fn invoke_auxiliary_model_with_usage(
         )
         .ok();
     }
-    let receipts = std::cell::RefCell::new(magi_bridge_client::ModelTransportRecorder::default());
-    let response = client.invoke_observed(
+    let (response, receipts) = invoke_observed_model_with_usage(
+        client.as_ref(),
         request,
         magi_bridge_client::ModelInvocationOptions {
             on_delta: None,
@@ -317,53 +317,22 @@ pub fn invoke_auxiliary_model_with_usage(
             is_cancelled: &|| false,
             max_output_tokens: None,
         },
-        &|event| {
-            let mut receipts = receipts.borrow_mut();
-            let transport = receipts.apply(event)?.clone();
-            if let (Some(session_id), Some(frozen)) = (context.session_id, frozen_context.as_ref())
-            {
-                crate::auxiliary_usage::write_fact(
-                    context.event_bus,
-                    &crate::auxiliary_usage::AuxiliaryUsageFact {
-                        schema_version: 1,
-                        session_id: session_id.clone(),
-                        turn_id: context.expected_turn_id.map(str::to_string),
-                        call_id: context.call_id.clone(),
-                        attempt: receipts.attempts.len(),
-                        context: frozen.clone(),
-                        transport,
-                        call_status: None,
-                    },
-                )?;
-            }
-            Ok(())
-        },
-    );
-    let receipts = receipts.into_inner().attempts;
-    if let (Some(session_id), Some(frozen)) = (context.session_id, frozen_context.as_ref())
-        && !receipts.is_empty()
-    {
-        for (index, transport) in receipts.iter().enumerate() {
-            let last = index + 1 == receipts.len();
-            let fact = crate::auxiliary_usage::AuxiliaryUsageFact {
+        context.event_bus,
+        &|transport, attempt, call_status| {
+            Some(crate::auxiliary_usage::AuxiliaryUsageFact {
                 schema_version: 1,
-                session_id: session_id.clone(),
+                session_id: Some(context.session_id?.clone()),
+                plugin: None,
                 turn_id: context.expected_turn_id.map(str::to_string),
                 call_id: context.call_id.clone(),
-                attempt: index + 1,
-                context: frozen.clone(),
-                transport: transport.clone(),
-                call_status: last.then_some(if response.is_ok() {
-                    UsageCallStatus::Success
-                } else {
-                    UsageCallStatus::Failed
-                }),
-            };
-            if last {
-                crate::auxiliary_usage::write_fact(context.event_bus, &fact)?;
-            }
-            crate::auxiliary_usage::publish_fact_usage(context.event_bus, &fact);
-        }
+                attempt,
+                context: frozen_context.as_ref()?.clone(),
+                transport,
+                call_status,
+            })
+        },
+    );
+    if context.session_id.is_some() && frozen_context.is_some() && !receipts.is_empty() {
         return response;
     }
     match response {
@@ -422,6 +391,52 @@ pub fn invoke_auxiliary_model_with_usage(
             Err(error)
         }
     }
+}
+
+/// 辅助业务与插件业务共用同一传输记录、落盘和结算入口。
+/// 观察回调落盘失败会中止 Bridge，不能在未记录请求时发送或重试。
+pub(crate) fn invoke_observed_model_with_usage(
+    client: &dyn ModelBridgeClient,
+    request: ModelInvocationRequest,
+    options: magi_bridge_client::ModelInvocationOptions<'_>,
+    event_bus: &InMemoryEventBus,
+    fact: &dyn Fn(
+        magi_session_store::ModelTransportRecord,
+        usize,
+        Option<UsageCallStatus>,
+    ) -> Option<crate::auxiliary_usage::AuxiliaryUsageFact>,
+) -> (
+    Result<ModelResponse, BridgeClientError>,
+    Vec<magi_session_store::ModelTransportRecord>,
+) {
+    let receipts = std::cell::RefCell::new(magi_bridge_client::ModelTransportRecorder::default());
+    let is_cancelled = options.is_cancelled;
+    let response = client.invoke_observed(request, options, &|event| {
+        let mut receipts = receipts.borrow_mut();
+        let transport = receipts.apply(event)?.clone();
+        if let Some(fact) = fact(transport, receipts.attempts.len(), None) {
+            crate::auxiliary_usage::write_fact(event_bus, &fact)?;
+        }
+        Ok(())
+    });
+    let receipts = receipts.into_inner().attempts;
+    for (index, transport) in receipts.iter().enumerate() {
+        let last = index + 1 == receipts.len();
+        let status = last.then_some(if is_cancelled() {
+            UsageCallStatus::Cancelled
+        } else if response.is_ok() {
+            UsageCallStatus::Success
+        } else {
+            UsageCallStatus::Failed
+        });
+        if let Some(fact) = fact(transport.clone(), index + 1, status) {
+            if last && let Err(error) = crate::auxiliary_usage::write_fact(event_bus, &fact) {
+                return (Err(error), receipts);
+            }
+            crate::auxiliary_usage::publish_fact_usage(event_bus, &fact);
+        }
+    }
+    (response, receipts)
 }
 
 /// 扩展模型调用沿同一角色绑定记录用量，不允许扩展自报模型身份。
@@ -817,7 +832,7 @@ fn publish_model_usage_record_internal(
     };
     let input = UsageCallRecordInput {
         workspace_id: workspace_id_value,
-        session_id: session_id.to_string(),
+        owner: magi_usage_authority::UsageOwner::session(session_id.to_string()),
         turn_id: options
             .expected_turn_id
             .map(str::to_string)
@@ -865,10 +880,10 @@ fn publish_model_usage_record_internal(
         });
     if let Some(records) = canonical_records {
         for record in records {
-            publish_usage_call_input(event_bus, workspace_id, session_id, &record);
+            publish_usage_call_input(event_bus, &record);
         }
     } else if attempts.is_empty() {
-        publish_usage_call_input(event_bus, workspace_id, session_id, &input);
+        publish_usage_call_input(event_bus, &input);
     } else {
         for (index, (attempt_id, transport)) in attempts.iter().enumerate() {
             let mut attempt = input.clone();
@@ -914,18 +929,15 @@ fn publish_model_usage_record_internal(
                         .unwrap_or_else(|| "model_transport_retry".into()),
                 );
             }
-            publish_usage_call_input(event_bus, workspace_id, session_id, &attempt);
+            publish_usage_call_input(event_bus, &attempt);
         }
     }
     if publishes_authoritative_context {
-        let thread_id = session_store
-            .orchestrator_thread_for_session(session_id)
-            .map(|thread| thread.thread_id);
-        let checkpoint_generation = thread_id
+        // 完成统计沿原 Step 的线程和历史代际；迟到响应不能改绑到最新检查点。
+        let thread_id = canonical_step.as_ref().map(|step| &step.thread_id);
+        let checkpoint_generation = canonical_step
             .as_ref()
-            .and_then(|thread_id| session_store.thread_context_checkpoint(thread_id))
-            .map(|checkpoint| checkpoint.generation)
-            .unwrap_or_default();
+            .map_or(0, |step| step.checkpoint_generation);
         publish_context_usage_update(
             event_bus,
             settings_store.map(Arc::as_ref),
@@ -936,7 +948,7 @@ fn publish_model_usage_record_internal(
             &resolved_model,
             authoritative_context_tokens,
             options.context_window_override,
-            thread_id.as_ref(),
+            thread_id,
             Some(&model_provider),
             binding.binding_revision,
             checkpoint_generation,
@@ -947,12 +959,7 @@ fn publish_model_usage_record_internal(
     }
 }
 
-pub(crate) fn publish_usage_call_input(
-    event_bus: &InMemoryEventBus,
-    workspace_id: &Option<WorkspaceId>,
-    session_id: &SessionId,
-    input: &UsageCallRecordInput,
-) {
+pub(crate) fn publish_usage_call_input(event_bus: &InMemoryEventBus, input: &UsageCallRecordInput) {
     let payload = match serde_json::to_value(input) {
         Ok(payload) => payload,
         Err(error) => {
@@ -971,8 +978,11 @@ pub(crate) fn publish_usage_call_input(
         payload,
     )
     .with_context(EventContext {
-        workspace_id: workspace_id.clone(),
-        session_id: Some(session_id.clone()),
+        workspace_id: input
+            .workspace_id
+            .as_ref()
+            .map(|id| WorkspaceId::new(id.clone())),
+        session_id: input.owner.session_id().map(SessionId::new),
         assignment_id: input
             .assignment_id
             .clone()
@@ -1625,7 +1635,6 @@ mod tests {
     #[test]
     fn publish_model_usage_record_emits_usage_event() {
         let event_bus = InMemoryEventBus::new(8);
-        let session_store = SessionStore::new();
         let settings_store = Arc::new(SettingsStore::new());
         let session_id = SessionId::new("session-1");
         settings_store
@@ -1652,10 +1661,29 @@ mod tests {
         let binding = session_turn_model_usage_binding(true);
         let workspace_id = Some(WorkspaceId::new("workspace-1"));
 
-        publish_model_usage_record(
+        let session_store = SessionStore::from_state_for_test(magi_session_store::SessionStoreState {
+            canonical_turns: vec![serde_json::from_value(json!({
+                "sessionId": session_id, "turnId": "usage-turn", "turnSeq": 1,
+                "acceptedAt": 1, "status": "running", "items": [],
+                "modelSteps": [{
+                    "stepId": "call-1", "threadId": "original-execution-thread", "checkpointGeneration": 7,
+                    "attempts": [{"attemptId": "call-1:attempt:1", "startedAt": 1, "settledAt": 2, "status": "response_received"}],
+                    "requestFingerprint": "a".repeat(64), "provider": "test", "messageCount": 1,
+                    "toolCount": 0, "inputRequestIds": [], "startedAt": 1, "settledAt": 2,
+                    "status": "response_received", "responseFingerprint": "b".repeat(64)
+                }]
+            })).unwrap()],
+            ..Default::default()
+        });
+        // 当前主线程没有检查点；完成事件仍应使用原 Step 的线程与代际。
+        session_store.ensure_session_mission(&session_id, UtcMillis(3), || {
+            magi_core::MissionId::new("usage-mission")
+        });
+        publish_model_usage_record_for_turn(
             &event_bus,
             &session_store,
             Some(&settings_store),
+            Some("usage-turn"),
             ModelUsageRecordInput {
                 context_breakdown: None,
                 session_id: &session_id,
@@ -1699,6 +1727,11 @@ mod tests {
                 .to_string()
                 .contains("secret-success-call-key")
         );
+        assert_eq!(
+            context_event.payload["thread_id"],
+            json!("original-execution-thread")
+        );
+        assert_eq!(context_event.payload["checkpoint_generation"], json!(7));
         assert_eq!(context_event.payload["measurement"], json!("authoritative"));
         assert_eq!(context_event.payload["phase"], json!("completed"));
         assert_eq!(context_event.payload["projected_request_tokens"], json!(3));

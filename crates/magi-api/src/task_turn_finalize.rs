@@ -827,35 +827,40 @@ mod tests {
             .create_session(session_id.clone(), "failed task plan pause")
             .expect("session should create");
         session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
+        let admitted_turn = ActiveExecutionTurn {
+            turn_id: "turn-failed-task-plan-pause".to_string(),
+            turn_seq: now.0,
+            accepted_at: now,
+            status: "running".to_string(),
+            completed_at: None,
+            user_message: Some("执行失败任务".to_string()),
+            items: Vec::new(),
+        };
         session_store
-            .upsert_active_execution_chain(
+            .accept_active_execution_chain_with_timeline_entry(
                 session_id.clone(),
+                magi_session_store::TimelineEntryInput::new(
+                    format!("timeline-chain-{}", admitted_turn.turn_id),
+                    magi_session_store::TimelineEntryKind::UserMessage,
+                    admitted_turn.user_message.clone().unwrap_or_default(),
+                    admitted_turn.accepted_at,
+                ),
                 ActiveExecutionChain {
                     session_id: session_id.clone(),
                     mission_id: mission_id.clone(),
                     root_task_id: root_task_id.clone(),
                     execution_chain_ref: "chain-failed-task-plan-pause".to_string(),
                     workspace_id: None,
-                    active_branch_task_ids: vec![root_task_id.clone()],
-                    active_worker_bindings: Vec::new(),
                     branches: Vec::new(),
-                    recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
                         accepted_at: now,
                         entry_id: "entry-failed-task-plan-pause".to_string(),
                         trimmed_text: Some("执行失败任务".to_string()),
                         skill_name: None,
                     },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: "turn-failed-task-plan-pause".to_string(),
-                        turn_seq: now.0,
-                        accepted_at: now,
-                        status: "running".to_string(),
-                        completed_at: None,
-                        user_message: Some("执行失败任务".to_string()),
-                        items: Vec::new(),
-                    }),
+                    current_turn_id: Some(admitted_turn.turn_id.clone()),
                 },
+                admitted_turn,
             )
             .expect("active chain should persist");
         let plan_store = magi_plan::PlanStore::new(session_store.clone(), session_id.clone());
@@ -981,25 +986,23 @@ mod tests {
                     root_task_id: root_task_id.clone(),
                     execution_chain_ref: "chain-fast-goal-completion".to_string(),
                     workspace_id: None,
-                    active_branch_task_ids: vec![root_task_id.clone()],
-                    active_worker_bindings: Vec::new(),
                     branches: Vec::new(),
-                    recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
                         accepted_at: now,
                         entry_id: "timeline-fast-goal-completion".to_string(),
                         trimmed_text: None,
                         skill_name: None,
                     },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: "turn-fast-goal-completion".to_string(),
-                        turn_seq: now.0,
-                        accepted_at: now,
-                        status: "running".to_string(),
-                        completed_at: None,
-                        user_message: None,
-                        items: Vec::new(),
-                    }),
+                    current_turn_id: Some("turn-fast-goal-completion".to_string()),
+                },
+                ActiveExecutionTurn {
+                    turn_id: "turn-fast-goal-completion".to_string(),
+                    turn_seq: now.0,
+                    accepted_at: now,
+                    status: "running".to_string(),
+                    completed_at: None,
+                    user_message: None,
+                    items: Vec::new(),
                 },
             )
             .expect("goal continuation should be accepted");

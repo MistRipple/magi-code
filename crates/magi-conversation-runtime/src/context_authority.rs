@@ -19,12 +19,12 @@ use magi_event_bus::{
 };
 use magi_session_store::{
     SessionStore, ThreadChatMessage, ThreadContextCheckpoint, ThreadFileFactVersion,
+    thread_history_fingerprint,
 };
 use magi_settings_store::SettingsStore;
 use magi_usage_authority::{
     ContextBudgetPolicy, ContextUsageBreakdown, ModelIdentitySnapshot, UsageCallStatus, UsagePhase,
 };
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -47,24 +47,28 @@ const MAX_COMPACTION_PASSES: usize = 64;
 /// 连续主动压缩失败达到该次数后熔断，直到下一次成功压缩。
 const PROACTIVE_COMPACTION_FAILURE_LIMIT: u32 = 3;
 
-/// 保留已交付给 loop、尚未进入 transcript 的原始输入；不另建持久队列。
+/// 保留本执行线程尚未覆盖的已接纳输入；只对照 canonical 快照，不读取缓存 transcript。
 pub(crate) fn unprojected_input_messages(
     store: &SessionStore,
     session_id: &SessionId,
     turn_id: Option<&str>,
     thread_id: &ThreadId,
     messages: &[ChatMessage],
-) -> Vec<ChatMessage> {
+) -> Result<Vec<ChatMessage>, ContextCompactionTerminal> {
     let Some(turn_id) = turn_id else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let bound = store.input_request_ids_for_turn(session_id, turn_id);
-    let mut projected = store
-        .thread_message_history(thread_id)
-        .into_iter()
-        .filter_map(|message| message.input_request_id)
+    let snapshot = store.thread_context_snapshot(thread_id).map_err(|error| {
+        tracing::error!(%error, %thread_id, "读取恢复输入的 canonical 历史失败");
+        ContextCompactionTerminal::Failed
+    })?;
+    let mut projected = snapshot
+        .messages()
+        .iter()
+        .filter_map(|message| message.input_request_id.clone())
         .collect::<BTreeSet<_>>();
-    messages
+    Ok(messages
         .iter()
         .filter(|message| message.role == "user")
         .filter(|message| {
@@ -74,7 +78,7 @@ pub(crate) fn unprojected_input_messages(
                 .is_some_and(|id| bound.contains(id) && projected.insert(id.clone()))
         })
         .cloned()
-        .collect()
+        .collect())
 }
 
 #[derive(Clone, Debug)]
@@ -108,6 +112,8 @@ pub(crate) struct ContextCompactionRecord {
 
 pub(crate) struct PreparedThreadHistory {
     pub messages: Vec<ThreadChatMessage>,
+    /// 本次实际历史视图的压缩代际，随消息传给 Step 和窗口统计。
+    pub checkpoint_generation: u64,
     pub compaction: Option<ContextCompactionRecord>,
     pub terminal: Option<ContextCompactionTerminal>,
 }
@@ -190,6 +196,7 @@ pub(crate) struct ContextAuthority<'a> {
     compaction_progress_gate: Mutex<ContextCompactionProgressGate>,
     /// 扩展 `compaction.before` 端口；None 表示没有可执行扩展。
     extension_hooks: Option<&'a dyn crate::extension_hooks::ExtensionHooks>,
+    tool_scope: Option<crate::extension_hooks::ToolHookScope<'a>>,
 }
 
 /// 上下文压缩策略。
@@ -230,9 +237,6 @@ impl ContextCompactionMode {
 }
 
 pub(crate) struct ContextPrepareRequest {
-    /// canonical/thread transcript 尚未可读时的一次性恢复输入；正常运行不会用它
-    /// 覆盖已有 transcript，避免形成第二份上下文事实源。
-    pub recovery_history: Vec<ThreadChatMessage>,
     pub phase: &'static str,
     /// 本次请求实际模型的上下文窗口。所有压力、阈值、保留目标和工具结果预算
     /// 都只由它计算；调用方必须提供，不存在默认窗口兜底。
@@ -334,6 +338,7 @@ impl<'a> ContextAuthority<'a> {
             is_cancelled: None,
             compaction_progress_gate: Mutex::new(ContextCompactionProgressGate::default()),
             extension_hooks: None,
+            tool_scope: None,
         }
     }
 
@@ -342,6 +347,14 @@ impl<'a> ContextAuthority<'a> {
         hooks: Option<&'a dyn crate::extension_hooks::ExtensionHooks>,
     ) -> Self {
         self.extension_hooks = hooks;
+        self
+    }
+
+    pub(crate) fn with_tool_scope(
+        mut self,
+        scope: crate::extension_hooks::ToolHookScope<'a>,
+    ) -> Self {
+        self.tool_scope = Some(scope);
         self
     }
 
@@ -365,6 +378,50 @@ impl<'a> ContextAuthority<'a> {
         self
     }
 
+    /// 原始历史始终来自 canonical；所有模型入口共用工具结果投影，摘要也不能绕过它。
+    fn project_tool_results(
+        &self,
+        memo: &crate::extension_hooks::ToolResultMemo,
+        history: &mut [ThreadChatMessage],
+    ) -> Option<String> {
+        let hooks = self.extension_hooks?;
+        let mut view = history
+            .iter()
+            .map(crate::conversation_loop::thread_chat_message_to_chat_message)
+            .collect::<Vec<_>>();
+        let fingerprint = memo.project(
+            hooks,
+            &self
+                .tool_scope
+                .unwrap_or(crate::extension_hooks::ToolHookScope {
+                    session_id: self.session_id.as_str(),
+                    task_id: self
+                        .task_id
+                        .map(|id| id.as_str())
+                        .or(self.expected_turn_id)
+                        .unwrap_or(self.thread_id.as_str()),
+                    workspace_id: self.workspace_id.as_ref().map(|id| id.as_str()),
+                    worker_id: None,
+                    round: 0,
+                }),
+            &mut view,
+        );
+        for (original, projected) in history.iter_mut().zip(view) {
+            original.content = projected.content;
+        }
+        fingerprint
+    }
+
+    fn tool_projection_fingerprint(
+        &self,
+        memo: &crate::extension_hooks::ToolResultMemo,
+        history: &[ThreadChatMessage],
+    ) -> Option<String> {
+        let mut history = history.to_vec();
+        refresh_file_facts(&mut history);
+        self.project_tool_results(memo, &mut history)
+    }
+
     pub(crate) fn prepare(&self, request: ContextPrepareRequest) -> PreparedThreadHistory {
         let context_window = request.context_window_tokens.max(1);
         if request.persist_checkpoint {
@@ -374,21 +431,29 @@ impl<'a> ContextAuthority<'a> {
                 UtcMillis::now(),
             );
         }
-        let mut transcript = self.session_store.thread_message_history(self.thread_id);
-        if transcript.is_empty() && !request.recovery_history.is_empty() {
-            transcript = request.recovery_history;
-            if request.persist_checkpoint {
-                self.session_store.replace_thread_messages(
-                    self.thread_id,
-                    transcript.clone(),
-                    UtcMillis::now(),
-                );
+        let mut snapshot = match self.session_store.thread_context_snapshot(self.thread_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::error!(%error, thread_id = %self.thread_id, "读取 canonical 上下文快照失败");
+                return PreparedThreadHistory {
+                    checkpoint_generation: 0,
+                    messages: Vec::new(),
+                    compaction: None,
+                    terminal: Some(ContextCompactionTerminal::Failed),
+                };
             }
-        }
-        let mut previous_checkpoint = self.session_store.thread_context_checkpoint(self.thread_id);
-        let checkpoint_binding_changed = request.persist_checkpoint
-            && previous_checkpoint.as_ref().is_some_and(|checkpoint| {
-                request.model_identity.as_ref().is_some_and(|identity| {
+        };
+        let protected_inputs = self
+            .expected_turn_id
+            .map(|turn_id| {
+                self.session_store
+                    .unconsumed_input_request_ids(self.session_id, turn_id)
+            })
+            .unwrap_or_default();
+        let tool_results = crate::extension_hooks::ToolResultMemo::default();
+        let invalid_checkpoint = snapshot.checkpoint().is_some_and(|checkpoint| {
+            let binding_changed = request.persist_checkpoint
+                && (request.model_identity.as_ref().is_some_and(|identity| {
                     checkpoint
                         .model_provider
                         .as_deref()
@@ -402,54 +467,9 @@ impl<'a> ContextAuthority<'a> {
                             .is_some_and(|revision| revision != identity.binding_revision)
                 }) || checkpoint
                     .context_window_limit_tokens
-                    .is_some_and(|checkpoint_window| checkpoint_window != context_window)
-            });
-        if checkpoint_binding_changed {
-            if let Some(checkpoint) = previous_checkpoint.as_ref() {
-                tracing::info!(
-                    thread_id = %self.thread_id,
-                    session_id = %self.session_id,
-                    checkpoint_id = checkpoint.checkpoint_id,
-                    "上下文检查点因模型身份或上下文窗口变化失效"
-                );
-            }
-            self.session_store
-                .clear_thread_context_checkpoint(self.thread_id);
-            previous_checkpoint = None;
-        }
-        if request.persist_checkpoint
-            && let Some(checkpoint) = previous_checkpoint.as_ref()
-            && !checkpoint_file_facts_are_current(checkpoint)
-        {
-            self.session_store
-                .clear_thread_context_checkpoint(self.thread_id);
-            tracing::info!(
-                thread_id = %self.thread_id,
-                session_id = %self.session_id,
-                checkpoint_id = checkpoint.checkpoint_id,
-                "上下文检查点因文件事实版本变化失效，将从原始 transcript 重建"
-            );
-            previous_checkpoint = None;
-        }
-        let raw_transcript = self.session_store.thread_message_history(self.thread_id);
-        let protected_inputs = self
-            .expected_turn_id
-            .map(|turn_id| {
-                self.session_store
-                    .unconsumed_input_request_ids(self.session_id, turn_id)
-            })
-            .unwrap_or_default();
-        let mut history = self.session_store.thread_context_history(self.thread_id);
-        if history.is_empty() && !transcript.is_empty() {
-            history = transcript;
-        }
-        let stale_checkpoint_id = previous_checkpoint.as_ref().and_then(|checkpoint| {
-            let source_changed = !checkpoint.source_fingerprint.is_empty()
-                && checkpoint.source_message_count > 0
-                && checkpoint.source_message_count <= raw_transcript.len()
-                && thread_history_fingerprint(&raw_transcript[..checkpoint.source_message_count])
-                    != checkpoint.source_fingerprint;
-            let hides_input = raw_transcript
+                    .is_some_and(|window| window != context_window));
+            let hides_input = snapshot
+                .messages()
                 .iter()
                 .take(checkpoint.source_message_count)
                 .any(|message| {
@@ -458,22 +478,42 @@ impl<'a> ContextAuthority<'a> {
                         .as_ref()
                         .is_some_and(|id| protected_inputs.contains(id))
                 });
-            (source_changed || hides_input).then(|| checkpoint.checkpoint_id.clone())
+            !checkpoint.matches_history(snapshot.messages())
+                || checkpoint.tool_result_projection_fingerprint
+                    != self.tool_projection_fingerprint(
+                        &tool_results,
+                        &snapshot.messages()[..checkpoint.source_message_count],
+                    )
+                || hides_input
+                || binding_changed
+                || request.persist_checkpoint && !checkpoint_file_facts_are_current(checkpoint)
         });
-        if let Some(checkpoint_id) = stale_checkpoint_id {
-            if request.persist_checkpoint {
-                self.session_store
-                    .clear_thread_context_checkpoint(self.thread_id);
+        if invalid_checkpoint && request.persist_checkpoint {
+            if !self
+                .session_store
+                .clear_thread_context_checkpoint_if_current(&mut snapshot)
+            {
+                return PreparedThreadHistory {
+                    checkpoint_generation: 0,
+                    messages: Vec::new(),
+                    compaction: None,
+                    terminal: Some(ContextCompactionTerminal::Failed),
+                };
             }
-            previous_checkpoint = None;
-            history = raw_transcript.clone();
-            tracing::info!(
-                thread_id = %self.thread_id,
-                session_id = %self.session_id,
-                checkpoint_id,
-                "上下文检查点源历史已变化或覆盖未消费输入，将从原始 transcript 重建"
-            );
+            tracing::info!(thread_id = %self.thread_id, "检查点来源、输入边界或模型绑定已失效，使用 canonical 原始历史");
         }
+        let previous_checkpoint = (!invalid_checkpoint)
+            .then(|| snapshot.checkpoint().cloned())
+            .flatten();
+        let history_generation = previous_checkpoint
+            .as_ref()
+            .map_or(0, |checkpoint| checkpoint.generation);
+        let raw_transcript = snapshot.messages();
+        let mut history = if invalid_checkpoint {
+            raw_transcript.to_vec()
+        } else {
+            snapshot.model_history()
+        };
         // transcript 不复制原图；未消费输入在本次模型视图中按 canonical 身份恢复图片。
         if !protected_inputs.is_empty()
             && let Some(turn) = self.expected_turn_id.and_then(|turn_id| {
@@ -511,6 +551,7 @@ impl<'a> ContextAuthority<'a> {
         // 返回给调用方的是校验后的原始序列；总预算只用于下面的压缩判定，视图投影由请求构造处完成。
         // 把降级后的结果交给实时循环再叠加一次预算，会让降级边界与下一回合的重建结果分叉。
         let unbounded = history.clone();
+        self.project_tool_results(&tool_results, &mut history);
         bound_tool_results(&mut history, context_window);
         let original_count = history.len();
         let original_tokens = estimate_thread_history_tokens(&history);
@@ -570,6 +611,7 @@ impl<'a> ContextAuthority<'a> {
                 "thread 历史未达到上下文压缩阈值"
             );
             return PreparedThreadHistory {
+                checkpoint_generation: history_generation,
                 messages: unbounded,
                 compaction: None,
                 terminal: None,
@@ -597,6 +639,7 @@ impl<'a> ContextAuthority<'a> {
                 "主动上下文压缩已熔断，本轮使用未压缩历史"
             );
             return PreparedThreadHistory {
+                checkpoint_generation: history_generation,
                 messages: unbounded,
                 compaction: None,
                 terminal: None,
@@ -611,6 +654,7 @@ impl<'a> ContextAuthority<'a> {
             matches!(request.mode, ContextCompactionMode::Manual { .. }),
             request.mode.instructions(),
             &protected_inputs,
+            history_generation,
         ) {
             Ok(Some(result)) => result,
             Ok(None) => {
@@ -619,6 +663,7 @@ impl<'a> ContextAuthority<'a> {
                     let _ = self.notify_compaction(ContextCompactionProgress::Skipped);
                 }
                 return PreparedThreadHistory {
+                    checkpoint_generation: history_generation,
                     messages: unbounded,
                     compaction: None,
                     terminal: None,
@@ -638,6 +683,7 @@ impl<'a> ContextAuthority<'a> {
                         "上下文语义压缩已取消"
                     );
                     return PreparedThreadHistory {
+                        checkpoint_generation: history_generation,
                         messages: unbounded,
                         compaction: None,
                         terminal: Some(ContextCompactionTerminal::Cancelled),
@@ -645,6 +691,7 @@ impl<'a> ContextAuthority<'a> {
                 }
                 return self.compaction_failed(
                     request.phase,
+                    history_generation,
                     unbounded,
                     &decision,
                     request.additional_context.total_tokens() as usize,
@@ -668,6 +715,7 @@ impl<'a> ContextAuthority<'a> {
                 }
             };
             return PreparedThreadHistory {
+                checkpoint_generation: history_generation,
                 messages: unbounded,
                 compaction: None,
                 terminal: Some(terminal),
@@ -686,7 +734,8 @@ impl<'a> ContextAuthority<'a> {
         ) {
             return self.compaction_failed(
                 request.phase,
-                history,
+                history_generation,
+                unbounded,
                 &decision,
                 request.additional_context.total_tokens() as usize,
                 &request.mode,
@@ -703,7 +752,18 @@ impl<'a> ContextAuthority<'a> {
         } else {
             previous_source_count.saturating_add(split)
         };
-        let source_message_count = source_message_count.min(raw_transcript.len());
+        if source_message_count == 0 || source_message_count > raw_transcript.len() {
+            return self.compaction_failed(
+                request.phase,
+                history_generation,
+                unbounded,
+                &decision,
+                request.additional_context.total_tokens() as usize,
+                &request.mode,
+                "压缩来源范围超出 canonical 快照",
+            );
+        }
+        let covered_visible_count = split + usize::from(previous_checkpoint.is_some());
         if request.persist_checkpoint {
             let model_identity = request.model_identity.clone().or_else(|| {
                 usage_observation.as_ref().map(|observation| {
@@ -734,6 +794,10 @@ impl<'a> ContextAuthority<'a> {
                     .as_ref()
                     .map(|checkpoint| checkpoint.generation.saturating_add(1))
                     .unwrap_or(1),
+                tool_result_projection_fingerprint: self.tool_projection_fingerprint(
+                    &tool_results,
+                    &raw_transcript[..source_message_count],
+                ),
                 source_fingerprint: thread_history_fingerprint(
                     &raw_transcript[..source_message_count],
                 ),
@@ -750,31 +814,28 @@ impl<'a> ContextAuthority<'a> {
                 context_window_limit_tokens: Some(decision.context_window_tokens()),
                 preserved_tail_message_count: compacted.len().saturating_sub(1),
                 file_fact_versions: collect_file_fact_versions(
-                    &history[..split],
+                    &unbounded[..covered_visible_count],
                     previous_checkpoint.as_ref(),
                 ),
             };
             let installed = self
                 .session_store
                 .install_thread_context_checkpoint_if_current(
-                    self.thread_id,
+                    &snapshot,
                     checkpoint.clone(),
-                    raw_transcript.len(),
-                    previous_checkpoint
-                        .as_ref()
-                        .map(|checkpoint| checkpoint.generation)
-                        .unwrap_or_default(),
                     compacted_at,
                 );
             if !installed {
-                return self.compaction_failed(
-                    request.phase,
-                    unbounded,
-                    &decision,
-                    request.additional_context.total_tokens() as usize,
-                    &request.mode,
-                    "候选检查点安装前 transcript 或检查点代际已变化",
-                );
+                // 自动压缩可在摘要模型失败时继续使用原历史，但 CAS 失败说明原快照已失效。
+                // 此时不能把旧历史作为可继续执行的视图返回。
+                let _ = self.notify_compaction(ContextCompactionProgress::Failed);
+                tracing::warn!(thread_id = %self.thread_id, "压缩提交期间 canonical 历史或检查点已变化");
+                return PreparedThreadHistory {
+                    checkpoint_generation: history_generation,
+                    messages: Vec::new(),
+                    compaction: None,
+                    terminal: Some(ContextCompactionTerminal::Failed),
+                };
             }
             self.session_store
                 .reset_thread_context_compaction_failures(self.thread_id);
@@ -794,18 +855,20 @@ impl<'a> ContextAuthority<'a> {
             );
         }
 
+        // 投影只供摘要请求使用，返回的尾部继续保留原文，下一模型请求重新投影。
+        let mut model_history = vec![compacted[0].clone()];
+        model_history.extend_from_slice(&unbounded[covered_visible_count..]);
         PreparedThreadHistory {
-            messages: compacted,
-            compaction: request
-                .persist_checkpoint
-                .then_some(ContextCompactionRecord {
-                    reason: request.mode.reason_label(&decision),
-                    original_message_count: original_count,
-                    compacted_message_count: compacted_count,
-                    original_token_estimate: original_tokens,
-                    compacted_token_estimate: compacted_tokens,
-                    compacted_at,
-                }),
+            checkpoint_generation: history_generation.saturating_add(1),
+            messages: model_history,
+            compaction: Some(ContextCompactionRecord {
+                reason: request.mode.reason_label(&decision),
+                original_message_count: original_count,
+                compacted_message_count: compacted_count,
+                original_token_estimate: original_tokens,
+                compacted_token_estimate: compacted_tokens,
+                compacted_at,
+            }),
             terminal: None,
         }
     }
@@ -818,6 +881,7 @@ impl<'a> ContextAuthority<'a> {
     fn compaction_failed(
         &self,
         phase: &'static str,
+        history_generation: u64,
         history: Vec<ThreadChatMessage>,
         decision: &ThreadHistoryCompactionDecision,
         additional_token_estimate: usize,
@@ -857,6 +921,7 @@ impl<'a> ContextAuthority<'a> {
             "上下文语义压缩失败"
         );
         PreparedThreadHistory {
+            checkpoint_generation: history_generation,
             messages: history,
             compaction: None,
             terminal,
@@ -873,6 +938,7 @@ impl<'a> ContextAuthority<'a> {
         fully_compact: bool,
         instructions: Option<&str>,
         protected_inputs: &BTreeSet<String>,
+        history_generation: u64,
     ) -> Result<Option<(Vec<ThreadChatMessage>, usize)>, String> {
         if history.len() <= 1 {
             // 单条消息没有可摘要的前缀，也没有需要保留的尾部。
@@ -910,6 +976,7 @@ impl<'a> ContextAuthority<'a> {
                 original_tokens,
                 instructions,
                 protected_inputs,
+                history_generation,
             )?
             else {
                 return Err("上下文压缩未生成有效候选".to_string());
@@ -965,6 +1032,7 @@ impl<'a> ContextAuthority<'a> {
         original_tokens: usize,
         instructions: Option<&str>,
         protected_inputs: &BTreeSet<String>,
+        history_generation: u64,
     ) -> Result<Option<(Vec<ThreadChatMessage>, usize)>, String> {
         if history.len() <= 1 {
             return Ok(None);
@@ -1040,6 +1108,7 @@ impl<'a> ContextAuthority<'a> {
                 0,
                 1,
                 instructions,
+                history_generation,
             )?,
         };
         self.notify_compaction(ContextCompactionProgress::Advanced {
@@ -1110,6 +1179,7 @@ impl<'a> ContextAuthority<'a> {
         chunk_index: usize,
         chunk_count: usize,
         instructions: Option<&str>,
+        history_generation: u64,
     ) -> Result<String, String> {
         let source_tokens = estimate_text_tokens(source);
         if source_tokens > source_budget {
@@ -1126,6 +1196,7 @@ impl<'a> ContextAuthority<'a> {
             chunk_count,
             summary_output_limit_tokens,
             instructions,
+            history_generation,
         )?;
         validate_compaction_summary(&summary)
     }
@@ -1158,6 +1229,7 @@ impl<'a> ContextAuthority<'a> {
         chunk_count: usize,
         summary_output_limit_tokens: usize,
         instructions: Option<&str>,
+        history_generation: u64,
     ) -> Result<String, String> {
         // 用户补充要求只调整摘要重点，不能改变固定标题结构或把历史当作指令执行。
         let focus = instructions
@@ -1218,6 +1290,7 @@ impl<'a> ContextAuthority<'a> {
             self.task_id,
             self.thread_id,
             &call_id,
+            history_generation,
         )
         .with_model_binding(self.settings_store, &binding)
         .with_purpose(magi_session_store::ModelStepPurpose::ContextCompaction);
@@ -1826,20 +1899,30 @@ pub(crate) fn current_session_file_facts(
     session_id: &SessionId,
 ) -> Vec<CurrentFileFact> {
     let mut facts = BTreeMap::<String, (usize, CurrentFileFact)>::new();
-    for thread in session_store.thread_registry_snapshot(session_id) {
-        for message in thread
-            .message_history
-            .iter()
-            .filter(|message| message.role == "tool")
-        {
-            let Some(result) = message.content.as_deref() else {
+    for turn in session_store
+        .canonical_turns_for_session(session_id)
+        .into_iter()
+        .filter(|turn| {
+            turn.status != magi_session_store::CanonicalTurnStatus::Superseded
+                && !turn.is_session_command()
+        })
+    {
+        for item in turn.items.iter().filter(|item| {
+            item.kind == magi_session_store::CanonicalTurnItemKind::ToolCall
+                && item.status == magi_session_store::CanonicalTurnItemStatus::Completed
+        }) {
+            let Some(raw) = item.tool.as_ref().and_then(|tool| tool.result.as_ref()) else {
                 continue;
             };
-            let Ok(payload) = serde_json::from_str::<serde_json::Value>(result) else {
+            let result = match raw {
+                serde_json::Value::String(text) => text.clone(),
+                value => value.to_string(),
+            };
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&result) else {
                 continue;
             };
             if payload.get("tool").and_then(serde_json::Value::as_str) != Some("file_read")
-                || infer_tool_call_status(result) != "success"
+                || infer_tool_call_status(&result) != "success"
             {
                 continue;
             }
@@ -1943,12 +2026,6 @@ fn latest_session_usage_observation(
     event_bus.with_audit_usage_ledger(|ledger| {
         latest_usage_observation_for_session(&ledger.usage_entries, session_id.as_str())
     })
-}
-
-fn thread_history_fingerprint(history: &[ThreadChatMessage]) -> String {
-    let serialized = serde_json::to_vec(history).unwrap_or_default();
-    let digest = Sha256::digest(serialized);
-    magi_core::hex_lower(digest)
 }
 
 /// 按当前请求模型的窗口判断是否需要主动压缩。
@@ -2071,6 +2148,47 @@ fn choose_thread_history_compaction_split(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_facts_use_canonical_receipts_and_current_file_hash() {
+        use super::*;
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("source.txt");
+        std::fs::write(&file, "canonical file").unwrap();
+        let receipt = json!({
+            "tool": "file_read", "status": "succeeded", "path": file,
+            "content_hash": magi_snapshot::path_content_hash(&file).unwrap(),
+            "content": "canonical file", "bytes_read": 14,
+        })
+        .to_string();
+        let store = SessionStore::new();
+        let session = SessionId::new("canonical-file-facts");
+        store.create_session(session.clone(), "file facts").unwrap();
+        let (_, thread) = store.ensure_session_mission(&session, UtcMillis(1), || {
+            magi_core::MissionId::new("file-facts")
+        });
+        let store = crate::test_history::with_messages(&store, &thread, serde_json::from_value(json!([
+            {"role": "assistant", "toolCalls": [{"id": "read", "type": "function", "function": {"name": "file_read", "arguments": "{}"}}]},
+            {"role": "tool", "toolCallId": "read", "content": receipt},
+        ])).unwrap(), UtcMillis(2));
+        let mut state = store.export_state();
+        let stale = SessionStore::from_state_for_test(state.clone());
+        let facts = current_session_file_facts(&stale, &session);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].result, receipt);
+        assert_eq!(facts[0].summary, "canonical file");
+        state.canonical_turns[0].status = magi_session_store::CanonicalTurnStatus::Superseded;
+        assert!(
+            current_session_file_facts(&SessionStore::from_state_for_test(state), &session).is_empty(),
+            "已废弃 Turn 不再提供文件事实"
+        );
+        std::fs::write(&file, "changed").unwrap();
+        assert!(
+            current_session_file_facts(&stale, &session).is_empty(),
+            "磁盘内容改变后原回执失效"
+        );
+    }
+
     #[test]
     fn a_fresh_file_read_matches_the_next_turn_history_rebuild_byte_for_byte() {
         use crate::history_projection::{refresh_file_facts, with_current_file_fact};
@@ -2230,7 +2348,7 @@ mod tests {
                 .with_task_id(&task);
         assert_eq!(
             authority
-                .invoke_compaction_summary(&client, "untrusted history", "test", 0, 1, 128, None)
+                .invoke_compaction_summary(&client, "untrusted history", "test", 0, 1, 128, None, 0)
                 .unwrap(),
             "summary"
         );

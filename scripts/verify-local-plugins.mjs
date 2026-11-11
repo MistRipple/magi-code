@@ -64,7 +64,14 @@ async function pack(version, dataSchemaVersion) {
   await mkdir(join(directory,'ui'),{recursive:true});
   // 1x1 PNG：只为验证图标在列表、详情和设置导航中显示。
   await writeFile(join(directory,'ui/icon.png'),Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==','base64'));
-  await writeFile(join(directory,'ui/page.html'),'<!doctype html><meta charset="utf-8"><p>local plugin page</p>');
+  await writeFile(join(directory,'ui/page.html'), `<!doctype html><meta charset="utf-8">
+<p>local plugin page</p><input id="draft" aria-label="Draft"><div style="height:1800px"></div>
+<script>
+window.addEventListener('message', event => {
+  if (event.source !== parent || event.data?.channel !== 'magi-plugin-v1' || event.data.type !== 'init') return;
+  parent.postMessage({channel:'magi-plugin-v1',instanceId:event.data.instanceId,type:'request',requestId:'size',operation:'view.resize',height:1900}, '*');
+});
+</script>`);
   await writeFile(join(directory,'extension/index.mjs'), `
 import {execFile} from 'node:child_process'; import {promisify} from 'node:util';
 import {mkdtemp,writeFile,readFile,rm} from 'node:fs/promises'; import {tmpdir} from 'node:os'; import {join} from 'node:path';

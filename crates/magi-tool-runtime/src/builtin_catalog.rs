@@ -724,7 +724,6 @@ impl BuiltinToolName {
                 | Self::KnowledgeQuery
                 | Self::KnowledgeGraphQuery
                 | Self::CodeSymbols
-                | Self::ToolCatalog
                 | Self::GitStatus
                 | Self::GitBranchList
                 | Self::GitMergePreview
@@ -1166,6 +1165,7 @@ impl BuiltinToolName {
                 - `runtime_internal=true` 只表示必须由对应运行时路由执行，不表示模型不可调用；请以每项 `model_call_scope` 和当前请求实际收到的 tools 定义为准\n\
                 - `model_call_scope=delegator_task_only` 的 agent_spawn / agent_send / agent_wait / agent_cancel 由 root coordinator 或显式获授 allow_delegation 的代理调用；最多两层代理，管理范围仅限自己的直接子任务\n\
                 - MCP/插件条目的 availability、reason_code 和 model_available 来自当前任务/Skill 范围、访问模式与执行器可用性；needs_approval 表示仍需授权，schema_included 不表示已加载到本轮 tools\n\
+                - MCP/插件工具默认只返回全局目录元数据；先用 query 搜索名称或用途，再使用 tool_names 指定实际 model_tool_name 并设置 include_schema=true，取得所需 schema 后下一轮再调用\n\
                 - 外接工具只读取 daemon 注入的 skill/MCP/插件运行时快照，不扫描文件系统"
             }
             Self::GitStatus => {
@@ -1701,8 +1701,10 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "include_internal": { "type": "boolean", "description": "是否包含运行时内部工具，默认 false" },
-                    "include_schema": { "type": "boolean", "description": "是否在每个内置工具条目中包含完整 parameters_schema，默认 false" },
-                    "include_external": { "type": "boolean", "description": "是否包含 skill 绑定工具、MCP 与当前工作区插件工具快照，默认 true" },
+                    "include_schema": { "type": "boolean", "description": "是否包含完整参数 schema，默认 false；外接工具须同时用 tool_names 指定要加载的模型工具名" },
+                    "tool_names": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true, "description": "选择目录中实际的 model_tool_name；仅返回这些 MCP/插件条目。include_schema=true 时将所选可用外接工具加载到后续模型请求；省略时只列全局元数据" },
+                    "query": { "type": "string", "description": "按名称、原工具名或描述搜索目录，不区分大小写，多个词均须匹配；提供 tool_names 时精确名称选择优先" },
+                    "include_external": { "type": "boolean", "description": "是否包含 skill 绑定工具、MCP 与全局插件工具快照，默认 true" },
                     "include_mcp_servers": { "type": "boolean", "description": "包含外接工具时是否同时返回 MCP server 健康摘要，默认 true" },
                     "include_agent_roles": { "type": "boolean", "description": "是否包含可通过 agent_spawn 派发的代理角色健康摘要，默认 true" }
                 },

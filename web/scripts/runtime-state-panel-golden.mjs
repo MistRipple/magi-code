@@ -59,82 +59,31 @@ await withGoldenViteServer(async (server) => {
   const runtimeTimeline = await server.ssrLoadModule('/src/lib/runtime-timeline.ts');
   const rustContract = await server.ssrLoadModule('/src/shared/bridges/rust-daemon-contract.ts');
 
-  assert.equal(
-    panel.shouldShowRuntimePanel({ status: 'idle', isProcessing: false, activeAssignmentCount: 0 }),
-    false,
-    'idle sessions without active assignments must not reserve homepage space',
-  );
-  assert.equal(
-    panel.shouldShowRuntimePanel({ status: 'running', isProcessing: false, activeAssignmentCount: 0 }),
-    true,
-    'active runtime state must remain visible',
-  );
-  assert.equal(
-    panel.shouldShowRuntimePanel({ status: 'idle', isProcessing: false, activeAssignmentCount: 2 }),
-    true,
-    'active assignments keep the runtime panel visible even if the aggregate status is stale',
-  );
-  assert.equal(
-    panel.shouldShowRuntimePanel({ status: 'completed', isProcessing: false, activeAssignmentCount: 0 }),
-    false,
-    'completed sessions must not keep reserving homepage space',
-  );
-  assert.equal(
-    panel.shouldShowRuntimePanel({ status: 'completed', isProcessing: false, activeAssignmentCount: 2 }),
-    false,
-    'historical assignments must not reopen a completed runtime panel',
-  );
-  assert.equal(
-    panel.shouldShowRuntimePanel({ status: 'cancelled', isProcessing: false, activeAssignmentCount: 0 }),
-    false,
-    'cancelled sessions must not keep reserving homepage space',
-  );
-  assert.equal(
-    panel.shouldShowRuntimePanel({ status: 'failed', isProcessing: false, activeAssignmentCount: 0 }),
-    true,
-    'failed sessions must keep their runtime diagnostics available',
-  );
+  for (const [status, visible] of [[undefined, false], ['idle', false], ['running', true],
+    ['blocked', true], ['failed', true], ['completed', false], ['cancelled', false]]) {
+    assert.equal(panel.shouldShowRuntimePanel(status), visible);
+  }
 
-  assert.equal(panel.runtimeAssignmentIsActive('running'), true);
-  assert.equal(panel.runtimeAssignmentIsActive('failed'), false);
-  assert.equal(panel.runtimeAssignmentIsActive('completed'), false);
-  assert.equal(panel.runtimeAssignmentIsActive('cancelled'), false);
-
-  assert.equal(
-    panel.resolveRuntimePanelStatus({ status: 'failed', isProcessing: true }),
-    'running',
-    '运行仍在继续时，过程中的失败事件不得把整体状态悬挂为失败',
-  );
-  assert.equal(
-    panel.resolveRuntimePanelStatus({ status: 'completed', isProcessing: false }),
-    'completed',
-    '运行结束后必须保留权威完成终态',
-  );
-  assert.equal(
-    panel.resolveRuntimePanelStatus({ status: 'failed', isProcessing: false }),
-    'failed',
-    '只有权威终态失败时才显示整体失败',
-  );
+  const { render } = await server.ssrLoadModule('svelte/server');
+  const { default: RuntimePanel } = await server.ssrLoadModule('/src/components/RuntimeStatePanel.svelte');
+  for (const status of ['idle', 'running', 'blocked', 'failed', 'completed', 'cancelled']) {
+    const runtimeState = { status, phase: status, statusChangedAt: 100, lastEventAt: 100,
+      assignments: [{ status: 'running', workerId: 'independent-agent' }] };
+    const html = render(RuntimePanel, { props: {
+      runtimeState,
+      // 旧调用参数和仍在执行的代理都不能改写主线的权威终态。
+      isProcessing: true, processingStartedAt: 200, turnStage: 'streaming',
+    } }).body;
+    if (['running', 'blocked', 'failed'].includes(status)) {
+      assert.ok(html.includes(`summary__badge--${status}`), '状态徽章必须保留主线事实');
+    } else {
+      assert.ok(!html.includes('runtime-diagnostics__summary-button'), '非活跃主线不能被本地忙碌或子代理重新打开');
+    }
+  }
 
   assert.equal(panel.shouldShowRuntimePhase('running', 'running'), false);
   assert.equal(panel.shouldShowRuntimePhase('idle', 'idle'), false);
   assert.equal(panel.shouldShowRuntimePhase('running', 'verify'), true);
-
-  assert.equal(panel.shouldShowRuntimeCache('healthy'), false);
-  assert.equal(panel.shouldShowRuntimeCache('cold'), false);
-  assert.equal(panel.shouldShowRuntimeCache('degraded'), true);
-
-  assert.deepEqual(
-    panel.resolveRuntimeTaskProgress({
-      requiredTotal: 5,
-      failedRequired: 1,
-      runningOrPendingRequired: 2,
-    }),
-    { completed: 2, failed: 1, running: 2, total: 5, percent: 40 },
-  );
-  assert.equal(panel.resolveRuntimeTaskProgress(undefined), null);
-  assert.equal(panel.resolveRuntimeTaskProgress({}), null, 'missing task counts remain unknown');
-  assert.equal(panel.resolveRuntimeTaskProgress({ requiredTotal: 0 }).total, 0, 'confirmed empty task counts remain zero');
 
   const runningRecords = conversationRecords.buildConversationRuntimeRecords([{
     key: 'latest-tool',
@@ -322,8 +271,6 @@ await withGoldenViteServer(async (server) => {
         ...processingRecords[0],
         timestamp: 505,
       }],
-      isProcessing: true,
-      processingStartedAt: 500,
       currentTurnStartedAt: 500,
     }).map((entry) => entry.eventId),
     ['current-turn-processing'],
@@ -366,35 +313,6 @@ await withGoldenViteServer(async (server) => {
     [],
     '用户中断造成且没有诊断正文的工具取消不得伪装为工具失败',
   );
-  assert.equal(
-    conversationRecords.resolveCurrentConversationTurnStartedAt([{
-      key: 'turn-start',
-      message: {
-        id: 'turn-start-message',
-        role: 'user',
-        source: 'user',
-        content: '开始',
-        timestamp: 700,
-        isStreaming: false,
-        isComplete: true,
-        metadata: { turnSeq: 5 },
-      },
-    }, {
-      key: 'turn-progress',
-      message: {
-        id: 'turn-progress-message',
-        role: 'assistant',
-        source: 'orchestrator',
-        content: '',
-        timestamp: 710,
-        isStreaming: true,
-        isComplete: false,
-        metadata: { turnSeq: 5 },
-      },
-    }]),
-    700,
-    '当前轮次起点必须来自该轮最早的规范化消息时间',
-  );
   const interruptedRecords = conversationRecords.buildConversationRuntimeRecords([{
     key: 'interrupted-user-message',
     message: {
@@ -435,7 +353,6 @@ await withGoldenViteServer(async (server) => {
         diffCount: 0,
       }],
       conversationEntries: interruptedRecords,
-      isProcessing: false,
       currentTurnStartedAt: 800,
     }).map((entry) => entry.eventId),
     ['interrupted-user-message:interrupted'],
@@ -482,6 +399,10 @@ await withGoldenViteServer(async (server) => {
         }],
       },
     },
+    canonicalTurns: [{
+      sessionId: 'session-runtime-failed', turnId: 'turn-runtime-failed', turnSeq: 1,
+      acceptedAt: 1_700_000_000_000, completedAt: 1_700_000_000_100, status: 'failed', items: [],
+    }],
     recentEvents: [{
       event_id: 'event-runtime-failed',
       event_type: 'task.status.changed',
@@ -535,7 +456,6 @@ await withGoldenViteServer(async (server) => {
   });
   assert.equal(normalized.orchestratorRuntimeState?.status, 'failed');
   assert.equal(normalized.orchestratorRuntimeState?.phase, 'failed');
-  assert.deepEqual(normalized.orchestratorRuntimeState?.errors, [failureDetail, `cargo_check_failed: ${toolErrorDetail}`]);
   assert.deepEqual(
     normalized.orchestratorRuntimeState?.opsView?.recentTimeline.map((entry) => entry.type),
     ['tool.call.finished', 'task.status.changed'],
@@ -554,7 +474,6 @@ await withGoldenViteServer(async (server) => {
     '任务快照与运行事件中的同一错误只能展示一次',
   );
   assert.equal(normalized.orchestratorRuntimeState?.opsView?.failureRootCause, undefined);
-  assert.equal(normalized.orchestratorRuntimeState?.opsView?.knowledgeAudit, undefined);
 
   const interrupted = rustContract.normalizeRustBootstrapPayload({
     generatedAt: 1_700_000_001_000,
@@ -737,14 +656,69 @@ await withGoldenViteServer(async (server) => {
     '续跑完成后必须以最新轮次为当前状态，历史失败只能保留在运行记录中',
   );
   assert.equal(
-    panel.shouldShowRuntimePanel({
-      status: resumed.orchestratorRuntimeState?.status,
-      isProcessing: false,
-      activeAssignmentCount: 0,
-    }),
+    panel.shouldShowRuntimePanel(resumed.orchestratorRuntimeState?.status),
     false,
     '续跑成功后不得继续展示历史失败状态面板',
   );
 
+  const statusPayload = {
+    generatedAt: 100,
+    currentSession: { sessionId: 'status-scope', title: '状态归属', createdAt: 1, updatedAt: 100 },
+    sessions: [{ sessionId: 'status-scope', title: '状态归属', createdAt: 1, updatedAt: 100 }],
+    runtimeReadModel: { details: {
+      sessions: [{ session_id: 'status-scope', current_status: 'resumed', root_task_id: 'main-root',
+        root_task_status: 'running', mission_id: 'shared-mission', active_task_ids: ['main-root'],
+        active_execution_group_ids: ['shared-mission'], execution_chain_ref: 'main-chain',
+        has_recoverable_chain: true, recoverable_branch_count: 1,
+        active_branches: [
+          { task_id: 'main-root', is_primary: true, status: 'running' },
+          { task_id: 'known-child', is_primary: false, status: 'running' },
+          { task_id: 'missing-child', is_primary: false, status: 'running' },
+        ] }],
+      tasks: [{ task_id: 'main-root', current_status: 'running', mission_id: 'shared-mission' },
+        { task_id: 'known-child', current_status: 'completed', title: '已完成代理', mission_id: 'shared-mission' },
+        { task_id: 'transferred-child', current_status: 'running', mission_id: 'shared-mission' }],
+      assignments: [{ assignment_id: 'old-assignment', task_ids: ['transferred-child'],
+        current_status: 'running', mission_id: 'shared-mission' }],
+    } },
+    recentEvents: [],
+  };
+  const projectStatus = (turns) => rustContract.normalizeRustBootstrapPayload({ ...statusPayload, canonicalTurns: turns },
+    { sessionId: 'status-scope' });
+  const missingMainline = projectStatus([]);
+  assert.equal(missingMainline.orchestratorRuntimeState.status, 'idle', 'Task/sidecar 状态不能替代缺失的主线 Turn');
+  assert.equal(missingMainline.state.processingState, null);
+  assert.equal(missingMainline.orchestratorRuntimeState.continuation, undefined, '缺少主线身份时不能展示继续入口');
+  assert.deepEqual(missingMainline.orchestratorRuntimeState.assignments.map(item => [item.assignmentId, item.status]),
+    [['known-child', 'completed']], '代理统计只用明确绑定且存在 Task 的分支，忽略旧 assignment 和同 mission 的转交任务');
+  for (const continuation of [undefined, 'resume_chain']) {
+    const recoveryPayload = structuredClone(statusPayload);
+    recoveryPayload.runtimeReadModel.details.sessions[0].continuation = continuation;
+    recoveryPayload.runtimeReadModel.recovery = {
+      active_recovery_ids: ['own-recovery', 'foreign-recovery'],
+      summaries: [
+        { recovery_id: 'own-recovery', session_id: 'status-scope', current_status: 'ready', latest_occurred_at: 10 },
+        { recovery_id: 'foreign-recovery', session_id: 'foreign-session', mission_id: 'shared-mission',
+          execution_chain_ref: 'main-chain', current_status: 'ready', latest_occurred_at: 20 },
+      ],
+    };
+    const recovery = rustContract.normalizeRustBootstrapPayload(recoveryPayload, { sessionId: 'status-scope' })
+      .orchestratorRuntimeState.opsView.recovery;
+    assert.equal(recovery.pendingTaskCount, 1, '同 mission/chain 的外部恢复记录不能混入当前会话');
+    assert.equal(recovery.continuationPolicy, continuation ? 'resumable' : 'none', '恢复记录不能自行授予继续资格');
+  }
+  for (const [status, expected] of [['completed', 'completed'], ['cancelled', 'cancelled'],
+    ['interrupted', 'failed'], ['failed', 'failed'], ['running', 'running']]) {
+    const projected = projectStatus([
+      { sessionId: 'status-scope', turnId: 'main-turn', turnSeq: 1, acceptedAt: 10,
+        ...(status === 'running' ? {} : { completedAt: 20 }), status, items: [] },
+      { sessionId: 'status-scope', turnId: 'independent-agent-turn', turnSeq: 2,
+        acceptedAt: 30, status: 'running', items: [], metadata: { agentExecution: { taskId: 'transferred-child' } } },
+    ]);
+    assert.equal(projected.orchestratorRuntimeState.status, expected, '独立代理不能覆盖主线状态');
+    assert.equal(Boolean(projected.state.processingState?.isProcessing), status === 'running',
+      '独立代理不能让已终止主线恢复输入忙碌状态');
+  }
+
   console.log('runtime state panel golden passed');
-});
+}, { configFile: 'vite.web.config.ts' });

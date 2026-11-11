@@ -59,3 +59,54 @@ export function dshThemeAliases(t) {
     '--dsw-font-markdown-code-font-family': t['--vscode-editor-font-family'],
   };
 }
+
+// 只投影 Magi 已接纳的外观；不创建另一份主题注册表或持久偏好。
+export function createThemeClient(request, reportError, onSuccess = () => {}) {
+  const listeners = new Set();
+  const publicId = id => ['builtin.light', 'builtin.dark', 'builtin.system'].includes(id) ? id.slice('builtin.'.length) : `magi:${id}`;
+  let snapshot, identity, appearance, disposed = false;
+  const freeze = value => {
+    if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); }
+    return value;
+  };
+  const service = {
+    getTheme() { if (!snapshot) throw new Error('Magi 外观尚未就绪'); return snapshot; },
+    setTheme(id) {
+      if (disposed) throw new Error('插件页面已失效');
+      const themeId = appearance?.themes.find(pack => publicId(pack.id) === id)?.id;
+      if (typeof id !== 'string' || !themeId) throw new Error(`Magi 主题不存在：${id}`);
+      // 上游写接口返回 void；异步提交失败由公共页面反馈展示，不发布乐观状态。
+      void request({ operation: 'host.theme.set', themeId, expectedRevision: appearance.revision }).then(
+        () => { if (!disposed) onSuccess(); }, error => { if (!disposed) reportError(error); });
+    },
+  };
+  return {
+    service,
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    update(theme) {
+      if (disposed || !theme.appearance) return;
+      const nextIdentity = JSON.stringify(theme);
+      if (identity === nextIdentity) return;
+      appearance = theme.appearance;
+      const definition = pack => {
+        const colorScheme = pack.schemePolicy === 'adaptive' ? theme.mode : pack.schemePolicy;
+        const scheme = pack.schemes[colorScheme];
+        return { id: publicId(pack.id), colorScheme, tokens: {
+          '--dsw-alias-brand-primary': scheme.accent,
+          '--dsw-alias-bg-base': scheme.background,
+          '--dsw-alias-label-primary': scheme.foreground,
+        } };
+      };
+      const activePack = appearance.activeTheme;
+      snapshot = freeze({
+        preference: publicId(appearance.preference),
+        active: { ...definition(activePack), tokens: Object.fromEntries(Object.entries(dshThemeAliases(theme.tokens)).filter(([, value]) => value)) },
+        themes: appearance.themes.filter(pack => pack.id !== 'builtin.system').map(definition),
+        revision: (snapshot?.revision ?? 0) + 1,
+      });
+      identity = nextIdentity;
+      for (const listener of [...listeners]) listener(snapshot);
+    },
+    dispose() { disposed = true; listeners.clear(); },
+  };
+}

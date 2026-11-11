@@ -3,7 +3,10 @@
 import ts from 'typescript';
 
 const isFunction = (node) => ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node) || ts.isMethodDeclaration(node);
-const methodName = (node) => ts.isPropertyAccessExpression(node) ? node.name.text
+const methodName = (node) => ts.isParenthesizedExpression(node) ? methodName(node.expression)
+  : ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.CommaToken ? methodName(node.right)
+  : ts.isIdentifier(node) ? node.text
+  : ts.isPropertyAccessExpression(node) ? node.name.text
   : ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression) ? node.argumentExpression.text : undefined;
 const INPUT_METHODS = new Set(['addAttachments', 'removeAttachment', 'focus', 'notify']);
 
@@ -78,7 +81,8 @@ export function translateClientBusiness(text) {
         else if (ts.isObjectBindingPattern(node.name) && ['ctx','composer'].includes(label(node.initializer))) for (const binding of node.name.elements) {
           if (!ts.isIdentifier(binding.name) || binding.dotDotDotToken) continue;
           const name = binding.propertyName?.text ?? binding.name.text;
-          const kind = label(node.initializer) === 'composer' ? `composer-op:${name}` : name === 'magiComposer' ? 'composer' : undefined;
+          const kind = label(node.initializer) === 'composer' ? `composer-op:${name}`
+            : name === 'magiComposer' ? 'composer' : undefined;
           changed = mark(binding.name, kind) || changed;
         }
       }
@@ -111,6 +115,7 @@ export function translateClientBusiness(text) {
     if ((ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) && parent.expression === identifier) {
       const name = methodName(parent);
       if (kind === 'input' && (INPUT_METHODS.has(name) || name === 'snapshot') || kind === 'inputs' && name === 'for') continue;
+      if (kind === 'input' && name) throw new Error(`原包使用了未支持的客户端输入操作“${name}”。请尝试在线更新插件，或选择使用当前 DSH 输入接口的版本。`);
     }
     if (ts.isCallExpression(parent)) {
       if (parent.expression === identifier && kind.startsWith('operation:') || callable(parent.expression)) continue;
@@ -182,7 +187,7 @@ export function translateClientBusiness(text) {
     edits.push([modifiers.length ? modifiers.at(-1).end + 1 : fn.getStart(source), 'async ']);
   }
   let code = text;
-  for (const [at, insertion] of edits.sort((a, b) => b[0] - a[0])) code = code.slice(0, at) + insertion + code.slice(at);
+  for (const [at, insertion, end = at] of edits.sort((a, b) => b[0] - a[0])) code = code.slice(0, at) + insertion + code.slice(end);
   const syntax = ts.createSourceFile('result.js', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   if (syntax.parseDiagnostics.length) throw new Error('客户端业务异步转换结果语法无效');
   const composerTargets = [...new Set([...members.map(member=>label(member)),...labels.values()]

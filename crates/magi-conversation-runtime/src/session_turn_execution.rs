@@ -15,10 +15,7 @@ use crate::model_context_window::{
 };
 use crate::{
     ConversationRegistry, SessionTurnInputBoundary, UserSignal,
-    conversation_loop::{
-        append_thread_messages_checkpoint, chat_message_to_thread_chat_message,
-        insert_interrupted_tool_result_messages, thread_chat_message_to_chat_message,
-    },
+    conversation_loop::thread_chat_message_to_chat_message,
     model_config::{resolve_orchestrator_model_config, resolve_vision_execution_config},
     model_error::{
         MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS,
@@ -28,14 +25,13 @@ use crate::{
     },
     prompt_utils::{
         PromptFragmentKind, current_access_profile_prompt, current_turn_context_priority_prompt,
-        normalize_model_stream_preview_content, normalize_model_visible_content,
-        system_prompt_fragment_message,
+        normalize_model_visible_content, system_prompt_fragment_message,
     },
     session_images::{SessionTurnImage, session_turn_image_sources},
     session_writeback::{
         CanonicalTurnEventSink, ContextCompactionWritebackContext, SessionStatePersistCallback,
         SessionTurnStreamPublishGate, append_session_turn_error_item,
-        append_session_turn_error_item_without_terminal_commit, append_session_turn_item_for_turn,
+        append_session_turn_error_item_without_terminal_commit,
         apply_model_response_round, new_context_compaction_item_id,
         persist_session_state_checkpoint, publish_current_session_turn_item_event,
         publish_model_retry_runtime_event, publish_session_turn_item_event,
@@ -59,10 +55,10 @@ use magi_bridge_client::{
 };
 use magi_core::{AccessProfile, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
-use magi_session_store::{CanonicalTurnItemKind, SessionStore, ThreadChatMessage};
+use magi_session_store::{SessionStore, ThreadChatMessage};
 use magi_settings_store::SettingsStore;
 use magi_usage_authority::UsageCallStatus;
-use std::{collections::BTreeSet, fmt, sync::Arc, time::Instant};
+use std::{fmt, sync::Arc, time::Instant};
 
 pub const BUSINESS_MODEL_PROVIDER: &str = "openai-compatible";
 
@@ -286,169 +282,18 @@ fn request_turn_is_writable(
         })
 }
 
-fn canonical_session_turn_history(
-    session_store: &SessionStore,
+#[cfg(test)]
+fn projected_test_history(
+    store: &SessionStore,
     request: &SessionTurnExecutionRequest,
 ) -> Vec<ThreadChatMessage> {
-    let current_turn = session_store
-        .runtime_sidecar(&request.session_id)
-        .and_then(|sidecar| sidecar.current_turn)
-        .filter(|turn| turn.turn_id == request.turn_id);
-    let accepted_at = current_turn.as_ref().map(|turn| turn.accepted_at);
-    // 主线历史只取属于 orchestrator thread 的 item；非主线（task 详情）item
-    // 不进入 LLM 上下文。session 一生一 mission，因此 thread 必存。
-    let orchestrator_thread_id = session_store
-        .orchestrator_thread_for_session(&request.session_id)
-        .map(|thread| thread.thread_id);
-    accepted_at
-        .zip(orchestrator_thread_id.as_ref())
-        .map(|(accepted_at, orchestrator_thread_id)| {
-            session_store
-                .canonical_turns_for_session(&request.session_id)
-                .into_iter()
-                .filter(|turn| {
-                    turn.turn_id != request.turn_id
-                        && turn.accepted_at.0 < accepted_at.0
-                        // 被编辑取代的轮次不再是事实；用户停止的轮次仍是对话的一部分。
-                        && turn.status != magi_session_store::CanonicalTurnStatus::Superseded
-                        && !turn.is_session_command()
-                })
-                .flat_map(|turn| {
-                    let stopped_by_user =
-                        turn.status == magi_session_store::CanonicalTurnStatus::Cancelled;
-                    let mut messages = turn
-                        .items
-                        .into_iter()
-                        .filter_map(|item| {
-                            let role = match item.kind {
-                                CanonicalTurnItemKind::UserMessage => "user",
-                                CanonicalTurnItemKind::AssistantText => "assistant",
-                                _ => return None,
-                            };
-                            if !item.visibility.renderable {
-                                return None;
-                            }
-                            let is_orchestrator_item =
-                                &item.source_thread_id == orchestrator_thread_id;
-                            let is_root_final_item = item.kind
-                                == CanonicalTurnItemKind::AssistantText
-                                && item
-                                    .metadata
-                                    .get("assistantOutputKind")
-                                    .and_then(|value| value.as_str())
-                                    == Some("final")
-                                && item.worker.as_ref().is_some_and(|worker| {
-                                    worker.task_id.is_some()
-                                        && worker.worker_id.is_none()
-                                        && worker.role_id.is_none()
-                                });
-                            // 普通 session turn 的最终回复由 coordinator task 负责落盘，
-                            // source_thread_id 可能不是 orchestrator thread；它仍是主线事实，
-                            // 必须进入后续回合上下文。带 worker/role 的 sidechain final 继续排除。
-                            if !is_orchestrator_item && !is_root_final_item {
-                                return None;
-                            }
-                            let content = item.model_input_content()?.trim().to_string();
-                            if content.is_empty() {
-                                return None;
-                            }
-                            Some(ThreadChatMessage {
-                                input_request_id: None,
-                                role: role.to_string(),
-                                content: Some(content),
-                                images: Vec::new(),
-                                tool_calls: Vec::new(),
-                                tool_call_id: None,
-                                provider_context: Vec::new(),
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    // 用户停止的轮次保留已产生的内容并明确标注，后续“改短一点”之类的
-                    // 指令才有上下文可依，未处理的引导也不会被模型忽略。
-                    if stopped_by_user {
-                        messages.push(ThreadChatMessage {
-                            input_request_id: None,
-                            role: "assistant".to_string(),
-                            content: Some(
-                                "（上面这一轮回复已被用户中断，可能不完整。）".to_string(),
-                            ),
-                            images: Vec::new(),
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                            provider_context: Vec::new(),
-                        });
-                    }
-                    messages
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-}
-
-fn started_tool_call_ids_for_session_thread(
-    session_store: &SessionStore,
-    session_id: &SessionId,
-    thread_id: &magi_core::ThreadId,
-) -> BTreeSet<String> {
-    session_store
-        .canonical_turns_for_session(session_id)
-        .into_iter()
-        .flat_map(|turn| turn.items)
-        .filter(|item| item.kind == CanonicalTurnItemKind::ToolCall)
-        .filter(|item| item.source_thread_id == *thread_id)
-        .filter_map(|item| item.tool)
-        .filter(|tool| {
-            !tool
-                .result
-                .as_ref()
-                .is_some_and(crate::tool_result_utils::tool_payload_waits_for_user)
-        })
-        .map(|tool| tool.call_id)
-        .collect()
-}
-
-fn normalize_interrupted_session_tool_history(
-    session_store: &SessionStore,
-    session_id: &SessionId,
-    thread_id: &magi_core::ThreadId,
-    persist_session_state: Option<&SessionStatePersistCallback>,
-) -> Result<usize, String> {
-    // 新路径的工具调用和结果都已经进入 canonical Turn；直接重建 thread
-    // projection 即可得到“结果未知”的 interrupted marker，不再单独修改 transcript。
-    let has_canonical_items = session_store
-        .canonical_turns_for_session(session_id)
-        .iter()
-        .any(|turn| {
-            turn.items
-                .iter()
-                .any(|item| item.source_thread_id == *thread_id)
-        });
-    if has_canonical_items {
-        let rebuilt = session_store
-            .rebuild_thread_message_projection(thread_id, UtcMillis::now())
-            .map_err(|error| format!("从 canonical Turn 重建中断工具历史失败: {error}"))?;
-        if rebuilt > 0 {
-            persist_session_state_checkpoint(
-                persist_session_state,
-                "session_turn_interrupted_tool_result",
-            )?;
-        }
-        return Ok(rebuilt);
-    }
-    let mut history = session_store.thread_message_history(thread_id);
-    let inserted = insert_interrupted_tool_result_messages(
-        &mut history,
-        &started_tool_call_ids_for_session_thread(session_store, session_id, thread_id),
-    );
-    if inserted == 0 {
-        return Ok(0);
-    }
-    session_store.replace_thread_messages(thread_id, history, UtcMillis::now());
-    persist_session_state_checkpoint(
-        persist_session_state,
-        "session_turn_interrupted_tool_result",
-    )?;
-    Ok(inserted)
+    let Some(thread) = store.orchestrator_thread_for_session(&request.session_id) else {
+        return Vec::new();
+    };
+    store
+        .thread_context_snapshot(&thread.thread_id)
+        .unwrap()
+        .model_history()
 }
 
 #[cfg(test)]
@@ -686,7 +531,11 @@ struct RebuildMessagesForContextWindowInput<'a> {
     prompt: &'a str,
     knowledge_context_prompt: Option<&'a str>,
     context_window: u64,
+    mode: ContextCompactionMode,
+    identity_prompt: Option<&'a str>,
+    safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
     messages: &'a mut Vec<ChatMessage>,
+    history_generation: &'a mut u64,
     request_context: &'a [ChatMessage],
     persist_session_state: Option<&'a SessionStatePersistCallback>,
     settings_store: Option<&'a Arc<SettingsStore>>,
@@ -708,7 +557,11 @@ fn rebuild_messages_for_context_window(
         prompt,
         knowledge_context_prompt,
         context_window,
+        mode,
+        identity_prompt,
+        safety_gate,
         messages,
+        history_generation,
         request_context,
         persist_session_state,
         settings_store,
@@ -717,6 +570,11 @@ fn rebuild_messages_for_context_window(
         stable_contributions,
         extension_hooks,
     } = input;
+    let phase = if mode == ContextCompactionMode::Automatic {
+        "pre_model"
+    } else {
+        "context_limit_recovery"
+    };
     let mut fixed_messages =
         build_session_turn_messages_with_runtime(BuildSessionTurnMessagesWithRuntimeInput {
             session_store,
@@ -725,7 +583,7 @@ fn rebuild_messages_for_context_window(
             knowledge_context_prompt,
             history: &[],
             settings_store,
-            safety_gate: None,
+            safety_gate,
             skill_runtime,
             stable_contributions,
         });
@@ -735,10 +593,9 @@ fn rebuild_messages_for_context_window(
         Some(&request.turn_id),
         thread_id,
         messages,
-    );
+    )?;
     fixed_messages.extend(pending_inputs.iter().cloned());
-    let compaction_item_id =
-        new_context_compaction_item_id(&request.turn_id, thread_id, "context_limit_recovery");
+    let compaction_item_id = new_context_compaction_item_id(&request.turn_id, thread_id, phase);
     let compaction_writeback = ContextCompactionWritebackContext {
         event_bus,
         session_store,
@@ -746,7 +603,7 @@ fn rebuild_messages_for_context_window(
         workspace_id: &request.workspace_id,
         thread_id,
         item_id: &compaction_item_id,
-        phase: "context_limit_recovery",
+        phase,
         persist_session_state,
         task: None,
         turn_visibility: None,
@@ -768,8 +625,7 @@ fn rebuild_messages_for_context_window(
     .with_extension_hooks(extension_hooks)
     .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
     .prepare(ContextPrepareRequest {
-        recovery_history: Vec::new(),
-        phase: "context_limit_recovery",
+        phase,
         context_window_tokens: context_window,
         additional_context: {
             let mut usage = estimate_context_usage_breakdown(&fixed_messages, None);
@@ -778,7 +634,7 @@ fn rebuild_messages_for_context_window(
         },
         persist_checkpoint,
         model_identity: None,
-        mode: ContextCompactionMode::Recovery,
+        mode,
     });
     if let Some(terminal) = prepared.terminal {
         return Err(terminal);
@@ -788,13 +644,8 @@ fn rebuild_messages_for_context_window(
         upsert_context_compaction_completed_notice(compaction_writeback, compaction)
             .map_err(|_| ContextCompactionTerminal::Failed)?;
     }
-    let mut history = prepared.messages;
-    if history
-        .last()
-        .is_some_and(|message| message.role == "user" && message.content.as_deref() == Some(prompt))
-    {
-        history.pop();
-    }
+    *history_generation = prepared.checkpoint_generation;
+    let history = prepared.messages;
     *messages =
         build_session_turn_messages_with_runtime(BuildSessionTurnMessagesWithRuntimeInput {
             session_store,
@@ -803,10 +654,19 @@ fn rebuild_messages_for_context_window(
             knowledge_context_prompt,
             history: &history,
             settings_store,
-            safety_gate: None,
+            safety_gate,
             skill_runtime,
             stable_contributions,
         });
+    if let Some(identity_prompt) = identity_prompt {
+        messages.insert(
+            0,
+            system_prompt_fragment_message(
+                PromptFragmentKind::CurrentTurnPriority,
+                identity_prompt,
+            ),
+        );
+    }
     for input in pending_inputs {
         if !messages
             .iter()
@@ -832,8 +692,7 @@ pub struct SessionTurnExecutionRuntime<'a> {
     pub knowledge_context_prompt: Option<String>,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
     pub live_settings_store: Option<Arc<SettingsStore>>,
-    /// 扩展钩子端口；None 表示没有可执行扩展。纯会话没有工具，所以只有提示贡献、上下文改写、
-    /// 压缩前与模型观察类钩子会被触发。
+    /// 扩展钩子端口；纯会话不执行工具，但历史工具结果仍经过模型投影钩子。
     pub extension_hooks: Option<&'a dyn crate::extension_hooks::ExtensionHooks>,
 }
 
@@ -855,7 +714,7 @@ struct ConversationAssembly<'a> {
     hooks: Option<&'a dyn crate::extension_hooks::ExtensionHooks>,
     request: &'a SessionTurnExecutionRequest,
     context_window_tokens: u64,
-    rewrite_memo: crate::extension_hooks::RewriteMemo,
+    history: crate::extension_hooks::RequestHistoryProjection,
     tail: Vec<ChatMessage>,
     projection: std::cell::RefCell<magi_session_store::HistoryProjection>,
 }
@@ -879,7 +738,7 @@ impl<'a> ConversationAssembly<'a> {
             hooks,
             request,
             context_window_tokens,
-            rewrite_memo: Default::default(),
+            history: Default::default(),
             tail,
             projection: Default::default(),
         }
@@ -890,18 +749,12 @@ impl<'a> ConversationAssembly<'a> {
         messages: &[ChatMessage],
         controls: &crate::request_controls::RequestControls,
     ) -> Vec<ChatMessage> {
-        let mut projection = magi_session_store::HistoryProjection::default();
-        let history = match self.hooks {
-            Some(hooks) => crate::extension_hooks::apply_context_assemble(
-                hooks,
-                &hook_scope(self.request),
-                &self.rewrite_memo,
-                messages.to_vec(),
-                self.context_window_tokens,
-                &mut projection,
-            ),
-            None => messages.to_vec(),
-        };
+        let (history, projection) = self.history.view(
+            self.hooks,
+            &hook_scope(self.request),
+            messages,
+            self.context_window_tokens,
+        );
         *self.projection.borrow_mut() = projection;
         controls.view(&history, self.tail.iter().cloned())
     }
@@ -1008,19 +861,6 @@ fn run_session_turn_execution_inner(
         .ok_or_else(SessionTurnExecutionError::runtime_invalid_state)?;
     let orchestrator_thread_id = orchestrator_thread.thread_id;
 
-    normalize_interrupted_session_tool_history(
-        session_store,
-        &request.session_id,
-        &orchestrator_thread_id,
-        persist_session_state,
-    )
-    .map_err(|error| {
-        SessionTurnExecutionError::new(
-            SessionTurnFailureReason::RuntimeInvalidState,
-            format!("中断工具历史持久化失败：{error}"),
-        )
-    })?;
-    let recovery_history = canonical_session_turn_history(session_store, &request);
     let selected_model_config = settings_store
         .and_then(|store| resolve_orchestrator_model_config(store, Some(&request.session_id)).ok());
     let selected_model = selected_model_config
@@ -1154,7 +994,6 @@ fn run_session_turn_execution_inner(
         .with_extension_hooks(extension_hooks)
         .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
         .prepare(ContextPrepareRequest {
-            recovery_history,
             phase: compaction_phase,
             context_window_tokens: effective_context_window,
             additional_context: estimate_context_usage_breakdown(&fixed_messages, None),
@@ -1199,6 +1038,9 @@ fn run_session_turn_execution_inner(
         // 不调用主模型，也不把命令本身写入模型可见历史。
         return Ok(SessionTurnExecutionOutput::completed(String::new()));
     }
+    let identity_prompt =
+        model_identity_prompt_for_request(&request.prompt, &resolved_context_model);
+    let mut history_generation = prepared_history.checkpoint_generation;
     let mut messages =
         build_session_turn_messages_with_runtime(BuildSessionTurnMessagesWithRuntimeInput {
             session_store,
@@ -1211,9 +1053,7 @@ fn run_session_turn_execution_inner(
             skill_runtime,
             stable_contributions: &stable_contributions,
         });
-    if let Some(identity_prompt) =
-        model_identity_prompt_for_request(&request.prompt, &resolved_context_model)
-    {
+    if let Some(identity_prompt) = identity_prompt.as_ref() {
         messages.insert(
             0,
             system_prompt_fragment_message(
@@ -1222,25 +1062,7 @@ fn run_session_turn_execution_inner(
             ),
         );
     }
-    if !messages.is_empty() {
-        // 当前用户消息已经在 Turn accepted 事务中写入 canonical；这里只更新
-        // ThreadChatMessage projection，不能在 Provider 执行路径追加第二份事实。
-        session_store
-            .rebuild_thread_message_projection(&orchestrator_thread_id, UtcMillis::now())
-            .map_err(|error| {
-                SessionTurnExecutionError::new(
-                    SessionTurnFailureReason::RuntimeInvalidState,
-                    format!("从 canonical Turn 重建用户消息 projection 失败：{error}"),
-                )
-            })?;
-        persist_session_state_checkpoint(persist_session_state, "session_turn_thread_user")
-            .map_err(|error| {
-                SessionTurnExecutionError::new(
-                    SessionTurnFailureReason::RuntimeInvalidState,
-                    format!("用户消息 projection 持久化失败：{error}"),
-                )
-            })?;
-    }
+
     let mut request_controls = crate::request_controls::RequestControls::default();
     let mut final_content: Option<String> = None;
     let mut final_item_id: Option<String> = None;
@@ -1254,6 +1076,38 @@ fn run_session_turn_execution_inner(
     let mut last_response_observation: Option<String> = None;
     let mut round = 0usize;
     loop {
+        if round > 0 {
+            match rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
+                client,
+                event_bus,
+                session_store,
+                request: &request,
+                thread_id: &orchestrator_thread_id,
+                prompt: &prompt,
+                knowledge_context_prompt: knowledge_context_prompt.as_deref(),
+                context_window: effective_context_window,
+                mode: ContextCompactionMode::Automatic,
+                identity_prompt: identity_prompt.as_deref(),
+                safety_gate,
+                messages: &mut messages,
+                history_generation: &mut history_generation,
+                request_context: &request_controls.view(&[], []),
+                persist_session_state,
+                settings_store,
+                skill_runtime,
+                persist_checkpoint: vision_execution_config.is_none(),
+                stable_contributions: &stable_contributions,
+                extension_hooks,
+            }) {
+                Ok(_) => {}
+                Err(ContextCompactionTerminal::Cancelled) => {
+                    return Ok(SessionTurnExecutionOutput::interrupted());
+                }
+                Err(ContextCompactionTerminal::Failed) => {
+                    return Err(SessionTurnExecutionError::context_compaction_failed());
+                }
+            }
+        }
         // 轮数上限与任务轮次共用：达到上限时按终止失败收口，不再继续调用模型。
         let round_result = match emergency_model_round_failure(round) {
             Some(failure) => Err(SessionTurnRoundError::RoundLimitReached(failure)),
@@ -1271,6 +1125,7 @@ fn run_session_turn_execution_inner(
                 stream_interruption_recovery_attempts,
                 round,
                 context_window_tokens: effective_context_window,
+                history_generation,
                 orchestrator_thread_id: &orchestrator_thread_id,
                 persist_session_state,
                 extension_hooks,
@@ -1382,6 +1237,9 @@ fn run_session_turn_execution_inner(
                     });
                     let compacted = match rebuild_messages_for_context_window(
                         RebuildMessagesForContextWindowInput {
+                            mode: ContextCompactionMode::Recovery,
+                            identity_prompt: identity_prompt.as_deref(),
+                            safety_gate,
                             client,
                             event_bus,
                             session_store,
@@ -1391,6 +1249,7 @@ fn run_session_turn_execution_inner(
                             knowledge_context_prompt: knowledge_context_prompt.as_deref(),
                             context_window: effective_context_window,
                             messages: &mut messages,
+                            history_generation: &mut history_generation,
                             request_context: &request_controls.view(&[], []),
                             persist_session_state,
                             settings_store,
@@ -1664,6 +1523,7 @@ struct SessionTurnRoundRuntime<'a> {
     stream_interruption_recovery_attempts: usize,
     round: usize,
     context_window_tokens: u64,
+    history_generation: u64,
     /// session 主线 thread：该 turn 内所有 session_turn_item 的 source_thread_id。
     orchestrator_thread_id: &'a magi_core::ThreadId,
     persist_session_state: Option<&'a SessionStatePersistCallback>,
@@ -1735,6 +1595,7 @@ fn stream_session_turn_round(
         stream_interruption_recovery_attempts,
         round,
         context_window_tokens,
+        history_generation,
         orchestrator_thread_id,
         persist_session_state,
         extension_hooks,
@@ -1807,10 +1668,7 @@ fn stream_session_turn_round(
             thread_id: Some(orchestrator_thread_id),
             model_provider: resolved_provider,
             binding_revision: usage_binding.binding_revision(),
-            checkpoint_generation: session_store
-                .thread_context_checkpoint(orchestrator_thread_id)
-                .map(|checkpoint| checkpoint.generation)
-                .unwrap_or_default(),
+            checkpoint_generation: history_generation,
         })
     });
     let content_buffer = std::cell::RefCell::new(TurnStreamBuffer::default());
@@ -1919,7 +1777,7 @@ fn stream_session_turn_round(
             content.clear();
             content.push_str(accumulated);
         }
-        let visible_content = normalize_model_stream_preview_content(accumulated);
+        let visible_content = normalize_model_visible_content(accumulated);
         let stream_update = {
             let current_visible = streamed_visible_content.borrow();
             let update = session_turn_stream_update(&current_visible, &visible_content);
@@ -2013,6 +1871,7 @@ fn stream_session_turn_round(
         None,
         orchestrator_thread_id,
         &call_id,
+        history_generation,
     )
     .with_model_binding(settings_store, usage_binding)
     .with_history_projection(assembly.projection.borrow().clone())
@@ -2171,7 +2030,10 @@ fn stream_session_turn_round(
             }
 
             let mut recovery_request = non_stream_recovery_template;
-            recovery_request.messages = Some(assembly.view(messages, request_controls));
+            recovery_request.messages = Some(
+                ConversationAssembly::new(extension_hooks, request, context_window_tokens)
+                    .view(messages, request_controls),
+            );
             tracing::warn!(
                 session_id = %request.session_id,
                 round,
@@ -2339,7 +2201,7 @@ fn stream_session_turn_round(
     let parsed_visible_content = parsed
         .content
         .as_deref()
-        .map(|content| normalize_model_visible_content(content.to_string()))
+        .map(normalize_model_visible_content)
         .filter(|content| !content.trim().is_empty());
     let completed_stream_content = if !streamed_visible_content.trim().is_empty() {
         Some(streamed_visible_content.clone())
@@ -2416,12 +2278,7 @@ fn stream_session_turn_round(
         .is_some_and(|content| !content.trim().is_empty())
         || !assistant_response_message.provider_context.is_empty()
     {
-        append_thread_messages_checkpoint(
-            session_store,
-            orchestrator_thread_id,
-            vec![chat_message_to_thread_chat_message(
-                &assistant_response_message,
-            )],
+        persist_session_state_checkpoint(
             persist_session_state,
             "session_turn_thread_assistant_response",
         )
@@ -2515,7 +2372,7 @@ fn append_final_item(
             None,
         )?
     } else {
-        append_session_turn_item_for_turn(
+        upsert_session_turn_item_for_turn(
             session_store,
             &request.session_id,
             Some(&request.turn_id),
@@ -2594,7 +2451,6 @@ mod tests {
         assert!(messages[0].content.is_none());
         assert_eq!(messages[0].images, vec![image.source]);
     }
-    use crate::session_writeback::append_session_turn_item_for_turn;
     use crate::{
         CanonicalTurnEventSink, CoordinatorAdmission, CoordinatorCommandResult,
         CoordinatorTurnStatus, ExecutionProfile, SessionTurnCoordinator, TurnAdmission,
@@ -2714,6 +2570,15 @@ mod tests {
             created_at: accepted_at,
             updated_at: accepted_at,
         };
+        let admitted_turn = ActiveExecutionTurn {
+            turn_id: turn_id.to_string(),
+            turn_seq,
+            accepted_at,
+            completed_at: None,
+            status: "accepted".to_string(),
+            user_message: Some(user_message.to_string()),
+            items: vec![item],
+        };
         CanonicalTurnEventSink::for_store(store, None)
             .accept_active_execution_chain_with_timeline_entry_and_task(
                 session_id.clone(),
@@ -2729,26 +2594,16 @@ mod tests {
                     root_task_id: task_id,
                     execution_chain_ref: format!("chain-{turn_id}"),
                     workspace_id: None,
-                    active_branch_task_ids: Vec::new(),
-                    active_worker_bindings: Vec::new(),
                     branches: Vec::new(),
-                    recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
                         accepted_at,
                         entry_id: format!("timeline-{turn_id}"),
                         trimmed_text: Some(user_message.to_string()),
                         skill_name: None,
                     },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: turn_id.to_string(),
-                        turn_seq,
-                        accepted_at,
-                        completed_at: None,
-                        status: "accepted".to_string(),
-                        user_message: Some(user_message.to_string()),
-                        items: vec![item],
-                    }),
+                    current_turn_id: Some(admitted_turn.turn_id.clone()),
                 },
+                admitted_turn,
                 &task,
             )
             .expect("测试 Turn 应通过 canonical sink 持久化");
@@ -3616,6 +3471,44 @@ mod tests {
     }
 
     #[test]
+    fn conversation_projects_historical_tools_and_rechecks_disabled_plugin() {
+        let request = SessionTurnExecutionRequest {
+            project_directories: None,
+            session_id: SessionId::new("projection-session"),
+            turn_id: "projection-turn".into(),
+            workspace_id: None,
+            prompt: "continue".into(),
+            images: vec![],
+            context_references: vec![],
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            command: None,
+        };
+        let raw = crate::test_history::tool_projection_history("historical")
+            .iter()
+            .map(thread_chat_message_to_chat_message)
+            .collect::<Vec<_>>();
+        let hooks = crate::test_history::ToolProjectionHooks::new();
+        let controls = crate::request_controls::RequestControls::default();
+        let first = ConversationAssembly::new(Some(&hooks), &request, 128_000);
+        let view = first.view(&raw, &controls);
+        assert_eq!(view[1].content.as_deref(), Some("[projection-v1]"));
+        hooks.version.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(first.view(&raw, &controls)[1].content, view[1].content);
+        let next = ConversationAssembly::new(Some(&hooks), &request, 128_000);
+        assert!(
+            next.view(&raw, &controls)[1]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("SOURCE_SECRET")
+        );
+    }
+
+    #[test]
     fn session_turn_cancellation_interrupts_model_invocation() {
         let session_id = SessionId::new("session-model-cancellation");
         let turn_id = "turn-model-cancellation".to_string();
@@ -3701,30 +3594,25 @@ mod tests {
         let (_, thread_id) = store.ensure_session_mission(&session_id, ts(900), || {
             magi_core::MissionId::new("mission-vision-takeover")
         });
-        store.append_thread_messages(
-            &thread_id,
-            vec![
-                ThreadChatMessage {
-                    input_request_id: None,
-                    role: "user".to_string(),
-                    content: Some("历史约束：保留表格结构".to_string()),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                },
-                ThreadChatMessage {
-                    input_request_id: None,
-                    role: "assistant".to_string(),
-                    content: Some("已确认历史约束".to_string()),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                },
-            ],
-            ts(950),
+        let mut persisted = store.export_state();
+        persisted.canonical_turns.push(
+            serde_json::from_value(serde_json::json!({
+                "sessionId": session_id, "turnId": "vision-previous-turn", "turnSeq": 1,
+                "acceptedAt": 950, "completedAt": 950, "status": "completed",
+                "items": [
+                    {"sessionId": session_id, "turnId": "vision-previous-turn", "turnSeq": 1,
+                     "itemId": "vision-previous-user", "itemSeq": 1, "kind": "user_message",
+                     "createdAt": 950, "updatedAt": 950, "status": "completed",
+                     "sourceThreadId": thread_id, "content": "历史约束：保留表格结构"},
+                    {"sessionId": session_id, "turnId": "vision-previous-turn", "turnSeq": 1,
+                     "itemId": "vision-previous-answer", "itemSeq": 2, "kind": "assistant_text",
+                     "createdAt": 950, "updatedAt": 950, "status": "completed",
+                     "sourceThreadId": thread_id, "content": "已确认历史约束"}
+                ],
+            }))
+            .unwrap(),
         );
+        let store = Arc::new(SessionStore::from_state_for_test(persisted));
         let coordinator = SessionTurnCoordinator::new();
         seed_conversation_turn(
             store.as_ref(),
@@ -3840,7 +3728,11 @@ mod tests {
             "识图接管不得先识图再调用第二次模型"
         );
 
-        let persisted_image_turn = store.thread_message_history(&thread_id);
+        let persisted_image_turn = store
+            .thread_context_snapshot(&thread_id)
+            .unwrap()
+            .messages()
+            .to_vec();
         assert!(
             persisted_image_turn
                 .iter()
@@ -3970,6 +3862,7 @@ mod tests {
     }
 
     struct SteeringModelBridgeClient {
+        store: SessionStore,
         registry: Arc<ConversationRegistry>,
         session_id: SessionId,
         turn_id: String,
@@ -3998,9 +3891,29 @@ mod tests {
                 .expect("request log lock")
                 .push(request);
             if call == 0 {
+                let thread = self
+                    .store
+                    .orchestrator_thread_for_session(&self.session_id)
+                    .unwrap();
+                let mut item = session_turn_item(
+                    "user_message",
+                    "completed",
+                    None,
+                    Some("优先收口，不要继续扩展".into()),
+                    Some("user-steer-runtime".into()),
+                    thread.thread_id,
+                );
+                item.request_id = Some("request-steer-runtime".into());
+                item.user_message_id = Some("user-steer-runtime".into());
+                item.metadata.insert(
+                    "requestFingerprint".into(),
+                    serde_json::json!("steer-fingerprint"),
+                );
+                item.metadata
+                    .insert("route".into(), serde_json::json!("steer"));
                 self.registry
                     .turn_coordinator()
-                    .try_steer_session_turn(
+                    .try_steer_session_turn_with(
                         &self.session_id,
                         &self.turn_id,
                         UserSignal {
@@ -4010,6 +3923,13 @@ mod tests {
                             user_message_id: Some("user-steer-runtime".to_string()),
                             placeholder_message_id: None,
                             accepted_at: ts(1_100),
+                        },
+                        || {
+                            self.store.upsert_current_turn_item_for_turn(
+                                &self.session_id,
+                                Some(&self.turn_id),
+                                item,
+                            )
                         },
                     )
                     .expect("steer should be accepted while first model call is active");
@@ -4158,6 +4078,7 @@ mod tests {
             .begin_session_turn_input(session_id.clone(), turn_id.clone())
             .expect("turn input should begin");
         let client = SteeringModelBridgeClient {
+            store: store.clone(),
             registry: registry.clone(),
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
@@ -4219,7 +4140,9 @@ mod tests {
         }));
         assert!(
             store
-                .thread_message_history(&orchestrator_thread_id)
+                .thread_context_snapshot(&orchestrator_thread_id)
+                .unwrap()
+                .messages()
                 .iter()
                 .any(|message| {
                     message.role == "assistant"
@@ -5135,6 +5058,7 @@ mod tests {
         }];
 
         let output = stream_session_turn_round(SessionTurnRoundRuntime {
+            history_generation: 0,
             client: &client,
             event_bus: &event_bus,
             session_store: &store,
@@ -5257,6 +5181,7 @@ mod tests {
         }];
 
         stream_session_turn_round(SessionTurnRoundRuntime {
+            history_generation: 0,
             client: &RetryEventModelBridgeClient,
             event_bus: &event_bus,
             session_store: &store,
@@ -5296,7 +5221,7 @@ mod tests {
     #[test]
     fn session_turn_messages_include_persisted_history_before_current_turn() {
         let session_id = SessionId::new("session-context-history");
-        let store = SessionStore::from_state(SessionStoreState {
+        let store = SessionStore::from_state_for_test(SessionStoreState {
             inputs: Vec::new(),
             current_session_id: Some(session_id.clone()),
             sessions: vec![SessionRecord {
@@ -5420,7 +5345,6 @@ mod tests {
                 last_used_at: ts(1200),
                 observed_context_window_tokens: None,
                 handled_task_ids: Vec::new(),
-                message_history: Vec::new(),
             }],
         });
         let coordinator = SessionTurnCoordinator::new();
@@ -5454,7 +5378,7 @@ mod tests {
             placeholder_message_id: None,
             command: None,
         };
-        let history = canonical_session_turn_history(&store, &request);
+        let history = projected_test_history(&store, &request);
         let messages =
             build_session_turn_messages(&store, &request, &request.prompt, None, &history);
 
@@ -5522,8 +5446,7 @@ mod tests {
         let session_id = SessionId::new("session-interrupted-tool-history");
         let thread_id = magi_core::ThreadId::new("thread-interrupted-tool-history");
         let tool_call_id = "call-interrupted-shell".to_string();
-        let tool_arguments = r#"{"command":"sleep 20; printf done"}"#.to_string();
-        let store = SessionStore::from_state(SessionStoreState {
+        let store = SessionStore::from_state_for_test(SessionStoreState {
             inputs: Vec::new(),
             current_session_id: Some(session_id.clone()),
             sessions: vec![SessionRecord {
@@ -5595,30 +5518,14 @@ mod tests {
                 last_used_at: ts(1_100),
                 observed_context_window_tokens: None,
                 handled_task_ids: Vec::new(),
-                message_history: vec![ThreadChatMessage {
-                    input_request_id: None,
-                    role: "assistant".to_string(),
-                    content: None,
-                    images: Vec::new(),
-                    tool_calls: vec![ThreadChatToolCall {
-                        id: tool_call_id,
-                        kind: "function".to_string(),
-                        function: ThreadChatToolFunction {
-                            name: "shell".to_string(),
-                            arguments: tool_arguments,
-                        },
-                    }],
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                }],
             }],
         });
 
-        assert_eq!(
-            normalize_interrupted_session_tool_history(&store, &session_id, &thread_id, None,),
-            Ok(1)
-        );
-        let history = store.thread_message_history(&thread_id);
+        let history = store
+            .thread_context_snapshot(&thread_id)
+            .unwrap()
+            .messages()
+            .to_vec();
         assert_eq!(
             history
                 .iter()
@@ -5631,9 +5538,24 @@ mod tests {
                 && content.contains(r#""execution":"unknown""#)
         }));
         assert_eq!(
-            normalize_interrupted_session_tool_history(&store, &session_id, &thread_id, None,),
-            Ok(0),
-            "重复进入下一轮不得再次插入中断结果"
+            store
+                .thread_context_snapshot(&thread_id)
+                .unwrap()
+                .messages(),
+            history,
+            "重复读取不得再次插入中断结果"
+        );
+
+        // 没有 canonical 证据时不推测工具执行结果。
+        let mut empty = store.export_state();
+        empty.canonical_turns.clear();
+        let empty = SessionStore::from_state_for_test(empty);
+        assert!(
+            empty
+                .thread_context_snapshot(&thread_id)
+                .unwrap()
+                .messages()
+                .is_empty()
         );
     }
 
@@ -5643,7 +5565,7 @@ mod tests {
         let thread_id = magi_core::ThreadId::new("thread-awaiting-approval-history");
         let tool_call_id = "call-interrupted-shell".to_string();
         let tool_arguments = r#"{"command":"rm -rf build"}"#.to_string();
-        let store = SessionStore::from_state(SessionStoreState {
+        let store = SessionStore::from_state_for_test(SessionStoreState {
             inputs: Vec::new(),
             current_session_id: Some(session_id.clone()),
             sessions: vec![SessionRecord {
@@ -5719,30 +5641,14 @@ mod tests {
                 last_used_at: ts(1_100),
                 observed_context_window_tokens: None,
                 handled_task_ids: Vec::new(),
-                message_history: vec![ThreadChatMessage {
-                    input_request_id: None,
-                    role: "assistant".to_string(),
-                    content: None,
-                    images: Vec::new(),
-                    tool_calls: vec![ThreadChatToolCall {
-                        id: tool_call_id,
-                        kind: "function".to_string(),
-                        function: ThreadChatToolFunction {
-                            name: "shell".to_string(),
-                            arguments: tool_arguments.clone(),
-                        },
-                    }],
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                }],
             }],
         });
 
-        assert_eq!(
-            normalize_interrupted_session_tool_history(&store, &session_id, &thread_id, None,),
-            Ok(1)
-        );
-        let history = store.thread_message_history(&thread_id);
+        let history = store
+            .thread_context_snapshot(&thread_id)
+            .unwrap()
+            .messages()
+            .to_vec();
         assert_eq!(
             history
                 .iter()
@@ -5781,7 +5687,7 @@ mod tests {
     fn session_turn_messages_keep_user_stopped_turn_with_interruption_marker() {
         let session_id = SessionId::new("session-context-history-cancelled");
         let thread_id = magi_core::ThreadId::new("thread-context-history-cancelled");
-        let store = SessionStore::from_state(SessionStoreState {
+        let store = SessionStore::from_state_for_test(SessionStoreState {
             inputs: Vec::new(),
             current_session_id: Some(session_id.clone()),
             sessions: vec![SessionRecord {
@@ -5845,7 +5751,6 @@ mod tests {
                 last_used_at: ts(1_100),
                 observed_context_window_tokens: None,
                 handled_task_ids: Vec::new(),
-                message_history: Vec::new(),
             }],
         });
         let coordinator = SessionTurnCoordinator::new();
@@ -5879,7 +5784,7 @@ mod tests {
             command: None,
         };
 
-        let history = canonical_session_turn_history(&store, &request);
+        let history = projected_test_history(&store, &request);
         let messages =
             build_session_turn_messages(&store, &request, &request.prompt, None, &history);
         let contents = messages
@@ -5967,7 +5872,7 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        let store = SessionStore::from_state(SessionStoreState {
+        let store = SessionStore::from_state_for_test(SessionStoreState {
             inputs: Vec::new(),
             current_session_id: Some(session_id.clone()),
             sessions: vec![SessionRecord {
@@ -6000,7 +5905,6 @@ mod tests {
                 last_used_at: ts(1_700),
                 observed_context_window_tokens: None,
                 handled_task_ids: Vec::new(),
-                message_history: Vec::new(),
             }],
         });
         let coordinator = SessionTurnCoordinator::new();
@@ -6034,7 +5938,7 @@ mod tests {
             command: None,
         };
 
-        let history = canonical_session_turn_history(&store, &request);
+        let history = projected_test_history(&store, &request);
         let messages =
             build_session_turn_messages(&store, &request, &request.prompt, None, &history);
 
@@ -6074,7 +5978,7 @@ mod tests {
             command: None,
         };
 
-        let history = canonical_session_turn_history(&store, &request);
+        let history = projected_test_history(&store, &request);
         let messages =
             build_session_turn_messages(&store, &request, &request.prompt, None, &history);
         let reference_context = messages
@@ -6120,7 +6024,7 @@ mod tests {
             &request,
             &request.prompt,
             Some("[reference:knowledge:adr] 单一事实源\n只读投影来自事件事实。"),
-            &canonical_session_turn_history(&store, &request),
+            &projected_test_history(&store, &request),
         );
 
         let knowledge = messages
@@ -6188,7 +6092,7 @@ mod tests {
             command: None,
         };
 
-        let history = canonical_session_turn_history(&store, &request);
+        let history = projected_test_history(&store, &request);
         let messages =
             build_session_turn_messages(&store, &request, &request.prompt, None, &history);
         let current_user_message = messages.last().expect("current user message");
@@ -6238,7 +6142,7 @@ mod tests {
             command: None,
         };
 
-        let history = canonical_session_turn_history(&store, &request);
+        let history = projected_test_history(&store, &request);
         let messages =
             build_session_turn_messages(&store, &request, &request.prompt, None, &history);
 
@@ -6311,7 +6215,7 @@ mod tests {
             orchestrator_thread_id.clone(),
         );
         pre_tool_stream.timeline_entry_id = Some("turn-item-assistant-stream-main".to_string());
-        append_session_turn_item_for_turn(
+        upsert_session_turn_item_for_turn(
             &store,
             &session_id,
             Some(&request.turn_id),
@@ -6327,7 +6231,7 @@ mod tests {
             Some("turn-item-assistant-stream-post-tool".to_string()),
             orchestrator_thread_id.clone(),
         );
-        append_session_turn_item_for_turn(
+        upsert_session_turn_item_for_turn(
             &store,
             &session_id,
             Some(&request.turn_id),
@@ -6613,7 +6517,7 @@ mod tests {
             tool_call_id: None,
             provider_context: Vec::new(),
         }));
-        store.append_thread_messages(&thread_id, history, ts(2));
+        let store = crate::test_history::with_messages(&store, &thread_id, history, ts(2));
         let coordinator = SessionTurnCoordinator::new();
         seed_conversation_turn(
             &store,
@@ -6649,6 +6553,10 @@ mod tests {
         };
         let mut messages = Vec::new();
         let rebuilt = rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
+            mode: ContextCompactionMode::Recovery,
+            identity_prompt: None,
+            safety_gate: None,
+            history_generation: &mut 0,
             client: &client,
             event_bus: &InMemoryEventBus::new(16),
             session_store: &store,
@@ -6704,7 +6612,8 @@ mod tests {
         let (_, thread_id) = store.ensure_session_mission(&session_id, ts(1), || {
             magi_core::MissionId::new("mission-context-compaction-failure")
         });
-        store.append_thread_messages(
+        let store = crate::test_history::with_messages(
+            &store,
             &thread_id,
             (0..32)
                 .map(|index| ThreadChatMessage {
@@ -6756,6 +6665,10 @@ mod tests {
         let mut messages = Vec::new();
 
         let result = rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
+            mode: ContextCompactionMode::Recovery,
+            identity_prompt: None,
+            safety_gate: None,
+            history_generation: &mut 0,
             client: &client,
             event_bus: &event_bus,
             session_store: &store,
@@ -6807,7 +6720,8 @@ mod tests {
         let (_, thread_id) = store.ensure_session_mission(&session_id, ts(1), || {
             magi_core::MissionId::new("mission-context-compaction-cancelled")
         });
-        store.append_thread_messages(
+        let store = Arc::new(crate::test_history::with_messages(
+            &store,
             &thread_id,
             (0..32)
                 .map(|index| ThreadChatMessage {
@@ -6821,7 +6735,7 @@ mod tests {
                 })
                 .collect(),
             ts(2),
-        );
+        ));
         let coordinator = SessionTurnCoordinator::new();
         seed_conversation_turn(
             store.as_ref(),
@@ -6860,6 +6774,10 @@ mod tests {
         let mut messages = Vec::new();
 
         let result = rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
+            mode: ContextCompactionMode::Recovery,
+            identity_prompt: None,
+            safety_gate: None,
+            history_generation: &mut 0,
             client: &client,
             event_bus: &event_bus,
             session_store: &store,

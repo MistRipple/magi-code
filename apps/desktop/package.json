@@ -13,8 +13,7 @@
     "check": "node scripts/check.mjs && tsc --noEmit -p tsconfig.json",
     "test": "node --import tsx --test src/**/*.test.ts",
     "dev": "node scripts/dev.mjs",
-    "package": "node scripts/package.mjs",
-    "bridge:preflight": "node scripts/bridge-preflight.mjs"
+    "package": "node scripts/package.mjs"
   },
   "devDependencies": {
     "@electron-internal/extract-zip": "1.0.6",

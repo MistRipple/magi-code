@@ -3,7 +3,7 @@
 //   node scripts/compat/cli.mjs inspect <上游插件目录> [--kind dsh] [--require llm,tools] [--json]
 //   node scripts/compat/cli.mjs prepare dsh <上游目录> --out <包目录> --integrity <sha512-…> [--archive <zip>]   （daemon 在安装期调用）
 import { renderText } from './core/report.mjs';
-import { createRegistry } from './index.mjs';
+import { createDshTranslator } from './dsh/translator.mjs';
 import { registryOptions } from './core/registry-options.mjs';
 
 // daemon 独占的管道关闭即结束工具链；崩溃时也不能留下联网重试的孤儿进程。
@@ -68,11 +68,12 @@ if (command !== 'inspect' || !directory) {
   console.error('用法: node scripts/compat/cli.mjs inspect <目录> [--kind dsh] [--require llm,tools] [--json]\n      node scripts/compat/cli.mjs prepare dsh <上游目录> --out <包目录> --integrity <sha512-…>');
   process.exit(2);
 }
-const registry = createRegistry();
 const kind = flag('kind');
 const required = flag('require')?.split(',').filter(Boolean);
 try {
-  const translator = kind ? registry.create(kind, { required }) : await registry.detect(directory, { required });
+  if (kind && kind !== 'dsh') throw new Error('当前仅支持 DSH 原包检查与安装');
+  const translator = createDshTranslator({ required });
+  if (!await translator.detect(directory)) throw new Error('无法识别为 DSH 插件');
   const report = await translator.inspect(directory, { required });
   await writeOutput((flags.includes('--json') ? JSON.stringify(report, null, 2) : renderText(report)) + '\n');
   process.exit(report.verdict.blocked.length === 0 ? 0 : 1);

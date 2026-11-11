@@ -1324,3 +1324,85 @@ fn retired_builtin_is_removed_on_reopen_without_erasing_resources() {
             .is_err()
     );
 }
+
+#[test]
+fn translated_message_replacement_is_blocked_on_activation_and_restart_but_native_views_remain() {
+    for translated in [false, true] {
+        let mut manifest = json!({
+            "sdkVersion":2,"id":"acme.messages","version":"1.0.0","name":"Messages","description":"",
+            "extension":{"hooks":[]},
+            "permissions":[{"kind":"extension","targets":["full-trust"]},{"kind":"sessionRead","targets":["render"]}],
+            "dataSchemaVersion":1,"settingsSchema":{"type":"object"},
+            "contributions":{"views":[{"id":"messages","title":"Messages","entry":"ui/messages.html","placements":["chatAssistant"]}]}
+        });
+        if translated {
+            manifest["extension"]["compat"] = json!({"kind":"dsh"});
+        }
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in [
+            ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
+            ("extension/index.mjs", b"export default () => {};".to_vec()),
+            (
+                "ui/messages.html",
+                b"<p>Original business view</p>".to_vec(),
+            ),
+        ] {
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        let package = PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap();
+        let root = tempdir().unwrap();
+        let mut manager = PluginManager::open(root.path()).unwrap();
+        let id = "acme.messages";
+        manager.install(&package, local("original.zip")).unwrap();
+        manager.enable(id).unwrap();
+        manager
+            .authorize(id, package.manifest().permissions.clone())
+            .unwrap();
+        PluginResourceStore::open(root.path().join("resources.json"))
+            .unwrap()
+            .write(id, "__settings", 0, json!({"retained":true}))
+            .unwrap();
+        if translated {
+            let before = manager.state().clone();
+            assert!(
+                manager
+                    .activate(id)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("PLUGIN_UI_BOUNDARY_CONFLICT")
+            );
+            assert_eq!(manager.state(), &before, "失败激活不能修改安装或授权");
+            // 模拟前一版留下的激活事实，重启读取原归档而非重写页面或授权。
+            let mut state = serde_json::to_value(manager.state()).unwrap();
+            state["plugins"][id]["active"] = json!(true);
+            std::fs::write(
+                root.path().join("state.json"),
+                serde_json::to_vec(&state).unwrap(),
+            )
+            .unwrap();
+        } else {
+            manager.activate(id).unwrap();
+        }
+        drop(manager);
+        let manager = PluginManager::open(root.path()).unwrap();
+        assert_eq!(manager.is_active(id).unwrap(), !translated);
+        assert_eq!(manager.ensure_host_supported(id).is_ok(), !translated);
+        assert_eq!(manager.manifests().unwrap().len(), usize::from(!translated));
+        assert_eq!(manager.package(id).unwrap().digest(), package.digest());
+        assert_eq!(
+            PluginResourceStore::open(root.path().join("resources.json"))
+                .unwrap()
+                .read(id, "__settings")
+                .unwrap()
+                .value,
+            json!({"retained":true})
+        );
+        assert_eq!(
+            manager.state().plugins[id].grants,
+            package.manifest().permissions
+        );
+    }
+}

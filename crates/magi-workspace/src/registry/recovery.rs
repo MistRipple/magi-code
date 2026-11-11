@@ -52,21 +52,6 @@ impl WorkspaceStore {
         flush_state.next_flush_hint = Some(now);
     }
 
-    pub fn register_recovery_handle(
-        &self,
-        workspace_id: WorkspaceId,
-        snapshot_id: impl Into<String>,
-        recovery_id: impl Into<String>,
-    ) -> RecoveryHandle {
-        self.prepare_recovery_entry(
-            workspace_id,
-            ExecutionOwnership::default(),
-            snapshot_id,
-            recovery_id,
-            None,
-        )
-    }
-
     pub fn prepare_recovery_entry(
         &self,
         workspace_id: WorkspaceId,
@@ -180,13 +165,6 @@ impl WorkspaceStore {
             .recovery_sidecar_store
             .recovery_handle(recovery_id)
             .map(|handle| handle.export_view())
-    }
-
-    pub fn active_recovery_handles_all(&self) -> Vec<RecoveryHandle> {
-        self.recovery_handles()
-            .into_iter()
-            .filter(|handle| !matches!(handle.status, RecoveryStatus::Consumed))
-            .collect()
     }
 
     pub fn recovery_sidecar_store_state(&self) -> WorkspaceRecoverySidecarStoreState {

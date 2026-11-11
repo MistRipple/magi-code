@@ -22,9 +22,6 @@ export type OrchestrationRuntimeStateStatus =
   | 'failed'
   | 'cancelled';
 
-export type ExecutionChainStatus = string;
-export type InterruptedReason = string;
-
 export interface OrchestrationRuntimeAssignmentSummary {
   assignmentId: string;
   workerId?: string;
@@ -41,47 +38,6 @@ export interface OrchestrationRuntimeAssignmentSummary {
   trace?: unknown;
 }
 
-export interface OrchestrationRuntimeChainSummary {
-  chainId: string;
-  status: ExecutionChainStatus;
-  recoverable: boolean;
-  attempt?: number;
-  createdAt: number;
-  updatedAt: number;
-  interruptedReason?: InterruptedReason;
-}
-
-export interface OrchestrationRuntimeScopeSummary {
-  sessionId: string;
-  requestId?: string;
-  executionGroupId?: string;
-  planId?: string;
-  batchId?: string;
-}
-
-export interface OrchestrationRuntimeExecutionGroupSummary {
-  executionGroupId: string;
-  title: string;
-  status: string;
-  phase: string;
-  deliveryStatus: string;
-  updatedAt: number;
-  failureReason?: string;
-}
-
-export interface OrchestrationRuntimePlanSummary {
-  planId: string;
-  status: string;
-  mode: string;
-  revision: number;
-  version: number;
-  updatedAt: number;
-  acceptanceSummary: unknown;
-  waitState: string;
-  replanState: string;
-  terminationReason?: string;
-}
-
 export interface OrchestrationRuntimeTimelineEntry {
   eventId: string;
   seq: number;
@@ -95,102 +51,18 @@ export interface OrchestrationRuntimeTimelineEntry {
   trace?: unknown;
 }
 
-export interface OrchestrationRuntimeStateDiffEntry {
-  eventId: string;
-  timestamp: number;
-  entityType: string;
-  entityId: string;
-  changedKeys: string[];
-  beforeSummary?: string;
-  afterSummary?: string;
-}
-
 export interface OrchestrationRuntimeRecoverySummary {
   continuationPolicy?: string;
   continuationReason?: string;
-  waitState?: string;
-  waitReasonCode?: string;
-  replanState?: string;
-  replanReason?: string;
-  terminationReason?: string;
-  acceptanceSummary?: unknown;
-  reviewState?: string;
   latestRecoveryAt?: number;
-  snapshotStorage?: 'head_commit' | 'ghost_commit';
-  snapshotRef?: string;
-  snapshotBaseRef?: string;
-  snapshotDirtyFileCount?: number;
-  snapshotPendingChangeCount?: number;
-  restoredWorkerBranchCount?: number;
-  restoredWorkerSessionCount?: number;
   pendingTaskCount?: number;
   runningTaskCount?: number;
   completedTaskCount?: number;
-  cancelledTaskCount?: number;
-}
-
-export interface OrchestrationRuntimeGovernanceView {
-  mode: string;
-  phase: string;
-  dispatchAllowed: boolean;
-  phaseReason: string;
-  reviewState: string;
-  verificationSummary: string;
-  waitState: string;
-  replanState: string;
-  approvalAction: string;
-  approvalReason: string;
-  blockedAssignments: number;
-  awaitingApprovalAssignments: number;
-  reviewRequiredAssignments: number;
 }
 
 export interface OrchestrationRuntimeOpsView {
-  scope: OrchestrationRuntimeScopeSummary;
-  timelinePath: string;
-  eventCount: number;
-  diffCount: number;
-  executionGroup?: OrchestrationRuntimeExecutionGroupSummary;
-  plan?: OrchestrationRuntimePlanSummary;
   recentTimeline: OrchestrationRuntimeTimelineEntry[];
-  recentStateDiffs: OrchestrationRuntimeStateDiffEntry[];
   recovery?: OrchestrationRuntimeRecoverySummary;
-  governance?: OrchestrationRuntimeGovernanceView;
-  projectInstructions?: unknown;
-  knowledgeSnapshot?: unknown;
-  knowledgeAudit?: OrchestrationRuntimeKnowledgeAuditView;
-  evidenceLedger?: unknown;
-}
-
-export type OrchestrationRuntimeKnowledgeDecision =
-  | 'not_needed'
-  | 'missing_workspace'
-  | 'queried_no_match'
-  | 'matched_not_injected'
-  | 'injected';
-
-export interface OrchestrationRuntimeKnowledgeAuditEntry {
-  timestamp: number;
-  consumer: string;
-  decision?: OrchestrationRuntimeKnowledgeDecision;
-  status?: string;
-  failureReason?: string;
-  candidateCount?: number;
-  insertedCount?: number;
-  knowledgeIds: string[];
-  resultKinds: string[];
-  matchedCount: number;
-  injectedCount: number;
-  injectedChars: number;
-  truncated: boolean;
-  purpose: string;
-  resultKind: string;
-  referenceCount: number;
-}
-
-export interface OrchestrationRuntimeKnowledgeAuditView {
-  eventCount: number;
-  recentEntries: OrchestrationRuntimeKnowledgeAuditEntry[];
 }
 
 // --- 从 types.ts 内联 UIProcessingState ---
@@ -449,57 +321,8 @@ export interface ModelStatus {
 // 模型状态映射
 export type ModelStatusMap = Record<string, ModelStatus>;
 
-// Wave 执行状态（提案 4.6）
-export interface WaveState {
-  /** 当前 Wave 索引 */
-  currentWave: number;
-  /** 总 Wave 数 */
-  totalWaves: number;
-  /** 每个 Wave 的任务 ID */
-  waves: string[][];
-  /** 关键路径 */
-  criticalPath: string[];
-  /** Wave 执行状态 */
-  status: 'idle' | 'executing' | 'completed';
-}
-
-export interface OrchestratorRuntimeDecisionGateState {
-  noProgressStreak: number;
-  externalWaitBreachStreak: number;
-  consecutiveUpstreamModelErrors: number;
-}
-
-export interface OrchestratorRuntimeDecisionTraceEntry {
-  round: number;
-  phase: 'no_tool' | 'tool' | 'handoff' | 'finalize';
-  action: 'continue' | 'continue_with_prompt' | 'terminate' | 'handoff' | 'fallback';
-  requiredTotal: number;
-  reason?: string;
-  candidates?: string[];
-  gateState?: OrchestratorRuntimeDecisionGateState;
-  note?: string;
-  timestamp: number;
-}
-
 export interface OrchestratorRuntimeSnapshot {
-  progressVector?: {
-    terminalRequiredTaskCount?: number;
-    acceptedCriteria?: number;
-    criticalPathResolved?: number;
-    unresolvedBlockers?: number;
-  };
-  reviewState?: {
-    accepted?: number;
-    total?: number;
-  };
-  blockerState?: {
-    open?: number;
-    score?: number;
-    externalWaitOpen?: number;
-    maxExternalWaitAgeMs?: number;
-  };
   budgetState?: {
-    elapsedMs?: number;
     tokenUsed?: number;
     projectedRequestTokens?: number;
     providerContextTokens?: number;
@@ -513,7 +336,6 @@ export interface OrchestratorRuntimeSnapshot {
     responseReserveTokens?: number;
     recoveryBufferTokens?: number;
     contextBreakdown?: ContextUsageBreakdown;
-    errorRate?: number;
     lastCompactionAt?: number;
     lastCompactionReason?: string;
     originalTokenEstimate?: number;
@@ -529,43 +351,21 @@ export interface OrchestratorRuntimeSnapshot {
     callId?: string;
     resolvedModel?: string;
   };
-  cacheState?: {
-    mode?: 'disabled' | 'unsupported' | 'cache_control' | 'cache_editing';
-    health?: 'unknown' | 'healthy' | 'cooling' | 'cold' | 'degraded';
-    cacheReadTokens?: number;
-    cacheWriteTokens?: number;
-    cacheReadRatio?: number;
-    baselineCacheReadTokens?: number;
-    suspectedBreak?: boolean;
-    lastBreakReason?: 'cache_read_miss' | 'cache_read_drop' | 'idle_expired';
-    lastResetAt?: number;
-    lastResetReason?: 'micro_compaction' | 'idle_micro_compaction' | 'manual_compaction' | 'session_reset';
-    lastObservedAt?: number;
-  };
-  requiredTotal?: number;
-  failedRequired?: number;
-  runningOrPendingRequired?: number;
-  sourceEventIds?: string[];
 }
 
 export interface OrchestratorRuntimeState {
   sessionId?: string;
-  requestId?: string;
-  chain?: OrchestrationRuntimeChainSummary;
+  /** 当前 canonical 主线身份；恢复资格和轮次诊断不得跨 Turn 继承。 */
+  turnId?: string;
   status: OrchestrationRuntimeStateStatus;
   phase: string;
-  statusReason?: string;
   /** daemon 判定的停止后继续方式；缺省即现在不可继续。 */
   continuation?: SessionContinuation;
-  runtimeReason?: string;
-  failureReason?: string;
-  errors: string[];
   startedAt?: number;
   statusChangedAt: number;
   lastEventAt: number;
   endedAt?: number;
   runtimeSnapshot?: OrchestratorRuntimeSnapshot | null;
-  runtimeDecisionTrace?: OrchestratorRuntimeDecisionTraceEntry[];
   assignments: OrchestrationRuntimeAssignmentSummary[];
   opsView?: OrchestrationRuntimeOpsView | null;
 }
@@ -750,16 +550,6 @@ export interface QueuedMessageContextReference {
   path: string;
   pathRef?: string;
   name: string;
-}
-
-export interface QueuedMessageBrowserAnnotationReference {
-  annotationId: string;
-  browserSessionId: string;
-  tabId: string;
-  sequence?: number;
-  kind: 'element' | 'region';
-  comment: string;
-  screenshotArtifactId?: string | null;
 }
 
 export type QueuedMessageBrowserNodeSelection = MessageBrowserNodeSelection;

@@ -28,7 +28,6 @@
   import {
     RUNTIME_CONNECTION_EVENT,
     BROWSER_AUTHORITY_CHANGED_EVENT,
-    isWebAgentMode,
     type AgentConnectionEventDetail,
   } from './web/agent-api';
   import { synchronizeBrowserAuthority } from './web/browser-authority-coordinator';
@@ -61,7 +60,6 @@
       ? (messagesState.currentTopTab as string)
       : 'thread'
   );
-  const isWebMode = isWebAgentMode();
   const currentSessionTitle = $derived(resolveCurrentSessionTitle({
     sessionId: messagesState.currentSessionId,
     workspaceId: messagesState.currentWorkspaceId,
@@ -284,8 +282,7 @@
     const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
     const changesVisible = currentTopTab === 'edits';
     if (
-      !isWebMode
-      || messagesState.sessionHydrating
+      messagesState.sessionHydrating
       || !isPersistedSessionId(sessionId)
       || (!workspaceId && !workspacePath)
     ) {

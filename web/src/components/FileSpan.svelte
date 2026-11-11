@@ -60,6 +60,7 @@
 
 {#if clickable}
   <button 
+    type="button"
     class="filespan" 
     class:clickable
     use:desktopContextMenu={{ kind: 'file', filePath: filepath, open: openFile, fileScope: filePreviewScope }}

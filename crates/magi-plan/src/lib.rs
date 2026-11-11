@@ -15,7 +15,6 @@ use std::{
     sync::Arc,
 };
 
-const DEFAULT_PLAN_LANGUAGE: &str = "zh-CN";
 const MAX_PLAN_ITEMS: usize = 12;
 const MAX_PLAN_TITLE_CHARS: usize = 120;
 
@@ -52,11 +51,6 @@ impl PlanStore {
 
     pub fn is_empty(&self) -> bool {
         self.snapshot().is_none_or(|plan| plan.items.is_empty())
-    }
-
-    pub fn has_item(&self, item_id: &PlanItemId) -> bool {
-        self.snapshot()
-            .is_some_and(|plan| plan.items.iter().any(|item| &item.item_id == item_id))
     }
 
     pub fn update(&self, input: UpdatePlanInput) -> Result<SessionPlan, PlanUpdateError> {
@@ -881,25 +875,6 @@ pub fn plan_event_type(plan: &SessionPlan) -> &'static str {
     }
 }
 
-pub fn execute_session_update_plan_tool(
-    event_bus: &InMemoryEventBus,
-    plan_store: &PlanStore,
-    session_id: &SessionId,
-    workspace_id: Option<&WorkspaceId>,
-    mission_id: &magi_core::MissionId,
-    arguments: &str,
-) -> (String, magi_core::ExecutionResultStatus) {
-    execute_update_plan_tool(
-        event_bus,
-        plan_store,
-        session_id,
-        workspace_id,
-        None,
-        Some(mission_id),
-        arguments,
-    )
-}
-
 pub fn publish_plan_event(
     event_bus: &InMemoryEventBus,
     event_type: &str,
@@ -951,10 +926,6 @@ pub fn publish_plan_cleared_event(
             ..EventContext::default()
         }),
     );
-}
-
-pub fn default_language() -> &'static str {
-    DEFAULT_PLAN_LANGUAGE
 }
 
 #[cfg(test)]

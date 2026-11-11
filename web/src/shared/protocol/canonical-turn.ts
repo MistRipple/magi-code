@@ -695,3 +695,8 @@ export function validateCanonicalTurnItemUpdate(
 
   return null;
 }
+
+/** 主线状态仅来自主线 Turn；独立 Agent Turn 保留在其原执行视图中。 */
+export function isMainlineCanonicalTurn(turn: CanonicalTurn): boolean {
+  return turn.metadata?.agentExecution == null;
+}

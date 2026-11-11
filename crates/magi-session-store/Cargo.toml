@@ -3,9 +3,13 @@ name = "magi-session-store"
 version.workspace = true
 edition.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 getrandom.workspace = true
 magi-app-server-protocol = { path = "../magi-app-server-protocol" }
 magi-core = { path = "../magi-core" }

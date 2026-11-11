@@ -362,10 +362,7 @@ impl SessionStore {
                     let source_root = sidecar
                         .and_then(|sidecar| sidecar.active_execution_chain.as_ref())
                         .filter(|chain| {
-                            chain
-                                .current_turn
-                                .as_ref()
-                                .is_some_and(|current| current.turn_id == interruption.turn_id)
+                            chain.current_turn_id.as_deref() == Some(interruption.turn_id.as_str())
                         })
                         .map(|chain| &chain.root_task_id);
                     if input.state != SessionInputState::Pending
@@ -373,8 +370,8 @@ impl SessionStore {
                         || turn.status.is_terminal()
                         || turn.completed_at.is_some()
                         || sidecar
-                            .and_then(|sidecar| sidecar.current_turn.as_ref())
-                            .is_none_or(|current| current.turn_id != interruption.turn_id)
+                            .and_then(|sidecar| sidecar.current_turn_id.as_deref())
+                            .is_none_or(|current| current != interruption.turn_id)
                         || source_root != interruption.root_task_id.as_ref()
                         || state.inputs.iter().any(|candidate| {
                             candidate.session_id == input.session_id

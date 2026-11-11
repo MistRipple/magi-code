@@ -4,13 +4,11 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { join, resolve, relative, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
 import { load, dump } from 'js-yaml';
 import { createPluginManager } from './plugin-manager.mjs';
 import { pluginLifecycle } from './plugin-directory.mjs';
 import { dshBundle as bundle } from './plugin-source.mjs';
-import { createProfileProcesses, profilePackageCommand } from './profile-process-host.mjs';
+import { createProfileProcesses, packageManagerScript, profilePackageArgs, profilePackageCommand } from './profile-process-host.mjs';
 import { readFileSync, statSync, readdirSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { unzipSync } from 'fflate';
@@ -329,9 +327,9 @@ async function commit(scope) {
     if (matches.length !== 1 || row.name !== undefined && row.name !== matches[0].name) throw error('EINVAL', 'loader 提案必须指向唯一的当前已安装插件');
     pending.set(matches[0].plugin.manifest.id, { disabled: row.disabled, reason: row.comment });
   }
-  // 删除有来源的停用项表示撤销该停用。daemon 在提交时再次比较来源和摘要，
-  // 用户已手动停用或其他管理器接管后，旧页面不能将它重新启用。
-  for (const [id, item] of byId) if (item.plugin.disabledBy && !pending.has(id)) {
+  // 删除快照中的停用项表示恢复启用，不依赖可选的停用说明。
+  // daemon 提交时继续核对预期状态、停用来源及摘要。
+  for (const [id, item] of byId) if (!item.plugin.enabled && !pending.has(id)) {
     pending.set(id, { disabled: false });
   }
   for (const [id, { disabled, reason }] of pending) {
@@ -469,38 +467,27 @@ export function profileSpawn(file, args = [], options) {
     if (child) return child;
   }
   if (!host || !packageCommand && !/^(dsh|dsh\.cmd)$/.test(basename(String(file)))) return;
-  const child = new EventEmitter(); child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough(); child.pid = undefined;
-  const controller = new AbortController(); child.kill = () => { controller.abort(); return true; };
-  queueMicrotask(async () => {
-    let code = 1;
+  let command = packageCommand;
+  if (!command) {
     try {
-      const scope = state(); scope.signal?.throwIfAborted();
-      if (packageCommand?.error) throw packageCommand.error;
-      let verb, spec;
-      if (packageCommand) ({ action: verb, spec } = packageCommand);
-      else {
-        const argv = args.map(String);
-        if (argv[0] !== 'plugin') throw new Error('仅翻译 dsh plugin 管理命令');
-        const p = argv.indexOf('--profile');
-        if (p >= 0) { if (argv[p + 1] !== 'magi') throw new Error('不能操作其他 DSH profile'); argv.splice(p, 2); }
-        const [_, action, target, ...rest] = argv;
-        if (rest.length || !target || !['add', 'remove'].includes(action)) throw new Error('DSH 管理命令参数不受支持');
-        verb = action; spec = target;
-      }
-      controller.signal.throwIfAborted();
-      const manager = createPluginManager(host.api, host.registry, controller.signal);
-      const requestId = crypto.randomUUID();
-      const cancel = () => { if (verb === 'add') void manager.cancelInstall(requestId).catch(() => {}); };
-      controller.signal.addEventListener('abort', cancel, { once: true });
-      scope.signal?.addEventListener('abort', cancel, { once: true });
-      let result;
-      try { result = verb === 'add' ? await manager.installBundle(spec, { enabled: true, requestId }) : await manager.removeBundle(spec); }
-      finally { controller.signal.removeEventListener('abort', cancel); scope.signal?.removeEventListener('abort', cancel); }
-      if (result.application !== 'applied') throw new Error(result.error?.message ?? `插件管理结果：${result.application}`);
-      child.stdout.end('Magi daemon 已提交插件管理操作\n'); code = 0;
-    } catch (cause) { child.stderr.end(String(cause.message ?? cause)); }
-    finally { child.stdout.end(); child.stderr.end(); child.emit('exit', code, null); child.emit('close', code, null); }
+      const argv = args.map(String);
+      if (argv[0] !== 'plugin') throw new Error('仅翻译 dsh plugin 管理命令');
+      const p = argv.indexOf('--profile');
+      if (p >= 0) { if (argv[p + 1] !== 'magi') throw new Error('不能操作其他 DSH profile'); argv.splice(p, 2); }
+      command = profilePackageArgs(argv.slice(1));
+    } catch (error) { command = { error }; }
+  }
+  const owner = host;
+  // 管理命令复用受管辅助进程，保留真实 PID、信号和 stdio；业务仍在原调用
+  // 的 profile/恢复事务内执行，不能把子进程变成另一条安装入口。
+  const arguments_ = command.error ? [] : [command.action, command.spec, ...(command.reporter ? [`--reporter=${command.reporter}`] : [])];
+  return owner.processes.spawn(process.execPath, [packageManagerScript, ...arguments_], options, scopes.getStore()?.signal, async (signal, installBundle) => {
+    state(); signal.throwIfAborted();
+    if (command.error) throw command.error;
+    const manager = createPluginManager({ ...owner.api, plugins: { ...owner.api.plugins, installBundle } }, owner.registry, signal);
+    return command.action === 'add'
+      ? manager.installBundle(command.spec, { enabled: true, requestId: crypto.randomUUID() })
+      : manager.removeBundle(command.spec);
   });
-  return child;
 }
 

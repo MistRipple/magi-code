@@ -2590,7 +2590,7 @@ mod tests {
             .create_session_for_workspace(sid.clone(), session_id, Some(workspace_id.to_string()))
             .expect("session should create");
         if let Some(mid) = mission_id {
-            state.session_store.bind_execution_ownership(
+            state.session_store.bind_execution_ownership_for_test(
                 sid.clone(),
                 ExecutionOwnership {
                     session_id: Some(sid.clone()),

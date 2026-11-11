@@ -1265,20 +1265,16 @@ fn shell_redirection_path_accesses(
         } else {
             magi_permissions::PathAccessKind::Write
         };
-        if (kind == magi_permissions::PathAccessKind::Write && (target == "/dev/null"
-            || target.eq_ignore_ascii_case("NUL")
-            || target.eq_ignore_ascii_case("$null")))
+        if (kind == magi_permissions::PathAccessKind::Write
+            && (target == "/dev/null"
+                || target.eq_ignore_ascii_case("NUL")
+                || target.eq_ignore_ascii_case("$null")))
             || target.starts_with('&')
             || target == "-"
         {
             continue;
         }
-        push_shell_path(
-            &mut paths,
-            target,
-            kind,
-            workspace_root_path,
-        );
+        push_shell_path(&mut paths, target, kind, workspace_root_path);
     }
     paths
 }
@@ -1310,7 +1306,10 @@ fn shell_segment_words(segment: &[ShellToken]) -> Vec<&str> {
     while index < segment.len() {
         match &segment[index] {
             ShellToken::Operator(operator)
-                if matches!(operator.as_str(), ">" | ">>" | ">|" | "<" | "<<" | "&>" | "&>>") =>
+                if matches!(
+                    operator.as_str(),
+                    ">" | ">>" | ">|" | "<" | "<<" | "&>" | "&>>"
+                ) =>
             {
                 // 重定向目标由专门的路径扫描处理，不是命令参数。否则 /dev/null
                 // 会在安全输出目标检查后再次被当作普通工作区文件，或污染 cp/mv 的目标。
@@ -1746,9 +1745,16 @@ mod shell_path_parser_tests {
             "(node --version)",
             "echo \"cwd: $(pwd)\"; node --version",
         ] {
-            assert_eq!(shell_command_required_executables(command, "/bin/zsh"), vec!["node"], "{command}");
+            assert_eq!(
+                shell_command_required_executables(command, "/bin/zsh"),
+                vec!["node"],
+                "{command}"
+            );
         }
-        assert!(shell_command_required_executables("run() { node --version; }; run", "/bin/zsh").is_empty());
+        assert!(
+            shell_command_required_executables("run() { node --version; }; run", "/bin/zsh")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1756,22 +1762,59 @@ mod shell_path_parser_tests {
         use magi_permissions::PathAccessKind::{Read, Write};
         use std::path::Path;
         let root = Path::new("/workspace");
-        let paths = |command: &str| super::tool_path_access_requests(
-            "shell_exec", &serde_json::json!({"command":command, "access_mode":"read_only"}).to_string(),
-            Some(root), magi_core::AccessProfile::Restricted,
-        );
-        for command in ["printf ok > /dev/null", "node --version 2>/dev/null", "printf ok 2>&1"] {
-            assert!(paths(command).iter().all(|request| request.absolute_path == root), "{command}");
+        let paths = |command: &str| {
+            super::tool_path_access_requests(
+                "shell_exec",
+                &serde_json::json!({"command":command, "access_mode":"read_only"}).to_string(),
+                Some(root),
+                magi_core::AccessProfile::Restricted,
+            )
+        };
+        for command in [
+            "printf ok > /dev/null",
+            "node --version 2>/dev/null",
+            "printf ok 2>&1",
+        ] {
+            assert!(
+                paths(command)
+                    .iter()
+                    .all(|request| request.absolute_path == root),
+                "{command}"
+            );
         }
         // 普通路径和输入重定向仍检查权限；不能全局豁免 /dev/null 或工作区外文件。
         for command in ["cat /dev/null", "cat < /dev/null"] {
-            assert!(paths(command).iter().any(|request| request.absolute_path == Path::new("/dev/null") && request.kind == Read));
+            assert!(
+                paths(command)
+                    .iter()
+                    .any(|request| request.absolute_path == Path::new("/dev/null")
+                        && request.kind == Read)
+            );
         }
-        assert!(paths("printf ok > /outside/file").iter().any(|request| request.absolute_path == Path::new("/outside/file") && request.kind == Write));
+        assert!(
+            paths("printf ok > /outside/file")
+                .iter()
+                .any(
+                    |request| request.absolute_path == Path::new("/outside/file")
+                        && request.kind == Write
+                )
+        );
         let copy = paths("cp src.txt dst.txt > log.txt");
-        assert!(copy.iter().any(|request| request.absolute_path == root.join("src.txt") && request.kind == Read));
-        assert!(copy.iter().any(|request| request.absolute_path == root.join("dst.txt") && request.kind == Write));
-        assert!(copy.iter().any(|request| request.absolute_path == root.join("log.txt") && request.kind == Write));
+        assert!(
+            copy.iter().any(
+                |request| request.absolute_path == root.join("src.txt") && request.kind == Read
+            )
+        );
+        assert!(
+            copy.iter()
+                .any(|request| request.absolute_path == root.join("dst.txt")
+                    && request.kind == Write)
+        );
+        assert!(
+            copy.iter()
+                .any(|request| request.absolute_path == root.join("log.txt")
+                    && request.kind == Write)
+        );
     }
 
     #[test]

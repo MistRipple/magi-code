@@ -1,6 +1,6 @@
 ## 1. 目标与范围
 
-Magi 是以主对话承接意图、由 Agent 完成工作的本地工作台。主 Agent 负责理解目标、编排任务和汇总结果，子代理 Worker 在获授范围内完成探索、设计、实现、测试或评审；工具范围也包括网页、文件与外部服务。整体演进与尚未完成的生命周期改造见 [Agent 运行时演进方案](magi-agent-runtime-evolution-plan.md)。
+Magi 是以主对话承接意图、由 Agent 完成工作的本地工作台。主 Agent 负责理解目标、编排任务和汇总结果，子代理 Worker 在获授范围内完成探索、设计、实现、测试或评审；工具范围也包括网页、文件与外部服务。跨模块所有权与后续修改门槛见[运行时边界](magi-agent-runtime-evolution-plan.md)。
 
 当前能力覆盖：在保留现有子代理 Worker 体系、任务分配方式、执行生命周期和设置界面的前提下，允许用户创建、编辑、删除、导入和导出自定义角色，并保证自定义角色可以被主 Agent 识别并正常分配任务。
 
@@ -26,7 +26,7 @@ Magi 是以主对话承接意图、由 Agent 完成工作的本地工作台。�
 - `magi-agent-role` 提供 Markdown role 解析、内置角色和用户角色目录加载；daemon 的实例目录为 `<state_root>/roles`，默认状态根为 `~/.magi`。
 - `ProfessionalCapabilityRegistry` 提供角色能力注册和组合。
 - `AgentBinding` 提供角色到 Engine 的绑定，以及继承主模型的语义。
-- `magi-orchestrator` 和 `magi-worker-runtime` 提供任务分派、父子关系（TaskStore 的 `parent_task_id`）、Worker 生命周期、工具调用和结果回传。
+- `magi-orchestrator` 的 TaskStore 拥有任务、父子关系、租约和转交事实；`magi-conversation-runtime` 负责模型/工具执行与统一结果回传。
 - Agent 设置页已经具备角色列表、角色详情和代理引擎绑定界面。
 
 当前实现中，角色注册表、API、前端 registry、Engine 绑定和 spawn 校验现在使用同一份有效角色集合；用户角色的创建、编辑、删除、导入、导出和进程内刷新都进入同一闭环。
@@ -116,7 +116,7 @@ AgentRoleRegistry 有效角色集合
         ↓
 按所选角色解析 AgentBinding → Engine → 模型配置并预检
         ↓
-WorkerRuntime 执行
+Conversation Runtime 执行
         ↓
 工具、Skill、模型调用
         ↓
@@ -134,7 +134,7 @@ Worker 报告回传主 Agent
 
 角色提示和专业能力不授予额外权限，也不因为名为 explorer/reviewer 就自动形成硬只读边界。子任务默认继承父 TaskPolicy；用户访问模式、显式工具/路径约束、Skill 封闭工作流和资源范围继续收紧有效权限。Skill 的多份显式封闭限制取交集，未声明限制时继承。
 
-默认由主线直接完成工作。代理仅用于用户明确要求，或有显著并行、上下文隔离、必要独立复核价值的自包含工作包；Task/Goal、多文件和角色匹配本身不触发代理创建。角色提示不能无条件禁止已获运行时委派授权的代理，也不能自行授予委派权；获授 `allow_delegation` 后仍应先判断收益。参考项目比较和当前实现边界见 [演进方案 §2.1](magi-agent-runtime-evolution-plan.md#21-代理唤起策略复审2026-10-17)。
+默认由主线直接完成工作。代理仅用于用户明确要求，或有显著并行、上下文隔离、必要独立复核价值的自包含工作包；Task/Goal、多文件和角色匹配本身不触发代理创建。角色提示不能无条件禁止已获运行时委派授权的代理，也不能自行授予委派权；获授 `allow_delegation` 后仍应先判断收益。具体决策顺序与实现边界见[子代理唤起设计](subagent-delegation-design.md)。
 
 主线和子代理共用原生 `conversation_loop`、Step 调用记录、工具目录范围和执行预检。子代理可通过带来源身份的 `ask_user_question` 提问，并查询自己的执行目录（`git_status / git_branch_list / git_worktree_list`），不能更新主会话 Git context。共享计划/Goal/长期记忆和主分支变更仍由主线控制；主线可通过 `allow_delegation=true` 显式允许直接子代理派发自己的子任务，最多两层；该授权独立于角色的 coordinatorMode，不授予共享状态或主分支权力。产出通过 agent_apply 逐级合入直接父任务的工作树，嵌套身份也只由同一父 Agent 继续。`agent_spawn(lifetime=session/goal)` 可显式保留身份，之后用最新已完成的 `resume_task_id` 创建新 activation；角色与作用域不变，权限取当前父任务且能力不扩大。未转交子树随父 Turn 结束；显式转交给 Session/Goal 的子树由新拥有方管理，重启后从原代理详情显式继续，沿原 Task/Thread 创建新 Turn，不改变当前主线；旧输出/transcript 按来源链读取，不能冒充新执行证据。后台进程限制为本 activation 的资源，持久 Job 状态和输出与执行结束分别保存。任务预算已移除，用量只做统计。
 

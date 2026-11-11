@@ -232,21 +232,6 @@ impl WorkspaceStore {
         Ok(updated)
     }
 
-    pub fn append_snapshot(
-        &self,
-        workspace_id: WorkspaceId,
-        snapshot_id: impl Into<String>,
-        mission_id: Option<magi_core::MissionId>,
-        label: impl Into<String>,
-    ) -> SnapshotRecord {
-        let ownership = ExecutionOwnership {
-            mission_id,
-            workspace_id: Some(workspace_id.clone()),
-            ..ExecutionOwnership::default()
-        };
-        self.append_execution_snapshot(workspace_id, ownership, snapshot_id, label)
-    }
-
     pub fn append_execution_snapshot(
         &self,
         workspace_id: WorkspaceId,
@@ -264,14 +249,6 @@ impl WorkspaceStore {
         };
         self.write_state().snapshots.push(snapshot.clone());
         snapshot
-    }
-
-    pub fn resolve_snapshot(&self, snapshot_id: &str) -> Option<SnapshotRecord> {
-        self.read_state()
-            .snapshots
-            .iter()
-            .find(|snapshot| snapshot.snapshot_id == snapshot_id)
-            .cloned()
     }
 
     pub fn workspaces(&self) -> Vec<WorkspaceRecord> {

@@ -103,6 +103,7 @@ mod tests {
             messages,
             max_tokens: None,
             temperature: None,
+            stop: Vec::new(),
             tools: None,
             stream: None,
 

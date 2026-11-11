@@ -120,15 +120,6 @@ export function buildTimelinePanelMessages(
   return buildProjectionPanelView(projection, displayContext, taskId, scope).messages;
 }
 
-export function buildTimelinePanelView(
-  projection: SessionTimelineProjection,
-  displayContext: TimelineDisplayContext,
-  taskId?: string,
-  scope: TimelineRenderScope = {},
-): TimelinePanelView {
-  return buildProjectionPanelView(projection, displayContext, taskId, scope);
-}
-
 export function buildTimelineRenderItems(
   projection: SessionTimelineProjection,
   displayContext: TimelineDisplayContext,

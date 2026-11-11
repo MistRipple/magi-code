@@ -2259,7 +2259,8 @@
         "sessionRead",
         "attachments",
         "client",
-        "sessionWrite"
+        "sessionWrite",
+        "webProviders"
       ]
     },
     "PluginPermission": {
@@ -2357,7 +2358,9 @@
         "home",
         "main",
         "rightPane",
-        "homeCard"
+        "homeCard",
+        "composerLeft",
+        "chatAssistant"
       ]
     },
     "PluginViewContribution": {
@@ -2389,6 +2392,10 @@
           },
           "minItems": 1,
           "maxItems": 5
+        },
+        "priority": {
+          "type": "integer",
+          "description": "同一位置的独立视图入口按升序排列；缺省为 0，再按插件和贡献身份稳定排序，不授予原生正文替换权。"
         }
       }
     },
@@ -2683,6 +2690,10 @@
           "items": {
             "$ref": "#/$defs/PluginPermission"
           }
+        },
+        "expectedDigest": {
+          "type": "string",
+          "description": "用户操作所确认的安装摘要；提交前及排空后核对，过期请求不改变当前版本。"
         }
       }
     },
@@ -5867,6 +5878,12 @@
         "contentDurationMs"
       ],
       "properties": {
+        "responseDurationMs": {
+          "description": "从本次 HTTP 请求开始到完整响应最后一次接收的耗时，包含等待、思考及正文；旧回执缺省时未知。",
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
         "firstContentMs": {
           "type": "integer",
           "minimum": 0,
@@ -5888,7 +5905,12 @@
       "type": "object",
       "additionalProperties": false,
       "required": [],
-      "properties": {}
+      "properties": {
+        "expectedDigest": {
+          "type": "string",
+          "description": "用户操作所确认的安装摘要；提交前及排空后核对，过期请求不改变当前版本。"
+        }
+      }
     },
     "PluginJobBudget": {
       "type": "object",
@@ -7441,6 +7463,188 @@
         "accepted",
         "unknown"
       ]
+    },
+    "PluginConversationViewContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "message": {
+          "$ref": "#/$defs/PluginAssistantViewMessage"
+        }
+      }
+    },
+    "PluginAssistantViewMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "text",
+        "streaming"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "text": {
+          "type": "string"
+        },
+        "streaming": {
+          "type": "boolean"
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "PluginViewAdmissionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "expectedDigest",
+        "entry",
+        "placement"
+      ],
+      "properties": {
+        "expectedDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "entry": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "placement": {
+          "$ref": "#/$defs/PluginViewPlacement"
+        }
+      }
+    },
+    "PluginWebKind": {
+      "type": "string",
+      "enum": [
+        "search",
+        "fetch"
+      ]
+    },
+    "PluginWebBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pluginId",
+        "contributionId",
+        "providerId"
+      ],
+      "properties": {
+        "pluginId": {
+          "type": "string",
+          "maxLength": 96
+        },
+        "contributionId": {
+          "type": "string",
+          "maxLength": 96
+        },
+        "providerId": {
+          "type": "string",
+          "maxLength": 96
+        }
+      }
+    },
+    "PluginWebConfiguration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "search",
+        "fetch"
+      ],
+      "properties": {
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "search": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/PluginWebBinding"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fetch": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/PluginWebBinding"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "PluginWebProviderChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "contributionId",
+        "providerId"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/PluginWebKind"
+        },
+        "contributionId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64
+        },
+        "providerId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 96
+        }
+      }
+    },
+    "PluginWebConfigureRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "expectedRevision",
+        "changes"
+      ],
+      "properties": {
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "changes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/PluginWebProviderChange"
+          }
+        }
+      }
     }
   }
 }

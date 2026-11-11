@@ -33,8 +33,6 @@ const provider = createServer(async (request, response) => {
   const body = JSON.parse(raw);
   requests.push(body);
   const messages = Array.isArray(body.messages) ? body.messages : [];
-  const latest = messages.filter((message) => message?.role === "user").at(-1)?.content || "";
-  const text = typeof latest === "string" ? latest : JSON.stringify(latest);
   const promptText = messages.map((message) => typeof message?.content === "string"
     ? message.content : JSON.stringify(message?.content || "")).join("\n");
   const toolResults = messages.filter((message) => message?.role === "tool");
@@ -67,13 +65,15 @@ const provider = createServer(async (request, response) => {
 
   const promptTokens = Math.max(128, messages.length * 64);
   const completionTokens = output.type === "text" ? Math.max(4, Math.ceil(output.content.length / 4)) : 12;
+  const zeroUsage = promptText.includes("ZERO_USAGE_TEST");
+  const missingUsage = promptText.includes("MISSING_USAGE_TEST") && !zeroUsage;
   const first = output.type === "tool"
     ? { tool_calls: [{ index: 0, id: output.id, type: "function", function: { name: output.name, arguments: JSON.stringify(output.args) } }] }
     : { content: output.content };
   const payload = [
     `data: ${JSON.stringify({ choices: [{ delta: first, finish_reason: null }] })}\n\n`,
     `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: output.type === "tool" ? "tool_calls" : "stop" }] })}\n\n`,
-    `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: promptTokens, prompt_tokens_details: { cached_tokens: requests.length > 1 ? Math.floor(promptTokens / 2) : 0 }, completion_tokens: completionTokens, completion_tokens_details: { reasoning_tokens: 0 } } })}\n\n`,
+    missingUsage ? "" : `data: ${JSON.stringify({ choices: [], usage: zeroUsage ? { prompt_tokens:0, completion_tokens:0 } : { prompt_tokens: promptTokens, prompt_tokens_details: { cached_tokens: requests.length > 1 ? Math.floor(promptTokens / 2) : 0 }, completion_tokens: completionTokens, completion_tokens_details: { reasoning_tokens: 0 } } })}\n\n`,
     "data: [DONE]\n\n",
   ].join("");
   response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
@@ -141,11 +141,13 @@ async function statsFor(sessionId) {
 async function openStatsAndSelect(scope, expected) {
   await waitFor(() => page.evaluate(`Boolean(document.querySelector('[data-testid="session-stats-trigger"]'))`), "统计入口");
   await page.call("Page.bringToFront").catch(() => {});
-  const rect = await page.evaluate(`(() => { const r = document.querySelector('[data-testid="session-stats-trigger"]')?.getBoundingClientRect(); return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null; })()`);
-  assert.ok(rect, "统计入口必须可见");
-  await page.call("Input.dispatchMouseEvent", { type: "mouseMoved", x: rect.x, y: rect.y });
-  await page.call("Input.dispatchMouseEvent", { type: "mousePressed", x: rect.x, y: rect.y, button: "left", clickCount: 1 });
-  await page.call("Input.dispatchMouseEvent", { type: "mouseReleased", x: rect.x, y: rect.y, button: "left", clickCount: 1 });
+  if (!await page.evaluate(`document.querySelector('[data-testid="session-stats-trigger"]')?.getAttribute('aria-expanded') === 'true'`)) {
+    const rect = await page.evaluate(`(() => { const r = document.querySelector('[data-testid="session-stats-trigger"]')?.getBoundingClientRect(); return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null; })()`);
+    assert.ok(rect, "统计入口必须可见");
+    await page.call("Input.dispatchMouseEvent", { type: "mouseMoved", x: rect.x, y: rect.y });
+    await page.call("Input.dispatchMouseEvent", { type: "mousePressed", x: rect.x, y: rect.y, button: "left", clickCount: 1 });
+    await page.call("Input.dispatchMouseEvent", { type: "mouseReleased", x: rect.x, y: rect.y, button: "left", clickCount: 1 });
+  }
   await waitFor(() => page.evaluate(`Boolean(document.querySelector('.session-stats-popover'))`), "统计面板").catch(async (error) => {
     const debug = await page.evaluate(`JSON.stringify({ button: document.querySelector('[data-testid="session-stats-trigger"]')?.outerHTML, expanded: document.querySelector('[data-testid="session-stats-trigger"]')?.getAttribute('aria-expanded'), body: document.body.innerText.slice(-500) })`);
     throw new Error(`${error.message}; ${debug}`);
@@ -218,6 +220,51 @@ try {
   assert.equal(afterRestart.status, 200);
   assert.deepEqual(afterRestart.body.totals, beforeRestart.totals, "桌面重启后统计必须保持一致");
 
+  // 真实 daemon 产生缺失与明确零用量，核对设置页两种视角及其自动刷新。
+  const api = (path, body) => page.evaluate(`fetch(${JSON.stringify(path)}, ${JSON.stringify(body === undefined ? {} : {
+    method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body),
+  })}).then(async response => { if(!response.ok) throw new Error(await response.text()); return response.json(); })`);
+  await api('/api/settings/stats/reset', {});
+  const presenceSession = (await api('/api/session/materialize', {scope:'personal'})).sessionId;
+  const runPresenceTurn = async marker => {
+    const {turnId} = await api('/api/session/turn', {scope:'personal',sessionId:presenceSession,text:marker,requestId:marker,userMessageId:marker+'-user'});
+    const result = await waitFor(async () => (await api(`/api/messages?scope=personal&sessionId=${presenceSession}`)).canonicalTurns
+      .find(turn=>turn.turnId===turnId && ['completed','failed','cancelled','blocked'].includes(turn.status)), marker);
+    assert.equal(result.status,'completed');
+    return (await statsFor(presenceSession)).body;
+  };
+  const missingStats = await runPresenceTurn('MISSING_USAGE_TEST');
+  await writeFile(evidencePath+'.missing.json',JSON.stringify({missingStats,turns:await api(`/api/messages?scope=personal&sessionId=${presenceSession}`),requests},null,2));
+  assert.equal(missingStats.totals.llmCallCount,1);
+  assert.equal(missingStats.totals.tokenObservedCallCount,0);
+  await waitFor(()=>page.evaluate(`Boolean(document.querySelector('[data-testid="sidebar-settings"]'))`),'设置入口');
+  await page.evaluate(`document.querySelector('[data-testid="sidebar-settings"]').click()`);
+  await waitFor(()=>page.evaluate(`Boolean(document.querySelector('[data-testid="settings-nav-stats"]'))`),'统计分类');
+  await page.evaluate(`document.querySelector('[data-testid="settings-nav-stats"]').click()`);
+  const settingsText = () => page.evaluate(`({
+    total:document.querySelector('.insight-cell:nth-child(2) .insight-headline')?.innerText,
+    selected:document.querySelector('.slice-kpi .kpi-value')?.innerText,
+    note:document.querySelector('.token-usage-note')?.innerText,
+    body:document.querySelector('.stats-tab-inner')?.innerText,
+  })`);
+  const missingUi = await waitFor(async()=>{
+    const value=await settingsText();
+    return /未返回|Not reported/.test(value.total) && /未返回|Not reported/.test(value.selected) && value.note.includes('0/1') && value;
+  },'缺少用量显示未知，保留真实调用数');
+  await page.evaluate(`document.querySelectorAll('.seg-toggle button')[1].click()`);
+  await waitFor(async()=>/未返回|Not reported/.test((await settingsText()).selected),'角色视角保持未知');
+  const zeroStats = await runPresenceTurn('ZERO_USAGE_TEST');
+  assert.equal(zeroStats.totals.llmCallCount,2);
+  assert.equal(zeroStats.totals.tokenObservedCallCount,1);
+  const zeroUi = await waitFor(async()=>{
+    const value=await settingsText();
+    return value.total==='0' && value.selected==='0' && value.note.includes('1/2') && value;
+  },'统计页面自动显示明确零值及部分覆盖');
+  await page.evaluate(`document.querySelectorAll('.seg-toggle button')[0].click()`);
+  await waitFor(async()=>(await settingsText()).selected==='0','模型视角保留真实零值');
+  await page.evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+  await writeFile(evidencePath+'.png',Buffer.from((await page.call('Page.captureScreenshot',{format:'png'})).data,'base64'));
+
   const evidence = {
     type: "electron_session_stats_live",
     status: "passed",
@@ -227,6 +274,7 @@ try {
     roles: { orchestrator: orchestrator.map((item) => item.llmCallCount), worker: worker.map((item) => item.llmCallCount) },
     ui: { allPanel, workerPanel },
     restartVerified: true,
+    usagePresence: {sessionId:presenceSession,missingStats,zeroStats,missingUi,zeroUi},
     note: "真实 Electron/Renderer/daemon/worker 链路；Provider 为本地受控 HTTP，仅证明统计归属和核算正确性。",
   };
   await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, "utf8");

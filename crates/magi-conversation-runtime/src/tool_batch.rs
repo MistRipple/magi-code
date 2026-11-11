@@ -1502,7 +1502,11 @@ fn execute_context_search(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(8)
         .clamp(1, 20) as usize;
-    let mut candidates = collect_context_candidates(task_store, session_store, task, session_id);
+    let mut candidates =
+        match collect_context_candidates(task_store, session_store, task, session_id) {
+            Ok(candidates) => candidates,
+            Err(error) => return context_tool_failure(tool, "context_history_unavailable", error),
+        };
     candidates.retain(|candidate| context_candidate_matches(&query, candidate));
     candidates.sort_by(|left, right| {
         context_candidate_score(&query, right)
@@ -1598,7 +1602,10 @@ fn execute_context_read(
             requested_ids.push(reference_id.to_string());
         }
     }
-    let candidates = collect_context_candidates(task_store, session_store, task, session_id);
+    let candidates = match collect_context_candidates(task_store, session_store, task, session_id) {
+        Ok(candidates) => candidates,
+        Err(error) => return context_tool_failure(tool, "context_history_unavailable", error),
+    };
     let mut results = Vec::with_capacity(requested_ids.len());
     for reference_id in &requested_ids {
         let Some(candidate) = candidates
@@ -1805,11 +1812,13 @@ pub(crate) fn context_reference_ids(
     session_store: &SessionStore,
     task: &magi_core::Task,
     session_id: &SessionId,
-) -> std::collections::HashSet<String> {
-    collect_context_candidates(task_store, session_store, task, session_id)
-        .into_iter()
-        .map(|candidate| candidate.reference_id)
-        .collect()
+) -> magi_core::DomainResult<std::collections::HashSet<String>> {
+    Ok(
+        collect_context_candidates(task_store, session_store, task, session_id)?
+            .into_iter()
+            .map(|candidate| candidate.reference_id)
+            .collect(),
+    )
 }
 
 fn collect_context_candidates(
@@ -1817,7 +1826,7 @@ fn collect_context_candidates(
     session_store: &SessionStore,
     task: &magi_core::Task,
     session_id: &SessionId,
-) -> Vec<ResolvedAgentContext> {
+) -> magi_core::DomainResult<Vec<ResolvedAgentContext>> {
     let mut candidates = session_store
         .timeline_for_session(session_id)
         .into_iter()
@@ -1843,7 +1852,11 @@ fn collect_context_candidates(
         })
         .collect::<Vec<_>>();
     let previous_activations =
-        crate::agent_activation::previous_activation_ids(task_store, task, session_id);
+        crate::agent_activation::previous_activation_tasks(task_store, task, session_id)
+            .map_err(|message| magi_core::DomainError::InvalidState { message })?
+            .into_iter()
+            .map(|task| task.task_id)
+            .collect::<Vec<_>>();
     for candidate_task in task_store.all_tasks().into_iter().filter(|candidate| {
         (candidate.root_task_id == task.root_task_id && candidate.mission_id == task.mission_id)
             || previous_activations.contains(&candidate.task_id)
@@ -1872,7 +1885,8 @@ fn collect_context_candidates(
                     continue;
                 }
                 // Thread 仍归原 activation；按引用读取的 transcript 不成为新调用授权。
-                let history = thread.message_history.iter().map(|message| serde_json::json!({
+                let snapshot = session_store.thread_context_snapshot(&thread.thread_id)?;
+                let history = snapshot.messages().iter().map(|message| serde_json::json!({
                     "role":message.role, "content":message.content, "tool_calls":message.tool_calls,
                     "tool_call_id":message.tool_call_id,
                 })).collect::<Vec<_>>();
@@ -1910,7 +1924,7 @@ fn collect_context_candidates(
             });
         }
     }
-    candidates
+    Ok(candidates)
 }
 
 fn resolve_package_reference_content(
@@ -7923,7 +7937,7 @@ mod tests {
             .unwrap()
             .current_turn
             .unwrap();
-        store.append_current_turn_item_for_turn(session,Some(&turn.turn_id),serde_json::from_value(serde_json::json!({
+        store.upsert_current_turn_item_for_turn(session,Some(&turn.turn_id),serde_json::from_value(serde_json::json!({
             "itemId":format!("test-tool-{}",call.id),"itemSeq":turn.items.len()+1,"kind":"tool_call_started","status":"running",
             "source":"orchestrator","sourceThreadId":"thread-approval-test","taskId":task.task_id,
             "toolCallId":call.id,"toolName":call.function.name,"toolArguments":call.function.arguments,
@@ -8382,7 +8396,7 @@ mod tests {
                 let restored = SessionStore::from_persisted_parts(durable, sidecars).unwrap();
                 let now = UtcMillis::now();
                 restored
-                    .upsert_active_execution_chain(
+                    .seed_execution_chain_for_test(
                         session_id.clone(),
                         magi_session_store::ActiveExecutionChain {
                             session_id: session_id.clone(),
@@ -8390,20 +8404,18 @@ mod tests {
                             root_task_id: task.task_id.clone(),
                             execution_chain_ref: "approval-recovery-chain".into(),
                             workspace_id: workspace_id.clone(),
-                            active_branch_task_ids: vec![],
-                            active_worker_bindings: vec![],
                             branches: vec![],
-                            recovery_ref: None,
                             dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
                                 accepted_at: now,
                                 entry_id: "approval-recovery-entry".into(),
                                 trimmed_text: Some("remove".into()),
                                 skill_name: None,
                             },
-                            current_turn: restored
+                            current_turn_id: (restored
                                 .runtime_sidecar(&session_id)
                                 .unwrap()
-                                .current_turn,
+                                .current_turn)
+                                .map(|turn| turn.turn_id),
                         },
                     )
                     .unwrap();
@@ -9645,6 +9657,7 @@ mod tests {
                 Some(&child.task_id),
                 &thread,
                 "partial-step",
+                0,
             )
             .with_execution_scope(scope());
             assert!(
@@ -9678,6 +9691,7 @@ mod tests {
                 Some(&child.task_id),
                 &thread,
                 "partial-step",
+                0,
             )
             .with_execution_scope(scope());
             assert!(replay.invoke(request()).is_err());
@@ -10453,6 +10467,85 @@ mod tests {
             "agent-context-assignment"
         );
         assert_eq!(signal.payload["context_revision"], 1);
+    }
+
+    #[test]
+    fn previous_agent_context_uses_canonical_history_and_rejects_broken_lineage() {
+        let tasks = TaskStore::new();
+        tasks
+            .insert_task(test_task("context-root", "context-root", None))
+            .unwrap();
+        let sessions = SessionStore::new();
+        let session = SessionId::new("canonical-agent-context");
+        sessions
+            .create_session(session.clone(), "agent context")
+            .unwrap();
+        let (_, thread) = sessions.ensure_session_mission(&session, UtcMillis(1), || {
+            magi_core::MissionId::new("context")
+        });
+        let mut prior = test_task(
+            "prior-context",
+            "context-root",
+            Some(TaskId::new("context-root")),
+        );
+        prior.status = TaskStatus::Completed;
+        let mut current = test_task(
+            "current-context",
+            "context-root",
+            Some(TaskId::new("context-root")),
+        );
+        for (task, generation, previous_task_id) in [
+            (&mut prior, 1, None),
+            (&mut current, 2, Some(TaskId::new("prior-context"))),
+        ] {
+            let mut binding = magi_core::TaskExecutorBinding::for_role("executor");
+            binding.agent_activation = Some(magi_core::AgentActivation {
+                agent_id: TaskId::new("prior-context"),
+                session_id: session.clone(),
+                lifetime: magi_core::AgentLifetime::Session,
+                generation,
+                previous_task_id,
+            });
+            task.executor_binding = Some(binding);
+        }
+        tasks.insert_task(prior.clone()).unwrap();
+        let sessions = crate::test_history::with_messages(
+            &sessions,
+            &thread,
+            serde_json::from_value(serde_json::json!([
+                {"role": "assistant", "content": "canonical prior result"},
+            ]))
+            .unwrap(),
+            UtcMillis(2),
+        );
+        let mut state = sessions.export_state();
+        state.thread_registry[0].handled_task_ids = vec![prior.task_id.clone()];
+        let sessions = SessionStore::from_state_for_test(state);
+        let candidates = collect_context_candidates(&tasks, &sessions, &current, &session).unwrap();
+        let history = candidates
+            .iter()
+            .find(|candidate| candidate.reference_id == "task:prior-context:transcript")
+            .unwrap();
+        assert!(history.content.contains("canonical prior result"));
+        current
+            .executor_binding
+            .as_mut()
+            .unwrap()
+            .agent_activation
+            .as_mut()
+            .unwrap()
+            .previous_task_id = Some(TaskId::new("missing-activation"));
+        let (payload, status) = execute_context_read(
+            &tasks,
+            &sessions,
+            &current,
+            &session,
+            BuiltinToolName::ContextRead,
+            &serde_json::json!({"reference_ids": ["task:prior-context:transcript"]}),
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        assert!(payload.contains("context_history_unavailable"));
+        assert!(payload.contains("前序 activation 缺失"));
     }
 
     #[test]
@@ -11327,7 +11420,7 @@ mod tests {
                         { "label": "全部文件", "description": "完整检查" }] }]
             }).to_string() },
         };
-        sessions.append_current_turn_item_for_turn(&session_id, Some("turn-worker-question"),
+        sessions.upsert_current_turn_item_for_turn(&session_id, Some("turn-worker-question"),
             serde_json::from_value(serde_json::json!({
                 "itemId": "question-child-item", "itemSeq": 1, "kind": "tool_call_started", "status": "running",
                 "source": "worker", "sourceThreadId": "thread-child", "taskId": child.task_id,

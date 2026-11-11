@@ -7,6 +7,10 @@ import { connectAppPage, connectTarget, pageTools, launchApp, waitFor } from './
 import { createPluginRegistryGate } from './lib/plugin-registry-gate.mjs';
 import { verifyDshUpgrader } from './lib/dsh-upgrader-acceptance.mjs';
 import { verifyDshHealth } from './lib/dsh-health-acceptance.mjs';
+import { verifyDshShare } from './lib/dsh-share-acceptance.mjs';
+import { verifyDshMarket } from './lib/dsh-market-acceptance.mjs';
+import { verifyDshAppshot } from './lib/dsh-appshot-acceptance.mjs';
+import { verifyDshManager } from './lib/dsh-manager-acceptance.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url)).replace(/\/scripts$/, '');
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
@@ -17,11 +21,11 @@ await mkdir(output, { recursive: true });
 const candidates = [
   ['dsh-plugin-health', '3.0.5'],
   ['dsh-plugin-ops-bundle', '0.20.8'],
-  ['dsh-plugin-upgrader', '1.8.0'],
+  ['dsh-plugin-upgrader', '1.8.0', '1.7.5'],
   ['dsh-plugin-debugging', '0.7.2'],
   ['dsh-plugin-appshot', '0.4.2'],
   ['dsh-plugin-share', '0.2.5'],
-  ['dsh-plugin-mgr', '0.2.12'],
+  ['dsh-plugin-mgr', '0.2.13', '0.2.12'],
   ['dsh-plugin-release-probe', '0.0.8'],
   ['@99galaxy/dsh-plugin-market', '1.2.2'],
 ];
@@ -149,11 +153,12 @@ try {
   await waitFor(async () => (await api('/health')).status === 200, 'Magi daemon', 60_000);
   page = await waitFor(() => connectAppPage(cdpPort, port, errors), 'Magi App Renderer'); ui = pageTools(page);
   const session = (await post('/api/session/materialize', { scope: 'personal' })).sessionId;
-  for (const [pkg, version] of candidates) {
-    const item = { package: pkg, version, preview: 'pending', core: 'unverified', upgrade: 'unverified' };
+  for (const [pkg, version, previousVersion] of candidates) {
+    const initialVersion = previousVersion ?? version;
+    const item = { package: pkg, version, ...(previousVersion ? { initialVersion } : {}), preview: 'pending', core: 'unverified', upgrade: 'unverified' };
     console.log(`CHECK ${pkg}@${version}`);
     try {
-      const previewResult = await api('/api/plugins/upstream/preview', { ecosystem: 'dsh', package: pkg, version });
+      const previewResult = await api('/api/plugins/upstream/preview', { ecosystem: 'dsh', package: pkg, version: initialVersion });
       if (previewResult.status !== 200) {
         item.preview = 'blocked'; throw new Error(previewResult.value?.message || previewResult.value?.error || JSON.stringify(previewResult.value));
       }
@@ -167,8 +172,8 @@ try {
         commands: preview.candidate.manifest?.contributions?.commands?.length ?? 0,
         views: preview.candidate.manifest?.contributions?.views?.length ?? 0,
       };
-      const installed = await post('/api/plugins/upstream/install', { ecosystem: 'dsh', package: pkg, version, expectedDigest: item.digest });
-      const plugin = installed.plugins.find((entry) => entry.source?.location === `dsh:${pkg}@${version}`) || installed.plugins.find((entry) => entry.source?.location?.startsWith(`dsh:${pkg}@`));
+      const installed = await post('/api/plugins/upstream/install', { ecosystem: 'dsh', package: pkg, version: initialVersion, expectedDigest: item.digest });
+      const plugin = installed.plugins.find((entry) => entry.source?.location === `dsh:${pkg}@${initialVersion}`);
       if (!plugin) throw new Error('安装响应未找到插件');
       item.id = plugin.manifest.id; item.installed = true;
       await post(`/api/plugins/${encodeURIComponent(item.id)}/enable`, {});
@@ -234,166 +239,54 @@ try {
           assert.ok(catalog.some(manifest => manifest.id === item.id && manifest.contributions.skills.some(entry => entry.id === skill.id && entry.title === pkg)));
           item.functionalChecks = { runtimeSkill: true, originalSkillBody: true, skillDiscovery: true, runtimeDiagnostics: 'unverified', restart: 'unverified' };
         }
+        if (pkg === 'dsh-plugin-appshot' && item.smoke?.ok) {
+          item.businessAttempted = true;
+          const business = await verifyDshAppshot({ request: post, origin, plugin: running, page, cdpPort, errors,
+            output, stateRoot: join(work, 'state'), liveCapture: process.env.MAGI_APPSHOT_LIVE_CAPTURE === '1',
+            restart: () => restart('before-appshot-restart.log'),
+            check: (name, ok, detail) => { assert.ok(ok, `${name}: ${JSON.stringify(detail ?? '')}`); console.log(`✓ ${name}`); },
+          });
+          page = business.page; ui = pageTools(page);
+          item.functionalChecks = business.checks;
+        }
         if (pkg === 'dsh-plugin-share' && item.smoke?.ok) {
-          const call = async (action, body) => {
-            const response = await post(`/api/plugins/${encodeURIComponent(item.id)}/routes`, { method: 'POST', path: `/api/plugin-share/${action}`, body });
-            assert.equal(response.status, 200, JSON.stringify(response)); assert.equal(response.body.ok, true, JSON.stringify(response.body));
-            return response.body;
-          };
-          const exported = await call('export', {});
-          assert.ok(exported.entries.some((entry) => entry.name === pkg && entry.version === version), '导出必须包含 daemon 中真实安装的包');
-          const parsed = await call('parse', { code: exported.code });
-          const qr = await call('qr', { code: exported.code });
-          assert.ok(parsed.preview.length && qr.modules.length);
-          let targetId;
-          try {
-            const code = (await call('export', { entries: [{ kind: 'npm', name: 'dsh-plugin-release-probe', version: '0.0.7', enabled: true }] })).code;
-            const targetQr = await call('qr', { code });
-            const scale = 5, quiet = 4, size = (targetQr.size + quiet * 2) * scale;
-            const gray = Buffer.alloc(size * size, 255);
-            for (let y = 0; y < targetQr.size; y++) for (let x = 0; x < targetQr.size; x++) {
-              if (targetQr.modules[y][x] !== '1') continue;
-              for (let dy = 0; dy < scale; dy++) gray.fill(0, ((y + quiet) * scale + dy) * size + (x + quiet) * scale,
-                ((y + quiet) * scale + dy) * size + (x + quiet + 1) * scale);
-            }
-            const scanned = await call('scan', { width: size, height: size, gray: gray.toString('base64') });
-            assert.equal(scanned.code, code, '原包必须从二维码图片识别回分享码');
-            await call('import', { code, confirm: true, requestId: 'sample-share-install' });
-            const target = await currentTarget(); assert.ok(target); targetId = target.manifest.id;
-            assert.equal(target.manifest.version, '0.0.7'); assert.equal(target.runtime.state, 'running');
-            const disabledCode = (await call('export', { entries: [{ kind: 'npm', name: 'dsh-plugin-release-probe', version: '0.0.7', enabled: false }] })).code;
-            await call('import', { code: disabledCode, confirm: true, requestId: 'sample-share-disable' });
-            assert.equal((await currentTarget()).enabled, false); assert.equal((await currentTarget()).active, false);
-            await call('import', { code, confirm: true, requestId: 'sample-share-enable' });
-            assert.equal((await currentTarget()).runtime.state, 'running');
-            const newer = (await call('export', { entries: [{ kind: 'npm', name: 'dsh-plugin-release-probe', version: '0.0.8', enabled: true }] })).code;
-            const blocked = await post(`/api/plugins/${item.id}/routes`, { method: 'POST', path: '/api/plugin-share/import', body: { code: newer, confirm: true, requestId: 'sample-share-upgrade' } });
-            assert.equal(blocked.status, 409); assert.equal(blocked.body.error, 'manual-update-required');
-            assert.equal((await currentTarget()).digest, target.digest, '上游拒绝更新不应修改当前目标');
-            item.functionalChecks = { export: true, parse: true, qr: true, scan: true, import: true, disable: true, enable: true,
-              upstreamManualUpdate: true, githubImport: 'unverified', queueRecovery: 'unverified' };
-          } finally {
-            const target = await currentTarget();
-            if (target) await removePlugin(targetId || target.manifest.id);
-          }
+          item.businessAttempted = true;
+          const business = await verifyDshShare({ request: post, plugin: running, page, cdpPort, errors,
+            inspector: () => ({ inspectPort: cdpPort + 1, pid: app.child.pid }),
+            gate: registryGate, output, stateRoot: join(work, 'state'), clipAudit,
+            restart: () => restart('before-share-restart.log'),
+            check: (name, ok, detail) => { assert.ok(ok, `${name}: ${JSON.stringify(detail ?? '')}`); console.log(`✓ ${name}`); },
+          });
+          page = business.page; ui = pageTools(page);
+          item.functionalChecks = business.checks;
+          item.upgrade = 'passed';
         }
         if (pkg === '@99galaxy/dsh-plugin-market' && item.smoke?.ok) {
-          const list = async (query) => {
-            const result = await post(`/api/plugins/${item.id}/routes`, { method: 'GET', path: '/dsh-plugin-market/list', query });
-            assert.equal(result.status, 200, JSON.stringify(result)); assert.equal(result.body.ok, true);
-            return result.body.payload;
-          };
-          const self = await list('only=installed&limit=5000');
-          item.marketInventory = self;
-          assert.ok(self.items.some(row => row.installedAs === pkg && row.installedVersion === version), `市场自己的已安装版本来自 daemon 目录：${JSON.stringify(self)}`);
-          const install = await post(`/api/plugins/${item.id}/routes`, { method: 'POST', path: '/dsh-plugin-market/install',
-            headers: { 'content-type': 'application/json' }, body: { install: 'dsh plugin add dsh-plugin-release-probe@0.0.7' } });
-          item.marketInstall = install;
-          assert.equal(install.status, 200, JSON.stringify(install));
-          const target = await currentTarget();
-          assert.equal(target?.manifest.version, '0.0.7', '市场安装必须写入 daemon 的真实安装目录');
-          assert.equal(target?.runtime?.state, 'running', '市场安装须完成已授权启用');
-          const inventory = await list('q=dsh-plugin-release-probe&only=installed');
-          assert.equal(inventory.unknownTotal, self.unknownTotal + 1, '原目录未收录的已装包按上游语义显示为版本未知');
-          const update = await post(`/api/plugins/${item.id}/routes`, { method: 'POST', path: '/dsh-plugin-market/install',
-            headers: { 'content-type': 'application/json' }, body: { install: 'dsh plugin add dsh-plugin-release-probe@0.0.8' } });
-          item.marketUpdate = update;
-          assert.equal(update.status, 200, JSON.stringify(update));
-          assert.equal((await currentTarget()).manifest.version, '0.0.8');
-          assert.equal((await currentTarget()).runtime.state, 'running');
-          const failed = await post(`/api/plugins/${item.id}/routes`, { method: 'POST', path: '/dsh-plugin-market/install',
-            headers: { 'content-type': 'application/json' }, body: { install: 'dsh plugin add dsh-plugin-release-probe@9999.0.0' } });
-          assert.equal(failed.body.ok, false, '不存在的原包版本必须向原页面报错');
-          assert.equal((await currentTarget()).manifest.version, '0.0.8');
-          assert.equal((await currentTarget()).runtime.state, 'running');
-          const reload = () => post(`/api/plugins/${item.id}/routes`, { method: 'POST', path: '/dsh-plugin-market/reload',
-            headers: { 'content-type': 'application/json' }, body: {} });
-          const beforeReload = await currentTarget();
-          item.marketReload = await reload();
-          assert.equal(item.marketReload.status, 200, JSON.stringify(item.marketReload));
-          assert.equal(item.marketReload.body.ok, true);
-          assert.deepEqual(item.marketReload.body.warnings, []);
-          assert.deepEqual(item.marketReload.body.pending, []);
-          assert.equal(item.marketReload.body.restartReason, '');
-          const afterReload = await currentTarget();
-          assert.equal(afterReload.runtime.generation, beforeReload.runtime.generation, '未变化插件继续使用原运行实例');
-          assert.equal(afterReload.digest, beforeReload.digest);
-          assert.deepEqual(afterReload.grants, beforeReload.grants);
-          await post(`/api/plugins/${target.manifest.id}/deactivate`, {});
-          await post(`/api/plugins/${target.manifest.id}/disable`, {});
-          const disabled = await reload();
-          assert.equal(disabled.status, 200, JSON.stringify(disabled));
-          assert.equal(disabled.body.ok, true);
-          assert.equal((await currentTarget()).enabled, false, 'profile 重载保留停用意图');
-          assert.equal((await currentTarget()).active, false);
-          await removePlugin(target.manifest.id);
-          await viewCheck(running, running.manifest.contributions.views[0], session, async frame => {
-            await waitFor(() => frame.evaluate('Boolean(document.querySelector(".dsxpm-input"))'), '市场原包搜索输入框');
-            await frame.evaluate(`(() => {const input=document.querySelector('.dsxpm-input');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'dsh-plugin-mgr');input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
-            await waitFor(() => frame.evaluate(`(() => {const button=[...document.querySelectorAll('button')].find(button=>button.innerText==='搜索');if(!button||button.disabled)return false;button.click();return true;})()`), '市场原包搜索操作可用后提交');
-            await waitFor(() => frame.evaluate(`Boolean([...document.querySelectorAll('.dsxpm-card')].find(card=>card.querySelector('.dsxpm-name')?.textContent==='dsh-plugin-mgr'))`), '市场原包搜索结果');
-            const managerEntry=(await list('q=dsh-plugin-mgr')).items.find(row=>row.name==='dsh-plugin-mgr');
-            assert.ok(managerEntry, '原包目录须提供待安装的管理器条目');
-            assert.match(managerEntry.install, /\badd dsh-plugin-mgr$/, '此原包入口未锁版本，应沿在线 latest 安装');
-            // 省略版本沿正式预览入口解析 registry latest；不依赖搜索索引
-            // 是否已收录该包，也不把过期的社区目录版本当成本次安装版本。
-            const expectedManager=(await post('/api/plugins/upstream/preview',{ecosystem:'dsh',package:'dsh-plugin-mgr'})).candidate;
-            const expectedManagerVersion=expectedManager.manifest.version;
-            await frame.evaluate(`[...document.querySelectorAll('.dsxpm-card')].find(card=>card.querySelector('.dsxpm-name')?.textContent==='dsh-plugin-mgr').querySelector('button').click()`);
-            const mgr = await waitFor(async () => {
-              const installed = (await api('/api/plugins')).value.plugins.find(plugin=>plugin.source.location===`dsh:dsh-plugin-mgr@${expectedManagerVersion}`);
-              return installed?.runtime?.state==='running' ? installed : false;
-            }, '原包按钮在线安装 Mgr 并运行', 180_000);
-            assert.equal(mgr.digest, expectedManager.digest, '原包未锁版本安装须与同一在线预览的内容身份一致');
-            await waitFor(() => frame.evaluate(`Boolean([...document.querySelectorAll('.dsxpm-card')].find(card=>card.querySelector('.dsxpm-name')?.textContent==='dsh-plugin-mgr')?.querySelector('.dsxpm-installed'))`), '市场原包页面显示已安装结果');
-            await writeFile(join(output,'market-installed.png'),Buffer.from(await ui.screenshot(),'base64'));
-            const updatedList = await list('only=installed&q=dsh-plugin-mgr');
-            assert.ok(updatedList.items.some(row=>row.installedAs==='dsh-plugin-mgr'&&row.installedVersion===expectedManagerVersion));
-            await frame.evaluate(`window.__magiReloadDocument='before-reload';[...document.querySelectorAll('button')].find(button=>button.innerText==='重载 profile').click()`);
-            await waitFor(() => frame.evaluate(`window.__magiReloadDocument===undefined && Boolean(document.querySelector('.dsxpm-input'))`), '原包重载完成并实际刷新文档', 30_000);
-            await frame.evaluate(`(() => {const input=document.querySelector('.dsxpm-input');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'dsh-plugin-mgr');input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
-            await frame.evaluate(`[...document.querySelectorAll('button')].find(button=>button.innerText==='搜索').click()`);
-            await waitFor(() => frame.evaluate(`Boolean([...document.querySelectorAll('.dsxpm-card')].find(card=>card.querySelector('.dsxpm-name')?.textContent==='dsh-plugin-mgr')?.querySelector('.dsxpm-installed'))`), '重载后新文档的桥和真实安装列表继续可用');
-            const currentMgr = (await api('/api/plugins')).value.plugins.find(plugin=>plugin.manifest.id===mgr.manifest.id);
-            const currentMarket = (await api('/api/plugins')).value.plugins.find(plugin=>plugin.manifest.id===item.id);
-            assert.equal(currentMgr.runtime.generation, mgr.runtime.generation);
-            assert.equal(currentMarket.runtime.generation, running.runtime.generation);
-            assert.equal(currentMgr.runtime.state, 'running');
-            await writeFile(join(output,'market-reloaded.png'),Buffer.from(await ui.screenshot(),'base64'));
-            await removePlugin(mgr.manifest.id);
+          item.businessAttempted = true;
+          const business = await verifyDshMarket({ request: post, origin, plugin: running, page, cdpPort, errors,
+            output, stateRoot: join(work, 'state'), restart: () => restart('before-market-restart.log'),
+            check: (name, ok, detail) => { assert.ok(ok, `${name}: ${JSON.stringify(detail ?? '')}`); console.log(`✓ ${name}`); },
           });
+          page = business.page; ui = pageTools(page);
+          item.functionalChecks = business.checks;
           item.upgrade = 'passed';
-          item.functionalChecks = { onlineInstall: true, daemonOwnership: true, activation: true, onlineUpdate: true, installedInventory: true,
-            originalPageInstall: true, failedInstallPreservesVersion: true, gitSources: 'unverified', profileReload: true,
-            unchangedInstances: true, disabledStateAfterReload: true, originalPageReload: true, bridgeAfterReload: true };
         }
         if (pkg === 'dsh-plugin-mgr' && item.smoke?.ok) {
-          const target = await installTarget();
-          const call = async (action, body) => {
-            const result = await post(`/api/plugins/${item.id}/routes`, { method: body === undefined ? 'GET' : 'POST', path: `/api/plugin-manager/${action}`, ...(body === undefined ? {} : { body }) });
-            assert.equal(result.status, 200, JSON.stringify(result)); assert.equal(result.body.ok, true, JSON.stringify(result)); return result.body;
-          };
+          item.businessAttempted = true;
           try {
-            item.daemonPluginsBeforeManagerRoute = (await api('/api/plugins')).value.plugins
-              .filter((entry) => entry.source?.kind === 'upstream').map((entry) => entry.source.location);
-            const row = (await call('list')).plugins.find((entry) => entry.name === 'dsh-plugin-release-probe');
-            assert.equal(row.version, '0.0.7'); assert.equal(row.disabled, false); assert.ok(row.rows.includes(target.manifest.id));
-            await call('toggle', { name: row.name, disable: true });
-            assert.equal((await currentTarget()).enabled, false); assert.equal((await currentTarget()).active, false);
-            await call('toggle', { name: row.name, disable: false });
-            assert.equal((await currentTarget()).runtime.state, 'running');
-            const update = (await call('updates')).updates;
-            item.updateCheck = update;
-            assert.equal(update?.[row.name]?.latest, '0.0.8', '原包须从 registry 检查到目标新版');
-            await call('update', { name: row.name });
-            const after = await currentTarget();
-            assert.equal(after.manifest.version, '0.0.8'); assert.equal(after.runtime.state, 'running');
-            await call('uninstall', { name: row.name }); assert.equal(await currentTarget(), undefined);
-            item.functionalChecks = { list: true, disable: true, enable: true, checkUpdates: true, onlineUpgrade: true, uninstall: true, runtimeFailureDisplay: 'unverified' };
+            const business = await verifyDshManager({ request: post, origin, plugin: running, page, cdpPort, errors,
+              gate: registryGate, output, stateRoot: join(work, 'state'), clipAudit,
+              restart, appPid: () => app.child.pid,
+              check: (name, ok, detail) => { assert.ok(ok, `${name}: ${JSON.stringify(detail ?? '')}`); console.log(`✓ ${name}`); },
+            });
+            page = business.page; ui = pageTools(page);
+            item.functionalChecks = business.checks;
+            item.updatedVersion = business.plugin.manifest.version;
+            item.updatedDigest = business.plugin.digest;
             item.upgrade = 'passed';
           } finally { const target = await currentTarget(); if (target) await removePlugin(target.manifest.id); }
         }
-        if (pkg === 'dsh-plugin-upgrader' && process.env.MAGI_DSH_FUNCTIONAL_UPGRADE === '1') {
+        if (pkg === 'dsh-plugin-upgrader') {
           item.businessAttempted = true;
           const business = await verifyDshUpgrader({ request: post, origin, plugin: running, page, cdpPort, errors,
             gate: registryGate, output, stateRoot: join(work, 'state'),
@@ -402,6 +295,8 @@ try {
           });
           page = business.page; ui = pageTools(page);
           item.functionalChecks = business.checks;
+          item.updatedVersion = business.plugin.manifest.version;
+          item.updatedDigest = business.plugin.digest;
           item.upgrade = 'passed';
         }
 
@@ -417,7 +312,7 @@ try {
       item.panelLifecycle = await removePlugin(item.id, { verifyPanel: true });
       item.cleaned = true;
     } catch (error) {
-      if (item.marketInstall || item.businessAttempted) item.core = 'failed';
+      if (item.businessAttempted) item.core = 'failed';
       item.runtime = item.runtime || 'error'; item.error = error?.message || String(error);
       if (item.id) await removePlugin(item.id).then(() => { item.cleaned = true; }, (error) => { item.cleanupError = error.message; });
     }

@@ -1,6 +1,5 @@
 import type { ClientBridgeMessage, SupportedLocale } from '../shared/bridges/client-bridge';
 import {
-  getBridgeKind,
   getBridgeState,
   getInitialBridgeLocale,
   getInitialBridgeSessionId,
@@ -40,8 +39,4 @@ export function getInitialSessionId(): string {
 
 export function getInitialLocale(): SupportedLocale {
   return getInitialBridgeLocale();
-}
-
-export function getClientKind(): 'vscode' | 'web' {
-  return getBridgeKind();
 }

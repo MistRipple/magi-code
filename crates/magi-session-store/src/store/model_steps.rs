@@ -314,7 +314,7 @@ impl SessionStore {
             .expect("canonical barrier poisoned");
         let lock = self.canonical_commit_lock_for(session_id);
         let _guard = lock.lock().expect("canonical session lock poisoned");
-        let (mutation, projection) = {
+        let mutation = {
             let state = self.state.read().expect("session state lock poisoned");
             let previous = state
                 .canonical_turns
@@ -440,50 +440,14 @@ impl SessionStore {
                 });
             }
             next.validate_update_from(previous)?;
-            let mutation = CanonicalTurnMutation {
+            CanonicalTurnMutation {
                 previous: Some(previous.clone()),
                 next,
-            };
-            // 只有新增 item 才需要刷新 sidecar；独立 Agent Turn 不改变主线当前指针。
-            // 与交互写回相同，持久提交前先校验投影，且只读取当前 Turn，避免复制会话历史。
-            let mut projection = if executor_failure.is_some() {
-                state.execution_sidecar_store.runtime_sidecar(session_id)
-            } else {
-                None
-            };
-            projection = projection.filter(|sidecar| {
-                sidecar
-                    .current_turn
-                    .as_ref()
-                    .is_some_and(|turn| turn.turn_id == turn_id)
-            });
-            if let Some(sidecar) = projection.as_mut() {
-                super::sidecar::rebuild_sidecar_projection_from_canonical(
-                    sidecar,
-                    std::slice::from_ref(&mutation.next),
-                )?;
             }
-            (mutation, projection)
         };
         self.persist_session_transaction(session_id, std::slice::from_ref(&mutation), &[], None)?;
         let mut state = self.state.write().expect("session state lock poisoned");
         super::sidecar::apply_canonical_turn_in_state(&mut state, mutation.next);
-        // 外部执行器失败证据是不可见的 canonical SystemNotice，但仍属于该 Turn
-        // 的持久事实。同步当前 sidecar 投影，否则进程重启时会因 item 集合不一致
-        // 拒绝恢复，等待/取消也无法读取同一份原始证据。
-        if let Some(projection) = projection
-            && let Some(sidecar) = state
-                .execution_sidecar_store
-                .runtime_sidecars
-                .iter_mut()
-                .find(|sidecar| sidecar.session_id == *session_id)
-        {
-            sidecar.current_turn = projection.current_turn;
-            if let Some(chain) = sidecar.active_execution_chain.as_mut() {
-                chain.current_turn = sidecar.current_turn.clone();
-                chain.normalize();
-            }
-        }
         drop(state);
         drop(_guard);
         drop(_barrier);

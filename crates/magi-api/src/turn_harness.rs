@@ -30,13 +30,12 @@ use magi_core::{AccessProfile, SessionId, UtcMillis};
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
 use magi_memory_store::MemoryStore;
-use magi_orchestrator::{OrchestratedExecutionRuntime, task_store::TaskStore};
+use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{
     ActiveExecutionTurn, CanonicalTurn, CanonicalTurnItemKind, SessionStore, TimelineEntryInput,
     TimelineEntryKind,
 };
 use magi_tool_runtime::{ExternalMcpToolExecutor, ExternalToolCatalogSnapshot, ToolRegistry};
-use magi_worker_runtime::WorkerRuntime;
 use magi_workspace::WorkspaceStore;
 use std::time::{Duration, Instant};
 use std::{
@@ -1419,10 +1418,6 @@ impl MagiTurnHarness {
             tool_registry = tool_registry.with_external_mcp_tool_executor(executor);
         }
         tool_registry.register_default_builtins();
-        let mut execution_runtime = OrchestratedExecutionRuntime::new(WorkerRuntime::new());
-        if let Some(task_store) = task_store.as_ref() {
-            execution_runtime = execution_runtime.with_task_store(Arc::clone(task_store));
-        }
         let completion_notifier = task_store
             .as_ref()
             .map(|task_store| Arc::new(TaskCompletionNotifier::new(Arc::clone(task_store))));
@@ -1480,7 +1475,7 @@ impl MagiTurnHarness {
         let mut dispatcher_builder = LlmTaskDispatcher::new(
             Arc::clone(&event_bus),
             ExecutionPipeline {
-                execution_runtime,
+                task_store: task_store.clone().unwrap_or_else(|| Arc::new(TaskStore::new())),
                 memory_store: MemoryStore::new(),
             },
             LlmTaskDispatcherDependencies {
@@ -3380,21 +3375,19 @@ mod tests {
                 harness.state.session_store.execution_sidecar_store_state(),
             )
             .unwrap();
-            let threads = restored.thread_registry_snapshot(&session);
-            for thread in &threads {
-                restored
-                    .rebuild_thread_message_projection(&thread.thread_id, UtcMillis::now())
-                    .unwrap();
-            }
             assert!(
                 restored
                     .thread_registry_snapshot(&session)
                     .iter()
-                    .flat_map(|thread| &thread.message_history)
+                    .flat_map(|thread| restored
+                        .thread_context_snapshot(&thread.thread_id)
+                        .unwrap()
+                        .messages()
+                        .to_vec())
                     .filter(|message| message.role == "tool"
                         && message.tool_call_id.as_deref() == Some(feedback.call_id.as_str()))
-                    .filter_map(|message| message.content.as_deref())
-                    .filter_map(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+                    .filter_map(|message| message.content)
+                    .filter_map(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
                     .any(|result| Some(&result) == feedback.result.as_ref()),
                 "序列化恢复并重建 Thread 后仍必须保留原拒绝，不能变成未知副作用"
             );
@@ -5290,7 +5283,7 @@ done
                 serde_json::from_str::<serde_json::Value>(&output.payload).unwrap()["stdout"],
                 "durable-output"
             );
-            let restored = Arc::new(SessionStore::from_state(
+            let restored = Arc::new(SessionStore::from_state_for_test(
                 harness.state.session_store.export_state(),
             ));
             assert_eq!(
@@ -11034,7 +11027,13 @@ done
                     "{historical_read:?}"
                 );
                 assert!(
-                    !prior_thread.message_history.is_empty(),
+                    !harness
+                        .state
+                        .session_store
+                        .thread_context_snapshot(&prior_thread.thread_id)
+                        .unwrap()
+                        .messages()
+                        .is_empty(),
                     "旧 transcript 仍保留"
                 );
                 let requests = harness.provider.requests();
@@ -15846,7 +15845,7 @@ done
             harness
                 .state
                 .session_store
-                .archive_active_execution_chain(&session, &parent_id)
+                .archive_active_execution_chain(&session, &parent_id, Some(&parent_turn))
                 .unwrap();
         }
         let expected_mainline =
@@ -18941,7 +18940,10 @@ done
         let history = harness
             .state
             .session_store
-            .thread_message_history(thread_id);
+            .thread_context_snapshot(thread_id)
+            .unwrap()
+            .messages()
+            .to_vec();
         assert!(
             history
                 .iter()

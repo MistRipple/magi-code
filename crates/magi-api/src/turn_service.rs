@@ -42,7 +42,7 @@ use crate::{
     performance::PerformanceTrace,
     session_continue::{
         SessionContinueAccepted, active_execution_branch_is_continue_recoverable,
-        continue_execution_chain_with_pre_resume, persist_resumed_branch_user_input,
+        continue_execution_chain_with_pre_resume,
     },
     state::{ApiState, QueuedRegularSessionTurn, normalize_session_turn_identity},
 };
@@ -459,7 +459,8 @@ async fn submit_session_turn_internal(
                 .ok_or_else(|| ApiError::InvalidInput("继续会话需要明确的 session".to_string()))?;
             require_session_record_in_scope(&state, &session_id, &scope)?;
             let resumed_turn_id = format!("turn-session-continue-{}", accepted_at.0);
-            let (accepted, _signal, user_message) = continue_execution_chain_with_pre_resume(
+            let signal = user_signal_from_request(&request, &images, accepted_at);
+            let (accepted, user_message) = continue_execution_chain_with_pre_resume(
                 &state,
                 &session_id,
                 &[],
@@ -469,21 +470,7 @@ async fn submit_session_turn_internal(
                     .request_id()
                     .unwrap_or_else(|| format!("request-{resumed_turn_id}")),
                 request_fingerprint.clone(),
-                |branches| {
-                    // S1：user 信号与恢复 runner 在同一个 session 临界区内串行提交，
-                    // 下游一律读 signal.*，不再读 request.*。
-                    let signal = user_signal_from_request(&request, &images, accepted_at);
-                    persist_resumed_branch_user_input(
-                        &state,
-                        &session_id,
-                        branches,
-                        signal.text.as_deref(),
-                        &images,
-                        accepted_at,
-                    )?;
-                    Ok(signal)
-                },
-                |chain, primary_branch, signal, coordinator_attempt| {
+                |chain, primary_branch, branches, coordinator_attempt| {
                     let (_, orchestrator_thread_id) = state.session_store.ensure_session_mission(
                         &session_id,
                         accepted_at,
@@ -500,6 +487,10 @@ async fn submit_session_turn_internal(
                         runner_started: false,
                     };
                     write_continue_user_message(ContinueUserMessageInput {
+                        resumed_thread_ids: branches
+                            .iter()
+                            .map(|branch| branch.thread_id.clone())
+                            .collect(),
                         state: &state,
                         accepted: &accepted_for_turn,
                         prompt_text: signal.text.as_deref(),
@@ -935,7 +926,7 @@ pub(crate) async fn submit_steer_current_turn_after_turn_commit(
         .try_steer_session_turn_with(&session_id, &expected_turn_id, signal, || {
             state
                 .turn_event_sink()
-                .append_item_sidecar(&session_id, Some(&expected_turn_id), user_message_item)
+                .upsert_item_sidecar(&session_id, Some(&expected_turn_id), user_message_item)
                 .and_then(|sidecar| {
                     sidecar.ok_or(magi_core::DomainError::InvalidState {
                         message: "当前会话没有可写入的活跃 Turn".to_string(),
@@ -1430,14 +1421,22 @@ fn interrupted_turn_resume_goal(resume: &UserInterruptedTurnResume, current_inpu
 }
 
 pub(crate) fn session_recoverable_branch_count(state: &ApiState, session_id: &SessionId) -> usize {
-    let Some(chain) = state.session_store.active_execution_chain(session_id) else {
+    let Some(sidecar) = state.session_store.runtime_sidecar(session_id) else {
+        return 0;
+    };
+    let Some(chain) = sidecar.active_execution_chain.as_ref() else {
         return 0;
     };
     chain
         .branches
         .iter()
         .filter(|branch| {
-            active_execution_branch_is_continue_recoverable(state.task_store(), &chain, branch)
+            active_execution_branch_is_continue_recoverable(
+                state.task_store(),
+                chain,
+                sidecar.current_turn.as_ref(),
+                branch,
+            )
         })
         .count()
 }
@@ -2386,7 +2385,7 @@ fn ensure_conversation_failure_item(
         );
     }
     if let Err(write_error) =
-        magi_conversation_runtime::session_writeback::append_session_turn_item_for_turn(
+        magi_conversation_runtime::session_writeback::upsert_session_turn_item_for_turn(
             &state.session_store,
             session_id,
             Some(turn_id),
@@ -3045,12 +3044,7 @@ fn session_turn_root_task_id(
     state
         .session_store
         .active_execution_chain(session_id)
-        .filter(|chain| {
-            chain
-                .current_turn
-                .as_ref()
-                .is_some_and(|turn| turn.turn_id == turn_id)
-        })
+        .filter(|chain| chain.current_turn_id.as_deref() == Some(turn_id))
         .map(|chain| chain.root_task_id)
         .or_else(|| {
             let turn = state
@@ -3624,6 +3618,7 @@ pub(crate) struct ContinueUserMessageInput<'a> {
     pub(crate) request_fingerprint: Option<String>,
     pub(crate) attempt_id: Option<String>,
     pub(crate) orchestrator_thread_id: magi_core::ThreadId,
+    pub(crate) resumed_thread_ids: Vec<magi_core::ThreadId>,
 }
 
 pub(crate) fn write_continue_user_message(
@@ -3641,6 +3636,7 @@ pub(crate) fn write_continue_user_message(
         request_fingerprint,
         attempt_id,
         orchestrator_thread_id,
+        resumed_thread_ids,
     } = input;
     let entry_id = format!("timeline-{}-{}", accepted.session_id, continued_at.0);
     let (user_message_item_id, items, user_message) = if let Some(prompt_text) = prompt_text {
@@ -3685,7 +3681,7 @@ pub(crate) fn write_continue_user_message(
                     metadata
                 },
                 task_id: Some(accepted.action_task_id.clone()),
-                source_thread_id: orchestrator_thread_id,
+                source_thread_id: orchestrator_thread_id.clone(),
             });
         (
             Some(user_message_item_id),
@@ -3729,7 +3725,7 @@ pub(crate) fn write_continue_user_message(
             None,
             None,
             Some(format!("turn-item-continue-phase-{}", accepted.turn_id)),
-            orchestrator_thread_id,
+            orchestrator_thread_id.clone(),
         );
         phase_item.task_id = Some(accepted.action_task_id.clone());
         phase_item.metadata = metadata;
@@ -3766,6 +3762,12 @@ pub(crate) fn write_continue_user_message(
             );
         }
     }
+    for item in &mut turn.items {
+        item.metadata.insert(
+            "continuedThreadIds".into(),
+            serde_json::json!(resumed_thread_ids),
+        );
+    }
     turn.normalize();
     state
         .turn_event_sink()
@@ -3780,19 +3782,6 @@ pub(crate) fn write_continue_user_message(
             turn,
         )
         .map_err(|error| ApiError::internal_assembly("写入 continue 用户消息失败", error))?;
-    // ThreadChatMessage 是 canonical Turn 的读取投影。canonical accepted 成功后，
-    // 同步重建 session 下所有 branch thread，保证 Continue 输入可被每个恢复分支看到。
-    for thread in state
-        .session_store
-        .thread_registry_snapshot(&accepted.session_id)
-    {
-        state
-            .session_store
-            .rebuild_thread_message_projection(&thread.thread_id, continued_at)
-            .map_err(|error| {
-                ApiError::internal_assembly("重建 continue thread projection 失败", error)
-            })?;
-    }
     state.persist_session_state_checkpoint("session_continue_user_message")?;
     if let Some(user_message) = user_message {
         publish_session_user_message_event(
@@ -4377,7 +4366,7 @@ pub(crate) async fn continue_session_with_expected_root(
         .map(WorkerId::new)
         .collect::<Vec<_>>();
     let resumed_turn_id = format!("turn-session-continue-{}", continued_at.0);
-    let (accepted, (), _) = continue_execution_chain_with_pre_resume(
+    let (accepted, _) = continue_execution_chain_with_pre_resume(
         state,
         session_id,
         &requested_agent_ids,
@@ -4385,17 +4374,7 @@ pub(crate) async fn continue_session_with_expected_root(
         continued_at,
         request_id.clone(),
         continue_request_fingerprint.clone(),
-        |branches| {
-            persist_resumed_branch_user_input(
-                state,
-                session_id,
-                branches,
-                prompt_text.as_deref(),
-                &[],
-                continued_at,
-            )
-        },
-        |chain, primary_branch, _, coordinator_attempt| {
+        |chain, primary_branch, branches, coordinator_attempt| {
             let (_, orchestrator_thread_id) =
                 state
                     .session_store
@@ -4411,6 +4390,10 @@ pub(crate) async fn continue_session_with_expected_root(
                 runner_started: false,
             };
             write_continue_user_message(ContinueUserMessageInput {
+                resumed_thread_ids: branches
+                    .iter()
+                    .map(|branch| branch.thread_id.clone())
+                    .collect(),
                 state,
                 accepted: &accepted_for_turn,
                 prompt_text: prompt_text.as_deref(),

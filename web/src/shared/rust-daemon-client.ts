@@ -1,5 +1,5 @@
 // Direct HTTP client for the Rust daemon API.
-// Uses the unified transport layer so it works in both browser-direct and VS Code proxy modes.
+// Electron Renderer and Web share the same daemon HTTP/SSE transport.
 
 import { getTransport } from './transport';
 import type { AgentContinueParams, AgentContinueResult, AgentTransferParams, AgentTransferResult } from './app-server-protocol.generated';
@@ -12,8 +12,6 @@ import type {
   ApproveChangeResponseDto,
   AuditUsageLedgerDto,
   BootstrapDto,
-  BridgePreflightSnapshotDto,
-  BridgeServicesSnapshotDto,
   NotificationContextRequestDto,
   ConnectionTestResponseDto,
   CurrentGoalResponseDto,
@@ -182,14 +180,6 @@ export class RustDaemonClient {
 
   public async fetchAuditUsageLedger(): Promise<AuditUsageLedgerDto> {
     return this.getJson<AuditUsageLedgerDto>('/ledger');
-  }
-
-  public async fetchBridgeServices(): Promise<BridgeServicesSnapshotDto> {
-    return this.getJson<BridgeServicesSnapshotDto>('/bridges/services');
-  }
-
-  public async fetchBridgePreflight(): Promise<BridgePreflightSnapshotDto> {
-    return this.getJson<BridgePreflightSnapshotDto>('/bridges/preflight');
   }
 
   public async submitSessionTurn(

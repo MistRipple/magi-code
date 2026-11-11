@@ -2,7 +2,7 @@ import { normalizeContextUsageBreakdown, type ContextUsageBreakdown } from '../.
 import type { SessionBootstrapSnapshot } from '../session-bootstrap';
 import type { CanonicalTurn, CanonicalTurnItem } from '../protocol/canonical-turn';
 import { normalizeCanonicalTurnStrict } from '../protocol/canonical-turn';
-import { deriveProcessingStateFromCanonicalTurns } from '../protocol/canonical-processing';
+import { deriveMainlineRuntimeState, deriveProcessingStateFromCanonicalTurns } from '../protocol/canonical-processing';
 import { parseRuntimeTaskStatus } from '../protocol/runtime-task-status';
 import { deriveHasUnreadCompletion } from '../../lib/session-activity-indicator';
 import { parseModelFailureDiagnostic } from '../../lib/model-failure';
@@ -11,9 +11,6 @@ import { mergeRuntimeTimelineEntries } from '../../lib/runtime-timeline';
 import type {
   AppState,
   OrchestrationRuntimeAssignmentSummary,
-  OrchestrationRuntimeKnowledgeAuditEntry,
-  OrchestrationRuntimeKnowledgeAuditView,
-  OrchestrationRuntimeKnowledgeDecision,
   OrchestrationRuntimeOpsView,
   OrchestrationRuntimeRecoverySummary,
   OrchestrationRuntimeTimelineEntry,
@@ -134,39 +131,6 @@ interface RustExecutionGroupRuntimeSummary {
   context_provenance_linked_memory_count?: number;
 }
 
-interface RustKnowledgeAuditRuntimeEntry {
-  event_id?: string;
-  event_type?: string;
-  occurred_at?: number;
-  sequence?: number;
-  workspace_id?: string | null;
-  session_id?: string | null;
-  mission_id?: string | null;
-  task_id?: string | null;
-  consumer?: string | null;
-  decision?: string | null;
-  status?: string | null;
-  failure_reason?: string | null;
-  knowledge_ids?: string[];
-  result_kinds?: string[];
-  matched_count?: number;
-  injected_count?: number;
-  injected_chars?: number;
-  truncated?: boolean;
-  candidate_count?: number;
-  inserted_count?: number;
-}
-
-interface RustAssignmentRuntimeSummary {
-  assignment_id?: string;
-  mission_id?: string | null;
-  completed_task_count?: number;
-  failed_task_count?: number;
-  task_ids?: string[];
-  latest_event_type?: string | null;
-  current_status?: string | null;
-}
-
 interface RustTaskRuntimeSummary {
   task_id?: string;
   title?: string | null;
@@ -198,15 +162,9 @@ interface RustSessionRuntimeSummary {
   last_update?: number | null;
   mission_id?: string | null;
   root_task_id?: string | null;
-  root_task_status?: string | null;
-  execution_chain_ref?: string | null;
   recovery_ref?: string | null;
-  has_recoverable_chain?: boolean;
-  recoverable_branch_count?: number;
   continuation?: SessionContinuation;
   active_branches?: RustSessionRuntimeBranchSummary[];
-  current_turn?: RustSessionRuntimeTurnSummary | null;
-  turn_items?: RustSessionRuntimeTurnItemSummary[];
   usage_observation?: RustSessionRuntimeUsageObservation | null;
   budget?: RustSessionRuntimeBudget | null;
   context_compaction?: RustSessionRuntimeContextCompaction | null;
@@ -255,48 +213,12 @@ interface RustSessionRuntimeContextCompaction {
   compacted_at?: number | null;
 }
 
-interface RustSessionRuntimeTurnSummary {
-  turn_id?: string;
-  turn_seq?: number;
-  accepted_at?: number | null;
-  completed_at?: number | null;
-  response_duration_ms?: number | null;
-  status?: string | null;
-  user_message?: string | null;
-}
-
-interface RustSessionRuntimeTurnItemSummary {
-  item_id?: string;
-  item_seq?: number;
-  kind?: string;
-  status?: string;
-  source?: string;
-  title?: string | null;
-  content?: string | null;
-  task_id?: string | null;
-  worker_id?: string | null;
-  role_id?: string | null;
-  tool_call_id?: string | null;
-  tool_name?: string | null;
-  tool_status?: string | null;
-  tool_arguments?: unknown;
-  tool_result?: string | null;
-  tool_error?: string | null;
-  request_id?: string | null;
-  user_message_id?: string | null;
-  placeholder_message_id?: string | null;
-  timeline_entry_id?: string | null;
-}
-
 interface RustSessionRuntimeBranchSummary {
   task_id?: string;
   worker_id?: string;
   status?: string;
   stage?: string;
   lease_id?: string | null;
-  execution_intent_ref?: string | null;
-  binding_lifecycle?: string | null;
-  last_checkpoint_at?: number | null;
   is_primary?: boolean;
 }
 
@@ -355,11 +277,9 @@ interface RustRuntimeReadModelDto {
   };
   details?: {
     execution_groups?: RustExecutionGroupRuntimeSummary[];
-    assignments?: RustAssignmentRuntimeSummary[];
     tasks?: RustTaskRuntimeSummary[];
     workers?: RustWorkerRuntimeSummary[];
     sessions?: RustSessionRuntimeSummary[];
-    knowledge_audit?: RustKnowledgeAuditRuntimeEntry[];
   };
   overview?: {
     category_counts?: RustEventCategoryCounts;
@@ -469,26 +389,6 @@ function getRuntimeDetailEntries(
   return Array.isArray(entries) ? entries : [];
 }
 
-function normalizeAssignmentRuntimeEntries(
-  runtimeReadModel: RustRuntimeReadModelDto | undefined,
-): RustAssignmentRuntimeSummary[] {
-  return getRuntimeDetailEntries(runtimeReadModel, 'assignments')
-    .map((entry) => normalizeObjectRecord(entry))
-    .filter((entry): entry is Record<string, unknown> => entry !== null)
-    .map((entry) => ({
-      assignment_id: normalizeString(entry.assignment_id) || undefined,
-      mission_id: normalizeString(entry.mission_id) || undefined,
-      completed_task_count: typeof entry.completed_task_count === 'number'
-        ? Math.floor(entry.completed_task_count)
-        : undefined,
-      failed_task_count: typeof entry.failed_task_count === 'number'
-        ? Math.floor(entry.failed_task_count)
-        : undefined,
-      task_ids: normalizeStringArray(entry.task_ids),
-      latest_event_type: normalizeString(entry.latest_event_type) || undefined,
-      current_status: normalizeString(entry.current_status) || undefined,
-    }));
-}
 
 function normalizeTaskRuntimeEntries(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
@@ -510,33 +410,6 @@ function normalizeTaskRuntimeEntries(
     }));
 }
 
-function normalizeRuntimeTurnSummary(raw: unknown): RustSessionRuntimeTurnSummary | null {
-  const turn = normalizeObjectRecord(raw);
-  if (!turn) {
-    return null;
-  }
-  return {
-    turn_id: normalizeString(turn.turn_id) || undefined,
-    turn_seq: typeof turn.turn_seq === 'number' ? Math.floor(turn.turn_seq) : undefined,
-    accepted_at: typeof turn.accepted_at === 'number' ? Math.floor(turn.accepted_at) : undefined,
-    completed_at: typeof turn.completed_at === 'number' ? Math.floor(turn.completed_at) : undefined,
-    response_duration_ms: typeof turn.response_duration_ms === 'number'
-      ? Math.floor(turn.response_duration_ms)
-      : undefined,
-    status: normalizeString(turn.status) || undefined,
-    user_message: normalizeString(turn.user_message) || undefined,
-  };
-}
-
-function normalizeRuntimeTurnItems(raw: unknown): RustSessionRuntimeTurnItemSummary[] {
-  return Array.isArray(raw)
-    ? raw
-      .map((item) => normalizeObjectRecord(item))
-      .filter((item): item is Record<string, unknown> => item !== null)
-      .map((item) => item as RustSessionRuntimeTurnItemSummary)
-    : [];
-}
-
 function normalizeSessionRuntimeEntries(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
 ): RustSessionRuntimeSummary[] {
@@ -553,13 +426,7 @@ function normalizeSessionRuntimeEntries(
       last_update: typeof entry.last_update === 'number' ? Math.floor(entry.last_update) : undefined,
       mission_id: normalizeString(entry.mission_id) || undefined,
       root_task_id: normalizeString(entry.root_task_id) || undefined,
-      root_task_status: normalizeString(entry.root_task_status) || undefined,
-      execution_chain_ref: normalizeString(entry.execution_chain_ref) || undefined,
       recovery_ref: normalizeString(entry.recovery_ref) || undefined,
-      has_recoverable_chain: entry.has_recoverable_chain === true,
-      recoverable_branch_count: typeof entry.recoverable_branch_count === 'number'
-        ? Math.floor(entry.recoverable_branch_count)
-        : undefined,
       continuation: normalizeSessionContinuation(entry.continuation),
       active_branches: Array.isArray(entry.active_branches)
         ? entry.active_branches
@@ -571,16 +438,9 @@ function normalizeSessionRuntimeEntries(
             status: normalizeString(branch.status) || undefined,
             stage: normalizeString(branch.stage) || undefined,
             lease_id: normalizeString(branch.lease_id) || undefined,
-            execution_intent_ref: normalizeString(branch.execution_intent_ref) || undefined,
-            binding_lifecycle: normalizeString(branch.binding_lifecycle) || undefined,
-            last_checkpoint_at: typeof branch.last_checkpoint_at === 'number'
-              ? Math.floor(branch.last_checkpoint_at)
-              : undefined,
             is_primary: branch.is_primary === true,
           }))
         : [],
-      current_turn: normalizeRuntimeTurnSummary(entry.current_turn),
-      turn_items: normalizeRuntimeTurnItems(entry.turn_items),
       usage_observation: normalizeRuntimeUsageObservation(entry.usage_observation),
       budget: normalizeRuntimeBudget(entry.budget),
       context_compaction: normalizeRuntimeContextCompaction(entry.context_compaction),
@@ -719,25 +579,6 @@ function resolveEventPayload(event: RustEventEnvelope): Record<string, unknown> 
   return event.payload || {};
 }
 
-function resolveEventMissionId(event: RustEventEnvelope): string {
-  const payload = resolveEventPayload(event);
-  return normalizeString(event.mission_id) || normalizeString(payload.mission_id);
-}
-
-function resolveEventAssignmentId(event: RustEventEnvelope): string {
-  const payload = resolveEventPayload(event);
-  return normalizeString(event.assignment_id) || normalizeString(payload.assignment_id);
-}
-
-function resolveEventTaskId(event: RustEventEnvelope): string {
-  const payload = resolveEventPayload(event);
-  return normalizeString(event.task_id) || normalizeString(payload.task_id);
-}
-
-function resolveEventWorkerId(event: RustEventEnvelope): string {
-  const payload = resolveEventPayload(event);
-  return normalizeString(payload.worker_id);
-}
 
 function normalizeRustSessions(
   payload: RustBootstrapDto,
@@ -839,52 +680,6 @@ function resolveSelectedWorkspace(
   };
 }
 
-function buildLookupMaps(events: RustEventEnvelope[]): {
-  missionTitles: Map<string, string>;
-  assignmentTitles: Map<string, string>;
-  taskTitles: Map<string, string>;
-  assignmentWorkers: Map<string, string>;
-} {
-  const missionTitles = new Map<string, string>();
-  const assignmentTitles = new Map<string, string>();
-  const taskTitles = new Map<string, string>();
-  const assignmentWorkers = new Map<string, string>();
-
-  for (const event of events) {
-    const payload = event.payload;
-    if (!payload) {
-      continue;
-    }
-    const missionId = resolveEventMissionId(event);
-    const assignmentId = resolveEventAssignmentId(event);
-    const taskId = resolveEventTaskId(event);
-    const missionTitle = normalizeString(payload.mission_title);
-    const assignmentTitle = normalizeString(payload.assignment_title);
-    const taskTitle = normalizeString(payload.task_title);
-    const workerId = resolveEventWorkerId(event);
-
-    if (missionId && missionTitle && !missionTitles.has(missionId)) {
-      missionTitles.set(missionId, missionTitle);
-    }
-    if (assignmentId && assignmentTitle && !assignmentTitles.has(assignmentId)) {
-      assignmentTitles.set(assignmentId, assignmentTitle);
-    }
-    if (taskId && taskTitle && !taskTitles.has(taskId)) {
-      taskTitles.set(taskId, taskTitle);
-    }
-    if (assignmentId && workerId && !assignmentWorkers.has(assignmentId)) {
-      assignmentWorkers.set(assignmentId, workerId);
-    }
-  }
-
-  return {
-    missionTitles,
-    assignmentTitles,
-    taskTitles,
-    assignmentWorkers,
-  };
-}
-
 function normalizeSubTaskStatus(status: string): SubTaskItem['status'] {
   switch (parseRuntimeTaskStatus(status)) {
     case 'running':
@@ -903,75 +698,10 @@ function normalizeSubTaskStatus(status: string): SubTaskItem['status'] {
 
 function buildAssignmentsFromRuntime(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
-  events: RustEventEnvelope[],
   sessionId: string,
 ): OrchestrationRuntimeAssignmentSummary[] {
-  const assignmentEntries = normalizeAssignmentRuntimeEntries(runtimeReadModel);
-  const { activeSession, taskEntries, activeMissionIds } = resolveSessionTaskEntries(runtimeReadModel, sessionId);
-  const tasksByAssignment = new Map<string, RustTaskRuntimeSummary[]>();
-  for (const task of taskEntries) {
-    const assignmentId = normalizeString(task.assignment_id);
-    if (!assignmentId) {
-      continue;
-    }
-    const bucket = tasksByAssignment.get(assignmentId) || [];
-    bucket.push(task);
-    tasksByAssignment.set(assignmentId, bucket);
-  }
-  const lookups = buildLookupMaps(events);
-
-  const assignments: OrchestrationRuntimeAssignmentSummary[] = [];
-  for (const assignment of assignmentEntries) {
-    const assignmentId = normalizeString(assignment.assignment_id);
-    const missionId = normalizeString(assignment.mission_id);
-    if (!assignmentId) {
-      continue;
-    }
-    if (missionId && activeMissionIds.size > 0 && !activeMissionIds.has(missionId)) {
-      continue;
-    }
-    const assignmentTasks = tasksByAssignment.get(assignmentId) || [];
-    const declaredTaskIds = normalizeStringArray(assignment.task_ids);
-    // 模型调用 lease 也会写入 assignments 读模型，但它不代表 agent_spawn 创建的任务。
-    // 只有能关联到实际 task 的 assignment 才能进入“代理数量”统计。
-    if (assignmentTasks.length === 0 && declaredTaskIds.length === 0) {
-      continue;
-    }
-    const assignmentTaskStatuses = assignmentTasks.map((task) => normalizeSubTaskStatus(
-      normalizeString(task.current_status),
-    ));
-    const taskTotal = assignmentTasks.length || declaredTaskIds.length;
-    const completedTaskCount = assignmentTasks.length > 0
-      ? assignmentTaskStatuses.filter((status) => status === 'completed' || status === 'skipped').length
-      : normalizeNumber(assignment.completed_task_count, 0);
-    const failedTaskCount = assignmentTasks.length > 0
-      ? assignmentTaskStatuses.filter((status) => status === 'failed' || status === 'blocked').length
-      : normalizeNumber(assignment.failed_task_count, 0);
-    const runningTaskCount = assignmentTaskStatuses.filter((status) => status === 'running').length;
-    const awaitingApprovalTaskCount = assignmentTaskStatuses.filter((status) => status === 'awaiting_approval').length;
-    const reviewRequiredTaskCount = assignmentTaskStatuses.filter((status) => status === 'review_required').length;
-    const blockedTaskCount = assignmentTaskStatuses.filter((status) => status === 'blocked').length;
-    const progress = taskTotal > 0 ? Math.round((completedTaskCount / taskTotal) * 100) : 0;
-
-    assignments.push({
-      assignmentId,
-      workerId: lookups.assignmentWorkers.get(assignmentId) || undefined,
-      title: lookups.assignmentTitles.get(assignmentId) || '任务分配',
-      status: normalizeString(assignment.current_status) || 'pending',
-      progress,
-      taskTotal,
-      awaitingApprovalTaskCount,
-      reviewRequiredTaskCount,
-      blockedTaskCount,
-      completedTaskCount,
-      failedTaskCount,
-      runningTaskCount,
-    });
-  }
-  if (assignments.length > 0) {
-    return assignments;
-  }
-  return buildBranchTaskTrackingSummaries(activeSession, taskEntries, lookups);
+  const { activeSession, taskEntries } = resolveSessionTaskEntries(runtimeReadModel, sessionId);
+  return buildBranchTaskTrackingSummaries(activeSession, taskEntries);
 }
 
 function taskTrackingProgressForStatus(status: SubTaskItem['status']): number {
@@ -990,17 +720,9 @@ function taskTrackingProgressForStatus(status: SubTaskItem['status']): number {
   }
 }
 
-function fallbackBranchTaskTitle(branch: RustSessionRuntimeBranchSummary, index: number): string {
-  if (branch.is_primary) {
-    return '主线任务';
-  }
-  return `代理任务 ${Math.max(1, index)}`;
-}
-
 function buildBranchTaskTrackingSummaries(
   activeSession: RustSessionRuntimeSummary | undefined,
   taskEntries: RustTaskRuntimeSummary[],
-  lookups: ReturnType<typeof buildLookupMaps>,
 ): OrchestrationRuntimeAssignmentSummary[] {
   const branches = Array.isArray(activeSession?.active_branches) ? activeSession.active_branches : [];
   if (branches.length === 0) {
@@ -1015,7 +737,7 @@ function buildBranchTaskTrackingSummaries(
   }
 
   const summaries: OrchestrationRuntimeAssignmentSummary[] = [];
-  for (const [index, branch] of branches.entries()) {
+  for (const branch of branches) {
     // primary branch 是主线 coordinator，不是 agent_spawn 创建的子代理。
     // 运行状态摘要中的“代理数量”只能统计用户实际派发的子代理，避免把主线混入。
     if (branch.is_primary) {
@@ -1026,10 +748,9 @@ function buildBranchTaskTrackingSummaries(
       continue;
     }
     const task = taskById.get(taskId);
-    const status = normalizeSubTaskStatus(normalizeString(task?.current_status || branch.status));
-    const title = normalizeString(task?.title)
-      || lookups.taskTitles.get(taskId)
-      || fallbackBranchTaskTitle(branch, index);
+    if (!task || !parseRuntimeTaskStatus(task.current_status)) continue;
+    const status = normalizeSubTaskStatus(normalizeString(task.current_status));
+    const title = normalizeString(task.title) || taskId;
     const completedTaskCount = status === 'completed' || status === 'skipped' ? 1 : 0;
     const failedTaskCount = status === 'failed' || status === 'blocked' ? 1 : 0;
     const runningTaskCount = status === 'running' || status === 'in_progress' ? 1 : 0;
@@ -1057,7 +778,6 @@ function resolveSessionTaskEntries(
 ): {
   activeSession: RustSessionRuntimeSummary | undefined;
   taskEntries: RustTaskRuntimeSummary[];
-  activeMissionIds: Set<string>;
 } {
   const allTaskEntries = normalizeTaskRuntimeEntries(runtimeReadModel);
   const activeSession = normalizeSessionRuntimeEntries(runtimeReadModel)
@@ -1074,60 +794,10 @@ function resolveSessionTaskEntries(
       sessionTaskIds.add(branchTaskId);
     }
   }
-  const activeMissionIds = new Set(normalizeStringArray(activeSession?.active_execution_group_ids));
-  if (activeMissionIds.size === 0 && sessionTaskIds.size > 0) {
-    for (const task of allTaskEntries) {
-      const taskId = normalizeString(task.task_id);
-      const missionId = normalizeString(task.mission_id);
-      if (taskId && missionId && sessionTaskIds.has(taskId)) {
-        activeMissionIds.add(missionId);
-      }
-    }
-  }
-  const taskEntries = allTaskEntries
-    .filter((entry) => {
-      const taskId = normalizeString(entry.task_id);
-      const missionId = normalizeString(entry.mission_id);
-      return sessionTaskIds.has(taskId) || (missionId && activeMissionIds.has(missionId));
-    });
-  return { activeSession, taskEntries, activeMissionIds };
+  const taskEntries = allTaskEntries.filter((entry) => sessionTaskIds.has(normalizeString(entry.task_id)));
+  return { activeSession, taskEntries };
 }
 
-function buildSessionTaskStatusSummary(
-  runtimeReadModel: RustRuntimeReadModelDto | undefined,
-  sessionId: string,
-): {
-  activeSession: RustSessionRuntimeSummary | undefined;
-  taskEntries: RustTaskRuntimeSummary[];
-  runningTaskIds: string[];
-  failedTaskIds: string[];
-} {
-  const { activeSession, taskEntries } = resolveSessionTaskEntries(runtimeReadModel, sessionId);
-  const runningTaskIds: string[] = [];
-  const failedTaskIds: string[] = [];
-
-  for (const task of taskEntries) {
-    const taskId = normalizeString(task.task_id);
-    if (!taskId) {
-      continue;
-    }
-    const status = normalizeSubTaskStatus(normalizeString(task.current_status));
-    if (status === 'running') {
-      runningTaskIds.push(taskId);
-      continue;
-    }
-    if (status === 'failed' || status === 'blocked') {
-      failedTaskIds.push(taskId);
-    }
-  }
-
-  return {
-    activeSession,
-    taskEntries,
-    runningTaskIds,
-    failedTaskIds,
-  };
-}
 
 function deriveProcessingState(
   sessionId: string,
@@ -1155,19 +825,16 @@ function deriveRecoverySummary(
   if (recoveryRef) {
     sessionRecoveryIds.add(recoveryRef);
   }
-  const missionId = normalizeString(activeSession?.mission_id);
-  const chainRef = normalizeString(activeSession?.execution_chain_ref);
   const scopedSummaries = summaries.filter((summary) => {
     const summarySessionId = normalizeString(summary.session_id);
     const summaryRecoveryId = normalizeString(summary.recovery_id);
-    return (summarySessionId && summarySessionId === sessionId)
-      || (summaryRecoveryId && sessionRecoveryIds.has(summaryRecoveryId))
-      || (missionId && normalizeString(summary.mission_id) === missionId)
-      || (chainRef && normalizeString(summary.execution_chain_ref) === chainRef);
+    return summarySessionId
+      ? summarySessionId === sessionId
+      : Boolean(summaryRecoveryId && sessionRecoveryIds.has(summaryRecoveryId));
   });
   const scopedRecoveryIds = new Set(scopedSummaries.map((summary) => normalizeString(summary.recovery_id)).filter(Boolean));
   const scopedActiveIds = activeIds.filter((id) => scopedRecoveryIds.has(id) || sessionRecoveryIds.has(id));
-  if (scopedSummaries.length === 0 || (scopedActiveIds.length === 0 && activeSession?.has_recoverable_chain !== true)) {
+  if (scopedSummaries.length === 0 || (scopedActiveIds.length === 0 && !activeSession?.continuation)) {
     return undefined;
   }
   // 取最新的 recovery 摘要
@@ -1182,7 +849,7 @@ function deriveRecoverySummary(
   ).length;
 
   return {
-    continuationPolicy: pendingCount > 0 ? 'resumable' : 'none',
+    continuationPolicy: activeSession?.continuation ? 'resumable' : 'none',
     continuationReason: latest.diagnostic_summary || undefined,
     latestRecoveryAt: normalizeNumber(latest.latest_occurred_at, undefined as unknown as number) || undefined,
     pendingTaskCount: pendingCount,
@@ -1581,155 +1248,6 @@ function formatRuntimeStatusLabel(status: string): string {
   }
 }
 
-function normalizeKnowledgeDecision(value: unknown): OrchestrationRuntimeKnowledgeDecision | null {
-  switch (normalizeString(value)) {
-    case 'not_needed':
-    case 'missing_workspace':
-    case 'queried_no_match':
-    case 'matched_not_injected':
-    case 'injected':
-      return normalizeString(value) as OrchestrationRuntimeKnowledgeDecision;
-    default:
-      return null;
-  }
-}
-
-function knowledgeDecisionSummary(
-  decision: OrchestrationRuntimeKnowledgeDecision,
-  injectedCount: number,
-): string {
-  switch (decision) {
-    case 'not_needed':
-      return '当前请求无需知识检索';
-    case 'missing_workspace':
-      return '缺少工作区，未执行知识检索';
-    case 'queried_no_match':
-      return '已检索当前工作区知识，但未命中';
-    case 'matched_not_injected':
-      return '知识已命中，但受预算约束未注入';
-    case 'injected':
-      return `已按需注入 ${injectedCount} 条知识`;
-  }
-}
-
-function knowledgeDecisionResultKind(decision: OrchestrationRuntimeKnowledgeDecision): string {
-  switch (decision) {
-    case 'injected':
-      return 'matched';
-    case 'queried_no_match':
-    case 'not_needed':
-    case 'missing_workspace':
-      return 'empty';
-    case 'matched_not_injected':
-      return 'matched_not_injected';
-  }
-}
-
-function deriveKnowledgeAudit(
-  runtimeReadModel: RustRuntimeReadModelDto,
-  recentEvents: RustEventEnvelope[],
-  sessionId: string,
-): OrchestrationRuntimeKnowledgeAuditView | undefined {
-  const persistedEvents = Array.isArray(runtimeReadModel.details?.knowledge_audit)
-    ? runtimeReadModel.details.knowledge_audit.map((entry): RustEventEnvelope => ({
-        event_id: entry.event_id,
-        event_type: entry.event_type,
-        occurred_at: entry.occurred_at,
-        sequence: entry.sequence,
-        workspace_id: entry.workspace_id,
-        session_id: entry.session_id,
-        mission_id: entry.mission_id,
-        task_id: entry.task_id,
-        payload: {
-          consumer: entry.consumer,
-          decision: entry.decision,
-          status: entry.status,
-          failure_reason: entry.failure_reason,
-          knowledge_ids: entry.knowledge_ids,
-          result_kinds: entry.result_kinds,
-          matched_count: entry.matched_count,
-          injected_count: entry.injected_count,
-          injected_chars: entry.injected_chars,
-          truncated: entry.truncated,
-          candidate_count: entry.candidate_count,
-          inserted_count: entry.inserted_count,
-        },
-      }))
-    : [];
-  const sourceEvents = persistedEvents.length > 0 ? persistedEvents : recentEvents;
-  const recentEntries = sourceEvents
-    .filter((event) => event.event_type === 'knowledge.context.selected'
-      || event.event_type === 'knowledge.learning.extraction')
-    .filter((event) => normalizeString(event.session_id) === sessionId)
-    .map((event): OrchestrationRuntimeKnowledgeAuditEntry | null => {
-      const payload = resolveEventPayload(event);
-      if (event.event_type === 'knowledge.learning.extraction') {
-        const status = normalizeString(payload.status);
-        const failureReason = normalizeString(payload.failure_reason);
-        const candidateCount = Math.max(0, normalizeNumber(payload.candidate_count, 0));
-        const insertedCount = Math.max(0, normalizeNumber(payload.inserted_count, 0));
-        const failed = status === 'failed';
-        if (!failed && insertedCount === 0) {
-          return null;
-        }
-        return {
-          timestamp: normalizeNumber(event.occurred_at, 0),
-          consumer: 'auxiliary',
-          status,
-          failureReason: failureReason || undefined,
-          candidateCount,
-          insertedCount,
-          knowledgeIds: [],
-          resultKinds: insertedCount > 0 ? ['learning'] : [],
-          matchedCount: candidateCount,
-          injectedCount: 0,
-          injectedChars: 0,
-          truncated: false,
-          purpose: failed
-            ? '自动经验抽取失败'
-            : insertedCount > 0
-              ? `已写入 ${insertedCount} 条自动经验`
-              : '自动经验抽取未产生可写入内容',
-          resultKind: failed ? 'error' : insertedCount > 0 ? 'matched' : 'empty',
-          referenceCount: insertedCount,
-        };
-      }
-      const decision = normalizeKnowledgeDecision(payload.decision);
-      if (!decision) {
-        return null;
-      }
-      if (decision === 'not_needed') {
-        return null;
-      }
-      const injectedCount = Math.max(0, normalizeNumber(payload.injected_count, 0));
-      return {
-        timestamp: normalizeNumber(event.occurred_at, 0),
-        consumer: normalizeString(payload.consumer),
-        decision,
-        knowledgeIds: normalizeStringArray(payload.knowledge_ids),
-        resultKinds: normalizeStringArray(payload.result_kinds),
-        matchedCount: Math.max(0, normalizeNumber(payload.matched_count, 0)),
-        injectedCount,
-        injectedChars: Math.max(0, normalizeNumber(payload.injected_chars, 0)),
-        truncated: payload.truncated === true,
-        purpose: knowledgeDecisionSummary(decision, injectedCount),
-        resultKind: knowledgeDecisionResultKind(decision),
-        referenceCount: injectedCount,
-      };
-    })
-    .filter((entry): entry is OrchestrationRuntimeKnowledgeAuditEntry => entry !== null)
-    .sort((left, right) => left.timestamp - right.timestamp)
-    .slice(-8);
-
-  if (recentEntries.length === 0) {
-    return undefined;
-  }
-  return {
-    eventCount: recentEntries.length,
-    recentEntries,
-  };
-}
-
 /**
  * 构建 opsView：聚合 recovery、timeline、diagnostics 等后端已有数据。
  */
@@ -1749,55 +1267,18 @@ function deriveOpsView(
     activeSession,
     sessionId,
   );
-  const knowledgeAudit = deriveKnowledgeAudit(runtimeReadModel, recentEvents, sessionId);
-  const eventCount = recentTimeline.length;
 
   // 没有任何有意义数据时返回 null，避免空壳
   const hasContent = recentTimeline.length > 0
-    || recovery !== undefined
-    || knowledgeAudit !== undefined;
+    || recovery !== undefined;
   if (!hasContent) {
     return null;
   }
 
   return {
-    scope: {
-      sessionId,
-    },
-    timelinePath: 'bootstrap',
-    eventCount,
-    diffCount: 0,
     recentTimeline,
-    recentStateDiffs: [],
     recovery,
-    knowledgeAudit,
   };
-}
-
-function collectRuntimeFailureDetails(
-  taskEntries: RustTaskRuntimeSummary[],
-  recentEvents: RustEventEnvelope[],
-  sessionId: string,
-): string[] {
-  const details = taskEntries
-    .filter((task) => {
-      const status = normalizeSubTaskStatus(normalizeString(task.current_status));
-      return status === 'failed' || status === 'blocked';
-    })
-    .map((task) => normalizeString(task.failure_detail))
-    .filter(Boolean);
-
-  for (const event of recentEvents) {
-    if (normalizeString(event.session_id) !== sessionId) {
-      continue;
-    }
-    const failureDetail = resolveEventIssueDetail(resolveEventPayload(event));
-    if (failureDetail) {
-      details.push(failureDetail);
-    }
-  }
-
-  return details.filter((detail, index) => details.indexOf(detail) === index);
 }
 
 type OrchestratorRuntimeSnapshotState = NonNullable<OrchestratorRuntimeState['runtimeSnapshot']>;
@@ -1821,7 +1302,7 @@ function normalizeBudgetWarningLevel(value: string | undefined): BudgetWarningLe
  * 从后端 session.budget 装配上下文预算快照。
  *
  * 后端 usage-authority 已在 DTO 层算好 token 占用、剩余与告警分级，这里只做
- * 字段映射；没有 budget 的会话返回 null，面板据此隐藏预算卡片。
+ * 字段映射；没有 budget 的会话返回 null，展示层保留参数名并将值显示为未知。
  */
 function buildRuntimeSnapshot(
   activeSession: RustSessionRuntimeSummary | undefined,
@@ -1899,69 +1380,12 @@ function deriveRuntimeState(
   sessionId: string,
   generatedAt: number,
 ): OrchestratorRuntimeState | null {
+  const mainline = deriveMainlineRuntimeState(canonicalTurns, sessionId);
   if (!runtimeReadModel) {
-    return null;
+    return mainline ? { sessionId, ...mainline, assignments: [] } : null;
   }
 
-  const { activeSession, taskEntries, runningTaskIds, failedTaskIds } = buildSessionTaskStatusSummary(
-    runtimeReadModel,
-    sessionId,
-  );
-  const rawRootTaskStatus = normalizeString(activeSession?.root_task_status || activeSession?.current_status);
-  const rootTaskStatus = normalizeSubTaskStatus(rawRootTaskStatus);
-  const hasRecoverableChain = activeSession?.has_recoverable_chain === true;
-  const recoverableBranchCount = typeof activeSession?.recoverable_branch_count === 'number'
-    ? activeSession.recoverable_branch_count
-    : 0;
-  const taskStatus = runningTaskIds.length > 0
-    ? 'running'
-    : rootTaskStatus === 'running'
-      ? 'running'
-      : rootTaskStatus === 'blocked'
-        ? 'blocked'
-        : rootTaskStatus === 'completed'
-          ? 'completed'
-          : rootTaskStatus === 'cancelled'
-            ? 'cancelled'
-            : rootTaskStatus === 'failed' || failedTaskIds.length > 0
-              ? 'failed'
-              : rootTaskStatus === 'paused'
-                ? 'paused'
-                : activeSession
-                  ? 'idle'
-                  : 'idle';
-  const latestTurn = canonicalTurns
-    .filter((turn) => turn.sessionId === sessionId)
-    .reduce<CanonicalTurn | null>((latest, turn) => {
-      if (!latest || turn.turnSeq > latest.turnSeq) {
-        return turn;
-      }
-      if (turn.turnSeq === latest.turnSeq && turn.acceptedAt > latest.acceptedAt) {
-        return turn;
-      }
-      return latest;
-    }, null);
-  const status: OrchestratorRuntimeState['status'] = latestTurn
-    ? latestTurn.status === 'pending' || latestTurn.status === 'running'
-      ? 'running'
-      : latestTurn.status === 'completed'
-        ? 'completed'
-        : latestTurn.status === 'blocked'
-          ? 'blocked'
-          : latestTurn.status === 'failed' || latestTurn.status === 'interrupted'
-            ? 'failed'
-            : latestTurn.status === 'cancelled' || latestTurn.status === 'superseded'
-              ? 'cancelled'
-              : taskStatus
-    : taskStatus;
-  const latestTurnAt = latestTurn
-    ? Math.max(
-      latestTurn.acceptedAt,
-      latestTurn.completedAt ?? 0,
-      ...latestTurn.items.map((item) => item.updatedAt),
-    )
-    : 0;
-  const failureDetails = collectRuntimeFailureDetails(taskEntries, recentEvents, sessionId);
+  const { activeSession, taskEntries } = resolveSessionTaskEntries(runtimeReadModel, sessionId);
 
   const opsView = deriveOpsView(
     runtimeReadModel,
@@ -1974,26 +1398,16 @@ function deriveRuntimeState(
 
   return {
     sessionId: sessionId || undefined,
-    status,
-    phase: status,
-    errors: failureDetails,
-    statusChangedAt: Math.max(normalizeNumber(activeSession?.last_update, generatedAt), latestTurnAt),
-    lastEventAt: Math.max(normalizeNumber(activeSession?.last_update, generatedAt), latestTurnAt),
-    ...(activeSession?.continuation ? { continuation: activeSession.continuation } : {}),
-    runtimeReason: activeSession?.latest_event_type || undefined,
+    ...(mainline ?? {
+      status: 'idle',
+      phase: 'idle',
+      statusChangedAt: generatedAt,
+      lastEventAt: generatedAt,
+    }),
+    ...(mainline && activeSession?.continuation ? { continuation: activeSession.continuation } : {}),
     assignments,
-    chain: activeSession?.execution_chain_ref
-      ? {
-          chainId: activeSession.execution_chain_ref,
-          status: activeSession.root_task_status || activeSession.current_status || 'unknown',
-          recoverable: hasRecoverableChain && recoverableBranchCount > 0,
-          createdAt: normalizeNumber(activeSession.last_update, generatedAt),
-          updatedAt: normalizeNumber(activeSession.last_update, generatedAt),
-        }
-      : undefined,
     opsView,
     runtimeSnapshot: buildRuntimeSnapshot(activeSession),
-    runtimeDecisionTrace: [],
   };
 }
 
@@ -2041,10 +1455,6 @@ function normalizeNotifications(
   return normalized;
 }
 
-export function isRustEventEnvelope(value: unknown): value is RustEventEnvelope {
-  return normalizeEventEnvelope(value) !== null;
-}
-
 export function parseRustEventEnvelope(rawData: string): RustEventEnvelope | null {
   try {
     return normalizeEventEnvelope(JSON.parse(rawData));
@@ -2079,7 +1489,6 @@ export function normalizeRustBootstrapPayload(
   ));
   const assignments = buildAssignmentsFromRuntime(
     payload.runtimeReadModel,
-    normalizedEvents,
     currentSession?.id || '',
   );
   const processingState = deriveProcessingState(

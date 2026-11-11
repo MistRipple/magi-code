@@ -1086,7 +1086,7 @@ mod tests {
                 }
             })
             .collect();
-        SessionStore::from_state(magi_session_store::SessionStoreState {
+        SessionStore::from_state_for_test(magi_session_store::SessionStoreState {
             canonical_turns: turns,
             ..Default::default()
         })
@@ -1146,7 +1146,6 @@ mod tests {
                     last_used_at: magi_core::UtcMillis(2),
                     observed_context_window_tokens: None,
                     handled_task_ids: vec![previous.task_id.clone()],
-                    message_history: Vec::new(),
                 })
                 .unwrap();
             let recovered = ToolExecutionLedger::from_canonical_task(
@@ -1214,7 +1213,7 @@ mod tests {
                 magi_tool_runtime::BACKGROUND_JOB_METADATA_KEY.into(),
                 serde_json::to_value(job).unwrap(),
             );
-            let store = SessionStore::from_state(state);
+            let store = SessionStore::from_state_for_test(state);
             let recovered = ToolExecutionLedger::from_canonical_task(
                 &store,
                 &TaskStore::new(),
@@ -1288,7 +1287,7 @@ mod tests {
                 magi_session_store::user_question::USER_QUESTION_METADATA_KEY.into(),
                 serde_json::to_value(question).unwrap(),
             );
-            let store = SessionStore::from_state(state);
+            let store = SessionStore::from_state_for_test(state);
             let recovered = ToolExecutionLedger::from_canonical_task(
                 &store,
                 &TaskStore::new(),
@@ -1475,8 +1474,9 @@ mod tests {
             let store = canonical_history(&task, &[(status, result)]);
             assert!(
                 store
-                    .thread_message_history(&ThreadId::new("recovery-thread"))
-                    .is_empty()
+                    .thread_registry_snapshot(&SessionId::new("recovery-session"))
+                    .is_empty(),
+                "未知副作用从 canonical 工具账本恢复，不依赖线程注册表或模型历史"
             );
             let recovered = ToolExecutionLedger::from_canonical_task(
                 &store,

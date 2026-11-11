@@ -127,10 +127,3 @@ export function parseCodeBlockDiagramPayload(language: string, code: string): Di
   }
   return null;
 }
-
-export function diagramSummary(payload: DiagramPayload): string {
-  if (payload.title?.trim()) {
-    return payload.title.trim();
-  }
-  return payload.summary?.trim() || '';
-}

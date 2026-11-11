@@ -37,6 +37,9 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
         if let Some(temperature) = params.temperature {
             body["temperature"] = json!(temperature);
         }
+        if !params.stop.is_empty() {
+            body["stop"] = json!(params.stop);
+        }
         if let Some(ref tools) = params.tools
             && !tools.is_empty()
         {
@@ -255,6 +258,7 @@ mod tests {
             messages,
             max_tokens: None,
             temperature: None,
+            stop: Vec::new(),
             tools: None,
             stream: None,
 

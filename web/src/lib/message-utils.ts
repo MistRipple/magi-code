@@ -14,7 +14,6 @@ import type { Message, ContentBlock, ToolCall, ThinkingBlock, RetryRuntimeState 
 import type { ContentBlock as StandardContentBlock } from '../shared/protocol/message-protocol';
 import { normalizeMessagePayload } from './message-payload';
 import { ensureArray } from './utils';
-import { i18n } from '../stores/i18n.svelte';
 
 export function safeParseJson(value?: string): Record<string, unknown> | null {
   if (!value || typeof value !== 'string') return null;
@@ -392,21 +391,4 @@ function mapToolResultStatus(
     default:
       return 'success';
   }
-}
-
-export function formatPlanBlock(block: any): string {
-  const parts: string[] = [];
-  if (block.goal) parts.push(i18n.t('messageHandler.planGoal', { goal: block.goal }));
-  if (block.analysis) parts.push(i18n.t('messageHandler.planAnalysis', { analysis: block.analysis }));
-  if (Array.isArray(block.constraints) && block.constraints.length > 0) {
-    parts.push(`${i18n.t('messageHandler.planConstraints')}\n- ${block.constraints.join('\n- ')}`);
-  }
-  if (Array.isArray(block.acceptanceCriteria) && block.acceptanceCriteria.length > 0) {
-    parts.push(`${i18n.t('messageHandler.planAcceptanceCriteria')}\n- ${block.acceptanceCriteria.join('\n- ')}`);
-  }
-  if (block.riskLevel) parts.push(i18n.t('messageHandler.planRiskLevel', { riskLevel: block.riskLevel }));
-  if (Array.isArray(block.riskFactors) && block.riskFactors.length > 0) {
-    parts.push(`${i18n.t('messageHandler.planRiskFactors')}\n- ${block.riskFactors.join('\n- ')}`);
-  }
-  return parts.join('\n\n');
 }

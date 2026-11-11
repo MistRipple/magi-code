@@ -21,6 +21,7 @@ mod image_attachments;
 mod removal;
 mod runtime_catalog;
 mod upgrade;
+mod web;
 
 pub use drain::PluginDrainGuard;
 pub use removal::PluginChangeScope;
@@ -80,6 +81,8 @@ pub struct PluginManagerState {
     pub plugins: BTreeMap<String, InstalledPlugin>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     removals: BTreeMap<String, removal::PendingRemoval>,
+    #[serde(default)]
+    web: web::WebConfiguration,
 }
 
 impl Default for PluginManagerState {
@@ -88,6 +91,7 @@ impl Default for PluginManagerState {
             schema_version: STATE_VERSION,
             plugins: BTreeMap::new(),
             removals: BTreeMap::new(),
+            web: web::WebConfiguration::default(),
         }
     }
 }
@@ -552,7 +556,7 @@ impl PluginManager {
     pub fn activate(&mut self, id: &str) -> Result<ActivePlugin, PluginError> {
         let package = self.package(id)?;
         self.ensure_not_draining(id)?;
-        ensure_host_supports_surfaces(package.manifest())?;
+        self.ensure_host_supported(id)?;
         let installed = self.state.plugins.get(id).expect("package checked");
         if !installed.enabled {
             return Err(conflict("插件未启用"));
@@ -653,6 +657,11 @@ impl PluginManager {
             .collect()
     }
 
+    /// 激活、重启恢复和运行准入共用宿主能力裁决；已安装包可继续查看、更新或卸载。
+    pub fn ensure_host_supported(&self, id: &str) -> Result<(), PluginError> {
+        ensure_host_supports_surfaces(self.package(id)?.manifest())
+    }
+
     /// 应用级实例与工作区准入分别记录；应用级激活不授予其他工作区权限。
     pub fn is_active(&self, id: &str) -> Result<bool, PluginError> {
         let package = self.package(id)?;
@@ -665,6 +674,7 @@ impl PluginManager {
             && !self.is_draining(id)
             && installed.active
             && installed.enabled
+            && ensure_host_supports_surfaces(package.manifest()).is_ok()
             && permissions_granted(package.manifest(), installed))
     }
 
@@ -885,6 +895,21 @@ impl PluginManager {
 /// 激活时明确拒绝，而不是接纳后静默按此语义运行。
 fn ensure_host_supports_surfaces(manifest: &PluginManifest) -> Result<(), PluginError> {
     use magi_app_server_protocol::generated::{PluginSurfaceCloseAction, PluginSurfacePersistence};
+    // 旧 DSH 翻译产物把替换消息渲染器映射为 chatAssistant。它与 Magi 原生
+    // 附加视图的合同不同，不能因已有授权或重启恢复而继续执行；不按包名判断。
+    if manifest
+        .extension
+        .as_ref()
+        .is_some_and(|extension| extension.compat.is_some())
+        && manifest.contributions.views.iter().any(|view| {
+            view.placements
+                .contains(&magi_app_server_protocol::PluginViewPlacement::ChatAssistant)
+        })
+    {
+        return Err(conflict(
+            "PLUGIN_UI_BOUNDARY_CONFLICT：旧翻译产物将上游消息替换转换为附加视图，与 Magi 原生对话边界冲突，不能启用。请通过在线更新重新检查；要求替换原生对话的原包仍会拒绝，原设置和数据保留",
+        ));
+    }
     let unsupported = manifest
         .contributions
         .browser_surfaces

@@ -1,5 +1,88 @@
 use serde::{Deserialize, Serialize};
 
+/// 模型调用的业务归属。插件操作不会创建或冒充用户会话。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginModelOwner {
+    pub plugin_id: String,
+    pub digest: String,
+    pub instance_id: String,
+    pub operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+impl PluginModelOwner {
+    pub fn key(&self) -> String {
+        format!("{}:{}:{}", self.plugin_id, self.digest, self.operation_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum UsageOwner {
+    Session {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
+    Plugin {
+        plugin: PluginModelOwner,
+    },
+}
+
+impl<'de> Deserialize<'de> for UsageOwner {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Fields {
+            session_id: Option<String>,
+            plugin: Option<PluginModelOwner>,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        match (fields.session_id, fields.plugin) {
+            (Some(session_id), None) if !session_id.trim().is_empty() => {
+                Ok(Self::Session { session_id })
+            }
+            (None, Some(plugin)) if !plugin.plugin_id.trim().is_empty() => {
+                Ok(Self::Plugin { plugin })
+            }
+            _ => Err(serde::de::Error::custom("模型用量必须且只能归属会话或插件")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum UsageSubject {
+    Session(String),
+    Plugin(String),
+}
+
+impl UsageOwner {
+    pub fn session(session_id: impl Into<String>) -> Self {
+        Self::Session {
+            session_id: session_id.into(),
+        }
+    }
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::Session { session_id } => Some(session_id),
+            Self::Plugin { .. } => None,
+        }
+    }
+    pub fn ledger_key(&self) -> String {
+        match self {
+            Self::Session { session_id } => session_id.clone(),
+            Self::Plugin { plugin } => format!("plugin:{}", plugin.key()),
+        }
+    }
+    pub(crate) fn subject(&self) -> UsageSubject {
+        match self {
+            Self::Session { session_id } => UsageSubject::Session(session_id.clone()),
+            Self::Plugin { plugin } => UsageSubject::Plugin(plugin.plugin_id.clone()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageSourceRole {
@@ -8,17 +91,6 @@ pub enum UsageSourceRole {
     Auxiliary,
     ImageGeneration,
     Vision,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsageScope {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace_id: Option<String>,
-    pub session_id: String,
-    pub turn_id: Option<String>,
-    pub dispatch_wave_id: Option<String>,
-    pub assignment_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -128,7 +200,6 @@ pub struct UsageEventUsageDelta {
 pub enum UsageEventType {
     LlmCallCompleted,
     LlmCallFailed,
-    SessionReset,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,7 +217,8 @@ pub struct UsageEvent {
     pub ledger_seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
-    pub session_id: String,
+    #[serde(flatten)]
+    pub owner: UsageOwner,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,6 +253,15 @@ pub struct UsagePerformanceTotals {
     pub last_observed_at: u64,
     pub last_ttft_ms: Option<u64>,
     pub last_tps: Option<f64>,
+    /// End-to-end response throughput; includes all reported output and waiting time.
+    #[serde(default)]
+    pub response_sample_count: u64,
+    #[serde(default)]
+    pub response_output_tokens: u64,
+    #[serde(default)]
+    pub response_duration_ms: u64,
+    #[serde(default)]
+    pub last_response_tps: Option<f64>,
 }
 
 impl UsagePerformanceTotals {
@@ -199,6 +280,10 @@ impl UsagePerformanceTotals {
             last_observed_at: last.last_observed_at,
             last_ttft_ms: last.last_ttft_ms,
             last_tps: last.last_tps,
+            response_sample_count: self.response_sample_count + other.response_sample_count,
+            response_output_tokens: self.response_output_tokens + other.response_output_tokens,
+            response_duration_ms: self.response_duration_ms + other.response_duration_ms,
+            last_response_tps: last.last_response_tps,
         }
     }
 }
@@ -267,6 +352,10 @@ impl UsageTotals {
 #[serde(rename_all = "camelCase")]
 pub struct UsageBindingSnapshot {
     pub template_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub engine_id: String,
     pub binding_revision: u32,
     pub role: UsageSourceRole,
@@ -306,6 +395,49 @@ pub struct SessionUsageSnapshot {
     pub totals: UsageTotals,
     pub by_execution_binding: Vec<UsageBindingSnapshot>,
     pub by_model_identity: Vec<UsageModelSnapshot>,
+}
+
+/// 统计投影的公共聚合部分，既不带会话身份也不制造插件会话。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct UsageAggregateSnapshot {
+    pub version: u64,
+    pub last_applied_ledger_seq: u64,
+    pub updated_at: u64,
+    pub totals: UsageTotals,
+    pub by_execution_binding: Vec<UsageBindingSnapshot>,
+    pub by_model_identity: Vec<UsageModelSnapshot>,
+}
+
+impl UsageAggregateSnapshot {
+    pub(crate) fn into_session(
+        self,
+        workspace_id: Option<&str>,
+        session_id: &str,
+    ) -> SessionUsageSnapshot {
+        SessionUsageSnapshot {
+            workspace_id: workspace_id.map(str::to_owned),
+            session_id: session_id.into(),
+            version: self.version,
+            last_applied_ledger_seq: self.last_applied_ledger_seq,
+            updated_at: self.updated_at,
+            totals: self.totals,
+            by_execution_binding: self.by_execution_binding,
+            by_model_identity: self.by_model_identity,
+        }
+    }
+}
+
+impl From<&SessionUsageSnapshot> for UsageAggregateSnapshot {
+    fn from(s: &SessionUsageSnapshot) -> Self {
+        Self {
+            version: s.version,
+            last_applied_ledger_seq: s.last_applied_ledger_seq,
+            updated_at: s.updated_at,
+            totals: s.totals.clone(),
+            by_execution_binding: s.by_execution_binding.clone(),
+            by_model_identity: s.by_model_identity.clone(),
+        }
+    }
 }
 
 impl SessionUsageSnapshot {
@@ -394,7 +526,8 @@ pub struct LlmConfig {
 pub struct UsageCallRecordInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
-    pub session_id: String,
+    #[serde(flatten)]
+    pub owner: UsageOwner,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

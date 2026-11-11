@@ -220,6 +220,7 @@ pub struct ImageSource {
 pub struct ParsedToolResultModelContent {
     pub text: String,
     pub images: Vec<ImageSource>,
+    pub is_error: bool,
 }
 
 pub fn parse_tool_result_model_content(raw_content: Option<&str>) -> ParsedToolResultModelContent {
@@ -228,12 +229,14 @@ pub fn parse_tool_result_model_content(raw_content: Option<&str>) -> ParsedToolR
         return ParsedToolResultModelContent {
             text: raw.to_string(),
             images: Vec::new(),
+            is_error: false,
         };
     };
     let Some(items) = value.get("model_content").and_then(Value::as_array) else {
         return ParsedToolResultModelContent {
             text: raw.to_string(),
             images: Vec::new(),
+            is_error: false,
         };
     };
 
@@ -259,10 +262,15 @@ pub fn parse_tool_result_model_content(raw_content: Option<&str>) -> ParsedToolR
         }
     }
 
-    if images.is_empty() {
+    let is_error = value
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if images.is_empty() && !is_error {
         return ParsedToolResultModelContent {
             text: raw.to_string(),
             images,
+            is_error,
         };
     }
 
@@ -272,9 +280,19 @@ pub fn parse_tool_result_model_content(raw_content: Option<&str>) -> ParsedToolR
         .filter(|summary| !summary.trim().is_empty())
         .map(str::to_string)
         .or_else(|| (!texts.is_empty()).then(|| texts.join("\n")))
-        .unwrap_or_else(|| "工具返回了一张图片。".to_string());
+        .unwrap_or_else(|| {
+            if images.is_empty() {
+                String::new()
+            } else {
+                "工具返回了一张图片。".to_string()
+            }
+        });
 
-    ParsedToolResultModelContent { text, images }
+    ParsedToolResultModelContent {
+        text,
+        images,
+        is_error,
+    }
 }
 
 fn parse_image_source(value: Option<&Value>) -> Option<ImageSource> {
@@ -444,93 +462,6 @@ pub struct PartialToolCall {
     /// OpenAI tool_call 在并行调用时通过 index 区分不同的 tool call。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<usize>,
-}
-
-use once_cell::sync::Lazy;
-use regex::Regex;
-
-static SUMMARY_HIJACK_MAIN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)Your task is to create a detailed summary").unwrap());
-static SUMMARY_HIJACK_NO_TOOLS: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)IMPORTANT:\s*Do NOT use any tools").unwrap());
-static SUMMARY_HIJACK_ANALYSIS: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)<analysis>").unwrap());
-static SUMMARY_HIJACK_SUMMARY: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)<summary>").unwrap());
-
-pub fn is_summary_hijack_text(text: &str) -> bool {
-    let normalized = text.trim();
-    if normalized.is_empty() {
-        return false;
-    }
-
-    let has_main = SUMMARY_HIJACK_MAIN.is_match(normalized);
-    let has_no_tools = SUMMARY_HIJACK_NO_TOOLS.is_match(normalized);
-    let has_analysis = SUMMARY_HIJACK_ANALYSIS.is_match(normalized);
-    let has_summary = SUMMARY_HIJACK_SUMMARY.is_match(normalized);
-    let has_tag_pair = has_analysis && has_summary;
-
-    if has_main && (has_no_tools || has_tag_pair) {
-        return true;
-    }
-    has_no_tools && has_tag_pair
-}
-
-pub fn sanitize_summary_hijack_messages(messages: &[LlmMessage]) -> Vec<LlmMessage> {
-    let mut sanitized = Vec::new();
-
-    for message in messages {
-        if message.role != "assistant" {
-            sanitized.push(message.clone());
-            continue;
-        }
-
-        match &message.content {
-            LlmMessageContent::Text(text) => {
-                if !is_summary_hijack_text(text) {
-                    sanitized.push(message.clone());
-                }
-            }
-            LlmMessageContent::Blocks(blocks) => {
-                let has_tool_use = blocks
-                    .iter()
-                    .any(|b| matches!(b, LlmContentBlock::ToolUse { .. }));
-
-                if !has_tool_use {
-                    let merged_text: String = blocks
-                        .iter()
-                        .filter_map(|b| match b {
-                            LlmContentBlock::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                    if !is_summary_hijack_text(&merged_text) {
-                        sanitized.push(message.clone());
-                    }
-                    continue;
-                }
-
-                let filtered: Vec<LlmContentBlock> = blocks
-                    .iter()
-                    .filter(|b| match b {
-                        LlmContentBlock::Text { text } => !is_summary_hijack_text(text),
-                        _ => true,
-                    })
-                    .cloned()
-                    .collect();
-
-                if !filtered.is_empty() {
-                    sanitized.push(LlmMessage {
-                        origin: message.origin,
-                        role: message.role.clone(),
-                        content: LlmMessageContent::Blocks(filtered),
-                    });
-                }
-            }
-        }
-    }
-
-    sanitized
 }
 
 pub fn sanitize_tool_order(messages: &[LlmMessage]) -> Vec<LlmMessage> {

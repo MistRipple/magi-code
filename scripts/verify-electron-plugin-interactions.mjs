@@ -1,7 +1,7 @@
 // 打包版真实 Electron：在线搜索、原包图标、翻译失败、确认安装与窄屏。
 // CDP 只在取消／乱序／搜索失败用例中暂停或失败 HTTP 请求，不替代插件安装事实。
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,7 +11,8 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
 const port = 38939, cdpPort = 9309, origin = `http://127.0.0.1:${port}`;
 const work = await mkdtemp(join(tmpdir(), 'magi-plugin-interactions-'));
-const output = join(root, 'target/plugin-acceptance/interactions');
+const output = process.env.MAGI_PLUGIN_INTERACTIONS_OUTPUT || join(root, 'target/plugin-acceptance/interactions');
+const clipAuditSource = process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE ? await readFile(process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE,'utf8') : null;
 await mkdir(output, { recursive: true });
 const report = createReporter(), errors = [];
 let app, page, ui, previews = 0;
@@ -29,7 +30,14 @@ const search = async (text) => {
   await waitFor(() => ui.exists('[data-testid=plugin-search-loading]'), '搜索加载反馈');
   await waitFor(async () => !await ui.exists('[data-testid=plugin-search-loading]'), '搜索完成', 60_000);
 };
-const screenshot = (name) => ui.screenshot().then((data) => writeFile(join(output, `${name}.png`), Buffer.from(data, 'base64')));
+async function screenshot(name) {
+  await writeFile(join(output, `${name}.png`), Buffer.from(await ui.screenshot(), 'base64'));
+  if (clipAuditSource) {
+    const audit = await page.evaluate(`(${clipAuditSource})({root:'[data-testid=plugin-detail]',viewport:true})`);
+    await writeFile(join(output,`${name}-clip.json`),JSON.stringify(audit,null,2));
+    report.check(`${name} 当前详情与操作区阴影无裁切`,audit.cut===0,JSON.stringify(audit));
+  }
+}
 async function intercept(pattern) {
   let request;
   const off = page.on('Fetch.requestPaused', (event) => { request = event; });
@@ -39,14 +47,27 @@ async function intercept(pattern) {
 async function fixedAction(button, scroller) {
   return page.evaluate(`(()=>{const button=document.querySelector(${JSON.stringify(button)}),scroll=document.querySelector(${JSON.stringify(scroller)});const stress=document.createElement('div');stress.style.height='2000px';scroll.append(stress);const before=button.getBoundingClientRect();scroll.scrollTop=scroll.scrollHeight;const after=button.getBoundingClientRect();stress.remove();scroll.scrollTop=0;return Math.abs(after.bottom-before.bottom)<1 && after.bottom<=innerHeight && after.top>=0;})()`);
 }
-async function narrowAction(button, scroller, name) {
+async function narrowAction(button, scroller, name, longLabel = '') {
   await page.call('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: false });
   try {
     await page.evaluate('document.querySelector("[data-testid=plugin-detail]").scrollIntoView({block:"nearest"}); true');
     const fixed = await fixedAction(button, scroller);
     const fits = await page.evaluate('document.documentElement.scrollWidth <= innerWidth');
     await screenshot(name);
-    return fixed && fits;
+    let longLabelFits = true;
+    if (longLabel) {
+      const caption = await ui.text(button);
+      try {
+        await page.evaluate(`document.querySelector(${JSON.stringify(button)}).textContent=${JSON.stringify(longLabel)};true`);
+        const geometry = await page.evaluate(`(()=>{const footer=document.querySelector('[data-testid=plugin-candidate-actions]'),box=footer.getBoundingClientRect();return {viewport:{width:innerWidth,height:innerHeight},footer:box.toJSON(),buttons:[...footer.querySelectorAll('button')].map(b=>b.getBoundingClientRect().toJSON()),fits:document.documentElement.scrollWidth<=innerWidth&&[...footer.querySelectorAll('button')].every(b=>{const r=b.getBoundingClientRect();return r.left>=box.left&&r.right<=box.right&&r.top>=0&&r.bottom<=innerHeight;})};})()`);
+        await writeFile(join(output,`${name}-long-label.json`),JSON.stringify(geometry,null,2));
+        await screenshot(`${name}-long-label`);
+        longLabelFits = geometry.fits;
+      } finally {
+        await page.evaluate(`document.querySelector(${JSON.stringify(button)}).textContent=${JSON.stringify(caption)};true`);
+      }
+    }
+    return fixed && fits && longLabelFits;
   } finally {
     await page.call('Emulation.clearDeviceMetricsOverride');
     await page.evaluate('document.querySelector("[data-testid=plugin-detail]").scrollIntoView({block:"nearest"}); true');
@@ -97,7 +118,10 @@ try {
     && await page.evaluate('document.querySelector("[data-testid=plugin-detail]").contains(document.querySelector("[data-testid=plugin-candidate]"))'));
   report.check('长权限预览滚动时确认安装按钮仍固定可见', await fixedAction('[data-action=confirm-candidate]', '[data-testid=plugin-candidate-scroll]'));
   await screenshot('preview');
-  report.check('390px 窄屏确认安装按钮固定可见', await narrowAction('[data-action=confirm-candidate]', '[data-testid=plugin-candidate-scroll]', 'preview-390'));
+  const confirmationSize = await page.evaluate(`(()=>{const b=document.querySelector('[data-action=confirm-candidate]'),r=b.getBoundingClientRect();return {height:r.height,width:r.width,requiredHeight:parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--btn-height-xl'))};})()`);
+  await writeFile(join(output,'confirmation-size.json'),JSON.stringify(confirmationSize,null,2));
+  report.check('确认安装保持主要操作的共享尺寸，不缩成紧凑辅助按钮',confirmationSize.height>=confirmationSize.requiredHeight,JSON.stringify(confirmationSize));
+  report.check('390px 窄屏及加长文案下确认与取消操作均可见', await narrowAction('[data-action=confirm-candidate]', '[data-testid=plugin-candidate-scroll]', 'preview-390', 'Confirm installation of this plugin and review its permissions'));
   await ui.click('[data-action=confirm-candidate]');
   await waitFor(() => page.evaluate('document.querySelector("[data-action=confirm-candidate]")?.disabled'), '安装中的确认按钮');
   report.check('确认安装期间显示进度并阻止重复提交', /安装|Installing/.test(await ui.text('[data-action=confirm-candidate]')));
@@ -113,6 +137,7 @@ try {
     await ui.click('[data-action=confirm-candidate]'); installed = await installResult();
   }
   assert.ok(installed.plugin, installed.error); const plugin = installed.plugin;
+  await writeFile(join(output,'installed.json'),JSON.stringify({id:plugin.manifest.id,version:plugin.manifest.version,source:plugin.source},null,2));
   await waitFor(() => ui.exists(`[data-testid=plugin-card][data-plugin-id="${plugin.manifest.id}"]`), '安装后保持选中');
   await waitFor(() => page.evaluate('!document.querySelector("[data-action=activate]")?.disabled'), '后续操作恢复');
   report.check('安装后保持当前插件详情且可继续授权激活', true);

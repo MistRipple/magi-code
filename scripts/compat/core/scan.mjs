@@ -1,11 +1,11 @@
-// 上游源码的静态扫描：只读语法树，不执行任何上游代码。供各翻译器复用。
+// DSH 原包的静态扫描：只读语法树，不执行任何上游代码。
 //
-// 判定“某个标识符是不是宿主给的上下文对象”靠数据流，不靠变量名：从生态给出的种子函数（DSH 的 apply、
-// pi 的默认导出工厂）出发，沿回调与同文件调用传播。LLM 请求里的 `context.messages` 之类同名变量不会混进来。
+// 从 DSH apply 入口按数据流传播宿主上下文，沿回调与同文件调用识别，
+// 不把 LLM 请求里的 `context.messages` 等同名变量当成宿主 API。
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, extname, join, relative, resolve } from 'node:path';
 import ts from 'typescript';
-import { conditionalService, guardedRegistration } from './optional.mjs';
+import { conditionalDependencies, conditionalService, guardedRegistration, nullableRegistration } from './optional.mjs';
 
 const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs', '.jsx']);
 const SKIP_DIRECTORIES = new Set(['node_modules', '.git', 'lib', 'dist', 'tests', 'test', '__tests__']);
@@ -48,7 +48,7 @@ function resolveRelative(fromFile, specifier) {
  * 从入口文件出发，沿相对导入收集会随入口一起运行的文件。
  * 相对导入解析不到时抛错：漏扫一个文件就可能漏掉一个不可翻译的 API，不能静默跳过。
  */
-export function reachableFiles(entries) {
+export function reachableFiles(entries, followImport = () => true, parsed) {
   const seen = new Set();
   const queue = (Array.isArray(entries) ? entries : [entries]).map((entry) => resolve(entry));
   while (queue.length > 0) {
@@ -56,16 +56,16 @@ export function reachableFiles(entries) {
     if (seen.has(file)) continue;
     if (!existsSync(file)) throw new Error(`入口依赖的文件不存在：${file}`);
     seen.add(file);
-    const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
-    const follow = (specifier) => {
+    const source = parsed?.get(file)?.source ?? ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
+    const follow = (specifier, node) => {
       if (!specifier.startsWith('.')) return;
       const target = resolveRelative(file, specifier);
       if (!target) throw new Error(`无法解析相对导入 ${specifier}（来自 ${file}）`);
-      if (SOURCE_EXTENSIONS.has(extname(target))) queue.push(target);
+      if (SOURCE_EXTENSIONS.has(extname(target)) && followImport(node, file)) queue.push(target);
     };
     const visit = (node) => {
-      if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) follow(node.moduleSpecifier.text);
-      else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword && ts.isStringLiteralLike(node.arguments[0])) follow(node.arguments[0].text);
+      if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) follow(node.moduleSpecifier.text, node);
+      else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword && ts.isStringLiteralLike(node.arguments[0])) follow(node.arguments[0].text, node);
       ts.forEachChild(node, visit);
     };
     visit(source);
@@ -73,10 +73,11 @@ export function reachableFiles(entries) {
   return [...seen].sort();
 }
 
-function bump(map, key, file, optional = false) {
-  const entry = map.get(key) ?? { count: 0, optionalCount: 0, files: new Set() };
+function bump(map, key, file, optional = false, nullable = false) {
+  const entry = map.get(key) ?? { count: 0, optionalCount: 0, nullableCount: 0, files: new Set() };
   entry.count += 1;
   if (optional) entry.optionalCount += 1;
+  if (nullable) entry.nullableCount += 1;
   entry.files.add(file);
   map.set(key, entry);
 }
@@ -105,23 +106,21 @@ function paramName(fn, index = 0) {
   return parameter ? IDENT(parameter.name) : undefined;
 }
 
-/** 对象字面量里值为函数的属性（含方法简写）。 */
-function functionProperties(objectLiteral, names) {
-  const found = [];
-  for (const property of objectLiteral.properties ?? []) {
-    const name = property.name && (IDENT(property.name) ?? (ts.isStringLiteralLike(property.name) ? property.name.text : undefined));
-    if (!name || !names.includes(name)) continue;
-    if (ts.isMethodDeclaration(property)) found.push({ name, fn: property });
-    else if (ts.isPropertyAssignment(property) && isFunctionLike(property.initializer)) found.push({ name, fn: property.initializer });
-  }
-  return found;
+function declarationScope(node) {
+  if (ts.isCatchClause(node.parent)) return node.parent;
+  const blockScoped = ts.isVariableDeclarationList(node.parent) && (node.parent.flags & ts.NodeFlags.BlockScoped);
+  let scope = node.parent;
+  while (scope.parent && !(blockScoped && (ts.isBlock(scope) || ts.isCaseBlock(scope)
+    || ts.isForStatement(scope) || ts.isForOfStatement(scope) || ts.isForInStatement(scope)))
+    && !isFunctionLike(scope) && !ts.isSourceFile(scope)) scope = scope.parent;
+  return scope;
 }
 
 /**
  * 生态数据流描述：
  *   seeds(source) → [{ fn, index, label }]   种子函数及其上下文形参
  *   derive(call, label) → [{ fn, index, label }]   由已知上下文的调用派生出的回调及其上下文形参
- *   keyOf(label) → 报告里的前缀（如 ctx / pi）
+ *   keyOf(label) → 报告里的前缀（ctx）
  *   eventLabel   事件监听所属的上下文标签
  */
 export const DSH_FLOW = {
@@ -146,47 +145,6 @@ export const DSH_FLOW = {
   },
 };
 
-export const PI_FLOW = {
-  keyOf: (label) => (label === 'ctx' ? 'ctx' : 'pi'),
-  eventLabel: 'pi',
-  seeds(source) {
-    const seeds = [];
-    const named = new Map();
-    ts.forEachChild(source, (node) => {
-      if (ts.isFunctionDeclaration(node) && node.name) named.set(node.name.text, node);
-      if (ts.isVariableStatement(node)) for (const d of node.declarationList.declarations) {
-        if (IDENT(d.name) && isFunctionLike(d.initializer)) named.set(d.name.text, d.initializer);
-      }
-    });
-    ts.forEachChild(source, (node) => {
-      const isDefault = ts.isFunctionDeclaration(node) && node.modifiers?.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword);
-      if (isDefault) seeds.push({ fn: node, index: 0, label: 'pi' });
-      if (ts.isExportAssignment(node) && !node.isExportEquals) {
-        if (isFunctionLike(node.expression)) seeds.push({ fn: node.expression, index: 0, label: 'pi' });
-        else if (IDENT(node.expression) && named.has(node.expression.text)) seeds.push({ fn: named.get(node.expression.text), index: 0, label: 'pi' });
-      }
-    });
-    return seeds;
-  },
-  derive(call, label) {
-    if (label !== 'pi' || !ts.isPropertyAccessExpression(call.expression)) return [];
-    const method = call.expression.name.text;
-    const out = [];
-    // pi.on(event, (event, ctx) => …)
-    if (method === 'on') for (const arg of call.arguments.slice(1)) if (isFunctionLike(arg)) out.push({ fn: arg, index: 1, label: 'ctx' });
-    // pi.registerCommand(name, { handler(args, ctx) }) / pi.registerTool({ execute(id, params, signal, onUpdate, ctx) })
-    if (method === 'registerCommand' || method === 'registerTool') {
-      for (const arg of call.arguments) {
-        if (!ts.isObjectLiteralExpression(arg)) continue;
-        for (const { name, fn } of functionProperties(arg, ['handler', 'execute'])) {
-          out.push({ fn, index: name === 'execute' ? 4 : 1, label: 'ctx' });
-        }
-      }
-    }
-    return out;
-  },
-};
-
 /**
  * 跨文件上下文传播。输入是整个文件集合：
  *  - 每个文件解析一次；具名函数（含 `export function`/`export const f = () =>`）按“文件 + 名字”登记；
@@ -204,10 +162,21 @@ function analyzeContexts(files, flow) {
   }
   const info = new Map();
   for (const [file, source] of parsed) {
-    const functions = new Map();
+    const functions = new Map(), scopes = new Map();
+    const declare = (scope, name) => {
+      if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) {
+        for (const element of name.elements) if (ts.isBindingElement(element)) declare(scope, element.name);
+        return;
+      }
+      if (!IDENT(name)) return;
+      const names = scopes.get(scope) ?? new Map();
+      names.set(name.text, undefined); scopes.set(scope, names);
+    };
     const collect = (node) => {
       if (ts.isFunctionDeclaration(node) && node.name) functions.set(node.name.text, node);
       if (ts.isVariableDeclaration(node) && IDENT(node.name) && isFunctionLike(node.initializer)) functions.set(node.name.text, node.initializer);
+      if (isFunctionLike(node)) for (const parameter of node.parameters) declare(node, parameter.name);
+      if (ts.isVariableDeclaration(node)) declare(declarationScope(node), node.name);
       ts.forEachChild(node, collect);
     };
     collect(source);
@@ -224,7 +193,7 @@ function analyzeContexts(files, flow) {
       const defaultName = IDENT(statement.importClause?.name);
       if (defaultName) imports.set(defaultName, { file: target, exported: 'default' });
     }
-    info.set(file, { source, functions, imports, scopes: new Map() });
+    info.set(file, { source, functions, imports, scopes });
   }
   const add = (file, fn, name, label) => {
     if (!name) return false;
@@ -237,7 +206,7 @@ function analyzeContexts(files, flow) {
   for (const [file, { source }] of info) for (const seed of flow.seeds(source)) add(file, seed.fn, paramName(seed.fn, seed.index), seed.label);
   const labelAt = (file, name, at) => {
     const scopes = info.get(file).scopes;
-    for (let n = at.parent; n; n = n.parent) { const label = scopes.get(n)?.get(name); if (label) return label; }
+    for (let n = at.parent; n; n = n.parent) if (scopes.get(n)?.has(name)) return scopes.get(n).get(name);
     return undefined;
   };
   /** 目标函数：同文件具名函数，或导入来的具名/默认导出函数。 */
@@ -267,6 +236,13 @@ function analyzeContexts(files, flow) {
     if (++pass > 50) throw new Error('上下文传播未收敛');
     for (const [file, { source }] of info) {
       const walk = (node) => {
+        // 不可变局部别名仍是同一个上下文，必须参与跨文件传播；不能等受限
+        // 启动后才发现经 `const host = ctx` 注册的必需事件或服务。
+        if (ts.isVariableDeclaration(node) && IDENT(node.name) && IDENT(node.initializer)
+          && ts.isVariableDeclarationList(node.parent) && (node.parent.flags & ts.NodeFlags.Const)) {
+          const alias = labelAt(file, IDENT(node.initializer), node);
+          if (alias) changed = add(file, declarationScope(node), IDENT(node.name), alias) || changed;
+        }
         if (ts.isCallExpression(node)) {
           const root = ts.isPropertyAccessExpression(node.expression) ? IDENT(rootOf(node.expression)) : undefined;
           const label = root && labelAt(file, root, node);
@@ -304,13 +280,13 @@ function rootOf(expr) {
 
 /**
  * @param {string} root 上游包根目录
- * @param {{ directories?: string[], entry?: string|string[], files?: string[], flow?: object, chainDepth?: number }} options
+ * @param {{ directories?: string[], entry?: string|string[], files?: string[], flow?: object, chainDepth?: number, unavailableServices?: string[] }} options
  * entry（沿相对导入收集，已构建产物或入口清单）、files（调用方已确定的文件集合）、directories（按目录扫描源码）三选一。
  */
 export function scanSources(root, options = {}) {
   const flow = options.flow ?? DSH_FLOW;
   const depth = options.chainDepth ?? 3;
-  const files = options.files ?? (options.entry ? reachableFiles(options.entry) : listSourceFiles(root, options.directories));
+  let files = options.files ?? (options.entry ? reachableFiles(options.entry) : listSourceFiles(root, options.directories));
   const imports = new Map();
   const symbols = new Map();
   const calls = new Map();
@@ -321,7 +297,50 @@ export function scanSources(root, options = {}) {
   const profileMutations = [];
   const profilePackageProcesses = [];
   let lines = 0;
-  const { info, unresolved } = analyzeContexts(files, flow);
+  let { info, unresolved } = analyzeContexts(files, flow);
+  const deferredImports = [];
+  // 只有真实宿主明确不提供的服务才能使条件 fiber 保持 PENDING。
+  // 静态 import 仍会执行；动态 import 的其他可达入口仍完整扫描。
+  if (options.entry && options.unavailableServices?.length && flow === DSH_FLOW) {
+    const absent = new Set(options.unavailableServices);
+    // 原包自己可能提供同名服务。存在显式发布证据时保持完整扫描，不能
+    // 仅凭宿主缺席就声称该条件分支不会运行。
+    for (const { source } of info.values()) {
+      const findProviders = node => {
+        if (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.SuperKeyword
+          || ts.isPropertyAccessExpression(node.expression) && ['provide', 'set'].includes(node.expression.name.text))) {
+          for (const argument of node.arguments) if (ts.isStringLiteralLike(argument)) absent.delete(argument.text);
+        }
+        ts.forEachChild(node, findProviders);
+      };
+      findProviders(source);
+    }
+    const active = reachableFiles(options.entry, (node, file) => {
+      if (!ts.isCallExpression(node) || node.expression.kind !== ts.SyntaxKind.ImportKeyword) return true;
+      // 只证明直接位于 inject 回调中的导入；嵌套闭包可能逃逸，不推断其生命周期。
+      let callback = node.parent;
+      while (callback && !isFunctionLike(callback)) callback = callback.parent;
+      if (!callback || !ts.isCallExpression(callback.parent)
+        || !ts.isPropertyAccessExpression(callback.parent.expression)
+        || callback.parent.expression.name.text !== 'inject') return true;
+      const isContext = (value, at) => {
+        if (!ts.isIdentifier(value)) return false;
+        for (let parent = at.parent; parent; parent = parent.parent) {
+          const names = info.get(file).scopes.get(parent);
+          if (names?.has(value.text)) return names.get(value.text) === 'ctx';
+        }
+        return false;
+      };
+      const missing = conditionalDependencies(node, isContext).filter(name => absent.has(name));
+      if (!missing.length) return true;
+      deferredImports.push({ file: relative(root, file), module: node.arguments[0].text, unavailableServices: missing });
+      return false;
+    }, info);
+    if (active.length !== files.length) {
+      files = active;
+      ({ info, unresolved } = analyzeContexts(files, flow));
+    }
+  }
   for (const file of files) {
     const text = readFileSync(file, 'utf8');
     lines += text.split('\n').length;
@@ -379,7 +398,7 @@ export function scanSources(root, options = {}) {
     inspectProcess(source);
     if (spawnsProcess && namesPackageManager) profilePackageProcesses.push(rel);
     const labelOf = (name, at) => {
-      for (let n = at.parent; n; n = n.parent) { const label = scopes.get(n)?.get(name); if (label) return label; }
+      for (let n = at.parent; n; n = n.parent) if (scopes.get(n)?.has(name)) return scopes.get(n).get(name);
       return undefined;
     };
     const isDshContext = (node, at) => flow === DSH_FLOW && ts.isIdentifier(node) && labelOf(node.text, at) === 'ctx';
@@ -426,13 +445,14 @@ export function scanSources(root, options = {}) {
           if (service) { bump(serviceMembers, [service, ...chain.slice(1, depth)].join('.'), rel); break; }
         }
       }
-      // 事件监听：`ctx.on('tools/pre-execute', …)` / `pi.on('tool_call', …)`。事件名不是字面量记为 <dynamic>。
+      // 事件监听：`ctx.on('tools/pre-execute', …)`。事件名不是字面量记为 <dynamic>。
       if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && ['on', 'once'].includes(node.expression.name.text)) {
         const owner = chainOf(node.expression.expression);
         if (owner && owner.length === 1 && labelOf(owner[0], node) === flow.eventLabel) {
           const first = node.arguments[0];
+          const nullable = flow === DSH_FLOW && nullableRegistration(node);
           bump(events, first && ts.isStringLiteralLike(first) ? first.text : '<dynamic>', rel,
-            flow === DSH_FLOW && guardedRegistration(node, source));
+            nullable || flow === DSH_FLOW && guardedRegistration(node, source), nullable);
         }
       }
       // `ctx.inject(['a', 'b'], …)` 与 `export const inject = [...]`
@@ -455,6 +475,9 @@ export function scanSources(root, options = {}) {
     };
     visit(source);
   }
-  const plain = (map) => Object.fromEntries([...map].sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => [key, { count: value.count, optional: value.optionalCount === value.count, files: [...value.files].sort() }]));
-  return { fileCount: files.length, lineCount: lines, files: files.map((file) => relative(root, file)), imports: plain(imports), symbols: plain(symbols), calls: plain(calls), injects: plain(injects), serviceReads: plain(serviceReads), serviceMembers: plain(serviceMembers), profileMutations, profilePackageProcesses, events: plain(events), unresolvedContextFlows: unresolved };
+  const plain = (map) => Object.fromEntries([...map].sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => [key, {
+    count: value.count, optional: value.optionalCount === value.count && (!value.nullableCount || value.nullableCount === value.count),
+    ...(value.nullableCount === value.count ? { nullable: true } : {}), files: [...value.files].sort(),
+  }]));
+  return { fileCount: files.length, lineCount: lines, files: files.map((file) => relative(root, file)), deferredImports, imports: plain(imports), symbols: plain(symbols), calls: plain(calls), injects: plain(injects), serviceReads: plain(serviceReads), serviceMembers: plain(serviceMembers), profileMutations, profilePackageProcesses, events: plain(events), unresolvedContextFlows: unresolved };
 }

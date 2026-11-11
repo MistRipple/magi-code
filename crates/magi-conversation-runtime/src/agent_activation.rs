@@ -56,8 +56,8 @@ pub(crate) fn preflight_activation(
     let active_goal = || {
         session_store
             .active_execution_chain(session_id)
-            .and_then(|chain| chain.current_turn)
-            .and_then(|turn| session_store.model_step_goal(session_id, &turn.turn_id))
+            .and_then(|chain| chain.current_turn_id)
+            .and_then(|turn_id| session_store.model_step_goal(session_id, &turn_id))
             .filter(|goal| goal.status == GoalStatus::Active)
     };
     let requested_lifetime = match lifetime {
@@ -171,16 +171,4 @@ pub(crate) fn previous_activation_tasks(
         return Err("Agent activation 来源链不完整".into());
     }
     Ok(result)
-}
-
-pub(crate) fn previous_activation_ids(
-    task_store: &TaskStore,
-    task: &Task,
-    session: &SessionId,
-) -> Vec<TaskId> {
-    previous_activation_tasks(task_store, task, session)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|task| task.task_id)
-        .collect()
 }

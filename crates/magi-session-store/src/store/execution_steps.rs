@@ -84,9 +84,7 @@ impl SessionStore {
                         .iter()
                         .any(|s| {
                             &s.session_id == session
-                                && s.current_turn
-                                    .as_ref()
-                                    .is_some_and(|t| t.turn_id == turn_id)
+                                && s.current_turn_id.as_deref() == Some(turn_id)
                         })
                 {
                     return Err(invalid("旧主线 Turn 不能更新执行步骤"));
@@ -175,33 +173,7 @@ impl SessionStore {
                     acceptance: None,
                 })
             },
-            |state, notice| {
-                // canonical 是权威；同步已有运行态投影，避免下一次工具写回删除新增卡片。
-                for sidecar in &mut state.execution_sidecar_store.runtime_sidecars {
-                    if &sidecar.session_id != session {
-                        continue;
-                    }
-                    if sidecar
-                        .current_turn
-                        .as_ref()
-                        .is_some_and(|t| t.turn_id == notice.turn.turn_id)
-                    {
-                        sidecar.current_turn =
-                            Some(super::sidecar::active_turn_projection(&notice.turn));
-                        sidecar.updated_at = notice.item.updated_at;
-                    }
-                    if let Some(chain) = sidecar.active_execution_chain.as_mut()
-                        && chain
-                            .current_turn
-                            .as_ref()
-                            .is_some_and(|t| t.turn_id == notice.turn.turn_id)
-                    {
-                        chain.current_turn =
-                            Some(super::sidecar::active_turn_projection(&notice.turn));
-                    }
-                }
-                notice
-            },
+            |_state, notice| notice,
         );
         if result.is_ok() {
             self.mark_sidecar_dirty_for_session(

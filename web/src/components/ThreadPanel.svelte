@@ -9,7 +9,6 @@
   } from '../lib/timeline-render-items';
   import {
     buildConversationRuntimeRecords,
-    resolveCurrentConversationTurnStartedAt,
   } from '../lib/conversation-runtime-records';
   import MessageList from './MessageList.svelte';
   import ConversationApprovalTray from './ConversationApprovalTray.svelte';
@@ -52,13 +51,10 @@
   const conversationRecords = $derived.by(() => buildConversationRuntimeRecords(
     threadRenderItems,
     {
-      isProcessing: messagesState.isProcessing,
-      processingStartedAt: messagesState.thinkingStartAt,
+      isProcessing: runtimeState?.status === 'running',
+      processingStartedAt: runtimeState?.startedAt,
     },
   ));
-  const conversationStartedAt = $derived(
-    resolveCurrentConversationTurnStartedAt(threadRenderItems),
-  );
   const anchoredApprovalIds = $derived.by(() => {
     const ids = new Set<string>();
     for (const item of threadRenderItems) {
@@ -102,10 +98,6 @@
   <RuntimeStatePanel
     {runtimeState}
     {conversationRecords}
-    {conversationStartedAt}
-    isProcessing={messagesState.isProcessing}
-    processingStartedAt={messagesState.thinkingStartAt}
-    turnStage={messagesState.turnStage}
   />
   <div class="main-content">
     <MessageList renderItems={threadRenderItems} isActive={isTopActive} />

@@ -24,8 +24,3 @@ export function parseRuntimeTaskStatus(value: unknown): RuntimeTaskStatus | null
       return null;
   }
 }
-
-export function isTerminalRuntimeTaskStatus(value: unknown): boolean {
-  const status = parseRuntimeTaskStatus(value);
-  return status === 'completed' || status === 'failed' || status === 'killed';
-}

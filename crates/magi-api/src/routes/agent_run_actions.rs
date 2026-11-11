@@ -254,11 +254,20 @@ async fn archive_task(
     )?;
     ensure_root_action_target(&task, "从面板移除")?;
     let session_id = scope.session_id.clone();
+    let _session_turn_guard = state.lock_session_turn_commit(&session_id).await;
+    let chain = state
+        .session_store
+        .active_execution_chain(&session_id)
+        .ok_or_else(|| ApiError::InvalidInput("当前会话没有可归档的执行链".into()))?;
     let root_task = ensure_terminal_root_action(&state, &task.root_task_id, "从面板移除")?;
     ensure_supported_root_action(&root_task, AgentRunActionKind::Archive, "归档")?;
     state
         .session_store
-        .archive_active_execution_chain(&session_id, &root_task.task_id)
+        .archive_active_execution_chain(
+            &session_id,
+            &root_task.task_id,
+            chain.current_turn_id.as_deref(),
+        )
         .map_err(|error| ApiError::internal_assembly("归档任务失败", error))?;
     state.persist_runtime_durable_state_for_sessions_for_api(std::slice::from_ref(&session_id))?;
 

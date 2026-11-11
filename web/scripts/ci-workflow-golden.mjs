@@ -55,11 +55,10 @@ assert.match(release, /make_latest:\s*true/, 'Desktop Release 必须显式成为
 assert.match(release, /GitHub Desktop 更新源[\s\S]*releases\/latest[\s\S]*latest-mac\.yml[\s\S]*latest-linux\.yml/, '发布流程必须校验统一 Desktop 更新源');
 assert.match(release, /build-legacy-desktop-bridge\.mjs[\s\S]*latest\.json/, '发布流程必须生成旧版客户端无感迁移桥');
 assert.match(release, /真实启动解包 Desktop[\s\S]*\/health[\s\S]*\/web\.html/, '发布链必须真实启动解包 Desktop');
-assert.doesNotMatch(
-  `${ci}\n${security}\n${release}\n${preflight}`,
-  /@tauri-apps|\btauri\b|chromium embedded framework|\bcef\b|browser-runtime-release|browser-host|native-browser-runtime|playwright/i,
-  '工作流不得残留旧桌面宿主、独立 Runtime 或生产 Playwright',
-);
+// 发行边界由同一个门禁定义，包含迁移签名 CLI 的精确用途。
+execFileSync(process.execPath, [
+  fileURLToPath(new URL('../../scripts/verify-electron-release-boundary.mjs', import.meta.url)),
+], { stdio: 'pipe' });
 assert.doesNotMatch(lock, /@tauri-apps|playwright(?:-core)?|browser-host/i, '根 npm lockfile 不得包含旧生产依赖');
 
 for (const relativePath of [

@@ -3,9 +3,7 @@ pub mod task_store;
 pub mod task_worker_catalog;
 
 use magi_context_runtime::ContextAssemblyResult;
-use magi_worker_runtime::WorkerRuntime;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 pub use execution_writeback::{DispatchMemoryExtractionInput, ExecutionWritebackPlans};
 
@@ -162,35 +160,6 @@ impl ExecutionContextSummary {
                 .filter(|record| record.provenance.is_some())
                 .count(),
         }
-    }
-}
-
-/// 执行管线持有的运行时句柄：任务事实由 `TaskStore` 拥有，分支检查点由 `WorkerRuntime` 拥有。
-#[derive(Clone)]
-pub struct OrchestratedExecutionRuntime {
-    task_store: Arc<task_store::TaskStore>,
-    worker_runtime: WorkerRuntime,
-}
-
-impl OrchestratedExecutionRuntime {
-    pub fn new(worker_runtime: WorkerRuntime) -> Self {
-        Self {
-            task_store: Arc::new(task_store::TaskStore::new()),
-            worker_runtime,
-        }
-    }
-
-    pub fn with_task_store(mut self, task_store: Arc<task_store::TaskStore>) -> Self {
-        self.task_store = task_store;
-        self
-    }
-
-    pub fn worker_runtime(&self) -> &WorkerRuntime {
-        &self.worker_runtime
-    }
-
-    pub fn task_store(&self) -> &task_store::TaskStore {
-        &self.task_store
     }
 }
 

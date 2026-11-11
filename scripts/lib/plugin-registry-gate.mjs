@@ -4,10 +4,20 @@ import { Readable } from 'node:stream';
 // 仅控制本次验收 daemon 的安装解析。原包、integrity、业务路由和
 // registry 其他请求仍转发官方字节，不修改插件或用户正在运行的实例。
 export async function createPluginRegistryGate() {
-  let paused;
+  let control;
   const held = new Set(), errors = [];
+  const requests = new Map(), rejections = new Map();
   const server = createServer(async (request, response) => {
-    if (paused && request.headers['pacote-pkg-id'] === `registry:${paused}`) {
+    const identity = request.headers['pacote-pkg-id'];
+    const name = typeof identity === 'string' && identity.startsWith('registry:') ? identity.slice('registry:'.length) : null;
+    if (name) requests.set(name, (requests.get(name) ?? 0) + 1);
+    if (control?.name === name && control.mode === 'fail') {
+      rejections.set(name, (rejections.get(name) ?? 0) + 1);
+      response.writeHead(404, { 'content-type': 'application/json' });
+      response.end('{"error":"acceptance-resolution-failure"}');
+      return;
+    }
+    if (control?.name === name && control.mode === 'pause') {
       held.add(response);
       response.on('close', () => held.delete(response));
       return;
@@ -29,10 +39,13 @@ export async function createPluginRegistryGate() {
     registry: `http://127.0.0.1:${server.address().port}`,
     held,
     errors,
-    pause(name) { paused = name; },
-    release() { paused = undefined; for (const response of held) response.destroy(); },
+    requests(name) { return requests.get(name) ?? 0; },
+    rejected(name) { return rejections.get(name) ?? 0; },
+    fail(name) { control = { name, mode: 'fail' }; },
+    pause(name) { control = { name, mode: 'pause' }; },
+    release() { control = undefined; for (const response of held) response.destroy(); },
     async close() {
-      paused = undefined;
+      control = undefined;
       server.closeAllConnections();
       await new Promise(resolve => server.close(resolve));
     },

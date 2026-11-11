@@ -2,9 +2,8 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { TranslatorRegistry } from './core/registry.mjs';
 import { renderText } from './core/report.mjs';
-import { createRegistry } from './index.mjs';
+import { createDshTranslator } from './dsh/translator.mjs';
 
 const fixture = fileURLToPath(new URL('./fixtures/mini-dsh', import.meta.url));
 const cli = fileURLToPath(new URL('./cli.mjs', import.meta.url));
@@ -53,8 +52,8 @@ test('运行组件身份可复现，同时覆盖业务转换源码与实际页�
   const { writeTranslationRuntime, translationRuntimeId } = await import('./core/translation-runtime.mjs');
   const root = mkdtempSync(join(tmpdir(), 'magi-translation-identity-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  for (const name of ['cli.mjs', 'index.mjs', 'package.json', 'package-lock.json']) writeFileSync(join(root, name), name);
-  for (const directory of ['core', 'dsh', 'pi', 'runtime', 'install', 'dist']) mkdirSync(join(root, directory));
+  for (const name of ['cli.mjs', 'package.json', 'package-lock.json']) writeFileSync(join(root, name), name);
+  for (const directory of ['core', 'dsh', 'runtime', 'install', 'dist']) mkdirSync(join(root, directory));
   writeFileSync(join(root, 'runtime/host.mjs'), 'first');
   writeFileSync(join(root, 'dist/host.js'), 'page');
   const original = writeTranslationRuntime(root);
@@ -94,7 +93,7 @@ test('可复现归档只携带原生辅助文件的执行意图，普通源码�
   assert.equal(entries.get('extension/upstream/native/linux/data') & 0o7777, 0o644);
 });
 
-async function inspectOptional(t, code) {
+async function inspectOptional(t, code, required = ['session', 'hooks', 'tools']) {
   const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -102,8 +101,18 @@ async function inspectOptional(t, code) {
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'optional-dsh', version: '1.0.0', main: 'index.js' }));
   writeFileSync(join(dir, 'index.js'), code);
-  return createRegistry().create('dsh').inspect(dir, { required: ['session', 'hooks', 'tools'] });
+  return createDshTranslator().inspect(dir, { required });
 }
+
+test('读取已支持路由服务不误判为服务器操作，未接入的成员仍拒绝', async t => {
+  const report=await inspectOptional(t,"export function apply(ctx) {const server=ctx.webServer;server.register({path:'/example',handler(req,res){res.end('original')}});}",['ui']);
+  assert.equal(report.verdict.blocked.length,0);
+  assert.equal(find(report,'ctx.webServer').status,'mapped');
+  for(const member of ['host','port','registerFallback','unknown']) {
+    const blocked=await inspectOptional(t,`export function apply(ctx) {return ctx.webServer.${member};}`,['ui']);
+    assert.ok(blocked.verdict.blocked.length>0,member);
+  }
+});
 
 test('profile 启停文件写入有独立准入证据，普通文件写入不申请插件管理权限', async t => {
   const report = await inspectOptional(t, "import {writeFileSync as save} from 'node:fs'; import {join} from 'node:path'; export function apply(ctx) {} export function disable(dir){save(join(dir,'cordis.patch.yml'),'[]')}");
@@ -136,6 +145,56 @@ test('DSH 可选服务保留缺失报告；必需依赖、未知服务和分支�
     "export function apply(ctx) { ctx.inject(['unknownService'], c => c.unknownService.read()); }",
     "export function apply(ctx) { ctx.inject(['tools'], c => c.compaction.run()); }",
   ]) assert.ok((await inspectOptional(t, code)).verdict.blocked.length > 0);
+});
+
+test('第三方 Desktop 服务保持缺席，跨环境原包可走自身路径，必需使用仍拒绝', async t => {
+  const conditional = "export function apply(ctx) { if (ctx.get('desktopProfiles') === undefined) return; ctx.inject(['desktopPnpm'], c => c.desktopPnpm.runPlugin(['add', 'example'], '/profile')); }";
+  const optional = await inspectOptional(t, conditional, ['runtime']);
+  assert.equal(optional.verdict.blocked.length, 0);
+  assert.equal(find(optional, 'desktopPnpm').status, 'dropped');
+  assert.equal(find(optional, 'desktopPnpm').optional, true);
+  for (const code of [
+    "export const inject = ['desktopPnpm'];\n" + conditional,
+    "export function apply(ctx) { ctx.desktopPnpm.runPlugin(['add', 'example'], '/profile'); }",
+    "export const inject = ['desktopProfiles']; export function apply(ctx) { console.log(ctx.desktopProfiles.current); }",
+  ]) assert.ok((await inspectOptional(t, code, ['runtime'])).verdict.blocked.length > 0, code);
+});
+
+test('缺席服务的条件动态模块不阻塞其余业务，其他入口及未知依赖仍完整准入', async t => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'magi-conditional-module-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'conditional-module', version: '1.0.0', main: 'index.js' }));
+  writeFileSync(join(dir, 'account.js'), "import '@deepseek-ai/dsh-credentials'; export function apply(ctx) { ctx.on('agent/error', () => {}); }");
+  const inspect = async code => {
+    writeFileSync(join(dir, 'index.js'), code);
+    return createDshTranslator().inspect(dir);
+  };
+  const conditional = "ctx.inject(['credentials', 'llm'], scoped => { void import('./account.js').then(pack => pack.apply(scoped)); });";
+  const report = await inspect(`export const inject=['llm']; export function apply(ctx) { ${conditional} ctx.llm.registerAdapter([], {}); }`);
+  assert.equal(report.verdict.blocked.length, 0);
+  assert.deepEqual(report.scanned.fileList, ['index.js']);
+  assert.deepEqual(report.deferredImports, [{ file: 'index.js', module: './account.js', unavailableServices: ['credentials'] }]);
+  assert.ok(report.entries.some(entry => entry.kind === 'modules' && entry.optional && entry.status === 'dropped'));
+  for (const code of [
+    `import './account.js'; export function apply(ctx) { ${conditional} }`,
+    `export function apply(ctx) { ${conditional} void import('./account.js'); }`,
+    "export function apply(ctx) { ctx.inject(['unknownService'], scoped => { void import('./account.js'); }); }",
+    "export function apply(ctx) { ctx.inject(['llm'], scoped => { void import('./account.js'); }); }",
+    `export const inject=['credentials']; export function apply(ctx) { ${conditional} }`,
+    `export function apply(ctx) { ctx.provide('credentials', {}); ${conditional} }`,
+    `class OwnCredentials extends Service { constructor(ctx) {super(ctx, 'credentials');} } export function apply(ctx) {ctx.plugin(OwnCredentials); ${conditional}}`,
+    "export function apply(ctx) { ctx.inject(['credentials'], scoped => { exported = () => import('./account.js'); }); }",
+    "export function apply(ctx) { const other={inject(){}}; other.inject(['credentials'], scoped => { void import('./account.js'); }); }",
+  ]) assert.ok((await inspect(code)).verdict.blocked.length > 0, code);
+});
+
+test('真实 Cordis registry 和 llm 通知可以读取，未登记 llm 成员仍拒绝', async t => {
+  const report = await inspectOptional(t, "export function apply(ctx) { const registry=ctx.registry; const llm=ctx.llm; ctx.llm.emitAdaptersUpdated(); }", ['runtime', 'llm']);
+  assert.equal(report.verdict.blocked.length, 0);
+  assert.ok((await inspectOptional(t, "export function apply(ctx) { ctx.llm.unknown(); }", ['llm'])).verdict.blocked.length > 0);
 });
 
 test('ctx.get 服务读取沿上下文辅助函数记录，供管理权限声明使用；普通同名对象不混入', async (t) => {
@@ -197,6 +256,34 @@ test('DSH 同步事件注册失败有明确 catch 时允许上游降级；无保
   ]) assert.ok((await inspectOptional(t, code)).verdict.blocked.length > 0);
 });
 
+test('上下文常量别名跨文件保留必需事件证据，同名局部参数和变量不会冒充上下文', async t => {
+  const report = await inspectOptional(t, `export function apply(ctx) { const host=ctx; register(host); }
+    function register(host) { const local=host; local.on('agent/created',()=>{});
+      (()=>{const host={directory:'ordinary'};console.log(host.directory);})();
+      ((local)=>console.log(local.version))({version:'ordinary'});
+      (({host})=>console.log(host.version))({host:{version:'ordinary'}});
+      try {throw {directory:'ordinary'};}catch(local){console.log(local.directory);}
+      for(const loop=local;false;)loop.on('session/event',()=>{});
+      (()=>{const loop={version:'ordinary'};console.log(loop.version);})();
+    }`);
+  assert.ok(report.verdict.blocked.some(item => item.name === 'agent/created'));
+  assert.equal(find(report, 'ctx.directory'), undefined); assert.equal(find(report, 'ctx.version'), undefined);
+});
+
+test('只有明确返回 null 的可选事件调用可协商不可用，必需、未知和混用仍拒绝', async t => {
+  const optional = "export function apply(ctx) { const host=ctx; const subscribe=()=>host.on?.('agent/created',()=>{}) ?? null; console.log(subscribe()); }";
+  const report = await inspectOptional(t, optional);
+  assert.equal(report.verdict.blocked.length, 0); assert.equal(find(report, 'agent/created').nullable, true);
+  for (const code of [
+    "export function apply(ctx) { ctx.on?.('agent/created',()=>{}); }",
+    "export function apply(ctx) { const off=ctx.on('agent/created',()=>{}) ?? null; }",
+    "export function apply(ctx) { const off=ctx.on?.('agent/created',()=>{}) ?? (()=>{}); }",
+    "export function apply(ctx) { ctx.on?.('agent/created',()=>{}) ?? null; ctx.on('agent/created',()=>{}); }",
+    "export function apply(ctx) { ctx.on?.('unknown/event',()=>{}) ?? null; }",
+    "export function apply(ctx) { ctx.on?.('agent/created',()=>{}) ?? null; try {ctx.on('agent/created',()=>{});}catch{} }",
+  ]) assert.ok((await inspectOptional(t, code)).verdict.blocked.length > 0, code);
+});
+
 test('DSH 交给普通函数的注册回调必须在所有可追踪调用点捕获，不把逃逸回调当可选', async (t) => {
   const mount = "export function apply(ctx) { mount({ subscribe: () => ctx.on('session/event', () => {}) }); }";
   const good = mount + "function mount(api) { read(api); try { api.subscribe(); } catch { return; } } function read(api) { return api.label; }";
@@ -246,34 +333,23 @@ test('DSH 版本门禁保持 engines 优先与预发布语义；豁免只覆盖�
   assert.throws(() => checkDshCompatibility(pkg, { ...environment, runtimeId: 'abcdef0123456789abcdef01' }, policy), /运行时不一致/);
 });
 
-test('工厂按名称创建，重复注册、未知名称与非法名称都明确失败', () => {
-  const registry = createRegistry();
-  assert.deepEqual(registry.kinds(), ['dsh', 'pi']);
-  assert.equal(registry.create('dsh').kind, 'dsh');
-  assert.throws(() => registry.register('dsh', () => ({})), /已注册/);
-  assert.equal(registry.create('pi').kind, 'pi');
-  assert.throws(() => registry.create('nope'), /未注册的翻译器: nope/);
-  assert.throws(() => registry.register('Bad Name', () => ({})), /名称无效/);
-  assert.throws(() => new TranslatorRegistry().register('x', () => ({ kind: 'y' })).create('x'), /kind 与注册名不一致/);
-});
-
-test('按目录特征识别生态；没有把握或并列时不猜', async () => {
-  const registry = createRegistry();
-  assert.equal((await registry.detect(fixture)).kind, 'dsh');
-  const { mkdtempSync, writeFileSync } = await import('node:fs');
+test('DSH 产品入口识别原包，拒绝其他生态与无关目录', async t => {
+  const translator = createDshTranslator();
+  assert.ok(await translator.detect(fixture));
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const unrelated = mkdtempSync(join(tmpdir(), 'magi-detect-'));
+  t.after(() => rmSync(unrelated, { recursive: true, force: true }));
   writeFileSync(join(unrelated, 'package.json'), JSON.stringify({ name: 'unrelated', version: '1.0.0' }));
-  await assert.rejects(registry.detect(unrelated), /无法识别/);
-  // 新增生态只需注册工厂：两个同分翻译器必须要求显式指定。
-  const twin = (kind) => () => ({ kind, detect: async () => 7, inspect: async () => ({}) });
-  const ambiguous = new TranslatorRegistry().register('a', twin('a')).register('b', twin('b'));
-  await assert.rejects(ambiguous.detect(fixture), /同时匹配 a 与 b/);
+  assert.equal(await translator.detect(unrelated), 0);
+  const rejected = spawnSync(process.execPath, [cli, 'inspect', fixture, '--kind', 'pi'], { encoding: 'utf8' });
+  assert.equal(rejected.status, 2);
+  assert.match(rejected.stderr, /仅支持 DSH/);
 });
 
 test('静态分析：每个能力都有明确状态，未登记的上游服务为 unknown 而非静默通过', async () => {
-  const report = await createRegistry().create('dsh').inspect(fixture, { required: ['llm', 'tools'] });
+  const report = await createDshTranslator().inspect(fixture, { required: ['llm', 'tools'] });
   assert.equal(report.upstream.name, 'mini-dsh-plugin');
   assert.equal(find(report, 'ctx.logger.warn').status, 'shim');
   assert.equal(find(report, 'ctx.effect').status, 'shim');
@@ -288,7 +364,7 @@ test('静态分析：每个能力都有明确状态，未登记的上游服务�
 });
 
 test('必需能力判定：unknown 永远阻塞；partial 与 dropped 在被要求的类别里阻塞；已映射的不阻塞', async () => {
-  const translator = createRegistry().create('dsh');
+  const translator = createDshTranslator();
   const names = (report) => report.verdict.blocked.map((entry) => entry.name);
   const onlyLlm = await translator.inspect(fixture, { required: ['llm'] });
   assert.ok(!names(onlyLlm).includes('ctx.llm.registerAdapter'), 'llm 注册已映射，不应阻塞');
@@ -342,13 +418,13 @@ test('已构建的 npm 产物（没有 src/）从 main 入口沿相对导入扫�
   writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'built-dsh', version: '1.0.0', main: 'lib/index.js', type: 'module', peerDependencies: { '@deepseek-ai/dsh-llm': '^0.2.0' } }));
   writeFileSync(join(dir, 'lib/index.js'), "import { inner } from './inner.js';\nexport function apply(ctx) { ctx.webServer.register('/x', inner); }\n");
   writeFileSync(join(dir, 'lib/inner.js'), 'export const inner = () => {};\n');
-  const report = await createRegistry().create('dsh').inspect(dir, { required: [] });
+  const report = await createDshTranslator().inspect(dir, { required: [] });
   assert.equal(report.scanned.files, 2);
   assert.equal(find(report, 'ctx.webServer.register').status, 'mapped');
 
   const empty = mkdtempSync(join(tmpdir(), 'compat-empty-'));
   writeFileSync(join(empty, 'package.json'), JSON.stringify({ name: 'empty-dsh', version: '1.0.0', main: 'lib/index.js' }));
-  await assert.rejects(createRegistry().create('dsh').inspect(empty, { required: [] }), /没有扫描到任何源文件/);
+  await assert.rejects(createDshTranslator().inspect(empty, { required: [] }), /没有扫描到任何源文件/);
 });
 
 test('能力目录与 Magi 源码一致：钩子名/模式取自 protocol.rs，RPC 方法取自宿主与 daemon 分发；引用不存在的能力在加载时失败', async () => {
@@ -397,7 +473,7 @@ test('拦截类 API：tools/pre-execute 等不再被当作“已可翻译”，p
     "  ctx.on(dynamicName(), () => {});",
     '}', 'function dynamicName() { return Math.random() > 2 ? "a" : "b"; }', '',
   ].join('\n'));
-  const report = await createRegistry().create('dsh').inspect(dir, { required: ['hooks'] });
+  const report = await createDshTranslator().inspect(dir, { required: ['hooks'] });
   assert.equal(find(report, 'tools/pre-execute').status, 'partial');
   assert.equal(find(report, 'tools/execute').status, 'dropped');
   assert.equal(find(report, 'agent/turn-stopping').status, 'dropped');
@@ -406,109 +482,48 @@ test('拦截类 API：tools/pre-execute 等不再被当作“已可翻译”，p
   for (const name of ['tools/pre-execute', 'tools/execute', 'agent/turn-stopping']) assert.ok(blocked.includes(name), `${name} 应阻塞`);
 });
 
-async function piFixture(files, pkg) {
-  const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
+async function dshFixture(code) {
+  const { mkdtempSync, writeFileSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
-  const { join, dirname } = await import('node:path');
-  const dir = mkdtempSync(join(tmpdir(), 'compat-pi-'));
-  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'pi-fixture', version: '1.0.0', ...pkg }));
-  for (const [name, text] of Object.entries(files)) {
-    mkdirSync(dirname(join(dir, name)), { recursive: true });
-    writeFileSync(join(dir, name), text);
-  }
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'compat-dsh-'));
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'dsh-fixture', version: '1.0.0', main: 'index.js', dsh: {} }));
+  writeFileSync(join(dir, 'index.js'), code);
   return dir;
 }
 
-test('pi 翻译器：入口来自 pi.extensions 或 extensions/ 约定目录；上下文靠数据流识别，处理器里的第二个参数也算', async () => {
-  const dir = await piFixture({
-    'extensions/a.ts': [
-      'import { helper } from "./lib/helper.ts";',
-      'export default function (pi) {',
-      '  pi.on("tool_call", async (event, ctx) => { ctx.ui.notify("x"); helper(ctx); });',
-      '  pi.registerCommand("c", { description: "d", handler: async (args, context) => { context.cwd; } });',
-      '}',
-    ].join('\n'),
-    'extensions/lib/helper.ts': 'export function helper(ctx) { ctx.sessionManager.getEntries(); }\n',
-  }, { keywords: ['pi-package'], pi: {} });
-  const registry = createRegistry();
-  assert.equal((await registry.detect(dir)).kind, 'pi');
-  const report = await registry.create('pi').inspect(dir, { required: [] });
-  assert.equal(report.scanned.files, 2, '应从约定目录入口出发并沿相对导入找到 helper.ts');
-  assert.equal(find(report, 'tool_call').status, 'partial');
-  assert.equal(find(report, 'ctx.ui.notify').status, 'partial');
-  assert.equal(find(report, 'ctx.cwd').status, 'shim', '处理器的第二个参数被识别为上下文，名字叫 context 也算');
-  assert.equal(find(report, 'ctx.sessionManager.getEntries').status, 'partial', '上下文经函数实参传播到相对导入的 helper');
-});
-
-test('pi 翻译器：dropped 的会话驱动与请求改写被如实阻塞；解析不了的入口与 glob 明确失败', async () => {
-  const dir = await piFixture({
-    'extensions/x.ts': [
-      'export default function (pi) {',
-      '  pi.sendUserMessage("go");',
-      '  pi.on("before_provider_request", (e) => e.payload);',
-      '  pi.on("agent_before_settle", () => ({ continue: true }));',
-      '  pi.on("some_unread_event", () => {});',
-      '}',
-    ].join('\n'),
-  }, {});
-  const report = await createRegistry().create('pi').inspect(dir, { required: ['hooks', 'session'] });
-  assert.equal(find(report, 'pi.sendUserMessage').status, 'dropped');
-  assert.equal(find(report, 'before_provider_request').status, 'dropped');
-  assert.equal(find(report, 'agent_before_settle').status, 'dropped');
-  assert.equal(find(report, 'some_unread_event').status, 'unknown', '文档已读区域之外的事件不猜');
-  assert.ok(report.verdict.blocked.length >= 4);
-
-  const missing = await piFixture({}, { pi: { extensions: ['./nope.ts'] } });
-  await assert.rejects(createRegistry().create('pi').inspect(missing), /不存在/);
-  const noEntry = await piFixture({ 'README.md': 'x' }, {});
-  await assert.rejects(createRegistry().create('pi').inspect(noEntry), /找不到 pi 扩展入口/);
-  const badGlob = await piFixture({ 'a.ts': 'export default function (pi) {}' }, { pi: { extensions: ['./{a,b}.ts'] } });
-  await assert.rejects(createRegistry().create('pi').inspect(badGlob), /尚不支持的 glob/);
-});
-
-test('规则表：pi 与 dsh 引用的能力都存在；partial/dropped 的规则必须写明原因，none 的规则必须有依据', async () => {
-  const { PI_RULES, PI_SYMBOL_RULES } = await import('./pi/catalog.mjs');
+test('DSH 规则引用的能力存在，partial/dropped 写明原因，none 给出依据', async () => {
   const { DSH_RULES } = await import('./dsh/catalog.mjs');
   const { CAPABILITIES } = await import('./core/capabilities.mjs');
-  for (const [name, rules] of [['pi', [...PI_RULES, ...PI_SYMBOL_RULES]], ['dsh', DSH_RULES]]) {
-    for (const r of rules) {
-      if (r.capability) {
-        assert.ok(CAPABILITIES[r.capability], `${name}: ${r.match} 引用了不存在的能力`);
-        if (r.fidelity !== 'full') assert.ok(r.note, `${name}: ${r.match} 是 ${r.fidelity}，必须写明原因`);
-        if (r.fidelity === 'none') assert.ok(r.source, `${name}: ${r.match} 标为 none，必须给出文档依据`);
-      }
-    }
+  for (const r of DSH_RULES) {
+    if (!r.capability) continue;
+    assert.ok(CAPABILITIES[r.capability], `${r.match} 引用了不存在的能力`);
+    if (r.fidelity !== 'full') assert.ok(r.note, `${r.match} 是 ${r.fidelity}，必须写明原因`);
+    if (r.fidelity === 'none') assert.ok(r.source, `${r.match} 标为 none，必须给出文档依据`);
   }
 });
 
 test('上下文传给上游辅助函数沿真实 Cordis 保留；未知宿主成员仍由规则阻断', async () => {
-  const dir = await piFixture({
-    'extensions/e.ts': [
-      'export default function (pi) {',
-      '  const holder = { pi };',
-      '  holder.pi.registerTool({ name: "t" });',
-      '  setup(pi);',
-      '}',
-      'function setup(p) { p.on("tool_call", () => {}); }',
-    ].join('\n'),
-  }, {});
-  const report = await createRegistry().create('pi').inspect(dir, { required: [] });
+  const dir = await dshFixture(`
+    export function apply(ctx) {
+      const holder = { ctx };
+      unknown(holder);
+      setup(ctx);
+    }
+    function setup(context) { context.on('tools/pre-execute', () => {}); }
+  `);
+  const report = await createDshTranslator().inspect(dir, { required: [] });
   assert.equal(find(report, '<context-escape>').status, 'shim');
   assert.ok(!report.verdict.blocked.some((entry) => entry.name === '<context-escape>'));
-  // 同文件函数 setup(pi) 里的订阅仍被传播识别
-  assert.equal(find(report, 'tool_call').status, 'partial');
+  assert.equal(find(report, 'tools/pre-execute').status, 'partial');
 });
 
 test('同名变量不是上下文：LLM 请求里的 context.messages 不会被当成宿主 API 调用', async () => {
-  const dir = await piFixture({
-    'extensions/n.ts': [
-      'export default function (pi) {',
-      '  pi.on("tool_call", () => {});',
-      '}',
-      'function unrelated(context) { return context.messages.length + context.tools.length; }',
-    ].join('\n'),
-  }, {});
-  const report = await createRegistry().create('pi').inspect(dir, { required: [] });
+  const dir = await dshFixture(`
+    export function apply(ctx) { ctx.on('tools/pre-execute', () => {}); }
+    function unrelated(context) { return context.messages.length + context.tools.length; }
+  `);
+  const report = await createDshTranslator().inspect(dir, { required: [] });
   assert.equal(report.entries.find((entry) => /messages|ctx\.tools|context\./.test(entry.name)), undefined);
 });
 
@@ -590,6 +605,67 @@ test('路由执行层：已取消调用不执行业务，取消关闭响应一�
   assert.equal(getEventListeners(complete.signal, 'abort').length, 0, '已完成请求不保留监听');
 });
 
+test('原页面主题快照来自原生外观，通知保持稳定引用并随文档释放', async () => {
+  const { createThemeClient } = await import('./runtime/client/theme.mjs');
+  const { createSlotContext } = await import('./runtime/client/slot-context.mjs');
+  const pack = (id, schemePolicy) => ({ id, schemePolicy, schemes: { light: { accent: 'blue', background: 'white', foreground: 'black' }, dark: { accent: 'cyan', background: 'black', foreground: 'white' } } });
+  const themes = [pack('builtin.light', 'light'), pack('builtin.dark', 'dark'), pack('builtin.system', 'adaptive'), pack('light', 'adaptive')];
+  const client = createThemeClient(() => Promise.resolve(), assert.fail);
+  const slots = createSlotContext({ scope: {}, theme: client });
+  assert.throws(() => slots.ctx.theme.getTheme(), /尚未就绪/);
+  const observed = [];
+  slots.ctx.on('theme/change', next => observed.push(next));
+  assert.throws(() => slots.ctx.on('unknown/event', () => {}), /尚未接入/);
+  let injected;
+  slots.ctx.inject(['theme'], ctx => { injected = ctx.theme; });
+  assert.equal(injected, slots.ctx.theme);
+  const theme = { mode: 'dark', tokens: { '--foreground': 'white' }, appearance: { revision: 7, preference: 'builtin.system', activeTheme: themes[2], themes } };
+  client.update(theme);
+  const first = slots.ctx.theme.getTheme();
+  assert.equal(first.preference, 'system');
+  assert.equal(first.active.colorScheme, 'dark');
+  assert.equal(first.active.tokens['--dsw-alias-label-primary'], 'white');
+  assert.deepEqual(first.themes.map(theme => theme.id), ['light', 'dark', 'magi:light']);
+  assert.throws(() => { first.active.tokens['--dsw-alias-label-primary'] = 'red'; }, TypeError);
+  client.update(structuredClone(theme));
+  assert.equal(slots.ctx.theme.getTheme(), first);
+  assert.equal(observed.length, 1);
+  const preview = { ...theme, appearance: { ...theme.appearance, activeTheme: pack('unsaved-preview', 'light') } };
+  client.update(preview);
+  assert.equal(slots.ctx.theme.getTheme().active.id, 'magi:unsaved-preview');
+  assert.equal(slots.ctx.theme.getTheme().preference, 'system', '临时预览不改写持久偏好');
+  slots.dispose(); client.update(theme);
+  assert.equal(observed.length, 2, '关闭文档回收原页面订阅');
+  client.dispose();
+  assert.throws(() => client.service.setTheme('dark'), /已失效/);
+});
+
+test('原页面切换主题使用原生 revision，失败不发布偏好并保留真实恢复错误', async () => {
+  const { createThemeClient } = await import('./runtime/client/theme.mjs');
+  const requests = [], errors = [];
+  let reject, resolve, successes = 0;
+  const client = createThemeClient(message => { requests.push(message); return new Promise((done, fail) => { resolve = done; reject = fail; }); }, error => errors.push(error), () => successes++);
+  const themes = ['light', 'dark'].map(mode => ({ id: `builtin.${mode}`, schemePolicy: mode, schemes: { [mode]: { accent: 'blue', background: 'black', foreground: 'white' } } }));
+  client.update({ mode: 'light', tokens: {}, appearance: { revision: 13, preference: 'builtin.light', activeTheme: themes[0], themes } });
+  const before = client.service.getTheme();
+  assert.throws(() => client.service.setTheme('constructor'), /不存在/);
+  assert.equal(requests.length, 0);
+  client.service.setTheme('dark');
+  assert.deepEqual(requests, [{ operation: 'host.theme.set', themeId: 'builtin.dark', expectedRevision: 13 }]);
+  assert.equal(client.service.getTheme(), before);
+  const failure = new Error('appearance revision conflict'); reject(failure);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(errors, [failure]);
+  assert.equal(client.service.getTheme(), before);
+  client.service.setTheme('dark'); resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(successes, 1, '实际提交成功后清理先前错误');
+  assert.equal(client.service.getTheme(), before, '提交回执不冒充新主题快照');
+  client.service.setTheme('dark'); client.dispose(); reject(new Error('page closed'));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(errors, [failure], '关闭文档后的异步失败不再渲染');
+});
+
 test('界面槽位：ctx 的实现只含上游入口用到的成员；未知服务缺席，未知槽位按策略分类', async () => {
   const { createSlotContext, slotDisposition } = await import('./runtime/client/slot-context.mjs');
   const scope = { getSnapshot: () => ({ value: {} }), subscribe: () => () => {}, set: async () => true };
@@ -605,7 +681,7 @@ test('界面槽位：ctx 的实现只含上游入口用到的成员；未知服�
   assert.equal(slotDisposition('plugins.row.config'), 'alternate');
   assert.equal(slotDisposition('settings.section'), 'mounted');
   assert.equal(slotDisposition('settings.section.icon'), 'alternate');
-  assert.equal(slotDisposition('conversation.input.right'), 'unmounted');
+  assert.equal(slotDisposition('conversation.input.right'), 'mounted');
   slots.ctx.locale.register('ns', { zh: { hi: '你好 {name}' }, en: { hi: 'Hi {name}' } });
   const t = slots.ctx.locale.bind('ns');
   assert.equal(t('hi', { name: 'A' }), '你好 A');
@@ -619,26 +695,26 @@ test('槽位使用上游条目身份与优先级，释放后恢复同一单元�
   const context = createSlotContext({ scope: {} });
   const slots = context.ctx.slots;
   const original = () => null, replacement = () => null;
-  const releaseOriginal = slots.register({ name: 'conversation.chat.node', key: 'assistant-step' }, original);
-  const entry = slots.entries('conversation.chat.node')[0];
+  const releaseOriginal = slots.register({ name: 'plugins.bundle.config', key: 'business' }, original);
+  const entry = slots.entries('plugins.bundle.config')[0];
   const changes = [];
-  const off = slots.subscribe('conversation.chat.node', () => changes.push(slots.entriesOfSlot('conversation.chat.node')[0]));
+  const off = slots.subscribe('plugins.bundle.config', () => changes.push(slots.entriesOfSlot('plugins.bundle.config')[0]));
   await Promise.resolve(); changes.length = 0;
-  assert.throws(() => slots.register({ name: 'conversation.chat.node', key: 'assistant-step' }, replacement), /already has an entry/);
-  const releaseReplacement = slots.register({ name: 'conversation.chat.node', key: 'assistant-step', priority: -1 }, replacement);
-  const shadow = slots.entries('conversation.chat.node').find(item => item.component === replacement);
+  assert.throws(() => slots.register({ name: 'plugins.bundle.config', key: 'business' }, replacement), /already has an entry/);
+  const releaseReplacement = slots.register({ name: 'plugins.bundle.config', key: 'business', priority: -1 }, replacement);
+  const shadow = slots.entries('plugins.bundle.config').find(item => item.component === replacement);
   assert.equal(slots.isLive(entry), true);
   assert.equal(context.live()[0].component, replacement);
   await Promise.resolve(); assert.deepEqual(changes, [shadow]);
   releaseReplacement(); releaseReplacement();
   await Promise.resolve(); assert.deepEqual(changes, [shadow, entry]);
   assert.equal(slots.isLive(shadow), false);
-  assert.equal(slots.entries('conversation.chat.node')[0], entry);
+  assert.equal(slots.entries('plugins.bundle.config')[0], entry);
   assert.equal(context.live()[0].component, original);
   assert.throws(() => slots.register({ name: 'settings.section.icon', key: 'invalid' }, original), /requires options.id/);
   off(); releaseOriginal(); context.dispose();
-  assert.deepEqual(slots.entries('conversation.chat.node'), []);
-  assert.throws(() => slots.register({ name: 'conversation.chat.node', key: 'assistant-step' }, original), /已失效/);
+  assert.deepEqual(slots.entries('plugins.bundle.config'), []);
+  assert.throws(() => slots.register({ name: 'plugins.bundle.config', key: 'business' }, original), /已失效/);
 });
 
 test('子槽位依声明生命周期注入，旧清理不删除新注册，失败初始化完整回收', async () => {
@@ -736,6 +812,76 @@ test('原生页面保留异步和条件注册的多个右栏页签，页面身�
   assert.throws(() => clientViews([analysis.mounted[0], analysis.mounted[0]], 'x'), /身份重复/);
   writeFileSync(join(directory, 'client.js'), `window.__ModuleLoader__.load({id:'failed',factory(require){return {async apply(){await Promise.resolve();throw new Error('async failed')}}}})`);
   assert.throws(() => analyzeNativeClient({ upstreamDir: directory, pkg: { exports: { './client': './client.js' } }, sharedRoot: fileURLToPath(new URL('.', import.meta.url)) }), /async failed/);
+});
+
+test('原配置组件的 main 别名只保留设置入口，独立业务页面不被名称或包名过滤', async t => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { analyzeNativeClient } = await import('./install/client-assets.mjs');
+  const { clientViews } = await import('./install/client-views.mjs');
+  const directory = mkdtempSync(join(tmpdir(), 'magi-settings-location-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  writeFileSync(join(directory, 'client.js'), `window.__ModuleLoader__.load({id:'arbitrary-plugin',factory(){return {apply(ctx){
+    const Configuration=()=>null, Business=()=>null;
+    ctx.slots.register({name:'main',key:'old-page',label:'Same title'}, Configuration);
+    ctx.slots.register({name:'main',key:'business',label:'Same title'}, Business);
+    ctx.slots.register({name:'settings.section',id:'preferences',label:'Same title'}, Configuration);
+  }}}});`);
+  const analysis = analyzeNativeClient({ upstreamDir: directory, pkg: { exports: { './client': './client.js' } }, sharedRoot: fileURLToPath(new URL('.', import.meta.url)) });
+  const views = clientViews(analysis.mounted, 'arbitrary-plugin');
+  assert.deepEqual(views.map(view => [view.slot.key, view.placements]), [['business', ['main', 'rightPane']], ['preferences', ['settings']]]);
+  assert.ok(analysis.unmounted.some(slot => slot.name === 'main' && slot.key === 'old-page' && slot.settingsDuplicate));
+});
+
+test('原生对话替换在安装记录和延迟注册时均拒绝，不能借正常设置页绕过', async t => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { analyzeNativeClient } = await import('./install/client-assets.mjs');
+  const { createSlotContext } = await import('./runtime/client/slot-context.mjs');
+  const directory = mkdtempSync(join(tmpdir(), 'magi-ui-boundary-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  for (const name of ['conversation.chat.node', 'conversation.input.dock']) {
+    writeFileSync(join(directory, 'client.js'), `window.__ModuleLoader__.load({id:'business',factory(){return {async apply(ctx){
+      ctx.slots.register({name:'plugins.bundle.config',key:'preferences'},()=>null);
+      await Promise.resolve();
+      ctx.slots.register({name:${JSON.stringify(name)},key:'assistant-step',id:'input'},()=>null);
+    }}}});`);
+    assert.throws(() => analyzeNativeClient({ upstreamDir: directory, pkg: { exports: { './client': './client.js' } }, sharedRoot: fileURLToPath(new URL('.', import.meta.url)) }), /PLUGIN_UI_BOUNDARY_CONFLICT.*不能安装或启用/);
+    const context = createSlotContext({ scope: {} });
+    context.ctx.slots.register({ name:'plugins.bundle.config', key:'preferences' }, () => null);
+    await Promise.resolve();
+    assert.throws(() => context.ctx.slots.register({ name, key:'assistant-step', id:'input' }, () => null), /PLUGIN_UI_BOUNDARY_CONFLICT/);
+    assert.equal(context.live().length, 1, '被拒绝注册不能留下替换组件，正常设置页仍可用');
+    context.dispose();
+  }
+  writeFileSync(join(directory, 'client.js'), `window.__ModuleLoader__.load({id:'business',factory(){return {apply(ctx){
+    ctx.slots.register({name:'plugins.bundle.config',key:'preferences'},()=>null);
+    ctx.slots.register({name:'conversation.session.header.actions',id:'action'},()=>null);
+  }}}});`);
+  assert.throws(() => analyzeNativeClient({ upstreamDir: directory, pkg: { exports: { './client': './client.js' } }, sharedRoot: fileURLToPath(new URL('.', import.meta.url)) }), /尚未接入的界面位置.*conversation.session.header.actions/);
+});
+
+test('独立业务页、设置和受控输入扩展保留，外壳注入不能按 UI 类别静默放行', async t => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { createSlotContext } = await import('./runtime/client/slot-context.mjs');
+  const context = createSlotContext({ scope: {} });
+  for (const descriptor of [{name:'main',key:'business'}, {name:'plugins.bundle.config',key:'preferences'}, {name:'conversation.input.left',id:'action'}, {name:'conversation.input.right',id:'credits'}]) {
+    context.ctx.slots.register(descriptor, () => null);
+  }
+  assert.equal(context.live().length, 4);
+  const { clientViews } = await import('./install/client-views.mjs');
+  assert.deepEqual(clientViews(context.live().map(entry=>({name:entry.descriptor.name,key:entry.descriptor.key??entry.descriptor.id})), 'Business').map(view=>view.placements), [['main','rightPane'],['settings'],['composerLeft'],['composerLeft']]);
+  context.dispose();
+  const root = mkdtempSync(join(tmpdir(), 'magi-ui-shell-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(join(root, 'package.json'), JSON.stringify({name:'shell-injection',version:'1.0.0',main:'index.js',dsh:{}}));
+  writeFileSync(join(root, 'index.js'), 'export function apply(ctx){ctx.webServer.tapIndex(()=>"<style>body{display:none}</style>")}');
+  const report = await createDshTranslator().inspect(root);
+  assert.ok(report.verdict.blocked.some(entry => entry.name === 'ctx.webServer.tapIndex'));
 });
 
 test('右栏导航只打开已注册页签，停用清理注册；语言改变通知上游订阅', async () => {

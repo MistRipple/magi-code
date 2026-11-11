@@ -1,5 +1,25 @@
 # App Server 协议生成约定
 
+`PluginAuthorizeRequest`／`PluginActivationRequest.expectedDigest` 为可选增量字段，
+原生管理页及插件设置页的授权、启用、激活和停用操作均发送用户看到的安装摘要。
+HTTP 入口复用 PluginOperations 已有的目标核对，准入和异步排空后的提交都必须一致；
+过期页面不能授权或停止新版插件。省略字段的已有调用保持原合同，插件管理 RPC 的摘要规则不变。
+插件设置页只使用已有授权重新启用；需要授权时定位原生管理页的同一插件，展示影响与权限后确认。
+
+`ModelResponseTiming.responseDurationMs` 为可选增量字段：成功且最终输出 Token 与本次传输可配对时，
+记录 HTTP 请求开始到完整响应最后一次接收的耗时，包含首段等待、思考、正文和用量尾段。
+daemon 用量权威用同次实际总输出和该耗时聚合整体响应速度；原正文 Token／正文时间仍独立保存，
+两种口径不能混合平均。旧回执缺少完整计时则保持未知，不把旧正文区间当成完整请求时长，
+恢复只重建账本，不重放请求。统计 HTTP 投影增量输出 responseSampleCount、responseOutputTokens、
+responseDurationMs 与 lastResponseTps；UI 不自行估算 Token 或重新计时。
+
+`composerLeft`／`chatAssistant` 是会话内视图位置的增量枚举，复用原 views 清单与包版本事务。
+`priority` 缺省为 0；独立视图入口沿优先级、插件与贡献身份排序，不授予原生正文替换权。`sessionRead:["render"]`
+独立于 `directory` 及 `composer:["text"]`，只读取可见会话身份及用于渲染的助手正文。
+`PluginViewAdmissionRequest` 由 daemon 校验当前安装摘要、激活、授权与位置声明；
+`PluginConversationViewContext` 为原 Renderer 投影经同一隔离页面桥交付的只读内容，
+不写入持久化、不新增会话事实。停用、版本切换及会话变化释放旧文档。
+
 `composer:["text"]` 为独立输入授权，不继承或替代 `images`。`PluginComposerAdmissionRequest.target`
 为增量字段，省略时保持原图片准入；文本必须显式选择 `text`。页面文本复用既有输入框与
 TurnService 提交、队列和幂等，不新增 App Server method。`PluginComposerTextInput/Receipt`
@@ -154,3 +174,14 @@ false，只有解析到实际 Token 数字段时才变为 true；缺失或空 us
 必须携带预览提交和摘要，不能重新解析浮动分支。来源和提交保存在同一 `PluginSource::Upstream`
 安装事实内；不同仓库和 npm 同名包不能互相冒用升级。管理插件仍使用同一安装任务、授权
 和中断回执，不新增包管理执行器、安装状态文件或 App Server 方法。
+
+## 运行读模型清退旧检查点字段（2026-11-10）
+
+HTTP `/runtime/read-model` 及 bootstrap 内嵌的 `SessionRuntimeBranchSummaryEntry` 删除
+`execution_intent_ref`、`binding_lifecycle`、`checkpoint_stage`、`next_step_index`、
+`checkpoint_at`、`resume_mode`。这些字段在 Worker 检查点实现清退后已无生产来源，
+Web DTO 与适配器同步删除，不提供旧状态补造路径。该 HTTP 类型不属于 App Server
+生成 schema，本次不变更 App Server method、生成协议或 canonical 事件格式。
+
+`active_task_ids` 仅包含 TaskStore 当前执行范围中 Pending/Running 的任务；历史终态
+和已转交子树不表示原主线仍活跃。`continuation` 仍是继续动作的唯一资格投影。

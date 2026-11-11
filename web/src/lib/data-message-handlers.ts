@@ -73,7 +73,9 @@ import {
 } from '../shared/protocol/canonical-turn';
 import {
   canonicalTurnRequestId,
+  deriveMainlineRuntimeState,
   deriveProcessingStateFromCanonicalTurns,
+  selectLatestMainlineCanonicalTurn,
 } from '../shared/protocol/canonical-processing';
 import {
   applyCanonicalTurnEvent,
@@ -805,10 +807,6 @@ export function handleUnifiedData(standard: StandardMessage) {
       });
       break;
 
-    case 'orchestratorRuntimeState':
-      handleOrchestratorRuntimeState(asMessage(payload));
-      break;
-
     case 'clarificationRequest':
       handleClarificationRequest(asMessage(payload));
       break;
@@ -1115,7 +1113,7 @@ function canonicalTurnsForSession(sessionId: string, turns: unknown): CanonicalT
 
 /**
  * 只采用快照里的 continuation（daemon 对“当前这次停止”的判定），不采用其余运行状态。
- * 仅当本地最新轮次仍处于停止态时才生效，已重新运行或完成的会话不会被旧快照重新点亮。
+ * 只接纳同一主线 Turn 的停止资格，旧 Turn 快照不能授予或撤销新 Turn 的资格。
  */
 function adoptDaemonContinuation(
   sessionId: string,
@@ -1123,56 +1121,40 @@ function adoptDaemonContinuation(
 ): void {
   const current = messagesState.orchestratorRuntimeState;
   if (!current || current.sessionId !== sessionId) return;
-  const latest = canonicalTurnsForSession(sessionId, turnStoreState.reducer.turns).at(-1);
+  const latest = selectLatestMainlineCanonicalTurn(turnStoreState.reducer.turns, sessionId);
+  if (!latest || current.turnId !== latest.turnId || snapshotState?.sessionId !== sessionId
+    || snapshotState.turnId !== latest.turnId) return;
   const stopped = latest?.status === 'failed'
     || latest?.status === 'cancelled'
     || latest?.status === 'interrupted';
-  const next = stopped && snapshotState?.sessionId === sessionId
-    ? snapshotState.continuation
-    : undefined;
+  const next = stopped ? snapshotState.continuation : undefined;
   if (current.continuation === next) return;
   const { continuation: _stale, ...rest } = current;
   replaceOrchestratorRuntimeState({ ...rest, ...(next ? { continuation: next } : {}) });
 }
 
 function reconcileRuntimeStateFromCanonicalTurns(sessionId: string): void {
-  const latestTurn = canonicalTurnsForSession(sessionId, turnStoreState.reducer.turns).at(-1);
-  if (!latestTurn) {
+  const mainline = deriveMainlineRuntimeState(turnStoreState.reducer.turns, sessionId);
+  const current = messagesState.orchestratorRuntimeState?.sessionId === sessionId
+    ? messagesState.orchestratorRuntimeState : null;
+  if (!mainline) {
+    if (current) replaceOrchestratorRuntimeState({
+      sessionId, status: 'idle', phase: 'idle', assignments: [],
+      statusChangedAt: current.statusChangedAt, lastEventAt: current.lastEventAt,
+      runtimeSnapshot: current.runtimeSnapshot,
+    });
     return;
   }
-  const status: OrchestratorRuntimeState['status'] = latestTurn.status === 'pending'
-    || latestTurn.status === 'running'
-    ? 'running'
-    : latestTurn.status === 'completed'
-      ? 'completed'
-      : latestTurn.status === 'blocked'
-        ? 'blocked'
-        : latestTurn.status === 'failed' || latestTurn.status === 'interrupted'
-          ? 'failed'
-          : latestTurn.status === 'cancelled' || latestTurn.status === 'superseded'
-            ? 'cancelled'
-            : 'idle';
-  const statusChangedAt = Math.max(
-    latestTurn.acceptedAt,
-    latestTurn.completedAt ?? 0,
-    ...latestTurn.items.map((item) => item.updatedAt),
-  );
-  const current = messagesState.orchestratorRuntimeState;
   // continuation 是 daemon 对“当前这次停止”的判定，轮次数据推不出它：
-  // 最新轮次重新运行、完成或阻塞后它必然已失效，只有仍处于停止态时才保留 daemon 最近给出的值。
-  const { continuation, ...retained } = current ?? { errors: [], assignments: [], lastEventAt: statusChangedAt };
-  const stillStopped = status === 'failed' || status === 'cancelled';
+  // 换轮时清掉原轮次诊断和资格，只保留会话最近一次上下文压力观测。
+  const { continuation, ...retained } = current && current.turnId === mainline.turnId
+    ? current : { assignments: [], runtimeSnapshot: current?.runtimeSnapshot, continuation: undefined };
+  const stillStopped = mainline.status === 'failed' || mainline.status === 'cancelled';
   replaceOrchestratorRuntimeState({
     ...retained,
     ...(stillStopped && continuation ? { continuation } : {}),
     sessionId,
-    status,
-    phase: status,
-    statusChangedAt,
-    lastEventAt: Math.max(current?.lastEventAt ?? 0, statusChangedAt),
-    ...(status === 'running'
-      ? { endedAt: undefined }
-      : { endedAt: latestTurn.completedAt ?? statusChangedAt }),
+    ...mainline,
   });
 }
 
@@ -1632,86 +1614,6 @@ function handleNotificationsLoaded(message: ClientBridgeMessage) {
 }
 
 
-function handleOrchestratorRuntimeState(message: ClientBridgeMessage) {
-  const store = getState();
-  const status = message.status === 'idle'
-    || message.status === 'running'
-    || message.status === 'waiting'
-    || message.status === 'paused'
-    || message.status === 'blocked'
-    || message.status === 'completed'
-    || message.status === 'failed'
-    || message.status === 'cancelled'
-    ? message.status
-    : null;
-  const phase = typeof message.phase === 'string' ? message.phase.trim() : '';
-  const statusChangedAt = typeof message.statusChangedAt === 'number' && Number.isFinite(message.statusChangedAt)
-    ? Math.floor(message.statusChangedAt)
-    : null;
-  const lastEventAt = typeof message.lastEventAt === 'number' && Number.isFinite(message.lastEventAt)
-    ? Math.floor(message.lastEventAt)
-    : null;
-  if (!status || !phase || statusChangedAt === null || lastEventAt === null) {
-    return;
-  }
-  const sessionId = typeof message.sessionId === 'string' && message.sessionId.trim().length > 0
-    ? message.sessionId.trim()
-    : undefined;
-  const currentSessionId = store.currentSessionId?.trim() || '';
-  if (sessionId && currentSessionId && sessionId !== currentSessionId) {
-    return;
-  }
-  const runtimeState: OrchestratorRuntimeState = {
-    status,
-    phase,
-    errors: Array.isArray(message.errors)
-      ? message.errors
-        .filter((item: unknown): item is string => typeof item === 'string' && item.trim().length > 0)
-        .map((item: string) => item.trim())
-      : [],
-    statusChangedAt,
-    lastEventAt,
-    assignments: Array.isArray(message.assignments)
-      ? (message.assignments as OrchestratorRuntimeState['assignments'])
-      : [],
-    ...(sessionId ? { sessionId } : {}),
-    ...(typeof message.requestId === 'string' && message.requestId.trim().length > 0
-      ? { requestId: message.requestId.trim() }
-      : {}),
-    ...(message.chain && typeof message.chain === 'object'
-      ? { chain: message.chain as OrchestratorRuntimeState['chain'] }
-      : {}),
-    ...(typeof message.statusReason === 'string' && message.statusReason.trim().length > 0
-      ? { statusReason: message.statusReason.trim() }
-      : {}),
-    ...(message.continuation === 'resume_chain' || message.continuation === 'resume_turn'
-      ? { continuation: message.continuation }
-      : {}),
-    ...(typeof message.runtimeReason === 'string' && message.runtimeReason.trim().length > 0
-      ? { runtimeReason: message.runtimeReason.trim() }
-      : {}),
-    ...(typeof message.failureReason === 'string' && message.failureReason.trim().length > 0
-      ? { failureReason: message.failureReason.trim() }
-      : {}),
-    ...(typeof message.startedAt === 'number' && Number.isFinite(message.startedAt) && message.startedAt > 0
-      ? { startedAt: Math.floor(message.startedAt) }
-      : {}),
-    ...(typeof message.endedAt === 'number' && Number.isFinite(message.endedAt) && message.endedAt > 0
-      ? { endedAt: Math.floor(message.endedAt) }
-      : {}),
-    runtimeSnapshot: message.runtimeSnapshot && typeof message.runtimeSnapshot === 'object'
-      ? (message.runtimeSnapshot as OrchestratorRuntimeState['runtimeSnapshot'])
-      : null,
-    runtimeDecisionTrace: Array.isArray(message.runtimeDecisionTrace)
-      ? (message.runtimeDecisionTrace as OrchestratorRuntimeState['runtimeDecisionTrace'])
-      : [],
-    opsView: message.opsView && typeof message.opsView === 'object'
-      ? (message.opsView as OrchestratorRuntimeState['opsView'])
-      : null,
-  };
-  setOrchestratorRuntimeState(runtimeState);
-}
-
 function handleClarificationRequest(_message: ClientBridgeMessage) {
   showFeedback('info', i18n.t('messageHandler.autoSkipClarification'));
 }
@@ -1814,4 +1716,4 @@ function handleConnectionTestResult(message: ClientBridgeMessage) {
 }
 
 // Named exports
-export { handleStateUpdate, handleSessionsUpdated, handleEmptyWorkspaceStateLoaded, handleSessionBootstrapLoaded, handleOrchestratorRuntimeState, handleClarificationRequest, handleWorkerStatusUpdate, handleConnectionTestResult };
+export { handleStateUpdate, handleSessionsUpdated, handleEmptyWorkspaceStateLoaded, handleSessionBootstrapLoaded, handleClarificationRequest, handleWorkerStatusUpdate, handleConnectionTestResult };

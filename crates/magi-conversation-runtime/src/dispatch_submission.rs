@@ -21,8 +21,8 @@ use magi_orchestrator::{
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurn, CanonicalTurnItemKind,
-    ExecutionThread, SessionPlan, SessionRuntimeSidecar, SessionStore, ThreadChatMessage,
-    ThreadContextCheckpoint, TimelineEntryInput, TimelineEntryKind,
+    ExecutionThread, SessionPlan, SessionRuntimeSidecar, SessionStore, TimelineEntryInput,
+    TimelineEntryKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +43,8 @@ use magi_settings_store::SettingsStore;
 pub struct DispatchSubmissionGraph {
     pub root_task_id: TaskId,
     pub action_task_id: TaskId,
-    pub active_execution_chain: Option<ActiveExecutionChain>,
+    pub active_execution_chain: ActiveExecutionChain,
+    pub turn: ActiveExecutionTurn,
     pub(crate) materialize_rollback: Option<MaterializeRollback>,
 }
 
@@ -51,12 +52,14 @@ impl DispatchSubmissionGraph {
     pub fn new(
         root_task_id: TaskId,
         action_task_id: TaskId,
-        active_execution_chain: Option<ActiveExecutionChain>,
+        active_execution_chain: ActiveExecutionChain,
+        turn: ActiveExecutionTurn,
     ) -> Self {
         Self {
             root_task_id,
             action_task_id,
             active_execution_chain,
+            turn,
             materialize_rollback: None,
         }
     }
@@ -383,7 +386,7 @@ pub struct DispatchSubmissionAccepted {
 pub struct PendingDispatchSubmission {
     pub task: magi_core::Task,
     pub active_execution_chain: ActiveExecutionChain,
-    pub turn_id: String,
+    pub turn: ActiveExecutionTurn,
     pub user_message_item_id: Option<String>,
 }
 
@@ -495,12 +498,8 @@ pub fn cleanup_rejected_dispatch(
             });
         }
     }
-    if let Some(chain) = graph.active_execution_chain.as_ref()
-        && let Some(turn_id) = chain
-            .current_turn
-            .as_ref()
-            .map(|turn| turn.turn_id.as_str())
-    {
+    let chain = &graph.active_execution_chain;
+    if let Some(turn_id) = chain.current_turn_id.as_deref() {
         for branch in &chain.branches {
             let _ = execution_registry.remove_if_turn_matches(&branch.task_id, turn_id);
         }
@@ -869,19 +868,11 @@ fn validate_dispatch_request(
 fn build_active_execution_chain(
     prepared: &PreparedDispatchSubmission,
     request: &DispatchSubmissionRequest,
-) -> Result<(ActiveExecutionChain, Option<String>), DispatchSubmissionRunError> {
+) -> Result<(ActiveExecutionChain, ActiveExecutionTurn, Option<String>), DispatchSubmissionRunError>
+{
     let branch = ActiveExecutionBranch {
         task_id: prepared.action_task_id.clone(),
         worker_id: prepared.worker_id.clone(),
-        stage: "execute".to_string(),
-        lease_id: None,
-        execution_intent_ref: None,
-        binding_lifecycle: None,
-        checkpoint_stage: Some("execute".to_string()),
-        next_step_index: Some(0),
-        checkpoint_at: Some(prepared.now),
-        resume_mode: Some("stage-restart".to_string()),
-        resume_token: None,
         use_tools: request.use_tools,
         skill_name: request.skill_name.clone(),
         is_primary: true,
@@ -1004,18 +995,16 @@ fn build_active_execution_chain(
             root_task_id: prepared.action_task_id.clone(),
             execution_chain_ref: prepared.execution_chain_ref.clone(),
             workspace_id: request.workspace_id.clone(),
-            active_branch_task_ids: vec![prepared.action_task_id.clone()],
-            active_worker_bindings: vec![prepared.worker_id.clone()],
             branches,
-            recovery_ref: None,
             dispatch_context: ActiveExecutionDispatchContext {
                 accepted_at: request.accepted_at,
                 entry_id: request.entry_id.clone(),
                 trimmed_text: request.trimmed_text.clone(),
                 skill_name: request.skill_name.clone(),
             },
-            current_turn: Some(current_turn),
+            current_turn_id: Some(current_turn.turn_id.clone()),
         },
+        current_turn,
         user_message_item_id,
     ))
 }
@@ -1051,15 +1040,22 @@ fn materialize_execution(
     pending_chain: Option<ActiveExecutionChain>,
 ) -> Result<DispatchSubmissionGraph, DispatchSubmissionRunError> {
     let accepted_materialize = pending_chain.is_some();
-    let active_execution_chain = match pending_chain {
-        Some(chain) => chain,
-        None => build_active_execution_chain(prepared, request)?.0,
+    let (active_execution_chain, turn) = match pending_chain {
+        Some(chain) => {
+            let turn = runtime
+                .session_store
+                .runtime_sidecar(&request.session_id)
+                .and_then(|sidecar| sidecar.current_turn)
+                .ok_or_else(|| {
+                    DispatchSubmissionRunError::Internal("已接纳任务缺少当前 Turn".into())
+                })?;
+            (chain, turn)
+        }
+        None => {
+            let (chain, turn, _) = build_active_execution_chain(prepared, request)?;
+            (chain, turn)
+        }
     };
-    let interrupted_checkpoint = request
-        .recovery_checkpoint
-        .as_ref()
-        .map(|checkpoint| prepare_interrupted_turn_checkpoint(runtime.session_store, checkpoint))
-        .transpose()?;
     let mut attempt = MaterializeExecutionAttempt::new(
         runtime.session_store,
         runtime.execution_registry,
@@ -1158,11 +1154,11 @@ fn materialize_execution(
     if coordinator_reused {
         attempt.rollback.record_coordinator_after(activated_thread);
     }
-    if let Some(checkpoint) = interrupted_checkpoint
-        && let Err(error) = install_interrupted_turn_checkpoint(
+    if let Some(checkpoint) = request.recovery_checkpoint.as_ref()
+        && let Err(error) = restore_interrupted_turn_context(
             runtime.session_store,
+            &checkpoint.source_thread_id,
             &worker_thread_id,
-            checkpoint,
             UtcMillis::now(),
         )
     {
@@ -1240,13 +1236,12 @@ fn materialize_execution(
     }
     attempt.rollback.record_registry_inserted();
     if accepted_materialize
-        && let Err(error) = runtime.session_store.upsert_active_execution_chain(
-            request.session_id.clone(),
-            active_execution_chain.clone(),
-        )
+        && let Err(error) = runtime
+            .session_store
+            .validate_execution_chain(&request.session_id, &active_execution_chain)
     {
         return attempt.fail(DispatchSubmissionRunError::Internal(format!(
-            "写回 materialize execution chain 失败: {error}"
+            "校验 materialize execution chain 失败: {error}"
         )));
     }
     let materialize_rollback = if accepted_materialize {
@@ -1269,7 +1264,8 @@ fn materialize_execution(
     Ok(DispatchSubmissionGraph {
         root_task_id: prepared.action_task_id.clone(),
         action_task_id: prepared.action_task_id.clone(),
-        active_execution_chain: Some(active_execution_chain),
+        active_execution_chain,
+        turn,
         materialize_rollback,
     })
 }
@@ -1280,7 +1276,7 @@ pub fn prepare_pending_dispatch_submission(
     request: &DispatchSubmissionRequest,
 ) -> Result<PendingDispatchSubmission, DispatchSubmissionRunError> {
     let prepared = validate_dispatch_request(runtime, request, true)?;
-    let (mut active_execution_chain, user_message_item_id) =
+    let (active_execution_chain, mut turn, user_message_item_id) =
         build_active_execution_chain(&prepared, request)?;
     // 不唤醒的插件上下文只在下一次真实模型 Task 接纳时领取。用户输入与这些
     // 消息在同一 canonical 事务建立 Input 绑定；失败不领取，重启不重放。
@@ -1288,10 +1284,6 @@ pub fn prepare_pending_dispatch_submission(
         .user_message_metadata
         .contains_key("pluginCommandId")
     {
-        let turn = active_execution_chain
-            .current_turn
-            .as_mut()
-            .expect("prepared Turn");
         for input in runtime.session_store.inbox_snapshot(&request.session_id).0 {
             let Some(origin) = input.payload.get("plugin_message").filter(|origin| {
                 origin.get("delivery").and_then(|v| v.as_str()) == Some("context")
@@ -1343,7 +1335,7 @@ pub fn prepare_pending_dispatch_submission(
     Ok(PendingDispatchSubmission {
         task: prepared.task,
         active_execution_chain,
-        turn_id: prepared.turn_id,
+        turn,
         user_message_item_id,
     })
 }
@@ -1394,8 +1386,10 @@ pub fn materialize_dispatch_submission(
     let current_turn = sidecar.current_turn.as_ref().ok_or_else(|| {
         DispatchSubmissionRunError::Internal("accepted Turn 缺少 current_turn".to_string())
     })?;
+    // Sidecar 从 canonical 投影读取，Preparing 已归一为 Running；
+    // 下方 Pending root task 校验才决定是否尚未开始执行。
     if current_turn.turn_id != expected_turn_id
-        || !matches!(current_turn.status.as_str(), "accepted" | "preparing")
+        || !matches!(current_turn.status.as_str(), "accepted" | "running")
     {
         return Err(DispatchSubmissionRunError::InvalidInput(
             "accepted Turn 已被终态或新的 Turn 取代".to_string(),
@@ -1467,11 +1461,6 @@ pub fn materialize_dispatch_submission(
     Ok(())
 }
 
-struct InterruptedTurnCheckpointSeed {
-    message_history: Vec<ThreadChatMessage>,
-    context_checkpoint: Option<ThreadContextCheckpoint>,
-}
-
 fn validate_interrupted_turn_checkpoint(
     session_store: &SessionStore,
     checkpoint: &TaskRecoveryCheckpoint,
@@ -1539,106 +1528,27 @@ fn validate_interrupted_turn_checkpoint(
     Ok(())
 }
 
-fn prepare_interrupted_turn_checkpoint(
-    session_store: &SessionStore,
-    checkpoint: &TaskRecoveryCheckpoint,
-) -> Result<InterruptedTurnCheckpointSeed, DispatchSubmissionRunError> {
-    validate_interrupted_turn_checkpoint(session_store, checkpoint)?;
-    let source_turn = session_store
-        .canonical_turns_for_session(&checkpoint.source_session_id)
-        .into_iter()
-        .find(|turn| turn.turn_id == checkpoint.source_turn_id)
-        .ok_or_else(|| {
-            DispatchSubmissionRunError::InvalidInput(format!(
-                "续接来源 Turn 不存在: {}",
-                checkpoint.source_turn_id
-            ))
-        })?;
-    if source_turn.status != magi_session_store::CanonicalTurnStatus::Cancelled {
-        return Err(DispatchSubmissionRunError::InvalidInput(format!(
-            "续接来源 Turn 不是用户中断状态: {}",
-            checkpoint.source_turn_id
-        )));
-    }
-    let interrupted_by_user = source_turn.items.iter().any(|item| {
-        item.kind == CanonicalTurnItemKind::UserMessage
-            && item
-                .metadata
-                .get("interruptionSource")
-                .and_then(serde_json::Value::as_str)
-                == Some("user")
-    });
-    if !interrupted_by_user {
-        return Err(DispatchSubmissionRunError::InvalidInput(format!(
-            "续接来源 Turn 不是用户主动中断: {}",
-            checkpoint.source_turn_id
-        )));
-    }
-    if !source_turn.items.iter().any(|item| {
-        item.worker
-            .as_ref()
-            .and_then(|worker| worker.task_id.as_ref())
-            == Some(&checkpoint.source_task_id)
-    }) {
-        return Err(DispatchSubmissionRunError::InvalidInput(format!(
-            "续接来源 Turn 与任务不匹配: {}",
-            checkpoint.source_task_id
-        )));
-    }
-    let source_thread = session_store
-        .thread_registry_snapshot(&checkpoint.source_session_id)
-        .into_iter()
-        .find(|thread| thread.thread_id == checkpoint.source_thread_id)
-        .ok_or_else(|| {
-            DispatchSubmissionRunError::InvalidInput(format!(
-                "续接来源任务缺少持久化 Thread: {}",
-                checkpoint.source_task_id
-            ))
-        })?;
-    if !source_thread
-        .handled_task_ids
-        .contains(&checkpoint.source_task_id)
-    {
-        return Err(DispatchSubmissionRunError::InvalidInput(format!(
-            "续接来源 Thread 与任务不匹配: {}",
-            checkpoint.source_task_id
-        )));
-    }
-    let context_checkpoint = session_store.thread_context_checkpoint(&checkpoint.source_thread_id);
-    Ok(InterruptedTurnCheckpointSeed {
-        message_history: source_thread.message_history,
-        context_checkpoint,
-    })
-}
-
-fn install_interrupted_turn_checkpoint(
-    session_store: &SessionStore,
-    destination_thread_id: &magi_core::ThreadId,
-    checkpoint: InterruptedTurnCheckpointSeed,
+fn restore_interrupted_turn_context(
+    store: &SessionStore,
+    source_thread_id: &ThreadId,
+    destination_thread_id: &ThreadId,
     now: UtcMillis,
 ) -> Result<(), DispatchSubmissionRunError> {
-    session_store
-        .replace_thread_messages_checked(destination_thread_id, checkpoint.message_history, now)
+    let source = store
+        .thread_context_snapshot(source_thread_id)
         .map_err(|error| {
-            DispatchSubmissionRunError::Internal(format!("替换恢复 thread 对话历史失败: {error}"))
+            DispatchSubmissionRunError::Internal(format!("读取恢复来源快照失败: {error}"))
         })?;
-    if let Some(source_checkpoint) = checkpoint.context_checkpoint {
-        session_store
-            .install_thread_context_checkpoint_checked(
-                destination_thread_id,
-                magi_session_store::ThreadContextCheckpoint {
-                    thread_id: destination_thread_id.clone(),
-                    ..source_checkpoint
-                },
-                now,
-            )
-            .map_err(|error| {
-                DispatchSubmissionRunError::Internal(format!(
-                    "安装恢复 thread 上下文检查点失败: {error}"
-                ))
-            })?;
-    }
-    Ok(())
+    let destination = store
+        .thread_context_snapshot(destination_thread_id)
+        .map_err(|error| {
+            DispatchSubmissionRunError::Internal(format!("读取恢复目标快照失败: {error}"))
+        })?;
+    store
+        .inherit_thread_context_checkpoint(&source, &destination, now)
+        .map_err(|error| {
+            DispatchSubmissionRunError::Internal(format!("安装恢复上下文检查点失败: {error}"))
+        })
 }
 
 pub fn accept_dispatch_submission(
@@ -1656,113 +1566,76 @@ pub fn accept_dispatch_submission(
             ),
         }
     })?;
-    let turn_id = graph
-        .active_execution_chain
-        .as_ref()
-        .and_then(|chain| chain.current_turn.as_ref())
-        .map(|turn| turn.turn_id.clone())
-        .or_else(|| {
-            session_store
-                .runtime_sidecar(&request.session_id)
-                .and_then(|sidecar| sidecar.current_turn)
-                .map(|turn| turn.turn_id)
-        })
-        .ok_or_else(|| DispatchSubmissionAcceptError::Internal {
-            message: "接纳任务派发后缺少当前 Turn".to_string(),
-        })?;
-    if let Some(active_execution_chain) = graph.active_execution_chain.clone() {
-        let accept_result = if let Some(goal_id) = request.turn_origin.continuation_goal_id() {
-            CanonicalTurnEventSink::for_store(session_store, Some(task_store))
-                .accept_goal_continuation_with_timeline_entry_and_task(
-                    request.session_id.clone(),
-                    goal_id,
-                    TimelineEntryInput::new(
-                        request.entry_id.clone(),
-                        request.turn_origin.timeline_kind(),
-                        request.timeline_message.clone(),
-                        request.accepted_at,
+    let turn_id = graph.turn.turn_id.clone();
+    let active_execution_chain = graph.active_execution_chain.clone();
+    let accept_result = if let Some(goal_id) = request.turn_origin.continuation_goal_id() {
+        CanonicalTurnEventSink::for_store(session_store, Some(task_store))
+            .accept_goal_continuation_with_timeline_entry_and_task(
+                request.session_id.clone(),
+                goal_id,
+                TimelineEntryInput::new(
+                    request.entry_id.clone(),
+                    request.turn_origin.timeline_kind(),
+                    request.timeline_message.clone(),
+                    request.accepted_at,
+                ),
+                active_execution_chain,
+                graph.turn.clone(),
+                &acceptance_task,
+            )
+            .map(|(_, _, canonical_turn)| (None, Some(canonical_turn)))
+    } else if let Some(replace_turn_id) = request.replace_turn_id.as_deref() {
+        CanonicalTurnEventSink::for_store(session_store, Some(task_store))
+            .replace_current_turn_with_active_execution_chain_and_timeline_entry_and_task(
+                request.session_id.clone(),
+                replace_turn_id,
+                TimelineEntryInput::new(
+                    request.entry_id.clone(),
+                    request.turn_origin.timeline_kind(),
+                    request.timeline_message.clone(),
+                    request.accepted_at,
+                ),
+                active_execution_chain,
+                graph.turn.clone(),
+                &acceptance_task,
+            )
+            .map(|(_, _, superseded_turn, canonical_turn)| {
+                (Some(superseded_turn), Some(canonical_turn))
+            })
+    } else {
+        CanonicalTurnEventSink::for_store(session_store, Some(task_store))
+            .accept_active_execution_chain_with_timeline_entry_and_task(
+                request.session_id.clone(),
+                TimelineEntryInput::new(
+                    request.entry_id.clone(),
+                    request.turn_origin.timeline_kind(),
+                    request.timeline_message.clone(),
+                    request.accepted_at,
+                ),
+                active_execution_chain,
+                graph.turn.clone(),
+                &acceptance_task,
+            )
+            .map(|(_, _, canonical_turn)| (None, Some(canonical_turn)))
+    };
+    let (superseded_turn, accepted_canonical_turn) = match accept_result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Err(checkpoint_error) =
+                cleanup_rejected_dispatch(Some(task_store), execution_registry, graph)
+            {
+                return Err(DispatchSubmissionAcceptError::Internal {
+                    message: format!(
+                        "接纳派发失败: {error}；回收任务 checkpoint 失败: {checkpoint_error}"
                     ),
-                    active_execution_chain,
-                    &acceptance_task,
-                )
-                .map(|(_, _, canonical_turn)| (None, canonical_turn))
-        } else if let Some(replace_turn_id) = request.replace_turn_id.as_deref() {
-            CanonicalTurnEventSink::for_store(session_store, Some(task_store))
-                .replace_current_turn_with_active_execution_chain_and_timeline_entry_and_task(
-                    request.session_id.clone(),
-                    replace_turn_id,
-                    TimelineEntryInput::new(
-                        request.entry_id.clone(),
-                        request.turn_origin.timeline_kind(),
-                        request.timeline_message.clone(),
-                        request.accepted_at,
-                    ),
-                    active_execution_chain,
-                    &acceptance_task,
-                )
-                .map(|(_, _, superseded_turn, canonical_turn)| {
-                    (Some(superseded_turn), Some(canonical_turn))
-                })
-        } else {
-            CanonicalTurnEventSink::for_store(session_store, Some(task_store))
-                .accept_active_execution_chain_with_timeline_entry_and_task(
-                    request.session_id.clone(),
-                    TimelineEntryInput::new(
-                        request.entry_id.clone(),
-                        request.turn_origin.timeline_kind(),
-                        request.timeline_message.clone(),
-                        request.accepted_at,
-                    ),
-                    active_execution_chain,
-                    &acceptance_task,
-                )
-                .map(|(_, _, canonical_turn)| (None, canonical_turn))
-        };
-        let (superseded_turn, accepted_canonical_turn) = match accept_result {
-            Ok(result) => result,
-            Err(error) => {
-                if let Err(checkpoint_error) =
-                    cleanup_rejected_dispatch(Some(task_store), execution_registry, graph)
-                {
-                    return Err(DispatchSubmissionAcceptError::Internal {
-                        message: format!(
-                            "接纳派发失败: {error}；回收任务 checkpoint 失败: {checkpoint_error}"
-                        ),
-                    });
-                }
-                return Err(DispatchSubmissionAcceptError::from_store_error(error));
+                });
             }
-        };
-
-        if let Some(rollback) = graph.materialize_rollback.take() {
-            rollback.commit();
+            return Err(DispatchSubmissionAcceptError::from_store_error(error));
         }
+    };
 
-        let user_message_item_id = request.turn_origin.creates_user_message_item().then(|| {
-            request
-                .user_message_id
-                .clone()
-                .unwrap_or_else(|| format!("turn-item-user-{}", request.accepted_at.0))
-        });
-
-        let accepted_session_id = request.session_id.clone();
-        let accepted_entry_id = request.entry_id.clone();
-        let accepted_at = request.accepted_at;
-        let created_session = request.created_session;
-        return Ok(DispatchSubmissionAccepted {
-            request,
-            session_id: accepted_session_id,
-            entry_id: accepted_entry_id,
-            accepted_at,
-            created_session,
-            root_task_id: graph.root_task_id,
-            action_task_id: graph.action_task_id,
-            turn_id: turn_id.clone(),
-            user_message_item_id,
-            accepted_canonical_turn,
-            runner_started: false,
-            superseded_turn,
-        });
+    if let Some(rollback) = graph.materialize_rollback.take() {
+        rollback.commit();
     }
 
     let user_message_item_id = request.turn_origin.creates_user_message_item().then(|| {
@@ -1776,9 +1649,6 @@ pub fn accept_dispatch_submission(
     let accepted_entry_id = request.entry_id.clone();
     let accepted_at = request.accepted_at;
     let created_session = request.created_session;
-    if let Some(rollback) = graph.materialize_rollback.take() {
-        rollback.commit();
-    }
     Ok(DispatchSubmissionAccepted {
         request,
         session_id: accepted_session_id,
@@ -1789,36 +1659,20 @@ pub fn accept_dispatch_submission(
         action_task_id: graph.action_task_id,
         turn_id,
         user_message_item_id,
-        accepted_canonical_turn: None,
+        accepted_canonical_turn,
         runner_started: false,
-        superseded_turn: None,
+        superseded_turn,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magi_session_store::ThreadContextCheckpoint;
     use magi_session_store::{
-        CanonicalTurnMutation, ExecutionThread, ExecutionThreadStatus, GoalContinuationPhase,
-        GoalStatus, SessionAcceptanceRecord, SessionEventWriter, ThreadChatMessage,
-        ThreadChatToolCall, ThreadChatToolFunction,
+        ExecutionThread, ExecutionThreadStatus, GoalContinuationPhase, GoalStatus,
+        ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction,
     };
-
-    struct RejectingCanonicalWriter;
-
-    impl SessionEventWriter for RejectingCanonicalWriter {
-        fn append_session_transaction(
-            &self,
-            _: &SessionId,
-            _: &[CanonicalTurnMutation],
-            _: &[magi_session_store::SessionInputMutation],
-            _: Option<(&SessionAcceptanceRecord, Option<&magi_core::Task>)>,
-        ) -> DomainResult<()> {
-            Err(DomainError::Persistence {
-                message: "test acceptance write rejection".into(),
-            })
-        }
-    }
 
     fn rollback_test_request(
         session_id: SessionId,
@@ -1976,15 +1830,7 @@ mod tests {
             serde_json::json!("plugin/acme.result/run"),
         );
         let command = prepare_pending_dispatch_submission(&runtime, &request).unwrap();
-        assert_eq!(
-            command
-                .active_execution_chain
-                .current_turn
-                .unwrap()
-                .items
-                .len(),
-            1
-        );
+        assert_eq!(command.turn.items.len(), 1);
         task_store.remove_task(&command.task.task_id).unwrap();
         assert_eq!(
             session_store
@@ -1995,16 +1841,7 @@ mod tests {
         );
         request.user_message_metadata.clear();
         let pending = prepare_pending_dispatch_submission(&runtime, &request).unwrap();
-        assert_eq!(
-            pending
-                .active_execution_chain
-                .current_turn
-                .as_ref()
-                .unwrap()
-                .items
-                .len(),
-            2
-        );
+        assert_eq!(pending.turn.items.len(), 2);
         assert_eq!(
             session_store
                 .input_for_request("context-request")
@@ -2016,7 +1853,8 @@ mod tests {
         let graph = DispatchSubmissionGraph::new(
             pending.task.task_id.clone(),
             pending.task.task_id,
-            Some(pending.active_execution_chain),
+            pending.active_execution_chain,
+            pending.turn,
         );
         let accepted = accept_dispatch_submission(
             &session_store,
@@ -2047,10 +1885,11 @@ mod tests {
             .orchestrator_thread_for_session(&session)
             .unwrap()
             .thread_id;
-        session_store
-            .rebuild_thread_message_projection(&thread, UtcMillis(3100))
-            .unwrap();
-        let projected = session_store.thread_message_history(&thread);
+        let projected = session_store
+            .thread_context_snapshot(&thread)
+            .unwrap()
+            .messages()
+            .to_vec();
         let message = projected
             .iter()
             .find(|message| message.input_request_id.as_deref() == Some("context-request"))
@@ -2144,20 +1983,12 @@ mod tests {
                 last_used_at: UtcMillis(1_000),
                 observed_context_window_tokens: None,
                 handled_task_ids: vec![TaskId::new("task-old")],
-                message_history: vec![ThreadChatMessage {
-                    input_request_id: None,
-                    role: "user".to_string(),
-                    content: Some(
-                        "历史验收任务：写 validation_auto_save_marker.txt / COMPLEX_WORKER_LANE_OK"
-                            .to_string(),
-                    ),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                }],
             })
             .expect("旧 thread 测试数据应注册成功");
+        let session_store = crate::test_history::with_messages(&session_store, &old_thread_id,
+            serde_json::from_value(serde_json::json!([
+                {"role": "user", "content": "历史验收任务：写 validation_auto_save_marker.txt / COMPLEX_WORKER_LANE_OK"},
+            ])).unwrap(), UtcMillis(1000));
 
         let request = DispatchSubmissionRequest {
             project_directories: None,
@@ -2207,20 +2038,23 @@ mod tests {
 
         let graph = run_dispatch_submission_for_test(&runtime, &request)
             .expect("dispatch submission should build graph");
-        let chain = graph
-            .active_execution_chain
-            .expect("dispatch should create active execution chain");
+        let chain = graph.active_execution_chain;
         let lane_thread_id = chain.branches[0].thread_id.clone();
 
         assert_ne!(lane_thread_id, old_thread_id);
         assert!(
             session_store
-                .thread_message_history(&lane_thread_id)
+                .thread_context_snapshot(&lane_thread_id)
+                .unwrap()
+                .messages()
                 .is_empty(),
-            "新的 worker thread 不能继承旧 role thread 的 message_history"
+            "新的 worker thread 不能继承旧 role thread 的历史"
         );
         assert_eq!(
-            session_store.thread_message_history(&old_thread_id)[0]
+            session_store
+                .thread_context_snapshot(&old_thread_id)
+                .unwrap()
+                .messages()[0]
                 .content
                 .as_deref(),
             Some("历史验收任务：写 validation_auto_save_marker.txt / COMPLEX_WORKER_LANE_OK")
@@ -2295,15 +2129,15 @@ mod tests {
             .thread_id;
         let first_thread_id = first
             .active_execution_chain
-            .as_ref()
-            .and_then(|chain| chain.branches.first())
+            .branches
+            .first()
             .expect("first branch should exist")
             .thread_id
             .clone();
         let second_thread_id = second
             .active_execution_chain
-            .as_ref()
-            .and_then(|chain| chain.branches.first())
+            .branches
+            .first()
             .expect("second branch should exist")
             .thread_id
             .clone();
@@ -2418,10 +2252,10 @@ mod tests {
             reference.contains("/tmp/browser-artifacts/session-dispatch/annotation.png")
         }));
         let user_item = graph
-            .active_execution_chain
-            .as_ref()
-            .and_then(|chain| chain.current_turn.as_ref())
-            .and_then(|turn| turn.items.iter().find(|item| item.kind == "user_message"))
+            .turn
+            .items
+            .iter()
+            .find(|item| item.kind == "user_message")
             .expect("canonical user item should persist");
         assert_eq!(
             user_item.metadata.get("browserAnnotationRefs"),
@@ -2515,7 +2349,6 @@ mod tests {
                 last_used_at: now,
                 observed_context_window_tokens: None,
                 handled_task_ids: vec![source_task_id.clone()],
-                message_history: source_history.clone(),
             })
             .expect("source thread 测试数据应注册成功");
         let coordinator = crate::SessionTurnCoordinator::new();
@@ -2568,6 +2401,22 @@ mod tests {
                 source_thread_id: orchestrator_thread_id,
             }],
         };
+        let mut turn = turn;
+        let mut task_input = turn.items[0].clone();
+        task_input.item_id = "source-task-input".into();
+        task_input.item_seq = 2;
+        task_input.source_thread_id = source_thread_id.clone();
+        let mut tool = task_input.clone();
+        tool.item_id = "source-tool".into();
+        tool.item_seq = 3;
+        tool.kind = "tool_call_result".into();
+        tool.source = "tool".into();
+        tool.tool_call_id = Some("call-resume-file-read".into());
+        tool.tool_name = Some("file_read".into());
+        tool.tool_status = Some("completed".into());
+        tool.tool_arguments = Some(r#"{"path":"Cargo.toml"}"#.into());
+        tool.tool_result = Some(r#"{"status":"succeeded","content":"workspace"}"#.into());
+        turn.items.extend([task_input, tool]);
         let source_task = make_dispatch_task(DispatchTaskInput {
             task_id: source_task_id.clone(),
             mission_id: mission_id.clone(),
@@ -2588,6 +2437,7 @@ mod tests {
             browser_annotation_refs: &[],
             browser_node_selections: &[],
         });
+        let admitted_turn = turn;
         CanonicalTurnEventSink::for_store(&session_store, None)
             .accept_active_execution_chain_with_timeline_entry_and_task(
                 session_id.clone(),
@@ -2603,34 +2453,23 @@ mod tests {
                     root_task_id: source_task_id.clone(),
                     execution_chain_ref: "chain-dispatch-resume-source".to_string(),
                     workspace_id: None,
-                    active_branch_task_ids: vec![source_task_id.clone()],
-                    active_worker_bindings: vec![source_worker_id.clone()],
                     branches: vec![ActiveExecutionBranch {
                         task_id: source_task_id.clone(),
                         worker_id: source_worker_id,
-                        stage: "execute".to_string(),
-                        lease_id: None,
-                        execution_intent_ref: None,
-                        binding_lifecycle: None,
-                        checkpoint_stage: Some("execute".to_string()),
-                        next_step_index: Some(0),
-                        checkpoint_at: Some(now),
-                        resume_mode: Some("stage-restart".to_string()),
-                        resume_token: None,
                         use_tools: true,
                         skill_name: None,
                         is_primary: true,
                         thread_id: source_thread_id.clone(),
                     }],
-                    recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
                         accepted_at: now,
                         entry_id: "timeline-dispatch-resume-source".to_string(),
                         trimmed_text: Some("画当前项目流程图".to_string()),
                         skill_name: None,
                     },
-                    current_turn: Some(turn),
+                    current_turn_id: Some(admitted_turn.turn_id.clone()),
                 },
+                admitted_turn,
                 &source_task,
             )
             .expect("source Turn should persist through sink");
@@ -2655,6 +2494,41 @@ mod tests {
         CanonicalTurnEventSink::for_store(&session_store, None)
             .interrupt_turn_by_user(&session_id)
             .expect("source Turn should be interrupted by user");
+
+        session_store
+            .install_thread_context_checkpoint_checked(
+                &source_thread_id,
+                ThreadContextCheckpoint {
+                    thread_id: source_thread_id.clone(),
+                    checkpoint_id: "source-summary".into(),
+                    source_message_count: 1,
+                    summary_message: ThreadChatMessage {
+                        content: Some("来源任务摘要".into()),
+                        ..source_history[0].clone()
+                    },
+                    reason: "context_window_pressure".into(),
+                    original_token_estimate: 100,
+                    checkpoint_token_estimate: 10,
+                    created_at: UtcMillis(2_500),
+                    generation: 1,
+                    tool_result_projection_fingerprint: None,
+                    source_fingerprint: magi_session_store::thread_history_fingerprint(
+                        &session_store
+                            .thread_context_snapshot(&source_thread_id)
+                            .unwrap()
+                            .messages()[..1],
+                    ),
+                    model_provider: None,
+                    model: None,
+                    binding_revision: None,
+                    projected_request_tokens: 0,
+                    context_window_limit_tokens: None,
+                    preserved_tail_message_count: 2,
+                    file_fact_versions: vec![],
+                },
+                UtcMillis(2_500),
+            )
+            .unwrap();
 
         let request = DispatchSubmissionRequest {
             project_directories: None,
@@ -2715,12 +2589,39 @@ mod tests {
             .expect("resume dispatch should build graph");
         let destination_thread_id = graph
             .active_execution_chain
-            .as_ref()
-            .and_then(|chain| chain.branches.first())
+            .branches
+            .first()
             .map(|branch| branch.thread_id.clone())
             .expect("resume task should own a thread");
         assert_ne!(destination_thread_id, source_thread_id);
-        let destination_history = session_store.thread_message_history(&destination_thread_id);
+        let resumed_task_id = graph.action_task_id.clone();
+        accept_dispatch_submission(
+            &session_store,
+            &task_store,
+            &execution_registry,
+            request,
+            graph,
+        )
+        .unwrap();
+        restore_interrupted_turn_context(
+            &session_store,
+            &source_thread_id,
+            &destination_thread_id,
+            UtcMillis(3_000),
+        )
+        .unwrap();
+        let destination_history = session_store
+            .thread_context_snapshot(&destination_thread_id)
+            .unwrap()
+            .messages()
+            .to_vec();
+        assert_eq!(
+            session_store
+                .thread_context_checkpoint(&destination_thread_id)
+                .unwrap()
+                .checkpoint_id,
+            "source-summary"
+        );
         assert_eq!(destination_history.len(), source_history.len());
         assert_eq!(
             destination_history[0].content.as_deref(),
@@ -2734,8 +2635,21 @@ mod tests {
             destination_history[2].tool_call_id.as_deref(),
             Some("call-resume-file-read")
         );
+        let persisted = serde_json::to_vec(&session_store.durable_state()).unwrap();
+        let restored = SessionStore::from_persisted_parts(
+            serde_json::from_slice(&persisted).unwrap(),
+            session_store.execution_sidecar_store_state(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored
+                .thread_context_snapshot(&destination_thread_id)
+                .unwrap()
+                .messages(),
+            destination_history
+        );
         let resumed_task = task_store
-            .get_task(&graph.action_task_id)
+            .get_task(&resumed_task_id)
             .expect("resume action task should persist");
         assert_eq!(
             resumed_task
@@ -2809,6 +2723,38 @@ mod tests {
             browser_annotation_refs: &[],
             browser_node_selections: &[],
         });
+        let admitted_turn = ActiveExecutionTurn {
+            turn_id: "turn-invalid-resume-source".to_string(),
+            turn_seq: now.0,
+            accepted_at: now,
+            completed_at: None,
+            status: "accepted".to_string(),
+            user_message: Some("继续验证".to_string()),
+            items: vec![ActiveExecutionTurnItem {
+                item_id: "user-invalid-resume-source".to_string(),
+                item_seq: 1,
+                kind: "user_message".to_string(),
+                status: "completed".to_string(),
+                source: "user".to_string(),
+                title: None,
+                content: Some("继续验证".to_string()),
+                task_id: Some(source_task_id.clone()),
+                worker_id: None,
+                role_id: None,
+                tool_call_id: None,
+                tool_name: None,
+                tool_status: None,
+                tool_arguments: None,
+                tool_result: None,
+                tool_error: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+                metadata: Default::default(),
+                timeline_entry_id: None,
+                source_thread_id: orchestrator_thread_id.clone(),
+            }],
+        };
         CanonicalTurnEventSink::for_store(&session_store, None)
             .accept_active_execution_chain_with_timeline_entry_and_task(
                 session_id.clone(),
@@ -2824,65 +2770,23 @@ mod tests {
                     root_task_id: source_task_id.clone(),
                     execution_chain_ref: "chain-invalid-resume-source".to_string(),
                     workspace_id: None,
-                    active_branch_task_ids: vec![source_task_id.clone()],
-                    active_worker_bindings: vec![source_worker_id.clone()],
                     branches: vec![ActiveExecutionBranch {
                         task_id: source_task_id.clone(),
                         worker_id: source_worker_id,
-                        stage: "execute".to_string(),
-                        lease_id: None,
-                        execution_intent_ref: None,
-                        binding_lifecycle: None,
-                        checkpoint_stage: Some("execute".to_string()),
-                        next_step_index: Some(0),
-                        checkpoint_at: Some(now),
-                        resume_mode: Some("stage-restart".to_string()),
-                        resume_token: None,
                         use_tools: true,
                         skill_name: None,
                         is_primary: true,
                         thread_id: orchestrator_thread_id.clone(),
                     }],
-                    recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
                         accepted_at: now,
                         entry_id: "timeline-invalid-resume-source".to_string(),
                         trimmed_text: Some("继续验证".to_string()),
                         skill_name: None,
                     },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: "turn-invalid-resume-source".to_string(),
-                        turn_seq: now.0,
-                        accepted_at: now,
-                        completed_at: None,
-                        status: "accepted".to_string(),
-                        user_message: Some("继续验证".to_string()),
-                        items: vec![ActiveExecutionTurnItem {
-                            item_id: "user-invalid-resume-source".to_string(),
-                            item_seq: 1,
-                            kind: "user_message".to_string(),
-                            status: "completed".to_string(),
-                            source: "user".to_string(),
-                            title: None,
-                            content: Some("继续验证".to_string()),
-                            task_id: Some(source_task_id.clone()),
-                            worker_id: None,
-                            role_id: None,
-                            tool_call_id: None,
-                            tool_name: None,
-                            tool_status: None,
-                            tool_arguments: None,
-                            tool_result: None,
-                            tool_error: None,
-                            request_id: None,
-                            user_message_id: None,
-                            placeholder_message_id: None,
-                            metadata: Default::default(),
-                            timeline_entry_id: None,
-                            source_thread_id: orchestrator_thread_id.clone(),
-                        }],
-                    }),
+                    current_turn_id: Some(admitted_turn.turn_id.clone()),
                 },
+                admitted_turn,
                 &source_task,
             )
             .expect("invalid source Turn should persist");
@@ -3080,13 +2984,10 @@ mod tests {
             "用户选择的访问模式必须写入 action task policy_snapshot",
         );
 
-        let chain = graph
-            .active_execution_chain
-            .as_ref()
-            .expect("ExecutionChain 路径必须同步产出 ActiveExecutionChain");
+        let chain = &graph.active_execution_chain;
         assert!(
-            chain.current_turn.is_some(),
-            "ActiveExecutionChain 必须带 current_turn，作为运行期 lane 调度入口",
+            chain.current_turn_id.is_some(),
+            "ActiveExecutionChain 必须指向当前 Turn",
         );
     }
 
@@ -3427,10 +3328,9 @@ mod tests {
                 .any(|value| value.contains("/tmp/external/reference.md"))
         );
         let user_item = graph
-            .active_execution_chain
-            .as_ref()
-            .and_then(|chain| chain.current_turn.as_ref())
-            .and_then(|turn| turn.items.first())
+            .turn
+            .items
+            .first()
             .expect("canonical user item should exist");
         assert!(user_item.metadata.contains_key("contextReferences"));
     }
@@ -3507,14 +3407,7 @@ mod tests {
 
         let graph =
             run_dispatch_submission_for_test(&runtime, &request).expect("dispatch should build");
-        let chain = graph
-            .active_execution_chain
-            .as_ref()
-            .expect("execution chain should exist");
-        let turn = chain
-            .current_turn
-            .as_ref()
-            .expect("continuation turn should exist");
+        let turn = &graph.turn;
         assert!(turn.user_message.is_none());
         assert_eq!(turn.items.len(), 1);
         assert_eq!(turn.items[0].kind, "assistant_phase");
@@ -3741,7 +3634,6 @@ mod tests {
                 last_used_at: UtcMillis(7_000),
                 observed_context_window_tokens: None,
                 handled_task_ids: vec![TaskId::new("task-existing-conflict")],
-                message_history: Vec::new(),
             })
             .expect("conflicting thread should register");
 
@@ -3801,52 +3693,42 @@ mod tests {
             last_used_at: UtcMillis(8_100),
             observed_context_window_tokens: None,
             handled_task_ids: vec![task_id.clone()],
-            message_history: vec![ThreadChatMessage {
-                input_request_id: None,
-                role: "user".to_string(),
-                content: Some("恢复上下文".to_string()),
-                images: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                provider_context: Vec::new(),
-            }],
         };
         session_store
             .register_thread(worker_thread.clone())
             .expect("worker thread should register");
-        session_store
-            .install_thread_context_checkpoint_checked(
-                &worker_thread_id,
-                ThreadContextCheckpoint {
-                    thread_id: worker_thread_id.clone(),
-                    checkpoint_id: "checkpoint-materialize-rollback".to_string(),
-                    source_message_count: 1,
-                    summary_message: ThreadChatMessage {
-                        input_request_id: None,
-                        role: "system".to_string(),
-                        content: Some("恢复摘要".to_string()),
-                        images: Vec::new(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                        provider_context: Vec::new(),
-                    },
-                    reason: "test".to_string(),
-                    original_token_estimate: 100,
-                    checkpoint_token_estimate: 20,
-                    created_at: UtcMillis(8_100),
-                    generation: 1,
-                    source_fingerprint: "fingerprint-materialize-rollback".to_string(),
-                    model_provider: None,
-                    model: None,
-                    binding_revision: None,
-                    projected_request_tokens: 20,
-                    context_window_limit_tokens: None,
-                    preserved_tail_message_count: 0,
-                    file_fact_versions: Vec::new(),
+        let mut persisted = session_store.export_state();
+        persisted
+            .thread_context_checkpoints
+            .push(ThreadContextCheckpoint {
+                thread_id: worker_thread_id.clone(),
+                checkpoint_id: "checkpoint-materialize-rollback".to_string(),
+                source_message_count: 1,
+                summary_message: ThreadChatMessage {
+                    input_request_id: None,
+                    role: "system".to_string(),
+                    content: Some("恢复摘要".to_string()),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
                 },
-                UtcMillis(8_100),
-            )
-            .expect("worker checkpoint should install");
+                reason: "test".to_string(),
+                original_token_estimate: 100,
+                checkpoint_token_estimate: 20,
+                created_at: UtcMillis(8_100),
+                generation: 1,
+                tool_result_projection_fingerprint: None,
+                source_fingerprint: "fingerprint-materialize-rollback".to_string(),
+                model_provider: None,
+                model: None,
+                binding_revision: None,
+                projected_request_tokens: 20,
+                context_window_limit_tokens: None,
+                preserved_tail_message_count: 0,
+                file_fact_versions: Vec::new(),
+            });
+        let session_store = SessionStore::from_state_for_test(persisted);
 
         let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
         let original_plan = plan_store
@@ -3972,7 +3854,8 @@ mod tests {
         let graph = DispatchSubmissionGraph::new(
             pending.task.task_id.clone(),
             pending.task.task_id,
-            Some(pending.active_execution_chain),
+            pending.active_execution_chain,
+            pending.turn,
         );
         let accepted = accept_dispatch_submission(
             &session_store,
@@ -3982,6 +3865,23 @@ mod tests {
             graph,
         )
         .expect("dispatch should be accepted");
+        session_store
+            .update_current_turn_status_for_turn_with_change(
+                &session_id,
+                Some(&accepted.turn_id),
+                "preparing",
+            )
+            .expect("preparation status should commit");
+        assert_eq!(
+            session_store
+                .runtime_sidecar(&session_id)
+                .unwrap()
+                .current_turn
+                .unwrap()
+                .status,
+            "running",
+            "preparing follows the canonical Running projection"
+        );
         materialize_dispatch_submission(&runtime, &request, &accepted.turn_id)
             .expect("accepted dispatch should materialize");
         let worker_thread_id = session_store
@@ -4073,7 +3973,8 @@ mod tests {
         let graph = DispatchSubmissionGraph::new(
             pending.task.task_id.clone(),
             pending.task.task_id,
-            Some(pending.active_execution_chain),
+            pending.active_execution_chain,
+            pending.turn,
         );
         let accepted = accept_dispatch_submission(
             &session_store,
@@ -4158,7 +4059,8 @@ mod tests {
         let graph = DispatchSubmissionGraph::new(
             pending.task.task_id.clone(),
             pending.task.task_id,
-            Some(pending.active_execution_chain),
+            pending.active_execution_chain,
+            pending.turn,
         );
         let accepted = accept_dispatch_submission(
             &session_store,
@@ -4173,25 +4075,18 @@ mod tests {
         let mut changed_chain = session_store
             .active_execution_chain(&session_id)
             .expect("accepted chain should exist");
-        changed_chain
-            .current_turn
-            .as_mut()
-            .and_then(|turn| turn.items.first_mut())
-            .expect("accepted user item should exist")
-            .metadata
-            .insert("forceWriteback".to_string(), serde_json::json!(true));
-        session_store.install_session_event_writer(Arc::new(RejectingCanonicalWriter));
+        changed_chain.current_turn_id = Some("stale-materialization-turn".into());
 
         let error = match materialize_execution(&runtime, &request, &prepared, Some(changed_chain))
         {
-            Ok(_) => panic!("canonical write rejection must fail materialization"),
+            Ok(_) => panic!("stale Turn binding must fail materialization"),
             Err(error) => error,
         };
 
         assert!(
             error
                 .into_message()
-                .contains("写回 materialize execution chain 失败")
+                .contains("校验 materialize execution chain 失败")
         );
         assert!(execution_registry.get(&accepted.root_task_id).is_none());
         assert!(
@@ -4261,7 +4156,8 @@ mod tests {
         let graph = DispatchSubmissionGraph::new(
             task_id.clone(),
             task_id.clone(),
-            Some(pending.active_execution_chain),
+            pending.active_execution_chain,
+            pending.turn,
         );
 
         cleanup_rejected_dispatch(Some(&task_store), &execution_registry, graph)

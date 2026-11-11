@@ -28,6 +28,17 @@ use magi_core::{
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
+/// 在 Session 提交边界内只读查询 TaskStore；不得回调 SessionStore 或执行写入。
+/// 参数依次为当前主线根 Task、Session、Goal 和计划绑定 Task。缺失事实须返回错误。
+pub type GoalTaskActivityResolver = dyn Fn(
+        &magi_core::TaskId,
+        &SessionId,
+        &magi_core::GoalId,
+        &[magi_core::TaskId],
+    ) -> DomainResult<bool>
+    + Send
+    + Sync;
+
 /// canonical 写模型在一次 SessionStore mutation 中准备的原子变更。
 ///
 /// `previous` 必须与事件日志当前重放结果一致；持久化实现据此生成逐 item 事件，
@@ -161,6 +172,7 @@ pub struct SessionStore {
     model_step_commit_observer: Arc<RwLock<Option<ModelStepCommitObserver>>>,
     canonical_item_commit_observer: Arc<RwLock<Option<CanonicalItemCommitObserver>>>,
     agent_run_transfer_resolver: Arc<RwLock<Option<Arc<crate::AgentRunTransferResolver>>>>,
+    goal_task_activity_resolver: Arc<RwLock<Option<Arc<GoalTaskActivityResolver>>>>,
     /// 仅唤醒进程内 Job 等待者；Job 状态仍只从 canonical item 读取。
     background_job_signal: Arc<(Mutex<u64>, std::sync::Condvar)>,
     /// 每个 thread 连续主动压缩失败次数，仅作进程内熔断状态，不持久化。
@@ -459,6 +471,7 @@ impl Default for SessionStore {
             model_step_commit_observer: Arc::new(RwLock::new(None)),
             canonical_item_commit_observer: Arc::new(RwLock::new(None)),
             agent_run_transfer_resolver: Arc::new(RwLock::new(None)),
+            goal_task_activity_resolver: Arc::new(RwLock::new(None)),
             background_job_signal: Arc::new((Mutex::new(0), std::sync::Condvar::new())),
             context_compaction_failures: Arc::new(Mutex::new(HashMap::new())),
             unavailable_sessions: Arc::new(RwLock::new(Vec::new())),
@@ -500,25 +513,17 @@ impl SessionStore {
             .remove(thread_id);
     }
 
-    pub fn from_state(mut state: SessionStoreState) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_state_for_test(state: SessionStoreState) -> Self {
+        Self::from_validated_state(state)
+    }
+
+    fn from_validated_state(mut state: SessionStoreState) -> Self {
         goals::reconcile_goal_token_usage(&mut state);
         sidecar::reconcile_goal_time_used(&mut state);
         Self {
             state: Arc::new(RwLock::new(state)),
-            durable_persistence_lock: Arc::new(Mutex::new(())),
-            canonical_commit_barrier: Arc::new(RwLock::new(())),
-            canonical_session_locks: Arc::new(Mutex::new(HashMap::new())),
-            sidecar_flush_state: Arc::new(RwLock::new(SidecarFlushState::default())),
-            sidecar_flush_lock: Arc::new(Mutex::new(())),
-            lifecycle_observer: Arc::new(RwLock::new(None)),
-            session_event_writer: Arc::new(RwLock::new(None)),
-            input_commit_observer: Arc::new(RwLock::new(None)),
-            model_step_commit_observer: Arc::new(RwLock::new(None)),
-            canonical_item_commit_observer: Arc::new(RwLock::new(None)),
-            agent_run_transfer_resolver: Arc::new(RwLock::new(None)),
-            background_job_signal: Arc::new((Mutex::new(0), std::sync::Condvar::new())),
-            context_compaction_failures: Arc::new(Mutex::new(HashMap::new())),
-            unavailable_sessions: Arc::new(RwLock::new(Vec::new())),
+            ..Self::default()
         }
     }
 
@@ -602,17 +607,26 @@ impl SessionStore {
             tool_approvals::validate_execution_links(&state, &session.session_id)?;
         }
         prune_incident_notifications(&mut state.notifications);
-        sidecar::reconcile_sidecars_from_canonical(&mut state)?;
+        sidecar::validate_sidecars_from_canonical(&state)?;
         sidecar::reconcile_terminal_goal_continuations(&mut state);
         sidecar::reconcile_goal_response_duration_scopes(&mut state);
-        Ok(Self::from_state(state))
-    }
-
-    pub fn rebuild_sidecar_projection_from_canonical(
-        sidecar: &mut crate::models::SessionRuntimeSidecar,
-        canonical_turns: &[CanonicalTurn],
-    ) -> DomainResult<()> {
-        sidecar::rebuild_sidecar_projection_from_canonical(sidecar, canonical_turns)
+        let threads = state
+            .thread_registry
+            .iter()
+            .map(|thread| thread.thread_id.clone())
+            .collect::<Vec<_>>();
+        let store = Self::from_validated_state(state);
+        // 恢复时核验 canonical 来源并清退失效摘要，不保存第二份线程历史。
+        for thread_id in threads {
+            let mut snapshot = store.thread_context_snapshot(&thread_id)?;
+            if snapshot
+                .checkpoint()
+                .is_some_and(|checkpoint| !checkpoint.matches_history(snapshot.messages()))
+            {
+                store.clear_thread_context_checkpoint_if_current(&mut snapshot);
+            }
+        }
+        Ok(store)
     }
 
     /// 安装 canonical 权威事件 writer。daemon 恢复完成后、接受任何新 mutation 前安装。
@@ -1477,48 +1491,6 @@ impl SessionStore {
             .find(|session| session.session_id == session_id)
         {
             session.updated_at = occurred_at;
-        }
-    }
-
-    /// 按 entry_id 更新已有 timeline 条目的内容，不存在则插入新条目。
-    /// 用于流式 LLM 输出时增量更新 timeline 中的 AssistantMessage。
-    pub fn upsert_timeline_entry(
-        &self,
-        session_id: SessionId,
-        entry_id: &str,
-        kind: TimelineEntryKind,
-        message: impl Into<String>,
-    ) {
-        let mut state = self
-            .state
-            .write()
-            .expect("session state write lock poisoned");
-        let now = UtcMillis::now();
-        let message_str = message.into();
-
-        if let Some(entry) = state
-            .timeline
-            .iter_mut()
-            .find(|entry| entry.entry_id == entry_id)
-        {
-            entry.message = message_str;
-            entry.kind = kind;
-        } else {
-            state.timeline.push(TimelineEntry {
-                entry_id: entry_id.to_string(),
-                session_id: session_id.clone(),
-                kind,
-                message: message_str,
-                occurred_at: now,
-            });
-        }
-
-        if let Some(session) = state
-            .sessions
-            .iter_mut()
-            .find(|session| session.session_id == session_id)
-        {
-            session.updated_at = now;
         }
     }
 

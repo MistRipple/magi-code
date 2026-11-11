@@ -12,7 +12,7 @@ export const STATUSES = ['mapped', 'shim', 'bundled', 'planned', 'partial', 'dro
 
 /**
  * @typedef {object} ReportEntry
- * @property {string} kind imports | calls | injects | events | native
+ * @property {string} kind imports | calls | injects | events | native | modules
  * @property {string} name
  * @property {string} status
  * @property {string} target 对应的 Magi 能力或处理方式

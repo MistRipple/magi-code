@@ -3,13 +3,11 @@ use magi_core::UtcMillis;
 use crate::costing::provider_context_tokens_from_usage;
 use crate::ledger_store::InMemoryLedgerStore;
 use crate::model_identity::build_model_resolution_identity;
-use crate::reducer::{
-    rebuild_session_snapshot_from_events, rebuild_workspace_snapshot_from_sessions,
-};
+use crate::reducer::{rebuild_usage_snapshot_from_events, rebuild_workspace_snapshot};
 use crate::types::{
     ExecutionBindingIdentity, SessionUsageSnapshot, UsageCallIdentity, UsageCallRecordInput,
-    UsageCallStatus, UsageEvent, UsageEventType, UsageEventUsageDelta, UsagePhase, UsageSourceRole,
-    WorkspaceUsageSnapshot,
+    UsageCallStatus, UsageEvent, UsageEventType, UsageEventUsageDelta, UsagePhase,
+    UsageSourceRole, UsageSubject, WorkspaceUsageSnapshot,
 };
 
 fn build_event_id(
@@ -42,7 +40,8 @@ impl UsageAuthority {
     }
 
     pub fn append_call_record(&mut self, input: UsageCallRecordInput) -> u64 {
-        let mut index = self.store.read_session_index(&input.session_id);
+        let subject = input.owner.subject();
+        let mut index = self.store.read_index(&subject);
         let ledger_seq = index.last_committed_ledger_seq + 1;
         let event_timestamp = input.timestamp.unwrap_or_else(|| UtcMillis::now().0);
         let event_id = input
@@ -53,7 +52,7 @@ impl UsageAuthority {
             .unwrap_or_else(|| {
                 build_event_id(
                     input.workspace_id.as_deref(),
-                    &input.session_id,
+                    &input.owner.ledger_key(),
                     &input.call_identity.call_id,
                     &input.execution_binding.template_id,
                     input.execution_binding.binding_revision,
@@ -76,7 +75,7 @@ impl UsageAuthority {
             event_id: event_id.clone(),
             ledger_seq,
             workspace_id: input.workspace_id.clone(),
-            session_id: input.session_id.clone(),
+            owner: input.owner.clone(),
             turn_id: input.turn_id.clone(),
             dispatch_wave_id: input.dispatch_wave_id.clone(),
             assignment_id: input.assignment_id.clone(),
@@ -101,7 +100,7 @@ impl UsageAuthority {
             error_code: input.error_code,
         };
 
-        self.store.append_session_event(event);
+        self.store.append_event(event);
         index.last_committed_ledger_seq = ledger_seq;
         let max_ids = 5000;
         if index.processed_event_ids.len() >= max_ids {
@@ -109,15 +108,16 @@ impl UsageAuthority {
             index.processed_event_ids.drain(..drain_count);
         }
         index.processed_event_ids.push(event_id);
-        self.store.write_session_index(&input.session_id, index);
+        self.store.write_index(subject.clone(), index);
 
-        let session_snapshot = self
-            .rebuild_session_snapshot_internal(input.workspace_id.as_deref(), &input.session_id);
+        let events = self.store.read_events(&subject);
+        let snapshot = rebuild_usage_snapshot_from_events(&events);
+        self.store.write_snapshot(subject, snapshot.clone());
         if let Some(workspace_id) = input.workspace_id.as_deref() {
             self.rebuild_workspace_snapshot(workspace_id);
         }
 
-        session_snapshot.last_applied_ledger_seq
+        snapshot.last_applied_ledger_seq
     }
 
     pub fn rebuild_session_snapshot(
@@ -129,12 +129,16 @@ impl UsageAuthority {
     }
 
     pub fn rebuild_workspace_snapshot(&mut self, workspace_id: &str) -> WorkspaceUsageSnapshot {
-        let session_ids = self.store.list_session_ids();
-        let session_snapshots: Vec<SessionUsageSnapshot> = session_ids
-            .iter()
-            .map(|sid| self.store.read_session_snapshot(Some(workspace_id), sid))
+        let snapshots: Vec<_> = self
+            .store
+            .subjects()
+            .into_iter()
+            .map(|subject| {
+                let snapshot = self.store.read_snapshot(&subject);
+                (subject, snapshot)
+            })
             .collect();
-        let snapshot = rebuild_workspace_snapshot_from_sessions(workspace_id, &session_snapshots);
+        let snapshot = rebuild_workspace_snapshot(workspace_id, &snapshots);
         self.store.write_workspace_snapshot(snapshot.clone());
         snapshot
     }
@@ -146,9 +150,9 @@ impl UsageAuthority {
     ) -> SessionUsageSnapshot {
         let snapshot = self
             .store
-            .read_session_snapshot(Some(workspace_id), session_id);
+            .read_snapshot(&UsageSubject::Session(session_id.into()));
         if snapshot.version > 0 || snapshot.last_applied_ledger_seq > 0 {
-            return snapshot;
+            return snapshot.into_session(Some(workspace_id), session_id);
         }
         self.rebuild_session_snapshot(workspace_id, session_id)
     }
@@ -161,51 +165,16 @@ impl UsageAuthority {
         self.rebuild_workspace_snapshot(workspace_id)
     }
 
-    pub fn reset_session(&mut self, workspace_id: &str, session_id: &str) {
-        let mut index = self.store.read_session_index(session_id);
-        let ledger_seq = index.last_committed_ledger_seq + 1;
-        let event_id = format!("reset:{workspace_id}:{session_id}:{ledger_seq}");
-        let event = UsageEvent {
-            event_id: event_id.clone(),
-            ledger_seq,
-            workspace_id: Some(workspace_id.to_string()),
-            session_id: session_id.to_string(),
-            turn_id: None,
-            dispatch_wave_id: None,
-            assignment_id: None,
-            timestamp: UtcMillis::now().0,
-            event_type: UsageEventType::SessionReset,
-            execution_binding: None,
-            model_identity: None,
-            call_identity: None,
-            usage_delta: None,
-            status: None,
-            error_code: None,
-        };
-        self.store.append_session_event(event);
-        index.last_committed_ledger_seq = ledger_seq;
-        index.processed_event_ids.push(event_id);
-        self.store.write_session_index(session_id, index);
-        self.rebuild_session_snapshot_internal(Some(workspace_id), session_id);
-        self.rebuild_workspace_snapshot(workspace_id);
-    }
-
-    pub fn reset_workspace(&mut self, workspace_id: &str) {
-        let session_ids = self.store.list_session_ids();
-        for sid in session_ids {
-            self.reset_session(workspace_id, &sid);
-        }
-    }
-
     fn rebuild_session_snapshot_internal(
         &mut self,
         workspace_id: Option<&str>,
         session_id: &str,
     ) -> SessionUsageSnapshot {
-        let events = self.store.read_session_events(session_id);
-        let snapshot = rebuild_session_snapshot_from_events(workspace_id, session_id, &events);
-        self.store.write_session_snapshot(snapshot.clone());
-        snapshot
+        let subject = UsageSubject::Session(session_id.into());
+        let events = self.store.read_events(&subject);
+        let snapshot = rebuild_usage_snapshot_from_events(&events);
+        self.store.write_snapshot(subject, snapshot.clone());
+        snapshot.into_session(workspace_id, session_id)
     }
 }
 

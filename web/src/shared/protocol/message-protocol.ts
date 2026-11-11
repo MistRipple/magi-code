@@ -89,8 +89,6 @@ export type DataMessageType =
   | 'mcpToolsRefreshed'
   | 'modelListFetched'
   | 'orchestratorConnectionTestResult'
-  | 'orchestratorRuntimeState'
-  | 'projectKnowledgeLoaded'
   | 'processingStateChanged'
   | 'registryAgentsLoaded'
   | 'recoveryRequest'
@@ -443,143 +441,6 @@ export function createStandardMessage(
   };
 }
 
-export function createTextMessage(
-  text: string,
-  source: MessageSource,
-  agent: AnyAgentId,
-  traceId: string,
-  options?: Partial<StandardMessage>
-): StandardMessage {
-  return createStandardMessage({
-    category: MessageCategory.CONTENT,
-    type: MessageType.TEXT,
-    source,
-    agent,
-    traceId,
-    lifecycle: MessageLifecycle.COMPLETED,
-    blocks: [{ type: 'text', blockId: `${traceId}:text`, content: text, isMarkdown: true }],
-    metadata: {},
-    ...options,
-  });
-}
-
-export function createUserInputMessage(
-  text: string,
-  traceId: string,
-  options?: Partial<StandardMessage>
-): StandardMessage {
-  const message = createStandardMessage({
-    category: MessageCategory.CONTENT,
-    type: MessageType.USER_INPUT,
-    source: 'orchestrator',
-    agent: 'orchestrator',
-    traceId,
-    lifecycle: MessageLifecycle.COMPLETED,
-    blocks: [{ type: 'text', blockId: `${traceId}:text`, content: text, isMarkdown: true }],
-    metadata: {},
-    ...options,
-  });
-  const metadata = message.metadata && typeof message.metadata === 'object'
-    ? message.metadata as Record<string, unknown>
-    : {};
-  const existingAnchorTimestamp = typeof metadata.timelineAnchorTimestamp === 'number'
-    && Number.isFinite(metadata.timelineAnchorTimestamp)
-    && metadata.timelineAnchorTimestamp > 0
-    ? Math.floor(metadata.timelineAnchorTimestamp)
-    : 0;
-  if (existingAnchorTimestamp > 0) {
-    return message;
-  }
-  return {
-    ...message,
-    metadata: {
-      ...metadata,
-      timelineAnchorTimestamp: message.timestamp,
-    },
-  };
-}
-
-export function createStreamingMessage(
-  source: MessageSource,
-  agent: AnyAgentId,
-  traceId: string,
-  options?: Partial<StandardMessage>
-): StandardMessage {
-  return createStandardMessage({
-    category: MessageCategory.CONTENT,
-    type: MessageType.TEXT,
-    source,
-    agent,
-    traceId,
-    lifecycle: MessageLifecycle.STARTED,
-    blocks: [],
-    metadata: {},
-    visibility: 'user',
-    ...options,
-  });
-}
-
-export function createErrorMessage(
-  error: string,
-  source: MessageSource,
-  agent: AnyAgentId,
-  traceId: string,
-  options?: Partial<StandardMessage>
-): StandardMessage {
-  return createStandardMessage({
-    category: MessageCategory.CONTENT,
-    type: MessageType.ERROR,
-    source,
-    agent,
-    traceId,
-    lifecycle: MessageLifecycle.FAILED,
-    blocks: [{ type: 'text', blockId: `${traceId}:error`, content: error }],
-    metadata: { error },
-    ...options,
-  });
-}
-
-export function createInteractionMessage(
-  interaction: InteractionRequest,
-  source: MessageSource,
-  agent: AnyAgentId,
-  traceId: string,
-  options?: Partial<StandardMessage>
-): StandardMessage {
-  return createStandardMessage({
-    category: MessageCategory.CONTENT,
-    type: MessageType.INTERACTION,
-    source,
-    agent,
-    traceId,
-    lifecycle: MessageLifecycle.STREAMING,
-    blocks: [{ type: 'text', blockId: `${traceId}:interaction`, content: interaction.prompt }],
-    interaction,
-    metadata: {},
-    ...options,
-  });
-}
-
-export function createControlMessage(
-  controlType: ControlMessageType,
-  payload: Record<string, unknown>,
-  traceId: string,
-  options?: Partial<StandardMessage>
-): StandardMessage {
-  return createStandardMessage({
-    category: MessageCategory.CONTROL,
-    type: MessageType.SYSTEM,
-    source: 'orchestrator',
-    agent: 'orchestrator',
-    traceId,
-    lifecycle: MessageLifecycle.COMPLETED,
-    blocks: [],
-    metadata: {},
-    control: { controlType, payload },
-    ...options,
-  });
-}
-
 export function createNotifyMessage(
   content: string,
   level: NotifyLevel,
@@ -598,26 +459,6 @@ export function createNotifyMessage(
     blocks: [{ type: 'text', blockId: `${traceId}:notify`, content }],
     metadata: {},
     notify: { level, duration, ...(presentation || {}) },
-    ...options,
-  });
-}
-
-export function createDataMessage(
-  dataType: DataMessageType,
-  payload: Record<string, unknown>,
-  traceId: string,
-  options?: Partial<StandardMessage>
-): StandardMessage {
-  return createStandardMessage({
-    category: MessageCategory.DATA,
-    type: MessageType.SYSTEM,
-    source: 'orchestrator',
-    agent: 'orchestrator',
-    traceId,
-    lifecycle: MessageLifecycle.COMPLETED,
-    blocks: [],
-    metadata: {},
-    data: { dataType, payload },
     ...options,
   });
 }

@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn fork_freezes_the_current_legal_boundary_without_private_or_unconsumed_history() {
         let (parent, state) = fixture();
-        let store = SessionStore::from_state(state.clone());
+        let store = SessionStore::from_state_for_test(state.clone());
         let snapshot = freeze_parent_history(
             &store,
             &parent,
@@ -274,7 +274,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .result = Some(json!("CHANGED_RESULT"));
-        let later = SessionStore::from_state(later);
+        let later = SessionStore::from_state_for_test(later);
         assert!(
             serde_json::to_string(
                 &freeze_parent_history(
@@ -322,7 +322,7 @@ mod tests {
             };
             assert!(
                 freeze_parent_history(
-                    &SessionStore::from_state(state),
+                    &SessionStore::from_state_for_test(state),
                     &parent,
                     &SessionId::new("session"),
                     &ThreadId::new("thread"),

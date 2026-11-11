@@ -43,6 +43,10 @@ export function analyzeNativeClient({ upstreamDir, pkg, sharedRoot }) {
   });
   const mounted = slots.filter((slot) => slot.disposition === 'mounted');
   const unmounted = slots.filter((slot) => slot.disposition !== 'mounted');
+  const missing = unmounted.filter(slot => slot.disposition !== 'alternate');
+  if (missing.length) {
+    throw new Error(`该插件需要尚未接入的界面位置：${missing.map(slot => slot.name).join('、')}。本次安装已停止，不会忽略这些界面功能后声称插件完整可用。`);
+  }
   if (mounted.length === 0) {
     throw new Error(`上游界面注册了 ${slots.map((slot) => slot.name).join('、') || '（无）'}，没有任何一个是 Magi 会渲染的槽位；不交付空白设置页`);
   }

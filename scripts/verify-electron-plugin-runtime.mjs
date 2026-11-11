@@ -13,6 +13,7 @@ import { createHash } from 'node:crypto';
 import { browserImageFixtures } from './lib/plugin-image-fixtures.mjs';
 import { packPlugin } from './compat/core/pack.mjs';
 import { connectAppPage, connectTarget, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
+import { authorizePluginFromNative } from './lib/plugin-native-acceptance.mjs';
 import { createPluginThemeCases, activatePluginTheme, measurePluginContrast } from './lib/plugin-theme-acceptance.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -226,7 +227,13 @@ export function apply(ctx, config) {
         // 状态当作未来动态贡献已经就绪，也不在同一固定请求内盲目重试。
         const selected=tool??request.tools.find(tool=>tool.name.endsWith('tool_catalog'));
         if(!selected)throw new Error('Requested acceptance tool and discovery entry are missing from the real model catalog');
-        const block = {type:'tool-call',id:tool?'acceptance-tool-call':'catalog-discovery',name:selected.name,arguments:JSON.stringify(tool?(originalCall?originalCall.args:outcomeCall?{outcome:outcomeCall.kind,id:outcomeCall.id}:messageCheck?{message:true}:{directory:true}):{include_external:true,include_schema:true})};
+        const discoveryMessages=request.messages.slice(request.messages.indexOf(lastUser)+1).filter(message=>message.role==='tool');
+        const discovered=discoveryMessages.flatMap(message=>message.content.flatMap(part=>{
+          if(part.type!=='text')return [];
+          try {const payload=JSON.parse(part.text),catalog=payload.result??payload;return [...(catalog.plugin_tools??[]),...(catalog.mcp_tools??[])];} catch {return [];}
+        })).find(entry=>originalCall?entry.description.startsWith(originalCall.description):entry.description==='读取验收配置');
+        const discovery={include_external:true,...(discovered?{include_schema:true,tool_names:[discovered.model_tool_name]}:{query:originalCall?.description??'读取验收配置'})};
+        const block = {type:'tool-call',id:tool?'acceptance-tool-call':'catalog-discovery-'+discoveryMessages.length,name:selected.name,arguments:JSON.stringify(tool?(originalCall?originalCall.args:outcomeCall?{outcome:outcomeCall.kind,id:outcomeCall.id}:messageCheck?{message:true}:{directory:true}):discovery)};
         yield {type:'block-start',index:0,blockType:'tool-call'};
         yield {type:'tool-call-delta',index:0,id:block.id,name:block.name,argumentsDelta:block.arguments};
         yield {type:'block-end',index:0,block};
@@ -376,7 +383,7 @@ async function verifyOriginalSkill(session, waitTurn) {
     const result=await waitTurn(diagnosis.turnId);
     await writeFile(join(output,`${name}.json`),JSON.stringify(result,null,2));
     assert.equal(result.status,'completed',JSON.stringify(result));
-    assert.ok(result.items.some(item=>item.kind==='tool_call'&&item.status==='completed')&&result.modelSteps.length>=2,JSON.stringify(result));
+    assert.ok(result.items.some(item=>item.tool?.name===pending.toolName&&item.status==='completed')&&result.modelSteps.length>=2,JSON.stringify(result));
     if(args.dshHome) {
       const observed=JSON.parse((await post(`/api/plugins/${pluginId}/routes`,{method:'GET',path:'/skill-request'})).body.request);
       const user=observed.messages.findLast(message=>message.role==='user'&&message.content.some(part=>part.type==='text'&&part.text.startsWith('ORIGINAL_TOOL_CHECK:')));
@@ -386,7 +393,7 @@ async function verifyOriginalSkill(session, waitTurn) {
       assert.ok(JSON.stringify(tool?.content).includes(args.dshHome),'真实原包结果必须保留本次指定的外部目录');
       await writeFile(join(output,`${name}-model-request.json`),JSON.stringify(observed,null,2));
     }
-    const receipt=result.items.find(item=>item.kind==='tool_call').tool.result.output;
+    const receipt=result.items.find(item=>item.tool?.name===pending.toolName).tool.result.output;
     return {value:receipt.value,text:receipt.content.filter(part=>part.type==='text').map(part=>part.text).join('\n')};
   };
   const diagnose=(name,packageName)=>originalTool(name,'Checks whether a plugin loaded.',{package:packageName});
@@ -710,18 +717,31 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
     && browserAssetBytes.toString('utf8').endsWith(bundledScriptPadding)
     && ['addAttachments','removeAttachment'].every(operation=>prepared.report.ui.business.operations.includes(operation)), JSON.stringify({status:browserAsset.status,bytes:browserAssetBytes.length,operations:prepared.report.ui.business.operations}));
   await waitFor(async () => (await api('/api/plugins')).value.plugins.find((item) => item.manifest.id === id)?.runtime?.state === 'running', '原生多面板插件');
-  reporter.check('标准包管理进程声明独立安装与授权委托', plugin.manifest.permissions.some(permission=>permission.kind==='pluginManagement'&&['install','authorize'].every(target=>permission.targets.includes(target))));
+  reporter.check('标准包管理进程声明安装能力且不默认代授目标权限', plugin.manifest.permissions.some(permission=>permission.kind==='pluginManagement'&&permission.targets.includes('install')&&!permission.targets.includes('authorize')));
   const packageName='dsh-plugin-release-probe';
   const managedPackage=async()=> (await api('/api/plugins')).value.plugins.find(item=>item.source.location.startsWith('dsh:'+packageName+'@'));
   const runManager=async(manager,args)=>{
     const reply=await post(`/api/plugins/${id}/routes`,{method:'POST',path:'/panel-package-manager',body:{manager,args,package:packageName}});
     assert.equal(reply.status,200,JSON.stringify(reply));return reply.body;
   };
+  const authorizeManagedPackage=async()=>{
+    await settingsTab('plugins');
+    await page.evaluate(`(()=>{const input=document.querySelector('[data-testid=plugin-search]');input.value='';input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+    return authorizePluginFromNative({request:async(path,body)=>{
+      const response=await api(path,body);assert.equal(response.status,200,JSON.stringify(response.value));return response.value;
+    },page,plugin:await managedPackage()});
+  };
   const installedPackage=await runManager('npm',['install',packageName+'@0.0.7','--ignore-scripts','--no-audit','--no-fund','--no-progress']);
-  reporter.check('原包 npm install 实际在线安装并运行，原文件读取来自同一 daemon 版本',installedPackage.code===0&&installedPackage.manifest.version==='0.0.7'&&(await managedPackage()).runtime.state==='running',installedPackage);
+  const installedPending=await managedPackage();
+  reporter.check('原包 npm install 保留已安装待授权回执和同一 daemon 原文件快照',installedPackage.code!==0&&installedPackage.manifest.version==='0.0.7'&&!installedPending.active&&installedPending.grants.length===0,installedPackage);
+  const installedAuthorized=await authorizeManagedPackage();
+  reporter.check('原生授权恢复 npm 已提交的同一版本，不重放包管理进程',installedAuthorized.digest===installedPending.digest&&installedAuthorized.manifest.version==='0.0.7');
   const updatedPackage=await runManager('pnpm',['add',packageName+'@0.0.8','--ignore-scripts','--reporter=append-only','--yes']);
+  const updatedPending=await managedPackage();
+  reporter.check('原包 pnpm add 在线提交新版并保留未代授的原文件快照',updatedPackage.code!==0&&updatedPackage.manifest.version==='0.0.8'&&updatedPending.manifest.version==='0.0.8'&&!updatedPending.active&&updatedPending.grants.length===0,updatedPackage);
+  await authorizeManagedPackage();
   const beforeFailure=await managedPackage();
-  reporter.check('原包 pnpm add 在线替换版本并刷新当前调用的原文件快照',updatedPackage.code===0&&updatedPackage.manifest.version==='0.0.8'&&beforeFailure.manifest.version==='0.0.8'&&beforeFailure.runtime.state==='running',updatedPackage);
+  reporter.check('原生授权恢复 pnpm 新摘要并运行，无需重复更新',beforeFailure.digest===updatedPending.digest&&beforeFailure.manifest.version==='0.0.8'&&beforeFailure.runtime.state==='running');
   const failedPackage=await runManager('npm',['install',packageName+'@9999.0.0','--ignore-scripts']);
   const afterFailure=await managedPackage();
   reporter.check('标准包管理失败返回原命令错误，旧摘要、授权及运行代次保持',failedPackage.code!==0&&failedPackage.stderr.length>0&&failedPackage.manifest.version==='0.0.8'&&afterFailure.digest===beforeFailure.digest&&afterFailure.runtime.generation===beforeFailure.runtime.generation&&JSON.stringify(afterFailure.grants)===JSON.stringify(beforeFailure.grants),failedPackage);
@@ -1124,6 +1144,9 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   await waitFor(()=>page.evaluate(`!document.querySelector('iframe[data-plugin-id="${id}"]')?.getClientRects().length`),'关闭全部可见面板并停放已授权持续文档');
   reporter.check('关闭原包全部面板保留已授权后台文档与在途 Remote，不把隐藏误当停用',
     (await remoteStates())['panel-closed']==='running'&&await frame.evaluate('window.__clientInstance')===clientInstance);
+  await waitFor(() => frame.evaluate('document.documentElement.dataset.placement === "background"'), '原客户端进入后台停放位置');
+  reporter.check('持续客户端停放保留原组件 React 局部状态及已有业务回执',
+    await frame.evaluate('document.getElementById("receipt")?.textContent === "second:SECOND"'));
   await completeRemote('panel-closed');
   await waitFor(()=>frame.evaluate(`window.__remoteCalls['panel-closed'].state==='completed:panel-closed'`),'后台 Remote 在面板关闭时完成实际业务');
   if(!await visible('.right-pane'))await ui.click('.header-right-pane-btn');
@@ -1365,7 +1388,9 @@ async function verifyToolOutcomes() {
   const invoke=kind=>post('/api/session/turn',{scope:'personal',sessionId:session,text:'TOOL_OUTCOME_CHECK:'+JSON.stringify({kind,id:kind}),requestId:'tool-outcome-'+kind,userMessageId:'tool-outcome-user-'+kind});
   for(const kind of ['continue','finish','failed']) {
     const accepted=await invoke(kind), turn=await waitTurn(accepted.turnId);
-    const tool=turn.items.find(item=>item.kind==='tool_call');
+    const tool=turn.items.find(item=>item.tool?.callId==='acceptance-tool-call');
+    const businessStep=turn.modelSteps.findIndex(step=>step.stepId===tool?.metadata?.modelStepId);
+    assert.ok(businessStep>=0,'业务工具必须绑定真实模型步骤');
     const context=turn.items.find(item=>item.metadata?.pluginMessage?.messageId==='outcome-context-'+kind);
     const final=turn.items.find(item=>item.metadata?.assistantOutputKind==='final');
     const request=JSON.parse((await post(`/api/plugins/${pluginId}/routes`,{method:'GET',path:'/skill-request'})).body.request);
@@ -1375,11 +1400,11 @@ async function verifyToolOutcomes() {
       && context?.content==='DEFERRED_CONTEXT:'+kind
       && context.metadata.pluginMessage.sourceKind==='runtime-tool-context',JSON.stringify(turn));
     if(kind==='finish') {
-      reporter.check('成功工具直接交付最终业务原文，保留完成来源且不请求第二次模型',final?.content==='ACTUAL_BUSINESS_RESULT:finish'
+      reporter.check('成功工具直接交付最终业务原文，保留完成来源且不再请求后续模型',final?.content==='ACTUAL_BUSINESS_RESULT:finish'
         && final.metadata.pluginToolCompletion?.[0]?.pluginId===pluginId && !final.metadata.modelStepId
-        && !final.metadata.providerContext && turn.modelSteps.length===1,JSON.stringify(turn));
+        && !final.metadata.providerContext && turn.modelSteps.length===businessStep+1,JSON.stringify(turn));
     } else {
-      reporter.check(`${kind} 的上下文交给原生下一模型步骤，失败不能请求结束本轮`,turn.modelSteps.length===2
+      reporter.check(`${kind} 的上下文交给原生下一模型步骤，失败不能请求结束本轮`,turn.modelSteps.length===businessStep+2
         && JSON.stringify(request.messages).includes('DEFERRED_CONTEXT:'+kind)
         && !final?.metadata?.pluginToolCompletion
         && (kind!=='failed'||JSON.stringify(tool.tool.result.error).includes('ACTUAL_BUSINESS_FAILURE:failed')),JSON.stringify({turn,request}));
@@ -1519,8 +1544,8 @@ try {
   const stopIntercept = page.on('Fetch.requestPaused', (event) => { settingsRead = event.requestId; });
   await page.call('Fetch.enable', { patterns: [{ urlPattern: `${origin}/api/plugins/${pluginId}/settings`, requestStage: 'Request' }] });
   await settingsTab(`plugin:${pluginId}:settings`);
-  await waitFor(() => ui.exists('.settings-frame iframe'), '插件设置视图');
-  const frameUrl = await page.evaluate('document.querySelector(".settings-frame iframe").src');
+  await waitFor(() => ui.exists('.settings-frame:not([hidden]) iframe'), '插件设置视图');
+  const frameUrl = await page.evaluate('document.querySelector(".settings-frame:not([hidden]) iframe").src');
     frame = await waitFor(() => connectTarget(cdpPort, (target) => (target.type === 'iframe' || target.type === 'page') && target.url === frameUrl, '插件隔离视图', errors), '插件隔离视图');
   const evaluateFrame = (expression) => frame.evaluate(expression);
   await waitFor(() => settingsRead, '设置读取请求');
@@ -1532,7 +1557,7 @@ try {
   reporter.check('设置读取失败显示原因且禁止覆盖配置', await evaluateFrame('document.getElementById("save").disabled')
     && (await api(`/api/plugins/${pluginId}/settings`)).value.version === 0 && errors.length === 0, errors.join('\n'));
   await page.call('Fetch.disable'); stopIntercept();
-  await page.evaluate('document.querySelector(".settings-frame iframe").src += ""; true');
+  await page.evaluate('document.querySelector(".settings-frame:not([hidden]) iframe").src += ""; true');
   await waitFor(() => evaluateFrame('Boolean(document.getElementById("save")) && !document.getElementById("save").disabled'), '重新加载设置恢复');
   await waitFor(() => evaluateFrame('Boolean(document.getElementById("f-label"))'), '动态 schema 设置字段');
   reporter.check('首次打开设置页展示与插件执行一致的 schema 默认值',
@@ -1543,7 +1568,7 @@ try {
   reporter.check('共享页面宿主经同一 settingsScope 保存动态 schema 配置', true);
   await snapshot('settings-desktop');
   const viewport = () => page.evaluate(`(() => {
-    const frame=document.querySelector('.settings-frame iframe'),scroller=frame.closest('.settings-frame'),style=getComputedStyle(scroller);
+    const frame=document.querySelector('.settings-frame:not([hidden]) iframe'),scroller=frame.closest('.settings-frame'),style=getComputedStyle(scroller);
     return {height:frame.getBoundingClientRect().height,available:scroller.clientHeight-parseFloat(style.paddingTop)-parseFloat(style.paddingBottom),scrollHeight:scroller.scrollHeight,clientHeight:scroller.clientHeight};
   })()`);
   await waitFor(async()=>{const size=await viewport();return size.available>0&&size.height>=size.available-1;},'短插件设置页面保留宿主可用视口');
@@ -1556,9 +1581,9 @@ try {
       runtime:(await installed()).runtime,errors,
     },null,2));throw error;
   });
-  await page.evaluate(`(() => {const scroller=document.querySelector('.settings-frame');scroller.scrollTop=scroller.scrollHeight;})()`);
+  await page.evaluate(`(() => {const scroller=document.querySelector('.settings-frame:not([hidden])');scroller.scrollTop=scroller.scrollHeight;})()`);
   reporter.check('长页面由宿主滚动，隔离文档没有第二条正文滚动链',
-    await page.evaluate(`document.querySelector('.settings-frame').scrollTop>0`)
+    await page.evaluate(`document.querySelector('.settings-frame:not([hidden])').scrollTop>0`)
     &&await evaluateFrame(`document.documentElement.scrollHeight<=innerHeight+1`));
   await evaluateFrame(`document.getElementById('viewport-long-content').remove()`);
   await waitFor(async()=>{const size=await viewport();return Math.abs(size.height-size.available)<=1;},'移除长内容后恢复完整可用视口，不保留旧内容高度');

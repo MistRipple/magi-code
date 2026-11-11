@@ -34,7 +34,7 @@ impl LlmTaskDispatcher {
                 .clone()
                 .ok_or("插件命令执行服务不可用")?;
             let guard = TaskExecutionGuard::new(
-                self.pipeline.execution_runtime.task_store(),
+                self.pipeline.task_store.as_ref(),
                 &self.session_store,
                 &self.execution_registry,
                 input.session_id,
@@ -115,7 +115,7 @@ impl LlmTaskDispatcher {
             conversation_loop::complete_task_command(conversation_loop::TaskCommandCompletion {
                 event_bus: &self.event_bus,
                 session_store: &self.session_store,
-                task_store: self.pipeline.execution_runtime.task_store(),
+                task_store: self.pipeline.task_store.as_ref(),
                 task: input.task,
                 session_id: input.session_id,
                 workspace_id: input.workspace_id,

@@ -7,17 +7,16 @@ use super::{
     plugin_bridge::PluginServices,
 };
 use magi_api::{
-    ApiError, ApiState, DaemonIdentity, DirectHttpModelProbeConfig, RunnerManager,
-    RuntimeStatePersistence, SessionProjectionPersistMode, TaskCheckpointPersist, build_router,
+    ApiError, ApiState, DaemonIdentity, RunnerManager, RuntimeStatePersistence,
+    SessionProjectionPersistMode, TaskCheckpointPersist, build_router,
     build_runtime_capability_dependency_provider,
     mcp_config::{build_mcp_config_from_entry, mcp_server_entry_enabled, mcp_server_entry_id},
 };
 use magi_bridge_client::{
     BridgeBindingKind, BridgeClientError, BridgeDispatchRuntime, BridgeErrorLayer, BridgeResponse,
-    BridgeServerKind, BridgeTransport, HttpModelBridgeClient, HttpModelBridgeProtocol,
-    ImageGenerationRequest as BridgeImageGenerationRequest, JsonRpcMcpBridgeClient,
-    JsonRpcStdioTransport, McpBridgeClient, McpServerClient, McpToolCallRequest,
-    StdioMcpBridgeClient,
+    HttpModelBridgeClient, HttpModelBridgeProtocol,
+    ImageGenerationRequest as BridgeImageGenerationRequest, McpBridgeClient, McpServerClient,
+    McpToolCallRequest, StdioMcpBridgeClient,
 };
 use magi_context_runtime::{
     ContextBudget, ContextRuntime, FileSummaryStore, ProjectRecentTurnStore, SharedContextPool,
@@ -40,17 +39,16 @@ use magi_conversation_runtime::{
         publish_model_usage_record_with_config,
     },
 };
-use magi_core::{
-    DomainError, EventId, ExecutionOwnership, SessionId, TaskStatus, UtcMillis,
-    public_runtime_excerpt,
-};
+#[cfg(test)]
+use magi_core::ExecutionOwnership;
+use magi_core::{DomainError, EventId, SessionId, TaskStatus, UtcMillis, public_runtime_excerpt};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
 use magi_memory_store::MemoryStore;
-use magi_orchestrator::{OrchestratedExecutionRuntime, task_store::TaskStore};
+use magi_orchestrator::task_store::TaskStore;
 use magi_process::ManagedProcessGroup;
-use magi_session_store::{SessionExecutionSidecarStatus, SessionStore};
+use magi_session_store::SessionStore;
 use magi_settings_store::SettingsStore;
 use magi_skill_runtime::SkillDispatchRuntime;
 use magi_tool_runtime::{
@@ -61,7 +59,6 @@ use magi_tool_runtime::{
     external_mcp_model_tool_name,
 };
 use magi_usage_authority::UsageCallStatus;
-use magi_worker_runtime::WorkerRuntime;
 use magi_workspace::WorkspaceStore;
 use std::{
     collections::{HashMap, HashSet},
@@ -497,19 +494,19 @@ fn external_mcp_error_marker(entry: &serde_json::Value) -> Option<String> {
 struct SettingsBackedMcpBridgeClient {
     settings_store: Arc<SettingsStore>,
     mcp_connections: Arc<RwLock<HashMap<String, Arc<McpServerClient>>>>,
-    default_client: Arc<dyn McpBridgeClient>,
+    environment_client: Option<Arc<dyn McpBridgeClient>>,
 }
 
 impl SettingsBackedMcpBridgeClient {
     fn new(
         settings_store: Arc<SettingsStore>,
         mcp_connections: Arc<RwLock<HashMap<String, Arc<McpServerClient>>>>,
-        default_client: Arc<dyn McpBridgeClient>,
+        environment_client: Option<Arc<dyn McpBridgeClient>>,
     ) -> Self {
         Self {
             settings_store,
             mcp_connections,
-            default_client,
+            environment_client,
         }
     }
 
@@ -521,15 +518,6 @@ impl SettingsBackedMcpBridgeClient {
             .flatten()
             .filter_map(magi_api::mcp_config::normalize_mcp_server_snapshot_entry)
             .find(|entry| mcp_entry_matches_target(entry, target))
-    }
-
-    fn client_for_entry(
-        &self,
-        _server_id: &str,
-        entry: &serde_json::Value,
-    ) -> Result<Arc<McpServerClient>, BridgeClientError> {
-        mcp_client_for_settings_entry(entry, &self.mcp_connections)
-            .map_err(mcp_config_unavailable_error)
     }
 }
 
@@ -543,12 +531,19 @@ impl McpBridgeClient for SettingsBackedMcpBridgeClient {
         }
 
         let Some(entry) = self.settings_entry_for_target(target) else {
-            return self.default_client.call_tool(request);
+            return self
+                .environment_client
+                .as_ref()
+                .ok_or_else(|| {
+                    mcp_config_unavailable_error(format!("MCP target is not configured: {target}"))
+                })?
+                .call_tool(request);
         };
         let server_id = mcp_server_entry_id(&entry)
             .map(str::to_string)
             .unwrap_or_else(|| target.to_string());
-        let client = self.client_for_entry(&server_id, &entry)?;
+        let client = mcp_client_for_settings_entry(&entry, &self.mcp_connections)
+            .map_err(mcp_config_unavailable_error)?;
         let response = client.call_tool(request);
         if response
             .as_ref()
@@ -712,10 +707,9 @@ impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
                 .to_string(),
             ));
         }
-        Ok(magi_bridge_client::ModelResponse::completed(format!(
-            "loopback-model::{}",
-            request.prompt.trim()
-        )))
+        Ok(magi_bridge_client::ModelResponse::completed(
+            request.prompt.trim(),
+        ))
     }
 
     fn invoke_streaming(
@@ -797,7 +791,6 @@ pub(crate) struct DaemonRuntime {
     workspace_store: Arc<WorkspaceStore>,
     knowledge_store: Arc<KnowledgeStore>,
     governance: Arc<GovernanceService>,
-    worker_runtime: WorkerRuntime,
     runtime_maintenance: RuntimeMaintenance,
     managed_process_group: ManagedProcessGroup,
     browser_host_controller_lifecycle: BrowserHostControllerLifecycle,
@@ -858,13 +851,10 @@ impl DaemonRuntime {
             state_repository.load_knowledge_state()?,
         ));
         let event_bus = Arc::new(InMemoryEventBus::new(2048));
-        let worker_runtime = WorkerRuntime::new();
-        worker_runtime.restore_durable_snapshot(state_repository.load_worker_runtime_snapshot()?);
         let runtime_persistence = RuntimeSidecarPersistence::new(
             state_repository.clone(),
             session_store.clone(),
             workspace_store.clone(),
-            worker_runtime.clone(),
         );
 
         Self::restore_ledger(&state_repository, &event_bus)?;
@@ -907,7 +897,6 @@ impl DaemonRuntime {
             workspace_store,
             knowledge_store,
             governance: Arc::new(GovernanceService::default()),
-            worker_runtime,
             runtime_maintenance,
             managed_process_group,
             browser_host_controller_lifecycle: BrowserHostControllerLifecycle::new(),
@@ -1001,10 +990,10 @@ impl DaemonRuntime {
         );
         runtime
             .session_store
-            .bind_execution_ownership(session_id.clone(), ownership);
+            .bind_execution_ownership_for_test(session_id.clone(), ownership);
         runtime
             .session_store
-            .attach_recovery_ref(&session_id, Some(recovery.recovery_id))
+            .set_recovery_id(&session_id, None, Some(recovery.recovery_id))
             .map_err(|error| DaemonError::internal(format!("绑定测试恢复入口失败: {error}")))?;
 
         let state_repository = runtime.state_repository.clone();
@@ -1012,7 +1001,6 @@ impl DaemonRuntime {
             state_repository.clone(),
             runtime.session_store.clone(),
             runtime.workspace_store.clone(),
-            runtime.worker_runtime.clone(),
         );
         Self::persist_initial_runtime_state(
             &state_repository,
@@ -1152,7 +1140,7 @@ impl DaemonRuntime {
             "system.started",
             serde_json::json!({
                 "service": service_name,
-                "mode": "local-loopback"
+                "mode": "daemon"
             }),
         ));
     }
@@ -1168,17 +1156,6 @@ impl DaemonRuntime {
         model_bridge_override: Option<Arc<dyn magi_bridge_client::ModelBridgeClient>>,
     ) -> Result<ApiState, DaemonError> {
         let mcp_connections = Arc::new(RwLock::new(HashMap::new()));
-        let model_transport = Self::bridge_loopback_transport_with_env(
-            "model_bridge_loopback",
-            bridge_env,
-            self.managed_process_group.clone(),
-        );
-        let mcp_transport = Self::bridge_loopback_transport_with_env(
-            "mcp_bridge_loopback",
-            bridge_env,
-            self.managed_process_group.clone(),
-        );
-
         // 创建带持久化路径的设置存储，并从磁盘恢复已有设置
         let settings_store = Arc::new(SettingsStore::with_persistence_path(
             self.state_root.join("settings.json"),
@@ -1197,13 +1174,13 @@ impl DaemonRuntime {
         );
         Self::seed_orchestrator_settings_from_env_if_empty(&settings_store, bridge_env)
             .map_err(|error| DaemonError::internal(format!("保存环境模型设置失败: {error}")))?;
-        let direct_http_probe_result = if model_bridge_override.is_some() {
+        let environment_model_client = if model_bridge_override.is_some() {
             None
         } else {
             Self::try_build_http_model_client(bridge_env)
         };
         let default_model_available =
-            model_bridge_override.is_some() || direct_http_probe_result.is_some();
+            model_bridge_override.is_some() || environment_model_client.is_some();
         let agent_role_registry = Arc::new(
             magi_agent_role::AgentRoleRegistry::load_from_state_root(&self.state_root)
                 .map_err(|error| DaemonError::internal(format!("加载代理角色失败: {error}")))?,
@@ -1332,7 +1309,6 @@ impl DaemonRuntime {
         let git_service = Arc::new(magi_git::GitService::new());
         let session_code_contexts = magi_git::SessionCodeContextRegistry::default();
         let workspace_git_coordinator = magi_git::WorkspaceGitOperationCoordinator::default();
-        let worker_runtime = self.worker_runtime.clone();
         let task_store_projection_path = self.state_repository.task_store_projection_path();
         let accepted_submission_repository = self.state_repository.clone();
         let accepted_submission_repository_for_checkpoint = accepted_submission_repository.clone();
@@ -1353,7 +1329,7 @@ impl DaemonRuntime {
                 task_checkpoint_persist_for_store(store)
             }));
             let (revoked_leases, failed_tasks) = restored
-                .reconcile_volatile_runtime_after_restore(&worker_runtime.durable_snapshot())
+                .reconcile_volatile_runtime_after_restore()
                 .map_err(|error| {
                     DaemonError::internal(format!("恢复任务运行态收敛失败: {error}"))
                 })?;
@@ -1371,8 +1347,7 @@ impl DaemonRuntime {
         task_store.set_checkpoint_callback(Box::new(move |store| {
             task_checkpoint_persist_for_store(store)
         }));
-        // Worker 结果直接提交 TaskStore durable 终态，再由完成通知唤醒 Turn 侧；
-        // Runner 仍可在未装配该通知目标的嵌入测试中使用结果队列。
+        // Worker 结果直接提交 TaskStore durable 终态，再由同一完成通知唤醒 Turn 侧。
         let task_store = Arc::new(task_store);
         let git_tool_executor = magi_api::git_tool_runtime::build_git_tool_executor(
             magi_api::git_tool_runtime::GitToolRuntimeDependencies {
@@ -1444,6 +1419,7 @@ impl DaemonRuntime {
                 self.plugins
                     .tool_executor(tokio::runtime::Handle::current()),
             )
+            .with_web_provider(self.plugins.web_executor(tokio::runtime::Handle::current()))
             .with_agent_role_catalog_provider(agent_role_catalog_provider)
             .with_image_generation_runtime(
                 image_generation_executor,
@@ -1454,7 +1430,7 @@ impl DaemonRuntime {
             .with_runtime_capability_dependency_provider(runtime_capability_dependency_provider);
         tool_registry.register_default_builtins();
 
-        // 业务模型桥用于会话正文生成和任务执行；任务规划/分类另走本地 loopback-model。
+        // 会话正文、任务执行与辅助调用使用正式模型客户端。
         //
         // 单一事实源（按优先级，由 task_execution_dispatcher::resolve_target_for_role
         // 的 RoleTarget::Orchestrator 分支串联）：
@@ -1467,21 +1443,17 @@ impl DaemonRuntime {
         //
         // settings.json 的 `auxiliary` 段不参与业务派发，只服务于会话标题、知识抽取、
         // 会话记忆、Prompt 增强等辅助任务（通过 RoleTarget::Auxiliary 分支独立解析）。
-        let direct_http_probe_config = direct_http_probe_result
-            .as_ref()
-            .map(|(_, config)| config.clone());
-
-        // Use StdioMcpBridgeClient for direct MCP server connections when
-        // MAGI_MCP_SERVER_COMMAND is configured, falling back to the
-        // JSON-RPC subprocess loopback.
-        let direct_mcp_client = StdioMcpBridgeClient::from_env()
-            .map(|client| client.with_process_group(self.managed_process_group.clone()));
+        // 仅保留显式配置的真实环境 MCP；未配置时没有模拟服务或默认成功结果。
+        let environment_mcp_client = StdioMcpBridgeClient::from_env().map(|client| {
+            Arc::new(client.with_process_group(self.managed_process_group.clone()))
+                as Arc<dyn McpBridgeClient>
+        });
 
         let business_model_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
             match model_bridge_override.clone() {
                 Some(client) => client,
                 None => {
-                    if let Some((client, _)) = direct_http_probe_result {
+                    if let Some(client) = environment_model_client {
                         // 环境配置只在 bootstrap 解析一次。实际 HTTP client 同时
                         // 拥有缓存 IR、连接身份和传输合同，不经另一层重建/转发。
                         Arc::new(client)
@@ -1491,7 +1463,7 @@ impl DaemonRuntime {
                             orchestrator_configured = orchestrator_settings_is_configured(
                                 &settings_store.get_section("orchestrator"),
                             ),
-                            "业务模型的环境默认桥未配置；真实会话仍会按会话/设置中的主模型配置创建 HTTP client，只有解析不到有效主模型时才返回可操作配置错误。loopback-model 仅保留用于桥探测/冒烟，不参与业务流式对话"
+                            "业务模型的环境默认桥未配置；真实会话仍会按会话/设置中的主模型配置创建 HTTP client，只有解析不到有效主模型时才返回可操作配置错误。未配置时不会生成模拟模型结果"
                         );
                         Arc::new(UnavailableBusinessModelBridgeClient::new(
                             self.state_root.clone(),
@@ -1499,16 +1471,10 @@ impl DaemonRuntime {
                     }
                 }
             };
-        let default_mcp_client: Arc<dyn McpBridgeClient> =
-            if let Some(mcp_client) = direct_mcp_client {
-                Arc::new(mcp_client)
-            } else {
-                Arc::new(JsonRpcMcpBridgeClient::new(mcp_transport.clone()))
-            };
         let settings_backed_mcp_client = SettingsBackedMcpBridgeClient::new(
             settings_store.clone(),
             mcp_connections.clone(),
-            default_mcp_client,
+            environment_mcp_client,
         );
         let bridge_runtime = BridgeDispatchRuntime::new()
             .with_model_client(business_model_client.clone())
@@ -1595,14 +1561,11 @@ impl DaemonRuntime {
             max_shared_items: 4,
             max_file_summaries: 4,
         };
-        let execution_runtime = OrchestratedExecutionRuntime::new(worker_runtime.clone())
-            .with_task_store(Arc::clone(&task_store));
 
         let session_checkpoint_persistence = RuntimeSidecarPersistence::new(
             self.state_repository.clone(),
             self.session_store.clone(),
             self.workspace_store.clone(),
-            self.worker_runtime.clone(),
         );
         let session_state_checkpoint_persist = Arc::new(move |checkpoint: &str| {
             session_checkpoint_persistence
@@ -1710,9 +1673,7 @@ impl DaemonRuntime {
                 })
             })
         })
-        .with_bridge_probe_transport(BridgeServerKind::Model, model_transport)
-        .with_bridge_probe_transport(BridgeServerKind::Mcp, mcp_transport)
-        .with_execution_pipeline(execution_runtime, memory_store);
+        .with_execution_pipeline(task_store.clone(), memory_store);
         browser_automation_dependencies
             .set(state.browser_tool_runtime_dependencies())
             .map_err(|_| DaemonError::internal("重复装配 Browser 工具运行时依赖"))?;
@@ -1923,10 +1884,6 @@ impl DaemonRuntime {
             );
         });
 
-        if let Some(probe_config) = direct_http_probe_config {
-            state = state.with_direct_http_model_probe(probe_config);
-        }
-
         // MCP 服务必须在工具注册表、审批注册表和会话存储全部装配后再恢复；
         // 它是独立监听入口，不挂到主 HTTP Router，但共享同一个 ApiState 事实源。
         state.start_mcp_service_if_enabled();
@@ -1996,8 +1953,8 @@ impl DaemonRuntime {
             return reconciled_task_count;
         }
 
-        let stale_count = stale_sidecars.len();
-        for mut sidecar in stale_sidecars {
+        let mut stale_count = 0;
+        for sidecar in stale_sidecars {
             // 在切断 chain 前，先把仍处于非终态的 current_turn 收敛为 cancelled，
             // 否则 reconcile_terminal_session_task_turns 会因 chain 已为 None 而跳过它，
             // 留下永远停在 "running" 的孤立 canonical turn。
@@ -2014,22 +1971,20 @@ impl DaemonRuntime {
                     %session_id,
                     "取消失效 session chain 的 current_turn 失败"
                 );
+                continue;
             }
-
-            sidecar.active_execution_chain = None;
-            sidecar.ownership = ExecutionOwnership::default();
-            sidecar.status = if sidecar.recovery_id.is_some() {
-                SessionExecutionSidecarStatus::RecoveryLinked
-            } else {
-                SessionExecutionSidecarStatus::Detached
-            };
-            sidecar.updated_at = UtcMillis::now();
-            // current_turn 已经被 cancel_current_turn 覆盖到最新状态，这里重新读取
-            // 一次，避免 upsert 时把刚 cancel 掉的 turn 又抬回非终态。
-            if let Some(latest) = self.session_store.runtime_sidecar(&session_id) {
-                sidecar.current_turn = latest.current_turn;
+            let chain = sidecar
+                .active_execution_chain
+                .as_ref()
+                .expect("stale chain was selected");
+            match self.session_store.archive_active_execution_chain(
+                &session_id,
+                &chain.root_task_id,
+                chain.current_turn_id.as_deref(),
+            ) {
+                Ok(()) => stale_count += 1,
+                Err(error) => warn!(?error, %session_id, "归档失效 session chain 失败"),
             }
-            self.session_store.upsert_runtime_sidecar(sidecar);
         }
 
         // chain 已经清理完，再统一处理 chain 缺失但 current_turn 仍非终态的 sidecar。
@@ -2046,42 +2001,43 @@ impl DaemonRuntime {
     }
 
     fn fail_interrupted_session_task_chains(&self, task_store: &TaskStore) -> usize {
-        let interrupted_chains = self
-            .session_store
-            .runtime_sidecars()
-            .into_iter()
-            .filter_map(|sidecar| {
-                let chain = sidecar.active_execution_chain?;
-                let root_task = task_store.get_task(&chain.root_task_id)?;
-                if matches!(root_task.status, TaskStatus::Completed | TaskStatus::Killed) {
-                    return None;
-                }
-                // accepted/preparing 是提交控制面已经 durable 的执行准备阶段。
-                // 这类 Turn 尚未向 provider 发起不可安全重放的请求，保留 chain，
-                // 待 ApiState 装配完成后由 preparation worker 恢复。
-                let recoverable_preparation = root_task.status == TaskStatus::Pending
-                    && sidecar.current_turn.as_ref().is_some_and(|turn| {
-                        matches!(turn.status.as_str(), "accepted" | "preparing")
-                    });
-                if recoverable_preparation {
-                    return None;
-                }
-                let turn_is_active = sidecar
-                    .current_turn
-                    .as_ref()
-                    .is_some_and(|turn| !current_turn_status_is_terminal(&turn.status));
-                let has_in_memory_task = task_store
-                    .collect_subtree_ids(&chain.root_task_id)
-                    .into_iter()
-                    .any(|task_id| {
-                        task_store.get_task(&task_id).is_some_and(|task| {
-                            matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
-                        })
-                    });
-                (turn_is_active || has_in_memory_task)
-                    .then_some((sidecar.session_id, chain.root_task_id))
-            })
-            .collect::<HashSet<_>>();
+        let interrupted_chains =
+            self.session_store
+                .runtime_sidecars()
+                .into_iter()
+                .filter_map(|sidecar| {
+                    let chain = sidecar.active_execution_chain?;
+                    let root_task = task_store.get_task(&chain.root_task_id)?;
+                    if matches!(root_task.status, TaskStatus::Completed | TaskStatus::Killed) {
+                        return None;
+                    }
+                    // 准备阶段在 canonical 投影中为 accepted/running；root Task
+                    // 仍为 Pending 才是尚未开始执行的准备阶段。
+                    // 这类 Turn 尚未向 provider 发起不可安全重放的请求，保留 chain，
+                    // 待 ApiState 装配完成后由 preparation worker 恢复。
+                    let recoverable_preparation = root_task.status == TaskStatus::Pending
+                        && sidecar.current_turn.as_ref().is_some_and(|turn| {
+                            matches!(turn.status.as_str(), "accepted" | "running")
+                        });
+                    if recoverable_preparation {
+                        return None;
+                    }
+                    let turn_is_active = sidecar
+                        .current_turn
+                        .as_ref()
+                        .is_some_and(|turn| !current_turn_status_is_terminal(&turn.status));
+                    let has_in_memory_task = task_store
+                        .collect_subtree_ids(&chain.root_task_id)
+                        .into_iter()
+                        .any(|task_id| {
+                            task_store.get_task(&task_id).is_some_and(|task| {
+                                matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+                            })
+                        });
+                    (turn_is_active || has_in_memory_task)
+                        .then_some((sidecar.session_id, chain.root_task_id))
+                })
+                .collect::<HashSet<_>>();
 
         let mut failed_count = 0usize;
         let mut interrupted_turn_count = 0usize;
@@ -2138,7 +2094,6 @@ impl DaemonRuntime {
             repository,
             self.session_store.clone(),
             self.workspace_store.clone(),
-            self.worker_runtime.clone(),
         );
         if let Err(error) = persistence.flush_runtime_sidecars() {
             warn!(?error, warning);
@@ -2260,19 +2215,6 @@ impl DaemonRuntime {
         Ok(())
     }
 
-    fn bridge_loopback_transport_with_env(
-        binary_name: &str,
-        bridge_env: &[(&str, &str)],
-        process_group: ManagedProcessGroup,
-    ) -> Arc<dyn BridgeTransport> {
-        let transport = bridge_env.iter().fold(
-            JsonRpcStdioTransport::new(Self::bridge_loopback_executable(binary_name))
-                .with_process_group(process_group),
-            |transport, (key, value)| transport.with_env(*key, *value),
-        );
-        Arc::new(transport)
-    }
-
     /// Build an `HttpModelBridgeClient` from configuration.
     ///
     /// 业务模型配置来源（仅这两类，按优先级）：
@@ -2283,25 +2225,14 @@ impl DaemonRuntime {
     /// 业务模型与辅助模型混读同一份字段会造成"改 aux 设置静默切换业务模型"的
     /// 配置错位。业务模型未配置时返回 `None`，调用方应据此走 unavailable-client 提示。
     ///
-    /// Returns the client together with a [`DirectHttpModelProbeConfig`] that
-    /// the cutover-smoke provider can use for its own independent probe.
-    fn try_build_http_model_client(
-        bridge_env: &[(&str, &str)],
-    ) -> Option<(HttpModelBridgeClient, DirectHttpModelProbeConfig)> {
+    fn try_build_http_model_client(bridge_env: &[(&str, &str)]) -> Option<HttpModelBridgeClient> {
         let config = Self::openai_compat_env_config(bridge_env)?;
-        let base_url = config.base_url;
-        let api_key = config.api_key;
-        let model = config.model;
-        let protocol = HttpModelBridgeProtocol::ChatCompletions;
-
-        let probe_config = DirectHttpModelProbeConfig {
-            base_url: base_url.clone(),
-            api_key: api_key.clone(),
-            model: model.clone(),
-        };
-        Some((
-            HttpModelBridgeClient::new_with_protocol(base_url, api_key, model, protocol, None),
-            probe_config,
+        Some(HttpModelBridgeClient::new_with_protocol(
+            config.base_url,
+            config.api_key,
+            config.model,
+            HttpModelBridgeProtocol::ChatCompletions,
+            None,
         ))
     }
 
@@ -2345,25 +2276,6 @@ impl DaemonRuntime {
             api_key: find_env("MAGI_OPENAI_COMPAT_API_KEY"),
             model: find_env("MAGI_OPENAI_COMPAT_MODEL").unwrap_or_else(|| "gpt-4".to_string()),
         })
-    }
-
-    fn bridge_loopback_executable(binary_name: &str) -> String {
-        let env_key = format!("CARGO_BIN_EXE_{binary_name}");
-        if let Some(path) = env::var_os(&env_key) {
-            return path.to_string_lossy().to_string();
-        }
-
-        let mut path = env::current_exe().expect("current executable should exist");
-        path.pop();
-        if path.ends_with("deps") {
-            path.pop();
-        }
-        path.push(Self::binary_name(binary_name));
-        path.to_string_lossy().to_string()
-    }
-
-    fn binary_name(binary_name: &str) -> String {
-        format!("{binary_name}{}", env::consts::EXE_SUFFIX)
     }
 }
 
@@ -2623,11 +2535,8 @@ mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
         fs,
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
         path::PathBuf,
-        sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, mpsc},
-        thread::{self, JoinHandle},
+        sync::{Arc, Mutex, MutexGuard, RwLock},
         time::{Duration, Instant},
     };
     use tower::util::ServiceExt;
@@ -2980,35 +2889,40 @@ done
         user.task_id = Some(root.task_id.clone());
         user.item_seq = 1;
         let source_turn = "detached-agent-source-turn";
+        let admitted_turn = ActiveExecutionTurn {
+            turn_id: source_turn.into(),
+            turn_seq: 1,
+            accepted_at: now,
+            completed_at: None,
+            status: "running".into(),
+            user_message: Some("run independent work".into()),
+            items: vec![user],
+        };
         store
-            .upsert_active_execution_chain(
+            .accept_active_execution_chain_with_timeline_entry(
                 session.clone(),
+                magi_session_store::TimelineEntryInput::new(
+                    format!("timeline-chain-{}", admitted_turn.turn_id),
+                    magi_session_store::TimelineEntryKind::UserMessage,
+                    admitted_turn.user_message.clone().unwrap_or_default(),
+                    admitted_turn.accepted_at,
+                ),
                 ActiveExecutionChain {
                     session_id: session.clone(),
                     mission_id: root.mission_id.clone(),
                     root_task_id: root.task_id.clone(),
                     execution_chain_ref: "detached-agent-chain".into(),
                     workspace_id: None,
-                    active_branch_task_ids: vec![root.task_id.clone()],
-                    active_worker_bindings: vec![],
                     branches: vec![],
-                    recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
                         accepted_at: now,
                         entry_id: "source-user".into(),
                         trimmed_text: Some("run independent work".into()),
                         skill_name: None,
                     },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: source_turn.into(),
-                        turn_seq: 1,
-                        accepted_at: now,
-                        completed_at: None,
-                        status: "running".into(),
-                        user_message: Some("run independent work".into()),
-                        items: vec![user],
-                    }),
+                    current_turn_id: Some(admitted_turn.turn_id.clone()),
                 },
+                admitted_turn,
             )
             .unwrap();
         let tasks = TaskStore::new();
@@ -3043,7 +2957,6 @@ done
                 last_used_at: now,
                 observed_context_window_tokens: None,
                 handled_task_ids: vec![child.task_id.clone()],
-                message_history: vec![],
             })
             .unwrap();
         let owned = store
@@ -3148,7 +3061,7 @@ done
             )
             .unwrap();
         store
-            .archive_active_execution_chain(&session, &root.task_id)
+            .archive_active_execution_chain(&session, &root.task_id, Some(source_turn))
             .unwrap();
         assert_eq!(
             super::task_status_event_scope(&store, &child),
@@ -3284,51 +3197,47 @@ done
                 Some(workspace_id.to_string()),
             )
             .expect("session should be created");
+        let admitted_turn = ActiveExecutionTurn {
+            turn_id: "turn-task-status-scope".to_string(),
+            turn_seq: now.0,
+            accepted_at: now,
+            completed_at: None,
+            status: "running".to_string(),
+            user_message: Some("run scoped task".to_string()),
+            items: Vec::new(),
+        };
         session_store
-            .upsert_active_execution_chain(
+            .accept_active_execution_chain_with_timeline_entry(
                 session_id.clone(),
+                magi_session_store::TimelineEntryInput::new(
+                    format!("timeline-chain-{}", admitted_turn.turn_id),
+                    magi_session_store::TimelineEntryKind::UserMessage,
+                    admitted_turn.user_message.clone().unwrap_or_default(),
+                    admitted_turn.accepted_at,
+                ),
                 ActiveExecutionChain {
                     session_id: session_id.clone(),
                     mission_id: mission_id.clone(),
                     root_task_id: task_id.clone(),
                     execution_chain_ref: "chain-task-status-scope".to_string(),
                     workspace_id: Some(workspace_id.clone()),
-                    active_branch_task_ids: vec![task_id.clone()],
-                    active_worker_bindings: vec![worker_id.clone()],
                     branches: vec![ActiveExecutionBranch {
                         task_id: task_id.clone(),
                         worker_id,
-                        stage: "execute".to_string(),
-                        lease_id: None,
-                        execution_intent_ref: None,
-                        binding_lifecycle: None,
-                        checkpoint_stage: Some("execute".to_string()),
-                        next_step_index: Some(0),
-                        checkpoint_at: Some(now),
-                        resume_mode: Some("stage-restart".to_string()),
-                        resume_token: None,
                         use_tools: true,
                         skill_name: None,
                         is_primary: true,
                         thread_id: ThreadId::new("thread-task-status-scope"),
                     }],
-                    recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
                         accepted_at: now,
                         entry_id: "timeline-task-status-scope".to_string(),
                         trimmed_text: Some("run scoped task".to_string()),
                         skill_name: None,
                     },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: "turn-task-status-scope".to_string(),
-                        turn_seq: now.0,
-                        accepted_at: now,
-                        completed_at: None,
-                        status: "running".to_string(),
-                        user_message: Some("run scoped task".to_string()),
-                        items: Vec::new(),
-                    }),
+                    current_turn_id: Some(admitted_turn.turn_id.clone()),
                 },
+                admitted_turn,
             )
             .expect("active execution chain should be stored");
         let mut task = restore_task_fixture(
@@ -3423,7 +3332,6 @@ done
                     last_used_at: UtcMillis(2_000),
                     observed_context_window_tokens: None,
                     handled_task_ids: vec![task_id.clone()],
-                    message_history: Vec::new(),
                 })
                 .expect("终态 thread 测试数据应注册成功");
         }
@@ -3485,7 +3393,6 @@ done
                 last_used_at: now,
                 observed_context_window_tokens: None,
                 handled_task_ids: vec![orphan_task_id.clone()],
-                message_history: Vec::new(),
             })
             .expect("孤儿 root thread 测试数据应注册成功");
         let mut orphan_task = restore_task_fixture(
@@ -3580,30 +3487,54 @@ done
     }
 
     #[test]
-    fn settings_backed_mcp_bridge_delegates_unconfigured_targets_to_default_client() {
+    fn settings_backed_mcp_bridge_rejects_missing_targets_without_environment_client() {
+        let client = SettingsBackedMcpBridgeClient::new(
+            Arc::new(SettingsStore::new()),
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
+        );
+        for target in ["", "missing", "loopback-mcp"] {
+            let error = client
+                .call_tool(McpToolCallRequest {
+                    server_name: target.into(),
+                    tool_name: "echo.inspect".into(),
+                    input: "{}".into(),
+                })
+                .expect_err("unconfigured targets must not produce simulated success");
+            assert!(matches!(
+                error,
+                BridgeClientError::MissingClient {
+                    bridge_kind: magi_bridge_client::BridgeBindingKind::Mcp
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn settings_backed_mcp_bridge_uses_explicit_environment_client() {
         let settings_store = Arc::new(SettingsStore::new());
         let default_client = Arc::new(RecordingMcpClient::default());
         let calls = default_client.calls.clone();
         let client = SettingsBackedMcpBridgeClient::new(
             settings_store,
             Arc::new(RwLock::new(HashMap::new())),
-            default_client,
+            Some(default_client),
         );
 
         let response = client
             .call_tool(McpToolCallRequest {
-                server_name: "loopback-mcp".to_string(),
+                server_name: "environment-mcp".to_string(),
                 tool_name: "echo.inspect".to_string(),
                 input: "{}".to_string(),
             })
-            .expect("unconfigured target should use default bridge client");
+            .expect("explicit environment MCP client should receive the target");
 
         assert!(response.ok);
         let calls = calls
             .lock()
             .expect("recording mcp client mutex should lock");
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].server_name, "loopback-mcp");
+        assert_eq!(calls[0].server_name, "environment-mcp");
     }
 
     #[test]
@@ -3638,8 +3569,11 @@ done
                     request_timeout: std::time::Duration::from_secs(30),
                 })),
             );
-        let client =
-            SettingsBackedMcpBridgeClient::new(settings_store, connections.clone(), default_client);
+        let client = SettingsBackedMcpBridgeClient::new(
+            settings_store,
+            connections.clone(),
+            Some(default_client),
+        );
 
         let error = client
             .call_tool(McpToolCallRequest {
@@ -4419,179 +4353,6 @@ done
         assert_eq!(projection["root_task"]["status"], "completed");
     }
 
-    fn service_entries_by_kind(snapshot: &Value) -> BTreeMap<String, &Value> {
-        snapshot["services"]
-            .as_array()
-            .expect("services should be an array")
-            .iter()
-            .map(|entry| {
-                (
-                    entry["server_kind"]
-                        .as_str()
-                        .expect("server kind should serialize as string")
-                        .to_string(),
-                    entry,
-                )
-            })
-            .collect()
-    }
-
-    fn ensure_test_bridge_binaries_built() {
-        static BUILD_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
-
-        let result = BUILD_RESULT.get_or_init(|| {
-            let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-            let output = magi_process::std_command(cargo)
-                .args(["build", "-p", "magi-bridge-client", "--bins", "--locked"])
-                .current_dir(workspace_root)
-                .output()
-                .map_err(|error| format!("failed to build bridge binaries: {error}"))?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "failed to build bridge binaries (status {}): {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ))
-            }
-        });
-
-        if let Err(error) = result {
-            panic!("{error}");
-        }
-    }
-
-    fn test_bridge_binary_path(binary_name: &str) -> PathBuf {
-        let env_key = format!("CARGO_BIN_EXE_{binary_name}");
-        if let Some(path) = std::env::var_os(&env_key) {
-            let path = PathBuf::from(path);
-            if path.is_file() {
-                return path;
-            }
-        }
-
-        let mut path = std::env::current_exe().expect("current exe should exist");
-        path.pop();
-        if path.ends_with("deps") {
-            path.pop();
-        }
-        path.push(format!("{binary_name}{}", std::env::consts::EXE_SUFFIX));
-        if !path.is_file() {
-            ensure_test_bridge_binaries_built();
-        }
-        path
-    }
-
-    #[derive(Debug)]
-    struct RecordedHttpRequest {
-        request_line: String,
-        headers: BTreeMap<String, String>,
-        body: String,
-    }
-
-    fn spawn_http_stub(
-        status: u16,
-        response_body: Value,
-    ) -> (String, mpsc::Receiver<RecordedHttpRequest>, JoinHandle<()>) {
-        // Default to 2 connections: one for the JSON-RPC bridge loopback
-        // and one for the direct HTTP model provider probe.
-        spawn_http_stub_multi(status, response_body, 2)
-    }
-
-    fn spawn_http_stub_multi(
-        status: u16,
-        response_body: Value,
-        connection_count: usize,
-    ) -> (String, mpsc::Receiver<RecordedHttpRequest>, JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("http stub should bind");
-        let address = listener.local_addr().expect("http stub addr should exist");
-        let (sender, receiver) = mpsc::channel();
-        let handle = thread::spawn(move || {
-            for _ in 0..connection_count {
-                let (mut stream, _) = listener.accept().expect("http stub should accept");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .expect("read timeout should set");
-                let request = read_http_request(&mut stream);
-                let body = response_body.to_string();
-                let response = format!(
-                    "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    status_reason(status),
-                    body.len()
-                );
-                stream
-                    .write_all(response.as_bytes())
-                    .expect("http stub should write");
-                stream.flush().expect("http stub should flush");
-                sender.send(request).expect("request should send to test");
-            }
-        });
-
-        (format!("http://{address}/v1"), receiver, handle)
-    }
-
-    fn read_http_request(stream: &mut TcpStream) -> RecordedHttpRequest {
-        let mut buffer = Vec::new();
-        let mut chunk = [0_u8; 1024];
-        let header_end = loop {
-            let read = stream.read(&mut chunk).expect("http request should read");
-            assert!(read > 0, "http request should include headers");
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some(index) = find_header_end(&buffer) {
-                break index + 4;
-            }
-        };
-
-        let header_text =
-            String::from_utf8(buffer[..header_end].to_vec()).expect("headers should be utf-8");
-        let mut lines = header_text.split("\r\n");
-        let request_line = lines.next().expect("request line should exist").to_string();
-        let mut headers = BTreeMap::new();
-        for line in lines {
-            if line.is_empty() {
-                continue;
-            }
-            let (name, value) = line
-                .split_once(':')
-                .expect("header should contain separator");
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
-        }
-
-        let content_length = headers
-            .get("content-length")
-            .expect("content-length should exist")
-            .parse::<usize>()
-            .expect("content-length should parse");
-        while buffer.len() < header_end + content_length {
-            let read = stream.read(&mut chunk).expect("http body should read");
-            assert!(read > 0, "http request should include body");
-            buffer.extend_from_slice(&chunk[..read]);
-        }
-
-        let body = String::from_utf8(buffer[header_end..header_end + content_length].to_vec())
-            .expect("request body should be utf-8");
-        RecordedHttpRequest {
-            request_line,
-            headers,
-            body,
-        }
-    }
-
-    fn find_header_end(buffer: &[u8]) -> Option<usize> {
-        buffer.windows(4).position(|window| window == b"\r\n\r\n")
-    }
-
-    fn status_reason(status: u16) -> &'static str {
-        match status {
-            200 => "OK",
-            401 => "Unauthorized",
-            429 => "Too Many Requests",
-            _ => "Test Response",
-        }
-    }
-
     #[tokio::test]
     async fn router_session_action_auto_extraction_is_consumed_on_followup_dispatch() {
         let state_root = temp_state_root("router-session-action");
@@ -4912,7 +4673,7 @@ done
             .expect("recovery should become ready");
         runtime
             .session_store
-            .attach_recovery_ref(&session_id, Some(recovery.recovery_id.clone()))
+            .set_recovery_id(&session_id, None, Some(recovery.recovery_id.clone()))
             .expect("recovery ref should attach to session");
 
         let (status, recovery_body) = post_json(
@@ -4970,66 +4731,6 @@ done
                 .iter()
                 .any(|value| value == expected_extraction_id),
             "followup execution group should consume recovery extraction, got {extraction_refs:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn daemon_router_bridge_services_exports_loopback_model_host_and_mcp_catalogs() {
-        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
-            let path = test_bridge_binary_path(binary_name);
-            assert!(
-                path.exists(),
-                "expected loopback binary {binary_name} at {}",
-                path.display()
-            );
-        }
-
-        let state_root = temp_state_root("router-bridge-services");
-        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
-            .expect("runtime restore should load explicit test fixture");
-        let app = runtime
-            .router("daemon-test".to_string())
-            .expect("测试路由应成功构造");
-
-        let snapshot = get_json(app, "/bridges/services").await;
-        let services = service_entries_by_kind(&snapshot);
-        assert_eq!(
-            services.len(),
-            2,
-            "unexpected bridge snapshot: {snapshot:?}"
-        );
-
-        let model = services
-            .get("model")
-            .expect("model bridge snapshot should exist");
-        assert_eq!(model["health"]["status"], "ok");
-        assert_eq!(model["health"]["ok"], true);
-        assert!(
-            model["service_catalog"]["services"]
-                .as_array()
-                .expect("model services should be an array")
-                .iter()
-                .any(|service| service["service_name"] == "loopback-model"),
-            "model catalog should include loopback-model: {model:?}"
-        );
-        assert!(
-            model["service_catalog"]["services"]
-                .as_array()
-                .expect("model services should be an array")
-                .iter()
-                .any(|service| service["service_name"] == "openai-compatible"),
-            "model catalog should include openai-compatible: {model:?}"
-        );
-
-        let mcp = services
-            .get("mcp")
-            .expect("mcp bridge snapshot should exist");
-        assert_eq!(mcp["health"]["status"], "ok");
-        assert_eq!(mcp["health"]["ok"], true);
-        assert_eq!(
-            mcp["service_catalog"]["services"][0]["service_name"],
-            "loopback-mcp-manager"
         );
     }
 
@@ -5097,7 +4798,7 @@ done
                 },
                 &|_| {},
             )
-            .expect_err("unconfigured business model should fail before JSON-RPC loopback");
+            .expect_err("unconfigured business model should return a configuration error");
 
         let BridgeClientError::CallFailed { layer, message, .. } = err else {
             panic!("unexpected business model error shape: {err:?}");
@@ -5107,457 +4808,6 @@ done
             message.contains("业务模型桥未配置"),
             "error should guide model configuration, got: {message}"
         );
-        assert!(
-            !message.contains("JsonRpcModelBridgeClient"),
-            "business chat must not surface JSON-RPC loopback streaming errors: {message}"
-        );
-    }
-
-    #[tokio::test]
-    async fn daemon_router_bridge_preflight_executes_loopback_model_and_mcp_smokes() {
-        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
-            let path = test_bridge_binary_path(binary_name);
-            assert!(
-                path.exists(),
-                "expected loopback binary {binary_name} at {}",
-                path.display()
-            );
-        }
-
-        let state_root = temp_state_root("router-bridge-preflight");
-        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
-            .expect("runtime restore should load explicit test fixture");
-        let app = runtime
-            .router("daemon-test".to_string())
-            .expect("测试路由应成功构造");
-        let services_snapshot = get_json(app.clone(), "/bridges/services").await;
-
-        let snapshot = get_json(app, "/bridges/preflight").await;
-        let services = service_entries_by_kind(&snapshot);
-        assert_eq!(
-            services.len(),
-            2,
-            "unexpected bridge preflight: {snapshot:?}"
-        );
-
-        let model = services.get("model").expect("model preflight should exist");
-        assert!(
-            model["checks"]
-                .as_array()
-                .expect("model checks should be an array")
-                .iter()
-                .any(|check| check["target"] == "loopback-model" && check["ok"] == true),
-            "model preflight should include loopback-model invoke: {model:?}"
-        );
-        let openai_ready = services_snapshot["services"]
-            .as_array()
-            .expect("bridge services should be an array")
-            .iter()
-            .find(|entry| entry["server_kind"] == "model")
-            .and_then(|entry| entry["service_catalog"]["services"].as_array())
-            .and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|service| service["service_name"] == "openai-compatible")
-            })
-            .and_then(|service| service["service_health"].as_str())
-            == Some("ready");
-        if openai_ready {
-            assert!(
-                model["checks"]
-                    .as_array()
-                    .expect("model checks should be an array")
-                    .iter()
-                    .any(|check| check["target"] == "openai-compatible" && check["ok"] == true),
-                "ready openai-compatible provider should execute preflight smoke: {model:?}"
-            );
-        } else {
-            assert!(
-                model["checks"]
-                    .as_array()
-                    .expect("model checks should be an array")
-                    .iter()
-                    .all(|check| check["target"] != "openai-compatible"),
-                "non-ready openai-compatible provider should not execute preflight smoke: {model:?}"
-            );
-        }
-
-        let mcp = services.get("mcp").expect("mcp preflight should exist");
-        assert!(
-            mcp["checks"]
-                .as_array()
-                .expect("mcp checks should be an array")
-                .iter()
-                .any(|check| check["check_name"] == "list_servers" && check["ok"] == true),
-            "mcp preflight should include manager list_servers: {mcp:?}"
-        );
-        assert!(
-            mcp["checks"]
-                .as_array()
-                .expect("mcp checks should be an array")
-                .iter()
-                .any(|check| check["target"] == "loopback-mcp.echo.inspect" && check["ok"] == true),
-            "mcp preflight should include loopback-mcp echo.inspect: {mcp:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn daemon_router_bridge_cutover_smoke_exports_contract_snapshots() {
-        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
-            let path = test_bridge_binary_path(binary_name);
-            assert!(
-                path.exists(),
-                "expected loopback binary {binary_name} at {}",
-                path.display()
-            );
-        }
-
-        let state_root = temp_state_root("router-bridge-cutover");
-        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
-            .expect("runtime restore should load explicit test fixture");
-        let app = runtime
-            .router("daemon-test".to_string())
-            .expect("测试路由应成功构造");
-        let services_snapshot = get_json(app.clone(), "/bridges/services").await;
-        let snapshot = get_json(app, "/bridges/cutover-smoke").await;
-        let services = service_entries_by_kind(&snapshot);
-        assert_eq!(
-            services.len(),
-            2,
-            "unexpected bridge cutover snapshot: {snapshot:?}"
-        );
-        assert_eq!(snapshot["checked_service_count"], 2);
-        let blocking_issues = snapshot["blocking_issues"]
-            .as_array()
-            .expect("blocking issues should serialize as array");
-        let failing_check_count = services
-            .values()
-            .flat_map(|service| {
-                service["checks"]
-                    .as_array()
-                    .expect("checks should serialize as array")
-                    .iter()
-            })
-            .filter(|check| check["ok"] != true)
-            .count();
-        assert_eq!(
-            snapshot["blocking_check_count"]
-                .as_u64()
-                .expect("blocking count should serialize as u64") as usize,
-            failing_check_count
-        );
-        assert_eq!(blocking_issues.len(), failing_check_count);
-        let reason_code_counts = snapshot["blocking_issue_counts_by_reason_code"]
-            .as_object()
-            .expect("reason-code counts should serialize as object");
-        let server_kind_counts = snapshot["blocking_issue_counts_by_server_kind"]
-            .as_object()
-            .expect("server-kind counts should serialize as object");
-
-        let model = services.get("model").expect("model cutover should exist");
-        let model_service_ok = model["service_ok"]
-            .as_bool()
-            .expect("model service_ok should serialize as bool");
-        assert!(
-            model["checks"]
-                .as_array()
-                .expect("model checks should be an array")
-                .iter()
-                .any(|check| check["target"] == "loopback-model" && check["ok"] == true),
-            "loopback-model cutover contract should always be present: {model:?}"
-        );
-        let openai_health = services_snapshot["services"]
-            .as_array()
-            .expect("bridge services should be an array")
-            .iter()
-            .find(|entry| entry["server_kind"] == "model")
-            .and_then(|entry| entry["service_catalog"]["services"].as_array())
-            .and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|service| service["service_name"] == "openai-compatible")
-            })
-            .and_then(|service| service["service_health"].as_str());
-        if let Some(openai_health) = openai_health {
-            let openai = model["checks"]
-                .as_array()
-                .expect("model checks should be an array")
-                .iter()
-                .find(|check| check["target"] == "openai-compatible")
-                .expect("cataloged openai-compatible cutover check should exist");
-            if openai_health == "ready" {
-                assert!(model_service_ok);
-                assert_eq!(openai["ok"], true);
-                assert_eq!(openai["model_contract"]["contract_ok"], true);
-            } else {
-                assert!(!model_service_ok);
-                assert_eq!(openai["ok"], false);
-                assert_eq!(openai["blocking_reason"], "bridge invocation failed");
-                assert_eq!(openai["error"]["layer"], "RemoteBusiness");
-            }
-        }
-
-        let mcp = services.get("mcp").expect("mcp cutover should exist");
-        let mcp_route_gate = &mcp["mcp_default_route_gate"];
-        let route_status = mcp_route_gate["route_status"]
-            .as_str()
-            .expect("route status should serialize as string");
-        match route_status {
-            "ready" => {
-                assert_eq!(mcp["service_ok"], true);
-                assert_eq!(mcp["blocking_check_count"], 0);
-                assert_eq!(mcp_route_gate["contract_ok"], true);
-                assert_eq!(mcp["checks"][0]["ok"], true);
-                assert_eq!(
-                    mcp_route_gate["route_status"],
-                    mcp["checks"][0]["mcp_contract"]["route_status"]
-                );
-                assert_eq!(
-                    mcp_route_gate["route_target"],
-                    mcp["checks"][0]["mcp_contract"]["route_target"]
-                );
-                assert_eq!(
-                    mcp_route_gate["resolved_server"],
-                    mcp["checks"][0]["mcp_contract"]["resolved_server"]
-                );
-                assert_eq!(
-                    mcp_route_gate["contract_ok"],
-                    mcp["checks"][0]["mcp_contract"]["contract_ok"]
-                );
-                assert_eq!(
-                    mcp_route_gate["resolved_server"],
-                    mcp_route_gate["route_target"]
-                );
-                if model_service_ok {
-                    assert_eq!(snapshot["overall_ok"], true);
-                    assert_eq!(snapshot["blocking_check_count"], 0);
-                    assert!(
-                        reason_code_counts.is_empty(),
-                        "ready snapshot should not export reason-code counts: {snapshot:?}"
-                    );
-                    assert!(
-                        server_kind_counts.is_empty(),
-                        "ready snapshot should not export server-kind counts: {snapshot:?}"
-                    );
-                    assert!(
-                        snapshot["blocking_services"]
-                            .as_array()
-                            .expect("blocking services should serialize as array")
-                            .is_empty()
-                    );
-                    assert!(blocking_issues.is_empty());
-                } else {
-                    assert_eq!(snapshot["overall_ok"], false);
-                    assert!(
-                        snapshot["blocking_check_count"]
-                            .as_u64()
-                            .expect("blocking count should serialize as u64")
-                            >= 1
-                    );
-                    assert_eq!(
-                        server_kind_counts
-                            .get("model")
-                            .and_then(|value| value.as_u64()),
-                        Some(1)
-                    );
-                    assert!(
-                        snapshot["blocking_services"]
-                            .as_array()
-                            .expect("blocking services should serialize as array")
-                            .iter()
-                            .any(|service| service == "model"),
-                        "blocking summary should include model: {snapshot:?}"
-                    );
-                }
-            }
-            "fallback-only" | "unavailable" => {
-                assert_eq!(snapshot["overall_ok"], false);
-                assert!(
-                    snapshot["blocking_check_count"]
-                        .as_u64()
-                        .expect("blocking count should serialize as u64")
-                        >= 1
-                );
-                assert_eq!(mcp["service_ok"], false);
-                assert!(
-                    mcp["blocking_check_count"]
-                        .as_u64()
-                        .expect("service blocking count should serialize as u64")
-                        >= 1
-                );
-                assert_eq!(blocking_issues.len(), 1);
-                assert_eq!(mcp_route_gate["contract_ok"], false);
-                assert_eq!(
-                    blocking_issues[0]["server_kind"],
-                    serde_json::Value::String("mcp".to_string())
-                );
-                assert_eq!(
-                    blocking_issues[0]["reason_code"],
-                    serde_json::Value::String(
-                        if route_status == "fallback-only" {
-                            "mcp_default_route_status_fallback_only"
-                        } else {
-                            "mcp_default_route_status_unavailable"
-                        }
-                        .to_string()
-                    )
-                );
-                assert_eq!(
-                    reason_code_counts
-                        .get(if route_status == "fallback-only" {
-                            "mcp_default_route_status_fallback_only"
-                        } else {
-                            "mcp_default_route_status_unavailable"
-                        })
-                        .and_then(|value| value.as_u64()),
-                    Some(1)
-                );
-                assert_eq!(
-                    server_kind_counts
-                        .get("mcp")
-                        .and_then(|value| value.as_u64()),
-                    Some(1)
-                );
-                assert_eq!(mcp["checks"][0]["ok"], false);
-                assert!(
-                    mcp["checks"][0]["blocking_reason"].is_string(),
-                    "blocking route should explain itself: {mcp:?}"
-                );
-                assert!(
-                    blocking_issues.iter().any(|issue| {
-                        issue["server_kind"] == serde_json::Value::String("mcp".to_string())
-                            && issue["reason_code"]
-                                == serde_json::Value::String(
-                                    if route_status == "fallback-only" {
-                                        "mcp_default_route_status_fallback_only"
-                                    } else {
-                                        "mcp_default_route_status_unavailable"
-                                    }
-                                    .to_string(),
-                                )
-                    }),
-                    "blocking issues should retain the mcp route failure: {snapshot:?}"
-                );
-                assert!(
-                    snapshot["blocking_services"]
-                        .as_array()
-                        .expect("blocking services should serialize as array")
-                        .iter()
-                        .any(|service| service == "mcp"),
-                    "blocking summary should include mcp: {snapshot:?}"
-                );
-            }
-            other => panic!("unexpected mcp default route status {other}: {mcp:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn daemon_router_bridge_cutover_smoke_reflects_env_backed_provider_and_mcp_routes() {
-        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
-            let path = test_bridge_binary_path(binary_name);
-            assert!(
-                path.exists(),
-                "expected loopback binary {binary_name} at {}",
-                path.display()
-            );
-        }
-
-        let (base_url, receiver, handle) = spawn_http_stub(
-            200,
-            json!({
-                "choices": [{
-                    "message": {
-                        "content": "hello from env-backed cutover smoke"
-                    }
-                }]
-            }),
-        );
-
-        let state_root = temp_state_root("router-bridge-cutover-env");
-        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
-            .expect("runtime restore should load explicit test fixture");
-        let (app, _) = runtime.router_with_bridge_env_for_tests(
-            "daemon-test".to_string(),
-            &[
-                ("MAGI_OPENAI_COMPAT_BASE_URL", base_url.as_str()),
-                ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
-                ("MAGI_OPENAI_COMPAT_MODEL", "gpt-test"),
-                ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
-                (
-                    "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "loopback-mcp-observability",
-                ),
-                ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
-                (
-                    "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-                    "loopback-mcp-observability=healthy,loopback-mcp=healthy",
-                ),
-            ],
-        );
-
-        let snapshot = get_json(app, "/bridges/cutover-smoke").await;
-        let services = service_entries_by_kind(&snapshot);
-
-        assert_eq!(
-            snapshot["overall_ok"], true,
-            "unexpected cutover snapshot: {snapshot:?}"
-        );
-        assert!(
-            snapshot["blocking_issue_counts_by_reason_code"]
-                .as_object()
-                .expect("reason-code counts should serialize as object")
-                .is_empty(),
-            "ready env-backed snapshot should not export reason-code counts: {snapshot:?}"
-        );
-        assert!(
-            snapshot["blocking_issue_counts_by_server_kind"]
-                .as_object()
-                .expect("server-kind counts should serialize as object")
-                .is_empty(),
-            "ready env-backed snapshot should not export server-kind counts: {snapshot:?}"
-        );
-
-        let model = services
-            .get("model")
-            .expect("model cutover snapshot should exist");
-        let openai = model["checks"]
-            .as_array()
-            .expect("model checks should serialize as array")
-            .iter()
-            .find(|check| check["target"] == "openai-compatible")
-            .expect("env-backed openai-compatible cutover check should exist");
-        assert_eq!(openai["ok"], true);
-        assert_eq!(openai["model_contract"]["contract_ok"], true);
-
-        let request = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("http stub should receive env-backed provider request");
-        handle.join().expect("http stub should join");
-        assert_eq!(request.request_line, "POST /v1/chat/completions HTTP/1.1");
-        assert_eq!(
-            request.headers.get("authorization").map(String::as_str),
-            Some("Bearer test-key")
-        );
-        let body: Value = serde_json::from_str(&request.body).expect("request body should be json");
-        assert_eq!(body["model"], "gpt-test");
-
-        let mcp = services
-            .get("mcp")
-            .expect("mcp cutover snapshot should exist");
-        assert_eq!(mcp["service_ok"], true);
-        assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "ready");
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["route_target"],
-            "loopback-mcp-observability"
-        );
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["resolved_server"],
-            "loopback-mcp-observability"
-        );
-        assert_eq!(mcp["mcp_default_route_gate"]["contract_ok"], true);
     }
 
     #[tokio::test]
@@ -5597,787 +4847,6 @@ done
                 .get("model")
                 .is_none(),
             "环境变量种子写入数据源目录，具体模型选择归会话默认值"
-        );
-    }
-
-    #[tokio::test]
-    async fn daemon_router_bridge_cutover_smoke_surfaces_env_backed_provider_failure_with_ready_mcp_route()
-     {
-        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
-            let path = test_bridge_binary_path(binary_name);
-            assert!(
-                path.exists(),
-                "expected loopback binary {binary_name} at {}",
-                path.display()
-            );
-        }
-
-        let (base_url, receiver, handle) = spawn_http_stub(
-            401,
-            json!({
-                "error": {
-                    "message": "bad api key",
-                    "type": "invalid_request_error",
-                    "code": "invalid_api_key"
-                }
-            }),
-        );
-
-        let state_root = temp_state_root("router-bridge-cutover-env-failure");
-        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
-            .expect("runtime restore should load explicit test fixture");
-        let (app, _) = runtime.router_with_bridge_env_for_tests(
-            "daemon-test".to_string(),
-            &[
-                ("MAGI_OPENAI_COMPAT_BASE_URL", base_url.as_str()),
-                ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
-                ("MAGI_OPENAI_COMPAT_MODEL", "gpt-test"),
-                ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
-                (
-                    "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "loopback-mcp-observability",
-                ),
-                ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
-                (
-                    "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-                    "loopback-mcp-observability=healthy,loopback-mcp=healthy",
-                ),
-            ],
-        );
-
-        let snapshot = get_json(app, "/bridges/cutover-smoke").await;
-        let services = service_entries_by_kind(&snapshot);
-
-        assert_eq!(
-            snapshot["overall_ok"], false,
-            "unexpected cutover snapshot: {snapshot:?}"
-        );
-        assert_eq!(snapshot["blocking_check_count"], 2);
-        assert_eq!(
-            snapshot["blocking_issue_counts_by_reason_code"]["model_provider_rejected"],
-            2
-        );
-        assert_eq!(snapshot["blocking_issue_counts_by_server_kind"]["model"], 2);
-        assert!(
-            snapshot["blocking_issue_counts_by_server_kind"]
-                .get("mcp")
-                .is_none(),
-            "ready MCP route should not contribute blocking server-kind counts: {snapshot:?}"
-        );
-        assert!(
-            snapshot["blocking_services"]
-                .as_array()
-                .expect("blocking services should serialize as array")
-                .iter()
-                .any(|service| service == "model"),
-            "blocking summary should include model: {snapshot:?}"
-        );
-        assert_eq!(
-            snapshot["blocking_issues"].as_array().map(Vec::len),
-            Some(2)
-        );
-
-        let model = services
-            .get("model")
-            .expect("model cutover snapshot should exist");
-        let openai = model["checks"]
-            .as_array()
-            .expect("model checks should serialize as array")
-            .iter()
-            .find(|check| check["target"] == "openai-compatible")
-            .expect("env-backed openai-compatible cutover check should exist");
-        assert_eq!(model["service_ok"], false);
-        assert_eq!(openai["ok"], false);
-        assert_eq!(openai["blocking_reason"], "bridge invocation failed");
-        assert_eq!(openai["error"]["layer"], "RemoteBusiness");
-        assert_eq!(openai["error"]["code"], -32006);
-        assert!(
-            openai["error"]["message"]
-                .as_str()
-                .expect("model error should serialize as string")
-                .contains("桥接服务返回失败状态"),
-            "provider failure should expose public bridge error: {openai:?}"
-        );
-
-        let request = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("http stub should receive env-backed provider request");
-        let _direct_http_request = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("http stub should receive direct HTTP probe request");
-        handle.join().expect("http stub should join");
-        assert_eq!(request.request_line, "POST /v1/chat/completions HTTP/1.1");
-
-        let mcp = services
-            .get("mcp")
-            .expect("mcp cutover snapshot should exist");
-        assert_eq!(mcp["service_ok"], true);
-        assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "ready");
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["route_target"],
-            "loopback-mcp-observability"
-        );
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["resolved_server"],
-            "loopback-mcp-observability"
-        );
-        assert_eq!(mcp["mcp_default_route_gate"]["contract_ok"], true);
-        assert_eq!(mcp["checks"][0]["ok"], true);
-    }
-
-    #[tokio::test]
-    async fn daemon_router_bridge_cutover_smoke_surfaces_cataloged_degraded_provider_with_ready_mcp_route()
-     {
-        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
-            let path = test_bridge_binary_path(binary_name);
-            assert!(
-                path.exists(),
-                "expected loopback binary {binary_name} at {}",
-                path.display()
-            );
-        }
-
-        let state_root = temp_state_root("router-bridge-cutover-env-degraded-provider");
-        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
-            .expect("runtime restore should load explicit test fixture");
-        let (app, _) = runtime.router_with_bridge_env_for_tests(
-            "daemon-test".to_string(),
-            &[
-                ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
-                (
-                    "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "loopback-mcp-observability",
-                ),
-                ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
-                (
-                    "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-                    "loopback-mcp-observability=healthy,loopback-mcp=healthy",
-                ),
-            ],
-        );
-
-        let snapshot = get_json(app, "/bridges/cutover-smoke").await;
-        let services = service_entries_by_kind(&snapshot);
-
-        assert_eq!(
-            snapshot["overall_ok"], false,
-            "unexpected cutover snapshot: {snapshot:?}"
-        );
-        assert_eq!(snapshot["blocking_check_count"], 1);
-        assert_eq!(
-            snapshot["blocking_issue_counts_by_reason_code"]["model_provider_unavailable"],
-            1
-        );
-        assert_eq!(snapshot["blocking_issue_counts_by_server_kind"]["model"], 1);
-        assert!(
-            snapshot["blocking_issue_counts_by_server_kind"]
-                .get("mcp")
-                .is_none(),
-            "ready MCP route should not contribute blocking server-kind counts: {snapshot:?}"
-        );
-        assert!(
-            snapshot["blocking_services"]
-                .as_array()
-                .expect("blocking services should serialize as array")
-                .iter()
-                .any(|service| service == "model"),
-            "blocking summary should include model: {snapshot:?}"
-        );
-
-        let model = services
-            .get("model")
-            .expect("model cutover snapshot should exist");
-        let openai = model["checks"]
-            .as_array()
-            .expect("model checks should serialize as array")
-            .iter()
-            .find(|check| check["target"] == "openai-compatible")
-            .expect("cataloged degraded openai-compatible cutover check should exist");
-        assert_eq!(model["service_ok"], false);
-        assert_eq!(openai["ok"], false);
-        assert_eq!(openai["blocking_reason"], "bridge invocation failed");
-        assert_eq!(openai["error"]["layer"], "RemoteBusiness");
-        assert_eq!(openai["error"]["code"], -32003);
-        assert!(
-            openai["error"]["message"]
-                .as_str()
-                .expect("model error should serialize as string")
-                .contains("桥接服务返回失败状态"),
-            "degraded provider should expose public bridge error: {openai:?}"
-        );
-
-        let mcp = services
-            .get("mcp")
-            .expect("mcp cutover snapshot should exist");
-        assert_eq!(mcp["service_ok"], true);
-        assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "ready");
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["route_target"],
-            "loopback-mcp-observability"
-        );
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["resolved_server"],
-            "loopback-mcp-observability"
-        );
-        assert_eq!(mcp["mcp_default_route_gate"]["contract_ok"], true);
-        assert_eq!(mcp["checks"][0]["ok"], true);
-    }
-
-    #[tokio::test]
-    async fn daemon_router_bridge_cutover_smoke_surfaces_env_backed_provider_invalid_response_with_ready_mcp_route()
-     {
-        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
-            let path = test_bridge_binary_path(binary_name);
-            assert!(
-                path.exists(),
-                "expected loopback binary {binary_name} at {}",
-                path.display()
-            );
-        }
-
-        let (base_url, receiver, handle) = spawn_http_stub(
-            200,
-            json!({
-                "choices": [{
-                    "message": {}
-                }]
-            }),
-        );
-
-        let state_root = temp_state_root("router-bridge-cutover-env-invalid-response");
-        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
-            .expect("runtime restore should load explicit test fixture");
-        let (app, _) = runtime.router_with_bridge_env_for_tests(
-            "daemon-test".to_string(),
-            &[
-                ("MAGI_OPENAI_COMPAT_BASE_URL", base_url.as_str()),
-                ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
-                ("MAGI_OPENAI_COMPAT_MODEL", "gpt-test"),
-                ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
-                (
-                    "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "loopback-mcp-observability",
-                ),
-                ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
-                (
-                    "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-                    "loopback-mcp-observability=healthy,loopback-mcp=healthy",
-                ),
-            ],
-        );
-
-        let snapshot = get_json(app, "/bridges/cutover-smoke").await;
-        let services = service_entries_by_kind(&snapshot);
-
-        assert_eq!(
-            snapshot["overall_ok"], false,
-            "unexpected cutover snapshot: {snapshot:?}"
-        );
-        assert_eq!(snapshot["blocking_check_count"], 2);
-        assert_eq!(
-            snapshot["blocking_issue_counts_by_reason_code"]["model_provider_invalid_response"],
-            2
-        );
-        assert_eq!(snapshot["blocking_issue_counts_by_server_kind"]["model"], 2);
-        assert!(
-            snapshot["blocking_issue_counts_by_server_kind"]
-                .get("mcp")
-                .is_none(),
-            "ready MCP route should not contribute blocking server-kind counts: {snapshot:?}"
-        );
-        assert!(
-            snapshot["blocking_services"]
-                .as_array()
-                .expect("blocking services should serialize as array")
-                .iter()
-                .any(|service| service == "model"),
-            "blocking summary should include model: {snapshot:?}"
-        );
-        assert_eq!(
-            snapshot["blocking_issues"].as_array().map(Vec::len),
-            Some(2)
-        );
-
-        let model = services
-            .get("model")
-            .expect("model cutover snapshot should exist");
-        let openai = model["checks"]
-            .as_array()
-            .expect("model checks should serialize as array")
-            .iter()
-            .find(|check| check["target"] == "openai-compatible")
-            .expect("env-backed openai-compatible cutover check should exist");
-        assert_eq!(model["service_ok"], false);
-        assert_eq!(openai["ok"], false);
-        assert_eq!(openai["blocking_reason"], "bridge invocation failed");
-        assert_eq!(openai["error"]["layer"], "RemoteBusiness");
-        assert_eq!(openai["error"]["code"], -32007);
-        let error_message = openai["error"]["message"]
-            .as_str()
-            .expect("model error should serialize as string");
-        assert!(
-            error_message.contains("桥接服务返回失败状态"),
-            "invalid provider response should expose public bridge error: {openai:?}"
-        );
-
-        let request = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("http stub should receive env-backed provider request");
-        let _direct_http_request = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("http stub should receive direct HTTP probe request");
-        handle.join().expect("http stub should join");
-        assert_eq!(request.request_line, "POST /v1/chat/completions HTTP/1.1");
-
-        let mcp = services
-            .get("mcp")
-            .expect("mcp cutover snapshot should exist");
-        assert_eq!(mcp["service_ok"], true);
-        assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "ready");
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["route_target"],
-            "loopback-mcp-observability"
-        );
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["resolved_server"],
-            "loopback-mcp-observability"
-        );
-        assert_eq!(mcp["mcp_default_route_gate"]["contract_ok"], true);
-        assert_eq!(mcp["checks"][0]["ok"], true);
-    }
-
-    #[tokio::test]
-    async fn daemon_router_bridge_cutover_smoke_surfaces_env_backed_mcp_fallback_only_route() {
-        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
-            let path = test_bridge_binary_path(binary_name);
-            assert!(
-                path.exists(),
-                "expected loopback binary {binary_name} at {}",
-                path.display()
-            );
-        }
-
-        let (base_url, receiver, handle) = spawn_http_stub(
-            200,
-            json!({
-                "choices": [{
-                    "message": {
-                        "content": "hello from env-backed cutover smoke"
-                    }
-                }]
-            }),
-        );
-
-        let state_root = temp_state_root("router-bridge-cutover-env-fallback-only");
-        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
-            .expect("runtime restore should load explicit test fixture");
-        let (app, _) = runtime.router_with_bridge_env_for_tests(
-            "daemon-test".to_string(),
-            &[
-                ("MAGI_OPENAI_COMPAT_BASE_URL", base_url.as_str()),
-                ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
-                ("MAGI_OPENAI_COMPAT_MODEL", "gpt-test"),
-                ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
-                (
-                    "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "loopback-mcp-observability,loopback-mcp",
-                ),
-                ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
-                (
-                    "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-                    "loopback-mcp-observability=degraded,loopback-mcp=healthy",
-                ),
-            ],
-        );
-
-        let snapshot = get_json(app, "/bridges/cutover-smoke").await;
-        let services = service_entries_by_kind(&snapshot);
-
-        assert_eq!(
-            snapshot["overall_ok"], false,
-            "unexpected cutover snapshot: {snapshot:?}"
-        );
-        assert_eq!(snapshot["blocking_check_count"], 1);
-        assert_eq!(
-            snapshot["blocking_issue_counts_by_reason_code"]["mcp_default_route_status_fallback_only"],
-            1
-        );
-        assert_eq!(snapshot["blocking_issue_counts_by_server_kind"]["mcp"], 1);
-        assert!(
-            snapshot["blocking_issue_counts_by_server_kind"]
-                .get("model")
-                .is_none(),
-            "ready provider route should not contribute blocking server-kind counts: {snapshot:?}"
-        );
-        assert!(
-            snapshot["blocking_services"]
-                .as_array()
-                .expect("blocking services should serialize as array")
-                .iter()
-                .any(|service| service == "mcp"),
-            "blocking summary should include mcp: {snapshot:?}"
-        );
-        assert_eq!(
-            snapshot["blocking_issues"].as_array().map(Vec::len),
-            Some(1)
-        );
-
-        let model = services
-            .get("model")
-            .expect("model cutover snapshot should exist");
-        let openai = model["checks"]
-            .as_array()
-            .expect("model checks should serialize as array")
-            .iter()
-            .find(|check| check["target"] == "openai-compatible")
-            .expect("env-backed openai-compatible cutover check should exist");
-        assert_eq!(model["service_ok"], true);
-        assert_eq!(openai["ok"], true);
-        assert_eq!(openai["model_contract"]["contract_ok"], true);
-
-        let request = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("http stub should receive env-backed provider request");
-        handle.join().expect("http stub should join");
-        assert_eq!(request.request_line, "POST /v1/chat/completions HTTP/1.1");
-
-        let mcp = services
-            .get("mcp")
-            .expect("mcp cutover snapshot should exist");
-        assert_eq!(mcp["service_ok"], false);
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["route_status"],
-            "fallback-only"
-        );
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["route_target"],
-            "loopback-mcp-observability"
-        );
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["resolved_server"],
-            "loopback-mcp-observability"
-        );
-        assert_eq!(mcp["mcp_default_route_gate"]["contract_ok"], false);
-        assert_eq!(mcp["checks"][0]["ok"], false);
-        assert_eq!(
-            mcp["checks"][0]["blocking_reason"],
-            "default route is fallback-only"
-        );
-    }
-
-    #[tokio::test]
-    async fn daemon_router_bridge_cutover_smoke_surfaces_env_backed_mcp_unavailable_route() {
-        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
-            let path = test_bridge_binary_path(binary_name);
-            assert!(
-                path.exists(),
-                "expected loopback binary {binary_name} at {}",
-                path.display()
-            );
-        }
-
-        let (base_url, receiver, handle) = spawn_http_stub(
-            200,
-            json!({
-                "choices": [{
-                    "message": {
-                        "content": "hello from env-backed cutover smoke"
-                    }
-                }]
-            }),
-        );
-
-        let state_root = temp_state_root("router-bridge-cutover-env-unavailable");
-        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
-            .expect("runtime restore should load explicit test fixture");
-        let (app, _) = runtime.router_with_bridge_env_for_tests(
-            "daemon-test".to_string(),
-            &[
-                ("MAGI_OPENAI_COMPAT_BASE_URL", base_url.as_str()),
-                ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
-                ("MAGI_OPENAI_COMPAT_MODEL", "gpt-test"),
-                ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
-                (
-                    "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "loopback-mcp-observability",
-                ),
-                ("MAGI_MCP_MANAGER_DISABLED_SERVERS", "loopback-mcp"),
-                (
-                    "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-                    "loopback-mcp-observability=unavailable",
-                ),
-            ],
-        );
-
-        let snapshot = get_json(app, "/bridges/cutover-smoke").await;
-        let services = service_entries_by_kind(&snapshot);
-
-        assert_eq!(
-            snapshot["overall_ok"], false,
-            "unexpected cutover snapshot: {snapshot:?}"
-        );
-        assert_eq!(snapshot["blocking_check_count"], 1);
-        assert_eq!(
-            snapshot["blocking_issue_counts_by_reason_code"]["mcp_default_route_status_unavailable"],
-            1
-        );
-        assert_eq!(snapshot["blocking_issue_counts_by_server_kind"]["mcp"], 1);
-        assert!(
-            snapshot["blocking_issue_counts_by_server_kind"]
-                .get("model")
-                .is_none(),
-            "ready provider route should not contribute blocking server-kind counts: {snapshot:?}"
-        );
-        assert!(
-            snapshot["blocking_services"]
-                .as_array()
-                .expect("blocking services should serialize as array")
-                .iter()
-                .any(|service| service == "mcp"),
-            "blocking summary should include mcp: {snapshot:?}"
-        );
-        assert_eq!(
-            snapshot["blocking_issues"].as_array().map(Vec::len),
-            Some(1)
-        );
-
-        let model = services
-            .get("model")
-            .expect("model cutover snapshot should exist");
-        let openai = model["checks"]
-            .as_array()
-            .expect("model checks should serialize as array")
-            .iter()
-            .find(|check| check["target"] == "openai-compatible")
-            .expect("env-backed openai-compatible cutover check should exist");
-        assert_eq!(model["service_ok"], true);
-        assert_eq!(openai["ok"], true);
-        assert_eq!(openai["model_contract"]["contract_ok"], true);
-
-        let request = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("http stub should receive env-backed provider request");
-        handle.join().expect("http stub should join");
-        assert_eq!(request.request_line, "POST /v1/chat/completions HTTP/1.1");
-
-        let mcp = services
-            .get("mcp")
-            .expect("mcp cutover snapshot should exist");
-        assert_eq!(mcp["service_ok"], false);
-        assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "unavailable");
-        assert_eq!(mcp["mcp_default_route_gate"]["route_target"], "<none>");
-        assert!(mcp["mcp_default_route_gate"]["resolved_server"].is_null());
-        assert_eq!(mcp["mcp_default_route_gate"]["contract_ok"], false);
-        assert_eq!(mcp["checks"][0]["target"], "<none>");
-        assert_eq!(mcp["checks"][0]["ok"], false);
-        assert_eq!(
-            mcp["checks"][0]["blocking_reason"],
-            "default route is unavailable"
-        );
-    }
-
-    #[tokio::test]
-    async fn daemon_router_bridge_cutover_smoke_surfaces_env_backed_provider_transport_failure_with_ready_mcp_route()
-     {
-        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
-            let path = test_bridge_binary_path(binary_name);
-            assert!(
-                path.exists(),
-                "expected loopback binary {binary_name} at {}",
-                path.display()
-            );
-        }
-
-        // TCP port 0 不能作为远端监听端口。使用它能稳定得到连接失败，而不是先
-        // 释放一个临时端口再让并行测试或其他进程重新占用该地址。
-        let unreachable_url = "http://127.0.0.1:0/v1";
-
-        let state_root = temp_state_root("router-bridge-cutover-env-transport-failure");
-        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
-            .expect("runtime restore should load explicit test fixture");
-        let (app, _) = runtime.router_with_bridge_env_for_tests(
-            "daemon-test".to_string(),
-            &[
-                ("MAGI_OPENAI_COMPAT_BASE_URL", unreachable_url),
-                ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
-                ("MAGI_OPENAI_COMPAT_MODEL", "gpt-test"),
-                ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
-                (
-                    "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "loopback-mcp-observability",
-                ),
-                ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
-                (
-                    "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-                    "loopback-mcp-observability=healthy,loopback-mcp=healthy",
-                ),
-            ],
-        );
-
-        let snapshot = get_json(app, "/bridges/cutover-smoke").await;
-        let services = service_entries_by_kind(&snapshot);
-
-        assert_eq!(
-            snapshot["overall_ok"], false,
-            "unreachable provider should block cutover: {snapshot:?}"
-        );
-        assert_eq!(
-            snapshot["blocking_check_count"], 2,
-            "transport failure cutover snapshot should include bridge and provider checks: {snapshot:?}"
-        );
-        assert_eq!(
-            snapshot["blocking_issue_counts_by_reason_code"]["model_provider_transport_failed"], 2,
-            "provider transport failures should be counted by their provider reason code across bridge and direct HTTP checks: {snapshot:?}"
-        );
-        assert_eq!(snapshot["blocking_issue_counts_by_server_kind"]["model"], 2);
-        assert!(
-            snapshot["blocking_issue_counts_by_server_kind"]
-                .get("mcp")
-                .is_none(),
-            "ready MCP route should not contribute blocking server-kind counts: {snapshot:?}"
-        );
-        assert!(
-            snapshot["blocking_services"]
-                .as_array()
-                .expect("blocking services should serialize as array")
-                .iter()
-                .any(|service| service == "model"),
-            "blocking summary should include model: {snapshot:?}"
-        );
-        assert_eq!(
-            snapshot["blocking_issues"].as_array().map(Vec::len),
-            Some(2)
-        );
-
-        let model = services
-            .get("model")
-            .expect("model cutover snapshot should exist");
-        let openai = model["checks"]
-            .as_array()
-            .expect("model checks should serialize as array")
-            .iter()
-            .find(|check| check["target"] == "openai-compatible")
-            .expect("env-backed openai-compatible cutover check should exist");
-        assert_eq!(model["service_ok"], false);
-        assert_eq!(openai["ok"], false);
-        assert_eq!(openai["blocking_reason"], "bridge invocation failed");
-        assert_eq!(openai["error"]["layer"], "RemoteBusiness");
-        assert_eq!(openai["error"]["code"], -32005);
-        let error_message = openai["error"]["message"]
-            .as_str()
-            .expect("model error should serialize as string");
-        assert!(
-            error_message.contains("桥接服务返回失败状态"),
-            "transport failure should expose public bridge error: {openai:?}"
-        );
-
-        let mcp = services
-            .get("mcp")
-            .expect("mcp cutover snapshot should exist");
-        assert_eq!(mcp["service_ok"], true);
-        assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "ready");
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["route_target"],
-            "loopback-mcp-observability"
-        );
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["resolved_server"],
-            "loopback-mcp-observability"
-        );
-        assert_eq!(mcp["mcp_default_route_gate"]["contract_ok"], true);
-        assert_eq!(mcp["checks"][0]["ok"], true);
-    }
-
-    #[tokio::test]
-    async fn daemon_router_bridge_routes_do_not_touch_execution_state() {
-        let state_root = temp_state_root("router-bridge-guard");
-        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
-            .expect("runtime restore should load explicit test fixture");
-        let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
-
-        let before_runtime_read_model = serde_json::to_value(state.runtime_read_model_dto())
-            .expect("runtime read model should serialize");
-        let before_session_sidecars =
-            serde_json::to_value(state.session_store.execution_sidecar_exports())
-                .expect("session sidecars should serialize");
-        let before_workspace_sidecars =
-            serde_json::to_value(state.workspace_registry.recovery_sidecar_exports())
-                .expect("workspace sidecars should serialize");
-
-        let _ = get_json(app.clone(), "/bridges/preflight").await;
-        let _ = get_json(app, "/bridges/cutover-smoke").await;
-
-        assert_eq!(
-            serde_json::to_value(state.runtime_read_model_dto())
-                .expect("runtime read model should serialize"),
-            before_runtime_read_model
-        );
-        assert_eq!(
-            serde_json::to_value(state.session_store.execution_sidecar_exports())
-                .expect("session sidecars should serialize"),
-            before_session_sidecars
-        );
-        assert_eq!(
-            serde_json::to_value(state.workspace_registry.recovery_sidecar_exports())
-                .expect("workspace sidecars should serialize"),
-            before_workspace_sidecars
-        );
-
-        assert!(
-            state
-                .execution_pipeline()
-                .expect("execution pipeline should exist")
-                .memory_store
-                .extraction_results_for_session(&magi_core::SessionId::new("bridge-route-guard"))
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn daemon_exposes_bridge_diagnostics_outside_bootstrap() {
-        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
-            let path = test_bridge_binary_path(binary_name);
-            assert!(
-                path.exists(),
-                "expected loopback binary {binary_name} at {}",
-                path.display()
-            );
-        }
-
-        let state_root = temp_state_root("router-bootstrap-bridges");
-        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
-            .expect("runtime restore should load explicit test fixture");
-        let app = runtime
-            .router("daemon-test".to_string())
-            .expect("测试路由应成功构造");
-
-        let bootstrap = get_json(app.clone(), "/bootstrap?scope=personal").await;
-        let bridge_services = get_json(app.clone(), "/bridges/services").await;
-        let bridge_preflight = get_json(app, "/bridges/preflight").await;
-
-        assert!(bootstrap.get("bridgeServices").is_none());
-        assert!(bootstrap.get("bridgePreflight").is_none());
-
-        let services = service_entries_by_kind(&bridge_services);
-        assert_eq!(
-            services.len(),
-            2,
-            "unexpected bridge services: {bridge_services:?}"
-        );
-
-        let preflight = service_entries_by_kind(&bridge_preflight);
-        assert_eq!(
-            preflight.len(),
-            2,
-            "unexpected bridge preflight: {bridge_preflight:?}"
         );
     }
 }

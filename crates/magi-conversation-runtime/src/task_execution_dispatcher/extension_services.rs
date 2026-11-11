@@ -60,8 +60,7 @@ impl LlmTaskDispatcher {
             .and_then(Value::as_str)
             .map(|id| {
                 self.pipeline
-                    .execution_runtime
-                    .task_store()
+                    .task_store.as_ref()
                     .get_task(&TaskId::new(id))
                     .ok_or("调用任务不存在")
             })
@@ -120,8 +119,7 @@ impl LlmTaskDispatcher {
             .as_ref()
             .and_then(|task| {
                 self.pipeline
-                    .execution_runtime
-                    .task_store()
+                    .task_store.as_ref()
                     .get_active_lease(&task.task_id)
             })
             .map(|lease| lease.worker_id);
@@ -141,6 +139,7 @@ impl LlmTaskDispatcher {
         method: &str,
         mut params: Value,
         cancelled: Arc<AtomicBool>,
+        progress: Option<magi_extension_host::ServiceProgress>,
     ) -> Result<Value, String> {
         if method == "session.message" {
             return self
@@ -155,6 +154,14 @@ impl LlmTaskDispatcher {
             .unwrap_or(Value::Null);
         if cancelled.load(Ordering::Acquire) {
             return Err("Cancelled: 调用已取消".into());
+        }
+        if matches!(method, "model.selection" | "model.cancel")
+            || method == "model.invoke" && context.pointer("/owner/sessionId").is_none()
+        {
+            if context.get("activity").and_then(Value::as_str) != Some("route") {
+                return Err("ReentryDenied: 插件模型业务需要活动页面路由".into());
+            }
+            return self.plugin_model_service(plugin, method, params, cancelled, progress);
         }
         if method == "session.directory" {
             use magi_app_server_protocol::generated::{
@@ -325,6 +332,7 @@ impl LlmTaskDispatcher {
                     owner.task.as_ref().map(|t| &t.task_id),
                     &owner.thread,
                     &call,
+                    0,
                 )
                 .with_model_binding(self.settings_store.as_ref(), &binding);
                 let request = ModelInvocationRequest {
@@ -460,7 +468,7 @@ impl LlmTaskDispatcher {
         owner: &Owner,
         item: magi_session_store::ActiveExecutionTurnItem,
     ) -> Result<(), String> {
-        let store = self.pipeline.execution_runtime.task_store();
+        let store = self.pipeline.task_store.as_ref();
         let sink = crate::session_writeback::CanonicalTurnEventSink::new(
             &self.session_store,
             &self.event_bus,
@@ -560,7 +568,7 @@ impl LlmTaskDispatcher {
             .task
             .as_ref()
             .ok_or("该动作需要活动 Task；插件命令没有子任务归属")?;
-        let store = self.pipeline.execution_runtime.task_store();
+        let store = self.pipeline.task_store.as_ref();
         let lease = store
             .get_active_lease(&task.task_id)
             .ok_or("Task 执行租约已失效")?;

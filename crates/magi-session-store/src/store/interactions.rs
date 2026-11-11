@@ -40,44 +40,13 @@ impl SessionStore {
                         }
                     }
                 }
-                let mut projection = state.execution_sidecar_store.runtime_sidecar(session);
-                if let Some(sidecar) = projection.as_mut() {
-                    let current_id = sidecar
-                        .current_turn
-                        .as_ref()
-                        .map(|turn| turn.turn_id.as_str());
-                    if let Some(mutation) = mutations
-                        .iter()
-                        .find(|mutation| Some(mutation.next.turn_id.as_str()) == current_id)
-                    {
-                        super::sidecar::rebuild_sidecar_projection_from_canonical(
-                            sidecar,
-                            std::slice::from_ref(&mutation.next),
-                        )?;
-                    }
-                }
                 Ok(super::sidecar::CanonicalCommitPlan {
                     mutations,
                     acceptance: None,
-                    value: (value, notices, projection),
+                    value: (value, notices),
                 })
             },
-            |state, (value, notices, projection)| {
-                if let Some(projection) = projection
-                    && let Some(sidecar) = state
-                        .execution_sidecar_store
-                        .runtime_sidecars
-                        .iter_mut()
-                        .find(|sidecar| &sidecar.session_id == session)
-                {
-                    sidecar.current_turn = projection.current_turn;
-                    if let Some(chain) = sidecar.active_execution_chain.as_mut() {
-                        chain.current_turn = sidecar.current_turn.clone();
-                        chain.normalize();
-                    }
-                }
-                (value, notices)
-            },
+            |_state, value| value,
         )?;
         let observer = self
             .canonical_item_commit_observer

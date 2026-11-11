@@ -5,6 +5,7 @@ import { Context, Service } from '@deepseek-ai/cordis';
 import { pathToFileURL } from 'node:url';
 import { deepEqual, volatileEntries, updateVolatile } from '@deepseek-ai/cosmokit';
 import { LlmRuntime } from '@deepseek-ai/dsh-llm';
+import { SettingsConflictError } from '@deepseek-ai/dsh-settings';
 import { ToolExecutionPipeline } from '@deepseek-ai/dsh-tools/pipeline';
 import { runtimeId } from '../core/identity.mjs';
 import { toJsonSchema } from './settings-schema.mjs';
@@ -12,16 +13,20 @@ import { RuntimeCatalog } from './catalog.mjs';
 import { runRoute } from './routes.mjs';
 import { createRouteStreams, STREAM_ROUTE } from './route-streams.mjs';
 import { startOpenAiBridge } from './openai-bridge.mjs';
-import { requestAttachments, saveRequestImage, withRequestImages } from './attachments.mjs';
+import { scopedRequestImage, prepareRequestImage, saveRequestImage, withRequestImages } from './attachments.mjs';
 import { mountRemote } from './remote.mjs';
 import { createPluginManager } from './plugin-manager.mjs';
 import { configureProfile, withProfile as runProfile, loaderEntries, profilePath, createProfileReload } from './profile.mjs';
 import { createBackendSessions } from './backend-sessions.mjs';
 import { createRegisteredSettings } from './registered-settings.mjs';
 import { installRegistryFetch } from './registry-fetch.mjs';
+import { installNullableEvents } from './event-subscriptions.mjs';
 import { createPluginDirectory } from './plugin-directory.mjs';
 import { profilePackageManager } from './profile-process-host.mjs';
 import { withInvocation, invocationAgent } from './invocation.mjs';
+import { installNativeModel, NATIVE_MODEL_PROVIDER } from './native-model.mjs';
+import { installWeb } from './web.mjs';
+import { reasoningOf } from './reasoning.mjs';
 
 const clone = (value) => structuredClone(value ?? {});
 const timeoutOf = (value) => value == null ? undefined : Math.min(600_000, Math.max(1_000, Number(value) || 1_000));
@@ -29,12 +34,9 @@ const freeze = (value) => {
   if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); }
   return value;
 };
-const LOCAL_EVENTS = new Set(['loader/volatile-update', 'settings/updated', 'llm/adapters-updated', 'llm/models-updated', 'llm/stream', 'tools/change', 'tools/pre-execute', 'tools/execute', 'tools/post-execute', 'tools/result', 'system-prompt/change']);
-// DSH 的可选兼容分支会在 Magi 不提供对应事实时仍登记监听器。静态翻译报告
-// 已把这些事件标成 partial/optional；运行期必须保留“无事件可收”的降级，而不是
-// 因为一个可选 UI/会话观察器把整个插件判为失败。
-
+const LOCAL_EVENTS = new Set(['loader/volatile-update', 'settings/updated', 'settings/document-updated', 'llm/adapters-updated', 'llm/models-updated', 'llm/stream', 'tools/change', 'tools/pre-execute', 'tools/execute', 'tools/post-execute', 'tools/result', 'system-prompt/change']);
 export async function activateDsh(api, module, options) {
+  const settingsNamespace = options.settingsNamespace ?? options.plugin;
   if (options?.runtimeVersion !== 2) throw new Error('DSH 兼容包版本不受支持，请从上游来源重新安装');
   const upstream = module.default ?? module;
   let releaseRegistryFetch = () => {};
@@ -42,11 +44,14 @@ export async function activateDsh(api, module, options) {
   const sessions = options.readSessionDirectory ? createBackendSessions(api) : undefined;
   const ctx = new Context();
   const registeredSettings = createRegisteredSettings(api, options.settingsNamespaces, (ns, value) => ctx.emit('settings/updated', ns, value));
-  const withProfile = (callback, signal) => registeredSettings.run(() => sessions
+  const withProfile = (callback, signal) => registeredSettings.run(() => web ? web.run(() => withSessionProfile(callback, signal)) : withSessionProfile(callback, signal));
+  const withSessionProfile = (callback, signal) => sessions
     ? sessions.run(() => runProfile(callback, signal), signal)
-    : runProfile(callback, signal));
+    : runProfile(callback, signal);
+  let nativeModel, web;
   const registerRoute = (path, handler, options) => api.route(path,
-    (input, context) => withProfile(() => handler(input, context), context.signal), options);
+    (input, context) => withProfile(() => nativeModel
+      ? nativeModel.run(() => handler(input, context), context.signal) : handler(input, context), context.signal), options);
   // Cordis inject 是“服务出现时挂载”的条件 fiber；不能把可选分支的 PENDING 当成整包失败。
   const conditionalFibers = new Set();
   const inject = ctx.inject;
@@ -72,6 +77,7 @@ export async function activateDsh(api, module, options) {
   let catalogTimer;
   let configUpdates = Promise.resolve();
   const diagnostic = (message) => api.log(String(message));
+  installNullableEvents(ctx, options.nullableEvents, diagnostic);
   const pluginDirectory = createPluginDirectory(api, diagnostic);
   // 全局 internal/status 是跨插件的只读观察；真实本地 fiber 仍由 Cordis 派发。
   // 外部状态只交给观察者，不进入本实例的启动、失败或处置流程。
@@ -90,10 +96,6 @@ export async function activateDsh(api, module, options) {
   ctx.on('internal/listener', (name) => {
     if (typeof name !== 'string' || name.startsWith('internal/') || LOCAL_EVENTS.has(name)) return;
     if (/^(agent|session|turn|system-prompt|fs|approval)\//.test(name)) {
-      if (options?.optionalEvents?.includes(name)) {
-        diagnostic(`DSH 事件 ${name} 在 Magi 中没有对应事实，按可选兼容分支忽略`);
-        return;
-      }
       throw new Error(`尚未实现 DSH 宿主事件 ${name}，拒绝注册`);
     }
   });
@@ -223,10 +225,11 @@ export async function activateDsh(api, module, options) {
   const refresh = (snapshot) => {
     const operation = configUpdates.then(() => withProfile(() => applyConfig(snapshot)));
     configUpdates = operation.catch(() => {});
-    return operation.then((result) => { ctx.emit('settings/updated', options.plugin, clone(snapshot.value)); return result; });
+    return operation.then((result) => { ctx.emit('settings/updated', settingsNamespace, clone(snapshot.value)); ctx.emit('settings/document-updated', settingsNamespace, snapshot.version); return result; });
   };
-  const writeSettings = async (producer) => {
+  const writeSettings = async (producer, expectedRevision) => {
     const current = await api.settings.read();
+    if (expectedRevision !== undefined && expectedRevision !== current.version) throw new SettingsConflictError(settingsNamespace, expectedRevision, current.version);
     const next = producer(clone(current.value));
     checkConfig(next);
     await refresh(await api.settings.write(current.version, next));
@@ -234,18 +237,19 @@ export async function activateDsh(api, module, options) {
   await ctx.plugin(class extends Service {
     constructor(c) { super(c, 'settings'); }
     configure() { return this.ctx.effect(() => () => {}); }
-    describe() { return [{ ns: options.plugin, value: clone(rawConfig) }]; }
+    describe() { return [{ ns: settingsNamespace, value: clone(rawConfig), revision: version, schema: catalog.catalog.settingsSchema }, ...(web ? [web.describe()] : [])]; }
     register(ns, schema, presentation) { return registeredSettings.register(this.ctx, ns, schema, presentation); }
     get(ns) { return registeredSettings.get(ns); }
-    update(ns, patch) {
+    update(ns, patch, expectedRevision) {
       if (registeredSettings.has(ns)) return registeredSettings.update(ns, patch);
-      this.check(ns); return writeSettings((value) => ({ ...value, ...clone(patch) }));
+      this.check(ns); return writeSettings((value) => ({ ...value, ...clone(patch) }), expectedRevision);
     }
-    replace(ns, value) {
+    replace(ns, value, expectedRevision) {
       if (registeredSettings.has(ns)) return registeredSettings.replace(ns, value);
-      this.check(ns); return writeSettings(() => clone(value));
+      this.check(ns); return writeSettings(() => clone(value), expectedRevision);
     }
-    mutate(ns, operations) {
+    mutate(ns, operations, expectedRevision) {
+      if (ns === 'web' && web) return web.mutate(operations, expectedRevision);
       if (registeredSettings.has(ns)) return registeredSettings.mutate(ns, operations);
       this.check(ns);
       return writeSettings((value) => {
@@ -258,10 +262,11 @@ export async function activateDsh(api, module, options) {
           else throw new Error(`不支持的设置操作 ${op.op}`);
         }
         return value;
-      });
+      }, expectedRevision);
     }
-    check(ns) { if (ns !== options.plugin) throw new Error(`不能修改其他插件的配置：${ns}`); }
+    check(ns) { if (ns !== settingsNamespace) throw new Error(`不能修改其他插件的配置：${ns}`); }
   });
+  if (options.webProviders) web = await installWeb(ctx, api, catalog, ns => ctx.emit('settings/document-updated', ns), withProfile);
   await ctx.plugin(class extends Service {
     constructor(c) { super(c, 'attachments'); }
     async saveImage(input) {
@@ -273,12 +278,17 @@ export async function activateDsh(api, module, options) {
     }
     async readImage(ref, signal) {
       signal?.throwIfAborted?.();
+      const temporary = scopedRequestImage(ref, signal);
+      if (temporary) return temporary;
       if (!api.images?.read) throw new Error('daemon 未提供持久图片附件服务');
       const image = await api.images.read(ref?.attachmentId);
       signal?.throwIfAborted?.();
       return image;
     }
-    readImageRequest(...args) { return requestAttachments.readImageRequest(...args); }
+    async readImageRequest(ref, target, signal) {
+      const image = await this.readImage(ref, signal);
+      return prepareRequestImage(image.ref, image.data, target, signal);
+    }
     imageHostPath() { return undefined; }
     fileHostPath() { return undefined; }
   });
@@ -288,6 +298,7 @@ export async function activateDsh(api, module, options) {
     await api.on('prompt.contribute', (event, context) => withProfile(() => contribute(event, context), context.signal));
   }
   await ctx.plugin(LlmRuntime);
+  if (options.nativeModels) nativeModel = installNativeModel(ctx, api);
 
   // 路由在 daemon 已完成插件准入后才到达此连接。插件目录每次读 daemon，
   // 会话服务仅在安装包请求独立目录授权时出现；可选未支持分支继续缺席。
@@ -315,7 +326,7 @@ export async function activateDsh(api, module, options) {
   });
   const publish = async (revision) => {
     const obsolete = () => stopped || revision !== modelRevision;
-    const active = new Set(ctx.llm.listProviders().map((provider) => provider.id));
+    const active = new Set(ctx.llm.listProviders().map((provider) => provider.id).filter(id => id !== NATIVE_MODEL_PROVIDER));
     for (const [provider, release] of sourceReleases) {
       if (active.has(provider)) continue;
       await api.modelSource.clear(runtimeId('model', provider));
@@ -422,6 +433,7 @@ export async function activateDsh(api, module, options) {
         diagnostic(`DSH 可选注入未挂载，宿主缺少服务：${Object.keys(child.inject).join(', ')}`);
       }
     }
+    await web?.drain();
     await catalog.drain();
     await refreshModels();
     await pluginDirectory.refresh();
@@ -433,19 +445,4 @@ export async function activateDsh(api, module, options) {
     catalogTimer.unref();
     return { dispose };
   } catch (error) { await dispose(); throw error; }
-}
-
-const EFFORT_TO_MAGI = { off: 'none', none: 'none', minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max', ultra: 'ultra' };
-function reasoningOf(efforts, defaultEffort) {
-  const mapped = efforts.map((effort) => {
-    const value = EFFORT_TO_MAGI[effort];
-    if (!value) throw new Error(`推理档位 ${effort} 无法映射到 Magi 的档位枚举`);
-    return value;
-  });
-  const declared = { supportedEfforts: mapped, transport: 'openai', source: 'dsh' };
-  if (defaultEffort !== undefined) {
-    if (!EFFORT_TO_MAGI[String(defaultEffort)]) throw new Error(`默认推理档位 ${defaultEffort} 无法映射`);
-    declared.defaultEffort = EFFORT_TO_MAGI[String(defaultEffort)];
-  }
-  return declared;
 }

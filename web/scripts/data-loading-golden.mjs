@@ -65,18 +65,22 @@ await withGoldenViteServer(async server => {
 
   const approvals = await server.ssrLoadModule('/src/stores/external-approvals.svelte.ts');
   const approvalsPath = '/api/mcp-server/approvals';
+  const queueApprovalSnapshots = (...responses) => {
+    queue(approvalsPath, ...responses);
+    queue('/api/mcp-server/directory-requests', ...responses.map(() => () => json([])));
+  };
   const approval = { approvalId: 'approval-1', clientName: 'fixture', summary: 'read' };
-  queue(approvalsPath, () => { throw new TypeError('offline'); }, () => json({ approvals: [approval] }));
+  queueApprovalSnapshots(() => { throw new TypeError('offline'); }, () => json({ approvals: [approval] }));
   const stop = approvals.trackExternalApprovals();
   await tick();
   intervals.values().find(item => item.ms === 3000).fn();
   await tick();
   assert.equal(approvals.externalApprovals.approvals.length, 1, '首次网络失败后无需新事件就能重试');
-  queue(approvalsPath, () => json({ message: 'unavailable' }, 503));
+  queueApprovalSnapshots(() => json({ message: 'unavailable' }, 503));
   await approvals.refreshExternalApprovals();
   assert.equal(approvals.externalApprovals.approvals.length, 1, '503 保留待确认并继续跟踪');
   const staleApprovals = deferred();
-  queue(approvalsPath, () => staleApprovals.promise);
+  queueApprovalSnapshots(() => staleApprovals.promise);
   const staleRead = approvals.refreshExternalApprovals();
   const readsBeforeResolve = counts.get(approvalsPath);
   queue('/api/mcp-server/approvals/resolve', () => json({ approvals: [] }));
@@ -87,19 +91,19 @@ await withGoldenViteServer(async server => {
   assert.deepEqual(approvals.externalApprovals.approvals, [], '批准前发出的读取不能复活已处理审批');
   const resolving = deferred();
   queue('/api/mcp-server/approvals/resolve', () => resolving.promise);
-  queue(approvalsPath, () => json({ approvals: [approval] }));
+  queueApprovalSnapshots(() => json({ approvals: [approval] }));
   const resolveWithEvent = approvals.resolveExternalApproval(approval, 'allow_once');
   window.dispatchEvent(new Event('magi:mcp-approvals-changed'));
   resolving.resolve(json({ approvals: [] }));
   await resolveWithEvent;
   assert.equal(approvals.externalApprovals.approvals.length, 1, '处理期间收到新审批事件必须补读，不能被 busy 丢弃');
-  queue(approvalsPath, () => json({ message: 'forbidden' }, 403));
+  queueApprovalSnapshots(() => json({ message: 'forbidden' }, 403));
   await approvals.refreshExternalApprovals();
   const count = counts.get(approvalsPath);
   intervals.values().find(item => item.ms === 3000).fn();
   await tick();
   assert.equal(counts.get(approvalsPath), count, '无权限时停止轮询');
-  queue(approvalsPath, () => json({ approvals: [approval] }));
+  queueApprovalSnapshots(() => json({ approvals: [approval] }));
   window.dispatchEvent(new CustomEvent('magi-runtime-connection', { detail: { status: 'connected' } }));
   await tick();
   assert.equal(approvals.externalApprovals.approvals.length, 1, '重连后重新核对权限及待确认');
@@ -111,6 +115,7 @@ await withGoldenViteServer(async server => {
   const pluginResponse = manifestResponse => {
     queue(manifestsPath, manifestResponse);
     queue('/api/plugins/commands', () => json([]));
+    queue('/api/plugins', () => json({ plugins: [] }));
   };
   pluginResponse(() => json([plugin]));
   await registry.loadedPluginProjection();

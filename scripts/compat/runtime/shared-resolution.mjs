@@ -41,12 +41,12 @@ export function installSharedResolution(sharedRoot, aliases = {}) {
       if (fromUpstream && facades.has(specifier)) return nextResolve(fileURLToPath(facades.get(specifier)), context);
       // 共享目录里的包按 Node 默认规则解析自己的依赖（可能有嵌套版本）；只有来自上游代码的裸导入才重定向。
       const fromShared = context.parentURL === anchor || (typeof context.parentURL === 'string' && context.parentURL.startsWith(sharedPrefix));
-      // 主入口、子路径和 require.resolve 必须使用同一份隔离 peer。
+      // 主入口、子路径和 require.resolve 必须使用同一份隔离 Cordis/Schema 库。
       // 查找止于当前原包目录，不能被物理祖先目录或其他插件污染宿主。
-      if (fromUpstream && packageName(specifier) === '@deepseek-ai/cordis') {
+      if (fromUpstream && ['@deepseek-ai/cordis', '@deepseek-ai/schemastery'].includes(packageName(specifier))) {
         let directory = dirname(fileURLToPath(parent));
         while (directory === upstreamDirectory || directory.startsWith(upstreamDirectory + sep)) {
-          if (existsSync(join(directory, 'node_modules', '@deepseek-ai', 'cordis', 'package.json'))) return nextResolve(specifier, context);
+          if (existsSync(join(directory, 'node_modules', ...packageName(specifier).split('/'), 'package.json'))) return nextResolve(specifier, context);
           if (directory === upstreamDirectory) break;
           directory = dirname(directory);
         }

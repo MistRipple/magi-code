@@ -8,7 +8,10 @@ use magi_core::{
     TaskKind, TaskStatus, TaskTier, classify_public_task_failure, public_task_failure_is_degraded,
     public_task_output_refs,
 };
-use magi_session_store::{ActiveExecutionChain, ExecutionThread, ORCHESTRATOR_ROLE_ID};
+use magi_session_store::{
+    ActiveExecutionChain, CanonicalTurn, CanonicalTurnItemKind, CanonicalTurnStatus,
+    ExecutionThread, ORCHESTRATOR_ROLE_ID,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -224,6 +227,7 @@ fn agent_read_model_for_projection(
     session_threads: &[ExecutionThread],
     model_bindings: &HashMap<String, AgentModelBinding>,
     queue_reasons: &HashMap<String, String>,
+    turns: &[CanonicalTurn],
 ) -> Vec<AgentProjectionDto> {
     let branches_by_task = chain
         .map(|chain| {
@@ -264,6 +268,7 @@ fn agent_read_model_for_projection(
                 execution_chain_ref.as_deref(),
                 model_bindings,
                 queue_reasons,
+                turns,
             ));
         }
     }
@@ -280,6 +285,7 @@ fn agent_read_model_for_projection(
             execution_chain_ref.as_deref(),
             model_bindings,
             queue_reasons,
+            turns,
         ));
     }
 
@@ -304,6 +310,7 @@ fn agent_projection_from_task(
     execution_chain_ref: Option<&str>,
     model_bindings: &HashMap<String, AgentModelBinding>,
     queue_reasons: &HashMap<String, String>,
+    turns: &[CanonicalTurn],
 ) -> AgentProjectionDto {
     let role = thread
         .map(|thread| thread.role_id.as_str())
@@ -385,7 +392,7 @@ fn agent_projection_from_task(
         updated_at: thread
             .map(|thread| thread.last_used_at)
             .unwrap_or(task.updated_at),
-        result: agent_projection_result(task, thread),
+        result: agent_projection_result(task, thread, turns),
         transfer_request: None,
         execution_owner: None,
         transfer_unavailable_reason: None,
@@ -556,6 +563,7 @@ fn agent_lifecycle(task: &Task) -> &'static str {
 fn agent_projection_result(
     task: &Task,
     thread: Option<&ExecutionThread>,
+    turns: &[CanonicalTurn],
 ) -> Option<AgentProjectionResultDto> {
     if !matches!(
         task.status,
@@ -564,7 +572,7 @@ fn agent_projection_result(
         return None;
     }
     let raw = thread
-        .and_then(latest_assistant_text_from_thread)
+        .and_then(|thread| latest_assistant_text_from_turns(thread, turns))
         .or_else(|| {
             task.output_refs
                 .iter()
@@ -584,16 +592,31 @@ fn agent_projection_result(
     })
 }
 
-fn latest_assistant_text_from_thread(thread: &ExecutionThread) -> Option<String> {
-    thread
-        .message_history
+fn latest_assistant_text_from_turns(
+    thread: &ExecutionThread,
+    turns: &[CanonicalTurn],
+) -> Option<String> {
+    turns
         .iter()
-        .rev()
-        .find(|message| message.role.trim().eq_ignore_ascii_case("assistant"))
-        .and_then(|message| message.content.as_deref())
-        .map(str::trim)
-        .filter(|content| !content.is_empty())
-        .map(ToString::to_string)
+        .filter(|turn| {
+            turn.session_id == thread.session_id
+                && turn.status != CanonicalTurnStatus::Superseded
+                && !turn.is_session_command()
+        })
+        .flat_map(|turn| turn.items.iter().map(move |item| (turn.turn_seq, item)))
+        .filter(|(_, item)| {
+            item.source_thread_id == thread.thread_id
+                && item.kind == CanonicalTurnItemKind::AssistantText
+        })
+        .filter_map(|(seq, item)| {
+            item.content
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(|text| ((seq, item.item_seq), text))
+        })
+        .max_by_key(|(order, _)| *order)
+        .map(|(_, text)| text.to_string())
 }
 
 fn text_from_output_ref(output: &str) -> Option<String> {
@@ -699,6 +722,9 @@ async fn get_agent_run_projection(
         &session_threads,
         &agent_model_bindings,
         &queue_reasons,
+        &state
+            .session_store
+            .canonical_turns_for_session(&scope.execution.session_id),
     );
     for agent in &mut agents {
         if let Some(task) = projection
@@ -790,7 +816,10 @@ fn recoverable_branch_count(
     session_id: &magi_core::SessionId,
     root_task_id: &TaskId,
 ) -> usize {
-    let Some(chain) = state.session_store.active_execution_chain(session_id) else {
+    let Some(sidecar) = state.session_store.runtime_sidecar(session_id) else {
+        return 0;
+    };
+    let Some(chain) = sidecar.active_execution_chain.as_ref() else {
         return 0;
     };
     if &chain.root_task_id != root_task_id {
@@ -800,7 +829,12 @@ fn recoverable_branch_count(
         .branches
         .iter()
         .filter(|branch| {
-            active_execution_branch_is_continue_recoverable(state.task_store(), &chain, branch)
+            active_execution_branch_is_continue_recoverable(
+                state.task_store(),
+                chain,
+                sidecar.current_turn.as_ref(),
+                branch,
+            )
         })
         .count()
 }
@@ -1027,7 +1061,6 @@ mod tests {
             last_used_at: UtcMillis(2),
             observed_context_window_tokens: None,
             handled_task_ids: vec![task.task_id.clone()],
-            message_history: Vec::new(),
         };
         let projection = agent_projection_from_task(
             &task,
@@ -1036,6 +1069,7 @@ mod tests {
             None,
             &HashMap::new(),
             &HashMap::new(),
+            &[],
         );
 
         assert_eq!(projection.status, "completed");
@@ -1080,7 +1114,7 @@ mod tests {
         child.output_refs = vec![
             serde_json::json!({
                 "blocks": [
-                    { "type": "text", "content": "旧 task output，不应覆盖 thread transcript。" }
+                    { "type": "text", "content": "旧 task output，不应覆盖 canonical 结果。" }
                 ]
             })
             .to_string(),
@@ -1109,33 +1143,21 @@ mod tests {
             root_task_id: root_id.clone(),
             execution_chain_ref: "chain-agent-read-model".to_string(),
             workspace_id: None,
-            active_branch_task_ids: vec![child_id.clone()],
-            active_worker_bindings: vec![magi_core::WorkerId::new("worker-agent-child")],
             branches: vec![magi_session_store::ActiveExecutionBranch {
                 task_id: child_id.clone(),
                 worker_id: magi_core::WorkerId::new("worker-agent-child"),
-                stage: "execute".to_string(),
-                lease_id: None,
-                execution_intent_ref: None,
-                binding_lifecycle: None,
-                checkpoint_stage: Some("execute".to_string()),
-                next_step_index: Some(0),
-                checkpoint_at: Some(UtcMillis(11)),
-                resume_mode: Some("stage-restart".to_string()),
-                resume_token: None,
                 use_tools: true,
                 skill_name: None,
                 is_primary: false,
                 thread_id: magi_core::ThreadId::new("thread-agent-child"),
             }],
-            recovery_ref: None,
             dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
                 accepted_at: UtcMillis(1),
                 entry_id: "entry-agent-read-model".to_string(),
                 trimmed_text: Some("测试代理读模型".to_string()),
                 skill_name: None,
             },
-            current_turn: None,
+            current_turn_id: None,
         };
         let session_threads = vec![ExecutionThread {
             thread_id: magi_core::ThreadId::new("thread-agent-child"),
@@ -1148,15 +1170,6 @@ mod tests {
             last_used_at: UtcMillis(21),
             observed_context_window_tokens: None,
             handled_task_ids: vec![child_id.clone()],
-            message_history: vec![magi_session_store::ThreadChatMessage {
-                input_request_id: None,
-                role: "assistant".to_string(),
-                content: Some("代理完成：thread transcript 是权威结果。".to_string()),
-                images: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                provider_context: Vec::new(),
-            }],
         }];
 
         let mut model_bindings = HashMap::new();
@@ -1169,12 +1182,28 @@ mod tests {
             },
         );
 
+        let make_turn = |id: &str, seq, status, text: &str| {
+            serde_json::from_value(serde_json::json!({
+                "sessionId": session_id, "turnId": id, "turnSeq": seq,
+                "acceptedAt": 1, "completedAt": 2, "status": status,
+                "items": [{"sessionId": session_id, "turnId": id, "turnSeq": seq,
+                    "itemId": format!("{id}-output"), "itemSeq": 1,
+                    "sourceThreadId": session_threads[0].thread_id, "kind": "assistant_text",
+                    "status": "completed", "createdAt": 1, "updatedAt": 2, "content": text}],
+            }))
+            .unwrap()
+        };
+        let turns = vec![
+            make_turn("result", 1, "completed", "代理完成：canonical 是权威结果。"),
+            make_turn("superseded", 2, "superseded", "已废弃的回复"),
+        ];
         let agents = agent_read_model_for_projection(
             &projection,
             Some(&chain),
             &session_threads,
             &model_bindings,
             &HashMap::new(),
+            &turns,
         );
 
         assert_eq!(agents.len(), 1);
@@ -1206,6 +1235,7 @@ mod tests {
             None,
             &model_bindings,
             &HashMap::new(),
+            &turns,
         );
         assert_eq!(frozen_agent.model.as_deref(), Some("o3-mini"));
         assert_eq!(frozen_agent.engine_id.as_deref(), Some("original-engine"));
@@ -1227,7 +1257,7 @@ mod tests {
                 .result
                 .as_ref()
                 .map(|result| result.final_text.as_str()),
-            Some("代理完成：thread transcript 是权威结果。")
+            Some("代理完成：canonical 是权威结果。")
         );
     }
 
@@ -1447,7 +1477,7 @@ mod tests {
                 Some(workspace_a.to_string()),
             )
             .expect("session should create");
-        state.session_store.bind_execution_ownership(
+        state.session_store.bind_execution_ownership_for_test(
             session_id.clone(),
             ExecutionOwnership {
                 session_id: Some(session_id.clone()),
@@ -1519,7 +1549,7 @@ mod tests {
             .session_store
             .create_session(session_id.clone(), "个人任务会话")
             .expect("personal session should create");
-        state.session_store.bind_execution_ownership(
+        state.session_store.bind_execution_ownership_for_test(
             session_id.clone(),
             ExecutionOwnership {
                 session_id: Some(session_id.clone()),

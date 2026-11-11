@@ -47,13 +47,12 @@ await withGoldenViteServer(async server => {
   const appearance = await server.ssrLoadModule('/src/appearance/contract.ts');
   const { formatDuration } = await server.ssrLoadModule('/src/lib/utils.ts');
   try {
-    for (const [locale, status, taskName, themeName] of [
-      ['zh-CN', '执行中', '未命名任务', 'Magi 深色'],
-      ['en-US', 'Running', 'Untitled task', 'Magi Dark'],
-      ['zh-CN', '执行中', '未命名任务', 'Magi 深色'],
+    for (const [locale, taskName, themeName] of [
+      ['zh-CN', '未命名任务', 'Magi 深色'],
+      ['en-US', 'Untitled task', 'Magi Dark'],
+      ['zh-CN', '未命名任务', 'Magi 深色'],
     ]) {
       i18n.setLocale(locale);
-      assert.equal(labels.getTaskStatusLabel('running'), status, '切换语言必须即时更新状态');
       assert.equal(labels.getTaskDisplayTitle({ title: '' }), taskName);
       assert.equal(labels.getTaskDisplayTitle({ title: '用户的中文标题' }), '用户的中文标题', '用户内容保持原样');
       assert.equal(themes.themeDisplayName({ id: 'builtin.dark', name: 'Magi 深色' }), themeName);
@@ -61,11 +60,6 @@ await withGoldenViteServer(async server => {
       assert.equal(formatDuration(68_000, (key, vars) => i18n.t(key, vars)), locale === 'en-US' ? '1min8sec' : '1分8秒');
       assert.throws(() => appearance.normalizeAppearanceSnapshot(null),
         locale === 'en-US' ? /Invalid appearance state/ : /外观状态格式无效/);
-      for (const kind of labels.USER_VISIBLE_TASK_KINDS) {
-        const label = labels.getTaskKindLabel(kind);
-        if (locale === 'en-US') assert.doesNotMatch(label, /[\u4e00-\u9fff]/u);
-      }
-      assert.equal(labels.getRunnerUserState('error'), 'finished', '本地化不得改变业务枚举');
     }
   } finally { i18n.setLocale('zh-CN'); }
 }, { plugins: [svelte()] });

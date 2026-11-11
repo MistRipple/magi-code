@@ -16,8 +16,17 @@ use std::{
     },
 };
 
-pub(super) type NativeService =
-    Arc<dyn Fn(String, String, Value, Arc<AtomicBool>) -> Result<Value, RpcError> + Send + Sync>;
+pub(super) type NativeService = Arc<
+    dyn Fn(
+            String,
+            String,
+            Value,
+            Arc<AtomicBool>,
+            Option<magi_extension_host::ServiceProgress>,
+        ) -> Result<Value, RpcError>
+        + Send
+        + Sync,
+>;
 
 pub(super) struct PluginHostService {
     pub manager: Arc<Mutex<PluginManager>>,
@@ -113,7 +122,10 @@ impl PluginHostService {
             }
             return Ok(());
         }
-        if !matches!(method, "model.invoke" | "credential.ref") {
+        if !matches!(
+            method,
+            "model.invoke" | "model.selection" | "model.cancel" | "credential.ref"
+        ) {
             return Ok(());
         }
         // models 授权只描述 Magi 管理的模型连接，不是 Node 的网络隔离。
@@ -221,6 +233,7 @@ impl HostService for PluginHostService {
         method: String,
         params: Value,
         cancelled: Arc<AtomicBool>,
+        progress: Option<magi_extension_host::ServiceProgress>,
     ) -> BoxFuture<Result<Value, RpcError>> {
         if let Err(error) = self.service_admitted(&plugin_id, &method, &params) {
             return Box::pin(async { Err(error) });
@@ -257,6 +270,8 @@ impl HostService for PluginHostService {
         if !matches!(
             method.as_str(),
             "model.invoke"
+                | "model.selection"
+                | "model.cancel"
                 | "task.spawn"
                 | "ask.user"
                 | "notify.user"
@@ -265,14 +280,29 @@ impl HostService for PluginHostService {
         ) {
             return self.request_with_identity(plugin_id, method, params);
         }
+        let mut params = params;
+        if matches!(method.as_str(), "model.selection" | "model.cancel")
+            || method == "model.invoke" && params.pointer("/_context/owner/sessionId").is_none()
+        {
+            let name = self.manager.lock().ok().and_then(|manager| {
+                manager
+                    .package(&plugin_id)
+                    .ok()
+                    .map(|package| package.manifest().name.clone())
+            });
+            params["_modelOwner"] = json!({"pluginId":plugin_id,"digest":self.digest,
+                "instanceId":params.get("_instance").and_then(Value::as_str),"displayName":name});
+        }
         let params = native_params(params);
         let native = self.native.get().cloned();
         Box::pin(async move {
             let native =
                 native.ok_or_else(|| RpcError::new(ErrorKind::HostGone, "原生业务服务未就绪"))?;
-            tokio::task::spawn_blocking(move || native(plugin_id, method, params, cancelled))
-                .await
-                .map_err(|e| RpcError::new(ErrorKind::Internal, e.to_string()))?
+            tokio::task::spawn_blocking(move || {
+                native(plugin_id, method, params, cancelled, progress)
+            })
+            .await
+            .map_err(|e| RpcError::new(ErrorKind::Internal, e.to_string()))?
         })
     }
 
@@ -400,7 +430,7 @@ impl HostService for PluginHostService {
             return Box::pin(async move {
                 let native = native
                     .ok_or_else(|| RpcError::new(ErrorKind::HostGone, "原生业务服务未就绪"))?;
-                native(plugin_id, method, params, Arc::default())
+                native(plugin_id, method, params, Arc::default(), None)
             });
         }
         let lease = params
@@ -459,6 +489,23 @@ impl HostService for PluginHostService {
                     .call(&mut manager_guard, &plugin_id, lease, &method, params);
             }
             let result = match method.as_str() {
+                "web.read" => {
+                    return serde_json::to_value(manager_guard.web_configuration())
+                        .map_err(|error| RpcError::new(ErrorKind::Internal, error.to_string()));
+                }
+                "web.configure" => {
+                    let input = serde_json::from_value(params).map_err(|error| {
+                        RpcError::new(ErrorKind::InvalidParams, error.to_string())
+                    })?;
+                    let lease = lease.as_deref().ok_or_else(|| {
+                        RpcError::new(ErrorKind::StaleGeneration, "联网配置需要实例租约")
+                    })?;
+                    let result = manager_guard
+                        .configure_web(&plugin_id, lease, input)
+                        .map_err(map_error)?;
+                    return serde_json::to_value(result)
+                        .map_err(|error| RpcError::new(ErrorKind::Internal, error.to_string()));
+                }
                 "plugins.list" => {
                     let request: magi_app_server_protocol::generated::PluginListRequest =
                         serde_json::from_value(params).map_err(|error| {
@@ -1121,6 +1168,7 @@ mod tests {
                     "sessionId": "other-session"
                 }),
                 Arc::default(),
+                None,
             )
             .await
             .unwrap_err();
@@ -1131,6 +1179,7 @@ mod tests {
                 "session.snapshot".into(),
                 json!({"sessionId": "signed-session"}),
                 Arc::default(),
+                None,
             )
             .await
             .unwrap_err();
@@ -1143,7 +1192,7 @@ mod tests {
         assert!(
             service
                 .native
-                .set(Arc::new(|_, method, params, _| {
+                .set(Arc::new(|_, method, params, _, _| {
                     assert_eq!(method, "session.directory");
                     assert!(params.get("_instance").is_none());
                     Ok(json!({"sessions":[],"hasMore":false,"nextAfterSessionId":null}))
@@ -1232,7 +1281,7 @@ mod tests {
         assert!(
             service
                 .native
-                .set(Arc::new(move |_, _, params, _| {
+                .set(Arc::new(move |_, _, params, _, _| {
                     assert!(params.get("_instance").is_none());
                     assert_eq!(
                         params.pointer("/_context/owner/sessionId"),
@@ -1257,6 +1306,7 @@ mod tests {
                     method.into(),
                     params.clone(),
                     Arc::default(),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1269,7 +1319,8 @@ mod tests {
                     "acme.services".into(),
                     "notify.user".into(),
                     params,
-                    Arc::default()
+                    Arc::default(),
+                    None
                 )
                 .await
                 .is_err()
@@ -1286,6 +1337,7 @@ mod tests {
                 "model.invoke".into(),
                 json!({"prompt":"hello"}),
                 Arc::default(),
+                None,
             )
             .await
             .unwrap_err();

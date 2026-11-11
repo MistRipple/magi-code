@@ -9,6 +9,10 @@ export function createResourceUrls(baseUri, resourceBase, staticFiles = []) {
     const url = new URL(input, base);
     if (url.origin === gateway.origin && url.pathname.startsWith(gateway.pathname)) {
       url.pathname = '/' + url.pathname.slice(gateway.pathname.length);
+    } else if (url.origin === base.origin && url.pathname.startsWith(directory)) {
+      // 原包也会以 document.baseURI 构造业务 URL；移除 Magi 生成的文档目录，
+      // 与资源入口恢复到同一原包路由命名空间，不把 ui-v/... 送给后台。
+      url.pathname = '/' + url.pathname.slice(directory.length);
     }
     return url;
   };

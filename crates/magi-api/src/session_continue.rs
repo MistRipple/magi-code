@@ -1,6 +1,6 @@
 //! 继续会话 API 适配层。
 //!
-//! 纯判定、校验、writeback 落盘、branch checkpoint 同步和子树解封逻辑已下沉到
+//! 纯判定、校验、writeback 落盘、子树解封逻辑已下沉到
 //! `magi_conversation_runtime::execution_chain_recovery`；本模块只负责把 `ApiState`
 //! 持有的 runner、task store 与 execution registry 装配给 runtime 恢复流程。
 
@@ -13,20 +13,17 @@ use magi_conversation_runtime::{
     SessionTurnCoordinator, TurnAdmission, TurnAttempt, TurnCommand,
     execution_chain_recovery::{
         apply_chain_recovery_if_needed, commit_chain_recovery, fail_resumed_execution_paths,
-        release_resumed_branch_path, sync_branch_checkpoint_to_worker_runtime,
+        release_resumed_branch_path,
     },
-    session_images::SessionTurnImage,
     task_execution_registry::TaskExecutionPlan,
 };
 use magi_core::{
-    SessionId, SessionLifecycleStatus, TaskExecutionTarget, TaskStatus, ThreadId, UtcMillis,
-    WorkerId,
+    SessionId, SessionLifecycleStatus, TaskExecutionTarget, TaskStatus, UtcMillis, WorkerId,
 };
 use magi_orchestrator::ExecutionWritebackPlans;
 use magi_session_store::{
-    ActiveExecutionBranch, ActiveExecutionChain, CanonicalTurn, CanonicalTurnItemKind,
-    ExecutionThread, ExecutionThreadStatus, InterruptedGoalResumeCheckpoint, SessionStore,
-    ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction,
+    ActiveExecutionBranch, ActiveExecutionChain, ExecutionThread, ExecutionThreadStatus,
+    InterruptedGoalResumeCheckpoint, SessionStore,
 };
 use magi_settings_store::SettingsStore;
 use std::sync::Arc;
@@ -368,6 +365,7 @@ fn fail_prepared_continue_turn(state: &ApiState, session_id: &SessionId, turn_id
 fn rebuild_dispatch_plan_for_branch(
     chain: &ActiveExecutionChain,
     branch: &ActiveExecutionBranch,
+    recovery_id: Option<String>,
     turn_id: &str,
     execution_root: Option<std::path::PathBuf>,
     execution_settings_snapshot: Option<Arc<SettingsStore>>,
@@ -393,7 +391,7 @@ fn rebuild_dispatch_plan_for_branch(
             root_task_id: chain.root_task_id.clone(),
             task_id: branch.task_id.clone(),
             requested_worker_id: Some(branch.worker_id.clone()),
-            recovery_id: chain.recovery_ref.clone(),
+            recovery_id,
             execution_chain_ref: Some(chain.execution_chain_ref.clone()),
         },
         worker_id: branch.worker_id.clone(),
@@ -411,153 +409,32 @@ fn rebuild_dispatch_plan_for_branch(
     }
 }
 
-fn canonical_value_text(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(text) => text.clone(),
-        _ => value.to_string(),
-    }
-}
-
-fn rebuild_thread_history_from_canonical(
-    turns: &[CanonicalTurn],
-    thread_id: &ThreadId,
-) -> Result<Vec<ThreadChatMessage>, ApiError> {
-    let mut history = Vec::new();
-    for item in turns
-        .iter()
-        .filter(|turn| !turn.is_session_command())
-        .flat_map(|turn| turn.items.iter())
-        .filter(|item| &item.source_thread_id == thread_id)
-    {
-        match item.kind {
-            CanonicalTurnItemKind::UserMessage => {
-                if item
-                    .content
-                    .as_deref()
-                    .is_some_and(|content| !content.trim().is_empty())
-                {
-                    history.push(ThreadChatMessage {
-                        input_request_id: None,
-                        role: "user".to_string(),
-                        content: item.content.clone(),
-                        images: Vec::new(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                        provider_context: Vec::new(),
-                    });
-                }
-            }
-            CanonicalTurnItemKind::AssistantText => {
-                if item
-                    .content
-                    .as_deref()
-                    .is_some_and(|content| !content.trim().is_empty())
-                {
-                    history.push(ThreadChatMessage {
-                        input_request_id: None,
-                        role: "assistant".to_string(),
-                        content: item.content.clone(),
-                        images: Vec::new(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                        provider_context: Vec::new(),
-                    });
-                }
-            }
-            CanonicalTurnItemKind::ToolCall => {
-                let Some(tool) = item.tool.as_ref() else {
-                    continue;
-                };
-                let arguments = tool
-                    .arguments
-                    .as_ref()
-                    .map(canonical_value_text)
-                    .unwrap_or_else(|| "{}".to_string());
-                history.push(ThreadChatMessage {
-                    input_request_id: None,
-                    role: "assistant".to_string(),
-                    content: None,
-                    images: Vec::new(),
-                    tool_calls: vec![ThreadChatToolCall {
-                        id: tool.call_id.clone(),
-                        kind: "function".to_string(),
-                        function: ThreadChatToolFunction {
-                            name: tool.name.clone(),
-                            arguments,
-                        },
-                    }],
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                });
-                let question_result = item
-                    .user_question()
-                    .map_err(|error| ApiError::internal_assembly("恢复提问失败", error))?
-                    .and_then(|question| question.result_payload());
-                let result = question_result
-                    .as_ref()
-                    .or(tool.result.as_ref())
-                    .map(canonical_value_text)
-                    .or_else(|| {
-                        tool.error.as_ref().map(|error| {
-                            serde_json::json!({
-                                "tool": tool.name,
-                                "status": "failed",
-                                "error": error,
-                            })
-                            .to_string()
-                        })
-                    })
-                    .unwrap_or_else(|| {
-                        serde_json::json!({
-                            "tool": tool.name,
-                            "status": "interrupted",
-                            "reason": "recovered_thread_history_without_tool_result",
-                        })
-                        .to_string()
-                    });
-                history.push(ThreadChatMessage {
-                    input_request_id: None,
-                    role: "tool".to_string(),
-                    content: Some(result),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: Some(tool.call_id.clone()),
-                    provider_context: Vec::new(),
-                });
-            }
-            CanonicalTurnItemKind::AssistantThinking
-            | CanonicalTurnItemKind::TaskStatus
-            | CanonicalTurnItemKind::SystemNotice => {}
-        }
-    }
-    Ok(history)
-}
-
-pub(crate) fn restore_missing_resumed_branch_threads(
+pub(crate) fn restore_resumed_branch_threads(
     state: &ApiState,
     session_id: &SessionId,
     chain: &ActiveExecutionChain,
     branches: &[ActiveExecutionBranch],
 ) -> Result<Vec<ExecutionThread>, ApiError> {
-    let registered_threads = state.session_store.thread_registry_snapshot(session_id);
-    let missing_branches = branches
-        .iter()
-        .filter(|branch| {
-            !registered_threads
-                .iter()
-                .any(|thread| thread.thread_id == branch.thread_id)
-        })
-        .collect::<Vec<_>>();
-    if missing_branches.is_empty() {
-        return Ok(Vec::new());
+    if &chain.session_id != session_id {
+        return Err(ApiError::internal_assembly(
+            "继续会话失败",
+            "恢复执行链不属于当前会话",
+        ));
     }
-
+    let registered_threads = state.session_store.thread_registry_snapshot(session_id);
     let task_store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("继续会话失败", "task_store 未配置"))?;
     let canonical_turns = state.session_store.canonical_turns_for_session(session_id);
-    let mut threads_to_register = Vec::with_capacity(missing_branches.len());
-    for branch in &missing_branches {
+    let mut threads_to_register = Vec::new();
+    let mut branch_threads = std::collections::HashSet::new();
+    for branch in branches {
+        if !branch_threads.insert(&branch.thread_id) {
+            return Err(ApiError::internal_assembly(
+                "继续会话失败",
+                format!("恢复分支重复使用 thread: {}", branch.thread_id),
+            ));
+        }
         let task = task_store.get_task(&branch.task_id).ok_or_else(|| {
             ApiError::not_found("恢复 branch 任务不存在", branch.task_id.as_str())
         })?;
@@ -566,6 +443,28 @@ pub(crate) fn restore_missing_resumed_branch_threads(
                 "继续会话失败",
                 format!("恢复 branch 不属于当前执行链: {}", branch.task_id),
             ));
+        }
+        if let Some(thread) = registered_threads
+            .iter()
+            .find(|thread| thread.thread_id == branch.thread_id)
+        {
+            // 主线 thread 归 Session 所有，常驻 worker 身份不等于本次派发 worker；
+            // 独立任务 thread 才由 branch worker 独占。
+            let owner_matches = if thread.role_id == magi_session_store::ORCHESTRATOR_ROLE_ID {
+                branch.is_primary && task.executor_binding_target_role() == Some("coordinator")
+            } else {
+                thread.worker_instance_id == branch.worker_id
+            };
+            if thread.mission_id != chain.mission_id
+                || !owner_matches
+                || !thread.handled_task_ids.contains(&branch.task_id)
+            {
+                return Err(ApiError::internal_assembly(
+                    "继续会话失败",
+                    format!("恢复分支 thread 归属不匹配: {}", branch.thread_id),
+                ));
+            }
+            continue;
         }
         let created_at = canonical_turns
             .iter()
@@ -588,20 +487,11 @@ pub(crate) fn restore_missing_resumed_branch_threads(
             last_used_at: UtcMillis::now(),
             observed_context_window_tokens: None,
             handled_task_ids: vec![branch.task_id.clone()],
-            message_history: rebuild_thread_history_from_canonical(
-                &canonical_turns,
-                &branch.thread_id,
-            )?,
         };
-        if threads_to_register
-            .iter()
-            .any(|existing: &ExecutionThread| existing.thread_id == thread.thread_id)
-        {
-            return Err(ApiError::internal_assembly(
-                "继续会话失败",
-                format!("恢复分支重复使用 thread: {}", thread.thread_id),
-            ));
-        }
+        state
+            .session_store
+            .canonical_thread_message_history(&thread)
+            .map_err(|error| ApiError::internal_assembly("重建恢复线程历史失败", error))?;
         threads_to_register.push(thread);
     }
 
@@ -622,7 +512,10 @@ pub(crate) fn restore_missing_resumed_branch_threads(
         }
         registered_threads.push(thread);
     }
-    if let Err(error) = state.persist_session_state_checkpoint("session_continue_thread_rebuild") {
+    if !registered_threads.is_empty()
+        && let Err(error) =
+            state.persist_session_state_checkpoint("session_continue_thread_rebuild")
+    {
         let rollback_errors =
             rollback_restored_branch_threads(state, session_id, chain, &registered_threads);
         let detail = if rollback_errors.is_empty() {
@@ -665,38 +558,12 @@ fn rollback_restored_branch_threads(
         .collect()
 }
 
-pub(crate) fn persist_resumed_branch_user_input(
-    state: &ApiState,
-    session_id: &SessionId,
-    branches: &[ActiveExecutionBranch],
-    _prompt_text: Option<&str>,
-    _images: &[SessionTurnImage],
-    _accepted_at: UtcMillis,
-) -> Result<(), ApiError> {
-    // Continue 的用户输入事实由新的 canonical Turn 写入；这里仅在写入前确认所有
-    // branch thread 仍属于当前 session。写入后由 write_continue_user_message 重建
-    // 每个 branch 的 ThreadChatMessage projection，避免在 canonical 之外再 append 一份事实。
-    let registered_threads = state.session_store.thread_registry_snapshot(session_id);
-    for branch in branches {
-        if !registered_threads
-            .iter()
-            .any(|thread| thread.thread_id == branch.thread_id)
-        {
-            return Err(ApiError::internal_assembly(
-                "继续会话失败",
-                format!("恢复分支 thread 不存在: {}", branch.thread_id),
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// 在持有 session 生命周期锁且领取恢复权后、启动新 runner 前写入本轮用户信号。
 ///
 /// 这使“用户输入接管中断任务”和“启动恢复 runner”属于同一个串行临界区，避免双击
 /// 恢复链接或多个窗口同时提交时把第二条输入遗留到错误执行链中。
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn continue_execution_chain_with_pre_resume<T, U, F, G>(
+pub(crate) async fn continue_execution_chain_with_pre_resume<U, G>(
     state: &ApiState,
     session_id: &SessionId,
     requested_agent_ids: &[WorkerId],
@@ -704,15 +571,13 @@ pub(crate) async fn continue_execution_chain_with_pre_resume<T, U, F, G>(
     resumed_at: UtcMillis,
     request_id: String,
     request_fingerprint: String,
-    prepare_input: F,
     prepare_turn: G,
-) -> Result<(SessionContinueAccepted, T, U), ApiError>
+) -> Result<(SessionContinueAccepted, U), ApiError>
 where
-    F: FnOnce(&[ActiveExecutionBranch]) -> Result<T, ApiError>,
     G: FnOnce(
         &ActiveExecutionChain,
         &ActiveExecutionBranch,
-        &T,
+        &[ActiveExecutionBranch],
         &TurnAttempt,
     ) -> Result<U, ApiError>,
 {
@@ -804,9 +669,12 @@ where
         .quiesce_for_restart(chain.root_task_id.as_str())
         .await;
 
-    chain = state
+    let recovery_sidecar = state
         .session_store
-        .active_execution_chain(session_id)
+        .runtime_sidecar(session_id)
+        .ok_or_else(|| ApiError::InvalidInput("当前会话没有可继续的执行链".to_string()))?;
+    chain = recovery_sidecar
+        .active_execution_chain
         .ok_or_else(|| ApiError::InvalidInput("当前会话没有可继续的执行链".to_string()))?;
     let root_task = task_store
         .get_task(&chain.root_task_id)
@@ -820,14 +688,16 @@ where
             ),
         ));
     }
-    let worker_runtime_handle = state
-        .execution_pipeline()
-        .map(|pipeline| pipeline.execution_runtime.worker_runtime());
     let resumable_branches = chain
         .branches
         .iter()
         .filter(|&branch| {
-            active_execution_branch_is_continue_recoverable(state.task_store(), &chain, branch)
+            active_execution_branch_is_continue_recoverable(
+                state.task_store(),
+                &chain,
+                recovery_sidecar.current_turn.as_ref(),
+                branch,
+            )
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -911,11 +781,7 @@ where
     // 恢复链可能已经因为任务失败或 daemon 停止而失去执行能力，但旧 current Turn
     // 的异步终态写回尚未到达。先按 execution chain 携带的 Turn ID 原子收口旧轮次，
     // 再写入 Continue 的新 Turn，避免新旧 Turn 竞争同一个 current_turn 指针。
-    if let Some(previous_turn_id) = chain
-        .current_turn
-        .as_ref()
-        .map(|turn| turn.turn_id.as_str())
-    {
+    if let Some(previous_turn_id) = chain.current_turn_id.as_deref() {
         state
             .turn_event_sink()
             .finalize_turn_for_continue(session_id, previous_turn_id)
@@ -927,39 +793,41 @@ where
     // 尚未释放 Coordinator active 槽位。先读取旧 attempt 和 canonical 终态，
     // 最后通过同一个 Continue command 原子收口并接纳新 Turn。
     let mut previous_coordinator = None;
-    if let Some(previous_turn_id) = chain
-        .current_turn
-        .as_ref()
-        .map(|turn| turn.turn_id.as_str())
-    {
+    if let Some(previous_turn_id) = chain.current_turn_id.as_deref() {
         let previous_turn = state
             .session_store
-            .runtime_sidecar(session_id)
-            .and_then(|sidecar| sidecar.current_turn)
-            .filter(|turn| turn.turn_id == previous_turn_id);
-        if let Some(previous_turn) = previous_turn {
-            let previous_status = match previous_turn.status.trim().to_ascii_lowercase().as_str() {
-                "completed" | "complete" | "succeeded" | "success" => {
-                    CoordinatorTurnStatus::Completed
-                }
-                "cancelled" | "canceled" | "interrupted" => CoordinatorTurnStatus::Cancelled,
-                "failed" | "error" => CoordinatorTurnStatus::Failed,
-                _ => CoordinatorTurnStatus::Failed,
-            };
-            match state
-                .turn_coordinator()
-                .current_attempt(session_id, previous_turn_id)
-            {
-                Ok(previous_attempt) => {
-                    previous_coordinator = Some((previous_attempt, previous_status));
-                }
-                Err(CoordinatorError::NoActiveTurn) => {}
-                Err(error) => {
-                    return Err(ApiError::conflict(
-                        "Continue 旧 Turn 与 Coordinator 不一致",
-                        &error.to_string(),
-                    ));
-                }
+            .canonical_turn_for_session_turn_id(session_id, previous_turn_id)
+            .ok_or_else(|| {
+                ApiError::internal_assembly("继续会话失败", "Continue 来源 canonical Turn 不存在")
+            })?;
+        let previous_status = match previous_turn.status {
+            magi_session_store::CanonicalTurnStatus::Completed => CoordinatorTurnStatus::Completed,
+            magi_session_store::CanonicalTurnStatus::Failed => CoordinatorTurnStatus::Failed,
+            magi_session_store::CanonicalTurnStatus::Cancelled
+            | magi_session_store::CanonicalTurnStatus::Interrupted
+            | magi_session_store::CanonicalTurnStatus::Superseded => {
+                CoordinatorTurnStatus::Cancelled
+            }
+            _ => {
+                return Err(ApiError::internal_assembly(
+                    "继续会话失败",
+                    "Continue 来源 Turn 尚未结算",
+                ));
+            }
+        };
+        match state
+            .turn_coordinator()
+            .current_attempt(session_id, previous_turn_id)
+        {
+            Ok(previous_attempt) => {
+                previous_coordinator = Some((previous_attempt, previous_status));
+            }
+            Err(CoordinatorError::NoActiveTurn) => {}
+            Err(error) => {
+                return Err(ApiError::conflict(
+                    "Continue 旧 Turn 与 Coordinator 不一致",
+                    &error.to_string(),
+                ));
             }
         }
     }
@@ -1017,12 +885,9 @@ where
         Some(state.turn_coordinator()),
     );
     recovery_attempt.record_coordinator_attempt(coordinator_attempt.clone());
-    for thread in
-        restore_missing_resumed_branch_threads(state, session_id, &chain, &branches_to_resume)?
-    {
+    for thread in restore_resumed_branch_threads(state, session_id, &chain, &branches_to_resume)? {
         recovery_attempt.record_registered_thread(thread);
     }
-    let prepared_input = prepare_input(&branches_to_resume)?;
     let goal_resume_guard = InterruptedGoalResumeGuard::prepare(
         &state.session_store,
         session_id,
@@ -1062,6 +927,7 @@ where
                 rebuild_dispatch_plan_for_branch(
                     &chain,
                     branch,
+                    recovery_sidecar.recovery_id.clone(),
                     resumed_turn_id,
                     execution_root.clone(),
                     execution_settings_snapshot.clone(),
@@ -1075,9 +941,6 @@ where
             ));
         }
         recovery_attempt.record_registered_task(branch.task_id.clone());
-        if let Some(worker_runtime) = worker_runtime_handle {
-            sync_branch_checkpoint_to_worker_runtime(worker_runtime, branch);
-        }
     }
 
     state
@@ -1089,7 +952,7 @@ where
                 root_task_id: chain.root_task_id.clone(),
                 task_id: primary_branch.task_id.clone(),
                 requested_worker_id: Some(primary_branch.worker_id.clone()),
-                recovery_id: chain.recovery_ref.clone(),
+                recovery_id: recovery_sidecar.recovery_id.clone(),
                 execution_chain_ref: Some(chain.execution_chain_ref.clone()),
             },
         )
@@ -1121,7 +984,7 @@ where
     let prepared_turn = prepare_turn(
         &chain,
         primary_branch,
-        &prepared_input,
+        &branches_to_resume,
         &coordinator_attempt,
     )?;
 
@@ -1149,7 +1012,6 @@ where
             &state.session_store,
             &state.workspace_registry,
             session_id,
-            &mut chain,
             commit,
         )
     {
@@ -1173,14 +1035,13 @@ where
     };
     recovery_claim.commit();
     recovery_attempt.commit();
-    Ok((accepted, prepared_input, prepared_turn))
+    Ok((accepted, prepared_turn))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::rebuild_thread_history_from_canonical;
-    use magi_core::ThreadId;
     use magi_session_store::{CanonicalTurn, SESSION_COMMAND_METADATA_KEY};
+    use magi_session_store::{ExecutionThread, SessionStore, SessionStoreState};
 
     fn canonical_turn(
         turn_id: &str,
@@ -1226,13 +1087,70 @@ mod tests {
             canonical_turn("turn-compact", 2, "保留接口约束", true),
         ];
         assert!(turns[1].is_session_command());
-        let history =
-            rebuild_thread_history_from_canonical(&turns, &ThreadId::new("thread-orchestrator"))
-                .unwrap();
+        let thread: ExecutionThread = serde_json::from_value(serde_json::json!({
+            "threadId": "thread-orchestrator", "sessionId": "session-command-history",
+            "missionId": "mission-history", "roleId": "orchestrator", "workerInstanceId": "worker-history",
+            "status": "idle", "createdAt": 1, "lastUsedAt": 2,
+        })).unwrap();
+        let store = SessionStore::from_state_for_test(SessionStoreState {
+            canonical_turns: turns,
+            ..Default::default()
+        });
+        let history = store.canonical_thread_message_history(&thread).unwrap();
         let contents = history
             .iter()
             .filter_map(|message| message.content.as_deref())
             .collect::<Vec<_>>();
         assert_eq!(contents, vec!["实现登录接口"]);
+    }
+    #[test]
+    fn continue_history_only_reaches_frozen_recipients_after_reload() {
+        let mut turn = canonical_turn("turn-continue", 1, "继续处理所选任务", false);
+        turn.items[0]
+            .metadata
+            .insert("route".into(), serde_json::json!("continue"));
+        turn.items[0]
+            .metadata
+            .insert("continuedThreadIds".into(), serde_json::json!(["selected"]));
+        let threads = ["selected", "unselected", "created-later"].map(|id| {
+            serde_json::from_value::<ExecutionThread>(serde_json::json!({
+                "threadId": id, "sessionId": "session-command-history", "missionId": "mission-history",
+                "roleId": "executor", "workerInstanceId": format!("worker-{id}"),
+                "status": "idle", "createdAt": 1, "lastUsedAt": 2,
+            })).unwrap()
+        });
+        let store = SessionStore::from_state_for_test(SessionStoreState {
+            canonical_turns: vec![turn.clone()],
+            thread_registry: threads.to_vec(),
+            ..Default::default()
+        });
+        for store in [
+            store.clone(),
+            SessionStore::from_state_for_test(store.export_state()),
+        ] {
+            for thread in &threads {
+                let snapshot = store.thread_context_snapshot(&thread.thread_id).unwrap();
+                assert_eq!(
+                    snapshot.messages().len(),
+                    usize::from(thread.thread_id.as_str() == "selected")
+                );
+            }
+        }
+        // 没有明确接收范围的旧 Continue 不能广播到任意线程。
+        turn.items[0].metadata.remove("continuedThreadIds");
+        let store = SessionStore::from_state_for_test(SessionStoreState {
+            canonical_turns: vec![turn],
+            thread_registry: threads.to_vec(),
+            ..Default::default()
+        });
+        for thread in &threads {
+            assert!(
+                store
+                    .thread_context_snapshot(&thread.thread_id)
+                    .unwrap()
+                    .messages()
+                    .is_empty()
+            );
+        }
     }
 }

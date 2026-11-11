@@ -61,7 +61,8 @@ export function readHostMethods() {
 /** 钩子处理器里调用就会被 ReentryDenied 拒绝的反向服务（instance.rs）。 */
 export function readHookReentryDenied() {
   const text = read('crates/magi-extension-host/src/instance.rs');
-  const at = text.indexOf('ErrorKind::ReentryDenied');
+  // 页面模型业务也有独立重入检查；根据公共拒绝说明定位完整的无租约服务列表。
+  const at = text.lastIndexOf('ErrorKind::ReentryDenied');
   if (at === -1) throw new Error('instance.rs 中找不到 ReentryDenied 分支');
   const before = text.slice(0, at);
   const start = before.lastIndexOf('if matches!(');

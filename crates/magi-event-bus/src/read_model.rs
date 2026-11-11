@@ -276,12 +276,6 @@ pub struct SessionRuntimeBranchSummaryEntry {
     pub status: String,
     pub stage: String,
     pub lease_id: Option<String>,
-    pub execution_intent_ref: Option<String>,
-    pub binding_lifecycle: Option<String>,
-    pub checkpoint_stage: Option<String>,
-    pub next_step_index: Option<usize>,
-    pub checkpoint_at: Option<UtcMillis>,
-    pub resume_mode: Option<String>,
     pub is_primary: bool,
 }
 

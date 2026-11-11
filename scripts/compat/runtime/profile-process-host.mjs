@@ -25,6 +25,19 @@ function directoryIdentity(path) {
 
 // npm/pnpm 只把当前 profile 的明确包操作转换为 daemon 请求；外部目录
 // 继续由真实程序拥有。不会在投影目录安装依赖、生成锁文件或运行脚本。
+export function profilePackageArgs(args) {
+  const [verb, ...rest] = args;
+  const action = ['add', 'install', 'i'].includes(verb) ? 'add'
+    : ['remove', 'uninstall', 'rm', 'un'].includes(verb) ? 'remove' : null;
+  const targets = rest.filter(value => !value.startsWith('-'));
+  if (!action || targets.length !== 1) throw new Error('Magi profile 包管理需要明确的单个安装或移除目标');
+  const flags = rest.filter(value => value.startsWith('-'));
+  const allowed = new Set(['--ignore-scripts', '--no-audit', '--no-fund', '--no-progress', '--yes', '--force', '-w', '--reporter=append-only', '--reporter=ndjson']);
+  if (flags.some(flag => !allowed.has(flag))) throw new Error('包管理参数未提供对应产品能力');
+  if (new Set(flags.filter(flag => flag.startsWith('--reporter='))).size > 1) throw new Error('包管理输出格式冲突');
+  return { action, spec: targets[0], ...(flags.includes('--reporter=ndjson') ? { reporter: 'ndjson' } : {}) };
+}
+
 export function profilePackageCommand(file, args, options, roots) {
   let name = basename(String(file)).replace(/\.cmd$/i, '').toLowerCase();
   if (file === process.execPath && Array.isArray(args) && /^(?:npm-cli\.js|pnpm\.(?:c?js|mjs))$/.test(basename(args[0] ?? ''))) {
@@ -49,13 +62,7 @@ export function profilePackageCommand(file, args, options, roots) {
   }
   if (invalidDirectory && touchesProfile) throw new Error('包管理目录参数无效或重复');
   if (!inProfile(directory)) return;
-  const [verb, spec, ...flags] = remaining;
-  const action = ['add', 'install', 'i'].includes(verb) ? 'add'
-    : ['remove', 'uninstall', 'rm', 'un'].includes(verb) ? 'remove' : null;
-  if (!action || !spec || spec.startsWith('-')) throw new Error('Magi profile 包管理需要明确的单个安装或移除目标');
-  const allowed = new Set(['--ignore-scripts', '--no-audit', '--no-fund', '--no-progress', '--yes', '--force', '-w', '--reporter=append-only']);
-  if (flags.some(flag => !allowed.has(flag))) throw new Error('包管理参数未提供对应产品能力');
-  return { action, spec };
+  return profilePackageArgs(remaining);
 }
 
 function installSpec(args, profile) {
@@ -77,6 +84,7 @@ export function createProfileProcesses(api, { home, registry }) {
     owner.controller.abort(new Error('辅助进程所属实例已失效'));
     for (const id of owner.installations) void api.plugins.cancelInstall(id).catch(() => {});
     for (const socket of owner.sockets) socket.destroy();
+    owner.execution?.emitDestroy();
   }
   async function request(owner, method, input) {
     // 每次调用都重新准入，子进程不持有可在父实例失效后使用的快照服务。
@@ -96,6 +104,10 @@ export function createProfileProcesses(api, { home, registry }) {
       finally { owner.installations.delete(input.requestId); }
     }
     if (method !== 'install') throw new Error('辅助进程方法未提供');
+    if (owner.execute) {
+      const result = await owner.execute(owner.controller.signal, input => request(owner, 'installBundle', input));
+      return { result, snapshot: await snapshot() };
+    }
     const spec = installSpec(input, resolve(home, 'profiles', 'magi'));
     const id = randomBytes(16).toString('hex');
     owner.installations.add(id);
@@ -139,21 +151,35 @@ export function createProfileProcesses(api, { home, registry }) {
     server.listen(endpoint); server.unref();
   }
   return {
-    spawn(file, args, options = {}, signal) {
+    spawn(file, args, options = {}, signal, operation) {
       if (closed || file !== process.execPath || !Array.isArray(args) || !/\.(?:mjs|cjs|js)$/.test(args[0] ?? '')) return;
       if (owners.size >= 16) throw new Error('当前插件的 Node 辅助进程过多');
       signal?.throwIfAborted();
       boundary.runInAsyncScope(listen);
       const token = randomBytes(32).toString('hex'), owner = { token, installations: new Set(), sockets: new Set(), controller: new AbortController() };
+      if (operation) {
+        owner.execution = new AsyncResource('MagiPackageCommand');
+        owner.execute = (...args) => owner.execution.runInAsyncScope(operation, undefined, ...args);
+      }
       const env = { ...(options.env ?? process.env), MAGI_PROFILE_PROCESS_ENDPOINT: endpoint, MAGI_PROFILE_PROCESS_TOKEN: token,
         MAGI_PROFILE_PROCESS_HOME: home, MAGI_PROFILE_PROCESS_REGISTRY: registry };
       // 委托只持有父扩展的受限端口，不继承 daemon RPC 传输凭据。
       for (const key of ['MAGI_EXT_ENDPOINT', 'MAGI_EXT_TOKEN', 'MAGI_EXT_ENTRY']) delete env[key];
       owners.set(token, owner);
       let child;
-      try { child = spawn(file, [fileURLToPath(new URL('profile-child.mjs', import.meta.url)), ...args], { ...options, env, detached: false }); }
+      const argv = operation ? args : [fileURLToPath(new URL('profile-child.mjs', import.meta.url)), ...args];
+      // profile 是 daemon 投影，不为辅助命令创建物理目录。
+      try { child = spawn(file, argv, { ...options, ...(operation ? { cwd: home } : {}), env, detached: false }); }
       catch (error) { revoke(owner); throw error; }
       owner.child = child;
+      const kill = child.kill.bind(child);
+      child.kill = (signal = 'SIGTERM') => {
+        const sent = kill(signal);
+        // 终止请求即撤销委托；不能等待 OS exit 通知才阻止已就绪的异步读取
+        // 继续发起安装。PID、信号投递和退出状态仍由真实 ChildProcess 提供。
+        if (sent && ['SIGTERM', 'SIGKILL', 'SIGINT'].includes(signal)) revoke(owner);
+        return sent;
+      };
       const abort = () => { revoke(owner); child.kill(); };
       signal?.addEventListener('abort', abort, { once: true });
       child.once('exit', () => revoke(owner)); child.once('error', () => revoke(owner));

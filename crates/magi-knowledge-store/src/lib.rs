@@ -345,13 +345,6 @@ impl KnowledgeStore {
         self.revision.fetch_add(1, Ordering::AcqRel);
     }
 
-    pub fn index_persistence_callback_configured(&self) -> bool {
-        self.index_persist_callback
-            .read()
-            .expect("knowledge store index persistence callback lock poisoned")
-            .is_some()
-    }
-
     /// 为指定 workspace 构建/重建本地代码检索索引。
     ///
     /// 复用 code_scanner 的扫描结果生成 (相对路径, 文件类型) 列表喂给
@@ -468,15 +461,6 @@ impl KnowledgeStore {
             .lock()
             .expect("knowledge store index builds lock poisoned")
             .contains_key(&self.index_key(workspace_id))
-    }
-
-    pub fn workspace_index_build_cancelled(&self, workspace_id: &WorkspaceId) -> bool {
-        self.index_builds
-            .lock()
-            .expect("knowledge store index builds lock poisoned")
-            .get(&self.index_key(workspace_id))
-            .copied()
-            .unwrap_or(false)
     }
 
     pub fn workspace_index_outcome(

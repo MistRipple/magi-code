@@ -5,9 +5,7 @@ use crate::costing::{
     context_window_tokens_from_usage, normalize_usage_delta, provider_context_tokens_from_usage,
 };
 use crate::model_identity::{build_model_resolution_identity, canonicalize_base_url};
-use crate::reducer::{
-    rebuild_session_snapshot_from_events, rebuild_workspace_snapshot_from_sessions,
-};
+use crate::reducer::{rebuild_usage_snapshot_from_events, rebuild_workspace_snapshot};
 use crate::types::*;
 
 fn make_llm_config() -> LlmConfig {
@@ -76,7 +74,7 @@ fn make_call_record_input(
 ) -> UsageCallRecordInput {
     UsageCallRecordInput {
         workspace_id: Some("ws-1".to_string()),
-        session_id: session_id.to_string(),
+        owner: UsageOwner::session(session_id),
         turn_id: Some("turn-1".to_string()),
         dispatch_wave_id: None,
         assignment_id: Some("assign-1".to_string()),
@@ -106,6 +104,51 @@ fn make_call_record_input(
         status: UsageCallStatus::Success,
         error_code: None,
     }
+}
+
+#[test]
+fn plugin_and_session_ownership_are_disjoint_and_deduplicated() {
+    let mut authority = UsageAuthority::new();
+    let input = make_call_record_input("session-1", "call-1", 10, 2);
+    authority.append_call_record(input.clone());
+    let mut plugin = input;
+    plugin.turn_id = None;
+    plugin.assignment_id = None;
+    plugin.owner = UsageOwner::Plugin {
+        plugin: PluginModelOwner {
+            plugin_id: "example".into(),
+            digest: "a".repeat(64),
+            instance_id: "instance".into(),
+            operation_id: "operation".into(),
+            display_name: Some("Example".into()),
+        },
+    };
+    let mut both = serde_json::to_value(&plugin).unwrap();
+    both["sessionId"] = serde_json::json!("session-1");
+    assert!(serde_json::from_value::<UsageCallRecordInput>(both).is_err());
+    authority.append_call_record(plugin.clone());
+    authority.append_call_record(plugin.clone());
+    let all = authority.get_workspace_snapshot("ws-1");
+    assert_eq!(all.totals.llm_call_count, 2);
+    assert_eq!(all.by_session.len(), 1);
+    assert_eq!(all.by_execution_binding.len(), 2);
+    assert_eq!(all.by_model_identity.len(), 1);
+    assert_eq!(
+        authority
+            .get_session_snapshot("ws-1", "session-1")
+            .totals
+            .llm_call_count,
+        1
+    );
+    plugin.call_identity.call_id = "call-2".into();
+    authority.append_call_record(plugin);
+    assert_eq!(
+        authority
+            .get_workspace_snapshot("ws-1")
+            .totals
+            .llm_call_count,
+        3
+    );
 }
 
 #[test]
@@ -366,21 +409,6 @@ fn test_workspace_snapshot_aggregation() {
 }
 
 #[test]
-fn test_session_reset() {
-    let mut authority = UsageAuthority::new();
-    authority.append_call_record(make_call_record_input("sess-1", "call-1", 1000, 500));
-
-    let before = authority.get_session_snapshot("ws-1", "sess-1");
-    assert_eq!(before.totals.llm_call_count, 1);
-
-    authority.reset_session("ws-1", "sess-1");
-
-    let after = authority.get_session_snapshot("ws-1", "sess-1");
-    assert_eq!(after.totals.llm_call_count, 0);
-    assert!(after.version > before.version);
-}
-
-#[test]
 fn test_failed_call_status() {
     let mut authority = UsageAuthority::new();
     let mut input = make_call_record_input("sess-1", "call-1", 500, 200);
@@ -464,7 +492,7 @@ fn test_rebuild_session_from_events() {
             event_id: "e1".to_string(),
             ledger_seq: 1,
             workspace_id: Some("ws-1".to_string()),
-            session_id: "sess-1".to_string(),
+            owner: UsageOwner::session("sess-1"),
             turn_id: Some("t1".to_string()),
             dispatch_wave_id: None,
             assignment_id: Some("a1".to_string()),
@@ -493,7 +521,7 @@ fn test_rebuild_session_from_events() {
             event_id: "e2".to_string(),
             ledger_seq: 2,
             workspace_id: Some("ws-1".to_string()),
-            session_id: "sess-1".to_string(),
+            owner: UsageOwner::session("sess-1"),
             turn_id: Some("t1".to_string()),
             dispatch_wave_id: None,
             assignment_id: Some("a1".to_string()),
@@ -520,7 +548,7 @@ fn test_rebuild_session_from_events() {
         },
     ];
 
-    let snapshot = rebuild_session_snapshot_from_events(Some("ws-1"), "sess-1", &events);
+    let snapshot = rebuild_usage_snapshot_from_events(&events).into_session(Some("ws-1"), "sess-1");
     assert_eq!(snapshot.version, 2);
     assert_eq!(snapshot.totals.llm_call_count, 2);
     assert_eq!(snapshot.totals.raw_input_tokens, 800);
@@ -565,7 +593,19 @@ fn test_rebuild_workspace_from_sessions() {
         by_model_identity: vec![],
     };
 
-    let ws = rebuild_workspace_snapshot_from_sessions("ws-1", &[s1, s2]);
+    let ws = rebuild_workspace_snapshot(
+        "ws-1",
+        &[
+            (
+                UsageSubject::Session(s1.session_id.clone()),
+                UsageAggregateSnapshot::from(&s1),
+            ),
+            (
+                UsageSubject::Session(s2.session_id.clone()),
+                UsageAggregateSnapshot::from(&s2),
+            ),
+        ],
+    );
     assert_eq!(ws.totals.llm_call_count, 3);
     assert_eq!(ws.totals.raw_input_tokens, 1500);
     assert_eq!(ws.by_session.len(), 2);
@@ -595,97 +635,6 @@ fn test_usage_totals_add() {
     assert_eq!(sum.raw_input_tokens, 1600);
     assert_eq!(sum.success_count, 7);
     assert_eq!(sum.failure_count, 1);
-}
-
-#[test]
-fn test_session_reset_rebuilds_from_events() {
-    let binding =
-        build_execution_binding_identity("tmpl-1", "engine-1", 1, UsageSourceRole::Worker);
-    let config = make_llm_config();
-    let model_id = build_model_resolution_identity(&config, &binding, None, None);
-
-    let events = vec![
-        UsageEvent {
-            event_id: "e1".to_string(),
-            ledger_seq: 1,
-            workspace_id: Some("ws-1".to_string()),
-            session_id: "sess-1".to_string(),
-            turn_id: None,
-            dispatch_wave_id: None,
-            assignment_id: None,
-            timestamp: 1000,
-            event_type: UsageEventType::LlmCallCompleted,
-            execution_binding: Some(binding.clone()),
-            model_identity: Some(model_id.clone()),
-            call_identity: Some(build_usage_call_identity(
-                "c1",
-                None,
-                UsageSourceRole::Worker,
-                None,
-            )),
-            usage_delta: Some(UsageEventUsageDelta {
-                raw_input_tokens: 500,
-                raw_output_tokens: 200,
-                context_window_tokens: None,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                cache_read_included_in_input: false,
-            }),
-            status: Some(UsageCallStatus::Success),
-            error_code: None,
-        },
-        UsageEvent {
-            event_id: "reset-1".to_string(),
-            ledger_seq: 2,
-            workspace_id: Some("ws-1".to_string()),
-            session_id: "sess-1".to_string(),
-            turn_id: None,
-            dispatch_wave_id: None,
-            assignment_id: None,
-            timestamp: 2000,
-            event_type: UsageEventType::SessionReset,
-            execution_binding: None,
-            model_identity: None,
-            call_identity: None,
-            usage_delta: None,
-            status: None,
-            error_code: None,
-        },
-        UsageEvent {
-            event_id: "e2".to_string(),
-            ledger_seq: 3,
-            workspace_id: Some("ws-1".to_string()),
-            session_id: "sess-1".to_string(),
-            turn_id: None,
-            dispatch_wave_id: None,
-            assignment_id: None,
-            timestamp: 3000,
-            event_type: UsageEventType::LlmCallCompleted,
-            execution_binding: Some(binding),
-            model_identity: Some(model_id),
-            call_identity: Some(build_usage_call_identity(
-                "c2",
-                None,
-                UsageSourceRole::Worker,
-                None,
-            )),
-            usage_delta: Some(UsageEventUsageDelta {
-                raw_input_tokens: 300,
-                raw_output_tokens: 100,
-                context_window_tokens: None,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                cache_read_included_in_input: false,
-            }),
-            status: Some(UsageCallStatus::Success),
-            error_code: None,
-        },
-    ];
-
-    let snapshot = rebuild_session_snapshot_from_events(Some("ws-1"), "sess-1", &events);
-    assert_eq!(snapshot.totals.llm_call_count, 1);
-    assert_eq!(snapshot.totals.raw_input_tokens, 300);
-    assert_eq!(snapshot.version, 3);
 }
 
 #[test]
@@ -719,6 +668,7 @@ fn response_performance_is_weighted_deduplicated_and_excludes_failed_calls() {
             request_fingerprint: "a".repeat(64),
             http_status: Some(200),
             response_timing: Some(ModelResponseTiming {
+                response_duration_ms: Some(ttft + duration),
                 first_content_ms: ttft,
                 content_duration_ms: duration,
                 text_output_tokens: tokens,
@@ -736,6 +686,13 @@ fn response_performance_is_weighted_deduplicated_and_excludes_failed_calls() {
     assert_eq!(perf.tps_sample_count, 2);
     assert_eq!(perf.text_output_tokens, 200);
     assert_eq!(perf.content_duration_ms, 4000);
+    assert_eq!(perf.response_sample_count, 4);
+    assert_eq!(
+        perf.response_output_tokens, 800,
+        "all reported output participates, including unsplit reasoning"
+    );
+    assert_eq!(perf.response_duration_ms, 8000);
+    assert_eq!(perf.last_response_tps, Some(250.0));
     assert_eq!(
         snapshot.by_execution_binding[0]
             .totals
@@ -760,6 +717,21 @@ fn response_performance_is_weighted_deduplicated_and_excludes_failed_calls() {
     let old: UsageTotals = serde_json::from_value(old).unwrap();
     assert_eq!(old.performance.ttft_sample_count, 0);
     assert_eq!(old.cache_write_observed_call_count, 0);
+    let mut old_performance = serde_json::to_value(perf).unwrap();
+    for name in [
+        "responseSampleCount",
+        "responseOutputTokens",
+        "responseDurationMs",
+        "lastResponseTps",
+    ] {
+        old_performance.as_object_mut().unwrap().remove(name);
+    }
+    let restored: UsagePerformanceTotals = serde_json::from_value(old_performance).unwrap();
+    assert_eq!(
+        restored.response_sample_count, 0,
+        "old body-only timing is not reinterpreted as complete response timing"
+    );
+    assert_eq!(restored.last_response_tps, None);
 }
 
 #[test]
@@ -775,11 +747,27 @@ fn token_presence_and_invalid_cache_do_not_become_zero_or_fabricated_hits() {
         call.usage.cache_write_tokens = None;
         call.call_identity.transport = Some(UsageTransportIdentity {
             usage_reported: reported,
-            response_timing: None,
+            response_timing: Some(magi_app_server_protocol::ModelResponseTiming {
+                first_content_ms: 100,
+                content_duration_ms: 200,
+                text_output_tokens: None,
+                response_duration_ms: Some(500),
+            }),
             request_fingerprint: "f".repeat(64),
             http_status: Some(200),
         });
         authority.append_call_record(call);
+        if reported == Some(true) {
+            assert_eq!(
+                authority
+                    .get_session_snapshot("ws-1", "observations")
+                    .totals
+                    .performance
+                    .last_response_tps,
+                Some(0.0),
+                "confirmed zero is a real zero-speed sample"
+            );
+        }
     }
     let totals = authority
         .get_session_snapshot("ws-1", "observations")
@@ -787,6 +775,16 @@ fn token_presence_and_invalid_cache_do_not_become_zero_or_fabricated_hits() {
     assert_eq!(totals.llm_call_count, 3);
     assert_eq!(totals.token_observed_call_count, 1);
     assert_eq!(totals.cache_observed_call_count, 0);
+    assert_eq!(
+        totals.performance.response_sample_count, 1,
+        "unknown usage is not a zero-speed sample"
+    );
+    assert_eq!(totals.performance.response_output_tokens, 0);
+    assert_eq!(totals.performance.response_duration_ms, 500);
+    assert_eq!(
+        totals.performance.last_response_tps, None,
+        "latest unknown response does not inherit an earlier speed"
+    );
 
     let mut invalid = make_call_record_input("bad-cache", "call", 1000, 10);
     invalid.usage.cache_read_tokens = Some(2000);

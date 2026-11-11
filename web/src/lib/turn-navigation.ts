@@ -28,16 +28,6 @@ export interface TurnNavigationItem {
   sentAt?: number;
 }
 
-export interface TurnNavigationRailLayout {
-  itemSpacing: number;
-  verticalPadding: number;
-  markerHeight: number;
-  viewportHeight: number;
-  contentHeight: number;
-  maxScrollTop: number;
-  scrollable: boolean;
-}
-
 interface MutableTurnNavigationItem extends Omit<TurnNavigationItem, 'index'> {
   fallbackSummary: string;
 }
@@ -143,35 +133,6 @@ export function calculateTurnNavigationMarkerOffsets(
   return Array.from({ length: count }, (_, index) => (
     verticalPadding + markerHeight / 2 + index * itemSpacing
   ));
-}
-
-export function calculateTurnNavigationRailLayout(
-  itemCount: number,
-  viewportHeight: number,
-  itemSpacing = 13,
-  verticalPadding = 12,
-  markerHeight = 2,
-): TurnNavigationRailLayout {
-  const markerOffsets = calculateTurnNavigationMarkerOffsets(
-    itemCount,
-    itemSpacing,
-    verticalPadding,
-    markerHeight,
-  );
-  const contentHeight = markerOffsets.length === 0
-    ? verticalPadding * 2
-    : markerOffsets[markerOffsets.length - 1] + markerHeight / 2 + verticalPadding;
-  const normalizedViewportHeight = Math.max(0, viewportHeight);
-  const maxScrollTop = Math.max(0, contentHeight - normalizedViewportHeight);
-  return {
-    itemSpacing,
-    verticalPadding,
-    markerHeight,
-    viewportHeight: normalizedViewportHeight,
-    contentHeight,
-    maxScrollTop,
-    scrollable: maxScrollTop > 0,
-  };
 }
 
 export function calculateTurnNavigationScrollTarget(

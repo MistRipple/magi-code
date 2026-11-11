@@ -145,6 +145,13 @@ HTTP 观测与重试进度是两个合同：重试通知继续负责在再次发
   零与缺失分别保留；缓存写入单独统计观测覆盖，不能用读取观测推断写入已报告。
   OpenAI Chat 与 DeepSeek 的 `prompt_cache_hit_tokens` 共用同一流式/非流式解析器；
   DeepSeek hit 已包含在 prompt token 内，不重复加入完整输入。
+  DSH `TokenUsage` 的 input／cacheRead／cacheWrite 互斥。模型桥转换为 Chat 时，
+  `prompt_tokens` 使用三者之和，保留精确 total 和可选计数的零／缺席；读缓存写入
+  `prompt_tokens_details.cached_tokens`，写缓存写入 `cache_creation_input_tokens`。
+  Chat parser 将明确的写缓存从完整输入拆出，仍沿同一 LlmUsage／用量账本核算，
+  不在 UI 再补算输入或修正命中率。明确的推理 token 拆分原样传递，缺席不补零。
+  模型桥即时交付已报告用量；后续错误通过 SSE 明确失败，缺少正常 finish 不生成成功结束信号。
+  正常 finish 等迭代器完整退出后提交，防止清理阶段异常被提前提交的成功回执遮蔽。
   输入已含缓存但缓存读取超过完整输入的异常回执不计入命中样本，不能用饱和相减制造 100% 命中。
 - `ModelTransportRecord.responseTiming` 在 HTTP I/O 线程采集正文首段和末段时间，沿原 Step /
   auxiliary 回执持久化。仅成功交付的正文流参与性能累计；TTFT 按有效流次数平均，TPS 按可配对
@@ -153,10 +160,14 @@ HTTP 观测与重试进度是两个合同：重试通知继续负责在再次发
   观测吞吐，不声称是模型内部纯解码速度。OpenAI 协议缺少明确推理 token 拆分、
   混有工具参数/音频/其他非正文输出、Anthropic 含未拆分或 redacted thinking、同批接收或
   非流式输出时不推算 TPS。推理明细必须来自与最终输出数相同的一份 usage，不能沿用中间拆分。
+  上游未提供计算所需数据而展示未知属于正确结果，不列为翻译器缺陷或待办；
+  上游已提供的拆分或计数若在 Magi 转换、持久化或展示链路丢失，仍属于 Magi 的修复责任。
 - `ModelTransportRecord.usageObserved` 冻结 Provider 是否实际报告用量；投影到
   `callIdentity.transport.usageReported` 并提供用量覆盖次数。缺失/空 usage 不能被 adapter 的零默认值补造。
   全部缺失时累计 Token 显示未知，部分缺失时展示已报告合计及覆盖数；不能把缺失用量解释为零成本。
   旧记录缺少存在性标记且全零时保持未知；有实际非零 token 或显式缓存字段时保守纳入已知样本。
+  设置统计的总计、模型、角色及交叉明细同样消费观测次数：无观测时显示未返回，明确零值显示零，
+  部分缺失时保留已报告合计并显示覆盖次数，不再只对图片模型区分缺失与零。
 - Chat 的完整 usage 和 Responses 终态 usage 可修正较早快照；Anthropic 保留协议规定的分段合并。
   持久化约束冻结请求身份和接收顺序；在途快照允许计数修正，用量不能整体丢失。
   计时与用量配对后、HTTP outcome 确认后都不可再改写；canonical 恢复消费最新冻结回执。

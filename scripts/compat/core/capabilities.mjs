@@ -1,7 +1,7 @@
 // Magi 能承载的能力清单：翻译器与上游生态之间的唯一共享词汇。
 //
-// 这里只描述“Magi 公开接口能做什么”，不描述任何上游生态。每个生态的规则表（dsh/、pi/）把自己的 API
-// 映射到这里的能力 ID，并声明保真度；“不可翻译”的原因因此只写在一处，生态之间不会各说各话。
+// 这里只描述“Magi 公开接口能做什么”。DSH 规则表把上游 API 映射到能力 ID，
+// 并声明保真度；能力存在不代表原包应当获得全局干预权。
 //
 // 每条能力都绑定到一个可校验的 Magi 事实（钩子目录条目或宿主 RPC 方法），`test.mjs` 会对照
 // crates/magi-extension-host 的源码核对，能力清单与实现不一致时测试失败。
@@ -42,7 +42,7 @@ export const CAPABILITIES = {
   'hook.subagent.spawn.guard': { group: 'hooks', magi: '钩子 subagent.spawn（guard：只能阻止）', hook: { name: 'subagent.spawn', mode: 'guard' }, invariants: ['不能指定或覆盖子代理模型'] },
 
   // —— 反向服务（扩展调用 daemon）——
-  'service.model': { group: 'services', magi: 'api.model.invoke（仅 prompt 文本）', rpc: 'model.invoke' },
+  'service.model': { group: 'services', magi: 'api.model.invoke（任务提示或独立页面的有序消息、图片、工具与生成控制）', rpc: 'model.invoke' },
   'service.notify': { group: 'services', magi: 'api.notify.user', rpc: 'notify.user' },
   'service.ask': { group: 'services', magi: 'api.ask.user（扩展不能代答审批）', rpc: 'ask.user' },
   'service.snapshot': { group: 'services', magi: 'api.session.snapshot（只读、有界）', rpc: 'session.snapshot' },

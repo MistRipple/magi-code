@@ -1,6 +1,7 @@
 import type {
   AgentProjectionDto,
   AgentRunOutcome,
+  AgentRunProjectionDto,
 } from '../shared/rust-backend-types';
 
 export interface ActiveAgentGroups {
@@ -167,24 +168,12 @@ export function formatAgentDuration(totalSeconds: number): string {
   return `${hours}h ${String(totalMinutes % 60).padStart(2, '0')}m`;
 }
 
-export type AgentProjectionPinDecision = 'pin' | 'clear' | 'ignore';
-
-/**
- * 当前 root task 的权威投影决定运行中心是否固定，而不是由上一轮固定状态决定。
- * 新投影不需要展示时也必须清理旧投影，避免已被后续任务取代的异常状态残留。
- */
-export function resolveAgentProjectionPin(
-  rootTaskId: string,
-  agentCount: number,
-  dismissedRootTaskId: string,
-  outcome?: AgentRunOutcome | null,
-): AgentProjectionPinDecision {
-  const normalizedRootTaskId = rootTaskId.trim();
-  if (!normalizedRootTaskId) {
-    return 'ignore';
-  }
-  if (normalizedRootTaskId === dismissedRootTaskId.trim()) {
-    return 'clear';
-  }
-  return agentCount > 0 || outcomeRequiresAgentCenter(outcome) ? 'pin' : 'clear';
+/** 只展示当前运行中的代理或需要关注的结果；缺失投影立即清空视图。 */
+export function selectActiveAgentRunProjection(
+  projection: AgentRunProjectionDto | null,
+): AgentRunProjectionDto | null {
+  if (!projection?.root_task.task_id.trim()) return null;
+  return projection.agents.length > 0 || outcomeRequiresAgentCenter(projection.outcome)
+    ? projection
+    : null;
 }

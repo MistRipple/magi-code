@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::costing::normalize_usage_delta;
 use crate::types::{
-    SessionSummary, SessionUsageSnapshot, UsageBindingSnapshot, UsageCallStatus, UsageEvent,
-    UsageEventType, UsageModelSnapshot, UsageTotals, WorkspaceUsageSnapshot,
+    SessionSummary, UsageAggregateSnapshot, UsageBindingSnapshot, UsageCallStatus, UsageEvent,
+    UsageModelSnapshot, UsageOwner, UsageSubject, UsageTotals, WorkspaceUsageSnapshot,
 };
 
 fn apply_delta(
@@ -13,6 +13,20 @@ fn apply_delta(
     event: &UsageEvent,
 ) -> UsageTotals {
     let mut next = totals.clone();
+    // Historical all-zero placeholders cannot prove the provider reported zero usage.
+    let reported = event
+        .call_identity
+        .as_ref()
+        .and_then(|call| call.transport.as_ref())
+        .and_then(|transport| transport.usage_reported)
+        .unwrap_or_else(|| {
+            event.usage_delta.as_ref().is_some_and(|usage| {
+                usage.raw_input_tokens > 0
+                    || usage.raw_output_tokens > 0
+                    || usage.cache_read_tokens.is_some()
+                    || usage.cache_write_tokens.is_some()
+            })
+        });
     if status == Some(UsageCallStatus::Success)
         && let Some(timing) = event
             .call_identity
@@ -25,6 +39,10 @@ fn apply_delta(
             .filter(|tokens| *tokens > 0 && *tokens <= delta.raw_output_tokens)
             .filter(|_| timing.content_duration_ms > 0)
             .map(|tokens| tokens as f64 * 1000.0 / timing.content_duration_ms as f64);
+        let response_duration = timing.response_duration_ms.filter(|duration| *duration > 0);
+        let response_tps = response_duration
+            .filter(|_| reported)
+            .map(|duration| delta.raw_output_tokens as f64 * 1000.0 / duration as f64);
         let sample = crate::types::UsagePerformanceTotals {
             ttft_sample_count: 1,
             ttft_total_ms: timing.first_content_ms,
@@ -42,23 +60,21 @@ fn apply_delta(
             last_observed_at: event.timestamp,
             last_ttft_ms: Some(timing.first_content_ms),
             last_tps: tps,
+            response_sample_count: u64::from(response_tps.is_some()),
+            response_output_tokens: if response_tps.is_some() {
+                delta.raw_output_tokens
+            } else {
+                0
+            },
+            response_duration_ms: if response_tps.is_some() {
+                response_duration.unwrap_or(0)
+            } else {
+                0
+            },
+            last_response_tps: response_tps,
         };
         next.performance = next.performance.add(&sample);
     }
-    // Historical all-zero placeholders cannot prove the provider reported zero usage.
-    let reported = event
-        .call_identity
-        .as_ref()
-        .and_then(|call| call.transport.as_ref())
-        .and_then(|transport| transport.usage_reported)
-        .unwrap_or_else(|| {
-            event.usage_delta.as_ref().is_some_and(|usage| {
-                usage.raw_input_tokens > 0
-                    || usage.raw_output_tokens > 0
-                    || usage.cache_read_tokens.is_some()
-                    || usage.cache_write_tokens.is_some()
-            })
-        });
     next.token_observed_call_count += u64::from(reported);
     next.llm_call_count += 1;
     next.raw_input_tokens += delta.raw_input_tokens;
@@ -87,6 +103,7 @@ fn upsert_binding_snapshot(
     let mut next: Vec<UsageBindingSnapshot> = current.to_vec();
     if let Some(pos) = next.iter().position(|item| {
         item.template_id == input.template_id
+            && item.plugin_id == input.plugin_id
             && item.engine_id == input.engine_id
             && item.binding_revision == input.binding_revision
             && item.role == input.role
@@ -115,15 +132,11 @@ fn upsert_model_snapshot(
     next
 }
 
-pub fn rebuild_session_snapshot_from_events(
-    workspace_id: Option<&str>,
-    session_id: &str,
-    events: &[UsageEvent],
-) -> SessionUsageSnapshot {
+pub(crate) fn rebuild_usage_snapshot_from_events(events: &[UsageEvent]) -> UsageAggregateSnapshot {
     let mut sorted: Vec<&UsageEvent> = events.iter().collect();
     sorted.sort_by_key(|e| e.ledger_seq);
 
-    let mut snapshot = SessionUsageSnapshot::empty(workspace_id, session_id);
+    let mut snapshot = UsageAggregateSnapshot::default();
     let mut seen_event_ids: HashSet<String> = HashSet::new();
     let mut seen_assignments: HashSet<String> = HashSet::new();
     let mut seen_turns: HashSet<String> = HashSet::new();
@@ -137,18 +150,6 @@ pub fn rebuild_session_snapshot_from_events(
         snapshot.version += 1;
         snapshot.last_applied_ledger_seq = event.ledger_seq;
         snapshot.updated_at = snapshot.updated_at.max(event.timestamp);
-
-        if event.event_type == UsageEventType::SessionReset {
-            let version = snapshot.version;
-            snapshot = SessionUsageSnapshot::empty(workspace_id, session_id);
-            snapshot.version = version;
-            snapshot.last_applied_ledger_seq = event.ledger_seq;
-            snapshot.updated_at = event.timestamp;
-            seen_assignments.clear();
-            seen_turns.clear();
-            seen_binding_assignments.clear();
-            continue;
-        }
 
         let (usage_delta, exec_binding, model_id) = match (
             &event.usage_delta,
@@ -175,6 +176,11 @@ pub fn rebuild_session_snapshot_from_events(
 
         let binding_existing = snapshot.by_execution_binding.iter().find(|item| {
             item.template_id == exec_binding.template_id
+                && item.plugin_id.as_deref()
+                    == match &event.owner {
+                        UsageOwner::Plugin { plugin } => Some(plugin.plugin_id.as_str()),
+                        UsageOwner::Session { .. } => None,
+                    }
                 && item.engine_id == exec_binding.engine_id
                 && item.binding_revision == exec_binding.binding_revision
                 && item.role == exec_binding.role
@@ -206,6 +212,14 @@ pub fn rebuild_session_snapshot_from_events(
             &snapshot.by_execution_binding,
             UsageBindingSnapshot {
                 template_id: exec_binding.template_id.clone(),
+                plugin_id: match &event.owner {
+                    UsageOwner::Plugin { plugin } => Some(plugin.plugin_id.clone()),
+                    _ => None,
+                },
+                display_name: match &event.owner {
+                    UsageOwner::Plugin { plugin } => plugin.display_name.clone(),
+                    _ => None,
+                },
                 engine_id: exec_binding.engine_id.clone(),
                 binding_revision: exec_binding.binding_revision,
                 role: exec_binding.role,
@@ -246,30 +260,34 @@ pub fn rebuild_session_snapshot_from_events(
     snapshot
 }
 
-pub fn rebuild_workspace_snapshot_from_sessions(
+pub(crate) fn rebuild_workspace_snapshot(
     workspace_id: &str,
-    session_snapshots: &[SessionUsageSnapshot],
+    snapshots: &[(UsageSubject, UsageAggregateSnapshot)],
 ) -> WorkspaceUsageSnapshot {
     let mut totals = UsageTotals::default();
     let mut binding_map: HashMap<String, UsageBindingSnapshot> = HashMap::new();
     let mut model_map: HashMap<String, UsageModelSnapshot> = HashMap::new();
 
-    let by_session: Vec<SessionSummary> = session_snapshots
+    let by_session: Vec<SessionSummary> = snapshots
         .iter()
-        .map(|s| SessionSummary {
-            session_id: s.session_id.clone(),
-            version: s.version,
-            updated_at: s.updated_at,
-            totals: s.totals.clone(),
+        .filter_map(|(subject, s)| match subject {
+            UsageSubject::Session(session_id) => Some(SessionSummary {
+                session_id: session_id.clone(),
+                version: s.version,
+                updated_at: s.updated_at,
+                totals: s.totals.clone(),
+            }),
+            UsageSubject::Plugin(_) => None,
         })
         .collect();
 
-    for session in session_snapshots {
+    for (_, session) in snapshots {
         totals = totals.add(&session.totals);
 
         for binding in &session.by_execution_binding {
             let key = format!(
-                "{}:{}:{}:{:?}:{}",
+                "{:?}:{}:{}:{}:{:?}:{}",
+                binding.plugin_id,
                 binding.template_id,
                 binding.engine_id,
                 binding.binding_revision,
@@ -294,19 +312,18 @@ pub fn rebuild_workspace_snapshot_from_sessions(
         }
     }
 
-    let version = session_snapshots
+    let version = snapshots.iter().map(|(_, s)| s.version).max().unwrap_or(0);
+    let updated_at = snapshots
         .iter()
-        .map(|s| s.version)
+        .map(|(_, s)| s.updated_at)
         .max()
         .unwrap_or(0);
-    let updated_at = session_snapshots
+    let last_applied = snapshots
         .iter()
-        .map(|s| s.updated_at)
-        .max()
-        .unwrap_or(0);
-    let last_applied = session_snapshots
-        .iter()
-        .map(|s| (s.session_id.clone(), s.version))
+        .filter_map(|(subject, s)| match subject {
+            UsageSubject::Session(id) => Some((id.clone(), s.version)),
+            UsageSubject::Plugin(_) => None,
+        })
         .collect();
 
     WorkspaceUsageSnapshot {

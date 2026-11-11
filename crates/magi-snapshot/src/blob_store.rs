@@ -207,15 +207,6 @@ impl BlobStore {
         Ok(false)
     }
 
-    /// 全量扫描 refcount，返回当前 0 引用的 blob hash 列表，不主动删除。
-    /// 调用方在归档/删除 session 时显式批量 release。
-    pub fn dangling_blobs(&self) -> Vec<String> {
-        let counts = self.refcount.lock().expect("refcount poisoned");
-        counts
-            .iter()
-            .filter_map(|(h, c)| if *c == 0 { Some(h.clone()) } else { None })
-            .collect()
-    }
 }
 
 fn now_ns() -> u128 {

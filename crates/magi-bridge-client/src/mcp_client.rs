@@ -89,16 +89,6 @@ impl McpServerConfig {
         }
     }
 
-    pub fn with_working_directory(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.working_directory = Some(dir.into());
-        self
-    }
-
-    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.env.insert(key.into(), value.into());
-        self
-    }
-
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout.max(Duration::from_millis(100));
         self

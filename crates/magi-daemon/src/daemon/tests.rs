@@ -15,8 +15,8 @@ use axum::{
     http::{Request, StatusCode},
 };
 use magi_core::{
-    AbsolutePath, AccessProfile, EventId, ExecutionOwnership, LeaseId, MissionId, SessionId, Task,
-    TaskId, TaskKind, TaskStatus, ThreadId, UtcMillis, WorkerId, WorkspaceId,
+    AbsolutePath, AccessProfile, EventId, ExecutionOwnership, MissionId, SessionId, Task, TaskId,
+    TaskKind, TaskStatus, ThreadId, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventEnvelope, InMemoryEventBus, RuntimeLedgerSummary};
 use magi_orchestrator::task_store::TaskStore;
@@ -25,9 +25,6 @@ use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, ExecutionThread, ExecutionThreadStatus,
     SessionExecutionSidecarStatus, SessionSidecarFlushMetadata, SessionSidecarFlushReason,
     SessionStore,
-};
-use magi_worker_runtime::{
-    WorkerBranchCheckpointState, WorkerExecutionBindingLifecycle, WorkerRuntime, WorkerStage,
 };
 use magi_workspace::{
     RecoveryStatus, WorkspaceRecoveryFlushMetadata, WorkspaceRecoveryFlushReason, WorkspaceStore,
@@ -56,21 +53,7 @@ fn test_sidecar_persistence(
     session_store: Arc<SessionStore>,
     workspace_store: Arc<WorkspaceStore>,
 ) -> RuntimeSidecarPersistence {
-    test_sidecar_persistence_with_worker_runtime(
-        repository,
-        session_store,
-        workspace_store,
-        WorkerRuntime::new(),
-    )
-}
-
-fn test_sidecar_persistence_with_worker_runtime(
-    repository: StateRepository,
-    session_store: Arc<SessionStore>,
-    workspace_store: Arc<WorkspaceStore>,
-    worker_runtime: WorkerRuntime,
-) -> RuntimeSidecarPersistence {
-    RuntimeSidecarPersistence::new(repository, session_store, workspace_store, worker_runtime)
+    RuntimeSidecarPersistence::new(repository, session_store, workspace_store)
 }
 
 #[test]
@@ -461,7 +444,7 @@ fn runtime_sidecar_flush_hook_only_persists_dirty_sidecars() {
         RuntimeSidecarFlushReport::default()
     );
 
-    session_store.bind_execution_ownership(
+    session_store.bind_execution_ownership_for_test(
         SessionId::new("session-flush"),
         ExecutionOwnership {
             session_id: Some(SessionId::new("session-flush")),
@@ -501,7 +484,6 @@ fn runtime_sidecar_flush_hook_only_persists_dirty_sidecars() {
         RuntimeSidecarFlushReport {
             session_sidecars_flushed: true,
             workspace_recovery_sidecars_flushed: true,
-            worker_runtime_snapshot_flushed: false,
         }
     );
     assert!(
@@ -658,127 +640,6 @@ fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
 }
 
 #[test]
-fn runtime_sidecar_flush_hook_persists_dirty_worker_runtime_snapshot() {
-    let state_root = temp_state_root("runtime-worker-snapshot-flush");
-    let repository = StateRepository::new(state_root.clone());
-    let session_store = Arc::new(SessionStore::new());
-    let workspace_store = Arc::new(WorkspaceStore::new());
-    let worker_runtime = WorkerRuntime::new();
-    let persistence = test_sidecar_persistence_with_worker_runtime(
-        repository.clone(),
-        session_store,
-        workspace_store,
-        worker_runtime.clone(),
-    );
-
-    worker_runtime.record_branch_checkpoint(
-        &TaskId::new("task-worker-snapshot"),
-        &WorkerId::new("worker-worker-snapshot"),
-        WorkerStage::Execute,
-        WorkerBranchCheckpointState {
-            lease_id: Some("lease-worker-snapshot".to_string()),
-            execution_intent_ref: Some("worker-intent-task-worker-snapshot".to_string()),
-            binding_lifecycle: Some(WorkerExecutionBindingLifecycle::Requested),
-            checkpoint_cursor: Some(magi_worker_runtime::WorkerExecutionCheckpointCursor {
-                checkpoint_stage: WorkerStage::Execute,
-                next_step_index: 1,
-                checkpoint_at: UtcMillis::now(),
-                resume_mode: magi_worker_runtime::WorkerCheckpointResumeMode::StepCheckpoint,
-                resume_token: None,
-            }),
-        },
-    );
-
-    assert_eq!(
-        persistence
-            .flush_runtime_sidecars()
-            .expect("dirty worker snapshot flush should succeed"),
-        RuntimeSidecarFlushReport {
-            session_sidecars_flushed: false,
-            workspace_recovery_sidecars_flushed: false,
-            worker_runtime_snapshot_flushed: true,
-        }
-    );
-    assert!(repository.worker_runtime_snapshot_path().exists());
-
-    let reloaded = repository
-        .load_worker_runtime_snapshot()
-        .expect("worker runtime snapshot should reload");
-    assert_eq!(reloaded.branches.len(), 1);
-    assert_eq!(
-        reloaded.branches[0].task_id,
-        TaskId::new("task-worker-snapshot")
-    );
-
-    assert_eq!(
-        persistence
-            .flush_runtime_sidecars()
-            .expect("clean worker snapshot flush should be skipped"),
-        RuntimeSidecarFlushReport::default()
-    );
-}
-
-#[test]
-fn maintenance_tick_flushes_worker_snapshot_even_when_sidecars_are_clean() {
-    let state_root = temp_state_root("maintenance-worker-snapshot-only");
-    let repository = StateRepository::new(state_root.clone());
-    let session_store = Arc::new(SessionStore::new());
-    let workspace_store = Arc::new(WorkspaceStore::new());
-    let event_bus = Arc::new(InMemoryEventBus::new(32));
-    let worker_runtime = WorkerRuntime::new();
-    let persistence = test_sidecar_persistence_with_worker_runtime(
-        repository.clone(),
-        session_store.clone(),
-        workspace_store.clone(),
-        worker_runtime.clone(),
-    );
-
-    worker_runtime.record_branch_checkpoint(
-        &TaskId::new("task-maintenance-worker"),
-        &WorkerId::new("worker-maintenance-worker"),
-        WorkerStage::Verify,
-        WorkerBranchCheckpointState {
-            lease_id: Some("lease-maintenance-worker".to_string()),
-            execution_intent_ref: Some("worker-intent-task-maintenance-worker".to_string()),
-            binding_lifecycle: Some(WorkerExecutionBindingLifecycle::Requested),
-            checkpoint_cursor: Some(magi_worker_runtime::WorkerExecutionCheckpointCursor {
-                checkpoint_stage: WorkerStage::Verify,
-                next_step_index: 1,
-                checkpoint_at: UtcMillis::now(),
-                resume_mode: magi_worker_runtime::WorkerCheckpointResumeMode::StageRestart,
-                resume_token: None,
-            }),
-        },
-    );
-
-    let maintenance = RuntimeMaintenance::new(
-        RuntimeMaintenanceConfig::default(),
-        event_bus,
-        persistence,
-        session_store,
-        workspace_store,
-    );
-
-    let report = maintenance
-        .run_once()
-        .expect("maintenance tick should flush dirty worker snapshot");
-    assert_eq!(
-        report.sidecar_report.outcome,
-        RuntimeMaintenanceStepOutcome::DueAndFlushed
-    );
-    assert!(
-        report
-            .sidecar_report
-            .detail
-            .as_deref()
-            .unwrap_or_default()
-            .contains("worker_runtime_snapshot_flushed=true"),
-        "maintenance detail should report worker snapshot flush"
-    );
-    assert!(repository.worker_runtime_snapshot_path().exists());
-}
-
-#[test]
 fn recovery_consume_updates_sidecars_can_be_flushed_incrementally() {
     let state_root = temp_state_root("recovery-sidecar-incremental");
     let repository = StateRepository::new(state_root);
@@ -800,7 +661,7 @@ fn recovery_consume_updates_sidecars_can_be_flushed_incrementally() {
         .register(workspace_id.clone(), workspace_root.clone())
         .expect("workspace should be registrable");
 
-    session_store.bind_execution_ownership(
+    session_store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -833,7 +694,7 @@ fn recovery_consume_updates_sidecars_can_be_flushed_incrementally() {
         Some("diagnostic".to_string()),
     );
     session_store
-        .attach_recovery_ref(&session_id, Some(recovery.recovery_id.clone()))
+        .set_recovery_id(&session_id, None, Some(recovery.recovery_id.clone()))
         .expect("recovery ref should be attachable");
     persistence
         .flush_runtime_sidecars()
@@ -859,7 +720,6 @@ fn recovery_consume_updates_sidecars_can_be_flushed_incrementally() {
         RuntimeSidecarFlushReport {
             session_sidecars_flushed: true,
             workspace_recovery_sidecars_flushed: true,
-            worker_runtime_snapshot_flushed: false,
         }
     );
 
@@ -922,7 +782,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
             Some(workspace_id.to_string()),
         )
         .expect("session should be creatable");
-    state.session_store.bind_execution_ownership(
+    state.session_store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -935,7 +795,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
     );
     state
         .session_store
-        .upsert_active_execution_chain(
+        .seed_execution_chain_for_test(
             session_id.clone(),
             ActiveExecutionChain {
                 session_id: session_id.clone(),
@@ -943,33 +803,21 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
                 root_task_id: TaskId::new("task-root-router-recovery"),
                 execution_chain_ref: execution_chain_ref.clone(),
                 workspace_id: Some(workspace_id.clone()),
-                active_branch_task_ids: vec![task_id.clone()],
-                active_worker_bindings: vec![worker_id.clone()],
                 branches: vec![ActiveExecutionBranch {
                     task_id: task_id.clone(),
                     worker_id: worker_id.clone(),
-                    stage: "blocked".to_string(),
-                    lease_id: None,
-                    execution_intent_ref: None,
-                    binding_lifecycle: Some("active".to_string()),
-                    checkpoint_stage: Some("execute".to_string()),
-                    next_step_index: Some(1),
-                    checkpoint_at: Some(UtcMillis::now()),
-                    resume_mode: Some("step-checkpoint".to_string()),
-                    resume_token: None,
                     is_primary: true,
                     use_tools: true,
                     skill_name: Some("resume".to_string()),
                     thread_id: ThreadId::new("thread-router-recovery"),
                 }],
-                recovery_ref: Some("recovery-router-recovery".to_string()),
                 dispatch_context: ActiveExecutionDispatchContext {
                     accepted_at: UtcMillis::now(),
                     entry_id: "timeline-router-recovery".to_string(),
                     trimmed_text: Some("resume parser after crash".to_string()),
                     skill_name: Some("resume".to_string()),
                 },
-                current_turn: None,
+                current_turn_id: None,
             },
         )
         .expect("active execution chain should attach");
@@ -1148,6 +996,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
                 && magi_conversation_runtime::execution_chain_recovery::active_execution_branch_is_continue_recoverable(
                     state.task_store(),
                     &retained_chain,
+                    state.session_store.runtime_sidecar(&session_id).as_ref().and_then(|s| s.current_turn.as_ref()),
                     branch,
                 )
         }),
@@ -1534,7 +1383,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         .expect("recovery should become ready");
     state
         .session_store
-        .attach_recovery_ref(&session_id, Some(recovery.recovery_id.clone()))
+        .set_recovery_id(&session_id, None, Some(recovery.recovery_id.clone()))
         .expect("recovery ref should attach to session");
 
     let (status, recovery_body) = post_json(
@@ -1754,7 +1603,7 @@ fn runtime_maintenance_tick_can_refresh_ledger_and_flush_due_sidecars() {
             workspace_root.clone(),
         )
         .expect("workspace should be registrable");
-    session_store.bind_execution_ownership(
+    session_store.bind_execution_ownership_for_test(
         SessionId::new("session-maintenance"),
         ExecutionOwnership {
             session_id: Some(SessionId::new("session-maintenance")),
@@ -1849,7 +1698,7 @@ fn runtime_maintenance_policy_can_skip_disabled_actions() {
             temp_workspace_absolute_path("runtime-sidecar-disabled-workspace"),
         )
         .expect("workspace should be registrable");
-    session_store.bind_execution_ownership(
+    session_store.bind_execution_ownership_for_test(
         SessionId::new("session-disabled"),
         ExecutionOwnership {
             session_id: Some(SessionId::new("session-disabled")),
@@ -2018,7 +1867,7 @@ fn aggressive_flush_profile_ignores_future_flush_hints_for_dirty_sidecars() {
     session_store
         .create_session(SessionId::new("session-aggressive"), "aggressive session")
         .expect("session should be creatable");
-    session_store.bind_execution_ownership(
+    session_store.bind_execution_ownership_for_test(
         SessionId::new("session-aggressive"),
         ExecutionOwnership {
             session_id: Some(SessionId::new("session-aggressive")),
@@ -2086,7 +1935,7 @@ fn persistence_long_chain_boot_mutate_flush_restart_verifies_sidecar_integrity()
         .expect("workspace should be registrable");
 
     // Bind execution ownership — makes session sidecar dirty
-    session_store.bind_execution_ownership(session_id.clone(), ownership.clone());
+    session_store.bind_execution_ownership_for_test(session_id.clone(), ownership.clone());
 
     // Create snapshot + recovery entry — makes workspace sidecar dirty
     let snapshot = workspace_store.append_execution_snapshot(
@@ -2103,7 +1952,7 @@ fn persistence_long_chain_boot_mutate_flush_restart_verifies_sidecar_integrity()
         Some("long-chain diagnostic".to_string()),
     );
     session_store
-        .attach_recovery_ref(&session_id, Some(recovery.recovery_id.clone()))
+        .set_recovery_id(&session_id, None, Some(recovery.recovery_id.clone()))
         .expect("recovery ref should be attachable");
 
     // workspace 注册事实必须先于引用它的 session projection。
@@ -2278,7 +2127,7 @@ fn persistence_long_chain_restart_mutate_flush_validates_incremental_across_boun
             )
             .expect("workspace should be registrable");
 
-        session_store.bind_execution_ownership(session_id.clone(), ownership.clone());
+        session_store.bind_execution_ownership_for_test(session_id.clone(), ownership.clone());
         let snapshot = workspace_store.append_execution_snapshot(
             workspace_id.clone(),
             ownership.clone(),
@@ -2452,7 +2301,7 @@ fn persistence_long_chain_maintenance_tick_drives_full_restart_recovery_cycle() 
         )
         .expect("workspace should be registrable");
 
-    session_store.bind_execution_ownership(session_id.clone(), ownership.clone());
+    session_store.bind_execution_ownership_for_test(session_id.clone(), ownership.clone());
     let snapshot = workspace_store.append_execution_snapshot(
         workspace_id.clone(),
         ownership.clone(),
@@ -2593,7 +2442,7 @@ fn graceful_shutdown_marks_runtime_status_complete_after_final_tick() {
             temp_workspace_absolute_path("runtime-shutdown-workspace"),
         )
         .expect("workspace should be registrable");
-    session_store.bind_execution_ownership(
+    session_store.bind_execution_ownership_for_test(
         SessionId::new("session-shutdown"),
         ExecutionOwnership {
             session_id: Some(SessionId::new("session-shutdown")),
@@ -3608,113 +3457,147 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
 
 #[tokio::test]
 async fn runtime_restore_detaches_session_chain_when_root_task_checkpoint_is_missing() {
-    let state_root = temp_state_root("stale-session-chain-root-missing");
-    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
-    let workspace_root = temp_state_root("stale-session-chain-root-missing-workspace");
-    let repository = StateRepository::new(state_root);
-    let session_store = SessionStore::new();
-    let workspace_store = WorkspaceStore::new();
-    let session_id = SessionId::new("session-stale-chain-root-missing");
-    let workspace_id = WorkspaceId::new("workspace-stale-chain-root-missing");
-    let mission_id = MissionId::new("mission-stale-chain-root-missing");
-    let root_task_id = TaskId::new("task-root-stale-chain-root-missing");
-    let branch_task_id = TaskId::new("task-branch-stale-chain-root-missing");
-    let worker_id = WorkerId::new("worker-stale-chain-root-missing");
+    for has_turn in [false, true] {
+        let state_root = temp_state_root(&format!("stale-session-chain-root-missing-{has_turn}"));
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
+        let workspace_root = temp_state_root("stale-session-chain-root-missing-workspace");
+        let repository = StateRepository::new(state_root);
+        let session_store = SessionStore::new();
+        let workspace_store = WorkspaceStore::new();
+        let session_id = SessionId::new("session-stale-chain-root-missing");
+        let workspace_id = WorkspaceId::new("workspace-stale-chain-root-missing");
+        let mission_id = MissionId::new("mission-stale-chain-root-missing");
+        let root_task_id = TaskId::new("task-root-stale-chain-root-missing");
+        let branch_task_id = TaskId::new("task-branch-stale-chain-root-missing");
+        let worker_id = WorkerId::new("worker-stale-chain-root-missing");
 
-    session_store
-        .create_session(session_id.clone(), "stale chain")
-        .expect("session should be creatable");
-    workspace_store
-        .register(
-            workspace_id,
-            AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
-        )
-        .expect("workspace should be registrable");
-    session_store
-        .upsert_active_execution_chain(
-            session_id.clone(),
-            ActiveExecutionChain {
-                session_id: session_id.clone(),
-                mission_id: mission_id.clone(),
-                root_task_id: root_task_id.clone(),
-                execution_chain_ref: "chain-stale-root-missing".to_string(),
-                workspace_id: None,
-                active_branch_task_ids: vec![branch_task_id.clone()],
-                active_worker_bindings: vec![worker_id.clone()],
-                branches: vec![ActiveExecutionBranch {
-                    task_id: branch_task_id,
-                    worker_id,
-                    stage: "execute".to_string(),
-                    lease_id: None,
-                    execution_intent_ref: Some("intent-stale-root-missing".to_string()),
-                    binding_lifecycle: Some("requested".to_string()),
-                    checkpoint_stage: Some("execute".to_string()),
-                    next_step_index: Some(1),
-                    checkpoint_at: Some(UtcMillis::now()),
-                    resume_mode: Some("step-checkpoint".to_string()),
-                    resume_token: None,
-                    use_tools: true,
-                    skill_name: None,
-                    is_primary: true,
-                    thread_id: ThreadId::new("thread-stale-root-missing"),
-                }],
-                recovery_ref: None,
-                dispatch_context: ActiveExecutionDispatchContext {
-                    accepted_at: UtcMillis::now(),
-                    entry_id: "timeline-stale-root-missing".to_string(),
-                    trimmed_text: Some("stale root should detach".to_string()),
-                    skill_name: None,
-                },
-                current_turn: None,
+        session_store
+            .create_session(session_id.clone(), "stale chain")
+            .expect("session should be creatable");
+        workspace_store
+            .register(
+                workspace_id,
+                AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
+            )
+            .expect("workspace should be registrable");
+        let chain = ActiveExecutionChain {
+            session_id: session_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            execution_chain_ref: "chain-stale-root-missing".to_string(),
+            workspace_id: None,
+            branches: vec![ActiveExecutionBranch {
+                task_id: branch_task_id,
+                worker_id,
+                use_tools: true,
+                skill_name: None,
+                is_primary: true,
+                thread_id: ThreadId::new("thread-stale-root-missing"),
+            }],
+            dispatch_context: ActiveExecutionDispatchContext {
+                accepted_at: UtcMillis::now(),
+                entry_id: "timeline-stale-root-missing".to_string(),
+                trimmed_text: Some("stale root should detach".to_string()),
+                skill_name: None,
             },
-        )
-        .expect("active execution chain should persist to sidecar");
-    repository
-        .save_session_projection_state(
-            &session_store.durable_state(),
-            &session_store.execution_sidecar_store_state(),
-        )
-        .expect("session projection should save");
-    repository
-        .save_workspace_durable_state(&workspace_store.durable_state())
-        .expect("workspace durable state should save");
+            current_turn_id: has_turn.then(|| "stale-root-turn".into()),
+        };
+        if has_turn {
+            session_store.install_session_event_writer(Arc::new(repository.clone()));
+            let accepted_at = UtcMillis::now();
+            session_store
+                .accept_active_execution_chain_with_timeline_entry(
+                    session_id.clone(),
+                    magi_session_store::TimelineEntryInput::new(
+                        "stale-root-timeline",
+                        magi_session_store::TimelineEntryKind::UserMessage,
+                        "stale root",
+                        accepted_at,
+                    ),
+                    chain,
+                    ActiveExecutionTurn {
+                        turn_id: "stale-root-turn".into(),
+                        turn_seq: accepted_at.0,
+                        accepted_at,
+                        completed_at: None,
+                        status: "running".into(),
+                        user_message: Some("stale root".into()),
+                        items: vec![],
+                    },
+                )
+                .unwrap();
+        } else {
+            session_store
+                .seed_execution_chain_for_test(session_id.clone(), chain)
+                .unwrap();
+        }
+        repository
+            .save_session_projection_state(
+                &session_store.durable_state(),
+                &session_store.execution_sidecar_store_state(),
+            )
+            .expect("session projection should save");
+        repository
+            .save_workspace_durable_state(&workspace_store.durable_state())
+            .expect("workspace durable state should save");
 
-    let runtime =
-        DaemonRuntime::restore(&config).expect("runtime restore should load stale sidecar");
-    let (_app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should load stale sidecar");
+        let (_app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
-    let sidecar = state
-        .session_store
-        .runtime_sidecar(&session_id)
-        .expect("session sidecar should still exist");
-    assert_eq!(sidecar.status, SessionExecutionSidecarStatus::Detached);
-    assert!(sidecar.active_execution_chain.is_none());
-    assert!(sidecar.ownership.mission_id.is_none());
-    assert!(sidecar.ownership.task_id.is_none());
-    assert!(sidecar.ownership.execution_chain_ref.is_none());
+        let sidecar = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .expect("session sidecar should still exist");
+        assert_eq!(sidecar.status, SessionExecutionSidecarStatus::Detached);
+        assert!(sidecar.active_execution_chain.is_none());
+        assert!(sidecar.ownership.mission_id.is_none());
+        assert!(sidecar.ownership.task_id.is_none());
+        assert!(sidecar.ownership.execution_chain_ref.is_none());
 
-    let read_model = state.runtime_read_model_dto();
-    let session_summary = read_model
-        .details
-        .sessions
-        .iter()
-        .find(|entry| entry.session_id == session_id.to_string())
-        .expect("runtime read model should contain session summary");
-    assert_eq!(session_summary.current_status.as_deref(), Some("detached"));
-    assert!(session_summary.root_task_id.is_none());
-    assert!(session_summary.active_task_ids.is_empty());
-    assert!(session_summary.active_execution_group_ids.is_empty());
+        let read_model = state.runtime_read_model_dto();
+        let session_summary = read_model
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == session_id.to_string())
+            .expect("runtime read model should contain session summary");
+        assert_eq!(session_summary.current_status.as_deref(), Some("detached"));
+        assert!(session_summary.root_task_id.is_none());
+        assert!(session_summary.active_task_ids.is_empty());
+        assert!(session_summary.active_execution_group_ids.is_empty());
 
-    let (_, persisted_sidecars) = repository
-        .load_session_projections(&[])
-        .expect("reconciled sidecars should persist");
-    let persisted = persisted_sidecars
-        .runtime_sidecars
-        .iter()
-        .find(|sidecar| sidecar.session_id == session_id)
-        .expect("persisted sidecar should exist");
-    assert_eq!(persisted.status, SessionExecutionSidecarStatus::Detached);
-    assert!(persisted.active_execution_chain.is_none());
+        let (_, persisted_sidecars) = repository
+            .load_session_projections(&[])
+            .expect("reconciled sidecars should persist");
+        let persisted = persisted_sidecars
+            .runtime_sidecars
+            .iter()
+            .find(|sidecar| sidecar.session_id == session_id)
+            .expect("persisted sidecar should exist");
+        assert_eq!(persisted.status, SessionExecutionSidecarStatus::Detached);
+        assert!(persisted.active_execution_chain.is_none());
+        if has_turn {
+            assert_eq!(sidecar.current_turn.as_ref().unwrap().status, "cancelled");
+            assert_eq!(
+                persisted
+                    .project(&state.session_store.durable_state().canonical_turns)
+                    .unwrap()
+                    .current_turn
+                    .unwrap()
+                    .status,
+                "cancelled"
+            );
+            assert_eq!(
+                state
+                    .session_store
+                    .canonical_turn_for_session_turn_id(&session_id, "stale-root-turn")
+                    .unwrap()
+                    .status,
+                magi_session_store::CanonicalTurnStatus::Cancelled
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -3815,15 +3698,6 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
     let primary_branch = ActiveExecutionBranch {
         task_id: root_task_id.clone(),
         worker_id: root_worker_id.clone(),
-        stage: "execute".to_string(),
-        lease_id: None,
-        execution_intent_ref: Some("worker-intent-session-continue-restart-chain".to_string()),
-        binding_lifecycle: Some("requested".to_string()),
-        checkpoint_stage: Some("execute".to_string()),
-        next_step_index: Some(1),
-        checkpoint_at: Some(now),
-        resume_mode: Some("step-checkpoint".to_string()),
-        resume_token: None,
         use_tools: true,
         skill_name: Some("refactor".to_string()),
         is_primary: true,
@@ -3842,7 +3716,6 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
             last_used_at: now,
             observed_context_window_tokens: None,
             handled_task_ids: vec![root_task_id.clone()],
-            message_history: Vec::new(),
         })
         .expect("restart chain root thread should register");
     let mut chain = ActiveExecutionChain {
@@ -3851,10 +3724,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         root_task_id: root_task_id.clone(),
         execution_chain_ref: execution_chain_ref.clone(),
         workspace_id: Some(workspace_id.clone()),
-        active_branch_task_ids: vec![root_task_id.clone()],
-        active_worker_bindings: vec![root_worker_id.clone()],
         branches: vec![primary_branch.clone()],
-        recovery_ref: None,
         dispatch_context: ActiveExecutionDispatchContext {
             accepted_at: now,
             entry_id: "timeline-session-continue-restart-chain".to_string(),
@@ -3863,17 +3733,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
             ),
             skill_name: Some("refactor".to_string()),
         },
-        current_turn: Some(ActiveExecutionTurn {
-            turn_id: "turn-session-continue-restart-chain".to_string(),
-            turn_seq: now.0,
-            accepted_at: now,
-            completed_at: None,
-            status: "running".to_string(),
-            user_message: Some(
-                "修复重启继续执行链路问题，完成后运行测试并汇总验证结果".to_string(),
-            ),
-            items: vec![user_item],
-        }),
+        current_turn_id: Some("turn-session-continue-restart-chain".to_string()),
     };
     state
         .session_store
@@ -3886,6 +3746,17 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
                 now,
             ),
             chain.clone(),
+            ActiveExecutionTurn {
+                turn_id: "turn-session-continue-restart-chain".to_string(),
+                turn_seq: now.0,
+                accepted_at: now,
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some(
+                    "修复重启继续执行链路问题，完成后运行测试并汇总验证结果".to_string(),
+                ),
+                items: vec![user_item],
+            },
         )
         .expect("restart chain should accept canonical turn");
     let admission = state
@@ -3909,18 +3780,10 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         )
     ));
     let extra_branch_specs = [
-        (
-            "task-restart-branch-1",
-            "worker-restart-branch-1",
-            "lease-restart-branch-1",
-        ),
-        (
-            "task-restart-branch-2",
-            "worker-restart-branch-2",
-            "lease-restart-branch-2",
-        ),
+        ("task-restart-branch-1", "worker-restart-branch-1"),
+        ("task-restart-branch-2", "worker-restart-branch-2"),
     ];
-    for (task_id, worker_id, lease_id) in extra_branch_specs {
+    for (task_id, worker_id) in extra_branch_specs {
         task_store
             .insert_task(Task {
                 task_id: TaskId::new(task_id),
@@ -3952,15 +3815,6 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         chain.branches.push(ActiveExecutionBranch {
             task_id: TaskId::new(task_id),
             worker_id: WorkerId::new(worker_id),
-            stage: "execute".to_string(),
-            lease_id: Some(LeaseId::new(lease_id)),
-            execution_intent_ref: Some(format!("worker-intent-{task_id}")),
-            binding_lifecycle: Some("requested".to_string()),
-            checkpoint_stage: Some("execute".to_string()),
-            next_step_index: Some(1),
-            checkpoint_at: Some(now),
-            resume_mode: Some("step-checkpoint".to_string()),
-            resume_token: None,
             use_tools: true,
             skill_name: None,
             is_primary: false,
@@ -3998,15 +3852,6 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
     chain.branches.push(ActiveExecutionBranch {
         task_id: TaskId::new("task-restart-branch-completed"),
         worker_id: WorkerId::new("worker-restart-branch-completed"),
-        stage: "finish".to_string(),
-        lease_id: None,
-        execution_intent_ref: Some("worker-intent-task-restart-branch-completed".to_string()),
-        binding_lifecycle: Some("bound".to_string()),
-        checkpoint_stage: None,
-        next_step_index: None,
-        checkpoint_at: None,
-        resume_mode: None,
-        resume_token: None,
         use_tools: true,
         skill_name: None,
         is_primary: false,
@@ -4035,20 +3880,9 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
                 last_used_at: now,
                 observed_context_window_tokens: None,
                 handled_task_ids: vec![branch.task_id.clone()],
-                message_history: Vec::new(),
             })
             .expect("恢复 branch thread 测试数据应注册成功");
     }
-    chain.active_branch_task_ids = chain
-        .branches
-        .iter()
-        .map(|branch| branch.task_id.clone())
-        .collect();
-    chain.active_worker_bindings = chain
-        .branches
-        .iter()
-        .map(|branch| branch.worker_id.clone())
-        .collect();
     let expected_active_branch_count = chain.branches.len();
     let expected_resumable_branch_count = chain
         .branches
@@ -4062,57 +3896,11 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
             })
         })
         .count();
-    state
-        .session_store
-        .upsert_active_execution_chain(session_id.clone(), chain.clone())
-        .expect("augmented execution chain should persist to sidecar");
-
-    let worker_runtime = state
-        .execution_pipeline()
-        .expect("execution pipeline should exist")
-        .execution_runtime
-        .worker_runtime()
-        .clone();
-    let parse_worker_stage = |stage: &str| match stage {
-        "review" => WorkerStage::Review,
-        "verify" => WorkerStage::Verify,
-        "repair" => WorkerStage::Repair,
-        "finish" => WorkerStage::Finish,
-        _ => WorkerStage::Execute,
-    };
-    let parse_binding_lifecycle = |lifecycle: Option<&str>| match lifecycle {
-        Some("bound") => Some(WorkerExecutionBindingLifecycle::Bound),
-        Some("released") => Some(WorkerExecutionBindingLifecycle::Released),
-        Some("none") => Some(WorkerExecutionBindingLifecycle::None),
-        Some("requested") => Some(WorkerExecutionBindingLifecycle::Requested),
-        None => None,
-        Some(_) => Some(WorkerExecutionBindingLifecycle::Requested),
-    };
-    for branch in &chain.branches {
-        worker_runtime.record_branch_checkpoint(
-            &branch.task_id,
-            &branch.worker_id,
-            parse_worker_stage(&branch.stage),
-            WorkerBranchCheckpointState {
-                lease_id: branch.lease_id.as_ref().map(ToString::to_string),
-                execution_intent_ref: branch.execution_intent_ref.clone(),
-                binding_lifecycle: parse_binding_lifecycle(branch.binding_lifecycle.as_deref()),
-                checkpoint_cursor: branch.checkpoint_stage.as_deref().map(|checkpoint_stage| {
-                    magi_worker_runtime::WorkerExecutionCheckpointCursor {
-                        checkpoint_stage: parse_worker_stage(checkpoint_stage),
-                        next_step_index: branch.next_step_index.unwrap_or(0),
-                        checkpoint_at: branch.checkpoint_at.unwrap_or(now),
-                        resume_mode: match branch.resume_mode.as_deref() {
-                            Some("step-checkpoint") => {
-                                magi_worker_runtime::WorkerCheckpointResumeMode::StepCheckpoint
-                            }
-                            _ => magi_worker_runtime::WorkerCheckpointResumeMode::StageRestart,
-                        },
-                        resume_token: branch.resume_token.clone(),
-                    }
-                }),
-            },
-        );
+    for branch in chain.branches.iter().filter(|branch| !branch.is_primary) {
+        state
+            .session_store
+            .insert_execution_branch(&session_id, &chain, branch.clone())
+            .expect("augmented execution branch should persist");
     }
 
     fs::create_dir_all(&state_root).expect("state root should exist before task checkpoint");
@@ -4123,7 +3911,6 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         repository.clone(),
         state.session_store.clone(),
         state.workspace_registry.clone(),
-        worker_runtime.clone(),
     )
     .flush_runtime_sidecars()
     .expect("runtime sidecars should flush");
@@ -4131,7 +3918,6 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
     // 的 checkpoint；此时 sidecar 已经是 clean，返回 false 只表示没有新增脏版本。
     // 后续 restart 断言会验证这份最新 chain 确实已落盘。
     let _ = flush_report.session_sidecars_flushed;
-    assert!(flush_report.worker_runtime_snapshot_flushed);
 
     drop(app);
     drop(state);
@@ -4195,44 +3981,6 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
             .iter()
             .all(|entry| entry["status"] != "running"),
         "restart 后不应残留假活跃 running branch"
-    );
-
-    let worker_snapshot = repository
-        .load_worker_runtime_snapshot()
-        .expect("worker runtime snapshot should reload after restart");
-    assert_eq!(worker_snapshot.branches.len(), expected_active_branch_count);
-    let resumed_checkpoint_branch = worker_snapshot
-        .branches
-        .iter()
-        .find(|branch| branch.task_id.as_str() == "task-restart-branch-1")
-        .expect("checkpointed branch should survive restart");
-    assert_eq!(resumed_checkpoint_branch.stage, WorkerStage::Execute);
-    let resumed_checkpoint_cursor = resumed_checkpoint_branch
-        .checkpoint_cursor
-        .as_ref()
-        .expect("checkpointed branch should retain checkpoint cursor");
-    assert_eq!(
-        resumed_checkpoint_cursor.checkpoint_stage,
-        WorkerStage::Execute
-    );
-    assert_eq!(resumed_checkpoint_cursor.next_step_index, 1);
-    assert_eq!(
-        resumed_checkpoint_cursor.resume_mode,
-        magi_worker_runtime::WorkerCheckpointResumeMode::StepCheckpoint
-    );
-    let completed_snapshot_branch = worker_snapshot
-        .branches
-        .iter()
-        .find(|branch| branch.task_id.as_str() == "task-restart-branch-completed")
-        .expect("completed branch snapshot should survive restart");
-    assert_eq!(completed_snapshot_branch.stage, WorkerStage::Finish);
-    assert_eq!(
-        completed_snapshot_branch.binding_lifecycle,
-        Some(WorkerExecutionBindingLifecycle::Bound)
-    );
-    assert!(
-        completed_snapshot_branch.checkpoint_cursor.is_none(),
-        "已完成 branch 不应保留可恢复 checkpoint"
     );
 
     let (continue_status, continue_body) = post_json(
@@ -4307,8 +4055,8 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         .expect("completed branch should still be visible after continue");
     assert_eq!(completed_branch_summary["status"], "completed");
     assert!(
-        completed_branch_summary["checkpoint_stage"].is_null(),
-        "已完成 branch 不应在 continue 后重新产生 checkpoint"
+        completed_branch_summary.get("checkpoint_stage").is_none(),
+        "旧检查点字段应从运行 DTO 清退"
     );
 
     let task_store_projection_dir = state_root.join("task-store-projections");
@@ -4335,15 +4083,11 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
     assert_eq!(resumed_chain.mission_id, mission_id);
     assert_eq!(resumed_chain.root_task_id, root_task_id);
     assert_eq!(resumed_chain.execution_chain_ref, execution_chain_ref);
-    let completed_resumed_branch = resumed_chain
-        .branches
-        .iter()
-        .find(|branch| branch.task_id.as_str() == "task-restart-branch-completed")
-        .expect("completed branch should remain attached to resumed chain");
-    assert_eq!(completed_resumed_branch.stage, "finish");
     assert!(
-        completed_resumed_branch.checkpoint_stage.is_none(),
-        "已完成 branch 不应在 resumed chain 中变成可恢复分支"
+        resumed_chain
+            .branches
+            .iter()
+            .any(|branch| branch.task_id.as_str() == "task-restart-branch-completed")
     );
     assert_eq!(
         restarted_state
@@ -4444,17 +4188,10 @@ async fn workspace_bound_session_continue_survives_runtime_restart() {
     task_store
         .checkpoint_to_projection_directory(&state_root.join("task-store-projections"))
         .expect("task store checkpoint should persist");
-    let worker_runtime = state
-        .execution_pipeline()
-        .expect("execution pipeline should exist")
-        .execution_runtime
-        .worker_runtime()
-        .clone();
     let _flush_report = RuntimeSidecarPersistence::new(
         repository.clone(),
         state.session_store.clone(),
         state.workspace_registry.clone(),
-        worker_runtime,
     )
     .flush_runtime_sidecars()
     .expect("runtime sidecars should flush");

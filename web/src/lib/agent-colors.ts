@@ -190,27 +190,3 @@ export function getAgentBrandInfo(
     label: resolveAgentDisplayLabel(agentId, translate),
   };
 }
-
-/**
- * 获取 agent 的统一视觉信息（品牌色 + 图标 + 标签）
- * 角色模板与引擎品牌都走这一条，避免组件各自推断颜色。
- */
-export function getAgentVisualInfo(
-  agentId: string,
-  colorToken?: string,
-  translate?: AgentLabelTranslator,
-): {
-  color: string;
-  muted: string;
-  icon: IconName;
-  label: string;
-} {
-  const colorPair = getAgentColor(agentId, colorToken);
-  const brand = getAgentBrandInfo(agentId, translate);
-  return {
-    color: colorPair.color,
-    muted: colorPair.muted,
-    icon: brand.icon,
-    label: brand.label,
-  };
-}

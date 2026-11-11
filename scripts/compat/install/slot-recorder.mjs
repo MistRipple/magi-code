@@ -3,7 +3,7 @@
 import { createRequire } from 'node:module';
 import { readFileSync, writeFileSync } from 'node:fs';
 import vm from 'node:vm';
-import { createSlotContext, slotDisposition } from '../runtime/client/slot-context.mjs';
+import { createSlotContext, slotDisposition, SLOT_SURFACE } from '../runtime/client/slot-context.mjs';
 import { browserLibraries } from '../runtime/client/modules.mjs';
 
 const [clientFile, sharedRoot, resultPath] = process.argv.slice(2);
@@ -64,19 +64,32 @@ sandbox.window.__ModuleLoader__ = {
     applied = true;
   },
 };
-vm.runInContext(readFileSync(clientFile, 'utf8'), context, { timeout: 20_000 });
-if (!applied) throw new Error('上游界面没有调用 __ModuleLoader__.load');
-await initialized;
-const labelOf = (label) => { const value = typeof label === 'function' ? label() : label; return typeof value === 'string' && value ? value : undefined; };
-const slots = slotContext.live().map(({ descriptor }) => {
-  const { name } = descriptor;
-  const key = String(descriptor.key ?? descriptor.id ?? '');
-  const tab = slotContext.tabTypes().find((item) => item.id === key);
-  const navigation = slotContext.live().find((item) => item.descriptor.name === 'sidebar.panellist' && item.descriptor.id === key);
-  return { name, key, label: labelOf(descriptor.label ?? tab?.title ?? navigation?.descriptor.label), count: 1, disposition: slotDisposition(name) };
-});
-// 与真实文档关闭采用同一清理合同；清理失败也属于原入口未完成，不能交付
-// 一份只记录了注册、却从未验证释放函数可调用的成功报告。
-slotContext.dispose();
-writeFileSync(resultPath, JSON.stringify(slots));
-process.exit(0);
+try {
+  vm.runInContext(readFileSync(clientFile, 'utf8'), context, { timeout: 20_000 });
+  if (!applied) throw new Error('上游界面没有调用 __ModuleLoader__.load');
+  await initialized;
+  const labelOf = (label) => { const value = typeof label === 'function' ? label() : label; return typeof value === 'string' && value ? value : undefined; };
+  const live = slotContext.live();
+  // 同一配置组件在上游外壳的 main 别名不成为第二个编辑入口；独立业务组件保留。
+  const settingsComponents = new Set(live.filter(entry => SLOT_SURFACE[entry.descriptor.name] === 'settings').map(entry => entry.component));
+  const slots = live.map(({ descriptor, component }) => {
+    const { name } = descriptor;
+    const key = String(descriptor.key ?? descriptor.id ?? '');
+    const tab = slotContext.tabTypes().find((item) => item.id === key);
+    const navigation = slotContext.live().find((item) => item.descriptor.name === 'sidebar.panellist' && item.descriptor.id === key);
+    const settingsDuplicate = name === 'main' && settingsComponents.has(component);
+    return { name, key, label: labelOf(descriptor.label ?? tab?.title ?? navigation?.descriptor.label),
+      ...(descriptor.priority === undefined ? {} : { priority: descriptor.priority }), count: 1,
+      ...(settingsDuplicate ? { settingsDuplicate: true } : {}), disposition: settingsDuplicate ? 'alternate' : slotDisposition(name, key) };
+  });
+  // 与真实文档关闭采用同一清理合同；清理失败也属于原入口未完成，不能交付
+  // 一份只记录了注册、却从未验证释放函数可调用的成功报告。
+  slotContext.dispose();
+  writeFileSync(resultPath, JSON.stringify(slots));
+} catch (error) {
+  // 安装准入失败作为用户可读原因传回 daemon，不把 Node 堆栈当作产品提示。
+  console.error(error.message);
+  process.exitCode = 1;
+} finally {
+  process.exit(process.exitCode ?? 0);
+}

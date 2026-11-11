@@ -786,96 +786,82 @@ fn preflight_agent_model(
         .get(&parent_task.task_id)
         .and_then(|plan| plan.execution_settings_snapshot());
     let settings = parent_settings.as_ref().or(runtime_settings.as_ref());
-    if settings.is_none() && default_model_client.is_none() {
-        // 轻量单测和仅验证任务拓扑的运行时没有模型配置注入，保留其原有能力；daemon
-        // 生产路径会注入 settings 或默认模型客户端，从而启用完整模型预检。
-        if effort.is_some() {
-            return Err(AgentSpawnPreflightError::input(
-                "reasoning_capability_unavailable",
-                "当前执行器未提供模型能力",
-                "省略 reasoning_effort 使用执行器默认值。",
-            ));
-        }
-        return Ok((None, None));
-    }
     if let Some(store) = settings {
+        let role_bound = configured_role_engine_model_config(store, role)
+            .map_err(|_| {
+                AgentSpawnPreflightError::runtime(
+                    "model_preflight_failed",
+                    "model",
+                    "角色模型配置不可用",
+                    "请检查角色模型引擎绑定后重试。",
+                )
+            })?
+            .is_some();
         let explicitly_bound = parent_task
             .executor_binding
             .as_ref()
             .and_then(|binding| binding.model_selection.as_ref())
             .is_some()
-            || crate::model_config::configured_role_engine_model_config(store, role)
-                .map_err(|_| {
+            || role_bound;
+        let configured = explicitly_bound
+            || crate::model_config::has_orchestrator_model_config(store, Some(session_id))
+                .map_err(|error| {
+                    tracing::warn!(role, %error, "agent model configuration is invalid");
                     AgentSpawnPreflightError::runtime(
                         "model_preflight_failed",
                         "model",
-                        "角色模型配置不可用",
-                        "请检查角色模型引擎绑定后重试。",
+                        "主对话模型配置无效",
+                        "请修复原模型配置后重试。",
                     )
-                })?
-                .is_some();
-        let fallback_available =
-            default_model_client.is_some() && effort.is_none() && !explicitly_bound;
-        let (config, engine, revision) = match crate::model_config::agent_target_model_config(
-            store,
-            parent_task,
-            role,
-            session_id,
-        ) {
-            Ok(resolved) => resolved,
-            Err(error) if fallback_available => {
-                // Harnesses and lightweight embedders may provide an already-built client
-                // without a persisted settings section. Preserve the historical fallback;
-                // production with a reasoning override still requires a real catalog.
-                tracing::debug!(role, %error, "falling back to injected agent model client");
-                return Ok((Some("inherited_orchestrator".into()), None));
-            }
-            Err(error) => {
-                tracing::warn!(role, %error, "agent model resolution failed");
+                })?;
+        if configured {
+            let (config, engine, revision) = match crate::model_config::agent_target_model_config(
+                store,
+                parent_task,
+                role,
+                session_id,
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    tracing::warn!(role, %error, "agent model resolution failed");
+                    return Err(AgentSpawnPreflightError::runtime(
+                        "model_preflight_failed",
+                        "model",
+                        "角色或继承模型配置不可用",
+                        "检查原角色模型引擎与主对话配置后重试。",
+                    ));
+                }
+            };
+            if config.to_http_model_client().is_none() {
                 return Err(AgentSpawnPreflightError::runtime(
                     "model_preflight_failed",
                     "model",
-                    "角色或继承模型配置不可用",
-                    "检查原角色模型引擎与主对话配置后重试。",
+                    "子代理模型连接不可用",
+                    "检查原模型连接配置后重试。",
                 ));
             }
-        };
-        if config.to_http_model_client().is_none() {
-            if fallback_available {
-                return Ok((Some("inherited_orchestrator".into()), None));
-            }
-            return Err(AgentSpawnPreflightError::runtime(
-                "model_preflight_failed",
-                "model",
-                "子代理模型连接不可用",
-                "检查原模型连接配置后重试。",
-            ));
-        }
-        let mut selection = config.freeze_agent_selection(engine, revision, effort).map_err(|message| AgentSpawnPreflightError::runtime(
+            let mut selection = config.freeze_agent_selection(engine, revision, effort).map_err(|message| AgentSpawnPreflightError::runtime(
             "invalid_reasoning_effort", "model", message, "按当前角色模型的可用档位重新选择，或省略 reasoning_effort；不得更换模型绕过配置。"
         ))?;
-        selection.context_window_tokens = Some(
-            crate::model_context_window::resolve_model_context_window_with_override(
-                Some(store),
-                &selection.model,
-                selection.context_window_tokens,
-            ),
-        );
-        let bound = configured_role_engine_model_config(store, role)
-            .ok()
-            .flatten()
-            .is_some();
-        return Ok((
-            Some(
-                if bound {
-                    "role_engine"
-                } else {
-                    "inherited_orchestrator"
-                }
-                .into(),
-            ),
-            Some(selection),
-        ));
+            selection.context_window_tokens = Some(
+                crate::model_context_window::resolve_model_context_window_with_override(
+                    Some(store),
+                    &selection.model,
+                    selection.context_window_tokens,
+                ),
+            );
+            return Ok((
+                Some(
+                    if role_bound {
+                        "role_engine"
+                    } else {
+                        "inherited_orchestrator"
+                    }
+                    .into(),
+                ),
+                Some(selection),
+            ));
+        }
     }
     if effort.is_some() {
         return Err(AgentSpawnPreflightError::input(
@@ -1071,16 +1057,30 @@ fn validate_context_references(
         let missing = match reference.kind {
             AgentContextReferenceKind::ConversationTurn
             | AgentContextReferenceKind::TaskOutput
-            | AgentContextReferenceKind::TaskEvidence => !resolvable
-                .get_or_insert_with(|| {
-                    crate::tool_batch::context_reference_ids(
-                        task_store,
-                        session_store,
-                        parent_task,
-                        session_id,
-                    )
-                })
-                .contains(&reference.source_ref),
+            | AgentContextReferenceKind::TaskEvidence => {
+                if resolvable.is_none() {
+                    resolvable = Some(
+                        crate::tool_batch::context_reference_ids(
+                            task_store,
+                            session_store,
+                            parent_task,
+                            session_id,
+                        )
+                        .map_err(|error| {
+                            AgentSpawnPreflightError::runtime(
+                                "context_history_unavailable",
+                                "context",
+                                error.to_string(),
+                                "当前 canonical 历史不可用，请检查来源后重试。",
+                            )
+                        })?,
+                    );
+                }
+                !resolvable
+                    .as_ref()
+                    .expect("context references resolved")
+                    .contains(&reference.source_ref)
+            }
             AgentContextReferenceKind::File => {
                 let path = PathBuf::from(reference.source_ref.trim());
                 let path = match workspace_root {
@@ -1399,6 +1399,47 @@ mod tests {
     use super::*;
     use magi_core::{MissionId, SessionId, TaskCompletionContract, TaskRuntimePayload};
     use magi_orchestrator::task_store::TaskStore;
+
+    #[test]
+    fn model_preflight_rejects_invalid_configuration_instead_of_using_injected_client() {
+        let registry = TaskExecutionRegistry::default();
+        let parent = reference_parent_task();
+        let session = SessionId::new("model-preflight");
+        let client: Arc<dyn ModelBridgeClient> = Arc::new(
+            magi_bridge_client::HttpModelBridgeClient::new(
+                "http://127.0.0.1:1/v1".into(), None, "injected-model".into(),
+            ),
+        );
+        for (catalog, selection) in [
+            (serde_json::json!({"sources": "invalid"}), serde_json::Value::Null),
+            (serde_json::json!({"sources": []}), serde_json::json!({"sourceId": "plugin/removed/model", "model": "gone"})),
+            (crate::main_model_sources::test_sources("http://127.0.0.1:1/v1", "", &["available"]), serde_json::json!({"sourceId": "custom/test", "model": "missing"})),
+        ] {
+            let settings = Arc::new(SettingsStore::new());
+            settings.set_section("orchestrator", catalog).unwrap();
+            settings.set_session_section(&session, "orchestrator", selection).unwrap();
+            let error = preflight_agent_model(
+                &registry, &parent, &Some(settings.clone()), Some(client.clone()),
+                "executor", &session, None,
+            ).expect_err("已配置但无效时不得改用注入客户端创建代理");
+            assert_eq!(error.error_code, "model_preflight_failed");
+            assert!(resolve_target_for_role(
+                Some(&settings), Some(client.clone()), RoleTarget::Orchestrator, Some(&session),
+            ).is_err(), "主对话与子代理必须遵守同一配置边界");
+            assert!(crate::model_config::ensure_extension_model_source(&settings, None, &session).is_err());
+        }
+        for settings in [None, Some(Arc::new(SettingsStore::new()))] {
+            let error = preflight_agent_model(
+                &registry, &parent, &settings, None, "executor", &session, None,
+            ).expect_err("缺少模型能力不能以拓扑测试为由创建代理");
+            assert_eq!(error.error_code, "model_preflight_failed");
+            let (source, selection) = preflight_agent_model(
+                &registry, &parent, &settings, Some(client.clone()), "executor", &session, None,
+            ).expect("未配置时允许显式注入模型客户端");
+            assert_eq!(source.as_deref(), Some("inherited_orchestrator"));
+            assert!(selection.is_none());
+        }
+    }
 
     #[test]
     fn child_policy_inherits_the_parents_access_profile_for_every_role() {

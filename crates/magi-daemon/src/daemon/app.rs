@@ -249,7 +249,7 @@ impl Daemon {
             service_name = %self.config.service_name,
             host = %self.config.host,
             port = bound_port,
-            "Rust 影子后端已启动"
+            "Rust daemon 已启动"
         );
         if self.config.open_browser && frontend_entry_available {
             let url = web_entry_url(&effective_config);

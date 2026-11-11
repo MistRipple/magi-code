@@ -364,12 +364,6 @@ await withGoldenViteServer(async (server) => {
     '非焦点刻度必须限制最大拉伸，避免与焦点同宽',
   );
 
-  const railLayout = navigation.calculateTurnNavigationRailLayout(10, 120);
-  assert.equal(railLayout.itemSpacing, 13, '轨道刻度必须使用缩短后的固定间距');
-  assert.equal(railLayout.markerHeight, 2, '轨道布局计算必须与 2px 细线一致');
-  assert.equal(railLayout.contentHeight, 143, '轨道内容高度必须按紧凑间距计算');
-  assert.equal(railLayout.scrollable, true, '轮次过多时轨道必须具备独立滚动所需的内容高度');
-
   const markerOffsets = navigation.calculateTurnNavigationMarkerOffsets(3);
   assert.deepEqual(markerOffsets, [13, 26, 39], '刻度中心必须按紧凑固定间距排列');
 

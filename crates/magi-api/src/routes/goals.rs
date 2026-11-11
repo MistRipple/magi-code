@@ -100,10 +100,9 @@ mod tests {
     use magi_core::{AccessProfile, PlanItemStatus};
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
-    use magi_orchestrator::{OrchestratedExecutionRuntime, task_store::TaskStore};
+    use magi_orchestrator::task_store::TaskStore;
     use magi_session_store::{GoalRevisionExpectation, GoalStatus, SessionGoal, SessionStore};
     use magi_tool_runtime::ToolRegistry;
-    use magi_worker_runtime::WorkerRuntime;
     use magi_workspace::WorkspaceStore;
     use std::sync::{
         Arc,
@@ -181,13 +180,11 @@ mod tests {
         .with_task_store(Arc::clone(&task_store));
         let mut tool_registry = ToolRegistry::new(governance, Arc::clone(&event_bus));
         tool_registry.register_default_builtins();
-        let execution_runtime = OrchestratedExecutionRuntime::new(WorkerRuntime::new())
-            .with_task_store(Arc::clone(&task_store));
         let dispatcher = Arc::new(
             LlmTaskDispatcher::new(
                 event_bus,
                 ExecutionPipeline {
-                    execution_runtime,
+                    task_store: task_store.clone(),
                     memory_store: magi_memory_store::MemoryStore::new(),
                 },
                 LlmTaskDispatcherDependencies {
@@ -218,6 +215,164 @@ mod tests {
             .with_tool_registry(tool_registry)
             .with_runner_manager(runner_manager)
             .with_session_turn_dispatcher(dispatcher)
+    }
+
+    #[test]
+    fn completed_task_allows_goal_completion_without_deleting_branch_or_plan_binding() {
+        use magi_core::{
+            PlanId, PlanItemId, PlanState, Task, TaskCompletionAttempt, TaskId, TaskKind,
+            TaskStatus, ThreadId, WorkerId,
+        };
+        use magi_session_store::{
+            ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
+            SessionPlan,
+        };
+        let state = state_with_recording_goal_dispatcher(Arc::new(AtomicUsize::new(0)));
+        let session = SessionId::new("goal-task-authority");
+        state
+            .session_store
+            .create_session(session.clone(), "goal task authority")
+            .unwrap();
+        // Continue 的 Turn ID 与根 Task 不同；不能靠字符串相等排除本次主线。
+        let turn = "continue-turn";
+        let goal = create_test_goal(&state, &session, turn, "完成已有计划");
+        let now = UtcMillis::now();
+        let root = Task {
+            task_id: TaskId::new("original-root"),
+            mission_id: MissionId::new("goal-mission"),
+            root_task_id: TaskId::new("original-root"),
+            parent_task_id: None,
+            kind: TaskKind::LocalAgent,
+            title: "root".into(),
+            goal: "finish".into(),
+            status: TaskStatus::Running,
+            dependency_ids: vec![],
+            required_children: vec![],
+            policy_snapshot: None,
+            executor_binding: None,
+            completion_contract: Default::default(),
+            recovery_checkpoint: None,
+            knowledge_refs: vec![],
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: vec![],
+            output_refs: vec![],
+            evidence_refs: vec![],
+            retry_count: 0,
+            runtime_payload: Default::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        let child = Task {
+            task_id: TaskId::new("bound-child"),
+            parent_task_id: Some(root.task_id.clone()),
+            ..root.clone()
+        };
+        let tasks = state.task_store().unwrap();
+        tasks.insert_task(root.clone()).unwrap();
+        tasks.insert_task(child.clone()).unwrap();
+        state
+            .session_store
+            .seed_execution_chain_for_test(
+                session.clone(),
+                ActiveExecutionChain {
+                    session_id: session.clone(),
+                    mission_id: root.mission_id.clone(),
+                    root_task_id: root.task_id.clone(),
+                    execution_chain_ref: "goal-chain".into(),
+                    workspace_id: None,
+                    current_turn_id: None,
+                    branches: vec![ActiveExecutionBranch {
+                        task_id: child.task_id.clone(),
+                        worker_id: WorkerId::new("child-worker"),
+                        use_tools: true,
+                        skill_name: None,
+                        is_primary: false,
+                        thread_id: ThreadId::new("child-thread"),
+                    }],
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "entry".into(),
+                        trimmed_text: None,
+                        skill_name: None,
+                    },
+                },
+            )
+            .unwrap();
+        let item = PlanItemId::new("finished-item");
+        let plan = state
+            .session_store
+            .upsert_plan(
+                &session,
+                SessionPlan {
+                    plan_id: PlanId::new("goal-plan"),
+                    session_id: session.clone(),
+                    goal_id: Some(goal.goal_id.clone()),
+                    revision: 1,
+                    language: "zh-CN".into(),
+                    state: PlanState::Completed,
+                    items: vec![magi_core::PlanItem::new(
+                        item.clone(),
+                        "验证成果",
+                        PlanItemStatus::Completed,
+                    )],
+                    task_bindings: [
+                        (root.task_id.clone(), item.clone()),
+                        (child.task_id.clone(), item),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    updated_at: now,
+                },
+                Some(0),
+            )
+            .unwrap();
+        let complete = || {
+            state.session_store.complete_goal(
+                &session,
+                &goal.goal_id,
+                GoalRevisionExpectation::new(goal.control_revision, Some(plan.revision)),
+                turn,
+                "任务与验证均完成",
+                vec!["verified-result".into()],
+            )
+        };
+        assert!(matches!(
+            complete(),
+            Err(magi_core::DomainError::GoalRejected {
+                reason: magi_core::GoalRejection::PlanTasksActive,
+                ..
+            })
+        ));
+        tasks
+            .complete_task(
+                &child.task_id,
+                TaskCompletionAttempt {
+                    final_response: Some("done".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            state
+                .session_store
+                .active_execution_chain(&session)
+                .unwrap()
+                .contains_task(&child.task_id)
+        );
+        assert_eq!(complete().unwrap().status, GoalStatus::Complete);
+        assert_eq!(
+            tasks.get_task(&root.task_id).unwrap().status,
+            TaskStatus::Running
+        );
+        assert!(
+            state
+                .session_store
+                .plan(&session)
+                .unwrap()
+                .task_bindings
+                .contains_key(&child.task_id)
+        );
     }
 
     #[cfg(unix)]

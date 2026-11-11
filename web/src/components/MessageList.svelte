@@ -15,7 +15,6 @@
   import PluginTabContent from './tabs/PluginTabContent.svelte';
   import { tick, onDestroy } from 'svelte';
   import {
-    clearMessageJump,
     beginTurnEditing,
     commitOlderSessionHistoryPage,
     messagesState,
@@ -1225,58 +1224,6 @@
       scheduleActivationScrollRestore();
     }
     wasActive = active;
-  });
-
-  // 外部触发的消息定位（例如：目标面板点击历史计划，穿透定位到对应对话轮次）
-  let handledMessageJumpNonce = 0;
-  $effect(() => {
-    const jumpNonce = messagesState.messageJump.nonce;
-    const targetMessageId = messagesState.messageJump.messageId;
-    const jumpScope = currentHistoryLoadScopeKey();
-    if (!targetMessageId) return;
-    if (jumpNonce === handledMessageJumpNonce) return;
-    if (displayContext !== 'thread') return;
-    if (!isActive) return;
-    if (!containerRef) return;
-
-    const existsInCurrentList = safeRenderItems.some((item) => item.message.id === targetMessageId);
-    if (!existsInCurrentList) return;
-    handledMessageJumpNonce = jumpNonce;
-
-    void revealRenderMessage(targetMessageId).then(async (revealed) => {
-      if (!revealed) return;
-      await tick();
-      if (
-        !containerRef
-        || jumpNonce !== messagesState.messageJump.nonce
-        || jumpScope !== currentHistoryLoadScopeKey()
-      ) return;
-      const selectorSafeId = targetMessageId.replace(/"/g, '\\"');
-      const targetElement = containerRef.querySelector(`[data-message-id="${selectorSafeId}"]`) as HTMLElement | null;
-      if (!targetElement) return;
-
-      const containerRect = containerRef.getBoundingClientRect();
-      const elementRect = targetElement.getBoundingClientRect();
-      const targetTop = containerRef.scrollTop
-        + elementRect.top
-        - containerRect.top
-        - Math.max(0, (containerRef.clientHeight - elementRect.height) / 2);
-      scrollToPositionFromNavigation(targetTop);
-      try {
-        targetElement.animate(
-          [
-            { boxShadow: '0 0 0 0 rgba(14, 99, 156, 0.0)' },
-            { boxShadow: '0 0 0 2px rgba(14, 99, 156, 0.55)' },
-            { boxShadow: '0 0 0 0 rgba(14, 99, 156, 0.0)' },
-          ],
-          { duration: 900, easing: 'ease-out' }
-        );
-      } catch {
-        // ignore: animate API 在极少数环境可能不可用
-      }
-
-      clearMessageJump();
-    });
   });
 
   function captureScrollSnapshot() {

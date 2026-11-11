@@ -10,7 +10,9 @@ mod mcp_server;
 mod mcp_skills_repos;
 mod messages;
 mod plugins;
-pub use plugins::{PluginOperations, write_plugin_resource_with_event, write_plugin_settings_with_event};
+pub use plugins::{
+    PluginOperations, write_plugin_resource_with_event, write_plugin_settings_with_event,
+};
 mod session_isolation;
 #[cfg(test)]
 pub(crate) mod sessions;
@@ -273,9 +275,8 @@ pub(crate) mod test_turn_fixtures {
 use crate::scope_binding::{require_session_record_in_scope, resolve_explicit_session_scope};
 use crate::{
     dto::{
-        AuditUsageLedgerDto, BootstrapDto, BridgeCutoverSmokeSnapshotDto,
-        BridgePreflightSnapshotDto, BridgeServicesSnapshotDto, HealthDto, RuntimeReadModelDto,
-        SessionScopeKindDto, VersionHandshakeDto,
+        AuditUsageLedgerDto, BootstrapDto, HealthDto, RuntimeReadModelDto, SessionScopeKindDto,
+        VersionHandshakeDto,
     },
     errors::ApiError,
     sse,
@@ -328,9 +329,6 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/runtime/read-model", get(runtime_read_model))
         .route("/runtime/execution-admission", get(execution_admission))
         .route("/ledger", get(ledger))
-        .route("/bridges/services", get(bridge_services))
-        .route("/bridges/preflight", get(bridge_preflight))
-        .route("/bridges/cutover-smoke", get(bridge_cutover_smoke))
         .route("/events", get(stream_events))
         .route("/version", get(version))
         .nest("/api", api_routes)
@@ -419,7 +417,6 @@ fn is_protected_remote_path(path: &str) -> bool {
         || path == "/runtime/execution-admission"
         || path == "/ledger"
         || path == "/events"
-        || path.starts_with("/bridges/")
         || path.starts_with("/api/")
 }
 
@@ -547,20 +544,6 @@ async fn execution_admission(
 
 async fn ledger(State(state): State<ApiState>) -> Json<AuditUsageLedgerDto> {
     Json(state.audit_usage_ledger_dto())
-}
-
-async fn bridge_services(State(state): State<ApiState>) -> Json<BridgeServicesSnapshotDto> {
-    Json(state.bridge_services_dto())
-}
-
-async fn bridge_preflight(State(state): State<ApiState>) -> Json<BridgePreflightSnapshotDto> {
-    Json(state.bridge_preflight_dto())
-}
-
-async fn bridge_cutover_smoke(
-    State(state): State<ApiState>,
-) -> Json<BridgeCutoverSmokeSnapshotDto> {
-    Json(state.bridge_cutover_smoke_dto())
 }
 
 async fn version(State(state): State<ApiState>) -> Json<VersionHandshakeDto> {

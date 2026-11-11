@@ -102,16 +102,6 @@ pub struct PermissionPolicy {
 }
 
 impl PermissionPolicy {
-    pub fn from_core_policy(policy: &magi_core::TaskPolicy) -> Self {
-        Self {
-            allowed_tools: policy.allowed_tools.iter().cloned().collect(),
-            denied_tools: policy.denied_tools.iter().cloned().collect(),
-            allowed_paths: policy.allowed_paths.iter().map(PathBuf::from).collect(),
-            denied_paths: policy.denied_paths.iter().map(PathBuf::from).collect(),
-            command_mode: policy.command_mode.clone(),
-        }
-    }
-
     fn is_read_only_command_mode(&self) -> bool {
         self.command_mode.eq_ignore_ascii_case("read_only")
     }
@@ -384,10 +374,6 @@ impl PermissionEngine {
         }
     }
 
-    /// caller 直接拿 list 用于 dedup 逻辑。
-    pub fn read_only_tool_names(&self) -> Vec<&'static str> {
-        self.read_only_tools.iter().copied().collect()
-    }
 }
 
 fn json_string(

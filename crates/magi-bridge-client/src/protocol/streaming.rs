@@ -1612,6 +1612,7 @@ mod tests {
                     ],
                     max_tokens: None,
                     temperature: None,
+                    stop: Vec::new(),
                     tools: None,
                     stream: Some(true),
 

@@ -9,8 +9,11 @@ import { installSharedResolution } from '../runtime/shared-resolution.mjs';
 import { dshEnvironment } from '../core/dsh-compatibility.mjs';
 import { createBackendSessions } from '../runtime/backend-sessions.mjs';
 import { profilePackageManager } from '../runtime/profile-process-host.mjs';
+import { installNullableEvents } from '../runtime/event-subscriptions.mjs';
+import { installWeb } from '../runtime/web.mjs';
+import { createRegisteredSettings } from '../runtime/registered-settings.mjs';
 
-const [entry, sharedRoot, resultPath, upstreamDir, readSessionDirectory] = process.argv.slice(2);
+const [entry, sharedRoot, resultPath, upstreamDir, readSessionDirectory, nullableEvents, webProviders, settingsNamespace] = process.argv.slice(2);
 // 上游常把运行状态写进 ~/.dsh；HOME 是记录用的空临时目录，预建它即可，不触碰真实用户目录。
 mkdirSync(`${process.env.HOME}/.dsh`, { recursive: true });
 installSharedResolution(sharedRoot, { '@magi/compat-upstream-root': upstreamDir + '/' });
@@ -47,6 +50,15 @@ globalThis.fetch = (input) => Promise.reject(new Error(`构建期记录不发送
 
 const out = { tools: [], commands: [], providers: [], routes: [], listeners: [], settingsNamespaces: [], profilePackageManager: false };
 const ctx = new Context();
+// 记录器只拥有临时观察值；与运行期共用 schema、base、句柄及订阅语义，
+// 不以简化设置替身掩盖启动时实际调用的成员。
+let recordedSettings = { version: 0, value: null };
+const registeredSettings = createRegisteredSettings({ resource: {
+  async read() { return structuredClone(recordedSettings); },
+  async write(_id, version, value) {
+    if (version !== recordedSettings.version) throw new Error('记录阶段设置版本冲突');
+    return recordedSettings = { version: version + 1, value: structuredClone(value) };
+  } }, log: message => console.error(message) }, true);
 // 只提供真实服务的命名空间；记录器没有 daemon 会话事实，调用读取即拒绝。
 if (readSessionDirectory === '1') ctx.provide('sessions', createBackendSessions({}).service);
 ctx.provide('loader', {entries:loaderEntries});
@@ -54,8 +66,9 @@ ctx.provide('hmr', createProfileReload());
 ctx.provide('profileContext', Object.freeze({ name: 'magi', dir: profilePath(), get packageManager() { out.profilePackageManager = true; return profilePackageManager(); } }));
 ctx.baseUrl = pathToFileURL(profilePath() + '/').href;
 // 记录默认启动观察到的事件名，供兼容报告核对；不据此生成 Magi 钩子。
-// 通过 Cordis 自带的 `internal/listener` 事件观察，不改写 ctx.on，也不执行监听器。
+// 通过 Cordis 自带的 `internal/listener` 观察实际登记，不执行监听器。
 const listenerNames = new Set();
+installNullableEvents(ctx, JSON.parse(nullableEvents ?? '[]'));
 ctx.on('internal/listener', (name) => { if (typeof name === 'string' && !name.startsWith('internal/')) listenerNames.add(name); });
 await installSkills(ctx, () => () => {});
 await installPromptContributions(ctx);
@@ -68,18 +81,31 @@ stub('webServer', (d) => {
   out.routes.push({ kind: d.kind === 'prefix' ? 'prefix' : 'exact', path: d.path });
   return () => {};
 });
+let recordedWeb;
+if (webProviders === '1') {
+  let snapshot = { revision: 0, search: null, fetch: null };
+  recordedWeb = await installWeb(ctx, { web: {
+    async read() { return structuredClone(snapshot); },
+    async configure({ expectedRevision, changes }) {
+      if (expectedRevision !== snapshot.revision) throw new Error('记录阶段联网配置冲突');
+      for (const change of changes) snapshot[change.kind] = change.providerId ? { pluginId: 'recording.plugin', providerId: change.providerId, contributionId: change.contributionId } : null;
+      snapshot.revision++; return structuredClone(snapshot);
+    },
+  }, tool() { return () => {}; } }, { register(_kind, definition) { out.tools.push(definition); return () => {}; }, async drain() {} }, ns => ctx.emit('settings/document-updated', ns));
+}
 ctx.plugin(class extends Service {
   constructor(c) { super(c, 'settings'); }
+  describe() { return [{ ns: settingsNamespace || metadata.name, value: {} }, ...(recordedWeb ? [recordedWeb.describe()] : [])]; }
   configure() { return () => {}; }
-  register(ns, schema) {
+  register(ns, schema, options) {
     if (typeof ns !== 'string' || !ns || ns.length > 128 || ['__proto__', 'prototype', 'constructor'].includes(ns) || typeof schema !== 'function') throw new Error('记录阶段设置注册无效');
     if (!out.settingsNamespaces.includes(ns)) out.settingsNamespaces.push(ns);
-    return { get: () => schema({}) };
+    return registeredSettings.register(this.ctx, ns, schema, options);
   }
-  get() { return undefined; }
-  async update() {}
-  async replace() {}
-  async mutate() {}
+  get(ns) { return registeredSettings.get(ns); }
+  update(ns, patch) { return registeredSettings.update(ns, patch); }
+  replace(ns, value) { return registeredSettings.replace(ns, value); }
+  mutate(ns, operations) { return ns === 'web' && recordedWeb ? recordedWeb.mutate(operations) : registeredSettings.mutate(ns, operations); }
 });
 ctx.plugin(class extends Service {
   constructor(c) { super(c, 'attachments'); }
@@ -98,19 +124,24 @@ const config = upstream.Config ? upstream.Config({}) : {};
 // 一个永远无法激活的翻译包通过安装校验。
 let fiber, startup;
 const settleTimeout = Number(process.env.MAGI_RECORD_START_TIMEOUT_MS ?? 15_000);
-await withProfile(async () => {
+await withProfile(() => registeredSettings.run(async () => {
 fiber = ctx.plugin({ apply: upstream.apply, inject: upstream.inject, name: upstream.name }, config);
 startup = await Promise.race([
   fiber.await().then(() => 'ready'),
   new Promise((resolve) => setTimeout(() => resolve('timeout'), settleTimeout)),
 ]);
-});
+}));
 if (startup === 'timeout') console.error(`记录阶段在 ${settleTimeout}ms 内未完全就绪，保留已观察的静态注册并交由 Magi 运行期继续收敛`);
 // 贡献可以在 apply 返回后由上游异步注册（例如 MCP 发现或延迟工具）。给它一个
 // 有界的稳定窗口；运行期目录仍然支持动态增删，但安装期不能把已观察到的启动
 // 失败隐藏成成功。
 await new Promise((r) => setTimeout(r, Number(process.env.MAGI_RECORD_SETTLE_MS ?? 3000)));
 if (startup === 'ready') await fiber.await();
+// 条件注入有自己的 fiber；根 apply 成功不能掩盖已观察到的子模块失败。
+for (const runtime of ctx.registry.values()) for (const child of runtime.fibers) {
+  if (child.state === 3) await child.await();
+}
+await recordedWeb?.drain();
 out.listeners = [...listenerNames].sort();
 // 结果写文件而不是 stdout：上游常用 console.log 打印日志，会混进输出。
 writeFileSync(resultPath, JSON.stringify(out));

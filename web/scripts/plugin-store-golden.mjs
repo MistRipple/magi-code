@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { withGoldenViteServer } from './golden-vite.mjs';
 
 await withGoldenViteServer(async (server) => {
-  const { buildStoreItems, filterStoreItems, installedUpstreamRequest } = await server.ssrLoadModule('/src/lib/plugin-store.ts');
+  const { buildStoreItems, filterStoreItems, installedUpstreamRequest, pluginImpactNotices } = await server.ssrLoadModule('/src/lib/plugin-store.ts');
   const text = (manifest, field) => manifest[field];
   const installed = (id, source) => ({
     manifest: { id, version: '1.0.0', name: id, description: '', permissions: [], contributions: {} },
@@ -13,6 +13,25 @@ await withGoldenViteServer(async (server) => {
     ecosystem: 'dsh', package: 'dsh-x', version: '2.0.0', name: 'dsh-x', description: '', publisher: 'p',
     official: false, state: 'available', installable: true, ...over,
   });
+
+  // 同一已声明事实供安装预览与激活使用；不按包名、优先级或当前启用状态推断能力。
+  {
+    const manifest = installed('arbitrary').manifest;
+    const t = (key, vars) => `${key}${vars?.locations ? ':' + vars.locations : ''}`;
+    assert.deepEqual(pluginImpactNotices(manifest, t), []);
+    manifest.contributions = { views: [
+      { id:'business', title:'Business', entry:'ui/page.html', placements:['main','rightPane'] },
+      { id:'input', title:'Action', entry:'ui/action.html', placements:['composerLeft'] },
+      { id:'duplicate', title:'Other action', entry:'ui/other.html', placements:['composerLeft'] },
+    ] };
+    const views = pluginImpactNotices(manifest, t);
+    assert.equal(views.length, 1);
+    assert.match(views[0].text, /impact.main.*impact.rightPane.*impact.composerLeft/);
+    assert.equal(views[0].text.split('impact.composerLeft').length, 2, '重复入口不重复告知同一位置');
+    manifest.extension = { hooks:[{name:'prompt.contribute',mode:'advise'},{name:'tool.call',mode:'guard'}] };
+    manifest.permissions = [{kind:'contextRewrite',targets:['history']}];
+    assert.deepEqual(pluginImpactNotices(manifest, t).map(notice => notice.id), ['ui','global-prompt','guard','context']);
+  }
 
   // 未安装的上游包用 生态+包名 作为临时身份，且不被文本过滤掉（registry 已按相关度匹配）。
   {

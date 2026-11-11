@@ -25,10 +25,6 @@ extraResources:
     filter:
       - magi-daemon-app
       - magi-daemon-app.exe
-      - model_bridge_loopback
-      - model_bridge_loopback.exe
-      - mcp_bridge_loopback
-      - mcp_bridge_loopback.exe
   - from: dist/node-runtime
     to: daemon/node
     filter:
@@ -88,8 +84,6 @@ mac:
   gatekeeperAssess: false
   binaries:
     - Contents/Resources/daemon/magi-daemon-app
-    - Contents/Resources/daemon/model_bridge_loopback
-    - Contents/Resources/daemon/mcp_bridge_loopback
     - Contents/Resources/daemon/node/node
   target:
     - dmg

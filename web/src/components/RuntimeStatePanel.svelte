@@ -12,32 +12,20 @@
   import type { IconName } from '../lib/icons';
   import { i18n } from '../stores/i18n.svelte';
   import {
-    resolveRuntimeTaskProgress,
-    resolveRuntimePanelStatus,
-    runtimeAssignmentIsActive,
     shouldShowRuntimePanel,
     shouldShowRuntimePhase,
   } from '../lib/runtime-state-panel';
   import { mergeCurrentRuntimeTimelineEntries } from '../lib/runtime-timeline';
   import { resolveToolDisplayName } from '../lib/tool-display-name';
-  import type { TurnStage } from '../shared/protocol/processing-state';
 
   interface Props {
     runtimeState: OrchestratorRuntimeState | null;
     conversationRecords?: OrchestrationRuntimeTimelineEntry[];
-    conversationStartedAt?: number | null;
-    isProcessing?: boolean;
-    processingStartedAt?: number | null;
-    turnStage?: TurnStage | null;
   }
 
   let {
     runtimeState,
     conversationRecords = [],
-    conversationStartedAt = null,
-    isProcessing = false,
-    processingStartedAt = null,
-    turnStage = null,
   }: Props = $props();
   let isPanelExpanded = $state(false);
   let expandedRecordIds = $state<Set<string>>(new Set());
@@ -76,16 +64,12 @@
     };
   });
   const opsView = $derived.by(() => runtimeState?.opsView || null);
-  const executionGroupSummary = $derived.by(() => opsView?.executionGroup || null);
-  const planSummary = $derived.by(() => opsView?.plan || null);
 
   const recentTimeline = $derived.by(() => (
     mergeCurrentRuntimeTimelineEntries({
       runtimeEntries: Array.isArray(opsView?.recentTimeline) ? opsView.recentTimeline : [],
       conversationEntries: Array.isArray(conversationRecords) ? conversationRecords : [],
-      isProcessing,
-      processingStartedAt,
-      currentTurnStartedAt: conversationStartedAt,
+      currentTurnStartedAt: runtimeState?.startedAt,
     }).filter((item) => Boolean(formatTimelineSummary(item)))
   ));
 
@@ -110,18 +94,6 @@
   });
   const summaryEntries = $derived.by(() => {
     const entries: Array<{ label: string; value: string }> = [];
-    if (executionGroupSummary?.title) {
-      entries.unshift({
-        label: i18n.t('runtimeState.summary.executionGroup'),
-        value: executionGroupSummary.title,
-      });
-    }
-    if (planSummary?.planId) {
-      entries.push({
-        label: i18n.t('runtimeState.summary.plan'),
-        value: formatPlanSummaryLabel(planSummary.status, planSummary.version),
-      });
-    }
     if (activeWorkerSummary) {
       entries.push({
         label: i18n.t('runtimeState.summary.activeWorkers'),
@@ -129,10 +101,6 @@
       });
     }
     entries.push({ label: i18n.t('runtimeState.summary.startedAt'), value: runtimeState?.startedAt != null ? formatDateTime(runtimeState.startedAt) : '--' });
-    const statusReason = sanitizeRuntimeDisplayText(runtimeState?.statusReason);
-    if (statusReason) {
-      entries.push({ label: i18n.t('runtimeState.summary.reason'), value: statusReason });
-    }
     return entries;
   });
 
@@ -150,62 +118,10 @@
     if (continuationReason) {
       entries.push({ label: i18n.t('runtimeDiagnostics.recovery.continuationReason'), value: continuationReason });
     }
-    const waitState = formatRecoveryState(recovery.waitState);
-    if (waitState) {
-      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.waitState'), value: waitState });
-    }
-    const replanState = formatRecoveryState(recovery.replanState);
-    if (replanState) {
-      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.replanState'), value: replanState });
-    }
-    const terminationReason = sanitizeRuntimeDisplayText(recovery.terminationReason);
-    if (terminationReason) {
-      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.terminationReason'), value: terminationReason });
-    }
-    if (recovery.acceptanceSummary) {
-      const acceptanceSummary = sanitizeRuntimeDisplayText(String(recovery.acceptanceSummary));
-      if (acceptanceSummary) {
-        entries.push({ label: i18n.t('runtimeDiagnostics.recovery.acceptanceSummary'), value: acceptanceSummary });
-      }
-    }
-    const reviewState = formatRecoveryState(recovery.reviewState);
-    if (reviewState) {
-      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.reviewState'), value: reviewState });
-    }
     if (recovery.latestRecoveryAt) {
       entries.push({
         label: i18n.t('runtimeDiagnostics.recovery.latestRecoveryAt'),
         value: formatDateTime(recovery.latestRecoveryAt),
-      });
-    }
-    if (recovery.snapshotStorage) {
-      entries.push({
-        label: i18n.t('runtimeDiagnostics.recovery.snapshotStorage'),
-        value: formatSnapshotStorageLabel(recovery.snapshotStorage),
-      });
-    }
-    if (typeof recovery.snapshotDirtyFileCount === 'number' && recovery.snapshotDirtyFileCount > 0) {
-      entries.push({
-        label: i18n.t('runtimeDiagnostics.recovery.snapshotDirtyFileCount'),
-        value: String(recovery.snapshotDirtyFileCount),
-      });
-    }
-    if (typeof recovery.snapshotPendingChangeCount === 'number' && recovery.snapshotPendingChangeCount > 0) {
-      entries.push({
-        label: i18n.t('runtimeDiagnostics.recovery.snapshotPendingChangeCount'),
-        value: String(recovery.snapshotPendingChangeCount),
-      });
-    }
-    if (typeof recovery.restoredWorkerBranchCount === 'number' && recovery.restoredWorkerBranchCount > 0) {
-      entries.push({
-        label: i18n.t('runtimeDiagnostics.recovery.restoredWorkerBranchCount'),
-        value: String(recovery.restoredWorkerBranchCount),
-      });
-    }
-    if (typeof recovery.restoredWorkerSessionCount === 'number' && recovery.restoredWorkerSessionCount > 0) {
-      entries.push({
-        label: i18n.t('runtimeDiagnostics.recovery.restoredWorkerSessionCount'),
-        value: String(recovery.restoredWorkerSessionCount),
       });
     }
     if (typeof recovery.pendingTaskCount === 'number' && recovery.pendingTaskCount > 0) {
@@ -217,30 +133,12 @@
     if (typeof recovery.completedTaskCount === 'number' && recovery.completedTaskCount > 0) {
       entries.push({ label: i18n.t('runtimeDiagnostics.recovery.completedTaskCount'), value: String(recovery.completedTaskCount) });
     }
-    if (typeof recovery.cancelledTaskCount === 'number' && recovery.cancelledTaskCount > 0) {
-      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.cancelledTaskCount'), value: String(recovery.cancelledTaskCount) });
-    }
     return entries;
   });
 
-  const canonicalProcessingActive = $derived.by(() => {
-    return isProcessing && turnStage !== null && turnStage !== 'done';
-  });
-
-  const effectiveStatus = $derived(resolveRuntimePanelStatus({
-    status: runtimeState?.status,
-    isProcessing,
-  }));
-  const effectivePhase = $derived.by(() => (
-    canonicalProcessingActive
-      ? turnStage || 'running'
-      : runtimeState?.phase
-  ));
-  const effectiveLastEventAt = $derived.by(() => (
-    canonicalProcessingActive
-      ? (processingStartedAt || runtimeState?.lastEventAt || Date.now())
-      : runtimeState?.lastEventAt
-  ));
+  const effectiveStatus = $derived(runtimeState?.status);
+  const effectivePhase = $derived(runtimeState?.phase);
+  const effectiveLastEventAt = $derived(runtimeState?.lastEventAt);
   const summaryTimeLabel = $derived.by(() => (
     typeof effectiveLastEventAt === 'number' && Number.isFinite(effectiveLastEventAt) && effectiveLastEventAt > 0
       ? `${i18n.t('runtimeState.summary.lastEventShort')} ${formatTimestamp(effectiveLastEventAt)}`
@@ -278,29 +176,10 @@
   });
 
   // 状态对应的 CSS modifier
-  const statusModifier = $derived.by(() => {
-    switch (effectiveStatus) {
-      case 'idle': return 'idle';
-      case 'running': return 'running';
-      case 'waiting': return 'waiting';
-      case 'paused': return 'paused';
-      case 'blocked': return 'blocked';
-      case 'completed': return 'completed';
-      case 'failed': return 'failed';
-      case 'cancelled': return 'cancelled';
-      default: return 'idle';
-    }
-  });
+  const statusModifier = $derived(effectiveStatus ?? 'idle');
 
-  const taskProgress = $derived(resolveRuntimeTaskProgress(runtimeState?.runtimeSnapshot));
   const snap = $derived(runtimeState?.runtimeSnapshot);
-  const panelVisible = $derived(shouldShowRuntimePanel({
-    status: effectiveStatus,
-    isProcessing: canonicalProcessingActive,
-    activeAssignmentCount: assignmentSummaries.filter((item) => (
-      runtimeAssignmentIsActive(item.status)
-    )).length,
-  }));
+  const panelVisible = $derived(shouldShowRuntimePanel(effectiveStatus));
   const phaseVisible = $derived(shouldShowRuntimePhase(effectiveStatus, effectivePhase));
 
   $effect(() => {
@@ -320,66 +199,12 @@
   }
 
   function formatRuntimePhase(phase: string | undefined): string {
-    const normalized = typeof phase === 'string' ? phase.trim() : '';
-    if (!normalized) return '--';
-    switch (normalized) {
-      case 'clarify': return i18n.t('runtimeDiagnostics.phase.clarify');
-      case 'design': return i18n.t('runtimeDiagnostics.phase.design');
-      case 'architecture': return i18n.t('runtimeDiagnostics.phase.architecture');
-      case 'frontend_implement': return i18n.t('runtimeDiagnostics.phase.frontendImplement');
-      case 'backend_implement': return i18n.t('runtimeDiagnostics.phase.backendImplement');
-      case 'integration': return i18n.t('runtimeDiagnostics.phase.integration');
-      case 'verify': return i18n.t('runtimeDiagnostics.phase.verify');
-      case 'review': return i18n.t('runtimeDiagnostics.phase.review');
-      case 'document': return i18n.t('runtimeDiagnostics.phase.document');
-      case 'deploy': return i18n.t('runtimeDiagnostics.phase.deploy');
-      case 'summarize': return i18n.t('runtimeDiagnostics.phase.summarize');
-      case 'analysis': return i18n.t('runtimeDiagnostics.phase.analysis');
-      case 'planning': return i18n.t('runtimeDiagnostics.phase.planning');
-      case 'running': return i18n.t('runtimeDiagnostics.phase.running');
+    switch (phase) {
       case 'pending': return i18n.t('runtimeDiagnostics.phase.pending');
       case 'preparing': return i18n.t('runtimeDiagnostics.phase.preparing');
       case 'streaming': return i18n.t('runtimeDiagnostics.phase.streaming');
       case 'finalizing': return i18n.t('runtimeDiagnostics.phase.finalizing');
-      case 'done': return i18n.t('runtimeDiagnostics.phase.done');
-      case 'waiting': return i18n.t('runtimeDiagnostics.phase.waiting');
-      case 'blocked': return i18n.t('runtimeState.status.blocked');
-      case 'reviewing': return i18n.t('runtimeDiagnostics.phase.reviewing');
-      case 'summary': return i18n.t('runtimeDiagnostics.phase.summary');
-      case 'idle': return i18n.t('runtimeState.status.idle');
-      case 'tool': return i18n.t('runtimeDiagnostics.phase.tool');
-      case 'handoff': return i18n.t('runtimeDiagnostics.phase.handoff');
-      case 'finalize': return i18n.t('runtimeDiagnostics.phase.finalize');
-      case 'no_tool': return i18n.t('runtimeDiagnostics.phase.noTool');
-      default: return normalized;
-    }
-  }
-
-  function formatPlanStatus(status: string | undefined): string {
-    const normalized = typeof status === 'string' ? status.trim() : '';
-    if (!normalized) return '--';
-    const camelStatus = normalized.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
-    const key = `tasks.planStatus.${camelStatus}`;
-    const label = i18n.t(key);
-    return label !== key ? label : normalized;
-  }
-
-  function formatPlanSummaryLabel(status?: string, version?: number): string {
-    const statusLabel = formatPlanStatus(status);
-    const versionLabel = typeof version === 'number' && Number.isFinite(version)
-      ? i18n.t('runtimeState.summary.planVersion', { version })
-      : '';
-    return [statusLabel, versionLabel].filter(Boolean).join(', ') || '--';
-  }
-
-  function formatSnapshotStorageLabel(storage: string | undefined): string {
-    switch (storage) {
-      case 'ghost_commit':
-        return i18n.t('runtimeDiagnostics.recovery.storage.ghostCommit');
-      case 'head_commit':
-        return i18n.t('runtimeDiagnostics.recovery.storage.headCommit');
-      default:
-        return '';
+      default: return phase || '--';
     }
   }
 
@@ -391,24 +216,6 @@
         return i18n.t('runtimeDiagnostics.recovery.continuation.none');
       default:
         return formatHumanizedRuntimeText(policy);
-    }
-  }
-
-  function formatRecoveryState(state: string | undefined): string {
-    const normalized = typeof state === 'string' ? state.trim() : '';
-    if (!normalized) return '';
-    const assignmentStatus = formatAssignmentStatus(normalized);
-    if (assignmentStatus && assignmentStatus !== normalized) {
-      return assignmentStatus;
-    }
-    switch (normalized) {
-      case 'ready':
-        return i18n.t('runtimeDiagnostics.recovery.state.ready');
-      case 'consumed':
-      case 'worker_resumed':
-        return i18n.t('runtimeDiagnostics.recovery.state.consumed');
-      default:
-        return formatHumanizedRuntimeText(normalized);
     }
   }
 
@@ -456,15 +263,6 @@
       default:
         return (typeof status === 'string' ? status.trim() : '') || '--';
     }
-  }
-
-  function formatDuration(ms: number | undefined): string {
-    if (ms == null || !Number.isFinite(ms)) return '--';
-    if (ms < 1000) return `${ms}ms`;
-    const s = Math.round(ms / 1000);
-    if (s < 60) return `${s}s`;
-    const m = Math.floor(s / 60);
-    return `${m}m${s % 60}s`;
   }
 
   function formatTokens(n: number | undefined): string {
@@ -788,9 +586,6 @@
       {#if phaseVisible}
         <span class="summary__phase">{formatRuntimePhase(effectivePhase)}</span>
       {/if}
-      {#if taskProgress && taskProgress.total > 0}
-        <span class="summary__meta">{taskProgress.completed}/{taskProgress.total}</span>
-      {/if}
       {#if assignmentSummaries.length > 0}
         <span class="summary__meta">{i18n.t('runtimeState.summary.agentCount', { count: assignmentSummaries.length })}</span>
       {/if}
@@ -817,55 +612,6 @@
         <div class="metrics-grid">
             <div class="metric-card">
               <div class="metric-card__header">
-                <Icon name="list" size={12} class="metric-card__icon" />
-                <span class="metric-card__title">{i18n.t('runtimeDiagnostics.taskProgress')}</span>
-              </div>
-              <div class="metric-card__value">{taskProgress?.completed ?? '--'}/{taskProgress?.total ?? '--'}</div>
-              <div class="progress-bar">
-                <div class="progress-bar__fill" style="width: {taskProgress?.percent ?? 0}%"></div>
-              </div>
-              {#if taskProgress && taskProgress.failed > 0}
-                <div class="metric-card__sub metric-card__sub--warn">{i18n.t('runtimeDiagnostics.failedCount', { count: taskProgress.failed })}</div>
-              {/if}
-            </div>
-            <div class="metric-card">
-              <div class="metric-card__header">
-                <Icon name="check-circle" size={12} class="metric-card__icon" />
-                <span class="metric-card__title">{i18n.t('runtimeDiagnostics.review')}</span>
-              </div>
-              <div class="metric-card__value">
-                {snap?.reviewState?.accepted ?? '--'}/{snap?.reviewState?.total ?? '--'}
-              </div>
-              <div class="metric-card__sub"
-                   class:metric-card__sub--ok={snap?.reviewState?.accepted != null && snap.reviewState.total != null && snap.reviewState.accepted >= snap.reviewState.total && snap.reviewState.total > 0}>
-                {#if snap?.reviewState?.accepted != null && snap.reviewState.total != null && snap.reviewState.accepted >= snap.reviewState.total && snap.reviewState.total > 0}
-                  {i18n.t('runtimeDiagnostics.allPassed')}
-                {:else if (snap?.reviewState?.total ?? 0) > 0}
-                  {i18n.t('runtimeDiagnostics.inProgress')}
-                {:else}
-                  —
-                {/if}
-              </div>
-            </div>
-            <div class="metric-card">
-              <div class="metric-card__header">
-                <Icon name={(snap?.blockerState?.open ?? 0) > 0 ? 'alert-triangle' : 'check-circle'} size={12} class="metric-card__icon" />
-                <span class="metric-card__title">{i18n.t('runtimeDiagnostics.blocker')}</span>
-              </div>
-              <div class="metric-card__value"
-                   class:metric-card__value--warn={(snap?.blockerState?.open ?? 0) > 0}>
-                {snap?.blockerState?.open ?? '--'}
-              </div>
-              {#if (snap?.blockerState?.externalWaitOpen ?? 0) > 0}
-                <div class="metric-card__sub metric-card__sub--warn">
-                  {i18n.t('runtimeDiagnostics.externalWait', { count: snap?.blockerState?.externalWaitOpen ?? 0 })}
-                </div>
-              {:else if snap?.blockerState?.open === 0}
-                <div class="metric-card__sub metric-card__sub--ok">{i18n.t('runtimeDiagnostics.noBlocker')}</div>
-              {/if}
-            </div>
-            <div class="metric-card">
-              <div class="metric-card__header">
                 <Icon name="clock" size={12} class="metric-card__icon" />
                 <span class="metric-card__title">{i18n.t('runtimeDiagnostics.budget')}</span>
               </div>
@@ -874,7 +620,7 @@
                 class:metric-card__value--notice={resolveBudgetTone(snap?.budgetState?.warningLevel) === 'notice'}
                 class:metric-card__value--warn={resolveBudgetTone(snap?.budgetState?.warningLevel) === 'warning' || resolveBudgetTone(snap?.budgetState?.warningLevel) === 'danger'}
               >
-                {formatDuration(snap?.budgetState?.elapsedMs)}
+                {formatUsageRatio(snap?.budgetState?.usageRatio)}
               </div>
                 <div class="progress-bar">
                   <div
@@ -886,9 +632,6 @@
                 <span>{i18n.t('runtimeDiagnostics.tokens', { value: formatTokens(snap?.budgetState?.tokenUsed) })}</span>
                 <span>{i18n.t('runtimeDiagnostics.tokenLimit', { value: formatTokens(snap?.budgetState?.tokenLimit) })}</span>
                 <span>{i18n.t('runtimeDiagnostics.remainingTokens', { value: formatTokens(snap?.budgetState?.remainingTokens) })}</span>
-                {#if snap?.budgetState?.errorRate != null && snap.budgetState.errorRate > 0}
-                  <span>{i18n.t('runtimeDiagnostics.errorRate', { rate: Math.round(snap.budgetState.errorRate * 100) })}</span>
-                {/if}
               </div>
                 <div
                   class="metric-card__sub ui-meta"
@@ -1207,11 +950,6 @@
     min-width: 0;
     overflow-wrap: anywhere;
     word-break: break-word;
-  }
-
-  .metric-card__sub--ok {
-    color: var(--success);
-    opacity: 1;
   }
 
   .metric-card__sub--warn {

@@ -154,7 +154,7 @@ pub(crate) fn persist_task_skill_activation(
     crate::session_writeback::persist_session_state_checkpoint(persist, "task_skill_activated")
 }
 
-pub(crate) struct RefreshLiveMcpToolDefinitionsInput<'a> {
+pub(crate) struct RefreshLiveExternalToolDefinitionsInput<'a> {
     pub definitions: Vec<ChatToolDefinition>,
     pub tool_registry: &'a ToolRegistry,
     pub skill_runtime: Option<&'a SkillRuntime>,
@@ -162,13 +162,34 @@ pub(crate) struct RefreshLiveMcpToolDefinitionsInput<'a> {
     pub access_profile: AccessProfile,
     pub allowed_tools: Option<&'a [String]>,
     pub denied_tools: &'a [String],
-    pub include_external: bool,
+    pub loaded_tool_names: &'a std::collections::BTreeSet<String>,
 }
 
-pub(crate) fn refresh_live_mcp_tool_definitions_with_mode(
-    input: RefreshLiveMcpToolDefinitionsInput<'_>,
+/// 只装配已取得完整 schema 的外接工具；元数据查询不改变下一步工具定义。
+pub(crate) fn extend_discovered_tool_names(
+    loaded: &mut std::collections::BTreeSet<String>,
+    result: &str,
+) {
+    let Ok(result) = serde_json::from_str::<serde_json::Value>(result) else {
+        return;
+    };
+    for kind in ["mcp_tools", "plugin_tools"] {
+        for tool in result[kind].as_array().into_iter().flatten() {
+            if tool["schema_included"] == true
+                && tool["model_available"] == true
+                && tool["input_schema"].is_object()
+                && let Some(name) = tool["model_tool_name"].as_str()
+            {
+                loaded.insert(name.to_string());
+            }
+        }
+    }
+}
+
+pub(crate) fn refresh_live_external_tool_definitions(
+    input: RefreshLiveExternalToolDefinitionsInput<'_>,
 ) -> Vec<ChatToolDefinition> {
-    let RefreshLiveMcpToolDefinitionsInput {
+    let RefreshLiveExternalToolDefinitionsInput {
         mut definitions,
         tool_registry,
         skill_runtime,
@@ -176,17 +197,18 @@ pub(crate) fn refresh_live_mcp_tool_definitions_with_mode(
         access_profile,
         allowed_tools,
         denied_tools,
-        include_external,
+        loaded_tool_names,
     } = input;
     definitions.retain(|definition| {
         !definition.function.name.starts_with("mcp__")
             && !definition.function.name.starts_with("plugin__")
     });
     let skill_allowed_tools = active_skill_allowed_tools(skill_runtime, active_skill_id);
-    if include_external {
+    if !loaded_tool_names.is_empty() {
         for tool in tool_registry.external_tool_catalog_snapshot().mcp_tools {
-            if magi_tool_runtime::external_tool_access_decision(tool.read_only, access_profile)
-                == Some(ExecutionResultStatus::Rejected)
+            if !loaded_tool_names.contains(&tool.model_tool_name)
+                || magi_tool_runtime::external_tool_access_decision(tool.read_only, access_profile)
+                    == Some(ExecutionResultStatus::Rejected)
                 || !tool_registry.external_mcp_tool_executor_available()
                 || denied_tools
                     .iter()
@@ -233,8 +255,9 @@ pub(crate) fn refresh_live_mcp_tool_definitions_with_mode(
         }
     }
     for tool in tool_registry.plugin_tool_catalog() {
-        if magi_tool_runtime::external_tool_access_decision(tool.read_only, access_profile)
-            == Some(ExecutionResultStatus::Rejected)
+        if !loaded_tool_names.contains(&tool.model_tool_name)
+            || magi_tool_runtime::external_tool_access_decision(tool.read_only, access_profile)
+                == Some(ExecutionResultStatus::Rejected)
             || denied_tools
                 .iter()
                 .any(|denied| denied == &tool.model_tool_name)
@@ -279,6 +302,105 @@ mod tests {
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     };
+
+    #[test]
+    fn plugin_discovery_loads_selected_schema_and_rechecks_live_policy() {
+        let enabled = Arc::new(AtomicBool::new(true));
+        let provider_enabled = Arc::clone(&enabled);
+        let registry = ToolRegistry::new(
+            Arc::new(magi_governance::GovernanceService::default()),
+            Arc::new(magi_event_bus::InMemoryEventBus::new(8)),
+        )
+        .with_plugin_tools(
+            Arc::new(move || {
+                if !provider_enabled.load(Ordering::Acquire) {
+                    return Vec::new();
+                }
+                ["analyze", "write"]
+                    .into_iter()
+                    .map(|name| magi_tool_runtime::PluginToolCatalogEntry {
+                        plugin_id: "example.analysis".into(),
+                        contribution_id: name.into(),
+                        model_tool_name: format!("plugin__analysis__{name}"),
+                        title: name.into(),
+                        description: name.into(),
+                        read_only: name == "analyze",
+                        input_schema: serde_json::json!({"type":"object","properties":{
+                            "evidence": {"type":"string", "description":"retained evidence ".repeat(2_000)}
+                        }}),
+                    })
+                    .collect()
+            }),
+            Arc::new(|_, _, _, _| ("{}".into(), ExecutionResultStatus::Succeeded)),
+        );
+        let refresh = |loaded: &std::collections::BTreeSet<String>,
+                       access_profile,
+                       denied_tools: &[String]| {
+            refresh_live_external_tool_definitions(RefreshLiveExternalToolDefinitionsInput {
+                definitions: Vec::new(),
+                tool_registry: &registry,
+                skill_runtime: None,
+                active_skill_id: None,
+                access_profile,
+                allowed_tools: None,
+                denied_tools,
+                loaded_tool_names: loaded,
+            })
+        };
+        let mut loaded = std::collections::BTreeSet::new();
+        assert!(refresh(&loaded, AccessProfile::Restricted, &[]).is_empty());
+        let metadata = registry.tool_catalog_value(
+            r#"{"query":"PLUGIN ANALYSIS ANALYZE","include_schema":true}"#,
+            &Default::default(),
+        );
+        assert_eq!(metadata["plugin_tools"].as_array().unwrap().len(), 1);
+        assert!(metadata["tools"].as_array().unwrap().is_empty());
+        assert!(
+            metadata.to_string().len()
+                < crate::tool_result_utils::MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES
+        );
+        assert!(metadata["plugin_tools"][0].get("input_schema").is_none());
+        extend_discovered_tool_names(&mut loaded, &metadata.to_string());
+        assert!(loaded.is_empty(), "元数据查询不能加载整个插件目录");
+        let selected = registry.tool_catalog_value(
+            r#"{"query":"additional descriptive words","tool_names":["plugin__analysis__analyze"],"include_schema":true}"#,
+            &Default::default(),
+        );
+        let raw = selected.to_string();
+        assert!(raw.len() > crate::tool_result_utils::MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES);
+        let visible =
+            crate::history_projection::project_tool_result(&raw, ExecutionResultStatus::Succeeded);
+        let visible: serde_json::Value = serde_json::from_str(&visible).unwrap();
+        assert_eq!(
+            visible["plugin_tools"][0]["model_tool_name"],
+            "plugin__analysis__analyze"
+        );
+        assert_eq!(visible["plugin_tools"][0]["schema_included"], true);
+        assert!(visible["plugin_tools"][0].get("input_schema").is_none());
+        extend_discovered_tool_names(&mut loaded, &selected.to_string());
+        let definitions = refresh(&loaded, AccessProfile::Restricted, &[]);
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].function.name, "plugin__analysis__analyze");
+        assert_eq!(
+            definitions[0].function.parameters,
+            selected["plugin_tools"][0]["input_schema"]
+        );
+        assert!(
+            refresh(
+                &loaded,
+                AccessProfile::Restricted,
+                &["plugin__analysis__analyze".into()]
+            )
+            .is_empty()
+        );
+        loaded.insert("plugin__analysis__write".into());
+        assert_eq!(refresh(&loaded, AccessProfile::ReadOnly, &[]).len(), 1);
+        enabled.store(false, Ordering::Release);
+        assert!(
+            refresh(&loaded, AccessProfile::Restricted, &[]).is_empty(),
+            "停用后已发现工具也须失效"
+        );
+    }
 
     #[test]
     fn browser_tool_surface_uses_one_round_scoped_capability_snapshot() {
@@ -424,7 +546,7 @@ mod tests {
         }));
 
         let definitions =
-            refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
+            refresh_live_external_tool_definitions(RefreshLiveExternalToolDefinitionsInput {
                 definitions: Vec::new(),
                 tool_registry: &registry,
                 skill_runtime: None,
@@ -432,7 +554,10 @@ mod tests {
                 access_profile: AccessProfile::ReadOnly,
                 allowed_tools: None,
                 denied_tools: &[],
-                include_external: true,
+                loaded_tool_names: &std::collections::BTreeSet::from([
+                    "mcp__repo__inspect".into(),
+                    "mcp__repo__write".into(),
+                ]),
             });
         let names = definitions
             .iter()
@@ -464,7 +589,7 @@ mod tests {
         }));
 
         let unavailable =
-            refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
+            refresh_live_external_tool_definitions(RefreshLiveExternalToolDefinitionsInput {
                 definitions: Vec::new(),
                 tool_registry: &registry,
                 skill_runtime: None,
@@ -472,7 +597,10 @@ mod tests {
                 access_profile: AccessProfile::FullAccess,
                 allowed_tools: None,
                 denied_tools: &[],
-                include_external: true,
+                loaded_tool_names: &std::collections::BTreeSet::from([
+                    "mcp__repo__inspect".into(),
+                    "mcp__repo__write".into(),
+                ]),
             });
         assert!(
             unavailable.is_empty(),
@@ -488,7 +616,7 @@ mod tests {
         }));
 
         let first_round =
-            refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
+            refresh_live_external_tool_definitions(RefreshLiveExternalToolDefinitionsInput {
                 definitions: Vec::new(),
                 tool_registry: &registry,
                 skill_runtime: None,
@@ -496,12 +624,12 @@ mod tests {
                 access_profile: AccessProfile::Restricted,
                 allowed_tools: None,
                 denied_tools: &[],
-                include_external: false,
+                loaded_tool_names: &std::collections::BTreeSet::new(),
             });
         assert!(first_round.is_empty(), "首轮不应注入完整 MCP schema");
 
         let after_catalog =
-            refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
+            refresh_live_external_tool_definitions(RefreshLiveExternalToolDefinitionsInput {
                 definitions: first_round,
                 tool_registry: &registry,
                 skill_runtime: None,
@@ -509,7 +637,10 @@ mod tests {
                 access_profile: AccessProfile::Restricted,
                 allowed_tools: None,
                 denied_tools: &[],
-                include_external: true,
+                loaded_tool_names: &std::collections::BTreeSet::from([
+                    "mcp__repo__inspect".into(),
+                    "mcp__repo__write".into(),
+                ]),
             });
         assert_eq!(
             after_catalog

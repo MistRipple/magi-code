@@ -13,8 +13,6 @@ export type SettingsWorkerStatusSnapshot = Record<string, {
   error?: string;
 }>;
 
-export type SettingsWorkerStatusMap = SettingsWorkerStatusSnapshot;
-
 export type ConversationDisplayMode = 'original' | 'summary';
 
 export interface SettingsBuiltinTool {

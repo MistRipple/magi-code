@@ -4,14 +4,12 @@
 //! 校验 / 校对 / 应用 / writeback 落盘 / branch checkpoint 同步 / 子树解封等
 //! "继续会话"实现细节。错误类型统一为 `String`，函数签名走显式 stores。
 
-use magi_core::{ExecutionOwnership, RecoveryResumeInput, SessionId, TaskStatus, UtcMillis};
+#[cfg(test)]
+use magi_core::UtcMillis;
+use magi_core::{ExecutionOwnership, RecoveryResumeInput, SessionId, TaskStatus};
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
 use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain, SessionStore};
-use magi_worker_runtime::{
-    WorkerBranchCheckpointState, WorkerCheckpointResumeMode, WorkerExecutionBindingLifecycle,
-    WorkerExecutionCheckpointCursor, WorkerRuntime, WorkerStage,
-};
 use magi_workspace::{RecoveryStatus, WorkspaceStore};
 
 #[derive(Clone, Debug)]
@@ -41,11 +39,15 @@ fn root_task_allows_continue(status: &TaskStatus) -> bool {
 pub fn active_execution_branch_is_continue_recoverable(
     task_store: Option<&TaskStore>,
     chain: &ActiveExecutionChain,
+    current_turn: Option<&magi_session_store::ActiveExecutionTurn>,
     branch: &ActiveExecutionBranch,
 ) -> bool {
     // 当前 Turn 是 canonical 的只读投影。插件命令没有模型检查点，不能走通用
     // Continue 重放副作用；用户须核对结果后重新发起明确的命令。
-    if chain.current_turn.as_ref().is_some_and(|turn| {
+    if chain.current_turn_id.as_deref() != current_turn.map(|turn| turn.turn_id.as_str()) {
+        return false;
+    }
+    if current_turn.is_some_and(|turn| {
         turn.items.iter().any(|item| {
             item.kind == "user_message" && item.metadata.contains_key("pluginCommandId")
         })
@@ -197,70 +199,6 @@ pub fn fail_resumed_execution_paths(
     Ok(())
 }
 
-pub fn parse_branch_worker_stage(value: &str) -> WorkerStage {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "review" => WorkerStage::Review,
-        "verify" => WorkerStage::Verify,
-        "repair" => WorkerStage::Repair,
-        "finish" | "finished" => WorkerStage::Finish,
-        _ => WorkerStage::Execute,
-    }
-}
-
-pub fn parse_branch_resume_mode(value: Option<&str>) -> WorkerCheckpointResumeMode {
-    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("step-checkpoint") => WorkerCheckpointResumeMode::StepCheckpoint,
-        _ => WorkerCheckpointResumeMode::StageRestart,
-    }
-}
-
-pub fn parse_branch_binding_lifecycle(
-    value: Option<&str>,
-) -> Option<WorkerExecutionBindingLifecycle> {
-    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("bound") => Some(WorkerExecutionBindingLifecycle::Bound),
-        Some("released") => Some(WorkerExecutionBindingLifecycle::Released),
-        Some("none") => Some(WorkerExecutionBindingLifecycle::None),
-        Some("requested") => Some(WorkerExecutionBindingLifecycle::Requested),
-        Some(_) => Some(WorkerExecutionBindingLifecycle::Requested),
-        None => None,
-    }
-}
-
-pub fn branch_checkpoint_cursor(
-    branch: &ActiveExecutionBranch,
-) -> Option<WorkerExecutionCheckpointCursor> {
-    branch
-        .checkpoint_stage
-        .as_deref()
-        .map(|checkpoint_stage| WorkerExecutionCheckpointCursor {
-            checkpoint_stage: parse_branch_worker_stage(checkpoint_stage),
-            next_step_index: branch.next_step_index.unwrap_or(0),
-            checkpoint_at: branch.checkpoint_at.unwrap_or_else(UtcMillis::now),
-            resume_mode: parse_branch_resume_mode(branch.resume_mode.as_deref()),
-            resume_token: branch.resume_token.clone(),
-        })
-}
-
-/// 把 active branch 上的 checkpoint 信息回灌 worker runtime —— 让 worker 进程恢复
-/// 时拿到与 session sidecar 一致的 stage/cursor。
-pub fn sync_branch_checkpoint_to_worker_runtime(
-    worker_runtime: &WorkerRuntime,
-    branch: &ActiveExecutionBranch,
-) {
-    worker_runtime.record_branch_checkpoint(
-        &branch.task_id,
-        &branch.worker_id,
-        parse_branch_worker_stage(&branch.stage),
-        WorkerBranchCheckpointState {
-            lease_id: branch.lease_id.as_ref().map(ToString::to_string),
-            execution_intent_ref: branch.execution_intent_ref.clone(),
-            binding_lifecycle: parse_branch_binding_lifecycle(branch.binding_lifecycle.as_deref()),
-            checkpoint_cursor: branch_checkpoint_cursor(branch),
-        },
-    );
-}
-
 #[derive(Debug)]
 pub enum RecoveryValidationError {
     /// recovery_id 在 workspace_registry 里查不到。
@@ -380,18 +318,18 @@ pub struct ChainRecoveryCommit {
     ownership: ExecutionOwnership,
 }
 
-/// 若 chain.recovery_ref 存在：校验 recovery 状态 / 入口匹配 → 应用 recovery resume
+/// 若 Session 恢复引用存在：校验 recovery 状态 / 入口匹配 → 应用 recovery resume
 /// 输入到 session_store → 落盘 writebacks。Recovery 仍保持 Ready，直到 runner 成功启动
-/// 后由 [`commit_chain_recovery`] 完成消费和 chain ref 清理。
+/// 后由 [`commit_chain_recovery`] 完成消费和 Session 恢复引用清理。
 pub fn apply_chain_recovery_if_needed(
     session_store: &SessionStore,
     workspace_registry: &WorkspaceStore,
     memory_store: Option<&MemoryStore>,
     session_id: &SessionId,
-    chain: &mut ActiveExecutionChain,
+    chain: &ActiveExecutionChain,
     primary_branch: &ActiveExecutionBranch,
 ) -> Result<Option<ChainRecoveryCommit>, RecoveryValidationError> {
-    let Some(recovery_id) = chain.recovery_ref.clone() else {
+    let Some(recovery_id) = session_store.recovery_id(session_id) else {
         return Ok(None);
     };
     validate_recovery_status(workspace_registry, &recovery_id)?;
@@ -429,43 +367,23 @@ pub fn apply_chain_recovery_if_needed(
 
 /// 在 runner 已成功启动后提交 recovery 消费。
 ///
-/// 消费和 session ref 清理跨两个 store，若清理失败，补偿回 Ready 并保留 ref，使下一次
-/// Continue 仍然可以重新进入，而不会留下 consumed recovery + active chain 的裂缝。
+/// 在 Session 提交锁内校验原恢复引用，再消费 Workspace 记录并清理引用。
+/// 归属已变化时不消费；消费失败时保留引用，不尝试把已消费记录反向改回 Ready。
 pub fn commit_chain_recovery(
     session_store: &SessionStore,
     workspace_registry: &WorkspaceStore,
     session_id: &SessionId,
-    chain: &mut ActiveExecutionChain,
     commit: ChainRecoveryCommit,
 ) -> Result<(), RecoveryValidationError> {
-    if chain.recovery_ref.as_deref() != Some(commit.recovery_id.as_str()) {
-        return Err(RecoveryValidationError::Mismatch {
-            message: format!(
-                "恢复提交 {} 与当前执行链 recovery_ref 不一致",
-                commit.recovery_id
-            ),
-        });
-    }
-    workspace_registry
-        .consume_recovery_with_ownership(&commit.recovery_id, commit.ownership)
+    session_store
+        .consume_recovery_id(session_id, &commit.recovery_id, || {
+            workspace_registry
+                .consume_recovery_with_ownership(&commit.recovery_id, commit.ownership)
+                .map(|_| ())
+        })
         .map_err(|error| RecoveryValidationError::Internal {
             message: error.to_string(),
         })?;
-    if let Err(error) = session_store.attach_recovery_ref(session_id, None) {
-        let compensation = workspace_registry.mark_recovery_ready(&commit.recovery_id);
-        let message = match compensation {
-            Ok(_) => format!(
-                "恢复 {} 已消费但 chain ref 清理失败，已补偿为 Ready: {}",
-                commit.recovery_id, error
-            ),
-            Err(compensation_error) => format!(
-                "恢复 {} 消费后 chain ref 清理失败，且无法补偿为 Ready: {}; {}",
-                commit.recovery_id, error, compensation_error
-            ),
-        };
-        return Err(RecoveryValidationError::Internal { message });
-    }
-    chain.recovery_ref = None;
     Ok(())
 }
 
@@ -516,24 +434,10 @@ mod tests {
         }
     }
 
-    fn branch(
-        task_id: &str,
-        worker_id: &str,
-        stage: &str,
-        lease_id: Option<&str>,
-    ) -> ActiveExecutionBranch {
+    fn branch(task_id: &str, worker_id: &str) -> ActiveExecutionBranch {
         ActiveExecutionBranch {
             task_id: TaskId::new(task_id),
             worker_id: WorkerId::new(worker_id),
-            stage: stage.to_string(),
-            lease_id: lease_id.map(magi_core::LeaseId::new),
-            execution_intent_ref: None,
-            binding_lifecycle: None,
-            checkpoint_stage: None,
-            next_step_index: None,
-            checkpoint_at: None,
-            resume_mode: None,
-            resume_token: None,
             use_tools: true,
             skill_name: None,
             is_primary: true,
@@ -546,7 +450,7 @@ mod tests {
         mission_id: &MissionId,
         root_task_id: &TaskId,
         branch: ActiveExecutionBranch,
-        recovery_ref: Option<String>,
+        _recovery_ref: Option<String>,
     ) -> ActiveExecutionChain {
         ActiveExecutionChain {
             session_id: session_id.clone(),
@@ -554,17 +458,14 @@ mod tests {
             root_task_id: root_task_id.clone(),
             execution_chain_ref: "chain-recovery-test".to_string(),
             workspace_id: Some(WorkspaceId::new("workspace-recovery-test")),
-            active_branch_task_ids: vec![branch.task_id.clone()],
-            active_worker_bindings: vec![branch.worker_id.clone()],
             branches: vec![branch],
-            recovery_ref,
             dispatch_context: ActiveExecutionDispatchContext {
                 accepted_at: UtcMillis(1),
                 entry_id: "entry-recovery-test".to_string(),
                 trimmed_text: None,
                 skill_name: None,
             },
-            current_turn: None,
+            current_turn_id: None,
         }
     }
 
@@ -613,7 +514,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let branch = branch(child.task_id.as_str(), "independent-worker", "finish", None);
+        let branch = branch(child.task_id.as_str(), "independent-worker");
         let chain = chain(
             &session,
             &root.mission_id,
@@ -621,15 +522,14 @@ mod tests {
             branch.clone(),
             None,
         );
-        let mut executable = branch.clone();
-        executable.stage = "execute".into();
         assert!(!active_execution_branch_is_continue_recoverable(
             Some(&store),
             &chain,
-            &executable
+            None,
+            &branch
         ));
-        assert!(release_resumed_branch_path(&store, &chain, &executable).is_err());
-        fail_resumed_execution_paths(&store, &chain, &[executable]).unwrap();
+        assert!(release_resumed_branch_path(&store, &chain, &branch).is_err());
+        fail_resumed_execution_paths(&store, &chain, &[branch]).unwrap();
         assert_eq!(
             store.get_task(&child.task_id).unwrap().status,
             TaskStatus::Pending
@@ -656,8 +556,8 @@ mod tests {
             TaskStatus::Failed,
         );
         store.insert_task(root.clone()).unwrap();
-        let branch = branch(root.task_id.as_str(), "worker", "finish", None);
-        let mut chain = chain(
+        let branch = branch(root.task_id.as_str(), "worker");
+        let chain = chain(
             &session,
             &root.mission_id,
             &root.task_id,
@@ -667,6 +567,7 @@ mod tests {
         assert!(active_execution_branch_is_continue_recoverable(
             Some(&store),
             &chain,
+            None,
             &branch
         ));
         let mut item = crate::session_writeback::session_turn_item(
@@ -681,7 +582,7 @@ mod tests {
             "pluginCommandId".into(),
             serde_json::json!("plugin/acme.cmd/run"),
         );
-        chain.current_turn = Some(magi_session_store::ActiveExecutionTurn {
+        let current_turn = Some(magi_session_store::ActiveExecutionTurn {
             turn_id: "command-turn".into(),
             turn_seq: 1,
             accepted_at: UtcMillis(1),
@@ -690,21 +591,25 @@ mod tests {
             user_message: Some("parameters".into()),
             items: vec![item],
         });
+        let mut chain = chain;
+        chain.current_turn_id = current_turn.as_ref().map(|turn| turn.turn_id.clone());
         assert!(!active_execution_branch_is_continue_recoverable(
             Some(&store),
             &chain,
+            current_turn.as_ref(),
             &branch
         ));
         let reloaded = serde_json::from_value(serde_json::to_value(chain).unwrap()).unwrap();
         assert!(!active_execution_branch_is_continue_recoverable(
             Some(&store),
             &reloaded,
+            current_turn.as_ref(),
             &branch
         ));
     }
 
     #[test]
-    fn finish_projection_does_not_override_task_recovery_status() {
+    fn task_recovery_reads_task_status_without_stage_projection() {
         let store = TaskStore::new();
         let session = SessionId::new("session-finish-recovery");
         let root = task("root", "root", "mission", None, TaskStatus::Running);
@@ -723,7 +628,7 @@ mod tests {
                 status,
             );
             store.insert_task(child.clone()).unwrap();
-            let branch = branch(child.task_id.as_str(), "worker", "finish", None);
+            let branch = branch(child.task_id.as_str(), "worker");
             let chain = chain(
                 &session,
                 &root.mission_id,
@@ -732,9 +637,14 @@ mod tests {
                 None,
             );
             assert_eq!(
-                active_execution_branch_is_continue_recoverable(Some(&store), &chain, &branch),
+                active_execution_branch_is_continue_recoverable(
+                    Some(&store),
+                    &chain,
+                    None,
+                    &branch
+                ),
                 status == TaskStatus::Failed,
-                "finish 阶段不能替代 Task 的实际结果"
+                "恢复资格只能由 Task 的实际结果决定"
             );
             assert_eq!(
                 serde_json::to_value(store.get_task(&child.task_id).unwrap()).unwrap(),
@@ -750,12 +660,7 @@ mod tests {
         let session_id = SessionId::new("session-recovery-commit");
         let mission_id = MissionId::new("mission-recovery-commit");
         let root_task_id = TaskId::new("task-root-recovery-commit");
-        let branch = branch(
-            "task-branch-recovery-commit",
-            "worker-recovery-commit",
-            "execute",
-            None,
-        );
+        let branch = branch("task-branch-recovery-commit", "worker-recovery-commit");
         let recovery_id = "recovery-commit-boundary";
         let chain_ref = "chain-recovery-test";
         session_store
@@ -777,7 +682,7 @@ mod tests {
             .mark_recovery_ready(recovery_id)
             .expect("recovery should become ready");
         session_store
-            .upsert_active_execution_chain(
+            .seed_execution_chain_for_test(
                 session_id.clone(),
                 chain(
                     &session_id,
@@ -788,6 +693,9 @@ mod tests {
                 ),
             )
             .expect("chain should persist");
+        session_store
+            .set_recovery_id(&session_id, None, Some(recovery_id.into()))
+            .unwrap();
         let mut active_chain = session_store
             .active_execution_chain(&session_id)
             .expect("active chain should exist");
@@ -809,24 +717,44 @@ mod tests {
                 .current_status,
             RecoveryStatus::Ready
         );
-        assert_eq!(active_chain.recovery_ref.as_deref(), Some(recovery_id));
         assert_eq!(
-            session_store
-                .active_execution_chain(&session_id)
-                .expect("chain should exist")
-                .recovery_ref
-                .as_deref(),
+            session_store.recovery_id(&session_id).as_deref(),
             Some(recovery_id)
         );
 
-        commit_chain_recovery(
-            &session_store,
-            &workspace_registry,
-            &session_id,
-            &mut active_chain,
-            commit,
-        )
-        .expect("recovery commit should succeed");
+        session_store
+            .set_recovery_id(&session_id, Some(recovery_id), Some("new-recovery".into()))
+            .unwrap();
+        assert!(
+            commit_chain_recovery(
+                &session_store,
+                &workspace_registry,
+                &session_id,
+                commit.clone(),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            session_store.recovery_id(&session_id).as_deref(),
+            Some("new-recovery")
+        );
+        assert_eq!(
+            session_store.recovery_id(&session_id).as_deref(),
+            Some("new-recovery")
+        );
+        assert_eq!(
+            workspace_registry
+                .recovery_sidecar_export(recovery_id)
+                .unwrap()
+                .current_status,
+            RecoveryStatus::Ready
+        );
+        session_store
+            .set_recovery_id(&session_id, Some("new-recovery"), Some(recovery_id.into()))
+            .unwrap();
+
+        commit_chain_recovery(&session_store, &workspace_registry, &session_id, commit)
+            .expect("recovery commit should succeed");
         assert_eq!(
             workspace_registry
                 .recovery_sidecar_export(recovery_id)
@@ -834,14 +762,7 @@ mod tests {
                 .current_status,
             RecoveryStatus::Consumed
         );
-        assert!(active_chain.recovery_ref.is_none());
-        assert!(
-            session_store
-                .active_execution_chain(&session_id)
-                .expect("chain should exist")
-                .recovery_ref
-                .is_none()
-        );
+        assert!(session_store.recovery_id(&session_id).is_none());
     }
 
     #[test]
@@ -884,12 +805,7 @@ mod tests {
             &session_id,
             &mission_id,
             &root_task_id,
-            branch(
-                branch_task_id.as_str(),
-                worker_id.as_str(),
-                "execute",
-                Some(lease.lease_id.as_str()),
-            ),
+            branch(branch_task_id.as_str(), worker_id.as_str()),
             None,
         );
 

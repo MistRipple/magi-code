@@ -50,10 +50,6 @@ impl MemoryStore {
         }
     }
 
-    pub fn record_extraction(&self, record: MemoryExtractionRecord) {
-        self.insert_extraction_record(normalize_extraction_record(record));
-    }
-
     pub fn extraction_linkage(&self, extraction_id: &str) -> Option<MemoryExtractionLinkage> {
         let extraction = self
             .extraction_results
@@ -190,7 +186,6 @@ fn normalize_extracted_memories(
                 source: EXTRACTION_PROVENANCE_SOURCE.to_string(),
                 extracted_from: Some(extraction_id.to_string()),
             }),
-            compacted: false,
             created_at: memory.created_at,
         })
         .collect::<Vec<_>>();

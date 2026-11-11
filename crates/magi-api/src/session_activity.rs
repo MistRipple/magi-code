@@ -5,7 +5,7 @@ use magi_session_store::SessionRuntimeSidecar;
 /// 这里使用活跃状态白名单，而不是终止状态黑名单：未知状态、暂停状态和
 /// 停止状态都不能把侧栏状态灯错误地抬回运行中。
 pub(crate) fn session_running_task_count(sidecar: Option<&SessionRuntimeSidecar>) -> usize {
-    let Some(turn) = sidecar.and_then(current_turn) else {
+    let Some(turn) = sidecar.and_then(|sidecar| sidecar.current_turn.as_ref()) else {
         return 0;
     };
     if !current_turn_status_is_active(&turn.status) {
@@ -22,17 +22,6 @@ pub(crate) fn session_running_task_count(sidecar: Option<&SessionRuntimeSidecar>
         })
         .count()
         .max(1)
-}
-
-fn current_turn(
-    sidecar: &SessionRuntimeSidecar,
-) -> Option<&magi_session_store::ActiveExecutionTurn> {
-    sidecar.current_turn.as_ref().or_else(|| {
-        sidecar
-            .active_execution_chain
-            .as_ref()
-            .and_then(|chain| chain.current_turn.as_ref())
-    })
 }
 
 pub(crate) fn current_turn_status_is_active(status: &str) -> bool {

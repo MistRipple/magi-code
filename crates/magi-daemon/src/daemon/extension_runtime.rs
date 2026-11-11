@@ -187,9 +187,8 @@ impl ExtensionRuntime {
         dispatcher: &Arc<magi_conversation_runtime::task_execution_dispatcher::LlmTaskDispatcher>,
     ) {
         let dispatcher = Arc::downgrade(dispatcher);
-        let _ = self
-            .native
-            .set(Arc::new(move |plugin, method, params, cancelled| {
+        let _ = self.native.set(Arc::new(
+            move |plugin, method, params, cancelled, progress| {
                 dispatcher
                     .upgrade()
                     .ok_or_else(|| {
@@ -198,14 +197,15 @@ impl ExtensionRuntime {
                             "原生执行器已退出",
                         )
                     })?
-                    .extension_service(&plugin, &method, params, cancelled)
+                    .extension_service(&plugin, &method, params, cancelled, progress)
                     .map_err(|e| {
                         magi_extension_host::protocol::RpcError::new(
                             magi_extension_host::protocol::ErrorKind::Blocked,
                             e,
                         )
                     })
-            }));
+            },
+        ));
     }
 
     fn set_status(&self, id: &str, status: Option<PluginRuntimeStatus>) {
@@ -442,6 +442,14 @@ impl ExtensionRuntime {
                     == magi_app_server_protocol::generated::PluginPermissionKind::ContextRewrite
             }),
         );
+        if let Err(error) = self
+            .manager
+            .lock()
+            .expect("plugin manager poisoned")
+            .ensure_host_supported(id)
+        {
+            return failed(error.to_string());
+        }
         let Some(node) = self.node.clone() else {
             return failed(format!(
                 "未找到随包 Node（应位于 daemon 同级的 node/ 目录；开发时可设置 {EXTENSION_NODE_ENV}）"

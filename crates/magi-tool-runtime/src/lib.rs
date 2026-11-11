@@ -46,7 +46,7 @@ pub use types::{
     RuntimeCapabilityDependencyEntry, RuntimeCapabilityDependencyProvider, ToolCallerScope,
     ToolExecutionContext, ToolExecutionContextQuery, ToolExecutionInput, ToolExecutionOutput,
     ToolExecutionPolicy, ToolExecutionProgress, ToolExecutionSummary, ToolInvocationRecord,
-    ToolNameRejection, ToolRuntimeResources, WriteProtectionScope,
+    ToolNameRejection, ToolRuntimeResources, WebProviderExecutor, WriteProtectionScope,
 };
 
 #[cfg(test)]

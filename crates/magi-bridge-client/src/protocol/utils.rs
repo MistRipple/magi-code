@@ -387,11 +387,17 @@ pub fn parse_openai_usage(usage: &Value) -> LlmUsage {
     let cache_read_tokens = usage["prompt_tokens_details"]["cached_tokens"]
         .as_u64()
         .or_else(|| usage["prompt_cache_hit_tokens"].as_u64());
+    let prompt_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
+    // 部分 Chat 提供方明确拆出缓存写入（DSH 桥也沿此字段交付）。
+    // LlmUsage 的 input 不包含写入量，保持与 Anthropic 及用量账本的合同一致。
+    let cache_write_tokens = usage["cache_creation_input_tokens"]
+        .as_u64()
+        .filter(|write| *write <= prompt_tokens.saturating_sub(cache_read_tokens.unwrap_or(0)));
     LlmUsage {
-        input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
+        input_tokens: prompt_tokens - cache_write_tokens.unwrap_or(0),
         output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
         cache_read_tokens,
-        cache_write_tokens: None,
+        cache_write_tokens,
         cache_read_included_in_input: cache_read_tokens.is_some(),
     }
 }
@@ -448,6 +454,42 @@ mod tests {
                 assert_eq!(parsed.cache_read_included_in_input, expected.is_some());
             }
         }
+    }
+
+    #[test]
+    fn chat_disjoint_cache_writes_round_trip_without_double_counting_input() {
+        use crate::protocol::adapter::ProviderFamily;
+        use crate::protocol::streaming::{SseEvent, parse_stream_event};
+        for write in [None, Some(0), Some(30)] {
+            let mut usage = serde_json::json!({
+                "prompt_tokens": 1000 + write.unwrap_or(0), "completion_tokens":20,
+                "prompt_tokens_details":{"cached_tokens":880}
+            });
+            if let Some(write) = write {
+                usage["cache_creation_input_tokens"] = serde_json::json!(write);
+            }
+            let event = SseEvent {
+                event_type: None,
+                data: serde_json::json!({"choices":[],"usage":usage}).to_string(),
+            };
+            let streamed = parse_stream_event(ProviderFamily::OpenAiChat, &event)
+                .into_iter()
+                .find_map(|chunk| chunk.usage)
+                .unwrap();
+            for parsed in [parse_openai_usage(&usage), streamed] {
+                assert_eq!(parsed.input_tokens, 1000);
+                assert_eq!(parsed.input_tokens - parsed.cache_read_tokens.unwrap(), 120);
+                assert_eq!(parsed.cache_write_tokens, write);
+                assert_eq!(parsed.output_tokens, 20);
+                assert!(parsed.cache_read_included_in_input);
+            }
+        }
+        let invalid = parse_openai_usage(&serde_json::json!({
+            "prompt_tokens":100,"completion_tokens":20,
+            "prompt_tokens_details":{"cached_tokens":80},"cache_creation_input_tokens":30
+        }));
+        assert_eq!(invalid.cache_write_tokens, None, "互斥读写不能超过完整输入");
+        assert_eq!(invalid.input_tokens, 100, "异常写入观测不制造零输入");
     }
 
     use crate::llm_types::{ImageSource, ToolInputSchema};

@@ -5,7 +5,6 @@ edition.workspace = true
 
 [dependencies]
 tokio.workspace = true
-tracing.workspace = true
 tracing-subscriber.workspace = true
 magi-runtime-state = { path = "../../crates/magi-runtime-state" }
 magi-daemon = { path = "../../crates/magi-daemon" }

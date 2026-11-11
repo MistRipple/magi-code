@@ -1170,8 +1170,8 @@ fn parse_requested_session_id(value: Option<&str>) -> Option<SessionId> {
 mod tests {
     use super::*;
     use crate::dto::SessionTurnRouteDto;
-    use crate::session_continue::restore_missing_resumed_branch_threads;
-    use crate::session_continue::{SessionContinueAccepted, persist_resumed_branch_user_input};
+    use crate::session_continue::SessionContinueAccepted;
+    use crate::session_continue::restore_resumed_branch_threads;
     use crate::state::{
         ApiState, QueuedRegularSessionTurn, RunnerManager, RuntimeStatePersistence,
     };
@@ -1297,7 +1297,7 @@ mod tests {
         ).unwrap();
         state
             .session_store
-            .upsert_active_execution_chain(
+            .seed_execution_chain_for_test(
                 session_id.clone(),
                 magi_session_store::ActiveExecutionChain {
                     session_id: session_id.clone(),
@@ -1305,21 +1305,19 @@ mod tests {
                     root_task_id: TaskId::new("task-user-question-route"),
                     execution_chain_ref: "question-route-chain".into(),
                     workspace_id: None,
-                    active_branch_task_ids: vec![],
-                    active_worker_bindings: vec![],
                     branches: vec![],
-                    recovery_ref: None,
                     dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
                         accepted_at: now,
                         entry_id: "question-route".into(),
                         trimmed_text: Some("test".into()),
                         skill_name: None,
                     },
-                    current_turn: state
+                    current_turn_id: (state
                         .session_store
                         .runtime_sidecar(&session_id)
                         .unwrap()
-                        .current_turn,
+                        .current_turn)
+                        .map(|turn| turn.turn_id),
                 },
             )
             .unwrap();
@@ -1616,7 +1614,7 @@ mod tests {
             .user_questions()
             .cancel(&question.request.question_id);
         let turn_id = "turn-user-question-route";
-        state.session_store.append_current_turn_item_for_turn(&session,Some(turn_id),serde_json::from_value(json!({
+        state.session_store.upsert_current_turn_item_for_turn(&session,Some(turn_id),serde_json::from_value(json!({
             "itemId":"approval-route-durable-item","itemSeq":2,"kind":"tool_call_started","status":"running",
             "source":"orchestrator","sourceThreadId":"thread-main","taskId":"task-user-question-route",
             "toolName":"shell_exec","toolCallId":"durable-approval-call","toolArguments":"{\"command\":\"publish\"}"
@@ -2959,7 +2957,6 @@ mod tests {
                 last_used_at: now,
                 observed_context_window_tokens: None,
                 handled_task_ids: vec![source_task_id.clone()],
-                message_history: Vec::new(),
             })
             .expect("thread should register");
 
@@ -3170,6 +3167,7 @@ mod tests {
             user_message: Some("原始任务".to_string()),
             items: Vec::new(),
         };
+        let admitted_turn = turn;
         state
             .session_store
             .accept_active_execution_chain_with_timeline_entry(
@@ -3186,34 +3184,23 @@ mod tests {
                     root_task_id: root_task_id.clone(),
                     execution_chain_ref: "chain-interrupted-recovery-route".to_string(),
                     workspace_id: None,
-                    active_branch_task_ids: vec![branch_task_id.clone()],
-                    active_worker_bindings: vec![WorkerId::new("worker-interrupted-recovery")],
                     branches: vec![magi_session_store::ActiveExecutionBranch {
                         task_id: branch_task_id,
                         worker_id: WorkerId::new("worker-interrupted-recovery"),
-                        stage: "execute".to_string(),
-                        lease_id: None,
-                        execution_intent_ref: None,
-                        binding_lifecycle: None,
-                        checkpoint_stage: Some("execute".to_string()),
-                        next_step_index: Some(0),
-                        checkpoint_at: Some(now),
-                        resume_mode: Some("resume".to_string()),
-                        resume_token: Some("recovery-route".to_string()),
                         use_tools: true,
                         skill_name: None,
                         is_primary: true,
                         thread_id: ThreadId::new("thread-interrupted-recovery-route"),
                     }],
-                    recovery_ref: None,
                     dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
                         accepted_at: now,
                         entry_id: "timeline-interrupted-recovery-route".to_string(),
                         trimmed_text: Some("原始任务".to_string()),
                         skill_name: None,
                     },
-                    current_turn: Some(turn),
+                    current_turn_id: Some(admitted_turn.turn_id.clone()),
                 },
+                admitted_turn,
             )
             .expect("active execution chain should persist");
         state
@@ -3238,86 +3225,6 @@ mod tests {
             continue_decision.route,
             SessionTurnRouteDto::Continue
         ));
-    }
-
-    #[test]
-    fn continue_input_waits_for_canonical_acceptance_before_projection() {
-        let state = test_state();
-        let session_id = SessionId::new("session-resume-input");
-        let mission_id = MissionId::new("mission-resume-input");
-        let now = UtcMillis::now();
-        state
-            .session_store
-            .create_session(session_id.clone(), "恢复输入持久化")
-            .expect("session should create");
-
-        let branches = ["primary", "child"]
-            .into_iter()
-            .map(|suffix| {
-                let task_id = TaskId::new(format!("task-{suffix}"));
-                let worker_id = WorkerId::new(format!("worker-{suffix}"));
-                let thread_id = ThreadId::new(format!("thread-{suffix}"));
-                state
-                    .session_store
-                    .register_thread(ExecutionThread {
-                        thread_id: thread_id.clone(),
-                        session_id: session_id.clone(),
-                        mission_id: mission_id.clone(),
-                        role_id: "executor".to_string(),
-                        worker_instance_id: worker_id.clone(),
-                        status: ExecutionThreadStatus::Active,
-                        created_at: now,
-                        last_used_at: now,
-                        observed_context_window_tokens: None,
-                        handled_task_ids: vec![task_id.clone()],
-                        message_history: Vec::new(),
-                    })
-                    .expect("thread should register");
-                ActiveExecutionBranch {
-                    task_id,
-                    worker_id,
-                    stage: "execute".to_string(),
-                    lease_id: None,
-                    execution_intent_ref: None,
-                    binding_lifecycle: None,
-                    checkpoint_stage: Some("execute".to_string()),
-                    next_step_index: Some(0),
-                    checkpoint_at: Some(now),
-                    resume_mode: Some("resume".to_string()),
-                    resume_token: Some(format!("resume-{suffix}")),
-                    use_tools: true,
-                    skill_name: None,
-                    is_primary: suffix == "primary",
-                    thread_id,
-                }
-            })
-            .collect::<Vec<_>>();
-        let image = magi_conversation_runtime::session_images::SessionTurnImage::from_data_url(
-            "context.png",
-            "data:image/png;base64,AAA",
-        )
-        .expect("image should parse");
-
-        persist_resumed_branch_user_input(
-            &state,
-            &session_id,
-            &branches,
-            Some("继续，但先遵守新增约束"),
-            &[image],
-            now,
-        )
-        .expect("continue input should persist");
-
-        for branch in branches {
-            // 用户输入尚未写入 canonical Turn；该阶段只做 thread 归属校验，
-            // 不允许先把 ThreadChatMessage 当作独立事实写入。
-            assert!(
-                state
-                    .session_store
-                    .thread_message_history(&branch.thread_id)
-                    .is_empty()
-            );
-        }
     }
 
     #[test]
@@ -3389,15 +3296,6 @@ mod tests {
         let branch = ActiveExecutionBranch {
             task_id: task_id.clone(),
             worker_id: worker_id.clone(),
-            stage: "execute".to_string(),
-            lease_id: None,
-            execution_intent_ref: None,
-            binding_lifecycle: None,
-            checkpoint_stage: Some("execute".to_string()),
-            next_step_index: Some(0),
-            checkpoint_at: Some(now),
-            resume_mode: Some("stage-restart".to_string()),
-            resume_token: None,
             use_tools: true,
             skill_name: None,
             is_primary: true,
@@ -3409,21 +3307,18 @@ mod tests {
             root_task_id: task_id.clone(),
             execution_chain_ref: "chain-recovered-thread".to_string(),
             workspace_id: None,
-            active_branch_task_ids: vec![task_id],
-            active_worker_bindings: vec![worker_id],
             branches: vec![branch.clone()],
-            recovery_ref: None,
             dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
                 accepted_at: now,
                 entry_id: "timeline-recovered-thread".to_string(),
                 trimmed_text: Some("检查项目".to_string()),
                 skill_name: None,
             },
-            current_turn: None,
+            current_turn_id: None,
         };
 
         assert_eq!(
-            restore_missing_resumed_branch_threads(&state, &session_id, &chain, &[branch])
+            restore_resumed_branch_threads(&state, &session_id, &chain, &[branch.clone()])
                 .expect("missing thread should rebuild")
                 .len(),
             1
@@ -3431,17 +3326,56 @@ mod tests {
         let threads = state.session_store.thread_registry_snapshot(&session_id);
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].thread_id, thread_id);
-        assert_eq!(threads[0].message_history.len(), 2);
-        assert_eq!(threads[0].message_history[0].role, "assistant");
-        assert_eq!(threads[0].message_history[0].tool_calls.len(), 1);
+        let snapshot = state
+            .session_store
+            .thread_context_snapshot(&thread_id)
+            .unwrap();
+        let history = snapshot.messages();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, "assistant");
+        assert_eq!(history[0].tool_calls.len(), 1);
+        assert_eq!(history[0].tool_calls[0].function.name, "file_read");
+        assert_eq!(history[1].role, "tool");
         assert_eq!(
-            threads[0].message_history[0].tool_calls[0].function.name,
-            "file_read"
-        );
-        assert_eq!(threads[0].message_history[1].role, "tool");
-        assert_eq!(
-            threads[0].message_history[1].tool_call_id.as_deref(),
+            history[1].tool_call_id.as_deref(),
             Some("call-recovered-read")
+        );
+        // 已存在的 thread 也必须核验 mission、task 与 worker，不能只比较 thread_id。
+        assert!(
+            restore_resumed_branch_threads(&state, &session_id, &chain, &[branch.clone()])
+                .unwrap()
+                .is_empty()
+        );
+        let mut wrong_worker = branch.clone();
+        wrong_worker.worker_id = WorkerId::new("other-worker");
+        assert!(
+            restore_resumed_branch_threads(&state, &session_id, &chain, &[wrong_worker]).is_err()
+        );
+        let mut other_task = test_root_task("task-other-branch", chain.mission_id.as_str());
+        other_task.root_task_id = chain.root_task_id.clone();
+        state
+            .task_store()
+            .unwrap()
+            .insert_task(other_task.clone())
+            .unwrap();
+        let mut wrong_task = branch.clone();
+        wrong_task.task_id = other_task.task_id;
+        assert!(
+            restore_resumed_branch_threads(&state, &session_id, &chain, &[wrong_task]).is_err()
+        );
+        let mut wrong_mission = chain.clone();
+        wrong_mission.mission_id = MissionId::new("other-mission");
+        assert!(
+            restore_resumed_branch_threads(&state, &session_id, &wrong_mission, &[branch.clone()])
+                .is_err()
+        );
+        assert!(
+            restore_resumed_branch_threads(&state, &session_id, &chain, &[branch.clone(), branch])
+                .is_err()
+        );
+        assert_eq!(
+            state.session_store.thread_registry_snapshot(&session_id),
+            threads
         );
     }
 
@@ -4443,6 +4377,15 @@ mod tests {
         task_store.insert_task(root_task).expect("根任务应插入");
         task_store.insert_task(branch_task).expect("分支任务应插入");
 
+        let admitted_turn = ActiveExecutionTurn {
+            turn_id: "turn-continue-git-context".to_string(),
+            turn_seq: now.0,
+            accepted_at: now,
+            status: "running".to_string(),
+            completed_at: None,
+            user_message: Some("继续测试".to_string()),
+            items: Vec::new(),
+        };
         state
             .session_store
             .accept_active_execution_chain_with_timeline_entry(
@@ -4459,42 +4402,23 @@ mod tests {
                     root_task_id: root_task_id.clone(),
                     execution_chain_ref: "chain-continue-git-context".to_string(),
                     workspace_id: Some(workspace_id.clone()),
-                    active_branch_task_ids: vec![branch_task_id.clone()],
-                    active_worker_bindings: vec![worker_id.clone()],
                     branches: vec![ActiveExecutionBranch {
                         task_id: branch_task_id,
                         worker_id,
-                        stage: "execute".to_string(),
-                        lease_id: None,
-                        execution_intent_ref: None,
-                        binding_lifecycle: None,
-                        checkpoint_stage: Some("execute".to_string()),
-                        next_step_index: Some(0),
-                        checkpoint_at: Some(now),
-                        resume_mode: Some("resume".to_string()),
-                        resume_token: Some("continue-git-context".to_string()),
                         use_tools: true,
                         skill_name: None,
                         is_primary: true,
                         thread_id: ThreadId::new("thread-continue-git-context"),
                     }],
-                    recovery_ref: None,
                     dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
                         accepted_at: now,
                         entry_id: "timeline-continue-git-context".to_string(),
                         trimmed_text: Some("继续测试".to_string()),
                         skill_name: None,
                     },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: "turn-continue-git-context".to_string(),
-                        turn_seq: now.0,
-                        accepted_at: now,
-                        status: "running".to_string(),
-                        completed_at: None,
-                        user_message: Some("继续测试".to_string()),
-                        items: Vec::new(),
-                    }),
+                    current_turn_id: Some(admitted_turn.turn_id.clone()),
                 },
+                admitted_turn,
             )
             .expect("active execution chain should persist");
         state
@@ -4659,34 +4583,23 @@ mod tests {
                     root_task_id: root_task_id.clone(),
                     execution_chain_ref: "chain-interrupted-goal-continue".to_string(),
                     workspace_id: Some(workspace_id.clone()),
-                    active_branch_task_ids: vec![branch_task_id.clone()],
-                    active_worker_bindings: vec![worker_id.clone()],
                     branches: vec![ActiveExecutionBranch {
                         task_id: branch_task_id,
                         worker_id,
-                        stage: "execute".to_string(),
-                        lease_id: None,
-                        execution_intent_ref: None,
-                        binding_lifecycle: None,
-                        checkpoint_stage: Some("execute".to_string()),
-                        next_step_index: Some(0),
-                        checkpoint_at: Some(now),
-                        resume_mode: Some("resume".to_string()),
-                        resume_token: Some("interrupted-goal-continue".to_string()),
                         use_tools: true,
                         skill_name: None,
                         is_primary: true,
                         thread_id: ThreadId::new("thread-interrupted-goal-continue"),
                     }],
-                    recovery_ref: None,
                     dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
                         accepted_at: now,
                         entry_id: "timeline-interrupted-goal-continue".to_string(),
                         trimmed_text: Some("推进长期目标".to_string()),
                         skill_name: None,
                     },
-                    current_turn: Some(current_turn),
+                    current_turn_id: Some((current_turn).turn_id.clone()),
                 },
+                current_turn,
             )
             .expect("goal execution chain should persist");
         state
@@ -4763,6 +4676,7 @@ mod tests {
             runner_started: true,
         };
         write_continue_user_message(ContinueUserMessageInput {
+            resumed_thread_ids: vec![ThreadId::new("selected-thread")],
             state: &state,
             accepted: &accepted,
             prompt_text: Some("继续"),
@@ -4782,6 +4696,10 @@ mod tests {
             .iter()
             .find(|item| item.kind == CanonicalTurnItemKind::UserMessage)
             .unwrap();
+        assert_eq!(
+            user.metadata.get("continuedThreadIds"),
+            Some(&json!(["selected-thread"]))
+        );
         assert!(!user.visibility.renderable);
         assert_eq!(user.content.as_deref(), Some("继续"));
         assert_eq!(
@@ -4829,6 +4747,7 @@ mod tests {
             runner_started: true,
         };
         let (_, user_item_id) = write_continue_user_message(ContinueUserMessageInput {
+            resumed_thread_ids: Vec::new(),
             state: &state,
             accepted: &accepted,
             prompt_text: Some("继续推进"),
@@ -8344,7 +8263,7 @@ mod tests {
             .session_store
             .create_session(session_id.clone(), "ownership 绑定当前会话")
             .expect("session should create");
-        state.session_store.bind_execution_ownership(
+        state.session_store.bind_execution_ownership_for_test(
             session_id.clone(),
             ExecutionOwnership {
                 session_id: Some(session_id.clone()),
@@ -8475,7 +8394,7 @@ mod tests {
             .session_store
             .create_session(session_id.clone(), "ownership 绑定通知操作")
             .expect("session should create");
-        state.session_store.bind_execution_ownership(
+        state.session_store.bind_execution_ownership_for_test(
             session_id.clone(),
             ExecutionOwnership {
                 session_id: Some(session_id.clone()),

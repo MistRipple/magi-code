@@ -10,7 +10,7 @@ use magi_session_store::{ActiveExecutionTurn, SessionStore};
 
 use crate::session_turn_coordinator::{CoordinatorTurnStatus, SessionTurnCoordinator};
 use crate::session_writeback::{
-    CanonicalTurnEventSink, SessionStatePersistCallback, append_session_turn_item_for_turn,
+    CanonicalTurnEventSink, SessionStatePersistCallback,
     persist_session_state_checkpoint, publish_current_session_turn_item_event,
     publish_session_turn_item_event, session_turn_item, upsert_session_turn_item_for_turn,
 };
@@ -119,10 +119,7 @@ pub fn publish_task_status_turn_item_for_active_sessions(
             .is_some_and(|chain| {
                 chain.root_task_id == task.root_task_id
                     || chain.root_task_id == task.task_id
-                    || chain
-                        .active_branch_task_ids
-                        .iter()
-                        .any(|task_id| task_id == &task.task_id)
+                    || chain.contains_task(&task.task_id)
             });
         let turn_matches = turn
             .items
@@ -161,7 +158,7 @@ pub fn publish_task_status_turn_item_for_active_sessions(
             item.worker_id = Some(branch.worker_id.clone());
         }
         let expected_turn_id = turn.turn_id.clone();
-        let published = match append_session_turn_item_for_turn(
+        let published = match upsert_session_turn_item_for_turn(
             session_store,
             &sidecar.session_id,
             Some(&expected_turn_id),
@@ -527,7 +524,7 @@ fn ensure_root_completion_final_item(
     final_item.source = "orchestrator".to_string();
     final_item.task_id = Some(root_task.task_id.clone());
 
-    let Some(_published) = append_session_turn_item_for_turn(
+    let Some(_published) = upsert_session_turn_item_for_turn(
         session_store,
         session_id,
         expected_turn_id,
@@ -719,7 +716,7 @@ fn archive_terminal_active_execution_chain(
         return Ok(false);
     };
     if chain.root_task_id != *root_task_id
-        || chain.recovery_ref.is_some()
+        || sidecar.recovery_id.is_some()
         || sidecar
             .current_turn
             .as_ref()
@@ -746,13 +743,16 @@ fn archive_terminal_active_execution_chain(
             .is_some_and(|root| root.status == TaskStatus::Failed)
     }) && chain.branches.iter().any(|branch| {
         crate::execution_chain_recovery::active_execution_branch_is_continue_recoverable(
-            task_store, chain, branch,
+            task_store,
+            chain,
+            sidecar.current_turn.as_ref(),
+            branch,
         )
     }) {
         return Ok(false);
     }
     session_store
-        .archive_active_execution_chain(session_id, root_task_id)
+        .archive_active_execution_chain(session_id, root_task_id, chain.current_turn_id.as_deref())
         .map(|_| true)
         .map_err(|error| format!("归档终态执行链失败: {error}"))
 }
@@ -1286,35 +1286,40 @@ mod tests {
             .create_session(session_id.clone(), "repeat task terminal")
             .expect("session should create");
         session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
+        let admitted_turn = ActiveExecutionTurn {
+            turn_id: "turn-repeat-task-terminal".to_string(),
+            turn_seq: now.0,
+            accepted_at: now,
+            completed_at: Some(now),
+            status: "completed".to_string(),
+            user_message: Some("重复终态通知".to_string()),
+            items: Vec::new(),
+        };
         session_store
-            .upsert_active_execution_chain(
+            .accept_active_execution_chain_with_timeline_entry(
                 session_id.clone(),
+                magi_session_store::TimelineEntryInput::new(
+                    format!("timeline-chain-{}", admitted_turn.turn_id),
+                    magi_session_store::TimelineEntryKind::UserMessage,
+                    admitted_turn.user_message.clone().unwrap_or_default(),
+                    admitted_turn.accepted_at,
+                ),
                 ActiveExecutionChain {
                     session_id: session_id.clone(),
                     mission_id,
                     root_task_id: root_task_id.clone(),
                     execution_chain_ref: "chain-repeat-task-terminal".to_string(),
                     workspace_id: None,
-                    active_branch_task_ids: vec![root_task_id],
-                    active_worker_bindings: Vec::new(),
                     branches: Vec::new(),
-                    recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
                         accepted_at: now,
                         entry_id: "entry-repeat-task-terminal".to_string(),
                         trimmed_text: Some("重复终态通知".to_string()),
                         skill_name: None,
                     },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: "turn-repeat-task-terminal".to_string(),
-                        turn_seq: now.0,
-                        accepted_at: now,
-                        completed_at: Some(now),
-                        status: "completed".to_string(),
-                        user_message: Some("重复终态通知".to_string()),
-                        items: Vec::new(),
-                    }),
+                    current_turn_id: Some(admitted_turn.turn_id.clone()),
                 },
+                admitted_turn,
             )
             .expect("terminal execution chain should persist");
 
@@ -1507,6 +1512,15 @@ mod tests {
             session_store.ensure_session_mission(&session_id, accepted_at, || mission_id.clone());
 
         let turn_id = "turn-task-status-active-error";
+        let admitted_turn = ActiveExecutionTurn {
+            turn_id: turn_id.to_string(),
+            turn_seq: 1,
+            accepted_at,
+            completed_at: None,
+            status: "running".to_string(),
+            user_message: Some("任务状态活动轮写回错误".to_string()),
+            items: Vec::new(),
+        };
         session_store
             .accept_active_execution_chain_with_timeline_entry(
                 session_id.clone(),
@@ -1522,26 +1536,16 @@ mod tests {
                     root_task_id: root_task_id.clone(),
                     execution_chain_ref: "chain-task-status-active-error".to_string(),
                     workspace_id: None,
-                    active_branch_task_ids: vec![root_task_id.clone()],
-                    active_worker_bindings: Vec::new(),
                     branches: Vec::new(),
-                    recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
                         accepted_at,
                         entry_id: "timeline-task-status-active-error".to_string(),
                         trimmed_text: Some("任务状态活动轮写回错误".to_string()),
                         skill_name: None,
                     },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: turn_id.to_string(),
-                        turn_seq: 1,
-                        accepted_at,
-                        completed_at: None,
-                        status: "running".to_string(),
-                        user_message: Some("任务状态活动轮写回错误".to_string()),
-                        items: Vec::new(),
-                    }),
+                    current_turn_id: Some(admitted_turn.turn_id.clone()),
                 },
+                admitted_turn,
             )
             .expect("active execution chain should be accepted");
 
@@ -1694,39 +1698,44 @@ mod tests {
                 .create_session(session_id.clone(), "terminal chain archive")
                 .expect("session should create");
             session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
+            let admitted_turn = ActiveExecutionTurn {
+                turn_id: "turn-terminal-chain-archive".to_string(),
+                turn_seq: now.0,
+                accepted_at: now,
+                completed_at: Some(now),
+                status: "cancelled".to_string(),
+                user_message: Some("停止旧任务".to_string()),
+                items: if bound_to_root {
+                    vec![task_item]
+                } else {
+                    Vec::new()
+                },
+            };
             session_store
-                .upsert_active_execution_chain(
+                .accept_active_execution_chain_with_timeline_entry(
                     session_id.clone(),
+                    magi_session_store::TimelineEntryInput::new(
+                        format!("timeline-chain-{}", admitted_turn.turn_id),
+                        magi_session_store::TimelineEntryKind::UserMessage,
+                        admitted_turn.user_message.clone().unwrap_or_default(),
+                        admitted_turn.accepted_at,
+                    ),
                     ActiveExecutionChain {
                         session_id: session_id.clone(),
                         mission_id: mission_id.clone(),
                         root_task_id: root_task_id.clone(),
                         execution_chain_ref: "chain-terminal-chain-archive".to_string(),
                         workspace_id: None,
-                        active_branch_task_ids: vec![root_task_id.clone()],
-                        active_worker_bindings: Vec::new(),
                         branches: Vec::new(),
-                        recovery_ref: None,
                         dispatch_context: ActiveExecutionDispatchContext {
                             accepted_at: now,
                             entry_id: "entry-terminal-chain-archive".to_string(),
                             trimmed_text: Some("停止旧任务".to_string()),
                             skill_name: None,
                         },
-                        current_turn: Some(ActiveExecutionTurn {
-                            turn_id: "turn-terminal-chain-archive".to_string(),
-                            turn_seq: now.0,
-                            accepted_at: now,
-                            completed_at: Some(now),
-                            status: "cancelled".to_string(),
-                            user_message: Some("停止旧任务".to_string()),
-                            items: if bound_to_root {
-                                vec![task_item]
-                            } else {
-                                Vec::new()
-                            },
-                        }),
+                        current_turn_id: Some(admitted_turn.turn_id.clone()),
                     },
+                    admitted_turn,
                 )
                 .expect("terminal chain should persist");
             task_store

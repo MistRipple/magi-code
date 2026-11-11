@@ -16,7 +16,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const PROTOCOL = { major: 1, minor: 0 };
-const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'plugin.installations', 'plugin.directory.events', 'plugin.reconciliation', 'plugin.changes', 'plugin.skills', 'session.directory', 'session.messages', 'images.store', 'tool.outcome', 'route.payload'];
+const FEATURES = ['hook.guard', 'plugin.management', 'plugin.management.background', 'plugin.installations', 'plugin.directory.events', 'plugin.reconciliation', 'plugin.changes', 'plugin.skills', 'session.directory', 'session.messages', 'images.store', 'tool.outcome', 'route.payload', 'model.operations', 'model.streaming'];
 let negotiatedFeatures = new Set();
 const pluginRequest = (method, input, background = false) => {
   if (!negotiatedFeatures.has('plugin.management')) throw new Error('daemon 未协商 plugin.management');
@@ -54,6 +54,7 @@ const socket = net.createConnection(endpoint);
 let buffer = Buffer.alloc(0);
 let nextId = 1;
 const pending = new Map();
+const modelProgress = new Map();
 let generation = null;
 let configValues = null;
 let configRevision = 0;
@@ -99,6 +100,7 @@ async function disposeExtension() {
   pluginDirectoryListeners.clear();
   if (shuttingDown) return;
   shuttingDown = true;
+  modelProgress.clear();
   clearInterval(routePayloadTimer);
   routePayloads.clear();
   for (const controller of inflight.values()) controller.abort();
@@ -278,7 +280,9 @@ function normalizeDecision(result) {
 }
 
 function handleNotification(method, params) {
-  if (method === 'plugins.changed' && negotiatedFeatures.has('plugin.directory.events')) {
+  if (method === 'model.delta' && params?.generation === generation) {
+    modelProgress.get(params.operationId)?.(params.delta);
+  } else if (method === 'plugins.changed' && negotiatedFeatures.has('plugin.directory.events')) {
     for (const listener of [...pluginDirectoryListeners]) {
       Promise.resolve().then(() => {
         if (pluginDirectoryListeners.has(listener)) return listener();
@@ -487,7 +491,34 @@ const api = Object.freeze({
     if (match !== 'exact' && match !== 'prefix') throw new TypeError('match 必须是 exact 或 prefix');
     return register('register.route', 'unregister.route', routeHandlers, `${match}:${path}`, handler);
   },
-  model: Object.freeze({ invoke: (input = {}) => request('model.invoke', input) }),
+  model: Object.freeze({
+    selection() {
+      if (!negotiatedFeatures.has('model.operations')) throw new Error('daemon 未协商 model.operations');
+      return request('model.selection', {});
+    },
+    async invoke(input = {}, { signal, onDelta } = {}) {
+      const context = invocationContext.getStore();
+      signal = signal && context?.signal ? AbortSignal.any([signal, context.signal]) : signal ?? context?.signal;
+      signal?.throwIfAborted();
+      if (onDelta !== undefined && (typeof onDelta !== 'function' || !negotiatedFeatures.has('model.streaming') || !input.operationId)) throw new Error('模型流需要 model.streaming、operationId 和 onDelta 回调');
+      if (onDelta && context?.activity !== 'route') throw new Error('模型进度回调需要活动页面路由');
+      if (modelProgress.has(input.operationId)) throw new Error('同一模型操作仍在执行');
+      let progressError;
+      const cancel = () => { if (input.operationId) void request('model.cancel', { operationId: input.operationId }).catch(() => {}); };
+      if (onDelta) modelProgress.set(input.operationId, delta => invocationContext.run(context, () => {
+        if (signal?.aborted || progressError) return;
+        try { onDelta(delta); } catch (error) { progressError=error; cancel(); }
+      }));
+      signal?.addEventListener('abort', cancel, { once: true });
+      try {
+        const result = await request('model.invoke', onDelta ? { ...input, stream:true } : input);
+        if (progressError) throw progressError;
+        signal?.throwIfAborted();
+        return result;
+      } catch(error) { cancel(); throw progressError ?? error; }
+      finally { modelProgress.delete(input.operationId); signal?.removeEventListener('abort', cancel); }
+    },
+  }),
   tools: Object.freeze({ call: (tool, input = {}) => request('tool.call', { tool, input }) }),
   task: Object.freeze({ spawn: (input = {}) => request('task.spawn', input) }),
   notify: Object.freeze({ user: (input = {}) => request('notify.user', input) }),
@@ -506,6 +537,10 @@ const api = Object.freeze({
   /** 读取 daemon 的插件目录；不包含插件配置、私有资源或凭据。 */
   plugins: pluginApi(),
   credential: Object.freeze({ ref: (input = {}) => request('credential.ref', input) }),
+  web: Object.freeze({
+    read: () => request('web.read', {}),
+    configure: input => request('web.configure', input),
+  }),
   /** 向主对话的模型目录提交（整体替换）清单声明过且获 `modelSources` 授权的数据源；宿主退出时自动撤销。 */
   modelSource: Object.freeze({
     set: (sourceId, input = {}) => request('modelSource.set', { sourceId, ...input }),

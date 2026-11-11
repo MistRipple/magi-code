@@ -102,7 +102,9 @@ daemon 响应形状：
 | `resource.read/write` | `api.resource.read(id)`／`write(id,expectedVersion,value)` | 当前插件全局资源，逐次 storage 授权与 CAS |
 | `settings.read/write` | `api.settings.read()`／`write(expectedVersion,value)` | `__settings` 授权、schema 校验、CAS 与事件同步 |
 | `settings.describe` | `api.settings.describe()` | 返回 `{schema}`，包含当前实例已接纳的运行期设置 schema |
-| `model.invoke` | `api.model.invoke(input)` | `{prompt,roleId?,credentialRef?,maxOutputTokens?}`，models 授权、原生模型解析和账本 |
+| `model.invoke` | `api.model.invoke(input,{signal?,onDelta?}?)` | 工具／命令保持 `{prompt,roleId?,credentialRef?,maxOutputTokens?}`；页面路由协商 `model.operations` 后使用有序消息、图片、工具及生成参数，见下文。`onDelta` 另需 `model.streaming`，仅限页面路由；均需 models 授权，由原生模型解析和账本结算 |
+| `model.selection` | `api.model.selection()` | 协商 `model.operations`，活动页面路由及 `models:["default"]` 授权；读取全局默认模型的 `{sourceId,model,revision,inputModalities?,reasoning?}` 无凭据快照；reasoning 沿 Magi 的 ReasoningCapability，不返回上游生态专属格式 |
+| `model.cancel` | SDK 由 `signal` 发出 | 仅取消当前插件／摘要内指定 operationId，沿同一调用控制中止，不重放模型请求 |
 | `credential.ref` | `api.credential.ref({roleId?})` | 返回模型绑定引用，不返回 secret；只由 model.invoke 消费 |
 | `session.snapshot` | `api.session.snapshot(input)` | 仅签发会话；`sessionId?`、`afterTurnSeq?`、`limit?`；最多 10 Turn，每 Turn 最多 20 条截断文本 |
 | `session.message` | `api.session.message(input)` | 协商 `session.messages`，输入与回执为 `PluginSessionMessageRequest/Receipt`。需要独立 `sessionWrite:["context"]` 或 `["wake"]` 授权，仅写当前有效调用所属的主会话；daemon 注入的真实 Task、Turn 与执行租约必须一致。子任务拒绝；计划作业只能提供 context，不能借 wake 绕过模型预算。正文保存插件来源和稳定身份，不能冒充用户／系统或指定其他会话；不提供后台入口 |
@@ -188,6 +190,22 @@ DSH 页面里的 `EventSource` 通过相同路由调用承载 SSE。兼容层保
 
 待处理消息沿原 Input 日志恢复，重启不自动执行 context；用户可取消，不能编辑原插件消息或把它改投递为用户输入。UI 完整展示已交付正文及来源。已接纳消息是会话事实，停用插件不撤销已提交内容；它仍可由用户取消。DSH 的同步 inject/steer/followup 在本次业务成功返回后统一等待真实 daemon 回执，失败、取消及失效调用不提交临时消息；不为这些方法另建 Agent、Session 或消息存储。
 
+### 页面模型操作
+
+`model.operations` 不改变插件默认全局的启用规则。页面路由由 daemon 签发调用租约，模型操作另绑定真实插件、包摘要、实例及调用者提供的稳定 `operationId`；不创建用户 Session 或借用主对话 Turn。`selection` 必须与接纳时的全局默认模型内容身份相同，原生来源消失或配置变化明确失败。页面业务可消费用户已选的插件模型来源；工具／命令、子代理与辅助模型继续沿其原有模型选择规则。
+
+选择快照的可选 `reasoning` 使用已有原生 `ReasoningCapability`：`supportedEfforts`、`defaultEffort`（当前有效选择）、`transport`、`source`；档位为 `none/minimal/low/medium/high/xhigh/max/ultra`，未知或未声明档位不接纳。快照原样回传给 `model.invoke`，不能改写为上游的 `efforts:[{id,name}]` 或将 `none` 改成 `off`。生态适配器只为原包生成自己的只读投影，并在回传调用时转换所选档位；原生插件直接使用同一公共合同。该字段修正早期未文档化的 DSH 格式，不保留第二套上游形状；已确认操作的结果读取与恢复仍沿原有操作身份，不重放请求。
+
+`messages` 为 1–256 条有序消息，字段为 `{role,content,images?,toolCalls?,toolCallId?,providerContext?}`，role 为 system／developer／user／assistant／tool。只有 assistant 可携带原生返回的 providerContext 和工具调用，tool 必须通过 toolCallId 回答本次历史中的唯一调用；user／tool 可携带 base64 PNG、JPEG、WebP 或 GIF 图片。序列化消息合计最多 3 MiB，输出上限 1–32768 Token（默认 4096），结果最多 1 MiB。工具定义 `tools` 最多 128 项，采用原生 ChatToolDefinition；只声明插件自己的业务函数，模型返回调用意图，不因此执行或授权 Magi 工具。`temperature?`、`stop?`、`reasoningEffort?` 由同一原生协议适配器校验及转换，协议无法表达或模型未声明的控制明确拒绝，不静默忽略。`metadata?` 的 sessionId／purpose 仅为请求指纹中的来源信息，不创建或改变真实会话归属。
+
+`model.streaming` 通过同一宿主连接的 `model.delta` 通知交付原生增量，绑定实例 generation、operationId 和活动路由租约；`onDelta` 在最终响应前运行。消费者取消、回调异常或连接失效取消同一模型操作，旧实例进度不交付新实例。DSH 适配器将正文和推理增量转换为原包块，最终补齐尚未交付的尾部；结果与已交付片段矛盾时明确失败。工具调用在原生最终结果确认后生成完整调用块，不声称交付逐字符工具参数。已确认结果读取可一次交付，不重新发送 HTTP 请求。该通知是传输进度，不是第二份业务结果或页面 HTTP 流接口；普通页面 fetch 的响应收集合同保持原样。
+
+原生 `ModelResponse` 的文本、推理、工具调用、终止原因、用量及私有续写数据保持真实值。源请求、生成控制及实际模型快照参与操作指纹，模型传输继续使用现有 Bridge 的流式入口及传输记录器。DSH 图片先经已有附件读取授权与共享图片转换，持久附件元数据以 daemon 回执为准；请求临时图片仍只属于当前请求。未声明的字段和内容明确失败，不返回假成功。
+
+操作接纳、已确认结果和传输用量进入同一持久审计／用量账本，插件归属不填充 sessionId。相同身份读取持久结果；内容变化、在途重复或已发送但结果未知的操作拒绝自动重放。父路由取消、显式 signal、停用及实例失效中止同一操作；接纳前先到的取消也不会漏发请求。并发上限为每插件 4、全局 8；取消记录有数量和期限约束。重启只恢复事实和用量投影，不重新发出模型请求。
+
+页面调用与会话调用统一结算为 `model.usage.recorded`，使用互斥的 `plugin` 或 `sessionId` 表达真实归属。`plugin` 保存插件 ID、摘要、实例、操作及名称快照，重启沿同一投影恢复。全局执行统计按插件展示实际调用、用量及取消结果；查看单个会话仅计入归属该会话的调用。插件的应用全局启用规则不受统计筛选影响。
+
 ## 5. 注册
 
 清单声明、用户授权和包摘要决定能力上界。静态贡献直接来自清单；动态贡献需要清单的 `extension.runtimeContributions` 显式列出 `tools`、`commands`、`modelSources`、`settings` 或 `skills`。只有声明对应动态贡献种类时，`tools`／`modelSources` 权限才允许 `"*"` 目标；它不授予模型调用、存储或其他能力。钩子仍完全静态，不能降低 guard 模式。插件工具名由 Magi 生成，作者不依赖模型侧编码后的名称。
@@ -220,7 +238,7 @@ DSH 页面里的 `EventSource` 通过相同路由调用承载 SSE。兼容层保
 | `subagent.spawn` | guard | `{role,taskName,goal,toolCallId}`；原生完整预检前，只能继续／阻止，不支持改角色或模型 |
 | `usage.update` | observe | 已提交用量事实，不含凭据 |
 
-实际调用链见设计文档第 5.6 节及 [`extension_bridge.rs`](../crates/magi-daemon/src/daemon/extension_bridge.rs)。工具钩子作用于有工具的 Task 管线，不能据此声称纯 conversation 会执行工具。
+实际调用链见设计文档第 5.6 节及 [`extension_bridge.rs`](../crates/magi-daemon/src/daemon/extension_bridge.rs)。`tool.call` 作用于 Task 的工具执行管线；`tool.result` 作用于模型历史投影，任务、普通会话读取历史工具结果和压缩摘要都使用同一规则。纯 conversation 不执行新工具。同一模型请求冻结投影，下一请求重新核对当前插件；检查点绑定工具投影指纹，投影变化后旧摘要失效。
 
 提示片段每条及每阶段总计最多 128K Unicode 字符，实际限额通过 `budget` 返回，超限整条拒绝、不截断；提示补丁 JSON 传输最多 1 MiB。start 仅 stable 并冻结，round 仅 volatile 并放在尾部。来源由 daemon 注入，不能伪造原生系统段；长业务指引仍计入正常模型上下文与压力处理。历史投影 patch 最多 64 KiB；模型可见原文逐条截断且总量有界。历史改写与自定义摘要必须有独立 `contextRewrite:["history"]` 授权；原始会话不被替换，改写来源与缓存归因进入 ModelStep，界面显示通知。
 

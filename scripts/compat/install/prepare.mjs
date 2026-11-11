@@ -5,7 +5,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSy
 import { createHash } from 'node:crypto';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createRegistry } from '../index.mjs';
+import { createDshTranslator } from '../dsh/translator.mjs';
 import { packageId } from '../core/identity.mjs';
 import { analyzeNativeClient, findClientFile } from './client-assets.mjs';
 import { resolveUpstreamIcon } from './icon.mjs';
@@ -18,7 +18,7 @@ import { clientViews } from './client-views.mjs';
 import { dshEnvironment, checkDshCompatibility } from '../core/dsh-compatibility.mjs';
 import { translateClientBusiness } from './client-business.mjs';
 import { REGISTERED_SETTINGS_RESOURCE } from '../runtime/registered-settings.mjs';
-import { backendEntry, readPackage } from '../core/package.mjs';
+import { backendEntry, readPackage, settingsNamespace } from '../core/package.mjs';
 import { translationRuntimeId } from '../core/translation-runtime.mjs';
 
 const COMPAT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -36,7 +36,8 @@ function copyTree(source, target) {
       if ((name.startsWith('native/windows/') && process.platform !== 'win32')
         || (name.startsWith('native/macos/') && process.platform !== 'darwin')
         || (name.startsWith('native/linux/') && process.platform !== 'linux')) continue;
-      if (/\.(node|wasm)$/i.test(name)) throw new Error(`上游原包或依赖包含未支持的原生模块：${name}`);
+      // WASM 是标准 Node/Web 资源，不依赖宿主 ABI；受信 Node 沿其自身执行权限加载。
+      if (/\.node$/i.test(name)) throw new Error(`上游原包或依赖包含未支持的原生模块：${name}`);
       const sourceStat = statSync(full), size = sourceStat.size; total += size;
       // 这里只限制准备进程的临时复制开销；脚本、资源和最终归档的准入
       // 由 daemon 的 PluginPackage 统一裁决，不维护第二份单文件规则。
@@ -59,12 +60,16 @@ function clientDocument(configFile, styles = []) {
 export async function prepareDsh(options) {
   const preparedRuntimeId = translationRuntimeId(options.sharedRoot);
   const pkg = readPackage(options.upstreamDir);
-  const translator = createRegistry().create('dsh');
+  const rootSettingsNamespace = settingsNamespace(options.upstreamDir, pkg);
+  const translator = createDshTranslator();
   if (!(await translator.detect(options.upstreamDir))) throw new Error(`${pkg.name} 不是 DSH 插件`);
   const compatibility = checkDshCompatibility(pkg, dshEnvironment(options.sharedRoot), options.compatibility);
   if (existsSync(options.outDir) && readdirSync(options.outDir).length) throw new Error('输出目录必须为空');
   const main = backendEntry(pkg), root = resolve(options.upstreamDir), entry = resolve(root, main);
   if (!entry.startsWith(root + sep) || !existsSync(entry) || !/\.(?:mjs|cjs|js)$/.test(main)) throw new Error('上游入口无效或尚未构建');
+  const client = findClientFile(root, pkg);
+  // 原包 UI 意图先准入，再做业务调用适配和写入产物；不得静默转换原生替换语义。
+  const clientAnalysis = client ? analyzeNativeClient({ upstreamDir: root, pkg, sharedRoot: options.sharedRoot }) : null;
   const inspection = await translator.inspect(root);
   if (inspection.verdict.blocked.length) throw new Error(`Magi 兼容检查未通过：\n${inspection.verdict.blocked.map((item) => `${item.name}（${item.status === 'unknown' ? '尚未完成兼容核对' : '宿主能力尚未接入'}）: ${item.note}`).join('\n')}`);
   const dependencies = await installDependencies(root, options.sharedRoot, undefined, compatibility);
@@ -75,7 +80,10 @@ export async function prepareDsh(options) {
   // 静态扫描不能证明 apply() 能启动，也看不到延迟注册的工具/事件。安装前在
   // 受限记录器中按默认配置启动一次真实 Cordis，仅保留观察证据；
   // 动态贡献由激活后的原包发布，不能从安装期快照生成静态贡献。
-  const recorded = recordUpstream({ entry, sharedRoot: options.sharedRoot, upstreamDir: root, readSessionDirectory });
+  const nullableEvents = inspection.entries.filter(item => item.kind === 'events' && item.nullable
+    && ['partial', 'dropped'].includes(item.status)).map(item => item.name);
+  const webProviders = inspection.entries.some(item => item.kind === 'injects' && item.name === 'web' || item.kind === 'calls' && /^ctx\.web(?:\.|$)/.test(item.name));
+  const recorded = recordUpstream({ settingsNamespace: rootSettingsNamespace, webProviders, entry, sharedRoot: options.sharedRoot, upstreamDir: root, readSessionDirectory, nullableEvents });
   const knownEvents = new Set(inspection.entries.filter(item => item.kind === 'events').map(item => item.name));
   const runtimeEntries = recorded.listeners.filter(name => !knownEvents.has(name)).map((name) => {
     const rule = classifyDsh('events', name);
@@ -92,7 +100,6 @@ export async function prepareDsh(options) {
     name: pkg.displayName ?? pkg.name, description: pkg.description ?? '', dataSchemaVersion: 1,
     extension: { hooks: [], compat: { kind: 'dsh' }, runtimeContributions: ['tools', 'commands', 'modelSources', 'settings', 'skills'] },
     permissions: [
-      { kind: 'sessionWrite', targets: ['context', 'wake'] },
       { kind: 'extension', targets: ['full-trust'] }, { kind: 'storage', targets: ['__settings'] },
       { kind: 'tools', targets: ['*'] }, { kind: 'modelSources', targets: ['*'] },
     ],
@@ -101,7 +108,14 @@ export async function prepareDsh(options) {
     // 清单，daemon 合并运行目录时会把同一个贡献 ID 计数两次。
     contributions: { tools: [], commands: [], views: [{ id: 'settings', title: '设置', entry: 'ui/settings.html', placements: ['settings'] }] },
   };
-  const client = findClientFile(root, pkg);
+  // 当前工具／命令的结果投递需要独立授权；页面、设置和模型连接不默认申请。
+  // 保留可选注入与配置后注册的业务，不能只依赖默认启动时观察到的目录。
+  if (webProviders) manifest.permissions.push({ kind: 'webProviders', targets: ['search', 'fetch'] });
+  const sessionBusiness = recorded.tools.length > 0 || recorded.commands.length > 0
+    || ['tools', 'commands'].some(name => Object.hasOwn(inspection.serviceReads, name))
+    || inspection.entries.some(entry => (entry.kind === 'calls' && /^ctx\.(tools|commands)(\.|$)/.test(entry.name))
+      || (entry.kind === 'injects' && ['tools', 'commands'].includes(entry.name)));
+  if (sessionBusiness) manifest.permissions.push({ kind: 'sessionWrite', targets: ['context', 'wake'] });
   const clientSource = client ? readFileSync(client.file, 'utf8') : null;
   const business = clientSource ? translateClientBusiness(clientSource) : null;
   if (client) {
@@ -116,7 +130,7 @@ export async function prepareDsh(options) {
     || Object.hasOwn(inspection.serviceReads, 'hmr');
   const profileWrites = inspection.profileMutations.length > 0;
   if (management || packageManagement || inspection.profilePackageProcesses.length > 0) {
-    manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', 'authorize', ...(management ? ['compatibility'] : []), 'background'] });
+    manifest.permissions.push({ kind: 'pluginManagement', targets: ['install', 'lifecycle', ...(management ? ['compatibility'] : []), 'background'] });
   } else if (profileReload || profileWrites) {
     manifest.permissions.push({ kind: 'pluginManagement', targets: ['lifecycle', 'background'] });
   }
@@ -133,20 +147,27 @@ export async function prepareDsh(options) {
   const promptContributions = inspection.entries.some(entry => ['systemPrompt', '@deepseek-ai/dsh-system-prompt'].includes(entry.name) || /^ctx\.systemPrompt(?:\.|$)/.test(entry.name))
     || Object.hasOwn(inspection.serviceReads, 'systemPrompt');
   if (promptContributions) manifest.extension.hooks.push({ name: 'prompt.contribute', mode: 'advise' });
+  const nativeModels = Object.hasOwn(inspection.serviceReads, 'agentDefaultModel')
+    || ['llm.stream','llm.prepareCall','agentDefaultModel.currentSelection'].some(member=>Object.hasOwn(inspection.serviceMembers,member))
+    || inspection.entries.some(entry=>entry.kind==='injects'&&entry.name==='agentDefaultModel')
+    || inspection.entries.some(entry => /^ctx\.(?:agentDefaultModel|llm\.(?:stream|prepareCall))(?:\.|$)/.test(entry.name));
+  if (nativeModels) manifest.permissions.push({ kind:'models', targets:['default'] });
   mkdirSync(options.outDir, { recursive: true });
   const kept = copyTree(root, options.outDir);
   const compatRuntimeId = compatibility.runtimeId;
-  const optionalEvents = inspection.entries.filter(item => item.kind === 'events' && item.optional).map(item => item.name);
-  writeFileSync(join(options.outDir, 'extension/index.mjs'), `import { activateDsh } from '@magi/compat-dsh';\nimport * as upstream from ${JSON.stringify(`./upstream/${main}`)};\nexport default api => activateDsh(api, upstream, ${JSON.stringify({ runtimeVersion: TRANSLATOR_VERSION, plugin: pkg.name, runtimeId: compatRuntimeId, optionalEvents, readSessionDirectory, settingsNamespaces: registeredSettings, promptContributions })});\n`);
+  writeFileSync(join(options.outDir, 'extension/index.mjs'), `import { activateDsh } from '@magi/compat-dsh';\nimport * as upstream from ${JSON.stringify(`./upstream/${main}`)};\nexport default api => activateDsh(api, upstream, ${JSON.stringify({ runtimeVersion: TRANSLATOR_VERSION, webProviders, plugin: pkg.name, settingsNamespace: rootSettingsNamespace, runtimeId: compatRuntimeId, nullableEvents, readSessionDirectory, settingsNamespaces: registeredSettings, promptContributions, nativeModels })});\n`);
   mkdirSync(join(options.outDir, 'ui'), { recursive: true });
   copyFileSync(join(COMPAT_DIR, 'dist/dsh-client-host.js'), join(options.outDir, 'ui/host.js'));
-  let clientAnalysis = null;
   if (client) {
-    clientAnalysis = analyzeNativeClient({ upstreamDir: root, pkg, sharedRoot: options.sharedRoot });
     const assets = copyBrowserAssets(COMPAT_DIR, join(options.outDir, 'ui'));
     writeFileSync(join(options.outDir, 'ui/client.js'), business.code);
     const views = clientViews(clientAnalysis.mounted, manifest.name);
     manifest.contributions.views = views.map(({ slot, ...view }) => view);
+    if (views.some(view => view.placements.includes('composerLeft'))) {
+      const permission = manifest.permissions.find(permission => permission.kind === 'sessionRead');
+      if (permission) permission.targets.push('render');
+      else manifest.permissions.push({ kind: 'sessionRead', targets: ['render'] });
+    }
     if (business.operations.length) {
       manifest.contributions.client = { entry: views[0].entry };
       manifest.permissions.push({ kind: 'client', targets: ['persistent'] });

@@ -211,14 +211,6 @@ pub fn spawn_managed(command: &mut Command) -> io::Result<ManagedChild> {
     default_managed_process_group().spawn(command)
 }
 
-/// 启动一个属于指定生命周期组、可整体终止子进程树的同步进程。
-pub fn spawn_managed_in_group(
-    process_group: &ManagedProcessGroup,
-    command: &mut Command,
-) -> io::Result<ManagedChild> {
-    process_group.spawn(command)
-}
-
 /// 启动一个可整体终止子进程树的异步进程。
 pub fn spawn_managed_tokio(command: &mut tokio::process::Command) -> io::Result<AsyncManagedChild> {
     default_managed_process_group().spawn_tokio(command)
@@ -385,10 +377,6 @@ impl ManagedChild {
         self.child.stdin.take()
     }
 
-    pub fn stdin_mut(&mut self) -> Option<&mut ChildStdin> {
-        self.child.stdin.as_mut()
-    }
-
     pub fn take_stdout(&mut self) -> Option<ChildStdout> {
         self.child.stdout.take()
     }
@@ -507,14 +495,6 @@ fn unregister_managed_process(process_group: &Arc<ManagedProcessRegistry>, regis
         .lock()
         .expect("managed process registry lock poisoned")
         .remove(&registration_id);
-}
-
-/// 终止当前 Magi 进程创建的全部受管子进程树。
-///
-/// daemon 优雅退出和异常收口都调用此入口，覆盖工具 Shell、后台进程、MCP、Tunnel、
-/// Vite 以及一次性本地执行器，避免某条调用栈阻塞时留下孤儿进程。
-pub fn terminate_all_managed_processes() -> usize {
-    default_managed_process_group().terminate_all()
 }
 
 fn prepare_managed_std_command(command: &mut Command) {

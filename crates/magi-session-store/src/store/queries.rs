@@ -582,18 +582,6 @@ impl SessionStore {
         Some((page, start > 0, cursor))
     }
 
-    pub fn recent_turn_messages(&self, session_id: &SessionId, limit: usize) -> Vec<String> {
-        let mut entries = self.timeline_for_session(session_id);
-        entries.reverse();
-        let mut messages = entries
-            .into_iter()
-            .take(limit)
-            .filter_map(|entry| crate::timeline_entry_visible_text(&entry.message))
-            .collect::<Vec<_>>();
-        messages.reverse();
-        messages
-    }
-
     pub fn notifications(&self) -> Vec<NotificationRecord> {
         let mut notifications = self
             .state
@@ -645,7 +633,6 @@ impl SessionStore {
         self.state
             .read()
             .expect("session state read lock poisoned")
-            .execution_sidecar_store
             .runtime_sidecar(session_id)
     }
 
@@ -661,18 +648,12 @@ impl SessionStore {
             .iter()
             .find(|session| &session.session_id == session_id)?
             .clone();
-        let sidecar = state
-            .execution_sidecar_store
-            .runtime_sidecars
-            .iter()
-            .find(|sidecar| {
-                &sidecar.session_id == session_id
-                    && sidecar
-                        .current_turn
-                        .as_ref()
-                        .is_some_and(|turn| turn.turn_id == turn_id)
-            })?
-            .clone();
+        let sidecar = state.runtime_sidecar(session_id).filter(|sidecar| {
+            sidecar
+                .current_turn
+                .as_ref()
+                .is_some_and(|turn| turn.turn_id == turn_id)
+        })?;
         let canonical_turn = state
             .canonical_turns
             .iter()
@@ -711,16 +692,18 @@ impl SessionStore {
             timeline_entry,
             superseded_turn,
             canonical_turn,
-            sidecar,
+            sidecar: sidecar.into(),
         })
     }
 
     pub fn active_execution_sidecars(&self) -> Vec<SessionRuntimeSidecar> {
-        self.state
-            .read()
-            .expect("session state read lock poisoned")
+        let state = self.state.read().expect("session state read lock poisoned");
+        state
             .execution_sidecar_store
             .active_runtime_sidecars()
+            .iter()
+            .map(|sidecar| state.project_sidecar(sidecar))
+            .collect()
     }
 
     /// 只返回与指定任务直接相关的活动执行 sidecar。
@@ -733,9 +716,8 @@ impl SessionStore {
         task_id: &TaskId,
         root_task_id: &TaskId,
     ) -> Vec<SessionRuntimeSidecar> {
-        self.state
-            .read()
-            .expect("session state read lock poisoned")
+        let state = self.state.read().expect("session state read lock poisoned");
+        state
             .execution_sidecar_store
             .runtime_sidecars
             .iter()
@@ -752,31 +734,38 @@ impl SessionStore {
                         .active_execution_chain
                         .as_ref()
                         .is_some_and(|chain| {
-                            chain.root_task_id == *root_task_id
-                                || chain.root_task_id == *task_id
-                                || chain
-                                    .active_branch_task_ids
-                                    .iter()
-                                    .any(|active_task_id| active_task_id == task_id)
-                                || chain
-                                    .branches
-                                    .iter()
-                                    .any(|branch| &branch.task_id == task_id)
+                            chain.root_task_id == *root_task_id || chain.contains_task(task_id)
                         });
-                let turn_matches = sidecar.current_turn.as_ref().is_some_and(|turn| {
-                    turn.items
-                        .iter()
-                        .any(|item| item.task_id.as_ref() == Some(task_id))
-                });
+                let turn_matches = sidecar
+                    .current_turn_id
+                    .as_deref()
+                    .and_then(|id| {
+                        state.canonical_turns.iter().find(|turn| {
+                            turn.session_id == sidecar.session_id && turn.turn_id == id
+                        })
+                    })
+                    .is_some_and(|turn| {
+                        turn.items.iter().any(|item| {
+                            item.worker
+                                .as_ref()
+                                .and_then(|worker| worker.task_id.as_ref())
+                                == Some(task_id)
+                        })
+                    });
                 active_chain_matches || turn_matches
             })
-            .cloned()
+            .map(|sidecar| state.project_sidecar(sidecar))
             .collect()
     }
 
     pub fn execution_sidecar_exports(&self) -> Vec<SessionRuntimeSidecarExport> {
         let state = self.state.read().expect("session state read lock poisoned");
-        let mut exports = state.execution_sidecar_store.export_views();
+        let mut exports = state
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .map(|sidecar| state.project_sidecar(sidecar).export_view())
+            .collect::<Vec<_>>();
         for export in &mut exports {
             export.resume_candidate = mainline_resume_candidate_in(&state, &export.session_id);
         }
@@ -787,10 +776,9 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
     ) -> Option<SessionRuntimeSidecarExport> {
-        let mut export = self
-            .runtime_sidecar(session_id)
-            .map(|sidecar| sidecar.export_view())?;
-        export.resume_candidate = self.mainline_resume_candidate(session_id);
+        let state = self.state.read().expect("session state read lock poisoned");
+        let mut export = state.runtime_sidecar(session_id)?.export_view();
+        export.resume_candidate = mainline_resume_candidate_in(&state, session_id);
         Some(export)
     }
 
@@ -807,22 +795,36 @@ impl SessionStore {
     }
 
     pub fn active_execution_chain(&self, session_id: &SessionId) -> Option<ActiveExecutionChain> {
-        self.runtime_sidecar(session_id)
-            .and_then(|sidecar| sidecar.active_execution_chain)
+        self.state
+            .read()
+            .expect("session state read lock poisoned")
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .find(|sidecar| &sidecar.session_id == session_id)
+            .and_then(|sidecar| sidecar.active_execution_chain.clone())
     }
 
     pub fn execution_ownership(&self, session_id: &SessionId) -> Option<ExecutionOwnership> {
-        self.runtime_sidecar(session_id)
-            .map(|sidecar| sidecar.ownership)
+        self.state
+            .read()
+            .expect("session state read lock poisoned")
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .find(|sidecar| &sidecar.session_id == session_id)
+            .map(|sidecar| sidecar.ownership.clone())
     }
 
     pub fn recovery_id(&self, session_id: &SessionId) -> Option<String> {
-        self.runtime_sidecar(session_id)
-            .and_then(|sidecar| sidecar.recovery_id)
-    }
-
-    pub fn recovery_ref(&self, session_id: &SessionId) -> Option<String> {
-        self.recovery_id(session_id)
+        self.state
+            .read()
+            .expect("session state read lock poisoned")
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .find(|sidecar| &sidecar.session_id == session_id)
+            .and_then(|sidecar| sidecar.recovery_id.clone())
     }
 
     pub fn execution_sidecar_store_state(&self) -> SessionExecutionSidecarStoreState {
@@ -853,10 +855,12 @@ impl SessionStore {
     }
 
     pub fn runtime_sidecars(&self) -> Vec<SessionRuntimeSidecar> {
-        self.state
-            .read()
-            .expect("session state read lock poisoned")
+        let state = self.state.read().expect("session state read lock poisoned");
+        state
             .execution_sidecar_store
-            .runtime_sidecars()
+            .runtime_sidecars
+            .iter()
+            .map(|sidecar| state.project_sidecar(sidecar))
+            .collect()
     }
 }

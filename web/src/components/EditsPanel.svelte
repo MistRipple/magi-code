@@ -23,10 +23,8 @@
   import { requestOpenHtmlFileInBrowser } from '../lib/browser-navigation';
   import {
     getAgentChangeDiff,
-    isWebAgentMode,
   } from '../web/agent-api';
 
-  const isWebMode = isWebAgentMode();
   const edits = $derived(ensureArray(messagesState.edits) as Edit[]);
   // 隔离会话里「批准」就是把改动合并回主工作区。
   const sessionIsolated = $derived(isSessionIsolated(messagesState.currentSessionId?.trim() || ''));
@@ -213,35 +211,8 @@
     }
   }
 
-  /**
-   * 点击文件行：
-   * - Web 模式：把变更推到全局右侧 RightPane 的 code tab（携带 diff 与文件元信息），由 RightPane 负责展示与切换
-   * - VS Code host：沿用 host 的 diff 编辑器（postMessage 给 extension）
-   * EditsPanel 自身不再承担 diff 预览职责，避免与 RightPane 双轨实现
-   */
+  // 变更预览统一交给右栏，沿原变更接口读取内容与目录身份。
   async function viewDiff(edit: Edit) {
-    if (!isWebMode) {
-      vscode.postMessage({
-        type: 'viewDiff',
-        filePath: edit.filePath,
-        ...editScope(edit),
-        diff: edit.diff || '',
-        originalContent: edit?.originalContent,
-        previewContent:
-          (typeof edit.previewContent === 'string' && edit.previewContent.length > 0)
-            ? edit.previewContent
-            : (typeof edit.originalContent === 'string' ? edit.originalContent : ''),
-        previewAbsolutePath: edit?.previewAbsolutePath,
-        previewCanOpenWorkspaceFile: edit?.previewCanOpenWorkspaceFile,
-        contentKind: edit?.contentKind ?? 'text',
-        size: edit?.size,
-        mime: edit?.mime,
-        symlinkTarget: edit?.symlinkTarget,
-        headSummary: edit?.headSummary,
-        tailSummary: edit?.tailSummary,
-      });
-      return;
-    }
     const scope = editScope(edit);
     const detail = await loadChangeDetail(edit, scope);
     if (requestOpenHtmlFileInBrowser(detail.filePath, scope)) {

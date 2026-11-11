@@ -40,7 +40,3 @@ export function getInitialBridgeLocale(): SupportedLocale {
 export function notifyBridgeReady(): void {
   getClientBridge().notifyReady();
 }
-
-export function getBridgeKind() {
-  return getClientBridge().kind;
-}

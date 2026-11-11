@@ -8,29 +8,6 @@
 import type { LLMConfig, ModelApiProtocol } from './agent-types';
 
 // ============================================================================
-// Normalizer 族
-// ============================================================================
-
-export type NormalizerFamily = 'anthropic' | 'openai' | 'google';
-
-// ============================================================================
-// 停滞检测配置
-// ============================================================================
-
-export interface StallDetectionConfig {
-  consecutiveFailThreshold: number;
-  totalFailLimit: number;
-  stallWarnLevel1: number;
-  stallWarnLevel2: number;
-  stallWarnLevel3: number;
-  stallAbortThreshold: number;
-  maxTotalRounds: number;
-  noOutputWarn: number;
-  noOutputForce: number;
-  noOutputAbort: number;
-}
-
-// ============================================================================
 // ModelEngine（用户配置）
 // ============================================================================
 
@@ -88,25 +65,4 @@ export interface AgentBinding {
     focus?: string[];
     constraints?: string[];
   };
-}
-
-// ============================================================================
-// 展示快照
-// ============================================================================
-
-export interface AgentDisplaySnapshot {
-  agentId: string;
-  displayName: string;
-  colorToken?: string;
-  icon?: string;
-}
-
-// ============================================================================
-// 配置文件结构
-// ============================================================================
-
-export interface AgentRegistryConfig {
-  version: '3.0';
-  engines: ModelEngine[];
-  agents: AgentBinding[];
 }

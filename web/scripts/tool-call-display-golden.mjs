@@ -27,6 +27,12 @@ const modelFailureCardSource = await readFile(
   'utf8',
 );
 
+function assertSeparateHeaderActions(markup, context) {
+  assert.doesNotMatch(markup,
+    /<button\b[^>]*>(?:(?!<\/button>)[\s\S])*<(?:button\b|[^>]+\brole="button")/,
+    `${context} 文件预览与展开必须是独立的原生操作，不能嵌套按钮`);
+}
+
 assert.match(
   modelFailureCardSource,
   /\.model-failure\s*\{[\s\S]*?width:\s*100%;[\s\S]*?max-width:\s*none;[\s\S]*?box-sizing:\s*border-box;/,
@@ -217,13 +223,12 @@ await withGoldenViteServer(async (server) => {
   const toolCallFailure = await server.ssrLoadModule('/src/lib/tool-call-failure.ts');
 
   assert.equal(
-    agentColors.getAgentVisualInfo(
+    agentColors.getAgentBrandInfo(
       'executor',
-      undefined,
       (key) => key === 'roleTemplate.executor.displayName' ? '执行工程师' : key,
     ).label,
     '执行工程师',
-    '统一代理视觉信息必须保留角色翻译器',
+    '生产组件使用的代理品牌入口必须保留角色翻译器',
   );
 
   assert.deepEqual(
@@ -270,7 +275,7 @@ await withGoldenViteServer(async (server) => {
   const { default: ConversationTurn } = await server.ssrLoadModule('/src/components/ConversationTurn.svelte');
   const { default: ToolCallRenderer } = await server.ssrLoadModule('/src/components/ToolCallRenderer.svelte');
   for (const sessionId of ['local-session', 'external-tool-chat-regression']) {
-    for (const changeType of ['create', 'modify', 'delete']) {
+    for (const changeType of ['create', 'modify', 'delete', 'rename']) {
       const filePreviewScope = { sessionId, workspaceId: 'workspace-a' };
       const message = {
         id: `${sessionId}-${changeType}`, role: 'assistant', source: 'orchestrator',
@@ -278,6 +283,7 @@ await withGoldenViteServer(async (server) => {
         metadata: { canonical: true, turnId: 'file-turn', conversationPresentationRole: 'artifact' },
         blocks: [{ id: `file-${changeType}`, type: 'file_change', content: '', fileChange: {
           filePath: 'src/collapse-regression.ts', changeType, additions: 2, deletions: 1,
+          ...(changeType === 'rename' ? { oldPath: 'src/old-name.ts' } : {}),
           diff: '@@ -1 +1,2 @@\n-const oldValue = 1;\n+const newValue = 2;\n+export { newValue };',
         } }],
       };
@@ -289,11 +295,21 @@ await withGoldenViteServer(async (server) => {
         } }).body,
       };
       for (const [mode, markup] of Object.entries(modes)) {
+        assertSeparateHeaderActions(markup, `${sessionId} ${changeType} ${mode}`);
         assert.match(markup, /aria-expanded="false"/, `${sessionId} ${changeType} ${mode} 文件变更默认折叠`);
         assert.match(markup, /collapse-regression/, '折叠后仍显示文件入口');
         assert.match(markup, /stats-badge/, '折叠后仍显示增删行数');
         assert.doesNotMatch(markup, /class="tool-content|const newValue/, '默认不渲染或暴露完整 diff');
       }
+    }
+  }
+  for (const name of ['file_read', 'view', 'file_write']) {
+    for (const status of ['running', 'pending', 'error', 'success']) {
+      const markup = render(toolCall.default, { props: {
+        name, status, input: { path: 'src/actions.ts' }, output: 'file content',
+        ...(status === 'error' ? { error: 'file unavailable' } : {}),
+      } }).body;
+      assertSeparateHeaderActions(markup, `${name} ${status}`);
     }
   }
   const truncatedBlock = (name) => ({

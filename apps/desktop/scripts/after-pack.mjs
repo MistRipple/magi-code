@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { access, readFile, readdir } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { extractFile, listPackage } from "@electron/asar";
-import { runBridgePreflight } from "./bridge-preflight.mjs";
 import { nodeRuntimeFileName, runNodeRuntimePreflight } from "./node-runtime.mjs";
 
 export async function afterPack(context) {
@@ -40,7 +39,6 @@ export async function afterPack(context) {
       throw new Error(`发行资源哈希不匹配: ${file.path}`);
     }
   }
-  await runBridgePreflight(join(resources, "daemon"), "Electron resources bridge");
   if (manifest.components.nodeRuntime?.path !== `daemon/node/${nodeRuntimeFileName}`
       || !manifest.files.some((file) => file.path === `daemon/node/${nodeRuntimeFileName}`)) {
     throw new Error("发行资源清单缺少随包 Node");
@@ -71,6 +69,7 @@ export function isRetiredRuntimePath(path) {
   // 品牌图片不是运行时实现；仍检查完整父路径，不能藏在 tauri/ 等目录中。
   const candidate = path.replace(/[^/]+\.(svg|png|jpe?g|webp|gif|avif|bmp|ico)$/i, "");
   return /(^|\/)(tauri|cef|playwright|native-browser|browser-runtime)(\/|\.|-|$)/i.test(candidate)
+    || /(^|\/)(model_bridge_loopback|mcp_bridge_loopback|mcp_manager_server)(\.exe)?$/i.test(candidate)
     || /^daemon\/compat\/translate\//.test(candidate)
     || /chromium embedded framework/i.test(candidate);
 }

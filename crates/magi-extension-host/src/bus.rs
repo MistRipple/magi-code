@@ -233,10 +233,6 @@ impl ExtensionBus {
             })
     }
 
-    pub fn set_order(&self, order: Vec<String>) {
-        *self.order.write().expect("order poisoned") = order;
-    }
-
     /// 绑定运行中的宿主实例并启动其 observe 投递。
     pub fn attach(&self, instance: Arc<HostInstance>) -> bool {
         let Some(slot) = self

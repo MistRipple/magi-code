@@ -280,10 +280,6 @@ export function normalizeImplicitFileReferenceTarget(reference: string): string 
   ) ? target : null;
 }
 
-export function isLikelyFileReference(reference: string): boolean {
-  return normalizeFileReferenceTarget(reference) !== null;
-}
-
 export function splitFileReferenceText(text: string): FileReferenceTextSegment[] {
   if (!text) {
     return [];

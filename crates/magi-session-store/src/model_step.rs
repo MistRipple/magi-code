@@ -591,6 +591,7 @@ mod tests {
         let untimed = next.clone();
         next.attempts[0].transport.as_mut().unwrap().response_timing =
             Some(magi_app_server_protocol::ModelResponseTiming {
+                response_duration_ms: Some(1500),
                 first_content_ms: 300,
                 content_duration_ms: 1000,
                 text_output_tokens: Some(3),

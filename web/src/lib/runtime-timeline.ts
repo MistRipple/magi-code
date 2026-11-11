@@ -28,25 +28,14 @@ export function mergeRuntimeTimelineEntries(
 export function mergeCurrentRuntimeTimelineEntries(input: {
   runtimeEntries: readonly OrchestrationRuntimeTimelineEntry[];
   conversationEntries: readonly OrchestrationRuntimeTimelineEntry[];
-  isProcessing: boolean;
-  processingStartedAt?: number | null;
   currentTurnStartedAt?: number | null;
 }): OrchestrationRuntimeTimelineEntry[] {
-  const processingStartedAt = typeof input.processingStartedAt === 'number'
-    && Number.isFinite(input.processingStartedAt)
-    ? input.processingStartedAt
-    : 0;
   const currentTurnStartedAt = typeof input.currentTurnStartedAt === 'number'
     && Number.isFinite(input.currentTurnStartedAt)
     ? input.currentTurnStartedAt
     : 0;
-  const timelineStartedAt = currentTurnStartedAt > 0
-    ? currentTurnStartedAt
-    : input.isProcessing
-      ? processingStartedAt
-      : 0;
-  const runtimeEntries = timelineStartedAt > 0
-    ? input.runtimeEntries.filter((entry) => entry.timestamp >= timelineStartedAt)
+  const runtimeEntries = currentTurnStartedAt > 0
+    ? input.runtimeEntries.filter((entry) => entry.timestamp >= currentTurnStartedAt)
     : input.runtimeEntries;
   const conversationKeys = new Set(input.conversationEntries.map(runtimeTimelineDedupKey));
   const conversationSingletonTypes = new Set<string>(

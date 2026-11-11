@@ -667,7 +667,7 @@ export type ServerNotification = JsonRpcServerNotification;
 
 export type ServerResponse = JsonRpcServerResponse;
 
-export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite" | "modelSources" | "pluginManagement" | "composer" | "sessionRead" | "attachments" | "client" | "sessionWrite";
+export type PluginPermissionKind = "storage" | "tools" | "models" | "browser" | "extension" | "contextRewrite" | "modelSources" | "pluginManagement" | "composer" | "sessionRead" | "attachments" | "client" | "sessionWrite" | "webProviders";
 
 export interface PluginPermission {
   kind: PluginPermissionKind;
@@ -690,13 +690,14 @@ export interface PluginToolContribution {
   timeoutMs?: number | null;
 }
 
-export type PluginViewPlacement = "settings" | "home" | "main" | "rightPane" | "homeCard";
+export type PluginViewPlacement = "settings" | "home" | "main" | "rightPane" | "homeCard" | "composerLeft" | "chatAssistant";
 
 export interface PluginViewContribution {
   id: string;
   title: string;
   entry: string;
   placements: Array<PluginViewPlacement>;
+  priority?: number;
 }
 
 export type PluginSurfacePersistence = "persistent" | "ephemeral";
@@ -762,6 +763,7 @@ export type JsonRpcMessage = JsonRpcRequest | JsonRpcNotification | JsonRpcRespo
 
 export interface PluginAuthorizeRequest {
   grants: Array<PluginPermission>;
+  expectedDigest?: string;
 }
 
 export interface PluginInstallRequest {
@@ -1468,12 +1470,14 @@ export interface ModelUsageContext {
 }
 
 export interface ModelResponseTiming {
+  responseDurationMs?: number;
   firstContentMs: number;
   contentDurationMs: number;
   textOutputTokens?: number;
 }
 
 export interface PluginActivationRequest {
+  expectedDigest?: string;
 }
 
 export interface PluginJobBudget {
@@ -1834,3 +1838,46 @@ export interface PluginComposerTextReceipt {
 }
 
 export type PluginComposerTextStatus = "accepted" | "unknown";
+
+export interface PluginConversationViewContext {
+  sessionId: string;
+  message?: PluginAssistantViewMessage;
+}
+
+export interface PluginAssistantViewMessage {
+  id: string;
+  text: string;
+  streaming: boolean;
+  turnId?: string;
+}
+
+export interface PluginViewAdmissionRequest {
+  expectedDigest: string;
+  entry: string;
+  placement: PluginViewPlacement;
+}
+
+export type PluginWebKind = "search" | "fetch";
+
+export interface PluginWebBinding {
+  pluginId: string;
+  contributionId: string;
+  providerId: string;
+}
+
+export interface PluginWebConfiguration {
+  revision: number;
+  search: PluginWebBinding | null;
+  fetch: PluginWebBinding | null;
+}
+
+export interface PluginWebProviderChange {
+  kind: PluginWebKind;
+  contributionId: string | null;
+  providerId: string | null;
+}
+
+export interface PluginWebConfigureRequest {
+  expectedRevision: number;
+  changes: Array<PluginWebProviderChange>;
+}

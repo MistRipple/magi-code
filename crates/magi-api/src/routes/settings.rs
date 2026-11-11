@@ -2002,7 +2002,7 @@ fn usage_authority_from_usage_entries_filtered(
             );
             continue;
         };
-        if session_id.is_some_and(|id| input.session_id != id) {
+        if session_id.is_some_and(|id| input.owner.session_id() != Some(id)) {
             continue;
         }
         if input.event_id.is_none() {
@@ -2023,10 +2023,11 @@ fn usage_binding_item_json(
 ) -> serde_json::Value {
     serde_json::json!({
         "templateId": binding.template_id,
+        "pluginId": binding.plugin_id,
         "engineId": binding.engine_id,
         "bindingRevision": binding.binding_revision,
         "role": binding.role,
-        "displayName": binding.template_id,
+        "displayName": binding.display_name.as_deref().unwrap_or(&binding.template_id),
         "provider": binding.provider,
         "declaredModelSpec": binding.declared_model_spec,
         "resolvedModel": binding.resolved_model,
@@ -5615,6 +5616,74 @@ mod tests {
         let reset = execution_stats(State(state), Query(query)).await.unwrap().0;
         assert_eq!(reset["totals"]["llmCallCount"], 0);
         assert_eq!(reset["totals"]["performance"]["ttftSampleCount"], 0);
+    }
+
+    #[tokio::test]
+    async fn execution_stats_includes_plugin_owners_without_merging_auxiliary_or_session_usage() {
+        let state = test_state();
+        state
+            .session_store
+            .create_session(magi_core::SessionId::new("stats-native"), "native")
+            .unwrap();
+        let mut native =
+            model_usage_payload("native", "ws-1", "stats-native", "native", 101, 10, 2);
+        native["executionBinding"]["role"] = json!("auxiliary");
+        native["callIdentity"]["source"] = json!("auxiliary");
+        for (index, plugin_id) in [None, Some("plugin-a"), Some("plugin-b")]
+            .into_iter()
+            .enumerate()
+        {
+            let mut payload = native.clone();
+            let event_id = format!("owner-{index}");
+            payload["eventId"] = json!(event_id);
+            payload["callIdentity"]["callId"] = json!(event_id);
+            if let Some(plugin_id) = plugin_id {
+                payload.as_object_mut().unwrap().remove("sessionId");
+                payload.as_object_mut().unwrap().remove("turnId");
+                payload["plugin"] = json!({"pluginId":plugin_id,"digest":"a".repeat(64),
+                    "instanceId":"instance-1","operationId":event_id,"displayName":format!("Name {plugin_id}")});
+            }
+            state.event_bus.publish(EventEnvelope::usage(
+                EventId::new(event_id),
+                "model.usage.recorded",
+                payload,
+            ));
+        }
+        let all = execution_stats(State(state.clone()), Query(HashMap::new()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(all["totals"]["llmCallCount"], 3);
+        assert_eq!(all["items"].as_array().unwrap().len(), 3);
+        assert_eq!(all["models"].as_array().unwrap().len(), 1);
+        for plugin in ["plugin-a", "plugin-b"] {
+            let row = all["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["pluginId"] == plugin)
+                .unwrap();
+            assert_eq!(row["displayName"], format!("Name {plugin}"));
+            assert_eq!(row["llmCallCount"], 1);
+        }
+        let session_query = HashMap::from([("sessionId".into(), "stats-native".into())]);
+        let session = execution_stats(State(state.clone()), Query(session_query))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(session["totals"]["llmCallCount"], 1);
+        assert_eq!(session["items"].as_array().unwrap().len(), 1);
+        assert!(session["items"][0]["pluginId"].is_null());
+        state.event_bus.publish(EventEnvelope::usage(
+            EventId::new("plugin-stats-reset"),
+            USAGE_STATS_RESET_EVENT_TYPE,
+            json!({}),
+        ));
+        let reset = execution_stats(State(state), Query(HashMap::new()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(reset["totals"]["llmCallCount"], 0);
     }
 
     #[tokio::test]

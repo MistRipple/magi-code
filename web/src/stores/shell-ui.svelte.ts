@@ -15,11 +15,14 @@ export const shellUi = $state<{
   settingsMounted: boolean;
   /** 其他视图请求设置页落到的分类；设置页消费后清空。 */
   settingsRequestedTab: string | null;
+  /** 插件管理页的一次性选择请求，不保存安装或授权事实。 */
+  settingsRequestedPlugin: string | null;
   popover: ShellPopover | null;
 }>({
   settingsOpen: false,
   settingsMounted: false,
   settingsRequestedTab: null,
+  settingsRequestedPlugin: null,
   popover: null,
 });
 
@@ -29,9 +32,10 @@ export function mountSettings(): void {
 }
 
 /** 打开设置；传入分类 id 时设置页会切到该分类（如从右栏添加菜单进入「插件」）。 */
-export function openSettings(tab?: string): void {
+export function openSettings(tab?: string, pluginId?: string): void {
   shellUi.popover = null;
   shellUi.settingsRequestedTab = tab ?? null;
+  shellUi.settingsRequestedPlugin = pluginId ?? null;
   shellUi.settingsMounted = true;
   shellUi.settingsOpen = true;
 }

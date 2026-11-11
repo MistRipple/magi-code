@@ -1,7 +1,7 @@
 use magi_core::{
-    AccessProfile, DomainError, DomainResult, ExecutionOwnership, GoalId, LeaseId, MissionId,
-    PlanId, PlanItem, PlanState, SessionId, SessionLifecycleStatus, TaskId, ThreadId, UtcMillis,
-    WorkerId, WorkspaceId,
+    AccessProfile, DomainError, DomainResult, ExecutionOwnership, GoalId, MissionId, PlanId,
+    PlanItem, PlanState, SessionId, SessionLifecycleStatus, TaskId, ThreadId, UtcMillis, WorkerId,
+    WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -73,28 +73,11 @@ pub struct ActiveExecutionDispatchContext {
     pub skill_name: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ActiveExecutionBranch {
     pub task_id: TaskId,
     pub worker_id: WorkerId,
-    pub stage: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lease_id: Option<LeaseId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_intent_ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binding_lifecycle: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkpoint_stage: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_step_index: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkpoint_at: Option<UtcMillis>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume_mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume_token: Option<String>,
     pub use_tools: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_name: Option<String>,
@@ -105,20 +88,6 @@ pub struct ActiveExecutionBranch {
     /// session resume 时 rebuild dispatch plan 需要取回 sub-task 的 thread；
     /// `ensure_thread_for_role` 用 `now.0` 拼 id 不可重放，必须持久化在 branch。
     pub thread_id: ThreadId,
-}
-
-pub struct ActiveExecutionBranchSnapshotUpdate {
-    pub task_id: TaskId,
-    pub worker_id: WorkerId,
-    pub stage: String,
-    pub lease_id: Option<LeaseId>,
-    pub execution_intent_ref: Option<String>,
-    pub binding_lifecycle: Option<String>,
-    pub checkpoint_stage: Option<String>,
-    pub next_step_index: Option<usize>,
-    pub checkpoint_at: Option<UtcMillis>,
-    pub resume_mode: Option<String>,
-    pub resume_token: Option<String>,
 }
 
 pub const CANONICAL_TURN_SCHEMA_VERSION: &str = "canonical-turn.v1";
@@ -959,7 +928,7 @@ pub fn active_execution_turn_request_id(turn: &ActiveExecutionTurn) -> Option<St
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ActiveExecutionChain {
     pub session_id: SessionId,
     pub mission_id: MissionId,
@@ -968,40 +937,55 @@ pub struct ActiveExecutionChain {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<WorkspaceId>,
     #[serde(default)]
-    pub active_branch_task_ids: Vec<TaskId>,
-    #[serde(default)]
-    pub active_worker_bindings: Vec<WorkerId>,
-    #[serde(default)]
     pub branches: Vec<ActiveExecutionBranch>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recovery_ref: Option<String>,
     pub dispatch_context: ActiveExecutionDispatchContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_turn: Option<ActiveExecutionTurn>,
+    /// 只关联当前 Turn；正文、工具和状态由 canonical Turn 投影提供。
+    pub current_turn_id: Option<String>,
 }
 
 impl ActiveExecutionChain {
+    pub fn task_ids(&self) -> impl Iterator<Item = &TaskId> {
+        std::iter::once(&self.root_task_id).chain(
+            self.branches
+                .iter()
+                .map(|branch| &branch.task_id)
+                .filter(|id| *id != &self.root_task_id),
+        )
+    }
+
+    pub fn contains_task(&self, task_id: &TaskId) -> bool {
+        self.task_ids().any(|id| id == task_id)
+    }
+
     pub fn normalize(&mut self) {
-        self.active_branch_task_ids
-            .sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        self.active_branch_task_ids
-            .dedup_by(|left, right| left == right);
-        self.active_worker_bindings
-            .sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        self.active_worker_bindings
-            .dedup_by(|left, right| left == right);
         self.branches.sort_by(|left, right| {
             left.task_id
                 .as_str()
                 .cmp(right.task_id.as_str())
                 .then_with(|| left.worker_id.as_str().cmp(right.worker_id.as_str()))
         });
-        if let Some(turn) = self.current_turn.as_mut() {
-            turn.normalize();
-        }
     }
 }
 
+/// 运行与持久化只保留 Turn 身份；正文由 canonical 按需投影。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionRuntimeSidecarState {
+    pub session_id: SessionId,
+    pub ownership: ExecutionOwnership,
+    #[serde(default)]
+    pub recovery_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_execution_chain: Option<ActiveExecutionChain>,
+    #[serde(default)]
+    pub status: SessionExecutionSidecarStatus,
+    pub updated_at: UtcMillis,
+}
+
+/// 读取或提交过程中使用的临时投影，不保存在 SessionStore 状态中。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRuntimeSidecar {
@@ -1016,6 +1000,20 @@ pub struct SessionRuntimeSidecar {
     #[serde(default)]
     pub status: SessionExecutionSidecarStatus,
     pub updated_at: UtcMillis,
+}
+
+impl From<SessionRuntimeSidecar> for SessionRuntimeSidecarState {
+    fn from(view: SessionRuntimeSidecar) -> Self {
+        Self {
+            session_id: view.session_id,
+            ownership: view.ownership,
+            recovery_id: view.recovery_id,
+            current_turn_id: view.current_turn.map(|turn| turn.turn_id),
+            active_execution_chain: view.active_execution_chain,
+            status: view.status,
+            updated_at: view.updated_at,
+        }
+    }
 }
 
 /// 主线最近一轮被停止（失败、中断或用户主动停止）后，可以重新激活并继续推进的来源。
@@ -1060,7 +1058,7 @@ pub struct SessionAcceptanceRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_turn: Option<CanonicalTurn>,
     pub canonical_turn: CanonicalTurn,
-    pub sidecar: SessionRuntimeSidecar,
+    pub sidecar: SessionRuntimeSidecarState,
 }
 
 impl SessionRuntimeSidecar {
@@ -1081,7 +1079,6 @@ impl SessionRuntimeSidecar {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionSidecarFlushReason {
-    UpsertRuntimeSidecar,
     RegisterThread,
     RemoveThread,
     RestoreThread,
@@ -1089,13 +1086,11 @@ pub enum SessionSidecarFlushReason {
     BindExecutionOwnership,
     ApplyRecoveryResumeInput,
     ApplyResumeExecutionTarget,
-    UpsertActiveExecutionChain,
     AcceptCurrentTurn,
     UpdateActiveExecutionBranchSnapshot,
     AppendCurrentTurnItem,
     UpdateCurrentTurnStatus,
-    AttachRecoveryRef,
-    ClearExecutionOwnership,
+    UpdateRecoveryId,
     ArchiveActiveExecutionChain,
     UpdatePlan,
     ClearPlan,
@@ -1114,16 +1109,16 @@ pub struct SessionSidecarFlushMetadata {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionExecutionSidecarStoreState {
-    pub runtime_sidecars: Vec<SessionRuntimeSidecar>,
+    pub runtime_sidecars: Vec<SessionRuntimeSidecarState>,
 }
 
 impl SessionExecutionSidecarStoreState {
-    fn sort_runtime_sidecars(runtime_sidecars: &mut [SessionRuntimeSidecar]) {
+    fn sort_runtime_sidecars(runtime_sidecars: &mut [SessionRuntimeSidecarState]) {
         runtime_sidecars
             .sort_by(|left, right| left.session_id.as_str().cmp(right.session_id.as_str()));
     }
 
-    pub fn upsert_runtime_sidecar(&mut self, sidecar: SessionRuntimeSidecar) {
+    pub fn upsert_runtime_sidecar(&mut self, sidecar: SessionRuntimeSidecarState) {
         if let Some(existing) = self
             .runtime_sidecars
             .iter_mut()
@@ -1141,20 +1136,20 @@ impl SessionExecutionSidecarStoreState {
             .retain(|sidecar| &sidecar.session_id != session_id);
     }
 
-    pub fn runtime_sidecar(&self, session_id: &SessionId) -> Option<SessionRuntimeSidecar> {
+    pub fn runtime_sidecar(&self, session_id: &SessionId) -> Option<SessionRuntimeSidecarState> {
         self.runtime_sidecars
             .iter()
             .find(|sidecar| &sidecar.session_id == session_id)
             .cloned()
     }
 
-    pub fn runtime_sidecars(&self) -> Vec<SessionRuntimeSidecar> {
+    pub fn runtime_sidecars(&self) -> Vec<SessionRuntimeSidecarState> {
         let mut sidecars = self.runtime_sidecars.clone();
         Self::sort_runtime_sidecars(&mut sidecars);
         sidecars
     }
 
-    pub fn active_runtime_sidecars(&self) -> Vec<SessionRuntimeSidecar> {
+    pub fn active_runtime_sidecars(&self) -> Vec<SessionRuntimeSidecarState> {
         self.runtime_sidecars()
             .into_iter()
             .filter(|sidecar| {
@@ -1164,16 +1159,6 @@ impl SessionExecutionSidecarStoreState {
                     || sidecar.ownership.task_id.is_some()
             })
             .collect()
-    }
-
-    pub fn export_views(&self) -> Vec<SessionRuntimeSidecarExport> {
-        let mut exports = self
-            .runtime_sidecars()
-            .into_iter()
-            .map(|sidecar| sidecar.export_view())
-            .collect::<Vec<_>>();
-        exports.sort_by(|left, right| left.session_id.as_str().cmp(right.session_id.as_str()));
-        exports
     }
 }
 
@@ -1641,13 +1626,6 @@ impl SessionDurableState {
             && self.thread_context_checkpoints.is_empty()
     }
 
-    pub fn append_state(&mut self, other: SessionDurableState) {
-        if self.current_session_id.is_none() {
-            self.current_session_id = other.current_session_id.clone();
-        }
-        self.append_state_without_current(other);
-    }
-
     pub fn append_state_without_current(&mut self, other: SessionDurableState) {
         self.sessions.extend(other.sessions);
         self.timeline.extend(other.timeline);
@@ -1876,6 +1854,7 @@ pub enum ExecutionThreadStatus {
 ///
 /// orchestrator thread 绑定 session 主线；worker thread 绑定单次 task + worker 实例，
 /// 不按 role 复用。这样当前 task 的执行事实不会被历史 tool-call 上下文污染。
+/// 这里只保存线程归属与运行元数据；消息历史由 canonical 按需投影，不另存缓存。
 ///
 /// `mission_id` 为必填。Session 首次接收 user 输入时通过 `ensure_session_mission`
 /// 创建该 session 的常驻 mission，并同时 spawn `role_id = ORCHESTRATOR_ROLE_ID`
@@ -1897,13 +1876,9 @@ pub struct ExecutionThread {
     /// 该 thread 处理过的 task 序列，用于调试 / UI 呈现时间线；worker thread 通常只有一个。
     #[serde(default)]
     pub handled_task_ids: Vec<TaskId>,
-    /// thread 内部的 LLM 对话审计 / 恢复记录。它只属于当前 thread，不能作为同 role
-    /// 下一 task 的执行上下文。
-    #[serde(default)]
-    pub message_history: Vec<ThreadChatMessage>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadContextCheckpoint {
     pub thread_id: ThreadId,
@@ -1921,6 +1896,9 @@ pub struct ThreadContextCheckpoint {
     /// 原始 transcript 前缀指纹，源历史变化时检查点必须失效。
     #[serde(default)]
     pub source_fingerprint: String,
+    /// 摘要来源中生效的工具结果改写指纹；改写变化后旧摘要失效。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_projection_fingerprint: Option<String>,
     /// 生成该检查点时绑定的模型身份。
     #[serde(default)]
     pub model_provider: Option<String>,
@@ -1936,6 +1914,58 @@ pub struct ThreadContextCheckpoint {
     pub preserved_tail_message_count: usize,
     #[serde(default)]
     pub file_fact_versions: Vec<ThreadFileFactVersion>,
+}
+
+/// 一次锁内读取的 canonical 历史与压缩检查点；仅用于运行期一致性校验，不持久化。
+#[derive(Clone, Debug)]
+pub struct ThreadContextSnapshot {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) session_id: SessionId,
+    pub(crate) messages: Vec<ThreadChatMessage>,
+    pub(crate) checkpoint: Option<ThreadContextCheckpoint>,
+    pub(crate) context_window_tokens: Option<u64>,
+}
+
+impl ThreadContextSnapshot {
+    pub fn messages(&self) -> &[ThreadChatMessage] {
+        &self.messages
+    }
+    pub fn checkpoint(&self) -> Option<&ThreadContextCheckpoint> {
+        self.checkpoint.as_ref()
+    }
+
+    pub fn model_history(&self) -> Vec<ThreadChatMessage> {
+        match self
+            .checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.matches_history(&self.messages))
+        {
+            Some(checkpoint) => std::iter::once(checkpoint.summary_message.clone())
+                .chain(
+                    self.messages[checkpoint.source_message_count..]
+                        .iter()
+                        .cloned(),
+                )
+                .collect(),
+            None => self.messages.clone(),
+        }
+    }
+}
+
+impl ThreadContextCheckpoint {
+    pub fn matches_history(&self, history: &[ThreadChatMessage]) -> bool {
+        self.source_message_count > 0
+            && !self.source_fingerprint.is_empty()
+            && history
+                .get(..self.source_message_count)
+                .is_some_and(|prefix| thread_history_fingerprint(prefix) == self.source_fingerprint)
+    }
+}
+
+pub fn thread_history_fingerprint(history: &[ThreadChatMessage]) -> String {
+    use sha2::{Digest, Sha256};
+    let serialized = serde_json::to_vec(history).expect("thread history must serialize");
+    magi_core::hex_lower(Sha256::digest(serialized))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

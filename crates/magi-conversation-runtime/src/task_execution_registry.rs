@@ -35,9 +35,9 @@ type AgentSubtreeSettler = dyn Fn(&SessionId, &[TaskId]) -> Result<(), String> +
 
 /// `agent_spawn` 创建前预检需要的进程级运行时事实。
 ///
-/// 该配置只保存可共享的句柄，不在预检阶段执行任何持久化或 Git mutation。测试和
-/// 轻量运行时可以不注入它，此时预检仍会执行参数、角色、作用域和准入检查；daemon
-/// 生产装配时必须注入真实 settings、模型客户端和 Git/workspace 事实源。
+/// 该配置只保存可共享的句柄，不在预检阶段执行任何持久化或 Git mutation。
+/// 创建代理必须提供有效模型配置或显式注入的客户端；测试也遵循同一预检合同。
+/// daemon 生产装配注入真实 settings、模型客户端和 Git/workspace 事实源。
 #[derive(Clone, Default)]
 pub struct AgentSpawnPreflightRuntime {
     pub settings_store: Option<Arc<SettingsStore>>,
@@ -579,7 +579,7 @@ impl TaskExecutionRegistry {
         let _registration_guard = self.registration_lock.lock().map_err(|error| {
             SpawnedChildExecutionError::InvalidState(format!("agent_spawn 注册锁不可用: {error}"))
         })?;
-        let mut chain = session_store
+        let chain = session_store
             .active_execution_chain(session_id)
             .ok_or_else(|| {
                 SpawnedChildExecutionError::InvalidState(
@@ -631,9 +631,9 @@ impl TaskExecutionRegistry {
         }
 
         if let Some(goal) = chain
-            .current_turn
-            .as_ref()
-            .and_then(|turn| session_store.model_step_goal(session_id, &turn.turn_id))
+            .current_turn_id
+            .as_deref()
+            .and_then(|turn_id| session_store.model_step_goal(session_id, turn_id))
             && goal.status != magi_session_store::GoalStatus::Active
         {
             return Err(SpawnedChildExecutionError::GoalPaused(
@@ -649,9 +649,9 @@ impl TaskExecutionRegistry {
             }
             if let magi_core::AgentLifetime::Goal { goal_id } = &activation.lifetime
                 && chain
-                    .current_turn
-                    .as_ref()
-                    .and_then(|turn| session_store.model_step_goal(session_id, &turn.turn_id))
+                    .current_turn_id
+                    .as_deref()
+                    .and_then(|turn_id| session_store.model_step_goal(session_id, turn_id))
                     .is_none_or(|goal| {
                         goal.goal_id != *goal_id
                             || goal.status != magi_session_store::GoalStatus::Active
@@ -817,7 +817,7 @@ impl TaskExecutionRegistry {
             .map(|plan| match plan {
                 TaskExecutionPlan::Dispatch { turn_id, .. } => turn_id.clone(),
             })
-            .or_else(|| chain.current_turn.as_ref().map(|turn| turn.turn_id.clone()))
+            .or_else(|| chain.current_turn_id.clone())
             .ok_or_else(|| {
                 SpawnedChildExecutionError::InvalidState(
                     "agent_spawn 父任务缺少所属 Turn，无法注册子任务".to_string(),
@@ -837,39 +837,12 @@ impl TaskExecutionRegistry {
         let branch = ActiveExecutionBranch {
             task_id: child_task.task_id.clone(),
             worker_id: worker_id.clone(),
-            stage: "execute".to_string(),
-            lease_id: None,
-            execution_intent_ref: None,
-            binding_lifecycle: None,
-            checkpoint_stage: Some("execute".to_string()),
-            next_step_index: Some(0),
-            checkpoint_at: Some(now),
-            resume_mode: Some("stage-restart".to_string()),
-            resume_token: None,
             use_tools: true,
             skill_name: inherited_skill_name.clone(),
             is_primary: false,
             thread_id: thread_id.clone(),
         };
-        chain
-            .branches
-            .retain(|entry| entry.task_id != child_task.task_id);
-        chain.branches.push(branch);
-        chain.active_branch_task_ids = chain
-            .branches
-            .iter()
-            .map(|entry| entry.task_id.clone())
-            .collect();
-        chain.active_worker_bindings = chain
-            .branches
-            .iter()
-            .map(|entry| entry.worker_id.clone())
-            .collect();
-        if let Some(turn) = chain.current_turn.as_mut() {
-            turn.normalize();
-        }
         let execution_chain_ref = chain.execution_chain_ref.clone();
-        chain.normalize();
 
         let execution_settings_snapshot = parent_plan
             .as_ref()
@@ -899,7 +872,7 @@ impl TaskExecutionRegistry {
         };
 
         if let Err(error) =
-            session_store.upsert_active_execution_chain(session_id.clone(), chain.clone())
+            session_store.insert_execution_branch(session_id, &chain, branch.clone())
         {
             return Err(rollback_spawned_local_agent_child(
                 self,
@@ -907,6 +880,7 @@ impl TaskExecutionRegistry {
                 session_id,
                 &child_task.task_id,
                 &original_chain,
+                &branch,
                 false,
                 false,
                 None,
@@ -922,6 +896,7 @@ impl TaskExecutionRegistry {
                 session_id,
                 &child_task.task_id,
                 &original_chain,
+                &branch,
                 true,
                 false,
                 None,
@@ -940,6 +915,7 @@ impl TaskExecutionRegistry {
                 session_id,
                 &child_task.task_id,
                 &original_chain,
+                &branch,
                 true,
                 true,
                 None,
@@ -962,6 +938,7 @@ impl TaskExecutionRegistry {
                         session_id,
                         &child_task.task_id,
                         &original_chain,
+                        &branch,
                         true,
                         true,
                         Some(&thread),
@@ -980,6 +957,7 @@ impl TaskExecutionRegistry {
                     session_id,
                     &child_task.task_id,
                     &original_chain,
+                    &branch,
                     true,
                     true,
                     Some(&thread),
@@ -1007,6 +985,7 @@ impl TaskExecutionRegistry {
                 session_id,
                 &child_task.task_id,
                 &original_chain,
+                &branch,
                 true,
                 true,
                 Some(&thread),
@@ -1061,6 +1040,7 @@ fn rollback_spawned_local_agent_child(
     session_id: &SessionId,
     child_task_id: &TaskId,
     original_chain: &magi_session_store::ActiveExecutionChain,
+    branch: &ActiveExecutionBranch,
     session_chain_updated: bool,
     registry_inserted: bool,
     registered_thread: Option<&ExecutionThread>,
@@ -1088,7 +1068,7 @@ fn rollback_spawned_local_agent_child(
     }
     if session_chain_updated
         && let Err(error) =
-            session_store.upsert_active_execution_chain(session_id.clone(), original_chain.clone())
+            session_store.remove_execution_branch_if_current(session_id, original_chain, branch)
     {
         rollback_errors.push(format!("session active chain 回滚失败: {error}"));
     }
@@ -1189,52 +1169,51 @@ mod tests {
         parent.status = TaskStatus::Running;
         parent.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
         task_store.insert_task(parent).expect("真实父任务应注册");
-        let _ = session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
         session_store
-            .upsert_active_execution_chain(
+            .create_session(session_id.clone(), "spawn fixture")
+            .unwrap();
+        let _ = session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
+        let admitted_turn = ActiveExecutionTurn {
+            turn_id: "turn-atomic-spawn".to_string(),
+            turn_seq: 1,
+            accepted_at: now,
+            completed_at: None,
+            status: "running".to_string(),
+            user_message: Some("spawn child".to_string()),
+            items: Vec::new(),
+        };
+        session_store
+            .accept_active_execution_chain_with_timeline_entry(
                 session_id.clone(),
+                magi_session_store::TimelineEntryInput::new(
+                    format!("timeline-chain-{}", admitted_turn.turn_id),
+                    magi_session_store::TimelineEntryKind::UserMessage,
+                    admitted_turn.user_message.clone().unwrap_or_default(),
+                    admitted_turn.accepted_at,
+                ),
                 ActiveExecutionChain {
                     session_id: session_id.clone(),
                     mission_id: mission_id.clone(),
                     root_task_id: root_task_id.clone(),
                     execution_chain_ref: "chain-atomic-spawn".to_string(),
                     workspace_id: workspace_id.clone(),
-                    active_branch_task_ids: vec![root_task_id.clone()],
-                    active_worker_bindings: vec![parent_worker_id.clone()],
                     branches: vec![ActiveExecutionBranch {
                         task_id: root_task_id.clone(),
                         worker_id: parent_worker_id,
-                        stage: "execute".to_string(),
-                        lease_id: None,
-                        execution_intent_ref: None,
-                        binding_lifecycle: None,
-                        checkpoint_stage: Some("execute".to_string()),
-                        next_step_index: Some(0),
-                        checkpoint_at: Some(now),
-                        resume_mode: Some("stage-restart".to_string()),
-                        resume_token: None,
                         use_tools: true,
                         skill_name: None,
                         is_primary: true,
                         thread_id: ThreadId::new("thread-atomic-spawn-parent"),
                     }],
-                    recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
                         accepted_at: now,
                         entry_id: "timeline-atomic-spawn".to_string(),
                         trimmed_text: Some("spawn child".to_string()),
                         skill_name: None,
                     },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: "turn-atomic-spawn".to_string(),
-                        turn_seq: 1,
-                        accepted_at: now,
-                        completed_at: None,
-                        status: "running".to_string(),
-                        user_message: Some("spawn child".to_string()),
-                        items: Vec::new(),
-                    }),
+                    current_turn_id: Some(admitted_turn.turn_id.clone()),
                 },
+                admitted_turn,
             )
             .expect("active chain should be accepted");
 
@@ -1403,8 +1382,13 @@ mod tests {
             .expect("child branch should exist");
         assert_eq!(child_branch.thread_id, registered.thread_id);
         assert_eq!(child_branch.skill_name.as_deref(), Some("code-review"));
-        assert!(chain.active_branch_task_ids.contains(&child.task_id));
-        assert!(chain.active_worker_bindings.contains(&registered.worker_id));
+        assert!(chain.contains_task(&child.task_id));
+        assert!(
+            chain
+                .branches
+                .iter()
+                .any(|branch| branch.worker_id == registered.worker_id)
+        );
 
         let task_state_before = format!("{:?}", task_store.get_task(&child.task_id));
         let plan_state_before = format!("{:?}", registry.get(&child.task_id));
@@ -1713,52 +1697,51 @@ mod tests {
         parent.status = TaskStatus::Running;
         parent.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
         task_store.insert_task(parent).expect("真实父任务应注册");
-        let _ = session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
         session_store
-            .upsert_active_execution_chain(
+            .create_session(session_id.clone(), "spawn fixture")
+            .unwrap();
+        let _ = session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
+        let admitted_turn = ActiveExecutionTurn {
+            turn_id: "turn-agent-capacity".to_string(),
+            turn_seq: 1,
+            accepted_at: now,
+            completed_at: None,
+            status: "running".to_string(),
+            user_message: Some("spawn children".to_string()),
+            items: Vec::new(),
+        };
+        session_store
+            .accept_active_execution_chain_with_timeline_entry(
                 session_id.clone(),
+                magi_session_store::TimelineEntryInput::new(
+                    format!("timeline-chain-{}", admitted_turn.turn_id),
+                    magi_session_store::TimelineEntryKind::UserMessage,
+                    admitted_turn.user_message.clone().unwrap_or_default(),
+                    admitted_turn.accepted_at,
+                ),
                 ActiveExecutionChain {
                     session_id: session_id.clone(),
                     mission_id: mission_id.clone(),
                     root_task_id: root_task_id.clone(),
                     execution_chain_ref: "chain-agent-capacity".to_string(),
                     workspace_id: workspace_id.clone(),
-                    active_branch_task_ids: vec![root_task_id.clone()],
-                    active_worker_bindings: vec![parent_worker_id.clone()],
                     branches: vec![ActiveExecutionBranch {
                         task_id: root_task_id.clone(),
                         worker_id: parent_worker_id,
-                        stage: "execute".to_string(),
-                        lease_id: None,
-                        execution_intent_ref: None,
-                        binding_lifecycle: None,
-                        checkpoint_stage: Some("execute".to_string()),
-                        next_step_index: Some(0),
-                        checkpoint_at: Some(now),
-                        resume_mode: Some("stage-restart".to_string()),
-                        resume_token: None,
                         use_tools: true,
                         skill_name: None,
                         is_primary: true,
                         thread_id: ThreadId::new("thread-agent-capacity-parent"),
                     }],
-                    recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
                         accepted_at: now,
                         entry_id: "timeline-agent-capacity".to_string(),
                         trimmed_text: Some("spawn children".to_string()),
                         skill_name: None,
                     },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: "turn-agent-capacity".to_string(),
-                        turn_seq: 1,
-                        accepted_at: now,
-                        completed_at: None,
-                        status: "running".to_string(),
-                        user_message: Some("spawn children".to_string()),
-                        items: Vec::new(),
-                    }),
+                    current_turn_id: Some(admitted_turn.turn_id.clone()),
                 },
+                admitted_turn,
             )
             .expect("active chain should be accepted");
 
@@ -1866,9 +1849,6 @@ mod tests {
             let (tasks, sessions, registry, session, workspace, mission, root, now) =
                 spawn_fixture("publish-last");
             let sessions = Arc::new(sessions);
-            sessions
-                .create_session(session.clone(), "publication")
-                .unwrap();
             sessions
                 .upsert_plan(
                     &session,
@@ -1983,9 +1963,6 @@ mod tests {
             now,
         ) = spawn_fixture("plan-binding-rollback");
         let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
-        session_store
-            .create_session(session_id.clone(), "计划绑定回滚测试")
-            .expect("计划绑定测试会话应创建");
         session_store
             .upsert_plan(
                 &session_id,
@@ -2335,52 +2312,51 @@ mod tests {
         parent.status = TaskStatus::Running;
         parent.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
         task_store.insert_task(parent).expect("真实父任务应注册");
-        let _ = session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
         session_store
-            .upsert_active_execution_chain(
+            .create_session(session_id.clone(), "spawn fixture")
+            .unwrap();
+        let _ = session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
+        let admitted_turn = ActiveExecutionTurn {
+            turn_id: format!("turn-{label}"),
+            turn_seq: 1,
+            accepted_at: now,
+            completed_at: None,
+            status: "running".to_string(),
+            user_message: Some("spawn children".to_string()),
+            items: Vec::new(),
+        };
+        session_store
+            .accept_active_execution_chain_with_timeline_entry(
                 session_id.clone(),
+                magi_session_store::TimelineEntryInput::new(
+                    format!("timeline-chain-{}", admitted_turn.turn_id),
+                    magi_session_store::TimelineEntryKind::UserMessage,
+                    admitted_turn.user_message.clone().unwrap_or_default(),
+                    admitted_turn.accepted_at,
+                ),
                 ActiveExecutionChain {
                     session_id: session_id.clone(),
                     mission_id: mission_id.clone(),
                     root_task_id: root_task_id.clone(),
                     execution_chain_ref: format!("chain-{label}"),
                     workspace_id: workspace_id.clone(),
-                    active_branch_task_ids: vec![root_task_id.clone()],
-                    active_worker_bindings: vec![parent_worker_id.clone()],
                     branches: vec![ActiveExecutionBranch {
                         task_id: root_task_id.clone(),
                         worker_id: parent_worker_id,
-                        stage: "execute".to_string(),
-                        lease_id: None,
-                        execution_intent_ref: None,
-                        binding_lifecycle: None,
-                        checkpoint_stage: Some("execute".to_string()),
-                        next_step_index: Some(0),
-                        checkpoint_at: Some(now),
-                        resume_mode: Some("stage-restart".to_string()),
-                        resume_token: None,
                         use_tools: true,
                         skill_name: None,
                         is_primary: true,
                         thread_id: ThreadId::new(format!("thread-{label}-parent")),
                     }],
-                    recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
                         accepted_at: now,
                         entry_id: format!("timeline-{label}"),
                         trimmed_text: Some("spawn children".to_string()),
                         skill_name: None,
                     },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: format!("turn-{label}"),
-                        turn_seq: 1,
-                        accepted_at: now,
-                        completed_at: None,
-                        status: "running".to_string(),
-                        user_message: Some("spawn children".to_string()),
-                        items: Vec::new(),
-                    }),
+                    current_turn_id: Some(admitted_turn.turn_id.clone()),
                 },
+                admitted_turn,
             )
             .expect("测试执行链应创建");
         (

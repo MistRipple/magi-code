@@ -74,7 +74,7 @@ Goal、Continue、子代理等待和恢复都是 `TaskRun` 内部行为，不创
 
 1. 每个 Session 只有一个 `SessionTurnCoordinator`；HTTP 和 App Server 适配器都进入同一个 `TurnService`。
 2. Turn 在接纳时固定 `conversation` 或 `task` profile，执行中不得隐式升级。
-3. Turn 的唯一事实源是 Canonical Turn Log，Task 的唯一事实源是 TaskStore；projection 只读。
+3. Turn 的唯一事实源是 Canonical Turn Log，Task 的唯一事实源是 TaskStore；projection 只读。执行链只保存任务归属、分支/恢复元数据和 `currentTurnId`，不携带第二份 Turn 正文。SessionStore 内存和持久化 sidecar 同样只保存 `current_turn_id`；读取、提交回执与重启结算均在同一状态快照内从 canonical 投影，不再在工具、审批或模型步骤提交后同步整份 Turn。缺失 canonical 来源、跨 Session 引用或链与 sidecar 的 Turn 身份不一致时拒绝恢复。新 Turn 显式进入接纳事务；普通链更新只校验已接纳的当前 Turn，不写 canonical、不根据快照新旧推测如何合并。Continue 在原接纳事务内更新链的 Turn 身份，迟到的旧链更新明确拒绝。旧链内嵌 `currentTurn` 和旧 sidecar 内嵌 `current_turn` 格式不再接受。
 4. `accepted` 表示可靠接纳，不表示 Provider 已启动或执行成功；accepted、阶段边界、取消和终态必须可恢复，普通 delta 可以批量写回，终态必须强制 flush。
 5. 终态 durable status mutation 的 `changed` 结果是唯一 terminal event 发布闸门；并发 finalizer 必须幂等，只有一个 `canonical_terminal_published`，迟到调用只能记录 `canonical_terminal_ignored`。
 6. Provider、工具和 Task 回调携带不可变 attempt 身份；迟到结果标为 stale/rejected。权限、Git、幂等、审计和恢复安全不能为降低延迟而跳过。
@@ -103,6 +103,8 @@ App Server 可以在调用前做只读的 canonical Turn/queued Turn replay 查�
 Coordinator 使用会话单写者边界决定 active Turn、输入投递、command mailbox、execution attempt、steer/continue FIFO、取消、终态及下一轮启动。持久输入由 SessionStore 拥有，队列只读取 Pending 输入，不再由 ApiState 单独保存。
 
 Coordinator 不得在状态锁内执行外部 IO。模型、工具、Git 和 Task 完成后，必须通过带身份的 command/event 回到 Coordinator；外部 API 不得直接改写 current Turn。
+
+编辑后重发的 Task Turn 通过携带 Task 的接纳事务替换旧 Turn，同时持久化旧轮 superseded、新轮、时间线与接纳记录；写盘失败或陈旧重试不得推进内存及 flush 状态。线程激活与恢复检查点安装在目标缺失时明确失败，运行中压缩仍以 transcript 长度和检查点 generation 校验后安装。
 
 文字与图片排队消息可通过既有 steer 入口引导当前 `conversation` 或主线 `task` Turn。能力由 Coordinator 的活动输入边界给出：先提交 canonical 用户 item，再进入同一 Turn 的 FIFO；主线 Task 在模型轮次之间消费，子代理不消费会话引导。模型准备结束时必须原子取走待处理引导或关闭边界；关闭后拒绝迟到输入，不得静默丢弃，也不得另建 Turn/Task。队列读取、领取、删除及转引导共用会话提交锁。用户 item 与 Input 的 Attached 转移写入同一个 canonical event segment；写盘成功后才更新内存并发布 Inbox 通知，不再存在独立的出队确认写入。
 
@@ -137,7 +139,7 @@ Input 的生命周期是 Pending → Attached → Consumed，尚未领取的输�
 
 ### 子代理生命周期
 
-daemon 重启先从 TaskStore 的持久 activation、lease 和 Worker checkpoint 结算易失执行态，按当前 execution scope 而非完整审计树选择范围；之后逐 Session 核对并结算独立 Agent canonical Turn，再处理主线中断。主线已结束、归档或切换不影响原转交 Agent 的持久交互定位；问题/审批答复需要有效 Session/Goal 拥有方及子树内的中断父链，只写回原调用，不创建新 Step 或重新开放已关闭 Turn。未知工具副作用保持 outcome_unknown，在途 Step 只能结算原用量。原主线 Continue 的分支选择、旧终态补交和路径恢复不能接管已经转交的执行范围。
+daemon 重启先从 TaskStore 的持久 Pending/Running 状态、activation 与 lease 结算易失执行态，按当前 execution scope 而非完整审计树选择范围；之后逐 Session 核对并结算独立 Agent canonical Turn，再处理主线中断。主线已结束、归档或切换不影响原转交 Agent 的持久交互定位；问题/审批答复需要有效 Session/Goal 拥有方及子树内的中断父链，只写回原调用，不创建新 Step 或重新开放已关闭 Turn。未知工具副作用保持 outcome_unknown，在途 Step 只能结算原用量。原主线 Continue 的分支选择、旧终态补交和路径恢复不能接管已经转交的执行范围。
 
 子代理选择规则作为每轮动态 `CurrentAgentMode` developer 片段注入，不能混入 `TaskContext` 的任务事实或写入 transcript。主线与获授嵌套委派的代理仅在本轮实际 tools 提供 `agent_spawn` 时收到派发规则与角色清单；Skill、策略、执行器或当前阶段隐藏该工具时说明当前不可派发，下一轮依据实际定义刷新。初始估算、最终工具筛选和压缩重建复用同一入口；片段替换不追加旧能力。模型判断委派价值，执行预检与 TaskStore 继续拥有授权和注册事实，不从提示文本授予权限。详见[当前唤起方案](subagent-delegation-design.md)。
 
@@ -148,6 +150,14 @@ daemon 重启先从 TaskStore 的持久 activation、lease 和 Worker checkpoint
 LocalAgent 的标题、目标和自然语言阶段名称不选择执行实现。主线与子代理统一经过模型循环、持久 Step 和结构化完成合同；`no_tools` 仅关闭工具。规划及验证没有关键词触发的固定答复或自动“通过”路径，依赖中的工具调用成功也不能替代业务验收。
 
 Worker 的 `finish` 阶段只描述执行进度，不拥有 Task 成功事实。Continue 不得把阶段快照、有效租约和中间 `output_refs` 拼成最终回复并提交 Completed；成功仍须从原执行结果通过统一完成门提交。恢复资格统一读取 TaskStore 的实际状态、mission/root 和当前执行拥有方，HTTP Continue、代理列表与运行投影共用同一判定。Failed 不能被陈旧 `finish` 阶段遮蔽，Completed/Killed 也不能因投影不一致而重新开放。
+
+Goal 完成门在 Session 提交边界内通过只读查询获取 TaskStore 的状态与当前执行拥有方；计划绑定是历史引用，不能用分支成员关系判断活跃。Pending/Running 的原执行子任务和转交给同一 Goal 的任务阻挡完成，已完成、失败、取消或转交其他拥有方的任务不阻挡。缺少查询端口、Task 或来源归属时明确失败，不清空计划绑定来绕过完成门。
+
+执行分支仅保存 Task/Worker/Thread 身份与获授配置，不保存 stage、lease、cursor 或恢复 token。旧 `magi-worker-runtime`、`worker-runtime.json` 读写、Continue 回灌和默认值解析已删除；正常执行与恢复使用同一个 TaskStore、canonical Step/工具历史和 Task 恢复检查点。运行管线直接持有共享 TaskStore，不另建运行时包装及私有默认 TaskStore。对外 DTO 的阶段和活动租约从 TaskStore 投影，失去生产来源的检查点字段已从 HTTP 读模型及 Web 类型/转换中删除。
+
+运行读模型的会话活跃任务和代理分支只取 TaskStore 当前 execution scope；完成、失败、取消与已转交子树不进入原主线活跃列表，历史终态分支仍可展示。全局活跃身份直接读取 TaskStore，重启后不依赖事件窗口；事件与恢复引用只补充诊断，缺失 Task 不能靠事件复活。Web 主线状态及输入忙碌态只消费主线 canonical Turn，独立 Agent Turn 不重开主线。代理计数按明确分支的 Task 身份及实际状态生成，删除 assignment/mission 回落；bootstrap 重连只读取当前 Session 的 root 和 active_task_ids，不从旧事件改绑。恢复动作资格只读取 daemon `continuation`，待恢复记录数量不构成执行授权。
+
+`SessionStore::from_state_for_test` 与归属种子入口仅在 test/test-support 编译，正式恢复只能通过 `from_persisted_parts` 完整校验。
 
 TaskStore 的父子关系是任务树的唯一来源。父任务进入终态时级联终止仍归其拥有的未结束子树；agent_cancel 只能取消直接派发的代理及其子树。子树取消和 Runner 异常失败通过 TaskStore 的单次 mutation/checkpoint 同时结算 Task 与当前租约，删除调用方逐项写入的路径；状态通知只在整体提交后发布，写盘失败不释放未结算的准入预占。普通任务 Turn 停止按当前执行拥有方范围取消工具/Browser 资源，已转交的 Session/Goal 子树继续由自己的拥有方控制；Session 关闭/删除才跨完整审计树收口。agent_wait 读取终态时生成的结构化回执，执行命令、退出码和文件变更来自工具记录。等待支持 all/any；审批关注信号可以提前返回，已结束的结果在超时返回时也计入已收集。
 
@@ -192,6 +202,10 @@ MCP 与插件按同一个副作用/访问档判定组装工具面、目录和执
 
 Sink 是 Turn 事实的唯一写入边界，负责事件顺序、attempt 和状态转移校验、Session 内连续序号、流式内容合并、批量持久化、通知发布和终态完整快照。
 
+发布载荷中的 canonical Turn/item、展示字段和流式版本必须来自同一份已提交 canonical 快照。缺少 Turn 或 item 时明确失败，禁止从 sidecar 临时合成事实、版本或时间戳。代理结果展示读取 canonical assistant item；前序 Agent 执行记录沿同一 canonical 线程投影读取，来源链损坏不能当作空历史。文件事实直接取已完成的 canonical 工具回执并校验当前文件哈希。线程注册表不保存历史缓存，模型、详情和恢复读取按需投影，不通过额外刷新或落盘建立第二份历史。
+
+Turn item 新增与更新统一经过 `upsert_session_turn_item_for_turn` 和对应的 Store upsert 事务，沿原 item 身份校验不可变字段与状态转换。重复的 append 实现及没有生产调用方的 item/timeline 联写入口已删除；输入接纳与时间线仍走接纳事务。sidecar 活动时间由执行元数据、canonical item 和模型 attempt 的最新时间共同投影，重启结算不依赖旧 sidecar 时间戳。
+
 跨域通知必须带 `turn_id`、`task_run_id`（如有）和 `causation_id`。Task/Agent 的完整状态以 TaskStore 提交结果为准，不能重复转换出多个 Turn 终态。
 
 ### 3.5 Provider transport
@@ -233,7 +247,7 @@ TurnEventEnvelope {
 2. 一个 `turn_id` 只能有一个终态；终态之后不得出现 delta、Task 或 phase 事件。
 3. `task_run_id` 和 `root_task_id` 只在 `execution_profile=task` 时存在。
 4. 相同 request ID 和 fingerprint 返回原 Turn receipt；相同 request ID 但 fingerprint 不同必须拒绝，不能创建第二个 Turn。
-5. `ThreadChatMessage` 是 projection，不能作为独立事实源写入；Coordinator 不能从多个 projection 表反推事实。
+5. `ThreadChatMessage` 是 canonical 的精确投影，重建时直接替换；无对应项的旧消息清退，空 canonical 生成空历史，不迁移、不保留旧 transcript。代理初始输入先写入原 Turn，恢复分支沿已接纳请求中的来源引用重建；工具中断结果只由 canonical 调用与终态推导。压缩检查点覆盖的前缀变化时一并失效，不能通过摘要重新注入旧消息。Coordinator 不能从多个 projection 表反推事实。Continue 输入在原 canonical item 中冻结接收线程集合，只投影给主线和本次恢复分支；没有接收范围的旧记录不向其他线程广播。恢复同时核验任务所属执行链及现有线程的 mission/task，独立任务线程还须匹配 Worker；主线常驻线程由 Session 拥有。
 6. 每个 attempt 绑定不可变 `context_snapshot_id`；输入变化后，新 attempt 必须使用新快照。迟到结果只能留下审计记录。
 
 ### 4.3 状态与命令
@@ -302,7 +316,7 @@ Coordinator 校验状态/幂等
 
 普通 delta 进入有界 `TurnStreamBuffer`，按短周期或字节阈值批量写入；阶段边界、工具边界和终态强制 flush。队列满时只能合并同一 item 的连续 delta；仍无法消费时暂停或取消 attempt，并发布明确事实。
 
-执行 sidecar checkpoint 按 Session 确认实际提交成功的版本。工作区暂未注册时，其脏版本继续保留，其他会话仍可正常落盘；重新注册后写回原工作区路径，不创建全局备用投影。快照构造期间产生的新版本、未提交项和写盘失败都不能被本次确认清除。移除工作区通过原 API 先撤销 MCP 准入、提交检查点，再清除属于该工作区的当前导航选择并移除注册；会话历史保留。
+执行 sidecar checkpoint 按 Session 确认实际提交成功的版本。工作区暂未注册时，其脏版本继续保留，其他会话仍可正常落盘；重新注册后写回原工作区路径，不创建全局备用投影。快照构造期间产生的新版本、未提交项和写盘失败都不能被本次确认清除。运行中的 sidecar 不接受外部整份快照覆盖；归属绑定、恢复和归档与 canonical 提交共用会话提交锁。恢复引用修改须匹配原记录 ID，归档须匹配 root Task、原 Turn 且该 Turn 已终止；daemon 失效链清理复用同一归档入口，取消写入失败时保留原链。恢复消费在同一会话提交锁内先核验引用，再同步提交 Workspace 内存状态并清理引用；消费失败保留引用，不对已消费记录执行反向状态补偿。移除工作区通过原 API 先撤销 MCP 准入、提交检查点，再清除属于该工作区的当前导航选择并移除注册；会话历史保留。
 
 EventBus 只负责实时传输，不作为恢复依据。断线或序号缺口时，客户端按 `afterSequence` 获取事件尾部和 canonical snapshot；如果 daemon 已重启导致内存 EventBus 没有同一 Session 的新事件，HTTP SSE 必须从已恢复的 Canonical Turn Log 生成一次性 recovery envelope（不创建新 Turn、不重发 Provider），App Server WebSocket 必须提供等价的 `events/resyncRequired` canonical snapshot。恢复通知仍携带原 `session_id`、`turn_id` 和终态，不得把全局 `system.*` 事件当作业务 Turn 进展。
 

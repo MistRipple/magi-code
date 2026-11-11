@@ -6,10 +6,10 @@
 // 不认识的字段与内容块明确报 400，不静默丢弃。
 import { createServer } from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { upstreamReasoningEffort } from './reasoning.mjs';
 
 const MAX_BODY = 32 * 1024 * 1024;
-const EFFORT_FROM_MAGI = { none: 'off', minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max', ultra: 'ultra' };
-const ALLOWED_FIELDS = new Set(['model', 'messages', 'stream', 'stream_options', 'max_tokens', 'temperature', 'tools', 'tool_choice', 'reasoning_effort', 'prompt_cache_key']);
+const ALLOWED_FIELDS = new Set(['model', 'messages', 'stream', 'stream_options', 'max_tokens', 'temperature', 'stop', 'tools', 'tool_choice', 'reasoning_effort', 'prompt_cache_key']);
 
 class RequestError extends Error {
   constructor(status, code, message) { super(message); this.status = status; this.code = code; }
@@ -128,8 +128,12 @@ export function createChunkTranslator(model) {
       }
       case 'usage': {
         const usage = chunk.usage;
-        const out = { prompt_tokens: usage.inputTokens, completion_tokens: usage.outputTokens, total_tokens: usage.totalTokens ?? usage.inputTokens + usage.outputTokens };
+        // DSH 的三类输入互不重叠；OpenAI prompt_tokens 是完整输入。
+        // 保留实际零值与缺席，不能把缓存量从 inputTokens 再扣一次。
+        const prompt = usage.inputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0);
+        const out = { prompt_tokens: prompt, completion_tokens: usage.outputTokens, total_tokens: usage.totalTokens ?? prompt + usage.outputTokens };
         if (usage.cacheReadTokens !== undefined) out.prompt_tokens_details = { cached_tokens: usage.cacheReadTokens };
+        if (usage.cacheWriteTokens !== undefined) out.cache_creation_input_tokens = usage.cacheWriteTokens;
         if (usage.reasoningTokens !== undefined) out.completion_tokens_details = { reasoning_tokens: usage.reasoningTokens };
         return [{ ...base(), choices: [], usage: out }];
       }
@@ -162,9 +166,11 @@ export async function startOpenAiBridge(options) {
     return presented.length === expected.length && timingSafeEqual(presented, expected);
   };
   const fail = (res, status, code, message) => {
-    if (res.headersSent) { res.end(); return; }
+    if (res.destroyed || res.writableEnded) return;
+    const error = { message, type: code, code };
+    if (res.headersSent) { res.end(`data: ${JSON.stringify({ error })}\n\n`); return; }
     res.writeHead(status, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ error: { message, type: code, code } }));
+    res.end(JSON.stringify({ error }));
   };
   const serve = async (req, res) => {
     const controller = new AbortController();
@@ -195,8 +201,9 @@ export async function startOpenAiBridge(options) {
       }
       let reasoningEffort;
       if (body.reasoning_effort !== undefined) {
-        reasoningEffort = EFFORT_FROM_MAGI[body.reasoning_effort];
-        if (!reasoningEffort) throw new RequestError(400, 'invalid_request', `不支持的 reasoning_effort：${body.reasoning_effort}`);
+        const info = await llm.resolveModelInfo(provider, body.model, controller.signal);
+        try { reasoningEffort = upstreamReasoningEffort((info.reasoning?.efforts ?? []).map(effort => effort.id), body.reasoning_effort); }
+        catch (error) { throw new RequestError(400, 'invalid_request', error.message); }
       }
       const request = {
         provider, model: body.model, messages, signal: controller.signal,
@@ -204,42 +211,38 @@ export async function startOpenAiBridge(options) {
         ...(tools.length ? { tools } : {}),
         ...(body.max_tokens === undefined ? {} : { maxTokens: body.max_tokens }),
         ...(body.temperature === undefined ? {} : { temperature: body.temperature }),
+        ...(body.stop === undefined ? {} : { stop: body.stop }),
         ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
       };
       const translator = createChunkTranslator(body.model);
       if (body.stream !== true) throw new RequestError(400, 'unsupported_field', '模型桥只支持流式请求（stream: true）');
-      const pending = [];
-      const iterator = llm.stream(request)[Symbol.asyncIterator]();
-      // 先取到第一个有效输出或错误，再决定返回 200 还是错误码，避免把上游拒绝伪装成空回复。
+      // 正文与用量立即交付；成功终态等待上游迭代器正常退出，错误退出自动回收它。
+      let terminal;
       let started = false;
       const start = () => {
         if (started) return;
         started = true;
         res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-        for (const item of pending.splice(0)) res.write(`data: ${JSON.stringify(item)}\n\n`);
       };
-      while (true) {
-        const step = await iterator.next();
-        if (step.done) break;
-        const out = translator.push(step.value);
-        if (translator.error) break;
-        if (!started && out.some((item) => item.choices?.length && Object.keys(item.choices[0].delta).length)) {
-          pending.push(...out);
-          start();
+      for await (const chunk of llm.stream(request)) {
+        controller.signal.throwIfAborted();
+        const out = translator.push(chunk);
+        if (translator.error) {
+          const error = translator.error;
+          const status = Number.isInteger(error.status) && error.status >= 400 && error.status <= 599 ? error.status : 502;
+          throw new RequestError(status, error.code ?? 'upstream_error', error.message);
+        }
+        if (chunk.type === 'finish') {
+          terminal = out[0];
+          if (!terminal?.choices[0].finish_reason) throw new RequestError(502, 'invalid_finish', '上游返回未知结束原因');
           continue;
         }
-        if (started) for (const item of out) res.write(`data: ${JSON.stringify(item)}\n\n`);
-        else pending.push(...out);
+        for (const item of out) { start(); res.write(`data: ${JSON.stringify(item)}\n\n`); }
       }
-      if (translator.error) {
-        const status = Number.isInteger(translator.error.status) ? translator.error.status : 502;
-        if (!started) return fail(res, status >= 400 ? status : 502, translator.error.code ?? 'upstream_error', translator.error.message);
-        res.write(`data: ${JSON.stringify({ error: { message: translator.error.message, code: translator.error.code ?? 'upstream_error' } })}\n\n`);
-        return res.end();
-      }
+      controller.signal.throwIfAborted();
+      if (!terminal) throw new RequestError(502, 'incomplete_stream', '上游流缺少结束信号');
       start();
-      res.write('data: [DONE]\n\n');
-      res.end();
+      res.end(`data: ${JSON.stringify(terminal)}\n\ndata: [DONE]\n\n`);
     } catch (error) {
       if (error instanceof RequestError) return fail(res, error.status, error.code, error.message);
       options.log?.(`模型桥内部错误：${error?.stack ?? error}`);

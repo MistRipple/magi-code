@@ -36,10 +36,10 @@ export async function installDependencies(root, sharedRoot, registry = process.e
           records.push({ name, version: installed.version, host: true, ...(depth === 0 && dshPeer && compatibility?.exempted ? { versionExemption: true } : {}) });
           continue;
         }
-        // Cordis peer 可以随译包从 registry 安装满足完整范围的精确版本；
+        // Cordis peer 与原包 Schema 库可从 registry 安装满足完整范围的精确版本；
         // minVersion 不是 registry 实际版本，不能据此猜测是否可以隔离。
         // Magi 自己的上下文仍使用随包实例，原包注册还须通过真实启动检查。
-        if (name !== '@deepseek-ai/cordis' || !peer) throw new Error(`宿主依赖 ${name}@${installed.version} 不满足 ${range}`);
+        if ((name !== '@deepseek-ai/cordis' || !peer) && name !== '@deepseek-ai/schemastery') throw new Error(`宿主依赖 ${name}@${installed.version} 不满足 ${range}`);
       }
       if (ancestors.has(name) && semver.satisfies(ancestors.get(name), range)) continue;
       // 可选依赖在当前平台确实不适用时才跳过；不以下载失败当作不可用。
@@ -55,7 +55,7 @@ export async function installDependencies(root, sharedRoot, registry = process.e
       await pacote.extract(manifest.dist.tarball, destination, { ...registryOptions(registry), integrity: manifest.dist.integrity });
       const saved = JSON.parse(readFileSync(join(destination, 'package.json'), 'utf8'));
       if (saved.name !== name || saved.version !== manifest.version) throw new Error(`依赖 ${name} 的包身份与 registry 不符`);
-      records.push({ name, version: saved.version, integrity: manifest.dist.integrity, host: false, isolated: name === '@deepseek-ai/cordis' });
+      records.push({ name, version: saved.version, integrity: manifest.dist.integrity, host: false, isolated: ['@deepseek-ai/cordis', '@deepseek-ai/schemastery'].includes(name) });
       await work(destination, new Map([...ancestors, [name, saved.version]]), depth + 1);
     }
   };

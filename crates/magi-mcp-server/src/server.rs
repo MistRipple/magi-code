@@ -66,32 +66,6 @@ pub enum AttributionTarget {
     ExternalSession { token_id: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AttributionRefusal(pub String);
-
-pub trait AttributionResolver: Send + Sync {
-    fn resolve(&self, principal: &ClientPrincipal)
-    -> Result<AttributionTarget, AttributionRefusal>;
-}
-
-#[derive(Debug, Default)]
-pub struct ExternalOnlyAttribution;
-
-impl AttributionResolver for ExternalOnlyAttribution {
-    fn resolve(
-        &self,
-        principal: &ClientPrincipal,
-    ) -> Result<AttributionTarget, AttributionRefusal> {
-        match principal.attribution {
-            AttributionMode::External | AttributionMode::Conversation => {
-                Ok(AttributionTarget::ExternalSession {
-                    token_id: principal.token_id.clone(),
-                })
-            }
-        }
-    }
-}
-
 /// 项目目录解析；宿主以签发或原 Turn 的冻结授权构造实际执行映射。
 pub trait WorkspaceResolver: Send + Sync {
     fn root_of(&self, workspace_id: &str) -> Option<PathBuf>;
@@ -337,16 +311,12 @@ impl InFlightCalls {
     }
 }
 
-type CatalogObserver = Arc<dyn Fn(&ClientPrincipal) + Send + Sync>;
-
 pub struct McpServer {
     name: String,
     version: String,
     backend: Arc<dyn ToolBackend>,
     workspaces: Arc<dyn WorkspaceResolver>,
-    attribution: Arc<dyn AttributionResolver>,
     audit: Arc<dyn AuditSink>,
-    catalog_observer: Option<CatalogObserver>,
     in_flight: Arc<InFlightCalls>,
 }
 
@@ -362,36 +332,14 @@ impl McpServer {
             version: version.into(),
             backend,
             workspaces,
-            attribution: Arc::new(ExternalOnlyAttribution),
             audit: Arc::new(NoopAudit),
-            catalog_observer: None,
             in_flight: Arc::new(InFlightCalls::default()),
         }
-    }
-
-    pub fn with_attribution(mut self, attribution: Arc<dyn AttributionResolver>) -> Self {
-        self.attribution = attribution;
-        self
     }
 
     pub fn with_audit(mut self, audit: Arc<dyn AuditSink>) -> Self {
         self.audit = audit;
         self
-    }
-
-    /// 每次成功响应 `tools/list` 时通知宿主，用于证明远端客户端确实读取过工具目录。
-    pub fn with_catalog_observer(mut self, observer: CatalogObserver) -> Self {
-        self.catalog_observer = Some(observer);
-        self
-    }
-
-    /// 连接器配置指纹只跟随工具定义与权限档，不随活动会话切换变化。
-    pub fn catalog_definition_for(&self, principal: &ClientPrincipal) -> Vec<ToolDescriptor> {
-        let dynamic = self.backend.dynamic_tools();
-        session_catalog(
-            principal,
-            build_catalog(principal.profile, self.backend.schemas(), &dynamic),
-        )
     }
 
     /// 当前调用方可见的工具目录；调用准入重复验证相同能力边界。
@@ -526,9 +474,6 @@ impl McpServer {
             "ping" => Some(success(id, ping_result())),
             "tools/list" => {
                 let result = tools_list_result(&self.catalog_for(principal));
-                if let Some(observer) = &self.catalog_observer {
-                    observer(principal);
-                }
                 Some(success(id, result))
             }
             "tools/call" => {
@@ -667,9 +612,8 @@ impl McpServer {
         let cancellation = in_flight.cancellation.clone();
         let _cancel_on_drop = CancelOnDrop(cancellation.clone());
 
-        let attribution = match self.attribution.resolve(principal) {
-            Ok(target) => target,
-            Err(AttributionRefusal(reason)) => return Ok(deny(reason, Vec::new(), false)),
+        let attribution = AttributionTarget::ExternalSession {
+            token_id: principal.token_id.clone(),
         };
 
         let directories = match self

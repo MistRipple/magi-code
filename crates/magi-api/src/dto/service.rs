@@ -73,7 +73,7 @@ impl VersionHandshakeDto {
             service_name: service_info.service_name.clone(),
             api_version: service_info.api_version.clone(),
             min_supported_ui_version: "v0".to_string(),
-            host_scope: vec!["vscode".to_string(), "idea".to_string()],
+            host_scope: vec!["desktop".to_string(), "web".to_string()],
             product_version: identity.product_version.clone(),
             build_identity: identity.build_identity.clone(),
             startup_nonce: identity.startup_nonce.clone(),
@@ -122,7 +122,7 @@ mod tests {
         assert_eq!(dto.service_name, "magi");
         assert_eq!(dto.api_version, "v0");
         assert_eq!(dto.min_supported_ui_version, "v0");
-        assert_eq!(dto.host_scope, vec!["vscode", "idea"]);
+        assert_eq!(dto.host_scope, vec!["desktop", "web"]);
         assert_eq!(dto.product_version, "3.0.51");
         assert_eq!(dto.build_identity, "commit-test");
         assert_eq!(dto.startup_nonce, "nonce-test");

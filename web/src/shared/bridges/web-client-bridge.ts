@@ -25,22 +25,18 @@ import { PLUGIN_REGISTRY_CHANGED_EVENT } from '../../web/plugin-api';
 import { i18n } from '../../stores/i18n.svelte';
 import { DEFAULT_LOCALE, isSupportedLocale } from '../../i18n/locales';
 import type { SessionTurnCommand, TurnStartParams } from '../app-server-protocol.generated';
-import { getHostApi, getTransport, initTransport } from '../transport';
+import { getTransport, initTransport } from '../transport';
 import {
   approveAgentChange,
   approveAllAgentChanges,
-  addAgentKnowledgeItem,
-  listAgentKnowledgeRelations,
   reportAgentIncident,
   addAgentCustomTool,
   addAgentMcpServer,
   addAgentRepository,
   clearAgentNotifications,
-  clearAgentProjectKnowledge,
   closeAgentSession,
   connectAgentMcpServer,
   deleteAgentSession,
-  deleteAgentKnowledgeItem,
   deleteAgentMcpServer,
   deleteAgentRepository,
   disconnectAgentMcpServer,
@@ -49,7 +45,6 @@ import {
   getAgentExecutionStats,
   getAgentChangeDiff,
   getAgentFilePreview,
-  getAgentProjectKnowledge,
   getAgentNotifications,
   getAgentSessionTurnQueue,
   getPersonalSessions,
@@ -63,7 +58,6 @@ import {
   markAllAgentNotificationsRead,
   refreshAgentMcpTools,
   refreshAgentRepository,
-  reindexAgentProjectKnowledge,
   removeAgentNotification,
   removeAgentSessionTurnQueueItem,
   updateAgentSessionTurnQueueItem,
@@ -85,7 +79,6 @@ import {
   testAgentAuxiliaryConnection,
   testAgentOrchestratorConnection,
   testAgentWorkerConnection,
-  updateAgentKnowledgeItem,
   updateAgentMcpServer,
   updateAgentRepository,
   updateAgentRuntimeSetting,
@@ -101,8 +94,6 @@ import {
 } from '../../lib/file-reference';
 import { openExternalUrl } from '../../lib/external-link';
 import type {
-  AgentKnowledgeItemPatch,
-  AgentKnowledgeItemPayload,
 } from '../../web/agent-api';
 import type { ClientBridge, ClientBridgeMessage, SupportedLocale } from './client-bridge';
 import {
@@ -132,7 +123,7 @@ import {
   type CanonicalTurnEvent,
 } from '../protocol/canonical-turn';
 import { canonicalTurnRequestId } from '../protocol/canonical-processing';
-import { isTerminalRuntimeTaskStatus } from '../protocol/runtime-task-status';
+import { parseRuntimeTaskStatus } from '../protocol/runtime-task-status';
 import type { SseConnection } from '../transport';
 import {
   AppServerClient,
@@ -583,26 +574,6 @@ function schedulePersistedWebviewState(): void {
   }, delay);
 }
 
-function sanitizeVsCodeMessage(message: ClientBridgeMessage): ClientBridgeMessage {
-  try {
-    if (typeof structuredClone === 'function') {
-      return structuredClone(message);
-    }
-  } catch {
-    // fall through to JSON clone
-  }
-  return JSON.parse(JSON.stringify(message)) as ClientBridgeMessage;
-}
-
-function forwardToVsCodeHost(message: ClientBridgeMessage): boolean {
-  const api = getHostApi();
-  if (!api) {
-    return false;
-  }
-  api.postMessage(sanitizeVsCodeMessage(message));
-  return true;
-}
-
 function normalizeErrorMessage(error: unknown): string | undefined {
   if (error && typeof error === 'object') {
     const candidate = error as { detail?: unknown; message?: unknown };
@@ -650,7 +621,7 @@ function resolveWorkspaceScopeFromSource(
   };
 }
 
-type BridgeRequestScope = AgentBindingOverride & { knowledgeRequestId?: string };
+type BridgeRequestScope = AgentBindingOverride;
 
 function requestScopeFromMessage(
   message: Record<string, unknown>,
@@ -785,18 +756,6 @@ export function extractBootstrapAgentRunTrackingHints(payload: BootstrapPayload,
       runtimeTaskMap.set(taskId, task);
     }
   }
-  const runtimeExecutionGroups = Array.isArray(runtimeDetails?.execution_groups)
-    ? runtimeDetails.execution_groups
-      .map((entry) => asBridgeRecord(entry))
-      .filter((entry): entry is Record<string, unknown> => entry !== null)
-    : [];
-  const runtimeExecutionGroupMap = new Map<string, Record<string, unknown>>();
-  for (const group of runtimeExecutionGroups) {
-    const missionId = trimBridgeString(group.mission_id);
-    if (missionId) {
-      runtimeExecutionGroupMap.set(missionId, group);
-    }
-  }
   const runtimeSessions = Array.isArray(runtimeDetails?.sessions)
     ? runtimeDetails.sessions
       .map((entry) => asBridgeRecord(entry))
@@ -804,7 +763,7 @@ export function extractBootstrapAgentRunTrackingHints(payload: BootstrapPayload,
     : [];
   const activeRuntimeSession = runtimeSessions.find((entry) => {
     const sessionId = trimBridgeString(entry.session_id);
-    return expectedSessionId ? sessionId === expectedSessionId : sessionId.length > 0;
+    return Boolean(expectedSessionId) && sessionId === expectedSessionId;
   });
   const trackableRootTaskId = (candidate: unknown): string => {
     const taskId = trimBridgeString(candidate);
@@ -814,73 +773,9 @@ export function extractBootstrapAgentRunTrackingHints(payload: BootstrapPayload,
     return runtimeTaskMap.has(taskId) ? taskId : '';
   };
   rootTaskId = trackableRootTaskId(activeRuntimeSession?.root_task_id);
-  const overview = asBridgeRecord(rawRuntimeReadModel?.overview);
-  const activity = asBridgeRecord(overview?.activity);
-  const sessionTaskIds = normalizeBridgeStringArray(activeRuntimeSession?.active_task_ids);
-  const sessionMissionIds = new Set(normalizeBridgeStringArray(activeRuntimeSession?.active_execution_group_ids));
-  for (const taskId of sessionTaskIds) {
-    const missionId = trimBridgeString(runtimeTaskMap.get(taskId)?.mission_id);
-    if (missionId) {
-      sessionMissionIds.add(missionId);
-    }
-  }
-
-  const collectActiveTaskId = (taskId: string) => {
-    if (!taskId) {
-      return;
-    }
-    const taskEntry = runtimeTaskMap.get(taskId);
-    if (taskEntry && isTerminalRuntimeTaskStatus(taskEntry.current_status)) {
-      return;
-    }
-    activeTaskIds.add(taskId);
-  };
-
-  for (const taskId of sessionTaskIds) {
-    collectActiveTaskId(taskId);
-  }
-  for (const missionId of normalizeBridgeStringArray(activeRuntimeSession?.active_execution_group_ids)) {
-    const group = runtimeExecutionGroupMap.get(missionId);
-    for (const taskId of normalizeBridgeStringArray(group?.active_task_ids)) {
-      collectActiveTaskId(taskId);
-    }
-  }
-  if (sessionMissionIds.size > 0) {
-    for (const taskId of normalizeBridgeStringArray(activity?.active_task_ids)) {
-      const taskEntry = runtimeTaskMap.get(taskId);
-      const missionId = trimBridgeString(taskEntry?.mission_id);
-      if (!sessionMissionIds.has(missionId)) {
-        continue;
-      }
-      collectActiveTaskId(taskId);
-    }
-  }
-
-  const recentEvents = Array.isArray(rawBootstrap?.recentEvents)
-    ? rawBootstrap.recentEvents
-      .map((entry) => asBridgeRecord(entry))
-      .filter((entry): entry is Record<string, unknown> => entry !== null)
-    : [];
-  for (let index = recentEvents.length - 1; index >= 0; index -= 1) {
-    const event = recentEvents[index];
-    const eventPayload = asBridgeRecord(event.payload);
-    const eventSessionId = trimBridgeString(event.session_id) || trimBridgeString(eventPayload?.session_id);
-    const eventTaskId = trimBridgeString(event.task_id) || trimBridgeString(eventPayload?.task_id);
-    const eventMissionId = trimBridgeString(event.mission_id) || trimBridgeString(eventPayload?.mission_id);
-    if (expectedSessionId) {
-      const belongsToExpectedSession = eventSessionId === expectedSessionId
-        || (eventTaskId && sessionTaskIds.includes(eventTaskId))
-        || (eventMissionId && sessionMissionIds.has(eventMissionId));
-      if (!belongsToExpectedSession) {
-        continue;
-      }
-    }
-    const eventRootTaskId = trimBridgeString(eventPayload?.root_task_id);
-    const trackableEventRootTaskId = trackableRootTaskId(eventRootTaskId);
-    if (trackableEventRootTaskId) {
-      rootTaskId = trackableEventRootTaskId;
-      break;
-    }
+  for (const taskId of normalizeBridgeStringArray(activeRuntimeSession?.active_task_ids)) {
+    const status = parseRuntimeTaskStatus(runtimeTaskMap.get(taskId)?.current_status);
+    if (status === 'pending' || status === 'running') activeTaskIds.add(taskId);
   }
   return {
     rootTaskId,
@@ -1895,9 +1790,8 @@ function applyContextBudgetRuntimeEvent(event: RustEventEnvelope): void {
   );
   setOrchestratorRuntimeState({
     ...(current ?? {
-      status: 'running',
-      phase: budgetState.phase || 'modeling',
-      errors: [],
+      status: 'idle',
+      phase: 'idle',
       statusChangedAt: eventAt,
       lastEventAt: eventAt,
       assignments: [],
@@ -2597,11 +2491,6 @@ function logBridgeOperationFailure(
   if (!options.suppressToast) {
     emitBridgeErrorToast(action, error);
   }
-}
-
-function logKnowledgeOperationFailure(action: string, logLabel: string, error: unknown): void {
-  console.error(logLabel, error);
-  emitBridgeErrorToast(action, error);
 }
 
 function isBridgeRecoveringOrUnavailable(): boolean {
@@ -3772,46 +3661,6 @@ async function dispatchRegistryAgents(): Promise<void> {
     // Registry 加载失败不阻断主流程，任务执行展示会基于已启用角色继续渲染
     console.warn('[web-client-bridge] Registry agents 加载失败，执行展示将使用引擎 fallback', err);
   }
-}
-
-async function dispatchProjectKnowledge(scope: BridgeRequestScope = currentSessionBindingOverride()): Promise<void> {
-  const requestWorkspaceScope = resolveWorkspaceScopeFromSource(scope);
-  const requestWorkspaceId = requestWorkspaceScope.workspaceId;
-  const requestWorkspacePath = requestWorkspaceScope.workspacePath;
-  const knowledgeRequestId = trimBridgeString(scope.knowledgeRequestId);
-  const [payload, relationPayload] = await Promise.all([
-    getAgentProjectKnowledge({
-      scope: 'workspace',
-      workspaceId: requestWorkspaceId,
-      workspacePath: requestWorkspacePath,
-    }),
-    listAgentKnowledgeRelations({
-      scope: 'workspace',
-      workspaceId: requestWorkspaceId,
-      workspacePath: requestWorkspacePath,
-    }),
-  ]);
-  const responseWorkspaceId = typeof payload.workspaceId === 'string' && payload.workspaceId.trim()
-    ? payload.workspaceId.trim()
-    : requestWorkspaceId;
-  const responseWorkspacePath = typeof payload.workspacePath === 'string' && payload.workspacePath.trim()
-    ? payload.workspacePath.trim()
-    : requestWorkspacePath;
-  emitDataMessage('projectKnowledgeLoaded', {
-    ...payload,
-    relations: relationPayload.relations,
-    relationMeta: {
-      totalRelations: relationPayload.totalRelations,
-      truncated: relationPayload.truncated,
-    },
-    ...(knowledgeRequestId ? { knowledgeRequestId } : {}),
-    workspaceId: responseWorkspaceId,
-    workspacePath: responseWorkspacePath,
-  });
-}
-
-async function emitKnowledgePayload(scope: BridgeRequestScope = currentSessionBindingOverride()): Promise<void> {
-  await dispatchProjectKnowledge(scope);
 }
 
 async function commitSessionNavigation(
@@ -5286,17 +5135,8 @@ async function updateAllSkills(): Promise<void> {
   );
 }
 
-async function clearProjectKnowledge(scope: BridgeRequestScope = currentSessionBindingOverride()): Promise<void> {
-  await clearAgentProjectKnowledge(requireWorkspaceRequestScope(scope));
-  await emitKnowledgePayload(scope);
-  emitBridgeSuccessToast(
-    i18n.t('settings.toast.action.clearProjectKnowledge'),
-    i18n.t('settings.toast.projectKnowledgeCleared'),
-  );
-}
-
 export function createWebClientBridge(): ClientBridge {
-  // 初始化传输层（自动检测 VS Code / Web 环境，选择对应策略）
+  // 初始化 Electron Renderer 与 Web 共用的 daemon 传输层
   initTransport();
   ensureWindowListener();
   hydrateCanonicalWorkspaceBinding();
@@ -5810,9 +5650,6 @@ export function createWebClientBridge(): ClientBridge {
           });
           return;
         case 'openLink':
-          if (forwardToVsCodeHost(message)) {
-            return;
-          }
           if (typeof message.url === 'string' && message.url.trim()) {
             const fileTarget = normalizeFileReferenceTarget(message.url);
             if (fileTarget) {
@@ -5831,9 +5668,6 @@ export function createWebClientBridge(): ClientBridge {
           }
           return;
         case 'openDiagramPanel':
-          if (forwardToVsCodeHost(message)) {
-            return;
-          }
           {
             const source = typeof message.source === 'string' ? message.source : '';
             if (!source.trim()) {
@@ -5847,9 +5681,6 @@ export function createWebClientBridge(): ClientBridge {
           }
           return;
         case 'openFile':
-          if (forwardToVsCodeHost(message)) {
-            return;
-          }
           {
             const filePath = typeof message.filepath === 'string' && message.filepath.trim()
               ? message.filepath
@@ -5865,9 +5696,6 @@ export function createWebClientBridge(): ClientBridge {
           }
           return;
         case 'viewDiff':
-          if (forwardToVsCodeHost(message)) {
-            return;
-          }
           if (typeof message.filePath === 'string' && message.filePath.trim()) {
             const diffContent = typeof message.diff === 'string' ? message.diff : undefined;
             void openDiffPreview(message.filePath, diffContent, requestScopeFromMessage(message)).catch((error) => {
@@ -5948,96 +5776,6 @@ export function createWebClientBridge(): ClientBridge {
             });
           }
           return;
-        case 'getProjectKnowledge':
-          void dispatchProjectKnowledge({
-            ...requestScopeFromMessage(message, ''),
-            knowledgeRequestId: trimBridgeString(message.knowledgeRequestId),
-          }).catch((error) => {
-            logKnowledgeOperationFailure(
-              i18n.t('settings.toast.action.loadProjectKnowledge'),
-              '[web-client-bridge] 项目知识加载失败:',
-              error,
-            );
-          });
-          return;
-        case 'reindexProjectKnowledge': {
-          const scope = {
-            ...requestScopeFromMessage(message, ''),
-            knowledgeRequestId: trimBridgeString(message.knowledgeRequestId),
-          };
-          void reindexAgentProjectKnowledge(scope)
-            .then(() => dispatchProjectKnowledge(scope))
-            .catch((error) => {
-              logKnowledgeOperationFailure(
-                i18n.t('settings.toast.action.loadProjectKnowledge'),
-                '[web-client-bridge] 项目知识重建失败:',
-                error,
-              );
-            });
-          return;
-        }
-        case 'clearProjectKnowledge':
-          void clearProjectKnowledge(requestScopeFromMessage(message, '')).catch((error) => {
-            logKnowledgeOperationFailure(
-              i18n.t('settings.toast.action.clearProjectKnowledge'),
-              '[web-client-bridge] 清空项目知识失败:',
-              error,
-            );
-          });
-          return;
-        case 'addKnowledgeItem': {
-          const kind = typeof message.kind === 'string' ? message.kind : '';
-          const content = typeof message.content === 'string' ? message.content : '';
-          if ((kind === 'adr' || kind === 'faq' || kind === 'learning') && content) {
-            const scope = requestScopeFromMessage(message, '');
-            const payload: AgentKnowledgeItemPayload = {
-              kind,
-              content,
-              title: typeof message.title === 'string' ? message.title : undefined,
-              tags: Array.isArray(message.tags) ? (message.tags as string[]) : [],
-              context: typeof message.context === 'string' ? message.context : undefined,
-            };
-            void addAgentKnowledgeItem(payload, scope).then(async () => {
-              await emitKnowledgePayload(scope);
-              emitBridgeSuccessToast(i18n.t('bridge.action.addKnowledgeItem'), i18n.t('bridge.detail.knowledgeItemAdded'));
-            }).catch((error) => {
-              logKnowledgeOperationFailure(i18n.t('bridge.action.addKnowledgeItem'), '[web-client-bridge] 添加知识条目失败:', error);
-            });
-          }
-          return;
-        }
-        case 'updateKnowledgeItem': {
-          const knowledgeId = typeof message.knowledgeId === 'string' ? message.knowledgeId.trim() : '';
-          if (knowledgeId) {
-            const scope = requestScopeFromMessage(message, '');
-            const patch: AgentKnowledgeItemPatch = {
-              title: typeof message.title === 'string' ? message.title : undefined,
-              content: typeof message.content === 'string' ? message.content : undefined,
-              tags: Array.isArray(message.tags) ? (message.tags as string[]) : undefined,
-              context: typeof message.context === 'string' ? message.context : undefined,
-            };
-            void updateAgentKnowledgeItem(knowledgeId, patch, scope).then(async () => {
-              await emitKnowledgePayload(scope);
-              emitBridgeSuccessToast(i18n.t('bridge.action.updateKnowledgeItem'), i18n.t('bridge.detail.knowledgeItemUpdated'));
-            }).catch((error) => {
-              logKnowledgeOperationFailure(i18n.t('bridge.action.updateKnowledgeItem'), '[web-client-bridge] 更新知识条目失败:', error);
-            });
-          }
-          return;
-        }
-        case 'deleteKnowledgeItem': {
-          const knowledgeId = typeof message.knowledgeId === 'string' ? message.knowledgeId.trim() : '';
-          if (knowledgeId) {
-            const scope = requestScopeFromMessage(message, '');
-            void deleteAgentKnowledgeItem(knowledgeId, scope).then(async () => {
-              await emitKnowledgePayload(scope);
-              emitBridgeSuccessToast(i18n.t('bridge.action.deleteKnowledgeItem'), i18n.t('bridge.detail.knowledgeItemDeleted'));
-            }).catch((error) => {
-              logKnowledgeOperationFailure(i18n.t('bridge.action.deleteKnowledgeItem'), '[web-client-bridge] 删除知识条目失败:', error);
-            });
-          }
-          return;
-        }
         case 'connectMCPServer':
           if (typeof message.serverId === 'string' && message.serverId.trim()) {
             void connectMcpServer(message.serverId).catch((error) => {

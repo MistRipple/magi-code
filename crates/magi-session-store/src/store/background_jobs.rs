@@ -408,7 +408,7 @@ mod tests {
                 "worker":{"taskId":"job-task"}
             }]
         })).unwrap();
-        let store = Arc::new(SessionStore::from_state(SessionStoreState {
+        let store = Arc::new(SessionStore::from_state_for_test(SessionStoreState {
             canonical_turns: vec![turn],
             ..Default::default()
         }));
@@ -955,7 +955,7 @@ mod tests {
         let job = journal
             .begin(&context, "job-call", "sleep 1", "/workspace")
             .unwrap();
-        let restored = Arc::new(SessionStore::from_state(store.export_state()));
+        let restored = Arc::new(SessionStore::from_state_for_test(store.export_state()));
         assert_eq!(
             restored.reconcile_background_jobs_after_restart().unwrap(),
             1

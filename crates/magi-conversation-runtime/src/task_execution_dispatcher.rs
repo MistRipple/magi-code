@@ -4,6 +4,7 @@
 
 mod extension_services;
 mod plugin_commands;
+mod plugin_models;
 
 use crate::{
     ConversationRegistry, SKILL_APPLY_TOOL_NAME, active_skill_tool_execution_policy,
@@ -38,8 +39,8 @@ use crate::{
     },
     task_runner_bridge::{TaskCompletionSink, TaskDispatcher, TaskOutcome, TaskResult},
     tool_surface_state::{
-        RefreshLiveMcpToolDefinitionsInput, constrain_task_tool_definitions,
-        refresh_live_mcp_tool_definitions_with_mode,
+        RefreshLiveExternalToolDefinitionsInput, constrain_task_tool_definitions,
+        refresh_live_external_tool_definitions,
     },
     usage_recording::{
         AuxiliaryModelUsageContext, ModelUsageBinding, invoke_auxiliary_model_with_usage,
@@ -60,8 +61,8 @@ use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
 use magi_memory_store::{ExtractedMemory, MemoryExtractionApplyRequest, MemoryLayer, MemoryStore};
 use magi_orchestrator::{
-    ExecutionContextSummary, ExecutionWritebackPlans, OrchestratedExecutionRuntime,
-    task_worker_catalog::WorkerInfo,
+    ExecutionContextSummary, ExecutionWritebackPlans,
+    task_store::TaskStore, task_worker_catalog::WorkerInfo,
 };
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
 use magi_settings_store::SettingsStore;
@@ -83,7 +84,7 @@ use magi_bridge_client::{BridgeClientError, BridgeErrorLayer, ModelResponse, Mod
 
 #[derive(Clone)]
 pub struct ExecutionPipeline {
-    pub execution_runtime: OrchestratedExecutionRuntime,
+    pub task_store: Arc<TaskStore>,
     pub memory_store: MemoryStore,
 }
 
@@ -264,6 +265,7 @@ pub struct LlmTaskDispatcher {
     /// 按设置事实源代际复用角色模型客户端。HTTP 连接池由 bridge-client 继续统一持有，
     /// 这里只避免每个 Turn 重复解析配置和构造同一角色包装器。
     model_client_cache: Arc<Mutex<HashMap<String, Arc<dyn ModelBridgeClient>>>>,
+    plugin_model_calls: Arc<Mutex<HashMap<String, plugin_models::ModelCall>>>,
     /// 按 root task 统计尚未退出的异步 dispatch。Runner 重启必须等待这里的计数
     /// 归零，不能只等待 Runner 自身循环结束。
     dispatch_quiesce: Arc<DispatchQuiesceState>,
@@ -597,17 +599,14 @@ fn build_orchestrator_client(
 ) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
     // 用户没有配置任何数据源、会话也没有选择过来源时才视为“未配置”；
     // 一旦选择了来源（含插件来源），就必须按目录解析，来源不可用即报错，不回退到默认客户端。
-    let selected_source = crate::model_config::orchestrator_selection(settings_store, session_id)
-        .get("sourceId")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|id| !id.is_empty());
-    if !crate::main_model_sources::is_configured(settings_store) && !selected_source {
+    if !crate::model_config::has_orchestrator_model_config(settings_store, session_id)? {
         return Ok(None);
     }
     let normalized = resolve_orchestrator_model_config(settings_store, session_id)?;
-    Ok(normalized
+    let client = normalized
         .to_http_model_client()
-        .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>))
+        .ok_or_else(|| "主对话模型连接不可用".to_string())?;
+    Ok(Some(Arc::new(client)))
 }
 
 /// daemon 未注入 [`ContextBudget`] 时，为最小运行时和测试构造提供的默认预算。
@@ -657,7 +656,7 @@ impl LlmTaskDispatcher {
         session_id: &SessionId,
         workspace_id: &Option<WorkspaceId>,
     ) -> Result<(), String> {
-        let store = self.pipeline.execution_runtime.task_store();
+        let store = self.pipeline.task_store.as_ref();
         let task = store.get_task(task_id).ok_or("转交代理不存在")?;
         let lease = store
             .get_active_lease(task_id)
@@ -740,7 +739,7 @@ impl LlmTaskDispatcher {
         worker_id: Option<&WorkerId>,
     ) -> Result<conversation_loop::PreparedWorkspaceExecution, String> {
         let execution_guard = crate::task_execution_guard::TaskExecutionGuard::new(
-            self.pipeline.execution_runtime.task_store(),
+            self.pipeline.task_store.as_ref(),
             &self.session_store,
             &self.execution_registry,
             session_id,
@@ -774,8 +773,7 @@ impl LlmTaskDispatcher {
             let identity_root = self.resolve_task_source_root(task, session_id, workspace_id);
             let transferred = self
                 .pipeline
-                .execution_runtime
-                .task_store()
+                .task_store.as_ref()
                 .agent_run_transfer_for_task(&task.task_id)
                 .map_err(|error| error.to_string())?
                 .is_some();
@@ -932,6 +930,7 @@ impl LlmTaskDispatcher {
             plugin_command_executor: None,
             plugin_session_message_admitter: None,
             extension_hooks: None,
+            plugin_model_calls: Arc::default(),
             snapshot_manager: None,
             workspace_execution_preparer: None,
             conversation_registry,
@@ -1098,14 +1097,6 @@ impl LlmTaskDispatcher {
         prepare: Arc<WorkspaceExecutionPreparer>,
     ) -> Self {
         self.workspace_execution_preparer = Some(prepare);
-        self
-    }
-
-    pub fn with_project_memory_registry(
-        mut self,
-        registry: Arc<magi_project_memory::ProjectMemoryRegistry>,
-    ) -> Self {
-        self.project_memory_registry = registry;
         self
     }
 
@@ -1670,7 +1661,7 @@ impl LlmTaskDispatcher {
             return definitions;
         };
         let definitions =
-            refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
+            refresh_live_external_tool_definitions(RefreshLiveExternalToolDefinitionsInput {
                 definitions,
                 tool_registry: registry,
                 skill_runtime: self.skill_runtime.as_deref(),
@@ -1682,7 +1673,7 @@ impl LlmTaskDispatcher {
                 denied_tools: task_policy
                     .map(|policy| policy.denied_tools.as_slice())
                     .unwrap_or_default(),
-                include_external: false,
+                loaded_tool_names: &std::collections::BTreeSet::new(),
             });
         constrain_task_tool_definitions(definitions, task_policy)
     }
@@ -1983,7 +1974,7 @@ impl LlmTaskDispatcher {
             }
             if let Some(previous) = previous_allocations.first().copied() {
                 let worker = worker_id.ok_or("恢复代理 worktree 缺少当前 Worker")?;
-                let store = self.pipeline.execution_runtime.task_store();
+                let store = self.pipeline.task_store.as_ref();
                 let current = store
                     .get_active_lease(&task.task_id)
                     .filter(|lease| &lease.lease_id == lease_id)
@@ -1999,8 +1990,7 @@ impl LlmTaskDispatcher {
                     .as_deref()
                     .and_then(|id| {
                         self.pipeline
-                            .execution_runtime
-                            .task_store()
+                            .task_store.as_ref()
                             .get_lease(&LeaseId::new(id))
                     })
                     .filter(|lease| {
@@ -2146,7 +2136,7 @@ impl LlmTaskDispatcher {
             return Err("父代理执行资源已释放，拒绝建立嵌套 worktree".into());
         }
         if let Some(source) = source {
-            let store = self.pipeline.execution_runtime.task_store();
+            let store = self.pipeline.task_store.as_ref();
             let current_parent = task
                 .parent_task_id
                 .as_ref()
@@ -2532,7 +2522,7 @@ impl LlmTaskDispatcher {
             self.execution_registry.get(&task.task_id)
         {
             let heads = crate::agent_activation::retained_agent_heads(
-                self.pipeline.execution_runtime.task_store(), &self.session_store, &session_id, task,
+                self.pipeline.task_store.as_ref(), &self.session_store, &session_id, task,
             ).into_iter().map(|head| serde_json::json!({
                     "activation":head.agent_activation(), "task_id":head.task_id, "title":head.title,
                     "status":head.status, "role":head.executor_binding_target_role(),
@@ -2550,7 +2540,7 @@ impl LlmTaskDispatcher {
             if let Some(previous) = activation
                 .previous_task_id
                 .as_ref()
-                .and_then(|id| self.pipeline.execution_runtime.task_store().get_task(id))
+                .and_then(|id| self.pipeline.task_store.as_ref().get_task(id))
             {
                 parts.push(format!("[previous-agent-activation] title={} goal={}\n可通过 context_read 按需读取输出：{}\n证据：{}\n原始执行记录：task:{}:transcript（历史参考，不是本轮工具执行证据）",
                     previous.title, previous.goal,
@@ -2577,7 +2567,7 @@ impl LlmTaskDispatcher {
             parts.push(prompt);
         }
 
-        let task_store = self.pipeline.execution_runtime.task_store();
+        let task_store = self.pipeline.task_store.as_ref();
         for dependency_id in &task.dependency_ids {
             if let Some(dependency) = task_store.get_task(dependency_id) {
                 parts.push(format_dependency_task_context(&dependency));
@@ -3373,7 +3363,7 @@ impl LlmTaskDispatcher {
             skill_dispatch_runtime: self.skill_dispatch_runtime.as_deref(),
             extension_hooks: self.extension_hooks.as_deref(),
             skill_name: skill_name.clone(),
-            task_store: self.pipeline.execution_runtime.task_store(),
+            task_store: self.pipeline.task_store.as_ref(),
             execution_registry: &self.execution_registry,
             conversation_registry: self.conversation_registry.as_ref(),
             agent_role_registry: self.agent_role_registry.as_ref(),
@@ -4014,7 +4004,7 @@ impl TaskDispatcher for LlmTaskDispatcher {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         let state = Arc::clone(&self.dispatch_quiesce);
         let root_task_id = root_task_id.clone();
-        let store = self.pipeline.execution_runtime.task_store();
+        let store = self.pipeline.task_store.as_ref();
         Box::pin(async move {
             state.wait_for_execution_scope(store, &root_task_id).await;
         })
@@ -4027,8 +4017,7 @@ impl TaskDispatcher for LlmTaskDispatcher {
         let state = Arc::clone(&self.dispatch_quiesce);
         let root = self
             .pipeline
-            .execution_runtime
-            .task_store()
+            .task_store.as_ref()
             .get_task(root_task_id)
             .map_or_else(|| root_task_id.clone(), |task| task.root_task_id);
         Box::pin(async move {
@@ -4337,10 +4326,9 @@ mod tests {
         tool_registry: ToolRegistry,
         state_label: &str,
     ) -> LlmTaskDispatcher {
-        let execution_runtime =
-            OrchestratedExecutionRuntime::new(magi_worker_runtime::WorkerRuntime::new());
+        let task_store = Arc::new(TaskStore::new());
         let pipeline = ExecutionPipeline {
-            execution_runtime,
+            task_store,
             memory_store: MemoryStore::new(),
         };
 
@@ -4601,7 +4589,7 @@ mod tests {
         let policy = child.policy_snapshot.as_mut().unwrap();
         policy.access_profile = AccessProfile::ReadOnly;
         policy.allowed_paths = vec![repository.to_string_lossy().into_owned()];
-        let store = dispatcher.pipeline.execution_runtime.task_store();
+        let store = dispatcher.pipeline.task_store.as_ref();
         store.insert_task(parent).unwrap();
         store.insert_task(child.clone()).unwrap();
         let worker = WorkerId::new("worker-external-scope");
@@ -4631,6 +4619,29 @@ mod tests {
             UtcMillis::now(),
         )
         .unwrap();
+        let turn_id = "turn-external-scope";
+        dispatcher.session_store.accept_current_turn_with_timeline_entry(
+            session.clone(),
+            magi_session_store::TimelineEntryInput::new(
+                "scope-probe-input", TimelineEntryKind::UserMessage, "inspect repository", UtcMillis::now(),
+            ),
+            magi_session_store::ActiveExecutionTurn {
+                turn_id: turn_id.into(), turn_seq: 1, accepted_at: UtcMillis::now(),
+                completed_at: None, status: "running".into(),
+                user_message: Some("inspect repository".into()), items: vec![],
+            },
+        ).unwrap();
+        dispatcher.execution_registry.insert(child.task_id.clone(), TaskExecutionPlan::Dispatch {
+            target: magi_core::TaskExecutionTarget {
+                mission_id: child.mission_id.clone(), root_task_id: child.root_task_id.clone(),
+                task_id: child.task_id.clone(), requested_worker_id: Some(worker.clone()),
+                recovery_id: None, execution_chain_ref: None,
+            },
+            worker_id: worker.clone(), thread_id: thread.clone(), is_primary: false,
+            session_id: session.clone(), turn_id: turn_id.into(), workspace_id: workspace.clone(),
+            execution_root: Some(repository.clone()), writebacks: ExecutionWritebackPlans::default(),
+            use_tools: true, skill_name: None, images: vec![], execution_settings_snapshot: None,
+        }).unwrap();
         let usage = crate::usage_recording::session_turn_model_usage_binding(true);
         let invoke = |use_tools| {
             dispatcher.invoke_llm_with_tools(TaskInvocationInput {
@@ -4743,7 +4754,7 @@ mod tests {
                     generation: 1,
                     previous_task_id: None,
                 });
-            let store = dispatcher.pipeline.execution_runtime.task_store();
+            let store = dispatcher.pipeline.task_store.as_ref();
             store.insert_task(parent).unwrap();
             store.insert_task(child.clone()).unwrap();
             let logical_worker = WorkerId::new("persistent-thread-worker");
@@ -5364,7 +5375,7 @@ mod tests {
     fn assemble_prompt_for_subagent_uses_package_and_current_file_facts_only() {
         let session_id = SessionId::new("session-context-prompt");
         let workspace_id = WorkspaceId::new("workspace-context-prompt");
-        let session_store = SessionStore::from_state(magi_session_store::SessionStoreState {
+        let session_store = SessionStore::from_state_for_test(magi_session_store::SessionStoreState {
             current_session_id: Some(session_id.clone()),
             sessions: vec![magi_session_store::SessionRecord {
                 session_id: session_id.clone(),
@@ -5407,7 +5418,7 @@ mod tests {
             file_summary_store,
             magi_context_runtime::ProjectRecentTurnStore::default(),
         );
-        let dispatcher = dispatcher_with_default_tool_surface()
+        let mut dispatcher = dispatcher_with_default_tool_surface()
             .with_context_runtime(Arc::new(context_runtime))
             .with_context_budget(ContextBudget {
                 max_turns: 1,
@@ -5430,7 +5441,8 @@ mod tests {
         let file_path = directory.path().join("src-lib.rs");
         std::fs::write(&file_path, "Important file summary from current workspace.")
             .expect("write file fact");
-        dispatcher.session_store.append_thread_messages(
+        dispatcher.session_store = Arc::new(crate::test_history::with_messages(
+            &dispatcher.session_store,
             &thread_id,
             vec![magi_session_store::ThreadChatMessage {
                 input_request_id: None,
@@ -5452,7 +5464,7 @@ mod tests {
                 provider_context: Vec::new(),
             }],
             UtcMillis(20),
-        );
+        ));
         let mut task = task_with_role("executor", TaskTier::ExecutionChain);
         task.runtime_payload = magi_core::TaskRuntimePayload::AgentContext {
             package: Box::new(magi_core::AgentContextPackage {
@@ -7223,7 +7235,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_for_role_orchestrator_requires_session_model_override() {
+    fn resolve_target_for_role_rejects_obsolete_flat_orchestrator_config() {
         use magi_settings_store::SettingsStore;
 
         let store = Arc::new(SettingsStore::new());
@@ -7238,11 +7250,9 @@ mod tests {
             )
             .unwrap();
 
-        let resolved = resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator, None)
-            .expect("orchestrator 段构造不应失败");
         assert!(
-            resolved.is_none(),
-            "全局 orchestrator 只承载连接配置，旧 model/reasoningEffort 不得生成主对话 client"
+            resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator, None).is_err(),
+            "旧连接结构必须拒绝，不能视为未配置后改用其他模型"
         );
     }
 
@@ -7935,6 +7945,295 @@ mod tests {
     }
 
     #[test]
+    fn plugin_page_model_selection_uses_native_reasoning_capability() {
+        let settings = Arc::new(SettingsStore::new());
+        let capability = magi_core::ReasoningCapability {
+            supported_efforts: vec![magi_core::ReasoningEffort::None, magi_core::ReasoningEffort::High],
+            default_effort: Some(magi_core::ReasoningEffort::None),
+            transport: magi_core::ReasoningTransport::Openai,
+            source: "user".into(),
+        };
+        settings.set_section("orchestrator", serde_json::json!({
+            "sources":[{
+                "id":"one","name":"one","baseUrl":"https://model.example.test/v1","apiKey":"private-key",
+                "apiProtocol":"openai_chat","models":[{"id":"test-model","reasoning":capability}]
+            }]
+        })).unwrap();
+        settings.set_section(magi_settings_store::ORCHESTRATOR_SESSION_DEFAULTS_SECTION, serde_json::json!({
+            "sourceId":"custom/one","model":"test-model","reasoningEffort":"none"
+        })).unwrap();
+        let dispatcher = dispatcher_with_default_tool_surface().with_settings_store(settings);
+        let selection = dispatcher.extension_service("acme.native", "model.selection", serde_json::json!({
+            "_context":{"activity":"route"},
+            "_modelOwner":{"pluginId":"acme.native","digest":"a".repeat(64),"instanceId":"native-instance"}
+        }), Arc::default(), None).unwrap();
+        assert_eq!(selection["reasoning"], serde_json::to_value(capability).unwrap());
+        assert!(!selection.to_string().contains("private-key"));
+        assert!(dispatcher.session_store.sessions().is_empty());
+    }
+
+    #[test]
+    fn plugin_page_model_uses_durable_plugin_ownership_without_creating_a_session_or_replaying() {
+        use std::io::Read;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut raw = Vec::new();
+            loop {
+                let mut bytes = [0; 4096];
+                let size = stream.read(&mut bytes).unwrap();
+                assert!(size > 0);
+                raw.extend_from_slice(&bytes[..size]);
+                if let Some(offset) = raw.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&raw[..offset]).to_lowercase();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    if raw.len() >= offset + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"PLUGIN RESULT\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n";
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            String::from_utf8(raw).unwrap()
+        });
+        let settings = Arc::new(SettingsStore::new());
+        settings.set_section("orchestrator", serde_json::json!({"sources":[{
+            "id":"one","name":"one","baseUrl":format!("http://{address}/v1"),"apiKey":"private-test-key",
+            "apiProtocol":"openai_chat","models":[{"id":"test-model"}]
+        }]})).unwrap();
+        let dispatcher = dispatcher_with_default_tool_surface().with_settings_store(settings);
+        let directory = tempfile::tempdir().unwrap();
+        dispatcher
+            .event_bus
+            .set_audit_usage_ledger_persistence(directory.path());
+        let identity = serde_json::json!({"pluginId":"acme.page","digest":"a".repeat(64),"instanceId":"instance-one"});
+        let base = serde_json::json!({"_context":{"activity":"route"},"_modelOwner":identity});
+        let selection = dispatcher
+            .extension_service(
+                "acme.page",
+                "model.selection",
+                base.clone(),
+                Arc::default(),
+                None,
+            )
+            .unwrap();
+        assert!(!selection.to_string().contains("private-test-key"));
+        let mut input = base.clone();
+        input["operationId"] = serde_json::json!("operation-one");
+        input["selection"] = selection;
+        input["messages"] = serde_json::json!([{"role":"system","content":"ORIGINAL SYSTEM"},{"role":"user","content":"ORIGINAL USER"}]);
+        let mut precancel = base.clone();
+        precancel["operationId"] = serde_json::json!("precancelled");
+        dispatcher
+            .extension_service("acme.page", "model.cancel", precancel, Arc::default(), None)
+            .unwrap();
+        let mut cancelled_input = input.clone();
+        cancelled_input["operationId"] = serde_json::json!("precancelled");
+        assert!(
+            dispatcher
+                .extension_service(
+                    "acme.page",
+                    "model.invoke",
+                    cancelled_input,
+                    Arc::default(),
+                    None
+                )
+                .unwrap_err()
+                .contains("Cancelled")
+        );
+        let result = dispatcher
+            .extension_service(
+                "acme.page",
+                "model.invoke",
+                input.clone(),
+                Arc::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result["content"], "PLUGIN RESULT");
+        dispatcher
+            .settings_store
+            .as_ref()
+            .unwrap()
+            .set_section("orchestrator", serde_json::json!({"sources":[]}))
+            .unwrap();
+        assert_eq!(
+            dispatcher
+                .extension_service(
+                    "acme.page",
+                    "model.invoke",
+                    input.clone(),
+                    Arc::default(),
+                    None
+                )
+                .unwrap(),
+            result
+        );
+        let raw = server.join().unwrap();
+        assert!(raw.contains("ORIGINAL SYSTEM") && raw.contains("ORIGINAL USER"));
+        let restored = InMemoryEventBus::new(16);
+        restored.restore_persisted_audit_usage_ledger(
+            magi_event_bus::AuditUsageLedgerSnapshot::load_from_dir(
+                directory.path(),
+                UtcMillis::now(),
+            )
+            .unwrap(),
+        );
+        crate::auxiliary_usage::recover(&restored).unwrap();
+        let ledger = restored.audit_usage_ledger_snapshot();
+        let usage = ledger
+            .usage_entries
+            .iter()
+            .find(|entry| entry.event_type == "model.usage.recorded")
+            .unwrap();
+        assert_eq!(usage.payload["plugin"]["pluginId"], "acme.page");
+        assert!(usage.context.session_id.is_none() && usage.payload.get("sessionId").is_none());
+        assert_eq!(usage.payload["usage"]["inputTokens"], 12);
+        assert!(dispatcher.session_store.sessions().is_empty());
+        input["messages"][1]["content"] = serde_json::json!("CHANGED");
+        assert!(
+            dispatcher
+                .extension_service("acme.page", "model.invoke", input, Arc::default(), None)
+                .unwrap_err()
+                .contains("发生变化")
+        );
+        // 重启恢复只重建账本投影；上游服务器已退出，没有第二次模型请求。
+        assert!(
+            ledger
+                .audit_entries
+                .iter()
+                .any(|entry| entry.payload["stage"] == "completed")
+        );
+    }
+
+    #[test]
+    fn plugin_page_model_streams_native_http_tools_images_and_controls_on_one_ledger() {
+        use std::io::{BufRead, Read};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (ack, ready) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let name = body["tools"][0]["function"]["name"].as_str().unwrap();
+            let mut stream = reader.into_inner();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+            let mut send = |value: serde_json::Value| {
+                let data = format!("data: {value}\n\n");
+                write!(stream, "{:x}\r\n{}\r\n", data.len(), data).unwrap();
+                stream.flush().unwrap();
+            };
+            send(serde_json::json!({"choices":[{"delta":{"content":"first"}}]}));
+            ready
+                .recv_timeout(Duration::from_secs(5))
+                .expect("进度必须在最终结果之前到达");
+            send(
+                serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"real-call","type":"function","function":{"name":name,"arguments":"{\"q\":\"value\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":30,"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":0}}}),
+            );
+            let data = "data: [DONE]\n\n";
+            write!(stream, "{:x}\r\n{}\r\n0\r\n\r\n", data.len(), data).unwrap();
+            body
+        });
+        let settings = Arc::new(SettingsStore::new());
+        settings.set_section("orchestrator",serde_json::json!({"sources":[{"id":"one","name":"one","baseUrl":format!("http://{address}/v1"),"apiKey":"private-key","apiProtocol":"openai_chat","models":[{"id":"model"}]}]})).unwrap();
+        let dispatcher = dispatcher_with_default_tool_surface().with_settings_store(settings);
+        let base = serde_json::json!({"_context":{"activity":"route"},"_modelOwner":{"pluginId":"acme.page","digest":"a".repeat(64),"instanceId":"live-one"}});
+        let selection = dispatcher
+            .extension_service(
+                "acme.page",
+                "model.selection",
+                base.clone(),
+                Arc::default(),
+                None,
+            )
+            .unwrap();
+        let mut input = base;
+        input["selection"] = selection;
+        input["operationId"] = serde_json::json!("rich-one");
+        input["messages"] = serde_json::json!([{"role":"user","content":"Inspect","images":[{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aRZkAAAAASUVORK5CYII="}]}]);
+        input["tools"] = serde_json::json!([{"type":"function","origin":"plugin","function":{"name":"business.lookup","description":"Lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]);
+        input["temperature"] = serde_json::json!(0.25);
+        input["stop"] = serde_json::json!(["END"]);
+        let progress = Arc::new(move |delta: serde_json::Value| {
+            if delta["content"] == "first" {
+                ack.send(()).unwrap();
+            }
+            Ok(())
+        });
+        let result = dispatcher
+            .extension_service(
+                "acme.page",
+                "model.invoke",
+                input.clone(),
+                Arc::default(),
+                Some(progress),
+            )
+            .unwrap();
+        assert_eq!(result["status"], "requires_tool_execution");
+        assert_eq!(result["content"], "first");
+        assert_eq!(
+            result["toolCalls"][0]["function"]["name"],
+            "business.lookup"
+        );
+        assert_eq!(result["usage"]["reasoningTokens"], 0);
+        let request = server.join().unwrap();
+        assert_eq!(request["temperature"], 0.25);
+        assert_eq!(request["stop"], serde_json::json!(["END"]));
+        assert!(
+            request["messages"][0]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|block| block["type"] == "image_url")
+        );
+        assert_eq!(
+            dispatcher
+                .extension_service("acme.page", "model.invoke", input, Arc::default(), None)
+                .unwrap(),
+            result,
+            "读取同一结果不能重放模型"
+        );
+        assert!(dispatcher.session_store.sessions().is_empty());
+        let ledger = dispatcher.event_bus.audit_usage_ledger_snapshot();
+        assert_eq!(
+            ledger
+                .usage_entries
+                .iter()
+                .filter(|entry| entry.event_type == "model.usage.recorded")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn extension_snapshot_is_bounded_and_actions_require_a_live_owner() {
         let (dispatcher, session, context) = extension_services_fixture();
         let snapshot = dispatcher
@@ -7943,6 +8242,7 @@ mod tests {
                 "session.snapshot",
                 serde_json::json!({"sessionId":session}),
                 Arc::default(),
+                None,
             )
             .unwrap();
         assert_eq!(snapshot["turns"].as_array().unwrap().len(), 1);
@@ -7952,7 +8252,8 @@ mod tests {
                     "acme.test",
                     "notify.user",
                     serde_json::json!({"message":"hello"}),
-                    Arc::default()
+                    Arc::default(),
+                    None
                 )
                 .is_err()
         );
@@ -7962,6 +8263,7 @@ mod tests {
                 "notify.user",
                 serde_json::json!({"_context":context,"message":"hello"}),
                 Arc::default(),
+                None,
             )
             .unwrap();
         let records = dispatcher.session_store.notifications_for_context(
@@ -7990,7 +8292,13 @@ mod tests {
             .create_external_tool_session(SessionId::new("external"), "Private", "w".into())
             .unwrap();
         let directory = |params| {
-            dispatcher.extension_service("acme.test", "session.directory", params, Arc::default())
+            dispatcher.extension_service(
+                "acme.test",
+                "session.directory",
+                params,
+                Arc::default(),
+                None,
+            )
         };
         let first = directory(json!({"limit":1})).unwrap();
         assert_eq!(first["sessions"][0]["sessionId"], "a");
@@ -8035,7 +8343,7 @@ mod tests {
         let (dispatcher, session, context) = extension_services_fixture();
         let worker = dispatcher.clone();
         let thread = std::thread::spawn(move || {
-            worker.extension_service("acme.test", "ask.user", serde_json::json!({"_context":context,"questions":[{"header":"方式","question":"选择方式","options":[{"label":"A"},{"label":"B"}]}]}), Arc::default())
+            worker.extension_service("acme.test", "ask.user", serde_json::json!({"_context":context,"questions":[{"header":"方式","question":"选择方式","options":[{"label":"A"},{"label":"B"}]}]}), Arc::default(), None)
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let question = loop {

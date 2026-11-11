@@ -1143,16 +1143,6 @@ impl SessionTurnCoordinator {
         removed
     }
 
-    pub fn active_profile(&self, session_id: &SessionId) -> Option<ExecutionProfile> {
-        self.state
-            .lock()
-            .expect("turn coordinator state poisoned")
-            .sessions
-            .get(session_id)
-            .and_then(|session| session.active.as_ref())
-            .map(|active| active.admission.profile)
-    }
-
     pub fn clear_session(&self, session_id: &SessionId) {
         self.state
             .lock()

@@ -4,7 +4,6 @@ use magi_core::{
     TaskCompletionAttempt, TaskId, TaskPolicy, TaskRuntimePayload, TaskStatus, TaskTier, UtcMillis,
     WorkerId,
 };
-use magi_worker_runtime::WorkerRuntimeDurableSnapshot;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -1521,10 +1520,58 @@ impl TaskStore {
         collect_subtree_ids_in_scope(&tasks, root_id, true)
     }
 
+    /// 同一读快照中的当前执行范围；转交子树保留在审计树中，不计入原主线。
+    pub fn execution_subtree_tasks(&self, root_id: &TaskId) -> Vec<Task> {
+        let tasks = self.tasks.read().expect("tasks read lock poisoned");
+        collect_subtree_ids_in_scope(&tasks, root_id, true)
+            .into_iter()
+            .filter_map(|id| tasks.get(&id).cloned())
+            .collect()
+    }
+
     /// 调度身份与审计 root 分离；转交不生成新 Task/root/lease 或另一棵任务树。
     pub fn execution_scope_root(&self, task_id: &TaskId) -> DomainResult<TaskId> {
         let tasks = self.tasks.read().expect("tasks read lock poisoned");
         Self::execution_scope_root_in_tasks(&tasks, task_id)
+    }
+
+    /// 计划保留历史绑定；是否阻挡目标完成只看同一 TaskStore 快照中的状态和拥有方。
+    pub fn goal_has_active_bound_tasks(
+        &self,
+        completing_root: &TaskId,
+        session: &magi_core::SessionId,
+        goal: &magi_core::GoalId,
+        bound_tasks: &[TaskId],
+    ) -> DomainResult<bool> {
+        let tasks = self.tasks.read().expect("tasks read lock poisoned");
+        Self::validate_task_root(&tasks, completing_root, completing_root)?;
+        let mut active = false;
+        for id in bound_tasks {
+            let task = tasks.get(id).ok_or(DomainError::NotFound {
+                entity: "GoalBoundTask",
+            })?;
+            if id == completing_root
+                || !matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+            {
+                continue;
+            }
+            let scope = Self::execution_scope_root_in_tasks(&tasks, id)?;
+            if scope == *completing_root {
+                active = true;
+            } else if let Some((_, transfer)) = Self::agent_run_transfer_in_tasks(&tasks, id)? {
+                if transfer.session_id != *session {
+                    return Err(DomainError::InvalidState {
+                        message: "目标绑定任务的转交会话不匹配".into(),
+                    });
+                }
+                active |= matches!(&transfer.owner, magi_core::AgentRunOwner::Goal { goal_id, .. } if goal_id == goal);
+            } else {
+                return Err(DomainError::InvalidState {
+                    message: "目标绑定的活动任务不属于当前执行范围".into(),
+                });
+            }
+        }
+        Ok(active)
     }
 
     fn execution_scope_root_in_tasks(
@@ -2712,34 +2759,20 @@ impl TaskStore {
         Ok(Some((old_status, cloned_task)))
     }
 
-    /// 更新活跃租约的心跳时间。
-    pub fn heartbeat_lease(&self, task_id: &TaskId, lease_id: &LeaseId) -> bool {
-        self.heartbeat_lease_inner(task_id, lease_id, None)
-    }
-
+    /// 更新当前执行作用域内活跃租约的心跳时间。
     pub fn heartbeat_lease_for_execution_scope(
         &self,
         scope_root: &TaskId,
         task_id: &TaskId,
         lease_id: &LeaseId,
     ) -> bool {
-        self.heartbeat_lease_inner(task_id, lease_id, Some(scope_root))
-    }
-
-    fn heartbeat_lease_inner(
-        &self,
-        task_id: &TaskId,
-        lease_id: &LeaseId,
-        scope_root: Option<&TaskId>,
-    ) -> bool {
         let _mutation_guard = self
             .mutation_lock
             .lock()
             .expect("task mutation lock poisoned");
         let tasks = self.tasks.read().expect("tasks read lock poisoned");
-        if let Some(scope) = scope_root
-            && !Self::execution_scope_root_in_tasks(&tasks, task_id)
-                .is_ok_and(|root| root == *scope)
+        if !Self::execution_scope_root_in_tasks(&tasks, task_id)
+            .is_ok_and(|root| root == *scope_root)
         {
             return false;
         }
@@ -2820,12 +2853,9 @@ impl TaskStore {
     /// 在进程重启后收敛易失执行态。
     ///
     /// 本轮只保证逻辑续接，不恢复进程内瞬时现场，因此 restore 后的 Active lease
-    /// 仍然不能被视为真实运行态。这里会结合 `WorkerRuntime` 的最小快照一起决定
-    /// 哪些 branch 属于当前可恢复执行树，并把对应子树统一收口到 `Failed`。
-    pub fn reconcile_volatile_runtime_after_restore(
-        &self,
-        worker_snapshot: &WorkerRuntimeDurableSnapshot,
-    ) -> DomainResult<(usize, usize)> {
+    /// 仍然不能被视为真实运行态。TaskStore 自身的 Pending/Running 与租约事实
+    /// 决定受影响的 execution scope，不依赖 sidecar 或旧 Worker 阶段快照。
+    pub fn reconcile_volatile_runtime_after_restore(&self) -> DomainResult<(usize, usize)> {
         let _mutation_guard = self
             .mutation_lock
             .lock()
@@ -2844,30 +2874,10 @@ impl TaskStore {
             .filter(|lease| lease.lease_status == TaskLeaseState::Active)
             .map(|lease| (lease.task_id.clone(), lease.lease_id.clone()))
             .collect::<Vec<_>>();
-        let interrupted_task_ids = worker_snapshot
-            .branches
-            .iter()
-            .filter_map(|branch| {
-                let task = tasks.get(&branch.task_id)?;
-                matches!(
-                    task.status,
-                    TaskStatus::Pending | TaskStatus::Running | TaskStatus::Failed
-                )
-                .then(|| branch.task_id.clone())
-            })
-            // Agent 的创建已持久化，但排队期间还可能没有 worker/lease。
-            // 转交后的原主线也可能已结束，不能只靠主线 sidecar 或 Worker
-            // 快照发现这些遗留 activation。重启不自动执行旧委派。
-            .chain(
-                tasks
-                    .values()
-                    .filter(|task| {
-                        task.parent_task_id.is_some()
-                            && task.agent_activation().is_some()
-                            && matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
-                    })
-                    .map(|task| task.task_id.clone()),
-            )
+        let interrupted_task_ids = tasks
+            .values()
+            .filter(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Running))
+            .map(|task| task.task_id.clone())
             .collect::<Vec<_>>();
         if active_leases.is_empty() && interrupted_task_ids.is_empty() {
             return Ok((0, 0));
@@ -5102,6 +5112,132 @@ mod tests {
     }
 
     #[test]
+    fn goal_task_activity_uses_durable_status_and_rejects_missing_facts() {
+        let session = magi_core::SessionId::new("goal-session");
+        let goal = magi_core::GoalId::new("goal");
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Killed,
+        ] {
+            let store = TaskStore::new();
+            let root = rooted_task("goal-root", "goal-root");
+            let mut child = rooted_task("goal-root", "goal-child");
+            child.status = status;
+            store.insert_task(root.clone()).unwrap();
+            store.insert_task(child.clone()).unwrap();
+            let snapshot = store.snapshot();
+            let restored = TaskStore::restore_checked(TaskStoreCheckpoint {
+                tasks: snapshot.tasks,
+                leases: snapshot.leases,
+            })
+            .unwrap();
+            for store in [&store, &restored] {
+                assert_eq!(
+                    store
+                        .goal_has_active_bound_tasks(
+                            &root.task_id,
+                            &session,
+                            &goal,
+                            &[root.task_id.clone(), child.task_id.clone()]
+                        )
+                        .unwrap(),
+                    matches!(status, TaskStatus::Pending | TaskStatus::Running)
+                );
+                assert!(
+                    store
+                        .goal_has_active_bound_tasks(
+                            &root.task_id,
+                            &session,
+                            &goal,
+                            &[TaskId::new("missing")]
+                        )
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn goal_task_activity_follows_session_and_goal_transfers() {
+        let goal = magi_core::GoalId::new("goal-owner");
+        for goal_owned in [false, true] {
+            let (_, root, mut child, mut leaf, mut transfer) = transfer_fixture();
+            if goal_owned {
+                for task in [&mut child, &mut leaf] {
+                    task.executor_binding
+                        .as_mut()
+                        .unwrap()
+                        .agent_activation
+                        .as_mut()
+                        .unwrap()
+                        .lifetime = magi_core::AgentLifetime::Goal {
+                        goal_id: goal.clone(),
+                    };
+                }
+                transfer.owner = magi_core::AgentRunOwner::Goal {
+                    goal_id: goal.clone(),
+                    control_revision: 1,
+                };
+            }
+            let store = TaskStore::new();
+            for task in [&root, &child, &leaf] {
+                store.insert_task(task.clone()).unwrap();
+            }
+            let session = transfer.session_id.clone();
+            let bound = [child.task_id.clone(), leaf.task_id.clone()];
+            assert!(
+                store
+                    .goal_has_active_bound_tasks(&root.task_id, &session, &goal, &bound)
+                    .unwrap()
+            );
+            store
+                .transfer_agent_subtree(&root.task_id, &child.task_id, transfer)
+                .unwrap();
+            assert_eq!(
+                store
+                    .goal_has_active_bound_tasks(&root.task_id, &session, &goal, &bound)
+                    .unwrap(),
+                goal_owned
+            );
+            assert!(
+                !store
+                    .goal_has_active_bound_tasks(
+                        &root.task_id,
+                        &session,
+                        &magi_core::GoalId::new("other-goal"),
+                        &bound
+                    )
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .goal_has_active_bound_tasks(
+                        &root.task_id,
+                        &magi_core::SessionId::new("other-session"),
+                        &goal,
+                        &bound
+                    )
+                    .is_err()
+            );
+            let snapshot = store.snapshot();
+            let restored = TaskStore::restore_checked(TaskStoreCheckpoint {
+                tasks: snapshot.tasks,
+                leases: snapshot.leases,
+            })
+            .unwrap();
+            assert_eq!(
+                restored
+                    .goal_has_active_bound_tasks(&root.task_id, &session, &goal, &bound)
+                    .unwrap(),
+                goal_owned
+            );
+        }
+    }
+
+    #[test]
     fn restart_reconciles_queued_agent_scope_without_worker_snapshot_or_mainline() {
         let (store, root, child, leaf, transfer) = transfer_fixture();
         store
@@ -5121,38 +5257,24 @@ mod tests {
                 message: "restart checkpoint failed".into(),
             })
         }));
-        assert!(
-            restored
-                .reconcile_volatile_runtime_after_restore(&Default::default())
-                .is_err()
-        );
+        assert!(restored.reconcile_volatile_runtime_after_restore().is_err());
         assert_eq!(
             serde_json::to_value(restored.snapshot().tasks).unwrap(),
             serde_json::to_value(before.tasks).unwrap()
         );
         restored.set_checkpoint_callback(Box::new(|_| Ok(())));
         assert_eq!(
-            restored
-                .reconcile_volatile_runtime_after_restore(&Default::default())
-                .unwrap(),
-            (0, 2)
+            restored.reconcile_volatile_runtime_after_restore().unwrap(),
+            (0, 4)
         );
-        for task in [child, leaf] {
+        for task in [root, child, leaf, sibling] {
             assert_eq!(
                 restored.get_task(&task.task_id).unwrap().status,
                 TaskStatus::Failed
             );
         }
-        for task in [root, sibling] {
-            assert_eq!(
-                restored.get_task(&task.task_id).unwrap().status,
-                task.status
-            );
-        }
         assert_eq!(
-            restored
-                .reconcile_volatile_runtime_after_restore(&Default::default())
-                .unwrap(),
+            restored.reconcile_volatile_runtime_after_restore().unwrap(),
             (0, 0)
         );
     }

@@ -20,6 +20,9 @@ use crate::peer::BoxFuture;
 use crate::protocol::RpcError;
 use serde_json::Value;
 
+/// 当前调用的临时进度；持久结果仍由业务服务提交。发送失败必须停止交付。
+pub type ServiceProgress = std::sync::Arc<dyn Fn(Value) -> Result<(), RpcError> + Send + Sync>;
+
 /// daemon 暴露给受信扩展的业务服务端口。实现必须在 Magi 原生事实源上执行准入，
 /// 不得让 Node 直接写 canonical 日志或复制会话/任务状态。
 pub trait HostService: Send + Sync + 'static {
@@ -41,6 +44,7 @@ pub trait HostService: Send + Sync + 'static {
         method: String,
         params: Value,
         _cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _progress: Option<ServiceProgress>,
     ) -> BoxFuture<Result<Value, RpcError>> {
         self.request_with_identity(plugin_id, method, params)
     }

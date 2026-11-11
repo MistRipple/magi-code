@@ -8,26 +8,32 @@ import { SlotCore } from '@deepseek-ai/dsh-client-ui-slots';
 const SLOT_CONTRACTS = {
   'settings.section': { kind: 'list', scope: 'root', disposition: 'mounted', surface: 'settings' },
   'settings.section.icon': { kind: 'list', scope: 'root', disposition: 'alternate' },
-  'plugins.bundle.config': { kind: 'keyed', scope: 'root', disposition: 'mounted' },
+  'plugins.bundle.config': { kind: 'keyed', scope: 'root', disposition: 'mounted', surface: 'settings' },
   'plugins.row.config': { kind: 'keyed', scope: 'root', disposition: 'alternate' },
-  'settings.plugins.tab': { kind: 'list', scope: 'root', disposition: 'mounted' },
-  'plugins.tab': { kind: 'list', scope: 'root', disposition: 'mounted' },
+  'settings.plugins.tab': { kind: 'list', scope: 'root', disposition: 'mounted', surface: 'settings' },
+  'plugins.tab': { kind: 'list', scope: 'root', disposition: 'mounted', surface: 'settings' },
   'main': { kind: 'keyed', scope: 'root', disposition: 'mounted' },
   'sidebar.right.pane.tab': { kind: 'keyed', scope: 'session', disposition: 'mounted' },
   'sidebar.panellist': { kind: 'list', scope: 'root', disposition: 'alternate' },
   'sidebar.right.pane.tab.title': { kind: 'keyed', scope: 'session', disposition: 'alternate' },
   'sidebar.right.tab.guide.entry': { kind: 'keyed', scope: 'session', disposition: 'alternate' },
   'sidebar.footer.action': { kind: 'list', scope: 'root', disposition: 'alternate' },
-  'conversation.input.left': { kind: 'list', scope: 'session', disposition: 'unmounted' },
-  'conversation.input.right': { kind: 'list', scope: 'session', disposition: 'unmounted' },
-  'conversation.chat.node': { kind: 'keyed', scope: 'session', disposition: 'unmounted' },
+  'conversation.input.left': { kind: 'list', scope: 'session', disposition: 'mounted' },
+  'conversation.input.right': { kind: 'list', scope: 'session', disposition: 'mounted' },
+  'conversation.chat.node': { kind: 'keyed', scope: 'session', disposition: 'blocked', reason: '替换原生消息渲染器' },
   'conversation.session.header.actions': { kind: 'list', scope: 'session', disposition: 'unmounted' },
   'conversation.chat.turnTail': { kind: 'list', scope: 'session', disposition: 'unmounted' },
-  'conversation.input.dock': { kind: 'list', scope: 'session', disposition: 'unmounted' },
+  'conversation.input.dock': { kind: 'list', scope: 'session', disposition: 'blocked', reason: '接管原生输入区' },
 };
 
-export function slotDisposition(name) {
+export function slotDisposition(name, key) {
   return SLOT_CONTRACTS[name]?.disposition ?? 'unmounted';
+}
+export function assertSlotAllowed(name) {
+  const contract = SLOT_CONTRACTS[name];
+  if (contract?.disposition === 'blocked') {
+    throw new Error(`PLUGIN_UI_BOUNDARY_CONFLICT：该插件要求${contract.reason}（${name}），与 Magi 的详细／摘要展示和原生交互冲突，不能安装或启用。Magi 不会自动改写为另一种功能，也不提供覆盖原生界面的授权。`);
+  }
 }
 export const MOUNT_PRIORITY = Object.keys(SLOT_CONTRACTS).filter(name => slotDisposition(name) === 'mounted');
 export const SLOT_SURFACE = Object.fromEntries(Object.entries(SLOT_CONTRACTS).filter(([, spec]) => spec.surface).map(([name, spec]) => [name, spec.surface]));
@@ -38,7 +44,7 @@ const HOST_SLOTS = Object.fromEntries(Object.entries(SLOT_CONTRACTS).map(([name,
  *   scope    settingsScope 的实现（getSnapshot / subscribe / set）
  *   onChange 槽位注册或释放后的回调
  */
-export function createSlotContext({ scope, connection, composer, onChange = () => {}, onOpenTab }) {
+export function createSlotContext({ scope, connection, composer, theme, onChange = () => {}, onOpenTab }) {
   const core = new SlotCore();
   const names = new Set();
   const releaseRoot = core.register({ name: 'root', children: HOST_SLOTS }, () => null);
@@ -73,6 +79,8 @@ export function createSlotContext({ scope, connection, composer, onChange = () =
     return release;
   };
   const register = (descriptor, component) => effect(() => {
+    // 安装记录与运行文档共用同一准入；延迟注册也不能接管原生控件。
+    assertSlotAllowed(descriptor.name);
     // names 只是枚举索引；存活身份及所有条目始终向同一个 core 查询。
     return core.register(descriptor, component);
   });
@@ -113,6 +121,10 @@ export function createSlotContext({ scope, connection, composer, onChange = () =
   const ctx = {
     configForms,
     connection,
+    ...(theme ? { theme: theme.service, on(name, listener) {
+      if (name !== 'theme/change') throw new Error(`页面事件尚未接入：${name}`);
+      return effect(() => theme.subscribe(listener));
+    } } : {}),
     slots: {
       register, inject,
       entries: (name) => core.entries(name),
@@ -151,6 +163,7 @@ export function createSlotContext({ scope, connection, composer, onChange = () =
         sidebarRight: ctx.sidebarRight,
         sidebarRightTabs: ctx.sidebarRightTabs,
         connection,
+        ...(theme ? { theme: theme.service } : {}),
         ...(composer ? { sessions: composer.sessions, conversation: composer.conversation } : {}),
       };
       if (requested.some((name) => services[name] === undefined)) return;

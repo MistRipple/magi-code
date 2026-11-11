@@ -34,6 +34,7 @@ const MAX_INSTALL_REQUEST_BYTES: usize = MAX_PACKAGE_BYTES.div_ceil(3) * 4 + 64 
 /// 路由 JSON 可承载最多 2 MiB 的 base64 字节及有界头部；其他 HTTP 接口保持原上限。
 const MAX_ROUTE_REQUEST_BYTES: usize = 3 * 1024 * 1024 + 64 * 1024;
 const VIEW_CONTENT_SECURITY_POLICY: &str = "sandbox allow-scripts allow-downloads; default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; object-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'; connect-src 'none'";
+const TRUSTED_VIEW_CONTENT_SECURITY_POLICY: &str = "sandbox allow-scripts allow-downloads; default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; object-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'; connect-src 'none'";
 
 mod assets;
 mod center;
@@ -92,6 +93,7 @@ pub fn routes() -> Router<ApiState> {
             post(call_route).layer(DefaultBodyLimit::max(MAX_ROUTE_REQUEST_BYTES)),
         )
         .route("/plugins/{id}/composer/admit", post(admit_composer))
+        .route("/plugins/{id}/views/admit", post(admit_view))
         .route("/plugins/{id}/settings/schema", get(settings_schema))
         .route(
             "/plugins/{id}/resources/{resource}",
@@ -258,7 +260,20 @@ fn resource_response(
         .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
     response.headers_mut().insert(
         "content-security-policy",
-        HeaderValue::from_static(VIEW_CONTENT_SECURITY_POLICY),
+        HeaderValue::from_static(
+            if manager
+                .permission_allowed(
+                    id,
+                    magi_plugin_system::PluginPermissionKind::Extension,
+                    "full-trust",
+                )
+                .map_err(plugin_error)?
+            {
+                TRUSTED_VIEW_CONTENT_SECURITY_POLICY
+            } else {
+                VIEW_CONTENT_SECURITY_POLICY
+            },
+        ),
     );
     response.headers_mut().insert(
         "x-content-type-options",
@@ -299,6 +314,46 @@ async fn call_route(
         .clone()
         .ok_or_else(|| ApiError::Conflict("扩展宿主未运行".into()))?;
     executor.call(id, request).await.map(Json)
+}
+
+/// 可见消息投影归原 Renderer；daemon 校验当前包及会话视图的独立读取授权。
+async fn admit_view(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(request): Json<magi_app_server_protocol::generated::PluginViewAdmissionRequest>,
+) -> Result<StatusCode, ApiError> {
+    use magi_app_server_protocol::PluginViewPlacement;
+    let manager = locked(&state, "校验插件会话视图授权")?;
+    if !matches!(
+        request.placement,
+        PluginViewPlacement::ComposerLeft | PluginViewPlacement::ChatAssistant
+    ) || !manager.is_active(&id).map_err(plugin_error)?
+        || !manager
+            .permission_allowed(
+                &id,
+                magi_plugin_system::PluginPermissionKind::SessionRead,
+                "render",
+            )
+            .map_err(plugin_error)?
+    {
+        return Err(ApiError::Forbidden(
+            "插件未激活或缺少会话视图读取授权".into(),
+        ));
+    }
+    let package = manager.package(&id).map_err(plugin_error)?;
+    if package.digest() != request.expected_digest {
+        return Err(ApiError::Conflict("插件页面属于旧版安装包".into()));
+    }
+    if !package
+        .manifest()
+        .contributions
+        .views
+        .iter()
+        .any(|view| view.entry == request.entry && view.placements.contains(&request.placement))
+    {
+        return Err(ApiError::Forbidden("插件未声明此会话视图位置".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// 输入草稿仍由当前 Renderer 的 InputArea 拥有；daemon 裁决调用插件的版本与授权。
@@ -671,37 +726,52 @@ async fn authorize(
     Json(request): Json<AuthorizeRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .authorize(&id, request.grants, None, None)
+        .authorize(&id, request.grants, None, request.expected_digest.as_deref())
         .await?;
     snapshot(&state, &*locked(&state, "读取授权结果")?)
 }
 async fn enable(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    Json(_request): Json<ActivationRequest>,
+    Json(request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .lifecycle("enable", &id, None, Default::default())
+        .lifecycle(
+            "enable",
+            &id,
+            None,
+            operations::LifecycleChange::for_digest(request.expected_digest.as_deref()),
+        )
         .await?;
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
 async fn activate(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    Json(_request): Json<ActivationRequest>,
+    Json(request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .lifecycle("activate", &id, None, Default::default())
+        .lifecycle(
+            "activate",
+            &id,
+            None,
+            operations::LifecycleChange::for_digest(request.expected_digest.as_deref()),
+        )
         .await?;
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
 async fn deactivate(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    Json(_request): Json<ActivationRequest>,
+    Json(request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .lifecycle("deactivate", &id, None, Default::default())
+        .lifecycle(
+            "deactivate",
+            &id,
+            None,
+            operations::LifecycleChange::for_digest(request.expected_digest.as_deref()),
+        )
         .await?;
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
@@ -709,10 +779,15 @@ async fn deactivate(
 async fn disable(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    Json(_request): Json<ActivationRequest>,
+    Json(request): Json<ActivationRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .lifecycle("disable", &id, None, Default::default())
+        .lifecycle(
+            "disable",
+            &id,
+            None,
+            operations::LifecycleChange::for_digest(request.expected_digest.as_deref()),
+        )
         .await?;
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
@@ -1145,19 +1220,110 @@ mod tests {
 
     #[tokio::test]
     async fn view_resources_carry_a_response_level_sandbox() {
+        for trusted in [false, true] {
+            let mut manifest = serde_json::json!({
+                "sdkVersion": 2,
+                "id": "acme.viewer",
+                "version": "1.0.0",
+                "name": "Viewer",
+                "description": "",
+                "permissions": [],
+                "dataSchemaVersion": 1,
+                "settingsSchema": {"type":"object","additionalProperties":false},
+                "contributions": {"views":[{
+                    "id": "page", "title": "Page", "entry": "ui/index.html",
+                    "placements": ["main"]
+                }]}
+            });
+            if trusted {
+                manifest["extension"] = serde_json::json!({"hooks":[]});
+                manifest["permissions"] =
+                    serde_json::json!([{"kind":"extension","targets":["full-trust"]}]);
+            }
+            let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+            for (name, bytes) in [
+                ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
+                ("ui/index.html", b"<!doctype html><title>x</title>".to_vec()),
+            ] {
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(&bytes).unwrap();
+            }
+            if trusted {
+                writer
+                    .start_file(
+                        "extension/index.mjs",
+                        zip::write::SimpleFileOptions::default(),
+                    )
+                    .unwrap();
+                writer.write_all(b"export default () => {};").unwrap();
+            }
+            let package =
+                PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let mut manager = PluginManager::open(root.path()).unwrap();
+            manager
+                .install(
+                    &package,
+                    PluginSource::Local {
+                        name: "viewer.zip".into(),
+                    },
+                )
+                .unwrap();
+            manager.enable("acme.viewer").unwrap();
+            manager
+                .authorize("acme.viewer", package.manifest().permissions.clone())
+                .unwrap();
+            manager.activate("acme.viewer").unwrap();
+            let state = ApiState::new(
+                "magi-test",
+                Arc::new(magi_event_bus::InMemoryEventBus::new(32)),
+                Arc::new(SessionStore::default()),
+                Arc::new(WorkspaceStore::default()),
+                Arc::new(GovernanceService::default()),
+            )
+            .with_plugin_manager(Arc::new(std::sync::Mutex::new(manager)));
+            let response = routes()
+                .with_state(state)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/plugins/acme.viewer/ui/index.html")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let csp = response
+                .headers()
+                .get("content-security-policy")
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(
+                csp.starts_with("sandbox allow-scripts allow-downloads;"),
+                "{csp}"
+            );
+            assert!(!csp.contains("allow-same-origin"), "{csp}");
+            assert!(!csp.contains("allow-popups"), "{csp}");
+            assert!(csp.contains("connect-src 'none'"), "{csp}");
+            assert!(csp.contains("img-src 'self' data: blob:"), "{csp}");
+            assert!(csp.contains("object-src 'none'"), "{csp}");
+            assert_eq!(csp.contains("unsafe-eval"), trusted);
+            drop(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_view_admission_binds_grant_digest_and_declared_placement() {
+        let root = tempfile::tempdir().unwrap();
+        let state = bare_state(root.path());
         let manifest = serde_json::json!({
-            "sdkVersion": 2,
-            "id": "acme.viewer",
-            "version": "1.0.0",
-            "name": "Viewer",
-            "description": "",
-            "permissions": [],
-            "dataSchemaVersion": 1,
-            "settingsSchema": {"type":"object","additionalProperties":false},
-            "contributions": {"views":[{
-                "id": "page", "title": "Page", "entry": "ui/index.html",
-                "placements": ["main"]
-            }]}
+            "sdkVersion":2,"id":"acme.conversation","version":"1.0.0","name":"Conversation","description":"",
+            "dataSchemaVersion":1,"settingsSchema":{"type":"object"},
+            "permissions":[{"kind":"sessionRead","targets":["render"]}],
+            "contributions":{"views":[{"id":"reply","title":"Reply","entry":"ui/index.html","placements":["chatAssistant"]}]}
         });
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         for (name, bytes) in [
@@ -1170,54 +1336,55 @@ mod tests {
             writer.write_all(&bytes).unwrap();
         }
         let package = PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let mut manager = PluginManager::open(root.path()).unwrap();
-        manager
-            .install(
-                &package,
-                PluginSource::Local {
-                    name: "viewer.zip".into(),
-                },
-            )
-            .unwrap();
-        manager.enable("acme.viewer").unwrap();
-        manager.authorize("acme.viewer", Vec::new()).unwrap();
-        manager.activate("acme.viewer").unwrap();
-        let state = ApiState::new(
-            "magi-test",
-            Arc::new(magi_event_bus::InMemoryEventBus::new(32)),
-            Arc::new(SessionStore::default()),
-            Arc::new(WorkspaceStore::default()),
-            Arc::new(GovernanceService::default()),
-        )
-        .with_plugin_manager(Arc::new(std::sync::Mutex::new(manager)));
-        let response = routes()
-            .with_state(state)
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/plugins/acme.viewer/ui/index.html")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let csp = response
-            .headers()
-            .get("content-security-policy")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(
-            csp.starts_with("sandbox allow-scripts allow-downloads;"),
-            "{csp}"
+        {
+            let mut manager = state.plugin_manager.lock().unwrap();
+            manager
+                .install(
+                    &package,
+                    PluginSource::Local {
+                        name: "conversation.zip".into(),
+                    },
+                )
+                .unwrap();
+            manager.enable("acme.conversation").unwrap();
+        }
+        let endpoint = "/plugins/acme.conversation/views/admit";
+        let request = serde_json::json!({"expectedDigest":package.digest(),"entry":"ui/index.html","placement":"chatAssistant"});
+        assert_eq!(
+            post_json(&state, endpoint, request.clone()).await.0,
+            StatusCode::FORBIDDEN
         );
-        assert!(!csp.contains("allow-same-origin"), "{csp}");
-        assert!(!csp.contains("allow-popups"), "{csp}");
-        assert!(csp.contains("connect-src 'none'"), "{csp}");
-        assert!(csp.contains("img-src 'self' data: blob:"), "{csp}");
-        assert!(csp.contains("object-src 'none'"), "{csp}");
-        drop(root);
+        {
+            let mut manager = state.plugin_manager.lock().unwrap();
+            manager
+                .authorize("acme.conversation", package.manifest().permissions.clone())
+                .unwrap();
+            manager.activate("acme.conversation").unwrap();
+        }
+        assert_eq!(
+            post_json(&state, endpoint, request.clone()).await.0,
+            StatusCode::NO_CONTENT
+        );
+        for (field, value, status) in [
+            ("expectedDigest", "0".repeat(64), StatusCode::CONFLICT),
+            ("entry", "ui/other.html".into(), StatusCode::FORBIDDEN),
+            ("placement", "composerLeft".into(), StatusCode::FORBIDDEN),
+            ("placement", "rightPane".into(), StatusCode::FORBIDDEN),
+        ] {
+            let mut changed = request.clone();
+            changed[field] = serde_json::json!(value);
+            assert_eq!(post_json(&state, endpoint, changed).await.0, status);
+        }
+        state
+            .plugin_manager
+            .lock()
+            .unwrap()
+            .deactivate("acme.conversation")
+            .unwrap();
+        assert_eq!(
+            post_json(&state, endpoint, request).await.0,
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]
@@ -1489,6 +1656,71 @@ mod tests {
         assert_eq!(plugin["active"], false);
         assert_eq!(plugin["grants"], serde_json::json!([]));
         assert_eq!(plugin["source"]["kind"], "local");
+        // 旧页即使权限清单相同，也不能替新摘要授权或改变新版启停。
+        let before = state.plugin_manager.lock().unwrap().state().clone();
+        let old_digest = package().digest().to_string();
+        for action in ["authorize", "enable", "activate", "deactivate", "disable"] {
+            let mut input = serde_json::json!({"expectedDigest": old_digest});
+            if action == "authorize" {
+                input["grants"] = plugin["manifest"]["permissions"].clone();
+            }
+            let (status, error) =
+                post_json(&state, &format!("/plugins/acme.resources/{action}"), input).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{action}: {error}");
+            assert_eq!(state.plugin_manager.lock().unwrap().state(), &before);
+        }
+        let current = serde_json::json!({"expectedDigest": plugin["digest"]});
+        assert_eq!(
+            post_json(&state, "/plugins/acme.resources/activate", current.clone())
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let grants = serde_json::json!({"expectedDigest":plugin["digest"],"grants":plugin["manifest"]["permissions"]});
+        assert_eq!(
+            post_json(&state, "/plugins/acme.resources/authorize", grants)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_json(&state, "/plugins/acme.resources/activate", current.clone())
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_json(
+                &state,
+                "/plugins/acme.resources/deactivate",
+                serde_json::json!({"expectedDigest":old_digest})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert!(
+            state
+                .plugin_manager
+                .lock()
+                .unwrap()
+                .is_active("acme.resources")
+                .unwrap()
+        );
+        assert_eq!(
+            post_json(&state, "/plugins/acme.resources/deactivate", current)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert!(
+            !state
+                .plugin_manager
+                .lock()
+                .unwrap()
+                .is_active("acme.resources")
+                .unwrap()
+        );
         drop(root);
     }
 

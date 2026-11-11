@@ -19,7 +19,6 @@ import type {
   AppState,
   WebviewPersistedState,
   PersistedSessionViewState,
-  WaveState,
   RequestResponseBinding,
   RetryRuntimeState,
   ModelStatusMap,
@@ -46,7 +45,6 @@ import {
 import type { SettingsBootstrapSnapshot } from '../shared/settings-bootstrap';
 import type { RoleTemplate } from '../shared/types/role-templates';
 import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
-import { shouldUseHostProxyTransport } from '../shared/transport';
 import { hasPendingToolApproval, toolApprovalState } from './tool-approval-store.svelte';
 import { hasPendingUserQuestion } from './user-question-store.svelte';
 import {
@@ -126,10 +124,6 @@ export const messagesState = $state({
 
   // Tab 状态
   currentTopTab: 'thread' as TabType,
-  messageJump: {
-    messageId: null as string | null,
-    nonce: 0,
-  },
 
   // 消息状态
   canonicalTimelineProjection: null as SessionTimelineProjection | null,
@@ -208,8 +202,6 @@ export const messagesState = $state({
     thread: true,
   } as AutoScrollConfig,
 });
-
-const IS_HOSTED_WEBVIEW = shouldUseHostProxyTransport();
 
 const MAX_PERSISTED_ARRAY_LENGTH = 10000;
 const WEBVIEW_STATE_SAVE_DEBOUNCE_MS = 120;
@@ -743,42 +735,20 @@ function normalizeOrchestratorRuntimeState(
   const sessionId = typeof input.sessionId === 'string' && input.sessionId.trim().length > 0
     ? input.sessionId.trim()
     : undefined;
-  const requestId = typeof input.requestId === 'string' && input.requestId.trim().length > 0
-    ? input.requestId.trim()
-    : undefined;
-  const statusReason = typeof input.statusReason === 'string' && input.statusReason.trim().length > 0
-    ? input.statusReason.trim()
+  const turnId = typeof input.turnId === 'string' && input.turnId.trim().length > 0
+    ? input.turnId.trim()
     : undefined;
   const continuation = input.continuation === 'resume_chain' || input.continuation === 'resume_turn'
     ? input.continuation
     : undefined;
-  const runtimeReason = typeof input.runtimeReason === 'string' && input.runtimeReason.trim().length > 0
-    ? input.runtimeReason.trim()
-    : undefined;
-  const failureReason = typeof input.failureReason === 'string' && input.failureReason.trim().length > 0
-    ? input.failureReason.trim()
-    : undefined;
-  const errors = Array.isArray(input.errors)
-    ? input.errors
-      .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-      .map((item) => item.trim())
-    : [];
   const runtimeSnapshot = input.runtimeSnapshot && typeof input.runtimeSnapshot === 'object'
     ? JSON.parse(JSON.stringify(input.runtimeSnapshot))
     : null;
-  const runtimeDecisionTrace = Array.isArray(input.runtimeDecisionTrace)
-    ? input.runtimeDecisionTrace
-      .filter((entry) => entry && typeof entry === 'object')
-      .map((entry) => JSON.parse(JSON.stringify(entry)))
-    : [];
   const assignments = Array.isArray(input.assignments)
     ? input.assignments
       .filter((entry) => entry && typeof entry === 'object')
       .map((entry) => JSON.parse(JSON.stringify(entry)))
     : [];
-  const chain = input.chain && typeof input.chain === 'object'
-    ? JSON.parse(JSON.stringify(input.chain))
-    : undefined;
   const startedAt = typeof input.startedAt === 'number' && Number.isFinite(input.startedAt) && input.startedAt > 0
     ? Math.floor(input.startedAt)
     : undefined;
@@ -791,21 +761,15 @@ function normalizeOrchestratorRuntimeState(
   return {
     status,
     phase,
-    errors,
     statusChangedAt,
     lastEventAt,
     assignments,
     ...(sessionId ? { sessionId } : {}),
-    ...(requestId ? { requestId } : {}),
-    ...(chain ? { chain } : {}),
-    ...(statusReason ? { statusReason } : {}),
+    ...(turnId ? { turnId } : {}),
     ...(continuation ? { continuation } : {}),
-    ...(runtimeReason ? { runtimeReason } : {}),
-    ...(failureReason ? { failureReason } : {}),
     ...(startedAt ? { startedAt } : {}),
     ...(endedAt ? { endedAt } : {}),
     runtimeSnapshot,
-    runtimeDecisionTrace,
     ...(opsView ? { opsView } : {}),
   };
 }
@@ -943,9 +907,6 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
   messagesState.isProcessing = nextIsProcessing;
   saveCurrentExecutionProjection();
 }
-
-// Wave 执行状态（提案 4.6）
-let waveState = $state<WaveState | null>(null);
 
 // 请求-响应绑定状态（消息响应流设计）
 let requestBindings = $state<Map<string, RequestResponseBinding>>(new Map());
@@ -1180,10 +1141,6 @@ export function getQueuedMessages() {
   return messagesState.queuedMessages;
 }
 
-export function hasQueuedMessagesAcrossSessions(): boolean {
-  return messagesState.queuedMessages.length > 0;
-}
-
 export function getToasts() {
   return toasts;
 }
@@ -1274,7 +1231,6 @@ function syncEditsFromAppState(nextState: AppState | null): void {
 export function getState() {
   return {
     get currentTopTab() { return messagesState.currentTopTab; },
-    get messageJump() { return messagesState.messageJump; },
     get canonicalTimelineProjection() { return messagesState.canonicalTimelineProjection; },
     get threadMessages() { return messageProjection.thread; },
     get sessions() { return messagesState.workspaceSessionProjection.sessions; },
@@ -1311,9 +1267,6 @@ export function getState() {
     // 角色驱动 Tab 状态
     get enabledAgents() { return enabledAgents; },
     set enabledAgents(v) { enabledAgents = v; },
-    // Wave 状态（提案 4.6）
-    get waveState() { return waveState; },
-    set waveState(v) { waveState = v; },
   };
 }
 
@@ -1420,7 +1373,7 @@ function resetSessionScopedExecutionState(sessionId: string | null): void {
   }
 }
 
-// 保存状态到 VS Code
+// 保存会话视图状态
 function saveWebviewState() {
   if (webviewStateBatchDepth > 0) {
     webviewStateBatchPending = true;
@@ -1446,9 +1399,9 @@ function saveWebviewState() {
   }
 }
 
-// 非 hosted webview 环境（独立 web 客户端）注册 beforeunload 同步保存，
+// 注册 beforeunload 同步保存，
 // 防止短暂的 debounce 窗口内刷新丢失数据。
-if (!IS_HOSTED_WEBVIEW && typeof window !== 'undefined') {
+if (typeof window !== 'undefined') {
   window.addEventListener('beforeunload', () => {
     if (deferredWebviewStateSaveTimer) {
       clearTimeout(deferredWebviewStateSaveTimer);
@@ -1535,23 +1488,6 @@ export function updatePanelScrollState(
 export function setCurrentTopTab(tab: TabType) {
   messagesState.currentTopTab = tab;
   saveWebviewState();
-}
-
-export function requestMessageJump(messageId: string): void {
-  const normalized = typeof messageId === 'string' ? messageId.trim() : '';
-  if (!normalized) return;
-  messagesState.messageJump = {
-    messageId: normalized,
-    nonce: messagesState.messageJump.nonce + 1,
-  };
-}
-
-export function clearMessageJump(): void {
-  if (!messagesState.messageJump.messageId) return;
-  messagesState.messageJump = {
-    messageId: null,
-    nonce: messagesState.messageJump.nonce,
-  };
 }
 
 // 会话操作
@@ -1968,16 +1904,6 @@ export function hasActiveLocalTimelineTurn(): boolean {
   return messagesState.isProcessing || timelineHasStreamingMessage();
 }
 
-export function markMessageActive(id: string) {
-  if (!id) return;
-  if (!messagesState.activeMessageIds.has(id)) {
-    const next = new Set(messagesState.activeMessageIds);
-    next.add(id);
-    messagesState.activeMessageIds = next;
-    saveCurrentExecutionProjection();
-  }
-}
-
 export function markMessageComplete(id: string) {
   if (!id) return;
   if (messagesState.activeMessageIds.has(id)) {
@@ -2352,11 +2278,6 @@ export function clearProcessingState() {
   clearAllRetryRuntime();
   updateProcessingState();
   saveCurrentExecutionProjection();
-}
-
-/** 获取后端处理状态（用于时序判断） */
-export function getBackendProcessing(): boolean {
-  return messagesState.backendProcessing;
 }
 
 export function clearPendingInteractions() {
@@ -2737,16 +2658,10 @@ export function clearAllMessages(options: {
   messagesState.queuedMessages = [];
   messagesState.editingTurn = null;
   setContinueSubmissionPending(null, false);
-  messagesState.messageJump = {
-    messageId: null,
-    nonce: messagesState.messageJump.nonce,
-  };
   if (options.preserveExecutionState !== true) {
     clearPendingInteractions();
     clearProcessingState();
   }
-  // 会话级运行时状态：会话切换时必须清理，避免旧数据泄漏到新会话
-  waveState = null;
   if (options.resetPanelState !== false) {
     resetPanelScrollRuntimeState();
   }
@@ -3013,26 +2928,6 @@ export function initializeState() {
     clearProcessingState();
     saveWebviewState();
   }
-}
-
-// ============ Wave 状态操作（提案 4.6） ============
-
-export function setWaveState(state: WaveState | null) {
-  waveState = state;
-}
-
-export function updateWaveProgress(waveIndex: number, status: WaveState['status']) {
-  if (waveState) {
-    waveState = {
-      ...waveState,
-      currentWave: waveIndex,
-      status,
-    };
-  }
-}
-
-export function clearWaveState() {
-  waveState = null;
 }
 
 // ============ 请求-响应绑定操作（消息响应流设计） ============

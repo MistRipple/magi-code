@@ -23,6 +23,7 @@
 
 - `apps/desktop` 是 Windows、Linux、macOS 的 Electron/Chromium 桌面产品入口，负责原生窗口、单实例、布局和进程生命周期。主 Renderer 管理右栏 DOM；当前 Browser Tab 在右栏内容槽中渲染唯一的真实 Electron `<webview>`，Main 只负责 guest WebContents 生命周期与自动化控制，不参与浏览器内容几何映射。
 - `magi-daemon` 是唯一业务内核。桌面端通过受控 sidecar 启动它，Magi UI 与内置浏览器共用同一 Chromium Desktop Host；浏览器自动化通过私有 Desktop Control 协议接管当前 Browser WebContents。
+- 模型调用使用正式 `HttpModelBridgeClient` 与既有 Provider adapter。重构期的模型/MCP loopback 二进制、模拟 MCP 注册表、独立 curl 请求实现及 `/bridges/services`、`/bridges/preflight`、`/bridges/cutover-smoke` 探测接口已撤下；配置检查沿设置页连接测试和正式模型链路。真实 MCP 使用设置或显式环境配置的 stdio/HTTP 客户端；未配置目标明确失败，不回落到模拟 echo 服务。
 - 主窗口关闭后默认隐藏到系统托盘，daemon 继续运行；只有托盘中的“退出 Magi”或操作系统显式退出动作会触发优雅关闭。
 - `magi-daemon-app` 承载开发、无头部署及桌面包中的 daemon sidecar 入口；业务实现复用 `magi-daemon`，不复制 Electron 宿主逻辑。
 - 扩展宿主：每个激活的可执行插件由 daemon 直接托管一个独立 Node 进程；Node 随产品携带固定版本、不依赖用户 PATH，Desktop 与无头入口使用同一合同，不经 Electron utilityProcess。插件以用户权限运行，业务提案经 daemon 内唯一的 ExtensionBus 裁决，资源/设置服务复用插件管理器的授权和版本事实，设计见[插件系统设计](plugin-system-requirements-design.md)。发行包把固定版本 Node（版本与各平台归档摘要固定在 `apps/desktop/node-runtime.json`）放在 `daemon/node/`，daemon 只在自身同级 `node/` 目录查找，不读用户 PATH；开发时可用 `node apps/desktop/scripts/node-runtime.mjs stage <目录>` 准备同一份 Node，并设置 `MAGI_EXTENSION_NODE` 指向它。
@@ -59,9 +60,7 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 - [项目与多源文件夹改造任务计划](project-multi-root-task-plan.md)：项目下统一会话、多本机目录、权限、Git/隔离、迁移与验收范围。当前独立 worktree 已接通主要产品链路；阶段证据、未验证平台和外部服务边界见[实现记录](project-multi-root-implementation.md)，不能把本机通过视为全部退出条件已满足。
 
 - [子代理唤起设计与改造](subagent-delegation-design.md)：默认主线执行、四种委派目的、派发前决策合同、唯一预检和验收边界。
-- [运行时改造收敛审计](runtime-consolidation-audit.md)：当前变更范围、移除项、冻结项和继续修改门槛。
-
-- [Magi 产品与 Agent 运行时演进方案](./magi-agent-runtime-evolution-plan.md)：2026-10-16 起分阶段实施，基于当前源码与 Claude Code、Codex CLI、DeepSeek Harness、ZCode 的一手资料，涵盖输入/队列/引导、主子代理工具权限、统一运行时和分阶段迁移。方案保留目标与退出条件；当前保留、移除和未验收范围见收敛审计。
+- [运行时边界与演进门槛](./magi-agent-runtime-evolution-plan.md)：产品范围、事实所有权、插件与子代理边界，以及后续修改和清退旧路径的要求。
 
 - 简单事走会话流和工具证据，不生成额外抽屉
 - 多步骤工作进入目标模式，目标抽屉承载目标内容、状态与操作
@@ -91,6 +90,8 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 升级前应先退出 Desktop 并停止使用该状态根的 daemon，再备份完整状态根（默认 `~/.magi`，以实际 `MAGI_STATE_ROOT` 为准），以及各旧源目录中的 `.magi`；源代码和未合入副本也应按原有备份策略保留。迁移写入新布局后，不能通过修改或删除 `state-layout.json` 让旧版程序继续写入。需要回退时，先停止新版、另存升级后的完整状态与成果，再在独立位置恢复升级前的整套备份并使用旧版启动；升级后的新会话和修改不会自动合并进旧备份。迁移清单和旧源目录中保留的文件是恢复输入，不能替代完整升级前备份。
 
 ## 架构与维护文档
+
+- [全项目整理计划](project-cleanup-plan.md)：本轮全仓清理的阶段、覆盖记录、完成结果、保留理由和未验收边界。
 
 - [UX/UI 设计与开发规范](ux-ui-guidelines.md)：后续界面工作的统一基线，涵盖自适应布局、控件分工、文案与多语言/RTL、移动触摸、关键动画、代理展示、组件示例及验收清单；规范要求不代表全项目已经完成合规改造。
 

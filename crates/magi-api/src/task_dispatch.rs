@@ -434,7 +434,8 @@ pub fn submit_dispatch_submission(
     let graph = DispatchSubmissionGraph::new(
         pending.task.task_id.clone(),
         pending.task.task_id,
-        Some(pending.active_execution_chain),
+        pending.active_execution_chain,
+        pending.turn,
     );
     match accept_dispatch_submission(
         &state.session_store,
@@ -1345,7 +1346,7 @@ pub(crate) fn schedule_session_task_dispatch(
 
 /// daemon 重启后恢复已经 durable accepted、但尚未开始 Runner 的主线 Turn。
 ///
-/// 只恢复 `accepted/preparing + pending root task`，已经进入模型执行的轮次仍由
+/// 准备阶段经 canonical 投影为 accepted/running；只恢复 root task 仍为 Pending 的轮次，已经进入模型执行的轮次仍由
 /// daemon 的中断收口逻辑处理，避免重复发送上游请求。
 pub fn schedule_restored_session_task_dispatches(state: ApiState) {
     let Some(task_store) = state.task_store() else {
@@ -1357,7 +1358,7 @@ pub fn schedule_restored_session_task_dispatches(state: ApiState) {
         .into_iter()
         .filter_map(|sidecar| {
             let turn = sidecar.current_turn.as_ref()?;
-            if !matches!(turn.status.as_str(), "accepted" | "preparing") {
+            if !matches!(turn.status.as_str(), "accepted" | "running") {
                 return None;
             }
             let chain = sidecar.active_execution_chain.as_ref()?;
@@ -1650,6 +1651,51 @@ mod tests {
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn personal_mapping_uses_existing_physical_root_without_materializing_missing_directories()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state");
+        std::fs::create_dir(&root).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let state =
+            test_state().with_runtime_persistence(Arc::new(crate::RuntimeStatePersistence::new(
+                &alias,
+                alias.join("workspaces.json"),
+                alias.join("knowledge.json"),
+            )));
+        let session = SessionId::new("personal-mapping");
+        let path = state.personal_session_execution_root_path(&session);
+        assert_eq!(
+            path,
+            std::fs::canonicalize(&root)
+                .unwrap()
+                .join("personal-sessions/personal-mapping")
+        );
+        let prepare = super::workspace_execution_preparer(&state);
+        let inspect =
+            move || {
+                prepare(&session, &None, "mapping-only", None,
+            magi_conversation_runtime::workspace_execution::WorkspacePreparationMode::Mapping)
+            };
+        let (inspect, missing) = tokio::task::spawn_blocking(move || {
+            let missing = inspect().unwrap().personal_root;
+            (inspect, missing)
+        })
+        .await
+        .unwrap();
+        assert_eq!(missing.as_ref(), Some(&path));
+        assert!(!path.exists(), "映射读取不能创建新的执行目录");
+        std::fs::create_dir_all(&path).unwrap();
+        let existing = tokio::task::spawn_blocking(inspect).await.unwrap().unwrap();
+        assert_eq!(
+            existing.personal_root,
+            Some(std::fs::canonicalize(&path).unwrap())
+        );
     }
 
     #[tokio::test]

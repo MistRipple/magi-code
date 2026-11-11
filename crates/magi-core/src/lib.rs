@@ -47,9 +47,8 @@ pub use public_text::{
     public_runtime_excerpt, public_runtime_summary, public_runtime_text,
 };
 pub use status::{
-    ApprovalRequirement, AssignmentLifecycleStatus, DispatchReason, ExecutionResultStatus,
-    MissionLifecycleStatus, RiskLevel, SessionLifecycleStatus, TaskResultKind, TerminationReason,
-    VerificationStatus, WorkerLifecycleStatus, WorkspaceLifecycleStatus,
+    ApprovalRequirement, ExecutionResultStatus, RiskLevel, SessionLifecycleStatus,
+    WorkspaceLifecycleStatus,
 };
 pub use task::{
     AccessProfile, AgentContextAccessOperation, AgentContextAccessRecord, AgentContextFork,

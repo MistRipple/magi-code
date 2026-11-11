@@ -110,19 +110,6 @@ impl SettingsStore {
         Ok(())
     }
 
-    /// 将当前设置保存到磁盘 JSON 文件（原子写入）
-    pub fn save_to_disk(&self) -> Result<(), std::io::Error> {
-        let path = match &self.persistence_path {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let sections = self.sections.read().unwrap();
-        Self::save_sections(path, &sections)
-    }
-
     fn save_sections(path: &Path, sections: &HashMap<String, Value>) -> Result<(), std::io::Error> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;

@@ -274,16 +274,6 @@ impl AuditUsageLedgerSnapshot {
         last(&self.audit_entries).max(last(&self.usage_entries))
     }
 
-    pub fn validate_schema(&self) -> Result<(), AuditUsageLedgerError> {
-        if self.schema_version != AUDIT_USAGE_LEDGER_SCHEMA_VERSION {
-            return Err(AuditUsageLedgerError::SchemaMismatch {
-                expected: AUDIT_USAGE_LEDGER_SCHEMA_VERSION.to_string(),
-                actual: self.schema_version.clone(),
-            });
-        }
-        Ok(())
-    }
-
     pub fn audit_count(&self) -> usize {
         self.audit_entries.len()
     }

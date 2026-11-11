@@ -8,12 +8,6 @@ import { promisify } from "node:util";
 import { downloadArtifact } from "@electron/get";
 import { extract as extractZip } from "@electron-internal/extract-zip";
 import { build as esbuild } from "esbuild";
-import {
-  assertBridgeBinaries,
-  bridgeBinaryNames,
-  bridgeBinaryPath,
-  runBridgePreflight,
-} from "./bridge-preflight.mjs";
 import { nodeRuntimeFileName, readNodeRuntimePin, runNodeRuntimePreflight, stageNodeRuntime } from "./node-runtime.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -106,16 +100,11 @@ export async function buildDaemon(profile) {
     "--locked",
     "-p",
     "magi-daemon-app",
-    "-p",
-    "magi-bridge-client",
     "--bins",
   ];
   if (profile === "release") args.push("--release");
   await run("cargo", args, repositoryRoot);
-  await Promise.all([
-    assertFile(daemonBinary(profile), "Rust daemon sidecar"),
-    assertBridgeBinaries(bridgeBinariesRoot(profile), `Rust ${profile} bridge`),
-  ]);
+  await assertFile(daemonBinary(profile), "Rust daemon sidecar");
 }
 
 export function daemonBinary(profile) {
@@ -147,13 +136,6 @@ export async function prepareReleaseMetadata() {
 
   const files = [];
   await appendFileHash(files, daemonBinary("release"), daemonResourcePath());
-  for (const binaryName of bridgeBinaryNames) {
-    await appendFileHash(
-      files,
-      bridgeBinary("release", binaryName),
-      bridgeResourcePath(binaryName),
-    );
-  }
   await appendFileHash(files, join(nodeRuntimeDist, nodeRuntimeFileName), `daemon/node/${nodeRuntimeFileName}`);
   await appendFileHash(files, join(workerDist, "index.cjs"), "browser-automation-worker/index.cjs");
   await appendTreeHashes(files, compatRuntimeDist, "daemon/compat");
@@ -174,15 +156,6 @@ export async function prepareReleaseMetadata() {
       ...(await componentHash(join(nodeRuntimeDist, nodeRuntimeFileName), `daemon/node/${nodeRuntimeFileName}`)),
       version: (await readNodeRuntimePin()).version,
     },
-    bridgeBinaries: Object.fromEntries(
-      await Promise.all(bridgeBinaryNames.map(async (binaryName) => [
-        binaryName,
-        await componentHash(
-          bridgeBinary("release", binaryName),
-          bridgeResourcePath(binaryName),
-        ),
-      ])),
-    ),
   };
 
   const manifest = {
@@ -242,14 +215,12 @@ export async function assertReleaseInputs() {
     assertFile(join(webDist, "web.html"), "Web Renderer"),
     assertFile(daemonBinary("release"), "Rust daemon sidecar"),
     assertFile(join(desktopDist, "resources", "browser-capability-manifest.json"), "能力清单"),
-    assertBridgeBinaries(bridgeBinariesRoot("release"), "Rust release bridge"),
     assertFile(join(nodeRuntimeDist, nodeRuntimeFileName), "随包 Node"),
     assertFile(join(compatRuntimeDist, "cli.mjs"), "上游插件翻译运行时"),
     assertFile(join(compatRuntimeDist, "dist", "dsh-client-host.js"), "上游插件页面运行时"),
     assertFile(join(compatRuntimeDist, "dist", "translation-runtime.json"), "插件运行组件版本"),
   ]);
   await runNodeRuntimePreflight(nodeRuntimeDist);
-  await runBridgePreflight(bridgeBinariesRoot("release"), "Rust release bridge");
 }
 
 /** 准备扩展宿主使用的固定版本 Node（归档摘要固定在 node-runtime.json）。 */
@@ -266,7 +237,7 @@ export async function stageCompatRuntime() {
   const source = join(repositoryRoot, "scripts", "compat");
   await rm(compatRuntimeDist, { recursive: true, force: true });
   await mkdir(compatRuntimeDist, { recursive: true });
-  const entries = ["cli.mjs", "index.mjs", "core", "dsh", "pi", "runtime", "install", "package.json", "package-lock.json"];
+  const entries = ["cli.mjs", "core", "dsh", "runtime", "install", "package.json", "package-lock.json"];
   for (const entry of entries) {
     await cp(join(source, entry), join(compatRuntimeDist, entry), { recursive: true, dereference: false });
   }
@@ -328,14 +299,6 @@ export async function assertFile(path, label) {
   } catch (cause) {
     throw new Error(`${label}不存在: ${path}`, { cause });
   }
-}
-
-export function bridgeBinariesRoot(profile) {
-  return join(repositoryRoot, "target", profile);
-}
-
-export function bridgeBinary(profile, binaryName) {
-  return bridgeBinaryPath(bridgeBinariesRoot(profile), binaryName);
 }
 
 async function readElectronVersions() {
@@ -627,10 +590,6 @@ async function walkFiles(root) {
 
 function daemonResourcePath() {
   return `daemon/${process.platform === "win32" ? "magi-daemon-app.exe" : "magi-daemon-app"}`;
-}
-
-function bridgeResourcePath(binaryName) {
-  return `daemon/${binaryName}${process.platform === "win32" ? ".exe" : ""}`;
 }
 
 function toPosix(path) {

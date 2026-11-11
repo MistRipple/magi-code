@@ -10,7 +10,6 @@ use crate::task_runner_bridge::{
 };
 use magi_agent_role::AgentRoleRegistry;
 use magi_core::{DomainError, SessionId, Task, TaskId, TaskStatus};
-use magi_event_bus::InMemoryEventBus;
 use magi_orchestrator::{
     task_store::TaskStore,
     task_worker_catalog::{WorkerInfo, resolve_task_role},
@@ -34,7 +33,6 @@ pub struct TaskRunner {
     dispatch_gate: Option<Arc<TaskDispatchGate>>,
     execution_admission: Arc<ExecutionAdmissionController>,
     session_id: Option<SessionId>,
-    event_bus: Option<Arc<InMemoryEventBus>>,
     checkpoint_signal: AtomicBool,
     first_dispatch_reported: AtomicBool,
     agent_role_registry: AgentRoleRegistry,
@@ -140,7 +138,6 @@ impl TaskRunner {
             dispatch_gate: None,
             execution_admission: Arc::new(ExecutionAdmissionController::default()),
             session_id: None,
-            event_bus: None,
             checkpoint_signal: AtomicBool::new(false),
             first_dispatch_reported: AtomicBool::new(false),
             agent_role_registry: AgentRoleRegistry::load_default(),
@@ -173,11 +170,6 @@ impl TaskRunner {
         provider: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
     ) -> Self {
         self.worker_catalog_provider = provider;
-        self
-    }
-
-    pub fn with_event_bus(mut self, event_bus: Arc<InMemoryEventBus>) -> Self {
-        self.event_bus = Some(event_bus);
         self
     }
 

@@ -44,17 +44,6 @@ export function buildConversationRuntimeRecords(
   }];
 }
 
-export function resolveCurrentConversationTurnStartedAt(
-  renderItems: readonly TimelineRenderItem[],
-): number | null {
-  const currentTurnMessages = resolveCurrentTurnMessages(renderItems);
-  if (currentTurnMessages.length === 0) return null;
-  const timestamps = currentTurnMessages
-    .map((message) => message.timestamp)
-    .filter((timestamp) => Number.isFinite(timestamp) && timestamp > 0);
-  return timestamps.length > 0 ? Math.min(...timestamps) : null;
-}
-
 function resolveCurrentTurnMessages(renderItems: readonly TimelineRenderItem[]): Message[] {
   let latestTurnSeq = Number.NEGATIVE_INFINITY;
   for (const item of renderItems) {

@@ -765,9 +765,9 @@ impl SessionConversationProjection {
             || acceptance
                 .session
                 .sidecar
-                .current_turn
-                .as_ref()
-                .is_none_or(|turn| turn.turn_id != acceptance.session.canonical_turn.turn_id)
+                .current_turn_id
+                .as_deref()
+                .is_none_or(|turn_id| turn_id != acceptance.session.canonical_turn.turn_id)
             || !self
                 .canonical_turns
                 .iter()

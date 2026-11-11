@@ -18,9 +18,8 @@ pub use path_guard::{PathAccess, PathGuard, PathRequest, PathViolation};
 pub use profile::{ApprovalMode, Disposition, Profile, ToolClass};
 pub use protocol::{JsonRpcRequest, MCP_PROTOCOL_VERSION};
 pub use server::{
-    AttributionRefusal, AttributionResolver, AttributionTarget, AuditEvent, AuditOutcome,
-    AuditSink, ClientPrincipal, ExternalOnlyAttribution, InvocationOutcome, McpServer, ToolBackend,
-    ToolInvocation, WorkspaceResolver,
+    AttributionTarget, AuditEvent, AuditOutcome, AuditSink, ClientPrincipal, InvocationOutcome,
+    McpServer, ToolBackend, ToolInvocation, WorkspaceResolver,
 };
 pub use token::{
     AttributionMode, AuthError, IssueTokenRequest, IssuedToken, TokenError, TokenPatch,

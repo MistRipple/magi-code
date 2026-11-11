@@ -25,6 +25,8 @@ let hasDelayedSlowProjection = false;
 const transferRequests = [];
 let releaseTransfer;
 let rejectTransfer = false;
+const delayedProjections = new Map();
+const delayedActions = new Map();
 
 class MemoryStorage {
   constructor() {
@@ -132,6 +134,11 @@ function installFetchStub(fetches, terminalAgentRunRootIds, actionRequests) {
     if (parsed.pathname.startsWith('/api/agent-runs/projection/')) {
       fetches.push(parsed);
       const rootTaskId = decodeURIComponent(parsed.pathname.split('/').pop() || '');
+      const delayed = delayedProjections.get(rootTaskId);
+      if (delayed) {
+        delayedProjections.delete(rootTaskId);
+        return delayed.promise;
+      }
       if (terminalAgentRunRootIds.has(rootTaskId)) {
         return new Response('not found', { status: 404 });
       }
@@ -147,6 +154,11 @@ function installFetchStub(fetches, terminalAgentRunRootIds, actionRequests) {
     if (parsed.pathname === '/api/agent-runs/action') {
       const payload = JSON.parse(String(init.body || '{}'));
       actionRequests.push(payload);
+      const delayed = delayedActions.get(payload.taskId);
+      if (delayed) {
+        delayedActions.delete(payload.taskId);
+        return delayed.promise;
+      }
       if (payload.action === 'archive') {
         return jsonResponse({
           action: 'archive',
@@ -205,6 +217,7 @@ installFetchStub(agentRunFetches, terminalAgentRunRootIds, actionRequests);
 await withGoldenViteServer(async (server) => {
   const bridgeRuntime = await server.ssrLoadModule('/src/shared/bridges/bridge-runtime.ts');
   const agentRunStore = await server.ssrLoadModule('/src/stores/agent-run-store.svelte.ts');
+  const { selectActiveAgentRunProjection } = await server.ssrLoadModule('/src/lib/active-agent-center.ts');
   const bridge = createBridge();
   bridgeRuntime.setClientBridge(bridge);
 
@@ -401,6 +414,28 @@ await withGoldenViteServer(async (server) => {
     '迟到的 404 不能将过期请求结论提交为永久退休，显式重读仍须经过 daemon',
   );
 
+  // 重连清空再加载同一 root 时，请求计数可能重新从 1 开始；旧请求仍属于已失效的缓存。
+  for (const staleResult of ['success', 'not_found']) {
+    const sessionId = `session-reloaded-${staleResult}`;
+    const rootTaskId = `root-reloaded-${staleResult}`;
+    const delayed = Promise.withResolvers();
+    delayedProjections.set(rootTaskId, delayed);
+    const staleFetch = agentRunStore.fetchAgentRunProjection(sessionId, rootTaskId, WORKSPACE_ID);
+    await delay(0);
+    agentRunStore.clearAgentRunProjection(sessionId, undefined, WORKSPACE_ID);
+    assert.equal(selectActiveAgentRunProjection(agentRunStore.getAgentRunState(sessionId, WORKSPACE_ID).projection), null);
+    await agentRunStore.fetchAgentRunProjection(sessionId, rootTaskId, WORKSPACE_ID);
+    const restoredProjection = agentRunStore.getAgentRunState(sessionId, WORKSPACE_ID).projection;
+    delayed.resolve(staleResult === 'success'
+      ? jsonResponse({ ...projectionPayload(rootTaskId), agents: [] })
+      : new Response('old root removed', { status: 404 }));
+    await staleFetch;
+    assert.equal(agentRunStore.getAgentRunState(sessionId, WORKSPACE_ID).projection, restoredProjection,
+      '重连前的旧成功响应或 404 都不能覆盖、退休重连后的同一 root');
+    assert.equal(selectActiveAgentRunProjection(restoredProjection).agents.length, 4);
+    agentRunStore.clearAgentRunProjection(sessionId, undefined, WORKSPACE_ID);
+  }
+
   agentRunStore.activateAgentRunSession(ACTION_SESSION_ID, WORKSPACE_ID, WORKSPACE_PATH);
   await agentRunStore.fetchAgentRunProjection(
     ACTION_SESSION_ID,
@@ -477,6 +512,60 @@ await withGoldenViteServer(async (server) => {
     null,
     '归档成功后才允许移除当前面板状态',
   );
+  assert.equal(selectActiveAgentRunProjection(agentRunStore.getAgentRunState(ARCHIVE_SESSION_ID, WORKSPACE_ID).projection), null,
+    '归档成功后列表与动作同步消失');
+  const readsAfterArchive = agentRunFetches.length;
+  await agentRunStore.fetchAgentRunProjection(ARCHIVE_SESSION_ID, ARCHIVE_ROOT_TASK_ID, WORKSPACE_ID, WORKSPACE_PATH);
+  assert.equal(agentRunFetches.length, readsAfterArchive, '旧 root 刷新不能复活已归档运行');
+
+  for (const actionResult of ['success', 'failure']) {
+    const sessionId = `session-late-archive-${actionResult}`;
+    const rootTaskId = `root-late-archive-${actionResult}`;
+    await agentRunStore.fetchAgentRunProjection(sessionId, rootTaskId, WORKSPACE_ID);
+    const delayed = Promise.withResolvers();
+    delayedActions.set(rootTaskId, delayed);
+    const archiving = agentRunStore.performAgentRunAction(sessionId, rootTaskId, 'archive', WORKSPACE_ID);
+    const result = actionResult === 'failure' ? assert.rejects(archiving, /archive rejected/) : archiving;
+    await delay(0);
+    assert.equal(agentRunStore.getAgentRunState(sessionId, WORKSPACE_ID).rootTaskId, rootTaskId,
+      '归档响应到达前仍保留原运行');
+    await agentRunStore.fetchAgentRunProjection(sessionId, NEXT_ROOT_TASK_ID, WORKSPACE_ID);
+    agentRunStore.activateAgentRunSession(SESSION_ID_B, WORKSPACE_ID, WORKSPACE_PATH);
+    const nextProjection = agentRunStore.getAgentRunState(sessionId, WORKSPACE_ID).projection;
+    const otherProjection = agentRunStore.getAgentRunState(SESSION_ID_B, WORKSPACE_ID).projection;
+    if (actionResult === 'success') {
+      delayed.resolve(jsonResponse({ action: 'archive', archived: true, sessionId, rootTaskId }));
+    } else {
+      delayed.reject(new Error('archive rejected'));
+    }
+    await result;
+    const latest = agentRunStore.getAgentRunState(sessionId, WORKSPACE_ID);
+    assert.equal(latest.projection, nextProjection, '旧归档回执不能清除同会话的新 root');
+    assert.equal(latest.actionError, null, '旧归档失败不能覆盖新 root 的错误状态');
+    assert.equal(latest.actionInFlight, null);
+    assert.equal(agentRunStore.getAgentRunState(SESSION_ID_B, WORKSPACE_ID).projection, otherProjection,
+      '切换会话后的归档回执不能影响当前会话');
+    if (actionResult === 'success') {
+      const reads = agentRunFetches.length;
+      await agentRunStore.fetchAgentRunProjection(sessionId, rootTaskId, WORKSPACE_ID);
+      assert.equal(agentRunFetches.length, reads, '迟到的成功回执仍要退休原 root');
+    }
+    agentRunStore.clearAgentRunProjection(sessionId, undefined, WORKSPACE_ID);
+  }
+
+  const failedRoot = 'root-archive-rejected';
+  await agentRunStore.fetchAgentRunProjection(ARCHIVE_SESSION_ID, failedRoot, WORKSPACE_ID);
+  const failedArchive = Promise.withResolvers();
+  delayedActions.set(failedRoot, failedArchive);
+  const failure = assert.rejects(
+    agentRunStore.performAgentRunAction(ARCHIVE_SESSION_ID, failedRoot, 'archive', WORKSPACE_ID), /archive rejected/);
+  await delay(0);
+  failedArchive.reject(new Error('archive rejected'));
+  await failure;
+  const failedState = agentRunStore.getAgentRunState(ARCHIVE_SESSION_ID, WORKSPACE_ID);
+  assert.equal(failedState.rootTaskId, failedRoot, '归档失败必须保留原运行供重试');
+  assert.equal(failedState.actionError, 'archive rejected');
+  assert.equal(selectActiveAgentRunProjection(failedState.projection).agents.length, 4);
 
   agentRunStore.setAgentRunBridgeConnected(false);
   agentRunStore.startAutoRefresh(30);

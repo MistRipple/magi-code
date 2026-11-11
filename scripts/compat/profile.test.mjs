@@ -112,7 +112,10 @@ test('同调用移除和安装携带同一恢复身份，失败与取消在关�
   const result=await withProfile(async()=>{
     assert.equal((await manager.removeBundle('target')).application,'applied');
     assert.deepEqual(loaderEntries(),[],'移除时不伪装目标仍已安装');
-    assert.equal((await manager.installBundle('target@2.0.0')).application,'failed');
+    const child=profileSpawn('dsh',['plugin','add','target@2.0.0']);
+    let stderr='';child.stdout.resume();child.stderr.on('data',chunk=>stderr+=chunk);
+    assert.equal((await once(child,'close'))[0],1);
+    assert.match(stderr,/下载失败/,'受管进程保留同一移除恢复身份及真实安装错误');
     return {status:500,body:{ok:false,error:'下载失败'}};
   });
   assert.equal(result.status,500);assert.deepEqual(plugins,[original]);
@@ -299,6 +302,40 @@ test('profile 配置复制沿同一调用提案，来源说明从 daemon 重读�
     assert.deepEqual(await fs.promises.readFile(backup), fs.readFileSync(patch));
   });
   assert.equal(nativeFs.existsSync(patch), false);
+});
+
+test('无说明的停用项也可删除恢复，保留其他停用项且旧提案不能覆盖后续操作', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'magi-profile-enable-')); t.after(() => rm(home, { recursive: true, force: true }));
+  const plugins = ['target', 'keeper'].map(name => ({ manifest: { id: `dsh.${name}` }, digest: 'one', enabled: name === 'target', active: name === 'target',
+    source: { kind: 'upstream', location: `dsh:${name}@1.0.0` } }));
+  const writes = [];
+  const release = configureProfile({ plugins: {
+    list: async () => ({ plugins: structuredClone(plugins) }),
+    setEnabled: async (id, enabled, digest, options) => {
+      const plugin = plugins.find(value => value.manifest.id === id);
+      assert.equal(digest, plugin.digest);
+      assert.deepEqual(options.expectedState, { enabled: plugin.enabled, ...(plugin.disabledBy ? { disabledBy: plugin.disabledBy } : {}) });
+      writes.push([id, enabled]); plugin.enabled = enabled; plugin.active = enabled;
+    },
+  } }, { home }); t.after(release);
+  const patch = join(profilePath(), 'cordis.patch.yml');
+  await withProfile(async () => {
+    const rows = load(fs.readFileSync(patch, 'utf8'));
+    rows.push({ id: 'dsh.target', disabled: true });
+    fs.writeFileSync(patch, dump(rows));
+  });
+  assert.equal(plugins[0].enabled, false); assert.equal(plugins[0].disabledBy, undefined);
+  await withProfile(async () => {
+    const rows = load(fs.readFileSync(patch, 'utf8'));
+    fs.writeFileSync(patch, dump(rows.filter(row => row.id !== 'dsh.target')));
+  });
+  assert.equal(plugins[0].enabled, true); assert.equal(plugins[1].enabled, false);
+  assert.deepEqual(writes, [['dsh.target', false], ['dsh.target', true]]);
+  await assert.rejects(withProfile(async () => {
+    fs.writeFileSync(patch, '[]');
+    plugins[1].disabledBy = { pluginId: 'another.manager', name: 'Another manager', reason: 'new operation' };
+  }), /expectedState|deep-equal/);
+  assert.equal(plugins[1].enabled, false); assert.equal(writes.length, 2);
 });
 
 test('私有业务文件与安装投影经过符号链接时保持相同路径身份，且不生成安装副本', async t => {
@@ -542,10 +579,13 @@ test('DSH 管理命令的终止请求取消同一个 daemon 安装任务，不�
   } }, {home});t.after(off);
   await withProfile(async()=>{
     const child=profileSpawn('dsh',['plugin','add','test@1.0.0']);
+    assert.ok(Number.isInteger(child.pid) && child.pid > 0, '管理命令必须提供真实进程 PID');
     child.stdout.resume(); child.stderr.resume();
     const closed=once(child,'close'), id=await began;
-    child.kill();
-    assert.equal((await closed)[0],1);assert.equal(cancelled,id);
+    // 与原包相同：POSIX 尝试进程组后回到真实 ChildProcess.kill。
+    if (process.platform === 'win32') child.kill();
+    else try { process.kill(-child.pid, 'SIGTERM'); } catch { child.kill(); }
+    assert.deepEqual(await closed,[null,'SIGTERM']);assert.equal(cancelled,id);
   });
 });
 
@@ -567,8 +607,8 @@ test('npm/pnpm 当前 profile 包操作共用 daemon 目录，无物理安装树
   } }, { home }); t.after(off);
   const run = async (file, args, options) => {
     const child = profileSpawn(file, args, options); assert.ok(child);
-    let stderr = ''; child.stdout.resume(); child.stderr.on('data', bytes => stderr += bytes);
-    return { code: (await once(child, 'close'))[0], stderr };
+    let stderr = '', stdout = ''; child.stdout.on('data', bytes => stdout += bytes); child.stderr.on('data', bytes => stderr += bytes);
+    return { code: (await once(child, 'close'))[0], stderr, stdout };
   };
   await withProfile(async () => {
     const directory = profilePath(); nativeFs.mkdirSync(directory, { recursive: true });
@@ -584,8 +624,14 @@ test('npm/pnpm 当前 profile 包操作共用 daemon 目录，无物理安装树
     for (const args of [
       ['install'], ['install', '@scope/target@1.0.0', '--ignore-scripts=false'],
       ['install', '@scope/target@1.0.0', '--prefix', home, '--prefix', directory],
+      ['install', '@scope/target@1.0.0', 'another@1.0.0'],
+      ['install', '@scope/target@1.0.0', '--reporter=ndjson', '--reporter=append-only'],
     ]) assert.equal((await run('npm', args, { cwd: directory })).code, 1);
     assert.equal(installations, 4, '无目标或不支持参数不能创建任何安装');
+    const reported = await run('dsh', ['plugin', '--profile', 'magi', 'add', '-w', '@scope/target@5.0.0', '--reporter=ndjson']);
+    assert.equal(reported.code, 0, reported.stderr);
+    assert.deepEqual(JSON.parse(reported.stdout), { name: 'magi:plugin-management', application: 'applied', installed: true, version: '5.0.0' });
+    assert.equal(installations, 5, 'DSH 命令与标准包管理使用同一目标解析及真实安装入口');
     assert.equal(profileSpawn('npm', ['install', 'outside@1.0.0'], { cwd: home }), undefined);
     assert.equal(profileSpawn('npm', ['install', 'outside@1.0.0', '--prefix', home], { cwd: directory }), undefined);
     for (const file of ['package.json', 'package-lock.json', 'node_modules']) assert.equal(nativeFs.existsSync(join(directory, file)), false);
@@ -610,7 +656,7 @@ test('标准包管理命令取消同一 native 安装任务，取消后仍可显
   await withProfile(async () => {
     const run = () => { const child = profileSpawn('pnpm', ['add', 'target@1.0.0'], { cwd: profilePath() }); child.stdout.resume(); child.stderr.resume(); return child; };
     const child = run(), closed = once(child, 'close'), requestId = await started;
-    child.kill(); assert.equal((await closed)[0], 1); assert.equal(cancelled, requestId);
+    child.kill(); assert.deepEqual(await closed, [null, 'SIGTERM']); assert.equal(cancelled, requestId);
     assert.equal((await once(run(), 'close'))[0], 0); assert.equal(attempts, 2);
   });
 });
@@ -631,7 +677,7 @@ test('DSH 管理命令在目录读取期间终止，迟到读取不能继续安�
     child.stdout.resume();child.stderr.resume();
     const closed=once(child,'close');await waiting;
     child.kill();hold=false;releaseRead();
-    assert.equal((await closed)[0],1);
+    assert.deepEqual(await closed,[null,'SIGTERM']);
     assert.equal(installations,0,'准备中的命令被终止，不能在收到目录后迟到开始安装');
     assert.equal(proposals,1);assert.equal(loaderEntries()[0].disabled,true,'父请求已有的配置提案仍正常结算');
     const retry=profileSpawn('dsh',['plugin','add','target@1.0.0']);
@@ -656,7 +702,7 @@ test('DSH 移除命令等待读取目标时终止，不删除插件或取消同�
     child.stdout.resume();child.stderr.resume();
     const closed=once(child,'close');await waiting;
     child.kill();hold=false;releaseRead();
-    assert.equal((await closed)[0],1);
+    assert.deepEqual(await closed,[null,'SIGTERM']);
     assert.equal(removals,0,'终止后收到的目标快照不能继续触发删除');
     const retry=profileSpawn('dsh',['plugin','remove','target']);
     retry.stdout.resume();retry.stderr.resume();

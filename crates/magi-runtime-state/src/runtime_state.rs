@@ -5,12 +5,11 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 38123;
-const CLIENT_LEASE_STALE_MS: u64 = 60_000;
 /// 返回 Desktop 与独立 daemon 共用的唯一应用状态根。
 ///
 /// `~/.magi` 是当前产品已经使用的全局状态事实源，开发 daemon、正式
-/// Electron 和历史客户端必须解析到同一个目录。workspace 自身的状态仍位于
-/// 项目目录下的 `.magi` 子目录，不能把两者混成同一份 workspace 状态。
+/// Electron 必须解析到同一个目录；项目数据由该目录下的 projects 管理，
+/// 源文件夹中的旧 `.magi` 仅作为单向迁移输入。
 pub fn default_state_root() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -53,34 +52,14 @@ pub struct RuntimeState {
     pub updated_at: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RuntimeClientLease {
-    pub client_id: String,
-    pub pid: u32,
-    pub workspace_roots: Vec<String>,
-    pub created_at: u64,
-    pub updated_at: u64,
-}
-
-impl RuntimeClientLease {
-    pub fn is_stale(&self, now: u64) -> bool {
-        now.saturating_sub(self.updated_at) > CLIENT_LEASE_STALE_MS
-    }
-}
-
 pub struct RuntimeStateManager {
     state_dir: PathBuf,
-    clients_dir: PathBuf,
 }
 
 impl RuntimeStateManager {
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
-        let state_dir = state_dir.into();
-        let clients_dir = state_dir.join("clients");
         Self {
-            state_dir,
-            clients_dir,
+            state_dir: state_dir.into(),
         }
     }
 
@@ -90,11 +69,6 @@ impl RuntimeStateManager {
 
     pub fn pid_file(&self) -> PathBuf {
         self.state_dir.join("runtime.pid")
-    }
-
-    fn client_lease_file(&self, client_id: &str) -> Option<PathBuf> {
-        let normalized = normalize_client_id(client_id)?;
-        Some(self.clients_dir.join(format!("{normalized}.json")))
     }
 
     pub fn read_runtime_state(&self) -> Option<RuntimeState> {
@@ -138,19 +112,6 @@ impl RuntimeStateManager {
         let _ = std::fs::remove_file(self.runtime_file());
     }
 
-    pub fn read_pid(&self) -> Option<u32> {
-        let content = std::fs::read_to_string(self.pid_file()).ok()?;
-        let pid: u32 = content.trim().parse().ok()?;
-        if pid == 0 {
-            return None;
-        }
-        if !is_process_alive(pid) {
-            let _ = std::fs::remove_file(self.pid_file());
-            return None;
-        }
-        Some(pid)
-    }
-
     pub fn write_pid(&self, pid: u32) {
         let _ = std::fs::create_dir_all(&self.state_dir);
         let _ = std::fs::write(self.pid_file(), pid.to_string());
@@ -159,107 +120,6 @@ impl RuntimeStateManager {
     pub fn remove_pid(&self) {
         let _ = std::fs::remove_file(self.pid_file());
     }
-
-    pub fn write_client_lease(
-        &self,
-        client_id: &str,
-        pid: u32,
-        workspace_roots: Vec<String>,
-    ) -> Option<RuntimeClientLease> {
-        let normalized = normalize_client_id(client_id)?;
-        let _ = std::fs::create_dir_all(&self.clients_dir);
-        let now = now_millis();
-        let existing = self.read_client_lease(&normalized);
-        let created_at = existing.as_ref().map(|l| l.created_at).unwrap_or(now);
-        let lease = RuntimeClientLease {
-            client_id: normalized.clone(),
-            pid,
-            workspace_roots,
-            created_at,
-            updated_at: now,
-        };
-        let path = self.client_lease_file(&normalized)?;
-        let _ = std::fs::write(
-            &path,
-            serde_json::to_string_pretty(&lease).unwrap_or_default(),
-        );
-        Some(lease)
-    }
-
-    pub fn read_client_lease(&self, client_id: &str) -> Option<RuntimeClientLease> {
-        let path = self.client_lease_file(client_id)?;
-        let content = std::fs::read_to_string(&path).ok()?;
-        serde_json::from_str(&content).ok()
-    }
-
-    pub fn remove_client_lease(&self, client_id: &str) {
-        if let Some(path) = self.client_lease_file(client_id) {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-
-    pub fn list_client_leases(&self) -> Vec<RuntimeClientLease> {
-        let entries = match std::fs::read_dir(&self.clients_dir) {
-            Ok(entries) => entries,
-            Err(_) => return Vec::new(),
-        };
-        let now = now_millis();
-        let mut leases = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let Ok(content) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(lease) = serde_json::from_str::<RuntimeClientLease>(&content) else {
-                let _ = std::fs::remove_file(&path);
-                continue;
-            };
-            if lease.is_stale(now) || !is_process_alive(lease.pid) {
-                let _ = std::fs::remove_file(&path);
-                continue;
-            }
-            leases.push(lease);
-        }
-        leases.sort_by_key(|l| l.created_at);
-        leases
-    }
-
-    pub fn resolve_base_url(&self) -> String {
-        self.read_runtime_state()
-            .map(|s| s.base_url)
-            .unwrap_or_else(default_base_url)
-    }
-
-    pub fn resolve_port(&self) -> u16 {
-        self.read_runtime_state()
-            .map(|s| s.port)
-            .unwrap_or(DEFAULT_PORT)
-    }
-}
-
-fn normalize_client_id(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let normalized: String = trimmed
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    Some(normalized)
-}
-
-fn default_base_url() -> String {
-    format!("http://{DEFAULT_HOST}:{DEFAULT_PORT}")
 }
 
 pub fn is_process_alive(pid: u32) -> bool {
@@ -306,14 +166,16 @@ mod tests {
             .expect("runtime state should read");
         assert_eq!(read.pid, pid);
         assert_eq!(read.port, 38123);
-        assert_eq!(manager.resolve_base_url(), "http://127.0.0.1:38123");
 
         manager.write_pid(pid);
-        assert_eq!(manager.read_pid(), Some(pid));
+        assert_eq!(
+            std::fs::read_to_string(manager.pid_file()).unwrap(),
+            pid.to_string()
+        );
         manager.remove_runtime_state();
         manager.remove_pid();
         assert!(manager.read_runtime_state().is_none());
-        assert!(manager.read_pid().is_none());
+        assert!(!manager.pid_file().exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -335,38 +197,6 @@ mod tests {
         assert_eq!(state.host, DEFAULT_HOST);
         assert_eq!(state.port, DEFAULT_PORT);
         assert_eq!(state.base_url, "http://127.0.0.1:38123");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn client_lease_normalizes_id_and_filters_stale_processes() {
-        let dir = temp_state_dir("lease");
-        let manager = RuntimeStateManager::new(&dir);
-
-        let lease = manager
-            .write_client_lease(
-                "client / one",
-                std::process::id(),
-                vec!["/tmp/a".to_string()],
-            )
-            .expect("valid client id should write");
-        assert_eq!(lease.client_id, "client___one");
-        assert_eq!(manager.list_client_leases().len(), 1);
-
-        let stale = RuntimeClientLease {
-            client_id: "dead".to_string(),
-            pid: 0,
-            workspace_roots: vec![],
-            created_at: 1,
-            updated_at: 1,
-        };
-        std::fs::write(
-            dir.join("clients").join("dead.json"),
-            serde_json::to_string(&stale).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(manager.list_client_leases().len(), 1);
-        assert!(!dir.join("clients").join("dead.json").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

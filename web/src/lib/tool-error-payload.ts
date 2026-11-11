@@ -73,11 +73,6 @@ export function toolPayloadRestrictionKind(content: unknown): ToolPolicyRestrict
     : '';
 }
 
-export function isAccessModeApprovalErrorPayload(content: unknown): boolean {
-  const errorCode = toolPayloadErrorCode(content);
-  return ACCESS_MODE_APPROVAL_ERROR_CODES.some((pattern) => errorCode.includes(pattern));
-}
-
 export function parseToolApprovalPayload(content: unknown): ToolApprovalPayload | null {
   const payload = parseToolPayloadRecord(content);
   if (!payload || toolPayloadStatus(payload) !== 'awaiting_approval') {

@@ -4,6 +4,7 @@ export function createViewTransport(post) {
   let next = 0, disposed = false;
   const closed = () => new DOMException('插件页面已关闭', 'AbortError');
   return {
+    get disposed() { return disposed; },
     request(message, signal) {
       if (disposed) return Promise.reject(closed());
       if (signal?.aborted) return Promise.reject(signal.reason);

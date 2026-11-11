@@ -70,11 +70,6 @@ export function normalizeTerminalToolName(name?: string): string {
   return TERMINAL_TOOL_ALIASES[normalized] ?? normalized;
 }
 
-export function normalizeTerminalOperation(name: string): TerminalOperation | null {
-  const normalized = normalizeTerminalToolName(name);
-  return TERMINAL_TOOLS.has(normalized) ? normalized as TerminalOperation : null;
-}
-
 export function extractLeadingJson(text: string): LeadingJsonMatch | null {
   if (!text) return null;
   const trimmed = text.trim();

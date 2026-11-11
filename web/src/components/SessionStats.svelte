@@ -112,7 +112,7 @@
   onclick={toggle} onkeydown={keydown} title={i18n.t('input.stats.title')} aria-label={i18n.t('input.stats.trigger', { speed: decimal(stats.tps), cache: percent(stats.cache.tokenHitRate) })}
   aria-expanded={open} aria-controls={id} aria-haspopup="dialog" data-testid="session-stats-trigger">
   <Icon name="stats" size={16} />
-  <span class="stats-summary"><bdi>{decimal(stats.tps)} tok/s</bdi><span aria-hidden="true">·</span><span>{i18n.t('input.stats.cacheShort', { value: snapshot ? percent(stats.cache.tokenHitRate) : '—' })}</span></span>
+  <span class="stats-summary"><bdi>{decimal(stats.tps)} tok/s</bdi><span>{i18n.t('input.stats.cacheShort', { value: snapshot ? percent(stats.cache.tokenHitRate) : '—' })}</span></span>
   {#if running}<span class="stats-update-dot" aria-hidden="true"></span>{/if}
 </button>
 {#if open && trigger}
@@ -144,6 +144,7 @@
           <div><dt>{i18n.t('input.stats.tpsCoverage')}</dt><dd>{count(stats.tpsCount)} / {count(stats.calls)}</dd></div>
           <div><dt>{i18n.t('input.stats.lastTtft')}</dt><dd>{seconds(stats.lastTtftMs)}</dd></div>
           <div><dt>{i18n.t('input.stats.lastTps')}</dt><dd>{stats.lastTps == null ? i18n.t('input.stats.unprovided') : `${decimal(stats.lastTps)} tok/s`}</dd></div>
+          <div><dt>{i18n.t('input.stats.textTps')}</dt><dd>{stats.textTps == null ? i18n.t('input.stats.unprovided') : `${decimal(stats.textTps)} tok/s`}</dd></div>
         </dl></div>{/if}
       </div>
       <div class="observation-footer"><Icon name="info" size={12} /><span>{i18n.t('input.stats.observed', { observed: count(stats.cache.observedCallCount), count: count(stats.calls) })}</span></div>

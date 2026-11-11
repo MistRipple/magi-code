@@ -1912,13 +1912,4 @@ mod tests {
         assert_eq!(blocked["error"]["kind"], "workspace_git_lease_conflict");
         state.workspace_git_coordinator.end_execution(&session_id);
     }
-
-    #[allow(dead_code)]
-    fn assert_response_payloads_are_serializable(
-        preview: magi_git::GitMergePreview,
-        worktree: magi_git::GitWorktree,
-    ) {
-        let _ = serde_json::to_value(preview).unwrap();
-        let _ = serde_json::to_value(worktree).unwrap();
-    }
 }

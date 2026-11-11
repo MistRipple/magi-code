@@ -136,6 +136,74 @@ impl PluginServices {
         })
     }
 
+    pub(super) fn web_executor(
+        &self,
+        handle: tokio::runtime::Handle,
+    ) -> magi_tool_runtime::WebProviderExecutor {
+        let manager = Arc::clone(&self.manager);
+        let bus = Arc::clone(&self.extension_bus);
+        Arc::new(move |tool, input, context, cancelled| {
+            use magi_app_server_protocol::generated::PluginWebKind;
+            let kind = match tool {
+                "web_search" => PluginWebKind::Search,
+                "web_fetch" => PluginWebKind::Fetch,
+                _ => return None,
+            };
+            let selected = manager
+                .lock()
+                .map_err(|_| "插件管理器不可用".to_string())
+                .and_then(|manager| {
+                    manager
+                        .selected_web_tool(&kind)
+                        .map_err(|error| error.to_string())
+                });
+            let selected = match selected {
+                Ok(Some(selected)) => selected,
+                Ok(None) => return None,
+                Err(error) => return Some(json!({"tool":tool,"status":"failed","error_code":"web_provider_unavailable","error":error}).to_string()),
+            };
+            let instance = manager
+                .lock()
+                .ok()
+                .and_then(|manager| manager.prepare_tool_call(&selected, input).ok())
+                .and_then(|prepared| {
+                    bus.instance(&prepared.plugin_id)
+                        .map(|instance| (prepared.plugin_id, instance))
+                });
+            let (payload, status) = execute_tool(
+                &manager, &bus, &handle, &selected, input, context, cancelled,
+            );
+            if status == magi_core::ExecutionResultStatus::Succeeded
+                && (cancelled.load(std::sync::atomic::Ordering::Acquire)
+                    || instance.as_ref().is_none_or(|(plugin, original)| {
+                        bus.instance(plugin)
+                            .is_none_or(|current| !Arc::ptr_eq(original, &current))
+                    })
+                    || manager
+                        .lock()
+                        .ok()
+                        .and_then(|manager| manager.selected_web_tool(&kind).ok().flatten())
+                        .as_deref()
+                        != Some(&selected))
+            {
+                return Some(json!({"tool":tool,"status":"failed","error_code":"web_provider_stale","error":"联网操作所属提供方或实例已失效，未重复请求","providerTool":selected}).to_string());
+            }
+            let mut value: serde_json::Value = serde_json::from_str(&payload)
+                .unwrap_or_else(|_| json!({"status":"failed","error":"联网提供方回执无效"}));
+            if status == magi_core::ExecutionResultStatus::Succeeded {
+                value = value
+                    .get("output")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"status":"failed","error":"联网提供方缺少结果"}));
+            }
+            if let Some(object) = value.as_object_mut() {
+                object.insert("tool".into(), json!(tool));
+                object.insert("providerTool".into(), json!(selected));
+            }
+            Some(value.to_string())
+        })
+    }
+
     /// 用户命令的执行端口：对话执行器在阻塞线程上同步调用。
     pub(super) fn command_executor(
         &self,

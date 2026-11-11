@@ -36,6 +36,10 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    pub fn with_web_provider(mut self, executor: crate::WebProviderExecutor) -> Self {
+        self.runtime_resources.web_provider_executor = Some(executor);
+        self
+    }
     pub fn with_background_job_journal(
         mut self,
         journal: Arc<dyn crate::BackgroundJobJournal>,
@@ -290,22 +294,6 @@ impl ToolRegistry {
             .get(tool_name)
             .and_then(|_| BuiltinToolName::from_name(tool_name))
             .map(|name| name.default_access_mode())
-    }
-
-    /// 根据允许/拒绝列表创建过滤后的工具注册表副本。
-    pub fn filtered_clone(&self, allowed: &[String], denied: &[String]) -> Self {
-        let mut filtered = self.clone();
-        if !allowed.is_empty() {
-            filtered
-                .builtin_tools
-                .retain(|name, _| allowed.contains(name));
-        }
-        if !denied.is_empty() {
-            filtered
-                .builtin_tools
-                .retain(|name, _| !denied.contains(name));
-        }
-        filtered
     }
 
     pub fn execute(&self, input: ToolExecutionInput) -> ToolExecutionOutput {

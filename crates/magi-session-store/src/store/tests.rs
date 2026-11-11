@@ -1,14 +1,13 @@
 use super::*;
 use crate::models::{
-    ActiveExecutionBranch, ActiveExecutionBranchSnapshotUpdate, ActiveExecutionChain,
-    ActiveExecutionDispatchContext, ActiveExecutionTurn, ActiveExecutionTurnItem,
-    CanonicalTurnStatus, ExecutionThread, ExecutionThreadStatus, GoalContinuationPhase,
-    GoalContinuationState, GoalRevisionExpectation, GoalStatus, NotificationContext,
-    NotificationRecord, NotificationScope, SessionAcceptanceRecord, SessionDurableState,
-    SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionPlan,
-    SessionSidecarFlushReason, SessionStoreState, ThreadChatMessage, ThreadChatToolCall,
-    ThreadChatToolFunction, ThreadContextCheckpoint, ThreadFileFactVersion,
-    ThreadModelProviderContext,
+    ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
+    ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurnStatus, ExecutionThread,
+    ExecutionThreadStatus, GoalContinuationPhase, GoalContinuationState, GoalRevisionExpectation,
+    GoalStatus, NotificationContext, NotificationRecord, NotificationScope,
+    SessionAcceptanceRecord, SessionDurableState, SessionExecutionSidecarStatus,
+    SessionExecutionSidecarStoreState, SessionPlan, SessionSidecarFlushReason, SessionStoreState,
+    ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction, ThreadContextCheckpoint,
+    ThreadFileFactVersion, ThreadModelProviderContext,
 };
 use magi_core::{
     AccessProfile, DomainError, ExecutionOwnership, MissionId, PlanId, PlanItem, PlanItemId,
@@ -23,6 +22,7 @@ struct RejectingCanonicalWriter;
 #[derive(Default)]
 struct RecordingCanonicalWriter {
     transactions: std::sync::Mutex<Vec<Vec<crate::CanonicalTurnMutation>>>,
+    accepted_tasks: std::sync::Mutex<Vec<TaskId>>,
 }
 
 impl crate::SessionEventWriter for RecordingCanonicalWriter {
@@ -31,9 +31,15 @@ impl crate::SessionEventWriter for RecordingCanonicalWriter {
         _: &SessionId,
         turns: &[crate::CanonicalTurnMutation],
         _: &[crate::SessionInputMutation],
-        _: Option<(&SessionAcceptanceRecord, Option<&magi_core::Task>)>,
+        acceptance: Option<(&SessionAcceptanceRecord, Option<&magi_core::Task>)>,
     ) -> magi_core::DomainResult<()> {
         self.transactions.lock().unwrap().push(turns.to_vec());
+        if let Some((_, Some(task))) = acceptance {
+            self.accepted_tasks
+                .lock()
+                .unwrap()
+                .push(task.task_id.clone());
+        }
         Ok(())
     }
 }
@@ -178,17 +184,14 @@ fn test_active_chain(
         root_task_id: TaskId::new(format!("task-root-{chain_ref}")),
         execution_chain_ref: chain_ref.to_string(),
         workspace_id: None,
-        active_branch_task_ids: Vec::new(),
-        active_worker_bindings: Vec::new(),
         branches: Vec::new(),
-        recovery_ref: None,
         dispatch_context: ActiveExecutionDispatchContext {
             accepted_at: UtcMillis(10),
             entry_id: format!("timeline-{chain_ref}"),
             trimmed_text: Some(format!("text for {chain_ref}")),
             skill_name: None,
         },
-        current_turn: turn,
+        current_turn_id: (turn).map(|turn| turn.turn_id),
     }
 }
 
@@ -272,97 +275,6 @@ fn unique_timeline_entry_id_appends_suffix_for_duplicate_base() {
     assert_eq!(
         unique_timeline_entry_id(&timeline, "timeline-session-duplicate-entry-42".to_string()),
         "timeline-session-duplicate-entry-42-2"
-    );
-}
-
-#[test]
-fn rejected_user_turn_is_durable_and_request_idempotent() {
-    let store = SessionStore::new();
-    let session_id = SessionId::new("session-rejected-user-turn");
-    store
-        .create_session(session_id.clone(), "Rejected user turn")
-        .expect("session should be creatable");
-
-    let request_id = "request-git-context-conflict".to_string();
-    let user_message_id = "user-git-context-conflict".to_string();
-    let placeholder_message_id = "assistant-placeholder-git-context-conflict".to_string();
-    let source_thread_id = ThreadId::new("thread-rejected-user-turn");
-    let mut user_item = test_turn_item(&user_message_id, "发送前 Git context 已漂移");
-    user_item.request_id = Some(request_id.clone());
-    user_item.user_message_id = Some(user_message_id.clone());
-    user_item.placeholder_message_id = Some(placeholder_message_id.clone());
-    user_item
-        .metadata
-        .insert("requestId".to_string(), json!(request_id.clone()));
-    user_item.source_thread_id = source_thread_id.clone();
-
-    let mut error_item = test_turn_item(
-        "assistant-error-git-context-conflict",
-        "Git context 发生高风险变化",
-    );
-    error_item.item_seq = 1;
-    error_item.kind = "assistant_error".to_string();
-    error_item.status = "failed".to_string();
-    error_item.source = "orchestrator".to_string();
-    error_item.request_id = Some(request_id.clone());
-    error_item.user_message_id = Some(user_message_id.clone());
-    error_item.placeholder_message_id = Some(placeholder_message_id.clone());
-    error_item.source_thread_id = source_thread_id;
-
-    let turn = ActiveExecutionTurn {
-        turn_id: "turn-rejected-user-turn".to_string(),
-        turn_seq: 100,
-        accepted_at: UtcMillis(100),
-        completed_at: Some(UtcMillis(100)),
-        status: "failed".to_string(),
-        user_message: Some("发送前 Git context 已漂移".to_string()),
-        items: vec![user_item, error_item],
-    };
-    let timeline = TimelineEntryInput::new(
-        "timeline-rejected-user-turn",
-        TimelineEntryKind::UserMessage,
-        "发送前 Git context 已漂移",
-        UtcMillis(100),
-    );
-
-    store
-        .record_rejected_user_turn_with_timeline_entry(session_id.clone(), timeline, turn.clone())
-        .expect("rejected turn should be durable")
-        .expect("first rejected turn should be recorded");
-
-    let turns = store.canonical_turns_for_session(&session_id);
-    assert_eq!(turns.len(), 1);
-    assert_eq!(turns[0].status, CanonicalTurnStatus::Failed);
-    assert_eq!(turns[0].items.len(), 2);
-    assert_eq!(
-        store
-            .timeline_for_session(&session_id)
-            .into_iter()
-            .filter(|entry| entry.entry_id == "timeline-rejected-user-turn")
-            .count(),
-        1
-    );
-
-    store
-        .record_rejected_user_turn_with_timeline_entry(
-            session_id.clone(),
-            TimelineEntryInput::new(
-                "timeline-rejected-user-turn-retry",
-                TimelineEntryKind::UserMessage,
-                "重复提交不应生成第二条",
-                UtcMillis(101),
-            ),
-            turn,
-        )
-        .expect("same request retry should be idempotent");
-    assert_eq!(store.canonical_turns_for_session(&session_id).len(), 1);
-    assert_eq!(
-        store
-            .timeline_for_session(&session_id)
-            .into_iter()
-            .filter(|entry| entry.entry_id.starts_with("timeline-rejected-user-turn"))
-            .count(),
-        1
     );
 }
 
@@ -634,7 +546,7 @@ fn session_projection_persistence_serializes_snapshot_and_write_transactions() {
     store
         .create_session(second_session_id.clone(), "Second")
         .expect("second session should create");
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         second_session_id.clone(),
         ExecutionOwnership {
             session_id: Some(second_session_id.clone()),
@@ -932,7 +844,7 @@ fn sidecar_flush_waits_for_canonical_commit_before_capturing_projection() {
         .create_session(session_id.clone(), "Sidecar canonical order")
         .expect("session should create");
     accept_test_turn(&store, &session_id, test_turn(turn_id, "running", 10));
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -1294,7 +1206,7 @@ fn session_sidecar_store_keeps_status_and_recovery_export() {
         .create_session(session_id.clone(), "Session 1")
         .expect("session should be creatable");
 
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -1305,7 +1217,7 @@ fn session_sidecar_store_keeps_status_and_recovery_export() {
     );
 
     let sidecar = store
-        .attach_recovery_id(&session_id, Some("recovery-1".to_string()))
+        .set_recovery_id(&session_id, None, Some("recovery-1".to_string()))
         .expect("recovery id should be attachable");
     assert_eq!(sidecar.recovery_id.as_deref(), Some("recovery-1"));
     assert_eq!(
@@ -1355,7 +1267,7 @@ fn bind_execution_ownership_backfills_workspace_into_active_chain() {
         .create_session(session_id.clone(), "Active Chain Workspace")
         .expect("session should be creatable");
     store
-        .upsert_active_execution_chain(
+        .seed_execution_chain_for_test(
             session_id.clone(),
             ActiveExecutionChain {
                 session_id: session_id.clone(),
@@ -1363,33 +1275,21 @@ fn bind_execution_ownership_backfills_workspace_into_active_chain() {
                 root_task_id: TaskId::new("task-root-active-chain"),
                 execution_chain_ref: "chain-active-workspace".to_string(),
                 workspace_id: None,
-                active_branch_task_ids: vec![TaskId::new("task-active-chain")],
-                active_worker_bindings: vec![WorkerId::new("worker-active-chain")],
                 branches: vec![ActiveExecutionBranch {
                     task_id: TaskId::new("task-active-chain"),
                     worker_id: WorkerId::new("worker-active-chain"),
-                    stage: "finish".to_string(),
-                    lease_id: None,
-                    execution_intent_ref: None,
-                    binding_lifecycle: None,
-                    checkpoint_stage: None,
-                    next_step_index: None,
-                    checkpoint_at: None,
-                    resume_mode: None,
-                    resume_token: None,
                     use_tools: false,
                     skill_name: None,
                     is_primary: true,
                     thread_id: ThreadId::new("thread-active-chain"),
                 }],
-                recovery_ref: None,
                 dispatch_context: ActiveExecutionDispatchContext {
                     accepted_at: UtcMillis::now(),
                     entry_id: "timeline-active-chain".to_string(),
                     trimmed_text: Some("active chain".to_string()),
                     skill_name: None,
                 },
-                current_turn: None,
+                current_turn_id: None,
             },
         )
         .expect("active execution chain should upsert");
@@ -1402,7 +1302,7 @@ fn bind_execution_ownership_backfills_workspace_into_active_chain() {
             .is_none()
     );
 
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -1463,27 +1363,32 @@ fn active_execution_chain_turn_replaces_stale_session_turn() {
         completed_at: None,
     };
 
+    let admitted_turn = task_turn.clone();
     store
-        .upsert_active_execution_chain(
+        .accept_active_execution_chain_with_timeline_entry(
             session_id.clone(),
+            crate::TimelineEntryInput::new(
+                format!("timeline-chain-{}", admitted_turn.turn_id),
+                crate::TimelineEntryKind::UserMessage,
+                admitted_turn.user_message.clone().unwrap_or_default(),
+                admitted_turn.accepted_at,
+            ),
             ActiveExecutionChain {
                 session_id: session_id.clone(),
                 mission_id: MissionId::new("mission-active-chain-turn-replace"),
                 root_task_id: TaskId::new("task-root-active-chain-turn-replace"),
                 execution_chain_ref: "chain-active-chain-turn-replace".to_string(),
                 workspace_id: None,
-                active_branch_task_ids: Vec::new(),
-                active_worker_bindings: Vec::new(),
                 branches: Vec::new(),
-                recovery_ref: None,
                 dispatch_context: ActiveExecutionDispatchContext {
                     accepted_at: UtcMillis(2),
                     entry_id: "timeline-active-chain-turn-replace".to_string(),
                     trimmed_text: Some("创建产品级任务".to_string()),
                     skill_name: None,
                 },
-                current_turn: Some(task_turn.clone()),
+                current_turn_id: Some(admitted_turn.turn_id.clone()),
             },
+            admitted_turn,
         )
         .expect("task chain should upsert");
 
@@ -1501,8 +1406,7 @@ fn active_execution_chain_turn_replaces_stale_session_turn() {
         sidecar
             .active_execution_chain
             .as_ref()
-            .and_then(|chain| chain.current_turn.as_ref())
-            .map(|turn| turn.turn_id.as_str()),
+            .and_then(|chain| chain.current_turn_id.as_deref()),
         Some("turn-task")
     );
 }
@@ -1530,7 +1434,7 @@ fn active_execution_chain_does_not_reuse_turn_from_different_chain() {
     );
 
     store
-        .upsert_active_execution_chain(
+        .seed_execution_chain_for_test(
             session_id.clone(),
             ActiveExecutionChain {
                 session_id: session_id.clone(),
@@ -1538,33 +1442,34 @@ fn active_execution_chain_does_not_reuse_turn_from_different_chain() {
                 root_task_id: TaskId::new("task-root-active-chain-turn-isolated"),
                 execution_chain_ref: "chain-active-chain-turn-isolated".to_string(),
                 workspace_id: None,
-                active_branch_task_ids: Vec::new(),
-                active_worker_bindings: Vec::new(),
                 branches: Vec::new(),
-                recovery_ref: None,
                 dispatch_context: ActiveExecutionDispatchContext {
                     accepted_at: UtcMillis(2),
                     entry_id: "timeline-active-chain-turn-isolated".to_string(),
                     trimmed_text: Some("创建产品级任务".to_string()),
                     skill_name: None,
                 },
-                current_turn: None,
+                current_turn_id: None,
             },
         )
-        .expect("task chain should upsert");
+        .expect_err("chain without a Turn binding cannot replace the current Turn");
 
     let sidecar = store
         .runtime_sidecar(&session_id)
         .expect("sidecar should exist");
-    assert!(
-        sidecar.current_turn.is_none(),
-        "不同 execution chain 不能复用旧 turn，否则任务会挂到上一轮普通对话"
+    assert_eq!(
+        sidecar
+            .current_turn
+            .as_ref()
+            .map(|turn| turn.turn_id.as_str()),
+        Some("turn-chat")
     );
+    assert!(sidecar.active_execution_chain.is_none());
     assert!(
         sidecar
             .active_execution_chain
             .as_ref()
-            .and_then(|chain| chain.current_turn.as_ref())
+            .and_then(|chain| chain.current_turn_id.as_ref())
             .is_none(),
         "active chain 内部也不能保留跨链 turn"
     );
@@ -1645,7 +1550,7 @@ fn finalize_current_turn_for_continue_closes_active_turn_and_chain_atomically() 
             .expect("active tool item should be visible in the current turn"),
     );
     store
-        .upsert_active_execution_chain(
+        .seed_execution_chain_for_test(
             session_id.clone(),
             test_active_chain(&session_id, "chain-before-continue", Some(chain_turn)),
         )
@@ -1662,9 +1567,8 @@ fn finalize_current_turn_for_continue_closes_active_turn_and_chain_atomically() 
     assert_eq!(
         finalized
             .active_execution_chain
-            .and_then(|chain| chain.current_turn)
-            .map(|turn| turn.status),
-        Some("failed".to_string())
+            .and_then(|chain| chain.current_turn_id),
+        Some("turn-before-continue".to_string())
     );
     assert_eq!(
         store
@@ -1746,20 +1650,74 @@ fn replacing_latest_user_interrupted_turn_is_atomic_and_rejects_stale_retry() {
         .metadata
         .insert("replacesTurnId".to_string(), json!("turn-original"));
     replacement_turn.items = vec![replacement_user_item];
-    let (_, sidecar, superseded_turn) = store
-        .replace_current_turn_with_timeline_entry(
+    let admission_turn = replacement_turn;
+    let chain = test_active_chain(&session_id, "replacement", Some(admission_turn.clone()));
+    let task = magi_core::Task {
+        task_id: chain.root_task_id.clone(),
+        mission_id: chain.mission_id.clone(),
+        root_task_id: chain.root_task_id.clone(),
+        parent_task_id: None,
+        kind: magi_core::TaskKind::LocalAgent,
+        title: "修改后的消息".into(),
+        goal: "修改后的消息".into(),
+        status: magi_core::TaskStatus::Pending,
+        dependency_ids: Vec::new(),
+        required_children: Vec::new(),
+        policy_snapshot: None,
+        executor_binding: None,
+        completion_contract: Default::default(),
+        recovery_checkpoint: None,
+        knowledge_refs: Vec::new(),
+        workspace_scope: None,
+        write_scope: None,
+        input_refs: Vec::new(),
+        output_refs: Vec::new(),
+        evidence_refs: Vec::new(),
+        retry_count: 0,
+        runtime_payload: magi_core::TaskRuntimePayload::None,
+        created_at: UtcMillis(20),
+        updated_at: UtcMillis(20),
+    };
+    let replacement_timeline = TimelineEntryInput::new(
+        "timeline-replacement",
+        TimelineEntryKind::UserMessage,
+        "修改后的消息",
+        UtcMillis(20),
+    );
+    let before = store_mutation_snapshot(&store);
+    reject_canonical_writes(&store);
+    let error = store
+        .replace_current_turn_with_active_execution_chain_and_timeline_entry_and_task(
             session_id.clone(),
             "turn-original",
-            TimelineEntryInput::new(
-                "timeline-replacement",
-                TimelineEntryKind::UserMessage,
-                "修改后的消息",
-                UtcMillis(20),
-            ),
-            replacement_turn,
+            replacement_timeline.clone(),
+            chain.clone(),
+            admission_turn.clone(),
+            &task,
+        )
+        .expect_err("writer failure must reject the whole replacement");
+    assert!(matches!(error, DomainError::Persistence { .. }));
+    assert_store_mutation_snapshot_unchanged(&store, &before);
+
+    let writer = Arc::new(RecordingCanonicalWriter::default());
+    store.install_session_event_writer(writer.clone());
+    let (_, sidecar, superseded_turn, accepted_turn) = store
+        .replace_current_turn_with_active_execution_chain_and_timeline_entry_and_task(
+            session_id.clone(),
+            "turn-original",
+            replacement_timeline,
+            chain,
+            admission_turn.clone(),
+            &task,
         )
         .expect("latest user-interrupted turn should be replaceable");
 
+    assert_eq!(accepted_turn.turn_id, "turn-replacement");
+    assert_eq!(
+        *writer.accepted_tasks.lock().unwrap(),
+        vec![task.task_id.clone()]
+    );
+    assert_eq!(writer.transactions.lock().unwrap()[0].len(), 2);
     assert_eq!(superseded_turn.status, CanonicalTurnStatus::Superseded);
     assert_eq!(
         superseded_turn
@@ -1784,17 +1742,25 @@ fn replacing_latest_user_interrupted_turn_is_atomic_and_rejects_stale_retry() {
         Some("turn-original")
     );
 
-    let stale_result = store.replace_current_turn_with_timeline_entry(
-        session_id.clone(),
-        "turn-original",
-        TimelineEntryInput::new(
-            "timeline-stale-replacement",
-            TimelineEntryKind::UserMessage,
-            "过期编辑",
-            UtcMillis(30),
-        ),
-        test_turn("turn-stale-replacement", "running", 30),
-    );
+    let before_stale = store_mutation_snapshot(&store);
+    let stale_result = store
+        .replace_current_turn_with_active_execution_chain_and_timeline_entry_and_task(
+            session_id.clone(),
+            "turn-original",
+            TimelineEntryInput::new(
+                "timeline-stale-replacement",
+                TimelineEntryKind::UserMessage,
+                "过期编辑",
+                UtcMillis(30),
+            ),
+            test_active_chain(
+                &session_id,
+                "stale-replacement",
+                Some((test_turn("turn-stale-replacement", "running", 30)).clone()),
+            ),
+            test_turn("turn-stale-replacement", "running", 30),
+            &task,
+        );
     assert!(matches!(
         stale_result,
         Err(magi_core::DomainError::InvalidState { .. })
@@ -1806,6 +1772,8 @@ fn replacing_latest_user_interrupted_turn_is_atomic_and_rejects_stale_retry() {
             .any(|entry| entry.entry_id == "timeline-stale-replacement"),
         "竞争失败不能留下新的 timeline 记录"
     );
+    assert_store_mutation_snapshot_unchanged(&store, &before_stale);
+    assert_eq!(writer.transactions.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -1821,10 +1789,11 @@ fn user_interruption_atomically_pauses_running_goal_and_plan() {
         "turn-create-goal-user-interruption",
         "验证用户中断释放 Goal continuation",
     );
+    let admission_turn = test_turn("turn-goal-user-interruption", "running", 10);
     let chain = test_active_chain(
         &session_id,
         "goal-user-interruption",
-        Some(test_turn("turn-goal-user-interruption", "running", 10)),
+        Some(admission_turn.clone()),
     );
     let continuation_turn_id = chain.root_task_id.to_string();
     store
@@ -1861,6 +1830,7 @@ fn user_interruption_atomically_pauses_running_goal_and_plan() {
                 UtcMillis(10),
             ),
             chain,
+            admission_turn.clone(),
         )
         .expect("goal continuation should start");
     assert_eq!(
@@ -1902,10 +1872,11 @@ fn daemon_restart_releases_running_goal_continuation() {
         "turn-create-goal-daemon-interruption",
         "验证 daemon 重启释放 Goal continuation",
     );
+    let admission_turn = test_turn("turn-goal-daemon-interruption", "running", 10);
     let chain = test_active_chain(
         &session_id,
         "goal-daemon-interruption",
-        Some(test_turn("turn-goal-daemon-interruption", "running", 10)),
+        Some(admission_turn.clone()),
     );
     store
         .accept_goal_continuation_with_timeline_entry(
@@ -1918,6 +1889,7 @@ fn daemon_restart_releases_running_goal_continuation() {
                 UtcMillis(10),
             ),
             chain,
+            admission_turn.clone(),
         )
         .expect("goal continuation should start");
 
@@ -1944,10 +1916,11 @@ fn interrupted_execution_resume_restores_owned_goal_plan_and_live_timing() {
     store
         .create_session(session_id.clone(), "Interrupted Goal Resume")
         .expect("session should be creatable");
+    let admission_turn = test_turn("turn-interrupted-goal-resume", "running", 10);
     let chain = test_active_chain(
         &session_id,
         "interrupted-goal-resume",
-        Some(test_turn("turn-interrupted-goal-resume", "running", 10)),
+        Some(admission_turn.clone()),
     );
     let goal = create_test_goal(
         &store,
@@ -1987,6 +1960,7 @@ fn interrupted_execution_resume_restores_owned_goal_plan_and_live_timing() {
                 UtcMillis(10),
             ),
             chain,
+            admission_turn.clone(),
         )
         .expect("goal continuation should start");
     assert_eq!(
@@ -2111,8 +2085,9 @@ fn interrupted_execution_does_not_resume_unrelated_paused_goal() {
             test_active_chain(
                 &session_id,
                 "unrelated-interruption",
-                Some(test_turn("turn-unrelated-interruption", "running", 10)),
+                Some((test_turn("turn-unrelated-interruption", "running", 10)).clone()),
             ),
+            test_turn("turn-unrelated-interruption", "running", 10),
         )
         .expect("unrelated chain should persist");
     store
@@ -2154,7 +2129,12 @@ fn restore_reconciles_terminal_goal_continuation() {
     let mut task_item = test_turn_item("item-goal-terminal-restore", "继续 Goal");
     task_item.task_id = Some(TaskId::new("task-root-goal-terminal-restore"));
     turn.items.push(task_item);
-    let chain = test_active_chain(&session_id, "goal-terminal-restore", Some(turn));
+    let admission_turn = turn;
+    let chain = test_active_chain(
+        &session_id,
+        "goal-terminal-restore",
+        Some(admission_turn.clone()),
+    );
     let continuation_turn_id = chain.root_task_id.to_string();
     store
         .accept_goal_continuation_with_timeline_entry(
@@ -2167,6 +2147,7 @@ fn restore_reconciles_terminal_goal_continuation() {
                 UtcMillis(10),
             ),
             chain,
+            admission_turn.clone(),
         )
         .expect("goal continuation should start");
     store
@@ -2212,10 +2193,11 @@ fn accept_active_execution_chain_with_timeline_entry_writes_timeline_and_turn_at
     store
         .create_session(session_id.clone(), "Atomic Task Accept")
         .expect("session should be creatable");
+    let admission_turn = test_turn("turn-task", "accepted", 3);
     let chain = test_active_chain(
         &session_id,
         "chain-atomic-task-accept",
-        Some(test_turn("turn-task", "accepted", 3)),
+        Some(admission_turn.clone()),
     );
 
     let (entry_id, sidecar) = store
@@ -2228,6 +2210,7 @@ fn accept_active_execution_chain_with_timeline_entry_writes_timeline_and_turn_at
                 UtcMillis(3),
             ),
             chain,
+            admission_turn.clone(),
         )
         .expect("task chain should be accepted");
 
@@ -2246,9 +2229,9 @@ fn accept_active_execution_chain_with_timeline_entry_writes_timeline_and_turn_at
     assert!(
         sidecar
             .active_execution_chain
-            .and_then(|chain| chain.current_turn)
+            .and_then(|chain| chain.current_turn_id)
             .is_some(),
-        "active chain 内部必须同步携带当前 turn"
+        "active chain 只保留当前 Turn 身份"
     );
 }
 
@@ -2259,10 +2242,11 @@ fn accept_active_execution_chain_rejects_invalid_canonical_turn_without_partial_
     store
         .create_session(session_id.clone(), "Atomic Invalid Canonical Turn")
         .expect("session should be creatable");
+    let admission_turn = test_turn("turn-invalid", "invalid", 4);
     let chain = test_active_chain(
         &session_id,
         "chain-atomic-invalid-canonical-turn",
-        Some(test_turn("turn-invalid", "invalid", 4)),
+        Some(admission_turn.clone()),
     );
 
     let result = store.accept_active_execution_chain_with_timeline_entry(
@@ -2274,6 +2258,7 @@ fn accept_active_execution_chain_rejects_invalid_canonical_turn_without_partial_
             UtcMillis(4),
         ),
         chain,
+        admission_turn.clone(),
     );
 
     assert!(matches!(
@@ -2298,10 +2283,11 @@ fn accept_active_execution_chain_rejects_running_turn_without_timeline_write() {
         .create_session(session_id.clone(), "Atomic Task Reject")
         .expect("session should be creatable");
     accept_test_turn(&store, &session_id, test_turn("turn-running", "running", 1));
+    let admission_turn = test_turn("turn-task", "accepted", 4);
     let chain = test_active_chain(
         &session_id,
         "chain-atomic-task-reject",
-        Some(test_turn("turn-task", "accepted", 4)),
+        Some(admission_turn.clone()),
     );
 
     let result = store.accept_active_execution_chain_with_timeline_entry(
@@ -2313,6 +2299,7 @@ fn accept_active_execution_chain_rejects_running_turn_without_timeline_write() {
             UtcMillis(4),
         ),
         chain,
+        admission_turn.clone(),
     );
 
     assert!(matches!(
@@ -2340,28 +2327,26 @@ fn accept_active_execution_chain_rejects_running_turn_without_timeline_write() {
 }
 
 #[test]
-fn upsert_active_execution_chain_rejects_different_running_turn() {
+fn execution_chain_fixture_rejects_a_turn_not_admitted_to_the_session() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-upsert-chain-running-reject");
     store
         .create_session(session_id.clone(), "Upsert Chain Running Reject")
         .expect("session should be creatable");
     accept_test_turn(&store, &session_id, test_turn("turn-running", "running", 1));
+    let admission_turn = test_turn("turn-different", "accepted", 5);
     let chain = test_active_chain(
         &session_id,
         "chain-reject-running",
-        Some(test_turn("turn-different", "accepted", 5)),
+        Some(admission_turn.clone()),
     );
 
-    let result = store.upsert_active_execution_chain(session_id.clone(), chain);
+    let result = store.seed_execution_chain_for_test(session_id.clone(), chain);
 
     assert!(matches!(
         result,
-        Err(magi_core::DomainError::CurrentTurnConflict {
-            session_id: ref conflicted_session_id,
-            active_turn_id: ref conflicted_turn_id,
-        }) if conflicted_session_id == session_id.as_str()
-            && conflicted_turn_id == "turn-running"
+        Err(magi_core::DomainError::InvalidState { ref message })
+            if message.contains("执行链与当前 Turn 归属不一致")
     ));
     assert_eq!(
         store
@@ -2373,44 +2358,94 @@ fn upsert_active_execution_chain_rejects_different_running_turn() {
 }
 
 #[test]
-fn append_current_turn_item_with_timeline_entry_writes_item_and_timeline_atomically() {
+fn execution_chain_refresh_preserves_canonical_and_rejects_stale_continue_binding() {
     let store = SessionStore::new();
-    let session_id = SessionId::new("session-append-item-timeline");
+    let session = SessionId::new("chain-metadata-only");
     store
-        .create_session(session_id.clone(), "Append Item Timeline")
-        .expect("session should be creatable");
-    accept_test_turn(&store, &session_id, test_turn("turn-running", "running", 1));
+        .create_session(session.clone(), "chain metadata")
+        .unwrap();
+    let turn = test_turn("turn-chain-original", "running", 10);
+    let chain = test_active_chain(&session, "metadata-only", Some(turn.clone()));
+    let before = store_mutation_snapshot(&store);
+    assert!(store.validate_execution_chain(&session, &chain).is_err());
+    assert_store_mutation_snapshot_unchanged(&store, &before);
 
-    let updated = store
-        .append_current_turn_item_with_timeline_entry_for_turn(
-            &session_id,
-            Some("turn-running"),
+    store
+        .accept_active_execution_chain_with_timeline_entry(
+            session.clone(),
             TimelineEntryInput::new(
-                "timeline-append-item",
+                "timeline-chain-original",
                 TimelineEntryKind::UserMessage,
-                "继续用户消息",
-                UtcMillis(2),
+                "original",
+                UtcMillis(10),
             ),
-            test_turn_item("turn-item-continue-user", "继续用户消息"),
+            chain.clone(),
+            turn,
         )
-        .expect("append should succeed")
-        .expect("current turn should exist");
+        .unwrap();
+    store
+        .upsert_current_turn_item_for_turn(
+            &session,
+            Some("turn-chain-original"),
+            test_turn_item("canonical-only-item", "committed content"),
+        )
+        .unwrap();
+    store
+        .update_current_turn_status_for_turn_with_change(
+            &session,
+            Some("turn-chain-original"),
+            "failed",
+        )
+        .unwrap();
+    let canonical = serde_json::to_value(store.canonical_turns_for_session(&session)).unwrap();
+    let current =
+        serde_json::to_value(store.runtime_sidecar(&session).unwrap().current_turn).unwrap();
+    let timeline = serde_json::to_value(store.timeline_for_session(&session)).unwrap();
 
-    assert!(
-        store
-            .timeline_for_session(&session_id)
-            .iter()
-            .any(
-                |entry| entry.entry_id == "timeline-append-item" && entry.message == "继续用户消息"
-            )
+    // Even a writer that rejects every canonical transaction cannot block metadata refresh.
+    reject_canonical_writes(&store);
+    store.validate_execution_chain(&session, &chain).unwrap();
+    assert_eq!(
+        serde_json::to_value(store.canonical_turns_for_session(&session)).unwrap(),
+        canonical
     );
-    assert!(
-        updated
-            .current_turn
-            .expect("turn should remain")
-            .items
-            .iter()
-            .any(|item| item.item_id == "turn-item-continue-user")
+    assert_eq!(
+        serde_json::to_value(store.runtime_sidecar(&session).unwrap().current_turn).unwrap(),
+        current
+    );
+    assert_eq!(
+        serde_json::to_value(store.timeline_for_session(&session)).unwrap(),
+        timeline
+    );
+    let mut encoded = serde_json::to_value(&chain).unwrap();
+    assert!(encoded.get("currentTurn").is_none());
+    assert_eq!(encoded["currentTurnId"], "turn-chain-original");
+    encoded["currentTurn"] = current;
+    assert!(serde_json::from_value::<ActiveExecutionChain>(encoded).is_err());
+
+    store.install_session_event_writer(Arc::new(RecordingCanonicalWriter::default()));
+    store
+        .accept_current_turn_with_timeline_entry(
+            session.clone(),
+            TimelineEntryInput::new(
+                "timeline-chain-continue",
+                TimelineEntryKind::UserMessage,
+                "continue",
+                UtcMillis(20),
+            ),
+            test_turn("turn-chain-continue", "running", 20),
+        )
+        .unwrap();
+    let before = store_mutation_snapshot(&store);
+    assert!(store.validate_execution_chain(&session, &chain).is_err());
+    assert_store_mutation_snapshot_unchanged(&store, &before);
+    assert_eq!(
+        store
+            .active_execution_chain(&session)
+            .unwrap()
+            .current_turn_id
+            .as_deref(),
+        Some("turn-chain-continue")
     );
 }
 
@@ -2972,10 +3007,11 @@ fn canonical_writer_failure_keeps_daemon_restart_interruption_unchanged() {
         goal_turn_id,
         "canonical writer 失败时重启中断不应释放目标",
     );
+    let admission_turn = test_turn(goal_turn_id, "running", 10);
     let chain = test_active_chain(
         &session_id,
         "chain-writer-failure-restart",
-        Some(test_turn(goal_turn_id, "running", 10)),
+        Some(admission_turn.clone()),
     );
     store
         .accept_goal_continuation_with_timeline_entry(
@@ -2988,6 +3024,7 @@ fn canonical_writer_failure_keeps_daemon_restart_interruption_unchanged() {
                 UtcMillis(10),
             ),
             chain,
+            admission_turn.clone(),
         )
         .expect("goal continuation should be stored");
 
@@ -3017,14 +3054,22 @@ fn canonical_writer_failure_keeps_interrupted_recovery_claim_unchanged() {
     store
         .create_session(session_id.clone(), "Writer Failure Claim")
         .expect("session should be creatable");
+    let admitted_turn = test_turn("turn-writer-failure-claim", "running", 10);
     store
-        .upsert_active_execution_chain(
+        .accept_active_execution_chain_with_timeline_entry(
             session_id.clone(),
+            TimelineEntryInput::new(
+                format!("timeline-chain-{}", admitted_turn.turn_id),
+                TimelineEntryKind::UserMessage,
+                admitted_turn.user_message.clone().unwrap_or_default(),
+                admitted_turn.accepted_at,
+            ),
             test_active_chain(
                 &session_id,
                 "chain-writer-failure-claim",
-                Some(test_turn("turn-writer-failure-claim", "running", 10)),
+                Some(admitted_turn.clone()),
             ),
+            admitted_turn,
         )
         .expect("active execution chain should be stored");
     store
@@ -3051,14 +3096,22 @@ fn canonical_writer_failure_keeps_interrupted_recovery_release_unchanged() {
     store
         .create_session(session_id.clone(), "Writer Failure Release")
         .expect("session should be creatable");
+    let admitted_turn = test_turn(turn_id, "running", 10);
     store
-        .upsert_active_execution_chain(
+        .accept_active_execution_chain_with_timeline_entry(
             session_id.clone(),
+            TimelineEntryInput::new(
+                format!("timeline-chain-{}", admitted_turn.turn_id),
+                TimelineEntryKind::UserMessage,
+                admitted_turn.user_message.clone().unwrap_or_default(),
+                admitted_turn.accepted_at,
+            ),
             test_active_chain(
                 &session_id,
                 "chain-writer-failure-release",
-                Some(test_turn(turn_id, "running", 10)),
+                Some(admitted_turn.clone()),
             ),
+            admitted_turn,
         )
         .expect("active execution chain should be stored");
     store
@@ -3080,94 +3133,6 @@ fn canonical_writer_failure_keeps_interrupted_recovery_release_unchanged() {
     assert_store_mutation_snapshot_unchanged(&store, &before);
     assert!(!store.has_recovery_ready_interruption(&session_id));
     assert!(store.has_claimed_interrupted_recovery(&session_id));
-}
-
-#[test]
-fn canonical_writer_failure_keeps_branch_snapshot_unchanged() {
-    let store = SessionStore::new();
-    let session_id = SessionId::new("session-writer-failure-branch");
-    let task_id = TaskId::new("task-writer-failure-branch");
-    let worker_id = WorkerId::new("worker-writer-failure-branch");
-    store
-        .create_session(session_id.clone(), "Writer Failure Branch")
-        .expect("session should be creatable");
-    let mut chain = test_active_chain(
-        &session_id,
-        "chain-writer-failure-branch",
-        Some(test_turn("turn-writer-failure-branch", "running", 10)),
-    );
-    chain.active_branch_task_ids = vec![task_id.clone()];
-    chain.active_worker_bindings = vec![worker_id.clone()];
-    chain.branches = vec![ActiveExecutionBranch {
-        task_id: task_id.clone(),
-        worker_id: worker_id.clone(),
-        stage: "execute".to_string(),
-        lease_id: None,
-        execution_intent_ref: None,
-        binding_lifecycle: None,
-        checkpoint_stage: None,
-        next_step_index: None,
-        checkpoint_at: None,
-        resume_mode: None,
-        resume_token: None,
-        use_tools: true,
-        skill_name: None,
-        is_primary: true,
-        thread_id: ThreadId::new("thread-writer-failure-branch"),
-    }];
-    store
-        .upsert_active_execution_chain(session_id.clone(), chain)
-        .expect("active execution chain should be stored");
-
-    // 模拟运行态 sidecar 已收到新 item，而 canonical 尚未收到该事实；分支快照
-    // 不能在 canonical writer 失败时把候选 branch 或 sidecar 提前写入内存。
-    let mut stale_sidecar = store
-        .runtime_sidecar(&session_id)
-        .expect("sidecar should exist");
-    let mut sidecar_turn = stale_sidecar
-        .current_turn
-        .clone()
-        .expect("current turn should exist");
-    sidecar_turn
-        .items
-        .push(test_turn_item("item-branch-delta", "运行中"));
-    sidecar_turn.normalize();
-    stale_sidecar.current_turn = Some(sidecar_turn.clone());
-    if let Some(chain) = stale_sidecar.active_execution_chain.as_mut() {
-        chain.current_turn = Some(sidecar_turn);
-    }
-    store.upsert_runtime_sidecar(stale_sidecar);
-
-    let before = store_mutation_snapshot(&store);
-    reject_canonical_writes(&store);
-
-    let error = store
-        .update_active_execution_branch_snapshot(ActiveExecutionBranchSnapshotUpdate {
-            task_id,
-            worker_id,
-            stage: "verify".to_string(),
-            lease_id: None,
-            execution_intent_ref: None,
-            binding_lifecycle: Some("active".to_string()),
-            checkpoint_stage: Some("checkpoint".to_string()),
-            next_step_index: Some(1),
-            checkpoint_at: Some(UtcMillis(20)),
-            resume_mode: Some("resume".to_string()),
-            resume_token: Some("token".to_string()),
-        })
-        .expect_err("canonical writer failure should reject branch snapshot");
-    assert!(matches!(error, DomainError::Persistence { .. }));
-    assert_store_mutation_snapshot_unchanged(&store, &before);
-    assert_eq!(
-        store
-            .runtime_sidecar(&session_id)
-            .expect("sidecar should remain")
-            .active_execution_chain
-            .expect("execution chain should remain")
-            .branches[0]
-            .stage,
-        "execute"
-    );
 }
 
 #[test]
@@ -3618,7 +3583,12 @@ fn daemon_restart_interruption_is_terminal_recoverable_and_single_claim() {
     assistant_item.status = "running".to_string();
     assistant_item.source = "orchestrator".to_string();
     turn.items = vec![user_item, assistant_item];
-    let chain = test_active_chain(&session_id, "daemon-restart-interrupted", Some(turn));
+    let admission_turn = turn;
+    let chain = test_active_chain(
+        &session_id,
+        "daemon-restart-interrupted",
+        Some(admission_turn.clone()),
+    );
     store
         .accept_active_execution_chain_with_timeline_entry(
             session_id.clone(),
@@ -3629,6 +3599,7 @@ fn daemon_restart_interruption_is_terminal_recoverable_and_single_claim() {
                 UtcMillis(10),
             ),
             chain,
+            admission_turn.clone(),
         )
         .expect("active chain should be accepted");
 
@@ -3644,6 +3615,9 @@ fn daemon_restart_interruption_is_terminal_recoverable_and_single_claim() {
             .find(|sidecar| sidecar.session_id == session_id)
             .expect("runtime sidecar should exist")
             .updated_at = UtcMillis(2_500);
+        for item in &mut state.canonical_turns[0].items {
+            item.updated_at = UtcMillis(2_000);
+        }
     }
 
     let interrupted = store
@@ -3737,7 +3711,7 @@ fn killed_task_status_item_is_written_as_cancelled_canonical_item() {
 }
 
 #[test]
-fn persisted_parts_keep_durable_terminal_turn_over_stale_sidecar_running_turn() {
+fn sidecar_identity_reads_latest_canonical_turn_before_and_after_restart() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-sidecar-terminal-wins");
     store
@@ -3748,21 +3722,26 @@ fn persisted_parts_keep_durable_terminal_turn_over_stale_sidecar_running_turn() 
         &session_id,
         test_turn("turn-terminal-wins", "running", 10),
     );
+    let sidecar_store = store.execution_sidecar_store_state();
     store
         .set_current_turn_status_for_test(&session_id, Some("turn-terminal-wins"), "completed")
         .expect("turn should complete");
 
     let durable_state = store.durable_state();
-    let mut sidecar_store = store.execution_sidecar_store_state();
-    let stale_turn = sidecar_store.runtime_sidecars[0]
-        .current_turn
-        .as_mut()
-        .expect("sidecar current turn should exist");
-    stale_turn.status = "running".to_string();
-    stale_turn.completed_at = None;
-
+    let stored = serde_json::to_value(&sidecar_store.runtime_sidecars[0]).unwrap();
+    assert_eq!(stored["current_turn_id"], "turn-terminal-wins");
+    assert!(stored.get("current_turn").is_none());
+    assert_eq!(
+        store
+            .runtime_sidecar(&session_id)
+            .unwrap()
+            .current_turn
+            .unwrap()
+            .status,
+        "completed"
+    );
     let restored = SessionStore::from_persisted_parts(durable_state, sidecar_store)
-        .expect("陈旧执行 Turn 清理后的持久化恢复应成功");
+        .expect("Turn 身份应从最新 canonical 事实恢复");
     let turns = restored.canonical_turns_for_session(&session_id);
     assert_eq!(turns.len(), 1);
     assert_eq!(turns[0].status, CanonicalTurnStatus::Completed);
@@ -3774,49 +3753,6 @@ fn persisted_parts_keep_durable_terminal_turn_over_stale_sidecar_running_turn() 
         .expect("terminal sidecar turn should remain");
     assert_eq!(sidecar_turn.status, "completed");
     assert_eq!(sidecar_turn.completed_at, turns[0].completed_at);
-}
-
-#[test]
-fn persisted_parts_rejects_non_terminal_canonical_and_sidecar_item_mismatch() {
-    let store = SessionStore::new();
-    let session_id = SessionId::new("session-terminal-active-item-repair");
-    store
-        .create_session(session_id.clone(), "Terminal Active Item Repair")
-        .expect("session should be creatable");
-    accept_test_turn(
-        &store,
-        &session_id,
-        test_turn("turn-terminal-active-item-repair", "running", 10),
-    );
-
-    let mut assistant_item = test_turn_item("turn-item-terminal-active", "任务执行需要处理");
-    assistant_item.kind = "assistant_error".to_string();
-    assistant_item.status = "running".to_string();
-    store
-        .upsert_current_turn_item_for_turn(
-            &session_id,
-            Some("turn-terminal-active-item-repair"),
-            assistant_item,
-        )
-        .expect("assistant item should upsert");
-    store
-        .set_current_turn_status_for_test(
-            &session_id,
-            Some("turn-terminal-active-item-repair"),
-            "blocked",
-        )
-        .expect("turn should become blocked");
-
-    let mut durable_state = store.durable_state();
-    durable_state.canonical_turns[0].items[0].status =
-        crate::models::CanonicalTurnItemStatus::Running;
-    let sidecar_store = store.execution_sidecar_store_state();
-
-    let error = match SessionStore::from_persisted_parts(durable_state, sidecar_store) {
-        Ok(_) => panic!("非终态 canonical 与 sidecar item 状态不一致时必须拒绝恢复"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("非终态 canonical 状态不一致"));
 }
 
 #[test]
@@ -3840,6 +3776,80 @@ fn persisted_parts_rejects_sidecar_turn_without_canonical_fact() {
             Err(error) => error,
         };
     assert!(error.to_string().contains("缺少对应 canonical turn"));
+}
+
+#[test]
+fn sidecar_restore_rejects_foreign_turns_mismatched_chains_and_embedded_turns() {
+    let (store, request) = user_question_fixture();
+    let durable = store.durable_state();
+    let sidecars = store.execution_sidecar_store_state();
+    let mut foreign = durable.clone();
+    foreign.canonical_turns[0].session_id = SessionId::new("another-session");
+    assert!(SessionStore::from_persisted_parts(foreign, sidecars.clone()).is_err());
+    for mismatch in ["turn", "session"] {
+        let mut broken = sidecars.clone();
+        let chain = broken.runtime_sidecars[0]
+            .active_execution_chain
+            .as_mut()
+            .unwrap();
+        if mismatch == "turn" {
+            chain.current_turn_id = Some("another-turn".into());
+        } else {
+            chain.session_id = SessionId::new("another-session");
+        }
+        assert!(SessionStore::from_persisted_parts(durable.clone(), broken).is_err());
+    }
+    let mut embedded = serde_json::to_value(&sidecars).unwrap();
+    embedded["runtime_sidecars"][0]["current_turn"] = serde_json::to_value(
+        store
+            .runtime_sidecar(&request.session_id)
+            .unwrap()
+            .current_turn,
+    )
+    .unwrap();
+    assert!(serde_json::from_value::<SessionExecutionSidecarStoreState>(embedded).is_err());
+}
+
+#[test]
+fn restart_activity_time_comes_from_canonical_items_and_model_attempts() {
+    for use_model_step in [false, true] {
+        let (store, request) = user_question_fixture();
+        let mut durable = store.durable_state();
+        let mut sidecars = store.execution_sidecar_store_state();
+        sidecars.runtime_sidecars[0].updated_at = UtcMillis(20);
+        durable.canonical_turns[0].items[0].updated_at =
+            UtcMillis(if use_model_step { 30 } else { 100 });
+        let restored = SessionStore::from_persisted_parts(durable, sidecars.clone()).unwrap();
+        if use_model_step {
+            let mut step = test_model_step("latest-activity", vec![]);
+            step.started_at = UtcMillis(100);
+            step.attempts[0].started_at = UtcMillis(100);
+            restored
+                .begin_model_step(&request.session_id, &request.turn_id, step)
+                .unwrap();
+        }
+        assert_eq!(
+            serde_json::to_value(restored.execution_sidecar_store_state()).unwrap(),
+            serde_json::to_value(sidecars).unwrap(),
+            "canonical 更新不需要同步 sidecar"
+        );
+        assert_eq!(
+            restored
+                .execution_sidecar_export(&request.session_id)
+                .unwrap()
+                .last_update,
+            UtcMillis(100)
+        );
+        let settled = restored
+            .interrupt_current_turn_by_daemon_restart(&request.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            settled.current_turn.unwrap().completed_at,
+            Some(UtcMillis(100)),
+            "重启不能按旧元数据提前结算 Turn"
+        );
+    }
 }
 
 #[test]
@@ -3965,7 +3975,7 @@ fn stale_turn_writeback_cannot_mutate_a_replacement_turn_or_resurrect_cancelled_
         .expect("old turn should be interruptible");
     accept_test_turn(&store, &session_id, test_turn("turn-new", "running", 2));
 
-    let stale_item = store.append_current_turn_item_for_turn(
+    let stale_item = store.upsert_current_turn_item_for_turn(
         &session_id,
         Some("turn-old"),
         test_turn_item("turn-item-stale", "迟到的旧轮次写回"),
@@ -3988,45 +3998,6 @@ fn stale_turn_writeback_cannot_mutate_a_replacement_turn_or_resurrect_cancelled_
     assert_eq!(current_turn.turn_id, "turn-new");
     assert_eq!(current_turn.status, "running");
     assert!(current_turn.items.is_empty());
-}
-
-#[test]
-fn append_current_turn_item_with_timeline_entry_does_not_write_timeline_without_turn() {
-    let store = SessionStore::new();
-    let session_id = SessionId::new("session-append-item-no-turn");
-    store
-        .create_session(session_id.clone(), "Append Item No Turn")
-        .expect("session should be creatable");
-    store.bind_execution_ownership(
-        session_id.clone(),
-        ExecutionOwnership {
-            session_id: Some(session_id.clone()),
-            ..ExecutionOwnership::default()
-        },
-    );
-
-    let updated = store
-        .append_current_turn_item_with_timeline_entry_for_turn(
-            &session_id,
-            Some("turn-no-current"),
-            TimelineEntryInput::new(
-                "timeline-no-turn",
-                TimelineEntryKind::UserMessage,
-                "不应写入的继续消息",
-                UtcMillis(2),
-            ),
-            test_turn_item("turn-item-no-turn", "不应写入的继续消息"),
-        )
-        .expect("missing current turn is a non-mutating no-op");
-
-    assert!(updated.is_none());
-    assert!(
-        !store
-            .timeline_for_session(&session_id)
-            .iter()
-            .any(|entry| entry.entry_id == "timeline-no-turn"),
-        "current_turn 不存在时不能留下 continue 用户 timeline"
-    );
 }
 
 #[test]
@@ -4168,7 +4139,7 @@ fn persisted_parts_round_trip_preserves_sidecars() {
     store
         .create_session(session_id.clone(), "Persisted Session")
         .expect("session should be creatable");
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -4178,7 +4149,7 @@ fn persisted_parts_round_trip_preserves_sidecars() {
         },
     );
     store
-        .attach_recovery_id(&session_id, Some("recovery-persisted".to_string()))
+        .set_recovery_id(&session_id, None, Some("recovery-persisted".to_string()))
         .expect("recovery id should be attachable");
 
     let durable_state = store.durable_state();
@@ -4409,14 +4380,14 @@ fn partial_sidecar_flush_keeps_uncommitted_and_concurrently_changed_sessions_dir
     let second = SessionId::new("checkpoint-second");
     for id in [&first, &second] {
         store.create_session(id.clone(), "checkpoint").unwrap();
-        store.bind_execution_ownership(id.clone(), ExecutionOwnership::default());
+        store.bind_execution_ownership_for_test(id.clone(), ExecutionOwnership::default());
     }
-    let mut changed = store.runtime_sidecar(&second).unwrap();
-    changed.updated_at = UtcMillis(changed.updated_at.0 + 1);
     assert!(
         store
             .flush_execution_sidecar_snapshot_with(|_, _, _| {
-                store.upsert_runtime_sidecar(changed.clone());
+                store
+                    .set_recovery_id(&second, None, Some("checkpoint-changed".into()))
+                    .unwrap();
                 Ok::<_, ()>(vec![second.clone()])
             })
             .unwrap()
@@ -4476,7 +4447,7 @@ fn execution_sidecar_flush_metadata_tracks_recovery_apply_and_resume() {
         .create_session(session_id.clone(), "metadata session")
         .expect("session should be creatable");
 
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -4588,7 +4559,7 @@ fn full_recovery_lifecycle_bind_resume_input_dispatch_with_consistency_checks() 
         .create_session(session_id.clone(), "Recovery Lifecycle")
         .expect("session should be creatable");
 
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -4727,7 +4698,7 @@ fn resumed_status_survives_follow_up_binding_and_chain_refresh() {
     store
         .create_session(session_id.clone(), "Resume Preserve")
         .expect("session should be creatable");
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -4768,7 +4739,7 @@ fn resumed_status_survives_follow_up_binding_and_chain_refresh() {
         )
         .expect("resume execution target should apply");
 
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -4788,7 +4759,7 @@ fn resumed_status_survives_follow_up_binding_and_chain_refresh() {
     );
 
     store
-        .upsert_active_execution_chain(
+        .seed_execution_chain_for_test(
             session_id.clone(),
             ActiveExecutionChain {
                 session_id: session_id.clone(),
@@ -4796,33 +4767,21 @@ fn resumed_status_survives_follow_up_binding_and_chain_refresh() {
                 root_task_id: root_task_id.clone(),
                 execution_chain_ref: execution_chain_ref.clone(),
                 workspace_id: Some(workspace_id.clone()),
-                active_branch_task_ids: vec![TaskId::new("task-resume-preserve-follow-up")],
-                active_worker_bindings: vec![WorkerId::new("worker-resume-preserve-follow-up")],
                 branches: vec![ActiveExecutionBranch {
                     task_id: TaskId::new("task-resume-preserve-follow-up"),
                     worker_id: WorkerId::new("worker-resume-preserve-follow-up"),
-                    stage: "execute".to_string(),
-                    lease_id: None,
-                    execution_intent_ref: None,
-                    binding_lifecycle: None,
-                    checkpoint_stage: None,
-                    next_step_index: None,
-                    checkpoint_at: None,
-                    resume_mode: None,
-                    resume_token: None,
                     use_tools: false,
                     skill_name: None,
                     is_primary: true,
                     thread_id: ThreadId::new("thread-resume-preserve-follow-up"),
                 }],
-                recovery_ref: None,
                 dispatch_context: ActiveExecutionDispatchContext {
                     accepted_at: UtcMillis::now(),
                     entry_id: "timeline-resume-preserve".to_string(),
                     trimmed_text: Some("resume preserve".to_string()),
                     skill_name: None,
                 },
-                current_turn: None,
+                current_turn_id: None,
             },
         )
         .expect("active execution chain should upsert");
@@ -4833,87 +4792,6 @@ fn resumed_status_survives_follow_up_binding_and_chain_refresh() {
             .status,
         SessionExecutionSidecarStatus::Resumed
     );
-}
-
-#[test]
-fn clear_ownership_after_resume_resets_to_recovery_linked_or_detached() {
-    let store = SessionStore::new();
-    let session_id = SessionId::new("session-clear-ownership");
-    let workspace_id = WorkspaceId::new("workspace-clear-ownership");
-    store
-        .create_session(session_id.clone(), "Clear Ownership")
-        .expect("session should be creatable");
-
-    store.bind_execution_ownership(
-        session_id.clone(),
-        ExecutionOwnership {
-            session_id: Some(session_id.clone()),
-            workspace_id: Some(workspace_id.clone()),
-            execution_chain_ref: Some("chain-clear".to_string()),
-            ..ExecutionOwnership::default()
-        },
-    );
-    store
-        .apply_recovery_resume_input(
-            session_id.clone(),
-            RecoveryResumeInput {
-                recovery_id: "recovery-clear".to_string(),
-                snapshot_id: "snapshot-clear".to_string(),
-                ownership: ExecutionOwnership {
-                    session_id: Some(session_id.clone()),
-                    workspace_id: Some(workspace_id.clone()),
-                    execution_chain_ref: Some("chain-clear".to_string()),
-                    ..ExecutionOwnership::default()
-                },
-                diagnostic_summary: None,
-                created_at: UtcMillis::now(),
-                updated_at: UtcMillis::now(),
-            },
-        )
-        .expect("recovery input should apply");
-    store
-        .apply_resume_execution_target(
-            &session_id,
-            &TaskExecutionTarget {
-                mission_id: MissionId::new("mission-clear"),
-                root_task_id: TaskId::new("task-root-clear"),
-                task_id: TaskId::new("todo-clear"),
-                requested_worker_id: None,
-                recovery_id: Some("recovery-clear".to_string()),
-                execution_chain_ref: Some("chain-clear".to_string()),
-            },
-        )
-        .expect("resume execution target should apply");
-
-    store
-        .clear_execution_ownership(&session_id)
-        .expect("clear should succeed");
-    let sidecar = store
-        .runtime_sidecar(&session_id)
-        .expect("sidecar should exist after clear");
-    assert_eq!(
-        sidecar.status,
-        SessionExecutionSidecarStatus::RecoveryLinked
-    );
-    assert!(sidecar.ownership.session_id.is_none());
-    assert!(sidecar.ownership.workspace_id.is_none());
-    assert!(sidecar.ownership.mission_id.is_none());
-    assert!(sidecar.ownership.task_id.is_none());
-    assert!(sidecar.ownership.worker_id.is_none());
-    assert!(sidecar.ownership.execution_chain_ref.is_none());
-    assert_eq!(sidecar.recovery_id.as_deref(), Some("recovery-clear"));
-
-    let active = store.active_execution_sidecars();
-    assert!(active.is_empty());
-
-    store
-        .attach_recovery_id(&session_id, None)
-        .expect("detach recovery should succeed");
-    let sidecar = store
-        .runtime_sidecar(&session_id)
-        .expect("sidecar should exist after detach");
-    assert_eq!(sidecar.status, SessionExecutionSidecarStatus::Detached);
-    assert!(sidecar.recovery_id.is_none());
 }
 
 #[test]
@@ -4928,48 +4806,44 @@ fn archive_active_execution_chain_detaches_task_panel_without_deleting_history()
     store
         .create_session(session_id.clone(), "Archive Chain")
         .expect("session should be creatable");
+    let admitted_turn = test_turn("turn-archive-chain", "completed", 42);
     store
-        .upsert_active_execution_chain(
+        .accept_active_execution_chain_with_timeline_entry(
             session_id.clone(),
+            crate::TimelineEntryInput::new(
+                format!("timeline-chain-{}", admitted_turn.turn_id),
+                crate::TimelineEntryKind::UserMessage,
+                admitted_turn.user_message.clone().unwrap_or_default(),
+                admitted_turn.accepted_at,
+            ),
             ActiveExecutionChain {
                 session_id: session_id.clone(),
                 mission_id: mission_id.clone(),
                 root_task_id: root_task_id.clone(),
                 execution_chain_ref: execution_chain_ref.clone(),
                 workspace_id: Some(workspace_id.clone()),
-                active_branch_task_ids: vec![root_task_id.clone()],
-                active_worker_bindings: vec![WorkerId::new("worker-archive-chain")],
                 branches: vec![ActiveExecutionBranch {
                     task_id: root_task_id.clone(),
                     worker_id: WorkerId::new("worker-archive-chain"),
-                    stage: "execute".to_string(),
-                    lease_id: None,
-                    execution_intent_ref: None,
-                    binding_lifecycle: None,
-                    checkpoint_stage: None,
-                    next_step_index: None,
-                    checkpoint_at: None,
-                    resume_mode: None,
-                    resume_token: None,
                     use_tools: true,
                     skill_name: None,
                     is_primary: true,
                     thread_id: ThreadId::new("thread-archive-chain"),
                 }],
-                recovery_ref: Some("recovery-archive-chain".to_string()),
                 dispatch_context: ActiveExecutionDispatchContext {
                     accepted_at: UtcMillis::now(),
                     entry_id: "timeline-archive-chain".to_string(),
                     trimmed_text: Some("archive chain".to_string()),
                     skill_name: None,
                 },
-                current_turn: Some(test_turn("turn-archive-chain", "completed", 42)),
+                current_turn_id: Some(admitted_turn.turn_id.clone()),
             },
+            admitted_turn,
         )
         .expect("active execution chain should upsert");
 
     store
-        .archive_active_execution_chain(&session_id, &root_task_id)
+        .archive_active_execution_chain(&session_id, &root_task_id, Some("turn-archive-chain"))
         .expect("archive should succeed");
 
     let sidecar = store
@@ -4991,6 +4865,259 @@ fn archive_active_execution_chain_detaches_task_panel_without_deleting_history()
 }
 
 #[test]
+fn sidecar_metadata_updates_wait_for_canonical_commit_and_preserve_the_committed_turn() {
+    for operation in [
+        "bind",
+        "recovery_input",
+        "resume_target",
+        "recovery_id",
+        "archive",
+    ] {
+        let store = SessionStore::new();
+        let session = SessionId::new(format!("metadata-{operation}"));
+        store.create_session(session.clone(), operation).unwrap();
+        let turn = test_turn("metadata-turn", "running", 10);
+        let chain = test_active_chain(&session, "metadata-chain", Some(turn.clone()));
+        store
+            .accept_active_execution_chain_with_timeline_entry(
+                session.clone(),
+                TimelineEntryInput::new(
+                    "metadata-timeline",
+                    TimelineEntryKind::UserMessage,
+                    "metadata",
+                    UtcMillis(10),
+                ),
+                chain.clone(),
+                turn,
+            )
+            .unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        store.install_session_event_writer(Arc::new(BlockingCanonicalWriter {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        }));
+        let writer_store = store.clone();
+        let writer_session = session.clone();
+        let writer = thread::spawn(move || {
+            writer_store
+                .set_current_turn_status_for_test(
+                    &writer_session,
+                    Some("metadata-turn"),
+                    "completed",
+                )
+                .unwrap()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let metadata_store = store.clone();
+        let metadata_session = session.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let metadata = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let ownership = ExecutionOwnership {
+                session_id: Some(metadata_session.clone()),
+                mission_id: Some(chain.mission_id.clone()),
+                task_id: Some(chain.root_task_id.clone()),
+                execution_chain_ref: Some(chain.execution_chain_ref.clone()),
+                ..ExecutionOwnership::default()
+            };
+            match operation {
+                "bind" => {
+                    metadata_store.bind_execution_ownership_for_test(metadata_session.clone(), ownership)
+                }
+                "recovery_input" => metadata_store
+                    .apply_recovery_resume_input(
+                        metadata_session.clone(),
+                        RecoveryResumeInput {
+                            recovery_id: "metadata-recovery".into(),
+                            snapshot_id: "metadata-snapshot".into(),
+                            ownership,
+                            diagnostic_summary: None,
+                            created_at: UtcMillis(10),
+                            updated_at: UtcMillis(10),
+                        },
+                    )
+                    .unwrap(),
+                "resume_target" => {
+                    metadata_store
+                        .apply_resume_execution_target(
+                            &metadata_session,
+                            &TaskExecutionTarget {
+                                mission_id: chain.mission_id,
+                                root_task_id: chain.root_task_id.clone(),
+                                task_id: chain.root_task_id,
+                                requested_worker_id: None,
+                                recovery_id: None,
+                                execution_chain_ref: Some(chain.execution_chain_ref),
+                            },
+                        )
+                        .unwrap();
+                }
+                "recovery_id" => {
+                    metadata_store
+                        .set_recovery_id(&metadata_session, None, Some("metadata-recovery".into()))
+                        .unwrap();
+                }
+                "archive" => metadata_store
+                    .archive_active_execution_chain(
+                        &metadata_session,
+                        &chain.root_task_id,
+                        Some("metadata-turn"),
+                    )
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let blocked = done_rx.recv_timeout(Duration::from_millis(100)).is_err();
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        metadata.join().unwrap();
+        assert!(blocked, "{operation} must wait for canonical commit");
+        let sidecar = store.runtime_sidecar(&session).unwrap();
+        assert_eq!(
+            sidecar.current_turn.unwrap().status,
+            "completed",
+            "{operation}"
+        );
+        assert_eq!(
+            store
+                .canonical_turn_for_session_turn_id(&session, "metadata-turn")
+                .unwrap()
+                .status,
+            CanonicalTurnStatus::Completed
+        );
+        match operation {
+            "recovery_input" | "recovery_id" => {
+                assert_eq!(sidecar.recovery_id.as_deref(), Some("metadata-recovery"));
+            }
+            "resume_target" => assert_eq!(sidecar.status, SessionExecutionSidecarStatus::Resumed),
+            "archive" => assert!(sidecar.active_execution_chain.is_none()),
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn stale_archive_and_recovery_cleanup_cannot_detach_a_new_turn_or_recovery() {
+    let store = SessionStore::new();
+    let session = SessionId::new("metadata-stale-owner");
+    store
+        .create_session(session.clone(), "stale owner")
+        .unwrap();
+    let turn = test_turn("old-turn", "completed", 10);
+    let chain = test_active_chain(&session, "retained-chain", Some(turn.clone()));
+    store
+        .accept_active_execution_chain_with_timeline_entry(
+            session.clone(),
+            TimelineEntryInput::new(
+                "old-timeline",
+                TimelineEntryKind::UserMessage,
+                "old",
+                UtcMillis(10),
+            ),
+            chain.clone(),
+            turn,
+        )
+        .unwrap();
+    store
+        .set_recovery_id(&session, None, Some("old-recovery".into()))
+        .unwrap();
+    store
+        .set_recovery_id(&session, Some("old-recovery"), Some("new-recovery".into()))
+        .unwrap();
+    let before = store_mutation_snapshot(&store);
+    assert!(
+        store
+            .set_recovery_id(&session, Some("old-recovery"), None)
+            .is_err()
+    );
+    assert!(
+        store
+            .consume_recovery_id(&session, "old-recovery", || {
+                panic!("不能消费已被替换的恢复记录");
+            })
+            .is_err()
+    );
+    assert!(
+        store
+            .consume_recovery_id(&session, "new-recovery", || {
+                Err(DomainError::InvalidState {
+                    message: "恢复记录拒绝消费".into(),
+                })
+            })
+            .is_err()
+    );
+    assert!(
+        store
+            .apply_resume_execution_target(
+                &session,
+                &TaskExecutionTarget {
+                    mission_id: chain.mission_id.clone(),
+                    root_task_id: chain.root_task_id.clone(),
+                    task_id: chain.root_task_id.clone(),
+                    requested_worker_id: None,
+                    recovery_id: None,
+                    execution_chain_ref: Some(chain.execution_chain_ref.clone()),
+                }
+            )
+            .is_err(),
+        "恢复目标不能通过省略 ID 清掉另一个恢复引用"
+    );
+    assert_store_mutation_snapshot_unchanged(&store, &before);
+
+    store
+        .accept_current_turn_with_timeline_entry(
+            session.clone(),
+            TimelineEntryInput::new(
+                "new-timeline",
+                TimelineEntryKind::UserMessage,
+                "continue",
+                UtcMillis(20),
+            ),
+            test_turn("new-turn", "running", 20),
+        )
+        .unwrap();
+    let before = store_mutation_snapshot(&store);
+    assert!(
+        store
+            .archive_active_execution_chain(&session, &chain.root_task_id, Some("old-turn"))
+            .is_err()
+    );
+    assert!(
+        store
+            .archive_active_execution_chain(&session, &chain.root_task_id, Some("new-turn"))
+            .is_err()
+    );
+    assert_store_mutation_snapshot_unchanged(&store, &before);
+    store
+        .set_current_turn_status_for_test(&session, Some("new-turn"), "completed")
+        .unwrap();
+    let before = store_mutation_snapshot(&store);
+    assert!(
+        store
+            .archive_active_execution_chain(&session, &chain.root_task_id, Some("old-turn"))
+            .is_err()
+    );
+    assert_store_mutation_snapshot_unchanged(&store, &before);
+    store
+        .archive_active_execution_chain(&session, &chain.root_task_id, Some("new-turn"))
+        .unwrap();
+    assert_eq!(store.canonical_turns_for_session(&session).len(), 2);
+    assert!(
+        store
+            .runtime_sidecar(&session)
+            .unwrap()
+            .recovery_id
+            .is_none()
+    );
+}
+
+#[test]
 fn recovery_resume_rejects_mismatched_recovery_id() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-mismatch-recovery");
@@ -4998,7 +5125,7 @@ fn recovery_resume_rejects_mismatched_recovery_id() {
         .create_session(session_id.clone(), "Mismatch Recovery")
         .expect("session should be creatable");
 
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -5006,7 +5133,7 @@ fn recovery_resume_rejects_mismatched_recovery_id() {
         },
     );
     store
-        .attach_recovery_id(&session_id, Some("recovery-A".to_string()))
+        .set_recovery_id(&session_id, None, Some("recovery-A".to_string()))
         .expect("attach recovery_id should succeed");
 
     let err = store
@@ -5048,7 +5175,7 @@ fn recovery_resume_rejects_mismatched_execution_chain_ref() {
         .create_session(session_id.clone(), "Mismatch Chain")
         .expect("session should be creatable");
 
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -5089,7 +5216,7 @@ fn multi_session_recovery_sidecars_are_isolated() {
         .create_session(session_b.clone(), "Session B")
         .expect("session B creatable");
 
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_a.clone(),
         ExecutionOwnership {
             session_id: Some(session_a.clone()),
@@ -5117,7 +5244,7 @@ fn multi_session_recovery_sidecars_are_isolated() {
         )
         .expect("session A recovery should apply");
 
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_b.clone(),
         ExecutionOwnership {
             session_id: Some(session_b.clone()),
@@ -5168,7 +5295,7 @@ fn sidecar_flush_scheduling_with_intermediate_flushes() {
         .create_session(session_id.clone(), "Flush Schedule")
         .expect("session should be creatable");
 
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -5259,7 +5386,7 @@ fn persisted_parts_restore_after_recovery_and_resume_preserves_all_fields() {
     store
         .create_session(session_id.clone(), "Restore Session")
         .expect("session should be creatable");
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -5352,7 +5479,7 @@ fn delete_session_cleans_up_sidecar_and_marks_dirty() {
     store
         .create_session(session_id.clone(), "Delete Sidecar")
         .expect("session should be creatable");
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -5361,7 +5488,7 @@ fn delete_session_cleans_up_sidecar_and_marks_dirty() {
         },
     );
     store
-        .attach_recovery_id(&session_id, Some("recovery-del".to_string()))
+        .set_recovery_id(&session_id, None, Some("recovery-del".to_string()))
         .expect("attach recovery should succeed");
 
     store
@@ -5534,7 +5661,7 @@ fn execution_sidecar_flush_hook_only_persists_dirty_sidecars() {
     );
     assert!(flushes.is_empty());
 
-    store.bind_execution_ownership(
+    store.bind_execution_ownership_for_test(
         session_id.clone(),
         ExecutionOwnership {
             session_id: Some(session_id.clone()),
@@ -5582,7 +5709,6 @@ fn sample_thread(
         last_used_at: now,
         observed_context_window_tokens: None,
         handled_task_ids: Vec::new(),
-        message_history: Vec::new(),
     }
 }
 
@@ -5614,88 +5740,111 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
         .register_thread(thread)
         .expect("thread should register");
     store.record_thread_context_window_tokens(&thread_id, 128_000, UtcMillis(1_100));
-    store.append_thread_messages(
-        &thread_id,
-        vec![
-            ThreadChatMessage {
-                input_request_id: None,
-                role: "assistant".to_string(),
-                content: None,
-                images: Vec::new(),
-                tool_calls: vec![ThreadChatToolCall {
-                    id: "call-shell-round-trip".to_string(),
-                    kind: "function".to_string(),
-                    function: ThreadChatToolFunction {
-                        name: "shell_exec".to_string(),
-                        arguments: r#"{"command":"cargo test"}"#.to_string(),
-                    },
-                }],
-                tool_call_id: None,
-                provider_context: vec![ThreadModelProviderContext {
-                    provider: "anthropic".to_string(),
-                    kind: "thinking".to_string(),
-                    data: json!({
-                        "type": "thinking",
-                        "thinking": "检查测试命令",
-                        "signature": "persisted-signature"
-                    }),
-                }],
-            },
-            ThreadChatMessage {
-                input_request_id: None,
-                role: "tool".to_string(),
-                content: Some("exit code 1: compilation failed".to_string()),
-                images: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_call_id: Some("call-shell-round-trip".to_string()),
-                provider_context: Vec::new(),
-            },
-            ThreadChatMessage {
-                input_request_id: None,
-                role: "user".to_string(),
-                content: Some("继续".to_string()),
-                images: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                provider_context: Vec::new(),
-            },
-        ],
-        UtcMillis(2_000),
-    );
-    store.install_thread_context_checkpoint(
-        &thread_id,
-        ThreadContextCheckpoint {
-            thread_id: thread_id.clone(),
-            checkpoint_id: "checkpoint-round-trip".to_string(),
-            source_message_count: 2,
-            summary_message: ThreadChatMessage {
-                input_request_id: None,
-                role: "system".to_string(),
-                content: Some("已执行测试，编译失败。".to_string()),
-                images: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                provider_context: Vec::new(),
-            },
-            reason: "context_window_pressure".to_string(),
-            original_token_estimate: 12_000,
-            checkpoint_token_estimate: 400,
-            created_at: UtcMillis(2_100),
-            generation: 1,
-            source_fingerprint: String::new(),
-            model_provider: None,
-            model: None,
-            binding_revision: None,
-            projected_request_tokens: 0,
-            context_window_limit_tokens: None,
-            preserved_tail_message_count: 0,
-            file_fact_versions: vec![ThreadFileFactVersion {
-                path: "/tmp/example.rs".to_string(),
-                content_hash: "hash-example".to_string(),
+    let history = vec![
+        ThreadChatMessage {
+            input_request_id: None,
+            role: "assistant".to_string(),
+            content: None,
+            images: Vec::new(),
+            tool_calls: vec![ThreadChatToolCall {
+                id: "call-shell-round-trip".to_string(),
+                kind: "function".to_string(),
+                function: ThreadChatToolFunction {
+                    name: "shell_exec".to_string(),
+                    arguments: r#"{"command":"cargo test"}"#.to_string(),
+                },
+            }],
+            tool_call_id: None,
+            provider_context: vec![ThreadModelProviderContext {
+                provider: "anthropic".to_string(),
+                kind: "thinking".to_string(),
+                data: json!({
+                    "type": "thinking",
+                    "thinking": "检查测试命令",
+                    "signature": "persisted-signature"
+                }),
             }],
         },
-        UtcMillis(2_100),
-    );
+        ThreadChatMessage {
+            input_request_id: None,
+            role: "tool".to_string(),
+            content: Some("exit code 1: compilation failed".to_string()),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call-shell-round-trip".to_string()),
+            provider_context: Vec::new(),
+        },
+        ThreadChatMessage {
+            input_request_id: None,
+            role: "user".to_string(),
+            content: Some("继续".to_string()),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            provider_context: Vec::new(),
+        },
+    ];
+    let mut persisted = store.export_state();
+    let base = json!({ "sessionId": session_id, "turnId": "round-trip", "turnSeq": 1,
+        "createdAt": 2000, "updatedAt": 2000, "status": "completed", "sourceThreadId": thread_id });
+    let mut assistant = base.clone();
+    assistant["itemId"] = json!("assistant");
+    assistant["itemSeq"] = json!(1);
+    assistant["kind"] = json!("assistant_text");
+    assistant["metadata"] =
+        json!({"toolCalls": history[0].tool_calls, "providerContext": history[0].provider_context});
+    let mut tool = base.clone();
+    tool["itemId"] = json!("tool");
+    tool["itemSeq"] = json!(2);
+    tool["kind"] = json!("tool_call");
+    tool["tool"] = json!({"callId":"call-shell-round-trip", "name":"shell_exec", "arguments":{"command":"cargo test"}, "result":history[1].content});
+    let mut user = base;
+    user["itemId"] = json!("user");
+    user["itemSeq"] = json!(3);
+    user["kind"] = json!("user_message");
+    user["content"] = json!("继续");
+    persisted.canonical_turns.push(serde_json::from_value(json!({
+        "sessionId":session_id,"turnId":"round-trip","turnSeq":1,"acceptedAt":2000,"completedAt":2000,
+        "status":"completed","items":[assistant, tool, user]
+    })).unwrap());
+    let store = SessionStore::from_state_for_test(persisted);
+    store
+        .install_thread_context_checkpoint_checked(
+            &thread_id,
+            ThreadContextCheckpoint {
+                thread_id: thread_id.clone(),
+                checkpoint_id: "checkpoint-round-trip".to_string(),
+                source_message_count: 2,
+                summary_message: ThreadChatMessage {
+                    input_request_id: None,
+                    role: "system".to_string(),
+                    content: Some("已执行测试，编译失败。".to_string()),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                },
+                reason: "context_window_pressure".to_string(),
+                original_token_estimate: 12_000,
+                checkpoint_token_estimate: 400,
+                created_at: UtcMillis(2_100),
+                generation: 1,
+                tool_result_projection_fingerprint: None,
+                source_fingerprint: crate::thread_history_fingerprint(&history[..2]),
+                model_provider: None,
+                model: None,
+                binding_revision: None,
+                projected_request_tokens: 0,
+                context_window_limit_tokens: None,
+                preserved_tail_message_count: 0,
+                file_fact_versions: vec![ThreadFileFactVersion {
+                    path: "/tmp/example.rs".to_string(),
+                    content_hash: "hash-example".to_string(),
+                }],
+            },
+            UtcMillis(2_100),
+        )
+        .expect("checkpoint should install");
 
     let restored = SessionStore::from_persisted_parts(
         store.durable_state(),
@@ -5712,12 +5861,12 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
         restored_threads[0].observed_context_window_tokens,
         Some(128_000)
     );
-    assert_eq!(
-        restored.thread_context_window_tokens(&restored_threads[0].thread_id),
-        Some(128_000)
-    );
 
-    let history = restored.thread_message_history(&restored_threads[0].thread_id);
+    let history = restored
+        .thread_context_snapshot(&restored_threads[0].thread_id)
+        .unwrap()
+        .messages()
+        .to_vec();
     assert_eq!(history.len(), 3);
     assert_eq!(history[0].role, "assistant");
     assert_eq!(history[0].tool_calls[0].function.name, "shell_exec");
@@ -5730,7 +5879,10 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
         Some("exit code 1: compilation failed")
     );
     assert_eq!(history[2].content.as_deref(), Some("继续"));
-    let context_history = restored.thread_context_history(&restored_threads[0].thread_id);
+    let context_history = restored
+        .thread_context_snapshot(&restored_threads[0].thread_id)
+        .unwrap()
+        .model_history();
     assert_eq!(context_history.len(), 2);
     assert_eq!(context_history[0].role, "system");
     assert_eq!(context_history[1].content.as_deref(), Some("继续"));
@@ -5739,13 +5891,6 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
         .expect("checkpoint should survive persistence");
     assert_eq!(checkpoint.source_message_count, 2);
     assert_eq!(checkpoint.file_fact_versions.len(), 1);
-
-    restored.replace_thread_messages(&restored_threads[0].thread_id, history, UtcMillis(3_000));
-    assert!(
-        restored
-            .thread_context_checkpoint(&restored_threads[0].thread_id)
-            .is_none()
-    );
 }
 
 #[test]
@@ -5768,7 +5913,9 @@ fn thread_registry_activation_tracks_task_ids_without_reuse_lookup() {
         .expect("thread should register");
 
     let task_a = TaskId::new("task-a");
-    store.activate_thread(&thread_id, &task_a, UtcMillis(2_000));
+    store
+        .activate_thread_checked(&thread_id, &task_a, UtcMillis(2_000))
+        .expect("thread should activate");
     assert_eq!(store.mark_task_threads_idle(&task_a, UtcMillis(3_000)), 1);
 
     let snapshot = store.thread_registry_snapshot(&session_id);
@@ -5777,7 +5924,7 @@ fn thread_registry_activation_tracks_task_ids_without_reuse_lookup() {
     assert_eq!(
         snapshot[0].handled_task_ids,
         vec![task_a],
-        "activate_thread 必须累积 task_id"
+        "activate_thread_checked 必须累积 task_id"
     );
 }
 
@@ -5894,53 +6041,6 @@ fn thread_registry_snapshot_is_scoped_per_session() {
 }
 
 #[test]
-fn thread_registry_retires_on_session_retirement() {
-    let store = SessionStore::new();
-    let session_id = SessionId::new("session-retire");
-    let mission_id = MissionId::new("mission-retire");
-    let now = UtcMillis(1_000);
-
-    store
-        .register_thread(sample_thread(
-            "thread-r-1",
-            &session_id,
-            &mission_id,
-            "reviewer",
-            now,
-            ExecutionThreadStatus::Idle,
-        ))
-        .expect("thread should register");
-    store
-        .register_thread(sample_thread(
-            "thread-r-2",
-            &session_id,
-            &mission_id,
-            "architect",
-            now,
-            ExecutionThreadStatus::Active,
-        ))
-        .expect("thread should register");
-
-    store.retire_session_threads(&session_id, UtcMillis(2_000));
-
-    let snapshot = store.thread_registry_snapshot(&session_id);
-    assert_eq!(snapshot.len(), 2);
-    for thread in &snapshot {
-        assert_eq!(
-            thread.status,
-            ExecutionThreadStatus::Retired,
-            "retire_session_threads 必须把 session 下所有 thread 标记为 Retired"
-        );
-    }
-
-    assert!(
-        snapshot
-            .iter()
-            .all(|thread| thread.status == ExecutionThreadStatus::Retired)
-    );
-}
-
-#[test]
 fn rebuilding_thread_projection_while_assistant_text_streams_does_not_duplicate_history() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-thread-stream-rebuild");
@@ -5980,13 +6080,20 @@ fn rebuilding_thread_projection_while_assistant_text_streams_does_not_duplicate_
                 assistant,
             )
             .expect("assistant item should upsert");
-        store
-            .rebuild_thread_message_projection(&thread_id, UtcMillis(100 + step as u64))
-            .expect("projection should rebuild");
-        lengths.push(store.thread_message_history(&thread_id).len());
+        lengths.push(
+            store
+                .thread_context_snapshot(&thread_id)
+                .unwrap()
+                .messages()
+                .len(),
+        );
     }
 
-    let history = store.thread_message_history(&thread_id);
+    let history = store
+        .thread_context_snapshot(&thread_id)
+        .unwrap()
+        .messages()
+        .to_vec();
     assert_eq!(
         lengths.iter().copied().max(),
         Some(2),
@@ -6054,12 +6161,11 @@ fn thread_projection_keeps_one_model_step_as_a_single_assistant_message() {
         upsert(tool);
     }
 
-    for round in 0..3 {
-        store
-            .rebuild_thread_message_projection(&thread_id, UtcMillis(100 + round))
-            .expect("projection should rebuild");
-    }
-    let history = store.thread_message_history(&thread_id);
+    let history = store
+        .thread_context_snapshot(&thread_id)
+        .unwrap()
+        .messages()
+        .to_vec();
     let roles = history.iter().map(|m| m.role.as_str()).collect::<Vec<_>>();
     assert_eq!(roles, ["user", "assistant", "tool", "tool"], "{history:?}");
     let ids = history[1]
@@ -6130,9 +6236,6 @@ fn rebuilding_while_a_batch_executes_keeps_one_assistant_message_per_step() {
         tool.tool_status = Some("running".to_string());
         tool.source_thread_id = thread_id.clone();
         upsert(tool);
-        store
-            .rebuild_thread_message_projection(&thread_id, UtcMillis(100 + seq as u64))
-            .expect("projection should rebuild");
     }
     for (seq, call_id) in [(3, "call-a"), (4, "call-b")] {
         let mut tool = test_turn_item(&format!("tool-{call_id}"), "");
@@ -6145,12 +6248,13 @@ fn rebuilding_while_a_batch_executes_keeps_one_assistant_message_per_step() {
         tool.tool_result = Some(format!("{{\"tool\":\"file_read\",\"id\":\"{call_id}\"}}"));
         tool.source_thread_id = thread_id.clone();
         upsert(tool);
-        store
-            .rebuild_thread_message_projection(&thread_id, UtcMillis(200 + seq as u64))
-            .expect("projection should rebuild");
     }
 
-    let history = store.thread_message_history(&thread_id);
+    let history = store
+        .thread_context_snapshot(&thread_id)
+        .unwrap()
+        .messages()
+        .to_vec();
     let shape = history
         .iter()
         .map(|message| (message.role.as_str(), message.tool_calls.len()))
@@ -6187,91 +6291,431 @@ fn thread_message(role: &str, content: &str) -> ThreadChatMessage {
     }
 }
 
-fn thread_tool_call(call_id: &str) -> ThreadChatMessage {
-    ThreadChatMessage {
-        input_request_id: None,
-        role: "assistant".to_string(),
-        content: None,
-        images: Vec::new(),
-        tool_calls: vec![ThreadChatToolCall {
-            id: call_id.to_string(),
-            kind: "function".to_string(),
-            function: ThreadChatToolFunction {
-                name: "file_read".to_string(),
-                arguments: "{}".to_string(),
-            },
-        }],
-        tool_call_id: None,
-        provider_context: Vec::new(),
-    }
-}
-
-fn thread_tool_result(call_id: &str, content: &str) -> ThreadChatMessage {
-    ThreadChatMessage {
-        input_request_id: None,
-        role: "tool".to_string(),
-        content: Some(content.to_string()),
-        images: Vec::new(),
-        tool_calls: Vec::new(),
-        tool_call_id: Some(call_id.to_string()),
-        provider_context: Vec::new(),
+fn snapshot_checkpoint(snapshot: &crate::ThreadContextSnapshot) -> ThreadContextCheckpoint {
+    ThreadContextCheckpoint {
+        thread_id: snapshot.thread_id.clone(),
+        checkpoint_id: "snapshot-summary".into(),
+        source_message_count: 1,
+        summary_message: thread_message("user", "摘要"),
+        reason: "test".into(),
+        original_token_estimate: 100,
+        checkpoint_token_estimate: 10,
+        created_at: UtcMillis(20),
+        generation: snapshot
+            .checkpoint()
+            .map(|value| value.generation + 1)
+            .unwrap_or(1),
+        tool_result_projection_fingerprint: None,
+        source_fingerprint: crate::thread_history_fingerprint(&snapshot.messages()[..1]),
+        model_provider: None,
+        model: None,
+        binding_revision: None,
+        projected_request_tokens: 0,
+        context_window_limit_tokens: None,
+        preserved_tail_message_count: 0,
+        file_fact_versions: vec![],
     }
 }
 
 #[test]
-fn thread_history_merge_is_idempotent_and_keeps_non_canonical_messages() {
-    use super::sidecar::merge_thread_history_with_projection as merge;
+fn checkpoint_commit_rejects_same_length_canonical_changes_and_stale_snapshots() {
+    let store = SessionStore::new();
+    let session = SessionId::new("checkpoint-cas");
+    store
+        .create_session(session.clone(), "checkpoint cas")
+        .unwrap();
+    let (_, thread) =
+        store.ensure_session_mission(&session, UtcMillis(1), || MissionId::new("checkpoint-cas"));
+    accept_test_turn(&store, &session, test_turn("cas-turn", "running", 10));
+    let mut item = test_turn_item("cas-output", "old");
+    item.kind = "assistant_stream".into();
+    item.source = "assistant".into();
+    item.status = "running".into();
+    item.source_thread_id = thread.clone();
+    store
+        .upsert_current_turn_item_for_turn(&session, Some("cas-turn"), item.clone())
+        .unwrap();
+    let before = store.thread_context_snapshot(&thread).unwrap();
+    let candidate = snapshot_checkpoint(&before);
+    item.content = Some("new".into());
+    store
+        .upsert_current_turn_item_for_turn(&session, Some("cas-turn"), item)
+        .unwrap();
+    // 相同消息数量不能掩盖 canonical 内容变化。
+    assert!(!store.install_thread_context_checkpoint_if_current(&before, candidate, UtcMillis(20)));
+    assert!(store.thread_context_checkpoint(&thread).is_none());
+    let current = store.thread_context_snapshot(&thread).unwrap();
+    assert_eq!(current.messages().len(), before.messages().len());
+    assert_eq!(before.messages()[0].content.as_deref(), Some("old"));
+    assert_eq!(current.messages()[0].content.as_deref(), Some("new"));
+    assert!(store.install_thread_context_checkpoint_if_current(
+        &current,
+        snapshot_checkpoint(&current),
+        UtcMillis(21)
+    ));
+    let mut stale = store.thread_context_snapshot(&thread).unwrap();
+    assert_eq!(stale.model_history()[0].content.as_deref(), Some("摘要"));
+    let mut replacement = snapshot_checkpoint(&stale);
+    replacement.checkpoint_id = "new-summary".into();
+    assert!(store.install_thread_context_checkpoint_if_current(
+        &stale,
+        replacement.clone(),
+        UtcMillis(22)
+    ));
+    assert!(!store.clear_thread_context_checkpoint_if_current(&mut stale));
+    assert!(!store.install_thread_context_checkpoint_if_current(
+        &stale,
+        replacement,
+        UtcMillis(23)
+    ));
+    assert_eq!(
+        store
+            .thread_context_checkpoint(&thread)
+            .unwrap()
+            .checkpoint_id,
+        "new-summary"
+    );
+    let mut current = store.thread_context_snapshot(&thread).unwrap();
+    store.record_thread_context_window_tokens(&thread, 16000, UtcMillis(24));
+    assert!(!store.install_thread_context_checkpoint_if_current(
+        &current,
+        snapshot_checkpoint(&current),
+        UtcMillis(25)
+    ));
+    assert!(!store.clear_thread_context_checkpoint_if_current(&mut current));
+}
 
-    let projection = vec![
-        thread_message("user", "分析项目"),
-        thread_tool_call("call-1"),
-        thread_tool_result("call-1", "结果一"),
-        thread_message("assistant", "完成"),
-    ];
+#[test]
+fn recovery_checkpoint_requires_current_source_and_destination_snapshots() {
+    for mutation in [
+        "none",
+        "source_history",
+        "source_checkpoint",
+        "destination_history",
+        "destination_checkpoint",
+        "source_window",
+        "session",
+    ] {
+        let store = SessionStore::new();
+        let session = SessionId::new(format!("inherit-{mutation}"));
+        store.create_session(session.clone(), "inherit").unwrap();
+        let (_, source_id) =
+            store.ensure_session_mission(&session, UtcMillis(1), || MissionId::new("inherit"));
+        let mut destination = store.orchestrator_thread_for_session(&session).unwrap();
+        destination.thread_id = ThreadId::new("destination");
+        destination.role_id = "executor".into();
+        let destination_id = destination.thread_id.clone();
+        store.register_thread(destination).unwrap();
+        accept_test_turn(&store, &session, test_turn("inherit-turn", "running", 10));
+        for thread in [&source_id, &destination_id] {
+            let mut item = test_turn_item(thread.as_str(), "original fact");
+            item.source_thread_id = thread.clone();
+            store
+                .upsert_current_turn_item_for_turn(&session, Some("inherit-turn"), item)
+                .unwrap();
+        }
+        // 不刷新缓存；恢复必须使用 canonical 快照。
+        let source = store.thread_context_snapshot(&source_id).unwrap();
+        assert!(store.install_thread_context_checkpoint_if_current(
+            &source,
+            snapshot_checkpoint(&source),
+            UtcMillis(11)
+        ));
+        let mut source = store.thread_context_snapshot(&source_id).unwrap();
+        let destination = store.thread_context_snapshot(&destination_id).unwrap();
+        match mutation {
+            "source_history" | "destination_history" => {
+                let thread = if mutation == "source_history" {
+                    &source_id
+                } else {
+                    &destination_id
+                };
+                let mut item = test_turn_item(thread.as_str(), "rewritten fact");
+                item.source_thread_id = thread.clone();
+                store
+                    .upsert_current_turn_item_for_turn(&session, Some("inherit-turn"), item)
+                    .unwrap();
+            }
+            "source_checkpoint" | "destination_checkpoint" => {
+                let snapshot = if mutation == "source_checkpoint" {
+                    &source
+                } else {
+                    &destination
+                };
+                let mut replacement = snapshot_checkpoint(snapshot);
+                replacement.checkpoint_id = "replacement".into();
+                assert!(store.install_thread_context_checkpoint_if_current(
+                    snapshot,
+                    replacement,
+                    UtcMillis(12)
+                ));
+            }
+            "source_window" => {
+                store.record_thread_context_window_tokens(&source_id, 16000, UtcMillis(12))
+            }
+            "session" => source.session_id = SessionId::new("other"),
+            _ => {}
+        }
+        let before = store.thread_context_snapshot(&destination_id).unwrap();
+        let result = store.inherit_thread_context_checkpoint(&source, &destination, UtcMillis(13));
+        if mutation == "none" {
+            result.unwrap();
+            let inherited = store.thread_context_snapshot(&destination_id).unwrap();
+            assert_eq!(inherited.model_history(), source.model_history());
+            assert_eq!(inherited.checkpoint().unwrap().thread_id, destination_id);
+        } else {
+            assert!(result.is_err(), "{mutation}");
+            assert_eq!(
+                store.thread_context_checkpoint(&destination_id).as_ref(),
+                before.checkpoint(),
+                "{mutation}"
+            );
+        }
+    }
+}
 
-    // 没有 canonical 对应物的前缀保留在最前面，重复合并不再增长。
-    let legacy = vec![thread_message("user", "旧迁移消息")];
-    let once = merge(&legacy, projection.clone());
-    assert_eq!(once.len(), 1 + projection.len());
-    assert_eq!(once[0], legacy[0]);
-    assert_eq!(merge(&once, projection.clone()), once);
+#[test]
+fn recovery_checkpoint_does_not_inherit_a_different_canonical_prefix() {
+    let store = SessionStore::new();
+    let session = SessionId::new("different-prefix");
+    store.create_session(session.clone(), "prefix").unwrap();
+    let (_, source_id) =
+        store.ensure_session_mission(&session, UtcMillis(1), || MissionId::new("prefix"));
+    let mut destination = store.orchestrator_thread_for_session(&session).unwrap();
+    destination.thread_id = ThreadId::new("destination");
+    destination.role_id = "executor".into();
+    let destination_id = destination.thread_id.clone();
+    store.register_thread(destination).unwrap();
+    accept_test_turn(&store, &session, test_turn("prefix-turn", "running", 10));
+    for (thread, content) in [
+        (&source_id, "source fact"),
+        (&destination_id, "different fact"),
+    ] {
+        let mut item = test_turn_item(thread.as_str(), content);
+        item.source_thread_id = thread.clone();
+        store
+            .upsert_current_turn_item_for_turn(&session, Some("prefix-turn"), item)
+            .unwrap();
+    }
+    let source = store.thread_context_snapshot(&source_id).unwrap();
+    assert!(store.install_thread_context_checkpoint_if_current(
+        &source,
+        snapshot_checkpoint(&source),
+        UtcMillis(11)
+    ));
+    let source = store.thread_context_snapshot(&source_id).unwrap();
+    let destination = store.thread_context_snapshot(&destination_id).unwrap();
+    store
+        .inherit_thread_context_checkpoint(&source, &destination, UtcMillis(12))
+        .unwrap();
+    assert!(store.thread_context_checkpoint(&destination_id).is_none());
+    assert_eq!(
+        store
+            .thread_context_snapshot(&destination_id)
+            .unwrap()
+            .model_history(),
+        destination.messages()
+    );
+}
 
-    // 工具结果尚未落盘时的占位，在真实结果到达后被替换而不是追加。
-    let pending = vec![
-        thread_message("user", "分析项目"),
-        thread_tool_call("call-1"),
-        thread_tool_result("call-1", "canonical_projection_missing_tool_result"),
-    ];
-    let resolved = merge(&pending, projection.clone());
-    assert_eq!(resolved, projection);
+#[test]
+fn checkpoint_install_rejects_invalid_range_identity_and_fingerprint() {
+    let store = SessionStore::new();
+    let session = SessionId::new("checkpoint-invalid");
+    store
+        .create_session(session.clone(), "checkpoint invalid")
+        .unwrap();
+    let (_, thread) =
+        store.ensure_session_mission(&session, UtcMillis(1), || MissionId::new("invalid"));
+    accept_test_turn(&store, &session, test_turn("invalid-turn", "running", 10));
+    let mut item = test_turn_item("input", "事实");
+    item.source_thread_id = thread.clone();
+    store
+        .upsert_current_turn_item_for_turn(&session, Some("invalid-turn"), item)
+        .unwrap();
+    let snapshot = store.thread_context_snapshot(&thread).unwrap();
+    for invalid in 0..5 {
+        let mut checkpoint = snapshot_checkpoint(&snapshot);
+        match invalid {
+            0 => checkpoint.source_message_count = 0,
+            1 => checkpoint.source_message_count = snapshot.messages().len() + 1,
+            2 => checkpoint.source_fingerprint.clear(),
+            3 => checkpoint.source_fingerprint = "wrong".into(),
+            _ => checkpoint.thread_id = ThreadId::new("other-thread"),
+        }
+        assert!(
+            store
+                .install_thread_context_checkpoint_checked(
+                    &thread,
+                    checkpoint.clone(),
+                    UtcMillis(20)
+                )
+                .is_err()
+        );
+        assert!(!store.install_thread_context_checkpoint_if_current(
+            &snapshot,
+            checkpoint,
+            UtcMillis(20)
+        ));
+        assert!(store.thread_context_checkpoint(&thread).is_none());
+    }
+    assert!(store.install_thread_context_checkpoint_if_current(
+        &snapshot,
+        snapshot_checkpoint(&snapshot),
+        UtcMillis(21)
+    ));
+    let mut current = store.thread_context_snapshot(&thread).unwrap();
+    assert!(store.clear_thread_context_checkpoint_if_current(&mut current));
+    assert!(current.checkpoint().is_none());
+    assert_eq!(current.model_history(), current.messages());
+}
 
-    // 流式输出：assistant 文本变长时原地更新。
-    let streaming = vec![
-        thread_message("user", "分析项目"),
-        thread_message("assistant", "完"),
-    ];
-    assert_eq!(merge(&streaming, projection[..1].to_vec()).len(), 2);
-    let grown = vec![
-        thread_message("user", "分析项目"),
-        thread_message("assistant", "完成了"),
-    ];
-    let merged = merge(&streaming, grown.clone());
-    assert_eq!(merged, grown);
+#[test]
+fn thread_projection_excludes_superseded_turns_and_keeps_mainline_final_ownership() {
+    let session = SessionId::new("projection-ownership");
+    let store = SessionStore::new();
+    store
+        .create_session(session.clone(), "projection ownership")
+        .unwrap();
+    let (_, thread) =
+        store.ensure_session_mission(&session, UtcMillis(1), || MissionId::new("ownership"));
+    let mut persisted = store.export_state();
+    for (seq, status, content) in [
+        (1, "superseded", "已被编辑取代"),
+        (2, "cancelled", "有效输入"),
+    ] {
+        persisted.canonical_turns.push(
+            serde_json::from_value(serde_json::json!({
+                "sessionId": session, "turnId": format!("turn-{seq}"), "turnSeq": seq,
+                "acceptedAt": seq, "completedAt": seq, "status": status,
+                "items": [{
+                    "sessionId": session, "turnId": format!("turn-{seq}"), "turnSeq": seq,
+                    "itemId": format!("user-{seq}"), "itemSeq": 1, "kind": "user_message",
+                    "createdAt": seq, "updatedAt": seq, "status": "completed",
+                    "sourceThreadId": thread, "content": content,
+                }],
+            }))
+            .unwrap(),
+        );
+    }
+    let turn = persisted.canonical_turns.last_mut().unwrap();
+    for (seq, role, content) in [
+        (2, None, "主线任务最终回复"),
+        (3, Some("executor"), "子代理最终回复"),
+    ] {
+        turn.items.push(
+            serde_json::from_value(serde_json::json!({
+                "sessionId": session, "turnId": "turn-2", "turnSeq": 2,
+                "itemId": format!("answer-{seq}"), "itemSeq": seq, "kind": "assistant_text",
+                "createdAt": 2, "updatedAt": 2, "status": "completed",
+                "sourceThreadId": format!("execution-thread-{seq}"), "content": content,
+                "worker": { "taskId": format!("task-{seq}"), "roleId": role },
+                "metadata": { "assistantOutputKind": "final" },
+            }))
+            .unwrap(),
+        );
+    }
+    let store = SessionStore::from_state_for_test(persisted);
+    let history = store
+        .thread_context_snapshot(&thread)
+        .unwrap()
+        .messages()
+        .to_vec();
+    let contents = history
+        .iter()
+        .filter_map(|message| message.content.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        contents,
+        [
+            "有效输入",
+            "主线任务最终回复",
+            "（上面这一轮回复已被用户中断，可能不完整。）"
+        ]
+    );
+    assert_eq!(
+        store.thread_context_snapshot(&thread).unwrap().messages(),
+        history
+    );
+}
 
-    // 恢复流程在历史中间插入的消息保持原位，且反复合并不再复制后续内容。
-    let with_inserted = vec![
-        thread_message("user", "分析项目"),
-        thread_tool_call("call-1"),
-        thread_message("system", "恢复流程插入"),
-        thread_tool_result("call-1", "结果一"),
-    ];
-    let first = merge(&with_inserted, projection.clone());
-    assert_eq!(first.len(), projection.len() + 1);
-    assert!(first.iter().any(|message| message.role == "system"));
-    assert_eq!(merge(&first, projection.clone()), first);
-
-    // 空 projection 不改动已有历史。
-    assert_eq!(merge(&legacy, Vec::new()), legacy);
+#[test]
+fn thread_history_is_not_persisted_and_restart_discards_stale_summary() {
+    let store = SessionStore::new();
+    let session = SessionId::new("canonical-only-history");
+    store
+        .create_session(session.clone(), "canonical only")
+        .unwrap();
+    let (_, thread) =
+        store.ensure_session_mission(&session, UtcMillis(1), || MissionId::new("canonical-only"));
+    accept_test_turn(
+        &store,
+        &session,
+        test_turn("canonical-only-turn", "running", 10),
+    );
+    let mut input = test_turn_item("canonical-input", "正式输入");
+    input.source_thread_id = thread.clone();
+    store
+        .upsert_current_turn_item_for_turn(&session, Some("canonical-only-turn"), input)
+        .unwrap();
+    let snapshot = store.thread_context_snapshot(&thread).unwrap();
+    let checkpoint = snapshot_checkpoint(&snapshot);
+    let expected = vec![thread_message("user", "正式输入")];
+    for source_count in [0, 1, 2] {
+        let mut durable = store.durable_state();
+        durable.thread_context_checkpoints = vec![ThreadContextCheckpoint {
+            source_message_count: source_count,
+            source_fingerprint: crate::thread_history_fingerprint(&[thread_message(
+                "user",
+                "旧消息",
+            )]),
+            ..checkpoint.clone()
+        }];
+        let mut encoded = serde_json::to_value(&durable).unwrap();
+        assert!(
+            encoded["thread_registry"][0]
+                .get("messageHistory")
+                .is_none()
+        );
+        // 旧字段只会被反序列化忽略，不进入运行态，也不再次写出。
+        encoded["thread_registry"][0]["messageHistory"] = json!([
+            {"role": "user", "content": "没有 canonical 来源的旧消息"},
+        ]);
+        let restored = SessionStore::from_persisted_parts(
+            serde_json::from_value(encoded).unwrap(),
+            store.execution_sidecar_store_state(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored
+                .thread_context_snapshot(&thread)
+                .unwrap()
+                .messages(),
+            expected
+        );
+        assert!(restored.thread_context_checkpoint(&thread).is_none());
+        assert_eq!(
+            restored.thread_registry_snapshot(&session)[0].last_used_at,
+            UtcMillis(1)
+        );
+        let encoded = serde_json::to_value(restored.durable_state()).unwrap();
+        assert!(
+            encoded["thread_registry"][0]
+                .get("messageHistory")
+                .is_none()
+        );
+        assert!(!encoded.to_string().contains("没有 canonical 来源的旧消息"));
+    }
+    let mut durable = store.durable_state();
+    durable.canonical_turns.clear();
+    let restored = SessionStore::from_persisted_parts(durable, Default::default()).unwrap();
+    assert!(
+        restored
+            .thread_context_snapshot(&thread)
+            .unwrap()
+            .messages()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -6467,7 +6911,7 @@ fn model_steps_survive_stream_writes_and_restart_without_replaying_unknown_calls
         .unwrap();
     // No new user input does not mean there was no model Step.
     store
-        .append_current_turn_item_for_turn(
+        .upsert_current_turn_item_for_turn(
             &session,
             Some("turn-step"),
             ActiveExecutionTurnItem {
@@ -7353,10 +7797,18 @@ fn user_question_fixture() -> (SessionStore, crate::user_question::PendingUserQu
         Some(json!({"tool": "ask_user_question", "status": "awaiting_user_input"}).to_string());
     turn.items.push(item);
     accept_test_turn(&store, &session, turn.clone());
+    let admitted_turn = turn;
     store
-        .upsert_active_execution_chain(
+        .accept_active_execution_chain_with_timeline_entry(
             session.clone(),
-            test_active_chain(&session, "question-chain", Some(turn)),
+            TimelineEntryInput::new(
+                format!("timeline-chain-{}", admitted_turn.turn_id),
+                TimelineEntryKind::UserMessage,
+                admitted_turn.user_message.clone().unwrap_or_default(),
+                admitted_turn.accepted_at,
+            ),
+            test_active_chain(&session, "question-chain", Some(admitted_turn.clone())),
+            admitted_turn,
         )
         .unwrap();
     let request = crate::user_question::PendingUserQuestion {
@@ -7373,19 +7825,22 @@ fn user_question_fixture() -> (SessionStore, crate::user_question::PendingUserQu
 #[test]
 fn user_question_survives_restart_and_response_precedes_tool_completion() {
     let (store, request) = user_question_fixture();
+    let before = store.execution_sidecar_store_state();
     store.register_user_question(request.clone()).unwrap();
-    let stale_sidecar = store.runtime_sidecar(&request.session_id).unwrap();
-    // 工具进度的旧写回不能擦掉持久交互。
-    store
-        .upsert_active_execution_chain(
-            request.session_id.clone(),
-            test_active_chain(
-                &request.session_id,
-                "question-chain",
-                stale_sidecar.current_turn,
-            ),
-        )
+    // 交互只提交 canonical；sidecar 无须同步整份 Turn 就能读到最新提问。
+    assert_eq!(
+        serde_json::to_value(&before).unwrap(),
+        serde_json::to_value(store.execution_sidecar_store_state()).unwrap()
+    );
+    let projected = store
+        .runtime_sidecar(&request.session_id)
+        .unwrap()
+        .current_turn
         .unwrap();
+    assert!(projected.items.iter().any(|item| {
+        item.metadata
+            .contains_key(crate::user_question::USER_QUESTION_METADATA_KEY)
+    }));
     assert_eq!(
         store.pending_user_questions(&request.session_id).unwrap(),
         vec![request.clone()]
@@ -7434,12 +7889,11 @@ fn user_question_survives_restart_and_response_precedes_tool_completion() {
     let thread = restored.thread_registry_snapshot(&request.session_id)[0]
         .thread_id
         .clone();
-    restored
-        .rebuild_thread_message_projection(&thread, UtcMillis::now())
-        .unwrap();
     assert!(
         restored
-            .thread_message_history(&thread)
+            .thread_context_snapshot(&thread)
+            .unwrap()
+            .messages()
             .iter()
             .any(|message| message.role == "tool"
                 && message
@@ -7582,12 +8036,21 @@ fn cancelled_user_question_does_not_resurrect_after_restart_or_mutate_late_tool_
     store
         .cancel_user_question(&request.session_id, &request.question_id)
         .unwrap();
-    store
-        .upsert_active_execution_chain(
-            request.session_id.clone(),
-            test_active_chain(&request.session_id, "question-chain", Some(stale)),
-        )
+    let late_item = stale
+        .items
+        .into_iter()
+        .find(|item| item.tool_call_id.as_deref() == Some(request.tool_call_id.as_str()))
         .unwrap();
+    let written = store
+        .upsert_current_turn_item_for_turn(&request.session_id, Some(&request.turn_id), late_item)
+        .unwrap()
+        .unwrap();
+    let current = store.runtime_sidecar(&request.session_id).unwrap();
+    assert_eq!(
+        serde_json::to_value(written).unwrap(),
+        serde_json::to_value(current).unwrap(),
+        "提交回执也必须读取合并后的 canonical 交互"
+    );
     store
         .interrupt_current_turn_by_daemon_restart(&request.session_id)
         .unwrap();
@@ -7640,10 +8103,22 @@ fn durable_approval_fixture() -> (
     item.tool_arguments = Some(r#"{"command":"publish","background":false}"#.into());
     turn.items.push(item);
     accept_test_turn(&store, &session, turn.clone());
+    let admitted_turn = turn;
     store
-        .upsert_active_execution_chain(
+        .accept_active_execution_chain_with_timeline_entry(
             session.clone(),
-            test_active_chain(&session, "durable-approval-chain", Some(turn)),
+            TimelineEntryInput::new(
+                format!("timeline-chain-{}", admitted_turn.turn_id),
+                TimelineEntryKind::UserMessage,
+                admitted_turn.user_message.clone().unwrap_or_default(),
+                admitted_turn.accepted_at,
+            ),
+            test_active_chain(
+                &session,
+                "durable-approval-chain",
+                Some(admitted_turn.clone()),
+            ),
+            admitted_turn,
         )
         .unwrap();
     let request = crate::tool_approval::PendingToolApproval {
@@ -7961,7 +8436,7 @@ fn approval_allow_for_turn_never_reuses_a_different_execution_root() {
     sibling.tool_call_id = Some("approval-other-root-call".into());
     sibling.metadata.clear();
     store
-        .append_current_turn_item_for_turn(&request.session_id, Some(&request.turn_id), sibling)
+        .upsert_current_turn_item_for_turn(&request.session_id, Some(&request.turn_id), sibling)
         .unwrap();
     let mut other = request.clone();
     other.approval_id = "approval-other-root".into();
@@ -8808,7 +9283,7 @@ fn transferred_agent_goal_revision_revokes_steps_tools_and_interaction_responses
         chain.root_task_id = task.root_task_id.clone();
         chain.mission_id = task.mission_id.clone();
         store
-            .upsert_active_execution_chain(session.clone(), chain)
+            .seed_execution_chain_for_test(session.clone(), chain)
             .unwrap();
         store
             .interrupt_current_turn_by_daemon_restart(&session)
@@ -8908,7 +9383,7 @@ fn independent_agent_restart_preserves_interactions_without_original_mainline_po
             chain.root_task_id = task.root_task_id.clone();
             chain.mission_id = task.mission_id.clone();
             store
-                .upsert_active_execution_chain(session.clone(), chain)
+                .seed_execution_chain_for_test(session.clone(), chain)
                 .unwrap();
             store
                 .interrupt_current_turn_by_daemon_restart(&session)
@@ -9806,7 +10281,7 @@ fn agent_turn_continue_creates_new_execution_without_reopening_history() {
     chain.root_task_id = task.root_task_id.clone();
     chain.mission_id = task.mission_id.clone();
     store
-        .upsert_active_execution_chain(session.clone(), chain)
+        .seed_execution_chain_for_test(session.clone(), chain)
         .unwrap();
     let first = store
         .create_agent_turn(&task, "agent-source-turn", &thread)
@@ -9945,7 +10420,7 @@ fn agent_turn_restart_commits_parent_and_child_atomically_and_restores_interacti
         chain.root_task_id = task.root_task_id.clone();
         chain.mission_id = task.mission_id.clone();
         store
-            .upsert_active_execution_chain(session.clone(), chain)
+            .seed_execution_chain_for_test(session.clone(), chain)
             .unwrap();
         let owned = store
             .create_agent_turn(&task, "agent-source-turn", &thread)
@@ -10111,7 +10586,7 @@ fn execution_steps_store() -> (SessionStore, SessionId, TaskId) {
     source.source = "orchestrator".into();
     source.task_id = Some(task.clone());
     store
-        .append_current_turn_item_for_turn(&session, Some("turn-execution-steps"), source)
+        .upsert_current_turn_item_for_turn(&session, Some("turn-execution-steps"), source)
         .unwrap();
     (store, session, task)
 }
@@ -10142,7 +10617,7 @@ fn execution_steps_survive_following_tool_write_and_durable_reload() {
     tool.metadata
         .insert("executionStepId".into(), json!("read"));
     store
-        .append_current_turn_item_for_turn(&session, Some("turn-execution-steps"), tool)
+        .upsert_current_turn_item_for_turn(&session, Some("turn-execution-steps"), tool)
         .unwrap();
     let mut next = execution_steps_params();
     next.steps[0].status = crate::execution_steps::ExecutionStepStatus::Completed;
@@ -10156,7 +10631,7 @@ fn execution_steps_survive_following_tool_write_and_durable_reload() {
         .unwrap();
     assert_eq!(snapshot.revision, 2);
     assert_eq!(snapshot.steps[0].evidence_refs, ["proof"]);
-    let restored = SessionStore::from_state(store.state.read().unwrap().clone());
+    let restored = SessionStore::from_state_for_test(store.state.read().unwrap().clone());
     assert_eq!(
         restored
             .execution_steps_for_task(&session, "turn-execution-steps", &task)
@@ -10215,7 +10690,7 @@ fn turn_completion_settles_steps_from_bound_success_instead_of_model_bookkeeping
     tool.metadata
         .insert("executionStepId".into(), json!("read"));
     store
-        .append_current_turn_item_for_turn(&session, Some(turn), tool)
+        .upsert_current_turn_item_for_turn(&session, Some(turn), tool)
         .unwrap();
     // 模型直接给出最终答复，没有回头把步骤标记完成。
     store
@@ -10399,7 +10874,7 @@ fn plugin_commands_never_resume_as_model_turns_after_failure_stop_or_reload() {
             store.mainline_resume_candidate(&session).is_none(),
             "{status}"
         );
-        let reloaded = SessionStore::from_state(store.export_state());
+        let reloaded = SessionStore::from_state_for_test(store.export_state());
         assert!(
             reloaded.mainline_resume_candidate(&session).is_none(),
             "reloaded {status}"

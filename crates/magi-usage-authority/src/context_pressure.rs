@@ -98,9 +98,6 @@ impl ModelIdentitySnapshot {
         }
     }
 
-    pub fn stable_key(&self) -> String {
-        format!("{}:{}:{}", self.provider, self.model, self.binding_revision)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,13 +270,6 @@ impl ContextPressureSnapshot {
             .saturating_sub(self.projected_request_tokens)
     }
 
-    pub fn anchor_matches(
-        &self,
-        model: &ModelIdentitySnapshot,
-        checkpoint_generation: u64,
-    ) -> bool {
-        self.model == *model && self.checkpoint_generation == checkpoint_generation
-    }
 }
 
 /// provider 锚点后新增的模型可见内容。所有调用方都必须先通过该函数合并，

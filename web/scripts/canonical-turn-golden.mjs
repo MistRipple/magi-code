@@ -26,8 +26,147 @@ await withGoldenViteServer(async (server) => {
   assertSteeringConsumptionReceipts(reducer, projection, canonicalProtocol);
   assertFrozenSourceFolderProjection(reducer, projection);
   assertPluginMessageProvenanceAndReceipt(reducer, projection);
+  assertMainlineRuntimeIgnoresIndependentAgents(dataHandlers, messagesStore, turnStore, contract);
+  assertContinuationStaysWithItsTurn(dataHandlers, messagesStore, turnStore, contract);
   console.log('canonical turn golden replay passed');
 }, { configFile: 'vite.web.config.ts' });
+
+function assertContinuationStaysWithItsTurn(dataHandlers, messagesStore, turnStore, contract) {
+  const old = baseCase('old-recovery', 'session-recovery-scope', 'old-stopped-turn', 30000);
+  const next = baseCase('new-recovery', old.sessionId, 'new-stopped-turn', 31000);
+  const snapshot = (context, continuation, includeOldDiagnostics = false) => {
+    const raw = {
+      generatedAt: context.turnSeq + 100,
+      agent: { runtimeEpoch: 'recovery-scope-test' }, eventStreamNextSequence: 10,
+      currentSession: { sessionId: context.sessionId, title: '恢复资格', createdAt: old.turnSeq, updatedAt: context.turnSeq + 100 },
+      sessions: [{ sessionId: context.sessionId, title: '恢复资格', createdAt: old.turnSeq, updatedAt: context.turnSeq + 100 }],
+      canonicalTurns: [turn(context, 'failed', [user(context, 1, '执行任务')], { completedAt: context.turnSeq + 10 })],
+      runtimeReadModel: {
+        details: {
+          sessions: [{ session_id: context.sessionId, current_status: 'failed', continuation,
+            budget: { token_used: 50, token_limit: 200 },
+            active_branches: includeOldDiagnostics ? [{ task_id: 'old-agent', is_primary: false }] : [],
+          }],
+          tasks: includeOldDiagnostics ? [{ task_id: 'old-agent', current_status: 'failed', title: '旧轮次代理' }] : [],
+        },
+        ...(includeOldDiagnostics ? { recovery: {
+          active_recovery_ids: ['old-recovery'], summaries: [{ recovery_id: 'old-recovery',
+            session_id: context.sessionId, current_status: 'ready', latest_occurred_at: old.turnSeq + 20 }],
+        } } : {}),
+      },
+      recentEvents: [],
+    };
+    return contract.normalizeRustBootstrapPayload(raw, { sessionId: context.sessionId });
+  };
+  const applySnapshot = (bootstrap, nextSequence) => dataHandlers.handleSessionBootstrapLoaded({
+    ...bootstrap, scope: 'personal', canonicalEventNextSequence: nextSequence,
+  });
+  messagesStore.messagesState.currentWorkspaceId = null;
+  messagesStore.messagesState.currentWorkspacePath = '';
+  messagesStore.setCurrentSessionId(old.sessionId);
+  messagesStore.clearAllMessages({ persist: false });
+  turnStore.clearCanonicalSessionTurns(old.sessionId, 'recovery-scope-test');
+
+  const oldSnapshot = snapshot(old, 'resume_turn', true);
+  applySnapshot(oldSnapshot, 2);
+  const previousRuntime = messagesStore.messagesState.orchestratorRuntimeState;
+  assert.equal(previousRuntime.turnId, old.turnId);
+  assert.equal(previousRuntime.continuation, 'resume_turn');
+  assert.equal(previousRuntime.assignments.length, 1);
+  assert.equal(previousRuntime.opsView.recovery.pendingTaskCount, 1);
+  const budget = structuredClone(previousRuntime.runtimeSnapshot);
+
+  // 未收到新轮次的 running 事件，直接收到完整失败事实，也不能继承上一次停止的资格。
+  const newSnapshot = snapshot(next, 'resume_turn');
+  dataHandlers.handleUnifiedData({
+    id: 'new-terminal', category: 'data', type: 'system', source: 'orchestrator', agent: 'orchestrator',
+    lifecycle: 'completed', blocks: [], timestamp: next.turnSeq + 10, updatedAt: next.turnSeq + 10,
+    data: { dataType: 'sessionTurnCanonicalEventUpdated', payload: {
+      sessionId: next.sessionId,
+      canonicalEvent: event(next, 2, 'turn_completed', { turn: newSnapshot.canonicalTurns[0] }),
+    } },
+  });
+  const runtime = () => messagesStore.messagesState.orchestratorRuntimeState;
+  assert.equal(runtime().turnId, next.turnId);
+  assert.equal(runtime().continuation, undefined, '新停止必须等待本轮 daemon 判定');
+  assert.deepEqual(runtime().assignments, [], '新轮次不能保留旧代理摘要');
+  assert.equal(runtime().opsView, undefined, '旧恢复诊断不能被带到新轮次');
+  assert.deepEqual(runtime().runtimeSnapshot, budget, '会话最近一次上下文观测仍可供输入区展示');
+  applySnapshot(oldSnapshot, 2);
+  assert.equal(runtime().continuation, undefined, '旧停止快照不能授予新轮次继续资格');
+  assert.equal(runtime().opsView, undefined);
+
+  applySnapshot(newSnapshot, 3);
+  assert.equal(runtime().continuation, 'resume_turn', '同轮次权威快照可以提供继续资格');
+  applySnapshot(snapshot(old, undefined), 2);
+  assert.equal(runtime().continuation, 'resume_turn', '旧轮次快照也不能撤销新轮次资格');
+  applySnapshot({ ...newSnapshot, orchestratorRuntimeState: { ...newSnapshot.orchestratorRuntimeState, turnId: undefined } }, 2);
+  assert.equal(runtime().continuation, 'resume_turn', '没有轮次身份的快照不能改写当前资格');
+  applySnapshot(snapshot(next, undefined), 2);
+  assert.equal(runtime().continuation, undefined, '同轮次 daemon 撤销资格必须及时生效');
+  messagesStore.clearAllMessages({ persist: false });
+  messagesStore.setCurrentSessionId(null);
+}
+
+function assertMainlineRuntimeIgnoresIndependentAgents(dataHandlers, messagesStore, turnStore, contract) {
+  const runtimeFields = runtime => Object.fromEntries(
+    ['turnId', 'status', 'phase', 'startedAt', 'endedAt', 'statusChangedAt', 'lastEventAt'].map(key => [key, runtime?.[key]]),
+  );
+  for (const status of ['pending', 'running', 'blocked', 'completed', 'failed', 'cancelled', 'interrupted']) {
+    for (const agentStatus of ['running', 'completed', 'failed']) {
+      const c = baseCase(`runtime-${status}-${agentStatus}`, `session-runtime-${status}-${agentStatus}`, 'mainline', 20000);
+      const child = baseCase('independent-agent', c.sessionId, 'independent-agent-turn', 21000);
+      const stopped = ['failed', 'cancelled', 'interrupted'].includes(status);
+      const terminal = stopped || status === 'completed';
+      const mainline = turn(c, status, [user(c, 1, '主线任务')], terminal ? { completedAt: 20100 } : {});
+      const independent = turn(child, agentStatus, [], {
+        metadata: { agentExecution: { taskId: 'independent-task' } },
+        ...(agentStatus === 'running' ? {} : { completedAt: 21100 }),
+      });
+      const raw = {
+        generatedAt: 22000,
+        agent: { runtimeEpoch: 'mainline-runtime-test' }, eventStreamNextSequence: 3,
+        currentSession: { sessionId: c.sessionId, title: '主线', createdAt: 20000, updatedAt: 22000 },
+        sessions: [{ sessionId: c.sessionId, title: '主线', createdAt: 20000, updatedAt: 22000 }],
+        canonicalTurns: [independent, mainline],
+        runtimeReadModel: { details: { sessions: [{ session_id: c.sessionId, current_status: 'running',
+          last_update: 22000, continuation: 'resume_turn' }], tasks: [] } },
+        recentEvents: [],
+      };
+      const bootstrap = contract.normalizeRustBootstrapPayload(raw, { sessionId: c.sessionId });
+      const withoutDiagnostics = contract.normalizeRustBootstrapPayload({ ...raw, runtimeReadModel: undefined }, { sessionId: c.sessionId });
+      assert.deepEqual(runtimeFields(withoutDiagnostics.orchestratorRuntimeState), runtimeFields(bootstrap.orchestratorRuntimeState),
+        '诊断读模型缺失不能影响 canonical 主线状态');
+      messagesStore.messagesState.currentWorkspaceId = null;
+      messagesStore.messagesState.currentWorkspacePath = '';
+      messagesStore.setCurrentSessionId(c.sessionId);
+      messagesStore.clearAllMessages({ persist: false });
+      turnStore.clearCanonicalSessionTurns(c.sessionId, bootstrap.agent.runtimeEpoch);
+      const emitTurn = (context, sequence, snapshot) => dataHandlers.handleUnifiedData({
+        id: `runtime-${sequence}`, category: 'data', type: 'system', source: 'orchestrator',
+        agent: 'orchestrator', lifecycle: 'completed', blocks: [], timestamp: 22000, updatedAt: 22000,
+        data: { dataType: 'sessionTurnCanonicalEventUpdated', payload: {
+          sessionId: c.sessionId,
+          canonicalEvent: event(context, sequence, 'turn_started', { turn: snapshot }),
+        } },
+      });
+      emitTurn(c, 1, mainline);
+      emitTurn(child, 2, independent);
+      assert.deepEqual(runtimeFields(messagesStore.messagesState.orchestratorRuntimeState), runtimeFields(bootstrap.orchestratorRuntimeState),
+        `${status}/${agentStatus}: 实时事件与启动快照必须给出相同的主线状态、阶段和时间`);
+      assert.equal(messagesStore.messagesState.isProcessing, !terminal,
+        '独立代理的状态不能改变主线输入处理态');
+
+      // 轮次水位落后的诊断快照仍可更新 daemon 的继续资格，判定对象必须是主线。
+      dataHandlers.handleSessionBootstrapLoaded({ ...bootstrap, scope: 'personal', canonicalEventNextSequence: 1 });
+      assert.equal(messagesStore.messagesState.orchestratorRuntimeState?.continuation, stopped ? 'resume_turn' : undefined,
+        '正在运行或已结束的独立代理不能授予、撤销主线的继续资格');
+      assert.deepEqual(runtimeFields(messagesStore.messagesState.orchestratorRuntimeState), runtimeFields(bootstrap.orchestratorRuntimeState));
+    }
+  }
+  messagesStore.clearAllMessages({ persist: false });
+  messagesStore.setCurrentSessionId(null);
+}
 
 function assertPluginMessageProvenanceAndReceipt(reducer, projection) {
   const c=baseCase('plugin-message','plugin-session','plugin-turn',100);

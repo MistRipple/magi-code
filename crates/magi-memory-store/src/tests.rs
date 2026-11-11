@@ -6,7 +6,6 @@ fn query_and_history_use_deterministic_tie_breakers() {
     let store = MemoryStore::new();
     let session_id = SessionId::new("session-1");
     let created_at = UtcMillis(42);
-    let updated_at = UtcMillis(43);
 
     store.append(MemoryRecord {
         memory_id: "memory-b".to_string(),
@@ -14,7 +13,6 @@ fn query_and_history_use_deterministic_tie_breakers() {
         layer: MemoryLayer::Recent,
         content: "content-b".to_string(),
         provenance: None,
-        compacted: false,
         created_at,
     });
     store.append(MemoryRecord {
@@ -23,39 +21,22 @@ fn query_and_history_use_deterministic_tie_breakers() {
         layer: MemoryLayer::Recent,
         content: "content-a".to_string(),
         provenance: None,
-        compacted: false,
         created_at,
     });
-    store.upsert_preference(PreferenceMemoryRecord {
-        preference_id: "pref-b".to_string(),
-        session_id: session_id.clone(),
-        key: "theme".to_string(),
-        value: "dark".to_string(),
-        provenance: None,
-        updated_at,
-    });
-    store.upsert_preference(PreferenceMemoryRecord {
-        preference_id: "pref-a".to_string(),
-        session_id: session_id.clone(),
-        key: "layout".to_string(),
-        value: "dense".to_string(),
-        provenance: None,
-        updated_at,
-    });
-    store.record_extraction(MemoryExtractionRecord {
+    store.apply_extraction(MemoryExtractionApplyRequest {
         extraction_id: "extract-b".to_string(),
         session_id: session_id.clone(),
         source_ref: Some("source-b".to_string()),
         summary: "summary-b".to_string(),
-        produced_memory_ids: vec!["m-2".to_string(), "m-1".to_string()],
+        memories: Vec::new(),
         created_at,
     });
-    store.record_extraction(MemoryExtractionRecord {
+    store.apply_extraction(MemoryExtractionApplyRequest {
         extraction_id: "extract-a".to_string(),
         session_id: session_id.clone(),
         source_ref: Some("source-a".to_string()),
         summary: "summary-a".to_string(),
-        produced_memory_ids: vec!["m-1".to_string(), "m-2".to_string()],
+        memories: Vec::new(),
         created_at,
     });
 
@@ -73,16 +54,6 @@ fn query_and_history_use_deterministic_tie_breakers() {
         vec!["memory-a".to_string(), "memory-b".to_string()]
     );
 
-    let preference_ids = store
-        .preferences_for_session(&session_id)
-        .into_iter()
-        .map(|record| record.preference_id)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        preference_ids,
-        vec!["pref-a".to_string(), "pref-b".to_string()]
-    );
-
     let extraction_ids = store
         .extraction_results_for_session(&session_id)
         .into_iter()
@@ -91,38 +62,6 @@ fn query_and_history_use_deterministic_tie_breakers() {
     assert_eq!(
         extraction_ids,
         vec!["extract-a".to_string(), "extract-b".to_string()]
-    );
-
-    let compaction = store.compact_session(&session_id, "memory-retained", "retained content");
-    assert_eq!(compaction.session_id, session_id);
-    assert_eq!(compaction.retained_id, "memory-retained");
-    assert_eq!(store.compaction_history_for_session(&session_id).len(), 1);
-}
-
-#[test]
-fn record_extraction_normalizes_duplicate_memory_ids() {
-    let store = MemoryStore::new();
-    let session_id = SessionId::new("session-1");
-
-    store.record_extraction(MemoryExtractionRecord {
-        extraction_id: "extract-1".to_string(),
-        session_id: session_id.clone(),
-        source_ref: Some("source".to_string()),
-        summary: "summary".to_string(),
-        produced_memory_ids: vec![
-            "m-2".to_string(),
-            "m-1".to_string(),
-            "m-2".to_string(),
-            "m-1".to_string(),
-        ],
-        created_at: UtcMillis(10),
-    });
-
-    let records = store.extraction_results_for_session(&session_id);
-    assert_eq!(records.len(), 1);
-    assert_eq!(
-        records[0].produced_memory_ids,
-        vec!["m-1".to_string(), "m-2".to_string()]
     );
 }
 
@@ -195,7 +134,6 @@ fn apply_extraction_writes_memory_records_and_verifies_closed_loop() {
             extracted_from: Some("extract-1".to_string()),
         })
     );
-    assert!(!stored.compacted);
 
     let stored_linkage = store
         .extraction_linkage("extract-1")
@@ -221,18 +159,22 @@ fn verify_extraction_linkage_detects_missing_and_mismatched_records() {
     let store = MemoryStore::new();
     let session_id = SessionId::new("session-1");
 
-    store.record_extraction(MemoryExtractionRecord {
-        extraction_id: "extract-1".to_string(),
-        session_id: session_id.clone(),
-        source_ref: Some("source".to_string()),
-        summary: "summary".to_string(),
-        produced_memory_ids: vec![
-            "memory-missing".to_string(),
-            "memory-wrong-session".to_string(),
-            "memory-provenance-mismatch".to_string(),
-        ],
-        created_at: UtcMillis(10),
-    });
+    // 构造损坏的内部记录以验证审计查询；生产写入只有 apply_extraction。
+    store.extraction_results.write().unwrap().insert(
+        "extract-1".into(),
+        MemoryExtractionRecord {
+            extraction_id: "extract-1".to_string(),
+            session_id: session_id.clone(),
+            source_ref: Some("source".to_string()),
+            summary: "summary".to_string(),
+            produced_memory_ids: vec![
+                "memory-missing".to_string(),
+                "memory-wrong-session".to_string(),
+                "memory-provenance-mismatch".to_string(),
+            ],
+            created_at: UtcMillis(10),
+        },
+    );
 
     store.append(MemoryRecord {
         memory_id: "memory-wrong-session".to_string(),
@@ -243,7 +185,6 @@ fn verify_extraction_linkage_detects_missing_and_mismatched_records() {
             source: "extraction".to_string(),
             extracted_from: Some("extract-1".to_string()),
         }),
-        compacted: false,
         created_at: UtcMillis(11),
     });
     store.append(MemoryRecord {
@@ -252,7 +193,6 @@ fn verify_extraction_linkage_detects_missing_and_mismatched_records() {
         layer: MemoryLayer::Durable,
         content: "wrong provenance".to_string(),
         provenance: None,
-        compacted: false,
         created_at: UtcMillis(12),
     });
     store.append(MemoryRecord {
@@ -264,7 +204,6 @@ fn verify_extraction_linkage_detects_missing_and_mismatched_records() {
             source: "extraction".to_string(),
             extracted_from: Some("extract-1".to_string()),
         }),
-        compacted: false,
         created_at: UtcMillis(13),
     });
 
@@ -289,42 +228,4 @@ fn verify_extraction_linkage_detects_missing_and_mismatched_records() {
         vec!["memory-wrong-session".to_string()]
     );
     assert!(!verification.is_consistent);
-}
-
-#[test]
-fn compaction_marks_existing_entries_and_retains_new_record() {
-    let store = MemoryStore::new();
-    let session_id = SessionId::new("session-1");
-
-    store.append(MemoryRecord {
-        memory_id: "memory-a".to_string(),
-        session_id: session_id.clone(),
-        layer: MemoryLayer::Recent,
-        content: "alpha".to_string(),
-        provenance: None,
-        compacted: false,
-        created_at: UtcMillis(1),
-    });
-    store.append(MemoryRecord {
-        memory_id: "memory-b".to_string(),
-        session_id: session_id.clone(),
-        layer: MemoryLayer::Shared,
-        content: "beta".to_string(),
-        provenance: None,
-        compacted: false,
-        created_at: UtcMillis(2),
-    });
-
-    let summary = store.compact_session(&session_id, "memory-retained", "retained");
-
-    assert_eq!(summary.affected_count, 2);
-    assert!(store.get("memory-a").is_some_and(|record| record.compacted));
-    assert!(store.get("memory-b").is_some_and(|record| record.compacted));
-
-    let retained = store
-        .get("memory-retained")
-        .expect("retained memory to exist");
-    assert_eq!(retained.layer, MemoryLayer::Durable);
-    assert!(!retained.compacted);
-    assert_eq!(retained.content, "retained");
 }

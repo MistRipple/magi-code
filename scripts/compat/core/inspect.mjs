@@ -18,13 +18,20 @@ export function buildReport({ translator, upstream, root, scanOptions, classify,
   const scan = scanSources(root, scanOptions);
   if (scan.fileCount === 0) throw new Error(`没有扫描到任何源文件（${root}）：无法给出兼容结论。请确认入口，或用 directories 指定源码目录`);
   const entries = [];
+  for (const deferred of scan.deferredImports) entries.push({
+    kind: 'modules', name: `${deferred.file} -> ${deferred.module}`, category: 'runtime', status: 'dropped', optional: true,
+    target: '原包条件注入保持等待', note: `宿主未提供 ${deferred.unavailableServices.join(', ')}；此动态导入分支不执行，不计为已翻译业务`,
+    count: 1, files: [deferred.file],
+  });
   for (const kind of kinds) {
     for (const [name, usage] of Object.entries(scan[kind] ?? {})) {
       const rule = classify(kind, name);
       entries.push({
         kind, name, category: rule.category, status: rule.status, target: rule.target,
         optional: usage.optional === true,
-        note: usage.optional ? `${rule.note}；上游可选路径：依赖缺席时不执行注入回调，或同步注册失败由上游捕获` : rule.note,
+        ...(usage.nullable ? { nullable: true } : {}),
+        note: usage.nullable ? `${rule.note}；上游可选路径：明确接纳订阅不可用时返回 null，不注册空监听`
+          : usage.optional ? `${rule.note}；上游可选路径：依赖缺席时不执行注入回调，或同步注册失败由上游捕获` : rule.note,
         source: rule.source, needs: rule.needs, capability: rule.capability, count: usage.count, files: usage.files,
       });
     }
@@ -42,6 +49,7 @@ export function buildReport({ translator, upstream, root, scanOptions, classify,
   return {
     translator, upstream,
     scanned: { files: scan.fileCount, lines: scan.lineCount, fileList: scan.files },
+    deferredImports: scan.deferredImports,
     serviceReads: scan.serviceReads,
     serviceMembers: scan.serviceMembers,
     profileMutations: scan.profileMutations,

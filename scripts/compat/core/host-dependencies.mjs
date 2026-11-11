@@ -6,7 +6,7 @@ import { join } from 'node:path';
 export function hostDependencies(sharedRoot) {
   const pkg = JSON.parse(readFileSync(join(sharedRoot, 'package.json'), 'utf8'));
   return new Set(Object.keys(pkg.dependencies ?? {}).filter((name) =>
-    name === '@deepseek-ai/cordis' || name.startsWith('@deepseek-ai/dsh-')
+    name === '@deepseek-ai/cordis' || name === '@deepseek-ai/schemastery' || name.startsWith('@deepseek-ai/dsh-')
       || name === '@earendil-works/pi-ai' || name === 'react' || name === 'react-dom'));
 }
 

@@ -5,8 +5,6 @@
   import Disclosure from './Disclosure.svelte';
   import { onMount } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
-  import type { StandardMessage } from '../shared/protocol/message-protocol';
-  import { MessageCategory } from '../shared/protocol/message-protocol';
   import { ensureArray } from '../lib/utils';
   import Icon from './Icon.svelte';
   import { selectedComposerSourceFolderId } from '../stores/composer-workspace.svelte';
@@ -28,7 +26,7 @@
     getAgentKnowledgeGraph,
     getAgentProjectKnowledge,
     listAgentKnowledgeRelations,
-    isWebAgentMode,
+
     reindexAgentProjectKnowledge,
     updateAgentKnowledgeRelation,
     updateAgentKnowledgeItem,
@@ -83,7 +81,6 @@
 
   // 状态
   const appState = getState();
-  const isWebMode = isWebAgentMode();
   const isKnowledgeActive = $derived(appState.currentTopTab === 'knowledge');
   const currentWorkspaceKey = $derived.by(() => {
     const workspaceId = typeof appState.currentWorkspaceId === 'string' ? appState.currentWorkspaceId.trim() : '';
@@ -401,52 +398,26 @@
     formError = '';
     try {
       const kind = editorKind;
-      if (isWebMode) {
-        if (editorId) {
-          const patch: { title?: string; content?: string; tags?: string[]; context?: string } = {
-            content,
-            tags,
-          };
-          if (kind === 'adr' || kind === 'faq') {
-            patch.title = title;
-          }
-          if (kind === 'learning') {
-            patch.context = context;
-          }
-          await updateAgentKnowledgeItem(editorId, patch, knowledgeWorkspaceScope(request));
-        } else {
-          await addAgentKnowledgeItem({
-            kind,
-            title: kind === 'learning' ? undefined : title,
-            content,
-            tags,
-            context: kind === 'learning' ? context : undefined,
-          }, knowledgeWorkspaceScope(request));
+      if (editorId) {
+        const patch: { title?: string; content?: string; tags?: string[]; context?: string } = {
+          content,
+          tags,
+        };
+        if (kind === 'adr' || kind === 'faq') {
+          patch.title = title;
         }
+        if (kind === 'learning') {
+          patch.context = context;
+        }
+        await updateAgentKnowledgeItem(editorId, patch, knowledgeWorkspaceScope(request));
       } else {
-        if (editorId) {
-          const updatePayload: { type: string; [key: string]: unknown } = {
-            type: 'updateKnowledgeItem',
-            knowledgeId: editorId,
-            ...knowledgeWorkspaceScope(request),
-            content,
-            tags,
-          };
-          if (kind === 'adr' || kind === 'faq') updatePayload.title = title;
-          if (kind === 'learning') updatePayload.context = context;
-          vscode.postMessage(updatePayload);
-        } else {
-          const addPayload: { type: string; [key: string]: unknown } = {
-            type: 'addKnowledgeItem',
-            ...knowledgeWorkspaceScope(request),
-            kind,
-            content,
-            tags,
-          };
-          if (kind === 'adr' || kind === 'faq') addPayload.title = title;
-          if (kind === 'learning') addPayload.context = context;
-          vscode.postMessage(addPayload);
-        }
+        await addAgentKnowledgeItem({
+          kind,
+          title: kind === 'learning' ? undefined : title,
+          content,
+          tags,
+          context: kind === 'learning' ? context : undefined,
+        }, knowledgeWorkspaceScope(request));
       }
       if (!isCurrentKnowledgeWorkspaceRequest(request)) {
         return;
@@ -826,16 +797,8 @@
     activeKnowledgeLoadRequestId = request.requestId;
     scheduleKnowledgeLoadTimeout(request);
     loadError = '';
-    if (isWebMode) {
-      fetchKnowledgeViaApi(request, reindex)
-        .catch((error) => handleKnowledgeLoadError(error, request));
-    } else {
-      vscode.postMessage({
-        type: reindex ? 'reindexProjectKnowledge' : 'getProjectKnowledge',
-        knowledgeRequestId: request.requestId,
-        ...knowledgeWorkspaceScope(request),
-      });
-    }
+    fetchKnowledgeViaApi(request, reindex)
+      .catch((error) => handleKnowledgeLoadError(error, request));
   }
 
   function refresh() {
@@ -874,17 +837,13 @@
     if (!(await confirmMessage(i18n.t('overlay.deleteKnowledgeBody'), { title: i18n.t('overlay.deleteKnowledge'), confirmLabel: i18n.t('overlay.deleteKnowledge'), tone: 'danger', anchor }))) return;
     if (scope !== currentWorkspaceKey) return;
     const request = currentKnowledgeWorkspaceRequest();
-    if (isWebMode) {
-      deleteAgentKnowledgeItem(id, knowledgeWorkspaceScope(request))
-        .then(() => {
-          if (isCurrentKnowledgeWorkspaceRequest(request)) {
-            refresh();
-          }
-        })
-        .catch((error) => handleKnowledgeMutationError(error, 'knowledge.toast.deleteFailed', request));
-    } else {
-      vscode.postMessage({ type: 'deleteKnowledgeItem', knowledgeId: id, ...knowledgeWorkspaceScope(request) });
-    }
+    deleteAgentKnowledgeItem(id, knowledgeWorkspaceScope(request))
+      .then(() => {
+        if (isCurrentKnowledgeWorkspaceRequest(request)) {
+          refresh();
+        }
+      })
+      .catch((error) => handleKnowledgeMutationError(error, 'knowledge.toast.deleteFailed', request));
   }
 
   async function createKnowledgeRelation(relation: AgentKnowledgeRelationDraft): Promise<void> {
@@ -923,17 +882,13 @@
     const request = currentKnowledgeWorkspaceRequest();
     showClearConfirm = false;
     isLoading = true;
-    if (isWebMode) {
-      clearAgentProjectKnowledge(knowledgeWorkspaceScope(request))
-        .then(() => {
-          if (isCurrentKnowledgeWorkspaceRequest(request)) {
-            refresh();
-          }
-        })
-        .catch((error) => handleKnowledgeMutationError(error, 'knowledge.toast.clearFailed', request));
-    } else {
-      vscode.postMessage({ type: 'clearProjectKnowledge', ...knowledgeWorkspaceScope(request) });
-    }
+    clearAgentProjectKnowledge(knowledgeWorkspaceScope(request))
+      .then(() => {
+        if (isCurrentKnowledgeWorkspaceRequest(request)) {
+          refresh();
+        }
+      })
+      .catch((error) => handleKnowledgeMutationError(error, 'knowledge.toast.clearFailed', request));
   }
 
   $effect(() => {
@@ -963,28 +918,8 @@
     requestKnowledgeLoad();
   });
 
-  // 监听来自扩展的消息
+  // 重连后从同一 daemon 接口重新读取知识投影
   onMount(() => {
-    const unsubscribe = vscode.onMessage((msg) => {
-      if (msg.type !== 'unifiedMessage') return;
-      const standard = msg.message as StandardMessage;
-      if (!standard || standard.category !== MessageCategory.DATA || !standard.data) return;
-      if (standard.data.dataType !== 'projectKnowledgeLoaded') return;
-
-      const payload = standard.data.payload as Record<string, unknown>;
-      const payloadRequestId = typeof payload.knowledgeRequestId === 'string' ? payload.knowledgeRequestId.trim() : '';
-      if (payloadRequestId && payloadRequestId !== activeKnowledgeLoadRequestId) {
-        return;
-      }
-      if (applyKnowledgePayload(payload)) {
-        refreshSettingsAfterKnowledgePayload();
-      } else if (!payloadRequestId || payloadRequestId === activeKnowledgeLoadRequestId) {
-        loadError = i18n.t('knowledge.toast.loadFailed');
-        isLoading = false;
-        finishKnowledgeLoad();
-      }
-    });
-
     const onConnected = (event: Event) => {
       if ((event as CustomEvent<AgentConnectionEventDetail>).detail?.status === 'connected') {
         hasRequestedKnowledge = false;
@@ -996,7 +931,6 @@
       window.removeEventListener(RUNTIME_CONNECTION_EVENT, onConnected);
       clearKnowledgeLoadTimeout();
       clearKnowledgeIndexPollTimeout();
-      unsubscribe();
     };
   });
 </script>

@@ -171,8 +171,8 @@ pub fn parse(value: &Value) -> Result<MainModelSourcesConfig, String> {
 /// 用户是否配置过主对话数据源。没有任何用户数据源即“未配置”，与“配置了但选择无效”不同：
 /// 未配置时由宿主注入的默认模型客户端（开发/测试/嵌入场景）承接，配置了就必须按目录解析，失败即报错。
 /// 插件来源是追加项，不改变“是否配置”。
-pub fn is_configured(store: &SettingsStore) -> bool {
-    parse(&store.get_section("orchestrator")).is_ok_and(|config| !config.sources.is_empty())
+pub fn is_configured(store: &SettingsStore) -> Result<bool, String> {
+    Ok(!parse(&store.get_section("orchestrator"))?.sources.is_empty())
 }
 
 fn plugin_catalog_sources(store: &SettingsStore) -> Vec<CatalogSource> {
@@ -570,7 +570,7 @@ mod tests {
             &plugin_input(&["p1"]),
         )
         .unwrap();
-        assert!(!is_configured(&only_plugin));
+        assert!(!is_configured(&only_plugin).unwrap());
         assert_eq!(
             with_first_model_default(&only_plugin, &json!({})),
             json!({})
@@ -628,7 +628,10 @@ mod tests {
             300_000
         );
         // 声明了模态的条目以声明为准；未声明的条目返回 None，交还文本模型规则。
-        assert_eq!(declared_image_input(&store, identity, "vision-1"), Some(true));
+        assert_eq!(
+            declared_image_input(&store, identity, "vision-1"),
+            Some(true)
+        );
         assert_eq!(declared_image_input(&store, identity, "plain"), None);
         let projection = catalog(&store).unwrap();
         let models = &projection["groups"][0]["models"];
@@ -636,12 +639,9 @@ mod tests {
         assert_eq!(models[0]["inputModalities"], json!(["text", "image"]));
         assert!(models[1].get("contextWindowTokens").is_none());
         assert_eq!(
-            effective_config(
-                &store,
-                &json!({"sourceId": identity, "model": "plain"})
-            )
-            .unwrap()
-            .get("contextWindowTokens"),
+            effective_config(&store, &json!({"sourceId": identity, "model": "plain"}))
+                .unwrap()
+                .get("contextWindowTokens"),
             None,
             "未声明窗口不得被编造"
         );
@@ -650,7 +650,13 @@ mod tests {
     fn declared_capabilities_are_rejected_when_invalid() {
         let store = SettingsStore::new();
         let attempt = |model: Value| {
-            set_plugin_source(&store, "acme.proxy", "gateway", "Gateway", &declared_input(json!([model])))
+            set_plugin_source(
+                &store,
+                "acme.proxy",
+                "gateway",
+                "Gateway",
+                &declared_input(json!([model])),
+            )
         };
         assert!(attempt(json!({"id": "m", "contextWindowTokens": 1000})).is_err());
         assert!(attempt(json!({"id": "m", "inputModalities": ["image"]})).is_err());

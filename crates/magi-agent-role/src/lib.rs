@@ -420,10 +420,6 @@ impl AgentRoleRegistry {
             .collect()
     }
 
-    pub fn capability_summaries(&self) -> Vec<ProfessionalCapabilitySummary> {
-        self.current_snapshot().capabilities.summaries()
-    }
-
     pub fn capability_ids(&self) -> Vec<String> {
         self.current_snapshot().capabilities.ids()
     }
@@ -467,21 +463,6 @@ impl AgentRoleRegistry {
         }
         normalized.sort();
         Ok(normalized)
-    }
-
-    pub fn compose_system_prompt(
-        &self,
-        role_id: &str,
-        role_prompt: &str,
-        capability_ids: &[String],
-    ) -> Result<String, String> {
-        if capability_ids.is_empty() {
-            return Ok(role_prompt.trim().to_string());
-        }
-        let capability_ids = self.validate_capability_ids_for_role(role_id, capability_ids)?;
-        self.current_snapshot()
-            .capabilities
-            .compose_prompt(role_id, role_prompt, &capability_ids)
     }
 
     /// 使用 Worker 创建时已经固定的角色提示词组合能力。该入口不重新读取角色的

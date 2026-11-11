@@ -22,7 +22,7 @@ export function withTempHome(fn) {
  * @returns {string} 子进程的 stdout
  */
 export function runRestricted({ script, args, readable, home, label }) {
-  const reads = [...new Set([COMPAT_DIR, home, ...readable])];
+  const reads = [...new Set([COMPAT_DIR, realpathSync(process.execPath), home, ...readable])];
   const result = spawnSync(process.execPath, [
     '--permission', ...reads.map((path) => `--allow-fs-read=${path}`), `--allow-fs-write=${home}`, script, ...args,
   ], {

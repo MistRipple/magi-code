@@ -1,8 +1,0 @@
-[package]
-name = "magi-worker-runtime"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-serde.workspace = true
-magi-core = { path = "../magi-core" }

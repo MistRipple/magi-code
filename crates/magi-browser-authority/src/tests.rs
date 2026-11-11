@@ -1059,7 +1059,8 @@ fn runtime_recovery_preserves_navigation_revision_for_replayed_surface() {
         .set_primary_surface(surface.clone(), at(7))
         .expect("当前 Surface 应绑定");
 
-    authority.begin_runtime_recovery(at(8));
+    authority = BrowserAuthority::restore_durable(authority.durable_state(), at(8))
+        .expect("运行时重启必须沿正式持久化恢复入口");
     let recovering_tab = authority.tab(&tab_id).expect("Tab 应保留");
     assert_eq!(recovering_tab.lifecycle, BrowserTabLifecycle::Suspended);
     assert_eq!(recovering_tab.navigation_revision, 1);
@@ -1223,7 +1224,7 @@ fn session_revision_tracks_surface_page_snapshot_annotation_and_lease_changes() 
         .revision;
     assert!(revision_after_lease > revision_after_comment);
     authority
-        .release_lease(&lease.lease_id, at(12))
+        .revoke_lease(&lease.lease_id, BrowserLeaseEndReason::OwnerReleased, at(12))
         .expect("lease should release");
     assert!(
         authority
@@ -1448,16 +1449,16 @@ fn snapshot_revision_is_authority_owned_and_survives_restart() {
         .expect("authority should allocate the first snapshot revision");
     assert_eq!(first, (0, 1));
     authority
-        .apply_host_snapshot_revision(&tab_id, 1, at(7))
+        .validate_snapshot_result(&tab_id, 0, 1)
         .expect("Host must echo the authority revision exactly");
     assert!(
         authority
-            .apply_host_snapshot_revision(&tab_id, 0, at(7))
+            .validate_snapshot_result(&tab_id, 0, 0)
             .is_err()
     );
     assert!(
         authority
-            .apply_host_snapshot_revision(&tab_id, 2, at(7))
+            .validate_snapshot_result(&tab_id, 0, 2)
             .is_err()
     );
 

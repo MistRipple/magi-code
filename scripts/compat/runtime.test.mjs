@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import Schema from '@deepseek-ai/schemastery';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { SettingsConflictError } from '@deepseek-ai/dsh-settings';
 import sharp from 'sharp';
 import { activateDsh } from './runtime/dsh-host.mjs';
 import { runtimeId } from './core/identity.mjs';
-import { startOpenAiBridge } from './runtime/openai-bridge.mjs';
+import { createChunkTranslator, startOpenAiBridge } from './runtime/openai-bridge.mjs';
 import { requestAttachments, saveRequestImage, withRequestImages } from './runtime/attachments.mjs';
 import * as McpClient from '@deepseek-ai/dsh-mcp-client';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
@@ -69,6 +70,224 @@ function host(value = {}) {
 }
 
 const options = { runtimeVersion: 2, plugin: 'fixture' };
+
+test('现代设置以原 bundle 入口统一读取、提交和通知，npm 包名不成为第二个写入口', async t => {
+  const h = host({ provider: 'original' }), events = []; let settings;
+  const running = await activateDsh(h.api, { inject: ['settings'], apply(ctx) {
+    settings = ctx.settings;
+    ctx.on('settings/document-updated', ns => events.push(ns));
+  } }, { ...options, settingsNamespace: 'original-entry' });
+  t.after(() => running.dispose());
+  assert.deepEqual(settings.describe().map(item => [item.ns, item.value, item.revision]), [['original-entry', { provider: 'original' }, 0]]);
+  await settings.mutate('original-entry', [{ op: 'set', path: ['provider'], value: 'selected' }]);
+  assert.deepEqual((await h.api.settings.read()).value, { provider: 'selected' });
+  assert.deepEqual(events, ['original-entry']);
+  assert.equal(settings.describe()[0].revision, 1);
+  assert.throws(() => settings.mutate(options.plugin, [{ op: 'set', path: ['provider'], value: 'wrong' }]), /不能修改/);
+  assert.deepEqual((await h.api.settings.read()).value, { provider: 'selected' });
+});
+
+test('现代设置拒绝旧表单的全部写入方式，保留最新配置并允许重新读取后保存', async t => {
+  const h = host({ provider: 'original' }), events = []; let settings;
+  const running = await activateDsh(h.api, { inject: ['settings'], apply(ctx) {
+    settings = ctx.settings;
+    ctx.on('settings/document-updated', (ns, revision) => events.push({ ns, revision }));
+  } }, options);
+  t.after(() => running.dispose());
+  const stale = settings.describe()[0];
+  await h.configure({ provider: 'newer', retained: true });
+  events.length = 0;
+  for (const write of [
+    () => settings.mutate('fixture', [{ op: 'set', path: ['provider'], value: 'stale' }], stale.revision),
+    () => settings.update('fixture', { provider: 'stale' }, stale.revision),
+    () => settings.replace('fixture', { provider: 'stale' }, stale.revision),
+  ]) {
+    await assert.rejects(write, error => error instanceof SettingsConflictError
+      && error.code === 'SETTINGS_CONFLICT' && error.expected === 0 && error.actual === 1);
+    assert.deepEqual(await h.api.settings.read(), { version: 1, value: { provider: 'newer', retained: true } });
+    assert.deepEqual(events, []);
+  }
+  const current = settings.describe()[0];
+  await settings.mutate('fixture', [{ op: 'set', path: ['provider'], value: 'selected' }], current.revision);
+  assert.deepEqual(await h.api.settings.read(), { version: 2, value: { provider: 'selected', retained: true } });
+  assert.deepEqual(events, [{ ns: 'fixture', revision: 2 }]);
+  await settings.update('fixture', { provider: 'updated' }, 2);
+  await settings.replace('fixture', { provider: 'replaced' }, 3);
+  assert.deepEqual(await h.api.settings.read(), { version: 4, value: { provider: 'replaced' } });
+});
+
+test('原页面模型业务保留角色、取消与实际用量，不把原生模型再发布成来源', async t => {
+  const h = host(); let context; const requests=[]; let history=[];
+  const providerContext=[{provider:'openai_chat',kind:'reasoning',data:{reasoning_text:'ORIGINAL REASONING'}}];
+  h.api.model = {
+    async selection() { return { sourceId:'plugin/provider/model', model:'real-model', revision:'frozen' }; },
+    async invoke(input, { signal }) { requests.push(input); signal.throwIfAborted(); return {
+      status:'completed', content:'REAL RESULT', thinking:'ORIGINAL REASONING', providerContext, finishReason:'stop',
+      usage:{ inputTokens:15, outputTokens:3, cacheReadTokens:5, cacheReadIncludedInInput:true },
+    }; },
+  };
+  const running = await activateDsh(h.api, { inject:['webServer','llm','agentDefaultModel'], apply(ctx) {
+    context=ctx;
+    ctx.webServer.register({ path:'/generate', async handler(req,res) {
+      const selection=ctx.agentDefaultModel.currentSelection();
+      let text='', replayState; const usage=[];
+      for await(const chunk of ctx.llm.stream({ ...selection, system:'SYSTEM ORIGINAL', messages:[
+        { role:'user', content:[{type:'text',text:'USER ORIGINAL'}] },
+        { role:'assistant', source:{kind:'plugin'}, content:[{type:'text',text:'ASSISTANT ORIGINAL'}] },
+        ...history,
+      ], maxTokens:800 })) {
+        if(chunk.type==='finish' && chunk.reason.kind==='error') throw new Error(chunk.reason.failure.message);
+        if(chunk.type==='text-delta')text+=chunk.text;
+        if(chunk.type==='usage')usage.push(chunk.usage);
+        if(chunk.type==='finish')replayState=chunk.replayState;
+      }
+      res.setHeader('content-type','application/json');res.end(JSON.stringify({text,usage,replayState}));
+    } });
+  } }, { ...options, nativeModels:true });
+  t.after(()=>running.dispose());
+  const signal=new AbortController().signal;
+  const result=await h.state.routes.get('/generate')({method:'POST',path:'/generate'}, {signal});
+  assert.equal(result.body.text,'REAL RESULT',JSON.stringify(result));
+  assert.deepEqual(requests[0].messages,[{role:'system',content:'SYSTEM ORIGINAL'},{role:'user',content:'USER ORIGINAL'},{role:'assistant',content:'ASSISTANT ORIGINAL'}]);
+  assert.equal(requests[0].maxOutputTokens,800);
+  assert.deepEqual(result.body.usage,[{inputTokens:10,outputTokens:3,cacheReadTokens:5}]);
+  history=[{role:'assistant',source:{kind:'model',provider:'magi-native',model:'real-model',replayState:result.body.replayState},
+    content:[{type:'reasoning',text:'ORIGINAL REASONING'},{type:'text',text:'REAL RESULT'}]}];
+  await h.state.routes.get('/generate')({method:'POST',path:'/generate'},{signal});
+  assert.deepEqual(requests[1].messages.at(-1),{role:'assistant',content:'REAL RESULT',providerContext});
+  assert.equal(h.state.models.size,0);
+  assert.throws(()=>context.agentDefaultModel.currentSelection(),/活动/);
+  const controller=new AbortController();controller.abort();
+  await assert.rejects(h.state.routes.get('/generate')({method:'POST',path:'/generate'},{signal:controller.signal}),/abort/i);
+  assert.equal(requests.length,2);
+  h.api.model.selection=async()=>{throw new Error('default model absent');};
+  const unavailable=await h.state.routes.get('/generate')({method:'POST',path:'/generate'},{signal});
+  assert.match(unavailable.body.error,/default model absent/);
+});
+
+test('原页面模型公开真实默认目录，流中失败和正文改写不能被翻译成正常结束', async t => {
+  const h=host();let mode='failure';const requests=[];
+  h.api.model={async selection(){return {model:'selected',revision:'frozen',inputModalities:['text','image']};},
+    async invoke(input,{onDelta}) {
+      requests.push(input);onDelta({content:'partial',thinking:''});
+      if(mode==='failure') throw new Error('REAL TRANSPORT FAILURE');
+      if(mode==='replace') onDelta({content:'replacement',thinking:'',replace:true});
+      return {status:'completed',content:'different',finishReason:'stop'};
+    }};
+  const running=await activateDsh(h.api,{inject:['webServer','llm','agentDefaultModel'],apply(ctx){
+    ctx.webServer.register({path:'/failure',async handler(_req,res){
+      const selection=ctx.agentDefaultModel.currentSelection();
+      const models=await ctx.llm.listModels(selection.provider),chunks=[];
+      for await(const chunk of ctx.llm.stream({...selection,messages:[{role:'user',content:[{type:'text',text:'request'}]}]})) chunks.push(chunk);
+      res.setHeader('content-type','application/json');res.end(JSON.stringify({models,chunks}));
+    }});
+  }},{...options,nativeModels:true});
+  t.after(()=>running.dispose());
+  for(mode of ['failure','replace','mismatch']) {
+    const result=await h.state.routes.get('/failure')({method:'POST',path:'/failure'},{signal:new AbortController().signal});
+    assert.equal(result.body.models[0].id,'selected');
+    assert.deepEqual(result.body.models[0].inputModalities,['text','image']);
+    assert.equal(result.body.chunks.find(chunk=>chunk.type==='text-delta').text,'partial');
+    const finish=result.body.chunks.at(-1);
+    assert.equal(finish.type,'finish');assert.equal(finish.reason.kind,'error');
+    assert.match(finish.reason.failure.message,mode==='failure'?/REAL TRANSPORT FAILURE/:mode==='replace'?/改写正文/:/最终结果/);
+  }
+  assert.equal(requests.length,3,'失败不重试或重放模型请求');
+});
+
+test('原页面模型在最终结果之前交付片段，消费者退出取消同一调用', async t => {
+  const h=host();let release,first,mode='complete',cancelled=false;
+  const gate=new Promise(resolve=>{release=resolve;}), started=new Promise(resolve=>{first=resolve;});
+  h.api.model={async selection(){return {model:'test',revision:'one'};},async invoke(_input,{signal,onDelta}) {
+    onDelta({content:'first',thinking:''});
+    if(mode==='cancel') {
+      await new Promise(resolve=>signal.addEventListener('abort',()=>{cancelled=true;resolve();},{once:true}));
+      signal.throwIfAborted();
+    }
+    await gate;onDelta({content:' last',thinking:''});return {status:'completed',content:'first last',finishReason:'stop'};
+  }};
+  const running=await activateDsh(h.api,{inject:['webServer','llm','agentDefaultModel'],apply(ctx){
+    ctx.webServer.register({path:'/stream',async handler(_req,res){
+      let text='';
+      for await(const chunk of ctx.llm.stream({...ctx.agentDefaultModel.currentSelection(),messages:[{role:'user',content:[{type:'text',text:'hello'}]}]})) {
+        if(chunk.type==='text-delta'){text+=chunk.text;first();if(mode==='cancel')break;}
+      }
+      res.end(text);
+    }});
+  }},{...options,nativeModels:true});
+  t.after(()=>{release();return running.dispose();});
+  let finished=false;
+  const result=h.state.routes.get('/stream')({method:'POST',path:'/stream'},{signal:new AbortController().signal}).then(value=>{finished=true;return value;});
+  await Promise.race([started,delay(2000).then(()=>{throw new Error('片段等待了最终结果');})]);
+  assert.equal(finished,false);release();assert.equal((await result).body,'first last');
+  mode='cancel';await h.state.routes.get('/stream')({method:'POST',path:'/stream'},{signal:new AbortController().signal});
+  assert.equal(cancelled,true,'上游消费者结束后不能留下孤立请求');
+});
+
+test('原生模型快照保留 Magi 合同，DSH 推理元数据和关闭档位只在翻译层转换', async t => {
+  const h=host(), requests=[];
+  const selection={sourceId:'native-source',model:'native-model',revision:'frozen',reasoning:{
+    supportedEfforts:['none','low','high'],defaultEffort:'none',transport:'openai',source:'user',
+  }};
+  h.api.model={async selection(){return structuredClone(selection);},async invoke(input){
+    requests.push(input);return {status:'completed',content:'NATIVE RESULT',finishReason:'stop'};
+  }};
+  const running=await activateDsh(h.api,{inject:['webServer','llm','agentDefaultModel'],apply(ctx){
+    ctx.webServer.register({path:'/reasoning',async handler(_req,res){
+      const selected=ctx.agentDefaultModel.currentSelection();
+      const info=await ctx.llm.resolveModelInfo(selected.provider,selected.model);
+      const chunks=[];
+      for await(const chunk of ctx.llm.stream({...selected,reasoningEffort:info.reasoning.defaultEffort,
+        messages:[{role:'user',content:[{type:'text',text:'hello'}]}]})) chunks.push(chunk);
+      res.setHeader('content-type','application/json');res.end(JSON.stringify({info,chunks}));
+    }});
+  }},{...options,nativeModels:true});
+  t.after(()=>running.dispose());
+  const response=await h.state.routes.get('/reasoning')({method:'POST',path:'/reasoning'},{signal:new AbortController().signal});
+  assert.deepEqual(response.body.info.reasoning.efforts.map(effort=>effort.id),['off','low','high']);
+  assert.equal(response.body.info.reasoning.defaultEffort,'off');
+  assert.equal(requests.length,1,JSON.stringify(response));
+  assert.deepEqual(requests[0].selection,selection,'原始选择是 daemon 的校验事实，不能回传 DSH 投影');
+  assert.equal(requests[0].reasoningEffort,'none');
+  assert.equal(response.body.chunks.find(chunk=>chunk.type==='text-delta').text,'NATIVE RESULT');
+  const {dshReasoningOf}=await import('./runtime/reasoning.mjs');
+  assert.throws(()=>dshReasoningOf({supportedEfforts:['unknown']}),/能力无效/);
+  assert.throws(()=>dshReasoningOf({supportedEfforts:['low'],defaultEffort:'high'}),/不在声明/);
+});
+
+test('原页面模型保留图片、工具调用与结果、推理和生成参数，工具结果不冒充 Magi 工具执行', async t => {
+  const h=host(),requests=[];
+  const data=await sharp({create:{width:2,height:2,channels:3,background:'#ff0000'}}).png().toBuffer();
+  const ref={attachmentId:'owned-image',mediaType:'image/png',bytes:data.length,width:2,height:2};
+  h.api.images={async read(id){assert.equal(id,ref.attachmentId);return {ref,data};}};
+  h.api.model={async selection(){return {model:'test',revision:'one',inputModalities:['text','image'],reasoning:{supportedEfforts:['high'],defaultEffort:'high',transport:'openai',source:'test'}};},async invoke(input){
+    requests.push(input);
+    return {status:'requires_tool_execution',content:'',toolCalls:[{id:'call-one',type:'function',function:{name:'business.lookup',arguments:'{"name":"sample"}'}}],finishReason:'tool_calls'};
+  }};
+  const history=[{role:'assistant',source:{kind:'model',provider:'magi-native',model:'test'},content:[{type:'tool-call',id:'old-call',name:'business.lookup',arguments:'{}'}]},
+    {role:'tool',toolCallId:'old-call',isError:true,source:{kind:'tool',callId:'old-call'},content:[{type:'text',text:'REAL ERROR'}]}];
+  const running=await activateDsh(h.api,{inject:['webServer','llm','agentDefaultModel'],apply(ctx){
+    ctx.webServer.register({path:'/tools',async handler(_req,res){
+      const chunks=[];
+      for await(const chunk of ctx.llm.stream({...ctx.agentDefaultModel.currentSelection(),messages:[
+        {role:'user',content:[{type:'text',text:'Inspect this image'},{type:'image',attachment:ref}]},...history,
+      ],tools:[{name:'business.lookup',description:'Business query',parameters:{type:'object',properties:{name:{type:'string'}}}}],temperature:0.25,stop:['STOP'],reasoningEffort:'high',maxTokens:900})) chunks.push(chunk);
+      res.setHeader('content-type','application/json');res.end(JSON.stringify(chunks));
+    }});
+  }},{...options,nativeModels:true});
+  t.after(()=>running.dispose());
+  const result=await h.state.routes.get('/tools')({method:'POST',path:'/tools'},{signal:new AbortController().signal});
+  assert.equal(requests.length,1,JSON.stringify(result));
+  const request=requests[0];
+  assert.equal(request.messages[0].images[0].media_type,'image/jpeg');
+  assert.equal((await sharp(Buffer.from(request.messages[0].images[0].data,'base64')).metadata()).width,2);
+  assert.equal(request.tools[0].function.name,'business.lookup');
+  assert.equal(request.temperature,0.25);assert.deepEqual(request.stop,['STOP']);assert.equal(request.reasoningEffort,'high');assert.equal(request.maxOutputTokens,900);
+  assert.equal(request.messages[1].toolCalls[0].id,'old-call');
+  assert.equal(request.messages[2].toolCallId,'old-call');assert.equal(JSON.parse(request.messages[2].content).is_error,true);
+  assert.deepEqual(result.body.find(chunk=>chunk.type==='tool-call-delta'),{type:'tool-call-delta',index:0,id:'call-one',name:'business.lookup',argumentsDelta:'{"name":"sample"}'});
+  assert.equal(result.body.at(-1).reason.kind,'tool-calls');assert.equal(h.state.tools.size,0);
+});
 
 test('提示贡献沿真实注册表保持顺序、插值、运行中切换和 effect 撤销，预算失败不提交部分指引', async t => {
   const h = host(); let context, release, text = '第一轮';
@@ -200,6 +419,42 @@ test('设置命名空间可在配置重载后动态出现，资源授权与 CAS 
   await settings.dispose();
   const denied = createRegisteredSettings({}, false);
   assert.throws(() => denied.register(ctx, 'unapproved', Schema.object({})), /未声明/);
+});
+
+test('注册设置按已提交值通知，保留 base 继承、异步顺序、取消订阅及停用清理', async () => {
+  let stored={version:0,value:null}, fail=false;
+  const logs=[], cleanup=[], observed=[];
+  const settings=createRegisteredSettings({resource:{
+    async read(){return structuredClone(stored);},
+    async write(_id,version,value){assert.equal(version,stored.version);if(fail)throw new Error('CAS rejected');return stored={version:version+1,value:structuredClone(value)};},
+  },log:message=>logs.push(message)},true);
+  const ctx={effect:callback=>cleanup.push(callback())};
+  const schema=value=>({enabled:value.enabled??true,nested:{source:'default',...value.nested}});
+  const scope=settings.register(ctx,'business',schema,{base:{enabled:false,nested:{source:'composition'}}});
+  assert.deepEqual(scope.get(),{enabled:false,nested:{source:'composition'}});
+  let releaseFirst;const first=new Promise(resolve=>{releaseFirst=resolve;});
+  const off=scope.watch(async(next,previous)=>{observed.push([next,previous]);if(observed.length===1)await first;});
+  await scope.update({nested:{edited:'one'}});await until(()=>observed.length===1);
+  await scope.update({nested:{edited:'two'}});
+  assert.equal(observed.length,1,'同一个异步观察器不能并发运行');
+  releaseFirst();await until(()=>observed.length===2);
+  assert.deepEqual(observed[1],[{enabled:false,nested:{source:'composition',edited:'two'}},{enabled:false,nested:{source:'composition',edited:'one'}}]);
+  assert.deepEqual(stored.value.business,{nested:{edited:'two'}},'派生默认值和组合 base 不能写成用户覆盖');
+  fail=true;await assert.rejects(scope.update({enabled:true}),/CAS rejected/);fail=false;
+  assert.equal(observed.length,2,'失败提交不能发出通知');
+  off();await scope.replace({});await delay(0);assert.equal(observed.length,2);
+  assert.deepEqual(scope.get(),{enabled:false,nested:{source:'composition'}},'清空用户层恢复组合 base');
+  const stopFault=scope.watch(()=>{throw new Error('observer failure');});
+  await scope.update({enabled:true});await until(()=>logs.some(line=>line.includes('observer failure')));stopFault();
+  let unblock,started=false,finished=false;
+  const pending=new Promise(resolve=>{unblock=resolve;});
+  const stop=scope.watch(async()=>{started=true;await pending;finished=true;});
+  await scope.update({enabled:false});await until(()=>started);
+  await scope.update({enabled:true});stop();
+  const disposing=settings.dispose();await delay(0);assert.equal(finished,false);
+  unblock();await disposing;assert.equal(finished,true);
+  for(const dispose of cleanup)dispose();
+  assert.throws(()=>scope.watch(()=>{}),/已失效/);
 });
 
 test('DSH 注册设置按命名空间保存到 daemon 资源，未 await 的写入在路由回执前落盘并在重建实例后恢复', async (t) => {
@@ -616,6 +871,20 @@ test('DSH 条件注入缺服务保留 pending，注册失败交由上游捕获�
   assert.deepEqual(h.state.failures, []);
 });
 
+test('事件不可用返回原包所声明的 null，catch 路径取得真实拒绝，不能伪装订阅成功', async t => {
+  const h=host(); let conditional, caught=false, context;
+  const running=await activateDsh(h.api, {apply(ctx) {
+    context=ctx;
+    conditional=ctx.on?.('agent/created',()=>assert.fail('不得触发未提供的 Agent 事件'))??null;
+    try {ctx.on('session/event',()=>{});}catch{caught=true;}
+  }}, {...options, nullableEvents:['agent/created'], optionalEvents:['session/event']});
+  t.after(()=>running.dispose());
+  assert.equal(conditional,null);assert.equal(caught,true);
+  context.emit('agent/created', {agent:{id:'must-not-be-observed'}});
+  assert.deepEqual(h.state.failures,[]);
+  assert.ok(h.state.logs.some(line=>line.includes('agent/created')&&line.includes('null')));
+});
+
 test('DSH 就绪后的注册、撤销、同名重绑沿 effect 生效，卸载清空目录', async (t) => {
   const h = host();
   let ctx;
@@ -853,6 +1122,39 @@ test('DSH 卸载在 daemon 拒绝回写时仍关闭模型端口', async (t) => {
   await assert.rejects(fetch(`${source.baseUrl}/models`));
 });
 
+test('推理关闭按模型实际声明双向转换，未声明及歧义档位不静默替换', async t => {
+  const { reasoningOf } = await import('./runtime/reasoning.mjs');
+  const received = [];
+  const bridge = await startOpenAiBridge({ provider: 'fixture', llm: {
+    async resolveModelInfo(_provider, model) { return { reasoning: { efforts: [{ id: model }] } }; },
+    async *stream(request) {
+      received.push([request.model, request.reasoningEffort]);
+      yield { type: 'text-delta', text: 'actual response' };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  } });
+  t.after(() => bridge.close());
+  const expected = [['disabled', 'none'], ['off', 'none'], ['none', 'none'], ['high', 'high'], ['light', 'low'], ['balanced', 'medium'], ['deep', 'high']];
+  for (const [id, native] of expected) {
+    const metadata = reasoningOf([id], id);
+    assert.deepEqual(metadata.supportedEfforts, [native]); assert.equal(metadata.defaultEffort, native);
+    const response = await fetch(`${bridge.baseUrl}/chat/completions`, { method: 'POST',
+      headers: { authorization: `Bearer ${bridge.apiKey}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: id, stream: true, reasoning_effort: native, messages: [{ role: 'user', content: 'hello' }] }),
+    });
+    assert.equal(response.status, 200); assert.match(await response.text(), /actual response/);
+  }
+  assert.deepEqual(received, expected.map(([id]) => [id, id]));
+  const rejected = await fetch(`${bridge.baseUrl}/chat/completions`, { method: 'POST',
+    headers: { authorization: `Bearer ${bridge.apiKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'high', stream: true, reasoning_effort: 'none', messages: [{ role: 'user', content: 'hello' }] }),
+  });
+  assert.equal(rejected.status, 400); assert.equal(received.length, expected.length);
+  assert.throws(() => reasoningOf(['off', 'disabled']), /无法区分/);
+  assert.throws(() => reasoningOf(['low'], 'high'), /不在模型声明/);
+  assert.throws(() => reasoningOf(['unknown']), /无法映射/);
+});
+
 test('图片经真实本机 HTTP 模型桥转换，附件引用只在该请求内有效', async (t) => {
   const bytes = await sharp({ create: { width: 8, height: 6, channels: 3, background: '#2468ab' } }).png().toBuffer();
   const dataUrl = `data:image/png;base64,${bytes.toString('base64')}`;
@@ -1010,4 +1312,125 @@ test('原包工具与命令共用已装配的消息端口，状态与真实 daem
   assert.deepEqual(messages.map(({messageId,delivery})=>({messageId,delivery})),[
     {messageId:'command-message',delivery:'steer'},{messageId:'tool-message',delivery:'context'},
   ]);
+});
+
+test('DSH 互斥输入量转换为完整 Chat 输入，保留缓存读写及推理拆分的实际零值与缺席', () => {
+  const translator = createChunkTranslator('any-provider');
+  const usage = value => translator.push({type:'usage',usage:value})[0].usage;
+  assert.deepEqual(usage({inputTokens:120,cacheReadTokens:880,cacheWriteTokens:30,outputTokens:20,reasoningTokens:5,totalTokens:1050}),{
+    prompt_tokens:1030,completion_tokens:20,total_tokens:1050,prompt_tokens_details:{cached_tokens:880},
+    cache_creation_input_tokens:30,completion_tokens_details:{reasoning_tokens:5},
+  });
+  assert.deepEqual(usage({inputTokens:120,cacheReadTokens:880,outputTokens:20}),{
+    prompt_tokens:1000,completion_tokens:20,total_tokens:1020,prompt_tokens_details:{cached_tokens:880},
+  });
+  assert.deepEqual(usage({inputTokens:10,cacheReadTokens:0,cacheWriteTokens:0,outputTokens:2,reasoningTokens:0}),{
+    prompt_tokens:10,completion_tokens:2,total_tokens:12,prompt_tokens_details:{cached_tokens:0},
+    cache_creation_input_tokens:0,completion_tokens_details:{reasoning_tokens:0},
+  });
+  assert.deepEqual(usage({inputTokens:10,outputTokens:2}),{prompt_tokens:10,completion_tokens:2,total_tokens:12});
+});
+
+test('DSH 模型桥即时交付正文，最终用量保留可配对的准确推理拆分而不补造缺失拆分', async t => {
+  let release, delivered;
+  const resume = new Promise(resolve=>{release=resolve;});
+  const first = new Promise(resolve=>{delivered=resolve;});
+  const bridge=await startOpenAiBridge({provider:'any-provider',llm:{async *stream() {
+    yield {type:'text-delta',text:'first'};delivered();await resume;
+    yield {type:'text-delta',text:' last'};
+    yield {type:'usage',usage:{inputTokens:494,cacheReadTokens:21120,outputTokens:979,reasoningTokens:0}};
+    yield {type:'finish',reason:{kind:'stop'}};
+  }}});
+  t.after(()=>{release();return bridge.close();});
+  const response=await fetch(bridge.baseUrl+'/chat/completions',{method:'POST',
+    headers:{authorization:'Bearer '+bridge.apiKey,'content-type':'application/json'},
+    body:JSON.stringify({model:'plain',stream:true,messages:[{role:'user',content:'long answer'}]})});
+  await first;
+  const reader=response.body.getReader();
+  const head=new TextDecoder().decode((await reader.read()).value);
+  assert.match(head,/first/);assert.doesNotMatch(head,/usage|last/,'正文不能等待最终用量才输出');
+  release();let tail='';while(true){const chunk=await reader.read();if(chunk.done)break;tail+=new TextDecoder().decode(chunk.value);}
+  const usage=tail.split('\n\n').filter(line=>line.startsWith('data: {')).map(line=>JSON.parse(line.slice(6))).find(chunk=>chunk.usage).usage;
+  assert.equal(usage.prompt_tokens,21614);assert.equal(usage.prompt_tokens_details.cached_tokens,21120);
+  assert.equal(usage.completion_tokens,979);assert.equal(usage.completion_tokens_details.reasoning_tokens,0);
+  assert.match(tail,/data: \[DONE\]/);
+});
+
+for (const kind of ['eof', 'throw', 'throw-after-finish', 'error', 'aborted']) {
+  test(`DSH 模型桥 ${kind} 保留已报告用量、返回真实失败并关闭迭代器`, async t => {
+    let closed = false;
+    const bridge = await startOpenAiBridge({ provider:'any-provider', llm:{ async *stream() {
+      try {
+        if (kind !== 'error' && kind !== 'aborted') yield {type:'text-delta',text:'partial'};
+        yield {type:'usage',usage:{inputTokens:12,cacheReadTokens:88,outputTokens:3}};
+        if (kind === 'throw-after-finish') yield {type:'finish',reason:{kind:'stop'}};
+        if (kind.startsWith('throw')) throw new Error('upstream connection failed');
+        if (kind !== 'eof') yield {type:'finish',reason:{kind,failure:{code:'UPSTREAM_STOPPED',message:'upstream stopped'}}};
+      } finally { closed = true; }
+    } } });
+    t.after(() => bridge.close());
+    const response = await fetch(bridge.baseUrl+'/chat/completions', {
+      method:'POST',headers:{authorization:'Bearer '+bridge.apiKey,'content-type':'application/json'},
+      body:JSON.stringify({model:'plain',stream:true,messages:[{role:'user',content:'test'}]}),
+    });
+    const body = await response.text();
+    assert.equal(response.status,200,'已收到的用量沿 SSE 回执提交，业务终态由 error 声明');
+    const chunks = body.split('\n\n').filter(line=>line.startsWith('data: {')).map(line=>JSON.parse(line.slice(6)));
+    assert.deepEqual(chunks.find(chunk=>chunk.usage)?.usage, {
+      prompt_tokens:100,completion_tokens:3,total_tokens:103,prompt_tokens_details:{cached_tokens:88},
+    });
+    assert.ok(chunks.some(chunk=>chunk.error?.message),'不得将上游失败或缺少 finish 当作成功');
+    assert.ok(!chunks.some(chunk=>chunk.choices?.some(choice=>choice.finish_reason)),'完成回执必须等待迭代器正常退出');
+    assert.doesNotMatch(body,/data: \[DONE\]/);
+    assert.equal(closed,true,'错误终态也必须释放上游生成器');
+  });
+}
+
+test('DSH 模型桥保留无用量的真实拒绝状态，正常 finish 后的最终用量也完整交付', async t => {
+  const bridge = await startOpenAiBridge({provider:'any-provider',llm:{async *stream(request) {
+    if (request.model==='denied') {
+      yield {type:'finish',reason:{kind:'error',failure:{status:403,code:'denied',message:'permission denied'}}};
+      return;
+    }
+    yield {type:'text-delta',text:'ok'};
+    yield {type:'finish',reason:{kind:'stop'}};
+    yield {type:'usage',usage:{inputTokens:0,outputTokens:0}};
+  }}});
+  t.after(()=>bridge.close());
+  const request = model => fetch(bridge.baseUrl+'/chat/completions', {method:'POST',
+    headers:{authorization:'Bearer '+bridge.apiKey,'content-type':'application/json'},
+    body:JSON.stringify({model,stream:true,messages:[{role:'user',content:'test'}]}),
+  });
+  const denied = await request('denied');
+  assert.equal(denied.status,403);
+  assert.equal((await denied.json()).error.code,'denied');
+  const completed = await request('completed'), body = await completed.text();
+  assert.equal(completed.status,200);
+  assert.match(body,/"prompt_tokens":0,"completion_tokens":0/);
+  assert.ok(body.indexOf('"usage"') < body.indexOf('"finish_reason":"stop"'));
+  assert.match(body,/data: \[DONE\]/);
+});
+
+test('取消本机 HTTP 模型桥请求会中止同一上游流并执行资源释放', async t => {
+  let released;
+  const closed = new Promise(resolve=>{released=resolve;});
+  const bridge = await startOpenAiBridge({provider:'any-provider',llm:{async *stream({signal}) {
+    try {
+      yield {type:'text-delta',text:'partial'};
+      await new Promise(resolve=>{
+        if(signal.aborted) resolve(); else signal.addEventListener('abort',resolve,{once:true});
+      });
+    } finally { released(signal.aborted); }
+  }}});
+  t.after(()=>bridge.close());
+  const controller = new AbortController();
+  const response = await fetch(bridge.baseUrl+'/chat/completions', {method:'POST',signal:controller.signal,
+    headers:{authorization:'Bearer '+bridge.apiKey,'content-type':'application/json'},
+    body:JSON.stringify({model:'test',stream:true,messages:[{role:'user',content:'test'}]}),
+  });
+  await response.body.getReader().read();
+  controller.abort();
+  assert.equal(await Promise.race([closed,new Promise((_,reject)=>{
+    const timer=setTimeout(()=>reject(new Error('上游未释放')),2000);timer.unref();
+  })]),true);
 });

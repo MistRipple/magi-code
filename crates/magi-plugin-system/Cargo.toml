@@ -5,7 +5,6 @@ edition.workspace = true
 
 [dependencies]
 magi-app-server-protocol = { path = "../magi-app-server-protocol" }
-magi-bridge-client = { path = "../magi-bridge-client" }
 magi-core = { path = "../magi-core" }
 magi-media = { path = "../magi-media" }
 magi-extension-host = { path = "../magi-extension-host" }
@@ -13,7 +12,6 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
 zip.workspace = true
 flate2 = "1"
 tar = "0.4"
@@ -23,5 +21,4 @@ semver = "1"
 jsonschema = { version = "0.60", default-features = false }
 
 [dev-dependencies]
-magi-process = { path = "../magi-process" }
 tempfile = "3"

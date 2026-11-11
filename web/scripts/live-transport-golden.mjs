@@ -24,9 +24,14 @@ class FakeEventSource {
 }
 
 globalThis.EventSource = FakeEventSource;
+// 注入旧宿主全局也不能改变 Magi 的 daemon 通信路径。
+globalThis.acquireVsCodeApi = () => {
+  throw new Error('retired IDE host must not be acquired');
+};
 
 await withGoldenViteServer(async (server) => {
   const transportModule = await server.ssrLoadModule('/src/shared/transport.ts');
+  transportModule.initTransport();
   const transport = transportModule.getTransport();
   let openCount = 0;
   let errorCount = 0;
@@ -86,6 +91,23 @@ await withGoldenViteServer(async (server) => {
   const publicRequestUrl = new URL(requestedUrls[0]);
   assert.equal(publicRequestUrl.searchParams.get('tunnel_token'), 'secret-token');
 
+  await transport.request('https://unrelated.example/api');
+  assert.equal(new URL(requestedUrls.at(-1)).searchParams.has('tunnel_token'), false,
+    'public tunnel credentials must stay on their original origin');
+
+  const controller = new AbortController();
+  let receivedInit;
+  globalThis.fetch = async (_url, init) => {
+    receivedInit = init;
+    init?.signal?.throwIfAborted();
+    return new Response('{}', { status: 200 });
+  };
+  const requestInit = { method: 'POST', body: '{"intent":"save"}', signal: controller.signal };
+  await transport.request('/api/settings', requestInit);
+  assert.equal(receivedInit, requestInit, 'request body and cancellation must reach the same fetch');
+  controller.abort();
+  await assert.rejects(transport.request('/api/settings', requestInit), { name: 'AbortError' });
+
   transport.connectEventStream('https://example.trycloudflare.com/events?sessionId=session-1', {
     onOpen() {},
     onMessage() {},
@@ -96,3 +118,4 @@ await withGoldenViteServer(async (server) => {
 
   console.log('live transport golden replay passed');
 });
+delete globalThis.acquireVsCodeApi;

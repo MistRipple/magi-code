@@ -57,7 +57,10 @@ impl BackgroundJob {
         context.session_id.as_ref() == Some(&self.session_id)
             && context.workspace_id == self.workspace_id
             && (context.caller_scope == ToolCallerScope::SessionMainline
-                || self.task_id.as_ref().is_some_and(|task| context.task_id.as_ref() == Some(task)))
+                || self
+                    .task_id
+                    .as_ref()
+                    .is_some_and(|task| context.task_id.as_ref() == Some(task)))
     }
 
     pub fn validate_snapshot(&self) -> Result<(), String> {
@@ -70,7 +73,10 @@ impl BackgroundJob {
             || self.item_id.trim().is_empty()
             || self.tool_call_id.trim().is_empty()
             || self.session_id.as_str().trim().is_empty()
-            || self.task_id.as_ref().is_some_and(|task| task.as_str().trim().is_empty())
+            || self
+                .task_id
+                .as_ref()
+                .is_some_and(|task| task.as_str().trim().is_empty())
             || self.revision == 0
             || !self.stdout_path.is_absolute()
             || !self.stderr_path.is_absolute()

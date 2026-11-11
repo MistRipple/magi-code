@@ -379,15 +379,6 @@ impl SessionCodeContextRegistry {
         )
     }
 
-    pub fn validate_revision(
-        &self,
-        session_id: &str,
-        expected_revision: Option<u64>,
-    ) -> Result<(), SessionContextError> {
-        let root = self.unambiguous_root(session_id)?;
-        self.validate_revision_for_root(session_id, &root, expected_revision)
-    }
-
     pub fn validate_revision_for_root(
         &self,
         session_id: &str,
@@ -492,26 +483,6 @@ impl SessionCodeContextRegistry {
         Ok(context.clone())
     }
 
-    /// 记录代理结束时提交的产出，供回执和 agent_apply 使用。
-    pub fn record_agent_worktree_result(
-        &self,
-        session_id: &str,
-        task_id: &str,
-        lease_id: &str,
-        result_head: String,
-        changed_paths: Vec<String>,
-    ) -> Result<SessionCodeContext, SessionContextError> {
-        let root = self.unambiguous_root(session_id)?;
-        self.record_agent_worktree_result_for_root(
-            session_id,
-            &root,
-            task_id,
-            lease_id,
-            result_head,
-            changed_paths,
-        )
-    }
-
     pub fn record_agent_worktree_result_for_root(
         &self,
         session_id: &str,
@@ -543,17 +514,6 @@ impl SessionCodeContextRegistry {
         agent_worktree.changed_paths = changed_paths;
         context.context_revision = context.context_revision.saturating_add(1);
         Ok(context.clone())
-    }
-
-    /// 标记代理产出已应用到主工作树。
-    pub fn mark_agent_worktree_applied(
-        &self,
-        session_id: &str,
-        task_id: &str,
-        result_head: &str,
-    ) -> Result<SessionCodeContext, SessionContextError> {
-        let root = self.unambiguous_root(session_id)?;
-        self.mark_agent_worktree_applied_for_root(session_id, &root, task_id, result_head)
     }
 
     pub fn mark_agent_worktree_applied_for_root(

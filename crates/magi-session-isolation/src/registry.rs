@@ -216,15 +216,6 @@ impl SessionIsolationRegistry {
         }
         target.len()
     }
-
-    /// 指定源目录下仍在使用隔离副本的会话；符号链接别名不分配第二份副本。
-    pub fn sessions_for_source(&self, source_root: &Path) -> Vec<SessionIsolation> {
-        let key = source_key(source_root);
-        self.all()
-            .into_iter()
-            .filter(|item| source_key(&item.source_root) == key)
-            .collect()
-    }
 }
 
 #[cfg(test)]

@@ -63,6 +63,16 @@ impl BuiltinTool for NormalizedBuiltinTool {
         context: &ToolExecutionContext,
         resources: &ToolRuntimeResources,
     ) -> String {
+        if matches!(
+            self.name,
+            BuiltinToolName::WebSearch | BuiltinToolName::WebFetch
+        ) && let Some(executor) = &resources.web_provider_executor
+        {
+            let operation = cancellation::OperationCancellation::new(context, resources);
+            if let Some(result) = executor(self.name.as_str(), input, context, operation.flag()) {
+                return result;
+            }
+        }
         match self.name {
             BuiltinToolName::FileRead => files::execute_file_read(input, context, resources),
             BuiltinToolName::ViewImage => execute_view_image(input, context),

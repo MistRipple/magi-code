@@ -54,7 +54,7 @@ mod turn_harness;
 mod turn_service;
 
 pub use browser_tool_runtime::BrowserToolRuntimeDependencies;
-pub use dto::{DaemonIdentity, DirectHttpModelProbeConfig};
+pub use dto::DaemonIdentity;
 pub use errors::{ApiError, ErrorResponseDto};
 pub use routes::build_router;
 pub use routes::{

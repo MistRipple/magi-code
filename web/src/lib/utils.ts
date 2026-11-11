@@ -101,34 +101,6 @@ export function debounce<T extends (...args: unknown[]) => void>(
 }
 
 /**
- * 节流函数
- */
-export function throttle<T extends (...args: unknown[]) => void>(
-  fn: T,
-  limit: number
-): (...args: Parameters<T>) => void {
-  let lastCall = 0;
-  return (...args: Parameters<T>) => {
-    const now = Date.now();
-    if (now - lastCall >= limit) {
-      lastCall = now;
-      fn(...args);
-    }
-  };
-}
-
-/**
- * 安全的 JSON 解析
- */
-export function safeJsonParse<T>(str: string, defaultValue: T): T {
-  try {
-    return JSON.parse(str) as T;
-  } catch {
-    return defaultValue;
-  }
-}
-
-/**
  * 格式化已用秒数（流式指示器专用，固定 MM:SS）
  */
 export function formatElapsed(seconds: number): string {
@@ -136,14 +108,6 @@ export function formatElapsed(seconds: number): string {
   const minutes = Math.floor(normalizedSeconds / 60);
   const remainingSeconds = normalizedSeconds % 60;
   return `${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`;
-}
-
-/**
- * 截断文本
- */
-export function truncate(str: string, maxLength: number): string {
-  if (!str || str.length <= maxLength) return str;
-  return str.substring(0, maxLength - 3) + '...';
 }
 
 /**

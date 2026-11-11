@@ -100,6 +100,9 @@ Prompt 缓存使用 `npm run test:prompt-cache`（或直接运行 `node scripts/
 
 输入区统计的跨层验收先执行 `cargo build -p magi-daemon-app`，再运行 `node scripts/verify-prompt-cache.mjs --session-stats --output /绝对路径/产物目录`。该模式只接受完整的本地夹具运行：分批发送正文并明确报告最终推理 token 拆分，要求主对话和 worker 都有真实 HTTP 接收计时；逐角色、绑定及会话核对 token、缓存读写观测覆盖、TTFT 总和、正文 token 与生成区间。关闭后读取持久账本，再从同一状态目录重启，确认统计不变、会话包含所属 worker、不重复追加 attempt、不调用模型。报告中的 `sessionStatsVerification` 保留各会话结果；合成的命中率和 TPS 只用于验证核算，不能作为真实供应商的缓存或速度结论。重试、失败和恢复另用 `cargo test -p magi-conversation-runtime main_and_worker_retry_measurements` 覆盖两个角色；界面筛选及跨模型加权用 `npm --prefix web run test:session-stats` 验证。
 
+真实 WorkBuddy 统计沿现有原包验收运行：`MAGI_WORKBUDDY_STATS=1 MAGI_WORKBUDDY_OUTPUT=target/plugin-acceptance/workbuddy-stats-final node scripts/verify-electron-workbuddy.mjs`。固定在线 `dsh-connect-workbuddy@5.21.2` 与 `deepseek-v4.1-flash`，在原生统计面板保持打开时提交较长真实回复；核对 usage 事件后自动读取的新版本、HTTP 正文首末接收时间、输入／缓存回执及累计输出，最后完整重启确认持久化不重复。不以单批短回复制造 TPS，不在缺少最终推理 token 拆分时补零或按字符估算。`scripts/lib/workbuddy-stats-acceptance.mjs` 只读取真实结果和收集证据，不提供产品统计状态。修复前失败证据 `workbuddy-stats-before/stats-counts.json` 保留输入 **494**、缓存读取 **21,120** 的矛盾；新运行必须完整通过，不能拼接旧结果。
+
+
 真实桌面端连续验收使用 `npm run test:electron-session-stats-live`：从当前源码构建的 Electron Desktop 启动独立 daemon、真实 App Renderer 和本地受控 HTTP Provider，通过真实输入区连续完成主对话与 worker，再读取会话统计接口和统计面板，切换 worker 筛选，关闭并重新启动 Desktop 后核对同一 session 的 totals 不变。该验收保存 `electron_session_stats_live` 证据，验证真实桌面链路的归属和恢复；Provider 仍为本地受控夹具，不作为供应商缓存效果结论。
 
 用 `--baseline /绝对路径/magi-daemon-app` 增加旧版对照，`--output /绝对路径/产物目录` 保存请求/工具哈希、首字节/首文本/总耗时、Provider usage、账本核对和失败阶段；不保存完整模型请求或上游凭据。`--max-calls 56` 限制**两版合计**的上游请求数（默认 48，最多 96），包含自然辅助调用和传输重试，超限返回不重试的 400 并保留失败证据。HTTP 传输次数与账本逻辑调用次数分开，重试不能虚增账本命中率；未报告缓存 usage 或价格保持未知。实际记录和对照限制见 [Prompt 缓存分析与优化记录](prompt-cache-optimization.md)。
@@ -129,6 +132,8 @@ Prompt 缓存使用 `npm run test:prompt-cache`（或直接运行 `node scripts/
 - `cargo test -p magi-daemon --lib daemon::persistence::tests`：包括旧检查点不能覆盖会话选择、撤销已保存的重命名或恢复已删除会话；刷盘期间继续接纳 canonical 工具结果并在重载后保留。SessionStore 原刷盘测试已改用生产环境的增量入口，撤下旧全量持锁入口及其专用阻塞测试。
 - `cargo test -p magi-api --lib remove_workspace_checkpoints_before_deregister`：移除工作区先提交检查点，失败时保留注册与选择；成功时仅清除所属工作区的当前选择，会话历史保留。
 - `cargo test -p magi-conversation-runtime --lib model_step`：共享调用边界、流中断恢复、transport 重试写盘失败。
+- `cargo test -p magi-conversation-runtime --lib session_writeback`：缺少已提交 Turn/item 拒绝发布，过期 sidecar 不改变事件正文、状态、metadata 或版本；增量事件保持存储版本。
+- `cargo test -p magi-conversation-runtime --lib file_facts_use_canonical`、`previous_agent_context` 与 `cargo test -p magi-api --lib routes::agent_runs::tests`：文件事实、前序代理记录和代理结果直接读取 canonical；废弃 Turn、已变化文件和损坏的代理来源链不得产生有效结果。
 - `cargo test -p magi-daemon --lib model_step_journal`：事件检查点恢复与 state layout 升级。
 - `cargo test -p magi-api --lib turn_harness::tests::task_profile_`：主线/子代理、工具来源与排队补充的实际调用链。
 - `cargo test -p magi-bridge-client --lib retry`：HTTP 流式/非流式重试与回调。
@@ -189,6 +194,7 @@ Git 漂移/冲突场景现在允许先请求模型，实际写入/Shell/Git/代�
 子任务并发发布与失败回滚：
 
 - `cargo test -p magi-conversation-runtime --lib task_execution_registry::tests::`：TaskStore 发布前已有执行计划、Thread、计划绑定和准入；Task 发布提交失败回滚全部准备结果。
+- `cargo test -p magi-session-store --lib replacing_latest_user_interrupted_turn`：沿携带 Task 的正式替换事务核对旧轮、新轮和接纳记录一次提交；写盘失败及陈旧重试不改变 durable、sidecar 或 flush 状态。
 - `cargo test -p magi-api --lib agent_spawn_commit_failure_discards_prepared_context_and_keeps_mainline_running`：真实发布故障后没有运行时信号通道、Task/Thread/名额残留，主线可接管。
 - `cargo test -p magi-api --lib concurrent_agent_turns_keep_child_completion_and_parent_results`：12 会话并发，父子完成与结果归属不串线。
 - `cargo test -p magi-api --lib interrupt_replacement_commit_failure_retains_input_and_revision_checked_retry_settles_it`：重复结算同一错误不推动 Input revision，后续显式重试/删除仍沿原屏障执行。
@@ -275,6 +281,8 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 改写钩子：`cargo test -p magi-conversation-runtime --lib extension_hooks`（可改写区域、授权、一次征询、拒绝时保留原生视图）、`extension_summary_replaces`/`custom_summary_that_fails`/`cancelled_compaction`（压缩前自定义摘要、门禁拒绝、取消）与 `cargo test -p magi-daemon --lib history_rewrite_hooks`（真实 Node 扩展的改写提案、授权开关、取消与自定义摘要，撤销授权后摘要被忽略）。
 
+工具结果投影与摘要恢复：`cargo test -p magi-conversation-runtime --lib compaction_projects_tool_sources` 验证摘要来源遵循当前插件投影，插件变化后旧摘要失效；`cargo test -p magi-session-store --lib checkpoint_` 验证摘要提交和继承的快照一致性；`cargo test -p magi-session-store --lib thread_history_is_not_persisted` 验证线程不再序列化历史、旧消息字段不进入运行态及重启清退失效摘要；`cargo test -p magi-daemon --lib session_projection_restores_canonical_history_and_checkpoint` 验证 canonical 日志、工具投影指纹及有效摘要落盘后重启读取，并核对磁盘快照不包含重复的线程历史。
+
 缓存失效原因：`cargo test -p magi-conversation-runtime --lib extension_rewrites_are_attributed`（新增、追加、替换、撤销与未声明改写的归因，记录随 Step 持久化后读回一致）与 `history_projection` 下的扩展改写测试（授权、保护区、工具配对、纯函数重建一致）。
 
 运行状态进界面：`cargo test -p magi-daemon --lib extension_runtime`（状态映射、随生命周期变化并通知界面、缺少 Node 时可见为失败并列出被阻止的 guard）、`cargo test -p magi-api --lib plugin_list_merges`（列表与变更操作返回都合并运行状态且不另存）；**真实浏览器验收（macOS，内置浏览器，release 构建的 daemon + 固定版本 Node，隔离状态目录）已做**：经真实 API 安装、授权、激活一个声明 guard/advise/observe 与 `contextRewrite` 的扩展包；缺少 Node 时详情页显示“不可用”、原因与被阻止动作；随包 Node 就绪后重启 daemon 自动拉起并显示“运行中”；杀掉宿主进程后页面不刷新地依次显示“重启中（已崩溃 N 次）→启动中→运行中”，列表项警示标记同步出现/消失；连续崩溃超过阈值后显示“不可用”、停止自动重启与原因，点击“停用”后阻止提示消失，再“授权并激活”回到“运行中”；浅色、深色、375px 窄屏均无横向溢出且长文本换行。未覆盖：Windows/Linux、真实 Electron、真实对话里 guard 阻止工具调用的人工路径（由测试覆盖）。
@@ -291,9 +299,17 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 `npm run test:electron-dsh-health` 与社区批次共用 `scripts/lib/dsh-health-acceptance.mjs` 的 Health 3.0.5 原包业务合同，使用 macOS 目录发行包、随包 Node 和独立状态根，在线安装固定版本 Health 与 Release Probe。验证诊断、修复预览／取消／确认、文件改变后的过期计划拒绝、真实文件隔离和恢复日志、停用来源展示与诊断交接、原页面显示偏好关闭／重开及持久化、原页面在线自更新和持久回执、应用重启及插件自身停用／重新启用。新实例以随机控制密钥变化及旧密钥 401 拒绝证明，不把每个 supervisor 内的崩溃 generation 当全局实例身份。`MAGI_DSH_HEALTH_OUTPUT` 指定证据目录，`MAGI_DSH_HEALTH_PORT`／`MAGI_DSH_HEALTH_CDP_PORT` 调整验收端口；`MAGI_PLUGIN_CLIP_AUDIT_SOURCE` 可提供桌面技能的原始阴影审计函数。该脚本只验证列出的业务，不作为全部修复类型或生态覆盖率的证明。
 
+`npm run test:electron-dshmarket` 在线安装 **dshmarket 1.73.15**，由原市场页面发起自身更新，在指定包真实 registry 解析进行中打开任务面板并取消，核对 daemon 任务 cancelled、旧摘要／授权／实例保持。随后从原页面显式重试，按原包实际请求身份与 daemon 回执确定目标版本，不用独立 metadata 查询的移动 latest 冒充该次版本；记录 `updates.json`、`cancelled-job.json`、`updated-job.json` 及新版摘要。继续覆盖原页面重挂载、完整应用重启后版本及授权恢复、停用释放文档和重新激活的新实例，安装日志不能重放。通过 `MAGI_DSHMARKET_OUTPUT`、`MAGI_DSHMARKET_PORT`、`MAGI_DSHMARKET_CDP_PORT` 调整输出和端口。设置 `MAGI_PLUGIN_CLIP_AUDIT_SOURCE` 时保留原任务面板的阴影门槛，先完成业务终态再报告视觉失败，不能把部分业务通过当成完整界面验收。该脚本使用独立状态和目录包，不计入既有 9 个社区样本的覆盖率，也不覆盖市场全部管理能力。
+
+市场专项还在同一原包文档中检查 1280px 与 390px 的默认、任务展开、真实悬停及收起状态，保存 `*-layout.json`、截图和可选的 `*-clip.json`。检查原文档未重建、取消操作可达、收起后内容留白恢复，以及原包文档、外层设置滚动容器和主窗口都没有横向溢出；取消按钮通过真实鼠标事件执行。阴影检查保留完整原脚本及物理视口，不能只检查最外层页面的 `scrollWidth` 或靠隐藏滚动条通过。
+
+`npm run test:electron-free-search` 使用标准 macOS 目录包、随包 daemon／Node 和独立状态，在线安装 Free Search **0.9.41**，从原设置页保存 Bing 并取得真实引擎结果，再通过 WorkBuddy **5.21.2** 的当前在线模型完成两个新会话的原生搜索／抓取，核对 daemon 全局绑定、实际工具回执和模型终态。抓取对象为 Google 公网 HTTPS DNS JSON；直接公网地址用于避开本机 fake-IP 域名解析，原包 SSRF 校验保持原样。脚本还检查 **0.9.39** 原子模块 schema 失败在预览时拒绝并保留当前实例、全局停用恢复原生联网、重新激活及完整重启后的选择／授权／配置持久化。`MAGI_FREE_SEARCH_OUTPUT`、`MAGI_FREE_SEARCH_PORT`、`MAGI_FREE_SEARCH_CDP_PORT` 设置输出和端口；`MAGI_FREE_SEARCH_MODEL` 选择在线目录中的真实模型，默认 `deepseek-v4.1-flash`，目录稳定后才选用。版本可由 `MAGI_FREE_SEARCH_VERSION` 指定，但旧候选拒绝与实际设置合同仍须满足。该专项不计入既有 9 个社区分母，不涵盖全部引擎、HTML 抓取、取消或自身在线升级。
+
 `node scripts/compat/cli.mjs inspect <原包目录> --kind dsh --json` 默认与在线安装采用同一完整业务静态准入；`--require` 仅供分项诊断，不能据成功退出推导原包可安装或实际业务通过。`npm run test:compat` 同时覆盖默认 CLI／安装准备对同一必需能力的拒绝及超过 64 KiB 管道输出的完整性。静态检查不会执行原包，不能代替目录包验收。
 
 `test:electron-plugin-runtime` 的公共提示合同使用原有运行时夹具，注册超过八万字符、JSON 补丁超过 256 KiB 的业务指引，经真实 daemon 每轮贡献及插件模型桥核对最终模型请求、完整原文、来源角色和配置替换。`test:compat` 同时验证提示注册、排序、变量插值、撤销、取消、过期设置句柄与预算失败；Rust 接纳点按 Unicode 字符验证单片段及总预算。夹具不计入社区原包的完整业务覆盖率。
+
+`node scripts/verify-electron-genui.mjs` 当前验证原生 UI 边界，而非 GenUI 卡片支持：固定 GenUI 0.3.3 官方原包，安装前明确拒绝消息替换；同一 Electron 内用 WorkBuddy 5.21.2 / deepseek-v4.1-flash 在拒绝前后完成实际回复，核对原生详细／摘要展示、草稿、安装事实和完整重启。旧 GenUI 卡片通过记录为历史合同，不计当前支持。最新证据见[本轮交付](plugin-convergence-delivery.md#本轮边界修正2026-11-10)。
 
 页面文本输入使用同一 `test:electron-plugin-runtime` 夹具，通过原按钮等待真实 daemon 接纳与模型结果，并核对用户草稿保护、在途重复、显式相同身份重试、失效会话拒绝、同版重新启用和完整应用重启后的同身份显式重试。重启前后 canonical 记录按字段深度比较，忽略 JSON 对象字段顺序，保留完整前后快照；不忽略任何业务字段。`npm --prefix web run test:plugin-composer` 验证独立授权、派发前会话／页面／授权失效、在途互斥与真实原生回执观察；超时和失败等待保留 `unknown`，不假定未接纳。`cargo test -p magi-api --lib composer_admission` 及 `cargo test -p magi-plugin-system --test package composer_text` 验证两个授权目标互不继承、旧图片请求及当前摘要／视图边界。机制回归不等于 GenUI 聊天槽位或完整业务完成。
 
@@ -305,11 +321,13 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 `npm run test:electron-plugin-runtime` 可设置 `MAGI_DSH_EXTERNAL_CLI=<真实 dsh 可执行文件路径>`，让在线安装的 Debugging 原包经真实模型工具调用和原生审批检查另一套独立 DSH 目录：外部 CLI 导出配置、执行 schema 检查及判断变更生效方式，Magi 安装状态保持不变。该可选分支需要本机已有的真实 DSH CLI，不提供替身命令；未设置时不计入对应业务证据。
 
-`npm run test:electron-dsh-profile` 在线安装 Mgr 0.2.12，先通过其真实路由验证 `dsh add/remove` 的在线替换与卸载，再经 Magi 原生预览、取消、确认及重新授权更新到固定 0.2.13；随后使用新版原页面完成目标插件启停、故障恢复、在线更新与真实回执、更新／卸载取消、390px 确认、应用重启和卸载。`MAGI_DSH_PROFILE_OUTPUT` 指定证据目录，端口使用 `MAGI_PROFILE_PORT`／`MAGI_PROFILE_CDP_PORT`。旧版路由通过不代表其 Button 页面缺陷已修复；该入口还通过只影响本次候选解析的 registry 代理，使 Mgr 原页面的先移除式更新失败，核对恢复旧摘要、授权和真实运行，并显示恢复说明；在旧版已移除且候选未提交时终止本次应用的 daemon，核对真实翻译进程退出、重启恢复原安装、不重放准备以及原页面显式重试。只验证列出的中断位置，不作为全部掉电阶段或外部副作用可回滚的证明。`test:compat` 另以延迟目录读取验证命令终止后零安装／移除，以及同请求的显式重试。
+`npm run test:electron-dsh-profile` 与社区入口共用 `scripts/lib/dsh-manager-acceptance.mjs` 的完整原包管理合同。在线安装 Mgr 0.2.12，先通过其真实路由验证 `dsh add/remove` 的在线替换与卸载，再复用原生升级驱动预览、取消、确认及重新授权更新到固定 0.2.13；随后使用新版原页面完成目标插件启停、故障恢复、在线更新与真实回执、更新／卸载取消、390px 确认、应用重启和卸载。`MAGI_DSH_PROFILE_OUTPUT` 指定证据目录，端口使用 `MAGI_PROFILE_PORT`／`MAGI_PROFILE_CDP_PORT`。社区用 `MAGI_DSH_ACCEPTANCE_PACKAGES=dsh-plugin-mgr` 定向运行同一合同，记录初始与更新版本、摘要和 `manager-business.json`；只运行本包时固定分母仍为 9，整体门槛仍退出 1。旧版路由通过不代表其 Button 页面缺陷已修复；共享 registry gate 只使本次候选解析失败，核对先移除式更新恢复旧摘要、授权和真实运行，并显示恢复说明；在旧版已移除且候选未提交时终止本次应用的 daemon，核对真实翻译进程退出、重启恢复原安装、不重放准备以及原页面显式重试。只验证列出的中断位置，不作为全部掉电阶段或外部副作用可回滚的证明。`test:compat` 另以延迟目录读取验证命令终止后零安装／移除，以及同请求的显式重试。
+
+`MAGI_DSH_OPS_CHAT=1 npm run test:electron-dsh-compatibility` 单独检验 Ops **0.20.8** 原页面诊断对话：在线安装 WorkBuddy **5.21.2**，使用本机已有的 WorkBuddy 登录态，在真实在线目录稳定后固定 **deepseek-v4.1-flash**，完成原生回复并保留模型步骤，再用 Ops 原输入框发送诊断问题、通过原按钮沉淀知识。回执须同时满足实际 HTTP 成功、`ok:true`、非空答复和原页面显示同一答复；原生用户会话的 canonical Turn 必须保持原样。还验证页面请求取消、插件用量独立归属、知识和账本的完整应用重启恢复、不重放／不重复计数、统计两种视角与重置后的恢复。原页面请求仅旁观记录，不替换响应或原包业务；不把原包扫描结论是否准确作为翻译器正确性的证明。输出使用 `MAGI_DSH_COMPATIBILITY_OUTPUT`，包含实际模型目录、`native-model-turn.json`、`ops-chat-receipt.json`、知识、插件账本、统计及原页面截图。该分支失败时保留失败，不运行管理分支补成通过；未设置时仍执行既有安装、原生授权恢复、启停、豁免及重启验收。
 
 `test:electron-dsh-management` 另验证 Share 原页面保存 SVG／PNG 二维码、取消下载后重新保存，并将落盘 PNG 交回原包识别；`test:electron-dsh-health` 验证原页面导出的 JSON 包含真实安装身份。下载观测器只连接脚本自有 Main inspector，核对进程身份后为该 App session 设置本次文件保存位置或取消下载，读取 Electron 的实际终态与落盘字节；不替换原包导出代码、不使用默认 CDP context 的状态冒充 App session 下载成功。脚本的 inspector 端口为各自 CDP 端口加一，需保持空闲；产品运行不启用 inspector。
 
-`test:electron-dsh-management` 与 `MAGI_DSH_FUNCTIONAL_UPGRADE=1 npm run test:electron-popular-dsh` 共用 `scripts/lib/dsh-upgrader-acceptance.mjs` 的 Upgrader 1.8.0 原包业务合同，覆盖配置保存、原页面在线升级、并发拒绝、关页／重开、取消、停用／重新启用、版本切换、失败保留、归档写入失败恢复、显式重试及应用重启；原包可用主按钮还需通过八种外观的默认及真实悬停对比度检查。证据为各自输出目录的 `upgrader-business.json`、`upgrader-button-contrast.json` 与截图；管理专项使用 `MAGI_DSH_MANAGEMENT_OUTPUT`，社区批次使用 `MAGI_DSH_ACCEPTANCE_OUTPUT`。registry gate 只暂停本次独立 daemon 的指定包解析，不替换原包、安装回执或业务结果。社区批次仍固定 9 个样本，只有整个合同通过才计入对应业务覆盖；可用 `MAGI_DSH_ACCEPTANCE_PACKAGES` 选择样本排错，但筛选不会缩小完整门槛的分母，未验证项使脚本退出 1。
+`test:electron-dsh-management` 与 `npm run test:electron-popular-dsh` 共用 `scripts/lib/dsh-upgrader-acceptance.mjs` 的 Upgrader 原包业务合同，先在线安装 **1.7.5**，在原页面保存实际配置，再由 Magi 原生在线入口预览 **1.8.0**、取消、重新预览、确认及授权，核对摘要、实例和配置后执行新版完整业务；覆盖配置保存、原页面在线升级、并发拒绝、关页／重开、取消、停用／重新启用、版本切换、失败保留、归档写入失败恢复、显式重试及应用重启；原包可用主按钮还需通过八种外观的默认及真实悬停对比度检查。证据为各自输出目录的 `upgrader-business.json`、`upgrader-button-contrast.json` 与截图；管理专项使用 `MAGI_DSH_MANAGEMENT_OUTPUT`，社区批次使用 `MAGI_DSH_ACCEPTANCE_OUTPUT`。registry gate 只暂停本次独立 daemon 的指定包解析，不替换原包、安装回执或业务结果。社区批次仍固定 9 个样本，只有整个合同通过才计入对应业务覆盖；可用 `MAGI_DSH_ACCEPTANCE_PACKAGES` 选择样本排错，但筛选不会缩小完整门槛的分母，未验证项使脚本退出 1。
 
 社区批次在停用／卸载实际打开右栏的原包时，另核对插件页签及隔离文档释放，重新打开原生启动页并继续操作，保存 `*-panel-deactivated.png` 与每个样本的 `panelLifecycle`。所有页面异常仍进入完整批次的失败门槛；该分项只证明面板生命周期，不将样本的核心业务改计为通过。公共运行时验收继续验证多页签切换保留同一原包文档、关闭／重开、停用、重新启用及应用重启。
 

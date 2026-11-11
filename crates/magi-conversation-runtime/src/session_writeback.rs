@@ -1,6 +1,5 @@
 use crate::context_authority::{ContextCompactionProgress, ContextCompactionRecord};
 use crate::tool_result_utils::{summarize_tool_result, turn_item_status_for_tool_result};
-use crate::turn_contract::{TurnEventEnvelope, TurnRecord};
 #[cfg(test)]
 use crate::{
     CoordinatorAdmission, CoordinatorCommandResult, CoordinatorTurnStatus, ExecutionProfile,
@@ -18,17 +17,11 @@ use magi_event_bus::{
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{
     ActiveExecutionChain, ActiveExecutionTurn, ActiveExecutionTurnItem,
-    CANONICAL_TURN_SCHEMA_VERSION, CanonicalToolCall, CanonicalTurn, CanonicalTurnEventKind,
-    CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus,
-    CanonicalTurnVisibility, CanonicalWorkerRef, SessionRuntimeSidecar, SessionStore,
-    TimelineEntryInput, active_execution_turn_request_id,
+    CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnEventKind, CanonicalTurnItem,
+    CanonicalTurnStatus, SessionRuntimeSidecar, SessionStore, TimelineEntryInput,
 };
-use magi_tool_runtime::BuiltinToolName;
 use serde_json::Value;
-use std::{
-    collections::HashMap,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type SessionStatePersistCallback = dyn Fn(&str) -> Result<(), String> + Send + Sync;
 static CONTEXT_COMPACTION_ITEM_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -276,8 +269,8 @@ pub struct PublishedSessionTurnItem {
     pub item: ActiveExecutionTurnItem,
     pub current_turn: SessionRuntimeTurnSummaryEntry,
     pub turn_items: Vec<SessionRuntimeTurnItemSummaryEntry>,
-    pub canonical_turn: Option<CanonicalTurn>,
-    pub canonical_item: Option<CanonicalTurnItem>,
+    pub canonical_turn: CanonicalTurn,
+    pub canonical_item: CanonicalTurnItem,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -390,43 +383,34 @@ fn published_session_turn_item_from_turn(
     item_id: &str,
     task_store: Option<&TaskStore>,
 ) -> Result<Option<PublishedSessionTurnItem>, String> {
-    let item = turn
-        .items
-        .iter()
-        .find(|candidate| candidate.item_id == item_id)
-        .ok_or_else(|| {
-            format!(
-                "会话 {} 的 Turn {} 已写入 item {}，但无法从当前 Turn 生成发布快照",
-                session_id, turn.turn_id, item_id
-            )
-        })
-        .cloned()?;
-    let response_duration_ms = turn
-        .completed_at
-        .map(|completed_at| completed_at.0.saturating_sub(turn.accepted_at.0));
     let canonical_turn = session_store
-        .canonical_turns_for_session(session_id)
-        .into_iter()
-        .find(|canonical| canonical.turn_id == turn.turn_id)
-        .or_else(|| to_canonical_turn(session_id, turn))
+        .canonical_turn_for_session_turn_id(session_id, &turn.turn_id)
         .ok_or_else(|| {
             format!(
-                "会话 {} 的 Turn {} 无法转换为 canonical 发布快照",
-                session_id, turn.turn_id
+                "会话 {} 的 Turn {} 缺少已提交 canonical 事实，拒绝发布",
+                session_id, turn.turn_id,
             )
         })?;
     let canonical_item = canonical_turn
         .items
         .iter()
-        .find(|candidate| candidate.item_id == item.item_id)
+        .find(|candidate| candidate.item_id == item_id)
         .cloned()
-        .or_else(|| to_canonical_turn_item(session_id, turn, &item))
         .ok_or_else(|| {
             format!(
-                "会话 {} 的 Turn {} item {} 无法转换为 canonical item",
-                session_id, turn.turn_id, item_id
+                "会话 {} 的 Turn {} item {} 缺少已提交 canonical 事实，拒绝发布",
+                session_id, turn.turn_id, item_id,
             )
         })?;
+    // 所有发布字段由同一份已提交快照派生，不能混用写回后已过期的 sidecar。
+    let turn = session_store.project_canonical_execution_turn(&canonical_turn);
+    let item = turn
+        .items
+        .iter()
+        .find(|candidate| candidate.item_id == item_id)
+        .expect("canonical execution projection preserves item identity")
+        .clone();
+    let response_duration_ms = canonical_turn.response_duration_ms;
     Ok(Some(PublishedSessionTurnItem {
         turn_id: turn.turn_id.clone(),
         turn_seq: turn.turn_seq,
@@ -448,8 +432,8 @@ fn published_session_turn_item_from_turn(
             .iter()
             .map(|item| to_turn_item_summary(item, task_store))
             .collect(),
-        canonical_turn: Some(canonical_turn),
-        canonical_item: Some(canonical_item),
+        canonical_turn,
+        canonical_item,
     }))
 }
 
@@ -470,253 +454,12 @@ fn turn_has_execution_chain_items(turn: &ActiveExecutionTurn) -> bool {
         .any(|item| item.task_id.is_some() || item.worker_id.is_some())
 }
 
-fn canonical_turn_status(status: &str) -> Option<CanonicalTurnStatus> {
-    match status.trim().to_ascii_lowercase().as_str() {
-        "pending" | "queued" | "accepted" => Some(CanonicalTurnStatus::Pending),
-        "running" | "started" | "streaming" | "awaiting_approval" | "review_required"
-        | "repairing" | "verifying" => Some(CanonicalTurnStatus::Running),
-        "completed" | "complete" | "succeeded" | "success" => Some(CanonicalTurnStatus::Completed),
-        "blocked" => Some(CanonicalTurnStatus::Blocked),
-        "failed" | "error" => Some(CanonicalTurnStatus::Failed),
-        "interrupted" => Some(CanonicalTurnStatus::Interrupted),
-        "cancelled" | "canceled" | "killed" => Some(CanonicalTurnStatus::Cancelled),
-        "superseded" => Some(CanonicalTurnStatus::Superseded),
-        _ => None,
-    }
-}
-
-fn canonical_item_status(status: &str) -> Option<CanonicalTurnItemStatus> {
-    if status.trim().eq_ignore_ascii_case("indeterminate") {
-        return Some(CanonicalTurnItemStatus::Indeterminate);
-    }
-    match canonical_turn_status(status)? {
-        CanonicalTurnStatus::Pending => Some(CanonicalTurnItemStatus::Pending),
-        CanonicalTurnStatus::Running => Some(CanonicalTurnItemStatus::Running),
-        CanonicalTurnStatus::Completed => Some(CanonicalTurnItemStatus::Completed),
-        CanonicalTurnStatus::Blocked => Some(CanonicalTurnItemStatus::Blocked),
-        CanonicalTurnStatus::Failed => Some(CanonicalTurnItemStatus::Failed),
-        CanonicalTurnStatus::Interrupted => Some(CanonicalTurnItemStatus::Cancelled),
-        CanonicalTurnStatus::Cancelled => Some(CanonicalTurnItemStatus::Cancelled),
-        CanonicalTurnStatus::Superseded => Some(CanonicalTurnItemStatus::Cancelled),
-    }
-}
-
-fn terminal_item_status_for_turn_status(
-    status: CanonicalTurnStatus,
-) -> Option<CanonicalTurnItemStatus> {
-    match status {
-        CanonicalTurnStatus::Completed => Some(CanonicalTurnItemStatus::Completed),
-        CanonicalTurnStatus::Blocked => Some(CanonicalTurnItemStatus::Blocked),
-        CanonicalTurnStatus::Failed => Some(CanonicalTurnItemStatus::Failed),
-        CanonicalTurnStatus::Interrupted => Some(CanonicalTurnItemStatus::Cancelled),
-        CanonicalTurnStatus::Cancelled => Some(CanonicalTurnItemStatus::Cancelled),
-        CanonicalTurnStatus::Superseded => Some(CanonicalTurnItemStatus::Cancelled),
-        CanonicalTurnStatus::Pending | CanonicalTurnStatus::Running => None,
-    }
-}
-
-fn canonical_item_kind(kind: &str) -> Option<CanonicalTurnItemKind> {
-    match kind {
-        "user_message" => Some(CanonicalTurnItemKind::UserMessage),
-        "assistant_stream" | "assistant_final" | "assistant_error" => {
-            Some(CanonicalTurnItemKind::AssistantText)
-        }
-        "assistant_thinking" => Some(CanonicalTurnItemKind::AssistantThinking),
-        "assistant_phase" => Some(CanonicalTurnItemKind::SystemNotice),
-        "tool_call_started" | "tool_call_result" => Some(CanonicalTurnItemKind::ToolCall),
-        "task_status" => Some(CanonicalTurnItemKind::TaskStatus),
-        _ => None,
-    }
-}
-
-fn canonical_tool_arguments(arguments: &Option<String>) -> Option<Value> {
-    let arguments = arguments.as_ref()?.trim();
-    if arguments.is_empty() {
-        return None;
-    }
-    serde_json::from_str(arguments)
-        .ok()
-        .or_else(|| Some(Value::String(arguments.to_string())))
-}
-
-fn canonical_tool_result(result: &Option<String>) -> Option<Value> {
-    let result = result.as_ref()?.trim();
-    if result.is_empty() {
-        return None;
-    }
-    serde_json::from_str(result)
-        .ok()
-        .or_else(|| Some(Value::String(result.to_string())))
-}
-
-fn to_canonical_tool_call(item: &ActiveExecutionTurnItem) -> Option<CanonicalToolCall> {
-    let call_id = item.tool_call_id.clone()?;
-    let name = item.tool_name.clone()?;
-    Some(CanonicalToolCall {
-        call_id,
-        name,
-        arguments: canonical_tool_arguments(&item.tool_arguments),
-        result: canonical_tool_result(&item.tool_result),
-        error: item.tool_error.clone(),
-    })
-}
-
-fn to_canonical_worker_ref(item: &ActiveExecutionTurnItem) -> Option<CanonicalWorkerRef> {
-    if item.task_id.is_none() && item.worker_id.is_none() && item.role_id.is_none() {
-        return None;
-    }
-    Some(CanonicalWorkerRef {
-        task_id: item.task_id.clone(),
-        worker_id: item.worker_id.clone(),
-        role_id: item.role_id.clone(),
-        title: item.title.clone(),
-    })
-}
-
-fn canonical_item_metadata(item: &ActiveExecutionTurnItem) -> HashMap<String, Value> {
-    let mut metadata = item.metadata.clone();
-    if let Some(output_kind) = match item.kind.as_str() {
-        "assistant_stream" => Some("progress"),
-        "assistant_final" => Some("final"),
-        "assistant_error" => Some("error"),
-        _ => None,
-    } {
-        metadata.insert(
-            "assistantOutputKind".to_string(),
-            Value::String(output_kind.to_string()),
-        );
-    }
-    if let Some(value) = item
-        .request_id
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        metadata.insert("requestId".to_string(), Value::String(value.clone()));
-    }
-    if let Some(value) = item
-        .user_message_id
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        metadata.insert("userMessageId".to_string(), Value::String(value.clone()));
-    }
-    if let Some(value) = item
-        .placeholder_message_id
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        metadata.insert(
-            "placeholderMessageId".to_string(),
-            Value::String(value.clone()),
-        );
-    }
-    metadata
-}
-
-fn canonical_item_renderable(
-    item: &ActiveExecutionTurnItem,
-    kind: CanonicalTurnItemKind,
-    status: CanonicalTurnItemStatus,
-) -> bool {
-    if let Some(renderable) = item.requested_renderable() {
-        return renderable;
-    }
-    if kind == CanonicalTurnItemKind::ToolCall
-        && item
-            .tool_name
-            .as_deref()
-            .and_then(BuiltinToolName::from_name)
-            .is_some_and(|tool| !tool.is_session_timeline_renderable_tool_call())
-    {
-        return false;
-    }
-    let has_content = item
-        .content
-        .as_ref()
-        .is_some_and(|content| !content.trim().is_empty());
-    if kind == CanonicalTurnItemKind::AssistantText {
-        return has_content || !status.is_terminal();
-    }
-    has_content || item.tool_call_id.is_some() || item.worker_id.is_some() || item.task_id.is_some()
-}
-
-fn to_canonical_turn_item(
-    session_id: &SessionId,
-    turn: &ActiveExecutionTurn,
-    item: &ActiveExecutionTurnItem,
-) -> Option<CanonicalTurnItem> {
-    let kind = canonical_item_kind(&item.kind)?;
-    let turn_status = canonical_turn_status(&turn.status)?;
-    let mut status = canonical_item_status(&item.status)?;
-    if let Some(terminal_item_status) = terminal_item_status_for_turn_status(turn_status)
-        && !status.is_terminal()
-    {
-        status = terminal_item_status;
-    }
-    let tool = to_canonical_tool_call(item);
-    if kind == CanonicalTurnItemKind::ToolCall && tool.is_none() {
-        return None;
-    }
-    Some(CanonicalTurnItem {
-        session_id: session_id.clone(),
-        turn_id: turn.turn_id.clone(),
-        turn_seq: turn.turn_seq,
-        item_id: item.item_id.clone(),
-        item_seq: item.item_seq,
-        kind,
-        created_at: turn.accepted_at,
-        status,
-        // 与 SessionStore 的 canonical 写模型保持一致：新 item 的事实版本从 1 开始。
-        item_version: Some(1),
-        updated_at: UtcMillis::now(),
-        title: item.title.clone(),
-        content: item.content.clone(),
-        blocks: Vec::new(),
-        tool,
-        worker: to_canonical_worker_ref(item),
-        source_thread_id: item.source_thread_id.clone(),
-        visibility: CanonicalTurnVisibility {
-            renderable: canonical_item_renderable(item, kind, status),
-        },
-        metadata: canonical_item_metadata(item),
-    })
-}
-
-fn canonical_event_kind(turn: Option<&CanonicalTurn>) -> CanonicalTurnEventKind {
-    match turn.map(|turn| turn.status) {
-        Some(status) if status.is_terminal() => CanonicalTurnEventKind::TurnCompleted,
-        Some(CanonicalTurnStatus::Pending) => CanonicalTurnEventKind::TurnStarted,
+fn canonical_event_kind(turn: &CanonicalTurn) -> CanonicalTurnEventKind {
+    match turn.status {
+        status if status.is_terminal() => CanonicalTurnEventKind::TurnCompleted,
+        CanonicalTurnStatus::Pending => CanonicalTurnEventKind::TurnStarted,
         _ => CanonicalTurnEventKind::TurnItemUpsert,
     }
-}
-
-fn to_canonical_turn(session_id: &SessionId, turn: &ActiveExecutionTurn) -> Option<CanonicalTurn> {
-    let items = turn
-        .items
-        .iter()
-        .filter_map(|item| to_canonical_turn_item(session_id, turn, item))
-        .collect::<Vec<_>>();
-    let mut metadata = HashMap::new();
-    if let Some(request_id) = active_execution_turn_request_id(turn) {
-        metadata.insert("requestId".to_string(), Value::String(request_id));
-    }
-    let mut canonical_turn = CanonicalTurn {
-        model_steps: Vec::new(),
-        session_id: session_id.clone(),
-        turn_id: turn.turn_id.clone(),
-        turn_seq: turn.turn_seq,
-        accepted_at: turn.accepted_at,
-        completed_at: turn.completed_at,
-        status: canonical_turn_status(&turn.status)?,
-        response_duration_ms: turn
-            .completed_at
-            .map(|completed_at| completed_at.0.saturating_sub(turn.accepted_at.0)),
-        usage: None,
-        items,
-        metadata,
-    };
-    canonical_turn.normalize();
-    Some(canonical_turn)
 }
 
 pub fn session_turn_item(
@@ -792,60 +535,9 @@ impl<'a> CanonicalTurnEventSink<'a> {
             task_store: None,
         }
     }
-
-    pub fn envelope_for_item(
-        &self,
-        published: &PublishedSessionTurnItem,
-        event_sequence: u64,
-    ) -> Option<TurnEventEnvelope> {
-        let turn = published
-            .canonical_turn
-            .as_ref()
-            .and_then(|turn| TurnRecord::from_canonical(turn, event_sequence));
-        let canonical_item = published.canonical_item.clone();
-        let turn_record = turn.as_ref()?;
-        Some(TurnEventEnvelope {
-            event_id: format!("session-turn-item-{}-{}", published.turn_id, event_sequence),
-            event_type: "session.turn.item".to_string(),
-            event_sequence,
-            session_id: turn_record.session_id.clone(),
-            turn_id: turn_record.turn_id.clone(),
-            turn_seq: turn_record.turn_seq,
-            occurred_at: UtcMillis::now(),
-            causation_id: turn_record.causation_id.clone(),
-            trace_id: turn_record.trace_id.clone(),
-            item_version: canonical_item.as_ref().and_then(|item| item.item_version),
-            base_content_length: None,
-            content_length: canonical_item
-                .as_ref()
-                .and_then(|item| item.content.as_deref())
-                .map(|content| content.chars().count()),
-            delta: None,
-            reset: None,
-            turn: Some(turn_record.clone()),
-            task_run: None,
-            item: canonical_item,
-        })
-    }
 }
 
 impl<'a> CanonicalTurnEventSink<'a> {
-    pub fn append_item(
-        &self,
-        session_id: &SessionId,
-        expected_turn_id: Option<&str>,
-        item: ActiveExecutionTurnItem,
-    ) -> Result<Option<PublishedSessionTurnItem>, String> {
-        append_session_turn_item_for_turn_raw(
-            self.session_store
-                .ok_or_else(|| "CanonicalTurnEventSink 缺少 SessionStore".to_string())?,
-            session_id,
-            expected_turn_id,
-            item,
-            self.task_store,
-        )
-    }
-
     pub fn upsert_item(
         &self,
         session_id: &SessionId,
@@ -913,19 +605,6 @@ impl<'a> CanonicalTurnEventSink<'a> {
     /// 需要保留 SessionStore 原始 DomainError 的边界（例如 API 要把
     /// CurrentTurnConflict 映射为 409）时使用这些方法。它们仍通过当前
     /// `CanonicalTurnEventSink` 对象执行 canonical mutation。
-    pub fn append_item_sidecar(
-        &self,
-        session_id: &SessionId,
-        expected_turn_id: Option<&str>,
-        item: ActiveExecutionTurnItem,
-    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
-        self.session_store
-            .ok_or_else(|| magi_core::DomainError::InvalidState {
-                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
-            })?
-            .append_current_turn_item_for_turn(session_id, expected_turn_id, item)
-    }
-
     pub fn upsert_item_sidecar(
         &self,
         session_id: &SessionId,
@@ -978,8 +657,9 @@ impl<'a> CanonicalTurnEventSink<'a> {
         session_id: SessionId,
         timeline_entry: TimelineEntryInput,
         active_execution_chain: ActiveExecutionChain,
+        turn: ActiveExecutionTurn,
         task: &magi_core::Task,
-    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, Option<CanonicalTurn>)> {
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, CanonicalTurn)> {
         self.session_store
             .ok_or_else(|| magi_core::DomainError::InvalidState {
                 message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
@@ -988,6 +668,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
                 session_id,
                 timeline_entry,
                 active_execution_chain,
+                turn,
                 task,
             )
     }
@@ -999,8 +680,9 @@ impl<'a> CanonicalTurnEventSink<'a> {
         goal_id: &magi_core::GoalId,
         timeline_entry: TimelineEntryInput,
         active_execution_chain: ActiveExecutionChain,
+        turn: ActiveExecutionTurn,
         task: &magi_core::Task,
-    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, Option<CanonicalTurn>)> {
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, CanonicalTurn)> {
         self.session_store
             .ok_or_else(|| magi_core::DomainError::InvalidState {
                 message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
@@ -1010,6 +692,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
                 goal_id,
                 timeline_entry,
                 active_execution_chain,
+                turn,
                 task,
             )
     }
@@ -1021,6 +704,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
         replace_turn_id: &str,
         timeline_entry: TimelineEntryInput,
         active_execution_chain: ActiveExecutionChain,
+        turn: ActiveExecutionTurn,
         task: &magi_core::Task,
     ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, CanonicalTurn, CanonicalTurn)>
     {
@@ -1033,6 +717,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
                 replace_turn_id,
                 timeline_entry,
                 active_execution_chain,
+                turn,
                 task,
             )
     }
@@ -1102,18 +787,6 @@ impl<'a> CanonicalTurnEventSink<'a> {
             .interrupt_current_turn_by_daemon_restart(session_id)
     }
 
-    pub fn complete_from_root_task(
-        &self,
-        session_id: &SessionId,
-        expected_turn_id: Option<&str>,
-    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
-        self.session_store
-            .ok_or_else(|| magi_core::DomainError::InvalidState {
-                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
-            })?
-            .complete_current_turn_from_completed_root_task_for_turn(session_id, expected_turn_id)
-    }
-
     pub fn complete_from_root_task_with_change(
         &self,
         session_id: &SessionId,
@@ -1128,20 +801,6 @@ impl<'a> CanonicalTurnEventSink<'a> {
                 expected_turn_id,
             )
     }
-}
-
-pub fn append_session_turn_item_for_turn(
-    session_store: &SessionStore,
-    session_id: &SessionId,
-    expected_turn_id: Option<&str>,
-    item: ActiveExecutionTurnItem,
-    task_store: Option<&TaskStore>,
-) -> Result<Option<PublishedSessionTurnItem>, String> {
-    CanonicalTurnEventSink::for_store(session_store, task_store).append_item(
-        session_id,
-        expected_turn_id,
-        item,
-    )
 }
 
 pub fn upsert_session_turn_item_for_turn(
@@ -1201,44 +860,6 @@ fn attach_execution_step(
         }
     }
     Ok(())
-}
-
-fn append_session_turn_item_for_turn_raw(
-    session_store: &SessionStore,
-    session_id: &SessionId,
-    expected_turn_id: Option<&str>,
-    mut item: ActiveExecutionTurnItem,
-    task_store: Option<&TaskStore>,
-) -> Result<Option<PublishedSessionTurnItem>, String> {
-    attach_execution_step(session_store, session_id, expected_turn_id, &mut item)?;
-    if let Some(turn_id) = expected_turn_id
-        && let Some(owned) = session_store.canonical_turn_for_session_turn_id(session_id, turn_id)
-        && let Some(binding) = owned
-            .agent_turn_binding()
-            .map_err(|error| error.to_string())?
-    {
-        let item_id = item.item_id.clone();
-        let turn = session_store
-            .upsert_agent_turn_item(session_id, &binding.task_id, turn_id, item)
-            .map_err(|error| error.to_string())?;
-        let projected = session_store.project_canonical_execution_turn(&turn);
-        return published_session_turn_item_from_turn(
-            session_store,
-            session_id,
-            &projected,
-            None,
-            &item_id,
-            task_store,
-        );
-    }
-    let item_id = item.item_id.clone();
-    let sidecar = session_store
-        .append_current_turn_item_for_turn(session_id, expected_turn_id, item)
-        .map_err(|error| error.to_string())?;
-    let Some(sidecar) = sidecar else {
-        return Ok(None);
-    };
-    published_session_turn_item_from_sidecar(session_store, sidecar, &item_id, task_store)
 }
 
 fn upsert_session_turn_item_for_turn_raw(
@@ -1325,7 +946,7 @@ fn publish_session_turn_item_event_raw(
         "current_turn": published.current_turn,
         "turn_items": published.turn_items,
         "canonical_schema_version": CANONICAL_TURN_SCHEMA_VERSION,
-        "canonical_event_kind": canonical_event_kind(published.canonical_turn.as_ref()),
+        "canonical_event_kind": canonical_event_kind(&published.canonical_turn),
         "canonical_turn": published.canonical_turn,
         "canonical_item": published.canonical_item,
     });
@@ -1420,13 +1041,11 @@ fn record_event_bus_item_timing(
                 .and_then(Value::as_str)
         })
         .or_else(|| {
-            published.canonical_turn.as_ref().and_then(|turn| {
-                turn.items.iter().find_map(|item| {
-                    item.metadata
-                        .get("traceId")
-                        .or_else(|| item.metadata.get("requestId"))
-                        .and_then(Value::as_str)
-                })
+            published.canonical_turn.items.iter().find_map(|item| {
+                item.metadata
+                    .get("traceId")
+                    .or_else(|| item.metadata.get("requestId"))
+                    .and_then(Value::as_str)
             })
         });
     let Some(trace_id) = trace_id.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -1444,11 +1063,7 @@ fn record_event_bus_item_timing(
         elapsed_ms = 0u64,
         "conversation response timing"
     );
-    if published
-        .canonical_turn
-        .as_ref()
-        .is_some_and(|turn| turn.status.is_terminal())
-    {
+    if published.canonical_turn.status.is_terminal() {
         tracing::info!(
             target: "magi.performance",
             trace_id,
@@ -1473,7 +1088,7 @@ fn publish_session_turn_item_stream_event_raw(
     stream_update: &SessionTurnStreamUpdate,
     publish_gate: &mut SessionTurnStreamPublishGate,
 ) -> Option<u64> {
-    let canonical_item = published.canonical_item.as_ref()?;
+    let canonical_item = &published.canonical_item;
     // 存储写入后的版本就是这份内容的事实版本；没有版本的 item 不能作为增量事实发布。
     let item_version = canonical_item.item_version?;
     let current_content = canonical_item.content.as_deref().unwrap_or_default();
@@ -1636,7 +1251,7 @@ fn append_session_turn_error_item_with_terminal_commit(
             serde_json::to_value(model_failure).expect("model failure diagnostic must serialize"),
         );
     }
-    let item_published = append_session_turn_item_for_turn(
+    let item_published = upsert_session_turn_item_for_turn(
         session_store,
         session_id,
         expected_turn_id,
@@ -2148,11 +1763,11 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(
             events[0].occurred_at,
-            first_published.canonical_item.as_ref().unwrap().updated_at
+            first_published.canonical_item.updated_at
         );
         assert_eq!(
             events[1].occurred_at,
-            second_published.canonical_item.as_ref().unwrap().updated_at
+            second_published.canonical_item.updated_at
         );
         let first_payload = &events[0].payload;
         assert!(first_payload.get("canonical_turn").is_none());
@@ -2205,8 +1820,7 @@ mod tests {
         // 它也是快照和恢复使用的版本，否则客户端从快照恢复后会把后续增量当成旧版本丢弃。
         let stored_version = second_published
             .canonical_item
-            .as_ref()
-            .and_then(|item| item.item_version)
+            .item_version
             .expect("stored item should carry a version");
         assert_eq!(stored_version, 3);
         assert_eq!(
@@ -2267,194 +1881,135 @@ mod tests {
     }
 
     #[test]
-    fn canonical_turn_carries_request_identity_for_terminal_shell() {
-        let session_id = SessionId::new("session-terminal-shell-runtime");
-        let thread_id = ThreadId::new("thread-terminal-shell-runtime");
-        let now = UtcMillis(10);
-        let mut user_item = session_turn_item(
-            "user_message",
-            "completed",
-            None,
-            Some("终态 shell 请求身份".to_string()),
-            Some("user-terminal-shell-runtime".to_string()),
-            thread_id,
-        );
-        user_item.item_seq = 1;
-        user_item.request_id = Some("request-terminal-shell-runtime".to_string());
-        let turn = ActiveExecutionTurn {
-            turn_id: "turn-terminal-shell-runtime".to_string(),
-            turn_seq: 1,
-            accepted_at: now,
-            completed_at: Some(UtcMillis(20)),
-            status: "completed".to_string(),
-            user_message: Some("终态 shell 请求身份".to_string()),
-            items: vec![user_item],
-        };
-
-        let canonical = to_canonical_turn(&session_id, &turn).expect("turn should canonicalize");
-        assert_eq!(
-            canonical.metadata.get("requestId"),
-            Some(&Value::String("request-terminal-shell-runtime".to_string()))
-        );
-
-        let mut shell = canonical;
-        shell.items.clear();
-        assert_eq!(
-            shell.metadata.get("requestId"),
-            Some(&Value::String("request-terminal-shell-runtime".to_string()))
-        );
-    }
-
-    #[test]
-    fn canonical_turn_hides_agent_wait_tool_call() {
-        let session_id = SessionId::new("session-agent-wait-hidden");
-        let thread_id = ThreadId::new("thread-agent-wait-hidden");
-        let now = UtcMillis::now();
-        let mut item = session_turn_item(
-            "tool_call_result",
-            "completed",
-            Some("agent_wait".to_string()),
-            Some("{\"status\":\"succeeded\"}".to_string()),
-            Some("turn-item-agent-wait".to_string()),
-            thread_id,
-        );
-        item.tool_call_id = Some("tool-call-agent-wait".to_string());
-        item.tool_name = Some("agent_wait".to_string());
-        item.tool_arguments = Some("{\"task_ids\":[\"task-1\"]}".to_string());
-        item.tool_result = Some("{\"status\":\"succeeded\"}".to_string());
-        let turn = ActiveExecutionTurn {
-            turn_id: "turn-agent-wait-hidden".to_string(),
-            turn_seq: 1,
-            accepted_at: now,
-            completed_at: None,
-            status: "running".to_string(),
-            user_message: None,
-            items: vec![item.clone()],
-        };
-
-        let canonical = to_canonical_turn_item(&session_id, &turn, &item)
-            .expect("agent_wait should still be kept in canonical audit log");
-
-        assert!(
-            !canonical.visibility.renderable,
-            "agent_wait 是编排协议回执，不能进入用户可见时间线"
-        );
-    }
-
-    #[test]
-    fn canonical_turn_respects_explicit_non_renderable_model_output() {
-        let session_id = SessionId::new("session-hidden-goal-progress");
-        let thread_id = ThreadId::new("thread-hidden-goal-progress");
-        let now = UtcMillis::now();
-        let mut item = session_turn_item(
+    fn publishing_requires_committed_canonical_turn_and_item() {
+        let store = SessionStore::new();
+        let session = SessionId::new("missing-published-facts");
+        store
+            .create_session(session.clone(), "missing facts")
+            .unwrap();
+        let item = session_turn_item(
             "assistant_final",
             "completed",
-            Some("最终回复".to_string()),
-            Some("目标仍在推进".to_string()),
-            Some("turn-item-hidden-goal-progress".to_string()),
-            thread_id,
+            None,
+            Some("uncommitted".into()),
+            Some("output".into()),
+            ThreadId::new("thread-missing-facts"),
         );
-        item.metadata
-            .insert("renderable".to_string(), serde_json::Value::Bool(false));
         let turn = ActiveExecutionTurn {
-            turn_id: "turn-hidden-goal-progress".to_string(),
+            turn_id: "missing-turn".into(),
             turn_seq: 1,
-            accepted_at: now,
-            completed_at: Some(now),
-            status: "completed".to_string(),
+            accepted_at: UtcMillis(1),
+            completed_at: None,
+            status: "running".into(),
             user_message: None,
             items: vec![item.clone()],
         };
-
-        let canonical = to_canonical_turn_item(&session_id, &turn, &item)
-            .expect("目标中间输出应保留在 canonical 审计记录");
-
-        assert!(!canonical.visibility.renderable);
-        assert_eq!(canonical.content.as_deref(), Some("目标仍在推进"));
+        let error = published_session_turn_item_from_turn(
+            &store,
+            &session,
+            &turn,
+            None,
+            &item.item_id,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("缺少已提交 canonical 事实"));
+        let mut committed = turn.clone();
+        committed.items.clear();
+        seed_test_conversation_turn(&store, &session, committed);
+        let error = published_session_turn_item_from_turn(
+            &store,
+            &session,
+            &turn,
+            None,
+            &item.item_id,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("item output 缺少已提交 canonical 事实"));
     }
 
     #[test]
-    fn canonical_assistant_output_metadata_distinguishes_progress_final_and_error() {
-        let session_id = SessionId::new("session-assistant-output-kind");
-        let thread_id = ThreadId::new("thread-assistant-output-kind");
-        let now = UtcMillis::now();
-
-        for (kind, expected) in [
-            ("assistant_stream", "progress"),
-            ("assistant_final", "final"),
-            ("assistant_error", "error"),
+    fn published_snapshot_uses_committed_content_metadata_and_versions() {
+        let store = SessionStore::new();
+        let session = SessionId::new("committed-published-facts");
+        store
+            .create_session(session.clone(), "committed facts")
+            .unwrap();
+        let thread = ThreadId::new("thread-committed-facts");
+        seed_test_conversation_turn(
+            &store,
+            &session,
+            ActiveExecutionTurn {
+                turn_id: "committed-turn".into(),
+                turn_seq: 1,
+                accepted_at: UtcMillis(1),
+                completed_at: None,
+                status: "running".into(),
+                user_message: Some("request".into()),
+                items: vec![],
+            },
+        );
+        for (kind, name, output, visible) in [
+            ("assistant_stream", None, "progress", true),
+            ("assistant_final", None, "final", true),
+            ("assistant_error", None, "error", true),
+            ("tool_call_result", Some("agent_wait"), "wait", false),
+            ("tool_call_result", Some("agent_spawn"), "spawn", true),
         ] {
-            let item = session_turn_item(
+            let mut item = session_turn_item(
                 kind,
                 "completed",
-                Some("模型输出".to_string()),
-                Some("内容".to_string()),
-                Some(format!("turn-item-{expected}")),
-                thread_id.clone(),
+                None,
+                Some(output.into()),
+                Some(output.into()),
+                thread.clone(),
             );
-            let turn = ActiveExecutionTurn {
-                turn_id: "turn-assistant-output-kind".to_string(),
-                turn_seq: 1,
-                accepted_at: now,
-                completed_at: Some(now),
-                status: "completed".to_string(),
-                user_message: None,
-                items: vec![item.clone()],
-            };
-
-            let canonical = to_canonical_turn_item(&session_id, &turn, &item)
-                .expect("assistant output should remain canonical");
+            item.request_id = Some("request-identity".into());
+            item.tool_name = name.map(str::to_string);
+            item.tool_call_id = name.map(|_| format!("call-{output}"));
+            item.tool_arguments = name.map(|_| "{}".into());
+            item.tool_result = name.map(|_| "{}".into());
+            let sidecar = store
+                .upsert_current_turn_item_for_turn(&session, Some("committed-turn"), item)
+                .unwrap()
+                .unwrap();
+            let mut stale = sidecar.current_turn.unwrap();
+            stale.status = "failed".into();
+            stale
+                .items
+                .iter_mut()
+                .for_each(|item| item.content = Some("stale".into()));
+            let published =
+                published_session_turn_item_from_turn(&store, &session, &stale, None, output, None)
+                    .unwrap()
+                    .unwrap();
+            let committed = store
+                .canonical_turn_for_session_turn_id(&session, "committed-turn")
+                .unwrap();
+            assert_eq!(published.canonical_turn, committed);
             assert_eq!(
-                canonical
-                    .metadata
-                    .get("assistantOutputKind")
-                    .and_then(serde_json::Value::as_str),
-                Some(expected)
+                &published.canonical_item,
+                committed
+                    .items
+                    .iter()
+                    .find(|item| item.item_id == output)
+                    .unwrap()
             );
+            assert_eq!(published.item.content.as_deref(), Some(output));
+            assert_eq!(published.current_turn.status, "running");
+            assert_eq!(published.canonical_item.visibility.renderable, visible);
+            assert_eq!(
+                published.canonical_item.metadata["requestId"],
+                "request-identity"
+            );
+            if name.is_none() {
+                assert_eq!(
+                    published.canonical_item.metadata["assistantOutputKind"],
+                    output
+                );
+            }
         }
-    }
-
-    #[test]
-    fn canonical_turn_keeps_agent_spawn_tool_call_renderable() {
-        let session_id = SessionId::new("session-agent-spawn-visible");
-        let thread_id = ThreadId::new("thread-agent-spawn-visible");
-        let now = UtcMillis::now();
-        let mut item = session_turn_item(
-            "tool_call_result",
-            "completed",
-            Some("agent_spawn".to_string()),
-            Some("{\"status\":\"started\"}".to_string()),
-            Some("turn-item-agent-spawn".to_string()),
-            thread_id,
-        );
-        item.tool_call_id = Some("tool-call-agent-spawn".to_string());
-        item.tool_name = Some("agent_spawn".to_string());
-        item.tool_arguments = Some(
-            serde_json::json!({
-                "role": "explorer",
-                "display_name": "目录探查代理",
-                "goal": "读取目录结构"
-            })
-            .to_string(),
-        );
-        item.tool_result = Some("{\"status\":\"started\"}".to_string());
-        let turn = ActiveExecutionTurn {
-            turn_id: "turn-agent-spawn-visible".to_string(),
-            turn_seq: 1,
-            accepted_at: now,
-            completed_at: None,
-            status: "running".to_string(),
-            user_message: None,
-            items: vec![item.clone()],
-        };
-
-        let canonical = to_canonical_turn_item(&session_id, &turn, &item)
-            .expect("agent_spawn should be canonicalized");
-
-        assert!(
-            canonical.visibility.renderable,
-            "agent_spawn 是主线代理卡片入口，必须保持可渲染"
-        );
     }
 
     #[test]
@@ -2470,7 +2025,7 @@ mod tests {
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
         session_store
-            .upsert_active_execution_chain(
+            .seed_execution_chain_for_test(
                 session_id.clone(),
                 ActiveExecutionChain {
                     session_id: session_id.clone(),
@@ -2478,17 +2033,14 @@ mod tests {
                     root_task_id,
                     execution_chain_ref: "chain-previous-task".to_string(),
                     workspace_id: None,
-                    active_branch_task_ids: Vec::new(),
-                    active_worker_bindings: Vec::new(),
                     branches: Vec::new(),
-                    recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
                         accepted_at: now,
                         entry_id: "timeline-previous-task".to_string(),
                         trimmed_text: Some("之前的任务".to_string()),
                         skill_name: None,
                     },
-                    current_turn: None,
+                    current_turn_id: None,
                 },
             )
             .expect("chain should be stored");

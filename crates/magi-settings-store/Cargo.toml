@@ -6,4 +6,3 @@ edition.workspace = true
 [dependencies]
 magi-core = { path = "../magi-core" }
 serde_json.workspace = true
-tracing.workspace = true

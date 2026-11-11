@@ -286,6 +286,48 @@ fn extension_manifest() -> Value {
 const ENTRY: &[(&str, &[u8])] = &[("extension/index.mjs", b"export default async () => {}")];
 
 #[test]
+fn upstream_binary_assets_require_a_trusted_node_extension_and_preserve_original_paths() {
+    let mut translated = extension_manifest();
+    translated["extension"]["compat"] = json!({"kind":"dsh"});
+    for (path, payload) in [
+        ("extension/upstream/vendor/auth.wasm", b"\0asm\x01\0\0\0".as_slice()),
+        ("extension/upstream/assets/runtime.000.part", b"MZpayload"),
+    ] {
+        let mut files = ENTRY.to_vec(); files.push((path, payload));
+        let package = PluginPackage::from_archive(&archive(&translated, &files)).unwrap();
+        assert_eq!(package.files().get(path).unwrap(), payload);
+        // 同一公共资源合同适用于原生 Node 插件，不依赖 DSH compat 身份。
+        assert!(PluginPackage::from_archive(&archive(&extension_manifest(), &files)).is_ok());
+        assert!(PluginPackage::from_archive(&archive(&manifest(), &[(path, payload)])).is_err());
+        let mut untrusted = translated.clone(); untrusted["permissions"] = json!([]);
+        assert!(PluginPackage::from_archive(&archive(&untrusted, &files)).is_err());
+    }
+    for path in ["ui/hidden.js", "extension/hidden.js", "extension/upstream/../hidden.wasm"] {
+        let mut files = ENTRY.to_vec(); files.push((path, b"\0asm\x01\0\0\0"));
+        assert!(PluginPackage::from_archive(&archive(&translated, &files)).is_err(), "{path}");
+    }
+}
+
+#[test]
+fn resource_bundles_keep_an_aggregate_limit_above_the_old_package_capacity() {
+    let data = vec![0u8; 4 * 1024 * 1024];
+    let names: Vec<_> = (0..17).map(|index| format!("extension/upstream/assets/{index}.bin")).collect();
+    let bytes = |count: usize| {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (path, contents) in [("manifest.json", serde_json::to_vec(&extension_manifest()).unwrap()), ("extension/index.mjs", b"export default () => {}".to_vec())] {
+            writer.start_file(path, options).unwrap(); writer.write_all(&contents).unwrap();
+        }
+        for name in names.iter().take(count) {
+            writer.start_file(name, options).unwrap(); writer.write_all(&data).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    };
+    assert!(PluginPackage::from_archive(&bytes(9)).is_ok());
+    assert!(PluginPackage::from_archive(&bytes(17)).unwrap_err().to_string().contains("展开大小超限"));
+}
+
+#[test]
 fn session_messages_require_explicit_scopes_and_a_trusted_extension() {
     for targets in [
         json!(["context"]),
@@ -633,13 +675,15 @@ fn browser_and_node_scripts_share_a_budget_with_bounded_package_resources() {
         .is_err()
     );
     let full = vec![b'/'; magi_plugin_system::MAX_SCRIPT_BYTES];
+    // 两个 16 MiB 脚本现在处于 64 MiB 总量内；上面的单文件拒绝仍有效，
+    // 聚合超限由 resource_bundles_keep_an_aggregate_limit_above_the_old_package_capacity 覆盖。
     assert!(
         PluginPackage::from_archive(&compressed_archive(
             &manifest,
             &full,
             ("ui/runtime.js", &full)
         ))
-        .is_err()
+        .is_ok()
     );
 }
 

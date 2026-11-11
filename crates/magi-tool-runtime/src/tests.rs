@@ -8771,6 +8771,10 @@ fn idempotent_read_tool_classification_uses_builtin_and_mcp_metadata() {
 
     assert!(registry.is_idempotent_read_tool(BuiltinToolName::WebSearch.as_str()));
     assert!(
+        !registry.is_idempotent_read_tool(BuiltinToolName::ToolCatalog.as_str()),
+        "工具目录及已绑定处理器会在同一任务中变化，查询必须读取当前快照"
+    );
+    assert!(
         !registry.is_idempotent_read_tool(BuiltinToolName::GetGoal.as_str()),
         "get_goal 返回可变的 Goal/Plan revision，必须每次读取当前状态"
     );

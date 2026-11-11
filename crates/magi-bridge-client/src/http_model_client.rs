@@ -111,7 +111,7 @@ pub struct ProviderCacheContract {
     pub continuation: ProviderContinuation,
 }
 
-/// 直接通过 HTTP 调用已配置的模型提供方，绕过 JSON-RPC 子进程 loopback。
+/// 通过 HTTP 调用已配置的模型提供方。
 ///
 /// HTTP I/O 放在独立线程执行，避免与调用方已经存在的 tokio runtime 冲突。
 pub struct HttpModelBridgeClient {
@@ -123,6 +123,8 @@ pub struct HttpModelBridgeClient {
     /// `None` 表示未配置（保留协议默认行为）。
     reasoning_effort: Option<ReasoningEffort>,
     reasoning_capability: Option<crate::reasoning::ReasoningCapability>,
+    temperature: Option<f64>,
+    stop: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -247,6 +249,8 @@ impl HttpModelBridgeClient {
             protocol,
             reasoning_effort,
             reasoning_capability: None,
+            temperature: None,
+            stop: Vec::new(),
         }
     }
 
@@ -257,6 +261,34 @@ impl HttpModelBridgeClient {
         self.reasoning_effort = capability.reconcile(self.reasoning_effort);
         self.reasoning_capability = Some(capability);
         self
+    }
+
+    /// 显式调用参数覆盖连接默认值；无法表达的协议控制必须拒绝，不能静默忽略。
+    pub fn with_generation_controls(
+        mut self,
+        temperature: Option<f64>,
+        stop: Vec<String>,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<Self, String> {
+        if temperature.is_some_and(|v| !v.is_finite() || !(0.0..=2.0).contains(&v))
+            || stop.len() > 16
+            || stop.iter().any(|v| v.is_empty() || v.len() > 4096)
+        {
+            return Err("InvalidParams: 生成参数超出有效范围".into());
+        }
+        if let Some(effort) = effort {
+            let capability = self
+                .reasoning_capability
+                .as_ref()
+                .ok_or("模型未声明推理强度能力")?;
+            if !capability.supported_efforts.contains(&effort) {
+                return Err("模型不支持所选推理强度".into());
+            }
+            self.reasoning_effort = Some(effort);
+        }
+        self.temperature = temperature;
+        self.stop = stop;
+        Ok(self)
     }
 
     #[cfg(test)]
@@ -387,6 +419,8 @@ impl HttpModelBridgeClient {
         let mut params =
             compile_prompt_ir(request, stream, self.reasoning_effort, max_output_tokens);
         params.reasoning_capability = self.reasoning_capability.clone();
+        params.temperature = self.temperature;
+        params.stop = self.stop.clone();
         // Chat Completions 兼容服务不保证接受 OpenAI 缓存扩展；直接 OpenAI
         // 连接才自动发送。Responses 沿其标准字段，Anthropic 由断点负责。
         if matches!(
@@ -1252,6 +1286,7 @@ fn provider_stream_event_error(
 struct BodyStreamTiming {
     first: Option<Duration>,
     last: Option<Duration>,
+    response_received_at: Duration,
     usage_output_tokens: Option<u64>,
     reasoning_tokens: Option<u64>,
     non_text_output: bool,
@@ -1272,6 +1307,7 @@ impl BodyStreamTiming {
         has_content: bool,
         received_at: Duration,
     ) -> bool {
+        self.response_received_at = received_at;
         if has_content {
             self.first.get_or_insert(received_at);
             self.last = Some(received_at);
@@ -1353,6 +1389,8 @@ impl BodyStreamTiming {
                 None
             };
         Some(magi_app_server_protocol::ModelResponseTiming {
+            response_duration_ms: (self.usage_output_tokens == Some(output_tokens))
+                .then_some(self.response_received_at.as_millis() as u64),
             first_content_ms: first.as_millis() as u64,
             content_duration_ms: self.last.unwrap_or(first).saturating_sub(first).as_millis()
                 as u64,
@@ -1969,6 +2007,7 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
             message: "provider response invalid: empty stream response".to_string(),
         });
     }
+    body_timing.response_received_at = received_at;
     if let Some(timing) = body_timing.finish(
         provider_family,
         adapted.usage.output_tokens,
@@ -1985,6 +2024,16 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
     let mut response: ModelResponse = adapted.into();
     if !body_timing.usage_observed {
         response.usage = None;
+    } else if body_timing.usage_output_tokens
+        == response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.get("outputTokens"))
+            .and_then(Value::as_u64)
+        && let Some(reasoning) = body_timing.reasoning_tokens
+        && let Some(usage) = response.usage.as_mut()
+    {
+        usage["reasoningTokens"] = json!(reasoning);
     }
     Ok(response)
 }
@@ -2300,6 +2349,7 @@ fn build_anthropic_messages_url_for_test(base_url: &str) -> Result<String, Strin
                 }],
                 max_tokens: None,
                 temperature: None,
+                stop: vec![],
                 tools: None,
                 stream: None,
 
@@ -2665,6 +2715,11 @@ mod tests {
         );
         assert_eq!(result.text_output_tokens, Some(40));
         assert_eq!(
+            result.response_duration_ms,
+            Some(1500),
+            "overall throughput includes the complete response, while body timing excludes the usage tail"
+        );
+        assert_eq!(
             timing
                 .finish(ProviderFamily::OpenAiChat, 101, true, false)
                 .unwrap()
@@ -2682,6 +2737,14 @@ mod tests {
             &event(r#"{"usage":{"completion_tokens":80}}"#),
             false,
             Duration::from_millis(1800),
+        );
+        assert_eq!(
+            timing
+                .finish(ProviderFamily::OpenAiChat, 80, true, false)
+                .unwrap()
+                .response_duration_ms,
+            Some(1800),
+            "missing reasoning split does not discard observed response duration"
         );
         assert_eq!(
             timing
@@ -2884,7 +2947,7 @@ mod tests {
         });
         let call = UsageCallRecordInput {
             workspace_id: Some("ws".into()),
-            session_id: "session".into(),
+            owner: magi_usage_authority::UsageOwner::session("session"),
             turn_id: None,
             dispatch_wave_id: None,
             assignment_id: None,
@@ -6130,6 +6193,52 @@ mod tests {
         server_handle
             .join()
             .expect("mock stream server should not panic");
+    }
+
+    #[test]
+    fn streaming_error_preserves_prior_usage_without_confirming_success() {
+        let server = spawn_mock_server_with_response_text(
+            200,
+            "text/event-stream",
+            concat!(
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"prompt_tokens_details\":{\"cached_tokens\":88},\"completion_tokens\":3}}\n\n",
+                "data: {\"error\":{\"message\":\"upstream stopped\",\"code\":\"UPSTREAM_STOPPED\"}}\n\n"
+            ).into(),
+        );
+        let client = HttpModelBridgeClient::new(server.address, None, "test".into());
+        let recorder = std::cell::RefCell::new(ModelTransportRecorder::default());
+        let result = client.invoke_observed(
+            ModelInvocationRequest {
+                cache_affinity_key: None,
+                prompt_cache_key: None,
+                provider: "test".into(),
+                prompt: "test".into(),
+                messages: None,
+                tools: None,
+                tool_choice: None,
+            },
+            ModelInvocationOptions {
+                on_delta: Some(&|_| {}),
+                on_retry: &|_| panic!("business rejection must not retry"),
+                is_cancelled: &|| false,
+                max_output_tokens: None,
+            },
+            &|event| recorder.borrow_mut().apply(event).map(|_| ()),
+        );
+        assert!(result.unwrap_err().to_string().contains("upstream stopped"));
+        let recorder = recorder.borrow();
+        assert_eq!(recorder.attempts.len(), 1);
+        let receipt = &recorder.attempts[0];
+        assert_eq!(receipt.outcome, Some(ModelTransportOutcome::Failed));
+        assert_eq!(receipt.usage_observed, Some(true));
+        let usage = receipt.usage.as_ref().unwrap();
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.cache_read_tokens, Some(88));
+        assert!(
+            receipt.response_timing.is_none(),
+            "failure is not a performance sample"
+        );
     }
 
     #[test]

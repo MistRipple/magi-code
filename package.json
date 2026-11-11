@@ -39,6 +39,8 @@
     "test:electron-dsh-profile": "node scripts/verify-electron-dsh-profile.mjs",
     "test:electron-dsh-health": "node scripts/verify-electron-dsh-health.mjs",
     "test:electron-dsh-management": "node scripts/verify-electron-dsh-management.mjs",
+    "test:electron-dshmarket": "node scripts/verify-electron-dshmarket.mjs",
+    "test:electron-free-search": "node scripts/verify-electron-free-search.mjs",
     "test:electron-plugin-install-recovery": "node scripts/verify-electron-plugin-install-recovery.mjs",
     "test:electron-dsh-compatibility": "node scripts/verify-electron-dsh-compatibility.mjs",
     "test:electron-popular-dsh": "node scripts/verify-electron-popular-dsh.mjs",

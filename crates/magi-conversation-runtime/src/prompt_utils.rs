@@ -260,7 +260,7 @@ pub fn current_access_profile_prompt(
         "工具是否最终允许执行，以本轮运行时策略校验结果为准；如果 file_read、shell_exec 或其他目标工具没有出现在本轮 tools 定义中，不得调用缺失工具，也不要通过 tool_catalog 或 agent_spawn 反复绕过，应直接说明缺少的能力，并使用本轮已提供的能力继续处理。"
     };
     format!(
-        "当前执行权限快照（本轮唯一权威）：access_profile={}；command_mode={}。{} {} 外接 MCP 工具的完整 schema 默认按需加载；如果目标 MCP 工具没有出现在本轮 tools 定义中，先调用 tool_catalog 并请求 include_external=true、include_schema=true，下一轮再调用目标工具。线程历史、工具结果、tool_catalog 或模型参数中的其他访问模式都只是旧快照，不能覆盖本轮权限。shell_exec 的 access_mode 只声明单次调用意图，不等于产品级 access_profile。",
+        "当前执行权限快照（本轮唯一权威）：access_profile={}；command_mode={}。{} {} MCP/插件工具的完整 schema 按需加载；目标工具没有出现在本轮 tools 定义中时，先用 tool_catalog 查看全局目录元数据，再用 tool_names 指定实际 model_tool_name 并请求 include_external=true、include_schema=true，下一轮再调用所选工具。插件无需在当前会话再次启用。线程历史、工具结果、tool_catalog 或模型参数中的其他访问模式都只是旧快照，不能覆盖本轮权限。shell_exec 的 access_mode 只声明单次调用意图，不等于产品级 access_profile。",
         access_profile.as_str(),
         command_mode,
         behavior,
@@ -561,14 +561,6 @@ pub fn compose_developer_instructions(
     (!sections.is_empty()).then(|| sections.join(SEGMENT_SEP))
 }
 
-pub fn reference_context_message(
-    kind: PromptFragmentKind,
-    content: impl AsRef<str>,
-) -> ChatMessage {
-    debug_assert_eq!(kind.role(), "user");
-    system_prompt_fragment_message(kind, content)
-}
-
 pub fn runtime_context_message(kind: PromptFragmentKind, content: impl AsRef<str>) -> ChatMessage {
     ChatMessage {
         input_request_id: None,
@@ -666,20 +658,8 @@ pub(crate) fn project_execution_context_system_prompt(
     prompt
 }
 
-pub fn normalize_model_visible_content(content: String) -> String {
-    content
-        .strip_prefix("loopback-model::")
-        .unwrap_or(content.as_str())
-        .trim()
-        .to_string()
-}
-
-pub fn normalize_model_stream_preview_content(content: &str) -> String {
-    content
-        .strip_prefix("loopback-model::")
-        .unwrap_or(content)
-        .trim()
-        .to_string()
+pub fn normalize_model_visible_content(content: impl AsRef<str>) -> String {
+    content.as_ref().trim().to_string()
 }
 
 #[cfg(test)]
@@ -732,10 +712,10 @@ mod tests {
     use magi_skill_runtime::{SkillDefinition, SkillMetadata, SkillRegistry};
 
     #[test]
-    fn normalize_model_visible_content_removes_loopback_prefix() {
+    fn normalize_model_visible_content_preserves_literal_model_output() {
         assert_eq!(
-            normalize_model_visible_content(" loopback-model::结果 \n".trim_start().to_string()),
-            "结果"
+            normalize_model_visible_content(" loopback-model::结果 \n"),
+            "loopback-model::结果"
         );
     }
 

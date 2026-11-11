@@ -269,6 +269,7 @@ mod tests {
             }],
             max_tokens: None,
             temperature: None,
+            stop: Vec::new(),
             tools: Some(vec![
                 tool("web_search", ChatToolOrigin::Builtin),
                 tool("file_read", ChatToolOrigin::Builtin),

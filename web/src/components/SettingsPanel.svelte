@@ -79,6 +79,20 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
   );
   /** 当前打开的是插件设置页时的插件项：页头据此显示图标并放置启停与卸载。 */
   const activePluginTab = $derived(pluginSettingsTabs.find((item) => item.tabId === store.activeTab) ?? null);
+  // 只保留用户打开过的设置文档；切换分类不等于关闭插件页面。
+  let openedPluginSettingsTabs = $state<`plugin:${string}`[]>([]);
+  const retainedPluginSettingsTabs = $derived(pluginSettingsTabs.filter(tab =>
+    openedPluginSettingsTabs.includes(tab.tabId) || (active && tab.tabId === store.activeTab)));
+  $effect(() => {
+    const available = new Set(pluginSettingsTabs.filter(tab => tab.active).map(tab => tab.tabId));
+    const selected = active ? activePluginTab : null;
+    const previous = untrack(() => openedPluginSettingsTabs);
+    const next = previous.filter(id => available.has(id));
+    if (selected?.active && !next.includes(selected.tabId)) next.push(selected.tabId);
+    if (previous.length !== next.length || previous.some((id, index) => id !== next[index])) {
+      openedPluginSettingsTabs = next;
+    }
+  });
   const activeTabTitle = $derived(
     'titleKey' in activeTabDefinition ? i18n.t(activeTabDefinition.titleKey) : activeTabDefinition.title,
   );
@@ -208,12 +222,6 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
       {/if}
       {/each}
     </nav>
-    {#if store.userInfo && store.clientKind === 'vscode'}
-      <div class="settings-nav-footer">
-        <span class="user-info-text" title={store.userInfo}>{store.userInfo}</span>
-        <button class="btn btn--secondary btn--sm" onclick={store.logout}>{i18n.t('settings.logout')}</button>
-      </div>
-    {/if}
   </aside>
 
   <!-- 右侧：当前分类的页面 -->
@@ -703,17 +711,16 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
         <div class="apple-manager"><div class="apple-scroller-proxy"><div class="settings-section">
           <SettingsMcpServerSection />
         </div></div></div>
-      {:else}
-        {#each pluginSettingsTabs.filter((item) => item.tabId === store.activeTab) as tab (tab.tabId)}
-          <div class="settings-frame">
+      {/if}
+        {#each retainedPluginSettingsTabs as tab (tab.tabId)}
+          <div class="settings-frame" hidden={tab.tabId !== store.activeTab} inert={!active || tab.tabId !== store.activeTab}>
             {#if tab.active}
-              <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} placement="settings" {active} />
+              <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} placement="settings" active={active && tab.tabId === store.activeTab} />
             {:else}
               <p class="settings-hint" role="status" data-testid="plugin-page-inactive">{i18n.t('settings.plugins.pageHeader.inactive')}</p>
             {/if}
           </div>
         {/each}
-      {/if}
     </div>
   </main>
 </div>
@@ -1338,14 +1345,6 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
       outline-offset: 1px;
     }
 
-    .settings-nav-footer {
-      margin-top: auto;
-      padding-top: var(--space-4);
-      display: flex;
-      flex-direction: column;
-      gap: var(--space-3);
-    }
-
     .settings-main {
       display: flex;
       flex-direction: column;
@@ -1360,6 +1359,7 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
     /* 页头与共享设置内容列保持同一宽度和左右留白。 */
     .main-header {
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
       gap: var(--space-4);
@@ -1373,16 +1373,18 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
       font-size: 18px;
       font-weight: var(--font-semibold);
       color: var(--foreground);
-      white-space: nowrap;
+      min-width: 0;
+      overflow-wrap: anywhere;
     }
 
     .header-breadcrumbs {
       min-width: 0;
-      flex: 1;
+      flex: 1 1 240px;
     }
 
     .header-title-group:has(.header-plugin-icon) {
       align-items: center;
+      flex-direction: row;
     }
 
     .header-plugin-icon {
@@ -1469,10 +1471,6 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
       height: 36px;
       padding: 0 var(--space-4);
       border-radius: var(--radius-full);
-    }
-
-    .settings-nav-footer {
-      display: none;
     }
 
     .settings-main {

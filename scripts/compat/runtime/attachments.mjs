@@ -15,6 +15,8 @@ const map = () => {
 };
 
 export const withRequestImages = (run) => requests.run(new Map(), run);
+// 活动模型请求独占其临时引用；无请求上下文时才使用插件持久附件服务。
+export const scopedRequestImage = (ref, signal) => requests.getStore() ? requestAttachments.readImage(ref, signal) : undefined;
 
 export async function saveRequestImage(url) {
   const match = typeof url === 'string' && /^data:(image\/(?:png|jpeg|webp|gif|avif|bmp|x-icon|svg\+xml));base64,([A-Za-z0-9+/]*={0,2})$/.exec(url);
@@ -47,15 +49,19 @@ export const requestAttachments = {
   },
   async readImageRequest(ref, target, signal) {
     const { data } = await requestAttachments.readImage(ref, signal);
-    if (![target?.width, target?.height, target?.maxBytes].every((n) => Number.isFinite(n) && n > 0)) throw new Error('图片请求目标无效');
-    let result;
-    for (const quality of [90, 75, 60, 40]) {
-      result = await sharp(data).resize({ width: Math.min(ref.width, Math.floor(target.width)), height: Math.min(ref.height, Math.floor(target.height)), fit: 'inside', withoutEnlargement: true }).flatten({ background: '#ffffff' }).toColourspace('srgb').jpeg({ quality }).toBuffer({ resolveWithObject: true });
-      abort(signal);
-      if (result.data.length <= target.maxBytes) break;
-    }
-    return { variantId: digest(result.data), attachment: ref, data: result.data, mediaType: 'image/jpeg', bytes: result.data.length, width: result.info.width, height: result.info.height, depth: 'uchar', space: 'srgb', hasAlpha: false };
+    return prepareRequestImage(ref, data, target, signal);
   },
   imageHostPath() { return undefined; },
   fileHostPath() { return undefined; },
 };
+
+export async function prepareRequestImage(ref, data, target, signal) {
+    if (![target?.width, target?.height, target?.maxBytes].every((n) => Number.isFinite(n) && n > 0)) throw new Error('图片请求目标无效');
+    let result;
+    for (const quality of [90, 75, 60, 40]) {
+      result = await (await modelImage(data, ref.mediaType)).resize({ width: Math.min(ref.width, Math.floor(target.width)), height: Math.min(ref.height, Math.floor(target.height)), fit: 'inside', withoutEnlargement: true }).flatten({ background: '#ffffff' }).toColourspace('srgb').jpeg({ quality }).toBuffer({ resolveWithObject: true });
+      abort(signal);
+      if (result.data.length <= target.maxBytes) break;
+    }
+    return { variantId: digest(result.data), attachment: ref, data: result.data, mediaType: 'image/jpeg', bytes: result.data.length, width: result.info.width, height: result.info.height, depth: 'uchar', space: 'srgb', hasAlpha: false };
+}

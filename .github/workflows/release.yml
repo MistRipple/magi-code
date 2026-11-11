@@ -247,8 +247,7 @@ jobs:
           set -euo pipefail
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
-          cli_package="$(printf 't''auri-cli')"
-          cargo install "$cli_package" --version "$TAURI_CLI_VERSION" --locked
+          cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
       - name: 生成旧版客户端无感迁移桥
         shell: bash
         env:

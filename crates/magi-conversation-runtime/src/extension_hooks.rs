@@ -1,9 +1,9 @@
-//! 扩展钩子端口：`tool.call` 与 `tool.result` 在原生工具管线上的唯一接入点。
+//! 扩展钩子端口：工具调用进入原生执行管线，结果改写进入统一模型视图。
 //!
 //! 端口由 daemon 注入（ExtensionBus 的适配器）。扩展只能阻止或提出改写，不能批准：
 //! - `tool.call` 在账本指纹、路径与并发分类、权限和审批之前生效；改写后的参数用本轮工具定义
 //!   重新校验，之后原生管线对**最终内容**照常裁决，不复用原参数的任何批准；
-//! - `tool.result` 只改模型可见投影，原始回执在此之前已经写入 canonical 事实。
+//! - `tool.result` 在请求投影时只改模型可见副本，实时与 canonical 重建共用同一入口。
 
 use crate::tool_call_validation::validate_tool_call_batch;
 use magi_bridge_client::{ChatToolCall, ChatToolDefinition};
@@ -97,6 +97,115 @@ pub struct AssembleView<'a> {
 pub(crate) struct RewriteMemo(
     std::cell::RefCell<Option<(String, Vec<crate::ExtensionRewriteProposal>)>>,
 );
+
+/// 工具结果改写只作用于请求副本。同一模型请求内，相同调用与原生结果复用同一次征询，
+/// 避免估算、发送和历史重建反复执行钩子或在改写结果上叠加改写。
+#[derive(Default)]
+pub(crate) struct ToolResultMemo(
+    std::cell::RefCell<std::collections::HashMap<String, Option<String>>>,
+);
+
+impl ToolResultMemo {
+    pub(crate) fn project(
+        &self,
+        hooks: &dyn ExtensionHooks,
+        scope: &ToolHookScope<'_>,
+        messages: &mut [magi_bridge_client::ChatMessage],
+    ) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        let mut calls = std::collections::HashMap::new();
+        let mut replacements = Vec::new();
+        for (index, message) in messages.iter_mut().enumerate() {
+            if message.role == "assistant" {
+                calls.extend(
+                    message
+                        .tool_calls
+                        .iter()
+                        .map(|call| (call.id.clone(), call.clone())),
+                );
+            }
+            if message.role != "tool" {
+                continue;
+            }
+            let Some((call, raw)) = message
+                .tool_call_id
+                .as_ref()
+                .and_then(|id| calls.get(id))
+                .zip(message.content.as_deref())
+            else {
+                continue;
+            };
+            let status = crate::tool_result_utils::tool_result_execution_status(raw);
+            let native = crate::history_projection::project_tool_result(raw, status);
+            let key = magi_core::hex_lower(Sha256::digest(
+                serde_json::to_vec(&(scope.session_id, scope.task_id, call, &native))
+                    .expect("tool projection identity serializes"),
+            ));
+            let cached = self.0.borrow().get(&key).cloned();
+            let replacement = cached.unwrap_or_else(|| {
+                let replacement = hooks.tool_result(
+                    scope,
+                    call,
+                    ToolResultView {
+                        status: status.wire_label(),
+                        projection: &native,
+                    },
+                );
+                self.0.borrow_mut().insert(key.clone(), replacement.clone());
+                replacement
+            });
+            if let Some(replacement) = replacement.filter(|replacement| replacement != &native) {
+                replacements.push((index, call.clone(), native, replacement.clone()));
+                message.content = Some(replacement);
+            }
+        }
+        (!replacements.is_empty()).then(|| {
+            magi_core::hex_lower(Sha256::digest(
+                serde_json::to_vec(&replacements).expect("projection fingerprint serializes"),
+            ))
+        })
+    }
+}
+
+/// 一次请求的历史投影：工具结果改写、预算和 context.assemble 的唯一装配顺序。
+/// 在新请求创建新的实例，禁止挂在整个 Task/Session 上复用。
+#[derive(Default)]
+pub(crate) struct RequestHistoryProjection {
+    pub(crate) tool_results: ToolResultMemo,
+    rewrites: RewriteMemo,
+}
+
+impl RequestHistoryProjection {
+    pub(crate) fn view(
+        &self,
+        hooks: Option<&dyn ExtensionHooks>,
+        scope: &ToolHookScope<'_>,
+        messages: &[magi_bridge_client::ChatMessage],
+        context_window_tokens: u64,
+    ) -> (
+        Vec<magi_bridge_client::ChatMessage>,
+        magi_session_store::HistoryProjection,
+    ) {
+        let mut history = messages.to_vec();
+        if let Some(hooks) = hooks {
+            self.tool_results.project(hooks, scope, &mut history);
+        }
+        let (history, mut report) =
+            crate::history_projection::bounded_request_history(&history, context_window_tokens);
+        let history = match hooks {
+            Some(hooks) => apply_context_assemble(
+                hooks,
+                scope,
+                &self.rewrites,
+                history,
+                context_window_tokens,
+                &mut report,
+            ),
+            None => history,
+        };
+        (history, report)
+    }
+}
 
 /// 压缩检查点摘要消息的标记；其及之前的历史属于检查点边界，不可改写。
 const COMPACTION_MARKER: &str = "[context_compaction]";
@@ -658,6 +767,98 @@ mod tests {
                 }),
             },
         }]
+    }
+
+    #[test]
+    fn tool_result_projection_is_stable_across_rebuilds_and_scoped_to_original_content() {
+        struct Counting(std::sync::atomic::AtomicUsize);
+        impl ExtensionHooks for Counting {
+            fn tool_call(&self, _: &ToolHookScope<'_>, _: &ChatToolCall) -> ToolCallDecision {
+                unreachable!()
+            }
+            fn tool_result(
+                &self,
+                _: &ToolHookScope<'_>,
+                _: &ChatToolCall,
+                view: ToolResultView<'_>,
+            ) -> Option<String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(format!("visible:{}", view.projection))
+            }
+        }
+        let raw: Vec<magi_bridge_client::ChatMessage> = serde_json::from_value(json!([
+            {"role": "assistant", "tool_calls": [{"id": "c", "type": "function", "function": {"name": "shell_exec", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c", "content": "{\"tool\":\"shell_exec\",\"status\":\"succeeded\",\"stdout\":\"original\"}"}
+        ])).unwrap();
+        let hooks = Counting(std::sync::atomic::AtomicUsize::new(0));
+        let memo = ToolResultMemo::default();
+        let mut first = raw.clone();
+        memo.project(&hooks, &scope(), &mut first);
+        assert!(first[1].content.as_deref().unwrap().starts_with("visible:"));
+        for _ in 0..3 {
+            let mut rebuilt = raw.clone();
+            memo.project(&hooks, &scope(), &mut rebuilt);
+            assert_eq!(rebuilt[1].content, first[1].content);
+        }
+        assert_eq!(
+            hooks.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "估算、发送和重建复用同一原始结果的投影"
+        );
+        assert!(!raw[1].content.as_deref().unwrap().contains("visible:"));
+        let mut changed = raw.clone();
+        changed[1].content =
+            Some(r#"{"tool":"shell_exec","status":"failed","error":"changed"}"#.into());
+        memo.project(&hooks, &scope(), &mut changed);
+        assert!(changed[1].content.as_deref().unwrap().contains("changed"));
+        assert_eq!(hooks.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let mut replay = raw.clone();
+        ToolResultMemo::default().project(&hooks, &scope(), &mut replay);
+        assert_eq!(
+            replay[1].content, first[1].content,
+            "重启后从原始回执重新投影"
+        );
+        let mut other_task = scope();
+        other_task.task_id = "other-task";
+        memo.project(&hooks, &other_task, &mut raw.clone());
+        assert_eq!(
+            hooks.0.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "调用 ID 相同不能跨任务复用"
+        );
+    }
+
+    #[test]
+    fn request_projection_freezes_one_request_and_rechecks_plugin_changes_for_the_next() {
+        use std::sync::atomic::Ordering;
+        let hooks = crate::test_history::ToolProjectionHooks::new();
+        let raw = crate::test_history::tool_projection_history("call")
+            .iter()
+            .map(crate::conversation_loop::thread_chat_message_to_chat_message)
+            .collect::<Vec<_>>();
+        let first = RequestHistoryProjection::default();
+        let view = |request: &RequestHistoryProjection| {
+            request.view(Some(&hooks), &scope(), &raw, 128_000).0
+        };
+        assert_eq!(view(&first)[1].content.as_deref(), Some("[projection-v1]"));
+        hooks.version.store(2, Ordering::SeqCst);
+        assert_eq!(view(&first)[1].content.as_deref(), Some("[projection-v1]"));
+        assert_eq!(hooks.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            view(&RequestHistoryProjection::default())[1]
+                .content
+                .as_deref(),
+            Some("[projection-v2]")
+        );
+        hooks.version.store(0, Ordering::SeqCst);
+        assert!(
+            view(&RequestHistoryProjection::default())[1]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("SOURCE_SECRET")
+        );
+        assert!(raw[1].content.as_deref().unwrap().contains("SOURCE_SECRET"));
     }
 
     struct Scripted(fn(&ChatToolCall) -> ToolCallDecision);

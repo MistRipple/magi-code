@@ -1511,6 +1511,8 @@ pub enum PluginPermissionKind {
     Client,
     #[serde(rename = "sessionWrite")]
     SessionWrite,
+    #[serde(rename = "webProviders")]
+    WebProviders,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1558,6 +1560,10 @@ pub enum PluginViewPlacement {
     RightPane,
     #[serde(rename = "homeCard")]
     HomeCard,
+    #[serde(rename = "composerLeft")]
+    ComposerLeft,
+    #[serde(rename = "chatAssistant")]
+    ChatAssistant,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1567,6 +1573,9 @@ pub struct PluginViewContribution {
     pub title: String,
     pub entry: String,
     pub placements: Vec<PluginViewPlacement>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1703,6 +1712,10 @@ pub enum JsonRpcMessage {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginAuthorizeRequest {
     pub grants: Vec<PluginPermission>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expectedDigest")]
+    pub expected_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3391,6 +3404,10 @@ pub struct ModelUsageContext {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelResponseTiming {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "responseDurationMs")]
+    pub response_duration_ms: Option<u64>,
     #[serde(rename = "firstContentMs")]
     pub first_content_ms: u64,
     #[serde(rename = "contentDurationMs")]
@@ -3403,7 +3420,12 @@ pub struct ModelResponseTiming {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginActivationRequest {}
+pub struct PluginActivationRequest {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expectedDigest")]
+    pub expected_digest: Option<String>,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -4129,4 +4151,81 @@ pub enum PluginComposerTextStatus {
     Accepted,
     #[serde(rename = "unknown")]
     Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginConversationViewContext {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<PluginAssistantViewMessage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginAssistantViewMessage {
+    pub id: String,
+    pub text: String,
+    pub streaming: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "turnId")]
+    pub turn_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginViewAdmissionRequest {
+    #[serde(rename = "expectedDigest")]
+    pub expected_digest: String,
+    pub entry: String,
+    pub placement: PluginViewPlacement,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginWebKind {
+    #[serde(rename = "search")]
+    Search,
+    #[serde(rename = "fetch")]
+    Fetch,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginWebBinding {
+    #[serde(rename = "pluginId")]
+    pub plugin_id: String,
+    #[serde(rename = "contributionId")]
+    pub contribution_id: String,
+    #[serde(rename = "providerId")]
+    pub provider_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginWebConfiguration {
+    pub revision: i64,
+    pub search: Option<PluginWebBinding>,
+    pub fetch: Option<PluginWebBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginWebProviderChange {
+    pub kind: PluginWebKind,
+    #[serde(rename = "contributionId")]
+    pub contribution_id: Option<String>,
+    #[serde(rename = "providerId")]
+    pub provider_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginWebConfigureRequest {
+    #[serde(rename = "expectedRevision")]
+    pub expected_revision: i64,
+    pub changes: Vec<PluginWebProviderChange>,
 }

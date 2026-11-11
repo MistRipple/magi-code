@@ -382,8 +382,6 @@
 
   // 目录/文件只读工具：只需紧凑 header
   const isCompactReadOnlyTool = $derived(name === 'file_read');
-  // 仅 view 类工具支持点击整行 header 打开文件
-  const isHeaderOpenableTool = $derived(name === 'file_read' || name === 'view');
 
   // 折叠态只计算卡片存在性和标题摘要；完整输入输出、图片和图表在展开后解析。
   const sanitizedInput = $derived(sanitizeToolDisplayPayload(input));
@@ -909,6 +907,9 @@
     {/if}
   </span>
 
+{/snippet}
+
+{#snippet headerMeta()}
   <ToolCardMeta status={statusInfo.class} label={toolStatusLabel(visualStatus)} expanded={canExpand ? !collapsed : undefined} {duration}></ToolCardMeta>
 {/snippet}
 
@@ -992,32 +993,30 @@
       data-tool-name={name}
       data-tool-call-id={id || undefined}
     >
-      {#if canExpand}
+      {#if canExpand && !(toolFilepath && !hasError)}
         <button
+          type="button"
           class="tool-header"
           onclick={toggle}
           aria-expanded={!collapsed}
           aria-controls={detailId}
         >
           {@render headerContent()}
+          {@render headerMeta()}
         </button>
       {:else}
-        <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
         <div
-          class="tool-header"
+          class="tool-header tool-header-with-actions"
           class:file-mutation-header={isCompactMutation || isCompactReadOnlyTool}
-          class:clickable={isHeaderOpenableTool && !!toolFilepath}
-          onclick={isHeaderOpenableTool && toolFilepath ? handleOpenFile : undefined}
-          onkeydown={(e) => {
-            if (isHeaderOpenableTool && toolFilepath && (e.key === 'Enter' || e.key === ' ')) {
-              e.preventDefault();
-              handleOpenFile();
-            }
-          }}
-          role={isHeaderOpenableTool && toolFilepath ? "button" : undefined}
-          tabindex={isHeaderOpenableTool && toolFilepath ? 0 : undefined}
         >
           {@render headerContent()}
+          {#if canExpand}
+            <button type="button" class="tool-header-disclosure" onclick={toggle} aria-label={toolDisplayName} aria-expanded={!collapsed} aria-controls={detailId}>
+              {@render headerMeta()}
+            </button>
+          {:else}
+            {@render headerMeta()}
+          {/if}
         </div>
       {/if}
 

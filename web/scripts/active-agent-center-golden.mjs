@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { compileModule } from 'svelte/compiler';
+import { transformWithOxc } from 'vite';
 import { withGoldenViteServer } from './golden-vite.mjs';
 
 function agent(overrides = {}) {
@@ -141,31 +143,102 @@ await withGoldenViteServer(async (server) => {
     '终态代理必须提供完成时刻与毫秒级总耗时，供右侧详情与主线复用同一展示组件',
   );
 
-  assert.equal(
-    center.resolveAgentProjectionPin('root-new', 2, 'root-old'),
-    'pin',
-    '不同 rootTaskId 的新代理组必须替换上一轮固定列表',
-  );
-  assert.equal(
-    center.resolveAgentProjectionPin('root-cleared', 2, 'root-cleared'),
-    'clear',
-    '用户已清空的同一轮代理不能被轮询重新打开',
-  );
-  assert.equal(
-    center.resolveAgentProjectionPin('root-empty', 0, '', 'active'),
-    'clear',
-    '没有实际子代理的新任务必须清理上一轮固定列表',
-  );
-  assert.equal(
-    center.resolveAgentProjectionPin('root-failed', 0, '', 'failed'),
-    'pin',
-    '失败 root 必须固定恢复面板，不能因为没有子代理而丢失操作入口',
-  );
-  assert.equal(
-    center.resolveAgentProjectionPin('', 0, '', 'completed'),
-    'ignore',
-    '缺少权威 rootTaskId 时不能改写现有固定状态',
-  );
+  const projection = { root_task: { task_id: 'root-new' }, agents: [agent()], outcome: 'active' };
+  assert.equal(center.selectActiveAgentRunProjection(projection), projection,
+    '运行中心直接读取当前 daemon 投影，保留全部代理');
+  assert.equal(center.selectActiveAgentRunProjection(null), null,
+    '归档、重连清空或切换 root 后不能继续展示旧运行');
+  assert.equal(center.selectActiveAgentRunProjection({ ...projection, agents: [] }), null,
+    '没有子代理的新主线不展示上一轮代理');
+  const failed = { ...projection, agents: [], outcome: 'failed' };
+  assert.equal(center.selectActiveAgentRunProjection(failed), failed,
+    '失败 root 即使没有子代理也必须保留诊断与服务端动作');
+  assert.equal(center.selectActiveAgentRunProjection({ ...projection, root_task: { task_id: '' } }), null,
+    '缺少权威 root 身份不能展示运行');
+});
+
+// 用客户端 rune 编译执行真实 store，验证失效与导航会同步更新所有展示 getter。
+await withGoldenViteServer(async (server) => {
+  const { activeAgentRun } = await server.ssrLoadModule('/src/stores/active-agent-run.svelte.ts');
+  const store = await server.ssrLoadModule('/src/stores/agent-run-store.svelte.ts');
+  const { messagesState } = await server.ssrLoadModule('/src/stores/messages.svelte.ts');
+  const { setClientBridge } = await server.ssrLoadModule('/src/shared/bridges/bridge-runtime.ts');
+  const bridgeMessages = [];
+  setClientBridge({ postMessage: message => bridgeMessages.push(message), onMessage: () => () => {} });
+  const previousFetch = globalThis.fetch;
+  let actionResponse;
+  globalThis.fetch = async (url) => {
+    const path = new URL(String(url)).pathname;
+    if (path.endsWith('/agent-runs/action')) return actionResponse.promise;
+    const rootTaskId = path.split('/').at(-1);
+    return Response.json({
+      root_task: { task_id: rootTaskId, status: 'failed' },
+      agents: [agent({ rootTaskId, status: 'failed', lifecycle: 'failed' })],
+      tasks: [{ task_id: rootTaskId, status: 'failed' }],
+      pending_tasks: [], running_tasks: [], outcome: 'failed',
+      availableActions: ['archive'], failureSummary: 'model failed',
+    });
+  };
+  try {
+    messagesState.currentSessionId = 'session-a';
+    messagesState.currentWorkspaceId = 'workspace-a';
+    messagesState.currentWorkspacePath = '/workspace-a';
+    assert.equal(activeAgentRun.hasRun, false);
+    await store.fetchAgentRunProjection('session-a', 'root-a', 'workspace-a');
+    assert.equal(activeAgentRun.hasRun, true);
+    assert.equal(activeAgentRun.summary.attentionCount, 1);
+    assert.deepEqual([...activeAgentRun.availableActions], ['archive']);
+
+    store.clearAgentRunProjection('session-a', undefined, 'workspace-a');
+    assert.equal(activeAgentRun.hasRun, false, '底层清空必须立即移除旧视图，无需 effect 再同步');
+    assert.equal(activeAgentRun.summary.triggerCount, 0);
+    assert.deepEqual([...activeAgentRun.availableActions], []);
+    assert.deepEqual([...activeAgentRun.tasks], []);
+
+    await store.fetchAgentRunProjection('session-a', 'root-a', 'workspace-a');
+    messagesState.currentWorkspaceId = 'workspace-b';
+    assert.equal(activeAgentRun.hasRun, false, '同名会话在其他项目不能继承当前投影');
+    messagesState.currentWorkspaceId = 'workspace-a';
+    assert.equal(activeAgentRun.hasRun, true);
+
+    actionResponse = Promise.withResolvers();
+    const archiving = activeAgentRun.runAction('archive');
+    assert.equal(activeAgentRun.hasRun, true, '等待服务端回执时不得提前隐藏运行');
+    messagesState.currentSessionId = 'session-b';
+    assert.equal(activeAgentRun.hasRun, false, '切换会话不能显示旧会话的列表与动作');
+    await store.fetchAgentRunProjection('session-b', 'root-b', 'workspace-a');
+    actionResponse.reject(new Error('archive rejected'));
+    await archiving;
+    assert.equal(activeAgentRun.hasRun, true);
+    assert.equal(activeAgentRun.tasks[0].task_id, 'root-b');
+    assert.equal(activeAgentRun.actionError, null);
+    const incident = bridgeMessages.find(message => message.type === 'reportIncident').incident;
+    assert.equal(incident.sessionId, 'session-a', '迟到的归档失败必须记录在发起会话');
+    assert.equal(incident.workspaceId, 'workspace-a');
+
+    actionResponse = Promise.withResolvers();
+    const archived = activeAgentRun.runAction('archive');
+    actionResponse.resolve(Response.json({ action: 'archive', archived: true, sessionId: 'session-b', rootTaskId: 'root-b' }));
+    await archived;
+    assert.equal(activeAgentRun.hasRun, false, '归档成功后直接由权威缓存清空驱动视图');
+    assert.deepEqual([...activeAgentRun.availableActions], []);
+    messagesState.currentSessionId = 'session-a';
+    assert.equal(activeAgentRun.hasRun, true, '失败的归档保留原会话运行供重试');
+    assert.equal(activeAgentRun.actionError, 'archive rejected');
+  } finally {
+    store.clearAgentRunProjection();
+    globalThis.fetch = previousFetch;
+  }
+}, {
+  plugins: [{
+    name: 'active-agent-client-runes',
+    enforce: 'pre',
+    async transform(source, id) {
+      if (!id.endsWith('.svelte.ts')) return;
+      const { code } = await transformWithOxc(source, id, { lang: 'ts' });
+      return compileModule(code, { filename: id, generate: 'client', dev: true }).js;
+    },
+  }],
 });
 
 const read = (path) => readFile(new URL(path, import.meta.url), 'utf8');
@@ -214,11 +287,10 @@ assert.match(
   /shouldShowRuntimeSummary[\s\S]*normalizedRuntimeCompletedAt[\s\S]*normalizedRuntimeDurationMs[\s\S]*TurnRuntimeSummary/,
   '任务详情必须在终态渲染与主线一致的总耗时和结束时间',
 );
-assert.match(runStoreSource, /localStorage/, '运行视图必须按会话持久化用户归档标记');
 assert.doesNotMatch(
   runStoreSource,
-  /pinnedRootTaskId|readPersistedState[\s\S]*fetchAgentRunProjection\(/,
-  '不能从本地固定状态反向加载 root；root 选择只能由权威运行投影驱动',
+  /localStorage|pinnedProjection|dismissedRootTaskId|\$state|\$effect/,
+  '运行视图不能保存第二份投影或归档事实；清除和切换直接随底层投影生效',
 );
 assert.match(
   runStoreSource,
@@ -240,11 +312,6 @@ assert.doesNotMatch(
   `${runStoreSource}${agentRunStoreSource}`,
   /new_attempt|startedNewAttempt|newRootTaskId|composerAction|composerRunAction/,
   '运行视图只剩归档：继续与新的执行尝试都由 daemon 在会话级统一决定',
-);
-assert.match(
-  runStoreSource,
-  /await performAgentRunAction\([\s\S]*dismissedRootTaskId = rootTaskId/,
-  '只有后端归档成功后才能清理本地固定状态',
 );
 assert.match(
   runStoreSource,

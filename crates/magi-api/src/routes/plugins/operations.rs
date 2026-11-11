@@ -26,6 +26,15 @@ pub(super) struct LifecycleChange<'a> {
     reason: Option<&'a str>,
 }
 
+impl<'a> LifecycleChange<'a> {
+    pub(super) fn for_digest(expected_digest: Option<&'a str>) -> Self {
+        Self {
+            expected_digest,
+            ..Default::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

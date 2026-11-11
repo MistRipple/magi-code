@@ -3,13 +3,13 @@ import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DSH_FLOW } from '../core/scan.mjs';
 import { buildReport } from '../core/inspect.mjs';
-import { classify } from './catalog.mjs';
+import { classify, DSH_UNAVAILABLE_SERVICES } from './catalog.mjs';
 import { backendEntry, readPackage } from '../core/package.mjs';
 
 // 独立检查与在线安装使用同一产品准入范围；显式 required 仅用于分项诊断。
-const REQUIRED_CATEGORIES = Object.freeze(['llm', 'tools', 'commands', 'settings', 'runtime', 'hooks', 'session', 'services', 'prompt', 'native']);
+const REQUIRED_CATEGORIES = Object.freeze(['llm', 'tools', 'commands', 'settings', 'runtime', 'hooks', 'session', 'services', 'prompt', 'native', 'ui']);
 
-/** 原生模块：`.node`/`.wasm` 文件，或随包 `native/` 目录里有构建产物。 */
+/** 依赖宿主 ABI 的原生模块；WASM 由标准 Node/Web 运行时加载。 */
 function findNative(dir) {
   const found = [];
   const walk = (directory, depth) => {
@@ -19,7 +19,7 @@ function findNative(dir) {
       if (entry.name === 'node_modules' || entry.name === '.git') continue;
       const full = join(directory, entry.name);
       if (entry.isDirectory()) { if (depth < 4) walk(full, depth + 1); }
-      else if (/\.(node|wasm)$/.test(entry.name)) found.push(full.slice(dir.length + 1));
+      else if (/\.node$/.test(entry.name)) found.push(full.slice(dir.length + 1));
     }
   };
   if (existsSync(join(dir, 'native'))) walk(join(dir, 'native'), 0);
@@ -49,10 +49,10 @@ export function createDshTranslator(options = {}) {
       const mainFile = join(dir, backendEntry(pkg));
       const scanOptions = inspectOptions.directories || !existsSync(mainFile)
         ? { directories: inspectOptions.directories ?? ['src'], flow: DSH_FLOW }
-        : { entry: mainFile, flow: DSH_FLOW };
+        : { entry: mainFile, flow: DSH_FLOW, unavailableServices: DSH_UNAVAILABLE_SERVICES };
       const native = findNative(dir).map((file) => ({
         kind: 'native', name: file, category: 'native', status: 'dropped', target: '无',
-        note: 'Magi 扩展不支持包内原生模块或 WASM', count: 1, files: [file],
+        note: 'Magi 扩展不支持包内依赖宿主 ABI 的原生模块', count: 1, files: [file],
       }));
       return buildReport({
         translator: 'dsh', upstream: { name: pkg.name, version: pkg.version }, root: dir,

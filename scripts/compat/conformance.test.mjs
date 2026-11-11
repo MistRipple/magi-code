@@ -4,7 +4,7 @@ import { translateClientBusiness } from './install/client-business.mjs';
 import { createSessionComposerServices } from './runtime/client/session-composer.mjs';
 import { createComposerClient } from './runtime/client/composer.mjs';
 import vm from 'node:vm';
-import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
@@ -20,7 +20,8 @@ import { createHash } from 'node:crypto';
 import { create as createTar } from 'tar';
 import { installRegistryFetch } from './runtime/registry-fetch.mjs';
 import { prepareDsh } from './install/prepare.mjs';
-import { backendEntry } from './core/package.mjs';
+import { runRestricted, withTempHome } from './install/sandbox.mjs';
+import { backendEntry, settingsNamespace } from './core/package.mjs';
 import { createViewTransport } from './runtime/client/view-transport.mjs';
 import { createRouteFetch } from './runtime/client/route-fetch.mjs';
 import { createResourceUrls, resolveSrcset } from './runtime/client/resource-urls.mjs';
@@ -35,6 +36,23 @@ const temporary = async (t) => {
   return root;
 };
 const json = (file, value) => writeFile(file, JSON.stringify(value));
+
+test('原包 bundle 根入口身份用于设置寻址，不采用其他插件身份或歧义根入口', async t => {
+  const root = await temporary(t), pkg = { name: 'dsh-settings-owner', dsh: { bundle: { patch: 'entry.yml' } } };
+  await writeFile(join(root, 'entry.yml'), '- insert:\n    - {id: other, name: another-package}\n    - {id: actual-settings, name: dsh-settings-owner}\n');
+  assert.equal(settingsNamespace(root, pkg), 'actual-settings');
+  await writeFile(join(root, 'entry.yml'), '- insert:\n    - {id: one, name: dsh-settings-owner}\n    - {id: two, name: dsh-settings-owner}\n');
+  assert.throws(() => settingsNamespace(root, pkg), /多个本包根入口/);
+  assert.throws(() => settingsNamespace(root, { ...pkg, dsh: { bundle: { patch: '../outside.yml' } } }), /越界/);
+  assert.equal(settingsNamespace(root, { name: pkg.name }), pkg.name);
+});
+
+test('准备期拒绝已观察到的条件子模块启动失败，不把根 apply 成功当作完整启动', async t => {
+  const root = await temporary(t), upstream = join(root, 'upstream'); await mkdir(upstream);
+  await json(join(upstream, 'package.json'), { name: 'dsh-failed-child', version: '1.0.0', type: 'module', main: 'index.js', dsh: {} });
+  await writeFile(join(upstream, 'index.js'), `export function apply(ctx) { ctx.inject(['tools'], () => { throw new Error('REAL_CHILD_STARTUP_FAILURE'); }); }`);
+  await assert.rejects(prepareDsh({ upstreamDir: upstream, outDir: join(root, 'out'), sharedRoot: new URL('.', import.meta.url).pathname, source: {} }), /REAL_CHILD_STARTUP_FAILURE/);
+});
 
 test('原生资源地址绑定同一实例，保留静态 SDK、查询和模块相对依赖，不把资源 URL 当业务路径', async () => {
   const base='https://magi.example/api/plugins/acme/ui-v/digest/index.html';
@@ -52,6 +70,12 @@ test('原生资源地址绑定同一实例，保留静态 SDK、查询和模块�
   const fetchRoute=createRouteFetch(async input=>{calls.push(input);return {status:200,body:'ok'};},base,urls.restore);
   await fetchRoute(gateway+'runtime/data.json?q=1');
   assert.equal(calls[0].path,'/runtime/data.json');assert.equal(calls[0].query,'q=1');
+  await fetchRoute(new URL('business/catalog?q=2',base));
+  assert.equal(calls[1].path,'/business/catalog');assert.equal(calls[1].query,'q=2');
+  await fetchRoute('/business/root'); assert.equal(calls[2].path,'/business/root');
+  await assert.rejects(fetchRoute('https://other.example/api/plugins/acme/ui-v/digest/business'), /只能访问/);
+  assert.equal(calls.length,3,'其他 origin 不能通过文档目录恢复变成本插件调用');
+  assert.equal(urls.restore('https://magi.example/api/plugins/other/ui-v/digest/business').pathname,'/api/plugins/other/ui-v/digest/business');
   assert.throws(()=>createResourceUrls(base,'https://other.example/'),/入口无效/);
 });
 
@@ -262,6 +286,7 @@ test('原包封装只观察默认启动，扫描与运行共用条件导出，�
     assert.deepEqual(result.manifest.contributions.tools, []);
     assert.deepEqual(result.manifest.contributions.commands, []);
     assert.deepEqual(result.manifest.extension.hooks, [{ name: 'prompt.contribute', mode: 'advise' }]);
+    assert.ok(!result.manifest.permissions.some(permission => permission.kind === 'sessionWrite'), '设置、提示与页面不附带后端会话写入权');
     assert.ok(result.manifest.permissions.some(permission => permission.kind === 'storage' && permission.targets.includes('dsh-registered-settings')));
     assert.deepEqual(result.manifest.permissions.find(permission => permission.kind === 'pluginManagement').targets, ['lifecycle', 'background'], '单独重载只声明生命周期授权');
     assert.equal(await readFile(join(outDir, 'ui/client.js'), 'utf8'), client);
@@ -275,6 +300,26 @@ test('原包封装只观察默认启动，扫描与运行共用条件导出，�
     const archive = join(root, `${name}.zip`); packPlugin(outDir, archive); prepared.push(await readFile(archive));
   }
   assert.deepEqual(prepared[0], prepared[1]);
+  // 管理原包可请求安装与启停；新包授权继续由 Magi 的原生入口拥有。
+  await writeFile(join(upstream, 'index.js'), `export const inject=['pluginManager']; export function apply(ctx) { ctx.pluginManager.listBundles(); }`);
+  const manager = await prepareDsh({ upstreamDir: upstream, outDir: join(root, 'manager'), sharedRoot, source: { integrity: 'contract' } });
+  const management = manager.manifest.permissions.find(permission => permission.kind === 'pluginManagement');
+  assert.ok(management.targets.includes('install'));
+  assert.ok(management.targets.includes('lifecycle'));
+  assert.ok(!management.targets.includes('authorize'), '翻译入口不能给 DSH 管理插件默认代授权权力');
+  assert.ok(!manager.manifest.permissions.some(permission => permission.kind === 'sessionWrite'), '插件管理不附带会话写入权');
+  for (const [name, code, writes] of [
+    ['model', "export const inject=['llm']; export function apply(ctx) {}", false],
+    ['late-tool', "export function apply(ctx) { ctx.inject(['tools'], c => c.effect(() => () => {})); }", true],
+    ['command', "export const inject=['commands']; export function apply(ctx) {}", true],
+    ['service-handle', "export function apply(ctx) { const tools = ctx.get('tools'); if (!tools) throw new Error('tools unavailable'); }", true],
+    ['observed-tool', "export function apply(ctx) { const name = ['to', 'ols'].join(''); ctx.get(name).register({name:'observed',description:'observed',parameters:{type:'object'}}); }", true],
+  ]) {
+    await writeFile(join(upstream, 'index.js'), code);
+    const result = await prepareDsh({ upstreamDir: upstream, outDir: join(root, name), sharedRoot, source: { integrity: 'contract' } });
+    assert.deepEqual(result.manifest.permissions.find(permission => permission.kind === 'sessionWrite')?.targets,
+      writes ? ['context', 'wake'] : undefined, `${name} 按后端业务证据声明会话写入权`);
+  }
   assert.equal(backendEntry({ exports: { default: './first.js', node: './second.js' } }), 'first.js');
   for (const exports of ['../outside.js', { '.': { browser: './browser.js' } }]) assert.throws(() => backendEntry({ exports }), /入口/);
 });
@@ -330,6 +375,18 @@ test('真实 Cordis 方法与报告对齐；不存在的 Reflect 方法仍拒绝
   assert.equal(classify('imports', '@deepseek-ai/cordis/unknown-api').status, 'unknown');
 });
 
+test('受限记录允许检查正在运行的随包 Node 文件，仍拒绝用户文件、网络与子进程', async t => {
+  const root = await realpath(await temporary(t)), script = join(root, 'probe.mjs'), privateFile = join(root, 'private.txt');
+  await writeFile(privateFile, 'outside recorder');
+  await writeFile(script, `import {existsSync,readFileSync} from 'node:fs'; import {spawnSync} from 'node:child_process';
+    const result={node:existsSync(process.execPath)};
+    for (const [name,check] of [['file',()=>readFileSync(${JSON.stringify(privateFile)})],['process',()=>{const r=spawnSync(process.execPath,['--version']);if(r.error)throw r.error;}],['network',()=>fetch('https://example.com')]]) {
+      try {await check();result[name]='allowed';}catch(error){result[name]=error.code??error.cause?.code;}
+    } console.log(JSON.stringify(result));`);
+  const result = withTempHome(home => runRestricted({ script, args: [], readable: [script], home, label: 'Node 身份检查' }));
+  assert.deepEqual(JSON.parse(result), { node: true, file: 'ERR_ACCESS_DENIED', process: 'ERR_ACCESS_DENIED', network: 'ERR_ACCESS_DENIED' });
+});
+
 test('普通 DSH 依赖沿原包解析，共享 Cordis 仍保持单实例', async (t) => {
   const root = await temporary(t), shared = join(root, 'shared'), upstream = join(root, 'upstream');
   for (const path of [join(shared, 'node_modules/@deepseek-ai/cordis'), join(upstream, 'node_modules/@deepseek-ai/dsh-local-helper')]) await mkdir(path, { recursive: true });
@@ -343,6 +400,44 @@ test('普通 DSH 依赖沿原包解析，共享 Cordis 仍保持单实例', asyn
   const hooks = installSharedResolution(shared);
   try { assert.deepEqual((await import(join(upstream, 'entry.mjs'))).default, ['shared', 'local']); }
   finally { hooks.deregister(); }
+});
+
+test('原包 Schema peer 满足范围时复用发行库，精确旧版沿真实依赖图隔离', async t => {
+  const upstream = await temporary(t), shared = new URL('.', import.meta.url).pathname;
+  const name = '@deepseek-ai/schemastery';
+  const manifest = range => ({ name: 'schema-peer-consumer', version: '1.0.0', peerDependencies: { [name]: range }, peerDependenciesMeta: { [name]: { optional: true } } });
+  await json(join(upstream, 'package.json'), manifest('^3.18.1'));
+  const records = await installDependencies(upstream, shared, 'http://127.0.0.1:1');
+  assert.equal(records.length, 1);
+  assert.equal(records[0].name, name); assert.equal(records[0].host, true);
+  assert.equal(records[0].skipped, undefined);
+  await writeFile(join(upstream, 'entry.mjs'), `import Schema from '${name}'; export default Schema;`);
+  const original = await import(name);
+  const hooks = installSharedResolution(shared, { '@magi/compat-upstream-root': upstream });
+  try { assert.equal((await import(join(upstream, 'entry.mjs'))).default, original.default); }
+  finally { hooks.deregister(); }
+  const source = join(upstream, 'source'); await mkdir(source);
+  await json(join(source, 'package.json'), { name, version: '3.18.4', type: 'module', exports: { '.': './index.js', './package.json': './package.json' } });
+  await writeFile(join(source, 'index.js'), "export default 'isolated-schema';");
+  const archive = join(upstream, 'schema.tgz');
+  await createTar({ cwd: source, gzip: true, file: archive, prefix: 'package' }, ['package.json', 'index.js']);
+  const tarball = await readFile(archive), integrity = `sha512-${createHash('sha512').update(tarball).digest('base64')}`;
+  let registry;
+  const server = createServer((request, response) => {
+    if (request.url === '/schema.tgz') return response.end(tarball);
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({ name, 'dist-tags': { latest: '3.18.4' }, versions: { '3.18.4': { name, version: '3.18.4', dist: { tarball: registry + '/schema.tgz', integrity } } } }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
+  registry = `http://127.0.0.1:${server.address().port}`;
+  await json(join(upstream, 'package.json'), { name: 'schema-consumer', version: '1.0.0', dependencies: { [name]: '3.18.4' } });
+  assert.deepEqual(await installDependencies(upstream, shared, registry), [{ name, version: '3.18.4', integrity, host: false, isolated: true }]);
+  await writeFile(join(upstream, 'isolated.mjs'), `import Schema from '${name}'; import metadata from '${name}/package.json' with { type: 'json' }; export default [Schema,metadata.version];`);
+  const isolated = installSharedResolution(shared, { '@magi/compat-upstream-root': upstream });
+  try { assert.deepEqual((await import(join(upstream, 'isolated.mjs'))).default, ['isolated-schema', '3.18.4']); }
+  finally { isolated.deregister(); }
+  assert.equal((await import(name)).default, original.default, '隔离副本不能改变宿主 Schema');
 });
 
 test('Cordis peer 在线隔离安装，主入口、子路径和 CJS 元数据使用同一版本，宿主不被污染', async (t) => {
@@ -625,4 +720,13 @@ test('DSH 草稿端口拒绝同步真值、跨会话/伪造身份，并在宿主
   facade.conversation.releaseDraftAttachment(draft.id);
   assert.deepEqual(facade.conversation.resolveDraftAttachments([draft.id]),[]);
   facade.dispose(); assert.throws(()=>input.snapshot,/失效|不属于/);
+});
+test('客户端业务适配不再把 DSH 草稿和提交改写为另一种消息业务', async () => {
+  const { translateClientBusiness } = await import('./install/client-business.mjs');
+  const source = `function apply(ctx){ctx.slots.register({name:'conversation.chat.node',key:'assistant-step'},
+    function Reply(props){return {execute:()=>{props.inputActions.setDraft('followup');props.inputActions.submit();}}});}`;
+  const translated = translateClientBusiness(source);
+  assert.equal(translated.code, source);
+  assert.deepEqual(translated.composerTargets, []);
+  assert.equal(translated.changedFunctions, 0);
 });

@@ -839,7 +839,6 @@ pub(super) fn restore_agent_turn_threads(state: &mut SessionStoreState) -> Domai
             last_used_at: turn.completed_at.unwrap_or(turn.accepted_at),
             observed_context_window_tokens: None,
             handled_task_ids: vec![binding.task_id],
-            message_history: vec![],
         });
     }
     Ok(())
@@ -1233,11 +1232,11 @@ pub(super) fn interaction_turn_is_current_or_recoverable(
         .runtime_sidecars
         .iter()
         .find(|sidecar| sidecar.session_id == turn.session_id)
-        .and_then(|sidecar| sidecar.current_turn.as_ref())
+        .and_then(|sidecar| sidecar.current_turn_id.as_deref())
     else {
         return Ok(false);
     };
-    if current_turn.turn_id == turn.turn_id {
+    if current_turn == turn.turn_id {
         return Ok(true);
     }
     if turn.agent_turn_binding()?.is_none() {
@@ -1260,7 +1259,7 @@ pub(super) fn interaction_turn_is_current_or_recoverable(
             })
             .ok_or_else(|| invalid("Agent Turn 父轮缺失"))?;
     }
-    Ok(source.turn_id == current_turn.turn_id
+    Ok(source.turn_id == current_turn
         && source.status == CanonicalTurnStatus::Interrupted
         && source.items.iter().any(|item| {
             item.metadata.get("noticeKind").and_then(Value::as_str) == Some("session_interrupted")

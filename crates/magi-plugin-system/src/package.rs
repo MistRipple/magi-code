@@ -7,8 +7,9 @@ use std::{
     sync::OnceLock,
 };
 
-pub const MAX_PACKAGE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_UNPACKED_BYTES: usize = 32 * 1024 * 1024;
+/// 与上游下载及准备阶段采用同一 64 MiB 容量，容纳原包资源及共享页面产物。
+pub const MAX_PACKAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_UNPACKED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
 /// 浏览器与 Node 的构建产物均可包含完整依赖；仍受归档与解压总量约束。
 pub const MAX_SCRIPT_BYTES: usize = 16 * 1024 * 1024;
@@ -96,6 +97,8 @@ impl PluginPackage {
         let mut manifest: PluginManifest = serde_json::from_slice(manifest_bytes)
             .map_err(|_| invalid("manifest.json 不符合插件合同"))?;
         validate_manifest(&manifest)?;
+        // 资源准入遵循公共 Node extension 合同，不按上游生态区别授权。
+        // validate_manifest 要求 full-trust；下方核对入口和 extension 目录归属。
         annotate_settings_order(&mut manifest, manifest_bytes);
         // 声明 extension 的包必须携带入口；纯声明式包（技能、视图、资源、浏览器 surface）不携带任何可执行文件。
         if manifest.extension.is_some() != files.contains_key("extension/index.mjs") {
@@ -250,10 +253,11 @@ fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
                     | PluginPermissionKind::ContextRewrite
                     | PluginPermissionKind::ModelSources
                     | PluginPermissionKind::PluginManagement
-                    | PluginPermissionKind::SessionRead
                     | PluginPermissionKind::SessionWrite
                     | PluginPermissionKind::Attachments
-            )
+                    | PluginPermissionKind::WebProviders
+            ) || (permission.kind == PluginPermissionKind::SessionRead
+                && permission.targets.iter().any(|target| target != "render"))
         }) {
             return Err(invalid(
                 "extension / contextRewrite / modelSources / pluginManagement / sessionRead / attachments 权限只能由声明了 extension 的包使用",
@@ -371,6 +375,15 @@ fn validate_manifest_with_limits(
         }
     }
     for permission in &manifest.permissions {
+        if permission.kind == PluginPermissionKind::WebProviders
+            && (permission.targets.is_empty()
+                || permission
+                    .targets
+                    .iter()
+                    .any(|target| !matches!(target.as_str(), "search" | "fetch")))
+        {
+            return Err(invalid("webProviders 权限只允许 search 与 fetch"));
+        }
         if permission.kind == PluginPermissionKind::Client
             && (permission.targets.as_slice() != ["persistent"]
                 || manifest.contributions.client.is_none())
@@ -385,9 +398,13 @@ fn validate_manifest_with_limits(
             return Err(invalid("attachments 权限当前只允许 images"));
         }
         if permission.kind == PluginPermissionKind::SessionRead
-            && permission.targets.as_slice() != ["directory"]
+            && (permission.targets.is_empty()
+                || permission
+                    .targets
+                    .iter()
+                    .any(|target| !matches!(target.as_str(), "directory" | "render")))
         {
-            return Err(invalid("sessionRead 权限当前只允许 directory"));
+            return Err(invalid("sessionRead 权限只允许 directory 与 render"));
         }
         if permission.kind == PluginPermissionKind::SessionWrite
             && (permission.targets.is_empty()
@@ -528,6 +545,17 @@ fn validate_manifest_with_limits(
             && !view.placements.contains(&PluginViewPlacement::Main)
         {
             return Err(invalid("主页入口必须同时声明主内容区页面"));
+        }
+        if view.placements.iter().any(|placement| {
+            matches!(
+                placement,
+                PluginViewPlacement::ComposerLeft | PluginViewPlacement::ChatAssistant
+            )
+        }) && !manifest.permissions.iter().any(|permission| {
+            permission.kind == PluginPermissionKind::SessionRead
+                && permission.targets.iter().any(|target| target == "render")
+        }) {
+            return Err(invalid("会话内视图必须声明 sessionRead:[render] 授权"));
         }
     }
     // 主页卡片是显式声明的嵌入视图；数量受限，避免一个插件占满主页。
@@ -721,8 +749,7 @@ fn validate_file(name: &str, bytes: &[u8]) -> Result<(), PluginError> {
         extension,
         "html" | "css" | "js" | "mjs" | "cjs" | "json" | "svg"
     );
-    // 扩展代码树：入口 extension/index.mjs 及其依赖的 JS／JSON 文件。仍是纯文本源码，
-    // 原生程序、字节码与 WASM 由下面的文件头检查拒绝。
+    // 原生扩展代码仍为文本；受信原包资源的准入还需核对清单与 full-trust。
     let upstream_asset = name.starts_with("extension/upstream/");
     let extension_code =
         name.starts_with("extension/") && matches!(extension, "js" | "mjs" | "cjs" | "json");
@@ -753,24 +780,22 @@ fn validate_file(name: &str, bytes: &[u8]) -> Result<(), PluginError> {
     {
         return Err(invalid("发布包含未允许的文件类型或入口"));
     }
-    // 上游翻译包可在明确的 extension/upstream/native/ 目录携带当前平台的
-    // full-trust 辅助程序（翻译器已在安装期剔除其他平台文件）。普通插件
-    // 仍然不能借发布包携带原生程序。
-    let native_asset = name.starts_with("extension/upstream/native/");
-    if !native_asset
-        && (bytes.starts_with(b"MZ")
-            || bytes.starts_with(b"\x7fELF")
-            || bytes.starts_with(b"\0asm")
-            || bytes.starts_with(b"\xfe\xed\xfa")
-            || bytes.starts_with(b"\xcf\xfa\xed\xfe")
-            || bytes.starts_with(b"\xca\xfe\xba\xbe"))
-    {
+    if !upstream_asset && executable_payload(bytes) {
         return Err(invalid("发布包不得包含原生程序、字节码或 WASM 后台组件"));
     }
     if text && std::str::from_utf8(bytes).is_err() {
         return Err(invalid("插件文本资源必须使用 UTF-8"));
     }
     Ok(())
+}
+
+fn executable_payload(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"MZ")
+        || bytes.starts_with(b"\x7fELF")
+        || bytes.starts_with(b"\0asm")
+        || bytes.starts_with(b"\xfe\xed\xfa")
+        || bytes.starts_with(b"\xcf\xfa\xed\xfe")
+        || bytes.starts_with(b"\xca\xfe\xba\xbe")
 }
 
 /// 图标体积上限。图标只用于列表和标题展示，不需要大图。

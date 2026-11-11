@@ -767,7 +767,7 @@ mod tests {
             })).unwrap()
         };
         let child = task(TaskStatus::Failed, vec!["model invocation failed".into()]);
-        let sessions = SessionStore::from_state(SessionStoreState {
+        let sessions = SessionStore::from_state_for_test(SessionStoreState {
             canonical_turns: vec![
                 make_turn(&session, &thread, child.task_id.as_str(), "original"),
                 make_turn(&session, &thread, "sibling-task", "sibling"),
@@ -795,7 +795,6 @@ mod tests {
                 last_used_at: UtcMillis(2),
                 observed_context_window_tokens: None,
                 handled_task_ids: vec![child.task_id.clone()],
-                message_history: vec![],
             }],
             ..Default::default()
         });

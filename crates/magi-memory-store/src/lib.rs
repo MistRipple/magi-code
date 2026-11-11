@@ -1,7 +1,5 @@
-mod compaction;
 mod extraction;
 mod history;
-mod preferences;
 mod query;
 
 #[cfg(test)]
@@ -34,18 +32,7 @@ pub struct MemoryRecord {
     pub layer: MemoryLayer,
     pub content: String,
     pub provenance: Option<MemoryProvenance>,
-    pub compacted: bool,
     pub created_at: UtcMillis,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PreferenceMemoryRecord {
-    pub preference_id: String,
-    pub session_id: SessionId,
-    pub key: String,
-    pub value: String,
-    pub provenance: Option<MemoryProvenance>,
-    pub updated_at: UtcMillis,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,27 +88,10 @@ pub struct MemoryQuery {
     pub limit: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemoryCompactionSummary {
-    pub session_id: SessionId,
-    pub merged_ids: Vec<String>,
-    pub retained_id: String,
-    pub affected_count: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemoryCompactionRecord {
-    pub session_id: SessionId,
-    pub summary: MemoryCompactionSummary,
-    pub created_at: UtcMillis,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct MemoryStore {
     entries: Arc<RwLock<HashMap<String, MemoryRecord>>>,
-    preferences: Arc<RwLock<HashMap<String, PreferenceMemoryRecord>>>,
     extraction_results: Arc<RwLock<HashMap<String, MemoryExtractionRecord>>>,
-    compaction_history: Arc<RwLock<Vec<MemoryCompactionRecord>>>,
 }
 
 impl MemoryStore {

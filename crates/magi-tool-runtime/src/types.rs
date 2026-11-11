@@ -286,6 +286,12 @@ pub type PluginToolExecutor = Arc<
         + Sync
         + 'static,
 >;
+/// 原生联网工具的插件提供方；None 表示当前由原生实现执行。
+pub type WebProviderExecutor = Arc<
+    dyn Fn(&str, &str, &ToolExecutionContext, &std::sync::atomic::AtomicBool) -> Option<String>
+        + Send
+        + Sync,
+>;
 pub type ExternalMcpToolExecutor =
     Arc<dyn Fn(&str, &str, &str) -> (String, ExecutionResultStatus) + Send + Sync + 'static>;
 pub type AgentRoleCatalogProvider =
@@ -482,6 +488,7 @@ pub struct RuntimeCapabilityDependencyEntry {
 /// daemon 进程内的共享服务引用，由 ToolRegistry 持有并在 dispatch 时传入。
 #[derive(Clone, Default)]
 pub struct ToolRuntimeResources {
+    pub web_provider_executor: Option<WebProviderExecutor>,
     pub background_job_journal: Option<Arc<dyn crate::BackgroundJobJournal>>,
     /// 单次执行的取消信号；注册表默认资源不持有该信号。
     pub cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,

@@ -12,8 +12,6 @@ import type {
   VisionBuiltinTextModelRule,
 } from '../shared/settings-bootstrap';
 import type {
-  IncidentNotificationItemDto,
-  NotificationCenterSnapshotDto,
   NotificationsResponseDto,
   SessionInterruptResponseDto,
   SessionToolApprovalResponseDto,
@@ -128,12 +126,6 @@ function normalizeUnavailableSessions(value: unknown): AgentUnavailableSession[]
       reason: typeof record.reason === 'string' ? record.reason : '',
     }];
   });
-}
-
-export interface AgentWorkspacePickResult {
-  cancelled: boolean;
-  rootPath: string | null;
-  name: string | null;
 }
 
 export interface AgentWorkspaceRegistrationResult {
@@ -432,6 +424,10 @@ export interface ModelPerformanceStats {
   lastObservedAt: number;
   lastTtftMs: number | null;
   lastTps: number | null;
+  responseSampleCount?: number;
+  responseOutputTokens?: number;
+  responseDurationMs?: number;
+  lastResponseTps?: number | null;
 }
 
 export interface PromptCacheStats {
@@ -446,6 +442,7 @@ export interface PromptCacheStats {
 }
 
 export interface AgentExecutionStatsItem {
+  pluginId?: string | null;
   tokenObservedCallCount?: number;
   performance?: ModelPerformanceStats;
   inputTokens?: number;
@@ -499,10 +496,6 @@ export interface AgentExecutionStatsPayload {
   items: AgentExecutionStatsItem[];
   models: AgentExecutionModelStatsItem[];
 }
-
-// 通知中心直接复用 Rust incident 契约，前端不再维护旧会话通知镜像类型。
-export type AgentIncidentNotificationRecord = IncidentNotificationItemDto;
-export type AgentNotificationCenterSnapshot = NotificationCenterSnapshotDto;
 export type AgentNotificationsPayload = NotificationsResponseDto;
 
 
@@ -1283,44 +1276,6 @@ export async function createBrowserTab(
   return parseAgentJson<BrowserTabSnapshot>(response, 'create browser tab');
 }
 
-const BROWSER_TAB_READY_POLL_INTERVAL_MS = 100;
-const BROWSER_TAB_READY_TIMEOUT_MS = 30_000;
-
-/**
- * 创建 Browser Tab 的 HTTP 请求只提交逻辑 Tab，Chromium Page 由 Host 异步物化。
- * 创建后的首个 authority 事件可能早于当前会话切换完成，因此这里以权威快照作为
- * 创建链路的确定性收敛点，不把 UI 是否刚好订阅到某个事件作为 ready 的前提。
- */
-export async function waitForBrowserTabReady(
-  browserSessionId: string,
-  tabId: string,
-): Promise<BrowserSessionSnapshot> {
-  const deadline = Date.now() + BROWSER_TAB_READY_TIMEOUT_MS;
-  let lastError: unknown = null;
-  while (Date.now() <= deadline) {
-    try {
-      const snapshot = await getBrowserSession(browserSessionId);
-      const tab = snapshot.tabs.find((candidate) => candidate.tabId === tabId);
-      if (!tab) {
-        throw new Error(`browser_tab_not_found:${tabId}`);
-      }
-      if (tab.lifecycle !== 'creating') {
-        return snapshot;
-      }
-      lastError = null;
-    } catch (error) {
-      lastError = error;
-    }
-    await new Promise<void>((resolve) => {
-      globalThis.setTimeout(resolve, BROWSER_TAB_READY_POLL_INTERVAL_MS);
-    });
-  }
-  if (lastError instanceof Error) {
-    throw lastError;
-  }
-  throw new Error(`browser_tab_ready_timeout:${tabId}`);
-}
-
 export async function activateBrowserTab(tabId: string): Promise<BrowserSessionSnapshot> {
   const response = await getTransport().request(
     agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/activate`),
@@ -1411,37 +1366,6 @@ export async function createBrowserAnnotation(
   return parseAgentJson<BrowserAnnotationSnapshot>(response, 'create browser annotation');
 }
 
-export function createBrowserElementAnnotation(
-  tabId: string,
-  selection: Omit<Extract<BrowserAnnotationSelection, { kind: 'element' }>, 'kind'>,
-  comment: string,
-): Promise<BrowserAnnotationSnapshot> {
-  return createBrowserAnnotation(tabId, { kind: 'element', ...selection }, comment);
-}
-
-export function createBrowserRegionAnnotation(
-  tabId: string,
-  selection: Omit<Extract<BrowserAnnotationSelection, { kind: 'region' }>, 'kind'>,
-  comment: string,
-): Promise<BrowserAnnotationSnapshot> {
-  return createBrowserAnnotation(tabId, { kind: 'region', ...selection }, comment);
-}
-
-export async function updateBrowserAnnotationStatus(
-  annotationId: string,
-  status: BrowserAnnotationStatus,
-): Promise<BrowserAnnotationSnapshot> {
-  const response = await getTransport().request(
-    agentUrl(`/api/browser/annotations/${encodeURIComponent(annotationId)}/status`),
-    {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ status }),
-    },
-  );
-  return parseAgentJson<BrowserAnnotationSnapshot>(response, 'update browser annotation');
-}
-
 export async function updateBrowserAnnotationComment(
   annotationId: string,
   comment: string,
@@ -1484,14 +1408,6 @@ export function resolveBrowserAnnotationArtifactUrl(
     throw new Error('浏览器标记预览缺少有效的 annotationId 或 sessionId');
   }
   return browserAnnotationArtifactUrlForSession(normalizedAnnotationId, normalizedSessionId);
-}
-
-export function isWebAgentMode(): boolean {
-  if (typeof window === 'undefined') {
-    return false;
-  }
-  const currentUrl = new URL(window.location.href);
-  return currentUrl.pathname === '/web.html' || currentUrl.pathname.startsWith('/assets/');
 }
 
 function buildBoundQuery(
@@ -1758,18 +1674,6 @@ export async function removeAgentWorkspace(workspaceId: string): Promise<AgentWo
       return await listAgentWorkspaces();
     }
     return [];
-  } catch (error) {
-    if (error instanceof TypeError) {
-      throw new Error(i18n.t('bridge.agentUnreachable'));
-    }
-    throw error;
-  }
-}
-
-export async function pickAgentWorkspace(): Promise<AgentWorkspacePickResult> {
-  try {
-    const response = await getTransport().request(agentUrl('/api/workspaces/pick'));
-    return await parseAgentJson<AgentWorkspacePickResult>(response, 'pick workspace');
   } catch (error) {
     if (error instanceof TypeError) {
       throw new Error(i18n.t('bridge.agentUnreachable'));
@@ -2693,23 +2597,6 @@ export async function listAgentSessionWorkspaceWaits(): Promise<WorkspaceWaitLis
   return parseAgentJson<WorkspaceWaitListResponseDto>(response, 'list session workspace waits');
 }
 
-export async function getAgentSessionIsolation(
-  sessionId: string,
-  binding?: { workspaceId?: string; workspacePath?: string; sourceFolderId?: string },
-): Promise<SessionIsolationResponseDto> {
-  const normalized = requireIsolationSessionId(sessionId, 'load session isolation');
-  const query = buildBoundQueryWithOverride(
-    {},
-    isolationBinding(normalized, binding),
-    { includeScope: false, includeSession: true },
-  );
-  const response = await getTransport().request(
-    agentUrl('/api/session/isolation', query),
-    { cache: 'no-store' },
-  );
-  return parseAgentJson<SessionIsolationResponseDto>(response, 'load session isolation');
-}
-
 export async function enableAgentSessionIsolation(
   sessionId: string,
   binding?: { workspaceId?: string; workspacePath?: string; sourceFolderId?: string },
@@ -2823,11 +2710,6 @@ export async function loadAgentToolCatalogDiagnostics(
     }
     throw error;
   }
-}
-
-export async function getAgentStatus(): Promise<Record<string, unknown>> {
-  const response = await getTransport().request(agentUrl('/api/status'));
-  return parseAgentJson<Record<string, unknown>>(response, 'get status');
 }
 
 export async function resetAgentExecutionStats(): Promise<Record<string, unknown>> {
@@ -3312,11 +3194,6 @@ export async function upsertAgentRegistryBinding(agent: AgentBinding): Promise<A
   return Array.isArray(payload.agents) ? payload.agents : [];
 }
 
-export async function removeAgentRegistryBinding(templateId: string): Promise<AgentBinding[]> {
-  const payload = await postGlobalJson<{ agents?: AgentBinding[] }>('/api/settings/registry/agents/remove', { templateId }, 'remove registry agent');
-  return Array.isArray(payload.agents) ? payload.agents : [];
-}
-
 export async function resolveAgentModelReasoning(config: Record<string, unknown>, model: string): Promise<import('../shared/rust-backend-types').ModelReasoningCapability> {
   return await postGlobalJson('/api/settings/models/reasoning', { config, model }, 'resolve model reasoning');
 }
@@ -3457,29 +3334,6 @@ export interface AgentKnowledgeRelationsResponse {
   truncated: boolean;
 }
 
-export async function listAgentKnowledgeItems(
-  kind?: AgentKnowledgeKind,
-  bindingOverride?: AgentBindingOverride,
-): Promise<Record<string, unknown>> {
-  const params: Record<string, string> = {};
-  if (kind) params.kind = kind;
-  const query = buildBoundQueryWithOverride(params, bindingOverride, { includeSession: false });
-  const response = await getTransport().request(agentUrl('/api/knowledge/items', query));
-  return await parseAgentJson<Record<string, unknown>>(response, 'list knowledge items');
-}
-
-export async function searchAgentKnowledgeItems(
-  keyword: string,
-  kind?: AgentKnowledgeKind,
-  bindingOverride?: AgentBindingOverride,
-): Promise<Record<string, unknown>> {
-  const params: Record<string, string> = { q: keyword };
-  if (kind) params.kind = kind;
-  const query = buildBoundQueryWithOverride(params, bindingOverride, { includeSession: false });
-  const response = await getTransport().request(agentUrl('/api/knowledge/items/search', query));
-  return await parseAgentJson<Record<string, unknown>>(response, 'search knowledge items');
-}
-
 export async function addAgentKnowledgeItem(
   payload: AgentKnowledgeItemPayload,
   bindingOverride?: AgentBindingOverride,
@@ -3583,11 +3437,6 @@ export async function deleteAgentKnowledgeRelation(
   );
 }
 
-export async function loadAgentMcpServers(): Promise<Record<string, unknown>> {
-  const response = await getTransport().request(agentUrl('/api/settings/mcp'));
-  return await parseAgentJson<Record<string, unknown>>(response, 'load mcp servers');
-}
-
 export async function addAgentMcpServer(server: Record<string, unknown>): Promise<Record<string, unknown>> {
   return await postGlobalJson<Record<string, unknown>>('/api/settings/mcp/add', normalizeMcpServerConfig(server), 'add mcp server');
 }
@@ -3618,11 +3467,6 @@ export async function connectAgentMcpServer(serverId: string): Promise<Record<st
 
 export async function disconnectAgentMcpServer(serverId: string): Promise<Record<string, unknown>> {
   return await postGlobalJson<Record<string, unknown>>('/api/settings/mcp/disconnect', { serverId }, 'disconnect mcp server');
-}
-
-export async function loadAgentRepositories(): Promise<Record<string, unknown>> {
-  const response = await getTransport().request(agentUrl('/api/settings/repositories'));
-  return await parseAgentJson<Record<string, unknown>>(response, 'load repositories');
 }
 
 export async function addAgentRepository(url: string): Promise<Record<string, unknown>> {

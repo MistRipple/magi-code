@@ -580,11 +580,12 @@ pub fn resolve_vision_execution_config(
         return Ok(None);
     }
     // 数据源条目明确声明了输入模态时以声明为准；未声明才回到文本模型规则。
-    let declared_accepts_images = settings_store
-        .zip(selected_source_id)
-        .and_then(|(store, source_id)| {
-            crate::main_model_sources::declared_image_input(store, source_id, selected_model)
-        });
+    let declared_accepts_images =
+        settings_store
+            .zip(selected_source_id)
+            .and_then(|(store, source_id)| {
+                crate::main_model_sources::declared_image_input(store, source_id, selected_model)
+            });
     let text_only = match declared_accepts_images {
         Some(accepts_images) => !accepts_images,
         None => model_matches_text_model_rule(settings_store, selected_model),
@@ -801,6 +802,18 @@ pub fn resolve_orchestrator_model_config(
     NormalizedModelConfig::from_settings_with_catalog(settings_store, &config)
 }
 
+/// 只有目录和来源选择都不存在时才可使用宿主注入的客户端；损坏或失效的配置必须报错。
+pub(crate) fn has_orchestrator_model_config(
+    store: &magi_settings_store::SettingsStore,
+    session_id: Option<&SessionId>,
+) -> Result<bool, String> {
+    Ok(crate::main_model_sources::is_configured(store)?
+        || orchestrator_selection(store, session_id)
+            .get("sourceId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty()))
+}
+
 /// 扩展的 `credential.ref` / `model.invoke` 只能使用角色绑定的独立引擎，或继承用户配置的主对话数据源；
 /// 插件贡献的主对话数据源（`plugin/`）只服务于主对话，不对扩展调用开放。
 pub fn ensure_extension_model_source(
@@ -813,11 +826,7 @@ pub fn ensure_extension_model_source(
     {
         return Ok(());
     }
-    let selected_source = orchestrator_selection(settings_store, Some(session_id))
-        .get("sourceId")
-        .and_then(Value::as_str)
-        .is_some_and(|id| !id.is_empty());
-    if !crate::main_model_sources::is_configured(settings_store) && !selected_source {
+    if !has_orchestrator_model_config(settings_store, Some(session_id))? {
         return Ok(());
     }
     let config = resolve_orchestrator_model_config(settings_store, Some(session_id))?;
@@ -828,36 +837,6 @@ pub fn ensure_extension_model_source(
         return Err("插件模型数据源只能用于主对话，扩展调用不能使用".into());
     }
     Ok(())
-}
-
-/// 角色绑定的引擎 id（角色不存在或未绑定引擎时返回 `None`）。
-pub fn role_bound_engine_id(
-    settings_store: &magi_settings_store::SettingsStore,
-    role_id: &str,
-) -> Option<String> {
-    role_engine_binding(settings_store, role_id).map(|binding| binding.engine_id)
-}
-
-pub fn ensure_orchestrator_reasoning_effort(config: &mut serde_json::Value) {
-    if !config.is_object() {
-        *config = serde_json::json!({});
-    }
-    let serde_json::Value::Object(config) = config else {
-        return;
-    };
-    let is_valid = config.get("reasoningEffort") == Some(&Value::Null)
-        || config
-            .get("reasoningEffort")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| {
-                matches!(
-                    value.trim(),
-                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
-                )
-            });
-    if !is_valid {
-        config.insert("reasoningEffort".to_string(), serde_json::Value::Null);
-    }
 }
 
 /// 把会话级覆盖（仅 `model` / `reasoningEffort`）叠加到全局 orchestrator base 上。

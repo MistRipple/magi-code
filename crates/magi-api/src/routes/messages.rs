@@ -253,7 +253,7 @@ mod tests {
     use magi_governance::GovernanceService;
     use magi_session_store::{
         SessionDurableState, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
-        SessionRuntimeSidecar, SessionStore, TimelineEntryKind,
+        SessionRuntimeSidecarState, SessionStore, TimelineEntryKind,
     };
     use magi_workspace::WorkspaceStore;
     use std::fs;
@@ -473,14 +473,14 @@ mod tests {
                 thread_registry: Vec::new(),
             },
             SessionExecutionSidecarStoreState {
-                runtime_sidecars: vec![SessionRuntimeSidecar {
+                runtime_sidecars: vec![SessionRuntimeSidecarState {
                     session_id: session_id.clone(),
                     ownership: ExecutionOwnership {
                         workspace_id: Some(WorkspaceId::new("workspace-sidecar-only")),
                         ..ExecutionOwnership::default()
                     },
                     recovery_id: None,
-                    current_turn: None,
+                    current_turn_id: None,
                     active_execution_chain: None,
                     status: SessionExecutionSidecarStatus::Bound,
                     updated_at: now,

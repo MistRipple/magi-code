@@ -1,10 +1,10 @@
 import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
-import { getClientKind, vscode } from "../lib/vscode-bridge";
+import { vscode } from "../lib/vscode-bridge";
 import { onMount, untrack } from "svelte";
 import type { StandardMessage } from "../shared/protocol/message-protocol";
 import { MessageCategory } from "../shared/protocol/message-protocol";
 import { ensureArray } from "../lib/utils";
-import { aggregateUsageStatsForDisplay } from "../lib/usage-stats-aggregation";
+import { aggregateUsageStatsForDisplay, usageStatsDisplayKey } from "../lib/usage-stats-aggregation";
 import { i18n } from "./i18n.svelte";
 import { isSupportedLocale } from "../i18n/locales";
 import { chooseAction, confirmMessage } from "./confirm-dialog.svelte";
@@ -31,7 +31,7 @@ import {
   getAgentSettingsBootstrap,
   installAgentLocalSkill,
   installAgentSkill,
-  isWebAgentMode,
+
   listAgentRegistryAgents,
   listAgentRegistryEngines,
   listAgentRoleTemplates,
@@ -306,7 +306,6 @@ export interface LibrarySkill {
 }
 
 function createSettingsStore(props: { onClose?: () => void; isActive?: () => boolean }) {
-  const isWebMode = isWebAgentMode();
   type SettingsBootstrapScope = "core" | "full";
 
   interface Props {
@@ -314,7 +313,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   }
 
   let { onClose }: Props = props;
-  const clientKind = getClientKind();
 
   // 设置视图会在后台保活。它不可见时不能做统计这类重活：执行统计接口要遍历整本
   // 审计/用量账本，而 executionStatsUpdate 会随每次模型用量推送，后台每推一次就重算一次，
@@ -350,7 +348,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   let totalInputTokens = $state(0);
   let totalOutputTokens = $state(0);
   let totalTokens = $derived(totalInputTokens + totalOutputTokens);
-  let userInfo = $state("");
   let showResetConfirm = $state(false);
 
   // 全局用户规则
@@ -1359,6 +1356,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     return {
       worker,
       totalExecutions: stats.totalExecutions,
+      tokenObservedCallCount: stats.tokenObservedCallCount,
       assignmentCount: stats.assignmentCount,
       successCount: stats.successCount,
       failureCount: stats.failureCount,
@@ -1397,10 +1395,10 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       keys.add(key);
     }
 
-    // 自定义角色只在产生过真实用量后追加，且不改变内置角色的固定顺序。
+    // 自定义角色和插件按真实用量追加，保留内置角色的固定顺序。
     for (const item of executionStats) {
-      if (item.role === "worker" && item.templateId.trim()) {
-        keys.add(item.templateId);
+      if (item.pluginId || item.role === "worker" && item.templateId.trim()) {
+        keys.add(usageStatsDisplayKey(item));
       }
     }
     return Array.from(keys);
@@ -1867,10 +1865,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
 
   function cancelResetStats() {
     showResetConfirm = false;
-  }
-
-  function logout() {
-    vscode.postMessage({ type: "logout" });
   }
 
   /** 还没保存的模型配置草稿。新建且尚未填写任何连接信息的引擎不算。 */
@@ -3196,40 +3190,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       return;
     }
     localSkillInstallError = "";
-    if (isWebMode) {
-      showLocalSkillFolderPicker = true;
-    } else {
-      localSkillInstalling = true;
-      try {
-        const result = await installAgentLocalSkill();
-        localSkillInstalling = false;
-        if ((result as any)?.canceled === true) {
-          localSkillInstallError = "";
-        } else if ((result as any)?.success !== false) {
-          localSkillInstallError = "";
-          const bootstrapPayload = await fetchCurrentSettingsBootstrap();
-          if (bootstrapPayload) {
-            applyFreshSettingsBootstrapPayload(bootstrapPayload);
-          }
-          showSkillLibraryDialogState = false;
-          notifySettingsSuccess(i18n.t("settings.toast.localSkillInstalled"));
-        } else {
-          localSkillInstallError = i18n.t(
-            "settings.skillLibrary.localImportFailed",
-          );
-        }
-      } catch (e) {
-        console.error("[SettingsPanel] 本地安装 Skill 失败:", e);
-        localSkillInstalling = false;
-        localSkillInstallError = i18n.t(
-          "settings.skillLibrary.localImportFailed",
-        );
-        notifySettingsError(
-          i18n.t("settings.toast.action.installLocalSkill"),
-          e,
-        );
-      }
-    }
+    showLocalSkillFolderPicker = true;
   }
 
   async function handleLocalSkillFolderSelected(
@@ -4064,9 +4025,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
 
   return {
     refreshOnShow,
-    get clientKind() {
-      return clientKind;
-    },
     get activeTab() {
       return activeTab;
     },
@@ -4119,9 +4077,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     },
     get executionStats() {
       return executionStats;
-    },
-    get userInfo() {
-      return userInfo;
     },
     get showResetConfirm() {
       return showResetConfirm;
@@ -4399,7 +4354,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     showResetConfirmDialog,
     confirmResetStats,
     cancelResetStats,
-    logout,
     closeSettings,
     reloadRoleTemplates,
     testModelConnection,

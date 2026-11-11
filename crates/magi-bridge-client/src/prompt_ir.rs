@@ -16,6 +16,7 @@ pub struct PromptIr {
     pub messages: Vec<LlmMessage>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f64>,
+    pub stop: Vec<String>,
     pub tools: Option<Vec<ToolDefinition>>,
     pub stream: Option<bool>,
     pub tool_choice: Option<ToolChoice>,
@@ -64,6 +65,7 @@ pub fn compile_prompt_ir(
         messages,
         max_tokens: max_output_tokens,
         temperature: None,
+        stop: Vec::new(),
         tools: request
             .tools
             .as_ref()
@@ -172,7 +174,7 @@ fn llm_message_from_chat_message(message: &crate::types::ChatMessage) -> LlmMess
             content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
                 tool_use_id: tool_call_id.clone(),
                 content: tool_result_content.text,
-                is_error: false,
+                is_error: tool_result_content.is_error,
                 images: tool_result_content.images,
             }]),
         };

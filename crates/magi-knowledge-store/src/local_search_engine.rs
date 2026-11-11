@@ -512,10 +512,6 @@ impl LocalSearchEngine {
         self.bump_index_version();
     }
 
-    pub fn invalidate_cache(&mut self) {
-        self.search_cache.invalidate_all();
-    }
-
     pub fn get_stats(&self) -> SearchEngineStats {
         let idx_stats = self.inverted_index.get_stats();
         let sym_stats = self.symbol_index.get_stats();

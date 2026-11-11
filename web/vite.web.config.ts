@@ -122,7 +122,7 @@ export default defineConfig(({ mode }) => {
           target: agentBaseUrl,
           changeOrigin: true,
         },
-        '^/(health|version|bootstrap|bridges|runtime|ledger|recovery|session)(/.*)?$': {
+        '^/(health|version|bootstrap|runtime|ledger|recovery|session)(/.*)?$': {
           target: agentBaseUrl,
           changeOrigin: true,
           timeout: 0,

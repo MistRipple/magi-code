@@ -1325,3 +1325,84 @@ async fn malformed_or_excessive_route_registrations_are_refused() {
     let error = launch(&env.group, env.config.clone(), 1).await;
     assert!(error.is_err(), "非法路由名必须让激活失败");
 }
+
+#[tokio::test]
+async fn page_model_progress_reaches_the_same_node_call_before_its_final_result() {
+    struct StreamingService {
+        ack: Arc<tokio::sync::Notify>,
+    }
+    impl HostService for StreamingService {
+        fn request_with_identity(
+            &self,
+            _: String,
+            _: String,
+            _: Value,
+        ) -> BoxFuture<Result<Value, RpcError>> {
+            Box::pin(async {
+                Err(RpcError::new(
+                    ErrorKind::MethodNotFound,
+                    "unscoped model denied",
+                ))
+            })
+        }
+        fn request_scoped(
+            &self,
+            _: String,
+            method: String,
+            params: Value,
+            _: Arc<std::sync::atomic::AtomicBool>,
+            progress: Option<magi_extension_host::ServiceProgress>,
+        ) -> BoxFuture<Result<Value, RpcError>> {
+            let ack = self.ack.clone();
+            Box::pin(async move {
+                assert_eq!(params["_context"]["activity"], "route");
+                if method == "model.selection" {
+                    ack.notify_one();
+                    return Ok(json!({}));
+                }
+                assert_eq!(method, "model.invoke");
+                progress.unwrap()(json!({"content":"first","thinking":""}))?;
+                tokio::time::timeout(Duration::from_secs(2), ack.notified())
+                    .await
+                    .map_err(|_| {
+                        RpcError::new(ErrorKind::DeadlineExceeded, "Node did not observe progress")
+                    })?;
+                Ok(json!({"content":"final"}))
+            })
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("index.mjs");
+    std::fs::write(
+        &entry,
+        r#"export default async api => {
+      await api.route('/stream',async()=>{
+        let observed='';
+        const result=await api.model.invoke({operationId:'one'},{onDelta:delta=>{
+          observed+=delta.content;void api.model.selection();
+        }});
+        return {body:{observed,result}};
+      });
+    }"#,
+    )
+    .unwrap();
+    let mut config = LaunchConfig::new(node(), runtime(), entry, dir.path().join("sock"));
+    config.service = Some(Arc::new(StreamingService {
+        ack: Arc::default(),
+    }));
+    let group = ManagedProcessGroup::new();
+    let host = launch(&group, config, 42).await.unwrap();
+    let result = host
+        .invoke_route(
+            "/stream",
+            json!({"method":"POST","path":"/stream"}),
+            json!({"invocationId":"stream-one"}),
+            Duration::from_secs(5),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["body"]["observed"], "first");
+    assert_eq!(result["body"]["result"]["content"], "final");
+    host.stop().await;
+}

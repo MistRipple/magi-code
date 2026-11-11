@@ -174,38 +174,35 @@ export async function installUpstreamPlugin(preview: PluginUpstreamPreview, ecos
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
 }
 
-/** 插件全局生效：一次授权清单里的全部权限，然后启用并激活。 */
-export async function authorizeAndActivatePlugin(pluginId: string, manifest: PluginManifest): Promise<void> {
-  const post = async (action: string, body: Record<string, unknown>, failure: string): Promise<void> => {
-    const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/${action}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) throw await pluginFailure(failure, response);
-  };
-  await post('authorize', { grants: manifest.permissions }, i18n.t('plugins.error.authorize'));
-  await post('enable', {}, i18n.t('plugins.error.activate'));
-  await post('activate', {}, i18n.t('plugins.error.activate'));
-  window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
-}
-
-async function changePluginActivation(pluginId: string, action: 'deactivate' | 'disable'): Promise<void> {
-  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/${action}`, {
+/** 每一步绑定用户看到的安装；失败也刷新已提交事实，不伪装整个操作已回滚。 */
+async function changePluginActivation(plugin: PluginInstalled, action: 'authorize' | 'enable' | 'activate' | 'deactivate' | 'disable'): Promise<void> {
+  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(plugin.manifest.id)}/${action}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({}),
+    body: JSON.stringify({ expectedDigest: plugin.digest, ...(action === 'authorize' ? { grants: plugin.manifest.permissions } : {}) }),
   });
-  if (!response.ok) throw await pluginFailure(action === 'deactivate' ? i18n.t('plugins.error.deactivate') : i18n.t('plugins.error.disable'), response);
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
+  if (!response.ok) throw await pluginFailure(i18n.t(`plugins.error.${action === 'enable' ? 'activate' : action}`), response);
 }
 
-export function deactivatePlugin(pluginId: string): Promise<void> {
-  return changePluginActivation(pluginId, 'deactivate');
+/** 管理页展示完整影响与权限后，用户显式授权同一安装，再启用。 */
+export async function authorizeAndActivatePlugin(plugin: PluginInstalled): Promise<void> {
+  await changePluginActivation(plugin, 'authorize');
+  await activatePlugin(plugin);
 }
 
-export function disablePlugin(pluginId: string): Promise<void> {
-  return changePluginActivation(pluginId, 'disable');
+/** 设置页重新启用只使用已有授权，不能在开关中补授权限。 */
+export async function activatePlugin(plugin: PluginInstalled): Promise<void> {
+  await changePluginActivation(plugin, 'enable');
+  await changePluginActivation(plugin, 'activate');
+}
+
+export function deactivatePlugin(plugin: PluginInstalled): Promise<void> {
+  return changePluginActivation(plugin, 'deactivate');
+}
+
+export function disablePlugin(plugin: PluginInstalled): Promise<void> {
+  return changePluginActivation(plugin, 'disable');
 }
 
 export async function uninstallPlugin(pluginId: string): Promise<void> {
@@ -363,4 +360,11 @@ export async function admitPluginComposer(pluginId: string, request: import('../
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request), signal,
   });
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.callRoute'), response);
+}
+
+export async function admitPluginView(pluginId: string, request: import('../shared/app-server-protocol.generated').PluginViewAdmissionRequest, signal?: AbortSignal): Promise<void> {
+  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/views/admit`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request), signal,
+  });
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.load'), response);
 }

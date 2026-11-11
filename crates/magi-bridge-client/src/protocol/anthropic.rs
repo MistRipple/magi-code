@@ -183,6 +183,15 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         } else if let Some(temperature) = params.temperature {
             body["temperature"] = json!(temperature);
         }
+        if params
+            .temperature
+            .is_some_and(|v| body.get("temperature").and_then(Value::as_f64) != Some(v))
+        {
+            return Err("Anthropic thinking 与请求的 temperature 冲突".into());
+        }
+        if !params.stop.is_empty() {
+            body["stop_sequences"] = json!(params.stop);
+        }
 
         if let Some(ref tools) = params.tools
             && !tools.is_empty()
@@ -427,6 +436,7 @@ mod tests {
             messages,
             max_tokens: None,
             temperature: None,
+            stop: Vec::new(),
             tools: None,
             stream: None,
 

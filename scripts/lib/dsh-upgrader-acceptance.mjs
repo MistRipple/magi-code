@@ -1,14 +1,15 @@
 import assert from 'node:assert/strict';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { connectTarget, pageTools, waitFor } from './electron-harness.mjs';
 import { createPluginThemeCases, activatePluginTheme, measurePluginContrast } from './plugin-theme-acceptance.mjs';
+import { authorizePluginFromNative, upgradePluginFromNative } from './plugin-native-acceptance.mjs';
 
 // 两个验收入口共享同一用户任务：原页面操作、后台生命周期、版本切换、
 // 失败恢复及重启。传入的 request 只访问调用者本次独立 daemon。
 export async function verifyDshUpgrader({ request, origin, plugin, page, cdpPort, errors, gate, output, stateRoot, restart, check }) {
   const name = 'dsh-plugin-release-probe', checks = {};
-  assert.equal(plugin.manifest.version, '1.8.0', 'Upgrader 业务合同固定验收原包版本');
+  assert.equal(plugin.manifest.version, '1.7.5', '从真实旧版开始验证升级器自身在线更新');
   const evidence = { package: 'dsh-plugin-upgrader@1.8.0', pluginId: plugin.manifest.id, digest: plugin.digest, completed: false, checks };
   const record = (key, label, ok, detail) => { check(label, ok, detail); checks[key] = true; };
   const plugins = async () => (await request('/api/plugins')).plugins;
@@ -65,7 +66,46 @@ export async function verifyDshUpgrader({ request, origin, plugin, page, cdpPort
     const submitted = await route('job', { steps: [{ name, version, action: 'switch', enabled }] });
     assert.equal(submitted.status, 202, JSON.stringify(submitted)); return waitJob(submitted.body.id);
   };
+  const authorizeCommitted = async job => {
+    const target = await current(), result = job.results[0];
+    assert.equal(job.failed, 1, JSON.stringify(job));
+    assert.equal(result.message, 'authorization-required', JSON.stringify(job));
+    assert.equal(result.stage, 'enable');
+    assert.ok(result.detail.includes(`已安装 ${name}@${target.manifest.version}`) && result.detail.includes('Magi 插件管理') && result.detail.includes('无需重复安装'));
+    assert.ok(!target.active && target.grants.length === 0);
+    const journal = await readFile(join(stateRoot, 'plugins/installations.json'), 'utf8');
+    const active = await authorizePluginFromNative({ request, page, plugin: target });
+    assert.equal(await readFile(join(stateRoot, 'plugins/installations.json'), 'utf8'), journal, '授权恢复不能重放安装任务');
+    await openPage(false);
+    return active;
+  };
   try {
+    await openPage();
+    // 来源列表是原包配置，不切换用户选择的 registry；安装仍经本次 gate。
+    const customSource = gate.registry;
+    await waitFor(() => frame.evaluate(`Boolean(document.querySelector('.dsh-pu-reg-btn:not(:disabled)'))`), '原包配置就绪');
+    await frame.evaluate(`document.querySelector('.dsh-pu-reg-btn').click()`);
+    await waitFor(() => frame.evaluate(`Boolean(document.querySelector('.dsh-pu-src-add input'))`), '原包来源编辑');
+    await frame.evaluate(`(() => {const input=document.querySelector('.dsh-pu-src-add input');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,${JSON.stringify(customSource)});input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+    await waitFor(() => frame.evaluate(`(() => {const button=document.querySelector('.dsh-pu-src-add button');if(button.disabled)return false;button.click();return true;})()`), '原包添加来源');
+    const savedSettings = await waitFor(async () => {
+      const snapshot = await request(pluginPath + '/settings');
+      return JSON.stringify(snapshot.value).includes(customSource) && snapshot;
+    }, '原页面配置由 daemon 持久保存');
+    record('configuration', 'Upgrader 原页面配置通过共享设置保存，未改写安装来源', true);
+    await frame.evaluate(`document.querySelector('.dsh-pu-modal-head button').click()`);
+    closeFrame();
+    const previous = plugin;
+    plugin = await upgradePluginFromNative({ request, page, plugin, version: '1.8.0',
+      check: record });
+    assert.equal(plugin.manifest.version, '1.8.0');
+    evidence.previous = { version: previous.manifest.version, digest: previous.digest };
+    evidence.digest = plugin.digest;
+    const upgradedSettings = await request(pluginPath + '/settings');
+    record('selfUpdateSettings', '升级器自身在线更新保留旧版原页面保存的实际配置', upgradedSettings.version === savedSettings.version
+      && JSON.stringify(upgradedSettings.value) === JSON.stringify(savedSettings.value));
+    evidence.selfUpdateSettings = { before: savedSettings, after: upgradedSettings };
+    record('noDelegation', 'Upgrader 原包未申请替其他包授权的委托', !plugin.manifest.permissions.some(permission => permission.kind === 'pluginManagement' && permission.targets.includes('authorize')));
     assert.equal(await current(), undefined, '每次 Upgrader 验收从独立的未安装目标开始');
     const original = await installTarget();
     await openPage();
@@ -99,19 +139,6 @@ export async function verifyDshUpgrader({ request, origin, plugin, page, cdpPort
       await activatePluginTheme(request, page, frame, originalTheme);
       await page.call('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 0, y: 0 });
     }
-    // 来源列表是原包配置，不切换用户选择的 registry；安装仍经本次 gate。
-    const customSource = gate.registry;
-    await waitFor(() => frame.evaluate(`Boolean(document.querySelector('.dsh-pu-reg-btn:not(:disabled)'))`), '原包配置就绪');
-    await frame.evaluate(`document.querySelector('.dsh-pu-reg-btn').click()`);
-    await waitFor(() => frame.evaluate(`Boolean(document.querySelector('.dsh-pu-src-add input'))`), '原包来源编辑');
-    await frame.evaluate(`(() => {const input=document.querySelector('.dsh-pu-src-add input');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,${JSON.stringify(customSource)});input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
-    await waitFor(() => frame.evaluate(`(() => {const button=document.querySelector('.dsh-pu-src-add button');if(button.disabled)return false;button.click();return true;})()`), '原包添加来源');
-    const savedSettings = await waitFor(async () => {
-      const snapshot = await request(pluginPath + '/settings');
-      return JSON.stringify(snapshot.value).includes(customSource) && snapshot;
-    }, '原页面配置由 daemon 持久保存');
-    record('configuration', 'Upgrader 原页面配置通过共享设置保存，未改写安装来源', true);
-    await frame.evaluate(`document.querySelector('.dsh-pu-modal-head button').click()`);
     const identity = await frame.evaluate('window.__upgraderAcceptance=crypto.randomUUID()');
     gate.pause(name);
     const cancelledId = await beginFromPage();
@@ -147,33 +174,43 @@ export async function verifyDshUpgrader({ request, origin, plugin, page, cdpPort
     const retryIdentity = await frame.evaluate('window.__upgraderAcceptance=crypto.randomUUID()');
     await waitFor(() => frame.evaluate(`Boolean(${upgradeButton}&&!${upgradeButton}.disabled)`), '停用恢复后原包显式重试');
     await frame.evaluate(`${upgradeButton}.click()`);
-    const upgraded = await waitFor(async () => { const value = await current(); return value?.manifest.version === '0.0.8' && value.runtime?.state === 'running' && value; }, 'Upgrader 原页面在线更新完成', 240_000);
+    const updateId = await waitFor(async () => (await route('overview')).body.jobs.find(job => job.status === 'finished')?.id, 'Upgrader 原页面更新任务结算', 240_000);
+    const updateJob = await waitJob(updateId);
+    const pending = await current();
+    await waitFor(() => frame.evaluate(`document.body.innerText.includes('已安装 ${name}@0.0.8')&&document.body.innerText.includes('Magi 插件管理')&&document.body.innerText.includes('无需重复安装')`), '原包显示授权恢复提示');
+    record('authorizationNotice', '原页面更新回执区分新版已安装与未授权，并说明原生恢复操作', pending.manifest.version === '0.0.8' && !pending.active);
+    evidence.authorizationRequired = { job: updateJob, plugin: pending };
+    await screenshot('authorization-required');
+    record('documentIdentity', '目标在线更新保留 Upgrader 原页面身份与实际完成回执', await frame.evaluate(`window.__upgraderAcceptance===${JSON.stringify(retryIdentity)}`));
+    const upgraded = await authorizeCommitted(updateJob);
     await waitFor(() => frame.evaluate(`!${upgradeButton} && ![...document.querySelectorAll('.dsh-pu-job button')].some(button=>/^(取消|Cancel|正在取消…|Cancelling…)$/.test(button.innerText.trim()))`), '原包页面更新完成回执');
-    record('onlineUpgrade', '重新启用后原包显式重试完成在线更新并展示实际新版', upgraded.active && upgraded.grants.length > 0);
-    record('documentIdentity', '目标版本更新保留 Upgrader 页面身份与实际完成回执', await frame.evaluate(`window.__upgraderAcceptance===${JSON.stringify(retryIdentity)}`));
+    record('onlineUpgrade', '原包在线更新后由用户原生授权恢复同一新版，未重复安装', upgraded.active && upgraded.grants.length > 0);
+    record('receiptPreserved', '原生授权后重开原页面仍可查询相同任务及原始失败回执', JSON.stringify((await route('job', undefined, `id=${updateId}`)).body) === JSON.stringify(updateJob));
     await screenshot('updated');
     const switched = await runVersion('0.0.7', false), disabled = await current();
     record('versionSwitch', 'Upgrader 真实版本切换保持目标停用意愿', switched.failed === 0 && disabled.manifest.version === '0.0.7' && !disabled.enabled && !disabled.active);
     const missing = await runVersion('9999.0.0', false);
     record('failedDisabled', '不存在版本的更新失败保留旧摘要与停用意愿', missing.failed === 1 && (await current()).digest === disabled.digest && !(await current()).enabled);
-    const restored = await runVersion('0.0.8', true), active = await current();
-    assert.equal(restored.failed, 0); assert.equal(active.runtime.state, 'running');
+    const restored = await runVersion('0.0.8', true);
+    await authorizeCommitted(restored);
+    const authorized = await current();
     const missingActive = await runVersion('9999.0.0', true), afterMissing = await current();
     record('failedActive', '不存在版本的更新失败保留旧授权及同一运行实例', missingActive.failed === 1
-      && afterMissing.digest === active.digest && afterMissing.enabled && afterMissing.active
-      && afterMissing.runtime.state === 'running' && afterMissing.runtime.generation === active.runtime.generation
-      && JSON.stringify(afterMissing.grants) === JSON.stringify(active.grants));
+      && afterMissing.digest === authorized.digest && afterMissing.enabled && afterMissing.active
+      && afterMissing.runtime.state === 'running' && afterMissing.runtime.generation === authorized.runtime.generation
+      && JSON.stringify(afterMissing.grants) === JSON.stringify(authorized.grants));
     const preview = await request('/api/plugins/upstream/preview', { ecosystem: 'dsh', package: name, version: '0.0.7' });
-    const blocked = join(stateRoot, 'plugins/versions', active.manifest.id, `${preview.candidate.digest}.zip`);
+    const blocked = join(stateRoot, 'plugins/versions', authorized.manifest.id, `${preview.candidate.digest}.zip`);
     await mkdir(blocked);
     try {
       const failed = await runVersion('0.0.7', true);
-      const recovered = await waitFor(async () => { const value = await current(); return value?.digest === active.digest && value.runtime?.state === 'running' && value; }, '真实落盘失败恢复原版本', 30_000);
+      const recovered = await waitFor(async () => { const value = await current(); return value?.digest === authorized.digest && value.runtime?.state === 'running' && value; }, '真实落盘失败恢复原版本', 30_000);
       record('failedReplacement', 'Upgrader 归档写入失败恢复旧版本、授权及实际运行', failed.failed === 1 && recovered.active && recovered.enabled
-        && JSON.stringify(recovered.grants) === JSON.stringify(active.grants));
+        && JSON.stringify(recovered.grants) === JSON.stringify(authorized.grants));
     } finally { await rm(blocked, { recursive: true, force: true }); }
     const retried = await runVersion('0.0.7', true);
-    record('explicitRetry', '清除落盘故障后显式重试成功，不重放已完成的安装', retried.failed === 0 && (await current()).manifest.version === '0.0.7' && (await current()).runtime.state === 'running');
+    await authorizeCommitted(retried);
+    record('explicitRetry', '清除落盘故障后显式重试并原生授权成功，不重放已完成的安装', (await current()).manifest.version === '0.0.7' && (await current()).runtime.state === 'running');
     const beforeRestart = await current(); closeFrame(); page = await restart();
     await waitFor(async () => (await plugins()).find(p => p.manifest.id === plugin.manifest.id)?.runtime?.state === 'running', '应用重启恢复 Upgrader', 120_000);
     await openPage();
@@ -182,7 +219,7 @@ export async function verifyDshUpgrader({ request, origin, plugin, page, cdpPort
       && afterRestart.digest === beforeRestart.digest && afterRestart.runtime.state === 'running' && (await route('overview')).body.active === null);
     await screenshot('restarted');
     Object.assign(evidence, { completed: true, cancelled, stoppedId, settings, beforeRestart, afterRestart });
-    return { checks, page };
+    return { checks, page, plugin };
   } finally {
     await writeFile(join(output, 'upgrader-business.json'), JSON.stringify(evidence, null, 2));
     gate.release(); closeFrame();

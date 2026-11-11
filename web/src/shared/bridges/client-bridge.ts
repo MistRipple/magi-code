@@ -1,7 +1,7 @@
 import type { LocaleCode } from '../../i18n/locales';
 
 export type SupportedLocale = LocaleCode | '';
-export type ClientBridgeKind = 'vscode' | 'web';
+export type ClientBridgeKind = 'web';
 
 export interface ClientBridgeMessage {
   type: string;

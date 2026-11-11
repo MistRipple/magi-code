@@ -25,6 +25,9 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
     }
 
     fn build_request(&self, params: &PromptIr, model: &str) -> Result<AdaptedRequest, String> {
+        if !params.stop.is_empty() {
+            return Err("OpenAI Responses 协议没有 stop 参数".into());
+        }
         let mut input = Vec::new();
         let response_call_history = ResponseCallHistory::from_messages(&params.messages);
         let mut emitted_call_ids = std::collections::HashSet::new();
@@ -526,6 +529,7 @@ mod tests {
             messages,
             max_tokens: Some(512),
             temperature: None,
+            stop: Vec::new(),
             tools: None,
             stream: Some(true),
 

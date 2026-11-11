@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Magi 兼容运行时：上游生态插件（DSH、pi）的翻译工具链与共享依赖。随 Magi 发行，不是 workspace。",
+  "description": "Magi DSH 原包接入：安装准备、运行宿主与共享依赖。随 Magi 发行，不是 workspace。",
   "scripts": {
     "build:client": "node tools/build-client-shim.mjs"
   },
@@ -29,6 +29,7 @@
     "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.1",
     "@deepseek-ai/dsh-util-code-language": "0.2.2-rc.1",
     "@deepseek-ai/dsh-util-workspace-path": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-web": "0.2.2-rc.1",
     "@deepseek-ai/schemastery": "3.19.0",
     "@earendil-works/pi-ai": "1.5.0",
     "@shikijs/langs": "4.6.0",

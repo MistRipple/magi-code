@@ -19,6 +19,7 @@ pub struct StepModelClient<'a> {
     task_id: Option<&'a TaskId>,
     thread_id: &'a ThreadId,
     call_id: &'a str,
+    history_generation: u64,
     sequence: AtomicUsize,
     binding: Option<ModelStepBinding>,
     purpose: magi_session_store::ModelStepPurpose,
@@ -30,6 +31,7 @@ pub struct StepModelClient<'a> {
 }
 
 impl<'a> StepModelClient<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         inner: &'a dyn ModelBridgeClient,
         store: &'a SessionStore,
@@ -38,6 +40,7 @@ impl<'a> StepModelClient<'a> {
         task_id: Option<&'a TaskId>,
         thread_id: &'a ThreadId,
         call_id: &'a str,
+        history_generation: u64,
     ) -> Self {
         Self {
             inner,
@@ -47,6 +50,7 @@ impl<'a> StepModelClient<'a> {
             task_id,
             thread_id,
             call_id,
+            history_generation,
             sequence: AtomicUsize::new(0),
             binding: None,
             purpose: magi_session_store::ModelStepPurpose::Execution,
@@ -230,10 +234,8 @@ impl<'a> StepModelClient<'a> {
                 PromptBranchScope::Orchestrator
             }
         });
-        let history_generation = self
-            .store
-            .thread_context_checkpoint(self.thread_id)
-            .map_or(0, |checkpoint| checkpoint.generation);
+        // 身份与组装好的历史一起冻结；发送时不能重新读取可能已变化的检查点。
+        let history_generation = self.history_generation;
         // 缓存 client 不保存某个 Task 的权限。每次真实调用重新绑定本 Step 的可信作用域；
         // 外部工具循环必须确认绑定成功，不能把默认 Ok(None) 当作已继承权限。
         let bound = self
@@ -898,6 +900,7 @@ mod tests {
             None,
             &thread,
             "observed-call",
+            0,
         )
         .with_extension_hooks(Some(&recorder))
         .invoke(request("机密提示词"))
@@ -943,6 +946,7 @@ mod tests {
             None,
             &thread,
             "http-call",
+            0,
         )
         .invoke(request("work"))
         .unwrap();
@@ -1010,6 +1014,7 @@ mod tests {
             None,
             &thread,
             "sse-call",
+            0,
         )
         .invoke_streaming(request("work"), &|_| {})
         .unwrap();
@@ -1082,7 +1087,8 @@ mod tests {
                 Some("turn-journal-client"),
                 None,
                 &thread,
-                "partial-call"
+                "partial-call",
+                0,
             )
             .invoke_streaming(request("work"), &|_| {})
             .is_err()
@@ -1128,7 +1134,7 @@ mod tests {
         let capture = Capture(std::sync::Mutex::new(vec![]));
         for (revision, call) in ["first", "next-turn", "after-restart"].iter().enumerate() {
             let mut client =
-                StepModelClient::new(&capture, &store, &session, None, None, &thread, call);
+                StepModelClient::new(&capture, &store, &session, None, None, &thread, call, 0);
             client.binding = Some(ModelStepBinding {
                 usage_context: None,
                 model: Some("same-model".into()),
@@ -1148,6 +1154,7 @@ mod tests {
             Some(&worker_task),
             &worker_thread,
             "worker",
+            0,
         )
         .with_prompt_branch(crate::prompt_lineage::PromptBranchScope::Worker {
             task_id: worker_task.as_str().to_string(),
@@ -1163,6 +1170,7 @@ mod tests {
             None,
             &thread,
             "other",
+            0,
         )
         .invoke(request("other"))
         .unwrap();
@@ -1249,6 +1257,7 @@ mod tests {
                 None,
                 &thread,
                 call,
+                0,
             )
             .with_history_projection(projection);
             client
@@ -1374,6 +1383,7 @@ mod tests {
                 None,
                 &thread,
                 call,
+                0,
             )
             .with_history_projection(projection)
             .invoke(ModelInvocationRequest {
@@ -1544,6 +1554,7 @@ mod tests {
                 None,
                 &thread,
                 call,
+                0,
             );
             // 设置快照和路由别名不是真实 transport 身份。
             client.binding = Some(ModelStepBinding {
@@ -1838,6 +1849,7 @@ mod tests {
             None,
             &thread,
             "frozen",
+            0,
         );
         let mut req = request("identical input");
         req.messages = Some(vec![magi_bridge_client::ChatMessage {
@@ -1905,6 +1917,7 @@ mod tests {
             None,
             &thread,
             "summary",
+            0,
         )
         .with_purpose(magi_session_store::ModelStepPurpose::ContextCompaction);
         req.messages.as_mut().unwrap()[0].input_request_id = Some("same-text-later".into());
@@ -1956,6 +1969,7 @@ mod tests {
             None,
             &thread,
             "unscoped",
+            0,
         )
         .with_execution_scope(external_scope("/first"));
         for error in [
@@ -2045,6 +2059,7 @@ mod tests {
             None,
             &thread,
             "external",
+            0,
         );
         assert!(
             client
@@ -2096,6 +2111,7 @@ mod tests {
             None,
             &thread,
             "untracked-external",
+            0,
         )
         .with_execution_scope(external_scope("/workspace"));
         let error = client.invoke(request("inspect")).unwrap_err();
@@ -2127,6 +2143,7 @@ mod tests {
             None,
             &thread,
             "denied-external",
+            0,
         )
         .with_execution_scope(external_scope("/first"));
         assert!(
@@ -2195,6 +2212,7 @@ mod tests {
             None,
             &thread,
             "caps",
+            0,
         );
         let mut unsupported = request("unsupported");
         unsupported.tool_choice = Some(magi_bridge_client::ChatToolChoice::force_function(
@@ -2255,6 +2273,7 @@ mod tests {
             None,
             &thread,
             "bad-caps",
+            0,
         );
         assert!(
             client
@@ -2323,6 +2342,7 @@ mod tests {
             None,
             &thread,
             "call-0",
+            0,
         );
         assert!(
             client
@@ -2405,6 +2425,7 @@ mod tests {
                 None,
                 &thread,
                 "call-retry",
+                0,
             );
             let result = client.invoke(request("retry"));
             assert_eq!(result.is_err(), reject_retry);
@@ -2437,6 +2458,7 @@ mod tests {
             None,
             &thread,
             "call-0",
+            0,
         );
         store.install_session_event_writer(Arc::new(RejectWrites));
         assert!(client.invoke(request("original")).is_err());
@@ -2509,6 +2531,7 @@ mod tests {
             None,
             &thread,
             "late-call",
+            0,
         );
         assert!(
             client.invoke(request("work")).is_err(),
@@ -2599,6 +2622,7 @@ mod tests {
             None,
             &thread,
             "paused",
+            0,
         )
         .invoke(request("do not send"))
         .unwrap_err();
@@ -2635,6 +2659,7 @@ mod tests {
             None,
             &thread,
             "resumed",
+            0,
         )
         .invoke(request("resume"))
         .unwrap();

@@ -20,14 +20,15 @@
   } from '../web/plugin-api';
   import PluginDetailPane from './PluginDetailPane.svelte';
   import PluginIcon from './PluginIcon.svelte';
+  import PluginImpactNotices from './PluginImpactNotices.svelte';
   import PluginGuidePage from './PluginGuidePage.svelte';
   import Icon from './Icon.svelte';
   import SettingsDetailPage from './SettingsDetailPage.svelte';
   import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
-  import { openSettings } from '../stores/shell-ui.svelte';
-  import { buildStoreItems, filterStoreItems, installedUpstreamRequest, paginate, storeGroup, type StoreFilter, type StoreGroup, type StoreItem } from '../lib/plugin-store';
+  import { openSettings, shellUi } from '../stores/shell-ui.svelte';
+  import { permissionText, buildStoreItems, filterStoreItems, installedUpstreamRequest, paginate, storeGroup, type StoreFilter, type StoreGroup, type StoreItem } from '../lib/plugin-store';
   import { pluginRegistryRevision } from '../stores/plugin-registry.svelte';
-  import type { PluginCandidatePreview, PluginEcosystem, PluginUpstreamRequest, PluginCenterProjection, PluginList, PluginManifest, PluginPermission, PluginUpstreamPreview, PluginUpstreamProjection } from '../shared/app-server-protocol.generated';
+  import type { PluginCandidatePreview, PluginEcosystem, PluginUpstreamRequest, PluginCenterProjection, PluginList, PluginManifest, PluginUpstreamPreview, PluginUpstreamProjection } from '../shared/app-server-protocol.generated';
 
   let list = $state<PluginList | null>(null);
   let address = $state('');
@@ -239,23 +240,6 @@
     }, i18n.t('settings.plugins.candidate.installing'));
   }
 
-  function permissionText(permission: PluginPermission): string {
-    if (permission.kind === 'client') return i18n.t('settings.plugins.permission.client');
-    if (permission.kind === 'attachments') return i18n.t('settings.plugins.permission.attachments');
-    if (permission.kind === 'sessionWrite') return permission.targets.map(target => i18n.t(target === 'wake' ? 'settings.plugins.permission.sessionWrite.wake' : 'settings.plugins.permission.sessionWrite.context')).join('；');
-    if (permission.kind === 'sessionRead') return i18n.t('settings.plugins.permission.sessionRead');
-    if (permission.kind === 'composer') return i18n.t('settings.plugins.permission.composer');
-    if (permission.kind === 'extension') return i18n.t('settings.plugins.permission.extensionFullTrust');
-    if (permission.kind === 'pluginManagement') return [
-      i18n.t(permission.targets.includes('authorize') ? 'settings.plugins.permission.pluginAuthorization' : 'settings.plugins.permission.pluginManagement'),
-      ...(permission.targets.includes('compatibility') ? [i18n.t('settings.plugins.permission.pluginCompatibility')] : []),
-      ...(permission.targets.includes('background') ? [i18n.t('settings.plugins.permission.pluginBackground')] : []),
-    ].join('；');
-    if (permission.kind === 'contextRewrite') return i18n.t('settings.plugins.permission.contextRewrite');
-    if (permission.kind === 'modelSources') return i18n.t('settings.plugins.permission.modelSources', { sources: permission.targets.join(', ') });
-    return `${permission.kind}${permission.targets.length ? `: ${permission.targets.join(', ')}` : ''}`;
-  }
-
   const hasCatalog = $derived(Boolean(center && center.entries.length > 0));
 
   /** 插件的名称与说明显示清单原文。 */
@@ -271,6 +255,17 @@
   let page = $state(1);
   let selectedId = $state<string | null>(null);
   let sourcesOpen = $state(false);
+
+  $effect(() => {
+    const id = shellUi.settingsRequestedPlugin;
+    const plugin = plugins.find(plugin => plugin.manifest.id === id);
+    if (!id || !plugin) return;
+    cancelPreview();
+    query = plugin.manifest.name;
+    filter = 'installed';
+    selectedId = id;
+    shellUi.settingsRequestedPlugin = null;
+  });
 
   const items = $derived(buildStoreItems(plugins, center?.entries ?? [], upstream?.entries ?? [], manifestText));
   const filtered = $derived(filterStoreItems(items, filter, query));
@@ -512,11 +507,12 @@
           </div>
         </div>
         <div class="settings-card-body">
+          <PluginImpactNotices manifest={preview.manifest} />
           <div class="plugin-perm" data-testid="candidate-added-permissions">
             <span class="settings-row-title">{i18n.t('settings.plugins.candidate.added')}</span>
             <div class="settings-chips">
               {#each preview.addedPermissions as permission}
-                <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement' || permission.kind === 'composer' || permission.kind === 'sessionRead' || permission.kind === 'sessionWrite' || permission.kind === 'client' || permission.kind === 'attachments'}>{permissionText(permission)}</span>
+                <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement' || permission.kind === 'composer' || permission.kind === 'sessionRead' || permission.kind === 'sessionWrite' || permission.kind === 'client' || permission.kind === 'attachments'}>{permissionText(permission, i18n.t.bind(i18n))}</span>
               {:else}
                 <span class="settings-row-desc">{i18n.t('settings.plugins.candidate.noneAdded')}</span>
               {/each}
@@ -527,7 +523,7 @@
               <span class="settings-row-title">{i18n.t('settings.plugins.candidate.removed')}</span>
               <div class="settings-chips">
                 {#each preview.removedPermissions as permission}
-                  <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement' || permission.kind === 'composer' || permission.kind === 'sessionRead' || permission.kind === 'sessionWrite' || permission.kind === 'client' || permission.kind === 'attachments'}>{permissionText(permission)}</span>
+                  <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement' || permission.kind === 'composer' || permission.kind === 'sessionRead' || permission.kind === 'sessionWrite' || permission.kind === 'client' || permission.kind === 'attachments'}>{permissionText(permission, i18n.t.bind(i18n))}</span>
                 {/each}
               </div>
             </div>
@@ -586,7 +582,7 @@
         </div>
         <div class="settings-card-foot" data-testid="plugin-candidate-actions">
           <button class="btn btn--sm btn--secondary" data-action="cancel-candidate" onclick={() => { staged = null; }} disabled={busy}>{i18n.t('settings.plugins.candidate.cancel')}</button>
-          <button class="btn btn--sm btn--primary" data-action="confirm-candidate" onclick={() => void confirmStaged()} disabled={busy}>
+          <button class="btn btn--lg btn--primary" data-action="confirm-candidate" onclick={() => void confirmStaged()} disabled={busy}>
             {#if busy}<Icon name="loader" class="spinning" size={14} /> {busyLabel}
             {:else}{preview.operation === 'upgrade' ? i18n.t('settings.plugins.candidate.confirmUpgrade') : i18n.t('settings.plugins.candidate.confirmInstall')}{/if}
           </button>
@@ -607,9 +603,9 @@
               onInstall={() => void installItem(selected)}
               onUpdateFromCenter={() => void updateFromCenter(selected)}
               onUninstall={() => void uninstallItem(selected)}
-              onActivate={() => void run(() => authorizeAndActivatePlugin(selected.id, selected.installed!.manifest))}
-              onDeactivate={() => void run(() => deactivatePlugin(selected.id))}
-              onDisable={() => void run(() => disablePlugin(selected.id))}
+              onActivate={() => void run(() => authorizeAndActivatePlugin(selected.installed!))}
+              onDeactivate={() => void run(() => deactivatePlugin(selected.installed!))}
+              onDisable={() => void run(() => disablePlugin(selected.installed!))}
               onOpenSettings={openSettings}
             />
           {/key}
@@ -736,7 +732,7 @@
   .plugin-candidate { display: flex; flex: 1; min-height: 0; margin: 0; }
   .plugin-candidate-card { display: flex; flex-direction: column; flex: 1; min-height: 0; border: 0; border-radius: 0; }
   .candidate-scroll { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
-  .plugin-candidate-card > .settings-card-foot { flex: 0 0 auto; }
+  .plugin-candidate-card > .settings-card-foot { flex: 0 0 auto; flex-wrap: wrap; }
   .sources-header { display: flex; align-items: center; justify-content: space-between; width: 100%; }
   .sources-header h3 { margin: 0; }
   .sources-body { display: grid; gap: var(--space-5); }

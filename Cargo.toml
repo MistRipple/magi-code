@@ -19,7 +19,6 @@ members = [
   "crates/magi-event-bus",
   "crates/magi-tool-runtime",
   "crates/magi-orchestrator",
-  "crates/magi-worker-runtime",
   "crates/magi-knowledge-store",
   "crates/magi-memory-store",
   "crates/magi-context-runtime",

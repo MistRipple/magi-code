@@ -3,7 +3,8 @@
   import Icon from '../Icon.svelte';
   import { agentUrl } from '../../web/agent-api';
   import { i18n } from '../../stores/i18n.svelte';
-  import { subscribeAppearanceRuntime } from '../../appearance/runtime';
+  import { applyAppearanceSnapshot, getAppearanceRuntimeSnapshot, subscribeAppearanceRuntime } from '../../appearance/runtime';
+  import { activateAppearanceTheme } from '../../appearance/client';
   import { openExternalUrl } from '../../lib/external-link';
   import { pluginProjection } from '../../stores/plugin-registry.svelte';
   import { rightPaneState, openPluginTab } from '../../stores/right-pane.svelte';
@@ -18,7 +19,8 @@
   } from '../../web/plugin-api';
   import { createPluginComposerBridge } from '../../lib/plugin-composer-bridge';
   import { subscribePluginComposer } from '../../lib/plugin-composer';
-  import { admitPluginComposer } from '../../web/plugin-api';
+  import { admitPluginComposer, admitPluginView } from '../../web/plugin-api';
+  import type { PluginConversationViewContext } from '../../shared/app-server-protocol.generated';
 
   interface Props {
     pluginId: string;
@@ -30,13 +32,19 @@
      * 视图所处的位置。`settings` 嵌入设置页的整页滚动：高度由页面经 `view.resize` 上报，
      * 底色取设置页主区域的实际底色；其他位置由宿主给定固定尺寸，页面自己滚动。
      */
-    placement?: 'settings' | 'page' | 'background';
+    placement?: 'settings' | 'page' | 'background' | 'composerLeft' | 'chatAssistant';
     viewEntry?: string | null;
+    conversation?: PluginConversationViewContext;
   }
 
-  let { pluginId, entry, label, frameTestId = 'plugin-view', placement = 'page', viewEntry = entry }: Props = $props();
+  let { pluginId, entry, label, frameTestId = 'plugin-view', placement = 'page', viewEntry = entry, conversation }: Props = $props();
+  const inline = $derived(placement === 'composerLeft' || placement === 'chatAssistant');
   /** 页面上报的内容高度（CSS 像素）；只在 settings 位置生效，重新加载后清空。 */
   let reportedHeight = $state<number | null>(null);
+  let overflowTop = $state(0);
+  let overflowLeft = $state(0);
+  let reportedWidth = $state<number | null>(null);
+  let settingsInsets = $state({ left: 0, right: 0 });
   /** 与页面可上报的合理上限一致，防止异常值撑爆设置页。 */
   const MAX_VIEW_HEIGHT = 20_000;
   let iframe = $state<HTMLIFrameElement | null>(null);
@@ -51,7 +59,7 @@
   const runtimeState = $derived(installed?.active ? runtime?.state ?? 'starting' : 'notRunning');
   const resourceDigest = $derived(installed?.digest ?? '');
   // 监管可能合并中间状态；即使只看到 running → running，新运行代次也必须创建新文档。
-  const documentIdentity = $derived(JSON.stringify([pluginId, entry, resourceDigest, ready, runtime?.instanceId]));
+  const documentIdentity = $derived(JSON.stringify([pluginId, entry, resourceDigest, ready, runtime?.instanceId, inline ? conversation?.sessionId : null]));
   const resourceUrl = $derived(
     agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/${resourceDigest ? `ui-v/${resourceDigest}` : 'ui'}/${entry.replace(/^ui\//, '').split('/').map(encodeURIComponent).join('/')}`),
   );
@@ -88,7 +96,7 @@
     return null;
   }
 
-  function readTheme(): { mode: 'light' | 'dark'; tokens: Record<string, string> } {
+  function readTheme() {
     const root = document.documentElement;
     const computed = getComputedStyle(root);
     const tokens: Record<string, string> = {};
@@ -105,7 +113,13 @@
       const radius = settingsScope.getPropertyValue('--ind-radius-card').trim();
       if (radius) tokens['--ind-radius-card'] = radius;
     }
-    return { mode: root.classList.contains('theme-light') ? 'light' : 'dark', tokens };
+    const { library, activeTheme } = getAppearanceRuntimeSnapshot();
+    return { mode: root.classList.contains('theme-light') ? 'light' : 'dark', tokens,
+      ...(library && activeTheme ? { appearance: {
+        revision: library.revision, preference: library.activeThemeId, activeTheme,
+        themes: library.themes.map(record => record.pack),
+      } } : {}),
+    };
   }
 
   function currentViewId(): string | null {
@@ -113,8 +127,34 @@
   }
 
   function sendHostContext(): void {
-    if (destroyed) return;
-    send({ type: 'context', placement, viewId: currentViewId(), locale: i18n.locale, theme: readTheme() });
+    if (destroyed || placement === 'settings' && !iframe?.getClientRects().length) return;
+    send({ type: 'context', placement, viewId: currentViewId(), locale: i18n.locale, theme: readTheme(), ...hostViewport() });
+    void sendConversationContext();
+  }
+  function hostViewport() {
+    if (placement === 'settings' && iframe) {
+      const frame = iframe.closest('.settings-frame');
+      const style = frame ? getComputedStyle(frame) : null;
+      const left = Number.parseFloat(style?.paddingLeft ?? '') || 0;
+      const right = Number.parseFloat(style?.paddingRight ?? '') || 0;
+      if (settingsInsets.left !== left || settingsInsets.right !== right) settingsInsets = { left, right };
+      return { settingsInsets: { left, right } };
+    }
+    if (settingsInsets.left || settingsInsets.right) settingsInsets = { left: 0, right: 0 };
+    return inline && iframe ? { layoutWidth: iframe.parentElement?.clientWidth, availableWidth: window.innerWidth - iframe.getBoundingClientRect().left - 8 } : {};
+  }
+  let viewportObserver: ResizeObserver | undefined;
+
+  let contextRevision = 0;
+  async function sendConversationContext(): Promise<void> {
+    if (!inline || !conversation || !documentDigest) return;
+    const revision = ++contextRevision, expectedInstance = instanceId, context = conversation;
+    try {
+      await admitPluginView(pluginId, { expectedDigest: documentDigest, entry: documentEntry, placement: placement as 'composerLeft' | 'chatAssistant' });
+      if (revision === contextRevision) send({ type: 'conversation', context }, expectedInstance);
+    } catch {
+      if (revision === contextRevision) send({ type: 'conversation', context: null }, expectedInstance);
+    }
   }
 
   function send(message: Record<string, unknown>, expectedInstance = instanceId): void {
@@ -218,8 +258,17 @@
     const callingDigest = documentDigest;
     const callingRuntimeId = documentRuntimeId;
     const operation = event.data.operation;
-    if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write', 'settings.describe', 'route.call', 'host.openExternal', 'clipboard.write', 'view.resize', 'view.open', 'view.storage.read', 'view.storage.write', 'composer.snapshot', 'composer.addImages', 'composer.removeImage', 'composer.notify', 'composer.focus', 'composer.submitText'].includes(operation)) return;
+    if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write', 'settings.describe', 'route.call', 'host.openExternal', 'host.theme.set', 'clipboard.write', 'view.resize', 'view.open', 'view.storage.read', 'view.storage.write', 'composer.snapshot', 'composer.addImages', 'composer.removeImage', 'composer.notify', 'composer.focus', 'composer.submitText'].includes(operation)) return;
     try {
+      if (operation === 'host.theme.set') {
+        const { library } = getAppearanceRuntimeSnapshot();
+        if (typeof event.data.themeId !== 'string' || !library?.themes.some(record => record.pack.id === event.data.themeId)
+          || !Number.isSafeInteger(event.data.expectedRevision)) throw new Error('主题选择无效');
+        const snapshot = await activateAppearanceTheme(event.data.themeId, event.data.expectedRevision);
+        await applyAppearanceSnapshot(snapshot);
+        send({ type: 'response', requestId, ok: true, result: null }, expectedInstance);
+        return;
+      }
       if (operation === 'view.storage.read' || operation === 'view.storage.write') {
         // 这是界面缓存，归浏览器 profile 所有；业务配置仍只走 daemon 的 settings CAS。
         const storageKey = `magi:plugin-ui:${pluginId}`;
@@ -322,7 +371,17 @@
         if (typeof height !== 'number' || !Number.isFinite(height) || height < 0 || height > MAX_VIEW_HEIGHT) {
           throw new Error('视图高度无效');
         }
-        if (placement === 'settings') reportedHeight = Math.ceil(height);
+        if (inline) {
+          const top = event.data.overflowTop ?? 0, left = event.data.overflowLeft ?? 0, width = event.data.width;
+          if (typeof top !== 'number' || !Number.isFinite(top) || top < 0 || top > 1000
+            || typeof left !== 'number' || !Number.isFinite(left) || left < 0 || left > 1000
+            || typeof width !== 'number' || !Number.isFinite(width) || width < 0 || width > 20000) throw new Error('内嵌视图尺寸无效');
+          overflowTop = Math.ceil(top); overflowLeft = Math.ceil(left); reportedWidth = Math.ceil(width);
+        }
+        // 先校验整份尺寸消息；拒绝的请求不能留下部分布局更新。
+        // 保活设置页隐藏时没有可测量视口，零尺寸不得覆盖最后一次有效高度，
+        // 否则恢复布局会压缩滚动范围并永久夹断用户的阅读位置。
+        if (inline || placement === 'settings' && iframe?.getClientRects().length) reportedHeight = Math.ceil(height);
         send({ type: 'response', requestId, ok: true, result: null }, expectedInstance);
         return;
       }
@@ -374,6 +433,7 @@
     });
     return () => {
       destroyed = true;
+      viewportObserver?.disconnect();
       window.removeEventListener('message', handleMessage);
       unsubscribeAppearance();
       unsubscribeComposer();
@@ -384,7 +444,7 @@
 
   $effect(() => {
     // 语言切换：读取响应式的 locale 即建立依赖。
-    void i18n.locale; void viewEntry; void placement;
+    void i18n.locale; void viewEntry; void placement; void conversation;
     sendHostContext();
   });
 
@@ -408,7 +468,12 @@
   class="plugin-view"
   class:plugin-view--settings={placement === 'settings'}
   class:plugin-view--sized={placement === 'settings' && reportedHeight !== null}
-  style:height={placement === 'settings' && reportedHeight !== null ? `${reportedHeight}px` : undefined}
+  class:plugin-view--inline={inline}
+  style:height={(placement === 'settings' || inline) && reportedHeight !== null ? `${reportedHeight}px` : inline ? '40px' : undefined}
+  style:margin-top={inline && overflowTop ? `${-overflowTop}px` : undefined}
+  style:margin-left={placement === 'settings' ? `${-settingsInsets.left}px` : inline && overflowLeft ? `${-overflowLeft}px` : undefined}
+  style:margin-right={placement === 'settings' ? `${-settingsInsets.right}px` : undefined}
+  style:width={placement === 'settings' ? `calc(100% + ${settingsInsets.left + settingsInsets.right}px)` : inline && reportedWidth ? `${reportedWidth}px` : undefined}
   data-testid={frameTestId}
   data-plugin-id={pluginId}
   src={resourceUrl}
@@ -418,11 +483,21 @@
     releaseResourceSubscriptions();
     releaseRoutes();
     reportedHeight = null;
+    overflowTop = 0; overflowLeft = 0; reportedWidth = null;
     documentDigest = resourceDigest;
     documentRuntimeId = runtime?.instanceId;
     documentEntry = entry;
+    viewportObserver?.disconnect();
+    if ((inline || placement === 'settings') && iframe?.parentElement) {
+      viewportObserver = new ResizeObserver(sendHostContext);
+      viewportObserver.observe(iframe.parentElement);
+      const frame = iframe.closest('.settings-frame');
+      if (frame && frame !== iframe.parentElement) viewportObserver.observe(frame);
+    }
     send({ type: 'init', pluginId, placement, viewId: currentViewId(), locale: i18n.locale, theme: readTheme(),
+      ...hostViewport(),
       resourceBase: documentRuntimeId ? agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/assets/${encodeURIComponent(documentDigest)}/${encodeURIComponent(documentRuntimeId)}/`) : undefined });
+    void sendConversationContext();
   }}
   sandbox="allow-scripts allow-downloads"
   referrerpolicy="no-referrer"
@@ -458,4 +533,5 @@
        短页面也要保留完整视口，不能让 fixed 浮层和 vh 限高跟着正文缩小。 */
     min-height: 100%;
   }
+  .plugin-view--inline { flex: none; background: transparent; }
 </style>

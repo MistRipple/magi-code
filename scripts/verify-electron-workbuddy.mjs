@@ -8,6 +8,8 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectAppPage, connectTarget, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
+import { verifyWorkbuddyStats } from './lib/workbuddy-stats-acceptance.mjs';
+import { previewFixedUpstreamFromNative, waitForPluginModel } from './lib/plugin-native-acceptance.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
@@ -15,6 +17,8 @@ const port = 38938, cdpPort = 9308, origin = `http://127.0.0.1:${port}`;
 const work = await mkdtemp(join(tmpdir(), 'magi-workbuddy-live-'));
 const output = process.env.MAGI_WORKBUDDY_OUTPUT || join(root, 'target/plugin-acceptance/workbuddy');
 const report = createReporter(), errors = [];
+const lifecycleRequests = [];
+const clipAuditSource = process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE ? await readFile(process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE, 'utf8') : null;
 let app, page, frame, ui, pluginId;
 await mkdir(output, { recursive: true });
 await mkdir(join(work, 'dsh'), { mode: 0o700 });
@@ -29,7 +33,11 @@ const api = async (path, body, method = body === undefined ? 'GET' : 'POST') => 
   return value;
 };
 const installed = async () => (await api('/api/plugins')).plugins.find((p) => p.manifest.name === 'DSH Connect WorkBuddy');
-const screenshot = async (name) => writeFile(join(output, `${name}.png`), Buffer.from(await ui.screenshot(), 'base64'));
+const screenshot = async (name) => {
+  // DOM 已渲染不等于合成帧已提交；截图要记录实际完成绘制的页面。
+  await page.evaluate('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+  await writeFile(join(output, `${name}.png`), Buffer.from(await ui.screenshot(), 'base64'));
+};
 const tab = async (id) => {
   if (!await page.evaluate('Boolean(document.querySelector("[data-testid=settings-page]")?.getClientRects().length)')) await ui.click('[data-testid=sidebar-settings]');
   await waitFor(async () => {
@@ -39,6 +47,40 @@ const tab = async (id) => {
     return page.evaluate(`document.querySelector(${JSON.stringify(selector)})?.getAttribute('aria-current') === 'page'`);
   }, `设置分类 ${id}`);
 };
+async function verifyAuthorizationLayout() {
+  const selector = '[data-testid=plugin-page-review-permissions]';
+  const caption = await ui.text(selector);
+  try {
+    for (const width of [1280, 390]) {
+      await page.call('Emulation.setDeviceMetricsOverride', { width, height: 844, deviceScaleFactor: 1, mobile: false });
+      for (const long of width === 390 ? [false, true] : [false]) {
+        await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).textContent=${JSON.stringify(caption)};true`);
+        if (long) await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).textContent='Review permissions and enable';true`);
+        await screenshot(`authorization-${width}${long ? '-long' : ''}`);
+        const bounds = await page.evaluate(`(() => {const nodes=[...document.querySelectorAll('.settings-main > .main-header h2, [data-testid=plugin-page-header] button')];return nodes.map(node=>{const r=node.getBoundingClientRect();return {text:node.innerText,x:r.x,right:r.right,y:r.y,bottom:r.bottom,visible:r.width>0&&r.height>0&&r.x>=0&&r.right<=innerWidth&&r.bottom<=innerHeight};});})()`);
+        const audit = clipAuditSource && await page.evaluate(`(${clipAuditSource})({root:'.settings-main',viewport:true})`);
+        await writeFile(join(output, `authorization-${width}${long ? '-long' : ''}.json`), JSON.stringify({ bounds, audit }, null, 2));
+        const overlap = bounds.some((a, index) => bounds.slice(index + 1).some(b => a.x < b.right && a.right > b.x && a.y < b.bottom && a.bottom > b.y));
+        report.check(`${width}px 插件标题和授权入口${long ? '加长文案' : ''}完整可见且无重叠或阴影裁切`, bounds.every(item => item.visible) && !overlap && (!audit || audit.cut === 0), JSON.stringify({ bounds, audit }));
+      }
+    }
+  } finally {
+    await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).textContent=${JSON.stringify(caption)};true`);
+    await page.call('Emulation.clearDeviceMetricsOverride');
+  }
+}
+async function start() {
+  app = launchApp({ executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort,
+    env: { MAGI_STATE_ROOT: join(work, 'state'), DSH_HOME: join(work, 'dsh'), MAGI_DESKTOP_DAEMON_PORT: String(port), MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '' } });
+  page = await waitFor(() => connectAppPage(cdpPort, port, errors), '真实 Magi 主窗口', 60_000);
+  await page.call('Network.enable');
+  page.on('Network.requestWillBeSent', ({ request }) => {
+    const action = request.url.match(/\/api\/plugins\/[^/]+\/(authorize|enable|activate|deactivate|disable)$/)?.[1];
+    if (action && request.method === 'POST') lifecycleRequests.push({ action, ...JSON.parse(request.postData || '{}') });
+  });
+  ui = pageTools(page);
+  await waitFor(() => ui.exists('[data-testid=sidebar-settings]'), '工作台');
+}
 async function verifyCliCommand(selected) {
   const binary = process.env.MAGI_WORKBUDDY_CLI_BINARY;
   if (!binary) return;
@@ -101,11 +143,7 @@ async function verifyCliCommand(selected) {
 try {
   report.check('独立验收端口空闲', !await fetch(origin + '/health').then(() => true, () => false)
     && !await fetch(`http://127.0.0.1:${cdpPort}/json/version`).then(() => true, () => false));
-  app = launchApp({ executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort,
-    env: { MAGI_STATE_ROOT: join(work, 'state'), DSH_HOME: join(work, 'dsh'), MAGI_DESKTOP_DAEMON_PORT: String(port), MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '' } });
-  page = await waitFor(() => connectAppPage(cdpPort, port, errors), '真实 Magi 主窗口', 60_000);
-  ui = pageTools(page);
-  await waitFor(() => ui.exists('[data-testid=sidebar-settings]'), '工作台');
+  await start();
   await tab('plugins');
   await waitFor(() => ui.exists('[data-testid=plugin-search]'), '插件搜索');
   await page.evaluate('const input=document.querySelector("[data-testid=plugin-search]"); input.value="dsh-connect-workbuddy"; input.dispatchEvent(new Event("input",{bubbles:true})); true');
@@ -113,7 +151,7 @@ try {
   await waitFor(() => ui.exists(upstreamRow), 'npm 在线搜索结果', 60_000);
   await ui.click(upstreamRow);
   report.check('在线搜索呈现真实 DSH 上游包', await ui.exists('[data-testid=plugin-upstream-badges]'));
-  await ui.click('[data-testid=plugin-detail-install]');
+  await previewFixedUpstreamFromNative({ page, packageName: 'dsh-connect-workbuddy', version: '5.21.2' });
   const preview = await waitFor(async () => {
     if (await ui.exists('[data-testid=plugin-candidate][data-origin=upstream]')) return { ok: true };
     const error = await page.evaluate('[...document.querySelectorAll("[role=status]")].map(e=>e.textContent).find(t=>t.includes("翻译上游插件失败"))');
@@ -121,15 +159,28 @@ try {
   }, '原包在线下载与翻译预览', 180_000);
   assert.ok(preview.ok, preview.error);
   const previewText = await ui.text('[data-testid=plugin-candidate]');
+  report.check('在线安装预览展示真实界面影响说明', await ui.exists('[data-testid=plugin-impact-ui]')
+    && /设置页/.test(await ui.text('[data-testid=plugin-impact-ui]')));
   report.check('预览显示 npm 完整性摘要与可选兼容限制', /sha512-/.test(previewText) && /可选路径/.test(previewText), previewText?.slice(-1500));
   await screenshot('install-preview');
   await ui.click('[data-action=confirm-candidate]');
   const plugin = await waitFor(installed, '确认在线安装', 120_000);
   pluginId = plugin.manifest.id;
+  assert.equal(plugin.manifest.version, '5.21.2');
+  report.check('WorkBuddy 工具和命令仍独立声明结果回注授权', plugin.manifest.permissions.some(permission => permission.kind === 'sessionWrite'
+    && permission.targets.includes('context') && permission.targets.includes('wake')));
   report.check(`已在线安装 ${plugin.manifest.name}@${plugin.manifest.version}`, plugin.source.kind === 'upstream');
   const row = `[data-testid=plugin-row][data-plugin-id="${pluginId}"]`;
-  await waitFor(() => ui.exists(row), '已安装列表项');
-  await ui.click(row);
+  await tab(`plugin:${pluginId}:settings`);
+  await waitFor(() => ui.exists('[data-testid=plugin-page-review-permissions]'), '未授权设置页的权限入口');
+  report.check('未授权的设置页不启动原包或自动授予权限', !await ui.exists(`iframe[data-plugin-id="${pluginId}"]`)
+    && !(await installed()).active && (await installed()).grants.length === 0 && lifecycleRequests.length === 0);
+  await verifyAuthorizationLayout();
+  await ui.click('[data-testid=plugin-page-review-permissions]');
+  await waitFor(() => page.evaluate(`document.querySelector(${JSON.stringify(row)})?.getAttribute('aria-current') === 'true'`), '管理页定位同一插件');
+  report.check('设置页授权入口定位同一插件并展示影响及权限', await ui.exists('[data-testid=plugin-impact-ui]')
+    && (await ui.text('[data-testid=plugin-detail]')).includes('完全信任'));
+  await screenshot('authorization-review');
   await waitFor(() => page.evaluate('Boolean(document.querySelector("[data-action=activate]")) && !document.querySelector("[data-action=activate]").disabled'), '授权激活');
   await ui.click('[data-action=activate]');
   const activated = await waitFor(async () => {
@@ -138,20 +189,23 @@ try {
   }, '真实 WorkBuddy 原包运行', 120_000);
   assert.equal(activated.runtime.state, 'running', activated.runtime.reason);
   report.check('真实 Cordis 原包激活成功', true);
-  const groups = await waitFor(async () => {
-    const catalog = (await api('/api/settings/models/catalog')).groups.filter((g) => g.pluginId === pluginId);
-    return catalog.some((g) => g.models.length) && catalog;
-  }, 'WorkBuddy 模型目录', 90_000);
-  const selected = groups.flatMap((g) => g.models.map((m) => ({ sourceId: g.sourceId, ...m })))
-    .find((m) => m.id === (process.env.MAGI_WORKBUDDY_MODEL || 'hy3'));
-  assert.ok(selected, '所选 WorkBuddy 模型必须真实出现在目录；不自动改用其他模型');
+  report.check('授权及启用均绑定用户查看的原包摘要', lifecycleRequests.length === 3
+    && lifecycleRequests.map(item => item.action).join(',') === 'authorize,enable,activate'
+    && lifecycleRequests.every(item => item.expectedDigest === plugin.digest));
+  report.check('配置只在设置页声明，原包同组件主区别名不生成主对话或右栏入口', activated.manifest.contributions.views.filter(view=>view.placements.includes('settings')).length === 1
+    && !activated.manifest.contributions.views.some(view=>view.placements.includes('main')||view.placements.includes('rightPane'))
+    && !await ui.exists('[data-testid=top-tab-plugin]'));
+  const selected = await waitForPluginModel({ request: api, pluginId, modelId: process.env.MAGI_WORKBUDDY_MODEL || 'deepseek-v4.1-flash',
+    record: value => writeFile(join(output, 'model-selection.json'), JSON.stringify(value, null, 2)) });
   report.check('真实 WorkBuddy 模型数据源进入主对话目录', Boolean(selected));
   await tab(`plugin:${pluginId}:settings`);
-  await waitFor(() => ui.exists('.settings-frame iframe'), '原包设置界面');
-  const frameUrl = await page.evaluate('document.querySelector(".settings-frame iframe").src');
+  await waitFor(() => ui.exists('.settings-frame:not([hidden]) iframe'), '原包设置界面');
+  const frameUrl = await page.evaluate('document.querySelector(".settings-frame:not([hidden]) iframe").src');
   frame = await waitFor(() => connectTarget(cdpPort, (t) => (t.type === 'iframe' || t.type === 'page') && t.url === frameUrl, 'WorkBuddy 原生设置', errors), 'WorkBuddy 设置 iframe');
   await waitFor(() => frame.evaluate('document.querySelectorAll("button").length > 3 && !document.body.innerText.includes("界面加载失败")'), '原生设置卡片渲染', 60_000);
   report.check('未经修改的上游设置卡片实际渲染', true);
+  report.check('原包配置通过独立插件设置 Tab 展示，主对话没有配置页签', await page.evaluate(`document.querySelector(${JSON.stringify(`[data-testid="settings-nav-plugin:${pluginId}:settings"]`)})?.getAttribute('aria-current') === 'page'`)
+    && !await ui.exists('[data-testid=top-tab-plugin]'));
   await screenshot('settings');
   const session = (await api('/api/session/materialize', { scope: 'personal' })).sessionId;
   await api('/api/settings/orchestrator/session/save', { scope: 'personal', sessionId: session, config: { sourceId: selected.sourceId, model: selected.id, reasoningEffort: null } });
@@ -167,17 +221,61 @@ try {
   await page.call('Page.navigate', { url: `${origin}/web.html?scope=personal&sessionId=${encodeURIComponent(session)}` });
   await waitFor(() => page.evaluate('document.body.innerText.includes("MAGI_WORKBUDDY_LIVE_OK")'), '真实回复展示');
   await screenshot('conversation');
+  const statsVerification = process.env.MAGI_WORKBUDDY_STATS === '1' ? await verifyWorkbuddyStats({ request:api,page,session,output,check:report.check }) : null;
+  await tab(`plugin:${pluginId}:settings`);
+  await waitFor(() => ui.exists(`iframe[data-plugin-id="${pluginId}"]`), '停用前真实原包文档');
+  const beforeStop = await installed();
+  const staleDocument = await page.evaluate(`document.querySelector('iframe[data-plugin-id="${pluginId}"]').src`);
   await tab('plugins');
   await waitFor(() => ui.exists(row), '插件列表'); await ui.click(row);
   await ui.click('[data-action=deactivate]');
   await waitFor(async () => !(await installed()).active, '停用原包');
   report.check('停用回收真实 WorkBuddy 模型数据源', !(await api('/api/settings/models/catalog')).groups.some((g) => g.pluginId === pluginId));
-  await waitFor(() => page.evaluate('Boolean(document.querySelector("[data-action=activate]")) && !document.querySelector("[data-action=activate]").disabled'), '再次激活'); await ui.click('[data-action=activate]');
+  await waitFor(() => page.evaluate(`!document.querySelector('iframe[data-plugin-id="${pluginId}"]')`), '停用回收保活设置文档');
+  const deniedDocument = await fetch(staleDocument);
+  report.check('停用回收隐藏页面，旧文档地址不能继续取得业务页面', [403,409].includes(deniedDocument.status));
+  await tab(`plugin:${pluginId}:settings`);
+  const requestOffset = lifecycleRequests.length;
+  await waitFor(() => ui.exists('[data-testid=plugin-page-header] [role=switch]:not([disabled])'), '已授权设置页的重新启用开关');
+  await ui.click('[data-testid=plugin-page-header] [role=switch]');
   await waitFor(async () => (await installed()).runtime?.state === 'running', '重新激活', 90_000);
-  report.check('重新激活真实原包成功', true);
+  const reactivated = await installed();
+  report.check('设置页重新启用保留授权，创建新实例且不重复授予权限', reactivated.runtime.instanceId !== beforeStop.runtime.instanceId
+    && JSON.stringify(reactivated.grants) === JSON.stringify(beforeStop.grants)
+    && lifecycleRequests.slice(requestOffset).map(item => item.action).join(',') === 'enable,activate'
+    && lifecycleRequests.slice(requestOffset).every(item => item.expectedDigest === plugin.digest));
+  await waitFor(() => ui.exists(`iframe[data-plugin-id="${pluginId}"]`), '重新启用后的原包文档');
+  await api(`/api/plugins/${pluginId}/authorize`, { grants: [], expectedDigest: plugin.digest });
+  await waitFor(() => ui.exists('[data-testid=plugin-page-review-permissions]'), '撤权后恢复明确授权入口');
+  report.check('撤权回收页面与模型来源，设置页不能静默补授权', (await installed()).grants.length === 0
+    && !(await installed()).active && !await ui.exists(`iframe[data-plugin-id="${pluginId}"]`)
+    && !(await api('/api/settings/models/catalog')).groups.some(group => group.pluginId === pluginId));
+  await ui.click('[data-testid=plugin-page-review-permissions]');
+  await waitFor(() => ui.exists('[data-action=activate]:not([disabled])'), '撤权后的原生授权恢复');
+  await ui.click('[data-action=activate]');
+  const reauthorized = await waitFor(async () => { const item = await installed(); return item.runtime?.state === 'running' && item; }, '明确重新授权后启动新实例', 90_000);
+  report.check('撤权后可在同一安装上明确重新授权恢复', reauthorized.digest === plugin.digest
+    && reauthorized.runtime.instanceId !== reactivated.runtime.instanceId
+    && JSON.stringify(reauthorized.grants) === JSON.stringify(beforeStop.grants));
+  await writeFile(join(output, 'lifecycle-requests.json'), JSON.stringify(lifecycleRequests, null, 2));
   await verifyCliCommand(selected);
+  const beforeRestart = await installed(), savedSettings = await api(`/api/plugins/${pluginId}/settings`);
+  frame?.close(); frame = null; page.close(); page = null;
+  await writeFile(join(output, 'before-restart.log'), app.log.join('')); await app.stop();
+  await start();
+  const restored = await waitFor(async () => { const item = await installed(); return item?.runtime?.state === 'running' && item; }, '应用重启恢复原包', 120_000);
+  await waitForPluginModel({ request: api, pluginId, modelId: selected.id,
+    record: value => writeFile(join(output, 'model-selection-restarted.json'), JSON.stringify(value, null, 2)) });
+  report.check('应用重启保持同一原包、授权和配置并恢复新宿主及真实模型目录', restored.digest === beforeRestart.digest
+    && restored.runtime.instanceId !== beforeRestart.runtime.instanceId && JSON.stringify(restored.grants) === JSON.stringify(beforeRestart.grants)
+    && JSON.stringify(await api(`/api/plugins/${pluginId}/settings`)) === JSON.stringify(savedSettings));
+  if (statsVerification) {
+    const restoredStats = await api('/api/settings/stats?sessionId='+encodeURIComponent(statsVerification.sessionId));
+    await writeFile(join(output,'stats-restored.json'),JSON.stringify(restoredStats,null,2));
+    report.check('完整重启恢复同一统计，无重复计数或模型重放',JSON.stringify(restoredStats.totals)===JSON.stringify(statsVerification.stats.totals));
+  }
   report.check('主窗口与上游设置无未捕获异常', errors.length === 0 && !/Uncaught|可信 Renderer 控制台错误/.test(app.log.join('')), errors.join('\n'));
-  await writeFile(join(output, 'installed.json'), JSON.stringify({ pluginId, version: plugin.manifest.version, source: plugin.source, model: selected.id, sessionId: session, turnId: turn.turnId, stateRoot: join(work, 'state') }, null, 2));
+  await writeFile(join(output, 'installed.json'), JSON.stringify({ completed: true, pluginId, version: plugin.manifest.version, digest: plugin.digest, source: plugin.source, model: selected.id, sessionId: session, turnId: turn.turnId, stateRoot: join(work, 'state') }, null, 2));
   console.log(report.summary());
 } catch (error) {
   console.error(error);

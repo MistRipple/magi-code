@@ -1,10 +1,7 @@
 use crate::dto::{
-    AuditUsageLedgerDto, BootstrapDto, BridgeCutoverSmokeProvider, BridgeCutoverSmokeSnapshotDto,
-    BridgeCutoverSmokeSnapshotProvider, BridgePreflightProvider, BridgePreflightSnapshotDto,
-    BridgePreflightSnapshotProvider, BridgeProbeSnapshotProvider, BridgeServicesSnapshotDto,
-    BridgeSnapshotProvider, DaemonIdentity, DirectHttpModelProbeConfig, HealthDto,
-    RuntimeReadModelDto, ServiceInfo, SessionTurnRequestDto, SessionTurnRouteDto,
-    VersionHandshakeDto, runtime_read_model_dto_with_usage,
+    AuditUsageLedgerDto, BootstrapDto, DaemonIdentity, HealthDto, RuntimeReadModelDto, ServiceInfo,
+    SessionTurnRequestDto, SessionTurnRouteDto, VersionHandshakeDto,
+    runtime_read_model_dto_with_usage,
 };
 use crate::errors::ApiError;
 use crate::mcp_config::{
@@ -16,10 +13,7 @@ use crate::model_config::{
 };
 use crate::scope_binding::strip_scope_binding_fields;
 use crate::skill_loader;
-use magi_bridge_client::{
-    BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerClient,
-    ModelBridgeClient,
-};
+use magi_bridge_client::{McpServerClient, ModelBridgeClient};
 use magi_browser_authority::{
     BrowserAuthority, BrowserAuthorityError, BrowserCapabilitySnapshot, BrowserControlLease,
     BrowserDurableState, BrowserHostClient, BrowserHostCommand, BrowserHostCommandOutcome,
@@ -46,7 +40,6 @@ use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{
-    OrchestratedExecutionRuntime,
     task_store::{TaskStore, TaskStoreSnapshot},
     task_worker_catalog::{WorkerInfo, build_worker_catalog_for_roles},
 };
@@ -954,16 +947,6 @@ impl RunnerManager {
         })
     }
 
-    /// Run a single cycle synchronously (for testing / manual trigger).
-    pub fn run_single_cycle(&self, root_task_id: &str) -> Result<RunCycleOutcome, String> {
-        let tid = TaskId::new(root_task_id);
-        self.task_store
-            .get_task(&tid)
-            .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
-        let task_runner = self.build_task_runner(None);
-        Ok(task_runner.run_cycle(&tid))
-    }
-
     pub fn kill_tree(&self, root_task_id: &str) -> Result<(), String> {
         let tid = TaskId::new(root_task_id);
         self.task_store
@@ -1440,10 +1423,6 @@ pub struct ApiState {
     session_projection_persist: Option<SessionProjectionPersist>,
     unavailable_session_discard: Option<UnavailableSessionDiscard>,
     workspace_history_restore: Option<WorkspaceHistoryRestore>,
-    bridge_probe_snapshot_provider: BridgeProbeSnapshotProvider,
-    bridge_preflight_snapshot_provider: BridgePreflightSnapshotProvider,
-    bridge_cutover_smoke_provider: BridgeCutoverSmokeSnapshotProvider,
-    bridge_snapshot_provider: Option<Arc<dyn BridgeSnapshotProvider>>,
     execution_pipeline: Option<ExecutionPipeline>,
     task_execution_registry: TaskExecutionRegistry,
     task_store: Option<Arc<TaskStore>>,
@@ -1455,7 +1434,6 @@ pub struct ApiState {
     session_turn_dispatcher: Option<Arc<LlmTaskDispatcher>>,
     mcp_connections: Arc<RwLock<HashMap<String, Arc<McpServerClient>>>>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
-    model_bridge_client_is_real: bool,
     tool_registry: Option<ToolRegistry>,
     pub browser_authority: Arc<Mutex<BrowserAuthority>>,
     browser_write_lock: Arc<Mutex<()>>,
@@ -2267,10 +2245,6 @@ impl ApiState {
             session_projection_persist: None,
             unavailable_session_discard: None,
             workspace_history_restore: None,
-            bridge_probe_snapshot_provider: BridgeProbeSnapshotProvider::default(),
-            bridge_preflight_snapshot_provider: BridgePreflightSnapshotProvider::default(),
-            bridge_cutover_smoke_provider: BridgeCutoverSmokeSnapshotProvider::default(),
-            bridge_snapshot_provider: None,
             execution_pipeline: None,
             task_execution_registry: TaskExecutionRegistry::default(),
             task_store: None,
@@ -2279,7 +2253,6 @@ impl ApiState {
             session_turn_dispatcher: None,
             mcp_connections: Arc::new(RwLock::new(HashMap::new())),
             model_bridge_client: None,
-            model_bridge_client_is_real: false,
             tool_registry: None,
             browser_authority,
             browser_write_lock,
@@ -2648,20 +2621,6 @@ impl ApiState {
         self.managed_process_group.terminate_all()
     }
 
-    pub fn with_bridge_probe_transport(
-        mut self,
-        server_kind: BridgeServerKind,
-        transport: Arc<dyn BridgeTransport>,
-    ) -> Self {
-        self.bridge_probe_snapshot_provider
-            .register_transport(server_kind, transport.clone());
-        self.bridge_preflight_snapshot_provider
-            .register_transport(server_kind, transport.clone());
-        self.bridge_cutover_smoke_provider
-            .register_transport(server_kind, transport);
-        self
-    }
-
     pub fn task_worker_catalog(&self) -> Vec<WorkerInfo> {
         // Runner 同时承接主线 coordinator task 和 agent_spawn 创建的 Worker task。
         // registry 对外的 role template 列表只包含可被 agent_spawn 派发的角色，
@@ -2674,37 +2633,13 @@ impl ApiState {
         build_worker_catalog_for_roles(&self.agent_role_registry, role_ids)
     }
 
-    pub fn with_bridge_probe(
-        mut self,
-        server_kind: BridgeServerKind,
-        probe: JsonRpcBridgeServerProbeClient,
-    ) -> Self {
-        self.bridge_probe_snapshot_provider
-            .register_probe(server_kind, probe);
-        self
-    }
-
-    pub fn with_direct_http_model_probe(mut self, config: DirectHttpModelProbeConfig) -> Self {
-        self.bridge_cutover_smoke_provider
-            .register_direct_http_probe(config);
-        self
-    }
-
-    pub fn with_bridge_snapshot_provider(
-        mut self,
-        provider: Arc<dyn BridgeSnapshotProvider>,
-    ) -> Self {
-        self.bridge_snapshot_provider = Some(provider);
-        self
-    }
-
     pub fn with_execution_pipeline(
         mut self,
-        execution_runtime: OrchestratedExecutionRuntime,
+        task_store: Arc<TaskStore>,
         memory_store: MemoryStore,
     ) -> Self {
         self.execution_pipeline = Some(ExecutionPipeline {
-            execution_runtime,
+            task_store,
             memory_store,
         });
         self
@@ -2745,21 +2680,6 @@ impl ApiState {
     ) -> Self {
         self.agent_role_registry = registry;
         self
-    }
-
-    pub fn cancel_active_tool_executions(
-        &self,
-        session_id: Option<&SessionId>,
-        workspace_id: Option<&WorkspaceId>,
-        task_id: Option<&TaskId>,
-    ) -> usize {
-        self.cancel_execution_resources(
-            session_id,
-            workspace_id,
-            task_id,
-            BrowserLeaseEndReason::TurnStopped,
-        )
-        .total()
     }
 
     /// 任务（含子任务）进入终态：释放它自己的进程、浏览器租约与默认浏览器目标，
@@ -2981,10 +2901,6 @@ impl ApiState {
     ) -> Vec<BrowserControlLease> {
         self.execution_resources
             .cancel_surface(tab_id, surface_id, reason, UtcMillis::now())
-    }
-
-    pub fn execution_resource_coordinator(&self) -> &ExecutionResourceCoordinator {
-        &self.execution_resources
     }
 
     pub fn browser_host_status(&self) -> BrowserHostStatusSnapshot {
@@ -3261,17 +3177,6 @@ impl ApiState {
         &self.runtime_epoch
     }
 
-    pub fn bootstrap_dto(&self) -> Result<BootstrapDto, ApiError> {
-        BootstrapDto::from_state(self)
-    }
-
-    pub fn bootstrap_dto_for_session(
-        &self,
-        requested_session_id: Option<&SessionId>,
-    ) -> Result<BootstrapDto, ApiError> {
-        BootstrapDto::from_state_with_selected_session(self, requested_session_id)
-    }
-
     pub(crate) fn canonical_event_next_sequence_for(
         &self,
         session_id: Option<&SessionId>,
@@ -3369,7 +3274,9 @@ impl ApiState {
             .and_then(RuntimeStatePersistence::state_root)
             .map(Path::to_path_buf)
             .unwrap_or_else(|| std::env::temp_dir().join("magi"));
-        state_root
+        // 在唯一目录入口解析状态根的物理身份，尚未创建的会话目录只拼接。
+        // 接纳、映射和实际工具执行必须共用路径，不能把 /var 别名当作目录替换。
+        magi_tool_runtime::canonicalize_tool_permission_path(&state_root)
             .join("personal-sessions")
             .join(session_id.as_str())
     }
@@ -3473,21 +3380,6 @@ impl ApiState {
         self.event_bus.runtime_ledger_summary()
     }
 
-    pub fn bridge_services_dto(&self) -> BridgeServicesSnapshotDto {
-        self.bridge_snapshot_provider
-            .as_ref()
-            .map(|provider| provider.services_snapshot())
-            .unwrap_or_else(|| self.bridge_probe_snapshot_provider.services_snapshot())
-    }
-
-    pub fn bridge_preflight_dto(&self) -> BridgePreflightSnapshotDto {
-        self.bridge_preflight_snapshot_provider.preflight_snapshot()
-    }
-
-    pub fn bridge_cutover_smoke_dto(&self) -> BridgeCutoverSmokeSnapshotDto {
-        self.bridge_cutover_smoke_provider.cutover_smoke_snapshot()
-    }
-
     pub fn version_handshake_dto(&self) -> VersionHandshakeDto {
         VersionHandshakeDto::from_service_info(&self.service_info, &self.daemon_identity)
     }
@@ -3503,20 +3395,6 @@ impl ApiState {
 
     pub fn task_execution_registry(&self) -> &TaskExecutionRegistry {
         &self.task_execution_registry
-    }
-
-    pub fn settings_snapshot_json(&self) -> serde_json::Value {
-        self.settings_snapshot_json_with_mcp_hydration(true)
-    }
-
-    pub fn settings_snapshot_json_with_mcp_hydration(
-        &self,
-        hydrate_mcp_servers: bool,
-    ) -> serde_json::Value {
-        self.settings_snapshot_json_with_mcp_hydration_and_tool_context(
-            hydrate_mcp_servers,
-            &ToolExecutionContext::default(),
-        )
     }
 
     pub fn settings_snapshot_json_with_mcp_hydration_and_tool_context(
@@ -4915,6 +4793,17 @@ impl ApiState {
 
     pub fn with_task_store(mut self, store: Arc<TaskStore>) -> Self {
         let source = Arc::downgrade(&store);
+        self.session_store.set_goal_task_activity_resolver(Arc::new(
+            move |root, session, goal, tasks| {
+                source
+                    .upgrade()
+                    .ok_or_else(|| DomainError::InvalidState {
+                        message: "目标任务状态查询不可用".into(),
+                    })?
+                    .goal_has_active_bound_tasks(root, session, goal, tasks)
+            },
+        ));
+        let source = Arc::downgrade(&store);
         self.session_store
             .set_agent_run_transfer_resolver(Arc::new(move |task| {
                 source
@@ -5278,12 +5167,7 @@ impl ApiState {
                 root_task_id: self
                     .session_store
                     .active_execution_chain(&turn.session_id)
-                    .filter(|chain| {
-                        chain
-                            .current_turn
-                            .as_ref()
-                            .is_some_and(|current| &current.turn_id == turn_id)
-                    })
+                    .filter(|chain| chain.current_turn_id.as_ref() == Some(turn_id))
                     .map(|chain| chain.root_task_id),
                 settled_at: None,
                 error: None,
@@ -5670,12 +5554,6 @@ impl ApiState {
         self
     }
 
-    pub fn with_real_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
-        self.model_bridge_client = Some(client);
-        self.model_bridge_client_is_real = true;
-        self
-    }
-
     pub fn with_skill_runtime(
         mut self,
         skill_runtime: Arc<magi_skill_runtime::SkillRuntime>,
@@ -5779,9 +5657,6 @@ impl ApiState {
         self.model_bridge_client.as_ref()
     }
 
-    pub fn model_bridge_client_is_real(&self) -> bool {
-        self.model_bridge_client_is_real
-    }
 }
 
 fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_json::Value>) {
@@ -7649,7 +7524,7 @@ mod tests {
             .create_session(session_id.clone(), "active chain cleanup")
             .expect("session should create");
         session_store
-            .upsert_active_execution_chain(
+            .seed_execution_chain_for_test(
                 session_id.clone(),
                 ActiveExecutionChain {
                     session_id: session_id.clone(),
@@ -7657,17 +7532,14 @@ mod tests {
                     root_task_id: root_task_id.clone(),
                     execution_chain_ref: "chain-active-runner-cleanup".to_string(),
                     workspace_id: None,
-                    active_branch_task_ids: Vec::new(),
-                    active_worker_bindings: Vec::new(),
                     branches: Vec::new(),
-                    recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
                         accepted_at: UtcMillis::now(),
                         entry_id: "entry-active-runner-cleanup".to_string(),
                         trimmed_text: None,
                         skill_name: None,
                     },
-                    current_turn: None,
+                    current_turn_id: None,
                 },
             )
             .expect("active chain should persist");

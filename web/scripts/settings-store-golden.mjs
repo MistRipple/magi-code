@@ -389,17 +389,39 @@ const imageStats = aggregateUsageStatsForDisplay([
 assert.equal(imageStats?.totalExecutions, 3, '图片模型必须按生成调用次数统计');
 assert.equal(imageStats?.successCount, 2, '图片模型成功与失败调用必须进入统一统计');
 assert.equal(imageStats?.totalTokens, 0, '图片接口未返回 usage 时不能伪造 Token');
+assert.equal(imageStats?.tokenObservedCallCount, 0, '未报告用量不能当作真实零值');
 assert.deepEqual(imageStats?.resolvedModels, ['gpt-image-test']);
+
+const sharedAuxiliaryUsage = {
+  templateId: 'auxiliary', engineId: 'same-model', role: 'auxiliary',
+  llmCallCount: 1, assignmentCount: 0, successCount: 1, failureCount: 0,
+  totalTokens: 12, netInputTokens: 10, netOutputTokens: 2, resolvedModel: 'model-a',
+};
+const pluginUsage = [
+  sharedAuxiliaryUsage,
+  { ...sharedAuxiliaryUsage, pluginId: 'example-a' },
+  { ...sharedAuxiliaryUsage, pluginId: 'example-b' },
+];
+assert.equal(aggregateUsageStatsForDisplay(pluginUsage, 'auxiliary')?.totalExecutions, 1,
+  '插件调用不得混入原生辅助模型角色');
+assert.equal(aggregateUsageStatsForDisplay(pluginUsage, 'plugin:example-a')?.totalExecutions, 1,
+  '同一模型上的插件必须分别展示实际用量');
 
 assert.match(
   settingsStatsTabSource,
   /binding\.role === ['"]image_generation['"][\s\S]*?return ['"]imageGeneration['"]/,
   '图片模型账本角色必须映射到产品角色标识',
 );
-assert.match(
-  settingsStatsTabSource,
-  /settings\.stats\.imageUsageMetricHint/,
-  '图片接口未返回 usage 时必须解释调用次数与 Token 的统计口径',
-);
+// 观测覆盖来自 daemon；图片和文本使用同一合同，不再按模型种类推断缺失。
+const zeroUsage = { ...sharedAuxiliaryUsage, totalTokens:0, netInputTokens:0, netOutputTokens:0 };
+assert.equal(aggregateUsageStatsForDisplay([zeroUsage], 'auxiliary')?.tokenObservedCallCount, 0);
+assert.equal(aggregateUsageStatsForDisplay([{ ...zeroUsage, tokenObservedCallCount:1 }], 'auxiliary')?.tokenObservedCallCount, 1,
+  '提供方明确报告零用量仍是已知观测');
+const partialUsage = aggregateUsageStatsForDisplay([
+  zeroUsage, { ...sharedAuxiliaryUsage, tokenObservedCallCount:1 },
+], 'auxiliary');
+assert.equal(partialUsage?.tokenObservedCallCount, 1);
+assert.equal(partialUsage?.totalExecutions, 2);
+assert.equal(partialUsage?.totalTokens, 12, '部分缺失时保留已报告合计及真实覆盖数');
 
 console.log('settings store golden tests passed');

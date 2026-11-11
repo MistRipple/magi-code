@@ -1,6 +1,6 @@
 use crate::{
     AuditUsageLedgerError, AuditUsageLedgerSnapshot, AuditUsageLedgerStatus, EventEnvelope,
-    EventStreamSnapshot, RecoveryReadModelInput, RuntimeLedgerSummary, RuntimeReadModelInput,
+    EventStreamSnapshot, RuntimeLedgerSummary, RuntimeReadModelInput,
 };
 use magi_core::UtcMillis;
 use std::path::PathBuf;
@@ -142,14 +142,6 @@ impl InMemoryEventBus {
                 .expect("event bus recent events read lock poisoned")
                 .clone(),
         }
-    }
-
-    pub fn recovery_read_model_input(&self) -> RecoveryReadModelInput {
-        let recent_events = self
-            .recent_events
-            .read()
-            .expect("event bus recent events read lock poisoned");
-        RecoveryReadModelInput::from_events(&recent_events)
     }
 
     pub fn runtime_read_model_input(&self) -> RuntimeReadModelInput {

@@ -89,13 +89,13 @@ extension/index.mjs        声明了 extension 时必需，唯一后台入口
 ui/…                       视图页面与静态资源，按需
 ```
 
-**包里只允许这三类文件**，其他任何文件（`README.md`、`LICENSE`、`package.json`、`.DS_Store`、`node_modules/`、其他目录……）都会让安装失败，报“发布包含未允许的文件类型或入口”：
+包内文件按目录准入，根目录只允许清单；运行代码和静态资源分别归属以下位置：
 
 - `manifest.json`；
-- `extension/index.mjs`；
+- `extension/index.mjs` 及 `extension/` 下的 JS／JSON 依赖；DSH 原包及其资源保留于 `extension/upstream/`；
 - `ui/` 下扩展名为 `html`、`css`、`js`、`mjs`、`json`、`svg`、`png`、`jpg`、`jpeg`、`webp`、`gif`、`avif`、`bmp`、`ico`、`woff`、`woff2` 的文件。
 
-文本文件必须是 UTF-8。限制：整包不超过 16 MiB，展开后不超过 32 MiB，最多 4096 个文件；浏览器及 Node 的 JavaScript 模块单文件最多 16 MiB，其余文件最多 4 MiB。脚本容量适用于包内代码模块，不限于后台入口，所有文件仍计入展开总量。不得有符号链接、可执行文件、原生程序或 WASM、路径穿越。预览、安装和升级的 JSON 上传容量按归档的 base64 长度另加 64 KiB 元数据计算；这不增加归档本身的大小上限。
+文本文件必须是 UTF-8。限制：整包及展开后均不超过 64 MiB，最多 4096 个文件；浏览器及 Node 的 JavaScript 模块单文件最多 16 MiB，其余文件最多 4 MiB。脚本容量适用于包内代码模块，不限于后台入口，所有文件仍计入展开总量。不得有符号链接、特殊文件或路径穿越。普通页面及扩展源码不能夹带原生程序或 WASM；声明 Node `extension` 且通过 `extension:["full-trust"]` 授权的插件，可在 `extension/upstream/` 中保留原有 WASM、二进制辅助资源及分片，仍受相同容量和路径检查约束；只有既有 `native/` 辅助程序目录可保留执行位。受信 Node 可执行系统程序，这些准入不构成操作系统沙箱。预览、安装和升级的 JSON 上传容量按归档的 base64 长度另加 64 KiB 元数据计算；这不增加归档本身的大小上限。
 
 清单字段：
 
@@ -358,6 +358,8 @@ await api.on('tool.call', async (event, ctx) => {
 
 声明工具需要三处一致：`contributions.tools` 条目、覆盖该工具 ID 的 `tools` 权限、`api.tool` 绑定。
 
+插件按应用全局激活，工具进入同一全局目录。模型通过 `tool_catalog` 的 `query` 搜索，再用 `tool_names` 指定返回的 `model_tool_name` 并设置 `include_schema:true`，取得后续请求需要的定义；注册工具不意味着每次请求携带全部 schema，也不需要用户在各会话重新启用插件。工具调用仍由 daemon 按实际权限、任务和实例裁决。
+
 ```json
 {
   "sdkVersion": 2,
@@ -468,6 +470,25 @@ const reply = await api.model.invoke({ prompt: '用一句话总结……', maxOu
 - 调用经 Magi 的模型服务，计入用量账本并归属当前会话；直接用 Node 自己的网络请求不在这个账本里。
 - `api.credential.ref({ roleId? })` 返回模型绑定引用（`model-default` 或 `model-role:<roleId>`），**不返回密钥**；它只能交给 `model.invoke` 的 `credentialRef` 使用。
 
+页面路由中的独立模型业务使用 `model.operations`，保持插件默认全局：
+
+```js
+await api.route('/generate', async (input, context) => {
+  const selection = await api.model.selection();
+  const reply = await api.model.invoke({
+    operationId: input.body.operationId, // 同一业务使用稳定身份，显式新请求使用新身份
+    selection,
+    messages: [{ role: 'user', content: input.body.text }],
+    maxOutputTokens: 800,
+  }, { signal: context.signal });
+  return { body: reply };
+});
+```
+
+需 `models:["default"]`，模型来自用户全局默认选择，包含已选插件来源；该页面业务的用量归属插件操作，不创建用户会话。保留有序角色、图片、工具定义／调用／结果、生成控制、原生推理续写数据及实际结束原因；工具定义不授予原生工具执行权。协商 `model.streaming` 后可传入 `onDelta` 接收同一次调用的正文／推理进度，回调异常或 signal 取消中止该调用。已确认结果按身份读取，发送后结果未知时须由用户核对并显式发起新操作；关闭页面或停用会取消在途调用。完整字段、限制与恢复合同见[页面模型操作](extension-protocol-v1.md#页面模型操作)。
+
+`selection.reasoning`（若有）是 Magi 原生推理能力：`supportedEfforts`、`defaultEffort`、`transport`、`source`。插件直接读取原生档位（关闭推理为 `none`），并将完整 selection 原样交回模型调用；DSH 的 `off` 和 `efforts` 结构由翻译器负责转换，不是原生插件合同。
+
 ### 提供主对话模型数据源
 
 ```json
@@ -487,7 +508,7 @@ await api.modelSource.clear('gateway');
 
 - 数据源 ID 必须先在清单 `contributions.modelSources` 声明，并有同名 `modelSources` 权限；展示名取清单里的 `title`。最多 8 个。
 - `set` 是整体替换：新的 `models` 取代旧的。校验与用户自己配置的数据源相同（地址有效、模型 ID 非空且唯一）。
-- **只影响主对话，只追加**：数据源以“插件”分组出现在主对话的模型选择器里，身份是 `plugin/<pluginId>/<id>`。它不覆盖用户配置的数据源，不会成为默认选择，子代理、`model.invoke`、辅助、识图和生图模型都不会使用它。
+- **目录只追加**：数据源以“插件”分组出现在主对话的模型选择器里，身份是 `plugin/<pluginId>/<id>`，不覆盖用户配置的数据源。获 `models:["default"]` 授权的页面模型操作也可消费用户已选的同一来源；工具／命令的 `model.invoke`、子代理、辅助、识图和生图模型仍沿原有选择规则。
 - **只存在于本次运行**：连接信息只在 daemon 内存中，不写盘。插件停用、卸载、崩溃或宿主退出时自动撤销；重启后的实例在 `activate` 里再次提交。已选用该数据源的会话在它不可用期间会明确报错，不会改用其他模型；恢复后可继续使用。
 - Magi 设置页不为插件另设数据源列表：用户在对话输入区的模型选择器里看到“插件”分组，插件的启停与授权在插件管理里。授权时会提示：选用后主对话内容（对话历史、工具结果等）会发送到你提供的地址。
 

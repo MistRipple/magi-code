@@ -1178,9 +1178,29 @@ await withGoldenViteServer(async (server) => {
   );
   assert.deepEqual(
     resumedRootHints,
-    { rootTaskId: 'task-resumed-root', activeTaskIds: [] },
-    'detached 会话必须从最近事件恢复最新 root，不能继续固定已被续跑取代的中断任务',
+    { rootTaskId: '', activeTaskIds: [] },
+    'detached 会话不能从旧事件重建已被权威投影清除的 root',
   );
+
+  const scopedTrackingPayload = {
+    runtimeReadModel: {
+      details: {
+        sessions: [{ session_id: 'session-scoped', root_task_id: 'root-scoped',
+          active_task_ids: ['root-scoped', 'done-scoped', 'missing-scoped'], active_execution_group_ids: ['mission-shared'] }],
+        tasks: [{ task_id: 'root-scoped', current_status: 'running', mission_id: 'mission-shared' },
+          { task_id: 'done-scoped', current_status: 'completed', mission_id: 'mission-shared' },
+          { task_id: 'transferred-scoped', current_status: 'running', mission_id: 'mission-shared' }],
+        execution_groups: [{ mission_id: 'mission-shared', active_task_ids: ['transferred-scoped'] }],
+      },
+      overview: { activity: { active_task_ids: ['transferred-scoped'] } },
+    },
+    recentEvents: [{ session_id: 'session-scoped', payload: { root_task_id: 'transferred-scoped' } }],
+  };
+  assert.deepEqual(bridgeModule.extractBootstrapAgentRunTrackingHints({ sessionId: 'session-scoped' }, scopedTrackingPayload),
+    { rootTaskId: 'root-scoped', activeTaskIds: ['root-scoped'] },
+    '重连跟踪只读取当前会话明确的 Task 身份，mission 和旧事件不能扩展范围');
+  assert.deepEqual(bridgeModule.extractBootstrapAgentRunTrackingHints({ sessionId: '' }, scopedTrackingPayload),
+    { rootTaskId: '', activeTaskIds: [] }, '缺少会话身份不能接管首个运行会话');
 
   const bridge = bridgeModule.createWebClientBridge();
   bridgeRuntime.setClientBridge(bridge);

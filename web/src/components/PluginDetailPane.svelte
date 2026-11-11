@@ -5,10 +5,11 @@
    */
   import { i18n } from '../stores/i18n.svelte';
   import type { InstalledPluginProjection } from '../web/plugin-api';
-  import type { PluginManifest, PluginPermission, PluginRuntimeStatus } from '../shared/app-server-protocol.generated';
-  import { installedUpstreamRequest, pluginSettingsTab, type StoreItem } from '../lib/plugin-store';
+  import type { PluginManifest, PluginRuntimeStatus } from '../shared/app-server-protocol.generated';
+  import { permissionText, installedUpstreamRequest, pluginSettingsTab, type StoreItem } from '../lib/plugin-store';
   import Icon from './Icon.svelte';
   import PluginIcon from './PluginIcon.svelte';
+  import PluginImpactNotices from './PluginImpactNotices.svelte';
 
   interface Props {
     item: StoreItem;
@@ -41,24 +42,6 @@
   const translationRuntime = $derived(plugin?.translationRuntime);
   const runtimeUpdate = $derived(translationRuntime?.state === 'updateAvailable' && item.upstream?.state !== 'updatable');
   const versionUpdate = $derived(item.catalog?.state === 'updatable' ? item.catalog.version : item.upstream?.state === 'updatable' ? item.upstream.version : null);
-
-  function permissionText(permission: PluginPermission): string {
-    if (permission.kind === 'client') return i18n.t('settings.plugins.permission.client');
-    if (permission.kind === 'attachments') return i18n.t('settings.plugins.permission.attachments');
-    if (permission.kind === 'sessionWrite') return permission.targets.map(target => i18n.t(target === 'wake' ? 'settings.plugins.permission.sessionWrite.wake' : 'settings.plugins.permission.sessionWrite.context')).join('；');
-    if (permission.kind === 'sessionRead') return i18n.t('settings.plugins.permission.sessionRead');
-    if (permission.kind === 'composer') return permission.targets.map(target => i18n.t(target === 'text'
-      ? 'settings.plugins.permission.composerText' : 'settings.plugins.permission.composer')).join('\n');
-    if (permission.kind === 'extension') return i18n.t('settings.plugins.permission.extensionFullTrust');
-    if (permission.kind === 'pluginManagement') return [
-      i18n.t(permission.targets.includes('authorize') ? 'settings.plugins.permission.pluginAuthorization' : 'settings.plugins.permission.pluginManagement'),
-      ...(permission.targets.includes('compatibility') ? [i18n.t('settings.plugins.permission.pluginCompatibility')] : []),
-      ...(permission.targets.includes('background') ? [i18n.t('settings.plugins.permission.pluginBackground')] : []),
-    ].join('；');
-    if (permission.kind === 'contextRewrite') return i18n.t('settings.plugins.permission.contextRewrite');
-    if (permission.kind === 'modelSources') return i18n.t('settings.plugins.permission.modelSources', { sources: permission.targets.join(', ') });
-    return `${permission.kind}${permission.targets.length ? `: ${permission.targets.join(', ')}` : ''}`;
-  }
 
   function sourceLabel(installed: InstalledPluginProjection): string {
     return i18n.t(`settings.plugins.source.${installed.source.kind}`);
@@ -177,9 +160,10 @@
   <section class="pane-section">
     <h4>{i18n.t('settings.plugins.permissions')}</h4>
     {#if manifest}
+      <PluginImpactNotices {manifest} />
       <div class="settings-chips">
         {#each manifest.permissions as permission}
-          <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement' || permission.kind === 'composer' || permission.kind === 'sessionRead' || permission.kind === 'sessionWrite' || permission.kind === 'client' || permission.kind === 'attachments'}>{permissionText(permission)}</span>
+          <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement' || permission.kind === 'composer' || permission.kind === 'sessionRead' || permission.kind === 'sessionWrite' || permission.kind === 'client' || permission.kind === 'attachments'}>{permissionText(permission, i18n.t.bind(i18n))}</span>
         {:else}
           <span class="settings-row-desc">{i18n.t('settings.plugins.noPermissions')}</span>
         {/each}

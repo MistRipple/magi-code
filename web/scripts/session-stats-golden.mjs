@@ -32,7 +32,8 @@ await withGoldenViteServer(async server => {
   const item = (role, count, tokens, duration, ttft, observed = true) => ({
     role, llmCallCount: count, tokenObservedCallCount: count, inputTokens: 1000, netOutputTokens: 200,
     cache: observed ? { observedCallCount: count, hitCallCount: 1, inputTokens: 1000, readTokens: 600, writeTokens: 0, tokenHitRate: .6, requestHitRate: 1 / count } : undefined,
-    performance: { ttftSampleCount: count, ttftTotalMs: ttft, tpsSampleCount: 1, textOutputTokens: tokens, contentDurationMs: duration, lastObservedAt: duration, lastTtftMs: ttft / count, lastTps: tokens * 1000 / duration },
+    performance: { ttftSampleCount: count, ttftTotalMs: ttft, tpsSampleCount: 1, textOutputTokens: tokens, contentDurationMs: duration, lastObservedAt: duration, lastTtftMs: ttft / count, lastTps: tokens * 1000 / duration,
+      responseSampleCount:1,responseOutputTokens:tokens,responseDurationMs:duration,lastResponseTps:tokens*1000/duration },
   });
   const rows = [item('orchestrator', 2, 20, 1000, 600), item('worker', 3, 180, 3000, 1900), item('auxiliary', 1, 0, 0, 0, false)];
   rows[2].performance = undefined;
@@ -78,6 +79,17 @@ await withGoldenViteServer(async server => {
   assert.equal(worker.cache.writeTokens, 500);
   assert.equal(projectSessionStats(mixed, 'orchestrator').calls, 2, 'worker and image calls cannot leak into main stats');
   assert.equal(projectSessionStats(mixed, 'all').calls, 8, 'all roles includes non-text calls');
+  const unsplit=item('orchestrator',1,100,1000,200);
+  unsplit.performance.textOutputTokens=0;unsplit.performance.contentDurationMs=0;unsplit.performance.tpsSampleCount=0;
+  unsplit.performance.responseOutputTokens=300;unsplit.performance.responseDurationMs=3000;unsplit.performance.lastResponseTps=100;
+  assert.equal(projectSessionStats([unsplit],'all').tps,100,'actual total output and complete response duration do not require a reasoning split');
+  assert.equal(projectSessionStats([unsplit],'all').textTps,null,'overall throughput does not invent exact body throughput');
+  const legacy=item('orchestrator',1,100,1000,200);
+  for(const field of ['responseSampleCount','responseOutputTokens','responseDurationMs','lastResponseTps'])delete legacy.performance[field];
+  assert.equal(projectSessionStats([legacy],'all').tps,null,'legacy body samples are not mixed into overall averages');
+  assert.equal(projectSessionStats([legacy],'all').textTps,100,'legacy precise body samples remain available');
+  const combined=projectSessionStats([unsplit,legacy],'all');
+  assert.equal(combined.tps,100);assert.equal(combined.tpsCount,1);
   console.log('session stats projection golden checks passed');
 
 });

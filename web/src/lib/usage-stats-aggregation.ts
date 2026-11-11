@@ -16,10 +16,12 @@ export function aggregatePromptCacheStats(items: { cache?: PromptCacheStats }[])
 }
 
 export interface UsageStatsItemLike {
+  pluginId?: string | null;
   templateId: string;
   engineId: string;
   role: 'worker' | 'orchestrator' | 'auxiliary' | 'image_generation' | 'vision';
   llmCallCount: number;
+  tokenObservedCallCount?: number;
   assignmentCount: number;
   successCount: number;
   failureCount: number;
@@ -29,8 +31,15 @@ export interface UsageStatsItemLike {
   resolvedModel?: string;
 }
 
+export function usageStatsDisplayKey(item: Pick<UsageStatsItemLike, 'pluginId' | 'role' | 'templateId'>): string {
+  if (item.pluginId) return `plugin:${item.pluginId}`;
+  if (item.role === 'image_generation') return 'imageGeneration';
+  return item.role === 'worker' ? item.templateId.trim() : item.role;
+}
+
 export interface AggregatedUsageStats {
   totalExecutions: number;
+  tokenObservedCallCount: number;
   assignmentCount: number;
   successCount: number;
   failureCount: number;
@@ -47,21 +56,7 @@ export function aggregateUsageStatsForDisplay(
   targetKey: string,
 ): AggregatedUsageStats | null {
   const normalizedKey = targetKey.trim();
-  const matched = items.filter((item) => {
-    if (normalizedKey === 'orchestrator') {
-      return item.role === 'orchestrator';
-    }
-    if (normalizedKey === 'auxiliary') {
-      return item.role === 'auxiliary';
-    }
-    if (normalizedKey === 'imageGeneration') {
-      return item.role === 'image_generation';
-    }
-    if (normalizedKey === 'vision') {
-      return item.role === 'vision';
-    }
-    return item.role === 'worker' && item.templateId === normalizedKey;
-  });
+  const matched = items.filter((item) => usageStatsDisplayKey(item) === normalizedKey);
 
   if (matched.length === 0) {
     return null;
@@ -90,6 +85,7 @@ export function aggregateUsageStatsForDisplay(
 
   return {
     totalExecutions,
+    tokenObservedCallCount: matched.reduce((sum, item) => sum + (item.tokenObservedCallCount ?? 0), 0),
     assignmentCount,
     successCount,
     failureCount,

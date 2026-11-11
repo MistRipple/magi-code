@@ -125,3 +125,6 @@ pub(crate) fn test_plan_store(name: &str) -> magi_plan::PlanStore {
         .expect("test plan session should create");
     magi_plan::PlanStore::new(store, session_id)
 }
+
+#[cfg(test)]
+mod test_history;

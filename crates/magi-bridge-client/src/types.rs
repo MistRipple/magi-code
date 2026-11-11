@@ -1,12 +1,8 @@
-use crate::{llm_types::ImageSource, local_process_protocol::BridgeServerServiceDescriptor};
+use crate::llm_types::ImageSource;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use thiserror::Error;
-
-pub const LOOPBACK_MODEL_PROVIDER: &str = "loopback-model";
-pub const LOOPBACK_MCP_SERVER_NAME: &str = "loopback-mcp";
-pub const LOOPBACK_MCP_TOOL_NAME: &str = "echo.inspect";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BridgeBindingKind {
@@ -409,90 +405,6 @@ pub struct McpToolCallRequest {
     pub input: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct McpManagerServerSelectionRequest {
-    #[serde(default)]
-    pub server_name: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct McpManagerServerHealthUpdateRequest {
-    pub server_name: String,
-    pub health_status: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct McpManagerServerRegistrationRequest {
-    pub server_name: String,
-    pub server_version: String,
-    pub capability_profile: String,
-    pub selection_key: String,
-    #[serde(default = "default_mcp_manager_implementation_source")]
-    pub implementation_source: String,
-    #[serde(default = "default_mcp_manager_registration_health")]
-    pub health_status: String,
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub tool_names: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct McpManagerLifecycleEvent {
-    pub server_name: String,
-    pub event_kind: McpManagerLifecycleEventKind,
-    pub previous_state: McpManagerServerLifecycleState,
-    pub new_state: McpManagerServerLifecycleState,
-    pub reason: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum McpManagerLifecycleEventKind {
-    Registered,
-    Started,
-    Stopped,
-    HealthChanged,
-    Deregistered,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum McpManagerServerLifecycleState {
-    Registered,
-    Running,
-    Stopped,
-    Failed,
-    Deregistered,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct McpManagerListServersResponse {
-    pub manager: BridgeServerServiceDescriptor,
-    pub servers: Vec<BridgeServerServiceDescriptor>,
-    pub selection_targets: Vec<String>,
-    pub default_route_status: String,
-    pub default_route_target: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct McpManagerDescribeServerResponse {
-    pub manager: BridgeServerServiceDescriptor,
-    pub server: BridgeServerServiceDescriptor,
-    pub lifecycle_events: Vec<McpManagerLifecycleEvent>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct McpManagerServerOperationResponse {
-    pub operation: String,
-    pub manager: BridgeServerServiceDescriptor,
-    pub server: BridgeServerServiceDescriptor,
-    pub lifecycle_event_count: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lifecycle_event: Option<McpManagerLifecycleEvent>,
-    pub server_events: Vec<McpManagerLifecycleEvent>,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BridgeBindingReference {
     pub binding_id: String,
@@ -550,48 +462,6 @@ impl BridgeDispatchResponse {
 pub struct BridgeResponse {
     pub ok: bool,
     pub payload: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BridgeTransportRequest {
-    pub method: String,
-    pub params: Value,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BridgeTransportResponse {
-    pub payload: Value,
-}
-
-#[derive(Debug, Error)]
-pub enum BridgeTransportError {
-    #[error("transport layer error: {message}")]
-    Transport { message: String },
-    #[error("protocol layer error: {message}")]
-    Protocol { message: String },
-    #[error("remote business error [{code}]: {message}")]
-    RemoteBusiness {
-        code: i64,
-        message: String,
-        data: Option<Value>,
-    },
-}
-
-impl BridgeTransportError {
-    pub fn layer(&self) -> BridgeErrorLayer {
-        match self {
-            Self::Transport { .. } => BridgeErrorLayer::Transport,
-            Self::Protocol { .. } => BridgeErrorLayer::Protocol,
-            Self::RemoteBusiness { .. } => BridgeErrorLayer::RemoteBusiness,
-        }
-    }
-
-    pub fn code(&self) -> Option<i64> {
-        match self {
-            Self::RemoteBusiness { code, .. } => Some(*code),
-            Self::Transport { .. } | Self::Protocol { .. } => None,
-        }
-    }
 }
 
 #[derive(Debug, Error)]
@@ -731,13 +601,6 @@ impl BridgeClientError {
             | Self::MissingWorkingDirectory { .. } => None,
         }
     }
-}
-
-pub trait BridgeTransport: Send + Sync {
-    fn call(
-        &self,
-        request: BridgeTransportRequest,
-    ) -> Result<BridgeTransportResponse, BridgeTransportError>;
 }
 
 /// 实际 transport 的不可变缓存环境。只由可信客户端提供，不接受模型请求传入。
@@ -1058,38 +921,4 @@ mod context_overflow_tests {
 
 pub trait McpBridgeClient: Send + Sync {
     fn call_tool(&self, request: McpToolCallRequest) -> Result<BridgeResponse, BridgeClientError>;
-}
-
-pub(crate) type SharedBridgeTransport = Arc<dyn BridgeTransport>;
-
-fn default_mcp_manager_implementation_source() -> String {
-    "loopback-server-prehost".to_string()
-}
-
-fn default_mcp_manager_registration_health() -> String {
-    "healthy".to_string()
-}
-
-impl std::fmt::Display for McpManagerLifecycleEventKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Registered => write!(f, "registered"),
-            Self::Started => write!(f, "started"),
-            Self::Stopped => write!(f, "stopped"),
-            Self::HealthChanged => write!(f, "health_changed"),
-            Self::Deregistered => write!(f, "deregistered"),
-        }
-    }
-}
-
-impl std::fmt::Display for McpManagerServerLifecycleState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Registered => write!(f, "registered"),
-            Self::Running => write!(f, "running"),
-            Self::Stopped => write!(f, "stopped"),
-            Self::Failed => write!(f, "failed"),
-            Self::Deregistered => write!(f, "deregistered"),
-        }
-    }
 }

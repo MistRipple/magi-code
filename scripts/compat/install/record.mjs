@@ -17,7 +17,7 @@ export function recordUpstream(options) {
   const entry = realpathSync(options.entry);
   return withTempHome((home) => {
     const resultPath = join(home, 'result.json');
-    runRestricted({ script: RECORDER, args: [entry, sharedRoot, resultPath, upstreamDir, options.readSessionDirectory ? '1' : '0'], readable: [sharedRoot, upstreamDir], home, label: '受限记录' });
+    runRestricted({ script: RECORDER, args: [entry, sharedRoot, resultPath, upstreamDir, options.readSessionDirectory ? '1' : '0', JSON.stringify(options.nullableEvents ?? []), options.webProviders ? '1' : '0', options.settingsNamespace ?? ''], readable: [sharedRoot, upstreamDir], home, label: '受限记录' });
     return JSON.parse(readFileSync(resultPath, 'utf8'));
   });
 }

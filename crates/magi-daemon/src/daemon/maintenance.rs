@@ -309,17 +309,11 @@ impl RuntimeMaintenance {
         if !self.config.policy.sidecar_flush_enabled {
             return false;
         }
-        let worker_runtime_snapshot_dirty =
-            self.sidecar_persistence.worker_runtime_snapshot_dirty();
         if self.config.policy.eager_flush_dirty_sidecars {
             let session_metadata = self.session_store.execution_sidecar_flush_metadata();
             let workspace_metadata = self.workspace_store.recovery_sidecar_flush_metadata();
             return session_metadata.current_version != session_metadata.flushed_version
-                || workspace_metadata.current_version != workspace_metadata.flushed_version
-                || worker_runtime_snapshot_dirty;
-        }
-        if worker_runtime_snapshot_dirty {
-            return true;
+                || workspace_metadata.current_version != workspace_metadata.flushed_version;
         }
         session_sidecar_flush_due(&self.session_store.execution_sidecar_flush_metadata(), now)
             || workspace_sidecar_flush_due(
@@ -352,10 +346,8 @@ impl RuntimeMaintenance {
                 kind: RuntimeMaintenanceStepKind::SidecarFlush,
                 outcome: RuntimeMaintenanceStepOutcome::DueAndFlushed,
                 detail: Some(format!(
-                    "force_flush={force_flush};session_sidecars_flushed={};workspace_recovery_sidecars_flushed={};worker_runtime_snapshot_flushed={}",
-                    flushed.session_sidecars_flushed,
-                    flushed.workspace_recovery_sidecars_flushed,
-                    flushed.worker_runtime_snapshot_flushed
+                    "force_flush={force_flush};session_sidecars_flushed={};workspace_recovery_sidecars_flushed={}",
+                    flushed.session_sidecars_flushed, flushed.workspace_recovery_sidecars_flushed
                 )),
             }),
             Err(error) => {

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { i18n } from '../stores/i18n.svelte';
   import { getAgentColor } from '../lib/agent-colors';
-  import { aggregatePromptCacheStats } from '../lib/usage-stats-aggregation';
+  import { aggregatePromptCacheStats, usageStatsDisplayKey as bindingRoleKey } from '../lib/usage-stats-aggregation';
   import Icon from './Icon.svelte';
   import type { ModelStatus, ModelStatusMap } from '../types/message';
   import type {
@@ -63,6 +63,8 @@
   }
 
   function workerLabel(worker: string): string {
+    const plugin = bindingUsageStats.find(binding => binding.pluginId && bindingRoleKey(binding) === worker);
+    if (plugin) return plugin.displayName?.trim() || plugin.pluginId!;
     if (worker === 'orchestrator') return i18n.t('settings.stats.orchestratorModel');
     if (worker === 'auxiliary') return i18n.t('settings.stats.auxiliaryModel');
     if (worker === 'vision') return i18n.t('settings.stats.visionModel');
@@ -116,7 +118,7 @@
     calls: number;
     successCount: number;
     successRate: number | null;
-    tokenOptional: boolean;
+    observedCalls: number;
   }
 
   const roleAtoms = $derived<RoleAtom[]>(
@@ -142,7 +144,7 @@
         calls,
         successCount,
         successRate: calls > 0 ? stats?.successRate ?? null : null,
-        tokenOptional: worker === 'imageGeneration',
+        observedCalls: stats?.tokenObservedCallCount ?? 0,
       };
     })
   );
@@ -150,7 +152,7 @@
   function resolveModelRuntimeStatus(identityKeys: string[]) {
     const identitySet = new Set(identityKeys);
     const bindings: AgentExecutionStatsItem[] = bindingUsageStats.filter((item: AgentExecutionStatsItem) => (
-      item.modelIdentityKey && identitySet.has(item.modelIdentityKey)
+      !item.pluginId && item.modelIdentityKey && identitySet.has(item.modelIdentityKey)
     ));
     const statusKeys: string[] = Array.from(new Set(bindings.map((binding: AgentExecutionStatsItem) => {
       if (binding.role === 'orchestrator') return 'orchestrator';
@@ -204,7 +206,7 @@
     identityKeys: string[];
     connectionCount: number;
     sourceLabels: string[];
-    tokenOptional: boolean;
+    observedCalls: number;
   }
 
   interface ModelBucket {
@@ -215,6 +217,7 @@
     totalOut: number;
     calls: number;
     successCount: number;
+    observedCalls: number;
   }
 
   const engineRows = $derived.by<EngineRow[]>(() => {
@@ -237,12 +240,14 @@
         totalOut: 0,
         calls: 0,
         successCount: 0,
+        observedCalls: 0,
       };
       bucket.identityKeys.push(model.modelIdentityKey);
       bucket.totalIn += model.totals.netInputTokens;
       bucket.totalOut += model.totals.netOutputTokens;
       bucket.calls += model.totals.llmCallCount;
       bucket.successCount += model.totals.successCount;
+      bucket.observedCalls += model.totals.tokenObservedCallCount ?? 0;
       buckets.set(key, bucket);
     }
 
@@ -285,9 +290,7 @@
           identityKeys: bucket.identityKeys,
           connectionCount: bucket.identityKeys.length,
           sourceLabels,
-          tokenOptional: sourceBindings.some(
-            (binding: AgentExecutionStatsItem) => binding.role === 'image_generation',
-          ),
+          observedCalls: bucket.observedCalls,
           ...resolveModelRuntimeStatus(bucket.identityKeys),
         };
       })
@@ -311,7 +314,7 @@
     statusClass: string;
     statusKey: string;
     errorMsg: string | null;
-    tokenOptional: boolean;
+    observedCalls: number;
     // 仅在某个视角下使用：
     roleAtom?: RoleAtom;
     engineRow?: EngineRow;
@@ -333,7 +336,7 @@
           statusClass: er.statusClass,
           statusKey: er.statusKey,
           errorMsg: er.errorMsg,
-          tokenOptional: er.tokenOptional,
+          observedCalls: er.observedCalls,
           engineRow: er,
         }))
       : roleAtoms.map((atom: RoleAtom): DisplayRow => ({
@@ -350,7 +353,7 @@
           statusClass: atom.statusClass,
           statusKey: atom.statusKey,
           errorMsg: atom.errorMsg,
-          tokenOptional: atom.tokenOptional,
+          observedCalls: atom.observedCalls,
           roleAtom: atom,
         }))
   );
@@ -389,14 +392,7 @@
     calls: number;
     successCount: number;
     successRate: number | null;
-    tokenOptional: boolean;
-  }
-
-  function bindingRoleKey(binding: AgentExecutionStatsItem): string {
-    if (binding.role === 'orchestrator') return 'orchestrator';
-    if (binding.role === 'auxiliary') return 'auxiliary';
-    if (binding.role === 'image_generation') return 'imageGeneration';
-    return binding.templateId.trim();
+    observedCalls: number;
   }
 
   function bindingModelLabel(binding: AgentExecutionStatsItem): string {
@@ -424,7 +420,7 @@
         calls: 0,
         successCount: 0,
         successRate: null,
-        tokenOptional: false,
+        observedCalls: 0,
       };
       bucket.totalIn += binding.netInputTokens;
       bucket.totalOut += binding.netOutputTokens;
@@ -432,7 +428,7 @@
       bucket.calls += binding.llmCallCount;
       bucket.successCount += binding.successCount;
       bucket.successRate = bucket.calls > 0 ? bucket.successCount / bucket.calls : null;
-      bucket.tokenOptional ||= binding.role === 'image_generation';
+      bucket.observedCalls += binding.tokenObservedCallCount ?? 0;
       buckets.set(key, bucket);
     }
     return Array.from(buckets.values()).sort((left, right) => (
@@ -496,12 +492,15 @@
     selectedRow ? Math.max(selectedRow.totalIn, selectedRow.totalOut, 1) : 1
   );
 
+  const totalCalls = $derived(bindingUsageStats.reduce((sum, item) => sum + item.llmCallCount, 0));
+  const totalObservedCalls = $derived(bindingUsageStats.reduce((sum, item) => sum + (item.tokenObservedCallCount ?? 0), 0));
+
   const selectedTokenUnavailable = $derived(
-    Boolean(selectedRow && selectedRow.calls > 0 && selectedRow.totalTokens === 0 && selectedRow.tokenOptional)
+    Boolean(selectedRow && selectedRow.calls > 0 && selectedRow.observedCalls === 0)
   );
 
-  function formatUsageTokens(tokens: number, calls: number, tokenOptional: boolean): string {
-    if (calls > 0 && tokens === 0 && tokenOptional) {
+  function formatUsageTokens(tokens: number, calls: number, observedCalls: number): string {
+    if (calls > 0 && observedCalls === 0) {
       return i18n.t('settings.stats.tokenNotReported');
     }
     return formatTokens(tokens);
@@ -537,13 +536,14 @@
 
       <div class="insight-cell">
         <span class="insight-kicker">{i18n.t('settings.stats.insightTotalKicker')}</span>
-        <span class="insight-headline">{formatTokens(totalTokens)}</span>
+        <span class="insight-headline">{formatUsageTokens(totalTokens, totalCalls, totalObservedCalls)}</span>
         <span class="insight-meta">
           {i18n.t('settings.stats.insightTotalMeta', {
-            input: formatTokens(totalInputTokens),
-            output: formatTokens(totalOutputTokens),
+            input: formatUsageTokens(totalInputTokens, totalCalls, totalObservedCalls),
+            output: formatUsageTokens(totalOutputTokens, totalCalls, totalObservedCalls),
           })}
         </span>
+        {#if totalCalls > totalObservedCalls}<span class="insight-meta">{i18n.t('settings.stats.tokenCoverage', { observed: totalObservedCalls, count: totalCalls })}</span>{/if}
       </div>
 
       <div class="insight-cell" class:warn={showWarnCell}>
@@ -651,7 +651,7 @@
                 class:warn={row.successRate != null && row.successRate >= 0.7 && row.successRate < 0.95}
                 class:danger={row.successRate != null && row.successRate < 0.7}
               >{formatPct(row.successRate)}</div>
-              <div class="row-metric num" data-label={i18n.t('settings.stats.colToken')}>{formatUsageTokens(row.totalTokens, row.calls, row.tokenOptional)}</div>
+              <div class="row-metric num" data-label={i18n.t('settings.stats.colToken')}>{formatUsageTokens(row.totalTokens, row.calls, row.observedCalls)}</div>
             </div>
           {/each}
         </div>
@@ -681,7 +681,7 @@
 
           <div class="slice-kpi">
             <div class="kpi-block">
-              <span class="kpi-value">{formatUsageTokens(selectedRow.totalTokens, selectedRow.calls, selectedRow.tokenOptional)}</span>
+              <span class="kpi-value">{formatUsageTokens(selectedRow.totalTokens, selectedRow.calls, selectedRow.observedCalls)}</span>
               <span class="kpi-label">{i18n.t('settings.stats.kpiToken')}</span>
             </div>
             <div class="kpi-block">
@@ -739,7 +739,7 @@
                     </div>
                     <span class="breakdown-metric num">{formatTokens(breakdown.calls)}</span>
                     <span class="breakdown-metric num">{formatPct(breakdown.successRate)}</span>
-                    <span class="breakdown-metric num">{formatUsageTokens(breakdown.totalTokens, breakdown.calls, breakdown.tokenOptional)}</span>
+                    <span class="breakdown-metric num">{formatUsageTokens(breakdown.totalTokens, breakdown.calls, breakdown.observedCalls)}</span>
                   </div>
                 {/each}
               </div>
@@ -753,8 +753,8 @@
               <span>{i18n.t('settings.stats.sectionIO')}</span>
               <span class="small-note">{i18n.t('settings.stats.sectionMonthly')}</span>
             </div>
-            {#if selectedTokenUnavailable}
-              <div class="token-usage-note">{i18n.t('settings.stats.imageUsageMetricHint')}</div>
+            {#if selectedRow.calls > selectedRow.observedCalls}
+              <div class="token-usage-note">{i18n.t('settings.stats.tokenCoverage', { observed: selectedRow.observedCalls, count: selectedRow.calls })}</div>
             {/if}
               <div class="bar-list">
                 <div class="bar-item">

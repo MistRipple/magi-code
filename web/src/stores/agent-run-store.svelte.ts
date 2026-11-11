@@ -14,7 +14,6 @@ import type {
   AgentRunActionKind,
   AgentRunActionResponseDto,
   AgentRunProjectionDto,
-  TaskStatus,
 } from '../shared/rust-backend-types';
 import { RustDaemonClient } from '../shared/rust-daemon-client';
 import { resolveAgentBaseUrl } from '../web/agent-api';
@@ -290,18 +289,6 @@ export function getAgentRunState(
   return readSessionState(normalizedSessionId, workspaceId) ?? EMPTY_AGENT_RUN_STATE;
 }
 
-export function ensureAgentRunState(
-  sessionId: string | null | undefined,
-  workspaceId: string | null | undefined = currentWorkspaceId(),
-  workspacePath: string | null | undefined = currentWorkspacePath(),
-): void {
-  const normalizedSessionId = normalizeSessionKey(sessionId);
-  if (!normalizedSessionId) {
-    return;
-  }
-  ensureSessionState(normalizedSessionId, workspaceId, workspacePath);
-}
-
 export function activateAgentRunSession(
   sessionId: string | null | undefined,
   workspaceId: string | null | undefined = currentWorkspaceId(),
@@ -349,19 +336,16 @@ export async function fetchAgentRunProjection(
     return;
   }
   if (rootChanged) {
-    state.fetchGeneration += 1;
-    state.loading = false;
     state.refreshAfterLoad = false;
     state.projection = null;
     state.selectedAgentRunId = null;
+    state.actionError = null;
   }
   const fetchGeneration = state.fetchGeneration + 1;
   state.fetchGeneration = fetchGeneration;
   state.rootTaskId = rootTaskId;
   state.loading = true;
   state.error = null;
-  let terminalProjectionLoadError = false;
-
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort('agent_run_request_timeout'), 10_000);
   try {
@@ -374,9 +358,10 @@ export async function fetchAgentRunProjection(
       normalizedWorkspacePath,
       controller.signal,
     );
-    const latestState = ensureSessionState(normalizedSessionId, normalizedWorkspaceId, normalizedWorkspacePath);
+    const latestState = readSessionState(normalizedSessionId, normalizedWorkspaceId);
     if (
-      latestState.fetchGeneration !== fetchGeneration
+      latestState !== state
+      || latestState.fetchGeneration !== fetchGeneration
       || latestState.rootTaskId !== rootTaskId
     ) {
       return;
@@ -390,38 +375,26 @@ export async function fetchAgentRunProjection(
       }
     }
   } catch (err) {
-    const latestState = ensureSessionState(normalizedSessionId, normalizedWorkspaceId, normalizedWorkspacePath);
+    const latestState = readSessionState(normalizedSessionId, normalizedWorkspaceId);
     if (
-      latestState.fetchGeneration !== fetchGeneration
+      latestState !== state
+      || latestState.fetchGeneration !== fetchGeneration
       || latestState.rootTaskId !== rootTaskId
     ) {
       return;
     }
-    terminalProjectionLoadError = isTerminalProjectionLoadError(err);
-    if (terminalProjectionLoadError) {
-      retiredSessionRootIds.add(sessionRootKey(normalizedWorkspaceId, normalizedSessionId, rootTaskId));
-      const scopeKey = projectionScopeKey(normalizedWorkspaceId, normalizedSessionId);
-      if (scopeKey && sessionStates[scopeKey]?.rootTaskId === rootTaskId) {
-        const nextStates = { ...sessionStates };
-        delete nextStates[scopeKey];
-        sessionStates = nextStates;
-      }
-      if (activeAgentRunScopeKey === scopeKey) {
-        activeAgentRunScopeKey = '';
-      }
-      reconcileAutoRefresh();
+    if (isTerminalProjectionLoadError(err)) {
+      clearAgentRunProjection(normalizedSessionId, rootTaskId, normalizedWorkspaceId);
       return;
     }
     console.warn('[agent-run-store] agent run projection refresh failed:', err);
     latestState.error = 'load_failed';
   } finally {
     clearTimeout(timeout);
-    if (terminalProjectionLoadError) {
-      return;
-    }
-    const latestState = ensureSessionState(normalizedSessionId, normalizedWorkspaceId, normalizedWorkspacePath);
+    const latestState = readSessionState(normalizedSessionId, normalizedWorkspaceId);
     if (
-      latestState.fetchGeneration !== fetchGeneration
+      latestState !== state
+      || latestState.fetchGeneration !== fetchGeneration
       || latestState.rootTaskId !== rootTaskId
     ) {
       return;
@@ -430,8 +403,8 @@ export async function fetchAgentRunProjection(
     if (latestState.refreshAfterLoad && latestState.rootTaskId) {
       latestState.refreshAfterLoad = false;
       queueMicrotask(() => {
-        const currentState = ensureSessionState(normalizedSessionId, normalizedWorkspaceId, normalizedWorkspacePath);
-        if (currentState.rootTaskId && !currentState.loading) {
+        const currentState = readSessionState(normalizedSessionId, normalizedWorkspaceId);
+        if (currentState === state && currentState.rootTaskId && !currentState.loading) {
           void refreshAgentRunProjection(normalizedSessionId, normalizedWorkspaceId, normalizedWorkspacePath);
         }
       });
@@ -451,8 +424,8 @@ export async function refreshAgentRunProjection(
   }
   const normalizedWorkspaceId = normalizeWorkspaceKey(workspaceId);
   const normalizedWorkspacePath = typeof workspacePath === 'string' ? workspacePath.trim() : '';
-  const state = ensureSessionState(normalizedSessionId, normalizedWorkspaceId, normalizedWorkspacePath);
-  if (state.rootTaskId) {
+  const state = readSessionState(normalizedSessionId, normalizedWorkspaceId);
+  if (state?.rootTaskId) {
     await fetchAgentRunProjection(
       normalizedSessionId,
       state.rootTaskId,
@@ -524,7 +497,10 @@ export async function performAgentRunAction(
     );
     return response;
   } catch (error) {
-    state.actionError = agentRunActionErrorMessage(error);
+    if (readSessionState(normalizedSessionId, normalizedWorkspaceId) === state
+      && state.rootTaskId === normalizedRootTaskId) {
+      state.actionError = agentRunActionErrorMessage(error);
+    }
     throw error;
   } finally {
     state.actionInFlight = null;
@@ -685,6 +661,8 @@ export function clearAgentRunProjection(
     : '';
   if (normalizedRetiredRootTaskId) {
     retiredSessionRootIds.add(sessionRootKey(normalizedWorkspaceId, normalizedSessionId, normalizedRetiredRootTaskId));
+    // 迟到的归档回执只退休原 root，不能清掉同一会话已经切换到的新运行。
+    if (sessionStates[scopeKey]?.rootTaskId !== normalizedRetiredRootTaskId) return;
   }
   if (activeAgentRunScopeKey === scopeKey) {
     activeAgentRunScopeKey = '';
@@ -712,8 +690,4 @@ export function selectAgentRun(
   const state = ensureSessionState(normalizedSessionId, workspaceId, workspacePath);
   const normalizedAgentRunId = typeof agentRunId === 'string' ? agentRunId.trim() : '';
   state.selectedAgentRunId = normalizedAgentRunId || null;
-}
-
-export function getAgentRunStatusModifier(status: TaskStatus): string {
-  return status;
 }

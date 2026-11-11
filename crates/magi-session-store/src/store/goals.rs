@@ -10,7 +10,7 @@ use crate::models::{
 };
 use magi_core::{
     AccessProfile, DomainError, DomainResult, GoalId, GoalRejection, PlanItemStatus, PlanState,
-    SessionId, TaskId, ThreadId, UtcMillis,
+    SessionId, ThreadId, UtcMillis,
 };
 
 const BLOCKED_TURN_THRESHOLD: u32 = 3;
@@ -550,6 +550,16 @@ impl SessionStore {
         Ok(state.goals[goal_index].clone())
     }
 
+    pub fn set_goal_task_activity_resolver(
+        &self,
+        resolver: std::sync::Arc<super::GoalTaskActivityResolver>,
+    ) {
+        *self
+            .goal_task_activity_resolver
+            .write()
+            .expect("goal task resolver lock poisoned") = Some(resolver);
+    }
+
     pub fn complete_goal(
         &self,
         session_id: &SessionId,
@@ -604,10 +614,35 @@ impl SessionStore {
                     message: "goal plan still contains unfinished or blocked work".to_string(),
                 });
             }
-            if plan.task_bindings.keys().any(|task_id| {
-                task_id.as_str() != turn_id
-                    && task_is_active_in_session_execution(&state, session_id, task_id)
-            }) {
+            let has_active_tasks = if plan.task_bindings.is_empty() {
+                false
+            } else {
+                let root = state
+                    .execution_sidecar_store
+                    .runtime_sidecars
+                    .iter()
+                    .find(|sidecar| &sidecar.session_id == session_id)
+                    .and_then(|sidecar| sidecar.active_execution_chain.as_ref())
+                    .map(|chain| &chain.root_task_id)
+                    .ok_or_else(|| DomainError::InvalidState {
+                        message: "目标任务查询缺少执行根归属".into(),
+                    })?;
+                let resolver = self
+                    .goal_task_activity_resolver
+                    .read()
+                    .expect("goal task resolver lock poisoned")
+                    .clone()
+                    .ok_or_else(|| DomainError::InvalidState {
+                        message: "目标任务状态查询不可用".into(),
+                    })?;
+                resolver(
+                    root,
+                    session_id,
+                    goal_id,
+                    &plan.task_bindings.keys().cloned().collect::<Vec<_>>(),
+                )?
+            };
+            if has_active_tasks {
                 return Err(DomainError::GoalRejected {
                     reason: GoalRejection::PlanTasksActive,
                     message: "goal plan still has active bound tasks".to_string(),
@@ -988,26 +1023,6 @@ fn goal_owned_by_turn(goal: &SessionGoal, turn_id: &str) -> bool {
     goal.created_by_turn_id.as_deref() == Some(turn_id)
         || (goal.continuation.phase == GoalContinuationPhase::Running
             && goal.continuation.turn_id.as_deref() == Some(turn_id))
-}
-
-fn task_is_active_in_session_execution(
-    state: &SessionStoreState,
-    session_id: &SessionId,
-    task_id: &TaskId,
-) -> bool {
-    state
-        .execution_sidecar_store
-        .runtime_sidecars
-        .iter()
-        .find(|sidecar| &sidecar.session_id == session_id)
-        .and_then(|sidecar| sidecar.active_execution_chain.as_ref())
-        .is_some_and(|chain| {
-            &chain.root_task_id == task_id
-                || chain
-                    .active_branch_task_ids
-                    .iter()
-                    .any(|active_task_id| active_task_id == task_id)
-        })
 }
 
 fn normalize_non_empty(value: impl Into<String>, field: &str) -> DomainResult<String> {
@@ -1689,7 +1704,7 @@ mod tests {
     }
 
     #[test]
-    fn goal_completion_uses_active_execution_chain_as_task_authority() {
+    fn goal_completion_uses_authoritative_task_query_without_removing_historical_branches() {
         let store = SessionStore::new();
         let session_id = SessionId::new("session-goal-owning-turn-completion");
         let owning_turn_id = "turn-goal-owning-turn-completion";
@@ -1727,28 +1742,61 @@ mod tests {
         let plan = store
             .upsert_plan(&session_id, plan.clone(), Some(0))
             .expect("completed plan should create");
+        let other_branch: crate::ActiveExecutionBranch =
+            serde_json::from_value(serde_json::json!({
+                "taskId": other_task_id,
+                "workerId": "worker-other-active-binding",
+                "useTools": true,
+                "threadId": "thread-other-active-binding"
+            }))
+            .unwrap();
         let active_chain = ActiveExecutionChain {
             session_id: session_id.clone(),
             mission_id: MissionId::new(format!("mission-{session_id}")),
             root_task_id: own_task_id,
             execution_chain_ref: "chain-goal-owning-turn-completion".to_string(),
             workspace_id: None,
-            active_branch_task_ids: vec![other_task_id.clone()],
-            active_worker_bindings: Vec::new(),
-            branches: Vec::new(),
-            recovery_ref: None,
+            branches: vec![other_branch.clone()],
             dispatch_context: ActiveExecutionDispatchContext {
                 accepted_at: UtcMillis::now(),
                 entry_id: "timeline-goal-owning-turn-completion".to_string(),
                 trimmed_text: None,
                 skill_name: None,
             },
-            current_turn: None,
+            current_turn_id: None,
         };
         store
-            .upsert_active_execution_chain(session_id.clone(), active_chain.clone())
+            .seed_execution_chain_for_test(session_id.clone(), active_chain.clone())
             .expect("active execution chain should persist");
 
+        // 未装配 TaskStore 查询时拒绝完成，不用分支成员关系猜测运行状态。
+        assert!(
+            store
+                .complete_goal(
+                    &session_id,
+                    &goal.goal_id,
+                    GoalRevisionExpectation::new(goal.control_revision, Some(plan.revision)),
+                    owning_turn_id,
+                    "missing authority",
+                    vec!["evidence".into()]
+                )
+                .is_err()
+        );
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let queried_active = active.clone();
+        let expected_root = active_chain.root_task_id.clone();
+        let expected_session = session_id.clone();
+        let expected_goal = goal.goal_id.clone();
+        let expected_other = other_task_id.clone();
+        store.set_goal_task_activity_resolver(std::sync::Arc::new(
+            move |root, session, goal, tasks| {
+                assert_eq!(root, &expected_root);
+                assert_eq!(session, &expected_session);
+                assert_eq!(goal, &expected_goal);
+                assert!(tasks.contains(&expected_other));
+                Ok(queried_active.load(std::sync::atomic::Ordering::SeqCst))
+            },
+        ));
         assert!(
             store
                 .complete_goal(
@@ -1763,15 +1811,17 @@ mod tests {
             "an unrelated active task must still block Goal completion"
         );
 
-        store
-            .upsert_active_execution_chain(
-                session_id.clone(),
-                ActiveExecutionChain {
-                    active_branch_task_ids: Vec::new(),
-                    ..active_chain
-                },
-            )
-            .expect("stale task should leave the active execution chain");
+        assert_eq!(
+            store.current_goal(&session_id).unwrap().status,
+            GoalStatus::Active
+        );
+        active.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            store
+                .active_execution_chain(&session_id)
+                .unwrap()
+                .contains_task(&other_task_id)
+        );
         let completed = store
             .complete_goal(
                 &session_id,

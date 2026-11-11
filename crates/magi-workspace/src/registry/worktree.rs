@@ -82,18 +82,6 @@ fn clear_workspace_root_if_inactive(state: &mut WorkspaceStoreState, workspace_i
 }
 
 impl WorkspaceStore {
-    pub fn assign_worktree_root(
-        &self,
-        workspace_id: &WorkspaceId,
-        worktree_root: AbsolutePath,
-    ) -> DomainResult<WorkspaceRecord> {
-        self.assign_worktree_root_for_execution(
-            workspace_id,
-            ExecutionOwnership::default(),
-            worktree_root,
-        )
-    }
-
     pub fn assign_worktree_root_for_execution(
         &self,
         workspace_id: &WorkspaceId,

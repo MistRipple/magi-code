@@ -13,7 +13,10 @@ const EVENT_TYPE: &str = "model.auxiliary.transport.observed";
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AuxiliaryUsageFact {
     pub schema_version: u32,
-    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<PluginModelOwner>,
     pub turn_id: Option<String>,
     pub call_id: String,
     pub attempt: usize,
@@ -22,12 +25,35 @@ pub(crate) struct AuxiliaryUsageFact {
     pub call_status: Option<UsageCallStatus>,
 }
 
+pub(crate) use magi_usage_authority::PluginModelOwner;
+
+pub(crate) fn valid_plugin_owner(owner: &PluginModelOwner) -> bool {
+    magi_plugin_system::valid_plugin_id(&owner.plugin_id)
+        && owner.digest.len() == 64
+        && owner.digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && [&owner.instance_id, &owner.operation_id]
+            .into_iter()
+            .all(|id| {
+                !id.is_empty()
+                    && id.len() <= 128
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_:.".contains(&byte))
+            })
+}
+
 fn validate(fact: &AuxiliaryUsageFact) -> DomainResult<()> {
     magi_session_store::validate_model_usage_context(&fact.context)?;
-    if fact.schema_version != 1
+    let valid_owner = match (&fact.session_id, &fact.plugin) {
+        (Some(session), None) => fact.schema_version == 1 && !session.as_str().trim().is_empty(),
+        (None, Some(plugin)) => {
+            fact.schema_version == 2 && valid_plugin_owner(plugin) && fact.turn_id.is_none()
+        }
+        _ => false,
+    };
+    if !valid_owner
         || fact.attempt == 0
         || fact.call_id.trim().is_empty()
-        || fact.session_id.as_str().trim().is_empty()
         || fact.context.role != ModelUsageSourceRole::Auxiliary
         || fact.transport.request_fingerprint.len() != 64
         || !fact
@@ -73,13 +99,19 @@ pub(crate) fn write_fact(
     let mut event = EventEnvelope::usage(
         EventId::new(format!(
             "auxiliary-transport:{}:{}:{}:{}",
-            fact.session_id, fact.call_id, fact.attempt, state
+            fact.session_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| fact.plugin.as_ref().expect("validated owner").key()),
+            fact.call_id,
+            fact.attempt,
+            state
         )),
         EVENT_TYPE,
         serde_json::to_value(fact).map_err(|error| failed(error.to_string()))?,
     )
     .with_context(EventContext {
-        session_id: Some(fact.session_id.clone()),
+        session_id: fact.session_id.clone(),
         workspace_id: fact
             .context
             .workspace_id
@@ -95,11 +127,18 @@ pub(crate) fn write_fact(
 }
 
 pub(crate) fn publish_fact_usage(bus: &InMemoryEventBus, fact: &AuxiliaryUsageFact) {
+    let owner = match (&fact.session_id, &fact.plugin) {
+        (Some(session), None) => magi_usage_authority::UsageOwner::session(session.to_string()),
+        (None, Some(plugin)) => magi_usage_authority::UsageOwner::Plugin {
+            plugin: plugin.clone(),
+        },
+        _ => return,
+    };
     let attempt_id = format!("{}:attempt:{}", fact.call_id, fact.attempt);
     let record = crate::canonical_usage::transport_usage_record(
         crate::canonical_usage::TransportUsageInput {
             context: &fact.context,
-            session_id: &fact.session_id,
+            owner,
             turn_id: fact.turn_id.as_deref(),
             logical_call_id: &fact.call_id,
             attempt_id: &attempt_id,
@@ -108,64 +147,63 @@ pub(crate) fn publish_fact_usage(bus: &InMemoryEventBus, fact: &AuxiliaryUsageFa
             fallback_timestamp: fact.transport.observed_at.unwrap_or(0),
         },
     );
-    crate::usage_recording::publish_usage_call_input(
-        bus,
-        &fact
-            .context
-            .workspace_id
-            .as_ref()
-            .map(|id| WorkspaceId::new(id.clone())),
-        &fact.session_id,
-        &record,
-    );
+    crate::usage_recording::publish_usage_call_input(bus, &record);
 }
 
 pub(crate) fn recover(bus: &InMemoryEventBus) -> DomainResult<()> {
-    let facts =
-        bus.with_audit_usage_ledger(|ledger| {
-            let mut latest =
-                std::collections::BTreeMap::<(String, String, usize), AuxiliaryUsageFact>::new();
-            for entry in ledger
-                .usage_entries
-                .iter()
-                .filter(|entry| entry.event_type == EVENT_TYPE)
-            {
-                let fact: AuxiliaryUsageFact = serde_json::from_value(entry.payload.clone())
-                    .map_err(|error| DomainError::Validation {
+    let facts = bus.with_audit_usage_ledger(|ledger| {
+        let mut latest =
+            std::collections::BTreeMap::<(String, String, usize), AuxiliaryUsageFact>::new();
+        for entry in ledger
+            .usage_entries
+            .iter()
+            .filter(|entry| entry.event_type == EVENT_TYPE)
+        {
+            let fact: AuxiliaryUsageFact =
+                serde_json::from_value(entry.payload.clone()).map_err(|error| {
+                    DomainError::Validation {
                         message: format!("辅助调用用量事实无法恢复: {error}"),
-                    })?;
-                validate(&fact)?;
-                if let Some(previous) = latest.get(&(
-                    fact.session_id.to_string(),
+                    }
+                })?;
+            validate(&fact)?;
+            if let Some(previous) = latest.get(&(
+                fact.session_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| fact.plugin.as_ref().expect("validated owner").key()),
+                fact.call_id.clone(),
+                fact.attempt,
+            )) {
+                if previous.plugin != fact.plugin
+                    || previous.context != fact.context
+                    || previous.turn_id != fact.turn_id
+                    || previous
+                        .call_status
+                        .is_some_and(|status| fact.call_status != Some(status))
+                {
+                    return Err(DomainError::InvalidState {
+                        message: "辅助调用的冻结统计归属或结果被改写".into(),
+                    });
+                }
+                magi_session_store::validate_model_transport_update(
+                    &previous.transport,
+                    &fact.transport,
+                )?;
+            }
+            latest.insert(
+                (
+                    fact.session_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| fact.plugin.as_ref().expect("validated owner").key()),
                     fact.call_id.clone(),
                     fact.attempt,
-                )) {
-                    if previous.context != fact.context
-                        || previous.turn_id != fact.turn_id
-                        || previous
-                            .call_status
-                            .is_some_and(|status| fact.call_status != Some(status))
-                    {
-                        return Err(DomainError::InvalidState {
-                            message: "辅助调用的冻结统计归属或结果被改写".into(),
-                        });
-                    }
-                    magi_session_store::validate_model_transport_update(
-                        &previous.transport,
-                        &fact.transport,
-                    )?;
-                }
-                latest.insert(
-                    (
-                        fact.session_id.clone().to_string(),
-                        fact.call_id.clone(),
-                        fact.attempt,
-                    ),
-                    fact,
-                );
-            }
-            Ok::<_, DomainError>(latest)
-        })?;
+                ),
+                fact,
+            );
+        }
+        Ok::<_, DomainError>(latest)
+    })?;
     for fact in facts.values() {
         publish_fact_usage(bus, fact);
     }
@@ -181,7 +219,7 @@ mod tests {
 
     fn fact(at: u64) -> AuxiliaryUsageFact {
         AuxiliaryUsageFact {
-            schema_version: 1, session_id: SessionId::new("aux-original-session"), turn_id: Some("original-turn".into()),
+            schema_version: 1, session_id: Some(SessionId::new("aux-original-session")), plugin: None, turn_id: Some("original-turn".into()),
             call_id: "aux-call".into(), attempt: 1,
             context: serde_json::from_value(json!({
                 "templateId":"auxiliary","engineId":"auxiliary","bindingRevision":1,"role":"auxiliary","phase":"integration",
@@ -250,6 +288,48 @@ mod tests {
             .unwrap();
         assert_eq!(confirmed.payload["status"], "success");
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn plugin_receipt_recovers_into_the_same_usage_projection_without_a_session() {
+        let bus = InMemoryEventBus::new(16);
+        let mut source = fact(UtcMillis::now().0);
+        source.schema_version = 2;
+        source.session_id = None;
+        source.turn_id = None;
+        source.plugin = Some(PluginModelOwner {
+            plugin_id: "acme.example".into(),
+            digest: "a".repeat(64),
+            instance_id: "instance-1".into(),
+            operation_id: "operation-1".into(),
+            display_name: Some("Example".into()),
+        });
+        source.call_status = Some(UsageCallStatus::Success);
+        write_fact(&bus, &source).unwrap();
+        let restored = InMemoryEventBus::new(16);
+        restored.restore_persisted_audit_usage_ledger(bus.audit_usage_ledger_snapshot());
+        recover(&restored).unwrap();
+        recover(&restored).unwrap();
+        let snapshot = restored.audit_usage_ledger_snapshot();
+        let entries: Vec<_> = snapshot
+            .usage_entries
+            .iter()
+            .filter(|entry| entry.event_type == "model.usage.recorded")
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let entry = entries[0];
+        assert!(entry.context.session_id.is_none());
+        assert!(entry.payload.get("sessionId").is_none());
+        let input: magi_usage_authority::UsageCallRecordInput =
+            serde_json::from_value(entry.payload.clone()).unwrap();
+        assert_eq!(input.owner.session_id(), None);
+        assert_eq!(entry.payload["plugin"]["displayName"], "Example");
+        assert_eq!(entry.payload["status"], "success");
+        assert_eq!(entry.payload["usage"]["inputTokens"], 12);
+        assert_eq!(
+            entry.payload["callIdentity"]["transport"]["httpStatus"],
+            200
+        );
     }
 
     #[test]

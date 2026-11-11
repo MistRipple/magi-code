@@ -287,14 +287,6 @@ pub(crate) fn tool_interrupted_before_execution_result(
     )
 }
 
-/// 人工等待不是副作用已执行的证据。授权批准后先提交 running；提问答复由 canonical 交互记录恢复。
-pub(crate) fn tool_payload_waits_for_user(payload: &Value) -> bool {
-    matches!(
-        payload.get("status").and_then(Value::as_str),
-        Some("awaiting_approval" | "awaiting_user_input")
-    )
-}
-
 pub(crate) fn tool_result_is_interrupted_not_started(result: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(result) else {
         return false;
@@ -423,6 +415,12 @@ pub fn model_visible_tool_result(result: &str, status: ExecutionResultStatus) ->
     if result.len() <= MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES {
         return result.to_string();
     }
+    if status == ExecutionResultStatus::Succeeded
+        && let Ok(catalog) = serde_json::from_str::<Value>(result)
+        && catalog["tool"] == "tool_catalog"
+    {
+        return model_visible_tool_catalog(&catalog);
+    }
     if result.len() <= MODEL_BUDGETED_TOOL_RESULT_MAX_BYTES
         && serde_json::from_str::<Value>(result)
             .is_ok_and(|parsed| parsed.get("model_budgeted").and_then(Value::as_bool) == Some(true))
@@ -533,6 +531,106 @@ pub fn model_visible_tool_result(result: &str, status: ExecutionResultStatus) ->
         })
         .to_string()
     }
+}
+
+/// 大目录保留可调用身份与准入事实，不能把 JSON 截成首尾预览。
+/// 完整 schema 已由原始回执加载到下一步 tools；这里与历史重建共用，
+/// 不改变 canonical 回执，也不建立另一份工具注册表。
+fn model_visible_tool_catalog(catalog: &Value) -> String {
+    const LISTS: [&str; 8] = [
+        "tools",
+        "skill_tools",
+        "mcp_servers",
+        "mcp_tools",
+        "plugin_tools",
+        "agent_roles",
+        "session_agents",
+        "runtime_dependencies",
+    ];
+    let mut projected = serde_json::json!({
+        "tool": "tool_catalog",
+        "status": catalog["status"],
+        "current_access_profile": catalog["current_access_profile"],
+        "summary": catalog["summary"],
+        "model_projection": "catalog_metadata",
+        "schema_delivery": "Callable schemas marked schema_included=true are supplied in the next request's tools definitions. Use the exact model_tool_name; do not invent a prefix. For other tools, request include_external=true, include_schema=true and exact tool_names.",
+    });
+    for list in LISTS {
+        let Some(items) = catalog[list].as_array() else {
+            continue;
+        };
+        projected[list] = Value::Array(
+            items
+                .iter()
+                .map(|item| {
+                    // 代理恢复身份、模型绑定和运行依赖继续使用原生目录合同。
+                    if !matches!(list, "tools" | "mcp_tools" | "plugin_tools") {
+                        return item.clone();
+                    }
+                    let mut metadata = Map::new();
+                    for key in [
+                        "name",
+                        "title",
+                        "tool_name",
+                        "model_tool_name",
+                        "server_id",
+                        "server_name",
+                        "role_id",
+                        "display_name",
+                        "spawnable",
+                        "status",
+                        "availability",
+                        "reason_code",
+                        "model_available",
+                        "schema_included",
+                        "read_only",
+                        "model_call_scope",
+                        "policy_summary",
+                        "description",
+                    ] {
+                        if let Some(value) = item.get(key) {
+                            let value = if key == "description" {
+                                Value::String(truncate_utf8_middle(
+                                    value.as_str().unwrap_or_default(),
+                                    256,
+                                ))
+                            } else {
+                                value.clone()
+                            };
+                            metadata.insert(key.into(), value);
+                        }
+                    }
+                    Value::Object(metadata)
+                })
+                .collect(),
+        );
+    }
+    // 描述让位于完整的工具名与准入状态，不能让一个长描述挤掉其他入口。
+    if projected.to_string().len() > MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES {
+        for list in LISTS {
+            for item in projected[list].as_array_mut().into_iter().flatten() {
+                item.as_object_mut()
+                    .expect("catalog metadata")
+                    .remove("description");
+            }
+        }
+    }
+    if projected.to_string().len() <= MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES {
+        return projected.to_string();
+    }
+    // 极大目录仍按完整条目裁剪并明确遗漏，模型可以用现有 query/tool_names 收窄。
+    let mut omitted = 0usize;
+    for list in LISTS.into_iter().rev() {
+        while projected.to_string().len() > MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES - 256 {
+            if projected[list].as_array_mut().and_then(Vec::pop).is_none() {
+                break;
+            }
+            omitted += 1;
+        }
+    }
+    projected["omitted_entries"] = Value::from(omitted);
+    projected["message"] = Value::String("Directory exceeds the model display budget. Refine query or use exact tool_names to retrieve omitted entries; do not guess tool names.".into());
+    projected.to_string()
 }
 
 /// 对一组已经按单条上限裁剪过的工具结果继续施加总预算。
@@ -921,6 +1019,87 @@ mod tests {
                 .unwrap()
                 .contains("model output truncated")
         );
+    }
+
+    #[test]
+    fn catalog_projection_keeps_every_matching_name_and_admission_without_schema_duplication() {
+        let tools = (0..24)
+            .map(|index| {
+                serde_json::json!({
+                    "model_tool_name": format!("plugin__example__tool_{index}"),
+                    "title": format!("Analysis {index}"),
+                    "description": "分析工具说明".repeat(100),
+                    "model_available": index != 1,
+                    "availability": if index == 1 { "denied" } else { "needs_approval" },
+                    "reason_code": if index == 1 { Some("tool_explicitly_denied") } else { None },
+                    "schema_included": index == 0,
+                    "input_schema": {"type":"object", "description":"large schema".repeat(2_000)},
+                })
+            })
+            .collect::<Vec<_>>();
+        let agents = serde_json::json!([{"task_id":"previous-task", "title":"Review",
+            "role":"reviewer", "status":"completed", "activation":{"agent_id":"agent-1","generation":2}}]);
+        let roles = serde_json::json!([{"role_id":"reviewer", "spawnable":true,
+            "supported_kinds":["local_agent"],"model_binding_status":"ready"}]);
+        let raw =
+            serde_json::json!({"tool":"tool_catalog", "status":"succeeded", "plugin_tools":tools,
+            "session_agents":agents,"agent_roles":roles})
+            .to_string();
+        let visible = model_visible_tool_result(&raw, ExecutionResultStatus::Succeeded);
+        assert!(visible.len() <= MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES);
+        let parsed: Value = serde_json::from_str(&visible).unwrap();
+        assert_eq!(parsed["session_agents"], agents);
+        assert_eq!(parsed["agent_roles"], roles);
+        assert_eq!(parsed["plugin_tools"].as_array().unwrap().len(), 24);
+        for index in 0..24 {
+            assert_eq!(
+                parsed["plugin_tools"][index]["model_tool_name"],
+                tools[index]["model_tool_name"]
+            );
+            assert_eq!(
+                parsed["plugin_tools"][index]["availability"],
+                tools[index]["availability"]
+            );
+            assert_eq!(
+                parsed["plugin_tools"][index]["reason_code"],
+                tools[index]["reason_code"]
+            );
+            assert_eq!(
+                parsed["plugin_tools"][index]["schema_included"],
+                tools[index]["schema_included"]
+            );
+            assert!(parsed["plugin_tools"][index].get("input_schema").is_none());
+        }
+        assert_eq!(
+            model_visible_tool_result(&visible, ExecutionResultStatus::Succeeded),
+            visible,
+            "实时结果再次进入历史预算时不能改变目录投影"
+        );
+        assert!(
+            serde_json::from_str::<Value>(&raw).unwrap()["plugin_tools"][0]["input_schema"]
+                .is_object()
+        );
+    }
+
+    #[test]
+    fn catalog_projection_reports_omissions_as_whole_entries_instead_of_broken_json() {
+        let tools = (0..200).map(|index| serde_json::json!({
+            "model_tool_name": format!("plugin__example__tool_{index}"),
+            "title": format!("Analysis {index}"), "availability":"available", "model_available":true,
+        })).collect::<Vec<_>>();
+        let raw =
+            serde_json::json!({"tool":"tool_catalog", "status":"succeeded", "plugin_tools":tools})
+                .to_string();
+        let visible = model_visible_tool_result(&raw, ExecutionResultStatus::Succeeded);
+        assert!(visible.len() <= MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES);
+        let parsed: Value = serde_json::from_str(&visible).unwrap();
+        let kept = parsed["plugin_tools"].as_array().unwrap();
+        assert!(!kept.is_empty());
+        assert_eq!(
+            kept.len() + parsed["omitted_entries"].as_u64().unwrap() as usize,
+            200
+        );
+        assert_eq!(kept, &tools[..kept.len()]);
     }
 
     #[test]

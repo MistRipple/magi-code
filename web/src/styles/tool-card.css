@@ -40,16 +40,37 @@
   transition: background-color var(--transition-fast);
   box-sizing: border-box;
 }
-:is(.tool-header, .code-header, .thinking-header):hover { background: var(--surface-hover); }
-:is(.tool-header, .thinking-header):focus-visible {
+:is(button.tool-header, .tool-header-disclosure, .code-header, .thinking-header):hover { background: var(--surface-hover); }
+:is(.tool-header, .tool-header-disclosure, .thinking-header):focus-visible {
   outline: 0;
   box-shadow: inset 0 0 0 1.5px var(--primary);
   border-radius: var(--tool-card-radius);
 }
 .file-mutation-header, .plan-header { cursor: default; }
 .tool-header { min-height:36px; padding-block:6px; line-height:20px; }
+.tool-header-with-actions { cursor:default; }
+.tool-header-disclosure {
+  display:flex;
+  align-items:center;
+  flex:0 0 auto;
+  margin-inline-start:auto;
+  min-inline-size:28px;
+  min-block-size:28px;
+  padding:0 4px;
+  border:0;
+  border-radius:var(--radius-sm);
+  background:transparent;
+  color:inherit;
+  font:inherit;
+  cursor:pointer;
+}
+.tool-header-with-actions :is(.filespan, .rename-path) { min-block-size:28px; }
+.tool-header-with-actions :is(.filespan, .rename-path, .tool-header-disclosure):active { background:var(--surface-active); }
+@media (hover:none), (pointer:coarse) {
+  .tool-header-with-actions :is(.filespan, .rename-path, .tool-header-disclosure) { min-block-size:44px; min-inline-size:44px; }
+}
 /* Finished/collapsed tools read as quiet execution rows; open results retain their card surface. */
-.message-card.tool-call:where(:not(.has-error):not(.has-warning):has(> .tool-header:not([aria-expanded="true"]))) {
+.message-card.tool-call:where(:not(.has-error):not(.has-warning):has(> .tool-header):not(:has(> .tool-header[aria-expanded="true"], > .tool-header [aria-expanded="true"]))) {
   background:var(--tool-row-background);
   box-shadow:inset 0 0 0 var(--magi-hairline) var(--tool-row-outline);
 }

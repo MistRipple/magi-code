@@ -839,11 +839,6 @@ impl TaskExecutorBinding {
         self
     }
 
-    pub fn with_exclusive_scope(mut self, scope: Option<String>) -> Self {
-        self.exclusive_scope = normalized_optional_string(scope);
-        self
-    }
-
     pub fn with_active_skill_id(mut self, skill_id: Option<String>) -> Self {
         self.active_skill_id = normalized_optional_string(skill_id);
         self
@@ -885,10 +880,6 @@ impl TaskExecutorBinding {
 
     fn parallelism_group(&self) -> Option<&str> {
         normalized_str_ref(self.parallelism_group.as_deref())
-    }
-
-    fn exclusive_scope(&self) -> Option<&str> {
-        normalized_str_ref(self.exclusive_scope.as_deref())
     }
 
     fn active_skill_id(&self) -> Option<&str> {
@@ -1000,12 +991,6 @@ impl Task {
         self.executor_binding
             .as_ref()
             .and_then(TaskExecutorBinding::parallelism_group)
-    }
-
-    pub fn executor_binding_exclusive_scope(&self) -> Option<&str> {
-        self.executor_binding
-            .as_ref()
-            .and_then(TaskExecutorBinding::exclusive_scope)
     }
 
     pub fn executor_binding_active_skill_id(&self) -> Option<&str> {

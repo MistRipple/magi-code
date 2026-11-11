@@ -174,14 +174,6 @@ impl SafetyEvaluation {
         self.decision.is_allow()
     }
 
-    pub fn selected_match(&self) -> Option<&SafetyMatch> {
-        self.matches.iter().find(|matched| match &self.decision {
-            SafetyDecision::Allow => false,
-            SafetyDecision::HardBlock { pattern, .. }
-            | SafetyDecision::RequireApprovalInRestricted { pattern, .. }
-            | SafetyDecision::AuditOnly { pattern, .. } => &matched.pattern == pattern,
-        })
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

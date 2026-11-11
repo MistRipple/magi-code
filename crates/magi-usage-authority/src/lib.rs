@@ -4,9 +4,7 @@ pub mod context_window;
 pub mod costing;
 pub mod ledger_store;
 pub mod model_identity;
-pub mod query_service;
 pub mod reducer;
-pub mod runtime_recorder;
 pub mod types;
 
 #[cfg(test)]
@@ -26,7 +24,4 @@ pub use costing::{
 };
 pub use ledger_store::InMemoryLedgerStore;
 pub use model_identity::{build_model_resolution_identity, prepare_llm_config_for_persistence};
-pub use query_service::UsageQueryService;
-pub use reducer::{rebuild_session_snapshot_from_events, rebuild_workspace_snapshot_from_sessions};
-pub use runtime_recorder::{RuntimeCallRecordInput, RuntimeRecorder};
 pub use types::*;

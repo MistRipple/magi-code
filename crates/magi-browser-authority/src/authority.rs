@@ -677,31 +677,6 @@ impl BrowserAuthority {
             })
     }
 
-    pub fn clear_primary_surfaces(&mut self, now: UtcMillis) -> Vec<BrowserControlLease> {
-        if self.primary_surfaces.is_empty() {
-            self.active_desktop_epoch = None;
-            return Vec::new();
-        }
-        let revoked = self.revoke_leases(
-            &BrowserLeaseSelector::default(),
-            BrowserLeaseEndReason::RuntimeUnavailable,
-            now,
-        );
-        let affected_sessions = self
-            .primary_surfaces
-            .keys()
-            .filter_map(|tab_id| self.tabs.get(tab_id))
-            .map(|tab| tab.browser_session_id.clone())
-            .collect::<HashSet<_>>();
-        self.primary_surfaces.clear();
-        self.active_desktop_epoch = None;
-        for browser_session_id in affected_sessions {
-            self.bump_session_revision(&browser_session_id, now);
-        }
-        self.bump_revision();
-        revoked
-    }
-
     pub fn create_session(
         &mut self,
         input: CreateBrowserSession,
@@ -1035,32 +1010,6 @@ impl BrowserAuthority {
         Ok(tab)
     }
 
-    pub fn update_tab_document(
-        &mut self,
-        tab_id: &BrowserTabId,
-        url: String,
-        origin: Option<String>,
-        title: String,
-        now: UtcMillis,
-    ) -> Result<BrowserTab, BrowserAuthorityError> {
-        self.require_ready_tab(tab_id)?;
-        let browser_session_id = self.require_tab(tab_id)?.browser_session_id.clone();
-        let tab = self
-            .tabs
-            .get_mut(tab_id)
-            .expect("browser tab was validated before mutation");
-        tab.url = url;
-        tab.origin = origin;
-        tab.title = title;
-        tab.navigation_revision = tab.navigation_revision.saturating_add(1);
-        tab.snapshot_revision = tab.snapshot_revision.saturating_add(1);
-        tab.updated_at = now;
-        let tab = tab.clone();
-        self.bump_session_revision(&browser_session_id, now);
-        self.bump_revision();
-        Ok(tab)
-    }
-
     pub fn apply_host_page_state(
         &mut self,
         tab_id: &BrowserTabId,
@@ -1110,57 +1059,6 @@ impl BrowserAuthority {
         Ok(tab)
     }
 
-    pub fn apply_native_page_state(
-        &mut self,
-        tab_id: &BrowserTabId,
-        url: Option<String>,
-        title: Option<String>,
-        now: UtcMillis,
-    ) -> Result<BrowserTab, BrowserAuthorityError> {
-        self.require_ready_tab(tab_id)?;
-        let browser_session_id = self.require_tab(tab_id)?.browser_session_id.clone();
-        let (tab, document_changed, changed) = {
-            let tab = self
-                .tabs
-                .get_mut(tab_id)
-                .expect("browser tab was validated before mutation");
-            let (next_url, next_origin, next_title) = match url {
-                Some(url) => normalize_browser_page_state(
-                    url.clone(),
-                    crate::browser_navigation_origin(&url),
-                    title.unwrap_or_else(|| tab.title.clone()),
-                ),
-                None => (
-                    tab.url.clone(),
-                    tab.origin.clone(),
-                    title.unwrap_or_else(|| tab.title.clone()),
-                ),
-            };
-            let document_changed = tab.url != next_url;
-            let metadata_changed = tab.origin != next_origin || tab.title != next_title;
-            let changed = document_changed || metadata_changed;
-            if changed {
-                tab.url = next_url;
-                tab.origin = next_origin;
-                tab.title = next_title;
-                if document_changed {
-                    tab.navigation_revision = tab.navigation_revision.saturating_add(1);
-                    tab.snapshot_revision = tab.snapshot_revision.saturating_add(1);
-                }
-                tab.updated_at = now;
-            }
-            (tab.clone(), document_changed, changed)
-        };
-        if document_changed {
-            self.mark_active_annotations_stale(tab_id, now);
-        }
-        if changed {
-            self.bump_session_revision(&browser_session_id, now);
-            self.bump_revision();
-        }
-        Ok(tab)
-    }
-
     pub fn record_snapshot(
         &mut self,
         tab_id: &BrowserTabId,
@@ -1180,26 +1078,6 @@ impl BrowserAuthority {
         Ok(revisions)
     }
 
-    pub fn apply_host_snapshot_revision(
-        &mut self,
-        tab_id: &BrowserTabId,
-        host_snapshot_revision: u64,
-        _now: UtcMillis,
-    ) -> Result<u64, BrowserAuthorityError> {
-        self.require_ready_tab(tab_id)?;
-        let tab = self
-            .tabs
-            .get_mut(tab_id)
-            .expect("browser tab was validated before mutation");
-        if host_snapshot_revision != tab.snapshot_revision {
-            return Err(BrowserAuthorityError::SnapshotRevisionMismatch {
-                expected: tab.snapshot_revision,
-                provided: host_snapshot_revision,
-            });
-        }
-        Ok(tab.snapshot_revision)
-    }
-
     pub fn validate_snapshot_result(
         &self,
         tab_id: &BrowserTabId,
@@ -1211,29 +1089,6 @@ impl BrowserAuthority {
             return Err(BrowserAuthorityError::NavigationRevisionRegression {
                 current: tab.navigation_revision,
                 received: navigation_revision,
-            });
-        }
-        if tab.snapshot_revision != snapshot_revision {
-            return Err(BrowserAuthorityError::SnapshotRevisionMismatch {
-                expected: tab.snapshot_revision,
-                provided: snapshot_revision,
-            });
-        }
-        Ok(())
-    }
-
-    pub fn validate_snapshot_ref(
-        &self,
-        browser_session_id: &BrowserSessionId,
-        tab_id: &BrowserTabId,
-        snapshot_revision: u64,
-    ) -> Result<(), BrowserAuthorityError> {
-        self.require_ready_session(browser_session_id)?;
-        let tab = self.require_ready_tab(tab_id)?;
-        if &tab.browser_session_id != browser_session_id {
-            return Err(BrowserAuthorityError::TabSessionMismatch {
-                tab_id: tab_id.clone(),
-                browser_session_id: browser_session_id.clone(),
             });
         }
         if tab.snapshot_revision != snapshot_revision {
@@ -1465,19 +1320,6 @@ impl BrowserAuthority {
         })
     }
 
-    pub fn release_lease(
-        &mut self,
-        lease_id: &BrowserLeaseId,
-        now: UtcMillis,
-    ) -> Result<BrowserControlLease, BrowserAuthorityError> {
-        self.finish_lease(
-            lease_id,
-            BrowserLeaseLifecycle::Released,
-            BrowserLeaseEndReason::OwnerReleased,
-            now,
-        )
-    }
-
     pub fn revoke_lease(
         &mut self,
         lease_id: &BrowserLeaseId,
@@ -1686,61 +1528,6 @@ impl BrowserAuthority {
             },
             now,
         )
-    }
-
-    pub fn begin_runtime_recovery(&mut self, now: UtcMillis) -> Vec<BrowserSessionId> {
-        self.revoke_leases(
-            &BrowserLeaseSelector::default(),
-            BrowserLeaseEndReason::RuntimeUnavailable,
-            now,
-        );
-        self.primary_surfaces.clear();
-        self.active_desktop_epoch = None;
-        let recovering_session_ids = self
-            .sessions
-            .values()
-            .filter(|session| session.lifecycle.is_recoverable())
-            .map(|session| session.browser_session_id.clone())
-            .collect::<Vec<_>>();
-        for browser_session_id in &recovering_session_ids {
-            if let Some(session) = self.sessions.get_mut(browser_session_id) {
-                if session.lifecycle != BrowserSessionLifecycle::Recovering {
-                    session.runtime_epoch = session.runtime_epoch.saturating_add(1);
-                }
-                session.lifecycle = BrowserSessionLifecycle::Recovering;
-                session.revision = session.revision.saturating_add(1);
-                session.updated_at = now;
-                for tab_id in &session.tab_ids {
-                    if let Some(tab) = self.tabs.get_mut(tab_id)
-                        && matches!(
-                            tab.lifecycle,
-                            BrowserTabLifecycle::Creating
-                                | BrowserTabLifecycle::Ready
-                                | BrowserTabLifecycle::Suspended
-                                | BrowserTabLifecycle::Crashed
-                        )
-                    {
-                        tab.lifecycle = BrowserTabLifecycle::Suspended;
-                        tab.snapshot_revision = tab.snapshot_revision.saturating_add(1);
-                        tab.updated_at = now;
-                    }
-                }
-            }
-        }
-        for browser_session_id in &recovering_session_ids {
-            let tab_ids = self
-                .sessions
-                .get(browser_session_id)
-                .map(|session| session.tab_ids.clone())
-                .unwrap_or_default();
-            for tab_id in tab_ids {
-                self.mark_active_annotations_stale(&tab_id, now);
-            }
-        }
-        if !recovering_session_ids.is_empty() {
-            self.bump_revision();
-        }
-        recovering_session_ids
     }
 
     /// 将上一次 Browser Host 耗尽重试后保留的中断会话重新投入恢复。

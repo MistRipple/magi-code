@@ -4,6 +4,14 @@ import ts from 'typescript';
 const functionLike = (node) => ts.isArrowFunction(node) || ts.isFunctionExpression(node) || ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node);
 const nameOf = (node) => node && (ts.isIdentifier(node) || ts.isStringLiteralLike(node)) ? node.text : undefined;
 
+// 原包显式接纳不可用订阅：缺少 on/once 时以 null 返回调用方。
+// 普通可选调用、未检查的返回值或任意其他回退值不具备此合同。
+export function nullableRegistration(node) {
+  return Boolean(node.questionDotToken && ts.isBinaryExpression(node.parent)
+    && node.parent.left === node && node.parent.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken
+    && node.parent.right.kind === ts.SyntaxKind.NullKeyword);
+}
+
 function catches(node) {
   for (let current = node; current.parent && !functionLike(current); current = current.parent) {
     const parent = current.parent;
@@ -63,15 +71,21 @@ export function guardedRegistration(node, source) {
 }
 
 /** ctx.inject 的回调只有在目标服务出现时才执行；export inject 仍是必需依赖。 */
-export function conditionalService(node, service, isContext) {
+export function conditionalDependencies(node, isContext) {
+  const services = new Set();
   for (let current = node.parent; current; current = current.parent) {
     if (!functionLike(current)) continue;
     const call = current.parent;
     if (!ts.isCallExpression(call) || !ts.isPropertyAccessExpression(call.expression)
       || call.expression.name.text !== 'inject' || !isContext(call.expression.expression, call)) continue;
     const dependencies = call.arguments[0];
-    if (dependencies && ts.isArrayLiteralExpression(dependencies)
-      && dependencies.elements.some((item) => ts.isStringLiteralLike(item) && item.text === service)) return true;
+    if (dependencies && ts.isArrayLiteralExpression(dependencies)) {
+      for (const item of dependencies.elements) if (ts.isStringLiteralLike(item)) services.add(item.text);
+    }
   }
-  return false;
+  return [...services];
+}
+
+export function conditionalService(node, service, isContext) {
+  return conditionalDependencies(node, isContext).includes(service);
 }

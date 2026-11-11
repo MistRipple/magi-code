@@ -1417,36 +1417,3 @@ export function updateRightPaneTabLabel(
     tab.label = normalizedLabel;
   }
 }
-
-/** 清理某个 session 的所有 tab 状态（在 session 关闭/重置时调用） */
-export function clearRightPaneSession(
-  scopeKeyOrWorkspaceId: string | null | undefined,
-  sessionId?: string | null,
-): void {
-  const scopeKey = sessionId === undefined
-    ? normalizeStoredScopeKey(scopeKeyOrWorkspaceId)
-    : paneScopeKey(scopeKeyOrWorkspaceId, sessionId);
-  if (!scopeKey) {
-    rightPaneState.perSession = {
-      [PERSONAL_SCOPE_KEY]: { ...EMPTY_SESSION_STATE, openTabs: [] },
-    };
-    rightPaneState.activeScopeKey = PERSONAL_SCOPE_KEY;
-    rightPaneState.activeWorkspaceId = '';
-    rightPaneState.activeSessionId = '';
-    return;
-  }
-  if (scopeKey === PERSONAL_SCOPE_KEY) {
-    rightPaneState.perSession[PERSONAL_SCOPE_KEY] = { ...EMPTY_SESSION_STATE, openTabs: [] };
-    rightPaneState.activeScopeKey = PERSONAL_SCOPE_KEY;
-    rightPaneState.activeWorkspaceId = '';
-    rightPaneState.activeSessionId = '';
-    return;
-  }
-  delete rightPaneState.perSession[scopeKey];
-  if (rightPaneState.activeScopeKey === scopeKey) {
-    ensureSession(PERSONAL_SCOPE_KEY);
-    rightPaneState.activeScopeKey = PERSONAL_SCOPE_KEY;
-    rightPaneState.activeWorkspaceId = '';
-    rightPaneState.activeSessionId = '';
-  }
-}

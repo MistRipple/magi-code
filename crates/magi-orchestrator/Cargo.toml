@@ -7,7 +7,6 @@ edition.workspace = true
 serde.workspace = true
 magi-core = { path = "../magi-core" }
 magi-agent-role = { path = "../magi-agent-role" }
-magi-worker-runtime = { path = "../magi-worker-runtime" }
 magi-context-runtime = { path = "../magi-context-runtime" }
 magi-memory-store = { path = "../magi-memory-store" }
 serde_json.workspace = true

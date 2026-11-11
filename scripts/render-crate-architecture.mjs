@@ -27,7 +27,7 @@ const CRATE_META = {
   'magi-app-server-protocol': ['bus', 'App Server schema 生成的协议与消息行为'],
   'magi-appearance': ['base', '跨宿主外观资产与主题资源'],
   'magi-browser-authority': ['bus', 'Browser Tab、Surface、租约与持久化权威'],
-  'magi-extension-host': ['exec', '受信 Node 扩展宿主：协议传输、宿主监管与 ExtensionBus（尚未接入对话调用链）'],
+  'magi-extension-host': ['exec', '受信 Node 扩展宿主：协议传输、宿主监管与 ExtensionBus 裁决'],
   'magi-git': ['storage', '结构化 Git 操作、仓库观测与 worktree'],
   'magi-mcp-server': ['api', '对外 MCP 服务、令牌、传输与网络入口'],
   'magi-process': ['base', '子进程、Shell 与跨平台进程生命周期'],
@@ -35,7 +35,7 @@ const CRATE_META = {
   'magi-session-isolation': ['storage', '会话隔离工作副本与合并'],
   'magi-agent-role': ['exec', 'AgentRole：角色定义、注册表与文件加载'],
   'magi-api': ['api', 'HTTP / 路由、MCP 配置、session 标题'],
-  'magi-bridge-client': ['bus', 'LLM 桥接客户端：适配器、决策引擎、最终文本策略'],
+  'magi-bridge-client': ['bus', 'LLM/MCP 桥接客户端：协议适配、Prompt IR 与传输'],
   'magi-context-runtime': ['storage', '分层记忆、共享上下文池'],
   'magi-conversation-runtime': ['api', '对话运行时：主线对话、任务分派与上下文聚合'],
   'magi-core': ['base', '地基：错误、ID、路径、原子写、执行原语、公开文本'],
@@ -45,6 +45,7 @@ const CRATE_META = {
   'magi-governance': ['bus', '审批 / 决策请求模型'],
   'magi-knowledge-store': ['storage', '本地代码检索引擎：扫描、分词、倒排索引、依赖图'],
   'magi-memory-store': ['storage', '记忆存储'],
+  'magi-media': ['base', '图片格式识别、解码与模型附件转换'],
   'magi-orchestrator': ['exec', '任务编排核心：任务存储、worker 目录、风险与校验策略'],
   'magi-permissions': ['bus', 'L7 工具 / 目录 / 命令三维权限与访问模式'],
   'magi-project-memory': ['storage', 'L14 跨 session / conversation 的项目记忆'],
@@ -57,7 +58,6 @@ const CRATE_META = {
   'magi-plan': ['mission', 'SessionPlan：用户可见计划协议与执行任务绑定'],
   'magi-tool-runtime': ['exec', '工具执行运行时'],
   'magi-usage-authority': ['bus', 'token 计费、上下文窗口、模型身份、用量账本'],
-  'magi-worker-runtime': ['exec', 'worker 执行运行时'],
   'magi-workspace': ['storage', '工作区注册表与模型'],
 };
 
@@ -87,7 +87,7 @@ const BUSINESS_FLOW = [
     id: 'routing',
     title: '任务接纳与分派',
     desc: 'TurnService 统一接纳请求；conversation profile 直接进入会话执行，task profile 由 TaskStore 与调度器执行，子代理使用同一任务树和角色注册表。',
-    crates: ['magi-orchestrator', 'magi-agent-role', 'magi-worker-runtime'],
+    crates: ['magi-orchestrator', 'magi-agent-role'],
     risk: '显式绑定的任务模型失败必须可见，不能静默 failover 到编排模型。',
   },
   {

@@ -311,171 +311,6 @@ export interface RecoveryHandleDto {
   consumedAt?: number | null;
 }
 
-export type BridgeServerKind = 'model' | 'host' | 'mcp';
-export type BridgeErrorLayer = 'transport' | 'protocol' | 'remote_business';
-
-export interface BridgeHandshakeDto {
-  protocol_version: string;
-  server_kind: BridgeServerKind;
-  health_method: string;
-  supported_methods: string[];
-}
-
-export interface BridgeHealthDto {
-  protocol_version: string;
-  server_kind: BridgeServerKind;
-  status: string;
-  ok: boolean;
-}
-
-export interface BridgeServerShellManifestDto {
-  shell_id: string;
-  minimum_version: string;
-  capability_version: string;
-  implementation_source: string;
-  capability_profile: string;
-  workspace_roots_source: string;
-}
-
-export interface BridgeServerShellProfileDto {
-  profile_id: string;
-  shell_id: string;
-  host_kind: string;
-  shell_family: string;
-  minimum_version: string;
-  capability_version: string;
-}
-
-export interface BridgeServerCommandCapabilityProfileDto {
-  command_name: string;
-  capability_id: string;
-  interaction_mode: string;
-  side_effect_level: string;
-  requires_session_context: boolean;
-  requires_workspace_context: boolean;
-  path_argument_policy: string;
-}
-
-export interface BridgeServerSessionDescriptorDto {
-  session_id: string;
-  session_scope: string;
-}
-
-export interface BridgeServerWorkspaceContextDto {
-  workspace_id: string;
-  workspace_scope: string;
-  workspace_roots_source: string;
-}
-
-export interface BridgeServerContextResolutionBoundaryDto {
-  request_binding: string;
-  session_resolution_strategy: string;
-  workspace_resolution_strategy: string;
-  session_resolution_source: string;
-  workspace_resolution_source: string;
-}
-
-export interface BridgeServiceDescriptorDto {
-  service_name: string;
-  shim_kind: string;
-  supported_operations: string[];
-  capabilities: string[];
-  service_health?: string | null;
-  service_health_reason?: string | null;
-  implementation_source?: string | null;
-  capability_profile?: string | null;
-  workspace_roots_source?: string | null;
-  manager_version?: string | null;
-  registry_profile?: string | null;
-  registry_manifest?: string | null;
-  selection_strategy?: string | null;
-  default_server?: string | null;
-  default_server_health?: string | null;
-  default_server_selection_key?: string | null;
-  default_route_status?: string | null;
-  default_route_target?: string | null;
-  selection_targets?: string[] | null;
-  selection_key?: string | null;
-  server_manifest?: string | null;
-  shell_manifest?: BridgeServerShellManifestDto | null;
-  shell_profile?: BridgeServerShellProfileDto | null;
-  command_capability_profiles?: BridgeServerCommandCapabilityProfileDto[] | null;
-  session_descriptor?: BridgeServerSessionDescriptorDto | null;
-  workspace_context?: BridgeServerWorkspaceContextDto | null;
-  context_resolution_boundary?: BridgeServerContextResolutionBoundaryDto | null;
-}
-
-export interface BridgeServiceCatalogDto {
-  protocol_version: string;
-  server_kind: BridgeServerKind;
-  services: BridgeServiceDescriptorDto[];
-}
-
-export interface BridgeProbeErrorDto {
-  layer?: BridgeErrorLayer | null;
-  code?: number | null;
-  message: string;
-}
-
-export interface BridgeServiceSnapshotDto {
-  server_kind: BridgeServerKind;
-  handshake?: BridgeHandshakeDto | null;
-  handshake_error?: BridgeProbeErrorDto | null;
-  health?: BridgeHealthDto | null;
-  health_error?: BridgeProbeErrorDto | null;
-  service_catalog?: BridgeServiceCatalogDto | null;
-  service_catalog_error?: BridgeProbeErrorDto | null;
-}
-
-export interface BridgeServicesSnapshotDto {
-  services: BridgeServiceSnapshotDto[];
-}
-
-export interface BridgePreflightCheckDto {
-  check_name: string;
-  target: string;
-  ok: boolean;
-  response_excerpt?: string | null;
-  error?: BridgeProbeErrorDto | null;
-}
-
-export interface BridgePreflightServiceDto {
-  server_kind: BridgeServerKind;
-  checks: BridgePreflightCheckDto[];
-}
-
-export interface BridgePreflightSnapshotDto {
-  services: BridgePreflightServiceDto[];
-}
-
-export interface BridgeModelContractDto {
-  contract_profile: string;
-  payload_kind: string;
-  contract_ok: boolean;
-  has_content: boolean;
-  has_finish_reason: boolean;
-  has_usage: boolean;
-  tool_call_count: number;
-  blocking_reason?: string | null;
-}
-
-export interface BridgeMcpDefaultRouteContractDto {
-  route_status: string;
-  route_target: string;
-  resolved_server?: string | null;
-  describe_ok: boolean;
-  blank_selection_ok: boolean;
-  contract_ok: boolean;
-  blocking_reason?: string | null;
-}
-
-export interface BridgeMcpDefaultRouteGateDto {
-  route_status: string;
-  route_target: string;
-  resolved_server?: string | null;
-  contract_ok: boolean;
-}
-
 export interface EventEnvelope {
   event_id: string;
   event_type: string;
@@ -748,12 +583,6 @@ export interface SessionRuntimeBranchSummaryDto {
   status: string;
   stage: string;
   lease_id?: string | null;
-  execution_intent_ref?: string | null;
-  binding_lifecycle?: string | null;
-  checkpoint_stage?: string | null;
-  next_step_index?: number | null;
-  checkpoint_at?: number | null;
-  resume_mode?: string | null;
   is_primary: boolean;
 }
 
@@ -971,34 +800,6 @@ export interface SessionCloseRequestDto {
   workspacePath?: string | null;
 }
 
-export interface SessionContinueRequestDto {
-  sessionId: string;
-  workspaceId?: string | null;
-  workspacePath?: string | null;
-  promptText?: string | null;
-  requestedAgentIds?: string[];
-  requestId?: string | null;
-  userMessageId?: string | null;
-  placeholderMessageId?: string | null;
-}
-
-export interface SessionContinueResponseDto {
-  sessionId: string;
-  workspaceId?: string | null;
-  missionId: string;
-  rootTaskId: string;
-  executionChainRef: string;
-  resumedBranchCount: number;
-  status: string;
-  runnerStarted: boolean;
-  eventId: string;
-  continuedAt: number;
-  turnId: string;
-  requestId: string;
-  executionProfile: "task";
-  eventSequence: number;
-}
-
 export type IncidentScopeDto = 'app' | 'workspace' | 'session';
 
 export interface IncidentNotificationItemDto {
@@ -1045,26 +846,6 @@ export interface NotificationContextRequestDto {
 export interface RemoveNotificationRequestDto extends NotificationContextRequestDto {
   notificationId: string;
 }
-
-export interface ReportIncidentRequestDto extends NotificationContextRequestDto {
-  scope: IncidentScopeDto;
-  level?: string | null;
-  title?: string | null;
-  message: string;
-  detail?: string | null;
-  errorCode?: string | null;
-  failureStage?: string | null;
-  taskId?: string | null;
-  requestId?: string | null;
-  source?: string | null;
-  actionRequired?: boolean | null;
-}
-
-export type MarkAllNotificationsReadResponseDto = NotificationsResponseDto;
-export type ClearNotificationsResponseDto = NotificationsResponseDto;
-export type RemoveNotificationResponseDto = NotificationsResponseDto;
-export type ResolveNotificationResponseDto = NotificationsResponseDto;
-export type ReportIncidentResponseDto = NotificationsResponseDto;
 
 // ─── Workspace management endpoints ─────────────────────────────────
 
@@ -1232,17 +1013,6 @@ export interface KnowledgeMutationResponseDto {
   workspaceId: string;
   workspacePath: string;
   knowledgeCount: number;
-}
-
-export interface KnowledgeItemDto {
-  id: string;
-  kind: 'adr' | 'faq' | 'learning';
-  title: string;
-  content: string;
-  context: string | null;
-  tags: string[];
-  createdAt: number;
-  updatedAt: number;
 }
 
 // ─── MCP / Skills / Repos endpoints ─────────────────────────────────
@@ -1634,12 +1404,6 @@ export interface AgentProjectionResultDto {
 
 export type GoalStatus = import('./app-server-protocol.generated').GoalStatus;
 
-export type GoalBlockerDto = import('./app-server-protocol.generated').GoalBlocker;
-
-export type GoalContinuationDto = import('./app-server-protocol.generated').GoalContinuation;
-
-export type GoalCompletionDto = import('./app-server-protocol.generated').GoalCompletion;
-
 export type SessionGoalDto = import('./app-server-protocol.generated').SessionGoal;
 
 export type PlanItemStatus = import('./app-server-protocol.generated').PlanItemStatus;
@@ -1650,8 +1414,6 @@ export type PlanItemDto = import('./app-server-protocol.generated').PlanItem;
 export type SessionPlanDto = import('./app-server-protocol.generated').SessionPlan;
 
 export type CurrentGoalResponseDto = import('./app-server-protocol.generated').GoalSnapshot;
-
-export type GoalAllowedActionsDto = import('./app-server-protocol.generated').GoalAllowedActions;
 
 export interface GoalActionRequestDto {
   sessionId: string;

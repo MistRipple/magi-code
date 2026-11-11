@@ -326,6 +326,9 @@ impl HostInstance {
             self.next_invocation.fetch_add(1, Ordering::Relaxed)
         );
         let mut ctx = ctx;
+        if method == "route.invoke" {
+            ctx["activity"] = json!("route");
+        }
         ctx["invocationId"] = json!(invocation_id);
         ctx["callerInvocationId"] = json!(base_invocation_id);
         ctx["generation"] = json!(self.generation);
@@ -471,6 +474,8 @@ impl HostInstance {
 }
 
 struct HostHandler {
+    output: Arc<Mutex<Option<Peer>>>,
+    generation: u64,
     plugin_id: String,
     lease: String,
     approved: HashMap<String, ApprovedHook>,
@@ -685,6 +690,27 @@ impl Incoming for HostHandler {
                 }
                 if let Some(lease) = lease {
                     if method == "model.invoke"
+                        && object.get("stream") == Some(&json!(true))
+                        && lease.context.get("activity").and_then(Value::as_str) != Some("route")
+                    {
+                        return Box::pin(async {
+                            Err(RpcError::new(
+                                ErrorKind::ReentryDenied,
+                                "模型进度需要活动页面路由",
+                            ))
+                        });
+                    }
+                    if matches!(method.as_str(), "model.selection" | "model.cancel")
+                        && lease.context.get("activity").and_then(Value::as_str) != Some("route")
+                    {
+                        return Box::pin(async {
+                            Err(RpcError::new(
+                                ErrorKind::ReentryDenied,
+                                "模型页面业务需要活动路由调用",
+                            ))
+                        });
+                    }
+                    if method == "model.invoke"
                         && let Some(budget) = lease.context.pointer("/job/budget")
                     {
                         let max_calls = budget
@@ -717,12 +743,42 @@ impl Incoming for HostHandler {
                         }
                         object.insert("maxOutputTokens".into(), json!(requested));
                     }
+                    let progress = if method == "model.invoke"
+                        && object.remove("stream") == Some(json!(true))
+                    {
+                        let output = self.output.clone();
+                        let operation = object
+                            .get("operationId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        let generation = self.generation;
+                        let cancelled = lease.cancelled.clone();
+                        Some(Arc::new(move |delta| {
+                            if cancelled.load(Ordering::Acquire) {
+                                return Err(RpcError::new(ErrorKind::Cancelled, "模型调用已失效"));
+                            }
+                            output.lock().expect("host output").as_ref()
+                                .ok_or_else(|| RpcError::new(ErrorKind::HostGone, "宿主连接已关闭"))?
+                                .notify("model.delta", json!({"generation":generation,"operationId":operation,"delta":delta}))
+                        }) as crate::ServiceProgress)
+                    } else {
+                        None
+                    };
                     object.insert("_context".into(), lease.context);
-                    return service.request_scoped(plugin_id, method, params, lease.cancelled);
+                    return service.request_scoped(
+                        plugin_id,
+                        method,
+                        params,
+                        lease.cancelled,
+                        progress,
+                    );
                 }
                 if matches!(
                     method.as_str(),
                     "model.invoke"
+                        | "model.selection"
+                        | "model.cancel"
                         | "task.spawn"
                         | "ask.user"
                         | "notify.user"
@@ -962,7 +1018,10 @@ pub async fn launch(
     let bound_routes: Arc<Mutex<HashSet<String>>> = Arc::default();
     let (ready_tx, mut ready_rx) = watch::channel(false);
     let invocations = Arc::default();
+    let output = Arc::new(Mutex::new(None));
     let handler = Arc::new(HostHandler {
+        output: output.clone(),
+        generation,
         plugin_id: config.plugin_id.clone(),
         lease: service_lease.lease.clone(),
         approved: approved.clone(),
@@ -977,6 +1036,7 @@ pub async fn launch(
         invocations: Arc::clone(&invocations),
     });
     let peer = Peer::spawn(stream, handler, config.limits);
+    *output.lock().expect("host output") = Some(peer.clone());
 
     let ready = tokio::time::timeout(config.ready_timeout, async {
         tokio::select! {
@@ -1140,6 +1200,8 @@ fn check_hello(
         "images.store",
         "tool.outcome",
         "route.payload",
+        "model.operations",
+        "model.streaming",
     ];
     let features: Vec<String> = supported
         .iter()
