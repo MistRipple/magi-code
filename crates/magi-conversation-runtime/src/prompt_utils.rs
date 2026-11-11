@@ -369,7 +369,7 @@ fn execution_capacity_rule(
     limits: &crate::execution_admission::ExecutionAdmissionLimits,
 ) -> String {
     format!(
-        "执行容量：全局最多同时运行 {} 个执行单元，单个会话 {} 个，每个角色 {} 个（自定义角色可能设置更低的实例上限）；当前代理在 agent_wait 期间不占用名额。超出容量时 agent_spawn 返回 queued，表示代理已创建并会在有名额后自动开始，保留 child_task_id 继续 agent_wait；rejected 表示没有创建代理，先判断是否应直接接管，确需委派时再按 error_code 修正。",
+        "执行容量：全局最多同时运行 {} 个执行单元，单个会话 {} 个，每个角色 {} 个（自定义角色可能设置更低的实例上限）；当前代理在 agent_wait 期间不占用名额。超出容量时 agent_spawn 返回 queued（已创建，有名额后自动开始）；rejected 表示没有创建代理，先判断是否应直接接管，确需委派时再按 error_code 修正。",
         limits.max_active_tasks,
         limits.max_active_tasks_per_session,
         limits.max_active_tasks_per_role
