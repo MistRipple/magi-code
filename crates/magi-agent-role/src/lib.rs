@@ -1301,10 +1301,16 @@ mod tests {
         let reg = AgentRoleRegistry::from_map(builtin_roles_map());
         for id in ["architect", "executor", "reviewer", "explorer", "tester"] {
             let role = reg.get(id).expect("builtin role exists");
+            // 委派授权的唯一来源是运行时注入的代理模式提示；角色提示既不授予也不禁止。
             assert!(
-                role.system_prompt.contains("未获授权时不能创建更多子代理")
-                    && role.system_prompt.contains("角色本身不授予委派权"),
-                "{id} 应遵守当前运行时委派授权，不能用角色提示覆盖授权或无条件禁止嵌套"
+                !role.system_prompt.contains("创建更多子代理")
+                    && !role.system_prompt.contains("不要继续创建代理")
+                    && !role.system_prompt.contains("授予委派权"),
+                "{id} 不应在角色提示中重复或覆盖运行时委派授权"
+            );
+            assert!(
+                role.system_prompt.contains("expected_output"),
+                "{id} 的输出结构应以父任务交付要求为准"
             );
             assert!(
                 role.system_prompt.contains("返回父任务"),

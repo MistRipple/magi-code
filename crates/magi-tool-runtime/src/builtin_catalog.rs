@@ -1217,7 +1217,7 @@ impl BuiltinToolName {
                 "【root coordinator 或显式获授委派权限的代理可调用】向已注册角色派发独立子任务。默认由主线直接完成；按运行时共享唤起规则判断用户明确要求、并行、上下文隔离或必要独立复核的价值。capabilities 可省略，省略时只激活 general_engineering；显式提供时必须属于该角色。必须提供 delegation 决策和结构化 context_package（直接 JSON 对象）；决策只说明收益，不授予权限。子代理不自动继承主对话历史。当前 Task/Skill 必须允许 agent_wait 和 agent_cancel，不能创建无法收集或取消的代理。立即返回 child_task_id；依赖结果时用 agent_wait，运行中补充用 agent_send。queued 表示已创建，不得重复派发；duplicate_task_name 或 duplicate_agent_work 应核对 existing_task_id 的原始目标和状态，不能仅换名重派。显式 lifetime=session/goal 可保留身份，新的委派确有价值时才用 resume_task_id 继续；普通后续步骤由当前代理完成。失败后按回执核对产物和副作用，再决定接管或重新委派。"
             }
             Self::AgentSend => {
-                "向当前任务直接派发、尚未结束的子代理发送补充上下文。消息与引用会写入目标代理的 AgentContextPackage，revision 原子递增：运行中的代理在下一次模型轮次前收到；排队中的代理在开始执行时随上下文包一起收到。"
+                "向当前任务直接派发、尚未结束的子代理发送补充上下文。消息与引用会写入目标代理的 AgentContextPackage，revision 原子递增：运行中的代理在下一次模型轮次前收到；排队中的代理在开始执行时随上下文包一起收到。只能补充事实与约束，不能扩大目标范围或权限；目标需要改变时用 agent_cancel 后重新派发。"
             }
             Self::AgentCancel => {
                 "取消当前任务直接派发的代理及其子树。用于方向错误、已不再需要或长时间无进展的情况。results 返回与 agent_wait 相同的终态回执；already_terminal 保留原结果。任务终态与资源退出分别核对：仅 resources_settled=true 确认执行线程与资源已退出；cancel_unsettled 或 false 时不能执行冲突的替代工作，可再次调用本工具核对结算。取消不保证此前没有副作用，先核对原产物，再按共享恢复规则判断后续工作。"

@@ -6056,7 +6056,7 @@ mod tests {
             assert!(prompt.contains("受委派代理模式"), "{role_id}: {prompt}");
             assert!(prompt.contains("获授委派能力不要求创建子代理"));
             assert!(!prompt.contains("不要继续创建代理"));
-            assert!(role.system_prompt.contains("未获授权时不能创建更多子代理"));
+            assert!(!role.system_prompt.contains("不要继续创建代理"));
             let names = dispatcher
                 .build_tool_definitions(
                     &delegated,
