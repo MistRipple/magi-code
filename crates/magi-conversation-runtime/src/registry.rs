@@ -169,6 +169,38 @@ impl ConversationRegistry {
             .map(|channel| channel.drain(..).collect())
     }
 
+    /// 只等待并取走满足条件的信号，其余信号保持原顺序留在通道里，交给任务循环或
+    /// `agent_wait` 处理。`None` 表示通道已关闭；`Some([])` 仅表示等待超时。
+    pub fn wait_for_matching_task_signals(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        timeout: Duration,
+        matches: impl Fn(&RuntimeSignal) -> bool,
+    ) -> Option<Vec<RuntimeSignal>> {
+        let key = (session_id.clone(), task_id.clone());
+        let channels = self
+            .task_signal_channels
+            .lock()
+            .expect("task signal channel mutex poisoned");
+        if !channels.contains_key(&key) {
+            return None;
+        }
+        let (mut channels, _) = self
+            .task_signal_ready
+            .wait_timeout_while(channels, timeout, |channels| {
+                channels
+                    .get(&key)
+                    .is_some_and(|channel| !channel.iter().any(&matches))
+            })
+            .expect("task signal channel wait poisoned");
+        let channel = channels.get_mut(&key)?;
+        let (taken, kept): (Vec<_>, Vec<_>) =
+            channel.drain(..).partition(|signal| matches(signal));
+        channel.extend(kept);
+        Some(taken)
+    }
+
     /// 主线任务同时检查会话引导和代理信号，再关闭输入。持有 task channel 锁
     /// 检查 Coordinator 边界，避免引导续跑时提前撤销代理通道及工具授权。
     pub fn take_task_inputs_or_close(

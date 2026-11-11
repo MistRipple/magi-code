@@ -1652,6 +1652,15 @@ fn execute_context_read(
     )
 }
 
+fn is_parent_context_reply(signal: &RuntimeSignal, parent_task_id: &TaskId) -> bool {
+    matches!(&signal.author, MailboxAuthor::Parent(id) if id == parent_task_id.as_str())
+        && signal
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            == Some("agent_context_supplement")
+}
+
 fn execute_context_request(
     task_store: &TaskStore,
     conversation_registry: &ConversationRegistry,
@@ -1758,10 +1767,13 @@ fn execute_context_request(
                     );
                 }
                 let wait_ms = (timeout_ms - elapsed_ms).min(250);
-                let Some(responses) = conversation_registry.wait_for_task_signals(
+                // 只有直接父任务的补充才是这次请求的答复；孙代理的请求、审批通知等
+                // 留在通道里，由任务循环或 agent_wait 按原路径处理。
+                let Some(responses) = conversation_registry.wait_for_matching_task_signals(
                     session_id,
                     &task.task_id,
                     std::time::Duration::from_millis(wait_ms),
+                    |signal| is_parent_context_reply(signal, &parent_task_id),
                 ) else {
                     return context_tool_failure(
                         tool,
@@ -2374,7 +2386,7 @@ fn execute_agent_wait_with_runtime(
         let (status, instruction) = if !runtime_signals.is_empty() {
             (
                 "attention_required",
-                "代理等待期间收到运行时消息。若为 agent_context_request，请先读取 child_task_id 和 request，使用 agent_send 回复对应代理；若为审批等待，告知用户需要处理的审批。之后对 pending_task_ids 继续 agent_wait。",
+                "代理等待期间收到运行时消息。若为 agent_context_request，请先读取 child_task_id 和 request，使用 agent_send 回复对应代理；若为审批等待，告知用户需要处理的审批；若来自 parent:* 的 agent_context_supplement，是你的父任务补充的事实与约束，按当前任务补充处理，不能扩大目标范围或权限。之后对 pending_task_ids 继续 agent_wait。",
             )
         } else if timed_out {
             (
@@ -11367,6 +11379,69 @@ mod tests {
                 AgentContextAccessOperation::Request
             );
         }
+    }
+
+    #[test]
+    fn context_request_ignores_signals_that_are_not_the_parent_reply() {
+        let task_store = TaskStore::new();
+        let registry = ConversationRegistry::new();
+        let session_id = SessionId::new("session-context-request-foreign");
+        let parent = coordinator_task(test_task("task-foreign-parent", "task-foreign-parent", None));
+        let mut child = test_task(
+            "task-foreign-child",
+            "task-foreign-parent",
+            Some(parent.task_id.clone()),
+        );
+        child.runtime_payload = TaskRuntimePayload::AgentContext {
+            package: Box::new(AgentContextPackage {
+                package_id: "agent-context-foreign".to_string(),
+                revision: 1,
+                parent_task_id: parent.task_id.clone(),
+                summary: "检查配置".to_string(),
+                constraints: Vec::new(),
+                expected_output: "完成检查".to_string(),
+                references: Vec::new(),
+                fork: None,
+                supplements: Vec::new(),
+                created_at: UtcMillis(1),
+                updated_at: UtcMillis(1),
+            }),
+            accesses: Vec::new(),
+        };
+        task_store.insert_task(parent.clone()).unwrap();
+        task_store.insert_task(child.clone()).unwrap();
+        registry.open_task_signal_channel(&session_id, &parent.task_id);
+        registry.open_task_signal_channel(&session_id, &child.task_id);
+        // 孙代理向这个 worker 发来的请求：不是父任务对本次 context_request 的答复。
+        registry
+            .enqueue_task_signal(
+                &session_id,
+                &child.task_id,
+                RuntimeSignal {
+                    author: MailboxAuthor::Child("task-grandchild".to_string()),
+                    kind: MailboxKind::Message,
+                    trigger_turn: true,
+                    payload: serde_json::json!({"type": "agent_context_request"}),
+                    enqueued_at: UtcMillis(1),
+                },
+            )
+            .unwrap();
+
+        let (payload, status) = execute_context_request(
+            &task_store,
+            &registry,
+            &child,
+            &session_id,
+            BuiltinToolName::ContextRequest,
+            &serde_json::json!({"request": "请提供配置来源", "timeout_ms": 1000}),
+        );
+        assert_eq!(status, ExecutionResultStatus::Succeeded, "{payload}");
+        let result: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(result["status"], "timeout", "{payload}");
+        // 未被消费的信号仍在通道里，交给任务循环或 agent_wait 处理。
+        let remaining = registry.drain_task_signals(&session_id, &child.task_id);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].payload["type"], "agent_context_request");
     }
 
     #[test]
