@@ -68,7 +68,9 @@ const provider = createServer(async (request, response) => {
       }
       return JSON.parse(message.content);
     });
-    if (!agentCase) for (const result of results) assert.equal(result.status,
+    // 历史里被后续写入改动过的 file_read 结果会被运行时改写为 stale（workspace_content_changed），这是设计行为。
+    const staleRead = result => result.tool === 'file_read' && result.status === 'stale' && result.reason === 'workspace_content_changed';
+    if (!agentCase) for (const result of results) if (!staleRead(result)) assert.equal(result.status,
       result.tool === 'ask_user_question' ? 'answered' : 'succeeded', JSON.stringify(result));
     if (matrix) {
       if (agentCase) for (const result of results) {
@@ -92,12 +94,9 @@ const provider = createServer(async (request, response) => {
       return respond(response, null, null, 'PERSONAL_GIT_DONE');
     }
     const stepsResult = results.findLast(result => result.tool === 'update_execution_steps');
-    const writeIndex = results.findIndex(result => result.tool === 'file_write');
     const searchIndex = results.findIndex(result => result.tool === 'shell_exec');
-    const step = (stepId, title, status, refs = []) => ({ stepId, title, status, dependsOn: [], evidenceRefs: refs, taskIds: [] });
-    const revision = stepsResult?.execution?.revision ?? 0;
-    const writeRef = writeIndex < 0 ? [] : [toolMessages[writeIndex].tool_call_id];
-    if (!stepsResult) return respond(response, 'update_execution_steps', { expectedRevision: 0, steps: [step('write', '生成报告', 'running'), step('verify', '核验报告', 'pending')] });
+    const step = (stepId, title, status) => ({ stepId, title, status, dependsOn: [], taskIds: [] });
+    if (!stepsResult) return respond(response, 'update_execution_steps', { steps: [step('write', '生成报告', 'running'), step('verify', '核验报告', 'pending')] });
     const files = [
       ['report.md', `${marker} report\n`],
       ['index.html', `<link rel="stylesheet" href="style.css"><main>${marker}_SITE</main><script src="app.js"></script>`],
@@ -108,11 +107,11 @@ const provider = createServer(async (request, response) => {
     if (written < files.length) return respond(response, 'file_write', { path: files[written][0], content: files[written][1] });
     if (!results.some(result => result.tool === 'image_generate')) return respond(response, 'image_generate', { prompt: 'fixture image', output_path: 'image.png' });
     if (stepsResult.execution.steps[0].status !== 'completed') return respond(response, 'update_execution_steps', {
-      expectedRevision: revision, steps: [step('write', '生成报告', 'completed', writeRef), step('verify', '核验报告', 'running')],
+      steps: [step('write', '生成报告', 'completed'), step('verify', '核验报告', 'running')],
     });
     if (searchIndex < 0) return respond(response, 'shell_exec', { command: 'cat report.md', access_mode: 'read_only' });
     if (stepsResult.execution.steps[1].status !== 'completed') return respond(response, 'update_execution_steps', {
-      expectedRevision: revision, steps: [step('write', '生成报告', 'completed', writeRef), step('verify', '核验报告', 'completed', [toolMessages[searchIndex].tool_call_id])],
+      steps: [step('write', '生成报告', 'completed'), step('verify', '核验报告', 'completed')],
     });
     respond(response, null, null, `${marker}_DONE [report.md](report.md)`);
   } catch (error) {
@@ -149,7 +148,7 @@ async function submit(marker, workspaceId) {
   const accepted = await rpc('turn/start', { scope: workspaceId ? 'workspace' : 'personal', workspaceId,
     goalMode: marker === 'PERSONAL_MATRIX_GOAL',
     text: `${marker} 生成并核验报告`, requestId: marker, userMessageId: `user-${marker}`,
-    orchestratorSessionConfig: { model: 'personal-fixture' }, accessProfile: marker === 'PERSONAL_GIT_CASE' || marker.startsWith('PERSONAL_MATRIX_') ? 'full_access' : 'restricted' });
+    orchestratorSessionConfig: { sourceId: 'custom/fixture', model: 'personal-fixture' }, accessProfile: marker === 'PERSONAL_GIT_CASE' || marker.startsWith('PERSONAL_MATRIX_') ? 'full_access' : 'restricted' });
   let snapshot;
   const deadline = Date.now() + 60000;
   while (Date.now() < deadline) {
@@ -173,7 +172,7 @@ async function submit(marker, workspaceId) {
 }
 try {
   await start();
-  await json('/api/settings/orchestrator/save', { baseUrl: `http://127.0.0.1:${provider.address().port}/v1`, apiKey: 'fixture', apiProtocol: 'openai_chat' });
+  await json('/api/settings/orchestrator/save', { expectedRevision: 0, sources: [{ id: 'fixture', name: 'Fixture', baseUrl: `http://127.0.0.1:${provider.address().port}/v1`, apiKey: 'fixture', apiProtocol: 'openai_chat', models: [{ id: 'personal-fixture' }] }] });
   await json('/api/settings/image-generation/save', { baseUrl: `http://127.0.0.1:${provider.address().port}/v1`, apiKey: 'fixture', model: 'fixture-image', apiProtocol: 'openai_chat' });
   const projectRoot = join(fixture, 'project'); await mkdir(projectRoot);
   await writeFile(join(projectRoot, 'AGENTS.md'), 'PROJECT_RULE_MUST_NOT_LEAK');

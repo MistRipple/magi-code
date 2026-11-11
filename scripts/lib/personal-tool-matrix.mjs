@@ -104,7 +104,9 @@ export function personalMatrixStep(marker, results, messages, origin) {
   assert.ok(steps, marker);
   results.forEach((result, index) => {
     assert.equal(result.tool, steps[index]?.[0], `回灌顺序 ${marker}/${index}`);
-    assert.equal(result.status, result.tool === 'ask_user_question' ? 'answered' : 'succeeded', `${marker}/${index}: ${JSON.stringify(result)}`);
+    // 后续写入改动过的 file_read 历史结果会被运行时改写为 stale，这是设计行为。
+    const staleRead = result.tool === 'file_read' && result.status === 'stale' && result.reason === 'workspace_content_changed';
+    if (!staleRead) assert.equal(result.status, result.tool === 'ask_user_question' ? 'answered' : 'succeeded', `${marker}/${index}: ${JSON.stringify(result)}`);
     if (result.tool === 'ask_user_question') assert.deepEqual(result.answers[0].selected, ['继续']);
   });
   const step = steps[results.length];
