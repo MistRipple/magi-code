@@ -1959,11 +1959,30 @@ fn context_candidate_score(query: &str, candidate: &ResolvedAgentContext) -> usi
     if haystack.contains(&query) {
         return 100 + query.chars().count();
     }
+    // 以非字母数字字符（含中文标点）切词；中文没有空格，整句词项再退化为相邻二字组匹配，
+    // 命中至少一半二字组才算相关，避免单个常用字组造成噪声。
     query
-        .split(|character: char| character.is_whitespace() || character.is_ascii_punctuation())
+        .split(|character: char| !character.is_alphanumeric())
         .filter(|term| !term.is_empty())
-        .filter(|term| haystack.contains(term))
-        .map(str::len)
+        .map(|term| {
+            if haystack.contains(term) {
+                return term.chars().count();
+            }
+            if term.is_ascii() {
+                return 0;
+            }
+            let characters = term.chars().collect::<Vec<_>>();
+            let total = characters.len().saturating_sub(1);
+            let matched = characters
+                .windows(2)
+                .filter(|pair| haystack.contains(pair.iter().collect::<String>().as_str()))
+                .count();
+            if total > 0 && matched * 2 >= total {
+                matched * 2
+            } else {
+                0
+            }
+        })
         .sum()
 }
 
@@ -11379,6 +11398,33 @@ mod tests {
                 AgentContextAccessOperation::Request
             );
         }
+    }
+
+    #[test]
+    fn context_search_matches_unsegmented_chinese_queries() {
+        let candidate = |content: &str| ResolvedAgentContext {
+            reference_id: "turn:1".into(),
+            kind: AgentContextReferenceKind::ConversationTurn,
+            title: "用户消息".into(),
+            content: content.into(),
+        };
+        let relevant = candidate("登录接口返回 500，失败原因是会话令牌过期。");
+        let unrelated = candidate("请把按钮颜色改成蓝色。");
+        for query in ["登录失败的原因", "登录失败，原因", "login 失败原因"] {
+            assert!(
+                context_candidate_matches(query, &relevant),
+                "{query} 应命中中文原文"
+            );
+            assert!(
+                !context_candidate_matches(query, &unrelated),
+                "{query} 不应命中无关内容"
+            );
+        }
+        assert!(
+            context_candidate_score("登录失败的原因", &relevant)
+                > context_candidate_score("原因", &unrelated),
+        );
+        assert!(!context_candidate_matches("token refresh", &relevant));
     }
 
     #[test]

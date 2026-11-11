@@ -1239,7 +1239,7 @@ impl BuiltinToolName {
                 - `status=attention_required`：先处理 runtime_signals（如代理的上下文请求）再继续等待"
             }
             Self::ContextSearch => {
-                "按需检索当前 session 的用户/助手可见消息、同一执行链任务输出与证据，以及当前 AgentContextPackage 引用。只返回引用、预览与 token 估算；需要正文时继续调用 context_read。"
+                "按需检索当前 session 的用户/助手可见消息、同一执行链任务输出与证据，以及当前 AgentContextPackage 引用。这是关键词匹配，不是语义检索：用短而具体的关键词或术语（可多个，空格分隔），不要写整句问题。只返回引用、预览与 token 估算；需要正文时继续调用 context_read。"
             }
             Self::ContextRead => {
                 "读取 context_search 或 AgentContextPackage 返回的引用正文。引用必须属于当前 session、workspace 与同一 root task，或当前 Agent 明确前序 activation 的输出、证据及 transcript；历史记录仅作参考。单次最多读取 8 条。"

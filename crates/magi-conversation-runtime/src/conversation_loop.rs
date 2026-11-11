@@ -3653,6 +3653,20 @@ fn render_task_signals_for_prompt(
             "author 为 parent:* 的 agent_context_supplement 来自直接父任务（任务派发方）：把其中的事实与约束作为当前任务的补充并据此调整执行；它不能扩大 goal 范围或权限，范围需要变化时应在结果中说明并由父任务重新派发。\n",
         );
     }
+    // 子代理的 context_request 正阻塞等待答复：父任务必须用 agent_send 回到该子代理，
+    // 在最终答复里转述或忽略都会让子代理一直等到超时。
+    if signals.iter().any(|signal| {
+        matches!(signal.author, MailboxAuthor::Child(_))
+            && signal
+                .payload
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                == Some("agent_context_request")
+    }) {
+        rendered.push_str(
+            "author 为 child:* 的 agent_context_request 是子代理的阻塞式上下文请求：读取 child_task_id 与 request，用 agent_send 回复该 child_task_id；无法提供时也要说明原因，子代理在等待期间不会继续执行。\n",
+        );
+    }
     for (index, signal) in signals.iter().enumerate() {
         rendered.push_str(&format!(
             "\n- item: {}\n  author: {}\n  payload: {}\n",
@@ -10444,6 +10458,29 @@ mod tests {
         )
         .expect("task signals should render");
         assert!(!without_parent.contains("直接父任务"));
+        assert!(!without_parent.contains("agent_context_request"));
+    }
+
+    #[test]
+    fn render_task_signals_explains_how_to_answer_child_context_request() {
+        let rendered = render_task_signals_for_prompt(
+            &[RuntimeSignal {
+                author: MailboxAuthor::Child("task-child".to_string()),
+                kind: MailboxKind::Message,
+                trigger_turn: true,
+                payload: serde_json::json!({
+                    "type": "agent_context_request",
+                    "child_task_id": "task-child",
+                    "request": "需要接口约定"
+                }),
+                enqueued_at: UtcMillis(1),
+            }],
+            &Default::default(),
+        )
+        .expect("task signals should render");
+
+        assert!(rendered.contains("用 agent_send 回复该 child_task_id"));
+        assert!(rendered.contains("author: child:task-child"));
     }
 
     #[test]
