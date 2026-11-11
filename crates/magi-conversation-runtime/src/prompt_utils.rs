@@ -335,18 +335,41 @@ pub fn root_multi_agent_mode_prompt(
     roles: &magi_agent_role::AgentRoleRegistry,
 ) -> String {
     format!(
-        "{}\n{ROOT_MULTI_AGENT_MODE_RULE}\n{}\n{}",
+        "{}\n\n{ROOT_MULTI_AGENT_MODE_RULE}\n\n{}\n\n{}",
         magi_tool_runtime::AGENT_DELEGATION_GUIDANCE,
         execution_capacity_rule(limits),
         spawnable_roles_rule(roles)
     )
 }
 
-/// 可派发角色清单从角色注册表渲染，包含用户自定义角色、各自能力和是否只读。
+/// 可派发角色清单从角色注册表渲染，包含用户自定义角色和是否只读。
+/// 所有角色都能选的专业能力只在清单头部写一次，角色行只列额外能力，避免每行重复同一串 id。
 fn spawnable_roles_rule(roles: &magi_agent_role::AgentRoleRegistry) -> String {
+    let role_ids = roles
+        .spawnable_agent_role_ids()
+        .into_iter()
+        .filter(|role_id| roles.get(role_id).is_some())
+        .collect::<Vec<_>>();
+    let capabilities = role_ids
+        .iter()
+        .map(|role_id| roles.capability_ids_for_role(role_id))
+        .collect::<Vec<_>>();
+    let shared = capabilities
+        .first()
+        .map(|first| {
+            first
+                .iter()
+                .filter(|id| capabilities.iter().all(|other| other.contains(id)))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let mut lines = vec!["可派发角色（以本清单为准）：".to_string()];
-    for role_id in roles.spawnable_agent_role_ids() {
-        let Some(role) = roles.get(&role_id) else {
+    if !shared.is_empty() {
+        lines.push(format!("所有角色均可选的专业能力：{}", shared.join("、")));
+    }
+    for (role_id, role_capabilities) in role_ids.iter().zip(&capabilities) {
+        let Some(role) = roles.get(role_id) else {
             continue;
         };
         let name = if role.display_name.trim().is_empty() {
@@ -355,10 +378,19 @@ fn spawnable_roles_rule(roles: &magi_agent_role::AgentRoleRegistry) -> String {
             role.display_name.trim().to_string()
         };
         let access = if role.is_read_only() { "，只读" } else { "" };
+        let extra = role_capabilities
+            .iter()
+            .filter(|id| !shared.contains(id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let extra = if extra.is_empty() {
+            String::new()
+        } else {
+            format!("；另可选：{}", extra.join("、"))
+        };
         lines.push(format!(
-            "- {role_id}（{name}{access}）：{}；能力：{}",
-            role.description.trim(),
-            roles.capability_ids_for_role(&role_id).join("、")
+            "- {role_id}（{name}{access}）：{}{extra}",
+            role.description.trim()
         ));
     }
     lines.join("\n")
@@ -381,7 +413,7 @@ pub fn delegating_agent_mode_prompt(
     roles: &magi_agent_role::AgentRoleRegistry,
 ) -> String {
     format!(
-        "受委派代理模式：只完成父任务交付的 goal；上下文以 AgentContextPackage 为准。你已被显式授权派发自己的直接子任务，最多两层代理；不能再向孙代理授予 allow_delegation。\n使用 agent_send/wait/cancel 管理自己的子代理，不能管理兄弟或祖先任务。子代理基于你的当前工作树建立隔离副本；agent_apply 只把直接子代理已完成的改动合入你的副本，主工作树仍由主线决定是否采用。结束前必须等待或取消所有子代理；不得把共享 Goal/计划/记忆或主分支作为自己的状态修改。获授委派能力不要求创建子代理；具体判断遵循同一子代理唤起规则，遵守父任务与用户的派发限制。需要更多信息时使用 context_request。\n{}\n{}\n{}",
+        "受委派代理模式：只完成父任务交付的 goal；上下文以 AgentContextPackage 为准。你已被显式授权派发自己的直接子任务，最多两层代理；不能再向孙代理授予 allow_delegation。\n使用 agent_send/wait/cancel 管理自己的子代理，不能管理兄弟或祖先任务。子代理基于你的当前工作树建立隔离副本；agent_apply 只把直接子代理已完成的改动合入你的副本，主工作树仍由主线决定是否采用。结束前必须等待或取消所有子代理；不得把共享 Goal/计划/记忆或主分支作为自己的状态修改。获授委派能力不要求创建子代理；具体判断遵循同一子代理唤起规则，遵守父任务与用户的派发限制。需要更多信息时使用 context_request。\n\n{}\n\n{}\n\n{}",
         magi_tool_runtime::AGENT_DELEGATION_GUIDANCE,
         execution_capacity_rule(limits),
         spawnable_roles_rule(roles)
@@ -698,6 +730,15 @@ mod tests {
         assert!(prompt.contains("- reviewer（Reviewer，只读）"), "{prompt}");
         assert!(prompt.contains("- executor（Executor）"));
         assert!(!prompt.contains("- coordinator"), "协调者不是可派发角色");
+        assert_eq!(
+            prompt.matches("所有角色均可选的专业能力：").count(),
+            1,
+            "各角色共有的能力只渲染一次"
+        );
+        assert!(
+            !prompt.contains("另可选："),
+            "内置角色能力一致时角色行不再重复能力列表: {prompt}"
+        );
         assert!(prompt.contains("默认由当前代理直接完成"));
         assert!(prompt.contains("不能明确说明收益时自己做"));
         assert!(!prompt.contains("否则只派一个或由主线顺序完成"));
