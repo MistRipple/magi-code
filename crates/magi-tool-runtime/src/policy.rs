@@ -1760,13 +1760,14 @@ mod shell_path_parser_tests {
     #[test]
     fn shell_redirection_paths_are_not_reinterpreted_as_command_operands() {
         use magi_permissions::PathAccessKind::{Read, Write};
-        use std::path::Path;
-        let root = Path::new("/workspace");
+        let root = super::canonicalize_tool_permission_path(
+            &std::env::temp_dir().join("magi-shell-path-parser-workspace"),
+        );
         let paths = |command: &str| {
             super::tool_path_access_requests(
                 "shell_exec",
                 &serde_json::json!({"command":command, "access_mode":"read_only"}).to_string(),
-                Some(root),
+                Some(&root),
                 magi_core::AccessProfile::Restricted,
             )
         };
@@ -1784,20 +1785,18 @@ mod shell_path_parser_tests {
         }
         // 普通路径和输入重定向仍检查权限；不能全局豁免 /dev/null 或工作区外文件。
         for command in ["cat /dev/null", "cat < /dev/null"] {
+            let null_device = super::resolve_tool_path("/dev/null", Some(&root));
             assert!(
                 paths(command)
                     .iter()
-                    .any(|request| request.absolute_path == Path::new("/dev/null")
-                        && request.kind == Read)
+                    .any(|request| request.absolute_path == null_device && request.kind == Read)
             );
         }
+        let outside = super::resolve_tool_path("/outside/file", Some(&root));
         assert!(
             paths("printf ok > /outside/file")
                 .iter()
-                .any(
-                    |request| request.absolute_path == Path::new("/outside/file")
-                        && request.kind == Write
-                )
+                .any(|request| request.absolute_path == outside && request.kind == Write)
         );
         let copy = paths("cp src.txt dst.txt > log.txt");
         assert!(
