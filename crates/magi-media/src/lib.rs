@@ -58,7 +58,7 @@ fn avif_brand(bytes: &[u8]) -> bool {
         return false;
     }
     let size = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
-    if size < 16 || size > bytes.len() || (size - 16) % 4 != 0 {
+    if size < 16 || size > bytes.len() || !(size - 16).is_multiple_of(4) {
         return false;
     }
     let supported = |brand: &[u8]| brand == b"avif" || brand == b"avis";

@@ -357,16 +357,17 @@ export default async api => {
     }
     assert_eq!(status["body"]["foreground"], "Cancelled");
     assert_eq!(status["body"]["background"]["applied"], true);
-    let calls = service.0.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0]["enabled"], false);
-    assert_eq!(calls[0]["expectedDigest"], "current");
-    assert_eq!(calls[0]["expectedState"], json!({"enabled":true}));
-    assert_eq!(calls[0]["reason"], "diagnostic pause");
-    assert_eq!(calls[0]["_background"], true);
-    assert!(calls[0]["_instance"].is_string());
-    assert!(calls[0].get("_context").is_none());
-    drop(calls);
+    {
+        let calls = service.0.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["enabled"], false);
+        assert_eq!(calls[0]["expectedDigest"], "current");
+        assert_eq!(calls[0]["expectedState"], json!({"enabled":true}));
+        assert_eq!(calls[0]["reason"], "diagnostic pause");
+        assert_eq!(calls[0]["_background"], true);
+        assert!(calls[0]["_instance"].is_string());
+        assert!(calls[0].get("_context").is_none());
+    }
     instance.stop().await;
 }
 

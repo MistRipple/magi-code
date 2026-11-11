@@ -148,7 +148,10 @@ assert.match(approvalStore, /if \(externalApprovals\.approvals\.length > 0 \|\| 
 assert.match(approvalStore, /disabled = true;/);
 assert.match(approvalActions, /'allow_once'/);
 assert.doesNotMatch(approvalActions, /allow_for_turn/);
-assert.match(read('web/src/components/ToolApprovalAction.svelte'), /\{#if !isExternalApproval\}[\s\S]*?allow_for_turn/);
+const toolApprovalAction = read('web/src/components/ToolApprovalAction.svelte');
+assert.match(toolApprovalAction, /offersTurnWideAllow/);
+assert.match(toolApprovalAction, /approval\.toolName !== 'agent_role_save'/);
+assert.match(toolApprovalAction, /\{#if offersTurnWideAllow\}[\s\S]*?allow_for_turn/);
 // 窗口不在前台时新的待确认发系统通知；启动时已存在的不重复提醒。
 assert.match(approvalStore, /new Notification\(/);
 assert.match(approvalStore, /document\.hasFocus\(\)/);

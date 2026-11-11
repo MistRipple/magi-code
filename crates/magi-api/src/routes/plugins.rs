@@ -223,12 +223,12 @@ fn resource_response(
     path: &str,
     digest: Option<&str>,
 ) -> Result<Response, ApiError> {
-    let manager = locked(&state, "读取插件视图")?;
-    if !manager.is_active(&id).map_err(plugin_error)? {
+    let manager = locked(state, "读取插件视图")?;
+    if !manager.is_active(id).map_err(plugin_error)? {
         return Err(ApiError::Forbidden("插件未激活".into()));
     }
     let resource_path = format!("ui/{path}");
-    let package = manager.package(&id).map_err(plugin_error)?;
+    let package = manager.package(id).map_err(plugin_error)?;
     if digest.is_some_and(|expected| expected != package.digest()) {
         return Err(ApiError::Conflict("插件页面版本已失效".into()));
     }

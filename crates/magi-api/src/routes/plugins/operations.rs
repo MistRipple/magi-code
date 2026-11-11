@@ -36,6 +36,7 @@ impl<'a> LifecycleChange<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -1467,11 +1468,11 @@ impl PluginOperations {
                     serde_json::from_value(params).map_err(|e| {
                         ApiError::InvalidInput(format!("管理恢复结算参数无效：{e}"))
                     })?;
-                let identity = Some((caller, digest, lease, background));
-                let scope = Self::change_scope(identity.unwrap(), input.change_id)?;
+                let identity = (caller, digest, lease, background);
+                let scope = Self::change_scope(identity, input.change_id)?;
                 let restored = {
                     let mut manager = self.locked("结算管理移除恢复")?;
-                    Self::check_caller(&manager, identity, "lifecycle")?;
+                    Self::check_caller(&manager, Some(identity), "lifecycle")?;
                     manager
                         .finish_change(&scope, input.commit)
                         .map_err(plugin_error)?
@@ -1483,7 +1484,7 @@ impl PluginOperations {
                         .is_active(id)
                         .map_err(plugin_error)?
                     {
-                        self.wait_running(id, identity, None).await?;
+                        self.wait_running(id, Some(identity), None).await?;
                     }
                 }
                 serde_json::to_value(
@@ -1631,16 +1632,15 @@ impl PluginOperations {
                             .into(),
                     ));
                 }
-                if let Some(reason) = &input.reason {
-                    if method != "plugins.setEnabled"
+                if let Some(reason) = &input.reason
+                    && (method != "plugins.setEnabled"
                         || input.enabled
                         || reason.trim().is_empty()
-                        || reason.len() > 4096
-                    {
-                        return Err(ApiError::InvalidInput(
-                            "停用原因仅可用于停用操作，须为 1–4096 字节".into(),
-                        ));
-                    }
+                        || reason.len() > 4096)
+                {
+                    return Err(ApiError::InvalidInput(
+                        "停用原因仅可用于停用操作，须为 1–4096 字节".into(),
+                    ));
                 }
                 if let Some(scope) = change_scope {
                     let identity = Some((caller, digest, lease, background));
@@ -1870,10 +1870,10 @@ impl PluginOperations {
             Self::check_caller(&manager, caller, "authorize")?;
             Self::check_target(&manager, id, expected)?;
             let result = manager.authorize(id, grants).map_err(plugin_error);
-            if result.is_ok() {
-                if let Some(drain) = drain {
-                    drain.commit(&mut manager);
-                }
+            if result.is_ok()
+                && let Some(drain) = drain
+            {
+                drain.commit(&mut manager);
             }
             result
         };
@@ -1886,12 +1886,12 @@ impl PluginOperations {
         id: &str,
         expected_digest: Option<&str>,
     ) -> Result<(), ApiError> {
-        if let Some(expected) = expected_digest {
-            if manager.package(id).map_err(plugin_error)?.digest() != expected {
-                return Err(ApiError::Conflict(
-                    "目标插件版本已变化，请刷新后重试".into(),
-                ));
-            }
+        if let Some(expected) = expected_digest
+            && manager.package(id).map_err(plugin_error)?.digest() != expected
+        {
+            return Err(ApiError::Conflict(
+                "目标插件版本已变化，请刷新后重试".into(),
+            ));
         }
         Ok(())
     }

@@ -5740,7 +5740,7 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
         .register_thread(thread)
         .expect("thread should register");
     store.record_thread_context_window_tokens(&thread_id, 128_000, UtcMillis(1_100));
-    let history = vec![
+    let history = [
         ThreadChatMessage {
             input_request_id: None,
             role: "assistant".to_string(),

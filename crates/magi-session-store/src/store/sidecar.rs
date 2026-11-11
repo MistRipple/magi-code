@@ -1563,13 +1563,13 @@ impl SessionRuntimeSidecarState {
         &self,
         canonical_turns: &[CanonicalTurn],
     ) -> DomainResult<SessionRuntimeSidecar> {
-        if let Some(chain) = &self.active_execution_chain {
-            if chain.session_id != self.session_id || chain.current_turn_id != self.current_turn_id
-            {
-                return Err(DomainError::InvalidState {
-                    message: format!("session {} 的执行链 Turn 归属不一致", self.session_id),
-                });
-            }
+        if let Some(chain) = &self.active_execution_chain
+            && (chain.session_id != self.session_id
+                || chain.current_turn_id != self.current_turn_id)
+        {
+            return Err(DomainError::InvalidState {
+                message: format!("session {} 的执行链 Turn 归属不一致", self.session_id),
+            });
         }
         let canonical_turn = self
             .current_turn_id

@@ -3318,7 +3318,7 @@ mod tests {
         };
 
         assert_eq!(
-            restore_resumed_branch_threads(&state, &session_id, &chain, &[branch.clone()])
+            restore_resumed_branch_threads(&state, &session_id, &chain, std::slice::from_ref(&branch))
                 .expect("missing thread should rebuild")
                 .len(),
             1
@@ -3342,7 +3342,7 @@ mod tests {
         );
         // 已存在的 thread 也必须核验 mission、task 与 worker，不能只比较 thread_id。
         assert!(
-            restore_resumed_branch_threads(&state, &session_id, &chain, &[branch.clone()])
+            restore_resumed_branch_threads(&state, &session_id, &chain, std::slice::from_ref(&branch))
                 .unwrap()
                 .is_empty()
         );
@@ -3366,7 +3366,7 @@ mod tests {
         let mut wrong_mission = chain.clone();
         wrong_mission.mission_id = MissionId::new("other-mission");
         assert!(
-            restore_resumed_branch_threads(&state, &session_id, &wrong_mission, &[branch.clone()])
+            restore_resumed_branch_threads(&state, &session_id, &wrong_mission, std::slice::from_ref(&branch))
                 .is_err()
         );
         assert!(

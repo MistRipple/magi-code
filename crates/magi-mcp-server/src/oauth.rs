@@ -553,21 +553,20 @@ fn context(
     state: &HttpState,
     peer: Option<std::net::IpAddr>,
     headers: &HeaderMap,
-) -> Result<String, Response> {
-    let issuer =
-        issuer(state, peer, headers).ok_or_else(|| StatusCode::FORBIDDEN.into_response())?;
+) -> Result<String, StatusCode> {
+    let issuer = issuer(state, peer, headers).ok_or(StatusCode::FORBIDDEN)?;
     if headers
         .get(header::ORIGIN)
         .is_some_and(|origin| origin.to_str().ok() != Some(issuer.as_str()))
     {
-        return Err(StatusCode::FORBIDDEN.into_response());
+        return Err(StatusCode::FORBIDDEN);
     }
     let source = crate::http::forwarded_source(headers);
     if !state
         .limiter
         .allow_request(&format!("oauth:{source}"), (state.clock)())
     {
-        return Err(StatusCode::TOO_MANY_REQUESTS.into_response());
+        return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     Ok(issuer)
 }
@@ -585,7 +584,7 @@ async fn guard(
         .map(|info| info.0.ip());
     let origin = match context(&state, peer, request.headers()) {
         Ok(origin) => origin,
-        Err(response) => return secure(response),
+        Err(status) => return secure(status.into_response()),
     };
     request.extensions_mut().insert(OAuthOrigin(origin));
     let path = request.uri().path().to_string();

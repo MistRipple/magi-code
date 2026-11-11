@@ -250,6 +250,16 @@ pub(crate) struct ContextPrepareRequest {
     pub mode: ContextCompactionMode,
 }
 
+struct CompactionFailure<'a> {
+    phase: &'static str,
+    history_generation: u64,
+    history: Vec<ThreadChatMessage>,
+    decision: &'a ThreadHistoryCompactionDecision,
+    additional_token_estimate: usize,
+    mode: &'a ContextCompactionMode,
+    error: &'a str,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CurrentFileFact {
     pub absolute_path: String,
@@ -685,15 +695,15 @@ impl<'a> ContextAuthority<'a> {
                         terminal: Some(ContextCompactionTerminal::Cancelled),
                     };
                 }
-                return self.compaction_failed(
-                    request.phase,
+                return self.compaction_failed(CompactionFailure {
+                    phase: request.phase,
                     history_generation,
-                    unbounded,
-                    &decision,
-                    request.additional_context.total_tokens() as usize,
-                    &request.mode,
-                    &error,
-                );
+                    history: unbounded,
+                    decision: &decision,
+                    additional_token_estimate: request.additional_context.total_tokens() as usize,
+                    mode: &request.mode,
+                    error: &error,
+                });
             }
         };
 
@@ -728,15 +738,15 @@ impl<'a> ContextAuthority<'a> {
             decision.target_history_tokens(),
             decision.context_window_tokens(),
         ) {
-            return self.compaction_failed(
-                request.phase,
+            return self.compaction_failed(CompactionFailure {
+                phase: request.phase,
                 history_generation,
-                unbounded,
-                &decision,
-                request.additional_context.total_tokens() as usize,
-                &request.mode,
-                &error,
-            );
+                history: unbounded,
+                decision: &decision,
+                additional_token_estimate: request.additional_context.total_tokens() as usize,
+                mode: &request.mode,
+                error: &error,
+            });
         }
         let compacted_at = UtcMillis::now();
         let previous_source_count = previous_checkpoint
@@ -749,15 +759,15 @@ impl<'a> ContextAuthority<'a> {
             previous_source_count.saturating_add(split)
         };
         if source_message_count == 0 || source_message_count > raw_transcript.len() {
-            return self.compaction_failed(
-                request.phase,
+            return self.compaction_failed(CompactionFailure {
+                phase: request.phase,
                 history_generation,
-                unbounded,
-                &decision,
-                request.additional_context.total_tokens() as usize,
-                &request.mode,
-                "压缩来源范围超出 canonical 快照",
-            );
+                history: unbounded,
+                decision: &decision,
+                additional_token_estimate: request.additional_context.total_tokens() as usize,
+                mode: &request.mode,
+                error: "压缩来源范围超出 canonical 快照",
+            });
         }
         let covered_visible_count = split + usize::from(previous_checkpoint.is_some());
         if request.persist_checkpoint {
@@ -874,16 +884,16 @@ impl<'a> ContextAuthority<'a> {
     /// 主动压缩失败不应终止仍能放入窗口的请求：记录失败次数（用于熔断）、
     /// 发布失败进度，然后使用未压缩历史继续。只有强制压缩（provider 已报告
     /// 超限）或请求已超过硬上限时，失败才成为当前执行的终态。
-    fn compaction_failed(
-        &self,
-        phase: &'static str,
-        history_generation: u64,
-        history: Vec<ThreadChatMessage>,
-        decision: &ThreadHistoryCompactionDecision,
-        additional_token_estimate: usize,
-        mode: &ContextCompactionMode,
-        error: &str,
-    ) -> PreparedThreadHistory {
+    fn compaction_failed(&self, failure: CompactionFailure<'_>) -> PreparedThreadHistory {
+        let CompactionFailure {
+            phase,
+            history_generation,
+            history,
+            decision,
+            additional_token_estimate,
+            mode,
+            error,
+        } = failure;
         let consecutive_failures = self
             .session_store
             .record_thread_context_compaction_failure(self.thread_id);

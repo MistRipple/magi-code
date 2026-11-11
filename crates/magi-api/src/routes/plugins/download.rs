@@ -431,7 +431,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 4096];
-            socket.read(&mut request).await.unwrap();
+            let received = socket.read(&mut request).await.unwrap();
+            assert!(received > 0, "客户端应先发送 HTTP 请求");
             socket
                 .write_all(
                     b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",

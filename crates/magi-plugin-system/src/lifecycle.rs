@@ -695,11 +695,11 @@ impl PluginManager {
     }
 
     pub fn manifests(&self) -> Result<Vec<PluginManifest>, PluginError> {
-        Ok(self
+        self
             .active_packages()?
             .iter()
             .map(|package| self.effective_manifest(&package.manifest().id))
-            .collect::<Result<_, _>>()?)
+            .collect::<Result<_, _>>()
     }
 
     /// 模型可见且可执行的工具目录：只含已获 `tools` 授权的贡献。目录与执行

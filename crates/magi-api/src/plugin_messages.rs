@@ -247,7 +247,7 @@ async fn admit(
                     .map(receipt)
                     .ok_or("消息接纳后缺少 Input 回执".into());
             }
-            Err(error) if matches!(error, crate::ApiError::TurnConflict { .. }) => {}
+            Err(crate::ApiError::TurnConflict { .. }) => {}
             Err(error) => return Err(error.message().into()),
         }
         request.steer_current_turn = false;

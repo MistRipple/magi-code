@@ -810,7 +810,7 @@ export default async function activate(api) {
         let package = PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap();
         let (_, entry) = fixture.runtime.materialize("acme.guard", &package).unwrap();
         let helper = entry.parent().unwrap().join("upstream/native/helper");
-        let result = std::process::Command::new(&helper).output().unwrap();
+        let result = magi_process::std_command(&helper).output().unwrap();
         assert!(result.status.success());
         assert_eq!(result.stdout, b"native-helper-ok");
         assert_eq!(
@@ -825,7 +825,7 @@ export default async function activate(api) {
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o644)).unwrap();
         fixture.runtime.materialize("acme.guard", &package).unwrap();
         assert!(
-            std::process::Command::new(helper)
+            magi_process::std_command(helper)
                 .status()
                 .unwrap()
                 .success()

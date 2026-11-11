@@ -2346,7 +2346,6 @@ fn append_final_item(
         timeline_entry_id,
         model_round,
     } = input;
-    let has_requested_final_item_id = final_item_id.is_some();
     let mut final_item = session_turn_item(
         "assistant_final",
         "completed",
@@ -2363,23 +2362,13 @@ fn append_final_item(
         apply_model_response_round(&mut final_item, model_round);
     }
     let final_item_id = final_item.item_id.clone();
-    let _published = if has_requested_final_item_id {
-        upsert_session_turn_item_for_turn(
-            session_store,
-            &request.session_id,
-            Some(&request.turn_id),
-            final_item,
-            None,
-        )?
-    } else {
-        upsert_session_turn_item_for_turn(
-            session_store,
-            &request.session_id,
-            Some(&request.turn_id),
-            final_item,
-            None,
-        )?
-    }
+    let _published = upsert_session_turn_item_for_turn(
+        session_store,
+        &request.session_id,
+        Some(&request.turn_id),
+        final_item,
+        None,
+    )?
     .ok_or_else(|| {
         format!(
             "会话 {} 的当前 Turn 已不可写，无法保存最终回复",

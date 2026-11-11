@@ -222,10 +222,10 @@ impl LlmTaskDispatcher {
                     return Err("InvalidParams: 工具调用身份无效或重复".into());
                 }
             }
-            if let Some(id) = &message.tool_call_id {
-                if !calls.contains(id) || !answered.insert(id) {
-                    return Err("InvalidParams: 工具结果缺少匹配调用或重复提交".into());
-                }
+            if let Some(id) = &message.tool_call_id
+                && (!calls.contains(id) || !answered.insert(id))
+            {
+                return Err("InvalidParams: 工具结果缺少匹配调用或重复提交".into());
             }
         }
         let request = ModelInvocationRequest {
@@ -348,13 +348,11 @@ impl LlmTaskDispatcher {
         let on_delta = |delta: &magi_bridge_client::ModelStreamingDelta| {
             if !is_cancelled()
                 && let Some(progress) = &progress
-            {
-                if let Err(error) =
+                && let Err(error) =
                     progress(serde_json::to_value(delta).expect("model delta serializes"))
-                {
-                    *delivery_error.lock().expect("model delivery") = Some(error.to_string());
-                    local_cancelled.store(true, Ordering::Release);
-                }
+            {
+                *delivery_error.lock().expect("model delivery") = Some(error.to_string());
+                local_cancelled.store(true, Ordering::Release);
             }
         };
         let (response, _) = crate::usage_recording::invoke_observed_model_with_usage(

@@ -696,7 +696,7 @@ mod tests {
         session_store
             .set_recovery_id(&session_id, None, Some(recovery_id.into()))
             .unwrap();
-        let mut active_chain = session_store
+        let active_chain = session_store
             .active_execution_chain(&session_id)
             .expect("active chain should exist");
 
@@ -705,7 +705,7 @@ mod tests {
             &workspace_registry,
             None,
             &session_id,
-            &mut active_chain,
+            &active_chain,
             &branch,
         )
         .expect("recovery should apply")

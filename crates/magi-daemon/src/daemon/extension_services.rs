@@ -1400,19 +1400,20 @@ mod tests {
         config.service = Some(service.clone());
         let group = magi_process::ManagedProcessGroup::new();
         let instance = launch(&group, config, 1).await.unwrap();
-        let manager = service.manager.lock().unwrap();
-        assert_eq!(
-            manager
-                .read_resource("acme.services", "notes")
-                .unwrap()
-                .value,
-            json!({"text": "from node"})
-        );
-        assert_eq!(
-            manager.read_settings("acme.services").unwrap().value,
-            json!({"enabled": true})
-        );
-        drop(manager);
+        {
+            let manager = service.manager.lock().unwrap();
+            assert_eq!(
+                manager
+                    .read_resource("acme.services", "notes")
+                    .unwrap()
+                    .value,
+                json!({"text": "from node"})
+            );
+            assert_eq!(
+                manager.read_settings("acme.services").unwrap().value,
+                json!({"enabled": true})
+            );
+        }
         // 真实 Node 激活期间提交的数据源进入主对话目录，并带上清单里的标题。
         let settings = service.settings.get().unwrap();
         let catalog = magi_conversation_runtime::main_model_sources::catalog(settings).unwrap();

@@ -668,6 +668,7 @@ fn execution_context(context: &ToolExecutionContext) -> Result<serde_json::Value
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use magi_core::{

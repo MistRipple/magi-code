@@ -4428,7 +4428,6 @@ fn append_task_final_turn_item(
     provider_context: &[ModelProviderContext],
     plugin_completions: &[magi_extension_host::protocol::PluginToolCompletion],
 ) -> Result<(), String> {
-    let has_requested_final_item_id = final_item_id.is_some();
     let mut final_item = session_turn_item(
         "assistant_final",
         "completed",
@@ -4464,23 +4463,13 @@ fn append_task_final_turn_item(
         final_item.timeline_entry_id = Some(timeline_entry_id.to_string());
     }
     let final_item_id = final_item.item_id.clone();
-    let published = if has_requested_final_item_id {
-        upsert_session_turn_item_for_turn(
-            context.session_store,
-            context.session_id,
-            context.expected_turn_id,
-            final_item,
-            Some(context.task_store),
-        )?
-    } else {
-        upsert_session_turn_item_for_turn(
-            context.session_store,
-            context.session_id,
-            context.expected_turn_id,
-            final_item,
-            Some(context.task_store),
-        )?
-    };
+    let published = upsert_session_turn_item_for_turn(
+        context.session_store,
+        context.session_id,
+        context.expected_turn_id,
+        final_item,
+        Some(context.task_store),
+    )?;
     let Some(published) = published else {
         return Err(format!(
             "会话 {} 的当前 Turn 已不可写，无法保存最终回复 item {}",
@@ -4559,23 +4548,13 @@ fn append_task_error_turn_item(
         );
     }
     let error_item_id = error_item.item_id.clone();
-    let published = if context.turn_visibility.is_mainline() {
-        upsert_session_turn_item_for_turn(
-            context.session_store,
-            context.session_id,
-            context.expected_turn_id,
-            error_item,
-            Some(context.task_store),
-        )?
-    } else {
-        upsert_session_turn_item_for_turn(
-            context.session_store,
-            context.session_id,
-            context.expected_turn_id,
-            error_item,
-            Some(context.task_store),
-        )?
-    }
+    let published = upsert_session_turn_item_for_turn(
+        context.session_store,
+        context.session_id,
+        context.expected_turn_id,
+        error_item,
+        Some(context.task_store),
+    )?
     .ok_or_else(|| {
         format!(
             "会话 {} 没有可写入的当前 Turn，无法记录失败 item {}",
@@ -5246,7 +5225,7 @@ mod tests {
         let session_store = crate::test_history::with_messages(
             &session_store,
             &thread_id,
-            (&repeated_thread_history(1_000, 1_000)).to_vec(),
+            repeated_thread_history(1_000, 1_000),
             UtcMillis(1),
         );
         let event_bus = InMemoryEventBus::new(32);
@@ -5609,7 +5588,7 @@ mod tests {
         let session_store = crate::test_history::with_messages(
             &session_store,
             &thread_id,
-            (&history).to_vec(),
+            history.clone(),
             UtcMillis(1),
         );
         let authority = ContextAuthority::new(
@@ -5696,7 +5675,7 @@ mod tests {
             .ensure_session_mission(&session, UtcMillis(1), || MissionId::new("pending-image"));
         let prefix = repeated_thread_history(1_000, 1_000);
         let store =
-            crate::test_history::with_messages(&store, &thread, (&prefix).to_vec(), UtcMillis(1));
+            crate::test_history::with_messages(&store, &thread, prefix.clone(), UtcMillis(1));
         let mut item = session_turn_item(
             "user_message",
             "completed",
@@ -8096,7 +8075,7 @@ mod tests {
         let session_store = crate::test_history::with_messages(
             &session_store,
             &thread_id,
-            (&repeated_thread_history(80, 1_000)).to_vec(),
+            repeated_thread_history(80, 1_000),
             UtcMillis(1),
         );
         let conversation_registry = ConversationRegistry::new();
@@ -10888,11 +10867,11 @@ mod tests {
         let session_store = crate::test_history::with_messages(
             &session_store,
             &thread_id,
-            (&[test_thread_message(
+            [test_thread_message(
                 "user",
                 "历史要求：输出 OLD_REFERENCE_RESULT",
-            )])
-                .to_vec(),
+            )]
+            .to_vec(),
             UtcMillis(1),
         );
         let conversation_registry = ConversationRegistry::new();

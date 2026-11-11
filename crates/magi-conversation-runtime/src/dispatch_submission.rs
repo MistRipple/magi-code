@@ -2301,7 +2301,7 @@ mod tests {
             });
         let source_thread_id = magi_core::ThreadId::new("thread-dispatch-resume-source");
         let source_worker_id = WorkerId::new("worker-dispatch-resume-source");
-        let source_history = vec![
+        let source_history = [
             ThreadChatMessage {
                 input_request_id: None,
                 role: "user".to_string(),

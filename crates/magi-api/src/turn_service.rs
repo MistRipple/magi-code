@@ -437,17 +437,17 @@ async fn submit_session_turn_internal(
             .await
         }
         SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute => {
-            submit_mainline_session_turn(
-                state.clone(),
+            submit_mainline_session_turn(MainlineSessionTurnInput {
+                state: state.clone(),
                 request,
                 images,
                 workspace_id,
                 accepted_at,
                 decision,
-                request_fingerprint,
+                creation_request_fingerprint: request_fingerprint,
                 job,
-                None,
-            )
+                plugin_message: None,
+            })
             .await
         }
         SessionTurnRouteDto::Steer => {
@@ -2406,7 +2406,7 @@ fn ensure_conversation_failure_item(
 ///
 /// 普通输入与 Goal 共用带工具的主线 Task；是否派发由模型按共享唤起规则判断，
 /// 接纳层不按文本裁剪代理工具，也不把 Goal/内部 root Task 等同于实际派发。
-async fn submit_mainline_session_turn(
+struct MainlineSessionTurnInput {
     state: ApiState,
     request: SessionTurnRequestDto,
     images: Vec<magi_conversation_runtime::session_images::SessionTurnImage>,
@@ -2416,7 +2416,22 @@ async fn submit_mainline_session_turn(
     creation_request_fingerprint: String,
     job: Option<magi_app_server_protocol::generated::PluginJobContext>,
     plugin_message: Option<magi_app_server_protocol::generated::PluginSessionMessageOrigin>,
+}
+
+async fn submit_mainline_session_turn(
+    input: MainlineSessionTurnInput,
 ) -> Result<SessionTurnResponseDto, ApiError> {
+    let MainlineSessionTurnInput {
+        state,
+        request,
+        images,
+        workspace_id,
+        accepted_at,
+        decision,
+        creation_request_fingerprint,
+        job,
+        plugin_message,
+    } = input;
     let trace = PerformanceTrace::new(request.request_id().as_deref(), accepted_at);
     let requested_session_label = request
         .requested_session_id()
@@ -3269,15 +3284,17 @@ pub(crate) async fn drain_next_queued_regular_session_turn(
                 SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute => {
                     match queued_request_fingerprint {
                         Some(creation_request_fingerprint) => submit_mainline_session_turn(
-                            state.clone(),
-                            queued_request,
-                            images,
-                            scope.workspace_id(),
-                            admission_at,
-                            decision,
-                            creation_request_fingerprint,
-                            None,
-                            plugin_message,
+                            MainlineSessionTurnInput {
+                                state: state.clone(),
+                                request: queued_request,
+                                images,
+                                workspace_id: scope.workspace_id(),
+                                accepted_at: admission_at,
+                                decision,
+                                creation_request_fingerprint,
+                                job: None,
+                                plugin_message,
+                            },
                         )
                         .await
                         .map(|_| ()),

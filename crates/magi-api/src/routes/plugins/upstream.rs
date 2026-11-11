@@ -22,6 +22,20 @@ pub(super) mod github;
 pub(super) mod icons;
 mod previewed;
 
+type UpstreamPackageKey = (String, String);
+type InstalledPluginIdentity = (String, String);
+type InstalledUpstreamPlugins =
+    std::collections::HashMap<UpstreamPackageKey, InstalledPluginIdentity>;
+
+struct TranslatorInput<'a> {
+    ecosystem: &'a PluginEcosystem,
+    upstream_dir: &'a FsPath,
+    out_dir: &'a FsPath,
+    archive: &'a FsPath,
+    integrity: &'a str,
+    github: Option<&'a magi_app_server_protocol::generated::PluginGithubSource>,
+}
+
 /// registry 的开发与验收覆盖入口；默认使用 npm 官方 registry。
 pub(super) const NPM_REGISTRY_ENV: &str = "MAGI_NPM_REGISTRY";
 const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
@@ -274,7 +288,7 @@ async fn search_ecosystem(
 /// 已安装的上游来源包：(生态, 包名) → (插件 ID, 已安装版本)。
 fn installed_upstream(
     state: &ApiState,
-) -> Result<std::collections::HashMap<(String, String), (String, String)>, ApiError> {
+) -> Result<InstalledUpstreamPlugins, ApiError> {
     let manager = locked(state, "读取已安装的上游插件")?;
     Ok(manager
         .state()
@@ -299,7 +313,7 @@ fn entry_from_search(
     package: SearchPackage,
     ecosystem: &PluginEcosystem,
     reason: &Option<String>,
-    installed: &std::collections::HashMap<(String, String), (String, String)>,
+    installed: &InstalledUpstreamPlugins,
 ) -> PluginUpstreamEntry {
     let key = (ecosystem_name(ecosystem).to_string(), package.name.clone());
     let current = installed.get(&key);
@@ -388,7 +402,7 @@ pub(super) async fn preview_candidate(
     operations: &PluginOperations,
     request: &PluginUpstreamRequest,
 ) -> Result<PluginUpstreamPreview, ApiError> {
-    let translated = translate(operations, &request).await?;
+    let translated = translate(operations, request).await?;
     previewed::remember(&translated);
     let source = translated.source.clone();
     let (candidate, translation_runtime) = {
@@ -642,12 +656,14 @@ pub(super) async fn prepare(
     let stdout = run_translator(
         state,
         &toolchain,
-        &request.ecosystem,
-        &upstream_dir,
-        &out_dir,
-        &archive_path,
-        &integrity,
-        github.as_ref(),
+        TranslatorInput {
+            ecosystem: &request.ecosystem,
+            upstream_dir: &upstream_dir,
+            out_dir: &out_dir,
+            archive: &archive_path,
+            integrity: &integrity,
+            github: github.as_ref(),
+        },
     )
     .await?;
     let archive = std::fs::read(&archive_path)
@@ -666,13 +682,16 @@ pub(super) async fn prepare(
 async fn run_translator(
     state: &PluginOperations,
     toolchain: &crate::state::PluginToolchain,
-    ecosystem: &PluginEcosystem,
-    upstream_dir: &FsPath,
-    out_dir: &FsPath,
-    archive: &FsPath,
-    integrity: &str,
-    github: Option<&magi_app_server_protocol::generated::PluginGithubSource>,
+    input: TranslatorInput<'_>,
 ) -> Result<String, ApiError> {
+    let TranslatorInput {
+        ecosystem,
+        upstream_dir,
+        out_dir,
+        archive,
+        integrity,
+        github,
+    } = input;
     let mut args = vec![
         "prepare".to_string(),
         ecosystem_name(ecosystem).to_string(),

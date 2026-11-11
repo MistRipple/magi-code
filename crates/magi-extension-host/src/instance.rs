@@ -1051,12 +1051,12 @@ pub async fn launch(
         return Err(LaunchError::NotReady(tail_text(&stderr_tail)));
     }
 
-    if let Some(service) = &config.service {
-        if let Err(error) = service.instance_ready(&config.plugin_id, &service_lease.lease) {
-            abort(&stop);
-            peer.close();
-            return Err(LaunchError::NotReady(error.to_string()));
-        }
+    if let Some(service) = &config.service
+        && let Err(error) = service.instance_ready(&config.plugin_id, &service_lease.lease)
+    {
+        abort(&stop);
+        peer.close();
+        return Err(LaunchError::NotReady(error.to_string()));
     }
     launch_guard.0 = None;
     Ok(Arc::new(HostInstance {

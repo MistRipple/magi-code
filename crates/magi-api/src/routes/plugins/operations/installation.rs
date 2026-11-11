@@ -158,8 +158,10 @@ impl PluginOperations {
                     None => tokio::select! {
                         biased;
                         _ = job.cancelled() => { job.finish(cancelled(&bundle)); return; }
-                        result = tokio::time::timeout(Duration::from_secs(840), operations.prepare_bundle(&input)) => result
-                            .unwrap_or_else(|_| Err(failure(ApiError::InvalidInput("安装准备超时，尚未提交版本".into()), false, &bundle, None, None))),
+                        result = tokio::time::timeout(Duration::from_secs(840), operations.prepare_bundle(&input)) => match result {
+                            Ok(prepared) => prepared,
+                            Err(_) => Err(failure(ApiError::InvalidInput("安装准备超时，尚未提交版本".into()), false, &bundle, None, None)),
+                        },
                     },
                 };
                 let translated = match prepared {

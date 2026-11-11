@@ -358,8 +358,8 @@ fn validate_manifest_with_limits(
         return Err(invalid("插件版本、名称或说明无效"));
     }
     validate_extension(manifest)?;
-    if let Some(client) = &manifest.contributions.client {
-        if !manifest
+    if let Some(client) = &manifest.contributions.client
+        && (!manifest
             .contributions
             .views
             .iter()
@@ -367,12 +367,11 @@ fn validate_manifest_with_limits(
             || !manifest.permissions.iter().any(|permission| {
                 permission.kind == PluginPermissionKind::Client
                     && permission.targets.as_slice() == ["persistent"]
-            })
-        {
-            return Err(invalid(
-                "常驻客户端须引用声明视图入口并申请 client:[persistent] 权限",
-            ));
-        }
+            }))
+    {
+        return Err(invalid(
+            "常驻客户端须引用声明视图入口并申请 client:[persistent] 权限",
+        ));
     }
     for permission in &manifest.permissions {
         if permission.kind == PluginPermissionKind::WebProviders

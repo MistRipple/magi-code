@@ -756,7 +756,7 @@ where
         &state.workspace_registry,
         memory_store,
         session_id,
-        &mut chain,
+        &chain,
         primary_branch,
     )
     .map_err(|error| {
