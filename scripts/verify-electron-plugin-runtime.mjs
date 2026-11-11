@@ -107,6 +107,8 @@ async function prepare() {
     peerDependencies: { '@deepseek-ai/cordis': '4.0.5-alpha.2', '@deepseek-ai/dsh-llm': deps['@deepseek-ai/dsh-llm'] },
     dependencies: { '@deepseek-ai/schemastery': deps['@deepseek-ai/schemastery'] },
   }));
+  // 包声明了 bundle patch，翻译器按真实合同要求该文件存在；空操作列表表示不改写其他插件入口。
+  await writeFile(join(upstream, 'cordis.patch.yml'), '[]\n');
   await writeFile(join(upstream, 'index.js'), `
 import Schema from '@deepseek-ai/schemastery';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';

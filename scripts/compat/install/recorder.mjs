@@ -3,6 +3,8 @@
 import { installSkills } from '../runtime/skills.mjs';
 import { installPromptContributions } from '../runtime/prompt.mjs';
 import { pathToFileURL } from 'node:url';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { promisify } from 'node:util';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { configureProfile, withProfile, loaderEntries, profilePath, createProfileReload } from '../runtime/profile.mjs';
 import { installSharedResolution } from '../runtime/shared-resolution.mjs';
@@ -14,6 +16,42 @@ import { installWeb } from '../runtime/web.mjs';
 import { createRegisteredSettings } from '../runtime/registered-settings.mjs';
 
 const [entry, sharedRoot, resultPath, upstreamDir, readSessionDirectory, nullableEvents, webProviders, settingsNamespace] = process.argv.slice(2);
+// 观察上游创建的定时器，用于判断启动后是否还有会触发的一次性工作。必须先于上游入口加载。
+// 只登记不改变语义：回调、返回值、清除与 promisify 行为都保持原样。
+const scheduled = [];
+const nativeSetTimeout = globalThis.setTimeout;
+{
+  const require = createRequire(import.meta.url);
+  const timers = require('node:timers'), timersPromises = require('node:timers/promises');
+  const delayOf = (value) => Math.max(1, Number(value) || 1);
+  const timerWrapper = (original, periodic) => {
+    const tracked = function (...args) {
+      const timer = original.apply(this, args);
+      scheduled.push({ timer, periodic, dueAt: Date.now() + delayOf(args[1]) });
+      return timer;
+    };
+    // promisify.custom 由下面单独接管；其余属性（含 length/name）原样复制。
+    const { [promisify.custom]: custom, ...descriptors } = Object.getOwnPropertyDescriptors(original);
+    Object.defineProperties(tracked, descriptors);
+    if (custom) Object.defineProperty(tracked, promisify.custom, { ...custom, configurable: true });
+    return tracked;
+  };
+  const trackedTimeout = timerWrapper(globalThis.setTimeout, false), trackedInterval = timerWrapper(globalThis.setInterval, true);
+  // timers/promises 的 setTimeout 返回 Promise；以其落定作为“已触发或已取消”。
+  const original = timersPromises.setTimeout;
+  const trackedSleep = (delay, ...rest) => {
+    const record = { done: false, periodic: false, dueAt: Date.now() + delayOf(delay), ref: rest[1]?.ref !== false };
+    scheduled.push(record);
+    const promise = original(delay, ...rest);
+    promise.then(() => { record.done = true; }, () => { record.done = true; });
+    return promise;
+  };
+  globalThis.setTimeout = timers.setTimeout = trackedTimeout;
+  globalThis.setInterval = timers.setInterval = trackedInterval;
+  timersPromises.setTimeout = trackedSleep;
+  Object.defineProperty(trackedTimeout, promisify.custom, { value: trackedSleep, configurable: true });
+  syncBuiltinESMExports();
+}
 // 上游常把运行状态写进 ~/.dsh；HOME 是记录用的空临时目录，预建它即可，不触碰真实用户目录。
 mkdirSync(`${process.env.HOME}/.dsh`, { recursive: true });
 installSharedResolution(sharedRoot, { '@magi/compat-upstream-root': upstreamDir + '/' });
@@ -123,7 +161,8 @@ const config = upstream.Config ? upstream.Config({}) : {};
 // 会把 apply() 的异常变成后台失败，记录器仍然输出“成功”的空清单，最终导致
 // 一个永远无法激活的翻译包通过安装校验。
 let fiber, startup;
-const settleTimeout = Number(process.env.MAGI_RECORD_START_TIMEOUT_MS ?? 15_000);
+// 记录进程不继承环境变量，下列时间是固定的记录合同，不能由外部改写。
+const settleTimeout = 15_000;
 await withProfile(() => registeredSettings.run(async () => {
 fiber = ctx.plugin({ apply: upstream.apply, inject: upstream.inject, name: upstream.name }, config);
 startup = await Promise.race([
@@ -132,10 +171,40 @@ startup = await Promise.race([
 ]);
 }));
 if (startup === 'timeout') console.error(`记录阶段在 ${settleTimeout}ms 内未完全就绪，保留已观察的静态注册并交由 Magi 运行期继续收敛`);
-// 贡献可以在 apply 返回后由上游异步注册（例如 MCP 发现或延迟工具）。给它一个
-// 有界的稳定窗口；运行期目录仍然支持动态增删，但安装期不能把已观察到的启动
-// 失败隐藏成成功。
-await new Promise((r) => setTimeout(r, Number(process.env.MAGI_RECORD_SETTLE_MS ?? 3000)));
+// 贡献可以在 apply 返回后由上游异步注册（例如延迟工具）。记录进程没有网络、子进程和 Worker，
+// 之后还能登记贡献的只有：尚未触发的一次性定时器、立即回调，以及周期定时器。
+// 所以“没有未完成的一次性工作”就是真实的静止态，不依赖机器快慢；
+// 周期定时器无法证明会停止，保留 3 秒观察并要求连续 1 秒没有新登记。
+// 15 秒上限保证上游用很长的一次性定时器时也能结束；运行期目录仍然支持动态增删，
+// 但安装期不能把已观察到的启动失败隐藏成成功。
+const activity = () => JSON.stringify([out.tools.length, out.commands.length, out.providers.length, out.routes.length,
+  out.settingsNamespaces.length, listenerNames.size, ctx.registry.size]);
+const pendingWork = (now) => {
+  let oneShot = 0, periodic = 0;
+  for (let index = scheduled.length - 1; index >= 0; index--) {
+    const record = scheduled[index];
+    const live = record.timer ? !record.timer._destroyed && record.timer.hasRef() : !record.done && record.ref;
+    if (!live) { scheduled.splice(index, 1); continue; }
+    if (record.periodic) periodic++;
+    // 只等待登记在观察范围内会触发的一次性定时器；更久之后才触发的由运行期继续发布。
+    else if (record.dueAt <= now + HORIZON) oneShot++;
+  }
+  return { oneShot, periodic };
+};
+const HORIZON = 5000;
+{
+  const began = Date.now(), PERIODIC_MIN = 3000, QUIET = 1000, MAX_SETTLE = 15_000, IDLE_POLLS = 5;
+  let last = activity(), changedAt = began, idle = 0;
+  for (;;) {
+    await new Promise((r) => nativeSetTimeout(r, 20));
+    const now = Date.now(), current = activity(), { oneShot, periodic } = pendingWork(now);
+    if (current !== last) { last = current; changedAt = now; }
+    // 文件请求等在线程池里完成，不是定时器；连续多次空闲后才认定静止。
+    idle = oneShot === 0 ? idle + 1 : 0;
+    if (now - began >= MAX_SETTLE) break;
+    if (idle >= IDLE_POLLS && (periodic === 0 || (now - began >= PERIODIC_MIN && now - changedAt >= QUIET))) break;
+  }
+}
 if (startup === 'ready') await fiber.await();
 // 条件注入有自己的 fiber；根 apply 成功不能掩盖已观察到的子模块失败。
 for (const runtime of ctx.registry.values()) for (const child of runtime.fibers) {

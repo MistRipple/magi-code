@@ -9,6 +9,8 @@ export async function createPluginThemeCases(request) {
   assert.ok(wallpaper, '材质验收必须使用实际壁纸');
   for (const mode of ['light', 'dark']) for (const material of ['clear', 'translucent', 'immersive']) {
     const id = `acceptance.original-${mode}-${material}`;
+    // 同一验收实例里多个原包共用这些固定主题：已存在时直接复用，不重复创建。
+    if (appearance.themes.some(theme => theme.pack.id === id)) { cases.push({ id, mode, material }); continue; }
     const scheme = mode === 'light' ? { accent: '#276749', background: '#f4ede3', foreground: '#29342c', contrast: 60 }
       : { accent: '#94bf85', background: '#17251f', foreground: '#e1efdf', contrast: 60 };
     const current = await request('/api/appearance/bootstrap');

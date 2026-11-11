@@ -54,6 +54,25 @@ test('准备期拒绝已观察到的条件子模块启动失败，不把根 appl
   await assert.rejects(prepareDsh({ upstreamDir: upstream, outDir: join(root, 'out'), sharedRoot: new URL('.', import.meta.url).pathname, source: {} }), /REAL_CHILD_STARTUP_FAILURE/);
 });
 
+test('记录器等到范围内的一次性定时器触发后再收敛：延迟登记被记录，范围外的长定时器不拖慢也不被记录', async t => {
+  const root = await temporary(t), upstream = join(root, 'upstream'); await mkdir(upstream);
+  await json(join(upstream, 'package.json'), { name: 'dsh-late-tools', version: '1.0.0', type: 'module', main: 'index.js', dsh: {} });
+  await writeFile(join(upstream, 'index.js'), `import { setTimeout as sleep } from 'node:timers/promises';
+export function apply(ctx) {
+  ctx.inject(['tools'], (c) => {
+    const add = (name) => c.tools.register({ name, description: name, parameters: { type: 'object', properties: {} } });
+    add('immediate');
+    setTimeout(() => add('late-timer'), 2500);
+    sleep(4000).then(() => add('late-promise'));
+    setTimeout(() => add('beyond-horizon'), 60000);
+  });
+}`);
+  const began = Date.now();
+  const { report } = await prepareDsh({ upstreamDir: upstream, outDir: join(root, 'out'), sharedRoot: new URL('.', import.meta.url).pathname, source: {} });
+  assert.deepEqual(report.tools.map(tool => tool.id), ['immediate', 'late-promise', 'late-timer'], '范围内的延迟登记被记录，且按稳定键排序');
+  assert.ok(Date.now() - began < 12_000, '60 秒的一次性定时器不能让记录等到上限');
+});
+
 test('原生资源地址绑定同一实例，保留静态 SDK、查询和模块相对依赖，不把资源 URL 当业务路径', async () => {
   const base='https://magi.example/api/plugins/acme/ui-v/digest/index.html';
   const gateway='https://magi.example/api/plugins/acme/assets/digest/instance/';
@@ -438,6 +457,48 @@ test('原包 Schema peer 满足范围时复用发行库，精确旧版沿真实�
   try { assert.deepEqual((await import(join(upstream, 'isolated.mjs'))).default, ['isolated-schema', '3.18.4']); }
   finally { isolated.deregister(); }
   assert.equal((await import(name)).default, original.default, '隔离副本不能改变宿主 Schema');
+});
+
+test('依赖按 Node 查找顺序去重：共用依赖只装一次，版本冲突才嵌套遮蔽', async t => {
+  const root = await temporary(t), shared = join(root, 'shared'), upstream = join(root, 'upstream');
+  await mkdir(shared); await json(join(shared, 'package.json'), { dependencies: {} });
+  const catalog = {
+    a: { '1.0.0': { c: '^1.0.0' } }, b: { '1.0.0': { c: '^1.0.0', e: '^1.0.0' } }, c: { '1.0.0': {} },
+    d: { '1.0.0': {}, '2.0.0': {} }, e: { '1.0.0': { d: '^2.0.0' } },
+  };
+  const tarballs = new Map(), downloads = new Map();
+  for (const [name, versions] of Object.entries(catalog)) for (const [version, dependencies] of Object.entries(versions)) {
+    const source = join(root, 'source', name, version); await mkdir(source, { recursive: true });
+    await json(join(source, 'package.json'), { name, version, dependencies });
+    const archive = join(root, `${name}-${version}.tgz`);
+    await createTar({ cwd: source, gzip: true, file: archive, prefix: 'package' }, ['package.json']);
+    tarballs.set(`/${name}-${version}.tgz`, await readFile(archive));
+  }
+  let registry;
+  const server = createServer((request, response) => {
+    if (tarballs.has(request.url)) { downloads.set(request.url, (downloads.get(request.url) ?? 0) + 1); return response.end(tarballs.get(request.url)); }
+    const name = request.url.slice(1), versions = catalog[name];
+    if (!versions) { response.writeHead(404); return response.end('{}'); }
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({ name, 'dist-tags': { latest: Object.keys(versions).at(-1) }, versions: Object.fromEntries(Object.entries(versions).map(([version, dependencies]) => {
+      const tarball = tarballs.get(`/${name}-${version}.tgz`);
+      return [version, { name, version, dependencies, dist: { tarball: `${registry}/${name}-${version}.tgz`, integrity: `sha512-${createHash('sha512').update(tarball).digest('base64')}` } }];
+    })) }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
+  registry = `http://127.0.0.1:${server.address().port}`;
+  await mkdir(upstream);
+  await json(join(upstream, 'package.json'), { name: 'dedupe-plugin', version: '1.0.0', dependencies: { a: '^1.0.0', b: '^1.0.0', d: '^1.0.0' } });
+  const records = await installDependencies(upstream, shared, registry);
+  const version = async (...parts) => JSON.parse(await readFile(join(upstream, ...parts, 'package.json'), 'utf8')).version;
+  assert.deepEqual(records.map(record => `${record.name}@${record.version}`).sort(), ['a@1.0.0', 'b@1.0.0', 'c@1.0.0', 'd@1.0.0', 'd@2.0.0', 'e@1.0.0']);
+  assert.equal(downloads.get('/c-1.0.0.tgz'), 1, '两个分支共用的依赖只下载安装一次');
+  assert.equal(await version('node_modules', 'c'), '1.0.0');
+  await assert.rejects(readFile(join(upstream, 'node_modules/a/node_modules/c/package.json')), { code: 'ENOENT' });
+  await assert.rejects(readFile(join(upstream, 'node_modules/b/node_modules/c/package.json')), { code: 'ENOENT' });
+  assert.equal(await version('node_modules', 'd'), '1.0.0');
+  assert.equal(await version('node_modules', 'e', 'node_modules', 'd'), '2.0.0', '版本冲突的依赖嵌套在使用者下，遮蔽根目录的旧版本');
 });
 
 test('Cordis peer 在线隔离安装，主入口、子路径和 CJS 元数据使用同一版本，宿主不被污染', async (t) => {

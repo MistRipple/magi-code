@@ -42,8 +42,12 @@ export async function verifyDshHealth({ request: api, plugin: health, target, pa
     record(`${name} 阴影无部分裁切`, result.cut === 0, result);
   };
   try {
-    const status = await call('/status', undefined, {}); key = status.key;
-    record('Health 原包检查真实安装目录与当前运行实例', status.profile === 'magi' && status.review.packages.some(p => p.name === 'dsh-plugin-release-probe' && p.version === '0.0.8') && status.liveReview.entries.some(p => p.name === 'dsh-plugin-release-probe' && p.state === 'active'));
+    const reviewed = status => status.profile === 'magi' && status.review.packages.some(p => p.name === 'dsh-plugin-release-probe' && p.version === '0.0.8') && status.liveReview.entries.some(p => p.name === 'dsh-plugin-release-probe' && p.state === 'active');
+    // Health 对 /status 有 5 秒节流缓存：更早的读取（目标安装前）可能仍在缓存里。
+    // 等缓存过期后核对真实安装目录，条件本身不变；超时直接失败。
+    const status = await waitFor(async () => { const value = await call('/status', undefined, {}); return reviewed(value) ? value : false; }, 'Health 审视到已安装目标', 30_000);
+    key = status.key;
+    record('Health 原包检查真实安装目录与当前运行实例', reviewed(status));
     const preview = await call('/repair', { dryRun: true });
     record('修复预览返回真实计划和一次性确认身份', preview.dryRun && typeof preview.planToken === 'string' && Array.isArray(preview.planned));
     const invalid = await api(`/api/plugins/${health.manifest.id}/routes`, { method: 'POST', path: '/plugins/dsh-plugin-health/repair', headers: { 'x-plugin-health-key': key }, body: { dryRun: false, planToken: 'invalid' } });
