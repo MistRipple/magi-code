@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { diagnoseUserStateFileStartupFailure } from "./startup-config-failure.js";
+import {
+  diagnoseUnsupportedStateLayout,
+  diagnoseUserStateFileStartupFailure,
+} from "./startup-config-failure.js";
 
 test("recognizes a damaged JSON state file under the Magi state root", () => {
   const result = diagnoseUserStateFileStartupFailure(
@@ -30,4 +33,20 @@ test("does not suggest clearing a project state file outside the global state ro
   );
 
   assert.equal(result, null);
+});
+
+test("recognizes an unsupported state layout reported by the daemon", () => {
+  const result = diagnoseUnsupportedStateLayout(
+    "magi_daemon_start_failed:magi_daemon_exited:1",
+    'Error: Internal("不支持的 state layout 版本: 21")\nError: Internal("不支持的 state layout 版本: 21")',
+  );
+
+  assert.deepEqual(result, { layoutVersion: 21 });
+});
+
+test("does not treat other startup failures as an unsupported state layout", () => {
+  assert.equal(
+    diagnoseUnsupportedStateLayout("magi_daemon_start_failed", "port already in use"),
+    null,
+  );
 });

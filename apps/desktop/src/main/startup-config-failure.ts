@@ -25,3 +25,15 @@ export function diagnoseUserStateFileStartupFailure(
   const filePath = tail.slice(0, extensionEnd + ".json".length).trim();
   return filePath.startsWith(rootPrefix) ? { filePath } : null;
 }
+
+/**
+ * daemon 只接受当前版本的 state layout：本机数据被更新版本的 Magi 升级过（或版本
+ * 未知）时会确定性拒绝启动。重试或重启不会改变结果，调用方据此不再提供“重试”。
+ */
+export function diagnoseUnsupportedStateLayout(
+  errorText: string,
+  recentOutput: string,
+): { layoutVersion: number } | null {
+  const match = /不支持的 state layout 版本: (\d+)/u.exec(`${errorText}\n${recentOutput}`);
+  return match ? { layoutVersion: Number(match[1]) } : null;
+}

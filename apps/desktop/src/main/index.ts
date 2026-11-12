@@ -37,7 +37,10 @@ import { DesktopControlServer } from "./desktop-control-server.js";
 import { openWorkspaceFolder, revealWorkspaceFile } from "./desktop-files.js";
 import { ProcessSupervisor } from "./process-supervisor.js";
 import { DesktopRuntimeRecoveryCoordinator } from "./desktop-runtime-recovery.js";
-import { diagnoseUserStateFileStartupFailure } from "./startup-config-failure.js";
+import {
+  diagnoseUnsupportedStateLayout,
+  diagnoseUserStateFileStartupFailure,
+} from "./startup-config-failure.js";
 import { defaultStateRoot } from "./state-root.js";
 import { UpdateManager } from "./update-manager.js";
 import { WindowManager } from "./window-manager.js";
@@ -1316,6 +1319,11 @@ async function promptDaemonFailure(
     supervisor.recentOutput,
     stateRoot,
   );
+  const unsupportedLayout = diagnoseUnsupportedStateLayout(
+    describeError(error),
+    supervisor.recentOutput,
+  );
+  // 以下两类故障重试不会改变结果，只提供查看材料和退出，不提供“重试”。
   const detail = damagedStateFile
     ? [
         `无法读取本机状态文件：${damagedStateFile.filePath}`,
@@ -1324,28 +1332,48 @@ async function promptDaemonFailure(
       ]
         .filter(Boolean)
         .join("\n\n")
-    : [
-        `原因：${describeError(error)}`,
-        recentOutput ? `最近输出：\n${recentOutput}` : "",
-        logPath ? `完整日志：${logPath}` : "",
-      ]
-        .filter(Boolean)
-        .join("\n\n");
+    : unsupportedLayout
+      ? [
+          `本机数据的 state layout 版本为 ${unsupportedLayout.layoutVersion}，当前 Magi 不支持。这通常是因为数据已被更新版本的 Magi 升级过。`,
+          "请安装更新版本的 Magi 后再启动。重试或重启不会解决这个问题；Magi 不会自动降级或改写本机数据，也请不要手动修改 state-layout.json。",
+          logPath ? `完整日志：${logPath}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n\n")
+      : [
+          `原因：${describeError(error)}`,
+          recentOutput ? `最近输出：\n${recentOutput}` : "",
+          logPath ? `完整日志：${logPath}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n\n");
   for (;;) {
     const { response } = await dialog.showMessageBox({
       type: "error",
       title: "Magi",
       message: damagedStateFile
         ? "Magi 无法读取本机配置文件"
-        : "Magi 后台服务无法启动",
+        : unsupportedLayout
+          ? "当前版本的 Magi 无法读取本机数据"
+          : "Magi 后台服务无法启动",
       detail,
       buttons: damagedStateFile
         ? ["打开配置文件", "打开日志位置", "退出"]
-        : ["重试", "打开日志位置", "退出"],
-      defaultId: damagedStateFile ? 2 : 0,
-      cancelId: 2,
+        : unsupportedLayout
+          ? ["打开日志位置", "退出"]
+          : ["重试", "打开日志位置", "退出"],
+      defaultId: damagedStateFile ? 2 : unsupportedLayout ? 1 : 0,
+      cancelId: damagedStateFile ? 2 : unsupportedLayout ? 1 : 2,
       noLink: true,
     });
+    if (unsupportedLayout) {
+      if (response === 0 && logPath) {
+        shell.showItemInFolder(logPath);
+        continue;
+      }
+      if (response === 0) continue;
+      return "exit";
+    }
     if (response === 0 && damagedStateFile) {
       shell.showItemInFolder(damagedStateFile.filePath);
       continue;
