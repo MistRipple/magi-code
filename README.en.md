@@ -19,7 +19,7 @@ Behind any non-trivial code modification lies a chain of decisions: what outcome
 - **Mainline first with specialist delegation**: The mainline agent owns the goal and drives implementation. When isolation is required, it delegates to specialized agents (executor, explorer, architect, tester, reviewer) with role-specific models.
 - **Embedded Chromium browser & multi-purpose right pane**: Directly renders an authentic Electron `<webview>` inside Svelte content slots, enabling agent-driven page automation, DOM inspection, element highlighting, and real-time live review.
 - **Extensible plugin ecosystem & standard MCP server**: One-click installation of sandboxed plugins and workflows. Magi not only consumes external MCP tools, but also exposes a standard MCP server for external clients.
-- **Full lifecycle controllability**: Supports FIFO input queuing, dynamic steering mid-execution, and immediate "stop and redirect". Context pressure is monitored by a single authority with continuous lossless prefix compaction.
+- **Full lifecycle controllability**: Supports FIFO input queuing, dynamic steering mid-execution, and immediate "stop and redirect". Context pressure is monitored by a single authority with continuous prefix compaction.
 - **Rigorous security & governance**: File I/O, shell execution, background processes, Git worktree isolation, network access, and MCP tools run under unified sandbox rules and permission approval gates.
 
 Magi is not another chat window with extra controls. It turns every request into an engineering pipeline that can run for hours, recover from crashes, and be reviewed end-to-end.
@@ -88,12 +88,12 @@ Magi delivers complete bidirectional interoperability for the Model Context Prot
 - **MCP Client**: Connects seamlessly to local and remote MCP servers, incorporating third-party tools into agent context.
 - **Magi MCP Server**: Built-in standard MCP server (`magi-mcp-server`) supporting **stdio**, **local loopback HTTP**, and **Cloudflare Quick Tunnel** remote access. External clients can securely inspect workspace files, perform symbol searches, and query Git diffs and change ledgers.
 
-#### 5. Context pressure authority & continuous lossless compaction
+#### 5. Context pressure authority & continuous prefix compaction
 
 Say goodbye to naive "head-and-tail stitching" or blunt truncation. Magi implements an industry-standard context architecture:
 
 - **Single source of truth**: `magi-usage-authority` manages token metering, physically separating upcoming window prediction from cumulative billing (`billable_tokens`).
-- **Continuous prefix summarization**: Compaction activates proactively before approaching the model context ceiling, summarizing a continuous time-range prefix.
+- **Continuous prefix summarization**: Compaction activates proactively before approaching the model context ceiling, summarizing a continuous time-range prefix. Summaries are model-generated and not guaranteed semantically lossless; what the mechanism guarantees is prefix continuity and intact tool-call structure.
 - **Structural pairing guarantee**: **Tool calls and their corresponding tool results are strictly never separated across compaction boundaries**. Oversized outputs are pre-trimmed deterministically, and provider context-limit errors trigger bounded automatic recovery.
 
 #### 6. Input queuing, dynamic steering & stop-and-redirect
@@ -318,7 +318,7 @@ npm run browser-network-policy:check
 # 3. Core end-to-end integration acceptance
 npm run test:daemon-controls     # Daemon control flow and crash recovery
 npm run test:daemon-input-queue  # Real input queuing, steering, and goal progression
-npm run test:browser-core        # Browser automation core acceptance
+npm run test:browser-core        # Browser core static-boundary checks (no real Chromium)
 ~~~
 
 ---

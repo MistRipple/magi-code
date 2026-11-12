@@ -128,4 +128,4 @@ assert.match(sources.surface, /this\.cancelActiveDownloads\(\)/u);
 assert.match(sources.surface, /item\.cancel\(\)/u);
 assert.match(sources.surface, /browser_download_cleanup_in_progress/u);
 
-console.log('browser core acceptance passed');
+console.log('browser core static checks passed');
