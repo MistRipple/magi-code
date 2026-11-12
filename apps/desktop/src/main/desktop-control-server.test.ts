@@ -775,6 +775,72 @@ test("持久化标记在页面刷新后按最后一次 Authority 投影重放", 
   }
 });
 
+test("关闭 Tab 后丢弃它的标记投影，Worker 恢复重放不再触及该 Tab", async () => {
+  const calls: BrowserHostCommand[] = [];
+  const worker = {
+    execute: async (_targetBinding: BrowserSurfaceBinding, command: BrowserHostCommand) => {
+      calls.push(command);
+      return {
+        outcome: {
+          status: "succeeded" as const,
+          payload: { type: "empty" as const },
+        },
+      };
+    },
+    forwardSurfaceEvent: () => undefined,
+  } as unknown as AutomationWorker;
+  const closed: string[] = [];
+  const { server, socketPath } = createControlServer(worker, {
+    closeTab: async (tabId) => {
+      closed.push(tabId);
+    },
+  });
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    const annotations = [{ annotation_id: "annotation-closed", sequence: 1, status: "active" }];
+    client.send(JSON.stringify(request("set-annotations-before-close", {
+      type: "set_annotations",
+      payload: { tab_id: binding.tab_id, annotations },
+    })));
+    await waitUntil(() => calls.filter((command) => command.type === "set_annotations").length === 1);
+
+    const closeResponse = nextJsonMatching(
+      client,
+      (message) => message.request_id === "close-tab",
+    );
+    client.send(JSON.stringify(request("close-tab", {
+      type: "close_page",
+      payload: { tab_id: binding.tab_id },
+    })));
+    assert.equal((await closeResponse).outcome?.status, "succeeded");
+    assert.deepEqual(closed, [binding.tab_id]);
+
+    // 迟到的页面事件会清掉“已应用”记录并触发重放；已关闭 Tab 的快照必须已被丢弃。
+    server.handleSurfaceEvent({
+      type: "page_updated",
+      binding,
+      page: {
+        tab_id: binding.tab_id,
+        url: "https://example.test/late",
+        origin: "https://example.test",
+        title: "Late",
+        navigation_revision: binding.navigation_revision,
+      },
+    } as BrowserSurfaceEvent);
+    await server.replayCachedAnnotations();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(
+      calls.filter((command) => command.type === "set_annotations").length,
+      1,
+      "已关闭 Tab 的标记快照不应再被重放",
+    );
+  } finally {
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
 test("文档就绪信号会重放刷新后尚未落地的标记投影", async () => {
   const calls: BrowserHostCommand[] = [];
   let attempts = 0;
@@ -1098,6 +1164,7 @@ function createControlServer(
     onConnectionState?: (connected: boolean) => void;
     onHostControlReleased?: () => void;
     onNetworkPolicy?: (policy: { lanAccessEnabled: boolean }) => void;
+    closeTab?: (tabId: string) => Promise<void>;
   } = {},
 ): { server: DesktopControlServer; socketPath: string } {
   // macOS limits Unix-domain socket paths to a little over 100 bytes. The
@@ -1146,6 +1213,7 @@ function createControlServer(
         viewport: { mode: "auto" as const },
       };
     },
+    closeTab: async (tabId: string) => options.closeTab?.(tabId),
     isContentSlotBoundBinding: (candidate: BrowserSurfaceBinding) => (
       options.bindingAvailable?.() !== false && candidate.tab_id === primaryTabId
     ),

@@ -895,6 +895,7 @@ export class DesktopControlServer {
       }
       case "close_page":
         await this.#surfaceManager.closeTab(command.payload.tab_id);
+        this.dropAnnotationProjection(command.payload.tab_id);
         return succeeded({ type: "empty" });
       case "navigate": {
         const binding = await this.requireRenderablePrimaryBinding(
@@ -1178,9 +1179,15 @@ export class DesktopControlServer {
     return run;
   }
 
-  private cancelAnnotationProjection(tabId: string): void {
+  /**
+   * 逻辑 Tab 关闭后，丢弃它的标记投影快照与已应用记录，并取消仍在进行的投影。
+   * 否则快照会随已关闭的 Tab 一直累积，Worker 恢复重放时还会对不存在的 Tab 反复投影。
+   */
+  private dropAnnotationProjection(tabId: string): void {
     this.#annotationProjectionControllers.get(tabId)?.abort();
     this.#annotationProjectionControllers.delete(tabId);
+    this.#annotationProjections.delete(tabId);
+    this.#appliedAnnotationProjections.delete(tabId);
   }
 
   private async requireRenderablePrimaryBinding(
