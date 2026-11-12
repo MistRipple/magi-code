@@ -126,7 +126,7 @@
       </div>
     </div>
     {:else}
-    <p class="settings-hint" role="status">{i18n.t('common.loading')}</p>
+    <p class="settings-hint" role="status"><Icon name="loader" size={13} class="spinning" /> {i18n.t('common.loading')}</p>
     {/if}
 </SettingsDetailPage>
 

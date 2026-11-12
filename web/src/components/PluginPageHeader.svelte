@@ -4,6 +4,7 @@
    * 生命周期事实在 daemon；这里只发起与插件详情面板相同的操作，并在完成后刷新投影。
    */
   import { i18n } from '../stores/i18n.svelte';
+  import Icon from './Icon.svelte';
   import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import {
     activatePlugin,
@@ -63,6 +64,9 @@
 
 <div class="plugin-page-actions" data-testid="plugin-page-header" data-plugin-id={manifest.id}>
   <span class="plugin-page-version">v{manifest.version}</span>
+  {#if busy}
+    <span class="plugin-page-busy" data-testid="plugin-page-progress" role="status" aria-label={i18n.t('common.loading')}><Icon name="loader" size={14} class="spinning" /></span>
+  {/if}
   {#if needsAuthorization}
     <button class="btn btn--sm btn--primary" type="button" data-testid="plugin-page-review-permissions" disabled={busy || !loaded} onclick={() => openSettings('plugins', manifest.id)}>
       {i18n.t('settings.plugins.reviewPermissions')}
@@ -83,6 +87,7 @@
 
 <style>
   .plugin-page-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-4); min-width: 0; flex: 0 1 auto; }
+  .plugin-page-busy { display: inline-flex; align-items: center; color: var(--foreground-muted); }
   .plugin-page-version { font-size: var(--text-xs); color: var(--foreground-muted); }
   .plugin-page-switch { display: inline-flex; align-items: center; gap: var(--space-3); font-size: var(--text-sm); color: var(--foreground); }
   .plugin-page-error { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-xs); color: var(--error); }

@@ -252,6 +252,16 @@ assert.match(
   /prefers-reduced-motion: reduce[\s\S]*?animation-iteration-count: infinite !important/,
   '运行状态的旋转不能因系统减少动态效果而停止',
 );
+assert.match(
+  globalStyle,
+  /prefers-reduced-motion: reduce\)[\s\S]*?:is\(\s*\.spinning[\s\S]*?\) \{\s*animation-name: magi-status-spin !important;[\s\S]*?animation-iteration-count: infinite !important;/,
+  '减少动态效果时转圈等待指示必须继续旋转，不能降为呼吸',
+);
+assert.doesNotMatch(
+  globalStyle,
+  /prefers-reduced-motion: reduce[\s\S]*?:is\([^)]*\.spinning[^)]*\),[^{]*\{[^}]*magi-status-pulse/,
+  '转圈指示不能再进入呼吸降级规则',
+);
 assert.doesNotMatch(
   globalStyle,
   /session-activity-indicator|personal-session-indicator|session-running-dot/,

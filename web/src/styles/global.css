@@ -1901,20 +1901,30 @@ strong, b { font-weight: var(--font-bold); }
   }
   [data-copy-feedback="true"] svg { animation: none; }
 
-  /* 关键状态反馈保留缓慢明暗循环；替换位移/旋转，不恢复装饰性动效。
-     加载图标沿用 spinning，其余选择器均对应已存在的运行态标记。 */
+  /* 转圈加载指示是必要的等待反馈：减少动态效果时仍保持旋转，不换成明暗循环，
+     与会话状态指示一致；装饰性动效仍被关闭。 */
   :is(
     .spinning, .spin, .spinner, .kp-spinner, .mac-spinner,
     .bootstrap-spinner:not(.static), .lazy-panel-loading svg, .loading-state svg,
     .sidebar-empty--recovering svg, .settings-loading svg, .sidebar-refreshing svg,
     .right-pane-add-tab[aria-busy='true'] svg, .git-repository-stats button.loading svg,
-    .refreshing svg, .ghost-action.saving svg, .skill-row-progress,
-    .btn:is(.is-testing, .is-saving) svg, .apple-indicator.checking,
+    .refreshing svg, .ghost-action.saving svg,
+    .btn:is(.is-testing, .is-saving) svg, .ia-context-picker-loading svg,
+    .update-status-action-icon--spinning, .update-status-progress-ring--indeterminate
+  ) {
+    animation-name: magi-status-spin !important;
+    animation-duration: 1s !important;
+    animation-iteration-count: infinite !important;
+    animation-timing-function: linear !important;
+  }
+
+  /* 其余关键持续反馈（非转圈）保留缓慢明暗循环；替换位移，不恢复装饰性动效。 */
+  :is(
+    .skill-row-progress,
     .turn-runtime-dot, .tool-card-meta .status-dot.pulsing, .executor-status .status-dot.running,
     .generated-image-progress > span, .ia-context-ring.estimating .ring-fill,
-    .notice-icon.compacting, .ia-context-picker-loading svg, .loading-dot,
-    .agent-cursor-dots span, .update-status-action-icon--spinning,
-    .update-status-progress-ring--indeterminate,
+    .notice-icon.compacting,
+    .agent-cursor-dots span,
     .streaming-badge, .image-tray-pending
   ),
   .conversation-process-row.streaming .process-marker::before,

@@ -461,7 +461,8 @@
               </button>
             {/each}
           {:else}
-            <div class="settings-empty">
+            <div class="settings-empty" role={upstreamLoading ? 'status' : undefined}>
+              {#if upstreamLoading}<Icon name="loader" class="spinning" size={14} />{/if}
               <span>{upstreamLoading ? i18n.t('settings.plugins.store.searching') : items.length === 0 ? i18n.t('settings.plugins.empty') : i18n.t('settings.plugins.store.noMatch')}</span>
             </div>
           {/each}
@@ -629,6 +630,9 @@
       </div>
     {/snippet}
     <p class="settings-hint" role="status">{i18n.t('overlay.draftMemory')}</p>
+    {#if busy}
+      <div class="settings-hint" data-testid="plugin-sources-progress" role="status"><Icon name="loader" size={13} class="spinning" /> {busyLabel || i18n.t('common.loading')}</div>
+    {/if}
     <div class="sources-body">
       <section>
         <h4>{i18n.t('settings.plugins.center.title')}</h4>

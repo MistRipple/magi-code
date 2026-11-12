@@ -228,8 +228,8 @@
   <div class="section">
     <div class="section-label">{i18n.t('lanAccess.sectionLan')}</div>
     {#if loading}
-      <div class="qr-placeholder">
-        <span class="loading-dot"></span><span class="loading-dot"></span><span class="loading-dot"></span>
+      <div class="qr-placeholder" role="status" aria-label={i18n.t('common.loading')}>
+        <Icon name="loader" class="spinning" size={18} />
       </div>
     {:else if !lanEnabled}
       <div class="qr-error" role="status" data-testid="lan-access-disabled">{i18n.t('lanAccess.loopbackOnly')}</div>
@@ -302,10 +302,6 @@
   .qr-container :global(svg) { width: 100%; height: 100%; }
   .qr-placeholder { display: flex; align-items: center; justify-content: center; gap: 6px; aspect-ratio: 1; margin: 4px 14px; background: var(--surface-2); border-radius: var(--radius-lg); }
   .qr-error { display: flex; align-items: center; justify-content: center; aspect-ratio: 1; margin: 4px 14px; padding: 12px; border-radius: var(--radius-lg); border: 1px dashed var(--border); background: var(--surface-2); color: var(--foreground-muted); font-size: var(--text-xs); line-height: 1.6; text-align: center; }
-  .loading-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--foreground-muted); animation: dotPulse 1.2s ease-in-out infinite; }
-  .loading-dot:nth-child(2) { animation-delay: 0.15s; }
-  .loading-dot:nth-child(3) { animation-delay: 0.3s; }
-  @keyframes dotPulse { 0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); } 40% { opacity: 1; transform: scale(1); } }
   .url-row { display: flex; gap: 6px; }
   .url-input { flex: 1; min-width: 0; padding: 6px 8px; font-size: var(--text-xs); font-family: var(--font-mono); color: var(--foreground); background: var(--vscode-input-background, var(--surface-2)); border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-sm); outline: none; }
   .url-input:focus { border-color: var(--primary); }
