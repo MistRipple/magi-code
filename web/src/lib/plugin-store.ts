@@ -6,31 +6,11 @@ import type {
   PluginCenterEntry,
   PluginInstalled,
   PluginManifest,
-  PluginPermission,
   PluginUpstreamEntry,
   PluginUpstreamRequest,
 } from '../shared/app-server-protocol.generated';
 
-/** 安装预览与已安装详情共用同一权限说明，语言由调用方当前的 i18n 提供。 */
-export function permissionText(permission: PluginPermission, t: (key: string, vars?: Record<string, string | number>) => string): string {
-  if (permission.kind === 'webProviders') return t('settings.plugins.permission.webProviders');
-  if (permission.kind === 'client') return t('settings.plugins.permission.client');
-  if (permission.kind === 'attachments') return t('settings.plugins.permission.attachments');
-  if (permission.kind === 'sessionWrite') return permission.targets.map(target => t(target === 'wake' ? 'settings.plugins.permission.sessionWrite.wake' : 'settings.plugins.permission.sessionWrite.context')).join('；');
-  if (permission.kind === 'sessionRead') return permission.targets.map(target => t(target === 'render' ? 'settings.plugins.permission.sessionRender' : 'settings.plugins.permission.sessionRead')).join('；');
-  if (permission.kind === 'composer') return permission.targets.map(target => t(target === 'text' ? 'settings.plugins.permission.composerText' : 'settings.plugins.permission.composer')).join('；');
-  if (permission.kind === 'extension') return t('settings.plugins.permission.extensionFullTrust');
-  if (permission.kind === 'pluginManagement') return [
-    t(permission.targets.includes('authorize') ? 'settings.plugins.permission.pluginAuthorization' : 'settings.plugins.permission.pluginManagement'),
-    ...(permission.targets.includes('compatibility') ? [t('settings.plugins.permission.pluginCompatibility')] : []),
-    ...(permission.targets.includes('background') ? [t('settings.plugins.permission.pluginBackground')] : []),
-  ].join('；');
-  if (permission.kind === 'contextRewrite') return t('settings.plugins.permission.contextRewrite');
-  if (permission.kind === 'modelSources') return t('settings.plugins.permission.modelSources', { sources: permission.targets.join(', ') });
-  return `${permission.kind}${permission.targets.length ? `: ${permission.targets.join(', ')}` : ''}`;
-}
-
-/** 只解释已声明的贡献与权限；安装预览、在线更新及激活前共用，不增加授权状态。 */
+/** 解释插件已声明的贡献对 Magi 的影响；安装预览、在线更新及详情共用。 */
 export function pluginImpactNotices(manifest: PluginManifest, t: (key: string, vars?: Record<string, string | number>) => string) {
   const notices: { id: string; text: string }[] = [];
   const placements = new Set((manifest.contributions.views ?? []).flatMap(view => view.placements));
@@ -43,12 +23,6 @@ export function pluginImpactNotices(manifest: PluginManifest, t: (key: string, v
   if (hooks.some(hook => hook.mode === 'guard')) notices.push({ id: 'guard', text: t('settings.plugins.impact.guard') });
   if (manifest.permissions.some(permission => permission.kind === 'contextRewrite')) notices.push({ id: 'context', text: t('settings.plugins.impact.context') });
   return notices;
-}
-
-/** 只决定显示授权入口还是启用开关；真正准入仍由 daemon 按摘要检查。 */
-export function pluginNeedsAuthorization(plugin: PluginInstalled): boolean {
-  return plugin.manifest.permissions.some(permission => !plugin.grants.some(grant =>
-    grant.kind === permission.kind && permission.targets.every(target => grant.targets.includes(target))));
 }
 
 export type StoreStatus = 'active' | 'installed' | 'available';

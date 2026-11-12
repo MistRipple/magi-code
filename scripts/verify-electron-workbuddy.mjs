@@ -47,28 +47,6 @@ const tab = async (id) => {
     return page.evaluate(`document.querySelector(${JSON.stringify(selector)})?.getAttribute('aria-current') === 'page'`);
   }, `设置分类 ${id}`);
 };
-async function verifyAuthorizationLayout() {
-  const selector = '[data-testid=plugin-page-review-permissions]';
-  const caption = await ui.text(selector);
-  try {
-    for (const width of [1280, 390]) {
-      await page.call('Emulation.setDeviceMetricsOverride', { width, height: 844, deviceScaleFactor: 1, mobile: false });
-      for (const long of width === 390 ? [false, true] : [false]) {
-        await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).textContent=${JSON.stringify(caption)};true`);
-        if (long) await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).textContent='Review permissions and enable';true`);
-        await screenshot(`authorization-${width}${long ? '-long' : ''}`);
-        const bounds = await page.evaluate(`(() => {const nodes=[...document.querySelectorAll('.settings-main > .main-header h2, [data-testid=plugin-page-header] button')];return nodes.map(node=>{const r=node.getBoundingClientRect();return {text:node.innerText,x:r.x,right:r.right,y:r.y,bottom:r.bottom,visible:r.width>0&&r.height>0&&r.x>=0&&r.right<=innerWidth&&r.bottom<=innerHeight};});})()`);
-        const audit = clipAuditSource && await page.evaluate(`(${clipAuditSource})({root:'.settings-main',viewport:true})`);
-        await writeFile(join(output, `authorization-${width}${long ? '-long' : ''}.json`), JSON.stringify({ bounds, audit }, null, 2));
-        const overlap = bounds.some((a, index) => bounds.slice(index + 1).some(b => a.x < b.right && a.right > b.x && a.y < b.bottom && a.bottom > b.y));
-        report.check(`${width}px 插件标题和授权入口${long ? '加长文案' : ''}完整可见且无重叠或阴影裁切`, bounds.every(item => item.visible) && !overlap && (!audit || audit.cut === 0), JSON.stringify({ bounds, audit }));
-      }
-    }
-  } finally {
-    await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).textContent=${JSON.stringify(caption)};true`);
-    await page.call('Emulation.clearDeviceMetricsOverride');
-  }
-}
 async function start() {
   app = launchApp({ executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort,
     env: { MAGI_STATE_ROOT: join(work, 'state'), DSH_HOME: join(work, 'dsh'), MAGI_DESKTOP_DAEMON_PORT: String(port), MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '' } });
@@ -172,17 +150,6 @@ try {
   report.check(`已在线安装 ${plugin.manifest.name}@${plugin.manifest.version}`, plugin.source.kind === 'upstream');
   const row = `[data-testid=plugin-row][data-plugin-id="${pluginId}"]`;
   await tab(`plugin:${pluginId}:settings`);
-  await waitFor(() => ui.exists('[data-testid=plugin-page-review-permissions]'), '未授权设置页的权限入口');
-  report.check('未授权的设置页不启动原包或自动授予权限', !await ui.exists(`iframe[data-plugin-id="${pluginId}"]`)
-    && !(await installed()).active && (await installed()).grants.length === 0 && lifecycleRequests.length === 0);
-  await verifyAuthorizationLayout();
-  await ui.click('[data-testid=plugin-page-review-permissions]');
-  await waitFor(() => page.evaluate(`document.querySelector(${JSON.stringify(row)})?.getAttribute('aria-current') === 'true'`), '管理页定位同一插件');
-  report.check('设置页授权入口定位同一插件并展示影响及权限', await ui.exists('[data-testid=plugin-impact-ui]')
-    && (await ui.text('[data-testid=plugin-detail]')).includes('完全信任'));
-  await screenshot('authorization-review');
-  await waitFor(() => page.evaluate('Boolean(document.querySelector("[data-action=activate]")) && !document.querySelector("[data-action=activate]").disabled'), '授权激活');
-  await ui.click('[data-action=activate]');
   const activated = await waitFor(async () => {
     const item = await installed();
     return ['running', 'failed'].includes(item.runtime?.state) && item;
@@ -246,15 +213,13 @@ try {
     && lifecycleRequests.slice(requestOffset).every(item => item.expectedDigest === plugin.digest));
   await waitFor(() => ui.exists(`iframe[data-plugin-id="${pluginId}"]`), '重新启用后的原包文档');
   await api(`/api/plugins/${pluginId}/authorize`, { grants: [], expectedDigest: plugin.digest });
-  await waitFor(() => ui.exists('[data-testid=plugin-page-review-permissions]'), '撤权后恢复明确授权入口');
-  report.check('撤权回收页面与模型来源，设置页不能静默补授权', (await installed()).grants.length === 0
+  await waitFor(() => ui.exists('[data-testid=plugin-page-header] [role=switch]:not([disabled])'), '撤权后的设置页启用开关');
+  report.check('撤权回收页面与模型来源', (await installed()).grants.length === 0
     && !(await installed()).active && !await ui.exists(`iframe[data-plugin-id="${pluginId}"]`)
     && !(await api('/api/settings/models/catalog')).groups.some(group => group.pluginId === pluginId));
-  await ui.click('[data-testid=plugin-page-review-permissions]');
-  await waitFor(() => ui.exists('[data-action=activate]:not([disabled])'), '撤权后的原生授权恢复');
-  await ui.click('[data-action=activate]');
+  await ui.click('[data-testid=plugin-page-header] [role=switch]');
   const reauthorized = await waitFor(async () => { const item = await installed(); return item.runtime?.state === 'running' && item; }, '明确重新授权后启动新实例', 90_000);
-  report.check('撤权后可在同一安装上明确重新授权恢复', reauthorized.digest === plugin.digest
+  report.check('撤权后可在同一安装上通过设置页开关恢复', reauthorized.digest === plugin.digest
     && reauthorized.runtime.instanceId !== reactivated.runtime.instanceId
     && JSON.stringify(reauthorized.grants) === JSON.stringify(beforeStop.grants));
   await writeFile(join(output, 'lifecycle-requests.json'), JSON.stringify(lifecycleRequests, null, 2));

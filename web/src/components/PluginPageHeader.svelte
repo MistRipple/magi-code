@@ -7,14 +7,13 @@
   import Icon from './Icon.svelte';
   import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import {
-    activatePlugin,
+    authorizeAndActivatePlugin,
     deactivatePlugin,
     uninstallPlugin,
   } from '../web/plugin-api';
   import { pluginProjection } from '../stores/plugin-registry.svelte';
   import type { PluginManifest } from '../shared/app-server-protocol.generated';
   import { openSettings } from '../stores/shell-ui.svelte';
-  import { pluginNeedsAuthorization } from '../lib/plugin-store';
   import Toggle from './Toggle.svelte';
 
   interface Props {
@@ -30,7 +29,6 @@
   const loaded = $derived(pluginProjection().loaded);
 
   const active = $derived(Boolean(installed?.active));
-  const needsAuthorization = $derived(installed ? pluginNeedsAuthorization(installed) : false);
 
   async function run(operation: () => Promise<void>): Promise<void> {
     if (busy) return;
@@ -47,7 +45,7 @@
 
   function toggle(next: boolean): void {
     const plugin = installed;
-    if (plugin) void run(() => next ? activatePlugin(plugin) : deactivatePlugin(plugin));
+    if (plugin) void run(() => next ? authorizeAndActivatePlugin(plugin) : deactivatePlugin(plugin));
   }
 
   async function uninstall(): Promise<void> {
@@ -67,16 +65,10 @@
   {#if busy}
     <span class="plugin-page-busy" data-testid="plugin-page-progress" role="status" aria-label={i18n.t('common.loading')}><Icon name="loader" size={14} class="spinning" /></span>
   {/if}
-  {#if needsAuthorization}
-    <button class="btn btn--sm btn--primary" type="button" data-testid="plugin-page-review-permissions" disabled={busy || !loaded} onclick={() => openSettings('plugins', manifest.id)}>
-      {i18n.t('settings.plugins.reviewPermissions')}
-    </button>
-  {:else}
-    <label class="plugin-page-switch">
-      <span>{i18n.t(active ? 'settings.plugins.pageHeader.on' : 'settings.plugins.pageHeader.off')}</span>
-      <Toggle checked={active} disabled={busy || !loaded || !installed} ariaLabel={i18n.t('settings.plugins.pageHeader.toggle', { name: manifest.name })} onchange={toggle} />
-    </label>
-  {/if}
+  <label class="plugin-page-switch">
+    <span>{i18n.t(active ? 'settings.plugins.pageHeader.on' : 'settings.plugins.pageHeader.off')}</span>
+    <Toggle checked={active} disabled={busy || !loaded || !installed} ariaLabel={i18n.t('settings.plugins.pageHeader.toggle', { name: manifest.name })} onchange={toggle} />
+  </label>
   <button class="btn btn--sm btn--secondary" type="button" data-testid="plugin-page-uninstall" onclick={() => void uninstall()} disabled={busy || !loaded || !installed}>
     {i18n.t('settings.plugins.uninstall')}
   </button>

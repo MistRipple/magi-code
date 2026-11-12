@@ -1518,7 +1518,6 @@ try {
   await waitFor(() => ui.exists(row), '已安装插件');
   await ui.click(row);
   await waitFor(() => ui.exists('[data-action="activate"]'), '授权激活按钮');
-  reporter.check('图片存储独立权限在授权前可见', (await ui.text('[data-testid="plugin-card"]')).includes('图片存储'));
   await ui.click('[data-action="activate"]');
   await waitFor(async () => {
     const plugin = await installed();

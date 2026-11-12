@@ -44,7 +44,7 @@ await withGoldenViteServer(async (server) => {
   const lifecycle = () => calls.filter(({ path }) => /\/(install|upgrade|authorize|enable|activate)$/.test(path)).map(({ path }) => path.split('/').slice(-1)[0]);
   const preview = { manifest: plugin().manifest, digest: 'digest-new', operation: 'install', addedPermissions: permissions, removedPermissions: [] };
 
-  // 本地/地址安装：确认后一次完成 安装 → 授权 → 启用 → 激活，授权内容就是预览里展示的权限。
+  // 本地/地址安装：确认后一次完成 安装 → 授权 → 启用 → 激活，授权内容就是插件声明的全部权限。
   installed = []; calls.length = 0;
   await api.applyPluginCandidate({ source: 'local:x' }, preview, true);
   assert.deepEqual(lifecycle(), ['install', 'authorize', 'enable', 'activate']);

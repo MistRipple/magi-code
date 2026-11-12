@@ -202,7 +202,7 @@ try {
   report.check('安装前后 SVG 原字节一致且直接导航被隔离', await icon.text() === svg
     && icon.headers.get('content-type') === 'image/svg+xml' && icon.headers.get('x-content-type-options') === 'nosniff'
     && icon.headers.get('content-security-policy')?.startsWith('sandbox;'));
-  await waitFor(() => ui.exists('[data-action=activate]'), '激活入口'); await ui.click('[data-action=activate]');
+  // 安装完成后默认激活，不再需要点击激活入口。
   const running = await waitFor(async () => {
     const item = await installed();
     if (item.runtime?.state === 'failed') throw new Error(item.runtime.reason);

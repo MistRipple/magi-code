@@ -26,7 +26,7 @@
   import SettingsDetailPage from './SettingsDetailPage.svelte';
   import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
   import { openSettings, shellUi } from '../stores/shell-ui.svelte';
-  import { permissionText, buildStoreItems, filterStoreItems, installedUpstreamRequest, paginate, storeGroup, type StoreFilter, type StoreGroup, type StoreItem } from '../lib/plugin-store';
+  import { buildStoreItems, filterStoreItems, installedUpstreamRequest, paginate, storeGroup, type StoreFilter, type StoreGroup, type StoreItem } from '../lib/plugin-store';
   import { pluginRegistryRevision, pluginProjection } from '../stores/plugin-registry.svelte';
   import { cachedUpstreamProjection, rememberUpstreamProjection } from '../lib/plugin-upstream-cache';
   import type { PluginCandidatePreview, PluginEcosystem, PluginUpstreamRequest, PluginCenterProjection, PluginList, PluginManifest, PluginUpstreamPreview, PluginUpstreamProjection } from '../shared/app-server-protocol.generated';
@@ -252,7 +252,7 @@
   const hasCatalog = $derived(Boolean(center && center.entries.length > 0));
 
   /**
-   * 安装完成后是否默认激活。新安装一律激活（预览里已展示全部权限，确认即同意）；
+   * 安装完成后是否默认激活。新安装一律激活（安装即获得插件声明的全部权限）；
    * 升级只恢复原本已激活的插件，不替用户重新启用被其主动停用的插件。
    */
   function activateAfterInstall(pluginId: string, operation: string): boolean {
@@ -315,9 +315,9 @@
     await run(() => uninstallPlugin(id));
   }
 
-  /** 插件中心没有安装前预览：只有已验签目录的新安装、或原本已激活插件的升级才默认激活；未验签目录的包留给用户在详情里审阅后再授权。 */
+  /** 插件中心的新安装默认激活；已安装插件的升级只恢复原本已激活的状态。 */
   function centerActivates(item: StoreItem): boolean {
-    return item.installed ? item.installed.active : Boolean(center?.verified);
+    return item.installed ? item.installed.active : true;
   }
 
   async function installItem(item: StoreItem): Promise<void> {
@@ -539,26 +539,6 @@
         </div>
         <div class="settings-card-body">
           <PluginImpactNotices manifest={preview.manifest} />
-          <div class="plugin-perm" data-testid="candidate-added-permissions">
-            <span class="settings-row-title">{i18n.t('settings.plugins.candidate.added')}</span>
-            <div class="settings-chips">
-              {#each preview.addedPermissions as permission}
-                <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement' || permission.kind === 'composer' || permission.kind === 'sessionRead' || permission.kind === 'sessionWrite' || permission.kind === 'client' || permission.kind === 'attachments'}>{permissionText(permission, i18n.t.bind(i18n))}</span>
-              {:else}
-                <span class="settings-row-desc">{i18n.t('settings.plugins.candidate.noneAdded')}</span>
-              {/each}
-            </div>
-          </div>
-          {#if preview.removedPermissions.length > 0}
-            <div class="plugin-perm">
-              <span class="settings-row-title">{i18n.t('settings.plugins.candidate.removed')}</span>
-              <div class="settings-chips">
-                {#each preview.removedPermissions as permission}
-                  <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement' || permission.kind === 'composer' || permission.kind === 'sessionRead' || permission.kind === 'sessionWrite' || permission.kind === 'client' || permission.kind === 'attachments'}>{permissionText(permission, i18n.t.bind(i18n))}</span>
-                {/each}
-              </div>
-            </div>
-          {/if}
           {#if preview.dataSchemaFrom !== undefined}
             <div class="settings-notice" class:settings-notice--error={preview.dataReset} role={preview.dataReset ? 'alert' : undefined}>
               {preview.dataReset

@@ -6,7 +6,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import type { InstalledPluginProjection } from '../web/plugin-api';
   import type { PluginManifest, PluginRuntimeStatus } from '../shared/app-server-protocol.generated';
-  import { permissionText, installedUpstreamRequest, pluginSettingsTab, type StoreItem } from '../lib/plugin-store';
+  import { installedUpstreamRequest, pluginSettingsTab, type StoreItem } from '../lib/plugin-store';
   import { cachedUpstreamBadge } from '../lib/plugin-upstream-cache';
   import Icon from './Icon.svelte';
   import PluginIcon from './PluginIcon.svelte';
@@ -174,21 +174,9 @@
     </p>
   {/if}
 
-  <section class="pane-section">
-    <h4>{i18n.t('settings.plugins.permissions')}</h4>
-    {#if manifest}
-      <PluginImpactNotices {manifest} />
-      <div class="settings-chips">
-        {#each manifest.permissions as permission}
-          <span class="settings-chip settings-mono" class:settings-chip--wrap={permission.kind === 'extension' || permission.kind === 'contextRewrite' || permission.kind === 'modelSources' || permission.kind === 'pluginManagement' || permission.kind === 'composer' || permission.kind === 'sessionRead' || permission.kind === 'sessionWrite' || permission.kind === 'client' || permission.kind === 'attachments'}>{permissionText(permission, i18n.t.bind(i18n))}</span>
-        {:else}
-          <span class="settings-row-desc">{i18n.t('settings.plugins.noPermissions')}</span>
-        {/each}
-      </div>
-    {:else}
-      <p class="settings-row-desc">{i18n.t('settings.plugins.detail.permissionsAfterInstall')}</p>
-    {/if}
-  </section>
+  {#if manifest}
+    <PluginImpactNotices {manifest} />
+  {/if}
 
   {#if plugin && activation}
     <section class="pane-section">

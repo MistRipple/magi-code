@@ -139,8 +139,8 @@ try {
   assert.ok(installed.plugin, installed.error); const plugin = installed.plugin;
   await writeFile(join(output,'installed.json'),JSON.stringify({id:plugin.manifest.id,version:plugin.manifest.version,source:plugin.source},null,2));
   await waitFor(() => ui.exists(`[data-testid=plugin-card][data-plugin-id="${plugin.manifest.id}"]`), '安装后保持选中');
-  await waitFor(() => page.evaluate('!document.querySelector("[data-action=activate]")?.disabled'), '后续操作恢复');
-  report.check('安装后保持当前插件详情且可继续授权激活', true);
+  await waitFor(() => page.evaluate('document.querySelector("[data-testid=plugin-activation-row]")?.dataset.state === "active"'), '安装后默认激活');
+  report.check('安装后保持当前插件详情且已默认激活', true);
   // 为在线升级准备真实 npm 旧版；不激活、不调用模型，只在本次隔离实例安装。
   await api(`/api/plugins/${plugin.manifest.id}/uninstall`, {});
   const older = { ecosystem: 'dsh', package: 'dsh-connect-workbuddy', version: '5.20.0' };

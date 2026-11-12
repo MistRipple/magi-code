@@ -214,7 +214,7 @@ async function activateInstalledPlugin(pluginId: string, expectedDigest?: string
 }
 
 /** 设置页重新启用只使用已有授权，不能在开关中补授权限。 */
-export async function activatePlugin(plugin: PluginInstalled): Promise<void> {
+async function activatePlugin(plugin: PluginInstalled): Promise<void> {
   await changePluginActivation(plugin, 'enable');
   await changePluginActivation(plugin, 'activate');
 }
