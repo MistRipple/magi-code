@@ -497,8 +497,7 @@ try {
     const history = JSON.parse((await api(page, `/api/messages?scope=workspace&workspaceId=${encodeURIComponent(workspaceId)}&sessionId=${encodeURIComponent(externalSession.sessionId)}`)).body);
     return history.canonicalTurns.at(-1)?.status === 'completed';
   }, "外部调用空闲后 daemon 收口活动段", 45_000);
-  await waitFor(() => page.evaluate(`!document.querySelector('.runtime-diagnostics-slot')?.innerText.includes('运行中')
-    && !document.querySelector('.turn-runtime-indicator')`), "外部活动段完成后界面不再显示运行中");
+  await waitFor(() => page.evaluate(`!document.querySelector('.turn-runtime-indicator')`), "外部活动段完成后界面不再显示运行中");
   check("外部活动段自动收口且实时清理运行状态，无需刷新", true);
   await fetch(`http://127.0.0.1:${daemonPort}/api/mcp-server/external`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ saveContent: true, retentionDays: 30 }) });
 

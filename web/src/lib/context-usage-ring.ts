@@ -1,7 +1,6 @@
 import type { ContextUsageBreakdown } from './context-usage-breakdown';
 // 上下文用量圆环的纯逻辑层。
-// 抽离自 ContextUsageRing.svelte，便于在 golden 测试里覆盖多场景，
-// 同时与 RuntimeStatePanel 的 budget 展示约定保持一致。
+// 抽离自 ContextUsageRing.svelte，便于在 golden 测试里覆盖多场景。
 
 export type ContextRingTone = 'normal' | 'notice' | 'warning' | 'danger';
 

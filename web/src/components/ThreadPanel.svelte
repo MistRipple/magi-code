@@ -1,5 +1,4 @@
 <script lang="ts">
-  import type { OrchestratorRuntimeState } from '../types/message';
   import {
     getLocalTurnSubmissionRenderItems,
     messagesState,
@@ -7,15 +6,11 @@
   import {
     buildTimelineRenderItems,
   } from '../lib/timeline-render-items';
-  import {
-    buildConversationRuntimeRecords,
-  } from '../lib/conversation-runtime-records';
   import MessageList from './MessageList.svelte';
   import ConversationApprovalTray from './ConversationApprovalTray.svelte';
   import ExternalSessionBar from './ExternalSessionBar.svelte';
   import { isExternalSessionId } from '../stores/external-sessions.svelte';
   import InputArea from './InputArea.svelte';
-  import RuntimeStatePanel from './RuntimeStatePanel.svelte';
   import AgentRunBanner from './AgentRunBanner.svelte';
   import { parseToolApprovalPayload } from '../lib/tool-error-payload';
   import {
@@ -47,14 +42,6 @@
       ...getLocalTurnSubmissionRenderItems(messagesState.currentSessionId),
     ];
   });
-  const runtimeState = $derived.by<OrchestratorRuntimeState | null>(() => messagesState.orchestratorRuntimeState);
-  const conversationRecords = $derived.by(() => buildConversationRuntimeRecords(
-    threadRenderItems,
-    {
-      isProcessing: runtimeState?.status === 'running',
-      processingStartedAt: runtimeState?.startedAt,
-    },
-  ));
   const anchoredApprovalIds = $derived.by(() => {
     const ids = new Set<string>();
     for (const item of threadRenderItems) {
@@ -95,10 +82,6 @@
 </script>
 
 <div class="thread-panel" data-desktop-drop-zone="conversation">
-  <RuntimeStatePanel
-    {runtimeState}
-    {conversationRecords}
-  />
   <div class="main-content">
     <MessageList renderItems={threadRenderItems} isActive={isTopActive} />
     <ConversationApprovalTray approvals={unanchoredApprovals} />

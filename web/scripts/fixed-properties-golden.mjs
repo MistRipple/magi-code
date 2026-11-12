@@ -4,25 +4,10 @@ import { parse } from 'svelte/compiler';
 import { withGoldenViteServer } from './golden-vite.mjs';
 
 // Fixed fields may be behind the user's disclosure, never behind data availability.
-const runtime = await readFile(new URL('../src/components/RuntimeStatePanel.svelte', import.meta.url), 'utf8');
 const sessionStats = await readFile(new URL('../src/components/SessionStats.svelte', import.meta.url), 'utf8');
 assert.match(sessionStats, /\.metric-value--status\s*\{[\s\S]*?font-size:\s*15px[\s\S]*?font-weight:\s*var\(--font-normal\)/, 'unobserved status stays slightly above body text without becoming a headline');
 assert.match(sessionStats, /\.metric-value\s*\{[\s\S]*?font-size:\s*24px/, 'observed metric values use a restrained size');
 assert.match(sessionStats, /\.metric-label\s*\{[\s\S]*?font-size:\s*12px/, 'metric labels remain readable at compact size');
-const metrics = [];
-function inspect(node, conditions = []) {
-  if (!node || typeof node !== 'object') return;
-  if (node.type === 'IfBlock') conditions = [...conditions, runtime.slice(node.expression.start, node.expression.end)];
-  const className = node.attributes?.find(attribute => attribute.name === 'class')?.value?.[0]?.data;
-  if (className === 'metric-card') metrics.push(conditions);
-  for (const value of Object.values(node)) {
-    for (const child of Array.isArray(value) ? value : [value]) inspect(child, conditions);
-  }
-}
-inspect(parse(runtime).html);
-assert.equal(metrics.length, 1, 'context is the only runtime metric with a production data source');
-for (const conditions of metrics) assert.deepEqual(conditions, ['panelVisible', 'isPanelExpanded']);
-
 for (const [file, className, allowed] of [
   ['KnowledgePanel.svelte', 'kp-stats-row', ["currentTab === 'overview'"]],
   ['PluginDetailPane.svelte', 'pane-facts', []],

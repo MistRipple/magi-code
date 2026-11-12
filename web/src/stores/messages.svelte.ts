@@ -744,33 +744,23 @@ function normalizeOrchestratorRuntimeState(
   const runtimeSnapshot = input.runtimeSnapshot && typeof input.runtimeSnapshot === 'object'
     ? JSON.parse(JSON.stringify(input.runtimeSnapshot))
     : null;
-  const assignments = Array.isArray(input.assignments)
-    ? input.assignments
-      .filter((entry) => entry && typeof entry === 'object')
-      .map((entry) => JSON.parse(JSON.stringify(entry)))
-    : [];
   const startedAt = typeof input.startedAt === 'number' && Number.isFinite(input.startedAt) && input.startedAt > 0
     ? Math.floor(input.startedAt)
     : undefined;
   const endedAt = typeof input.endedAt === 'number' && Number.isFinite(input.endedAt) && input.endedAt > 0
     ? Math.floor(input.endedAt)
     : undefined;
-  const opsView = input.opsView && typeof input.opsView === 'object'
-    ? JSON.parse(JSON.stringify(input.opsView))
-    : null;
   return {
     status,
     phase,
     statusChangedAt,
     lastEventAt,
-    assignments,
     ...(sessionId ? { sessionId } : {}),
     ...(turnId ? { turnId } : {}),
     ...(continuation ? { continuation } : {}),
     ...(startedAt ? { startedAt } : {}),
     ...(endedAt ? { endedAt } : {}),
     runtimeSnapshot,
-    ...(opsView ? { opsView } : {}),
   };
 }
 

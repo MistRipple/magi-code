@@ -3,7 +3,7 @@ import ts from 'typescript';
 import { access, readFile } from 'node:fs/promises';
 
 const settingsTabs = await readFile(new URL('../src/lib/settings-tabs.ts', import.meta.url), 'utf8');
-const [mainWeb, runtime, desktopAppearance, desktopMain, desktopPreload, desktopWindowManager, appearanceContract, client, settingsPanel, settingsAppearance, modal, modelConfigForm, enginePicker, knowledgePanel, runtimeStatePanel, settingsRules, settingsTools, webFolderPicker, workbenchShell, header, globalCss, settingsCss, bridge] = await Promise.all([
+const [mainWeb, runtime, desktopAppearance, desktopMain, desktopPreload, desktopWindowManager, appearanceContract, client, settingsPanel, settingsAppearance, modal, modelConfigForm, enginePicker, knowledgePanel, settingsRules, settingsTools, webFolderPicker, workbenchShell, header, globalCss, settingsCss, bridge] = await Promise.all([
   readFile(new URL('../src/main-web.ts', import.meta.url), 'utf8'),
   readFile(new URL('../src/appearance/runtime.ts', import.meta.url), 'utf8'),
   readFile(new URL('../src/lib/desktop-appearance.ts', import.meta.url), 'utf8'),
@@ -18,7 +18,6 @@ const [mainWeb, runtime, desktopAppearance, desktopMain, desktopPreload, desktop
   readFile(new URL('../src/components/ModelConfigForm.svelte', import.meta.url), 'utf8'),
   readFile(new URL('../src/components/EnginePicker.svelte', import.meta.url), 'utf8'),
   readFile(new URL('../src/components/KnowledgePanel.svelte', import.meta.url), 'utf8'),
-  readFile(new URL('../src/components/RuntimeStatePanel.svelte', import.meta.url), 'utf8'),
   readFile(new URL('../src/components/SettingsRulesTab.svelte', import.meta.url), 'utf8'),
   readFile(new URL('../src/components/SettingsToolsTab.svelte', import.meta.url), 'utf8'),
   readFile(new URL('../src/web/WebFolderPicker.svelte', import.meta.url), 'utf8'),
@@ -100,7 +99,6 @@ assert.match(modelConfigForm, /use:portalToBody[\s\S]*?class="model-select-list"
 assert.match(modelConfigForm, /addEventListener\('scroll', handleScroll, true\)/, '模型选择浮层必须在任意滚动容器滚动时关闭，避免脱离锚点');
 assert.match(enginePicker, /engine-picker-popup"[\s\S]*?data-magi-surface="popover"/, '代理模型选择浮层必须接入统一悬浮材质');
 assert.match(knowledgePanel, /kp-confirm-dialog" data-magi-surface="critical"/, '知识库关键确认必须接入统一关键材质');
-assert.match(runtimeStatePanel, /runtime-diagnostics__content" data-magi-surface="popover"/, '运行态展开面板必须接入统一悬浮材质');
 assert.doesNotMatch(settingsAppearance, /\.(primary-button|secondary-button|icon-button|danger-button|segmented-control)\s*\{/, '主题页不得重复定义基础控件样式');
 assert.match(settingsPanel, /ui-segmented mcp-transport-switch/, 'MCP 传输模式必须复用全局分段控件');
 assert.match(settingsPanel, /class="form-input"[\s\S]*?class="form-textarea"/, '设置弹窗必须显式复用全局表单控件');

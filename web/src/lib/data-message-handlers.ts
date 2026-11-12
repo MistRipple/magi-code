@@ -1139,7 +1139,7 @@ function reconcileRuntimeStateFromCanonicalTurns(sessionId: string): void {
     ? messagesState.orchestratorRuntimeState : null;
   if (!mainline) {
     if (current) replaceOrchestratorRuntimeState({
-      sessionId, status: 'idle', phase: 'idle', assignments: [],
+      sessionId, status: 'idle', phase: 'idle',
       statusChangedAt: current.statusChangedAt, lastEventAt: current.lastEventAt,
       runtimeSnapshot: current.runtimeSnapshot,
     });
@@ -1148,7 +1148,7 @@ function reconcileRuntimeStateFromCanonicalTurns(sessionId: string): void {
   // continuation 是 daemon 对“当前这次停止”的判定，轮次数据推不出它：
   // 换轮时清掉原轮次诊断和资格，只保留会话最近一次上下文压力观测。
   const { continuation, ...retained } = current && current.turnId === mainline.turnId
-    ? current : { assignments: [], runtimeSnapshot: current?.runtimeSnapshot, continuation: undefined };
+    ? current : { runtimeSnapshot: current?.runtimeSnapshot, continuation: undefined };
   const stillStopped = mainline.status === 'failed' || mainline.status === 'cancelled';
   replaceOrchestratorRuntimeState({
     ...retained,

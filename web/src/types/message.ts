@@ -22,49 +22,6 @@ export type OrchestrationRuntimeStateStatus =
   | 'failed'
   | 'cancelled';
 
-export interface OrchestrationRuntimeAssignmentSummary {
-  assignmentId: string;
-  workerId?: string;
-  title: string;
-  status: string;
-  progress: number;
-  taskTotal: number;
-  awaitingApprovalTaskCount: number;
-  reviewRequiredTaskCount: number;
-  blockedTaskCount: number;
-  completedTaskCount: number;
-  failedTaskCount: number;
-  runningTaskCount: number;
-  trace?: unknown;
-}
-
-export interface OrchestrationRuntimeTimelineEntry {
-  eventId: string;
-  seq: number;
-  timestamp: number;
-  type: string;
-  summary: string;
-  kind?: 'progress' | 'success' | 'warning' | 'error';
-  source?: string;
-  detail?: string;
-  diffCount: number;
-  trace?: unknown;
-}
-
-export interface OrchestrationRuntimeRecoverySummary {
-  continuationPolicy?: string;
-  continuationReason?: string;
-  latestRecoveryAt?: number;
-  pendingTaskCount?: number;
-  runningTaskCount?: number;
-  completedTaskCount?: number;
-}
-
-export interface OrchestrationRuntimeOpsView {
-  recentTimeline: OrchestrationRuntimeTimelineEntry[];
-  recovery?: OrchestrationRuntimeRecoverySummary;
-}
-
 // --- 从 types.ts 内联 UIProcessingState ---
 
 export type MessageSource = 'orchestrator' | 'system' | string;
@@ -366,8 +323,6 @@ export interface OrchestratorRuntimeState {
   lastEventAt: number;
   endedAt?: number;
   runtimeSnapshot?: OrchestratorRuntimeSnapshot | null;
-  assignments: OrchestrationRuntimeAssignmentSummary[];
-  opsView?: OrchestrationRuntimeOpsView | null;
 }
 
 // 单条消息
@@ -616,62 +571,6 @@ export interface ScrollAnchors {
 
 // 任务状态
 export type TaskStatus = 'pending' | 'paused' | 'running' | 'completed' | 'failed' | 'cancelled';
-export type DeliveryStatus = 'pending' | 'passed' | 'failed' | 'blocked' | 'skipped';
-
-// 子任务状态（对齐后端 SubTaskViewStatus）
-export type SubTaskStatus =
-  | 'pending'
-  | 'waiting_deps'
-  | 'review_required'
-  | 'awaiting_approval'
-  | 'running'
-  | 'paused'
-  | 'completed'
-  | 'failed'
-  | 'skipped'
-  | 'blocked'
-  | 'cancelled'
-  | 'in_progress'; // 增量事件可能发送此值
-
-// 子任务（对齐后端 TaskItemView）
-export interface SubTaskItem {
-  id: string;
-  description: string;
-  title?: string;
-  assignedWorker: string;
-  assignmentId: string;
-  source?: string;
-  status: SubTaskStatus;
-  progress: number;
-  priority: number;
-  approvalStatus?: 'pending' | 'approved' | 'rejected';
-  approvalSeverity?: 'medium' | 'high' | 'critical';
-  approvalNote?: string;
-  reviewStatus?: 'approved' | 'needs_revision' | 'rejected';
-  reviewFeedback?: string;
-  targetFiles: string[];
-  modifiedFiles?: string[];
-  error?: string;
-  startedAt?: number;
-  completedAt?: number;
-}
-
-// 任务（对齐后端 TaskView）
-export interface Task {
-  id: string;
-  name: string;
-  prompt?: string;
-  description?: string;
-  status: TaskStatus;
-  deliveryStatus?: DeliveryStatus;
-  deliverySummary?: string;
-  deliveryDetails?: string;
-  deliveryWarnings?: string[];
-  subTasks: SubTaskItem[];
-  progress: number;
-  executionGroupId: string;
-  failureReason?: string;
-}
 
 // 编辑/变更记录
 export type EditType = 'add' | 'modify' | 'delete' | 'rename';

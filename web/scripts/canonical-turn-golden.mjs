@@ -72,8 +72,6 @@ function assertContinuationStaysWithItsTurn(dataHandlers, messagesStore, turnSto
   const previousRuntime = messagesStore.messagesState.orchestratorRuntimeState;
   assert.equal(previousRuntime.turnId, old.turnId);
   assert.equal(previousRuntime.continuation, 'resume_turn');
-  assert.equal(previousRuntime.assignments.length, 1);
-  assert.equal(previousRuntime.opsView.recovery.pendingTaskCount, 1);
   const budget = structuredClone(previousRuntime.runtimeSnapshot);
 
   // 未收到新轮次的 running 事件，直接收到完整失败事实，也不能继承上一次停止的资格。
@@ -89,12 +87,9 @@ function assertContinuationStaysWithItsTurn(dataHandlers, messagesStore, turnSto
   const runtime = () => messagesStore.messagesState.orchestratorRuntimeState;
   assert.equal(runtime().turnId, next.turnId);
   assert.equal(runtime().continuation, undefined, '新停止必须等待本轮 daemon 判定');
-  assert.deepEqual(runtime().assignments, [], '新轮次不能保留旧代理摘要');
-  assert.equal(runtime().opsView, undefined, '旧恢复诊断不能被带到新轮次');
   assert.deepEqual(runtime().runtimeSnapshot, budget, '会话最近一次上下文观测仍可供输入区展示');
   applySnapshot(oldSnapshot, 2);
   assert.equal(runtime().continuation, undefined, '旧停止快照不能授予新轮次继续资格');
-  assert.equal(runtime().opsView, undefined);
 
   applySnapshot(newSnapshot, 3);
   assert.equal(runtime().continuation, 'resume_turn', '同轮次权威快照可以提供继续资格');
@@ -368,7 +363,6 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertParallelAgentSpawnUsesTaskIdTabs(reducer, projection, timelineRenderItems);
   assertAgentTerminalOutputExtractsFinalText(agentOutput);
   assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
-  assertBootstrapCountsOnlySpawnedAgents(contract);
   assertBootstrapProcessingStateIgnoresForeignSessionRunningTurn(contract);
   assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract);
   assertBootstrapDefersPendingChangesProjection(contract);
@@ -4106,75 +4100,6 @@ function assertBootstrapProcessingStateFromRunningCanonicalTurn(contract) {
     bootstrap.state.processingState?.pendingRequestIds,
     ['request-bootstrap-running'],
     'bootstrap should recover only the root request and ignore same-turn guide request ids',
-  );
-}
-
-function assertBootstrapCountsOnlySpawnedAgents(contract) {
-  const c = baseCase(
-    'bootstrap-agent-count',
-    'session-bootstrap-agent-count',
-    'turn-bootstrap-agent-count',
-    7_200,
-  );
-  const rootTaskId = 'task-bootstrap-agent-root';
-  const firstChildTaskId = 'task-bootstrap-agent-child-one';
-  const secondChildTaskId = 'task-bootstrap-agent-child-two';
-  const bootstrap = contract.normalizeRustBootstrapPayload({
-    generatedAt: 7_300,
-    currentSession: {
-      sessionId: c.sessionId,
-      title: '代理计数',
-      createdAt: 7_200,
-      updatedAt: 7_300,
-      messageCount: 1,
-    },
-    sessions: [{
-      sessionId: c.sessionId,
-      title: '代理计数',
-      createdAt: 7_200,
-      updatedAt: 7_300,
-      messageCount: 1,
-    }],
-    runtimeReadModel: {
-      details: {
-        assignments: [
-          {
-            assignment_id: 'lease-model-call',
-            mission_id: null,
-            task_ids: [],
-            current_status: null,
-          },
-        ],
-        sessions: [{
-          session_id: c.sessionId,
-          root_task_id: rootTaskId,
-          root_task_status: 'running',
-          active_branches: [
-            { task_id: rootTaskId, worker_id: 'coordinator', status: 'running', is_primary: true },
-            { task_id: firstChildTaskId, worker_id: 'explorer-one', status: 'running', is_primary: false },
-            { task_id: secondChildTaskId, worker_id: 'explorer-two', status: 'completed', is_primary: false },
-          ],
-        }],
-        tasks: [
-          { task_id: rootTaskId, title: '主线任务', current_status: 'running' },
-          { task_id: firstChildTaskId, title: '文档探索', current_status: 'running' },
-          { task_id: secondChildTaskId, title: '配置检查', current_status: 'completed' },
-        ],
-      },
-    },
-  }, { sessionId: c.sessionId });
-
-  const assignments = bootstrap.orchestratorRuntimeState?.assignments ?? [];
-  assert.deepEqual(
-    assignments.map((assignment) => assignment.assignmentId),
-    [firstChildTaskId, secondChildTaskId],
-    'runtime agent count must exclude the primary coordinator branch',
-  );
-  assert.equal(assignments.length, 2, 'two spawned agents must render as two agents');
-  assert.equal(
-    assignments.some((assignment) => assignment.assignmentId === 'lease-model-call'),
-    false,
-    'model call lease must not be counted as a spawned agent',
   );
 }
 

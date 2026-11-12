@@ -1794,7 +1794,6 @@ function applyContextBudgetRuntimeEvent(event: RustEventEnvelope): void {
       phase: 'idle',
       statusChangedAt: eventAt,
       lastEventAt: eventAt,
-      assignments: [],
     }),
     sessionId: rustEventSessionId(event) || currentSessionId || current?.sessionId,
     lastEventAt: Math.max(current?.lastEventAt ?? 0, eventAt),
