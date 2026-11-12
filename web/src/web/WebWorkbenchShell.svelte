@@ -5,6 +5,7 @@
   $effect(() => { document.documentElement.lang = i18n.locale; });
   import { onMount, tick, untrack, type Component } from 'svelte';
   import App from '../App.svelte';
+  import SessionActivityIndicator from '../components/SessionActivityIndicator.svelte';
   import { personalSessionList } from '../lib/personal-sessions';
   import { workspacePathHints } from '../lib/workspace-display';
   import { beginPanelResize } from '../lib/panel-resize';
@@ -3363,9 +3364,15 @@ import {
                                   aria-label={session.name === externalSession.clientName ? session.name : `${session.name} · ${externalSession.clientName}`}
                                   onclick={() => openExternalSessionIn(workspace, externalSession.sessionId)}
                                 >
-                                  <span class="external-dot" class:running={externalSession.running > 0 && awaiting === 0} class:awaiting={awaiting > 0} aria-hidden="true">
-                                    <Icon name="plug" size={12} />
-                                  </span>
+                                  {#if awaiting > 0}
+                                    <SessionActivityIndicator state="awaiting" />
+                                  {:else if externalSession.running > 0}
+                                    <SessionActivityIndicator state="running" />
+                                  {:else}
+                                    <span class="external-dot" aria-hidden="true">
+                                      <Icon name="plug" size={12} />
+                                    </span>
+                                  {/if}
                                   <span class="session-name">{session.name}</span>
                                   <span class="session-meta external-session-meta">
                                     {#if awaiting > 0}
@@ -3444,12 +3451,7 @@ import {
                                 title={session.name || i18n.t('header.unnamedSession')}
                                 onclick={() => switchSession(workspace, session.id)}
                               >
-                                <span
-                                  class="session-running-dot"
-                                  class:running={sessionIndicator === 'running'}
-                                  class:unread={sessionIndicator === 'unread'}
-                                  aria-hidden="true"
-                                ></span>
+                                <SessionActivityIndicator state={sessionIndicator} />
                                 <span class="session-name">{session.name || i18n.t('header.unnamedSession')}</span>
                                 {#if isSessionIsolated(session.id)}
                                   <span class="session-isolated-mark" title={i18n.t('isolation.sidebar.badge')} aria-label={i18n.t('isolation.sidebar.badge')}>
@@ -3650,9 +3652,7 @@ import {
                     </div>
                   {:else}
                     <button type="button" class="session-item personal-session-item" class:active={sessionSelected} class:pending={session.id === pendingSessionSwitchId && (pendingSessionSwitchWorkspaceId || '') === (session.workspaceId || '')} data-session-id={session.id} aria-current={sessionSelected ? 'page' : undefined} aria-label={sessionActivityLabel ? `${sessionLabel}, ${sessionActivityLabel}` : sessionLabel} title={sessionLabel} onclick={() => switchPersonalSession(session.id)}>
-                      <span class="personal-session-indicator" class:running={sessionIndicator === 'running'} class:unread={sessionIndicator === 'unread'} title={sessionActivityLabel || undefined} aria-hidden="true">
-                        {#if sessionIndicator === 'running'}<Icon name="loader" size={12} />{/if}
-                      </span>
+                      <SessionActivityIndicator state={sessionIndicator} title={sessionActivityLabel} />
                       <span class="session-name personal-session-name">{sessionLabel}</span>
                       <span class="session-meta personal-session-meta"><span class="session-time">{formatRelativeTime(session.updatedAt || session.createdAt, relativeTimeNow, i18n.locale)}</span></span>
                     </button>
@@ -4684,28 +4684,6 @@ import {
     line-height: 20px;
   }
 
-  .personal-session-indicator {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex: 0 0 12px;
-    width: 12px;
-    height: 20px;
-    color: var(--info);
-  }
-
-  .personal-session-indicator.running :global(svg) {
-    animation: personal-session-spin 1.2s linear infinite;
-  }
-
-  .personal-session-indicator.unread::before {
-    content: '';
-    width: 5px;
-    height: 5px;
-    border-radius: var(--radius-full);
-    background: var(--foreground-muted);
-  }
-
   .personal-session-row .personal-session-meta {
     min-width: 54px;
     line-height: 20px;
@@ -4736,10 +4714,6 @@ import {
       opacity: 0;
       pointer-events: none;
     }
-  }
-
-  @keyframes personal-session-spin {
-    to { transform: rotate(360deg); }
   }
 
 
@@ -4780,21 +4754,8 @@ import {
     color: var(--foreground-muted);
   }
 
-  .external-dot.running {
-    color: var(--primary);
-    animation: external-pulse 1.4s ease-in-out infinite;
-  }
-
-  .external-dot.awaiting {
-    color: var(--warning);
-  }
-
   .external-session-meta {
     font-variant-numeric: tabular-nums;
-  }
-
-  @keyframes external-pulse {
-    50% { opacity: 0.35; }
   }
 
   .session-row:hover .session-actions,
@@ -4835,88 +4796,6 @@ import {
   .session-item.unavailable-session-item {
     cursor: default;
     color: var(--foreground-muted);
-  }
-
-  .session-running-dot {
-    position: relative;
-    width: 14px;
-    height: 14px;
-    border-radius: var(--radius-full);
-    background: transparent;
-    opacity: 0;
-    flex-shrink: 0;
-  }
-
-  .session-running-dot.running,
-  .session-running-dot.unread {
-    opacity: 1;
-  }
-
-  .session-running-dot.running::before,
-  .session-running-dot.running::after,
-  .session-running-dot.unread::before {
-    content: '';
-    position: absolute;
-    inset: 50% auto auto 50%;
-    border-radius: var(--radius-full);
-    transform: translate(-50%, -50%);
-    pointer-events: none;
-  }
-
-  .session-running-dot.running::before {
-    width: 6px;
-    height: 6px;
-    background: var(--info);
-    box-shadow: 0 0 8px color-mix(in srgb, var(--info) 58%, transparent);
-    z-index: 1;
-    animation: session-running-core-breath 1.8s ease-in-out infinite;
-  }
-
-  .session-running-dot.running::after {
-    width: 6px;
-    height: 6px;
-    background: color-mix(in srgb, var(--info) 32%, transparent);
-    box-shadow:
-      0 0 0 1px color-mix(in srgb, var(--info) 52%, transparent),
-      0 0 8px color-mix(in srgb, var(--info) 46%, transparent);
-    animation: session-running-breath 1.8s cubic-bezier(0.2, 0.55, 0.35, 1) infinite;
-  }
-
-  .session-running-dot.unread::before {
-    width: 6px;
-    height: 6px;
-    background: var(--success);
-    box-shadow: 0 0 7px color-mix(in srgb, var(--success) 42%, transparent);
-  }
-
-  @keyframes session-running-breath {
-    0% {
-      opacity: 0.78;
-      transform: translate(-50%, -50%) scale(0.7);
-    }
-    48% {
-      opacity: 0.34;
-      transform: translate(-50%, -50%) scale(1.8);
-    }
-    82% {
-      opacity: 0;
-      transform: translate(-50%, -50%) scale(2.8);
-    }
-    100% {
-      opacity: 0;
-      transform: translate(-50%, -50%) scale(2.8);
-    }
-  }
-
-  @keyframes session-running-core-breath {
-    0%, 100% {
-      opacity: 0.72;
-      box-shadow: 0 0 4px color-mix(in srgb, var(--info) 38%, transparent);
-    }
-    50% {
-      opacity: 1;
-      box-shadow: 0 0 10px color-mix(in srgb, var(--info) 78%, transparent);
-    }
   }
 
 

@@ -89,6 +89,10 @@ const shellSource = await readFile(
   new URL('../src/web/WebWorkbenchShell.svelte', import.meta.url),
   'utf8',
 );
+const globalStyle = await readFile(
+  new URL('../src/styles/global.css', import.meta.url),
+  'utf8',
+);
 const bridgeSource = await readFile(
   new URL('../src/shared/bridges/web-client-bridge.ts', import.meta.url),
   'utf8',
@@ -209,35 +213,49 @@ assert.match(
   /markAgentSessionViewed\([\s\S]*?hasUnreadCompletion: false/,
   '成功标记已查看后必须同步清除本地未读完成状态',
 );
-assert.match(
-  shellSource,
-  /class:running=\{sessionIndicator === 'running'\}[\s\S]*?class:unread=\{sessionIndicator === 'unread'\}/,
-  '会话指示灯必须分别渲染运行和未读完成状态',
+const indicatorSource = await readFile(
+  new URL('../src/components/SessionActivityIndicator.svelte', import.meta.url),
+  'utf8',
 );
-assert.match(
-  shellSource,
-  /\.session-running-dot\.unread::before[\s\S]*?background: var\(--success\);/,
-  '未读完成状态必须使用绿色常亮灯',
-);
-assert.match(
-  shellSource,
-  /\.session-running-dot\.running::before[\s\S]*?animation: session-running-core-breath/,
-  '运行状态必须让蓝色核心灯持续执行呼吸动画',
-);
-assert.match(
-  shellSource,
-  /\.session-running-dot\.running::after[\s\S]*?background: color-mix\(in srgb, var\(--info\) 32%, transparent\)[\s\S]*?animation: session-running-breath/,
-  '运行状态必须使用可见的蓝色扩散光晕',
-);
-assert.match(
-  shellSource,
-  /@keyframes session-running-breath[\s\S]*?scale\(2\.8\)/,
-  '运行状态的扩散光晕必须具有足够的扩散范围',
+assert.equal(
+  (shellSource.match(/<SessionActivityIndicator\b/g) ?? []).length,
+  4,
+  '项目会话、无项目会话和外部会话（运行、等待）必须共用同一个会话指示组件',
 );
 assert.doesNotMatch(
   shellSource,
-  /prefers-reduced-motion[\s\S]*?session-running-dot\.running/,
-  '运行状态指示灯不能因系统动画偏好而失去状态动画',
+  /session-running-dot|personal-session-indicator|external-pulse/,
+  '侧栏不能保留第二套会话运行指示实现',
+);
+assert.match(
+  indicatorSource,
+  /\.session-activity-indicator\.unread::before[\s\S]*?background: var\(--success\);/,
+  '未读完成状态必须使用绿色常亮灯',
+);
+assert.match(
+  indicatorSource,
+  /\.session-activity-indicator\.awaiting::before[\s\S]*?background: var\(--warning\);/,
+  '等待确认状态必须使用黄色常亮灯',
+);
+assert.match(
+  indicatorSource,
+  /\.session-activity-indicator\.running :global\(svg\) \{\s*animation: magi-status-spin 1\.2s linear infinite;/,
+  '运行状态只用匀速旋转表达',
+);
+assert.doesNotMatch(
+  indicatorSource,
+  /breath|pulse/,
+  '运行状态不能叠加呼吸或脉冲动画',
+);
+assert.match(
+  indicatorSource,
+  /prefers-reduced-motion: reduce[\s\S]*?animation-iteration-count: infinite !important/,
+  '运行状态的旋转不能因系统减少动态效果而停止',
+);
+assert.doesNotMatch(
+  globalStyle,
+  /session-activity-indicator|personal-session-indicator|session-running-dot/,
+  '全局降级规则不能再把会话运行指示改成呼吸',
 );
 assert.match(
   bridgeSource,

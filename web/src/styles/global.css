@@ -1986,18 +1986,15 @@ strong, b { font-weight: var(--font-bold); }
     .generated-image-progress > span, .ia-context-ring.estimating .ring-fill,
     .notice-icon.compacting, .ia-context-picker-loading svg, .loading-dot,
     .agent-cursor-dots span, .update-status-action-icon--spinning,
-    .update-status-progress-ring--indeterminate, .personal-session-indicator.running svg,
-    .external-dot.running, .streaming-badge, .image-tray-pending
+    .update-status-progress-ring--indeterminate,
+    .streaming-badge, .image-tray-pending
   ),
   .conversation-process-row.streaming .process-marker::before,
   .turn-navigation-marker.running::before,
-  .turn-navigation-status-dot.running,
-  .session-running-dot.running::before {
+  .turn-navigation-status-dot.running {
     animation-name: magi-status-pulse !important;
     animation-duration: 1.8s !important;
     animation-iteration-count: infinite !important;
     animation-timing-function: ease-in-out !important;
   }
-
-  .session-running-dot.running::after { display: none; }
 }

@@ -250,7 +250,7 @@ app.whenReady().then(() => { const win = new BrowserWindow({ show: false, webPre
   assert.equal(pending.disabled, false, pending.title);
   const sessionId = await page.evaluate(`document.querySelector('#personal-session-content .session-item.active[data-session-id]')?.getAttribute('data-session-id')`);
   assert.ok(sessionId, "队列验收需要当前真实会话身份");
-  await waitFor(() => page.evaluate(`!!document.querySelector('[data-session-id="${sessionId}"] .personal-session-indicator.running')`), '运行中的会话显示运行灯');
+  await waitFor(() => page.evaluate(`!!document.querySelector('[data-session-id="${sessionId}"] .session-activity-indicator.running')`), '运行中的会话显示运行灯');
   const readQueue = async () => {
     const response = await fetch(`${origin}/api/session/queue?sessionId=${encodeURIComponent(sessionId)}`);
     assert.equal(response.status, 200);
@@ -387,7 +387,7 @@ app.whenReady().then(() => { const win = new BrowserWindow({ show: false, webPre
   assert.ok(replacementTurns[2].items.some(item => item.kind === 'user_message' && item.content.includes('REPLACE_FIFO')));
   assert.equal((await queue()).length, 0);
 
-  await waitFor(() => page.evaluate(`!!document.querySelector('[data-session-id="${sessionId}"] .personal-session-indicator:not(.running)')`), '停止并换轮完成后，个人会话运行灯熄灭');
+  await waitFor(() => page.evaluate(`!!document.querySelector('[data-session-id="${sessionId}"] .session-activity-indicator:not(.running)')`), '停止并换轮完成后，个人会话运行灯熄灭');
 
   const readGoal = async () => {
     const response = await fetch(`${origin}/api/goals/current?scope=personal&sessionId=${encodeURIComponent(sessionId)}`);
