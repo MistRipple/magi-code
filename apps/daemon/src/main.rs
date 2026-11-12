@@ -8,7 +8,7 @@ use std::{env, path::PathBuf, process};
 use magi_daemon::{Daemon, DaemonConfig};
 use magi_runtime_state::{RuntimeStateManager, default_state_root};
 
-const DEFAULT_HOST: &str = "0.0.0.0";
+const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 38123;
 const DEFAULT_SERVICE_NAME: &str = "magi-rust-backend";
 

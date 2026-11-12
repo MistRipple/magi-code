@@ -7,9 +7,9 @@
 ## 运行与验收
 
 - Web、Rust daemon 的日常开发和真实浏览器验收都通过 `./scripts/dev-daemon.sh`。主入口是 `http://127.0.0.1:38123/web.html`；API、SSE、会话、任务和设置请求应回到同一个 daemon。
-- daemon 开启 `MAGI_WEB_DEV=1` 后会复用或启动 Vite。Vite 默认监听 `0.0.0.0:3000`，但它只是 daemon 托管的模块热加载后端，不是产品或浏览器验收入口。
+- daemon 开启 `MAGI_WEB_DEV=1` 后会复用或启动 Vite。Vite 默认监听 `127.0.0.1:3000`，但它只是 daemon 托管的模块热加载后端，不是产品或浏览器验收入口。
 - 除了孤立调试 Vite 配置，不要直接运行 `npm --prefix web run dev`。该入口当前会失败退出。不要让 Vite 改用 `3001` 等漂移端口；先确认已有 daemon/Vite，再处理占用。
-- 可通过 `MAGI_WEB_DEV_HOST`、`MAGI_WEB_DEV_PORT`、`MAGI_WEB_DEV_ROOT` 调整 Vite；通过 `MAGI_HOST`、`MAGI_PORT`、`MAGI_STATE_ROOT` 调整 daemon。端口调整从 `./scripts/dev-daemon.sh` 启动。
+- 可通过 `MAGI_WEB_DEV_HOST`、`MAGI_WEB_DEV_PORT`、`MAGI_WEB_DEV_ROOT` 调整 Vite；通过 `MAGI_HOST`、`MAGI_PORT`、`MAGI_STATE_ROOT` 调整 daemon。daemon 与 Vite 默认都只监听回环；daemon 的 API 没有访问者身份认证，要让局域网设备访问时需显式设置 `MAGI_HOST` 与 `MAGI_WEB_DEV_HOST`，并自行承担该风险（Vite 会把 `/api` 代理到 daemon，只开放其一等于开放全部）。端口调整从 `./scripts/dev-daemon.sh` 启动。
 - 真实验收按需确认 `curl -I http://127.0.0.1:38123/web.html` 和 `curl http://127.0.0.1:38123/health`，然后在 daemon 主入口检查用户流程。
 - 生产近似验证使用静态模式：先 `npm --prefix web run build`，再运行 `cargo run -p magi-daemon-app`。
 
