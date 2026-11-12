@@ -7,6 +7,7 @@
   import type { InstalledPluginProjection } from '../web/plugin-api';
   import type { PluginManifest, PluginRuntimeStatus } from '../shared/app-server-protocol.generated';
   import { permissionText, installedUpstreamRequest, pluginSettingsTab, type StoreItem } from '../lib/plugin-store';
+  import { cachedUpstreamBadge } from '../lib/plugin-upstream-cache';
   import Icon from './Icon.svelte';
   import PluginIcon from './PluginIcon.svelte';
   import PluginImpactNotices from './PluginImpactNotices.svelte';
@@ -42,6 +43,20 @@
   const translationRuntime = $derived(plugin?.translationRuntime);
   const runtimeUpdate = $derived(translationRuntime?.state === 'updateAvailable' && item.upstream?.state !== 'updatable');
   const versionUpdate = $derived(item.catalog?.state === 'updatable' ? item.catalog.version : item.upstream?.state === 'updatable' ? item.upstream.version : null);
+
+  /**
+   * 上游徽标：生态来自已安装记录，立即可用；发布者与“官方/第三方”来自上游搜索结果，
+   * 已见过的包用缓存补上，避免进入页面后徽标晚一步出现、页面跳动。
+   */
+  const upstreamBadges = $derived.by(() => {
+    if (item.upstream) {
+      return { ecosystem: item.upstream.ecosystem, official: item.upstream.official as boolean | null, publisher: item.upstream.publisher };
+    }
+    const request = plugin ? installedUpstreamRequest(plugin) : null;
+    if (!request) return null;
+    const cached = request.package ? cachedUpstreamBadge(request.ecosystem, request.package) : null;
+    return { ecosystem: request.ecosystem, official: cached ? cached.official : null, publisher: cached?.publisher ?? '' };
+  });
 
   function sourceLabel(installed: InstalledPluginProjection): string {
     return i18n.t(`settings.plugins.source.${installed.source.kind}`);
@@ -83,13 +98,15 @@
       {#if item.updatable}<span class="settings-chip settings-chip--accent">{i18n.t('settings.plugins.status.updatable')}</span>{/if}
     </div>
     <div class="pane-id settings-mono">{item.upstream && !plugin ? item.upstream.package : item.id}</div>
-    {#if item.upstream}
+    {#if upstreamBadges}
       <div class="settings-chips pane-upstream" data-testid="plugin-upstream-badges">
-        <span class="settings-chip">{i18n.t(`settings.plugins.upstream.ecosystem.${item.upstream.ecosystem}`)}</span>
-        <span class="settings-chip" class:settings-chip--ok={item.upstream.official}>
-          {item.upstream.official ? i18n.t('settings.plugins.upstream.official') : i18n.t('settings.plugins.upstream.thirdParty')}
-        </span>
-        {#if item.upstream.publisher}<span class="settings-chip">{i18n.t('settings.plugins.upstream.publisher')}：{item.upstream.publisher}</span>{/if}
+        <span class="settings-chip">{i18n.t(`settings.plugins.upstream.ecosystem.${upstreamBadges.ecosystem}`)}</span>
+        {#if upstreamBadges.official !== null}
+          <span class="settings-chip" class:settings-chip--ok={upstreamBadges.official}>
+            {upstreamBadges.official ? i18n.t('settings.plugins.upstream.official') : i18n.t('settings.plugins.upstream.thirdParty')}
+          </span>
+        {/if}
+        {#if upstreamBadges.publisher}<span class="settings-chip">{i18n.t('settings.plugins.upstream.publisher')}：{upstreamBadges.publisher}</span>{/if}
       </div>
     {/if}
   </header>

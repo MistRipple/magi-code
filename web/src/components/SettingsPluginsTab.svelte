@@ -27,10 +27,12 @@
   import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
   import { openSettings, shellUi } from '../stores/shell-ui.svelte';
   import { permissionText, buildStoreItems, filterStoreItems, installedUpstreamRequest, paginate, storeGroup, type StoreFilter, type StoreGroup, type StoreItem } from '../lib/plugin-store';
-  import { pluginRegistryRevision } from '../stores/plugin-registry.svelte';
+  import { pluginRegistryRevision, pluginProjection } from '../stores/plugin-registry.svelte';
+  import { cachedUpstreamProjection, rememberUpstreamProjection } from '../lib/plugin-upstream-cache';
   import type { PluginCandidatePreview, PluginEcosystem, PluginUpstreamRequest, PluginCenterProjection, PluginList, PluginManifest, PluginUpstreamPreview, PluginUpstreamProjection } from '../shared/app-server-protocol.generated';
 
-  let list = $state<PluginList | null>(null);
+  // 先用全局投影里已有的已安装插件起步，进入页面时列表不是空的，也不需要等一次请求。
+  let list = $state<PluginList | null>(pluginProjection().loaded ? { plugins: pluginProjection().installed } : null);
   let address = $state('');
   let busy = $state(false);
   let busyLabel = $state('');
@@ -55,6 +57,8 @@
   let staged = $state<Staged | null>(null);
   let upstream = $state<PluginUpstreamProjection | null>(null);
   let upstreamSeq = 0;
+  /** 当前 `upstream` 对应的搜索词；搜索词不变时的刷新沿用已有结果。 */
+  let upstreamQuery: string | null = null;
   let upstreamLoading = $state(false);
   let searchRetry = $state(0);
   const plugins = $derived(list?.plugins ?? []);
@@ -96,10 +100,13 @@
   async function refreshUpstream(text: string, requestSeq: number, signal: AbortSignal): Promise<void> {
     try {
       const next = await searchUpstreamPlugins(text, signal);
-      if (requestSeq === upstreamSeq) upstream = next;
+      if (requestSeq !== upstreamSeq) return;
+      upstream = next;
+      rememberUpstreamProjection(text, next);
     } catch (error) {
       if (signal.aborted || requestSeq !== upstreamSeq) return;
-      upstream = { registry: upstream?.registry ?? '', entries: [], error: describe(error) };
+      // 静默刷新失败时保留已有内容，只附上错误；不能让列表被清空。
+      upstream = { registry: upstream?.registry ?? '', entries: upstream?.entries ?? [], error: describe(error) };
     } finally {
       if (requestSeq === upstreamSeq) upstreamLoading = false;
     }
@@ -321,7 +328,14 @@
     void searchRetry;
     const requestSeq = ++upstreamSeq;
     const controller = new AbortController();
-    untrack(() => { upstream = null; upstreamLoading = true; });
+    // 只有用户输入了搜索词、且还没有这个搜索词的结果时才显示“搜索中”。
+    // 进入页面、窗口重新获得焦点、安装/卸载后的刷新都是后台刷新：沿用已有结果，不出现搜索状态。
+    const cached = cachedUpstreamProjection(text);
+    untrack(() => {
+      upstream = cached ?? (upstreamQuery === text ? upstream : null);
+      upstreamQuery = text;
+      upstreamLoading = Boolean(text) && !cached;
+    });
     const timer = setTimeout(() => void refreshUpstream(text, requestSeq, controller.signal), text ? 350 : 0);
     return () => { clearTimeout(timer); controller.abort(); };
   });
@@ -382,7 +396,7 @@
       <div class="settings-notice settings-notice--warn store-center-error" data-testid="plugin-upstream-error" role="status">
         <Icon name="alert-triangle" size={14} />
         <span>{i18n.t('settings.plugins.upstream.searchFailed', { reason: upstream.error })}</span>
-        <button class="btn btn--sm btn--secondary" onclick={() => { searchRetry += 1; }}>{i18n.t('settings.plugins.center.retry')}</button>
+        <button class="btn btn--sm btn--secondary" onclick={() => { upstream = null; searchRetry += 1; }}>{i18n.t('settings.plugins.center.retry')}</button>
       </div>
     {/if}
     {#if center?.error || centerFailure}
@@ -461,9 +475,9 @@
               </button>
             {/each}
           {:else}
-            <div class="settings-empty" role={upstreamLoading ? 'status' : undefined}>
-              {#if upstreamLoading}<Icon name="loader" class="spinning" size={14} />{/if}
-              <span>{upstreamLoading ? i18n.t('settings.plugins.store.searching') : items.length === 0 ? i18n.t('settings.plugins.empty') : i18n.t('settings.plugins.store.noMatch')}</span>
+            <div class="settings-empty" role={upstreamLoading || !list ? 'status' : undefined}>
+              {#if upstreamLoading || !list}<Icon name="loader" class="spinning" size={14} />{/if}
+              <span>{upstreamLoading ? i18n.t('settings.plugins.store.searching') : !list ? i18n.t('common.loading') : items.length === 0 ? i18n.t('settings.plugins.empty') : i18n.t('settings.plugins.store.noMatch')}</span>
             </div>
           {/each}
         </div>

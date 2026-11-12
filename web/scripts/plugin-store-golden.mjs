@@ -118,5 +118,21 @@ await withGoldenViteServer(async (server) => {
     assert.equal(filterStoreItems(buildStoreItems([current], [], [], text), 'updatable', '').length, 0);
     assert.equal(installedUpstreamRequest(installed('local')), null);
   }
+  // 上游搜索结果缓存：重新进入页面先显示上一次结果；失败结果不覆盖；已见过的发布者信息跨会话保留。
+  {
+    const store = new Map();
+    globalThis.window = { localStorage: { getItem: (key) => store.get(key) ?? null, setItem: (key, value) => { store.set(key, value); } } };
+    const { cachedUpstreamProjection, rememberUpstreamProjection, cachedUpstreamBadge } = await server.ssrLoadModule('/src/lib/plugin-upstream-cache.ts');
+    assert.equal(cachedUpstreamProjection(''), null);
+    assert.equal(cachedUpstreamBadge('dsh', 'dsh-x'), null);
+    rememberUpstreamProjection('', { registry: 'r', entries: [upstream({ publisher: 'dmh2002', official: false })] });
+    assert.equal(cachedUpstreamProjection('').entries.length, 1);
+    assert.deepEqual(cachedUpstreamBadge('dsh', 'dsh-x'), { publisher: 'dmh2002', official: false });
+    rememberUpstreamProjection('', { registry: 'r', entries: [], error: 'offline' });
+    assert.equal(cachedUpstreamProjection('').entries.length, 1, '失败的刷新不能覆盖上一次可用的结果');
+    assert.equal(cachedUpstreamProjection('other'), null);
+    assert.match(store.get('magi.plugin-upstream-badges.v1'), /dmh2002/);
+    delete globalThis.window;
+  }
   console.log('plugin-store golden passed');
 });
