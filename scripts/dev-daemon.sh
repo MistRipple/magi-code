@@ -72,8 +72,9 @@ DAEMON_ENV=(
   "MAGI_BUILD_ID=$BUILD_ID"
 )
 
-# 若开发目录已有经校验的固定版本 Node，自动接入它；发行包仍使用
-# daemon 同级的 node/ 目录，未准备开发运行时时保持原有失败提示。
+# 若开发目录已有桌面构建脚本准备并校验过（按 node-runtime.json 固定的摘要）的
+# 固定版本 Node，自动接入它；发行包仍使用 daemon 同级的 node/ 目录，
+# 未准备开发运行时时保持原有失败提示。
 if [ -z "${MAGI_EXTENSION_NODE:-}" ] && [ -x "$ROOT_DIR/apps/desktop/dist/node-runtime/node" ]; then
   DAEMON_ENV+=("MAGI_EXTENSION_NODE=$ROOT_DIR/apps/desktop/dist/node-runtime/node")
 fi
