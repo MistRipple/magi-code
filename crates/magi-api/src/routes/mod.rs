@@ -526,9 +526,7 @@ fn resolve_bootstrap_scope(
     })
 }
 
-fn trimmed_query_param(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
-}
+use crate::scope_binding::trimmed_non_empty as trimmed_query_param;
 
 async fn runtime_read_model(State(state): State<ApiState>) -> Json<RuntimeReadModelDto> {
     Json(state.runtime_read_model_dto())

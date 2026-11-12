@@ -271,10 +271,7 @@ fn public_local_instruction_skill_entry(entry: &serde_json::Value) -> serde_json
 }
 
 fn epoch_ms_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    magi_core::UtcMillis::now().0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

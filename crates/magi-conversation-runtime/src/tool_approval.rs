@@ -393,24 +393,7 @@ impl ToolApprovalRegistry {
     /// 模型在同一次用户请求内可能经历多个内部执行子轮，不能在子轮边界清理拒绝记忆；
     /// 只有新的用户请求开始时，才允许相同调用再次进入授权流程。
     pub fn begin_turn(&self, session_id: &SessionId) {
-        if let Ok(mut state) = self.state.lock() {
-            state.pending.retain(|_, entry| {
-                let keep = entry.request.session_id != *session_id;
-                if !keep {
-                    Self::persist_cancel(entry);
-                }
-                keep
-            });
-            state
-                .turn_tool_grants
-                .retain(|grant| grant.session_id != *session_id);
-            state
-                .denied_session_tool_calls
-                .retain(|fingerprint| fingerprint.session_id != *session_id);
-            state
-                .expired
-                .retain(|(expired_session, _), _| expired_session != session_id);
-        }
+        self.remove_session(session_id);
     }
 
     pub fn remove_task(&self, session_id: &SessionId, task_id: &TaskId) {

@@ -216,31 +216,11 @@ impl Default for AgentRoleRegistry {
 
 impl AgentRoleRegistry {
     pub fn empty() -> Self {
-        let snapshot = RegistrySnapshot {
-            roles: HashMap::new(),
-            builtin_ids: HashSet::new(),
-            capabilities: ProfessionalCapabilityRegistry::empty(),
-            registry_revision: 0,
-        };
-        Self {
-            snapshot: Arc::new(RwLock::new(Arc::new(snapshot))),
-            user_role_dir: Arc::new(default_user_role_dir()),
-            mutation_lock: Arc::new(Mutex::new(())),
-        }
+        Self::from_maps(HashMap::new(), ProfessionalCapabilityRegistry::empty())
     }
 
     pub fn from_map(map: HashMap<String, AgentRole>) -> Self {
-        let builtin_ids = map.keys().cloned().collect();
-        Self {
-            snapshot: Arc::new(RwLock::new(Arc::new(RegistrySnapshot {
-                roles: map,
-                builtin_ids,
-                capabilities: ProfessionalCapabilityRegistry::builtin(),
-                registry_revision: 0,
-            }))),
-            user_role_dir: Arc::new(default_user_role_dir()),
-            mutation_lock: Arc::new(Mutex::new(())),
-        }
+        Self::from_maps(map, ProfessionalCapabilityRegistry::builtin())
     }
 
     pub fn from_maps(

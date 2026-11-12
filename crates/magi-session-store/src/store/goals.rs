@@ -104,10 +104,7 @@ fn new_goal_id(session_id: &SessionId, now: UtcMillis) -> DomainResult<GoalId> {
     getrandom::fill(&mut entropy).map_err(|error| DomainError::InvalidState {
         message: format!("failed to generate goal identity: {error}"),
     })?;
-    let entropy = entropy
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let entropy = magi_core::hex_lower(entropy);
     Ok(GoalId::new(format!(
         "goal-{session_id}-{}-{entropy}",
         now.0

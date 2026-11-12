@@ -16,7 +16,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-use crate::{errors::ApiError, session_activity::session_running_task_count, state::ApiState};
+use crate::{
+    errors::ApiError,
+    git_tool_runtime::{path_is_within, same_path, sanitize_component},
+    session_activity::session_running_task_count,
+    state::ApiState,
+};
 
 #[derive(Clone)]
 struct WorkspaceGitScope {
@@ -714,7 +719,7 @@ async fn worktree_create(
             "仓库没有 HEAD，必须显式指定 worktree base commit",
         )));
     };
-    let allocation_key = sanitize_allocation_key(
+    let allocation_key = sanitize_component(
         request
             .allocation_key
             .as_deref()
@@ -1102,44 +1107,6 @@ fn managed_worktree_root(state: &ApiState, scope: &WorkspaceGitScope) -> PathBuf
         .join(scope.workspace_id.as_str())
 }
 
-fn sanitize_allocation_key(value: &str) -> String {
-    let sanitized = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let sanitized = sanitized.trim_matches('-');
-    if sanitized.is_empty() {
-        "allocation".to_string()
-    } else {
-        sanitized.chars().take(80).collect()
-    }
-}
-
-fn path_is_within(path: &Path, root: &Path) -> bool {
-    let candidate = path
-        .canonicalize()
-        .or_else(|_| {
-            path.parent()
-                .ok_or_else(|| std::io::Error::other("path has no parent"))?
-                .canonicalize()
-                .map(|parent| parent.join(path.file_name().unwrap_or_default()))
-        })
-        .unwrap_or_else(|_| path.to_path_buf());
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    candidate.starts_with(root)
-}
-
-fn same_path(left: &Path, right: &Path) -> bool {
-    left.canonicalize().unwrap_or_else(|_| left.to_path_buf())
-        == right.canonicalize().unwrap_or_else(|_| right.to_path_buf())
-}
-
 fn git_internal_error(context: &str, error: GitError) -> ApiError {
     ApiError::InternalAssemblyError(format!("{context}: {error}"))
 }
@@ -1256,9 +1223,9 @@ mod tests {
 
     #[test]
     fn allocation_key_is_path_safe_and_bounded() {
-        assert_eq!(sanitize_allocation_key("session/a b"), "session-a-b");
-        assert_eq!(sanitize_allocation_key("///"), "allocation");
-        assert_eq!(sanitize_allocation_key(&"a".repeat(100)).len(), 80);
+        assert_eq!(sanitize_component("session/a b"), "session-a-b");
+        assert_eq!(sanitize_component("///"), "allocation");
+        assert_eq!(sanitize_component(&"a".repeat(100)).len(), 80);
     }
 
     #[test]

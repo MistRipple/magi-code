@@ -136,15 +136,7 @@ pub fn hash_secret(secret: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"magi-mcp-token-v1:");
     hasher.update(secret.as_bytes());
-    hex(&hasher.finalize())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
+    magi_core::hex_lower(hasher.finalize())
 }
 
 /// 恒定时间比较，避免通过响应时间逐字节猜测哈希。
@@ -162,7 +154,7 @@ pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 fn random_hex(byte_len: usize) -> Result<String, TokenError> {
     let mut bytes = vec![0u8; byte_len];
     getrandom::fill(&mut bytes).map_err(|error| TokenError::Random(error.to_string()))?;
-    Ok(hex(&bytes))
+    Ok(magi_core::hex_lower(bytes))
 }
 
 /// 令牌存储（进程内）。持久化由调用方通过 `records` / `from_records` 完成。

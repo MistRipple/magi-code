@@ -391,7 +391,7 @@ pub(crate) fn resolve_session_workspace_binding(
     Ok(bound_workspace_id)
 }
 
-fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
+pub(crate) fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 

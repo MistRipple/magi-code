@@ -28,6 +28,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    git_tool_runtime::optional_string,
     RuntimeStatePersistence, browser_image::crop_browser_screenshot, errors::ApiError,
     state::ApiState, state::BrowserHostStatusSnapshot,
 };
@@ -2544,15 +2545,6 @@ fn failure_payload_with_status(
 fn string_arg(arguments: &Map<String, Value>, name: &str) -> Result<String, BrowserToolError> {
     optional_string(arguments, name)
         .ok_or_else(|| BrowserToolError::new("invalid_arguments", format!("缺少参数 {name}")))
-}
-
-fn optional_string(arguments: &Map<String, Value>, name: &str) -> Option<String> {
-    arguments
-        .get(name)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 fn screenshot_has_element_scope(arguments: &Map<String, Value>) -> bool {

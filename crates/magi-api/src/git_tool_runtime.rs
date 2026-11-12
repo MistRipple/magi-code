@@ -1200,7 +1200,7 @@ fn required_string(arguments: &Map<String, Value>, key: &str) -> Result<String, 
     optional_string(arguments, key).ok_or_else(|| format!("缺少非空字符串字段 {key}"))
 }
 
-fn optional_string(arguments: &Map<String, Value>, key: &str) -> Option<String> {
+pub(crate) fn optional_string(arguments: &Map<String, Value>, key: &str) -> Option<String> {
     arguments
         .get(key)
         .and_then(Value::as_str)
@@ -1350,7 +1350,7 @@ fn git_error(tool: &str, error: GitError) -> (String, ExecutionResultStatus) {
     (payload.to_string(), status)
 }
 
-fn sanitize_component(value: &str) -> String {
+pub(crate) fn sanitize_component(value: &str) -> String {
     let sanitized = value
         .chars()
         .map(|ch| {
@@ -1369,7 +1369,7 @@ fn sanitize_component(value: &str) -> String {
     }
 }
 
-fn path_is_within(path: &Path, root: &Path) -> bool {
+pub(crate) fn path_is_within(path: &Path, root: &Path) -> bool {
     let candidate = path
         .canonicalize()
         .or_else(|_| {
@@ -1383,7 +1383,7 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
     candidate.starts_with(root)
 }
 
-fn same_path(left: &Path, right: &Path) -> bool {
+pub(crate) fn same_path(left: &Path, right: &Path) -> bool {
     left.canonicalize().unwrap_or_else(|_| left.to_path_buf())
         == right.canonicalize().unwrap_or_else(|_| right.to_path_buf())
 }
