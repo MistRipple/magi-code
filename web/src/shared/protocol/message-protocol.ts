@@ -71,7 +71,6 @@ export type NotifyCategory = 'incident' | 'feedback';
  */
 export type DataMessageType =
   | 'changeMutationStatus'
-  | 'clarificationRequest'
   | 'auxiliaryConnectionTestResult'
   | 'customToolAdded'
   | 'customToolRemoved'

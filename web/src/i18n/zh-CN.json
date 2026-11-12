@@ -2257,7 +2257,6 @@
   "workerBadge.status.failed": "失败",
   "messageHandler.requestRejected": "请求被拒绝，请重试",
   "messageHandler.taskDefaultLabel": "任务",
-  "messageHandler.autoSkipClarification": "自动模式已跳过澄清并继续执行",
   "messageHandler.syncError": "消息同步异常，已终止当前执行态，请重试。",
   "runtimeState.status.running": "运行中",
   "web.themeSystem": "系统",

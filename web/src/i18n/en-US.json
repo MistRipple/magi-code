@@ -2257,7 +2257,6 @@
   "workerBadge.status.failed": "Failed",
   "messageHandler.requestRejected": "Request rejected, please retry",
   "messageHandler.taskDefaultLabel": "Task",
-  "messageHandler.autoSkipClarification": "Auto mode skipped clarification and continuing",
   "messageHandler.syncError": "Message sync failed and the current running state was stopped. Please retry.",
   "runtimeState.status.running": "Running",
   "web.themeSystem": "System",

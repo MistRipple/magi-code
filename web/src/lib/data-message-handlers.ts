@@ -807,10 +807,6 @@ export function handleUnifiedData(standard: StandardMessage) {
       });
       break;
 
-    case 'clarificationRequest':
-      handleClarificationRequest(asMessage(payload));
-      break;
-
     case 'settingsBootstrapLoaded':
       handleSettingsBootstrapLoaded(asMessage(payload));
       break;
@@ -1614,9 +1610,6 @@ function handleNotificationsLoaded(message: ClientBridgeMessage) {
 }
 
 
-function handleClarificationRequest(_message: ClientBridgeMessage) {
-  showFeedback('info', i18n.t('messageHandler.autoSkipClarification'));
-}
 /**
  * 处理代理状态更新消息
  * 将检测到的模型状态同步到全局 store，供设置和执行状态共用
@@ -1716,4 +1709,4 @@ function handleConnectionTestResult(message: ClientBridgeMessage) {
 }
 
 // Named exports
-export { handleStateUpdate, handleSessionsUpdated, handleEmptyWorkspaceStateLoaded, handleSessionBootstrapLoaded, handleClarificationRequest, handleWorkerStatusUpdate, handleConnectionTestResult };
+export { handleStateUpdate, handleSessionsUpdated, handleEmptyWorkspaceStateLoaded, handleSessionBootstrapLoaded, handleWorkerStatusUpdate, handleConnectionTestResult };
