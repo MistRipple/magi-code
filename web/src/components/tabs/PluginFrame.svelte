@@ -458,7 +458,9 @@
     if (identity === navigationIdentity) return;
     navigationIdentity = identity;
     // 旧文档的空内容不能隐藏新实例的加载或失败状态。
-    onContentVisibility?.(true);
+    // 内嵌输入栏只应占用可用插件的空间；运行时失败时由宿主收起可选入口，
+    // 详细错误仍在插件设置页展示，避免把长诊断文本挤进 96px 工具栏槽位。
+    onContentVisibility?.(placement === 'composerLeft' ? ready : true);
     releaseResourceSubscriptions();
     releaseRoutes();
     documentDigest = '';
@@ -509,10 +511,12 @@
 ></iframe>
 {/key}
 {:else}
-  <div class="settings-notice plugin-view-status" class:settings-notice--error={runtime?.state === 'failed'} role="status" aria-busy={waiting} data-testid="plugin-view-runtime" data-plugin-id={pluginId}>
-    <Icon name={waiting ? 'loader' : 'warning'} class={waiting ? 'spinning' : ''} size={14} />
-    <span>{waiting && !installed ? i18n.t('common.loading') : i18n.t(`settings.plugins.runtime.state.${runtimeState}`)}{#if installed?.active && runtime?.reason}<br />{runtime.reason}{/if}</span>
-  </div>
+  {#if placement !== 'composerLeft'}
+    <div class="settings-notice plugin-view-status" class:settings-notice--error={runtime?.state === 'failed'} role="status" aria-busy={waiting} data-testid="plugin-view-runtime" data-plugin-id={pluginId}>
+      <Icon name={waiting ? 'loader' : 'warning'} class={waiting ? 'spinning' : ''} size={14} />
+      <span>{waiting && !installed ? i18n.t('common.loading') : i18n.t(`settings.plugins.runtime.state.${runtimeState}`)}{#if installed?.active && runtime?.reason}<br />{runtime.reason}{/if}</span>
+    </div>
+  {/if}
 {/if}
 
 <style>
