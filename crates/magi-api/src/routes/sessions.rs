@@ -20,8 +20,6 @@ use crate::scope_binding::{
     SessionScope, parse_session_id, require_session_record_in_scope,
     resolve_existing_session_scope, resolve_explicit_session_scope, resolve_session_scope,
 };
-#[cfg(test)]
-use crate::turn_service::canonical_turn_matches_queued_regular_turn;
 use crate::{
     dto::{
         BootstrapDto, ContinueSessionRequest, ContinueSessionResponseDto, NotificationsResponseDto,
