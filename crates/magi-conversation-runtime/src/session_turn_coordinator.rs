@@ -648,7 +648,7 @@ impl SessionTurnCoordinator {
             turn_seq: active.turn_seq,
             finished_order: 0,
         };
-        session.record_finished(active.admission.request_id.clone(), finished);
+        session.record_finished(active.admission.request_id, finished);
         // 释放 active 槽位前清理输入，避免下一次 Start 看见上一轮残留的边界。
         self.close_session_turn_input(session_id, &attempt.turn_id);
         Ok(true)

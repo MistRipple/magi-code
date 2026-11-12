@@ -508,7 +508,7 @@ impl SessionStore {
                 }
                 let turn = CanonicalTurn {
                     session_id: session.clone(),
-                    turn_id: turn_id.clone(),
+                    turn_id,
                     turn_seq,
                     accepted_at,
                     completed_at: None,

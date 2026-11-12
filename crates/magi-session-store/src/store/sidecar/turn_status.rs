@@ -52,7 +52,7 @@ impl SessionStore {
             |state, updated| {
                 let (sidecar_index, candidate) = updated?;
                 state.execution_sidecar_store.runtime_sidecars[sidecar_index] =
-                    candidate.clone().into();
+                    candidate.into();
                 Some(state.project_sidecar(
                     &state.execution_sidecar_store.runtime_sidecars[sidecar_index],
                 ))

@@ -149,9 +149,9 @@ impl PluginManager {
                 &self.root.join(RESET_JOURNAL),
                 serde_json::to_vec(&ResetJournal {
                     plugin_id: id.to_owned(),
-                    from_digest: current.digest.clone(),
+                    from_digest: current.digest,
                     to_digest: package.digest().to_owned(),
-                    previous: previous_entries.clone().unwrap_or_default(),
+                    previous: previous_entries.unwrap_or_default(),
                 })
                 .map_err(|error| PluginError::CorruptState(error.to_string()))?,
             )?;

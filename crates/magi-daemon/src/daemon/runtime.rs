@@ -1589,11 +1589,11 @@ impl DaemonRuntime {
         .with_daemon_identity(self.daemon_identity.clone())
         .with_managed_process_group(self.managed_process_group.clone())
         .with_knowledge_store(self.knowledge_store.clone())
-        .with_settings_store(settings_store.clone())
+        .with_settings_store(settings_store)
         .with_appearance_library(appearance_library)
         .with_snapshot_manager(snapshot_manager)
         .with_skill_runtime(app_skill_runtime.clone())
-        .with_skill_dispatch_runtime(Arc::new(skill_runtime.clone()))
+        .with_skill_dispatch_runtime(Arc::new(skill_runtime))
         .with_mcp_connections(mcp_connections)
         .with_tool_registry(tool_registry_for_dispatcher.clone())
         .with_git_context_runtime(
@@ -1744,7 +1744,7 @@ impl DaemonRuntime {
                 .with_session_state_persist_callback(session_state_persist_callback)
                 .with_settings_store(state.settings_store.clone())
                 .with_context_runtime(context_runtime_for_dispatcher)
-                .with_context_budget(context_budget.clone())
+                .with_context_budget(context_budget)
                 .with_workspace_registry(state.workspace_registry.clone())
                 .with_git_context_runtime(
                     state.git_service.clone(),
@@ -1784,9 +1784,9 @@ impl DaemonRuntime {
         // 过程结束前不能重开该 scope，也不会持有 TaskStore mutation 锁执行 IO。
         task_store.set_status_change_callback_async(true);
         let status_runner_manager = Arc::downgrade(&runner_manager);
-        let eb = event_bus_for_task_store.clone();
-        let session_store = session_store_for_task_status.clone();
-        let task_execution_registry_for_status = task_execution_registry.clone();
+        let eb = event_bus_for_task_store;
+        let session_store = session_store_for_task_status;
+        let task_execution_registry_for_status = task_execution_registry;
         let completion_notifier_for_status = completion_notifier.clone();
         let task_store_for_status = Arc::downgrade(&task_store);
         task_store.set_status_change_callback(Box::new(

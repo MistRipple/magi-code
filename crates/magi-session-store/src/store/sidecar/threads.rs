@@ -283,7 +283,7 @@ impl SessionStore {
         let existing_mission = state
             .execution_sidecar_store
             .runtime_sidecar(session_id)
-            .and_then(|sidecar| sidecar.ownership.mission_id.clone());
+            .and_then(|sidecar| sidecar.ownership.mission_id);
         let mission_id = existing_mission.unwrap_or_else(mission_id_factory);
         let thread_id = ThreadId::new(format!("thread-orchestrator-{}", session_id));
         state.thread_registry.push(ExecutionThread {

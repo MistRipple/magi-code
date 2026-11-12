@@ -1119,7 +1119,7 @@ fn revoke_surface_control(
         return;
     }
     let context = browser_tab_context(state, &binding.tab_id);
-    let Some(context) = context.clone() else {
+    let Some(context) = context else {
         tracing::debug!(tab_id = %binding.tab_id, "忽略未知 Browser Surface 的控制权撤销事件");
         return;
     };

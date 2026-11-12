@@ -352,7 +352,7 @@ pub fn execute_skill_custom_tool(
         SkillDispatchInput {
             tool_call_id: ToolCallId::new(&tool_call.id),
             tool_name: binding.tool_name.clone(),
-            binding_id: Some(binding.binding_id.clone()),
+            binding_id: Some(binding.binding_id),
             payload,
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,

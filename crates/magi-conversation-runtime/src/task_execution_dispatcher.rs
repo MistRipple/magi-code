@@ -1627,7 +1627,7 @@ impl LlmTaskDispatcher {
             skill_runtime: self.skill_runtime.as_deref(),
             skill_dispatch_runtime: self.skill_dispatch_runtime.as_deref(),
             extension_hooks: self.extension_hooks.as_deref(),
-            skill_name: skill_name.clone(),
+            skill_name,
             task_store: self.pipeline.task_store.as_ref(),
             execution_registry: &self.execution_registry,
             conversation_registry: self.conversation_registry.as_ref(),

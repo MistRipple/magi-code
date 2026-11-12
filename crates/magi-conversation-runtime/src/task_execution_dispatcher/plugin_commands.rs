@@ -67,7 +67,7 @@ impl LlmTaskDispatcher {
                     .map(|policy| policy.access_profile)
                     .unwrap_or_default(),
                 working_directory: prepared.root.clone(),
-                project_directory_map: prepared.resources.directories.clone(),
+                project_directory_map: prepared.resources.directories,
                 ..Default::default()
             }
             .for_tool_arguments("{}")

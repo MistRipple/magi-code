@@ -431,7 +431,7 @@ pub fn execute_external_tool_call(
                 skill,
                 binding,
                 None,
-                tool_policy.clone(),
+                tool_policy,
                 safety_gate,
                 call.skill_runtime,
                 call.skill_dispatch_runtime,

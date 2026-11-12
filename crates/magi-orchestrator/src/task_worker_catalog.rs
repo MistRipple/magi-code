@@ -52,7 +52,7 @@ pub fn build_worker_info_for_role(
         role: role_id.to_string(),
         supported_kinds,
         parallelism_limit: role.parallelism_limit,
-        system_prompt_template: Some(role.system_prompt.clone()),
+        system_prompt_template: Some(role.system_prompt),
     })
 }
 

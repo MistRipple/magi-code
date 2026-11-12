@@ -332,13 +332,13 @@ impl TaskStore {
         mission_index
             .entry(mission_id)
             .or_default()
-            .push(task_id.clone());
+            .push(task_id);
         if checkpoint {
             let leases = self.leases.read().expect("leases read lock poisoned");
             let snapshot = Self::snapshot_from_maps_with_dirty_roots(
                 &tasks,
                 &leases,
-                vec![root_task_id.clone()],
+                vec![root_task_id],
             );
             self.fire_checkpoint(&snapshot)?;
         }

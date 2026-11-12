@@ -521,8 +521,6 @@ fn build_application_router(api_router: Router, frontend: &FrontendMode) -> Rout
             .route(
                 "/web.html",
                 get({
-                    let dev_html = dev_html.clone();
-                    let content_security_policy = content_security_policy.clone();
                     move || {
                         let dev_html = dev_html.clone();
                         let content_security_policy = content_security_policy.clone();

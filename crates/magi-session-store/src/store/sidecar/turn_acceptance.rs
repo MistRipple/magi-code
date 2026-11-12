@@ -494,7 +494,7 @@ impl SessionStore {
                 let (sidecar_index, candidate, changed) = updated?;
                 if changed {
                     state.execution_sidecar_store.runtime_sidecars[sidecar_index] =
-                        candidate.clone().into();
+                        candidate.into();
                 }
                 Some(state.project_sidecar(
                     &state.execution_sidecar_store.runtime_sidecars[sidecar_index],
@@ -962,7 +962,7 @@ impl SessionStore {
                     .active_execution_chain
                     .as_mut()
                     .expect("validated chain");
-                chain.branches.push(branch.clone());
+                chain.branches.push(branch);
                 chain.normalize();
                 sidecar.updated_at = UtcMillis::now();
             },

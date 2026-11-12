@@ -40,7 +40,7 @@ fn normalize_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<ToolCall> {
     let mut used_ids = HashSet::<String>::new();
 
     for (index, mut tool_call) in tool_calls.into_iter().enumerate() {
-        let arguments = tool_call.arguments_for_wire().to_string();
+        let arguments = tool_call.arguments_for_wire().clone();
         let original_id = tool_call.id.trim().to_string();
 
         if let Some((seen_name, seen_arguments)) = seen_by_id.get(&original_id)

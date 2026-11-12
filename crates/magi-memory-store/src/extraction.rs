@@ -32,7 +32,7 @@ impl MemoryStore {
         }
 
         let extraction = normalize_extraction_record(MemoryExtractionRecord {
-            extraction_id: extraction_id.clone(),
+            extraction_id,
             session_id,
             source_ref,
             summary,

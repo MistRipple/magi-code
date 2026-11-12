@@ -150,12 +150,12 @@ impl SnapshotSession {
 
         let session = Arc::new(Self {
             session_id,
-            workspace_root: workspace_root.clone(),
+            workspace_root,
             session_dir,
-            blobs: blobs.clone(),
+            blobs,
             baseline: RwLock::new(baseline),
             refs: RwLock::new(refs),
-            events: events.clone(),
+            events,
             current: RwLock::new(HashMap::new()),
             last_event: RwLock::new(HashMap::new()),
             active_tool_ctxs: RwLock::new(HashMap::new()),

@@ -384,7 +384,7 @@ pub(super) fn execute_agent_spawn(
             "child_task_id": child_task_id.to_string(),
             "agent_id": activation.agent_id,
             "activation": activation,
-            "task_name": preflight.task_name.clone(),
+            "task_name": preflight.task_name,
             "canonical_task_name": preflight.canonical_task_name,
             "plan_item_id": plan_item_id.as_ref().map(ToString::to_string),
             "role": preflight.role,
@@ -550,7 +550,7 @@ pub(super) fn execute_agent_send(
             now.0
         ),
         operation: AgentContextAccessOperation::Send,
-        query: Some(message.clone()),
+        query: Some(message),
         reference_ids: references
             .iter()
             .map(|reference| reference.reference_id.clone())

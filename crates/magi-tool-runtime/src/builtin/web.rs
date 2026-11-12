@@ -902,7 +902,7 @@ pub(super) fn execute_web_fetch(input: &str) -> String {
     let content = if content_type.contains("json") {
         format!("```json\n{}\n```", body)
     } else if content_type.contains("text/plain") || content_type.contains("xml") {
-        body.clone()
+        body
     } else {
         html_to_markdown(&body)
     };

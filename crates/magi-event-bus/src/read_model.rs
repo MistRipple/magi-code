@@ -869,7 +869,7 @@ impl RuntimeExecutorSummary {
                 .get("request_source")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
-            observation_status: observation_status.clone(),
+            observation_status,
             requested_stage: payload
                 .get("requested_stage")
                 .and_then(serde_json::Value::as_str)
@@ -1292,7 +1292,7 @@ impl RuntimeReadModelInput {
                 );
             }
             if let Some(mission_id) = resolved_mission_id.as_ref() {
-                let mission_id = mission_id.to_string();
+                let mission_id = mission_id.clone();
                 if !summary
                     .active_execution_group_ids
                     .iter()
@@ -1392,7 +1392,7 @@ impl RuntimeReadModelInput {
                 }
                 mission_entry.latest_event_type = Some(event.event_type.clone());
                 if let Some(task_id) = resolved_task_id.as_ref() {
-                    let task_id = task_id.to_string();
+                    let task_id = task_id.clone();
                     if !mission_entry
                         .active_task_ids
                         .iter()
@@ -1403,7 +1403,7 @@ impl RuntimeReadModelInput {
                 }
             }
             if let Some(task_id) = resolved_task_id.as_ref() {
-                let task_id = task_id.to_string();
+                let task_id = task_id.clone();
                 if !summary.active_task_ids.iter().any(|id| id == &task_id) {
                     summary.active_task_ids.push(task_id.clone());
                 }
@@ -1478,7 +1478,7 @@ impl RuntimeReadModelInput {
                     assignment_entry.audit_event_count += 1;
                 }
                 if let Some(task_id) = resolved_task_id.as_ref() {
-                    let task_id = task_id.to_string();
+                    let task_id = task_id.clone();
                     if !assignment_entry.task_ids.iter().any(|id| id == &task_id) {
                         assignment_entry.task_ids.push(task_id);
                     }

@@ -1967,7 +1967,7 @@ pub(crate) fn current_session_file_facts(
             let fact = CurrentFileFact {
                 absolute_path: path.to_string(),
                 content_hash: content_hash.to_string(),
-                result: result.to_string(),
+                result: result.clone(),
                 summary,
             };
             match facts.get(path) {

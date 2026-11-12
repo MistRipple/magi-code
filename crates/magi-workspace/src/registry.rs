@@ -204,8 +204,8 @@ impl WorkspaceStore {
             updated_at: now,
             source_folders: vec![WorkspaceSourceFolder {
                 source_folder_id: format!("{workspace_id}-source-0"),
-                path: root_path.clone(),
-                path_ref: root_path_ref.clone(),
+                path: root_path,
+                path_ref: root_path_ref,
                 name: None,
                 created_at: now,
                 updated_at: now,

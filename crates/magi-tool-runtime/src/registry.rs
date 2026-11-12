@@ -501,7 +501,7 @@ impl ToolRegistry {
                         capture_tool_workspace_snapshot(&input, &context)
                     };
                     let mut resources = self.runtime_resources.clone();
-                    resources.cancellation = cancellation.clone();
+                    resources.cancellation = cancellation;
                     resources.execution_policy = Some(policy.clone());
                     // 读工具只做读取：与权限预检同一规则，读取不受默认的工作区范围约束。
                     let execution_policy =
@@ -566,7 +566,7 @@ impl ToolRegistry {
             payload: serde_json::json!({
                 "tool": tool_name.as_str(),
                 "status": "rejected",
-                "error": reason.clone(),
+                "error": reason,
             })
             .to_string(),
             governance: GovernanceDecision {
@@ -599,7 +599,7 @@ impl ToolRegistry {
                 "tool": tool_name.as_str(),
                 "status": "rejected",
                 "error_code": code,
-                "error": reason.clone(),
+                "error": reason,
             })
             .to_string(),
             governance: GovernanceDecision {

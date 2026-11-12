@@ -516,7 +516,7 @@ impl LlmTaskDispatcher {
             can_skip: true,
         };
         item.tool_result = Some(json!({"status":"awaiting_user_input","question_id":question.question_id,"questions":questions}).to_string());
-        self.extension_commit_item(owner, item.clone())?;
+        self.extension_commit_item(owner, item)?;
         let registry = self.conversation_registry.user_questions();
         let waiter = registry.request_persisted(&self.session_store, question.clone())?;
         // 取消路径同样发布 resolved，界面不会留下孤立等待状态。
@@ -650,7 +650,7 @@ impl LlmTaskDispatcher {
                 &definitions,
             )
         });
-        let original = [call.clone()];
+        let original = [call];
         let calls = hooked
             .as_ref()
             .map(|h| h.execute.as_slice())

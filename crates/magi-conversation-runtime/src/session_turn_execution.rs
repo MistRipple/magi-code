@@ -1805,7 +1805,7 @@ fn stream_session_turn_round(
             "assistant_stream",
             "running",
             Some("生成回复".to_string()),
-            Some(visible_content.clone()),
+            Some(visible_content),
             Some(stream_item_id.clone()),
             orchestrator_thread_id.clone(),
         );
@@ -2141,7 +2141,7 @@ fn stream_session_turn_round(
     }
     if writeback_aborted.get() || !request_turn_is_writable(session_store, request) {
         return Ok(SessionTurnRoundOutput::interrupted(
-            response_observation.clone(),
+            response_observation,
         ));
     }
     let streamed_content = streamed_content.into_inner();
@@ -2156,7 +2156,7 @@ fn stream_session_turn_round(
     if let Some(thinking) = final_thinking {
         if !request_turn_is_writable(session_store, request) {
             return Ok(SessionTurnRoundOutput::interrupted(
-                response_observation.clone(),
+                response_observation,
             ));
         }
         let mut thinking_item = session_turn_item(
@@ -2204,14 +2204,14 @@ fn stream_session_turn_round(
         .map(normalize_model_visible_content)
         .filter(|content| !content.trim().is_empty());
     let completed_stream_content = if !streamed_visible_content.trim().is_empty() {
-        Some(streamed_visible_content.clone())
+        Some(streamed_visible_content)
     } else {
-        parsed_visible_content.clone()
+        parsed_visible_content
     };
     if let Some(completed_stream_content) = completed_stream_content.as_ref() {
         if !request_turn_is_writable(session_store, request) {
             return Ok(SessionTurnRoundOutput::interrupted(
-                response_observation.clone(),
+                response_observation,
             ));
         }
         let mut stream_item = session_turn_item(
@@ -2306,7 +2306,7 @@ fn stream_session_turn_round(
         final_item_id,
         timeline_entry_id,
         response_observation,
-        provider_context: parsed.provider_context.clone(),
+        provider_context: parsed.provider_context,
         interrupted: false,
     })
 }

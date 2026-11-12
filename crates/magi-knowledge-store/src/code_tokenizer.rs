@@ -243,7 +243,7 @@ impl CodeTokenizer {
 
         let mut tokens = BTreeSet::new();
         let lower = identifier.to_ascii_lowercase();
-        tokens.insert(lower.clone());
+        tokens.insert(lower);
 
         if identifier.contains('_') || identifier.contains('-') {
             let parts: Vec<&str> = identifier

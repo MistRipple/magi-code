@@ -1803,7 +1803,7 @@ fn await_task_tool_approval(
         && let Err(error) = on_progress(ToolExecutionProgress {
             tool_call_id: ToolCallId::new(&tool_call.id),
             tool_name: tool_call.function.name.clone(),
-            payload: progress_payload.clone(),
+            payload: progress_payload,
         })
     {
         registry.cancel(&approval_id);

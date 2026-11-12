@@ -49,7 +49,7 @@ pub fn apply_task_result(store: &TaskStore, result: TaskResult) -> Result<bool, 
         );
         return Ok(false);
     };
-    let root_task_id = task.root_task_id.clone();
+    let root_task_id = task.root_task_id;
     match result.outcome {
         TaskOutcome::Completed { attempt } => match store.complete_lease_and_task(
             &result.task_id,

@@ -266,7 +266,7 @@ impl TaskCompletionNotifier {
                 .and_then(|context| context.session_id.clone()),
             turn_id: context.as_ref().and_then(|context| context.turn_id.clone()),
             root_task_id: task.root_task_id.clone(),
-            task_id: task_id.clone(),
+            task_id,
             attempt_id: context
                 .as_ref()
                 .and_then(|context| context.coordinator_attempt_id.clone())

@@ -302,7 +302,7 @@ impl ToolApprovalRegistry {
         if decision == ToolApprovalDecision::Deny {
             state.denied_session_tool_calls.insert(entry.fingerprint);
         } else if decision == ToolApprovalDecision::AllowForTurn {
-            let grant = entry.fingerprint.clone();
+            let grant = entry.fingerprint;
             state.turn_tool_grants.insert(grant.clone());
             let matching_approval_ids = state
                 .pending

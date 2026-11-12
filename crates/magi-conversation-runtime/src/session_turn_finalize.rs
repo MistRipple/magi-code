@@ -1067,7 +1067,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
             Some(title.to_string()),
             Some(message),
             Some(item_id.clone()),
-            orchestrator_thread_id.clone(),
+            orchestrator_thread_id,
         );
         error_item.task_id = Some(root_task_id.clone());
         upsert_session_turn_item_for_turn(

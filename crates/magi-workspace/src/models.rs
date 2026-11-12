@@ -340,7 +340,7 @@ impl WorkspaceRecoverySidecarStoreState {
     pub fn consume_recovery(&mut self, recovery_id: &str) -> DomainResult<RecoveryHandle> {
         let ownership = self
             .recovery_handle(recovery_id)
-            .map(|handle| handle.ownership.clone())
+            .map(|handle| handle.ownership)
             .ok_or(DomainError::NotFound {
                 entity: "recovery_handle",
             })?;
