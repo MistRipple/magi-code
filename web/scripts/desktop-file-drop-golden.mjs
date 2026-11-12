@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { withGoldenViteServer } from './golden-vite.mjs';
+import { readSplitSource } from './lib/split-source.mjs';
 
 await withGoldenViteServer(async (server) => {
   const desktopDrop = await server.ssrLoadModule('/src/lib/desktop-file-drop.ts');
@@ -111,10 +113,7 @@ const folderPickerSource = await readFile(
   new URL('../src/web/WebFolderPicker.svelte', import.meta.url),
   'utf8',
 );
-const agentApiSource = await readFile(
-  new URL('../src/web/agent-api.ts', import.meta.url),
-  'utf8',
-);
+const agentApiSource = readSplitSource(fileURLToPath(new URL('../src/web/agent-api.ts', import.meta.url)));
 const threadPanelSource = await readFile(
   new URL('../src/components/ThreadPanel.svelte', import.meta.url),
   'utf8',

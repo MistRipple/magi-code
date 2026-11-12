@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { readSplitSource } from './lib/split-source.mjs';
 
 const repositoryRoot = path.resolve(new URL('../..', import.meta.url).pathname);
 
@@ -20,10 +21,7 @@ const desktopTypesSource = fs.readFileSync(
   path.join(repositoryRoot, 'web/src/types/magi-desktop.d.ts'),
   'utf8',
 );
-const agentApiSource = fs.readFileSync(
-  path.join(repositoryRoot, 'web/src/web/agent-api.ts'),
-  'utf8',
-);
+const agentApiSource = readSplitSource(path.join(repositoryRoot, 'web/src/web/agent-api.ts'));
 const zhCN = JSON.parse(fs.readFileSync(path.join(repositoryRoot, 'web/src/i18n/zh-CN.json'), 'utf8'));
 const enUS = JSON.parse(fs.readFileSync(path.join(repositoryRoot, 'web/src/i18n/en-US.json'), 'utf8'));
 

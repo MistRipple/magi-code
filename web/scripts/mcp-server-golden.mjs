@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import ts from 'typescript';
 import { parse } from 'svelte/compiler';
+import { readSplitSource } from './lib/split-source.mjs';
 
 const repositoryRoot = path.resolve(new URL('../..', import.meta.url).pathname);
 const read = (relative) => fs.readFileSync(path.join(repositoryRoot, relative), 'utf8');
@@ -16,7 +17,7 @@ const settingsPanel = read('web/src/components/SettingsPanel.svelte');
 const toolsTab = read('web/src/components/SettingsToolsTab.svelte');
 const shell = read('web/src/web/WebWorkbenchShell.svelte');
 const bridge = read('web/src/shared/bridges/web-client-bridge.ts');
-const agentApi = read('web/src/web/agent-api.ts');
+const agentApi = readSplitSource(path.join(repositoryRoot, 'web/src/web/agent-api.ts'));
 const events = read('web/src/lib/mcp-server-events.ts');
 const zhCN = JSON.parse(read('web/src/i18n/zh-CN.json'));
 const enUS = JSON.parse(read('web/src/i18n/en-US.json'));

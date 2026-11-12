@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { withGoldenViteServer } from './golden-vite.mjs';
+import { readSplitSource } from './lib/split-source.mjs';
 
 await withGoldenViteServer(async (server) => {
   const skill = await server.ssrLoadModule('/src/lib/skill-instruction.ts');
@@ -29,7 +31,7 @@ await withGoldenViteServer(async (server) => {
   const tools = await readFile(new URL('../src/components/SettingsToolsTab.svelte', import.meta.url), 'utf8');
   assert.match(tools, /getAgentSkillDetail/);
   assert.match(tools, /skill-detail/);
-  const api = await readFile(new URL('../src/web/agent-api.ts', import.meta.url), 'utf8');
+  const api = readSplitSource(fileURLToPath(new URL('../src/web/agent-api.ts', import.meta.url)));
   assert.match(api, /\/api\/settings\/skills\/detail/);
 
   console.log('skill detail golden passed');

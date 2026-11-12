@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { withGoldenViteServer } from './golden-vite.mjs';
+import { readSplitSource } from './lib/split-source.mjs';
 
 const read = (path) => readFile(new URL(path, import.meta.url), 'utf8');
 
@@ -40,7 +42,7 @@ await withGoldenViteServer(async (server) => {
   );
 
   // 接线：接口、事件、输入区芯片、变更面板横幅和合并面板都要接上。
-  const api = await read('../src/web/agent-api.ts');
+  const api = readSplitSource(fileURLToPath(new URL('../src/web/agent-api.ts', import.meta.url)));
   for (const endpoint of [
     '/api/session/isolations',
     '/api/session/workspace-waits',
