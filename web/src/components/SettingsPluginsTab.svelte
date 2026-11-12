@@ -236,8 +236,10 @@
     const pending = staged;
     if (!pending) return;
     await run(async () => {
-      if (pending.kind === 'upstream') await installUpstreamPlugin(pending.preview, pending.ecosystem);
-      else await applyPluginCandidate(pending.candidate, pending.preview);
+      const operation = pending.kind === 'upstream' ? pending.preview.candidate : pending.preview;
+      const activate = activateAfterInstall(operation.manifest.id, operation.operation);
+      if (pending.kind === 'upstream') await installUpstreamPlugin(pending.preview, pending.ecosystem, activate);
+      else await applyPluginCandidate(pending.candidate, pending.preview, activate);
       staged = null;
       address = '';
       const preview = pending.kind === 'upstream' ? pending.preview.candidate : pending.preview;
@@ -248,6 +250,15 @@
   }
 
   const hasCatalog = $derived(Boolean(center && center.entries.length > 0));
+
+  /**
+   * 安装完成后是否默认激活。新安装一律激活（预览里已展示全部权限，确认即同意）；
+   * 升级只恢复原本已激活的插件，不替用户重新启用被其主动停用的插件。
+   */
+  function activateAfterInstall(pluginId: string, operation: string): boolean {
+    if (operation !== 'upgrade') return true;
+    return plugins.find((plugin) => plugin.manifest.id === pluginId)?.active ?? false;
+  }
 
   /** 插件的名称与说明显示清单原文。 */
   function manifestText(manifest: PluginManifest, field: 'name' | 'description'): string {
@@ -304,8 +315,13 @@
     await run(() => uninstallPlugin(id));
   }
 
+  /** 插件中心没有安装前预览：只有已验签目录的新安装、或原本已激活插件的升级才默认激活；未验签目录的包留给用户在详情里审阅后再授权。 */
+  function centerActivates(item: StoreItem): boolean {
+    return item.installed ? item.installed.active : Boolean(center?.verified);
+  }
+
   async function installItem(item: StoreItem): Promise<void> {
-    if (item.catalog) await run(() => installFromPluginCenter(item.catalog!));
+    if (item.catalog) await run(() => installFromPluginCenter(item.catalog!, centerActivates(item)));
     else if (item.upstream) await stageUpstream(item.upstream);
   }
 
@@ -317,7 +333,7 @@
     } else if (item.installed?.source.github) {
       const { repository, reference } = item.installed.source.github;
       await stageUpstream({ ecosystem: 'dsh', github: { repository, reference } });
-    } else if (item.catalog && item.catalog.state === 'updatable') await run(() => installFromPluginCenter(item.catalog!));
+    } else if (item.catalog && item.catalog.state === 'updatable') await run(() => installFromPluginCenter(item.catalog!, centerActivates(item)));
     else if (item.upstream) await stageUpstream(item.upstream);
   }
 

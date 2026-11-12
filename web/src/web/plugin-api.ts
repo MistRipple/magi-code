@@ -88,8 +88,11 @@ export async function previewPluginCandidate(candidate: PluginCandidate, signal?
   return await response.json() as PluginCandidatePreview;
 }
 
-/** 确认后安装或升级：只接受与预览摘要一致的包。升级由 daemon 先排空插件再切换，新包须重新授权后激活。 */
-export async function applyPluginCandidate(candidate: PluginCandidate, preview: PluginCandidatePreview): Promise<void> {
+/**
+ * 确认后安装或升级：只接受与预览摘要一致的包。升级由 daemon 先排空插件再切换，新包须重新授权后激活。
+ * `activate` 为真时，安装完成后直接授权并激活：用户在预览里已看到全部权限与影响，确认安装即同意。
+ */
+export async function applyPluginCandidate(candidate: PluginCandidate, preview: PluginCandidatePreview, activate: boolean): Promise<void> {
   const upgrade = preview.operation === 'upgrade';
   const response = await pluginRequest(upgrade ? '/api/plugins/upgrade' : '/api/plugins/install', {
     method: 'POST',
@@ -98,6 +101,7 @@ export async function applyPluginCandidate(candidate: PluginCandidate, preview: 
   });
   if (!response.ok) throw await pluginFailure(upgrade ? i18n.t('plugins.error.upgrade') : i18n.t('plugins.error.install'), response);
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
+  if (activate) await activateInstalledPlugin(preview.manifest.id, preview.digest);
 }
 
 /** 插件作者指南（Markdown）：随 daemon 发布，与仓库文档同源。 */
@@ -123,8 +127,11 @@ export async function savePluginCenterConfig(config: PluginCenterConfig): Promis
   return await response.json() as PluginCenterConfig;
 }
 
-/** 从已签名目录安装或升级：包内容须与目录签名绑定的摘要一致。 */
-export async function installFromPluginCenter(entry: PluginCenterEntry): Promise<void> {
+/**
+ * 从插件中心安装或升级：包内容须与目录签名绑定的摘要一致。
+ * `activate` 为真时安装完成后直接授权并激活；调用方只在可信目录或原本已激活的插件升级时传真。
+ */
+export async function installFromPluginCenter(entry: PluginCenterEntry, activate: boolean): Promise<void> {
   const response = await pluginRequest('/api/plugins/center/install', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -132,6 +139,7 @@ export async function installFromPluginCenter(entry: PluginCenterEntry): Promise
   });
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.installCenter'), response);
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
+  if (activate) await activateInstalledPlugin(entry.id);
 }
 
 /** 在上游生态（DSH、pi）的官方 npm 发布中搜索；空查询列出该生态的常见包。 */
@@ -163,8 +171,8 @@ export async function previewUpstreamPlugin(entry: PluginUpstreamRequest, signal
   return await response.json() as PluginUpstreamPreview;
 }
 
-/** 确认后安装：daemon 重新翻译并只接受与预览摘要一致的结果。 */
-export async function installUpstreamPlugin(preview: PluginUpstreamPreview, ecosystem: PluginUpstreamEntry['ecosystem']): Promise<void> {
+/** 确认后安装：daemon 重新翻译并只接受与预览摘要一致的结果。`activate` 为真时安装完成后直接授权并激活。 */
+export async function installUpstreamPlugin(preview: PluginUpstreamPreview, ecosystem: PluginUpstreamEntry['ecosystem'], activate: boolean): Promise<void> {
   const response = await pluginRequest('/api/plugins/upstream/install', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -172,6 +180,7 @@ export async function installUpstreamPlugin(preview: PluginUpstreamPreview, ecos
   });
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.upstreamInstall'), response);
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
+  if (activate) await activateInstalledPlugin(preview.candidate.manifest.id, preview.candidate.digest);
 }
 
 /** 每一步绑定用户看到的安装；失败也刷新已提交事实，不伪装整个操作已回滚。 */
@@ -189,6 +198,19 @@ async function changePluginActivation(plugin: PluginInstalled, action: 'authoriz
 export async function authorizeAndActivatePlugin(plugin: PluginInstalled): Promise<void> {
   await changePluginActivation(plugin, 'authorize');
   await activatePlugin(plugin);
+}
+
+/**
+ * 安装完成后的默认激活：读取 daemon 刚提交的安装，授权并激活。
+ * 若给出摘要，必须与刚安装的包一致，避免对被替换的版本授权。
+ */
+async function activateInstalledPlugin(pluginId: string, expectedDigest?: string): Promise<void> {
+  const { plugins } = await listInstalledPlugins();
+  const plugin = plugins.find((item) => item.manifest.id === pluginId);
+  if (!plugin) throw new Error(i18n.t('plugins.error.activate'));
+  if (expectedDigest && plugin.digest !== expectedDigest) throw new Error(i18n.t('plugins.error.activate'));
+  if (plugin.active) return;
+  await authorizeAndActivatePlugin(plugin);
 }
 
 /** 设置页重新启用只使用已有授权，不能在开关中补授权限。 */
