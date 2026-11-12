@@ -27,7 +27,7 @@ for (const key of Object.keys(zh)) {
 let sourceCount = 0;
 async function checkSources(directory) {
   for (const entry of await readdir(directory, { withFileTypes: true })) {
-    if (['demos', 'acceptance', 'i18n'].includes(entry.name)) continue;
+    if (['acceptance', 'i18n'].includes(entry.name)) continue;
     const url = new URL(entry.name + (entry.isDirectory() ? '/' : ''), directory);
     if (entry.isDirectory()) { await checkSources(url); continue; }
     if (!/\.(?:svelte|ts)$/.test(entry.name)) continue;

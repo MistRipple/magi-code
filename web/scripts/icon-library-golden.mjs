@@ -78,17 +78,6 @@ assert.deepEqual(errors, [], errors.join('\n'));
 const pane = await readFile(new URL('web/RightPane.svelte', root), 'utf8');
 assert.match(pane, /tab\.kind === 'code'[\s\S]*?<FileTypeIcon/u, 'code tabs share the file icon renderer');
 assert.match(pane, /<FileTypeIcon path=\{\(tab\.payload as CodeTabPayload\)\.displayPath \?\?/u, 'file identity uses the readable path rather than an opaque host path');
-const legacy = await readFile(new URL('demos/message-card-preview.ts', root), 'utf8');
-assert.match(legacy, /mount\(FileTypeIcon/u, 'legacy demo must reuse file identity renderer');
-assert.match(legacy, /import \{ icons, iconStyle,/u, 'legacy symbols must use the shared catalog');
-const legacyMarkup = (await readFile(new URL('demos/message-cards.html', root), 'utf8')).replace(/<script\b[^>]*>[\s\S]*?<\/script>/gu, '');
-const ids = new Set([...legacy.matchAll(/(?:^|[,\s])([a-z]+): '[^']+'/gu)].map(match => match[1]));
-for (const match of legacyMarkup.matchAll(/<svg\b[^>]*>[\s\S]*?<\/svg>/gu)) {
-  const drawing = match[0];
-  const use = drawing.match(/<use href="#([^"]+)"/u);
-  if (use) assert.ok(ids.has(use[1]), `legacy demo icon missing from shared map: ${use[1]}`);
-  else assert.ok(/role="img"|id="demo-icon-definitions"/u.test(drawing), 'legacy inline SVG must be chart content or shared symbol definitions');
-}
 for (const path of ['components/KnowledgePanel.svelte', 'components/MermaidRenderer.svelte', 'components/diagram/GraphvizRenderer.svelte', 'web/WebFolderPicker.svelte']) {
   const source = await readFile(new URL(path, root), 'utf8');
   assert.match(source, /class="(?:kp-|mac-)?spinner"><Icon name="loader"/u, `${path}: shared loading glyph`);
