@@ -2,7 +2,7 @@
 
 本文是 Magi 正式稳定版的操作手册和完成门禁。发布人员和自动化代理必须按顺序执行。日常开发及单纯修改文档无需执行整套发布预检。
 
-**主流程：检查工作区 → 准备版本与说明 → 本地完整预检 → 推送 main → 同一提交 CI 全部通过 → 推送版本 Tag → 四平台打包与发布 → 在线验收。** 上一步未通过，不进入下一步。推送 Tag、安装包构建成功或出现 Release 页面，都不能单独作为发布完成依据。
+**主流程：检查工作区 → 准备版本与说明 → 本地打包与审计预检 → 推送 main → 同一提交 CI 全部通过 → 推送版本 Tag → 四平台打包与发布 → 在线验收。** 上一步未通过，不进入下一步。推送 Tag、安装包构建成功或出现 Release 页面，都不能单独作为发布完成依据。
 
 ## 1. 发布边界与事实来源
 
@@ -66,7 +66,7 @@ git config user.email east_xiaodong@126.com
 - Rust 以 rust-toolchain.toml 为准，目前为 1.97.0，安装 clippy、rustfmt；预检脚本与工作流必须对齐。
 - 安装 cargo-audit，当前安全工作流固定为 0.22.2。另需 Git、GitHub CLI、jq、curl 及当前平台原生构建工具；macOS 需要 Xcode Command Line Tools。
 - 检查磁盘空间。Rust debug/release 缓存、Electron 解包目录和安装包会同时占用空间。只清理已确认可重建、没有进程使用的生成缓存，不删除状态目录、工作区数据或未提交文件。
-- 本地完整预检构建当前操作系统与架构的安装包；跨平台发行包由 GitHub 构建，不用本机交叉打包替代。
+- 本地预检构建当前操作系统与架构的安装包；跨平台发行包由 GitHub 构建，不用本机交叉打包替代。
 
 ~~~bash
 node --version
@@ -107,30 +107,30 @@ git ls-remote origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}"
 
 确认没有意外依赖升级，继承 workspace 版本的 crate 已反映到 Cargo.lock。新版本 Tag 应不存在；已存在时不能直接覆盖，按失败恢复或更高版本发布处理。
 
-## 4. 执行完整本地预检
+## 4. 执行本地预检
+
+类型检查、测试、生成物一致性、Clippy 和 Rust 全量测试由推送 main 后同一提交的 CI（`npm run release:preflight`）承担，本地不再重复运行。本地只补 CI 做不到的两件事：当前平台的安装包构建与安全审计，并校验版本与说明。
 
 ~~~bash
 export CSC_IDENTITY_AUTO_DISCOVERY=false
-npm run release:preflight:full -- --tag "$RELEASE_TAG"
+npm run release:preflight:local -- --tag "$RELEASE_TAG"
 ~~~
 
 需要日志时，在 Bash 的 pipefail 生效后使用命令重定向或 tee，避免日志管道掩盖失败。必须同时确认退出码为 0 和日志包含“发布前置校验全部通过”。
 
-完整预检覆盖：
+本地预检覆盖：
 
 | 阶段 | 验证内容 |
 | --- | --- |
 | 版本入口 | 产品版本与 Tag 一致、说明文件可读；操作人员另确认非空 |
-| 工程检查 | crate 架构文档、Desktop/Worker TypeScript、Web Svelte |
-| JS 测试与构建 | Desktop、Worker、Web 测试，Browser 核心边界，Web/Worker 生产构建 |
-| 发行边界 | Browser 工具目录、网络策略、App Server 生成协议、Browser 合同、Electron 唯一发行边界 |
-| Rust | daemon debug 构建、正式模型/MCP 客户端回归、全 workspace Clippy（警告视为错误）、全 workspace 测试 |
 | 本机安装包 | 构建 Web、Worker、Rust sidecar、Electron，生成安装包并执行解包结构自检 |
 | 安全审计 | npm audit --omit=dev --workspaces 与 cargo audit |
 
-普通 release:preflight 不含打包和审计，不能代替完整命令。desktop:package -- --dir 只生成目录包，也不能代替安装包。产物默认位于 target/electron-dist/。
+以下由 CI 的 `release:preflight` 在同一提交上验证（本地要提前发现问题时可直接运行 `npm run release:preflight`）：crate 架构文档、Desktop/Worker TypeScript 与 Web Svelte 检查、Desktop/Worker/Web 测试、Browser 核心边界、Web/Worker 生产构建、发行边界（Browser 工具目录、网络策略、App Server 生成协议、Browser 合同、Electron 唯一发行边界）、daemon 构建、全 workspace Clippy（警告视为错误）与全 workspace 测试。这些检查失败发生在推送 main 之后、打 Tag 之前，修复后推新 SHA 重跑即可，不影响已发布版本。
 
-失败时保留首个错误与阶段，修复后先做相关回归，再重新运行完整预检。不得删除断言、跳过审计、增加未说明的漏洞忽略项或只反复重跑到偶然成功。通过后若修改源码、版本、依赖、生成文件或构建/发布配置，需验证最终快照；仅补充说明文档时运行对应文档检查即可。
+desktop:package -- --dir 只生成目录包，不能代替安装包。产物默认位于 target/electron-dist/。
+
+失败时保留首个错误与阶段，修复后先做相关回归，再重新运行本地预检。不得删除断言、跳过审计、增加未说明的漏洞忽略项或只反复重跑到偶然成功。通过后若修改源码、版本、依赖、生成文件或构建/发布配置，需验证最终快照；仅补充说明文档时运行对应文档检查即可。
 
 审计通过不代表没有任何告警。记录未维护依赖等允许告警，区分生产依赖审计与 npm ci 输出的全依赖统计，不把后者直接说成生产漏洞数量。
 
@@ -205,7 +205,7 @@ gh run view "$RELEASE_RUN_ID" --repo "$RELEASE_REPO" \
 
 工作流依次完成：
 
-1. 检查同一 SHA 的 CI 成功，校验版本、非空说明和发行边界。
+1. 检查同一 SHA 的 CI 成功，校验版本、非空说明和发行边界。发行边界（release:guard）只在此阶段检查一次；它只依赖源码，与平台无关，四个打包作业不再重复运行。
 2. 并行构建 macOS arm64、macOS x64、Linux x64、Windows x64；真实启动解包程序，访问 /health 与 /web.html，再上传平台附件。
 3. 汇总产物，合并两个 macOS 更新清单并校验 SHA-512；生成旧版迁移包、签名和 latest.json。
 4. 生成 SHA256SUMS、GitHub 构建来源证明，创建正式 Release 并设为 Latest。
@@ -364,7 +364,7 @@ gh workflow run release.yml --repo "$RELEASE_REPO" --ref "$RELEASE_TAG"
 
 | 当前状态 | 恢复方式 |
 | --- | --- |
-| 尚无公开 Release | 修复 → 最终快照完整预检 → 推送 main → 新 SHA 全部 CI 通过 → 安全移动失败 Tag → 新发布流程 → 在线验收 |
+| 尚无公开 Release | 修复 → 最终快照本地预检 → 推送 main → 新 SHA 全部 CI 通过 → 安全移动失败 Tag → 新发布流程 → 在线验收 |
 | 已公开，但代码或安装包有问题 | 发布更高版本，不移动已交付 Tag，不用不同内容覆盖同版本包 |
 | Release 已创建，仅上传或 Feed 收尾失败 | 仍标记未完成，保持原 Tag/SHA，从原 run 恢复失败作业，重新验收全部附件与更新源 |
 
@@ -391,7 +391,7 @@ lease 被拒绝时重新读取远端并调查，不改用无条件 --force。不
 | 后台恢复偶现 ready 而非 consumed | 接纳后后台消费尚未结束 | 等待可观察状态并设截止时间，保留断言，不用任意固定 sleep 掩盖竞态 |
 | Worker 超时测试提前退出或不稳定 | 模拟 IPC 生命周期不完整 | 检查 mock 事件循环存活与资源清理，不跳过超时断言 |
 | Linux apt 长时间卡住 | runner 镜像源连接停滞 | 保留官方镜像配置、连接超时与有限重试，不只延长整个作业超时 |
-| 本地磁盘不足 | Rust 缓存、解包目录、安装包并存 | 检查占用，停止相关构建后清理可重建缓存，再完整预检 |
+| 本地磁盘不足 | Rust 缓存、解包目录、安装包并存 | 检查占用，停止相关构建后清理可重建缓存，再本地预检 |
 | macOS 排队或 Intel 构建慢 | runner 容量或冷缓存 | 观察实际步骤并等待，不重复触发或提前宣称成功 |
 | 迁移签名失败 | Secret、密码或产物名错误 | 核对名称与签名工具，不输出私钥，不省略 .sig |
 | Latest 正确但旧客户端不更新 | 稳定 Feed 未更新或入口仍指向旧包 | 检查固定 Feed、版本、八入口和四份签名，恢复收尾步骤 |
@@ -401,7 +401,7 @@ lease 被拒绝时重新读取远端并调查，不改用无条件 --force。不
 全部完成后才能报告发布成功：
 
 - [ ] 产品版本、说明、Tag 与最终发布提交一致。
-- [ ] 本地完整预检通过，保留日志与允许告警说明。
+- [ ] 本地预检（版本、安装包、审计）通过，保留日志与允许告警说明。
 - [ ] 发布提交已到 main，同一 SHA 的必要 CI 全部成功。
 - [ ] Tag 指向该 SHA，发布工作流整体成功。
 - [ ] 四平台安装包构建与真实启动验收成功。

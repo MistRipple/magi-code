@@ -53,7 +53,7 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 
 ## 发布流程
 
-- [GitHub 新版本发布流程](./release-process.md)：发布前完整预检、main 与 CI 门禁、Tag 顺序及发布后交付物核对。
+- [GitHub 新版本发布流程](./release-process.md)：发布前本地预检、main 与 CI 门禁、Tag 顺序及发布后交付物核对。
 
 ## 目标与代理运行设计
 

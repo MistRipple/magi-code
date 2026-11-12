@@ -60,8 +60,6 @@ jobs:
     steps:
       - name: 检出发布版本
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - name: 安装 Node.js
         uses: actions/setup-node@v7
         with:
@@ -136,8 +134,6 @@ jobs:
           fi
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y libasound2 libgtk-3-0 libnss3 xauth xvfb
-      - name: 校验唯一 Electron 发行边界
-        run: npm run release:guard
       - name: 构建 Web、Worker、daemon、Electron 并组装安装包
         shell: bash
         env:

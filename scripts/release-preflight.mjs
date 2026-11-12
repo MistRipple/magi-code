@@ -28,7 +28,10 @@ const commonSteps = [
   ["Rust 全量测试", "cargo", [rustPrefix(), "test", "--workspace", "--locked"]],
 ];
 
-for (const [label, command, args] of commonSteps) run(label, command, args);
+// 公共检查与 CI 在同一提交上完全相同；本地发布入口只补 CI 做不到的打包与审计。
+if (!options.releaseOnly) {
+  for (const [label, command, args] of commonSteps) run(label, command, args);
+}
 
 if (options.package) {
   run("当前平台 Electron Desktop 发行打包", npm, ["run", "desktop:package"]);
@@ -82,13 +85,15 @@ function rustPrefix() {
 }
 
 function parseArgs(values) {
-  const output = { audit: false, help: false, package: false, tag: null };
+  const output = { audit: false, help: false, package: false, releaseOnly: false, tag: null };
   for (let index = 0; index < values.length; index += 1) {
     const value = values[index];
     if (value === "--help" || value === "-h") {
       output.help = true;
     } else if (value === "--audit") {
       output.audit = true;
+    } else if (value === "--release-only") {
+      output.releaseOnly = true;
     } else if (value === "--package") {
       output.package = true;
     } else if (value === "--tag") {
@@ -106,11 +111,12 @@ function printHelp() {
 
 选项：
   --tag vX.Y.Z   校验 Tag、产品版本和发布说明一致
+  --release-only 跳过与 CI 重复的公共检查，只做版本校验及 --package/--audit
   --package      在当前平台额外执行 Electron Desktop 打包
   --audit        额外执行 npm audit 和 cargo audit
   --help         显示帮助
 
-推荐：
-  npm run release:preflight -- --tag vX.Y.Z --package --audit
+推荐（公共检查由同一提交的 CI 承担）：
+  npm run release:preflight:local -- --tag vX.Y.Z
 `);
 }
