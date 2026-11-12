@@ -2533,6 +2533,7 @@
   "lanAccess.sectionTunnel": "公网隧道",
   "lanAccess.description": "使用同一局域网内的设备扫描二维码即可访问",
   "lanAccess.qrError": "二维码生成失败，请刷新重试",
+  "lanAccess.loopbackOnly": "Magi 当前只监听本机，局域网设备无法访问。如需开放，可通过 MAGI_HOST 指定监听地址（接口没有身份认证，仅限可信网络）。公网隧道不受影响。",
   "lanAccess.copy": "复制链接",
   "lanAccess.copied": "已复制",
   "lanAccess.tunnelOpen": "开启公网隧道",

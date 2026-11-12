@@ -563,8 +563,9 @@ async fn register_workspace_and_snapshot(
 #[tokio::test]
 async fn lan_access_uses_current_daemon_port() {
     let root = unique_temp_dir("magi-changes-route-lan-access");
-    let state =
-        build_state_with_workspace_root(&root, "workspace-lan-access").with_tunnel_port(39219);
+    let state = build_state_with_workspace_root(&root, "workspace-lan-access")
+        .with_tunnel_port(39219)
+        .with_bind_host("0.0.0.0");
 
     let response = routes()
             .with_state(state)
@@ -594,6 +595,47 @@ async fn lan_access_uses_current_daemon_port() {
     let url = payload["url"].as_str().expect("url should be string");
     assert!(url.contains("workspacePath=%2Ftmp%2Fmagi%20test"));
     assert!(url.contains("sessionId=session-lan-access"));
+}
+
+#[test]
+fn lan_reach_follows_the_actual_bind_host() {
+    assert!(matches!(lan_reach("127.0.0.1"), LanReach::Unreachable));
+    assert!(matches!(lan_reach("::1"), LanReach::Unreachable));
+    assert!(matches!(lan_reach("localhost"), LanReach::Unreachable));
+    assert!(matches!(lan_reach("0.0.0.0"), LanReach::AllInterfaces));
+    assert!(matches!(lan_reach("::"), LanReach::AllInterfaces));
+    assert!(matches!(lan_reach("192.168.1.8"), LanReach::Interface(ip) if ip == "192.168.1.8"));
+    assert!(matches!(lan_reach("fd00::8"), LanReach::Interface(ip) if ip == "[fd00::8]"));
+}
+
+#[tokio::test]
+async fn lan_access_is_disabled_when_daemon_only_listens_on_loopback() {
+    let root = unique_temp_dir("magi-changes-route-lan-loopback");
+    let state = build_state_with_workspace_root(&root, "workspace-lan-loopback")
+        .with_tunnel_port(39220)
+        .with_bind_host("127.0.0.1");
+
+    let response = routes()
+        .with_state(state)
+        .oneshot(
+            Request::builder()
+                .uri("/lan-access")
+                .method("GET")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body).expect("payload should deserialize");
+    assert_eq!(payload["enabled"], false);
+    assert!(payload["url"].is_null());
+    assert_eq!(payload["port"], 39220);
 }
 
 #[tokio::test]

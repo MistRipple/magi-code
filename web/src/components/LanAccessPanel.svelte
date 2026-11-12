@@ -11,6 +11,8 @@
   let { visible, onClose }: Props = $props();
 
   let lanUrl = $state('');
+  /** daemon 只监听本机时局域网设备连不上，不展示不可达的链接与二维码。 */
+  let lanEnabled = $state(true);
   let copied = $state(false);
   let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
   let tunnelCopyResetTimer: ReturnType<typeof setTimeout> | undefined;
@@ -60,17 +62,19 @@
 
   async function requestLanInfo() {
     const requestSeq = ++lanInfoRequestSeq;
-    loading = true; lanUrl = ''; qrSvg = ''; qrError = '';
+    loading = true; lanUrl = ''; qrSvg = ''; qrError = ''; lanEnabled = true;
     try {
       const query = currentAccessBindingQuery();
       const res = await getTransport().request(agentUrl('/api/lan-access', query));
       const data = await res.json();
-      const nextLanUrl = typeof data?.url === 'string' ? data.url : '';
+      const nextEnabled = data?.enabled !== false;
+      const nextLanUrl = nextEnabled && typeof data?.url === 'string' ? data.url : '';
       const nextQrSvg = nextLanUrl ? await renderQR(nextLanUrl) : '';
       if (requestSeq !== lanInfoRequestSeq) return;
+      lanEnabled = nextEnabled;
       lanUrl = nextLanUrl;
       qrSvg = nextQrSvg;
-      qrError = nextLanUrl && nextQrSvg ? '' : 'fail';
+      qrError = !nextEnabled || (nextLanUrl && nextQrSvg) ? '' : 'fail';
     } catch {
       if (requestSeq !== lanInfoRequestSeq) return;
       qrError = 'fail';
@@ -227,12 +231,15 @@
       <div class="qr-placeholder">
         <span class="loading-dot"></span><span class="loading-dot"></span><span class="loading-dot"></span>
       </div>
+    {:else if !lanEnabled}
+      <div class="qr-error" role="status" data-testid="lan-access-disabled">{i18n.t('lanAccess.loopbackOnly')}</div>
     {:else if qrSvg}
       <div class="qr-container">{@html qrSvg}</div>
     {:else if qrError}
       <div class="qr-error">{i18n.t('lanAccess.qrError')}</div>
     {/if}
     <div class="panel-body">
+      {#if lanEnabled}
       <p class="panel-desc">{i18n.t('lanAccess.description')}</p>
         <div class="url-row">
           <input class="url-input" type="text" value={lanUrl || ''} placeholder={i18n.t('common.notProvided')} aria-label={i18n.t('lanAccess.sectionLan')} readonly />
@@ -240,6 +247,7 @@
             {#if copied}<Icon name="check" size={14} />{:else}<Icon name="copy" size={14} />{/if}
           </button>
         </div>
+      {/if}
     </div>
   </div>
   <div class="section tunnel-section">

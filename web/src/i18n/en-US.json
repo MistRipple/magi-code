@@ -2533,6 +2533,7 @@
   "lanAccess.sectionTunnel": "Public Tunnel",
   "lanAccess.description": "Scan the QR code from any device on the same network",
   "lanAccess.qrError": "Failed to generate QR code, please refresh",
+  "lanAccess.loopbackOnly": "Magi is listening on this computer only, so devices on your network cannot reach it. To allow that, set the listen address with MAGI_HOST (the API has no sign-in; use trusted networks only). The public tunnel is not affected.",
   "lanAccess.copy": "Copy Link",
   "lanAccess.copied": "Copied",
   "lanAccess.tunnelOpen": "Open Public Tunnel",

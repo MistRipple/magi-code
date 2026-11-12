@@ -785,6 +785,7 @@ pub(crate) struct DaemonRuntime {
     state_root: PathBuf,
     state_repository: StateRepository,
     local_port: u16,
+    bind_host: String,
     daemon_identity: DaemonIdentity,
     event_bus: Arc<InMemoryEventBus>,
     session_store: Arc<SessionStore>,
@@ -891,6 +892,7 @@ impl DaemonRuntime {
             state_root: config.state_root.clone(),
             state_repository,
             local_port: config.port,
+            bind_host: config.host.clone(),
             daemon_identity: config.identity(),
             event_bus,
             session_store,
@@ -1604,6 +1606,7 @@ impl DaemonRuntime {
         .with_task_execution_registry(task_execution_registry.clone())
         .with_agent_role_registry(agent_role_registry)
         .with_tunnel_port(self.local_port)
+        .with_bind_host(self.bind_host.clone())
         .with_plugin_manager(self.plugins.manager())
         .with_extension_status(self.plugins.extension_status())
         .with_plugin_route_executor(self.plugins.route_executor())

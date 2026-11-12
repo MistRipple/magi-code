@@ -1131,12 +1131,44 @@ async fn tunnel_status(State(state): State<ApiState>) -> Json<serde_json::Value>
     Json(serde_json::to_value(&tunnel_state).unwrap_or_default())
 }
 
+/// 局域网设备能否连上 daemon：只监听回环时不能；监听具体网卡时只有该地址可用；监听全部网卡时取首选局域网地址。
+enum LanReach {
+    Unreachable,
+    Interface(String),
+    AllInterfaces,
+}
+
+fn lan_reach(bind_host: &str) -> LanReach {
+    let host = bind_host.trim();
+    if host.eq_ignore_ascii_case("localhost") {
+        return LanReach::Unreachable;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_loopback() => LanReach::Unreachable,
+        Ok(ip) if ip.is_unspecified() => LanReach::AllInterfaces,
+        Ok(std::net::IpAddr::V6(ip)) => LanReach::Interface(format!("[{ip}]")),
+        Ok(ip) => LanReach::Interface(ip.to_string()),
+        Err(_) => LanReach::AllInterfaces,
+    }
+}
+
 async fn lan_access_status(
     State(state): State<ApiState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    let ip = resolve_preferred_lan_ipv4();
     let port = state.tunnel_manager.local_port().await;
+    let ip = match lan_reach(&state.bind_host) {
+        LanReach::Unreachable => {
+            return Json(serde_json::json!({
+                "enabled": false,
+                "url": null,
+                "ip": null,
+                "port": port,
+            }));
+        }
+        LanReach::Interface(ip) => ip,
+        LanReach::AllInterfaces => resolve_preferred_lan_ipv4(),
+    };
 
     let binding = RemoteAccessBinding::new(
         query.get("workspaceId").map(String::as_str),

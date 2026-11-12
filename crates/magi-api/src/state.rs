@@ -1460,6 +1460,8 @@ pub struct ApiState {
     /// 扩展 `input` 钩子端口；None 表示没有可执行扩展。
     pub(crate) input_guard: Option<Arc<dyn magi_conversation_runtime::extension_hooks::InputGuard>>,
     pub tunnel_manager: crate::tunnel::TunnelManager,
+    /// daemon 实际监听的地址；局域网访问入口据此判断其他设备能否连上。
+    pub(crate) bind_host: String,
     /// 插件安装、授权和生命周期的唯一 daemon 领域服务。
     pub plugin_manager: Arc<Mutex<magi_plugin_system::PluginManager>>,
     pub(crate) plugin_jobs: Arc<crate::plugin_jobs::PluginJobs>,
@@ -2252,6 +2254,7 @@ impl ApiState {
             plugin_installations,
             input_guard: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
+            bind_host: "127.0.0.1".to_string(),
             plugin_manager,
             mcp_service: Arc::new(crate::mcp_runtime::McpServiceRuntime::in_memory()),
             plugin_jobs: Arc::new(crate::plugin_jobs::PluginJobs::open(
@@ -2275,6 +2278,11 @@ impl ApiState {
 
     pub fn with_tunnel_port(mut self, port: u16) -> Self {
         self.tunnel_manager = crate::tunnel::TunnelManager::new(port);
+        self
+    }
+
+    pub fn with_bind_host(mut self, host: impl Into<String>) -> Self {
+        self.bind_host = host.into();
         self
     }
 
