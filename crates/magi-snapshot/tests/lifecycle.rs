@@ -1059,3 +1059,44 @@ async fn a_file_rewritten_by_someone_else_is_reported_before_it_can_be_reverted(
         "A 的最后一次写入之后文件被改过，回退前必须能查出来"
     );
 }
+
+/// 并发工具的结果里会带上对方的改动（工作区差异观测）。结果补充的路径若已被另一个活动工具
+/// 在启动前声明，就不能让后结束的调用抢走归属。
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_result_paths_do_not_steal_ownership_from_another_active_tool() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let mgr = SnapshotManager::new();
+    let session = mgr
+        .start_session("s-concurrent-ownership".into(), root.clone())
+        .await
+        .unwrap();
+
+    let ctx = |id: &str, path: &str| ToolHookCtx {
+        tool_call_id: id.into(),
+        worker_id: None,
+        execution_group_id: Some("concurrent".into()),
+        declared_paths: vec![PathBuf::from(path)],
+    };
+    let call_a = ctx("call-a", "a.txt");
+    let call_b = ctx("call-b", "b.txt");
+    session.before_tool(&call_a);
+    session.before_tool(&call_b);
+    fs::write(root.join("a.txt"), "from a").unwrap();
+    fs::write(root.join("b.txt"), "from b").unwrap();
+
+    // B 先结束，其结果观测到了 a.txt 的变化并把它补进了 declared_paths。
+    let mut finished_b = call_b.clone();
+    finished_b.declared_paths.push(PathBuf::from("a.txt"));
+    session.after_tool(&finished_b);
+    session.after_tool(&call_a);
+
+    let pending = session.pending_changes().unwrap();
+    for (path, owner) in [("a.txt", "call-a"), ("b.txt", "call-b")] {
+        let change = pending
+            .iter()
+            .find(|change| change.path == path)
+            .unwrap_or_else(|| panic!("{path} 应被记录"));
+        assert_eq!(change.tool_call_id.as_deref(), Some(owner), "{path}");
+    }
+}

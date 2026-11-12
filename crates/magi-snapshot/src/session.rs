@@ -1292,7 +1292,31 @@ impl ToolHook for SnapshotSession {
     }
 
     fn after_tool(&self, ctx: &ToolHookCtx) {
+        // 工具结束后才补进 declared_paths 的路径来自结果里观测到的工作区差异，并发时会包含其他
+        // 活动工具声明的改动；这类路径若已被另一个活动工具在启动前声明，就归那个工具，
+        // 不能被后结束的调用覆盖归属。
+        let foreign_declared: Vec<PathBuf> = {
+            let active = self.active_tool_ctxs.read().expect("ctx poisoned");
+            let own_declared = active
+                .get(&ctx.tool_call_id)
+                .map(|own| own.declared_paths.as_slice())
+                .unwrap_or_default();
+            ctx.declared_paths
+                .iter()
+                .filter(|path| !own_declared.contains(path))
+                .filter(|path| {
+                    active.values().any(|other| {
+                        other.tool_call_id != ctx.tool_call_id
+                            && other.declared_paths.contains(path)
+                    })
+                })
+                .cloned()
+                .collect()
+        };
         for p in &ctx.declared_paths {
+            if foreign_declared.contains(p) {
+                continue;
+            }
             let abs = if p.is_absolute() {
                 p.clone()
             } else {
