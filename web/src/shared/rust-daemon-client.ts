@@ -62,7 +62,6 @@ import type {
   NotificationsResponseDto,
   SessionRenameRequestDto,
   ExecutionStatsResponseDto,
-  ExecutionAdmissionSnapshotDto,
   SessionTurnRequestDto,
   SessionTurnResponseDto,
   SettingsUpdateRequestDto,
@@ -172,10 +171,6 @@ export class RustDaemonClient {
 
   public async fetchRuntimeReadModel(): Promise<RuntimeReadModelDto> {
     return this.getJson<RuntimeReadModelDto>('/runtime/read-model');
-  }
-
-  public async fetchExecutionAdmission(): Promise<ExecutionAdmissionSnapshotDto | null> {
-    return this.getJson<ExecutionAdmissionSnapshotDto | null>('/runtime/execution-admission');
   }
 
   public async fetchAuditUsageLedger(): Promise<AuditUsageLedgerDto> {

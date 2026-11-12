@@ -37,7 +37,6 @@ const CONTEXT_USAGE_EMIT_TOKEN_DELTA: u64 = 128;
 pub enum AuxiliaryModelPurpose {
     SessionTitle,
     PromptEnhance,
-    PromptSuggestions,
     KnowledgeExtraction,
     SessionMemoryExtraction,
 }
@@ -47,7 +46,6 @@ impl AuxiliaryModelPurpose {
         match self {
             Self::SessionTitle => "session_title",
             Self::PromptEnhance => "prompt_enhance",
-            Self::PromptSuggestions => "prompt_suggestions",
             Self::KnowledgeExtraction => "knowledge_extraction",
             Self::SessionMemoryExtraction => "session_memory_extraction",
         }
@@ -1419,7 +1417,6 @@ mod tests {
         let purposes = [
             AuxiliaryModelPurpose::SessionTitle,
             AuxiliaryModelPurpose::PromptEnhance,
-            AuxiliaryModelPurpose::PromptSuggestions,
             AuxiliaryModelPurpose::KnowledgeExtraction,
             AuxiliaryModelPurpose::SessionMemoryExtraction,
         ];
@@ -1444,7 +1441,7 @@ mod tests {
                     event_bus: &bus,
                     session_store: &store,
                     settings_store: None,
-                    session_id: (index < 10).then_some(&session),
+                    session_id: (index < 8).then_some(&session),
                     workspace_id: &None,
                     call_id: format!("call-{index}"),
                     phase: UsagePhase::Integration,
@@ -1455,15 +1452,15 @@ mod tests {
             .unwrap();
         }
         let keys = client.0.lock().unwrap();
-        assert_eq!(keys[..5], keys[5..10]);
+        assert_eq!(keys[..4], keys[4..8]);
         assert_eq!(
             keys[..5]
                 .iter()
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
-            5
+            4
         );
-        assert!(keys[10].is_none());
+        assert!(keys[8].is_none());
     }
 
     #[test]

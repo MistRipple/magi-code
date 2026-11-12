@@ -90,10 +90,6 @@ pub fn routes() -> Router<ApiState> {
             get(list_annotations).post(create_annotation),
         )
         .route(
-            "/browser/annotations/{annotation_id}/status",
-            post(update_annotation_status),
-        )
-        .route(
             "/browser/annotations/{annotation_id}",
             post(update_annotation_comment),
         )
@@ -1245,12 +1241,6 @@ enum BrowserAnnotationSelectionRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct UpdateBrowserAnnotationStatusRequest {
-    status: BrowserAnnotationStatus,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateBrowserAnnotationCommentRequest {
     comment: String,
 }
@@ -1871,45 +1861,6 @@ fn normalize_hit_bounds(
         width: right - left,
         height: bottom - top,
     })
-}
-
-async fn update_annotation_status(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Path(annotation_id): Path<String>,
-    Json(request): Json<UpdateBrowserAnnotationStatusRequest>,
-) -> Result<Json<BrowserAnnotationResponse>, ApiError> {
-    require_desktop_browser_capability(&state, &headers, None)?;
-    let annotation_id = BrowserAnnotationId::new(annotation_id);
-    let annotation = state
-        .browser_authority
-        .lock()
-        .expect("browser authority lock poisoned")
-        .annotation(&annotation_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("浏览器标记不存在", annotation_id.as_str()))?;
-    let (_tab, session) = browser_tab_scope(&state, &annotation.tab_id)?;
-    ensure_user_control_for_ui(&state, &session, &annotation.tab_id).await?;
-    let _control_guard = state
-        .browser_control_locks
-        .lock_tab(&annotation.tab_id)
-        .await;
-    let updated = state.mutate_browser_authority(|authority| {
-        authority.update_annotation_status(&annotation_id, request.status, UtcMillis::now())
-    })?;
-    sync_browser_annotations_to_host(&state, &updated.tab_id).await?;
-    publish_browser_event(
-        &state,
-        "browser.annotation.status_changed",
-        session.owner_workspace_id(),
-        require_session_scope(&session)?,
-        serde_json::json!({
-            "annotation_id": updated.annotation_id,
-            "tab_id": updated.tab_id,
-            "status": updated.status,
-        }),
-    );
-    Ok(Json(BrowserAnnotationResponse::from(updated)))
 }
 
 async fn update_annotation_comment(
