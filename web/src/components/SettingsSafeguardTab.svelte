@@ -72,7 +72,7 @@
       {#if view === 'rules' && safeguardStatusText}
         <div class="rules-save-status" class:error={safeguardSaveStatus === 'error'}>
           {#if safeguardSaveStatus === 'saving'}
-            <Icon name="refresh" size={13} />
+            <Icon name="loader" size={13} class="spinning" />
           {:else if safeguardSaveStatus === 'saved'}
             <Icon name="check" size={13} />
           {:else}

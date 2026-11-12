@@ -63,9 +63,7 @@
       disabled={Boolean(resolving) || resolved || !approvalIsActive}
       onclick={() => void resolve('allow_once')}
     >
-      {resolving === 'allow_once'
-        ? i18n.t('toolCall.approval.processing')
-        : i18n.t(isExternalApproval ? 'mcpServer.approvals.allow' : 'toolCall.approval.allowOnce')}
+      {#if resolving === 'allow_once'}<Icon name="loader" size={13} class="spinning" /> {i18n.t('toolCall.approval.processing')}{:else}{i18n.t(isExternalApproval ? 'mcpServer.approvals.allow' : 'toolCall.approval.allowOnce')}{/if}
     </button>
     {#if offersTurnWideAllow}
       <button
@@ -74,9 +72,7 @@
         disabled={Boolean(resolving) || resolved || !approvalIsActive}
         onclick={() => void resolve('allow_for_turn')}
       >
-        {resolving === 'allow_for_turn'
-          ? i18n.t('toolCall.approval.processing')
-          : i18n.t(approval.agent ? 'toolCall.approval.allowForTurnAgent' : 'toolCall.approval.allowForTurn')}
+        {#if resolving === 'allow_for_turn'}<Icon name="loader" size={13} class="spinning" /> {i18n.t('toolCall.approval.processing')}{:else}{i18n.t(approval.agent ? 'toolCall.approval.allowForTurnAgent' : 'toolCall.approval.allowForTurn')}{/if}
       </button>
     {/if}
     <button
@@ -85,7 +81,7 @@
       disabled={Boolean(resolving) || resolved || !approvalIsActive}
       onclick={() => void resolve('deny')}
     >
-      {resolving === 'deny' ? i18n.t('toolCall.approval.processing') : i18n.t('toolCall.approval.deny')}
+      {#if resolving === 'deny'}<Icon name="loader" size={13} class="spinning" /> {i18n.t('toolCall.approval.processing')}{:else}{i18n.t('toolCall.approval.deny')}{/if}
     </button>
   </div>
   {#if resolved}

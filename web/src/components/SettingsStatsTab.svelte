@@ -556,7 +556,7 @@
             aria-label={isRefreshing ? i18n.t('settings.stats.checking') : i18n.t('settings.stats.check')}
             title={isRefreshing ? i18n.t('settings.stats.checking') : i18n.t('settings.stats.check')}
           >
-            <Icon name="refresh" size={14} />
+            {#if isRefreshing}<Icon name="loader" size={14} class="spinning" />{:else}<Icon name="refresh" size={14} />{/if}
           </button>
           <button
             class="ghost-action danger"

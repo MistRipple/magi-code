@@ -24,6 +24,7 @@
     type GitWorktree,
   } from '../web/agent-api';
   import Icon from './Icon.svelte';
+  import LoadingText from './LoadingText.svelte';
   import { selectedComposerSourceFolderId } from '../stores/composer-workspace.svelte';
   import { RUNTIME_CONNECTION_EVENT, type AgentConnectionEventDetail } from '../web/agent-api';
 
@@ -354,7 +355,7 @@
             <button type="button" class="btn btn--primary btn--sm" disabled={interactionLocked || gitContextState.contextDrift} onclick={() => void createWorktree()}>{i18n.t('input.branch.worktreeCreate')}</button>
           </div>
           {#if worktreesLoading}
-            <div class="git-empty">{i18n.t('input.branch.loading')}</div>
+            <div class="git-empty"><LoadingText text={i18n.t('input.branch.loading')} size={13} /></div>
           {:else if worktrees.length === 0}
             <div class="git-empty">{i18n.t('input.branch.worktreeEmpty')}</div>
           {:else}

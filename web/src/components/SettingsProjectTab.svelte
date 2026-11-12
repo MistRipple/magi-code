@@ -190,7 +190,7 @@
           aria-label={`${i18n.t('settings.about.versionDetails')} v${displayVersion}`}
           onclick={() => { detailsOpen = !detailsOpen; }}
         >
-          <span class="about-dot about-dot--{chipTone}" aria-hidden="true"></span>
+          {#if chipTone === 'busy'}<Icon name="loader" size={10} class="spinning" />{:else}<span class="about-dot about-dot--{chipTone}" aria-hidden="true"></span>{/if}
           <span class="about-version-number">v{displayVersion}</span>
           <Icon name="info" size={13} />
         </button>
@@ -219,7 +219,7 @@
             <div class="about-popover-section">
               {#if updateStatus}
                 <div class="about-status">
-                  <span class="about-dot about-dot--{updateStatus.tone}" aria-hidden="true"></span>
+                  {#if updateStatus.tone === 'busy'}<Icon name="loader" size={10} class="spinning" />{:else}<span class="about-dot about-dot--{updateStatus.tone}" aria-hidden="true"></span>{/if}
                   <span>{updateStatus.text}</span>
                 </div>
                 {#if lastCheckedText}

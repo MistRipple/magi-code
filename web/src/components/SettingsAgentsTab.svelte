@@ -582,7 +582,7 @@
               </div>
               {#if editorError}<div class="role-editor-error" role="alert">{editorError}</div>{/if}
               <footer class="role-editor-footer">
-                <button type="submit" class="btn btn--primary btn--sm" disabled={editorBusy}>{editorBusy ? i18n.t('settings.agents.editor.saving') : i18n.t('settings.agents.editor.save')}</button>
+                <button type="submit" class="btn btn--primary btn--sm" disabled={editorBusy}>{#if editorBusy}<Icon name="loader" size={13} class="spinning" /> {i18n.t('settings.agents.editor.saving')}{:else}{i18n.t('settings.agents.editor.save')}{/if}</button>
               </footer>
             </form>
           </div>

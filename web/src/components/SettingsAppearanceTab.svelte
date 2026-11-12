@@ -548,7 +548,7 @@
         <footer class="editor-footer">
           <button class="btn btn--secondary btn--sm" type="button" onclick={() => void closeEditor()} disabled={Boolean(busyAction)}>{i18n.t('common.cancel')}</button>
           <button class="btn btn--primary btn--sm" type="button" onclick={() => void saveDraft()} disabled={Boolean(busyAction) || !draft.name.trim() || !canPreview(draft)}>
-            {busyAction === 'save' ? i18n.t('common.loading') : i18n.t('appearance.saveAndApply')}
+            {#if busyAction === 'save'}<Icon name="loader" size={13} class="spinning" /> {i18n.t('common.loading')}{:else}{i18n.t('appearance.saveAndApply')}{/if}
           </button>
         </footer>
       </section>

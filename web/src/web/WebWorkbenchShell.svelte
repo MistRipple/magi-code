@@ -14,6 +14,7 @@
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { setWebSidebarContext } from './sidebar-context';
   import Icon from '../components/Icon.svelte';
+  import LoadingText from '../components/LoadingText.svelte';
   import { delegatedTooltip } from '../lib/delegated-tooltip';
   import UnavailableSessionList from '../components/UnavailableSessionList.svelte';
   import NotificationCenter from '../components/NotificationCenter.svelte';
@@ -3259,7 +3260,7 @@ import {
         <div id="workspace-section-content" class:sidebar-section-content--collapsed={workspacesCollapsed}>
         {#if !workspacesCollapsed}
         {#if loading}
-          <div class="sidebar-empty">{i18n.t('common.loading')}</div>
+          <div class="sidebar-empty"><LoadingText text={i18n.t('common.loading')} size={13} /></div>
         {:else if agentRecovering}
           <div class="sidebar-empty sidebar-empty--recovering">
             <Icon name="loader" size={13} />
@@ -3339,7 +3340,7 @@ import {
                 {#if expandedWorkspaceIds[workspace.workspaceId]}
                   <div class="workspace-children">
                     {#if loadingWorkspaceIds[workspace.workspaceId] && !Object.prototype.hasOwnProperty.call(sessionsByWorkspace, workspace.workspaceId)}
-                      <div class="sidebar-empty sidebar-empty--nested">{i18n.t('common.loading')}</div>
+                      <div class="sidebar-empty sidebar-empty--nested"><LoadingText text={i18n.t('common.loading')} size={13} /></div>
                     {:else if workspaceSessionErrors[workspace.workspaceId] && getWorkspaceSidebarSessionList(workspace.workspaceId).length === 0}
                       <div class="sidebar-error">{workspaceSessionErrors[workspace.workspaceId]}</div>
                     {:else if getWorkspaceSidebarSessionList(workspace.workspaceId).length === 0}
@@ -3589,7 +3590,7 @@ import {
             })}
           />
         {:else}
-          <div class="sidebar-empty">{i18n.t('common.loading')}</div>
+          <div class="sidebar-empty"><LoadingText text={i18n.t('common.loading')} size={13} /></div>
         {/if}
         </section>
       {/if}
@@ -3627,7 +3628,7 @@ import {
         {#if !personalSessionsCollapsed}
           <div id="personal-session-content">
             {#if personalSessionsLoading && personalSessionRows.length === 0}
-              <div class="sidebar-empty sidebar-empty--nested">{i18n.t('common.loading')}</div>
+              <div class="sidebar-empty sidebar-empty--nested"><LoadingText text={i18n.t('common.loading')} size={13} /></div>
             {:else if personalSessionsError && personalSessionRows.length === 0}
               <div class="sidebar-error">{personalSessionsError}</div>
             {:else if personalSessionRows.length === 0}
@@ -3825,7 +3826,7 @@ import {
         disabled={workspaceActionPending}
       />
     {:else}
-      <div class="sidebar-empty">{i18n.t('common.loading')}</div>
+      <div class="sidebar-empty"><LoadingText text={i18n.t('common.loading')} size={13} /></div>
     {/if}
   </Modal>
 {/if}
@@ -3912,7 +3913,7 @@ import {
   <button class="btn btn--secondary" type="button" onclick={closeProjectEditor} disabled={workspaceActionPending}>{i18n.t('web.folderPickerCancel')}</button>
   <button class="btn btn--primary" type="submit" form={projectEditorFormId}
     disabled={workspaceActionPending || !projectEditPrimary || !projectEditFolders.length || !projectEffectiveName}>
-    {workspaceActionPending ? i18n.t('common.loading') : i18n.t(projectEditWorkspace ? 'web.saveWorkspaceChanges' : 'web.createProjectTitle')}
+    {#if workspaceActionPending}<Icon name="loader" size={13} class="spinning" /> {i18n.t('common.loading')}{:else}{i18n.t(projectEditWorkspace ? 'web.saveWorkspaceChanges' : 'web.createProjectTitle')}{/if}
   </button>
 {/snippet}
 

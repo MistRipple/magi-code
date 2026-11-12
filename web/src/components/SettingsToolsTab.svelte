@@ -4,6 +4,7 @@
   import FileName from './FileName.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
+  import LoadingText from './LoadingText.svelte';
   import Toggle from './Toggle.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
   import { getAgentSkillDetail } from '../web/agent-api';
@@ -992,7 +993,7 @@
                           </div>
                         {/if}
                         {#if mcpRefreshingServers.has(server.id)}
-                          <div class="mcp-tools-empty">{i18n.t('settings.tools.loading')}</div>
+                          <div class="mcp-tools-empty"><LoadingText text={i18n.t('settings.tools.loading')} size={13} /></div>
                         {:else if mcpServerTools[server.id] && mcpServerTools[server.id].length > 0}
                           {#each mcpServerTools[server.id] as tool}
                             <div class="mcp-tool-item">
@@ -1040,7 +1041,7 @@
             </div>
             <div class="settings-section-actions">
               <button class="btn btn--secondary btn--sm" onclick={() => checkSkillUpdates()} disabled={skillUpdatesChecking}>
-                <Icon name="refresh" size={14} />
+                {#if skillUpdatesChecking}<Icon name="loader" size={14} class="spinning" />{:else}<Icon name="refresh" size={14} />{/if}
                 <span>{skillUpdatesChecking ? i18n.t('settings.tools.checkingSkillUpdates') : i18n.t('settings.tools.checkSkillUpdates')}</span>
               </button>
               {#if skillUpdateAvailableCount > 0}
@@ -1144,7 +1145,7 @@
                   {@const state = skillDetails[skill.skillId]}
                   <div class="skill-detail">
                     {#if !state || state.status === 'loading'}
-                      <div class="skill-detail-note">{i18n.t('settings.tools.loading')}</div>
+                      <div class="skill-detail-note"><LoadingText text={i18n.t('settings.tools.loading')} size={13} /></div>
                     {:else if state.status === 'error'}
                       <div class="skill-detail-note skill-detail-note--error" role="alert">{state.message}</div>
                     {:else}

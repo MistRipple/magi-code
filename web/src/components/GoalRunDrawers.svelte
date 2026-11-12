@@ -747,7 +747,7 @@
                     class="btn btn--primary btn--sm"
                     disabled={goalActionLoading !== null || !goalDraftSavable}
                   >
-                    {goalActionLoading === 'save' ? i18n.t('common.loading') : i18n.t('common.save')}
+                    {#if goalActionLoading === 'save'}<Icon name="loader" size={13} class="spinning" /> {i18n.t('common.loading')}{:else}{i18n.t('common.save')}{/if}
                   </button>
                 </span>
               </div>

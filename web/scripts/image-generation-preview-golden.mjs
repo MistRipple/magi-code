@@ -95,7 +95,8 @@ assert.match(
   'image_generate 成功后必须直接展示图片，不再包裹通用工具卡片',
 );
 assert.match(generatedImageSource, /<ToolCardMeta \{status\}/, '图片生成使用统一状态圆点与右侧列');
-assert.match(generatedImageSource, /@keyframes generated-image-pulse/, '生成占位保留轻量动态反馈');
+assert.match(generatedImageSource, /<LoadingText[^>]*generatedImagePending/, '生成占位使用统一的旋转圆圈等待反馈');
+assert.doesNotMatch(generatedImageSource, /generated-image-pulse/, '生成占位不再使用呼吸动画');
 assert.doesNotMatch(generatedImageSource, /prefers-reduced-motion:reduce[\s\S]*?animation:none/, '图片生成等待反馈不能被局部规则冻结，统一使用共享低动态效果');
 assert.doesNotMatch(generatedImageSource, /linear-gradient|backdrop-filter|generated-image-progress-dots/, '生成状态不再堆叠渐变、玻璃胶囊和多组状态点');
 

@@ -108,7 +108,7 @@
       </div>
     {/each}
     {#each Array.from({ length: pendingCount }) as _, index (index)}
-      <div class="image-tray-item image-tray-pending" aria-hidden="true"></div>
+      <div class="image-tray-item image-tray-pending" role="status" aria-label={i18n.t('common.loading')}><Icon name="loader" size={14} class="spinning" /></div>
     {/each}
   </div>
   <div class="image-tray-meta">
@@ -242,7 +242,10 @@
     background: var(--surface-2);
     border: 1px dashed var(--border);
     border-radius: var(--radius-sm);
-    animation: imageTrayPulse 1.2s ease-in-out infinite;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--foreground-muted);
   }
 
   .image-tray-meta {
@@ -350,8 +353,4 @@
   .image-lightbox-nav.next { right: 24px; top: 50%; transform: translateY(-50%); }
   .image-lightbox-close { top: 20px; right: 20px; }
 
-  @keyframes imageTrayPulse {
-    0%, 100% { opacity: 0.45; }
-    50% { opacity: 0.9; }
-  }
 </style>

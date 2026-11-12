@@ -20,6 +20,7 @@
     summarizeMergePlan,
   } from '../lib/isolation-merge';
   import Icon from './Icon.svelte';
+  import LoadingText from './LoadingText.svelte';
   import Modal from './Modal.svelte';
 
   let loading = $state(true);
@@ -153,7 +154,7 @@
       <div class="merge-exit-hint">{i18n.t('isolation.merge.exitHint')}</div>
     {/if}
     {#if loading}
-      <div class="merge-status">{i18n.t('isolation.merge.loading')}</div>
+      <div class="merge-status"><LoadingText text={i18n.t('isolation.merge.loading')} size={13} /></div>
     {:else if loadError}
       <div class="merge-status merge-status--error">{loadError}</div>
     {:else if entries.length === 0}
@@ -241,7 +242,7 @@
           disabled={applying || loading || mergeableCount === 0}
           onclick={() => void apply()}
         >
-          {applying ? i18n.t('isolation.merge.applying') : i18n.t('isolation.merge.apply')}
+          {#if applying}<Icon name="loader" size={13} class="spinning" /> {i18n.t('isolation.merge.applying')}{:else}{i18n.t('isolation.merge.apply')}{/if}
         </button>
       </div>
     {/snippet}

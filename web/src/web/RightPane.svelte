@@ -7,6 +7,7 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
   import { resolveComposerSourceFolder } from '../stores/composer-workspace.svelte';
   import { onMount, tick } from 'svelte';
   import Icon from '../components/Icon.svelte';
+  import LoadingText from '../components/LoadingText.svelte';
   import { getAgentBrandInfo, getAgentRunColor } from '../lib/agent-colors';
   import { selectLauncherAgents } from '../lib/active-agent-center';
   import { getAgentRunState, selectAgentRun } from '../stores/agent-run-store.svelte';
@@ -1264,7 +1265,7 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
         active={visible}
       />
     {:else if previewLoading}
-      <div class="right-pane-state">{i18n.t('web.filePreviewLoading')}</div>
+      <div class="right-pane-state"><LoadingText text={i18n.t('web.filePreviewLoading')} size={14} /></div>
     {:else if previewError}
       <div class="right-pane-state right-pane-state--error">
         {previewError}

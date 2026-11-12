@@ -38,6 +38,7 @@
   } from '../web/agent-api';
   import type { AgentBindingOverride } from '../web/agent-binding-context';
   import Icon from './Icon.svelte';
+  import LoadingText from './LoadingText.svelte';
   import UserQuestionPanel from './UserQuestionPanel.svelte';
   import GoalRunDrawers from './GoalRunDrawers.svelte';
   import { userQuestionState } from '../stores/user-question-store.svelte';
@@ -3599,7 +3600,7 @@ async function refreshPickerSettingsSnapshot() {
                       </div>
                     {/if}
                     {#if currentPickerSourceError}<p class="ia-picker-status-error" role="alert">{i18n.t('input.mainModelSourceUnavailable')}</p>{/if}
-                    {#if !currentReasoningCapability && reasoningReadStatus === 'loading'}<p class="ia-reasoning-hint" role="status">{i18n.t('settings.model.reasoning.loading')}</p>
+                    {#if !currentReasoningCapability && reasoningReadStatus === 'loading'}<p class="ia-reasoning-hint"><LoadingText text={i18n.t('settings.model.reasoning.loading')} size={12} /></p>
                     {:else if !currentReasoningCapability && reasoningReadStatus === 'failed'}<p class="ia-reasoning-hint" role="alert">{i18n.t('settings.model.reasoning.failed')}</p><button type="button" class="btn btn--sm btn--secondary" onclick={() => reasoningRetry++}>{i18n.t('input.mainModelPicker.retry')}</button>
                     {:else if !reasoningOptions.length}<p class="ia-reasoning-hint">{i18n.t(currentReasoningCapability?.source === 'unknown' ? 'input.mainModelPicker.reasoning.unknown' : 'input.mainModelPicker.reasoning.unsupported')}</p>
                     {/if}
@@ -3627,7 +3628,7 @@ async function refreshPickerSettingsSnapshot() {
                   <input type="search" class="form-input" bind:value={modelSearch} placeholder={i18n.t('selection.search')} aria-label={i18n.t('selection.searchFor', { label: i18n.t('input.mainModelPicker.header') })} />
                 {/if}
                 {#if pickerLoading}
-                  <div class="ia-picker-status">{i18n.t('input.mainModelPicker.loading')}</div>
+                  <div class="ia-picker-status"><LoadingText text={i18n.t('input.mainModelPicker.loading')} size={13} /></div>
                 {:else if pickerError}
                   <div class="ia-picker-status ia-picker-status-error">
                     {pickerError}

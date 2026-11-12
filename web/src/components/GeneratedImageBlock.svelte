@@ -9,6 +9,7 @@
     parseImageGenerationPreview,
   } from '../lib/image-generation-preview';
   import Icon from './Icon.svelte';
+  import LoadingText from './LoadingText.svelte';
   import ToolCardMeta from './ToolCardMeta.svelte';
   import FileName from './FileName.svelte';
   import { resolveToolDisplayName } from '../lib/tool-display-name';
@@ -74,7 +75,7 @@
   <div class="message-card generated-image-block" role="status" aria-live="polite">
     {@render header()}
     <div class="generated-image-progress" style:aspect-ratio={requestedAspectRatio}>
-      <span>{i18n.t('messageItem.generatedImagePending')}</span>
+      <LoadingText text={i18n.t('messageItem.generatedImagePending')} size={16} />
     </div>
   </div>
 {/if}
@@ -90,6 +91,4 @@
   .generated-image-button:focus-visible { outline:0; box-shadow:inset 0 0 0 2px var(--primary); }
   figcaption { margin:0; padding:9px var(--tool-card-padding) 12px; color:var(--foreground-muted); font-size:var(--text-xs); overflow-wrap:anywhere; text-wrap:pretty; }
   .generated-image-progress { display:flex; align-items:center; justify-content:center; width:100%; min-height:150px; max-height:320px; background:var(--code-bg); color:var(--foreground-muted); font-size:var(--text-sm); }
-  .generated-image-progress > span { animation:generated-image-pulse 1.5s ease-in-out infinite; }
-  @keyframes generated-image-pulse { 50% { opacity:.4; } }
 </style>

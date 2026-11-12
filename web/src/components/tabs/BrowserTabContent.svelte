@@ -3,6 +3,7 @@
   import FileName from '../FileName.svelte';
   import { onMount, tick, untrack } from 'svelte';
   import Icon from '../Icon.svelte';
+  import LoadingText from '../LoadingText.svelte';
   import { delegatedTooltip } from '../../lib/delegated-tooltip';
   import AgentCursorOverlay, { type AgentCursorSignal } from './AgentCursorOverlay.svelte';
   import { agentCursorPoint, normalizeAgentCursorAction } from '../../lib/agent-cursor';
@@ -2144,7 +2145,7 @@ function browserPartitionForSession(browserSessionId: string): string { return `
       {/if}
     {:else}
       {#if loading}
-        <div class="browser-placeholder">{i18n.t('common.loading')}</div>
+        <div class="browser-placeholder"><LoadingText text={i18n.t('common.loading')} size={16} /></div>
       {:else if sessionError}
         <div class="browser-placeholder error">{sessionError}</div>
       {:else if activeTab}

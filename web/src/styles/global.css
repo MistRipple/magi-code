@@ -1910,7 +1910,8 @@ strong, b { font-weight: var(--font-bold); }
     .right-pane-add-tab[aria-busy='true'] svg, .git-repository-stats button.loading svg,
     .refreshing svg, .ghost-action.saving svg,
     .btn:is(.is-testing, .is-saving) svg, .ia-context-picker-loading svg,
-    .update-status-action-icon--spinning, .update-status-progress-ring--indeterminate
+    .update-status-action-icon--spinning, .update-status-progress-ring--indeterminate,
+    .notice-icon.compacting, .skill-row-progress, .resource-empty svg, .image-tray-pending svg
   ) {
     animation-name: magi-status-spin !important;
     animation-duration: 1s !important;
@@ -1920,12 +1921,10 @@ strong, b { font-weight: var(--font-bold); }
 
   /* 其余关键持续反馈（非转圈）保留缓慢明暗循环；替换位移，不恢复装饰性动效。 */
   :is(
-    .skill-row-progress,
     .turn-runtime-dot, .tool-card-meta .status-dot.pulsing, .executor-status .status-dot.running,
-    .generated-image-progress > span, .ia-context-ring.estimating .ring-fill,
-    .notice-icon.compacting,
+    .ia-context-ring.estimating .ring-fill,
     .agent-cursor-dots span,
-    .streaming-badge, .image-tray-pending
+    .streaming-badge
   ),
   .conversation-process-row.streaming .process-marker::before,
   .turn-navigation-marker.running::before,

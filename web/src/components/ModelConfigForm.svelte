@@ -603,7 +603,7 @@
         disabled={isTesting || isSaving}
       >
         {#if currentTestStatus === 'testing'}
-          <Icon name="refresh" size={14} />
+          <Icon name="loader" size={14} class="spinning" />
           {i18n.t('settings.model.testing')}
         {:else if currentTestStatus === 'success'}
           <Icon name="check" size={14} />
@@ -623,7 +623,7 @@
         disabled={saveDisabled}
       >
         {#if isSaving}
-          <Icon name="refresh" size={14} />
+          <Icon name="loader" size={14} class="spinning" />
           {i18n.t('settings.model.saving')}
         {:else if showSavedLabel}
           <Icon name="check" size={14} />

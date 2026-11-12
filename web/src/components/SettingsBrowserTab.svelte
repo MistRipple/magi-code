@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Icon from './Icon.svelte';
+  import LoadingText from './LoadingText.svelte';
   import Toggle from './Toggle.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import {
@@ -485,7 +486,7 @@
           <span class="settings-row-desc">
             {i18n.t('settings.browser.resourcesReclaimable', { count: browserResources?.reclaimableTabs ?? '—' })}
           </span>
-          {#if resourceLoading && !browserResources}<span class="settings-row-desc" role="status">{i18n.t('settings.browser.resourcesReading')}</span>{/if}
+          {#if resourceLoading && !browserResources}<span class="settings-row-desc"><LoadingText text={i18n.t('settings.browser.resourcesReading')} size={13} /></span>{/if}
         </div>
         <button
           type="button"

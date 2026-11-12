@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Icon from './Icon.svelte';
+  import LoadingText from './LoadingText.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import { addToast } from '../stores/messages.svelte';
@@ -159,7 +160,7 @@
   {/if}
 
   {#if loading}
-    <div class="audit-status">{i18n.t('common.loading')}</div>
+    <div class="audit-status"><LoadingText text={i18n.t('common.loading')} size={13} /></div>
   {:else if nextBefore !== null}
     <div class="audit-more">
       <button type="button" class="btn btn--secondary btn--sm" onclick={() => void load(nextBefore)}>

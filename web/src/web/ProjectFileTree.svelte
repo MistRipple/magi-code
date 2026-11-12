@@ -2,6 +2,7 @@
   import FileName from '../components/FileName.svelte';
   import { onMount, untrack } from 'svelte';
   import Icon from '../components/Icon.svelte';
+  import LoadingText from '../components/LoadingText.svelte';
   import FileTypeIcon from '../components/FileTypeIcon.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import {
@@ -251,7 +252,7 @@
   {#if !rootPath && !sessionId}
     <div class="file-tree-empty">{i18n.t('web.projectFilesNoWorkspace')}</div>
   {:else if rootLoading && rootEntries.length === 0}
-    <div class="file-tree-empty">{i18n.t('common.loading')}</div>
+    <div class="file-tree-empty"><LoadingText text={i18n.t('common.loading')} size={13} /></div>
   {:else if rootError}
     <div class="file-tree-error">{rootError}</div>
   {:else if rootEntries.length === 0}
@@ -300,7 +301,7 @@
     {#if entry.isDirectory && expanded}
       <div class="file-tree-children" role="group">
         {#if loading && children.length === 0}
-          <div class="file-tree-status" style={`--tree-depth: ${depth + 1}`}>{i18n.t('common.loading')}</div>
+          <div class="file-tree-status" style={`--tree-depth: ${depth + 1}`}><LoadingText text={i18n.t('common.loading')} size={12} /></div>
         {:else if error}
           <div class="file-tree-status file-tree-status--error" style={`--tree-depth: ${depth + 1}`}>{error}</div>
         {:else if children.length === 0}

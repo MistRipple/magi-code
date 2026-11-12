@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Icon from './Icon.svelte';
   import type { ContentBlock } from '../types/message';
   import { coerceToolArgumentsRecord } from '../lib/tool-call-display';
   import type { FilePreviewScope } from '../lib/file-reference';
@@ -98,7 +99,7 @@
     <div class="tool-output-truncated" data-testid="tool-output-truncated" aria-busy={loadingFull}>
       <span>{i18n.t('toolCall.truncatedOutput', { omitted: truncatedRef.omittedChars })}</span>
       <button type="button" class="btn btn--secondary btn--sm" disabled={loadingFull} onclick={loadFullResult}>
-        {i18n.t(loadingFull ? 'common.loading' : 'toolCall.loadFullOutput')}
+        {#if loadingFull}<Icon name="loader" size={13} class="spinning" /> {i18n.t('common.loading')}{:else}{i18n.t('toolCall.loadFullOutput')}{/if}
       </button>
       {#if loadFullFailed}
         <span class="tool-output-error" role="alert">{i18n.t('toolCall.loadFullOutputFailed')}</span>

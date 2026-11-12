@@ -248,7 +248,7 @@
       <div class="notification-list">
         {#if notificationStatus.isLoading && filteredNotifications.length === 0}
           <div class="empty-state">
-            <Icon name="refresh" size={24} class="spin" />
+            <Icon name="loader" size={24} class="spinning" />
             <span>{i18n.t('notification.loading')}</span>
           </div>
         {:else if notificationStatus.error && filteredNotifications.length === 0}

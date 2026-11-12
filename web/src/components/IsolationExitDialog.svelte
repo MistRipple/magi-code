@@ -13,6 +13,7 @@
   } from '../stores/session-isolation-store.svelte';
   import { isolationOriginBlockingSession, summarizeMergePlan } from '../lib/isolation-merge';
   import Icon from './Icon.svelte';
+  import LoadingText from './LoadingText.svelte';
   import Modal from './Modal.svelte';
 
   const PREVIEW_LIMIT = 6;
@@ -100,7 +101,7 @@
     closeOnEscape={!working}
   >
     {#if loading}
-      <div class="exit-status">{i18n.t('isolation.exit.checking')}</div>
+      <div class="exit-status"><LoadingText text={i18n.t('isolation.exit.checking')} size={13} /></div>
     {:else if loadError}
       <p class="exit-text exit-text--error">{i18n.t('isolation.exit.checkFailed', { error: loadError })}</p>
     {:else if pending.length === 0}

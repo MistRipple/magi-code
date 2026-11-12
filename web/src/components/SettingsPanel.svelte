@@ -522,7 +522,7 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
                 disabled={store.saveStatus.mcp === 'saving'}
               >
                 {#if store.saveStatus.mcp === 'saving'}
-                  <Icon name="refresh" size={14} />
+                  <Icon name="loader" size={14} class="spinning" />
                   {i18n.t('settings.mcp.saving')}
                 {:else if store.saveStatus.mcp === 'saved'}
                   <Icon name="check" size={14} />
@@ -562,7 +562,7 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
             <div class="repo-manage-list">
               {#if store.repositoriesLoading}
                 <div class="loading-state">
-                  <Icon name="refresh" size={24} />
+                  <Icon name="loader" size={24} class="spinning" />
                   <span>{i18n.t('settings.repo.loading')}</span>
                 </div>
               {:else if store.repositories.length === 0}
@@ -613,7 +613,7 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
                 </button>
                 <button class="btn btn--secondary btn--sm" onclick={store.installLocalSkill} disabled={store.localSkillInstalling}>
                   {#if store.localSkillInstalling}
-                    <Icon name="refresh" size={14} />
+                    <Icon name="loader" size={14} class="spinning" />
                     {i18n.t('settings.skillLibrary.importing')}
                   {:else}
                     <Icon name="plus" size={14} />
@@ -681,7 +681,7 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
                             disabled={(skill.installed && !skill.updateAvailable) || store.installingSkills.has(skill.fullName) || store.skillUpdatingIds.has(skill.fullName)}
                           >
                             {#if store.installingSkills.has(skill.fullName) || store.skillUpdatingIds.has(skill.fullName)}
-                              <Icon name="refresh" size={14} />
+                              <Icon name="loader" size={14} class="spinning" />
                               {i18n.t('settings.skillLibrary.installing')}
                             {:else if skill.installed && skill.updateAvailable}
                               {skill.source === 'local' ? i18n.t('settings.tools.reloadSkill') : i18n.t('settings.tools.updateSkill')}
