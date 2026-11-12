@@ -849,11 +849,6 @@ async fn get_file_content(
     Ok(Json(payload))
 }
 
-/// 按文件扩展名推断图片 MIME 类型；非图片返回 None（用于白名单拦截）。
-fn image_mime_for_path(path: &Path) -> Option<&'static str> {
-    magi_media::image_content_type(path)
-}
-
 /// 返回图片文件原始字节流（带 Content-Type），供前端 `<img src>` 直接预览。
 ///
 /// 与 `/files/content`（仅 UTF-8 文本）职责分离：图片是二进制，read_to_string
@@ -880,7 +875,7 @@ async fn get_file_raw(
     )?;
     let absolute_path = safe_file_preview_path(&state, &scope.root, path)?;
 
-    let mime = image_mime_for_path(&absolute_path)
+    let mime = magi_media::image_content_type(&absolute_path)
         .ok_or_else(|| ApiError::InvalidInput("仅支持图片文件预览".to_string()))?;
 
     let bytes = std::fs::read(&absolute_path)

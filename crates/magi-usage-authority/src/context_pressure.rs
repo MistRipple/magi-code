@@ -260,16 +260,6 @@ impl ContextPressureSnapshot {
         }
     }
 
-    pub fn usage_ratio(&self) -> f64 {
-        (self.projected_request_tokens as f64 / self.context_window_tokens.max(1) as f64)
-            .clamp(0.0, 1.0)
-    }
-
-    pub fn remaining_tokens(&self) -> u64 {
-        self.context_window_tokens
-            .saturating_sub(self.projected_request_tokens)
-    }
-
 }
 
 /// provider 锚点后新增的模型可见内容。所有调用方都必须先通过该函数合并，

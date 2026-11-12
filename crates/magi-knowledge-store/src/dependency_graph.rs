@@ -17,14 +17,6 @@ pub struct DependencyEdge {
     pub import_type: ImportType,
 }
 
-#[derive(Clone, Debug)]
-pub struct FileCentrality {
-    pub file_path: String,
-    pub in_degree: usize,
-    pub out_degree: usize,
-    pub centrality: f64,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DependencyGraphSnapshot {
     pub forward_deps: Vec<(String, Vec<String>)>,
@@ -186,47 +178,6 @@ impl DependencyGraph {
         let mut expanded = visited.into_iter().collect::<Vec<_>>();
         expanded.sort();
         expanded
-    }
-
-    pub fn get_top_central_files(&self, n: usize) -> Vec<FileCentrality> {
-        let mut all_files = HashSet::new();
-        all_files.extend(self.forward_deps.keys().cloned());
-        all_files.extend(self.reverse_deps.keys().cloned());
-
-        let mut results: Vec<FileCentrality> = all_files
-            .into_iter()
-            .map(|file_path| {
-                let in_degree = self
-                    .reverse_deps
-                    .get(&file_path)
-                    .map(|s| s.len())
-                    .unwrap_or(0);
-                let out_degree = self
-                    .forward_deps
-                    .get(&file_path)
-                    .map(|s| s.len())
-                    .unwrap_or(0);
-                let centrality = self
-                    .centrality_cache
-                    .get(&file_path)
-                    .copied()
-                    .unwrap_or(0.0);
-                FileCentrality {
-                    file_path,
-                    in_degree,
-                    out_degree,
-                    centrality,
-                }
-            })
-            .collect();
-
-        results.sort_by(|a, b| {
-            b.centrality
-                .partial_cmp(&a.centrality)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        results.truncate(n);
-        results
     }
 
     pub fn get_stats(&self) -> DependencyGraphStats {
@@ -920,18 +871,5 @@ from ..app import create_app
 
         g.path_aliases.insert("@/".to_string(), "src/".to_string());
         assert!(g.is_internal_path("@/utils"));
-    }
-
-    #[test]
-    fn test_top_central_files() {
-        let mut g = DependencyGraph::new();
-        g.add_edge("a.ts", "hub.ts", ImportType::Static);
-        g.add_edge("b.ts", "hub.ts", ImportType::Static);
-        g.add_edge("c.ts", "hub.ts", ImportType::Static);
-        g.compute_centrality();
-
-        let top = g.get_top_central_files(2);
-        assert!(!top.is_empty());
-        assert_eq!(top[0].file_path, "hub.ts");
     }
 }

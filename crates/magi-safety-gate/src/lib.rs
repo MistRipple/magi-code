@@ -200,9 +200,6 @@ impl SafetyDecision {
     pub fn is_allow(&self) -> bool {
         matches!(self, Self::Allow)
     }
-    pub fn is_block(&self) -> bool {
-        matches!(self, Self::HardBlock { .. })
-    }
     pub fn is_require_approval(&self) -> bool {
         matches!(self, Self::RequireApprovalInRestricted { .. })
     }
@@ -847,7 +844,7 @@ mod tests {
             "shell_exec",
             &serde_json::json!({ "command": "deploy production" }).to_string(),
         );
-        assert!(decision.is_block());
+        assert!(matches!(decision, SafetyDecision::HardBlock { .. }));
     }
 
     #[test]

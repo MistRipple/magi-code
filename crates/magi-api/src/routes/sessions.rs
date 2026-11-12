@@ -973,33 +973,9 @@ async fn mark_all_notifications_read(
     )))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ClearNotificationsRequest {
-    session_id: Option<String>,
-    #[serde(default)]
-    workspace_id: Option<String>,
-    #[serde(default)]
-    workspace_path: Option<String>,
-}
-
-impl ClearNotificationsRequest {
-    fn requested_session_id(&self) -> Option<SessionId> {
-        parse_requested_session_id(self.session_id.as_deref())
-    }
-
-    fn requested_workspace_id(&self) -> Option<&str> {
-        trimmed_non_empty(self.workspace_id.as_deref())
-    }
-
-    fn requested_workspace_path(&self) -> Option<&str> {
-        trimmed_non_empty(self.workspace_path.as_deref())
-    }
-}
-
 async fn clear_notifications(
     State(state): State<ApiState>,
-    Json(request): Json<ClearNotificationsRequest>,
+    Json(request): Json<NotificationScopeRequest>,
 ) -> Result<Json<NotificationsResponseDto>, ApiError> {
     let scope = resolve_session_scope(
         &state,

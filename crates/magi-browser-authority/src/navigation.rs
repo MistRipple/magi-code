@@ -35,11 +35,6 @@ pub fn normalize_browser_page_state(
     ("about:blank".to_string(), None, String::new())
 }
 
-pub fn browser_navigation_origin(raw_url: &str) -> Option<String> {
-    let url = Url::parse(raw_url.trim()).ok()?;
-    matches!(url.scheme(), "http" | "https").then(|| url.origin().ascii_serialization())
-}
-
 /// 校验所有进入 Browser Host 的 URL。浏览器不做逐 Origin 授权，但固定阻止危险
 /// scheme、URL 凭据和云元数据 / 链路本地地址，避免本机网络边界被网页导航绕过。
 /// 规则来自 `contracts/desktop-browser/network-policy.json`，Electron Main 使用同一份。

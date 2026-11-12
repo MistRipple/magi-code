@@ -2,9 +2,7 @@ use magi_usage_authority::ReasoningEffort;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-use crate::llm_types::{
-    LlmContentBlock, LlmMessage, LlmMessageContent, LlmUsage, ToolCall, ToolDefinition,
-};
+use crate::llm_types::{LlmContentBlock, LlmMessage, LlmMessageContent, LlmUsage, ToolDefinition};
 
 /// 部分 OpenAI-compatible 服务省略工具调用 id。运行时仍需要稳定 id 将 assistant
 /// tool_call 与后续 tool_result 配对，因此在协议边界根据调用内容生成本轮稳定标识。
@@ -35,43 +33,6 @@ pub fn reasoning_effort_label(effort: ReasoningEffort) -> &'static str {
     crate::reasoning::effort_label(effort)
 }
 
-pub fn estimate_message_tokens(messages: &[LlmMessage]) -> u64 {
-    let mut total = 0u64;
-    for msg in messages {
-        total += 4;
-        match &msg.content {
-            LlmMessageContent::Text(text) => {
-                total += (text.len() as u64) / 4;
-            }
-            LlmMessageContent::Blocks(blocks) => {
-                for block in blocks {
-                    match block {
-                        LlmContentBlock::Text { text } => {
-                            total += (text.len() as u64) / 4;
-                        }
-                        LlmContentBlock::ToolUse { input, .. } => {
-                            total += (input.to_string().len() as u64) / 4 + 20;
-                        }
-                        LlmContentBlock::ToolResult {
-                            content, images, ..
-                        } => {
-                            total += (content.len() as u64) / 4 + 10;
-                            total += images.len() as u64 * 1000;
-                        }
-                        LlmContentBlock::Image { .. } => {
-                            total += 1000;
-                        }
-                        LlmContentBlock::ProviderContext { context } => {
-                            total += (context.data.to_string().len() as u64) / 4;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    total
-}
-
 pub fn serialize_tool_definitions(tools: &[ToolDefinition]) -> Vec<Value> {
     tools
         .iter()
@@ -99,30 +60,6 @@ pub fn serialize_anthropic_tool_definitions(tools: &[ToolDefinition]) -> Vec<Val
             })
         })
         .collect()
-}
-
-pub fn convert_tool_calls_to_openai(tool_calls: &[ToolCall]) -> Vec<Value> {
-    tool_calls
-        .iter()
-        .map(|tc| {
-            json!({
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.name,
-                    "arguments": tc.arguments_for_wire(),
-                }
-            })
-        })
-        .collect()
-}
-
-pub fn convert_tool_results_to_openai(tool_call_id: &str, content: &str) -> Value {
-    json!({
-        "role": "tool",
-        "tool_call_id": tool_call_id,
-        "content": content,
-    })
 }
 
 pub fn convert_messages_to_openai(messages: &[LlmMessage]) -> Vec<Value> {

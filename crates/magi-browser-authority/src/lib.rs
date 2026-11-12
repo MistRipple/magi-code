@@ -41,8 +41,8 @@ pub use host_client::{
 };
 pub use host_protocol::*;
 pub use navigation::{
-    BrowserNavigationUrlError, browser_navigation_origin, normalize_browser_page_state,
-    validate_browser_navigation_url, validate_browser_navigation_url_with,
+    BrowserNavigationUrlError, normalize_browser_page_state, validate_browser_navigation_url,
+    validate_browser_navigation_url_with,
 };
 
 #[cfg(test)]

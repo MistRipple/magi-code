@@ -38,22 +38,6 @@ async fn transfer_agent_run(
         .map(Json)
 }
 
-fn require_task_request_scope(
-    state: &ApiState,
-    session_id_value: Option<&str>,
-    requested_scope: SessionScopeKindDto,
-    workspace_id_value: Option<&str>,
-    workspace_path_value: Option<&str>,
-) -> Result<SessionRequestScope, ApiError> {
-    require_session_request_scope(
-        state,
-        session_id_value,
-        requested_scope,
-        workspace_id_value,
-        workspace_path_value,
-    )
-}
-
 fn turn_contains_task_root(
     store: &TaskStore,
     turn: &ActiveExecutionTurn,
@@ -112,7 +96,7 @@ fn require_session_historical_task(
     workspace_path_value: Option<&str>,
     task_id: &str,
 ) -> Result<(SessionRequestScope, magi_core::Task), ApiError> {
-    let scope = require_task_request_scope(
+    let scope = require_session_request_scope(
         state,
         session_id_value,
         requested_scope,

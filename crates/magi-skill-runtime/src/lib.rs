@@ -353,20 +353,6 @@ impl SkillRegistry {
         }
     }
 
-    pub fn is_tool_allowed(&self, skill_id: &str, tool_name: &str) -> bool {
-        self.get(skill_id).is_some_and(|skill| {
-            skill.standard_tool_access().allows(tool_name)
-                || skill
-                    .custom_tool_bindings
-                    .iter()
-                    .any(|binding| binding.tool_name == tool_name)
-        })
-    }
-
-    pub fn resolve_context(&self, selection: &SkillSelection) -> ResolvedSkillContext {
-        Self::resolve_selected_context(selection, self.selected_skills(selection))
-    }
-
     fn selected_skills(&self, selection: &SkillSelection) -> Vec<SkillDefinition> {
         let skills = self.list();
         selection
@@ -518,21 +504,10 @@ impl SkillRuntime {
         self.registry.clone()
     }
 
-    pub fn resolve(&self, selection: SkillSelection) -> ResolvedSkillContext {
-        self.registry.resolve_context(&selection)
-    }
-
     pub fn build_tool_runtime_plan(&self, selection: SkillSelection) -> SkillToolRuntimePlan {
         self.registry.build_tool_runtime_plan(&selection)
     }
 
-    pub fn is_tool_allowed(&self, skill_ids: &[String], tool_name: &str) -> bool {
-        let plan = self.build_tool_runtime_plan(SkillSelection {
-            skill_ids: skill_ids.to_vec(),
-            requested_tools: vec![tool_name.to_string()],
-        });
-        plan.tool_policy.tool_name_rejection(tool_name).is_none()
-    }
 }
 
 impl SkillDispatchRuntime {
