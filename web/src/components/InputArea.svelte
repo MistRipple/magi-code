@@ -637,9 +637,6 @@
   const MAX_INPUT_CHARS = MAX_COMPOSER_TEXT_CHARS;
   let inputTextareaEl = $state<HTMLDivElement | null>(null);
   let isComposing = $state(false);
-  // Safari/Chromium 在 compositionend 后偶尔会再补发一次 Enter；这段
-  // 短暂保护期只吞掉该重复事件，不改变后续正常发送。
-  let compositionEndedAt = $state(0);
   let pendingCaretOffset = $state<number | null>(null);
   const sendButtonTitle = $derived.by(() => {
     if (sendPreparing) {
@@ -1712,12 +1709,10 @@
 
   function handleCompositionStart() {
     isComposing = true;
-    compositionEndedAt = 0;
   }
 
   function handleCompositionEnd() {
     isComposing = false;
-    compositionEndedAt = Date.now();
     handleComposerInput();
   }
 
@@ -2194,10 +2189,6 @@
       event.preventDefault();
       closeSlashMenu();
       insertNewlineAtCursor();
-      return;
-    }
-    if (isEnterKey(event) && compositionEndedAt > 0 && Date.now() - compositionEndedAt < 500) {
-      event.preventDefault();
       return;
     }
     if (slashMenuOpen) {

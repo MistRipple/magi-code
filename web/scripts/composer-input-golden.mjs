@@ -65,9 +65,6 @@ const handlers = names.map(name => {
 }).join('\n');
 const makeHarness = new Function(ts.transpileModule(`
   let isComposing = false;
-  let compositionEndedAt = 0;
-  let now = 1000;
-  const Date = { now: () => now };
   let slashMenuOpen = false;
   let slashHighlightIndex = 0;
   const filteredSlashCommands = [{ id: 'first' }, { id: 'second' }];
@@ -84,7 +81,6 @@ const makeHarness = new Function(ts.transpileModule(`
     start: handleCompositionStart,
     end: handleCompositionEnd,
     menu: () => { slashMenuOpen = true; },
-    advance: (ms) => { now += ms; },
     snapshot: () => ({ calls: [...calls], index: slashHighlightIndex, menuOpen: slashMenuOpen }),
   };
 `, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText);
@@ -146,30 +142,24 @@ for (const signal of ['event flag', 'legacy 229', 'component composition']) {
   }
 }
 
-check('composition ending suppresses Safari duplicate Enter, later ordinary Enter submits once', () => {
+check('Enter sends right after composition ends; the confirming Enter (229) stays with the IME', () => {
   const h = makeHarness();
   h.start();
   press(h, { isComposing: true });
   h.end();
   press(h, { keyCode: 229 });
   assert.deepEqual(h.snapshot().calls, ['input'], 'IME completion only synchronizes text');
-  press(h);
-  assert.deepEqual(h.snapshot().calls, ['input'], 'duplicate Enter inside the composition grace period is swallowed');
-  h.advance(501);
-  press(h);
-  assert.deepEqual(h.snapshot().calls, ['input', 'send']);
+  const e = press(h);
+  assert.deepEqual(h.snapshot().calls, ['input', 'send'], 'no time-based guard: the next Enter submits immediately');
+  assert.equal(e.prevented, true);
 });
 
 for (const menuOpen of [false, true]) {
-  check(`composition grace period blocks duplicate command selection (menu=${menuOpen})`, () => {
+  check(`Enter right after composition ends is not delayed (menu=${menuOpen})`, () => {
     const h = makeHarness();
     h.start();
     h.end();
     if (menuOpen) h.menu();
-    h.advance(499);
-    assert.equal(press(h).prevented, true);
-    assert.deepEqual(h.snapshot().calls, ['input']);
-    h.advance(1);
     press(h);
     assert.deepEqual(h.snapshot().calls, ['input', menuOpen ? 'commit:first' : 'send']);
   });
