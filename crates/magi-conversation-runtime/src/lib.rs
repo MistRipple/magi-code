@@ -110,7 +110,7 @@ pub use tool_approval::{
     ApprovalRequestAgent, PendingToolApproval, TOOL_APPROVAL_TTL_MILLIS, ToolApprovalDecision,
     ToolApprovalRegistry, ToolApprovalRequestOutcome,
 };
-pub(crate) use tool_batch::execute_task_tool_call_batch;
+pub(crate) use tool_batch::{TaskToolBatchEnv, execute_task_tool_call_batch};
 pub use turn_contract::{TaskRunRecord, TurnCommand, TurnEventEnvelope, TurnRecord};
 pub use user_question::{
     PendingUserQuestion, UserQuestion, UserQuestionAnswer, UserQuestionOption,

@@ -60,7 +60,8 @@ impl LlmTaskDispatcher {
             .and_then(Value::as_str)
             .map(|id| {
                 self.pipeline
-                    .task_store.as_ref()
+                    .task_store
+                    .as_ref()
                     .get_task(&TaskId::new(id))
                     .ok_or("调用任务不存在")
             })
@@ -119,7 +120,8 @@ impl LlmTaskDispatcher {
             .as_ref()
             .and_then(|task| {
                 self.pipeline
-                    .task_store.as_ref()
+                    .task_store
+                    .as_ref()
                     .get_active_lease(&task.task_id)
             })
             .map(|lease| lease.worker_id);
@@ -682,31 +684,33 @@ impl LlmTaskDispatcher {
                     .is_some_and(|current| current.lease_id == lease.lease_id)
         };
         let results = crate::tool_batch::execute_task_tool_call_batch(
-            &self.event_bus,
-            Some(registry),
-            &self.agent_role_registry,
-            self.skill_runtime.as_deref(),
-            self.skill_dispatch_runtime.as_deref(),
-            None,
-            store,
-            &self.session_store,
-            &self.execution_registry,
-            &self.conversation_registry,
-            safety.as_ref(),
-            &plan,
-            None,
-            &prepared.task,
-            &owner.session,
-            &workspace,
-            prepared.root.as_ref(),
-            Some(&lease.worker_id),
-            None,
+            &crate::tool_batch::TaskToolBatchEnv {
+                event_bus: &self.event_bus,
+                tool_registry: Some(registry),
+                agent_role_registry: &self.agent_role_registry,
+                skill_runtime: self.skill_runtime.as_deref(),
+                skill_dispatch_runtime: self.skill_dispatch_runtime.as_deref(),
+                skill_name: None,
+                task_store: store,
+                session_store: &self.session_store,
+                execution_registry: &self.execution_registry,
+                conversation_registry: &self.conversation_registry,
+                safety_gate: safety.as_ref(),
+                plan_store: &plan,
+                project_memory: None,
+                task: &prepared.task,
+                session_id: &owner.session,
+                workspace_id: &workspace,
+                workspace_root_path: prepared.root.as_ref(),
+                worker_id: Some(&lease.worker_id),
+                browser_capability_snapshot: None,
+                on_progress: Some(&progress),
+                workspace_resources: Some(prepared.resources),
+                execution_group_id: None,
+                execution_allowed: &allowed,
+            },
             calls,
             &mut ledger,
-            Some(&progress),
-            Some(prepared.resources),
-            None,
-            &allowed,
         );
         let mut results = hooked
             .map(|hooked| hooked.merge(results.clone()))

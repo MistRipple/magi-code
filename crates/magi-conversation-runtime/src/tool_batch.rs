@@ -71,17 +71,20 @@ use crate::{
 mod agent_tools;
 use agent_tools::*;
 mod context_tools;
-pub(crate) use context_tools::{context_reference_ids};
+pub(crate) use context_tools::context_reference_ids;
 use context_tools::*;
 mod tool_policy;
-pub(crate) use tool_policy::{SafetyEvaluationAuditContext, ToolPreflightDecision, policy_tool_decision, policy_tool_preflight_decision_in_context, publish_safety_evaluation_audit};
-#[cfg(test)]
-pub(crate) use tool_policy::access_profile_tool_decision;
 #[cfg(test)]
 pub(crate) use tool_policy::AccessProfileToolDecisionInput;
+#[cfg(test)]
+pub(crate) use tool_policy::access_profile_tool_decision;
 use tool_policy::*;
+pub(crate) use tool_policy::{
+    SafetyEvaluationAuditContext, ToolPreflightDecision, policy_tool_decision,
+    policy_tool_preflight_decision_in_context, publish_safety_evaluation_audit,
+};
 mod coordinator_tools;
-pub(crate) use coordinator_tools::{execute_goal_tool};
+pub(crate) use coordinator_tools::execute_goal_tool;
 use coordinator_tools::*;
 
 #[derive(Clone, Copy)]
@@ -184,34 +187,46 @@ fn tool_arguments_preview(value: &str) -> String {
     preview
 }
 
-#[allow(clippy::too_many_arguments)]
+/// 一批工具调用执行所需的运行环境。调用方按字段名构造，避免 25 个位置参数的顺序错误。
+#[derive(Clone)]
+pub(crate) struct TaskToolBatchEnv<'a> {
+    pub(crate) event_bus: &'a InMemoryEventBus,
+    pub(crate) tool_registry: Option<&'a ToolRegistry>,
+    pub(crate) agent_role_registry: &'a magi_agent_role::AgentRoleRegistry,
+    pub(crate) skill_runtime: Option<&'a magi_skill_runtime::SkillRuntime>,
+    pub(crate) skill_dispatch_runtime: Option<&'a magi_skill_runtime::SkillDispatchRuntime>,
+    pub(crate) skill_name: Option<&'a str>,
+    pub(crate) task_store: &'a TaskStore,
+    pub(crate) session_store: &'a SessionStore,
+    pub(crate) execution_registry: &'a TaskExecutionRegistry,
+    pub(crate) conversation_registry: &'a ConversationRegistry,
+    pub(crate) safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
+    pub(crate) plan_store: &'a magi_plan::PlanStore,
+    pub(crate) project_memory: Option<&'a magi_project_memory::ProjectMemoryStore>,
+    pub(crate) task: &'a magi_core::Task,
+    pub(crate) session_id: &'a SessionId,
+    pub(crate) workspace_id: &'a Option<WorkspaceId>,
+    pub(crate) workspace_root_path: Option<&'a PathBuf>,
+    pub(crate) worker_id: Option<&'a magi_core::WorkerId>,
+    pub(crate) browser_capability_snapshot: Option<BrowserCapabilitySnapshot>,
+    pub(crate) on_progress:
+        Option<&'a (dyn Fn(ToolExecutionProgress) -> Result<(), String> + Sync)>,
+    pub(crate) workspace_resources: Option<crate::workspace_execution::WorkspaceExecutionResources>,
+    pub(crate) execution_group_id: Option<String>,
+    pub(crate) execution_allowed: &'a (dyn Fn() -> bool + Sync),
+}
+
 pub(crate) fn execute_task_tool_call_batch(
-    event_bus: &InMemoryEventBus,
-    tool_registry: Option<&ToolRegistry>,
-    agent_role_registry: &magi_agent_role::AgentRoleRegistry,
-    skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
-    skill_dispatch_runtime: Option<&magi_skill_runtime::SkillDispatchRuntime>,
-    skill_name: Option<&str>,
-    task_store: &TaskStore,
-    session_store: &SessionStore,
-    execution_registry: &TaskExecutionRegistry,
-    conversation_registry: &ConversationRegistry,
-    safety_gate: Option<&magi_safety_gate::SafetyGate>,
-    plan_store: &magi_plan::PlanStore,
-    project_memory: Option<&magi_project_memory::ProjectMemoryStore>,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    workspace_root_path: Option<&PathBuf>,
-    worker_id: Option<&magi_core::WorkerId>,
-    browser_capability_snapshot: Option<BrowserCapabilitySnapshot>,
+    env: &TaskToolBatchEnv<'_>,
     tool_calls: &[ChatToolCall],
     tool_execution_ledger: &mut ToolExecutionLedger,
-    on_progress: Option<&(dyn Fn(ToolExecutionProgress) -> Result<(), String> + Sync)>,
-    workspace_resources: Option<crate::workspace_execution::WorkspaceExecutionResources>,
-    execution_group_id: Option<String>,
-    execution_allowed: &(dyn Fn() -> bool + Sync),
 ) -> Vec<(String, ExecutionResultStatus)> {
+    let execution_allowed = env.execution_allowed;
+    let execution_registry = env.execution_registry;
+    let task = env.task;
+    let workspace_id = env.workspace_id;
+    let tool_registry = env.tool_registry;
+    let workspace_resources = &env.workspace_resources;
     if !execution_allowed() {
         return tool_calls
             .iter()
@@ -261,33 +276,7 @@ pub(crate) fn execute_task_tool_call_batch(
                 .iter()
                 .map(|(_, call)| call.clone())
                 .collect::<Vec<_>>();
-            execute_task_tool_call_batch(
-                event_bus,
-                tool_registry,
-                agent_role_registry,
-                skill_runtime,
-                skill_dispatch_runtime,
-                skill_name,
-                task_store,
-                session_store,
-                execution_registry,
-                conversation_registry,
-                safety_gate,
-                plan_store,
-                project_memory,
-                task,
-                session_id,
-                workspace_id,
-                workspace_root_path,
-                worker_id,
-                browser_capability_snapshot.clone(),
-                &calls,
-                tool_execution_ledger,
-                on_progress,
-                workspace_resources.clone(),
-                execution_group_id.clone(),
-                execution_allowed,
-            )
+            execute_task_tool_call_batch(env, &calls, tool_execution_ledger)
         };
         let mut merged: Vec<Option<(String, ExecutionResultStatus)>> = vec![None; tool_calls.len()];
         for group in [&steps_calls, &other_calls] {
@@ -306,62 +295,39 @@ pub(crate) fn execute_task_tool_call_batch(
             .and_then(|resources| resources.directories.as_ref()),
     );
     tool_execution_ledger.execute_batch_with(tool_calls, tool_registry, |execution_calls| {
-        execute_task_tool_call_batch_unchecked(
-            event_bus,
-            tool_registry,
-            agent_role_registry,
-            skill_runtime,
-            skill_dispatch_runtime,
-            skill_name,
-            task_store,
-            session_store,
-            execution_registry,
-            conversation_registry,
-            safety_gate,
-            plan_store,
-            project_memory,
-            task,
-            session_id,
-            workspace_id,
-            workspace_root_path,
-            worker_id,
-            browser_capability_snapshot.clone(),
-            execution_calls,
-            on_progress,
-            workspace_resources.clone(),
-            execution_group_id.clone(),
-            execution_allowed,
-        )
+        execute_task_tool_call_batch_unchecked(env, execution_calls)
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn execute_task_tool_call_batch_unchecked(
-    event_bus: &InMemoryEventBus,
-    tool_registry: Option<&ToolRegistry>,
-    agent_role_registry: &magi_agent_role::AgentRoleRegistry,
-    skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
-    skill_dispatch_runtime: Option<&magi_skill_runtime::SkillDispatchRuntime>,
-    skill_name: Option<&str>,
-    task_store: &TaskStore,
-    session_store: &SessionStore,
-    execution_registry: &TaskExecutionRegistry,
-    conversation_registry: &ConversationRegistry,
-    safety_gate: Option<&magi_safety_gate::SafetyGate>,
-    plan_store: &magi_plan::PlanStore,
-    project_memory: Option<&magi_project_memory::ProjectMemoryStore>,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    workspace_root_path: Option<&PathBuf>,
-    worker_id: Option<&magi_core::WorkerId>,
-    browser_capability_snapshot: Option<BrowserCapabilitySnapshot>,
+    env: &TaskToolBatchEnv<'_>,
     tool_calls: &[ChatToolCall],
-    on_progress: Option<&(dyn Fn(ToolExecutionProgress) -> Result<(), String> + Sync)>,
-    workspace_resources: Option<crate::workspace_execution::WorkspaceExecutionResources>,
-    execution_group_id: Option<String>,
-    execution_allowed: &(dyn Fn() -> bool + Sync),
 ) -> Vec<(String, ExecutionResultStatus)> {
+    let TaskToolBatchEnv {
+        event_bus,
+        tool_registry,
+        agent_role_registry,
+        skill_runtime,
+        skill_dispatch_runtime,
+        skill_name,
+        task_store,
+        session_store,
+        execution_registry,
+        conversation_registry,
+        safety_gate,
+        plan_store,
+        project_memory,
+        task,
+        session_id,
+        workspace_id,
+        workspace_root_path,
+        worker_id,
+        browser_capability_snapshot,
+        on_progress,
+        workspace_resources,
+        execution_group_id,
+        execution_allowed,
+    } = env.clone();
     let hook_contexts = tool_calls
         .iter()
         .map(|tool_call| ToolHookCtx {

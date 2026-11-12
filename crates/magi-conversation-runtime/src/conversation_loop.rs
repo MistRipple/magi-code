@@ -13,8 +13,8 @@ use crate::model_context_window::{
 };
 use crate::session_writeback::{
     CanonicalTurnEventSink, ContextCompactionWritebackContext, SessionStatePersistCallback,
-    SessionTurnStreamPublishGate, SessionTurnStreamUpdate,
-    apply_model_response_round, new_context_compaction_item_id, persist_session_state_checkpoint,
+    SessionTurnStreamPublishGate, SessionTurnStreamUpdate, apply_model_response_round,
+    new_context_compaction_item_id, persist_session_state_checkpoint,
     publish_current_session_turn_item_event, publish_model_retry_runtime_event,
     publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
     session_turn_stream_update, upsert_context_compaction_completed_notice,
@@ -38,15 +38,15 @@ use crate::tool_surface_state::{
     constrain_task_tool_definitions, refresh_live_external_tool_definitions,
 };
 use crate::{
-    ConversationRegistry, GoalModeLifecycleState, MailboxAuthor, RuntimeSignal,
-    TaskSignalBoundary, TaskTurnVisibility, apply_task_final_visibility,
-    apply_task_turn_visibility, apply_task_worker_detail_visibility, canonical_tool_call_name,
-    compact_validation_failure, execute_task_tool_call_batch, forced_task_tool_choice_for_round,
-    goal_mode_required_tool_chain, goal_mode_requires_terminalization,
-    goal_mode_tool_batch_violation, record_completed_required_tools,
-    required_tool_chain_is_complete, required_tool_chain_recovery_prompt,
-    required_tool_definitions_for_round, strict_goal_mode_tool_definitions_for_round,
-    task_required_tool_chain, task_turn_visibility, validation_result_rejects_delivery,
+    ConversationRegistry, GoalModeLifecycleState, MailboxAuthor, RuntimeSignal, TaskSignalBoundary,
+    TaskToolBatchEnv, TaskTurnVisibility, apply_task_final_visibility, apply_task_turn_visibility,
+    apply_task_worker_detail_visibility, canonical_tool_call_name, compact_validation_failure,
+    execute_task_tool_call_batch, forced_task_tool_choice_for_round, goal_mode_required_tool_chain,
+    goal_mode_requires_terminalization, goal_mode_tool_batch_violation,
+    record_completed_required_tools, required_tool_chain_is_complete,
+    required_tool_chain_recovery_prompt, required_tool_definitions_for_round,
+    strict_goal_mode_tool_definitions_for_round, task_required_tool_chain, task_turn_visibility,
+    validation_result_rejects_delivery,
 };
 use crate::{
     model_error::{
@@ -99,7 +99,7 @@ use std::{
 };
 
 mod thread_history;
-pub(crate) use thread_history::{thread_chat_message_to_chat_message};
+pub(crate) use thread_history::thread_chat_message_to_chat_message;
 use thread_history::*;
 mod signals;
 use signals::*;
@@ -2917,31 +2917,33 @@ fn run_conversation_loop_inner(
                     hooked.execute.as_slice()
                 });
             let native_results = execute_task_tool_call_batch(
-                event_bus,
-                tool_registry,
-                agent_role_registry,
-                skill_runtime,
-                skill_dispatch_runtime,
-                active_skill_name.as_deref(),
-                task_store,
-                session_store,
-                execution_registry,
-                conversation_registry,
-                safety_gate,
-                plan_store,
-                project_memory,
-                prepared_execution_task.as_ref().unwrap_or(task),
-                session_id,
-                workspace_id,
-                workspace_root_path.as_ref(),
-                turn_visibility.worker_id(),
-                browser_capability_snapshot,
+                &TaskToolBatchEnv {
+                    event_bus,
+                    tool_registry,
+                    agent_role_registry,
+                    skill_runtime,
+                    skill_dispatch_runtime,
+                    skill_name: active_skill_name.as_deref(),
+                    task_store,
+                    session_store,
+                    execution_registry,
+                    conversation_registry,
+                    safety_gate,
+                    plan_store,
+                    project_memory,
+                    task: prepared_execution_task.as_ref().unwrap_or(task),
+                    session_id,
+                    workspace_id,
+                    workspace_root_path: workspace_root_path.as_ref(),
+                    worker_id: turn_visibility.worker_id(),
+                    browser_capability_snapshot,
+                    on_progress: Some(&tool_progress_callback),
+                    workspace_resources: workspace_resources.clone(),
+                    execution_group_id: execution_group_id.clone(),
+                    execution_allowed: &|| execution_guard.is_active(),
+                },
                 native_calls,
                 &mut tool_execution_ledger,
-                Some(&tool_progress_callback),
-                workspace_resources.clone(),
-                execution_group_id.clone(),
-                &|| execution_guard.is_active(),
             );
             match hooked {
                 Some(hooked) => hooked.merge(native_results),
