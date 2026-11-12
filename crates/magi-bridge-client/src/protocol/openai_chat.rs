@@ -5,7 +5,7 @@ use super::adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderF
 use super::capability::resolve_capability_profile;
 use super::utils::{
     compatible_tool_call_id, convert_messages_to_openai, parse_openai_usage,
-    reasoning_effort_label, serialize_tool_definitions,
+    reasoning_effort_label, serialize_tool_definitions, truncate,
 };
 use crate::llm_types::{ToolCall, ToolChoice, parse_tool_arguments};
 
@@ -236,15 +236,6 @@ fn parse_openai_tool_calls(value: &Value) -> Vec<ToolCall> {
         .collect()
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    let trimmed = s.trim();
-    if trimmed.len() <= max {
-        trimmed.to_string()
-    } else {
-        format!("{}...", &trimmed[..max])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +435,15 @@ mod tests {
             "已检查工具结果"
         );
         assert_eq!(adapted.stop_reason, "stop");
+    }
+
+    #[test]
+    fn truncates_multibyte_error_body_without_panicking() {
+        let body = "错".repeat(300);
+        let error = OpenAiChatCompletionsAdapter
+            .parse_response(500, &body)
+            .expect_err("非成功响应必须返回协议错误");
+        assert!(error.contains("OpenAI API error"));
+        assert!(error.ends_with("..."));
     }
 }

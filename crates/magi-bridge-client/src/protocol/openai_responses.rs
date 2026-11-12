@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 
 use super::adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderFamily};
 use super::capability::resolve_capability_profile;
-use super::utils::reasoning_effort_label;
+use super::utils::{reasoning_effort_label, truncate};
 use crate::llm_types::{
     ImageSource, LlmContentBlock, LlmMessage, LlmMessageContent, ToolCall, ToolChoice,
     ToolDefinition, parse_tool_arguments,
@@ -500,19 +500,6 @@ fn parse_responses_usage(usage: Option<&Value>) -> crate::llm_types::LlmUsage {
         cache_read_tokens,
         cache_write_tokens: None,
         cache_read_included_in_input: cache_read_tokens.is_some(),
-    }
-}
-
-fn truncate(value: &str, max: usize) -> String {
-    let trimmed = value.trim();
-    if trimmed.len() <= max {
-        trimmed.to_string()
-    } else {
-        let mut end = max;
-        while !trimmed.is_char_boundary(end) {
-            end = end.saturating_sub(1);
-        }
-        format!("{}...", &trimmed[..end])
     }
 }
 

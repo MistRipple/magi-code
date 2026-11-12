@@ -5,7 +5,7 @@ use super::adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderF
 use super::capability::{ThinkingKind, resolve_capability_profile};
 use super::utils::{
     convert_messages_to_anthropic, parse_anthropic_usage, reasoning_effort_label,
-    serialize_anthropic_tool_definitions,
+    serialize_anthropic_tool_definitions, truncate,
 };
 use crate::llm_types::{ToolCall, ToolChoice};
 use magi_usage_authority::ReasoningEffort;
@@ -379,15 +379,6 @@ fn build_thinking_value(
         ThinkingKind::Effort | ThinkingKind::Adaptive => {
             Some(attach_display(json!({ "type": "adaptive" })))
         }
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let trimmed = s.trim();
-    if trimmed.len() <= max {
-        trimmed.to_string()
-    } else {
-        format!("{}...", &trimmed[..max])
     }
 }
 
@@ -964,5 +955,15 @@ mod tests {
             adapted.body.get("thinking").is_none(),
             "未知模型不得注入 thinking 字段"
         );
+    }
+
+    #[test]
+    fn truncates_multibyte_error_body_without_panicking() {
+        let body = "错".repeat(300);
+        let error = AnthropicMessagesAdapter
+            .parse_response(500, &body)
+            .expect_err("非成功响应必须返回协议错误");
+        assert!(error.contains("Anthropic API error"));
+        assert!(error.ends_with("..."));
     }
 }

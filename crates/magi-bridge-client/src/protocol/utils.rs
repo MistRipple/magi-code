@@ -33,6 +33,20 @@ pub fn reasoning_effort_label(effort: ReasoningEffort) -> &'static str {
     crate::reasoning::effort_label(effort)
 }
 
+/// 截断供错误信息展示的响应体：先 trim，超出 `max` 字节时在 UTF-8 字符边界处截断并追加省略号。
+pub(crate) fn truncate(value: &str, max: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() <= max {
+        trimmed.to_string()
+    } else {
+        let mut end = max;
+        while !trimmed.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        format!("{}...", &trimmed[..end])
+    }
+}
+
 pub fn serialize_tool_definitions(tools: &[ToolDefinition]) -> Vec<Value> {
     tools
         .iter()
