@@ -342,7 +342,8 @@ if (singleInstance) {
         logFilePath: join(app.getPath("logs"), "daemon.log"),
         environment: {
           ...process.env,
-          MAGI_HOST: "127.0.0.1",
+          // 默认监听全部网卡以支持局域网访问；需要只限本机时用环境变量 MAGI_HOST=127.0.0.1 覆盖。
+          MAGI_HOST: process.env.MAGI_HOST?.trim() || "0.0.0.0",
           MAGI_PORT: String(daemonPort),
           MAGI_SERVICE_NAME: MAGI_DAEMON_SERVICE_NAME,
           MAGI_PRODUCT_VERSION: PRODUCT_VERSION,
