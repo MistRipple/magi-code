@@ -815,7 +815,8 @@
     display: grid;
     grid-template-columns: 220px minmax(0, 1fr);
     gap: 22px;
-    min-height: 100%;
+    /* 工具栏之后占满剩余高度；min-height: 100% 会在工具栏高度之上再整页，必然溢出。 */
+    flex: 1 0 auto;
     align-items: stretch;
   }
   .agents-shell.editing {

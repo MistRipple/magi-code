@@ -74,7 +74,8 @@
     min-height: 0;
     overflow-y: auto;
     box-sizing: border-box;
-    padding: 20px max(32px, calc((100% - 880px) / 2)) 56px;
+    /* 上下留白对称：尾部留白也计入滚动范围，过大会让本可容纳的页面出现滚动。 */
+    padding: 20px max(32px, calc((100% - 880px) / 2)) 20px;
     scrollbar-width: none;
   }
   .apple-scroller-proxy::-webkit-scrollbar,
@@ -474,7 +475,7 @@
     .settings-frame {
       padding-left: 16px;
       padding-right: 16px;
-      padding-bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+      padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
     }
   }
 
