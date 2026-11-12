@@ -1536,17 +1536,6 @@
     overflow-y: auto;
   }
 
-  .tool-meta {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    margin-top: var(--space-3);
-    padding-top: var(--space-3);
-    border-top: 1px dashed var(--border);
-  }
-
   /* 识别色属于 Task；状态仍独立使用语义色。两种模式复用同一入口。 */
   .agent-spawn-card {
     width: 100%;

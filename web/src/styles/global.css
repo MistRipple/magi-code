@@ -664,7 +664,6 @@ textarea:focus {
 /* 短标题平衡换行；单行省略控件仍由自身的 white-space 规则决定。 */
 :where(h1, h2, h3, h4, h5, h6),
 .modal-title,
-.empty-state__title,
 .settings-section-title {
   text-wrap: balance;
 }
@@ -1002,11 +1001,6 @@ pre code {
   border-bottom: var(--magi-hairline) solid var(--border);
 }
 
-.tab-bar--bottom {
-  padding: 0 var(--space-4);
-  border-top: var(--magi-hairline) solid var(--border);
-}
-
 .tab-item {
   display: flex;
   align-items: center;
@@ -1034,10 +1028,6 @@ pre code {
 
 .tab-bar--top .tab-item::after {
   bottom: 0;
-}
-
-.tab-bar--bottom .tab-item::after {
-  top: 0;
 }
 
 .tab-item:hover {
@@ -1069,19 +1059,6 @@ pre code {
   background: var(--primary);
   border-radius: var(--radius-full);
   line-height: 1;
-}
-
-.badge--success {
-  background: var(--success);
-}
-
-.badge--warning {
-  background: var(--warning);
-  color: var(--primary-foreground);
-}
-
-.badge--error {
-  background: var(--error);
 }
 
 .chip {
@@ -1145,30 +1122,6 @@ pre code {
   box-sizing: border-box;
 }
 
-.empty-state__icon {
-  width: var(--icon-2xl);
-  height: var(--icon-2xl);
-  margin-bottom: var(--space-4);
-  opacity: 0.4;
-}
-
-.empty-state__icon svg {
-  width: 100%;
-  height: 100%;
-}
-
-.empty-state__title {
-  font-size: var(--text-base);
-  font-weight: var(--font-medium);
-  color: var(--foreground);
-  margin-bottom: var(--space-2);
-}
-
-.empty-state__hint {
-  font-size: var(--text-sm);
-  opacity: 0.7;
-}
-
 /* ------------------------------------------
    面板系统 (Panel System) - Magi Design System v2.0
    用于统一个面板的页面留白与内部排版
@@ -1212,26 +1165,6 @@ pre code {
   border-color: var(--border-subtle);
 }
 
-.magi-card-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
-}
-
-.magi-card-title {
-  font-size: var(--text-md);
-  font-weight: var(--font-semibold);
-  color: var(--foreground);
-  margin: 0;
-}
-
-.magi-card-body {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
-
 /* ------------------------------------------
    列表系统 (List System)
    ------------------------------------------ */
@@ -1265,11 +1198,6 @@ pre code {
 /* ------------------------------------------
    表单系统 (Form System)
    ------------------------------------------ */
-.form-group {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
 
 .form-label {
   font-size: var(--text-sm);

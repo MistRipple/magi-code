@@ -4651,15 +4651,6 @@ async function refreshPickerSettingsSnapshot() {
     font-size: 13px;
     line-height: 1;
   }
-  .ia-picker-notice {
-    margin: 6px 6px 0;
-    font-size: var(--text-xs);
-    line-height: 1.5;
-    color: var(--foreground-muted);
-  }
-  .ia-picker-notice--warning {
-    color: var(--warning, var(--foreground-muted));
-  }
   .ia-picker-divider {
     height: 1px;
     margin: 5px 6px;

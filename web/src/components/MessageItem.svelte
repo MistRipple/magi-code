@@ -952,33 +952,6 @@
     font-size: var(--text-sm);
     color: var(--foreground);
   }
-  .interaction-actions {
-    display: flex;
-    gap: var(--space-2);
-    margin-bottom: var(--space-2);
-  }
-  .interaction-action-btn {
-    min-width: 88px;
-    padding: 6px 12px;
-    border-radius: var(--radius-md);
-    border: var(--magi-hairline) solid var(--border);
-    background: var(--surface);
-    color: var(--foreground);
-    cursor: pointer;
-    transition: background 120ms ease, border-color 120ms ease, opacity 120ms ease;
-  }
-  .interaction-action-btn:hover:not(:disabled) {
-    border-color: var(--primary);
-    background: color-mix(in srgb, var(--primary) 10%, var(--surface));
-  }
-  .interaction-action-btn.is-primary {
-    border-color: color-mix(in srgb, var(--primary) 55%, transparent);
-    background: color-mix(in srgb, var(--primary) 18%, var(--surface));
-  }
-  .interaction-action-btn:disabled {
-    opacity: 0.6;
-    cursor: default;
-  }
   .system-section-fold {
     margin: var(--space-1) 0;
     border: var(--magi-hairline) solid var(--border);

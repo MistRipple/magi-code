@@ -90,7 +90,6 @@
   }
   
   /* Quiet shared surfaces; colour layers come from the selected theme. */
-  .apple-glass-panel,
   .apple-tile {
     background: transparent;
     border: 0;
@@ -100,30 +99,6 @@
   }
   .apple-tile { padding: 10px 14px; display: flex; flex-direction: column; gap: 4px; box-sizing: border-box; }
   .apple-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; padding-bottom: 6px; }
-  .apple-dashboard-bar { flex-wrap: wrap; gap: var(--space-3); }
-
-  .tile-row {
-    display: flex;
-    align-items: center;
-    width: 100%;
-  }
-  
-  .tile-header {
-    justify-content: space-between;
-    height: 24px;
-    flex-shrink: 0;
-  }
-  
-  .tile-body {
-    flex-shrink: 0;
-  }
-  
-  .tile-footer {
-    justify-content: space-between;
-    height: 24px;
-    margin-top: auto;
-    flex-shrink: 0;
-  }
   
   .avatar-squircle {
     width: 24px;
@@ -236,14 +211,12 @@
     border-radius: 10px;
     overflow: hidden;
   }
-  .settings-card--accent { box-shadow: inset 0 0 0 var(--magi-hairline) color-mix(in srgb, var(--primary) 55%, var(--border)); }
   .settings-card-head { display: flex; align-items: flex-start; gap: var(--space-3); padding: var(--space-3) var(--space-3) var(--space-2); }
   .settings-card-body { display: grid; gap: var(--space-3); padding: 0 var(--space-3) var(--space-3); }
   .settings-card-foot { display: flex; justify-content: flex-end; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3) var(--space-3); }
   .settings-card-title { min-width: 0; flex: 1; display: grid; gap: 4px; }
   .settings-card-title-line { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
   .settings-card-name { font-size: var(--text-sm); font-weight: var(--font-bold); color: var(--foreground); }
-  .settings-card-actions { display: flex; align-items: center; gap: var(--space-2); flex: 0 0 auto; }
   .settings-icon-tile {
     width: 30px; height: 30px; flex: 0 0 auto; display: grid; place-items: center;
     border-radius: 8px; color: var(--primary); background: var(--primary-muted);
@@ -261,7 +234,6 @@
     padding: var(--space-2) 0; box-sizing: border-box;
   }
   .settings-row + .settings-row { border-top: var(--magi-hairline) solid var(--border-subtle); }
-  .settings-row--stacked { flex-direction: column; align-items: stretch; }
   .settings-row-copy { min-width: 0; flex: 1; display: grid; gap: 3px; }
   .settings-row-title { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
   .settings-row-desc { font-size: var(--text-xs); line-height: 1.45; color: var(--foreground-muted); overflow-wrap: anywhere; }
@@ -381,63 +353,11 @@
     .model-form-action-desc:empty { display: none; }
   }
 
-  .llm-config-field-row { display: grid; grid-template-columns: 1fr auto; gap: var(--space-3); }
-  .llm-config-field-row.has-thinking { grid-template-columns: 1fr auto 72px; }
-  .llm-config-field-row.has-level { grid-template-columns: 1fr auto auto auto; }
-
-  .llm-config-toggle-label { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-sm); cursor: pointer; }
-  .llm-config-toggle-btn {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    height: var(--btn-height-md);
-    padding: 0;
-    background: transparent;
-    border: none;
-    color: var(--foreground);
-    font-size: var(--text-sm);
-    cursor: pointer;
-    justify-content: flex-start;
-    width: 100%;
-  }
-  .inline-toggle { display: flex; flex-direction: column; gap: var(--space-2); align-items: flex-start; }
-
   /* Profile 编辑器 - 公共部分（组件特有部分在 scoped 中）*/
-  .profile-field-header { display: flex; justify-content: space-between; align-items: center; }
-  .profile-field-label { font-size: var(--text-sm); font-weight: var(--font-semibold); color: var(--foreground); }
-
-  .profile-two-columns { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
   .profile-column { min-width: 0; }
-
-  .profile-add-btn { display: flex; align-items: center; justify-content: center; width: var(--btn-height-xs); height: var(--btn-height-xs); padding: 0; background: var(--primary); border: none; border-radius: var(--radius-sm); color: var(--primary-foreground); cursor: pointer; transition: all var(--transition-fast); }
-  .profile-add-btn:hover { background: var(--primary-hover); }
 
   .profile-tags { display: flex; flex-wrap: wrap; gap: var(--space-2); min-height: var(--btn-height-lg); padding: var(--space-3); background: var(--surface-2); border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-sm); }
   .profile-tag { display: inline-flex; align-items: center; gap: var(--space-2); height: var(--btn-height-xs); padding: 0 var(--space-3); font-size: var(--text-sm); background: var(--primary); border-radius: var(--radius-full); color: var(--primary-foreground); }
-  .profile-tag-remove { display: flex; align-items: center; justify-content: center; width: 14px; height: 14px; padding: 0; background: color-mix(in srgb, var(--primary-foreground) 18%, transparent); border: none; border-radius: var(--radius-full); color: var(--primary-foreground); cursor: pointer; transition: background var(--transition-fast); }
-  .profile-tag-remove:hover { background: color-mix(in srgb, var(--primary-foreground) 30%, transparent); }
-  .profile-tags-empty { font-size: var(--text-sm); color: var(--foreground-muted); font-style: italic; }
-
-  .profile-save-footer {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--space-3);
-    margin-top: 5px;
-    padding: var(--space-3) var(--space-4);
-    background: var(--surface-1);
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-sm);
-  }
-  .profile-save-hint {
-    font-size: var(--text-sm);
-    color: var(--foreground-muted);
-  }
-  .profile-save-actions {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-  }
 
   /* Skill 操作按钮 */
   .skill-actions .btn-icon--danger:hover { background: var(--error-muted); border-color: var(--error-text); color: var(--error-text); }
@@ -494,66 +414,15 @@
     }
 
     .settings-section-header,
-    .settings-section-actions,
-    .profile-save-footer,
-    .profile-save-actions {
+    .settings-section-actions {
       flex-wrap: wrap;
-    }
-
-    .llm-config-field-row,
-    .llm-config-field-row.has-thinking,
-    .llm-config-field-row.has-thinking.has-level,
-    .profile-categories-grid,
-    .profile-two-columns,
-    .profile-guidance-columns {
-      grid-template-columns: 1fr;
     }
 
   }
 
   /* 引擎管理 */
-  .engine-empty-hint {
-    display: flex; flex-direction: column; align-items: center; gap: var(--space-3);
-    padding: var(--space-6) var(--space-4);
-    color: var(--foreground-muted); font-size: var(--text-sm); text-align: center;
-  }
-  .engine-list { display: flex; flex-direction: column; gap: var(--space-2); }
-  .engine-card {
-    display: flex; flex-direction: column; gap: var(--space-2);
-    padding: var(--space-3); border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-md); background: var(--surface);
-    transition: border-color var(--transition-fast);
-  }
-  .engine-card:hover { border-color: var(--border-hover, var(--primary)); }
-  .engine-card.disabled { opacity: 0.55; }
-  .engine-card-header { display: flex; justify-content: space-between; align-items: center; gap: var(--space-3); }
-  .engine-card-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-  .engine-card-name { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .engine-card-meta { font-size: var(--text-xs); color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .engine-ref-count { margin-left: var(--space-2); padding: 1px 6px; background: var(--surface-hover); border-radius: var(--radius-sm); font-size: var(--text-xs); }
-  .engine-card-actions { display: flex; align-items: center; gap: var(--space-1); flex-shrink: 0; }
-  .engine-card-toggle { display: flex; align-items: center; }
-  .engine-select {
-    height: var(--btn-height-sm); padding: 0 var(--space-2); font-size: var(--text-xs);
-    background: var(--surface); border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-sm);
-    color: var(--foreground); cursor: pointer; min-width: 100px; max-width: 160px;
-  }
 
   /* 角色模板选择器 */
-  .role-template-list { display: flex; flex-direction: column; gap: var(--space-1); }
-  .role-template-item {
-    display: flex; justify-content: space-between; align-items: center;
-    gap: var(--space-3); padding: var(--space-3);
-    border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-sm);
-    background: var(--surface); cursor: pointer; text-align: left; width: 100%;
-    transition: background var(--transition-fast), border-color var(--transition-fast);
-  }
-  .role-template-item:hover:not(:disabled) { background: var(--surface-hover); border-color: var(--primary); }
-  .role-template-item:disabled { opacity: 0.45; cursor: not-allowed; }
-  .role-template-item-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-  .role-template-item-name { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); }
-  .role-template-item-desc { font-size: var(--text-xs); color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .role-template-item-badge { font-size: var(--text-xs); padding: 1px 6px; background: var(--surface-hover); border-radius: var(--radius-sm); color: var(--foreground-muted); flex-shrink: 0; }
 
   /* Nested rows share their parent edge. */
   .settings-card .settings-rows { box-shadow: none; }
