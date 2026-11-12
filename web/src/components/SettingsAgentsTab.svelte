@@ -137,6 +137,8 @@
         muted: pair.muted,
       };
     })
+      // 内置角色在前、自建角色在后；稳定排序保留各组内原有顺序。
+      .sort((left, right) => Number(left.template.source === 'user') - Number(right.template.source === 'user'))
   );
   const domainCapabilities = $derived(collectDomainCapabilities(atoms));
 
@@ -508,7 +510,12 @@
                   <Icon name="bot" size={11} />
                 </span>
                 <span class="role-tab-copy">
-                  <span class="role-tab-name">{atom.displayName}</span>
+                  <span class="role-tab-title">
+                    <span class="role-tab-name">{atom.displayName}</span>
+                    {#if atom.template.source === 'user'}
+                      <span class="source-badge source-user role-tab-source">{i18n.t('settings.agents.source.user')}</span>
+                    {/if}
+                  </span>
                   <span class="role-tab-subtitle">{statusTooltip(atom.status)}</span>
                 </span>
                 <span
@@ -902,7 +909,21 @@
     min-width: 0;
   }
 
+  /* 自建角色在名称后带一枚来源标记；内置角色不加标记，详情页同时标出两类来源。 */
+  .role-tab-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+  .role-tab-source {
+    flex: none;
+    padding: 1px 6px;
+    line-height: 1.3;
+  }
+
   .role-tab-name {
+    min-width: 0;
     font-variant-numeric: tabular-nums;
     overflow: hidden;
     text-overflow: ellipsis;

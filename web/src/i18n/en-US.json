@@ -1120,7 +1120,7 @@
   "settings.agents.editor.capabilities": "Available professional capabilities",
   "settings.agents.editor.save": "Save role",
   "settings.agents.editor.saving": "Saving…",
-  "settings.agents.source.user": "My role",
+  "settings.agents.source.user": "User",
   "settings.agents.source.builtin": "Built-in",
   "settings.agents.action.copy": "Copy",
   "settings.agents.action.export": "Export",

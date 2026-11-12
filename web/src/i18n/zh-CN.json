@@ -1120,7 +1120,7 @@
   "settings.agents.editor.capabilities": "可用专业能力",
   "settings.agents.editor.save": "保存角色",
   "settings.agents.editor.saving": "保存中…",
-  "settings.agents.source.user": "我的角色",
+  "settings.agents.source.user": "用户",
   "settings.agents.source.builtin": "系统内置",
   "settings.agents.action.copy": "复制",
   "settings.agents.action.export": "导出",
