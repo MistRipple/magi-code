@@ -98,10 +98,13 @@ mod tests {
         let library = AppearanceLibrary::in_memory();
         let snapshot = library.snapshot();
         let expected_theme_ids = [
+            "builtin.magi-orbital",
+            "builtin.magi-cyber-rain",
+            "builtin.magi-celestial",
+            "builtin.magi-aurora",
             "builtin.forest",
             "builtin.starry-snow-mountain",
             "builtin.anime-shrine",
-            "builtin.quantum-grid",
             "builtin.coastal-dawn",
             "builtin.desert-dawn",
         ];
