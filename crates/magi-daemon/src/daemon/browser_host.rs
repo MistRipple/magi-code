@@ -683,130 +683,13 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
 
     match event.envelope.event {
         BrowserHostEvent::PrimarySurfaceChanged { binding } => {
-            let context = browser_tab_context(state, &binding.tab_id);
-            let result = state.mutate_browser_authority(|authority| {
-                authority.accept_primary_surface(binding.clone(), UtcMillis::now())
-            });
-            match result {
-                Ok((true, tab, revoked)) => {
-                    // Host 重连时 Control Server 只会重放当前 Primary Surface；
-                    // 之前已经完成加载的页面不会再次发送 page_updated。标记
-                    // 投影必须在 Primary 确认后立即由 Authority 重新下发，
-                    // 否则服务或 Electron 重启后持久化标记会永久消失。
-                    schedule_browser_annotation_sync(state, &binding.tab_id);
-                    publish_tab_event(
-                        state,
-                        "browser.tab.status_changed",
-                        context.clone(),
-                        serde_json::json!({
-                            "tab_id": tab.tab_id,
-                            "lifecycle": tab.lifecycle,
-                            "surface_id": binding.surface_id,
-                            "surface_revision": binding.surface_revision,
-                            "navigation_revision": tab.navigation_revision,
-                        }),
-                    );
-                    publish_tab_event(
-                        state,
-                        "browser.surface.primary_changed",
-                        context,
-                        serde_json::json!({ "binding": binding }),
-                    );
-                    if !revoked.is_empty() {
-                        publish_tab_event(
-                            state,
-                            "browser.control.revoked",
-                            browser_tab_context(state, &binding.tab_id),
-                            serde_json::json!({
-                                "tab_id": binding.tab_id,
-                                "reason": "primary_surface_changed",
-                                "revoked_lease_count": revoked.len(),
-                            }),
-                        );
-                    }
-                }
-                Ok((false, _, _)) => tracing::debug!(
-                    tab_id = %binding.tab_id,
-                    surface_id = %binding.surface_id,
-                    surface_revision = binding.surface_revision,
-                    "忽略旧 Browser Surface 主页面事件"
-                ),
-                Err(error) => tracing::debug!(
-                    tab_id = %binding.tab_id,
-                    ?error,
-                    "忽略无法收敛的 Browser Surface 主页面状态"
-                ),
-            }
+            on_primary_surface_changed(state, binding)
         }
         BrowserHostEvent::PrimarySurfaceClosed { binding } => {
-            let context = browser_tab_context(state, &binding.tab_id);
-            match state.mutate_browser_authority(|authority| {
-                authority.clear_primary_surface(&binding, UtcMillis::now())
-            }) {
-                Ok((true, tab, revoked)) => {
-                    publish_tab_event(
-                        state,
-                        "browser.tab.status_changed",
-                        context.clone(),
-                        serde_json::json!({
-                            "tab_id": tab.tab_id,
-                            "lifecycle": tab.lifecycle,
-                            "surface_id": null,
-                            "surface_revision": binding.surface_revision,
-                            "navigation_revision": tab.navigation_revision,
-                        }),
-                    );
-                    publish_tab_event(
-                        state,
-                        "browser.surface.primary_closed",
-                        context,
-                        serde_json::json!({ "binding": binding }),
-                    );
-                    if !revoked.is_empty() {
-                        publish_tab_event(
-                            state,
-                            "browser.control.revoked",
-                            browser_tab_context(state, &binding.tab_id),
-                            serde_json::json!({
-                                "tab_id": binding.tab_id,
-                                "reason": "primary_surface_closed",
-                                "revoked_lease_count": revoked.len(),
-                            }),
-                        );
-                    }
-                }
-                Ok((false, _, _)) => tracing::debug!(
-                    tab_id = %binding.tab_id,
-                    surface_id = %binding.surface_id,
-                    "忽略非当前 Primary Surface 的关闭事件"
-                ),
-                Err(error) => tracing::warn!(
-                    tab_id = %binding.tab_id,
-                    surface_id = %binding.surface_id,
-                    ?error,
-                    "处理 Primary Surface 关闭事件失败"
-                ),
-            }
+            on_primary_surface_closed(state, binding)
         }
-        BrowserHostEvent::UserTakeover { binding } => {
-            // 用户直接操作页面后由用户保持控制：代理不能在用户未交还前自动抢回。
-            revoke_surface_control(
-                state,
-                &binding,
-                BrowserLeaseEndReason::UserTakeover,
-                "user_takeover",
-                true,
-            );
-        }
-        BrowserHostEvent::UserActivity { binding } => {
-            if !is_current_primary_binding(state, &binding) {
-                return;
-            }
-            let _ = state.mutate_browser_authority(|authority| {
-                authority.record_user_activity(&binding.tab_id, UtcMillis::now());
-                Ok(())
-            });
-        }
+        BrowserHostEvent::UserTakeover { binding } => on_user_takeover(state, binding),
+        BrowserHostEvent::UserActivity { binding } => on_user_activity(state, binding),
         BrowserHostEvent::ControlRevoked { binding, reason } => {
             let lease_reason = control_revocation_reason(&reason);
             revoke_surface_control(state, &binding, lease_reason, &reason, false);
@@ -814,187 +697,21 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
         BrowserHostEvent::PageUpdated {
             binding,
             page_state,
-        } => {
-            if page_state.tab_id != binding.tab_id
-                || page_state.navigation_revision != binding.navigation_revision
-            {
-                tracing::debug!(
-                    tab_id = %binding.tab_id,
-                    "忽略页面状态与 Surface binding 不一致的事件"
-                );
-                return;
-            }
-            let context = browser_tab_context(state, &binding.tab_id);
-            match state.mutate_browser_authority(|authority| {
-                let (accepted, revoked) =
-                    authority.accept_page_binding(&binding, UtcMillis::now())?;
-                if !accepted {
-                    return Ok((None, revoked));
-                }
-                authority
-                    .apply_host_page_state(
-                        &page_state.tab_id,
-                        page_state.navigation_revision,
-                        page_state.url.clone(),
-                        page_state.origin.clone(),
-                        page_state.title.clone(),
-                        UtcMillis::now(),
-                    )
-                    .map(|tab| (Some(tab), revoked))
-            }) {
-                Ok((Some(_), revoked)) => {
-                    schedule_browser_annotation_sync(state, &binding.tab_id);
-                    publish_tab_event(
-                        state,
-                        "browser.tab.updated",
-                        context.clone(),
-                        serde_json::json!({
-                            "tab_id": page_state.tab_id,
-                            "url": page_state.url,
-                            "title": page_state.title,
-                            "navigation_revision": page_state.navigation_revision,
-                            "binding": binding,
-                        }),
-                    );
-                    if !revoked.is_empty() {
-                        publish_tab_event(
-                            state,
-                            "browser.control.revoked",
-                            context,
-                            serde_json::json!({
-                                "tab_id": binding.tab_id,
-                                "binding": binding,
-                                "reason": "navigation_changed",
-                                "revoked_lease_count": revoked.len(),
-                            }),
-                        );
-                    }
-                }
-                Ok((None, _)) => tracing::debug!(
-                    tab_id = %binding.tab_id,
-                    surface_id = %binding.surface_id,
-                    surface_revision = binding.surface_revision,
-                    "忽略旧 Browser Surface 页面事件"
-                ),
-                Err(error) => tracing::debug!(
-                    tab_id = %binding.tab_id,
-                    ?error,
-                    "忽略无法应用的旧页面状态"
-                ),
-            }
-        }
-        BrowserHostEvent::PageFailed { binding, reason } => {
-            if !is_current_or_advanced_primary_binding(state, &binding) {
-                tracing::debug!(
-                    tab_id = %binding.tab_id,
-                    surface_id = %binding.surface_id,
-                    navigation_revision = binding.navigation_revision,
-                    "忽略已失效 Browser Surface 的页面失败事件"
-                );
-                return;
-            }
-            publish_tab_event(
-                state,
-                "browser.automation.page_failed",
-                browser_tab_context(state, &binding.tab_id),
-                serde_json::json!({
-                    "tab_id": binding.tab_id,
-                    "binding": binding,
-                    "reason": magi_core::public_runtime_excerpt(&reason, 1024),
-                }),
-            );
-        }
+        } => on_page_updated(state, binding, page_state),
+        BrowserHostEvent::PageFailed { binding, reason } => on_page_failed(state, binding, reason),
         BrowserHostEvent::LoadingChanged { binding, loading } => {
-            if !is_current_or_advanced_primary_binding(state, &binding) {
-                tracing::debug!(
-                    tab_id = %binding.tab_id,
-                    surface_id = %binding.surface_id,
-                    navigation_revision = binding.navigation_revision,
-                    "忽略已失效 Browser Surface 的加载事件"
-                );
-                return;
-            }
-            publish_tab_event(
-                state,
-                "browser.tab.loading_changed",
-                browser_tab_context(state, &binding.tab_id),
-                serde_json::json!({
-                    "tab_id": binding.tab_id,
-                    "binding": binding,
-                    "loading": loading,
-                }),
-            );
+            on_loading_changed(state, binding, loading)
         }
         BrowserHostEvent::PageCrashed {
             binding,
             diagnostic,
-        } => {
-            if !is_current_primary_binding(state, &binding) {
-                tracing::debug!(
-                    tab_id = %binding.tab_id,
-                    surface_id = %binding.surface_id,
-                    surface_revision = binding.surface_revision,
-                    "忽略已失效 Browser Surface 的崩溃事件"
-                );
-                return;
-            }
-            let context = browser_tab_context(state, &binding.tab_id);
-            let lifecycle = state.mutate_browser_authority(|authority| {
-                authority.transition_tab(
-                    &binding.tab_id,
-                    magi_browser_authority::BrowserTabLifecycle::Crashed,
-                    UtcMillis::now(),
-                )
-            });
-            match lifecycle {
-                Ok(tab) => {
-                    publish_tab_event(
-                        state,
-                        "browser.tab.status_changed",
-                        context.clone(),
-                        serde_json::json!({
-                            "tab_id": tab.tab_id,
-                            "lifecycle": tab.lifecycle,
-                            "surface_id": binding.surface_id,
-                            "surface_revision": binding.surface_revision,
-                        }),
-                    );
-                    publish_tab_event(
-                        state,
-                        "browser.automation.page_crashed",
-                        context,
-                        serde_json::json!({
-                            "tab_id": binding.tab_id,
-                            "binding": binding,
-                            "diagnostic": diagnostic.map(|value| magi_core::public_runtime_excerpt(&value, 1024)),
-                        }),
-                    );
-                }
-                Err(error) => tracing::debug!(
-                    tab_id = %binding.tab_id,
-                    ?error,
-                    "忽略无法收敛的 Browser Surface 崩溃状态"
-                ),
-            }
-        }
+        } => on_page_crashed(state, binding, diagnostic),
         BrowserHostEvent::Dialog {
             tab_id,
             dialog_id,
             dialog_type,
             message,
-        } => {
-            publish_tab_event(
-                state,
-                "browser.dialog.opened",
-                browser_tab_context(state, &tab_id),
-                serde_json::json!({
-                    "tab_id": tab_id,
-                    "dialog_id": dialog_id,
-                    "dialog_type": dialog_type,
-                    "message": magi_core::public_runtime_excerpt(&message, 1024),
-                }),
-            );
-        }
+        } => on_dialog(state, tab_id, dialog_id, dialog_type, message),
         BrowserHostEvent::Download {
             tab_id,
             download_id,
@@ -1005,91 +722,471 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
             byte_length,
             saved_path,
             error,
-        } => {
-            // 文件位置只进登记（供 browser_download 复制进工作区），不进下面面向用户的事件。
-            state
-                .browser_downloads()
-                .record(magi_api::browser_downloads::BrowserDownloadUpdate {
-                    tab_id: tab_id.clone(),
-                    download_id: download_id.clone(),
-                    filename: suggested_filename.clone(),
-                    state: download_state.clone(),
-                    received_bytes,
-                    total_bytes,
-                    saved_path,
-                    error: error
-                        .as_ref()
-                        .map(|value| magi_core::public_runtime_excerpt(value, 1024)),
-                });
-            publish_tab_event(
-                state,
-                "browser.download.updated",
-                browser_tab_context(state, &tab_id),
-                serde_json::json!({
-                    "tab_id": tab_id,
-                    "download_id": download_id,
-                    "suggested_filename": suggested_filename,
-                    "state": download_state,
-                    "received_bytes": received_bytes,
-                    "total_bytes": total_bytes,
-                    "byte_length": byte_length,
-                    "error": error.map(|value| magi_core::public_runtime_excerpt(&value, 1024)),
-                }),
-            );
-        }
+        } => on_download(
+            state,
+            HostDownloadUpdate {
+                tab_id,
+                download_id,
+                suggested_filename,
+                state: download_state,
+                received_bytes,
+                total_bytes,
+                byte_length,
+                saved_path,
+                error,
+            },
+        ),
         BrowserHostEvent::PopupBlocked {
             binding,
             url,
             reason,
-        } => {
-            if !is_current_or_advanced_primary_binding(state, &binding) {
-                tracing::debug!(
-                    tab_id = %binding.tab_id,
-                    surface_id = %binding.surface_id,
-                    navigation_revision = binding.navigation_revision,
-                    "忽略已失效 Browser Surface 的弹窗事件"
-                );
-                return;
-            }
-            publish_tab_event(
-                state,
-                "browser.popup.blocked",
-                browser_tab_context(state, &binding.tab_id),
-                serde_json::json!({
-                    "tab_id": binding.tab_id,
-                    "binding": binding,
-                    "url": url,
-                    "reason": reason,
-                }),
-            );
-        }
-        BrowserHostEvent::NodeSelection(selection) => {
-            if !is_current_node_selection(state, &selection) {
-                tracing::debug!(
-                    tab_id = %selection.tab_id,
-                    surface_id = %selection.surface_id,
-                    navigation_revision = selection.navigation_revision,
-                    "忽略已失效 Browser Surface 的节点选择事件"
-                );
-                return;
-            }
-            let payload = serde_json::to_value(&selection)
-                .expect("BrowserNodeSelection must serialize as a structured event");
-            publish_tab_event(
-                state,
-                "browser.node.selected",
-                browser_tab_context(state, &selection.tab_id),
-                magi_conversation_runtime::context_reference::sanitize_browser_node_selection(
-                    &payload,
-                ),
-            );
-        }
+        } => on_popup_blocked(state, binding, url, reason),
+        BrowserHostEvent::NodeSelection(selection) => on_node_selection(state, selection),
         BrowserHostEvent::Ready(_)
         | BrowserHostEvent::Console { .. }
         | BrowserHostEvent::AgentCursor(_)
         | BrowserHostEvent::BinaryPayloadReady(_)
         | BrowserHostEvent::Heartbeat { .. } => {}
     }
+}
+
+fn on_primary_surface_changed(
+    state: &ApiState,
+    binding: magi_browser_authority::BrowserSurfaceBinding,
+) {
+    let context = browser_tab_context(state, &binding.tab_id);
+    let result = state.mutate_browser_authority(|authority| {
+        authority.accept_primary_surface(binding.clone(), UtcMillis::now())
+    });
+    match result {
+        Ok((true, tab, revoked)) => {
+            // Host 重连时 Control Server 只会重放当前 Primary Surface；
+            // 之前已经完成加载的页面不会再次发送 page_updated。标记
+            // 投影必须在 Primary 确认后立即由 Authority 重新下发，
+            // 否则服务或 Electron 重启后持久化标记会永久消失。
+            schedule_browser_annotation_sync(state, &binding.tab_id);
+            publish_tab_event(
+                state,
+                "browser.tab.status_changed",
+                context.clone(),
+                serde_json::json!({
+                    "tab_id": tab.tab_id,
+                    "lifecycle": tab.lifecycle,
+                    "surface_id": binding.surface_id,
+                    "surface_revision": binding.surface_revision,
+                    "navigation_revision": tab.navigation_revision,
+                }),
+            );
+            publish_tab_event(
+                state,
+                "browser.surface.primary_changed",
+                context,
+                serde_json::json!({ "binding": binding }),
+            );
+            if !revoked.is_empty() {
+                publish_tab_event(
+                    state,
+                    "browser.control.revoked",
+                    browser_tab_context(state, &binding.tab_id),
+                    serde_json::json!({
+                        "tab_id": binding.tab_id,
+                        "reason": "primary_surface_changed",
+                        "revoked_lease_count": revoked.len(),
+                    }),
+                );
+            }
+        }
+        Ok((false, _, _)) => tracing::debug!(
+            tab_id = %binding.tab_id,
+            surface_id = %binding.surface_id,
+            surface_revision = binding.surface_revision,
+            "忽略旧 Browser Surface 主页面事件"
+        ),
+        Err(error) => tracing::debug!(
+            tab_id = %binding.tab_id,
+            ?error,
+            "忽略无法收敛的 Browser Surface 主页面状态"
+        ),
+    }
+}
+
+fn on_primary_surface_closed(
+    state: &ApiState,
+    binding: magi_browser_authority::BrowserSurfaceBinding,
+) {
+    let context = browser_tab_context(state, &binding.tab_id);
+    match state.mutate_browser_authority(|authority| {
+        authority.clear_primary_surface(&binding, UtcMillis::now())
+    }) {
+        Ok((true, tab, revoked)) => {
+            publish_tab_event(
+                state,
+                "browser.tab.status_changed",
+                context.clone(),
+                serde_json::json!({
+                    "tab_id": tab.tab_id,
+                    "lifecycle": tab.lifecycle,
+                    "surface_id": null,
+                    "surface_revision": binding.surface_revision,
+                    "navigation_revision": tab.navigation_revision,
+                }),
+            );
+            publish_tab_event(
+                state,
+                "browser.surface.primary_closed",
+                context,
+                serde_json::json!({ "binding": binding }),
+            );
+            if !revoked.is_empty() {
+                publish_tab_event(
+                    state,
+                    "browser.control.revoked",
+                    browser_tab_context(state, &binding.tab_id),
+                    serde_json::json!({
+                        "tab_id": binding.tab_id,
+                        "reason": "primary_surface_closed",
+                        "revoked_lease_count": revoked.len(),
+                    }),
+                );
+            }
+        }
+        Ok((false, _, _)) => tracing::debug!(
+            tab_id = %binding.tab_id,
+            surface_id = %binding.surface_id,
+            "忽略非当前 Primary Surface 的关闭事件"
+        ),
+        Err(error) => tracing::warn!(
+            tab_id = %binding.tab_id,
+            surface_id = %binding.surface_id,
+            ?error,
+            "处理 Primary Surface 关闭事件失败"
+        ),
+    }
+}
+
+fn on_user_takeover(state: &ApiState, binding: magi_browser_authority::BrowserSurfaceBinding) {
+    // 用户直接操作页面后由用户保持控制：代理不能在用户未交还前自动抢回。
+    revoke_surface_control(
+        state,
+        &binding,
+        BrowserLeaseEndReason::UserTakeover,
+        "user_takeover",
+        true,
+    );
+}
+
+fn on_user_activity(state: &ApiState, binding: magi_browser_authority::BrowserSurfaceBinding) {
+    if !is_current_primary_binding(state, &binding) {
+        return;
+    }
+    let _ = state.mutate_browser_authority(|authority| {
+        authority.record_user_activity(&binding.tab_id, UtcMillis::now());
+        Ok(())
+    });
+}
+
+fn on_page_updated(
+    state: &ApiState,
+    binding: magi_browser_authority::BrowserSurfaceBinding,
+    page_state: magi_browser_authority::BrowserHostPageState,
+) {
+    if page_state.tab_id != binding.tab_id
+        || page_state.navigation_revision != binding.navigation_revision
+    {
+        tracing::debug!(
+            tab_id = %binding.tab_id,
+            "忽略页面状态与 Surface binding 不一致的事件"
+        );
+        return;
+    }
+    let context = browser_tab_context(state, &binding.tab_id);
+    match state.mutate_browser_authority(|authority| {
+        let (accepted, revoked) = authority.accept_page_binding(&binding, UtcMillis::now())?;
+        if !accepted {
+            return Ok((None, revoked));
+        }
+        authority
+            .apply_host_page_state(
+                &page_state.tab_id,
+                page_state.navigation_revision,
+                page_state.url.clone(),
+                page_state.origin.clone(),
+                page_state.title.clone(),
+                UtcMillis::now(),
+            )
+            .map(|tab| (Some(tab), revoked))
+    }) {
+        Ok((Some(_), revoked)) => {
+            schedule_browser_annotation_sync(state, &binding.tab_id);
+            publish_tab_event(
+                state,
+                "browser.tab.updated",
+                context.clone(),
+                serde_json::json!({
+                    "tab_id": page_state.tab_id,
+                    "url": page_state.url,
+                    "title": page_state.title,
+                    "navigation_revision": page_state.navigation_revision,
+                    "binding": binding,
+                }),
+            );
+            if !revoked.is_empty() {
+                publish_tab_event(
+                    state,
+                    "browser.control.revoked",
+                    context,
+                    serde_json::json!({
+                        "tab_id": binding.tab_id,
+                        "binding": binding,
+                        "reason": "navigation_changed",
+                        "revoked_lease_count": revoked.len(),
+                    }),
+                );
+            }
+        }
+        Ok((None, _)) => tracing::debug!(
+            tab_id = %binding.tab_id,
+            surface_id = %binding.surface_id,
+            surface_revision = binding.surface_revision,
+            "忽略旧 Browser Surface 页面事件"
+        ),
+        Err(error) => tracing::debug!(
+            tab_id = %binding.tab_id,
+            ?error,
+            "忽略无法应用的旧页面状态"
+        ),
+    }
+}
+
+fn on_page_failed(
+    state: &ApiState,
+    binding: magi_browser_authority::BrowserSurfaceBinding,
+    reason: String,
+) {
+    if !is_current_or_advanced_primary_binding(state, &binding) {
+        tracing::debug!(
+            tab_id = %binding.tab_id,
+            surface_id = %binding.surface_id,
+            navigation_revision = binding.navigation_revision,
+            "忽略已失效 Browser Surface 的页面失败事件"
+        );
+        return;
+    }
+    publish_tab_event(
+        state,
+        "browser.automation.page_failed",
+        browser_tab_context(state, &binding.tab_id),
+        serde_json::json!({
+            "tab_id": binding.tab_id,
+            "binding": binding,
+            "reason": magi_core::public_runtime_excerpt(&reason, 1024),
+        }),
+    );
+}
+
+fn on_loading_changed(
+    state: &ApiState,
+    binding: magi_browser_authority::BrowserSurfaceBinding,
+    loading: bool,
+) {
+    if !is_current_or_advanced_primary_binding(state, &binding) {
+        tracing::debug!(
+            tab_id = %binding.tab_id,
+            surface_id = %binding.surface_id,
+            navigation_revision = binding.navigation_revision,
+            "忽略已失效 Browser Surface 的加载事件"
+        );
+        return;
+    }
+    publish_tab_event(
+        state,
+        "browser.tab.loading_changed",
+        browser_tab_context(state, &binding.tab_id),
+        serde_json::json!({
+            "tab_id": binding.tab_id,
+            "binding": binding,
+            "loading": loading,
+        }),
+    );
+}
+
+fn on_page_crashed(
+    state: &ApiState,
+    binding: magi_browser_authority::BrowserSurfaceBinding,
+    diagnostic: Option<String>,
+) {
+    if !is_current_primary_binding(state, &binding) {
+        tracing::debug!(
+            tab_id = %binding.tab_id,
+            surface_id = %binding.surface_id,
+            surface_revision = binding.surface_revision,
+            "忽略已失效 Browser Surface 的崩溃事件"
+        );
+        return;
+    }
+    let context = browser_tab_context(state, &binding.tab_id);
+    let lifecycle = state.mutate_browser_authority(|authority| {
+        authority.transition_tab(
+            &binding.tab_id,
+            magi_browser_authority::BrowserTabLifecycle::Crashed,
+            UtcMillis::now(),
+        )
+    });
+    match lifecycle {
+        Ok(tab) => {
+            publish_tab_event(
+                state,
+                "browser.tab.status_changed",
+                context.clone(),
+                serde_json::json!({
+                    "tab_id": tab.tab_id,
+                    "lifecycle": tab.lifecycle,
+                    "surface_id": binding.surface_id,
+                    "surface_revision": binding.surface_revision,
+                }),
+            );
+            publish_tab_event(
+                state,
+                "browser.automation.page_crashed",
+                context,
+                serde_json::json!({
+                    "tab_id": binding.tab_id,
+                    "binding": binding,
+                    "diagnostic": diagnostic.map(|value| magi_core::public_runtime_excerpt(&value, 1024)),
+                }),
+            );
+        }
+        Err(error) => tracing::debug!(
+            tab_id = %binding.tab_id,
+            ?error,
+            "忽略无法收敛的 Browser Surface 崩溃状态"
+        ),
+    }
+}
+
+fn on_dialog(
+    state: &ApiState,
+    tab_id: BrowserTabId,
+    dialog_id: u64,
+    dialog_type: String,
+    message: String,
+) {
+    publish_tab_event(
+        state,
+        "browser.dialog.opened",
+        browser_tab_context(state, &tab_id),
+        serde_json::json!({
+            "tab_id": tab_id,
+            "dialog_id": dialog_id,
+            "dialog_type": dialog_type,
+            "message": magi_core::public_runtime_excerpt(&message, 1024),
+        }),
+    );
+}
+
+fn on_popup_blocked(
+    state: &ApiState,
+    binding: magi_browser_authority::BrowserSurfaceBinding,
+    url: String,
+    reason: magi_browser_authority::BrowserPopupBlockReason,
+) {
+    if !is_current_or_advanced_primary_binding(state, &binding) {
+        tracing::debug!(
+            tab_id = %binding.tab_id,
+            surface_id = %binding.surface_id,
+            navigation_revision = binding.navigation_revision,
+            "忽略已失效 Browser Surface 的弹窗事件"
+        );
+        return;
+    }
+    publish_tab_event(
+        state,
+        "browser.popup.blocked",
+        browser_tab_context(state, &binding.tab_id),
+        serde_json::json!({
+            "tab_id": binding.tab_id,
+            "binding": binding,
+            "url": url,
+            "reason": reason,
+        }),
+    );
+}
+
+fn on_node_selection(state: &ApiState, selection: magi_browser_authority::BrowserNodeSelection) {
+    if !is_current_node_selection(state, &selection) {
+        tracing::debug!(
+            tab_id = %selection.tab_id,
+            surface_id = %selection.surface_id,
+            navigation_revision = selection.navigation_revision,
+            "忽略已失效 Browser Surface 的节点选择事件"
+        );
+        return;
+    }
+    let payload = serde_json::to_value(&selection)
+        .expect("BrowserNodeSelection must serialize as a structured event");
+    publish_tab_event(
+        state,
+        "browser.node.selected",
+        browser_tab_context(state, &selection.tab_id),
+        magi_conversation_runtime::context_reference::sanitize_browser_node_selection(&payload),
+    );
+}
+
+/// Electron 报告的一次下载状态更新。
+struct HostDownloadUpdate {
+    tab_id: BrowserTabId,
+    download_id: String,
+    suggested_filename: String,
+    state: String,
+    received_bytes: u64,
+    total_bytes: Option<u64>,
+    byte_length: Option<u64>,
+    saved_path: Option<String>,
+    error: Option<String>,
+}
+
+fn on_download(state: &ApiState, download: HostDownloadUpdate) {
+    let HostDownloadUpdate {
+        tab_id,
+        download_id,
+        suggested_filename,
+        state: download_state,
+        received_bytes,
+        total_bytes,
+        byte_length,
+        saved_path,
+        error,
+    } = download;
+    // 文件位置只进登记（供 browser_download 复制进工作区），不进下面面向用户的事件。
+    state
+        .browser_downloads()
+        .record(magi_api::browser_downloads::BrowserDownloadUpdate {
+            tab_id: tab_id.clone(),
+            download_id: download_id.clone(),
+            filename: suggested_filename.clone(),
+            state: download_state.clone(),
+            received_bytes,
+            total_bytes,
+            saved_path,
+            error: error
+                .as_ref()
+                .map(|value| magi_core::public_runtime_excerpt(value, 1024)),
+        });
+    publish_tab_event(
+        state,
+        "browser.download.updated",
+        browser_tab_context(state, &tab_id),
+        serde_json::json!({
+            "tab_id": tab_id,
+            "download_id": download_id,
+            "suggested_filename": suggested_filename,
+            "state": download_state,
+            "received_bytes": received_bytes,
+            "total_bytes": total_bytes,
+            "byte_length": byte_length,
+            "error": error.map(|value| magi_core::public_runtime_excerpt(&value, 1024)),
+        }),
+    );
 }
 
 fn control_revocation_reason(reason: &str) -> BrowserLeaseEndReason {
