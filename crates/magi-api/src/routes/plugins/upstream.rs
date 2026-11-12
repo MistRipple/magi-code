@@ -286,9 +286,7 @@ async fn search_ecosystem(
 }
 
 /// 已安装的上游来源包：(生态, 包名) → (插件 ID, 已安装版本)。
-fn installed_upstream(
-    state: &ApiState,
-) -> Result<InstalledUpstreamPlugins, ApiError> {
+fn installed_upstream(state: &ApiState) -> Result<InstalledUpstreamPlugins, ApiError> {
     let manager = locked(state, "读取已安装的上游插件")?;
     Ok(manager
         .state()

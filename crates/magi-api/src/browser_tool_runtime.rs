@@ -28,9 +28,8 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    git_tool_runtime::optional_string,
     RuntimeStatePersistence, browser_image::crop_browser_screenshot, errors::ApiError,
-    state::ApiState, state::BrowserHostStatusSnapshot,
+    git_tool_runtime::optional_string, state::ApiState, state::BrowserHostStatusSnapshot,
 };
 
 /// Host 的页面事件追平 Authority 的最多确认次数（见 `ensure_surface`）。
@@ -72,10 +71,10 @@ pub struct BrowserToolRuntimeDependencies {
     pub persistence: Option<Arc<RuntimeStatePersistence>>,
 }
 
-mod events;
-mod devtools_tabs;
-mod session_tabs;
 mod artifacts;
+mod devtools_tabs;
+mod events;
+mod session_tabs;
 
 impl BrowserToolRuntimeDependencies {
     pub fn execute(

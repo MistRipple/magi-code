@@ -2090,13 +2090,13 @@ pub trait PluginRouteExecutor: Send + Sync {
     >;
 }
 
-mod session_turns;
-mod snapshot;
-mod task_resources;
 mod browser;
 mod persistence;
-mod settings_json;
 mod session_git;
+mod session_turns;
+mod settings_json;
+mod snapshot;
+mod task_resources;
 
 impl ApiState {
     pub fn new(

@@ -154,10 +154,10 @@ struct StateLayoutMarker {
     version: u32,
 }
 
+mod durable_state;
+mod projection_transactions;
 mod session_projections;
 mod state_layout;
-mod projection_transactions;
-mod durable_state;
 
 impl StateRepository {
     pub(crate) fn new(state_root: PathBuf) -> Self {

@@ -50,24 +50,41 @@ use crate::{
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod queued_turns;
-pub(crate) use queued_turns::{QueuedRegularSessionTurnDrainOutcome, canonical_turn_matches_queued_regular_turn, drain_next_queued_regular_session_turn, schedule_next_queued_regular_session_turn, settle_queued_input_interruption_after_turn_commit};
 use queued_turns::*;
+pub(crate) use queued_turns::{
+    QueuedRegularSessionTurnDrainOutcome, canonical_turn_matches_queued_regular_turn,
+    drain_next_queued_regular_session_turn, schedule_next_queued_regular_session_turn,
+    settle_queued_input_interruption_after_turn_commit,
+};
 mod steering;
-pub(crate) use steering::{session_turn_guide_capability, session_turn_request_is_steerable_input, submit_steer_current_turn_after_turn_commit};
 use steering::*;
+pub(crate) use steering::{
+    session_turn_guide_capability, session_turn_request_is_steerable_input,
+    submit_steer_current_turn_after_turn_commit,
+};
 mod replay;
 use replay::*;
 mod goal_turns;
-#[cfg(test)]
-pub(crate) use goal_turns::{goal_continuation_prompt, goal_runtime_retry_backoff, plan_allows_goal_continuation};
-pub(crate) use goal_turns::{ensure_goal_continuation_runtime_available, goal_mode_tool_intent, record_active_goal_turn_failure, record_active_goal_turn_success, resume_active_goal_continuation_turn_after_turn_commit, settle_goal_start_turn};
 use goal_turns::*;
+pub(crate) use goal_turns::{
+    ensure_goal_continuation_runtime_available, goal_mode_tool_intent,
+    record_active_goal_turn_failure, record_active_goal_turn_success,
+    resume_active_goal_continuation_turn_after_turn_commit, settle_goal_start_turn,
+};
+#[cfg(test)]
+pub(crate) use goal_turns::{
+    goal_continuation_prompt, goal_runtime_retry_backoff, plan_allows_goal_continuation,
+};
 mod interrupt_continue;
 #[cfg(test)]
 pub(crate) use interrupt_continue::continue_session_with_expected_root;
-pub(crate) use interrupt_continue::{ContinueUserMessageInput, cancel_active_session_turn_for_lifecycle, continue_session, finalize_continue_session, finalize_terminal_root_current_turn, interrupt_session_turn, interrupt_session_turn_with_expected, turn_status_is_interruptible, write_continue_user_message};
 use interrupt_continue::*;
-
+pub(crate) use interrupt_continue::{
+    ContinueUserMessageInput, cancel_active_session_turn_for_lifecycle, continue_session,
+    finalize_continue_session, finalize_terminal_root_current_turn, interrupt_session_turn,
+    interrupt_session_turn_with_expected, turn_status_is_interruptible,
+    write_continue_user_message,
+};
 
 static ACCEPTED_AT_COUNTER: AtomicU64 = AtomicU64::new(0);
 

@@ -1475,7 +1475,9 @@ impl MagiTurnHarness {
         let mut dispatcher_builder = LlmTaskDispatcher::new(
             Arc::clone(&event_bus),
             ExecutionPipeline {
-                task_store: task_store.clone().unwrap_or_else(|| Arc::new(TaskStore::new())),
+                task_store: task_store
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(TaskStore::new())),
                 memory_store: MemoryStore::new(),
             },
             LlmTaskDispatcherDependencies {

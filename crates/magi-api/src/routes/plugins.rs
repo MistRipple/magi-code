@@ -726,7 +726,12 @@ async fn authorize(
     Json(request): Json<AuthorizeRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
-        .authorize(&id, request.grants, None, request.expected_digest.as_deref())
+        .authorize(
+            &id,
+            request.grants,
+            None,
+            request.expected_digest.as_deref(),
+        )
         .await?;
     snapshot(&state, &*locked(&state, "读取授权结果")?)
 }
