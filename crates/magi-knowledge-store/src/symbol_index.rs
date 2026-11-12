@@ -62,7 +62,6 @@ pub struct SymbolIndex {
     lang_patterns: HashMap<&'static str, Vec<SymbolPattern>>,
     method_pattern: Regex,
     java_method_pattern: Regex,
-    reexport_pattern: Regex,
     ready: bool,
 }
 
@@ -84,10 +83,6 @@ impl SymbolIndex {
             .unwrap(),
             java_method_pattern: Regex::new(
                 r"^\s+(?:(?:public|private|protected|static|final|abstract|synchronized|native)\s+)*(?:<[^>]+>\s+)?[A-Za-z_][A-Za-z0-9_<>,\[\]\s.]*\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(",
-            )
-            .unwrap(),
-            reexport_pattern: Regex::new(
-                r#"^export\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#,
             )
             .unwrap(),
             ready: false,
@@ -448,11 +443,10 @@ impl SymbolIndex {
             return;
         };
 
-        let is_ts = matches!(ext, ".ts" | ".tsx" | ".js" | ".jsx" | ".mjs" | ".cjs");
         let is_java = ext == ".java";
         let is_csharp = ext == ".cs";
         let is_cpp = matches!(ext, ".cpp" | ".cc" | ".cxx" | ".hpp" | ".hh");
-        let has_class_scope = is_ts || is_java || is_csharp || is_cpp;
+        let has_class_scope = is_java || is_csharp || is_cpp;
 
         let lines: Vec<&str> = content.lines().collect();
         let mut symbol_names: Vec<String> = Vec::new();
@@ -493,33 +487,6 @@ impl SymbolIndex {
                     in_block_comment = true;
                 }
                 continue;
-            }
-
-            // re-export (TS/JS)
-            if is_ts
-                && let Some(caps) = self.reexport_pattern.captures(line)
-                && let Some(exported_names_str) = caps.get(1)
-            {
-                for name_part in exported_names_str.as_str().split(',') {
-                    let name = name_part.trim().split(" as ").last().unwrap_or("").trim();
-                    if name.len() >= 2 {
-                        let entry = SymbolEntry {
-                            name: name.to_string(),
-                            kind: SymbolKind::Variable,
-                            file_path: file_path.to_string(),
-                            line: line_idx,
-                            end_line: Some(line_idx),
-                            is_exported: true,
-                            container: None,
-                            signature: None,
-                        };
-                        self.symbols
-                            .entry(name.to_string())
-                            .or_default()
-                            .push(entry);
-                        symbol_names.push(name.to_string());
-                    }
-                }
             }
 
             let (stripped_line, opens_multi) = strip_strings(line);
@@ -830,103 +797,6 @@ fn update_end_line(
 fn build_lang_patterns() -> HashMap<&'static str, Vec<SymbolPattern>> {
     let mut map = HashMap::new();
 
-    let ts_patterns = [SymbolPattern {
-            kind: SymbolKind::Function,
-            pattern: Regex::new(r"^(export\s+)?(?:async\s+)?function\s+([a-zA-Z_$][a-zA-Z0-9_$]*)").unwrap(),
-            name_group: 2,
-            export_group: Some(1),
-        },
-        SymbolPattern {
-            kind: SymbolKind::Function,
-            pattern: Regex::new(r"^(export\s+)?(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[a-zA-Z_$][a-zA-Z0-9_$]*)\s*=>").unwrap(),
-            name_group: 2,
-            export_group: Some(1),
-        },
-        SymbolPattern {
-            kind: SymbolKind::Class,
-            pattern: Regex::new(r"^(export\s+)?(?:abstract\s+)?class\s+([a-zA-Z_$][a-zA-Z0-9_$]*)").unwrap(),
-            name_group: 2,
-            export_group: Some(1),
-        },
-        SymbolPattern {
-            kind: SymbolKind::Interface,
-            pattern: Regex::new(r"^(export\s+)?interface\s+([a-zA-Z_$][a-zA-Z0-9_$]*)").unwrap(),
-            name_group: 2,
-            export_group: Some(1),
-        },
-        SymbolPattern {
-            kind: SymbolKind::Type,
-            pattern: Regex::new(r"^(export\s+)?type\s+([a-zA-Z_$][a-zA-Z0-9_$]*)").unwrap(),
-            name_group: 2,
-            export_group: Some(1),
-        },
-        SymbolPattern {
-            kind: SymbolKind::Enum,
-            pattern: Regex::new(r"^(export\s+)?(?:const\s+)?enum\s+([a-zA-Z_$][a-zA-Z0-9_$]*)").unwrap(),
-            name_group: 2,
-            export_group: Some(1),
-        },
-        SymbolPattern {
-            kind: SymbolKind::Variable,
-            pattern: Regex::new(r"^(export\s+)(?:const|let|var)\s+([A-Z][a-zA-Z0-9_$]*)").unwrap(),
-            name_group: 2,
-            export_group: Some(1),
-        }];
-    for ext in [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"] {
-        map.insert(ext, Vec::new());
-    }
-    for ext in [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"] {
-        map.insert(
-            ext,
-            ts_patterns
-                .iter()
-                .map(|sp| SymbolPattern {
-                    kind: sp.kind,
-                    pattern: sp.pattern.clone(),
-                    name_group: sp.name_group,
-                    export_group: sp.export_group,
-                })
-                .collect(),
-        );
-    }
-
-    map.insert(
-        ".py",
-        vec![
-            SymbolPattern {
-                kind: SymbolKind::Function,
-                pattern: Regex::new(r"^(?:async\s+)?def\s+([a-zA-Z_][a-zA-Z0-9_]*)").unwrap(),
-                name_group: 1,
-                export_group: None,
-            },
-            SymbolPattern {
-                kind: SymbolKind::Class,
-                pattern: Regex::new(r"^class\s+([a-zA-Z_][a-zA-Z0-9_]*)").unwrap(),
-                name_group: 1,
-                export_group: None,
-            },
-        ],
-    );
-
-    map.insert(
-        ".go",
-        vec![
-            SymbolPattern {
-                kind: SymbolKind::Function,
-                pattern: Regex::new(r"^func\s+(?:\([^)]+\)\s+)?([A-Za-z_][A-Za-z0-9_]*)").unwrap(),
-                name_group: 1,
-                export_group: None,
-            },
-            SymbolPattern {
-                kind: SymbolKind::Type,
-                pattern: Regex::new(r"^type\s+([A-Za-z_][A-Za-z0-9_]*)\s+(?:struct|interface)")
-                    .unwrap(),
-                name_group: 1,
-                export_group: None,
-            },
-        ],
-    );
-
     map.insert(".java", vec![
         SymbolPattern {
             kind: SymbolKind::Class,
@@ -947,47 +817,6 @@ fn build_lang_patterns() -> HashMap<&'static str, Vec<SymbolPattern>> {
             export_group: None,
         },
     ]);
-
-    let rust_patterns = vec![
-        SymbolPattern {
-            kind: SymbolKind::Function,
-            pattern: Regex::new(
-                r"^(?:pub\s+(?:\(crate\)\s+)?)?(?:async\s+)?fn\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-            )
-            .unwrap(),
-            name_group: 1,
-            export_group: None,
-        },
-        SymbolPattern {
-            kind: SymbolKind::Class,
-            pattern: Regex::new(r"^(?:pub\s+(?:\(crate\)\s+)?)?struct\s+([A-Za-z_][A-Za-z0-9_]*)")
-                .unwrap(),
-            name_group: 1,
-            export_group: None,
-        },
-        SymbolPattern {
-            kind: SymbolKind::Interface,
-            pattern: Regex::new(r"^(?:pub\s+(?:\(crate\)\s+)?)?trait\s+([A-Za-z_][A-Za-z0-9_]*)")
-                .unwrap(),
-            name_group: 1,
-            export_group: None,
-        },
-        SymbolPattern {
-            kind: SymbolKind::Enum,
-            pattern: Regex::new(r"^(?:pub\s+(?:\(crate\)\s+)?)?enum\s+([A-Za-z_][A-Za-z0-9_]*)")
-                .unwrap(),
-            name_group: 1,
-            export_group: None,
-        },
-        SymbolPattern {
-            kind: SymbolKind::Type,
-            pattern: Regex::new(r"^(?:pub\s+(?:\(crate\)\s+)?)?type\s+([A-Za-z_][A-Za-z0-9_]*)")
-                .unwrap(),
-            name_group: 1,
-            export_group: None,
-        },
-    ];
-    map.insert(".rs", rust_patterns);
 
     let c_patterns = [SymbolPattern {
             kind: SymbolKind::Function,
