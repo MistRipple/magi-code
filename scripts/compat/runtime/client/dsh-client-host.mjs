@@ -257,7 +257,9 @@ export function startDshClient(options) {
     const rank = (entry) => { const index = MOUNT_PRIORITY.indexOf(entry.descriptor.name); return index === -1 ? MOUNT_PRIORITY.length : index; };
     const card = [...cards].sort((a, b) => rank(a) - rank(b))[0];
     if (!card) {
-      root.render(React.createElement('div', { style: { padding: 16 } }, '该插件没有提供设置界面。'));
+      // 输入框左侧不是设置页：切换会话时会话上下文先到、卡片稍后才注册，此间必须保持空白，
+      // 设置页的“没有提供界面”提示只属于设置位置，否则每次切换都会在输入框左下角闪一下。
+      root.render(['composerLeft'].includes(placement) ? null : React.createElement('div', { style: { padding: 16 } }, '该插件没有提供设置界面。'));
       return;
     }
     const injected = bindSlotProps(card.descriptor, card.descriptor.inject?.(conversation?.sessionId) ?? {}, ctx.locale);
