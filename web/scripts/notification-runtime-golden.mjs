@@ -117,6 +117,17 @@ await withGoldenViteServer(async (server) => {
   await action;
   assert.equal(posted.at(-1).incident.workspaceId, 'workspace-notification-runtime');
   assert.equal(posted.at(-1).incident.sessionId, 'session-notification-runtime', '异步错误保留操作发起时的归属');
+  assert.equal(store.getToasts().at(-1).message, 'original operation failed',
+    '主动操作失败需即时反馈，不能只有异常记录');
+  const toastCount = store.getToasts().length;
+  let inlineError;
+  await runActionWithFeedback(async () => { throw new Error('inline validation failed'); }, {
+    actionLabel: '保存配置',
+    onError: (message, error) => { inlineError = error.message; },
+  });
+  assert.equal(inlineError, 'inline validation failed');
+  assert.equal(store.getToasts().length, toastCount,
+    '已有就地错误反馈时不叠加相同 toast');
 
   console.log('notification runtime golden passed');
 });

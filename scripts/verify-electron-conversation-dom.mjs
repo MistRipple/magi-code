@@ -1231,12 +1231,9 @@ async function rendererState(page) {
       } : null;
     })(),
     agentCenter: (() => {
-      // 代理状态条常驻顶栏；有代理时 data-agent-count > 0，点击后在右栏打开代理列表。
-      const trigger = document.querySelector('[data-testid="agent-status-chip"]');
       const panel = document.querySelector('[data-testid="right-pane-agent-list"]');
       return {
-        visible: Number(trigger?.getAttribute('data-agent-count') || 0) > 0,
-        expanded: trigger?.getAttribute('aria-pressed') || null,
+        open: Boolean(panel),
         text: panel?.innerText || '',
         rows: [...document.querySelectorAll('.agent-row')].map((item) => item.innerText || ''),
         agentCards: [...document.querySelectorAll('[data-tool-name="agent_spawn"]')].map((item) => ({
@@ -2522,6 +2519,35 @@ async function ensureLatestAgentGroupVisible(page) {
   })()`), "本轮代理组可见");
 }
 
+async function openAgentList(page) {
+  await page.evaluate(`(() => {
+    const toggle = document.querySelector('.header-right-pane-btn');
+    if (!toggle) throw new Error('right pane toggle missing');
+    if (toggle.getAttribute('aria-expanded') !== 'true') toggle.click();
+  })()`);
+  await waitFor(() => page.evaluate(`Boolean(document.querySelector('.right-pane-add-tab'))`), "右栏新增面板入口");
+  await page.evaluate(`document.querySelector('.right-pane-add-tab').click()`);
+  await waitFor(() => page.evaluate(`Boolean(document.querySelector('[data-testid="right-pane-launcher"] [data-kind="agents"]'))`), "新标签页代理入口");
+  await page.evaluate(`document.querySelector('[data-testid="right-pane-launcher"] [data-kind="agents"]').click()`);
+  return await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.agentCenter.open ? state : null;
+  }, "右栏代理列表打开");
+}
+
+async function expandCompletedAgents(page) {
+  try {
+    await waitFor(() => page.evaluate(`(() => {
+      const toggle = document.querySelector('[data-testid="right-pane-agent-list"] .group-heading--toggle');
+      if (!toggle) return false;
+      if (toggle.getAttribute('aria-expanded') !== 'true') toggle.click();
+      return true;
+    })()`), "代理列表完成分组");
+  } catch (error) {
+    throw new Error(`${error.message}; renderer=${JSON.stringify(await rendererState(page))}`);
+  }
+}
+
 async function gitFixtureCommand(repositoryRoot, args) {
   await execFileAsync("git", args, {
     cwd: repositoryRoot,
@@ -3554,16 +3580,14 @@ try {
   check("桌面端 worker 统计与接口调用数一致", desktopStats.items
     .filter((item) => item.role === "worker")
     .reduce((sum, item) => sum + item.llmCallCount, 0) > 0);
-  const agentCenterBeforeExpand = await rendererState(page);
-  if (agentCenterBeforeExpand.agentCenter.visible) {
-    await page.evaluate(`document.querySelector('[data-testid="agent-status-chip"]')?.click()`);
-    const expandedAgentCenter = await waitFor(async () => {
-      const state = await rendererState(page);
-      return state.agentCenter.expanded === "true" && state.agentCenter.rows.length > 0 ? state : null;
-    }, "代理运行中心展开");
-    check("代理运行中心支持展开", expandedAgentCenter.agentCenter.expanded === "true");
-    check("代理运行中心显示子代理", expandedAgentCenter.agentCenter.rows.length > 0);
-  }
+  await openAgentList(page);
+  await expandCompletedAgents(page);
+  const expandedAgentCenter = await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.agentCenter.rows.length > 0 ? state : null;
+  }, "代理列表展示已完成子代理");
+  check("右栏新增面板可打开代理列表", expandedAgentCenter.agentCenter.open);
+  check("代理列表显示子代理", expandedAgentCenter.agentCenter.rows.length > 0);
 
   // 失败代理也必须沿真实 agent_spawn -> canonical/tool projection -> Agent
   // Run read model 进入 Renderer；不能只验成功卡片或直接注入失败状态。
@@ -3601,17 +3625,9 @@ try {
   );
   check("子代理失败卡片未伪造 child task id", !failedAgent.agentCenter.agentCards.at(-1)?.taskId);
   check("未创建的代理卡片不可打开", failedAgent.agentCenter.agentCards.at(-1)?.disabled);
-  if (failedAgent.agentCenter.visible) {
-    await page.evaluate(`document.querySelector('[data-testid="agent-status-chip"]')?.click()`);
-    const failedAgentCenter = await waitFor(async () => {
-      const state = await rendererState(page);
-      return state.agentCenter.expanded === "true"
-        && /失败|需要处理|不可用|failed|error/iu.test(state.agentCenter.text)
-        ? state
-        : null;
-    }, "代理运行中心失败恢复状态", 45_000);
-    check("代理运行中心显示失败恢复状态", /失败|需要处理|不可用|failed|error/iu.test(failedAgentCenter.agentCenter.text));
-  }
+  const failedAgentCenter = await openAgentList(page);
+  check("派发拒绝后代理列表不伪造代理", failedAgentCenter.agentCenter.rows.length === 0);
+  check("普通派发拒绝不出现代理恢复横幅", !await page.evaluate(`Boolean(document.querySelector('[data-testid="agent-run-banner"]'))`));
   const failedAgentTurnId = failedAgent.turns.at(-1)?.id
     || failedAgent.assistant.at(-1)?.turnId
     || null;
@@ -3678,29 +3694,16 @@ try {
   check("子代理多状态卡片保留不同任务身份", new Set(multiCards.map(card => card.taskId)).size === 2);
   check("子代理多状态卡片分别显示成功和失败", multiCards.some(card => card.status.includes('status-success'))
     && multiCards.some(card => card.status.includes('status-error')));
-  if (multiAgentCenter.agentCenter.visible) {
-    if (multiAgentCenter.agentCenter.expanded !== "true") {
-      await page.evaluate(`document.querySelector('[data-testid="agent-status-chip"]')?.click()`);
-      await waitFor(async () => {
-        const state = await rendererState(page);
-        return state.agentCenter.expanded === "true" ? state : null;
-      }, "子代理多状态运行中心展开");
-    }
-    await page.evaluate(`(() => {
-      const toggle = document.querySelector('[data-testid="right-pane-agent-list"] .group-heading--toggle');
-      if (toggle?.getAttribute('aria-expanded') !== 'true') toggle?.click();
-    })()`);
-    const expandedMultiAgentCenter = await waitFor(async () => {
-      const state = await rendererState(page);
-      const rowsText = state.agentCenter.rows.join("\n");
-      return state.agentCenter.rows.length >= 2
-        && /成功|完成|completed|success/iu.test(rowsText)
-        && /失败|failed|error/iu.test(rowsText)
-        ? state
-        : null;
-    }, "子代理多状态运行中心行", 45_000);
-    check("代理运行中心同时显示成功和失败子代理行", expandedMultiAgentCenter.agentCenter.rows.length >= 2);
-  }
+  await openAgentList(page);
+  await expandCompletedAgents(page);
+  const expandedMultiAgentCenter = await waitFor(async () => {
+    const state = await rendererState(page);
+    const rowsText = state.agentCenter.rows.join("\n");
+    return state.agentCenter.rows.length >= 2
+      && /成功|完成|completed|success/iu.test(rowsText)
+      && /失败|failed|error/iu.test(rowsText) ? state : null;
+  }, "子代理多状态运行中心行", 45_000);
+  check("代理运行中心同时显示成功和失败子代理行", expandedMultiAgentCenter.agentCenter.rows.length >= 2);
 
   await chooseAccessProfile(page, "read_only");
   const permissionDeniedPrompt = "权限拒绝 DOM 验收：请明确调用 file_write 写入文件";

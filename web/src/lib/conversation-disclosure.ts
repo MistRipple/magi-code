@@ -13,7 +13,16 @@ export type ConversationStreamEntry =
   | { kind: 'event'; key: string; item: TimelineRenderItem }
   | { kind: 'tool-group'; key: string; items: TimelineRenderItem[] }
   | { kind: 'item'; key: string; item: TimelineRenderItem; role: 'artifact' | 'attention' | 'interaction' }
-  | { kind: 'agent-group'; key: string; items: TimelineRenderItem[] };
+  | { kind: 'agent-group'; key: string; items: TimelineRenderItem[] }
+  | { kind: 'user-input'; key: string; item: TimelineRenderItem };
+
+/**
+ * 运行中补充的用户消息。它在时间线上的位置就是发送时刻：此前已经输出的内容留在它上面，
+ * 之后的输出接在它下面，所以不能和首条用户消息一起固定在整轮的最顶部。
+ */
+export function isSteeringUserInput(message: Message): boolean {
+  return message.type === 'user_input' && message.metadata?.route === 'steer';
+}
 
 export interface ConversationPresentationEntry {
   item: TimelineRenderItem;
@@ -50,6 +59,12 @@ export function buildConversationStreamEntries(
   };
 
   for (const entry of presentationItems) {
+    if (isSteeringUserInput(entry.item.message)) {
+      flushToolGroup();
+      flushAgentGroup();
+      result.push({ kind: 'user-input', key: `user-input:${entry.item.key}`, item: entry.item });
+      continue;
+    }
     if (entry.role === 'final') continue;
     if (entry.role === 'delegation') {
       flushToolGroup();
@@ -103,7 +118,7 @@ export interface ConversationPhase {
 
 export type ConversationDisclosureBlock =
   | { kind: 'phase'; phase: ConversationPhase }
-  | Extract<ConversationStreamEntry, { kind: 'item' | 'agent-group' | 'tool-group' }>;
+  | Extract<ConversationStreamEntry, { kind: 'item' | 'agent-group' | 'tool-group' | 'user-input' }>;
 
 export type ConversationTranslate = (
   key: string,

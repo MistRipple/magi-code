@@ -555,6 +555,8 @@ await withGoldenViteServer(async (server) => {
   assert.match(unavailableToolMarkup, /校验工具可用性/);
   assert.match(unavailableToolMarkup, /重新选择可用工具/);
   assert.match(unavailableToolMarkup, /tool_not_available/);
+  assert.match(unavailableToolMarkup, /<details[^>]*class="[^"]*model-failure-details/);
+  assert.doesNotMatch(unavailableToolMarkup, /<details[^>]*model-failure-details[^>]*open/);
   assert.doesNotMatch(unavailableToolMarkup, /工具调用格式错误/);
 
   assert.equal(

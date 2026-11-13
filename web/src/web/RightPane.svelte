@@ -1,5 +1,5 @@
 <script lang="ts">
-import { rightPaneState, getRightPaneState, closeTab, setActiveRightPaneTab, updateRightPaneTabLabel, setRightPaneCollapsed, clearBrowserTabClosePending, markBrowserTabClosePending, type RightPaneTab, type CodeTabPayload, type AgentTabPayload, type BrowserTabPayload, type TerminalTabPayload, type PluginTabPayload, synchronizeBrowserSessionSnapshot, openTerminalTab, openPluginTab, openCodeTab, openAgentTab, openLauncherTab, LAUNCHER_TAB_ID } from '../stores/right-pane.svelte';
+import { rightPaneState, getRightPaneState, closeTab, setActiveRightPaneTab, updateRightPaneTabLabel, setRightPaneCollapsed, clearBrowserTabClosePending, markBrowserTabClosePending, type RightPaneTab, type CodeTabPayload, type AgentTabPayload, type BrowserTabPayload, type TerminalTabPayload, type PluginTabPayload, synchronizeBrowserSessionSnapshot, openTerminalTab, openPluginTab, openCodeTab, openAgentTab, openLauncherTab, openAgentsTab, LAUNCHER_TAB_ID } from '../stores/right-pane.svelte';
 import { recentPaneItems, recordRecentPaneItem, forgetRecentPaneItem, recentCodeKey, recentWebKey, recordableWebUrl, type RecentPaneItem } from '../stores/right-pane-recent.svelte';
 import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession, getBrowserCapabilities, getAgentChangeDiff, getAgentFilePreview, isPublicTunnelAccess, type BrowserCapabilitiesSnapshot } from './agent-api';
   import FileName from '../components/FileName.svelte';
@@ -252,11 +252,19 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     }) !== null;
   }
 
-  type LauncherToolKind = 'browser' | 'terminal' | 'plugin' | 'managePlugins';
+  type LauncherToolKind = 'agents' | 'browser' | 'terminal' | 'plugin' | 'managePlugins';
 
   const pluginViews = $derived.by(() => pluginManifests.flatMap((manifest) => manifest.contributions?.views?.filter((view) => view.placements.includes('rightPane')).map((view) => ({ manifest, view })) ?? []));
   const pluginViewNeedsSession = $derived(!rightPaneState.activeSessionId.trim());
   const launcherTools = $derived<LauncherTool[]>([
+    {
+      key: 'agents',
+      kind: 'agents' satisfies LauncherToolKind,
+      label: i18n.t('rightPane.agents.title'),
+      icon: 'bot',
+      enabled: true,
+      disabledReason: '',
+    },
     {
       key: 'terminal',
       kind: 'terminal' satisfies LauncherToolKind,
@@ -341,6 +349,11 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
 
   async function chooseLauncherTool(tool: LauncherTool): Promise<void> {
     const kind = tool.kind as LauncherToolKind;
+    if (kind === 'agents') {
+      openAgentsTab(paneScopeKey);
+      closeLauncher();
+      return;
+    }
     if (kind === 'browser') {
       // 与消息里的链接共用同一个创建入口；空白页不参与同 URL 复用。
       if (creatingBrowserPane) return;

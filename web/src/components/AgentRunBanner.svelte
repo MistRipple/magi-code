@@ -7,67 +7,43 @@
    * 位置与待确认的工具审批相同：在消息列表下方、输入区上方，不遮挡正在看的消息。
    */
   import Icon from './Icon.svelte';
+  import { resolveAgentRunNotice } from '../lib/active-agent-center';
   import { activeAgentRun } from '../stores/active-agent-run.svelte';
   import { i18n } from '../stores/i18n.svelte';
 
   const outcome = $derived(activeAgentRun.outcome);
   const failureSummary = $derived(activeAgentRun.failureSummary);
-  const availableActions = $derived(activeAgentRun.availableActions);
-  // 继续推进由输入框的发送按钮承担（daemon 判定的 `continuation`）；横幅只保留归档。
-  const canContinue = $derived(activeAgentRun.continuation !== null);
-  const canArchive = $derived(availableActions.includes('archive'));
-
-  const visible = $derived(
-    outcome === 'recoverable'
-      || outcome === 'failed'
-      || outcome === 'degraded'
-      || outcome === 'killed'
-      || (outcome === 'active' && Boolean(failureSummary)),
-  );
-
-  const tone = $derived.by((): 'warning' | 'error' | 'muted' => {
-    if (outcome === 'failed' || outcome === 'recoverable') return 'error';
-    if (outcome === 'degraded' || (outcome === 'active' && failureSummary)) return 'warning';
-    return 'muted';
-  });
-
-  const title = $derived.by(() => {
-    if (outcome === 'active') return i18n.t('activeAgentCenter.recovery.mainlineHandling');
-    if (outcome === 'recoverable') return i18n.t('activeAgentCenter.recovery.recoverable');
-    if (outcome === 'failed') return i18n.t('activeAgentCenter.recovery.failed');
-    if (outcome === 'degraded') return i18n.t('activeAgentCenter.recovery.degraded');
-    return i18n.t('activeAgentCenter.recovery.killed');
-  });
-
-  const description = $derived.by(() => {
-    if (outcome === 'active') return i18n.t('activeAgentCenter.recovery.mainlineHandlingHint');
-    if (outcome === 'recoverable') return i18n.t('activeAgentCenter.recovery.recoverableHint');
-    if (outcome === 'failed') return i18n.t('activeAgentCenter.recovery.failedHint');
-    if (outcome === 'degraded') return i18n.t('activeAgentCenter.recovery.degradedHint');
-    return i18n.t('activeAgentCenter.recovery.killedHint');
-  });
+  const continuation = $derived(activeAgentRun.continuation);
+  const notice = $derived(resolveAgentRunNotice({
+    outcome,
+    hasAgentEntries: activeAgentRun.hasAgentEntries,
+    failedAgentCount: failureSummary?.failedAgentCount ?? 0,
+    availableActions: activeAgentRun.availableActions,
+  }));
 
 </script>
 
-{#if visible}
+{#if notice}
   <div class="run-banner-wrap">
-  <section class="run-banner run-banner--{tone}" aria-live="polite" data-testid="agent-run-banner">
+  <section class="run-banner run-banner--{notice.tone}" aria-live="polite" data-testid="agent-run-banner">
     <span class="run-banner-icon" aria-hidden="true">
       <Icon name={outcome === 'active' ? 'alert-triangle' : 'warning'} size={15} />
     </span>
     <span class="run-banner-copy">
-      <strong>{title}</strong>
-      <span>{description}</span>
-      {#if canContinue}<span class="run-banner-hint">{i18n.t('activeAgentCenter.composerHintContinue')}</span>{/if}
-      {#if failureSummary?.message}<code>{failureSummary.message}</code>{/if}
+      <strong>{i18n.t(`activeAgentCenter.recovery.${notice.kind}`)}</strong>
+      <span>{i18n.t(`activeAgentCenter.recovery.${notice.kind}Hint`)}</span>
+      {#if continuation}<span class="run-banner-hint">{i18n.t(`activeAgentCenter.recovery.${continuation}`)}</span>{/if}
       {#if activeAgentRun.actionError}<code class="run-banner-error">{activeAgentRun.actionError}</code>{/if}
     </span>
+    {#if notice.showAgents || notice.canArchive}
     <span class="run-banner-actions">
-      <button type="button" class="btn btn--secondary btn--sm run-banner-view" onclick={() => activeAgentRun.openList()}>
-        <Icon name="bot" size={12} />
-        {i18n.t('activeAgentCenter.viewAgents')}
-      </button>
-      {#if canArchive}
+      {#if notice.showAgents}
+        <button type="button" class="btn btn--secondary btn--sm run-banner-view" onclick={() => activeAgentRun.openList()}>
+          <Icon name="bot" size={12} />
+          {i18n.t('activeAgentCenter.viewAgents')}
+        </button>
+      {/if}
+      {#if notice.canArchive}
         <button
           type="button"
           class="btn btn--secondary btn--sm run-banner-action--archive"
@@ -83,6 +59,7 @@
         </button>
       {/if}
     </span>
+    {/if}
   </section>
   </div>
 {/if}
@@ -160,17 +137,13 @@
     gap: var(--space-3);
   }
 
-  /* 窄屏纵向空间紧：说明文字收起，只留标题与真实错误；顶栏的状态条就在上方，不再重复「查看代理」。 */
+  /* 窄屏纵向空间紧：说明文字收起，只留标题与真实错误。 */
   @media (max-width: 640px) {
     .run-banner {
       flex-wrap: wrap;
     }
 
     .run-banner-copy > span:not(.run-banner-error):not(.run-banner-hint) {
-      display: none;
-    }
-
-    .run-banner-view {
       display: none;
     }
 

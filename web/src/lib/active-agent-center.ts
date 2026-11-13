@@ -1,5 +1,6 @@
 import type {
   AgentProjectionDto,
+  AgentRunActionKind,
   AgentRunOutcome,
   AgentRunProjectionDto,
 } from '../shared/rust-backend-types';
@@ -17,6 +18,33 @@ export interface ActiveAgentSummary {
   attentionCount: number;
   completedCount: number;
   triggerCount: number;
+}
+
+/** 只决定呈现：错误归原条目，继续归会话，代理管理归确有失败的代理运行。 */
+export function resolveAgentRunNotice(input: {
+  outcome: AgentRunOutcome | null | undefined;
+  hasAgentEntries: boolean;
+  failedAgentCount: number;
+  availableActions: readonly AgentRunActionKind[];
+}): {
+  kind: 'mainlineHandling' | 'recoverable' | 'failed' | 'degraded' | 'killed';
+  tone: 'warning' | 'error' | 'muted';
+  showAgents: boolean;
+  canArchive: boolean;
+} | null {
+  const { outcome } = input;
+  // continuation 是会话级输入区能力；没有真实代理条目时不在主对话再放一条运行横幅。
+  if (!outcome || outcome === 'completed' || !input.hasAgentEntries) return null;
+  const failedAgents = input.hasAgentEntries && input.failedAgentCount > 0;
+  const showAgents = outcome === 'killed' || failedAgents;
+  if (!showAgents) return null;
+  return {
+    kind: outcome === 'active' ? 'mainlineHandling' : outcome,
+    tone: outcome === 'active' || outcome === 'degraded' ? 'warning'
+      : outcome === 'killed' ? 'muted' : 'error',
+    showAgents,
+    canArchive: showAgents && input.availableActions.includes('archive'),
+  };
 }
 
 export function isAgentRuntimeActive(agent: AgentProjectionDto): boolean {
@@ -130,7 +158,7 @@ export function selectLauncherAgents(
   return [...groups.running].sort(newestFirst).concat([...groups.queued].sort(newestFirst));
 }
 
-/** 一句话概括当前这轮代理运行；状态条的提示和代理列表的标题共用。 */
+/** 一句话概括当前这轮代理运行；代理列表标题和恢复提示共用。 */
 export function summarizeActiveAgentRun(
   summary: ActiveAgentSummary,
   outcome: AgentRunOutcome | null | undefined,

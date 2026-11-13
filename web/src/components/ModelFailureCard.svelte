@@ -12,6 +12,7 @@
 
   let { failure }: Props = $props();
   let copied = $state(false);
+  let copyFailed = $state(false);
   let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
   const isToolCallFailure = $derived(failure.schemaVersion === 'tool-call-failure.v1');
   const isUnavailableTool = $derived(
@@ -77,13 +78,19 @@
       `${i18n.t('messageItem.modelFailure.code')}: ${failure.code}`,
       `${i18n.t('messageItem.modelFailure.diagnostic')}: ${failure.detail}`,
     ].join('\n');
-    await navigator.clipboard.writeText(text);
-    copied = true;
-    if (copyResetTimer) clearTimeout(copyResetTimer);
-    copyResetTimer = setTimeout(() => {
-      copied = false;
-      copyResetTimer = null;
-    }, 2500);
+    copyFailed = false;
+    copied = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+      if (copyResetTimer) clearTimeout(copyResetTimer);
+      copyResetTimer = setTimeout(() => {
+        copied = false;
+        copyResetTimer = null;
+      }, 2500);
+    } catch {
+      copyFailed = true;
+    }
   }
 
   onDestroy(() => {
@@ -113,7 +120,13 @@
   </header>
 
   <p class="model-failure-summary">{failure.summary}</p>
+  <p class="model-failure-recovery">{recoveryText}</p>
+  {#if copyFailed}
+    <p class="model-failure-copy-error" role="alert">{i18n.t('notification.copyFailed')}</p>
+  {/if}
 
+  <details class="model-failure-details">
+    <summary>{i18n.t('messageItem.modelFailure.details')}</summary>
   <dl class="model-failure-facts">
     {#if isToolCallFailure}
       <div>
@@ -124,10 +137,6 @@
     <div>
       <dt>{i18n.t('messageItem.modelFailure.stage')}</dt>
       <dd>{stageLabel}</dd>
-    </div>
-    <div>
-      <dt>{i18n.t('messageItem.modelFailure.recovery')}</dt>
-      <dd>{recoveryText}</dd>
     </div>
     <div>
       <dt>{i18n.t('messageItem.modelFailure.code')}</dt>
@@ -141,6 +150,7 @@
     <span>{i18n.t('messageItem.modelFailure.diagnostic')}</span>
     <pre>{failure.detail}</pre>
   </div>
+  </details>
 </section>
 
 <style>
@@ -199,6 +209,41 @@
     font-size: var(--text-base);
     line-height: var(--leading-relaxed);
     font-weight: var(--font-medium);
+    overflow-wrap: anywhere;
+  }
+
+  .model-failure-recovery,
+  .model-failure-copy-error {
+    margin: var(--space-2) 0 0;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    line-height: var(--leading-relaxed);
+    overflow-wrap: anywhere;
+  }
+
+  .model-failure-copy-error { color: var(--error); }
+
+  .model-failure-details {
+    margin-top: var(--space-2);
+  }
+
+  .model-failure-details > summary {
+    width: fit-content;
+    max-width: 100%;
+    padding-block: var(--space-2);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+
+  .model-failure-details > summary:hover,
+  .model-failure-details > summary:focus-visible {
+    color: var(--foreground);
+  }
+
+  @media (pointer: coarse) {
+    .model-failure-copy { width: 44px; height: 44px; }
+    .model-failure-details > summary { min-height: 44px; box-sizing: border-box; }
   }
 
   .model-failure-facts {

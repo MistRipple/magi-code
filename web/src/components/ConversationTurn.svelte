@@ -26,6 +26,7 @@
     buildConversationDisclosureBlocks,
     buildConversationStreamEntries,
     isConversationFinalMessage,
+    isSteeringUserInput,
     type ConversationDisclosureBlock,
   } from '../lib/conversation-disclosure';
 
@@ -56,11 +57,16 @@
   }: Props = $props();
 
   // 自动状态只负责实时轮次；用户手动展开/收起后，流式更新不能覆盖这个选择。
-  // 与结束时的自动收起规则一致：没有最终回答的轮次默认展开过程。
+  // 错误条目不能替代最终回答；失败时仍展示已有输出，用户手动收起的选择优先。
+  function isFinalAnswer(item: TimelineRenderItem): boolean {
+    return isConversationFinalMessage(item.message)
+      && item.message.type !== 'error'
+      && item.message.metadata?.assistantOutputKind !== 'error';
+  }
   let expanded = $state(untrack(() => (
     initialExpanded
     || runtimeActive
-    || !items.some((item) => isConversationFinalMessage(item.message))
+    || !items.some(isFinalAnswer)
   )));
   let manualTurnOverride = false;
   let previousLive = false;
@@ -105,8 +111,11 @@
     }
   }
 
-  const userItems = $derived(items.filter((item) => item.message.type === 'user_input'));
+  // 首条用户消息固定在整轮顶部；运行中补充的消息按发送时刻留在过程流里，
+  // 此前已输出的内容在它上面，之后的输出接在它下面。
+  const userItems = $derived(items.filter((item) => item.message.type === 'user_input' && !isSteeringUserInput(item.message)));
   const assistantItems = $derived(items.filter((item) => item.message.type !== 'user_input'));
+  const steeringItems = $derived(items.filter((item) => isSteeringUserInput(item.message)));
   // 最终区只承载后端标记为 final / error 的输出；进行中的文字按真实顺序留在过程区。
   // 呈现角色是投影写入的事实（两种显示模式共用），这里只按角色布局。
   const presentationItems = $derived(assistantItems.map((item) => ({
@@ -116,6 +125,7 @@
   const finalItems = $derived(
     presentationItems.filter((entry) => entry.role === 'final').map((entry) => entry.item),
   );
+  const hasFinalAnswer = $derived(finalItems.some(isFinalAnswer));
   const stepItems = $derived(assistantItems.filter((item) => readExecutionSteps(item.message.metadata?.executionSteps)));
   const extensionRewriteCount = $derived(
     (canonicalTurn?.modelSteps || []).reduce((total, step) => {
@@ -127,7 +137,11 @@
     (canonicalTurn?.modelSteps ?? []).flatMap(step =>
       step.promptFrame?.historyProjection?.extensionRewrites?.map(rewrite => rewrite.pluginId) ?? []),
   )].sort().join(', '));
-  const streamEntries = $derived(buildConversationStreamEntries(presentationItems.filter((entry) => !readExecutionSteps(entry.item.message.metadata?.executionSteps))));
+  const streamPresentationItems = $derived(items
+    .filter((item) => item.message.type !== 'user_input' || steeringItems.includes(item))
+    .map((item) => ({ item, role: inferConversationPresentationRole(item.message) }))
+    .filter((entry) => !readExecutionSteps(entry.item.message.metadata?.executionSteps)));
+  const streamEntries = $derived(buildConversationStreamEntries(streamPresentationItems));
 
   const hasProcess = $derived(
     streamEntries.some((entry) => entry.kind === 'event' || entry.kind === 'tool-group')
@@ -148,7 +162,7 @@
   $effect(() => {
     const nextLive = isLive;
     if (nextLive !== previousLive) {
-      if (!manualTurnOverride) expanded = nextLive || finalItems.length === 0;
+      if (!manualTurnOverride) expanded = nextLive || !hasFinalAnswer;
       previousLive = nextLive;
     }
   });
@@ -275,6 +289,16 @@
           items={block.items}
           {filePreviewScopeForItem}
         />
+      {:else if block.kind === 'user-input'}
+        <!-- 补充消息不进折叠区：过程收起后仍能看到它插在哪一步之后 -->
+        <MessageItem
+          message={block.item.message}
+          {readOnly}
+          {displayContext}
+          filePreviewScope={filePreviewScopeForItem(block.item)}
+          canEdit={canEditMessage(block.item)}
+          onEdit={() => editMessage(block.item)}
+        />
       {:else if block.kind === 'tool-group'}
         <Disclosure expanded={expanded}>
           <!-- 与思考 / 文字阶段同级：不再额外缩进一层、也不画引导线 -->
@@ -332,6 +356,7 @@
 
   .turn-disclosure {
     min-width: 0;
+    border-bottom: var(--magi-hairline) solid var(--border);
   }
 
   .turn-disclosure-header,
@@ -339,12 +364,12 @@
     display: flex;
     align-items: center;
     width: fit-content;
+    min-width: 0;
     max-width: 100%;
     min-height: 38px;
     gap: 8px;
     padding: 0;
     border: 0;
-    border-bottom: var(--magi-hairline) solid var(--border);
     border-radius: 0;
     background: transparent;
     color: var(--foreground-muted);
@@ -357,6 +382,8 @@
 
   .turn-status-header {
     cursor: default;
+    width: 100%;
+    border-bottom: var(--magi-hairline) solid var(--border);
   }
 
   .turn-disclosure-header:hover,

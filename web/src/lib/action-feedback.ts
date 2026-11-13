@@ -54,6 +54,14 @@ export async function runActionWithFeedback<T>(
     const errorMessage = i18n.t('common.actionFailed', { action: options.actionLabel });
     await options.onError?.(errorMessage, error);
     const directError = directIncidentError(error, errorMessage);
+    if (!options.onError) {
+      // 无就地错误呈现的操作仍需即时反馈；异常记录负责持久诊断，不替代操作回执。
+      showFeedback('error', directError, {
+        title: options.errorTitle || errorMessage,
+        source: 'web-action',
+        ...options.errorToast,
+      });
+    }
     reportIncident(directError, {
       scope: options.incidentScope || (context.workspaceId ? 'workspace' : 'app'),
       context,

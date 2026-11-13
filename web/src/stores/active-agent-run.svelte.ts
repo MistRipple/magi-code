@@ -1,7 +1,7 @@
 /**
  * 当前会话的代理运行视图模型。
  *
- * 状态条、对话里的恢复横幅和右栏的代理列表读取同一份投影，这里是它们共用的唯一入口：
+ * 对话里的恢复横幅和右栏的代理列表读取同一份投影，这里是它们共用的唯一入口：
  * - 运行投影只来自 daemon 的权威投影（agent-run-store），不从本地状态反推 root；
  * - 列表直接派生自当前投影，归档由 daemon 解除执行链绑定，不另存投影或本地归档标记；
  * - 运行视图的操作只有归档，由后端 `availableActions` 驱动；停止后的“继续”是会话级动作，
@@ -65,7 +65,7 @@ async function runAction(action: AgentRunActionKind): Promise<void> {
     const fallback = i18n.t(`activeAgentCenter.action.${action}Failed`);
     const message = directIncidentError(error, fallback);
     const diagnostics = incidentErrorDiagnostics(error, message);
-    addToast('error', message);
+    // 失败由原操作面板的 actionError 就地呈现；异常记录保留诊断，不再叠加 toast。
     reportIncident(message, {
       scope: 'session',
       context: { sessionId, workspaceId: workspaceId || undefined, workspacePath: workspacePath || undefined },
@@ -100,6 +100,8 @@ export const activeAgentRun = {
   get summary(): ActiveAgentSummary { return summary; },
   /** 本会话是否有（未被用户归档的）一轮代理运行。 */
   get hasRun(): boolean { return visibleProjection !== null; },
+  /** 主线失败可以没有任何子代理；只有确有代理条目时才显示代理中心入口。 */
+  get hasAgentEntries(): boolean { return summary.triggerCount > 0; },
   get outcome() { return visibleProjection?.outcome ?? null; },
   get failureSummary() { return visibleProjection?.failureSummary ?? null; },
   get availableActions(): AgentRunActionKind[] { return visibleProjection?.availableActions ?? []; },

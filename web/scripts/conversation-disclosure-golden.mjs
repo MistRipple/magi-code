@@ -532,6 +532,21 @@ await withGoldenViteServer(async (server) => {
     const collapsedTurn = turnHtml();
     assert.doesNotMatch(collapsedTurn, /data-conversation-phase=/u, '整轮收起时，思考和工具一样收在「已处理」里');
     assert.match(collapsedTurn, /turn-disclosure-header/u, '有思考时整轮折叠标题存在，用来展开它');
+    const failedTurn = renderTurn(turnComponent.default, {
+      props: {
+        turnId: 'failed-partial-turn',
+        items: [
+          { key: 'partial', message: message({ id: 'partial', source: 'orchestrator', content: '断流前已经输出的内容', metadata: { assistantOutputKind: 'progress' } }) },
+          { key: 'failure', message: message({ id: 'failure', source: 'orchestrator', type: 'error', content: '模型服务响应中断', metadata: { assistantOutputKind: 'error' } }) },
+        ],
+        runtimeActive: false,
+        filePreviewScopeForItem: () => undefined,
+        canEditMessage: () => false,
+        editMessage: () => undefined,
+      },
+    }).body;
+    assert.match(failedTurn, /断流前已经输出的内容/u, '恢复失败历史时，错误不使已有输出自动收起');
+    assert.match(failedTurn, /模型服务响应中断/u, '错误原因与已有输出同时可读');
     const collapsedWithAgent = turnHtml([{ key: 'delegation', message: message({
       id: 'delegation', type: 'tool_call', content: '', source: 'orchestrator',
       metadata: { conversationPresentationRole: 'delegation', agentChildStatus: 'completed' },

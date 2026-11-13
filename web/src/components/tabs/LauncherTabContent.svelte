@@ -14,7 +14,7 @@
     kind: string;
     label: string;
     detail?: string;
-    icon: 'terminal' | 'globe' | 'plug';
+    icon: 'bot' | 'terminal' | 'globe' | 'plug';
     enabled: boolean;
     disabledReason: string;
     pluginId?: string;
@@ -26,7 +26,7 @@
   /**
    * 右栏新标签页：先选「做什么」，再变成对应的面板。
    *
-   * 纯展示组件：能力判断（终端、浏览器、插件视图）和实际创建都留在 RightPane，
+   * 纯展示组件：能力判断和面板打开都留在 RightPane，
    * 这里只渲染它给出的工具列表和最近项，并把选择回传。没有自己的业务状态。
    */
   import Icon from '../Icon.svelte';

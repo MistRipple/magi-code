@@ -2,8 +2,8 @@
   /**
    * 右栏里的代理列表：当前会话这一轮运行的全部代理，按状态分组。
    *
-   * 数据与操作都来自 `activeAgentRun`（和对话顶部的状态条、恢复横幅同源）；
-   * 这里只负责展示。整轮运行的“继续/重新执行”在对话里的恢复横幅中，不混进列表。
+   * 数据与操作都来自 `activeAgentRun`（和恢复横幅同源）；
+   * 这里只负责展示。会话继续由输入区承担，不混进列表。
    */
   import AgentRow from '../AgentRow.svelte';
   import Disclosure from '../Disclosure.svelte';
@@ -56,6 +56,10 @@
       </button>
     {/if}
   </header>
+
+  {#if activeAgentRun.actionError}
+    <p class="agent-list-action-error" role="alert">{activeAgentRun.actionError}</p>
+  {/if}
 
   {#if empty}
     <div class="agent-list-empty">
@@ -114,6 +118,12 @@
 </div>
 
 <style>
+  .agent-list-action-error {
+    margin: 0;
+    color: var(--error);
+    font-size: var(--text-xs);
+    overflow-wrap: anywhere;
+  }
   .agent-list {
     display: flex;
     flex-direction: column;
