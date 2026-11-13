@@ -412,6 +412,18 @@ pub fn summarize_tool_result(result: &str) -> String {
 }
 
 pub fn model_visible_tool_result(result: &str, status: ExecutionResultStatus) -> String {
+    let Some(text) = multimodal_text_projection(result) else {
+        return model_visible_text_tool_result(result, status);
+    };
+    let bounded = model_visible_text_tool_result(&text, status);
+    if bounded == text {
+        return result.to_string();
+    }
+    attach_model_images(&bounded, result)
+}
+
+/// Images remain intact; only their accompanying text enters the byte budget.
+fn model_visible_text_tool_result(result: &str, status: ExecutionResultStatus) -> String {
     if result.len() <= MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES {
         return result.to_string();
     }
@@ -644,12 +656,75 @@ fn model_visible_tool_catalog(catalog: &Value) -> String {
 /// - 降级边界只落在从头累计的“块”边界上（块大小约为预算的一半），新结果追加时边界保持不变，
 ///   直到最近的完整结果装不下才整块前移一次，两次前移之间历史逐字节不变。
 pub fn bound_model_visible_tool_history(results: &[String], budget_bytes: usize) -> Vec<String> {
+    let visible = results
+        .iter()
+        .map(|result| model_visible_tool_result(result, tool_result_execution_status(result)))
+        .collect::<Vec<_>>();
+    let text = visible
+        .iter()
+        .map(|result| multimodal_text_projection(result))
+        .collect::<Vec<_>>();
+    let latest_image = text.iter().rposition(Option::is_some);
+    let text_results = visible
+        .iter()
+        .zip(&text)
+        .map(|(original, text)| text.as_ref().unwrap_or(original).clone())
+        .collect::<Vec<_>>();
+    bound_text_tool_history(&text_results, budget_bytes)
+        .into_iter()
+        .enumerate()
+        .map(|(index, bounded)| {
+            if bounded == text_results[index] {
+                visible[index].clone()
+            } else if Some(index) == latest_image {
+                // Keep the latest visual observation, including its bounded
+                // text receipt. Older images follow ordinary history demotion.
+                attach_model_images(&bounded, &visible[index])
+            } else {
+                bounded
+            }
+        })
+        .collect()
+}
+
+/// Use the same multimodal parser as provider rendering. The text budget never
+/// sees base64 image bytes, and adding an image cannot exempt accompanying text.
+fn multimodal_text_projection(result: &str) -> Option<String> {
+    let model = magi_bridge_client::llm_types::parse_tool_result_model_content(Some(result));
+    if model.images.is_empty() {
+        return None;
+    }
+    let mut payload: Value = serde_json::from_str(result).ok()?;
+    payload.as_object_mut()?.remove("model_content");
+    payload["summary"] = Value::String(model.text);
+    Some(payload.to_string())
+}
+
+fn attach_model_images(text: &str, original: &str) -> String {
+    let model = magi_bridge_client::llm_types::parse_tool_result_model_content(Some(original));
+    // The complete bounded receipt remains visible, including compaction/error
+    // metadata; do not replace it with an unbounded original summary.
+    let mut payload = serde_json::json!({"summary": text, "is_error": model.is_error});
+    payload["model_content"] = Value::Array(
+        std::iter::once(serde_json::json!({"type": "text", "text": text}))
+            .chain(
+                model
+                    .images
+                    .into_iter()
+                    .map(|source| serde_json::json!({"type": "image", "source": source})),
+            )
+            .collect(),
+    );
+    payload.to_string()
+}
+
+fn bound_text_tool_history(results: &[String], budget_bytes: usize) -> Vec<String> {
     if results.is_empty() {
         return Vec::new();
     }
     let visible = results
         .iter()
-        .map(|result| model_visible_tool_result(result, tool_result_execution_status(result)))
+        .map(|result| model_visible_text_tool_result(result, tool_result_execution_status(result)))
         .collect::<Vec<_>>();
     let total = visible.iter().map(String::len).sum::<usize>();
     if total <= budget_bytes {
@@ -960,6 +1035,97 @@ mod tests {
     }
 
     #[test]
+    fn model_visible_tool_result_preserves_multimodal_image_payload() {
+        let result = serde_json::json!({
+            "tool": "screenshot",
+            "status": "succeeded",
+            "summary": "screen",
+            "model_content": [
+                {"type": "text", "text": "screen"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg", "data": "x".repeat(80_000)
+                }}
+            ]
+        })
+        .to_string();
+
+        let visible = model_visible_tool_result(&result, ExecutionResultStatus::Succeeded);
+        assert_eq!(visible, result);
+        assert!(
+            !magi_bridge_client::llm_types::parse_tool_result_model_content(Some(&visible))
+                .images
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn multimodal_results_bound_text_without_damaging_images_or_error_state() {
+        use magi_bridge_client::llm_types::parse_tool_result_model_content;
+        let image = "x".repeat(80_000);
+        let result = serde_json::json!({
+            "status": "failed", "is_error": true,
+            "summary": "start".to_string() + &"中文".repeat(20_000) + "frame_id=42",
+            "model_content": [{"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": image
+            }}]
+        })
+        .to_string();
+        let visible = model_visible_tool_result(&result, ExecutionResultStatus::Failed);
+        let model = parse_tool_result_model_content(Some(&visible));
+        assert!(model.is_error);
+        assert_eq!(model.images[0].data, image);
+        assert!(model.text.len() <= MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES);
+        assert!(model.text.contains("model_truncated"));
+        assert!(model.text.contains("frame_id=42"));
+        assert_eq!(
+            model_visible_tool_result(&visible, ExecutionResultStatus::Failed),
+            visible
+        );
+    }
+
+    #[test]
+    fn historical_image_bytes_do_not_evict_text_and_old_images_can_be_demoted() {
+        use magi_bridge_client::llm_types::parse_tool_result_model_content;
+        let image = serde_json::json!({"summary": "frame_id=42", "model_content": [
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": "y".repeat(80_000)
+            }}
+        ]})
+        .to_string();
+        let mut results = vec![image.clone()];
+        results.extend((0..20).map(|i| {
+            serde_json::json!({
+                "tool": "read", "status": "succeeded", "summary": i.to_string(),
+                "content": "z".repeat(6_000)
+            })
+            .to_string()
+        }));
+        let bounded = bound_model_visible_tool_history(&results, 48 * 1024);
+        assert_eq!(bounded.len(), results.len());
+        assert_eq!(
+            parse_tool_result_model_content(Some(&bounded[0]))
+                .images
+                .len(),
+            1
+        );
+        assert!(
+            parse_tool_result_model_content(Some(&bounded[0]))
+                .text
+                .contains("history_compacted")
+        );
+        assert_eq!(bounded.last(), results.last());
+        // A newer observation permits the older visual result to be demoted.
+        results.push(image.clone());
+        let bounded = bound_model_visible_tool_history(&results, 48 * 1024);
+        assert!(
+            parse_tool_result_model_content(Some(&bounded[0]))
+                .images
+                .is_empty()
+        );
+        assert_eq!(bounded.last(), Some(&image));
+    }
+
+    #[test]
     fn model_visible_tool_result_keeps_structured_error_for_recovery() {
         let result = r#"{"status":"needs_approval","error_code":"tool_policy_needs_approval","error":"该操作需要你的确认，授权后将继续当前调用","access_profile":"restricted","required_access_profile":"full_access"}"#;
 
@@ -1018,6 +1184,42 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("model output truncated")
+        );
+    }
+
+    #[test]
+    fn tool_history_keeps_latest_multimodal_result_outside_text_budget() {
+        let image = serde_json::json!({
+            "tool": "screenshot",
+            "status": "succeeded",
+            "model_content": [{"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": "y".repeat(80_000)
+            }}]
+        })
+        .to_string();
+        let results = vec![
+            serde_json::json!({
+                "tool": "shell_exec", "status": "succeeded", "stdout": "z".repeat(20_000)
+            })
+            .to_string(),
+            image.clone(),
+        ];
+        let bounded = bound_model_visible_tool_history(&results, 12 * 1024);
+        assert_eq!(bounded[1], image);
+        assert!(
+            !magi_bridge_client::llm_types::parse_tool_result_model_content(Some(&bounded[1]))
+                .images
+                .is_empty()
+        );
+        assert!(
+            bounded
+                .iter()
+                .map(|result| multimodal_text_projection(result)
+                    .unwrap_or_else(|| result.clone())
+                    .len())
+                .sum::<usize>()
+                <= 12 * 1024,
+            "image base64 must not consume the textual history budget"
         );
     }
 

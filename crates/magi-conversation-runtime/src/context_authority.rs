@@ -1785,7 +1785,15 @@ pub(crate) fn estimate_thread_history_tokens(history: &[ThreadChatMessage]) -> u
 fn estimate_chat_message_tokens(message: &ChatMessage) -> usize {
     let mut total = estimate_text_tokens(&message.role) + 4;
     if let Some(content) = message.content.as_deref() {
-        total += estimate_text_tokens(content);
+        // Match prompt_ir's provider projection: tool image envelopes become
+        // text plus image blocks, never base64 text tokens.
+        if message.tool_call_id.is_some() {
+            let model =
+                magi_bridge_client::llm_types::parse_tool_result_model_content(Some(content));
+            total += estimate_text_tokens(&model.text);
+        } else {
+            total += estimate_text_tokens(content);
+        }
     }
     if let Some(tool_call_id) = message.tool_call_id.as_deref() {
         total += estimate_text_tokens(tool_call_id);
@@ -1796,10 +1804,22 @@ fn estimate_chat_message_tokens(message: &ChatMessage) -> usize {
         total += estimate_text_tokens(&call.function.name);
         total += estimate_text_tokens(&call.function.arguments);
     }
-    for image in &message.images {
-        total += estimate_text_tokens(&image.media_type) + 1_024;
-    }
+    total += estimate_chat_message_image_tokens(message);
     total
+}
+
+fn estimate_chat_message_image_tokens(message: &ChatMessage) -> usize {
+    let tool_images = message.tool_call_id.as_ref().map(|_| {
+        magi_bridge_client::llm_types::parse_tool_result_model_content(message.content.as_deref())
+            .images
+    });
+    // Tool messages are rendered from their result envelope, while ordinary
+    // messages use their explicit image attachments (same choice as prompt_ir).
+    let images = tool_images.as_deref().unwrap_or(&message.images);
+    images
+        .iter()
+        .map(|image| estimate_text_tokens(&image.media_type) + 1_024)
+        .sum()
 }
 
 /// 将当前发送给模型的消息和工具定义按内容来源归类。总量与上下文压力估算使用
@@ -1811,11 +1831,7 @@ pub(crate) fn estimate_context_usage_breakdown(
     let mut breakdown = ContextUsageBreakdown::default();
     for message in messages {
         let message_tokens = estimate_chat_message_tokens(message) as u64;
-        let image_tokens = message
-            .images
-            .iter()
-            .map(|image| estimate_text_tokens(&image.media_type) + 1_024)
-            .sum::<usize>() as u64;
+        let image_tokens = estimate_chat_message_image_tokens(message) as u64;
         breakdown.image_tokens = breakdown.image_tokens.saturating_add(image_tokens);
         let tokens = message_tokens.saturating_sub(image_tokens);
         let target = match message.context_origin {
@@ -2372,6 +2388,43 @@ mod tests {
             step.status,
             magi_session_store::ModelStepStatus::ResponseReceived
         );
+    }
+
+    #[test]
+    fn tool_images_use_image_tokens_instead_of_base64_text_tokens() {
+        use super::*;
+        let message = |bytes| ChatMessage {
+            input_request_id: None,
+            context_origin: ChatMessageOrigin::Conversation,
+            role: "tool".into(),
+            content: Some(
+                serde_json::json!({
+                    "summary": "frame_id=42",
+                    "model_content": [{"type": "image", "source": {
+                        "type": "base64", "media_type": "image/jpeg", "data": "x".repeat(bytes)
+                    }}]
+                })
+                .to_string(),
+            ),
+            images: vec![],
+            tool_calls: vec![],
+            tool_call_id: Some("capture".into()),
+            provider_context: vec![],
+        };
+        let small = message(100);
+        let large = message(1_000_000);
+        assert_eq!(
+            estimate_chat_message_tokens(&small),
+            estimate_chat_message_tokens(&large)
+        );
+        let expected_image = estimate_text_tokens("image/jpeg") + 1_024;
+        let breakdown = estimate_context_usage_breakdown(std::slice::from_ref(&large), None);
+        assert_eq!(breakdown.image_tokens, expected_image as u64);
+        assert_eq!(
+            breakdown.total_tokens(),
+            estimate_chat_message_tokens(&large) as u64
+        );
+        assert!(breakdown.total_tokens() < 1_100);
     }
 
     #[test]

@@ -415,12 +415,7 @@ impl McpBridgeClient for StdioMcpBridgeClient {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        let payload = if let Some(content) = result.get("content") {
-            // Extract text content from the MCP content array
-            extract_text_content(content)
-        } else {
-            result.to_string()
-        };
+        let payload = format_mcp_tool_payload(&result);
 
         Ok(BridgeResponse {
             ok: !is_error,
@@ -717,10 +712,7 @@ impl McpBridgeClient for StreamableHttpMcpBridgeClient {
             .get("isError")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let payload = result
-            .get("content")
-            .map(extract_text_content)
-            .unwrap_or_else(|| result.to_string());
+        let payload = format_mcp_tool_payload(&result);
         Ok(BridgeResponse {
             ok: !is_error,
             payload,
@@ -896,7 +888,9 @@ fn execute_mcp_http_post_with_client(
         match expected_response_id {
             None => String::new(),
             Some(expected_response_id) if is_event_stream => {
-                read_matching_mcp_sse_response(response, expected_response_id)?
+                let value =
+                    read_matching_mcp_sse_response(BufReader::new(response), expected_response_id)?;
+                format!("data: {value}\n\n")
             }
             Some(_) => response.text().map_err(|error| {
                 mcp_transport_error(format!("read HTTP MCP response failed: {error}"))
@@ -913,10 +907,9 @@ fn execute_mcp_http_post_with_client(
 }
 
 fn read_matching_mcp_sse_response(
-    response: reqwest::blocking::Response,
+    mut reader: impl BufRead,
     expected_id: u64,
-) -> Result<String, BridgeClientError> {
-    let mut reader = BufReader::new(response);
+) -> Result<Value, BridgeClientError> {
     let mut data_lines = Vec::new();
     loop {
         let mut line = String::new();
@@ -937,6 +930,11 @@ fn read_matching_mcp_sse_response(
             }
             let data = data_lines.join("\n");
             data_lines.clear();
+            // Streamable HTTP servers may send an empty SSE data event as a
+            // keep-alive. It is a transport event, not an MCP JSON-RPC message.
+            if data.is_empty() {
+                continue;
+            }
             let value = serde_json::from_str::<Value>(&data).map_err(|error| {
                 BridgeClientError::CallFailed {
                     layer: BridgeErrorLayer::Protocol,
@@ -945,7 +943,7 @@ fn read_matching_mcp_sse_response(
                 }
             })?;
             if value.get("id").and_then(Value::as_u64) == Some(expected_id) {
-                return Ok(format!("data: {data}\n\n"));
+                return Ok(value);
             }
             continue;
         }
@@ -1050,36 +1048,7 @@ fn decode_mcp_http_response(
 }
 
 fn decode_mcp_sse_response(body: &str, expected_id: u64) -> Result<Value, BridgeClientError> {
-    let mut data_lines = Vec::new();
-    let mut values = Vec::new();
-    for line in body.lines().chain(std::iter::once("")) {
-        if line.is_empty() {
-            if !data_lines.is_empty() {
-                let data = data_lines.join("\n");
-                let value = serde_json::from_str::<Value>(&data).map_err(|error| {
-                    BridgeClientError::CallFailed {
-                        layer: BridgeErrorLayer::Protocol,
-                        code: None,
-                        message: format!("decode HTTP MCP SSE data failed: {error}"),
-                    }
-                })?;
-                values.push(value);
-                data_lines.clear();
-            }
-            continue;
-        }
-        if let Some(data) = line.strip_prefix("data:") {
-            data_lines.push(data.strip_prefix(' ').unwrap_or(data).to_string());
-        }
-    }
-    values
-        .into_iter()
-        .find(|value| value.get("id").and_then(Value::as_u64) == Some(expected_id))
-        .ok_or_else(|| BridgeClientError::CallFailed {
-            layer: BridgeErrorLayer::Protocol,
-            code: None,
-            message: format!("HTTP MCP SSE response missing request id {expected_id}"),
-        })
+    read_matching_mcp_sse_response(std::io::Cursor::new(body), expected_id)
 }
 
 fn reset_http_mcp_state(state: &mut HttpMcpConnectionState) {
@@ -1361,28 +1330,67 @@ fn negotiate_mcp_protocol_version(
     })
 }
 
-fn extract_text_content(content: &Value) -> String {
-    match content.as_array() {
-        Some(items) => {
-            let text_parts: Vec<&str> = items
-                .iter()
-                .filter_map(|item| {
-                    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("text");
-                    if item_type == "text" {
-                        item.get("text").and_then(Value::as_str)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if text_parts.is_empty() {
-                content.to_string()
-            } else {
-                text_parts.join("\n")
+/// Convert MCP tool content into the payload contract consumed by Magi's
+/// conversation runtime. Text results retain their plain text contract.
+/// When an MCP server returns an image, preserve the complete
+/// multimodal content in the existing `model_content` envelope so the next
+/// model request can attach the image to the tool result instead of dropping
+/// it at the bridge boundary.
+fn format_mcp_tool_payload(result: &Value) -> String {
+    let Some(content) = result.get("content").and_then(Value::as_array) else {
+        return result.to_string();
+    };
+    let mut texts = Vec::new();
+    let mut images = Vec::new();
+    for item in content {
+        match item.get("type").and_then(Value::as_str).unwrap_or("text") {
+            "text" => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    texts.push(text.to_string());
+                }
             }
+            "image" => {
+                if let (Some(data), Some(media_type)) = (
+                    item.get("data")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty()),
+                    item.get("mimeType")
+                        .and_then(Value::as_str)
+                        .filter(|s| s.starts_with("image/")),
+                ) {
+                    images.push(json!({"type": "image", "source": {
+                        "type": "base64", "media_type": media_type, "data": data,
+                    }}));
+                } else {
+                    texts.push(item.to_string());
+                }
+            }
+            _ => texts.push(item.to_string()),
         }
-        None => content.to_string(),
     }
+    // Native execution/verification/retry receipts can exist only here. Keep
+    // them in model-visible text, including when the result also contains images.
+    if let Some(structured) = result.get("structuredContent") {
+        let already_rendered = texts.iter().any(|text| {
+            serde_json::from_str::<Value>(text).is_ok_and(|value| &value == structured)
+        });
+        if !already_rendered {
+            texts.push(json!({"structuredContent": structured}).to_string());
+        }
+    }
+    let text = texts.join("\n");
+    if images.is_empty() {
+        return text;
+    }
+    let model_content = std::iter::once(json!({"type": "text", "text": text}))
+        .chain(images)
+        .collect::<Vec<_>>();
+    json!({
+        "summary": text,
+        "model_content": model_content,
+        "is_error": result.get("isError").and_then(Value::as_bool).unwrap_or(false),
+    })
+    .to_string()
 }
 
 fn mcp_transport_error(message: String) -> BridgeClientError {
@@ -1457,28 +1465,76 @@ mod tests {
     }
 
     #[test]
-    fn extract_text_content_extracts_text_items() {
-        let content = json!([
-            {"type": "text", "text": "hello"},
-            {"type": "text", "text": "world"},
-        ]);
-        assert_eq!(extract_text_content(&content), "hello\nworld");
+    fn format_mcp_tool_payload_preserves_images_for_model_content() {
+        let payload = format_mcp_tool_payload(&json!({
+            "content": [
+                {"type": "text", "text": "screen"},
+                {"type": "image", "mimeType": "image/png", "data": "AAA"},
+                {"type": "text", "text": "frame_id=42"}
+            ],
+            "isError": true
+        }));
+        let model = crate::llm_types::parse_tool_result_model_content(Some(&payload));
+        assert_eq!(model.text, "screen\nframe_id=42");
+        assert!(model.is_error);
+        assert_eq!(model.images.len(), 1);
+        assert_eq!(model.images[0].kind, "base64");
+        assert_eq!(model.images[0].media_type, "image/png");
+        assert_eq!(model.images[0].data, "AAA");
     }
 
     #[test]
-    fn extract_text_content_falls_back_for_non_text_items() {
-        let content = json!([
-            {"type": "image", "data": "base64data"},
-        ]);
-        // Should fall back to stringified JSON since no text items
-        let result = extract_text_content(&content);
-        assert!(result.contains("image"));
+    fn format_mcp_tool_payload_keeps_text_results_plain() {
+        assert_eq!(
+            format_mcp_tool_payload(&json!({
+                "content": [{"type": "text", "text": "hello"}]
+            })),
+            "hello"
+        );
     }
 
     #[test]
-    fn extract_text_content_handles_scalar_value() {
-        let content = json!("plain text");
-        assert_eq!(extract_text_content(&content), "\"plain text\"");
+    fn format_mcp_tool_payload_keeps_structured_and_unmodeled_content() {
+        let payload = format_mcp_tool_payload(&json!({
+            "content": [
+                {"type": "text", "text": "ready"},
+                {"type": "resource_link", "uri": "file:///tmp/result.txt"}
+            ],
+            "structuredContent": {"window_id": 42, "complete": true}
+        }));
+        assert!(payload.starts_with("ready\n"));
+        assert!(payload.contains("file:///tmp/result.txt"));
+        assert!(payload.contains(r#""window_id":42"#));
+    }
+
+    #[test]
+    fn format_mcp_tool_payload_uses_structured_content_with_images() {
+        let payload = format_mcp_tool_payload(&json!({
+            "content": [{"type": "image", "mimeType": "image/png", "data": "AAA"}],
+            "structuredContent": {"frame_id": 42, "verification": {"matches": true}}
+        }));
+        let model = crate::llm_types::parse_tool_result_model_content(Some(&payload));
+        assert_eq!(model.images.len(), 1);
+        assert_eq!(model.images[0].data, "AAA");
+        assert!(model.text.contains(r#""frame_id":42"#));
+        assert!(model.text.contains(r#""matches":true"#));
+    }
+
+    #[test]
+    fn mcp_sse_ignores_priming_and_comments_but_keeps_json_errors() {
+        let body = concat!(
+            ": keep-alive\r\n\r\ndata: \r\nid: 0\r\nretry: 3000\r\n\r\n",
+            "data:\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\n",
+            "data: \"id\":7,\"result\":{\"tools\":[]}}\n\n",
+        );
+        let value = decode_mcp_sse_response(body, 7).expect("matching response after priming");
+        assert_eq!(value["id"], 7);
+        assert_eq!(value["result"]["tools"], json!([]));
+        assert!(decode_mcp_sse_response("data: \n\ndata: invalid\n\n", 7).is_err());
+        assert!(decode_mcp_sse_response("data: \n\n", 7).is_err());
     }
 
     #[test]
@@ -1859,7 +1915,7 @@ done
                         "200 OK",
                         &[("Content-Type", "text/event-stream")],
                         &format!(
-                            "event: message\ndata: {}\n\n",
+                            "data: \n\nevent: message\ndata: {}\n\n",
                             json!({
                                 "jsonrpc": "2.0",
                                 "id": body["id"],
