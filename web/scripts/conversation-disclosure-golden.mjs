@@ -259,6 +259,22 @@ await withGoldenViteServer(async (server) => {
     '提问以独立块进入过程流',
   );
 
+  // ---- 运行中补充的用户消息：留在发送时刻的位置，此前的输出在它上面、之后的输出接在它下面 ----
+  const steer = (key) => ({ key, message: message({ id: key, type: 'user_input', content: '再补充一句', metadata: { route: 'steer' } }) });
+  const steerEntries = disclosure.buildConversationStreamEntries([...process(t1, a), { item: steer('s'), role: 'process' }, ...process(t2, b)]);
+  assert.deepEqual(
+    steerEntries.map((entry) => entry.key),
+    ['event:t1', 'tool-group:a', 'user-input:s', 'event:t2', 'tool-group:b'],
+    '补充消息打断前面的工具组，之后的输出另起，不被并入补充之前的内容',
+  );
+  assert.equal(steerEntries[2].kind, 'user-input');
+  assert.ok(
+    disclosure.buildConversationDisclosureBlocks(steerEntries).some((block) => block.kind === 'user-input' && block.item.key === 's'),
+    '补充消息以独立块进入过程流，不进折叠阶段',
+  );
+  assert.equal(disclosure.isSteeringUserInput(steer('s').message), true);
+  assert.equal(disclosure.isSteeringUserInput(message({ id: 'u', type: 'user_input', content: '首条' })), false);
+
   // ---- 紧凑事件：短小纯文字才是紧凑的 ----
   assert.equal(disclosure.isCompactProcessEvent(message({ content: '我先读取入口文件。' })), true);
   assert.equal(disclosure.isCompactProcessEvent(message({ content: 'a\nb' })), false, '含换行不能压成一行');
