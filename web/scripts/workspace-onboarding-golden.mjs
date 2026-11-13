@@ -294,8 +294,13 @@ assert.doesNotMatch(
 );
 assert.match(
   bridgeSource,
-  /function refreshWorkspaceSessionsAfterBootstrap[\s\S]*?runtimeEpoch: snapshot\.runtimeEpoch[\s\S]*?eventStreamNextSequence: snapshot\.eventStreamNextSequence/,
+  /function refreshSessionDirectoryAfterBootstrap[\s\S]*?runtimeEpoch: snapshot\.runtimeEpoch[\s\S]*?eventStreamNextSequence: snapshot\.eventStreamNextSequence/,
   'bootstrap 后的会话运行态必须通过带运行时代际和事件游标的唯一目录快照接管',
+);
+assert.match(
+  bridgeSource,
+  /function refreshSessionDirectoryAfterBootstrap[\s\S]*?workspaceId\s*\?\s*await getWorkspaceSessions[\s\S]*?await getPersonalSessions\(\)/,
+  'bootstrap 的会话记录不含运行态；个人会话与工作区会话都必须在 bootstrap 后重读目录，否则导航会抹掉其他会话的响应中状态',
 );
 assert.match(
   shellSource,

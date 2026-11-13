@@ -987,7 +987,7 @@ function syncTunnelRuntimeForSilentEventStream(reason: string, error: Error): vo
       forceFresh: true,
       forceEventStreamReconnect: false,
       refreshSettingsBootstrapOnBindingChange: false,
-      refreshWorkspaceSessionsAfterBootstrap: false,
+      refreshSessionDirectoryAfterBootstrap: false,
     });
   })().catch((syncError) => {
     scheduleRecovery(reason, syncError || error, true);
@@ -3374,7 +3374,7 @@ async function fetchBootstrap(
     forceEventStreamReconnect?: boolean;
     forceFresh?: boolean;
     refreshSettingsBootstrapOnBindingChange?: boolean;
-    refreshWorkspaceSessionsAfterBootstrap?: boolean;
+    refreshSessionDirectoryAfterBootstrap?: boolean;
     /** 仅连接恢复流程显式开启；后台 bootstrap 失败不得改写 UI 运行态。 */
     settleProcessingOnFailure?: boolean;
     refreshSessionTurnQueueAfterBootstrap?: boolean;
@@ -3483,8 +3483,8 @@ async function fetchBootstrap(
         refreshSessionTurnQueueAfterBootstrap: options.refreshSessionTurnQueueAfterBootstrap,
         rawPayload,
       });
-      if (options.refreshWorkspaceSessionsAfterBootstrap !== false) {
-        void refreshWorkspaceSessionsAfterBootstrap(payload, requestBindingKey, requestSeq);
+      if (options.refreshSessionDirectoryAfterBootstrap !== false) {
+        void refreshSessionDirectoryAfterBootstrap(payload, requestBindingKey, requestSeq);
       }
     } catch (error) {
       if (processingSnapshot) {
@@ -3505,38 +3505,41 @@ async function fetchBootstrap(
   return requestPromise;
 }
 
-async function refreshWorkspaceSessionsAfterBootstrap(
+/**
+ * bootstrap 的会话记录是持久化记录，不含运行态；侧栏的运行态只来自会话目录端点。
+ * 每次 bootstrap 写入目录投影后都要重新读取目录，个人会话与工作区会话同样处理，
+ * 否则其他会话的“响应中”状态会在导航后一直丢失到下一次目录事件。
+ */
+async function refreshSessionDirectoryAfterBootstrap(
   payload: BootstrapPayload,
   requestBindingKey: string,
   requestSeq: number,
 ): Promise<void> {
-  if (!payload.workspace.workspaceId) {
-    return;
-  }
+  const workspaceId = payload.workspace.workspaceId;
   try {
-    const snapshot = await getWorkspaceSessions(
-      payload.workspace.workspaceId,
-      payload.workspace.rootPath,
-    );
+    const workspaceSnapshot = workspaceId
+      ? await getWorkspaceSessions(workspaceId, payload.workspace.rootPath)
+      : null;
+    const snapshot = workspaceSnapshot ?? await getPersonalSessions();
     if (!isCurrentBootstrapRequest(requestBindingKey, requestSeq)) {
       return;
     }
-    if (snapshot.workspace.workspaceId !== payload.workspace.workspaceId) {
+    if (workspaceSnapshot && workspaceSnapshot.workspace.workspaceId !== workspaceId) {
       console.warn('[web-client-bridge] 忽略工作区不一致的会话摘要快照', {
-        expectedWorkspaceId: payload.workspace.workspaceId,
-        actualWorkspaceId: snapshot.workspace.workspaceId,
+        expectedWorkspaceId: workspaceId,
+        actualWorkspaceId: workspaceSnapshot.workspace.workspaceId,
       });
       return;
     }
     if (payload.sessionId && !snapshot.sessions.some((session) => session.id === payload.sessionId)) {
       console.warn('[web-client-bridge] 忽略不包含当前会话的摘要快照', {
-        workspaceId: payload.workspace.workspaceId,
+        workspaceId,
         sessionId: payload.sessionId,
       });
       return;
     }
     emitDataMessage('sessionsUpdated', {
-      workspaceId: payload.workspace.workspaceId,
+      ...(workspaceId ? { workspaceId } : {}),
       sessions: snapshot.sessions,
       runtimeEpoch: snapshot.runtimeEpoch,
       eventStreamNextSequence: snapshot.eventStreamNextSequence,
@@ -3742,7 +3745,7 @@ async function commitSessionNavigation(
         orchestratorSessionConfig: carriedSessionConfig,
       },
     });
-    void refreshWorkspaceSessionsAfterBootstrap(
+    void refreshSessionDirectoryAfterBootstrap(
       payload,
       navigationBindingKey,
       navigationBootstrapSeq,
