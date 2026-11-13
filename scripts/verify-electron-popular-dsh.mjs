@@ -127,7 +127,7 @@ async function viewCheck(plugin, view, session, interact) {
     // 等待一次上游页面初始化；请求结果另由后端 smoke 记录，不能把页面有字视为业务完成。
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const text = await frame.evaluate('document.body.innerText');
-    const failure = text.match(/界面加载失败|Minified React error|[\w.]+ is not a function|Cannot read properties|ReferenceError:|TypeError:|ERR_MODULE_NOT_FOUND/)?.[0];
+    const failure = text.match(/界面加载失败|该插件没有提供设置界面|Minified React error|[\w.]+ is not a function|Cannot read properties|ReferenceError:|TypeError:|ERR_MODULE_NOT_FOUND/)?.[0];
     const screenshot = `${plugin.manifest.id}-${view.id}.png`;
     await writeFile(join(output, screenshot), Buffer.from(await ui.screenshot(), 'base64'));
     return { id: view.id, placement: view.placements.includes('rightPane') ? 'rightPane' : 'settings', ok: !failure, ...(failure ? { failure } : {}), text: text.slice(0, 5000), screenshot, declaredViews: views.length };

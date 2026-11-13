@@ -256,9 +256,12 @@ export function startDshClient(options) {
     // 同一张卡片可能以多个槽位注册（DSH 的不同入口与行布局）；Magi 只有一种页面，按优先级取一份。
     const rank = (entry) => { const index = MOUNT_PRIORITY.indexOf(entry.descriptor.name); return index === -1 ? MOUNT_PRIORITY.length : index; };
     const card = [...cards].sort((a, b) => rank(a) - rank(b))[0];
-    // 视图由插件清单声明的槽位决定，槽位在上游脚本执行期间陆续注册；还没有卡片只是加载中的瞬时状态，
-    // 渲染空白即可，任何占位文案都会在每次挂载（例如切换会话）时闪一下。真正的加载失败由上面的错误界面报告。
-    if (!card) { root.render(null); return; }
+    if (!card) {
+      // 输入框左侧不是设置页：切换会话时会话上下文先到、卡片稍后才注册，此间必须保持空白，
+      // 设置页的“没有提供界面”提示只属于设置位置，否则每次切换都会在输入框左下角闪一下。
+      root.render(['composerLeft'].includes(placement) ? null : React.createElement('div', { style: { padding: 16 } }, '该插件没有提供设置界面。'));
+      return;
+    }
     const injected = bindSlotProps(card.descriptor, card.descriptor.inject?.(conversation?.sessionId) ?? {}, ctx.locale);
     const element = React.createElement(card.component, { ...injected, ...conversation, settingsScope: scope, surface: SLOT_SURFACE[card.descriptor.name] ?? 'page', view: 'page' });
     root.render(React.createElement(React.Fragment, null,

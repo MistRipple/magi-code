@@ -792,8 +792,9 @@ test('客户端业务适配不再把 DSH 草稿和提交改写为另一种消息
   assert.equal(translated.changedFunctions, 0);
 });
 
-test('插件视图在卡片尚未注册时渲染空白，不再有“没有提供设置界面”占位', async () => {
+test('输入框左侧位置在卡片尚未注册时保持空白，设置页的“没有提供界面”提示只属于设置位置', async () => {
   const source = await readFile(new URL('./runtime/client/dsh-client-host.mjs', import.meta.url), 'utf8');
-  assert.match(source, /if \(!card\) \{ root\.render\(null\); return; \}/);
-  assert.doesNotMatch(source, /没有提供设置界面/);
+  const empty = source.slice(source.indexOf('if (!card) {'), source.indexOf('const injected = bindSlotProps'));
+  assert.match(empty, /\['composerLeft'\]\.includes\(placement\) \? null :/);
+  assert.match(empty, /该插件没有提供设置界面/);
 });
