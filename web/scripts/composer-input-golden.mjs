@@ -244,4 +244,14 @@ check('project directory selection respects input locks and cannot rewrite edite
   assert.deepEqual(draft.snapshot().calls, [{ folder: ['project-a', '', 'source-b'] }]);
 });
 
+// 切换会话时输入区工具栏不得闪动：Git 分支按钮在重新读取期间以同尺寸占位保位，
+// 禁用变淡延迟生效，几十毫秒的导航锁定不再让按钮先淡出再恢复。
+const gitContextControl = await readFile(new URL('../src/components/GitContextControl.svelte', import.meta.url), 'utf8');
+assert.match(gitContextControl, /knownRepoAppearance[\s\S]*?\{:else if reserved\}[\s\S]*?git-context-slot/, 'Git 分支按钮重新读取期间必须保留同尺寸占位');
+assert.match(component, /--ia-lock-dim-delay:\s*160ms/, '输入区必须定义锁定变淡延迟');
+for (const selector of ['ia-add-btn', 'ia-picker-btn', 'ia-workspace-btn']) {
+  assert.match(component, new RegExp(`\\.${selector}:disabled \\{[^}]*var\\(--ia-lock-dim-delay\\)`), `${selector} 禁用变淡必须延迟生效`);
+}
+scenarios += 4;
+
 console.log(`composer input golden checks passed (${scenarios} scenarios)`);

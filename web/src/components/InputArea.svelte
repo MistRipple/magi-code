@@ -3871,6 +3871,8 @@ async function refreshPickerSettingsSnapshot() {
      前缀: ia-
      ============================================ */
   .ia-container {
+    /* 切换会话时输入区会短暂锁定；工具栏按钮延迟变淡，几十毫秒的锁定不再引起闪烁。 */
+    --ia-lock-dim-delay: 160ms;
     display: flex;
     flex-direction: column;
     gap: 0;
@@ -4146,6 +4148,7 @@ async function refreshPickerSettingsSnapshot() {
   .ia-add-btn:disabled {
     opacity: 0.4;
     cursor: not-allowed;
+    transition: opacity var(--transition-fast) var(--ia-lock-dim-delay);
   }
   .ia-add-wrap {
     flex: 0 0 auto;
@@ -4205,7 +4208,7 @@ async function refreshPickerSettingsSnapshot() {
     border-color: color-mix(in srgb, var(--primary) 38%, transparent);
     color: var(--primary);
   }
-  .ia-picker-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .ia-picker-btn:disabled { opacity: 0.4; cursor: not-allowed; transition: opacity var(--transition-fast) var(--ia-lock-dim-delay); }
   .ia-picker-btn.active {
     background: color-mix(in srgb, var(--primary) 14%, transparent);
     border-color: color-mix(in srgb, var(--primary) 42%, transparent);
@@ -4277,7 +4280,7 @@ async function refreshPickerSettingsSnapshot() {
     border-color: color-mix(in srgb, var(--primary) 38%, transparent);
     color: var(--primary);
   }
-  .ia-workspace-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .ia-workspace-btn:disabled { opacity: 0.4; cursor: not-allowed; transition: opacity var(--transition-fast) var(--ia-lock-dim-delay); }
   .ia-workspace-btn.active {
     background: color-mix(in srgb, var(--primary) 14%, transparent);
     border-color: color-mix(in srgb, var(--primary) 42%, transparent);

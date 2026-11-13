@@ -180,6 +180,7 @@
   .session-isolation-trigger:disabled {
     cursor: not-allowed;
     opacity: 0.45;
+    transition: opacity var(--transition-fast) var(--ia-lock-dim-delay);
   }
 
   .session-isolation-popover {

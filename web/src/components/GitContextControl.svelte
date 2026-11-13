@@ -1,3 +1,10 @@
+<script module lang="ts">
+  // 已确认是 Git 仓库的工作区及其按钮外观（宽度与分支名）。切换会话会按新绑定重新读取
+  // Git 状态，读取期间按钮要以同样外观的不可操作占位保留原位，否则按钮会先消失、
+  // 相邻按钮左移，读完又整体右移。占位只是视觉保位，读取完成后立即由真实状态接管。
+  const knownRepoAppearance = new Map<string, { width: number; branch: string }>();
+</script>
+
 <script lang="ts">
   import { onMount } from 'svelte';
   import type { ComposerWorkspaceOption } from '../stores/composer-workspace.svelte';
@@ -46,6 +53,21 @@
   // 隔离会话在自己的副本里运行，这里的分支 / 状态描述的是主工作区的仓库，对它没有意义，不显示。
   const isolated = $derived(Boolean(sessionId.trim()) && isSessionIsolated(sessionId));
   const visible = $derived(stateMatches && gitContextState.loaded && gitContextState.isRepo && !isolated);
+  const workspaceId = $derived(workspace?.workspaceId ?? '');
+  const resolved = $derived(stateMatches && gitContextState.loaded);
+  let controlWidth = $state(0);
+  $effect(() => {
+    if (!workspaceId) return;
+    if (visible && controlWidth > 0) {
+      knownRepoAppearance.set(workspaceId, {
+        width: controlWidth,
+        branch: gitContextState.currentBranch || i18n.t('input.branch.detached'),
+      });
+    } else if (resolved && !gitContextState.isRepo) {
+      knownRepoAppearance.delete(workspaceId);
+    }
+  });
+  const reserved = $derived(!resolved && !isolated && workspaceId ? (knownRepoAppearance.get(workspaceId) ?? null) : null);
   const busy = $derived(gitContextState.operation !== null);
   const interactionDisabled = $derived(disabled || busy);
   const filteredBranches = $derived.by(() => {
@@ -193,7 +215,7 @@
 </script>
 
 {#if visible}
-  <div class="git-context-control">
+  <div class="git-context-control" bind:clientWidth={controlWidth}>
     <button
       type="button"
       class="git-context-trigger"
@@ -281,9 +303,17 @@
       </div>
     {/if}
   </div>
+{:else if reserved}
+  <div class="git-context-control git-context-slot" style:width="{reserved.width}px" aria-hidden="true">
+    <span class="git-context-trigger">
+      <Icon name="git-branch" size={12} />
+      <span class="git-context-branch">{reserved.branch}</span>
+    </span>
+  </div>
 {/if}
 
 <style>
+  .git-context-slot { flex: 0 0 auto; max-width: none; pointer-events: none; }
   .git-context-control { position: relative; flex: 0 1 auto; min-width: 0; max-width: 150px; }
   .git-context-trigger {
     position: relative; display: inline-flex; align-items: center; gap: 5px; width: max-content; min-width: 0; max-width: 100%; height: 24px; padding: 0 8px;
