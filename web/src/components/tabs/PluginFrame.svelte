@@ -61,7 +61,10 @@
   const runtimeState = $derived(installed?.active ? runtime?.state ?? 'starting' : 'notRunning');
   const resourceDigest = $derived(installed?.digest ?? '');
   // 监管可能合并中间状态；即使只看到 running → running，新运行代次也必须创建新文档。
-  const documentIdentity = $derived(JSON.stringify([pluginId, entry, resourceDigest, ready, runtime?.instanceId, inline ? conversation?.sessionId : null]));
+  // 会话不属于文档身份：输入区、消息区的内嵌视图在切换会话时保持同一个 iframe，只通过
+  // `conversation` 消息下发新会话（带 contextRevision，旧回执不能覆盖新会话）。每次切换都重建文档
+  // 会让不透明画布和宿主初始化在输入区左下角闪烁；会话相关的提交由 InputArea 在派发前核对当前会话。
+  const documentIdentity = $derived(JSON.stringify([pluginId, entry, resourceDigest, ready, runtime?.instanceId]));
   const resourceUrl = $derived(
     agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/${resourceDigest ? `ui-v/${resourceDigest}` : 'ui'}/${entry.replace(/^ui\//, '').split('/').map(encodeURIComponent).join('/')}`),
   );

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { withGoldenViteServer } from './golden-vite.mjs';
 
 // 测试只替代浏览器解码；真实 Chromium 解码与输入挂载由 Electron 验收覆盖。
@@ -119,4 +120,11 @@ await withGoldenViteServer(async (server) => {
   } finally { release(); }
   assert.equal(ports.pluginComposerSession(), null);
 });
+// 切换会话时内嵌视图（输入区左侧、消息附加视图）必须保持同一个 iframe：会话只通过 conversation 消息下发。
+// 把会话放进文档身份会让每次切换都销毁并重建文档，输入区左下角随之闪烁。
+const pluginFrame = await readFile(new URL('../src/components/tabs/PluginFrame.svelte', import.meta.url), 'utf8');
+const identity = pluginFrame.match(/const documentIdentity = \$derived\(JSON\.stringify\(\[([^\]]*)\]\)\);/);
+assert.ok(identity, '必须能找到 PluginFrame 的文档身份定义');
+assert.doesNotMatch(identity[1], /sessionId|conversation/, '会话不能参与内嵌视图的文档身份');
+assert.match(pluginFrame, /void conversation;\s*sendHostContext\(\);/, '会话变化必须经 conversation 消息下发给已存在的文档');
 console.log('plugin composer golden checks passed');
