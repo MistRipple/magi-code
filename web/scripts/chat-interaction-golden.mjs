@@ -20,7 +20,7 @@ await withGoldenViteServer(async server => {
   const { deriveMessageScrollDirection, isMainMessageWheelInput, shouldFollowMessageScrollInput } = await server.ssrLoadModule('/src/lib/message-scroll-input.ts');
   const { splitFileName } = await server.ssrLoadModule('/src/lib/file-name.ts');
   const { beginPanelResize } = await server.ssrLoadModule('/src/lib/panel-resize.ts');
-  const { imeEnterGuard } = await server.ssrLoadModule('/src/lib/ime-enter-guard.ts');
+  const { imeEnterGuard, POST_COMPOSITION_ENTER_GUARD_MS } = await server.ssrLoadModule('/src/lib/ime-enter-guard.ts');
   const { previewSplitAt, equalPreviewSplitWidth } = await server.ssrLoadModule('/src/web/panel-layout.ts');
   const makeScroll = new Function('MessageScrollCoordinator', 'MessageLayoutStabilizer', 'deriveMessageScrollDirection', 'isMainMessageWheelInput', 'shouldFollowMessageScrollInput', ts.transpileModule(`
     let shouldAutoScroll = true, distanceToBottom = 0;
@@ -201,12 +201,13 @@ await withGoldenViteServer(async server => {
     assert.equal(dispatch('keydown', { key: 'Enter' }, input).defaultPrevented, true,
       'post-composition duplicate Enter is swallowed before nested shortcuts');
     assert.equal(submissions, 0);
+    assert.ok(POST_COMPOSITION_ENTER_GUARD_MS <= 50, '选字后的正常回车必须立即可发送，保护窗口只覆盖重复事件');
     dispatch('keydown', { key: 'Enter', shiftKey: true }, input);
     assert.equal(submissions, 1, 'intentional newline shortcut stays available');
     dispatch('keydown', { key: 'Enter', keyCode: 229 }, input);
     dispatch('keydown', { key: 'Enter', isComposing: true }, input);
     assert.equal(submissions, 1, 'legacy and browser composition flags both protect text fields');
-    await new Promise(resolve => setTimeout(resolve, 510));
+    await new Promise(resolve => setTimeout(resolve, POST_COMPOSITION_ENTER_GUARD_MS + 20));
     dispatch('keydown', { key: 'Enter' }, input);
     assert.equal(submissions, 2, 'ordinary Enter is restored after the grace period');
     const editorChild = new Element();
@@ -223,7 +224,7 @@ await withGoldenViteServer(async server => {
     assert.equal(dispatch('keydown', { key: 'Enter' }, input).defaultPrevented, true,
       'descendant composition end uses the same editor grace period');
     assert.equal(submissions, 2);
-    await new Promise(resolve => setTimeout(resolve, 510));
+    await new Promise(resolve => setTimeout(resolve, POST_COMPOSITION_ENTER_GUARD_MS + 20));
     cleanup.destroy();
     dispatch('compositionstart', {}, input);
     dispatch('keydown', { key: 'Enter' }, input);

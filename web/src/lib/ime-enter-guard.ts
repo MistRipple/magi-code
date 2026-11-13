@@ -1,3 +1,9 @@
+/**
+ * 选字结束后补发的重复回车只会紧跟 compositionend 到达；窗口只需覆盖这一次事件，
+ * 远小于人手再按一次回车的间隔，用户确认选字后的正常回车不会感到延迟。
+ */
+export const POST_COMPOSITION_ENTER_GUARD_MS = 50;
+
 /** Protect every text-entry shortcut, including rename, settings and browser URL fields. */
 export function imeEnterGuard(node: HTMLElement) {
   let disposed = false;
@@ -31,7 +37,7 @@ export function imeEnterGuard(node: HTMLElement) {
     }
     if ((event.key === 'Enter' || event.code === 'NumpadEnter')
       && !event.shiftKey && !event.altKey
-      && performance.now() - (endedAt.get(field) ?? -Infinity) < 500) {
+      && performance.now() - (endedAt.get(field) ?? -Infinity) < POST_COMPOSITION_ENTER_GUARD_MS) {
       event.preventDefault();
       event.stopImmediatePropagation();
     }
