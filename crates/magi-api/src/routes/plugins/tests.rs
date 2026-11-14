@@ -2,9 +2,7 @@ use super::*;
 use axum::body::Body;
 use futures_util::StreamExt;
 use magi_governance::GovernanceService;
-use magi_plugin_system::{
-    PluginManager, PluginPackage, PluginPermission, PluginPermissionKind, PluginSource,
-};
+use magi_plugin_system::{PluginManager, PluginPackage, PluginSource};
 use magi_session_store::SessionStore;
 use magi_workspace::WorkspaceStore;
 use std::{
@@ -252,17 +250,6 @@ async fn active_resource_state() -> (ApiState, tempfile::TempDir) {
         )
         .unwrap();
     manager.enable("acme.resources").unwrap();
-    manager
-        .authorize(
-            "acme.resources",
-            vec![PluginPermission {
-                kind: PluginPermissionKind::Storage,
-
-                targets: vec!["dashboard".into()],
-            }],
-        )
-        .unwrap();
-    manager.activate("acme.resources").unwrap();
     let manager = Arc::new(std::sync::Mutex::new(manager));
     let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(32));
     let api_state = ApiState::new(
@@ -329,10 +316,6 @@ async fn view_resources_carry_a_response_level_sandbox() {
             )
             .unwrap();
         manager.enable("acme.viewer").unwrap();
-        manager
-            .authorize("acme.viewer", package.manifest().permissions.clone())
-            .unwrap();
-        manager.activate("acme.viewer").unwrap();
         let state = ApiState::new(
             "magi-test",
             Arc::new(magi_event_bus::InMemoryEventBus::new(32)),
@@ -373,7 +356,7 @@ async fn view_resources_carry_a_response_level_sandbox() {
 }
 
 #[tokio::test]
-async fn conversation_view_admission_binds_grant_digest_and_declared_placement() {
+async fn conversation_view_admission_binds_enablement_digest_and_declared_placement() {
     let root = tempfile::tempdir().unwrap();
     let state = bare_state(root.path());
     let manifest = serde_json::json!({
@@ -403,7 +386,7 @@ async fn conversation_view_admission_binds_grant_digest_and_declared_placement()
                 },
             )
             .unwrap();
-        manager.enable("acme.conversation").unwrap();
+        manager.disable("acme.conversation").unwrap();
     }
     let endpoint = "/plugins/acme.conversation/views/admit";
     let request = serde_json::json!({"expectedDigest":package.digest(),"entry":"ui/index.html","placement":"chatAssistant"});
@@ -411,13 +394,13 @@ async fn conversation_view_admission_binds_grant_digest_and_declared_placement()
         post_json(&state, endpoint, request.clone()).await.0,
         StatusCode::FORBIDDEN
     );
-    {
-        let mut manager = state.plugin_manager.lock().unwrap();
-        manager
-            .authorize("acme.conversation", package.manifest().permissions.clone())
-            .unwrap();
-        manager.activate("acme.conversation").unwrap();
-    }
+    // 启用之前一律拒绝；启用后才可准入。
+    state
+        .plugin_manager
+        .lock()
+        .unwrap()
+        .enable("acme.conversation")
+        .unwrap();
     assert_eq!(
         post_json(&state, endpoint, request.clone()).await.0,
         StatusCode::NO_CONTENT
@@ -436,7 +419,7 @@ async fn conversation_view_admission_binds_grant_digest_and_declared_placement()
         .plugin_manager
         .lock()
         .unwrap()
-        .deactivate("acme.conversation")
+        .disable("acme.conversation")
         .unwrap();
     assert_eq!(
         post_json(&state, endpoint, request).await.0,
@@ -445,7 +428,7 @@ async fn conversation_view_admission_binds_grant_digest_and_declared_placement()
 }
 
 #[tokio::test]
-async fn composer_admission_binds_current_digest_view_and_grant() {
+async fn composer_admission_binds_enablement_current_digest_and_view() {
     for target in ["images", "text"] {
         check_composer_admission(target).await;
     }
@@ -481,7 +464,7 @@ async fn check_composer_admission(target: &str) {
                 },
             )
             .unwrap();
-        manager.enable("acme.composer").unwrap();
+        manager.disable("acme.composer").unwrap();
     }
     let mut request =
         serde_json::json!({"expectedDigest":package.digest(),"entry":"ui/index.html"});
@@ -493,13 +476,13 @@ async fn check_composer_admission(target: &str) {
         post_json(&state, endpoint, request.clone()).await.0,
         StatusCode::FORBIDDEN
     );
-    {
-        let mut manager = state.plugin_manager.lock().unwrap();
-        manager
-            .authorize("acme.composer", package.manifest().permissions.clone())
-            .unwrap();
-        manager.activate("acme.composer").unwrap();
-    }
+    // 启用之前一律拒绝；启用后才可准入。
+    state
+        .plugin_manager
+        .lock()
+        .unwrap()
+        .enable("acme.composer")
+        .unwrap();
     assert_eq!(
         post_json(&state, endpoint, request.clone()).await.0,
         StatusCode::NO_CONTENT
@@ -555,7 +538,7 @@ async fn check_composer_admission(target: &str) {
         .plugin_manager
         .lock()
         .unwrap()
-        .deactivate("acme.composer")
+        .disable("acme.composer")
         .unwrap();
     assert_eq!(
         post_json(&state, endpoint, request).await.0,
@@ -620,7 +603,7 @@ async fn resource_writes_publish_snapshot_and_subscription_updates() {
     drop(root);
 }
 #[tokio::test]
-async fn resource_subscription_closes_when_the_plugin_is_deactivated() {
+async fn resource_subscription_closes_when_the_plugin_is_disabled() {
     let (state, root) = active_resource_state().await;
     let router = routes().with_state(state.clone());
     let mut stream = router
@@ -645,7 +628,7 @@ async fn resource_subscription_closes_when_the_plugin_is_deactivated() {
         .plugin_manager
         .lock()
         .unwrap()
-        .deactivate("acme.resources")
+        .disable("acme.resources")
         .unwrap();
     let closed = timeout(Duration::from_secs(3), stream.next())
         .await
@@ -668,7 +651,7 @@ async fn resource_subscription_closes_when_the_plugin_is_deactivated() {
 }
 
 #[tokio::test]
-async fn upgrade_route_switches_the_package_and_requires_reauthorization() {
+async fn upgrade_route_switches_the_package_and_keeps_the_enabled_state() {
     let (state, root) = active_resource_state().await;
     let body = serde_json::json!({
         "source": "local:/tmp/acme-resources-1.1.0.zip",
@@ -709,17 +692,12 @@ async fn upgrade_route_switches_the_package_and_requires_reauthorization() {
     let plugin = &list["plugins"][0];
     assert_eq!(plugin["manifest"]["version"], "1.1.0");
     assert_eq!(plugin["enabled"], true);
-    assert_eq!(plugin["active"], false);
-    assert_eq!(plugin["grants"], serde_json::json!([]));
     assert_eq!(plugin["source"]["kind"], "local");
-    // 旧页即使权限清单相同，也不能替新摘要授权或改变新版启停。
+    // 旧页不能改变新版启停。
     let before = state.plugin_manager.lock().unwrap().state().clone();
     let old_digest = package().digest().to_string();
-    for action in ["authorize", "enable", "activate", "deactivate", "disable"] {
-        let mut input = serde_json::json!({"expectedDigest": old_digest});
-        if action == "authorize" {
-            input["grants"] = plugin["manifest"]["permissions"].clone();
-        }
+    for action in ["enable", "disable"] {
+        let input = serde_json::json!({"expectedDigest": old_digest});
         let (status, error) =
             post_json(&state, &format!("/plugins/acme.resources/{action}"), input).await;
         assert_eq!(status, StatusCode::CONFLICT, "{action}: {error}");
@@ -727,28 +705,9 @@ async fn upgrade_route_switches_the_package_and_requires_reauthorization() {
     }
     let current = serde_json::json!({"expectedDigest": plugin["digest"]});
     assert_eq!(
-        post_json(&state, "/plugins/acme.resources/activate", current.clone())
-            .await
-            .0,
-        StatusCode::FORBIDDEN
-    );
-    let grants = serde_json::json!({"expectedDigest":plugin["digest"],"grants":plugin["manifest"]["permissions"]});
-    assert_eq!(
-        post_json(&state, "/plugins/acme.resources/authorize", grants)
-            .await
-            .0,
-        StatusCode::OK
-    );
-    assert_eq!(
-        post_json(&state, "/plugins/acme.resources/activate", current.clone())
-            .await
-            .0,
-        StatusCode::OK
-    );
-    assert_eq!(
         post_json(
             &state,
-            "/plugins/acme.resources/deactivate",
+            "/plugins/acme.resources/disable",
             serde_json::json!({"expectedDigest":old_digest})
         )
         .await
@@ -760,11 +719,11 @@ async fn upgrade_route_switches_the_package_and_requires_reauthorization() {
             .plugin_manager
             .lock()
             .unwrap()
-            .is_active("acme.resources")
+            .is_enabled("acme.resources")
             .unwrap()
     );
     assert_eq!(
-        post_json(&state, "/plugins/acme.resources/deactivate", current)
+        post_json(&state, "/plugins/acme.resources/disable", current)
             .await
             .0,
         StatusCode::OK
@@ -774,7 +733,7 @@ async fn upgrade_route_switches_the_package_and_requires_reauthorization() {
             .plugin_manager
             .lock()
             .unwrap()
-            .is_active("acme.resources")
+            .is_enabled("acme.resources")
             .unwrap()
     );
     drop(root);
@@ -818,7 +777,7 @@ async fn exhausted_download_preserves_active_version_and_allows_explicit_upgrade
         serde_json::to_value(state.plugin_manager.lock().unwrap().projection().unwrap()).unwrap(),
         before
     );
-    assert!(state.plugin_manager.lock().unwrap().state().plugins["acme.resources"].active);
+    assert!(state.plugin_manager.lock().unwrap().state().plugins["acme.resources"].enabled);
 
     // 网络恢复后由用户显式重试，同一确认摘要进入原有升级提交点。
     unavailable.store(false, Ordering::SeqCst);
@@ -826,8 +785,7 @@ async fn exhausted_download_preserves_active_version_and_allows_explicit_upgrade
     assert_eq!(status, StatusCode::OK, "{upgraded}");
     assert_eq!(requests.load(Ordering::SeqCst), 4);
     assert_eq!(upgraded["plugins"][0]["manifest"]["version"], "1.1.0");
-    assert_eq!(upgraded["plugins"][0]["active"], false);
-    assert_eq!(upgraded["plugins"][0]["grants"], serde_json::json!([]));
+    assert_eq!(upgraded["plugins"][0]["enabled"], true);
     server.abort();
 }
 
@@ -1059,7 +1017,7 @@ async fn plugin_list_merges_the_extension_runtime_status_without_storing_it() {
     let (_, body) = call(
         &state,
         "POST",
-        "/plugins/acme.resources/deactivate",
+        "/plugins/acme.resources/disable",
         Some(serde_json::json!({})),
     )
     .await;

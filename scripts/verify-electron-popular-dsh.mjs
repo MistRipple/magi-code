@@ -66,7 +66,7 @@ async function removePlugin(id, { verifyPanel = false } = {}) {
   const frameSelector = `iframe[data-plugin-id=${JSON.stringify(id)}]`;
   const panelWasOpen = verifyPanel && await ui.exists(tabSelector);
   const errorsBefore = errors.length;
-  if (installed.active) await post(`/api/plugins/${encodeURIComponent(id)}/deactivate`, {});
+  if (installed.enabled) await post(`/api/plugins/${encodeURIComponent(id)}/disable`, {});
   if (panelWasOpen) {
     await waitFor(async () => !await ui.exists(tabSelector) && !await ui.exists(frameSelector), '停用原包回收右栏页签与隔离文档');
     if (!await page.evaluate('Boolean(document.querySelector(".right-pane")?.getClientRects().length)')) await ui.click('.header-right-pane-btn');
@@ -93,8 +93,6 @@ async function installTarget(version = '0.0.7') {
   const plugin = list.plugins.find((entry) => entry.source.location === `dsh:${request.package}@${version}`);
   assert.ok(plugin, 'daemon 必须确认目标安装身份');
   await post(`/api/plugins/${plugin.manifest.id}/enable`, {});
-  await post(`/api/plugins/${plugin.manifest.id}/authorize`, { grants: plugin.manifest.permissions });
-  await post(`/api/plugins/${plugin.manifest.id}/activate`, {});
   await waitFor(async () => (await currentTarget())?.runtime?.state === 'running', '业务验收目标运行', 120_000);
   return plugin;
 }
@@ -178,8 +176,7 @@ try {
       item.id = plugin.manifest.id; item.installed = true;
       await post(`/api/plugins/${encodeURIComponent(item.id)}/enable`, {});
       const afterEnable = (await api('/api/plugins')).value.plugins.find((entry) => entry.manifest.id === item.id);
-      await post(`/api/plugins/${encodeURIComponent(item.id)}/authorize`, { grants: afterEnable.manifest.permissions });
-      await post(`/api/plugins/${encodeURIComponent(item.id)}/activate`, {});
+      await post(`/api/plugins/${encodeURIComponent(item.id)}/enable`, {});
       const running = await waitFor(async () => {
         const current = (await api('/api/plugins')).value.plugins.find((entry) => entry.manifest.id === item.id);
         if (current?.runtime?.state === 'failed') return { failed: current.runtime.reason, current };

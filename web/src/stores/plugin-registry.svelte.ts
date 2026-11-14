@@ -10,8 +10,8 @@ import { untrack } from 'svelte';
 import type { PluginInstalled } from '../shared/app-server-protocol.generated';
 import {
   listInstalledPlugins,
-  loadActivePluginCommands,
-  loadActivePluginManifests,
+  loadEnabledPluginCommands,
+  loadEnabledPluginManifests,
   PLUGIN_REGISTRY_CHANGED_EVENT,
   type PluginCommandProjection,
   type PluginManifestProjection,
@@ -54,7 +54,7 @@ export function trackPluginProjection(): void {
   requestedRevision = revision;
   untrack(() => { projection.loaded = false; });
   const isCurrent = () => registry.revision === revision && requestedRevision === revision;
-  inflight = Promise.all([loadActivePluginManifests(), loadActivePluginCommands(), listInstalledPlugins()])
+  inflight = Promise.all([loadEnabledPluginManifests(), loadEnabledPluginCommands(), listInstalledPlugins()])
     .then(([manifests, commands, list]) => {
       if (isCurrent()) Object.assign(projection, { manifests, commands, installed: list.plugins, loaded: true });
     }).catch(() => { if (isCurrent()) requestedRevision = undefined; });

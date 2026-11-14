@@ -18,6 +18,7 @@ use std::{
 mod compatibility;
 mod drain;
 mod image_attachments;
+mod migration;
 mod removal;
 mod runtime_catalog;
 mod upgrade;
@@ -27,7 +28,7 @@ pub use drain::PluginDrainGuard;
 pub use removal::PluginChangeScope;
 
 const STATE_FILE: &str = "state.json";
-const STATE_VERSION: u16 = 2;
+const STATE_VERSION: u16 = 3;
 /// 设置沿用资源版本存储，使用清单资源 ID 不可能出现的保留键。
 const SETTINGS_RESOURCE_ID: &str = "__settings";
 /// Magi MCP 等原生功能不通过插件身份表达。这里仅保留旧版本内置记录的退役清理，
@@ -67,9 +68,8 @@ pub struct InstalledPlugin {
     pub digest: String,
     pub source: PluginSource,
     pub package_path: String,
+    /// 插件唯一的生命周期状态：启用即运行，停用即不运行。安装完成即启用；权限随清单全部授予。
     pub enabled: bool,
-    pub grants: Vec<PluginPermission>,
-    pub active: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_by: Option<PluginDisableInfo>,
 }
@@ -107,7 +107,7 @@ pub struct PreparedToolCall {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ActivePlugin {
+pub struct EnabledPlugin {
     pub id: String,
     pub version: String,
     pub digest: String,
@@ -131,11 +131,11 @@ pub struct PluginManager {
     retired_builtins: Vec<RetiredBuiltin>,
 }
 
-/// 被退役的内置插件：`was_active` 为退役前是否激活。
+/// 被退役的内置插件：`was_enabled` 为退役前是否启用。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetiredBuiltin {
     pub id: String,
-    pub was_active: bool,
+    pub was_enabled: bool,
 }
 
 impl PluginSource {
@@ -177,8 +177,7 @@ impl PluginManager {
         let root = root.into();
         fs::create_dir_all(&root)?;
         let state: PluginManagerState = match fs::read(root.join(STATE_FILE)) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|error| PluginError::CorruptState(error.to_string()))?,
+            Ok(bytes) => migration::read_state(&root, &bytes)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
             Err(error) => return Err(error.into()),
         };
@@ -224,7 +223,7 @@ impl PluginManager {
             })
             .map(|plugin| RetiredBuiltin {
                 id: plugin.id.clone(),
-                was_active: plugin.active,
+                was_enabled: plugin.enabled,
             })
             .collect();
         let retired: Vec<_> = retired_records.iter().map(|r| r.id.clone()).collect();
@@ -250,7 +249,7 @@ impl PluginManager {
 
         if !missing.is_empty() {
             // 旧版 Windows 曾误删仍被引用的 ZIP。隔离缺包记录，让其他功能正常启动；
-            // 原始记录和资源保留，重新安装须显式启用和授权。
+            // 原始记录和资源保留，重新安装后按安装流程启用。
             let backup_path = manager.root.join(format!(
                 "{STATE_FILE}.missing-packages-{}-{}",
                 UtcMillis::now().0,
@@ -267,7 +266,7 @@ impl PluginManager {
             }
             manager.commit(recovered)?;
             eprintln!(
-                "插件安装包缺失，已隔离安装记录，请在插件中心重新安装：{}；原始记录备份：{}。插件资源数据已保留，重新安装后需重新启用和授权。",
+                "插件安装包缺失，已隔离安装记录，请在插件中心重新安装：{}；原始记录备份：{}。插件资源数据已保留，重新安装后即启用。",
                 missing.join(", "),
                 backup_path.display()
             );
@@ -303,14 +302,9 @@ impl PluginManager {
         target: &str,
     ) -> Result<bool, PluginError> {
         let package = self.package(id)?;
-        let installed = self
-            .state
-            .plugins
-            .get(id)
-            .ok_or_else(|| PluginError::Conflict("插件未安装".into()))?;
         Ok(package.manifest().permissions.iter().any(|permission| {
-            if permission.kind != kind
-                || !permission.targets.iter().any(|item| {
+            permission.kind == kind
+                && permission.targets.iter().any(|item| {
                     item == target
                         || (item == "*"
                             && matches!(
@@ -318,10 +312,6 @@ impl PluginManager {
                                 PluginPermissionKind::Tools | PluginPermissionKind::ModelSources
                             ))
                 })
-            {
-                return false;
-            }
-            permission_granted(permission, &installed.grants)
         }))
     }
 
@@ -395,11 +385,11 @@ impl PluginManager {
         self.ensure_storage_access(id, resource_id)
     }
 
-    /// 插件已激活且声明的存储目标已获授权；隐藏界面入口不能代替这里的拒绝。
+    /// 插件已启用且清单声明了该存储目标；隐藏界面入口不能代替这里的拒绝。
     fn ensure_storage_access(&self, id: &str, target: &str) -> Result<(), PluginError> {
         self.ensure_not_draining(id)?;
-        if !self.is_active(id)? {
-            return Err(PluginError::NotAuthorized("插件未激活".into()));
+        if !self.is_enabled(id)? {
+            return Err(PluginError::NotAuthorized("插件未启用".into()));
         }
         if !self.permission_allowed(id, PluginPermissionKind::Storage, target)? {
             return Err(PluginError::NotAuthorized("插件未获存储权限".into()));
@@ -456,6 +446,8 @@ impl PluginManager {
     ) -> Result<(), PluginError> {
         let manifest = package.manifest();
         ensure_builtin_source(manifest.id.as_str(), &source)?;
+        // 安装完成即启用；宿主不能承载的清单在安装时拒绝，而不是装上一个启用不了的插件。
+        ensure_host_supports_surfaces(manifest)?;
         if self.state.removals.contains_key(&manifest.id) {
             return Err(conflict("目标正在管理调用的移除恢复边界内"));
         }
@@ -469,12 +461,13 @@ impl PluginManager {
         if self.resources.has_data(&manifest.id) {
             match fs::read(missing_package_record_path(&self.root, &manifest.id)) {
                 Ok(bytes) => {
-                    let previous: InstalledPlugin = serde_json::from_slice(&bytes)
+                    // 缺包记录由旧版本写入，字段不一定与当前状态一致；这里只读取身份。
+                    let previous: Value = serde_json::from_slice(&bytes)
                         .map_err(|error| PluginError::CorruptState(error.to_string()))?;
-                    if previous.digest != package.digest() {
+                    if previous["digest"].as_str() != Some(package.digest()) {
                         return Err(conflict(format!(
                             "插件原安装包缺失且保留了资源数据，请先重新安装原版本 {}，再执行升级",
-                            previous.version
+                            previous["version"].as_str().unwrap_or("未知")
                         )));
                     }
                 }
@@ -492,9 +485,7 @@ impl PluginManager {
                 digest: package.digest().to_string(),
                 source,
                 package_path: relative.clone(),
-                enabled: false,
-                grants: Vec::new(),
-                active: false,
+                enabled: true,
                 disabled_by: None,
             },
         );
@@ -521,31 +512,10 @@ impl PluginManager {
         Ok(relative)
     }
 
-    pub fn authorize(
-        &mut self,
-        id: &str,
-        grants: Vec<PluginPermission>,
-    ) -> Result<(), PluginError> {
-        let package = self.package(id)?;
-        for grant in &grants {
-            if !permission_declared(&package.manifest().permissions, grant) {
-                return Err(PluginError::NotAuthorized("授权超出清单声明".into()));
-            }
-        }
-        let mut next = self.state.clone();
-        let installed = next.plugins.get_mut(id).expect("package checked");
-        installed.grants = grants;
-        let complete = permissions_granted(package.manifest(), installed);
-        if !complete {
-            installed.active = false;
-        }
-        self.commit(next)?;
-        Ok(())
-    }
-
     pub fn enable(&mut self, id: &str) -> Result<(), PluginError> {
         self.package(id)?;
         self.ensure_not_draining(id)?;
+        self.ensure_host_supported(id)?;
         let mut next = self.state.clone();
         let installed = next.plugins.get_mut(id).expect("package checked");
         installed.enabled = true;
@@ -553,55 +523,9 @@ impl PluginManager {
         self.commit(next)
     }
 
-    pub fn activate(&mut self, id: &str) -> Result<ActivePlugin, PluginError> {
-        let package = self.package(id)?;
-        self.ensure_not_draining(id)?;
-        self.ensure_host_supported(id)?;
-        let installed = self.state.plugins.get(id).expect("package checked");
-        if !installed.enabled {
-            return Err(conflict("插件未启用"));
-        }
-        if !permissions_granted(package.manifest(), installed) {
-            return Err(PluginError::NotAuthorized(
-                "插件声明的权限尚未全部授权".into(),
-            ));
-        }
-        let mut next = self.state.clone();
-        let active = {
-            let installed = next.plugins.get_mut(id).expect("package checked");
-            installed.active = true;
-            ActivePlugin {
-                id: installed.id.clone(),
-                version: installed.version.clone(),
-                digest: installed.digest.clone(),
-                package_path: self.root.join(&installed.package_path),
-            }
-        };
-        self.commit(next)?;
-        Ok(active)
-    }
-
-    pub fn deactivate(&mut self, id: &str) -> Result<(), PluginError> {
-        self.package(id)?;
-        let mut next = self.state.clone();
-        let installed = next
-            .plugins
-            .get_mut(id)
-            .ok_or_else(|| conflict("插件未安装"))?;
-        installed.active = false;
-        let result = self.commit(next);
-        if result.is_ok() {
-            self.release_drain(id);
-        }
-        result
-    }
-
     pub fn disable(&mut self, id: &str) -> Result<(), PluginError> {
         self.package(id)?;
         self.ensure_not_draining(id)?;
-        if self.state.plugins[id].active {
-            return Err(conflict("插件仍处于激活状态"));
-        }
         self.commit_disabled(id, None)
     }
 
@@ -638,17 +562,16 @@ impl PluginManager {
             }
         }
         installed.enabled = false;
-        installed.active = false;
         installed.disabled_by = origin;
         self.commit(next)
     }
 
-    pub fn active(&self) -> Vec<ActivePlugin> {
+    pub fn enabled_plugins(&self) -> Vec<EnabledPlugin> {
         self.state
             .plugins
             .values()
-            .filter(|p| p.active)
-            .map(|p| ActivePlugin {
+            .filter(|p| p.enabled)
+            .map(|p| EnabledPlugin {
                 id: p.id.clone(),
                 version: p.version.clone(),
                 digest: p.digest.clone(),
@@ -657,13 +580,13 @@ impl PluginManager {
             .collect()
     }
 
-    /// 激活、重启恢复和运行准入共用宿主能力裁决；已安装包可继续查看、更新或卸载。
+    /// 安装、启用、重启恢复和运行准入共用宿主能力裁决；已安装包可继续查看、更新或卸载。
     pub fn ensure_host_supported(&self, id: &str) -> Result<(), PluginError> {
         ensure_host_supports_surfaces(self.package(id)?.manifest())
     }
 
-    /// 应用级实例与工作区准入分别记录；应用级激活不授予其他工作区权限。
-    pub fn is_active(&self, id: &str) -> Result<bool, PluginError> {
+    /// 插件当前是否可用：已启用，且没有生命周期事务在排空、宿主能承载其清单。
+    pub fn is_enabled(&self, id: &str) -> Result<bool, PluginError> {
         let package = self.package(id)?;
         let installed = self
             .state
@@ -672,17 +595,15 @@ impl PluginManager {
             .ok_or_else(|| conflict("插件未安装"))?;
         Ok(self.pending_reset.as_deref() != Some(id)
             && !self.is_draining(id)
-            && installed.active
             && installed.enabled
-            && ensure_host_supports_surfaces(package.manifest()).is_ok()
-            && permissions_granted(package.manifest(), installed))
+            && ensure_host_supports_surfaces(package.manifest()).is_ok())
     }
 
-    /// 全局已激活插件的包。清单是贡献来源，这里是当前可用性的唯一投影。
-    fn active_packages(&self) -> Result<Vec<Arc<PluginPackage>>, PluginError> {
+    /// 全局已启用插件的包。清单是贡献来源，这里是当前可用性的唯一投影。
+    fn enabled_packages(&self) -> Result<Vec<Arc<PluginPackage>>, PluginError> {
         let mut packages = Vec::new();
         for id in self.state.plugins.keys() {
-            if self.is_active(id)? {
+            if self.is_enabled(id)? {
                 packages.push(self.package(id)?);
             }
         }
@@ -695,8 +616,7 @@ impl PluginManager {
     }
 
     pub fn manifests(&self) -> Result<Vec<PluginManifest>, PluginError> {
-        self
-            .active_packages()?
+        self.enabled_packages()?
             .iter()
             .map(|package| self.effective_manifest(&package.manifest().id))
             .collect::<Result<_, _>>()
@@ -714,7 +634,7 @@ impl PluginManager {
         PluginError,
     > {
         let mut tools = Vec::new();
-        for package in self.active_packages()? {
+        for package in self.enabled_packages()? {
             let manifest = self.effective_manifest(&package.manifest().id)?;
             for tool in &manifest.contributions.tools {
                 if self.permission_allowed(&manifest.id, PluginPermissionKind::Tools, &tool.id)? {
@@ -725,7 +645,7 @@ impl PluginManager {
         Ok(tools)
     }
 
-    /// 已激活插件声明的用户命令目录。
+    /// 已启用插件声明的用户命令目录。
     pub fn command_contributions(
         &self,
     ) -> Result<
@@ -736,7 +656,7 @@ impl PluginManager {
         PluginError,
     > {
         let mut commands = Vec::new();
-        for package in self.active_packages()? {
+        for package in self.enabled_packages()? {
             let manifest = self.effective_manifest(&package.manifest().id)?;
             for command in &manifest.contributions.commands {
                 commands.push((manifest.clone(), command.clone()));
@@ -758,7 +678,7 @@ impl PluginManager {
             .find(|(manifest, tool)| {
                 crate::model_tool_name(&manifest.id, &tool.id) == model_tool_name
             })
-            .ok_or_else(|| PluginError::NotFound("插件工具未激活或未授权".into()))?;
+            .ok_or_else(|| PluginError::NotFound("插件工具未启用或未声明".into()))?;
         let digest = self.package(&manifest.id)?.digest().to_owned();
         // 部分模型对无参数工具发送空字符串，按空对象处理。
         let input: serde_json::Value = if arguments.trim().is_empty() {
@@ -814,8 +734,6 @@ impl PluginManager {
                         manifest: self.effective_manifest(&installed.id)?,
                         digest: installed.digest.clone(),
                         enabled: installed.enabled,
-                        active: installed.active,
-                        grants: installed.grants.clone(),
                         source: installed.source.projection(),
                         upstream_manifest,
                         upstream_archive_path,
@@ -853,15 +771,16 @@ impl PluginManager {
         Ok(Some(manifest))
     }
 
-    pub fn uninstall(&mut self, id: &str) -> Result<(), PluginError> {
+    /// 卸载不要求先停用：调用方持有该插件的排空标记，后台已经停止后一次提交移除。
+    pub fn uninstall(&mut self, id: &str, drain: &PluginDrainGuard) -> Result<(), PluginError> {
+        if drain.plugin_id() != id || !self.is_draining(id) {
+            return Err(conflict("卸载必须持有目标插件的排空标记"));
+        }
         let installed = self
             .state
             .plugins
             .get(id)
             .ok_or_else(|| conflict("插件未安装"))?;
-        if installed.active || installed.enabled {
-            return Err(conflict("插件仍处于启用或激活状态"));
-        }
         let package_path = self.root.join(&installed.package_path);
         let staged_path = if package_path.exists() {
             Some(stage_package_for_removal(&package_path)?)
@@ -885,18 +804,18 @@ impl PluginManager {
             .map_err(|error| PluginError::CorruptState(error.to_string()))?;
         write_atomic(&self.root.join(STATE_FILE), bytes)?;
         self.state = next;
-        self.invalidate_inactive_runtimes();
+        self.invalidate_disabled_runtimes();
         Ok(())
     }
 }
 
 /// 宿主（BrowserAuthority 与 Main）当前只实现了一种原生 Browser surface 语义：应用级唯一实例、
 /// 持久分区、保持挂载、关闭按钮只隐藏视图。其他组合在合同中合法，但宿主不能挂载，
-/// 激活时明确拒绝，而不是接纳后静默按此语义运行。
+/// 启用时明确拒绝，而不是接纳后静默按此语义运行。
 fn ensure_host_supports_surfaces(manifest: &PluginManifest) -> Result<(), PluginError> {
     use magi_app_server_protocol::generated::{PluginSurfaceCloseAction, PluginSurfacePersistence};
     // 输入区左侧的插件面板（composerLeft）已移除，没有任何界面承载它。旧翻译产物声明的这类视图
-    // 不能因已有授权或重启恢复而继续启用；与下面的 chatAssistant 旧产物相同，配置、包摘要和授权记录保留，
+    // 不能因已有安装或重启恢复而继续启用；与下面的 chatAssistant 旧产物相同，配置和包摘要保留，
     // 在线更新或重新安装后由新翻译产物恢复。不按包名判断。
     if manifest.contributions.views.iter().any(|view| {
         view.placements
@@ -907,7 +826,7 @@ fn ensure_host_supports_surfaces(manifest: &PluginManifest) -> Result<(), Plugin
         ));
     }
     // 旧 DSH 翻译产物把替换消息渲染器映射为 chatAssistant。它与 Magi 原生
-    // 附加视图的合同不同，不能因已有授权或重启恢复而继续执行；不按包名判断。
+    // 附加视图的合同不同，不能因已有安装或重启恢复而继续执行；不按包名判断。
     if manifest
         .extension
         .as_ref()
@@ -1022,24 +941,6 @@ fn cleanup_unreferenced_packages(
     Ok(())
 }
 
-fn permission_declared(declared: &[PluginPermission], grant: &PluginPermission) -> bool {
-    declared
-        .iter()
-        .any(|p| p.kind == grant.kind && grant.targets.iter().all(|t| p.targets.contains(t)))
-}
-fn permission_granted(permission: &PluginPermission, grants: &[PluginPermission]) -> bool {
-    grants.iter().any(|g| {
-        g.kind == permission.kind && permission.targets.iter().all(|t| g.targets.contains(t))
-    })
-}
-
-fn permissions_granted(manifest: &PluginManifest, installed: &InstalledPlugin) -> bool {
-    let grants = &installed.grants;
-    manifest
-        .permissions
-        .iter()
-        .all(|permission| permission_granted(permission, grants))
-}
 fn conflict(message: impl Into<String>) -> PluginError {
     PluginError::Conflict(message.into())
 }

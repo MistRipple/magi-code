@@ -1,4 +1,4 @@
-//! daemon 插件领域：包、授权与生命周期。
+//! daemon 插件领域：包、启停与生命周期。
 //!
 //! 插件的可执行部分只有受信 Node 扩展，由 `magi-extension-host` 承载；这里只拥有包校验、
 //! 授权、启用/激活/升级状态与插件资源存储。SDK 1（QuickJS 后台）已移除，其包在校验阶段被拒绝。
@@ -15,7 +15,7 @@ pub use catalog::{
     TrustedKey,
 };
 pub use lifecycle::{
-    ActivePlugin, InstalledPlugin, PluginChangeScope, PluginDrainGuard, PluginManager,
+    EnabledPlugin, InstalledPlugin, PluginChangeScope, PluginDrainGuard, PluginManager,
     PluginManagerState, PluginSource, PreparedToolCall, RetiredBuiltin,
 };
 pub use magi_app_server_protocol::{PluginManifest, PluginPermission, PluginPermissionKind};

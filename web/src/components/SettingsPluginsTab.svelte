@@ -4,9 +4,8 @@
   import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import {
     applyPluginCandidate,
-    authorizeAndActivatePlugin,
-    deactivatePlugin,
     disablePlugin,
+    enablePlugin,
     fetchPluginCenter,
     installFromPluginCenter,
     listInstalledPlugins,
@@ -236,10 +235,8 @@
     const pending = staged;
     if (!pending) return;
     await run(async () => {
-      const operation = pending.kind === 'upstream' ? pending.preview.candidate : pending.preview;
-      const activate = activateAfterInstall(operation.manifest.id, operation.operation);
-      if (pending.kind === 'upstream') await installUpstreamPlugin(pending.preview, pending.ecosystem, activate);
-      else await applyPluginCandidate(pending.candidate, pending.preview, activate);
+      if (pending.kind === 'upstream') await installUpstreamPlugin(pending.preview, pending.ecosystem);
+      else await applyPluginCandidate(pending.candidate, pending.preview);
       staged = null;
       address = '';
       const preview = pending.kind === 'upstream' ? pending.preview.candidate : pending.preview;
@@ -250,15 +247,6 @@
   }
 
   const hasCatalog = $derived(Boolean(center && center.entries.length > 0));
-
-  /**
-   * 安装完成后是否默认激活。新安装一律激活（安装即获得插件声明的全部权限）；
-   * 升级只恢复原本已激活的插件，不替用户重新启用被其主动停用的插件。
-   */
-  function activateAfterInstall(pluginId: string, operation: string): boolean {
-    if (operation !== 'upgrade') return true;
-    return plugins.find((plugin) => plugin.manifest.id === pluginId)?.active ?? false;
-  }
 
   /** 插件的名称与说明显示清单原文。 */
   function manifestText(manifest: PluginManifest, field: 'name' | 'description'): string {
@@ -315,13 +303,8 @@
     await run(() => uninstallPlugin(id));
   }
 
-  /** 插件中心的新安装默认激活；已安装插件的升级只恢复原本已激活的状态。 */
-  function centerActivates(item: StoreItem): boolean {
-    return item.installed ? item.installed.active : true;
-  }
-
   async function installItem(item: StoreItem): Promise<void> {
-    if (item.catalog) await run(() => installFromPluginCenter(item.catalog!, centerActivates(item)));
+    if (item.catalog) await run(() => installFromPluginCenter(item.catalog!));
     else if (item.upstream) await stageUpstream(item.upstream);
   }
 
@@ -333,7 +316,7 @@
     } else if (item.installed?.source.github) {
       const { repository, reference } = item.installed.source.github;
       await stageUpstream({ ecosystem: 'dsh', github: { repository, reference } });
-    } else if (item.catalog && item.catalog.state === 'updatable') await run(() => installFromPluginCenter(item.catalog!, centerActivates(item)));
+    } else if (item.catalog && item.catalog.state === 'updatable') await run(() => installFromPluginCenter(item.catalog!));
     else if (item.upstream) await stageUpstream(item.upstream);
   }
 
@@ -614,8 +597,7 @@
               onInstall={() => void installItem(selected)}
               onUpdateFromCenter={() => void updateFromCenter(selected)}
               onUninstall={() => void uninstallItem(selected)}
-              onActivate={() => void run(() => authorizeAndActivatePlugin(selected.installed!))}
-              onDeactivate={() => void run(() => deactivatePlugin(selected.installed!))}
+              onEnable={() => void run(() => enablePlugin(selected.installed!))}
               onDisable={() => void run(() => disablePlugin(selected.installed!))}
               onOpenSettings={openSettings}
             />

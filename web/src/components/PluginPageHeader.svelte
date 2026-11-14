@@ -6,11 +6,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
   import { confirmMessage } from '../stores/confirm-dialog.svelte';
-  import {
-    authorizeAndActivatePlugin,
-    deactivatePlugin,
-    uninstallPlugin,
-  } from '../web/plugin-api';
+  import { disablePlugin, enablePlugin, uninstallPlugin } from '../web/plugin-api';
   import { pluginProjection } from '../stores/plugin-registry.svelte';
   import type { PluginManifest } from '../shared/app-server-protocol.generated';
   import { openSettings } from '../stores/shell-ui.svelte';
@@ -28,7 +24,7 @@
   const installed = $derived(pluginProjection().installed.find((plugin) => plugin.manifest.id === manifest.id) ?? null);
   const loaded = $derived(pluginProjection().loaded);
 
-  const active = $derived(Boolean(installed?.active));
+  const enabled = $derived(Boolean(installed?.enabled));
 
   async function run(operation: () => Promise<void>): Promise<void> {
     if (busy) return;
@@ -45,7 +41,7 @@
 
   function toggle(next: boolean): void {
     const plugin = installed;
-    if (plugin) void run(() => next ? authorizeAndActivatePlugin(plugin) : deactivatePlugin(plugin));
+    if (plugin) void run(() => next ? enablePlugin(plugin) : disablePlugin(plugin));
   }
 
   async function uninstall(): Promise<void> {
@@ -66,8 +62,8 @@
     <span class="plugin-page-busy" data-testid="plugin-page-progress" role="status" aria-label={i18n.t('common.loading')}><Icon name="loader" size={14} class="spinning" /></span>
   {/if}
   <label class="plugin-page-switch">
-    <span>{i18n.t(active ? 'settings.plugins.pageHeader.on' : 'settings.plugins.pageHeader.off')}</span>
-    <Toggle checked={active} disabled={busy || !loaded || !installed} ariaLabel={i18n.t('settings.plugins.pageHeader.toggle', { name: manifest.name })} onchange={toggle} />
+    <span>{i18n.t(enabled ? 'settings.plugins.pageHeader.on' : 'settings.plugins.pageHeader.off')}</span>
+    <Toggle checked={enabled} disabled={busy || !loaded || !installed} ariaLabel={i18n.t('settings.plugins.pageHeader.toggle', { name: manifest.name })} onchange={toggle} />
   </label>
   <button class="btn btn--sm btn--secondary" type="button" data-testid="plugin-page-uninstall" onclick={() => void uninstall()} disabled={busy || !loaded || !installed}>
     {i18n.t('settings.plugins.uninstall')}

@@ -339,4 +339,25 @@ checkout 本体及分支仍保留：Codex 归档工具仅接受当前对话附�
 且每次切换会话都会销毁并重建 iframe，输入区左下角随之闪动。本轮以打包 Electron、独立状态根、在线安装
 WorkBuddy **5.23.1** 核实：根节点为空、高度 0、外层折叠；积分读数依赖 Magi 不提供的 `modelSelection` 投影。
 整块移除该位置（面板、宿主分支、翻译映射、授权、文档与测试），输入区槽位归为可忽略，安装不受影响；
-旧产物声明 `composerLeft` 时拒绝激活并保留记录，更新或重装后恢复。消息附加视图不受影响。
+旧产物声明 `composerLeft` 时拒绝启用并保留记录，更新或重装后恢复。消息附加视图不受影响。
+
+## 插件状态收敛为启用／停用，删除授权与激活层（2026-11-14）
+
+用户视角的插件生命周期只应有：安装（完成即启用）、启用／停用、卸载（任何状态都可直接卸载）。此前的
+“安装 → 授权 → 启用 → 激活”和“停用 → 取消激活 → 卸载”是 daemon 内部状态在界面上的直接暴露，授权与激活
+对用户没有独立含义：安装预览已经展示全部声明的权限与影响，确认安装即同意。本轮一步到位清除这一层：
+
+- **协议**：`PluginInstalled` 删除 `grants`／`active`，`PluginAuthorizeRequest` 删除，`PluginActivationRequest`
+  更名为 `PluginLifecycleRequest`；HTTP 入口只剩 `/enable`、`/disable`、`/uninstall`；扩展宿主 RPC 删除 `plugins.authorize`，
+  `pluginManagement` 的 `authorize` 目标不再存在。
+- **持久化**：`state.json` 的 `STATE_VERSION` 2 → 3，首次打开折叠为单一 `enabled`（旧模型里 `enabled && active` 才保持启用，
+  已启用但未激活的插件原本就不运行，折叠后为停用），迁移前备份为 `state.json.schema-v2-<毫秒时间戳>`；
+  测试 `state_version_two_is_folded_into_one_enabled_flag_and_backed_up`。
+- **daemon**：安装即 `enabled: true`；升级保持原状态；`uninstall` 与 `disable` 共用同一个排空，任意状态可卸载；
+  准入核对（视图、composer、资源、设置、模型来源、图片、命令、后台）统一读清单声明 + `enabled`，不再读授权记录。
+  经 DSH 管理插件在线安装的插件同样安装即启用（`authorization-required` 回执码只保留给安装后启停请求被拒绝的情形）。
+- **Web**：设置页头开关与详情只有“启用／停用”和“卸载”，卸载不再被停用状态阻塞；删除 `authorizeAndActivatePlugin`、
+  `deactivatePlugin`、`activateInstalledPlugin` 及相关文案；`StoreStatus` 为 `enabled | disabled | available`。
+- **翻译层**：DSH `pluginManager` 目录不再返回 `active`；profile 重载的告警改为“已启用但未运行”。
+- **验收脚本**：真实 Electron／DSH 验收脚本中的授权、激活、`authorization-required` 流程已转换为新语义，
+  **尚未在真实环境整批重跑**（需联网安装 npm 原包的社区批次，见各脚本）。

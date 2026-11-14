@@ -6,7 +6,7 @@ await withGoldenViteServer(async (server) => {
   const text = (manifest, field) => manifest[field];
   const installed = (id, source) => ({
     manifest: { id, version: '1.0.0', name: id, description: '', permissions: [], contributions: {} },
-    digest: 'd', grants: [], enabled: false, active: false,
+    digest: 'd', enabled: false,
     source: source ?? { kind: 'local', location: '/x.zip' },
   });
   const upstream = (over = {}) => ({
@@ -89,7 +89,7 @@ await withGoldenViteServer(async (server) => {
   {
     const names = ['unrelated-z', 'dsh-rea-agents', '@scope/dsh-rea', 'dsh-rea', 'unrelated-a'];
     const items = buildStoreItems([{
-      ...installed('local-active'), active: true,
+      ...installed('local-active'), enabled: true,
       manifest: { ...installed('local-active').manifest, description: 'dsh-rea related' },
     }], [], names.map((name) => upstream({ package: name, name })), text);
     assert.deepEqual(filterStoreItems(items, 'all', 'dsh-rea').map((i) => i.name),

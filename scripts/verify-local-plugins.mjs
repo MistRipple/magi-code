@@ -144,9 +144,8 @@ try {
   const first=await pack('1.0.0',1); const preview=await post('/api/plugins/preview',first);
   check('安装预览明确完全信任及包摘要', preview.digest && preview.addedPermissions.some(p=>p.kind==='extension'));
   await post('/api/plugins/install',{...first,expectedDigest:preview.digest});
-  check('未授权插件资源不可读',(await api('/api/plugins/test.local/resources/notes')).status===403);
-  check('旧安装 scope 被明确拒绝',(await api('/api/plugins/test.local/activate',{scope:'application'})).status>=400);
-  await post('/api/plugins/test.local/authorize',{grants:preview.manifest.permissions}); await post('/api/plugins/test.local/enable'); await post('/api/plugins/test.local/activate');
+  check('安装完成即启用',(await installed())?.enabled===true);
+  check('旧安装 scope 被明确拒绝',(await api('/api/plugins/test.local/enable',{scope:'application'})).status>=400);
   await wait(async()=> (await installed())?.runtime?.state==='running','Node ready');
   await post('/api/plugins/test.local/settings',{expectedVersion:0,value:{label:'configured'}},'PUT');
   const session=(await post('/api/session/materialize',{scope:'personal'})).sessionId;
@@ -172,25 +171,24 @@ try {
   await wait(async()=> (await api('/api/plugins/test.local/jobs')).value.find(j=>j.id===plan.id)?.lastOutcome==='completed','持久计划结算');
   check('daemon 原生调度执行命令并持久回执',true);
   if (process.argv.includes('--ui')) await verifyUi(session);
-  const slow=await command(session,'wait'); await sleep(200); await post('/api/plugins/test.local/deactivate');
+  const slow=await command(session,'wait'); await sleep(200); await post('/api/plugins/test.local/disable');
   const stopped=await settled(session,slow.turnId); check('停用在途宿主后 Turn 有限结算',stopped.status==='failed'||stopped.status==='cancelled');
   check('停用后资源和调用均撤销',(await api('/api/plugins/test.local/resources/notes')).status===403);
-  await post('/api/plugins/test.local/activate'); await wait(async()=> (await installed())?.runtime?.state==='running','重新激活');
+  await post('/api/plugins/test.local/enable'); await wait(async()=> (await installed())?.runtime?.state==='running','重新启用');
   const next=await pack('2.0.0',2); const nextPreview=await post('/api/plugins/preview',next);
   check('数据格式变化升级明确预告清空',nextPreview.dataReset===true);
   await post('/api/plugins/upgrade',{...next,expectedDigest:nextPreview.digest});
-  const upgraded=await installed(); check('升级只保留启用意愿，清空授权和激活',upgraded.manifest.version==='2.0.0'&&upgraded.enabled&&!upgraded.active&&upgraded.grants.length===0);
-  await post('/api/plugins/test.local/authorize',{grants:nextPreview.manifest.permissions}); await post('/api/plugins/test.local/activate'); await wait(async()=> (await installed())?.runtime?.state==='running','新版激活');
+  const upgraded=await installed(); check('升级保持启用状态',upgraded.manifest.version==='2.0.0'&&upgraded.enabled);
+  await wait(async()=> (await installed())?.runtime?.state==='running','新版启动');
   const reset=(await api('/api/plugins/test.local/resources/notes')).value; check('新版不会读到旧格式资源',reset.version===0&&reset.value===null);
-  await post('/api/plugins/test.local/deactivate'); await post('/api/plugins/test.local/disable'); await post('/api/plugins/test.local/uninstall');
-  check('卸载后插件与贡献消失',!(await installed()));
+  await post('/api/plugins/test.local/uninstall');
+  check('启用状态下可直接卸载，插件与贡献消失',!(await installed()));
   // ---- 插件贡献主对话模型数据源：授权预览、目录追加、真实请求走插件端点、撤销后不回退 ----
   const proxy=await packProxy(); const proxyPreview=await post('/api/plugins/preview',proxy);
   check('预览单独列出 modelSources 授权（区别于 models）',proxyPreview.addedPermissions.some(p=>p.kind==='modelSources'&&p.targets.includes('gateway'))&&!proxyPreview.addedPermissions.some(p=>p.kind==='models'));
   await post('/api/plugins/install',{...proxy,expectedDigest:proxyPreview.digest});
   const catalogGroups=async()=> (await api('/api/settings/models/catalog')).value.groups;
-  check('未激活的插件不向目录追加数据源',!(await catalogGroups()).some(g=>g.kind==='plugin'));
-  await post('/api/plugins/test.proxy/authorize',{grants:proxyPreview.manifest.permissions}); await post('/api/plugins/test.proxy/enable'); await post('/api/plugins/test.proxy/activate');
+await post('/api/plugins/test.proxy/enable');
   const group=await wait(async()=> (await catalogGroups()).find(g=>g.sourceId==='plugin/test.proxy/gateway'),'插件数据源进入目录');
   check('插件数据源以插件分组追加，用户的环境数据源保持在前且不含连接信息',group.kind==='plugin'&&group.pluginId==='test.proxy'&&group.name==='本地反代'&&group.models[0].id==='proxy-model'&&(await catalogGroups())[0].kind==='custom'&&!JSON.stringify(await catalogGroups()).includes('plugin-key'));
   const proxySession=(await post('/api/session/materialize',{scope:'personal'})).sessionId;
@@ -199,13 +197,13 @@ try {
   const proxied=await post('/api/session/turn',{scope:'personal',sessionId:proxySession,text:'PLUGIN_SOURCE_CHECK',requestId:'proxy-1',userMessageId:'proxy-user-1'});
   const proxiedTurn=await settled(proxySession,proxied.turnId);
   check('选用插件数据源的主对话请求真实发往插件提供的端点并带插件密钥',proxiedTurn.status==='completed'&&authorizations.slice(before).some(r=>r.model==='proxy-model'&&r.authorization==='Bearer plugin-key'));
-  await post('/api/plugins/test.proxy/deactivate');
+  await post('/api/plugins/test.proxy/disable');
   await wait(async()=> !(await catalogGroups()).some(g=>g.kind==='plugin'),'插件停用后数据源撤销');
   const afterRevoke=authorizations.length;
   const orphan=await api('/api/session/turn',{scope:'personal',sessionId:proxySession,text:'AFTER_REVOKE',requestId:'proxy-2',userMessageId:'proxy-user-2'});
   const orphanSettled=orphan.status===200 ? await settled(proxySession,orphan.value.turnId) : null;
   check('插件数据源撤销后会话明确失败，不静默回退到其他模型',(orphan.status>=400||orphanSettled?.status==='failed')&&authorizations.length===afterRevoke);
-  await post('/api/plugins/test.proxy/disable'); await post('/api/plugins/test.proxy/uninstall');
+  await post('/api/plugins/test.proxy/uninstall');
   check('MCP 管理面不依赖插件',(await api('/api/mcp-server/status')).status===200);
 } catch(error) {console.error(error); console.error('plugin status:', JSON.stringify(await installed().catch(()=>null))); process.exitCode=1;}
 finally {

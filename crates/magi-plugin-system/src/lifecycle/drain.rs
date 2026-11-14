@@ -27,23 +27,12 @@ impl PluginManager {
     pub fn is_draining(&self, id: &str) -> bool {
         self.pending_reset.as_deref() == Some(id) || self.draining.contains(id)
     }
-    pub fn begin_deactivation(
+    /// 停用、卸载与升级共用的准入关闭：之后新请求被拒绝，由调用方等待后台排空再提交。
+    pub fn begin_drain(
         manager: Arc<Mutex<Self>>,
         id: &str,
     ) -> Result<PluginDrainGuard, PluginError> {
-        {
-            let guard = manager.lock().map_err(|_| conflict("插件管理器不可用"))?;
-            if !guard.state.plugins.get(id).is_some_and(|p| p.active) {
-                return Err(conflict("插件未激活"));
-            }
-        }
-        Self::begin_upgrade_drain(manager, id)
-    }
-    pub fn begin_upgrade_drain(
-        manager: Arc<Mutex<Self>>,
-        id: &str,
-    ) -> Result<PluginDrainGuard, PluginError> {
-        Self::begin_drain(manager, id, None)
+        Self::begin_drain_with_lease(manager, id, None)
     }
     /// 原实例发起的更新必须在关闭准入的同一锁内核对租约，避免准备完成后
     /// 恰好重启的旧请求排空并替换已经接管的新宿主。
@@ -52,9 +41,9 @@ impl PluginManager {
         id: &str,
         lease: &str,
     ) -> Result<PluginDrainGuard, PluginError> {
-        Self::begin_drain(manager, id, Some(lease))
+        Self::begin_drain_with_lease(manager, id, Some(lease))
     }
-    fn begin_drain(
+    fn begin_drain_with_lease(
         manager: Arc<Mutex<Self>>,
         id: &str,
         lease: Option<&str>,

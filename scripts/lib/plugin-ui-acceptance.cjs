@@ -77,13 +77,13 @@ app.whenReady().then(async () => {
   win.setContentSize(390,844); nativeTheme.themeSource='dark'; await new Promise(r=>setTimeout(r,500));
   if (!await js('document.documentElement.scrollWidth<=innerWidth')) throw Error('UI viewport overflow at 390px');
   await fs.writeFile(path.join(output,'plugin-page-narrow.png'), (await win.webContents.capturePage()).toPNG());
-  // 重新启用：回到插件列表里用详情面板的“授权并激活”开启，页面随之恢复。
+  // 重新启用：回到插件列表里用详情面板的“启用”开启，页面随之恢复。
   await click('[data-testid="settings-nav-plugins"]');
   await wait(`Boolean(${select('[data-testid="plugin-row"][data-plugin-id="test.local"]')})`, 'plugin row');
   await click('[data-testid="plugin-row"][data-plugin-id="test.local"]');
-  await wait(`Boolean(${select('[data-action="activate"]')})`, 'activate button');
-  await click('[data-action="activate"]');
-  await wait(`fetch('/api/plugins').then(r=>r.json()).then(j=>{const p=j.plugins.find(p=>p.manifest.id==='test.local');return p?.active===true&&p?.runtime?.state==='running';})`, 'plugin re-activated from the list and host running');
+  await wait(`Boolean(${select('[data-action="enable"]')})`, 'enable button');
+  await click('[data-action="enable"]');
+  await wait(`fetch('/api/plugins').then(r=>r.json()).then(j=>{const p=j.plugins.find(p=>p.manifest.id==='test.local');return p?.enabled===true&&p?.runtime?.state==='running';})`, 'plugin re-activated from the list and host running');
   await click(navId);
   await wait(`Boolean(${select('.settings-frame:not([hidden]) iframe')})`, 'plugin view restored');
   await wait(async () => pluginFrame() && pluginFrame() !== retainedFrame && pluginFrame().executeJavaScript('Boolean(document.querySelector("#draft"))'), 'new document after reactivation');

@@ -73,8 +73,8 @@ cd hello && zip -qr ../hello.zip . -x '.*'
 
 安装与使用：
 
-1. 设置 → 插件 → “安装本地 ZIP”，选择 `hello.zip`。预览会列出“完全信任”权限和包摘要，确认安装（安装本身**不会**激活）。
-2. 在插件详情里点“授权并激活”，状态变为“已激活”，扩展运行状态显示“运行中”。
+1. 设置 → 插件 → “安装本地 ZIP”，选择 `hello.zip`。预览会列出“完全信任”权限和包摘要，确认安装；安装完成即启用，没有单独的授权或激活步骤。
+2. 插件详情的状态显示“已启用”，扩展运行状态显示“运行中”；之后可随时“停用”再“启用”，也可在任何状态直接卸载。
 3. 回到对话，输入 `/`，选择“问候”，附上文字（如“世界”）发送，会话里出现 `你好，世界！`。
 
 更完整的参考：仓库里的 `examples/plugins/notes` 演示了资源、设置和一个模型工具。
@@ -129,11 +129,11 @@ ui/…                       视图页面与静态资源，按需
 | `contextRewrite` | `["history"]` | 允许改写已装配历史的钩子（第 7 节） |
 | `modelSources` | 数据源贡献 ID | 允许向主对话的模型列表提交对应数据源；用户选用后，主对话内容会发送到你提供的地址（第 10 节） |
 | `browser` | surface ID | 浏览器 surface，见第 5 节 |
-| `pluginManagement` | `install`／`lifecycle`／`authorize`／`compatibility`／`background` | 在线安装／启停和卸载／独立委托授予目标包声明的权限／修改精确版本豁免／页面请求完成后继续后台管理；各目标分别授权，豁免不能绕过 Magi 能力检查 |
+| `pluginManagement` | `install`／`lifecycle`／`compatibility`／`background` | 在线安装（完成即启用）／启停和卸载／修改精确版本豁免／页面请求完成后继续后台管理；各目标分别声明，豁免不能绕过 Magi 能力检查 |
 | `composer` | `["images"]` | 由插件原生页面把用户选择的图片加入当前会话输入框草稿；只能移除本插件页面自己接纳的图片或聚焦输入框，不会自动发送 |
 | `sessionRead` | `["directory"]` | 读取全部用户会话的标题、身份、项目归属与创建/更新时间；不含消息、路径或凭据，不授予任何会话写入能力 |
 
-`permissions` 里列出的每一项，用户都必须在授权时逐项确认；缺少任何一项都不能激活。
+`permissions` 里列出的每一项都在安装预览中展示，确认安装即获得全部声明；运行时的准入按已安装包的清单声明核对，没有单独的授权步骤。
 
 ### 信任模型
 
@@ -263,13 +263,12 @@ export default async function activate(api) {
 | `api.plugins.list({includeUpstreamManifest?:true})` | 读取 daemon 当前插件目录；显式请求时在同一快照附带已安装原包 package.json，来源及精确版本由 daemon 校验。默认不附带，不含配置或凭据 |
 | `api.plugins.onChanged(listener)` | 协商 `plugin.directory.events` 后监听目录或运行状态失效通知，返回解除订阅函数；先订阅再读取 `plugins.list()`，读取期间收到通知则补读。通知没有目录数据，不替代 daemon 快照；实例退出回收监听器 |
 | `api.plugins.preview(input)`／`install(input)` | 上游包预览与在线安装；复用精确版本和摘要确认合同，需 `pluginManagement:["install"]` |
-| `api.plugins.reconcile({pluginIds})` | 协商 `plugin.reconciliation`，需 lifecycle 授权；最多 512 个唯一已安装插件 ID。沿现有 daemon 监管器应用已提交的激活意图，等待活动扩展真实就绪并返回当前目录；不启用停用项、不重启未变化实例，不代授权。启动失败、超时、目标版本／激活变化和调用者失效明确拒绝；故障原因由插件管理展示，修复后沿启停或在线更新入口恢复 |
+| `api.plugins.reconcile({pluginIds})` | 协商 `plugin.reconciliation`，需 lifecycle 授权；最多 512 个唯一已安装插件 ID。沿现有 daemon 监管器应用已提交的启停意图，等待活动扩展真实就绪并返回当前目录；不启用停用项、不重启未变化实例。启动失败、超时、目标版本／启用状态变化和调用者失效明确拒绝；故障原因由插件管理展示，修复后沿启停或在线更新入口恢复 |
 | `api.plugins.setEnabled(pluginId,enabled,expectedDigest?)`／`remove(pluginId,expectedDigest?)` | 启停或卸载其他插件；需 `pluginManagement:["lifecycle"]`。传入目标摘要可拒绝过期页面操作；启用本身不会代授目标插件权限 |
 | `api.plugins.finishChange({changeId,commit})` | 协商 `plugin.changes`。一次管理调用的移除与后续安装可携带同一全新 changeId（remove 第三个参数 `{changeId}`，installBundle 输入同名字段）；失败以 commit:false 恢复未提交候选的原安装，成功以 commit:true 确认独立卸载。需 lifecycle，后台另需 background；返回 `{restored:[插件ID]}`。候选已提交时保留新版本实际状态，不回滚已提交业务。实例退出／daemon 重启也恢复未结算移除；详见[恢复合同](extension-protocol-v1.md) |
-| `api.plugins.authorize(pluginId,expectedDigest,grants)` | 需单独的 `pluginManagement:["authorize"]` 用户委托。仅授予目标当前摘要声明的权限（可包含完全信任），不能改变自身权限；授权和激活沿原生入口执行，异步提交前复核发起方租约与权限 |
 | `api.plugins.compatibility()` | 读取当前随包 DSH SDK 版本、锁文件 runtimeId、revision 与精确版本豁免；仍需活动宿主租约 |
 | `api.plugins.setVersionExemption(input)` | 需独立 `pluginManagement:["compatibility"]`。输入使用 `PluginDshVersionExemptionRequest`：精确 target、当前 runtimeVersion／runtimeId、revision、enabled、acceptRisk；写入需要风险确认，安装与升级提交前再次核对 |
-| `api.plugins.background` | 与 plugins 相同的管理方法，显式使用宿主实例身份，适用于 HTTP 202 后继续执行的管理任务；写操作另需 `pluginManagement:["background"]`，且仍需 install／lifecycle／authorize／compatibility 各动作授权。停用、撤权、升级或实例替换后失效，提交前重验；不延长原会话调用，也不能调用模型、工具或会话服务 |
+| `api.plugins.background` | 与 plugins 相同的管理方法，显式使用宿主实例身份，适用于 HTTP 202 后继续执行的管理任务；写操作另需 `pluginManagement:["background"]`，且仍需 install／lifecycle／compatibility 各动作授权。停用、卸载、升级或实例替换后失效，提交前重验；不延长原会话调用，也不能调用模型、工具或会话服务 |
 | `api.session.directory(input?)` | 需 `sessionRead:["directory"]` 和协商特性 `session.directory`；直接读 daemon 当前用户会话元数据，支持 `workspaceId`、`afterSessionId`、`limit`（默认 100，上限 200）。按稳定 sessionId 升序分页，返回 `{sessions,hasMore,nextAfterSessionId}`；不创建 DSH Session 或复制 Magi 消息，不能据此写入会话 |
 | `api.tools.call(tool, input)` | 调用公开的原生工具 |
 | `api.task.spawn(input)` | 派发子任务 |
@@ -358,7 +357,7 @@ await api.on('tool.call', async (event, ctx) => {
 
 声明工具需要三处一致：`contributions.tools` 条目、覆盖该工具 ID 的 `tools` 权限、`api.tool` 绑定。
 
-插件按应用全局激活，工具进入同一全局目录。模型通过 `tool_catalog` 的 `query` 搜索，再用 `tool_names` 指定返回的 `model_tool_name` 并设置 `include_schema:true`，取得后续请求需要的定义；注册工具不意味着每次请求携带全部 schema，也不需要用户在各会话重新启用插件。工具调用仍由 daemon 按实际权限、任务和实例裁决。
+插件按应用全局启用，工具进入同一全局目录。模型通过 `tool_catalog` 的 `query` 搜索，再用 `tool_names` 指定返回的 `model_tool_name` 并设置 `include_schema:true`，取得后续请求需要的定义；注册工具不意味着每次请求携带全部 schema，也不需要用户在各会话重新启用插件。工具调用仍由 daemon 按实际权限、任务和实例裁决。
 
 ```json
 {
@@ -442,7 +441,7 @@ try { await api.model.invoke({ prompt: '…' }); }
 catch (error) { console.error(error.kind, error.message); }
 ```
 
-常见 `kind`：`PermissionDenied`（缺少权限、未激活或包已替换）、`Conflict`（版本冲突）、`ReentryDenied`、`Cancelled`、`DeadlineExceeded`、`InvalidParams`、`Blocked`、`HostGone`、`BlobExpired`、`Internal`。
+常见 `kind`：`PermissionDenied`（缺少权限、未启用或包已替换）、`Conflict`（版本冲突）、`ReentryDenied`、`Cancelled`、`DeadlineExceeded`、`InvalidParams`、`Blocked`、`HostGone`、`BlobExpired`、`Internal`。
 
 ### 资源与设置
 
@@ -570,7 +569,7 @@ POST /api/plugins/{pluginId}/jobs
 }
 ```
 
-- `commandId` 是清单里声明的命令 ID（不是完整身份）；插件必须处于激活状态。
+- `commandId` 是清单里声明的命令 ID（不是完整身份）；插件必须处于启用状态。
 - `runAt` 是 Unix 毫秒；`intervalMs` 可省略（只执行一次），重复间隔至少 1 分钟。
 - 预算：`maxModelCalls` 0–100、`maxOutputTokens` 1–32768、`timeoutMs` 1000–120000，由 daemon 强制；命令里 `ctx.job.budget` 可读到。
 - 目标必须是普通用户会话；计划列表与取消分别是 `GET /api/plugins/{pluginId}/jobs` 和 `POST /api/plugins/{pluginId}/jobs/{job}/cancel`。
@@ -605,14 +604,14 @@ node scripts/pack-plugin.mjs <插件目录> <输出.zip>
 
 升级：
 
-- 升级会保留全局启用意愿，**清空授权与激活**，用户须对新包重新授权；有独立管理委托的自身在线更新由 daemon 在原已批范围内为新摘要重新授权，见下方恢复合同。
+- 升级保持原来的启用／停用状态，不需要重新授权；由原实例发起的自身在线更新只允许原版本已声明的权限范围，见下方恢复合同。
 - 改变 `dataSchemaVersion` 且插件已有持久数据时，**升级会清空该插件的资源数据与设置**——没有数据转换通道。升级前的预览会明确提示。
 - 新版读不到旧版本数据格式留下的内容；需要保留的内容请让用户先导出。
 
 ## 14. 调试与排错
 
 - **看运行状态**：设置 → 插件，选中你的插件，详情里有扩展的运行状态：运行中、启动中、重启中（含崩溃次数）、不可用及原因。guard 钩子在宿主不可用时会阻止对应动作，详情里会列出被阻止的动作。
-- **激活失败**：入口抛错、10 秒内未返回、未声明就注册（`RegistrationDenied`）、清单与代码绑定不一致，都会让激活失败；详情页给出原因。
+- **启动失败**：入口抛错、10 秒内未返回、未声明就注册（`RegistrationDenied`）、清单与代码绑定不一致，都会让扩展启动失败；详情页给出原因。
 - **找不到 Node**：Magi 只使用安装包里随附的固定版本 Node，不读用户的 PATH。开发调试时可用环境变量 `MAGI_EXTENSION_NODE` 指向某个 Node。
 - **日志**：`api.log(message)` 写入诊断日志，不进入会话记录。
 - **模型/服务调用被拒绝**：看异常的 `kind`：`PermissionDenied` 多半是缺少 `models`/`storage` 授权或插件已被撤权；`ReentryDenied` 说明你在钩子里调用了需要活动处理器的服务。
@@ -623,9 +622,9 @@ node scripts/pack-plugin.mjs <插件目录> <输出.zip>
 | 现象 | 原因与办法 |
 | --- | --- |
 | 安装报“发布包含未允许的文件类型或入口” | 包里有第 3 节之外的文件（`.DS_Store`、`README.md`、`package.json`、多套了一层目录……）；用 `-x '.*'` 重新打包 |
-| 激活失败，原因含 `RegistrationDenied` | 代码里 `api.on` / `api.tool` / `api.command` 绑定的名字，没有在清单里声明（或工具缺 `tools` 权限） |
-| 激活超时 | `activate` 里有长时间等待或未 `await` 的注册；10 秒内必须返回 |
-| 工具、命令不出现 | 插件没有“授权并激活”；工具还需要 `tools` 权限已授权 |
+| 启动失败，原因含 `RegistrationDenied` | 代码里 `api.on` / `api.tool` / `api.command` 绑定的名字，没有在清单里声明（或工具缺 `tools` 权限） |
+| 启动超时 | `activate` 里有长时间等待或未 `await` 的注册；10 秒内必须返回 |
+| 工具、命令不出现 | 插件处于停用状态；工具还需要清单声明 `tools` 权限 |
 | 清单被拒绝 | 有未知字段；贡献 ID 重名；声明了 `extension` 却没有钩子、工具或命令；缺 `extension: ["full-trust"]` |
 | 钩子里调用 `api.model.invoke` 报 `ReentryDenied` | 这些服务只能在工具、命令、作业处理器里用 |
 | 命令里 `api.tools.call` / `api.task.spawn` 被拒绝 | 检查当前 Task 租约、插件对应权限和原生任务策略；具有任务归属不代表额外授权 |
@@ -648,7 +647,7 @@ node scripts/pack-plugin.mjs <插件目录> <输出.zip>
 
 需要关闭页面后继续订阅事件的插件可声明 `contributions.client: {"entry":"ui/settings.html"}`
 并申请 `{"kind":"client","targets":["persistent"]}`；入口必须属于同一清单的 views。
-当前窗口在插件激活期间只持有一份隔离客户端，显示位置和视图选择由宿主 context 下发，
+当前窗口在插件启用期间只持有一份隔离客户端，显示位置和视图选择由宿主 context 下发，
 无可见页面时继续执行客户端注册的后台逻辑。停用、撤权或升级会销毁旧文档。
 会话图片写入和后台持久图片仍分别需要 composer、attachments 授权。
 普通 views 不声明 client 时保留原页面生命周期。不要把浏览器文档当作 daemon 会话或持久状态源。
@@ -665,7 +664,7 @@ node scripts/pack-plugin.mjs <插件目录> <输出.zip>
 
 `installation-interrupted` 表示应用退出前任务未完成结算。`installed:true` 仅证明候选摘要已经安装，不能视作授权或运行成功；提示用户到 Magi 插件管理检查状态，确认后再用新 requestId 显式重试。恢复不自动下载、安装或代授权。原回执最多保留 256 项、至少保留至请求创建后七天；容量不足时明确失败。完整提交边界、取消及损坏日志处理见[扩展协议](extension-protocol-v1.md)。
 
-目标是发起插件自身时，daemon 要求当前实例具备 install／lifecycle／authorize 委托，并核对候选权限全部处于原已批范围内、无需重置数据。准备完成后由 daemon 接管提交，旧实例和页面会结束；新版文档应重读当前安装版本与运行状态，不能依赖旧 RPC 返回或在新摘要下自动重发。新增权限或数据重置需用户在 Magi 在线升级入口确认。该流程不允许直接修改自身授权，也不允许用自身停用／移除实现更新。
+目标是发起插件自身时，daemon 要求当前实例具备 install／lifecycle 委托，并核对候选权限全部处于原版本声明范围内、无需重置数据。准备完成后由 daemon 接管提交，旧实例和页面会结束；新版文档应重读当前安装版本与运行状态，不能依赖旧 RPC 返回或在新摘要下自动重发。新增权限或数据重置需用户在 Magi 在线升级入口确认。该流程不允许用自身停用／移除实现更新。
 
 GitHub 来源插件经相同的在线安装、授权和生命周期管理：支持 `github:owner/repository#reference`
 及公开 GitHub HTTPS 仓库地址，安装准备将引用固定到提交。Magi 原生确认流程须携带预览提交与

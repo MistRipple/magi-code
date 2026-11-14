@@ -656,8 +656,8 @@ test('DSH 插件目录读取 daemon 当前事实，保留作用域包名、版�
   const { createPluginManager } = await import('./runtime/plugin-manager.mjs');
   let enabled = true;
   const manager = createPluginManager({ plugins: { async list() { return { plugins: [
-    { manifest: { name: 'Scoped plugin', description: 'description' }, source: { kind: 'upstream', location: 'dsh:@scope/sample@1.2.3' }, enabled, active: false },
-    { manifest: { name: 'Native' }, source: { kind: 'local', location: 'native.zip' }, enabled: true, active: true },
+    { manifest: { name: 'Scoped plugin', description: 'description' }, source: { kind: 'upstream', location: 'dsh:@scope/sample@1.2.3' }, enabled },
+    { manifest: { name: 'Native' }, source: { kind: 'local', location: 'native.zip' }, enabled: true },
   ] }; } } }, 'https://registry.npmjs.org');
   const first = await manager.listBundles();
   assert.equal(first.length, 1); assert.equal(first[0].name, '@scope/sample');
@@ -725,7 +725,7 @@ test('全局插件状态观察来自 daemon 当前目录，其他插件失败不
   const h = host(), failures = new Map();
   let notify;
   const plugin = (state, reason) => ({ manifest: { id: 'dsh.other' }, digest: 'other-digest',
-    source: { kind: 'upstream', location: 'dsh:@scope/other@1.0.0' }, active: true, runtime: { state, reason, generation: 1 } });
+    source: { kind: 'upstream', location: 'dsh:@scope/other@1.0.0' }, enabled: true, runtime: { state, reason, generation: 1 } });
   let plugins = [plugin('failed', '真实启动失败')];
   h.api.plugins = {
     async list() { return { plugins: structuredClone(plugins) }; },
@@ -762,7 +762,7 @@ test('插件目录观察合并变更并补读在途更新，取消订阅与处�
     onChanged(listener) { notify = listener; return () => { notify = undefined; }; },
   } };
   const directory = createPluginDirectory(api, message => errors.push(message));
-  const plugin = (state) => ({ manifest: { id: 'dsh.other' }, digest: 'digest', source: { kind: 'upstream', location: 'dsh:other@1.0.0' }, active: true, runtime: { state, generation: 1 } });
+  const plugin = (state) => ({ manifest: { id: 'dsh.other' }, digest: 'digest', source: { kind: 'upstream', location: 'dsh:other@1.0.0' }, enabled: true, runtime: { state, generation: 1 } });
   const off = directory.subscribe(value => { calls.push(value.state); });
   const change = notify();
   resolveRead({ plugins: [plugin('starting')] });

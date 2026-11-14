@@ -42,10 +42,9 @@ pub use generated::{
 };
 
 pub use generated::{
-    PluginActivationRequest, PluginAuthorizeRequest, PluginComposerAdmissionRequest,
-    PluginContributions, PluginInstallRequest, PluginInstalled, PluginList, PluginManifest,
-    PluginNamedContribution, PluginPermission, PluginPermissionKind, PluginResource,
-    PluginResourceWriteRequest, PluginToolContribution, PluginViewContribution,
+    PluginComposerAdmissionRequest, PluginContributions, PluginInstallRequest, PluginInstalled,
+    PluginList, PluginManifest, PluginNamedContribution, PluginPermission, PluginPermissionKind,
+    PluginResource, PluginResourceWriteRequest, PluginToolContribution, PluginViewContribution,
     PluginViewPlacement,
 };
 

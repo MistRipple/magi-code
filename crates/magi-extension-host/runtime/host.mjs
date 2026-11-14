@@ -394,7 +394,6 @@ const pluginApi = (background = false) => Object.freeze({
     ...(options.expectedState === undefined ? {} : { expectedState: options.expectedState }),
     ...(options.reason === undefined ? {} : { reason: options.reason }),
   }, background),
-  authorize: (pluginId, expectedDigest, grants) => pluginRequest('plugins.authorize', { pluginId, expectedDigest, grants }, background),
   remove: (pluginId, expectedDigest, options = {}) => pluginRequest('plugins.remove', { pluginId, ...(expectedDigest === undefined ? {} : { expectedDigest }),
     ...(options.changeId === undefined ? {} : { changeId: options.changeId }) }, background),
   finishChange: (input) => pluginRequest('plugins.finishChange', input, background),

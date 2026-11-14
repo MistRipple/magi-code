@@ -33,14 +33,17 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 mod config;
-pub use config::{HttpModelBridgeProtocol, ProviderCacheContract, ProviderCacheControl, ProviderCacheRouteKey, ProviderContinuation};
 use config::*;
+pub use config::{
+    HttpModelBridgeProtocol, ProviderCacheContract, ProviderCacheControl, ProviderCacheRouteKey,
+    ProviderContinuation,
+};
 mod client;
-pub use client::{HttpModelBridgeClient};
+pub use client::HttpModelBridgeClient;
 use client::*;
 mod usage;
 #[cfg(test)]
-pub use usage::{ModelProbeRequest};
+pub use usage::ModelProbeRequest;
 use usage::*;
 mod gate;
 use gate::*;

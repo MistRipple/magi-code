@@ -35,7 +35,7 @@ try {
   const preview = await api('/api/plugins/upstream/preview', { ecosystem: 'dsh', package: 'dsh-plugin-appshot', version: '0.4.2' });
   const installed = await api('/api/plugins/upstream/install', { ecosystem: 'dsh', package: 'dsh-plugin-appshot', version: '0.4.2', expectedDigest: preview.candidate.digest });
   const plugin = installed.plugins.find(p => p.source?.location === 'dsh:dsh-plugin-appshot@0.4.2'); id = plugin.manifest.id;
-  await api(pluginPath() + '/enable', {}); await api(pluginPath() + '/authorize', { grants: plugin.manifest.permissions }); await api(pluginPath() + '/activate', {});
+  await api(pluginPath() + '/enable', {});
   const result = await verifyDshAppshot({ request: api, origin, plugin, page, cdpPort, errors, output, stateRoot: join(work, 'state'),
     liveCapture: process.env.MAGI_APPSHOT_LIVE_CAPTURE === '1', check: name => console.log(`PASS ${name}`),
     restart: async () => { page.close(); await stop(); await start(); return page; },

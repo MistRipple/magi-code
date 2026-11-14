@@ -172,7 +172,9 @@ pub fn parse(value: &Value) -> Result<MainModelSourcesConfig, String> {
 /// 未配置时由宿主注入的默认模型客户端（开发/测试/嵌入场景）承接，配置了就必须按目录解析，失败即报错。
 /// 插件来源是追加项，不改变“是否配置”。
 pub fn is_configured(store: &SettingsStore) -> Result<bool, String> {
-    Ok(!parse(&store.get_section("orchestrator"))?.sources.is_empty())
+    Ok(!parse(&store.get_section("orchestrator"))?
+        .sources
+        .is_empty())
 }
 
 fn plugin_catalog_sources(store: &SettingsStore) -> Vec<CatalogSource> {

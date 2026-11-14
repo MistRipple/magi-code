@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectAppPage, connectTarget, createReporter, launchApp, pageTools, waitFor } from './lib/electron-harness.mjs';
-import { authorizePluginFromNative } from './lib/plugin-native-acceptance.mjs';
+import { waitForInstalledPlugin } from './lib/plugin-native-acceptance.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const packageName = process.env.MAGI_OFM_PACKAGE || '@ebony-vinyl/dsh-our-free-model';
@@ -60,7 +60,7 @@ try {
   const preview = await request('/api/plugins/upstream/preview', spec); await save('preview', preview);
   plugin = (await request('/api/plugins/upstream/install', { ...spec, expectedDigest: preview.candidate.digest }))
     .plugins.find(value => value.manifest.id === preview.candidate.manifest.id);
-  plugin = await authorizePluginFromNative({ request, page, plugin }); await save('running', plugin);
+  plugin = await waitForInstalledPlugin({ request, page, plugin }); await save('running', plugin);
   report.check('固定原包在线安装、原生授权并启动', plugin.manifest.version === version && plugin.runtime.state === 'running');
   await settings();
   const originalPage = await frame.evaluate('({text:document.body.innerText,links:[...document.querySelectorAll("a[href]")].map(a=>a.href)})');
@@ -105,15 +105,15 @@ try {
   await save('cancelled-turn', cancelledTurn);
   report.check('执行中的原包模型调用可由 Magi 原生取消', true);
   const before = await current();
-  await request(`/api/plugins/${plugin.manifest.id}/deactivate`, {});
-  await waitFor(async () => { const value = await current(); return !value.active && value.runtime?.state !== 'running'; }, '停用回收实例');
+  await request(`/api/plugins/${plugin.manifest.id}/disable`, {});
+  await waitFor(async () => { const value = await current(); return !value.enabled && value.runtime?.state !== 'running'; }, '停用回收实例');
   report.check('全局停用清除原包模型来源', !(await request('/api/settings/models/catalog')).groups.some(group => group.pluginId === plugin.manifest.id));
-  await request(`/api/plugins/${plugin.manifest.id}/activate`, {});
+  await request(`/api/plugins/${plugin.manifest.id}/enable`, {});
   const reactivated = await waitFor(async () => { const value = await current(); return value.runtime?.state === 'running' && value; }, '重新启用', 120_000);
   report.check('重新启用使用新实例及原摘要', reactivated.digest === before.digest && reactivated.runtime.instanceId !== before.runtime.instanceId);
   await stop('before-restart'); await start();
   const restored = await waitFor(async () => { const value = await current(); return value.runtime?.state === 'running' && value; }, '完整应用重启', 120_000);
-  report.check('完整重启保留安装和授权并恢复新实例', restored.digest === before.digest && restored.runtime.instanceId !== reactivated.runtime.instanceId && JSON.stringify(restored.grants) === JSON.stringify(before.grants));
+  report.check('完整重启保留安装和授权并恢复新实例', restored.digest === before.digest && restored.runtime.instanceId !== reactivated.runtime.instanceId);
   report.check('完整重启保留原包业务配置', (await route('/summary')).body.settings?.probeIntervalMinutes === 23);
   const restoredTurns = (await request(`/api/messages?scope=personal&sessionId=${session}`)).canonicalTurns;
   report.check('重启保留真实正文和取消终态，不重放已取消请求', restoredTurns.some(turn => turn.turnId === result.turnId && turn.status === 'completed'

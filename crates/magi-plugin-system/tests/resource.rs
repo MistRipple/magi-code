@@ -115,7 +115,7 @@ fn dashboard_package() -> PluginPackage {
 
 #[test]
 fn manager_resource_access_is_declared_authorized_in_one_place() {
-    use magi_plugin_system::{PluginError, PluginPermission, PluginPermissionKind};
+    use magi_plugin_system::PluginError;
 
     let dir = tempdir().unwrap();
     let mut manager = PluginManager::open(dir.path()).unwrap();
@@ -127,23 +127,13 @@ fn manager_resource_access_is_declared_authorized_in_one_place() {
             },
         )
         .unwrap();
-    // 未激活：隐藏入口之外，直接调用也被拒绝。
+    // 已停用：隐藏入口之外，直接调用也被拒绝。
+    manager.disable("acme.dashboard").unwrap();
     assert!(matches!(
         manager.read_resource("acme.dashboard", "board"),
         Err(PluginError::NotAuthorized(_))
     ));
     manager.enable("acme.dashboard").unwrap();
-    manager
-        .authorize(
-            "acme.dashboard",
-            vec![PluginPermission {
-                kind: PluginPermissionKind::Storage,
-
-                targets: vec!["board".into()],
-            }],
-        )
-        .unwrap();
-    manager.activate("acme.dashboard").unwrap();
 
     assert!(matches!(
         manager.read_resource("acme.dashboard", "forged"),

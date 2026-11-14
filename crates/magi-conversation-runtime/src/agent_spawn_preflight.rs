@@ -1405,37 +1405,77 @@ mod tests {
         let registry = TaskExecutionRegistry::default();
         let parent = reference_parent_task();
         let session = SessionId::new("model-preflight");
-        let client: Arc<dyn ModelBridgeClient> = Arc::new(
-            magi_bridge_client::HttpModelBridgeClient::new(
-                "http://127.0.0.1:1/v1".into(), None, "injected-model".into(),
-            ),
-        );
+        let client: Arc<dyn ModelBridgeClient> =
+            Arc::new(magi_bridge_client::HttpModelBridgeClient::new(
+                "http://127.0.0.1:1/v1".into(),
+                None,
+                "injected-model".into(),
+            ));
         for (catalog, selection) in [
-            (serde_json::json!({"sources": "invalid"}), serde_json::Value::Null),
-            (serde_json::json!({"sources": []}), serde_json::json!({"sourceId": "plugin/removed/model", "model": "gone"})),
-            (crate::main_model_sources::test_sources("http://127.0.0.1:1/v1", "", &["available"]), serde_json::json!({"sourceId": "custom/test", "model": "missing"})),
+            (
+                serde_json::json!({"sources": "invalid"}),
+                serde_json::Value::Null,
+            ),
+            (
+                serde_json::json!({"sources": []}),
+                serde_json::json!({"sourceId": "plugin/removed/model", "model": "gone"}),
+            ),
+            (
+                crate::main_model_sources::test_sources(
+                    "http://127.0.0.1:1/v1",
+                    "",
+                    &["available"],
+                ),
+                serde_json::json!({"sourceId": "custom/test", "model": "missing"}),
+            ),
         ] {
             let settings = Arc::new(SettingsStore::new());
             settings.set_section("orchestrator", catalog).unwrap();
-            settings.set_session_section(&session, "orchestrator", selection).unwrap();
+            settings
+                .set_session_section(&session, "orchestrator", selection)
+                .unwrap();
             let error = preflight_agent_model(
-                &registry, &parent, &Some(settings.clone()), Some(client.clone()),
-                "executor", &session, None,
-            ).expect_err("已配置但无效时不得改用注入客户端创建代理");
+                &registry,
+                &parent,
+                &Some(settings.clone()),
+                Some(client.clone()),
+                "executor",
+                &session,
+                None,
+            )
+            .expect_err("已配置但无效时不得改用注入客户端创建代理");
             assert_eq!(error.error_code, "model_preflight_failed");
-            assert!(resolve_target_for_role(
-                Some(&settings), Some(client.clone()), RoleTarget::Orchestrator, Some(&session),
-            ).is_err(), "主对话与子代理必须遵守同一配置边界");
-            assert!(crate::model_config::ensure_extension_model_source(&settings, None, &session).is_err());
+            assert!(
+                resolve_target_for_role(
+                    Some(&settings),
+                    Some(client.clone()),
+                    RoleTarget::Orchestrator,
+                    Some(&session),
+                )
+                .is_err(),
+                "主对话与子代理必须遵守同一配置边界"
+            );
+            assert!(
+                crate::model_config::ensure_extension_model_source(&settings, None, &session)
+                    .is_err()
+            );
         }
         for settings in [None, Some(Arc::new(SettingsStore::new()))] {
             let error = preflight_agent_model(
                 &registry, &parent, &settings, None, "executor", &session, None,
-            ).expect_err("缺少模型能力不能以拓扑测试为由创建代理");
+            )
+            .expect_err("缺少模型能力不能以拓扑测试为由创建代理");
             assert_eq!(error.error_code, "model_preflight_failed");
             let (source, selection) = preflight_agent_model(
-                &registry, &parent, &settings, Some(client.clone()), "executor", &session, None,
-            ).expect("未配置时允许显式注入模型客户端");
+                &registry,
+                &parent,
+                &settings,
+                Some(client.clone()),
+                "executor",
+                &session,
+                None,
+            )
+            .expect("未配置时允许显式注入模型客户端");
             assert_eq!(source.as_deref(), Some("inherited_orchestrator"));
             assert!(selection.is_none());
         }

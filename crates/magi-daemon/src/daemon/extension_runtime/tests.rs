@@ -168,7 +168,7 @@ fn materialized_native_helper_executes_and_assets_stay_non_executable() {
     );
 }
 
-fn activate(fixture: &Fixture, package: &PluginPackage) {
+fn install_enabled(fixture: &Fixture, package: &PluginPackage) {
     let mut manager = fixture.manager.lock().unwrap();
     manager
         .install(
@@ -179,10 +179,6 @@ fn activate(fixture: &Fixture, package: &PluginPackage) {
         )
         .unwrap();
     manager.enable("acme.guard").unwrap();
-    manager
-        .authorize("acme.guard", package.manifest().permissions.clone())
-        .unwrap();
-    manager.activate("acme.guard").unwrap();
 }
 
 fn call(command: &str) -> serde_json::Value {
@@ -310,10 +306,6 @@ async fn view_routes_follow_plugin_admission_and_are_cancelled_with_the_request(
                 .install(package, PluginSource::Local { name: name.into() })
                 .unwrap();
             manager.enable(&id).unwrap();
-            manager
-                .authorize(&id, package.manifest().permissions.clone())
-                .unwrap();
-            manager.activate(&id).unwrap();
         }
     }
     fixture.runtime.reconcile().await;
@@ -415,7 +407,7 @@ async fn view_routes_follow_plugin_admission_and_are_cancelled_with_the_request(
         .manager
         .lock()
         .unwrap()
-        .deactivate("acme.guard")
+        .disable("acme.guard")
         .unwrap();
     let stopped = executor
         .call("acme.guard".into(), request("/status", ""))
@@ -446,10 +438,6 @@ async fn extension_commands_run_through_the_real_host_and_follow_stop_requests()
             )
             .unwrap();
         manager.enable("acme.guard").unwrap();
-        manager
-            .authorize("acme.guard", package.manifest().permissions.clone())
-            .unwrap();
-        manager.activate("acme.guard").unwrap();
         assert_eq!(manager.command_contributions().unwrap().len(), 3);
     }
     fixture.runtime.reconcile().await;
@@ -551,7 +539,7 @@ async fn extension_commands_run_through_the_real_host_and_follow_stop_requests()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn extension_tools_are_listed_only_when_authorized_and_execute_through_the_real_host() {
+async fn extension_tools_are_listed_for_enabled_plugins_and_execute_through_the_real_host() {
     use super::super::plugin_bridge::execute_tool;
     use magi_core::ExecutionResultStatus::{Cancelled, Failed, Indeterminate, Rejected, Succeeded};
     use std::sync::atomic::AtomicBool;
@@ -568,12 +556,6 @@ async fn extension_tools_are_listed_only_when_authorized_and_execute_through_the
             )
             .unwrap();
         manager.enable("acme.guard").unwrap();
-        // 未授权时目录为空，也无法执行。
-        assert!(manager.tool_contributions().unwrap().is_empty());
-        manager
-            .authorize("acme.guard", package.manifest().permissions.clone())
-            .unwrap();
-        manager.activate("acme.guard").unwrap();
         assert_eq!(manager.tool_contributions().unwrap().len(), 4);
     }
     fixture.runtime.reconcile().await;
@@ -653,10 +635,10 @@ async fn extension_tools_are_listed_only_when_authorized_and_execute_through_the
 }
 
 #[tokio::test]
-async fn activated_extension_packages_become_supervised_hosts_and_stop_on_deactivation() {
+async fn enabled_extension_packages_become_supervised_hosts_and_stop_on_disable() {
     let fixture = fixture(Some(test_node()));
     let package = package();
-    activate(&fixture, &package);
+    install_enabled(&fixture, &package);
     fixture.runtime.reconcile().await;
     fixture
         .runtime
@@ -691,7 +673,7 @@ async fn activated_extension_packages_become_supervised_hosts_and_stop_on_deacti
         .manager
         .lock()
         .unwrap()
-        .deactivate("acme.guard")
+        .disable("acme.guard")
         .unwrap();
     fixture.runtime.reconcile().await;
     assert!(!fixture.runtime.is_running("acme.guard").await);
@@ -741,7 +723,7 @@ async fn plugin_model_sources_follow_the_supervised_instance_lifecycle() {
     let fixture = fixture(Some(test_node()));
     let settings = Arc::new(magi_settings_store::SettingsStore::new());
     fixture.runtime.bind_settings(&settings);
-    activate(&fixture, &model_source_package());
+    install_enabled(&fixture, &model_source_package());
     fixture.runtime.reconcile().await;
     fixture
         .runtime
@@ -767,7 +749,7 @@ async fn plugin_model_sources_follow_the_supervised_instance_lifecycle() {
         .manager
         .lock()
         .unwrap()
-        .deactivate("acme.guard")
+        .disable("acme.guard")
         .unwrap();
     fixture.runtime.reconcile().await;
     assert!(identities(&settings).is_empty());
@@ -815,7 +797,7 @@ export default async function activate(api) {
         writer.write_all(&bytes).unwrap();
     }
     let package = PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap();
-    activate(&fixture, &package);
+    install_enabled(&fixture, &package);
     fixture.runtime.reconcile().await;
     fixture
         .runtime
@@ -910,7 +892,7 @@ export default async function activate(api) {
         .manager
         .lock()
         .unwrap()
-        .deactivate("acme.guard")
+        .disable("acme.guard")
         .unwrap();
     fixture.runtime.reconcile().await;
     assert!(
@@ -931,7 +913,7 @@ async fn registry_change_events_drive_the_reconciler() {
     let fixture = fixture(Some(test_node()));
     let events = Arc::new(InMemoryEventBus::new(32));
     fixture.runtime.start(Arc::clone(&events));
-    activate(&fixture, &package());
+    install_enabled(&fixture, &package());
     events.publish(EventEnvelope::domain(
         magi_core::EventId::unique("plugin-registry-changed"),
         "plugin.registry.changed",
@@ -956,7 +938,7 @@ async fn registry_change_events_drive_the_reconciler() {
         .manager
         .lock()
         .unwrap()
-        .deactivate("acme.guard")
+        .disable("acme.guard")
         .unwrap();
     events.publish(EventEnvelope::domain(
         magi_core::EventId::unique("plugin-registry-changed"),
@@ -976,7 +958,7 @@ async fn registry_change_events_drive_the_reconciler() {
 async fn without_a_node_runtime_guard_hooks_fail_closed_instead_of_silently_disappearing() {
     let fixture = fixture(None);
     let package = package();
-    activate(&fixture, &package);
+    install_enabled(&fixture, &package);
     fixture.runtime.reconcile().await;
     assert!(
         fixture
@@ -1038,7 +1020,7 @@ async fn runtime_status_follows_the_lifecycle_and_notifies_the_ui() {
     let events = Arc::new(InMemoryEventBus::new(32));
     let mut feed = events.subscribe();
     fixture.runtime.start(Arc::clone(&events));
-    activate(&fixture, &package());
+    install_enabled(&fixture, &package());
     fixture.runtime.reconcile().await;
     // 状态变化事件到达，状态最终为运行中，且没有被阻止的动作。
     let mut running = None;
@@ -1074,7 +1056,7 @@ async fn runtime_status_follows_the_lifecycle_and_notifies_the_ui() {
         .manager
         .lock()
         .unwrap()
-        .deactivate("acme.guard")
+        .disable("acme.guard")
         .unwrap();
     fixture.runtime.reconcile().await;
     assert!(fixture.runtime.status("acme.guard").is_none());
@@ -1082,7 +1064,7 @@ async fn runtime_status_follows_the_lifecycle_and_notifies_the_ui() {
         .manager
         .lock()
         .unwrap()
-        .activate("acme.guard")
+        .enable("acme.guard")
         .unwrap();
     fixture.runtime.reconcile().await;
     let next = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -1112,7 +1094,7 @@ async fn runtime_status_follows_the_lifecycle_and_notifies_the_ui() {
 async fn a_missing_node_runtime_is_visible_as_failed_with_the_reason_and_blocking_guards() {
     use magi_api::ExtensionStatusSource;
     let fixture = fixture(None);
-    activate(&fixture, &package());
+    install_enabled(&fixture, &package());
     fixture.runtime.reconcile().await;
     let status = fixture
         .runtime

@@ -27,7 +27,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
 
-/// 资源订阅检查插件是否仍激活并持有授权的间隔；失效后立即关闭订阅。
+/// 资源订阅检查插件是否仍启用并声明所需权限的间隔；失效后立即关闭订阅。
 const RESOURCE_SUBSCRIPTION_RECHECK: Duration = Duration::from_millis(500);
 /// JSON 上传承载合法归档的 base64（每三字节占四字符），另留有界元数据空间。
 const MAX_INSTALL_REQUEST_BYTES: usize = MAX_PACKAGE_BYTES.div_ceil(3) * 4 + 64 * 1024;
@@ -48,8 +48,7 @@ use center::{center, center_install, guide, write_center_config};
 use download::download_bytes;
 
 type InstallRequest = magi_app_server_protocol::PluginInstallRequest;
-type ActivationRequest = magi_app_server_protocol::PluginActivationRequest;
-type AuthorizeRequest = magi_app_server_protocol::PluginAuthorizeRequest;
+type LifecycleRequest = magi_app_server_protocol::generated::PluginLifecycleRequest;
 type ResourceWriteRequest = magi_app_server_protocol::PluginResourceWriteRequest;
 
 #[derive(Deserialize)]
@@ -116,9 +115,6 @@ pub fn routes() -> Router<ApiState> {
             post(upgrade).layer(DefaultBodyLimit::max(MAX_INSTALL_REQUEST_BYTES)),
         )
         .route("/plugins/{id}/enable", post(enable))
-        .route("/plugins/{id}/authorize", post(authorize))
-        .route("/plugins/{id}/activate", post(activate))
-        .route("/plugins/{id}/deactivate", post(deactivate))
         .route("/plugins/{id}/disable", post(disable))
         .route("/plugins/{id}/uninstall", post(uninstall))
 }
@@ -183,7 +179,7 @@ async fn resource_events(
         .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(5))))
 }
 
-/// 轮询到订阅所需的激活状态、声明和授权不再成立为止。
+/// 轮询到订阅所需的启用状态与声明不再成立为止。
 async fn resource_subscription_revoked(
     manager: std::sync::Arc<std::sync::Mutex<PluginManager>>,
     id: String,
@@ -224,8 +220,8 @@ fn resource_response(
     digest: Option<&str>,
 ) -> Result<Response, ApiError> {
     let manager = locked(state, "读取插件视图")?;
-    if !manager.is_active(id).map_err(plugin_error)? {
-        return Err(ApiError::Forbidden("插件未激活".into()));
+    if !manager.is_enabled(id).map_err(plugin_error)? {
+        return Err(ApiError::Forbidden("插件未启用".into()));
     }
     let resource_path = format!("ui/{path}");
     let package = manager.package(id).map_err(plugin_error)?;
@@ -282,7 +278,7 @@ fn resource_response(
     Ok(response)
 }
 
-/// 已安装插件的图标。与视图资源不同，列表要展示所有已安装插件，所以不要求插件已激活；
+/// 已安装插件的图标。与视图资源不同，列表要展示所有已安装插件，所以不要求插件已启用；
 /// 只返回清单声明且通过包校验的那一个图片，其他包内文件不经此接口出去。
 async fn icon(State(state): State<ApiState>, Path(id): Path<String>) -> Result<Response, ApiError> {
     let manager = locked(&state, "读取插件图标")?;
@@ -325,7 +321,7 @@ async fn admit_view(
     use magi_app_server_protocol::PluginViewPlacement;
     let manager = locked(&state, "校验插件会话视图授权")?;
     if !matches!(request.placement, PluginViewPlacement::ChatAssistant)
-        || !manager.is_active(&id).map_err(plugin_error)?
+        || !manager.is_enabled(&id).map_err(plugin_error)?
         || !manager
             .permission_allowed(
                 &id,
@@ -335,7 +331,7 @@ async fn admit_view(
             .map_err(plugin_error)?
     {
         return Err(ApiError::Forbidden(
-            "插件未激活或缺少会话视图读取授权".into(),
+            "插件未启用或缺少会话视图读取权限".into(),
         ));
     }
     let package = manager.package(&id).map_err(plugin_error)?;
@@ -365,7 +361,7 @@ async fn admit_composer(
         Some(magi_app_server_protocol::generated::PluginComposerTarget::Text) => "text",
         None | Some(magi_app_server_protocol::generated::PluginComposerTarget::Images) => "images",
     };
-    if !manager.is_active(&id).map_err(plugin_error)?
+    if !manager.is_enabled(&id).map_err(plugin_error)?
         || !manager
             .permission_allowed(
                 &id,
@@ -375,7 +371,7 @@ async fn admit_composer(
             .map_err(plugin_error)?
     {
         return Err(ApiError::Forbidden(format!(
-            "插件未激活或缺少 composer:[{target}] 授权"
+            "插件未启用或缺少 composer:[{target}] 权限"
         )));
     }
     let package = manager.package(&id).map_err(plugin_error)?;
@@ -683,7 +679,7 @@ async fn install_or_upgrade(
         .await
 }
 
-/// 升级的唯一入口：关闭该插件全局准入，再原子切换到新包。任一步失败都保持旧版本与旧激活状态不变。
+/// 升级的唯一入口：关闭该插件全局准入，再原子切换到新包。任一步失败都保持旧版本与原启用状态不变。
 async fn upgrade_installed_plugin(
     state: &ApiState,
     package: &PluginPackage,
@@ -694,7 +690,7 @@ async fn upgrade_installed_plugin(
         .await
 }
 
-/// 已激活插件声明的用户命令。身份固定为 `plugin/{插件}/{贡献}`，供输入框斜杠菜单使用。
+/// 已启用插件声明的用户命令。身份固定为 `plugin/{插件}/{贡献}`，供输入框斜杠菜单使用。
 async fn commands(
     State(state): State<ApiState>,
     Query(_query): Query<PluginQuery>,
@@ -718,25 +714,10 @@ async fn commands(
     ))
 }
 
-async fn authorize(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-    Json(request): Json<AuthorizeRequest>,
-) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    PluginOperations::from_state(&state)
-        .authorize(
-            &id,
-            request.grants,
-            None,
-            request.expected_digest.as_deref(),
-        )
-        .await?;
-    snapshot(&state, &*locked(&state, "读取授权结果")?)
-}
 async fn enable(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    Json(request): Json<ActivationRequest>,
+    Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
         .lifecycle(
@@ -748,41 +729,10 @@ async fn enable(
         .await?;
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
-async fn activate(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-    Json(request): Json<ActivationRequest>,
-) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    PluginOperations::from_state(&state)
-        .lifecycle(
-            "activate",
-            &id,
-            None,
-            operations::LifecycleChange::for_digest(request.expected_digest.as_deref()),
-        )
-        .await?;
-    snapshot(&state, &*locked(&state, "读取插件状态")?)
-}
-async fn deactivate(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-    Json(request): Json<ActivationRequest>,
-) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    PluginOperations::from_state(&state)
-        .lifecycle(
-            "deactivate",
-            &id,
-            None,
-            operations::LifecycleChange::for_digest(request.expected_digest.as_deref()),
-        )
-        .await?;
-    snapshot(&state, &*locked(&state, "读取插件状态")?)
-}
-
 async fn disable(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    Json(request): Json<ActivationRequest>,
+    Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     PluginOperations::from_state(&state)
         .lifecycle(
@@ -804,7 +754,7 @@ async fn uninstall(
     snapshot(&state, &*locked(&state, "读取插件状态")?)
 }
 
-// 只发布注册表失效事实；所有客户端经原清单入口读取，不复制激活或权限状态。
+// 只发布注册表失效事实；所有客户端经原清单入口读取，不复制启用或权限状态。
 fn publish_plugin_registry_changed(state: &ApiState) {
     state.event_bus.publish(EventEnvelope::domain(
         EventId::unique("plugin-registry-changed"),
@@ -822,7 +772,7 @@ fn locked<'a>(
         .lock()
         .map_err(|_| ApiError::internal_assembly(action, "插件锁已损坏"))
 }
-/// 插件列表投影 = 管理器的安装/授权/生命周期事实 + 扩展宿主的运行状态（只读合并，不另存）。
+/// 插件列表投影 = 管理器的安装/生命周期事实 + 扩展宿主的运行状态（只读合并，不另存）。
 fn snapshot(
     state: &ApiState,
     manager: &magi_plugin_system::PluginManager,

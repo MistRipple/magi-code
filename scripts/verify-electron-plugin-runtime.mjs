@@ -13,7 +13,7 @@ import { createHash } from 'node:crypto';
 import { browserImageFixtures } from './lib/plugin-image-fixtures.mjs';
 import { packPlugin } from './compat/core/pack.mjs';
 import { connectAppPage, connectTarget, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
-import { authorizePluginFromNative } from './lib/plugin-native-acceptance.mjs';
+import { waitForInstalledPlugin } from './lib/plugin-native-acceptance.mjs';
 import { createPluginThemeCases, activatePluginTheme, measurePluginContrast } from './lib/plugin-theme-acceptance.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -286,7 +286,7 @@ async function verifyOriginalSkill(session, waitTurn) {
   const list = await post('/api/plugins/upstream/install', {...request,expectedDigest:preview.candidate.digest});
   const original = list.plugins.find(plugin=>plugin.source.location==='dsh:dsh-plugin-debugging@0.7.2');
   const path = `/api/plugins/${original.manifest.id}`;
-  await post(path+'/enable'); await post(path+'/authorize',{grants:original.manifest.permissions}); await post(path+'/activate');
+  await post(path+'/enable');
   const running = await waitFor(async()=>{
     const plugin=(await api('/api/plugins')).value.plugins.find(plugin=>plugin.manifest.id===original.manifest.id);
     return plugin?.runtime?.state==='running' && plugin;
@@ -340,7 +340,7 @@ async function verifyOriginalSkill(session, waitTurn) {
   await snapshot('original-skill-conversation');
   await selectSkill();
   await page.evaluate(`[...document.querySelectorAll('.ia-slash-item')].find(item=>item.querySelector('.ia-slash-item-label')?.textContent==='/dsh-plugin-debugging').dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true}))`);
-  await post(path+'/deactivate');
+  await post(path+'/disable');
   await waitFor(async()=>!(await activeSkills()).some(entry=>entry.id===skill.id)&&!await ui.exists('.ia-skill-chip'),'停用撤销技能目录和草稿选择');
   reporter.check('停用从同一事实源撤销技能入口和已选技能',true);
   reporter.check('插件停用后历史消息仍显示接纳时技能名称',await page.evaluate(`Array.from(document.querySelectorAll('.user-command-text')).some(node=>node.textContent==='/dsh-plugin-debugging')`));
@@ -348,7 +348,7 @@ async function verifyOriginalSkill(session, waitTurn) {
   const staleResult=stale.status===200 ? await waitTurn(stale.value.turnId) : stale.value;
   reporter.check('停用后的旧技能身份不能继续执行',JSON.stringify(staleResult).includes('skill_unavailable')
     && (stale.status>=400 || ['failed','blocked'].includes(staleResult.status)),JSON.stringify(staleResult).slice(0,500));
-  await post(path+'/activate');
+  await post(path+'/enable');
   await waitFor(async()=>(await activeSkills()).some(entry=>entry.id===skill.id),'重新启用恢复同一技能身份');
   const bootstrap=(await api(`/api/settings/bootstrap?scope=personal&sessionId=${encodeURIComponent(session)}`)).value;
   reporter.check('重新激活重新注册技能，不写入本地技能配置',!bootstrap.skillsConfig.instructionSkills.some(entry=>entry.skillId===skill.id||entry.name==='dsh-plugin-debugging'));
@@ -411,15 +411,14 @@ async function verifyOriginalSkill(session, waitTurn) {
   const disabled=await diagnose('original-debugging-disabled','dsh-plugin-release-probe');
   reporter.check('Debugging 原包将真实停用状态与启动失败区分展示',disabled.value.ok===true
     &&disabled.value.data.key.packages[0].entryState==='present'&&disabled.value.data.key.packages[0].phase==='disabled',JSON.stringify(disabled));
-  await post(targetPath+'/enable');await post(targetPath+'/authorize',{grants:target.manifest.permissions});
-  await post(targetPath+'/activate');
+  await post(targetPath+'/enable');
   await waitFor(async()=>(await api('/api/plugins')).value.plugins.find(plugin=>plugin.manifest.id===target.manifest.id)?.runtime?.state==='running','故障注入前原包实际运行');
-  await post(targetPath+'/deactivate');
+  await post(targetPath+'/disable');
   const entry=join(work,'state/extensions/packages',target.manifest.id,target.digest,'extension/index.mjs');
   const saved=entry+'.acceptance-save';
   await rename(entry,saved);await mkdir(entry);
   try {
-    await post(targetPath+'/activate');
+    await post(targetPath+'/enable');
     const failure=await waitFor(async()=>{
       const plugin=(await api('/api/plugins')).value.plugins.find(plugin=>plugin.manifest.id===target.manifest.id);
       return plugin?.runtime?.state==='failed'&&plugin;
@@ -427,9 +426,9 @@ async function verifyOriginalSkill(session, waitTurn) {
     const failed=await diagnose('original-debugging-failed','dsh-plugin-release-probe');
     reporter.check('Debugging 原包的失败诊断保留 daemon 实际原因，其他插件故障不终止诊断器',failed.value.ok===true
       &&failed.value.data.key.packages[0].phase==='failed'&&failed.value.data.key.packages[0].error===failure.runtime.reason,JSON.stringify(failed));
-    await post(targetPath+'/deactivate');
+    await post(targetPath+'/disable');
   } finally { await rm(entry,{recursive:true,force:true});await rename(saved,entry); }
-  await post(targetPath+'/activate');
+  await post(targetPath+'/enable');
   await waitFor(async()=>(await api('/api/plugins')).value.plugins.find(plugin=>plugin.manifest.id===target.manifest.id)?.runtime?.state==='running','恢复原包入口后重新启用');
   const recovered=await diagnose('original-debugging-recovered','dsh-plugin-release-probe');
   reporter.check('Debugging 原包重新读取恢复后的运行事实，不保留旧故障',recovered.value.ok===true&&recovered.text.includes('active')&&!recovered.text.includes('Observed load failure'),JSON.stringify(recovered));
@@ -439,7 +438,7 @@ async function verifyOriginalSkill(session, waitTurn) {
     await writeFile(join(externalProfile,'package.json'),JSON.stringify({name:'external-diagnostic-profile',private:true,dsh:{profile:{bundles:[]}},dependencies:{}}));
     await writeFile(join(externalProfile,'cordis.yml'),'[]\n');
     await writeFile(join(externalProfile,'cordis.patch.yml'),'[]\n');
-    const before=(await api('/api/plugins')).value.plugins.map(plugin=>({id:plugin.manifest.id,digest:plugin.digest,enabled:plugin.enabled,active:plugin.active}));
+    const before=(await api('/api/plugins')).value.plugins.map(plugin=>({id:plugin.manifest.id,digest:plugin.digest,enabled:plugin.enabled}));
     const dumped=await originalTool('original-debugging-external-config','Shows what a profile resolves to.',{dshHome:externalHome});
     const key=dumped.value.data?.key;
     reporter.check('Debugging 原包调用真实外部 DSH CLI 导出配置并完成 schema 检查',dumped.value.ok===true
@@ -447,12 +446,12 @@ async function verifyOriginalSkill(session, waitTurn) {
     const effect=await originalTool('original-debugging-external-effect','Classifies what a change needs to take effect:',{change:'config',dshHome:externalHome});
     reporter.check('外部 DSH 的生效诊断读取其真实空配置，未混入 Magi 的重载能力',effect.value.ok===true
       &&effect.value.data.key.mode==='restart-required'&&effect.value.data.key.hmr==='absent',JSON.stringify(effect));
-    const after=(await api('/api/plugins')).value.plugins.map(plugin=>({id:plugin.manifest.id,digest:plugin.digest,enabled:plugin.enabled,active:plugin.active}));
+    const after=(await api('/api/plugins')).value.plugins.map(plugin=>({id:plugin.manifest.id,digest:plugin.digest,enabled:plugin.enabled}));
     reporter.check('外部实例诊断保留独立配置文件且不改变 Magi 的安装与运行意愿',JSON.stringify(after)===JSON.stringify(before)
       &&JSON.parse(await readFile(join(externalProfile,'package.json'),'utf8')).name==='external-diagnostic-profile');
   }
-  await post(targetPath+'/deactivate');await post(targetPath+'/disable');await post(targetPath+'/uninstall');
-  await post(path+'/deactivate'); await post(path+'/disable'); await post(path+'/uninstall');
+  await post(targetPath+'/disable');await post(targetPath+'/uninstall');
+  await post(path+'/disable'); await post(path+'/uninstall');
 }
 
 async function verifyNativePanels(session) {
@@ -710,8 +709,7 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   await post('/api/plugins/install', { ...payload, expectedDigest: preview.digest });
   await post(`/api/plugins/${id}/enable`);
   const plugin = (await api('/api/plugins')).value.plugins.find((item) => item.manifest.id === id);
-  await post(`/api/plugins/${id}/authorize`, { grants: plugin.manifest.permissions });
-  await post(`/api/plugins/${id}/activate`);
+  await post(`/api/plugins/${id}/enable`);
   const browserAsset = await fetch(`${origin}/api/plugins/${id}/ui-v/${preview.digest}/client.js`);
   const browserAssetBytes = Buffer.from(await browserAsset.arrayBuffer());
   reporter.check('超过 5 MiB 的页面脚本经统一包校验与资源入口完整交付', browserAsset.status === 200
@@ -726,27 +724,27 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
     const reply=await post(`/api/plugins/${id}/routes`,{method:'POST',path:'/panel-package-manager',body:{manager,args,package:packageName}});
     assert.equal(reply.status,200,JSON.stringify(reply));return reply.body;
   };
-  const authorizeManagedPackage=async()=>{
+  const waitManagedPackageRunning=async()=>{
     await settingsTab('plugins');
     await page.evaluate(`(()=>{const input=document.querySelector('[data-testid=plugin-search]');input.value='';input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
-    return authorizePluginFromNative({request:async(path,body)=>{
+    return waitForInstalledPlugin({request:async(path,body)=>{
       const response=await api(path,body);assert.equal(response.status,200,JSON.stringify(response.value));return response.value;
     },page,plugin:await managedPackage()});
   };
   const installedPackage=await runManager('npm',['install',packageName+'@0.0.7','--ignore-scripts','--no-audit','--no-fund','--no-progress']);
   const installedPending=await managedPackage();
-  reporter.check('原包 npm install 保留已安装待授权回执和同一 daemon 原文件快照',installedPackage.code!==0&&installedPackage.manifest.version==='0.0.7'&&!installedPending.active&&installedPending.grants.length===0,installedPackage);
-  const installedAuthorized=await authorizeManagedPackage();
-  reporter.check('原生授权恢复 npm 已提交的同一版本，不重放包管理进程',installedAuthorized.digest===installedPending.digest&&installedAuthorized.manifest.version==='0.0.7');
+  reporter.check('原包 npm install 提交即启用，并保持同一 daemon 原文件快照',installedPackage.code===0&&installedPackage.manifest.version==='0.0.7'&&installedPending.enabled,installedPackage);
+  const installedAuthorized=await waitManagedPackageRunning();
+  reporter.check('npm 提交的同一版本直接运行，不重放包管理进程',installedAuthorized.digest===installedPending.digest&&installedAuthorized.manifest.version==='0.0.7');
   const updatedPackage=await runManager('pnpm',['add',packageName+'@0.0.8','--ignore-scripts','--reporter=append-only','--yes']);
   const updatedPending=await managedPackage();
-  reporter.check('原包 pnpm add 在线提交新版并保留未代授的原文件快照',updatedPackage.code!==0&&updatedPackage.manifest.version==='0.0.8'&&updatedPending.manifest.version==='0.0.8'&&!updatedPending.active&&updatedPending.grants.length===0,updatedPackage);
-  await authorizeManagedPackage();
+  reporter.check('原包 pnpm add 在线提交新版并保持启用，原文件快照一致',updatedPackage.code===0&&updatedPackage.manifest.version==='0.0.8'&&updatedPending.manifest.version==='0.0.8'&&updatedPending.enabled,updatedPackage);
+  await waitManagedPackageRunning();
   const beforeFailure=await managedPackage();
-  reporter.check('原生授权恢复 pnpm 新摘要并运行，无需重复更新',beforeFailure.digest===updatedPending.digest&&beforeFailure.manifest.version==='0.0.8'&&beforeFailure.runtime.state==='running');
+  reporter.check('pnpm 新摘要直接运行，无需重复更新',beforeFailure.digest===updatedPending.digest&&beforeFailure.manifest.version==='0.0.8'&&beforeFailure.runtime.state==='running');
   const failedPackage=await runManager('npm',['install',packageName+'@9999.0.0','--ignore-scripts']);
   const afterFailure=await managedPackage();
-  reporter.check('标准包管理失败返回原命令错误，旧摘要、授权及运行代次保持',failedPackage.code!==0&&failedPackage.stderr.length>0&&failedPackage.manifest.version==='0.0.8'&&afterFailure.digest===beforeFailure.digest&&afterFailure.runtime.generation===beforeFailure.runtime.generation&&JSON.stringify(afterFailure.grants)===JSON.stringify(beforeFailure.grants),failedPackage);
+  reporter.check('标准包管理失败返回原命令错误，旧摘要及运行代次保持',failedPackage.code!==0&&failedPackage.stderr.length>0&&failedPackage.manifest.version==='0.0.8'&&afterFailure.digest===beforeFailure.digest&&afterFailure.runtime.generation===beforeFailure.runtime.generation,failedPackage);
   const removedPackage=await runManager('npm',['uninstall',packageName,'--ignore-scripts']);
   reporter.check('原包 npm uninstall 经同一排空入口移除目标且不留下投影残留',removedPackage.code===0&&removedPackage.manifest===null&&!await managedPackage(),removedPackage);
   const managedDirectory=join(work,'state/extensions/data',id,'profiles/magi');
@@ -1163,14 +1161,14 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
     await frame.evaluate(`window.__clientInstance===${JSON.stringify(clientInstance)}&&window.__remoteCalls['panel-closed'].state==='completed:panel-closed'`));
   const settings = (await api(`/api/plugins/${id}/settings`)).value;
   await post(`/api/plugins/${id}/settings`, { expectedVersion: settings.version, value: { startupUrl: gateUrl } }, 'PUT');
-  await post(`/api/plugins/${id}/deactivate`);
+  await post(`/api/plugins/${id}/disable`);
   await waitFor(async () => !await ui.exists(`iframe[data-plugin-id="${id}"]`), '停用回收右栏面板');
   reporter.check('停用后右栏不保留可调用的旧插件 iframe', true);
   const stoppedStream = await api(`/api/plugins/${id}/routes`, { method:'POST', path:'/__magi_compat/streams', body:{action:'open',request:{method:'GET',path:'/panel-events'}} });
   reporter.check('停用后事件连接沿同一 daemon 准入拒绝重连', stoppedStream.status === 409);
   frame?.close(); frame = null;
   holdStart = true;
-  await post(`/api/plugins/${id}/activate`);
+  await post(`/api/plugins/${id}/enable`);
   const stateSelector = `[data-testid="plugin-view-runtime"][data-plugin-id="${id}"]`;
   await waitFor(() => heldStarts.size > 0, '后台等待真实异步初始化');
   await waitFor(() => ui.exists(stateSelector), '共享页面宿主显示启动状态');
@@ -1208,7 +1206,7 @@ window.__ModuleLoader__.load({id:'native-panels',factory(require){
   reporter.check('同版重新启用后的原页面可显式重试旧文本操作，沿同一 daemon 身份读取且不另起模型',
     textAfter.length===1&&textAfter[0].turnId===textBefore.turnId&&textAfter[0].modelSteps.length===textBefore.modelSteps.length);
   await snapshot('panel-restarted');
-  await post(`/api/plugins/${id}/deactivate`);
+  await post(`/api/plugins/${id}/disable`);
   await waitFor(async () => !await ui.exists(`iframe[data-plugin-id="${id}"]`), '再次停用回收客户端');
   frame.close(); frame = null;
   const persistedTurns=await currentTurns();
@@ -1255,8 +1253,6 @@ async function verifySessionDirectory(session) {
     const preview = await post('/api/plugins/preview', payload);
     await post('/api/plugins/install', { ...payload, expectedDigest: preview.digest });
     await post(`/api/plugins/${id}/enable`);
-    await post(`/api/plugins/${id}/authorize`, { grants: manifest.permissions });
-    await post(`/api/plugins/${id}/activate`);
     await waitFor(async () => (await api('/api/plugins')).value.plugins.find(p=>p.manifest.id===id)?.runtime?.state==='running', id);
     return id;
   };
@@ -1278,12 +1274,8 @@ async function verifySessionDirectory(session) {
   reporter.check('完全信任插件缺少会话目录独立授权时仍被 daemon 拒绝', missingGrant.status===403 && missingGrant.body.kind==='PermissionDenied');
   const invalid = await read(allowed, {limit:201});
   reporter.check('会话目录超限请求明确失败', invalid.status===403 && invalid.body.message.includes('InvalidParams'));
-  await post(`/api/plugins/${allowed}/authorize`, {grants:[{kind:'extension',targets:['full-trust']}]});
-  const revoked = await api(`/api/plugins/${allowed}/routes`, {method:'POST',path:'/directory',body:{}});
-  reporter.check('撤销会话目录授权后旧插件路由不可继续读取', revoked.status===409 || revoked.status===403);
   for (const id of [allowed, denied]) {
     const item = (await api('/api/plugins')).value.plugins.find((plugin) => plugin.manifest.id === id);
-    if (item?.active) await post(`/api/plugins/${id}/deactivate`);
     if (item?.enabled) await post(`/api/plugins/${id}/disable`);
   }
 }
@@ -1517,14 +1509,12 @@ try {
   const row = `[data-testid="plugin-row"][data-plugin-id="${pluginId}"]`;
   await waitFor(() => ui.exists(row), '已安装插件');
   await ui.click(row);
-  await waitFor(() => ui.exists('[data-action="activate"]'), '授权激活按钮');
-  await ui.click('[data-action="activate"]');
   await waitFor(async () => {
     const plugin = await installed();
     if (plugin?.runtime?.state === 'failed') throw new Error(plugin.runtime.reason);
     return plugin?.runtime?.state === 'running';
   }, 'DSH 宿主就绪', 30_000);
-  reporter.check('通过界面授权后运行真实 Cordis 插件', true);
+  reporter.check('安装完成即启用并运行真实 Cordis 插件', true);
   const peer = await post(`/api/plugins/${pluginId}/routes`, { method: 'GET', path: '/cordis-peer' });
   reporter.check('实际宿主的 Cordis ESM、CJS 子路径与 Service 均使用同一隔离版本',
     peer.status === 200 && peer.body.esm === '4.0.5-alpha.2' && peer.body.cjs === peer.body.esm && peer.body.service === peer.body.esm, JSON.stringify(peer));
@@ -1646,7 +1636,7 @@ try {
   await settingsTab(`plugin:${pluginId}:settings`);
   await waitFor(() => ui.exists('[data-testid="plugin-page-header"] input[role=switch]'), '插件启用开关');
   await ui.click('[data-testid="plugin-page-header"] input[role=switch]');
-  await waitFor(async () => !(await installed()).active, '停用');
+  await waitFor(async () => !(await installed()).enabled, '停用');
   reporter.check('界面停用回收动态工具、技能和模型来源', (await installed()).manifest.contributions.tools.length === 0
     && !(await activeSkills()).some(skill=>skill.pluginId===pluginId)
     && !(await api('/api/settings/models/catalog')).value.groups.some((group) => group.pluginId === pluginId));
@@ -1659,10 +1649,10 @@ try {
   await settingsTab('plugins');
   await waitFor(() => ui.exists(row), '停用后的插件列表');
   await ui.click(row);
-  await waitFor(() => ui.exists('[data-action="activate"]'), '重新激活按钮');
-  await ui.click('[data-action="activate"]');
-  await waitFor(async () => (await installed()).runtime?.state === 'running', '重新激活');
-  reporter.check('重新激活恢复持久配置并建立新运行目录', (await api(`/api/plugins/${pluginId}/settings`)).value.value.label === 'changed');
+  await waitFor(() => ui.exists('[data-action="enable"]'), '重新启用按钮');
+  await ui.click('[data-action="enable"]');
+  await waitFor(async () => (await installed()).runtime?.state === 'running', '重新启用');
+  reporter.check('重新启用恢复持久配置并建立新运行目录', (await api(`/api/plugins/${pluginId}/settings`)).value.value.label === 'changed');
   const unsupported = join(work, 'unsupported');
   await mkdir(unsupported);
   await writeFile(join(unsupported, 'package.json'), JSON.stringify({ name: 'unsupported-dsh', version: '1.0.0', type: 'module', main: 'index.js', dsh: { bundle: {} } }));

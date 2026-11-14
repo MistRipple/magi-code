@@ -49,26 +49,19 @@ export async function upgradePluginFromNative({ request, page, plugin, version, 
   const current = async () => (await request('/api/plugins')).plugins.find(item => item.manifest.id === id);
   await preview(); await ui.click('[data-action=cancel-candidate]');
   const cancelled = await current();
-  check('selfUpdateCancelled', '取消原生在线更新保留原包摘要、授权和当前实例', cancelled.digest === plugin.digest
-    && cancelled.active && cancelled.runtime.instanceId === plugin.runtime.instanceId
-    && JSON.stringify(cancelled.grants) === JSON.stringify(plugin.grants));
+  check('selfUpdateCancelled', '取消原生在线更新保留原包摘要和当前实例', cancelled.digest === plugin.digest
+    && cancelled.enabled && cancelled.runtime.instanceId === plugin.runtime.instanceId);
   await preview(); await ui.click('[data-action=confirm-candidate]');
   const pending = await waitFor(async () => { const value = await current(); return value?.manifest.version === version && value; }, '提交实际在线新版', 240_000);
-  check('selfUpdateCommitted', '原生在线更新提交新摘要并明确等待新版授权', pending.digest !== plugin.digest && pending.enabled && !pending.active && pending.grants.length === 0);
-  const installed = await authorizePluginFromNative({ request, page, plugin: pending });
-  check('selfUpdateActivated', '原生授权启用同一新版且旧宿主实例已回收', installed.digest === pending.digest && installed.runtime.instanceId !== plugin.runtime.instanceId);
+  check('selfUpdateCommitted', '原生在线更新提交新摘要并保持启用', pending.digest !== plugin.digest && pending.enabled);
+  const installed = await waitForInstalledPlugin({ request, page, plugin: pending });
+  check('selfUpdateActivated', '同一新版运行且旧宿主实例已回收', installed.digest === pending.digest && installed.runtime.instanceId !== plugin.runtime.instanceId);
   return installed;
 }
 
-// 验收只通过用户现有入口授权，不修改清单或用测试 API 代授。
-export async function authorizePluginFromNative({ request, page, plugin }) {
-  const ui = pageTools(page), id = plugin.manifest.id;
-  if (!await page.evaluate('Boolean(document.querySelector("[data-testid=settings-page]")?.getClientRects().length)')) await ui.click('[data-testid=sidebar-settings]');
-  await waitFor(() => ui.exists('[data-testid=settings-nav-plugins]'), '原生插件管理入口');
-  await ui.click('[data-testid=settings-nav-plugins]');
-  const row = `[data-testid=plugin-row][data-plugin-id=${JSON.stringify(id)}]`;
-  await waitFor(() => ui.exists(row), '待授权的实际安装'); await ui.click(row);
-  await waitFor(() => ui.exists('[data-action=activate]'), '原生授权与激活操作'); await ui.click('[data-action=activate]');
+// 安装完成即启用；验收只等待同一安装的宿主真实运行，不再有授权或激活步骤。
+export async function waitForInstalledPlugin({ request, plugin }) {
+  const id = plugin.manifest.id;
   return waitFor(async () => (await request('/api/plugins')).plugins.find(value => value.manifest.id === id
-    && value.digest === plugin.digest && value.active && value.runtime?.state === 'running'), '用户授权后同一安装运行', 120_000);
+    && value.digest === plugin.digest && value.enabled && value.runtime?.state === 'running'), '同一安装运行', 120_000);
 }

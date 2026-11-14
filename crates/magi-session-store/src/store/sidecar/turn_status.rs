@@ -51,8 +51,7 @@ impl SessionStore {
             },
             |state, updated| {
                 let (sidecar_index, candidate) = updated?;
-                state.execution_sidecar_store.runtime_sidecars[sidecar_index] =
-                    candidate.into();
+                state.execution_sidecar_store.runtime_sidecars[sidecar_index] = candidate.into();
                 Some(state.project_sidecar(
                     &state.execution_sidecar_store.runtime_sidecars[sidecar_index],
                 ))
@@ -458,9 +457,8 @@ impl SessionStore {
                         .expect("current turn was set"),
                     None,
                 )?;
-                canonical_plan
-                    .mutations
-                    .extend(super::super::agent_turns::interrupted_descendant_turns(
+                canonical_plan.mutations.extend(
+                    super::super::agent_turns::interrupted_descendant_turns(
                         self,
                         state,
                         session_id,
@@ -469,7 +467,8 @@ impl SessionStore {
                             .as_ref()
                             .expect("current turn")
                             .turn_id,
-                    )?);
+                    )?,
+                );
                 Ok(CanonicalCommitPlan {
                     mutations: canonical_plan.mutations,
                     value: Some((

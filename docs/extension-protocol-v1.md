@@ -109,11 +109,11 @@ daemon 响应形状：
 | `session.snapshot` | `api.session.snapshot(input)` | 仅签发会话；`sessionId?`、`afterTurnSeq?`、`limit?`；最多 10 Turn，每 Turn 最多 20 条截断文本 |
 | `session.message` | `api.session.message(input)` | 协商 `session.messages`，输入与回执为 `PluginSessionMessageRequest/Receipt`。需要独立 `sessionWrite:["context"]` 或 `["wake"]` 授权，仅写当前有效调用所属的主会话；daemon 注入的真实 Task、Turn 与执行租约必须一致。子任务拒绝；计划作业只能提供 context，不能借 wake 绕过模型预算。正文保存插件来源和稳定身份，不能冒充用户／系统或指定其他会话；不提供后台入口 |
 | `session.directory` | `api.session.directory(input?)` | 需协商 `session.directory` 及独立 `sessionRead:["directory"]` 授权。按当前实例读取 daemon 用户会话目录，不要求活动 Turn；输入 `PluginSessionDirectoryRequest`，输出 `PluginSessionDirectory`。按 sessionId 升序分页，每页 1–200 条（默认 100），可筛选 workspaceId；仅身份、标题、项目归属与创建/更新时间，不含外部工具会话、消息、文件路径或凭据。末页游标为 null；跨页并非事务快照，调用者需按身份处理期间新增/删除。旧版本、停用、撤权、排空及失效实例拒绝 |
-| `plugins.list` | `api.plugins.list()` | 读取 daemon 的既有 `PluginList` 目录投影，每次校验当前插件包、激活状态及实例租约；不包含配置、资源或凭据 |
+| `plugins.list` | `api.plugins.list()` | 读取 daemon 的既有 `PluginList` 目录投影，每次校验当前插件包、启用状态及实例租约；不包含配置、资源或凭据 |
 | `plugins.changed`（通知） | `api.plugins.onChanged(listener)` | 协商 `plugin.directory.events`；daemon 在安装目录或运行状态变化时发送无载荷的失效通知，返回值为解除订阅函数；消费者重新调用 plugins.list，不由通知构造安装或运行事实 |
 | `plugins.compatibility`／`plugins.setVersionExemption` | `api.plugins.compatibility()`／`setVersionExemption(input)` | 需协商 `plugin.management`。读取要求活动宿主租约；写入另需 `pluginManagement:["compatibility"]`，使用 `PluginDshVersionExemptionRequest` 的精确 target、当前 runtimeVersion／runtimeId、revision CAS 和显式风险确认。安装／升级提交前重验，撤销后旧译包不能继续提交 |
 | `plugins.preview/install` | `api.plugins.preview(input)`／`install(input)` | 需协商 `plugin.management` 与 `pluginManagement:["install"]` 授权；复用 `PluginUpstreamRequest`、预览与安装入口，返回既有预览／目录 DTO；仅支持已接入的上游生态。安装必须指定精确版本与预览摘要；自身更新转入下述 daemon 安装任务及受限重新授权，其他目标不代授权 |
-| `plugins.installBundle/cancelInstall` | `api.plugins.installBundle(input)`／`cancelInstall(requestId)` | 另协商 `plugin.installations`，使用 `PluginBundleInstall*` DTO；由 daemon 完成在线版本解析、准备、安装／升级及请求的启停，返回实际应用结果。两者均需 install 授权，后台调用另需 background；启停及代授新版本分别核对 lifecycle、authorize 委托 |
+| `plugins.installBundle/cancelInstall` | `api.plugins.installBundle(input)`／`cancelInstall(requestId)` | 另协商 `plugin.installations`，使用 `PluginBundleInstall*` DTO；由 daemon 完成在线版本解析、准备、安装／升级及请求的启停，返回实际应用结果。两者均需 install 授权，后台调用另需 background；与请求不一致的启停另核对 lifecycle 委托 |
 | `plugins.reconcile` | `api.plugins.reconcile({pluginIds})` | 协商 `plugin.reconciliation`，需 `pluginManagement:["lifecycle"]`，后台另需 background。输入 `PluginReconcileRequest`（至多 512 个唯一已安装 ID），沿 daemon 原监管器收敛已提交的激活意图并等待所选活动扩展真实就绪；所有目标共用 110 秒预算。返回既有目录 DTO；停用项保持停用，未变化实例保持代次，缺少监管器、启动失败、排空、版本／激活变化、过期租约和撤权明确失败。不授予权限、不重新安装、不清空故障或强制重启 |
 | `plugins.setEnabled/remove` | `api.plugins.setEnabled(pluginId,enabled,expectedDigest?,options?)`／`remove(pluginId,expectedDigest?)` | 需协商 `plugin.management` 与 `pluginManagement:["lifecycle"]`；复用 HTTP 的生命周期、排空与停止端口。启停输入为 `PluginSetEnabledRequest`；options 可带 `reason`（仅停用，1–4096 字节）及 `expectedState`，后者须与 expectedDigest 一起提交。daemon 注入停用者身份，与 enabled/active 原子保存；启用及显式停用会清除旧来源。排空前后比较相同摘要及启停来源，过期恢复拒绝。拒绝当前发起插件的自身停止或删除；自身在线更新沿安装任务完成。启用后等待真实宿主运行状态，启动失败不返回成功 |
 | `plugins.finishChange` | `api.plugins.finishChange({changeId,commit})` | 协商 `plugin.changes`，需 lifecycle，后台另需 background。`remove` 第三个参数和 `installBundle` 输入可携带同一 changeId；使用 `PluginRemoveRequest`、`PluginManagementChangeRequest/Receipt`。移除原安装由 daemon 暂存恢复引用；失败结算恢复尚未提交候选的原安装并等待原活动扩展运行，回执 `restored` 列出本次真实恢复的 ID。成功结算确认独立卸载；已提交候选不会回退。身份绑定当前调用者包摘要和实例，不能结算其他实例的操作 |
@@ -129,8 +129,8 @@ daemon 响应形状：
 | `host.log` | `api.log(message)` | 最多 4096 字符的诊断通知，不写 canonical 日志 |
 
 需要在关闭页面后保持事件订阅的隔离客户端，可声明 `contributions.client.entry` 并申请
-`client:["persistent"]`。入口必须属于同一清单的 views；daemon 激活投影决定其挂载和销毁，
-Renderer 不自行延长插件激活。每个工作台窗口为该插件持有一个客户端文档，设置和右栏
+`client:["persistent"]`。入口必须属于同一清单的 views；daemon 启用投影决定其挂载和销毁，
+Renderer 不自行延长插件启用。每个工作台窗口为该插件持有一个客户端文档，设置和右栏
 切换通过保留文档的物理挂载与视图上下文切换完成，不重新运行上游 apply。无可见入口时
 停放在不参与布局、焦点或辅助技术导航的容器中，业务订阅继续；停用、撤权和包摘要变更
 销毁旧文档、关闭事件连接并废弃迟到回执。该合同不会代替 composer、attachments 或
@@ -156,7 +156,7 @@ DSH `profileContext.packageManager` 提供插件实例拥有的内部 Node 命�
 
 当前 profile 的 `dsh plugin add/remove` 命令同样进入公共管理边界。单条命令终止会阻止排队中或目录读取后的新业务调用；已发起的安装按其 requestId 取消，进入提交后的真实回执仍沿安装任务合同结算。命令终止不取消父请求、其他命令或父请求已有的配置提案，同一请求可以显式重试；不将命令自身的取消信号序列化到 daemon DTO。
 
-标准 npm／pnpm 的单包 install／add／uninstall／remove，在 cwd 或明确的 --prefix／--dir／-C 指向当前 profile（含物理别名）时进入同一边界；Node 启动 npm-cli.js 或 pnpm 脚本也沿相同识别。未提供目标、重复目录和未支持参数明确失败，不运行真实包管理来写投影目录、锁文件或 node_modules。其他目录保留真实进程行为。静态准备为延迟执行的包管理声明 install／lifecycle／authorize／background 委托，普通截图等子进程不增加这些权限；运行时仍逐次核对 daemon 授权和当前实例。
+标准 npm／pnpm 的单包 install／add／uninstall／remove，在 cwd 或明确的 --prefix／--dir／-C 指向当前 profile（含物理别名）时进入同一边界；Node 启动 npm-cli.js 或 pnpm 脚本也沿相同识别。未提供目标、重复目录和未支持参数明确失败，不运行真实包管理来写投影目录、锁文件或 node_modules。其他目录保留真实进程行为。静态准备为延迟执行的包管理声明 install／lifecycle／background 委托，普通截图等子进程不增加这些权限；运行时仍逐次核对 daemon 授权和当前实例。
 
 原包管理服务在一次调用快照内首次移除时生成 changeId，随后安装复用同一身份；调用成功结算独立卸载，失败、异常或取消则要求 daemon 恢复尚未提交候选的移除。原安装记录（含来源、摘要、授权、启停来源和意愿）转为 PluginManager 同一状态中的待结算记录，归档不复制、不删除；当前目录如实不包含已移除目标，其他调用不能占用它。候选提交复用原版本切换及数据重置日志，原恢复引用随同一次提交移除，不绕过数据版本或新摘要授权。实例结束或 daemon 重启恢复未结算原安装，不重新下载、授权、执行安装或回放插件业务；之后由原监管器按原激活意愿启动。调用失败的页面错误附带已恢复说明；结算或运行未确认时明确要求检查当前状态，不声称业务已成功，也不自动重试。
 
@@ -168,7 +168,7 @@ DSH `profileContext.packageManager` 提供插件实例拥有的内部 Node 命�
 
 准备阶段在线解析 npm 精确版本、标签或范围并保留原包身份与 integrity，最多 840 秒；取消返回 `cancelled` 前停止该准备流程及受控翻译子进程，不能提交候选版本。进入应用阶段后返回 `too-late`，daemon 继续结算实际结果；已结算或非本实例任务返回 `not-running`。`application:applied` 只有在请求的安装及启停完成后返回；安装已提交但启用失败返回 `failed`、`installed:true`、`stage:enable`，缺少独立授权时带 `authorization-required`，调用方应引导用户处理权限，不能再次伪装为安装未发生。不执行 npm 安装脚本。
 
-自身在线更新复用同一持久安装任务。daemon 在提交前核对 install／lifecycle／authorize（后台另需 background）、候选来源及兼容准入；候选权限必须全部属于当前已批范围，数据重置拒绝，保持原启用意愿且不接受 changeId 或停用请求。原租约核对与关闭准入原子完成，排空后再次比较原安装状态并复核兼容准入，用户撤权或替换优先。daemon 随后为新摘要重新授权并等待新版就绪；旧宿主结束不取消已进入提交的任务，也不能再操作新版。新文档读取实际目录和运行状态，不依赖旧调用接收回执；摘要变化后的新实例不得自动重发旧请求。提交前失败保留原安装，已提交后按真实授权和运行状态结算，不回退旧代码；中断恢复沿上述安装日志合同。
+自身在线更新复用同一持久安装任务。daemon 在提交前核对 install／lifecycle（后台另需 background）、候选来源及兼容准入；候选权限必须全部属于当前版本已声明的范围，数据重置拒绝，保持原启用意愿且不接受 changeId 或停用请求。原租约核对与关闭准入原子完成，排空后再次比较原安装状态并复核兼容准入，用户停用或替换优先。daemon 随后提交新摘要（保持原启用状态）并等待新版就绪；旧宿主结束不取消已进入提交的任务，也不能再操作新版。新文档读取实际目录和运行状态，不依赖旧调用接收回执；摘要变化后的新实例不得自动重发旧请求。提交前失败保留原安装，已提交后按真实运行状态结算，不回退旧代码；中断恢复沿上述安装日志合同。
 
 插件私有页面的路由请求可携带可选 `headers`（`PluginRouteCallRequest`）。只转交页面自己提供的应用头，不转交 Magi HTTP 请求的 Cookie、凭据和 Origin；Host、Origin、Cookie、代理与传输控制头禁止覆盖。DSH 原生页面的 localStorage/sessionStorage 由 iframe 消息桥按插件 ID 隔离代理，仅保存浏览器 profile 内的界面缓存；插件业务配置仍走 daemon 设置 CAS。右栏导航仅能打开当前激活插件清单声明的右栏视图。
 
@@ -216,7 +216,7 @@ DSH 页面里的 `EventSource` 通过相同路由调用承载 SSE。兼容层保
 
 初始化阶段的动态目录仅供本实例校验与绑定，`host.ready` 后才进入对外贡献投影。动态目录不写入安装包或持久设置，重启后重新提交。daemon 为每个实例签发独立租约：旧实例不能修改新目录、标记新实例就绪或清理新来源。停用或撤权一经提交，旧租约永久失效；重新授权并激活也不能恢复它。
 
-同一插件只激活一个包摘要。停用、撤权、升级先关闭准入并停止旧宿主；注册随实例释放。没有独立的持久动态注册表，也没有通配远程目录注册。
+同一插件只运行一个包摘要。停用、卸载、升级先关闭准入并停止旧宿主；注册随实例释放。没有独立的持久动态注册表，也没有通配远程目录注册。
 
 `api.onConfig(listener)` 按通知顺序交付 `{version,value}`，`api.onDispose(disposer)` 注册回收动作；两者返回取消监听函数。入口也可返回一个 disposer 或 `{dispose}`。`api.settings.onValidate(handler)` 只能注册一个校验器；它补充 daemon 的 JSON Schema 校验。`api.fail(error)` 报告无法继续的运行失败，由原宿主监管回收并按既有策略处理。
 

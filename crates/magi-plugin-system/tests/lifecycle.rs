@@ -43,7 +43,7 @@ fn removal_scope() -> magi_plugin_system::PluginChangeScope {
 }
 
 fn recoverable_remove(manager: &Arc<Mutex<PluginManager>>) {
-    let drain = PluginManager::begin_upgrade_drain(Arc::clone(manager), "acme.lifecycle").unwrap();
+    let drain = PluginManager::begin_drain(Arc::clone(manager), "acme.lifecycle").unwrap();
     let mut guard = manager.lock().unwrap();
     guard
         .remove_for_change("acme.lifecycle", removal_scope(), &drain)
@@ -66,9 +66,6 @@ fn management_removal_failure_and_restart_restore_original_identity_and_data_wit
             },
         )
         .unwrap();
-    manager.enable("acme.lifecycle").unwrap();
-    manager.authorize("acme.lifecycle", vec![grant()]).unwrap();
-    manager.activate("acme.lifecycle").unwrap();
     manager
         .write_resource("acme.lifecycle", "cache", 0, json!({"preserve":true}))
         .unwrap();
@@ -123,7 +120,7 @@ fn management_removal_failure_and_restart_restore_original_identity_and_data_wit
         "restart already settled only the uncommitted removal"
     );
     let manager = Arc::new(Mutex::new(reopened));
-    let drain = PluginManager::begin_upgrade_drain(Arc::clone(&manager), "acme.lifecycle").unwrap();
+    let drain = PluginManager::begin_drain(Arc::clone(&manager), "acme.lifecycle").unwrap();
     let disabled = {
         let mut guard = manager.lock().unwrap();
         guard
@@ -172,8 +169,7 @@ fn management_removal_failure_and_restart_restore_original_identity_and_data_wit
 }
 
 #[test]
-fn management_replacement_uses_upgrade_data_and_authorization_boundary_and_never_rolls_back_committed_version()
- {
+fn management_replacement_uses_upgrade_data_boundary_and_never_rolls_back_committed_version() {
     let root = tempdir().unwrap();
     let mut value = manifest(true);
     value["contributions"]["resources"] = json!([{"id":"cache","title":"Cache","description":""}]);
@@ -189,9 +185,6 @@ fn management_replacement_uses_upgrade_data_and_authorization_boundary_and_never
     };
     let mut manager = PluginManager::open(root.path()).unwrap();
     manager.install(&old, source.clone()).unwrap();
-    manager.enable("acme.lifecycle").unwrap();
-    manager.authorize("acme.lifecycle", vec![grant()]).unwrap();
-    manager.activate("acme.lifecycle").unwrap();
     manager
         .write_resource("acme.lifecycle", "cache", 0, json!({"old":true}))
         .unwrap();
@@ -227,8 +220,6 @@ fn management_replacement_uses_upgrade_data_and_authorization_boundary_and_never
         let current = &guard.state().plugins["acme.lifecycle"];
         assert_eq!(current.digest, new.digest());
         assert!(current.enabled);
-        assert!(!current.active);
-        assert!(current.grants.is_empty());
         assert!(!guard.has_resource_data("acme.lifecycle"));
         assert!(
             guard
@@ -417,7 +408,7 @@ fn repository_upgrades_keep_source_identity_and_commit_in_the_same_installation_
 }
 
 #[test]
-fn install_enable_authorize_activate_and_reopen_use_one_immutable_package() {
+fn install_enables_and_reopen_uses_one_immutable_package() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();
     let package = package(true);
@@ -429,35 +420,31 @@ fn install_enable_authorize_activate_and_reopen_use_one_immutable_package() {
             },
         )
         .unwrap();
-    assert!(manager.activate("acme.lifecycle").is_err());
-    manager.enable("acme.lifecycle").unwrap();
-    assert!(manager.activate("acme.lifecycle").is_err());
-    manager
-        .authorize(
-            "acme.lifecycle",
-            vec![magi_plugin_system::PluginPermission {
-                kind: magi_plugin_system::PluginPermissionKind::Storage,
-
-                targets: vec!["cache".into()],
-            }],
-        )
-        .unwrap();
-    let active = manager.activate("acme.lifecycle").unwrap();
-    assert_eq!(active.digest, package.digest());
-    assert_eq!(manager.active().len(), 1);
-    assert!(manager.disable("acme.lifecycle").is_err());
-    manager.deactivate("acme.lifecycle").unwrap();
+    let enabled = manager.enabled_plugins();
+    assert_eq!(enabled.len(), 1);
+    assert_eq!(enabled[0].digest, package.digest());
+    assert!(manager.is_enabled("acme.lifecycle").unwrap());
     manager.disable("acme.lifecycle").unwrap();
+    assert!(manager.enabled_plugins().is_empty());
+    assert!(!manager.is_enabled("acme.lifecycle").unwrap());
+    manager.enable("acme.lifecycle").unwrap();
     let reopened = PluginManager::open(root.path()).unwrap();
     assert_eq!(
         reopened.package("acme.lifecycle").unwrap().digest(),
         package.digest()
     );
-    reopened.state();
+    assert!(reopened.is_enabled("acme.lifecycle").unwrap());
+}
+
+fn uninstall_now(manager: &Arc<Mutex<PluginManager>>, id: &str) {
+    let drain = PluginManager::begin_drain(Arc::clone(manager), id).unwrap();
+    let mut guard = manager.lock().unwrap();
+    guard.uninstall(id, &drain).unwrap();
+    drain.commit(&mut guard);
 }
 
 #[test]
-fn lifecycle_rejects_out_of_manifest_grants_and_uninstall_while_enabled() {
+fn uninstall_works_from_any_state_but_only_with_the_plugin_drained() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();
     manager
@@ -468,17 +455,32 @@ fn lifecycle_rejects_out_of_manifest_grants_and_uninstall_while_enabled() {
             },
         )
         .unwrap();
-    let grant = magi_plugin_system::PluginPermission {
-        kind: magi_plugin_system::PluginPermissionKind::Storage,
-
-        targets: vec!["undeclared-resource".into()],
-    };
-    assert!(manager.authorize("acme.lifecycle", vec![grant]).is_err());
-    manager.enable("acme.lifecycle").unwrap();
-    assert!(manager.uninstall("acme.lifecycle").is_err());
-    manager.disable("acme.lifecycle").unwrap();
-    manager.uninstall("acme.lifecycle").unwrap();
-    assert!(manager.package("acme.lifecycle").is_err());
+    let manager = Arc::new(Mutex::new(manager));
+    // 启用中直接卸载：不要求先停用。
+    assert!(
+        manager
+            .lock()
+            .unwrap()
+            .is_enabled("acme.lifecycle")
+            .unwrap()
+    );
+    uninstall_now(&manager, "acme.lifecycle");
+    assert!(manager.lock().unwrap().package("acme.lifecycle").is_err());
+    // 停用状态同样可以卸载。
+    manager
+        .lock()
+        .unwrap()
+        .install(
+            &package(false),
+            PluginSource::Address {
+                url: "https://example.invalid/p.zip".into(),
+            },
+        )
+        .unwrap();
+    manager.lock().unwrap().disable("acme.lifecycle").unwrap();
+    uninstall_now(&manager, "acme.lifecycle");
+    assert!(manager.lock().unwrap().package("acme.lifecycle").is_err());
+    // 卸载必须持有该插件的排空标记（类型签名强制），后台停止后才提交移除。
 }
 
 fn upgrade_with_drain(
@@ -486,8 +488,7 @@ fn upgrade_with_drain(
     package: &PluginPackage,
     name: &str,
 ) -> Result<(), PluginError> {
-    let drain =
-        PluginManager::begin_upgrade_drain(Arc::clone(manager), package.manifest().id.as_str())?;
+    let drain = PluginManager::begin_drain(Arc::clone(manager), package.manifest().id.as_str())?;
     let result =
         manager
             .lock()
@@ -512,7 +513,7 @@ fn grant() -> PluginPermission {
 }
 
 #[test]
-fn upgrade_drains_the_plugin_then_keeps_enablement_but_not_activation_or_grants() {
+fn upgrade_drains_the_plugin_then_keeps_the_enabled_state() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();
     let first = package(true);
@@ -524,14 +525,11 @@ fn upgrade_drains_the_plugin_then_keeps_enablement_but_not_activation_or_grants(
             },
         )
         .unwrap();
-    manager.enable("acme.lifecycle").unwrap();
-    manager.authorize("acme.lifecycle", vec![grant()]).unwrap();
-    manager.activate("acme.lifecycle").unwrap();
     let manager = Arc::new(Mutex::new(manager));
     let second = version_two();
 
-    // 停用和升级都关闭整插件准入，可共享同一个排空凭据。
-    let single = PluginManager::begin_deactivation(Arc::clone(&manager), "acme.lifecycle").unwrap();
+    // 停用、卸载和升级都关闭整插件准入，可共享同一个排空凭据。
+    let single = PluginManager::begin_drain(Arc::clone(&manager), "acme.lifecycle").unwrap();
     manager
         .lock()
         .unwrap()
@@ -555,10 +553,8 @@ fn upgrade_drains_the_plugin_then_keeps_enablement_but_not_activation_or_grants(
         "1.1.0"
     );
     let installed = &manager.state().plugins["acme.lifecycle"];
-    assert!(installed.enabled, "启用意愿跨升级保留");
-    assert!(!installed.active, "新包必须重新激活");
-    assert!(installed.grants.is_empty(), "授权绑定摘要，不跨版本继承");
-    assert!(!manager.is_active("acme.lifecycle").unwrap());
+    assert!(installed.enabled, "启用状态跨升级保留");
+    assert!(manager.is_enabled("acme.lifecycle").unwrap());
 }
 
 #[test]
@@ -584,13 +580,9 @@ fn data_schema_change_clears_stored_data_and_is_announced_by_the_preview() {
     let next = package_from_manifest(changed);
 
     // 有持久数据时升级成功，但该插件的数据被清空；预览阶段已标记 data_reset。
-    manager.enable("acme.lifecycle").unwrap();
-    manager.authorize("acme.lifecycle", vec![grant()]).unwrap();
-    manager.activate("acme.lifecycle").unwrap();
     manager
         .write_resource("acme.lifecycle", "cache", 0, json!({"k": 1}))
         .unwrap();
-    manager.deactivate("acme.lifecycle").unwrap();
     manager.disable("acme.lifecycle").unwrap();
     let manager = Arc::new(Mutex::new(manager));
     assert!(
@@ -639,7 +631,7 @@ fn data_schema_change_clears_stored_data_and_is_announced_by_the_preview() {
 }
 
 #[test]
-fn upgrade_drain_blocks_activation_until_it_is_released() {
+fn upgrade_drain_blocks_enabling_until_it_is_released() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();
     manager
@@ -650,16 +642,15 @@ fn upgrade_drain_blocks_activation_until_it_is_released() {
             },
         )
         .unwrap();
-    manager.enable("acme.lifecycle").unwrap();
     let manager = Arc::new(Mutex::new(manager));
-    let drain = PluginManager::begin_upgrade_drain(Arc::clone(&manager), "acme.lifecycle").unwrap();
+    let drain = PluginManager::begin_drain(Arc::clone(&manager), "acme.lifecycle").unwrap();
     {
         let mut guard = manager.lock().unwrap();
-        assert!(guard.activate("acme.lifecycle").is_err());
         assert!(guard.enable("acme.lifecycle").is_err());
+        assert!(guard.disable("acme.lifecycle").is_err());
     }
     assert!(
-        PluginManager::begin_upgrade_drain(Arc::clone(&manager), "acme.lifecycle").is_err(),
+        PluginManager::begin_drain(Arc::clone(&manager), "acme.lifecycle").is_err(),
         "同一插件不能同时存在两个排空操作"
     );
     drop(drain);
@@ -680,8 +671,6 @@ fn runtime_upgrade_rejects_replaced_lease_before_closing_current_instance_admiss
             },
         )
         .unwrap();
-    manager.enable(id).unwrap();
-    manager.activate(id).unwrap();
     manager.begin_runtime(id, package.digest(), "old").unwrap();
     let installed = manager.state().plugins[id].clone();
     manager.end_runtime(id, "old");
@@ -790,7 +779,7 @@ fn reopening_cleans_unreferenced_package_versions_after_lifecycle_commit() {
 }
 
 #[test]
-fn active_manifests_follow_the_global_activation_state() {
+fn enabled_manifests_follow_the_global_enabled_state() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();
     manager
@@ -801,12 +790,11 @@ fn active_manifests_follow_the_global_activation_state() {
             },
         )
         .unwrap();
+    assert_eq!(manager.manifests().unwrap().len(), 1);
+    manager.disable("acme.lifecycle").unwrap();
     assert!(manager.manifests().unwrap().is_empty());
     manager.enable("acme.lifecycle").unwrap();
-    manager.activate("acme.lifecycle").unwrap();
     assert_eq!(manager.manifests().unwrap().len(), 1);
-    manager.deactivate("acme.lifecycle").unwrap();
-    assert!(manager.manifests().unwrap().is_empty());
 }
 
 #[test]
@@ -821,9 +809,8 @@ fn plugins_are_global_and_use_one_application_state() {
             },
         )
         .unwrap();
-    manager.enable("acme.lifecycle").unwrap();
-    assert!(manager.manifests().unwrap().is_empty());
-    assert!(!manager.is_active("acme.lifecycle").unwrap());
+    assert_eq!(manager.manifests().unwrap().len(), 1);
+    assert!(manager.is_enabled("acme.lifecycle").unwrap());
 }
 
 #[test]
@@ -839,18 +826,6 @@ fn resource_permission_is_required_for_each_declared_resource() {
             },
         )
         .unwrap();
-    manager.enable("acme.lifecycle").unwrap();
-    manager
-        .authorize(
-            "acme.lifecycle",
-            vec![magi_plugin_system::PluginPermission {
-                kind: magi_plugin_system::PluginPermissionKind::Storage,
-
-                targets: vec!["cache".into()],
-            }],
-        )
-        .unwrap();
-    manager.activate("acme.lifecycle").unwrap();
     assert!(
         manager
             .permission_allowed(
@@ -869,47 +844,6 @@ fn resource_permission_is_required_for_each_declared_resource() {
             )
             .unwrap()
     );
-}
-
-#[test]
-fn activation_requires_every_declared_permission_to_be_granted() {
-    let root = tempdir().unwrap();
-    let mut manager = PluginManager::open(root.path()).unwrap();
-    let package = package_from_manifest(json!({
-        "sdkVersion":2,"id":"acme.shared","version":"1.0.0","name":"Shared","description":"", "permissions":[
-            {"kind":"storage","targets":["session"]},
-            {"kind":"storage","targets":["cache"]}
-        ],
-        "dataSchemaVersion":1,"settingsSchema":{"type":"object","additionalProperties":false},
-        "contributions":{"resources":[{"id":"open","title":"Open","description":""}]}
-    }));
-    manager
-        .install(
-            &package,
-            PluginSource::Local {
-                name: "shared.zip".into(),
-            },
-        )
-        .unwrap();
-    manager.enable("acme.shared").unwrap();
-    let workspace_grant = PluginPermission {
-        kind: PluginPermissionKind::Storage,
-
-        targets: vec!["cache".into()],
-    };
-    let application_grant = PluginPermission {
-        kind: PluginPermissionKind::Storage,
-
-        targets: vec!["session".into()],
-    };
-    manager
-        .authorize("acme.shared", vec![workspace_grant.clone()])
-        .unwrap();
-    assert!(manager.activate("acme.shared").is_err());
-    manager
-        .authorize("acme.shared", vec![workspace_grant, application_grant])
-        .unwrap();
-    manager.activate("acme.shared").unwrap();
 }
 
 fn package_from_manifest(manifest: Value) -> PluginPackage {
@@ -936,13 +870,11 @@ fn draining_closes_independent_editing_admission() {
             },
         )
         .unwrap();
-    manager.enable("acme.lifecycle").unwrap();
-    manager.activate("acme.lifecycle").unwrap();
     let manager = Arc::new(Mutex::new(manager));
     let guard = manager.lock().unwrap();
     assert!(guard.ensure_editing_admitted("acme.lifecycle").is_ok());
     drop(guard);
-    let drain = PluginManager::begin_deactivation(Arc::clone(&manager), "acme.lifecycle").unwrap();
+    let drain = PluginManager::begin_drain(Arc::clone(&manager), "acme.lifecycle").unwrap();
     assert!(
         manager
             .lock()
@@ -954,7 +886,7 @@ fn draining_closes_independent_editing_admission() {
 }
 
 #[test]
-fn activation_rejects_browser_surface_policies_the_host_cannot_mount() {
+fn install_rejects_browser_surface_policies_the_host_cannot_mount() {
     let mut manifest = json!({
         "sdkVersion":2,"id":"acme.surface","version":"1.0.0","name":"Surface","description":"", "permissions":[{"kind":"browser","targets":["login"]}],
         "dataSchemaVersion":1,"settingsSchema":{"type":"object","additionalProperties":false},
@@ -972,44 +904,24 @@ fn activation_rejects_browser_surface_policies_the_host_cannot_mount() {
             },
         )
         .unwrap();
-    manager.enable("acme.surface").unwrap();
-    manager
-        .authorize(
-            "acme.surface",
-            vec![PluginPermission {
-                kind: PluginPermissionKind::Browser,
-
-                targets: vec!["login".into()],
-            }],
-        )
-        .unwrap();
-    manager.activate("acme.surface").unwrap();
 
     manifest["version"] = json!("1.1.0");
     manifest["contributions"]["browserSurfaces"][0]["closeAction"] = json!("destroy");
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();
-    manager
+    let error = manager
         .install(
             &package_from_manifest(manifest),
             PluginSource::Local {
                 name: "s.zip".into(),
             },
         )
-        .unwrap();
-    manager.enable("acme.surface").unwrap();
-    manager
-        .authorize(
-            "acme.surface",
-            vec![PluginPermission {
-                kind: PluginPermissionKind::Browser,
-
-                targets: vec!["login".into()],
-            }],
-        )
-        .unwrap();
-    let error = manager.activate("acme.surface").unwrap_err();
+        .unwrap_err();
     assert!(error.to_string().contains("宿主尚不支持"), "{error}");
+    assert!(
+        manager.package("acme.surface").is_err(),
+        "拒绝的安装不能留下记录"
+    );
 }
 
 fn local(name: &str) -> PluginSource {
@@ -1098,9 +1010,6 @@ fn preview_of_an_upgrade_reports_permission_diff_and_blocked_data_migration() {
     let preview = third.preview(&schema, &local("v2.zip")).unwrap();
     assert_eq!(preview.data_schema_from, Some(1));
     assert!(!preview.data_reset);
-    third.enable("acme.lifecycle").unwrap();
-    third.authorize("acme.lifecycle", vec![grant()]).unwrap();
-    third.activate("acme.lifecycle").unwrap();
     third
         .write_resource("acme.lifecycle", "cache", 0, json!({"k": 1}))
         .unwrap();
@@ -1140,10 +1049,6 @@ fn missing_package_is_isolated_on_startup_without_losing_other_plugins_or_resour
             .unwrap();
     }
     manager.enable("acme.lifecycle").unwrap();
-    manager
-        .authorize("acme.lifecycle", package.manifest().permissions.clone())
-        .unwrap();
-    manager.activate("acme.lifecycle").unwrap();
     let missing_path = manager.state().plugins["acme.lifecycle"]
         .package_path
         .clone();
@@ -1200,9 +1105,7 @@ fn missing_package_is_isolated_on_startup_without_losing_other_plugins_or_resour
         )
         .unwrap();
     let reinstalled = &recovered.state().plugins["acme.lifecycle"];
-    assert!(!reinstalled.enabled);
-    assert!(!reinstalled.active);
-    assert!(reinstalled.grants.is_empty());
+    assert!(reinstalled.enabled, "重新安装即启用");
     drop(recovered);
     assert_eq!(
         PluginManager::open(root.path())
@@ -1265,8 +1168,9 @@ fn repeated_reopen_and_uninstall_preserve_all_referenced_version_packages() {
         assert!(manager.package("acme.first").is_ok());
         assert!(manager.package("acme.second").is_ok());
     }
-    manager.uninstall("acme.first").unwrap();
-    drop(manager);
+    let shared = Arc::new(Mutex::new(manager));
+    uninstall_now(&shared, "acme.first");
+    drop(shared);
     let reopened = PluginManager::open(root.path()).unwrap();
     assert_eq!(reopened.projection().unwrap().plugins.len(), 1);
     assert!(reopened.package("acme.second").is_ok());
@@ -1278,8 +1182,6 @@ fn retired_builtin_is_removed_on_reopen_without_erasing_resources() {
     let mut manager = PluginManager::open(root.path()).unwrap();
     let package = package(false);
     manager.install(&package, local("retired.zip")).unwrap();
-    manager.enable("acme.lifecycle").unwrap();
-    manager.activate("acme.lifecycle").unwrap();
     let state_path = root.path().join("state.json");
     // 模拟旧宿主曾经发布的内置包；新宿主目录不再声明该身份。
     let mut state = serde_json::to_value(manager.state()).unwrap();
@@ -1301,7 +1203,7 @@ fn retired_builtin_is_removed_on_reopen_without_erasing_resources() {
         reopened.retired_builtins(),
         [magi_plugin_system::RetiredBuiltin {
             id: "acme.lifecycle".into(),
-            was_active: true
+            was_enabled: true
         }]
     );
     assert!(root.path().join("resources.json").exists());
@@ -1325,8 +1227,42 @@ fn retired_builtin_is_removed_on_reopen_without_erasing_resources() {
     );
 }
 
+fn archive_of(manifest: &Value, files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    for (name, bytes) in std::iter::once(("manifest.json", serde_json::to_vec(manifest).unwrap()))
+        .chain(files.iter().map(|(name, bytes)| (*name, bytes.to_vec())))
+    {
+        writer
+            .start_file(name, SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+/// 升级前已经安装的旧产物：现在的 install 会拒绝它，所以先安装同身份的可安装包，
+/// 再把归档和摘要换成旧产物，模拟前一版留在状态根里的安装事实。
+fn simulate_legacy_install(
+    root: &std::path::Path,
+    id: &str,
+    supported: &PluginPackage,
+    legacy_bytes: &[u8],
+    legacy: &PluginPackage,
+) {
+    let mut manager = PluginManager::open(root).unwrap();
+    manager.install(supported, local("original.zip")).unwrap();
+    let archive = root.join(&manager.state().plugins[id].package_path);
+    drop(manager);
+    std::fs::write(archive, legacy_bytes).unwrap();
+    let mut state: Value =
+        serde_json::from_slice(&std::fs::read(root.join("state.json")).unwrap()).unwrap();
+    state["plugins"][id]["digest"] = json!(legacy.digest());
+    std::fs::write(root.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+}
+
 #[test]
-fn translated_message_replacement_is_blocked_on_activation_and_restart_but_native_views_remain() {
+fn translated_message_replacement_is_rejected_on_install_and_legacy_records_stay_disabled_but_native_views_remain()
+ {
     for translated in [false, true] {
         let mut manifest = json!({
             "sdkVersion":2,"id":"acme.messages","version":"1.0.0","name":"Messages","description":"",
@@ -1335,60 +1271,51 @@ fn translated_message_replacement_is_blocked_on_activation_and_restart_but_nativ
             "dataSchemaVersion":1,"settingsSchema":{"type":"object"},
             "contributions":{"views":[{"id":"messages","title":"Messages","entry":"ui/messages.html","placements":["chatAssistant"]}]}
         });
+        let native_bytes = archive_of(
+            &manifest,
+            &[
+                ("extension/index.mjs", b"export default () => {};"),
+                ("ui/messages.html", b"<p>Original business view</p>"),
+            ],
+        );
+        let native = PluginPackage::from_archive(&native_bytes).unwrap();
         if translated {
             manifest["extension"]["compat"] = json!({"kind":"dsh"});
         }
-        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-        for (name, bytes) in [
-            ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
-            ("extension/index.mjs", b"export default () => {};".to_vec()),
-            (
-                "ui/messages.html",
-                b"<p>Original business view</p>".to_vec(),
-            ),
-        ] {
-            writer
-                .start_file(name, SimpleFileOptions::default())
-                .unwrap();
-            writer.write_all(&bytes).unwrap();
-        }
-        let package = PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap();
+        let bytes = archive_of(
+            &manifest,
+            &[
+                ("extension/index.mjs", b"export default () => {};"),
+                ("ui/messages.html", b"<p>Original business view</p>"),
+            ],
+        );
+        let package = PluginPackage::from_archive(&bytes).unwrap();
         let root = tempdir().unwrap();
-        let mut manager = PluginManager::open(root.path()).unwrap();
         let id = "acme.messages";
-        manager.install(&package, local("original.zip")).unwrap();
-        manager.enable(id).unwrap();
-        manager
-            .authorize(id, package.manifest().permissions.clone())
-            .unwrap();
+        if translated {
+            let mut manager = PluginManager::open(root.path()).unwrap();
+            assert!(
+                manager
+                    .install(&package, local("original.zip"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("PLUGIN_UI_BOUNDARY_CONFLICT"),
+                "宿主不能承载的产物在安装时拒绝"
+            );
+            assert!(manager.package(id).is_err(), "拒绝的安装不留记录");
+            drop(manager);
+            simulate_legacy_install(root.path(), id, &native, &bytes, &package);
+        } else {
+            let mut manager = PluginManager::open(root.path()).unwrap();
+            manager.install(&package, local("original.zip")).unwrap();
+        }
         PluginResourceStore::open(root.path().join("resources.json"))
             .unwrap()
             .write(id, "__settings", 0, json!({"retained":true}))
             .unwrap();
-        if translated {
-            let before = manager.state().clone();
-            assert!(
-                manager
-                    .activate(id)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("PLUGIN_UI_BOUNDARY_CONFLICT")
-            );
-            assert_eq!(manager.state(), &before, "失败激活不能修改安装或授权");
-            // 模拟前一版留下的激活事实，重启读取原归档而非重写页面或授权。
-            let mut state = serde_json::to_value(manager.state()).unwrap();
-            state["plugins"][id]["active"] = json!(true);
-            std::fs::write(
-                root.path().join("state.json"),
-                serde_json::to_vec(&state).unwrap(),
-            )
-            .unwrap();
-        } else {
-            manager.activate(id).unwrap();
-        }
-        drop(manager);
         let manager = PluginManager::open(root.path()).unwrap();
-        assert_eq!(manager.is_active(id).unwrap(), !translated);
+        // 旧产物的记录仍标记为启用，但宿主能力裁决让它不可用；原生视图正常启用。
+        assert_eq!(manager.is_enabled(id).unwrap(), !translated);
         assert_eq!(manager.ensure_host_supported(id).is_ok(), !translated);
         assert_eq!(manager.manifests().unwrap().len(), usize::from(!translated));
         assert_eq!(manager.package(id).unwrap().digest(), package.digest());
@@ -1400,65 +1327,105 @@ fn translated_message_replacement_is_blocked_on_activation_and_restart_but_nativ
                 .value,
             json!({"retained":true})
         );
-        assert_eq!(
-            manager.state().plugins[id].grants,
-            package.manifest().permissions
-        );
     }
 }
 
 #[test]
-fn removed_composer_panel_is_blocked_on_activation_and_restart_but_records_remain() {
-    let manifest = json!({
+fn removed_composer_panel_is_rejected_on_install_and_legacy_records_remain_unusable() {
+    let mut manifest = json!({
         "sdkVersion":2,"id":"acme.composer","version":"1.0.0","name":"Composer","description":"",
         "extension":{"hooks":[]},
         "permissions":[{"kind":"extension","targets":["full-trust"]}],
         "dataSchemaVersion":1,"settingsSchema":{"type":"object"},
-        "contributions":{"views":[{"id":"credits","title":"Credits","entry":"ui/credits.html","placements":["composerLeft"]}]}
+        "contributions":{"views":[{"id":"credits","title":"Credits","entry":"ui/credits.html","placements":["rightPane"]}]}
     });
-    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-    for (name, bytes) in [
-        ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
-        ("extension/index.mjs", b"export default () => {};".to_vec()),
-        ("ui/credits.html", b"<p>Credits</p>".to_vec()),
-    ] {
-        writer
-            .start_file(name, SimpleFileOptions::default())
-            .unwrap();
-        writer.write_all(&bytes).unwrap();
-    }
-    let package = PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap();
+    let supported = PluginPackage::from_archive(&archive_of(
+        &manifest,
+        &[
+            ("extension/index.mjs", b"export default () => {};"),
+            ("ui/credits.html", b"<p>Credits</p>"),
+        ],
+    ))
+    .unwrap();
+    manifest["contributions"]["views"][0]["placements"] = json!(["composerLeft"]);
+    let legacy_bytes = archive_of(
+        &manifest,
+        &[
+            ("extension/index.mjs", b"export default () => {};"),
+            ("ui/credits.html", b"<p>Credits</p>"),
+        ],
+    );
+    let legacy = PluginPackage::from_archive(&legacy_bytes).unwrap();
     let root = tempdir().unwrap();
-    let mut manager = PluginManager::open(root.path()).unwrap();
     let id = "acme.composer";
-    manager.install(&package, local("composer.zip")).unwrap();
-    manager.enable(id).unwrap();
-    manager
-        .authorize(id, package.manifest().permissions.clone())
-        .unwrap();
-    let before = manager.state().clone();
+    let mut manager = PluginManager::open(root.path()).unwrap();
     assert!(
         manager
-            .activate(id)
+            .install(&legacy, local("composer.zip"))
             .unwrap_err()
             .to_string()
             .contains("PLUGIN_UI_BOUNDARY_CONFLICT")
     );
-    assert_eq!(manager.state(), &before, "失败激活不能修改安装或授权");
-    // 模拟前一版留下的激活事实，重启读取原归档而不重写授权。
-    let mut state = serde_json::to_value(manager.state()).unwrap();
-    state["plugins"][id]["active"] = json!(true);
-    std::fs::write(
-        root.path().join("state.json"),
-        serde_json::to_vec(&state).unwrap(),
-    )
-    .unwrap();
+    assert!(manager.package(id).is_err(), "拒绝的安装不留记录");
     drop(manager);
+    simulate_legacy_install(root.path(), id, &supported, &legacy_bytes, &legacy);
     let manager = PluginManager::open(root.path()).unwrap();
     assert!(manager.ensure_host_supported(id).is_err());
-    assert_eq!(manager.package(id).unwrap().digest(), package.digest());
-    assert_eq!(
-        manager.state().plugins[id].grants,
-        package.manifest().permissions
+    assert!(!manager.is_enabled(id).unwrap());
+    assert_eq!(manager.package(id).unwrap().digest(), legacy.digest());
+    assert!(
+        manager.state().plugins[id].enabled,
+        "记录保留启用状态，更新后恢复"
     );
+}
+
+#[test]
+fn state_version_two_is_folded_into_one_enabled_flag_and_backed_up() {
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    for id in ["acme.running", "acme.idle", "acme.off"] {
+        let mut value = manifest(false);
+        value["id"] = json!(id);
+        manager
+            .install(&package_from_manifest(value), local("legacy.zip"))
+            .unwrap();
+    }
+    drop(manager);
+    // 版本 2 的三层状态：运行中（启用且激活）、启用待激活、已停用；全部带授权记录。
+    let state_path = root.path().join("state.json");
+    let mut state: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    state["schema_version"] = json!(2);
+    for (id, enabled, active) in [
+        ("acme.running", true, true),
+        ("acme.idle", true, false),
+        ("acme.off", false, false),
+    ] {
+        state["plugins"][id]["enabled"] = json!(enabled);
+        state["plugins"][id]["active"] = json!(active);
+        state["plugins"][id]["grants"] = json!([{"kind":"storage","targets":["cache"]}]);
+    }
+    std::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let manager = PluginManager::open(root.path()).unwrap();
+    let plugins = &manager.state().plugins;
+    assert!(plugins["acme.running"].enabled, "原来实际在运行的保持启用");
+    assert!(
+        !plugins["acme.idle"].enabled,
+        "启用但未激活的原本就没有在运行"
+    );
+    assert!(!plugins["acme.off"].enabled);
+    drop(manager);
+    let migrated: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(migrated["schema_version"], json!(3));
+    assert!(migrated["plugins"]["acme.running"].get("grants").is_none());
+    assert!(migrated["plugins"]["acme.running"].get("active").is_none());
+    assert!(
+        std::fs::read_dir(root.path()).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("state.json.schema-v2-")),
+        "迁移前原状态文件必须备份"
+    );
+    // 再次打开不重复迁移。
+    assert!(PluginManager::open(root.path()).unwrap().state().plugins["acme.running"].enabled);
 }

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { connectTarget, pageTools, waitFor } from './electron-harness.mjs';
-import { authorizePluginFromNative } from './plugin-native-acceptance.mjs';
+import { waitForInstalledPlugin } from './plugin-native-acceptance.mjs';
 
 // 专项和社区验证同一 Market 原包任务，不把后续用户授权改记成原安装成功。
 export async function verifyDshMarket({ request, origin, plugin, page, cdpPort, errors, output, stateRoot, restart, check }) {
@@ -22,7 +22,7 @@ export async function verifyDshMarket({ request, origin, plugin, page, cdpPort, 
   const remove = async name => {
     const value = await current(name); if (!value) return;
     const path = `/api/plugins/${value.manifest.id}`;
-    if (value.active) await request(path + '/deactivate', {});
+    if (value.enabled) await request(path + '/disable', {});
     if (value.enabled) await request(path + '/disable', {});
     await request(path + '/uninstall', {});
   };
@@ -31,7 +31,7 @@ export async function verifyDshMarket({ request, origin, plugin, page, cdpPort, 
   const screenshot = label => ui.screenshot().then(bytes => writeFile(join(output, `market-${label}.png`), Buffer.from(bytes, 'base64')));
   const authorize = async target => {
     const before = await journal();
-    const active = await authorizePluginFromNative({ request, page, plugin: target });
+    const active = await waitForInstalledPlugin({ request, page, plugin: target });
     assert.equal(await journal(), before, '原生授权不能创建或重放 Market 的安装任务');
     await ui.click('[data-testid=settings-back]');
     return active;
@@ -39,9 +39,8 @@ export async function verifyDshMarket({ request, origin, plugin, page, cdpPort, 
   const installPending = async (spec, name, version) => {
     const receipt = await install(spec), pending = await current(name);
     evidence.receipts.push({ spec, receipt, pending });
-    assert.equal(receipt.status, 500, JSON.stringify(receipt)); assert.equal(receipt.body.ok, false);
-    assert.match(receipt.body.log, /已安装.*但未完成启用/); assert.match(receipt.body.log, /Magi 插件管理.*无需重复安装/);
-    assert.equal(pending?.manifest.version, version); assert.equal(pending.active, false); assert.deepEqual(pending.grants, []);
+    assert.equal(receipt.status, 200, JSON.stringify(receipt)); assert.equal(receipt.body.ok, true);
+    assert.equal(pending?.manifest.version, version); assert.equal(pending.enabled, true);
     return authorize(pending);
   };
   const openPage = async () => {
@@ -79,17 +78,17 @@ export async function verifyDshMarket({ request, origin, plugin, page, cdpPort, 
     const updated = await installPending(`${probe}@0.0.8`, probe, '0.0.8');
     record('npmUpdate', 'Market npm 在线更新后由用户授权新摘要，无重复安装', updated.manifest.version === '0.0.8');
     const missing = await install(`${probe}@9999.0.0`), preserved = await current(probe);
-    record('failurePreservation', '不存在版本保留旧包、授权和原运行实例', missing.body.ok === false && preserved.digest === updated.digest && preserved.runtime.generation === updated.runtime.generation && JSON.stringify(preserved.grants) === JSON.stringify(updated.grants));
+    record('failurePreservation', '不存在版本保留旧包、授权和原运行实例', missing.body.ok === false && preserved.digest === updated.digest && preserved.runtime.generation === updated.runtime.generation);
     await installPending('github:easonmws/dsh-plugin-health#v3.0.5', health, '3.0.5');
     const gitUpdated = await installPending('git+https://github.com/easonmws/dsh-plugin-health.git#v3.0.6', health, '3.0.6');
     record('gitSources', 'Market GitHub 安装和 HTTPS Git 更新经原生授权后真实运行', gitUpdated.runtime.state === 'running' && gitUpdated.source.github.reference === 'v3.0.6');
     const gitMissing = await install('github:easonmws/dsh-plugin-health#magi-missing-revision-acceptance');
     record('gitFailure', 'Git 不存在引用保留已授权版本和运行实例', gitMissing.body.ok === false && (await current(health)).digest === gitUpdated.digest && (await current(health)).runtime.generation === gitUpdated.runtime.generation);
     const reload = await route('reload', {}), afterReload = await current(probe);
-    record('profileReload', '原包重载保留未变化的摘要、授权和运行实例', reload.status === 200 && reload.body.ok === true && reload.body.pending.length === 0 && reload.body.warnings.length === 0 && reload.body.restartReason === '' && afterReload.digest === updated.digest && afterReload.runtime.generation === updated.runtime.generation && JSON.stringify(afterReload.grants) === JSON.stringify(updated.grants));
-    await request(`/api/plugins/${updated.manifest.id}/deactivate`, {}); await request(`/api/plugins/${updated.manifest.id}/disable`, {});
+    record('profileReload', '原包重载保留未变化的摘要、授权和运行实例', reload.status === 200 && reload.body.ok === true && reload.body.pending.length === 0 && reload.body.warnings.length === 0 && reload.body.restartReason === '' && afterReload.digest === updated.digest && afterReload.runtime.generation === updated.runtime.generation);
+    await request(`/api/plugins/${updated.manifest.id}/disable`, {});
     const disabledReload = await route('reload', {}), disabled = await current(probe);
-    record('disabledIntent', 'Market 重载保留目标插件的全局停用意愿', disabledReload.body.ok === true && !disabled.enabled && !disabled.active);
+    record('disabledIntent', 'Market 重载保留目标插件的全局停用意愿', disabledReload.body.ok === true && !disabled.enabled && !disabled.enabled);
     await remove(probe); await remove(health);
     await openPage(); await searchManager();
     const entry = (await list(`q=${mgr}`)).items.find(value => value.name === mgr);
@@ -98,13 +97,10 @@ export async function verifyDshMarket({ request, origin, plugin, page, cdpPort, 
     const marker = await frame.evaluate('window.__marketAcceptance=crypto.randomUUID()');
     await frame.evaluate(`[...document.querySelectorAll('.dsxpm-card')].find(card=>card.querySelector('.dsxpm-name')?.textContent===${JSON.stringify(mgr)}).querySelector('button').click()`);
     const pending = await waitFor(async () => { const value = await current(mgr); return value?.digest === expected.digest && value; }, 'Market 原按钮在线安装 Mgr', 240_000);
-    await waitFor(() => frame.evaluate('document.body.innerText.includes("未完成启用")&&document.body.innerText.includes("无需重复安装")'), 'Market 原页面显示完整恢复日志');
-    const log = await frame.evaluate('document.querySelector(".dsxpm-log")?.innerText');
-    record('originalPageReceipt', 'Market 原组件保留失败、已安装版本及完整恢复说明', !pending.active && pending.grants.length === 0 && log.includes(`已安装 ${mgr}@${expected.manifest.version}`) && log.includes('Magi 插件管理'));
-    await screenshot('authorization-required');
     const manager = await authorize(pending);
-    record('nativeRecovery', '用户原生授权后原 Market 文档和失败日志保持真实', await frame.evaluate(`window.__marketAcceptance===${JSON.stringify(marker)}&&document.querySelector('.dsxpm-log')?.innerText===${JSON.stringify(log)}`) && manager.digest === expected.digest);
-    // 原包失败分支保留旧列表；用户从原生授权返回后，沿原按钮刷新快照。
+    record('originalPageInstall', 'Market 原按钮在线安装后直接启用并运行，原页面文档保持不变', pending.enabled && manager.digest === expected.digest
+      && await frame.evaluate(`window.__marketAcceptance===${JSON.stringify(marker)}`));
+    // 安装完成后沿原按钮刷新快照。
     await waitFor(() => clickText('强制重新获取'), 'Market 原页面显式刷新');
     await waitFor(() => frame.evaluate(`Boolean([...document.querySelectorAll('.dsxpm-card')].find(card=>card.querySelector('.dsxpm-name')?.textContent===${JSON.stringify(mgr)})?.querySelector('.dsxpm-installed'))`), 'Market 原页面刷新后的已安装事实', 120_000);
     record('originalPageInventory', '原页面显式刷新后展示同一在线版本的真实安装', (await list(`only=installed&q=${mgr}`)).items.some(value => value.installedAs === mgr && value.installedVersion === expected.manifest.version));
@@ -113,16 +109,16 @@ export async function verifyDshMarket({ request, origin, plugin, page, cdpPort, 
     await searchManager();
     record('originalPageReload', '原页面重载后的新文档桥继续可用且不重启未变化宿主', (await current(mgr)).runtime.generation === manager.runtime.generation && (await plugins()).find(value => value.manifest.id === id).runtime.generation === initial.runtime.generation);
     await screenshot('reloaded'); closeFrame();
-    await request(`/api/plugins/${id}/deactivate`, {}); await request(`/api/plugins/${id}/disable`, {});
+    await request(`/api/plugins/${id}/disable`, {});
     await waitFor(async () => !await ui.exists(`iframe[data-plugin-id=${JSON.stringify(id)}]`), 'Market 停用释放原包文档');
-    const beforeEnable = await journal(); await request(`/api/plugins/${id}/enable`, {}); await request(`/api/plugins/${id}/activate`, {});
+    const beforeEnable = await journal(); await request(`/api/plugins/${id}/enable`, {});
     await waitFor(async () => (await plugins()).find(value => value.manifest.id === id)?.runtime?.state === 'running', 'Market 重新启用运行');
     await openPage(); await searchManager();
     record('lifecycle', 'Market 全局停用和重新启用保留安装事实且不重放安装', await journal() === beforeEnable && (await current(mgr)).digest === manager.digest && (await current(mgr)).runtime.state === 'running');
     closeFrame(); const beforeRestart = await journal(); page = await restart(); ui = pageTools(page);
     await waitFor(async () => (await current(mgr))?.runtime?.state === 'running' && (await plugins()).find(value => value.manifest.id === id)?.runtime?.state === 'running', '完整应用重启恢复 Market 及目标插件', 120_000);
     await openPage(); await searchManager();
-    record('restart', '完整应用重启恢复真实目录、授权和业务页面且不重放安装', await journal() === beforeRestart && (await current(mgr)).digest === manager.digest && JSON.stringify((await current(mgr)).grants) === JSON.stringify(manager.grants) && (await list(`only=installed&q=${mgr}`)).items.some(value => value.installedVersion === expected.manifest.version));
+    record('restart', '完整应用重启恢复真实目录、授权和业务页面且不重放安装', await journal() === beforeRestart && (await current(mgr)).digest === manager.digest && (await list(`only=installed&q=${mgr}`)).items.some(value => value.installedVersion === expected.manifest.version));
     await screenshot('restarted'); await remove(mgr);
     record('uninstall', 'Market 安装的目标沿唯一卸载入口移除', !await current(mgr));
     evidence.completed = true; return { page, checks: evidence.checks };

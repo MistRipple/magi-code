@@ -42,11 +42,6 @@ fn fixture_with(kinds: &[&str]) -> (TempDir, PluginManager, PluginPackage) {
             },
         )
         .unwrap();
-    manager.enable(ID).unwrap();
-    manager
-        .authorize(ID, package.manifest().permissions.clone())
-        .unwrap();
-    manager.activate(ID).unwrap();
     (dir, manager, package)
 }
 
@@ -136,7 +131,7 @@ fn runtime_skills_require_a_declaration_and_share_ready_cas_and_revocation() {
     manager
         .replace_runtime_catalog(id, "skills", 2, value)
         .unwrap();
-    manager.deactivate(id).unwrap();
+    manager.disable(id).unwrap();
     assert!(manager.manifests().unwrap().iter().all(|m| m.id != id));
     assert!(
         manager
@@ -378,40 +373,31 @@ fn old_instance_cannot_publish_bind_mark_ready_or_remove_the_new_catalog() {
 }
 
 #[test]
-fn deactivation_and_revocation_permanently_invalidate_the_previous_lease() {
-    for revoke in [false, true] {
-        let (_dir, mut manager, package) = fixture();
-        manager.begin_runtime(ID, package.digest(), "old").unwrap();
+fn disabling_permanently_invalidates_the_previous_lease() {
+    let (_dir, mut manager, package) = fixture();
+    manager.begin_runtime(ID, package.digest(), "old").unwrap();
+    manager
+        .replace_runtime_catalog(ID, "old", 0, catalog())
+        .unwrap();
+    manager.ready_runtime(ID, "old").unwrap();
+    assert!(manager.runtime_ready(ID).unwrap());
+    manager.disable(ID).unwrap();
+    assert!(manager.check_runtime(ID, "old").is_err());
+    assert!(!manager.runtime_ready(ID).unwrap());
+    assert!(
         manager
-            .replace_runtime_catalog(ID, "old", 0, catalog())
-            .unwrap();
-        manager.ready_runtime(ID, "old").unwrap();
-        assert!(manager.runtime_ready(ID).unwrap());
-        if revoke {
-            manager.authorize(ID, vec![]).unwrap();
-        } else {
-            manager.deactivate(ID).unwrap();
-        }
-        assert!(manager.check_runtime(ID, "old").is_err());
-        assert!(!manager.runtime_ready(ID).unwrap());
-        manager
-            .authorize(ID, package.manifest().permissions.clone())
-            .unwrap();
-        manager.activate(ID).unwrap();
-        assert!(
-            manager
-                .effective_manifest(ID)
-                .unwrap()
-                .contributions
-                .tools
-                .is_empty()
-        );
-        assert!(manager.check_runtime(ID, "old").is_err());
-        assert!(!manager.runtime_ready(ID).unwrap());
-        manager.begin_runtime(ID, package.digest(), "new").unwrap();
-        manager.check_runtime(ID, "new").unwrap();
-        assert!(!manager.runtime_ready(ID).unwrap());
-        manager.ready_runtime(ID, "new").unwrap();
-        assert!(manager.runtime_ready(ID).unwrap());
-    }
+            .effective_manifest(ID)
+            .unwrap()
+            .contributions
+            .tools
+            .is_empty()
+    );
+    manager.enable(ID).unwrap();
+    assert!(manager.check_runtime(ID, "old").is_err());
+    assert!(!manager.runtime_ready(ID).unwrap());
+    manager.begin_runtime(ID, package.digest(), "new").unwrap();
+    manager.check_runtime(ID, "new").unwrap();
+    assert!(!manager.runtime_ready(ID).unwrap());
+    manager.ready_runtime(ID, "new").unwrap();
+    assert!(manager.runtime_ready(ID).unwrap());
 }

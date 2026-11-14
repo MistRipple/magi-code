@@ -55,7 +55,7 @@ export async function verifyDshHealth({ request: api, plugin: health, target, pa
     const repaired = await call('/repair', { dryRun: false, planToken: preview.planToken });
     record('健康目录的修复确认如实返回空操作，不改动安装', !repaired.dryRun && repaired.actions.length === 0 && (await current(target.manifest.id)).digest === target.digest);
     const disabled = await call('/rescue/disable', { plugin: 'dsh-plugin-release-probe' });
-    record('Health 原包停用提案提交到 daemon 并停止目标', disabled.disabled === true && !(await current(target.manifest.id)).enabled && !(await current(target.manifest.id)).active);
+    record('Health 原包停用提案提交到 daemon 并停止目标', disabled.disabled === true && !(await current(target.manifest.id)).enabled);
     const originInfo = (await current(target.manifest.id)).disabledBy;
     record('停用来源与原因由 daemon 记录，未改变目标包和授权', originInfo?.pluginId === health.manifest.id && originInfo.reason.includes('dsh-plugin-health-disabled') && (await current(target.manifest.id)).digest === target.digest);
     await waitFor(() => ui.exists('[data-testid=sidebar-settings]'), '设置入口'); await ui.click('[data-testid=sidebar-settings]');
@@ -142,7 +142,6 @@ export async function verifyDshHealth({ request: api, plugin: health, target, pa
       const value = await call('/update'); return value.status === 'ok' && value.updateAvailable && value;
     }, 'Health 原包当前在线版本', 30_000);
     const beforeUpdate = await current(health.manifest.id);
-    record('Health 在线自更新不依赖替其他插件授权的委托', !beforeUpdate.grants.some(permission => permission.kind === 'pluginManagement' && permission.targets.includes('authorize')));
     const beforeSettings = await api(`/api/plugins/${health.manifest.id}/settings`);
     const beforeDocument = await frame.evaluate('window.__healthSelfUpdate=crypto.randomUUID()');
     await waitFor(() => clickText(`!b.disabled && /^(立即更新|Update now)$/.test(b.innerText.trim())`), 'Health 原页面自更新入口');
@@ -165,9 +164,8 @@ export async function verifyDshHealth({ request: api, plugin: health, target, pa
     await audit('self-update-complete');
     await writeFile(join(output, 'health-self-update.png'), Buffer.from(await ui.screenshot(), 'base64'));
     record('Health 原页面在线自更新由 daemon 完成替换与实际新版运行，旧调用结束不丢提交', journal.result.application === 'applied' && journal.candidate.digest === afterUpdate.digest
-      && afterUpdate.active && newStatus.update.currentVersion === update.latestVersion, journal.result);
-    record('自更新保留原设置和已批权限范围，新文档不复用旧页面状态', JSON.stringify(await api(`/api/plugins/${health.manifest.id}/settings`)) === JSON.stringify(beforeSettings)
-      && afterUpdate.grants.every(permission => beforeUpdate.grants.some(grant => JSON.stringify(grant) === JSON.stringify(permission)))
+      && afterUpdate.enabled && newStatus.update.currentVersion === update.latestVersion, journal.result);
+    record('自更新保留原设置，新文档不复用旧页面状态', JSON.stringify(await api(`/api/plugins/${health.manifest.id}/settings`)) === JSON.stringify(beforeSettings)
       && typeof beforeDocument === 'string' && await frame.evaluate('window.__healthSelfUpdate===undefined'));
     record('原页面显示偏好跨在线更新保持，修复日志仍为原字节', await frame.evaluate('document.querySelector(".dph-mode select").value==="advanced"')
       && await readFile(action.to, 'utf8') === 'RECOVERABLE_PRIVATE_DATA');
@@ -181,13 +179,13 @@ export async function verifyDshHealth({ request: api, plugin: health, target, pa
     closeFrame();
     const healthPath = `/api/plugins/${health.manifest.id}`;
     const beforeDisableKey = (await call('/status', undefined, {})).key;
-    await api(healthPath + '/deactivate', {}); await api(healthPath + '/disable', {});
+    await api(healthPath + '/disable', {});
     await waitFor(() => page.evaluate(`!document.querySelector(${JSON.stringify(selector)})`), 'Health 停用释放原文档');
     const inactive = await current(health.manifest.id);
-    record('停用 Health 释放页面与动态工具，保留已更新包和私有修复数据', !inactive.enabled && !inactive.active
+    record('停用 Health 释放页面与动态工具，保留已更新包和私有修复数据', !inactive.enabled && !inactive.enabled
       && inactive.manifest.contributions.tools.length === 0 && inactive.digest === afterUpdate.digest
       && await readFile(action.to, 'utf8') === 'RECOVERABLE_PRIVATE_DATA');
-    await api(healthPath + '/enable', {}); await api(healthPath + '/activate', {});
+    await api(healthPath + '/enable', {});
     await waitFor(async () => (await current(health.manifest.id)).runtime?.state === 'running', 'Health 重新启用运行');
     await openPage();
     const restored = await call('/status', undefined, {}); key = restored.key;
@@ -197,8 +195,7 @@ export async function verifyDshHealth({ request: api, plugin: health, target, pa
       current: await current(health.manifest.id), mode: await frame.evaluate('document.querySelector(".dph-mode select").value') };
     record('重新启用 Health 创建新实例并可继续诊断，保留页面偏好和原授权', restored.profile === 'magi'
       && key !== beforeDisableKey && oldControl.status === 401
-      && await frame.evaluate('document.querySelector(".dph-mode select").value==="advanced"')
-      && JSON.stringify((await current(health.manifest.id)).grants) === JSON.stringify(afterUpdate.grants));
+      && await frame.evaluate('document.querySelector(".dph-mode select").value==="advanced"'));
     const finalJournal = JSON.parse(await readFile(join(stateRoot, 'plugins/installations.json'), 'utf8'));
     record('重启及重新启用没有重放自更新，原持久回执保持不变', JSON.stringify(Object.values(finalJournal.records)
       .find(record => record.plugin === health.manifest.id && record.candidate?.digest === afterUpdate.digest)) === JSON.stringify(journal));

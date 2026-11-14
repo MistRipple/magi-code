@@ -5,7 +5,7 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectAppPage, connectTarget, createReporter, launchApp, pageTools, waitFor } from './lib/electron-harness.mjs';
-import { authorizePluginFromNative, waitForPluginModel } from './lib/plugin-native-acceptance.mjs';
+import { waitForInstalledPlugin, waitForPluginModel } from './lib/plugin-native-acceptance.mjs';
 
 // 同一官方原包：原页面配置、实际联网工具、全局选择和完整应用重启。
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -36,7 +36,7 @@ async function install(spec) {
   const installed = (await request('/api/plugins/upstream/install', { ecosystem: 'dsh', ...spec, expectedDigest: preview.candidate.digest }))
     .plugins.find(value => value.manifest.id === preview.candidate.manifest.id);
   assert.ok(installed); assert.equal(installed.digest, preview.candidate.digest);
-  return authorizePluginFromNative({ request, page, plugin: installed });
+  return waitForInstalledPlugin({ request, page, plugin: installed });
 }
 async function start() {
   assert.equal(await fetch(origin + '/health').then(() => true, () => false), false, '验收端口已占用');
@@ -95,7 +95,7 @@ try {
   const rejectedBody = await rejected.json(); await save('invalid-candidate', { status: rejected.status, body: rejectedBody });
   const afterCandidate = await current();
   report.check('旧原包的实际子模块失败在在线预览中明确报告，当前业务保持原实例', rejected.status === 400 && JSON.stringify(rejectedBody).includes('parameters.maxResults.minimum')
-    && afterCandidate.digest === beforeCandidate.digest && afterCandidate.runtime.instanceId === beforeCandidate.runtime.instanceId && JSON.stringify(afterCandidate.grants) === JSON.stringify(beforeCandidate.grants));
+    && afterCandidate.digest === beforeCandidate.digest && afterCandidate.runtime.instanceId === beforeCandidate.runtime.instanceId);
 
   await mkdir(dshHome, { recursive: true, mode: 0o700 });
   await cp(join(homedir(), '.dsh/.workbuddy-device.json'), join(dshHome, '.workbuddy-device.json'));
@@ -119,12 +119,12 @@ try {
       && (tool === 'web_search' ? receipt.sources?.length > 0 : receipt.statusCode === 200 && fetched?.Status === 0 && fetched.Question?.some(item => /^example\.com\.?$/.test(item.name))), JSON.stringify(receipt));
   }
   const beforeStop = await current();
-  await request(`/api/plugins/${plugin.manifest.id}/deactivate`, {});
-  await waitFor(async () => { const value = await current(); return !value.active && (!value.runtime || value.runtime.state === 'stopped'); }, '停用后回收宿主');
+  await request(`/api/plugins/${plugin.manifest.id}/disable`, {});
+  await waitFor(async () => { const value = await current(); return !value.enabled && (!value.runtime || value.runtime.state === 'stopped'); }, '停用后回收宿主');
   const fallback = await turn(sessions[1], `请调用 web_fetch 一次，url=${JSON.stringify(fetchUrl)}，返回本次取得的 DNS 记录摘要，不要调用其他工具。`, 'native-after-deactivate');
   const nativeReceipt = fallback.items.filter(item => item.tool?.name === 'web_fetch').at(-1)?.tool?.result;
   report.check('全局停用后原生联网继续可用且未交给已停用的原包', nativeReceipt?.status === 'succeeded' && !nativeReceipt.providerTool, JSON.stringify(nativeReceipt));
-  await request(`/api/plugins/${plugin.manifest.id}/activate`, {});
+  await request(`/api/plugins/${plugin.manifest.id}/enable`, {});
   const reactivated = await waitFor(async () => { const value = await current(); return value?.runtime?.state === 'running' && value; }, '全局重新激活', 120_000);
   report.check('重新激活恢复原选择及设置，释放旧实例', reactivated.runtime.instanceId !== beforeStop.runtime.instanceId && reactivated.digest === beforeStop.digest
     && JSON.stringify(await webState()) === JSON.stringify(selection) && (await request(`/api/plugins/${plugin.manifest.id}/settings`)).value.provider === 'bing');
@@ -132,7 +132,7 @@ try {
   const restored = await waitFor(async () => { const value = await current(); return value?.runtime?.state === 'running' && value; }, '完整重启恢复原包', 120_000);
   assert.deepEqual(await webState(), selection);
   assert.equal((await request(`/api/plugins/${plugin.manifest.id}/settings`)).value.provider, 'bing');
-  report.check('完整应用重启保留全局选择、原设置和授权并恢复新实例', restored.digest === before.digest && restored.runtime.instanceId !== before.runtime.instanceId && JSON.stringify(restored.grants) === JSON.stringify(before.grants));
+  report.check('完整应用重启保留全局选择、原设置和授权并恢复新实例', restored.digest === before.digest && restored.runtime.instanceId !== before.runtime.instanceId);
   await settings(); await writeFile(join(output, 'restored.png'), Buffer.from(await ui.screenshot(), 'base64'));
   report.check('Renderer 和原包页面无异常', errors.length === 0, errors.join('\n'));
   await save('evidence', { completed: true, package: 'dsh-free-search', version: plugin.manifest.version, digest: plugin.digest, selection, sessions, checks: report.results.length });

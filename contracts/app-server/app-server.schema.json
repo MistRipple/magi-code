@@ -2678,25 +2678,6 @@
         }
       ]
     },
-    "PluginAuthorizeRequest": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "grants"
-      ],
-      "properties": {
-        "grants": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PluginPermission"
-          }
-        },
-        "expectedDigest": {
-          "type": "string",
-          "description": "用户操作所确认的安装摘要；提交前及排空后核对，过期请求不改变当前版本。"
-        }
-      }
-    },
     "PluginInstallRequest": {
       "type": "object",
       "additionalProperties": false,
@@ -2809,8 +2790,6 @@
         "manifest",
         "digest",
         "enabled",
-        "active",
-        "grants",
         "source"
       ],
       "properties": {
@@ -2820,12 +2799,6 @@
         "digest": {
           "type": "string"
         },
-        "grants": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PluginPermission"
-          }
-        },
         "source": {
           "$ref": "#/$defs/PluginSourceProjection"
         },
@@ -2833,9 +2806,6 @@
           "$ref": "#/$defs/PluginRuntimeStatus"
         },
         "enabled": {
-          "type": "boolean"
-        },
-        "active": {
           "type": "boolean"
         },
         "upstreamManifest": {
@@ -5901,17 +5871,6 @@
         }
       }
     },
-    "PluginActivationRequest": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [],
-      "properties": {
-        "expectedDigest": {
-          "type": "string",
-          "description": "用户操作所确认的安装摘要；提交前及排空后核对，过期请求不改变当前版本。"
-        }
-      }
-    },
     "PluginJobBudget": {
       "type": "object",
       "additionalProperties": false,
@@ -6892,7 +6851,7 @@
         "entry": {
           "type": "string",
           "maxLength": 256,
-          "description": "激活期间常驻的隔离客户端入口；必须为已声明视图入口，视图共用该客户端。"
+          "description": "启用期间常驻的隔离客户端入口；必须为已声明视图入口，视图共用该客户端。"
         }
       }
     },
@@ -7105,7 +7064,7 @@
             "minLength": 1,
             "maxLength": 128
           },
-          "description": "显式选择需要核对的已安装插件；仅收敛已有激活意图，不启用停用项、不重启未变化实例。"
+          "description": "显式选择需要核对的已安装插件；仅收敛已启用的插件，不启用停用项、不重启未变化实例。"
         }
       }
     },
@@ -7643,6 +7602,17 @@
           "items": {
             "$ref": "#/$defs/PluginWebProviderChange"
           }
+        }
+      }
+    },
+    "PluginLifecycleRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "expectedDigest": {
+          "type": "string",
+          "description": "用户操作所确认的安装摘要；提交前及排空后核对，过期请求不改变当前版本。"
         }
       }
     }

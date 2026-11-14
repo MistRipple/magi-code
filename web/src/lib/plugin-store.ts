@@ -25,7 +25,7 @@ export function pluginImpactNotices(manifest: PluginManifest, t: (key: string, v
   return notices;
 }
 
-export type StoreStatus = 'active' | 'installed' | 'available';
+export type StoreStatus = 'enabled' | 'disabled' | 'available';
 export type StoreFilter = 'all' | 'installed' | 'available' | 'updatable';
 
 export interface StoreItem {
@@ -50,7 +50,7 @@ type Text = (manifest: PluginManifest, field: 'name' | 'description') => string;
 /** 列表分组：有更新的排最前，其次是已安装，最后是尚未安装的。 */
 export type StoreGroup = 'updatable' | 'installed' | 'available';
 const GROUP_ORDER: Record<StoreGroup, number> = { updatable: 0, installed: 1, available: 2 };
-const STATUS_ORDER: Record<StoreStatus, number> = { active: 0, installed: 1, available: 2 };
+const STATUS_ORDER: Record<StoreStatus, number> = { enabled: 0, disabled: 1, available: 2 };
 
 export function storeGroup(item: StoreItem): StoreGroup {
   if (item.updatable) return 'updatable';
@@ -59,7 +59,7 @@ export function storeGroup(item: StoreItem): StoreGroup {
 
 function statusOf(installed: PluginInstalled | null): StoreStatus {
   if (!installed) return 'available';
-  return installed.active ? 'active' : 'installed';
+  return installed.enabled ? 'enabled' : 'disabled';
 }
 
 export function buildStoreItems(

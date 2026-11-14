@@ -59,7 +59,7 @@ const { Context, Service } = await import('@deepseek-ai/cordis');
 const { LlmRuntime } = await import('@deepseek-ai/dsh-llm');
 const metadata = JSON.parse(readFileSync(new URL('package.json', pathToFileURL(upstreamDir + '/')), 'utf8'));
 configureProfile({ plugins: {
-  async list() { return { plugins: [{manifest: {id:'recording.plugin', description:metadata.description}, upstreamManifest:metadata, digest:'recording', source:{kind:'upstream', location:`dsh:${metadata.name}@${metadata.version}`}, enabled:true, active:false}] }; },
+  async list() { return { plugins: [{manifest: {id:'recording.plugin', description:metadata.description}, upstreamManifest:metadata, digest:'recording', source:{kind:'upstream', location:`dsh:${metadata.name}@${metadata.version}`}, enabled:true}] }; },
   async compatibility() { return { ...dshEnvironment(sharedRoot), revision: 0, exemptions: {} }; },
 } }, { home: process.env.HOME + '/.dsh' });
 const upstream = await withProfile(() => import(pathToFileURL(entry).href));

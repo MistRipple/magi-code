@@ -2201,7 +2201,8 @@ mod tests {
         assert_eq!(facts[0].summary, "canonical file");
         state.canonical_turns[0].status = magi_session_store::CanonicalTurnStatus::Superseded;
         assert!(
-            current_session_file_facts(&SessionStore::from_state_for_test(state), &session).is_empty(),
+            current_session_file_facts(&SessionStore::from_state_for_test(state), &session)
+                .is_empty(),
             "已废弃 Turn 不再提供文件事实"
         );
         std::fs::write(&file, "changed").unwrap();

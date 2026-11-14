@@ -2062,10 +2062,9 @@ fn validate_execution_chain_in_state<'a>(
     Ok(sidecar)
 }
 
-mod turn_acceptance;
-mod threads;
 mod recovery;
+mod threads;
+mod turn_acceptance;
 mod turn_status;
 
-impl SessionStore {
-}
+impl SessionStore {}

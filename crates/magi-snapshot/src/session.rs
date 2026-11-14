@@ -758,7 +758,12 @@ impl SnapshotSession {
         let mut settled = std::collections::HashSet::new();
         let mut owned = std::collections::HashSet::new();
         for event in self.events.read_all()?.into_iter().rev() {
-            let Some(path) = event.after.as_ref().or(event.before.as_ref()).map(|meta| &meta.path) else {
+            let Some(path) = event
+                .after
+                .as_ref()
+                .or(event.before.as_ref())
+                .map(|meta| &meta.path)
+            else {
                 continue;
             };
             if settled.contains(path) {
@@ -781,8 +786,13 @@ impl SnapshotSession {
                 settled.insert(path.clone());
             }
         }
-        changes.retain(|change| owned.contains(&change.path)
-            || change.old_path.as_ref().is_some_and(|path| owned.contains(path)));
+        changes.retain(|change| {
+            owned.contains(&change.path)
+                || change
+                    .old_path
+                    .as_ref()
+                    .is_some_and(|path| owned.contains(path))
+        });
         Ok(changes)
     }
 

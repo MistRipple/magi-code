@@ -70,7 +70,7 @@ impl PluginJobs {
             .any(|(m, c)| m.id == plugin && c.id == request.command_id)
         {
             return Err(ApiError::Forbidden(
-                "计划必须引用当前已激活插件的公开命令".into(),
+                "计划必须引用当前已启用插件的公开命令".into(),
             ));
         }
         let digest = manager
@@ -174,7 +174,7 @@ impl PluginJobs {
                     .plugin_manager
                     .lock()
                     .map_err(|_| ApiError::Conflict("插件管理器不可用".into()))?;
-                manager.is_active(&previous.plugin_id).unwrap_or(false)
+                manager.is_enabled(&previous.plugin_id).unwrap_or(false)
                     && manager
                         .package(&previous.plugin_id)
                         .is_ok_and(|p| p.digest() == previous.digest)

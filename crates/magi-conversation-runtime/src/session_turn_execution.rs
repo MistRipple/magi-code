@@ -31,13 +31,12 @@ use crate::{
     session_writeback::{
         CanonicalTurnEventSink, ContextCompactionWritebackContext, SessionStatePersistCallback,
         SessionTurnStreamPublishGate, append_session_turn_error_item,
-        append_session_turn_error_item_without_terminal_commit,
-        apply_model_response_round, new_context_compaction_item_id,
-        persist_session_state_checkpoint, publish_current_session_turn_item_event,
-        publish_model_retry_runtime_event, publish_session_turn_item_event,
-        publish_session_turn_item_stream_event, session_turn_item, session_turn_stream_update,
-        upsert_context_compaction_completed_notice, upsert_context_compaction_progress_notice,
-        upsert_session_turn_item_for_turn,
+        append_session_turn_error_item_without_terminal_commit, apply_model_response_round,
+        new_context_compaction_item_id, persist_session_state_checkpoint,
+        publish_current_session_turn_item_event, publish_model_retry_runtime_event,
+        publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
+        session_turn_stream_update, upsert_context_compaction_completed_notice,
+        upsert_context_compaction_progress_notice, upsert_session_turn_item_for_turn,
     },
     tool_result_utils::{DeterministicToolFailure, emergency_model_round_failure},
     turn_stream_buffer::TurnStreamBuffer,
@@ -2140,9 +2139,7 @@ fn stream_session_turn_round(
         return Err(SessionTurnRoundError::WritebackFailed(error));
     }
     if writeback_aborted.get() || !request_turn_is_writable(session_store, request) {
-        return Ok(SessionTurnRoundOutput::interrupted(
-            response_observation,
-        ));
+        return Ok(SessionTurnRoundOutput::interrupted(response_observation));
     }
     let streamed_content = streamed_content.into_inner();
     let streamed_thinking = streamed_thinking.into_inner();
@@ -2155,9 +2152,7 @@ fn stream_session_turn_round(
         .or_else(|| (!streamed_thinking.trim().is_empty()).then_some(streamed_thinking));
     if let Some(thinking) = final_thinking {
         if !request_turn_is_writable(session_store, request) {
-            return Ok(SessionTurnRoundOutput::interrupted(
-                response_observation,
-            ));
+            return Ok(SessionTurnRoundOutput::interrupted(response_observation));
         }
         let mut thinking_item = session_turn_item(
             "assistant_thinking",
@@ -2210,9 +2205,7 @@ fn stream_session_turn_round(
     };
     if let Some(completed_stream_content) = completed_stream_content.as_ref() {
         if !request_turn_is_writable(session_store, request) {
-            return Ok(SessionTurnRoundOutput::interrupted(
-                response_observation,
-            ));
+            return Ok(SessionTurnRoundOutput::interrupted(response_observation));
         }
         let mut stream_item = session_turn_item(
             "assistant_stream",

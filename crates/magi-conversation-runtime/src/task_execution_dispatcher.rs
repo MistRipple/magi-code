@@ -61,8 +61,8 @@ use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
 use magi_memory_store::{ExtractedMemory, MemoryExtractionApplyRequest, MemoryLayer, MemoryStore};
 use magi_orchestrator::{
-    ExecutionContextSummary, ExecutionWritebackPlans,
-    task_store::TaskStore, task_worker_catalog::WorkerInfo,
+    ExecutionContextSummary, ExecutionWritebackPlans, task_store::TaskStore,
+    task_worker_catalog::WorkerInfo,
 };
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
 use magi_settings_store::SettingsStore;
@@ -776,7 +776,8 @@ impl LlmTaskDispatcher {
             let identity_root = self.resolve_task_source_root(task, session_id, workspace_id);
             let transferred = self
                 .pipeline
-                .task_store.as_ref()
+                .task_store
+                .as_ref()
                 .agent_run_transfer_for_task(&task.task_id)
                 .map_err(|error| error.to_string())?
                 .is_some();
@@ -1188,8 +1189,8 @@ fn builtin_tool_visible_in_access_profile(
 }
 
 mod execution_roots;
-mod prompts;
 mod model_target;
+mod prompts;
 
 impl LlmTaskDispatcher {
     #[cfg(test)]
@@ -2282,7 +2283,8 @@ impl TaskDispatcher for LlmTaskDispatcher {
         let state = Arc::clone(&self.dispatch_quiesce);
         let root = self
             .pipeline
-            .task_store.as_ref()
+            .task_store
+            .as_ref()
             .get_task(root_task_id)
             .map_or_else(|| root_task_id.clone(), |task| task.root_task_id);
         Box::pin(async move {

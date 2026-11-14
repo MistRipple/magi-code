@@ -24,7 +24,7 @@ impl PluginManager {
         lease: &str,
     ) -> Result<(), PluginError> {
         self.ensure_editing_admitted(id)?;
-        if !self.is_active(id)? || self.package(id)?.digest() != digest {
+        if !self.is_enabled(id)? || self.package(id)?.digest() != digest {
             return Err(conflict("实例不是当前授权的插件版本"));
         }
         self.runtime_catalogs.insert(
@@ -50,7 +50,7 @@ impl PluginManager {
         if runtime.revoked
             || runtime.lease != lease
             || self.package(id)?.digest() != runtime.digest
-            || !self.is_active(id)?
+            || !self.is_enabled(id)?
         {
             return Err(conflict("宿主实例已失效或授权已撤销"));
         }
@@ -89,13 +89,14 @@ impl PluginManager {
         }
     }
 
-    /// 撤权或停用一经提交，旧租约永久失效；重新激活只能接受新实例。
+    /// 停用或版本替换一经提交，旧租约永久失效；重新启用只能接受新实例。
     /// 保留失效租约直到实例退出，以便 daemon 仍能按租约清理其模型来源。
-    pub(super) fn invalidate_inactive_runtimes(&mut self) {
+    pub(super) fn invalidate_disabled_runtimes(&mut self) {
         for (id, runtime) in &mut self.runtime_catalogs {
-            runtime.revoked |= !self.state.plugins.get(id).is_some_and(|installed| {
-                installed.active && installed.enabled && installed.digest == runtime.digest
-            });
+            runtime.revoked |=
+                !self.state.plugins.get(id).is_some_and(|installed| {
+                    installed.enabled && installed.digest == runtime.digest
+                });
         }
     }
 
@@ -190,7 +191,7 @@ impl PluginManager {
                 if !runtime.revoked
                     && (runtime.ready || include_starting)
                     && runtime.digest == package.digest()
-                    && self.is_active(id)? =>
+                    && self.is_enabled(id)? =>
             {
                 merge(package.manifest(), &runtime.catalog)
             }

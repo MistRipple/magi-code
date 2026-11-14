@@ -1,9 +1,9 @@
-//! 受信扩展的运行时协调：把“已安装、已授权、应用级激活”的 Node 扩展包变成受监管的宿主进程。
+//! 受信扩展的运行时协调：把“已安装、应用级启用”的 Node 扩展包变成受监管的宿主进程。
 //!
-//! 协调器只读取插件管理服务的事实（激活状态与不可变包），不持有第二份启用意愿。
+//! 协调器只读取插件管理服务的事实（启用状态与不可变包），不持有第二份启用意愿。
 //! 每次 `plugin.registry.changed` 事件后收敛到期望集合：
-//! - 激活且声明了 `extension` 的包：登记到 ExtensionBus 并启动监管；
-//! - 不再激活、被卸载或摘要变化：停止监管并注销登记（用户显式停用才解除 guard）；
+//! - 已启用且声明了 `extension` 的包：登记到 ExtensionBus 并启动监管；
+//! - 被停用、被卸载或摘要变化：停止监管并注销登记（用户显式停用才解除 guard）；
 //! - 找不到随包 Node：登记仍保留但不启动宿主，因此 guard 钩子 fail-closed。
 
 use magi_app_server_protocol::generated::{PluginRuntimeState, PluginRuntimeStatus};
@@ -382,7 +382,7 @@ impl ExtensionRuntime {
             .state()
             .plugins
             .values()
-            .filter(|plugin| plugin.active)
+            .filter(|plugin| plugin.enabled)
             .filter_map(|plugin| manager.package(&plugin.id).ok())
             .filter(|package| package.manifest().extension.is_some())
             .map(|package| (package.manifest().id.clone(), package))
@@ -434,7 +434,7 @@ impl ExtensionRuntime {
         if let Err(error) = self.bus.register_plugin(id, &hooks) {
             return failed(format!("钩子登记被拒绝: {error}"));
         }
-        // 能激活就说明清单声明的权限已全部授权；contextRewrite 授权决定历史改写提案是否被采纳。
+        // 能启用就说明清单声明的权限随安装一并获得；contextRewrite 授权决定历史改写提案是否被采纳。
         self.bus.set_context_rewrite_authorized(
             id,
             package.manifest().permissions.iter().any(|permission| {
@@ -478,7 +478,7 @@ impl ExtensionRuntime {
         config.version = package.manifest().version.clone();
         config.digest = digest.clone();
         config.hooks = hooks;
-        // 激活意味着清单声明的权限已全部授权，因此声明的工具都已获 `tools` 授权。
+        // 启用意味着清单声明的权限已随安装获得，因此声明的工具都已获 `tools` 权限。
         config.tools = package
             .manifest()
             .contributions

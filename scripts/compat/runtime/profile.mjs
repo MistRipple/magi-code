@@ -291,8 +291,8 @@ export function createProfileReload() {
       await refresh(scope);
       const entries = new Map(loaderEntries().map(entry => [entry.options.id, entry]));
       for (const id of requiredIds) if (entries.get(id)?.fiber?.state !== 2) throw new Error(`profile 必需条目未运行：${id}`);
-      const warnings = scope.bundles.filter(({ plugin }) => plugin.enabled && !plugin.active)
-        .map(({ name }) => `${name} 尚未激活，请在 Magi 插件管理检查授权与运行状态`);
+      const warnings = scope.bundles.filter(({ plugin }) => plugin.enabled && plugin.runtime?.state !== 'running')
+        .map(({ name }) => `${name} 尚未运行，请在 Magi 插件管理检查运行状态`);
       return { warnings, pending: [] };
     },
   });

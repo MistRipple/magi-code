@@ -21,25 +21,18 @@
     onInstall: () => void;
     onUpdateFromCenter: () => void;
     onUninstall: () => void;
-    onActivate: () => void;
-    onDeactivate: () => void;
+    onEnable: () => void;
     onDisable: () => void;
     onOpenSettings: (tab: string) => void;
   }
   let {
     item, busy, busyLabel = '', previewing = false, onCancelPreview, onInstall, onUpdateFromCenter,
-    onUninstall, onActivate, onDeactivate, onDisable, onOpenSettings,
+    onUninstall, onEnable, onDisable, onOpenSettings,
   }: Props = $props();
-
-  interface ActivationRow {
-    state: 'active' | 'enabled' | 'off';
-  }
 
   const plugin = $derived(item.installed);
   const manifest = $derived<PluginManifest | null>(plugin?.manifest ?? null);
-  const settingsTab = $derived(plugin && plugin.active ? pluginSettingsTab(plugin.manifest) : null);
-  const activation = $derived(plugin ? activationRow(plugin) : null);
-  const removable = $derived(Boolean(plugin) && !plugin!.active && !plugin!.enabled);
+  const settingsTab = $derived(plugin && plugin.enabled ? pluginSettingsTab(plugin.manifest) : null);
   const translationRuntime = $derived(plugin?.translationRuntime);
   const runtimeUpdate = $derived(translationRuntime?.state === 'updateAvailable' && item.upstream?.state !== 'updatable');
   const versionUpdate = $derived(item.catalog?.state === 'updatable' ? item.catalog.version : item.upstream?.state === 'updatable' ? item.upstream.version : null);
@@ -62,13 +55,6 @@
     return i18n.t(`settings.plugins.source.${installed.source.kind}`);
   }
 
-  /** 插件全局生效，只有一个启用状态。 */
-  function activationRow(installed: InstalledPluginProjection): ActivationRow {
-    if (installed.active) return { state: 'active' };
-    if (installed.enabled) return { state: 'enabled' };
-    return { state: 'off' };
-  }
-
   /** 受信扩展的宿主运行状态；只有声明了 extension 的插件才有这一行。 */
   const runtime = $derived(plugin?.runtime ?? null);
   const isExtension = $derived(Boolean(manifest?.extension));
@@ -79,10 +65,6 @@
     const suffix = status.crashes > 0 ? i18n.t('settings.plugins.runtime.crashes', { count: status.crashes }) : '';
     return `${i18n.t(`settings.plugins.runtime.state.${status.state}`)}${suffix}`;
   }
-
-  function stateText(row: ActivationRow): string {
-    return i18n.t(`settings.plugins.activationState.${row.state}`);
-  }
 </script>
 
 <article class="pane" data-testid="plugin-card" data-plugin-id={item.id}>
@@ -92,8 +74,8 @@
       <span class="pane-icon" aria-hidden="true"><PluginIcon pluginId={item.id} icon={item.installed?.manifest.icon} upstream={item.installed ? null : item.upstream} revision={item.installed?.digest ?? ''} size={28} /></span>
       <h3>{item.name}</h3>
       <span class="settings-chip">v{item.version}</span>
-      {#if item.status === 'active'}<span class="settings-chip settings-chip--ok">{i18n.t('settings.plugins.status.active')}</span>
-            {:else if item.status === 'installed'}<span class="settings-chip">{i18n.t('settings.plugins.status.installed')}</span>
+      {#if item.status === 'enabled'}<span class="settings-chip settings-chip--ok">{i18n.t('settings.plugins.status.enabled')}</span>
+{:else if item.status === 'disabled'}<span class="settings-chip">{i18n.t('settings.plugins.status.disabled')}</span>
       {:else}<span class="settings-chip">{i18n.t('settings.plugins.status.notInstalled')}</span>{/if}
       {#if item.updatable}<span class="settings-chip settings-chip--accent">{i18n.t('settings.plugins.status.updatable')}</span>{/if}
     </div>
@@ -178,24 +160,21 @@
     <PluginImpactNotices {manifest} />
   {/if}
 
-  {#if plugin && activation}
+  {#if plugin}
     <section class="pane-section">
-      <h4>{i18n.t('settings.plugins.activation')}</h4>
-      <div class="pane-activation">
-        <div class="pane-activation-row" data-testid="plugin-activation-row" data-state={activation.state}>
-          <span class="settings-dot" class:settings-dot--ok={activation.state === 'active'} class:settings-dot--warn={activation.state === 'enabled'} aria-hidden="true"></span>
+      <h4>{i18n.t('settings.plugins.stateHeading')}</h4>
+      <div class="pane-state">
+        <div class="pane-state-row" data-testid="plugin-state-row" data-state={plugin.enabled ? 'enabled' : 'disabled'}>
+          <span class="settings-dot" class:settings-dot--ok={plugin.enabled} aria-hidden="true"></span>
           <div class="settings-row-copy">
-            <span class="settings-row-title">{i18n.t('settings.plugins.globalActivation')}</span>
-            <span class="settings-row-desc">{stateText(activation)}</span>
+            <span class="settings-row-title">{i18n.t('settings.plugins.globalEnabled')}</span>
+            <span class="settings-row-desc">{i18n.t(plugin.enabled ? 'settings.plugins.enabledState.on' : 'settings.plugins.enabledState.off')}</span>
           </div>
           <div class="settings-row-actions">
-            {#if activation.state === 'active'}
-              <button class="btn btn--sm btn--secondary" data-action="deactivate" onclick={onDeactivate} disabled={busy}>{i18n.t('settings.plugins.deactivate')}</button>
-            {:else if activation.state === 'enabled' || activation.state === 'off'}
-              {#if activation.state === 'enabled'}
-                <button class="btn btn--sm btn--secondary" onclick={onDisable} disabled={busy}>{i18n.t('settings.plugins.disable')}</button>
-              {/if}
-              <button class="btn btn--sm btn--primary" data-action="activate" onclick={onActivate} disabled={busy}>{i18n.t('settings.plugins.activate')}</button>
+            {#if plugin.enabled}
+              <button class="btn btn--sm btn--secondary" data-action="disable" onclick={onDisable} disabled={busy}>{i18n.t('settings.plugins.disable')}</button>
+            {:else}
+              <button class="btn btn--sm btn--primary" data-action="enable" onclick={onEnable} disabled={busy}>{i18n.t('settings.plugins.enable')}</button>
             {/if}
           </div>
         </div>
@@ -218,12 +197,7 @@
           <span>{i18n.t('settings.plugins.openSettings')}</span>
         </button>
       {/if}
-      <button
-        class="btn btn--sm btn--secondary"
-        onclick={onUninstall}
-        disabled={busy || !removable}
-        title={removable ? undefined : i18n.t('settings.plugins.uninstallBlocked')}
-      >{i18n.t('settings.plugins.uninstall')}</button>
+      <button class="btn btn--sm btn--secondary" onclick={onUninstall} disabled={busy}>{i18n.t('settings.plugins.uninstall')}</button>
     {:else}
       <button class="btn btn--lg btn--primary" data-testid="plugin-detail-install" onclick={onInstall} disabled={busy || (item.upstream !== null && !item.upstream.installable)} title={item.upstream?.blockedReason ?? undefined}>
         <Icon name={busy ? 'loader' : 'download'} class={busy ? 'spinning' : ''} size={13} />
@@ -248,10 +222,10 @@
   .pane-facts > div { display: grid; grid-template-columns: fit-content(30%) minmax(0, 1fr); gap: var(--space-3); align-items: baseline; }
   .pane-facts dt { overflow-wrap: anywhere; color: var(--foreground-muted); font-size: var(--text-xs); }
   .pane-facts dd { margin: 0; font-size: var(--text-xs); color: var(--foreground); overflow-wrap: anywhere; display: flex; gap: 8px; flex-wrap: wrap; }
-  .pane-facts dd > *, .pane-activation .settings-row-copy { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
-  .pane-activation-row { flex-wrap: wrap; }
+  .pane-facts dd > *, .pane-state .settings-row-copy { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+  .pane-state-row { flex-wrap: wrap; }
   .pane-warn dd { color: var(--warning); }
   .pane-section h4 { margin: 0 0 var(--space-2); font-size: var(--text-sm); font-weight: var(--font-bold); color: var(--foreground); }
-  .pane-activation { border: var(--magi-hairline) solid var(--border); border-radius: 10px; padding: 0 12px; }
-  .pane-activation-row { display: flex; align-items: center; gap: var(--space-3); min-height: 46px; padding: var(--space-2) 0; }
+  .pane-state { border: var(--magi-hairline) solid var(--border); border-radius: 10px; padding: 0 12px; }
+  .pane-state-row { display: flex; align-items: center; gap: var(--space-3); min-height: 46px; padding: var(--space-2) 0; }
 </style>

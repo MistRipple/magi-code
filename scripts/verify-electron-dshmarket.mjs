@@ -40,7 +40,7 @@ try {
   const path = `/api/plugins/${plugin.manifest.id}`;
   const current = async () => (await request('/api/plugins')).plugins.find(value => value.manifest.id === plugin.manifest.id);
   const journal = async () => JSON.parse(await readFile(join(work, 'state/plugins/installations.json'), 'utf8')).records;
-  await request(path + '/enable', {}); await request(path + '/authorize', { grants: plugin.manifest.permissions }); await request(path + '/activate', {});
+  await request(path + '/enable', {});
   const running = await waitFor(async () => { const value = (await request('/api/plugins')).plugins.find(value => value.manifest.id === plugin.manifest.id); return ['running','failed'].includes(value?.runtime?.state) && value; }, '原包实际运行', 120_000);
   assert.equal(running.runtime.state,'running',running.runtime.reason);
   await writeFile(join(output, 'plugin.json'), JSON.stringify(running, null, 2));
@@ -156,7 +156,7 @@ try {
   const cancelledJob=await waitFor(async()=>Object.values(await journal()).find(value=>value.phase==='finished'&&value.result?.application==='cancelled'),'daemon 取消任务结算');
   await writeFile(join(output,'cancelled-job.json'),JSON.stringify(cancelledJob,null,2));
   const cancelled=await current();
-  report.check('取消自身在线更新保留旧摘要、授权和运行代次',cancelled.digest===running.digest&&cancelled.active&&cancelled.runtime.instanceId===running.runtime.instanceId&&JSON.stringify(cancelled.grants)===JSON.stringify(running.grants));
+  report.check('取消自身在线更新保留旧摘要、授权和运行代次',cancelled.digest===running.digest&&cancelled.enabled&&cancelled.runtime.instanceId===running.runtime.instanceId);
   await page.call('Emulation.setDeviceMetricsOverride', { width: 1280, height: 844, deviceScaleFactor: 1, mobile: false });
   gate.release();
   const completedIds = new Set(Object.keys(await journal()));
@@ -168,9 +168,9 @@ try {
   assert.equal(selected.package,'dshmarket'); assert.notEqual(toVersion,spec.version);
   assert.equal(completedJob.result.application,'applied',JSON.stringify(completedJob.result));
   assert.equal(completedJob.result.version,toVersion,'提交版本必须与原市场实际请求一致；独立的 metadata 读取不替代该请求');
-  const pending=await waitFor(async()=>{const value=await current();return value?.manifest.version===toVersion&&value.active&&value.runtime?.state==='running'&&value;},'实际新版运行',120_000);
+  const pending=await waitFor(async()=>{const value=await current();return value?.manifest.version===toVersion&&value.enabled&&value.runtime?.state==='running'&&value;},'实际新版运行',120_000);
   await writeFile(join(output,'updated.json'),JSON.stringify(pending,null,2));
-  report.check('原市场自身更新沿既有授权运行新摘要，未扩大授权',pending.digest!==running.digest&&pending.active&&pending.runtime.instanceId!==running.runtime.instanceId&&JSON.stringify(pending.grants)===JSON.stringify(running.grants));
+  report.check('原市场自身更新沿既有授权运行新摘要，未扩大授权',pending.digest!==running.digest&&pending.enabled&&pending.runtime.instanceId!==running.runtime.instanceId);
   frame.close();frame=undefined;
   const newUrl=await waitFor(()=>page.evaluate(`document.querySelector(${JSON.stringify(selector)})?.src!==${JSON.stringify(url)}&&document.querySelector(${JSON.stringify(selector)})?.src`),'新版原包隔离文档');
   frame=await waitFor(()=>connectTarget(cdpPort,value=>['iframe','page'].includes(value.type)&&value.url===newUrl,'新版原包页面',errors),'新版原包页面');
@@ -185,12 +185,12 @@ try {
   await openMarket();
   await waitFor(()=>frame.evaluate(`document.body.innerText.includes(${JSON.stringify('v'+toVersion)})`),'重启后的原市场版本');
   const restarted=await current();
-  report.check('应用重启恢复实际新版、原授权且不重放安装',restarted.digest===pending.digest&&restarted.active&&JSON.stringify(restarted.grants)===JSON.stringify(pending.grants)&&JSON.stringify(await journal())===settled);
-  await request(path+'/deactivate',{});
+  report.check('应用重启恢复实际新版、原授权且不重放安装',restarted.digest===pending.digest&&restarted.enabled&&JSON.stringify(await journal())===settled);
+  await request(path+'/disable',{});
   await waitFor(()=>page.evaluate(`!document.querySelector(${JSON.stringify(selector)})`),'停用释放原文档');
-  report.check('停用实际市场不保留运行文档',!(await current()).active);
-  await request(path+'/activate',{});
-  const reactivated=await waitFor(async()=>{const value=await current();return value.active&&value.runtime?.state==='running'&&value;},'市场重新激活',120_000);
+  report.check('停用实际市场不保留运行文档',!(await current()).enabled);
+  await request(path+'/enable',{});
+  const reactivated=await waitFor(async()=>{const value=await current();return value.enabled&&value.runtime?.state==='running'&&value;},'市场重新激活',120_000);
   await openMarket();
   await waitFor(()=>frame.evaluate(`document.body.innerText.includes(${JSON.stringify('v'+toVersion)})`),'重新激活的原页面');
   report.check('重新激活使用新实例并保留同一摘要，无迟到安装',reactivated.digest===pending.digest&&reactivated.runtime.instanceId!==restarted.runtime.instanceId&&JSON.stringify(await journal())===settled);

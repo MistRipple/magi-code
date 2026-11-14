@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { connectTarget, pageTools, waitFor } from './electron-harness.mjs';
 import { capturePluginDownload } from './plugin-download-acceptance.mjs';
-import { authorizePluginFromNative } from './plugin-native-acceptance.mjs';
+import { waitForInstalledPlugin } from './plugin-native-acceptance.mjs';
 
 // 专项和社区共用完整 Share 原包流程；页面、二维码和原始回执不改写。
 export async function verifyDshShare({ request, plugin, page, cdpPort, inspector, errors, gate, output, stateRoot, restart, check, clipAudit }) {
@@ -43,14 +43,14 @@ export async function verifyDshShare({ request, plugin, page, cdpPort, inspector
   const history = () => frame.evaluate(`JSON.parse(localStorage.getItem('dsh-plugin-share:results:v1')??'null')`);
   const authorize = async target => {
     const before = await journal();
-    const active = await authorizePluginFromNative({ request, page, plugin: target });
+    const active = await waitForInstalledPlugin({ request, page, plugin: target });
     assert.equal(await journal(), before, '原生授权不能重放原包安装任务');
     await openPage(); return active;
   };
   const remove = async packageName => {
     const target = await current(packageName); if (!target) return;
     const path = `/api/plugins/${target.manifest.id}`;
-    if (target.active) await request(path + '/deactivate', {});
+    if (target.enabled) await request(path + '/disable', {});
     if (target.enabled) await request(path + '/disable', {});
     await request(path + '/uninstall', {});
   };
@@ -75,24 +75,15 @@ export async function verifyDshShare({ request, plugin, page, cdpPort, inspector
     gate.release();
     await waitFor(() => clickText('重试当前项'), 'Share 原包取消后显式重试');
     const pending = await waitFor(async () => { const value = await current(name); return value?.manifest.version === '0.0.7' && value; }, 'Share 在线提交 npm 原包', 240_000);
-    await waitFor(() => frame.evaluate('document.body.innerText.includes("authorization-required")&&document.body.innerText.includes("Magi 插件管理")'), 'Share 原页面授权恢复说明');
-    const failedHistory = await history(), failedId = failedHistory.items.find(value => value.reason === 'authorization-required').id;
-    const failedReceipt = await route('import-status', { requestId: failedId });
-    evidence.authorizationRequired = { receipt: failedReceipt, plugin: pending };
-    record('authorizationNotice', 'Share 原回执保留新版已安装、未授权和原生恢复说明', failedReceipt.body.operation?.installed === true && failedReceipt.body.operation.stage === 'enable'
-      && failedReceipt.body.operation.error.message.includes(`已安装 ${name}@0.0.7`) && !pending.active && pending.grants.length === 0);
-    await screenshot('authorization-required');
     const active = await authorize(pending);
-    record('nativeRecovery', '用户从原生入口授权同一摘要运行，原任务和失败记录保持真实', active.digest === pending.digest
-      && JSON.stringify(await route('import-status', { requestId: failedId })) === JSON.stringify(failedReceipt)
-      && JSON.stringify(await history()) === JSON.stringify(failedHistory));
+    record('installEnabled', 'Share 原包在线导入后直接启用并运行同一摘要', pending.enabled && active.digest === pending.digest);
     for (const enabled of [false, true]) {
       const toggle = (await call('export', { entries: [{ kind: 'npm', name, version: '0.0.7', enabled }] })).code;
       await call('import', { code: toggle, confirm: true, requestId: `share-toggle-${enabled}` });
-      const target = await current(name); assert.equal(target.enabled, enabled); assert.equal(target.active, enabled);
+      const target = await current(name); assert.equal(target.enabled, enabled);
       if (enabled) assert.equal(target.runtime.state, 'running');
     }
-    record('lifecycle', 'Share 原包导入启停设置实际停止及恢复已授权宿主', true);
+    record('lifecycle', 'Share 原包导入启停设置实际停止及恢复宿主', true);
     const newer = (await call('export', { entries: [{ kind: 'npm', name, version: '0.0.8', enabled: true }] })).code;
     const refused = await route('import', { code: newer, confirm: true, requestId: 'share-manual-update' });
     record('manualUpdate', '保留原包要求手动更新的回执和当前真实版本', refused.status === 409 && refused.body.error === 'manual-update-required'
@@ -127,7 +118,7 @@ export async function verifyDshShare({ request, plugin, page, cdpPort, inspector
     }, 'Share 提交真实 GitHub 原包', 300_000);
     const completedGit = await waitFor(async () => (await history()).items.find(value => value.spec === githubSpec && value.outcome === 'success'), 'Share GitHub 安装成功回执', 60_000);
     await waitFor(() => page.evaluate(`(() => {const values=JSON.parse(localStorage.getItem(${JSON.stringify(`magi:plugin-ui:${id}`)})??'{}');return JSON.parse(values['dsh-plugin-share:results:v1']??'null')?.items.some(value=>value.id===${JSON.stringify(completedGit.id)}&&value.outcome==='success');})()`), 'Share GitHub 成功结果实际持久化');
-    record('githubImport', 'Share 从 GitHub 安装固定提交，保持停用和未授权事实', !gitInstalled.enabled && !gitInstalled.active && gitInstalled.grants.length === 0
+    record('githubImport', 'Share 从 GitHub 安装固定提交并启用', gitInstalled.enabled
       && gitInstalled.source.github?.commit === '8e1d4366fb71012b82a7c2bc476398a764eab76c');
     const collected = await call('state');
     record('githubSource', '原包导出目录保留 GitHub 来源及真实版本', collected.bundles.some(value => value.name === 'dsh-plugin-health' && value.source === githubSpec && value.version === '3.0.5')
@@ -155,7 +146,7 @@ export async function verifyDshShare({ request, plugin, page, cdpPort, inspector
     record('updateCancellation', '取消在线更新保留原提交、授权与运行实例', (await current('dsh-plugin-health')).digest === gitActive.digest && (await current('dsh-plugin-health')).runtime.generation === gitActive.runtime.generation);
     await previewUpdate(); await ui.click('[data-action=confirm-candidate]');
     const gitUpdated = await waitFor(async () => { const target = await current('dsh-plugin-health'); return target?.manifest.version === '3.0.6' && target; }, '原生提交 GitHub 新版本', 300_000);
-    record('onlineUpdate', 'GitHub 在线更新提交新版本并保留待授权事实', gitUpdated.source.github?.reference === 'v3.0.6' && !gitUpdated.active && gitUpdated.grants.length === 0);
+    record('onlineUpdate', 'GitHub 在线更新提交新版本并保持启用', gitUpdated.source.github?.reference === 'v3.0.6' && gitUpdated.enabled);
     await authorize(gitUpdated);
     await ui.click('[data-testid=settings-nav-plugins]');
     const gitRow = `[data-testid=plugin-row][data-plugin-id=${JSON.stringify(gitUpdated.manifest.id)}]`;
@@ -178,13 +169,13 @@ export async function verifyDshShare({ request, plugin, page, cdpPort, inspector
     await remove(name); await parse(code); gate.pause(name);
     await waitFor(() => clickText('全部可处理项加入队列'), 'Share 停用前发起真实导入');
     await waitFor(() => gate.held.size > 0, 'Share 停用前真实准备');
-    closeFrame(); await request(`/api/plugins/${id}/deactivate`, {});
+    closeFrame(); await request(`/api/plugins/${id}/disable`, {});
     await waitFor(() => gate.held.size === 0, 'Share 停用取消准备'); gate.release();
     await waitFor(() => page.evaluate(`!document.querySelector('iframe[data-plugin-id="${id}"]')`), 'Share 停用释放文档');
     const stoppedJournal = await waitFor(async () => { const value = await journal(); return Object.values(JSON.parse(value).records).every(record => record.phase === 'finished') && value; }, 'Share 停用结算原导入持久回执');
     record('deactivation', '停用 Share 回收原包文档和在途导入，未提交目标保持未安装', !await current(name)
       && await page.evaluate(`!document.querySelector('iframe[data-plugin-id="${id}"]')`));
-    await request(`/api/plugins/${id}/activate`, {});
+    await request(`/api/plugins/${id}/enable`, {});
     await waitFor(async () => (await plugins()).find(value => value.manifest.id === id)?.runtime?.state === 'running', 'Share 重新启用');
     await openPage();
     const restoredHistory = await history();
@@ -205,7 +196,7 @@ export async function verifyDshShare({ request, plugin, page, cdpPort, inspector
     await screenshot('failure').catch(() => {}); throw error;
   } finally {
     closeFrame();
-    if (!evidence.completed) await request(`/api/plugins/${id}/deactivate`, {}).catch(() => {});
+    if (!evidence.completed) await request(`/api/plugins/${id}/disable`, {}).catch(() => {});
     gate.release();
     await remove(name); await remove('dsh-plugin-health');
     await writeFile(join(output, 'share-business.json'), JSON.stringify(evidence, null, 2));

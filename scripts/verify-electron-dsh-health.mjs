@@ -29,8 +29,6 @@ async function install(name, version) {
   await api('/api/plugins/upstream/install', { ...input, expectedDigest: preview.candidate.digest });
   const plugin = (await plugins()).find(p => p.source.location === `dsh:${name}@${version}`); assert.ok(plugin);
   await api(`/api/plugins/${plugin.manifest.id}/enable`, {});
-  await api(`/api/plugins/${plugin.manifest.id}/authorize`, { grants: plugin.manifest.permissions });
-  await api(`/api/plugins/${plugin.manifest.id}/activate`, {});
   await waitFor(async () => (await current(plugin.manifest.id)).runtime?.state === 'running', `${name} 原包运行`, 90_000);
   return plugin;
 }

@@ -1,6 +1,6 @@
 //! daemon 对插件系统的装配。
 //!
-//! `magi-plugin-system` 拥有安装、授权与资源的事实；本模块只持有插件管理器、
+//! `magi-plugin-system` 拥有安装、启停与资源的事实；本模块只持有插件管理器、
 //! 扩展总线与受信 Node 扩展运行时，并把它们接到 daemon 的执行链路上。这里不保存任何插件
 //! 状态，也不另建权限判定。
 
@@ -271,7 +271,7 @@ impl magi_conversation_runtime::plugin_command::PluginCommandExecutor for NodeCo
             .ok_or("插件命令缺少所属会话")?;
         let execution = execution_context(&invocation.context)?;
         let selected = magi_plugin_system::ContributionRef::parse("命令", &invocation.command_id)?;
-        // 与目录同一判定：命令必须来自当前激活的插件。
+        // 与目录同一判定：命令必须来自当前启用的插件。
         let digest = {
             let manager = self
                 .manager
@@ -285,7 +285,7 @@ impl magi_conversation_runtime::plugin_command::PluginCommandExecutor for NodeCo
                     manifest.id == selected.plugin_id && command.id == selected.contribution_id
                 });
             if !available {
-                return Err("插件命令未在当前全局状态激活".into());
+                return Err("插件命令未在当前全局状态启用".into());
             }
             manager
                 .package(&selected.plugin_id)
@@ -298,7 +298,7 @@ impl magi_conversation_runtime::plugin_command::PluginCommandExecutor for NodeCo
             .instance(&selected.plugin_id)
             .ok_or_else(|| "扩展宿主未运行".to_string())?;
         if instance.digest != digest {
-            return Err("扩展宿主不是当前授权的版本".into());
+            return Err("扩展宿主不是当前安装的版本".into());
         }
         let ctx = json!({
             "job": invocation.job,
@@ -351,7 +351,7 @@ impl magi_conversation_runtime::plugin_command::PluginCommandExecutor for NodeCo
 /// 但仍有界；HTTP 请求被丢弃时宿主侧调用随即取消。
 const ROUTE_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// 视图后端路由的执行者。授权判定与工具、命令同源：插件必须在当前全局状态激活，
+/// 视图后端路由的执行者。授权判定与工具、命令同源：插件必须在当前全局状态启用，
 /// 宿主摘要必须是当前授权的包；路由本身只服务该插件自己的视图。
 pub(super) struct NodeRouteExecutor {
     manager: Arc<Mutex<PluginManager>>,
@@ -415,10 +415,10 @@ impl magi_api::PluginRouteExecutor for NodeRouteExecutor {
                     ApiError::internal_assembly("插件路由调用失败", "插件管理器不可用")
                 })?;
                 if !manager
-                    .is_active(&plugin_id)
+                    .is_enabled(&plugin_id)
                     .map_err(|error| ApiError::Conflict(error.to_string()))?
                 {
-                    return Err(ApiError::Conflict("插件未激活".into()));
+                    return Err(ApiError::Conflict("插件未启用".into()));
                 }
                 let package = manager
                     .package(&plugin_id)
@@ -446,7 +446,7 @@ impl magi_api::PluginRouteExecutor for NodeRouteExecutor {
                 ));
             }
             if instance.digest != digest {
-                return Err(ApiError::Conflict("扩展宿主不是当前授权的版本".into()));
+                return Err(ApiError::Conflict("扩展宿主不是当前安装的版本".into()));
             }
             let ctx = json!({
                 "invocationId": format!("route_{}", NEXT_PLUGIN_INVOCATION.fetch_add(1, Ordering::Relaxed)),
@@ -509,7 +509,7 @@ impl magi_api::PluginRouteExecutor for NodeRouteExecutor {
                     ApiError::internal_assembly("插件路由调用失败", "插件管理器不可用")
                 })?;
                 if !manager
-                    .is_active(&plugin_id)
+                    .is_enabled(&plugin_id)
                     .map_err(|error| ApiError::Conflict(error.to_string()))?
                     || manager
                         .package(&plugin_id)
@@ -812,9 +812,9 @@ pub(super) fn execute_tool(
     let Some(instance) = bus.instance(&prepared.plugin_id) else {
         return failure(Failed, "plugin_host_unavailable", "扩展宿主未运行");
     };
-    // 校验后升级换包会让旧宿主继续存在一小段时间；摘要不符的宿主不得执行新授权的调用。
+    // 校验后升级换包会让旧宿主继续存在一小段时间；摘要不符的宿主不得执行新版本的调用。
     if instance.digest != prepared.digest {
-        return failure(Failed, "plugin_host_stale", "扩展宿主不是当前授权的版本");
+        return failure(Failed, "plugin_host_stale", "扩展宿主不是当前安装的版本");
     }
     let execution = match execution_context(context) {
         Ok(execution) => execution,

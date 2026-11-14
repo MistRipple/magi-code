@@ -61,8 +61,7 @@ try {
     await api('/api/plugins/upstream/install', { ...source, expectedDigest: preview.candidate.digest });
     const installed = await plugin(), id = installed.manifest.id;
     await api(`/api/plugins/${id}/enable`, {});
-    await api(`/api/plugins/${id}/authorize`, { grants: installed.manifest.permissions });
-    await api(`/api/plugins/${id}/activate`, {}); await running();
+    await api(`/api/plugins/${id}/enable`, {}); await running();
     const settings = await api(`/api/plugins/${id}/settings`);
     const saved = await api(`/api/plugins/${id}/settings`, { expectedVersion: settings?.version ?? 0, value: settings?.value ?? {} }, 'PUT');
     await writeFile(join(output, 'seed.json'), JSON.stringify({ work, source, plugin: await plugin(), settings: saved }, null, 2));
@@ -101,10 +100,9 @@ try {
     await screenshot('update-preview');
     await ui.click('[data-action=confirm-candidate]');
     const installed = await waitFor(async () => { const current = await plugin(); return current.digest !== before.digest && current.translationRuntime?.state === 'current' && current; }, '在线确认提交', 240_000);
-    reporter.check('同版原包切换摘要后保留启用意愿，新摘要需要重新授权', installed.manifest.version === before.manifest.version && installed.enabled && !installed.active && installed.grants.length === 0);
-    await waitFor(() => ui.exists('[data-action=activate]'), '新摘要的授权激活入口'); await ui.click('[data-action=activate]');
+    reporter.check('同版原包切换摘要后保持启用', installed.manifest.version === before.manifest.version && installed.enabled);
     const updated = await running();
-    reporter.check('用户重新授权激活后，新组件的原包恢复运行', updated.active && updated.runtime.state === 'running');
+    reporter.check('新组件的原包无需再次确认即恢复运行', updated.enabled && updated.runtime.state === 'running');
     reporter.check('运行组件更新保留原包来源和已保存设置', JSON.stringify(updated.source) === JSON.stringify(before.source) && JSON.stringify(await api(`/api/plugins/${id}/settings`)) === JSON.stringify(previous.settings));
     await waitFor(() => ui.exists('[data-testid=plugin-open-settings]'), '原包设置入口'); await ui.click('[data-testid=plugin-open-settings]');
     const selector = `iframe[data-plugin-id="${id}"]`;

@@ -1,10 +1,13 @@
 # App Server 协议生成约定
 
-`PluginAuthorizeRequest`／`PluginActivationRequest.expectedDigest` 为可选增量字段，
-原生管理页及插件设置页的授权、启用、激活和停用操作均发送用户看到的安装摘要。
-HTTP 入口复用 PluginOperations 已有的目标核对，准入和异步排空后的提交都必须一致；
-过期页面不能授权或停止新版插件。省略字段的已有调用保持原合同，插件管理 RPC 的摘要规则不变。
-插件设置页只使用已有授权重新启用；需要授权时定位原生管理页的同一插件，展示影响与权限后确认。
+插件生命周期只有启用／停用／卸载三个动作（2026-11-14 起）：`PluginInstalled` 删除 `grants` 与 `active` 字段，`PluginAuthorizeRequest`
+删除，`PluginActivationRequest` 更名为 `PluginLifecycleRequest`；HTTP 入口只有 `/enable`、`/disable`、`/uninstall`，没有
+`/authorize`、`/activate`、`/deactivate`。`PluginLifecycleRequest.expectedDigest` 仍为可选增量字段，原生管理页及插件设置页的
+启用和停用操作均发送用户看到的安装摘要。HTTP 入口复用 PluginOperations 已有的目标核对，准入和异步排空后的提交都必须一致；
+过期页面不能操作新版插件。省略字段的已有调用保持原合同。这是一次有意的破坏性协议收敛（产品还没有外部客户端依赖这些字段）：
+持久化 `state.json` 的 `STATE_VERSION` 由 2 升到 3，首次打开时折叠为单一 `enabled`（旧的 `enabled && active` 为真才保持启用），
+迁移前备份为 `state.json.schema-v2-<毫秒时间戳>`，旧授权记录不再被读取。插件扩展协议握手中的 `grants` 字段保持原形状，
+内容为已安装包声明的运行权限。
 
 `ModelResponseTiming.responseDurationMs` 为可选增量字段：成功且最终输出 Token 与本次传输可配对时，
 记录 HTTP 请求开始到完整响应最后一次接收的耗时，包含首段等待、思考、正文和用量尾段。
@@ -14,12 +17,12 @@ daemon 用量权威用同次实际总输出和该耗时聚合整体响应速度�
 responseDurationMs 与 lastResponseTps；UI 不自行估算 Token 或重新计时。
 
 `chatAssistant` 是会话内视图位置的增量枚举，复用原 views 清单与包版本事务。`composerLeft`（输入区左侧插件面板）已移除，
-没有任何界面承载它；枚举值只为让已安装包的清单仍能解析而保留：daemon 对声明它的包拒绝激活，配置、包摘要和授权记录保留，
+没有任何界面承载它；枚举值只为让已安装包的清单仍能解析而保留：daemon 对声明它的包拒绝安装与启用，配置和包摘要保留，
 在线更新或重新安装获得新产物后恢复，新翻译产物不再声明。清退条件：已发布的产物不再声明该位置、且持久化清单迁移就绪后，
 同时删除该枚举值与激活拒绝规则。
 `priority` 缺省为 0；独立视图入口沿优先级、插件与贡献身份排序，不授予原生正文替换权。`sessionRead:["render"]`
 独立于 `directory` 及 `composer:["text"]`，只读取可见会话身份及用于渲染的助手正文。
-`PluginViewAdmissionRequest` 由 daemon 校验当前安装摘要、激活、授权与位置声明；
+`PluginViewAdmissionRequest` 由 daemon 校验当前安装摘要、启用状态与位置声明；
 `PluginConversationViewContext` 为原 Renderer 投影经同一隔离页面桥交付的只读内容，
 不写入持久化、不新增会话事实。停用、版本切换及会话变化释放旧文档。
 
@@ -85,12 +88,12 @@ Bridge 可以拥有不同传输实现，但不得重新定义同形状的 wire D
 也必须沿用 canonical session/turn/item 语义。
 
 插件系统的 `Plugin*` 清单与 DTO 也定义于本 schema，复用同一生成入口。清单类型
-定义本身不增加可调用的 App Server method；能力准入仍由 daemon 的插件安装、授权
-与激活状态决定。`magi-plugin-system` 使用生成类型并对包资源与作用域补充语义校验；不得
+定义本身不增加可调用的 App Server method；能力准入仍由 daemon 的插件安装与
+启用状态决定。`magi-plugin-system` 使用生成类型并对包资源与作用域补充语义校验；不得
 在插件 SDK、HTTP 适配器或 UI 手写另一份清单结构。
 
 `PluginContributions.client` 与 `client:["persistent"]` 为常驻客户端的增量合同。
-入口必须引用已声明视图；启动仍须满足 daemon 的激活与全部授权事实。旧包不声明该
+入口必须引用已声明视图；启动仍须满足 daemon 的启用状态与清单声明的全部权限。旧包不声明该
 贡献，继续按页面生命周期挂载。新增权限须在升级预览中展示并重新授权，不自动授予。
 常驻客户端只在当前工作台窗口存活，视图切换复用同一隔离文档；不改变 daemon 的
 Session、Turn 或草稿事实，也不允许未授权的后台会话写入。
@@ -110,8 +113,8 @@ Session、Turn 或草稿事实，也不允许未授权的后台会话写入。
 管理写操作需要独立 compatibility 授权和风险确认，不改变已有安装摘要、能力或权限准入。
 
 `PluginReconcileRequest` 为扩展服务的增量输入 DTO，经 `plugin.reconciliation` 协商使用，不新增 App Server 方法。
-显式选择至多 512 个唯一已安装 ID，只核对已提交的激活意图并等待原监管器就绪，返回既有插件目录。
-它不修改启停、授权或安装事实；需要 lifecycle 授权，后台调用另需 background，期间版本／状态变化明确拒绝。
+显式选择至多 512 个唯一已安装 ID，只核对已提交的启停意图并等待原监管器就绪，返回既有插件目录。
+它不修改启停或安装事实；需要 lifecycle 授权，后台调用另需 background，期间版本／状态变化明确拒绝。
 
 `PluginListRequest.includeUpstreamManifest` 与 `PluginInstalled.upstreamManifest` 是只读增量字段：
 旧请求默认省略原包元数据；显式请求时仅返回 daemon 当前不可变安装归档内通过包名/版本校验的
@@ -119,7 +122,7 @@ package.json，不包含插件可写配置或凭据。旧包缺失该文件时�
 
 同一显式请求还提供 `PluginInstalled.upstreamArchivePath`：daemon 当前不可变安装归档的
 绝对路径，受信 Node 宿主读取前须核对同一投影的 digest。它只用于调用期间的原包只读
-文件快照，不生成第二份安装树，不表示该包已激活或已物化。默认列表不返回该路径；
+文件快照，不生成第二份安装树，不表示该包已启用或已物化。默认列表不返回该路径；
 目录读取、实例租约和管理权限仍沿原入口，路径不允许作为安装或写入提案。
 
 `PluginRouteCallRequest.headers` 是可选的增量字段，用于插件页面向其私有后端携带应用头。

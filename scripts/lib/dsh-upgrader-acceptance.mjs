@@ -3,7 +3,7 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { connectTarget, pageTools, waitFor } from './electron-harness.mjs';
 import { createPluginThemeCases, activatePluginTheme, measurePluginContrast } from './plugin-theme-acceptance.mjs';
-import { authorizePluginFromNative, upgradePluginFromNative } from './plugin-native-acceptance.mjs';
+import { waitForInstalledPlugin, upgradePluginFromNative } from './plugin-native-acceptance.mjs';
 
 // 两个验收入口共享同一用户任务：原页面操作、后台生命周期、版本切换、
 // 失败恢复及重启。传入的 request 只访问调用者本次独立 daemon。
@@ -45,7 +45,7 @@ export async function verifyDshUpgrader({ request, origin, plugin, page, cdpPort
     await request('/api/plugins/upstream/install', { ...input, expectedDigest: preview.candidate.digest });
     const target = await current(); assert.ok(target);
     const path = `/api/plugins/${target.manifest.id}`;
-    await request(path + '/enable', {}); await request(path + '/authorize', { grants: target.manifest.permissions }); await request(path + '/activate', {});
+    await request(path + '/enable', {});
     await waitFor(async () => (await current())?.runtime?.state === 'running', 'Upgrader 真实目标运行', 120_000);
     return current();
   };
@@ -55,7 +55,7 @@ export async function verifyDshUpgrader({ request, origin, plugin, page, cdpPort
     await frame.evaluate(`${upgradeButton}.click()`);
     await waitFor(() => gate.held.size > 0, 'Upgrader 当前安装进入真实解析等待', 30_000);
     const overview = await route('overview'); assert.equal(overview.status, 200);
-    assert.ok(overview.body.active?.id); return overview.body.active.id;
+    assert.ok(overview.body.enabled?.id); return overview.body.enabled.id;
   };
   const waitJob = id => waitFor(async () => {
     const result = await route('job', undefined, `id=${id}`);
@@ -66,18 +66,13 @@ export async function verifyDshUpgrader({ request, origin, plugin, page, cdpPort
     const submitted = await route('job', { steps: [{ name, version, action: 'switch', enabled }] });
     assert.equal(submitted.status, 202, JSON.stringify(submitted)); return waitJob(submitted.body.id);
   };
-  const authorizeCommitted = async job => {
-    const target = await current(), result = job.results[0];
-    assert.equal(job.failed, 1, JSON.stringify(job));
-    assert.equal(result.message, 'authorization-required', JSON.stringify(job));
-    assert.equal(result.stage, 'enable');
-    assert.ok(result.detail.includes(`已安装 ${name}@${target.manifest.version}`) && result.detail.includes('Magi 插件管理') && result.detail.includes('无需重复安装'));
-    assert.ok(!target.active && target.grants.length === 0);
-    const journal = await readFile(join(stateRoot, 'plugins/installations.json'), 'utf8');
-    const active = await authorizePluginFromNative({ request, page, plugin: target });
-    assert.equal(await readFile(join(stateRoot, 'plugins/installations.json'), 'utf8'), journal, '授权恢复不能重放安装任务');
+  // 安装与切换提交即启用；这里只确认任务没有失败，并等待同一安装的宿主真实运行。
+  const awaitCommitted = async job => {
+    const target = await current();
+    assert.equal(job.failed, 0, JSON.stringify(job));
+    const running = await waitForInstalledPlugin({ request, page, plugin: target });
     await openPage(false);
-    return active;
+    return running;
   };
   try {
     await openPage();
@@ -105,7 +100,6 @@ export async function verifyDshUpgrader({ request, origin, plugin, page, cdpPort
     record('selfUpdateSettings', '升级器自身在线更新保留旧版原页面保存的实际配置', upgradedSettings.version === savedSettings.version
       && JSON.stringify(upgradedSettings.value) === JSON.stringify(savedSettings.value));
     evidence.selfUpdateSettings = { before: savedSettings, after: upgradedSettings };
-    record('noDelegation', 'Upgrader 原包未申请替其他包授权的委托', !plugin.manifest.permissions.some(permission => permission.kind === 'pluginManagement' && permission.targets.includes('authorize')));
     assert.equal(await current(), undefined, '每次 Upgrader 验收从独立的未安装目标开始');
     const original = await installTarget();
     await openPage();
@@ -147,25 +141,25 @@ export async function verifyDshUpgrader({ request, origin, plugin, page, cdpPort
       && (await current()).digest === original.digest && (await current()).runtime.generation === original.runtime.generation);
     await pageTools(page).click('[data-testid=settings-back]');
     record('background', '关闭 Upgrader 设置页保留同一后台文档及实际在途任务',
-      await frame.evaluate(`window.__upgraderAcceptance===${JSON.stringify(identity)}`) && (await route('overview')).body.active.id === cancelledId && gate.held.size > 0);
+      await frame.evaluate(`window.__upgraderAcceptance===${JSON.stringify(identity)}`) && (await route('overview')).body.enabled.id === cancelledId && gate.held.size > 0);
     await openPage(false);
     record('reopen', '重开 Upgrader 原页面沿真实任务恢复运行反馈',
-      await frame.evaluate(`window.__upgraderAcceptance===${JSON.stringify(identity)}`) && (await route('overview')).body.active.id === cancelledId);
+      await frame.evaluate(`window.__upgraderAcceptance===${JSON.stringify(identity)}`) && (await route('overview')).body.enabled.id === cancelledId);
     await waitFor(() => frame.evaluate(`(() => {const button=[...document.querySelectorAll('.dsh-pu-job button')].find(button=>/^(取消|Cancel)$/.test(button.innerText.trim())&&!button.disabled);if(!button)return false;button.click();return true;})()`), '原包取消安装');
     await waitFor(() => gate.held.size === 0, '取消回收真实解析连接');
     const cancelled = await waitJob(cancelledId), afterCancel = await current();
     record('cancellation', 'Upgrader 原包取消真正停止安装并保留旧摘要、授权与运行代次', cancelled.status === 'cancelled' && cancelled.results[0]?.application === 'cancelled'
-      && afterCancel.digest === original.digest && afterCancel.runtime.generation === original.runtime.generation && JSON.stringify(afterCancel.grants) === JSON.stringify(original.grants));
+      && afterCancel.digest === original.digest && afterCancel.runtime.generation === original.runtime.generation);
     await screenshot('cancelled');
     // 已结束的请求租约不能拥有后台任务；停用则必须结束实例所有任务。
     const stoppedId = await beginFromPage();
-    await request(pluginPath + '/deactivate', {});
+    await request(pluginPath + '/disable', {});
     await waitFor(() => gate.held.size === 0, '停用升级器回收真实准备进程');
     const stopped = await current();
     record('deactivation', '停用 Upgrader 取消准备中的安装，目标摘要、授权与运行意愿保持', stopped.digest === original.digest
-      && stopped.active && stopped.runtime.generation === original.runtime.generation && JSON.stringify(stopped.grants) === JSON.stringify(original.grants));
+      && stopped.enabled && stopped.runtime.generation === original.runtime.generation);
     closeFrame(); gate.release();
-    await request(pluginPath + '/activate', {});
+    await request(pluginPath + '/enable', {});
     await waitFor(async () => (await plugins()).find(p => p.manifest.id === plugin.manifest.id)?.runtime?.state === 'running', 'Upgrader 重新激活', 120_000);
     await openPage();
     const oldJob = await route('job', undefined, `id=${stoppedId}`);
@@ -177,40 +171,35 @@ export async function verifyDshUpgrader({ request, origin, plugin, page, cdpPort
     const updateId = await waitFor(async () => (await route('overview')).body.jobs.find(job => job.status === 'finished')?.id, 'Upgrader 原页面更新任务结算', 240_000);
     const updateJob = await waitJob(updateId);
     const pending = await current();
-    await waitFor(() => frame.evaluate(`document.body.innerText.includes('已安装 ${name}@0.0.8')&&document.body.innerText.includes('Magi 插件管理')&&document.body.innerText.includes('无需重复安装')`), '原包显示授权恢复提示');
-    record('authorizationNotice', '原页面更新回执区分新版已安装与未授权，并说明原生恢复操作', pending.manifest.version === '0.0.8' && !pending.active);
-    evidence.authorizationRequired = { job: updateJob, plugin: pending };
-    await screenshot('authorization-required');
+    record('updateCommitted', '原页面更新提交新版并直接启用，没有授权恢复步骤', pending.manifest.version === '0.0.8' && pending.enabled && updateJob.failed === 0);
     record('documentIdentity', '目标在线更新保留 Upgrader 原页面身份与实际完成回执', await frame.evaluate(`window.__upgraderAcceptance===${JSON.stringify(retryIdentity)}`));
-    const upgraded = await authorizeCommitted(updateJob);
+    const upgraded = await awaitCommitted(updateJob);
     await waitFor(() => frame.evaluate(`!${upgradeButton} && ![...document.querySelectorAll('.dsh-pu-job button')].some(button=>/^(取消|Cancel|正在取消…|Cancelling…)$/.test(button.innerText.trim()))`), '原包页面更新完成回执');
-    record('onlineUpgrade', '原包在线更新后由用户原生授权恢复同一新版，未重复安装', upgraded.active && upgraded.grants.length > 0);
-    record('receiptPreserved', '原生授权后重开原页面仍可查询相同任务及原始失败回执', JSON.stringify((await route('job', undefined, `id=${updateId}`)).body) === JSON.stringify(updateJob));
+    record('onlineUpgrade', '原包在线更新后同一新版已启用并运行，未重复安装', upgraded.enabled && upgraded.runtime?.state === 'running');
+    record('receiptPreserved', '重开原页面仍可查询相同任务回执', JSON.stringify((await route('job', undefined, `id=${updateId}`)).body) === JSON.stringify(updateJob));
     await screenshot('updated');
     const switched = await runVersion('0.0.7', false), disabled = await current();
-    record('versionSwitch', 'Upgrader 真实版本切换保持目标停用意愿', switched.failed === 0 && disabled.manifest.version === '0.0.7' && !disabled.enabled && !disabled.active);
+    record('versionSwitch', 'Upgrader 真实版本切换保持目标停用意愿', switched.failed === 0 && disabled.manifest.version === '0.0.7' && !disabled.enabled);
     const missing = await runVersion('9999.0.0', false);
     record('failedDisabled', '不存在版本的更新失败保留旧摘要与停用意愿', missing.failed === 1 && (await current()).digest === disabled.digest && !(await current()).enabled);
     const restored = await runVersion('0.0.8', true);
-    await authorizeCommitted(restored);
+    await awaitCommitted(restored);
     const authorized = await current();
     const missingActive = await runVersion('9999.0.0', true), afterMissing = await current();
-    record('failedActive', '不存在版本的更新失败保留旧授权及同一运行实例', missingActive.failed === 1
-      && afterMissing.digest === authorized.digest && afterMissing.enabled && afterMissing.active
-      && afterMissing.runtime.state === 'running' && afterMissing.runtime.generation === authorized.runtime.generation
-      && JSON.stringify(afterMissing.grants) === JSON.stringify(authorized.grants));
+    record('failedActive', '不存在版本的更新失败保留旧版本及同一运行实例', missingActive.failed === 1
+      && afterMissing.digest === authorized.digest && afterMissing.enabled
+      && afterMissing.runtime.state === 'running' && afterMissing.runtime.generation === authorized.runtime.generation);
     const preview = await request('/api/plugins/upstream/preview', { ecosystem: 'dsh', package: name, version: '0.0.7' });
     const blocked = join(stateRoot, 'plugins/versions', authorized.manifest.id, `${preview.candidate.digest}.zip`);
     await mkdir(blocked);
     try {
       const failed = await runVersion('0.0.7', true);
       const recovered = await waitFor(async () => { const value = await current(); return value?.digest === authorized.digest && value.runtime?.state === 'running' && value; }, '真实落盘失败恢复原版本', 30_000);
-      record('failedReplacement', 'Upgrader 归档写入失败恢复旧版本、授权及实际运行', failed.failed === 1 && recovered.active && recovered.enabled
-        && JSON.stringify(recovered.grants) === JSON.stringify(authorized.grants));
+      record('failedReplacement', 'Upgrader 归档写入失败恢复旧版本及实际运行', failed.failed === 1 && recovered.enabled);
     } finally { await rm(blocked, { recursive: true, force: true }); }
     const retried = await runVersion('0.0.7', true);
-    await authorizeCommitted(retried);
-    record('explicitRetry', '清除落盘故障后显式重试并原生授权成功，不重放已完成的安装', (await current()).manifest.version === '0.0.7' && (await current()).runtime.state === 'running');
+    await awaitCommitted(retried);
+    record('explicitRetry', '清除落盘故障后显式重试成功，不重放已完成的安装', (await current()).manifest.version === '0.0.7' && (await current()).runtime.state === 'running');
     const beforeRestart = await current(); closeFrame(); page = await restart();
     await waitFor(async () => (await plugins()).find(p => p.manifest.id === plugin.manifest.id)?.runtime?.state === 'running', '应用重启恢复 Upgrader', 120_000);
     await openPage();
@@ -226,7 +215,7 @@ export async function verifyDshUpgrader({ request, origin, plugin, page, cdpPort
     const target = await current();
     if (target) {
       const path = `/api/plugins/${target.manifest.id}`;
-      if (target.active) await request(path + '/deactivate', {});
+      if (target.enabled) await request(path + '/disable', {});
       if (target.enabled) await request(path + '/disable', {});
       await request(path + '/uninstall', {});
     }

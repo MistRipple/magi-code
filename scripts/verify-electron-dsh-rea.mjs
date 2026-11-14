@@ -6,7 +6,7 @@ import { tmpdir, homedir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectAppPage, connectTarget, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
-import { authorizePluginFromNative, previewFixedUpstreamFromNative, waitForPluginModel } from './lib/plugin-native-acceptance.mjs';
+import { waitForInstalledPlugin, previewFixedUpstreamFromNative, waitForPluginModel } from './lib/plugin-native-acceptance.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
@@ -54,7 +54,7 @@ async function verifyAnalysis() {
   const buddy = (await api('/api/plugins/upstream/install', { ...request, expectedDigest: preview.candidate.digest })).plugins.find(item => item.manifest.id === preview.candidate.manifest.id);
   await settings('plugins');
   await page.evaluate(`(()=>{const input=document.querySelector('[data-testid=plugin-search]');input.value='';input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
-  await authorizePluginFromNative({ request: api, page, plugin: buddy });
+  await waitForInstalledPlugin({ request: api, page, plugin: buddy });
   const model = await waitForPluginModel({ request: api, pluginId: buddy.manifest.id,
     record: value => writeFile(join(output, 'model-selection.json'), JSON.stringify(value, null, 2)) });
   const session = (await api('/api/session/materialize', { scope: 'personal' })).sessionId;
@@ -251,7 +251,7 @@ try {
   await settings(`plugin:${pluginId}:settings`);
   report.check('返回对话再打开设置仍保留同一原包表单', await frame.evaluate(`window.__settingsVisitIdentity===${JSON.stringify(settingsIdentity)} && document.getElementById('plugin-config-dsh-rea-timeout').value==='320000'`));
   await ui.click('[data-testid=plugin-page-header] input[role=switch]');
-  await waitFor(async () => !(await installed()).active, '停用回收');
+  await waitFor(async () => !(await installed()).enabled, '停用回收');
   report.check('停用清空真实 MCP 动态目录', (await installed()).manifest.contributions.tools.length === 0);
   await waitFor(() => page.evaluate('!window.__reaSettingsFrame.isConnected'), '停用释放已保活的设置文档');
   report.check('全局停用释放设置文档，不把页面保活当成插件继续运行', true);

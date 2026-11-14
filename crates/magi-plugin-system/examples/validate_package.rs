@@ -3,12 +3,19 @@
 use magi_plugin_system::PluginPackage;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("用法：validate_package <包.zip>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("用法：validate_package <包.zip>");
     let bytes = std::fs::read(&path).expect("读取失败");
     match PluginPackage::from_archive(&bytes) {
         Ok(package) => {
             let manifest = package.manifest();
-            println!("通过校验：{} {} 摘要 {}", manifest.id, manifest.version, package.digest());
+            println!(
+                "通过校验：{} {} 摘要 {}",
+                manifest.id,
+                manifest.version,
+                package.digest()
+            );
             println!(
                 "工具 {} 命令 {} 模型数据源 {} 视图 {}",
                 manifest.contributions.tools.len(),

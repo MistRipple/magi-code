@@ -64,5 +64,4 @@ impl GovernanceDecision {
             reason,
         }
     }
-
 }

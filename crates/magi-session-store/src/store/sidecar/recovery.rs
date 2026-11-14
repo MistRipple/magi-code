@@ -496,8 +496,10 @@ impl SessionStore {
                         self, state, session_id,
                     )?
                     .is_empty()
-                        || !super::super::tool_approvals::pending_in_state(self, state, session_id)?
-                            .is_empty())
+                        || !super::super::tool_approvals::pending_in_state(
+                            self, state, session_id,
+                        )?
+                        .is_empty())
                 {
                     return Err(DomainError::InvalidState {
                         message: "请先处理待回答问题和工具审批，再继续执行".into(),

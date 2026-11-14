@@ -27,11 +27,6 @@ fn install(manager: &mut PluginManager, id: &str) {
             },
         )
         .unwrap();
-    manager.enable(id).unwrap();
-    manager
-        .authorize(id, package.manifest().permissions.clone())
-        .unwrap();
-    manager.activate(id).unwrap();
 }
 fn image(bytes: &[u8]) -> PluginImageAttachmentBegin {
     PluginImageAttachmentBegin {
@@ -151,7 +146,7 @@ fn failed_commits_corrupt_payloads_revocation_and_upgrade_resets_do_not_forge_im
         .save_image_attachment("acme.images", image(SVG), SVG)
         .unwrap();
     assert_eq!(read(&manager, "acme.images", &record.attachment_id), SVG);
-    manager.deactivate("acme.images").unwrap();
+    manager.disable("acme.images").unwrap();
     assert!(
         manager
             .image_attachment("acme.images", &record.attachment_id)
@@ -170,7 +165,7 @@ fn failed_commits_corrupt_payloads_revocation_and_upgrade_resets_do_not_forge_im
             .data_reset
     );
     let shared = std::sync::Arc::new(std::sync::Mutex::new(manager));
-    let drain = PluginManager::begin_upgrade_drain(shared.clone(), "acme.images").unwrap();
+    let drain = PluginManager::begin_drain(shared.clone(), "acme.images").unwrap();
     shared
         .lock()
         .unwrap()
@@ -184,7 +179,7 @@ fn failed_commits_corrupt_payloads_revocation_and_upgrade_resets_do_not_forge_im
         .unwrap();
     drop(drain);
     drop(shared);
-    let mut manager = PluginManager::open(dir.path()).unwrap();
+    let manager = PluginManager::open(dir.path()).unwrap();
     assert_eq!(
         std::fs::read_dir(dir.path().join("images"))
             .unwrap()
@@ -192,10 +187,6 @@ fn failed_commits_corrupt_payloads_revocation_and_upgrade_resets_do_not_forge_im
         0,
         "数据重置后的孤立载荷应回收"
     );
-    manager
-        .authorize("acme.images", candidate.manifest().permissions.clone())
-        .unwrap();
-    manager.activate("acme.images").unwrap();
     assert!(
         manager
             .image_attachment("acme.images", &record.attachment_id)

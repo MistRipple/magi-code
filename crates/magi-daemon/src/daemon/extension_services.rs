@@ -174,13 +174,10 @@ impl PluginHostService {
             .ensure_editing_admitted(plugin)
             .map_err(|e| RpcError::new(ErrorKind::Conflict, e.to_string()))?;
         if !manager
-            .is_active(plugin)
+            .is_enabled(plugin)
             .map_err(|e| RpcError::new(ErrorKind::PermissionDenied, e.to_string()))?
         {
-            return Err(RpcError::new(
-                ErrorKind::PermissionDenied,
-                "插件未激活或已撤权",
-            ));
+            return Err(RpcError::new(ErrorKind::PermissionDenied, "插件未启用"));
         }
         Ok(())
     }
@@ -251,7 +248,6 @@ impl HostService for PluginHostService {
                 | "plugins.setEnabled"
                 | "plugins.remove"
                 | "plugins.finishChange"
-                | "plugins.authorize"
                 | "plugins.compatibility"
                 | "plugins.setVersionExemption"
         ) {
@@ -368,7 +364,6 @@ impl HostService for PluginHostService {
                 | "plugins.setEnabled"
                 | "plugins.remove"
                 | "plugins.finishChange"
-                | "plugins.authorize"
                 | "plugins.compatibility"
                 | "plugins.setVersionExemption"
         ) {
@@ -849,10 +844,6 @@ mod tests {
             )
             .unwrap();
         manager.enable("acme.services").unwrap();
-        manager
-            .authorize("acme.services", package.manifest().permissions.clone())
-            .unwrap();
-        manager.activate("acme.services").unwrap();
         let events = Arc::new(std::sync::OnceLock::new());
         events.set(Arc::new(InMemoryEventBus::new(32))).unwrap();
         let service = Arc::new(PluginHostService {
@@ -1030,7 +1021,7 @@ mod tests {
             .manager
             .lock()
             .unwrap()
-            .deactivate("acme.services")
+            .disable("acme.services")
             .unwrap();
         assert!(
             call(
@@ -1048,7 +1039,7 @@ mod tests {
         let (_dir, service) = fixture();
         let listed = call(&service, "plugins.list", json!({})).await.unwrap();
         assert_eq!(listed["plugins"][0]["manifest"]["id"], "acme.services");
-        assert_eq!(listed["plugins"][0]["active"], true);
+        assert_eq!(listed["plugins"][0]["enabled"], true);
         assert!(listed["plugins"][0].get("settings").is_none());
         assert!(
             call(&service, "plugins.list", json!({"unknown": true}))
@@ -1059,7 +1050,7 @@ mod tests {
             .manager
             .lock()
             .unwrap()
-            .deactivate("acme.services")
+            .disable("acme.services")
             .unwrap();
         assert!(call(&service, "plugins.list", json!({})).await.is_err());
     }
@@ -1127,8 +1118,7 @@ mod tests {
             ErrorKind::MethodNotFound
         );
         let drain =
-            PluginManager::begin_deactivation(Arc::clone(&service.manager), "acme.services")
-                .unwrap();
+            PluginManager::begin_drain(Arc::clone(&service.manager), "acme.services").unwrap();
         assert_eq!(
             call(
                 &service,
@@ -1145,7 +1135,7 @@ mod tests {
             .manager
             .lock()
             .unwrap()
-            .authorize("acme.services", vec![])
+            .disable("acme.services")
             .unwrap();
         assert_eq!(
             call(&service, "resource.read", json!({"resourceId": "notes"}))
@@ -1187,7 +1177,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_directory_requires_current_instance_digest_and_explicit_grant() {
+    async fn session_directory_requires_current_instance_digest_and_an_enabled_plugin() {
         let (_dir, service) = fixture();
         assert!(
             service
@@ -1226,21 +1216,12 @@ mod tests {
             .unwrap()["hasMore"],
             false
         );
-        {
-            let mut manager = service.manager.lock().unwrap();
-            let grants = manager
-                .package("acme.services")
-                .unwrap()
-                .manifest()
-                .permissions
-                .iter()
-                .filter(|permission| {
-                    permission.kind != magi_plugin_system::PluginPermissionKind::SessionRead
-                })
-                .cloned()
-                .collect();
-            manager.authorize("acme.services", grants).unwrap();
-        }
+        service
+            .manager
+            .lock()
+            .unwrap()
+            .disable("acme.services")
+            .unwrap();
         assert_eq!(
             call(
                 &service,
@@ -1252,13 +1233,6 @@ mod tests {
             .kind(),
             ErrorKind::PermissionDenied
         );
-        {
-            let mut manager = service.manager.lock().unwrap();
-            manager
-                .authorize("acme.services", package().manifest().permissions.clone())
-                .unwrap();
-            manager.activate("acme.services").unwrap();
-        }
         let stale = PluginHostService {
             digest: "old-digest".into(),
             ..Arc::try_unwrap(service).ok().unwrap()
@@ -1532,7 +1506,7 @@ mod tests {
             .manager
             .lock()
             .unwrap()
-            .deactivate("acme.services")
+            .disable("acme.services")
             .unwrap();
         let denied = instance
             .invoke_command(
@@ -1586,7 +1560,7 @@ mod tests {
             .manager
             .lock()
             .unwrap()
-            .authorize("acme.services", vec![])
+            .disable("acme.services")
             .unwrap();
         service.instance_ended("acme.services", "new");
         assert!(sources::sources(settings).unwrap().is_empty());
@@ -1669,7 +1643,7 @@ mod tests {
             .manager
             .lock()
             .unwrap()
-            .authorize("acme.services", vec![])
+            .disable("acme.services")
             .unwrap();
         assert_eq!(
             call(&service, "modelSource.clear", json!({"sourceId": "proxy"}))

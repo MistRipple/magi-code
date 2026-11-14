@@ -70,7 +70,7 @@ fn validate_image(input: &PluginImageAttachmentBegin, bytes: &[u8]) -> Result<()
 impl PluginManager {
     pub fn ensure_image_attachment_access(&self, plugin: &str) -> Result<(), PluginError> {
         self.ensure_editing_admitted(plugin)?;
-        if !self.is_active(plugin)?
+        if !self.is_enabled(plugin)?
             || !self.permission_allowed(plugin, PluginPermissionKind::Attachments, "images")?
         {
             return Err(PluginError::NotAuthorized(

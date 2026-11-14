@@ -49,7 +49,7 @@ fn failure(
             |version| format!("{bundle}@{version}"),
         );
         format!(
-            "已安装 {candidate}，但未完成启用：{}。请在 Magi 插件管理中检查授权与运行状态，无需重复安装。",
+            "已安装 {candidate}，但未完成启用：{}。请在 Magi 插件管理中检查运行状态，无需重复安装。",
             error.message()
         )
     } else {
@@ -332,39 +332,19 @@ impl PluginOperations {
             Err(e) => return failure(e, false, &bundle, Some(version), None),
         };
         let enable = async {
-            let enabled = input.enabled.unwrap_or(true);
-            let (active, currently_enabled) = {
-                let manager = self.locked("读取安装状态")?;
-                (
-                    manager.is_active(&id).map_err(plugin_error)?,
-                    manager.state().plugins[&id].enabled,
-                )
-            };
-            if !enabled && !active && !currently_enabled {
-                return Ok(());
-            }
-            if enabled && !active {
-                let delegated = self
-                    .locked("检查安装授权委托")?
-                    .permission_allowed(
-                        &owner.plugin,
-                        magi_plugin_system::PluginPermissionKind::PluginManagement,
-                        "authorize",
-                    )
-                    .map_err(plugin_error)?;
-                if delegated {
-                    self.authorize(
-                        &id,
-                        package.manifest().permissions.clone(),
-                        Some(owner.caller()),
-                        Some(package.digest()),
-                    )
-                    .await?;
+            let requested = input.enabled.unwrap_or(true);
+            let currently_enabled = self.locked("读取安装状态")?.state().plugins[&id].enabled;
+            if requested == currently_enabled {
+                // 新装与升级默认启用；已经处于目标状态时只等待宿主就绪。
+                if requested {
+                    self.wait_running(&id, Some(owner.caller()), Some(package.digest()))
+                        .await?;
                 }
+                return Ok(());
             }
             self.manage_target(
                 &id,
-                enabled,
+                requested,
                 false,
                 Some(owner.caller()),
                 LifecycleChange {
@@ -391,7 +371,7 @@ impl PluginOperations {
 
     /// 自更新的提交由 daemon 安装任务拥有。排空旧宿主会结束发起 RPC，
     /// 不能再依赖该宿主接收回执或继续使用旧租约；唯一结果是安装事实、
-    /// 持久任务回执和新宿主运行状态。新授权不得超出提交前的已批范围。
+    /// 持久任务回执和新宿主运行状态。新版本的权限不得超出提交前已安装版本声明的范围。
     async fn apply_self_update(
         &self,
         owner: &InstallOwner,
@@ -405,8 +385,8 @@ impl PluginOperations {
         let bundle = bundle_label(input);
         let updated = async {
             let previous = {
-                let manager = self.locked("核对自更新授权")?;
-                // daemon 在已批范围内续用自身授权，无需替其他包授权的委托。
+                let manager = self.locked("核对自更新权限")?;
+                // daemon 只在当前版本已声明的范围内续用自身权限。
                 for target in ["install", "lifecycle"] {
                     Self::check_caller(&manager, Some(owner.caller()), target)?;
                 }
@@ -429,7 +409,7 @@ impl PluginOperations {
                             .map_err(plugin_error)?
                         {
                             return Err(ApiError::Forbidden(
-                                "自更新包含尚未授权的能力，当前版本继续保留。请到 Magi 设置 → 插件选择此插件，在线更新后授权并激活新版本".into(),
+                                "自更新扩大了权限声明，当前版本继续保留。请到 Magi 设置 → 插件选择此插件，在线更新新版本".into(),
                             ));
                         }
                     }
@@ -438,7 +418,7 @@ impl PluginOperations {
                     .permission_allowed(id, PluginPermissionKind::Extension, "full-trust")
                     .map_err(plugin_error)?
                 {
-                    return Err(ApiError::Forbidden("自更新需要已批准的完全信任授权".into()));
+                    return Err(ApiError::Forbidden("自更新需要当前版本已声明完全信任".into()));
                 }
                 if matches!(
                     candidate.operation,
@@ -454,7 +434,7 @@ impl PluginOperations {
             self.quiesce(id).await?;
             let commit = (|| {
                 let mut manager = self.locked("提交自更新")?;
-                // 用户停用／撤权或其他安装若已改变事实，旧请求不能重启它。
+                // 用户停用或其他安装若已改变事实，旧请求不能重启它。
                 if manager.state().plugins.get(id) != Some(&previous) {
                     return Err(ApiError::Conflict(
                         "自更新期间插件状态已变化，请刷新后重试".into(),
@@ -465,10 +445,6 @@ impl PluginOperations {
                     .upgrade(&package, source, &drain)
                     .map_err(plugin_error)?;
                 drain.commit(&mut manager);
-                manager
-                    .authorize(id, package.manifest().permissions.clone())
-                    .map_err(plugin_error)?;
-                manager.activate(id).map_err(plugin_error)?;
                 Ok(())
             })();
             self.changed();
@@ -565,10 +541,6 @@ mod tests {
                 .unwrap();
             manager.enable("acme.manager").unwrap();
             manager
-                .authorize("acme.manager", caller.manifest().permissions.clone())
-                .unwrap();
-            manager.activate("acme.manager").unwrap();
-            manager
                 .begin_runtime("acme.manager", caller.digest(), "current")
                 .unwrap();
         }
@@ -605,51 +577,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_install_requires_explicit_authorize_delegation_and_reports_a_committed_inactive_package()
-     {
-        let (state, _root, who) = fixture(&["install", "lifecycle"]);
-        let operations = PluginOperations::from_state(&state);
-        let result = operations
-            .apply_bundle(&who, &input(true), target(), npm_source())
-            .await;
-        assert_eq!(result.application, Application::Failed);
-        assert_eq!(result.installed, Some(true), "{result:?}");
-        assert_eq!(result.version.as_deref(), Some("1.0.0"));
-        let error = result.error.unwrap();
-        assert_eq!(error.code, "authorization-required");
-        assert!(error.message.contains("已安装 sample@1.0.0"));
-        assert!(error.message.contains("尚未全部授权"));
-        assert!(error.message.contains("Magi 插件管理"));
-        assert!(error.message.contains("无需重复安装"));
-        assert_eq!(error.diagnostic, error.message);
-        let manager = state.plugin_manager.lock().unwrap();
-        assert!(manager.state().plugins["dsh.sample"].grants.is_empty());
-        assert!(!manager.state().plugins["dsh.sample"].active);
-    }
-
-    #[tokio::test]
-    async fn delegated_install_uses_the_committed_digest_and_disabled_install_does_not_require_extra_lifecycle_grants()
-     {
-        let (state, _root, who) = fixture(&["install", "lifecycle", "authorize"]);
+    async fn delegated_install_is_enabled_by_default_and_needs_only_the_install_target() {
+        let (state, _root, who) = fixture(&["install"]);
         let operations = PluginOperations::from_state(&state);
         let result = operations
             .apply_bundle(&who, &input(true), target(), npm_source())
             .await;
         assert_eq!(result.application, Application::Applied, "{result:?}");
-        assert!(state.plugin_manager.lock().unwrap().state().plugins["dsh.sample"].active);
-        let (state, _root2, who) = fixture(&["install"]);
-        let result = PluginOperations::from_state(&state)
-            .apply_bundle(&who, &input(false), target(), npm_source())
-            .await;
-        assert_eq!(result.application, Application::Applied);
-        let manager = state.plugin_manager.lock().unwrap();
-        assert!(!manager.state().plugins["dsh.sample"].enabled);
-        assert!(manager.state().plugins["dsh.sample"].grants.is_empty());
+        assert!(state.plugin_manager.lock().unwrap().state().plugins["dsh.sample"].enabled);
     }
 
     #[tokio::test]
-    async fn background_admission_and_commit_both_require_the_current_authorized_owner() {
-        let (state, _root, who) = fixture(&["install", "lifecycle", "authorize"]);
+    async fn delegated_install_can_leave_the_package_disabled_with_the_lifecycle_target() {
+        let (state, _root, who) = fixture(&["install", "lifecycle"]);
+        let result = PluginOperations::from_state(&state)
+            .apply_bundle(&who, &input(false), target(), npm_source())
+            .await;
+        assert_eq!(result.application, Application::Applied, "{result:?}");
+        assert!(!state.plugin_manager.lock().unwrap().state().plugins["dsh.sample"].enabled);
+    }
+
+    #[tokio::test]
+    async fn disabling_after_install_without_the_lifecycle_target_reports_a_committed_install() {
+        let (state, _root, who) = fixture(&["install"]);
+        let result = PluginOperations::from_state(&state)
+            .apply_bundle(&who, &input(false), target(), npm_source())
+            .await;
+        assert_eq!(result.application, Application::Failed);
+        assert_eq!(result.installed, Some(true), "{result:?}");
+        let error = result.error.unwrap();
+        assert_eq!(error.code, "authorization-required");
+        assert!(error.message.contains("已安装 sample@1.0.0"));
+        assert!(error.message.contains("无需重复安装"));
+        assert!(state.plugin_manager.lock().unwrap().state().plugins["dsh.sample"].enabled);
+    }
+
+    #[tokio::test]
+    async fn background_admission_and_commit_both_require_the_current_enabled_owner() {
+        let (state, _root, who) = fixture(&["install", "lifecycle"]);
         let operations = PluginOperations::from_state(&state);
         let error = operations
             .call_background(
@@ -688,7 +653,6 @@ mod tests {
     struct SelfUpdateRuntime {
         manager: Arc<Mutex<PluginManager>>,
         stops: std::sync::atomic::AtomicUsize,
-        revoke: bool,
         replacement: Option<PluginPackage>,
     }
     impl crate::ExtensionStatusSource for SelfUpdateRuntime {
@@ -700,9 +664,6 @@ mod tests {
             self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut manager = self.manager.lock().unwrap();
             manager.end_runtime(&id, "current");
-            if self.revoke {
-                manager.deactivate(&id).unwrap();
-            }
             Box::pin(async { Ok(()) })
         }
         fn status(
@@ -710,14 +671,10 @@ mod tests {
             id: &str,
         ) -> Option<magi_app_server_protocol::generated::PluginRuntimeStatus> {
             if let Some(replacement) = &self.replacement {
-                let drain = PluginManager::begin_upgrade_drain(self.manager.clone(), id).unwrap();
+                let drain = PluginManager::begin_drain(self.manager.clone(), id).unwrap();
                 let mut manager = self.manager.lock().unwrap();
                 manager.upgrade(replacement, self_source(), &drain).unwrap();
                 drain.commit(&mut manager);
-                manager
-                    .authorize(id, replacement.manifest().permissions.clone())
-                    .unwrap();
-                manager.activate(id).unwrap();
             }
             let mut manager = self.manager.lock().unwrap();
             let digest = manager.state().plugins[id].digest.clone();
@@ -768,7 +725,6 @@ mod tests {
         let runtime = Arc::new(SelfUpdateRuntime {
             manager: state.plugin_manager.clone(),
             stops: 0.into(),
-            revoke: false,
             replacement: None,
         });
         let candidate = self_candidate(&state, false);
@@ -782,8 +738,7 @@ mod tests {
         let manager = state.plugin_manager.lock().unwrap();
         let current = &manager.state().plugins[&who.plugin];
         assert_eq!(current.digest, candidate.digest());
-        assert!(current.active && current.enabled);
-        assert_eq!(current.grants, candidate.manifest().permissions);
+        assert!(current.enabled);
         assert!(PluginOperations::check_caller(&manager, Some(who.caller()), "install").is_err());
         assert!(manager.runtime_ready(&who.plugin).unwrap());
     }
@@ -793,14 +748,13 @@ mod tests {
         for (grants, extra, reason) in [
             (vec!["install"], false, "pluginManagement:[lifecycle]"),
             (vec!["lifecycle"], false, "pluginManagement:[install]"),
-            (vec!["install", "lifecycle"], true, "尚未授权的能力"),
+            (vec!["install", "lifecycle"], true, "扩大了权限声明"),
         ] {
             let (state, _root, who) = fixture(&grants);
             let candidate = self_candidate(&state, extra);
             let runtime = Arc::new(SelfUpdateRuntime {
                 manager: state.plugin_manager.clone(),
                 stops: 0.into(),
-                revoke: false,
                 replacement: None,
             });
             let state = state.with_extension_status(runtime.clone());
@@ -813,51 +767,42 @@ mod tests {
             if extra {
                 assert!(error.message.contains("当前版本继续保留"));
                 assert!(error.message.contains("Magi 设置 → 插件"));
-                assert!(error.message.contains("授权并激活"));
             }
             assert_eq!(runtime.stops.load(std::sync::atomic::Ordering::SeqCst), 0);
             let manager = state.plugin_manager.lock().unwrap();
             let current = &manager.state().plugins[&who.plugin];
             assert_eq!(current.digest, who.digest);
-            assert!(current.active && current.enabled);
+            assert!(current.enabled);
         }
     }
 
     #[tokio::test]
-    async fn self_update_rechecks_user_state_after_stop_and_preserves_old_installation_on_archive_failure()
-     {
-        for revoke in [false, true] {
-            let (state, root, who) = fixture(&["install", "lifecycle"]);
-            let original =
-                state.plugin_manager.lock().unwrap().state().plugins[&who.plugin].clone();
-            let candidate = self_candidate(&state, false);
-            if !revoke {
-                std::fs::create_dir_all(
-                    root.path()
-                        .join("versions")
-                        .join(&who.plugin)
-                        .join(format!("{}.zip", candidate.digest())),
-                )
-                .unwrap();
-            }
-            let runtime = Arc::new(SelfUpdateRuntime {
-                manager: state.plugin_manager.clone(),
-                stops: 0.into(),
-                revoke,
-                replacement: None,
-            });
-            let state = state.with_extension_status(runtime.clone());
-            let result = PluginOperations::from_state(&state)
-                .apply_self_update(&who, &input(true), candidate, self_source())
-                .await;
-            assert_eq!(result.application, Application::Failed, "{result:?}");
-            let manager = state.plugin_manager.lock().unwrap();
-            let current = &manager.state().plugins[&who.plugin];
-            assert_eq!(current.digest, original.digest);
-            assert_eq!(current.grants, original.grants);
-            assert_eq!(current.active, !revoke);
-            assert!(!manager.is_draining(&who.plugin));
-        }
+    async fn self_update_preserves_the_old_installation_on_archive_failure() {
+        let (state, root, who) = fixture(&["install", "lifecycle"]);
+        let original = state.plugin_manager.lock().unwrap().state().plugins[&who.plugin].clone();
+        let candidate = self_candidate(&state, false);
+        std::fs::create_dir_all(
+            root.path()
+                .join("versions")
+                .join(&who.plugin)
+                .join(format!("{}.zip", candidate.digest())),
+        )
+        .unwrap();
+        let runtime = Arc::new(SelfUpdateRuntime {
+            manager: state.plugin_manager.clone(),
+            stops: 0.into(),
+            replacement: None,
+        });
+        let state = state.with_extension_status(runtime.clone());
+        let result = PluginOperations::from_state(&state)
+            .apply_self_update(&who, &input(true), candidate, self_source())
+            .await;
+        assert_eq!(result.application, Application::Failed, "{result:?}");
+        let manager = state.plugin_manager.lock().unwrap();
+        let current = &manager.state().plugins[&who.plugin];
+        assert_eq!(current.digest, original.digest);
+        assert!(current.enabled);
+        assert!(!manager.is_draining(&who.plugin));
     }
 
     #[tokio::test]
@@ -872,7 +817,6 @@ mod tests {
         let runtime = Arc::new(SelfUpdateRuntime {
             manager: state.plugin_manager.clone(),
             stops: 0.into(),
-            revoke: false,
             replacement: Some(replacement.clone()),
         });
         let state = state.with_extension_status(runtime);

@@ -77,8 +77,7 @@ export async function verifyDshAppshot({ request: api, origin, plugin, page, cdp
       assert.equal(repeated.candidate.digest, before.digest);
       const result = await api('/api/plugins/upstream/install', { ...same, expectedDigest: repeated.candidate.digest });
       const current = result.plugins.find(p => p.manifest.id === id);
-      assert.equal(current.active, true);
-      assert.deepEqual(current.grants, before.grants);
+      assert.equal(current.enabled, true);
       assert.equal((await config()).soundEnabled, false);
       // 客户端此时停放在后台；通过真实配置调用后核对进程和文档身份，
       // 不等待被隐藏 iframe 正常节流的动画帧。
@@ -92,7 +91,7 @@ export async function verifyDshAppshot({ request: api, origin, plugin, page, cdp
       assert.notEqual(response.status, 200); const error = JSON.parse(response.body);
       assert.match(error.message, /未支持.*输入操作.*addImages/); assert.match(error.message, /在线更新插件/);
       const after = await running();
-      assert.equal(after.digest, before.digest); assert.deepEqual(after.grants, before.grants);
+      assert.equal(after.digest, before.digest);
       assert.deepEqual(await nativeProcesses(), processes); assert.equal((await config()).soundEnabled, false);
       assert.equal(await frame.evaluate('window.__acceptanceIdentity'), marker);
       return { version: after.manifest.version, error };
@@ -134,9 +133,9 @@ export async function verifyDshAppshot({ request: api, origin, plugin, page, cdp
     }
     frame.close(); frame = null;
     await verify('关闭页面后配置仍在', async () => { assert.equal((await config()).soundEnabled, false); return config(); });
-    await api(pluginPath() + '/deactivate', {});
+    await api(pluginPath() + '/disable', {});
     await verify('停用回收原生辅助进程', () => waitFor(async () => !(await nativeProcesses()).length, '原生辅助进程回收'));
-    await api(pluginPath() + '/activate', {}); await running();
+    await api(pluginPath() + '/enable', {}); await running();
     await verify('停用再激活恢复配置', async () => { assert.equal((await config()).soundEnabled, false); return config(); });
     const oldProcesses = await nativeProcesses();
     page = await restart(); await running();

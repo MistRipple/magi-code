@@ -58,7 +58,7 @@
     "test:session-stats": "node scripts/session-stats-golden.mjs",
     "test:fixed-properties": "node scripts/fixed-properties-golden.mjs",
     "test:i18n": "node scripts/i18n-golden.mjs",
-    "test:plugin-store": "node scripts/plugin-store-golden.mjs && node scripts/plugin-install-activation-golden.mjs",
+    "test:plugin-store": "node scripts/plugin-store-golden.mjs && node scripts/plugin-install-golden.mjs",
     "test:plugin-composer": "node scripts/plugin-composer-golden.mjs",
     "test:relative-time": "node scripts/relative-time-golden.mjs",
     "test:session-title": "node scripts/session-title-golden.mjs",

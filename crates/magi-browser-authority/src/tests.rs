@@ -1224,7 +1224,11 @@ fn session_revision_tracks_surface_page_snapshot_annotation_and_lease_changes() 
         .revision;
     assert!(revision_after_lease > revision_after_comment);
     authority
-        .revoke_lease(&lease.lease_id, BrowserLeaseEndReason::OwnerReleased, at(12))
+        .revoke_lease(
+            &lease.lease_id,
+            BrowserLeaseEndReason::OwnerReleased,
+            at(12),
+        )
         .expect("lease should release");
     assert!(
         authority
@@ -1451,16 +1455,8 @@ fn snapshot_revision_is_authority_owned_and_survives_restart() {
     authority
         .validate_snapshot_result(&tab_id, 0, 1)
         .expect("Host must echo the authority revision exactly");
-    assert!(
-        authority
-            .validate_snapshot_result(&tab_id, 0, 0)
-            .is_err()
-    );
-    assert!(
-        authority
-            .validate_snapshot_result(&tab_id, 0, 2)
-            .is_err()
-    );
+    assert!(authority.validate_snapshot_result(&tab_id, 0, 0).is_err());
+    assert!(authority.validate_snapshot_result(&tab_id, 0, 2).is_err());
 
     let durable = authority.durable_state();
     assert_eq!(durable.tabs[0].snapshot_revision, 1);

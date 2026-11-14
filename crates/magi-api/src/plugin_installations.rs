@@ -117,7 +117,7 @@ impl Journal {
 }
 
 impl PluginInstallations {
-    /// 只读取原安装事实判定提交是否存在；恢复绝不重新下载、授权、激活或替换包。
+    /// 只读取原安装事实判定提交是否存在；恢复绝不重新下载、启用或替换包。
     /// 损坏日志保留原字节并阻止安装写入，不影响已安装插件的读取与运行。
     pub fn open(manager: &PluginManager) -> Self {
         let path = manager.root().join("installations.json");
@@ -158,7 +158,7 @@ impl PluginInstallations {
                 });
                 let installed = committed.is_some();
                 let message = if installed {
-                    "应用退出时安装任务尚未结算；候选版本已安装，请在插件管理检查授权与运行状态。再次安装须显式发起新请求。"
+                    "应用退出时安装任务尚未结算；候选版本已安装，请在插件管理检查运行状态。再次安装须显式发起新请求。"
                 } else {
                     "应用退出时安装任务尚未结算；没有确认候选版本已提交。请检查插件状态后显式重试。"
                 };
@@ -601,7 +601,6 @@ mod tests {
         );
         assert_eq!(receipt.stage.as_deref(), Some("enable"));
         assert_eq!(manager.state(), &before);
-        assert!(!manager.state().plugins["acme.candidate"].active);
     }
 
     #[tokio::test]

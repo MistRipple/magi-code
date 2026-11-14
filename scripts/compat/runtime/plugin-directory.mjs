@@ -3,7 +3,7 @@ import { dshBundle } from './plugin-source.mjs';
 // 这里保留上一份已投递的观察投影，以产生状态迁移，不拥有可执行 Cordis fiber。
 export function pluginLifecycle(plugin) {
   const runtime = plugin.runtime;
-  const state = !plugin.active ? 4 : runtime?.state === 'running' ? 2
+  const state = !plugin.enabled ? 4 : runtime?.state === 'running' ? 2
     : runtime?.state === 'failed' ? 3 : ['starting', 'restarting'].includes(runtime?.state) ? 1
       : runtime?.state === 'stopped' ? 4 : 0;
   const reason = state === 3 ? runtime.reason ?? '插件启动失败，daemon 未提供原因' : undefined;

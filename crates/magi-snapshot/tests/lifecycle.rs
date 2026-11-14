@@ -656,10 +656,18 @@ async fn tool_changes_exclude_foreign_paths_but_preserve_own_overwrite_conflicts
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("shared.txt"), "baseline").unwrap();
     let mgr = SnapshotManager::new();
-    let a = mgr.start_session("tool-changes-a".into(), root.clone()).await.unwrap();
-    let b = mgr.start_session("tool-changes-b".into(), root.clone()).await.unwrap();
+    let a = mgr
+        .start_session("tool-changes-a".into(), root.clone())
+        .await
+        .unwrap();
+    let b = mgr
+        .start_session("tool-changes-b".into(), root.clone())
+        .await
+        .unwrap();
     let ctx = ToolHookCtx {
-        tool_call_id: "a-write".into(), worker_id: None, execution_group_id: None,
+        tool_call_id: "a-write".into(),
+        worker_id: None,
+        execution_group_id: None,
         declared_paths: vec![root.join("shared.txt"), root.join("a.txt")],
     };
     a.before_tool(&ctx);
@@ -674,8 +682,17 @@ async fn tool_changes_exclude_foreign_paths_but_preserve_own_overwrite_conflicts
     a.reconcile().unwrap();
     let own = a.pending_tool_changes().unwrap();
     assert_eq!(own.len(), 2);
-    assert!(!own.iter().find(|change| change.path == "shared.txt").unwrap().revertible);
-    assert!(!a.paths_modified_outside_tools(&["shared.txt".into()]).unwrap().is_empty());
+    assert!(
+        !own.iter()
+            .find(|change| change.path == "shared.txt")
+            .unwrap()
+            .revertible
+    );
+    assert!(
+        !a.paths_modified_outside_tools(&["shared.txt".into()])
+            .unwrap()
+            .is_empty()
+    );
     // 批准之后再发生的外部变化不能沿用已结束的工具归属。
     a.approve(&["shared.txt".into(), "a.txt".into()]).unwrap();
     fs::write(root.join("shared.txt"), "new external edit after approval").unwrap();

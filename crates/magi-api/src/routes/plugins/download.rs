@@ -20,7 +20,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 // 仅重试未提交任何安装状态的 GET。每次丢弃不完整正文、从原地址重新校验；
-// 不拼接无法证明属于同一版本的部分内容，也不重跑翻译、安装或激活。
+// 不拼接无法证明属于同一版本的部分内容，也不重跑翻译或安装。
 enum DownloadFailure {
     Permanent(ApiError),
     Transient { message: String, delay: Duration },

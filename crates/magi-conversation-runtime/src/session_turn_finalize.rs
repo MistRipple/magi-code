@@ -10,9 +10,9 @@ use magi_session_store::{ActiveExecutionTurn, SessionStore};
 
 use crate::session_turn_coordinator::{CoordinatorTurnStatus, SessionTurnCoordinator};
 use crate::session_writeback::{
-    CanonicalTurnEventSink, SessionStatePersistCallback,
-    persist_session_state_checkpoint, publish_current_session_turn_item_event,
-    publish_session_turn_item_event, session_turn_item, upsert_session_turn_item_for_turn,
+    CanonicalTurnEventSink, SessionStatePersistCallback, persist_session_state_checkpoint,
+    publish_current_session_turn_item_event, publish_session_turn_item_event, session_turn_item,
+    upsert_session_turn_item_for_turn,
 };
 use crate::turn_contract::TurnCommand;
 

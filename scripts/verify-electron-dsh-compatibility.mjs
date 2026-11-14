@@ -5,7 +5,7 @@ import { tmpdir, homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectAppPage, connectTarget, createReporter, launchApp, pageTools, waitFor } from './lib/electron-harness.mjs';
-import { authorizePluginFromNative, waitForPluginModel } from './lib/plugin-native-acceptance.mjs';
+import { waitForInstalledPlugin, waitForPluginModel } from './lib/plugin-native-acceptance.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
@@ -27,11 +27,9 @@ async function api(path, body) {
 }
 const plugins = async () => (await api('/api/plugins')).plugins;
 const installedTarget = async () => (await plugins()).find((p) => p.source.location.startsWith('dsh:dsh-plugin-release-probe@'));
-async function activate(plugin, grants = plugin.manifest.permissions) {
+async function activate(plugin) {
   const path = `/api/plugins/${plugin.manifest.id}`;
   await api(path + '/enable', {});
-  await api(path + '/authorize', { grants });
-  await api(path + '/activate', {});
   await waitFor(async () => (await plugins()).find((p) => p.manifest.id === plugin.manifest.id)?.runtime?.state === 'running', '原包实际运行', 120_000);
 }
 async function route(path, body) {
@@ -74,16 +72,9 @@ try {
   const preview = await api('/api/plugins/upstream/preview', input);
   ops = (await api('/api/plugins/upstream/install', { ...input, expectedDigest: preview.candidate.digest })).plugins.find((p) => p.source.location === 'dsh:dsh-plugin-ops-bundle@0.20.8');
   report.check('ctx.get 取得的管理服务也声明独立兼容授权', ops.manifest.permissions.some((p) => p.kind === 'pluginManagement' && p.targets.includes('compatibility')));
-  await api(`/api/plugins/${ops.manifest.id}/enable`, {});
-  const incomplete = ops.manifest.permissions.map((p) => p.kind === 'pluginManagement' ? { ...p, targets: p.targets.filter((t) => t !== 'compatibility') } : p);
-  await api(`/api/plugins/${ops.manifest.id}/authorize`, { grants: incomplete });
-  let activationDenied = false;
-  try { await api(`/api/plugins/${ops.manifest.id}/activate`, {}); } catch (error) { activationDenied = /权限|FORBIDDEN/i.test(error.message); }
-  report.check('完全信任和安装权限不能代替 compatibility 委托', activationDenied);
   const runtimeVersion = JSON.parse(await readFile(join(appRoot, 'Contents/Resources/daemon/compat/node_modules/@deepseek-ai/dsh-tools/package.json'), 'utf8')).version;
   const target = { name: 'dsh-plugin-release-probe', version: '0.0.8', spec: 'dsh-plugin-release-probe@0.0.8', runtimeVersion };
-  const grants = ops.manifest.permissions;
-  await activate(ops, grants);
+  await activate(ops);
   if (chatOnly) {
     // 同一 daemon 先证明用户选择的真实模型可用，再检验原包业务，排除未配置模型。
     await mkdir(dshHome, { recursive: true, mode: 0o700 });
@@ -191,28 +182,22 @@ try {
     const missing = { name: 'magi-dsh-compatibility-nonexistent', version: '0.0.1', spec: 'magi-dsh-compatibility-nonexistent@0.0.1', runtimeVersion };
     const rolledBack = await route('/api/adapt/apply', missing);
     report.check('上游失败安装撤销刚提交的精确版本豁免', rolledBack.body.ok === false && rolledBack.body.rolledBack === true, JSON.stringify(rolledBack));
-    report.check('Ops 安装准备不默认申请替其他插件授权的能力', !ops.manifest.permissions.some(p => p.kind === 'pluginManagement' && p.targets.includes('authorize')));
     await settings(); await installFromPage(target.spec);
     const pending = await waitFor(installedTarget, 'Ops 原按钮在线提交真实目标', 240_000);
-    const originalError = await waitFor(() => frame.evaluate(`(() => {const error=[...document.querySelectorAll('.dshops-err')].find(node=>node.innerText.includes('authorization-required')&&node.innerText.includes('无需重复安装'));return error?.innerText;})()`), 'Ops 原页面完整授权恢复说明');
-    report.check('Ops 原按钮在线安装后保留已安装、未授权及无需重复安装的说明', pending.manifest.version === target.version && !pending.active && pending.grants.length === 0, originalError);
-    await writeFile(join(output, 'ops-authorization-required.png'), Buffer.from(await ui.screenshot(), 'base64'));
-    const journal = await readFile(join(stateRoot, 'plugins/installations.json'), 'utf8');
-    const authorized = await authorizePluginFromNative({ request: api, page, plugin: pending });
-    report.check('用户原生授权恢复同一安装，不创建或重放 Ops 安装任务', authorized.digest === pending.digest && await readFile(join(stateRoot, 'plugins/installations.json'), 'utf8') === journal);
+    const authorized = await waitForInstalledPlugin({ request: api, page, plugin: pending });
+    report.check('Ops 原按钮在线安装后直接启用并运行', pending.manifest.version === target.version && pending.enabled && authorized.digest === pending.digest);
     await settings(); await installFromPage(target.spec);
     await waitFor(() => frame.evaluate('document.body.innerText.includes("安装完成")'), 'Ops 原页面显式重试成功');
     const retried = await installedTarget();
     report.check('用户回到原包显式重试读取现有安装，保留同一运行实例', retried.digest === authorized.digest && retried.runtime.generation === authorized.runtime.generation);
     for (const [label, enabled] of [['禁用', false], ['启用', true]]) {
       await waitFor(() => frame.evaluate(`(() => {const row=[...document.querySelectorAll('.dshops-row')].find(node=>node.innerText.includes('dsh-plugin-release-probe'));const button=row?.querySelector('button');if(!button||button.disabled||button.innerText!==${JSON.stringify(label)})return false;button.click();return true;})()`), `Ops 原页面${label}目标`);
-      await waitFor(async () => { const current = await installedTarget(); return current.enabled === enabled && current.active === enabled
+      await waitFor(async () => { const current = await installedTarget(); return current.enabled === enabled
         && (enabled ? current.runtime?.state === 'running' : !current.runtime || current.runtime.state === 'stopped'); }, `Ops 真实目标${label}`);
     }
     const resumed = await installedTarget();
     report.check('Ops 原页面启停沿 daemon 全局生命周期真实停止并恢复目标', resumed.digest === retried.digest
-      && resumed.runtime.instanceId && resumed.runtime.instanceId !== retried.runtime.instanceId
-      && JSON.stringify(resumed.grants) === JSON.stringify(retried.grants));
+      && resumed.runtime.instanceId && resumed.runtime.instanceId !== retried.runtime.instanceId);
     const applied = await route('/api/adapt/apply', target);
     report.check('Ops 对已授权包登记精确版本豁免并保持实际运行', applied.body.ok === true && (await installedTarget())?.runtime?.state === 'running', JSON.stringify(applied));
     const exemptions = await route('/api/adapt/exemptions');

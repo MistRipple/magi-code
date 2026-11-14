@@ -219,10 +219,10 @@ fn collect_subtree_ids_in_scope(
     all_ids
 }
 
+mod agents;
+mod leases;
 mod notifications;
 mod projection;
-mod leases;
-mod agents;
 
 impl TaskStore {
     pub fn new() -> Self {
@@ -329,17 +329,11 @@ impl TaskStore {
         }
         Self::validate_agent_activation_insert(&tasks, &task)?;
         tasks.insert(task_id.clone(), task);
-        mission_index
-            .entry(mission_id)
-            .or_default()
-            .push(task_id);
+        mission_index.entry(mission_id).or_default().push(task_id);
         if checkpoint {
             let leases = self.leases.read().expect("leases read lock poisoned");
-            let snapshot = Self::snapshot_from_maps_with_dirty_roots(
-                &tasks,
-                &leases,
-                vec![root_task_id],
-            );
+            let snapshot =
+                Self::snapshot_from_maps_with_dirty_roots(&tasks, &leases, vec![root_task_id]);
             self.fire_checkpoint(&snapshot)?;
         }
         *self.tasks.write().expect("tasks write lock poisoned") = tasks;

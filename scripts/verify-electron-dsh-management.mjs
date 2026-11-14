@@ -35,8 +35,6 @@ const targetPackage = 'dsh-plugin-release-probe';
 const target = async () => (await plugins()).find((plugin) => plugin.source.location.startsWith(`dsh:${targetPackage}@`));
 async function authorize(plugin) {
   await api(`/api/plugins/${plugin.manifest.id}/enable`, {});
-  await api(`/api/plugins/${plugin.manifest.id}/authorize`, { grants: plugin.manifest.permissions });
-  await api(`/api/plugins/${plugin.manifest.id}/activate`, {});
   await waitFor(async () => (await plugins()).find((p) => p.manifest.id === plugin.manifest.id)?.runtime?.state === 'running', '原包运行', 120_000);
 }
 async function installUpstream(name, version) {
@@ -110,18 +108,16 @@ try {
   const input = { ecosystem: 'dsh', package: targetPackage, version: '0.0.8' };
   const preview = await manage('preview', input); assert.equal(preview.ok, true, JSON.stringify(preview));
   const mismatch = await manage('install', { ...input, expectedDigest: 'wrong' });
-  report.check('管理服务拒绝错误摘要，保留旧版运行', !mismatch.ok && (await target()).manifest.version === '0.0.7' && (await target()).active);
+  report.check('管理服务拒绝错误摘要，保留旧版运行', !mismatch.ok && (await target()).manifest.version === '0.0.7' && (await target()).enabled);
   const updated = await manage('install', { ...input, expectedDigest: preview.value.candidate.digest });
   assert.equal(updated.ok, true, JSON.stringify(updated));
   const newer = await target();
-  report.check('管理服务在线升级真实 npm 原包，排空旧宿主并清空旧版本授权', newer.manifest.version === '0.0.8' && !newer.active && newer.grants.length === 0);
-  const denied = await manage('enable', { pluginId: newer.manifest.id, enabled: true });
-  report.check('新版本未授权时拒绝激活', !denied.ok && denied.kind === 'PermissionDenied' && !(await target()).active);
+  report.check('管理服务在线升级真实 npm 原包，排空旧宿主并保持启用', newer.manifest.version === '0.0.8' && newer.enabled);
   await authorize(newer);
   const removed = await manage('remove', { pluginId: newer.manifest.id });
   report.check('管理服务移除运行中的插件，先停止宿主再删除安装事实', removed.ok && !await target());
   const self = await manage('remove', { pluginId: 'magi.management-test' });
-  report.check('自身移除明确拒绝，宿主不会在回执前自杀', !self.ok && (await plugins()).some((p) => p.manifest.id === 'magi.management-test' && p.active));
+  report.check('自身移除明确拒绝，宿主不会在回执前自杀', !self.ok && (await plugins()).some((p) => p.manifest.id === 'magi.management-test' && p.enabled));
   const upgrader = await installUpstream('dsh-plugin-upgrader', '1.7.5'); await authorize(upgrader);
   const business = await verifyDshUpgrader({ request: api, origin, plugin: upgrader, page, cdpPort, errors,
     gate: registryGate, output, stateRoot: join(work, 'state'), check: report.check,

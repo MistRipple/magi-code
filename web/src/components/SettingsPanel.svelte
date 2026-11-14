@@ -60,7 +60,7 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
         tabId: `plugin:${installed.manifest.id}:${view.id}` as `plugin:${string}`,
         id: installed.manifest.id,
         manifest: installed.manifest,
-        active: installed.active,
+        enabled: installed.enabled,
         digest: installed.digest,
         entry: view.entry,
         // 插件设置页直接以插件名称呈现：导航项与页头一致，不再拼接视图标题。
@@ -84,11 +84,11 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
   const retainedPluginSettingsTabs = $derived(pluginSettingsTabs.filter(tab =>
     openedPluginSettingsTabs.includes(tab.tabId) || (active && tab.tabId === store.activeTab)));
   $effect(() => {
-    const available = new Set(pluginSettingsTabs.filter(tab => tab.active).map(tab => tab.tabId));
+    const available = new Set(pluginSettingsTabs.filter(tab => tab.enabled).map(tab => tab.tabId));
     const selected = active ? activePluginTab : null;
     const previous = untrack(() => openedPluginSettingsTabs);
     const next = previous.filter(id => available.has(id));
-    if (selected?.active && !next.includes(selected.tabId)) next.push(selected.tabId);
+    if (selected?.enabled && !next.includes(selected.tabId)) next.push(selected.tabId);
     if (previous.length !== next.length || previous.some((id, index) => id !== next[index])) {
       openedPluginSettingsTabs = next;
     }
@@ -714,7 +714,7 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
       {/if}
         {#each retainedPluginSettingsTabs as tab (tab.tabId)}
           <div class="settings-frame" hidden={tab.tabId !== store.activeTab} inert={!active || tab.tabId !== store.activeTab}>
-            {#if tab.active}
+            {#if tab.enabled}
               <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} placement="settings" active={active && tab.tabId === store.activeTab} />
             {:else}
               <p class="settings-hint" role="status" data-testid="plugin-page-inactive">{i18n.t('settings.plugins.pageHeader.inactive')}</p>

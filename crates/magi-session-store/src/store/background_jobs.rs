@@ -66,10 +66,10 @@ impl SessionStore {
                 .is_none_or(|session| {
                     (job.task_id.is_none() && session.kind != crate::SessionKind::ExternalTool)
                         || session.workspace_id.as_deref()
-                        != job
-                            .workspace_id
-                            .as_ref()
-                            .map(|workspace| workspace.as_str())
+                            != job
+                                .workspace_id
+                                .as_ref()
+                                .map(|workspace| workspace.as_str())
                 })
             {
                 return Err("Job 与 Session 的工作区归属不匹配".into());
@@ -229,10 +229,14 @@ impl BackgroundJobJournal for SessionJobJournal {
         }
         let job = {
             let state = self.store.state.read().expect("session state lock");
-            let owner = state.sessions.iter().find(|owner| &owner.session_id == session)
+            let owner = state
+                .sessions
+                .iter()
+                .find(|owner| &owner.session_id == session)
                 .ok_or("Job 所属 Session 不存在")?;
-            if task.is_none() && (owner.kind != crate::SessionKind::ExternalTool
-                || context.caller_scope != magi_tool_runtime::ToolCallerScope::SessionMainline)
+            if task.is_none()
+                && (owner.kind != crate::SessionKind::ExternalTool
+                    || context.caller_scope != magi_tool_runtime::ToolCallerScope::SessionMainline)
             {
                 return Err("原生执行的持久 Job 需要 Task 身份".into());
             }

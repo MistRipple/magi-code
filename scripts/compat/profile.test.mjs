@@ -19,13 +19,13 @@ import { pathToFileURL } from 'node:url';
 
 test('管理服务直接安装、启停和移除后的 profile 读取反映本次 daemon 已提交事实', async t => {
   const home=await mkdtemp(join(tmpdir(),'magi-profile-manager-'));t.after(()=>rm(home,{recursive:true,force:true}));
-  let plugins=[{manifest:{id:'dsh.target',name:'Target'},digest:'old',enabled:true,active:true,runtime:{state:'running'},
+  let plugins=[{manifest:{id:'dsh.target',name:'Target'},digest:'old',enabled:true,runtime:{state:'running'},
     source:{kind:'upstream',location:'dsh:target@1.0.0'}}];
   const api={plugins:{
     list:async()=>({plugins:structuredClone(plugins)}),
     async installBundle(){plugins[0]={...plugins[0],digest:'new',source:{kind:'upstream',location:'dsh:target@2.0.0'}};
       return {application:'applied',bundle:'target',installed:true,version:'2.0.0',changed:true};},
-    async setEnabled(id,enabled,digest){assert.equal(id,'dsh.target');assert.equal(digest,plugins[0].digest);plugins[0].enabled=enabled;plugins[0].active=enabled;},
+    async setEnabled(id,enabled,digest){assert.equal(id,'dsh.target');assert.equal(digest,plugins[0].digest);plugins[0].enabled=enabled;},
     async remove(id,digest){assert.equal(id,'dsh.target');assert.equal(digest,plugins[0].digest);plugins=[];},
     async finishChange(input){assert.equal(input.commit,true);assert.ok(input.changeId);return {restored:[]};},
   }};
@@ -47,7 +47,7 @@ test('管理服务直接安装、启停和移除后的 profile 读取反映本�
 
 test('管理修改先结算有效配置提案，串行读取新版本；取消、无效提案和未知回执不重放业务', async t => {
   const home=await mkdtemp(join(tmpdir(),'magi-profile-mutation-'));t.after(()=>rm(home,{recursive:true,force:true}));
-  let plugin={manifest:{id:'dsh.target'},digest:'old',enabled:true,active:true,source:{kind:'upstream',location:'dsh:target@1.0.0'}};
+  let plugin={manifest:{id:'dsh.target'},digest:'old',enabled:true,source:{kind:'upstream',location:'dsh:target@1.0.0'}};
   let failRead=false,installations=0;
   const actions=[];
   const api={plugins:{
@@ -100,7 +100,7 @@ test('管理修改先结算有效配置提案，串行读取新版本；取消�
 
 test('同调用移除和安装携带同一恢复身份，失败与取消在关闭快照前结算；成功卸载明确提交', async t => {
   const home=await mkdtemp(join(tmpdir(),'magi-profile-change-'));t.after(()=>rm(home,{recursive:true,force:true}));
-  const original={manifest:{id:'dsh.target'},digest:'old',enabled:true,active:true,source:{kind:'upstream',location:'dsh:target@1.0.0'}};
+  const original={manifest:{id:'dsh.target'},digest:'old',enabled:true,source:{kind:'upstream',location:'dsh:target@1.0.0'}};
   let plugins=[original],pending,changeId;const receipts=[];
   const api={plugins:{
     list:async()=>({plugins}),
@@ -257,7 +257,7 @@ test('明确指定外部 DSH 实例的 CLI 和 Node 辅助进程保留原环境�
 
 test('profile 配置复制沿同一调用提案，来源说明从 daemon 重读，删除停用项可恢复且旧来源不能覆盖新操作', async t => {
   const home = await mkdtemp(join(tmpdir(), 'magi-profile-reason-')); t.after(() => rm(home, { recursive: true, force: true }));
-  const plugin = { manifest: { id: 'dsh.target' }, digest: 'one', enabled: true, active: true,
+  const plugin = { manifest: { id: 'dsh.target' }, digest: 'one', enabled: true,
     source: { kind: 'upstream', location: 'dsh:target@1.0.0' } };
   const writes = [];
   const release = configureProfile({ plugins: {
@@ -265,7 +265,7 @@ test('profile 配置复制沿同一调用提案，来源说明从 daemon 重读�
     setEnabled: async (id, enabled, digest, options) => {
       assert.equal(id, plugin.manifest.id); assert.equal(digest, plugin.digest);
       assert.deepEqual(options.expectedState, { enabled: plugin.enabled, ...(plugin.disabledBy ? { disabledBy: plugin.disabledBy } : {}) });
-      writes.push({ enabled, options }); plugin.enabled = enabled; plugin.active = enabled;
+      writes.push({ enabled, options }); plugin.enabled = enabled;
       if (!enabled && options.reason) plugin.disabledBy = { pluginId: 'manager', name: 'Manager', reason: options.reason };
       else delete plugin.disabledBy;
     },
@@ -306,7 +306,7 @@ test('profile 配置复制沿同一调用提案，来源说明从 daemon 重读�
 
 test('无说明的停用项也可删除恢复，保留其他停用项且旧提案不能覆盖后续操作', async t => {
   const home = await mkdtemp(join(tmpdir(), 'magi-profile-enable-')); t.after(() => rm(home, { recursive: true, force: true }));
-  const plugins = ['target', 'keeper'].map(name => ({ manifest: { id: `dsh.${name}` }, digest: 'one', enabled: name === 'target', active: name === 'target',
+  const plugins = ['target', 'keeper'].map(name => ({ manifest: { id: `dsh.${name}` }, digest: 'one', enabled: name === 'target',
     source: { kind: 'upstream', location: `dsh:${name}@1.0.0` } }));
   const writes = [];
   const release = configureProfile({ plugins: {
@@ -315,7 +315,7 @@ test('无说明的停用项也可删除恢复，保留其他停用项且旧提�
       const plugin = plugins.find(value => value.manifest.id === id);
       assert.equal(digest, plugin.digest);
       assert.deepEqual(options.expectedState, { enabled: plugin.enabled, ...(plugin.disabledBy ? { disabledBy: plugin.disabledBy } : {}) });
-      writes.push([id, enabled]); plugin.enabled = enabled; plugin.active = enabled;
+      writes.push([id, enabled]); plugin.enabled = enabled;
     },
   } }, { home }); t.after(release);
   const patch = join(profilePath(), 'cordis.patch.yml');
@@ -375,7 +375,7 @@ test('profile 从 daemon 当前不可变归档读取真实原包文件，保留�
     'extension/upstream/lib/index.js':payload,'extension/index.mjs':strToU8('not an upstream file')});
   const archivePath=join(home,'installed.zip');await writeFile(archivePath,archive);
   const digest=createHash('sha256').update(archive).digest('hex');
-  const plugin={manifest:{id:'dsh.artifact'},digest,enabled:false,active:false,
+  const plugin={manifest:{id:'dsh.artifact'},digest,enabled:false,
     source:{kind:'upstream',location:'dsh:@scope/artifact@1.0.0'},upstreamManifest:original,upstreamArchivePath:archivePath};
   const off=configureProfile({plugins:{list:async()=>({plugins:[plugin]})}},{home});t.after(off);
   await withProfile(async()=>{
@@ -397,7 +397,7 @@ test('profile 从 daemon 当前不可变归档读取真实原包文件，保留�
 test('GitHub 原包目录与 profile 共用 daemon 来源，导出保留分支，版本仍来自不可变原包', async t => {
   const home = await mkdtemp(join(tmpdir(), 'magi-github-profile-'));
   t.after(() => rm(home, { recursive: true, force: true }));
-  const plugin = { manifest: { id: 'dsh.github', name: 'Original', description: '' }, digest: 'current', enabled: true, active: true,
+  const plugin = { manifest: { id: 'dsh.github', name: 'Original', description: '' }, digest: 'current', enabled: true,
     source: { kind: 'upstream', location: 'dsh:@scope/github@1.2.0', github: { repository: 'owner/repo', reference: 'main', commit: 'a'.repeat(40) } },
     upstreamManifest: { name: '@scope/github', version: '1.2.0', engines: { dsh: '^0.2' } } };
   const api = { plugins: { list: async () => ({ plugins: [plugin] }) } };
@@ -414,14 +414,14 @@ test('GitHub 原包目录与 profile 共用 daemon 来源，导出保留分支�
 test('profile 重载串行提交真实启停意图、等待 daemon 收敛；失败、嵌套、取消与过期调用不冒充成功', async t => {
   const home = await mkdtemp(join(tmpdir(), 'magi-profile-reconcile-'));
   t.after(() => rm(home, { recursive: true, force: true }));
-  const plugins = [{ manifest: { id: 'dsh.target' }, digest: 'current', enabled: true, active: true,
+  const plugins = [{ manifest: { id: 'dsh.target' }, digest: 'current', enabled: true,
     source: { kind: 'upstream', location: 'dsh:target@1.0.0' }, runtime: { state: 'running', generation: 7 } }];
   let failure, calls = 0;
   const off = configureProfile({ plugins: {
     async list() { return { plugins }; },
     async setEnabled(id, enabled, digest) {
       assert.equal(id, 'dsh.target'); assert.equal(digest, 'current');
-      plugins[0].enabled = enabled; plugins[0].active = enabled;
+      plugins[0].enabled = enabled;
     },
     async reconcile(input) {
       calls++;
@@ -439,13 +439,14 @@ test('profile 重载串行提交真实启停意图、等待 daemon 收敛；失�
     await assert.rejects(reload.runExclusive(() => reload.runExclusive(() => {})), /cannot be nested/);
     fs.writeFileSync(join(profilePath(), 'cordis.patch.yml'), dump([{ id: 'dsh.target', disabled: true }]));
     await reload.runExclusive(() => reload.reconcileProfile());
-    assert.equal(plugins[0].active, false, '提案先沿原提交入口生效，再核对运行状态');
+    assert.equal(plugins[0].enabled, false, '提案先沿原提交入口生效，再核对运行状态');
     await assert.rejects(reload.runExclusive(() => reload.reconcileProfile(['dsh.target'])), /必需条目未运行/);
     assert.equal(plugins[0].enabled, false, '重载不能重新启用停用项');
     plugins[0].enabled = true;
-    const inactive = await reload.runExclusive(() => reload.reconcileProfile());
-    assert.match(inactive.warnings[0], /尚未激活/);
-    assert.equal(plugins[0].active, false, '未激活项只报告真实状态，不代授或自动激活');
+    plugins[0].runtime = { state: 'stopped', generation: 7 };
+    const stopped = await reload.runExclusive(() => reload.reconcileProfile());
+    assert.match(stopped.warnings[0], /尚未运行/);
+    plugins[0].runtime = { state: 'running', generation: 7 };
     failure = '真实宿主启动失败';
     await assert.rejects(reload.runExclusive(() => reload.reconcileProfile()), /真实宿主启动失败/);
     failure = undefined;
@@ -482,12 +483,12 @@ test('原包 Node 辅助进程读取真实 profile，内部包管理经同一 da
       request = input;
       plugins = [{ manifest: { id: 'dsh.child', description: 'native' }, digest: 'current',
         upstreamManifest: { name: '@scope/child', version: '2.0.0', dsh: { bundle: {} } },
-        source: { kind: 'upstream', location: 'dsh:@scope/child@2.0.0' }, enabled: true, active: true }];
+        source: { kind: 'upstream', location: 'dsh:@scope/child@2.0.0' }, enabled: true }];
       return { application: 'applied', version: '2.0.0' };
     },
     async setEnabled(id, enabled, digest) {
       assert.equal(id, 'dsh.child'); assert.equal(digest, 'current');
-      plugins[0].enabled = enabled; plugins[0].active = enabled;
+      plugins[0].enabled = enabled;
     },
   } }, { home }); t.after(off);
   const script = join(home, 'helper.cjs');
@@ -597,7 +598,7 @@ test('npm/pnpm 当前 profile 包操作共用 daemon 目录，无物理安装树
     list: async () => ({ plugins: structuredClone(plugins) }),
     async installBundle(input) {
       installations++; assert.equal(input.package, '@scope/target'); assert.equal(input.enabled, true);
-      plugins = [{ manifest: { id: 'dsh.target' }, digest: input.version, enabled: true, active: true,
+      plugins = [{ manifest: { id: 'dsh.target' }, digest: input.version, enabled: true,
         source: { kind: 'upstream', location: `dsh:@scope/target@${input.version}` },
         upstreamManifest: { name: '@scope/target', version: input.version } }];
       return { application: 'applied', installed: true, version: input.version };
@@ -717,7 +718,7 @@ test('profile 同步读取真实调用快照，启停提案经 daemon 与摘要�
   let enabled = true, digest = 'current';
   const calls = [];
   const off = configureProfile({ plugins: {
-    async list() { return { plugins: [{ manifest: { id: 'dsh.example', description: 'real' }, upstreamManifest: { name: '@scope/example', version: '1.2.3' }, digest, source: { kind: 'upstream', location: 'dsh:@scope/example@1.2.3' }, enabled, active: enabled, runtime: { state: enabled ? 'running' : 'stopped' } }] }; },
+    async list() { return { plugins: [{ manifest: { id: 'dsh.example', description: 'real' }, upstreamManifest: { name: '@scope/example', version: '1.2.3' }, digest, source: { kind: 'upstream', location: 'dsh:@scope/example@1.2.3' }, enabled, runtime: { state: enabled ? 'running' : 'stopped' } }] }; },
     async setEnabled(id, value, expected) { assert.equal(id, 'dsh.example'); assert.equal(expected, digest); calls.push(value); enabled = value; },
   } }, { home });
   t.after(off);

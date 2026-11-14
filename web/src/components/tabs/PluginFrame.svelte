@@ -51,9 +51,9 @@
   const MAX_WRITE_BYTES = 4 * 1024 * 1024;
   const installed = $derived(pluginProjection().installed.find((item) => item.manifest.id === pluginId));
   const runtime = $derived(installed?.runtime);
-  const ready = $derived(Boolean(installed?.active && (!installed.manifest.extension || runtime?.state === 'running')));
-  const waiting = $derived((!installed && !pluginProjection().loaded) || Boolean(installed?.active && (!runtime || runtime.state === 'starting' || runtime.state === 'restarting')));
-  const runtimeState = $derived(installed?.active ? runtime?.state ?? 'starting' : 'notRunning');
+  const ready = $derived(Boolean(installed?.enabled && (!installed.manifest.extension || runtime?.state === 'running')));
+  const waiting = $derived((!installed && !pluginProjection().loaded) || Boolean(installed?.enabled && (!runtime || runtime.state === 'starting' || runtime.state === 'restarting')));
+  const runtimeState = $derived(installed?.enabled ? runtime?.state ?? 'starting' : 'notRunning');
   const resourceDigest = $derived(installed?.digest ?? '');
   // 监管可能合并中间状态；即使只看到 running → running，新运行代次也必须创建新文档。
   // 会话不属于文档身份：消息附加视图在切换会话时保持同一个 iframe，只通过 `conversation` 消息
@@ -495,7 +495,7 @@
 {:else}
   <div class="settings-notice plugin-view-status" class:settings-notice--error={runtime?.state === 'failed'} role="status" aria-busy={waiting} data-testid="plugin-view-runtime" data-plugin-id={pluginId}>
     <Icon name={waiting ? 'loader' : 'warning'} class={waiting ? 'spinning' : ''} size={14} />
-    <span>{waiting && !installed ? i18n.t('common.loading') : i18n.t(`settings.plugins.runtime.state.${runtimeState}`)}{#if installed?.active && runtime?.reason}<br />{runtime.reason}{/if}</span>
+    <span>{waiting && !installed ? i18n.t('common.loading') : i18n.t(`settings.plugins.runtime.state.${runtimeState}`)}{#if installed?.enabled && runtime?.reason}<br />{runtime.reason}{/if}</span>
   </div>
 {/if}
 

@@ -40,7 +40,9 @@ impl PluginManager {
         };
         // 每个上游生态必须有自己的准入证据校验；没有校验器的生态不能放行。
         if ecosystem != "dsh" {
-            return Err(invalid(format!("上游生态 {ecosystem} 没有可用的兼容准入校验")));
+            return Err(invalid(format!(
+                "上游生态 {ecosystem} 没有可用的兼容准入校验"
+            )));
         }
         let report: Value = serde_json::from_slice(
             package

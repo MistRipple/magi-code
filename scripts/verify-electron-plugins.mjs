@@ -188,7 +188,7 @@ try {
   navigationUrl.searchParams.set("workspacePath", workspaceRoot);
   navigationUrl.searchParams.set("sessionId", sidebarSessions[0]);
   await page.call("Page.navigate", { url: navigationUrl.href });
-  const activeSession = () => page.evaluate("document.querySelector('.session-item.active')?.dataset.sessionId ?? ''");
+  const activeSession = () => page.evaluate("document.querySelector('.session-item.enabled')?.dataset.sessionId ?? ''");
   await waitFor(async () => (await activeSession()) === sidebarSessions[0], "当前会话 A 已恢复");
   const otherHeader = `[data-workspace-id="${otherWorkspace}"]`;
   if (await page.evaluate(`document.querySelector(${JSON.stringify(otherHeader)}).getAttribute('aria-expanded') === 'true'`)) await click(page, otherHeader);

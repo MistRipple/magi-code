@@ -1710,16 +1710,6 @@ pub enum JsonRpcMessage {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginAuthorizeRequest {
-    pub grants: Vec<PluginPermission>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "expectedDigest")]
-    pub expected_digest: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginInstallRequest {
     pub source: String,
     #[serde(default)]
@@ -1799,13 +1789,11 @@ pub struct PluginSourceProjection {
 pub struct PluginInstalled {
     pub manifest: PluginManifest,
     pub digest: String,
-    pub grants: Vec<PluginPermission>,
     pub source: PluginSourceProjection,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<PluginRuntimeStatus>,
     pub enabled: bool,
-    pub active: bool,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "upstreamManifest")]
@@ -3420,15 +3408,6 @@ pub struct ModelResponseTiming {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginActivationRequest {
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "expectedDigest")]
-    pub expected_digest: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginJobBudget {
     #[serde(rename = "maxModelCalls")]
     pub max_model_calls: u16,
@@ -4228,4 +4207,13 @@ pub struct PluginWebConfigureRequest {
     #[serde(rename = "expectedRevision")]
     pub expected_revision: i64,
     pub changes: Vec<PluginWebProviderChange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginLifecycleRequest {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expectedDigest")]
+    pub expected_digest: Option<String>,
 }

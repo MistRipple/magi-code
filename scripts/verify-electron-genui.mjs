@@ -5,7 +5,7 @@ import { cp, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { connectAppPage, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
-import { authorizePluginFromNative, previewFixedUpstreamFromNative, waitForPluginModel } from './lib/plugin-native-acceptance.mjs';
+import { waitForInstalledPlugin, previewFixedUpstreamFromNative, waitForPluginModel } from './lib/plugin-native-acceptance.mjs';
 
 const root = resolve(import.meta.dirname, '..');
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
@@ -59,7 +59,7 @@ try {
   const spec = { ecosystem: 'dsh', package: 'dsh-connect-workbuddy', version: '5.21.2' };
   const preview = await api('/api/plugins/upstream/preview', spec); await save('workbuddy-preview', preview);
   const installed = (await api('/api/plugins/upstream/install', { ...spec, expectedDigest: preview.candidate.digest })).plugins.find(item => item.manifest.id === preview.candidate.manifest.id);
-  const buddy = await authorizePluginFromNative({ request: api, page, plugin: installed });
+  const buddy = await waitForInstalledPlugin({ request: api, page, plugin: installed });
   report.check('普通原包在线安装、原生授权和模型来源仍可用', buddy.runtime.state === 'running');
   report.check('激活前显示界面位置和原生对话边界说明', /原生对话/.test(await ui.text('[data-testid=plugin-impact-ui]')));
   const model = await waitForPluginModel({ request: api, pluginId: buddy.manifest.id, record: value => save('model-selection', value) });
@@ -93,7 +93,7 @@ try {
   report.check('拒绝安装后真实模型业务仍完成', true);
   await stop('before-restart'); await start(); await navigate();
   const current = await plugins();
-  report.check('完整重启保留原包和摘要模式，不恢复冲突原包', current.length === registry.length && current.some(item => item.digest === buddy.digest && item.active)
+  report.check('完整重启保留原包和摘要模式，不恢复冲突原包', current.length === registry.length && current.some(item => item.digest === buddy.digest && item.enabled)
     && await ui.exists('[data-conversation-display-mode=summary]') && !await ui.exists('[data-plugin-placement=chatAssistant]'));
   await save('identity', { work, sessionId: session, workbuddy: { version: buddy.manifest.version, digest: buddy.digest }, rejected: 'dsh-genui@0.3.3', model: model.id });
   report.check('Renderer 无未捕获异常', errors.length === 0, errors.join('\n'));

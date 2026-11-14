@@ -761,11 +761,6 @@ export interface PluginManifest {
 
 export type JsonRpcMessage = JsonRpcRequest | JsonRpcNotification | JsonRpcResponse;
 
-export interface PluginAuthorizeRequest {
-  grants: Array<PluginPermission>;
-  expectedDigest?: string;
-}
-
 export interface PluginInstallRequest {
   source: string;
   archiveBase64?: string;
@@ -797,11 +792,9 @@ export interface PluginSourceProjection {
 export interface PluginInstalled {
   manifest: PluginManifest;
   digest: string;
-  grants: Array<PluginPermission>;
   source: PluginSourceProjection;
   runtime?: PluginRuntimeStatus;
   enabled: boolean;
-  active: boolean;
   upstreamManifest?: Record<string, unknown>;
   upstreamArchivePath?: string;
   translationRuntime?: PluginTranslationRuntimeStatus;
@@ -1476,10 +1469,6 @@ export interface ModelResponseTiming {
   textOutputTokens?: number;
 }
 
-export interface PluginActivationRequest {
-  expectedDigest?: string;
-}
-
 export interface PluginJobBudget {
   maxModelCalls: number;
   maxOutputTokens: number;
@@ -1880,4 +1869,8 @@ export interface PluginWebProviderChange {
 export interface PluginWebConfigureRequest {
   expectedRevision: number;
   changes: Array<PluginWebProviderChange>;
+}
+
+export interface PluginLifecycleRequest {
+  expectedDigest?: string;
 }

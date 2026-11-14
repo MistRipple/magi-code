@@ -173,7 +173,6 @@ impl SafetyEvaluation {
     pub fn is_allow(&self) -> bool {
         self.decision.is_allow()
     }
-
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

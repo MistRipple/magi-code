@@ -36,7 +36,7 @@ export const DSH_RULES = [
   rule('calls', /^ctx\.connection(\.|$)/, { fixed: 'shim', group: 'runtime', target: 'Magi daemon 已认证的插件私有路由', note: '只提供 requestRejection；准入由 daemon 完成', source: COOKBOOK }),
   rule('calls', /^ctx\.pluginManager(\.(listBundles|registries))?$/, { fixed: 'shim', group: 'runtime', target: 'Magi daemon 插件目录只读投影', note: '每次读取真实包来源、版本和启用状态；在线管理沿 Magi 插件入口', source: COOKBOOK }),
   rule('calls', /^ctx\.pluginManager\.(listVersionExemptions|setVersionExemption)$/, { fixed: 'shim', group: 'runtime', target: 'daemon 全局版本豁免 CAS', note: '只读取当前兼容运行时的精确版本豁免；写入需要独立 compatibility 授权、风险确认及当前 revision', source: COOKBOOK }),
-  rule('calls', /^ctx\.pluginManager\.(installBundle|setBundleEnabled|removeBundle)$/, { fixed: 'shim', group: 'runtime', target: 'Magi daemon 插件管理服务', note: '在线包预览、摘要核对、排空升级和启停；需 pluginManagement 授权，委托授权目标单独告知，不运行安装脚本', source: COOKBOOK }),
+  rule('calls', /^ctx\.pluginManager\.(installBundle|setBundleEnabled|removeBundle)$/, { fixed: 'shim', group: 'runtime', target: 'Magi daemon 插件管理服务', note: '在线包预览、摘要核对、排空升级和启停；需 pluginManagement 授权，安装完成即启用，不运行安装脚本', source: COOKBOOK }),
   rule('calls', /^ctx\.pluginManager\./, { capability: 'ui.view', fidelity: 'partial', group: 'runtime', note: '尚未接入 DSH 插件管理写操作；不伪造安装、升级或启停成功', source: COOKBOOK }),
   rule('calls', /^ctx\.hmr(\.(runExclusive|reconcileProfile))?$/, { fixed: 'shim', group: 'runtime', target: 'daemon 运行目录收敛', note: '串行应用已提交的 profile 意图，等待真实宿主就绪；不重启未变化实例或启用停用项，失败与过期调用明确拒绝', source: src('packages/boot/hmr/src/index.ts', 'runExclusive / reconcileProfile') }),
   rule('calls', /^ctx\.loader(\.entries)?$/, { fixed: 'shim', group: 'runtime', target: 'daemon 插件目录的调用期 loader 投影', note: '同步读调用快照；profile 启停写入回执前由 daemon 提交，不保存第二份安装事实', source: COOKBOOK }),

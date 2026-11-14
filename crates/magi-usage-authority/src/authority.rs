@@ -6,8 +6,8 @@ use crate::model_identity::build_model_resolution_identity;
 use crate::reducer::{rebuild_usage_snapshot_from_events, rebuild_workspace_snapshot};
 use crate::types::{
     ExecutionBindingIdentity, SessionUsageSnapshot, UsageCallIdentity, UsageCallRecordInput,
-    UsageCallStatus, UsageEvent, UsageEventType, UsageEventUsageDelta, UsagePhase,
-    UsageSourceRole, UsageSubject, WorkspaceUsageSnapshot,
+    UsageCallStatus, UsageEvent, UsageEventType, UsageEventUsageDelta, UsagePhase, UsageSourceRole,
+    UsageSubject, WorkspaceUsageSnapshot,
 };
 
 fn build_event_id(

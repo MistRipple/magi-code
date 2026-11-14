@@ -42,8 +42,6 @@ try {
   const plugin = installed.plugins.find(value => value.manifest.id === preview.candidate.manifest.id);
   assert.ok(plugin);
   await api(`/api/plugins/${plugin.manifest.id}/enable`, {});
-  await api(`/api/plugins/${plugin.manifest.id}/authorize`, { grants: plugin.manifest.permissions });
-  await api(`/api/plugins/${plugin.manifest.id}/activate`, {});
   const running = await waitFor(async () => {
     const value = (await api('/api/plugins')).plugins.find(value => value.manifest.id === plugin.manifest.id);
     assert.notEqual(value?.runtime?.state, 'failed', value?.runtime?.reason);

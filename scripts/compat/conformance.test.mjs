@@ -319,13 +319,12 @@ test('原包封装只观察默认启动，扫描与运行共用条件导出，�
     const archive = join(root, `${name}.zip`); packPlugin(outDir, archive); prepared.push(await readFile(archive));
   }
   assert.deepEqual(prepared[0], prepared[1]);
-  // 管理原包可请求安装与启停；新包授权继续由 Magi 的原生入口拥有。
+  // 管理原包可请求安装与启停；安装完成即启用，没有单独的授权或激活步骤。
   await writeFile(join(upstream, 'index.js'), `export const inject=['pluginManager']; export function apply(ctx) { ctx.pluginManager.listBundles(); }`);
   const manager = await prepareDsh({ upstreamDir: upstream, outDir: join(root, 'manager'), sharedRoot, source: { integrity: 'contract' } });
   const management = manager.manifest.permissions.find(permission => permission.kind === 'pluginManagement');
   assert.ok(management.targets.includes('install'));
   assert.ok(management.targets.includes('lifecycle'));
-  assert.ok(!management.targets.includes('authorize'), '翻译入口不能给 DSH 管理插件默认代授权权力');
   assert.ok(!manager.manifest.permissions.some(permission => permission.kind === 'sessionWrite'), '插件管理不附带会话写入权');
   for (const [name, code, writes] of [
     ['model', "export const inject=['llm']; export function apply(ctx) {}", false],

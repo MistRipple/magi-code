@@ -4925,9 +4925,8 @@ fn sidecar_metadata_updates_wait_for_canonical_commit_and_preserve_the_committed
                 ..ExecutionOwnership::default()
             };
             match operation {
-                "bind" => {
-                    metadata_store.bind_execution_ownership_for_test(metadata_session.clone(), ownership)
-                }
+                "bind" => metadata_store
+                    .bind_execution_ownership_for_test(metadata_session.clone(), ownership),
                 "recovery_input" => metadata_store
                     .apply_recovery_resume_input(
                         metadata_session.clone(),

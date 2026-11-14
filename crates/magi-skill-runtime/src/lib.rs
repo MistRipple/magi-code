@@ -507,7 +507,6 @@ impl SkillRuntime {
     pub fn build_tool_runtime_plan(&self, selection: SkillSelection) -> SkillToolRuntimePlan {
         self.registry.build_tool_runtime_plan(&selection)
     }
-
 }
 
 impl SkillDispatchRuntime {

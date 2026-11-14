@@ -90,7 +90,7 @@ if(process.env.MAGI_EXT_ENDPOINT) await fetch(process.env.MAGI_INSTALL_RECOVERY_
   await start();const preview=await api('/api/plugins/preview',request);await api('/api/plugins/install',{...request,expectedDigest:preview.digest});
   const manager=(await plugins()).find(p=>p.manifest.id==='acme.install-recovery');
   await api('/api/plugins/acme.install-recovery/enable',{});
-  await api('/api/plugins/acme.install-recovery/authorize',{grants:manager.manifest.permissions});await api('/api/plugins/acme.install-recovery/activate',{});await ready();
+await api('/api/plugins/acme.install-recovery/enable',{});await ready();
 }
 try{
   assert.ok(!await fetch(origin+'/health').then(()=>true,()=>false));await prepare();

@@ -373,7 +373,6 @@ impl PermissionEngine {
             Some(_) => false,
         }
     }
-
 }
 
 fn json_string(

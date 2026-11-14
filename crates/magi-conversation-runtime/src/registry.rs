@@ -195,8 +195,7 @@ impl ConversationRegistry {
             })
             .expect("task signal channel wait poisoned");
         let channel = channels.get_mut(&key)?;
-        let (taken, kept): (Vec<_>, Vec<_>) =
-            channel.drain(..).partition(|signal| matches(signal));
+        let (taken, kept): (Vec<_>, Vec<_>) = channel.drain(..).partition(|signal| matches(signal));
         channel.extend(kept);
         Some(taken)
     }

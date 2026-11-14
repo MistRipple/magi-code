@@ -87,7 +87,7 @@ impl PluginManager {
         Ok(self.web_configuration())
     }
 
-    /// 停用／卸载回到原生实现；已激活但未就绪仍保留选择，由真实调用明确失败。
+    /// 停用／卸载回到原生实现；已启用但未就绪仍保留选择，由真实调用明确失败。
     pub fn selected_web_tool(&self, kind: &PluginWebKind) -> Result<Option<String>, PluginError> {
         let binding = match kind {
             PluginWebKind::Search => &self.state.web.search,
@@ -99,7 +99,7 @@ impl PluginManager {
         let Some(installed) = self.state.plugins.get(&binding.plugin_id) else {
             return Ok(None);
         };
-        if !installed.active || !installed.enabled {
+        if !installed.enabled {
             return Ok(None);
         }
         let target = match kind {

@@ -48,11 +48,6 @@ fn web_selection_is_atomic_authorized_persistent_and_bound_to_current_runtime() 
             },
         )
         .unwrap();
-    manager.enable("example.web").unwrap();
-    manager
-        .authorize("example.web", package.manifest().permissions.clone())
-        .unwrap();
-    manager.activate("example.web").unwrap();
     manager
         .begin_runtime("example.web", package.digest(), "first")
         .unwrap();
@@ -103,7 +98,7 @@ fn web_selection_is_atomic_authorized_persistent_and_bound_to_current_runtime() 
             .unwrap()
             .is_some()
     );
-    manager.deactivate("example.web").unwrap();
+    manager.disable("example.web").unwrap();
     assert!(
         manager
             .selected_web_tool(&PluginWebKind::Search)
@@ -118,7 +113,7 @@ fn web_selection_is_atomic_authorized_persistent_and_bound_to_current_runtime() 
     drop(manager);
     let mut restored = PluginManager::open(root.path()).unwrap();
     assert_eq!(restored.web_configuration(), configured);
-    restored.activate("example.web").unwrap();
+    restored.enable("example.web").unwrap();
     assert!(
         restored
             .selected_web_tool(&PluginWebKind::Fetch)

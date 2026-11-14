@@ -97,7 +97,6 @@ impl ModelIdentitySnapshot {
             binding_revision,
         }
     }
-
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,7 +258,6 @@ impl ContextPressureSnapshot {
             observed_at: input.observed_at,
         }
     }
-
 }
 
 /// provider 锚点后新增的模型可见内容。所有调用方都必须先通过该函数合并，

@@ -694,7 +694,7 @@ pub(crate) fn resolve_plugin_command_selection(
                 == selected
         })
         .map(|(_, command)| command)
-        .ok_or_else(|| ApiError::Forbidden("所选插件命令未激活".into()))?;
+        .ok_or_else(|| ApiError::Forbidden("所选插件命令未启用".into()))?;
     Ok(Some(command))
 }
 
@@ -1970,12 +1970,8 @@ mod tests {
                 },
             )
             .unwrap();
-        if active {
-            manager.enable("acme.cmd").unwrap();
-            manager
-                .authorize("acme.cmd", package.manifest().permissions.clone())
-                .unwrap();
-            manager.activate("acme.cmd").unwrap();
+        if !active {
+            manager.disable("acme.cmd").unwrap();
         }
         let state = crate::ApiState::new(
             "magi-test",
@@ -2038,7 +2034,7 @@ mod tests {
                 "{extra}"
             );
         }
-        // 未激活的插件不提供命令。
+        // 未启用的插件不提供命令。
         let (inactive, _dir2) = command_state(false);
         assert!(resolve_plugin_command_selection(&inactive, &request).is_err());
     }

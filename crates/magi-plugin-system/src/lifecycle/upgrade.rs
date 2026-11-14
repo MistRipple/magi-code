@@ -53,11 +53,10 @@ impl PluginManager {
 
 impl PluginManager {
     /// 排空后的版本切换。调用方须持有覆盖该插件的升级排空标记
-    /// （[`PluginManager::begin_upgrade_drain`]）。
+    /// （[`PluginManager::begin_drain`]）。
     ///
-    /// 授权绑定到具体包摘要，不跨版本继承：切换后保留全局启用意愿，
-    /// 但所有激活与授权清空，须用户对新包重新授权后激活。不保留双版本并发或
-    /// 自动回退；数据格式版本变化且已有持久数据时没有转换通道，切换后清空该插件的数据。
+    /// 切换后保留启用状态，新版本随清单获得全部权限，由 daemon 在排空释放后按新包重新启动。
+    /// 不保留双版本并发或自动回退；数据格式版本变化且已有持久数据时没有转换通道，切换后清空该插件的数据。
     pub fn upgrade(
         &mut self,
         package: &PluginPackage,
@@ -136,8 +135,6 @@ impl PluginManager {
             source,
             package_path: relative.clone(),
             enabled,
-            grants: Vec::new(),
-            active: false,
             disabled_by: None,
         };
         let mut next = self.state.clone();

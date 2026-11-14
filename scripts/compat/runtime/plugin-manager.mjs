@@ -1,5 +1,5 @@
-// DSH 插件管理沿 daemon 的安装、摘要确认和生命周期入口。新包授权需要
-// 管理插件单独获得 authorize 委托；失败不能把已下载当成已运行。
+// DSH 插件管理沿 daemon 的安装、摘要确认和生命周期入口。新包安装完成即启用；
+// 失败不能把已下载当成已运行。
 import { NPM_NAME as NAME, parseBundleSpec, dshBundle } from './plugin-source.mjs';
 export { parseBundleSpec } from './plugin-source.mjs';
 import { profileCompatibility, updateProfileExemption, createProfileMutation, profileChangeId } from './profile.mjs';
@@ -25,11 +25,11 @@ export function createPluginManager(api, registry = process.env.MAGI_NPM_REGISTR
     async listBundles() {
       const { plugins } = await api.plugins.list();
       return plugins.flatMap(plugin => {
-        const { manifest, enabled, active } = plugin;
+        const { manifest, enabled } = plugin;
         const bundle = dshBundle(plugin);
         if (!bundle) return [];
         const { name, version, source } = bundle;
-        return [{ name, version, enabled, active, installed: true, source,
+        return [{ name, version, enabled, installed: true, source,
           availability: 'profile', removable: true, official: !plugin.source.github && name.startsWith('@deepseek-ai/'),
           ...(!api.plugins.installBundle ? { readOnlyReason: '在线安装、升级和启停请使用 Magi 的插件管理入口' } : {}),
           meta: { title: manifest.name, description: manifest.description } }];

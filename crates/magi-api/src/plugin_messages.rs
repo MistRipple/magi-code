@@ -135,7 +135,7 @@ async fn admit(
             .plugin_manager
             .lock()
             .map_err(|_| "插件管理器不可用")?;
-        if !manager.is_active(plugin).map_err(|e| e.to_string())?
+        if !manager.is_enabled(plugin).map_err(|e| e.to_string())?
             || !manager
                 .permission_allowed(
                     plugin,

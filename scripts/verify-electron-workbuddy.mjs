@@ -53,7 +53,7 @@ async function start() {
   page = await waitFor(() => connectAppPage(cdpPort, port, errors), '真实 Magi 主窗口', 60_000);
   await page.call('Network.enable');
   page.on('Network.requestWillBeSent', ({ request }) => {
-    const action = request.url.match(/\/api\/plugins\/[^/]+\/(authorize|enable|activate|deactivate|disable)$/)?.[1];
+    const action = request.url.match(/\/api\/plugins\/[^/]+\/(enable|disable)$/)?.[1];
     if (action && request.method === 'POST') lifecycleRequests.push({ action, ...JSON.parse(request.postData || '{}') });
   });
   ui = pageTools(page);
@@ -155,10 +155,8 @@ try {
     return ['running', 'failed'].includes(item.runtime?.state) && item;
   }, '真实 WorkBuddy 原包运行', 120_000);
   assert.equal(activated.runtime.state, 'running', activated.runtime.reason);
-  report.check('真实 Cordis 原包激活成功', true);
-  report.check('授权及启用均绑定用户查看的原包摘要', lifecycleRequests.length === 3
-    && lifecycleRequests.map(item => item.action).join(',') === 'authorize,enable,activate'
-    && lifecycleRequests.every(item => item.expectedDigest === plugin.digest));
+  report.check('真实 Cordis 原包启动成功', true);
+  report.check('安装完成即启用，不再发出任何授权或启用请求', lifecycleRequests.length === 0 && activated.enabled);
   report.check('配置只在设置页声明，原包同组件主区别名不生成主对话或右栏入口', activated.manifest.contributions.views.filter(view=>view.placements.includes('settings')).length === 1
     && !activated.manifest.contributions.views.some(view=>view.placements.includes('main')||view.placements.includes('rightPane'))
     && !await ui.exists('[data-testid=top-tab-plugin]'));
@@ -195,33 +193,22 @@ try {
   const staleDocument = await page.evaluate(`document.querySelector('iframe[data-plugin-id="${pluginId}"]').src`);
   await tab('plugins');
   await waitFor(() => ui.exists(row), '插件列表'); await ui.click(row);
-  await ui.click('[data-action=deactivate]');
-  await waitFor(async () => !(await installed()).active, '停用原包');
+  await ui.click('[data-action=disable]');
+  await waitFor(async () => !(await installed()).enabled, '停用原包');
   report.check('停用回收真实 WorkBuddy 模型数据源', !(await api('/api/settings/models/catalog')).groups.some((g) => g.pluginId === pluginId));
   await waitFor(() => page.evaluate(`!document.querySelector('iframe[data-plugin-id="${pluginId}"]')`), '停用回收保活设置文档');
   const deniedDocument = await fetch(staleDocument);
   report.check('停用回收隐藏页面，旧文档地址不能继续取得业务页面', [403,409].includes(deniedDocument.status));
   await tab(`plugin:${pluginId}:settings`);
   const requestOffset = lifecycleRequests.length;
-  await waitFor(() => ui.exists('[data-testid=plugin-page-header] [role=switch]:not([disabled])'), '已授权设置页的重新启用开关');
+  await waitFor(() => ui.exists('[data-testid=plugin-page-header] [role=switch]:not([disabled])'), '设置页的重新启用开关');
   await ui.click('[data-testid=plugin-page-header] [role=switch]');
-  await waitFor(async () => (await installed()).runtime?.state === 'running', '重新激活', 90_000);
+  await waitFor(async () => (await installed()).runtime?.state === 'running', '重新启用', 90_000);
   const reactivated = await installed();
-  report.check('设置页重新启用保留授权，创建新实例且不重复授予权限', reactivated.runtime.instanceId !== beforeStop.runtime.instanceId
-    && JSON.stringify(reactivated.grants) === JSON.stringify(beforeStop.grants)
-    && lifecycleRequests.slice(requestOffset).map(item => item.action).join(',') === 'enable,activate'
+  report.check('设置页重新启用创建新实例，只发出一次启用请求', reactivated.runtime.instanceId !== beforeStop.runtime.instanceId
+    && lifecycleRequests.slice(requestOffset).map(item => item.action).join(',') === 'enable'
     && lifecycleRequests.slice(requestOffset).every(item => item.expectedDigest === plugin.digest));
   await waitFor(() => ui.exists(`iframe[data-plugin-id="${pluginId}"]`), '重新启用后的原包文档');
-  await api(`/api/plugins/${pluginId}/authorize`, { grants: [], expectedDigest: plugin.digest });
-  await waitFor(() => ui.exists('[data-testid=plugin-page-header] [role=switch]:not([disabled])'), '撤权后的设置页启用开关');
-  report.check('撤权回收页面与模型来源', (await installed()).grants.length === 0
-    && !(await installed()).active && !await ui.exists(`iframe[data-plugin-id="${pluginId}"]`)
-    && !(await api('/api/settings/models/catalog')).groups.some(group => group.pluginId === pluginId));
-  await ui.click('[data-testid=plugin-page-header] [role=switch]');
-  const reauthorized = await waitFor(async () => { const item = await installed(); return item.runtime?.state === 'running' && item; }, '明确重新授权后启动新实例', 90_000);
-  report.check('撤权后可在同一安装上通过设置页开关恢复', reauthorized.digest === plugin.digest
-    && reauthorized.runtime.instanceId !== reactivated.runtime.instanceId
-    && JSON.stringify(reauthorized.grants) === JSON.stringify(beforeStop.grants));
   await writeFile(join(output, 'lifecycle-requests.json'), JSON.stringify(lifecycleRequests, null, 2));
   await verifyCliCommand(selected);
   const beforeRestart = await installed(), savedSettings = await api(`/api/plugins/${pluginId}/settings`);
@@ -232,7 +219,7 @@ try {
   await waitForPluginModel({ request: api, pluginId, modelId: selected.id,
     record: value => writeFile(join(output, 'model-selection-restarted.json'), JSON.stringify(value, null, 2)) });
   report.check('应用重启保持同一原包、授权和配置并恢复新宿主及真实模型目录', restored.digest === beforeRestart.digest
-    && restored.runtime.instanceId !== beforeRestart.runtime.instanceId && JSON.stringify(restored.grants) === JSON.stringify(beforeRestart.grants)
+    && restored.runtime.instanceId !== beforeRestart.runtime.instanceId
     && JSON.stringify(await api(`/api/plugins/${pluginId}/settings`)) === JSON.stringify(savedSettings));
   if (statsVerification) {
     const restoredStats = await api('/api/settings/stats?sessionId='+encodeURIComponent(statsVerification.sessionId));
