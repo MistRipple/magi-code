@@ -308,16 +308,30 @@
     else if (item.upstream) await stageUpstream(item.upstream);
   }
 
-  /** 升级：插件中心条目直接安装；上游条目先翻译预览，由用户确认后安装。 */
+  /**
+   * 上游条目升级：点击一次即完成取包、翻译和提交，不再停在确认页。
+   * 只有会清空插件数据（dataReset）的升级才保留确认页，避免无提示丢数据。
+   */
+  async function upgradeUpstream(entry: PluginUpstreamRequest): Promise<void> {
+    await run(async () => {
+      const preview = await previewUpstreamPlugin(entry);
+      const candidate = preview.candidate;
+      if (candidate.operation === 'unchanged') { message = i18n.t('settings.plugins.candidate.unchanged'); return; }
+      if (candidate.dataReset) { staged = { kind: 'upstream', ecosystem: entry.ecosystem, preview }; return; }
+      await installUpstreamPlugin(preview, entry.ecosystem);
+    }, i18n.t('settings.plugins.candidate.installing'));
+  }
+
+  /** 升级：插件中心与上游条目都是一次点击直接完成。 */
   async function updateFromCenter(item: StoreItem): Promise<void> {
     if (item.installed?.translationRuntime?.state === 'updateAvailable' && item.upstream?.state !== 'updatable') {
       const request = installedUpstreamRequest(item.installed);
-      if (request) await stageUpstream(request);
+      if (request) await upgradeUpstream(request);
     } else if (item.installed?.source.github) {
       const { repository, reference } = item.installed.source.github;
-      await stageUpstream({ ecosystem: 'dsh', github: { repository, reference } });
+      await upgradeUpstream({ ecosystem: 'dsh', github: { repository, reference } });
     } else if (item.catalog && item.catalog.state === 'updatable') await run(() => installFromPluginCenter(item.catalog!));
-    else if (item.upstream) await stageUpstream(item.upstream);
+    else if (item.upstream) await upgradeUpstream(item.upstream);
   }
 
   // 搜索词变化后稍作等待再请求 registry；注册表变化（安装、卸载）后立即刷新，使安装状态保持准确。

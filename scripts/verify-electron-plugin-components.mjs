@@ -94,11 +94,6 @@ try {
     await page.call('Fetch.disable'); off();
     reporter.check('更新检查失败保留原包、设置及运行实例并可重试', (await plugin()).digest === before.digest && (await plugin()).runtime.generation === before.runtime.generation);
     await ui.click('[data-testid=plugin-detail-update]');
-    await waitFor(() => ui.exists('[data-testid=plugin-candidate][data-operation=upgrade]'), '同版原包更新预览', 240_000);
-    reporter.check('预览说明运行组件更新，原包仍为固定版本', await ui.exists('[data-testid=candidate-runtime-update]') && (await ui.text('[data-testid=plugin-candidate]')).includes(source.version));
-    await audit('preview');
-    await screenshot('update-preview');
-    await ui.click('[data-action=confirm-candidate]');
     const installed = await waitFor(async () => { const current = await plugin(); return current.digest !== before.digest && current.translationRuntime?.state === 'current' && current; }, '在线确认提交', 240_000);
     reporter.check('同版原包切换摘要后保持启用', installed.manifest.version === before.manifest.version && installed.enabled);
     const updated = await running();

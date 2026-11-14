@@ -154,11 +154,9 @@ try {
     && !(await ui.text('[data-testid=plugin-card]')).includes('vundefined'));
   report.check('390px 窄屏在线更新按钮固定可见', await narrowAction('[data-testid=plugin-detail-update]', '[data-testid=plugin-detail-scroll]', 'update-390'));
   await ui.click('[data-testid=plugin-detail-update]');
-  await waitFor(() => ui.exists('[data-testid=plugin-candidate][data-operation=upgrade]'), '在线升级预览', 190_000);
-  await screenshot('update-preview');
-  await ui.click('[data-action=confirm-candidate]');
+  report.check('点击更新直接升级，不出现确认预览', !await ui.exists('[data-testid=plugin-candidate]'));
   await waitFor(async () => (await api('/api/plugins')).plugins.find((p) => p.manifest.id === plugin.manifest.id)?.manifest.version === plugin.manifest.version, '在线升级完成', 190_000);
-  report.check('真实 npm 旧版通过在线预览与确认更新到当前版本', true, `${older.version} → ${plugin.manifest.version}`);
+  report.check('真实 npm 旧版一键更新到当前版本', true, `${older.version} → ${plugin.manifest.version}`);
   await waitFor(async () => !await ui.exists('[data-testid=plugin-search-loading]'), '安装后的搜索刷新', 60_000);
   const failure = await intercept(`${origin}/api/plugins/upstream?*`);
   await query('dsh-rea'); const failed = await failure.request();

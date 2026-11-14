@@ -40,18 +40,12 @@ export async function upgradePluginFromNative({ request, page, plugin, version, 
   await page.evaluate(`(() => {const input=document.querySelector(${JSON.stringify(search)});Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,${JSON.stringify(plugin.manifest.name)});input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
   const row = `[data-testid=plugin-row][data-plugin-id=${JSON.stringify(id)}]`;
   await waitFor(() => ui.exists(row), '已安装原包'); await ui.click(row);
-  const preview = async () => {
+  const update = async () => {
     await waitFor(() => ui.exists('[data-testid=plugin-detail-update]'), '原生在线更新入口', 90_000);
     await ui.click('[data-testid=plugin-detail-update]');
-    await waitFor(() => ui.exists('[data-testid=plugin-candidate][data-operation=upgrade]'), '实际在线升级预览', 240_000);
-    assert.ok((await ui.text('[data-testid=plugin-candidate]')).includes(version), '预览必须包含实际目标版本');
   };
   const current = async () => (await request('/api/plugins')).plugins.find(item => item.manifest.id === id);
-  await preview(); await ui.click('[data-action=cancel-candidate]');
-  const cancelled = await current();
-  check('selfUpdateCancelled', '取消原生在线更新保留原包摘要和当前实例', cancelled.digest === plugin.digest
-    && cancelled.enabled && cancelled.runtime.instanceId === plugin.runtime.instanceId);
-  await preview(); await ui.click('[data-action=confirm-candidate]');
+  await update();
   const pending = await waitFor(async () => { const value = await current(); return value?.manifest.version === version && value; }, '提交实际在线新版', 240_000);
   check('selfUpdateCommitted', '原生在线更新提交新摘要并保持启用', pending.digest !== plugin.digest && pending.enabled);
   const installed = await waitForInstalledPlugin({ request, page, plugin: pending });
