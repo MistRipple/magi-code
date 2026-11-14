@@ -18,8 +18,10 @@ const SLOT_CONTRACTS = {
   'sidebar.right.pane.tab.title': { kind: 'keyed', scope: 'session', disposition: 'alternate' },
   'sidebar.right.tab.guide.entry': { kind: 'keyed', scope: 'session', disposition: 'alternate' },
   'sidebar.footer.action': { kind: 'list', scope: 'root', disposition: 'alternate' },
-  'conversation.input.left': { kind: 'list', scope: 'session', disposition: 'mounted' },
-  'conversation.input.right': { kind: 'list', scope: 'session', disposition: 'mounted' },
+  // 输入区左／右的并列贡献没有 Magi 位置：原包的这类入口（如 WorkBuddy 的积分读数）依赖 DSH 外壳的
+  // modelSelection 投影，Magi 不提供，页面渲染为空。登记后忽略，不阻止安装；见设计文档第 6.0 节。
+  'conversation.input.left': { kind: 'list', scope: 'session', disposition: 'alternate' },
+  'conversation.input.right': { kind: 'list', scope: 'session', disposition: 'alternate' },
   'conversation.chat.node': { kind: 'keyed', scope: 'session', disposition: 'blocked', reason: '替换原生消息渲染器' },
   'conversation.session.header.actions': { kind: 'list', scope: 'session', disposition: 'unmounted' },
   'conversation.chat.turnTail': { kind: 'list', scope: 'session', disposition: 'unmounted' },

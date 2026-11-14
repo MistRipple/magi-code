@@ -15,7 +15,7 @@ export function pluginImpactNotices(manifest: PluginManifest, t: (key: string, v
   const notices: { id: string; text: string }[] = [];
   const placements = new Set((manifest.contributions.views ?? []).flatMap(view => view.placements));
   if (placements.size) notices.push({ id: 'ui', text: t('settings.plugins.impact.ui', {
-    locations: (['settings', 'main', 'rightPane', 'home', 'homeCard', 'composerLeft', 'chatAssistant'] as const)
+    locations: (['settings', 'main', 'rightPane', 'home', 'homeCard', 'chatAssistant'] as const)
       .filter(placement => placements.has(placement)).map(placement => t(`settings.plugins.impact.${placement}`)).join(' / '),
   }) });
   const hooks = manifest.extension?.hooks ?? [];

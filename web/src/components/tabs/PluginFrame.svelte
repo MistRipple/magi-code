@@ -32,20 +32,15 @@
      * 视图所处的位置。`settings` 嵌入设置页的整页滚动：高度由页面经 `view.resize` 上报，
      * 底色取设置页主区域的实际底色；其他位置由宿主给定固定尺寸，页面自己滚动。
      */
-    placement?: 'settings' | 'page' | 'background' | 'composerLeft' | 'chatAssistant';
+    placement?: 'settings' | 'page' | 'background' | 'chatAssistant';
     viewEntry?: string | null;
     conversation?: PluginConversationViewContext;
-    /** 内嵌入口按页面实际内容收起占位，文档继续保留以接收后续内容。 */
-    onContentVisibility?: (visible: boolean) => void;
   }
 
-  let { pluginId, entry, label, frameTestId = 'plugin-view', placement = 'page', viewEntry = entry, conversation, onContentVisibility }: Props = $props();
-  const inline = $derived(placement === 'composerLeft' || placement === 'chatAssistant');
+  let { pluginId, entry, label, frameTestId = 'plugin-view', placement = 'page', viewEntry = entry, conversation }: Props = $props();
+  const inline = $derived(placement === 'chatAssistant');
   /** 页面上报的内容高度（CSS 像素）；只在 settings 位置生效，重新加载后清空。 */
   let reportedHeight = $state<number | null>(null);
-  let overflowTop = $state(0);
-  let overflowLeft = $state(0);
-  let reportedWidth = $state<number | null>(null);
   let settingsInsets = $state({ left: 0, right: 0 });
   /** 与页面可上报的合理上限一致，防止异常值撑爆设置页。 */
   const MAX_VIEW_HEIGHT = 20_000;
@@ -61,9 +56,8 @@
   const runtimeState = $derived(installed?.active ? runtime?.state ?? 'starting' : 'notRunning');
   const resourceDigest = $derived(installed?.digest ?? '');
   // 监管可能合并中间状态；即使只看到 running → running，新运行代次也必须创建新文档。
-  // 会话不属于文档身份：输入区、消息区的内嵌视图在切换会话时保持同一个 iframe，只通过
-  // `conversation` 消息下发新会话（带 contextRevision，旧回执不能覆盖新会话）。每次切换都重建文档
-  // 会让不透明画布和宿主初始化在输入区左下角闪烁；会话相关的提交由 InputArea 在派发前核对当前会话。
+  // 会话不属于文档身份：消息附加视图在切换会话时保持同一个 iframe，只通过 `conversation` 消息
+  // 下发新会话（带 contextRevision，旧回执不能覆盖新会话）；会话相关的提交由 InputArea 在派发前核对当前会话。
   const documentIdentity = $derived(JSON.stringify([pluginId, entry, resourceDigest, ready, runtime?.instanceId]));
   const resourceUrl = $derived(
     agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/${resourceDigest ? `ui-v/${resourceDigest}` : 'ui'}/${entry.replace(/^ui\//, '').split('/').map(encodeURIComponent).join('/')}`),
@@ -146,7 +140,7 @@
       return { settingsInsets: { left, right } };
     }
     if (settingsInsets.left || settingsInsets.right) settingsInsets = { left: 0, right: 0 };
-    return inline && iframe ? { layoutWidth: iframe.parentElement?.clientWidth, availableWidth: window.innerWidth - iframe.getBoundingClientRect().left - 8 } : {};
+    return {};
   }
   let viewportObserver: ResizeObserver | undefined;
 
@@ -155,7 +149,7 @@
     if (!inline || !conversation || !documentDigest) return;
     const revision = ++contextRevision, expectedInstance = instanceId, context = conversation;
     try {
-      await admitPluginView(pluginId, { expectedDigest: documentDigest, entry: documentEntry, placement: placement as 'composerLeft' | 'chatAssistant' });
+      await admitPluginView(pluginId, { expectedDigest: documentDigest, entry: documentEntry, placement: 'chatAssistant' });
       if (revision === contextRevision) send({ type: 'conversation', context }, expectedInstance);
     } catch {
       if (revision === contextRevision) send({ type: 'conversation', context: null }, expectedInstance);
@@ -371,23 +365,14 @@
         return;
       }
       if (operation === 'view.resize') {
-        // 页面报告自己的内容高度；设置页用于整页滚动，内嵌入口据此收起空内容占位。
+        // 页面报告自己的内容高度；只有设置页用于整页滚动，其他位置由宿主给定固定尺寸。
         const height = event.data.height;
         if (typeof height !== 'number' || !Number.isFinite(height) || height < 0 || height > MAX_VIEW_HEIGHT) {
           throw new Error('视图高度无效');
         }
-        if (inline) {
-          const top = event.data.overflowTop ?? 0, left = event.data.overflowLeft ?? 0, width = event.data.width;
-          if (typeof top !== 'number' || !Number.isFinite(top) || top < 0 || top > 1000
-            || typeof left !== 'number' || !Number.isFinite(left) || left < 0 || left > 1000
-            || typeof width !== 'number' || !Number.isFinite(width) || width < 0 || width > 20000) throw new Error('内嵌视图尺寸无效');
-          overflowTop = Math.ceil(top); overflowLeft = Math.ceil(left); reportedWidth = Math.ceil(width);
-        }
-        // 先校验整份尺寸消息；拒绝的请求不能留下部分布局更新。
         // 保活设置页隐藏时没有可测量视口，零尺寸不得覆盖最后一次有效高度，
         // 否则恢复布局会压缩滚动范围并永久夹断用户的阅读位置。
-        if (inline || placement === 'settings' && iframe?.getClientRects().length) reportedHeight = Math.ceil(height);
-        if (inline) onContentVisibility?.(height > 0);
+        if (placement === 'settings' && iframe?.getClientRects().length) reportedHeight = Math.ceil(height);
         send({ type: 'response', requestId, ok: true, result: null }, expectedInstance);
         return;
       }
@@ -460,10 +445,6 @@
     const identity = documentIdentity;
     if (identity === navigationIdentity) return;
     navigationIdentity = identity;
-    // 旧文档的空内容不能隐藏新实例的加载或失败状态。
-    // 内嵌输入栏只应占用可用插件的空间；运行时失败时由宿主收起可选入口，
-    // 详细错误仍在插件设置页展示，避免把长诊断文本挤进 96px 工具栏槽位。
-    onContentVisibility?.(placement === 'composerLeft' ? ready : true);
     releaseResourceSubscriptions();
     releaseRoutes();
     documentDigest = '';
@@ -479,11 +460,10 @@
   class:plugin-view--settings={placement === 'settings'}
   class:plugin-view--sized={placement === 'settings' && reportedHeight !== null}
   class:plugin-view--inline={inline}
-  style:height={(placement === 'settings' || inline) && reportedHeight !== null ? `${reportedHeight}px` : inline ? '40px' : undefined}
-  style:margin-top={inline && overflowTop ? `${-overflowTop}px` : undefined}
-  style:margin-left={placement === 'settings' ? `${-settingsInsets.left}px` : inline && overflowLeft ? `${-overflowLeft}px` : undefined}
+  style:height={placement === 'settings' && reportedHeight !== null ? `${reportedHeight}px` : inline ? '40px' : undefined}
+  style:margin-left={placement === 'settings' ? `${-settingsInsets.left}px` : undefined}
   style:margin-right={placement === 'settings' ? `${-settingsInsets.right}px` : undefined}
-  style:width={placement === 'settings' ? `calc(100% + ${settingsInsets.left + settingsInsets.right}px)` : inline && reportedWidth ? `${reportedWidth}px` : undefined}
+  style:width={placement === 'settings' ? `calc(100% + ${settingsInsets.left + settingsInsets.right}px)` : undefined}
   data-testid={frameTestId}
   data-plugin-id={pluginId}
   src={resourceUrl}
@@ -493,12 +473,11 @@
     releaseResourceSubscriptions();
     releaseRoutes();
     reportedHeight = null;
-    overflowTop = 0; overflowLeft = 0; reportedWidth = null;
     documentDigest = resourceDigest;
     documentRuntimeId = runtime?.instanceId;
     documentEntry = entry;
     viewportObserver?.disconnect();
-    if ((inline || placement === 'settings') && iframe?.parentElement) {
+    if (placement === 'settings' && iframe?.parentElement) {
       viewportObserver = new ResizeObserver(sendHostContext);
       viewportObserver.observe(iframe.parentElement);
       const frame = iframe.closest('.settings-frame');
@@ -514,12 +493,10 @@
 ></iframe>
 {/key}
 {:else}
-  {#if placement !== 'composerLeft'}
-    <div class="settings-notice plugin-view-status" class:settings-notice--error={runtime?.state === 'failed'} role="status" aria-busy={waiting} data-testid="plugin-view-runtime" data-plugin-id={pluginId}>
-      <Icon name={waiting ? 'loader' : 'warning'} class={waiting ? 'spinning' : ''} size={14} />
-      <span>{waiting && !installed ? i18n.t('common.loading') : i18n.t(`settings.plugins.runtime.state.${runtimeState}`)}{#if installed?.active && runtime?.reason}<br />{runtime.reason}{/if}</span>
-    </div>
-  {/if}
+  <div class="settings-notice plugin-view-status" class:settings-notice--error={runtime?.state === 'failed'} role="status" aria-busy={waiting} data-testid="plugin-view-runtime" data-plugin-id={pluginId}>
+    <Icon name={waiting ? 'loader' : 'warning'} class={waiting ? 'spinning' : ''} size={14} />
+    <span>{waiting && !installed ? i18n.t('common.loading') : i18n.t(`settings.plugins.runtime.state.${runtimeState}`)}{#if installed?.active && runtime?.reason}<br />{runtime.reason}{/if}</span>
+  </div>
 {/if}
 
 <style>

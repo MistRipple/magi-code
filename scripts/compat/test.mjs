@@ -688,7 +688,8 @@ test('界面槽位：ctx 的实现只含上游入口用到的成员；未知服�
   assert.equal(slotDisposition('plugins.row.config'), 'alternate');
   assert.equal(slotDisposition('settings.section'), 'mounted');
   assert.equal(slotDisposition('settings.section.icon'), 'alternate');
-  assert.equal(slotDisposition('conversation.input.right'), 'mounted');
+  assert.equal(slotDisposition('conversation.input.right'), 'alternate');
+  assert.equal(slotDisposition('conversation.input.left'), 'alternate');
   slots.ctx.locale.register('ns', { zh: { hi: '你好 {name}' }, en: { hi: 'Hi {name}' } });
   const t = slots.ctx.locale.bind('ns');
   assert.equal(t('hi', { name: 'A' }), '你好 A');
@@ -841,6 +842,24 @@ test('原配置组件的 main 别名只保留设置入口，独立业务页面�
   assert.ok(analysis.unmounted.some(slot => slot.name === 'main' && slot.key === 'old-page' && slot.settingsDuplicate));
 });
 
+test('输入区左／右的并列入口没有 Magi 位置：登记后忽略且不阻止安装，不生成输入区视图', async t => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { analyzeNativeClient } = await import('./install/client-assets.mjs');
+  const { clientViews } = await import('./install/client-views.mjs');
+  const directory = mkdtempSync(join(tmpdir(), 'magi-ui-input-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  writeFileSync(join(directory, 'client.js'), `window.__ModuleLoader__.load({id:'business',factory(){return {apply(ctx){
+    ctx.slots.register({name:'settings.section',id:'preferences'},()=>null);
+    ctx.slots.register({name:'conversation.input.right',id:'credits'},()=>null);
+    ctx.slots.register({name:'conversation.input.left',id:'action'},()=>null);
+  }}}});`);
+  const analysis = analyzeNativeClient({ upstreamDir: directory, pkg: { exports: { './client': './client.js' } }, sharedRoot: fileURLToPath(new URL('.', import.meta.url)) });
+  assert.deepEqual(clientViews(analysis.mounted, 'arbitrary-plugin').map(view => view.placements), [['settings']]);
+  assert.deepEqual(analysis.unmounted.map(slot => [slot.name, slot.disposition]).sort(), [['conversation.input.left', 'alternate'], ['conversation.input.right', 'alternate']]);
+});
+
 test('原生对话替换在安装记录和延迟注册时均拒绝，不能借正常设置页绕过', async t => {
   const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
@@ -876,12 +895,12 @@ test('独立业务页、设置和受控输入扩展保留，外壳注入不能�
   const { join } = await import('node:path');
   const { createSlotContext } = await import('./runtime/client/slot-context.mjs');
   const context = createSlotContext({ scope: {} });
-  for (const descriptor of [{name:'main',key:'business'}, {name:'plugins.bundle.config',key:'preferences'}, {name:'conversation.input.left',id:'action'}, {name:'conversation.input.right',id:'credits'}]) {
+  for (const descriptor of [{name:'main',key:'business'}, {name:'plugins.bundle.config',key:'preferences'}]) {
     context.ctx.slots.register(descriptor, () => null);
   }
-  assert.equal(context.live().length, 4);
+  assert.equal(context.live().length, 2);
   const { clientViews } = await import('./install/client-views.mjs');
-  assert.deepEqual(clientViews(context.live().map(entry=>({name:entry.descriptor.name,key:entry.descriptor.key??entry.descriptor.id})), 'Business').map(view=>view.placements), [['main','rightPane'],['settings'],['composerLeft'],['composerLeft']]);
+  assert.deepEqual(clientViews(context.live().map(entry=>({name:entry.descriptor.name,key:entry.descriptor.key??entry.descriptor.id})), 'Business').map(view=>view.placements), [['main','rightPane'],['settings']]);
   context.dispose();
   const root = mkdtempSync(join(tmpdir(), 'magi-ui-shell-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));

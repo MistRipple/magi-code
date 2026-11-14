@@ -1,8 +1,6 @@
 <script lang="ts">
 
   import FileName from './FileName.svelte';
-  import PluginConversationView from './PluginConversationView.svelte';
-  import { conversationViews } from '../lib/plugin-conversation-views';
   import FileTypeIcon from './FileTypeIcon.svelte';
   import { onMount, tick, type Component } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
@@ -3327,12 +3325,6 @@ async function refreshPickerSettingsSnapshot() {
             </div>
           {/if}
         </div>
-        {#if currentSessionId}
-          {#each conversationViews(pluginProjection().manifests, 'composerLeft') as item (item.pluginId + ':' + item.view.id)}
-            <PluginConversationView pluginId={item.pluginId} entry={item.view.entry} label={item.view.title}
-              placement="composerLeft" context={{ sessionId: currentSessionId }} />
-          {/each}
-        {/if}
         <div class="ia-picker-wrap ia-workspace-wrap">
           <button
             type="button"

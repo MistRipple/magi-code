@@ -21,13 +21,13 @@ await withGoldenViteServer(async (server) => {
     assert.deepEqual(pluginImpactNotices(manifest, t), []);
     manifest.contributions = { views: [
       { id:'business', title:'Business', entry:'ui/page.html', placements:['main','rightPane'] },
-      { id:'input', title:'Action', entry:'ui/action.html', placements:['composerLeft'] },
-      { id:'duplicate', title:'Other action', entry:'ui/other.html', placements:['composerLeft'] },
+      { id:'input', title:'Action', entry:'ui/action.html', placements:['chatAssistant'] },
+      { id:'duplicate', title:'Other action', entry:'ui/other.html', placements:['chatAssistant'] },
     ] };
     const views = pluginImpactNotices(manifest, t);
     assert.equal(views.length, 1);
-    assert.match(views[0].text, /impact.main.*impact.rightPane.*impact.composerLeft/);
-    assert.equal(views[0].text.split('impact.composerLeft').length, 2, '重复入口不重复告知同一位置');
+    assert.match(views[0].text, /impact.main.*impact.rightPane.*impact.chatAssistant/);
+    assert.equal(views[0].text.split('impact.chatAssistant').length, 2, '重复入口不重复告知同一位置');
     manifest.extension = { hooks:[{name:'prompt.contribute',mode:'advise'},{name:'tool.call',mode:'guard'}] };
     manifest.permissions = [{kind:'contextRewrite',targets:['history']}];
     assert.deepEqual(pluginImpactNotices(manifest, t).map(notice => notice.id), ['ui','global-prompt','guard','context']);

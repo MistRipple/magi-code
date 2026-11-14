@@ -859,7 +859,6 @@
   "settings.plugins.impact.rightPane": "右栏（主动打开）",
   "settings.plugins.impact.home": "首页入口",
   "settings.plugins.impact.homeCard": "首页卡片",
-  "settings.plugins.impact.composerLeft": "输入区附加操作",
   "settings.plugins.impact.chatAssistant": "消息附加视图（展开后加载）",
   "settings.plugins.impact.guard": "全局执行拦截：启用后，插件可按已声明的规则阻止操作。插件故障时，受保护的操作也可能被阻止；可在此停用插件。插件不能代替你批准操作。",
   "settings.plugins.impact.context": "模型上下文调整：插件可按授权提出历史、工具结果或压缩内容的调整，可能影响回复；原始会话记录和最终裁决仍由 Magi 保留。",

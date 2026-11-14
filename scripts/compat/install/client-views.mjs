@@ -17,7 +17,6 @@ export function clientViews(slots, fallbackTitle) {
     return { slot, id, title: slot.label ?? (slot.name.startsWith('conversation.') ? fallbackTitle : slot.key || fallbackTitle),
       entry: primarySettings ? 'ui/settings.html' : `ui/${id}.html`,
       ...(slot.priority === undefined ? {} : { priority: slot.priority }),
-      placements: settings ? ['settings'] : ['conversation.input.left', 'conversation.input.right'].includes(slot.name) ? ['composerLeft']
-        : slot.name === 'main' ? ['main', 'rightPane'] : ['rightPane'] };
+      placements: settings ? ['settings'] : slot.name === 'main' ? ['main', 'rightPane'] : ['rightPane'] };
   });
 }

@@ -545,15 +545,14 @@ fn validate_manifest_with_limits(
         {
             return Err(invalid("主页入口必须同时声明主内容区页面"));
         }
-        if view.placements.iter().any(|placement| {
-            matches!(
-                placement,
-                PluginViewPlacement::ComposerLeft | PluginViewPlacement::ChatAssistant
-            )
-        }) && !manifest.permissions.iter().any(|permission| {
-            permission.kind == PluginPermissionKind::SessionRead
-                && permission.targets.iter().any(|target| target == "render")
-        }) {
+        if view
+            .placements
+            .contains(&PluginViewPlacement::ChatAssistant)
+            && !manifest.permissions.iter().any(|permission| {
+                permission.kind == PluginPermissionKind::SessionRead
+                    && permission.targets.iter().any(|target| target == "render")
+            })
+        {
             return Err(invalid("会话内视图必须声明 sessionRead:[render] 授权"));
         }
     }

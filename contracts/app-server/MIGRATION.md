@@ -13,7 +13,10 @@ daemon 用量权威用同次实际总输出和该耗时聚合整体响应速度�
 恢复只重建账本，不重放请求。统计 HTTP 投影增量输出 responseSampleCount、responseOutputTokens、
 responseDurationMs 与 lastResponseTps；UI 不自行估算 Token 或重新计时。
 
-`composerLeft`／`chatAssistant` 是会话内视图位置的增量枚举，复用原 views 清单与包版本事务。
+`chatAssistant` 是会话内视图位置的增量枚举，复用原 views 清单与包版本事务。`composerLeft`（输入区左侧插件面板）已移除，
+没有任何界面承载它；枚举值只为让已安装包的清单仍能解析而保留：daemon 对声明它的包拒绝激活，配置、包摘要和授权记录保留，
+在线更新或重新安装获得新产物后恢复，新翻译产物不再声明。清退条件：已发布的产物不再声明该位置、且持久化清单迁移就绪后，
+同时删除该枚举值与激活拒绝规则。
 `priority` 缺省为 0；独立视图入口沿优先级、插件与贡献身份排序，不授予原生正文替换权。`sessionRead:["render"]`
 独立于 `directory` 及 `composer:["text"]`，只读取可见会话身份及用于渲染的助手正文。
 `PluginViewAdmissionRequest` 由 daemon 校验当前安装摘要、激活、授权与位置声明；

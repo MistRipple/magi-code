@@ -324,10 +324,8 @@ async fn admit_view(
 ) -> Result<StatusCode, ApiError> {
     use magi_app_server_protocol::PluginViewPlacement;
     let manager = locked(&state, "校验插件会话视图授权")?;
-    if !matches!(
-        request.placement,
-        PluginViewPlacement::ComposerLeft | PluginViewPlacement::ChatAssistant
-    ) || !manager.is_active(&id).map_err(plugin_error)?
+    if !matches!(request.placement, PluginViewPlacement::ChatAssistant)
+        || !manager.is_active(&id).map_err(plugin_error)?
         || !manager
             .permission_allowed(
                 &id,

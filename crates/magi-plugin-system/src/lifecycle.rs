@@ -895,6 +895,17 @@ impl PluginManager {
 /// 激活时明确拒绝，而不是接纳后静默按此语义运行。
 fn ensure_host_supports_surfaces(manifest: &PluginManifest) -> Result<(), PluginError> {
     use magi_app_server_protocol::generated::{PluginSurfaceCloseAction, PluginSurfacePersistence};
+    // 输入区左侧的插件面板（composerLeft）已移除，没有任何界面承载它。旧翻译产物声明的这类视图
+    // 不能因已有授权或重启恢复而继续启用；与下面的 chatAssistant 旧产物相同，配置、包摘要和授权记录保留，
+    // 在线更新或重新安装后由新翻译产物恢复。不按包名判断。
+    if manifest.contributions.views.iter().any(|view| {
+        view.placements
+            .contains(&magi_app_server_protocol::PluginViewPlacement::ComposerLeft)
+    }) {
+        return Err(conflict(
+            "PLUGIN_UI_BOUNDARY_CONFLICT：输入区插件面板已移除，旧产物声明了这类视图，不能启用。请通过在线更新或重新安装获取新版产物，原设置和数据保留",
+        ));
+    }
     // 旧 DSH 翻译产物把替换消息渲染器映射为 chatAssistant。它与 Magi 原生
     // 附加视图的合同不同，不能因已有授权或重启恢复而继续执行；不按包名判断。
     if manifest

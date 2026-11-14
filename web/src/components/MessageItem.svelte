@@ -9,7 +9,7 @@
   import type { IconName } from '../lib/icons';
   import MarkdownContent from './MarkdownContent.svelte';
   import PluginConversationView from './PluginConversationView.svelte';
-  import { conversationViews } from '../lib/plugin-conversation-views';
+  import { assistantMessageViews } from '../lib/plugin-conversation-views';
   import { pluginProjection } from '../stores/plugin-registry.svelte';
   import ExecutionSteps from './ExecutionSteps.svelte';
   import { readExecutionSteps } from '../lib/execution-steps';
@@ -127,7 +127,7 @@
   );
   const assistantViews = $derived(message.role === 'assistant' && displayContext === 'thread' && !readOnly
     && filePreviewScope?.sessionId && presentationBlocks.every(block => block.type === 'text')
-    ? conversationViews(pluginProjection().manifests, 'chatAssistant') : []);
+    ? assistantMessageViews(pluginProjection().manifests) : []);
   // 检查是否真的有可见内容（防止虽然有 blocks 但全是空字符串导致 UI 假死）
   const hasVisibleContent = $derived.by(() => {
     if (message.content && message.content.trim().length > 0) return true;
@@ -636,7 +636,7 @@
           {#key JSON.stringify([filePreviewScope.sessionId, message.id])}
             {#each assistantViews as assistantView (`${assistantView.pluginId}:${assistantView.view.id}`)}
               <PluginConversationView pluginId={assistantView.pluginId} entry={assistantView.view.entry} label={assistantView.view.title}
-                placement="chatAssistant" context={{ sessionId: filePreviewScope.sessionId, message: {
+                context={{ sessionId: filePreviewScope.sessionId, message: {
                   id: message.id, text: message.content, streaming: message.isStreaming,
                   ...(messageTurnId ? { turnId: messageTurnId } : {}),
                 } }} />

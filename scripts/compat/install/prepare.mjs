@@ -164,11 +164,6 @@ export async function prepareDsh(options) {
     writeFileSync(join(options.outDir, 'ui/client.js'), business.code);
     const views = clientViews(clientAnalysis.mounted, manifest.name);
     manifest.contributions.views = views.map(({ slot, ...view }) => view);
-    if (views.some(view => view.placements.includes('composerLeft'))) {
-      const permission = manifest.permissions.find(permission => permission.kind === 'sessionRead');
-      if (permission) permission.targets.push('render');
-      else manifest.permissions.push({ kind: 'sessionRead', targets: ['render'] });
-    }
     if (business.operations.length) {
       manifest.contributions.client = { entry: views[0].entry };
       manifest.permissions.push({ kind: 'client', targets: ['persistent'] });

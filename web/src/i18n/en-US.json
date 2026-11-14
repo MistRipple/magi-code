@@ -859,7 +859,6 @@
   "settings.plugins.impact.rightPane": "Right pane (opened by you)",
   "settings.plugins.impact.home": "Home entry",
   "settings.plugins.impact.homeCard": "Home card",
-  "settings.plugins.impact.composerLeft": "Additional composer actions",
   "settings.plugins.impact.chatAssistant": "Message view (loaded when expanded)",
   "settings.plugins.impact.guard": "Global execution guards: this plugin can block operations under its declared rules. Protected operations may also be blocked if it fails; you can deactivate the plugin here. It cannot approve operations for you.",
   "settings.plugins.impact.context": "Model context changes: this plugin can propose authorized changes to history, tool results, or compaction, which may affect replies. Magi retains the original conversation records and final decisions.",

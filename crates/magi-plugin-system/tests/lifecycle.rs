@@ -1406,3 +1406,59 @@ fn translated_message_replacement_is_blocked_on_activation_and_restart_but_nativ
         );
     }
 }
+
+#[test]
+fn removed_composer_panel_is_blocked_on_activation_and_restart_but_records_remain() {
+    let manifest = json!({
+        "sdkVersion":2,"id":"acme.composer","version":"1.0.0","name":"Composer","description":"",
+        "extension":{"hooks":[]},
+        "permissions":[{"kind":"extension","targets":["full-trust"]}],
+        "dataSchemaVersion":1,"settingsSchema":{"type":"object"},
+        "contributions":{"views":[{"id":"credits","title":"Credits","entry":"ui/credits.html","placements":["composerLeft"]}]}
+    });
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    for (name, bytes) in [
+        ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
+        ("extension/index.mjs", b"export default () => {};".to_vec()),
+        ("ui/credits.html", b"<p>Credits</p>".to_vec()),
+    ] {
+        writer
+            .start_file(name, SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+    }
+    let package = PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap();
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    let id = "acme.composer";
+    manager.install(&package, local("composer.zip")).unwrap();
+    manager.enable(id).unwrap();
+    manager
+        .authorize(id, package.manifest().permissions.clone())
+        .unwrap();
+    let before = manager.state().clone();
+    assert!(
+        manager
+            .activate(id)
+            .unwrap_err()
+            .to_string()
+            .contains("PLUGIN_UI_BOUNDARY_CONFLICT")
+    );
+    assert_eq!(manager.state(), &before, "失败激活不能修改安装或授权");
+    // 模拟前一版留下的激活事实，重启读取原归档而不重写授权。
+    let mut state = serde_json::to_value(manager.state()).unwrap();
+    state["plugins"][id]["active"] = json!(true);
+    std::fs::write(
+        root.path().join("state.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    drop(manager);
+    let manager = PluginManager::open(root.path()).unwrap();
+    assert!(manager.ensure_host_supported(id).is_err());
+    assert_eq!(manager.package(id).unwrap().digest(), package.digest());
+    assert_eq!(
+        manager.state().plugins[id].grants,
+        package.manifest().permissions
+    );
+}
