@@ -666,7 +666,7 @@ impl PluginManager {
     }
 
     /// 解析并校验一次模型发起的工具调用：工具必须在当前激活目录内，参数必须是
-    /// 合法 JSON 且符合插件声明的 `inputSchema`。校验失败时不会启动任何扩展调用。
+    /// 合法 JSON 且符合插件声明的 `inputSchema`（Magi 能编译该 schema 时）。校验失败时不会启动任何扩展调用。
     pub fn prepare_tool_call(
         &self,
         model_tool_name: &str,
@@ -687,9 +687,11 @@ impl PluginManager {
             serde_json::from_str(arguments)
                 .map_err(|_| PluginError::InvalidInput("工具参数不是合法 JSON".into()))?
         };
-        let validator = jsonschema::validator_for(&tool.input_schema)
-            .map_err(|error| invalid(format!("插件工具 schema 无效：{error}")))?;
-        if !validator.is_valid(&input) {
+        // Magi 只对自己能编译的 schema 做预校验；编译不了的（上游 JS 生态的写法）交给工具实现方校验，
+        // 参数不合法时由它返回 InvalidParams，Magi 不在这里替它拒绝或放行。
+        if let Ok(validator) = jsonschema::validator_for(&tool.input_schema)
+            && !validator.is_valid(&input)
+        {
             return Err(PluginError::InvalidInput(
                 "工具参数不符合插件声明的 inputSchema".into(),
             ));

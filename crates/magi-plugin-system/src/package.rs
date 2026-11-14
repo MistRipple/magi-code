@@ -500,7 +500,7 @@ fn validate_manifest_with_limits(
                 tool.id
             )));
         }
-        validate_object_schema(&tool.input_schema, max_tool_schema_bytes)?;
+        validate_object_schema(&tool.input_schema, max_tool_schema_bytes, false)?;
         if let Some(timeout) = tool.timeout_ms
             && !(1_000..=600_000).contains(&timeout)
         {
@@ -617,11 +617,18 @@ fn validate_manifest_with_limits(
             "插件需要至少一项贡献或权限声明，且贡献不超过 {max_contributions} 项"
         )));
     }
-    validate_object_schema(&manifest.settings_schema, 32 * 1024)?;
+    validate_object_schema(&manifest.settings_schema, 32 * 1024, true)?;
     Ok(())
 }
 
-fn validate_object_schema(schema: &serde_json::Value, max_bytes: usize) -> Result<(), PluginError> {
+/// `compile` 为真时还要求 schema 能被 Magi 自己的校验引擎编译：插件设置由 Magi 保存并校验，
+/// 必须如此。工具输入 schema 只作为数据交给模型，真正的校验权在工具实现方（插件处理器、MCP 服务），
+/// 上游 schema 常用 JS 生态的写法（如 Zod 生成的正则），Magi 的 Rust 引擎编译不了不应使整个工具目录失效。
+fn validate_object_schema(
+    schema: &serde_json::Value,
+    max_bytes: usize,
+    compile: bool,
+) -> Result<(), PluginError> {
     if !schema.is_object()
         || schema.get("type").and_then(|x| x.as_str()) != Some("object")
         || serde_json::to_vec(schema).map_or(true, |v| v.len() > max_bytes)
@@ -629,7 +636,9 @@ fn validate_object_schema(schema: &serde_json::Value, max_bytes: usize) -> Resul
         return Err(invalid("配置或工具输入必须声明有界的 object schema"));
     }
     reject_external_references(schema)?;
-    jsonschema::validator_for(schema).map_err(|_| invalid("配置或工具输入 schema 无效"))?;
+    if compile {
+        jsonschema::validator_for(schema).map_err(|_| invalid("配置 schema 无效"))?;
+    }
     Ok(())
 }
 

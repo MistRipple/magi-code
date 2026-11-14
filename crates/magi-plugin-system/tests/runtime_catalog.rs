@@ -401,3 +401,29 @@ fn disabling_permanently_invalidates_the_previous_lease() {
     manager.ready_runtime(ID, "new").unwrap();
     assert!(manager.runtime_ready(ID).unwrap());
 }
+
+#[test]
+fn tool_schemas_the_engine_cannot_compile_do_not_invalidate_the_catalog() {
+    let (_dir, mut manager, package) = fixture();
+    manager.begin_runtime(ID, package.digest(), "zod").unwrap();
+    // Zod 生成的“拒绝孤立代理项”写法，Rust 正则无法编译；同一目录里的其他工具必须照常可用。
+    let catalog: PluginRuntimeCatalog = serde_json::from_value(json!({"tools": [
+        {"id": "zod", "title": "Zod", "description": "", "readOnly": true,
+         "inputSchema": {"type": "object", "properties": {"text": {"type": "string", "pattern": r"^[^\uD800-\uDFFF]*$"}}}},
+        {"id": "plain", "title": "Plain", "description": "", "readOnly": true,
+         "inputSchema": {"type": "object", "properties": {"count": {"type": "integer"}}, "required": ["count"]}}
+    ]}))
+    .unwrap();
+    manager
+        .replace_runtime_catalog(ID, "zod", 0, catalog)
+        .unwrap();
+    manager.ready_runtime(ID, "zod").unwrap();
+    let call = |tool: &str, arguments: &str| {
+        manager.prepare_tool_call(&magi_plugin_system::model_tool_name(ID, tool), arguments)
+    };
+    // 编译不了的 schema 不做预校验，交给工具实现方。
+    assert!(call("zod", r#"{"text": "anything"}"#).is_ok());
+    // 能编译的 schema 照常在 Magi 侧预校验。
+    assert!(call("plain", r#"{"count": 1}"#).is_ok());
+    assert!(call("plain", r#"{"count": "x"}"#).is_err());
+}
