@@ -61,6 +61,7 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 
 - [子代理唤起设计与改造](subagent-delegation-design.md)：默认主线执行、四种委派目的、派发前决策合同、唯一预检和验收边界。
 - [运行时边界与演进门槛](./magi-agent-runtime-evolution-plan.md)：产品范围、事实所有权、插件与子代理边界，以及后续修改和清退旧路径的要求。
+- [项目级 Super-agent 与上游持续维护](./magi-project-super-agent-and-upstream-maintenance-design.md)：用户项目的长期维护、Magi 平台问题上报、开发者侧修复 PR、工程协议与分阶段验收；当前为方案设计，未代表已交付能力。
 
 - 简单事走会话流和工具证据，不生成额外抽屉
 - 多步骤工作进入目标模式，目标抽屉承载目标内容、状态与操作
