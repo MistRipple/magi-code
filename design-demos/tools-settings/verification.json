@@ -1,0 +1,53 @@
+[
+  {
+    "direction": 1,
+    "consoleErrors": [],
+    "mobileOverflow": false,
+    "checks": [
+      "search",
+      "service-selection-or-disclosure",
+      "tool-parameters",
+      "connection-failure",
+      "retry",
+      "refresh-failure-retains-directory",
+      "enable-disable",
+      "add-form",
+      "light-dark",
+      "375px-layout"
+    ]
+  },
+  {
+    "direction": 2,
+    "consoleErrors": [],
+    "mobileOverflow": false,
+    "checks": [
+      "search",
+      "service-selection-or-disclosure",
+      "tool-parameters",
+      "connection-failure",
+      "retry",
+      "refresh-failure-retains-directory",
+      "enable-disable",
+      "add-form",
+      "light-dark",
+      "375px-layout"
+    ]
+  },
+  {
+    "direction": 3,
+    "consoleErrors": [],
+    "mobileOverflow": false,
+    "checks": [
+      "search",
+      "service-selection-or-disclosure",
+      "tool-parameters",
+      "connection-failure",
+      "retry",
+      "refresh-failure-retains-directory",
+      "enable-disable",
+      "add-form",
+      "light-dark",
+      "375px-layout"
+    ]
+  }
+]

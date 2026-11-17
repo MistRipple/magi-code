@@ -1,0 +1,35 @@
+{
+  "url": "http://127.0.0.1:38124/web.html",
+  "scope": "Isolated daemon state; production web build; real Tap directory; no tool execution",
+  "checks": [
+    "Real Tap stdio tools/list: 50 tool names and descriptions; no duplicate directory heading/count or parameter table",
+    "Description expands/collapses; exact tool name ranks first; no-match feedback; search sends no MCP requests and restores manual expansion",
+    "Injected transport failure preserves 50 cached entries; retry returns to actual Tap service and clears the error",
+    "Actual unavailable HTTP service: inline failure, explicit details and retry; never displayed as an empty successful directory",
+    "375px coarse-pointer viewport: no horizontal overflow; refresh, toggle, edit and delete targets at least 44px",
+    "Built-in light and dark themes rendered through the actual appearance settings; isolated theme restored to dark",
+    "Chromium pageerror: none"
+  ],
+  "mobile": {
+    "coarse": true,
+    "overflow": false,
+    "buttons": [
+      {
+        "width": 44,
+        "height": 44
+      },
+      {
+        "width": 44,
+        "height": 44
+      },
+      {
+        "width": 44,
+        "height": 44
+      },
+      {
+        "width": 44,
+        "height": 44
+      }
+    ]
+  }
+}

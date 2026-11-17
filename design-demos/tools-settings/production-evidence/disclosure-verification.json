@@ -1,0 +1,35 @@
+{
+  "url": "http://127.0.0.1:38124/web.html",
+  "checks": [
+    "MCP title/arrow clicks, Enter and Space toggle once; arrow points right when closed and down when open",
+    "Search-expanded MCP rows remain collapsible; clearing search restores the previous manual selection",
+    "Skill title uses the same indicator and keyboard interaction; its independent enable switch preserves expansion and was restored",
+    "Built-in title and native category summaries use the same indicator and keyboard feedback; refresh is independent; preview and command environment remain visible",
+    "RTL mirrors closed chevrons while keeping open chevrons pointed down",
+    "Reduced motion disables indicator transitions",
+    "375px touch viewport: no horizontal overflow, panel triggers at least 44px, one tap toggles once"
+  ],
+  "touchTargets": [
+    {
+      "width": 319,
+      "height": 44
+    },
+    {
+      "width": 319,
+      "height": 45.390625
+    },
+    {
+      "width": 321,
+      "height": 66
+    },
+    {
+      "width": 321,
+      "height": 66
+    },
+    {
+      "width": 274.84375,
+      "height": 44
+    }
+  ],
+  "pageErrors": []
+}

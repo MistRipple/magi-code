@@ -1,0 +1,27 @@
+{
+  "direction": "C",
+  "errors": [],
+  "viewports": [
+    1440,
+    1024,
+    768,
+    375
+  ],
+  "checks": [
+    "matching-tool-reachable",
+    "search-keeps-manual-disclosure",
+    "tool-name-and-description-only",
+    "no-parameter-controls",
+    "long-description-disclosure",
+    "reopen-retains-tool-information",
+    "disabled-refresh-blocked",
+    "cached-directory-labelled",
+    "refresh-failure-retains-directory",
+    "retry-clears-error",
+    "edited-connection-invalidates-directory",
+    "add-configuration",
+    "density-restores",
+    "light-dark",
+    "no-horizontal-overflow"
+  ]
+}
