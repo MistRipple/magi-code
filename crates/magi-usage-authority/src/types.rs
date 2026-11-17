@@ -312,6 +312,13 @@ pub struct UsageTotals {
     /// 已观测调用的完整输入量，统一包含缓存读取/写入；可作 token 命中率分母。
     #[serde(default)]
     pub cache_observed_input_tokens: u64,
+    /// 稳态命中率的分母：已观测完整输入中，去掉本统计范围内首个已观测调用（冷启动）。
+    /// 该调用没有可复用的前一次请求，混入会让短会话的累计命中率主要反映上游缓存当时是否已热。
+    #[serde(default)]
+    pub cache_steady_input_tokens: u64,
+    /// 稳态命中率的分子：与 `cache_steady_input_tokens` 同一批调用的缓存读取量。
+    #[serde(default)]
+    pub cache_steady_read_tokens: u64,
     pub net_input_tokens: u64,
     pub net_output_tokens: u64,
     pub total_tokens: u64,
@@ -339,6 +346,10 @@ impl UsageTotals {
             cache_hit_call_count: self.cache_hit_call_count + other.cache_hit_call_count,
             cache_observed_input_tokens: self.cache_observed_input_tokens
                 + other.cache_observed_input_tokens,
+            cache_steady_input_tokens: self.cache_steady_input_tokens
+                + other.cache_steady_input_tokens,
+            cache_steady_read_tokens: self.cache_steady_read_tokens
+                + other.cache_steady_read_tokens,
             net_input_tokens: self.net_input_tokens + other.net_input_tokens,
             net_output_tokens: self.net_output_tokens + other.net_output_tokens,
             total_tokens: self.total_tokens + other.total_tokens,

@@ -545,6 +545,11 @@ impl SessionTurnRequestDto {
             "expectedTurnId": normalized.expected_turn_id(),
             "replaceTurnId": normalized.replace_turn_id(),
         });
+        // 恢复省略权限表示继承原 Task，与显式 Restricted 的授权意图不同。
+        // 其余新建请求保留既有缺省指纹。
+        if normalized.resume && normalized.access_profile.is_none() {
+            canonical_request["accessProfile"] = Value::Null;
+        }
         // 不改变历史普通/引导请求的指纹；只有新增投递意图才带此键。
         if let Some(turn_id) = &normalized.interrupt_turn_id {
             canonical_request["interruptTurnId"] = serde_json::json!(turn_id);
@@ -911,6 +916,32 @@ mod tests {
             request.requested_access_profile(),
             magi_core::AccessProfile::FullAccess
         );
+    }
+
+    #[test]
+    fn resume_profile_inheritance_has_a_distinct_request_fingerprint() {
+        let mut request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope": "personal", "sessionId": "session-profile", "text": "继续"
+        }))
+        .unwrap();
+        assert_eq!(
+            request.requested_access_profile(),
+            AccessProfile::Restricted
+        );
+        let new_default = request.request_fingerprint().unwrap();
+        request.access_profile = Some(AccessProfile::Restricted);
+        assert_eq!(request.request_fingerprint().unwrap(), new_default);
+        request.resume = true;
+        let explicit = request.request_fingerprint().unwrap();
+        request.access_profile = None;
+        let inherited = request.request_fingerprint().unwrap();
+        assert_ne!(explicit, inherited);
+        let parsed: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope": "personal", "sessionId": "session-profile", "text": "继续", "resume": true,
+            "accessProfile": null
+        }))
+        .unwrap();
+        assert_eq!(parsed.request_fingerprint().unwrap(), inherited);
     }
 
     #[test]

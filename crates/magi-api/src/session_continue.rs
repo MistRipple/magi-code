@@ -571,6 +571,7 @@ pub(crate) async fn continue_execution_chain_with_pre_resume<U, G>(
     resumed_at: UtcMillis,
     request_id: String,
     request_fingerprint: String,
+    access_profile: Option<magi_core::AccessProfile>,
     prepare_turn: G,
 ) -> Result<(SessionContinueAccepted, U), ApiError>
 where
@@ -987,6 +988,19 @@ where
         &branches_to_resume,
         &coordinator_attempt,
     )?;
+
+    if let Some(access_profile) = access_profile {
+        task_store
+            .set_recovery_access_profile(
+                &chain.root_task_id,
+                &branches_to_resume
+                    .iter()
+                    .map(|branch| branch.task_id.clone())
+                    .collect::<Vec<_>>(),
+                access_profile,
+            )
+            .map_err(|error| ApiError::internal_assembly("更新恢复任务访问模式失败", error))?;
+    }
 
     // 旧 runner 已在恢复状态前完成退出；这里只允许启动一个全新的执行轮。
     match manager.start_after_quiesce(chain.root_task_id.as_str(), Some(session_id.clone())) {

@@ -1055,6 +1055,197 @@ fn reuses_successful_read_only_call_across_model_rounds() {
 }
 
 #[test]
+fn repeated_failed_call_is_blocked_without_blocking_other_work() {
+    let mut ledger = ToolExecutionLedger::for_task_goal("完成独立步骤");
+    let failed = call("call-failed", "browser_webmcp", r#"{"action":"get_state"}"#);
+    let result = r#"{"status":"failed","error_code":"mcp_tool_failed","error":"capture target is unavailable"}"#;
+    assert!(
+        ledger
+            .observe_tool_result(
+                "browser_webmcp",
+                &failed.function.arguments,
+                result,
+                ExecutionResultStatus::Failed,
+                1,
+            )
+            .is_none()
+    );
+    assert!(
+        ledger
+            .observe_tool_result(
+                "browser_webmcp",
+                &failed.function.arguments,
+                result,
+                ExecutionResultStatus::Failed,
+                1,
+            )
+            .is_some()
+    );
+    assert!(matches!(
+        ledger.plan(&[failed], None)[0],
+        ToolCallExecutionDecision::RecoveryBlocked { .. }
+    ));
+    let independent = call("call-independent", "web_search", r#"{"query":"MCP"}"#);
+    assert!(matches!(
+        ledger.plan(&[independent], None)[0],
+        ToolCallExecutionDecision::Execute { .. }
+    ));
+}
+
+fn mcp_observation_registry() -> ToolRegistry {
+    ToolRegistry::new(
+        std::sync::Arc::new(magi_governance::GovernanceService::default()),
+        std::sync::Arc::new(magi_event_bus::InMemoryEventBus::new(8)),
+    )
+    .with_external_tool_catalog_provider(std::sync::Arc::new(|| {
+        magi_tool_runtime::ExternalToolCatalogSnapshot {
+            mcp_tools: ["tap", "other"]
+                .into_iter()
+                .map(|server| magi_tool_runtime::ExternalMcpToolCatalogEntry {
+                    server_id: server.into(),
+                    server_name: server.into(),
+                    tool_name: "ax_read".into(),
+                    model_tool_name: format!("mcp__{server}__ax_read"),
+                    description: "Read UI".into(),
+                    read_only: true,
+                    input_schema: serde_json::json!({"type":"object"}),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }))
+}
+
+#[test]
+fn mcp_failure_budget_blocks_changed_references_and_reopens_after_fresh_read() {
+    let registry = mcp_observation_registry();
+    let mut ledger = ToolExecutionLedger::for_task_goal("读取界面");
+    let calls = (1..=4).map(|index| call(&format!("bad-{index}"), "mcp__tap__ax_node_action",
+        &serde_json::json!({"snapshot_id":format!("invalid-probe-{index}"),"node_id":"placeholder"}).to_string()))
+        .collect::<Vec<_>>();
+    let mut dispatched = 0;
+    let results = ledger.execute_batch_with(&calls, Some(&registry), |calls| {
+        dispatched += calls.len();
+        calls
+            .iter()
+            .map(|_| {
+                (
+                    serde_json::json!({"status":"failed","error_code":"mcp_stale_snapshot",
+            "detail":"Run a fresh ax_read", "receipt":{"execution":{"dispatch":"not_started"}}})
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                )
+            })
+            .collect()
+    });
+    assert_eq!(dispatched, 2, "同批四个不同假 snapshot 只能派发预算内两次");
+    for result in &results[2..] {
+        let result: Value = serde_json::from_str(&result.0).unwrap();
+        assert_eq!(result["error_code"], "tool_repeated_failure_blocked");
+        assert_eq!(result["execution_started"], false);
+        assert_eq!(
+            result["diagnostic"]["source_result"]["receipt"]["execution"]["dispatch"],
+            "not_started"
+        );
+    }
+    let independent = call("other", "mcp__other__ax_read", "{}");
+    ledger.execute_batch_with(&[independent], Some(&registry), |_| {
+        vec![(
+            r#"{"status":"succeeded"}"#.into(),
+            ExecutionResultStatus::Succeeded,
+        )]
+    });
+    assert!(matches!(
+        ledger.plan(&calls[..1], None)[0],
+        ToolCallExecutionDecision::RecoveryBlocked { .. }
+    ));
+    // 只读工具名称本身不证明观察，目录没有 readonly 标记时不能重开。
+    let fresh = call("fresh", "mcp__tap__ax_read", "{}");
+    ledger.execute_batch_with(std::slice::from_ref(&fresh), None, |_| {
+        vec![(
+            r#"{"status":"succeeded"}"#.into(),
+            ExecutionResultStatus::Succeeded,
+        )]
+    });
+    assert!(matches!(
+        ledger.plan(&calls[..1], None)[0],
+        ToolCallExecutionDecision::RecoveryBlocked { .. }
+    ));
+    ledger.execute_batch_with(&[fresh], Some(&registry), |_| {
+        vec![(
+            r#"{"status":"succeeded","snapshot_id":"fresh-2"}"#.into(),
+            ExecutionResultStatus::Succeeded,
+        )]
+    });
+    assert!(matches!(
+        ledger.plan(&calls[..1], None)[0],
+        ToolCallExecutionDecision::Execute { .. }
+    ));
+    let results = ledger.execute_batch_with(&calls[..1], Some(&registry), |_| {
+        vec![(
+            r#"{"status":"failed","error_code":"mcp_stale_snapshot"}"#.into(),
+            ExecutionResultStatus::Failed,
+        )]
+    });
+    assert_ne!(
+        serde_json::from_str::<Value>(&results[0].0).unwrap()["execution"],
+        "skipped"
+    );
+}
+
+#[test]
+fn canonical_mcp_failure_budget_survives_continue_and_fresh_read_recovers() {
+    let task = recovery_task();
+    let registry = mcp_observation_registry();
+    for fresh_read in [false, true] {
+        let failure = serde_json::json!({"status":"failed","error_code":"mcp_stale_snapshot","receipt":{"execution":{"dispatch":"not_started"}}});
+        let mut outcomes = vec![("failed", Some(failure.clone())), ("failed", Some(failure))];
+        if fresh_read {
+            outcomes.push((
+                "completed",
+                Some(serde_json::json!({"status":"succeeded","snapshot_id":"fresh"})),
+            ));
+        }
+        let mut turns = canonical_history(&task, &outcomes)
+            .canonical_turns_for_session(&SessionId::new("recovery-session"));
+        for (index, turn) in turns.iter_mut().enumerate() {
+            let tool = turn.items[0].tool.as_mut().unwrap();
+            tool.name = if index == 2 {
+                "mcp__tap__ax_read"
+            } else {
+                "mcp__tap__ax_node_action"
+            }
+            .into();
+            tool.arguments =
+                Some(serde_json::json!({"snapshot_id":format!("invalid-probe-{index}")}));
+        }
+        let store = SessionStore::from_state_for_test(magi_session_store::SessionStoreState {
+            canonical_turns: turns,
+            ..Default::default()
+        });
+        let recovered = ToolExecutionLedger::from_canonical_task(
+            &store,
+            &TaskStore::new(),
+            &SessionId::new("recovery-session"),
+            &task,
+            &ThreadId::new("recovery-thread"),
+            Some(&registry),
+        )
+        .unwrap();
+        let next = call(
+            "new-call",
+            "mcp__tap__ax_node_action",
+            r#"{"snapshot_id":"changed-again"}"#,
+        );
+        let blocked = matches!(
+            recovered.ledger.plan(&[next], Some(&registry))[0],
+            ToolCallExecutionDecision::RecoveryBlocked { .. }
+        );
+        assert_eq!(blocked, !fresh_read);
+    }
+}
+
+#[test]
 fn get_goal_is_never_reused_across_state_mutations() {
     let mut ledger = ToolExecutionLedger::for_task_goal("推进 Goal");
     let first = call("call-goal-1", "get_goal", "{}");

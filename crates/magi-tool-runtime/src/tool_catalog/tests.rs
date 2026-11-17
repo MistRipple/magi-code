@@ -1,4 +1,5 @@
 use super::*;
+use crate::ExternalMcpToolCatalogEntry;
 
 #[test]
 fn delegated_catalog_uses_execution_scope_and_policy_without_claiming_schema_loading() {
@@ -621,6 +622,45 @@ fn tool_catalog_can_include_internal_and_schema() {
 }
 
 #[test]
+fn tool_catalog_resolves_provider_wire_alias_to_mcp_schema() {
+    let resources = ToolRuntimeResources {
+        external_tool_catalog_provider: Some(Arc::new(|| ExternalToolCatalogSnapshot {
+            mcp_tools: vec![ExternalMcpToolCatalogEntry {
+                server_id: "tap".into(),
+                server_name: "Tap".into(),
+                model_tool_name: "mcp__tap__window_action".into(),
+                tool_name: "window_action".into(),
+                description: "Window action".into(),
+                read_only: false,
+                input_schema: serde_json::json!({
+                    "$defs": {"WindowOperation": {"type": "object"}},
+                    "type": "object",
+                    "properties": {"operation": {"$ref": "#/$defs/WindowOperation"}}
+                }),
+            }],
+            ..ExternalToolCatalogSnapshot::default()
+        })),
+        ..ToolRuntimeResources::default()
+    };
+    let payload = build_tool_catalog_value(
+        r#"{"include_schema":true,"tool_names":["magi_mcp_mcp__tap__window_action"]}"#,
+        &ToolExecutionContext::default(),
+        &resources,
+    );
+    let tool = payload["mcp_tools"]
+        .as_array()
+        .expect("mcp tools")
+        .first()
+        .expect("wire alias should select canonical MCP tool");
+    assert_eq!(tool["model_tool_name"], "mcp__tap__window_action");
+    assert_eq!(
+        tool["input_schema"]["properties"]["operation"]["$ref"],
+        "#/$defs/WindowOperation"
+    );
+    assert_eq!(tool["schema_included"], true);
+}
+
+#[test]
 fn tool_catalog_includes_runtime_capability_dependency_provider_entries() {
     let resources = ToolRuntimeResources {
         runtime_capability_dependency_provider: Some(std::sync::Arc::new(|| {
@@ -678,6 +718,7 @@ fn tool_catalog_includes_external_skill_and_mcp_health_when_provider_exists() {
                 status: "available".to_string(),
             }],
             mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
+                instructions: None,
                 server_id: "loopback-mcp".to_string(),
                 name: "loopback-mcp".to_string(),
                 enabled: true,
@@ -753,6 +794,7 @@ fn tool_catalog_does_not_call_external_provider_when_external_disabled() {
                     status: "available".to_string(),
                 }],
                 mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
+                    instructions: None,
                     server_id: "slow-mcp".to_string(),
                     name: "slow-mcp".to_string(),
                     enabled: true,
@@ -822,6 +864,7 @@ fn tool_catalog_reuses_single_external_snapshot_for_dependencies() {
                     status: "available".to_string(),
                 }],
                 mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
+                    instructions: None,
                     server_id: "loopback-mcp".to_string(),
                     name: "loopback-mcp".to_string(),
                     enabled: true,
@@ -936,6 +979,7 @@ fn tool_catalog_treats_disabled_mcp_servers_as_configured_not_active() {
             instruction_skill_count: 0,
             skill_tools: Vec::new(),
             mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
+                instructions: None,
                 server_id: "disabled-mcp".to_string(),
                 name: "disabled-mcp".to_string(),
                 enabled: false,
@@ -975,6 +1019,7 @@ fn tool_catalog_counts_only_connected_mcp_tools_as_ready() {
             instruction_skill_count: 0,
             skill_tools: Vec::new(),
             mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
+                instructions: None,
                 server_id: "disconnected-mcp".to_string(),
                 name: "disconnected-mcp".to_string(),
                 enabled: true,

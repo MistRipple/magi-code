@@ -286,6 +286,14 @@ pub(crate) fn build_tool_catalog_value(
     } else {
         Vec::new()
     };
+    let schema_requested = |name: &str| {
+        tool_names.as_ref().is_some_and(|names| {
+            names.contains(name)
+                || names
+                    .iter()
+                    .any(|candidate| *candidate == format!("magi_mcp_{name}"))
+        })
+    };
     let external_tool_value =
         |tool: serde_json::Value, name: &str, read_only: bool, executor_available: bool| {
             external_tool_catalog_value(
@@ -295,15 +303,26 @@ pub(crate) fn build_tool_catalog_value(
                 context,
                 resources,
                 executor_available,
-                include_schema
-                    && tool_names
-                        .as_ref()
-                        .is_some_and(|names| names.contains(name)),
+                include_schema && schema_requested(name),
             )
         };
     let mcp_values = external_mcp_tools
         .iter()
-        .filter(|tool| matches(&tool.model_tool_name, &tool.tool_name, &tool.description))
+        .filter(|tool| {
+            // Provider requests expose a namespaced wire name (for example
+            // `magi_mcp_mcp__tap__window_action`), while the catalog stores
+            // the canonical MCP name. Accept that exact alias for schema
+            // lookup but keep canonical names in the returned catalog.
+            tool_names.as_ref().map_or_else(
+                || matches(&tool.model_tool_name, &tool.tool_name, &tool.description),
+                |names| {
+                    names.contains(tool.model_tool_name.as_str())
+                        || names
+                            .iter()
+                            .any(|name| *name == format!("magi_mcp_{}", tool.model_tool_name))
+                },
+            )
+        })
         .map(|tool| {
             external_tool_value(
                 serde_json::json!(tool),

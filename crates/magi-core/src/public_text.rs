@@ -58,17 +58,34 @@ fn redact_json_value(value: &mut Value) {
             }
         }
         Value::String(text) => {
-            *text = redact_sensitive_text(text);
+            if let Ok(mut nested) = serde_json::from_str::<Value>(text)
+                && (nested.is_object() || nested.is_array())
+            {
+                redact_json_value(&mut nested);
+                *text = nested.to_string();
+            } else {
+                *text = redact_sensitive_text(text);
+            }
         }
         _ => {}
     }
 }
 
 fn is_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    if ["_token", "_secret", "_password", "_api_key"]
+        .iter()
+        .any(|suffix| key.ends_with(suffix))
+    {
+        return true;
+    }
     matches!(
-        key.to_ascii_lowercase().as_str(),
+        key.as_str(),
         "api_key"
             | "apikey"
+            | "accesstoken"
+            | "refreshtoken"
+            | "clientsecret"
             | "authorization"
             | "access_token"
             | "auth_token"
@@ -83,13 +100,121 @@ fn is_sensitive_key(key: &str) -> bool {
             | "credential"
             | "credentials"
             | "x-api-key"
+            | "api-key"
+            | "cookie"
+            | "set-cookie"
     )
 }
 
 fn redact_sensitive_text(value: &str) -> String {
     let value = redact_bearer_tokens(value);
     let value = redact_prefixed_tokens(&value);
+    let value = redact_named_credentials(&value);
+    let value = redact_url_userinfo(&value);
     redact_absolute_paths(&value)
+}
+
+/// Errors often embed headers, URL queries or JSON in otherwise plain text.
+/// Redact their named values as well as structured JSON fields.
+fn redact_named_credentials(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut index = 0;
+    let mut copied = 0;
+    while index < value.len() {
+        let byte = value.as_bytes()[index];
+        if !byte.is_ascii_alphabetic() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < value.len()
+            && (value.as_bytes()[index].is_ascii_alphanumeric()
+                || matches!(value.as_bytes()[index], b'_' | b'-'))
+        {
+            index += 1;
+        }
+        if !is_sensitive_key(&value[start..index]) {
+            continue;
+        }
+        let mut cursor = index;
+        if matches!(value.as_bytes().get(cursor), Some(b'"' | b'\'')) {
+            cursor += 1;
+        }
+        while value
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            cursor += 1;
+        }
+        if !matches!(value.as_bytes().get(cursor), Some(b':' | b'=')) {
+            continue;
+        }
+        cursor += 1;
+        while value
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            cursor += 1;
+        }
+        let quote = value
+            .as_bytes()
+            .get(cursor)
+            .copied()
+            .filter(|b| matches!(b, b'"' | b'\''));
+        if quote.is_some() {
+            cursor += 1;
+        }
+        let value_start = cursor;
+        while cursor < value.len() {
+            let ch = value.as_bytes()[cursor];
+            if quote.is_some_and(|quote| ch == quote) {
+                break;
+            }
+            if quote.is_none()
+                && (ch.is_ascii_whitespace()
+                    || matches!(
+                        ch,
+                        b'&' | b'#' | b',' | b';' | b')' | b']' | b'}' | b'"' | b'\''
+                    ))
+            {
+                break;
+            }
+            if quote.is_some() && ch == b'\\' && cursor + 1 < value.len() {
+                cursor += 1;
+            }
+            cursor += 1;
+        }
+        output.push_str(&value[copied..value_start]);
+        output.push_str(PUBLIC_REDACTED_VALUE);
+        copied = cursor;
+        index = cursor;
+    }
+    output.push_str(&value[copied..]);
+    output
+}
+
+fn redact_url_userinfo(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(scheme_end) = remaining.find("://") {
+        let authority_start = scheme_end + 3;
+        let authority_end = remaining[authority_start..]
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '"' | '\''))
+            .map(|offset| authority_start + offset)
+            .unwrap_or(remaining.len());
+        if let Some(at) = remaining[authority_start..authority_end].rfind('@') {
+            output.push_str(&remaining[..authority_start]);
+            output.push_str(PUBLIC_REDACTED_VALUE);
+            remaining = &remaining[authority_start + at..];
+        } else {
+            output.push_str(&remaining[..authority_end]);
+            remaining = &remaining[authority_end..];
+        }
+    }
+    output.push_str(remaining);
+    output
 }
 
 fn redact_bearer_tokens(value: &str) -> String {
@@ -293,6 +418,33 @@ mod tests {
         assert!(public.contains(r#""http":"http://127.0.0.1:38123/web.html""#));
         assert!(public.contains(r#""https":"https://cn.bing.com/search?q=magi-code""#));
         assert!(!public.contains(PUBLIC_REDACTED_PATH));
+    }
+
+    #[test]
+    fn public_runtime_text_redacts_embedded_diagnostic_credentials() {
+        let raw = serde_json::json!({
+            "error": "capture target is unavailable; api_key=raw-secret; https://user:pass@example.com/mcp?access_token=query-secret",
+            "content": "{\"receipt\":{\"status\":\"failed\",\"retry\":\"after_recheck\"},\"authorization\":\"header-secret\"}",
+            "structuredContent": {"receipt": {"dispatch": "not_applicable"}, "cookie": "cookie-secret"}
+        }).to_string();
+        let public = public_runtime_text(&raw);
+        for secret in [
+            "raw-secret",
+            "user:pass",
+            "query-secret",
+            "header-secret",
+            "cookie-secret",
+        ] {
+            assert!(!public.contains(secret), "leaked {secret}: {public}");
+        }
+        for diagnostic in [
+            "capture target is unavailable",
+            "after_recheck",
+            "not_applicable",
+            "example.com",
+        ] {
+            assert!(public.contains(diagnostic));
+        }
     }
 
     #[test]

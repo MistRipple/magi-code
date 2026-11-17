@@ -442,6 +442,9 @@ pub struct ExternalMcpServerCatalogEntry {
     pub health: String,
     pub tool_count: Option<usize>,
     pub error: Option<String>,
+    /// MCP initialize instructions, delivered once per server by tool_catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

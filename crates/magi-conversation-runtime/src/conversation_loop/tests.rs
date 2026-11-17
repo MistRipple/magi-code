@@ -392,6 +392,39 @@ fn current_agent_mode_replaces_stale_capabilities_without_rewriting_transcript()
     );
 }
 
+#[test]
+fn runtime_fragment_order_is_identical_for_first_request_and_rebuilt_request() {
+    let mut task = make_task_loop_test_task("fragment-order");
+    task.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+    let roles = magi_agent_role::AgentRoleRegistry::builtin();
+    let limits = crate::execution_admission::ExecutionAdmissionLimits::default();
+    let tools = vec![exposed_test_tool("agent_spawn")];
+    let base = vec![
+        system_prompt_fragment_message(PromptFragmentKind::Role, "角色约定"),
+        system_prompt_fragment_message(PromptFragmentKind::WorkspaceContext, "工作区"),
+    ];
+    let render = |messages: &[ChatMessage]| {
+        messages
+            .iter()
+            .map(|message| message.content.clone().unwrap_or_default())
+            .collect::<Vec<_>>()
+    };
+
+    // 首个请求：先装配规则片段，MCP 说明要在工具面刷新后才知道。
+    let mut first = base.clone();
+    append_runtime_instruction_fragments(&mut first, "权限".to_string(), None);
+    refresh_current_agent_mode(&mut first, &task, &roles, &limits, &tools, None);
+    refresh_mcp_instructions(&mut first, Some("MCP 说明"));
+    refresh_current_agent_mode(&mut first, &task, &roles, &limits, &tools, None);
+
+    // 后续请求：重建时一次性带着已知的 MCP 说明。
+    let mut rebuilt = base;
+    append_runtime_instruction_fragments(&mut rebuilt, "权限".to_string(), Some("MCP 说明"));
+    refresh_current_agent_mode(&mut rebuilt, &task, &roles, &limits, &tools, None);
+
+    assert_eq!(render(&first), render(&rebuilt));
+}
+
 fn discovery_tool_call_for_test(name: &str, arguments: &str) -> ChatToolCall {
     ChatToolCall {
         id: format!("call-{name}"),

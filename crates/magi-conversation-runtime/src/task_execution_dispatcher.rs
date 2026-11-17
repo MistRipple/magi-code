@@ -1017,7 +1017,7 @@ impl LlmTaskDispatcher {
                     .unwrap_or_default(),
                 loaded_tool_names: &std::collections::BTreeSet::new(),
             });
-        constrain_task_tool_definitions(definitions, task_policy)
+        constrain_task_tool_definitions(definitions.definitions, task_policy)
     }
 
     fn build_base_tool_definitions(

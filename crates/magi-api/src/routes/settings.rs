@@ -2075,6 +2075,10 @@ fn usage_cache_json(totals: &UsageTotals) -> serde_json::Value {
             totals.cache_read_tokens as f64 / totals.cache_observed_input_tokens as f64),
         "requestHitRate": (totals.cache_observed_call_count > 0).then(||
             totals.cache_hit_call_count as f64 / totals.cache_observed_call_count as f64),
+        "steadyInputTokens": totals.cache_steady_input_tokens,
+        "steadyReadTokens": totals.cache_steady_read_tokens,
+        "steadyTokenHitRate": (totals.cache_steady_input_tokens > 0).then(||
+            totals.cache_steady_read_tokens as f64 / totals.cache_steady_input_tokens as f64),
     })
 }
 

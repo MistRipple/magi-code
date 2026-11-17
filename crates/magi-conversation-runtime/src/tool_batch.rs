@@ -294,6 +294,12 @@ pub(crate) fn execute_task_tool_call_batch(
             .as_ref()
             .and_then(|resources| resources.directories.as_ref()),
     );
+    tool_execution_ledger.set_retry_limit(
+        task.policy_snapshot
+            .as_ref()
+            .map(|policy| policy.retry_limit)
+            .unwrap_or(crate::tool_result_utils::DEFAULT_TOOL_RETRY_LIMIT),
+    );
     tool_execution_ledger.execute_batch_with(tool_calls, tool_registry, |execution_calls| {
         execute_task_tool_call_batch_unchecked(env, execution_calls)
     })

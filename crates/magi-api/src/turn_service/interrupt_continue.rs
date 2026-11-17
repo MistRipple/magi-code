@@ -779,6 +779,7 @@ pub(crate) async fn continue_session_with_expected_root(
         continued_at,
         request_id.clone(),
         continue_request_fingerprint.clone(),
+        None,
         |chain, primary_branch, branches, coordinator_attempt| {
             let (_, orchestrator_thread_id) =
                 state

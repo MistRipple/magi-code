@@ -41,7 +41,10 @@ use magi_conversation_runtime::{
 };
 #[cfg(test)]
 use magi_core::ExecutionOwnership;
-use magi_core::{DomainError, EventId, SessionId, TaskStatus, UtcMillis, public_runtime_excerpt};
+use magi_core::{
+    DomainError, EventId, SessionId, TaskStatus, UtcMillis, public_runtime_excerpt,
+    public_runtime_text,
+};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
@@ -197,11 +200,14 @@ fn build_external_mcp_tool_executor(
         let client = match mcp_client_for_settings_entry(&entry, &mcp_connections) {
             Ok(client) => client,
             Err(error) => {
+                let detail = public_runtime_excerpt(&error, 12_000);
                 return (
                     serde_json::json!({
                         "tool": external_mcp_model_tool_name(server_id, tool_name),
                         "status": "failed",
-                        "error": error,
+                        "error_code": "mcp_tool_config_failed",
+                        "error": "MCP 工具配置不可用；请展开诊断检查连接配置。",
+                        "detail": detail,
                     })
                     .to_string(),
                     magi_core::ExecutionResultStatus::Failed,
@@ -214,7 +220,16 @@ fn build_external_mcp_tool_executor(
             input: arguments.to_string(),
         }) {
             Ok(response) => (
-                response.payload,
+                if response.ok {
+                    response.payload
+                } else {
+                    // Keep the MCP server's complete diagnostic (including
+                    // structuredContent/receipts) visible to the model and the
+                    // expandable tool details.  It is passed through the same
+                    // public redaction boundary as other runtime diagnostics so
+                    // credentials and host paths never cross the daemon boundary.
+                    public_runtime_text(&response.payload)
+                },
                 if response.ok {
                     magi_core::ExecutionResultStatus::Succeeded
                 } else {
@@ -228,11 +243,28 @@ fn build_external_mcp_tool_executor(
                         .expect("mcp connections write lock poisoned")
                         .remove(server_id);
                 }
+                let detail = public_runtime_text(&error.to_string());
+                let instruction = (error.code() == Some(-32602)).then_some(
+                    "MCP server rejected the tool arguments (JSON-RPC -32602). Re-read the exact input schema and submit values with their declared JSON types; object-valued fields must remain objects and must not be JSON-encoded strings. Do not retry the same arguments.",
+                );
                 (
                     serde_json::json!({
                         "tool": external_mcp_model_tool_name(server_id, tool_name),
                         "status": "failed",
-                        "error": error.to_string(),
+                        "error_code": "mcp_tool_call_failed",
+                        "error": detail,
+                        "diagnostic": {
+                            "message": public_runtime_text(&error.to_string()),
+                            "layer": error.layer().map(|layer| format!("{layer:?}")),
+                            "code": error.code(),
+                            "http_status": error.http_status(),
+                        },
+                        "bridge_error_layer": error.layer().map(|layer| format!("{layer:?}")),
+                        "bridge_error_code": error.code(),
+                        "http_status": error.http_status(),
+                        "reason_code": (error.code() == Some(-32602))
+                            .then_some("invalid_arguments"),
+                        "instruction": instruction,
                     })
                     .to_string(),
                     magi_core::ExecutionResultStatus::Failed,
@@ -385,8 +417,12 @@ fn external_mcp_server_catalog_snapshot(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
     let live_tools = enabled.then(|| {
-        mcp_client_for_settings_entry(entry, mcp_connections)
-            .and_then(|client| client.list_tools().map_err(|error| error.to_string()))
+        mcp_client_for_settings_entry(entry, mcp_connections).and_then(|client| {
+            client
+                .list_tools()
+                .map(|tools| (tools, client.instructions()))
+                .map_err(|error| error.to_string())
+        })
     });
     if live_tools.as_ref().is_some_and(Result::is_err) {
         mcp_connections
@@ -398,7 +434,7 @@ fn external_mcp_server_catalog_snapshot(
     let tool_count = live_tools
         .as_ref()
         .and_then(|result| result.as_ref().ok())
-        .map(Vec::len);
+        .map(|(tools, _)| tools.len());
     let health = if !enabled {
         "disabled"
     } else if connected {
@@ -409,6 +445,7 @@ fn external_mcp_server_catalog_snapshot(
     let tools = live_tools
         .as_ref()
         .and_then(|result| result.as_ref().ok())
+        .map(|(tools, _)| tools)
         .into_iter()
         .flatten()
         .map(|tool| ExternalMcpToolCatalogEntry {
@@ -437,6 +474,10 @@ fn external_mcp_server_catalog_snapshot(
             connected,
             health: health.to_string(),
             tool_count,
+            instructions: live_tools
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .and_then(|(_, instructions)| instructions.clone()),
             error: if enabled && live_tools.as_ref().is_some_and(Result::is_err) {
                 Some("mcp_connection_failed".to_string())
             } else if enabled {

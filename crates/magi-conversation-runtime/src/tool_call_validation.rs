@@ -20,6 +20,10 @@ impl ToolCallValidationIssue {
     pub(crate) fn model_feedback(&self) -> String {
         let instruction = if self.reason_code == "tool_not_available" {
             "该工具不在本轮可用工具列表中；请改用本轮已提供的工具，或直接返回文本结果。"
+        } else if self.tool_name.starts_with("mcp__")
+            && self.reason_code == "tool_arguments_invalid_json"
+        {
+            "MCP 工具参数必须是严格 JSON：对象键和所有字符串值都必须使用双引号，不能使用 Python/JavaScript 对象写法。请完整重生成 arguments；例如 source 必须写成 \"source\":\"ocr_center\"，不要写成 \"source\":ocr_center。"
         } else if self.tool_name == "agent_spawn" {
             "先重新判断是否值得委派：不符合条件时主线直接完成，不要为通过校验编造收益；确需派发时按 expected_input_schema 提供完整决策与独立工作包，不要重复相同无效调用。"
         } else {
@@ -153,12 +157,24 @@ pub(crate) fn validate_tool_call_batch(
     batch
 }
 
-pub(crate) fn invalid_tool_result_message(invalid: &InvalidToolCall) -> ChatMessage {
+pub(crate) fn invalid_tool_result_message(
+    invalid: &InvalidToolCall,
+    current_steps: &Value,
+) -> ChatMessage {
+    let mut feedback = invalid.issue.model_feedback();
+    if invalid.call.function.name == "update_execution_steps" {
+        let mut payload: Value = serde_json::from_str(&feedback).expect("validation JSON");
+        payload["current_steps"] = current_steps.clone();
+        payload["instruction"] = serde_json::json!(
+            "按 expected_input_schema 一次修正 message 列出的所有错误。current_steps 是当前 Task/Turn 的输入投影，非空时完整保留其中稳定 stepId 和已结束状态；为 null 时历史步骤不属于本轮，新步骤只能从 pending/running 开始。不得提交 evidenceRefs 等服务端字段，不得为缺失的已有步骤 ID 编造替代值。"
+        );
+        feedback = payload.to_string();
+    }
     ChatMessage {
         input_request_id: None,
         context_origin: Default::default(),
         role: "tool".to_string(),
-        content: Some(invalid.issue.model_feedback()),
+        content: Some(feedback),
         images: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: Some(invalid.call.id.clone()),
@@ -214,26 +230,28 @@ fn validate_tool_call(
         ))
     })?;
 
-    let mut missing_fields = expected_input_schema
-        .as_ref()
-        .map(|schema| schema_missing_required_fields(object, schema))
-        .unwrap_or_default();
+    let mut missing_fields = Vec::new();
+    if let Some(schema) = expected_input_schema.as_ref() {
+        collect_missing_required_fields(&arguments, schema, "", &mut missing_fields);
+    }
     missing_fields.extend(shell_exec_missing_fields(&call.function.name, object));
     missing_fields.sort();
     missing_fields.dedup();
+    let schema_error = expected_input_schema
+        .as_ref()
+        .and_then(|schema| validate_json_schema_value(&arguments, schema).err());
     if !missing_fields.is_empty() {
         return Err(Box::new(validation_issue(
             call,
             "tool_arguments_missing_required",
-            format!("缺少必填参数：{}。", missing_fields.join(", ")),
+            schema_error
+                .unwrap_or_else(|| format!("缺少必填参数：{}。", missing_fields.join(", "))),
             missing_fields,
             expected_input_schema,
         )));
     }
 
-    if let Some(schema) = expected_input_schema.as_ref()
-        && let Err(message) = validate_json_schema_value(&arguments, schema)
-    {
+    if let Some(message) = schema_error {
         return Err(Box::new(validation_issue(
             call,
             "tool_arguments_schema_mismatch",
@@ -291,6 +309,47 @@ fn schema_missing_required_fields(object: &Map<String, Value>, schema: &Value) -
         })
         .map(str::to_string)
         .collect()
+}
+
+/// Keep diagnostic field paths aligned with recursive schema validation.
+fn collect_missing_required_fields(
+    value: &Value,
+    schema: &Value,
+    path: &str,
+    missing: &mut Vec<String>,
+) {
+    if let Some(object) = value.as_object() {
+        missing.extend(
+            schema_missing_required_fields(object, schema)
+                .into_iter()
+                .map(|field| {
+                    if path.is_empty() {
+                        field
+                    } else {
+                        format!("{path}.{field}")
+                    }
+                }),
+        );
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (field, child_schema) in properties {
+                if let Some(child) = object.get(field) {
+                    let child_path = if path.is_empty() {
+                        format!("$.{field}")
+                    } else {
+                        format!("{path}.{field}")
+                    };
+                    collect_missing_required_fields(child, child_schema, &child_path, missing);
+                }
+            }
+        }
+    }
+    if let Some(array) = value.as_array()
+        && let Some(items) = schema.get("items")
+    {
+        for (index, item) in array.iter().enumerate() {
+            collect_missing_required_fields(item, items, &format!("{path}[{index}]"), missing);
+        }
+    }
 }
 
 fn shell_exec_missing_fields(tool_name: &str, object: &Map<String, Value>) -> Vec<String> {
@@ -435,37 +494,52 @@ fn validate_json_schema_value_at(
             return Err(format!("{path} 最多允许 {max_items} 项"));
         }
         if let Some(item_schema) = schema.get("items") {
-            for (index, item) in array.iter().enumerate() {
-                validate_json_schema_value_at(item, item_schema, format!("{path}[{index}]"))?;
+            let errors = array
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| {
+                    validate_json_schema_value_at(item, item_schema, format!("{path}[{index}]"))
+                        .err()
+                })
+                .collect::<Vec<_>>();
+            if !errors.is_empty() {
+                return Err(errors.join("；"));
             }
         }
     }
 
     if let Some(object) = value.as_object() {
+        let mut errors = Vec::new();
         if let Some(required) = schema.get("required").and_then(Value::as_array) {
             for field in required.iter().filter_map(Value::as_str) {
                 if !object.contains_key(field) {
-                    return Err(format!("{path} 缺少必填参数 {field}"));
+                    errors.push(format!("{path} 缺少必填参数 {field}"));
                 }
             }
         }
         if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-            if schema
-                .get("additionalProperties")
-                .is_some_and(|value| value == &Value::Bool(false))
-                && let Some(unknown) = object.keys().find(|field| !properties.contains_key(*field))
-            {
-                return Err(format!("{path} 不支持未知参数 {unknown}"));
+            if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+                for unknown in object
+                    .keys()
+                    .filter(|field| !properties.contains_key(*field))
+                {
+                    errors.push(format!("{path} 不支持未知参数 {unknown}"));
+                }
             }
             for (field, field_schema) in properties {
-                if let Some(field_value) = object.get(field) {
-                    validate_json_schema_value_at(
+                if let Some(field_value) = object.get(field)
+                    && let Err(error) = validate_json_schema_value_at(
                         field_value,
                         field_schema,
                         format!("{path}.{field}"),
-                    )?;
+                    )
+                {
+                    errors.push(error);
                 }
             }
+        }
+        if !errors.is_empty() {
+            return Err(errors.join("；"));
         }
     }
 
@@ -964,5 +1038,104 @@ mod tests {
         assert_eq!(diagnostic.code, "tool_not_available");
         assert!(diagnostic.summary.contains("本轮未提供"));
         assert!(!diagnostic.summary.contains("工具参数"));
+    }
+
+    #[test]
+    fn execution_steps_reports_all_real_multi_error_paths_without_rewriting_arguments() {
+        let definition =
+            crate::builtin_tool_schema::public_builtin_tool_definition("update_execution_steps")
+                .unwrap();
+        let mut steps = (0..8)
+            .map(|i| {
+                serde_json::json!({
+                    "stepId": format!("stable-{i}"), "title": format!("步骤{i}"),
+                    "status": if i == 6 { "blocked" } else { "completed" },
+                    "reason": "原始事实", "evidenceRefs": [], "dependsOn": []
+                })
+            })
+            .collect::<Vec<_>>();
+        steps[7] = serde_json::json!({"title":"当前操作", "status":"running", "evidenceRefs":[]});
+        let raw = serde_json::json!({"steps":steps}).to_string();
+        let batch = validate_tool_call_batch(
+            &[call("update_execution_steps", &raw)],
+            std::slice::from_ref(&definition),
+        );
+        let invalid = &batch.invalid_calls[0];
+        assert_eq!(invalid.call.function.arguments, raw);
+        assert_eq!(invalid.issue.missing_fields, ["$.steps[7].stepId"]);
+        for i in 0..8 {
+            assert!(
+                invalid
+                    .issue
+                    .message
+                    .contains(&format!("$.steps[{i}] 不支持未知参数 evidenceRefs"))
+            );
+        }
+        assert!(
+            invalid
+                .issue
+                .message
+                .contains("$.steps[7] 缺少必填参数 stepId")
+        );
+        let diagnostic = ToolCallFailureDiagnostic::repeated(&invalid.issue, 1);
+        assert!(diagnostic.detail.contains("缺失字段：$.steps[7].stepId"));
+        for step in &mut steps {
+            step.as_object_mut().unwrap().remove("evidenceRefs");
+        }
+        steps[7]["stepId"] = serde_json::json!("stable-7");
+        let corrected = serde_json::json!({"steps":steps}).to_string();
+        let batch =
+            validate_tool_call_batch(&[call("update_execution_steps", &corrected)], &[definition]);
+        assert_eq!(batch.valid_calls[0].function.arguments, corrected);
+        assert!(batch.invalid_calls.is_empty());
+    }
+
+    #[test]
+    fn invalid_mcp_json_is_rejected_before_execution_without_inventing_a_frame() {
+        let schema = serde_json::json!({"type":"object", "properties":{"frame_id":{"type":"integer"}}, "required":["frame_id"]});
+        let batch = validate_tool_call_batch(
+            &[call(
+                "mcp__tap__left_click",
+                r#"{"frame_id":5,"x":12 "y":3}"#,
+            )],
+            &[definition("mcp__tap__left_click", schema.clone())],
+        );
+        assert!(batch.valid_calls.is_empty());
+        let feedback: Value =
+            serde_json::from_str(&batch.invalid_calls[0].issue.model_feedback()).unwrap();
+        assert_eq!(feedback["reason_code"], "tool_arguments_invalid_json");
+        assert_eq!(feedback["stage"], "tool_call_validation");
+        assert_eq!(feedback["expected_input_schema"], schema);
+        assert!(
+            feedback["instruction"]
+                .as_str()
+                .expect("MCP JSON instruction")
+                .contains("\"source\":\"ocr_center\"")
+        );
+    }
+    #[test]
+    fn execution_step_rejection_delivers_current_owner_facts_and_explicit_empty_state() {
+        let definition =
+            crate::builtin_tool_schema::public_builtin_tool_definition("update_execution_steps")
+                .unwrap();
+        let batch =
+            validate_tool_call_batch(&[call("update_execution_steps", "{}")], &[definition]);
+        let invalid = &batch.invalid_calls[0];
+        let current = serde_json::json!({"steps":[
+            {"stepId":"read", "title":"读取", "status":"completed"},
+            {"stepId":"verify", "title":"验证", "status":"blocked", "reason":"等待外部服务"}
+        ]});
+        for snapshot in [&current, &Value::Null] {
+            let result = invalid_tool_result_message(invalid, snapshot);
+            let value: Value = serde_json::from_str(result.content.as_deref().unwrap()).unwrap();
+            assert_eq!(&value["current_steps"], snapshot);
+            assert_eq!(result.tool_call_id, Some(invalid.call.id.clone()));
+            assert!(
+                value["instruction"]
+                    .as_str()
+                    .unwrap()
+                    .contains("不得为缺失的已有步骤 ID 编造替代值")
+            );
+        }
     }
 }

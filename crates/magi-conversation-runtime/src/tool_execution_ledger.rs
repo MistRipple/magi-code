@@ -27,6 +27,9 @@ use crate::{
     },
 };
 
+type ToolBatchExecutor<'a> =
+    dyn FnMut(&[ChatToolCall]) -> Vec<(String, ExecutionResultStatus)> + 'a;
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ToolExecutionLedger {
     successful_idempotent_calls: BTreeMap<ToolCallFingerprint, String>,
@@ -39,6 +42,10 @@ pub(crate) struct ToolExecutionLedger {
     explicit_call_limits: BTreeMap<String, usize>,
     /// 本轮重复失败检测；任务轮次与对话轮次共用同一账本，因此共用同一刹车。
     failure_tracker: DeterministicToolFailureTracker,
+    retry_limit: Option<u32>,
+    /// 达到重试上限后只阻止该调用再次产生副作用；模型仍能观察结果并继续
+    /// 处理同一响应中的其他独立工作。
+    blocked_repeated_failures: BTreeMap<ToolCallFingerprint, String>,
 }
 
 /// 恢复裁决与完成证据共用完整工具事实；模型摘要不参与安全判断。
@@ -169,7 +176,48 @@ impl ToolExecutionLedger {
             item.tool_approval().map_err(|error| error.to_string())?;
         }
         let history = canonical_tool_history(items);
+        let retry_limit = task
+            .policy_snapshot
+            .as_ref()
+            .map(|policy| policy.retry_limit)
+            .unwrap_or(crate::tool_result_utils::DEFAULT_TOOL_RETRY_LIMIT);
         let mut restored = Self::from_thread_history(&task.goal, &history, tool_registry);
+        restored.set_retry_limit(retry_limit);
+        for message in &history {
+            if message.role != "assistant" {
+                continue;
+            }
+            for call in &message.tool_calls {
+                if !call.function.name.starts_with("mcp__") {
+                    continue;
+                }
+                let Some(result) = history
+                    .iter()
+                    .find(|message| {
+                        message.role == "tool" && message.tool_call_id.as_deref() == Some(&call.id)
+                    })
+                    .and_then(|message| message.content.as_ref())
+                else {
+                    continue;
+                };
+                let call = ChatToolCall {
+                    id: call.id.clone(),
+                    kind: call.kind.clone(),
+                    function: magi_bridge_client::ChatToolFunction {
+                        name: call.function.name.clone(),
+                        arguments: call.function.arguments.clone(),
+                    },
+                };
+                restored.observe_mcp_execution(
+                    &call,
+                    &(
+                        result.clone(),
+                        crate::tool_result_utils::tool_result_execution_status(result),
+                    ),
+                    tool_registry,
+                );
+            }
+        }
         let sources =
             crate::agent_activation::previous_activation_tasks(task_store, task, session_id)?;
         if !sources.is_empty() {
@@ -418,6 +466,15 @@ impl ToolExecutionLedger {
                     };
                 }
 
+                if let Some(fingerprint) =
+                    repeated_failure_fingerprint(&canonical_name, &tool_call.function.arguments)
+                    && let Some(result) = self.blocked_repeated_failures.get(&fingerprint)
+                {
+                    return ToolCallExecutionDecision::RecoveryBlocked {
+                        result: result.clone(),
+                    };
+                }
+
                 if let Some(limit) = self.explicit_call_limits.get(&canonical_name)
                     && planned_call_counts
                         .get(&canonical_name)
@@ -497,8 +554,68 @@ impl ToolExecutionLedger {
         status: ExecutionResultStatus,
         retry_limit: u32,
     ) -> Option<DeterministicToolFailure> {
-        self.failure_tracker
-            .observe(tool_name, arguments, result, status, retry_limit)
+        if serde_json::from_str::<Value>(result).is_ok_and(|value| value["execution"] == "skipped")
+        {
+            return None;
+        }
+        let failure =
+            self.failure_tracker
+                .observe(tool_name, arguments, result, status, retry_limit);
+        if let Some(failure) = failure.as_ref()
+            && let Some(fingerprint) = repeated_failure_fingerprint(tool_name, arguments)
+        {
+            self.blocked_repeated_failures.insert(
+                    fingerprint,
+                    serde_json::json!({
+                        "tool": tool_name,
+                        "status": "failed",
+                        "execution": "skipped",
+                        "execution_started": false,
+                        "error_code": "tool_repeated_failure_blocked",
+                        "error": failure.summary,
+                        "diagnostic": {"detail": failure.detail, "source_result": serde_json::from_str::<Value>(result).unwrap_or_else(|_| Value::String(result.into()))},
+                        "instruction": "该工具已达到失败预算，本次未派发。MCP 需先调用同一服务的只读观察工具并成功取得当前状态，才重新开放派发；改变无效引用或参数不能重开预算。"
+                    })
+                    .to_string(),
+                );
+        }
+        failure
+    }
+
+    pub(crate) fn set_retry_limit(&mut self, retry_limit: u32) {
+        self.retry_limit = Some(retry_limit);
+    }
+
+    fn observe_mcp_execution(
+        &mut self,
+        call: &ChatToolCall,
+        result: &(String, ExecutionResultStatus),
+        registry: Option<&ToolRegistry>,
+    ) {
+        let name = &call.function.name;
+        if serde_json::from_str::<Value>(&result.0)
+            .is_ok_and(|value| value["execution"] == "skipped")
+        {
+            return;
+        }
+        // 只有目录声明的只读工具实际成功，才提供重新执行的当前观察。
+        // 名称、参数、模型宣告和缓存/阻断回执都不能重开预算。
+        if result.1 == ExecutionResultStatus::Succeeded
+            && registry.is_some_and(|registry| registry.is_idempotent_read_tool(name))
+        {
+            self.failure_tracker.clear_mcp_server(name);
+            self.blocked_repeated_failures
+                .retain(|fingerprint, _| !same_mcp_server(&fingerprint.tool_name, name));
+        } else {
+            self.observe_tool_result(
+                name,
+                &call.function.arguments,
+                &result.0,
+                result.1,
+                self.retry_limit
+                    .unwrap_or(crate::tool_result_utils::DEFAULT_TOOL_RETRY_LIMIT),
+            );
+        }
     }
 
     pub(crate) fn execute_batch_with(
@@ -507,6 +624,63 @@ impl ToolExecutionLedger {
         tool_registry: Option<&ToolRegistry>,
         mut execute: impl FnMut(&[ChatToolCall]) -> Vec<(String, ExecutionResultStatus)>,
     ) -> Vec<(String, ExecutionResultStatus)> {
+        self.execute_batch_dyn(tool_calls, tool_registry, &mut execute)
+    }
+
+    fn execute_batch_dyn(
+        &mut self,
+        tool_calls: &[ChatToolCall],
+        tool_registry: Option<&ToolRegistry>,
+        execute: &mut ToolBatchExecutor<'_>,
+    ) -> Vec<(String, ExecutionResultStatus)> {
+        // MCP 调用逐个领取执行资格；同一响应内伪造多个引用也不能超出失败预算。
+        // 非 MCP 的连续区段继续沿原批处理执行。
+        if tool_calls
+            .iter()
+            .any(|call| call.function.name.starts_with("mcp__"))
+        {
+            let mut results = Vec::with_capacity(tool_calls.len());
+            let mut index = 0;
+            while index < tool_calls.len() {
+                if !tool_calls[index].function.name.starts_with("mcp__") {
+                    let end = tool_calls[index..]
+                        .iter()
+                        .position(|call| call.function.name.starts_with("mcp__"))
+                        .map(|offset| index + offset)
+                        .unwrap_or(tool_calls.len());
+                    results.extend(self.execute_batch_dyn(
+                        &tool_calls[index..end],
+                        tool_registry,
+                        execute,
+                    ));
+                    index = end;
+                    continue;
+                }
+                let call = &tool_calls[index];
+                let decision = self
+                    .plan(std::slice::from_ref(call), tool_registry)
+                    .remove(0);
+                let result = if let Some(result) = decision.immediate_result() {
+                    result
+                } else {
+                    let ToolCallExecutionDecision::Execute { fingerprint } = decision else {
+                        unreachable!("single MCP invocation cannot defer reuse");
+                    };
+                    let result = execute(std::slice::from_ref(call)).into_iter().next().unwrap_or_else(|| (
+                        serde_json::json!({"status":"failed","error_code":"tool_result_missing","error":"MCP 执行器未返回回执"}).to_string(),
+                        ExecutionResultStatus::Failed,
+                    ));
+                    if !tool_result_is_interrupted_not_started(&result.0) {
+                        self.record_execution(call, fingerprint.as_ref(), &result);
+                        self.observe_mcp_execution(call, &result, tool_registry);
+                    }
+                    result
+                };
+                results.push(result);
+                index += 1;
+            }
+            return results;
+        }
         let decisions = self.plan(tool_calls, tool_registry);
         let execution_indices = decisions
             .iter()
@@ -898,7 +1072,33 @@ fn tool_call_fingerprint(
     })
 }
 
+fn repeated_failure_fingerprint(tool_name: &str, arguments: &str) -> Option<ToolCallFingerprint> {
+    serde_json::from_str::<Value>(arguments).ok()?;
+    Some(ToolCallFingerprint {
+        tool_name: tool_name.to_string(),
+        canonical_arguments: if tool_name.starts_with("mcp__") {
+            String::new()
+        } else {
+            normalized_tool_arguments(arguments)
+        },
+    })
+}
+
+fn same_mcp_server(left: &str, right: &str) -> bool {
+    left.strip_prefix("mcp__")
+        .and_then(|value| value.split("__").next())
+        .zip(
+            right
+                .strip_prefix("mcp__")
+                .and_then(|value| value.split("__").next()),
+        )
+        .is_some_and(|(left, right)| left == right)
+}
+
 fn is_idempotent_read_tool(tool_name: &str, tool_registry: Option<&ToolRegistry>) -> bool {
+    if tool_name.starts_with("mcp__") {
+        return false;
+    }
     BuiltinToolName::from_name(tool_name).is_some_and(|tool| tool.is_idempotent_read_operation())
         || tool_registry.is_some_and(|registry| registry.is_idempotent_read_tool(tool_name))
 }

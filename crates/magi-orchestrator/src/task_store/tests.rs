@@ -986,6 +986,152 @@ fn rooted_task(root_task_id: &str, task_id: &str) -> Task {
 }
 
 #[test]
+fn recovery_access_profile_is_atomic_scoped_and_preserves_other_constraints() {
+    let store = TaskStore::new();
+    let mut root = rooted_task("profile-root", "profile-root");
+    let mut child = rooted_task("profile-root", "profile-child");
+    let mut history = rooted_task("profile-root", "profile-history");
+    let mut other = rooted_task("other-root", "other-root");
+    history.status = TaskStatus::Completed;
+    let mut policy = default_frozen_policy();
+    policy.command_mode = "read_only".into();
+    policy.denied_tools = vec!["blocked-tool".into()];
+    policy.denied_paths = vec!["/private".into()];
+    for task in [&mut root, &mut child, &mut history, &mut other] {
+        task.policy_snapshot = Some(policy.clone());
+        store.insert_task(task.clone()).unwrap();
+    }
+    let select = [&root.task_id, &child.task_id];
+    store.set_checkpoint_callback(Box::new(|_| {
+        Err(DomainError::Persistence {
+            message: "profile checkpoint failed".into(),
+        })
+    }));
+    assert!(
+        store
+            .set_recovery_access_profile(
+                &root.task_id,
+                std::slice::from_ref(&root.task_id),
+                AccessProfile::FullAccess
+            )
+            .is_err()
+    );
+    for id in select {
+        assert_eq!(
+            store.get_task(id).unwrap().policy_snapshot,
+            Some(policy.clone())
+        );
+    }
+    store.set_checkpoint_callback(Box::new(|_| Ok(())));
+    assert!(
+        store
+            .set_recovery_access_profile(
+                &root.task_id,
+                std::slice::from_ref(&other.task_id),
+                AccessProfile::FullAccess
+            )
+            .is_err()
+    );
+    let lease = store
+        .grant_lease(
+            &child.task_id,
+            &root.task_id,
+            &WorkerId::new("profile-worker"),
+            "executor",
+            60_000,
+        )
+        .unwrap();
+    assert!(
+        store
+            .set_recovery_access_profile(
+                &root.task_id,
+                std::slice::from_ref(&root.task_id),
+                AccessProfile::FullAccess
+            )
+            .is_err()
+    );
+    assert!(store.revoke_lease(&child.task_id, &lease.lease_id));
+    store
+        .set_recovery_access_profile(
+            &root.task_id,
+            std::slice::from_ref(&root.task_id),
+            AccessProfile::FullAccess,
+        )
+        .unwrap();
+    let mut updated = policy.clone();
+    updated.access_profile = AccessProfile::FullAccess;
+    for id in select {
+        let actual = store.get_task(id).unwrap().policy_snapshot.unwrap();
+        assert_eq!(actual, updated);
+        assert_eq!(actual.effective_access_profile(), AccessProfile::ReadOnly);
+    }
+    for id in [&history.task_id, &other.task_id] {
+        assert_eq!(
+            store.get_task(id).unwrap().policy_snapshot,
+            Some(policy.clone())
+        );
+    }
+    let directory = tempfile::tempdir().unwrap();
+    store
+        .checkpoint_to_projection_directory(directory.path())
+        .unwrap();
+    let restored = TaskStore::restore_from_projection_directory(directory.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        restored.get_task(&child.task_id).unwrap().policy_snapshot,
+        Some(updated)
+    );
+}
+
+#[test]
+fn recovery_access_profile_excludes_transferred_agents() {
+    let (store, root, child, leaf, transfer) = transfer_fixture();
+    store
+        .transfer_agent_subtree(&root.task_id, &child.task_id, transfer)
+        .unwrap();
+    for task in store.tasks.write().unwrap().values_mut() {
+        task.policy_snapshot = Some(default_frozen_policy());
+    }
+    assert!(
+        store
+            .set_recovery_access_profile(
+                &root.task_id,
+                std::slice::from_ref(&child.task_id),
+                AccessProfile::FullAccess
+            )
+            .is_err()
+    );
+    store
+        .set_recovery_access_profile(
+            &root.task_id,
+            std::slice::from_ref(&root.task_id),
+            AccessProfile::FullAccess,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .get_task(&root.task_id)
+            .unwrap()
+            .policy_snapshot
+            .unwrap()
+            .access_profile,
+        AccessProfile::FullAccess
+    );
+    for id in [&child.task_id, &leaf.task_id] {
+        assert_eq!(
+            store
+                .get_task(id)
+                .unwrap()
+                .policy_snapshot
+                .unwrap()
+                .access_profile,
+            AccessProfile::Restricted
+        );
+    }
+}
+
+#[test]
 fn execution_lease_rejects_terminal_ancestors_before_cascade_cleanup() {
     for status in [
         TaskStatus::Completed,

@@ -76,6 +76,9 @@ Provider 响应 → 原有 usage 解析 → 原有 `model.usage.recorded` 账本
 | `readTokens` / `writeTokens` | Provider 已返回的缓存读取/写入 token 合计，未报告的写入量不推算 |
 | `tokenHitRate` | 缓存读取 token / 已观测完整输入 token，分母为零时为 null |
 | `requestHitRate` | 命中调用数 / 已观测调用数，无观测时为 null |
+| `steadyInputTokens` / `steadyReadTokens` / `steadyTokenHitRate` | 稳态命中率：与 `tokenHitRate` 同口径，但在每个统计范围（会话、执行绑定、模型各自）内去掉第一次被观测到缓存读取的调用——它没有可复用的前一次请求，是冷启动；分母为零（范围内只有一次观测）时为 null。会话合计取各执行绑定稳态量之和（会话里时间上第一个被观测的可能是很小的辅助调用，不能占掉主模型的冷启动）；工作区/全局合计是各会话稳态量相加。 |
+
+会话统计面板在缓存卡片下以“稳态 x%（不含首个请求）”并列显示稳态命中率，详情里给出分子/分母。累计命中率包含冷启动，短会话主要反映上游缓存当时是否已热（同一代码下两个 2 步会话可以是 48% 和 96%）；与长上下文长会话的数字比较时应看稳态值。`UsageTotals` 新增 `cache_steady_input_tokens` / `cache_steady_read_tokens`，旧快照缺字段按零读取，下一次写入会从原账本整体重建。
 
 统计页按原有模型/角色切片展示两种命中率及“已观测 X / 总调用 Y”；跨连接先加总分子分母再计算比例，不平均百分比。没有缓存 usage 显示“未观测”，明确的零读取显示 0%。沿用共享设置行及中英文翻译。
 
@@ -407,3 +410,11 @@ Gemini `gemini-3.8-flash` 本次未纳入完整场景统计：当前连接返回
 **未做：压缩作为主线分叉。** 评估后决定不做（已实现过一版并通过单测，随后撤回），原因是它改变摘要的生成语义（历史由“不可信数据文本”变为原生角色消息，注入防护靠指令而不是形态）、需要与分块/辅助模型两条路径并存，且在本网关上无法证明收益：对不是整体延长的请求，上游复用不稳定（见 7.4）。没有可测的收益目标，不为它改变压缩这条关键路径。条件和接口约束见架构文档。
 
 **定期检查。** `npm run report:cache-usage -- --since <改动落地日期>` 读取真实用量账本，按模型/角色与日期汇总命中率。落地前的基线（账本全量，2026-10-29 至 10-31，已按 attempt 去重）：`gpt-6-luna` orchestrator 约 25%（10-29/30 日整体 24–27%，10-31 日 68% 混有新旧构建），DeepSeek orchestrator/worker 约 85–87%，`gemini-3.8-flash` 约 75%。之后以新构建的数据为准重新比较；GPT 类在受控场景里约 80% 以上，真实使用能否达到、仍有多少差距来自上游，要靠这份报告积累的数据判断。
+
+### MCP 工具面完整性（2026-11-15）
+
+MCP 的逐工具 schema 延迟加载已撤下：恢复时临时发现集合可能丢失观察工具，只留下历史动作工具。当前每轮从同一 live catalog 装配全部获准 MCP schema 和 initialize instructions，分别按工具名/server_id 稳定排序；初始化说明每服务只注入一次，压缩重建沿用同轮快照，不依赖会被裁剪的工具历史。插件 schema 继续按既有显式发现合同加载。完整 MCP schema 会增加输入上下文，完整性优先于缩减工具面。
+
+插件 schema 的“已发现集合”不再每回合从空集合开始：循环起点从线程历史里成功的 `tool_catalog` 回执恢复（`discovered_tool_names_from_history`，历史投影已去掉 `input_schema`，依据回执当时的 `schema_included`；失败、`execution=skipped` 和非 `tool_catalog` 的回执不计入），当前目录与准入仍由实时刷新再次裁决。原因：2026-11-15 的真实账本中，每个回合都是“基础工具面 → 发现后变大”，工具表位于前缀最前面，`tool_surface_changed` 之后的第一个请求整段读取为 0（gpt-6-luna 输入 38k/82k/90k、glm 102k/103k 各丢一次），按 Magi 自身断代原因归因，约占 gpt-6-luna 浪费的 11%、glm 的 22%。压缩会清掉历史回执，这本来就是断代边界。这不解决另一部分更大的损失：同一账本里 Magi 标记为纯追加的 gpt-6-luna 请求仅 42% 命中（同代码 glm 为 83%），网关为 round-robin 且未开启会话亲和，请求落在不同 Codex 账号上，属于网关路由，需另行处理。本节改动未做真实模型对照。
+
+运行时规则片段只有一种顺序（`append_runtime_instruction_fragments`）：访问权限 → 当前轮优先级 → MCP 说明，随后 `refresh_current_agent_mode` 把模式片段放在其后；首个请求与 `round > 0` 的重建请求共用该入口。此前首个请求是“优先级 → MCP 说明”，重建请求是“MCP 说明 → 优先级”，所以每个 Turn 的第 0 步与上一 Turn 的最后一步、以及同 Turn 的第 0/1 步，稳定前缀都在这里分叉。证据：2026-11-15/16 用 glm-5.3（智谱官方路由，轮内稳态 94–99%）的真实会话里，Turn 首步命中仅 0%/43%/53%，分叉点约在 27–37k token（工具表之后、系统片段处），同一会话 PromptFrame 的 `stablePrefixHash` 在第 0 步与第 1 步不同（`stable_prefix_changed`），其余步相同。测试：`runtime_fragment_order_is_identical_for_first_request_and_rebuilt_request`。跨 Turn 的工具面变化（`tool_surface_changed`/`permission_changed`）仍需用真实会话再取证；本节改动尚未做真实模型对照。

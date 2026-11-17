@@ -627,6 +627,23 @@ fn tool_registry_order_does_not_change_wire_prefix_but_schema_changes_do() {
         canonical_a["tools"],
         client.build_request_body(&schema_request)["tools"]
     );
+
+    schema_request.tools = Some(vec![schema_tool(json!({
+        "$defs": {"WindowOperation": {"oneOf": [{
+            "type": "object",
+            "properties": {"action": {"const": "focus", "type": "string"}},
+            "required": ["action"],
+            "additionalProperties": false
+        }]}},
+        "type": "object",
+        "properties": {"operation": {"$ref": "#/$defs/WindowOperation"}},
+        "required": ["operation"]
+    }))]);
+    let body = client.build_request_body(&schema_request);
+    let wire_schema = body["tools"][0]["parameters"].clone();
+    assert_eq!(wire_schema["properties"]["operation"]["type"], "object");
+    assert!(wire_schema["properties"]["operation"].get("$ref").is_none());
+    assert!(wire_schema.get("$defs").is_none());
 }
 
 #[test]
@@ -3776,6 +3793,53 @@ fn invoke_retries_retryable_status_before_success() {
             .expect("mock server should receive every retry attempt");
         assert_eq!(recorded.path, "/v1/chat/completions");
     }
+}
+
+#[test]
+fn cancelling_during_retry_backoff_still_settles_the_retry_runtime() {
+    let server = spawn_mock_server_sequence(vec![MockHttpResponse {
+        status: 429,
+        content_type: "application/json".to_string(),
+        response_text: serde_json::json!({
+            "error": {"message": "rate limited", "type": "rate_limit_error", "code": "too_many_requests"}
+        })
+        .to_string(),
+    }]);
+    let client = HttpModelBridgeClient::new(
+        server.address.clone(),
+        Some("sk-test-key".to_string()),
+        "gpt-4.1-mini".to_string(),
+    );
+    let events = std::cell::RefCell::new(Vec::new());
+    let cancelled = std::cell::Cell::new(false);
+    let result = client.invoke_with_retry_events_and_cancellation(
+        ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
+            provider: "openai-compatible".to_string(),
+            prompt: "hello".to_string(),
+            messages: None,
+            tools: None,
+            tool_choice: None,
+        },
+        &|event| {
+            events.borrow_mut().push(event.phase);
+            if event.phase == ModelRetryRuntimePhase::Scheduled {
+                // 退避等待期间用户取消。
+                cancelled.set(true);
+            }
+        },
+        &|| cancelled.get(),
+    );
+    assert!(result.is_err());
+    // 取消后必须以 Settled 收尾，界面据此清除“准备发起第 N 次尝试”。
+    assert_eq!(
+        events.into_inner(),
+        vec![
+            ModelRetryRuntimePhase::Scheduled,
+            ModelRetryRuntimePhase::Settled
+        ]
+    );
 }
 
 #[test]

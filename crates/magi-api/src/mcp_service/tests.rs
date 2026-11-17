@@ -88,6 +88,7 @@ fn fixture_with_approval(approval_mode: ApprovalMode, approval_timeout: Duration
             };
             ExternalToolCatalogSnapshot {
                 mcp_servers: vec![ExternalMcpServerCatalogEntry {
+                    instructions: None,
                     server_id: "docs".to_string(),
                     name: "Docs".to_string(),
                     enabled: true,

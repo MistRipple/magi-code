@@ -480,10 +480,14 @@ mod tests {
     }
 
     #[test]
-    fn serialize_tool_definitions_preserves_conditional_schema_keywords() {
+    fn serialize_tool_definitions_preserves_keywords_and_inlines_local_refs() {
         let schema = json!({
+            "$defs": {"WindowOperation": {"type": "object", "oneOf": [{"required": ["action"]}]}},
             "type": "object",
-            "properties": {"value": {"type": "string"}},
+            "properties": {
+                "value": {"type": "string"},
+                "operation": {"$ref": "#/$defs/WindowOperation"}
+            },
             "oneOf": [{"required": ["value"]}],
             "additionalProperties": false
         });
@@ -495,7 +499,15 @@ mod tests {
         };
 
         let serialized = serialize_tool_definitions(&[tool]);
-        assert_eq!(serialized[0]["function"]["parameters"], schema);
+        let parameters = &serialized[0]["function"]["parameters"];
+        assert_eq!(parameters["oneOf"], schema["oneOf"]);
+        assert_eq!(parameters["properties"]["operation"]["type"], "object");
+        assert_eq!(
+            parameters["properties"]["operation"]["oneOf"],
+            schema["$defs"]["WindowOperation"]["oneOf"]
+        );
+        assert!(parameters.get("$defs").is_none());
+        assert!(parameters["properties"]["operation"].get("$ref").is_none());
     }
 
     #[test]

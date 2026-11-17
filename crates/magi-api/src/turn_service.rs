@@ -257,6 +257,7 @@ async fn submit_session_turn_internal(
     check_input_guard(&state, &request, "turn").await?;
 
     let decision = decide_session_turn(&state, &request)?;
+    inherit_resume_access_profile(&state, &mut request, &decision)?;
     request.source_folder_id =
         trimmed_non_empty(request.source_folder_id.as_deref()).map(str::to_string);
     request.project_directories = if request.resume {
@@ -507,6 +508,7 @@ async fn submit_session_turn_internal(
                     .request_id()
                     .unwrap_or_else(|| format!("request-{resumed_turn_id}")),
                 request_fingerprint.clone(),
+                request.access_profile,
                 |chain, primary_branch, branches, coordinator_attempt| {
                     let (_, orchestrator_thread_id) = state.session_store.ensure_session_mission(
                         &session_id,
@@ -635,6 +637,29 @@ pub(crate) fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Re
             "编辑上一条消息不能同时作为当前轮次引导".to_string(),
         ));
     }
+    Ok(())
+}
+
+/// 省略权限的恢复请求沿已裁决的来源 Task 继承权限，不读取 UI 偏好或其他会话。
+/// 调用位置在幂等重放之后、session Turn 锁内；新建默认值不变。
+fn inherit_resume_access_profile(
+    state: &ApiState,
+    request: &mut SessionTurnRequestDto,
+    decision: &SessionTurnIntentDecision,
+) -> Result<(), ApiError> {
+    if !request.resume || request.access_profile.is_some() {
+        return Ok(());
+    }
+    // 原链恢复直接使用各 Task 已持久化的策略；只有新建恢复 Task 才需要补齐输入。
+    let Some(checkpoint) = decision.recovery_checkpoint.as_ref() else {
+        return Ok(());
+    };
+    let policy = state
+        .task_store()
+        .and_then(|store| store.get_task(&checkpoint.source_task_id))
+        .and_then(|task| task.policy_snapshot)
+        .ok_or_else(|| ApiError::Conflict("原任务权限快照缺失，无法继承访问模式".into()))?;
+    request.access_profile = Some(policy.effective_access_profile());
     Ok(())
 }
 

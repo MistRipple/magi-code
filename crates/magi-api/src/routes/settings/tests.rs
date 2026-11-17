@@ -2308,6 +2308,7 @@ async fn settings_bootstrap_full_scope_hydrates_external_capability_dependencies
         instruction_skill_count: 0,
         skill_tools: Vec::new(),
         mcp_servers: vec![ExternalMcpServerCatalogEntry {
+            instructions: None,
             server_id: "loopback-mcp".to_string(),
             name: "loopback-mcp".to_string(),
             enabled: true,
@@ -3469,6 +3470,9 @@ async fn execution_stats_session_filter_preserves_missing_cache_and_performance(
     assert_eq!(result["totals"]["tokenObservedCallCount"], 2);
     assert_eq!(result["totals"]["cache"]["observedCallCount"], 1);
     assert_eq!(result["totals"]["cache"]["tokenHitRate"], 0.6);
+    // 唯一一次观测是冷启动，没有稳态样本。
+    assert_eq!(result["totals"]["cache"]["steadyInputTokens"], 0);
+    assert!(result["totals"]["cache"]["steadyTokenHitRate"].is_null());
     assert_eq!(result["totals"]["performance"]["ttftSampleCount"], 1);
     assert_eq!(result["totals"]["performance"]["textOutputTokens"], 40);
     assert_eq!(result["items"][0]["performance"]["contentDurationMs"], 1000);

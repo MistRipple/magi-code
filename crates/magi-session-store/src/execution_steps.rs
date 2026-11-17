@@ -8,6 +8,27 @@ use magi_core::{DomainError, DomainResult, UtcMillis};
 use std::collections::HashSet;
 pub const EXECUTION_STEPS_KEY: &str = "executionSteps";
 pub const EXECUTION_STEP_KEY: &str = "executionStepId";
+
+/// Model-facing update fields projected from canonical facts. Server evidence and
+/// timestamps are deliberately absent; this does not mutate the stored snapshot.
+pub fn execution_steps_input(steps: &ExecutionSteps) -> UpdateExecutionStepsParams {
+    UpdateExecutionStepsParams {
+        steps: steps
+            .steps
+            .iter()
+            .map(|step| ExecutionStepInput {
+                step_id: step.step_id.clone(),
+                title: step.title.clone(),
+                status: step.status.clone(),
+                depends_on: Some(step.depends_on.clone()),
+                task_ids: Some(step.task_ids.clone()),
+                reason: step.reason.clone(),
+                plan_item_id: step.plan_item_id.clone(),
+            })
+            .collect(),
+        explanation: steps.explanation.clone(),
+    }
+}
 fn invalid(message: impl Into<String>) -> DomainError {
     DomainError::Validation {
         message: message.into(),
@@ -621,5 +642,35 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn model_input_projection_preserves_step_facts_and_excludes_server_fields() {
+        let mut snapshot = prepare_steps(
+            &turn(),
+            "task",
+            two_steps(ExecutionStepStatus::Running, ExecutionStepStatus::Pending),
+            None,
+        )
+        .unwrap();
+        snapshot.steps[0].status = ExecutionStepStatus::Completed;
+        snapshot.steps[0].evidence_refs = vec!["server-evidence".into()];
+        snapshot.steps[1].status = ExecutionStepStatus::Blocked;
+        snapshot.steps[1].reason = Some("原始阻塞原因".into());
+        let original = snapshot.clone();
+        let input = execution_steps_input(&snapshot);
+        assert_eq!(snapshot, original);
+        for (step, fact) in input.steps.iter().zip(&snapshot.steps) {
+            assert_eq!(step.step_id, fact.step_id);
+            assert_eq!(step.status, fact.status);
+            assert_eq!(step.reason, fact.reason);
+            assert_eq!(step.depends_on.as_ref(), Some(&fact.depends_on));
+            assert_eq!(step.task_ids.as_ref(), Some(&fact.task_ids));
+        }
+        let value = serde_json::to_value(input).unwrap();
+        for step in value["steps"].as_array().unwrap() {
+            assert!(step.get("evidenceRefs").is_none());
+            assert!(step.get("startedAt").is_none());
+            assert!(step.get("settledAt").is_none());
+        }
     }
 }

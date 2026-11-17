@@ -507,6 +507,13 @@ pub(super) fn execute_streaming_http_post_with_retries(
                     delay_ms: Some(delay.as_millis() as u64),
                 });
                 if !sleep_retry_delay_cancellable(delay, controls.is_cancelled) {
+                    // 退避等待中被取消也要结算，否则界面会一直停在“准备发起第 N 次尝试”。
+                    (controls.on_retry)(&ModelRetryRuntimeEvent {
+                        phase: ModelRetryRuntimePhase::Settled,
+                        attempt: retries,
+                        max_attempts,
+                        delay_ms: None,
+                    });
                     return Err(model_invocation_cancelled_error());
                 }
                 (controls.on_retry)(&ModelRetryRuntimeEvent {

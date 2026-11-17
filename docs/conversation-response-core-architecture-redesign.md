@@ -155,6 +155,8 @@ Goal 完成门在 Session 提交边界内通过只读查询获取 TaskStore 的�
 
 执行分支仅保存 Task/Worker/Thread 身份与获授配置，不保存 stage、lease、cursor 或恢复 token。旧 `magi-worker-runtime`、`worker-runtime.json` 读写、Continue 回灌和默认值解析已删除；正常执行与恢复使用同一个 TaskStore、canonical Step/工具历史和 Task 恢复检查点。运行管线直接持有共享 TaskStore，不另建运行时包装及私有默认 TaskStore。对外 DTO 的阶段和活动租约从 TaskStore 投影，失去生产来源的检查点字段已从 HTTP 读模型及 Web 类型/转换中删除。
 
+输入框 Continue 显式提交用户所选访问模式。`resume` 请求省略访问模式时，新建恢复 Task 继承来源 Task 的有效访问模式，原链恢复保留各 Task 的冻结策略；普通新任务仍默认 `restricted`。原链恢复收到显式访问模式时，在原 runner 退出且新 Turn 接纳后，由 TaskStore 原子持久化本次恢复范围的访问档，再启动 runner；工具/路径限制与 command mode 不变，历史完成任务及已转交子树不被重写。权限 checkpoint 失败阻止启动。省略与显式 `restricted` 的恢复请求使用不同幂等指纹，重放先读取原回执，不重新解析或写入权限。
+
 运行读模型的会话活跃任务和代理分支只取 TaskStore 当前 execution scope；完成、失败、取消与已转交子树不进入原主线活跃列表，历史终态分支仍可展示。全局活跃身份直接读取 TaskStore，重启后不依赖事件窗口；事件与恢复引用只补充诊断，缺失 Task 不能靠事件复活。Web 主线状态及输入忙碌态只消费主线 canonical Turn，独立 Agent Turn 不重开主线。代理计数按明确分支的 Task 身份及实际状态生成，删除 assignment/mission 回落；bootstrap 重连只读取当前 Session 的 root 和 active_task_ids，不从旧事件改绑。恢复动作资格只读取 daemon `continuation`，待恢复记录数量不构成执行授权。
 
 `SessionStore::from_state_for_test` 与归属种子入口仅在 test/test-support 编译，正式恢复只能通过 `from_persisted_parts` 完整校验。

@@ -50,6 +50,11 @@ pub struct ToolInputSchema {
 
 impl ToolInputSchema {
     pub fn from_json_schema(schema: &Value) -> Self {
+        // Provider tool APIs and tool-calling models commonly support only a
+        // JSON-Schema subset. Keep the canonical schema untouched at runtime,
+        // but inline local `$defs` references in this model-facing projection so
+        // an object property is visibly an object instead of an untyped `$ref`.
+        let schema = expand_local_schema_refs(schema);
         let object = schema.as_object();
         let kind = object
             .and_then(|object| object.get("type"))
@@ -97,6 +102,66 @@ impl ToolInputSchema {
         }
         Value::Object(schema)
     }
+}
+
+fn expand_local_schema_refs(schema: &Value) -> Value {
+    fn expand(value: &Value, root: &Value, stack: &mut Vec<String>) -> Value {
+        let Some(object) = value.as_object() else {
+            return value
+                .as_array()
+                .map(|items| {
+                    Value::Array(items.iter().map(|item| expand(item, root, stack)).collect())
+                })
+                .unwrap_or_else(|| value.clone());
+        };
+
+        if let Some(reference) = object.get("$ref").and_then(Value::as_str)
+            && let Some(target) = reference
+                .strip_prefix("#/$defs/")
+                .or_else(|| reference.strip_prefix("#/definitions/"))
+                .and_then(|name| {
+                    root.get("$defs")
+                        .or_else(|| root.get("definitions"))?
+                        .get(name)
+                })
+            && !stack.iter().any(|seen| seen == reference)
+        {
+            stack.push(reference.to_string());
+            let mut expanded = expand(target, root, stack);
+            stack.pop();
+            if let (Some(base), Some(expanded_object)) = (expanded.as_object_mut(), Some(object)) {
+                for (key, sibling) in expanded_object {
+                    if key != "$ref" {
+                        base.insert(key.clone(), expand(sibling, root, stack));
+                    }
+                }
+                if !base.contains_key("type")
+                    && base
+                        .get("oneOf")
+                        .and_then(Value::as_array)
+                        .is_some_and(|branches| {
+                            !branches.is_empty()
+                                && branches.iter().all(|branch| {
+                                    branch.get("type").and_then(Value::as_str) == Some("object")
+                                })
+                        })
+                {
+                    base.insert("type".to_string(), Value::String("object".to_string()));
+                }
+            }
+            return expanded;
+        }
+
+        Value::Object(
+            object
+                .iter()
+                .filter(|(key, _)| *key != "$defs" && *key != "definitions")
+                .map(|(key, child)| (key.clone(), expand(child, root, stack)))
+                .collect(),
+        )
+    }
+
+    expand(schema, schema, &mut Vec::new())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

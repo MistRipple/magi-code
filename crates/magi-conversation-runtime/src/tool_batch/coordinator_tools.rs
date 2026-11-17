@@ -390,7 +390,7 @@ pub(super) fn execute_execution_steps(
             let code = "execution_steps_invalid_update";
             let failure=magi_core::ToolFailure::coded("update_execution_steps",code,error)
                 .instruction("按 current_steps 里的稳定 stepId 修正后重试，每次提交完整步骤列表。只能在步骤 running 期间有成功执行后完成步骤；取消、失败和阻塞要填写原因。")
-                .with("current_steps",serde_json::to_value(current).expect("steps serializable"));
+                .with("current_steps",serde_json::to_value(current.as_ref().map(magi_session_store::execution_steps::execution_steps_input)).expect("steps serializable"));
             (failure.into_payload(), ExecutionResultStatus::Failed)
         }
     }

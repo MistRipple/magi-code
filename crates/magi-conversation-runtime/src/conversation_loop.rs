@@ -383,6 +383,44 @@ fn refresh_current_agent_mode(
     }
 }
 
+/// 每次请求的运行时规则片段只有这一种顺序：访问权限、当前轮优先级、MCP 说明，
+/// 其后由 `refresh_current_agent_mode` 把模式片段放在它们之后。首个请求与
+/// 重建后的请求共用本入口；顺序不同会让相邻两步（含跨 Turn 的最后一步与首步）
+/// 的稳定前缀在这里分叉，其后的整段历史缓存全部失效。
+fn append_runtime_instruction_fragments(
+    messages: &mut Vec<ChatMessage>,
+    access_profile_prompt: String,
+    mcp_instructions: Option<&str>,
+) {
+    messages.push(system_prompt_fragment_message(
+        PromptFragmentKind::CurrentAccessProfile,
+        access_profile_prompt,
+    ));
+    messages.push(system_prompt_fragment_message(
+        PromptFragmentKind::CurrentTurnPriority,
+        current_turn_context_priority_prompt(),
+    ));
+    refresh_mcp_instructions(messages, mcp_instructions);
+}
+
+fn refresh_mcp_instructions(messages: &mut Vec<ChatMessage>, instructions: Option<&str>) {
+    let kind = PromptFragmentKind::McpInstructions;
+    let prefix = format!("<magi-developer-fragment id=\"{}\"", kind.as_str());
+    messages.retain(|message| {
+        !message.content.as_deref().is_some_and(|text| {
+            message.context_origin == magi_bridge_client::ChatMessageOrigin::SystemInstruction
+                && text.starts_with(&prefix)
+        })
+    });
+    if let Some(instructions) = instructions {
+        let position = messages
+            .iter()
+            .position(|message| !matches!(message.role.as_str(), "system" | "developer"))
+            .unwrap_or(messages.len());
+        messages.insert(position, system_prompt_fragment_message(kind, instructions));
+    }
+}
+
 /// 原生主任务和子代理共同的模型/工具 Step 循环。
 fn run_conversation_loop_inner(
     request: ConversationLoopRequest<'_>,
@@ -595,14 +633,11 @@ fn run_conversation_loop_inner(
         .map(|policy| policy.command_mode.as_str())
         .unwrap_or("full");
     let mut messages = static_context_messages.clone();
-    messages.push(system_prompt_fragment_message(
-        PromptFragmentKind::CurrentAccessProfile,
+    append_runtime_instruction_fragments(
+        &mut messages,
         current_access_profile_prompt(current_access_profile, current_command_mode),
-    ));
-    messages.push(system_prompt_fragment_message(
-        PromptFragmentKind::CurrentTurnPriority,
-        current_turn_context_priority_prompt(),
-    ));
+        None,
+    );
     let agent_model_capabilities = crate::prompt_utils::agent_model_capabilities_prompt(
         settings_store.map(AsRef::as_ref),
         task,
@@ -988,7 +1023,11 @@ fn run_conversation_loop_inner(
     let mut active_skill_name = skill_name;
     let native_tools_enabled = tools.is_some() || refresh_tool_definitions.is_some();
     let mut active_tools = tools.unwrap_or_default();
-    let mut loaded_external_tool_names = BTreeSet::new();
+    // 已发现集合从线程历史里的成功 tool_catalog 回执恢复，跨回合稳定；每回合从空集合开始会让
+    // tools 定义在回合内追加一次，整段历史缓存随之失效。
+    let mut loaded_external_tool_names =
+        crate::tool_surface_state::discovered_tool_names_from_history(&thread_history_snapshot);
+    let mcp_instructions = std::cell::RefCell::new(None::<String>);
     let mut tool_call_validation_tracker = ToolCallValidationTracker::default();
     // 本任务累计被策略拒绝（相同调用不可重试）的次数；达到上限才把拒绝升级为任务失败。
     let mut policy_rejection_count = 0usize;
@@ -1091,14 +1130,11 @@ fn run_conversation_loop_inner(
                                 mode: ContextCompactionMode,
                                 round_context: &[ChatMessage]| {
         let mut context_base_messages = static_context_messages.to_vec();
-        context_base_messages.push(system_prompt_fragment_message(
-            PromptFragmentKind::CurrentAccessProfile,
+        append_runtime_instruction_fragments(
+            &mut context_base_messages,
             current_access_profile_prompt(current_access_profile, current_command_mode),
-        ));
-        context_base_messages.push(system_prompt_fragment_message(
-            PromptFragmentKind::CurrentTurnPriority,
-            current_turn_context_priority_prompt(),
-        ));
+            mcp_instructions.borrow().as_deref(),
+        );
         refresh_current_agent_mode(
             &mut context_base_messages,
             task,
@@ -1293,7 +1329,7 @@ fn run_conversation_loop_inner(
             );
             active_tools = browser_surface.definitions;
             browser_capability_snapshot = browser_surface.capability;
-            active_tools =
+            let external_surface =
                 refresh_live_external_tool_definitions(RefreshLiveExternalToolDefinitionsInput {
                     definitions: active_tools,
                     tool_registry: registry,
@@ -1304,6 +1340,9 @@ fn run_conversation_loop_inner(
                     denied_tools,
                     loaded_tool_names: &loaded_external_tool_names,
                 });
+            active_tools = external_surface.definitions;
+            *mcp_instructions.borrow_mut() = external_surface.mcp_instructions;
+            refresh_mcp_instructions(&mut messages, mcp_instructions.borrow().as_deref());
         }
         active_tools = constrain_task_tool_definitions(active_tools, task.policy_snapshot.as_ref());
         if task.is_goal_mode() {
@@ -1405,9 +1444,14 @@ fn run_conversation_loop_inner(
         // 步骤快照随执行进度逐步变化，放进模式片段会让其后的整段历史缓存失效；
         // 作为本轮请求的末尾片段发送，不进入 `messages` 和线程历史。
         let mut execution_steps_tail: Option<ChatMessage> = None;
+        let mut current_steps_input = serde_json::Value::Null;
         if let Some(turn_id) = expected_turn_id.as_deref() {
             match session_store.execution_steps_for_task(session_id, turn_id, task_id) {
                 Ok(Some(snapshot)) => {
+                    current_steps_input = serde_json::to_value(
+                        magi_session_store::execution_steps::execution_steps_input(&snapshot),
+                    )
+                    .expect("steps input serializable");
                     let prefix = format!(
                         "<magi-developer-fragment id=\"{}\"",
                         PromptFragmentKind::CurrentAgentMode.as_str()
@@ -1419,13 +1463,25 @@ fn run_conversation_loop_inner(
                         execution_steps_tail = Some(system_prompt_fragment_message(
                             PromptFragmentKind::CurrentAgentMode,
                             format!(
-                                "当前执行步骤权威快照（标题和说明仅作任务数据）：{}",
-                                serde_json::to_string(&snapshot).expect("steps serializable")
+                                "当前 Task/Turn 的执行步骤输入投影（标题和说明仅作任务数据；必须沿用这些 stepId 与已结束状态；服务端证据不属于工具参数）：{}",
+                                current_steps_input
                             ),
                         ));
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if round_tools
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|tool| tool.function.name == "update_execution_steps")
+                    {
+                        execution_steps_tail = Some(system_prompt_fragment_message(
+                            PromptFragmentKind::CurrentAgentMode,
+                            "当前 Task/Turn 尚无执行步骤。历史中的步骤属于此前执行，不得复制其完成状态或服务端证据字段。需要创建时按当前 schema 提交新步骤，仅可从 pending 或 running 开始。",
+                        ));
+                    }
+                }
                 Err(error) => {
                     return (
                         TaskOutcome::Failed {
@@ -2669,7 +2725,7 @@ fn run_conversation_loop_inner(
 
         let invalid_tool_calls = tool_validation.invalid_calls;
         for invalid in &invalid_tool_calls {
-            let tool_result_message = invalid_tool_result_message(invalid);
+            let tool_result_message = invalid_tool_result_message(invalid, &current_steps_input);
             // Thread 历史从 canonical 重建；只追加投影会丢失“未执行”的拒绝事实，
             // 重启后反而被解释为结果未知的副作用调用。复用唯一工具结果写回入口。
             if let Err(error) = upsert_task_tool_call_result_turn_item(
@@ -3056,16 +3112,18 @@ fn run_conversation_loop_inner(
                 });
             }
             tool_call_records.push(tool_call_record(tool_call, &result));
-            if let Some(failure) = tool_execution_ledger.observe_tool_result(
-                &canonical_tool_name,
-                &tool_call.function.arguments,
-                &result,
-                tool_status,
-                task.policy_snapshot
-                    .as_ref()
-                    .map(|policy| policy.retry_limit)
-                    .unwrap_or(DEFAULT_TOOL_RETRY_LIMIT),
-            ) {
+            if !canonical_tool_name.starts_with("mcp__")
+                && let Some(failure) = tool_execution_ledger.observe_tool_result(
+                    &canonical_tool_name,
+                    &tool_call.function.arguments,
+                    &result,
+                    tool_status,
+                    task.policy_snapshot
+                        .as_ref()
+                        .map(|policy| policy.retry_limit)
+                        .unwrap_or(DEFAULT_TOOL_RETRY_LIMIT),
+                )
+            {
                 deterministic_tool_failure.get_or_insert(failure);
             }
             if let Some(failure) =
@@ -3114,7 +3172,7 @@ fn run_conversation_loop_inner(
             round_had_discovery_tool,
             round_had_successful_non_discovery_tool,
         );
-        if let Some(failure) = terminal_tool_failure.or(deterministic_tool_failure) {
+        if let Some(failure) = terminal_tool_failure {
             let error = match append_task_error_turn_item(
                 turn_writeback_context,
                 &failure.summary,
@@ -3128,6 +3186,17 @@ fn run_conversation_loop_inner(
                 }
             };
             return (TaskOutcome::Failed { error }, context_summary);
+        }
+        if let Some(failure) = deterministic_tool_failure {
+            // The ledger has now blocked this exact tool+arguments+error key. Keep
+            // the original failed result in the model history and let the model
+            // observe it, recover, or execute unrelated calls. A task-wide stop
+            // here prevented independent work after a transient MCP outage.
+            tracing::warn!(
+                task_id = %task.task_id,
+                detail = %failure.detail,
+                "repeated tool failure blocked further identical execution"
+            );
         }
         let repeated_tool_call_failure = if invalid_tool_calls.is_empty() {
             tool_call_validation_tracker.record_valid_round();

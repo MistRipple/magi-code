@@ -85,6 +85,11 @@ fn apply_delta(
     next.cache_observed_call_count += delta.cache_observed_call_count;
     next.cache_hit_call_count += delta.cache_hit_call_count;
     next.cache_observed_input_tokens += delta.cache_observed_input_tokens;
+    // 范围内第一次观测到缓存读取的调用是冷启动，不进入稳态样本。
+    if delta.cache_observed_call_count > 0 && totals.cache_observed_call_count > 0 {
+        next.cache_steady_input_tokens += delta.cache_observed_input_tokens;
+        next.cache_steady_read_tokens += delta.cache_read_tokens;
+    }
     next.net_input_tokens += delta.net_input_tokens;
     next.net_output_tokens += delta.net_output_tokens;
     next.total_tokens += delta.total_tokens;
@@ -256,6 +261,19 @@ pub(crate) fn rebuild_usage_snapshot_from_events(events: &[UsageEvent]) -> Usage
             },
         );
     }
+
+    // 冷启动按执行绑定判定：会话里时间上第一个被观测的调用可能是很小的辅助调用，
+    // 不能替主模型的首个请求“占掉”冷启动，所以会话合计取各绑定稳态量之和。
+    snapshot.totals.cache_steady_input_tokens = snapshot
+        .by_execution_binding
+        .iter()
+        .map(|binding| binding.totals.cache_steady_input_tokens)
+        .sum();
+    snapshot.totals.cache_steady_read_tokens = snapshot
+        .by_execution_binding
+        .iter()
+        .map(|binding| binding.totals.cache_steady_read_tokens)
+        .sum();
 
     snapshot
 }

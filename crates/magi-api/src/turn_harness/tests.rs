@@ -17354,3 +17354,207 @@ async fn empty_provider_response_becomes_a_single_failed_terminal_turn() {
         .count();
     assert!(terminal_events <= 1, "终态事件不得重复发布");
 }
+
+#[tokio::test]
+async fn resume_access_profile_inherits_frozen_task_and_honors_explicit_selection() {
+    for (cancelled, (source, selected, expected)) in
+        [false, true].into_iter().flat_map(|cancelled| {
+            [
+                (AccessProfile::FullAccess, None, AccessProfile::FullAccess),
+                (AccessProfile::Restricted, None, AccessProfile::Restricted),
+                (AccessProfile::ReadOnly, None, AccessProfile::ReadOnly),
+                (
+                    AccessProfile::FullAccess,
+                    Some(AccessProfile::Restricted),
+                    AccessProfile::Restricted,
+                ),
+                (
+                    AccessProfile::Restricted,
+                    Some(AccessProfile::FullAccess),
+                    AccessProfile::FullAccess,
+                ),
+                (
+                    AccessProfile::FullAccess,
+                    Some(AccessProfile::ReadOnly),
+                    AccessProfile::ReadOnly,
+                ),
+            ]
+            .into_iter()
+            .map(move |case| (cancelled, case))
+        })
+    {
+        let dispatched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&dispatched);
+        let catalog = ExternalToolCatalogSnapshot {
+            mcp_tools: vec![magi_tool_runtime::ExternalMcpToolCatalogEntry {
+                server_id: "tap".into(),
+                server_name: "Tap".into(),
+                model_tool_name: "mcp__tap__ax_node_action".into(),
+                tool_name: "ax_node_action".into(),
+                description: "Act on fresh UI reference".into(),
+                read_only: false,
+                input_schema: serde_json::json!({"type":"object","properties":{}}),
+            }],
+            ..Default::default()
+        };
+        let harness = MagiTurnHarness::new_task_with_external_mcp(
+            "done",
+            catalog,
+            Arc::new(move |_, _, _| {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (
+                    r#"{"status":"succeeded","receipt":{"execution":{"dispatch":"completed"}}}"#
+                        .into(),
+                    magi_core::ExecutionResultStatus::Succeeded,
+                )
+            }),
+        );
+        if cancelled {
+            harness.provider.set_hold_for_cancellation();
+        } else {
+            harness.provider.set_failure("pause before resume");
+        }
+        let first = TurnService::new(harness.state.clone()).submit(serde_json::from_value(serde_json::json!({
+            "scope":"personal","text":"continue MCP workflow","accessProfile":source,"requestId":"source-profile","userMessageId":"source-user"
+        })).unwrap()).await.unwrap();
+        let session = SessionId::new(first.session_id.clone());
+        if cancelled {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while harness.provider.requests().is_empty() {
+                assert!(Instant::now() < deadline, "来源任务必须已调用 Provider");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            harness.cancel(&session).await.unwrap();
+        }
+        harness
+            .wait_for_terminal(&session, first.turn_id.as_deref().unwrap())
+            .await;
+        harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(first.root_task_id.clone().unwrap()))
+            .await;
+        if expected == AccessProfile::FullAccess {
+            harness.provider.set_tool_sequence_then_completed(
+                vec![(String::from("mcp__tap__ax_node_action"), String::from("{}"))],
+                "done",
+            );
+        } else {
+            harness.provider.set_completed_response("done");
+        }
+        let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope":"personal","sessionId":session,"text":"继续","resume":true,"accessProfile":selected,
+            "requestId":"continue-profile","userMessageId":"continue-user"
+        })).unwrap();
+        let resumed = TurnService::new(harness.state.clone())
+            .submit(request.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.route,
+            if cancelled {
+                crate::dto::SessionTurnRouteDto::Execute
+            } else {
+                crate::dto::SessionTurnRouteDto::Continue
+            }
+        );
+        assert_eq!(resumed.root_task_id == first.root_task_id, !cancelled);
+        let resumed_turn_id = harness
+            .state
+            .session_store
+            .canonical_turn_for_request_id("continue-profile")
+            .unwrap()
+            .turn_id;
+        let turn = harness.wait_for_terminal(&session, &resumed_turn_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(
+                resumed.root_task_id.clone().unwrap(),
+            ))
+            .await;
+        assert_eq!(
+            task.policy_snapshot.unwrap().effective_access_profile(),
+            expected,
+            "cancelled={cancelled} source={source:?} selected={selected:?}"
+        );
+        let replay = TurnService::new(harness.state.clone())
+            .submit(request)
+            .await
+            .unwrap();
+        assert_eq!(replay.turn_id.as_deref(), Some(resumed_turn_id.as_str()));
+        assert_eq!(
+            dispatched.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(expected == AccessProfile::FullAccess)
+        );
+        assert!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session)
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn resume_access_profile_checkpoint_failure_prevents_runner_start() {
+    let harness = MagiTurnHarness::new_task("done");
+    harness.provider.set_failure("pause before resume");
+    let first = harness
+        .submit(
+            None,
+            "执行任务",
+            "profile-failure-source",
+            "profile-failure-source-user",
+        )
+        .await
+        .unwrap();
+    let session = SessionId::new(&first.session_id);
+    harness
+        .wait_for_terminal(&session, first.turn_id.as_deref().unwrap())
+        .await;
+    let root = magi_core::TaskId::new(first.root_task_id.unwrap());
+    harness.wait_for_task_terminal(&root).await;
+    harness.provider.set_completed_response("done");
+    let requests = harness.provider.requests().len();
+    harness
+        .state
+        .task_store()
+        .unwrap()
+        .set_checkpoint_callback(Box::new(|snapshot| {
+            if snapshot.tasks.iter().any(|task| {
+                task.policy_snapshot
+                    .as_ref()
+                    .is_some_and(|policy| policy.access_profile == AccessProfile::FullAccess)
+            }) {
+                Err(magi_core::DomainError::Persistence {
+                    message: "profile checkpoint failure".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }));
+    let result = TurnService::new(harness.state.clone()).submit(serde_json::from_value(serde_json::json!({
+        "scope": "personal", "sessionId": session, "text": "继续", "resume": true,
+        "accessProfile": "full_access", "requestId": "profile-failure-continue", "userMessageId": "profile-failure-continue-user"
+    })).unwrap()).await;
+    assert!(result.is_err());
+    assert_eq!(harness.provider.requests().len(), requests);
+    assert_eq!(
+        harness
+            .state
+            .task_store()
+            .unwrap()
+            .get_task(&root)
+            .unwrap()
+            .policy_snapshot
+            .unwrap()
+            .access_profile,
+        AccessProfile::Restricted
+    );
+    let turn = harness
+        .state
+        .session_store
+        .canonical_turn_for_request_id("profile-failure-continue")
+        .unwrap();
+    assert_eq!(turn.status, CanonicalTurnStatus::Failed);
+}

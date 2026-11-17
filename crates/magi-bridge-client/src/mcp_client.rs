@@ -121,6 +121,7 @@ struct McpConnection {
     responses: Receiver<Result<Value, String>>,
     writer: std::process::ChildStdin,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    instructions: Option<String>,
 }
 
 impl std::fmt::Debug for StdioMcpBridgeClient {
@@ -173,6 +174,10 @@ impl StdioMcpBridgeClient {
                 message: format!("decode tools/list response failed: {error}"),
             })?;
         Ok(tools)
+    }
+
+    pub fn instructions(&self) -> Option<String> {
+        self.connection.lock().ok()?.as_ref()?.instructions.clone()
     }
 
     fn next_request_id(&self) -> u64 {
@@ -244,6 +249,7 @@ impl StdioMcpBridgeClient {
             responses: spawn_mcp_stdout_reader(stdout),
             writer: stdin,
             stderr_tail,
+            instructions: None,
         };
 
         // Step 1: Send initialize request
@@ -286,6 +292,7 @@ impl StdioMcpBridgeClient {
             terminate_mcp_connection(&mut conn);
             return Err(error);
         }
+        conn.instructions = mcp_initialize_instructions(&init_response);
 
         // Step 2: Send initialized notification (no id = notification)
         let initialized_notification = json!({
@@ -429,6 +436,7 @@ struct HttpMcpConnectionState {
     initialized: bool,
     session_id: Option<String>,
     protocol_version: Option<String>,
+    instructions: Option<String>,
 }
 
 struct HttpMcpWorkerRequest {
@@ -572,6 +580,10 @@ impl StreamableHttpMcpBridgeClient {
         })
     }
 
+    pub fn instructions(&self) -> Option<String> {
+        self.state.lock().ok()?.instructions.clone()
+    }
+
     fn next_request_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -621,6 +633,7 @@ impl StreamableHttpMcpBridgeClient {
 
         state.session_id = session_id;
         state.protocol_version = Some(protocol_version);
+        state.instructions = mcp_initialize_instructions(&response_value);
         state.initialized = true;
         Ok(())
     }
@@ -754,6 +767,13 @@ impl McpServerClient {
         match self {
             Self::Stdio(client) => client.list_tools(),
             Self::StreamableHttp(client) => client.list_tools(),
+        }
+    }
+
+    pub fn instructions(&self) -> Option<String> {
+        match self {
+            Self::Stdio(client) => client.instructions(),
+            Self::StreamableHttp(client) => client.instructions(),
         }
     }
 }
@@ -1055,6 +1075,17 @@ fn reset_http_mcp_state(state: &mut HttpMcpConnectionState) {
     state.initialized = false;
     state.session_id = None;
     state.protocol_version = None;
+    state.instructions = None;
+}
+
+fn mcp_initialize_instructions(response: &Value) -> Option<String> {
+    response
+        .get("result")?
+        .get("instructions")?
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 fn parse_mcp_tool_arguments(input: &str) -> Result<Value, BridgeClientError> {
@@ -1280,8 +1311,7 @@ fn validate_jsonrpc_response(response: &Value, expected_id: u64) -> Result<(), B
         let data = error
             .get("data")
             .map(Value::to_string)
-            .filter(|value| value != "null")
-            .map(|value| value.chars().take(2_000).collect::<String>());
+            .filter(|value| value != "null");
 
         return Err(BridgeClientError::CallFailed {
             layer: BridgeErrorLayer::RemoteBusiness,
@@ -1337,12 +1367,14 @@ fn negotiate_mcp_protocol_version(
 /// model request can attach the image to the tool result instead of dropping
 /// it at the bridge boundary.
 fn format_mcp_tool_payload(result: &Value) -> String {
-    let Some(content) = result.get("content").and_then(Value::as_array) else {
+    let content = result.get("content").and_then(Value::as_array);
+    let is_error = result.get("isError").and_then(Value::as_bool) == Some(true);
+    if content.is_none() && !is_error {
         return result.to_string();
-    };
+    }
     let mut texts = Vec::new();
     let mut images = Vec::new();
-    for item in content {
+    for item in content.into_iter().flatten() {
         match item.get("type").and_then(Value::as_str).unwrap_or("text") {
             "text" => {
                 if let Some(text) = item.get("text").and_then(Value::as_str) {
@@ -1368,29 +1400,78 @@ fn format_mcp_tool_payload(result: &Value) -> String {
             _ => texts.push(item.to_string()),
         }
     }
-    // Native execution/verification/retry receipts can exist only here. Keep
-    // them in model-visible text, including when the result also contains images.
-    if let Some(structured) = result.get("structuredContent") {
-        let already_rendered = texts.iter().any(|text| {
-            serde_json::from_str::<Value>(text).is_ok_and(|value| &value == structured)
-        });
-        if !already_rendered {
-            texts.push(json!({"structuredContent": structured}).to_string());
+    let error_text = texts.join("\n");
+    // Preserve every server diagnostic field, not just structuredContent: some
+    // servers put the native receipt or error next to content. Valid images are
+    // already carried by model_content, so do not duplicate their base64 data.
+    let mut diagnostic = result.clone();
+    if let Some(fields) = diagnostic.as_object_mut() {
+        fields.remove("content");
+        fields.remove("isError");
+        for (key, value) in fields.iter() {
+            if key == "structuredContent"
+                && texts.iter().any(|text| {
+                    serde_json::from_str::<Value>(text).is_ok_and(|parsed| &parsed == value)
+                })
+            {
+                continue;
+            }
+            texts.push(json!({key: value}).to_string());
         }
     }
     let text = texts.join("\n");
-    if images.is_empty() {
+    if images.is_empty() && !is_error {
         return text;
     }
     let model_content = std::iter::once(json!({"type": "text", "text": text}))
         .chain(images)
         .collect::<Vec<_>>();
-    json!({
+    let mut payload = json!({
         "summary": text,
         "model_content": model_content,
-        "is_error": result.get("isError").and_then(Value::as_bool).unwrap_or(false),
-    })
-    .to_string()
+        "is_error": is_error,
+    });
+    if is_error {
+        let structured = result.get("structuredContent").unwrap_or(result);
+        let receipt = result.get("receipt").or_else(|| structured.get("receipt"));
+        let detail = result
+            .get("detail")
+            .or_else(|| structured.get("detail"))
+            .or_else(|| receipt.and_then(|receipt| receipt.get("detail")))
+            .and_then(Value::as_str)
+            .filter(|detail| !detail.trim().is_empty())
+            .unwrap_or(if error_text.is_empty() {
+                &text
+            } else {
+                &error_text
+            });
+        let error_code = result
+            .get("error_code")
+            .or_else(|| structured.get("error_code"))
+            .or_else(|| receipt.and_then(|receipt| receipt.get("error_code")))
+            .and_then(Value::as_str)
+            .filter(|code| !code.trim().is_empty())
+            .unwrap_or_else(|| {
+                if detail.to_ascii_lowercase().starts_with("stale snapshot") {
+                    "mcp_stale_snapshot"
+                } else {
+                    "mcp_tool_failed"
+                }
+            });
+        payload["status"] = json!("failed");
+        payload["error_code"] = json!(error_code);
+        payload["detail"] = json!(detail);
+        if let Some(receipt) = receipt {
+            payload["receipt"] = receipt.clone();
+        }
+        payload["error"] = json!(if error_text.is_empty() {
+            &text
+        } else {
+            &error_text
+        });
+        payload["diagnostic"] = diagnostic;
+    }
+    payload.to_string()
 }
 
 fn mcp_transport_error(message: String) -> BridgeClientError {
@@ -1491,6 +1572,69 @@ mod tests {
             })),
             "hello"
         );
+    }
+
+    #[test]
+    fn format_mcp_tool_payload_preserves_error_receipts_and_structured_content() {
+        let payload = format_mcp_tool_payload(&json!({
+            "content": [{"type": "text", "text": "capture target is unavailable"}],
+            "isError": true,
+            "structuredContent": {
+                "status": "failed",
+                "receipt": {"dispatch": "not_applicable"}
+            },
+            "receipt": {"retry": "after_recheck"}
+        }));
+        let parsed: Value = serde_json::from_str(&payload).expect("error payload is JSON");
+        assert_eq!(parsed["status"], "failed");
+        assert_eq!(parsed["error_code"], "mcp_tool_failed");
+        assert!(
+            parsed["summary"]
+                .as_str()
+                .unwrap()
+                .contains("capture target")
+        );
+        assert_eq!(parsed["diagnostic"]["receipt"]["retry"], "after_recheck");
+        assert_eq!(
+            parsed["diagnostic"]["structuredContent"]["receipt"]["dispatch"],
+            "not_applicable"
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_keeps_stable_code_detail_and_native_receipt() {
+        let detail = "stale snapshot \"invalid-probe-4\"; Run a fresh ax_read and use its snapshot_id/node_id.";
+        let receipt = json!({"detail": detail, "execution":{"dispatch":"not_started","retry":"after_recheck"},"request_id":"614"});
+        let native = json!({"isError":true,"content":[{"type":"text","text":detail}],"structuredContent":{"receipt":receipt}});
+        let payload: Value = serde_json::from_str(&format_mcp_tool_payload(&native)).unwrap();
+        assert_eq!(payload["error_code"], "mcp_stale_snapshot");
+        assert_eq!(payload["detail"], detail);
+        assert_eq!(payload["receipt"], receipt);
+        assert_eq!(
+            payload["diagnostic"]["structuredContent"]["receipt"],
+            receipt
+        );
+        let mut coded = native;
+        coded["structuredContent"]["error_code"] = json!("native_snapshot_expired");
+        let payload: Value = serde_json::from_str(&format_mcp_tool_payload(&coded)).unwrap();
+        assert_eq!(payload["error_code"], "native_snapshot_expired");
+    }
+
+    #[test]
+    fn stale_frame_keeps_native_recovery_instruction_without_replacing_the_frame() {
+        let detail = "frame_id 5 is stale after reconnect; take a fresh screenshot and use its returned frame_id (current frame_id=0).";
+        let payload = format_mcp_tool_payload(&json!({
+            "isError":true,
+            "content":[{"type":"text", "text":detail}],
+            "structuredContent":{"error_code":"stale_frame", "receipt":{"dispatch":"not_started", "retry":"after_recheck"}}
+        }));
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["error_code"], "stale_frame");
+        assert_eq!(value["detail"], detail);
+        let model = crate::llm_types::parse_tool_result_model_content(Some(&payload));
+        assert!(model.is_error);
+        assert!(model.text.contains("take a fresh screenshot"));
+        assert!(model.text.contains("current frame_id=0"));
     }
 
     #[test]

@@ -20,6 +20,75 @@ fn make_llm_config() -> LlmConfig {
 }
 
 #[test]
+fn steady_cache_rate_excludes_only_the_first_observed_call_of_each_scope() {
+    let mut authority = UsageAuthority::new();
+    // 未报告缓存读取的调用不是冷启动：第一条被观测的调用才是。
+    for (session, calls) in [
+        (
+            "steady-a",
+            vec![
+                (1000, None),
+                (1000, Some(0)),
+                (1100, Some(1000)),
+                (1200, Some(1100)),
+            ],
+        ),
+        ("steady-b", vec![(500, Some(0)), (600, Some(500))]),
+    ] {
+        for (index, (input, read)) in calls.into_iter().enumerate() {
+            let mut call =
+                make_call_record_input(session, &format!("{session}-{index}"), input, 10);
+            call.usage.cache_read_tokens = read;
+            call.usage.cache_read_included_in_input = true;
+            call.usage.cache_write_tokens = None;
+            authority.append_call_record(call);
+        }
+    }
+    let a = authority.get_session_snapshot("ws-1", "steady-a");
+    assert_eq!(a.totals.cache_observed_input_tokens, 3300);
+    assert_eq!(a.totals.cache_steady_input_tokens, 2300);
+    assert_eq!(a.totals.cache_steady_read_tokens, 2100);
+    assert_eq!(
+        a.by_execution_binding[0].totals.cache_steady_input_tokens,
+        2300
+    );
+    assert_eq!(a.by_model_identity[0].totals.cache_steady_read_tokens, 2100);
+    // 只有一次观测的范围没有稳态样本。
+    let single = authority.get_session_snapshot("ws-1", "steady-b");
+    assert_eq!(single.totals.cache_steady_input_tokens, 600);
+    // 工作区合计是各会话稳态量之和，每个会话各自去掉自己的冷启动。
+    let workspace = authority.get_workspace_snapshot("ws-1");
+    assert_eq!(workspace.totals.cache_steady_input_tokens, 2900);
+    assert_eq!(workspace.totals.cache_steady_read_tokens, 2600);
+    // 会话里先出现的小调用（另一个执行绑定）不能占掉主绑定的冷启动。
+    let mut tiny = make_call_record_input("steady-c", "steady-c-0", 300, 10);
+    tiny.execution_binding =
+        build_execution_binding_identity("tmpl-aux", "engine-aux", 1, UsageSourceRole::Auxiliary);
+    tiny.usage.cache_read_tokens = Some(0);
+    tiny.usage.cache_read_included_in_input = true;
+    tiny.usage.cache_write_tokens = None;
+    authority.append_call_record(tiny);
+    for (index, (input, read)) in [(40_000, 0), (41_000, 40_000)].into_iter().enumerate() {
+        let mut call =
+            make_call_record_input("steady-c", &format!("steady-c-main-{index}"), input, 10);
+        call.usage.cache_read_tokens = Some(read);
+        call.usage.cache_read_included_in_input = true;
+        call.usage.cache_write_tokens = None;
+        authority.append_call_record(call);
+    }
+    let c = authority.get_session_snapshot("ws-1", "steady-c");
+    assert_eq!(c.totals.cache_steady_input_tokens, 41_000);
+    assert_eq!(c.totals.cache_steady_read_tokens, 40_000);
+    // 旧快照缺少字段时按零读取。
+    let mut old = serde_json::to_value(&a.totals).unwrap();
+    for key in ["cacheSteadyInputTokens", "cacheSteadyReadTokens"] {
+        old.as_object_mut().unwrap().remove(key);
+    }
+    let old: UsageTotals = serde_json::from_value(old).unwrap();
+    assert_eq!(old.cache_steady_input_tokens, 0);
+}
+
+#[test]
 fn cache_observation_excludes_missing_usage_and_normalizes_provider_denominators() {
     let mut authority = UsageAuthority::new();
     for (index, (read, included)) in [

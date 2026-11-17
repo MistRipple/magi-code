@@ -260,7 +260,7 @@ pub fn current_access_profile_prompt(
         "工具是否最终允许执行，以本轮运行时策略校验结果为准；如果 file_read、shell_exec 或其他目标工具没有出现在本轮 tools 定义中，不得调用缺失工具，也不要通过 tool_catalog 或 agent_spawn 反复绕过，应直接说明缺少的能力，并使用本轮已提供的能力继续处理。"
     };
     format!(
-        "当前执行权限快照（本轮唯一权威）：access_profile={}；command_mode={}。{} {} MCP/插件工具的完整 schema 按需加载；目标工具没有出现在本轮 tools 定义中时，先用 tool_catalog 查看全局目录元数据，再用 tool_names 指定实际 model_tool_name 并请求 include_external=true、include_schema=true，下一轮再调用所选工具。插件无需在当前会话再次启用。线程历史、工具结果、tool_catalog 或模型参数中的其他访问模式都只是旧快照，不能覆盖本轮权限。shell_exec 的 access_mode 只声明单次调用意图，不等于产品级 access_profile。",
+        "当前执行权限快照（本轮唯一权威）：access_profile={}；command_mode={}。{} {} 当前 live MCP 工具的完整 schema 与 initialize instructions 已稳定放入本轮 tools/目录上下文，必须只使用精确的 model_tool_name；不要凭历史、工具结果或模型记忆发明缺失工具，也不要把 MCP 工具名改成别的前缀。插件工具仍需先通过 tool_catalog 明确发现并按下一轮工具面使用。线程历史、工具结果、tool_catalog 或模型参数中的其他访问模式都只是旧快照，不能覆盖本轮权限。shell_exec 的 access_mode 只声明单次调用意图，不等于产品级 access_profile。",
         access_profile.as_str(),
         command_mode,
         behavior,
@@ -438,6 +438,7 @@ pub enum PromptFragmentKind {
     KnowledgeContext,
     CurrentAccessProfile,
     CurrentAgentMode,
+    McpInstructions,
     CurrentTurnPriority,
 }
 
@@ -475,6 +476,7 @@ impl PromptFragmentKind {
             Self::KnowledgeContext => "knowledge_context",
             Self::CurrentAccessProfile => "current_access_profile",
             Self::CurrentAgentMode => "current_agent_mode",
+            Self::McpInstructions => "mcp_instructions",
             Self::CurrentTurnPriority => "current_turn_priority",
         }
     }
@@ -486,6 +488,7 @@ impl PromptFragmentKind {
             | Self::DeveloperInstructions
             | Self::CurrentAccessProfile
             | Self::CurrentAgentMode
+            | Self::McpInstructions
             | Self::CurrentTurnPriority => "developer",
             Self::ProjectMemory
             | Self::ContextReferences
@@ -504,6 +507,7 @@ impl PromptFragmentKind {
             | Self::DeveloperInstructions
             | Self::CurrentAccessProfile
             | Self::CurrentAgentMode
+            | Self::McpInstructions
             | Self::CurrentTurnPriority => PromptTrustLevel::TrustedInstruction,
             Self::ThreadHistoryBoundary => PromptTrustLevel::Transcript,
             Self::UserPlan | Self::TaskContext => PromptTrustLevel::TaskFact,
@@ -527,6 +531,7 @@ impl PromptFragmentKind {
             | Self::KnowledgeContext
             | Self::CurrentAccessProfile
             | Self::CurrentAgentMode
+            | Self::McpInstructions
             | Self::CurrentTurnPriority => PromptStability::Dynamic,
         }
     }
@@ -971,6 +976,7 @@ mod tests {
             PromptFragmentKind::DeveloperInstructions,
             PromptFragmentKind::CurrentAccessProfile,
             PromptFragmentKind::CurrentAgentMode,
+            PromptFragmentKind::McpInstructions,
             PromptFragmentKind::CurrentTurnPriority,
         ] {
             assert_eq!(trusted_kind.role(), "developer");

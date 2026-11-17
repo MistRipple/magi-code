@@ -494,6 +494,71 @@ impl TaskStore {
         self.transition_recovery_status(task_id, TaskStatus::Failed, TaskStatus::Pending, false)
     }
 
+    /// 用户显式继续时更新本次恢复范围的访问档；调用方须先停止原 runner。
+    /// 其他策略约束、历史终态任务和已转交子树保持原值。
+    pub fn set_recovery_access_profile(
+        &self,
+        root_task_id: &TaskId,
+        branch_ids: &[TaskId],
+        access_profile: AccessProfile,
+    ) -> DomainResult<()> {
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .expect("task mutation lock poisoned");
+        let mut tasks = self.tasks.read().expect("tasks read lock poisoned").clone();
+        Self::validate_task_root(&tasks, root_task_id, root_task_id)?;
+        let mut selected = HashSet::from([root_task_id.clone()]);
+        for branch_id in branch_ids {
+            if Self::execution_scope_root_in_tasks(&tasks, branch_id)? != *root_task_id {
+                return Err(DomainError::InvalidState {
+                    message: "恢复访问模式不能修改其他执行范围".into(),
+                });
+            }
+            selected.extend(collect_subtree_ids_in_scope(&tasks, branch_id, true));
+        }
+        selected.retain(|id| {
+            tasks.get(id).is_some_and(|task| {
+                matches!(
+                    task.status,
+                    TaskStatus::Pending | TaskStatus::Running | TaskStatus::Failed
+                )
+            })
+        });
+        let leases = self.leases.read().expect("leases read lock poisoned");
+        if leases.values().any(|lease| {
+            selected.contains(&lease.task_id) && lease.lease_status == TaskLeaseState::Active
+        }) {
+            return Err(DomainError::InvalidState {
+                message: "恢复任务仍有活跃租约，不能改变访问模式".into(),
+            });
+        }
+        let mut changed = false;
+        for id in selected {
+            let task = tasks.get_mut(&id).expect("selected task exists");
+            let policy =
+                task.policy_snapshot
+                    .as_mut()
+                    .ok_or_else(|| DomainError::InvalidState {
+                        message: format!("任务 {id} 缺少冻结权限快照"),
+                    })?;
+            if policy.access_profile != access_profile {
+                policy.access_profile = access_profile;
+                task.updated_at = UtcMillis::now();
+                changed = true;
+            }
+        }
+        if changed {
+            self.fire_checkpoint(&Self::snapshot_from_maps_with_dirty_roots(
+                &tasks,
+                &leases,
+                vec![root_task_id.clone()],
+            ))?;
+            *self.tasks.write().expect("tasks write lock poisoned") = tasks;
+        }
+        Ok(())
+    }
+
     /// 将失败的 root task 置为 Running，供指定 branch 的恢复入口启动执行树。
     pub fn start_failed_root_for_recovery(&self, root_task_id: &TaskId) -> DomainResult<()> {
         self.transition_recovery_status(root_task_id, TaskStatus::Failed, TaskStatus::Running, true)

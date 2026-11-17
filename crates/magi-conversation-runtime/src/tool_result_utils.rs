@@ -128,14 +128,25 @@ pub(crate) fn emergency_model_round_failure(round: usize) -> Option<Deterministi
 /// 工具参数的规范形式：JSON 按键排序、去除空白差异；无法解析时取去除首尾空白的原文。
 pub(crate) use magi_tool_runtime::normalized_tool_arguments;
 
-/// 重复失败检测：按“工具 + 规范化参数 + 错误”计数。其他调用的成功不会清零计数；
-/// 只有同一调用本身成功才说明它不再失败。
+/// MCP 失败按工具累计，不让模型通过不断改变无效引用绕过执行边界；
+/// 内置工具仍按规范参数和错误累计。其他调用成功不清零计数。
 #[derive(Clone, Debug, Default)]
 pub struct DeterministicToolFailureTracker {
     observations: BTreeMap<String, usize>,
 }
 
 impl DeterministicToolFailureTracker {
+    pub fn clear_mcp_server(&mut self, tool_name: &str) {
+        let Some((server, _)) = tool_name
+            .strip_prefix("mcp__")
+            .and_then(|name| name.split_once("__"))
+        else {
+            return;
+        };
+        let prefix = format!("mcp__{server}__");
+        self.observations.retain(|key, _| !key.starts_with(&prefix));
+    }
+
     pub fn observe(
         &mut self,
         tool_name: &str,
@@ -144,10 +155,15 @@ impl DeterministicToolFailureTracker {
         status: ExecutionResultStatus,
         retry_limit: u32,
     ) -> Option<DeterministicToolFailure> {
-        let call_key = format!(
-            "{tool_name}\u{1f}{}\u{1f}",
-            normalized_tool_arguments(arguments)
-        );
+        let is_mcp = tool_name.starts_with("mcp__");
+        let call_key = if is_mcp {
+            format!("{tool_name}\u{1f}")
+        } else {
+            format!(
+                "{tool_name}\u{1f}{}\u{1f}",
+                normalized_tool_arguments(arguments)
+            )
+        };
         if status == ExecutionResultStatus::Succeeded {
             self.observations
                 .retain(|key, _| !key.starts_with(&call_key));
@@ -174,7 +190,11 @@ impl DeterministicToolFailureTracker {
             .and_then(|payload| payload.get("access_profile"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        let key = format!("{call_key}{error_code}\u{1f}{access_profile}");
+        let key = if is_mcp {
+            call_key
+        } else {
+            format!("{call_key}{error_code}\u{1f}{access_profile}")
+        };
         let observations = self.observations.entry(key).or_default();
         *observations = observations.saturating_add(1);
         let max_attempts = retry_limit.saturating_add(1) as usize;
@@ -187,11 +207,9 @@ impl DeterministicToolFailureTracker {
             .and_then(serde_json::Value::as_str)
             .unwrap_or(result);
         Some(DeterministicToolFailure {
-            summary: format!(
-                "{tool_name} 使用相同参数连续失败 {max_attempts} 次，已停止重复执行。"
-            ),
+            summary: format!("{tool_name} 连续失败 {max_attempts} 次，已停止重复执行。"),
             detail: format!(
-                "工具：{tool_name}\n错误码：{error_code}\n访问模式：{access_profile}\n原因：{error}\n相同参数和错误重复出现，继续调用不会改变结果；请修正参数、启动依赖服务或由用户调整访问模式后恢复任务。"
+                "工具：{tool_name}\n错误码：{error_code}\n访问模式：{access_profile}\n原因：{error}\n失败预算已用尽；MCP 需先通过同一服务的只读工具取得新的成功观察，其他工具需修正原因。改变无效引用不能重开预算。"
             ),
         })
     }
@@ -545,8 +563,8 @@ fn model_visible_text_tool_result(result: &str, status: ExecutionResultStatus) -
     }
 }
 
-/// 大目录保留可调用身份与准入事实，不能把 JSON 截成首尾预览。
-/// 完整 schema 已由原始回执加载到下一步 tools；这里与历史重建共用，
+/// 大目录保留可调用身份、准入事实和 MCP 初始化说明，不能把 JSON 截成首尾预览。
+/// 完整 MCP schema 由当前 live tools 面提供；这里与历史重建共用，
 /// 不改变 canonical 回执，也不建立另一份工具注册表。
 fn model_visible_tool_catalog(catalog: &Value) -> String {
     const LISTS: [&str; 8] = [
@@ -565,7 +583,7 @@ fn model_visible_tool_catalog(catalog: &Value) -> String {
         "current_access_profile": catalog["current_access_profile"],
         "summary": catalog["summary"],
         "model_projection": "catalog_metadata",
-        "schema_delivery": "Callable schemas marked schema_included=true are supplied in the next request's tools definitions. Use the exact model_tool_name; do not invent a prefix. For other tools, request include_external=true, include_schema=true and exact tool_names.",
+        "schema_delivery": "All current MCP schemas are supplied in this request's tools definitions. Use the exact model_tool_name; do not invent a prefix. Plugin schemas are supplied after an explicit discovery request.",
     });
     for list in LISTS {
         let Some(items) = catalog[list].as_array() else {
@@ -595,6 +613,7 @@ fn model_visible_tool_catalog(catalog: &Value) -> String {
                         "reason_code",
                         "model_available",
                         "schema_included",
+                        "instructions",
                         "read_only",
                         "model_call_scope",
                         "policy_summary",
