@@ -131,6 +131,7 @@ ui/…                       视图页面与静态资源，按需
 | `browser` | surface ID | 浏览器 surface，见第 5 节 |
 | `pluginManagement` | `install`／`lifecycle`／`compatibility`／`background` | 在线安装（完成即启用）／启停和卸载／修改精确版本豁免／页面请求完成后继续后台管理；各目标分别声明，豁免不能绕过 Magi 能力检查 |
 | `composer` | `["images"]` | 由插件原生页面把用户选择的图片加入当前会话输入框草稿；只能移除本插件页面自己接纳的图片或聚焦输入框，不会自动发送 |
+| `sessionRead` | `["events"]` | 允许声明 `session.item` 钩子，接收已到终态的会话条目（用户消息、助手文本、系统提示的有界正文，以及工具调用的名称与是否失败）；不含思考内容、工具参数与结果，不授予写入能力 |
 | `sessionRead` | `["directory"]` | 读取全部用户会话的标题、身份、项目归属与创建/更新时间；不含消息、路径或凭据，不授予任何会话写入能力 |
 
 `permissions` 里列出的每一项都在安装预览中展示，确认安装即获得全部声明；运行时的准入按已安装包的清单声明核对，没有单独的授权步骤。
@@ -335,6 +336,7 @@ await api.on('tool.call', async (event, ctx) => {
 | --- | --- | --- | --- |
 | `session.created` / `session.deleted` | observe | 脱敏的领域事件 | — |
 | `turn.accepted` / `turn.end` | observe | 接纳或终态事实，不含完整正文 | — |
+| `session.item` | observe | 终态的会话条目，需 `sessionRead:["events"]`；字段与去重规则见扩展协议第 6 节 | — |
 | `input` | guard | `{ raw: { text, imageCount }, kind, requestId }` | 只能继续或阻止 |
 | `prompt.contribute` | advise | `{ target, phase, round, budget }` | `{ fragments: [{ id, stability, priority?, text }] }` |
 | `context.assemble` | advise | `{ sessionId, contextWindowTokens, rewritable: { from, to }, messages, omitted }` | `{ rewrites: [{ from, to, replacement: [{ role, text }] }] }` |

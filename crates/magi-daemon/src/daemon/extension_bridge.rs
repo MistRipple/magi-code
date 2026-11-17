@@ -470,6 +470,9 @@ pub(super) fn spawn_event_forwarder(bus: Arc<ExtensionBus>, events: Arc<InMemory
                     if let Some((hook, payload)) = project_event(&event, &mut ended) {
                         bus.notify(hook, payload);
                     }
+                    if let Some(payload) = project_session_item(&event) {
+                        bus.notify("session.item", payload);
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::warn!(skipped, "扩展事件转发落后，部分观察事件已丢失");
@@ -502,6 +505,63 @@ impl EndedTurns {
 fn first_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
+}
+
+/// `session.item` 单条正文的字符上限；超出时截断并标记，需要完整内容的插件读取会话快照。
+const SESSION_ITEM_TEXT_CHARS: usize = 4096;
+
+/// 把一个已到终态的 canonical item 投影给 `session.item` 观察钩子。
+///
+/// 只转发“已提交的事实”：非终态、增量帧（不带完整 item）都不转发。正文只给用户消息、
+/// 助手文本和系统提示，且有界；思考内容、工具参数与工具结果不转发（插件需要时经快照读取）。
+/// 同一 item 可能因资源事实更新被再次发布，插件按 `(itemId, itemVersion)` 去重；
+/// 事件总线是广播通道，落后会丢事件，需要权威事实时读取快照。
+fn project_session_item(event: &EventEnvelope) -> Option<Value> {
+    use magi_session_store::{CanonicalTurnItem, CanonicalTurnItemKind};
+    if event.event_type != "session.turn.item" {
+        return None;
+    }
+    let item: CanonicalTurnItem =
+        serde_json::from_value(event.payload.get("canonical_item")?.clone()).ok()?;
+    if !item.status.is_terminal() {
+        return None;
+    }
+    let kind = serde_json::to_value(item.kind).ok()?;
+    let carries_text = matches!(
+        item.kind,
+        CanonicalTurnItemKind::UserMessage
+            | CanonicalTurnItemKind::AssistantText
+            | CanonicalTurnItemKind::SystemNotice
+    );
+    let (text, truncated) = match item.content.as_deref().filter(|_| carries_text) {
+        Some(content) => {
+            let mut chars = content.chars();
+            let head: String = chars.by_ref().take(SESSION_ITEM_TEXT_CHARS).collect();
+            (Some(head), chars.next().is_some())
+        }
+        None => (None, false),
+    };
+    Some(json!({
+        "sessionId": event.session_id.as_ref().map(ToString::to_string),
+        "workspaceId": event.workspace_id.as_ref().map(ToString::to_string),
+        "turnId": item.turn_id,
+        "turnSeq": item.turn_seq,
+        "itemId": item.item_id,
+        "itemSeq": item.item_seq,
+        "itemVersion": item.item_version,
+        "kind": kind,
+        "status": serde_json::to_value(item.status).ok()?,
+        "threadId": item.source_thread_id.to_string(),
+        "createdAt": item.created_at.0,
+        "updatedAt": item.updated_at.0,
+        "text": text,
+        "textTruncated": truncated,
+        "tool": item.tool.as_ref().map(|tool| json!({
+            "callId": tool.call_id,
+            "name": tool.name,
+            "failed": tool.error.is_some(),
+        })),
+    }))
 }
 
 fn project_event(event: &EventEnvelope, ended: &mut EndedTurns) -> Option<(&'static str, Value)> {
@@ -753,6 +813,91 @@ mod tests {
         )
     }
 
+    fn item_event(kind: &str, status: &str, content: &str, extra: Value) -> EventEnvelope {
+        let mut item = json!({
+            "sessionId": "s1", "turnId": "t1", "turnSeq": 3, "itemId": "i1", "itemSeq": 0,
+            "kind": kind, "createdAt": 10, "status": status, "itemVersion": 2, "updatedAt": 20,
+            "content": content, "sourceThreadId": "th1",
+        });
+        for (key, value) in extra.as_object().into_iter().flatten() {
+            item[key] = value.clone();
+        }
+        domain("session.turn.item", "s1", json!({"canonical_item": item}))
+    }
+
+    #[test]
+    fn session_items_are_projected_only_when_terminal_and_with_bounded_text() {
+        let done = project_session_item(&item_event(
+            "assistant_text",
+            "completed",
+            "你好",
+            json!({}),
+        ))
+        .expect("终态 item 必须投影");
+        assert_eq!(done["kind"], "assistant_text");
+        assert_eq!(done["status"], "completed");
+        assert_eq!(done["text"], "你好");
+        assert_eq!(done["textTruncated"], false);
+        assert_eq!(
+            (
+                done["turnId"].clone(),
+                done["itemId"].clone(),
+                done["itemVersion"].clone()
+            ),
+            (json!("t1"), json!("i1"), json!(2))
+        );
+        assert_eq!(done["sessionId"], "s1");
+
+        // 非终态、增量帧（没有完整 item）、其他事件都不投影。
+        assert!(
+            project_session_item(&item_event("assistant_text", "running", "x", json!({})))
+                .is_none()
+        );
+        assert!(
+            project_session_item(&domain(
+                "session.turn.item",
+                "s1",
+                json!({"current_turn": {}})
+            ))
+            .is_none()
+        );
+        assert!(project_session_item(&domain("session.created", "s1", json!({}))).is_none());
+
+        // 正文有界，截断时明确标记；按字符而不是字节截断。
+        let long = "文".repeat(SESSION_ITEM_TEXT_CHARS + 5);
+        let cut = project_session_item(&item_event("user_message", "completed", &long, json!({})))
+            .unwrap();
+        assert_eq!(
+            cut["text"].as_str().unwrap().chars().count(),
+            SESSION_ITEM_TEXT_CHARS
+        );
+        assert_eq!(cut["textTruncated"], true);
+
+        // 思考内容、工具参数与结果不转发；工具只给调用身份与是否失败。
+        let thinking = project_session_item(&item_event(
+            "assistant_thinking",
+            "completed",
+            "内部推理",
+            json!({}),
+        ))
+        .unwrap();
+        assert!(thinking["text"].is_null());
+        assert!(!thinking.to_string().contains("内部推理"));
+        let tool = project_session_item(&item_event(
+            "tool_call",
+            "failed",
+            "输出",
+            json!({"tool": {"callId": "c1", "name": "shell_exec", "arguments": {"command": "秘密"}, "result": {"out": "秘密"}, "error": "boom"}}),
+        ))
+        .unwrap();
+        assert_eq!(
+            tool["tool"],
+            json!({"callId": "c1", "name": "shell_exec", "failed": true})
+        );
+        assert!(!tool.to_string().contains("秘密"));
+        assert!(tool["text"].is_null());
+    }
+
     #[test]
     fn domain_events_are_projected_to_bounded_observe_payloads() {
         let mut ended = EndedTurns::default();
@@ -868,6 +1013,11 @@ mod tests {
                 mode: HookMode::Observe,
                 deadline_ms: None,
             },
+            HookRegistration {
+                name: "session.item".into(),
+                mode: HookMode::Observe,
+                deadline_ms: None,
+            },
         ];
         let node = std::env::var_os("MAGI_EXTENSION_NODE")
             .map(std::path::PathBuf::from)
@@ -963,10 +1113,29 @@ mod tests {
             "s9",
             json!({"modelConfig": {"provider": "p", "model": "m1"}, "usage": {"inputTokens": 7, "outputTokens": 1}}),
         ));
+        events.publish(item_event(
+            "assistant_text",
+            "completed",
+            "真实正文",
+            json!({"itemId": "i9", "turnId": "t9"}),
+        ));
+        events.publish(item_event(
+            "tool_call",
+            "completed",
+            "不转发的输出",
+            json!({"itemId": "i10", "tool": {"callId": "c", "name": "shell_exec"}}),
+        ));
+        // 非终态的 item 不会到达扩展。
+        events.publish(item_event(
+            "assistant_text",
+            "running",
+            "未完成",
+            json!({"itemId": "i11"}),
+        ));
         let mut log = String::new();
         for _ in 0..60 {
             log = std::fs::read_to_string(&marker).unwrap_or_default();
-            if log.lines().count() >= 3 {
+            if log.lines().count() >= 5 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -980,6 +1149,15 @@ mod tests {
             "{log}"
         );
         assert!(lines.contains("usage:m1:7"), "{log}");
+        assert!(lines.contains("item:assistant_text:i9:真实正文:"), "{log}");
+        assert!(
+            lines.contains("item:tool_call:i10:null:shell_exec"),
+            "{log}"
+        );
+        assert!(
+            !log.contains("i11") && !log.contains("不转发的输出"),
+            "{log}"
+        );
         instance.stop().await;
     }
 

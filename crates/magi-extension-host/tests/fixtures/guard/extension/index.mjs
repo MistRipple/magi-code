@@ -33,6 +33,7 @@ export default async function activate(api) {
   await on('subagent.spawn', async (event) =>
     event.role === 'reviewer' ? { decision: 'block', reason: '禁止评审代理' } : { decision: 'continue' });
   await on('session.created', (event) => { note(`session.created:${event.sessionId}`); });
+  await on('session.item', (event) => { note(`item:${event.kind}:${event.itemId}:${event.text}:${event.tool?.name ?? ''}`); });
   await on('usage.update', (event) => { note(`usage:${event.model}:${event.inputTokens}`); });
   await on('context.assemble', async (event) => {
     const messages = event.messages;

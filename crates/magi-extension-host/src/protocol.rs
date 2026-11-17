@@ -242,6 +242,13 @@ pub const HOOKS: &[HookSpec] = &[
         patch_limit: 0,
     },
     HookSpec {
+        name: "session.item",
+        modes: OBSERVE,
+        wired: OBSERVE,
+        replace: false,
+        patch_limit: 0,
+    },
+    HookSpec {
         name: "turn.accepted",
         modes: OBSERVE,
         wired: OBSERVE,

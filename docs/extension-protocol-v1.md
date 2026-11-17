@@ -6,7 +6,7 @@
 
 【现状】SDK 2、传输协议 1.0、扩展 API 1.0。daemon 独立托管每插件一个 Node 进程；支持钩子、模型工具、用户命令、持久计划及反向服务。SDK 1／QuickJS、迁移 VM、工作流与会话引擎替换不提供。DSH 翻译功能按设计文档第 6.0 节的产品合同开发，当前能力与未完成项见第 11 节；pi 运行器后置；MCP 完整内置于 Magi，不经插件注册。
 
-【现状】下表列出的 15 个钩子名称均有实际接线。`input`／`subagent.spawn` 仅允许 guard，`model.request` 仅允许 observe；清单声明未接线模式时安装拒绝。不能把目录中未来可能支持的模式当作已交付合同。
+【现状】下表列出的 16 个钩子名称均有实际接线。`input`／`subagent.spawn` 仅允许 guard，`model.request` 仅允许 observe；清单声明未接线模式时安装拒绝。不能把目录中未来可能支持的模式当作已交付合同。
 
 【现状·已运行验证】macOS 真实 Node 集成、真实 daemon＋本地 HTTP 模型，以及 Electron Chromium 工作台回归已运行；Windows demo、Windows 实机和正式安装包验收后置。证据和未覆盖范围见[验证入口](validation.md)及设计文档第 12 节。
 
@@ -228,6 +228,7 @@ DSH 页面里的 `EventSource` 通过相同路由调用承载 SSE。兼容层保
 | --- | --- | --- |
 | `session.created/deleted` | observe | 提交后的脱敏领域事件 |
 | `turn.accepted/end` | observe | 接纳／终态事实；不含完整正文 |
+| `session.item` | observe | 一个 canonical item 到达终态后的提交事实，需 `sessionRead:["events"]`。字段：`sessionId`、`workspaceId`、`turnId`、`turnSeq`、`itemId`、`itemSeq`、`itemVersion`、`kind`（`user_message`／`assistant_text`／`assistant_thinking`／`tool_call`／`task_status`／`system_notice`）、`status`、`threadId`、`createdAt`、`updatedAt`、`text`、`textTruncated`、`tool:{callId,name,failed}`。`text` 只给用户消息、助手文本和系统提示，最多 4096 字符并标记截断；思考内容、工具参数与结果不转发，需要时读会话快照。非终态与增量帧不投递；同一 item 可能因资源事实更新再次投递，按 `(itemId,itemVersion)` 去重；事件总线落后会丢事件，需要权威事实读快照 |
 | `input` | guard | `{raw:{text,imageCount},kind,requestId}`；接纳事实前，幂等重放后；只能继续或阻止，replace 按失败阻止 |
 | `prompt.contribute` | advise | `{target,phase,round,budget}`；patch 为 `{fragments:[{id,stability,priority?,text}]}` |
 | `context.assemble` | advise | `{sessionId,contextWindowTokens,rewritable:{from,to},messages,omitted}`；patch 为 `{rewrites:[{from,to,replacement:[{role,text}]}]}` |
