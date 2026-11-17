@@ -148,6 +148,48 @@
   .settings-section {
     padding: 18px 0;
   }
+  /* Disclosure controls share one hit area, feedback and directional indicator. */
+  .settings-disclosure-trigger {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    min-inline-size: 0;
+    min-block-size: 32px;
+    padding: 4px 8px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground);
+    font: inherit;
+    text-align: start;
+    list-style: none;
+    cursor: pointer;
+    transition: background var(--transition-fast);
+  }
+  .settings-disclosure-trigger::-webkit-details-marker { display: none; }
+  .settings-disclosure-trigger:hover { background: var(--surface-hover); }
+  .settings-disclosure-trigger:active { background: var(--surface-3); }
+  .settings-disclosure-trigger:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+  }
+  .settings-disclosure-chevron {
+    display: inline-flex;
+    flex: 0 0 14px;
+    align-items: center;
+    justify-content: center;
+    color: var(--foreground-muted);
+    transition: transform var(--transition-fast);
+  }
+  [dir='rtl'] .settings-disclosure-chevron { transform: rotate(180deg); }
+  .settings-disclosure-trigger[aria-expanded='true'] > .settings-disclosure-chevron,
+  details[open] > .settings-disclosure-trigger > .settings-disclosure-chevron { transform: rotate(90deg); }
+  @media (pointer: coarse) {
+    .settings-disclosure-trigger { min-block-size: 44px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .settings-disclosure-trigger, .settings-disclosure-chevron { transition: none; }
+  }
   .settings-section-header {
     display: flex;
     justify-content: space-between;
@@ -189,6 +231,31 @@
     gap: var(--space-2);
     flex-wrap: wrap;
     justify-content: flex-end;
+  }
+
+  /* Tool directory refresh controls share one icon geometry. The surrounding
+     button can differ by context, but the glyph and header hit area do not. */
+  .tools-refresh-icon {
+    display: block;
+    inline-size: 16px;
+    block-size: 16px;
+    flex: 0 0 16px;
+  }
+  .tools-section-refresh {
+    inline-size: 28px;
+    block-size: 28px;
+  }
+  .tools-section-refresh-action {
+    min-block-size: 28px;
+  }
+  @media (pointer: coarse) {
+    .tools-section-refresh {
+      inline-size: 44px;
+      block-size: 44px;
+    }
+    .tools-section-refresh-action {
+      min-block-size: 44px;
+    }
   }
 
   .settings-hint {

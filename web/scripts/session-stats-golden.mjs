@@ -44,6 +44,16 @@ await withGoldenViteServer(async server => {
   assert.equal(all.tps, 50, 'TPS uses summed tokens / duration, not mean request speed');
   assert.equal(all.ttftMs, 500, 'TTFT uses number of measured streams');
   assert.equal(all.cache.tokenHitRate, .6, 'unobserved requests do not dilute cache rates');
+  {
+    const { aggregatePromptCacheStats } = await server.ssrLoadModule('/src/lib/usage-stats-aggregation.ts');
+    const steady = aggregatePromptCacheStats([
+      { cache: { observedCallCount: 4, hitCallCount: 3, inputTokens: 3300, readTokens: 2100, writeTokens: 0, steadyInputTokens: 2300, steadyReadTokens: 2100, tokenHitRate: null, requestHitRate: null } },
+      { cache: { observedCallCount: 2, hitCallCount: 1, inputTokens: 1100, readTokens: 500, writeTokens: 0, steadyInputTokens: 600, steadyReadTokens: 500, tokenHitRate: null, requestHitRate: null } },
+    ]);
+    assert.equal(steady.steadyTokenHitRate, 2600 / 2900, 'steady rate sums tokens before dividing');
+    assert.equal(aggregatePromptCacheStats([{}]).steadyTokenHitRate, null, 'missing steady fields stay unobserved');
+    assert.match(component, /input\.stats\.steadyRate/u, 'cache card shows the steady rate');
+  }
   assert.equal(all.cache.observedCallCount, 5);
   assert.equal(all.lastTps, 60);
   assert.equal(projectSessionStats(rows, 'worker').calls, 3);

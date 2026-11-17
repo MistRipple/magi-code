@@ -1,10 +1,9 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
   import Disclosure from './Disclosure.svelte';
+  import SettingsMcpToolsSection from './SettingsMcpToolsSection.svelte';
   import FileName from './FileName.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
-  import LoadingText from './LoadingText.svelte';
   import Toggle from './Toggle.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
   import { getAgentSkillDetail } from '../web/agent-api';
@@ -14,16 +13,19 @@
   import {
     getBuiltinToolFallbackLabel,
     getCapabilityDependencyFallbackLabel,
-    summarizeMcpServers,
   } from '../shared/tool-display';
 
   let {
     mcpServers,
     mcpServersHydrated,
     mcpServersLoading,
+    mcpServersError,
+    retryMcpServers,
     mcpExpandedServer,
     mcpServerTools,
     mcpRefreshingServers,
+    mcpToolErrors,
+    mcpChangingServers,
     builtinTools,
     builtinToolsLoading,
     capabilityDependencies,
@@ -54,9 +56,13 @@
     mcpServers: any[];
     mcpServersHydrated: boolean;
     mcpServersLoading: boolean;
+    mcpServersError: string;
+    retryMcpServers: () => void;
     mcpExpandedServer: string | null;
     mcpServerTools: Record<string, any[]>;
     mcpRefreshingServers: Set<string>;
+    mcpToolErrors: Record<string, string>;
+    mcpChangingServers: Set<string>;
     builtinToolsLoading: boolean;
     builtinTools: Array<{
       name: string;
@@ -363,19 +369,6 @@
       : 'settings.tools.builtin.localCapability');
   }
 
-  function getMCPServerSubtitle(server: any): string {
-    if (server?.enabled === false) {
-      return i18n.t('settings.tools.disabledLabel');
-    }
-    if (server?.health !== 'connected') {
-      return getMCPHealthLabel(server);
-    }
-    if (typeof server?.toolCount === 'number' && Number.isFinite(server.toolCount) && server.toolCount > 0) {
-      return i18n.t('settings.tools.mcpToolCount', { count: server.toolCount });
-    }
-    return getMCPHealthLabel(server);
-  }
-
   function getCapabilityDependencyLabel(name: string): string {
     switch (name) {
       case 'knowledge_store':
@@ -390,8 +383,6 @@
         return i18n.t('settings.tools.dependency.contextRuntime');
       case 'skill_runtime':
         return i18n.t('settings.tools.dependency.skillRuntime');
-      case 'mcp_servers':
-        return i18n.t('settings.tools.dependency.mcpServers');
       case 'image_generation_model':
         return i18n.t('settings.tools.dependency.imageGenerationModel');
       default:
@@ -447,8 +438,6 @@
         return 'brain';
       case 'skill_runtime':
         return 'skill';
-      case 'mcp_servers':
-        return 'plug';
       case 'image_generation_model':
         return 'sparkles';
       default:
@@ -479,21 +468,6 @@
       return i18n.t('settings.tools.dependency.skillCount', {
         skills: dependency.configuredCount,
         tools: dependency.toolCount,
-      });
-    }
-    if (
-      dependency.name === 'mcp_servers'
-      && typeof dependency.enabledCount === 'number'
-      && typeof dependency.readyCount === 'number'
-    ) {
-      return i18n.t('settings.tools.dependency.readyServerCount', {
-        ready: dependency.readyCount,
-        total: dependency.enabledCount,
-      });
-    }
-    if (dependency.name === 'mcp_servers' && typeof dependency.configuredCount === 'number') {
-      return i18n.t('settings.tools.dependency.configuredServerCount', {
-        count: dependency.configuredCount,
       });
     }
     return '';
@@ -549,7 +523,7 @@
     readyToolCount?: number | null;
     toolCount?: number | null;
   }): string {
-    const displayStatus = getCapabilityDependencyDisplayStatus(dependency);
+    const displayStatus = getCapabilityDependencyStatusLabel(dependency.status);
     const parts = [`${getCapabilityDependencyLabel(dependency.name)}: ${displayStatus}`];
     const metric = getCapabilityDependencyMetric(dependency);
     if (metric) parts.push(metric);
@@ -561,65 +535,9 @@
     return parts.join('\n');
   }
 
-  function getMCPOverviewSummary() {
-    return summarizeMcpServers(mcpServers, mcpServersHydrated, mcpServersLoading);
-  }
-
-  function getMCPOverviewStatusLabel(): string {
-    const summary = getMCPOverviewSummary();
-    switch (summary.kind) {
-      case 'checking':
-        return i18n.t('settings.tools.mcpHealthChecking');
-      case 'not_configured':
-        return i18n.t('settings.tools.mcpHealthNotConfigured');
-      case 'disabled':
-        return i18n.t('settings.tools.disabledLabel');
-      case 'connected':
-        return i18n.t('settings.tools.mcpHealthConnected');
-      case 'partial':
-        return i18n.t('settings.tools.mcpHealthPartial', {
-          connected: summary.connected,
-          total: summary.enabled,
-        });
-      case 'disconnected':
-        return i18n.t('settings.tools.mcpHealthDisconnected');
-    }
-  }
-
-  function getCapabilityDependencyDisplayStatus(dependency: { name: string; status: string }): string {
-    return dependency.name === 'mcp_servers'
-      ? getMCPOverviewStatusLabel()
-      : getCapabilityDependencyStatusLabel(dependency.status);
-  }
-
-  function getCapabilityDependencyDisplayClass(dependency: { name: string; status: string }): string {
-    if (dependency.name !== 'mcp_servers') {
-      return getCapabilityDependencyClass(dependency.status);
-    }
-    const summary = getMCPOverviewSummary();
-    switch (summary.kind) {
-      case 'disconnected':
-        return 'error';
-      case 'disabled':
-      case 'not_configured':
-        return 'disabled';
-      case 'connected':
-        return 'success';
-      default:
-        return 'warning';
-    }
-  }
-
-  function getMCPStatusTitle(server: any): string {
-    const status = getMCPHealthLabel(server);
-    if (typeof server?.errorDetail === 'string' && server.errorDetail.trim()) {
-      return `${status}\n${server.errorDetail.trim()}`;
-    }
-    return server.error
-      ? `${status}\n${i18n.t('settings.tools.mcpConnectionIssue')}`
-      : status;
-  }
-
+  const builtinCapabilityDependencies = $derived(
+    capabilityDependencies.filter(dependency => dependency.name !== 'mcp_servers'),
+  );
   let builtinExpanded = $state(false);
   const builtinToolGroups = $derived.by(() => {
     const groups = new Map<string, typeof builtinTools>();
@@ -646,144 +564,226 @@
     builtinExpanded = !builtinExpanded;
   }
 
-  // MCP 工具描述 hover 浮层：默认右侧弹出；按钮 + 浮层共同构成 hover 区域，移出即消失
-  const DESC_POPOVER_MAX_HEIGHT = 240;
-  const DESC_CLOSE_GRACE_MS = 120;
-  let descAnchor = $state<{ x: number; y: number; width: number; description: string } | null>(null);
-  let descTrigger: HTMLElement | null = null;
-  let closeTimer: ReturnType<typeof setTimeout> | null = null;
-
-  function clearCloseTimer() {
-    if (closeTimer !== null) {
-      clearTimeout(closeTimer);
-      closeTimer = null;
-    }
-  }
-
-  function scheduleClose() {
-    clearCloseTimer();
-    closeTimer = setTimeout(closeDesc, DESC_CLOSE_GRACE_MS);
-  }
-
-  function closeDesc() {
-    clearCloseTimer();
-    descTrigger = null;
-    descAnchor = null;
-  }
-
-  $effect(() => {
-    if (!descAnchor) return;
-    const trigger = descTrigger;
-    const scroll = (event: Event) => {
-      // The description itself remains scrollable; only moving its anchor closes it.
-      if (event.target instanceof Element && event.target.closest('.mcp-tool-desc-popover')) return;
-      closeDesc();
-    };
-    const keydown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') closeDesc();
-    };
-    const observer = new MutationObserver(() => {
-      if (!trigger?.isConnected || !trigger.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) closeDesc();
-    });
-    if (trigger) observer.observe(trigger.closest('.tools-manager') ?? trigger, {
-      subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'style', 'hidden', 'inert'],
-    });
-    window.addEventListener('scroll', scroll, true);
-    window.addEventListener('keydown', keydown, true);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener('scroll', scroll, true);
-      window.removeEventListener('keydown', keydown, true);
-    };
-  });
-  onDestroy(clearCloseTimer);
-
-  function openDesc(description: string, e: MouseEvent | FocusEvent) {
-    clearCloseTimer();
-    const btn = e.currentTarget as HTMLElement;
-    const rect = btn.getBoundingClientRect();
-    const gutter = 8;
-    const width = Math.min(480, Math.max(280, window.innerWidth * 0.3), window.innerWidth - gutter * 2);
-    // 默认按钮右侧弹出；右侧不够则回落到左侧
-    let left = rect.right + 8;
-    if (left + width + gutter > window.innerWidth) {
-      left = rect.left - width - 8;
-    }
-    if (left < gutter) left = gutter;
-    // 垂直对齐按钮中线，再按底部/顶部边界 clamp
-    const btnCenter = rect.top + rect.height / 2;
-    let top = btnCenter - DESC_POPOVER_MAX_HEIGHT / 2;
-    if (top + DESC_POPOVER_MAX_HEIGHT + gutter > window.innerHeight) {
-      top = window.innerHeight - DESC_POPOVER_MAX_HEIGHT - gutter;
-    }
-    if (top < gutter) top = gutter;
-    descTrigger = btn;
-    descAnchor = { x: left, y: top, width, description };
-  }
 </script>
-
-<svelte:window onresize={closeDesc} onblur={closeDesc} />
 
 <div class="apple-manager tools-manager">
   <div class="apple-scroller-proxy">
-        <!-- 内置工具 -->
-        <div class="settings-section tools-section builtin-section">
+        <SettingsMcpToolsSection servers={mcpServers} hydrated={mcpServersHydrated} loading={mcpServersLoading} listError={mcpServersError} retryServers={retryMcpServers}
+          expandedServer={mcpExpandedServer} tools={mcpServerTools} refreshing={mcpRefreshingServers}
+          errors={mcpToolErrors} changing={mcpChangingServers} openEditor={openMCPDialog}
+          toggleExpanded={toggleMCPExpand} healthLabel={getMCPHealthLabel} toggleServer={toggleMCPServer}
+          deleteServer={deleteMCPServer} refreshTools={refreshMCPTools} />
+
+        <!-- Skill 工具 -->
+        <div class="settings-section tools-section">
           <div class="settings-section-header">
             <div>
-              <div class="settings-section-title">
-                {i18n.t('settings.tools.builtinTools')}
-                <span class="builtin-count-tag">{i18n.t('settings.tools.builtinCount', { ready: builtinReadyCount, total: builtinToolGroups.length })}</span>
-              </div>
+              <div class="settings-section-title">{i18n.t('settings.tools.skillsTools')}</div>
 
             </div>
             <div class="settings-section-actions">
+              <button class="btn btn--secondary btn--sm tools-section-refresh-action" onclick={() => checkSkillUpdates()} disabled={skillUpdatesChecking}>
+                {#if skillUpdatesChecking}<Icon name="loader" size={16} class="tools-refresh-icon spinning" />{:else}<Icon name="refresh" size={16} class="tools-refresh-icon" />{/if}
+                <span>{skillUpdatesChecking ? i18n.t('settings.tools.checkingSkillUpdates') : i18n.t('settings.tools.checkSkillUpdates')}</span>
+              </button>
+              {#if skillUpdateAvailableCount > 0}
+                <button class="btn btn--secondary btn--sm" onclick={() => updateAllSkills()} disabled={skillUpdatesChecking}>
+                  <Icon name="download" size={14} />
+                  <span>{i18n.t('settings.tools.updateAllSkills', { count: skillUpdateAvailableCount })}</span>
+                </button>
+              {/if}
+              <button class="btn btn--secondary btn--sm" onclick={() => openRepoDialog()}>
+                <Icon name="grid" size={14} />
+                <span>{i18n.t('settings.tools.manageRepos')}</span>
+              </button>
+              <button class="btn btn--primary btn--sm" onclick={() => openSkillLibraryDialog()}>
+                <Icon name="plus" size={14} />
+                <span>{i18n.t('settings.tools.installSkill')}</span>
+              </button>
+            </div>
+          </div>
+          <div class="tools-fixed-panel tools-fixed-panel--skills">
+            {#if skills.length === 0}
+              <div class="settings-empty">
+                <Icon name="tools" size={16} />
+                <div><div class="settings-empty-title">{i18n.t('settings.tools.noSkills')}</div>{i18n.t('settings.tools.noSkillsHint')}</div>
+              </div>
+            {:else}
+              <div class="skill-list">
+              {#each skills as skill (skill.skillId)}
+                <div class="skill-item">
+                <div class="skill-row" class:disabled={skill.source !== 'custom' && skill.enabled === false}>
+                  <button type="button" class="settings-disclosure-trigger skill-primary"
+                    aria-expanded={skillExpandedId === skill.skillId} aria-controls={`skill-detail-${skill.skillId}`}
+                    onclick={() => toggleSkillDetail(skill.skillId)}>
+                  <span class="settings-disclosure-chevron"><Icon name="chevron-right" size={14} /></span>
+                  <span class="skill-avatar">
+                    <Icon name={skill.origin === 'local' ? 'folder' : 'tools'} size={13} />
+                  </span>
+                  <span class="skill-main">
+                    <span class="skill-title-line">
+                      <span class="skill-name" title={skill.name}>{skill.name}</span>
+                      <span class="skill-source-tag">{getSkillSourceLabel(skill)}</span>
+                      {#if skill.source !== 'custom' && skill.enabled === false}
+                        <span class="skill-status-tag disabled">{i18n.t('settings.tools.disabledLabel')}</span>
+                      {:else if skill.source !== 'custom'}
+                        <span class="skill-status-tag {getSkillStatusClass(skill)}">{getSkillStatusLabel(skill)}</span>
+                      {/if}
+                    </span>
+                    <span class="skill-desc" title={skill.description}>{skill.description || i18n.t('settings.tools.skillNoDescription')}</span>
+                    {#if skill.source !== 'custom'}
+                      <span class="skill-meta">
+                        <span>{i18n.t('settings.tools.skillVersion', { version: skill.version || i18n.t('common.notProvided') })}</span>
+                        {#if skill.repositoryName}<span title={skill.repositoryName}>{skill.repositoryName}</span>{/if}
+                        <span>{skill.lastCheckedAt
+                          ? i18n.t('settings.tools.skillCheckedAt', { time: formatSkillCheckedAt(skill.lastCheckedAt) })
+                          : i18n.t('settings.tools.skillNeverChecked')}</span>
+                      </span>
+                    {/if}
+                  </span>
+                  </button>
+                  <div class="skill-row-actions">
+                    {#if skill.source !== 'custom'}
+                      <Toggle
+                        checked={skill.enabled !== false}
+                        ariaLabel={skill.name}
+                        disabled={skillTogglingIds.has(skill.skillId)}
+                        title={skill.enabled !== false ? i18n.t('settings.tools.clickToDisable') : i18n.t('settings.tools.clickToEnable')}
+                        onchange={(enabled) => toggleSkill(skill.skillId, enabled)}
+                      />
+                    {/if}
+                    {#if skill.source !== 'custom' && !skill.builtin && (skill.updateAvailable || skill.updateStatus === 'local_modified')}
+                      <button class="skill-action-btn primary" onclick={() => updateSkill(skill.skillId)} disabled={skillUpdatingIds.has(skill.skillId)}>
+                        <Icon name="refresh" size={13} />
+                        <span>{skill.origin === 'local' ? i18n.t('settings.tools.reloadSkill') : i18n.t('settings.tools.updateSkill')}</span>
+                      </button>
+                    {/if}
+                    {#if skill.rollbackAvailable}
+                      <button class="skill-action-btn" onclick={() => rollbackSkill(skill.skillId)} disabled={skillUpdatingIds.has(skill.skillId)} title={i18n.t('settings.tools.rollbackSkill')}>
+                        <Icon name="refresh" size={13} />
+                      </button>
+                    {/if}
+                    {#if skill.builtin}
+                      <span class="skill-builtin-badge" data-skill-builtin="1" title={i18n.t('settings.tools.builtinSkillHint')}>{i18n.t('settings.tools.builtinSkill')}</span>
+                    {:else}
+                      <button class="skill-action-btn danger" title={i18n.t('settings.tools.delete')} onclick={() => deleteSkill(skill)}>
+                        <Icon name="trash" size={13} />
+                      </button>
+                    {/if}
+                    {#if skillUpdatingIds.has(skill.skillId)}
+                      <span class="skill-row-progress"><Icon name="refresh" size={13} /></span>
+                    {/if}
+                  </div>
+                </div>
+
+                <Disclosure expanded={skillExpandedId === skill.skillId}>
+                  {@const state = skillDetails[skill.skillId]}
+                  <div class="skill-detail" id={`skill-detail-${skill.skillId}`}>
+                    {#if !state || state.status === 'loading'}
+                      <div class="skill-detail-note"><Icon name="loader" size={16} class="spinning" />{i18n.t('settings.tools.loading')}</div>
+                    {:else if state.status === 'error'}
+                      <div class="skill-detail-note skill-detail-note--error" role="alert">{state.message}</div>
+                    {:else}
+                      {@const parts = splitSkillInstruction(state.detail.instruction)}
+                      <div class="skill-detail-head">
+                        <div class="skill-detail-title">
+                          <span class="skill-detail-file">{state.detail.instructionFile}</span>
+                          <span class="skill-detail-size">{formatSkillFileSize(state.detail.instructionBytes)}</span>
+                        </div>
+                        <div class="skill-detail-tabs" role="tablist">
+                          <button type="button" role="tab" class="skill-detail-tab" class:active={!skillRawView[skill.skillId]} aria-selected={!skillRawView[skill.skillId]} onclick={() => (skillRawView[skill.skillId] = false)}>{i18n.t('settings.tools.skillDetailRendered')}</button>
+                          <button type="button" role="tab" class="skill-detail-tab" class:active={Boolean(skillRawView[skill.skillId])} aria-selected={Boolean(skillRawView[skill.skillId])} onclick={() => (skillRawView[skill.skillId] = true)}>{i18n.t('settings.tools.skillDetailRaw')}</button>
+                        </div>
+                      </div>
+                      {#if parts.meta.length > 0 && !skillRawView[skill.skillId]}
+                        <dl class="skill-detail-meta">
+                          {#each parts.meta as item (item.key)}
+                            <dt>{item.key}</dt>
+                            <dd title={item.value}>{item.value}</dd>
+                          {/each}
+                        </dl>
+                      {/if}
+                      <div class="skill-detail-body">
+                        {#if skillRawView[skill.skillId]}
+                          <pre class="skill-detail-raw">{state.detail.instruction}</pre>
+                        {:else}
+                          <MarkdownContent content={parts.body} isStreaming={false} />
+                        {/if}
+                      </div>
+                      {#if state.detail.truncated}
+                        <div class="skill-detail-note">{i18n.t('settings.tools.skillDetailTruncated')}</div>
+                      {/if}
+                      {#if state.detail.files.length > 0}
+                        <div class="skill-detail-files">
+                          <div class="skill-detail-files-title">{i18n.t('settings.tools.skillDetailFiles', { count: state.detail.files.length })}</div>
+                          <ul>
+                            {#each state.detail.files as file (file.path)}
+                              <li><code title={file.path}><FileName name={file.path} /></code><span>{formatSkillFileSize(file.size)}</span></li>
+                            {/each}
+                          </ul>
+                        </div>
+                      {/if}
+                    {/if}
+                  </div>
+                </Disclosure>
+                </div>
+              {/each}
+              </div>
+            {/if}
+          </div>
+        </div>
+        <!-- 内置工具 -->
+        <div class="settings-section tools-section builtin-section">
+          <div class="settings-section-header">
+            <button type="button" class="settings-disclosure-trigger builtin-disclosure-toggle"
+              onclick={toggleBuiltinExpanded} aria-expanded={builtinExpanded} aria-controls="builtin-tool-directory">
+              <span class="settings-disclosure-chevron"><Icon name="chevron-right" size={14} /></span>
+              <span class="settings-section-title">
+                {i18n.t('settings.tools.builtinTools')}
+                <span class="builtin-count-tag">{i18n.t('settings.tools.builtinCount', { ready: builtinReadyCount, total: builtinToolGroups.length })}</span>
+              </span>
+              <span class="builtin-disclosure-hint">{builtinExpanded ? i18n.t('settings.tools.collapse') : i18n.t('settings.tools.expand')}</span>
+            </button>
+            <div class="settings-section-actions">
               <button
                 type="button"
-                class="btn-icon btn-icon--sm"
+                class="btn-icon tools-section-refresh"
                 class:refreshing={builtinToolsLoading}
                 title={i18n.t('settings.tools.refreshBuiltinTools')}
                 aria-label={i18n.t('settings.tools.refreshBuiltinTools')}
                 onclick={() => refreshBuiltinToolCatalog()}
                 disabled={builtinToolsLoading}
               >
-                <Icon name="refresh" size={13} />
-              </button>
-              <button
-                type="button"
-                class="btn btn--secondary btn--sm"
-                onclick={toggleBuiltinExpanded}
-                aria-expanded={builtinExpanded}
-              >
-                <span>{builtinExpanded ? i18n.t('settings.tools.collapse') : i18n.t('settings.tools.expand')}</span>
-                <span class="builtin-expand-icon" class:expanded={builtinExpanded}><Icon name="chevronDown" size={12} /></span>
+                <Icon name="refresh" size={16} class="tools-refresh-icon" />
               </button>
             </div>
           </div>
-          {#if capabilityDependencies.length > 0}
+          {#if builtinCapabilityDependencies.length > 0}
             <div class="capability-dependency-strip" aria-label={i18n.t('settings.tools.capabilityDependencySummary')}>
-              {#each capabilityDependencies as dependency (dependency.name)}
+              {#each builtinCapabilityDependencies as dependency (dependency.name)}
                 <span
-                  class={`capability-dependency-chip capability-dependency-chip--${getCapabilityDependencyDisplayClass(dependency)}`}
+                  class={`capability-dependency-chip capability-dependency-chip--${getCapabilityDependencyClass(dependency.status)}`}
                   title={getCapabilityDependencyTitle(dependency)}
                 >
                   <Icon name={getCapabilityDependencyIcon(dependency.name)} size={11} />
                   <span>{getCapabilityDependencyLabel(dependency.name)}</span>
                   <span class="capability-dependency-status">
-                    {getCapabilityDependencyDisplayStatus(dependency)}
+                    {getCapabilityDependencyStatusLabel(dependency.status)}
                   </span>
                 </span>
               {/each}
             </div>
           {/if}
           <Disclosure expanded={builtinExpanded}>
-            <div class="tools-fixed-panel tools-fixed-panel--builtin builtin-tool-panel">
+            <div class="tools-fixed-panel tools-fixed-panel--builtin builtin-tool-panel" id="builtin-tool-directory">
               {#if builtinTools.length === 0}
                 <div class="settings-empty"><span>{i18n.t('settings.tools.noBuiltinTools')}</span></div>
               {:else}
                 <div class="builtin-category-list">
                   {#each builtinToolGroups as group (group.category)}
                     <details class="builtin-category-group">
-                      <summary class="builtin-category-summary">
+                      <summary class="settings-disclosure-trigger builtin-category-summary">
+                        <span class="settings-disclosure-chevron"><Icon name="chevron-right" size={14} /></span>
                         <div class="avatar-squircle builtin-tool-avatar" style="background: rgba(var(--primary-rgb, 0, 122, 255), 0.12); color: var(--primary);">
                           <Icon name={getBuiltinCategoryIcon(group.category)} size={13} />
                         </div>
@@ -796,7 +796,6 @@
                             {i18n.t('settings.tools.builtinCategoryReadyCount', { ready: group.readyCount, total: group.tools.length })}
                           </span>
                           <span class={`apple-indicator ${group.readyCount === group.tools.length ? 'success' : group.readyCount > 0 ? 'warning' : 'error'}`}></span>
-                          <Icon name="chevronDown" size={12} />
                         </div>
                       </summary>
                       <div class="builtin-tool-list">
@@ -856,14 +855,14 @@
             <div class="settings-section-actions">
               <button
                 type="button"
-                class="btn-icon btn-icon--sm"
+                class="btn-icon tools-section-refresh"
                 class:refreshing={commandEnvironmentLoading}
                 title={i18n.t('settings.tools.refreshCommandEnvironment')}
                 aria-label={i18n.t('settings.tools.refreshCommandEnvironment')}
                 onclick={() => refreshCommandEnvironment()}
                 disabled={commandEnvironmentLoading}
               >
-                <Icon name="refresh" size={13} />
+                <Icon name="refresh" size={16} class="tools-refresh-icon" />
               </button>
             </div>
           </div>
@@ -890,329 +889,8 @@
           </div>
         </div>
 
-        <!-- MCP 工具 -->
-        <div class="settings-section tools-section">
-          <div class="settings-section-header">
-            <div>
-              <div class="settings-section-title">{i18n.t('settings.tools.mcpTools')}</div>
-
-            </div>
-            <div class="settings-section-actions">
-              <button class="btn btn--primary btn--sm" onclick={() => openMCPDialog(null)}>
-                <Icon name="plus" size={14} />
-                <span>{i18n.t('settings.tools.addServer')}</span>
-              </button>
-            </div>
-          </div>
-          <div class="tools-fixed-panel tools-fixed-panel--mcp">
-            {#if mcpServersLoading && !mcpServersHydrated}
-              <div class="settings-empty">
-                <Icon name="loader" size={16} class="spinning" />
-                <div><div class="settings-empty-title">{i18n.t('settings.tools.loading')}</div>{i18n.t('settings.tools.mcpLoadingHint')}</div>
-              </div>
-            {:else if mcpServers.length === 0}
-              <div class="settings-empty">
-                <Icon name="plug" size={16} />
-                <div><div class="settings-empty-title">{i18n.t('settings.tools.noMcpServer')}</div>{i18n.t('settings.tools.noMcpServerHint')}</div>
-              </div>
-            {:else}
-              <div class="mcp-server-list">
-              {#each mcpServers as server (server.id)}
-                <div class="mcp-server-item" class:expanded={mcpExpandedServer === server.id}>
-                  <div class="mcp-server-row">
-                    <button
-                      type="button"
-                      class="mcp-server-primary"
-                      onclick={() => toggleMCPExpand(server.id)}
-                      aria-expanded={mcpExpandedServer === server.id}
-                    >
-                      <span class="avatar-squircle mcp-server-avatar">
-                        <Icon name="plug" size={13} />
-                      </span>
-                      <span class="mcp-server-identity">
-                        <span class="mcp-server-name" title={server.name}>{server.name}</span>
-                        <span class="mcp-server-subtitle" title={getMCPStatusTitle(server)}>{getMCPServerSubtitle(server)}</span>
-                      </span>
-                    </button>
-                    <div class="mcp-server-actions">
-                      <span
-                        class="mcp-server-health"
-                        title={getMCPStatusTitle(server)}
-                      >
-                        <span
-                          class="apple-indicator"
-                          class:success={server.health === 'connected'}
-                          class:warning={server.health === 'degraded' || (server.enabled !== false && server.health === 'disconnected' && !server.error)}
-                          class:disabled={server.health === 'disabled' || server.enabled === false}
-                          class:error={server.enabled !== false && (Boolean(server.error) || !server.health)}
-                        ></span>
-                      </span>
-                      <Toggle
-                        checked={server.enabled}
-                        ariaLabel={server.name}
-                        title={server.enabled ? i18n.t('settings.tools.clickToDisable') : i18n.t('settings.tools.clickToEnable')}
-                        onchange={() => toggleMCPServer(server.id, server.enabled)}
-                      />
-                      <button class="btn-icon btn-icon--sm" title={i18n.t('settings.tools.edit')} onclick={() => openMCPDialog(server)}>
-                        <Icon name="edit" size={13} />
-                      </button>
-                      <button class="btn-icon btn-icon--sm btn-icon--danger" title={i18n.t('settings.tools.delete')} onclick={() => deleteMCPServer(server.id)}>
-                        <Icon name="trash" size={13} />
-                      </button>
-                      <button
-                        type="button"
-                        class="btn-icon btn-icon--sm mcp-expand-button"
-                        title={i18n.t('settings.tools.toolList')}
-                        onclick={() => toggleMCPExpand(server.id)}
-                        aria-expanded={mcpExpandedServer === server.id}
-                      >
-                        <span class="mcp-expand-icon" class:expanded={mcpExpandedServer === server.id}>
-                          <Icon name="chevronDown" size={14} />
-                        </span>
-                      </button>
-                    </div>
-                  </div>
-
-                  <Disclosure expanded={mcpExpandedServer === server.id}>
-                    <div class="mcp-tools-popover" data-magi-surface="popover">
-                      <div class="mcp-tools-header">
-                        <div class="mcp-tools-heading">
-                          <span>{i18n.t('settings.tools.toolList')}</span>
-                          <span class="mcp-tools-count">{mcpServerTools[server.id]?.length ?? '—'}</span>
-                        </div>
-                        <button class="btn-icon btn-icon--sm" class:refreshing={mcpRefreshingServers.has(server.id)} title={i18n.t('settings.tools.refreshTools')}
-                          onclick={() => refreshMCPTools(server.id)} disabled={mcpRefreshingServers.has(server.id)}>
-                          <Icon name="refresh" size={12} />
-                        </button>
-                      </div>
-                      <div class="mcp-tools-list">
-                        {#if server.errorDetail}
-                          <div class="mcp-connection-diagnostic" role="alert">
-                            <span>{i18n.t('settings.tools.mcpConnectionDetail')}</span>
-                            <code>{server.errorDetail}</code>
-                          </div>
-                        {/if}
-                        {#if mcpRefreshingServers.has(server.id)}
-                          <div class="mcp-tools-empty"><LoadingText text={i18n.t('settings.tools.loading')} size={13} /></div>
-                        {:else if mcpServerTools[server.id] && mcpServerTools[server.id].length > 0}
-                          {#each mcpServerTools[server.id] as tool}
-                            <div class="mcp-tool-item">
-                              <div class="mcp-tool-row">
-                                <div class="mcp-tool-identity">
-                                  <div class="mcp-tool-name" title={tool.name}>{tool.name}</div>
-                                  {#if tool.description}
-                                    <div class="mcp-tool-description" title={tool.description}>{tool.description}</div>
-                                  {/if}
-                                </div>
-                                {#if tool.description}
-                                  <button
-                                    class="mcp-tool-desc-btn"
-                                    aria-label={i18n.t('settings.tools.viewDesc')}
-                                    onmouseenter={(e) => openDesc(tool.description, e)}
-                                    onmouseleave={scheduleClose}
-                                    onfocus={(e) => openDesc(tool.description, e)}
-                                    onblur={scheduleClose}
-                                  >
-                                    <Icon name="info" size={12} />
-                                  </button>
-                                {/if}
-                              </div>
-                            </div>
-                          {/each}
-                        {:else}
-                          <div class="mcp-tools-empty">{i18n.t('settings.tools.noToolsHint')}</div>
-                        {/if}
-                      </div>
-                    </div>
-                  </Disclosure>
-                </div>
-              {/each}
-              </div>
-            {/if}
-          </div>
-        </div>
-
-        <!-- Skill 工具 -->
-        <div class="settings-section tools-section">
-          <div class="settings-section-header">
-            <div>
-              <div class="settings-section-title">{i18n.t('settings.tools.skillsTools')}</div>
-
-            </div>
-            <div class="settings-section-actions">
-              <button class="btn btn--secondary btn--sm" onclick={() => checkSkillUpdates()} disabled={skillUpdatesChecking}>
-                {#if skillUpdatesChecking}<Icon name="loader" size={14} class="spinning" />{:else}<Icon name="refresh" size={14} />{/if}
-                <span>{skillUpdatesChecking ? i18n.t('settings.tools.checkingSkillUpdates') : i18n.t('settings.tools.checkSkillUpdates')}</span>
-              </button>
-              {#if skillUpdateAvailableCount > 0}
-                <button class="btn btn--secondary btn--sm" onclick={() => updateAllSkills()} disabled={skillUpdatesChecking}>
-                  <Icon name="download" size={14} />
-                  <span>{i18n.t('settings.tools.updateAllSkills', { count: skillUpdateAvailableCount })}</span>
-                </button>
-              {/if}
-              <button class="btn btn--secondary btn--sm" onclick={() => openRepoDialog()}>
-                <Icon name="grid" size={14} />
-                <span>{i18n.t('settings.tools.manageRepos')}</span>
-              </button>
-              <button class="btn btn--primary btn--sm" onclick={() => openSkillLibraryDialog()}>
-                <Icon name="plus" size={14} />
-                <span>{i18n.t('settings.tools.installSkill')}</span>
-              </button>
-            </div>
-          </div>
-          <div class="tools-fixed-panel tools-fixed-panel--skills">
-            {#if skills.length === 0}
-              <div class="settings-empty">
-                <Icon name="tools" size={16} />
-                <div><div class="settings-empty-title">{i18n.t('settings.tools.noSkills')}</div>{i18n.t('settings.tools.noSkillsHint')}</div>
-              </div>
-            {:else}
-              <div class="skill-list">
-              {#each skills as skill (skill.skillId)}
-                <div class="skill-item">
-                <div class="skill-row" class:disabled={skill.source !== 'custom' && skill.enabled === false}>
-                  <div class="skill-avatar">
-                    <Icon name={skill.origin === 'local' ? 'folder' : 'tools'} size={13} />
-                  </div>
-                  <div class="skill-main">
-                    <div class="skill-title-line">
-                      <span class="skill-name" title={skill.name}>{skill.name}</span>
-                      <span class="skill-source-tag">{getSkillSourceLabel(skill)}</span>
-                      {#if skill.source !== 'custom' && skill.enabled === false}
-                        <span class="skill-status-tag disabled">{i18n.t('settings.tools.disabledLabel')}</span>
-                      {:else if skill.source !== 'custom'}
-                        <span class="skill-status-tag {getSkillStatusClass(skill)}">{getSkillStatusLabel(skill)}</span>
-                      {/if}
-                    </div>
-                    <p class="skill-desc" title={skill.description}>{skill.description || i18n.t('settings.tools.skillNoDescription')}</p>
-                    {#if skill.source !== 'custom'}
-                      <div class="skill-meta">
-                        <span>{i18n.t('settings.tools.skillVersion', { version: skill.version || i18n.t('common.notProvided') })}</span>
-                        {#if skill.repositoryName}<span title={skill.repositoryName}>{skill.repositoryName}</span>{/if}
-                        <span>{skill.lastCheckedAt
-                          ? i18n.t('settings.tools.skillCheckedAt', { time: formatSkillCheckedAt(skill.lastCheckedAt) })
-                          : i18n.t('settings.tools.skillNeverChecked')}</span>
-                      </div>
-                    {/if}
-                  </div>
-                  <div class="skill-row-actions">
-                    {#if skill.source !== 'custom'}
-                      <Toggle
-                        checked={skill.enabled !== false}
-                        ariaLabel={skill.name}
-                        disabled={skillTogglingIds.has(skill.skillId)}
-                        title={skill.enabled !== false ? i18n.t('settings.tools.clickToDisable') : i18n.t('settings.tools.clickToEnable')}
-                        onchange={(enabled) => toggleSkill(skill.skillId, enabled)}
-                      />
-                    {/if}
-                    {#if skill.source !== 'custom' && !skill.builtin && (skill.updateAvailable || skill.updateStatus === 'local_modified')}
-                      <button class="skill-action-btn primary" onclick={() => updateSkill(skill.skillId)} disabled={skillUpdatingIds.has(skill.skillId)}>
-                        <Icon name="refresh" size={13} />
-                        <span>{skill.origin === 'local' ? i18n.t('settings.tools.reloadSkill') : i18n.t('settings.tools.updateSkill')}</span>
-                      </button>
-                    {/if}
-                    {#if skill.rollbackAvailable}
-                      <button class="skill-action-btn" onclick={() => rollbackSkill(skill.skillId)} disabled={skillUpdatingIds.has(skill.skillId)} title={i18n.t('settings.tools.rollbackSkill')}>
-                        <Icon name="refresh" size={13} />
-                      </button>
-                    {/if}
-                    {#if skill.builtin}
-                      <span class="skill-builtin-badge" data-skill-builtin="1" title={i18n.t('settings.tools.builtinSkillHint')}>{i18n.t('settings.tools.builtinSkill')}</span>
-                    {:else}
-                      <button class="skill-action-btn danger" title={i18n.t('settings.tools.delete')} onclick={() => deleteSkill(skill)}>
-                        <Icon name="trash" size={13} />
-                      </button>
-                    {/if}
-                    {#if skillUpdatingIds.has(skill.skillId)}
-                      <span class="skill-row-progress"><Icon name="refresh" size={13} /></span>
-                    {/if}
-                    <button
-                      type="button"
-                      class="btn-icon btn-icon--sm mcp-expand-button skill-detail-toggle"
-                      title={i18n.t('settings.tools.skillDetail')}
-                      aria-label={i18n.t('settings.tools.skillDetail')}
-                      aria-expanded={skillExpandedId === skill.skillId}
-                      onclick={() => toggleSkillDetail(skill.skillId)}
-                    >
-                      <span class="mcp-expand-icon" class:expanded={skillExpandedId === skill.skillId}>
-                        <Icon name="chevronDown" size={14} />
-                      </span>
-                    </button>
-                  </div>
-                </div>
-
-                <Disclosure expanded={skillExpandedId === skill.skillId}>
-                  {@const state = skillDetails[skill.skillId]}
-                  <div class="skill-detail">
-                    {#if !state || state.status === 'loading'}
-                      <div class="skill-detail-note"><LoadingText text={i18n.t('settings.tools.loading')} size={13} /></div>
-                    {:else if state.status === 'error'}
-                      <div class="skill-detail-note skill-detail-note--error" role="alert">{state.message}</div>
-                    {:else}
-                      {@const parts = splitSkillInstruction(state.detail.instruction)}
-                      <div class="skill-detail-head">
-                        <div class="skill-detail-title">
-                          <span class="skill-detail-file">{state.detail.instructionFile}</span>
-                          <span class="skill-detail-size">{formatSkillFileSize(state.detail.instructionBytes)}</span>
-                        </div>
-                        <div class="skill-detail-tabs" role="tablist">
-                          <button type="button" role="tab" class="skill-detail-tab" class:active={!skillRawView[skill.skillId]} aria-selected={!skillRawView[skill.skillId]} onclick={() => (skillRawView[skill.skillId] = false)}>{i18n.t('settings.tools.skillDetailRendered')}</button>
-                          <button type="button" role="tab" class="skill-detail-tab" class:active={Boolean(skillRawView[skill.skillId])} aria-selected={Boolean(skillRawView[skill.skillId])} onclick={() => (skillRawView[skill.skillId] = true)}>{i18n.t('settings.tools.skillDetailRaw')}</button>
-                        </div>
-                      </div>
-                      {#if parts.meta.length > 0 && !skillRawView[skill.skillId]}
-                        <dl class="skill-detail-meta">
-                          {#each parts.meta as item (item.key)}
-                            <dt>{item.key}</dt>
-                            <dd title={item.value}>{item.value}</dd>
-                          {/each}
-                        </dl>
-                      {/if}
-                      <div class="skill-detail-body">
-                        {#if skillRawView[skill.skillId]}
-                          <pre class="skill-detail-raw">{state.detail.instruction}</pre>
-                        {:else}
-                          <MarkdownContent content={parts.body} isStreaming={false} />
-                        {/if}
-                      </div>
-                      {#if state.detail.truncated}
-                        <div class="skill-detail-note">{i18n.t('settings.tools.skillDetailTruncated')}</div>
-                      {/if}
-                      {#if state.detail.files.length > 0}
-                        <div class="skill-detail-files">
-                          <div class="skill-detail-files-title">{i18n.t('settings.tools.skillDetailFiles', { count: state.detail.files.length })}</div>
-                          <ul>
-                            {#each state.detail.files as file (file.path)}
-                              <li><code title={file.path}><FileName name={file.path} /></code><span>{formatSkillFileSize(file.size)}</span></li>
-                            {/each}
-                          </ul>
-                        </div>
-                      {/if}
-                    {/if}
-                  </div>
-                </Disclosure>
-                </div>
-              {/each}
-              </div>
-            {/if}
-          </div>
-        </div>
     </div>
 </div>
-
-{#if descAnchor}
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div
-    class="mcp-tool-desc-popover"
-    data-magi-surface="popover"
-    style="top: {descAnchor.y}px; left: {descAnchor.x}px; width: {descAnchor.width}px;"
-    role="tooltip"
-    onmouseenter={clearCloseTimer}
-    onmouseleave={scheduleClose}
-  >
-    {descAnchor.description}
-  </div>
-{/if}
 
 <style>
   .tools-manager {
@@ -1223,8 +901,6 @@
     container-type: inline-size;
     container-name: tools-tab;
   }
-
-
 
   .tools-section {
     display: flex;
@@ -1249,15 +925,6 @@
   .tools-fixed-panel .apple-grid {
     min-height: 0;
   }
-
-
-
-
-
-
-
-
-
 
   .builtin-count-tag {
     margin-left: 8px;
@@ -1318,19 +985,8 @@
     opacity: 0.78;
   }
 
-
-  .builtin-expand-icon {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    margin-left: 10px;
-    transition: transform 0.2s cubic-bezier(0.3, 0, 0.2, 1);
-    color: var(--foreground-muted);
-  }
-
-  .builtin-expand-icon.expanded {
-    transform: rotate(180deg);
-  }
+  .builtin-disclosure-toggle { flex: 1; flex-wrap: wrap; }
+  .builtin-disclosure-hint { color: var(--foreground-muted); font-size: var(--text-xs); }
 
   .command-environment-panel {
     width: 100%;
@@ -1339,7 +995,6 @@
     border: var(--magi-hairline) solid var(--border);
     border-radius: 10px;
   }
-
 
   .command-environment-list {
     display: flex;
@@ -1383,7 +1038,6 @@
     font-size: var(--text-xs);
   }
 
-
   .builtin-category-list {
     display: flex;
     flex-direction: column;
@@ -1404,36 +1058,11 @@
 
   .builtin-category-summary {
     display: grid;
-    grid-template-columns: 28px minmax(0, 1fr) auto;
+    grid-template-columns: 14px 28px minmax(0, 1fr) auto;
     align-items: center;
     gap: 9px;
     min-height: 52px;
     padding: 7px 10px;
-    cursor: pointer;
-    list-style: none;
-    transition: background 0.15s ease;
-  }
-
-  .builtin-category-summary::-webkit-details-marker {
-    display: none;
-  }
-
-  .builtin-category-summary:hover,
-  .builtin-category-group[open] > .builtin-category-summary {
-    background: rgba(var(--foreground-rgb), 0.04);
-  }
-
-  .builtin-category-summary:focus-visible {
-    outline: 1px solid color-mix(in srgb, var(--primary) 58%, transparent);
-    outline-offset: -2px;
-  }
-
-  .builtin-category-summary > .builtin-tool-badges > :global(svg) {
-    transition: transform 0.16s ease;
-  }
-
-  .builtin-category-group[open] > .builtin-category-summary > .builtin-tool-badges > :global(svg) {
-    transform: rotate(180deg);
   }
 
   .builtin-category-group > .builtin-tool-list {
@@ -1582,369 +1211,6 @@
     }
   }
 
-  .mcp-tools-popover {
-    position: absolute;
-    top: calc(100% + 5px);
-    right: 8px;
-    left: 34px;
-    background: var(--background);
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: 9px;
-    box-shadow: var(--shadow-lg);
-    z-index: var(--z-popover);
-    padding: 0;
-    box-sizing: border-box;
-    display: flex;
-    flex-direction: column;
-    animation: mcp-tools-popover-in 0.14s ease-out;
-  }
-
-  .mcp-tools-popover::before {
-    position: absolute;
-    top: -5px;
-    right: 10px;
-    width: 8px;
-    height: 8px;
-    border-top: var(--magi-hairline) solid var(--border);
-    border-left: var(--magi-hairline) solid var(--border);
-    background: var(--background);
-    content: '';
-    transform: rotate(45deg);
-  }
-
-  @keyframes mcp-tools-popover-in {
-    from {
-      opacity: 0;
-      transform: translateY(-3px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
-  }
-
-  .mcp-server-list {
-    width: 100%;
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: 10px;
-  }
-
-  .mcp-server-item {
-    position: relative;
-    z-index: 1;
-  }
-
-  .mcp-server-item + .mcp-server-item {
-    border-top: var(--magi-hairline) solid var(--border);
-  }
-
-  .mcp-server-item.expanded {
-    z-index: 100;
-  }
-
-  .mcp-server-row {
-    display: flex;
-    align-items: center;
-    min-height: 54px;
-    padding: 7px 8px 7px 10px;
-    transition: background 0.15s ease;
-  }
-
-  .mcp-server-item:first-child .mcp-server-row {
-    border-radius: 9px 9px 0 0;
-  }
-
-  .mcp-server-item:last-child .mcp-server-row {
-    border-radius: 0 0 9px 9px;
-  }
-
-  .mcp-server-item:only-child .mcp-server-row {
-    border-radius: 9px;
-  }
-
-  .mcp-server-row:hover {
-    background: rgba(var(--foreground-rgb), 0.045);
-  }
-
-  .mcp-server-primary {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    flex: 1 1 auto;
-    min-width: 0;
-    padding: 0;
-    border: 0;
-    background: transparent;
-    color: inherit;
-    cursor: pointer;
-    font: inherit;
-    text-align: left;
-  }
-
-  .mcp-server-primary:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--primary) 58%, transparent);
-    outline-offset: 3px;
-    border-radius: 6px;
-  }
-
-  .mcp-server-avatar {
-    flex: 0 0 auto;
-    background: rgba(var(--primary-rgb, 0, 122, 255), 0.13);
-    color: var(--primary);
-  }
-
-  .mcp-server-identity {
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    gap: 1px;
-    min-width: 0;
-  }
-
-  .mcp-server-name {
-    overflow: hidden;
-    color: var(--foreground);
-    font-size: 13px;
-    font-weight: calc(var(--font-semibold) + 50);
-    line-height: 1.3;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .mcp-server-subtitle {
-    overflow: hidden;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    line-height: 1.3;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .mcp-server-actions {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    flex: 0 0 auto;
-    margin-left: 12px;
-  }
-
-  .mcp-server-health {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 18px;
-    height: 28px;
-  }
-
-  .mcp-expand-button {
-    margin-left: 1px;
-  }
-
-  .mcp-tools-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    min-height: 36px;
-    padding: 5px 8px 5px 11px;
-    border-bottom: var(--magi-hairline) solid var(--border);
-  }
-
-  .mcp-tools-heading {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    color: var(--foreground);
-    font-size: var(--text-xs);
-    font-weight: var(--font-semibold);
-  }
-
-  .mcp-tools-count {
-    min-width: 18px;
-    padding: 1px 5px;
-    border-radius: 999px;
-    background: rgba(var(--foreground-rgb), 0.07);
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    font-weight: var(--font-semibold);
-    line-height: 16px;
-    text-align: center;
-  }
-
-  .avatar-squircle {
-    width: 24px;
-    height: 24px;
-    border-radius: 7px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .mcp-expand-icon {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    transition: transform 0.25s cubic-bezier(0.3, 0, 0.2, 1);
-  }
-
-  .mcp-expand-icon.expanded {
-    transform: rotate(180deg);
-  }
-
-  @container tools-tab (max-width: 640px) {
-    .mcp-server-row {
-      min-height: 52px;
-      padding-left: 8px;
-      padding-right: 6px;
-    }
-
-    .mcp-server-actions {
-      gap: 2px;
-      margin-left: 8px;
-    }
-
-    .mcp-server-health {
-      width: 14px;
-    }
-
-    .mcp-server-avatar {
-      width: 22px;
-      height: 22px;
-    }
-
-    .mcp-tools-popover {
-      right: 5px;
-      left: 5px;
-    }
-  }
-
-  .mcp-tools-list {
-    display: flex;
-    flex-direction: column;
-    padding: 5px;
-  }
-
-  .mcp-connection-diagnostic {
-    padding: 8px;
-    border-bottom: var(--magi-hairline) solid color-mix(in srgb, var(--error, #d33) 24%, transparent);
-    color: var(--error, #d33);
-    font-size: var(--text-xs);
-    line-height: 1.45;
-  }
-
-  .mcp-connection-diagnostic span {
-    display: block;
-    margin-bottom: 4px;
-    font-weight: var(--font-semibold);
-  }
-
-  .mcp-connection-diagnostic code {
-    display: block;
-    max-height: 120px;
-    overflow: auto;
-    color: var(--foreground);
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    overflow-wrap: anywhere;
-    white-space: pre-wrap;
-  }
-
-  /* MCP 工具项样式 */
-  .mcp-tool-item {
-    position: relative;
-    padding: 7px 8px;
-    border-radius: 6px;
-    transition: background var(--transition-fast);
-  }
-  .mcp-tool-item:hover {
-    background: rgba(var(--foreground-rgb), 0.045);
-  }
-  .mcp-tool-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .mcp-tool-identity {
-    flex: 1;
-    min-width: 0;
-  }
-  .mcp-tool-name {
-    overflow: hidden;
-    color: var(--foreground);
-    font-size: var(--text-xs);
-    font-weight: var(--font-semibold);
-    line-height: 1.35;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .mcp-tool-description {
-    display: -webkit-box;
-    overflow: hidden;
-    margin-top: 2px;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    line-height: 1.35;
-    line-clamp: 1;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 1;
-  }
-  .mcp-tools-empty {
-    padding: 14px 10px;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    text-align: center;
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .mcp-tools-popover {
-      animation: none;
-    }
-  }
-
-  /* MCP 工具描述浮层气泡：fixed 定位，已在脚本中按视口边界 clamp */
-  .mcp-tool-desc-popover {
-    position: fixed;
-    max-width: calc(100vw - 16px);
-    max-height: min(240px, calc(100dvh - 16px));
-    overflow-y: auto;
-    padding: 10px 12px;
-    background: var(--background);
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: 8px;
-    box-shadow: var(--shadow-lg);
-    font-size: var(--text-xs);
-    line-height: 1.5;
-    color: var(--foreground);
-    z-index: calc(var(--z-popover) + 10);
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    box-sizing: border-box;
-  }
-
-  /* MCP 工具描述查看按钮 */
-  .mcp-tool-desc-btn {
-    width: 24px;
-    height: 24px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    background: transparent;
-    border: var(--magi-hairline) solid transparent;
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    color: var(--foreground-muted);
-    transition: all var(--transition-fast);
-    flex-shrink: 0;
-    opacity: 0.62;
-    transform: scale(0.9);
-  }
-  .mcp-tool-desc-btn:hover,
-  .mcp-tool-desc-btn:focus-visible {
-    background: var(--surface-hover);
-    border-color: var(--primary);
-    color: var(--foreground);
-    opacity: 1;
-  }
-
   /* Skill 卡片内部 */
   .skill-list {
     display: flex;
@@ -1955,7 +1221,7 @@
   }
   .skill-row {
     display: grid;
-    grid-template-columns: 30px minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
     gap: 10px;
     min-height: 64px;
@@ -1963,7 +1229,7 @@
   }
   .skill-item { border-bottom: var(--magi-hairline) solid var(--border); }
   .skill-item:last-child { border-bottom: 0; }
-  .skill-row:hover { background: rgba(var(--foreground-rgb), 0.025); }
+  .skill-primary { inline-size: 100%; }
   .skill-row.disabled .skill-avatar {
     background: var(--surface-3);
     color: var(--foreground-muted);
@@ -1971,7 +1237,7 @@
   .skill-row.disabled .skill-desc,
   .skill-row.disabled .skill-meta { opacity: 0.72; }
   .skill-avatar { width: 28px; height: 28px; border-radius: 7px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; background: rgba(var(--success-rgb, 52, 199, 89), 0.1); color: var(--success); }
-  .skill-main { min-width: 0; }
+  .skill-main { display: block; min-width: 0; flex: 1; }
   .skill-title-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
   .skill-name { max-width: 42%; font-size: 13px; font-weight: calc(var(--font-semibold) + 50); color: var(--foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .skill-source-tag, .skill-status-tag { font-size: var(--text-xs); line-height: 16px; padding: 0 6px; border-radius: 4px; white-space: nowrap; flex-shrink: 0; }
@@ -1981,7 +1247,7 @@
   .skill-status-tag.modified { color: var(--primary); background: rgba(var(--primary-rgb, 0, 122, 255), 0.1); }
   .skill-status-tag.error { color: var(--error); background: rgba(var(--error-rgb, 255, 59, 48), 0.1); }
   .skill-status-tag.disabled { color: var(--foreground-muted); background: var(--surface-3); }
-  .skill-desc { margin: 3px 0 0; font-size: var(--text-xs); color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .skill-desc { display: block; margin: 3px 0 0; font-size: var(--text-xs); color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .skill-meta { display: flex; gap: 10px; margin-top: 3px; min-width: 0; font-size: var(--text-xs); color: var(--foreground-muted); }
   .skill-meta span { min-width: 0; max-width: 38%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .skill-builtin-badge {
@@ -2048,12 +1314,13 @@
       width: 100%;
     }
     .skill-row {
-      grid-template-columns: 28px minmax(0, 1fr);
+      grid-template-columns: minmax(0, 1fr);
       align-items: start;
       padding: 10px;
     }
     .skill-row-actions {
-      grid-column: 2;
+      grid-column: 1;
+      padding-inline-start: 58px;
       justify-content: flex-start;
     }
     .skill-name { max-width: 55%; }
@@ -2062,7 +1329,5 @@
   }
 
   /* 空状态 */
-
-
 
 </style>

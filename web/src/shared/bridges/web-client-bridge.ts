@@ -23,6 +23,7 @@ import {
 } from '../../web/agent-binding-context';
 import { PLUGIN_REGISTRY_CHANGED_EVENT } from '../../web/plugin-api';
 import { i18n } from '../../stores/i18n.svelte';
+import { isAccessProfile, type AccessProfile } from '../access-profile';
 import { DEFAULT_LOCALE, isSupportedLocale } from '../../i18n/locales';
 import type { SessionTurnCommand, TurnStartParams } from '../app-server-protocol.generated';
 import { getTransport, initTransport } from '../transport';
@@ -4527,7 +4528,7 @@ async function interruptTask(): Promise<void> {
   }
 }
 
-async function continueSessionExecution(expectedSessionId?: string): Promise<void> {
+async function continueSessionExecution(expectedSessionId?: string, accessProfile?: AccessProfile): Promise<void> {
   const sessionId = currentSessionId.trim();
   if (!sessionId) {
     emitBridgeErrorToast(
@@ -4553,6 +4554,7 @@ async function continueSessionExecution(expectedSessionId?: string): Promise<voi
   const accepted = await executeTask({
     text: '继续',
     resume: true,
+    accessProfile,
     workspaceId: currentWorkspaceId,
     workspacePath: currentWorkspacePath,
     sessionId,
@@ -5610,7 +5612,10 @@ export function createWebClientBridge(): ClientBridge {
           void interruptTask();
           return;
         case 'continueTask':
-          void continueSessionExecution(typeof message.sessionId === 'string' ? message.sessionId : undefined);
+          void continueSessionExecution(
+            typeof message.sessionId === 'string' ? message.sessionId : undefined,
+            isAccessProfile(message.accessProfile) ? message.accessProfile : undefined,
+          );
           return;
         case 'renameSession':
           if (

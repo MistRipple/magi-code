@@ -2946,7 +2946,8 @@ export function setRetryRuntime(
   const session = sessionId?.trim();
   if (session) {
     const bySession = new Map(retryRuntimeState.bySessionId);
-    bySession.set(session, runtime);
+    // 记录归属的消息：消息结束时能连带清掉会话级投影，不依赖事件里恰好带会话 ID。
+    bySession.set(session, { ...runtime, messageId });
     retryRuntimeState.bySessionId = bySession;
   }
 }
@@ -2959,9 +2960,12 @@ export function clearRetryRuntime(messageId: string, sessionId?: string): void {
     retryRuntimeState.byMessageId = next;
   }
   const session = sessionId?.trim();
-  if (session && retryRuntimeState.bySessionId.has(session)) {
+  const owned = [...retryRuntimeState.bySessionId].filter(
+    ([key, value]) => key === session || value.messageId === messageId,
+  );
+  if (owned.length > 0) {
     const bySession = new Map(retryRuntimeState.bySessionId);
-    bySession.delete(session);
+    for (const [key] of owned) bySession.delete(key);
     retryRuntimeState.bySessionId = bySession;
   }
 }

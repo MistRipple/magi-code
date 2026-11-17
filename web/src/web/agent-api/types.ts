@@ -132,6 +132,10 @@ export interface PromptCacheStats {
   writeTokens: number;
   tokenHitRate: number | null;
   requestHitRate: number | null;
+  /** 不含每个统计范围内首个已观测调用（冷启动）的缓存读取 / 完整输入。 */
+  steadyInputTokens?: number;
+  steadyReadTokens?: number;
+  steadyTokenHitRate?: number | null;
 }
 
 export interface AgentExecutionStatsItem {

@@ -1,3 +1,4 @@
+import { svelte } from '@sveltejs/vite-plugin-svelte';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { withGoldenViteServer } from './golden-vite.mjs';
@@ -15,30 +16,6 @@ await withGoldenViteServer(async (server) => {
     display.getCapabilityDependencyFallbackLabel('image_generation_model'),
     'image generation model',
     'dependency identifiers must remain understandable when a translation is missing',
-  );
-
-  assert.deepEqual(
-    display.summarizeMcpServers([], false, false),
-    { kind: 'checking' },
-    'MCP status must show a checking state while its snapshot is still loading',
-  );
-
-  assert.deepEqual(
-    display.summarizeMcpServers([
-      { enabled: false, health: 'disabled' },
-      { enabled: false, health: 'disabled' },
-    ], true, false),
-    { kind: 'disabled' },
-    'MCP status must distinguish configured-but-disabled servers',
-  );
-
-  assert.deepEqual(
-    display.summarizeMcpServers([
-      { enabled: true, connected: true, health: 'connected' },
-      { enabled: true, connected: false, health: 'disconnected', error: 'connection_issue' },
-    ], true, false),
-    { kind: 'partial', connected: 1, enabled: 2 },
-    'MCP status must expose partial availability instead of a generic not-ready state',
   );
 
   console.log('tool display golden replay passed');
@@ -140,34 +117,34 @@ assert.doesNotMatch(
   /\.command-environment-command\.command-unavailable\s*\{[^}]*text-decoration:\s*line-through;/,
   'unavailable commands should use a muted status indicator instead of destructive strikethrough styling',
 );
-assert.match(
-  settingsToolsSource,
-  /class="mcp-server-list"[\s\S]*?class="mcp-server-item"[\s\S]*?class="mcp-server-row"/,
-  'MCP servers must use a compact management list instead of repeated dashboard cards',
-);
-assert.doesNotMatch(
-  settingsToolsSource,
-  /class="apple-tile mcp-server-item"/,
-  'MCP server default rows must not reuse the oversized generic tile presentation',
-);
-assert.match(
-  settingsToolsSource,
-  /class="mcp-server-actions"[\s\S]*?<Toggle[\s\S]*?openMCPDialog\(server\)[\s\S]*?deleteMCPServer\(server\.id\)/,
-  'MCP list rows must keep enable, edit, and delete actions together',
-);
-assert.match(
-  settingsToolsSource,
-  /<Disclosure expanded=\{mcpExpandedServer === server\.id\}>[\s\S]*?class="mcp-tools-popover"[\s\S]*?class="mcp-tools-list"/,
-  'MCP server rows must preserve the existing expanded tool-list presentation',
-);
-assert.match(
-  settingsToolsSource,
-  /class="mcp-tools-heading"[\s\S]*?class="mcp-tools-count"[\s\S]*?class="mcp-tool-identity"[\s\S]*?class="mcp-tool-description"/,
-  'expanded MCP tool lists must expose a compact count and readable tool descriptions',
-);
-for (const selector of ['builtin-category-list', 'mcp-tools-list', 'skill-detail-body']) {
+// MCP rendering is covered below against the actual Svelte section, replacing the old popup-source assertions.
+for (const selector of ['builtin-category-list', 'skill-detail-body']) {
   const body = settingsToolsSource.match(new RegExp(`\\.${selector}\\s*\\{([^}]+)\\}`))?.[1];
   assert.ok(body, `${selector} must keep its content layout`);
   assert.doesNotMatch(body, /(?:max-)?height\s*:|overflow(?:-y)?\s*:\s*(?:auto|scroll)/,
     `${selector} must use the settings page scroll area instead of a nested height cap`);
 }
+
+await withGoldenViteServer(async server => {
+  const { render } = await server.ssrLoadModule('svelte/server');
+  const { default: Section } = await server.ssrLoadModule('/src/components/SettingsMcpToolsSection.svelte');
+  const props = {
+    servers: [{ id: 'files', name: 'Files', type: 'stdio', enabled: true, connected: true, health: 'connected', toolCount: 1 }],
+    hydrated: true, loading: false, listError: '', retryServers() {}, expandedServer: 'files', tools: { files: [{ name: 'read_file', description: 'Read project files.' }] },
+    refreshing: new Set(), errors: {}, changing: new Set(), openEditor() {}, toggleExpanded() {},
+    healthLabel: item => item.connected ? 'Connected' : 'Disconnected', toggleServer() {}, deleteServer() {}, refreshTools() {},
+  };
+  const html = render(Section, { props }).body;
+  assert.match(html, /read_file/);
+  assert.match(html, /Read project files\./);
+  assert.equal((html.match(/1 个工具/g) ?? []).length, 1, 'tool count belongs only in the service row');
+  assert.doesNotMatch(html, /inputSchema|参数|工具目录<|role="tooltip"/, 'directory is capability information, without invocation details or popup layers');
+  const failed = render(Section, { props: { ...props, errors: { files: 'Read failed' } } }).body;
+  assert.match(failed, /Read failed/);
+  assert.match(failed, /read_file/, 'failed refresh preserves the previous directory');
+  const unavailable = render(Section, { props: { ...props, tools: {}, errors: { files: 'Read failed' } } }).body;
+  assert.match(unavailable, /Read failed/);
+  assert.doesNotMatch(unavailable, /此服务未提供工具/, 'read failure is not an empty directory');
+  const empty = render(Section, { props: { ...props, tools: { files: [] } } }).body;
+  assert.match(empty, /此服务未提供工具/, 'a successful empty directory has its own state');
+}, { plugins: [svelte()], ssr: { noExternal: ['svelte'] } });

@@ -1,6 +1,5 @@
 <script lang="ts">
   import { themeDisplayName, themeDisplayDescription } from '../appearance/labels';
-  import SelectField from './SelectField.svelte';
   import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
   import Modal from './Modal.svelte';
   import SettingsDetailPage from './SettingsDetailPage.svelte';
@@ -8,8 +7,6 @@
   import Icon from './Icon.svelte';
   import Toggle from './Toggle.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { LOCALES, isSupportedLocale } from '../i18n/locales';
-  import { switchLocale } from '../lib/locale-switch';
   import {
     activateAppearanceTheme,
     createAppearanceTheme,
@@ -336,20 +333,6 @@
 
 <div class="appearance-tab">
   <div class="settings-frame" hidden={editorOpen}>
-  <div class="settings-section">
-    <div class="settings-section-header">
-      <div>
-        <div class="settings-section-title">{i18n.t('settings.locale.label')}</div>
-
-      </div>
-      <div class="settings-section-actions">
-        <SelectField value={i18n.locale} label={i18n.t('settings.locale.label')}
-          options={LOCALES.map(locale => ({ value: locale.code, label: locale.nativeName }))}
-          onchange={(code) => { if (isSupportedLocale(code)) void switchLocale(code); }} />
-      </div>
-    </div>
-  </div>
-
   <div class="settings-section">
     <div class="settings-section-header">
       <div>

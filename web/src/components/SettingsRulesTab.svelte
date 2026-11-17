@@ -2,6 +2,9 @@
   import type { ConversationDisplayMode } from '../shared/settings-bootstrap';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
+  import SelectField from './SelectField.svelte';
+  import { LOCALES, isSupportedLocale } from '../i18n/locales';
+  import { switchLocale } from '../lib/locale-switch';
   import ConversationDisplayPreference from './ConversationDisplayPreference.svelte';
 
   let {
@@ -34,6 +37,17 @@
 
 <div class="apple-manager">
 <div class="apple-scroller-proxy">
+<div class="settings-section">
+  <div class="settings-section-header">
+    <div class="settings-section-title">{i18n.t('settings.locale.label')}</div>
+    <div class="settings-section-actions">
+      <SelectField value={i18n.locale} label={i18n.t('settings.locale.label')}
+        options={LOCALES.map(locale => ({ value: locale.code, label: locale.nativeName }))}
+        onchange={(code) => { if (isSupportedLocale(code)) void switchLocale(code); }} />
+    </div>
+  </div>
+</div>
+
 <ConversationDisplayPreference
   mode={conversationDisplayMode}
   saveStatus={conversationDisplaySaveStatus}

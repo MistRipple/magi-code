@@ -68,6 +68,8 @@ export interface RetryRuntimeState {
   maxAttempts: number;
   delayMs?: number;
   nextRetryAt?: number;
+  /** 会话级投影记录它属于哪条消息，消息结束时一并清除。 */
+  messageId?: string;
 }
 
 // 消息类型 - 与协议层 MessageType 完全对齐

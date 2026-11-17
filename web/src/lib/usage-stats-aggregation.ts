@@ -1,14 +1,18 @@
 import type { PromptCacheStats } from '../web/agent-api';
 
 export function aggregatePromptCacheStats(items: { cache?: PromptCacheStats }[]): PromptCacheStats {
-  const sum = (field: 'observedCallCount' | 'hitCallCount' | 'inputTokens' | 'readTokens' | 'writeTokens') =>
+  const sum = (field: 'observedCallCount' | 'hitCallCount' | 'inputTokens' | 'readTokens' | 'writeTokens' | 'steadyInputTokens' | 'steadyReadTokens') =>
     items.reduce((total, item) => total + (item.cache?.[field] ?? 0), 0);
   const observedCallCount = sum('observedCallCount');
   const hitCallCount = sum('hitCallCount');
   const inputTokens = sum('inputTokens');
   const readTokens = sum('readTokens');
+  const steadyInputTokens = sum('steadyInputTokens');
+  const steadyReadTokens = sum('steadyReadTokens');
   return {
     observedCallCount, hitCallCount, inputTokens, readTokens,
+    steadyInputTokens, steadyReadTokens,
+    steadyTokenHitRate: steadyInputTokens > 0 ? steadyReadTokens / steadyInputTokens : null,
     writeTokens: sum('writeTokens'),
     tokenHitRate: inputTokens > 0 ? readTokens / inputTokens : null,
     requestHitRate: observedCallCount > 0 ? hitCallCount / observedCallCount : null,

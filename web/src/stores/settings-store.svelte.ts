@@ -907,6 +907,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   let mcpServers = $state<MCPServer[]>([]);
   let mcpServersHydrated = $state(true);
   let mcpServersLoading = $state(false);
+  let mcpServersError = $state("");
   let settingsBootstrapBindingGeneration = 0;
   let settingsBootstrapRequestSeq = 0;
   let fullSettingsBootstrapRequestSeq = 0;
@@ -920,6 +921,11 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   let currentEditingMCPServer = $state<MCPServer | null>(null);
   let mcpRefreshingServers = $state<Set<string>>(new Set()); // 正在刷新工具的服务器 ID
   let mcpConnectingServers = $state<Set<string>>(new Set());
+  let mcpToolErrors = $state<Record<string, string>>({});
+  let mcpChangingServers = $state<Set<string>>(new Set());
+  // View requests and cached directories are scoped to the accepted connection configuration.
+  const mcpToolRequests = new Map<string, object>();
+  const mcpConnectionRequests = new Map<string, object>();
 
   // Skills 完整结构（内置工具已迁移到 ToolManager，不再通过 Skills 配置）
   let skills = $state<SkillItem[]>([]);
@@ -1524,6 +1530,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       : 0;
     if (hydratesMcpState) {
       mcpServersLoading = true;
+      mcpServersError = '';
     }
     try {
       const payload = await fetchCurrentSettingsBootstrap({ bootstrapScope: scope });
@@ -1546,10 +1553,8 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
         return;
       }
       console.error("[SettingsPanel] 加载设置数据失败:", e);
-      notifySettingsError(
-        i18n.t("settings.toast.action.loadSettingsData"),
-        e,
-      );
+      if (hydratesMcpState) mcpServersError = directIncidentError(e, i18n.t('settings.tools.mcpServersFailed'));
+      else notifySettingsError(i18n.t("settings.toast.action.loadSettingsData"), e);
     } finally {
       if (hydratesMcpState && fullRequestSeq === fullSettingsBootstrapRequestSeq) {
         mcpServersLoading = false;
@@ -2651,10 +2656,14 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     saveStatus = { ...saveStatus };
     try {
       if (mcpDialogIsEdit && currentEditingMCPServer) {
-        await updateAgentMcpServer(currentEditingMCPServer.id, {
-          ...normalizedServers[0],
-          id: currentEditingMCPServer.id,
-        });
+        const serverId = currentEditingMCPServer.id;
+        await updateAgentMcpServer(serverId, { ...normalizedServers[0], id: serverId });
+        invalidateMcpDirectory(serverId);
+        // The daemon acknowledged this configuration; old connection diagnostics no longer apply.
+        mcpServers = mcpServers.map(server => server.id === serverId ? {
+          ...normalizedServers[0], id: serverId, connected: false,
+          health: normalizedServers[0].enabled ? 'disconnected' : 'disabled',
+        } : server);
       } else {
         for (const serverData of normalizedServers) {
           await addAgentMcpServer(serverData);
@@ -2665,8 +2674,8 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
         if (payload) {
           applyMcpServersPayload(payload.mcpServers);
         }
-      } catch (_) {
-        /* 忽略刷新失败 */
+      } catch (error) {
+        mcpServersError = directIncidentError(error, i18n.t('settings.tools.mcpServersFailed'));
       }
       saveStatus.mcp = "saved";
       saveStatus = { ...saveStatus };
@@ -2685,23 +2694,30 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   }
 
   async function deleteMCPServer(serverId: string) {
-    await confirmThen(
-      i18n.t("settings.tools.deleteMcpServer"),
-      i18n.t("settings.tools.deleteMcpServerConfirm"),
-      async () => {
-        try {
-          await deleteAgentMcpServer(serverId);
-          const payload = await fetchCurrentSettingsBootstrap();
-          if (payload) {
-            applyMcpServersPayload(payload.mcpServers);
+    if (mcpChangingServers.has(serverId)) return;
+    mcpChangingServers = new Set([...mcpChangingServers, serverId]);
+    try {
+      await confirmThen(
+        i18n.t("settings.tools.deleteMcpServer"),
+        i18n.t("settings.tools.deleteMcpServerConfirm"),
+        async () => {
+          try {
+            await deleteAgentMcpServer(serverId);
+            invalidateMcpDirectory(serverId);
+            mcpServers = mcpServers.filter(server => server.id !== serverId);
+            if (mcpExpandedServer === serverId) mcpExpandedServer = null;
+            await requestSettingsBootstrap(true, 'full');
+            notifySettingsSuccess(i18n.t("settings.toast.mcpServerDeleted"));
+          } catch (error) {
+            notifySettingsError(i18n.t("settings.toast.action.deleteMcpServer"), error);
           }
-          notifySettingsSuccess(i18n.t("settings.toast.mcpServerDeleted"));
-        } catch (e) {
-          console.error("[SettingsPanel] 删除 MCP 服务器失败:", e);
-          notifySettingsError(i18n.t("settings.toast.action.deleteMcpServer"), e);
-        }
-      },
-    );
+        },
+      );
+    } finally {
+      const next = new Set(mcpChangingServers);
+      next.delete(serverId);
+      mcpChangingServers = next;
+    }
   }
 
   /** MCP 写入只提交配置字段；连接状态等运行态投影不属于设置 schema。 */
@@ -2719,124 +2735,129 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   }
 
   async function toggleMCPServer(serverId: string, enabled: boolean) {
-    const server = mcpServers.find((s) => s.id === serverId);
-    if (server) {
-      try {
-        await updateAgentMcpServer(serverId, { ...mcpServerConfigPayload(server), enabled: !enabled });
-        const payload = await fetchCurrentSettingsBootstrap();
-        if (payload) {
-          applyMcpServersPayload(payload.mcpServers);
-        }
-        notifySettingsSuccess(i18n.t("settings.toast.mcpServerStatusUpdated"));
-      } catch (e) {
-        console.error("[SettingsPanel] 切换 MCP 服务器状态失败:", e);
-        notifySettingsError(i18n.t("settings.toast.action.toggleMcpServer"), e);
-      }
+    const server = mcpServers.find(item => item.id === serverId);
+    if (!server || mcpChangingServers.has(serverId)) return;
+    mcpChangingServers = new Set([...mcpChangingServers, serverId]);
+    try {
+      await updateAgentMcpServer(serverId, { ...mcpServerConfigPayload(server), enabled: !enabled });
+      invalidateMcpDirectory(serverId, true);
+      mcpServers = mcpServers.map(current => current.id === serverId ? {
+        ...current, enabled: !enabled, connected: false, health: enabled ? 'disabled' : 'disconnected',
+        error: undefined, errorDetail: undefined,
+      } : current);
+      const payload = await fetchCurrentSettingsBootstrap();
+      if (payload) applyMcpServersPayload(payload.mcpServers);
+    } catch (error) {
+      mcpExpandedServer = serverId;
+      mcpToolErrors = { ...mcpToolErrors, [serverId]: directIncidentError(error, i18n.t('settings.tools.mcpDirectoryFailed')) };
+    } finally {
+      const next = new Set(mcpChangingServers);
+      next.delete(serverId);
+      mcpChangingServers = next;
+    }
+    if (!enabled) await connectEnabledMcpServers(serverId);
+  }
+
+  function mcpConnectionSignature(server: MCPServer): string {
+    const { enabled: _enabled, name: _name, ...connection } = mcpServerConfigPayload(server);
+    return JSON.stringify(connection);
+  }
+
+  function invalidateMcpDirectory(serverId: string, keepDirectory = false): void {
+    mcpToolRequests.delete(serverId);
+    mcpConnectionRequests.delete(serverId);
+    const connecting = new Set(mcpConnectingServers);
+    connecting.delete(serverId);
+    mcpConnectingServers = connecting;
+    const refreshing = new Set(mcpRefreshingServers);
+    refreshing.delete(serverId);
+    mcpRefreshingServers = refreshing;
+    const errors = { ...mcpToolErrors };
+    delete errors[serverId];
+    mcpToolErrors = errors;
+    if (!keepDirectory) {
+      const directories = { ...mcpServerTools };
+      delete directories[serverId];
+      mcpServerTools = directories;
     }
   }
 
   async function toggleMCPExpand(serverId: string) {
     if (mcpExpandedServer === serverId) {
       mcpExpandedServer = null;
-    } else {
-      mcpExpandedServer = serverId;
-      // 加载工具列表（如果尚未加载）
-      if (!mcpServerTools[serverId]) {
-        mcpRefreshingServers = new Set([...mcpRefreshingServers, serverId]);
-        try {
-          const result = await getAgentMcpServerTools(serverId);
-          const tools = ensureArray<any>((result as any)?.tools);
-          const loaded = applyMcpToolsResult(serverId, result, tools);
-          if ((result as any)?.servers) {
-            applyMcpServersPayload((result as any).servers);
-          }
-          if (loaded) {
-            notifySettingsSuccess(i18n.t("settings.toast.mcpToolListLoaded"));
-          }
-        } catch (e) {
-          console.error("[SettingsPanel] 获取 MCP 工具列表失败:", e);
-          notifySettingsError(
-            i18n.t("settings.toast.action.loadMcpToolList"),
-            e,
-          );
-        }
-        const newSet = new Set(mcpRefreshingServers);
-        newSet.delete(serverId);
-        mcpRefreshingServers = newSet;
-      }
+      return;
+    }
+    mcpExpandedServer = serverId;
+    if (mcpServerTools[serverId] === undefined && !mcpToolErrors[serverId]) {
+      await loadMcpDirectory(serverId, false);
     }
   }
 
   async function refreshMCPTools(serverId: string) {
+    // Failures need a durable local place even when refresh starts from a collapsed row.
+    mcpExpandedServer = serverId;
+    await loadMcpDirectory(serverId, true);
+  }
+
+  async function loadMcpDirectory(serverId: string, refresh: boolean): Promise<void> {
+    const server = mcpServers.find(item => item.id === serverId);
+    if (!server?.enabled || mcpRefreshingServers.has(serverId) || mcpChangingServers.has(serverId)) return;
+    const signature = mcpConnectionSignature(server);
+    mcpConnectionRequests.delete(serverId);
+    const connecting = new Set(mcpConnectingServers);
+    connecting.delete(serverId);
+    mcpConnectingServers = connecting;
+    const request = {};
+    mcpToolRequests.set(serverId, request);
     mcpRefreshingServers = new Set([...mcpRefreshingServers, serverId]);
+    const isCurrent = () => mcpToolRequests.get(serverId) === request
+      && mcpServers.some(current => current.id === serverId && current.enabled && mcpConnectionSignature(current) === signature);
     try {
-      const result = await refreshAgentMcpTools(serverId);
-      const tools = ensureArray<any>((result as any)?.tools);
-      const refreshed = applyMcpToolsResult(serverId, result, tools);
-      if ((result as any)?.servers) {
-        applyMcpServersPayload((result as any).servers);
+      const result = await (refresh ? refreshAgentMcpTools(serverId) : getAgentMcpServerTools(serverId));
+      if (!isCurrent()) return;
+      applyMcpToolsResult(serverId, result, ensureArray<any>(result.tools));
+    } catch (error) {
+      if (!isCurrent()) return;
+      mcpToolErrors = { ...mcpToolErrors, [serverId]: directIncidentError(error, i18n.t('settings.tools.mcpDirectoryFailed')) };
+    } finally {
+      if (mcpToolRequests.get(serverId) === request) {
+        mcpToolRequests.delete(serverId);
+        const next = new Set(mcpRefreshingServers);
+        next.delete(serverId);
+        mcpRefreshingServers = next;
       }
-      if (refreshed) {
-        notifySettingsSuccess(i18n.t("settings.toast.mcpToolsRefreshed"));
-      }
-    } catch (e) {
-      console.error("[SettingsPanel] 刷新 MCP 工具失败:", e);
-      notifySettingsError(i18n.t("settings.toast.action.refreshMcpTools"), e);
     }
-    const newSet = new Set(mcpRefreshingServers);
-    newSet.delete(serverId);
-    mcpRefreshingServers = newSet;
   }
 
   function applyMcpToolsResult(
     serverId: string,
     result: Record<string, unknown>,
     tools: any[],
-  ): boolean {
-    const unavailable = result?.connected === false;
-    const resultHealth = typeof result?.health === "string" ? result.health : "";
-    const connectionFailed =
-      unavailable
-      && resultHealth !== "disabled"
-      && typeof result?.error === "string"
-      && result.error.trim().length > 0;
-    const errorDetail = typeof result?.errorDetail === "string"
-      ? result.errorDetail.trim()
-      : "";
-    const lastCheckedAt = Number.isFinite(result?.lastCheckedAt)
-      ? Number(result.lastCheckedAt)
-      : Date.now();
-    mcpServerTools = { ...mcpServerTools, [serverId]: unavailable ? [] : tools };
-    mcpServers = mcpServers.map((server) => {
-      if (server.id !== serverId) return server;
-      if (unavailable) {
-        const disabled = resultHealth === "disabled" || server.enabled === false;
-        return {
-          ...server,
-          connected: false,
-          health: disabled ? "disabled" : "disconnected",
-          error: !disabled && connectionFailed ? "connection_issue" : undefined,
-          errorDetail: !disabled && errorDetail ? errorDetail : undefined,
-          toolCount: 0,
-          lastCheckedAt,
-        };
-      }
-      return {
-        ...server,
-        connected: true,
-        health: "connected",
-        error: undefined,
-        errorDetail: undefined,
-        toolCount: tools.length,
-        lastCheckedAt,
-      };
+  ): void {
+    const connected = result.connected === true;
+    const disabled = result.health === 'disabled';
+    const errorDetail = typeof result.errorDetail === 'string' ? result.errorDetail.trim() : '';
+    const errors = { ...mcpToolErrors };
+    if (connected || disabled) delete errors[serverId];
+    else errors[serverId] = i18n.t('settings.tools.mcpDirectoryFailed');
+    mcpToolErrors = errors;
+    // Only a successful directory read can replace its cached contents (including a true empty list).
+    if (connected) mcpServerTools = { ...mcpServerTools, [serverId]: tools };
+    mcpServers = mcpServers.map(server => server.id !== serverId ? server : {
+      ...server,
+      connected,
+      health: disabled ? 'disabled' : connected ? 'connected' : 'disconnected',
+      error: connected || disabled ? undefined : 'connection_issue',
+      errorDetail: errorDetail || undefined,
+      toolCount: connected ? tools.length : server.toolCount,
+      lastCheckedAt: Number.isFinite(result.lastCheckedAt) ? Number(result.lastCheckedAt) : server.lastCheckedAt,
     });
-    return !unavailable;
   }
 
   function getMCPHealthLabel(server: MCPServer): string {
     if (server.enabled === false || server.health === "disabled")
       return i18n.t("settings.tools.disabledLabel");
+    if (mcpConnectingServers.has(server.id)) return i18n.t('settings.tools.mcpHealthChecking');
     if (server.health === "connected")
       return i18n.t("settings.tools.mcpHealthConnected");
     if (server.health === "degraded")
@@ -3425,7 +3446,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
 
   function applyMcpServersPayload(serversPayload: unknown): void {
     const servers = ensureArray<any>(serversPayload);
-    mcpServers = servers.map((s: any) => {
+    const nextServers: MCPServer[] = servers.map((s: any) => {
       const id = typeof s?.id === "string" && s.id.trim() ? s.id.trim() : "";
       if (!id) {
         throw new Error("[SettingsPanel] MCP server 缺少 id");
@@ -3474,7 +3495,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
           enabled && typeof s.errorDetail === "string" && s.errorDetail.trim()
             ? s.errorDetail.trim()
             : undefined,
-        toolCount: Number.isFinite(s.toolCount) ? Number(s.toolCount) : 0,
+        toolCount: Number.isFinite(s.toolCount) ? Number(s.toolCount) : undefined,
         reconnectAttempts: Number.isFinite(s.reconnectAttempts)
           ? Number(s.reconnectAttempts)
           : 0,
@@ -3489,6 +3510,16 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
           : undefined,
       };
     });
+    for (const previous of mcpServers) {
+      const next = nextServers.find(server => server.id === previous.id);
+      if (!next || mcpConnectionSignature(previous) !== mcpConnectionSignature(next)) {
+        invalidateMcpDirectory(previous.id);
+      } else if (previous.enabled && !next.enabled) {
+        invalidateMcpDirectory(previous.id, true);
+      }
+    }
+    if (mcpExpandedServer && !nextServers.some(server => server.id === mcpExpandedServer)) mcpExpandedServer = null;
+    mcpServers = nextServers;
     // 应用 settings-bootstrap 时会顺带重连所有已启用的 MCP 服务。设置视图保活后，
     // 应用每次切换会话都会刷新 bootstrap，不可见时如果照旧重连，每次切换都会白白
     // 握手一遍全部 MCP 服务。不可见时只记“过期”，重新显示时再补一次。
@@ -3499,10 +3530,13 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     }
   }
 
-  async function connectEnabledMcpServers(): Promise<void> {
+  async function connectEnabledMcpServers(serverId?: string): Promise<void> {
     const targets = mcpServers.filter((server) =>
-      server.enabled !== false
+      (!serverId || server.id === serverId)
+      && server.enabled !== false
       && !mcpConnectingServers.has(server.id)
+      && !mcpRefreshingServers.has(server.id)
+      && !mcpChangingServers.has(server.id)
     );
     if (targets.length === 0) return;
 
@@ -3511,8 +3545,14 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       ...targets.map((server) => server.id),
     ]);
     await Promise.all(targets.map(async (server) => {
+      const signature = mcpConnectionSignature(server);
+      const request = {};
+      mcpConnectionRequests.set(server.id, request);
+      const isCurrent = () => mcpConnectionRequests.get(server.id) === request
+        && mcpServers.some(current => current.id === server.id && current.enabled && mcpConnectionSignature(current) === signature);
       try {
         const result = await connectAgentMcpServer(server.id);
+        if (!isCurrent()) return;
         const connected = result.connected === true;
         const errorDetail = typeof result.errorDetail === "string"
           ? result.errorDetail.trim()
@@ -3534,6 +3574,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
             }
           : current);
       } catch (error) {
+        if (!isCurrent()) return;
         console.error(`[SettingsPanel] 自动连接 MCP 服务器 ${server.id} 失败:`, error);
         const errorDetail = error instanceof Error ? error.message.trim() : String(error);
         mcpServers = mcpServers.map((current) => current.id === server.id
@@ -3547,9 +3588,12 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
             }
           : current);
       } finally {
-        const next = new Set(mcpConnectingServers);
-        next.delete(server.id);
-        mcpConnectingServers = next;
+        if (mcpConnectionRequests.get(server.id) === request) {
+          mcpConnectionRequests.delete(server.id);
+          const next = new Set(mcpConnectingServers);
+          next.delete(server.id);
+          mcpConnectingServers = next;
+        }
       }
     }));
   }
@@ -4203,6 +4247,8 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     get mcpServersLoading() {
       return mcpServersLoading;
     },
+    get mcpServersError() { return mcpServersError; },
+    retryMcpServers: () => requestSettingsBootstrap(true, 'full'),
     get mcpExpandedServer() {
       return mcpExpandedServer;
     },
@@ -4212,6 +4258,8 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     get mcpRefreshingServers() {
       return mcpRefreshingServers;
     },
+    get mcpToolErrors() { return mcpToolErrors; },
+    get mcpChangingServers() { return mcpChangingServers; },
     get skills() {
       return skills;
     },

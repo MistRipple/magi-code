@@ -124,7 +124,7 @@
     <div class="metric-grid">
         <div class="metric"><div class="metric-label"><Icon name="clock" size={13} /><span>{i18n.t('input.stats.ttft')} <small>TTFT</small></span></div><div class="metric-value" class:metric-value--placeholder={stats.ttftMs == null}>{decimal(stats.ttftMs == null ? null : stats.ttftMs / 1000)}{#if stats.ttftMs != null}<span>{i18n.t('input.stats.secondUnit')}</span>{/if}</div><span class="metric-caption">{i18n.t('input.stats.ttftSamples', { count: count(stats.ttftCount) })}</span></div>
         <div class="metric"><div class="metric-label"><Icon name="zap" size={13} /><span>{i18n.t('input.stats.tps')} <small>TPS</small></span></div><div class="metric-value" class:metric-value--placeholder={stats.tps == null}>{decimal(stats.tps)}{#if stats.tps != null}<span>tok/s</span>{/if}</div><span class="metric-caption">{stats.tpsCount ? i18n.t('input.stats.weighted') : i18n.t('input.stats.noSpeed')}</span></div>
-        <div class="metric"><div class="metric-label"><Icon name="database" size={13} /><span>{i18n.t('input.stats.cache')}</span></div><div class="metric-value" class:metric-value--placeholder={stats.cache.tokenHitRate == null} class:metric-value--status={stats.cache.tokenHitRate == null && !stats.cache.observedCallCount}>{stats.cache.tokenHitRate == null ? (stats.cache.observedCallCount ? '—' : i18n.t('input.stats.unobserved')) : percent(stats.cache.tokenHitRate)}</div><span class="metric-caption">{i18n.t('input.stats.cacheBasis')}</span></div>
+        <div class="metric"><div class="metric-label"><Icon name="database" size={13} /><span>{i18n.t('input.stats.cache')}</span></div><div class="metric-value" class:metric-value--placeholder={stats.cache.tokenHitRate == null} class:metric-value--status={stats.cache.tokenHitRate == null && !stats.cache.observedCallCount}>{stats.cache.tokenHitRate == null ? (stats.cache.observedCallCount ? '—' : i18n.t('input.stats.unobserved')) : percent(stats.cache.tokenHitRate)}</div><span class="metric-caption">{i18n.t('input.stats.cacheBasis')}</span><span class="metric-caption metric-caption--steady" data-testid="session-stats-steady">{i18n.t('input.stats.steadyRate', { value: stats.cache.steadyTokenHitRate == null ? '—' : percent(stats.cache.steadyTokenHitRate) })}</span></div>
         <div class="metric"><div class="metric-label"><Icon name="send" size={13} /><span>{i18n.t('input.stats.output')}</span></div><div class="metric-value" class:metric-value--placeholder={!tokensKnown}>{tokensKnown ? compact(stats.output) : '—'}{#if tokensKnown}<span>tok</span>{/if}</div><span class="metric-caption">{i18n.t('input.stats.tokenCoverage', { observed: count(stats.tokenObserved), count: count(stats.calls) })}</span></div>
     </div>
       <div class="stats-details">
@@ -135,6 +135,7 @@
           <div><dt>{i18n.t('input.stats.uncached')}</dt><dd>{(empty || stats.cache.observedCallCount) ? `${exact(Math.max(0, stats.cache.inputTokens - stats.cache.readTokens))} tok` : i18n.t('input.stats.unprovided')}</dd></div>
           <div><dt>{i18n.t('input.stats.write')}</dt><dd>{(empty || stats.writeObserved) ? `${exact(stats.cache.writeTokens)} tok` : i18n.t('input.stats.unprovided')}</dd></div>
           <div><dt>{i18n.t('input.stats.output')}</dt><dd>{tokensKnown ? `${exact(stats.output)} tok` : i18n.t('input.stats.unprovided')}</dd></div>
+          <div><dt>{i18n.t('input.stats.steadyDetail')}</dt><dd>{stats.cache.steadyInputTokens ? `${exact(stats.cache.steadyReadTokens ?? 0)} / ${exact(stats.cache.steadyInputTokens)} tok` : i18n.t('input.stats.unprovided')}</dd></div>
           <div><dt>{i18n.t('input.stats.requestRate')}</dt><dd>{percent(stats.cache.requestHitRate)}</dd></div>
           <div><dt>{i18n.t('input.stats.hitRequests')}</dt><dd>{count(stats.cache.hitCallCount)} / {count(stats.cache.observedCallCount)}</dd></div>
         </dl></div>{/if}
@@ -176,6 +177,7 @@
   .metric-value > span { font-size: var(--text-xs); color: var(--foreground-muted); font-weight: var(--font-normal); }
   .metric-value--placeholder { color: var(--foreground-muted); font-size: 21px; line-height: 1.45; font-weight: var(--font-normal); }
   .metric-value--status { font-size: 15px; line-height: 1.5; font-weight: var(--font-normal); letter-spacing: .01em; }
+  .metric-caption--steady { display: block; }
   .metric-caption, .detail-note { color: var(--foreground-muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
   .detail-note { margin-block: 10px 0; }
   .stats-details, .observation-footer { border-block-start: var(--magi-hairline) solid var(--border); }

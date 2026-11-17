@@ -57,6 +57,7 @@
   import type { ConversationPresentationRole } from '../lib/conversation-presentation';
   import { onDestroy, untrack, type Snippet } from 'svelte';
   import Disclosure from './Disclosure.svelte';
+  import ErrorDetailPopover from './ErrorDetailPopover.svelte';
 
   interface ErrorDiagnosis {
     category: 'model_input' | 'context_stale' | 'permission' | 'policy' | 'model_output' | 'workspace_write' | 'runtime';
@@ -425,6 +426,21 @@
       required_access_profile: payload?.required_access_profile,
     });
   });
+  const structuredErrorDetail = $derived.by(() => {
+    const payload = parseToolPayloadRecord(output)
+      || parseToolPayloadRecord(error)
+      || parseToolPayloadRecord(standardized?.message);
+    if (!payload) return '';
+    const detail = {
+      error_code: payload.error_code,
+      detail: payload.detail,
+      receipt: payload.receipt,
+      diagnostic: payload.diagnostic,
+      raw_output: payload.raw_output,
+    };
+    return Object.values(detail).some((value) => value !== undefined)
+      ? JSON.stringify(detail, null, 2) : '';
+  });
   const errorForDiagnosis = $derived((error && error.trim()) || structuredErrorText);
   const hasError = $derived(!!errorForDiagnosis);
   // 写操作已经发出但无法确认是否生效（例如浏览器命令执行中途连接断开）。这是 item 的正式状态，
@@ -687,6 +703,16 @@
       };
     }
 
+    if (matches('mcp_stale_snapshot', 'stale snapshot', '快照无效', 'fresh ax_read')) {
+      return {
+        category: 'context_stale',
+        categoryLabel: i18n.t('toolCall.errorDiagnosis.mcpSnapshot.categoryLabel'),
+        ownerLabel: i18n.t('toolCall.errorDiagnosis.mcpSnapshot.ownerLabel'),
+        message: i18n.t('toolCall.errorDiagnosis.mcpSnapshot.message'),
+        hint: i18n.t('toolCall.errorDiagnosis.mcpSnapshot.hint'),
+      };
+    }
+
     if (matches(
       'tool_policy_not_allowed',
       'tool_policy_external_not_allowed',
@@ -809,7 +835,9 @@
     || publicToolPayloadMessage(standardized?.message)
   );
   const publicErrorMessage = $derived(
-    publicPayloadErrorMessage
+    (errorDiagnosis?.category === 'context_stale' && parseToolIdentity(name).source === 'mcp'
+      ? errorDiagnosis.message : '')
+    || publicPayloadErrorMessage
     || (errorDiagnosis?.category === 'model_input' ? errorForDiagnosis : '')
     || errorDiagnosis?.message
     || i18n.t('toolCall.errorDiagnosis.runtime.message')
@@ -1232,6 +1260,9 @@
                 {/if}
               </div>
               <div class="section-content error-content">{publicErrorMessage}</div>
+              {#if structuredErrorDetail}
+                <ErrorDetailPopover text={structuredErrorDetail} maxInlineChars={96} />
+              {/if}
               {#if outcomeUnconfirmed}
                 <div class="error-hint">{i18n.t('toolCall.unconfirmedHint')}</div>
               {:else if errorDiagnosis}

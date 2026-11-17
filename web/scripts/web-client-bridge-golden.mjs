@@ -1447,6 +1447,16 @@ await withGoldenViteServer(async (server) => {
     false,
     '重连结束事件必须清理消息运行态，不能留下永久动画',
   );
+  // 退避等待中被取消、Settled 没到时：消息结束必须连带清掉会话级投影，
+  // 不能让下一轮的运行指示继续显示“准备发起第 N 次尝试”。
+  recoveredStream.onmessage?.({ data: JSON.stringify(modelRetryRuntimeEnvelope('scheduled', 6)) });
+  assert.equal(messagesStore.retryRuntimeState.bySessionId.get(SESSION_ID)?.phase, 'scheduled');
+  messagesStore.markMessageComplete('assistant-bridge-retry-runtime');
+  assert.equal(
+    messagesStore.retryRuntimeState.bySessionId.has(SESSION_ID),
+    false,
+    '消息结束后会话级重试投影必须一并清除',
+  );
 
   const artifact = findArtifactByTurnItemId(
     messagesStore.messagesState.canonicalTimelineProjection,
@@ -2914,7 +2924,7 @@ await withGoldenViteServer(async (server) => {
   const continueWorkspaceSessionsRequestCount = workspaceSessionsRequestCount;
   const continueCapturedTurnCount = capturedTurnBodies.length;
   sessionTurnInterceptors.push(() => continueTurnAccepted.promise);
-  bridge.postMessage({ type: 'continueTask' });
+  bridge.postMessage({ type: 'continueTask', accessProfile: 'full_access' });
   assert.equal(
     workspaceSessionsRequestCount,
     continueWorkspaceSessionsRequestCount,
@@ -2927,6 +2937,7 @@ await withGoldenViteServer(async (server) => {
   const continueTurnBody = capturedTurnBodies.at(-1);
   assert.equal(continueTurnBody.text, '继续');
   assert.equal(continueTurnBody.resume, true, 'button continuation keeps its structural resume flag');
+  assert.equal(continueTurnBody.accessProfile, 'full_access', 'Continue must submit the composer selected Full Access, not null/default Restricted');
   assert.equal(messagesStore.messagesState.continueSubmissionPending, true,
     'continue submission temporarily blocks editing the interrupted message');
   assert.equal(messagesStore.getLocalTurnSubmissionRenderItems(SESSION_ID).some(

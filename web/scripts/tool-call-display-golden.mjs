@@ -408,6 +408,16 @@ await withGoldenViteServer(async (server) => {
   } }).body;
   assert.match(compactReadFailure, /aria-expanded="false" aria-controls="tool-call-detail-compact-read-failure"/, '只读工具失败后可展开诊断，不会丢失错误详情');
   assert.match(compactReadFailure, /status-error/, '只读失败仍保留红点');
+  const staleMcpFailure = render(toolCall.default, { props: {
+    name: 'mcp__tap__ax_node_action', id: 'stale-mcp-failure', status: 'error',
+    presentationRole: 'attention', output: {
+      status: 'failed', error_code: 'mcp_stale_snapshot',
+      error: 'stale snapshot invalid-probe; run a fresh ax_read',
+      detail: 'dispatch=not_started', receipt: { execution: { dispatch: 'not_started' } },
+    },
+  } }).body;
+  assert.match(staleMcpFailure, /快照无效，请先重新 ax_read|Stale snapshot/, 'MCP stale snapshot must show a readable recovery reason');
+  assert.match(staleMcpFailure, /mcp_stale_snapshot|dispatch=not_started/, 'MCP error details must retain error code and receipt');
   const recoveredCard = render(toolCall.default, { props: {
     name: 'agent_spawn', status: 'success', agentChildStatus: 'completed',
     output: { status: 'failed', child_task_id: 'recovered-child' },

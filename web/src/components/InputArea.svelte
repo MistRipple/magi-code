@@ -623,7 +623,7 @@
   function continueSession(): void {
     if (!canContinue || continueSubmitting || isSending || sessionInputLocked
       || isInteractionBlocking || composerHasDraft()) return;
-    vscode.postMessage({ type: 'continueTask', sessionId: currentSessionId });
+    vscode.postMessage({ type: 'continueTask', sessionId: currentSessionId, accessProfile: selectedAccessProfile });
   }
 
   const activeInteraction = $derived.by(() => getActiveInteractionType());

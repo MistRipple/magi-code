@@ -425,3 +425,66 @@ assert.equal(partialUsage?.totalExecutions, 2);
 assert.equal(partialUsage?.totalTokens, 12, '部分缺失时保留已报告合计及真实覆盖数');
 
 console.log('settings store golden tests passed');
+
+// Exercise the production MCP directory owner with deferred transport receipts.
+// In particular, old receipts must not repopulate an edited/disabled/deleted service.
+const mcpHelperNames = ['mcpServerConfigPayload', 'mcpConnectionSignature', 'invalidateMcpDirectory', 'loadMcpDirectory', 'applyMcpToolsResult', 'applyMcpServersPayload'];
+const mcpHelpersSource = mcpHelperNames.map(name => storeFactory.body.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name).getText(settingsAst)).join('\n');
+function createMcpHarness() {
+  const receipts = [];
+  const transport = () => new Promise((resolve, reject) => receipts.push({ resolve, reject }));
+  const create = new Function('transport', ts.transpileModule(`
+    let mcpServers = [{ id: 'one', name: 'One', type: 'stdio', command: 'first', args: [], env: {}, enabled: true, connected: true, health: 'connected' }];
+    let mcpServerTools = {}, mcpToolErrors = {}, mcpRefreshingServers = new Set(), mcpChangingServers = new Set(), mcpConnectingServers = new Set(), mcpExpandedServer = null;
+    let mcpAutoConnectStale = false;
+    const mcpToolRequests = new Map(), mcpConnectionRequests = new Map();
+    const getAgentMcpServerTools = transport, refreshAgentMcpTools = transport;
+    const ensureArray = value => Array.isArray(value) ? value : [];
+    const directIncidentError = error => error.message;
+    const i18n = { t: key => key };
+    const isSettingsActive = () => false;
+    const connectEnabledMcpServers = () => {};
+    ${mcpHelpersSource}
+    return {
+      load: loadMcpDirectory, snapshot: applyMcpServersPayload,
+      get state() { return { servers: mcpServers, tools: mcpServerTools, errors: mcpToolErrors, refreshing: mcpRefreshingServers }; }
+    };
+  `, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText);
+  return { owner: create(transport), receipts };
+}
+const successfulDirectory = names => ({ connected: true, health: 'connected', tools: names.map(name => ({ name, description: `${name} purpose` })) });
+{
+  const { owner, receipts } = createMcpHarness();
+  const first = owner.load('one', false);
+  await owner.load('one', true);
+  assert.equal(receipts.length, 1, 'a second read cannot duplicate an in-flight service request');
+  receipts.shift().resolve(successfulDirectory(['read_file'])); await first;
+  const failing = owner.load('one', true);
+  assert.equal(owner.state.tools.one[0].name, 'read_file', 'refresh does not blank the current directory');
+  receipts.shift().reject(new Error('connection timed out')); await failing;
+  assert.equal(owner.state.errors.one, 'connection timed out');
+  assert.equal(owner.state.tools.one[0].name, 'read_file');
+  assert.equal(owner.state.refreshing.size, 0);
+  const disconnected = owner.load('one', true);
+  receipts.shift().resolve({ connected: false, health: 'disconnected', tools: [], errorDetail: 'server unavailable' }); await disconnected;
+  assert.equal(owner.state.tools.one[0].name, 'read_file', 'an unavailable response must not erase a known directory');
+  assert.ok(owner.state.errors.one);
+  const empty = owner.load('one', true);
+  receipts.shift().resolve(successfulDirectory([])); await empty;
+  assert.deepEqual(owner.state.tools.one, [], 'a successful empty response replaces the old directory');
+  assert.equal(owner.state.errors.one, undefined);
+}
+for (const change of ['edit', 'disable', 'delete']) {
+  const { owner, receipts } = createMcpHarness();
+  const pending = owner.load('one', false);
+  const current = owner.state.servers[0];
+  owner.snapshot(change === 'delete' ? [] : [{ ...current, ...(change === 'edit' ? { command: 'second' } : { enabled: false }) }]);
+  receipts.shift().resolve(successfulDirectory(['old_tool'])); await pending;
+  assert.equal(owner.state.tools.one, undefined, `${change}: a late response cannot restore the old directory`);
+  assert.equal(owner.state.refreshing.size, 0, `${change}: the old view request is released`);
+  if (change === 'disable') {
+    await owner.load('one', true);
+    assert.equal(receipts.length, 0, 'disabled services cannot refresh');
+  }
+}
+console.log('MCP directory lifecycle checks passed');
