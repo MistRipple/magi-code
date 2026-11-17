@@ -457,8 +457,8 @@ impl ExtensionHooks for ExtensionBusHooks {
 /// 观察类钩子的来源：daemon 的领域事件总线。
 ///
 /// 事件总线上的事件都是先提交后发布的事实，因此“先提交后观察”天然成立，且不需要在
-/// 各个路由与运行时热路径上各加一份回调。投影只带有限、脱敏的字段，不转发正文、
-/// 提示词、凭据或 base_url。事件总线是广播通道：消费落后时会丢事件，这里只记日志，
+/// 各个路由与运行时热路径上各加一份回调。会话、Turn、用量投影只带有限字段，不含
+/// 凭据或 base_url；`session.item` 转发完整的已提交条目（见 `project_session_item`）。事件总线是广播通道：消费落后时会丢事件，这里只记日志，
 /// 扩展需要权威事实时应读取快照（观察钩子不承诺完整送达，见协议第 10 节）。
 pub(super) fn spawn_event_forwarder(bus: Arc<ExtensionBus>, events: Arc<InMemoryEventBus>) {
     let mut receiver = events.subscribe();
@@ -507,60 +507,25 @@ fn first_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
         .find_map(|key| value.get(*key).and_then(Value::as_str))
 }
 
-/// `session.item` 单条正文的字符上限；超出时截断并标记，需要完整内容的插件读取会话快照。
-const SESSION_ITEM_TEXT_CHARS: usize = 4096;
-
-/// 把一个已到终态的 canonical item 投影给 `session.item` 观察钩子。
+/// 把一次已提交的 canonical item 写入投影给 `session.item` 观察钩子。
 ///
-/// 只转发“已提交的事实”：非终态、增量帧（不带完整 item）都不转发。正文只给用户消息、
-/// 助手文本和系统提示，且有界；思考内容、工具参数与工具结果不转发（插件需要时经快照读取）。
-/// 同一 item 可能因资源事实更新被再次发布，插件按 `(itemId, itemVersion)` 去重；
-/// 事件总线是广播通道，落后会丢事件，需要权威事实时读取快照。
+/// 转发完整 item（正文、blocks、思考、工具参数与结果），不截断、不脱敏：扩展进程本身
+/// 以用户权限运行（`extension:full-trust`），与 DSH 对插件放行的会话事件一致。只转发带
+/// 完整 item 的写入；流式增量帧（只有 delta）不转发。同一 item 会随状态推进多次到达，
+/// 按 `(itemId, itemVersion)` 区分版本；事件总线是广播通道，落后会丢事件，需要权威
+/// 事实时读取快照。
 fn project_session_item(event: &EventEnvelope) -> Option<Value> {
-    use magi_session_store::{CanonicalTurnItem, CanonicalTurnItemKind};
     if event.event_type != "session.turn.item" {
         return None;
     }
-    let item: CanonicalTurnItem =
-        serde_json::from_value(event.payload.get("canonical_item")?.clone()).ok()?;
-    if !item.status.is_terminal() {
-        return None;
-    }
-    let kind = serde_json::to_value(item.kind).ok()?;
-    let carries_text = matches!(
-        item.kind,
-        CanonicalTurnItemKind::UserMessage
-            | CanonicalTurnItemKind::AssistantText
-            | CanonicalTurnItemKind::SystemNotice
-    );
-    let (text, truncated) = match item.content.as_deref().filter(|_| carries_text) {
-        Some(content) => {
-            let mut chars = content.chars();
-            let head: String = chars.by_ref().take(SESSION_ITEM_TEXT_CHARS).collect();
-            (Some(head), chars.next().is_some())
-        }
-        None => (None, false),
-    };
+    let item = event.payload.get("canonical_item")?;
+    item.get("itemId")?;
     Some(json!({
         "sessionId": event.session_id.as_ref().map(ToString::to_string),
         "workspaceId": event.workspace_id.as_ref().map(ToString::to_string),
-        "turnId": item.turn_id,
-        "turnSeq": item.turn_seq,
-        "itemId": item.item_id,
-        "itemSeq": item.item_seq,
-        "itemVersion": item.item_version,
-        "kind": kind,
-        "status": serde_json::to_value(item.status).ok()?,
-        "threadId": item.source_thread_id.to_string(),
-        "createdAt": item.created_at.0,
-        "updatedAt": item.updated_at.0,
-        "text": text,
-        "textTruncated": truncated,
-        "tool": item.tool.as_ref().map(|tool| json!({
-            "callId": tool.call_id,
-            "name": tool.name,
-            "failed": tool.error.is_some(),
-        })),
+        "sequence": event.sequence,
+        "occurredAt": event.occurred_at.0,
+        "item": item,
     }))
 }
 
@@ -585,6 +550,7 @@ fn project_event(event: &EventEnvelope, ended: &mut EndedTurns) -> Option<(&'sta
                     "sessionId": session,
                     "workspaceId": workspace,
                     "turnId": turn.and_then(|t| first_str(t, &["turnId", "turn_id"])),
+                    "turnSeq": turn.and_then(|t| t.get("turnSeq").or_else(|| t.get("turn_seq"))).and_then(Value::as_u64),
                     "requestId": first_str(payload, &["request_id"]),
                     "route": first_str(payload, &["route"]),
                 }),
@@ -607,6 +573,7 @@ fn project_event(event: &EventEnvelope, ended: &mut EndedTurns) -> Option<(&'sta
                         "sessionId": session,
                         "workspaceId": workspace,
                         "turnId": turn_id,
+                        "turnSeq": turn.get("turn_seq").or_else(|| turn.get("turnSeq")).and_then(Value::as_u64),
                         "outcome": status,
                         "durationMs": turn.get("response_duration_ms").and_then(Value::as_u64),
                     }),
@@ -826,76 +793,39 @@ mod tests {
     }
 
     #[test]
-    fn session_items_are_projected_only_when_terminal_and_with_bounded_text() {
-        let done = project_session_item(&item_event(
-            "assistant_text",
-            "completed",
-            "你好",
-            json!({}),
+    fn session_items_carry_the_full_committed_item_and_skip_stream_deltas() {
+        let long = "文".repeat(10_000);
+        let tool = project_session_item(&item_event(
+            "tool_call",
+            "failed",
+            &long,
+            json!({"tool": {"callId": "c1", "name": "shell_exec", "arguments": {"command": "ls"}, "result": {"out": "x"}, "error": "boom"}}),
         ))
-        .expect("终态 item 必须投影");
-        assert_eq!(done["kind"], "assistant_text");
-        assert_eq!(done["status"], "completed");
-        assert_eq!(done["text"], "你好");
-        assert_eq!(done["textTruncated"], false);
+        .expect("带完整 item 的写入必须投影");
+        assert_eq!(tool["sessionId"], "s1");
+        assert!(tool["sequence"].is_u64() && tool["occurredAt"].is_u64());
+        // 原样转发：正文不截断，工具参数、结果与错误都在。
         assert_eq!(
-            (
-                done["turnId"].clone(),
-                done["itemId"].clone(),
-                done["itemVersion"].clone()
-            ),
-            (json!("t1"), json!("i1"), json!(2))
+            tool["item"]["content"].as_str().unwrap().chars().count(),
+            10_000
         );
-        assert_eq!(done["sessionId"], "s1");
+        assert_eq!(tool["item"]["tool"]["arguments"], json!({"command": "ls"}));
+        assert_eq!(tool["item"]["tool"]["result"], json!({"out": "x"}));
+        assert_eq!(tool["item"]["tool"]["error"], "boom");
+        assert_eq!(tool["item"]["itemVersion"], 2);
 
-        // 非终态、增量帧（没有完整 item）、其他事件都不投影。
-        assert!(
-            project_session_item(&item_event("assistant_text", "running", "x", json!({})))
-                .is_none()
-        );
+        // 非终态的完整写入同样转发（工具调用开始时即可观察）；增量帧与其他事件不转发。
+        let running = project_session_item(&item_event("tool_call", "running", "", json!({})));
+        assert_eq!(running.unwrap()["item"]["status"], "running");
         assert!(
             project_session_item(&domain(
                 "session.turn.item",
                 "s1",
-                json!({"current_turn": {}})
+                json!({"current_turn": {}, "stream_delta": "x"})
             ))
             .is_none()
         );
         assert!(project_session_item(&domain("session.created", "s1", json!({}))).is_none());
-
-        // 正文有界，截断时明确标记；按字符而不是字节截断。
-        let long = "文".repeat(SESSION_ITEM_TEXT_CHARS + 5);
-        let cut = project_session_item(&item_event("user_message", "completed", &long, json!({})))
-            .unwrap();
-        assert_eq!(
-            cut["text"].as_str().unwrap().chars().count(),
-            SESSION_ITEM_TEXT_CHARS
-        );
-        assert_eq!(cut["textTruncated"], true);
-
-        // 思考内容、工具参数与结果不转发；工具只给调用身份与是否失败。
-        let thinking = project_session_item(&item_event(
-            "assistant_thinking",
-            "completed",
-            "内部推理",
-            json!({}),
-        ))
-        .unwrap();
-        assert!(thinking["text"].is_null());
-        assert!(!thinking.to_string().contains("内部推理"));
-        let tool = project_session_item(&item_event(
-            "tool_call",
-            "failed",
-            "输出",
-            json!({"tool": {"callId": "c1", "name": "shell_exec", "arguments": {"command": "秘密"}, "result": {"out": "秘密"}, "error": "boom"}}),
-        ))
-        .unwrap();
-        assert_eq!(
-            tool["tool"],
-            json!({"callId": "c1", "name": "shell_exec", "failed": true})
-        );
-        assert!(!tool.to_string().contains("秘密"));
-        assert!(tool["text"].is_null());
     }
 
     #[test]
@@ -910,13 +840,14 @@ mod tests {
             &domain(
                 "session.turn.task.accepted",
                 "s1",
-                json!({"request_id": "r1", "route": "task", "text": "秘密正文", "canonical_turn": {"turnId": "t1"}}),
+                json!({"request_id": "r1", "route": "task", "text": "秘密正文", "canonical_turn": {"turnId": "t1", "turnSeq": 4}}),
             ),
             &mut ended,
         )
         .unwrap();
         assert_eq!(accepted.0, "turn.accepted");
         assert_eq!(accepted.1["turnId"], "t1");
+        assert_eq!(accepted.1["turnSeq"], 4);
         assert!(!accepted.1.to_string().contains("秘密正文"), "正文不得转发");
 
         // 非终态的 item 事件不产生 turn.end；终态只通知一次。
@@ -924,7 +855,7 @@ mod tests {
             domain(
                 "session.turn.item",
                 "s1",
-                json!({"current_turn": {"turn_id": "t1", "status": status, "response_duration_ms": 42}}),
+                json!({"current_turn": {"turn_id": "t1", "turn_seq": 4, "status": status, "response_duration_ms": 42}}),
             )
         };
         assert!(project_event(&item("running"), &mut ended).is_none());
@@ -933,6 +864,7 @@ mod tests {
             (end.0, end.1["outcome"].clone(), end.1["durationMs"].clone()),
             ("turn.end", json!("completed"), json!(42))
         );
+        assert_eq!(end.1["turnSeq"], 4);
         assert!(
             project_event(&item("completed"), &mut ended).is_none(),
             "同一终态不重复通知"
@@ -1013,11 +945,6 @@ mod tests {
                 mode: HookMode::Observe,
                 deadline_ms: None,
             },
-            HookRegistration {
-                name: "session.item".into(),
-                mode: HookMode::Observe,
-                deadline_ms: None,
-            },
         ];
         let node = std::env::var_os("MAGI_EXTENSION_NODE")
             .map(std::path::PathBuf::from)
@@ -1033,7 +960,8 @@ mod tests {
         config.version = "1.0.0".into();
         config.config = json!({
             "marker": marker,
-            "hooks": declared.iter().map(|h| h.name.clone()).collect::<Vec<_>>(),
+            // session.item 不在清单里声明：观察钩子由运行中的扩展按需订阅。
+            "hooks": declared.iter().map(|h| h.name.clone()).chain(["session.item".to_string()]).collect::<Vec<_>>(),
         });
         config.hooks = declared.clone();
 
@@ -1122,15 +1050,8 @@ mod tests {
         events.publish(item_event(
             "tool_call",
             "completed",
-            "不转发的输出",
-            json!({"itemId": "i10", "tool": {"callId": "c", "name": "shell_exec"}}),
-        ));
-        // 非终态的 item 不会到达扩展。
-        events.publish(item_event(
-            "assistant_text",
-            "running",
-            "未完成",
-            json!({"itemId": "i11"}),
+            "",
+            json!({"itemId": "i10", "tool": {"callId": "c", "name": "shell_exec", "arguments": {"command": "ls"}}}),
         ));
         let mut log = String::new();
         for _ in 0..60 {
@@ -1151,11 +1072,7 @@ mod tests {
         assert!(lines.contains("usage:m1:7"), "{log}");
         assert!(lines.contains("item:assistant_text:i9:真实正文:"), "{log}");
         assert!(
-            lines.contains("item:tool_call:i10:null:shell_exec"),
-            "{log}"
-        );
-        assert!(
-            !log.contains("i11") && !log.contains("不转发的输出"),
+            lines.contains(r#"item:tool_call:i10::shell_exec:{"command":"ls"}"#),
             "{log}"
         );
         instance.stop().await;

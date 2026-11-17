@@ -821,36 +821,18 @@ fn persistent_clients_require_an_explicit_grant_and_a_declared_view_entry() {
     assert!(PluginPackage::from_archive(&archive(&m, &[])).is_err());
 }
 
-fn session_item_manifest() -> Value {
+#[test]
+fn observe_hooks_need_no_extra_permission_beyond_full_trust() {
+    // 观察钩子是运行期订阅原语；扩展本就以 full-trust 运行，不再另设会话读取授权。
     let mut m = extension_manifest();
     m["extension"]["hooks"] = json!([{"name":"session.item","mode":"observe"}]);
+    m["permissions"] = json!([{"kind":"extension","targets":["full-trust"]}]);
+    let ok = PluginPackage::from_archive(&extension_archive(&m, ENTRY));
+    assert!(ok.is_ok(), "{:?}", ok.err());
+    // sessionRead 目标仍只允许 directory 与 render。
     m["permissions"] = json!([
         {"kind":"extension","targets":["full-trust"]},
         {"kind":"sessionRead","targets":["events"]}
-    ]);
-    m
-}
-
-#[test]
-fn session_item_hook_carries_bounded_text_and_needs_its_own_session_read_grant() {
-    let ok = PluginPackage::from_archive(&extension_archive(&session_item_manifest(), ENTRY));
-    assert!(ok.is_ok(), "{:?}", ok.err());
-    // 缺少 sessionRead:["events"]：不能只凭 extension 完全信任就收到会话正文。
-    let mut m = session_item_manifest();
-    m["permissions"] = json!([{"kind":"extension","targets":["full-trust"]}]);
-    assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
-    // 只给目录或渲染的 sessionRead 不够。
-    let mut m = session_item_manifest();
-    m["permissions"] = json!([
-        {"kind":"extension","targets":["full-trust"]},
-        {"kind":"sessionRead","targets":["directory"]}
-    ]);
-    assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
-    // 未知 sessionRead 目标仍被拒绝。
-    let mut m = session_item_manifest();
-    m["permissions"] = json!([
-        {"kind":"extension","targets":["full-trust"]},
-        {"kind":"sessionRead","targets":["events","everything"]}
     ]);
     assert!(PluginPackage::from_archive(&extension_archive(&m, ENTRY)).is_err());
 }

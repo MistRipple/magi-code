@@ -4,7 +4,7 @@ use crate::frame::{read_frame, write_frame};
 use crate::peer::{BoxFuture, Incoming, Peer, PeerLimits};
 use crate::protocol::{
     ErrorKind, HookMode, HookRegistration, Message, PROTOCOL_MAJOR, PROTOCOL_MINOR, RpcError,
-    Version, response_err, response_ok,
+    Version, hook_spec, response_err, response_ok,
 };
 use crate::transport;
 use magi_process::ManagedProcessGroup;
@@ -532,7 +532,11 @@ impl Incoming for HostHandler {
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if self.approved.contains_key(name) {
+                // 观察钩子是订阅原语：运行中的扩展（均为 full-trust）可按需订阅，不需清单声明。
+                // guard/advise 会影响执行，仍须在清单中声明并获批。
+                let observable =
+                    hook_spec(name).is_some_and(|spec| spec.wired.contains(&HookMode::Observe));
+                if self.approved.contains_key(name) || observable {
                     self.bound
                         .lock()
                         .expect("bound lock poisoned")

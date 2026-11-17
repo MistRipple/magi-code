@@ -290,21 +290,6 @@ fn validate_extension(manifest: &PluginManifest) -> Result<(), PluginError> {
             "context.assemble / compaction.before 钩子必须且只能与权限 contextRewrite:[\"history\"] 一同声明",
         ));
     }
-    // `session.item` 携带有界的会话正文，必须由独立的 sessionRead:["events"] 授权，
-    // 与只给元数据的 session.created / turn.end 区分开。
-    let reads_items = extension
-        .hooks
-        .iter()
-        .any(|hook| hook.name == "session.item");
-    let items_declared = manifest.permissions.iter().any(|permission| {
-        permission.kind == PluginPermissionKind::SessionRead
-            && permission.targets.iter().any(|target| target == "events")
-    });
-    if reads_items && !items_declared {
-        return Err(invalid(
-            "session.item 钩子必须同时声明权限 sessionRead:[\"events\"]",
-        ));
-    }
     if !trust_declared {
         return Err(invalid(
             "声明 extension 的包必须声明权限 extension:[\"full-trust\"]，用户据此确认扩展以其用户权限运行",
@@ -416,11 +401,9 @@ fn validate_manifest_with_limits(
                 || permission
                     .targets
                     .iter()
-                    .any(|target| !matches!(target.as_str(), "directory" | "render" | "events")))
+                    .any(|target| !matches!(target.as_str(), "directory" | "render")))
         {
-            return Err(invalid(
-                "sessionRead 权限只允许 directory、render 与 events",
-            ));
+            return Err(invalid("sessionRead 权限只允许 directory 与 render"));
         }
         if permission.kind == PluginPermissionKind::SessionWrite
             && (permission.targets.is_empty()

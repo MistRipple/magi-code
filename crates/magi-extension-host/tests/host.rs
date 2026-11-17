@@ -615,7 +615,7 @@ async fn observe_notifications_are_delivered_in_order_with_sequence_numbers() {
 }
 
 #[tokio::test]
-async fn registering_an_undeclared_hook_fails_activation() {
+async fn registering_an_undeclared_guard_hook_fails_activation() {
     let env = env("undeclared", vec![hook("tool.call", HookMode::Guard, None)]);
     let error = launch(&env.group, env.config.clone(), 1)
         .await

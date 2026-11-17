@@ -299,7 +299,8 @@ impl ExtensionBus {
         }
     }
 
-    fn frozen(&self, hook: &str, observe: bool) -> Vec<Arc<Slot>> {
+    /// 声明了该钩子 guard/advise 模式的插件，按调用顺序。
+    fn frozen(&self, hook: &str) -> Vec<Arc<Slot>> {
         let slots = self.slots.read().expect("slots poisoned");
         let order = self.order.read().expect("order poisoned");
         let mut chosen: Vec<Arc<Slot>> = slots
@@ -307,7 +308,7 @@ impl ExtensionBus {
             .filter(|slot| {
                 slot.hooks
                     .get(hook)
-                    .is_some_and(|h| (h.mode == HookMode::Observe) == observe)
+                    .is_some_and(|h| h.mode != HookMode::Observe)
             })
             .cloned()
             .collect();
@@ -337,8 +338,22 @@ impl ExtensionBus {
     }
 
     /// 观察通知：有界异步队列，不阻塞调用方。
+    /// observe 投递：清单声明了 observe 的插件，以及运行期按需订阅（未声明该钩子）的插件；
+    /// 两者都要求宿主实例已绑定处理器。声明为 guard/advise 的插件走 `invoke`，不在这里重复投递。
     pub fn notify(&self, hook: &str, input: Value) {
-        for slot in self.frozen(hook, true) {
+        let slots: Vec<Arc<Slot>> = self
+            .slots
+            .read()
+            .expect("slots poisoned")
+            .values()
+            .filter(|slot| {
+                slot.hooks
+                    .get(hook)
+                    .is_none_or(|approved| approved.mode == HookMode::Observe)
+            })
+            .cloned()
+            .collect();
+        for slot in slots {
             let bound = slot
                 .instance
                 .read()
@@ -363,7 +378,7 @@ impl ExtensionBus {
         if ctx.depth > MAX_REENTRY_DEPTH {
             return Err(RpcError::new(ErrorKind::ReentryDenied, "重入深度超过上限"));
         }
-        let slots = self.frozen(hook, false);
+        let slots = self.frozen(hook);
         let total = slots
             .iter()
             .fold((Duration::ZERO, Duration::ZERO), |(guard, advise), slot| {

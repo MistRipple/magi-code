@@ -1,29 +1,36 @@
 # DSH 对齐：Magi 插件系统的当前设计
 
-> 状态：里程碑改造的权威设计，2026-11-17。**本文取代此前的插件设计文档**（`plugin-system-requirements-design.md` 及其附属的剪除审核、交付记录），旧文档已过时，不再修改，仅作历史。作者指南 `plugin-authoring.md` 与 `extension-protocol-v1.md` 在本文的接口章节写成之前仍是现行接口参考，之后由本文取代。
+> 状态：里程碑改造的权威设计，2026-11-17 修订（第二版：取消翻译层，以 DSH 插件合约为 Magi 唯一插件接口）。**本文取代此前的插件设计文档**（`plugin-system-requirements-design.md` 及其附属的剪除审核、交付记录），旧文档已过时，不再修改，仅作历史。`plugin-authoring.md` 与 `extension-protocol-v1.md` 描述的是即将降为内部协议的 SDK 2（决策 10），在平台重构（第 10 节第 1 项）完成时改写或移除。
 >
-> 本文不代表任何一项已交付。依据：DSH 仓库 `docs/capability-seams.md` 的全部 113 个 `ctx.*` 服务（master，2026-11-17 读取，不锁版本）；Magi 源码与现有翻译层规则；对 100 个真实 DSH 插件的静态扫描（第 5 节）。表中分类是文档与名称层面的判断，不是逐项代码审计。
+> 本文不代表任何一项已交付。依据：DSH 仓库 `docs/capability-seams.md` 的全部 113 个 `ctx.*` 服务与 `docs/architecture.md`（master，2026-11-17 读取，不锁版本）；Magi 源码；对 100 个真实 DSH 插件的静态扫描（第 5 节）。表中分类是文档与名称层面的判断，不是逐项代码审计。
 
 ## 1. 决策（用户）
 
-1. **Magi 的插件接口按 DSH 对齐：DSH 支持的，Magi 同样支持。** DSH 对插件放行的事项（审批决策、系统提示整体改写、模型请求拦截、替换执行循环和会话存储后端等），Magi 不另设例外。此前提出的“事实类是否放开”“工作流是否恢复”“新建类是否都做”均按此处理，不再单独待决；先做哪个，只由实际依赖决定（第 10 节）。
+1. **Magi 的插件接口按 DSH 对齐：DSH 支持的，Magi 同样支持。** DSH 对插件放行的事项（审批决策、系统提示整体改写、模型请求拦截、替换执行循环和会话存储后端等），Magi 不另设例外。先做哪个，只由实际依赖决定（第 10 节）。
 2. **会话能力组合与 DSH 一致。** 插件按应用全局安装与启停；会话启用哪些能力，由预设从已启用插件中组合。
 3. **不锁定 DSH 版本，跟随上游。** DSH 业务线已基本稳定；上游更新后重新读取接缝清单核对本表。
-4. **Magi 内核实现保持自有，只在对外接口上对齐 DSH 的接缝。** 不要安装期翻译与改写这类中间层：对齐后安装只做校验与放置，运行在单层宿主里。
+4. **Magi 内核实现保持自有，只在对外接口上对齐 DSH 的接缝。** 不要安装期翻译与改写这类中间层：安装只做校验与放置，运行在单层宿主里。
 5. **旧设计文档不再修改。** 本文是替代。
 6. **插件管理页的槽位（`plugins.*`）渲染在该插件自己的设置页里，沿现状。** 设置页本来就是槽位的承载位置（导航入口加原生页头，正文由插件的组件渲染）；不新增界面位置，也不另做分区设计，也不做 DSH 式的插件管理界面。
 7. **界面范围只做到设置页、主页面和右栏标签页。** 主对话（输入区、对话区、工具调用视图、会话头部）、左栏、外壳浮层的槽位暂不支持，先把核心接缝对齐，后续有条件再评估。这些位置的设计想法保留在第 8 节末尾作为起点。
 8. **范围外的界面槽位不再拒绝安装，而是允许安装并明示缺失。** 安装预览与插件详情列出“N 项界面功能在 Magi 中不可用”及具体槽位，其余功能正常。见 8.4。
+9. **目标架构采用本方案，补强的是执行合同与交付分期，不是退回旧插件边界。** daemon 仍是唯一内核，但可以与可替换实现共存：daemon 负责选择提供方、绑定调用身份、管理生命周期、提交事实；插件可以承担实际策略或执行实现（第 3 节）。
+10. **DSH 插件合约是 Magi 唯一的对外插件接口。** 包格式（npm 包、`package.json` 的 `exports` 与 `./client`）、后端 `ctx.*` 服务与事件、客户端槽位与标准套件，都以 DSH 为准。Magi 现有的 SDK 2（清单加 `api.*`）降为 Node 插件宿主与 daemon 之间的内部协议，不再作为公开插件接口，不再接受按它编写的第三方包。核对：官方插件中心目录为空，`examples/plugins` 只有说明文字，没有需要迁移的 SDK 2 插件。
+11. **从产品长远架构出发，不做兼容，不打补丁。** 不建翻译层、垫片、别名、“部分实现”或“最小外观”；Magi 缺的事实与能力在内核里正式补齐，做不到的明确不提供。
+12. **所有已启用插件运行在同一个 Cordis 宿主进程中**，与 DSH 一致，插件之间可以提供和注入服务。单个插件的启动失败由 Cordis 隔离；进程崩溃时整体重启，进行中的调用按 3.1“撤权与停用”处理。接受的代价：一个插件让进程崩溃会影响全部插件。
+13. **不提供 DSH profile 相关服务**（`loader`、`hmr`、`profileContext`）。Magi 由 daemon 拥有全局安装与启停（决策 2），没有 profile 文件；需要管理插件的插件使用 `pluginManager`，它在 Magi 插件生命周期上完整实现。
+14. **插件配置以 Magi 的插件设置（CAS）为唯一事实**，宿主据此向 Cordis 插件传入配置；不存在 profile patch 文件里的第二份配置。
 
 ## 2. 对齐原则与“完全运行”的定义
 
-- **完全运行** = 只使用 DSH 公开接缝的插件，其用户目标在 Magi 中完整可用。范围按决策 7：后端接缝加设置页、主页面、右栏标签页；主对话与左栏等位置的界面功能暂不计入，也不声称支持。
+- **完全运行** = 只使用 DSH 公开合约的插件，其用户目标在 Magi 中完整可用。范围按决策 7：后端接缝加设置页、主页面、右栏标签页；主对话与左栏等位置的界面功能暂不计入，也不声称支持。
+- **没有翻译层。** DSH 包原样安装、原样运行。安装期不扫描、不试跑、不合成清单或权限、不改写代码；能否运行由运行时决定，而不是由一张规则表预判（第 3.4 节）。
+- **服务只有两种状态：完整实现或不提供。** Node 插件宿主提供的每个 `ctx.*` 服务、事件和标准套件 hook，要么按 DSH 合约完整实现（背后是 daemon 的正式能力），要么不提供。不提供时沿 DSH 自己的语义：可选注入的分支不运行，必需依赖缺失则该插件启动失败并明确说明缺哪个服务。不做“部分实现”“最小外观”“调用时报未提供”的半成品。
+- **缺事实就补内核，不在宿主编造。** DSH 合约需要而 Magi 没有的事实（例如事件序号、条目所属的模型步骤、轮次结束原因），作为 Magi 自己的领域事实在内核里补齐，命名不带 DSH；Node 宿主只做格式表达，不合成、不猜测、不填占位值。
 - 接口对齐分三层：签名；语义（顺序、`next` 环绕、错误、取消、时机）；对象身份。前两层对齐。**对象身份无法跨进程共享**，由第 3.2 节的句柄与“对象行为清单”承担：清单里的行为统一实现，清单之外的对象修改在注册时明确拒绝，不做逐插件的特殊处理。
 - 给 DSH 宿主安装文件打补丁的功能（如 dsh-purge 的 86 条宿主补丁）在 Magi 中没有宿主可打，标“不适用”，不显示为失败。
-- DSH 专属名字与逻辑只放在 Node 侧宿主服务层，Rust 内核不出现 DSH 分支。
-- 每对齐一个接缝，同步清退它对应的翻译代码，不保留双份；清退的前提是运行时已能承担该接缝的语义（第 3.4 节）。
+- DSH 专属名字与逻辑只放在 Node 插件宿主，Rust 内核不出现 DSH 分支（现有的 DSH 版本豁免、兼容投影等随平台重构删除，第 3.4 节）。
 - 按真实任务形成少数几项公共能力，不把 DSH 的每个服务名机械对应成一个新的 Rust 服务（第 7 节）。
-9. **目标架构采用本方案，补强的是执行合同与交付分期，不是退回旧插件边界。** daemon 仍是唯一内核，但可以与可替换实现共存：daemon 负责选择提供方、绑定调用身份、管理生命周期、提交事实；插件可以承担实际策略或执行实现。需要补齐的是提供方选择、冲突处理、失败与撤权规则（第 3.1 节），跨进程语义的承载方式（第 3.2 节）和能力组合的最小合同（第 3.3 节），而不是恢复旧的禁止条款。
 
 
 ## 3. 执行合同
@@ -65,7 +72,7 @@ Magi 默认提供方是原生实现；插件的贡献作为候选随插件全局
 
 ### 3.2 运行时语义（跨进程后怎么工作）
 
-Node 宿主保留四个统一部件：**服务代理、事件桥、页面宿主、依赖解析**。DSH 专属语义只在这一层，Rust 只提供正式业务能力。
+Node 插件宿主原生实现 DSH 合约，由四个部件组成：**服务实现**（`ctx.*` 服务调用 daemon 的正式能力）、**事件桥**、**页面宿主**（客户端槽位与标准套件）、**依赖解析**。DSH 专属语义只在这一层，Rust 只提供正式业务能力。
 
 | 语义 | 承载方式 |
 | --- | --- |
@@ -96,13 +103,23 @@ Node 宿主保留四个统一部件：**服务代理、事件桥、页面宿主�
 
 预设的编辑界面可以后做，不需要先建设庞大的通用框架。
 
-### 3.4 取消安装期改写的完成条件
+### 3.4 插件平台结构（取代安装期翻译）
 
-取消安装期的代码改写、扫描规则和报告，**以运行时能正确承担 3.2 的语义为条件**，并按调用类别逐类清退，不一次性删除：
+**安装。** 来源是 npm 包（或用户给的包文件）。daemon 拥有安装、启停、升级、卸载的唯一事实；安装只做四件事：解析并锁定依赖（DSH SDK 包由 Magi 随发行提供同一份，原包其余依赖按其 `package.json` 安装）、校验包结构与入口、放置到 Magi 的插件目录、向用户展示安装确认。授权沿 DSH：插件以用户权限完全受信运行，用户在安装时确认。**不做**：静态扫描与兼容结论、受限试跑、合成清单与权限、包装入口、改写客户端代码、按扫描结果拒绝安装。
 
-- 某一类同步读取只有在快照机制覆盖后才删除对应的 AST 改写；
-- 需要同步写语义的类别如果无法满足，保留适配并写明原因，不假称已清退；
-- 清退以样本回归通过为准（第 5 节的 95 个包再扫一遍，被阻塞数不得上升）。
+**贡献全部在运行时注册。** 工具、命令、技能、模型数据源、设置结构、路由、槽位组件、事件订阅，都由插件在 `apply` 中注册，经 daemon 的运行期目录进入产品；停用、撤权、崩溃时随实例回收（已有运行期目录与租约机制沿用）。观察类事件已是按需订阅（第 10 节第 2 项）。
+
+**版本。** Node 插件宿主声明自己实现的 DSH SDK 版本；原包对 DSH SDK 的 `peerDependencies` 不满足时，安装失败并说明需要的版本。不设版本豁免。
+
+**插件宿主进程（决策 12）。** 所有已启用插件运行在同一个 Cordis 树里，插件之间可以互相提供和注入服务；取代现在的一插件一宿主进程。Cordis 负责单个插件的启动失败隔离；进程崩溃时整体重启，进行中的调用按 3.1“撤权与停用”处理。实例代次（3.2）随宿主进程重启变化。**插件配置**由 Magi 插件设置提供（决策 14）。
+
+**删除清单。** 平台重构完成时一并删除，不保留双份：
+- 安装期：`scripts/compat/core` 的扫描、规则、报告、能力清单，`scripts/compat/dsh` 的规则表与翻译器，`scripts/compat/install` 的准备、记录器、客户端分析与改写、槽位记录；
+- 运行时垫片：按 SDK 2 `api.*` 转接的 `dsh-host.mjs` 结构、`nullableEvents` 协商、DSH profile 目录模拟（`profile*.mjs`、`DSH_HOME` 重定向）；其中仍需要的服务按“完整实现或不提供”在新宿主中重写；
+- Rust：插件系统中的 DSH 版本豁免策略（`lifecycle/compatibility.rs`）、翻译运行时状态与 `PluginDshCompatibilityProjection` 等兼容投影、对 `extension/compat.json` 的读取；
+- 文档：本文第 5 节的方法改为真实激活回归后，扫描结论不再作为依据。
+
+**验收。** 以真实激活代替静态扫描：第 5 节的样本包在 Magi 中原样安装并激活，记录每个包“激活成功／缺哪个必需服务／运行期错误”。平台重构前后，能真正激活的包数不得下降；之后每补一项能力，以这份真实结果衡量。
 
 ### 3.5 已确认的运行时合同
 
@@ -121,15 +138,15 @@ Node 宿主保留四个统一部件：**服务代理、事件桥、页面宿主�
 
 | 处置 | 含义 |
 | --- | --- |
-| 已有 | Magi 已有对应公共能力或翻译层已接，补语义细节 |
-| 补端口 | Magi 内部有该能力，要新增或放宽对插件的端口 |
+| 已有能力 | Magi 内核已有对应的正式能力；Node 插件宿主按 DSH 合约完整实现该服务即可 |
+| 补端口 | Magi 内部有该能力，要新增或放宽对插件的端口，必要时补齐领域事实 |
 | 新建 | Magi 没有对应能力，需先设计 |
-| 页面宿主 | DSH 的宿主、客户端或 API 外壳；Magi 自有，由页面宿主为依赖它的插件页面提供最小服务外观 |
-| 无需 | 遥测、账号、实验、调试类；DSH 插件以条件注入使用，缺席时自行降级，Magi 保持缺席 |
+| 宿主服务 | DSH 的宿主、客户端或 API 外壳服务；对应 Magi 自有的产品服务。要么经 DSH 合约完整提供，要么不提供（依赖它的插件按 DSH 语义降级或启动失败），不做“最小外观” |
+| 不提供 | 遥测、账号、实验、调试类；DSH 插件自身以可选注入使用，Magi 不提供，插件按 DSH 语义自行跳过 |
 
 ## 5. 真实插件的依赖实测
 
-**方法。** 取 npm 上关键字 `dsh-plugin` 搜索结果前 100 个包（2026-11-17），排除 4 个 PDF 原生二进制子包，其余 95 个用 `npm pack --ignore-scripts` 下载解压（不执行任何包代码），用仓库内 `scripts/compat` 的静态扫描器分析。
+**方法。** 取 npm 上关键字 `dsh-plugin` 搜索结果前 100 个包（2026-11-17），排除 4 个 PDF 原生二进制子包，其余 95 个用 `npm pack --ignore-scripts` 下载解压（不执行任何包代码），用仓库内 `scripts/compat` 的静态扫描器分析。**该扫描器属于第 3.4 节的删除清单；这里的数字只说明需求分布，验收改为真实激活回归。**
 
 **覆盖。** 95 个中 79 个被识别为 DSH 插件并完成扫描；16 个不是插件（目录、命令行工具、规范文档）或没有可扫描源码。**这是静态扫描，不是业务验收；样本按搜索相关度取得，不代表整个生态。** 按当前翻译器的**后端**准入规则：50 个无阻塞，29 个被阻塞。**只看后端会高估：再加上界面槽位的安装准入，两项都通过的是 43 个（54%），见第 8 节；这仍是安装准入，不是业务验收。**
 
@@ -138,7 +155,7 @@ Node 宿主保留四个统一部件：**服务代理、事件桥、页面宿主�
 **29 个被阻塞的原因**（受影响插件数）：`session/event` 逐条事件 6；`ctx.agents` 5；`skills.registerProvider`（含 `dsh-skill` 导入）5；`dsh-session` 导入 4；`agent/pre-step` 3；`agent/created` 3；`storageDomain` 3；`tools.guard` 3；`credentials` 约 3；`sessionQuery` 2；`tools/result`、`pre-execute`、`post-execute` 各 2；`workspaceRegistry` 2。
 
 **结论。**
-- 绝大多数插件依赖的是工具、页面路由、设置、命令，这些已经接通。
+- 绝大多数插件依赖的是工具、页面路由、设置、命令。Magi 已有这些能力（目前经翻译层接通，平台重构后在原生插件宿主中按合约重写）。
 - 阻塞集中在**读取会话与 Agent、会话与 Agent 事件、工具执行管线事件、技能提供方、凭据、存储域**。这些都是“补端口”或“新建”，而且以只读或观察为主。
 - **要求替换执行循环或会话存储的插件，在样本里没有出现**（`agentLoop` 0；`sessionPersistence` 有 3 个插件注入它，但不构成阻塞原因，需要核对具体用法）。系统提示整体改写与模型请求拦截在样本中各只有 1 个或 0 个插件（dsh-purge 在样本之外单独分析）。
 
@@ -150,7 +167,7 @@ Node 宿主保留四个统一部件：**服务代理、事件桥、页面宿主�
 
 按 DSH `capability-seams.md` 的 113 个服务逐项列出。最后一列是第 5 节样本（79 个已扫描插件）中使用该服务的插件数，0 表示样本中没有用到。
 
-汇总：已有 9，补端口 38，新建 19，页面宿主 28，无需 19（共 113 项）。
+汇总：已有能力 8，补端口 39，新建 19，宿主服务 26，不提供 21（共 113 项）。
 
 ### 一、代理运行时与会话（决定插件能不能改变代理的行为）
 
@@ -159,7 +176,7 @@ Node 宿主保留四个统一部件：**服务代理、事件桥、页面宿主�
 | `ctx.agentLoop` | bundle | 补端口 | Turn 执行器；外部执行器接口（ExecutorCapabilities） | DSH 中循环本身是一个可替换插件。落点是 Magi 已预留的外部执行器接口，见第 9 节 | 0 |
 | `ctx.agents` | core | 补端口 | Task / Thread / 角色 | DSH 是活 Agent 句柄与 create/resume 工厂；Magi 以句柄代理加提案表达，不暴露活对象 | 8 |
 | `ctx.agentPresets` | core | 新建 | 角色（agent-role）与能力单元 | 按决议：插件全局安装启停，会话能力由预设从全局已启用插件中组合；需先做能力单元注册表 | 1 |
-| `ctx.agentDefaultModel` | core | 已有 | 主对话默认模型选择 | 翻译层已接（只读无凭据投影） | 3 |
+| `ctx.agentDefaultModel` | core | 已有能力 | 主对话默认模型选择 | 默认模型的只读无凭据投影 | 3 |
 | `ctx.agentTeams` | core | 新建 | 子代理派发与计划 | 共享任务 DAG 无对应，需设计 | 0 |
 | `ctx.subagents` | seam | 补端口 | agent_spawn 与角色绑定 | DSH 有 6 种实现（进程内 spawn/fork 等）；现仅有只能阻止的 guard 钩子 | 1 |
 | `ctx.subagentModelSelection` | core | 补端口 | 角色模型绑定 | DSH 默认关闭的设置命名空间；Magi 绑定在角色上 | 0 |
@@ -173,8 +190,8 @@ Node 宿主保留四个统一部件：**服务代理、事件桥、页面宿主�
 | `ctx.planMode` | core | 新建 | 计划（magi-plan） | 已核对：Magi 的 PlanStore 是用户可见的阶段计划（最多 12 项），没有“计划模式”及其退出流程 | 0 |
 | `ctx.goals` | core | 补端口 | 目标（Goal） | Magi 原生拥有；现被明确拒绝，需放开读写 | 1 |
 | `ctx.schedule` | core | 补端口 | 插件作业调度 | Magi 现仅调度插件命令；DSH 是定时向目标会话排入消息 | 0 |
-| `ctx.userQuestions` | seam | 已有 | ask_user_question | seam | 1 |
-| `ctx.commands` | core | 已有 | 命令贡献 | 翻译层已接 | 14 |
+| `ctx.userQuestions` | seam | 已有能力 | ask_user_question | seam | 1 |
+| `ctx.commands` | core | 已有能力 | 命令贡献 | 命令注册与执行 | 14 |
 | `ctx.skills` | seam | 补端口 | 技能（skill-runtime） | 现仅接入全局文本技能；其他调用策略、资源根、provider、agent 作用域未接 | 9 |
 | `ctx.compaction` | seam | 补端口 | 上下文压缩（context-runtime） | seam，后端可替换；Magi 现为单一权威，放开需设计 | 0 |
 | `ctx.tokenMeter` | core | 补端口 | 用量权威（usage-authority） | 现只能观察已提交用量 | 0 |
@@ -183,9 +200,9 @@ Node 宿主保留四个统一部件：**服务代理、事件桥、页面宿主�
 | `ctx.tools` | core | 补端口 | 工具注册与执行 | 注册已有；pre-execute 的 allow/ask、execute 环绕、restrict 需补 | 34 |
 | `ctx.approval` | seam | 补端口 | 审批与安全规则（safety-gate） | 按决议完全放行：插件可决定审批，审批事实仍由 daemon 记录来源 | 0 |
 | `ctx.permissionPresets` | core | 补端口 | 访问档位（Restricted / FullAccess） | 对应 workspace-write / danger-full-access 预设 | 0 |
-| `ctx.llm` | seam | 已有 | 模型数据源（modelSources） | 翻译层已接；stream / prepareCall 仍是 partial | 9 |
+| `ctx.llm` | seam | 已有能力 | 模型数据源（modelSources）与模型调用 | 数据源注册与模型调用均已有；`stream`、`prepareCall` 按合约完整实现 | 9 |
 | `ctx.deepseekLlmApiExtensions` | seam | 补端口 | 模型请求拦截 | 请求体扩展需要模型请求前的拦截端口 | 0 |
-| `ctx.sessionLogDeepSeek` | core | 无需 | — | DeepSeek 会话日志上传策略，绑定其账号体系 | 0 |
+| `ctx.sessionLogDeepSeek` | core | 不提供 | — | DeepSeek 会话日志上传策略，绑定其账号体系 | 0 |
 
 ### 二、执行环境（工具背后的可替换后端）
 
@@ -202,11 +219,11 @@ Node 宿主保留四个统一部件：**服务代理、事件桥、页面宿主�
 | `ctx.ptcRuntime` | seam | 新建 | — | PTC（代码执行式工具调用）模式，Magi 无 | 0 |
 | `ctx.ssh` | core | 新建 | — | Magi 无 SSH 后端 | 0 |
 | `ctx.lsp` | seam | 新建 | — | Magi 无 LSP 工具 | 0 |
-| `ctx.web` | seam | 已有 | web_search / web_fetch | 翻译层已接联网提供方选择 | 0 |
+| `ctx.web` | seam | 已有能力 | web_search / web_fetch | 联网提供方选择 | 0 |
 | `ctx.spillStore` | seam | 新建 | 工具结果预算与历史压缩 | 已核对：Magi 用预算与历史压缩处理超长输出，没有“落盘并返回引用”的机制 | 0 |
 | `ctx.workingDirectory` | seam | 补端口 | 会话工作目录 | 现仅有调用期 cwd 投影 | 1 |
 | `ctx.worktrees` | seam | 补端口 | Git 工作树（magi-git）与任务租约 | seam | 0 |
-| `ctx.attachments` | seam | 已有 | 私有图片服务 | 翻译层已接图片读写；其余附件语义待补 | 3 |
+| `ctx.attachments` | seam | 补端口 | 私有图片服务 | 图片读写已有；文件附件等其余语义补齐后才算完整 | 3 |
 | `ctx.fileReferences` | seam | 补端口 | 上下文文件引用 | seam | 0 |
 | `ctx.workflowEngine` | seam | 新建 | — | DSH：模型编写的 JS 脚本编排并发子代理。Magi 有子代理派发与计划，没有脚本编排引擎；本样本中 0 个插件使用 | 0 |
 
@@ -214,7 +231,7 @@ Node 宿主保留四个统一部件：**服务代理、事件桥、页面宿主�
 
 | ctx 服务 | DSH 角色 | 处置 | Magi 对应 | 说明 | 样本使用 |
 | --- | --- | --- | --- | --- | --- |
-| `ctx.mcpResources` | seam | 已有 | MCP 客户端 | 翻译层打入上游 MCP 客户端，调用经 Magi 工具入口 | 0 |
+| `ctx.mcpResources` | seam | 已有能力 | MCP 客户端 | 上游 MCP 客户端作为普通依赖运行，工具调用经 Magi 工具入口 | 0 |
 | `ctx.mcpManager` | core | 补端口 | MCP 服务器配置与状态 | Magi 的 MCP 管理在设置中，未向插件开放 | 0 |
 | `ctx.browserUse` | seam | 补端口 | 内置浏览器（browser-authority） | DSH 是 provider 注册；Magi 浏览器由权威状态拥有 | 0 |
 | `ctx.computerUse` | seam | 新建 | — | Magi 无 computer use | 0 |
@@ -225,79 +242,79 @@ Node 宿主保留四个统一部件：**服务代理、事件桥、页面宿主�
 | `ctx.speechController` | core | 新建 | — | 随 speechToText | 0 |
 | `ctx.forge` | seam | 新建 | — | 代码托管变更请求；Magi 有 Git 能力和 Super-agent 设计稿，尚无对应服务 | 0 |
 | `ctx.forgeSession` | service | 新建 | — | 随 forge | 0 |
-| `ctx.forgePanel` | service | 页面宿主 | — | 随 forge 的界面远程服务 | 0 |
+| `ctx.forgePanel` | service | 宿主服务 | — | 随 forge 的界面远程服务 | 0 |
 | `ctx.webhookRuntime` | core | 新建 | — | 外部事件投递 | 0 |
 
 ### 四、凭据、设置与存储
 
 | ctx 服务 | DSH 角色 | 处置 | Magi 对应 | 说明 | 样本使用 |
 | --- | --- | --- | --- | --- | --- |
-| `ctx.credentials` | seam | 新建 | — | DSH 凭据引用 seam；翻译层目前保持缺席，必需凭据的业务拒绝安装 | 9 |
+| `ctx.credentials` | seam | 新建 | — | DSH 凭据引用 seam；建成前不提供，必需它的插件启动失败并说明 | 9 |
 | `ctx.authorization` | seam | 新建 | — | 凭据获取流程注册，随 credentials | 0 |
-| `ctx.deepseekAccount` | service | 无需 | — | 绑定 DeepSeek 账号体系 | 0 |
-| `ctx.settings` | core | 已有 | 插件设置（CAS） | 翻译层已接 | 14 |
-| `ctx.configEditor` | core | 已有 | 插件设置写入 | 随 settings | 0 |
+| `ctx.deepseekAccount` | service | 不提供 | — | 绑定 DeepSeek 账号体系 | 0 |
+| `ctx.settings` | core | 已有能力 | 插件设置（CAS） | 设置读取与 CAS 写入 | 14 |
+| `ctx.configEditor` | core | 已有能力 | 插件设置写入 | 随 settings | 0 |
 | `ctx.storage` | seam | 补端口 | 插件资源存储 | Magi 有带版本的资源；DSH 是通用后端 seam（JSON / SQLite） | 0 |
 | `ctx.storageDomain` | core | 补端口 | 插件资源存储 | 随 storage | 4 |
 | `ctx.workspaceRegistry` | core | 补端口 | 工作区（magi-workspace） | 只读投影 | 4 |
 
-### 五、宿主、客户端与 API 控制器（Magi 自有界面，由页面宿主提供最小外观）
+### 五、宿主、客户端与 API 控制器（Magi 自有产品服务：经 DSH 合约完整提供，或不提供）
 
 | ctx 服务 | DSH 角色 | 处置 | Magi 对应 | 说明 | 样本使用 |
 | --- | --- | --- | --- | --- | --- |
-| `ctx.connection` | core | 页面宿主 | daemon 已认证路由 | 翻译层已 shim | 14 |
-| `ctx.connection.authentication` | seam | 页面宿主 | — | 宿主认证，Magi 自有 | 0 |
-| `ctx.webServer` | core | 页面宿主 | 插件私有路由（api.route） | 翻译层已接；监听器与外壳相关成员无意义 | 28 |
-| `ctx.webApp` | core | 页面宿主 | — | DSH Web GUI 地址 | 0 |
-| `ctx.clientModules` | core | 页面宿主 | 视图加载 | 插件客户端模块打包与服务 | 0 |
-| `ctx.typert` | core | 页面宿主 | 插件私有 Remote 路由 | 翻译层已接 JSON unary；流与 Host 对象查找未接 | 1 |
-| `ctx.typertGateway` | core | 页面宿主 | 同上 | 随 typert | 0 |
-| `ctx.remoteAccess` | core | 页面宿主 | — | 远程访问，Magi 自有 | 0 |
-| `ctx.hmr` | core | 页面宿主 | daemon 运行目录收敛 | 翻译层已 shim（runExclusive、reconcileProfile） | 1 |
-| `ctx.pluginManager` | core | 页面宿主 | 插件管理入口 | 翻译层已 shim；写操作沿 Magi 生命周期 | 5 |
-| `ctx.pluginMarket` | core | 页面宿主 | 插件中心 | Magi 自有 | 0 |
-| `ctx.pluginRegistryProbe` | core | 页面宿主 | — | DSH 插件管理界面使用 | 0 |
-| `ctx.profileContext` | core | 页面宿主 | 调用期 profile 身份 | 翻译层已 shim | 4 |
-| `ctx.headlessStartup` | core | 无需 | — | DSH 无头运行选项 | 0 |
-| `ctx.sessionController` | core | 页面宿主 | Magi API | 会话命令与冷读，Magi 自有 API | 2 |
-| `ctx.sessionStatus` | core | 页面宿主 | Magi 界面 | 已读与未读标记 | 0 |
-| `ctx.sessionFileReferences` | core | 页面宿主 | Magi API | 文件引用远程适配 | 0 |
-| `ctx.sessionSkillCatalog` | core | 页面宿主 | Magi API | 技能目录远程适配 | 0 |
-| `ctx.jobController` | core | 页面宿主 | Magi API | 后台作业观察流 | 0 |
-| `ctx.credentialsController` | core | 页面宿主 | — | 随 credentials | 0 |
-| `ctx.settingsController` | core | 页面宿主 | Magi 设置 API | 设置远程适配 | 0 |
-| `ctx.workspaceFiles` | core | 页面宿主 | Magi API | 工作区文件读取与变更流 | 0 |
-| `ctx.workspaceChanges` | core | 页面宿主 | Magi 变更视图 | 工作区变更摘要 | 0 |
-| `ctx.terminalController` | core | 页面宿主 | Magi 终端面板 | 用户终端的远程适配，Magi 自有 | 0 |
-| `ctx.workspaceController` | core | 页面宿主 | Magi API | 工作区命令 | 0 |
-| `ctx.directoryPicker` | seam | 页面宿主 | 桌面目录选择 | seam，Magi 由 Electron 宿主承担 | 0 |
-| `ctx.directoryPickerController` | core | 页面宿主 | 桌面目录选择 | 随 directoryPicker | 0 |
-| `ctx.fileUploads` | core | 页面宿主 | — | 客户端文件上传 | 0 |
+| `ctx.connection` | core | 宿主服务 | daemon 已认证连接 | 按合约完整提供 | 14 |
+| `ctx.connection.authentication` | seam | 宿主服务 | — | 宿主认证，Magi 自有 | 0 |
+| `ctx.webServer` | core | 宿主服务 | 插件私有路由 | 路由经 daemon 转交；其余成员逐项核对后完整提供 | 28 |
+| `ctx.webApp` | core | 宿主服务 | — | DSH Web GUI 地址 | 0 |
+| `ctx.clientModules` | core | 宿主服务 | 视图加载 | 插件客户端模块打包与服务 | 0 |
+| `ctx.typert` | core | 宿主服务 | 插件私有 Remote 路由 | JSON unary 已有；流与 Host 对象查找补齐后才算完整 | 1 |
+| `ctx.typertGateway` | core | 宿主服务 | 同上 | 随 typert | 0 |
+| `ctx.remoteAccess` | core | 宿主服务 | — | 远程访问，Magi 自有 | 0 |
+| `ctx.hmr` | core | 不提供 | — | 操作 DSH profile 文件与模块热替换；不提供（决策 13） | 1 |
+| `ctx.pluginManager` | core | 宿主服务 | 插件生命周期 | 在 Magi 插件生命周期上完整实现；安装、启停、更新、卸载经用户确认 | 5 |
+| `ctx.pluginMarket` | core | 宿主服务 | 插件中心 | Magi 自有 | 0 |
+| `ctx.pluginRegistryProbe` | core | 宿主服务 | — | DSH 插件管理界面使用 | 0 |
+| `ctx.profileContext` | core | 不提供 | — | DSH profile 身份；不提供（决策 13） | 4 |
+| `ctx.headlessStartup` | core | 不提供 | — | DSH 无头运行选项 | 0 |
+| `ctx.sessionController` | core | 宿主服务 | Magi API | 会话命令与冷读，Magi 自有 API | 2 |
+| `ctx.sessionStatus` | core | 宿主服务 | Magi 界面 | 已读与未读标记 | 0 |
+| `ctx.sessionFileReferences` | core | 宿主服务 | Magi API | 文件引用的远程服务 | 0 |
+| `ctx.sessionSkillCatalog` | core | 宿主服务 | Magi API | 技能目录的远程服务 | 0 |
+| `ctx.jobController` | core | 宿主服务 | Magi API | 后台作业观察流 | 0 |
+| `ctx.credentialsController` | core | 宿主服务 | — | 随 credentials | 0 |
+| `ctx.settingsController` | core | 宿主服务 | Magi 设置 API | 设置的远程服务 | 0 |
+| `ctx.workspaceFiles` | core | 宿主服务 | Magi API | 工作区文件读取与变更流 | 0 |
+| `ctx.workspaceChanges` | core | 宿主服务 | Magi 变更视图 | 工作区变更摘要 | 0 |
+| `ctx.terminalController` | core | 宿主服务 | Magi 终端面板 | 用户终端的远程服务，Magi 自有 | 0 |
+| `ctx.workspaceController` | core | 宿主服务 | Magi API | 工作区命令 | 0 |
+| `ctx.directoryPicker` | seam | 宿主服务 | 桌面目录选择 | seam，Magi 由 Electron 宿主承担 | 0 |
+| `ctx.directoryPickerController` | core | 宿主服务 | 桌面目录选择 | 随 directoryPicker | 0 |
+| `ctx.fileUploads` | core | 宿主服务 | — | 客户端文件上传 | 0 |
 
-### 六、遥测、反馈与实验服务（DSH 插件以条件注入使用，缺席时自行降级）
+### 六、遥测、反馈与实验服务（Magi 不提供；DSH 插件以可选注入使用，自行跳过）
 
 | ctx 服务 | DSH 角色 | 处置 | Magi 对应 | 说明 | 样本使用 |
 | --- | --- | --- | --- | --- | --- |
-| `ctx.otel` | service | 无需 | — | 遥测 | 0 |
-| `ctx.productAnalytics` | service | 无需 | — | 产品统计 | 0 |
-| `ctx.productTelemetry` | service | 无需 | — | 产品遥测 | 0 |
-| `ctx.sessionTelemetry` | seam | 无需 | — | 会话遥测 seam | 0 |
-| `ctx.messageFeedback` | core | 无需 | — | 消息反馈，写入 DSH canonical 日志 | 0 |
-| `ctx.sessionFeedback` | core | 无需 | — | 会话级反馈 | 0 |
-| `ctx.actionCards` | service | 无需 | — | 实验：行动卡片 | 0 |
-| `ctx.pluginRecommendations` | service | 无需 | — | 实验：插件推荐 | 0 |
-| `ctx.deepseekChatImport` | service | 无需 | — | 导入 DeepSeek 聊天导出 | 0 |
-| `ctx.cotTranslation` | service | 无需 | — | 实验：推理翻译 | 0 |
-| `ctx.translator` | service | 无需 | — | 实验：文本翻译 | 0 |
-| `ctx.liveshareShares` | service | 无需 | — | 实验：实时共享 | 0 |
-| `ctx.claudeCodeMods` | core | 无需 | — | 实验：Claude Code 模组 | 0 |
-| `ctx.inspector` | core | 无需 | — | DSH 调试观察 | 0 |
-| `ctx.dynamicCordisRunner` | core | 无需 | — | DSH 开发调试 | 0 |
-| `ctx.cordisInspect` | core | 无需 | — | DSH 开发调试 | 0 |
+| `ctx.otel` | service | 不提供 | — | 遥测 | 0 |
+| `ctx.productAnalytics` | service | 不提供 | — | 产品统计 | 0 |
+| `ctx.productTelemetry` | service | 不提供 | — | 产品遥测 | 0 |
+| `ctx.sessionTelemetry` | seam | 不提供 | — | 会话遥测 seam | 0 |
+| `ctx.messageFeedback` | core | 不提供 | — | 消息反馈，写入 DSH canonical 日志 | 0 |
+| `ctx.sessionFeedback` | core | 不提供 | — | 会话级反馈 | 0 |
+| `ctx.actionCards` | service | 不提供 | — | 实验：行动卡片 | 0 |
+| `ctx.pluginRecommendations` | service | 不提供 | — | 实验：插件推荐 | 0 |
+| `ctx.deepseekChatImport` | service | 不提供 | — | 导入 DeepSeek 聊天导出 | 0 |
+| `ctx.cotTranslation` | service | 不提供 | — | 实验：推理翻译 | 0 |
+| `ctx.translator` | service | 不提供 | — | 实验：文本翻译 | 0 |
+| `ctx.liveshareShares` | service | 不提供 | — | 实验：实时共享 | 0 |
+| `ctx.claudeCodeMods` | core | 不提供 | — | 实验：Claude Code 模组 | 0 |
+| `ctx.inspector` | core | 不提供 | — | DSH 调试观察 | 0 |
+| `ctx.dynamicCordisRunner` | core | 不提供 | — | DSH 开发调试 | 0 |
+| `ctx.cordisInspect` | core | 不提供 | — | DSH 开发调试 | 0 |
 
 ## 7. 公共能力分组
 
-第 6 节的 113 行是 DSH 的服务清单，不是 Magi 要新增的 113 个服务。Magi 按真实任务形成少数几项公共能力，DSH 的服务名只作为 Node 宿主里的外观，映射到这些能力：
+第 6 节的 113 行是 DSH 的服务清单，不是 Magi 要新增的 113 个服务。Magi 按真实任务形成少数几项公共能力；Node 插件宿主按 DSH 合约实现这些服务，背后调用这些能力：
 
 | 公共能力 | 涵盖的 DSH 接缝 | 依据 |
 | --- | --- | --- |
@@ -327,12 +344,14 @@ DSH 的界面是**槽位系统**：宿主和各界面包声明槽位，插件的
 
 槽位表（`scripts/compat/runtime/client/slot-context.mjs`，核对的是 DSH 0.2.2-rc.1）登记了 18 个：
 - **6 个挂载**：主页面 `main`、设置 `settings.section`、`settings.plugins.tab`、`plugins.tab`、`plugins.bundle.config`、右栏 `sidebar.right.pane.tab`。
-- **5 个别名，由已挂载槽位承担，不算缺口**：`settings.section.icon`、`plugins.row.config`（与 `plugins.bundle.config` 是同一个配置组件）、`sidebar.panellist`、`sidebar.right.pane.tab.title`、`sidebar.right.tab.guide.entry`（右栏标签的名称与导航）。
-- **3 个接收但内容不显示**：`sidebar.footer.action`、`conversation.input.left`、`conversation.input.right`。
+- **5 个别名（现状：组件被接收，但不按合约渲染，由别的槽位或清单数据代替）**：`settings.section.icon`、`plugins.row.config`（与 `plugins.bundle.config` 是同一个配置组件）、`sidebar.panellist`、`sidebar.right.pane.tab.title`、`sidebar.right.tab.guide.entry`（右栏标签的名称与导航）。
+- **3 个接收但内容不显示（现状：静默丢弃，没有告诉用户）**：`sidebar.footer.action`、`conversation.input.left`、`conversation.input.right`。
 - **2 个拒绝安装**：`conversation.chat.node`、`conversation.input.dock`。
 - **2 个明确未接入**：`conversation.session.header.actions`、`conversation.chat.turnTail`。其余槽位没有登记。
 
 **关键事实：安装时只要插件注册了既不挂载、也不是别名或忽略的槽位，安装就会直接失败**（提示“该插件需要尚未接入的界面位置”）。DSH 当前 master 的槽位与 rc.1 有出入，下表以 master 为准。
+
+**目标规则（取代别名与静默丢弃）**：范围内的槽位，插件注册的每个组件都按 DSH 合约在对应位置渲染；同一个组件注册到两个范围内槽位时，渲染位置相同的只渲染一次，不同组件各自渲染。范围外的槽位按 8.4 接收、不渲染，并在安装预览与详情里明示。不再有“别名”“接收但静默不显示”。
 
 ### 8.3 实测（样本 95 个包，对注册调用做静态匹配）
 
@@ -348,7 +367,7 @@ DSH 的界面是**槽位系统**：宿主和各界面包声明槽位，插件的
 
 **没有可显示的页面，也不能因此否定仍然可用的工具或模型业务。** 只提供工具、模型数据源、命令或后台能力的插件，没有任何挂载槽位时照常安装运行，只是没有设置页入口。
 
-这改变了现有行为：当前 `client-assets.mjs` 对未登记槽位直接抛错，对“没有任何挂载槽位”也抛错（“不交付空白设置页”）。落地时同步清退这两条拒绝，并让运行期的动态槽位注册走同一规则；依赖它们的验收与文案同步更新。
+这改变了现有行为：当前 `client-assets.mjs` 对未登记槽位直接抛错，对“没有任何挂载槽位”也抛错（“不交付空白设置页”）。`client-assets.mjs` 属于第 3.4 节的删除清单；槽位在运行期注册时判定范围，依赖旧行为的验收与文案同步更新。
 
 按样本，这样后端无阻塞的 50 个插件都能通过界面准入；其中受影响的 7 个会带着“界面功能缺失”的说明安装。这仍是安装准入，不是业务验收。
 
@@ -356,12 +375,12 @@ DSH 的界面是**槽位系统**：宿主和各界面包声明槽位，插件的
 
 同一前缀的槽位并不都是“把正文渲染进页面”：它们收到的参数、需要的交互和对应的 Magi 承载方式各不相同（配置正文要 `form`，详情动作要 `subject`，设置关闭按钮属于 DSH 设置外壳，整块右栏要 `width`）。下表按槽位逐项确定，数据取自 DSH 的 `slot-catalog`：“宿主提供的参数”是 owner 传给组件的属性，“标准套件”是组件可调用的 hook 个数（根作用域 10 个，会话作用域 19 个，见 8.6）。
 
-“范围”列：**已挂载**＝现有；**待登记**＝范围内，尚未登记，需要接入；**别名**＝由已挂载槽位承担；**范围外**＝DSH 的外壳或会话区，Magi 自有，不渲染，计入缺失说明；**按需**＝样本中没有插件使用，出现需求再对应。
+“范围”列：**已挂载**＝现有；**待登记**＝范围内，尚未登记，需要按合约渲染；**范围外**＝DSH 的外壳或会话区，Magi 自有，不渲染，计入缺失说明；**按需**＝范围内但样本中没有插件使用，出现需求再接入，接入前按范围外明示。
 
 | 槽位 | 内容性质（宿主提供的参数） | 标准套件 | Magi 承载方式 | 范围 | 样本 |
 | --- | --- | --- | --- | --- | --- |
 | `settings.section` | 设置页正文；owner 提供 close() | 10 | 该插件的设置页正文 | 已挂载 | 12 |
-| `settings.section.icon` | 设置导航图标（size、active） | 10 | 用清单图标，组件作为别名接收 | 别名 | 1 |
+| `settings.section.icon` | 设置导航图标（size、active） | 10 | 渲染为该插件设置导航入口的图标 | 待登记 | 1 |
 | `settings.plugins.tab` | 插件分类里的标签页内容（children） | 10 | 并入该插件的设置页 | 已挂载 | 5 |
 | `settings.general.item` | 常规设置条目（children） | 10 | Magi 偏好页自有 | 范围外 | 0 |
 | `settings.header` | 设置外壳页头（children） | 10 | Magi 外壳自有 | 范围外 | 0 |
@@ -375,7 +394,7 @@ DSH 的界面是**槽位系统**：宿主和各界面包声明槽位，插件的
 | `settings.models.provider-card` | DSH 模型提供商卡片（provider、configured） | 10 | 同上 | 范围外 | 1 |
 | `settings.models.sign-in` | DSH 模型登录 | 10 | 同上 | 范围外 | 0 |
 | `plugins.bundle.config` | 插件配置正文（view、form） | 10 | 该插件设置页正文；form 由 Magi 的设置 CAS 提供 | 已挂载 | 5 |
-| `plugins.row.config` | 插件行配置（view、form） | 10 | 与 bundle.config 同一个配置组件 | 别名 | 7 |
+| `plugins.row.config` | 插件行配置（view、form） | 10 | 该插件设置页正文；与 bundle.config 是同一组件时只渲染一次 | 待登记 | 7 |
 | `plugins.tab` | 插件管理标签页（install、update、openPackage） | 10 | 该插件的设置页；install、update 经 Magi 插件操作桥 | 已挂载 | 3 |
 | `plugins.item` | 插件行内容（view、form） | 10 | 设置页正文的摘要区 | 待登记 | 5 |
 | `plugins.detail.section` | 详情分区（subject） | 10 | 设置页正文的附加分区；subject 为插件身份与状态 | 待登记 | 2 |
@@ -388,9 +407,9 @@ DSH 的界面是**槽位系统**：宿主和各界面包声明槽位，插件的
 | `rightbar` | 整块右栏（width、viewportWidth、canShow） | 10 | Magi 右栏自有，不支持整块替换，只支持标签页 | 范围外 | 0 |
 | `rightbar.session` | 整块会话右栏（同上） | 19 | 同上 | 范围外 | 0 |
 | `sidebar.right.pane.tab` | 右栏标签页正文（key；会话作用域） | 19 | 右栏标签页；需要 8.6 的标准套件 | 已挂载 | 5 |
-| `sidebar.right.pane.tab.title` | 标签标题 | 19 | 用作标签名称，组件作为别名接收 | 别名 | 4 |
+| `sidebar.right.pane.tab.title` | 标签标题 | 19 | 渲染为该右栏标签的标题 | 待登记 | 4 |
 | `sidebar.right.tab.guide` | DSH 右栏引导页正文 | 19 | Magi 右栏没有引导页 | 范围外 | 0 |
-| `sidebar.right.tab.guide.entry` | 引导页卡片（entryId、title） | 19 | 同上 | 别名 | 2 |
+| `sidebar.right.tab.guide.entry` | 引导页卡片（entryId、title） | 19 | 同上 | 范围外 | 2 |
 | `sidebar.right.tab.guide.actions` | 引导页更多菜单 | 10 | 同上 | 范围外 | 0 |
 | `sidebar.right.tab.document` | DSH 文档预览正文（content、scrollportRef 等） | 19 | 按 Magi 右栏文件预览逐个对应 | 按需 | 0 |
 | `sidebar.right.tab.document.action` | 文档预览工具栏控件 | 19 | 同上 | 按需 | 0 |
@@ -404,7 +423,7 @@ DSH 的界面是**槽位系统**：宿主和各界面包声明槽位，插件的
 
 ### 8.6 标准套件（组件可调用的 hook）
 
-DSH 在槽位组件里提供一套标准 hook：根作用域（设置、主页面、插件管理）10 个，会话作用域（右栏标签页）在此基础上再加 9 个。页面宿主要为组件提供它们才能运行。**只实现样本中实际用到的，其余在被调用时明确返回“未提供”，并列入缺失说明。**
+DSH 在槽位组件里提供一套标准 hook：根作用域（设置、主页面、插件管理）10 个，会话作用域（右栏标签页）在此基础上再加 9 个。页面宿主要为组件提供它们才能运行。**标准套件是槽位合约的一部分：某个作用域（根或会话）的槽位，只有在该作用域的套件完整提供后才算交付，不做只实现一部分就上线的作用域。** 实现顺序按样本用量；依赖 Magi 尚无能力的 hook，按第 4 节先补能力。
 
 | hook | 作用域 | 样本使用（95 个包） | Magi 提供方式 |
 | --- | --- | --- | --- |
@@ -415,13 +434,13 @@ DSH 在槽位组件里提供一套标准 hook：根作用域（设置、主页�
 | `useChat`、`useInput` | 会话 | 各 2 | 依赖“会话读取与事件”，按需 |
 | `useWorkspaces` | 根 | 1 | 工作区投影（依赖 `workspaceRegistry`） |
 | `useSessionStatus` | 根 | 1 | 会话状态投影 |
-| 其余 11 个：`useRemoteAccess`、`useResource`、`useContextMenu`、`usePanelInfo`、`useSessionRetainInfo`、`useSessionAccess`、`useWorkspaceAccess`、`useConversation`、`useAccess`、`useTrajectory`，以及 `sessionId` 属性 | — | 0（`sessionId` 是属性，随会话提供） | 不实现，调用时明确报未提供 |
+| 其余 11 个：`useRemoteAccess`、`useResource`、`useContextMenu`、`usePanelInfo`、`useSessionRetainInfo`、`useSessionAccess`、`useWorkspaceAccess`、`useConversation`、`useAccess`、`useTrajectory`，以及 `sessionId` 属性 | — | 0（`sessionId` 是属性，随会话提供） | 随所属作用域完整实现；依赖尚无能力的先补能力 |
 
 统计是对 hook 名称做静态匹配，可能把同名的普通变量算进去，只作优先级参考。
 
 ### 8.7 槽位清单
 
-122 个槽位逐项列出。“Magi 现状”：挂载 = 已渲染；别名 = 由已挂载槽位承担；接收不显示 = 能安装但内容丢失；拒绝 = 会拒绝安装；空 = 未登记，安装会失败。“样本”为 95 个包中注册该槽位的包数。
+122 个槽位逐项列出。“Magi 现状”是平台重构前的行为：挂载 = 已渲染；别名 = 组件被接收但不按合约渲染；接收不显示 = 能安装但内容丢失；拒绝 = 会拒绝安装；空 = 未登记，安装会失败。“范围”是目标：待登记 = 按合约渲染；暂不支持 = 范围外，按 8.4 明示缺失。“样本”为 95 个包中注册该槽位的包数。
 
 | 槽位 | 基数 | 作用域 | Magi 现状 | 范围 | 样本 |
 | --- | --- | --- | --- | --- | --- |
@@ -490,7 +509,7 @@ DSH 在槽位组件里提供一套标准 hook：根作用域（设置、主页�
 | `plugins.detail.badge` | list | root |  | 待登记 | 1 |
 | `plugins.detail.section` | list | root |  | 待登记 | 2 |
 | `plugins.item` | list | root |  | 待登记 | 5 |
-| `plugins.row.config` | keyed | root | 别名 | 别名 | 7 |
+| `plugins.row.config` | keyed | root | 别名 | 待登记 | 7 |
 | `plugins.tab` | list | root | 挂载 | 已挂载 | 3 |
 | `rightbar` | single | root |  | 范围外 | 0 |
 | `rightbar.session` | single | session |  | 范围外 | 0 |
@@ -507,7 +526,7 @@ DSH 在槽位组件里提供一套标准 hook：根作用域（设置、主页�
 | `settings.onboarding` | list | root |  | 范围外 | 0 |
 | `settings.plugins.tab` | list | root | 挂载 | 已挂载 | 5 |
 | `settings.section` | list | root | 挂载 | 已挂载 | 12 |
-| `settings.section.icon` | list | root | 别名 | 别名 | 1 |
+| `settings.section.icon` | list | root | 别名 | 待登记 | 1 |
 | `settings.trigger` | single | root |  | 范围外 | 0 |
 | `shell.bottom` | single | root |  | 暂不支持 | 0 |
 | `shell.leading` | single | root |  | 暂不支持 | 0 |
@@ -521,7 +540,7 @@ DSH 在槽位组件里提供一套标准 hook：根作用域（设置、主页�
 | `sidebar.panellist` | list | root | 别名 | 暂不支持 | 6 |
 | `sidebar.panellist.actions` | list | root |  | 暂不支持 | 0 |
 | `sidebar.right.pane.tab` | keyed | session | 挂载 | 已挂载 | 5 |
-| `sidebar.right.pane.tab.title` | keyed | session | 别名 | 别名 | 4 |
+| `sidebar.right.pane.tab.title` | keyed | session | 别名 | 待登记 | 4 |
 | `sidebar.right.tab.document` | keyed | session |  | 按需 | 0 |
 | `sidebar.right.tab.document.action` | keyed | session |  | 按需 | 0 |
 | `sidebar.right.tab.document.actions` | list | session |  | 按需 | 0 |
@@ -530,7 +549,7 @@ DSH 在槽位组件里提供一套标准 hook：根作用域（设置、主页�
 | `sidebar.right.tab.files.actions` | list | session |  | 按需 | 0 |
 | `sidebar.right.tab.guide` | chain | session |  | 范围外 | 0 |
 | `sidebar.right.tab.guide.actions` | list | root |  | 范围外 | 0 |
-| `sidebar.right.tab.guide.entry` | keyed | session | 别名 | 别名 | 2 |
+| `sidebar.right.tab.guide.entry` | keyed | session | 别名 | 暂不支持 | 2 |
 | `sidebar.right.tab.menu.item` | list | session |  | 按需 | 0 |
 | `sidebar.session.action` | hoc | root |  | 暂不支持 | 0 |
 | `sidebar.session.row.hover` | list | root |  | 暂不支持 | 0 |
@@ -565,23 +584,38 @@ DSH 在槽位组件里提供一套标准 hook：根作用域（设置、主页�
 
 ## 10. 推进顺序
 
-以第 5 节的实测为依据，从被阻塞最多的接缝开始，每项独立设计、验证、交付，并同步清退对应的翻译代码。界面只做决策 7 的范围，其余暂不做。
+先重构插件平台，再逐项补能力。在翻译结构上逐个接缝推进，每一项都会在翻译里再长出补丁，所以平台重构排在所有接缝之前。界面只做决策 7 的范围。
 
-0. **合同先行（已确认）**：第 3 节的提供方合同、运行时语义和对象行为清单，以及能力组合最小合同（能力身份、提供方选择、组合顺序、会话绑定、生效时机）。它们影响后面每一项，已在 3.5 定稿。
-1. **会话读取与事件**：`sessions`、`agents`（句柄代理）、`session/event`、`agent/created`、`sessionProjections`、`sessionQuery`、`workspaceRegistry`，并提供标准套件里样本用到的 hook（8.6）。样本里阻塞插件最多。
-   - **已交付（2026-11-17）**：Rust 侧 `session.item` 观察钩子与 `sessionRead:["events"]` 授权——终态 canonical item 的有界投影（用户消息、助手文本、系统提示的正文最多 4096 字符，工具只给名称与是否失败，思考内容、工具参数与结果不转发），经真实 Node 宿主验证；清单校验要求钩子与授权同时声明。协议见扩展协议第 6 节。
-   - **未完成**：Node 兼容层把 DSH 的 `session/event`、`session/created` 映射到 `session.item` 与 `session.created`（目前翻译规则仍标 partial）；`sessions`/`agents` 句柄（含实例代次）；`agent/created`；`sessionProjections`、`sessionQuery`、`workspaceRegistry`；8.6 的标准套件 hook。
-2. **工具管线**：`tools/pre-execute`、`post-execute`、`result`、`tools.guard`，以及 `execute` 环绕。
-3. **凭据与持久业务数据**：`credentials` 与 `authorization`、`storage` 与 `storageDomain`，以及技能提供方 `skills.registerProvider`。
-4. **提供方端口**（dsh-purge 依赖）：`system-prompt/assemble` 整体改写、`llm/stream` 环绕、`agent/pre-step` 环绕、对象行为清单里的消息投影转换、`approval` 链；均遵守 3.1。
-5. **范围内的界面**：登记并渲染 `plugins.*`，提供 8.6 的标准套件，右栏 `sidebar.right.tab.*` 按需求逐个对应；范围外槽位与无页面插件按 8.4 的规则处理，同时清退 `client-assets.mjs` 里的两处拒绝。
-6. **能力组合的落地**：预设与会话绑定的实现（合同已在第 0 项定好，这里不再决定规则，只做实现与必要的界面）。
-7. **执行循环与会话存储后端**：按第 9 节，先审计，再做真实后端。
-8. **按需新建**：第 7 节最后一行列出的能力，按插件出现的实际需求逐个排期。
+0. **合同先行（已确认）**：第 3 节的提供方合同、运行时语义和对象行为清单，以及能力组合最小合同。已在 3.5 定稿。
+1. **插件平台重构**（第 3.4 节）：
+   - Node 插件宿主原生运行 DSH 合约，所有已启用插件在同一个 Cordis 宿主进程中（决策 12），配置来自 Magi 插件设置（决策 14）；
+   - 安装只做校验与放置，贡献全部在运行时注册；
+   - 现有已接通的能力（工具、命令、设置、模型数据源与模型调用、路由、技能、联网、插件生命周期、连接、图片）在新宿主中按合约完整重写；
+   - SDK 2 降为内部协议（决策 10），`plugin-authoring.md` 与 `extension-protocol-v1.md` 改写为内部协议文档或移除；
+   - 按删除清单删掉翻译层、垫片与 Rust 中的 DSH 兼容代码；
+   - 验收：样本包真实安装激活，能激活的包数不低于重构前。
+2. **会话读取与事件**：`sessions`、`agents`（句柄，含实例代次）、`session/event`、`session/created`、`agent/created`、`sessionProjections`、`sessionQuery`、`workspaceRegistry`，以及 8.6 中这些服务支撑的标准套件 hook。
+   - **现状（2026-11-17）**：daemon 的观察钩子已改为运行期按需订阅，`session.item` 投递完整的已提交条目，`turn.accepted/end` 带 `turnSeq`；这部分是正式能力。曾按旧结构在兼容层写过一个事件桥，其中失败原因、取消原因、工具结果消息 id、`seq`、`stream` 是在宿主里合成的，违反第 2 节，已丢弃；`session/event` 在平台重构后于新宿主中实现，兼容层仍按原状拒绝注册它。
+   - **需要先在内核补齐的事实**：会话内单调的事件序号；条目所属的模型步骤，以及步骤开始与结束；轮次结束原因（取消原因、失败的结构化事实）；助手消息的流记录与用量；工具结果的消息身份；子代理会话与主会话的归属关系。
+3. **工具管线**：`tools/pre-execute`、`post-execute`、`result`、`tools.guard`，以及 `execute` 环绕。
+4. **凭据与持久业务数据**：`credentials` 与 `authorization`、`storage` 与 `storageDomain`，以及技能提供方 `skills.registerProvider`。
+5. **提供方端口**（dsh-purge 依赖）：`system-prompt/assemble` 整体改写、`llm/stream` 环绕、`agent/pre-step` 环绕、对象行为清单里的消息投影转换、`approval` 链；均遵守 3.1。
+6. **范围内的界面**：按 8.2 的目标规则渲染范围内槽位（含 `plugins.*`、设置导航图标、右栏标签标题），按作用域完整提供 8.6 的标准套件；范围外槽位与无页面插件按 8.4 处理。
+7. **能力组合的落地**：预设与会话绑定的实现（合同已在第 0 项定好）。
+8. **执行循环与会话存储后端**：按第 9 节，先审计，再做真实后端。
+9. **按需新建**：第 7 节最后一行列出的能力，按插件出现的实际需求逐个排期。
 
 ## 11. 与项目指令的关系，及未验证的边界
 
-- 项目根目录 `AGENTS.md` 的“功能开发”一节仍指向旧设计文档的两个锚点（翻译功能的产品合同、每轮推进与完成门槛）。本文替代它们，但项目指令文件需要你确认后再改，我没有动。
-- 对既有不变量的影响：按决策 1，DSH 放行的事项不再保留“扩展只能阻止、不能批准”“提示只能追加”这类限制，由第 3.1 节的提供方合同取代；以下仍沿用：扩展不直接写 canonical 事实、一个事实一个写入口、调用与实例可失效、超时与队列有界、撤权优先、未支持的契约明确拒绝。具体字句由后续接口章节定稿。
+**已定事项**：原列为待定的宿主进程形态、profile 相关服务、插件配置归属，已按建议确定为决策 12–14（2026-11-17）。
+
+**与项目指令的关系：**
+- 项目根目录 `AGENTS.md` 的“功能开发”一节仍指向旧设计文档的两个锚点（翻译功能的产品合同、每轮推进与完成门槛）。本文替代它们，但项目指令文件需要用户确认后再改，尚未改动。
+- 对既有不变量的影响：按决策 1，DSH 放行的事项不再保留“扩展只能阻止、不能批准”“提示只能追加”这类限制，由第 3.1 节的提供方合同取代；以下仍沿用：插件不直接写 canonical 事实、一个事实一个写入口、调用与实例可失效、超时与队列有界、撤权优先、未支持的合约明确拒绝。具体字句由后续接口章节定稿。
 - 第 3 节的运行时合同已确认（3.5）；与 DSH 语义有出入处以 DSH 为准，每个接缝落地时核对。
-- **未验证**：本表未逐项审计 Magi 源码（已核对 4 项：`planMode`、`terminals`、`spillStore`、`terminalController`）；样本是搜索前 100 个、静态扫描，不代表生态整体，也没有任何业务验收；扫描器的“未登记”有一部分只是规则表没有收录，不等于 DSH 不支持；hook 与槽位的使用数是静态匹配，可能漏掉动态拼出的名字，也可能把同名变量算进去。
+
+**未验证：**
+- 本表未逐项审计 Magi 源码（已核对 4 项：`planMode`、`terminals`、`spillStore`、`terminalController`）。
+- 样本是搜索结果前 100 个，静态扫描，不代表生态整体，也没有任何业务验收；扫描器的“未登记”有一部分只是规则表没有收录。
+- hook 与槽位的使用数是静态匹配，可能漏掉动态拼出的名字，也可能把同名变量算进去。
+- 平台重构的工作量与样本的真实激活结果尚未测量。

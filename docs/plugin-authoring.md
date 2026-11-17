@@ -131,7 +131,6 @@ ui/…                       视图页面与静态资源，按需
 | `browser` | surface ID | 浏览器 surface，见第 5 节 |
 | `pluginManagement` | `install`／`lifecycle`／`compatibility`／`background` | 在线安装（完成即启用）／启停和卸载／修改精确版本豁免／页面请求完成后继续后台管理；各目标分别声明，豁免不能绕过 Magi 能力检查 |
 | `composer` | `["images"]` | 由插件原生页面把用户选择的图片加入当前会话输入框草稿；只能移除本插件页面自己接纳的图片或聚焦输入框，不会自动发送 |
-| `sessionRead` | `["events"]` | 允许声明 `session.item` 钩子，接收已到终态的会话条目（用户消息、助手文本、系统提示的有界正文，以及工具调用的名称与是否失败）；不含思考内容、工具参数与结果，不授予写入能力 |
 | `sessionRead` | `["directory"]` | 读取全部用户会话的标题、身份、项目归属与创建/更新时间；不含消息、路径或凭据，不授予任何会话写入能力 |
 
 `permissions` 里列出的每一项都在安装预览中展示，确认安装即获得全部声明；运行时的准入按已安装包的清单声明核对，没有单独的授权步骤。
@@ -330,13 +329,13 @@ await api.on('tool.call', async (event, ctx) => {
 
 **决定的写法**：返回 `undefined` 等同 `continue`；`{ decision: 'block', reason }` 必须带非空原因，会展示给用户；`{ decision: 'replace', patch }` 的 `patch` 必须是有界对象，形状由钩子决定。`block` 不能被其他插件撤销。
 
-**钩子目录**（清单中声明不在这张表里的钩子或模式，安装会被拒绝，而不是静默忽略）：
+**钩子目录**（清单中声明不在这张表里的钩子或模式，安装会被拒绝，而不是静默忽略。observe 钩子可以不在清单声明，运行时直接 `api.on` 订阅；guard 与 advise 必须声明）：
 
 | 钩子 | 可用模式 | 输入 | 可返回的 `patch` |
 | --- | --- | --- | --- |
 | `session.created` / `session.deleted` | observe | 脱敏的领域事件 | — |
 | `turn.accepted` / `turn.end` | observe | 接纳或终态事实，不含完整正文 | — |
-| `session.item` | observe | 终态的会话条目，需 `sessionRead:["events"]`；字段与去重规则见扩展协议第 6 节 | — |
+| `session.item` | observe | 已提交的完整会话条目（正文、思考、工具参数与结果）；字段与版本规则见扩展协议第 6 节 | — |
 | `input` | guard | `{ raw: { text, imageCount }, kind, requestId }` | 只能继续或阻止 |
 | `prompt.contribute` | advise | `{ target, phase, round, budget }` | `{ fragments: [{ id, stability, priority?, text }] }` |
 | `context.assemble` | advise | `{ sessionId, contextWindowTokens, rewritable: { from, to }, messages, omitted }` | `{ rewrites: [{ from, to, replacement: [{ role, text }] }] }` |
@@ -624,7 +623,7 @@ node scripts/pack-plugin.mjs <插件目录> <输出.zip>
 | 现象 | 原因与办法 |
 | --- | --- |
 | 安装报“发布包含未允许的文件类型或入口” | 包里有第 3 节之外的文件（`.DS_Store`、`README.md`、`package.json`、多套了一层目录……）；用 `-x '.*'` 重新打包 |
-| 启动失败，原因含 `RegistrationDenied` | 代码里 `api.on` / `api.tool` / `api.command` 绑定的名字，没有在清单里声明（或工具缺 `tools` 权限） |
+| 启动失败，原因含 `RegistrationDenied` | 代码里 `api.on` 绑定的 guard／advise 钩子、`api.tool` / `api.command` 绑定的名字，没有在清单里声明（或工具缺 `tools` 权限）；observe 钩子不需要声明 |
 | 启动超时 | `activate` 里有长时间等待或未 `await` 的注册；10 秒内必须返回 |
 | 工具、命令不出现 | 插件处于停用状态；工具还需要清单声明 `tools` 权限 |
 | 清单被拒绝 | 有未知字段；贡献 ID 重名；声明了 `extension` 却没有钩子、工具或命令；缺 `extension: ["full-trust"]` |

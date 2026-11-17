@@ -94,7 +94,7 @@ daemon 响应形状：
 
 | 方法 | Node API | 当前合同 |
 | --- | --- | --- |
-| `register.hook` | `api.on(name,handler)` | 只能绑定清单获批钩子 |
+| `register.hook` | `api.on(name,handler)` | guard／advise 只能绑定清单获批钩子；observe 钩子是订阅原语，运行中的实例可按需订阅，无需清单声明（扩展均以 `extension:["full-trust"]` 运行） |
 | `register.tool` | `api.tool(id,handler)` | 只能绑定清单或当前实例运行目录中声明且获 tools 授权的工具 |
 | `register.command` | `api.command(id,handler)` | 只能绑定清单或当前实例运行目录中的公开命令 |
 | `catalog.replace` | `api.catalog.replace(expectedRevision,catalog)` | 整体替换当前实例的动态目录，返回 `{revision}`；校验清单授权上界、唯一 ID、schema、大小及实例租约，见第 5 节 |
@@ -227,8 +227,8 @@ DSH 页面里的 `EventSource` 通过相同路由调用承载 SSE。兼容层保
 | 钩子 | 当前模式 | 输入／提案与落点 |
 | --- | --- | --- |
 | `session.created/deleted` | observe | 提交后的脱敏领域事件 |
-| `turn.accepted/end` | observe | 接纳／终态事实；不含完整正文 |
-| `session.item` | observe | 一个 canonical item 到达终态后的提交事实，需 `sessionRead:["events"]`。字段：`sessionId`、`workspaceId`、`turnId`、`turnSeq`、`itemId`、`itemSeq`、`itemVersion`、`kind`（`user_message`／`assistant_text`／`assistant_thinking`／`tool_call`／`task_status`／`system_notice`）、`status`、`threadId`、`createdAt`、`updatedAt`、`text`、`textTruncated`、`tool:{callId,name,failed}`。`text` 只给用户消息、助手文本和系统提示，最多 4096 字符并标记截断；思考内容、工具参数与结果不转发，需要时读会话快照。非终态与增量帧不投递；同一 item 可能因资源事实更新再次投递，按 `(itemId,itemVersion)` 去重；事件总线落后会丢事件，需要权威事实读快照 |
+| `turn.accepted/end` | observe | 接纳／终态事实（`sessionId`、`turnId`、`turnSeq`；终态另含 `outcome`、`durationMs`）；不含完整正文 |
+| `session.item` | observe | 一次已提交的 canonical item 写入：`{sessionId,workspaceId,sequence,occurredAt,item}`，`item` 为完整 `CanonicalTurnItem`（正文、`blocks`、思考、工具参数／结果／错误、`worker`、`metadata`），不截断、不脱敏。带完整 item 的写入都会投递（含非终态，例如工具调用开始），流式增量帧不投递；同一 item 随状态推进多次到达，按 `(itemId,itemVersion)` 区分；事件总线落后会丢事件，需要权威事实读快照 |
 | `input` | guard | `{raw:{text,imageCount},kind,requestId}`；接纳事实前，幂等重放后；只能继续或阻止，replace 按失败阻止 |
 | `prompt.contribute` | advise | `{target,phase,round,budget}`；patch 为 `{fragments:[{id,stability,priority?,text}]}` |
 | `context.assemble` | advise | `{sessionId,contextWindowTokens,rewritable:{from,to},messages,omitted}`；patch 为 `{rewrites:[{from,to,replacement:[{role,text}]}]}` |
