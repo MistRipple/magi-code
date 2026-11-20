@@ -17,7 +17,7 @@ flate2 = "1"
 tar = "0.4"
 base64.workspace = true
 semver = "1"
-jsonschema = { version = "0.60", default-features = false }
+jsonschema = { version = "0.61", default-features = false }
 tokio.workspace = true
 notify.workspace = true
 
